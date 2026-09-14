@@ -23,6 +23,8 @@ import {
   insertReconcileAction,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
+  releaseOverseerMergeSlot,
+  reserveOverseerMergeSlot,
 } from './overseer';
 
 function cleanupDb(path: string): void {
@@ -409,5 +411,13 @@ describe('overseer db', () => {
         action: 'reconcile_skip_noted',
       })
     ).toBe(false);
+  });
+
+  test('reserves a merge slot under the ceiling and rejects the next at the limit', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    expect(await reserveOverseerMergeSlot('verdict-a', since, 1)).toBe(true);
+    expect(await reserveOverseerMergeSlot('verdict-b', since, 1)).toBe(false);
+    await releaseOverseerMergeSlot('verdict-a');
+    expect(await reserveOverseerMergeSlot('verdict-b', since, 1)).toBe(true);
   });
 });

@@ -364,6 +364,49 @@ export async function countRecentOverseerVerdictMerges(since: string): Promise<n
   return Number(result.rows[0]?.merge_count ?? 0);
 }
 
+export async function reserveOverseerMergeSlot(
+  verdictId: string,
+  since: string,
+  limit: number
+): Promise<boolean> {
+  const db = getDatabase();
+  const now = new Date().toISOString();
+  return db.withTransaction(async query => {
+    const locked = await query('UPDATE overseer_merge_slot_lock SET id = 1 WHERE id = 1');
+    if (locked.rowCount !== 1) {
+      throw new Error('overseer_merge_slot_lock_missing');
+    }
+    const occupiedResult = await query<{ occupied: number | string }>(
+      `SELECT COUNT(*) AS occupied FROM (
+         SELECT verdict_id AS slot_key FROM overseer_merge_slot_reservations
+         WHERE reserved_at >= $1 AND released_at IS NULL
+         UNION
+         SELECT id FROM overseer_verdicts
+         WHERE mutation_sent = true AND actioned_at >= $1
+       ) slots`,
+      [since]
+    );
+    const occupied = Number(occupiedResult.rows[0]?.occupied ?? 0);
+    if (!Number.isFinite(occupied) || occupied >= limit) return false;
+    const inserted = await query(
+      `INSERT INTO overseer_merge_slot_reservations (id, verdict_id, reserved_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (verdict_id) DO NOTHING`,
+      [randomUUID(), verdictId, now]
+    );
+    return inserted.rowCount === 1;
+  });
+}
+
+export async function releaseOverseerMergeSlot(verdictId: string): Promise<void> {
+  await getDatabase().query(
+    `UPDATE overseer_merge_slot_reservations
+     SET released_at = $2
+     WHERE verdict_id = $1 AND released_at IS NULL`,
+    [verdictId, new Date().toISOString()]
+  );
+}
+
 export async function claimVerdictForMergeExecution(verdictId: string): Promise<boolean> {
   const now = new Date().toISOString();
   const result = await getDatabase().query(

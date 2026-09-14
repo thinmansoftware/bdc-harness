@@ -2,7 +2,6 @@ import { createLogger } from '@archon/paths';
 import {
   claimOverseerVerdict,
   claimVerdictForMergeExecution,
-  countRecentOverseerVerdictMerges,
   finalizeOverseerVerdict,
   getOverseerWatchRunById,
   insertOverseerAction,
@@ -10,6 +9,8 @@ import {
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
   recordVerdictMergeOutcome,
+  releaseOverseerMergeSlot,
+  reserveOverseerMergeSlot,
 } from '@archon/core/db/overseer';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
 import type { OverseerVerdictStoreDeps } from './types.ts';
@@ -428,7 +429,8 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
             listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
             claimVerdict: claimVerdictForMergeExecution,
             getRunById: getOverseerWatchRunById,
-            countRecentMerges: countRecentOverseerVerdictMerges,
+            reserveMergeSlot: reserveOverseerMergeSlot,
+            releaseMergeSlot: releaseOverseerMergeSlot,
             recordOutcome: recordVerdictMergeOutcome,
           },
         }));

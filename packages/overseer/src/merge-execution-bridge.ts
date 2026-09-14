@@ -1,3 +1,20 @@
+/**
+ * Unattended merge execution: claim a flag_merge_ready verdict, re-check GitHub,
+ * and squash-merge when policy, allowlist, and the hourly ceiling all pass.
+ *
+ * Allowlist (OVERSEER_MERGE_REPO_CONFIG): JSON object keyed by the full GitHub
+ * identity `owner/repo` (exactly one slash, both sides non-empty), each value
+ * `{ "baseBranch": "<integration-branch>" }`. Repo-only keys are invalid and
+ * fail closed (empty allowlist). Defaults:
+ *   thinmansoftware/bdc-harness -> dev
+ *   thinmansoftware/shopops -> staging
+ *   thinmansoftware/lspro-react -> dev
+ * Lookup compares BOTH run.owner and run.repo; mismatch -> skip('repo_not_allowed').
+ *
+ * Ceiling (OVERSEER_MAX_MERGES_PER_HOUR, default 4): occupancy is reserved
+ * atomically in durable storage before any GitHub merge mutation. A failed
+ * merge releases its reservation; a successful merge keeps it for the window.
+ */
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
@@ -8,9 +25,9 @@ const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
 const FLAG_MERGE_READY = 'flag_merge_ready';
 const DEFAULT_REPO_CONFIG: Readonly<Record<string, { baseBranch: string }>> = Object.freeze({
-  'bdc-harness': { baseBranch: 'dev' },
-  shopops: { baseBranch: 'staging' },
-  'lspro-react': { baseBranch: 'dev' },
+  'thinmansoftware/bdc-harness': { baseBranch: 'dev' },
+  'thinmansoftware/shopops': { baseBranch: 'staging' },
+  'thinmansoftware/lspro-react': { baseBranch: 'dev' },
 });
 const REPO_CONFIG_ENV = 'OVERSEER_MERGE_REPO_CONFIG';
 
@@ -20,7 +37,8 @@ export interface MergeExecutionBridgeStore {
   listUnactionedVerdicts(): Promise<OverseerVerdictRow[]>;
   claimVerdict(verdictId: string): Promise<boolean>;
   getRunById(runId: string): Promise<OverseerWatchRun | null>;
-  countRecentMerges(since: string): Promise<number>;
+  reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
+  releaseMergeSlot(verdictId: string): Promise<void>;
   recordOutcome(input: {
     verdictId: string;
     mutationSent: boolean;
@@ -45,6 +63,11 @@ function configuredLimit(override?: number): number {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_MERGES_PER_HOUR;
 }
 
+function isOwnerRepoIdentity(key: string): boolean {
+  const slash = key.indexOf('/');
+  return slash > 0 && !key.includes('/', slash + 1) && slash < key.length - 1;
+}
+
 function configuredRepos(override?: MergeExecutionRepoConfig): MergeExecutionRepoConfig {
   if (override !== undefined) return override;
   const raw = process.env[REPO_CONFIG_ENV];
@@ -57,6 +80,7 @@ function configuredRepos(override?: MergeExecutionRepoConfig): MergeExecutionRep
       if (
         repo.trim() !== repo ||
         repo.length === 0 ||
+        !isOwnerRepoIdentity(repo) ||
         !value ||
         typeof value !== 'object' ||
         Array.isArray(value) ||
@@ -119,7 +143,7 @@ export async function runMergeExecutionBridgeOnce(
       await skip('run_context_unresolvable');
       continue;
     }
-    const config = repoConfig[run.repo];
+    const config = repoConfig[`${run.owner}/${run.repo}`];
     if (!config) {
       await skip('repo_not_allowed');
       continue;
@@ -168,7 +192,11 @@ export async function runMergeExecutionBridgeOnce(
     const now = (options.now ?? ((): Date => new Date()))();
     const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
     if (
-      (await options.store.countRecentMerges(since)) >= configuredLimit(options.maxMergesPerHour)
+      !(await options.store.reserveMergeSlot(
+        verdict.id,
+        since,
+        configuredLimit(options.maxMergesPerHour)
+      ))
     ) {
       await skip('rate_ceiling_exceeded', pr.htmlUrl);
       continue;
@@ -188,6 +216,7 @@ export async function runMergeExecutionBridgeOnce(
     try {
       merged = await options.github.mergePullRequest({ ...pr.pr, mergeMethod: 'squash' });
     } catch (error) {
+      await options.store.releaseMergeSlot(verdict.id);
       await skip(
         error instanceof Error && error.message ? `merge_failed:${error.message}` : 'merge_failed',
         pr.htmlUrl
@@ -195,6 +224,7 @@ export async function runMergeExecutionBridgeOnce(
       continue;
     }
     if (!merged.merged) {
+      await options.store.releaseMergeSlot(verdict.id);
       await skip(merged.message ?? 'merge_failed', pr.htmlUrl);
       continue;
     }

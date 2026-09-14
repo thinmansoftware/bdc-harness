@@ -2032,6 +2032,19 @@ export class SqliteAdapter implements IDatabase {
         PRIMARY KEY (owner, repo, base_ref, head_sha)
       );
 
+      -- overseer_merge_slot_reservations: atomic hourly merge ceiling (migration 051).
+      CREATE TABLE IF NOT EXISTS overseer_merge_slot_lock (
+        id INTEGER PRIMARY KEY CHECK (id = 1)
+      );
+      INSERT INTO overseer_merge_slot_lock (id) VALUES (1)
+      ON CONFLICT (id) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS overseer_merge_slot_reservations (
+        id TEXT PRIMARY KEY,
+        verdict_id TEXT NOT NULL UNIQUE,
+        reserved_at TEXT NOT NULL,
+        released_at TEXT
+      );
+
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_overseer_required_contexts_attempts_touched
         ON overseer_required_contexts_attempts(touched_at);
@@ -2039,6 +2052,8 @@ export class SqliteAdapter implements IDatabase {
       CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_status ON overseer_verdicts(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(created_at)
         WHERE proposed_action = 'flag_merge_ready' AND actioned_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_overseer_merge_slot_reservations_window
+        ON overseer_merge_slot_reservations(reserved_at);
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_conversation ON remote_agent_sessions(conversation_id);

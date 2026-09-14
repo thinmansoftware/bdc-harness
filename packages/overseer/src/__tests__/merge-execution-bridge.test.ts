@@ -59,11 +59,22 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
   const outcomes: { verdictId: string; mutationSent: boolean; reason: string }[] = [];
   let merges = 0;
   let approvals = 0;
+  let occupied = recentMerges;
+  const reserved = new Set<string>();
   const store: MergeExecutionBridgeStore = {
     listUnactionedVerdicts: async () => [...pending],
     claimVerdict: async verdictId => pending.some(row => row.id === verdictId),
     getRunById: async runId => run(runId.replace('run-', '')),
-    countRecentMerges: async () => recentMerges + outcomes.filter(row => row.mutationSent).length,
+    reserveMergeSlot: async (verdictId, _since, limit) => {
+      if (reserved.has(verdictId)) return false;
+      if (occupied >= limit) return false;
+      occupied += 1;
+      reserved.add(verdictId);
+      return true;
+    },
+    releaseMergeSlot: async verdictId => {
+      if (reserved.delete(verdictId)) occupied -= 1;
+    },
     recordOutcome: async input => {
       outcomes.push(input);
       const index = pending.findIndex(row => row.id === input.verdictId);
@@ -91,6 +102,9 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
     },
     get approvals() {
       return approvals;
+    },
+    get occupied() {
+      return occupied;
     },
   };
 }
@@ -133,7 +147,7 @@ describe('merge execution bridge', () => {
 
   test('uses the configured per-repository integration branch allowlist', async () => {
     process.env.OVERSEER_MERGE_REPO_CONFIG = JSON.stringify({
-      'new-repo': { baseBranch: 'integration' },
+      'thinmansoftware/new-repo': { baseBranch: 'integration' },
     });
     const h = harness([verdict('configured')], greenPr({ baseBranch: 'integration' }));
     h.store.getRunById = async () => ({ ...run('configured'), repo: 'new-repo' });
@@ -219,6 +233,75 @@ describe('merge execution bridge', () => {
     expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
   });
 
+  test('records a matching repo name on a non-allowlisted owner as not allowed', async () => {
+    const h = harness([verdict('fork')]);
+    h.store.getRunById = async () => ({ ...run('fork'), owner: 'other-org', repo: 'bdc-harness' });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
+  });
+
+  test('two concurrent executions at limit-1 admit exactly one merge', async () => {
+    let occupied = 3;
+    const reserved = new Set<string>();
+    const outcomes: { verdictId: string; mutationSent: boolean; reason: string }[] = [];
+    let merges = 0;
+    const reserveMergeSlot = async (
+      verdictId: string,
+      _since: string,
+      limit: number
+    ): Promise<boolean> => {
+      if (reserved.has(verdictId)) return false;
+      if (occupied >= limit) return false;
+      occupied += 1;
+      reserved.add(verdictId);
+      return true;
+    };
+    const releaseMergeSlot = async (verdictId: string): Promise<void> => {
+      if (reserved.delete(verdictId)) occupied -= 1;
+    };
+    const storeFor = (id: string): MergeExecutionBridgeStore => ({
+      listUnactionedVerdicts: async () => [verdict(id)],
+      claimVerdict: async () => true,
+      getRunById: async () => run(id),
+      reserveMergeSlot,
+      releaseMergeSlot,
+      recordOutcome: async input => {
+        outcomes.push(input);
+      },
+    });
+    const github: GitHubClientDeps = {
+      findPullRequest: async () => greenPr(),
+      approvePullRequest: async () => ({ approved: true }),
+      mergePullRequest: async input => {
+        expect(input.mergeMethod).toBe('squash');
+        merges += 1;
+        return { merged: true, mergeSha: 'merge-sha' };
+      },
+    };
+    await Promise.all([
+      runMergeExecutionBridgeOnce({
+        store: storeFor('left'),
+        github,
+        readPolicy: () => policy(),
+        maxMergesPerHour: 4,
+      }),
+      runMergeExecutionBridgeOnce({
+        store: storeFor('right'),
+        github,
+        readPolicy: () => policy(),
+        maxMergesPerHour: 4,
+      }),
+    ]);
+    expect(merges).toBe(1);
+    expect(outcomes.filter(row => row.reason === 'merge_executed')).toHaveLength(1);
+    expect(outcomes.filter(row => row.reason === 'rate_ceiling_exceeded')).toHaveLength(1);
+  });
+
   test('records a thrown merge failure precisely', async () => {
     const h = harness([verdict('throws')]);
     h.github.mergePullRequest = async () => {
@@ -229,6 +312,8 @@ describe('merge execution bridge', () => {
       github: h.github,
       readPolicy: () => policy(),
     });
+    expect(h.merges).toBe(0);
+    expect(h.occupied).toBe(0);
     expect(h.outcomes[0]).toEqual(
       expect.objectContaining({ mutationSent: false, reason: 'merge_failed:network down' })
     );
@@ -242,6 +327,8 @@ describe('merge execution bridge', () => {
       github: h.github,
       readPolicy: () => policy(),
     });
+    expect(h.merges).toBe(0);
+    expect(h.occupied).toBe(0);
     expect(h.outcomes[0]).toEqual(
       expect.objectContaining({ mutationSent: false, reason: 'github rejected' })
     );
