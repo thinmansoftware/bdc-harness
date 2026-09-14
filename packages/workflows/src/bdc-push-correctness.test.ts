@@ -93,6 +93,7 @@ REPO="\${REPO:-thinmansoftware/bdc-xo}"
 REMOTE_URL="\${REPO_REMOTE_URL:-https://github.com/\${REPO}.git}"
 STAGING_GATE=$(printf '%s\\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
 BASE_BRANCH_OVERRIDE=$(printf '%s\\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+BASE_BRANCH_OVERRIDE=$(printf '%s' "$BASE_BRANCH_OVERRIDE" | tr -d '\\r\\t' | sed "s/^'\\\\(.*\\\\)'$/\\\\1/;s/^\\"\\\\(.*\\\\)\\"$/\\\\1/;s/^[[:space:]]*//;s/[[:space:]]*$//")
 STAGING_GATE="\${STAGING_GATE:-0}"
 if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
   case "$BASE_BRANCH_OVERRIDE" in
@@ -356,6 +357,36 @@ describe('F-8C: staging-gate base-branch selection for gh pr create', () => {
 });
 
 describe('Base branch override: deterministic open-pr-if-needed handling', () => {
+  it.each([
+    ["single-quoted empty value", "''"],
+    ['double-quoted empty value', '""'],
+    ['space-only value', ' '],
+    ['carriage-return-only value', '\r'],
+    ['tab-only value', '\t'],
+  ])('treats a %s as absent and falls through to the staging gate', (_label, override) => {
+    const decideOutput = [
+      'push_target: feature-branch:feat/wo-foo-01',
+      'pr_required: true',
+      'staging_gate_required: true',
+      `base_branch_override: ${override}`,
+      'repo: thinmansoftware/shopops',
+    ].join('\n');
+
+    const result = bash(BASE_BRANCH_OVERRIDE_SELECTION_AND_BODY, worktreeDir, {
+      DECIDE_OUTPUT: decideOutput,
+      IMPLEMENT_OUTPUT: 'implemented',
+      PLAN_OUTPUT: 'Commit message: feat: work',
+      REPO_REMOTE_URL: originDir,
+      UNIQUE_BRANCH: 'feat/wo-foo-01-thread-abc',
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain('ERROR:');
+    expect(result.stdout).toContain('BASE_BRANCH=staging');
+    expect(result.stdout).toContain('--base staging');
+    expect(result.stdout).not.toContain('## Base branch override');
+  });
+
   it('extracts exact base and unique branch values from node-output handoff files', () => {
     const nodeOutDir = worktreeDir;
     writeFileSync(
