@@ -360,7 +360,13 @@ nodes:
         2. Missing files -- in-scope work the plan omits.
         3. Unsafe assumptions -- "assume X exists" without verification.
         4. Rule 20 staging gate -- if target repo is lspro-react / shopops-storefront /
-           shopops, plan MUST require --base staging. If not those, must NOT.
+           shopops and the spec does not declare a `Base branch:`, plan MUST require
+           --base staging. A spec-declared PR base is self-authorizing: preserve it in
+           the approved plan as `base_authorized_by_spec: <branch-name>` and do not ask
+           for separate human authorization. You have no shell access and do not verify
+           branch existence here; decide-push-target verifies it and commit-and-push
+           fails closed before pushing when it is missing. If the repo is not one of
+           those three and no base is declared, the plan must NOT require staging.
         5. Out-of-scope list present and correct.
 
         ## Self-repair (the point -- do not just report)
@@ -398,6 +404,8 @@ nodes:
         so emit it ONLY when PLAN_REVIEW_PASS=true.
 
         ## Escalation (emit instead of approving; do NOT emit the approved sentinel)
+        A spec-declared `Base branch:` on a Rule 20 repo is never, by itself, a valid
+        escalation reason. This does not weaken the separate crossing-into-staging gate.
         If the spec is ambiguous/contradictory, the fix needs a new side-effect class or
         ungranted scope, or the same finding survived a prior attempt and you cannot
         resolve it -- set PLAN_REVIEW_PASS=false, emit PLAN_REVIEW_NEEDS_REVISION, and put
@@ -1961,6 +1969,9 @@ nodes:
       4. `**Target Repo:** \`<owner>/<repo>\`` (Markdown bold, capital R)
 
       ## Base Branch Override
+      Emit `base_branch_override:` only for a non-empty declared branch. Never quote
+      the branch name. If no override is declared, omit the line entirely; do not emit
+      a blank value, `''`, or `""`.
       Before consulting the hardcoded staging-gate list below, check whether the spec
       declares an explicit PR base branch override. Look for any of these patterns
       (in priority order):
@@ -2448,6 +2459,7 @@ nodes:
       # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (closes Rule 20 bypass hole 2026-05-18).
       STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
       BASE_BRANCH_OVERRIDE=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      BASE_BRANCH_OVERRIDE=$(printf '%s' "$BASE_BRANCH_OVERRIDE" | tr -d '\r\t' | sed "s/^'\\(.*\\)'$/\\1/;s/^\"\\(.*\\)\"$/\\1/;s/^[[:space:]]*//;s/[[:space:]]*$//")
       STAGING_GATE="${STAGING_GATE:-0}"
       if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
         case "$BASE_BRANCH_OVERRIDE" in
@@ -2509,7 +2521,7 @@ nodes:
       # re-check after each create attempt so a non-zero-exit-but-created PR is
       # caught instead of triggering a spurious failure.
       PR_OK=false
-      EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+      EXIST=$(gh pr list --head "$UNIQUE_BRANCH" --repo "$REPO" --state open \
         --json url --jq '.[0].url // empty' 2>/dev/null || true)
       if [ -n "$EXIST" ]; then
         echo "PR_URL=$EXIST"
@@ -2522,7 +2534,7 @@ nodes:
             break
           fi
           # Re-check: gh pr create may have created the PR but returned non-zero.
-          EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+          EXIST=$(gh pr list --head "$UNIQUE_BRANCH" --repo "$REPO" --state open \
             --json url --jq '.[0].url // empty' 2>/dev/null || true)
           if [ -n "$EXIST" ]; then
             echo "PR_URL=$EXIST"
