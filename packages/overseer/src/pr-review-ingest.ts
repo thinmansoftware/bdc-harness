@@ -185,7 +185,9 @@ export function countConsecutiveAutoRereviews(
     // flight or cancelled before judging is skipped entirely.
     if (!isJudgedVerdict(work.verdict)) continue;
     if (work.isAutoRereview) {
-      const successor = index === 0 ? undefined : prior[index - 1];
+      // The successor must be the nearest newer JUDGED row. An unjudged,
+      // cancelled, queued, or claimed row is not a green fixed-push reset.
+      const successor = findJudgedSuccessor(prior, index);
       const successorHeadSha = successor?.headSha ?? currentHeadSha;
       const successorCiGreen = successor?.headCiGreen ?? currentHeadCiGreen;
       if (successorHeadSha && successorHeadSha !== work.headSha && successorCiGreen) return count;
@@ -220,6 +222,27 @@ export function countTotalAutoRereviews(prior: PriorReviewWork[]): number {
  */
 function isJudgedVerdict(verdict: PriorReviewWork['verdict']): boolean {
   return verdict === 'approved' || verdict === 'changes_requested';
+}
+
+/**
+ * Nearest newer row that actually judged the code. `prior` is newest-first,
+ * so newer rows sit at lower indexes. Unjudged, cancelled, queued, and
+ * claimed rows are skipped: they neither prove a head moved with green CI
+ * nor authorize a consecutive-count reset.
+ */
+function findJudgedSuccessor(prior: PriorReviewWork[], index: number): PriorReviewWork | undefined {
+  for (let newer = index - 1; newer >= 0; newer -= 1) {
+    const candidate = prior[newer];
+    if (
+      candidate.status === 'queued' ||
+      candidate.status === 'claimed' ||
+      candidate.status === 'cancelled'
+    ) {
+      continue;
+    }
+    if (isJudgedVerdict(candidate.verdict)) return candidate;
+  }
+  return undefined;
 }
 
 /**

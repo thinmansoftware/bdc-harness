@@ -387,6 +387,62 @@ describe('#797 -- the count is CONSECUTIVE, so a hand nudge resets it', () => {
     expect(countConsecutiveAutoRereviews(prior)).toBe(3);
   });
 
+  test('an unjudged row between two auto re-reviews does not reset the count', () => {
+    // Review finding (Overseer, PR #809): successor was prior[index - 1] even
+    // when that row never judged. A queued green row between two autos looked
+    // like a fixed push and collapsed the streak from 2 to 1.
+    const prior = [
+      work({ messageId: 'newer-auto', isAutoRereview: true, headSha: 'c'.repeat(40) }),
+      work({
+        messageId: 'unjudged-between',
+        isAutoRereview: true,
+        headSha: 'b'.repeat(40),
+        status: 'queued',
+        verdict: null,
+        verdictId: null,
+        headCiGreen: true,
+      }),
+      work({ messageId: 'older-auto', isAutoRereview: true, headSha: 'a'.repeat(40) }),
+    ];
+    expect(countConsecutiveAutoRereviews(prior)).toBe(2);
+  });
+
+  test('a cancelled row between two auto re-reviews does not reset the count', () => {
+    const prior = [
+      work({ messageId: 'newer-auto', isAutoRereview: true, headSha: 'c'.repeat(40) }),
+      work({
+        messageId: 'cancelled-between',
+        isAutoRereview: true,
+        headSha: 'b'.repeat(40),
+        status: 'cancelled',
+        verdict: null,
+        verdictId: null,
+        headCiGreen: true,
+      }),
+      work({ messageId: 'older-auto', isAutoRereview: true, headSha: 'a'.repeat(40) }),
+    ];
+    expect(countConsecutiveAutoRereviews(prior)).toBe(2);
+  });
+
+  test('a judged green fixed-push successor still resets the consecutive count to 1', () => {
+    const prior = [
+      work({
+        messageId: 'newest-auto',
+        isAutoRereview: true,
+        headSha: NEW_HEAD,
+        headCiGreen: true,
+      }),
+      work({
+        messageId: 'fixed-push-auto',
+        isAutoRereview: true,
+        headSha: 'c'.repeat(40),
+        headCiGreen: true,
+      }),
+      work({ messageId: 'older-auto', isAutoRereview: true, headSha: OLD_HEAD }),
+    ];
+    expect(countConsecutiveAutoRereviews(prior)).toBe(1);
+  });
+
   test('a PR with no auto history counts zero', () => {
     expect(countConsecutiveAutoRereviews([])).toBe(0);
     expect(countConsecutiveAutoRereviews([work()])).toBe(0);
