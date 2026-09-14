@@ -449,4 +449,32 @@ describe('merge execution bridge', () => {
     expect(await h.store.releaseVerdictClaim('finalized', 'should-not-unfinalize')).toBe(false);
     expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
   });
+
+  test('keeps claim and slot when merge succeeds and recordOutcome throws once', async () => {
+    const h = harness([verdict('persist-throws')]);
+    const record = h.store.recordOutcome;
+    let recordCalls = 0;
+    h.store.recordOutcome = async input => {
+      recordCalls += 1;
+      if (recordCalls === 1) throw new Error('db write failed');
+      return record(input);
+    };
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(h.occupied).toBe(1);
+    expect(h.claimReleases).toEqual([]);
+    expect(recordCalls).toBe(2);
+    expect(h.outcomes).toEqual([
+      expect.objectContaining({
+        verdictId: 'persist-throws',
+        mutationSent: true,
+        reason: 'merge_executed_outcome_unpersisted:db write failed',
+      }),
+    ]);
+    expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
+  });
 });

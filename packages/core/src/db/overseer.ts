@@ -439,7 +439,7 @@ export async function recordVerdictMergeOutcome(input: {
   prUrl?: string;
 }): Promise<OverseerVerdictRow> {
   const db = getDatabase();
-  await db.query(
+  const updated = await db.query(
     `UPDATE overseer_verdicts
      SET mutation_sent = $2, action_reason = $3,
          merge_sha = $4, pr_url = $5, updated_at = $6
@@ -453,6 +453,9 @@ export async function recordVerdictMergeOutcome(input: {
       new Date().toISOString(),
     ]
   );
+  if (updated.rowCount !== 1) {
+    throw new Error(`overseer_verdict_outcome_not_recorded:${input.verdictId}`);
+  }
   const result = await db.query<OverseerVerdictRow>(
     'SELECT * FROM overseer_verdicts WHERE id = $1',
     [input.verdictId]

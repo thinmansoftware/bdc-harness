@@ -108,6 +108,49 @@ function isDocumentationOnly(paths: readonly string[]): boolean {
   );
 }
 
+async function recordPostMutationOutcome(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  input: { reason: string; mergeSha?: string; prUrl?: string }
+): Promise<boolean> {
+  try {
+    await options.store.recordOutcome({
+      verdictId: verdict.id,
+      mutationSent: true,
+      reason: input.reason,
+      mergeSha: input.mergeSha,
+      prUrl: input.prUrl,
+    });
+    return true;
+  } catch (error) {
+    log.error(
+      {
+        err: error as Error,
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        mergeSha: input.mergeSha,
+        prUrl: input.prUrl,
+      },
+      'merge-coordinator.merge_outcome_persist_failed'
+    );
+    try {
+      await options.store.recordOutcome({
+        verdictId: verdict.id,
+        mutationSent: true,
+        reason: `merge_executed_outcome_unpersisted:${
+          error instanceof Error && error.message ? error.message : 'unknown'
+        }`,
+        mergeSha: input.mergeSha,
+        prUrl: input.prUrl,
+      });
+    } catch {
+      // Retain the slot and processing claim so the mutation is not retried or uncounted.
+    }
+    return false;
+  }
+}
+
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
@@ -237,17 +280,24 @@ async function mergeClaimedVerdict(
     return;
   }
   if (!merged.merged) {
+    if (merged.message === 'github_merge_transport_ambiguous') {
+      await recordPostMutationOutcome(options, verdict, {
+        reason: 'github_merge_transport_ambiguous',
+        mergeSha: merged.mergeSha ?? merged.sha,
+        prUrl: pr.htmlUrl,
+      });
+      return;
+    }
     await options.store.releaseMergeSlot(verdict.id);
     await skip(merged.message ?? 'merge_failed', pr.htmlUrl);
     return;
   }
-  await options.store.recordOutcome({
-    verdictId: verdict.id,
-    mutationSent: true,
+  const persisted = await recordPostMutationOutcome(options, verdict, {
     reason: 'merge_executed',
     mergeSha: merged.mergeSha,
     prUrl: pr.htmlUrl,
   });
+  if (!persisted) return;
   log.info(
     {
       verdictId: verdict.id,

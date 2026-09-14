@@ -484,4 +484,31 @@ describe('overseer db', () => {
     expect(skipped[0]?.action_reason).toBe('repo_not_allowed');
     expect(skipped[0]?.actioned_at).toBeTruthy();
   });
+
+  test('recordVerdictMergeOutcome throws when action_reason is not processing', async () => {
+    await seedRun('run-outcome-mismatch');
+    await db.query(
+      `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, proposed_action)
+       VALUES ('verdict-mismatch', 'run-outcome-mismatch', 'WO-TEST-OVERSEER-01', 'sha', 'flag_merge_ready')`
+    );
+    expect(await claimVerdictForMergeExecution('verdict-mismatch')).toBe(true);
+    await recordVerdictMergeOutcome({
+      verdictId: 'verdict-mismatch',
+      mutationSent: false,
+      reason: 'repo_not_allowed',
+    });
+    await expect(
+      recordVerdictMergeOutcome({
+        verdictId: 'verdict-mismatch',
+        mutationSent: true,
+        reason: 'merge_executed',
+        mergeSha: 'should-not-write',
+      })
+    ).rejects.toThrow('overseer_verdict_outcome_not_recorded');
+    const rows = await getOverseerVerdictsForRun('run-outcome-mismatch');
+    expect(rows[0]?.action_reason).toBe('repo_not_allowed');
+    expect(rows[0]?.merge_sha).toBeNull();
+    expect(rows[0]?.mutation_sent === false || rows[0]?.mutation_sent === 0).toBe(true);
+    expect(await listUnactionedFlagMergeReadyVerdicts()).toHaveLength(0);
+  });
 });
