@@ -3231,6 +3231,12 @@ nodes:
         echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
         exit 1
       fi
+      if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+        # The leased push advanced origin/<branch> to this HEAD; refresh the lease so the
+        # origin-visibility re-push in open-pr-if-needed leases against the new head.
+        REPAIR_TARGET_LEASE_SHA=$(git rev-parse HEAD)
+        echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LEASE_SHA}"
+      fi
       # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: the ONLY success invariant.
       # Clean-tree / commits-ahead-0 / HEAD-reachable-from-some-remote are NOT
       # valid proxies. The canonical PR branch MUST be on origin at local HEAD
@@ -3296,7 +3302,7 @@ nodes:
         echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
         exit 1
       fi
-      REPAIR_TARGET_LEASE_SHA=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | head -n 1)
+      REPAIR_TARGET_LEASE_SHA=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1)
       # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: precondition guard. Re-verify
       # the canonical branch is on origin at local HEAD BEFORE attempting any PR.
       # If commit-and-push's verify passed this should always hold; failing here

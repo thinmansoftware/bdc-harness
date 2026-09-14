@@ -676,6 +676,8 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
       expect(yaml).toContain('--force-with-lease=');
       expect(yaml).toContain('repair_target_diverged');
+      expect(yaml).toContain("sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1");
+      expect(yaml).toContain('REPAIR_TARGET_LEASE_SHA=$(git rev-parse HEAD)');
     }
   });
 
