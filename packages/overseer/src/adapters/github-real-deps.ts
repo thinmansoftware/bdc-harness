@@ -110,6 +110,7 @@ export interface RealGitHubOctokitLike {
         changed_files?: number;
         head: { sha: string };
         base?: { sha: string; ref?: string };
+        user?: { login?: string | null };
       };
     }>;
     merge(input: {

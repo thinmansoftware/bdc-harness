@@ -24,12 +24,27 @@ export const prReviewRequestBodySchema = z
 
 export const prReviewRequestResponseSchema = z
   .object({
-    ok: z.boolean(),
+    ok: z.literal(true),
     messageId: z.string(),
     alreadyExisted: z.boolean(),
     correlationId: z.string(),
   })
   .openapi('PrReviewRequestResponse');
+
+export const prReviewRequestHeadNotCurrentSchema = z
+  .object({
+    ok: z.literal(false),
+    error: z.literal('head_not_current'),
+    currentHead: z.string(),
+  })
+  .openapi('PrReviewRequestHeadNotCurrent');
+
+export const prReviewRequestHeadLookupFailedSchema = z
+  .object({
+    ok: z.literal(false),
+    error: z.literal('head_lookup_failed'),
+  })
+  .openapi('PrReviewRequestHeadLookupFailed');
 
 const prReviewLastReviewSchema = z.object({
   messageId: z.string(),

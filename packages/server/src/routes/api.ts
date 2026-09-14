@@ -353,6 +353,8 @@ import {
   prReviewQueueQuerySchema,
   prReviewQueueResponseSchema,
   prReviewRequestBodySchema,
+  prReviewRequestHeadLookupFailedSchema,
+  prReviewRequestHeadNotCurrentSchema,
   prReviewRequestResponseSchema,
   prReviewStatusQuerySchema,
   prReviewStatusResponseSchema,
@@ -1444,6 +1446,14 @@ const postPrReviewRequestRoute = createRoute({
     },
     400: jsonError('Bad request'),
     401: jsonError('Missing or invalid operator token'),
+    409: {
+      content: { 'application/json': { schema: prReviewRequestHeadNotCurrentSchema } },
+      description: 'headSha is not the PR current head; nothing enqueued',
+    },
+    502: {
+      content: { 'application/json': { schema: prReviewRequestHeadLookupFailedSchema } },
+      description: 'GitHub current-head lookup failed; nothing enqueued',
+    },
     500: jsonError('Server error'),
   },
 });
@@ -5031,7 +5041,14 @@ export function registerApiRoutes(
   registerOpenApiRoute(postPrReviewRequestRoute, async c => {
     try {
       const body = getValidatedBody(c, prReviewRequestBodySchema);
-      return c.json(await requestPrReview(body));
+      const result = await requestPrReview(body);
+      if (!result.ok) {
+        if (result.error === 'head_lookup_failed') {
+          return c.json(result, 502);
+        }
+        return c.json(result, 409);
+      }
+      return c.json(result);
     } catch (error) {
       getLog().error({ err: error }, 'pr_review.request_failed');
       return apiError(c, 500, 'Failed to enqueue PR review');

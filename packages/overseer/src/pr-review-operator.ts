@@ -15,6 +15,7 @@ import {
 import type { PriorReviewWork } from './pr-review-ingest';
 import {
   createRealIngestDeps,
+  fetchCurrentPullHead,
   parseReviewWorkBody,
   resolveReviewRouteConfig,
   REVIEW_RECIPIENT,
@@ -47,12 +48,30 @@ export interface PrReviewRequestInput {
   reason: string;
 }
 
-export interface PrReviewRequestResult {
+export interface PrReviewRequestAccepted {
   ok: true;
   messageId: string;
   alreadyExisted: boolean;
   correlationId: string;
 }
+
+export type PrReviewRequestRejected =
+  | { ok: false; error: 'head_lookup_failed' }
+  | { ok: false; error: 'head_not_current'; currentHead: string };
+
+export type PrReviewRequestResult = PrReviewRequestAccepted | PrReviewRequestRejected;
+
+export interface ResolvedPrHead {
+  currentHead: string;
+  baseRef: string;
+  author: string;
+}
+
+export type ResolveCurrentHeadFn = (input: {
+  owner: string;
+  repo: string;
+  prNumber: number;
+}) => Promise<ResolvedPrHead>;
 
 export interface PrReviewLastReview {
   messageId: string;
@@ -122,6 +141,9 @@ interface QueuedRecipientAgeRow {
 }
 
 let cachedReviewWorkDeps: IngestDeps | undefined;
+let injectedResolveCurrentHead: ResolveCurrentHeadFn | undefined;
+let injectedNow: (() => number) | undefined;
+let injectedStaleAfterMs: number | undefined;
 
 function reviewWorkDeps(): IngestDeps {
   if (!cachedReviewWorkDeps) {
@@ -134,6 +156,25 @@ function reviewWorkDeps(): IngestDeps {
     );
   }
   return cachedReviewWorkDeps;
+}
+
+export function setResolveCurrentHead(resolver: ResolveCurrentHeadFn | undefined): void {
+  injectedResolveCurrentHead = resolver;
+}
+
+export function setPrReviewOperatorClock(
+  input: { now?: () => number; staleAfterMs?: number } | undefined
+): void {
+  injectedNow = input?.now;
+  injectedStaleAfterMs = input?.staleAfterMs;
+}
+
+async function defaultResolveCurrentHead(input: {
+  owner: string;
+  repo: string;
+  prNumber: number;
+}): Promise<ResolvedPrHead> {
+  return fetchCurrentPullHead(input);
 }
 
 export function operatorRequestIdempotencyKey(input: {
@@ -266,7 +307,28 @@ export async function getPrReviewStatus(input: PrReviewStatusQuery): Promise<PrR
   };
 }
 
-export async function requestPrReview(input: PrReviewRequestInput): Promise<PrReviewRequestResult> {
+export async function requestPrReview(
+  input: PrReviewRequestInput,
+  options?: { resolveCurrentHead?: ResolveCurrentHeadFn }
+): Promise<PrReviewRequestResult> {
+  const resolver =
+    options?.resolveCurrentHead ?? injectedResolveCurrentHead ?? defaultResolveCurrentHead;
+  let resolved: ResolvedPrHead;
+  try {
+    resolved = await resolver({
+      owner: input.owner,
+      repo: input.repo,
+      prNumber: input.prNumber,
+    });
+  } catch {
+    return { ok: false, error: 'head_lookup_failed' };
+  }
+  if (typeof resolved.currentHead !== 'string' || resolved.currentHead === '') {
+    return { ok: false, error: 'head_lookup_failed' };
+  }
+  if (input.headSha.toLowerCase() !== resolved.currentHead.toLowerCase()) {
+    return { ok: false, error: 'head_not_current', currentHead: resolved.currentHead };
+  }
   const correlationId = reviewCorrelationId(input);
   const idempotencyKey = operatorRequestIdempotencyKey(input);
   const subjectKey = reviewSubjectKey(input.owner, input.repo, input.prNumber);
@@ -283,8 +345,8 @@ export async function requestPrReview(input: PrReviewRequestInput): Promise<PrRe
     repo: input.repo,
     prNumber: input.prNumber,
     headSha: input.headSha,
-    baseRef: '',
-    author: '',
+    baseRef: resolved.baseRef,
+    author: resolved.author,
     repeatReason: operatorRequestRepeatReason(input.reason),
     headCiGreen: false,
   });
@@ -331,28 +393,76 @@ function toQueueItem(message: DispatchMessage, nowMs: number): PrReviewQueueItem
   };
 }
 
-function workerCoversRecipient(worker: dispatch.DispatchWorker, recipient: string): boolean {
+interface DispatchWorkerOrphanRow {
+  worker_id: string;
+  status: string;
+  last_heartbeat_at: string;
+  capabilities: unknown;
+}
+
+function parseWorkerCapabilities(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== 'string') return {};
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function workerCoversRecipient(
+  worker: { worker_id: string; capabilities: Record<string, unknown> },
+  recipient: string
+): boolean {
   const principal = worker.capabilities.principal;
   const principalId = typeof principal === 'string' ? principal.trim().toLowerCase() : '';
   const workerId = worker.worker_id.trim().toLowerCase();
   return principalId === recipient || workerId === recipient;
 }
 
-async function listOrphanedRecipients(nowMs: number): Promise<PrReviewOrphanedRecipient[]> {
+function workerHeartbeatIsFresh(
+  lastHeartbeatAt: string,
+  nowMs: number,
+  staleAfterMs: number
+): boolean {
+  const heartbeatMs = Date.parse(lastHeartbeatAt);
+  if (!Number.isFinite(heartbeatMs)) return false;
+  return nowMs - heartbeatMs <= staleAfterMs;
+}
+
+async function listOrphanedRecipients(
+  nowMs: number,
+  staleAfterMs: number
+): Promise<PrReviewOrphanedRecipient[]> {
   const result = await getDatabase().query<QueuedRecipientAgeRow>(
     `SELECT recipient, COUNT(*) AS count, MIN(created_at) AS oldest_created_at
      FROM agent_dispatch_messages
      WHERE status = 'queued'
      GROUP BY recipient`
   );
-  const workers = await dispatch.listWorkers();
-  const liveWorkers = workers.filter(worker => worker.status === 'available');
+  const workers = await getDatabase().query<DispatchWorkerOrphanRow>(
+    'SELECT worker_id, status, last_heartbeat_at, capabilities FROM agent_dispatch_workers'
+  );
+  const liveWorkers = workers.rows.filter(worker => {
+    if (worker.status !== 'available') return false;
+    return workerHeartbeatIsFresh(worker.last_heartbeat_at, nowMs, staleAfterMs);
+  });
   const orphaned: PrReviewOrphanedRecipient[] = [];
   for (const row of result.rows) {
     const oldestMs = Date.parse(row.oldest_created_at);
     if (!Number.isFinite(oldestMs) || nowMs - oldestMs < ORPHAN_QUEUED_AFTER_MS) continue;
     const recipient = row.recipient.trim().toLowerCase();
-    const hasLiveWorker = liveWorkers.some(worker => workerCoversRecipient(worker, recipient));
+    const hasLiveWorker = liveWorkers.some(worker =>
+      workerCoversRecipient(
+        { worker_id: worker.worker_id, capabilities: parseWorkerCapabilities(worker.capabilities) },
+        recipient
+      )
+    );
     if (hasLiveWorker) continue;
     orphaned.push({
       recipient: row.recipient,
@@ -365,8 +475,12 @@ async function listOrphanedRecipients(nowMs: number): Promise<PrReviewOrphanedRe
 
 export async function listPrReviewQueue(input: {
   status?: PrReviewQueueStatus;
+  now?: number;
+  staleAfterMs?: number;
 }): Promise<PrReviewQueueResult> {
-  const nowMs = Date.now();
+  const nowMs = input.now ?? injectedNow?.() ?? Date.now();
+  const staleAfterMs =
+    input.staleAfterMs ?? injectedStaleAfterMs ?? dispatch.DEFAULT_WORKER_STALE_AFTER_MS;
   const statuses: PrReviewQueueStatus[] = input.status ? [input.status] : [...QUEUE_STATUSES];
   const items: PrReviewQueueItem[] = [];
   for (const status of statuses) {
@@ -377,6 +491,6 @@ export async function listPrReviewQueue(input: {
   }
   return {
     items,
-    orphaned: await listOrphanedRecipients(nowMs),
+    orphaned: await listOrphanedRecipients(nowMs, staleAfterMs),
   };
 }

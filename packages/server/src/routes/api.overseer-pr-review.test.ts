@@ -5,7 +5,7 @@ import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
-import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
+import { createAuthenticatedMessage, registerWorker } from '@archon/core/db/dispatch';
 import { validationErrorHook } from './openapi-defaults';
 import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
 
@@ -122,6 +122,10 @@ for (const moduleName of [
 import { registerApiRoutes } from './api';
 import { createRealIngestDeps, reviewSubjectKey } from '@archon/overseer/pr-review-wiring';
 import { isAutoRereviewReason, reviewCorrelationId } from '@archon/overseer/pr-review-ingest';
+import {
+  setPrReviewOperatorClock,
+  setResolveCurrentHead,
+} from '@archon/overseer/pr-review-operator';
 
 const TOKEN = 'secret-token';
 const OWNER = 'thinmansoftware';
@@ -130,6 +134,10 @@ const PR_NUMBER = 806;
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
 const HEAD_C = 'c'.repeat(40);
+const HEAD_D = 'd'.repeat(40);
+const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+const TWENTY_FIVE_HOURS_MS = 25 * 60 * 60 * 1000;
+const ORPHAN_RECIPIENT = 'overseer-review-route';
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -249,6 +257,53 @@ function statusPath(prNumber = PR_NUMBER): string {
   return `/api/overseer/pr-review/status?owner=${OWNER}&repo=${REPO}&prNumber=${prNumber}`;
 }
 
+function stubCurrentHead(currentHead: string, extra?: { baseRef?: string; author?: string }): void {
+  setResolveCurrentHead(async () => ({
+    currentHead,
+    baseRef: extra?.baseRef ?? 'dev',
+    author: extra?.author ?? 'alice',
+  }));
+}
+
+async function countRunReviewRows(): Promise<number> {
+  const result = await db.query<{ n: number | string }>(
+    `SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE task_type = 'run_review'`
+  );
+  return Number(result.rows[0]?.n ?? 0);
+}
+
+async function seedOrphanQueue(nowMs: number): Promise<void> {
+  const created = await createAuthenticatedMessage(
+    { kind: 'system', sender: 'overseer' },
+    {
+      correlation_id: `orphan:${ORPHAN_RECIPIENT}`,
+      idempotency_key: `orphan:${ORPHAN_RECIPIENT}`,
+      task_type: 'run_review',
+      recipient: ORPHAN_RECIPIENT,
+      body: JSON.stringify({ kind: 'orphan-fixture' }),
+    }
+  );
+  await db.query(`UPDATE agent_dispatch_messages SET created_at = $1 WHERE id = $2`, [
+    new Date(nowMs - TWENTY_FIVE_HOURS_MS).toISOString(),
+    created.id,
+  ]);
+}
+
+async function seedCoveringWorker(heartbeatAtMs: number): Promise<void> {
+  await registerWorker({
+    worker_id: ORPHAN_RECIPIENT,
+    host: 'orphan-test',
+    capabilities: { principal: ORPHAN_RECIPIENT },
+    max_concurrency: 1,
+  });
+  await db.query(
+    `UPDATE agent_dispatch_workers
+     SET status = 'available', last_heartbeat_at = $1
+     WHERE worker_id = $2`,
+    [new Date(heartbeatAtMs).toISOString(), ORPHAN_RECIPIENT]
+  );
+}
+
 describe('overseer PR review operator routes', () => {
   beforeEach(() => {
     process.env.BUN_ENV = 'test';
@@ -257,9 +312,12 @@ describe('overseer PR review operator routes', () => {
       `.test-api-overseer-pr-review-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
     );
     db = new SqliteAdapter(currentDbPath);
+    stubCurrentHead(HEAD_C);
   });
 
   afterEach(async () => {
+    setResolveCurrentHead(undefined);
+    setPrReviewOperatorClock(undefined);
     delete process.env.ARCHON_OPERATOR_TOKEN;
     await db.close();
     cleanupDb(currentDbPath);
@@ -312,6 +370,7 @@ describe('overseer PR review operator routes', () => {
   });
 
   test('request at a subject with existing terminal rows succeeds', async () => {
+    stubCurrentHead(HEAD_B);
     const first = await enqueueReview({ headSha: HEAD_A, repeatReason: null });
     await markDone(first.messageId);
     await recordVerdict({
@@ -428,5 +487,117 @@ describe('overseer PR review operator routes', () => {
     expect(body.items[0]?.repo).toBe(REPO);
     expect(body.items[0]?.prNumber).toBe(PR_NUMBER);
     expect(body.items[0]?.headSha).toBe(HEAD_A);
+  });
+
+  test('request at a mismatched head returns 409 and enqueues nothing', async () => {
+    stubCurrentHead(HEAD_A);
+    const response = await makeApp(TOKEN).request('/api/overseer/pr-review/request', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        owner: OWNER,
+        repo: REPO,
+        prNumber: PR_NUMBER,
+        headSha: HEAD_B,
+        reason: 'stale-head',
+      }),
+    });
+    expect(response.status).toBe(409);
+    const body = (await response.json()) as {
+      ok: boolean;
+      error: string;
+      currentHead: string;
+    };
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('head_not_current');
+    expect(body.currentHead).toBe(HEAD_A);
+    expect(await countRunReviewRows()).toBe(0);
+  });
+
+  test('request at the current head enqueues one row with baseRef and author', async () => {
+    stubCurrentHead(HEAD_D, { baseRef: 'main', author: 'octocat' });
+    const response = await makeApp(TOKEN).request('/api/overseer/pr-review/request', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        owner: OWNER,
+        repo: REPO,
+        prNumber: PR_NUMBER,
+        headSha: HEAD_D,
+        reason: 'exact-head',
+      }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { ok: boolean; messageId: string };
+    expect(body.ok).toBe(true);
+    expect(await countRunReviewRows()).toBe(1);
+    const rows = await db.query<{ body: string }>(
+      `SELECT body FROM agent_dispatch_messages WHERE task_type = 'run_review'`
+    );
+    const queued = JSON.parse(rows.rows[0]?.body ?? '{}') as {
+      baseRef: string;
+      author: string;
+      headCiGreen: boolean;
+      headSha: string;
+    };
+    expect(queued.headSha).toBe(HEAD_D);
+    expect(queued.baseRef).toBe('main');
+    expect(queued.author).toBe('octocat');
+    expect(queued.headCiGreen).toBe(false);
+  });
+
+  test('request when current-head lookup throws returns 502 and enqueues nothing', async () => {
+    setResolveCurrentHead(async () => {
+      throw new Error('github unavailable');
+    });
+    const response = await makeApp(TOKEN).request('/api/overseer/pr-review/request', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        owner: OWNER,
+        repo: REPO,
+        prNumber: PR_NUMBER,
+        headSha: HEAD_C,
+        reason: 'lookup-failed',
+      }),
+    });
+    expect(response.status).toBe(502);
+    const body = (await response.json()) as { ok: boolean; error: string };
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('head_lookup_failed');
+    expect(await countRunReviewRows()).toBe(0);
+  });
+
+  test('an available worker with a 2h-stale heartbeat does not suppress an orphan', async () => {
+    const wall = Date.now();
+    const nowMs = wall + TWO_HOURS_MS;
+    setPrReviewOperatorClock({ now: () => nowMs });
+    await seedOrphanQueue(nowMs);
+    await seedCoveringWorker(wall);
+    const response = await makeApp(TOKEN).request('/api/overseer/pr-review/queue', {
+      headers: authHeaders(),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      orphaned: Array<{ recipient: string; count: number }>;
+    };
+    const hit = body.orphaned.find(row => row.recipient === ORPHAN_RECIPIENT);
+    expect(hit).toBeDefined();
+    expect(hit?.count).toBe(1);
+  });
+
+  test('an available worker with a fresh heartbeat suppresses an orphan', async () => {
+    const nowMs = Date.now();
+    setPrReviewOperatorClock({ now: () => nowMs });
+    await seedOrphanQueue(nowMs);
+    await seedCoveringWorker(nowMs);
+    const response = await makeApp(TOKEN).request('/api/overseer/pr-review/queue', {
+      headers: authHeaders(),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      orphaned: Array<{ recipient: string }>;
+    };
+    expect(body.orphaned.some(row => row.recipient === ORPHAN_RECIPIENT)).toBe(false);
   });
 });

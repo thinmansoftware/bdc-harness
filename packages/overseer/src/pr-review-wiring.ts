@@ -127,6 +127,29 @@ export function parseReviewWorkBody(body: string): ReviewWorkBody | null {
   }
 }
 
+export interface CurrentPullHead {
+  currentHead: string;
+  baseRef: string;
+  author: string;
+}
+
+/** Same `pulls.get` lookup `createRealSubmitDeps().currentHeadSha` uses. */
+export async function fetchCurrentPullHead(
+  input: { owner: string; repo: string; prNumber: number },
+  octokit: ReturnType<typeof createRealOctokitClient> = createRealOctokitClient()
+): Promise<CurrentPullHead> {
+  const pr = await octokit.pulls.get({
+    owner: input.owner,
+    repo: input.repo,
+    pull_number: input.prNumber,
+  });
+  return {
+    currentHead: pr.data.head.sha,
+    baseRef: typeof pr.data.base?.ref === 'string' ? pr.data.base.ref : '',
+    author: typeof pr.data.user?.login === 'string' ? pr.data.user.login : '',
+  };
+}
+
 /**
  * Subject key for a PR's review work. Head-independent on purpose: it groups
  * every review attempt for one pull request so stale-head lookup can find
@@ -914,12 +937,7 @@ export function createRealSubmitDeps(
     },
     submitReview: createRealSubmitPullRequestReview(octokit),
     async currentHeadSha(input): Promise<string> {
-      const pr = await octokit.pulls.get({
-        owner: input.owner,
-        repo: input.repo,
-        pull_number: input.prNumber,
-      });
-      return pr.data.head.sha;
+      return (await fetchCurrentPullHead(input, octokit)).currentHead;
     },
     async recordReceipt(input): Promise<void> {
       // This receipt IS the escalation path: every terminal disposition lands
