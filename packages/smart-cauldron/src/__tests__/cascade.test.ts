@@ -89,14 +89,10 @@ afterAll(async () => {
 
 /** Build base options pointing to the real config (entry defaults to codex).
  *
- *  outDir is UNIQUE PER CALL. Most tests here omit deps.acquireWoLock, so the
- *  REAL wo-lock runs against outDir keyed on the shared woId 'WO-TEST-001'.
- *  With a shared outDir, one test dying mid-cascade (e.g. a Windows timeout)
- *  leaves its lock file behind and every later cascade test fails with
- *  "REFUSING duplicate cascade" -- one flake poisoned the whole suite
- *  (2026-08-25 windows-latest). A per-test outDir makes each cascade's lock
- *  namespace disposable, so no test can contaminate another. */
+ * Claim lookup and WO locking default to in-memory stubs so tests cannot reach
+ * GitHub or the filesystem by omission. Tests can override individual deps. */
 function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
+  const { deps, ...options } = partial;
   return {
     woId: 'WO-TEST-001',
     woClass: 'CODE',
@@ -104,7 +100,24 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     outDir: join(testOutRoot, randomUUID()),
     token: 'test-token',
     project: 'test-project',
-    ...partial,
+    ...options,
+    deps: {
+      findWoClaim: async () => null,
+      acquireWoLock: async (woId, project, cascadeId) => ({
+        acquired: true,
+        path: 'in-memory-test-lock',
+        record: {
+          woId,
+          project,
+          cascadeId,
+          status: 'running',
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString(),
+        },
+      }),
+      releaseWoLock: async () => {},
+      ...deps,
+    },
   };
 }
 
