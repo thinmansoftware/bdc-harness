@@ -1767,22 +1767,28 @@ nodes:
       if [ "$CHANGED" -eq 0 ] && [ "$AHEAD" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
       # Branch suffix uses $$ (Rule 2: never $WORKFLOW_ID under set -u).
       BR="salvage/opus-repair-$(basename "$WT")-$$"
-      printf '%s\n' "$STATUS_RAW" | while IFS= read -r entry; do
-        [ -n "$entry" ] || continue
-        path=$(printf '%s\n' "$entry" | cut -c4-)
-        git add -- "$path" 2>/dev/null || true
-      done
+      # Stage only paths reported by Git. NUL delimiters preserve spaces, quotes,
+      # and rename paths; --exclude-standard keeps ignored runtime artifacts out.
+      { git diff --name-only -z; git diff --cached --name-only -z; git ls-files --others --exclude-standard -z; } |
+        while IFS= read -r -d '' path; do
+          [ -n "$path" ] || continue
+          git add -- "$path" 2>/dev/null || true
+        done
       if ! git diff --cached --quiet 2>/dev/null; then
+        STAGED=$(git diff --cached --name-only | wc -l | tr -d ' ')
         if [ "$CHANGED" -gt 0 ]; then
-          COMMIT_MSG="salvage(uncommitted): ${CHANGED} files"
+          COMMIT_MSG="salvage(uncommitted): ${STAGED} files"
         else
           COMMIT_MSG="salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)"
         fi
-        git -c user.name='cauldron-salvage' -c user.email='noreply@bluedevilcollectibles.com' \
-          commit -m "$COMMIT_MSG" 2>&1 | tail -1 || true
-      fi
-      if [ "$CHANGED" -gt 0 ]; then
-        echo "SALVAGE=preserved_uncommitted:${CHANGED}"
+        if git -c user.name='cauldron-salvage' -c user.email='noreply@bluedevilcollectibles.com' \
+          commit -m "$COMMIT_MSG" 2>&1 | tail -1; then
+          if [ "$CHANGED" -gt 0 ]; then
+            echo "SALVAGE=preserved_uncommitted:${STAGED}"
+          fi
+        else
+          echo "WARN: noninteractive salvage commit failed -- work remains in worktree" >&2
+        fi
       fi
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')

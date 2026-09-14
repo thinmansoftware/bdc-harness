@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { parse } from 'yaml';
@@ -86,6 +86,10 @@ describe('diff-repair checkpoint and salvage', () => {
       expect(node('noninteractive-salvage')?.bash).toContain('SALVAGE=preserved_uncommitted:');
       expect(node('checkpoint-diff-repair')?.bash).not.toContain('git add -A');
       expect(node('noninteractive-salvage')?.bash).not.toContain('git add -A');
+      expect(node('noninteractive-salvage')?.bash).not.toContain('git add -- .');
+      expect(node('noninteractive-salvage')?.bash).toContain(
+        'git ls-files --others --exclude-standard -z'
+      );
     }
   });
   it('commits two modified files before final diff capture', () => {
@@ -117,6 +121,24 @@ describe('diff-repair checkpoint and salvage', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toContain('SALVAGE=preserved_uncommitted:1');
     expect(git(['log', '-1', '--pretty=%s'], dir)).toBe('salvage(uncommitted): 1 files');
+  });
+  it('does not emit the preservation sentinel when the salvage commit fails', () => {
+    const dir = makeRepo();
+    const before = git(['rev-parse', 'HEAD'], dir);
+    writeFileSync(join(dir, 'README.md'), 'not salvaged\n');
+    const hook = join(dir, '.git', 'hooks', 'pre-commit');
+    writeFileSync(hook, '#!/bin/sh\nexit 1\n');
+    chmodSync(hook, 0o755);
+    const script = nodeBash('noninteractive-salvage').replace(
+      '$block-reclassify.output',
+      '{"status":"BLOCKED"}'
+    );
+    const result = run(['bash', '-c', script], dir);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).not.toContain('SALVAGE=preserved_uncommitted:');
+    expect(result.stderr.toString()).toContain('noninteractive salvage commit failed');
+    expect(git(['rev-parse', 'HEAD'], dir)).toBe(before);
+    expect(git(['status', '--porcelain'], dir)).not.toBe('');
   });
   it('leaves the BLOCKED commit-and-push authorization refusal intact', () => {
     const script = nodeBash('commit-and-push');
