@@ -118,6 +118,54 @@ describe('diff-repair checkpoint and salvage', () => {
     expect(result.stdout.toString()).toContain('SALVAGE=preserved_uncommitted:1');
     expect(git(['log', '-1', '--pretty=%s'], dir)).toBe('salvage(uncommitted): 1 files');
   });
+  it('stages a git-mv rename as the new path and drops the old path', () => {
+    const dir = makeRepo();
+    writeFileSync(join(dir, 'old-name.ts'), 'export const v = 1;\n');
+    git(['add', 'old-name.ts'], dir);
+    git(['commit', '-m', 'add old'], dir);
+    git(['mv', 'old-name.ts', 'new-name.ts'], dir);
+    const result = run(['bash', '-c', nodeBash('checkpoint-diff-repair')], dir);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain('CHECKPOINT_DIFF_REPAIR=committed');
+    expect(git(['ls-tree', '-r', '--name-only', 'HEAD'], dir)).toBe('README.md\nnew-name.ts');
+    expect(git(['status', '--porcelain'], dir)).toBe('');
+  });
+  it.skipIf(process.platform === 'win32')(
+    'stages a filename containing a space and a double quote',
+    () => {
+      const dir = makeRepo();
+      const name = 'weird " file.ts';
+      writeFileSync(join(dir, name), 'export const weird = true;\n');
+      const result = run(['bash', '-c', nodeBash('checkpoint-diff-repair')], dir);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.toString()).toContain('CHECKPOINT_DIFF_REPAIR=committed');
+      expect(git(['-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', 'HEAD'], dir)).toBe(
+        `README.md\n${name}`
+      );
+      expect(git(['status', '--porcelain'], dir)).toBe('');
+    }
+  );
+  it('fails closed with stage_failed when git add fails', () => {
+    const dir = makeRepo();
+    writeFileSync(join(dir, 'blocked.ts'), 'export const blocked = true;\n');
+    const before = git(['rev-parse', 'HEAD'], dir);
+    const script = [
+      'git() {',
+      '  if [ "$1" = "add" ]; then',
+      '    echo "fatal: simulated add failure" >&2',
+      '    return 1',
+      '  fi',
+      '  command git "$@"',
+      '}',
+      nodeBash('checkpoint-diff-repair'),
+    ].join('\n');
+    const result = run(['bash', '-c', script], dir);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.toString()).toContain(
+      'CHECKPOINT_DIFF_REPAIR=stage_failed path=blocked.ts'
+    );
+    expect(git(['rev-parse', 'HEAD'], dir)).toBe(before);
+  });
   it('leaves the BLOCKED commit-and-push authorization refusal intact', () => {
     const script = nodeBash('commit-and-push');
     expect(script).toContain("status='$RECLASS_STATUS'");
