@@ -589,8 +589,8 @@ describe('Lane consistency: all feature-development lanes share review-base wiri
 
 describe('Plan-review repair targets and operator-recorded stops', () => {
   const judgeLanes = [
-    '.archon/workflows/defaults/bdc-feature-development-codex.yaml',
-    '.archon/workflows/defaults/bdc-feature-development.yaml',
+    join(DEFAULTS_DIR, 'bdc-feature-development-codex.yaml'),
+    join(DEFAULTS_DIR, 'bdc-feature-development.yaml'),
   ];
 
   it('authorizes a spec-declared repair target in the Codex lane', () => {
@@ -611,6 +611,14 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
 
   it('preserves operator-recorded stops as pending in the default lane', () => {
     expect(readFileSync(judgeLanes[1], 'utf8')).toContain('OPERATOR-RECORDED (pending)');
+  });
+
+  it('hands the verified repair-target branch to commit-and-push without a thread suffix', () => {
+    for (const lane of judgeLanes) {
+      const yaml = readFileSync(lane, 'utf8');
+      expect(yaml).toContain('repair_target_branch: <spec-declared-head-branch>');
+      expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
+    }
   });
 });
 

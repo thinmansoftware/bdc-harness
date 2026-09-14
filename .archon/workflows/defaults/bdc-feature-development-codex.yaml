@@ -416,6 +416,8 @@ nodes:
         escalation reason. This does not weaken the separate crossing-into-staging gate.
         Asking whether an existing, spec-named PR is canonical or should be closed is
         never a valid escalation reason; apply the repair-target verification above.
+        A stop condition ending `-- recorded by XO`, `-- recorded by the operator`, or
+        `(operator-recorded)` is also never, by itself, a valid escalation reason.
         If the spec is ambiguous/contradictory, the fix needs a new side-effect class or
         ungranted scope, or the same finding survived a prior attempt and you cannot
         resolve it -- set PLAN_REVIEW_PASS=false, emit PLAN_REVIEW_NEEDS_REVISION, and put
@@ -1954,6 +1956,13 @@ nodes:
       $war-council-validator.output
 
       ## Branch Name Derivation Rules (F-6A prevention)
+      First check for `Repair target: PR #N (branch X)` in the spec. Verify it with
+      `gh pr view N --repo <target-repo> --json state,headRefName`: state must be OPEN
+      and headRefName must equal X. On success, emit the normal fields below plus
+      `repair_target_branch: <spec-declared-head-branch>` and use X as the feature
+      branch. On a closed PR or repo/branch mismatch, fail closed with the exact
+      declared-repair-target reason from the approved plan. Never mint a replacement.
+
       Anchor incidents 2026-05-18: agents emitted branch names that embedded the
       current worktree thread suffix, producing double-suffixed targets like
       "archon/thread-9772643d-thread-9772643d" or
@@ -2241,7 +2250,16 @@ nodes:
         echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
         exit 1
       fi
-      UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
+      REPAIR_TARGET_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
+      if [ -n "$REPAIR_TARGET_BRANCH" ]; then
+        if ! printf '%s\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+          echo "ERROR: invalid repair_target_branch '${REPAIR_TARGET_BRANCH}'" >&2
+          exit 1
+        fi
+        UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"
+      else
+        UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
+      fi
       git status --short
       DIRTY=$(git status --porcelain)
       if [ -z "$DIRTY" ]; then
@@ -2645,6 +2663,8 @@ nodes:
         VALIDATION: PASS   <- only when all in-run reviews passed
       NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
       files. If no files changed (ALREADY_SATISFIED), emit "Files created: none" only.
+      Any stop condition marked `-- recorded by XO`, `-- recorded by the operator`, or
+      `(operator-recorded)` must be rendered as `OPERATOR-RECORDED (pending)`, never FAIL or N/A.
 
       ## In-run review evidence (record as evidence, NOT vibes -- doctrine
       self-repair-review-loops)
