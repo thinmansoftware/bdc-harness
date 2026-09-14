@@ -592,15 +592,11 @@ describe('Lane consistency: all feature-development lanes share review-base wiri
 });
 
 describe('Spec-declared repair targets and operator-recorded stops', () => {
-  it('records repair targets as authorized by the spec in both target lanes', () => {
+  it('places repair-target authorization in the approved-plan contract', () => {
     for (const lane of REPAIR_TARGET_LANES) {
-      expect(readFileSync(lane, 'utf8')).toContain('repair_target_authorized_by_spec');
-    }
-  });
-
-  it('marks operator-recorded stops as pending in both target lanes', () => {
-    for (const lane of REPAIR_TARGET_LANES) {
-      expect(readFileSync(lane, 'utf8')).toContain('OPERATOR-RECORDED');
+      const yaml = readFileSync(lane, 'utf8');
+      expect(yaml).toContain('repair_target_authorized_by_spec: #N');
+      expect(yaml).toContain('Record `repair_target_authorized_by_spec: #N` in the approved');
     }
   });
 
@@ -613,6 +609,24 @@ describe('Spec-declared repair targets and operator-recorded stops', () => {
   it('does not ask for a platform-specific authorized operator', () => {
     for (const lane of REPAIR_TARGET_LANES) {
       expect(readFileSync(lane, 'utf8')).not.toContain('authorized Windows operator');
+    }
+  });
+
+  it('keeps operator evidence outside STOP-if triggers and mandates pending rendering', () => {
+    for (const lane of REPAIR_TARGET_LANES) {
+      const yaml = readFileSync(lane, 'utf8');
+      const prose = yaml.indexOf('A stop condition marked `-- recorded by XO`');
+      const stopList = yaml.indexOf('Write the escalation block', prose);
+      const ambiguousTrigger = yaml.indexOf('- the spec is ambiguous', stopList);
+      expect(prose).toBeGreaterThan(-1);
+      expect(prose).toBeLessThan(stopList);
+      expect(stopList).toBeLessThan(ambiguousTrigger);
+      expect(yaml).toContain(
+        '`-- recorded by XO`, `-- recorded by the operator`, or `(operator-recorded)` as `OPERATOR-RECORDED (pending)`'
+      );
+      expect(yaml).toContain(
+        'REPAIR TARGET NOT IMPLEMENTED: do not re-fire this WO; branch reuse (Tier B) is not delivered and the current push path can create a duplicate PR.'
+      );
     }
   });
 });

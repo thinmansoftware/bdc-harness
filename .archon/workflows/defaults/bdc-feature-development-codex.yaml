@@ -1336,13 +1336,13 @@ nodes:
         implementation content from those commits" -- exactly the fraud this rule forbids.
 
         ## Escalation (ONLY these -- else fix and let the loop continue)
+        A stop condition marked `-- recorded by XO`, `-- recorded by the operator`, or
+        `(operator-recorded)` is not the builder's gate. Do not escalate on it; proceed
+        and let build-manifest record it as `OPERATOR-RECORDED (pending)`.
         Write the escalation block to $ARTIFACTS_DIR/diff-repair-escalation.txt and STOP if:
         - a finding requires a new side-effect class / scope the lane was not granted
         - a finding requires human-only authority (deploy, prod write, customer comms,
           irreversible/destructive op) where safe behavior is not already encoded
-        - a stop condition marked `-- recorded by XO`, `recorded by the operator`, or
-          `(operator-recorded)` is not the builder's gate: do not escalate on it; proceed
-          and let build-manifest record it as `OPERATOR-RECORDED (pending)`
         - the spec is ambiguous about the correct fix
         - the same finding survived a prior repair attempt and you cannot resolve it
         Escalation block (exact keys):
@@ -2639,7 +2639,8 @@ nodes:
         PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
         Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
         Grep assertions: one line; value is a ';'-separated list of sub-assertions, each EXACTLY "<command> => <count>" with a bare integer count -- NO prose after the count, and NO assertion about pre-change state (never write "=> 0" for a path this diff creates -- it is false by construction once the file exists); or "N/A (<reason>)". Each <command> MUST be a single read-only inspection built only from grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test, optionally piped ('|') to one of those; it MUST NOT contain a literal ';' or any shell chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>' '<') -- verify-manifest-assertions splits the value on ';' and DROPS (unexecuted) any command not on that read-only allowlist. verify-manifest-assertions executes each surviving sub-assertion and rewrites wrong counts, so emit your best honest count.
-        Runtime verification: <evidence> or N/A (<reason>); for model-access or live-model probe stop conditions, include the exact in-container probe output or an explicit [UNVERIFIED-DEFERRED] note with the deferral reason; render a stop marked `-- recorded by XO`, `recorded by the operator`, or `(operator-recorded)` as `OPERATOR-RECORDED (pending)` instead of FAIL/N/A, and do not let that pending operator evidence by itself block `VALIDATION: PASS`
+        Runtime verification: <evidence> or N/A (<reason>); for model-access or live-model probe stop conditions, include the exact in-container probe output or an explicit [UNVERIFIED-DEFERRED] note with the deferral reason; render a stop marked `-- recorded by XO`, `-- recorded by the operator`, or `(operator-recorded)` as `OPERATOR-RECORDED (pending)` instead of FAIL/N/A, and do not let that pending operator evidence by itself block `VALIDATION: PASS`
+        Repair-target warning: if the approved plan contains `repair_target_authorized_by_spec: #N`, write `REPAIR TARGET NOT IMPLEMENTED: do not re-fire this WO; branch reuse (Tier B) is not delivered and the current push path can create a duplicate PR.` Otherwise write N/A.
         VALIDATION: PASS   <- only when all in-run reviews passed
       NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
       files. If no files changed (ALREADY_SATISFIED), emit "Files created: none" only.
