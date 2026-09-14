@@ -172,30 +172,30 @@ async function mergeClaimedVerdict(
   const policy = (options.readPolicy ?? readOverseerActionPolicyFromEnv)();
   if (!policy.service_enabled) {
     await skip('service_disabled');
-    return;
+    return undefined;
   }
   if (policy.emergency_stop) {
     await skip('emergency_stop');
-    return;
+    return undefined;
   }
   if (policy.legacy_dry_run) {
     await skip('legacy_dry_run');
-    return;
+    return undefined;
   }
   if (!policy.capability_flags.merge) {
     await skip('merge_actions_disabled');
-    return;
+    return undefined;
   }
 
   const run = await options.store.getRunById(verdict.run_id);
   if (!run?.owner || !run.repo) {
     await skip('run_context_unresolvable');
-    return;
+    return undefined;
   }
   const config = repoConfig[`${run.owner}/${run.repo}`];
   if (!config) {
     await skip('repo_not_allowed');
-    return;
+    return undefined;
   }
 
   const pr = await options.github.findPullRequest({
@@ -207,35 +207,35 @@ async function mergeClaimedVerdict(
   });
   if (!pr.exists || !pr.pr) {
     await skip(pr.lookupFailed ? 'pr_lookup_failed' : 'open_pr_not_found', pr.htmlUrl);
-    return;
+    return undefined;
   }
   if (pr.headSha !== verdict.head_sha) {
     await skip('verdict_stale_head', pr.htmlUrl);
-    return;
+    return undefined;
   }
   if (pr.state !== 'open') {
     await skip('pr_not_open', pr.htmlUrl);
-    return;
+    return undefined;
   }
   if (pr.checks.total === 0 || pr.checks.failed > 0 || pr.checks.pending > 0) {
     await skip('required_checks_not_success', pr.htmlUrl);
-    return;
+    return undefined;
   }
   if (pr.mergeable !== true || pr.mergeableState !== 'clean') {
     await skip('mergeable_state_not_clean', pr.htmlUrl);
-    return;
+    return undefined;
   }
   if (!pr.changedFilePaths) {
     await skip('changed_files_unresolved', pr.htmlUrl);
-    return;
+    return undefined;
   }
   if (isDocumentationOnly(pr.changedFilePaths)) {
     await skip('spec_only', pr.htmlUrl);
-    return;
+    return undefined;
   }
   if (pr.baseBranch !== config.baseBranch) {
     await skip('integration_base_mismatch', pr.htmlUrl);
-    return;
+    return undefined;
   }
 
   const now = (options.now ?? ((): Date => new Date()))();
@@ -286,7 +286,7 @@ async function mergeClaimedVerdict(
       error instanceof Error && error.message ? `merge_failed:${error.message}` : 'merge_failed',
       pr.htmlUrl
     );
-    return;
+    return undefined;
   }
   if (!merged.merged) {
     if (merged.message === 'github_merge_transport_ambiguous') {
@@ -295,11 +295,11 @@ async function mergeClaimedVerdict(
         mergeSha: merged.mergeSha ?? merged.sha,
         prUrl: pr.htmlUrl,
       });
-      return;
+      return undefined;
     }
     await options.store.releaseMergeSlot(verdict.id);
     await skip(merged.message ?? 'merge_failed', pr.htmlUrl);
-    return;
+    return undefined;
   }
   const persisted = await recordPostMutationOutcome(options, verdict, {
     reason: 'merge_executed',
@@ -319,6 +319,7 @@ async function mergeClaimedVerdict(
     },
     'merge-coordinator.merge_executed'
   );
+  return undefined;
 }
 
 export async function runMergeExecutionBridgeOnce(
