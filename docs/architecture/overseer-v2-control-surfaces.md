@@ -62,6 +62,11 @@ readonly dispatch store. Extra flags:
 - `--window <hours>`: unscoped C4 lookback (default 24). Named `--owner/--repo/--pr-number`
   still selects the newest ingest whose correlation id starts with
   `pr-review:<owner>/<repo>#<N>@`.
+- `--c2-live-enqueue`: opt in to C2's mutation. Without it C2 never POSTs to
+  `/api/overseer/pr-review/request`; it observes an already-queued `run_review` row for
+  the subject (pass when the row carries `repeat_reason`, `blocked` with
+  `c2_live_enqueue_not_enabled` when there is none). An API base and operator token
+  alone never imply the enqueue: it creates a real review and model usage.
 - `--c3-synthetic-escalation`: opt in to C3. Without it C3 is `blocked` with
   `c3_synthetic_escalation_not_enabled`. When set, C3 switches the core DB singleton
   onto a temp `ARCHON_HOME` sqlite via `closeDatabase`/`resetDatabase` and refuses with

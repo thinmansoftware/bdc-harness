@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { runRepeatSendCanary } from './repeat-send-canary';
 
@@ -100,6 +100,84 @@ describe('C2 repeat-send canary', () => {
     });
     expect(result.verdict).toBe('passed');
     expect(result.reasonCodes).toEqual([]);
+  });
+
+  test('observe mode (no --c2-live-enqueue): never POSTs, blocked when nothing is queued', async () => {
+    const db = fixture();
+    const fetcher = mock(async () => new Response('{}', { status: 200 }));
+    const result = await runRepeatSendCanary({
+      db,
+      subjectKey: SUBJECT,
+      requestUrl: 'http://localhost:3090/api/overseer/pr-review/request',
+      operatorToken: 'operator-token',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 806,
+      headSha: HEAD_B,
+      fetcher: fetcher as unknown as typeof fetch,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(result.verdict).toBe('blocked');
+    expect(result.reasonCodes).toEqual(['c2_live_enqueue_not_enabled']);
+  });
+
+  test('observe mode passes on an already-queued row that carries repeat_reason', async () => {
+    const db = fixture();
+    insert(db, {
+      id: 'queued-1',
+      headSha: HEAD_B,
+      status: 'queued',
+      repeatReason: 'operator_request:earlier',
+      createdAt: '2026-09-14T12:00:01.000Z',
+    });
+    const fetcher = mock(async () => new Response('{}', { status: 200 }));
+    const result = await runRepeatSendCanary({
+      db,
+      subjectKey: SUBJECT,
+      requestUrl: 'http://localhost:3090/api/overseer/pr-review/request',
+      operatorToken: 'operator-token',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 806,
+      headSha: HEAD_B,
+      fetcher: fetcher as unknown as typeof fetch,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(result.verdict).toBe('passed');
+    expect(result.evidenceRefs).toContain('mode=observe');
+  });
+
+  test('--c2-live-enqueue POSTs the request with the operator token', async () => {
+    const db = fixture();
+    const fetcher = mock(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { headSha: string };
+      insert(db, {
+        id: 'queued-live',
+        headSha: body.headSha,
+        status: 'queued',
+        repeatReason: 'operator_request:canary_repeat_send',
+        createdAt: '2026-09-14T12:00:02.000Z',
+      });
+      return new Response('{"ok":true}', { status: 200 });
+    });
+    const result = await runRepeatSendCanary({
+      db,
+      c2LiveEnqueue: true,
+      subjectKey: SUBJECT,
+      requestUrl: 'http://localhost:3090/api/overseer/pr-review/request',
+      operatorToken: 'operator-token',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 806,
+      headSha: HEAD_B,
+      fetcher: fetcher as unknown as typeof fetch,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const [url, init] = fetcher.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://localhost:3090/api/overseer/pr-review/request');
+    expect((init.headers as Record<string, string>)['x-archon-operator-token']).toBe('operator-token');
+    expect(result.verdict).toBe('passed');
+    expect(result.evidenceRefs).toContain('mode=enqueue');
   });
 
   test('RED: stripping repeat_reason refuses the enqueue', async () => {

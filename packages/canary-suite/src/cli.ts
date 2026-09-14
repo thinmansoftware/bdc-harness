@@ -175,6 +175,7 @@ export async function runCanaryCli(
       headSha,
       prNumber,
       ...(windowHours === undefined ? {} : { ingestLookbackMs: windowHours * 60 * 60 * 1000 }),
+      ...(hasFlag(args, '--c2-live-enqueue') ? { c2LiveEnqueue: true } : {}),
       ...(hasFlag(args, '--c3-synthetic-escalation') ? { c3SyntheticEscalation: true } : {}),
       ...(github ? { github } : {}),
     });
@@ -187,8 +188,9 @@ export async function runCanaryCli(
   if (level === null) {
     deps.stderr(
       'Usage: archon-canary <check|plan|taskmaster|pr-review> [options]\n' +
-        'pr-review: --db-path --output-root [--owner --repo --pr-number] [--window hours] [--c3-synthetic-escalation]\n' +
-        'blocked reasons: c6_github_client_unavailable, c3_synthetic_escalation_not_enabled, c3_refused_production_store'
+        'pr-review: --db-path --output-root [--owner --repo --pr-number] [--window hours] [--c2-live-enqueue] [--c3-synthetic-escalation]\n' +
+        'mutation opt-ins (never implied): --c2-live-enqueue POSTs a real review request; --c3-synthetic-escalation runs the escalation path on an isolated store\n' +
+        'blocked reasons: c6_github_client_unavailable, c2_live_enqueue_not_enabled, c3_synthetic_escalation_not_enabled, c3_refused_production_store'
     );
     return 3;
   }

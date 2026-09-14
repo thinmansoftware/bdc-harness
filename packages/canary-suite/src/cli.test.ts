@@ -292,6 +292,39 @@ test('pr-review omits github when App env is absent and reports C6 blocked', asy
   expect(deps.stderr).toHaveBeenCalledWith('blocked canaries: C6:c6_github_client_unavailable');
 });
 
+test('pr-review forwards --c2-live-enqueue and never implies it from an API base', async () => {
+  const deps = prReviewDeps();
+  expect(
+    await runCanaryCli(
+      [...prReviewArgs, '--api-base', 'http://localhost:3090'],
+      { ARCHON_OPERATOR_TOKEN: 'operator-token' },
+      deps
+    )
+  ).toBe(0);
+  const implied = (deps.prReviewRunner as ReturnType<typeof mock>).mock.calls[0]?.[0] as Record<
+    string,
+    unknown
+  >;
+  expect(implied.requestUrl).toBe('http://localhost:3090/api/overseer/pr-review/request');
+  expect(implied.c2LiveEnqueue).toBeUndefined();
+
+  const optIn = prReviewDeps();
+  expect(await runCanaryCli([...prReviewArgs, '--c2-live-enqueue'], {}, optIn)).toBe(0);
+  expect(optIn.prReviewRunner).toHaveBeenCalledWith({
+    dbPath: 'archon.db',
+    operatorToken: undefined,
+    statusUrl: undefined,
+    requestUrl: undefined,
+    queueUrl: undefined,
+    owner: undefined,
+    repo: undefined,
+    branch: undefined,
+    headSha: undefined,
+    prNumber: undefined,
+    c2LiveEnqueue: true,
+  });
+});
+
 test('pr-review forwards --c3-synthetic-escalation', async () => {
   const deps = prReviewDeps();
   expect(await runCanaryCli([...prReviewArgs, '--c3-synthetic-escalation'], {}, deps)).toBe(0);
