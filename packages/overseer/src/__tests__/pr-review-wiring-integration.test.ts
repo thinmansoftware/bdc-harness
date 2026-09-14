@@ -55,8 +55,12 @@ const {
   REVIEW_RECIPIENT,
   REVIEW_SENDER,
 } = await import('../pr-review-wiring.ts');
-const { AUTO_REREVIEW_REASON_PREFIX, MAX_REREVIEW_ATTEMPTS, ingestPullRequestEvent } =
-  await import('../pr-review-ingest.ts');
+const {
+  AUTO_REREVIEW_REASON_PREFIX,
+  MAX_REREVIEW_ATTEMPTS,
+  buildSupersedeReason,
+  ingestPullRequestEvent,
+} = await import('../pr-review-ingest.ts');
 const { createHmac } = await import('crypto');
 // Imported dynamically, after mock.module above, so it binds the mocked
 // connection and therefore the per-test SqliteAdapter.
@@ -318,7 +322,7 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     expect(JSON.parse(rows.rows[0]?.body ?? '{}').headSha).toBe(secondHeadSha);
   });
 
-  test('an approved receipt round-trip does not authorize review of a newer head', async () => {
+  test('an approved receipt round-trip still reviews a newer head with a supersede reason', async () => {
     const config = {
       webhookSecret: 'integration-test-secret',
       reviewerIdentity: 'thinman-overseer[bot]',
@@ -404,14 +408,17 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       deps
     );
 
-    expect(second.disposition).toBe('blocked');
-    expect(second.reason).toBe('enqueue_failed:repeat_reason_required');
+    expect(second.disposition).toBe('queued');
     const rows = await db.query<{ repeat_reason: string | null }>(
       `SELECT repeat_reason FROM agent_dispatch_messages
        WHERE recipient = $1 AND body LIKE $2`,
       [REVIEW_RECIPIENT, `%${secondHeadSha}%`]
     );
-    expect(rows.rows).toHaveLength(0);
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]?.repeat_reason).toBe(
+      buildSupersedeReason(firstHeadSha, secondHeadSha, 'approved')
+    );
+    expect(rows.rows[0]?.repeat_reason?.startsWith(AUTO_REREVIEW_REASON_PREFIX)).toBe(false);
   });
 
   /**

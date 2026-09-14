@@ -28,6 +28,9 @@
  * the route, submitting a live review, and merging remain separately gated.
  */
 import { checkGitHubWebhookSignature } from '@archon/adapters/forge/github/webhook-signature';
+import { createLogger } from '@archon/paths';
+
+const log = createLogger('overseer/pr-review-ingest');
 
 /** pull_request actions that warrant a fresh independent review. */
 export const REVIEWABLE_PR_ACTIONS = [
@@ -331,6 +334,23 @@ export function buildRereviewReason(
 }
 
 /**
+ * Prefix for a fresh exact-head review after a standing verdict that is NOT
+ * `changes_requested`. Dispatch requires a repeat_reason on any later send
+ * for the same PR subject; this prefix satisfies that transport rule without
+ * consuming the automatic re-review budget (`isAutoRereviewReason` is false).
+ */
+export const SUPERSEDE_REASON_PREFIX = 'supersede:';
+
+export function buildSupersedeReason(
+  priorHeadSha: string,
+  newHeadSha: string,
+  verdict: PriorReviewWork['verdict']
+): string {
+  const standing = verdict ?? 'none';
+  return `${SUPERSEDE_REASON_PREFIX}${priorHeadSha}->${newHeadSha} after ${standing}`;
+}
+
+/**
  * Selects the prior review whose verdict authorizes (or refuses) an automatic
  * re-review of `headSha`.
  *
@@ -357,8 +377,10 @@ export function buildRereviewReason(
  * Rows on the CURRENT head are still excluded: a verdict on this exact head is
  * a duplicate delivery, not a supersession, and must not authorize a repeat.
  * A verdict of `approved` or `other` is deliberately still selected rather
- * than skipped, so an approval continues to withhold authorization instead of
- * letting an older changes_requested row reach back past it.
+ * than skipped, so an older changes_requested row cannot reach past it
+ * into the cap-counted auto_rereview path. Ingest still stamps a
+ * supersede: repeat_reason for those standing verdicts so Dispatch
+ * accepts a fresh exact-head review.
  */
 export function findAuthorizingPriorReview(
   prior: PriorReviewWork[],
@@ -762,6 +784,23 @@ export async function ingestPullRequestEvent(
       priorAtDifferentHead.headSha,
       headSha
     );
+  } else {
+    // Any TERMINAL prior row on this PR makes Dispatch require a repeat_reason
+    // (repeat_reason_required); without one the enqueue is refused and the
+    // new head is never reviewed (#836). The auto prefix is reserved for
+    // changes_requested so this path does not burn the cap. A push after
+    // approved/other is a fresh exact-head review: the prior approval is
+    // stale and the merge manager requires an exact-head match. A prior row
+    // that is merely queued or was cancelled before a verdict never triggered
+    // the transport rule, so it gets no reason (operator dedupe stays exact).
+    const standing =
+      priorAtDifferentHead ??
+      prior.find(
+        work => work.headSha !== headSha && (work.status === 'done' || work.status === 'failed')
+      );
+    if (standing) {
+      repeatReason = buildSupersedeReason(standing.headSha, headSha, standing.verdict);
+    }
   }
 
   // Queue durable work bound to this EXACT head.
@@ -813,6 +852,10 @@ export async function ingestPullRequestEvent(
       headSha,
       ...(invalidatedMessageIds.length > 0 ? { invalidatedMessageIds } : {}),
     };
+    log.warn(
+      { owner, repo, prNumber, headSha, reason: result.reason },
+      'overseer.pr_review_enqueue_failed'
+    );
     await safeReceipt(deps, {
       correlationId,
       deliveryId,

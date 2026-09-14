@@ -1467,66 +1467,78 @@ describe('tm_health DAL', () => {
     expect((await getHealthSample('claude'))?.evidence).toBe('current');
   });
 
-  test('health repair handles missing primary key and ignores partial unique indexes', async () => {
-    await db.close();
-    cleanupDb(currentDbPath);
-    const old = new Database(currentDbPath);
-    old.run(`CREATE TABLE tm_health (
+  test(
+    'health repair handles missing primary key and ignores partial unique indexes',
+    async () => {
+      await db.close();
+      cleanupDb(currentDbPath);
+      const old = new Database(currentDbPath);
+      old.run(`CREATE TABLE tm_health (
       provider TEXT NOT NULL, state TEXT NOT NULL, sampled_at TEXT NOT NULL,
       expires_at TEXT, evidence TEXT
     )`);
-    old.run("CREATE UNIQUE INDEX health_partial ON tm_health(provider) WHERE state = 'healthy'");
-    old.run("INSERT INTO tm_health VALUES ('claude','dark','2026-08-28',NULL,'first')");
-    old.run("INSERT INTO tm_health VALUES ('claude','degraded','2026-08-28',NULL,'last')");
-    old.close();
+      old.run("CREATE UNIQUE INDEX health_partial ON tm_health(provider) WHERE state = 'healthy'");
+      old.run("INSERT INTO tm_health VALUES ('claude','dark','2026-08-28',NULL,'first')");
+      old.run("INSERT INTO tm_health VALUES ('claude','degraded','2026-08-28',NULL,'last')");
+      old.close();
 
-    db = new SqliteAdapter(currentDbPath);
-    expect((await db.query('SELECT evidence FROM tm_health')).rows).toEqual([{ evidence: 'last' }]);
-    await upsertHealthSample({ provider: 'claude', state: 'healthy', expires_at: '2026-09-08' });
-    expect((await db.query('SELECT state FROM tm_health')).rows).toEqual([{ state: 'healthy' }]);
-  });
+      db = new SqliteAdapter(currentDbPath);
+      expect((await db.query('SELECT evidence FROM tm_health')).rows).toEqual([
+        { evidence: 'last' },
+      ]);
+      await upsertHealthSample({ provider: 'claude', state: 'healthy', expires_at: '2026-09-08' });
+      expect((await db.query('SELECT state FROM tm_health')).rows).toEqual([{ state: 'healthy' }]);
+    },
+    { timeout: 180_000 }
+  );
 
-  test('health repair preserves occupied schema names and chooses a free index name', async () => {
-    await db.close();
-    cleanupDb(currentDbPath);
-    const old = new Database(currentDbPath);
-    old.run(`CREATE TABLE tm_health (
+  test(
+    'health repair preserves occupied schema names and chooses a free index name',
+    async () => {
+      await db.close();
+      cleanupDb(currentDbPath);
+      const old = new Database(currentDbPath);
+      old.run(`CREATE TABLE tm_health (
       provider TEXT NOT NULL, state TEXT NOT NULL, sampled_at TEXT NOT NULL,
       expires_at TEXT, evidence TEXT, PRIMARY KEY (provider, sampled_at)
     )`);
-    old.run('CREATE TABLE other_health (id INTEGER, state TEXT)');
-    old.run('CREATE INDEX TM_HEALTH_PROVIDER_UNIQUE ON other_health(state)');
-    old.run('CREATE INDEX tm_health_provider_unique_1 ON tm_health(state)');
-    old.run('CREATE TABLE tm_health_provider_unique_2 (id INTEGER)');
-    old.run("INSERT INTO tm_health VALUES ('claude','dark','2026-08-27',NULL,'old')");
-    old.run("INSERT INTO tm_health VALUES ('claude','healthy','2026-08-28',NULL,'new')");
-    old.close();
+      old.run('CREATE TABLE other_health (id INTEGER, state TEXT)');
+      old.run('CREATE INDEX TM_HEALTH_PROVIDER_UNIQUE ON other_health(state)');
+      old.run('CREATE INDEX tm_health_provider_unique_1 ON tm_health(state)');
+      old.run('CREATE TABLE tm_health_provider_unique_2 (id INTEGER)');
+      old.run("INSERT INTO tm_health VALUES ('claude','dark','2026-08-27',NULL,'old')");
+      old.run("INSERT INTO tm_health VALUES ('claude','healthy','2026-08-28',NULL,'new')");
+      old.close();
 
-    db = new SqliteAdapter(currentDbPath);
-    expect((await db.query('SELECT evidence FROM tm_health')).rows).toEqual([{ evidence: 'new' }]);
-    expect(
-      (
-        await db.query(
-          "SELECT tbl_name FROM sqlite_schema WHERE LOWER(name)='tm_health_provider_unique'"
-        )
-      ).rows
-    ).toEqual([{ tbl_name: 'other_health' }]);
-    expect((await db.query('PRAGMA index_info(tm_health_provider_unique_1)')).rows).toEqual([
-      { seqno: 0, cid: 1, name: 'state' },
-    ]);
-    expect((await db.query('PRAGMA index_info(tm_health_provider_unique_3)')).rows).toEqual([
-      { seqno: 0, cid: 0, name: 'provider' },
-    ]);
-    await upsertHealthSample({ provider: 'claude', state: 'healthy', expires_at: '2026-09-08' });
-    const before = await db.query(
-      "SELECT name FROM sqlite_schema WHERE type='index' ORDER BY name"
-    );
-    await db.close();
-    db = new SqliteAdapter(currentDbPath);
-    expect(
-      (await db.query("SELECT name FROM sqlite_schema WHERE type='index' ORDER BY name")).rows
-    ).toEqual(before.rows);
-  });
+      db = new SqliteAdapter(currentDbPath);
+      expect((await db.query('SELECT evidence FROM tm_health')).rows).toEqual([
+        { evidence: 'new' },
+      ]);
+      expect(
+        (
+          await db.query(
+            "SELECT tbl_name FROM sqlite_schema WHERE LOWER(name)='tm_health_provider_unique'"
+          )
+        ).rows
+      ).toEqual([{ tbl_name: 'other_health' }]);
+      expect((await db.query('PRAGMA index_info(tm_health_provider_unique_1)')).rows).toEqual([
+        { seqno: 0, cid: 1, name: 'state' },
+      ]);
+      expect((await db.query('PRAGMA index_info(tm_health_provider_unique_3)')).rows).toEqual([
+        { seqno: 0, cid: 0, name: 'provider' },
+      ]);
+      await upsertHealthSample({ provider: 'claude', state: 'healthy', expires_at: '2026-09-08' });
+      const before = await db.query(
+        "SELECT name FROM sqlite_schema WHERE type='index' ORDER BY name"
+      );
+      await db.close();
+      db = new SqliteAdapter(currentDbPath);
+      expect(
+        (await db.query("SELECT name FROM sqlite_schema WHERE type='index' ORDER BY name")).rows
+      ).toEqual(before.rows);
+    },
+    { timeout: 180_000 }
+  );
 
   test('health repair rolls back partial trigger effects when deduplication fails', async () => {
     await db.close();

@@ -184,9 +184,9 @@ nodes:
       # happened. Mirrors the direct-assignment pattern that already works in
       # the bdc-harness-*.yaml lanes.
       CAS=$check-already-satisfied.output
-      if printf '%s\n' "$CAS" | grep -qE '^ALREADY_SATISFIED=true'; then
+      if [[ $'\n'"$CAS" == *$'\n'ALREADY_SATISFIED=true* ]]; then
         SATISFIED_EVIDENCE=$(printf '%s\n' "$CAS" | sed -n 's/^SATISFIED_EVIDENCE=//p' | head -1)
-        if printf '%s\n' "$CAS" | grep -qE '^SATISFIED_ON_BASE=true'; then
+        if [[ $'\n'"$CAS" == *$'\n'SATISFIED_ON_BASE=true* ]]; then
           ALREADY_VALUE=true PRECHECK_VERDICT=already-merged-on-base SATISFIED_ON_BASE=true SATISFIED_EVIDENCE="$SATISFIED_EVIDENCE" python3 - <<'PY'
       import json
       import os

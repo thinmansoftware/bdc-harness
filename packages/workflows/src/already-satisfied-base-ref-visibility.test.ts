@@ -354,4 +354,37 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       });
     });
   }
+
+  // SIGPIPE / pipefail flake (issue #837): eleven concurrent bash gates, five
+  // rounds. Skip-capable lanes must stay already-merged-on-base (45/45). Zero
+  // lanes keep the force-build contract (10/10 needs-build). No assertion retry.
+  it('base-present is stable across concurrent lane spawns (5 rounds x 11 lanes)', async () => {
+    const checkOutput = [
+      'ALREADY_SATISFIED=true',
+      'SATISFIED_ON_BASE=true',
+      'SATISFIED_EVIDENCE=deliverable merged on origin/dev by concurrent sibling run',
+    ].join('\n');
+    const forceBuild = (file: string): boolean =>
+      file === 'bdc-feature-development-zero.yaml' ||
+      file === 'bdc-feature-development-zero-open.yaml';
+    for (let round = 0; round < 5; round++) {
+      const results = await Promise.all(
+        JSON_GATE_FEATURE_LANES.map(async (file: string) => ({
+          file,
+          ...(await runGate(file, checkOutput)),
+        }))
+      );
+      for (const { file, stdout, exitCode } of results) {
+        expect(exitCode).toBe(0);
+        const doc: { ALREADY_SATISFIED: boolean; PRECHECK_VERDICT: string } = JSON.parse(stdout);
+        if (forceBuild(file)) {
+          expect(doc.ALREADY_SATISFIED).toBe(false);
+          expect(doc.PRECHECK_VERDICT).toBe('needs-build');
+        } else {
+          expect(doc.ALREADY_SATISFIED).toBe(true);
+          expect(doc.PRECHECK_VERDICT).toBe('already-merged-on-base');
+        }
+      }
+    }
+  });
 });
