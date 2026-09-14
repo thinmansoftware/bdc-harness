@@ -5,6 +5,7 @@ import {
   type MergeEvidenceAssemblyDeps,
 } from './merge-coordinator';
 import { judgeWithGrok } from './judge-second-opinion';
+import { isSpecOnlyChangeSet } from './reconcile';
 import {
   readWorktreeHeadShaWithGit,
   verifyMergeProvenance,
@@ -26,6 +27,10 @@ export const PRODUCTION_EFFECT_HOLD_REASON = 'production_effect_held_for_john' a
 export const MERGE_MANAGER_MODE_ENV = 'OVERSEER_MERGE_MANAGER_MODE' as const;
 export const MERGE_MANAGER_MUTATIONS_ENABLED_ENV = 'MERGE_MANAGER_MUTATIONS_ENABLED' as const;
 export const MERGE_MANAGER_ALLOWED_BASES_ENV = 'MERGE_MANAGER_ALLOWED_BASES' as const;
+export const MERGE_MANAGER_ALLOWED_REPOS_ENV = 'MERGE_MANAGER_ALLOWED_REPOS' as const;
+export const MERGE_MANAGER_REPO_BASES_ENV = 'MERGE_MANAGER_REPO_BASES' as const;
+export const MERGE_MANAGER_MAX_MERGES_PER_HOUR_ENV = 'MERGE_MANAGER_MAX_MERGES_PER_HOUR' as const;
+export const OVERSEER_MERGE_ACTIONS_ENABLED_ENV = 'OVERSEER_MERGE_ACTIONS_ENABLED' as const;
 export const MERGE_MANAGER_BASE_EFFECT_OVERRIDES_ENV =
   'MERGE_MANAGER_BASE_EFFECT_OVERRIDES' as const;
 export const MERGE_MANAGER_REVIEW_GATE_LOGIN_ENV = 'MERGE_MANAGER_REVIEW_GATE_LOGIN' as const;
@@ -63,7 +68,12 @@ export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps 
   readonly mode?: string;
   /** Explicit activation/configuration overrides for tests and dependency injection. */
   readonly mutationsEnabled?: boolean;
+  readonly mergeActionsEnabled?: boolean;
   readonly allowedBases?: readonly string[];
+  readonly allowedRepos?: readonly string[];
+  readonly repoBases?: ReadonlyMap<string, string>;
+  readonly maxMergesPerHour?: number;
+  readonly now?: () => number;
   /**
    * Per-repo base-branch effect declarations, normally parsed from
    * MERGE_MANAGER_BASE_EFFECT_OVERRIDES. Injected in tests. Distinct from allowedBases:
@@ -505,6 +515,34 @@ function envFlagEnabled(raw: string | undefined): boolean {
   return raw?.trim().toLowerCase() === 'true';
 }
 
+function capabilityFlagEnabled(raw: string | undefined): boolean {
+  return ['1', 'true', 'yes'].includes(raw ?? '');
+}
+
+function commaList(raw: string | undefined, fallback: string): readonly string[] {
+  return (raw ?? fallback)
+    .split(',')
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function repoKey(owner: string, repo: string): string {
+  return `${owner.trim().toLowerCase()}/${repo.trim().toLowerCase()}`;
+}
+
+function repoBasesFromEnv(raw: string | undefined): ReadonlyMap<string, string> {
+  const result = new Map<string, string>();
+  for (const entry of commaList(
+    raw,
+    'thinmansoftware/bdc-harness:dev,thinmansoftware/shopops:staging'
+  )) {
+    const colon = entry.lastIndexOf(':');
+    if (colon > 0 && colon < entry.length - 1)
+      result.set(entry.slice(0, colon), entry.slice(colon + 1));
+  }
+  return result;
+}
+
 function allowedBasesFromEnv(raw: string | undefined): readonly string[] {
   return (raw ?? 'dev,staging')
     .split(',')
@@ -519,6 +557,10 @@ async function mergePreconditionMiss(
   reviewGateLogin: string
 ): Promise<string | null> {
   const headSha = evidence.head_sha;
+  if (!evidence.record.prEvidence.exists || evidence.record.prEvidence.state !== 'open') {
+    return 'pull_request_not_open';
+  }
+  if (evidence.record.prEvidence.headSha !== headSha) return 'verdict_stale_head';
   const checks = evidence.required_checks;
   if (
     checks.length === 0 ||
@@ -556,6 +598,24 @@ async function mergePreconditionMiss(
     : 'review_gate_approval_missing_for_head';
 }
 
+function logMergeSkipped(
+  record: WatchedRunRecord,
+  reason: string,
+  fields: Record<string, unknown> = {}
+): void {
+  log.warn(
+    {
+      runId: record.runId,
+      woId: record.woId,
+      owner: record.owner,
+      repo: record.repo,
+      reason,
+      ...fields,
+    },
+    'merge-coordinator.merge_skipped'
+  );
+}
+
 /**
  * Option B from the approved WO plan: this manager deliberately does not call
  * the legacy merge-ready assessment path, because that path contains a narrow
@@ -584,6 +644,24 @@ export function createMergeManager(
     deps.mutationsEnabled ?? envFlagEnabled(process.env[MERGE_MANAGER_MUTATIONS_ENABLED_ENV]);
   const allowedBases =
     deps.allowedBases ?? allowedBasesFromEnv(process.env[MERGE_MANAGER_ALLOWED_BASES_ENV]);
+  const mergeActionsEnabled =
+    deps.mergeActionsEnabled ??
+    capabilityFlagEnabled(process.env[OVERSEER_MERGE_ACTIONS_ENABLED_ENV]);
+  const allowedRepos =
+    deps.allowedRepos ??
+    commaList(
+      process.env[MERGE_MANAGER_ALLOWED_REPOS_ENV],
+      'thinmansoftware/bdc-harness,thinmansoftware/shopops,thinmansoftware/lspro-react'
+    );
+  const repoBases = deps.repoBases ?? repoBasesFromEnv(process.env[MERGE_MANAGER_REPO_BASES_ENV]);
+  const maxMergesPerHour =
+    deps.maxMergesPerHour ??
+    Math.max(
+      0,
+      Number.parseInt(process.env[MERGE_MANAGER_MAX_MERGES_PER_HOUR_ENV] ?? '4', 10) || 0
+    );
+  const now = deps.now ?? Date.now;
+  const mergeTimestamps: number[] = [];
   const reviewGateLogin = (
     deps.reviewGateLogin ??
     process.env[MERGE_MANAGER_REVIEW_GATE_LOGIN_ENV] ??
@@ -591,6 +669,8 @@ export function createMergeManager(
   ).trim();
 
   return async (record: WatchedRunRecord): Promise<MergeManagerResult> => {
+    // Consumer for the judge pipeline's flag_merge_ready steward handoff. The verdict
+    // claim remains exactly-once; this function owns live validation and mutation.
     const assembled = await assembleEvidence(record);
     const { evidence, evidenceDigest } = assembled;
 
@@ -600,6 +680,7 @@ export function createMergeManager(
         { runId: record.runId, woId: record.woId, effect: 'production', mode },
         'merge_manager.production_effect_held_for_john'
       );
+      logMergeSkipped(record, PRODUCTION_EFFECT_HOLD_REASON);
       return {
         status: 'held',
         receipt: null,
@@ -648,6 +729,7 @@ export function createMergeManager(
         },
         'merge_manager.provenance_unverified'
       );
+      logMergeSkipped(record, `provenance_${provenance.reason}`);
       return {
         status: 'held',
         receipt: null,
@@ -669,6 +751,7 @@ export function createMergeManager(
     }
     if (receipt.disposition !== 'approve') {
       await recordManagerAction(deps, record, 'merge_denied', receipt.reason);
+      logMergeSkipped(record, receipt.reason);
       return { status: 'held', receipt, execution: null, reason: receipt.reason, mode };
     }
 
@@ -685,6 +768,7 @@ export function createMergeManager(
         'would_comment',
         JSON.stringify({ ...association, disposition: receipt.disposition })
       );
+      logMergeSkipped(record, 'hold_canary', association);
       await recordManagerAction(
         deps,
         record,
@@ -717,6 +801,7 @@ export function createMergeManager(
           'comment_channel_unavailable',
           JSON.stringify(association)
         );
+        logMergeSkipped(record, 'comment_channel_unavailable', association);
         return {
           status: 'held',
           receipt,
@@ -757,6 +842,7 @@ export function createMergeManager(
           JSON.stringify({ ...association, error: message, merge: 'hard_off' })
         );
       }
+      logMergeSkipped(record, 'comment_findings_merge_hard_off', association);
       return {
         status: 'held',
         receipt,
@@ -768,6 +854,8 @@ export function createMergeManager(
 
     // execute: both legacy mode and the mutation flag are explicit opt-ins.
     if (!mutationsEnabled) {
+      await recordManagerAction(deps, record, 'merge_denied', 'mutations_disabled');
+      logMergeSkipped(record, 'mutations_disabled', association);
       return {
         status: 'held',
         receipt,
@@ -775,6 +863,44 @@ export function createMergeManager(
         reason: 'mutations_disabled',
         mode,
       };
+    }
+
+    if (!mergeActionsEnabled) {
+      await recordManagerAction(deps, record, 'merge_denied', 'merge_actions_disabled');
+      logMergeSkipped(record, 'merge_actions_disabled', association);
+      return { status: 'held', receipt, execution: null, reason: 'merge_actions_disabled', mode };
+    }
+
+    const repository = repoKey(evidence.owner, evidence.repository);
+    if (!allowedRepos.includes(repository)) {
+      await recordManagerAction(deps, record, 'merge_denied', 'repository_not_allowed');
+      logMergeSkipped(record, 'repository_not_allowed', association);
+      return { status: 'held', receipt, execution: null, reason: 'repository_not_allowed', mode };
+    }
+    const configuredBase = repoBases.get(repository);
+    if (!configuredBase || configuredBase !== evidence.base_branch.trim().toLowerCase()) {
+      await recordManagerAction(deps, record, 'merge_denied', 'repo_base_branch_not_allowed');
+      logMergeSkipped(record, 'repo_base_branch_not_allowed', association);
+      return {
+        status: 'held',
+        receipt,
+        execution: null,
+        reason: 'repo_base_branch_not_allowed',
+        mode,
+      };
+    }
+    if (isSpecOnlyChangeSet(evidence.changed_files)) {
+      await recordManagerAction(deps, record, 'merge_denied', 'spec_only');
+      logMergeSkipped(record, 'spec_only', association);
+      return { status: 'held', receipt, execution: null, reason: 'spec_only', mode };
+    }
+
+    const cutoff = now() - 60 * 60 * 1000;
+    while (mergeTimestamps.length > 0 && mergeTimestamps[0]! <= cutoff) mergeTimestamps.shift();
+    if (mergeTimestamps.length >= maxMergesPerHour) {
+      await recordManagerAction(deps, record, 'merge_denied', 'rate_ceiling_exceeded');
+      logMergeSkipped(record, 'rate_ceiling_exceeded', association);
+      return { status: 'held', receipt, execution: null, reason: 'rate_ceiling_exceeded', mode };
     }
 
     const preconditionMiss = await mergePreconditionMiss(
@@ -790,6 +916,7 @@ export function createMergeManager(
         'merge_denied',
         JSON.stringify({ ...association, precondition_miss_reason: preconditionMiss })
       );
+      logMergeSkipped(record, preconditionMiss, association);
       return {
         status: 'held',
         receipt,
@@ -800,6 +927,7 @@ export function createMergeManager(
     }
 
     const execution = await execute(evidence);
+    if (execution.merged) mergeTimestamps.push(now());
     await recordManagerAction(
       deps,
       record,
@@ -813,6 +941,19 @@ export function createMergeManager(
         merged_sha: execution.merged ? (execution.sha ?? null) : null,
       })
     );
+    if (execution.merged) {
+      log.info(
+        {
+          ...association,
+          mutation_sent: true,
+          mergeSha: execution.sha ?? null,
+          timestamp: new Date(now()).toISOString(),
+        },
+        'merge-coordinator.merge_executed'
+      );
+    } else {
+      logMergeSkipped(record, execution.message ?? 'merge_failed', association);
+    }
     return { status: 'executed', receipt, execution };
   };
 }

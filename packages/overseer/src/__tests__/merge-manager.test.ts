@@ -114,6 +114,7 @@ describe('merge manager', () => {
     const manager = createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
+      mergeActionsEnabled: true,
       allowedBases: ['dev', 'staging'],
       reviewGateLogin: 'thinman-review-gate[bot]',
       listPullRequestReviews: async () => [
@@ -379,6 +380,7 @@ describe('merge manager', () => {
     const manager = createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
+      mergeActionsEnabled: true,
       allowedBases: ['dev', 'staging'],
       reviewGateLogin: 'thinman-review-gate[bot]',
       listPullRequestReviews: async () => [
@@ -409,7 +411,7 @@ describe('merge manager', () => {
     );
   });
 
-  test('a merge candidate from another repo is not denied for registry scope', async () => {
+  test('a merge candidate from another repo is denied by the execution allowlist', async () => {
     const otherRecord = {
       ...record,
       repo: 'bdc-public-site',
@@ -423,6 +425,7 @@ describe('merge manager', () => {
     const manager = createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
+      mergeActionsEnabled: true,
       allowedBases: ['dev', 'staging'],
       reviewGateLogin: 'thinman-review-gate[bot]',
       listPullRequestReviews: async () => [
@@ -447,12 +450,12 @@ describe('merge manager', () => {
 
     const result = await manager(otherRecord);
 
-    expect(result.status).toBe('executed');
-    expect(execute).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ status: 'held', reason: 'repository_not_allowed' });
+    expect(execute).not.toHaveBeenCalled();
     expect(insertOverseerAction).toHaveBeenCalledWith(
       expect.objectContaining({
-        action: 'merged',
-        result: expect.stringContaining('other_repo_merged'),
+        action: 'merge_denied',
+        result: 'repository_not_allowed',
       })
     );
   });
@@ -463,6 +466,11 @@ describe('merge manager', () => {
         assembled?: QualifiedMergeEvidence;
         reviews?: { login: string; state: string; commitId: string }[];
         mutationsEnabled?: boolean;
+        mergeActionsEnabled?: boolean;
+        allowedRepos?: readonly string[];
+        repoBases?: ReadonlyMap<string, string>;
+        maxMergesPerHour?: number;
+        now?: () => number;
       } = {}
     ) {
       const assembled = options.assembled ?? evidence({ resulting_deployment_effect: 'none' });
@@ -475,6 +483,11 @@ describe('merge manager', () => {
       const manager = createMergeManager({
         mode: 'execute',
         mutationsEnabled: options.mutationsEnabled ?? true,
+        mergeActionsEnabled: options.mergeActionsEnabled ?? true,
+        allowedRepos: options.allowedRepos,
+        repoBases: options.repoBases,
+        maxMergesPerHour: options.maxMergesPerHour,
+        now: options.now,
         allowedBases: ['dev', 'staging'],
         reviewGateLogin: 'thinman-review-gate[bot]',
         assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: '9'.repeat(64) }),
@@ -491,7 +504,7 @@ describe('merge manager', () => {
       return { manager, mergePullRequest, insertOverseerAction };
     }
 
-    test('merges once and truthfully journals mutation and merged SHA', async () => {
+    test('merge-coordinator.merge_executed: merges once and truthfully journals mutation and merged SHA', async () => {
       const { manager, mergePullRequest, insertOverseerAction } = activatedManager();
       const result = await manager(record);
 
@@ -545,7 +558,7 @@ describe('merge manager', () => {
       });
       const result = await manager(record);
 
-      expect(result).toMatchObject({ status: 'held', reason: 'base_branch_not_allowed' });
+      expect(result).toMatchObject({ status: 'held', reason: 'repo_base_branch_not_allowed' });
       expect(mergePullRequest).not.toHaveBeenCalled();
     });
 
@@ -560,6 +573,59 @@ describe('merge manager', () => {
       expect(insertOverseerAction).not.toHaveBeenCalledWith(
         expect.objectContaining({ action: 'merged' })
       );
+    });
+
+    test('OVERSEER_MERGE_ACTIONS_ENABLED gates execution independently', async () => {
+      const { manager, mergePullRequest } = activatedManager({ mergeActionsEnabled: false });
+      const result = await manager(record);
+      expect(result).toMatchObject({ status: 'held', reason: 'merge_actions_disabled' });
+      expect(mergePullRequest).not.toHaveBeenCalled();
+    });
+
+    test('merge-coordinator.merge_skipped: denies a spec-only change set', async () => {
+      const { manager, mergePullRequest } = activatedManager({
+        assembled: evidence({ changed_files: ['docs/work-orders/WO-ONLY.md'] }),
+      });
+      expect(await manager(record)).toMatchObject({ status: 'held', reason: 'spec_only' });
+      expect(mergePullRequest).not.toHaveBeenCalled();
+    });
+
+    test('denies a stale verdict head', async () => {
+      const { manager, mergePullRequest } = activatedManager({
+        assembled: evidence({
+          head_sha: '9'.repeat(40),
+          required_checks: [{ name: 'ci', conclusion: 'success', head_sha: '9'.repeat(40) }],
+        }),
+      });
+      expect(await manager(record)).toMatchObject({ status: 'held', reason: 'verdict_stale_head' });
+      expect(mergePullRequest).not.toHaveBeenCalled();
+    });
+
+    test('enforces the per-repository integration branch', async () => {
+      const { manager, mergePullRequest } = activatedManager({
+        assembled: evidence({ base_branch: 'staging' }),
+      });
+      expect(await manager(record)).toMatchObject({
+        status: 'held',
+        reason: 'repo_base_branch_not_allowed',
+      });
+      expect(mergePullRequest).not.toHaveBeenCalled();
+    });
+
+    test('limits successful merges within a sliding hour', async () => {
+      let timestamp = 1_000_000;
+      const { manager, mergePullRequest } = activatedManager({
+        maxMergesPerHour: 1,
+        now: () => timestamp,
+      });
+      expect((await manager(record)).status).toBe('executed');
+      expect(await manager(record)).toMatchObject({
+        status: 'held',
+        reason: 'rate_ceiling_exceeded',
+      });
+      timestamp += 60 * 60 * 1000 + 1;
+      expect((await manager(record)).status).toBe('executed');
+      expect(mergePullRequest).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -677,6 +743,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const manager = createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
+      mergeActionsEnabled: true,
       allowedBases: ['dev', 'staging'],
       reviewGateLogin: 'thinman-overseer[bot]',
       // Exact-head approval by the Review Gate identity -- still required.
@@ -719,6 +786,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const manager = createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
+      mergeActionsEnabled: true,
       allowedBases: ['dev', 'staging'],
       reviewGateLogin: 'thinman-overseer[bot]',
       listPullRequestReviews: async () => [
@@ -752,6 +820,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const manager = createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
+      mergeActionsEnabled: true,
       allowedBases: ['dev', 'staging'],
       reviewGateLogin: 'thinman-overseer[bot]',
       listPullRequestReviews: async () => [
@@ -769,7 +838,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const result = await manager(discoveredRecord);
 
     expect(result.status).toBe('held');
-    expect(result.reason).toBe('base_branch_not_allowed');
+    expect(result.reason).toBe('repo_base_branch_not_allowed');
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -782,6 +851,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const manager = createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
+      mergeActionsEnabled: true,
       allowedBases: ['dev', 'staging'],
       reviewGateLogin: 'thinman-overseer[bot]',
       // Approved -- but on a SUPERSEDED commit.
@@ -815,6 +885,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const manager = createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
+      mergeActionsEnabled: true,
       allowedBases: ['dev', 'staging'],
       reviewGateLogin: 'thinman-overseer[bot]',
       listPullRequestReviews: async () => [
@@ -852,6 +923,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const manager = createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
+      mergeActionsEnabled: true,
       allowedBases: ['dev', 'staging'],
       reviewGateLogin: 'thinman-overseer[bot]',
       listPullRequestReviews: async () => [
@@ -901,7 +973,7 @@ describe('per-repo base effect overrides', () => {
         base_branch: 'main',
         head_sha: RUN_HEAD_SHA,
         base_sha: '1'.repeat(40),
-        changed_files: 'docs/work-orders/WO-EXAMPLE-01.md',
+        changed_files: 'packages/overseer/src/merge-manager.ts',
         ...metadata,
       },
     };
@@ -919,9 +991,12 @@ describe('per-repo base effect overrides', () => {
     return createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
+      mergeActionsEnabled: true,
       // `main` is allowed as a BASE here so the test isolates the EFFECT classification;
       // allowed-bases semantics are deliberately untouched by this change.
       allowedBases: ['dev', 'staging', 'main'],
+      allowedRepos: [`${target.owner}/${target.repo}`],
+      repoBases: new Map([[`${target.owner}/${target.repo}`, 'main']]),
       baseEffectOverrides: overrides,
       reviewGateLogin: 'thinman-review-gate[bot]',
       listPullRequestReviews: async () => [
