@@ -1374,7 +1374,12 @@ nodes:
         echo "CHECKPOINT_DIFF_REPAIR=noop"
         exit 0
       fi
-      git add -A 2>/dev/null || true
+      DIRTY=$(git status --porcelain 2>/dev/null || true)
+      printf '%s\n' "$DIRTY" | while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        path=$(printf '%s\n' "$entry" | cut -c4-)
+        git add -- "$path" 2>/dev/null || true
+      done
       if git diff --cached --quiet 2>/dev/null; then
         echo "CHECKPOINT_DIFF_REPAIR=noop"
         exit 0
@@ -1755,7 +1760,11 @@ nodes:
       if [ "$CHANGED" -eq 0 ] && [ "$AHEAD" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
       # Branch suffix uses $$ (Rule 2: never $WORKFLOW_ID under set -u).
       BR="salvage/opus-repair-$(basename "$WT")-$$"
-      git add -A 2>/dev/null || true
+      printf '%s\n' "$STATUS_RAW" | while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        path=$(printf '%s\n' "$entry" | cut -c4-)
+        git add -- "$path" 2>/dev/null || true
+      done
       if ! git diff --cached --quiet 2>/dev/null; then
         if [ "$CHANGED" -gt 0 ]; then
           COMMIT_MSG="salvage(uncommitted): ${CHANGED} files"

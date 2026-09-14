@@ -84,6 +84,8 @@ describe('diff-repair checkpoint and salvage', () => {
       expect(node('checkpoint-diff-repair')?.depends_on).toContain('diff-repair');
       expect(node('capture-diff-final')?.depends_on).toContain('checkpoint-diff-repair');
       expect(node('noninteractive-salvage')?.bash).toContain('SALVAGE=preserved_uncommitted:');
+      expect(node('checkpoint-diff-repair')?.bash).not.toContain('git add -A');
+      expect(node('noninteractive-salvage')?.bash).not.toContain('git add -A');
     }
   });
   it('commits two modified files before final diff capture', () => {
