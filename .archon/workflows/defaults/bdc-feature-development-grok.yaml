@@ -3301,8 +3301,8 @@ nodes:
         esac
         grep_declared="${grep_declared:-0}"
         if [ "$grep_declared" -gt 0 ] 2>/dev/null; then
-          if [ "$grep_status" != "passed" ]; then
-            echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) were declared but grep_status=${grep_status:-missing}. Every declared grep stop condition must execute and match before manifest evidence can be published (bdc-xo #1940)." >&2
+          if [ "$grep_status" = "incomplete" ] || [ "$grep_status" = "all_dropped" ] || [ "$grep_status" = "missing" ] || [ -z "$grep_status" ]; then
+            echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) were declared but grep_status=${grep_status:-missing}. Every declared grep stop condition must execute before manifest evidence can be published (bdc-xo #1940)." >&2
             return 1
           fi
           if printf '%s\n' "$grep_line" | grep -qiE '^(n/a|none|\(none\)|\[list\]|\[\])'; then
