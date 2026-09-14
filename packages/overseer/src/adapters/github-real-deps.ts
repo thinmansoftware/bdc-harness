@@ -653,7 +653,7 @@ export function createRealMergeOctokitClient(): RealGitHubOctokitLike {
   return createRealOctokitClient();
 }
 
-function summarizeChecks(
+export function summarizeChecks(
   checkRuns: { status: string; conclusion: string | null }[]
 ): PullRequestCheckSummary {
   let passed = 0;

@@ -17,11 +17,15 @@ import { createHmac } from 'crypto';
 import {
   MAX_REREVIEW_ATTEMPTS,
   MAX_REREVIEW_ATTEMPTS_ENV,
+  MAX_TOTAL_REREVIEWS,
+  MAX_TOTAL_REREVIEWS_ENV,
   buildRereviewCapComment,
   countConsecutiveAutoRereviews,
+  countTotalAutoRereviews,
   ingestPullRequestEvent,
   rereviewCapCommentMarker,
   resolveMaxRereviewAttempts,
+  resolveMaxTotalRereviews,
   type IngestDeps,
   type PriorReviewWork,
 } from '../pr-review-ingest.ts';
@@ -37,9 +41,12 @@ const NEW_HEAD = 'a'.repeat(40);
 const OLD_HEAD = 'b'.repeat(40);
 
 const originalEnvValue = process.env[MAX_REREVIEW_ATTEMPTS_ENV];
+const originalTotalEnvValue = process.env[MAX_TOTAL_REREVIEWS_ENV];
 afterEach(() => {
   if (originalEnvValue === undefined) delete process.env[MAX_REREVIEW_ATTEMPTS_ENV];
   else process.env[MAX_REREVIEW_ATTEMPTS_ENV] = originalEnvValue;
+  if (originalTotalEnvValue === undefined) delete process.env[MAX_TOTAL_REREVIEWS_ENV];
+  else process.env[MAX_TOTAL_REREVIEWS_ENV] = originalTotalEnvValue;
 });
 
 function request(): Parameters<typeof ingestPullRequestEvent>[0] {
@@ -72,6 +79,7 @@ function work(overrides: Partial<PriorReviewWork> = {}): PriorReviewWork {
     verdict: 'changes_requested',
     verdictId: 'verdict-1',
     isAutoRereview: false,
+    headCiGreen: false,
     ...overrides,
   };
 }
@@ -95,7 +103,12 @@ interface Captured {
 
 function deps(
   prior: PriorReviewWork[],
-  options: { existingMarkers?: Set<string>; commentSeam?: boolean } = {}
+  options: {
+    existingMarkers?: Set<string>;
+    commentSeam?: boolean;
+    ci?: boolean | Error;
+    onCiCheck?: () => void;
+  } = {}
 ): { value: IngestDeps; captured: Captured } {
   const captured: Captured = { comments: [], receipts: [], enqueued: [] };
   const existingMarkers = options.existingMarkers ?? new Set<string>();
@@ -110,6 +123,11 @@ function deps(
     },
     recordReceipt: async input => {
       captured.receipts.push(input);
+    },
+    isHeadCiGreen: async () => {
+      options.onCiCheck?.();
+      if (options.ci instanceof Error) throw options.ci;
+      return options.ci === true;
     },
   };
   if (options.commentSeam !== false) {
@@ -170,6 +188,87 @@ describe('#797 -- the cap is configurable', () => {
     expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
       'rereview_attempts_exhausted'
     );
+  });
+});
+
+describe('#797 item 4 -- green fixed pushes re-arm within a lifetime ceiling', () => {
+  test('initial reviews do not fetch CI evidence used only by automatic progress tracking', async () => {
+    let ciChecks = 0;
+    const fake = deps([], { onCiCheck: () => (ciChecks += 1) });
+    expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
+    expect(ciChecks).toBe(0);
+    expect(fake.captured.enqueued[0]?.headCiGreen).toBe(false);
+  });
+
+  test('four productive automatic rounds allow a fifth review (fuelglass regression)', async () => {
+    const prior = [
+      ...autoAttempts(4).map((row, index) => ({
+        ...row,
+        headSha: index === 0 ? NEW_HEAD : row.headSha,
+        headCiGreen: true,
+      })),
+      work({ messageId: 'initial' }),
+    ];
+    const fake = deps(prior, { ci: true });
+    // The newest attempt is on the incoming head, so only the persisted green
+    // state on that row can prove progress to the preceding attempt.
+    expect(countConsecutiveAutoRereviews(prior, NEW_HEAD, true)).toBe(1);
+    expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
+    expect(fake.captured.enqueued[0]?.headCiGreen).toBe(true);
+  });
+
+  test('same-head thrashing is blocked by the consecutive cap', async () => {
+    const prior = [
+      ...autoAttempts(3).map(row => ({ ...row, headSha: NEW_HEAD })),
+      work({ messageId: 'initial', headSha: OLD_HEAD }),
+    ];
+    expect((await ingestPullRequestEvent(request(), deps(prior, { ci: true }).value)).reason).toBe(
+      'rereview_attempts_exhausted'
+    );
+  });
+
+  test('moved heads with red CI do not re-arm', async () => {
+    expect(
+      (await ingestPullRequestEvent(request(), deps(autoAttempts(3), { ci: false }).value)).reason
+    ).toBe('rereview_attempts_exhausted');
+  });
+
+  test('unavailable CI fails closed', async () => {
+    expect(
+      (
+        await ingestPullRequestEvent(
+          request(),
+          deps(autoAttempts(3), { ci: new Error('outage') }).value
+        )
+      ).reason
+    ).toBe('rereview_attempts_exhausted');
+  });
+
+  test('ten productive rounds bind at the lifetime hard ceiling', async () => {
+    const prior = autoAttempts(MAX_TOTAL_REREVIEWS);
+    const fake = deps(prior, { ci: true });
+    const result = await ingestPullRequestEvent(request(), fake.value);
+    expect(result.reason).toBe('rereview_total_ceiling_reached');
+    expect(fake.captured.comments[0]?.body).toContain('lifetime hard ceiling');
+    expect(fake.captured.comments[0]?.body).toContain('total attempts: 10');
+    expect(fake.captured.receipts[0]?.reason).toContain('consecutive=0:total=10');
+  });
+
+  test('total resolver mirrors floor and fallback semantics', () => {
+    expect(resolveMaxTotalRereviews({})).toBe(10);
+    expect(resolveMaxTotalRereviews({ [MAX_TOTAL_REREVIEWS_ENV]: '12.9' })).toBe(12);
+    expect(resolveMaxTotalRereviews({ [MAX_TOTAL_REREVIEWS_ENV]: '0' })).toBe(10);
+  });
+
+  test('newest-first ordering is required when persisted progress resets the count', () => {
+    const newestFirst = autoAttempts(3).map((row, index) => ({
+      ...row,
+      headSha: index === 0 ? NEW_HEAD : row.headSha,
+      headCiGreen: index === 0,
+    }));
+    expect(countConsecutiveAutoRereviews(newestFirst, NEW_HEAD, false)).toBe(1);
+    expect(countConsecutiveAutoRereviews([...newestFirst].reverse(), NEW_HEAD, false)).toBe(3);
+    expect(countTotalAutoRereviews(newestFirst)).toBe(3);
   });
 });
 
@@ -288,6 +387,62 @@ describe('#797 -- the count is CONSECUTIVE, so a hand nudge resets it', () => {
     expect(countConsecutiveAutoRereviews(prior)).toBe(3);
   });
 
+  test('an unjudged row between two auto re-reviews does not reset the count', () => {
+    // Review finding (Overseer, PR #809): successor was prior[index - 1] even
+    // when that row never judged. A queued green row between two autos looked
+    // like a fixed push and collapsed the streak from 2 to 1.
+    const prior = [
+      work({ messageId: 'newer-auto', isAutoRereview: true, headSha: 'c'.repeat(40) }),
+      work({
+        messageId: 'unjudged-between',
+        isAutoRereview: true,
+        headSha: 'b'.repeat(40),
+        status: 'queued',
+        verdict: null,
+        verdictId: null,
+        headCiGreen: true,
+      }),
+      work({ messageId: 'older-auto', isAutoRereview: true, headSha: 'a'.repeat(40) }),
+    ];
+    expect(countConsecutiveAutoRereviews(prior)).toBe(2);
+  });
+
+  test('a cancelled row between two auto re-reviews does not reset the count', () => {
+    const prior = [
+      work({ messageId: 'newer-auto', isAutoRereview: true, headSha: 'c'.repeat(40) }),
+      work({
+        messageId: 'cancelled-between',
+        isAutoRereview: true,
+        headSha: 'b'.repeat(40),
+        status: 'cancelled',
+        verdict: null,
+        verdictId: null,
+        headCiGreen: true,
+      }),
+      work({ messageId: 'older-auto', isAutoRereview: true, headSha: 'a'.repeat(40) }),
+    ];
+    expect(countConsecutiveAutoRereviews(prior)).toBe(2);
+  });
+
+  test('a judged green fixed-push successor still resets the consecutive count to 1', () => {
+    const prior = [
+      work({
+        messageId: 'newest-auto',
+        isAutoRereview: true,
+        headSha: NEW_HEAD,
+        headCiGreen: true,
+      }),
+      work({
+        messageId: 'fixed-push-auto',
+        isAutoRereview: true,
+        headSha: 'c'.repeat(40),
+        headCiGreen: true,
+      }),
+      work({ messageId: 'older-auto', isAutoRereview: true, headSha: OLD_HEAD }),
+    ];
+    expect(countConsecutiveAutoRereviews(prior)).toBe(1);
+  });
+
   test('a PR with no auto history counts zero', () => {
     expect(countConsecutiveAutoRereviews([])).toBe(0);
     expect(countConsecutiveAutoRereviews([work()])).toBe(0);
@@ -322,7 +477,7 @@ describe('#797 -- the block is VISIBLE on the pull request', () => {
     // what keeps the thread from filling with identical notices.
     expect(second.captured.comments).toHaveLength(0);
     expect(second.captured.receipts[0]?.reason).toBe(
-      'rereview_attempts_exhausted:comment_existing_or_failed'
+      'rereview_attempts_exhausted:consecutive=3:total=3:comment_existing_or_failed'
     );
   });
 
@@ -336,7 +491,9 @@ describe('#797 -- the block is VISIBLE on the pull request', () => {
   test('the receipt records whether the comment was actually posted', async () => {
     const fake = deps([...autoAttempts(MAX_REREVIEW_ATTEMPTS), work()]);
     await ingestPullRequestEvent(request(), fake.value);
-    expect(fake.captured.receipts[0]?.reason).toBe('rereview_attempts_exhausted:comment_posted');
+    expect(fake.captured.receipts[0]?.reason).toBe(
+      'rereview_attempts_exhausted:consecutive=3:total=3:comment_posted'
+    );
   });
 
   test('a comment failure never changes the block or throws the ingest open', async () => {
@@ -358,7 +515,9 @@ describe('#797 -- the block is VISIBLE on the pull request', () => {
     const result = await ingestPullRequestEvent(request(), fake.value);
 
     expect(result.reason).toBe('rereview_attempts_exhausted');
-    expect(fake.captured.receipts[0]?.reason).toBe('rereview_attempts_exhausted');
+    expect(fake.captured.receipts[0]?.reason).toBe(
+      'rereview_attempts_exhausted:consecutive=3:total=3'
+    );
   });
 
   test('no comment is posted when the budget is not exhausted', async () => {
