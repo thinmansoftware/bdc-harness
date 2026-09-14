@@ -2327,9 +2327,21 @@ nodes:
       fi
       REPAIR_TARGET_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       REPAIR_TARGET_PR=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_pr:[[:space:]]*#\{0,1\}\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
-      if [ -n "$REPAIR_TARGET_BRANCH" ]; then
-        if [ -z "$REPAIR_TARGET_PR" ]; then
-          echo "ERROR: repair_target_branch present without repair_target_pr" >&2
+      REPAIR_TARGET_PR_PRESENT=false
+      REPAIR_TARGET_BRANCH_PRESENT=false
+      REPAIR_TARGET_AUTHORIZED_PRESENT=false
+      if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q '^[[:space:]]*repair_target_pr:'; then
+        REPAIR_TARGET_PR_PRESENT=true
+      fi
+      if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q '^[[:space:]]*repair_target_branch:'; then
+        REPAIR_TARGET_BRANCH_PRESENT=true
+      fi
+      if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q '^[[:space:]]*repair_target_authorized_by_spec:'; then
+        REPAIR_TARGET_AUTHORIZED_PRESENT=true
+      fi
+      if [ "$REPAIR_TARGET_PR_PRESENT" = true ] || [ "$REPAIR_TARGET_BRANCH_PRESENT" = true ] || [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" = true ]; then
+        if [ -z "$REPAIR_TARGET_PR" ] || [ -z "$REPAIR_TARGET_BRANCH" ]; then
+          echo "ERROR: repair_target_malformed: both repair_target_pr and repair_target_branch are required before branch selection" >&2
           exit 1
         fi
         if ! git check-ref-format --branch "$REPAIR_TARGET_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
@@ -2341,18 +2353,28 @@ nodes:
           echo "ERROR: invalid or missing repo for repair target verification" >&2
           exit 1
         fi
-        if ! REPAIR_TARGET_LIVE=$(gh pr view "$REPAIR_TARGET_PR" --repo "$REPO_FOR_CHECK" --json state,headRefName --jq '.state + "\t" + .headRefName' 2>/dev/null); then
+        REPO_OWNER=${REPO_FOR_CHECK%%/*}
+        REPO_NAME=${REPO_FOR_CHECK#*/}
+        if ! REPAIR_TARGET_LIVE=$(gh pr view "$REPAIR_TARGET_PR" --repo "$REPO_FOR_CHECK" --json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository --jq '.state + "\t" + .headRefName + "\t" + (.isCrossRepository|tostring) + "\t" + (.headRepositoryOwner.login // "") + "\t" + (.headRepository.name // "")' 2>/dev/null); then
           echo "ERROR: declared repair target #${REPAIR_TARGET_PR} not found on ${REPO_FOR_CHECK}" >&2
           exit 1
         fi
-        REPAIR_TARGET_STATE=${REPAIR_TARGET_LIVE%%$'\t'*}
-        REPAIR_TARGET_LIVE_BRANCH=${REPAIR_TARGET_LIVE#*$'\t'}
+        REPAIR_TARGET_STATE=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f1)
+        REPAIR_TARGET_LIVE_BRANCH=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f2)
+        REPAIR_TARGET_CROSS=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f3)
+        REPAIR_TARGET_HEAD_OWNER=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f4)
+        REPAIR_TARGET_HEAD_REPO=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f5)
         if [ "$REPAIR_TARGET_STATE" != "OPEN" ]; then
           echo "ERROR: declared repair target #${REPAIR_TARGET_PR} is ${REPAIR_TARGET_STATE}" >&2
           exit 1
         fi
         if [ "$REPAIR_TARGET_LIVE_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
           echo "ERROR: declared repair target #${REPAIR_TARGET_PR} head branch mismatch: expected ${REPAIR_TARGET_BRANCH}, got ${REPAIR_TARGET_LIVE_BRANCH}" >&2
+          exit 1
+        fi
+        if [ "$REPAIR_TARGET_CROSS" != "false" ] || [ "$REPAIR_TARGET_HEAD_OWNER" != "$REPO_OWNER" ] || [ "$REPAIR_TARGET_HEAD_REPO" != "$REPO_NAME" ]; then
+          echo "repair_target_rejected:fork"
+          echo "ERROR: repair_target_rejected:fork declared repair target #${REPAIR_TARGET_PR} head is ${REPAIR_TARGET_HEAD_OWNER}/${REPAIR_TARGET_HEAD_REPO} (cross=${REPAIR_TARGET_CROSS}); refusing to push a fork" >&2
           exit 1
         fi
         UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"

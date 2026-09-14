@@ -636,11 +636,46 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).toContain('repair_target_branch: <verified-headRefName-from-gh>');
       expect(yaml).toContain('repair_target_pr: #N');
       expect(yaml).toContain('gh pr view "$REPAIR_TARGET_PR"');
+      expect(yaml).toContain(
+        '--json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository'
+      );
+      expect(yaml).toContain('repair_target_rejected:fork');
+      expect(yaml).toContain('repair_target_malformed');
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
     }
   });
 
-  function fakeGhPath(state: string, branch: string): string {
+  it('verifies repair-target head repository identity in every feature-development lane', () => {
+    const lanes = [
+      'bdc-feature-development.yaml',
+      'bdc-feature-development-codex.yaml',
+      'bdc-feature-development-codex-only.yaml',
+      'bdc-feature-development-fable.yaml',
+      'bdc-feature-development-fusion-cx-kimi.yaml',
+      'bdc-feature-development-fusion-cx-qwen.yaml',
+      'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-kimi-k3.yaml',
+      'bdc-feature-development-zero-claude.yaml',
+      'bdc-feature-development-zero-open.yaml',
+      'bdc-feature-development-zero.yaml',
+    ].map(file => join(DEFAULTS_DIR, file));
+    expect(lanes).toHaveLength(11);
+    for (const lane of lanes) {
+      const yaml = readFileSync(lane, 'utf8');
+      expect(yaml).toContain(
+        '--json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository'
+      );
+      expect(yaml).toContain('repair_target_rejected:fork');
+      expect(yaml).toContain('repair_target_malformed');
+      expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
+    }
+  });
+
+  function fakeGhPath(
+    state: string,
+    branch: string,
+    opts?: { cross?: boolean; owner?: string; repo?: string }
+  ): string {
     const binDir = mkdtempSync(join(tmpdir(), 'bdc-fake-gh-'));
     const ghPath = join(binDir, 'gh');
     writeFileSync(
@@ -652,12 +687,16 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 [ -n "$filter" ] || exit 2
-printf '{"state":"%s","headRefName":"%s"}\\n' "$FAKE_GH_STATE" "$FAKE_GH_BRANCH" | jq -r "$filter"
+printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryOwner":{"login":"%s"},"headRepository":{"name":"%s"}}\\n' \\
+  "$FAKE_GH_STATE" "$FAKE_GH_BRANCH" "\${FAKE_GH_CROSS:-false}" "\${FAKE_GH_OWNER:-thinmansoftware}" "\${FAKE_GH_REPO:-bdc-harness}" | jq -r "$filter"
 `
     );
     chmodSync(ghPath, 0o755);
     process.env.FAKE_GH_STATE = state;
     process.env.FAKE_GH_BRANCH = branch;
+    process.env.FAKE_GH_CROSS = opts?.cross ? 'true' : 'false';
+    process.env.FAKE_GH_OWNER = opts?.owner ?? 'thinmansoftware';
+    process.env.FAKE_GH_REPO = opts?.repo ?? 'bdc-harness';
     return `${binDir}:${process.env.PATH ?? ''}`;
   }
 
@@ -696,6 +735,54 @@ printf '{"state":"%s","headRefName":"%s"}\\n' "$FAKE_GH_STATE" "$FAKE_GH_BRANCH"
     });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('declared repair target #826 head branch mismatch');
+  });
+
+  it('fails closed when the repair-target PR is cross-repository', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: decideOutput(branch),
+      PATH: fakeGhPath('OPEN', branch, { cross: true, owner: 'someone-else', repo: 'bdc-harness' }),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('repair_target_rejected:fork');
+    expect(result.stdout).toContain('repair_target_rejected:fork');
+    expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
+  });
+
+  it('fails closed when repair_target_pr is present without repair_target_branch', () => {
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      BRANCH: 'feat/should-not-mint',
+      DECIDE_OUTPUT: ['repair_target_pr: #826', 'repo: thinmansoftware/bdc-harness'].join('\n'),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('repair_target_malformed');
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=feat/should-not-mint-thread-test');
+  });
+
+  it('fails closed when repair_target_branch is present without repair_target_pr', () => {
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      BRANCH: 'feat/should-not-mint',
+      DECIDE_OUTPUT: [
+        'repair_target_branch: feat/wo-repair-target-01',
+        'repo: thinmansoftware/bdc-harness',
+      ].join('\n'),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('repair_target_malformed');
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=feat/should-not-mint-thread-test');
+  });
+
+  it('fails closed when repair_target_authorized_by_spec is set without both fields', () => {
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      BRANCH: 'feat/should-not-mint',
+      DECIDE_OUTPUT: [
+        'repair_target_authorized_by_spec: #826',
+        'repo: thinmansoftware/bdc-harness',
+      ].join('\n'),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('repair_target_malformed');
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=feat/should-not-mint-thread-test');
   });
 });
 
