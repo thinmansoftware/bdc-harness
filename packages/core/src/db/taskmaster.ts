@@ -397,10 +397,10 @@ export type RegisterExpectationResult =
  * the tm_control singleton under Postgres, which orders the counts. See the
  * comment at the insert for why that instrument and not SERIALIZABLE.
  *
- * A retry under an EXISTING key is admitted by the same statement even at the
- * cap. The predicate explicitly admits an existing registration_key so it can
- * reach ON CONFLICT; a genuinely new key must still have cap headroom. This is
- * deliberately not decided by a pre-insert probe, which would race another
+ * A retry under an EXISTING key is admitted even at the cap. If the INSERT cap
+ * predicate rejects it, the lookup after the INSERT returns the stored row;
+ * only a genuinely new key has neither an inserted nor an existing row. This
+ * is deliberately not decided by a pre-insert probe, which would race another
  * request creating the same key.
  */
 export async function registerExpectationReportingCreation(
@@ -432,8 +432,7 @@ export async function registerExpectationReportingCreation(
   if (applyCap) {
     params.push(dayAgo, data.daily_cap);
     capClause =
-      ' WHERE EXISTS (SELECT 1 FROM tm_expectations WHERE registration_key = $2)' +
-      ' OR (SELECT COUNT(*) FROM tm_expectations' +
+      ' WHERE (SELECT COUNT(*) FROM tm_expectations' +
       " WHERE registration_key LIKE 'ext:%' AND created_at >= $12) < $13";
   }
   const insertSql = `INSERT INTO tm_expectations
@@ -465,7 +464,7 @@ export async function registerExpectationReportingCreation(
   //
   // UNCAPPED registrations (the loop's own) take no lock: they are bounded
   // elsewhere and must not queue behind the front door. Capped retries take the
-  // same serialized path as new keys so retry-vs-new is decided under the lock.
+  // same serialized path as new keys; the post-insert lookup decides retry-vs-new.
   const runInsert = async (
     query: <U>(sql: string, p?: unknown[]) => Promise<QueryResult<U>>
   ): Promise<string | undefined> => {

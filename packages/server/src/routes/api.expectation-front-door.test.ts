@@ -4,6 +4,10 @@ import { join } from 'path';
 import { evidenceSpecSchema, registerExpectationBodySchema } from './schemas/taskmaster.schemas';
 
 const apiSource = readFileSync(join(import.meta.dir, 'api.ts'), 'utf8');
+const expectScriptSource = readFileSync(
+  join(import.meta.dir, '../../../../scripts/taskmaster/expect.ps1'),
+  'utf8'
+);
 
 /**
  * bdc-xo#2007. The registry shipped with #1850 and every live row was written
@@ -17,12 +21,17 @@ describe('expectation front door: route wiring', () => {
     expect(apiSource).toContain('registerOpenApiRoute(getTaskmasterExpectationsRoute');
   });
 
+  test('the front-door script accepts both create and retry success statuses', () => {
+    expect(expectScriptSource).toContain("$status -notin @('200', '201')");
+  });
+
   test('the POST declares its refusals, so a caller is not surprised by them', () => {
     const declaration = apiSource.slice(
       apiSource.indexOf('const postTaskmasterExpectationRoute'),
       apiSource.indexOf('const getTaskmasterExpectationsRoute')
     );
     expect(declaration).toContain("401: jsonError('Missing or invalid operator token')");
+    expect(declaration).toMatch(/201: \{/);
     expect(declaration).toMatch(/400: jsonError\(/);
     expect(declaration).toMatch(/429: jsonError\(/);
   });
@@ -66,7 +75,7 @@ describe('expectation front door: route wiring', () => {
     expect(apiSource).toContain('EXPECTATION_DAILY_CAP');
   });
 
-  test('retry-vs-new is decided atomically by the DAL', () => {
+  test('the handler delegates retry-vs-new to the DAL', () => {
     // The route must not probe before the serialized write: two same-key calls
     // can both observe absence, and the second must still become a retry at cap.
     const handler = apiSource.slice(

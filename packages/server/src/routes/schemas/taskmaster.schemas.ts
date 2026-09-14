@@ -241,7 +241,7 @@ export const expectationRowSchema = z
     status: z.enum(['pending', 'met', 'failed', 'escalating', 'escalated', 'given_up']),
     evidence_pointer: z.string().nullable(),
     registered_by: z.string().nullable(),
-    self_supervised: z.number().int(),
+    self_supervised: z.boolean(),
     created_at: z.string(),
     updated_at: z.string(),
   })

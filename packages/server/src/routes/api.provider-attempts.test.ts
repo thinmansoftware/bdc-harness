@@ -55,6 +55,31 @@ const mockListProviderAttemptsFeed = mock(
   async (_opts: { since?: string; limit?: number }): Promise<FeedRow[]> => [sampleRow()]
 );
 
+type StoredExpectation = {
+  capped: false;
+  id: string;
+  created: boolean;
+  expectation: { due_at: string; on_absence: 'escalate'; self_supervised: number };
+};
+const expectationRows = new Map<string, StoredExpectation>();
+const mockRegisterExpectation = mock(async (data: { registration_key: string }) => {
+  const existing = expectationRows.get(data.registration_key);
+  if (existing) return { ...existing, created: false };
+  if (expectationRows.size >= 2) return { capped: true as const, observed: expectationRows.size };
+  const created: StoredExpectation = {
+    capped: false,
+    id: `expectation-${String(expectationRows.size + 1)}`,
+    created: true,
+    expectation: {
+      due_at: new Date(Date.now() + 60_000).toISOString(),
+      on_absence: 'escalate',
+      self_supervised: 0,
+    },
+  };
+  expectationRows.set(data.registration_key, created);
+  return created;
+});
+
 const loggerStub = () => ({
   fatal: mock(() => undefined),
   error: mock(() => undefined),
@@ -147,6 +172,10 @@ mock.module('@archon/core/db/workflows', () => ({
 
 mock.module('@archon/core/db/workflow-events', () => ({
   listWorkflowEvents: mock(async () => []),
+}));
+
+mock.module('@archon/core/db/taskmaster', () => ({
+  registerExpectationReportingCreation: mockRegisterExpectation,
 }));
 
 mock.module('@archon/core/db/messages', () => ({
@@ -270,6 +299,59 @@ describe('GET /api/dashboard/provider-attempts', () => {
     const callArgs = mockListProviderAttemptsFeed.mock.calls[0]?.[0];
     expect(callArgs?.since).toBe(since);
     expect(callArgs?.limit).toBe(5);
+  });
+});
+
+describe('POST /api/taskmaster/expectations', () => {
+  const post = (app: OpenAPIHono, key: string) =>
+    app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        registration_key: key,
+        dispatch_ref: `dispatch-${key}`,
+        recipient: 'worker',
+        evidence: { kind: 'pr_opened', repo: 'thinmansoftware/bdc-harness' },
+        due_in_minutes: 5,
+        on_absence: 'escalate',
+        registered_by: 'operator',
+      }),
+    });
+
+  beforeEach(() => {
+    expectationRows.clear();
+    mockRegisterExpectation.mockClear();
+  });
+
+  test('HTTP creation, retry, and cap refusal use their documented statuses', async () => {
+    const app = makeApp();
+    const created = await post(app, 'request-one');
+    expect(created.status).toBe(201);
+    expect((await created.json()) as { created: boolean }).toMatchObject({ created: true });
+
+    const retried = await post(app, 'request-one');
+    expect(retried.status).toBe(200);
+    expect((await retried.json()) as { created: boolean }).toMatchObject({ created: false });
+
+    expect((await post(app, 'request-two')).status).toBe(201);
+    expect((await post(app, 'request-three')).status).toBe(429);
+  });
+
+  test('concurrent same-key HTTP registrations create once and retry once', async () => {
+    const app = makeApp();
+    const responses = await Promise.all([post(app, 'same-key'), post(app, 'same-key')]);
+    expect(responses.map(response => response.status).sort()).toEqual([200, 201]);
+  });
+
+  test('OpenAPI documents both successful POST statuses', async () => {
+    const response = await makeApp().request('/api/openapi.json');
+    expect(response.status).toBe(200);
+    const spec = (await response.json()) as {
+      paths: Record<string, { post: { responses: Record<string, unknown> } }>;
+    };
+    const responses = spec.paths['/api/taskmaster/expectations']?.post.responses;
+    expect(responses).toHaveProperty('200');
+    expect(responses).toHaveProperty('201');
   });
 });
 

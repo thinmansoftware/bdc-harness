@@ -213,7 +213,7 @@ $lines = $response -split "`n"
 $status = $lines[-1].Trim()
 $responseBody = ($lines[0..($lines.Count - 2)] -join "`n").Trim()
 
-if ($status -ne '200') {
+if ($status -notin @('200', '201')) {
     Write-Error "Registration failed (HTTP $status): $responseBody"
     exit 1
 }

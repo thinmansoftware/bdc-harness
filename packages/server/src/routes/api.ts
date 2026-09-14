@@ -2355,6 +2355,10 @@ const postTaskmasterExpectationRoute = createRoute({
     },
   },
   responses: {
+    201: {
+      content: { 'application/json': { schema: registerExpectationResponseSchema } },
+      description: 'A newly created expectation',
+    },
     200: {
       content: { 'application/json': { schema: registerExpectationResponseSchema } },
       description: 'The expectation id; `created: false` when the key already existed',
@@ -3574,7 +3578,10 @@ export function registerApiRoutes(
         registered_by: query.registered_by,
         limit: query.limit,
       });
-      return c.json(result);
+      return c.json({
+        ...result,
+        rows: result.rows.map(row => ({ ...row, self_supervised: row.self_supervised === 1 })),
+      });
     } catch (error) {
       getLog().error({ err: error }, 'taskmaster_expectation_list_failed');
       return apiError(c, 500, 'Failed to list taskmaster expectations');
