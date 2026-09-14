@@ -498,6 +498,7 @@ async function defaultExecute(
     repo: evidence.repository,
     number: evidence.pr_number,
     commitTitle: `Overseer merge ${evidence.record.woId}`,
+    expectedHeadSha: evidence.head_sha,
   });
 }
 

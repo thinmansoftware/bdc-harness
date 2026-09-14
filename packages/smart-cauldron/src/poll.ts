@@ -123,6 +123,11 @@ interface PollOptions {
    * the PR URL for the branch, or null when gh is unavailable / no PR is found.
    */
   ghPrListForBranch?: (branch: string) => Promise<string | null>;
+  /**
+   * Injectable seam for `gh pr view --json mergeable`. Test-only:
+   * production always uses the real gh CLI (checkPrMergeableDefault).
+   */
+  checkPrMergeable?: (prUrl: string) => Promise<boolean | null>;
 }
 
 /**
@@ -144,6 +149,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     prBranchLookupAttempts = 3,
     prBranchLookupDelayMs = 10_000,
     ghPrListForBranch = ghPrListForBranchDefault,
+    checkPrMergeable: checkPrMergeableFn = checkPrMergeableDefault,
   } = opts;
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
 
@@ -213,7 +219,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
         }
       }
 
-      const prMergeable = prUrl ? await checkPrMergeable(prUrl) : null;
+      const prMergeable = prUrl ? await checkPrMergeableFn(prUrl) : null;
       const servedModelId = extractServedModelId(detail.run.metadata ?? {});
 
       return {
@@ -446,7 +452,7 @@ function extractServedModelId(metadata: Record<string, unknown>): string | null 
  * Check if a PR is mergeable via the gh CLI.
  * Returns null if gh is unavailable or returns non-zero.
  */
-async function checkPrMergeable(prUrl: string): Promise<boolean | null> {
+async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
   try {
     const { stdout } = await execFileAsync('gh', [
       'pr',

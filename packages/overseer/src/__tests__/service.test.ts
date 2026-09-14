@@ -211,6 +211,7 @@ describe('service', () => {
         owner: 'thinmansoftware',
         repo: 'bdc-harness',
         number: 42,
+        expectedHeadSha: 'a'.repeat(40),
       })
     ).rejects.toThrow('overseer_slice1_direct_merge_unreachable');
     expect(realFactory).not.toHaveBeenCalled();
@@ -242,6 +243,7 @@ describe('service', () => {
         owner: 'thinmansoftware',
         repo: 'bdc-harness',
         number: 42,
+        expectedHeadSha: 'a'.repeat(40),
       })
     ).resolves.toEqual({ merged: true, message: 'merged' });
     expect(realFactory).toHaveBeenCalledTimes(1);

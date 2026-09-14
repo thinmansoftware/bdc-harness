@@ -60,6 +60,9 @@ export interface PullRequestEvidence {
    * merge provenance compares this against the run's own worktree tip.
    */
   headSha?: string;
+  baseBranch?: string;
+  mergeableState?: string;
+  changedFilePaths?: readonly string[];
   /**
    * True when the lookup itself failed, so `exists: false` means "unknown", not
    * "no PR". Never widens the merge gate (both cases stay `exists: false`); it
@@ -157,10 +160,18 @@ export interface GitHubPullRequestSearchInput {
    * binds to the PR they asked about regardless.
    */
   prNumber?: number;
+  includeChangedFiles?: boolean;
 }
 
 export interface GitHubPullRequestMergeInput extends PullRequestRef {
   commitTitle?: string;
+  mergeMethod?: 'merge' | 'squash' | 'rebase';
+  /**
+   * Reviewed head SHA. Passed through to GitHub as the merge `sha`
+   * precondition. Callers must not omit it; adapters must not replace it
+   * with a refetched head.
+   */
+  expectedHeadSha: string;
 }
 
 /**
@@ -233,7 +244,7 @@ export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
   mergePullRequest(
     input: GitHubPullRequestMergeInput
-  ): Promise<{ merged: boolean; message?: string; sha?: string }>;
+  ): Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }>;
   /** Reviews used by the Merge Manager's distinct Review Gate approval check. */
   listPullRequestReviews?(
     input: PullRequestRef
@@ -252,8 +263,11 @@ export interface GitHubClientDeps {
    * existing GitHubClientDeps implementers (fakes, legacy compositions) keep
    * compiling. GitHub rejects self-approval regardless of identity -- the real
    * implementation surfaces a usable message rather than throwing in that case.
+   * When `expectedHeadSha` is set it is pinned as GitHub review `commit_id`.
    */
-  approvePullRequest?(input: PullRequestRef): Promise<{ approved: boolean; message?: string }>;
+  approvePullRequest?(
+    input: PullRequestRef & { expectedHeadSha?: string }
+  ): Promise<{ approved: boolean; message?: string }>;
   /**
    * List open pull requests for PR-first merge candidate discovery
    * (bdc-harness#758). Optional: when absent the watcher keeps its

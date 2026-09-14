@@ -111,7 +111,11 @@ export interface RealGitHubOctokitLike {
         head: { sha: string };
         base?: { sha: string; ref?: string };
         user?: { login?: string | null };
+        mergeable_state?: string;
       };
+    }>;
+    listFiles?(input: Record<string, unknown>): Promise<{
+      data: { filename: string }[];
     }>;
     merge(input: {
       owner: string;
@@ -758,6 +762,26 @@ export function createRealFindPullRequest(
         per_page: 100,
       });
       const checks = summarizeChecks(checkRunsResp.data.check_runs);
+      let changedFilePaths: string[] | undefined;
+      if (input.includeChangedFiles) {
+        if (!octokit.pulls.listFiles) throw new Error('overseer_real_adapter_missing_list_files');
+        changedFilePaths = [];
+        for (let page = 1; page <= 3; page += 1) {
+          const files = await octokit.pulls.listFiles({
+            owner: input.owner,
+            repo: input.repo,
+            pull_number: prNumber,
+            per_page: 100,
+            page,
+          });
+          changedFilePaths.push(...files.data.map(file => file.filename));
+          if (page === 3 && files.data.length === 100) {
+            changedFilePaths = undefined;
+            break;
+          }
+          if (files.data.length < 100) break;
+        }
+      }
 
       const state = pr.data.merged ? 'merged' : pr.data.state;
 
@@ -786,6 +810,9 @@ export function createRealFindPullRequest(
         htmlUrl: pr.data.html_url,
         // Provenance anchor: GitHub's own view of the PR head, not run metadata.
         headSha: pr.data.head.sha,
+        baseBranch: pr.data.base?.ref,
+        mergeableState: pr.data.mergeable_state,
+        changedFilePaths,
       };
       rateLimitBackoffUntil = 0;
       rateLimitLastLoggedAt = 0;
@@ -849,36 +876,52 @@ export function createRealMergePullRequest(
   octokit: RealGitHubOctokitLike
 ): (
   input: GitHubPullRequestMergeInput
-) => Promise<{ merged: boolean; message?: string; sha?: string }> {
+) => Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }> {
   return async (
     input: GitHubPullRequestMergeInput
-  ): Promise<{ merged: boolean; message?: string; sha?: string }> => {
+  ): Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }> => {
     const pr = await octokit.pulls.get({
       owner: input.owner,
       repo: input.repo,
       pull_number: input.number,
     });
+    const seenHead = pr.data.head.sha;
+    if (seenHead !== input.expectedHeadSha) {
+      return { merged: false, message: `head_moved:${seenHead}` };
+    }
     try {
-      const response = await octokit.pulls.merge({
+      const mergeInput = {
         owner: input.owner,
         repo: input.repo,
         pull_number: input.number,
-        sha: pr.data.head.sha,
-        merge_method: 'squash',
-      });
+        sha: input.expectedHeadSha,
+        merge_method: 'squash' as const,
+      };
+      const response = await octokit.pulls.merge(mergeInput);
       if (!response.data.merged) {
         return { merged: false, message: 'github_merge_not_merged' };
       }
       return {
         merged: true,
         message: input.commitTitle,
-        ...(response.data.sha ? { sha: response.data.sha } : {}),
+        ...(response.data.sha ? { sha: response.data.sha, mergeSha: response.data.sha } : {}),
       };
     } catch (error) {
       const status =
         typeof error === 'object' && error !== null && 'status' in error
           ? (error as { status?: number }).status
           : undefined;
+      if (status === 405) {
+        const apiMessage =
+          typeof error === 'object' &&
+          error !== null &&
+          'message' in error &&
+          typeof (error as { message: unknown }).message === 'string' &&
+          (error as { message: string }).message.trim() !== ''
+            ? (error as { message: string }).message
+            : 'github_merge_rejected_405';
+        return { merged: false, message: apiMessage };
+      }
       if (status === 409 || status === 422) {
         return { merged: false, message: `github_merge_rejected_${status}` };
       }
@@ -902,23 +945,30 @@ export function createRealMergePullRequest(
  */
 export function createRealApprovePullRequest(
   octokit: RealGitHubOctokitLike
-): (input: PullRequestRef) => Promise<{ approved: boolean; message?: string }> {
+): (
+  input: PullRequestRef & { expectedHeadSha?: string }
+) => Promise<{ approved: boolean; message?: string }> {
   const submit = createRealSubmitPullRequestReview(octokit);
-  return async (input: PullRequestRef): Promise<{ approved: boolean; message?: string }> => {
-    // PullRequestRef carries no head SHA, and commit_id is now required
-    // (stop condition 4): fetch the live head immediately before approving
-    // so the review still binds to a real, current commit rather than
-    // whatever GitHub would pick if commit_id were omitted.
+  return async (
+    input: PullRequestRef & { expectedHeadSha?: string }
+  ): Promise<{ approved: boolean; message?: string }> => {
+    // Prefer the reviewed SHA when the caller supplied it so the review
+    // cannot bind to a later unreviewed head. Compatibility callers that
+    // still pass only PullRequestRef keep the live-head fetch.
     let commitId: string;
-    try {
-      const pr = await octokit.pulls.get({
-        owner: input.owner,
-        repo: input.repo,
-        pull_number: input.number,
-      });
-      commitId = pr.data.head.sha;
-    } catch {
-      return { approved: false, message: 'github_review_head_lookup_failed' };
+    if (input.expectedHeadSha) {
+      commitId = input.expectedHeadSha;
+    } else {
+      try {
+        const pr = await octokit.pulls.get({
+          owner: input.owner,
+          repo: input.repo,
+          pull_number: input.number,
+        });
+        commitId = pr.data.head.sha;
+      } catch {
+        return { approved: false, message: 'github_review_head_lookup_failed' };
+      }
     }
     const result = await submit({ ...input, event: 'APPROVE', commitId });
     return result.message === undefined
