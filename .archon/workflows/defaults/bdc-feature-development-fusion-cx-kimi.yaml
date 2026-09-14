@@ -1246,11 +1246,65 @@ nodes:
         unresolved state. The flag means "repair pass complete", not "semantically
         certified" -- diff-review-final re-checks semantics next.
 
+  # checkpoint-diff-repair: commit any diff-repair fix to HEAD before capture-diff-final
+  # snapshots the review diff, so diff-review-final judges the repaired code, not a stale
+  # committed HEAD with the fix sitting unstaged. Mirrors checkpoint-push's commit-only
+  # idiom (no push here -- commit-and-push / noninteractive-salvage own pushing).
+  # trigger_rule all_done: runs whether diff-repair ran, was skipped (verdict=satisfied),
+  # or exhausted its loop -- a clean worktree is a safe no-op.
+  # Anchor: 2026-09-14 run cec6aa30 -- diff-repair's fix sat unstaged, diff-review-final
+  # judged the stale committed HEAD at 11 locations, block-classify->BLOCKED, and the fix
+  # was lost. WO-HARNESS-DIFF-REPAIR-COMMITS-BEFORE-FINAL-REVIEW-01.
+  - id: checkpoint-diff-repair
+    depends_on: [diff-repair]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+        echo "CHECKPOINT_DIFF_REPAIR=noop"
+        exit 0
+      fi
+      while IFS= read -r -d '' rec; do
+        [ -n "$rec" ] || continue
+        xy=${rec%"${rec#??}"}
+        path=${rec#???}
+        orig=
+        case "$xy" in
+          R*|C*|?R|?C)
+            IFS= read -r -d '' orig || orig=
+            ;;
+        esac
+        if [ -n "$orig" ]; then
+          if [ -e "$orig" ]; then orig_ok=$(git add -- "$orig" && echo yes); else orig_ok=$(git rm -q --cached --ignore-unmatch -- "$orig" && echo yes); fi
+          if [ "${orig_ok:-}" != "yes" ] || ! git add -- "$path"; then
+            printf 'CHECKPOINT_DIFF_REPAIR=stage_failed path=%s\n' "$path"
+            exit 1
+          fi
+        else
+          if ! git add -- "$path"; then
+            printf 'CHECKPOINT_DIFF_REPAIR=stage_failed path=%s\n' "$path"
+            exit 1
+          fi
+        fi
+      done < <(git status --porcelain=v1 -z 2>/dev/null || true)
+      if git diff --cached --quiet 2>/dev/null; then
+        echo "CHECKPOINT_DIFF_REPAIR=noop"
+        exit 0
+      fi
+      N=$(git diff --cached --name-only | wc -l | tr -d ' ')
+      if git -c user.name='cauldron-checkpoint' -c user.email='noreply@bluedevilcollectibles.com' \
+        commit -q -m "checkpoint(diff-repair): ${N} files"; then
+        echo "CHECKPOINT_DIFF_REPAIR=committed"
+      else
+        echo "WARN: checkpoint-diff-repair commit failed -- continuing" >&2
+        echo "CHECKPOINT_DIFF_REPAIR=noop"
+      fi
+
   # capture-diff-final: refresh the diff artifact AFTER repair so the final reviewer sees
   # the repaired tree, not the pre-repair diff. trigger_rule all_done so it runs even if
   # diff-repair failed/exhausted (F6) -- the final reviewer must still adjudicate.
   - id: capture-diff-final
-    depends_on: [diff-repair]
+    depends_on: [checkpoint-diff-repair]
     trigger_rule: all_done
     bash: |
       set -uo pipefail
@@ -1608,10 +1662,40 @@ nodes:
       if [ "$CHANGED" -eq 0 ] && [ "$AHEAD" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
       # Branch suffix uses $$ (Rule 2: never $WORKFLOW_ID under set -u).
       BR="salvage/opus-repair-$(basename "$WT")-$$"
-      git add -A 2>/dev/null || true
+      while IFS= read -r -d '' rec; do
+        [ -n "$rec" ] || continue
+        xy=${rec%"${rec#??}"}
+        path=${rec#???}
+        orig=
+        case "$xy" in
+          R*|C*|?R|?C)
+            IFS= read -r -d '' orig || orig=
+            ;;
+        esac
+        if [ -n "$orig" ]; then
+          if [ -e "$orig" ]; then orig_ok=$(git add -- "$orig" && echo yes); else orig_ok=$(git rm -q --cached --ignore-unmatch -- "$orig" && echo yes); fi
+          if [ "${orig_ok:-}" != "yes" ] || ! git add -- "$path"; then
+            printf 'SALVAGE=stage_failed path=%s\n' "$path"
+            exit 1
+          fi
+        else
+          if ! git add -- "$path"; then
+            printf 'SALVAGE=stage_failed path=%s\n' "$path"
+            exit 1
+          fi
+        fi
+      done < <(git status --porcelain=v1 -z 2>/dev/null || true)
       if ! git diff --cached --quiet 2>/dev/null; then
+        if [ "$CHANGED" -gt 0 ]; then
+          COMMIT_MSG="salvage(uncommitted): ${CHANGED} files"
+        else
+          COMMIT_MSG="salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)"
+        fi
         git -c user.name='cauldron-salvage' -c user.email='noreply@bluedevilcollectibles.com' \
-          commit -m "salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)" 2>&1 | tail -1 || true
+          commit -m "$COMMIT_MSG" 2>&1 | tail -1 || true
+      fi
+      if [ "$CHANGED" -gt 0 ]; then
+        echo "SALVAGE=preserved_uncommitted:${CHANGED}"
       fi
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
