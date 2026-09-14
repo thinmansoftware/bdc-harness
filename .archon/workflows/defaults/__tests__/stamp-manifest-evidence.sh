@@ -141,6 +141,11 @@ OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c 
 assert_contains "VALIDATION: FAIL on grep mismatch" "VALIDATION: FAIL" "$OUT"
 assert_contains "audit line says greps=mismatch" "greps=mismatch" "$OUT"
 
+echo "--- Test 3b: incomplete greps flip VALIDATION to FAIL ---"
+OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c "a" b => 1; 1/2 declared grep assertions executed' incomplete)"
+assert_contains "VALIDATION: FAIL on incomplete greps" "VALIDATION: FAIL" "$OUT"
+assert_contains "audit line says greps=incomplete" "greps=incomplete" "$OUT"
+
 echo "--- Test 4: short ALREADY_SATISFIED manifest passes through untouched ---"
 SHORT='WO: WO-X
 OUTCOME=ALREADY_SATISFIED
