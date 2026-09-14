@@ -147,6 +147,76 @@ nodes:
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:building
       echo "claim-issue: $ISSUE_REPO#$ISSUE_NUM -> status:building"
 
+  - id: checkout-repair-target
+    depends_on: [read-spec, claim-issue]
+    trigger_rule: all_done
+    task_class: clerical
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      SPEC_TEXT=$read-spec.output
+      SPEC_REPAIR_PR=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #\([0-9][0-9]*\)[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
+      SPEC_REPAIR_BRANCH=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #[0-9][0-9]*[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
+      if [ -z "$SPEC_REPAIR_PR" ] || [ -z "$SPEC_REPAIR_BRANCH" ]; then
+        echo "REPAIR_TARGET=none"
+        exit 0
+      fi
+      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+      if ! git check-ref-format --branch "$SPEC_REPAIR_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$SPEC_REPAIR_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        echo "ERROR: invalid repair_target_branch '${SPEC_REPAIR_BRANCH}'" >&2
+        exit 1
+      fi
+      REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
+      if ! printf '%s\n' "$REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+        echo "ERROR: invalid or missing repo for repair target verification" >&2
+        exit 1
+      fi
+      REPO_OWNER=${REPO%%/*}
+      REPO_NAME=${REPO#*/}
+      if ! REPAIR_TARGET_LIVE=$(gh pr view "$SPEC_REPAIR_PR" --repo "$REPO" --json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository,headRefOid --jq '.state + "\t" + .headRefName + "\t" + (.isCrossRepository|tostring) + "\t" + (.headRepositoryOwner.login // "") + "\t" + (.headRepository.name // "") + "\t" + (.headRefOid // "")' 2>/dev/null); then
+        echo "ERROR: declared repair target #${SPEC_REPAIR_PR} not found on ${REPO}" >&2
+        exit 1
+      fi
+      REPAIR_TARGET_STATE=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f1)
+      REPAIR_TARGET_LIVE_BRANCH=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f2)
+      REPAIR_TARGET_CROSS=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f3)
+      REPAIR_TARGET_HEAD_OWNER=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f4)
+      REPAIR_TARGET_HEAD_REPO=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f5)
+      REPAIR_TARGET_LIVE_OID=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f6)
+      if [ "$REPAIR_TARGET_STATE" != "OPEN" ]; then
+        echo "ERROR: declared repair target #${SPEC_REPAIR_PR} is ${REPAIR_TARGET_STATE}" >&2
+        exit 1
+      fi
+      if [ "$REPAIR_TARGET_LIVE_BRANCH" != "$SPEC_REPAIR_BRANCH" ]; then
+        echo "ERROR: declared repair target #${SPEC_REPAIR_PR} head branch mismatch: expected ${SPEC_REPAIR_BRANCH}, got ${REPAIR_TARGET_LIVE_BRANCH}" >&2
+        exit 1
+      fi
+      if [ "$REPAIR_TARGET_CROSS" != "false" ] || [ "$REPAIR_TARGET_HEAD_OWNER" != "$REPO_OWNER" ] || [ "$REPAIR_TARGET_HEAD_REPO" != "$REPO_NAME" ]; then
+        echo "repair_target_rejected:fork"
+        echo "ERROR: repair_target_rejected:fork declared repair target #${SPEC_REPAIR_PR} head is ${REPAIR_TARGET_HEAD_OWNER}/${REPAIR_TARGET_HEAD_REPO} (cross=${REPAIR_TARGET_CROSS}); refusing to push a fork" >&2
+        exit 1
+      fi
+      if [ -z "$REPAIR_TARGET_LIVE_OID" ]; then
+        echo "repair_target_fetch_failed"
+        echo "ERROR: repair_target_fetch_failed: live head SHA missing for #${SPEC_REPAIR_PR}" >&2
+        exit 1
+      fi
+      if ! git fetch origin "refs/heads/${SPEC_REPAIR_BRANCH}"; then
+        echo "repair_target_fetch_failed"
+        echo "ERROR: repair_target_fetch_failed: could not fetch origin/${SPEC_REPAIR_BRANCH}" >&2
+        exit 1
+      fi
+      FETCHED_SHA=$(git rev-parse FETCH_HEAD)
+      if [ "$FETCHED_SHA" != "$REPAIR_TARGET_LIVE_OID" ]; then
+        echo "repair_target_head_mismatch"
+        echo "ERROR: repair_target_head_mismatch: fetched ${FETCHED_SHA} != live ${REPAIR_TARGET_LIVE_OID}" >&2
+        exit 1
+      fi
+      git checkout -B "$SPEC_REPAIR_BRANCH" FETCH_HEAD
+      echo "REPAIR_TARGET=#${SPEC_REPAIR_PR}"
+      echo "REPAIR_TARGET_BRANCH=${SPEC_REPAIR_BRANCH}"
+      echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LIVE_OID}"
+
   # check-already-satisfied (Fix B, 2026-05-30 -- idempotency short-circuit).
   # Cheap read-only check BEFORE plan/implement: are the WO's deliverables ALREADY
   # present in THIS worktree's HEAD? If clearly yes, route to the ALREADY_SATISFIED
@@ -158,7 +228,7 @@ nodes:
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     provider: codex
-    depends_on: [read-spec]
+    depends_on: [checkout-repair-target]
     task_class: clerical
     prompt: |
       You decide ONE thing: are this WO's deliverables ALREADY fully present, such
@@ -359,6 +429,14 @@ nodes:
         3. Unsafe assumptions -- "assume X exists" without verification.
         4. Rule 20 staging gate -- if target repo is lspro-react / shopops-storefront /
            shopops, plan MUST require --base staging. If not those, must NOT.
+        4b. Repair target -- when the spec declares `Repair target: PR #N (branch X)`,
+           use WebFetch to verify that PR #N is open on the target repo and its head
+           branch is X. An open matching PR is self-authorizing: preserve it in the
+           approved plan as `repair_target_authorized_by_spec: #N`; never ask whether
+           it is canonical or whether to close it and rebuild fresh. If it is closed,
+           fail this plan iteration with the literal reason `declared repair target #N
+           is closed`. If it is not on the target repo, its branch does not match X, or
+           it cannot be verified, fail with `declared repair target #N is not on <repo>`.
         5. Out-of-scope list present and correct.
 
         ## Self-repair (the point -- do not just report)
@@ -396,6 +474,8 @@ nodes:
         so emit it ONLY when PLAN_REVIEW_PASS=true.
 
         ## Escalation (emit instead of approving; do NOT emit the approved sentinel)
+        Asking whether an existing, spec-named PR is canonical or should be closed is
+        never a valid escalation reason; apply the repair-target verification above.
         If the spec is ambiguous/contradictory, the fix needs a new side-effect class or
         ungranted scope, or the same finding survived a prior attempt and you cannot
         resolve it -- set PLAN_REVIEW_PASS=false, emit PLAN_REVIEW_NEEDS_REVISION, and put
@@ -413,7 +493,7 @@ nodes:
 
   - id: capture-run-scope
     persona: major-build
-    depends_on: [plan-review]
+    depends_on: [plan-review, checkout-repair-target]
     trigger_rule: all_done
     load_bearing: true
     bash: |
@@ -2858,6 +2938,16 @@ nodes:
       $war-council-validator.output
 
       ## Branch Name Derivation Rules (F-6A prevention)
+      First check for `Repair target: PR #N (branch X)` in the spec. Verify it with
+      `gh pr view N --repo <target-repo> --json state,headRefName`: state must be OPEN
+      and headRefName must equal X. On success, emit the normal fields below plus
+      `repair_target_pr: #N` and `repair_target_branch: <verified-headRefName-from-gh>`;
+      emit `repair_target_authorized_by_spec: #N` ONLY when the approved plan carried
+      that authorization. Use that verified head as the feature branch and stop
+      without deriving a fresh branch. On a closed PR or repo/branch mismatch, fail
+      closed with the exact declared-repair-target reason from the approved plan.
+      Never mint a replacement.
+
       Anchor incidents 2026-05-18: agents emitted branch names that embedded the
       current worktree thread suffix, producing double-suffixed targets like
       "archon/thread-9772643d-thread-9772643d" or
@@ -3142,7 +3232,105 @@ nodes:
         echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
         exit 1
       fi
-      UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
+      # Direct assignment, never a heredoc: the executor substitutes $read-spec.output
+      # shellQuote-wrapped (single-quoted, embedded quotes escaped), so untrusted spec
+      # text can neither terminate a delimiter nor be evaluated by this shell.
+      SPEC_TEXT=$read-spec.output
+      CHECKOUT_OUTPUT=$checkout-repair-target.output
+      REPAIR_TARGET_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
+      REPAIR_TARGET_PR=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_pr:[[:space:]]*#\{0,1\}\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
+      REPAIR_TARGET_PR_PRESENT=false
+      REPAIR_TARGET_BRANCH_PRESENT=false
+      REPAIR_TARGET_AUTHORIZED_PRESENT=false
+      if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q '^[[:space:]]*repair_target_pr:'; then
+        REPAIR_TARGET_PR_PRESENT=true
+      fi
+      if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q '^[[:space:]]*repair_target_branch:'; then
+        REPAIR_TARGET_BRANCH_PRESENT=true
+      fi
+      if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q '^[[:space:]]*repair_target_authorized_by_spec:'; then
+        REPAIR_TARGET_AUTHORIZED_PRESENT=true
+      fi
+      if [ "$REPAIR_TARGET_PR_PRESENT" = true ] || [ "$REPAIR_TARGET_BRANCH_PRESENT" = true ] || [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" = true ]; then
+        if [ -z "$REPAIR_TARGET_PR" ] || [ -z "$REPAIR_TARGET_BRANCH" ]; then
+          echo "ERROR: repair_target_malformed: both repair_target_pr and repair_target_branch are required before branch selection" >&2
+          exit 1
+        fi
+        if ! git check-ref-format --branch "$REPAIR_TARGET_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+          echo "ERROR: invalid repair_target_branch '${REPAIR_TARGET_BRANCH}'" >&2
+          exit 1
+        fi
+        REPAIR_TARGET_AUTHORIZED=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_authorized_by_spec:[[:space:]]*\(#[0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
+        SPEC_REPAIR_PR=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #\([0-9][0-9]*\)[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
+        SPEC_REPAIR_BRANCH=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #[0-9][0-9]*[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
+        if [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" != true ] || [ "$REPAIR_TARGET_AUTHORIZED" != "#${REPAIR_TARGET_PR}" ] || [ "$SPEC_REPAIR_PR" != "$REPAIR_TARGET_PR" ] || [ "$SPEC_REPAIR_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
+          echo "repair_target_unauthorized"
+          echo "ERROR: repair_target_unauthorized: refusing to select an existing branch without a spec-bound authorization matching PR #${REPAIR_TARGET_PR} branch ${REPAIR_TARGET_BRANCH}" >&2
+          exit 1
+        fi
+        REPO_FOR_CHECK=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repo:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
+        if ! printf '%s\n' "$REPO_FOR_CHECK" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+          echo "ERROR: invalid or missing repo for repair target verification" >&2
+          exit 1
+        fi
+        REPO_OWNER=${REPO_FOR_CHECK%%/*}
+        REPO_NAME=${REPO_FOR_CHECK#*/}
+        if ! REPAIR_TARGET_LIVE=$(gh pr view "$REPAIR_TARGET_PR" --repo "$REPO_FOR_CHECK" --json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository,headRefOid --jq '.state + "\t" + .headRefName + "\t" + (.isCrossRepository|tostring) + "\t" + (.headRepositoryOwner.login // "") + "\t" + (.headRepository.name // "") + "\t" + (.headRefOid // "")' 2>/dev/null); then
+          echo "ERROR: declared repair target #${REPAIR_TARGET_PR} not found on ${REPO_FOR_CHECK}" >&2
+          exit 1
+        fi
+        REPAIR_TARGET_STATE=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f1)
+        REPAIR_TARGET_LIVE_BRANCH=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f2)
+        REPAIR_TARGET_CROSS=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f3)
+        REPAIR_TARGET_HEAD_OWNER=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f4)
+        REPAIR_TARGET_HEAD_REPO=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f5)
+        REPAIR_TARGET_LIVE_OID=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f6)
+        if [ "$REPAIR_TARGET_STATE" != "OPEN" ]; then
+          echo "ERROR: declared repair target #${REPAIR_TARGET_PR} is ${REPAIR_TARGET_STATE}" >&2
+          exit 1
+        fi
+        if [ "$REPAIR_TARGET_LIVE_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
+          echo "ERROR: declared repair target #${REPAIR_TARGET_PR} head branch mismatch: expected ${REPAIR_TARGET_BRANCH}, got ${REPAIR_TARGET_LIVE_BRANCH}" >&2
+          exit 1
+        fi
+        if [ "$REPAIR_TARGET_CROSS" != "false" ] || [ "$REPAIR_TARGET_HEAD_OWNER" != "$REPO_OWNER" ] || [ "$REPAIR_TARGET_HEAD_REPO" != "$REPO_NAME" ]; then
+          echo "repair_target_rejected:fork"
+          echo "ERROR: repair_target_rejected:fork declared repair target #${REPAIR_TARGET_PR} head is ${REPAIR_TARGET_HEAD_OWNER}/${REPAIR_TARGET_HEAD_REPO} (cross=${REPAIR_TARGET_CROSS}); refusing to push a fork" >&2
+          exit 1
+        fi
+        if [ -z "$REPAIR_TARGET_LIVE_OID" ]; then
+          echo "repair_target_fetch_failed"
+          echo "ERROR: repair_target_fetch_failed: live head SHA missing for #${REPAIR_TARGET_PR}" >&2
+          exit 1
+        fi
+        if ! git fetch origin "refs/heads/${REPAIR_TARGET_BRANCH}"; then
+          echo "repair_target_fetch_failed"
+          echo "ERROR: repair_target_fetch_failed: could not fetch origin/${REPAIR_TARGET_BRANCH}" >&2
+          exit 1
+        fi
+        FETCHED_SHA=$(git rev-parse FETCH_HEAD)
+        if [ "$FETCHED_SHA" != "$REPAIR_TARGET_LIVE_OID" ]; then
+          echo "repair_target_head_mismatch"
+          echo "ERROR: repair_target_head_mismatch: fetched ${FETCHED_SHA} != live ${REPAIR_TARGET_LIVE_OID}" >&2
+          exit 1
+        fi
+        CHECKOUT_LEASE_SHA=$(printf '%s\n' "${CHECKOUT_OUTPUT-}" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1)
+        if [ -n "$CHECKOUT_LEASE_SHA" ] && [ "$REPAIR_TARGET_LIVE_OID" != "$CHECKOUT_LEASE_SHA" ]; then
+          echo "repair_target_head_moved"
+          echo "ERROR: repair_target_head_moved: live ${REPAIR_TARGET_LIVE_OID} != checkout ${CHECKOUT_LEASE_SHA}" >&2
+          exit 1
+        fi
+        REPAIR_TARGET_LEASE_SHA="${CHECKOUT_LEASE_SHA:-$REPAIR_TARGET_LIVE_OID}"
+        echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LEASE_SHA}"
+        if ! git merge-base --is-ancestor "$REPAIR_TARGET_LEASE_SHA" HEAD; then
+          echo "repair_target_base_not_incorporated"
+          echo "ERROR: repair_target_base_not_incorporated: HEAD does not contain repair-target lease ${REPAIR_TARGET_LEASE_SHA}" >&2
+          exit 1
+        fi
+        UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"
+      else
+        UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
+      fi
       git status --short
       DIRTY=$(git status --porcelain)
       if [ -z "$DIRTY" ]; then
@@ -3249,9 +3437,23 @@ nodes:
       # (UNIQUE_BRANCH) and does not collide with other parallel runs.
       PUSH_OK=false
       for attempt in 1 2 3; do
-        if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
-          PUSH_OK=true
-          break
+        if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+          if PUSH_OUT=$(git push --force-with-lease="refs/heads/${UNIQUE_BRANCH}:${REPAIR_TARGET_LEASE_SHA}" origin HEAD:"${UNIQUE_BRANCH}" 2>&1); then
+            printf '%s\n' "$PUSH_OUT"
+            PUSH_OK=true
+            break
+          fi
+          printf '%s\n' "$PUSH_OUT"
+          if printf '%s\n' "$PUSH_OUT" | grep -Eq 'stale info|\[rejected\]'; then
+            echo "repair_target_lease_rejected"
+            echo "ERROR: repair_target_lease_rejected: origin/${UNIQUE_BRANCH} moved since lease ${REPAIR_TARGET_LEASE_SHA}" >&2
+            exit 1
+          fi
+        else
+          if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
+            PUSH_OK=true
+            break
+          fi
         fi
         echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
         sleep $((attempt * 5))
@@ -3259,6 +3461,12 @@ nodes:
       if [ "$PUSH_OK" = "false" ]; then
         echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
         exit 1
+      fi
+      if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+        # The leased push advanced origin/<branch> to this HEAD; refresh the lease so the
+        # origin-visibility re-push in open-pr-if-needed leases against the new head.
+        REPAIR_TARGET_LEASE_SHA=$(git rev-parse HEAD)
+        echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LEASE_SHA}"
       fi
       # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: the ONLY success invariant.
       # Clean-tree / commits-ahead-0 / HEAD-reachable-from-some-remote are NOT
@@ -3319,6 +3527,7 @@ nodes:
         echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
         exit 1
       fi
+      REPAIR_TARGET_LEASE_SHA=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1)
       # WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01: tolerate delayed origin visibility,
       # then re-push and re-verify before failing the PR-open precondition.
       LOCAL_HEAD="$(git rev-parse HEAD)"
@@ -3341,9 +3550,23 @@ nodes:
         echo "WARN: origin still missing/mismatched after wait -- re-pushing HEAD:${UNIQUE_BRANCH}" >&2
         PUSH_OK=false
         for attempt in 1 2 3; do
-          if git push origin "HEAD:${UNIQUE_BRANCH}" 2>&1; then
-            PUSH_OK=true
-            break
+          if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+            if PUSH_OUT=$(git push --force-with-lease="refs/heads/${UNIQUE_BRANCH}:${REPAIR_TARGET_LEASE_SHA}" origin HEAD:"${UNIQUE_BRANCH}" 2>&1); then
+              printf '%s\n' "$PUSH_OUT"
+              PUSH_OK=true
+              break
+            fi
+            printf '%s\n' "$PUSH_OUT"
+            if printf '%s\n' "$PUSH_OUT" | grep -Eq 'stale info|\[rejected\]'; then
+              echo "repair_target_lease_rejected"
+              echo "ERROR: repair_target_lease_rejected: origin/${UNIQUE_BRANCH} moved since lease ${REPAIR_TARGET_LEASE_SHA}" >&2
+              exit 1
+            fi
+          else
+            if git push origin "HEAD:${UNIQUE_BRANCH}" 2>&1; then
+              PUSH_OK=true
+              break
+            fi
           fi
           echo "WARN: re-push attempt ${attempt} failed; retrying..." >&2
           sleep $((attempt * 5))
