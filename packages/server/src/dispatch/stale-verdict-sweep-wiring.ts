@@ -153,6 +153,9 @@ export function createDurableSweepCursor(): SweepCursor {
   };
 }
 
+const CHECK_RUN_PAGE_SIZE = 100;
+const MAX_CHECK_RUN_PAGES = 10;
+
 interface CheckRunLike {
   id?: number;
   name?: string;
@@ -161,13 +164,41 @@ interface CheckRunLike {
   completed_at?: string | null;
 }
 
+interface CheckRunsForRefClient {
+  checks: {
+    listForRef(input: Record<string, unknown>): Promise<{
+      data: { check_runs?: unknown[] };
+    }>;
+  };
+}
+
+export async function fetchAllCheckRunsForRef(
+  octokit: CheckRunsForRefClient,
+  input: { owner: string; repo: string; ref: string }
+): Promise<{ runs: CheckRunLike[]; complete: boolean }> {
+  const runs: CheckRunLike[] = [];
+  for (let page = 1; page <= MAX_CHECK_RUN_PAGES; page += 1) {
+    try {
+      const response = await octokit.checks.listForRef({
+        ...input,
+        per_page: CHECK_RUN_PAGE_SIZE,
+        page,
+      });
+      const pageRuns = (response.data.check_runs ?? []) as CheckRunLike[];
+      runs.push(...pageRuns);
+      if (pageRuns.length < CHECK_RUN_PAGE_SIZE) return { runs, complete: true };
+    } catch {
+      return { runs, complete: false };
+    }
+  }
+  return { runs, complete: false };
+}
+
 /**
  * The most recently COMPLETED check run at a head, or null.
  *
- * One `checks.listForRef` call, pinned to the exact head -- the same call the
- * evaluator already makes, so the shape and the cost are both known. A run with
- * no `completed_at` cannot be compared against a verdict timestamp and is
- * skipped rather than guessed at.
+ * Check runs pinned to the exact head. A run with no `completed_at` cannot be
+ * compared against a verdict timestamp and is skipped rather than guessed at.
  */
 export function selectLatestCompletion(runs: CheckRunLike[]): LatestCheckCompletion | null {
   let latest: LatestCheckCompletion | null = null;
@@ -214,19 +245,21 @@ export function createRealStaleVerdictSweepDeps(config: ReviewRouteConfig): Stal
     listCandidates: (limit, afterSeq) => listRealSweepCandidates(limit, afterSeq),
     readStandingVerdict: candidate => recheckDeps.readStandingVerdict(candidate),
     async readLatestCheckCompletion(candidate): Promise<LatestCheckCompletion | null> {
-      const runs = await octokit.checks.listForRef({
+      const { runs, complete } = await fetchAllCheckRunsForRef(octokit, {
         owner: candidate.owner,
         repo: candidate.repo,
         ref: candidate.headSha,
-        per_page: 100,
       });
       // The shared octokit interface models only the fields the evaluator needs
       // (name/status/conclusion); the live API also returns `id` and
       // `completed_at`, which the staleness comparison requires. Narrow through
       // `unknown` here rather than widening the shared type, so this sweep
       // cannot alter what other callers of that interface are promised.
-      const checkRuns = (runs.data.check_runs ?? []) as unknown as CheckRunLike[];
-      return selectLatestCompletion(checkRuns);
+      const latest = selectLatestCompletion(runs);
+      if (!latest || complete) return latest;
+      // A capped or failed page walk is partial evidence and therefore cannot
+      // establish that every check at the exact head is green.
+      return { ...latest, allChecksGreen: false };
     },
     enqueueRecheckWork: input => recheckDeps.enqueueRecheckWork(input),
   };

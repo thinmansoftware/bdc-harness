@@ -16,7 +16,7 @@ import {
   type StaleVerdictSweepDeps,
   type SweepCandidate,
 } from './stale-verdict-sweep';
-import { selectLatestCompletion } from './stale-verdict-sweep-wiring';
+import { fetchAllCheckRunsForRef, selectLatestCompletion } from './stale-verdict-sweep-wiring';
 
 const HEAD = '5ac93b765ac93b765ac93b765ac93b765ac93b76';
 
@@ -801,5 +801,41 @@ describe('selectLatestCompletion', () => {
         { id: 1, name: 'test', status: 'completed', conclusion: 'success', completed_at: 'nope' },
       ])
     ).toBeNull();
+  });
+});
+
+describe('fetchAllCheckRunsForRef', () => {
+  test('includes a failing check run beyond the first 100', async () => {
+    const allRuns = Array.from({ length: 150 }, (_, index) => ({
+      id: index + 1,
+      name: `check-${index + 1}`,
+      status: 'completed',
+      conclusion: index === 119 ? 'failure' : 'success',
+      completed_at: new Date(Date.UTC(2026, 8, 7, 0, index)).toISOString(),
+    }));
+    const pages: number[] = [];
+    const octokit = {
+      checks: {
+        listForRef: mock(async (input: Record<string, unknown>) => {
+          const page = Number(input.page);
+          const perPage = Number(input.per_page);
+          pages.push(page);
+          return {
+            data: { check_runs: allRuns.slice((page - 1) * perPage, page * perPage) },
+          };
+        }),
+      },
+    };
+
+    const result = await fetchAllCheckRunsForRef(octokit, {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      ref: HEAD,
+    });
+
+    expect(pages).toEqual([1, 2]);
+    expect(result.complete).toBe(true);
+    expect(result.runs).toHaveLength(150);
+    expect(selectLatestCompletion(result.runs)?.allChecksGreen).toBe(false);
   });
 });
