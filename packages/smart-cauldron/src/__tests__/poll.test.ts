@@ -9,6 +9,16 @@ afterEach(() => {
 });
 
 describe('pollForTerminal PR-detection race guard', () => {
+  const hermeticPollGh: {
+    ghPrListForBranch: (branch: string) => Promise<string | null>;
+    checkPrMergeable: (prUrl: string) => Promise<boolean | null>;
+    prBranchLookupDelayMs: number;
+  } = {
+    ghPrListForBranch: async (): Promise<string | null> => null,
+    checkPrMergeable: async (): Promise<boolean | null> => null,
+    prBranchLookupDelayMs: 1,
+  };
+
   const completedRun = (events: unknown[]) =>
     new Response(
       JSON.stringify({
@@ -40,6 +50,7 @@ describe('pollForTerminal PR-detection race guard', () => {
       intervalMs: 1,
       prRetryAttempts: 3,
       prRetryDelayMs: 1,
+      ...hermeticPollGh,
     });
 
     expect(result.terminalStatus).toBe('completed');
@@ -66,6 +77,7 @@ describe('pollForTerminal PR-detection race guard', () => {
       intervalMs: 1,
       prRetryAttempts: 3,
       prRetryDelayMs: 1,
+      ...hermeticPollGh,
     });
 
     expect(result.prUrl).toBeNull();
@@ -87,6 +99,7 @@ describe('pollForTerminal PR-detection race guard', () => {
       intervalMs: 1,
       prRetryAttempts: 3,
       prRetryDelayMs: 1,
+      ...hermeticPollGh,
     });
 
     expect(result.prUrl).toBe('https://github.com/thinmansoftware/bdc-harness/pull/488');
