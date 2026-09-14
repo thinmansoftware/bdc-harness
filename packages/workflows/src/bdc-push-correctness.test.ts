@@ -173,6 +173,10 @@ const FEATURE_DEV_LANES = [
   join(DEFAULTS_DIR, 'bdc-feature-development-zero-open.yaml'),
   join(DEFAULTS_DIR, 'bdc-feature-development-zero.yaml'),
 ];
+const REPAIR_TARGET_LANES = [
+  join(DEFAULTS_DIR, 'bdc-feature-development-codex.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development.yaml'),
+];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -583,6 +587,32 @@ describe('Lane consistency: all feature-development lanes share review-base wiri
       expect(yaml).toContain('depends_on: [diff-repair, resolve-review-base]');
       expect(yaml).not.toContain('BASE_REF="origin/${BASE_BRANCH:-main}"');
       expect(yaml).toContain('base_branch_override');
+    }
+  });
+});
+
+describe('Spec-declared repair targets and operator-recorded stops', () => {
+  it('records repair targets as authorized by the spec in both target lanes', () => {
+    for (const lane of REPAIR_TARGET_LANES) {
+      expect(readFileSync(lane, 'utf8')).toContain('repair_target_authorized_by_spec');
+    }
+  });
+
+  it('marks operator-recorded stops as pending in both target lanes', () => {
+    for (const lane of REPAIR_TARGET_LANES) {
+      expect(readFileSync(lane, 'utf8')).toContain('OPERATOR-RECORDED');
+    }
+  });
+
+  it('does not ask whether a declared repair target needs closing', () => {
+    for (const lane of REPAIR_TARGET_LANES) {
+      expect(readFileSync(lane, 'utf8')).not.toContain('should it be closed');
+    }
+  });
+
+  it('does not ask for a platform-specific authorized operator', () => {
+    for (const lane of REPAIR_TARGET_LANES) {
+      expect(readFileSync(lane, 'utf8')).not.toContain('authorized Windows operator');
     }
   });
 });

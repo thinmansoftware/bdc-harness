@@ -368,6 +368,13 @@ nodes:
            fails closed before pushing when it is missing. If the repo is not one of
            those three and no base is declared, the plan must NOT require staging.
         5. Out-of-scope list present and correct.
+        5.5. Repair target -- a spec-declared `Repair target: PR #N (branch X)` on the
+           target repo is self-authorizing: preserve it in the approved plan as
+           `repair_target_authorized_by_spec: #N` and do not ask whether the named PR
+           is canonical or needs rebuilding. You have no shell access and do not verify
+           the PR's existence or state here; that verification and mechanical branch
+           reuse are tracked separately. This clause trusts the spec-declared fact but
+           does not certify the PR's actual state.
 
         ## Self-repair (the point -- do not just report)
         If you find issues AND they are plan-level fixable, REVISE the plan to resolve
@@ -406,6 +413,9 @@ nodes:
         ## Escalation (emit instead of approving; do NOT emit the approved sentinel)
         A spec-declared `Base branch:` on a Rule 20 repo is never, by itself, a valid
         escalation reason. This does not weaken the separate crossing-into-staging gate.
+        A spec-declared `Repair target:` on the target repo is never, by itself, a valid
+        escalation reason. Record `repair_target_authorized_by_spec: #N` in the approved
+        plan and continue without asking whether the named PR is canonical or needs rebuilding.
         If the spec is ambiguous/contradictory, the fix needs a new side-effect class or
         ungranted scope, or the same finding survived a prior attempt and you cannot
         resolve it -- set PLAN_REVIEW_PASS=false, emit PLAN_REVIEW_NEEDS_REVISION, and put
@@ -1330,6 +1340,9 @@ nodes:
         - a finding requires a new side-effect class / scope the lane was not granted
         - a finding requires human-only authority (deploy, prod write, customer comms,
           irreversible/destructive op) where safe behavior is not already encoded
+        - a stop condition marked `-- recorded by XO`, `recorded by the operator`, or
+          `(operator-recorded)` is not the builder's gate: do not escalate on it; proceed
+          and let build-manifest record it as `OPERATOR-RECORDED (pending)`
         - the spec is ambiguous about the correct fix
         - the same finding survived a prior repair attempt and you cannot resolve it
         Escalation block (exact keys):
@@ -2626,7 +2639,7 @@ nodes:
         PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
         Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
         Grep assertions: one line; value is a ';'-separated list of sub-assertions, each EXACTLY "<command> => <count>" with a bare integer count -- NO prose after the count, and NO assertion about pre-change state (never write "=> 0" for a path this diff creates -- it is false by construction once the file exists); or "N/A (<reason>)". Each <command> MUST be a single read-only inspection built only from grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test, optionally piped ('|') to one of those; it MUST NOT contain a literal ';' or any shell chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>' '<') -- verify-manifest-assertions splits the value on ';' and DROPS (unexecuted) any command not on that read-only allowlist. verify-manifest-assertions executes each surviving sub-assertion and rewrites wrong counts, so emit your best honest count.
-        Runtime verification: <evidence> or N/A (<reason>); for model-access or live-model probe stop conditions, include the exact in-container probe output or an explicit [UNVERIFIED-DEFERRED] note with the deferral reason
+        Runtime verification: <evidence> or N/A (<reason>); for model-access or live-model probe stop conditions, include the exact in-container probe output or an explicit [UNVERIFIED-DEFERRED] note with the deferral reason; render a stop marked `-- recorded by XO`, `recorded by the operator`, or `(operator-recorded)` as `OPERATOR-RECORDED (pending)` instead of FAIL/N/A, and do not let that pending operator evidence by itself block `VALIDATION: PASS`
         VALIDATION: PASS   <- only when all in-run reviews passed
       NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
       files. If no files changed (ALREADY_SATISFIED), emit "Files created: none" only.
