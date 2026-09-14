@@ -175,7 +175,9 @@ describe('C2 repeat-send canary', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
     const [url, init] = fetcher.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('http://localhost:3090/api/overseer/pr-review/request');
-    expect((init.headers as Record<string, string>)['x-archon-operator-token']).toBe('operator-token');
+    expect((init.headers as Record<string, string>)['x-archon-operator-token']).toBe(
+      'operator-token'
+    );
     expect(result.verdict).toBe('passed');
     expect(result.evidenceRefs).toContain('mode=enqueue');
   });
