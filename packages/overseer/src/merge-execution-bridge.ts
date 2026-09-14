@@ -155,7 +155,7 @@ async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
   repoConfig: MergeExecutionRepoConfig
-): Promise<'stop' | void> {
+): Promise<'stop' | undefined> {
   const skip = async (reason: string, prUrl?: string): Promise<void> => {
     await options.store.recordOutcome({
       verdictId: verdict.id,
