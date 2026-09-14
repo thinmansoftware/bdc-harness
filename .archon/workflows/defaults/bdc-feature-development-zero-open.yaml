@@ -3229,7 +3229,7 @@ nodes:
         fi
         REPO_OWNER=${REPO_FOR_CHECK%%/*}
         REPO_NAME=${REPO_FOR_CHECK#*/}
-        if ! REPAIR_TARGET_LIVE=$(gh pr view "$REPAIR_TARGET_PR" --repo "$REPO_FOR_CHECK" --json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository --jq '.state + "\t" + .headRefName + "\t" + (.isCrossRepository|tostring) + "\t" + (.headRepositoryOwner.login // "") + "\t" + (.headRepository.name // "")' 2>/dev/null); then
+        if ! REPAIR_TARGET_LIVE=$(gh pr view "$REPAIR_TARGET_PR" --repo "$REPO_FOR_CHECK" --json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository,headRefOid --jq '.state + "\t" + .headRefName + "\t" + (.isCrossRepository|tostring) + "\t" + (.headRepositoryOwner.login // "") + "\t" + (.headRepository.name // "") + "\t" + (.headRefOid // "")' 2>/dev/null); then
           echo "ERROR: declared repair target #${REPAIR_TARGET_PR} not found on ${REPO_FOR_CHECK}" >&2
           exit 1
         fi
@@ -3238,6 +3238,7 @@ nodes:
         REPAIR_TARGET_CROSS=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f3)
         REPAIR_TARGET_HEAD_OWNER=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f4)
         REPAIR_TARGET_HEAD_REPO=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f5)
+        REPAIR_TARGET_LIVE_OID=$(printf '%s\n' "$REPAIR_TARGET_LIVE" | cut -f6)
         if [ "$REPAIR_TARGET_STATE" != "OPEN" ]; then
           echo "ERROR: declared repair target #${REPAIR_TARGET_PR} is ${REPAIR_TARGET_STATE}" >&2
           exit 1
@@ -3250,6 +3251,32 @@ nodes:
           echo "repair_target_rejected:fork"
           echo "ERROR: repair_target_rejected:fork declared repair target #${REPAIR_TARGET_PR} head is ${REPAIR_TARGET_HEAD_OWNER}/${REPAIR_TARGET_HEAD_REPO} (cross=${REPAIR_TARGET_CROSS}); refusing to push a fork" >&2
           exit 1
+        fi
+        if [ -z "$REPAIR_TARGET_LIVE_OID" ]; then
+          echo "repair_target_fetch_failed"
+          echo "ERROR: repair_target_fetch_failed: live head SHA missing for #${REPAIR_TARGET_PR}" >&2
+          exit 1
+        fi
+        if ! git fetch origin "refs/heads/${REPAIR_TARGET_BRANCH}"; then
+          echo "repair_target_fetch_failed"
+          echo "ERROR: repair_target_fetch_failed: could not fetch origin/${REPAIR_TARGET_BRANCH}" >&2
+          exit 1
+        fi
+        FETCHED_SHA=$(git rev-parse FETCH_HEAD)
+        if [ "$FETCHED_SHA" != "$REPAIR_TARGET_LIVE_OID" ]; then
+          echo "repair_target_head_mismatch"
+          echo "ERROR: repair_target_head_mismatch: fetched ${FETCHED_SHA} != live ${REPAIR_TARGET_LIVE_OID}" >&2
+          exit 1
+        fi
+        REPAIR_TARGET_LEASE_SHA="$REPAIR_TARGET_LIVE_OID"
+        echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LEASE_SHA}"
+        if ! git merge-base --is-ancestor "$REPAIR_TARGET_LEASE_SHA" HEAD; then
+          if ! git rebase --autostash "$REPAIR_TARGET_LEASE_SHA"; then
+            git rebase --abort >/dev/null 2>&1 || true
+            echo "repair_target_diverged"
+            echo "ERROR: repair_target_diverged: local work does not rebase onto ${REPAIR_TARGET_BRANCH} at ${REPAIR_TARGET_LEASE_SHA}" >&2
+            exit 1
+          fi
         fi
         UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"
       else
@@ -3361,9 +3388,23 @@ nodes:
       # (UNIQUE_BRANCH) and does not collide with other parallel runs.
       PUSH_OK=false
       for attempt in 1 2 3; do
-        if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
-          PUSH_OK=true
-          break
+        if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+          if PUSH_OUT=$(git push --force-with-lease="refs/heads/${UNIQUE_BRANCH}:${REPAIR_TARGET_LEASE_SHA}" origin HEAD:"${UNIQUE_BRANCH}" 2>&1); then
+            printf '%s\n' "$PUSH_OUT"
+            PUSH_OK=true
+            break
+          fi
+          printf '%s\n' "$PUSH_OUT"
+          if printf '%s\n' "$PUSH_OUT" | grep -Eq 'stale info|\[rejected\]'; then
+            echo "repair_target_lease_rejected"
+            echo "ERROR: repair_target_lease_rejected: origin/${UNIQUE_BRANCH} moved since lease ${REPAIR_TARGET_LEASE_SHA}" >&2
+            exit 1
+          fi
+        else
+          if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
+            PUSH_OK=true
+            break
+          fi
         fi
         echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
         sleep $((attempt * 5))
@@ -3431,6 +3472,7 @@ nodes:
         echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
         exit 1
       fi
+      REPAIR_TARGET_LEASE_SHA=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | head -n 1)
       # WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01: tolerate delayed origin visibility,
       # then re-push and re-verify before failing the PR-open precondition.
       LOCAL_HEAD="$(git rev-parse HEAD)"
@@ -3453,9 +3495,23 @@ nodes:
         echo "WARN: origin still missing/mismatched after wait -- re-pushing HEAD:${UNIQUE_BRANCH}" >&2
         PUSH_OK=false
         for attempt in 1 2 3; do
-          if git push origin "HEAD:${UNIQUE_BRANCH}" 2>&1; then
-            PUSH_OK=true
-            break
+          if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+            if PUSH_OUT=$(git push --force-with-lease="refs/heads/${UNIQUE_BRANCH}:${REPAIR_TARGET_LEASE_SHA}" origin HEAD:"${UNIQUE_BRANCH}" 2>&1); then
+              printf '%s\n' "$PUSH_OUT"
+              PUSH_OK=true
+              break
+            fi
+            printf '%s\n' "$PUSH_OUT"
+            if printf '%s\n' "$PUSH_OUT" | grep -Eq 'stale info|\[rejected\]'; then
+              echo "repair_target_lease_rejected"
+              echo "ERROR: repair_target_lease_rejected: origin/${UNIQUE_BRANCH} moved since lease ${REPAIR_TARGET_LEASE_SHA}" >&2
+              exit 1
+            fi
+          else
+            if git push origin "HEAD:${UNIQUE_BRANCH}" 2>&1; then
+              PUSH_OK=true
+              break
+            fi
           fi
           echo "WARN: re-push attempt ${attempt} failed; retrying..." >&2
           sleep $((attempt * 5))

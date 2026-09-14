@@ -637,7 +637,7 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).toContain('repair_target_pr: #N');
       expect(yaml).toContain('gh pr view "$REPAIR_TARGET_PR"');
       expect(yaml).toContain(
-        '--json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository'
+        '--json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository,headRefOid'
       );
       expect(yaml).toContain('repair_target_rejected:fork');
       expect(yaml).toContain('repair_target_malformed');
@@ -666,7 +666,7 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
     for (const lane of lanes) {
       const yaml = readFileSync(lane, 'utf8');
       expect(yaml).toContain(
-        '--json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository'
+        '--json state,headRefName,headRepositoryOwner,headRepository,isCrossRepository,headRefOid'
       );
       expect(yaml).toContain('repair_target_rejected:fork');
       expect(yaml).toContain('repair_target_malformed');
@@ -674,13 +674,15 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).toContain('s/^[[:space:]]*Repair target:[[:space:]]*PR #');
       expect(yaml).toContain('BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC_20260914_020');
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
+      expect(yaml).toContain('--force-with-lease=');
+      expect(yaml).toContain('repair_target_diverged');
     }
   });
 
   function fakeGhPath(
     state: string,
     branch: string,
-    opts?: { cross?: boolean; owner?: string; repo?: string }
+    opts?: { cross?: boolean; owner?: string; repo?: string; headRefOid?: string }
   ): string {
     const binDir = mkdtempSync(join(tmpdir(), 'bdc-fake-gh-'));
     const ghPath = join(binDir, 'gh');
@@ -693,8 +695,8 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 [ -n "$filter" ] || exit 2
-printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryOwner":{"login":"%s"},"headRepository":{"name":"%s"}}\\n' \\
-  "$FAKE_GH_STATE" "$FAKE_GH_BRANCH" "\${FAKE_GH_CROSS:-false}" "\${FAKE_GH_OWNER:-thinmansoftware}" "\${FAKE_GH_REPO:-bdc-harness}" | jq -r "$filter"
+printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryOwner":{"login":"%s"},"headRepository":{"name":"%s"},"headRefOid":"%s"}\\n' \\
+  "$FAKE_GH_STATE" "$FAKE_GH_BRANCH" "\${FAKE_GH_CROSS:-false}" "\${FAKE_GH_OWNER:-thinmansoftware}" "\${FAKE_GH_REPO:-bdc-harness}" "\${FAKE_GH_HEAD_OID:-}" | jq -r "$filter"
 `
     );
     chmodSync(ghPath, 0o755);
@@ -703,6 +705,7 @@ printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryO
     process.env.FAKE_GH_CROSS = opts?.cross ? 'true' : 'false';
     process.env.FAKE_GH_OWNER = opts?.owner ?? 'thinmansoftware';
     process.env.FAKE_GH_REPO = opts?.repo ?? 'bdc-harness';
+    process.env.FAKE_GH_HEAD_OID = opts?.headRefOid ?? '';
     return `${binDir}:${process.env.PATH ?? ''}`;
   }
 
@@ -721,13 +724,89 @@ printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryO
 
   it('re-verifies an open matching PR before selecting its branch', () => {
     const branch = 'feat/wo-repair-target-01';
+    git(['push', 'origin', `HEAD:${branch}`], worktreeDir);
+    const headOid = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
     const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
       DECIDE_OUTPUT: authorizedDecideOutput(branch),
       SPEC_TEXT: matchingSpec(branch),
-      PATH: fakeGhPath('OPEN', branch),
+      PATH: fakeGhPath('OPEN', branch, { headRefOid: headOid }),
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
+    expect(result.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${headOid}`);
+  });
+
+  it('rebases onto a repair-target commit that exists only on origin', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const initSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+    writeFileSync(join(worktreeDir, 'pr-only.txt'), 'on the PR\n');
+    git(['add', 'pr-only.txt'], worktreeDir);
+    git(['commit', '-m', 'pr-only commit'], worktreeDir);
+    const leaseSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+    git(['push', 'origin', `HEAD:${branch}`], worktreeDir);
+    git(['reset', '--hard', initSha], worktreeDir);
+    writeFileSync(join(worktreeDir, 'implement.txt'), 'run work\n');
+    git(['add', 'implement.txt'], worktreeDir);
+    git(['commit', '-m', 'implement work'], worktreeDir);
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
+      PATH: fakeGhPath('OPEN', branch, { headRefOid: leaseSha }),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
+    expect(result.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${leaseSha}`);
+    const ancestor = bash(
+      `git merge-base --is-ancestor ${leaseSha} HEAD && echo ANCESTOR`,
+      worktreeDir
+    );
+    expect(ancestor.exitCode).toBe(0);
+    expect(ancestor.stdout).toContain('ANCESTOR');
+  });
+
+  it('fails closed when live headRefOid differs from the fetched branch head', () => {
+    const branch = 'feat/wo-repair-target-01';
+    git(['push', 'origin', `HEAD:${branch}`], worktreeDir);
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
+      PATH: fakeGhPath('OPEN', branch, {
+        headRefOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      }),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('repair_target_head_mismatch');
+    expect(result.stderr).toContain('repair_target_head_mismatch');
+    expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
+  });
+
+  it('fails closed on a conflicting repair-target rebase and leaves the worktree idle', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const initSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+    writeFileSync(join(worktreeDir, 'README.md'), 'remote-change\n');
+    git(['add', 'README.md'], worktreeDir);
+    git(['commit', '-m', 'remote conflict'], worktreeDir);
+    const leaseSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+    git(['push', 'origin', `HEAD:${branch}`], worktreeDir);
+    git(['reset', '--hard', initSha], worktreeDir);
+    writeFileSync(join(worktreeDir, 'README.md'), 'local-change\n');
+    git(['add', 'README.md'], worktreeDir);
+    git(['commit', '-m', 'local conflict'], worktreeDir);
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
+      PATH: fakeGhPath('OPEN', branch, { headRefOid: leaseSha }),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('repair_target_diverged');
+    expect(result.stderr).toContain('repair_target_diverged');
+    expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
+    expect(bash('git status --porcelain', worktreeDir).stdout.trim()).toBe('');
+    const rebaseState = bash(
+      'if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then echo REBASE_IN_PROGRESS; else echo REBASE_IDLE; fi',
+      worktreeDir
+    );
+    expect(rebaseState.stdout).toContain('REBASE_IDLE');
   });
 
   it('fails closed when the repair-target PR has closed', () => {
