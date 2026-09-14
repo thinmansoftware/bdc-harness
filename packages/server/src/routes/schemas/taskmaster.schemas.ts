@@ -213,13 +213,34 @@ export const registerExpectationResponseSchema = z
   .object({
     id: z.string(),
     registration_key: z.string(),
+    dispatch_ref: z.string(),
+    recipient: z.string(),
+    evidence: evidenceSpecSchema,
     due_at: z.string(),
     on_absence: z.enum(['redispatch', 'escalate', 'give_up']),
     /** False when this key already existed and the existing row was returned. */
     created: z.boolean(),
     self_supervised: z.boolean(),
+    created_at: z.string(),
   })
   .openapi('TaskmasterRegisterExpectationResponse');
+
+export const expectationConflictResponseSchema = z
+  .object({
+    error: z.string(),
+    mismatched_fields: z
+      .array(z.enum(['recipient', 'evidence', 'dispatch_ref', 'on_absence']))
+      .min(1),
+    stored: z.object({
+      recipient: z.string(),
+      evidence: evidenceSpecSchema,
+      dispatch_ref: z.string(),
+      on_absence: z.enum(['redispatch', 'escalate', 'give_up']),
+      due_at: z.string(),
+      created_at: z.string(),
+    }),
+  })
+  .openapi('TaskmasterExpectationConflictResponse');
 
 export const listExpectationsQuerySchema = z.object({
   status: z.enum(['pending', 'met', 'failed', 'escalating', 'escalated', 'given_up']).optional(),
@@ -254,6 +275,7 @@ export const listExpectationsResponseSchema = z
 export type EvidenceSpecBody = z.infer<typeof evidenceSpecSchema>;
 export type RegisterExpectationBody = z.infer<typeof registerExpectationBodySchema>;
 export type RegisterExpectationResponse = z.infer<typeof registerExpectationResponseSchema>;
+export type ExpectationConflictResponse = z.infer<typeof expectationConflictResponseSchema>;
 export type ListExpectationsResponse = z.infer<typeof listExpectationsResponseSchema>;
 
 export type TaskmasterStatusResponse = z.infer<typeof taskmasterStatusResponseSchema>;

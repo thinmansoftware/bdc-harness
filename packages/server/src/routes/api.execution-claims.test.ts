@@ -487,7 +487,7 @@ describe('expectation front door HTTP contract', () => {
     delete process.env.ARCHON_OPERATOR_TOKEN;
   });
 
-  function expectationBody(): string {
+  function expectationBody(over: Record<string, unknown> = {}): string {
     return JSON.stringify({
       registration_key: 'integration-creation',
       dispatch_ref: 'bdc-xo#2007',
@@ -496,21 +496,47 @@ describe('expectation front door HTTP contract', () => {
       evidence: { kind: 'pr_opened', repo: 'thinmansoftware/bdc-harness' },
       due_in_minutes: 60,
       on_absence: 'give_up',
+      ...over,
     });
   }
 
-  function registrationResult(created: boolean) {
+  function registrationResult(created: boolean, over: Record<string, unknown> = {}) {
     return {
       capped: false as const,
       id: 'expectation-1',
       created,
       expectation: {
+        id: 'expectation-1',
+        dispatch_ref: 'bdc-xo#2007',
+        recipient: 'assigned-seat',
+        evidence_json: JSON.stringify({
+          kind: 'pr_opened',
+          repo: 'thinmansoftware/bdc-harness',
+        }),
         due_at: '2026-07-14T01:00:00.000Z',
         on_absence: 'give_up' as const,
+        max_retries: 0,
+        retries: 0,
+        status: 'pending' as const,
+        evidence_pointer: null,
+        registered_by: 'assigning-seat',
         self_supervised: 0,
+        created_at: '2026-07-13T00:00:00.000Z',
+        updated_at: '2026-07-13T00:00:00.000Z',
+        ...over,
       },
     };
   }
+
+  const storedBody = {
+    id: 'expectation-1',
+    recipient: 'assigned-seat',
+    dispatch_ref: 'bdc-xo#2007',
+    evidence: { kind: 'pr_opened', repo: 'thinmansoftware/bdc-harness' },
+    due_at: '2026-07-14T01:00:00.000Z',
+    on_absence: 'give_up',
+    created_at: '2026-07-13T00:00:00.000Z',
+  };
 
   test('returns 201 for creation and 200 for an idempotent retry', async () => {
     const app = makeApp(TOKEN);
@@ -521,7 +547,7 @@ describe('expectation front door HTTP contract', () => {
       body: expectationBody(),
     });
     expect(created.status).toBe(201);
-    expect(await created.json()).toMatchObject({ id: 'expectation-1', created: true });
+    expect(await created.json()).toMatchObject({ ...storedBody, created: true });
 
     registerExpectationSpy.mockImplementation((async () => registrationResult(false)) as never);
     const retried = await app.request('/api/taskmaster/expectations', {
@@ -530,7 +556,57 @@ describe('expectation front door HTTP contract', () => {
       body: expectationBody(),
     });
     expect(retried.status).toBe(200);
-    expect(await retried.json()).toMatchObject({ id: 'expectation-1', created: false });
+    expect(await retried.json()).toMatchObject({ ...storedBody, created: false });
+  });
+
+  test('same-key retry with a different recipient is 409', async () => {
+    const app = makeApp(TOKEN);
+    registerExpectationSpy.mockImplementation((async () =>
+      registrationResult(false, { recipient: 'original-seat' })) as never);
+    const conflicted = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody(),
+    });
+    expect(conflicted.status).toBe(409);
+    expect(await conflicted.json()).toMatchObject({
+      mismatched_fields: ['recipient'],
+      stored: { recipient: 'original-seat' },
+    });
+  });
+
+  test('same-key retry with different evidence is 409', async () => {
+    const app = makeApp(TOKEN);
+    registerExpectationSpy.mockImplementation((async () =>
+      registrationResult(false, {
+        evidence_json: JSON.stringify({ kind: 'pr_opened', repo: 'other/repo' }),
+      })) as never);
+    const conflicted = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody(),
+    });
+    expect(conflicted.status).toBe(409);
+    expect(await conflicted.json()).toMatchObject({
+      mismatched_fields: ['evidence'],
+      stored: { evidence: { kind: 'pr_opened', repo: 'other/repo' } },
+    });
+  });
+
+  test('same-key retry that only changes the deadline is 200 with the stored deadline', async () => {
+    const app = makeApp(TOKEN);
+    registerExpectationSpy.mockImplementation((async () => registrationResult(false)) as never);
+    const retried = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody({ due_in_minutes: 1440 }),
+    });
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toMatchObject({
+      ...storedBody,
+      created: false,
+      due_at: '2026-07-14T01:00:00.000Z',
+    });
   });
 
   test('publishes both success statuses with the same response schema', async () => {
@@ -543,6 +619,7 @@ describe('expectation front door HTTP contract', () => {
     expect(responses).toMatchObject({
       '200': { description: expect.any(String) },
       '201': { description: 'New expectation created.' },
+      '409': { description: expect.any(String) },
     });
   });
 });

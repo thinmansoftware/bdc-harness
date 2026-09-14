@@ -1,7 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { evidenceSpecSchema, registerExpectationBodySchema } from './schemas/taskmaster.schemas';
+import {
+  evidenceSpecSchema,
+  expectationConflictResponseSchema,
+  registerExpectationBodySchema,
+  registerExpectationResponseSchema,
+} from './schemas/taskmaster.schemas';
 
 const apiSource = readFileSync(join(import.meta.dir, 'api.ts'), 'utf8');
 
@@ -25,6 +30,7 @@ describe('expectation front door: route wiring', () => {
     expect(declaration).toContain("401: jsonError('Missing or invalid operator token')");
     expect(declaration).toMatch(/400: jsonError\(/);
     expect(declaration).toMatch(/429: jsonError\(/);
+    expect(declaration).toMatch(/409: \{[\s\S]*expectationConflictResponseSchema/);
   });
 
   test('the POST declares both idempotent retry and creation success responses', () => {
@@ -88,6 +94,18 @@ describe('expectation front door: route wiring', () => {
     expect(handler).not.toContain('cap_exempt');
     expect(handler).toContain('registerExpectationReportingCreation');
     expect(handler).toContain('created ? 201 : 200');
+    expect(handler).toContain('expectationSemanticMismatches');
+    expect(handler).toContain('mismatched_fields');
+  });
+
+  test('a same-key semantic mismatch is a 409, not a silent 200', () => {
+    const handler = apiSource.slice(
+      apiSource.indexOf('// POST /api/taskmaster/expectations -'),
+      apiSource.indexOf('// GET /api/taskmaster/expectations -')
+    );
+    expect(handler).toContain('if (mismatched.length > 0)');
+    expect(handler).toMatch(/,\s*409/);
+    expect(handler).toContain('created_at: expectation.created_at');
   });
 
   test('the cap is enforced in the write, not by a count before it', () => {
@@ -226,6 +244,41 @@ describe('expectation front door: the contract', () => {
         due_in_minutes: 43_201,
       }).success
     ).toBe(false);
+  });
+
+  test('the success body carries the stored specification, not just id and deadline', () => {
+    const parsed = registerExpectationResponseSchema.parse({
+      id: 'e1',
+      registration_key: 'ext:xo:abcdefgh',
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence: { kind: 'pr_opened', repo: 'a/b' },
+      due_at: '2026-09-15T00:00:00.000Z',
+      on_absence: 'escalate',
+      created: false,
+      self_supervised: false,
+      created_at: '2026-09-14T00:00:00.000Z',
+    });
+    expect(parsed.recipient).toBe('fable-cursor');
+    expect(parsed.dispatch_ref).toBe('bdc-xo#2006');
+    expect(parsed.created_at).toBe('2026-09-14T00:00:00.000Z');
+  });
+
+  test('a 409 body names the mismatched fields and the stored values', () => {
+    const parsed = expectationConflictResponseSchema.parse({
+      error: 'Expectation already exists under this key with a different specification',
+      mismatched_fields: ['recipient'],
+      stored: {
+        recipient: 'fable-cursor',
+        evidence: { kind: 'pr_opened', repo: 'a/b' },
+        dispatch_ref: 'bdc-xo#2006',
+        on_absence: 'escalate',
+        due_at: '2026-09-15T00:00:00.000Z',
+        created_at: '2026-09-14T00:00:00.000Z',
+      },
+    });
+    expect(parsed.mismatched_fields).toEqual(['recipient']);
+    expect(parsed.stored.recipient).toBe('fable-cursor');
   });
 });
 

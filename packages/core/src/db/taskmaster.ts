@@ -362,6 +362,50 @@ export type RegisterExpectationResult =
   | { capped: false; id: string; created: boolean; expectation: TmExpectation }
   | { capped: true; observed: number };
 
+export type ExpectationSemanticField = 'recipient' | 'evidence' | 'dispatch_ref' | 'on_absence';
+
+/**
+ * Fields that identify WHAT is being supervised. A retry under the same
+ * registration_key that differs in any of these is not an idempotent retry:
+ * it is a request to watch different work. Deadline is intentionally absent
+ * -- a caller may send a new due_at and still match; the stored deadline wins.
+ */
+export function expectationSemanticMismatches(
+  stored: Pick<TmExpectation, 'recipient' | 'evidence_json' | 'dispatch_ref' | 'on_absence'>,
+  requested: Pick<TmExpectation, 'recipient' | 'evidence_json' | 'dispatch_ref' | 'on_absence'>
+): ExpectationSemanticField[] {
+  const mismatched: ExpectationSemanticField[] = [];
+  if (stored.recipient !== requested.recipient) mismatched.push('recipient');
+  if (
+    canonicalizeJsonText(stored.evidence_json) !== canonicalizeJsonText(requested.evidence_json)
+  ) {
+    mismatched.push('evidence');
+  }
+  if (stored.dispatch_ref !== requested.dispatch_ref) mismatched.push('dispatch_ref');
+  if (stored.on_absence !== requested.on_absence) mismatched.push('on_absence');
+  return mismatched;
+}
+
+function canonicalizeJsonText(text: string): string {
+  try {
+    return canonicalizeJsonValue(JSON.parse(text) as unknown);
+  } catch {
+    return text;
+  }
+}
+
+function canonicalizeJsonValue(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(item => canonicalizeJsonValue(item)).join(',')}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map(key => `${JSON.stringify(key)}:${canonicalizeJsonValue(record[key])}`)
+    .join(',')}}`;
+}
+
 /**
  * Register through the front door, ENFORCING THE DAILY CAP ATOMICALLY.
  *

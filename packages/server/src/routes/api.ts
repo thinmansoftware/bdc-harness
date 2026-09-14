@@ -82,6 +82,7 @@ import {
   taskmasterControlResponseSchema,
   registerExpectationBodySchema,
   registerExpectationResponseSchema,
+  expectationConflictResponseSchema,
   listExpectationsQuerySchema,
   listExpectationsResponseSchema,
   registerListQuerySchema,
@@ -2357,7 +2358,8 @@ const postTaskmasterExpectationRoute = createRoute({
   responses: {
     200: {
       content: { 'application/json': { schema: registerExpectationResponseSchema } },
-      description: 'The expectation id; `created: false` when the key already existed',
+      description:
+        'Idempotent retry of the same specification; body is the stored row including original deadline',
     },
     201: {
       content: { 'application/json': { schema: registerExpectationResponseSchema } },
@@ -2365,6 +2367,10 @@ const postTaskmasterExpectationRoute = createRoute({
     },
     400: jsonError('Invalid evidence spec, deadline, or self-supervised escalation'),
     401: jsonError('Missing or invalid operator token'),
+    409: {
+      content: { 'application/json': { schema: expectationConflictResponseSchema } },
+      description: 'Same registration_key already watches different work',
+    },
     429: jsonError('Registrant exceeded its daily expectation cap'),
     500: jsonError('Server error'),
   },
@@ -3548,6 +3554,32 @@ export function registerApiRoutes(
             'registration_key are always accepted'
         );
       const { id, created, expectation } = result;
+      const storedEvidence = JSON.parse(expectation.evidence_json) as unknown;
+      if (!created) {
+        const mismatched = taskmasterDb.expectationSemanticMismatches(expectation, {
+          recipient: body.recipient,
+          evidence_json: JSON.stringify(body.evidence),
+          dispatch_ref: body.dispatch_ref,
+          on_absence: body.on_absence,
+        });
+        if (mismatched.length > 0) {
+          return c.json(
+            {
+              error: 'Expectation already exists under this key with a different specification',
+              mismatched_fields: mismatched,
+              stored: {
+                recipient: expectation.recipient,
+                evidence: storedEvidence,
+                dispatch_ref: expectation.dispatch_ref,
+                on_absence: expectation.on_absence,
+                due_at: expectation.due_at,
+                created_at: expectation.created_at,
+              },
+            },
+            409
+          );
+        }
+      }
       getLog().info(
         { expectationId: id, registeredBy: body.registered_by, dueAt, created, selfSupervised },
         'taskmaster_expectation_registered'
@@ -3556,10 +3588,14 @@ export function registerApiRoutes(
         {
           id,
           registration_key: registrationKey,
+          dispatch_ref: expectation.dispatch_ref,
+          recipient: expectation.recipient,
+          evidence: storedEvidence,
           due_at: expectation.due_at,
           on_absence: expectation.on_absence,
           created,
           self_supervised: expectation.self_supervised === 1,
+          created_at: expectation.created_at,
         },
         created ? 201 : 200
       );

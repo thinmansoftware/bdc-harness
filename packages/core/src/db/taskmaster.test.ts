@@ -38,6 +38,7 @@ import {
   registerExpectation,
   registerExpectationReportingCreation,
   listExpectations,
+  expectationSemanticMismatches,
   countExternalExpectationsSince,
   expectationKeyExists,
   listDueExpectations,
@@ -2248,6 +2249,60 @@ describe('expectation front door (bdc-xo#2007)', () => {
     expect(page.rows).toHaveLength(2);
     // A caller paging the registry must be told how much it has NOT seen.
     expect(page.total).toBe(4);
+  });
+
+  test('same-key different recipient does not overwrite the stored row', async () => {
+    const first = await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:semantic-1',
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    const second = await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:semantic-1',
+      dispatch_ref: 'other-ref',
+      recipient: 'other-seat',
+      evidence_json: JSON.stringify({ kind: 'lease_holder_is', name: 'xo-main' }),
+      due_at: future(),
+      on_absence: 'give_up',
+      max_retries: 2,
+      registered_by: 'xo',
+    });
+    expect(second.created).toBe(false);
+    expect(second.id).toBe(first.id);
+    expect(second.expectation.recipient).toBe('fable-cursor');
+    expect(second.expectation.dispatch_ref).toBe('bdc-xo#2006');
+    expect(second.expectation.evidence_json).toBe(spec);
+    expect(second.expectation.on_absence).toBe('escalate');
+    expect(second.expectation.max_retries).toBe(0);
+  });
+
+  test('semantic comparison ignores evidence key order and does not compare deadline', () => {
+    const stored = {
+      recipient: 'fable-cursor',
+      evidence_json: '{"repo":"a/b","kind":"pr_opened"}',
+      dispatch_ref: 'bdc-xo#2006',
+      on_absence: 'escalate' as const,
+    };
+    expect(
+      expectationSemanticMismatches(stored, {
+        ...stored,
+        evidence_json: '{"kind":"pr_opened","repo":"a/b"}',
+      })
+    ).toEqual([]);
+    expect(expectationSemanticMismatches(stored, { ...stored, recipient: 'other-seat' })).toEqual([
+      'recipient',
+    ]);
+    expect(
+      expectationSemanticMismatches(stored, {
+        ...stored,
+        evidence_json: '{"kind":"pr_opened","repo":"other/repo"}',
+      })
+    ).toEqual(['evidence']);
   });
 });
 

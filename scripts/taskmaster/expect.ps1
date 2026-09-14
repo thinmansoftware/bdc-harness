@@ -213,6 +213,10 @@ $lines = $response -split "`n"
 $status = $lines[-1].Trim()
 $responseBody = ($lines[0..($lines.Count - 2)] -join "`n").Trim()
 
+if ($status -eq '409') {
+    Write-Error "Registration conflict (HTTP 409): this key already watches different work. $responseBody"
+    exit 1
+}
 if ($status -notin @('200', '201')) {
     Write-Error "Registration failed (HTTP $status): $responseBody"
     exit 1
@@ -227,10 +231,14 @@ if ($result.created) {
     Write-Host "Expectation already existed under this key: $($result.id)"
     Write-Host 'The deadline below is the ORIGINAL one, not the one you just asked for.'
 }
-Write-Host "  recipient:  $Recipient"
-Write-Host "  evidence:   $Evidence"
+# Print the STORED specification. Echoing the request would tell the caller
+# their new recipient/evidence is watched when the row still watches the original.
+Write-Host "  recipient:  $($result.recipient)"
+Write-Host "  evidence:   $($result.evidence | ConvertTo-Json -Compress -Depth 8)"
+Write-Host "  dispatch_ref: $($result.dispatch_ref)"
 Write-Host "  due at:     $($result.due_at)"
 Write-Host "  on absence: $($result.on_absence)"
+Write-Host "  created at: $($result.created_at)"
 if ($result.self_supervised) {
     Write-Host '  NOTE: self-supervised (registrant is the recipient).'
 }
