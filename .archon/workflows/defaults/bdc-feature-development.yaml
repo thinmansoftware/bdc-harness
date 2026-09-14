@@ -1939,7 +1939,8 @@ nodes:
       First check for `Repair target: PR #N (branch X)` in the spec. Verify it with
       `gh pr view N --repo <target-repo> --json state,headRefName`: state must be OPEN
       and headRefName must equal X. On success, emit the normal fields below plus
-      `repair_target_branch: <spec-declared-head-branch>` and use X as the feature
+      `repair_target_pr: #N` and `repair_target_branch: <verified-headRefName-from-gh>`;
+      use that verified head as the feature branch and stop without deriving a fresh
       branch. On a closed PR or repo/branch mismatch, fail closed with the exact
       declared-repair-target reason from the approved plan. Never mint a replacement.
 
@@ -2241,9 +2242,33 @@ nodes:
         exit 1
       fi
       REPAIR_TARGET_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
+      REPAIR_TARGET_PR=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_pr:[[:space:]]*#\{0,1\}\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
       if [ -n "$REPAIR_TARGET_BRANCH" ]; then
-        if ! printf '%s\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        if [ -z "$REPAIR_TARGET_PR" ]; then
+          echo "ERROR: repair_target_branch present without repair_target_pr" >&2
+          exit 1
+        fi
+        if ! git check-ref-format --branch "$REPAIR_TARGET_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
           echo "ERROR: invalid repair_target_branch '${REPAIR_TARGET_BRANCH}'" >&2
+          exit 1
+        fi
+        REPO_FOR_CHECK=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repo:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
+        if ! printf '%s\n' "$REPO_FOR_CHECK" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+          echo "ERROR: invalid or missing repo for repair target verification" >&2
+          exit 1
+        fi
+        if ! REPAIR_TARGET_LIVE=$(gh pr view "$REPAIR_TARGET_PR" --repo "$REPO_FOR_CHECK" --json state,headRefName --jq '.state + "\\t" + .headRefName' 2>/dev/null); then
+          echo "ERROR: declared repair target #${REPAIR_TARGET_PR} not found on ${REPO_FOR_CHECK}" >&2
+          exit 1
+        fi
+        REPAIR_TARGET_STATE=${REPAIR_TARGET_LIVE%%$'\t'*}
+        REPAIR_TARGET_LIVE_BRANCH=${REPAIR_TARGET_LIVE#*$'\t'}
+        if [ "$REPAIR_TARGET_STATE" != "OPEN" ]; then
+          echo "ERROR: declared repair target #${REPAIR_TARGET_PR} is ${REPAIR_TARGET_STATE}" >&2
+          exit 1
+        fi
+        if [ "$REPAIR_TARGET_LIVE_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
+          echo "ERROR: declared repair target #${REPAIR_TARGET_PR} head branch mismatch: expected ${REPAIR_TARGET_BRANCH}, got ${REPAIR_TARGET_LIVE_BRANCH}" >&2
           exit 1
         fi
         UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"

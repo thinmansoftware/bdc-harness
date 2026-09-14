@@ -17,7 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -158,6 +158,42 @@ else
   echo "REVIEW_BASE=master"
   echo "REVIEW_BASE_SOURCE=fallback-master"
 fi
+`;
+
+// Repair-target selection from commit-and-push. The gh executable is replaced
+// by each test so these checks exercise the push-time trust boundary without
+// network access.
+const REPAIR_TARGET_SELECTION = `
+set -euo pipefail
+DECIDE_OUTPUT_CLEAN=$(printf '%s\\n' "$DECIDE_OUTPUT" | tr -d '\`')
+BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+REPAIR_TARGET_BRANCH=$(printf '%s\\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\\([^[:space:]]*\\)[[:space:]]*$/\\1/p' | head -n 1)
+REPAIR_TARGET_PR=$(printf '%s\\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_pr:[[:space:]]*#\\{0,1\\}\\([0-9][0-9]*\\)[[:space:]]*$/\\1/p' | head -n 1)
+if [ -z "$REPAIR_TARGET_PR" ]; then
+  echo "ERROR: repair_target_branch present without repair_target_pr" >&2
+  exit 1
+fi
+if ! git check-ref-format --branch "$REPAIR_TARGET_BRANCH" >/dev/null 2>&1 || ! printf '%s\\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+  echo "ERROR: invalid repair_target_branch '\${REPAIR_TARGET_BRANCH}'" >&2
+  exit 1
+fi
+REPO_FOR_CHECK=$(printf '%s\\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repo:[[:space:]]*\\([^[:space:]]*\\)[[:space:]]*$/\\1/p' | head -n 1)
+if ! REPAIR_TARGET_LIVE=$(gh pr view "$REPAIR_TARGET_PR" --repo "$REPO_FOR_CHECK" --json state,headRefName --jq '.state + "\\t" + .headRefName' 2>/dev/null); then
+  echo "ERROR: declared repair target #\${REPAIR_TARGET_PR} not found on \${REPO_FOR_CHECK}" >&2
+  exit 1
+fi
+REPAIR_TARGET_STATE=\${REPAIR_TARGET_LIVE%%$'\\t'*}
+REPAIR_TARGET_LIVE_BRANCH=\${REPAIR_TARGET_LIVE#*$'\\t'}
+if [ "$REPAIR_TARGET_STATE" != "OPEN" ]; then
+  echo "ERROR: declared repair target #\${REPAIR_TARGET_PR} is \${REPAIR_TARGET_STATE}" >&2
+  exit 1
+fi
+if [ "$REPAIR_TARGET_LIVE_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
+  echo "ERROR: declared repair target #\${REPAIR_TARGET_PR} head branch mismatch" >&2
+  exit 1
+fi
+UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"
+echo "UNIQUE_BRANCH=$UNIQUE_BRANCH"
 `;
 
 // Anchor on import.meta.dir, not CWD: turbo runs package tests with cwd at the
@@ -616,9 +652,54 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
   it('hands the verified repair-target branch to commit-and-push without a thread suffix', () => {
     for (const lane of judgeLanes) {
       const yaml = readFileSync(lane, 'utf8');
-      expect(yaml).toContain('repair_target_branch: <spec-declared-head-branch>');
+      expect(yaml).toContain('repair_target_branch: <verified-headRefName-from-gh>');
+      expect(yaml).toContain('repair_target_pr: #N');
+      expect(yaml).toContain('gh pr view "$REPAIR_TARGET_PR"');
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
     }
+  });
+
+  function fakeGhPath(state: string, branch: string): string {
+    const binDir = mkdtempSync(join(tmpdir(), 'bdc-fake-gh-'));
+    const ghPath = join(binDir, 'gh');
+    writeFileSync(ghPath, `#!/bin/sh\nprintf '%s\\t%s\\n' '${state}' '${branch}'\n`);
+    chmodSync(ghPath, 0o755);
+    return `${binDir}:${process.env.PATH ?? ''}`;
+  }
+
+  const decideOutput = (branch: string) =>
+    [`repair_target_pr: #826`, `repair_target_branch: ${branch}`, 'repo: thinmansoftware/bdc-harness'].join(
+      '\n'
+    );
+
+  it('re-verifies an open matching PR before selecting its branch', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: decideOutput(branch),
+      PATH: fakeGhPath('OPEN', branch),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
+  });
+
+  it('fails closed when the repair-target PR has closed', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: decideOutput(branch),
+      PATH: fakeGhPath('CLOSED', branch),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('declared repair target #826 is CLOSED');
+  });
+
+  it('fails closed when the live repair-target branch differs', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: decideOutput(branch),
+      PATH: fakeGhPath('OPEN', 'feat/a-different-branch'),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('declared repair target #826 head branch mismatch');
   });
 });
 
