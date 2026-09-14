@@ -98,14 +98,8 @@ describe('diff-repair checkpoint and salvage', () => {
   it('uses the uncommitted salvage message and preservation sentinel', () => {
     const dir = makeRepo();
     writeFileSync(join(dir, 'README.md'), 'salvaged\n');
-    const script = `set -euo pipefail
-CHANGED=$(git status --porcelain | grep -c . || true)
-git add -A
-if ! git diff --cached --quiet; then
-  if [ "$CHANGED" -gt 0 ]; then COMMIT_MSG="salvage(uncommitted): \${CHANGED} files"; else COMMIT_MSG="salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)"; fi
-  git commit -q -m "$COMMIT_MSG"
-fi
-if [ "$CHANGED" -gt 0 ]; then echo "SALVAGE=preserved_uncommitted:\${CHANGED}"; fi`;
+    const script = nodeBash('noninteractive-salvage')
+      .replace('$block-reclassify.output', '{"status":"BLOCKED"}');
     const result = run(['bash', '-c', script], dir);
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toContain('SALVAGE=preserved_uncommitted:1');

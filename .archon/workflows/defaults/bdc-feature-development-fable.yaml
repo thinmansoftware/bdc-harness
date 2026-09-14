@@ -1770,15 +1770,15 @@ nodes:
         git -c user.name='cauldron-salvage' -c user.email='noreply@bluedevilcollectibles.com' \
           commit -m "$COMMIT_MSG" 2>&1 | tail -1 || true
       fi
+      if [ "$CHANGED" -gt 0 ]; then
+        echo "SALVAGE=preserved_uncommitted:${CHANGED}"
+      fi
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
         PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "${BASE_BRANCH:-dev}" \
           --title "FALLBACK: opus-repaired build needs human review" \
           --body "FALLBACK PATH: a BLOCKED build was auto-repaired by opus-repair, but the non-interactive run could not reach a human approval gate. The repair commit is pushed here for human review instead of being stranded in the worktree. See run artifacts for the original block reason." \
           2>&1 | tail -1 || true)
-        if [ "$CHANGED" -gt 0 ]; then
-          echo "SALVAGE=preserved_uncommitted:${CHANGED}"
-        fi
         echo "SALVAGE=pushed branch ${BR}; PR=${PR_URL}"
       else
         echo "SALVAGE=push-failed (work remains in worktree ${WT})"
