@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'bun:test';
-import { readFileSync, readdirSync } from 'fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { parseWorkflow } from './loader';
+import { substituteNodeOutputRefs } from './dag-executor';
 import {
   clearRegistry,
   registerBuiltinProviders,
@@ -110,6 +112,7 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         expect(n.bash).toContain(
           "case \"$cmd\" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1"
         );
+        expect(n.bash).toContain('[ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]');
       });
 
       it('war-council-validator depends on both evidence nodes and carries the executed-command contract', () => {
@@ -174,5 +177,130 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
       'utf-8'
     );
     expect(collector).toContain("'Tests: N/A (required gates are reported separately)'");
+  });
+});
+
+function rstField(stdout: string, key: string): string {
+  const line = stdout.split('\n').find(row => row.startsWith(`${key}=`));
+  if (!line) {
+    throw new Error(`missing ${key} in:\n${stdout}`);
+  }
+  return line.slice(key.length + 1);
+}
+
+function rstSpec(command: string): string {
+  return [
+    'WO Class: CODE',
+    '',
+    'Stop 2 (test suite):',
+    `  ${command}`,
+    '  Expected: all passing',
+  ].join('\n');
+}
+
+function runStopTestsNode(opts: {
+  readonly spec: string;
+  readonly files?: Readonly<Record<string, string>>;
+}): { readonly stdout: string; readonly log: string } {
+  const cwd = mkdtempSync(join(tmpdir(), 'rst-ladder-'));
+  const artifacts = join(cwd, 'artifacts');
+  mkdirSync(artifacts);
+  try {
+    writeFileSync(
+      join(cwd, 'package.json'),
+      `${JSON.stringify({ name: 'x', scripts: { test: 'bash ./repo-pass.sh' } })}\n`
+    );
+    writeFileSync(join(cwd, 'bun.lock'), '{}\n');
+    writeFileSync(join(cwd, 'repo-pass.sh'), 'echo "Tests: 1/1"\nexit 0\n');
+    for (const [rel, body] of Object.entries(opts.files ?? {})) {
+      writeFileSync(join(cwd, rel), body);
+    }
+    const bash = node(
+      laneNodes('bdc-feature-development-codex.yaml'),
+      'run-stop-tests',
+      'canonical'
+    ).bash;
+    if (!bash) throw new Error('run-stop-tests has no bash');
+    const rendered = substituteNodeOutputRefs(
+      bash,
+      new Map([['read-spec', { state: 'completed' as const, output: opts.spec }]]),
+      true
+    );
+    const proc = Bun.spawnSync(['bash', '-c', rendered], {
+      cwd,
+      env: { ...process.env, ARTIFACTS_DIR: artifacts },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stdout = proc.stdout.toString();
+    let log = '';
+    try {
+      log = readFileSync(join(artifacts, 'evidence', 'stop-tests.log'), 'utf-8');
+    } catch {
+      log = '';
+    }
+    if (proc.exitCode !== 0) {
+      throw new Error(
+        `run-stop-tests exited ${proc.exitCode}: ${stdout}\n${proc.stderr.toString()}`
+      );
+    }
+    return { stdout, log };
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+// The behavioral cases spawn the node's bash; on win32 `bash` resolves to WSL and
+// produces nothing, so they run on POSIX CI only (ubuntu-latest).
+describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral)', () => {
+  it('a spec-declared command that exits nonzero with no counts stays failed; repo_test_script is not run', () => {
+    const { stdout, log } = runStopTestsNode({
+      spec: rstSpec('bash ./exit3.sh'),
+      files: { 'exit3.sh': 'exit 3\n' },
+    });
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('failed');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toBe('spec_declared');
+    expect(rstField(stdout, 'TESTS_LINE')).toBe(
+      'N/A (spec-declared test command exited 3 with no parseable counts: bash ./exit3.sh) -- FAILED'
+    );
+    expect(log).toContain('### run-stop-tests: bash ./exit3.sh');
+    expect(log).toContain('### exit 3');
+    expect(log).not.toContain('### run-stop-tests: bun run test');
+    expect(stdout).not.toContain('repo_test_script');
+  });
+
+  it('a spec-declared command that exits 0 with no counts still falls through to repo_test_script', () => {
+    const { stdout, log } = runStopTestsNode({
+      spec: rstSpec('bash ./noop.sh'),
+      files: { 'noop.sh': 'exit 0\n' },
+    });
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('passed');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toContain('repo_test_script');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toContain('after: spec_declared');
+    expect(log).toContain('### run-stop-tests: bash ./noop.sh');
+    expect(log).toContain('### run-stop-tests: bun run test');
+    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/1 (bun run test)');
+  });
+
+  it('parsed passing counts from a spec-declared command still report passed', () => {
+    const { stdout, log } = runStopTestsNode({
+      spec: rstSpec('bash ./green.sh'),
+      files: { 'green.sh': 'echo "Tests: 3/3"\nexit 0\n' },
+    });
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('passed');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toBe('spec_declared');
+    expect(rstField(stdout, 'TESTS_LINE')).toBe('3/3 (bash ./green.sh)');
+    expect(log).not.toContain('### run-stop-tests: bun run test');
+  });
+
+  it('parsed failing counts from a spec-declared command still report failed', () => {
+    const { stdout, log } = runStopTestsNode({
+      spec: rstSpec('bash ./red.sh'),
+      files: { 'red.sh': 'echo "Tests: 1/2"\nexit 1\n' },
+    });
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('failed');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toBe('spec_declared');
+    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/2 (bash ./red.sh) -- FAILED, exit 1');
+    expect(log).not.toContain('### run-stop-tests: bun run test');
   });
 });

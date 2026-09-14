@@ -1243,9 +1243,12 @@ nodes:
       }
       # rst_report <class> <cmd> <exit> <counts>   (-> TESTS_STATUS / TESTS_LINE lines)
       #   Status law: passed only when the command exited 0 AND passed == total > 0.
-      #   Any nonzero exit, any failing test, or 0 tests ran is "failed". Unparseable
-      #   output is "counts_unparsed" (fail-closed downstream on CODE/MIXED). A CODE or
-      #   MIXED spec with no runnable test command AND no test files in the diff is
+      #   Any nonzero exit, any failing test, or 0 tests ran is "failed". A
+      #   spec-declared command that exited nonzero with no parseable counts is
+      #   also "failed" (the required command failed; do not treat it as an
+      #   unparseable rung). Other unparseable output is "counts_unparsed"
+      #   (fail-closed downstream on CODE/MIXED). A CODE or MIXED spec with no
+      #   runnable test command AND no test files in the diff is
       #   "no_command_declared" (spec + build defect).
       rst_report() {
         local class="$1" cmd="$2" exit_code="$3" counts="$4" status line p t
@@ -1255,8 +1258,13 @@ nodes:
             *) status="not_required"; line="N/A ($class class, no test command declared)" ;;
           esac
         elif [ -z "$counts" ]; then
-          status="counts_unparsed"
-          line="N/A (test command exited $exit_code but pass/total could not be parsed from its output: $cmd)"
+          if [ "$exit_code" -ne 0 ] && [ "${SOURCE:-}" = "spec_declared" ]; then
+            status="failed"
+            line="N/A (spec-declared test command exited $exit_code with no parseable counts: $cmd) -- FAILED"
+          else
+            status="counts_unparsed"
+            line="N/A (test command exited $exit_code but pass/total could not be parsed from its output: $cmd)"
+          fi
         else
           p="${counts%% *}"; t="${counts##* }"
           if [ "$exit_code" -ne 0 ] || [ "$t" -eq 0 ] || [ "$p" -lt "$t" ]; then
@@ -1309,22 +1317,27 @@ nodes:
       }
       if [ "$CLASS" != "DOCUMENTATION" ] && [ "$CLASS" != "OPERATOR" ]; then
         # Ladder: spec-declared -> test files in this run's diff -> the repo's own test
-        # script. A rung whose command(s) produced no parseable counts (a prose mention
-        # that looked like a command, a runner that printed nothing) falls through to
-        # the next rung; the earlier attempt stays in the log and in TESTS_SOURCE.
+        # script. A spec-declared command that ran and exited nonzero is failed even
+        # with no parseable counts -- do not replace it with fallback evidence. A rung
+        # that exited 0 with no parseable counts (or no command at all) falls through;
+        # the earlier attempt stays in the log and in TESTS_SOURCE.
         TRIED=""
         if ! rst_try "spec_declared"; then
-          [ -s "$CMDS" ] && TRIED="spec_declared command(s) gave no parseable counts: $CMD_JOINED"
-          : > "$CMDS"
-          RUN_START_SHA="$(cat "${ARTIFACTS_DIR:-.}/run-start-sha.txt" 2>/dev/null || true)"
-          if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
-            rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
-          fi
-          if ! rst_try "tests_in_diff"; then
-            [ -s "$CMDS" ] && TRIED="${TRIED:+$TRIED; }tests_in_diff command(s) gave no parseable counts: $CMD_JOINED"
+          if [ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]; then
+            TRIED="spec_declared command(s) exited $EXIT_CODE with no parseable counts: $CMD_JOINED"
+          else
+            [ -s "$CMDS" ] && TRIED="spec_declared command(s) gave no parseable counts: $CMD_JOINED"
             : > "$CMDS"
-            rst_repo_test_script > "$CMDS"
-            rst_try "repo_test_script" || true
+            RUN_START_SHA="$(cat "${ARTIFACTS_DIR:-.}/run-start-sha.txt" 2>/dev/null || true)"
+            if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
+              rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
+            fi
+            if ! rst_try "tests_in_diff"; then
+              [ -s "$CMDS" ] && TRIED="${TRIED:+$TRIED; }tests_in_diff command(s) gave no parseable counts: $CMD_JOINED"
+              : > "$CMDS"
+              rst_repo_test_script > "$CMDS"
+              rst_try "repo_test_script" || true
+            fi
           fi
         fi
         if [ -z "$COUNTS" ] && [ -z "$CMD_JOINED" ] && [ -n "$TRIED" ]; then
@@ -1332,7 +1345,11 @@ nodes:
           # the N/A line names what was actually run
           CMD_JOINED="${TRIED##*: }"
         fi
-        [ -n "$TRIED" ] && SOURCE="$SOURCE (after: $TRIED)"
+        if [ -n "$TRIED" ]; then
+          if [ "$SOURCE" != "spec_declared" ] || [ "$EXIT_CODE" -eq 0 ]; then
+            SOURCE="$SOURCE (after: $TRIED)"
+          fi
+        fi
       fi
       echo "TESTS_CLASS=$CLASS"
       echo "TESTS_SOURCE=$SOURCE"
