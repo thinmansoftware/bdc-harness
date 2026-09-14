@@ -587,6 +587,33 @@ describe('Lane consistency: all feature-development lanes share review-base wiri
   });
 });
 
+describe('Plan-review repair targets and operator-recorded stops', () => {
+  const judgeLanes = [
+    '.archon/workflows/defaults/bdc-feature-development-codex.yaml',
+    '.archon/workflows/defaults/bdc-feature-development.yaml',
+  ];
+
+  it('authorizes a spec-declared repair target in the Codex lane', () => {
+    const yaml = readFileSync(judgeLanes[0], 'utf8');
+    expect(yaml).toContain('repair_target_authorized_by_spec');
+    expect(yaml).not.toContain('should it be closed');
+  });
+
+  it('authorizes a spec-declared repair target in the default lane', () => {
+    const yaml = readFileSync(judgeLanes[1], 'utf8');
+    expect(yaml).toContain('repair_target_authorized_by_spec');
+    expect(yaml).not.toContain('should it be closed');
+  });
+
+  it('preserves operator-recorded stops as pending in the Codex lane', () => {
+    expect(readFileSync(judgeLanes[0], 'utf8')).toContain('OPERATOR-RECORDED (pending)');
+  });
+
+  it('preserves operator-recorded stops as pending in the default lane', () => {
+    expect(readFileSync(judgeLanes[1], 'utf8')).toContain('OPERATOR-RECORDED (pending)');
+  });
+});
+
 describe('Backward compatibility: clean valid path', () => {
   it('Test 5: validator accepts + fallback is not triggered for clean valid case', () => {
     // Agent emits BRANCH=feat/wo-bar-02; the regex passes.
