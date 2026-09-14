@@ -235,6 +235,22 @@ export function selectLatestCompletion(runs: CheckRunLike[]): LatestCheckComplet
   return { ...latest, allChecksGreen: sawAnyRun && allChecksGreen };
 }
 
+export async function readLatestCheckCompletion(
+  octokit: CheckRunsForRefClient,
+  candidate: Pick<SweepCandidate, 'owner' | 'repo' | 'headSha'>
+): Promise<LatestCheckCompletion | null> {
+  const { runs, complete } = await fetchAllCheckRunsForRef(octokit, {
+    owner: candidate.owner,
+    repo: candidate.repo,
+    ref: candidate.headSha,
+  });
+  const latest = selectLatestCompletion(runs);
+  if (!latest || complete) return latest;
+  // A capped or failed page walk is partial evidence and therefore cannot
+  // establish that every check at the exact head is green.
+  return { ...latest, allChecksGreen: false };
+}
+
 export function createRealStaleVerdictSweepDeps(config: ReviewRouteConfig): StaleVerdictSweepDeps {
   // Reuse the recheck ingest's own bindings for the two seams they share, so
   // the sweep and the webhook cannot disagree about what a standing verdict is
@@ -244,23 +260,7 @@ export function createRealStaleVerdictSweepDeps(config: ReviewRouteConfig): Stal
   return {
     listCandidates: (limit, afterSeq) => listRealSweepCandidates(limit, afterSeq),
     readStandingVerdict: candidate => recheckDeps.readStandingVerdict(candidate),
-    async readLatestCheckCompletion(candidate): Promise<LatestCheckCompletion | null> {
-      const { runs, complete } = await fetchAllCheckRunsForRef(octokit, {
-        owner: candidate.owner,
-        repo: candidate.repo,
-        ref: candidate.headSha,
-      });
-      // The shared octokit interface models only the fields the evaluator needs
-      // (name/status/conclusion); the live API also returns `id` and
-      // `completed_at`, which the staleness comparison requires. Narrow through
-      // `unknown` here rather than widening the shared type, so this sweep
-      // cannot alter what other callers of that interface are promised.
-      const latest = selectLatestCompletion(runs);
-      if (!latest || complete) return latest;
-      // A capped or failed page walk is partial evidence and therefore cannot
-      // establish that every check at the exact head is green.
-      return { ...latest, allChecksGreen: false };
-    },
+    readLatestCheckCompletion: candidate => readLatestCheckCompletion(octokit, candidate),
     enqueueRecheckWork: input => recheckDeps.enqueueRecheckWork(input),
   };
 }

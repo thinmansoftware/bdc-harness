@@ -16,7 +16,7 @@ import {
   type StaleVerdictSweepDeps,
   type SweepCandidate,
 } from './stale-verdict-sweep';
-import { fetchAllCheckRunsForRef, selectLatestCompletion } from './stale-verdict-sweep-wiring';
+import { readLatestCheckCompletion, selectLatestCompletion } from './stale-verdict-sweep-wiring';
 
 const HEAD = '5ac93b765ac93b765ac93b765ac93b765ac93b76';
 
@@ -804,14 +804,14 @@ describe('selectLatestCompletion', () => {
   });
 });
 
-describe('fetchAllCheckRunsForRef', () => {
-  test('includes a failing check run beyond the first 100', async () => {
+describe('paginated check runs in the stale-verdict sweep', () => {
+  test('the sweep does not enqueue when a failing check run is beyond the first 100', async () => {
     const allRuns = Array.from({ length: 150 }, (_, index) => ({
       id: index + 1,
       name: `check-${index + 1}`,
       status: 'completed',
       conclusion: index === 119 ? 'failure' : 'success',
-      completed_at: new Date(Date.UTC(2026, 8, 7, 0, index)).toISOString(),
+      completed_at: new Date(Date.UTC(2026, 8, 7, 16, index)).toISOString(),
     }));
     const pages: number[] = [];
     const octokit = {
@@ -827,15 +827,49 @@ describe('fetchAllCheckRunsForRef', () => {
       },
     };
 
-    const result = await fetchAllCheckRunsForRef(octokit, {
-      owner: 'thinmansoftware',
-      repo: 'bdc-harness',
-      ref: HEAD,
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const deps = makeDeps([candidate()], recorded, {
+      readLatestCheckCompletion: input => readLatestCheckCompletion(octokit, input),
     });
+    const result = await runStaleVerdictSweep(deps, 1);
 
     expect(pages).toEqual([1, 2]);
-    expect(result.complete).toBe(true);
-    expect(result.runs).toHaveLength(150);
-    expect(selectLatestCompletion(result.runs)?.allChecksGreen).toBe(false);
+    expect(result.skippedNotGreen).toBe(1);
+    expect(result.enqueued).toBe(0);
+    expect(recorded.enqueued).toHaveLength(0);
+  });
+
+  test('an incomplete paginated read fails closed and the sweep does not enqueue', async () => {
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({
+      id: index + 1,
+      name: `check-${index + 1}`,
+      status: 'completed',
+      conclusion: 'success',
+      completed_at: new Date(Date.UTC(2026, 8, 7, 16, index)).toISOString(),
+    }));
+    const pages: number[] = [];
+    const octokit = {
+      checks: {
+        listForRef: mock(async (input: Record<string, unknown>) => {
+          const page = Number(input.page);
+          pages.push(page);
+          if (page === 1) return { data: { check_runs: firstPage } };
+          throw new Error('secondary page unavailable');
+        }),
+      },
+    };
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const deps = makeDeps([candidate()], recorded, {
+      readLatestCheckCompletion: input => readLatestCheckCompletion(octokit, input),
+    });
+
+    const completion = await deps.readLatestCheckCompletion(candidate());
+    expect(completion?.allChecksGreen).toBe(false);
+    const result = await runStaleVerdictSweep(deps, 1);
+
+    expect(pages).toEqual([1, 2, 1, 2]);
+    expect(result.skippedNotGreen).toBe(1);
+    expect(result.enqueued).toBe(0);
+    expect(recorded.enqueued).toHaveLength(0);
   });
 });
