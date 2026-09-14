@@ -226,6 +226,7 @@ mock.module('@archon/core/utils/commands', () => ({
 import { registerApiRoutes } from './api';
 import { setBoardPrincipalResolverForTests } from '@archon/core/db/board-authority';
 import * as executionClaimsDb from '@archon/core/db/execution-claims';
+import * as taskmasterDb from '@archon/core/db/taskmaster';
 
 function makeApp(token?: string): OpenAPIHono {
   if (token) {
@@ -466,5 +467,82 @@ describe('execution claims API', () => {
       headers: { 'x-archon-operator-token': TOKEN },
     });
     expect(missing.status).toBe(404);
+  });
+});
+
+describe('expectation front door HTTP contract', () => {
+  let registerExpectationSpy: Spy;
+
+  beforeEach(() => {
+    registerExpectationSpy = spyOn(
+      taskmasterDb,
+      'registerExpectationReportingCreation'
+    ).mockImplementation((async () => {
+      throw new Error('test must configure the registration result');
+    }) as never);
+  });
+
+  afterEach(() => {
+    registerExpectationSpy.mockRestore();
+    delete process.env.ARCHON_OPERATOR_TOKEN;
+  });
+
+  function expectationBody(): string {
+    return JSON.stringify({
+      registration_key: 'integration-creation',
+      dispatch_ref: 'bdc-xo#2007',
+      recipient: 'assigned-seat',
+      registered_by: 'assigning-seat',
+      evidence: { kind: 'pr_opened', repo: 'thinmansoftware/bdc-harness' },
+      due_in_minutes: 60,
+      on_absence: 'give_up',
+    });
+  }
+
+  function registrationResult(created: boolean) {
+    return {
+      capped: false as const,
+      id: 'expectation-1',
+      created,
+      expectation: {
+        due_at: '2026-07-14T01:00:00.000Z',
+        on_absence: 'give_up' as const,
+        self_supervised: 0,
+      },
+    };
+  }
+
+  test('returns 201 for creation and 200 for an idempotent retry', async () => {
+    const app = makeApp(TOKEN);
+    registerExpectationSpy.mockImplementation((async () => registrationResult(true)) as never);
+    const created = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody(),
+    });
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ id: 'expectation-1', created: true });
+
+    registerExpectationSpy.mockImplementation((async () => registrationResult(false)) as never);
+    const retried = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody(),
+    });
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toMatchObject({ id: 'expectation-1', created: false });
+  });
+
+  test('publishes both success statuses with the same response schema', async () => {
+    const response = await makeApp(TOKEN).request('/api/openapi.json');
+    expect(response.status).toBe(200);
+    const spec = (await response.json()) as {
+      paths: Record<string, { post?: { responses?: Record<string, unknown> } }>;
+    };
+    const responses = spec.paths['/api/taskmaster/expectations']?.post?.responses;
+    expect(responses).toMatchObject({
+      '200': { description: expect.any(String) },
+      '201': { description: 'New expectation created.' },
+    });
   });
 });

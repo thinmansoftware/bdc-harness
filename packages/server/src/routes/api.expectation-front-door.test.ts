@@ -27,6 +27,17 @@ describe('expectation front door: route wiring', () => {
     expect(declaration).toMatch(/429: jsonError\(/);
   });
 
+  test('the POST declares both idempotent retry and creation success responses', () => {
+    const declaration = apiSource.slice(
+      apiSource.indexOf('const postTaskmasterExpectationRoute'),
+      apiSource.indexOf('const getTaskmasterExpectationsRoute')
+    );
+    expect(declaration).toMatch(/200: \{[\s\S]*registerExpectationResponseSchema/);
+    expect(declaration).toMatch(
+      /201: \{[\s\S]*registerExpectationResponseSchema[\s\S]*description: 'New expectation created\.'/
+    );
+  });
+
   test('registration is namespaced, so an external key cannot collide with a loop key', () => {
     // The loop's keys are "<action id>:<dispatch_ref>" or a bare dispatch_ref.
     // Without the prefix, a caller could name a key that adopts or blocks the

@@ -2359,6 +2359,10 @@ const postTaskmasterExpectationRoute = createRoute({
       content: { 'application/json': { schema: registerExpectationResponseSchema } },
       description: 'The expectation id; `created: false` when the key already existed',
     },
+    201: {
+      content: { 'application/json': { schema: registerExpectationResponseSchema } },
+      description: 'New expectation created.',
+    },
     400: jsonError('Invalid evidence spec, deadline, or self-supervised escalation'),
     401: jsonError('Missing or invalid operator token'),
     429: jsonError('Registrant exceeded its daily expectation cap'),
