@@ -692,11 +692,9 @@ nodes:
       if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
         WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
       fi
-      # Safe capture of read-spec output (heredoc+python; do not naive-interpolate).
-      _RS_OUT=$(python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)' <<'BDC_NODE_OUTPUT_READ_SPEC'
-      $read-spec.output
-      BDC_NODE_OUTPUT_READ_SPEC
-      )
+      # read-spec output arrives shellQuote-wrapped by the executor; a direct assignment
+      # lets bash unquote it. Never wrap it in a fixed-delimiter heredoc (bdc-harness #841).
+      _RS_OUT=$read-spec.output
       if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
         WO_ID=$(printf '%s\n' "$_RS_OUT" | sed -n 's/^WO_ID=//p' | head -1 || true)
         WO_ID=$(printf '%s' "$WO_ID" | tr -d '\r' | head -c 200)
@@ -1526,10 +1524,7 @@ nodes:
       }
       # ---- END rst core ----
 
-      SPEC=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
-      $read-spec.output
-      BDC_NODE_OUTPUT_READ_SPEC
-      )
+      SPEC=$read-spec.output
       CLASS="$(printf '%s\n' "$SPEC" | rst_class)"
       EVIDENCE_DIR="${ARTIFACTS_DIR:-.}/evidence"
       mkdir -p "$EVIDENCE_DIR" 2>/dev/null || true
@@ -1936,10 +1931,7 @@ nodes:
       }
       # ---- END rsg core ----
 
-      SPEC=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
-      $read-spec.output
-      BDC_NODE_OUTPUT_READ_SPEC
-      )
+      SPEC=$read-spec.output
       printf '%s\n' "$SPEC" | rsg_extract | rsg_run
       exit 0
 
@@ -2024,10 +2016,7 @@ nodes:
     depends_on: [read-spec]
     bash: |
       set -uo pipefail
-      SPEC_TEXT=$(cat <<'RESOLVE_REVIEW_BASE_READ_SPEC_SENTINEL'
-      $read-spec.output
-      RESOLVE_REVIEW_BASE_READ_SPEC_SENTINEL
-      )
+      SPEC_TEXT=$read-spec.output
       # Same 3 patterns decide-push-target's Base Branch Override section already
       # documents (plain header, markdown-bold, YAML field), in priority order.
       DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '^Base branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^Base branch:[[:space:]]*//')
