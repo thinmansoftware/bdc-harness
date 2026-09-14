@@ -138,9 +138,10 @@ R="$(run_check "$GOOD" PROCEED CODE passed 5 incomplete)"
 assert_eq "incomplete greps rc 1" "1" "${R%%|*}"
 assert_contains "error names incomplete grep status" "grep_status=incomplete" "$R"
 
-echo "--- Test 7c: declared greps with a mismatch -> OK so honest failure is published ---"
+echo "--- Test 7c: declared greps with a mismatch -> error ---"
 R="$(run_check "$GOOD" PROCEED CODE passed 5 mismatch)"
-assert_eq "mismatched greps rc 0 / OK" "0|OK|" "$R"
+assert_eq "mismatched greps rc 1" "1" "${R%%|*}"
+assert_contains "error names mismatch grep status" "grep_status=mismatch" "$R"
 
 echo "--- Test 8: failing tests are NOT blocked here (stamped honestly, VALIDATION: FAIL) ---"
 R="$(run_check "$FAILED_TESTS" PROCEED CODE failed 9 passed)"

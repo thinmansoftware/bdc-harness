@@ -124,7 +124,8 @@ assert_contains "'no output' becomes eq 0" "grep -n \"delta\" fixture.txt${TAB}e
 assert_contains "awk assertion still extracted (dropped later, not here)" "| awk -F: \"{s+=\$2} END {print s+0}\"${TAB}eq${TAB}0" "$EXTRACTED"
 assert_contains "DECLARED counts every grep header including the one without Expected" "DECLARED${TAB}5" "$EXTRACTED"
 assert_eq "test-suite and ASCII stops are not grep assertions" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c 'bun test\|LC_ALL' || true)"
-assert_eq "header without Expected: emits no assertion line" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c 'gamma' || true)"
+assert_eq "header without Expected: emits no executable assertion line" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c "gamma.*${TAB}eq${TAB}" || true)"
+assert_contains "header without Expected is named as unparsed" 'UNPARSED	1	grep -c "gamma" fixture.txt' "$EXTRACTED"
 assert_eq "no grep stops -> zero unparsed and declared" "UNPARSED${TAB}0
 DECLARED${TAB}0" "$(printf 'Stop 2 (test suite):\n  bun test\n  Expected: ok\n' | rsg_extract)"
 assert_contains "'at most' becomes le" "${TAB}le${TAB}3" "$(printf 'Stop 1 (grep assertion):\n  grep -c a b\n  Expected: at most 3\n' | rsg_extract)"
@@ -156,7 +157,8 @@ assert_contains "GREP_DROPPED=1 (the awk one)" "GREP_DROPPED=1" "$OUT"
 assert_contains "GREP_UNPARSED=1 (the missing expectation)" "GREP_UNPARSED=1" "$OUT"
 assert_contains "GREP_MISMATCH=0" "GREP_MISMATCH=0" "$OUT"
 assert_contains "partial execution is incomplete" "GREP_STATUS=incomplete" "$OUT"
-assert_contains "manifest line names unverified counts" "UNVERIFIED: 1 dropped, 1 unparsed" "$OUT"
+assert_contains "manifest line names the dropped assertion" 'UNVERIFIED (dropped): grep -rciE "password" src 2>/dev/null | awk' "$OUT"
+assert_contains "manifest line names the unparsed assertion" 'UNVERIFIED (unparsed): grep -c "gamma" fixture.txt' "$OUT"
 assert_contains "GREP_LINE carries observed counts in manifest v2 form" 'GREP_LINE=grep -c "alpha" fixture.txt => 2; grep -c "beta" fixture.txt => 2; grep -n "delta" fixture.txt => 0' "$OUT"
 assert_contains "dropped assertion is named in detail" 'DROPPED (not on read-only allowlist; not executed): grep -rciE "password" src 2>/dev/null | awk' "$OUT"
 
@@ -165,6 +167,7 @@ assert_contains "executed below declared with no unparsed is incomplete" "GREP_S
 
 OUT="$(printf 'grep -c "alpha" fixture.txt\teq\t2\nUNPARSED\t1\nDECLARED\t1\n' | rsg_run)"
 assert_contains "unparsed is incomplete even when executed equals declared" "GREP_STATUS=incomplete" "$OUT"
+assert_contains "unnamed legacy unparsed input is identified" "UNVERIFIED (unparsed): 1 unnamed assertion(s)" "$OUT"
 
 printf 'alpha\n' > "$TMP/fixture.txt"
 OUT="$(printf '%s\n' "$SPEC" | rsg_extract | rsg_run)"
@@ -209,10 +212,12 @@ WO Class: CODE
 '
 OUT="$(printf '%s\n' "$SPEC_GCD" | rsg_extract)"
 assert_contains "'returns 1 or greater' -> ge 1" "grep -c \"gcd\" shopops-api/routes/store.js${TAB}ge${TAB}1" "$OUT"
-assert_eq "wrapped expectation (number on the next line) is not emitted" "0" "$(printf '%s\n' "$OUT" | grep -c 'skip_gcd_enrichment' || true)"
+assert_eq "wrapped expectation is not emitted as executable" "0" "$(printf '%s\n' "$OUT" | grep -c "skip_gcd_enrichment.*${TAB}ge${TAB}" || true)"
+assert_contains "wrapped expectation assertion is named as unparsed" 'grep -c "skip_gcd_enrichment" shopops-api/services/coverResolver.js' "$OUT"
 assert_contains "'returns nothing' -> eq 0 with LC_ALL prefix kept" "LC_ALL=C grep -n \"[^ -~]\" shopops-api/routes/store.js${TAB}eq${TAB}0" "$OUT"
 assert_contains "'=> 3' -> eq 3 (rg)" "rg -c \"gcd\" shopops-api/routes/store.js${TAB}eq${TAB}3" "$OUT"
-assert_eq "no-expectation bullet not emitted" "0" "$(printf '%s\n' "$OUT" | grep -c '"x" y.js' || true)"
+assert_eq "no-expectation bullet not emitted as executable" "0" "$(printf '%s\n' "$OUT" | grep -c '"x" y.js.*\teq\t' || true)"
+assert_contains "no-expectation bullet is named as unparsed" 'grep -c "x" y.js' "$OUT"
 assert_eq "bullets outside a Stop conditions section ignored" "0" "$(printf '%s\n' "$OUT" | grep -c 'not in a stop section' || true)"
 assert_eq "runner commands are not grep assertions" "0" "$(printf '%s\n' "$OUT" | grep -c 'node tests' || true)"
 assert_contains "DECLARED counts every backticked read-only command in the section (5), not the runner" "DECLARED${TAB}5" "$OUT"

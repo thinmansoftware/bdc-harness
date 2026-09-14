@@ -1367,6 +1367,10 @@ nodes:
       rsg_extract() {
         awk '
           function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
+          function note_unparsed(name) {
+            if (name == "") name = "unnamed grep stop condition"
+            unparsed_names = (unparsed_names == "" ? name : unparsed_names "; " name)
+          }
           function expect(ex,   low, op, n) {
             low = tolower(ex); op = "eq"; n = ""
             if (low ~ /at least|>=|or more|or greater|minimum|no fewer/) op = "ge"
@@ -1383,16 +1387,17 @@ nodes:
             if (line ~ /^[Ee]xpected:/) {
               ex = line; sub(/^[Ee]xpected:[ \t]*/, "", ex); e = expect(ex)
               if (cmd != "" && e != "") { print cmd "\t" e; parsed++ }
+              else { note_unparsed(cmd != "" ? cmd : label) }
               state = 0; cmd = ""; next
             }
-            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { state = 0; cmd = "" }
+            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { note_unparsed(cmd != "" ? cmd : label); state = 0; cmd = "" }
             else {
               cmd = (cmd == "" ? line : cmd " " line)
               sub(/[ \t]*\\$/, "", cmd)
               next
             }
           }
-          /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/ { state = 1; cmd = ""; declared++; next }
+          /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/ { state = 1; cmd = ""; label = clean($0); declared++; next }
           /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition/) ? 1 : 0; bl = 0; next }
           insec && /^[ \t]*[*_]*[Bb]aseline/ { bl = 1 }
           insec && bl && (/^[ \t]*$/ || /^[ \t]*([0-9]+[.)]|[-*])[ \t]/) { bl = 0 }
@@ -1404,9 +1409,15 @@ nodes:
               declared++
               e = expect(rest)
               if (e != "") { print g "\t" e; parsed++ }
+              else { note_unparsed(g) }
             }
           }
-          END { print "UNPARSED\t" (declared - parsed); print "DECLARED\t" (declared + 0) }
+          END {
+            if (state == 1) note_unparsed(cmd != "" ? cmd : label)
+            if (unparsed_names != "") print "UNPARSED\t" (declared - parsed) "\t" unparsed_names
+            else print "UNPARSED\t" (declared - parsed)
+            print "DECLARED\t" (declared + 0)
+          }
         '
       }
       # rsg_allow_cmd <command>   (same fail-closed read-only allowlist as the vma core)
@@ -1453,24 +1464,31 @@ nodes:
       }
       # rsg_run   (extracted TSV on stdin -> GREP_* summary lines + per-assertion detail)
       rsg_run() {
-        local line cmd op n obs declared=0 executed=0 dropped=0 unparsed=0 mismatch=0 out="" detail="" status tab
+        local line cmd op n obs declared=0 executed=0 dropped=0 unparsed=0 unparsed_names="" mismatch=0 out="" detail="" status tab
         tab="$(printf '\t')"
         while IFS= read -r line; do
           case "$line" in
             DECLARED*) declared="${line#DECLARED*"$tab"}"; continue ;;
-            UNPARSED*) unparsed="${line#UNPARSED*"$tab"}"; continue ;;
+            UNPARSED*)
+              line="${line#UNPARSED*"$tab"}"
+              unparsed="${line%%"$tab"*}"
+              if [ "$line" != "$unparsed" ]; then unparsed_names="${line#*"$tab"}"; fi
+              continue
+              ;;
             "") continue ;;
           esac
           cmd="${line%%"$tab"*}"; line="${line#*"$tab"}"; op="${line%%"$tab"*}"; n="${line#*"$tab"}"
           if ! rsg_allow_cmd "$cmd"; then
             dropped=$((dropped + 1))
             detail="${detail}DROPPED (not on read-only allowlist; not executed): $cmd => expected $op $n"$'\n'
+            out="${out:+$out; }UNVERIFIED (dropped): $cmd"
             continue
           fi
           obs="$(rsg_observe "$cmd")"
           if [ "$obs" = "ERR" ]; then
             dropped=$((dropped + 1))
             detail="${detail}DROPPED (command errored): $cmd => expected $op $n"$'\n'
+            out="${out:+$out; }UNVERIFIED (errored): $cmd"
             continue
           fi
           executed=$((executed + 1))
@@ -1490,7 +1508,9 @@ nodes:
           status="mismatch"
         elif [ "$executed" -ne "$declared" ] || [ "$dropped" -gt 0 ] || [ "$unparsed" -gt 0 ]; then
           status="incomplete"
-          out="${out:+$out; }UNVERIFIED: $dropped dropped, $unparsed unparsed"
+          if [ "$unparsed" -gt 0 ]; then
+            out="${out:+$out; }UNVERIFIED (unparsed): ${unparsed_names:-$unparsed unnamed assertion(s)}"
+          fi
         else
           status="passed"
         fi
@@ -3098,7 +3118,7 @@ nodes:
         esac
         grep_declared="${grep_declared:-0}"
         if [ "$grep_declared" -gt 0 ] 2>/dev/null; then
-          if [ "$grep_status" = "incomplete" ] || [ "$grep_status" = "all_dropped" ] || [ "$grep_status" = "missing" ] || [ -z "$grep_status" ]; then
+          if [ "$grep_status" != "passed" ]; then
             echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) were declared but grep_status=${grep_status:-missing}. Every declared grep stop condition must execute before manifest evidence can be published (bdc-xo #1940)." >&2
             return 1
           fi
