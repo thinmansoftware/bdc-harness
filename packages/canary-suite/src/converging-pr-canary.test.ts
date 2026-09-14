@@ -10,6 +10,7 @@ import { runConvergingPrCanary } from './converging-pr-canary';
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
 const HEAD_C = 'c'.repeat(40);
+const HEAD_D = 'd'.repeat(40);
 const SUBJECT_KEY = 'gh:thinmansoftware/bdc-harness#806';
 const databases: Database[] = [];
 
@@ -165,6 +166,18 @@ describe('C1 converging-PR canary', () => {
     const db = fixture();
     seedConvergingHistory(db);
     insertExhaustedReceipt(db, HEAD_C, '2026-09-14T12:30:00.000Z');
+    const result = await runConvergingPrCanary({ db, env: {} });
+    expect(result.verdict).toBe('failed');
+    expect(result.reasonCodes).toContain('c1_budget_exhausted_on_converging_pr');
+    expect(result.evidenceRefs).toContain('exhausted_receipt=true');
+  });
+
+  test('a push rejected at ingest (no run_review row) still moves the current head', async () => {
+    const db = fixture();
+    seedConvergingHistory(db);
+    // HEAD_D was pushed and refused with rereview_attempts_exhausted BEFORE any review
+    // work was enqueued, so the newest run_review row still names HEAD_C.
+    insertExhaustedReceipt(db, HEAD_D, '2026-09-14T13:00:00.000Z');
     const result = await runConvergingPrCanary({ db, env: {} });
     expect(result.verdict).toBe('failed');
     expect(result.reasonCodes).toContain('c1_budget_exhausted_on_converging_pr');

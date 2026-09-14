@@ -120,6 +120,11 @@ function loadSubjectsFromDb(db: OutcomeCanaryDatabase): ConvergingPrSubject[] {
     { verdict: PriorReviewWork['verdict']; verdictId: string }
   >();
   const exhaustedBySubject = new Map<string, ExhaustedReceipt[]>();
+  // Newest ingest receipt per subject. A push that is rejected at ingest (for
+  // example rereview_attempts_exhausted) never gets a run_review row, so the
+  // newest review row can name an OLDER head than the PR actually sits at.
+  // Review finding, PR #840 round 7.
+  const newestIngestBySubject = new Map<string, { headSha: string; createdAt: string }>();
   for (const receipt of receipts) {
     try {
       const body = JSON.parse(receipt.body) as {
@@ -138,6 +143,20 @@ function loadSubjectsFromDb(db: OutcomeCanaryDatabase): ConvergingPrSubject[] {
           verdict: classifyVerdict(body.disposition),
           verdictId: receipt.id,
         });
+      }
+      if (
+        body.kind === 'pr_review_ingest_receipt' &&
+        typeof body.headSha === 'string' &&
+        body.headSha !== '' &&
+        receipt.subject_key
+      ) {
+        const newest = newestIngestBySubject.get(receipt.subject_key);
+        if (!newest || receipt.created_at > newest.createdAt) {
+          newestIngestBySubject.set(receipt.subject_key, {
+            headSha: body.headSha,
+            createdAt: receipt.created_at,
+          });
+        }
       }
       if (
         body.kind === 'pr_review_ingest_receipt' &&
@@ -183,12 +202,17 @@ function loadSubjectsFromDb(db: OutcomeCanaryDatabase): ConvergingPrSubject[] {
         };
       })
       .filter(work => work.headSha !== '');
-    const currentHead = prior[0]?.headSha ?? '';
+    const newestReviewAt = group.rows[0]?.created_at ?? '';
+    const newestIngest = newestIngestBySubject.get(group.id);
+    const ingestIsNewer = newestIngest !== undefined && newestIngest.createdAt > newestReviewAt;
+    const currentHead = ingestIsNewer ? newestIngest.headSha : (prior[0]?.headSha ?? '');
+    const currentHeadCiGreen =
+      prior[0]?.headSha === currentHead ? (prior[0]?.headCiGreen ?? false) : false;
     return {
       id: group.id,
       prior,
       currentHead,
-      currentHeadCiGreen: prior[0]?.headCiGreen ?? false,
+      currentHeadCiGreen,
       exhaustedReceipt: isExhaustedForCurrentHead(
         exhaustedBySubject.get(group.id) ?? [],
         currentHead,

@@ -77,6 +77,8 @@ readonly dispatch store. Extra flags:
 - C1 counts an `rereview_attempts_exhausted` ingest receipt only when it names the
   subject's current head and no non-automatic review row was queued after it; a
   receipt for an older head, or one followed by a hand/operator review, is history.
+  The current head is the newest ingest receipt's head when that receipt is newer
+  than the newest review row (a push refused at ingest never gets a review row).
 - `--c3-synthetic-escalation`: opt in to C3. Without it C3 is `blocked` with
   `c3_synthetic_escalation_not_enabled`. When set, C3 switches the core DB singleton
   onto a temp `ARCHON_HOME` sqlite via `closeDatabase`/`resetDatabase` and refuses with
