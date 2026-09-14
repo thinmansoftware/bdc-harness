@@ -66,15 +66,17 @@ describe('expectation front door: route wiring', () => {
     expect(apiSource).toContain('EXPECTATION_DAILY_CAP');
   });
 
-  test('a retry of an existing key never consumes the cap', () => {
-    // Overseer finding [minor] on PR 810: charging a retry would turn the
-    // documented idempotent 200 into a 429 the moment a caller got busy.
+  test('retry-vs-new is decided atomically by the DAL', () => {
+    // The route must not probe before the serialized write: two same-key calls
+    // can both observe absence, and the second must still become a retry at cap.
     const handler = apiSource.slice(
       apiSource.indexOf('// POST /api/taskmaster/expectations -'),
       apiSource.indexOf('// GET /api/taskmaster/expectations -')
     );
-    expect(handler).toContain('expectationKeyExists');
-    expect(handler).toContain('cap_exempt: capExempt');
+    expect(handler).not.toContain('expectationKeyExists');
+    expect(handler).not.toContain('cap_exempt');
+    expect(handler).toContain('registerExpectationReportingCreation');
+    expect(handler).toContain('created ? 201 : 200');
   });
 
   test('the cap is enforced in the write, not by a count before it', () => {

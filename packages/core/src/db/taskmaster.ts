@@ -397,25 +397,22 @@ export type RegisterExpectationResult =
  * the tm_control singleton under Postgres, which orders the counts. See the
  * comment at the insert for why that instrument and not SERIALIZABLE.
  *
- * A retry under an EXISTING key is exempt: the ON CONFLICT arm absorbs it before
- * the cap can reject it, so the documented idempotent 200 holds even at the cap.
- * (Order matters -- the cap predicate is evaluated first, so an at-cap retry
- * would insert nothing and the conflict arm would never fire. Hence
- * `capExempt`, which the route sets for a key it has already seen; the cap
- * predicate is skipped entirely for those, and idempotency does the rest.)
+ * A retry under an EXISTING key is admitted by the same statement even at the
+ * cap. The predicate explicitly admits an existing registration_key so it can
+ * reach ON CONFLICT; a genuinely new key must still have cap headroom. This is
+ * deliberately not decided by a pre-insert probe, which would race another
+ * request creating the same key.
  */
 export async function registerExpectationReportingCreation(
   data: Parameters<typeof registerExpectation>[0] & {
     registration_key: string;
     /** Per-24h bound on externally-registered rows. Omit to skip the cap. */
     daily_cap?: number;
-    /** True when this key already exists, so the retry must not be capped. */
-    cap_exempt?: boolean;
   }
 ): Promise<RegisterExpectationResult> {
   const db = getDatabase();
   const now = new Date().toISOString();
-  const applyCap = data.daily_cap !== undefined && data.cap_exempt !== true;
+  const applyCap = data.daily_cap !== undefined;
   const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const params: unknown[] = [
     randomUUID(),
@@ -435,7 +432,8 @@ export async function registerExpectationReportingCreation(
   if (applyCap) {
     params.push(dayAgo, data.daily_cap);
     capClause =
-      ' WHERE (SELECT COUNT(*) FROM tm_expectations' +
+      ' WHERE EXISTS (SELECT 1 FROM tm_expectations WHERE registration_key = $2)' +
+      ' OR (SELECT COUNT(*) FROM tm_expectations' +
       " WHERE registration_key LIKE 'ext:%' AND created_at >= $12) < $13";
   }
   const insertSql = `INSERT INTO tm_expectations
@@ -465,8 +463,9 @@ export async function registerExpectationReportingCreation(
   // SERIALIZABLE plus retry would also work, but costs a retry loop on a path
   // that is not hot, and this repo already has the FOR UPDATE idiom.
   //
-  // UNCAPPED registrations (the loop's own, and exempt retries) take no lock:
-  // they are bounded elsewhere and must not queue behind the front door.
+  // UNCAPPED registrations (the loop's own) take no lock: they are bounded
+  // elsewhere and must not queue behind the front door. Capped retries take the
+  // same serialized path as new keys so retry-vs-new is decided under the lock.
   const runInsert = async (
     query: <U>(sql: string, p?: unknown[]) => Promise<QueryResult<U>>
   ): Promise<string | undefined> => {

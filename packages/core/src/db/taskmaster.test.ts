@@ -2255,10 +2255,7 @@ describe('front door daily cap is enforced in the write (Overseer PR 810)', () =
   const spec = JSON.stringify({ kind: 'pr_opened', repo: 'thinmansoftware/fuelglass' });
   const future = (): string => new Date(Date.now() + 86_400_000).toISOString();
 
-  const register = (
-    key: string,
-    extra: { daily_cap?: number; cap_exempt?: boolean; registered_by?: string } = {}
-  ) =>
+  const register = (key: string, extra: { daily_cap?: number; registered_by?: string } = {}) =>
     registerExpectationReportingCreation({
       registration_key: key,
       dispatch_ref: `ref-${key}`,
@@ -2269,7 +2266,6 @@ describe('front door daily cap is enforced in the write (Overseer PR 810)', () =
       max_retries: 0,
       registered_by: extra.registered_by ?? 'xo',
       daily_cap: extra.daily_cap,
-      cap_exempt: extra.cap_exempt,
     });
 
   test('the cap refuses the row rather than writing it', async () => {
@@ -2302,6 +2298,17 @@ describe('front door daily cap is enforced in the write (Overseer PR 810)', () =
     expect(await countExternalExpectationsSince(dayAgo)).toBe(cap);
   });
 
+  test('two concurrent registrations of one new key create once and retry once at cap one', async () => {
+    const results = await Promise.all([
+      register('ext:xo:same-key-race', { daily_cap: 1 }),
+      register('ext:xo:same-key-race', { daily_cap: 1 }),
+    ]);
+    expect(results.filter(result => result.capped)).toHaveLength(0);
+    expect(results.filter(result => !result.capped && result.created)).toHaveLength(1);
+    expect(results.filter(result => !result.capped && !result.created)).toHaveLength(1);
+    expect((await listExpectations({ limit: 10 })).total).toBe(1);
+  });
+
   test('a retry of an existing key is admitted even at the cap', async () => {
     await register('ext:xo:retry-me', { daily_cap: 1 });
     // Cap is now full. A NEW key must be refused...
@@ -2309,9 +2316,18 @@ describe('front door daily cap is enforced in the write (Overseer PR 810)', () =
     // ...but the existing key must still return its row, not a 429. This is the
     // [minor] finding: charging a retry turns the documented idempotent success
     // into a refusal the moment a caller gets busy.
-    const retry = await register('ext:xo:retry-me', { daily_cap: 1, cap_exempt: true });
+    const retry = await register('ext:xo:retry-me', { daily_cap: 1 });
     expect(retry.capped).toBe(false);
     if (!retry.capped) expect(retry.created).toBe(false);
+  });
+
+  test('SQLite returns created, retried, and capped from the same atomic path', async () => {
+    const created = await register('ext:xo:sqlite-parity', { daily_cap: 1 });
+    const retried = await register('ext:xo:sqlite-parity', { daily_cap: 1 });
+    const capped = await register('ext:xo:sqlite-new-at-cap', { daily_cap: 1 });
+    expect(!created.capped && created.created).toBe(true);
+    expect(!retried.capped && !retried.created).toBe(true);
+    expect(capped.capped).toBe(true);
   });
 
   test('renaming the registrant does not buy more headroom', async () => {
@@ -2387,7 +2403,7 @@ describe('front door cap serializes on PostgreSQL (Overseer PR 810 round 3)', ()
   async function registerAgainstSpy(
     statements: string[],
     adapter: SqliteAdapter,
-    extra: { daily_cap?: number; cap_exempt?: boolean }
+    extra: { daily_cap?: number }
   ): Promise<void> {
     const real = db;
     db = adapter;
@@ -2430,10 +2446,10 @@ describe('front door cap serializes on PostgreSQL (Overseer PR 810 round 3)', ()
     expect(spy.statements.some(s => s.startsWith('INSERT INTO tm_expectations'))).toBe(true);
   });
 
-  test('an EXEMPT retry takes no lock either', async () => {
+  test('a capped retry takes the same serialized lock as a new key', async () => {
     const spy = postgresSpy();
-    await registerAgainstSpy(spy.statements, spy.adapter, { daily_cap: 5, cap_exempt: true });
-    expect(spy.statements.some(s => s.includes('FOR UPDATE'))).toBe(false);
+    await registerAgainstSpy(spy.statements, spy.adapter, { daily_cap: 5 });
+    expect(spy.statements.some(s => s.includes('FOR UPDATE'))).toBe(true);
   });
 
   test('the cap predicate is absent from an uncapped insert', () => {

@@ -203,6 +203,23 @@ Pause state:
 sqlite3 /opt/bdc/archon-data/archon.db "SELECT * FROM tm_control WHERE id=1"
 ```
 
+## Registering an expectation
+
+Use the authenticated front door instead of writing `tm_expectations` directly.
+From the bdc-harness checkout, register a 24-hour PR expectation with:
+
+```powershell
+scripts/taskmaster/expect.ps1 -Ref bdc-xo#2006 -Recipient fable-cursor `
+  -Evidence pr_opened:thinmansoftware/fuelglass -DueIn 24h -OnAbsence escalate
+```
+
+The script calls `POST /api/taskmaster/expectations` with the operator token.
+Reuse the same registration key when retrying: the first request returns a new
+expectation and later requests return that stored expectation without consuming
+daily-cap headroom. See
+`docs/doctrine/taskmaster-expectation-registration.md` for the API contract and
+evidence forms.
+
 ## Known issues
 
 WO-HARNESS-TM-HEALTH-UPSERT-CONFLICT-FIX-01 repairs legacy on-disk `tm_health`

@@ -3517,21 +3517,6 @@ export function registerApiRoutes(
       // own per-tick budgets, and neither side should be able to exhaust the
       // other's headroom.
       //
-      // AN EXISTING KEY IS EXEMPT. A retry under a key that already exists
-      // creates nothing, so charging it would turn the documented idempotent
-      // 200 into a 429 the moment a caller got busy -- punishing exactly the
-      // safe retry behaviour the caller-supplied key exists to make possible.
-      //
-      // ENFORCED IN THE WRITE, NOT BEFORE IT. This probe only decides EXEMPTION;
-      // it does not decide admission. The cap itself is a predicate inside the
-      // INSERT (see registerExpectationReportingCreation), because a count taken
-      // here and an insert taken after it leave a window in which concurrent
-      // callers all read a count below the cap and all then write, exceeding the
-      // bound by however many raced. A stale read here is therefore harmless: at
-      // worst an existing key is treated as new, and the cap predicate lets it
-      // through anyway because the ON CONFLICT arm absorbs it.
-      const capExempt = await taskmasterDb.expectationKeyExists(registrationKey);
-
       // Registration is idempotent on the key, so a retry is a 200 and not a
       // duplicate. `created` reports WHICH happened -- a caller that believes it
       // opened a fresh 24h expectation when it actually matched a key whose
@@ -3549,7 +3534,6 @@ export function registerApiRoutes(
         registered_by: body.registered_by,
         self_supervised: selfSupervised,
         daily_cap: EXPECTATION_DAILY_CAP,
-        cap_exempt: capExempt,
       });
       if (result.capped)
         return apiError(
@@ -3564,14 +3548,17 @@ export function registerApiRoutes(
         { expectationId: id, registeredBy: body.registered_by, dueAt, created, selfSupervised },
         'taskmaster_expectation_registered'
       );
-      return c.json({
-        id,
-        registration_key: registrationKey,
-        due_at: expectation.due_at,
-        on_absence: expectation.on_absence,
-        created,
-        self_supervised: expectation.self_supervised === 1,
-      });
+      return c.json(
+        {
+          id,
+          registration_key: registrationKey,
+          due_at: expectation.due_at,
+          on_absence: expectation.on_absence,
+          created,
+          self_supervised: expectation.self_supervised === 1,
+        },
+        created ? 201 : 200
+      );
     } catch (error) {
       getLog().error({ err: error }, 'taskmaster_expectation_register_failed');
       return apiError(c, 500, 'Failed to register taskmaster expectation');
