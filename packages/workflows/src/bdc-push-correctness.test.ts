@@ -687,7 +687,8 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).not.toContain('BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC');
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
       expect(yaml).toContain('--force-with-lease=');
-      expect(yaml).toContain('repair_target_diverged');
+      expect(yaml).toContain('repair_target_base_not_incorporated');
+      expect(yaml).toContain('repair_target_head_moved');
       expect(yaml).toContain("sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1");
       expect(yaml).toContain('REPAIR_TARGET_LEASE_SHA=$(git rev-parse HEAD)');
       const result = parseWorkflow(yaml, basename(lane));
@@ -702,6 +703,42 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(decidePrompt).toContain('repair_target_authorized_by_spec: #N');
       const planReview = result.workflow.nodes.find(node => node.id === 'plan-review');
       expect(planReview?.loop?.prompt).toContain('repair_target_authorized_by_spec: #N');
+    }
+  });
+
+  it('checks out the repair-target head before capture-run-scope and never rebases at push', () => {
+    const lanes = [
+      'bdc-feature-development.yaml',
+      'bdc-feature-development-codex.yaml',
+      'bdc-feature-development-codex-only.yaml',
+      'bdc-feature-development-fable.yaml',
+      'bdc-feature-development-fusion-cx-kimi.yaml',
+      'bdc-feature-development-fusion-cx-qwen.yaml',
+      'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-kimi-k3.yaml',
+      'bdc-feature-development-zero-claude.yaml',
+      'bdc-feature-development-zero-open.yaml',
+      'bdc-feature-development-zero.yaml',
+    ].map(file => join(DEFAULTS_DIR, file));
+    expect(lanes).toHaveLength(11);
+    for (const lane of lanes) {
+      const yaml = readFileSync(lane, 'utf8');
+      const result = parseWorkflow(yaml, basename(lane));
+      if (!result.workflow) {
+        throw new Error(`${basename(lane)}: ${result.error?.error ?? 'failed to parse'}`);
+      }
+      const checkout = result.workflow.nodes.find(node => node.id === 'checkout-repair-target');
+      expect(checkout, basename(lane)).toBeDefined();
+      expect(checkout?.depends_on ?? []).toContain('read-spec');
+      expect(checkout?.bash).toContain('SPEC_TEXT=$read-spec.output');
+      expect(checkout?.bash).toContain('git checkout -B');
+      expect(checkout?.bash).toContain('repair_target_rejected:fork');
+      expect(checkout?.bash).toContain('REPAIR_TARGET_LEASE_SHA=');
+      const capture = result.workflow.nodes.find(node => node.id === 'capture-run-scope');
+      expect(capture?.depends_on ?? []).toContain('checkout-repair-target');
+      const commit = result.workflow.nodes.find(node => node.id === 'commit-and-push');
+      expect(commit?.bash).toContain('repair_target_base_not_incorporated');
+      expect(commit?.bash).not.toContain('git rebase');
     }
   });
 
@@ -762,7 +799,7 @@ printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryO
     expect(result.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${headOid}`);
   });
 
-  it('rebases onto a repair-target commit that exists only on origin', () => {
+  it('fails closed with repair_target_base_not_incorporated when the lease sha is not an ancestor of HEAD', () => {
     const branch = 'feat/wo-repair-target-01';
     const initSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
     writeFileSync(join(worktreeDir, 'pr-only.txt'), 'on the PR\n');
@@ -779,15 +816,10 @@ printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryO
       SPEC_TEXT: matchingSpec(branch),
       PATH: fakeGhPath('OPEN', branch, { headRefOid: leaseSha }),
     });
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
-    expect(result.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${leaseSha}`);
-    const ancestor = bash(
-      `git merge-base --is-ancestor ${leaseSha} HEAD && echo ANCESTOR`,
-      worktreeDir
-    );
-    expect(ancestor.exitCode).toBe(0);
-    expect(ancestor.stdout).toContain('ANCESTOR');
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('repair_target_base_not_incorporated');
+    expect(result.stderr).toContain('repair_target_base_not_incorporated');
+    expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
   });
 
   it('fails closed when live headRefOid differs from the fetched branch head', () => {
@@ -824,8 +856,8 @@ printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryO
       PATH: fakeGhPath('OPEN', branch, { headRefOid: leaseSha }),
     });
     expect(result.exitCode).toBe(1);
-    expect(result.stdout).toContain('repair_target_diverged');
-    expect(result.stderr).toContain('repair_target_diverged');
+    expect(result.stdout).toContain('repair_target_base_not_incorporated');
+    expect(result.stderr).toContain('repair_target_base_not_incorporated');
     expect(result.stdout).not.toContain(`UNIQUE_BRANCH=${branch}`);
     expect(bash('git status --porcelain', worktreeDir).stdout.trim()).toBe('');
     const rebaseState = bash(
