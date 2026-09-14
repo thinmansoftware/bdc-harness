@@ -329,8 +329,13 @@ export async function requestPrReview(
   if (input.headSha.toLowerCase() !== resolved.currentHead.toLowerCase()) {
     return { ok: false, error: 'head_not_current', currentHead: resolved.currentHead };
   }
-  const correlationId = reviewCorrelationId(input);
-  const idempotencyKey = operatorRequestIdempotencyKey(input);
+  // Canonical head: the verified current head in lowercase hex. The schema accepts
+  // either case, and the comparison above is case-insensitive, so every id derived
+  // from the head (correlation id, idempotency key, the enqueued work) must use one
+  // spelling or the same commit could be queued twice. Review finding, #840 round 8.
+  const canonical = { ...input, headSha: resolved.currentHead.toLowerCase() };
+  const correlationId = reviewCorrelationId(canonical);
+  const idempotencyKey = operatorRequestIdempotencyKey(canonical);
   const subjectKey = reviewSubjectKey(input.owner, input.repo, input.prNumber);
   const prior = await dispatch.listMessages({
     recipient: REVIEW_RECIPIENT,
@@ -344,7 +349,7 @@ export async function requestPrReview(
     owner: input.owner,
     repo: input.repo,
     prNumber: input.prNumber,
-    headSha: input.headSha,
+    headSha: canonical.headSha,
     baseRef: resolved.baseRef,
     author: resolved.author,
     repeatReason: operatorRequestRepeatReason(input.reason),

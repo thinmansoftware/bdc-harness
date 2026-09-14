@@ -425,6 +425,51 @@ describe('overseer PR review operator routes', () => {
     expect(secondBody.messageId).toBe(firstBody.messageId);
   });
 
+  test('the same commit spelled in uppercase hex is the same request (canonical head)', async () => {
+    const app = makeApp(TOKEN);
+    const lower = await app.request('/api/overseer/pr-review/request', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        owner: OWNER,
+        repo: REPO,
+        prNumber: PR_NUMBER,
+        headSha: HEAD_C,
+        reason: 'operator_rereview:case',
+      }),
+    });
+    const upper = await app.request('/api/overseer/pr-review/request', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({
+        owner: OWNER,
+        repo: REPO,
+        prNumber: PR_NUMBER,
+        headSha: HEAD_C.toUpperCase(),
+        reason: 'operator_rereview:case',
+      }),
+    });
+    expect(lower.status).toBe(200);
+    expect(upper.status).toBe(200);
+    const lowerBody = (await lower.json()) as {
+      messageId: string;
+      alreadyExisted: boolean;
+      correlationId: string;
+    };
+    const upperBody = (await upper.json()) as {
+      messageId: string;
+      alreadyExisted: boolean;
+      correlationId: string;
+    };
+    expect(upperBody.alreadyExisted).toBe(true);
+    expect(upperBody.messageId).toBe(lowerBody.messageId);
+    expect(upperBody.correlationId).toBe(lowerBody.correlationId);
+    expect(upperBody.correlationId.endsWith(`@${HEAD_C}`)).toBe(true);
+    const queued = await app.request('/api/overseer/pr-review/queue', { headers: authHeaders() });
+    const body = (await queued.json()) as { items: { headSha?: string | null }[] };
+    expect(body.items).toHaveLength(1);
+  });
+
   test('the operator request repeat_reason is not an auto re-review reason', async () => {
     const app = makeApp(TOKEN);
     const posted = await app.request('/api/overseer/pr-review/request', {
