@@ -14,6 +14,17 @@ import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 
+interface GhPrSearchOptions {
+  /** Override command execution without relying on process-global module mocks. */
+  readonly exec?: (
+    command: string,
+    args: readonly string[],
+    options: { timeout: number }
+  ) => Promise<{ stdout: string }>;
+  /** Override hermetic detection (tests exercising command construction). */
+  readonly hermetic?: boolean;
+}
+
 export type WoClaimState = 'OPEN' | 'MERGED';
 
 export interface WoClaim {
@@ -125,13 +136,18 @@ interface GhPrRow {
   body?: string;
 }
 
-export async function ghPrSearchDefault(repo: string, woId: string): Promise<WoClaim[]> {
-  if (process.env.SMART_CAULDRON_HERMETIC === '1') {
-    console.log('[smart-cauldron/already-satisfied] skipping GitHub search in hermetic mode');
+export async function ghPrSearchDefault(
+  repo: string,
+  woId: string,
+  options: GhPrSearchOptions = {}
+): Promise<WoClaim[]> {
+  const hermetic = options.hermetic ?? process.env.SMART_CAULDRON_HERMETIC === '1';
+  if (hermetic) {
     return [];
   }
   try {
-    const { stdout } = await execFileAsync(
+    const execute = options.exec ?? execFileAsync;
+    const { stdout } = await execute(
       'gh',
       [
         'pr',

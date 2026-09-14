@@ -170,9 +170,12 @@ describe('auth/project binding guards', () => {
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
     };
 
+    const startedAt = performance.now();
     const result = await runCascade(baseOpts({ deps }));
+    const elapsedMs = performance.now() - startedAt;
 
     expect(fireCalled).toBe(false);
+    expect(elapsedMs).toBeLessThan(2000);
     expect(result.status).toBe('infra-alert');
     expect(result.attempts[0]?.outcome).toBe('infra-error');
     expect(result.attempts[0]?.infraErrorReason).toContain('is unavailable');
