@@ -4,6 +4,8 @@ import {
   AUTO_REREVIEW_REASON_PREFIX,
   MAX_REREVIEW_ATTEMPTS,
   buildRereviewReason,
+  buildSupersedeReason,
+  countTotalAutoRereviews,
   findAuthorizingPriorReview,
   ingestPullRequestEvent,
   isAutoRereviewReason,
@@ -85,14 +87,20 @@ describe('bounded repeat reason policy', () => {
     expect(fake.enqueued[0]?.repeatReason).toBeNull();
   });
 
-  test('APPROVED and missing verdicts get no reason and remain blocked', async () => {
-    for (const verdict of ['approved', null] as const) {
-      const fake = deps([work({ verdict })]);
-      expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
-        'enqueue_failed:repeat_reason_required'
-      );
-      expect(fake.enqueued[0]?.repeatReason).toBeNull();
-    }
+  test('prior verdict other at an older head enqueues with a non-auto supersede reason', async () => {
+    const fake = deps([work({ verdict: 'other' })]);
+    expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
+    const reason = fake.enqueued[0]?.repeatReason ?? '';
+    expect(reason).toBe(buildSupersedeReason(OLD_HEAD, NEW_HEAD, 'other'));
+    expect(isAutoRereviewReason(reason)).toBe(false);
+  });
+
+  test('prior verdict approved at an older head enqueues with a non-auto supersede reason', async () => {
+    const fake = deps([work({ verdict: 'approved' })]);
+    expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
+    const reason = fake.enqueued[0]?.repeatReason ?? '';
+    expect(reason).toBe(buildSupersedeReason(OLD_HEAD, NEW_HEAD, 'approved'));
+    expect(isAutoRereviewReason(reason)).toBe(false);
   });
 
   test('a never-reviewed PR follows the first-review path unchanged', async () => {
@@ -154,6 +162,28 @@ describe('auto re-review marker recognition', () => {
     expect(isAutoRereviewReason(undefined)).toBe(false);
     // The marker must lead; a reason merely mentioning it does not count.
     expect(isAutoRereviewReason(`see ${AUTO_REREVIEW_REASON_PREFIX}${NEW_HEAD}`)).toBe(false);
+    expect(isAutoRereviewReason(buildSupersedeReason(OLD_HEAD, NEW_HEAD, 'approved'))).toBe(false);
+  });
+
+  test('countTotalAutoRereviews ignores the supersede prefix', () => {
+    const reason = buildSupersedeReason(OLD_HEAD, NEW_HEAD, 'approved');
+    expect(isAutoRereviewReason(reason)).toBe(false);
+    expect(
+      countTotalAutoRereviews([
+        work({
+          messageId: 'after-approve',
+          verdict: 'approved',
+          isAutoRereview: isAutoRereviewReason(reason),
+        }),
+      ])
+    ).toBe(0);
+    expect(
+      countTotalAutoRereviews([
+        work({
+          isAutoRereview: isAutoRereviewReason(buildRereviewReason('v', OLD_HEAD, NEW_HEAD)),
+        }),
+      ])
+    ).toBe(1);
   });
 
   test('a PR carrying only legacy review_exact_head rows is NOT capped', async () => {
@@ -275,17 +305,18 @@ describe('verdict-bearing prior selection', () => {
     expect(fake.enqueued[0]?.repeatReason).toContain(OLD_HEAD);
   });
 
-  test('a newer APPROVED verdict still withholds authorization', async () => {
+  test('a newer APPROVED verdict withholds the auto path but still enqueues', async () => {
     // Selection skips verdict-less rows only. A real newer verdict remains
-    // authoritative, so an older changes_requested cannot reach past it.
+    // authoritative, so an older changes_requested cannot reach past it
+    // into the cap-counted auto prefix. The new head is still reviewed.
     const fake = deps([
       work({ messageId: 'review-b', headSha: MID_HEAD, verdict: 'approved' }),
       work({ messageId: 'review-a', headSha: OLD_HEAD, verdict: 'changes_requested' }),
     ]);
-    expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
-      'enqueue_failed:repeat_reason_required'
-    );
-    expect(fake.enqueued[0]?.repeatReason).toBeNull();
+    expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
+    const reason = fake.enqueued[0]?.repeatReason ?? '';
+    expect(reason).toBe(buildSupersedeReason(MID_HEAD, NEW_HEAD, 'approved'));
+    expect(isAutoRereviewReason(reason)).toBe(false);
   });
 
   test('a verdict on the CURRENT head never authorizes a repeat', () => {
