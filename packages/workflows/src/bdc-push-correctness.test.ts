@@ -358,7 +358,7 @@ describe('F-8C: staging-gate base-branch selection for gh pr create', () => {
 
 describe('Base branch override: deterministic open-pr-if-needed handling', () => {
   it.each([
-    ["single-quoted empty value", "''"],
+    ['single-quoted empty value', "''"],
     ['double-quoted empty value', '""'],
     ['space-only value', ' '],
     ['carriage-return-only value', '\r'],
