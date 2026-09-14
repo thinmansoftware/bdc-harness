@@ -653,7 +653,8 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).toContain('repair_target_malformed');
       expect(yaml).toContain('repair_target_unauthorized');
       expect(yaml).toContain('s/^[[:space:]]*Repair target:[[:space:]]*PR #');
-      expect(yaml).toContain('BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC_20260914_020');
+      expect(yaml).toContain('SPEC_TEXT=$read-spec.output');
+      expect(yaml).not.toContain('BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC');
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
     }
   });
@@ -682,7 +683,8 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).toContain('repair_target_malformed');
       expect(yaml).toContain('repair_target_unauthorized');
       expect(yaml).toContain('s/^[[:space:]]*Repair target:[[:space:]]*PR #');
-      expect(yaml).toContain('BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC_20260914_020');
+      expect(yaml).toContain('SPEC_TEXT=$read-spec.output');
+      expect(yaml).not.toContain('BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC');
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
       expect(yaml).toContain('--force-with-lease=');
       expect(yaml).toContain('repair_target_diverged');

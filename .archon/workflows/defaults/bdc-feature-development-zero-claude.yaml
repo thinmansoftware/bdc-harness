@@ -2988,10 +2988,10 @@ nodes:
         echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
         exit 1
       fi
-      SPEC_TEXT=$(cat <<'BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC_20260914_020'
-      $read-spec.output
-      BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC_20260914_020
-      )
+      # Direct assignment, never a heredoc: the executor substitutes $read-spec.output
+      # shellQuote-wrapped (single-quoted, embedded quotes escaped), so untrusted spec
+      # text can neither terminate a delimiter nor be evaluated by this shell.
+      SPEC_TEXT=$read-spec.output
       REPAIR_TARGET_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       REPAIR_TARGET_PR=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_pr:[[:space:]]*#\{0,1\}\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
       REPAIR_TARGET_PR_PRESENT=false
