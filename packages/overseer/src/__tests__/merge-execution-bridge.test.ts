@@ -83,12 +83,14 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
   };
   const github: GitHubClientDeps = {
     findPullRequest: async () => evidence,
-    approvePullRequest: async () => {
+    approvePullRequest: async input => {
+      expect(input.expectedHeadSha).toBe('judged-sha');
       approvals += 1;
       return { approved: true };
     },
     mergePullRequest: async input => {
       expect(input.mergeMethod).toBe('squash');
+      expect(input.expectedHeadSha).toBe('judged-sha');
       merges += 1;
       return { merged: true, mergeSha: 'merge-sha' };
     },
@@ -279,6 +281,7 @@ describe('merge execution bridge', () => {
       approvePullRequest: async () => ({ approved: true }),
       mergePullRequest: async input => {
         expect(input.mergeMethod).toBe('squash');
+        expect(input.expectedHeadSha).toBe('judged-sha');
         merges += 1;
         return { merged: true, mergeSha: 'merge-sha' };
       },
@@ -352,4 +355,28 @@ describe('merge execution bridge', () => {
       expect(h.outcomes[0]?.reason).toBe(reason);
     }
   );
+
+  test('forwards verdict.head_sha as expectedHeadSha on merge and approve', async () => {
+    const reviewed = 'reviewed-head-sha';
+    const h = harness([verdict('pin-sha', reviewed)], greenPr({ headSha: reviewed }));
+    const seen: { merge?: string; approve?: string } = {};
+    h.github.approvePullRequest = async input => {
+      seen.approve = input.expectedHeadSha;
+      return { approved: true };
+    };
+    h.github.mergePullRequest = async input => {
+      seen.merge = input.expectedHeadSha;
+      return { merged: true, mergeSha: 'merge-sha' };
+    };
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(seen.merge).toBe(reviewed);
+    expect(seen.approve).toBe(reviewed);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
 });

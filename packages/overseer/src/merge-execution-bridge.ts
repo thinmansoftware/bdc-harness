@@ -212,7 +212,10 @@ export async function runMergeExecutionBridgeOnce(
 
     if (options.github.approvePullRequest) {
       try {
-        await options.github.approvePullRequest(pr.pr);
+        await options.github.approvePullRequest({
+          ...pr.pr,
+          expectedHeadSha: verdict.head_sha,
+        });
       } catch (error) {
         log.warn(
           { err: error as Error, verdictId: verdict.id },
@@ -222,7 +225,11 @@ export async function runMergeExecutionBridgeOnce(
     }
     let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
     try {
-      merged = await options.github.mergePullRequest({ ...pr.pr, mergeMethod: 'squash' });
+      merged = await options.github.mergePullRequest({
+        ...pr.pr,
+        mergeMethod: 'squash',
+        expectedHeadSha: verdict.head_sha,
+      });
     } catch (error) {
       await options.store.releaseMergeSlot(verdict.id);
       await skip(

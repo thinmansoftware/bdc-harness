@@ -884,12 +884,16 @@ export function createRealMergePullRequest(
       repo: input.repo,
       pull_number: input.number,
     });
+    const seenHead = pr.data.head.sha;
+    if (seenHead !== input.expectedHeadSha) {
+      return { merged: false, message: `head_moved:${seenHead}` };
+    }
     try {
       const mergeInput = {
         owner: input.owner,
         repo: input.repo,
         pull_number: input.number,
-        sha: pr.data.head.sha,
+        sha: input.expectedHeadSha,
         merge_method: 'squash' as const,
       };
       const response = await octokit.pulls.merge(mergeInput);
@@ -906,6 +910,17 @@ export function createRealMergePullRequest(
         typeof error === 'object' && error !== null && 'status' in error
           ? (error as { status?: number }).status
           : undefined;
+      if (status === 405) {
+        const apiMessage =
+          typeof error === 'object' &&
+          error !== null &&
+          'message' in error &&
+          typeof (error as { message: unknown }).message === 'string' &&
+          (error as { message: string }).message.trim() !== ''
+            ? (error as { message: string }).message
+            : 'github_merge_rejected_405';
+        return { merged: false, message: apiMessage };
+      }
       if (status === 409 || status === 422) {
         return { merged: false, message: `github_merge_rejected_${status}` };
       }
@@ -929,23 +944,30 @@ export function createRealMergePullRequest(
  */
 export function createRealApprovePullRequest(
   octokit: RealGitHubOctokitLike
-): (input: PullRequestRef) => Promise<{ approved: boolean; message?: string }> {
+): (
+  input: PullRequestRef & { expectedHeadSha?: string }
+) => Promise<{ approved: boolean; message?: string }> {
   const submit = createRealSubmitPullRequestReview(octokit);
-  return async (input: PullRequestRef): Promise<{ approved: boolean; message?: string }> => {
-    // PullRequestRef carries no head SHA, and commit_id is now required
-    // (stop condition 4): fetch the live head immediately before approving
-    // so the review still binds to a real, current commit rather than
-    // whatever GitHub would pick if commit_id were omitted.
+  return async (
+    input: PullRequestRef & { expectedHeadSha?: string }
+  ): Promise<{ approved: boolean; message?: string }> => {
+    // Prefer the reviewed SHA when the caller supplied it so the review
+    // cannot bind to a later unreviewed head. Compatibility callers that
+    // still pass only PullRequestRef keep the live-head fetch.
     let commitId: string;
-    try {
-      const pr = await octokit.pulls.get({
-        owner: input.owner,
-        repo: input.repo,
-        pull_number: input.number,
-      });
-      commitId = pr.data.head.sha;
-    } catch {
-      return { approved: false, message: 'github_review_head_lookup_failed' };
+    if (input.expectedHeadSha) {
+      commitId = input.expectedHeadSha;
+    } else {
+      try {
+        const pr = await octokit.pulls.get({
+          owner: input.owner,
+          repo: input.repo,
+          pull_number: input.number,
+        });
+        commitId = pr.data.head.sha;
+      } catch {
+        return { approved: false, message: 'github_review_head_lookup_failed' };
+      }
     }
     const result = await submit({ ...input, event: 'APPROVE', commitId });
     return result.message === undefined
