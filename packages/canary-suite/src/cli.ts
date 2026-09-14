@@ -7,6 +7,12 @@ import {
   type TaskmasterCanaryDeps,
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
+import {
+  runPrReviewCanarySuite,
+  writePrReviewCanaryArtifacts,
+  type PrReviewCanaryDeps,
+} from './pr-review-canary';
+import type { OutcomeCanaryResult } from './outcome-canary';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
@@ -16,6 +22,11 @@ interface CanaryCliDeps {
   readonly taskmasterArtifactWriter?: (
     outputRoot: string,
     report: TaskmasterCanaryResult
+  ) => Promise<readonly string[]>;
+  readonly prReviewRunner?: (options: PrReviewCanaryDeps) => Promise<OutcomeCanaryResult>;
+  readonly prReviewArtifactWriter?: (
+    outputRoot: string,
+    report: OutcomeCanaryResult
   ) => Promise<readonly string[]>;
 }
 
@@ -80,9 +91,48 @@ export async function runCanaryCli(
     deps.stdout(JSON.stringify(report, null, 2));
     return exitFor(report.verdict);
   }
+  if (command === 'pr-review') {
+    const dbPath = flag(args, '--db-path');
+    const outputRoot = flag(args, '--output-root');
+    const apiBase = flag(args, '--api-base');
+    const owner = flag(args, '--owner');
+    const repo = flag(args, '--repo');
+    const branch = flag(args, '--branch');
+    const headSha = flag(args, '--head-sha');
+    const prValue = flag(args, '--pr-number');
+    const prNumber = prValue === undefined ? undefined : Number(prValue);
+    if (
+      !dbPath ||
+      !outputRoot ||
+      (prValue !== undefined && (!Number.isSafeInteger(prNumber) || (prNumber ?? 0) <= 0))
+    ) {
+      deps.stderr('pr_review_canary_missing_or_invalid_required_argument');
+      return 3;
+    }
+    const token = env.ARCHON_OPERATOR_TOKEN;
+    const report = await (deps.prReviewRunner ?? runPrReviewCanarySuite)({
+      dbPath,
+      operatorToken: token,
+      statusUrl: apiBase
+        ? `${apiBase.replace(/\/$/, '')}/api/overseer/pr-review/status`
+        : undefined,
+      requestUrl: apiBase
+        ? `${apiBase.replace(/\/$/, '')}/api/overseer/pr-review/request`
+        : undefined,
+      queueUrl: apiBase ? `${apiBase.replace(/\/$/, '')}/api/overseer/pr-review/queue` : undefined,
+      owner,
+      repo,
+      branch,
+      headSha,
+      prNumber,
+    });
+    await (deps.prReviewArtifactWriter ?? writePrReviewCanaryArtifacts)(outputRoot, report);
+    deps.stdout(JSON.stringify(report, null, 2));
+    return exitFor(report.verdict);
+  }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster> [options]');
+    deps.stderr('Usage: archon-canary <check|plan|taskmaster|pr-review> [options]');
     return 3;
   }
   const manifestPath = flag(args, '--manifest');

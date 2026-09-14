@@ -18,6 +18,7 @@
     "@archon/workflows": "workspace:*",
     "@archon/providers": "workspace:*",
     "@archon/smart-cauldron": "workspace:*",
+    "@archon/overseer": "workspace:*",
     "zod": "^3.25.28"
   }
 }

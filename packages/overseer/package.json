@@ -45,7 +45,8 @@
     "./pr-review-check-ingest": "./src/pr-review-check-ingest.ts",
     "./pr-review-check-wiring": "./src/pr-review-check-wiring.ts",
     "./github-rate-limit": "./src/github-rate-limit.ts",
-    "./adapters/github-real-deps": "./src/adapters/github-real-deps.ts"
+    "./adapters/github-real-deps": "./src/adapters/github-real-deps.ts",
+    "./adapters/required-contexts": "./src/adapters/required-contexts.ts"
   },
   "scripts": {
     "pretest": "bun test --timeout 30000 src/__tests__/pr-review-rereview-cap.test.ts && bun test --timeout 30000 src/__tests__/pr-review-evaluator.test.ts && bun test --timeout 30000 src/__tests__/required-contexts.test.ts && bun test --timeout 30000 src/__tests__/required-contexts-durability.test.ts && bun test --timeout 30000 src/__tests__/github-real-deps-octokit-shape.test.ts && bun test --timeout 30000 src/__tests__/pr-review-rereview-reason.test.ts",

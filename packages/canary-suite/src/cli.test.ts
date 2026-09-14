@@ -2,6 +2,7 @@ import { expect, mock, test } from 'bun:test';
 import { runCanaryCli } from './cli';
 import type { CanaryReport, RunCanaryResult } from './types';
 import type { TaskmasterCanaryResult } from './taskmaster-canary';
+import type { OutcomeCanaryResult } from './outcome-canary';
 
 const baseReport: CanaryReport = {
   schemaVersion: 1,
@@ -159,4 +160,94 @@ test('taskmaster maps a failed report to exit 2 after writing its artifact', asy
 
   expect(await runCanaryCli([...taskmasterArgs, '--interval-ms', '60000'], {}, deps)).toBe(2);
   expect(deps.taskmasterArtifactWriter).toHaveBeenCalledWith('artifacts', failedReport);
+});
+
+const prReviewArgs = ['pr-review', '--db-path', 'archon.db', '--output-root', 'artifacts'];
+
+const prReviewReport: OutcomeCanaryResult = {
+  verdict: 'passed',
+  reasonCodes: [],
+  evidenceRefs: ['fixture'],
+};
+
+function prReviewDeps(report: OutcomeCanaryResult = prReviewReport) {
+  return {
+    runner: mock(async () => ({}) as RunCanaryResult),
+    prReviewRunner: mock(async () => report),
+    prReviewArtifactWriter: mock(async () => ['artifacts/pr-review-fixture/summary.json']),
+    stdout: mock(() => {}),
+    stderr: mock(() => {}),
+  };
+}
+
+test.each([
+  ['--db-path', ''],
+  ['--output-root', ''],
+  ['--pr-number', '0'],
+  ['--pr-number', 'not-a-number'],
+] as const)('pr-review rejects invalid %s before running checks', async (name, value) => {
+  const deps = prReviewDeps();
+  const index = prReviewArgs.indexOf(name);
+  const invocation =
+    index >= 0
+      ? prReviewArgs.map((argument, argumentIndex) =>
+          argumentIndex === index + 1 ? value : argument
+        )
+      : [...prReviewArgs, name, value];
+
+  expect(await runCanaryCli(invocation, {}, deps)).toBe(3);
+  expect(deps.prReviewRunner).not.toHaveBeenCalled();
+  expect(deps.prReviewArtifactWriter).not.toHaveBeenCalled();
+  expect(deps.stderr).toHaveBeenCalledWith('pr_review_canary_missing_or_invalid_required_argument');
+});
+
+test('pr-review wires token, api-base, and artifacts', async () => {
+  const deps = prReviewDeps();
+  const exit = await runCanaryCli(
+    [
+      ...prReviewArgs,
+      '--api-base',
+      'http://127.0.0.1:3090',
+      '--owner',
+      'thinmansoftware',
+      '--repo',
+      'bdc-harness',
+      '--pr-number',
+      '806',
+      '--head-sha',
+      'a'.repeat(40),
+      '--branch',
+      'dev',
+    ],
+    { ARCHON_OPERATOR_TOKEN: 'operator-token' },
+    deps
+  );
+
+  expect(exit).toBe(0);
+  expect(deps.prReviewRunner).toHaveBeenCalledWith({
+    dbPath: 'archon.db',
+    operatorToken: 'operator-token',
+    statusUrl: 'http://127.0.0.1:3090/api/overseer/pr-review/status',
+    requestUrl: 'http://127.0.0.1:3090/api/overseer/pr-review/request',
+    queueUrl: 'http://127.0.0.1:3090/api/overseer/pr-review/queue',
+    owner: 'thinmansoftware',
+    repo: 'bdc-harness',
+    branch: 'dev',
+    headSha: 'a'.repeat(40),
+    prNumber: 806,
+  });
+  expect(deps.prReviewArtifactWriter).toHaveBeenCalledWith('artifacts', prReviewReport);
+  expect(deps.stdout).toHaveBeenCalledWith(JSON.stringify(prReviewReport, null, 2));
+});
+
+test('pr-review maps a failed report to exit 2 after writing its artifact', async () => {
+  const failedReport: OutcomeCanaryResult = {
+    verdict: 'failed',
+    reasonCodes: ['c1_budget_exhausted_on_converging_pr'],
+    evidenceRefs: [],
+  };
+  const deps = prReviewDeps(failedReport);
+
+  expect(await runCanaryCli(prReviewArgs, {}, deps)).toBe(2);
+  expect(deps.prReviewArtifactWriter).toHaveBeenCalledWith('artifacts', failedReport);
 });
