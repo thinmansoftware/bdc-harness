@@ -9,15 +9,21 @@
  * extending it, so the same-head recheck path and the head-moved push path can
  * evolve without either regressing the other.
  *
- * NO GITHUB CLIENT IS CONSTRUCTED HERE. The whole point of #782 part 1 is to
- * decide "does this completion warrant a re-review" from the webhook payload
- * plus the local store, because the shared per-user GitHub budget is what
- * collapsed the review on #776 in the first place.
+ * A GitHub client is constructed lazily, and only for the suite-level
+ * listForRef fallback: check_run completions still decide from the webhook
+ * payload plus the local store. The shared per-user GitHub budget is what
+ * collapsed the review on #776, so this read fires only when a workflow_run
+ * / check_suite name cannot be matched to a verdict-named check.
  */
 import * as dispatch from '@archon/core/db/dispatch';
-import type { RecheckIngestDeps, StandingVerdict } from './pr-review-check-ingest.ts';
+import type {
+  RecheckCheckRun,
+  RecheckIngestDeps,
+  StandingVerdict,
+} from './pr-review-check-ingest.ts';
 import type { SubmitOutcome } from './pr-review-submit.ts';
 import { recheckCorrelationId } from './pr-review-check-ingest';
+import { createRealOctokitClient } from './adapters/github-real-deps';
 import {
   REVIEW_RECIPIENT,
   REVIEW_SENDER,
@@ -28,6 +34,45 @@ import {
 
 /** Receipt recipient the submit path writes its verdicts to. */
 const RECEIPT_RECIPIENT = 'operator';
+
+const CHECK_RUN_PAGE_SIZE = 100;
+const MAX_CHECK_RUN_PAGES = 10;
+
+interface CheckRunsForRefClient {
+  checks: {
+    listForRef(input: Record<string, unknown>): Promise<{
+      data: { check_runs?: unknown[] };
+    }>;
+  };
+}
+
+/**
+ * Same paginated listForRef walk the stale sweep uses. Incomplete (capped or
+ * failed) pages are reported so the ingest can fail closed.
+ */
+async function listCheckRunsForRefFromOctokit(
+  octokit: CheckRunsForRefClient,
+  input: { owner: string; repo: string; headSha: string }
+): Promise<{ runs: RecheckCheckRun[]; complete: boolean }> {
+  const runs: RecheckCheckRun[] = [];
+  for (let page = 1; page <= MAX_CHECK_RUN_PAGES; page += 1) {
+    try {
+      const response = await octokit.checks.listForRef({
+        owner: input.owner,
+        repo: input.repo,
+        ref: input.headSha,
+        per_page: CHECK_RUN_PAGE_SIZE,
+        page,
+      });
+      const pageRuns = (response.data.check_runs ?? []) as RecheckCheckRun[];
+      runs.push(...pageRuns);
+      if (pageRuns.length < CHECK_RUN_PAGE_SIZE) return { runs, complete: true };
+    } catch {
+      return { runs, complete: false };
+    }
+  }
+  return { runs, complete: false };
+}
 
 /**
  * Shape of a `pr_review_submit_receipt` body, as written by
@@ -130,6 +175,7 @@ export function extractReviewSummary(resultBody: string | null): string | null {
  * it is what bounds the path to one re-review per (head, completed check).
  */
 export function createRealRecheckIngestDeps(config: ReviewRouteConfig): RecheckIngestDeps {
+  let octokit: CheckRunsForRefClient | undefined;
   return {
     webhookSecret: config.webhookSecret,
 
@@ -223,6 +269,11 @@ export function createRealRecheckIngestDeps(config: ReviewRouteConfig): RecheckI
           }),
         }
       );
+    },
+
+    async listCheckRunsForRef(input): Promise<{ runs: RecheckCheckRun[]; complete: boolean }> {
+      octokit ??= createRealOctokitClient();
+      return listCheckRunsForRefFromOctokit(octokit, input);
     },
   };
 }

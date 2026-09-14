@@ -32,12 +32,15 @@
  */
 import { createLogger } from '@archon/paths';
 import {
+  blockingCheckNamesFromVerdict,
   buildRecheckReason,
   recheckCorrelationId,
   recheckIdempotencyKey,
   verdictAuthorizesRecheck,
   type StandingVerdict,
 } from '@archon/overseer/pr-review-check-ingest';
+
+export { blockingCheckNamesFromVerdict };
 
 const log = createLogger('dispatch/stale-verdict-sweep');
 
@@ -260,47 +263,6 @@ export interface StaleVerdictSweepResult {
    * declining to churn rejections whose evidence has not actually improved.
    */
   skippedNotGreen: number;
-}
-
-const FINDING_LINE_RE = /^\[(blocker|major|minor|note)\]\s+(.+)$/i;
-const CHECKS_SCOPE_PREFIX = 'checks/';
-
-/**
- * Check names the standing verdict actually rejected for, from `checks/`
- * finding lines. Used by the stale sweep so allChecksGreen is the blocking
- * set, not every optional job at the head.
- *
- * Unstructured prose (no finding lines) returns empty: the caller then falls
- * back to every latest attempt. Do not GitHub-read required contexts here;
- * that set is not in the sweep deps and a per-PR protection lookup would
- * spend the rate budget this backstop exists to bound.
- */
-export function blockingCheckNamesFromVerdict(summary: string | null | undefined): string[] {
-  if (typeof summary !== 'string' || summary.length === 0) return [];
-  const names: string[] = [];
-  const seen = new Set<string>();
-  for (const raw of summary.split(/\r?\n/)) {
-    const line = raw.trim();
-    const match = FINDING_LINE_RE.exec(line);
-    if (!match) continue;
-    const rest = match[2] ?? '';
-    const colon = rest.indexOf(':');
-    const scope = (colon === -1 ? rest : rest.slice(0, colon)).trim();
-    if (!scope.toLowerCase().startsWith(CHECKS_SCOPE_PREFIX)) continue;
-    // Live summaries sometimes omit the colon: `[major] checks/test
-    // (windows-latest) failed`. Strip that trailing prose so the remainder
-    // matches the GitHub check name.
-    const name = scope
-      .slice(CHECKS_SCOPE_PREFIX.length)
-      .trim()
-      .replace(/\s+failed\b.*$/i, '')
-      .trim();
-    const key = name.toLowerCase();
-    if (name.length === 0 || seen.has(key)) continue;
-    seen.add(key);
-    names.push(name);
-  }
-  return names;
 }
 
 /**

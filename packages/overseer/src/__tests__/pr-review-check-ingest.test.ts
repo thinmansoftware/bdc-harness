@@ -10,10 +10,12 @@ import { createHmac } from 'node:crypto';
 import { describe, expect, test } from 'bun:test';
 import {
   buildRecheckReason,
+  blockingCheckNamesFromVerdict,
   completionIsRelevantToVerdict,
   conclusionIsPassing,
   extractCheckCompletion,
   ingestCheckCompletionEvent,
+  namedBlockingChecksAreGreen,
   recheckIdempotencyKey,
   summaryNamesACheck,
   verdictAuthorizesRecheck,
@@ -96,6 +98,24 @@ function checkRunPayload(
         number,
         head: { sha: HEAD },
       })),
+    },
+    repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+  });
+}
+
+function workflowRunPayload(
+  name: string,
+  overrides: { id?: number; conclusion?: string | null } = {}
+): string {
+  return JSON.stringify({
+    action: 'completed',
+    workflow_run: {
+      id: overrides.id ?? 4242,
+      name,
+      status: 'completed',
+      conclusion: overrides.conclusion === undefined ? 'success' : overrides.conclusion,
+      head_sha: HEAD,
+      pull_requests: [{ number: 746, head: { sha: HEAD } }],
     },
     repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
   });
@@ -323,6 +343,35 @@ describe('ingestCheckCompletionEvent', () => {
         { checkName: 'test' }
       )
     ).toBe(false);
+
+    expect(blockingCheckNamesFromVerdict(CHECK_CAUSED_VERDICT.summary)).toEqual([
+      'test (windows-latest)',
+    ]);
+    // Suite-level: identity must match a verdict-named check.
+    expect(
+      completionIsRelevantToVerdict(CHECK_CAUSED_VERDICT, {
+        checkName: 'Gitleaks',
+        checkId: 'workflow_run:1',
+      })
+    ).toBe(false);
+    expect(
+      completionIsRelevantToVerdict(CHECK_CAUSED_VERDICT, {
+        checkName: 'test (windows-latest)',
+        checkId: 'workflow_run:1',
+      })
+    ).toBe(true);
+    expect(
+      completionIsRelevantToVerdict(CHECK_CAUSED_VERDICT, {
+        checkName: 'test',
+        checkId: 'workflow_run:1',
+      })
+    ).toBe(true);
+    expect(
+      completionIsRelevantToVerdict(CHECK_CAUSED_VERDICT, {
+        checkName: 'CI',
+        checkId: 'workflow_run:1',
+      })
+    ).toBe(false);
   });
 
   test('the idempotency key includes the check id, so it never collides with the push-path review row', () => {
@@ -356,27 +405,100 @@ describe('ingestCheckCompletionEvent', () => {
     expect(new Set(recorded.enqueued.map(row => row.idempotencyKey)).size).toBe(2);
   });
 
-  test('a workflow_run completion is accepted on the same terms', async () => {
+  test('a passing workflow_run for a different workflow queues nothing', async () => {
     const recorded: Recorded = { enqueued: [], receipts: [] };
     const deps = makeDeps(CHECK_CAUSED_VERDICT, recorded);
-    const rawBody = JSON.stringify({
-      action: 'completed',
-      workflow_run: {
-        id: 4242,
-        name: 'CI',
-        status: 'completed',
-        conclusion: 'success',
-        head_sha: HEAD,
-        pull_requests: [{ number: 746 }],
-      },
-      repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
-    });
+    const rawBody = workflowRunPayload('Gitleaks');
     const result = await ingestCheckCompletionEvent(
       { rawBody, signature: sign(rawBody), eventType: 'workflow_run', deliveryId: 'd-wf' },
       deps
     );
+    expect(recorded.enqueued).toHaveLength(0);
+    expect(result.disposition).toBe('ignored_no_authorizing_verdict');
+    const skip = recorded.receipts.find(r => r.disposition === 'ignored_check_not_actionable');
+    expect(skip?.reason).toContain('rereview_skipped_check_not_relevant');
+    expect(skip?.reason).toContain('Gitleaks');
+  });
+
+  test('a passing workflow_run whose name matches the named check enqueues once', async () => {
+    const recorded: Recorded = { enqueued: [], receipts: [] };
+    const deps = makeDeps(CHECK_CAUSED_VERDICT, recorded);
+    const rawBody = workflowRunPayload('test');
+    const result = await ingestCheckCompletionEvent(
+      { rawBody, signature: sign(rawBody), eventType: 'workflow_run', deliveryId: 'd-wf-match' },
+      deps
+    );
     expect(result.disposition).toBe('queued');
+    expect(recorded.enqueued).toHaveLength(1);
     expect(recorded.enqueued[0]?.idempotencyKey).toContain('workflow_run:4242');
+  });
+
+  test('unmatched workflow_run enqueues when listForRef shows every named blocking check green', async () => {
+    const recorded: Recorded = { enqueued: [], receipts: [] };
+    const deps = makeDeps(CHECK_CAUSED_VERDICT, recorded, {
+      async listCheckRunsForRef() {
+        return {
+          complete: true,
+          runs: [
+            {
+              id: 1,
+              name: 'Gitleaks',
+              status: 'completed',
+              conclusion: 'success',
+              completed_at: '2026-09-14T00:00:00Z',
+            },
+            {
+              id: 2,
+              name: 'test (windows-latest)',
+              status: 'completed',
+              conclusion: 'success',
+              completed_at: '2026-09-14T00:01:00Z',
+            },
+          ],
+        };
+      },
+    });
+    const rawBody = workflowRunPayload('Gitleaks');
+    const result = await ingestCheckCompletionEvent(
+      { rawBody, signature: sign(rawBody), eventType: 'workflow_run', deliveryId: 'd-wf-green' },
+      deps
+    );
+    expect(result.disposition).toBe('queued');
+    expect(recorded.enqueued).toHaveLength(1);
+  });
+
+  test('unmatched workflow_run queues nothing when the named blocking check is still red', async () => {
+    const recorded: Recorded = { enqueued: [], receipts: [] };
+    const deps = makeDeps(CHECK_CAUSED_VERDICT, recorded, {
+      async listCheckRunsForRef() {
+        return {
+          complete: true,
+          runs: [
+            {
+              id: 1,
+              name: 'Gitleaks',
+              status: 'completed',
+              conclusion: 'success',
+              completed_at: '2026-09-14T00:00:00Z',
+            },
+            {
+              id: 2,
+              name: 'test (windows-latest)',
+              status: 'completed',
+              conclusion: 'failure',
+              completed_at: '2026-09-14T00:01:00Z',
+            },
+          ],
+        };
+      },
+    });
+    const rawBody = workflowRunPayload('Gitleaks');
+    const result = await ingestCheckCompletionEvent(
+      { rawBody, signature: sign(rawBody), eventType: 'workflow_run', deliveryId: 'd-wf-red' },
+      deps
+    );
+    expect(recorded.enqueued).toHaveLength(0);
+    expect(result.disposition).toBe('ignored_no_authorizing_verdict');
   });
 
   test('a CHECKS_PENDING deferral is authorization: the completion is what it was waiting for', async () => {
@@ -655,5 +777,75 @@ describe('summaryNamesACheck', () => {
   test('a mixed check-and-code summary is not check-only', () => {
     expect(summaryNamesACheck(MIXED_FINDINGS_SUMMARY)).toBe(false);
     expect(summaryNamesACheck('[major] checks/test (windows-latest) failed')).toBe(true);
+  });
+});
+
+describe('namedBlockingChecksAreGreen', () => {
+  test('named check green ignores an optional lint failure', () => {
+    expect(
+      namedBlockingChecksAreGreen(
+        [
+          {
+            id: 1,
+            name: 'lint',
+            status: 'completed',
+            conclusion: 'failure',
+            completed_at: '2026-09-14T00:00:00Z',
+          },
+          {
+            id: 2,
+            name: 'test (windows-latest)',
+            status: 'completed',
+            conclusion: 'success',
+            completed_at: '2026-09-14T00:01:00Z',
+          },
+        ],
+        ['test (windows-latest)'],
+        true
+      )
+    ).toBe(true);
+  });
+
+  test('named check still red is not green', () => {
+    expect(
+      namedBlockingChecksAreGreen(
+        [
+          {
+            id: 1,
+            name: 'Gitleaks',
+            status: 'completed',
+            conclusion: 'success',
+            completed_at: '2026-09-14T00:00:00Z',
+          },
+          {
+            id: 2,
+            name: 'test (windows-latest)',
+            status: 'completed',
+            conclusion: 'failure',
+            completed_at: '2026-09-14T00:01:00Z',
+          },
+        ],
+        ['test (windows-latest)'],
+        true
+      )
+    ).toBe(false);
+  });
+
+  test('incomplete listForRef evidence is fail-closed', () => {
+    expect(
+      namedBlockingChecksAreGreen(
+        [
+          {
+            id: 2,
+            name: 'test (windows-latest)',
+            status: 'completed',
+            conclusion: 'success',
+            completed_at: '2026-09-14T00:01:00Z',
+          },
+        ],
+        ['test (windows-latest)'],
+        false
+      )
+    ).toBe(false);
   });
 });

@@ -23,10 +23,12 @@
  * no database and no GitHub App key.
  *
  * RATE BUDGET: the per-user GitHub budget is shared across the whole harness
- * (it is what exhausted during #776's review). This path therefore performs NO
- * GitHub API reads at all. Every fact it needs -- head sha, repository, the
- * open PRs the completion belongs to -- arrives in the webhook payload itself,
- * and the prior-verdict lookup reads the local dispatch store.
+ * (it is what exhausted during #776's review). check_run completions still
+ * decide from the webhook payload plus the local store. A suite-level
+ * completion (`workflow_run` / `check_suite`) whose name does not match a
+ * verdict-named check may issue ONE `checks.listForRef` read to verify those
+ * named blocking checks are now passing -- the same latest-attempt rule the
+ * stale sweep uses. An unmatched name without that verification never enqueues.
  */
 import { checkGitHubWebhookSignature } from '@archon/adapters/forge/github/webhook-signature';
 
@@ -141,6 +143,17 @@ export interface CheckCompletion {
   prNumbers: number[];
 }
 
+/** Minimal check-run row from `checks.listForRef`, for latest-attempt grouping. */
+export interface RecheckCheckRun {
+  id?: number;
+  name?: string;
+  status?: string;
+  conclusion?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  app?: { slug?: string; name?: string };
+}
+
 export interface RecheckIngestDeps {
   /** Shared webhook secret. Empty/absent means the route must fail closed. */
   webhookSecret: string;
@@ -181,6 +194,17 @@ export interface RecheckIngestDeps {
     reason?: string;
     messageId?: string;
   }): Promise<void>;
+  /**
+   * Optional GitHub `checks.listForRef` read. Used ONLY when a suite-level
+   * (`workflow_run` / `check_suite`) completion cannot be matched by name
+   * against the verdict's `checks/` findings. Absent, incomplete, or throwing
+   * is fail-closed: the completion is not treated as relevant.
+   */
+  listCheckRunsForRef?(input: {
+    owner: string;
+    repo: string;
+    headSha: string;
+  }): Promise<{ runs: RecheckCheckRun[]; complete: boolean }>;
 }
 
 export interface RecheckIngestRequest {
@@ -252,6 +276,7 @@ export function conclusionIsPassing(conclusion: string | null | undefined): bool
 }
 
 const FINDING_LINE_RE = /^\[(blocker|major|minor|note)\]\s+(.+)$/i;
+const CHECKS_SCOPE_PREFIX = 'checks/';
 
 /**
  * Split a persisted review summary into finding lines.
@@ -279,6 +304,151 @@ function parseReviewFindingLines(
 }
 
 /**
+ * Check names the standing verdict actually rejected for, from `checks/`
+ * finding lines. Moved here from the stale sweep (round 4) so ingest and
+ * sweep share one extractor.
+ *
+ * Unstructured prose (no finding lines) returns empty: the caller then falls
+ * back to every latest attempt when verifying via listForRef. Do not
+ * GitHub-read required contexts here.
+ */
+export function blockingCheckNamesFromVerdict(summary: string | null | undefined): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const finding of parseReviewFindingLines(summary)) {
+    const scope = finding.scope;
+    if (!scope.toLowerCase().startsWith(CHECKS_SCOPE_PREFIX)) continue;
+    const name = scope
+      .slice(CHECKS_SCOPE_PREFIX.length)
+      .trim()
+      .replace(/\s+failed\b.*$/i, '')
+      .trim();
+    const key = name.toLowerCase();
+    if (name.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    names.push(name);
+  }
+  return names;
+}
+
+function isSuiteLevelCheckId(checkId: string): boolean {
+  return checkId.startsWith('workflow_run:') || checkId.startsWith('check_suite:');
+}
+
+/**
+ * Sweep-style matcher: exact, or bare context vs matrix job. Two different
+ * matrix cells (windows vs ubuntu) do not match each other.
+ */
+function checkNameMatchesBlockingName(checkName: string, named: string): boolean {
+  const runName = checkName.trim().toLowerCase();
+  const want = named.trim().toLowerCase();
+  if (runName.length === 0 || want.length === 0) return false;
+  if (runName === want) return true;
+  const runBare = runName.replace(/\s*\([^)]*\)\s*$/, '').trim();
+  const wantBare = want.replace(/\s*\([^)]*\)\s*$/, '').trim();
+  if (runBare.length >= 3 && runBare === want) return true;
+  if (wantBare.length >= 3 && wantBare === runName) return true;
+  return false;
+}
+
+function checkAttemptKey(run: RecheckCheckRun): string {
+  const name = (run.name ?? 'check').trim().toLowerCase();
+  const app = (run.app?.slug ?? run.app?.name ?? '').trim().toLowerCase();
+  return app.length > 0 ? `${name}@${app}` : name;
+}
+
+function checkAttemptRank(run: RecheckCheckRun): number {
+  const completed = typeof run.completed_at === 'string' ? Date.parse(run.completed_at) : NaN;
+  if (Number.isFinite(completed)) return completed;
+  const started = typeof run.started_at === 'string' ? Date.parse(run.started_at) : NaN;
+  if (Number.isFinite(started)) return started;
+  return Number.NEGATIVE_INFINITY;
+}
+
+function checkAttemptIsNewer(candidate: RecheckCheckRun, current: RecheckCheckRun): boolean {
+  const candidateRank = checkAttemptRank(candidate);
+  const currentRank = checkAttemptRank(current);
+  if (candidateRank !== currentRank) return candidateRank > currentRank;
+  return (candidate.id ?? 0) > (current.id ?? 0);
+}
+
+function latestAttemptPerCheck(runs: RecheckCheckRun[]): RecheckCheckRun[] {
+  const latest = new Map<string, RecheckCheckRun>();
+  for (const run of runs) {
+    const key = checkAttemptKey(run);
+    const held = latest.get(key);
+    if (!held || checkAttemptIsNewer(run, held)) latest.set(key, run);
+  }
+  return [...latest.values()];
+}
+
+function latestAttemptIsBlocking(
+  run: RecheckCheckRun,
+  blockingCheckNames: readonly string[]
+): boolean {
+  if (blockingCheckNames.length === 0) return true;
+  return blockingCheckNames.some(name => checkNameMatchesBlockingName(run.name ?? '', name));
+}
+
+function blockingNamesAllHaveAttempts(
+  current: RecheckCheckRun[],
+  blockingCheckNames: readonly string[]
+): boolean {
+  if (blockingCheckNames.length === 0) return true;
+  return blockingCheckNames.every(name =>
+    current.some(run => checkNameMatchesBlockingName(run.name ?? '', name))
+  );
+}
+
+/**
+ * True when every verdict-named blocking check's LATEST attempt is passing.
+ * Incomplete listForRef evidence is fail-closed. Empty names keep the sweep's
+ * every-latest-attempt fallback.
+ */
+export function namedBlockingChecksAreGreen(
+  runs: RecheckCheckRun[],
+  blockingCheckNames: readonly string[],
+  complete = true
+): boolean {
+  if (!complete) return false;
+  const current = latestAttemptPerCheck(runs);
+  if (current.length === 0) return false;
+  const blocking = blockingCheckNames.map(name => name.trim()).filter(name => name.length > 0);
+  let allChecksGreen = true;
+  for (const run of current) {
+    if (
+      latestAttemptIsBlocking(run, blocking) &&
+      (run.status !== 'completed' || !conclusionIsPassing(run.conclusion))
+    ) {
+      allChecksGreen = false;
+    }
+  }
+  return allChecksGreen && blockingNamesAllHaveAttempts(current, blocking);
+}
+
+async function suiteBlockingChecksAreGreen(
+  deps: RecheckIngestDeps,
+  input: { owner: string; repo: string; headSha: string; summary?: string | null }
+): Promise<boolean> {
+  if (!deps.listCheckRunsForRef) return false;
+  try {
+    const listed = await deps.listCheckRunsForRef({
+      owner: input.owner,
+      repo: input.repo,
+      headSha: input.headSha,
+    });
+    return namedBlockingChecksAreGreen(
+      listed.runs,
+      blockingCheckNamesFromVerdict(input.summary),
+      listed.complete
+    );
+  } catch {
+    // Fail closed: a listForRef fault must not enqueue. The sweep is the backstop.
+    return false;
+  }
+}
+
+/**
  * Does the completed check bear on what the standing verdict was actually
  * waiting for?
  *
@@ -301,11 +471,12 @@ function parseReviewFindingLines(
  *    fail-closed direction: an unrecognised name is treated as unrelated, so a
  *    stray green job cannot clear a real rejection.
  *
- *  - A SUITE-level unit (`workflow_run`, `check_suite`) is always relevant when
- *    it passed: a green suite means every job inside it passed, the named one
- *    included, which is strictly stronger than any single job's result. Its own
- *    name ("CI") will not match an individual job name, so this case has to be
- *    recognised by unit kind rather than by name.
+ *  - A SUITE-level unit (`workflow_run`, `check_suite`) is relevant only when
+ *    the payload name matches a verdict-named `checks/` finding
+ *    (case-insensitive, bare-context tolerant, same matcher as the sweep).
+ *    When the name cannot be matched, this function returns false and the
+ *    ingest path may still enqueue after listForRef shows every named
+ *    blocking check's latest attempt is passing.
  *
  * NO GITHUB READ. The spec's alternative -- "the required-context set for the
  * head is now fully green" -- would need a `checks.listForRef` call per
@@ -334,7 +505,10 @@ export function completionIsRelevantToVerdict(
   // green, so it is always relevant -- and its name ("CI") deliberately will
   // not match an individual job name like "test (windows-latest)".
   const checkId = completion.checkId ?? '';
-  if (checkId.startsWith('workflow_run:') || checkId.startsWith('check_suite:')) return true;
+  if (isSuiteLevelCheckId(checkId)) {
+    const blocking = blockingCheckNamesFromVerdict(verdict.summary);
+    return blocking.some(name => checkNameMatchesBlockingName(completion.checkName, name));
+  }
 
   const summary = typeof verdict.summary === 'string' ? verdict.summary.toLowerCase() : '';
   if (summary.length === 0) return false;
@@ -622,17 +796,30 @@ export async function ingestCheckCompletionEvent(
         checkId: completion.checkId,
       })
     ) {
-      await safeReceipt(deps, {
-        correlationId,
-        deliveryId,
-        owner,
-        repo,
-        prNumber,
-        headSha: completion.headSha,
-        disposition: 'ignored_check_not_actionable',
-        reason: `rereview_skipped_check_not_relevant:${completion.checkName}`,
-      });
-      continue;
+      let verifiedGreen = false;
+      if (verdict && isSuiteLevelCheckId(completion.checkId)) {
+        verifiedGreen = await suiteBlockingChecksAreGreen(deps, {
+          owner,
+          repo,
+          headSha: completion.headSha,
+          summary: verdict.summary,
+        });
+      }
+      if (verifiedGreen) {
+        // Name did not match; listForRef showed every named blocking check green.
+      } else {
+        await safeReceipt(deps, {
+          correlationId,
+          deliveryId,
+          owner,
+          repo,
+          prNumber,
+          headSha: completion.headSha,
+          disposition: 'ignored_check_not_actionable',
+          reason: `rereview_skipped_check_not_relevant:${completion.checkName}`,
+        });
+        continue;
+      }
     }
 
     anyAuthorized = true;

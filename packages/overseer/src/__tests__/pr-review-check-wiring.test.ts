@@ -296,6 +296,21 @@ describe('integration: stored outcome -> check_run completed -> exactly one re-r
     });
   }
 
+  function workflowRunPayload(name: string): string {
+    return JSON.stringify({
+      action: 'completed',
+      workflow_run: {
+        id: 4242,
+        name,
+        status: 'completed',
+        conclusion: 'success',
+        head_sha: HEAD,
+        pull_requests: [{ number: PR_NUMBER, head: { sha: HEAD } }],
+      },
+      repository: { name: REPO, owner: { login: OWNER } },
+    });
+  }
+
   interface Enqueued {
     idempotencyKey: string;
     headSha: string;
@@ -307,7 +322,11 @@ describe('integration: stored outcome -> check_run completed -> exactly one re-r
    * same two reads `createRealRecheckIngestDeps.readStandingVerdict` performs:
    * the receipt for the disposition, the work item's result body for the text.
    */
-  function makeDeps(resultBody: string, enqueued: Enqueued[]): RecheckIngestDeps {
+  function makeDeps(
+    resultBody: string,
+    enqueued: Enqueued[],
+    overrides: Partial<RecheckIngestDeps> = {}
+  ): RecheckIngestDeps {
     const rows = new Map<string, string>();
     return {
       webhookSecret: SECRET,
@@ -341,6 +360,7 @@ describe('integration: stored outcome -> check_run completed -> exactly one re-r
         return { messageId, alreadyExisted: false };
       },
       async recordReceipt() {},
+      ...overrides,
     };
   }
 
@@ -434,6 +454,110 @@ describe('integration: stored outcome -> check_run completed -> exactly one re-r
       makeDeps(body, enqueued)
     );
 
+    expect(result.disposition).toBe('ignored_no_authorizing_verdict');
+    expect(enqueued).toHaveLength(0);
+  });
+
+  test('NEGATIVE: a passing Gitleaks workflow_run queues nothing for a named windows test', async () => {
+    const { body } = await persistedResultBody({
+      approved: false,
+      summary: CHECK_FINDING,
+      reviewedHeadSha: HEAD,
+    });
+    const enqueued: Enqueued[] = [];
+    const raw = workflowRunPayload('Gitleaks');
+    const result = await ingestCheckCompletionEvent(
+      {
+        rawBody: raw,
+        signature: sign(raw),
+        eventType: 'workflow_run',
+        deliveryId: 'delivery-gitleaks',
+      },
+      makeDeps(body, enqueued)
+    );
+    expect(result.disposition).toBe('ignored_no_authorizing_verdict');
+    expect(enqueued).toHaveLength(0);
+  });
+
+  test('a passing workflow_run whose name matches the named check queues exactly one re-review', async () => {
+    const { body } = await persistedResultBody({
+      approved: false,
+      summary: CHECK_FINDING,
+      reviewedHeadSha: HEAD,
+    });
+    const enqueued: Enqueued[] = [];
+    const raw = workflowRunPayload('test');
+    const result = await ingestCheckCompletionEvent(
+      {
+        rawBody: raw,
+        signature: sign(raw),
+        eventType: 'workflow_run',
+        deliveryId: 'delivery-wf-match',
+      },
+      makeDeps(body, enqueued)
+    );
+    expect(result.disposition).toBe('queued');
+    expect(enqueued).toHaveLength(1);
+  });
+
+  test('unmatched workflow_run enqueues when listForRef shows the named check green', async () => {
+    const { body } = await persistedResultBody({
+      approved: false,
+      summary: CHECK_FINDING,
+      reviewedHeadSha: HEAD,
+    });
+    const enqueued: Enqueued[] = [];
+    const raw = workflowRunPayload('Gitleaks');
+    const result = await ingestCheckCompletionEvent(
+      {
+        rawBody: raw,
+        signature: sign(raw),
+        eventType: 'workflow_run',
+        deliveryId: 'delivery-wf-list-green',
+      },
+      makeDeps(body, enqueued, {
+        async listCheckRunsForRef() {
+          return {
+            complete: true,
+            runs: [
+              { id: 1, name: 'Gitleaks', status: 'completed', conclusion: 'success' },
+              { id: 2, name: 'test (windows-latest)', status: 'completed', conclusion: 'success' },
+            ],
+          };
+        },
+      })
+    );
+    expect(result.disposition).toBe('queued');
+    expect(enqueued).toHaveLength(1);
+  });
+
+  test('unmatched workflow_run queues nothing when listForRef shows the named check still red', async () => {
+    const { body } = await persistedResultBody({
+      approved: false,
+      summary: CHECK_FINDING,
+      reviewedHeadSha: HEAD,
+    });
+    const enqueued: Enqueued[] = [];
+    const raw = workflowRunPayload('Gitleaks');
+    const result = await ingestCheckCompletionEvent(
+      {
+        rawBody: raw,
+        signature: sign(raw),
+        eventType: 'workflow_run',
+        deliveryId: 'delivery-wf-list-red',
+      },
+      makeDeps(body, enqueued, {
+        async listCheckRunsForRef() {
+          return {
+            complete: true,
+            runs: [
+              { id: 1, name: 'Gitleaks', status: 'completed', conclusion: 'success' },
+              { id: 2, name: 'test (windows-latest)', status: 'completed', conclusion: 'failure' },
+            ],
+          };
+        },
+      })
+    );
     expect(result.disposition).toBe('ignored_no_authorizing_verdict');
     expect(enqueued).toHaveLength(0);
   });
