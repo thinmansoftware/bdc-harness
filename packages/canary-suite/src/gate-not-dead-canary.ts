@@ -148,7 +148,14 @@ export async function runGateNotDeadCanary(
       ]);
     }
     if (resolution.contexts.length === 0) {
-      return passResult([`branch=${branch}`, 'required_contexts=0', `source=${resolution.source}`]);
+      // A base with no required checks IS a dead gate: nothing can turn red, so
+      // nothing can hold a merge. Review finding, PR #840 round 9.
+      return failResult('c6_no_required_checks_on_base', [
+        `branch=${branch}`,
+        `head_sha=${headSha}`,
+        'required_contexts=0',
+        `source=${resolution.source}`,
+      ]);
     }
     const listed = await github.listCheckRunsForRef({ owner, repo, ref: headSha });
     const runs = listed.data.check_runs;

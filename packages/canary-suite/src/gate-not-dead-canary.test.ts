@@ -55,6 +55,23 @@ describe('C6 gate-not-dead canary', () => {
     expect(result.reasonCodes).toContain('c6_required_check_red_on_head:docker-build');
   });
 
+  test('RED: a base with no required checks is a dead gate, not a pass', async () => {
+    const result = await runGateNotDeadCanary({
+      github: {
+        ...github('success'),
+        getAllStatusCheckContexts: async () => ({ data: [] }),
+      },
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      branch: 'dev',
+      headSha: HEAD,
+      env: {},
+    });
+    expect(result.verdict).toBe('failed');
+    expect(result.reasonCodes).toEqual(['c6_no_required_checks_on_base']);
+    expect(result.evidenceRefs).toContain('required_contexts=0');
+  });
+
   test('missing github client is blocked, not failed', async () => {
     const result = await runGateNotDeadCanary({ env: {} });
     expect(result.verdict).toBe('blocked');

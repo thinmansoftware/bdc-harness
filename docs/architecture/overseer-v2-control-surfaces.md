@@ -87,5 +87,7 @@ readonly dispatch store. Extra flags:
 C6 uses `createRealOctokitClient()` only when GitHub App env is complete
 (`GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and `GITHUB_APP_PRIVATE_KEY` or
 `GITHUB_APP_PRIVATE_KEY_PATH`). Absent/unusable App credentials omit the client and C6
-is `blocked` with `c6_github_client_unavailable` (not `failed`). The CLI prints
+is `blocked` with `c6_github_client_unavailable` (not `failed`). A base whose required
+contexts resolve to an empty list is `failed` with `c6_no_required_checks_on_base`: an
+unenforced gate is the dead gate the canary exists to catch. The CLI prints
 `blocked canaries: ...` on stderr. Composed verdict: `failed` outranks `blocked`.
