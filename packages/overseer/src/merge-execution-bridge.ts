@@ -7,11 +7,14 @@ import type { GitHubClientDeps } from './types.ts';
 const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
 const FLAG_MERGE_READY = 'flag_merge_ready';
-const REPO_CONFIG: Readonly<Record<string, { baseBranch: string }>> = Object.freeze({
+const DEFAULT_REPO_CONFIG: Readonly<Record<string, { baseBranch: string }>> = Object.freeze({
   'bdc-harness': { baseBranch: 'dev' },
   shopops: { baseBranch: 'staging' },
   'lspro-react': { baseBranch: 'dev' },
 });
+const REPO_CONFIG_ENV = 'OVERSEER_MERGE_REPO_CONFIG';
+
+export type MergeExecutionRepoConfig = Readonly<Record<string, { readonly baseBranch: string }>>;
 
 export interface MergeExecutionBridgeStore {
   listUnactionedVerdicts(): Promise<OverseerVerdictRow[]>;
@@ -33,12 +36,43 @@ export interface MergeExecutionBridgeOptions {
   readPolicy?: () => OverseerActionPolicy;
   now?: () => Date;
   maxMergesPerHour?: number;
+  repoConfig?: MergeExecutionRepoConfig;
 }
 
 function configuredLimit(override?: number): number {
   if (override !== undefined) return override;
   const parsed = Number.parseInt(process.env.OVERSEER_MAX_MERGES_PER_HOUR ?? '', 10);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_MERGES_PER_HOUR;
+}
+
+function configuredRepos(override?: MergeExecutionRepoConfig): MergeExecutionRepoConfig {
+  if (override !== undefined) return override;
+  const raw = process.env[REPO_CONFIG_ENV];
+  if (raw === undefined) return DEFAULT_REPO_CONFIG;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const config: Record<string, { baseBranch: string }> = {};
+    for (const [repo, value] of Object.entries(parsed)) {
+      if (
+        repo.trim() !== repo ||
+        repo.length === 0 ||
+        !value ||
+        typeof value !== 'object' ||
+        Array.isArray(value) ||
+        typeof (value as { baseBranch?: unknown }).baseBranch !== 'string'
+      ) {
+        return {};
+      }
+      const baseBranch = (value as { baseBranch: string }).baseBranch.trim();
+      if (!baseBranch) return {};
+      config[repo] = { baseBranch };
+    }
+    return config;
+  } catch {
+    // A malformed unattended-merge allowlist must fail closed.
+    return {};
+  }
 }
 
 function isDocumentationOnly(paths: readonly string[]): boolean {
@@ -52,6 +86,7 @@ function isDocumentationOnly(paths: readonly string[]): boolean {
 export async function runMergeExecutionBridgeOnce(
   options: MergeExecutionBridgeOptions
 ): Promise<void> {
+  const repoConfig = configuredRepos(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
   for (const verdict of verdicts) {
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
@@ -84,7 +119,7 @@ export async function runMergeExecutionBridgeOnce(
       await skip('run_context_unresolvable');
       continue;
     }
-    const config = REPO_CONFIG[run.repo];
+    const config = repoConfig[run.repo];
     if (!config) {
       await skip('repo_not_allowed');
       continue;

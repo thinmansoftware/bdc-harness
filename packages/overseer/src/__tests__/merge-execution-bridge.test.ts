@@ -95,7 +95,10 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
   };
 }
 
-afterEach(() => delete process.env.OVERSEER_MAX_MERGES_PER_HOUR);
+afterEach(() => {
+  delete process.env.OVERSEER_MAX_MERGES_PER_HOUR;
+  delete process.env.OVERSEER_MERGE_REPO_CONFIG;
+});
 
 describe('merge execution bridge', () => {
   test('merges an eligible verdict exactly once across two cycles', async () => {
@@ -112,6 +115,50 @@ describe('merge execution bridge', () => {
         reason: 'merge_executed',
       }),
     ]);
+  });
+
+  test('does not execute a verdict when its claim is rejected even if it remains listed', async () => {
+    const h = harness([verdict('already-claimed')]);
+    h.store.claimVerdict = async () => false;
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(await h.store.listUnactionedVerdicts()).toHaveLength(1);
+  });
+
+  test('uses the configured per-repository integration branch allowlist', async () => {
+    process.env.OVERSEER_MERGE_REPO_CONFIG = JSON.stringify({
+      'new-repo': { baseBranch: 'integration' },
+    });
+    const h = harness([verdict('configured')], greenPr({ baseBranch: 'integration' }));
+    h.store.getRunById = async () => ({ ...run('configured'), repo: 'new-repo' });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+  });
+
+  test('continues to merge when optional approval fails', async () => {
+    const h = harness([verdict('approval-fails')]);
+    h.github.approvePullRequest = async () => {
+      throw new Error('approval unavailable');
+    };
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
   });
 
   test.each([
