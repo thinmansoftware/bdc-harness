@@ -251,6 +251,33 @@ export function conclusionIsPassing(conclusion: string | null | undefined): bool
   return (PASSING_CONCLUSIONS as readonly string[]).includes(conclusion.toLowerCase());
 }
 
+const FINDING_LINE_RE = /^\[(blocker|major|minor|note)\]\s+(.+)$/i;
+
+/**
+ * Split a persisted review summary into finding lines.
+ *
+ * The reviewer posts `[severity] scope: summary` (pr-review-wiring). The real
+ * discriminator is `IndependentReviewFinding.scope`: check failures use the
+ * `checks/` prefix; code findings use a path.
+ */
+function parseReviewFindingLines(
+  summary: string | null | undefined
+): { severity: string; scope: string }[] {
+  if (typeof summary !== 'string' || summary.length === 0) return [];
+  const findings: { severity: string; scope: string }[] = [];
+  for (const raw of summary.split(/\r?\n/)) {
+    const line = raw.trim();
+    const match = FINDING_LINE_RE.exec(line);
+    if (!match) continue;
+    const rest = match[2] ?? '';
+    const colon = rest.indexOf(':');
+    const scope = (colon === -1 ? rest : rest.slice(0, colon)).trim();
+    if (scope.length === 0) continue;
+    findings.push({ severity: (match[1] ?? '').toLowerCase(), scope });
+  }
+  return findings;
+}
+
 /**
  * Does the completed check bear on what the standing verdict was actually
  * waiting for?
@@ -293,6 +320,13 @@ export function completionIsRelevantToVerdict(
 ): boolean {
   // The deferral case names nothing and is unblocked by any passing completion.
   if (verdict.disposition === 'checks_pending') return true;
+
+  // Mixed check-and-code rejections must not auto-clear: a green check does
+  // not unwind a code finding that still stands. Checked before the suite-level
+  // early return so a green workflow_run cannot authorize a mixed verdict.
+  if (verdict.disposition === 'changes_requested' && !summaryNamesACheck(verdict.summary)) {
+    return false;
+  }
 
   // A SUITE-LEVEL completion (`workflow_run` / `check_suite`) that concluded
   // passing means EVERY job inside it passed, including whichever one the
@@ -396,12 +430,18 @@ export function verdictAuthorizesRecheck(verdict: StandingVerdict | null): boole
  * The reviewer writes findings as `[severity] scope: summary`, and a
  * check-caused rejection carries the check in its scope -- live examples from
  * 2026-09-07: `[major] checks/test (windows-latest) failed`. Matching on the
- * `checks/` scope prefix plus the small set of phrases the reviewer actually
- * emits keeps this narrow; an unrecognized summary is treated as a code finding
- * and does NOT authorize, which is the fail-closed direction.
+ * `checks/` scope prefix is the structured discriminator. A mixed summary
+ * (any finding whose scope is not `checks/`) does NOT authorize: the code
+ * finding still stands after a green rerun. Unstructured prose falls back to
+ * the small set of phrases the reviewer actually emits; an unrecognized
+ * summary is treated as a code finding and does NOT authorize.
  */
 export function summaryNamesACheck(summary: string | null | undefined): boolean {
   if (typeof summary !== 'string' || summary.trim().length === 0) return false;
+  const findings = parseReviewFindingLines(summary);
+  if (findings.length > 0) {
+    return findings.every(finding => finding.scope.trim().toLowerCase().startsWith('checks/'));
+  }
   const text = summary.toLowerCase();
   return (
     text.includes('checks/') ||

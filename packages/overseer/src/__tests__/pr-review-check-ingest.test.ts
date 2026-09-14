@@ -108,6 +108,10 @@ const CHECK_CAUSED_VERDICT: StandingVerdict = {
   recordedAt: '2026-09-07T11:46:00.000Z',
 };
 
+const MIXED_FINDINGS_SUMMARY =
+  '[major] checks/test (windows-latest): required check failed at this head\n' +
+  '[major] packages/overseer/src/pr-review-submit.ts: missing null guard on head';
+
 describe('ingestCheckCompletionEvent', () => {
   test('a check_run completion on a check-caused CHANGES_REQUESTED head queues exactly one re-review, and a second identical event queues none', async () => {
     const recorded: Recorded = { enqueued: [], receipts: [] };
@@ -431,6 +435,26 @@ describe('ingestCheckCompletionEvent', () => {
     expect(recorded.enqueued).toHaveLength(0);
   });
 
+  test('a MIXED check-and-code rejection is never cleared by a green named check', async () => {
+    const recorded: Recorded = { enqueued: [], receipts: [] };
+    const deps = makeDeps(
+      {
+        headSha: HEAD,
+        disposition: 'changes_requested',
+        summary: MIXED_FINDINGS_SUMMARY,
+        recordedAt: null,
+      },
+      recorded
+    );
+    const rawBody = checkRunPayload();
+    const result = await ingestCheckCompletionEvent(
+      { rawBody, signature: sign(rawBody), eventType: 'check_run', deliveryId: 'd-mixed' },
+      deps
+    );
+    expect(result.disposition).toBe('ignored_no_authorizing_verdict');
+    expect(recorded.enqueued).toHaveLength(0);
+  });
+
   test('no standing verdict at the head means nothing to clear', async () => {
     const recorded: Recorded = { enqueued: [], receipts: [] };
     const deps = makeDeps(null, recorded);
@@ -578,6 +602,32 @@ describe('verdictAuthorizesRecheck', () => {
       ).toBe(false);
     }
   });
+
+  test('a mixed check-and-code rejection does not authorize or count as relevant', () => {
+    expect(
+      verdictAuthorizesRecheck({
+        headSha: HEAD,
+        disposition: 'changes_requested',
+        summary: MIXED_FINDINGS_SUMMARY,
+      })
+    ).toBe(false);
+    expect(
+      completionIsRelevantToVerdict(
+        { headSha: HEAD, disposition: 'changes_requested', summary: MIXED_FINDINGS_SUMMARY },
+        { checkName: 'test (windows-latest)', checkId: 'check_run:1' }
+      )
+    ).toBe(false);
+    expect(
+      completionIsRelevantToVerdict(
+        { headSha: HEAD, disposition: 'changes_requested', summary: MIXED_FINDINGS_SUMMARY },
+        { checkName: 'CI', checkId: 'workflow_run:9' }
+      )
+    ).toBe(false);
+  });
+
+  test('a check-only rejection still authorizes', () => {
+    expect(verdictAuthorizesRecheck(CHECK_CAUSED_VERDICT)).toBe(true);
+  });
 });
 
 describe('summaryNamesACheck', () => {
@@ -600,5 +650,10 @@ describe('summaryNamesACheck', () => {
     expect(summaryNamesACheck('')).toBe(false);
     expect(summaryNamesACheck(null)).toBe(false);
     expect(summaryNamesACheck(undefined)).toBe(false);
+  });
+
+  test('a mixed check-and-code summary is not check-only', () => {
+    expect(summaryNamesACheck(MIXED_FINDINGS_SUMMARY)).toBe(false);
+    expect(summaryNamesACheck('[major] checks/test (windows-latest) failed')).toBe(true);
   });
 });

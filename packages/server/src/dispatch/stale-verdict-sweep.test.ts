@@ -793,6 +793,53 @@ describe('selectLatestCompletion', () => {
       { id: 2, name: 'build', status: 'in_progress', conclusion: null, completed_at: null },
     ]);
     expect(stillRunning?.allChecksGreen).toBe(false);
+
+    // Same check name, older failed attempt retained by listForRef: only the
+    // newest attempt is current suite state.
+    const rerunGreen = selectLatestCompletion([
+      {
+        id: 1,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'failure',
+        started_at: '2026-09-07T10:00:00Z',
+        completed_at: '2026-09-07T10:05:00Z',
+      },
+      {
+        id: 2,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'success',
+        started_at: '2026-09-07T16:00:00Z',
+        completed_at: '2026-09-07T16:15:00Z',
+      },
+    ]);
+    expect(rerunGreen?.checkId).toBe('check_run:2');
+    expect(rerunGreen?.conclusion).toBe('success');
+    expect(rerunGreen?.allChecksGreen).toBe(true);
+
+    // Same check name, newer attempt failed: the old success is stale.
+    const rerunRed = selectLatestCompletion([
+      {
+        id: 1,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'success',
+        started_at: '2026-09-07T10:00:00Z',
+        completed_at: '2026-09-07T10:05:00Z',
+      },
+      {
+        id: 2,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'failure',
+        started_at: '2026-09-07T16:00:00Z',
+        completed_at: '2026-09-07T16:15:00Z',
+      },
+    ]);
+    expect(rerunRed?.checkId).toBe('check_run:2');
+    expect(rerunRed?.conclusion).toBe('failure');
+    expect(rerunRed?.allChecksGreen).toBe(false);
   });
 
   test('skips runs with no usable completion timestamp', () => {

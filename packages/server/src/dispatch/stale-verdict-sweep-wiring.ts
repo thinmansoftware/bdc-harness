@@ -161,7 +161,9 @@ interface CheckRunLike {
   name?: string;
   status?: string;
   conclusion?: string | null;
+  started_at?: string | null;
   completed_at?: string | null;
+  app?: { slug?: string; name?: string };
 }
 
 interface CheckRunsForRefClient {
@@ -194,6 +196,45 @@ export async function fetchAllCheckRunsForRef(
   return { runs, complete: false };
 }
 
+function checkAttemptKey(run: CheckRunLike): string {
+  const name = (run.name ?? 'check').trim().toLowerCase();
+  const app = (run.app?.slug ?? run.app?.name ?? '').trim().toLowerCase();
+  return app.length > 0 ? `${name}@${app}` : name;
+}
+
+function checkAttemptRank(run: CheckRunLike): number {
+  const completed = typeof run.completed_at === 'string' ? Date.parse(run.completed_at) : NaN;
+  if (Number.isFinite(completed)) return completed;
+  const started = typeof run.started_at === 'string' ? Date.parse(run.started_at) : NaN;
+  if (Number.isFinite(started)) return started;
+  return Number.NEGATIVE_INFINITY;
+}
+
+function checkAttemptIsNewer(candidate: CheckRunLike, current: CheckRunLike): boolean {
+  const candidateRank = checkAttemptRank(candidate);
+  const currentRank = checkAttemptRank(current);
+  if (candidateRank !== currentRank) return candidateRank > currentRank;
+  return (candidate.id ?? 0) > (current.id ?? 0);
+}
+
+/**
+ * Keep only the newest attempt of each check name (and app, when present).
+ *
+ * GitHub's `checks.listForRef` retains older rerun attempts. A failed first
+ * try sitting next to a later success is not current suite state: grouping
+ * by name and evaluating the newest attempt is what makes `allChecksGreen`
+ * mean "the head is green now", not "every historical attempt passed".
+ */
+export function latestAttemptPerCheck(runs: CheckRunLike[]): CheckRunLike[] {
+  const latest = new Map<string, CheckRunLike>();
+  for (const run of runs) {
+    const key = checkAttemptKey(run);
+    const held = latest.get(key);
+    if (!held || checkAttemptIsNewer(run, held)) latest.set(key, run);
+  }
+  return [...latest.values()];
+}
+
 /**
  * The most recently COMPLETED check run at a head, or null.
  *
@@ -201,15 +242,18 @@ export async function fetchAllCheckRunsForRef(
  * compared against a verdict timestamp and is skipped rather than guessed at.
  */
 export function selectLatestCompletion(runs: CheckRunLike[]): LatestCheckCompletion | null {
+  const current = latestAttemptPerCheck(runs);
   let latest: LatestCheckCompletion | null = null;
   let latestMs = Number.NEGATIVE_INFINITY;
   // WHOLE-SUITE HEALTH (#786 review @18df6323). Computed from the SAME list the
   // latest-completion scan walks, so the stricter "has the evidence actually
   // improved" test costs no additional GitHub read. Any run that is not
   // completed, or completed in a non-passing state, disqualifies the head.
+  // Older rerun attempts are ignored: listForRef retains them, and a later
+  // success must not stay blocked by the failed first try.
   let allChecksGreen = true;
   let sawAnyRun = false;
-  for (const run of runs) {
+  for (const run of current) {
     sawAnyRun = true;
     if (run.status !== 'completed' || !conclusionIsPassing(run.conclusion)) {
       allChecksGreen = false;

@@ -209,6 +209,21 @@ describe('the recovered summary drives the authorization decision', () => {
     expect(verdictAuthorizesRecheck(asVerdict(checkCaused.body))).toBe(true);
     expect(verdictAuthorizesRecheck(asVerdict(codeCaused.body))).toBe(false);
   });
+
+  test('a MIXED check-and-code changes_requested does not authorize', async () => {
+    const mixed = await persistedResultBody({
+      approved: false,
+      summary: `${CHECK_FINDING}\n${CODE_FINDING}`,
+      reviewedHeadSha: HEAD,
+    });
+    expect(
+      verdictAuthorizesRecheck({
+        headSha: HEAD,
+        disposition: 'changes_requested',
+        summary: extractReviewSummary(mixed.body),
+      })
+    ).toBe(false);
+  });
 });
 
 describe('foldSubmitReceipts establishes WHICH verdict stands at a head', () => {
@@ -398,6 +413,28 @@ describe('integration: stored outcome -> check_run completed -> exactly one re-r
 
     expect(result.disposition).toBe('ignored_no_authorizing_verdict');
     // The code did not change, so the finding still stands.
+    expect(enqueued).toHaveLength(0);
+  });
+
+  test('NEGATIVE: a MIXED check-and-code CHANGES_REQUESTED queues nothing', async () => {
+    const { body } = await persistedResultBody({
+      approved: false,
+      summary: `${CHECK_FINDING}\n${CODE_FINDING}`,
+      reviewedHeadSha: HEAD,
+    });
+    const enqueued: Enqueued[] = [];
+    const raw = checkRunPayload();
+    const result = await ingestCheckCompletionEvent(
+      {
+        rawBody: raw,
+        signature: sign(raw),
+        eventType: 'check_run',
+        deliveryId: 'delivery-mixed',
+      },
+      makeDeps(body, enqueued)
+    );
+
+    expect(result.disposition).toBe('ignored_no_authorizing_verdict');
     expect(enqueued).toHaveLength(0);
   });
 });
