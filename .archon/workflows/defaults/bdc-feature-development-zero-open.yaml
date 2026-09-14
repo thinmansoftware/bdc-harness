@@ -3245,8 +3245,8 @@ nodes:
       #   (manifest on stdin -> stdout). Rewrites the first "Tests:" and first
       #   "Grep assertions:" lines with the observed values; a manifest without a
       #   "Tests:" line is the short ALREADY_SATISFIED / BLOCKED form and passes through.
-      #   Missing evidence (a skipped run-stop-* node) is stamped honestly as
-      #   "N/A (evidence node did not run)". When tests failed or a grep stop condition
+      #   Missing evidence (a skipped run-stop-* node) is stamped honestly as Tests: N/A
+      #   or Grep assertions: MISSING. When tests failed or a grep stop condition
       #   mismatched, "VALIDATION: PASS" becomes "VALIDATION: FAIL". A "Stop conditions:"
       #   audit line is inserted after VALIDATION: (a non-label line there is outside
       #   every bdc-ci section; OUTCOME: already lives there).
@@ -3259,10 +3259,10 @@ nodes:
         fi
         [ -n "$tests_line" ] || tests_line="N/A (evidence node run-stop-tests did not run)"
         [ -n "$tests_status" ] || tests_status="missing"
-        [ -n "$grep_line" ] || grep_line="N/A (evidence node run-stop-greps did not run)"
+        [ -n "$grep_line" ] || grep_line="MISSING (run-stop-greps produced no output)"
         [ -n "$grep_status" ] || grep_status="missing"
         verdict="keep"
-        if [ "$tests_status" = "failed" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "incomplete" ]; then
+        if [ "$tests_status" = "failed" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "incomplete" ] || [ "$grep_status" = "missing" ]; then
           verdict="fail"
         fi
         printf '%s\n' "$manifest" | T_LINE="Tests: ${tests_line}" G_LINE="Grep assertions: ${grep_line}" S_LINE="Stop conditions: tests=${tests_status}; greps=${grep_status} (observed by run-stop-tests / run-stop-greps in the run worktree)" VERDICT="$verdict" awk '
@@ -3321,8 +3321,8 @@ nodes:
       # mec_check <reclassify_status> <class> <tests_status> <grep_declared> <grep_status>
       #   (stamped manifest on stdin -> "OK" rc 0, or "EVIDENCE_ERROR: ..." rc 1)
       #   Only a PROCEED run (real build, real PR) is gated. CODE/MIXED: the Tests: line
-      #   must be "<n>/<n> ...". Any class: a spec that declared grep stop conditions
-      #   may not publish "Grep assertions: N/A". A short manifest (no Tests: line) is
+      #   must be "<n>/<n> ...". Any class: run-stop-greps must report its declaration
+      #   count and status, and declared greps may not publish N/A. A short manifest is
       #   the ALREADY_SATISFIED / BLOCKED form and is not gated.
       mec_check() {
         local status="$1" class="$2" tests_status="$3" grep_declared="$4" grep_status="$5" manifest tests_line grep_line
@@ -3346,7 +3346,10 @@ nodes:
             fi
             ;;
         esac
-        grep_declared="${grep_declared:-0}"
+        if [ -z "$grep_declared" ] || [ -z "$grep_status" ]; then
+          echo "EVIDENCE_ERROR: run-stop-greps produced no output (grep_status=missing). Grep evidence is required before manifest evidence can be published (bdc-xo #1940)." >&2
+          return 1
+        fi
         if [ "$grep_declared" -gt 0 ] 2>/dev/null; then
           if [ "$grep_status" != "passed" ]; then
             echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) were declared but grep_status=${grep_status:-missing}. Every declared grep stop condition must execute before manifest evidence can be published (bdc-xo #1940)." >&2

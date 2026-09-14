@@ -143,6 +143,12 @@ R="$(run_check "$GOOD" PROCEED CODE passed 5 mismatch)"
 assert_eq "mismatched greps rc 1" "1" "${R%%|*}"
 assert_contains "error names mismatch grep status" "grep_status=mismatch" "$R"
 
+echo "--- Test 7d: missing run-stop-greps output fails closed independently of class ---"
+MISSING_GREPS="$(printf '%s\n' "$NA_TESTS" | sed 's|^Grep assertions:.*|Grep assertions: MISSING (run-stop-greps produced no output)|')"
+R="$(run_check "$MISSING_GREPS" PROCEED INFRA not_required "" "")"
+assert_eq "missing grep output rc 1" "1" "${R%%|*}"
+assert_contains "error names missing grep evidence" "run-stop-greps produced no output (grep_status=missing)" "$R"
+
 echo "--- Test 8: failing tests are NOT blocked here (stamped honestly, VALIDATION: FAIL) ---"
 R="$(run_check "$FAILED_TESTS" PROCEED CODE failed 9 passed)"
 assert_eq "rc 0 / OK so the honest FAIL manifest reaches the PR body" "0|OK|" "$R"
