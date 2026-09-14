@@ -34,6 +34,7 @@ function insert(
     body: string;
     status: string;
     createdAt: string;
+    correlationId?: string;
   }
 ): void {
   db.run(
@@ -42,7 +43,7 @@ function insert(
      VALUES (?, ?, ?, ?, 'overseer', ?, ?, ?, ?, 'gh:thinmansoftware/bdc-harness#806', 'auto_rereview:head_moved:${HEAD}')`,
     [
       input.id,
-      `pr-review:thinmansoftware/bdc-harness#806@${HEAD}`,
+      input.correlationId ?? `pr-review:thinmansoftware/bdc-harness#806@${HEAD}`,
       input.id,
       input.taskType,
       input.recipient,
@@ -110,5 +111,74 @@ describe('C4 push-to-review canary', () => {
     expect(result.verdict).toBe('failed');
     expect(result.reasonCodes[0]?.startsWith('c4_review_not_queued:')).toBe(true);
     expect(result.reasonCodes[0]).toContain('no pull_request event received since');
+  });
+
+  test('RED: an older run_review at the same head created before the ingest fails with why_no_review', async () => {
+    const db = fixture();
+    insert(db, {
+      id: 'review-old',
+      taskType: 'run_review',
+      recipient: 'overseer-reviewer',
+      status: 'queued',
+      createdAt: '2026-09-14T11:59:40.000Z',
+      body: JSON.stringify({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 806,
+        headSha: HEAD,
+      }),
+    });
+    insert(db, {
+      id: 'ingest-1',
+      taskType: 'run_report',
+      recipient: 'operator',
+      status: 'done',
+      createdAt: '2026-09-14T11:59:50.000Z',
+      body: JSON.stringify({
+        kind: 'pr_review_ingest_receipt',
+        disposition: 'queued',
+        reason: null,
+        headSha: HEAD,
+      }),
+    });
+    const result = await runPushToReviewCanary({ db, now: () => NOW });
+    expect(result.verdict).toBe('failed');
+    expect(result.reasonCodes[0]?.startsWith('c4_review_not_queued:')).toBe(true);
+    expect(result.evidenceRefs.some(value => value.startsWith('why_no_review='))).toBe(true);
+  });
+
+  test('RED: a run_review for a different PR at the same head fails with why_no_review', async () => {
+    const db = fixture();
+    insert(db, {
+      id: 'ingest-1',
+      taskType: 'run_report',
+      recipient: 'operator',
+      status: 'done',
+      createdAt: '2026-09-14T11:59:50.000Z',
+      body: JSON.stringify({
+        kind: 'pr_review_ingest_receipt',
+        disposition: 'queued',
+        reason: null,
+        headSha: HEAD,
+      }),
+    });
+    insert(db, {
+      id: 'review-other-pr',
+      taskType: 'run_review',
+      recipient: 'overseer-reviewer',
+      status: 'queued',
+      createdAt: '2026-09-14T11:59:55.000Z',
+      correlationId: `pr-review:thinmansoftware/bdc-harness#999@${HEAD}`,
+      body: JSON.stringify({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 999,
+        headSha: HEAD,
+      }),
+    });
+    const result = await runPushToReviewCanary({ db, now: () => NOW });
+    expect(result.verdict).toBe('failed');
+    expect(result.reasonCodes[0]?.startsWith('c4_review_not_queued:')).toBe(true);
+    expect(result.evidenceRefs.some(value => value.startsWith('why_no_review='))).toBe(true);
   });
 });

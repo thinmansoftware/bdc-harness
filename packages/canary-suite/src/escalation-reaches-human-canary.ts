@@ -1,3 +1,12 @@
+import { randomUUID } from 'crypto';
+import { buildDispatchRunReportBody, runEscalation } from '@archon/overseer/escalate';
+import {
+  createDefaultOperatorCardChannels,
+  runDueOperatorCardDeliveries,
+  type ChannelDeliveryResult,
+  type OperatorCardChannel,
+  type OperatorCardChannelDeps,
+} from '@archon/overseer/escalation-delivery';
 import {
   failResult,
   passResult,
@@ -24,26 +33,84 @@ function urlOf(input: Parameters<typeof fetch>[0]): string {
   return input.url;
 }
 
-export async function deliverNeedsHumanToOperator(
-  _fetcher: typeof fetch
+function recordDispatchArtifacts(
+  channels: readonly OperatorCardChannel[],
+  artifacts: HumanArtifact[]
+): OperatorCardChannel[] {
+  return channels.map((channel): OperatorCardChannel => {
+    if (channel.channel !== 'dispatch') return channel;
+    return {
+      channel: 'dispatch',
+      async deliver(
+        card: Parameters<OperatorCardChannel['deliver']>[0],
+        key: string
+      ): Promise<ChannelDeliveryResult> {
+        const result = await channel.deliver(card, key);
+        if (result.outcome === 'succeeded') {
+          artifacts.push({
+            kind: 'operator_dispatch',
+            body: buildDispatchRunReportBody(card.card),
+          });
+        }
+        return result;
+      },
+      reconcile(
+        card: Parameters<OperatorCardChannel['reconcile']>[0],
+        attempt: number
+      ): Promise<ChannelDeliveryResult> {
+        return channel.reconcile(card, attempt);
+      },
+    };
+  });
+}
+
+async function deliverNeedsHumanThroughProductionPath(
+  fetcher: typeof fetch,
+  channelOverrides: Partial<OperatorCardChannelDeps>
 ): Promise<readonly HumanArtifact[]> {
-  return [
+  const artifacts: HumanArtifact[] = [];
+  const runId = `c3-canary-${randomUUID()}`;
+  await runEscalation(
+    runId,
+    { decision: 'escalate', reason: 'needs_human' },
     {
-      kind: 'operator_dispatch',
-      body: 'needs_human: operator card dispatched to a human-readable surface',
+      errorClass: 'unknown',
+      woId: 'WO-C3-CANARY',
+      repository: 'thinmansoftware/bdc-harness',
     },
-  ];
+    {
+      sourceEventId: `event-${runId}`,
+      eventType: 'node_failed',
+      stepName: 'verify',
+      eventCreatedAt: new Date().toISOString(),
+    }
+  );
+  const channels = createDefaultOperatorCardChannels({
+    fetch: fetcher,
+    resolve_owner: async (): Promise<string | null> => 'operator',
+    builder_monitor_url: 'https://c3-canary.invalid/builder-monitor',
+    ...channelOverrides,
+  });
+  await runDueOperatorCardDeliveries({
+    channels: recordDispatchArtifacts(channels, artifacts),
+    owner: 'c3-canary',
+  });
+  return artifacts;
+}
+
+export async function deliverNeedsHumanToOperator(
+  fetcher: typeof fetch
+): Promise<readonly HumanArtifact[]> {
+  return deliverNeedsHumanThroughProductionPath(fetcher, {});
 }
 
 export async function deliverNeedsHumanViaNotion(
   fetcher: typeof fetch
 ): Promise<readonly HumanArtifact[]> {
-  await fetcher('https://api.notion.com/v1/comments', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: '{}',
+  return deliverNeedsHumanThroughProductionPath(fetcher, {
+    notion_api_key: 'c3-canary-notion-key',
+    notion_database_id: 'c3-canary-notion-db',
   });
-  return [];
 }
 
 export async function runEscalationReachesHumanCanary(

@@ -1,8 +1,10 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { mkdtemp, readFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { closeDatabase, resetDatabase } from '@archon/core/db';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import type { PriorReviewWork } from '@archon/overseer/pr-review-ingest';
 import { deliverNeedsHumanToOperator } from './escalation-reaches-human-canary';
 import { runPrReviewCanarySuite, writePrReviewCanaryArtifacts } from './pr-review-canary';
@@ -58,7 +60,33 @@ afterEach(() => {
   for (const db of databases.splice(0)) db.close();
 });
 
-describe('PR review outcome canary suite', () => {
+describe.serial('PR review outcome canary suite', () => {
+  let home = '';
+  const originalHome = process.env.ARCHON_HOME;
+  const originalUrl = process.env.DATABASE_URL;
+  const originalNotion = process.env.NOTION_API_KEY;
+
+  beforeEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    home = join(import.meta.dir, `.archon-c3-suite-${Date.now()}-${Math.random()}`);
+    process.env.ARCHON_HOME = home;
+    delete process.env.DATABASE_URL;
+    delete process.env.NOTION_API_KEY;
+  });
+
+  afterEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    if (originalHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalHome;
+    if (originalUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalUrl;
+    if (originalNotion === undefined) delete process.env.NOTION_API_KEY;
+    else process.env.NOTION_API_KEY = originalNotion;
+    removeTempDirWithRetry(home);
+  });
+
   test('GREEN fixtures pass the composed suite', async () => {
     const db = fixture();
     db.run(
@@ -107,6 +135,7 @@ describe('PR review outcome canary suite', () => {
       db,
       now: () => NOW,
       env: {},
+      fetcher: async () => new Response('{}', { status: 200 }),
       subjectKey: SUBJECT,
       subjects: [
         {

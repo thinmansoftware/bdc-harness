@@ -20,6 +20,7 @@
     "./authorized-escalation": "./src/authorized-escalation.ts",
     "./permit": "./src/permit.ts",
     "./operator-card": "./src/operator-card.ts",
+    "./escalate": "./src/escalate.ts",
     "./escalation-delivery": "./src/escalation-delivery.ts",
     "./adapters/fake-github": "./src/adapters/fake-github.ts",
     "./adapters/github-qualified-merge": "./src/adapters/github-qualified-merge.ts",

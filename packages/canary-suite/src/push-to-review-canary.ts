@@ -63,6 +63,55 @@ function headFromCorrelation(correlationId: string): string | null {
   return match?.[1] ?? null;
 }
 
+interface PrReviewRef {
+  readonly owner: string;
+  readonly repo: string;
+  readonly prNumber: number;
+}
+
+function parseCorrelationRef(correlationId: string): PrReviewRef | null {
+  const match = /^pr-review:([^/]+)\/([^#]+)#(\d+)@([0-9a-fA-F]{40})$/.exec(correlationId);
+  const owner = match?.[1];
+  const repo = match?.[2];
+  const prRaw = match?.[3];
+  if (!owner || !repo || !prRaw) return null;
+  return { owner, repo, prNumber: Number(prRaw) };
+}
+
+function parseBodyPrRef(body: string): Partial<PrReviewRef> {
+  try {
+    const value = JSON.parse(body) as {
+      owner?: unknown;
+      repo?: unknown;
+      prNumber?: unknown;
+    };
+    return {
+      owner: typeof value.owner === 'string' && value.owner !== '' ? value.owner : undefined,
+      repo: typeof value.repo === 'string' && value.repo !== '' ? value.repo : undefined,
+      prNumber:
+        typeof value.prNumber === 'number' && Number.isInteger(value.prNumber) && value.prNumber > 0
+          ? value.prNumber
+          : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function resolvePrReviewRef(row: MessageRow): PrReviewRef | null {
+  const fromCorr = parseCorrelationRef(row.correlation_id);
+  const fromBody = parseBodyPrRef(row.body);
+  const owner = fromCorr?.owner ?? fromBody.owner;
+  const repo = fromCorr?.repo ?? fromBody.repo;
+  const prNumber = fromCorr?.prNumber ?? fromBody.prNumber;
+  if (!owner || !repo || prNumber === undefined) return null;
+  return { owner, repo, prNumber };
+}
+
+function samePr(left: PrReviewRef, right: PrReviewRef): boolean {
+  return left.owner === right.owner && left.repo === right.repo && left.prNumber === right.prNumber;
+}
+
 function whyNoReview(input: {
   pendingId: string | null;
   blockedReason: string | null;
@@ -133,6 +182,8 @@ export async function runPushToReviewCanary(
       return passResult([`disposition=${newest.ingest.disposition}`]);
     }
     const headSha = newest.ingest.headSha ?? headFromCorrelation(newest.row.correlation_id);
+    const ingestAt = Date.parse(newest.row.created_at);
+    const ingestRef = resolvePrReviewRef(newest.row);
     const reviews = opened.db
       .query<MessageRow>(
         `SELECT id, correlation_id, body, created_at, status
@@ -142,12 +193,22 @@ export async function runPushToReviewCanary(
       )
       .all();
     const match = reviews.find(row => {
+      const reviewRef = resolvePrReviewRef(row);
       const workHead = parseWorkHead(row.body) ?? headFromCorrelation(row.correlation_id);
-      return headSha !== null && workHead === headSha;
+      const queuedAt = Date.parse(row.created_at);
+      return (
+        ingestRef !== null &&
+        reviewRef !== null &&
+        samePr(ingestRef, reviewRef) &&
+        headSha !== null &&
+        workHead === headSha &&
+        Number.isFinite(queuedAt) &&
+        Number.isFinite(ingestAt) &&
+        queuedAt >= ingestAt
+      );
     });
     const windowMs = deps.pushToReviewWindowMs ?? PUSH_TO_REVIEW_WINDOW_MS;
     const nowMs = (deps.now ?? Date.now)();
-    const ingestAt = Date.parse(newest.row.created_at);
     const pending = reviews.find(row => row.status === 'queued' || row.status === 'claimed');
     const blockedReason =
       newest.ingest.disposition === 'blocked' ? (newest.ingest.reason ?? 'blocked') : null;
@@ -169,6 +230,14 @@ export async function runPushToReviewCanary(
       Number.isFinite(ingestAt) && Number.isFinite(queuedAt)
         ? queuedAt - ingestAt
         : nowMs - ingestAt;
+    if (delayMs < 0) {
+      const why = (await fetchWhyNoReview(deps)) ?? localWhy;
+      return failResult(`c4_review_not_queued:${why}`, [
+        `ingest_id=${newest.row.id}`,
+        `head_sha=${headSha ?? 'null'}`,
+        `why_no_review=${why}`,
+      ]);
+    }
     if (delayMs > windowMs) {
       const why = (await fetchWhyNoReview(deps)) ?? localWhy;
       return failResult(`c4_review_not_queued:${why}`, [
