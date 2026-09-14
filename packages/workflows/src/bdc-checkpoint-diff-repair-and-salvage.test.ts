@@ -139,9 +139,13 @@ describe('diff-repair checkpoint and salvage', () => {
       const result = run(['bash', '-c', nodeBash('checkpoint-diff-repair')], dir);
       expect(result.exitCode).toBe(0);
       expect(result.stdout.toString()).toContain('CHECKPOINT_DIFF_REPAIR=committed');
-      expect(git(['-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', 'HEAD'], dir)).toBe(
-        `README.md\n${name}`
-      );
+      // ls-tree C-quotes a double quote in a path even with core.quotepath=false;
+      // read NUL-delimited names so the assertion sees the raw filename.
+      const tracked = git(['ls-tree', '-r', '--name-only', '-z', 'HEAD'], dir)
+        .split('\0')
+        .filter(Boolean)
+        .sort();
+      expect(tracked).toEqual(['README.md', name].sort());
       expect(git(['status', '--porcelain'], dir)).toBe('');
     }
   );
