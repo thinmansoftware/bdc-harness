@@ -550,6 +550,31 @@ export class SqliteAdapter implements IDatabase {
         throw error;
       }
     }
+    // Verdict merge-execution bookkeeping (migration 052).
+    try {
+      const verdictCols = this.pragmaAll("PRAGMA table_info('overseer_verdicts')") as {
+        name: string;
+      }[];
+      const verdictColNames = new Set(verdictCols.map(column => column.name));
+      const additions: [string, string][] = [
+        ['actioned_at', 'TEXT'],
+        ['mutation_sent', 'INTEGER'],
+        ['action_reason', 'TEXT'],
+        ['merge_sha', 'TEXT'],
+        ['pr_url', 'TEXT'],
+      ];
+      for (const [name, definition] of additions) {
+        if (!verdictColNames.has(name)) {
+          this.db.run(`ALTER TABLE overseer_verdicts ADD COLUMN ${name} ${definition}`);
+        }
+      }
+      this.db.run(
+        "CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(created_at) WHERE proposed_action = 'flag_merge_ready' AND actioned_at IS NULL"
+      );
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_overseer_verdict_columns_failed');
+    }
+
     // Conversations columns
     try {
       const cols = this.pragmaAll("PRAGMA table_info('remote_agent_conversations')") as {
@@ -2015,6 +2040,11 @@ export class SqliteAdapter implements IDatabase {
         reason TEXT,
         evidence TEXT,
         retry_count INTEGER NOT NULL DEFAULT 0,
+        actioned_at TEXT,
+        mutation_sent INTEGER,
+        action_reason TEXT,
+        merge_sha TEXT,
+        pr_url TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
@@ -2042,6 +2072,19 @@ export class SqliteAdapter implements IDatabase {
         PRIMARY KEY (owner, repo, base_ref, head_sha)
       );
 
+      -- overseer_merge_slot_reservations: atomic hourly merge ceiling (migration 053).
+      CREATE TABLE IF NOT EXISTS overseer_merge_slot_lock (
+        id INTEGER PRIMARY KEY CHECK (id = 1)
+      );
+      INSERT INTO overseer_merge_slot_lock (id) VALUES (1)
+      ON CONFLICT (id) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS overseer_merge_slot_reservations (
+        id TEXT PRIMARY KEY,
+        verdict_id TEXT NOT NULL UNIQUE,
+        reserved_at TEXT NOT NULL,
+        released_at TEXT
+      );
+
       -- Mirror of migration 050. Durable keyset cursor for the stale-verdict
       -- sweep: a process-local cursor rewound to the head of the store on every
       -- archon-app-1 rebuild, so rows past the first page were never reached.
@@ -2056,6 +2099,10 @@ export class SqliteAdapter implements IDatabase {
         ON overseer_required_contexts_attempts(touched_at);
       CREATE UNIQUE INDEX IF NOT EXISTS uq_overseer_verdicts_run_head ON overseer_verdicts(run_id, head_sha);
       CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_status ON overseer_verdicts(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(created_at)
+        WHERE proposed_action = 'flag_merge_ready' AND actioned_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_overseer_merge_slot_reservations_window
+        ON overseer_merge_slot_reservations(reserved_at);
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_conversation ON remote_agent_sessions(conversation_id);

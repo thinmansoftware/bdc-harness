@@ -7,6 +7,7 @@ import { createAppAuth } from '@octokit/auth-app';
 import {
   createRealApprovePullRequest,
   createRealFindPullRequest,
+  createRealMergePullRequest,
   resolveGitHubAppAuth,
   resolveRealOctokitAuthOptions,
   type RealGitHubOctokitLike,
@@ -300,6 +301,106 @@ describe('createRealApprovePullRequest', () => {
     await expect(createRealApprovePullRequest(octokit)(approveInput())).rejects.toThrow(
       /overseer_real_adapter_missing_review_api/
     );
+  });
+
+  test('pins commit_id to expectedHeadSha rather than a later live head', async () => {
+    const createReview = mock(async () => ({ data: { id: 999, state: 'APPROVED' } }));
+    const expectedHeadSha = 'b'.repeat(40);
+    const result = await createRealApprovePullRequest(octokitWithReview(createReview))({
+      ...approveInput(),
+      expectedHeadSha,
+    });
+
+    expect(createReview).toHaveBeenCalledWith({
+      owner: 'bluedevilcollectibles',
+      repo: 'lspro-react',
+      pull_number: 42,
+      event: 'APPROVE',
+      commit_id: expectedHeadSha,
+    });
+    expect(result).toEqual({ approved: true });
+  });
+});
+
+describe('createRealMergePullRequest expected head SHA', () => {
+  const reviewed = 'b'.repeat(40);
+  const live = 'a'.repeat(40);
+
+  test('passes expectedHeadSha as pulls.merge sha', async () => {
+    const merge = mock(async () => ({ data: { merged: true, sha: reviewed } }));
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.get = async () => ({
+      data: {
+        number: 42,
+        title: 't',
+        state: 'open',
+        html_url: 'u',
+        head: { sha: reviewed },
+      },
+    });
+    octokit.pulls.merge = merge;
+    const result = await createRealMergePullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 42,
+      expectedHeadSha: reviewed,
+    });
+    expect(merge).toHaveBeenCalledWith({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      pull_number: 42,
+      sha: reviewed,
+      merge_method: 'squash',
+    });
+    expect(result.merged).toBe(true);
+  });
+
+  test('refetched head differs -> no merge call, head_moved', async () => {
+    const merge = mock(async () => ({ data: { merged: true, sha: live } }));
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.merge = merge;
+    const result = await createRealMergePullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 42,
+      expectedHeadSha: reviewed,
+    });
+    expect(merge).not.toHaveBeenCalled();
+    expect(result).toEqual({ merged: false, message: `head_moved:${live}` });
+  });
+
+  test('GitHub 405 precondition mismatch surfaces the API message', async () => {
+    const merge = mock(async () => {
+      throw Object.assign(new Error('Pull Request is not mergeable'), { status: 405 });
+    });
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.get = async () => ({
+      data: {
+        number: 42,
+        title: 't',
+        state: 'open',
+        html_url: 'u',
+        head: { sha: reviewed },
+      },
+    });
+    octokit.pulls.merge = merge;
+    const result = await createRealMergePullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 42,
+      expectedHeadSha: reviewed,
+    });
+    expect(merge).toHaveBeenCalledWith({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      pull_number: 42,
+      sha: reviewed,
+      merge_method: 'squash',
+    });
+    expect(result).toEqual({
+      merged: false,
+      message: 'Pull Request is not mergeable',
+    });
   });
 });
 
