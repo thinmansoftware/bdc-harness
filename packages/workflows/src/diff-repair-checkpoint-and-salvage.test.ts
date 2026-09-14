@@ -38,8 +38,15 @@ const tempDirs: string[] = [];
 function run(args: string[], cwd: string) {
   return Bun.spawnSync(args, {
     cwd,
-    env: { ...process.env, GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com' },
-    stdout: 'pipe', stderr: 'pipe',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Test',
+      GIT_AUTHOR_EMAIL: 'test@example.com',
+      GIT_COMMITTER_NAME: 'Test',
+      GIT_COMMITTER_EMAIL: 'test@example.com',
+    },
+    stdout: 'pipe',
+    stderr: 'pipe',
   });
 }
 function git(args: string[], cwd: string): string {
@@ -63,7 +70,9 @@ function nodeBash(id: string): string {
   if (!bash) throw new Error(`missing bash node ${id}`);
   return bash;
 }
-afterEach(() => { for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 describe('diff-repair checkpoint and salvage', () => {
   it('wires every feature-development lane through checkpoint-diff-repair', () => {
@@ -98,8 +107,10 @@ describe('diff-repair checkpoint and salvage', () => {
   it('uses the uncommitted salvage message and preservation sentinel', () => {
     const dir = makeRepo();
     writeFileSync(join(dir, 'README.md'), 'salvaged\n');
-    const script = nodeBash('noninteractive-salvage')
-      .replace('$block-reclassify.output', '{"status":"BLOCKED"}');
+    const script = nodeBash('noninteractive-salvage').replace(
+      '$block-reclassify.output',
+      '{"status":"BLOCKED"}'
+    );
     const result = run(['bash', '-c', script], dir);
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toContain('SALVAGE=preserved_uncommitted:1');
