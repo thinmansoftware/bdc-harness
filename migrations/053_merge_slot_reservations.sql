@@ -1,4 +1,4 @@
--- Migration 051: atomic hourly merge-slot reservations for the unattended
+-- Migration 053: atomic hourly merge-slot reservations for the unattended
 -- merge execution bridge (bdc-harness PR #687 review).
 --
 -- Occupancy is the UNION of unreleased reservations and mutation_sent merges

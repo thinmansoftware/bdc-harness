@@ -550,7 +550,7 @@ export class SqliteAdapter implements IDatabase {
         throw error;
       }
     }
-    // Verdict merge-execution bookkeeping (migration 050).
+    // Verdict merge-execution bookkeeping (migration 052).
     try {
       const verdictCols = this.pragmaAll("PRAGMA table_info('overseer_verdicts')") as {
         name: string;
@@ -2072,7 +2072,7 @@ export class SqliteAdapter implements IDatabase {
         PRIMARY KEY (owner, repo, base_ref, head_sha)
       );
 
-      -- overseer_merge_slot_reservations: atomic hourly merge ceiling (migration 051).
+      -- overseer_merge_slot_reservations: atomic hourly merge ceiling (migration 053).
       CREATE TABLE IF NOT EXISTS overseer_merge_slot_lock (
         id INTEGER PRIMARY KEY CHECK (id = 1)
       );
