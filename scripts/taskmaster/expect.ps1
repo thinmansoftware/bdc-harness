@@ -238,6 +238,7 @@ Write-Host "  evidence:   $($result.evidence | ConvertTo-Json -Compress -Depth 8
 Write-Host "  dispatch_ref: $($result.dispatch_ref)"
 Write-Host "  due at:     $($result.due_at)"
 Write-Host "  on absence: $($result.on_absence)"
+Write-Host "  max retries: $($result.max_retries)"
 Write-Host "  created at: $($result.created_at)"
 if ($result.self_supervised) {
     Write-Host '  NOTE: self-supervised (registrant is the recipient).'

@@ -535,6 +535,7 @@ describe('expectation front door HTTP contract', () => {
     evidence: { kind: 'pr_opened', repo: 'thinmansoftware/bdc-harness' },
     due_at: '2026-07-14T01:00:00.000Z',
     on_absence: 'give_up',
+    max_retries: 0,
     created_at: '2026-07-13T00:00:00.000Z',
   };
 
@@ -590,6 +591,21 @@ describe('expectation front door HTTP contract', () => {
     expect(await conflicted.json()).toMatchObject({
       mismatched_fields: ['evidence'],
       stored: { evidence: { kind: 'pr_opened', repo: 'other/repo' } },
+    });
+  });
+
+  test('same-key retry with a different max_retries is 409', async () => {
+    const app = makeApp(TOKEN);
+    registerExpectationSpy.mockImplementation((async () => registrationResult(false)) as never);
+    const conflicted = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody({ max_retries: 2 }),
+    });
+    expect(conflicted.status).toBe(409);
+    expect(await conflicted.json()).toMatchObject({
+      mismatched_fields: ['max_retries'],
+      stored: { max_retries: 0 },
     });
   });
 

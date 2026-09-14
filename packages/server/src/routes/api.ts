@@ -3561,6 +3561,7 @@ export function registerApiRoutes(
           evidence_json: JSON.stringify(body.evidence),
           dispatch_ref: body.dispatch_ref,
           on_absence: body.on_absence,
+          max_retries: body.max_retries,
         });
         if (mismatched.length > 0) {
           return c.json(
@@ -3572,6 +3573,7 @@ export function registerApiRoutes(
                 evidence: storedEvidence,
                 dispatch_ref: expectation.dispatch_ref,
                 on_absence: expectation.on_absence,
+                max_retries: expectation.max_retries,
                 due_at: expectation.due_at,
                 created_at: expectation.created_at,
               },
@@ -3593,6 +3595,7 @@ export function registerApiRoutes(
           evidence: storedEvidence,
           due_at: expectation.due_at,
           on_absence: expectation.on_absence,
+          max_retries: expectation.max_retries,
           created,
           self_supervised: expectation.self_supervised === 1,
           created_at: expectation.created_at,

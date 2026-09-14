@@ -362,17 +362,30 @@ export type RegisterExpectationResult =
   | { capped: false; id: string; created: boolean; expectation: TmExpectation }
   | { capped: true; observed: number };
 
-export type ExpectationSemanticField = 'recipient' | 'evidence' | 'dispatch_ref' | 'on_absence';
+export type ExpectationSemanticField =
+  | 'recipient'
+  | 'evidence'
+  | 'dispatch_ref'
+  | 'on_absence'
+  | 'max_retries';
 
 /**
  * Fields that identify WHAT is being supervised. A retry under the same
  * registration_key that differs in any of these is not an idempotent retry:
  * it is a request to watch different work. Deadline is intentionally absent
  * -- a caller may send a new due_at and still match; the stored deadline wins.
+ * max_retries is included because it is the supervision policy: a redispatch
+ * with a different retry limit is not the same expectation.
  */
 export function expectationSemanticMismatches(
-  stored: Pick<TmExpectation, 'recipient' | 'evidence_json' | 'dispatch_ref' | 'on_absence'>,
-  requested: Pick<TmExpectation, 'recipient' | 'evidence_json' | 'dispatch_ref' | 'on_absence'>
+  stored: Pick<
+    TmExpectation,
+    'recipient' | 'evidence_json' | 'dispatch_ref' | 'on_absence' | 'max_retries'
+  >,
+  requested: Pick<
+    TmExpectation,
+    'recipient' | 'evidence_json' | 'dispatch_ref' | 'on_absence' | 'max_retries'
+  >
 ): ExpectationSemanticField[] {
   const mismatched: ExpectationSemanticField[] = [];
   if (stored.recipient !== requested.recipient) mismatched.push('recipient');
@@ -383,6 +396,7 @@ export function expectationSemanticMismatches(
   }
   if (stored.dispatch_ref !== requested.dispatch_ref) mismatched.push('dispatch_ref');
   if (stored.on_absence !== requested.on_absence) mismatched.push('on_absence');
+  if (stored.max_retries !== requested.max_retries) mismatched.push('max_retries');
   return mismatched;
 }
 

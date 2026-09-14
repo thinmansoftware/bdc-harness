@@ -255,6 +255,7 @@ describe('expectation front door: the contract', () => {
       evidence: { kind: 'pr_opened', repo: 'a/b' },
       due_at: '2026-09-15T00:00:00.000Z',
       on_absence: 'escalate',
+      max_retries: 0,
       created: false,
       self_supervised: false,
       created_at: '2026-09-14T00:00:00.000Z',
@@ -262,6 +263,7 @@ describe('expectation front door: the contract', () => {
     expect(parsed.recipient).toBe('fable-cursor');
     expect(parsed.dispatch_ref).toBe('bdc-xo#2006');
     expect(parsed.created_at).toBe('2026-09-14T00:00:00.000Z');
+    expect(parsed.max_retries).toBe(0);
   });
 
   test('a 409 body names the mismatched fields and the stored values', () => {
@@ -273,12 +275,32 @@ describe('expectation front door: the contract', () => {
         evidence: { kind: 'pr_opened', repo: 'a/b' },
         dispatch_ref: 'bdc-xo#2006',
         on_absence: 'escalate',
+        max_retries: 0,
         due_at: '2026-09-15T00:00:00.000Z',
         created_at: '2026-09-14T00:00:00.000Z',
       },
     });
     expect(parsed.mismatched_fields).toEqual(['recipient']);
     expect(parsed.stored.recipient).toBe('fable-cursor');
+    expect(parsed.stored.max_retries).toBe(0);
+  });
+
+  test('a 409 body can name max_retries as the mismatched field', () => {
+    const parsed = expectationConflictResponseSchema.parse({
+      error: 'Expectation already exists under this key with a different specification',
+      mismatched_fields: ['max_retries'],
+      stored: {
+        recipient: 'fable-cursor',
+        evidence: { kind: 'pr_opened', repo: 'a/b' },
+        dispatch_ref: 'bdc-xo#2006',
+        on_absence: 'redispatch',
+        max_retries: 1,
+        due_at: '2026-09-15T00:00:00.000Z',
+        created_at: '2026-09-14T00:00:00.000Z',
+      },
+    });
+    expect(parsed.mismatched_fields).toEqual(['max_retries']);
+    expect(parsed.stored.max_retries).toBe(1);
   });
 });
 

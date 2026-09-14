@@ -218,6 +218,7 @@ export const registerExpectationResponseSchema = z
     evidence: evidenceSpecSchema,
     due_at: z.string(),
     on_absence: z.enum(['redispatch', 'escalate', 'give_up']),
+    max_retries: z.number().int(),
     /** False when this key already existed and the existing row was returned. */
     created: z.boolean(),
     self_supervised: z.boolean(),
@@ -229,13 +230,14 @@ export const expectationConflictResponseSchema = z
   .object({
     error: z.string(),
     mismatched_fields: z
-      .array(z.enum(['recipient', 'evidence', 'dispatch_ref', 'on_absence']))
+      .array(z.enum(['recipient', 'evidence', 'dispatch_ref', 'on_absence', 'max_retries']))
       .min(1),
     stored: z.object({
       recipient: z.string(),
       evidence: evidenceSpecSchema,
       dispatch_ref: z.string(),
       on_absence: z.enum(['redispatch', 'escalate', 'give_up']),
+      max_retries: z.number().int(),
       due_at: z.string(),
       created_at: z.string(),
     }),

@@ -2287,6 +2287,7 @@ describe('expectation front door (bdc-xo#2007)', () => {
       evidence_json: '{"repo":"a/b","kind":"pr_opened"}',
       dispatch_ref: 'bdc-xo#2006',
       on_absence: 'escalate' as const,
+      max_retries: 0,
     };
     expect(
       expectationSemanticMismatches(stored, {
@@ -2303,6 +2304,23 @@ describe('expectation front door (bdc-xo#2007)', () => {
         evidence_json: '{"kind":"pr_opened","repo":"other/repo"}',
       })
     ).toEqual(['evidence']);
+    expect(expectationSemanticMismatches(stored, { ...stored, max_retries: 2 })).toEqual([
+      'max_retries',
+    ]);
+  });
+
+  test('semantic comparison treats a different max_retries as a mismatch', () => {
+    const stored = {
+      recipient: 'fable-cursor',
+      evidence_json: '{"kind":"pr_opened","repo":"a/b"}',
+      dispatch_ref: 'bdc-xo#2006',
+      on_absence: 'redispatch' as const,
+      max_retries: 1,
+    };
+    expect(expectationSemanticMismatches(stored, stored)).toEqual([]);
+    expect(expectationSemanticMismatches(stored, { ...stored, max_retries: 3 })).toEqual([
+      'max_retries',
+    ]);
   });
 });
 

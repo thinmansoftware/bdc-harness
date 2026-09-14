@@ -41,7 +41,9 @@ describe('taskmaster expectation registration script', () => {
     expect(printBlock).toContain('$result.recipient');
     expect(printBlock).toContain('$result.evidence');
     expect(printBlock).toContain('$result.dispatch_ref');
+    expect(printBlock).toContain('$result.max_retries');
     expect(printBlock).not.toContain('Write-Host "  recipient:  $Recipient"');
     expect(printBlock).not.toContain('Write-Host "  evidence:   $Evidence"');
+    expect(printBlock).not.toContain('$MaxRetries');
   });
 });
