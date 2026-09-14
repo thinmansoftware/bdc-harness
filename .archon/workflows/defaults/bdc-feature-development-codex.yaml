@@ -2892,9 +2892,11 @@ nodes:
       `gh pr view N --repo <target-repo> --json state,headRefName`: state must be OPEN
       and headRefName must equal X. On success, emit the normal fields below plus
       `repair_target_pr: #N` and `repair_target_branch: <verified-headRefName-from-gh>`;
-      use that verified head as the feature branch and stop without deriving a fresh
-      branch. On a closed PR or repo/branch mismatch, fail closed with the exact
-      declared-repair-target reason from the approved plan. Never mint a replacement.
+      emit `repair_target_authorized_by_spec: #N` ONLY when the approved plan carried
+      that authorization. Use that verified head as the feature branch and stop
+      without deriving a fresh branch. On a closed PR or repo/branch mismatch, fail
+      closed with the exact declared-repair-target reason from the approved plan.
+      Never mint a replacement.
 
       Anchor incidents 2026-05-18: agents emitted branch names that embedded the
       current worktree thread suffix, producing double-suffixed targets like

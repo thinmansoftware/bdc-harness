@@ -19,7 +19,17 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { basename, join } from 'path';
+import { parseWorkflow } from './loader';
+import {
+  clearRegistry,
+  registerBuiltinProviders,
+  registerCommunityProviders,
+} from '@archon/providers';
+
+clearRegistry();
+registerBuiltinProviders();
+registerCommunityProviders();
 
 // ---------------------------------------------------------------------------
 // Snippet 1 (F-6A): BRANCH allowlist regex validator from commit-and-push.
@@ -678,6 +688,18 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).toContain('repair_target_diverged');
       expect(yaml).toContain("sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1");
       expect(yaml).toContain('REPAIR_TARGET_LEASE_SHA=$(git rev-parse HEAD)');
+      const result = parseWorkflow(yaml, basename(lane));
+      if (!result.workflow) {
+        throw new Error(`${basename(lane)}: ${result.error?.error ?? 'failed to parse'}`);
+      }
+      const decide = result.workflow.nodes.find(node => node.id === 'decide-push-target');
+      const decidePrompt = decide && 'prompt' in decide ? decide.prompt : undefined;
+      expect(decidePrompt).toContain('Repair target: PR #N (branch X)');
+      expect(decidePrompt).toContain('repair_target_pr: #N');
+      expect(decidePrompt).toContain('repair_target_branch:');
+      expect(decidePrompt).toContain('repair_target_authorized_by_spec: #N');
+      const planReview = result.workflow.nodes.find(node => node.id === 'plan-review');
+      expect(planReview?.loop?.prompt).toContain('repair_target_authorized_by_spec: #N');
     }
   });
 

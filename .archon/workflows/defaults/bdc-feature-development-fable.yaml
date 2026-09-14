@@ -377,6 +377,14 @@ nodes:
         3. Unsafe assumptions -- "assume X exists" without verification.
         4. Rule 20 staging gate -- if target repo is lspro-react / shopops-storefront /
            shopops, plan MUST require --base staging. If not those, must NOT.
+        4b. Repair target -- when the spec declares `Repair target: PR #N (branch X)`,
+           use WebFetch to verify that PR #N is open on the target repo and its head
+           branch is X. An open matching PR is self-authorizing: preserve it in the
+           approved plan as `repair_target_authorized_by_spec: #N`; never ask whether
+           it is canonical or whether to close it and rebuild fresh. If it is closed,
+           fail this plan iteration with the literal reason `declared repair target #N
+           is closed`. If it is not on the target repo, its branch does not match X, or
+           it cannot be verified, fail with `declared repair target #N is not on <repo>`.
         5. Out-of-scope list present and correct.
 
         ## Self-repair (the point -- do not just report)
@@ -414,6 +422,8 @@ nodes:
         so emit it ONLY when PLAN_REVIEW_PASS=true.
 
         ## Escalation (emit instead of approving; do NOT emit the approved sentinel)
+        Asking whether an existing, spec-named PR is canonical or should be closed is
+        never a valid escalation reason; apply the repair-target verification above.
         If the spec is ambiguous/contradictory, the fix needs a new side-effect class or
         ungranted scope, or the same finding survived a prior attempt and you cannot
         resolve it -- set PLAN_REVIEW_PASS=false, emit PLAN_REVIEW_NEEDS_REVISION, and put
@@ -2870,6 +2880,16 @@ nodes:
       $war-council-validator.output
 
       ## Branch Name Derivation Rules (F-6A prevention)
+      First check for `Repair target: PR #N (branch X)` in the spec. Verify it with
+      `gh pr view N --repo <target-repo> --json state,headRefName`: state must be OPEN
+      and headRefName must equal X. On success, emit the normal fields below plus
+      `repair_target_pr: #N` and `repair_target_branch: <verified-headRefName-from-gh>`;
+      emit `repair_target_authorized_by_spec: #N` ONLY when the approved plan carried
+      that authorization. Use that verified head as the feature branch and stop
+      without deriving a fresh branch. On a closed PR or repo/branch mismatch, fail
+      closed with the exact declared-repair-target reason from the approved plan.
+      Never mint a replacement.
+
       Anchor incidents 2026-05-18: agents emitted branch names that embedded the
       current worktree thread suffix, producing double-suffixed targets like
       "archon/thread-9772643d-thread-9772643d" or
