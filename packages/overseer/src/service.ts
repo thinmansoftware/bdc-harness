@@ -10,6 +10,7 @@ import {
   listUnactionedFlagMergeReadyVerdicts,
   recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
+  releaseVerdictClaimForMergeExecution,
   reserveOverseerMergeSlot,
 } from '@archon/core/db/overseer';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
@@ -428,6 +429,7 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
           store: {
             listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
             claimVerdict: claimVerdictForMergeExecution,
+            releaseVerdictClaim: releaseVerdictClaimForMergeExecution,
             getRunById: getOverseerWatchRunById,
             reserveMergeSlot: reserveOverseerMergeSlot,
             releaseMergeSlot: releaseOverseerMergeSlot,

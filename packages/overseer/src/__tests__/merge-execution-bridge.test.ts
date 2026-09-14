@@ -57,13 +57,25 @@ function policy(merge = true, emergencyStop = false, serviceEnabled = true, lega
 function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges = 0) {
   const pending = [...rows];
   const outcomes: { verdictId: string; mutationSent: boolean; reason: string }[] = [];
+  const claimReleases: { verdictId: string; reason: string }[] = [];
+  const processing = new Set<string>();
   let merges = 0;
   let approvals = 0;
   let occupied = recentMerges;
   const reserved = new Set<string>();
   const store: MergeExecutionBridgeStore = {
     listUnactionedVerdicts: async () => [...pending],
-    claimVerdict: async verdictId => pending.some(row => row.id === verdictId),
+    claimVerdict: async verdictId => {
+      if (!pending.some(row => row.id === verdictId)) return false;
+      processing.add(verdictId);
+      return true;
+    },
+    releaseVerdictClaim: async (verdictId, reason) => {
+      if (!processing.has(verdictId)) return false;
+      processing.delete(verdictId);
+      claimReleases.push({ verdictId, reason });
+      return true;
+    },
     getRunById: async runId => run(runId.replace('run-', '')),
     reserveMergeSlot: async (verdictId, _since, limit) => {
       if (reserved.has(verdictId)) return false;
@@ -77,6 +89,7 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
     },
     recordOutcome: async input => {
       outcomes.push(input);
+      processing.delete(input.verdictId);
       const index = pending.findIndex(row => row.id === input.verdictId);
       if (index >= 0) pending.splice(index, 1);
     },
@@ -99,6 +112,7 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
     store,
     github,
     outcomes,
+    claimReleases,
     get merges() {
       return merges;
     },
@@ -269,6 +283,7 @@ describe('merge execution bridge', () => {
     const storeFor = (id: string): MergeExecutionBridgeStore => ({
       listUnactionedVerdicts: async () => [verdict(id)],
       claimVerdict: async () => true,
+      releaseVerdictClaim: async () => false,
       getRunById: async () => run(id),
       reserveMergeSlot,
       releaseMergeSlot,
@@ -378,5 +393,60 @@ describe('merge execution bridge', () => {
     expect(h.outcomes[0]).toEqual(
       expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
     );
+  });
+
+  test('releases a claim when getRunById throws so the next cycle can merge', async () => {
+    const h = harness([verdict('lookup-throws')]);
+    let lookups = 0;
+    h.store.getRunById = async runId => {
+      lookups += 1;
+      if (lookups === 1) throw new Error('db unavailable');
+      return run(runId.replace('run-', ''));
+    };
+    const options = { store: h.store, github: h.github, readPolicy: () => policy() };
+    await runMergeExecutionBridgeOnce(options);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'lookup-throws', reason: 'db unavailable' }]);
+    expect(await h.store.listUnactionedVerdicts()).toHaveLength(1);
+    await runMergeExecutionBridgeOnce(options);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('releases the merge slot and claim when findPullRequest throws after a reservation', async () => {
+    const h = harness([verdict('pr-throws')]);
+    expect(await h.store.reserveMergeSlot('pr-throws', '2026-09-14T00:00:00.000Z', 4)).toBe(true);
+    expect(h.occupied).toBe(1);
+    h.github.findPullRequest = async () => {
+      throw new Error('github unavailable');
+    };
+    const options = { store: h.store, github: h.github, readPolicy: () => policy() };
+    await runMergeExecutionBridgeOnce(options);
+    expect(h.merges).toBe(0);
+    expect(h.occupied).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'pr-throws', reason: 'github unavailable' }]);
+    expect(await h.store.listUnactionedVerdicts()).toHaveLength(1);
+    h.github.findPullRequest = async () => greenPr();
+    await runMergeExecutionBridgeOnce(options);
+    expect(h.merges).toBe(1);
+  });
+
+  test('does not un-finalize a recorded outcome when releaseVerdictClaim is invoked', async () => {
+    const h = harness([verdict('finalized')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+    expect(h.claimReleases).toEqual([]);
+    expect(await h.store.releaseVerdictClaim('finalized', 'should-not-unfinalize')).toBe(false);
+    expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
   });
 });

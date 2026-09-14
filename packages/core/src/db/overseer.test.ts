@@ -12,6 +12,7 @@ mock.module('./connection', () => ({
 
 import {
   claimOverseerVerdict,
+  claimVerdictForMergeExecution,
   countRunsPendingOverseerJudgment,
   finalizeOverseerVerdict,
   getOverseerActionsForRun,
@@ -23,7 +24,10 @@ import {
   insertReconcileAction,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
+  listUnactionedFlagMergeReadyVerdicts,
+  recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
+  releaseVerdictClaimForMergeExecution,
   reserveOverseerMergeSlot,
 } from './overseer';
 
@@ -419,5 +423,65 @@ describe('overseer db', () => {
     expect(await reserveOverseerMergeSlot('verdict-b', since, 1)).toBe(false);
     await releaseOverseerMergeSlot('verdict-a');
     expect(await reserveOverseerMergeSlot('verdict-b', since, 1)).toBe(true);
+  });
+
+  test('releaseVerdictClaimForMergeExecution restores a processing claim for a later cycle', async () => {
+    await seedRun('run-claim-release');
+    await db.query(
+      `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, proposed_action)
+       VALUES ('verdict-release', 'run-claim-release', 'WO-TEST-OVERSEER-01', 'sha', 'flag_merge_ready')`
+    );
+    expect(await listUnactionedFlagMergeReadyVerdicts()).toHaveLength(1);
+    expect(await claimVerdictForMergeExecution('verdict-release')).toBe(true);
+    expect(await listUnactionedFlagMergeReadyVerdicts()).toHaveLength(0);
+    expect(await releaseVerdictClaimForMergeExecution('verdict-release', 'db unavailable')).toBe(
+      true
+    );
+    const listed = await listUnactionedFlagMergeReadyVerdicts();
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.id).toBe('verdict-release');
+    expect(listed[0]?.actioned_at).toBeNull();
+    expect(listed[0]?.action_reason).toBeNull();
+    expect(await claimVerdictForMergeExecution('verdict-release')).toBe(true);
+  });
+
+  test('releaseVerdictClaimForMergeExecution never un-finalizes a recorded outcome', async () => {
+    await seedRun('run-claim-final');
+    await db.query(
+      `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, proposed_action)
+       VALUES ('verdict-final', 'run-claim-final', 'WO-TEST-OVERSEER-01', 'sha', 'flag_merge_ready')`
+    );
+    expect(await claimVerdictForMergeExecution('verdict-final')).toBe(true);
+    await recordVerdictMergeOutcome({
+      verdictId: 'verdict-final',
+      mutationSent: true,
+      reason: 'merge_executed',
+      mergeSha: 'abc',
+    });
+    expect(await releaseVerdictClaimForMergeExecution('verdict-final', 'should-not-clear')).toBe(
+      false
+    );
+    const merged = await getOverseerVerdictsForRun('run-claim-final');
+    expect(merged[0]?.action_reason).toBe('merge_executed');
+    expect(merged[0]?.actioned_at).toBeTruthy();
+    expect(await listUnactionedFlagMergeReadyVerdicts()).toHaveLength(0);
+
+    await seedRun('run-claim-skip');
+    await db.query(
+      `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, proposed_action)
+       VALUES ('verdict-skip', 'run-claim-skip', 'WO-TEST-OVERSEER-01', 'sha', 'flag_merge_ready')`
+    );
+    expect(await claimVerdictForMergeExecution('verdict-skip')).toBe(true);
+    await recordVerdictMergeOutcome({
+      verdictId: 'verdict-skip',
+      mutationSent: false,
+      reason: 'repo_not_allowed',
+    });
+    expect(await releaseVerdictClaimForMergeExecution('verdict-skip', 'should-not-clear')).toBe(
+      false
+    );
+    const skipped = await getOverseerVerdictsForRun('run-claim-skip');
+    expect(skipped[0]?.action_reason).toBe('repo_not_allowed');
+    expect(skipped[0]?.actioned_at).toBeTruthy();
   });
 });

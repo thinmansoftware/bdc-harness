@@ -418,6 +418,19 @@ export async function claimVerdictForMergeExecution(verdictId: string): Promise<
   return result.rowCount === 1;
 }
 
+export async function releaseVerdictClaimForMergeExecution(
+  verdictId: string,
+  _reason: string
+): Promise<boolean> {
+  const result = await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET actioned_at = NULL, mutation_sent = NULL, action_reason = NULL, updated_at = $2
+     WHERE id = $1 AND actioned_at IS NOT NULL AND action_reason = 'processing'`,
+    [verdictId, new Date().toISOString()]
+  );
+  return result.rowCount === 1;
+}
+
 export async function recordVerdictMergeOutcome(input: {
   verdictId: string;
   mutationSent: boolean;

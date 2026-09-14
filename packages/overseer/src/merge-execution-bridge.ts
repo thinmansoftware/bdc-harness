@@ -36,6 +36,7 @@ export type MergeExecutionRepoConfig = Readonly<Record<string, { readonly baseBr
 export interface MergeExecutionBridgeStore {
   listUnactionedVerdicts(): Promise<OverseerVerdictRow[]>;
   claimVerdict(verdictId: string): Promise<boolean>;
+  releaseVerdictClaim(verdictId: string, reason: string): Promise<boolean>;
   getRunById(runId: string): Promise<OverseerWatchRun | null>;
   reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
   releaseMergeSlot(verdictId: string): Promise<void>;
@@ -107,6 +108,160 @@ function isDocumentationOnly(paths: readonly string[]): boolean {
   );
 }
 
+async function mergeClaimedVerdict(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  repoConfig: MergeExecutionRepoConfig
+): Promise<void> {
+  const skip = async (reason: string, prUrl?: string): Promise<void> => {
+    await options.store.recordOutcome({
+      verdictId: verdict.id,
+      mutationSent: false,
+      reason,
+      prUrl,
+    });
+    log.info(
+      { verdictId: verdict.id, runId: verdict.run_id, woId: verdict.wo_id, reason, prUrl },
+      'merge-coordinator.merge_skipped'
+    );
+  };
+
+  const policy = (options.readPolicy ?? readOverseerActionPolicyFromEnv)();
+  if (!policy.service_enabled) {
+    await skip('service_disabled');
+    return;
+  }
+  if (policy.emergency_stop) {
+    await skip('emergency_stop');
+    return;
+  }
+  if (policy.legacy_dry_run) {
+    await skip('legacy_dry_run');
+    return;
+  }
+  if (!policy.capability_flags.merge) {
+    await skip('merge_actions_disabled');
+    return;
+  }
+
+  const run = await options.store.getRunById(verdict.run_id);
+  if (!run?.owner || !run.repo) {
+    await skip('run_context_unresolvable');
+    return;
+  }
+  const config = repoConfig[`${run.owner}/${run.repo}`];
+  if (!config) {
+    await skip('repo_not_allowed');
+    return;
+  }
+
+  const pr = await options.github.findPullRequest({
+    owner: run.owner,
+    repo: run.repo,
+    headBranch: run.headBranch,
+    woId: run.woId,
+    includeChangedFiles: true,
+  });
+  if (!pr.exists || !pr.pr) {
+    await skip(pr.lookupFailed ? 'pr_lookup_failed' : 'open_pr_not_found', pr.htmlUrl);
+    return;
+  }
+  if (pr.headSha !== verdict.head_sha) {
+    await skip('verdict_stale_head', pr.htmlUrl);
+    return;
+  }
+  if (pr.state !== 'open') {
+    await skip('pr_not_open', pr.htmlUrl);
+    return;
+  }
+  if (pr.checks.total === 0 || pr.checks.failed > 0 || pr.checks.pending > 0) {
+    await skip('required_checks_not_success', pr.htmlUrl);
+    return;
+  }
+  if (pr.mergeable !== true || pr.mergeableState !== 'clean') {
+    await skip('mergeable_state_not_clean', pr.htmlUrl);
+    return;
+  }
+  if (!pr.changedFilePaths) {
+    await skip('changed_files_unresolved', pr.htmlUrl);
+    return;
+  }
+  if (isDocumentationOnly(pr.changedFilePaths)) {
+    await skip('spec_only', pr.htmlUrl);
+    return;
+  }
+  if (pr.baseBranch !== config.baseBranch) {
+    await skip('integration_base_mismatch', pr.htmlUrl);
+    return;
+  }
+
+  const now = (options.now ?? ((): Date => new Date()))();
+  const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
+  if (
+    !(await options.store.reserveMergeSlot(
+      verdict.id,
+      since,
+      configuredLimit(options.maxMergesPerHour)
+    ))
+  ) {
+    await skip('rate_ceiling_exceeded', pr.htmlUrl);
+    return;
+  }
+
+  if (options.github.approvePullRequest) {
+    try {
+      await options.github.approvePullRequest({
+        ...pr.pr,
+        expectedHeadSha: verdict.head_sha,
+      });
+    } catch (error) {
+      log.warn(
+        { err: error as Error, verdictId: verdict.id },
+        'merge-coordinator.approval_failed_nonfatal'
+      );
+    }
+  }
+  let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
+  try {
+    merged = await options.github.mergePullRequest({
+      ...pr.pr,
+      mergeMethod: 'squash',
+      expectedHeadSha: verdict.head_sha,
+    });
+  } catch (error) {
+    await options.store.releaseMergeSlot(verdict.id);
+    await skip(
+      error instanceof Error && error.message ? `merge_failed:${error.message}` : 'merge_failed',
+      pr.htmlUrl
+    );
+    return;
+  }
+  if (!merged.merged) {
+    await options.store.releaseMergeSlot(verdict.id);
+    await skip(merged.message ?? 'merge_failed', pr.htmlUrl);
+    return;
+  }
+  await options.store.recordOutcome({
+    verdictId: verdict.id,
+    mutationSent: true,
+    reason: 'merge_executed',
+    mergeSha: merged.mergeSha,
+    prUrl: pr.htmlUrl,
+  });
+  log.info(
+    {
+      verdictId: verdict.id,
+      runId: verdict.run_id,
+      woId: verdict.wo_id,
+      prUrl: pr.htmlUrl,
+      mergeSha: merged.mergeSha,
+      mutationSent: true,
+      timestamp: now.toISOString(),
+    },
+    'merge-coordinator.merge_executed'
+  );
+}
+
 export async function runMergeExecutionBridgeOnce(
   options: MergeExecutionBridgeOptions
 ): Promise<void> {
@@ -115,152 +270,18 @@ export async function runMergeExecutionBridgeOnce(
   for (const verdict of verdicts) {
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
     if (!(await options.store.claimVerdict(verdict.id))) continue;
-    const skip = async (reason: string, prUrl?: string): Promise<void> => {
-      await options.store.recordOutcome({
-        verdictId: verdict.id,
-        mutationSent: false,
-        reason,
-        prUrl,
-      });
-      log.info(
-        { verdictId: verdict.id, runId: verdict.run_id, woId: verdict.wo_id, reason, prUrl },
-        'merge-coordinator.merge_skipped'
-      );
-    };
-
-    const policy = (options.readPolicy ?? readOverseerActionPolicyFromEnv)();
-    if (!policy.service_enabled) {
-      await skip('service_disabled');
-      continue;
-    }
-    if (policy.emergency_stop) {
-      await skip('emergency_stop');
-      continue;
-    }
-    if (policy.legacy_dry_run) {
-      await skip('legacy_dry_run');
-      continue;
-    }
-    if (!policy.capability_flags.merge) {
-      await skip('merge_actions_disabled');
-      continue;
-    }
-
-    const run = await options.store.getRunById(verdict.run_id);
-    if (!run?.owner || !run.repo) {
-      await skip('run_context_unresolvable');
-      continue;
-    }
-    const config = repoConfig[`${run.owner}/${run.repo}`];
-    if (!config) {
-      await skip('repo_not_allowed');
-      continue;
-    }
-
-    const pr = await options.github.findPullRequest({
-      owner: run.owner,
-      repo: run.repo,
-      headBranch: run.headBranch,
-      woId: run.woId,
-      includeChangedFiles: true,
-    });
-    if (!pr.exists || !pr.pr) {
-      await skip(pr.lookupFailed ? 'pr_lookup_failed' : 'open_pr_not_found', pr.htmlUrl);
-      continue;
-    }
-    if (pr.headSha !== verdict.head_sha) {
-      await skip('verdict_stale_head', pr.htmlUrl);
-      continue;
-    }
-    if (pr.state !== 'open') {
-      await skip('pr_not_open', pr.htmlUrl);
-      continue;
-    }
-    if (pr.checks.total === 0 || pr.checks.failed > 0 || pr.checks.pending > 0) {
-      await skip('required_checks_not_success', pr.htmlUrl);
-      continue;
-    }
-    if (pr.mergeable !== true || pr.mergeableState !== 'clean') {
-      await skip('mergeable_state_not_clean', pr.htmlUrl);
-      continue;
-    }
-    if (!pr.changedFilePaths) {
-      await skip('changed_files_unresolved', pr.htmlUrl);
-      continue;
-    }
-    if (isDocumentationOnly(pr.changedFilePaths)) {
-      await skip('spec_only', pr.htmlUrl);
-      continue;
-    }
-    if (pr.baseBranch !== config.baseBranch) {
-      await skip('integration_base_mismatch', pr.htmlUrl);
-      continue;
-    }
-
-    const now = (options.now ?? ((): Date => new Date()))();
-    const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
-    if (
-      !(await options.store.reserveMergeSlot(
-        verdict.id,
-        since,
-        configuredLimit(options.maxMergesPerHour)
-      ))
-    ) {
-      await skip('rate_ceiling_exceeded', pr.htmlUrl);
-      continue;
-    }
-
-    if (options.github.approvePullRequest) {
-      try {
-        await options.github.approvePullRequest({
-          ...pr.pr,
-          expectedHeadSha: verdict.head_sha,
-        });
-      } catch (error) {
-        log.warn(
-          { err: error as Error, verdictId: verdict.id },
-          'merge-coordinator.approval_failed_nonfatal'
-        );
-      }
-    }
-    let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
     try {
-      merged = await options.github.mergePullRequest({
-        ...pr.pr,
-        mergeMethod: 'squash',
-        expectedHeadSha: verdict.head_sha,
-      });
+      await mergeClaimedVerdict(options, verdict, repoConfig);
     } catch (error) {
       await options.store.releaseMergeSlot(verdict.id);
-      await skip(
-        error instanceof Error && error.message ? `merge_failed:${error.message}` : 'merge_failed',
-        pr.htmlUrl
+      await options.store.releaseVerdictClaim(
+        verdict.id,
+        error instanceof Error && error.message ? error.message : 'unexpected_error'
       );
-      continue;
+      log.error(
+        { err: error as Error, verdictId: verdict.id, runId: verdict.run_id, woId: verdict.wo_id },
+        'merge-coordinator.claim_released'
+      );
     }
-    if (!merged.merged) {
-      await options.store.releaseMergeSlot(verdict.id);
-      await skip(merged.message ?? 'merge_failed', pr.htmlUrl);
-      continue;
-    }
-    await options.store.recordOutcome({
-      verdictId: verdict.id,
-      mutationSent: true,
-      reason: 'merge_executed',
-      mergeSha: merged.mergeSha,
-      prUrl: pr.htmlUrl,
-    });
-    log.info(
-      {
-        verdictId: verdict.id,
-        runId: verdict.run_id,
-        woId: verdict.wo_id,
-        prUrl: pr.htmlUrl,
-        mergeSha: merged.mergeSha,
-        mutationSent: true,
-        timestamp: now.toISOString(),
-      },
-      'merge-coordinator.merge_executed'
-    );
   }
 }
