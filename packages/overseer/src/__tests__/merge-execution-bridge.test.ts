@@ -214,7 +214,6 @@ describe('merge execution bridge', () => {
       0,
       'pr_lookup_failed',
     ],
-    ['limited', greenPr(), 4, 'rate_ceiling_exceeded'],
     ['closed', greenPr({ state: 'closed' }), 0, 'pr_not_open'],
   ])('records honest skip for %s', async (id, evidence, recent, reason) => {
     const h = harness([verdict(id)], evidence, recent);
@@ -265,6 +264,7 @@ describe('merge execution bridge', () => {
     let occupied = 3;
     const reserved = new Set<string>();
     const outcomes: { verdictId: string; mutationSent: boolean; reason: string }[] = [];
+    const claimReleases: { verdictId: string; reason: string }[] = [];
     let merges = 0;
     const reserveMergeSlot = async (
       verdictId: string,
@@ -283,7 +283,10 @@ describe('merge execution bridge', () => {
     const storeFor = (id: string): MergeExecutionBridgeStore => ({
       listUnactionedVerdicts: async () => [verdict(id)],
       claimVerdict: async () => true,
-      releaseVerdictClaim: async () => false,
+      releaseVerdictClaim: async (verdictId, reason) => {
+        claimReleases.push({ verdictId, reason });
+        return true;
+      },
       getRunById: async () => run(id),
       reserveMergeSlot,
       releaseMergeSlot,
@@ -317,7 +320,55 @@ describe('merge execution bridge', () => {
     ]);
     expect(merges).toBe(1);
     expect(outcomes.filter(row => row.reason === 'merge_executed')).toHaveLength(1);
-    expect(outcomes.filter(row => row.reason === 'rate_ceiling_exceeded')).toHaveLength(1);
+    expect(outcomes.filter(row => row.reason === 'rate_ceiling_exceeded')).toHaveLength(0);
+    expect(claimReleases).toEqual([expect.objectContaining({ reason: 'rate_ceiling_deferred' })]);
+  });
+
+  test('releases a rate-ceiling claim so a later pass can merge when capacity returns', async () => {
+    const h = harness([verdict('ceiling')], greenPr(), 4);
+    const options = {
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      maxMergesPerHour: 4,
+    };
+    await runMergeExecutionBridgeOnce(options);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.occupied).toBe(4);
+    expect(h.claimReleases).toEqual([{ verdictId: 'ceiling', reason: 'rate_ceiling_deferred' }]);
+    expect(await h.store.listUnactionedVerdicts()).toHaveLength(1);
+
+    await runMergeExecutionBridgeOnce({ ...options, maxMergesPerHour: 5 });
+    expect(h.merges).toBe(1);
+    expect(h.outcomes).toEqual([
+      expect.objectContaining({
+        verdictId: 'ceiling',
+        mutationSent: true,
+        reason: 'merge_executed',
+      }),
+    ]);
+  });
+
+  test('stops claiming further verdicts in a pass after a rate-ceiling deferral', async () => {
+    const h = harness([verdict('first'), verdict('second')], greenPr(), 4);
+    let claims = 0;
+    const claimVerdict = h.store.claimVerdict;
+    h.store.claimVerdict = async verdictId => {
+      claims += 1;
+      return claimVerdict(verdictId);
+    };
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(claims).toBe(1);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.occupied).toBe(4);
+    expect(h.claimReleases).toEqual([{ verdictId: 'first', reason: 'rate_ceiling_deferred' }]);
+    expect(await h.store.listUnactionedVerdicts()).toHaveLength(2);
   });
 
   test('records a thrown merge failure precisely', async () => {

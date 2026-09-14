@@ -155,7 +155,7 @@ async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
   repoConfig: MergeExecutionRepoConfig
-): Promise<void> {
+): Promise<'stop' | void> {
   const skip = async (reason: string, prUrl?: string): Promise<void> => {
     await options.store.recordOutcome({
       verdictId: verdict.id,
@@ -247,8 +247,17 @@ async function mergeClaimedVerdict(
       configuredLimit(options.maxMergesPerHour)
     ))
   ) {
-    await skip('rate_ceiling_exceeded', pr.htmlUrl);
-    return;
+    await options.store.releaseVerdictClaim(verdict.id, 'rate_ceiling_deferred');
+    log.info(
+      {
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        prUrl: pr.htmlUrl,
+      },
+      'merge-coordinator.rate_ceiling_deferred'
+    );
+    return 'stop';
   }
 
   if (options.github.approvePullRequest) {
@@ -321,7 +330,7 @@ export async function runMergeExecutionBridgeOnce(
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
     if (!(await options.store.claimVerdict(verdict.id))) continue;
     try {
-      await mergeClaimedVerdict(options, verdict, repoConfig);
+      if ((await mergeClaimedVerdict(options, verdict, repoConfig)) === 'stop') break;
     } catch (error) {
       await options.store.releaseMergeSlot(verdict.id);
       await options.store.releaseVerdictClaim(
