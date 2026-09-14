@@ -72,8 +72,9 @@ readonly dispatch store. Extra flags:
   `c2_live_enqueue_prerequisites_missing`; after the POST, C2 passes only if the
   `messageId` the route returned is a queued `run_review` row whose correlation id ends
   with the requested exact head (`enqueued_row_missing` / `enqueued_row_head_mismatch`
-  otherwise). Observe mode reports the newest queued row for the subject and names that
-  row's head (`row_head=`) in the evidence.
+  otherwise). Observe mode is exact-head as well: with `--head-sha` only a queued row
+  whose correlation id ends with that head counts (`row_head=` names it); a row queued
+  for another head is stale work and leaves C2 `blocked`.
 - C1 counts an `rereview_attempts_exhausted` ingest receipt only when it names the
   subject's current head and no non-automatic review row was queued after it; a
   receipt for an older head, or one followed by a hand/operator review, is history.

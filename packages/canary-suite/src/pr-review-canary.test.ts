@@ -131,6 +131,22 @@ describe.serial('PR review outcome canary suite', () => {
         SUBJECT,
       ]
     );
+    // C2 observe mode is exact-head: the suite runs at HEAD_C, so the repeat-send row it
+    // may report must be queued at HEAD_C (the HEAD_B row above belongs to C4's ingest).
+    db.run(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, recipient, body, status, created_at, subject_key, repeat_reason)
+       VALUES ('queued-2', 'pr-review:thinmansoftware/bdc-harness#806@${HEAD_C}', 'queued-2', 'run_review', 'overseer-reviewer', ?, 'queued', '2026-09-14T11:59:58.000Z', ?, 'operator_request:canary')`,
+      [
+        JSON.stringify({
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          prNumber: 806,
+          headSha: HEAD_C,
+        }),
+        SUBJECT,
+      ]
+    );
     const result = await runPrReviewCanarySuite({
       db,
       now: () => NOW,
@@ -176,6 +192,9 @@ describe.serial('PR review outcome canary suite', () => {
     });
     expect(result.verdict).toBe('passed');
     expect(result.checks).toHaveLength(6);
+    expect(result.checks.find(check => check.id === 'C2')?.evidenceRefs).toContain(
+      `row_head=${HEAD_C}`
+    );
   });
 
   test('without a github client only C6 is blocked when C3 is enabled', async () => {
@@ -218,6 +237,20 @@ describe.serial('PR review outcome canary suite', () => {
           disposition: 'queued',
           reason: null,
           headSha: HEAD_B,
+        }),
+        SUBJECT,
+      ]
+    );
+    db.run(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, recipient, body, status, created_at, subject_key, repeat_reason)
+       VALUES ('queued-2', 'pr-review:thinmansoftware/bdc-harness#806@${HEAD_C}', 'queued-2', 'run_review', 'overseer-reviewer', ?, 'queued', '2026-09-14T11:59:58.000Z', ?, 'operator_request:canary')`,
+      [
+        JSON.stringify({
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          prNumber: 806,
+          headSha: HEAD_C,
         }),
         SUBJECT,
       ]

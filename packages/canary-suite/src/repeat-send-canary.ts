@@ -87,12 +87,15 @@ async function liveEnqueue(deps: RepeatSendCanaryDeps): Promise<RepeatSendEnqueu
 
 /**
  * After a real (or injected) enqueue the row must be the one the route returned and
- * must carry the requested exact head; in observe mode the newest queued row for the
- * subject is reported with its own head named in the evidence.
+ * must carry the requested exact head. In observe mode the newest queued row for the
+ * subject AT THE REQUESTED HEAD is reported; a queued row for another head is stale
+ * work, never evidence for this head (review finding, PR #840 round 10). Only when
+ * no head is requested does the subject-level newest row count.
  */
 function findQueuedRow(
   db: ReturnType<typeof openOutcomeDatabase>['db'],
   subjectKey: string,
+  headSha: string | undefined,
   expectedMessageId: string | undefined
 ): QueuedRow | null {
   if (expectedMessageId) {
@@ -103,6 +106,16 @@ function findQueuedRow(
          LIMIT 1`
       )
       .get(expectedMessageId, subjectKey);
+  }
+  if (headSha) {
+    return db
+      .query<QueuedRow>(
+        `SELECT id, correlation_id, repeat_reason FROM agent_dispatch_messages
+         WHERE subject_key = ? AND task_type = 'run_review' AND status = 'queued'
+           AND correlation_id LIKE ?
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(subjectKey, `%@${headSha}`);
   }
   return db
     .query<QueuedRow>(
@@ -154,13 +167,10 @@ export async function runRepeatSendCanary(
     return failResult('c2_repeat_send_refused', [`error=${(error as Error).message}`]);
   }
   try {
-    const row = findQueuedRow(opened.db, subjectKey, expectedMessageId);
+    const row = findQueuedRow(opened.db, subjectKey, deps.headSha, expectedMessageId);
     const rowHead = row?.correlation_id.split('@').pop() ?? 'none';
     const headMatches =
-      row === null ||
-      expectedMessageId === undefined ||
-      !deps.headSha ||
-      row.correlation_id.endsWith(`@${deps.headSha}`);
+      row === null || !deps.headSha || row.correlation_id.endsWith(`@${deps.headSha}`);
     const reason = row?.repeat_reason?.trim() ?? '';
     const scope = [
       `subject_key=${subjectKey}`,

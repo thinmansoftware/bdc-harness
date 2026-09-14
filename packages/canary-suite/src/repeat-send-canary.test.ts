@@ -147,6 +147,29 @@ describe('C2 repeat-send canary', () => {
     expect(result.evidenceRefs).toContain('mode=observe');
   });
 
+  test('observe mode is exact-head: a queued row at another head is not this head', async () => {
+    const db = fixture();
+    insert(db, {
+      id: 'queued-old',
+      headSha: HEAD_A,
+      status: 'queued',
+      repeatReason: 'operator_request:earlier',
+      createdAt: '2026-09-14T12:00:01.000Z',
+    });
+    const result = await runRepeatSendCanary({
+      db,
+      subjectKey: SUBJECT,
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 806,
+      headSha: HEAD_B,
+    });
+    expect(result.verdict).toBe('blocked');
+    expect(result.reasonCodes).toEqual(['c2_live_enqueue_not_enabled']);
+    expect(result.evidenceRefs).toContain(`requested_head=${HEAD_B}`);
+    expect(result.evidenceRefs).toContain('row_head=none');
+  });
+
   test('--c2-live-enqueue fails when the returned row is queued at a different head', async () => {
     const db = fixture();
     insert(db, {
