@@ -2267,7 +2267,7 @@ nodes:
           echo "ERROR: invalid or missing repo for repair target verification" >&2
           exit 1
         fi
-        if ! REPAIR_TARGET_LIVE=$(gh pr view "$REPAIR_TARGET_PR" --repo "$REPO_FOR_CHECK" --json state,headRefName --jq '.state + "\\t" + .headRefName' 2>/dev/null); then
+        if ! REPAIR_TARGET_LIVE=$(gh pr view "$REPAIR_TARGET_PR" --repo "$REPO_FOR_CHECK" --json state,headRefName --jq '.state + "\t" + .headRefName' 2>/dev/null); then
           echo "ERROR: declared repair target #${REPAIR_TARGET_PR} not found on ${REPO_FOR_CHECK}" >&2
           exit 1
         fi

@@ -160,41 +160,6 @@ else
 fi
 `;
 
-// Repair-target selection from commit-and-push. The gh executable is replaced
-// by each test so these checks exercise the push-time trust boundary without
-// network access.
-const REPAIR_TARGET_SELECTION = `
-set -euo pipefail
-DECIDE_OUTPUT_CLEAN=$(printf '%s\\n' "$DECIDE_OUTPUT" | tr -d '\`')
-BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
-REPAIR_TARGET_BRANCH=$(printf '%s\\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\\([^[:space:]]*\\)[[:space:]]*$/\\1/p' | head -n 1)
-REPAIR_TARGET_PR=$(printf '%s\\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_pr:[[:space:]]*#\\{0,1\\}\\([0-9][0-9]*\\)[[:space:]]*$/\\1/p' | head -n 1)
-if [ -z "$REPAIR_TARGET_PR" ]; then
-  echo "ERROR: repair_target_branch present without repair_target_pr" >&2
-  exit 1
-fi
-if ! git check-ref-format --branch "$REPAIR_TARGET_BRANCH" >/dev/null 2>&1 || ! printf '%s\\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
-  echo "ERROR: invalid repair_target_branch '\${REPAIR_TARGET_BRANCH}'" >&2
-  exit 1
-fi
-REPO_FOR_CHECK=$(printf '%s\\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repo:[[:space:]]*\\([^[:space:]]*\\)[[:space:]]*$/\\1/p' | head -n 1)
-if ! REPAIR_TARGET_LIVE=$(gh pr view "$REPAIR_TARGET_PR" --repo "$REPO_FOR_CHECK" --json state,headRefName --jq '.state + "\\t" + .headRefName' 2>/dev/null); then
-  echo "ERROR: declared repair target #\${REPAIR_TARGET_PR} not found on \${REPO_FOR_CHECK}" >&2
-  exit 1
-fi
-REPAIR_TARGET_STATE=\${REPAIR_TARGET_LIVE%%$'\\t'*}
-REPAIR_TARGET_LIVE_BRANCH=\${REPAIR_TARGET_LIVE#*$'\\t'}
-if [ "$REPAIR_TARGET_STATE" != "OPEN" ]; then
-  echo "ERROR: declared repair target #\${REPAIR_TARGET_PR} is \${REPAIR_TARGET_STATE}" >&2
-  exit 1
-fi
-if [ "$REPAIR_TARGET_LIVE_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
-  echo "ERROR: declared repair target #\${REPAIR_TARGET_PR} head branch mismatch" >&2
-  exit 1
-fi
-UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"
-echo "UNIQUE_BRANCH=$UNIQUE_BRANCH"
-`;
 
 // Anchor on import.meta.dir, not CWD: turbo runs package tests with cwd at the
 // package dir, so bare repo-root-relative paths ENOENT in CI.
@@ -209,6 +174,23 @@ const FEATURE_DEV_LANES = [
   join(DEFAULTS_DIR, 'bdc-feature-development-zero-open.yaml'),
   join(DEFAULTS_DIR, 'bdc-feature-development-zero.yaml'),
 ];
+
+function extractRepairTargetSelection(): string {
+  const yaml = readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8');
+  const start = yaml.indexOf('      REPAIR_TARGET_BRANCH=');
+  const end = yaml.indexOf('      git status --short', start);
+  if (start < 0 || end < 0) throw new Error('commit-and-push repair-target block not found');
+  const block = yaml.slice(start, end).replace(/^      /gm, '');
+  return `set -euo pipefail
+DECIDE_OUTPUT_CLEAN="$DECIDE_OUTPUT"
+BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+THREAD_ID=test
+${block}
+echo "UNIQUE_BRANCH=$UNIQUE_BRANCH"
+`;
+}
+
+const REPAIR_TARGET_SELECTION = extractRepairTargetSelection();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -662,8 +644,21 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
   function fakeGhPath(state: string, branch: string): string {
     const binDir = mkdtempSync(join(tmpdir(), 'bdc-fake-gh-'));
     const ghPath = join(binDir, 'gh');
-    writeFileSync(ghPath, `#!/bin/sh\nprintf '%s\\t%s\\n' '${state}' '${branch}'\n`);
+    writeFileSync(
+      ghPath,
+      `#!/bin/sh
+filter=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--jq" ]; then filter=$2; break; fi
+  shift
+done
+[ -n "$filter" ] || exit 2
+printf '{"state":"%s","headRefName":"%s"}\\n' "$FAKE_GH_STATE" "$FAKE_GH_BRANCH" | jq -r "$filter"
+`
+    );
     chmodSync(ghPath, 0o755);
+    process.env.FAKE_GH_STATE = state;
+    process.env.FAKE_GH_BRANCH = branch;
     return `${binDir}:${process.env.PATH ?? ''}`;
   }
 
