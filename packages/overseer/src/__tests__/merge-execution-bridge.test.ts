@@ -62,7 +62,7 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
   let merges = 0;
   let approvals = 0;
   let occupied = recentMerges;
-  const reserved = new Set<string>();
+  const slots = new Map<string, { released: boolean }>();
   const store: MergeExecutionBridgeStore = {
     listUnactionedVerdicts: async () => [...pending],
     claimVerdict: async verdictId => {
@@ -78,14 +78,18 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
     },
     getRunById: async runId => run(runId.replace('run-', '')),
     reserveMergeSlot: async (verdictId, _since, limit) => {
-      if (reserved.has(verdictId)) return false;
+      const existing = slots.get(verdictId);
+      if (existing && !existing.released) return false;
       if (occupied >= limit) return false;
       occupied += 1;
-      reserved.add(verdictId);
+      slots.set(verdictId, { released: false });
       return true;
     },
     releaseMergeSlot: async verdictId => {
-      if (reserved.delete(verdictId)) occupied -= 1;
+      const existing = slots.get(verdictId);
+      if (!existing || existing.released) return;
+      existing.released = true;
+      occupied -= 1;
     },
     recordOutcome: async input => {
       outcomes.push(input);
@@ -262,7 +266,7 @@ describe('merge execution bridge', () => {
 
   test('two concurrent executions at limit-1 admit exactly one merge', async () => {
     let occupied = 3;
-    const reserved = new Set<string>();
+    const slots = new Map<string, { released: boolean }>();
     const outcomes: { verdictId: string; mutationSent: boolean; reason: string }[] = [];
     const claimReleases: { verdictId: string; reason: string }[] = [];
     let merges = 0;
@@ -271,14 +275,18 @@ describe('merge execution bridge', () => {
       _since: string,
       limit: number
     ): Promise<boolean> => {
-      if (reserved.has(verdictId)) return false;
+      const existing = slots.get(verdictId);
+      if (existing && !existing.released) return false;
       if (occupied >= limit) return false;
       occupied += 1;
-      reserved.add(verdictId);
+      slots.set(verdictId, { released: false });
       return true;
     };
     const releaseMergeSlot = async (verdictId: string): Promise<void> => {
-      if (reserved.delete(verdictId)) occupied -= 1;
+      const existing = slots.get(verdictId);
+      if (!existing || existing.released) return;
+      existing.released = true;
+      occupied -= 1;
     };
     const storeFor = (id: string): MergeExecutionBridgeStore => ({
       listUnactionedVerdicts: async () => [verdict(id)],
@@ -484,6 +492,7 @@ describe('merge execution bridge', () => {
     h.github.findPullRequest = async () => greenPr();
     await runMergeExecutionBridgeOnce(options);
     expect(h.merges).toBe(1);
+    expect(h.occupied).toBe(1);
   });
 
   test('does not un-finalize a recorded outcome when releaseVerdictClaim is invoked', async () => {

@@ -65,6 +65,21 @@ async function seedRun(id: string, status = 'failed'): Promise<void> {
   );
 }
 
+async function mergeSlotRow(
+  verdictId: string
+): Promise<{ id: string; reserved_at: string; released_at: string | null } | undefined> {
+  const result = await db.query<{
+    id: string;
+    reserved_at: string;
+    released_at: string | null;
+  }>(
+    `SELECT id, reserved_at, released_at FROM overseer_merge_slot_reservations
+     WHERE verdict_id = $1`,
+    [verdictId]
+  );
+  return result.rows[0];
+}
+
 describe('overseer db', () => {
   beforeEach(() => {
     currentDbPath = join(
@@ -423,6 +438,53 @@ describe('overseer db', () => {
     expect(await reserveOverseerMergeSlot('verdict-b', since, 1)).toBe(false);
     await releaseOverseerMergeSlot('verdict-a');
     expect(await reserveOverseerMergeSlot('verdict-b', since, 1)).toBe(true);
+  });
+
+  test('revives a released merge slot for the same verdict', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    expect(await reserveOverseerMergeSlot('verdict-revive', since, 1)).toBe(true);
+    const first = await mergeSlotRow('verdict-revive');
+    expect(first).toBeDefined();
+    await releaseOverseerMergeSlot('verdict-revive');
+    const released = await mergeSlotRow('verdict-revive');
+    expect(released?.id).toBe(first?.id);
+    expect(released?.released_at).toBeTruthy();
+    expect(await reserveOverseerMergeSlot('verdict-revive', since, 1)).toBe(true);
+    const revived = await mergeSlotRow('verdict-revive');
+    expect(revived?.id).toBe(first?.id);
+    expect(revived?.released_at).toBeNull();
+    expect(revived?.reserved_at).toBeTruthy();
+    const count = await db.query<{ n: number | string }>(
+      'SELECT COUNT(*) AS n FROM overseer_merge_slot_reservations WHERE verdict_id = $1',
+      ['verdict-revive']
+    );
+    expect(Number(count.rows[0]?.n)).toBe(1);
+  });
+
+  test('refuses a second reserve of an active merge slot', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    expect(await reserveOverseerMergeSlot('verdict-active', since, 2)).toBe(true);
+    const first = await mergeSlotRow('verdict-active');
+    expect(await reserveOverseerMergeSlot('verdict-active', since, 2)).toBe(false);
+    expect(await mergeSlotRow('verdict-active')).toEqual(first);
+  });
+
+  test('counts a revived reservation toward occupancy again', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    expect(await reserveOverseerMergeSlot('verdict-a', since, 1)).toBe(true);
+    await releaseOverseerMergeSlot('verdict-a');
+    expect(await reserveOverseerMergeSlot('verdict-a', since, 1)).toBe(true);
+    expect(await reserveOverseerMergeSlot('verdict-b', since, 1)).toBe(false);
+  });
+
+  test('releaseOverseerMergeSlot is a no-op on a released row', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    expect(await reserveOverseerMergeSlot('verdict-noop', since, 1)).toBe(true);
+    await releaseOverseerMergeSlot('verdict-noop');
+    const first = await mergeSlotRow('verdict-noop');
+    expect(first?.released_at).toBeTruthy();
+    await releaseOverseerMergeSlot('verdict-noop');
+    expect(await mergeSlotRow('verdict-noop')).toEqual(first);
   });
 
   test('releaseVerdictClaimForMergeExecution restores a processing claim for a later cycle', async () => {

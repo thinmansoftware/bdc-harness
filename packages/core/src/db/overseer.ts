@@ -388,10 +388,16 @@ export async function reserveOverseerMergeSlot(
     );
     const occupied = Number(occupiedResult.rows[0]?.occupied ?? 0);
     if (!Number.isFinite(occupied) || occupied >= limit) return false;
+    // Revival of a released row succeeds (rowCount 1). An active reservation
+    // for the same verdict is a no-op (rowCount 0); the bridge never re-reserves
+    // an active slot.
     const inserted = await query(
       `INSERT INTO overseer_merge_slot_reservations (id, verdict_id, reserved_at)
        VALUES ($1, $2, $3)
-       ON CONFLICT (verdict_id) DO NOTHING`,
+       ON CONFLICT (verdict_id) DO UPDATE SET
+         reserved_at = excluded.reserved_at,
+         released_at = NULL
+       WHERE overseer_merge_slot_reservations.released_at IS NOT NULL`,
       [randomUUID(), verdictId, now]
     );
     return inserted.rowCount === 1;
