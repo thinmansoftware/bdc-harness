@@ -93,6 +93,8 @@ export interface PriorReviewWork {
    * subsystems or by hand are all false and never consume the attempt budget.
    */
   isAutoRereview: boolean;
+  /** CI on this row's exact head was terminal and green when it was queued. */
+  headCiGreen: boolean;
 }
 
 /**
@@ -103,6 +105,10 @@ export const MAX_REREVIEW_ATTEMPTS = 3;
 
 /** Env var overriding the automatic re-review budget (#797). */
 export const MAX_REREVIEW_ATTEMPTS_ENV = 'OVERSEER_MAX_REREVIEW_ATTEMPTS';
+
+/** Lifetime hard ceiling on automatic re-reviews, regardless of progress. */
+export const MAX_TOTAL_REREVIEWS = 10;
+export const MAX_TOTAL_REREVIEWS_ENV = 'OVERSEER_MAX_TOTAL_REREVIEWS';
 
 /**
  * The effective automatic re-review budget (#797).
@@ -121,6 +127,14 @@ export function resolveMaxRereviewAttempts(
   const raw = env[MAX_REREVIEW_ATTEMPTS_ENV];
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 1) return MAX_REREVIEW_ATTEMPTS;
+  return Math.floor(parsed);
+}
+
+export function resolveMaxTotalRereviews(
+  env: Record<string, string | undefined> = process.env
+): number {
+  const parsed = Number(env[MAX_TOTAL_REREVIEWS_ENV]);
+  if (!Number.isFinite(parsed) || parsed < 1) return MAX_TOTAL_REREVIEWS;
   return Math.floor(parsed);
 }
 
@@ -145,9 +159,14 @@ export function resolveMaxRereviewAttempts(
  * execute, which is the runaway this cap exists to prevent. Rows with no verdict
  * are therefore skipped entirely: they neither consume the budget nor restore it.
  */
-export function countConsecutiveAutoRereviews(prior: PriorReviewWork[]): number {
+export function countConsecutiveAutoRereviews(
+  prior: PriorReviewWork[],
+  currentHeadSha?: string,
+  currentHeadCiGreen = false
+): number {
   let count = 0;
-  for (const work of prior) {
+  for (let index = 0; index < prior.length; index += 1) {
+    const work = prior[index];
     // A ROW WITH NO VERDICT IS NOT AN ATTEMPT, automatic or not.
     //
     // Review finding (Overseer, PR #803): the first cut counted every
@@ -166,6 +185,12 @@ export function countConsecutiveAutoRereviews(prior: PriorReviewWork[]): number 
     // flight or cancelled before judging is skipped entirely.
     if (!isJudgedVerdict(work.verdict)) continue;
     if (work.isAutoRereview) {
+      // The successor must be the nearest newer JUDGED row. An unjudged,
+      // cancelled, queued, or claimed row is not a green fixed-push reset.
+      const successor = findJudgedSuccessor(prior, index);
+      const successorHeadSha = successor?.headSha ?? currentHeadSha;
+      const successorCiGreen = successor?.headCiGreen ?? currentHeadCiGreen;
+      if (successorHeadSha && successorHeadSha !== work.headSha && successorCiGreen) return count;
       count += 1;
       continue;
     }
@@ -173,6 +198,11 @@ export function countConsecutiveAutoRereviews(prior: PriorReviewWork[]): number 
     return count;
   }
   return count;
+}
+
+/** All judged automatic re-reviews in the PR's lifetime; progress never resets it. */
+export function countTotalAutoRereviews(prior: PriorReviewWork[]): number {
+  return prior.filter(work => work.isAutoRereview && isJudgedVerdict(work.verdict)).length;
 }
 
 /**
@@ -192,6 +222,27 @@ export function countConsecutiveAutoRereviews(prior: PriorReviewWork[]): number 
  */
 function isJudgedVerdict(verdict: PriorReviewWork['verdict']): boolean {
   return verdict === 'approved' || verdict === 'changes_requested';
+}
+
+/**
+ * Nearest newer row that actually judged the code. `prior` is newest-first,
+ * so newer rows sit at lower indexes. Unjudged, cancelled, queued, and
+ * claimed rows are skipped: they neither prove a head moved with green CI
+ * nor authorize a consecutive-count reset.
+ */
+function findJudgedSuccessor(prior: PriorReviewWork[], index: number): PriorReviewWork | undefined {
+  for (let newer = index - 1; newer >= 0; newer -= 1) {
+    const candidate = prior[newer];
+    if (
+      candidate.status === 'queued' ||
+      candidate.status === 'claimed' ||
+      candidate.status === 'cancelled'
+    ) {
+      continue;
+    }
+    if (isJudgedVerdict(candidate.verdict)) return candidate;
+  }
+  return undefined;
 }
 
 /**
@@ -216,12 +267,23 @@ export function rereviewCapCommentMarker(headSha: string): string {
  * stopped answering. This says what happened and what to do about it, in the
  * one place the person pushing is actually looking.
  */
-export function buildRereviewCapComment(headSha: string, maxAttempts: number): string {
+export function buildRereviewCapComment(
+  headSha: string,
+  maxAttempts: number,
+  totalAttempts = maxAttempts,
+  maxTotal = MAX_TOTAL_REREVIEWS,
+  rule: 'consecutive' | 'total' = 'consecutive',
+  consecutiveAttempts = maxAttempts
+): string {
+  const ruleText =
+    rule === 'total'
+      ? `The lifetime hard ceiling (${maxTotal}) was reached.`
+      : `The consecutive automatic re-review cap (${maxAttempts}) was reached.`;
   return [
     rereviewCapCommentMarker(headSha),
-    `Automatic re-review budget (${maxAttempts}) exhausted for this pull request.`,
+    `Automatic re-review budget (${rule === 'total' ? maxTotal : maxAttempts}) exhausted for this pull request.`,
     '',
-    `The last review requested changes, and ${maxAttempts} consecutive automatic re-reviews have already run since a maintainer last looked. No review was queued for \`${headSha}\`.`,
+    `${ruleText} Consecutive attempts: ${consecutiveAttempts}; total attempts: ${totalAttempts}. No review was queued for \`${headSha}\`.`,
     '',
     'A maintainer can request one more review with a Dispatch nudge; once a hand-requested review runs, automatic re-reviews resume for later pushes.',
   ].join('\n');
@@ -337,7 +399,15 @@ export interface IngestDeps {
     baseRef: string;
     author: string;
     repeatReason: string | null;
+    headCiGreen: boolean;
   }): Promise<{ messageId: string; alreadyExisted: boolean }>;
+  /** Resolve whether CI on the current exact head is terminal and green. */
+  isHeadCiGreen?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+  }): Promise<boolean>;
   /**
    * Post the cap-exhausted notice on the PR (#797). MUST be idempotent per
    * head: the implementation checks for an existing comment carrying
@@ -605,15 +675,37 @@ export async function ingestPullRequestEvent(
     return result;
   }
 
+  let headCiGreen = false;
   const priorAtDifferentHead = findAuthorizingPriorReview(prior, headSha);
   let repeatReason: string | null = null;
   if (priorAtDifferentHead?.verdict === 'changes_requested') {
+    // Persist this exact head's CI state only for an automatic re-review. The
+    // live evidence lookup has durable failure accounting, so initial reviews
+    // must not invoke it when progress/cap tracking cannot use the result.
+    // Fail closed: unavailable or unknown evidence is never recorded as green.
+    if (deps.isHeadCiGreen) {
+      try {
+        headCiGreen = await deps.isHeadCiGreen({ owner, repo, prNumber, headSha });
+      } catch {
+        headCiGreen = false;
+      }
+    }
     // CONSECUTIVE, not lifetime (#797): a hand-requested review that ran resets
     // the budget, so a PR converging on a later round is not permanently locked
     // out of automatic review.
     const maxAttempts = resolveMaxRereviewAttempts();
-    const rereviewAttempts = countConsecutiveAutoRereviews(prior);
-    if (rereviewAttempts >= maxAttempts) {
+    const maxTotalRereviews = resolveMaxTotalRereviews();
+    const rereviewAttempts = countConsecutiveAutoRereviews(prior, headSha, headCiGreen);
+    const totalRereviews = countTotalAutoRereviews(prior);
+    const blockedReason =
+      totalRereviews >= maxTotalRereviews
+        ? 'rereview_total_ceiling_reached'
+        : rereviewAttempts >= maxAttempts
+          ? 'rereview_attempts_exhausted'
+          : null;
+    if (blockedReason) {
+      const firedRule =
+        blockedReason === 'rereview_total_ceiling_reached' ? 'total' : 'consecutive';
       // SAY SO ON THE PR. The cap previously blocked with HTTP 200 and no
       // visible trace, so the author saw the reviewer simply go quiet.
       let commentPosted: boolean | null = null;
@@ -624,7 +716,14 @@ export async function ingestPullRequestEvent(
             repo,
             prNumber,
             headSha,
-            body: buildRereviewCapComment(headSha, maxAttempts),
+            body: buildRereviewCapComment(
+              headSha,
+              maxAttempts,
+              totalRereviews,
+              maxTotalRereviews,
+              firedRule,
+              rereviewAttempts
+            ),
             marker: rereviewCapCommentMarker(headSha),
           });
           commentPosted = outcome.posted;
@@ -637,7 +736,7 @@ export async function ingestPullRequestEvent(
       const result: IngestResult = {
         disposition: 'blocked',
         status: 200,
-        reason: 'rereview_attempts_exhausted',
+        reason: blockedReason,
         correlationId,
         headSha,
         ...(invalidatedMessageIds.length > 0 ? { invalidatedMessageIds } : {}),
@@ -650,10 +749,11 @@ export async function ingestPullRequestEvent(
         prNumber,
         headSha,
         disposition: result.disposition,
-        reason:
+        reason: `${result.reason}:consecutive=${rereviewAttempts}:total=${totalRereviews}${
           commentPosted === null
-            ? result.reason
-            : `${result.reason}:comment_${commentPosted ? 'posted' : 'existing_or_failed'}`,
+            ? ''
+            : `:comment_${commentPosted ? 'posted' : 'existing_or_failed'}`
+        }`,
       });
       return result;
     }
@@ -676,6 +776,7 @@ export async function ingestPullRequestEvent(
       baseRef,
       author,
       repeatReason,
+      headCiGreen,
     });
     const disposition: IngestDisposition = enqueued.alreadyExisted
       ? 'duplicate_delivery'
