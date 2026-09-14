@@ -290,12 +290,12 @@ TMP="$(mktemp -d)"
 mkdir -p "$TMP/shopops-api/tests" "$TMP/docs" "$TMP/node_modules/x/tests"
 printf 'x' > "$TMP/shopops-api/tests/test_x.js"
 printf 'x' > "$TMP/node_modules/x/tests/test_x.js"
-( cd "$TMP" && assert_eq "node tests/x.js rescued into the only depth-1 dir that has it" "cd shopops-api && node tests/test_x.js" "$(rst_rescue_subdir 'node tests/test_x.js')" )
-( cd "$TMP" && assert_eq "already cd-prefixed command untouched" "cd shopops-api && node tests/test_x.js" "$(rst_rescue_subdir 'cd shopops-api && node tests/test_x.js')" )
-( cd "$TMP" && assert_eq "path that exists at root untouched" "bun test shopops-api/tests/test_x.js" "$(rst_rescue_subdir 'bun test shopops-api/tests/test_x.js')" )
-( cd "$TMP" && assert_eq "path found nowhere untouched" "node tests/nope.js" "$(rst_rescue_subdir 'node tests/nope.js')" )
+assert_eq "node tests/x.js rescued into the only depth-1 dir that has it" "cd shopops-api && node tests/test_x.js" "$(cd "$TMP" && rst_rescue_subdir 'node tests/test_x.js')"
+assert_eq "already cd-prefixed command untouched" "cd shopops-api && node tests/test_x.js" "$(cd "$TMP" && rst_rescue_subdir 'cd shopops-api && node tests/test_x.js')"
+assert_eq "path that exists at root untouched" "bun test shopops-api/tests/test_x.js" "$(cd "$TMP" && rst_rescue_subdir 'bun test shopops-api/tests/test_x.js')"
+assert_eq "path found nowhere untouched" "node tests/nope.js" "$(cd "$TMP" && rst_rescue_subdir 'node tests/nope.js')"
 mkdir -p "$TMP/other/tests" && printf 'x' > "$TMP/other/tests/test_x.js"
-( cd "$TMP" && assert_eq "ambiguous (two candidate dirs) untouched" "node tests/test_x.js" "$(rst_rescue_subdir 'node tests/test_x.js')" )
+assert_eq "ambiguous (two candidate dirs) untouched" "node tests/test_x.js" "$(cd "$TMP" && rst_rescue_subdir 'node tests/test_x.js')"
 rm -rf "$TMP"
 
 echo "--- rst_tests_in_diff (temp git repo) ---"
@@ -317,26 +317,27 @@ TMP="$(mktemp -d)"
   printf 's\n' > tests/test_validate_prior_art_evidence.sh
   git add -A && git commit -qm change
   mkdir -p packages/y && printf 'u\n' > packages/y/z.spec.ts
-  OUT="$(rst_tests_in_diff "$BASE")"
-  assert_eq "bun runner groups committed + untracked test files; bash test at root; fixtures/helpers/run_all/_harness/src excluded" \
-    "$(printf 'cd shopops-api && node tests/test_b.js\nbash tests/test_validate_prior_art_evidence.sh\nbun test packages/x/src/a.test.ts packages/y/z.spec.ts')" "$OUT"
+  rst_tests_in_diff "$BASE" > "$TMP/out1"
   printf '{"name":"x","devDependencies":{"vitest":"^2"}}\n' > package.json
-  OUT="$(rst_tests_in_diff "$BASE")"
-  assert_contains "vitest declared in package.json -> npx vitest run" "npx vitest run packages/x/src/a.test.ts packages/y/z.spec.ts" "$OUT"
+  rst_tests_in_diff "$BASE" > "$TMP/out2"
   git checkout -q -- . 2>/dev/null; rm -f packages/y/z.spec.ts
-  assert_eq "no test files in diff -> empty" "" "$(rst_tests_in_diff HEAD)"
+  rst_tests_in_diff HEAD > "$TMP/out3"
 )
+assert_eq "bun runner groups committed + untracked test files; bash test at root; fixtures/helpers/run_all/_harness/src excluded" \
+  "$(printf 'cd shopops-api && node tests/test_b.js\nbash tests/test_validate_prior_art_evidence.sh\nbun test packages/x/src/a.test.ts packages/y/z.spec.ts')" "$(cat "$TMP/out1")"
+assert_contains "vitest declared in package.json -> npx vitest run" "npx vitest run packages/x/src/a.test.ts packages/y/z.spec.ts" "$(cat "$TMP/out2")"
+assert_eq "no test files in diff -> empty" "" "$(cat "$TMP/out3")"
 rm -rf "$TMP"
 
 echo "--- rst_repo_test_script (last rung) ---"
 TMP="$(mktemp -d)"
-( cd "$TMP" && assert_eq "no package.json -> empty" "" "$(rst_repo_test_script)" )
+assert_eq "no package.json -> empty" "" "$(cd "$TMP" && rst_repo_test_script)"
 printf '{"name":"x","scripts":{"build":"tsc"}}\n' > "$TMP/package.json"
-( cd "$TMP" && assert_eq "package.json without a test script -> empty" "" "$(rst_repo_test_script)" )
+assert_eq "package.json without a test script -> empty" "" "$(cd "$TMP" && rst_repo_test_script)"
 printf '{"name":"x","scripts":{"test":"vitest run"}}\n' > "$TMP/package.json"
-( cd "$TMP" && assert_eq "test script, no bun lockfile -> npm test" "npm test" "$(rst_repo_test_script)" )
+assert_eq "test script, no bun lockfile -> npm test" "npm test" "$(cd "$TMP" && rst_repo_test_script)"
 printf '{}\n' > "$TMP/bun.lock"
-( cd "$TMP" && assert_eq "test script + bun.lock -> bun run test" "bun run test" "$(rst_repo_test_script)" )
+assert_eq "test script + bun.lock -> bun run test" "bun run test" "$(cd "$TMP" && rst_repo_test_script)"
 rm -rf "$TMP"
 
 echo "--- rst_run_commands: two commands, counts summed, first nonzero exit kept ---"
@@ -352,13 +353,13 @@ echo " 1 fail"
 exit 1
 EOF
 printf 'bash ./ok.sh\nbash ./red.sh\n' > "$TMP/cmds"
-( cd "$TMP" && assert_eq "exit 1, 7 passed of 8" "1 7 8" "$(rst_run_commands ./cmds ./log)" )
+assert_eq "exit 1, 7 passed of 8" "1 7 8" "$(cd "$TMP" && rst_run_commands ./cmds ./log)"
 assert_contains "log carries per-command headers" "### run-stop-tests: bash ./red.sh" "$(cat "$TMP/log")"
 assert_contains "log carries per-command exit" "### exit 1" "$(cat "$TMP/log")"
 printf 'bash ./ok.sh\n' > "$TMP/cmds"
-( cd "$TMP" && assert_eq "single green command" "0 3 3" "$(rst_run_commands ./cmds ./log2)" )
+assert_eq "single green command" "0 3 3" "$(cd "$TMP" && rst_run_commands ./cmds ./log2)"
 printf 'true\n' > "$TMP/cmds"
-( cd "$TMP" && assert_eq "no counts parsed -> exit only" "0  " "$(rst_run_commands ./cmds ./log3)" )
+assert_eq "no counts parsed -> exit only" "0  " "$(cd "$TMP" && rst_run_commands ./cmds ./log3)"
 rm -rf "$TMP"
 
 echo
