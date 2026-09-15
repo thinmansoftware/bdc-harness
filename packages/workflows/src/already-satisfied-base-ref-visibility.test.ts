@@ -33,6 +33,7 @@ const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 const EXPECTED_PRECHECK_LANES = [
   'bdc-feature-development-codex-only.yaml',
   'bdc-feature-development-codex.yaml',
+  'bdc-feature-development-cursor.yaml',
   'bdc-feature-development-fable.yaml',
   'bdc-feature-development-fusion-cx-kimi.yaml',
   'bdc-feature-development-fusion-cx-qwen.yaml',
@@ -71,7 +72,7 @@ function precheckPrompt(file: string): string {
 }
 
 describe('already-satisfied base-ref visibility (WO-HARNESS-PRECHECK-BASE-REF-VISIBILITY-01)', () => {
-  it('discovers exactly the 14 expected precheck lanes', () => {
+  it('discovers exactly the 15 expected precheck lanes', () => {
     expect(PRECHECK_LANE_FILES).toEqual(EXPECTED_PRECHECK_LANES);
   });
 
@@ -236,7 +237,7 @@ async function runGate(file: string, checkOutput: string) {
 }
 
 describe('gate-already-satisfied disposition (behavioral)', () => {
-  it('executes exactly the 11 JSON-gate feature-development lanes', () => {
+  it('executes exactly the 12 JSON-gate feature-development lanes', () => {
     // The two Kimi canary lanes appear here only because they now carry the MODERN
     // gate node. They were cloned from fusion-cx-qwen before both the M-85 base-ref
     // fix AND the heredoc-to-shellQuote gate fix landed, so on arrival they had the
@@ -245,6 +246,7 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
     expect(JSON_GATE_FEATURE_LANES).toEqual([
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
+      'bdc-feature-development-cursor.yaml',
       'bdc-feature-development-fable.yaml',
       'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',

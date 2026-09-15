@@ -78,6 +78,11 @@ services:
       GITHUB_APP_INSTALLATION_ID: ${GITHUB_APP_INSTALLATION_ID:-}
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
       GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
+      # PR #848: Cursor rail (Overseer `cursor` judge rung + `cursor` provider).
+      # cursor-agent reads its credential from CURSOR_API_KEY when set; otherwise
+      # from ~/.cursor, seeded from the read-only mount below. NEVER a literal
+      # here -- value comes from .env (gitignored) or the host shell env.
+      CURSOR_API_KEY: ${CURSOR_API_KEY:-}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     volumes:
@@ -88,6 +93,13 @@ services:
       # read-only file, then set GITHUB_APP_PRIVATE_KEY_PATH=/run/secrets/thinman-overseer.pem
       # (keeps the key out of `docker compose config` output and process env).
       - ${GITHUB_APP_PRIVATE_KEY_HOST_PATH:-/dev/null}:/run/secrets/thinman-overseer.pem:ro
+      # PR #848: host cursor-agent credential directory (the ~/.cursor of the
+      # user who ran `cursor-agent login`), read-only. Set CURSOR_CONFIG_HOST_PATH
+      # in .env. Default /dev/null makes a missing path harmless: the entrypoint
+      # only seeds /home/appuser/.cursor when this target is a non-empty DIRECTORY.
+      # Not mounted over ~/.cursor directly: cursor-agent writes state there and a
+      # /dev/null default would turn ~/.cursor into a file on the persisted volume.
+      - ${CURSOR_CONFIG_HOST_PATH:-/dev/null}:/run/secrets/cursor-config:ro
       # WO-168 Tier 1: host-persistent artifact mount. Load-bearing workflow
       # nodes (bdc-author-wo-batch commit-and-push, etc.) write a git bundle +
       # raw artifacts here BEFORE attempting remote push, so worktree prune /

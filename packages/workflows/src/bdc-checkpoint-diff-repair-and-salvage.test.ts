@@ -23,6 +23,7 @@ const LANE_FILES = readdirSync(LANES_DIR)
 const EXPECTED_LANES = [
   'bdc-feature-development-codex-only.yaml',
   'bdc-feature-development-codex.yaml',
+  'bdc-feature-development-cursor.yaml',
   'bdc-feature-development-fable.yaml',
   'bdc-feature-development-fusion-cx-kimi.yaml',
   'bdc-feature-development-fusion-cx-qwen.yaml',
