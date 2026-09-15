@@ -223,10 +223,16 @@ export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
 }
 
 export async function getOverseerWatchRunById(runId: string): Promise<OverseerWatchRun | null> {
+  // Same codebase JOIN as listRunsForOverseerWatch. Without it codebase_name is
+  // never selected, parseRepo falls back to metadata (which no run writes), and
+  // the merge-execution bridge skips every run-backed verdict as
+  // run_context_unresolvable (bdc-harness #846: 141 skipped, 0 merged).
   const result = await getDatabase().query<WorkflowRunRow>(
-    `SELECT id, status, metadata, user_message, working_path
-     FROM remote_agent_workflow_runs
-     WHERE id = $1`,
+    `SELECT r.id, r.status, r.metadata, r.user_message, r.working_path,
+            c.name AS codebase_name
+     FROM remote_agent_workflow_runs r
+     LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
+     WHERE r.id = $1`,
     [runId]
   );
   return result.rows[0] ? normalizeRun(result.rows[0]) : null;

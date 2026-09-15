@@ -4,7 +4,11 @@ import {
   runMergeExecutionBridgeOnce,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
-import type { GitHubClientDeps, PullRequestEvidence } from '../types.ts';
+import type {
+  GitHubClientDeps,
+  GitHubPullRequestSearchInput,
+  PullRequestEvidence,
+} from '../types.ts';
 
 const verdict = (id: string, head = 'judged-sha'): OverseerVerdictRow =>
   ({
@@ -543,5 +547,175 @@ describe('merge execution bridge', () => {
       }),
     ]);
     expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
+  });
+});
+
+const RUNLESS_PR = 844;
+
+const runlessVerdict = (
+  id: string,
+  overrides: Partial<Pick<OverseerVerdictRow, 'run_id' | 'wo_id' | 'head_sha'>> = {}
+): OverseerVerdictRow =>
+  ({
+    id,
+    run_id: `pr-discovery:thinmansoftware/bdc-harness#${RUNLESS_PR}`,
+    wo_id: `gh:thinmansoftware/bdc-harness#${RUNLESS_PR}`,
+    head_sha: 'judged-sha',
+    proposed_action: 'flag_merge_ready',
+    ...overrides,
+  }) as OverseerVerdictRow;
+
+const runlessPr = (overrides: Partial<PullRequestEvidence> = {}): PullRequestEvidence =>
+  greenPr({
+    htmlUrl: `https://github.test/pr/${RUNLESS_PR}`,
+    pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: RUNLESS_PR },
+    ...overrides,
+  });
+
+function runlessHarness(rows: OverseerVerdictRow[], evidence = runlessPr()) {
+  const h = harness(rows, evidence);
+  const searches: GitHubPullRequestSearchInput[] = [];
+  let runLookups = 0;
+  h.store.getRunById = async () => {
+    runLookups += 1;
+    return null;
+  };
+  h.github.findPullRequest = async input => {
+    searches.push(input);
+    return evidence;
+  };
+  return { h, searches, runLookups: (): number => runLookups };
+}
+
+async function runOnce(h: ReturnType<typeof harness>): Promise<void> {
+  await runMergeExecutionBridgeOnce({
+    store: h.store,
+    github: h.github,
+    readPolicy: () => policy(),
+  });
+}
+
+describe('merge execution bridge -- run-less verdicts (#846)', () => {
+  test('(a) merges a run-less verdict on an open allowlisted PR via the same mutation path', async () => {
+    const { h, searches, runLookups } = runlessHarness([runlessVerdict('runless-ok')]);
+    const seen: { number?: number; expectedHeadSha?: string } = {};
+    const merge = h.github.mergePullRequest;
+    h.github.mergePullRequest = async input => {
+      seen.number = input.number;
+      seen.expectedHeadSha = input.expectedHeadSha;
+      return merge(input);
+    };
+    await runOnce(h);
+    expect(runLookups()).toBe(0);
+    expect(searches).toEqual([
+      {
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: RUNLESS_PR,
+        includeChangedFiles: true,
+      },
+    ]);
+    expect(h.merges).toBe(1);
+    expect(h.approvals).toBe(1);
+    expect(h.occupied).toBe(1);
+    expect(seen).toEqual({ number: RUNLESS_PR, expectedHeadSha: 'judged-sha' });
+    expect(h.outcomes).toEqual([
+      expect.objectContaining({
+        verdictId: 'runless-ok',
+        mutationSent: true,
+        reason: 'merge_executed',
+      }),
+    ]);
+  });
+
+  test('(b) skips a run-less verdict whose PR targets a base outside the allowlist', async () => {
+    const { h, searches } = runlessHarness(
+      [runlessVerdict('runless-base')],
+      runlessPr({ baseBranch: 'master' })
+    );
+    await runOnce(h);
+    expect(searches).toHaveLength(1);
+    expect(h.merges).toBe(0);
+    expect(h.occupied).toBe(0);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: false, reason: 'base_not_allowlisted' })
+    );
+  });
+
+  test.each([
+    ['(c) closed PR', runlessPr({ state: 'closed' }), 'pr_not_open'],
+    ['(c) merged PR', runlessPr({ state: 'merged' }), 'pr_not_open'],
+    ['(d) moved head', runlessPr({ headSha: 'moved' }), 'head_moved'],
+    [
+      '(e) lookup failed',
+      runlessPr({ exists: false, state: 'lookup_failed', pr: undefined, lookupFailed: true }),
+      'pr_context_unresolvable',
+    ],
+  ])('%s is recorded honestly with no mutation', async (_label, evidence, reason) => {
+    const { h } = runlessHarness([runlessVerdict('runless-skip')], evidence);
+    await runOnce(h);
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.occupied).toBe(0);
+    expect(h.outcomes[0]).toEqual(expect.objectContaining({ mutationSent: false, reason }));
+  });
+
+  test('(e) records pr_context_unresolvable and sends no mutation when the fetch throws', async () => {
+    const { h } = runlessHarness([runlessVerdict('runless-throws')]);
+    h.github.findPullRequest = async () => {
+      throw new Error('github unavailable');
+    };
+    await runOnce(h);
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.occupied).toBe(0);
+    expect(h.claimReleases).toEqual([]);
+    expect(h.outcomes).toEqual([
+      expect.objectContaining({
+        verdictId: 'runless-throws',
+        mutationSent: false,
+        reason: 'pr_context_unresolvable',
+      }),
+    ]);
+    expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
+  });
+
+  test('(f) a verdict WITH a run id whose run row is missing still records run_context_unresolvable', async () => {
+    const { h, searches, runLookups } = runlessHarness([verdict('run-gone')]);
+    await runOnce(h);
+    expect(runLookups()).toBe(1);
+    expect(searches).toEqual([]);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('run_context_unresolvable');
+  });
+
+  test('resolves the PR from a gh: wo_id when the run id is empty', async () => {
+    const { h, searches } = runlessHarness([runlessVerdict('runless-wo', { run_id: '' })]);
+    await runOnce(h);
+    expect(searches[0]?.prNumber).toBe(RUNLESS_PR);
+    expect(h.merges).toBe(1);
+  });
+
+  test('records pr_context_unresolvable without calling GitHub when no PR identity exists', async () => {
+    const { h, searches } = runlessHarness([
+      runlessVerdict('runless-blank', { run_id: '', wo_id: 'WO-TEST' }),
+    ]);
+    await runOnce(h);
+    expect(searches).toEqual([]);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('pr_context_unresolvable');
+  });
+
+  test('records repo_not_allowed without calling GitHub for a run-less PR outside the allowlist', async () => {
+    const { h, searches } = runlessHarness([
+      runlessVerdict('runless-repo', {
+        run_id: 'pr-discovery:other-org/bdc-harness#7',
+        wo_id: 'gh:other-org/bdc-harness#7',
+      }),
+    ]);
+    await runOnce(h);
+    expect(searches).toEqual([]);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
   });
 });
