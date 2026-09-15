@@ -11,6 +11,13 @@
  *   thinmansoftware/lspro-react -> dev
  * Lookup compares BOTH run.owner and run.repo; mismatch -> skip('repo_not_allowed').
  *
+ * Run-less verdicts (bdc-harness #846): a PR-first candidate has no run row, so
+ * its verdict carries the PR identity in the synthetic `pr-discovery:owner/repo#N`
+ * run id (or a `gh:owner/repo#N` wo_id). The bridge resolves those from GitHub by
+ * PR number and applies the same allowlist to the live base. Their skip reasons
+ * are `pr_context_unresolvable`, `pr_not_open`, `head_moved`, `base_not_allowlisted`;
+ * `run_context_unresolvable` stays reserved for a real run id whose row is gone.
+ *
  * Ceiling (OVERSEER_MAX_MERGES_PER_HOUR, default 4): occupancy is reserved
  * atomically in durable storage before any GitHub merge mutation. A failed
  * merge releases its reservation; a successful merge keeps it for the window.
@@ -18,8 +25,9 @@
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
+import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
 import { isSpecOnlyChangeSet } from './reconcile';
-import type { GitHubClientDeps } from './types.ts';
+import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
 
 const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
@@ -151,6 +159,171 @@ async function recordPostMutationOutcome(
   }
 }
 
+type SkipVerdict = (reason: string, prUrl?: string) => Promise<void>;
+
+interface MergeTarget {
+  pr: PullRequestEvidence;
+  config: { readonly baseBranch: string };
+}
+
+interface RunlessPullRef {
+  owner: string;
+  repo: string;
+  prNumber: number;
+}
+
+/** `wo_id` shape the PR-first sweep mints when a PR carries no WO id. */
+const WO_ID_PULL_REF_PREFIX = 'gh:';
+const PULL_REF_PATTERN = /^([^\s/#]+)\/([^\s/#]+)#(\d+)$/;
+
+function parsePullRef(value: string, prefix: string): RunlessPullRef | null {
+  if (!value.startsWith(prefix)) return null;
+  const match = PULL_REF_PATTERN.exec(value.slice(prefix.length));
+  const owner = match?.[1];
+  const repo = match?.[2];
+  const prNumber = Number.parseInt(match?.[3] ?? '', 10);
+  if (!owner || !repo || !Number.isSafeInteger(prNumber) || prNumber <= 0) return null;
+  return { owner, repo, prNumber };
+}
+
+/**
+ * A verdict no Cauldron run produced (bdc-harness #846). The verdict store keys
+ * rows by run id, so the PR-first sweep mints a synthetic `pr-discovery:` run id
+ * (buildDiscoveredCandidateRecord) that no run row will ever match. An empty
+ * run id is treated the same way. The typeof guards cover a NULL that reached
+ * the row despite the column constraint; the column type says string.
+ */
+function isRunlessVerdict(verdict: OverseerVerdictRow): boolean {
+  const runId = typeof verdict.run_id === 'string' ? verdict.run_id.trim() : '';
+  return runId === '' || runId.startsWith(PR_DISCOVERY_RUN_ID_PREFIX);
+}
+
+function runlessPullRef(verdict: OverseerVerdictRow): RunlessPullRef | null {
+  const runId = typeof verdict.run_id === 'string' ? verdict.run_id : '';
+  const woId = typeof verdict.wo_id === 'string' ? verdict.wo_id : '';
+  return (
+    parsePullRef(runId, PR_DISCOVERY_RUN_ID_PREFIX) ?? parsePullRef(woId, WO_ID_PULL_REF_PREFIX)
+  );
+}
+
+/**
+ * Resolve a run-less verdict's merge target from GitHub itself. The PR is
+ * addressed by NUMBER (the only unique key GitHub offers; the real adapter maps
+ * this to `pulls.get`), so state/head/base read here are the live PR, not a
+ * branch-name guess. Backlog replay is bounded here: only an OPEN PR whose
+ * current head still equals the judged head reaches the shared tail, and the
+ * hourly slot ceiling in that tail is unchanged. The owner/repo allowlist is
+ * checked BEFORE the fetch so a non-allowlisted backlog row costs no API call.
+ */
+async function resolveRunlessTarget(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  repoConfig: MergeExecutionRepoConfig,
+  skip: SkipVerdict
+): Promise<MergeTarget | null> {
+  const ref = runlessPullRef(verdict);
+  if (!ref) {
+    await skip('pr_context_unresolvable');
+    return null;
+  }
+  const config = repoConfig[`${ref.owner}/${ref.repo}`];
+  if (!config) {
+    await skip('repo_not_allowed');
+    return null;
+  }
+  let pr: PullRequestEvidence;
+  try {
+    pr = await options.github.findPullRequest({
+      owner: ref.owner,
+      repo: ref.repo,
+      prNumber: ref.prNumber,
+      includeChangedFiles: true,
+    });
+  } catch (error) {
+    log.warn(
+      {
+        err: error as Error,
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        owner: ref.owner,
+        repo: ref.repo,
+        prNumber: ref.prNumber,
+      },
+      'merge-coordinator.pr_context_fetch_failed'
+    );
+    await skip('pr_context_unresolvable');
+    return null;
+  }
+  if (!pr.exists || pr.pr?.number !== ref.prNumber) {
+    await skip('pr_context_unresolvable', pr.htmlUrl);
+    return null;
+  }
+  log.info(
+    {
+      verdictId: verdict.id,
+      runId: verdict.run_id,
+      woId: verdict.wo_id,
+      owner: ref.owner,
+      repo: ref.repo,
+      prNumber: ref.prNumber,
+      state: pr.state,
+      baseBranch: pr.baseBranch,
+      headSha: pr.headSha,
+      verdictHeadSha: verdict.head_sha,
+      prUrl: pr.htmlUrl,
+    },
+    'merge-coordinator.pr_context_resolved_from_github'
+  );
+  if (pr.state !== 'open') {
+    await skip('pr_not_open', pr.htmlUrl);
+    return null;
+  }
+  if (pr.headSha !== verdict.head_sha) {
+    await skip('head_moved', pr.htmlUrl);
+    return null;
+  }
+  if (pr.baseBranch !== config.baseBranch) {
+    await skip('base_not_allowlisted', pr.htmlUrl);
+    return null;
+  }
+  return { pr, config };
+}
+
+/**
+ * Resolve the PR and allowlist entry a verdict points at. Run-backed verdicts
+ * keep the run-row path unchanged; `run_context_unresolvable` stays reserved
+ * for "a run id is referenced but the row (or its repo identity) is gone".
+ * Everything after this -- slot reservation, claim/release, the expectedHeadSha
+ * precondition, the rate ceiling, recordPostMutationOutcome -- is shared.
+ */
+async function resolveMergeTarget(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  repoConfig: MergeExecutionRepoConfig,
+  skip: SkipVerdict
+): Promise<MergeTarget | null> {
+  if (isRunlessVerdict(verdict)) return resolveRunlessTarget(options, verdict, repoConfig, skip);
+  const run = await options.store.getRunById(verdict.run_id);
+  if (!run?.owner || !run.repo) {
+    await skip('run_context_unresolvable');
+    return null;
+  }
+  const config = repoConfig[`${run.owner}/${run.repo}`];
+  if (!config) {
+    await skip('repo_not_allowed');
+    return null;
+  }
+  const pr = await options.github.findPullRequest({
+    owner: run.owner,
+    repo: run.repo,
+    headBranch: run.headBranch,
+    woId: run.woId,
+    includeChangedFiles: true,
+  });
+  return { pr, config };
+}
+
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
@@ -187,24 +360,9 @@ async function mergeClaimedVerdict(
     return undefined;
   }
 
-  const run = await options.store.getRunById(verdict.run_id);
-  if (!run?.owner || !run.repo) {
-    await skip('run_context_unresolvable');
-    return undefined;
-  }
-  const config = repoConfig[`${run.owner}/${run.repo}`];
-  if (!config) {
-    await skip('repo_not_allowed');
-    return undefined;
-  }
-
-  const pr = await options.github.findPullRequest({
-    owner: run.owner,
-    repo: run.repo,
-    headBranch: run.headBranch,
-    woId: run.woId,
-    includeChangedFiles: true,
-  });
+  const target = await resolveMergeTarget(options, verdict, repoConfig, skip);
+  if (!target) return undefined;
+  const { pr, config } = target;
   if (!pr.exists || !pr.pr) {
     await skip(pr.lookupFailed ? 'pr_lookup_failed' : 'open_pr_not_found', pr.htmlUrl);
     return undefined;
