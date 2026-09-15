@@ -221,6 +221,12 @@ async function mergeClaimedVerdict(
     await skip('required_checks_not_success', pr.htmlUrl);
     return undefined;
   }
+  // Conflicts are a distinct operator-visible skip: a generic not-clean
+  // reason hid DIRTY PRs inside the same bucket as blocked/unstable.
+  if (pr.mergeableState === 'dirty') {
+    await skip('not_mergeable_dirty', pr.htmlUrl);
+    return undefined;
+  }
   if (pr.mergeable !== true || pr.mergeableState !== 'clean') {
     await skip('mergeable_state_not_clean', pr.htmlUrl);
     return undefined;

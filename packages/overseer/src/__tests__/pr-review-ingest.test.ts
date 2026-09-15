@@ -452,3 +452,69 @@ describe('failure handling and receipts', () => {
     expect(result.disposition).toBe('queued');
   });
 });
+
+describe('dirty mergeable_state (#845)', () => {
+  const LIVE_BASE_SHA = 'd'.repeat(40);
+
+  function mergeabilityDeps(
+    state: string | undefined,
+    throws = false
+  ): { deps: IngestDeps; rec: Recorded } {
+    return makeDeps({
+      fetchPullRequestMergeability: async () => {
+        if (throws) throw new Error('github_unavailable');
+        return { mergeableState: state, baseRef: 'dev', baseSha: LIVE_BASE_SHA };
+      },
+    });
+  }
+
+  test('dirty writes a blocked base_not_incorporated receipt and does not enqueue', async () => {
+    const { deps, rec } = mergeabilityDeps('dirty');
+    const result = await ingestPullRequestEvent(req(prPayload()), deps);
+    const reason = `base_not_incorporated:dev@${LIVE_BASE_SHA}`;
+    expect(result.disposition).toBe('blocked');
+    expect(result.status).toBe(200);
+    expect(result.reason).toBe(reason);
+    expect(rec.enqueued).toHaveLength(0);
+    expect(rec.receipts).toHaveLength(1);
+    expect(rec.receipts[0]?.disposition).toBe('blocked');
+    expect(rec.receipts[0]?.reason).toBe(reason);
+    expect(rec.receipts[0]?.headSha).toBe(HEAD);
+    expect(rec.receipts[0]?.prNumber).toBe(673);
+  });
+
+  test.each(['unknown', 'clean'] as const)('mergeable_state %s still enqueues', async state => {
+    const { deps, rec } = mergeabilityDeps(state);
+    const result = await ingestPullRequestEvent(req(prPayload()), deps);
+    expect(result.disposition).toBe('queued');
+    expect(rec.enqueued).toHaveLength(1);
+  });
+
+  test('a fetch error is treated as unknown and still enqueues', async () => {
+    const { deps, rec } = mergeabilityDeps('dirty', true);
+    const result = await ingestPullRequestEvent(req(prPayload()), deps);
+    expect(result.disposition).toBe('queued');
+    expect(rec.enqueued).toHaveLength(1);
+  });
+
+  test('re-ingest of the same head after the PR is mergeable enqueues', async () => {
+    let state = 'dirty';
+    const { deps, rec } = makeDeps({
+      fetchPullRequestMergeability: async () => ({
+        mergeableState: state,
+        baseRef: 'dev',
+        baseSha: LIVE_BASE_SHA,
+      }),
+    });
+    const first = await ingestPullRequestEvent(req(prPayload()), deps);
+    expect(first.disposition).toBe('blocked');
+    expect(rec.enqueued).toHaveLength(0);
+    state = 'clean';
+    const second = await ingestPullRequestEvent(
+      req(prPayload(), { deliveryId: 'delivery-2' }),
+      deps
+    );
+    expect(second.disposition).toBe('queued');
+    expect(rec.enqueued).toHaveLength(1);
+  });
+});

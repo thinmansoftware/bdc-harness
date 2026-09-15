@@ -49,3 +49,23 @@ merge-steward path, where fail-closed remains correct.
 
 One primary verdict per `(run_id, head_sha)` (unique index, claim-before-call in
 `claimOverseerVerdict`). Replay never re-bills a model call and never re-acts.
+
+## PR review ingest receipts
+
+Every `pull_request` ingest writes one `pr_review_ingest_receipt` into
+`agent_dispatch_messages` (`task_type: run_report`, `recipient: operator`).
+Dispositions: `queued`, `duplicate_delivery`, `superseded_head`,
+`ignored_event`, `ignored_draft`, `rejected_signature`, `custody_conflict`,
+`blocked`.
+
+`blocked` reasons include the existing fail-closed codes (`webhook_secret_not_configured`,
+`payload_unparseable`, `incomplete_pull_request_context`, `rereview_attempts_exhausted`,
+`rereview_total_ceiling_reached`, `enqueue_failed:...`) and:
+
+- `base_not_incorporated:<baseRef>@<baseSha>` -- GitHub `pulls.get` reported
+  `mergeable_state: dirty` (content conflict with the current base). Review is
+  not queued. Base ref and SHA come from that `pulls.get` payload. The receipt
+  is per delivery, not sticky: a later ingest of the same head after the PR is
+  mergeable enqueues normally. `unknown` / omitted `mergeable_state` must not
+  block: GitHub returns those while it is still computing mergeability, and
+  treating them as conflicts would drop every fresh PR from review. (#845)
