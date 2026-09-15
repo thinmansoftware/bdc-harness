@@ -606,6 +606,15 @@ export function resolveReviewModelTimeoutMs(
  *   (`grok --help`, verified in the container 2026-09-07). The prompt is
  *   written to a temp file and the PATH is passed, which is a short argument.
  *   `-p/--single` takes the prompt inline and is exactly what must be avoided.
+ * - `cursor`: `cursor-agent --print --mode ask --trust --model <MODEL>` with
+ *   the prompt on stdin. `--print` with no inline prompt argument reads the
+ *   prompt from stdin (this tree's own record: scripts/dispatch-worker/
+ *   adapters.ts, promptDelivery 'stdin' -- "claude -p, codex exec,
+ *   cursor-agent --print"). cursor-agent has no --prompt-file flag anywhere in
+ *   this tree, so stdin is the only argv-free transport. `--mode ask` is
+ *   READ-ONLY (both `ask` and `plan` are; see adapters.ts `cursor-build`),
+ *   which is exactly right for a judge. The model is selected per call from
+ *   OVERSEER_CURSOR_JUDGE_MODEL (default DEFAULT_CURSOR_JUDGE_MODEL).
  */
 interface ReviewModelTransport {
   argv: string[];
@@ -648,6 +657,21 @@ async function writePrivatePromptFile(
   return { promptFile, promptDir };
 }
 
+/**
+ * Default model for the `cursor` judge rung. One of the ids returned by
+ * `cursor-agent --list-models` on the operator account (verified live
+ * 2026-09-15). Override with OVERSEER_CURSOR_JUDGE_MODEL; a blank value falls
+ * back to the default rather than producing `--model ''`.
+ */
+export const DEFAULT_CURSOR_JUDGE_MODEL = 'claude-fable-5-1-thinking-high';
+
+export function resolveCursorJudgeModel(
+  env: Record<string, string | undefined> = process.env
+): string {
+  const configured = env.OVERSEER_CURSOR_JUDGE_MODEL;
+  return nonEmpty(configured) ? configured.trim() : DEFAULT_CURSOR_JUDGE_MODEL;
+}
+
 /** Exported for the permission test; not part of the review API surface. */
 export async function buildReviewModelTransport(
   binary: string,
@@ -656,6 +680,21 @@ export async function buildReviewModelTransport(
   if (binary === 'codex') {
     return {
       argv: ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check'],
+      stdinPrompt: prompt,
+    };
+  }
+  if (binary === 'cursor') {
+    // Read-only ask mode on the Cursor rail; prompt on stdin, never in argv.
+    return {
+      argv: [
+        'cursor-agent',
+        '--print',
+        '--mode',
+        'ask',
+        '--trust',
+        '--model',
+        resolveCursorJudgeModel(),
+      ],
       stdinPrompt: prompt,
     };
   }
@@ -830,6 +869,11 @@ function destroyStdin(stdin: unknown): void {
 }
 
 function normalizeModelOutput(binary: string, stdout: string): string {
+  // cursor-agent --print returns the assistant's final text verbatim; models
+  // routinely wrap a JSON answer in a markdown fence, which JSON.parse rejects.
+  // Stripping ONE outer fence is presentation, not judgment: an answer that is
+  // not the required JSON object still fails parseReviewVerdict as before.
+  if (binary === 'cursor') return stripMarkdownFence(stdout);
   if (binary !== 'codex') return stdout;
   const lines = stdout.split(/\r?\n/);
   const start = lines.lastIndexOf('codex');
@@ -837,6 +881,12 @@ function normalizeModelOutput(binary: string, stdout: string): string {
   const rest = lines.slice(start + 1);
   const end = rest.findIndex(line => /^tokens used/i.test(line.trim()));
   return (end === -1 ? rest : rest.slice(0, end)).join('\n').trim();
+}
+
+function stripMarkdownFence(text: string): string {
+  const trimmed = text.trim();
+  const match = /^```[A-Za-z0-9_-]*\r?\n([\s\S]*?)\r?\n```$/.exec(trimmed);
+  return match?.[1]?.trim() ?? trimmed;
 }
 
 function errorMessage(error: unknown): string {

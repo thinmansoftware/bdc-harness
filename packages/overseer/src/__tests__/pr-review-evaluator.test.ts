@@ -8,12 +8,16 @@ import {
   resetRequiredContextsAttemptCounters,
 } from '../adapters/required-contexts.ts';
 import {
+  buildReviewModelTransport,
   buildReviewPrompt,
   checksAreTerminal,
   evaluatePullRequest,
   parseReviewVerdict,
+  runReviewModelProcess,
+  DEFAULT_CURSOR_JUDGE_MODEL,
   type PrReviewDeps,
   type PrReviewInput,
+  type ReviewModelSpawn,
 } from '../pr-review-evaluator.ts';
 
 // The required-contexts resolver counts CONSECUTIVE unknown attempts per
@@ -568,5 +572,117 @@ describe('governed PR-code reviewer', () => {
     expect(result.verdict).toBe('CHECKS_PENDING');
     expect(result.error).toBe('checks_pending');
     expect(modelInvoked).toBe(false);
+  });
+});
+
+// PR #848 -- the CURSOR rail as a judge rung. Both configured rungs
+// (codex, grok) are dead (usage limit / defunded credits), so every review
+// since 2026-09-14 returned INDETERMINATE model_exit_nonzero. A third rung on
+// the Cursor subscription must be able to return a determinate verdict.
+describe('cursor judge rung', () => {
+  const prevModel = process.env.OVERSEER_CURSOR_JUDGE_MODEL;
+  const prevLadder = process.env.OVERSEER_JUDGE_LADDER;
+
+  function restoreEnv(): void {
+    if (prevModel === undefined) delete process.env.OVERSEER_CURSOR_JUDGE_MODEL;
+    else process.env.OVERSEER_CURSOR_JUDGE_MODEL = prevModel;
+    if (prevLadder === undefined) delete process.env.OVERSEER_JUDGE_LADDER;
+    else process.env.OVERSEER_JUDGE_LADDER = prevLadder;
+  }
+
+  test('23 transport spawns cursor-agent in read-only ask mode with the default model', async () => {
+    delete process.env.OVERSEER_CURSOR_JUDGE_MODEL;
+    try {
+      const prompt = `review this ${'x'.repeat(150_000)}`;
+      const transport = await buildReviewModelTransport('cursor', prompt);
+      expect(DEFAULT_CURSOR_JUDGE_MODEL).toBe('claude-fable-5-1-thinking-high');
+      expect(transport.argv).toEqual([
+        'cursor-agent',
+        '--print',
+        '--mode',
+        'ask',
+        '--trust',
+        '--model',
+        DEFAULT_CURSOR_JUDGE_MODEL,
+      ]);
+      // The prompt travels on stdin; no argv element may carry any of it.
+      expect(transport.stdinPrompt).toBe(prompt);
+      expect(transport.promptFile).toBeUndefined();
+      expect(transport.promptDir).toBeUndefined();
+      for (const arg of transport.argv) {
+        expect(arg.length).toBeLessThan(200);
+        expect(arg).not.toContain('review this');
+        expect(arg).not.toContain('x'.repeat(100));
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('24 transport honours OVERSEER_CURSOR_JUDGE_MODEL and ignores a blank value', async () => {
+    try {
+      process.env.OVERSEER_CURSOR_JUDGE_MODEL = 'gpt-5.6-sol-high';
+      const configured = await buildReviewModelTransport('cursor', 'p');
+      expect(configured.argv.slice(-2)).toEqual(['--model', 'gpt-5.6-sol-high']);
+
+      process.env.OVERSEER_CURSOR_JUDGE_MODEL = '   ';
+      const blank = await buildReviewModelTransport('cursor', 'p');
+      expect(blank.argv.slice(-2)).toEqual(['--model', DEFAULT_CURSOR_JUDGE_MODEL]);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('25 ladder codex,grok,cursor: two dead rungs then a cursor verdict is determinate', async () => {
+    try {
+      process.env.OVERSEER_JUDGE_LADDER = 'codex,grok,cursor';
+      const invoked: string[] = [];
+      const result = await evaluatePullRequest(
+        input,
+        deps({
+          // undefined -> evaluator falls back to OVERSEER_JUDGE_LADDER.
+          ladder: undefined,
+          invokeModel: async binary => {
+            invoked.push(binary);
+            if (binary === 'cursor') {
+              return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
+            }
+            // What the dead rungs print today: model_exit_nonzero.
+            return { exitCode: 1, timedOut: false, stdout: '' };
+          },
+        })
+      );
+      expect(invoked).toEqual(['codex', 'grok', 'cursor']);
+      expect(result.verdict).toBe('APPROVE');
+      expect(result.reviewer).toEqual({ provider: 'test-provider', model: 'cursor' });
+      expect(result.error).toBeUndefined();
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('26 a fenced JSON answer from cursor-agent still satisfies parseReviewVerdict', async () => {
+    const fenced = '```json\n' + output('APPROVE') + '\n```\n';
+    const spawn: ReviewModelSpawn = () => ({
+      stdin: null,
+      stdout: new Response(fenced).body,
+      stderr: new Response('').body,
+      exited: Promise.resolve(0),
+      kill: (): void => undefined,
+    });
+    const result = await runReviewModelProcess(
+      { argv: ['cursor-agent', '--print'], stdinPrompt: 'p' },
+      'cursor',
+      5_000,
+      spawn
+    );
+    expect(result.exitCode).toBe(0);
+    expect(parseReviewVerdict(result.stdout)?.verdict).toBe('APPROVE');
+    // Unfenced output is passed through unchanged.
+    expect(
+      parseReviewVerdict(
+        output('REQUEST_CHANGES', [{ scope: 'a.ts', severity: 'major', summary: 'x' }])
+      )?.verdict
+    ).toBe('REQUEST_CHANGES');
   });
 });
