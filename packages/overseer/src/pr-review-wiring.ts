@@ -37,10 +37,12 @@ import type { IngestDeps, PriorReviewWork, PullRequestMergeability } from './pr-
 import {
   configuredReviewIdentity,
   checksAreTerminal,
+  defaultReviewLadder,
   evaluatePullRequest,
   invokeConfiguredReviewModel,
   reviewErrorCode,
 } from './pr-review-evaluator';
+import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-health';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
 
@@ -548,6 +550,27 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
     webhookSecret: config.webhookSecret,
     reviewerIdentity: config.reviewerIdentity,
 
+    // JUDGE LADDER BREAKER (#847). Records live in judge-ladder-health.ts
+    // (process memory). The hourly notice rides Dispatch as an agent_message
+    // whose idempotency key IS the hour, so a restart inside the same hour
+    // cannot send a second one even though the in-memory hour marker is gone.
+    judgeLadderBreaker: createJudgeLadderBreaker({
+      ladder: defaultReviewLadder(),
+      async sendOperatorMessage(input): Promise<void> {
+        await dispatch.createAuthenticatedMessage(
+          { kind: 'system', sender: REVIEW_SENDER },
+          {
+            correlation_id: input.idempotencyKey,
+            idempotency_key: input.idempotencyKey,
+            task_type: 'agent_message',
+            recipient: 'operator',
+            priority: 'blocker',
+            body: input.body,
+          }
+        );
+      },
+    }),
+
     async isHeadCiGreen(input): Promise<boolean> {
       const evidence = await createRealFetchExactHeadPullRequestEvidence(
         createRealOctokitClient(),
@@ -852,6 +875,9 @@ export function createRealSubmitDeps(
           // Missing criteria is an explicit, recorded degrade path.
           fetchAcceptanceCriteria: async () => null,
           invokeModel: overrides.invokeModel ?? invokeConfiguredReviewModel,
+          // #847: every rung refusal (quota, credits, auth) and every clean
+          // exit is recorded so ingest can stop spawning a dead ladder.
+          recordRungOutage: recordJudgeRungOutage,
         }
       );
       // CHECKS_PENDING is a non-terminal defer, NOT a verdict. Surface it as a
@@ -923,10 +949,16 @@ export function createRealSubmitDeps(
           : result.verdict === 'INDETERMINATE'
             ? buildIndeterminateSummary(result.error)
             : 'No blocking findings.';
+      // #847: the INDETERMINATE reason code travels to the submit receipt as
+      // well as the PR body, so the event store says WHY (usage_limit_until,
+      // provider_credits_exhausted, auth_expired) without a container probe.
+      const indeterminateCode =
+        result.verdict === 'INDETERMINATE' ? reviewErrorCode(result.error) : null;
       return {
         approved: result.verdict === 'APPROVE',
         summary,
         reviewedHeadSha: result.reviewed_head_sha,
+        ...(indeterminateCode ? { reasonCode: indeterminateCode } : {}),
       };
     },
     submitReview: createRealSubmitPullRequestReview(octokit),

@@ -50,6 +50,41 @@ merge-steward path, where fail-closed remains correct.
 One primary verdict per `(run_id, head_sha)` (unique index, claim-before-call in
 `claimOverseerVerdict`). Replay never re-bills a model call and never re-acts.
 
+## Judge ladder outages and the ladder-exhausted breaker (#847)
+
+When a PR-review judge rung exits non-zero or throws, `pr-review-evaluator.ts`
+classifies its stderr/stdout tail (`classifyJudgeOutage` in
+`judge-ladder-health.ts`) before falling back to `model_exit_nonzero:<binary>`:
+
+| Rung text | Reason code |
+|---|---|
+| Codex `You've hit your usage limit ... try again at <date>` | `usage_limit_until:<ISO-8601 UTC>` (`usage_limit` when the date cannot be parsed) |
+| xAI / grok `insufficient credits`, `402`, `payment required` | `provider_credits_exhausted` |
+| `401`, `unauthorized`, `Authentication required`, invalid API key | `auth_expired` |
+
+These are JUDGMENT failures (the process ran), so the attempt is terminal
+exactly as before: the PR review says `Reason code: <code>` and the submit
+receipt carries `reason: indeterminate:<code>`.
+
+**Breaker.** Each classified refusal is recorded per rung binary in process
+memory (`judge-ladder-health.ts`: a Map keyed by binary, a Map of parked heads
+keyed by correlation id, and the hour of the last notice; a clean exit clears
+the rung). When EVERY rung in `OVERSEER_JUDGE_LADDER` has a record in force --
+stated retry time in the future, or a credit/auth record under 60 minutes old
+-- `pr-review-ingest` parks the head instead of enqueueing: ingest receipt
+`blocked` / `judge_ladder_exhausted_until:<earliest ISO>`, no `run_review`
+row, no review on the PR, and one Dispatch `agent_message` to `operator`
+(priority `blocker`, idempotency key `judge-ladder-exhausted:<YYYY-MM-DDTHH>`)
+per hour naming the rungs, their codes, the earliest retry, and the parked
+heads. Recovery: the review worker tick re-enqueues parked heads
+(`repeat_reason` `judge_ladder_recovered:<sha>`) once the ladder is open; an
+operator `run_review` whose `repeat_reason` starts
+`operator_request:ladder_restored` clears the records and runs immediately.
+On restart all records are empty: one review re-spawns the ladder, the breaker
+re-trips, and heads parked before the restart are not auto-recovered (their
+trail is the `blocked` receipt and the notice). The check-completion ingest and
+the stale-verdict sweep do not consult the breaker.
+
 ## PR review ingest receipts
 
 Every `pull_request` ingest writes one `pr_review_ingest_receipt` into
@@ -69,3 +104,7 @@ Dispositions: `queued`, `duplicate_delivery`, `superseded_head`,
   mergeable enqueues normally. `unknown` / omitted `mergeable_state` must not
   block: GitHub returns those while it is still computing mergeability, and
   treating them as conflicts would drop every fresh PR from review. (#845)
+- `judge_ladder_exhausted_until:<ISO>` -- every configured judge rung is out of
+  quota, credits, or credentials, so the head is parked rather than reviewed.
+  See the breaker section above. Checked BEFORE the mergeability read: a parked
+  head does not spend a GitHub call. (#847)

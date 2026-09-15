@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
+import { classifyJudgeOutage, type JudgeOutage } from './judge-ladder-health';
 
 /**
  * CHECKS_UNAVAILABLE (#775) is TERMINAL and NON-APPROVING: the required
@@ -94,6 +95,12 @@ export interface PrReviewModelResult {
   exitCode: number;
   stdout: string;
   timedOut: boolean;
+  /**
+   * Raw stderr of the judge process (#847). `stdout` falls back to stderr only
+   * when stdout is empty, so a refusal printed alongside partial stdout was
+   * invisible to classification. Optional so existing doubles keep compiling.
+   */
+  stderr?: string;
 }
 
 export interface PrReviewDeps {
@@ -127,6 +134,14 @@ export interface PrReviewDeps {
   fetchAcceptanceCriteria(woId: string): Promise<string | null>;
   invokeModel(binary: string, prompt: string): Promise<PrReviewModelResult>;
   ladder?: readonly string[];
+  /**
+   * Per-rung outage seam (#847). Called with the classified quota / credit /
+   * auth refusal when a rung is refused, and with `null` when a rung exits 0
+   * (proof the rung is back). The real binding is `recordJudgeRungOutage` in
+   * judge-ladder-health.ts; test doubles collect the calls. Optional so
+   * existing dependency doubles keep compiling.
+   */
+  recordRungOutage?(binary: string, outage: JudgeOutage | null): void;
 }
 
 interface ParsedReviewVerdict {
@@ -520,9 +535,19 @@ export async function evaluatePullRequest(
       // The process ran and returned. Whatever happens below is judgment.
       reachedAnyRung = true;
       if (result.exitCode !== 0) {
-        lastError = `model_exit_nonzero:${binary}`;
+        // QUOTA / CREDIT / AUTH REFUSALS ARE NAMED, NOT HIDDEN (#847). The
+        // process ran, so this is still a JUDGMENT failure and still terminal
+        // exactly as before -- but `model_exit_nonzero` told nobody that codex
+        // had hit its usage limit and grok had no credits (2026-09-14, every
+        // review from ~20:45Z). The code now says which, and the rung's outage
+        // is reported so the ladder breaker can stop spawning dead rungs.
+        const outage = classifyJudgeOutage(`${result.stderr ?? ''}\n${result.stdout}`);
+        if (outage) deps.recordRungOutage?.(binary, outage);
+        lastError = outage ? outage.code : `model_exit_nonzero:${binary}`;
         continue;
       }
+      // A clean exit proves the rung has quota, credits, and credentials.
+      deps.recordRungOutage?.(binary, null);
       const parsed = parseReviewVerdict(result.stdout);
       if (!parsed) {
         lastError = `model_output_invalid:${binary}`;
@@ -545,6 +570,20 @@ export async function evaluatePullRequest(
       // exhausted and end at INDETERMINATE anyway.
       const rateLimit = classifyRateLimitError(error);
       if (rateLimit) return rateLimited(input, deps, rateLimit, `invoke_model:${binary}`);
+      // A thrown quota/credit/auth refusal (#847) is the same judgment failure
+      // as a non-zero exit carrying that text: the rung was reachable and the
+      // error will recur, so it is terminal and named. Classified on the FULL
+      // message -- the Codex retry date sits past the 120-char slice that
+      // `errorMessage` keeps for the detail half.
+      const outage = classifyJudgeOutage(
+        error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+      );
+      if (outage) {
+        deps.recordRungOutage?.(binary, outage);
+        lastError = outage.code;
+        nonTransportFailure = true;
+        continue;
+      }
       lastError = `model_error:${errorMessage(error)}`;
       if (isTransportError(error)) {
         // E2BIG and friends: the process never ran, so this rung was not reached.
@@ -566,7 +605,8 @@ export async function evaluatePullRequest(
   return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError);
 }
 
-function defaultReviewLadder(): string[] {
+/** The configured judge ladder, cheapest first. Exported for the breaker (#847). */
+export function defaultReviewLadder(): string[] {
   return (process.env.OVERSEER_JUDGE_LADDER ?? 'grok')
     .split(',')
     .map(value => value.trim())
@@ -810,7 +850,7 @@ export async function runReviewModelProcess(
     // A kill fired by the timeout also settles `exited`; report that as the
     // timeout it is rather than as a spurious non-zero exit.
     if (timedOut) return { exitCode: 124, stdout: '', timedOut: true };
-    return { exitCode, stdout: normalizeModelOutput(binary, payload), timedOut: false };
+    return { exitCode, stdout: normalizeModelOutput(binary, payload), stderr, timedOut: false };
   })();
   const result = await Promise.race([processResult, timeoutResult]);
   if (timeout) clearTimeout(timeout);
