@@ -465,6 +465,12 @@ export async function runAndSubmitReview(
     disposition: verdict.approved ? 'approved' : 'changes_requested',
     event,
     ...summaryField(verdict),
+    // #847: an INDETERMINATE posted as REQUEST_CHANGES names its code on the
+    // receipt too. Only set when the reviewer supplied one; a real code finding
+    // has no reasonCode and its receipt shape is unchanged.
+    ...(!verdict.approved && verdict.reasonCode
+      ? { reason: `indeterminate:${verdict.reasonCode}` }
+      : {}),
   });
 }
 

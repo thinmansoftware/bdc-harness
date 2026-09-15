@@ -16,6 +16,13 @@ import {
 } from './stale-verdict-sweep-wiring';
 import { createLogger } from '@archon/paths';
 import {
+  applyLadderRestoredRequest,
+  recoverParkedJudgeHeads,
+} from '@archon/overseer/judge-ladder-health';
+import { defaultReviewLadder } from '@archon/overseer/pr-review-evaluator';
+import type { IngestDeps } from '@archon/overseer/pr-review-ingest';
+import {
+  createRealIngestDeps,
   createRealSubmitDeps,
   parseReviewWorkBody,
   REVIEW_RECIPIENT,
@@ -61,6 +68,12 @@ export interface ReviewWorkerDeps {
    * primary review path is untouched.
    */
   staleVerdictSweep?: (config: ReviewRouteConfig) => Promise<unknown>;
+  /**
+   * Re-enqueue heads parked by the judge-ladder breaker once the ladder is
+   * open again (#847). Optional for the same reason as the sweep; when absent
+   * parked heads wait for an operator `ladder_restored` row.
+   */
+  judgeLadderRecovery?: (config: ReviewRouteConfig) => Promise<unknown>;
 }
 
 interface ResultMapping {
@@ -106,6 +119,9 @@ function mapSubmitOutcome(
 }
 
 export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
+  // Built once, lazily: createRealIngestDeps logs its configuration at
+  // construction and the recovery pass runs every tick.
+  let ingestDeps: IngestDeps | undefined;
   return {
     registerWorker,
     heartbeatWorker,
@@ -125,6 +141,10 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
         // process lifetime covers (#786 review @45aa739e).
         createDurableSweepCursor()
       ),
+    judgeLadderRecovery: (config): Promise<{ recovered: string[]; stillParked: number }> => {
+      ingestDeps ??= createRealIngestDeps(config);
+      return recoverParkedJudgeHeads(ingestDeps, defaultReviewLadder());
+    },
   };
 }
 
@@ -153,6 +173,13 @@ export async function tickReviewWorkerClock(
       try {
         const claimed = await deps.claimMessage({ id: message.id, worker_id: REVIEW_WORKER_ID });
         if (!claimed) continue;
+        // OPERATOR OVERRIDE (#847): a hand-enqueued run_review whose
+        // repeat_reason starts with `operator_request:ladder_restored` clears
+        // the judge-ladder breaker before the judge runs; the recovery pass at
+        // the end of this tick then re-enqueues every parked head.
+        if (applyLadderRestoredRequest(claimed.repeat_reason)) {
+          log.info({ messageId: claimed.id }, 'overseer_review_judge_ladder_restored_by_operator');
+        }
         const body = parseReviewWorkBody(claimed.body);
         if (!body) throw new Error('invalid_review_work_body');
         const work: ReviewWorkItem = {
@@ -253,6 +280,18 @@ export async function tickReviewWorkerClock(
         await deps.staleVerdictSweep(config);
       } catch (error) {
         log.error({ err: error }, 'overseer_stale_verdict_sweep_failed');
+      }
+    }
+
+    // JUDGE LADDER RECOVERY (#847). Also after the drain: a head re-enqueued
+    // here is claimed on the NEXT tick, and a failure here never delays the
+    // primary review path. The pass is a no-op while any rung's outage record
+    // is still in force.
+    if (deps.judgeLadderRecovery) {
+      try {
+        await deps.judgeLadderRecovery(config);
+      } catch (error) {
+        log.error({ err: error }, 'overseer_judge_ladder_recovery_failed');
       }
     }
   } catch (error) {

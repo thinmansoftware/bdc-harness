@@ -196,7 +196,8 @@ describe('#789 -- a reached rung makes the failure terminal, not a deferral', ()
     );
 
     expect(result.verdict).toBe('INDETERMINATE');
-    expect(reviewErrorCode(result.error)).toBe('model_error');
+    // #847: a thrown 401 is classified as auth_expired (still terminal).
+    expect(reviewErrorCode(result.error)).toBe('auth_expired');
     // No retry budget: a 401 will recur on every attempt.
     expect(result.retry_after_ms).toBeUndefined();
   });

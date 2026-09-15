@@ -29,6 +29,7 @@
  */
 import { checkGitHubWebhookSignature } from '@archon/adapters/forge/github/webhook-signature';
 import { createLogger } from '@archon/paths';
+import type { JudgeLadderBreaker } from './judge-ladder-health';
 
 const log = createLogger('overseer/pr-review-ingest');
 
@@ -452,6 +453,15 @@ export interface IngestDeps {
     body: string;
     marker: string;
   }): Promise<{ posted: boolean }>;
+  /**
+   * Judge-ladder circuit breaker (#847). When `check()` reports that every
+   * configured rung is out of quota, credits, or credentials, ingest parks the
+   * head instead of enqueueing: `blocked` receipt with reason
+   * `judge_ladder_exhausted_until:<iso>`, no review posted, one operator
+   * notice per hour. Optional so existing dependency doubles keep compiling;
+   * when absent the breaker is simply not consulted (pre-#847 behaviour).
+   */
+  judgeLadderBreaker?: JudgeLadderBreaker;
   /** Persist a correlated audit receipt. Never throws the ingest path open. */
   recordReceipt(input: {
     correlationId: string;
@@ -684,6 +694,71 @@ export async function ingestPullRequestEvent(
       correlationId,
       headSha,
     };
+    await safeReceipt(deps, {
+      correlationId,
+      deliveryId,
+      owner,
+      repo,
+      prNumber,
+      headSha,
+      disposition: result.disposition,
+      reason: result.reason,
+    });
+    return result;
+  }
+
+  // JUDGE LADDER CIRCUIT BREAKER (#847). When every configured rung is known
+  // to be out of quota, credits, or credentials, running the judge can only
+  // spawn dead processes and post a rejecting review for a code-blind reason
+  // -- which is what every push did from 20:45Z on 2026-09-14. So the head is
+  // PARKED, not enqueued: a `blocked` receipt says until when, nothing is
+  // posted on the PR, the operator is told at most once an hour, and the
+  // parked head is re-enqueued by `recoverParkedJudgeHeads` (review worker
+  // tick) when the earliest retry time passes -- or at once when an operator
+  // clears the breaker with an `operator_request:ladder_restored` row.
+  //
+  // Placed AFTER stale-head invalidation on purpose -- in-flight work on a
+  // dead head is cancelled either way -- and BEFORE the re-review cap, whose
+  // `isHeadCiGreen` lookup is a GitHub read the parked head does not need.
+  const breaker = deps.judgeLadderBreaker;
+  const exhaustion = breaker?.check() ?? null;
+  if (breaker && exhaustion) {
+    breaker.park({
+      correlationId,
+      idempotencyKey: reviewIdempotencyKey({ owner, repo, prNumber, headSha }),
+      owner,
+      repo,
+      prNumber,
+      headSha,
+      baseRef,
+      author,
+    });
+    let notified = false;
+    try {
+      notified = await breaker.notify(exhaustion);
+    } catch {
+      // The block stands either way: the receipt below reaches the operator.
+    }
+    const result: IngestResult = {
+      disposition: 'blocked',
+      status: 200,
+      reason: `judge_ladder_exhausted_until:${exhaustion.until}`,
+      correlationId,
+      headSha,
+      ...(invalidatedMessageIds.length > 0 ? { invalidatedMessageIds } : {}),
+    };
+    log.warn(
+      {
+        owner,
+        repo,
+        prNumber,
+        headSha,
+        until: exhaustion.until,
+        rungs: exhaustion.rungs.map(rung => `${rung.binary}=${rung.code}`),
+        operatorNotified: notified,
+      },
+      'overseer.pr_review.judge_ladder_exhausted'
+    );
     await safeReceipt(deps, {
       correlationId,
       deliveryId,
