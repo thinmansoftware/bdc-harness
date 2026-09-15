@@ -33,7 +33,7 @@ import {
   resolveMaxRereviewAttempts,
   resolveMaxTotalRereviews,
 } from './pr-review-ingest';
-import type { IngestDeps, PriorReviewWork } from './pr-review-ingest.ts';
+import type { IngestDeps, PriorReviewWork, PullRequestMergeability } from './pr-review-ingest.ts';
 import {
   configuredReviewIdentity,
   checksAreTerminal,
@@ -577,6 +577,23 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         createRealReadOnlyPatOctokitClient() ?? undefined
       )(input);
       return isExactHeadCiGreen(evidence);
+    },
+
+    async fetchPullRequestMergeability(input): Promise<PullRequestMergeability> {
+      // Built at call time: createRealOctokitClient throws without credentials,
+      // and ingest has always been constructible without a GitHub token. Ingest
+      // treats a throw as `unknown` (do not block).
+      const octokit = createRealOctokitClient();
+      const pr = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+      });
+      return {
+        mergeableState: pr.data.mergeable_state,
+        baseRef: pr.data.base?.ref,
+        baseSha: pr.data.base?.sha,
+      };
     },
 
     async postCapExhaustedComment(input): Promise<{ posted: boolean }> {

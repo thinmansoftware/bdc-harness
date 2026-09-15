@@ -84,3 +84,27 @@ On restart all records are empty: one review re-spawns the ladder, the breaker
 re-trips, and heads parked before the restart are not auto-recovered (their
 trail is the `blocked` receipt and the notice). The check-completion ingest and
 the stale-verdict sweep do not consult the breaker.
+
+## PR review ingest receipts
+
+Every `pull_request` ingest writes one `pr_review_ingest_receipt` into
+`agent_dispatch_messages` (`task_type: run_report`, `recipient: operator`).
+Dispositions: `queued`, `duplicate_delivery`, `superseded_head`,
+`ignored_event`, `ignored_draft`, `rejected_signature`, `custody_conflict`,
+`blocked`.
+
+`blocked` reasons include the existing fail-closed codes (`webhook_secret_not_configured`,
+`payload_unparseable`, `incomplete_pull_request_context`, `rereview_attempts_exhausted`,
+`rereview_total_ceiling_reached`, `enqueue_failed:...`) and:
+
+- `base_not_incorporated:<baseRef>@<baseSha>` -- GitHub `pulls.get` reported
+  `mergeable_state: dirty` (content conflict with the current base). Review is
+  not queued. Base ref and SHA come from that `pulls.get` payload. The receipt
+  is per delivery, not sticky: a later ingest of the same head after the PR is
+  mergeable enqueues normally. `unknown` / omitted `mergeable_state` must not
+  block: GitHub returns those while it is still computing mergeability, and
+  treating them as conflicts would drop every fresh PR from review. (#845)
+- `judge_ladder_exhausted_until:<ISO>` -- every configured judge rung is out of
+  quota, credits, or credentials, so the head is parked rather than reviewed.
+  See the breaker section above. Checked BEFORE the mergeability read: a parked
+  head does not spend a GitHub call. (#847)

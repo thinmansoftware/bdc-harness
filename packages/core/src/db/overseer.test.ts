@@ -19,6 +19,7 @@ import {
   getOverseerLastActionAt,
   getOverseerLastVerdictAt,
   getOverseerVerdictsForRun,
+  getOverseerWatchRunById,
   hasReconcileActionForPr,
   insertOverseerAction,
   insertReconcileAction,
@@ -199,6 +200,35 @@ describe('overseer db', () => {
     expect(run?.owner).toBe('thinmansoftware');
     expect(run?.repo).toBe('bdc-harness');
     expect(run?.woId).toBe('WO-HARNESS-E2E-MERGE-CANARY-01');
+  });
+
+  test('getOverseerWatchRunById resolves repo identity from the codebase FK (bdc-harness #846)', async () => {
+    // The merge-execution bridge resolves a verdict's run through THIS query.
+    // Without the join it returns owner/repo undefined for every real run and
+    // the bridge records run_context_unresolvable.
+    await db.query(
+      `INSERT INTO remote_agent_codebases (id, name, default_cwd)
+       VALUES ('cb-by-id', 'thinmansoftware/bdc-harness', '/tmp/cb-by-id')`
+    );
+    await db.query(
+      `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
+       VALUES ('conv-by-id', 'test', 'conv-by-id', 'Test')`
+    );
+    await db.query(
+      `INSERT INTO remote_agent_workflow_runs
+       (id, conversation_id, codebase_id, workflow_name, user_message, status, metadata)
+       VALUES ('run-by-id', 'conv-by-id', 'cb-by-id', 'bdc-feature-development', $1, 'completed', $2)`,
+      [
+        'WO_ID=WO-HARNESS-846 --project bdc-harness',
+        JSON.stringify({ node_counts: { completed: 3 } }),
+      ]
+    );
+
+    const run = await getOverseerWatchRunById('run-by-id');
+    expect(run?.owner).toBe('thinmansoftware');
+    expect(run?.repo).toBe('bdc-harness');
+    expect(run?.woId).toBe('WO-HARNESS-846');
+    expect(await getOverseerWatchRunById('run-absent')).toBeNull();
   });
 
   test('reads latest action/verdict effect timestamps and pending judgment count', async () => {
