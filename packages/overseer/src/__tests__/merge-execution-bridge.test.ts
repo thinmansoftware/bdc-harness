@@ -219,6 +219,13 @@ describe('merge execution bridge', () => {
       'pr_lookup_failed',
     ],
     ['closed', greenPr({ state: 'closed' }), 0, 'pr_not_open'],
+    ['dirty', greenPr({ mergeable: false, mergeableState: 'dirty' }), 0, 'not_mergeable_dirty'],
+    [
+      'blocked-state',
+      greenPr({ mergeable: false, mergeableState: 'blocked' }),
+      0,
+      'mergeable_state_not_clean',
+    ],
   ])('records honest skip for %s', async (id, evidence, recent, reason) => {
     const h = harness([verdict(id)], evidence, recent);
     await runMergeExecutionBridgeOnce({

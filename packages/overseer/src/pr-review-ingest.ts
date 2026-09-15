@@ -389,6 +389,13 @@ export function findAuthorizingPriorReview(
   return prior.find(work => work.headSha !== headSha && work.verdict !== null);
 }
 
+/** Live mergeability from GitHub `pulls.get` (#845). */
+export interface PullRequestMergeability {
+  mergeableState?: string;
+  baseRef?: string;
+  baseSha?: string;
+}
+
 export interface IngestDeps {
   /** Shared webhook secret. Empty/absent means the route must fail closed. */
   webhookSecret: string;
@@ -430,6 +437,25 @@ export interface IngestDeps {
     prNumber: number;
     headSha: string;
   }): Promise<boolean>;
+  /**
+   * Live GitHub mergeability for this PR via `pulls.get` (#845).
+   *
+   * `dirty` means a content conflict with the current base: ingest writes a
+   * blocked receipt and does not enqueue. Any other value -- including
+   * `unknown`, undefined, or a thrown lookup -- keeps current behaviour
+   * (enqueue). GitHub returns `unknown` while it is still computing
+   * mergeability; treating that as a conflict would drop every fresh PR from
+   * review. The receipt is per delivery, not sticky: a later ingest of the
+   * same head after the PR is mergeable enqueues normally.
+   *
+   * Optional so existing dependency doubles keep compiling; when absent, ingest
+   * behaves as it does for `unknown`.
+   */
+  fetchPullRequestMergeability?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<PullRequestMergeability>;
   /**
    * Post the cap-exhausted notice on the PR (#797). MUST be idempotent per
    * head: the implementation checks for an existing comment carrying
@@ -695,6 +721,48 @@ export async function ingestPullRequestEvent(
       reason: result.reason,
     });
     return result;
+  }
+
+  // DIRTY: a content conflict with the current base. Reviewing this head
+  // cannot make the PR mergeable, so do not enqueue. The receipt is per
+  // delivery -- a later ingest after the branch incorporates the base
+  // enqueues normally.
+  if (deps.fetchPullRequestMergeability) {
+    let mergeableState: string | undefined;
+    let liveBaseRef = baseRef;
+    let liveBaseSha = payload.pull_request?.base?.sha ?? '';
+    try {
+      const live = await deps.fetchPullRequestMergeability({ owner, repo, prNumber });
+      mergeableState = live.mergeableState;
+      if (live.baseRef) liveBaseRef = live.baseRef;
+      if (live.baseSha) liveBaseSha = live.baseSha;
+    } catch {
+      // GitHub returns `unknown` while it is still computing mergeability.
+      // A fetch error is the same class: not evidence of a conflict. Blocking
+      // here would drop every fresh PR from review.
+    }
+    if (mergeableState === 'dirty') {
+      const reason = `base_not_incorporated:${liveBaseRef}@${liveBaseSha}`;
+      const result: IngestResult = {
+        disposition: 'blocked',
+        status: 200,
+        reason,
+        correlationId,
+        headSha,
+        ...(invalidatedMessageIds.length > 0 ? { invalidatedMessageIds } : {}),
+      };
+      await safeReceipt(deps, {
+        correlationId,
+        deliveryId,
+        owner,
+        repo,
+        prNumber,
+        headSha,
+        disposition: result.disposition,
+        reason,
+      });
+      return result;
+    }
   }
 
   let headCiGreen = false;
