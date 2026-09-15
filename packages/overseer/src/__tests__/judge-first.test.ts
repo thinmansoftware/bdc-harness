@@ -304,6 +304,34 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
     }
   });
 
+  // #852 (live 2026-09-15 13:47Z): OVERSEER_JUDGE_LADDER=codex,grok,cursor with
+  // codex out of quota and grok out of credits. cursor was the only live rung,
+  // so the ONLY acceptable outcome is its verdict -- never judge_unavailable.
+  test('#852: codex and grok dead, cursor answers -- determinate verdict, not judge_unavailable', async () => {
+    const spawned: string[] = [];
+    const outcome = await judgeTerminalRun(envelope, {
+      ladder: ['codex', 'grok', 'cursor'],
+      spawn: async (binary: string): Promise<JudgeSpawnResult> => {
+        spawned.push(binary);
+        if (binary !== 'cursor') return { exitCode: 1, stdout: '', timedOut: false };
+        return {
+          exitCode: 0,
+          stdout:
+            '{"verdict":"observe","confidence":0.7,"proposed_action":"none","reason":"uneventful terminal run"}',
+          timedOut: false,
+        };
+      },
+      recordOutcome: ignoreOutcome,
+    });
+    expect(spawned).toEqual(['codex', 'grok', 'cursor']);
+    expect(outcome).toMatchObject({
+      kind: 'verdict',
+      verdict: 'observe',
+      model: 'cursor',
+      modelRung: 2,
+    });
+  });
+
   test('records an unavailable outcome when spawning throws', async () => {
     const recorded: unknown[] = [];
     const outcome = await judgeTerminalRun(envelope, {

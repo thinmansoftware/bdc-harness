@@ -1,10 +1,17 @@
-import { chmod, mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
 import { classifyJudgeOutage, type JudgeOutage } from './judge-ladder-health';
+import {
+  buildJudgeTransport,
+  defaultJudgeChildSpawn,
+  deliverStdin,
+  destroyStdin,
+  removeJudgeTransportFiles,
+  type JudgeChild,
+  type JudgeChildSpawn,
+  type JudgeTransport,
+} from './judge-transport';
 
 /**
  * CHECKS_UNAVAILABLE (#775) is TERMINAL and NON-APPROVING: the required
@@ -630,116 +637,20 @@ export function resolveReviewModelTimeoutMs(
 }
 
 /**
- * How one judge binary receives the review prompt.
- *
- * NEVER as an argv element. Linux caps a SINGLE argument at MAX_ARG_STRLEN
- * (131,072 bytes; verified in archon-app-1 alongside ARG_MAX 2,097,152), and
- * the prompt is a header plus the checks JSON plus the FULL diff -- so every PR
- * with a diff over roughly 128 KB failed with E2BIG on both rungs and the
- * reviewer returned INDETERMINATE with no stated reason (#776, #786,
- * 2026-09-07). Neither transport below has any size limit.
- *
- * - `codex exec`: with no positional PROMPT, "instructions are read from stdin"
- *   (`codex exec --help`, verified in the container 2026-09-07; matches the
- *   board skill's 2026-07-26 finding). Written to the child's stdin pipe.
- * - `grok`: `--prompt-file <PATH>` -- "Single-turn prompt from a file"
- *   (`grok --help`, verified in the container 2026-09-07). The prompt is
- *   written to a temp file and the PATH is passed, which is a short argument.
- *   `-p/--single` takes the prompt inline and is exactly what must be avoided.
- * - `cursor`: `cursor-agent --print --mode ask --trust --model <MODEL>` with
- *   the prompt on stdin. `--print` with no inline prompt argument reads the
- *   prompt from stdin (this tree's own record: scripts/dispatch-worker/
- *   adapters.ts, promptDelivery 'stdin' -- "claude -p, codex exec,
- *   cursor-agent --print"). cursor-agent has no --prompt-file flag anywhere in
- *   this tree, so stdin is the only argv-free transport. `--mode ask` is
- *   READ-ONLY (both `ask` and `plan` are; see adapters.ts `cursor-build`),
- *   which is exactly right for a judge. The model is selected per call from
- *   OVERSEER_CURSOR_JUDGE_MODEL (default DEFAULT_CURSOR_JUDGE_MODEL).
+ * How one judge binary receives the review prompt: judge-transport.ts, shared
+ * with judge-first.ts and judge-second-opinion.ts since #852. The per-binary
+ * argv shapes, the never-in-argv rule (Linux MAX_ARG_STRLEN; #776/#786) and
+ * the private prompt-file hygiene are documented there. This path delegates
+ * and sends exactly what it sent before.
  */
-interface ReviewModelTransport {
-  argv: string[];
-  /** Written to the child's stdin when set. */
-  stdinPrompt?: string;
-  /** Temp file holding the prompt; removed after the process settles. */
-  promptFile?: string;
-  /** Private 0700 directory containing `promptFile`; removed with it. */
-  promptDir?: string;
-}
-
-/** Owner-only directory (rwx------). */
-const PROMPT_DIR_MODE = 0o700;
-/** Owner-only file (rw-------). */
-const PROMPT_FILE_MODE = 0o600;
-
-/**
- * Write the prompt to a file only the running user can read.
- *
- * Review finding (Overseer, PR #790): the prompt embeds the FULL private diff
- * and the acceptance criteria. Writing it straight into the shared system temp
- * directory with default permissions leaves it world-readable under a typical
- * 022 umask, exposing repository contents to any other local user or process
- * for as long as the judge runs.
- *
- * `mkdtemp` creates the directory atomically and exclusively -- no
- * predictable-name race, and no pre-existing path can be hijacked. The mode is
- * then set explicitly rather than trusted to the umask, and the file is written
- * before its mode is tightened, so the window is inside a 0700 directory the
- * whole time.
- */
-async function writePrivatePromptFile(
-  prompt: string
-): Promise<{ promptFile: string; promptDir: string }> {
-  const promptDir = await mkdtemp(join(tmpdir(), 'overseer-review-'));
-  await chmod(promptDir, PROMPT_DIR_MODE);
-  const promptFile = join(promptDir, 'prompt.txt');
-  await writeFile(promptFile, prompt, { mode: PROMPT_FILE_MODE });
-  await chmod(promptFile, PROMPT_FILE_MODE);
-  return { promptFile, promptDir };
-}
-
-/**
- * Default model for the `cursor` judge rung. One of the ids returned by
- * `cursor-agent --list-models` on the operator account (verified live
- * 2026-09-15). Override with OVERSEER_CURSOR_JUDGE_MODEL; a blank value falls
- * back to the default rather than producing `--model ''`.
- */
-export const DEFAULT_CURSOR_JUDGE_MODEL = 'claude-fable-5-1-thinking-high';
-
-export function resolveCursorJudgeModel(
-  env: Record<string, string | undefined> = process.env
-): string {
-  const configured = env.OVERSEER_CURSOR_JUDGE_MODEL;
-  return nonEmpty(configured) ? configured.trim() : DEFAULT_CURSOR_JUDGE_MODEL;
-}
+export { DEFAULT_CURSOR_JUDGE_MODEL, resolveCursorJudgeModel } from './judge-transport';
 
 /** Exported for the permission test; not part of the review API surface. */
 export async function buildReviewModelTransport(
   binary: string,
   prompt: string
-): Promise<ReviewModelTransport> {
-  if (binary === 'codex') {
-    return {
-      argv: ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check'],
-      stdinPrompt: prompt,
-    };
-  }
-  if (binary === 'cursor') {
-    // Read-only ask mode on the Cursor rail; prompt on stdin, never in argv.
-    return {
-      argv: [
-        'cursor-agent',
-        '--print',
-        '--mode',
-        'ask',
-        '--trust',
-        '--model',
-        resolveCursorJudgeModel(),
-      ],
-      stdinPrompt: prompt,
-    };
-  }
-  const { promptFile, promptDir } = await writePrivatePromptFile(prompt);
-  return { argv: [binary, '--prompt-file', promptFile], promptFile, promptDir };
+): Promise<JudgeTransport> {
+  return buildJudgeTransport(binary, prompt);
 }
 
 export async function invokeConfiguredReviewModel(
@@ -753,52 +664,26 @@ export async function invokeConfiguredReviewModel(
   } finally {
     // Always in a finally: the prompt holds the private diff, so it must not
     // outlive the judge process on any path -- success, throw, or timeout.
-    if (transport.promptFile) {
-      try {
-        await unlink(transport.promptFile);
-      } catch {
-        // Best effort: a leaked temp prompt is far less bad than a throw that
-        // would reclassify a successful review as a model_error.
-      }
-    }
-    if (transport.promptDir) {
-      try {
-        await rm(transport.promptDir, { recursive: true, force: true });
-      } catch {
-        // Same rationale: cleanup never changes the review's outcome.
-      }
-    }
+    await removeJudgeTransportFiles(transport);
   }
 }
 
 /**
- * The subset of a spawned child this module uses. Declared so a test can supply
- * a double -- notably one that never READS stdin, which is the only way to
- * exercise the pipe back-pressure path deterministically.
+ * The subset of a spawned child this module uses (JudgeChild in
+ * judge-transport.ts, shared with the other two judge seams). Declared so a
+ * test can supply a double -- notably one that never READS stdin, which is the
+ * only way to exercise the pipe back-pressure path deterministically.
  */
-export interface ReviewModelChild {
-  stdin: unknown;
-  stdout: ReadableStream | null;
-  stderr: ReadableStream | null;
-  exited: Promise<number>;
-  kill(): void;
-}
+export type ReviewModelChild = JudgeChild;
 
-export type ReviewModelSpawn = (argv: string[], stdinMode: 'ignore' | 'pipe') => ReviewModelChild;
-
-const defaultReviewModelSpawn: ReviewModelSpawn = (argv, stdinMode) =>
-  Bun.spawn(argv, {
-    stdin: stdinMode,
-    stdout: 'pipe',
-    stderr: 'pipe',
-  }) as unknown as ReviewModelChild;
+export type ReviewModelSpawn = JudgeChildSpawn;
 
 /** Exported for the back-pressure test; not part of the review API surface. */
 export async function runReviewModelProcess(
-  transport: ReviewModelTransport,
+  transport: JudgeTransport,
   binary: string,
   timeoutMs: number,
-  spawn: ReviewModelSpawn = defaultReviewModelSpawn
+  spawn: ReviewModelSpawn = defaultJudgeChildSpawn
 ): Promise<PrReviewModelResult> {
   const subprocess = spawn(transport.argv, transport.stdinPrompt === undefined ? 'ignore' : 'pipe');
 
@@ -859,53 +744,6 @@ export async function runReviewModelProcess(
   // parked if the child exited without draining stdin.
   destroyStdin(subprocess.stdin);
   return result;
-}
-
-/**
- * Write the prompt to the child and close the pipe so it sees EOF.
- *
- * Rejections are swallowed on purpose. Once the child is gone -- killed by the
- * timeout, or exited early having read only part of the prompt -- the pending
- * write fails with EPIPE/ERR_STREAM_DESTROYED. That is expected, is not a
- * review failure, and must not surface as an unhandled rejection (which crashes
- * the worker under Bun's default handler).
- */
-async function deliverStdin(stdin: unknown, prompt: string): Promise<void> {
-  const writer = stdin as {
-    write(chunk: string): unknown;
-    end(): unknown;
-  } | null;
-  if (!writer) return;
-  try {
-    await writer.write(prompt);
-    await writer.end();
-  } catch {
-    // Child gone or pipe torn down -- see above.
-  }
-}
-
-/**
- * Force the stdin pipe closed so any write parked on back-pressure settles.
- *
- * Killing the child is not sufficient on its own: the awaiting write stays
- * pending until the writer itself is torn down. Every method is attempted
- * defensively because the concrete stdin object differs between Bun's
- * FileSink and a test double, and cleanup must never throw into the result path.
- */
-function destroyStdin(stdin: unknown): void {
-  const writer = stdin as {
-    destroy?: () => unknown;
-    end?: () => unknown;
-    close?: () => unknown;
-  } | null;
-  if (!writer) return;
-  for (const method of ['destroy', 'end', 'close'] as const) {
-    try {
-      writer[method]?.();
-    } catch {
-      // Best effort: teardown never changes the review's outcome.
-    }
-  }
 }
 
 function normalizeModelOutput(binary: string, stdout: string): string {
