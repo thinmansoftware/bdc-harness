@@ -172,9 +172,10 @@ const EMPTY_RESULT: MergeCandidateDiscoveryResult = {
 };
 
 /**
- * Parse a comma-separated base-branch list. Reuses MERGE_MANAGER_ALLOWED_BASES
- * on purpose: discovery must never surface a PR the Merge Manager would refuse
- * on `base_branch_not_allowed` grounds, so the two lists are the same list.
+ * Parse a comma-separated base-branch list used as discovery's broad branch filter.
+ * Execution separately enforces MERGE_MANAGER_REPO_BASES and may refuse a surfaced
+ * candidate with `repo_base_branch_not_allowed`; that exact repo+branch map is the
+ * authoritative mutation boundary.
  */
 export function resolveWatchedBaseBranches(
   raw: string | undefined = process.env[DISCOVERY_BASE_BRANCHES_ENV]
