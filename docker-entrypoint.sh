@@ -62,18 +62,43 @@ if [ "$(id -u)" = "0" ]; then
   # on 2026-09-16. Mirror the GitHub auth pre-flight below and write a machine-readable
   # status to /tmp so healthcheck/monitoring wiring can assert on it rather than on
   # process liveness. Values: ok | seed-failed | unmounted | missing.
+  # TWO consumers, TWO paths, and ownership matters as much as location:
+  #   - the SDK binary spawned for a lane resolves HOME=/root, so it reads
+  #     /root/.claude/.credentials.json (CLAUDE_USE_GLOBAL_AUTH=true)
+  #   - the server's own auth-refresh (packages/providers/src/auth-refresh/claude.ts)
+  #     calls os.homedir(), and the server runs as APPUSER, so it reads
+  #     /home/appuser/.claude/.credentials.json
+  # Seed both. The appuser copy MUST be chowned appuser: a 0600 file owned by root is
+  # unreadable to it, readCreds() treats unreadable as absent, and every lane fails
+  # with "Cauldron auth for claude is dead (reason: no_refresh_token)" while
+  # `claude auth status` still reports loggedIn:true. Verified live 2026-09-16 --
+  # a hand `docker cp` left both copies root-owned and produced exactly that.
+  # The .claude DIRECTORY must be appuser-owned too: refreshClaude() writes
+  # .refresh.lock beside the credential.
   if [ -d /run/secrets/claude-creds ] && [ -f /run/secrets/claude-creds/.credentials.json ]; then
-    mkdir -p /root/.claude
+    mkdir -p /root/.claude /home/appuser/.claude
+    _seed_ok=1
     if cp -a /run/secrets/claude-creds/.credentials.json /root/.claude/.credentials.json 2>/dev/null; then
       chown root:root /root/.claude/.credentials.json
       chmod 600 /root/.claude/.credentials.json
-      echo "[archon] Claude credential seeded from /run/secrets/claude-creds" >&2
+    else
+      _seed_ok=0
+    fi
+    if cp -a /run/secrets/claude-creds/.credentials.json /home/appuser/.claude/.credentials.json 2>/dev/null; then
+      chown appuser:appuser /home/appuser/.claude /home/appuser/.claude/.credentials.json
+      chmod 600 /home/appuser/.claude/.credentials.json
+    else
+      _seed_ok=0
+    fi
+    if [ "$_seed_ok" = "1" ]; then
+      echo "[archon] Claude credential seeded from /run/secrets/claude-creds to /root/.claude (SDK) and /home/appuser/.claude (auth-refresh)" >&2
       echo "ok" > /tmp/claude-creds.status
     else
-      echo "[archon] ERROR: failed to copy /run/secrets/claude-creds/.credentials.json to /root/.claude/ -- Claude build lanes will fail with 'Not logged in' until it is installed by hand" >&2
+      echo "[archon] ERROR: failed to seed /run/secrets/claude-creds/.credentials.json to both /root/.claude and /home/appuser/.claude -- Claude build lanes will fail until it is installed by hand" >&2
       echo "seed-failed" > /tmp/claude-creds.status
     fi
-  elif [ -f /root/.claude/.credentials.json ]; then
+    unset _seed_ok
+  elif [ -f /root/.claude/.credentials.json ] || [ -f /home/appuser/.claude/.credentials.json ]; then
     # Works today, but dies on the next rebuild -- that is the whole defect this
     # mount exists to close, so it is not an "ok" state.
     echo "[archon] WARN: Claude credential present at /root/.claude but NO host mount configured -- it will be WIPED by the next rebuild or --force-recreate. Set CLAUDE_CREDS_HOST_PATH in .env." >&2
