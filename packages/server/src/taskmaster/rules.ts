@@ -172,7 +172,9 @@ export interface NextActionContext {
   /** Durable tm_suppression row for this thread's canonical ref, if any. */
   suppression?: SuppressionLike;
   fireEligible?: boolean;
-  fireLane?: 'claude' | 'codex' | 'xai' | null;
+  // WO-HARNESS-RETIRE-XAI-DIRECT-LANE-01: direct xAI lane retired (credit-blocked team,
+  // bdc-xo#2018); Grok is reached over the Cursor rail. Do NOT restore a direct xAI fire lane.
+  fireLane?: 'claude' | 'codex' | null;
   fireHolding?: boolean;
   fireEscalate?: boolean;
   customerP0Exempt?: boolean;

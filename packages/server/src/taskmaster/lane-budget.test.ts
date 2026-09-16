@@ -17,7 +17,7 @@ const sample = (provider: string, state: 'healthy' | 'degraded' | 'dark' | 'unkn
 });
 
 describe('lane budget', () => {
-  test('UNKNOWN does not hold codex but does not spend claude or xai', () => {
+  test('UNKNOWN does not hold codex but does not spend claude', () => {
     expect(decideFireLane(unknown, {}).lane).toBe('codex');
   });
   test('degraded cheapest lane downshifts and all degraded holds', () => {
@@ -25,10 +25,7 @@ describe('lane budget', () => {
       decideFireLane({ ...unknown, state: 'LOW' }, { codex: sample('codex', 'healthy') }).lane
     ).toBe('codex');
     expect(
-      decideFireLane(
-        { ...unknown, state: 'LOW' },
-        { codex: sample('codex', 'degraded'), xai: sample('xai', 'dark') }
-      )
+      decideFireLane({ ...unknown, state: 'LOW' }, { codex: sample('codex', 'degraded') })
     ).toEqual({ lane: null, holding: true, reason: 'all_lanes_degraded_or_unavailable' });
   });
 });
