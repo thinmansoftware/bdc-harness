@@ -58,19 +58,29 @@ if [ "$(id -u)" = "0" ]; then
   # writable mount would let the container's refreshed token flow back to the host,
   # which is desirable but is a separate decision (see the WO's follow-up section).
   # The /dev/null default is a char device, not a directory, so it is skipped.
+  # A log WARN is not detection -- an unread warning is exactly how 18 hours passed
+  # on 2026-09-16. Mirror the GitHub auth pre-flight below and write a machine-readable
+  # status to /tmp so healthcheck/monitoring wiring can assert on it rather than on
+  # process liveness. Values: ok | seed-failed | unmounted | missing.
   if [ -d /run/secrets/claude-creds ] && [ -f /run/secrets/claude-creds/.credentials.json ]; then
     mkdir -p /root/.claude
     if cp -a /run/secrets/claude-creds/.credentials.json /root/.claude/.credentials.json 2>/dev/null; then
       chown root:root /root/.claude/.credentials.json
       chmod 600 /root/.claude/.credentials.json
       echo "[archon] Claude credential seeded from /run/secrets/claude-creds" >&2
+      echo "ok" > /tmp/claude-creds.status
     else
-      echo "[archon] WARN: failed to copy /run/secrets/claude-creds/.credentials.json to /root/.claude/ -- Claude build lanes will fail with 'Not logged in' until it is installed by hand" >&2
+      echo "[archon] ERROR: failed to copy /run/secrets/claude-creds/.credentials.json to /root/.claude/ -- Claude build lanes will fail with 'Not logged in' until it is installed by hand" >&2
+      echo "seed-failed" > /tmp/claude-creds.status
     fi
   elif [ -f /root/.claude/.credentials.json ]; then
-    echo "[archon] Claude credential present at /root/.claude (no host mount configured)" >&2
+    # Works today, but dies on the next rebuild -- that is the whole defect this
+    # mount exists to close, so it is not an "ok" state.
+    echo "[archon] WARN: Claude credential present at /root/.claude but NO host mount configured -- it will be WIPED by the next rebuild or --force-recreate. Set CLAUDE_CREDS_HOST_PATH in .env." >&2
+    echo "unmounted" > /tmp/claude-creds.status
   else
-    echo "[archon] WARN: no Claude credential at /root/.claude and no /run/secrets/claude-creds mount -- Claude build lanes will fail with 'Not logged in'. Set CLAUDE_CREDS_HOST_PATH in .env. See doctrine/cauldron-creds-target-root-not-appuser." >&2
+    echo "[archon] ERROR: no Claude credential at /root/.claude and no /run/secrets/claude-creds mount -- ALL Claude build lanes will fail with 'Not logged in' while every health check stays green. Set CLAUDE_CREDS_HOST_PATH in .env. See doctrine/cauldron-creds-target-root-not-appuser." >&2
+    echo "missing" > /tmp/claude-creds.status
   fi
   # WO-168 Tier 1: /host-artifacts is a host bind mount for load-bearing
   # workflow output (git bundles, raw artifacts). Workflow nodes run as
