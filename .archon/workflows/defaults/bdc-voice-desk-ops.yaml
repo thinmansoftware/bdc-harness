@@ -1,0 +1,484 @@
+# bdc-voice-desk-ops.yaml
+# WO: WO-SHOPOPS-DESK-VOICE-TOOLS-01
+# Spec source: bdc-xo:docs/work-orders/WO-SHOPOPS-DESK-VOICE-TOOLS-01.md
+# Design anchor: bdc-harness:docs/architecture/2026-09-16-voice-desk-ops-design.md
+#
+# Phase 1 of 3. Builds ONLY the ShopOps tool surface that a voice front end calls.
+# No audio, no models, no voice-bridge code in this WO (Phase 2, different repo/owner).
+#
+# Pre-flight (OPERATOR MUST VERIFY BEFORE FIRING):
+#   1. YAML exists: this file
+#   2. Spec exists: bdc-xo:docs/work-orders/WO-SHOPOPS-DESK-VOICE-TOOLS-01.md
+#      (authored 2026-09-16; push it to bdc-xo main BEFORE firing -- read-spec hard-fails without it)
+#   3. CWD scope: thinmansoftware/shopops SINGLE repo (select shopops in the Archon dropdown)
+#   4. Codebase registered:
+#        sqlite3 /opt/bdc/archon-data/archon.db \
+#          "SELECT name FROM remote_agent_codebases" | grep shopops
+#   5. parallel_ok: NO -- adds a migration (desk_voice_log); serialize with other shopops
+#      migration WOs.
+#   6. GH_TOKEN/GITHUB_TOKEN needs push access to thinmansoftware/shopops
+#
+# Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-voice-desk-ops.yaml
+#
+# Fire after deploy (path is /run SINGULAR; /runs plural 404s):
+#   curl -X POST https://archon.bluedevilcollectibles.com/api/workflows/bdc-voice-desk-ops/run \
+#     -H "Content-Type: application/json" \
+#     -d '{"conversationId":"voice-desk-WO-SHOPOPS-DESK-VOICE-TOOLS-01","message":"Execute WO-SHOPOPS-DESK-VOICE-TOOLS-01 --project shopops"}'
+
+name: bdc-voice-desk-ops
+description: |
+  Use when: Executing WO-SHOPOPS-DESK-VOICE-TOOLS-01 -- the ShopOps desk-voice tool
+    surface (Phase 1 of Voice Desk Ops).
+  Input: WO_ID = WO-SHOPOPS-DESK-VOICE-TOOLS-01.
+  Does: Reads spec from bdc-xo. Adds shopops-api/routes/desk-voice.js (whitelisted
+        receiving/packing tool surface), shopops-api/services/deskVoiceTools.js
+        (whitelist + idempotency + version-conflict classification), a desk_voice_log
+        migration, and bun tests. Enforces the gate table: scan/count/flag/advance are
+        voice-allowed; submit and commit are typed-only; shipping-finalize and anything
+        billing are FORBIDDEN and must return 403. Opens a PR against master and flips
+        the WO to REVIEW.
+  Does NOT: touch audio, STT/TTS, model providers, or voice-bridge. That is Phase 2 in
+        bluedevilcollectibles/voice-bridge under a separate WO.
+  Repo: thinmansoftware/shopops (default branch: master)
+  Class: CODE (single-repo backend + one migration)
+  parallel_ok: false -- adds a migration; serialize with other shopops migration WOs.
+  Polish bar: HIGH -- this is the write path for warehouse voice; a wrong whitelist
+        entry lets voice cross a ratified gate.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+target_repo: thinmansoftware/shopops
+
+nodes:
+
+  # ---------------------------------------------------------------------------
+  # 1. READ-SPEC -- fetch WO spec from bdc-xo (cross-repo via gh api)
+  # ---------------------------------------------------------------------------
+  - id: read-spec
+    bash: |
+      set -eo pipefail
+      WO_ID="${INPUT_WO_ID:-${WO_ID:-WO-SHOPOPS-DESK-VOICE-TOOLS-01}}"
+
+      SPEC_CONTENT=$(gh api \
+        "repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+
+      if [ -z "$SPEC_CONTENT" ]; then
+        GLOB_PATH=$(gh api \
+          "repos/thinmansoftware/bdc-xo/contents/docs/wo-specs?ref=main" \
+          --template '{{range .}}{{.path}}{{"\n"}}{{end}}' \
+          2>/dev/null | grep "${WO_ID}.md$" | head -1 || true)
+        if [ -n "$GLOB_PATH" ]; then
+          SPEC_CONTENT=$(gh api \
+            "repos/thinmansoftware/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+        fi
+      fi
+
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "read-spec: FATAL -- spec for ${WO_ID} not found in bdc-xo."
+        echo "Author and push docs/work-orders/${WO_ID}.md to bdc-xo main, then re-fire."
+        exit 1
+      fi
+
+      echo "WO_ID=${WO_ID}"
+      echo "SPEC_PATH=docs/work-orders/${WO_ID}.md"
+      echo "--- SPEC BEGIN ---"
+      printf '%s\n' "$SPEC_CONTENT"
+      echo "--- SPEC END ---"
+
+  # ---------------------------------------------------------------------------
+  # 2. ROUTE-AUDIT -- prove the endpoints the whitelist references actually exist
+  # ---------------------------------------------------------------------------
+  - id: route-audit
+    depends_on: [read-spec]
+    bash: |
+      set -eo pipefail
+      MISSING=0
+      for f in \
+        shopops-api/routes/receiving-sessions.js \
+        shopops-api/routes/inventory-receipt-sessions.js \
+        shopops-api/routes/packing.js \
+        shopops-api/routes/shipping.js \
+        shopops-api/services/receivingSession.js \
+        shopops-api/services/voice-events.js
+      do
+        if [ -f "$f" ]; then
+          echo "OK   $f"
+        else
+          echo "MISS $f"
+          MISSING=1
+        fi
+      done
+
+      if [ "$MISSING" -ne 0 ]; then
+        echo "route-audit: FATAL -- a referenced route/service is missing."
+        echo "The whitelist cannot be authored against endpoints that do not exist."
+        exit 1
+      fi
+
+      echo "--- concurrency contracts (whitelist must honor these) ---"
+      grep -n "expected_version" shopops-api/routes/packing.js | head -5 || true
+      grep -n "idempotency_key" shopops-api/routes/shipping.js | head -5 || true
+      echo "route-audit: PASS"
+
+  # ---------------------------------------------------------------------------
+  # 3. FRESH-BRANCH
+  # ---------------------------------------------------------------------------
+  - id: fresh-branch
+    depends_on: [route-audit]
+    bash: |
+      set -eo pipefail
+      DEFAULT_BRANCH="$(git remote show origin | sed -n 's,.*HEAD branch: ,,p')"
+      if ! git checkout "$DEFAULT_BRANCH" 2>/dev/null; then
+        echo "default branch held by another worktree; staying on current HEAD"
+      fi
+      git fetch origin "$DEFAULT_BRANCH" --depth=50 || true
+      git reset --hard "origin/$DEFAULT_BRANCH" 2>/dev/null || true
+      BASE_BRANCH="wo/shopops-desk-voice-tools-01"
+      BRANCH="${BASE_BRANCH}-run-$(date +%Y%m%d%H%M%S)"
+      if git show-ref --quiet "refs/heads/$BASE_BRANCH"; then
+        if git worktree list --porcelain | grep -q "branch refs/heads/$BASE_BRANCH" && \
+           [ "$(git rev-parse --abbrev-ref HEAD)" != "$BASE_BRANCH" ]; then
+          git checkout -b "$BRANCH"
+        else
+          BRANCH="$BASE_BRANCH"
+          git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH"
+          git reset --hard "origin/$DEFAULT_BRANCH" 2>/dev/null || true
+        fi
+      else
+        BRANCH="$BASE_BRANCH"
+        git checkout -b "$BRANCH"
+      fi
+      echo "BRANCH=${BRANCH}"
+
+  # ---------------------------------------------------------------------------
+  # 4. PLAN
+  # ---------------------------------------------------------------------------
+  - id: plan
+    depends_on: [fresh-branch]
+    task_class: medium_work
+    prompt: |
+      You are planning WO-SHOPOPS-DESK-VOICE-TOOLS-01 in the shopops repo.
+
+      ## Spec
+      $read-spec.output
+
+      ## Verified route surface
+      $route-audit.output
+
+      ## Design anchor (authoritative, do not re-litigate)
+      bdc-harness:docs/architecture/2026-09-16-voice-desk-ops-design.md sections S7 and S8.
+
+      This WO builds ONE thing: a whitelisted HTTP tool surface that a voice front end
+      calls to do receiving and packing work. No audio. No models. No voice-bridge code.
+
+      ## The gate table is RATIFIED POLICY, not a preference
+      Standing ruling (2026-06-26 S10, restated 2026-09-07 rule 4): voice NEVER crosses a
+      gate -- no deploy, no money, no external send, no merge.
+
+      VOICE-ALLOWED (proxy these):
+        GET  /receiving-sessions/:id
+        POST /receiving-sessions                     (open)
+        POST /receiving-sessions/:id/scan
+        POST /receiving-sessions/:id/cancel
+        POST /inventory-receipt/sessions/:id/items
+        GET  /inventory-receipt/sessions/:id/summary
+        GET  /packing/queue
+        GET  /packing/metrics
+        POST /packing/:id/advance                    (QUEUED->PICKED->PACKED only)
+        GET  /shipping
+
+      TYPED-ONLY (return 409 with a spoken-safe message telling the operator to use the screen):
+        POST /receiving-sessions/:id/submit
+        POST /inventory-receipt/commit
+
+      FORBIDDEN (return 403, log the attempt):
+        POST  /shipping/finalize
+        PATCH /shipping/:id
+        anything invoices / billing / Stripe
+
+      ## Two safety properties the existing endpoints demand
+      1. Idempotency. Every voice-originated write carries an idempotency_key derived from
+         subject_key + a hash of the utterance. Voice re-delivery is far more likely than UI
+         double-click. A repeated key must return the FIRST result, not apply twice.
+      2. Optimistic concurrency. /packing/:id/advance requires expected_version. Read the
+         current version immediately before writing. A version conflict must surface as a
+         distinct, spoken-safe error ("someone else moved that one"), never a blind retry.
+
+      ## Produce
+      1. File-by-file plan: routes/desk-voice.js, services/deskVoiceTools.js,
+         migrations/<date>_desk_voice_log.sql, tests/test_desk_voice_tools.js.
+      2. The exact whitelist data structure (tool name -> method, path, gate class,
+         required params, whether it needs a version pre-read).
+      3. Auth decision, following the mixed-auth precedent already in routes/pos-voice.js
+         (VOICE_BRIDGE_TOKEN shared secret for bridge-originated calls).
+      4. desk_voice_log columns: at minimum tenant_id, tool_name, gate_class, idempotency_key,
+         subject_key, utterance, outcome, created_at. Append-only.
+      5. The test matrix. Minimum 9 tests, and it MUST include one test per gate class:
+         an allowed call succeeds, a typed-only call returns 409, a forbidden call returns 403,
+         a duplicate idempotency_key does not double-apply, and a stale expected_version
+         returns the conflict error.
+
+      Do not write code in this node. Plan only.
+
+  # ---------------------------------------------------------------------------
+  # 5. IMPLEMENT
+  # ---------------------------------------------------------------------------
+  - id: implement
+    depends_on: [plan]
+    task_class: medium_work
+    prompt: |
+      Implement WO-SHOPOPS-DESK-VOICE-TOOLS-01 in the shopops repo per this plan:
+
+      $plan.output
+
+      ## House rules (shopops-api)
+      - Match the surrounding style in shopops-api/routes/: 'use strict', var, express.Router(),
+        promise chains with pool.connect() + beginSession(client, tenantId, '<label>'), and
+        client.release() on EVERY path including errors. Do not introduce async/await or ESM
+        into these files -- the existing routes are CommonJS.
+      - ASCII ONLY. No emojis in code (house constraint, see CLAUDE_CONSTRAINTS.md).
+      - Reuse services/voice-events.js for any SSE desk event broadcast. Do not write a second
+        pub/sub.
+      - Follow routes/pos-voice.js for the VOICE_BRIDGE_TOKEN middleware pattern.
+      - Mount the router in shopops-api/index.js BEFORE any catch-all that would swallow it
+        (same hazard pos-voice.js documents).
+
+      ## Fail-fast, no silent fallback
+      A tool name not in the whitelist is an error, never a passthrough. Never forward an
+      unknown path to shopops-api. Never downgrade a FORBIDDEN call to a warning.
+
+      ## Deliverables
+      - shopops-api/services/deskVoiceTools.js -- whitelist table + pure helpers
+        (resolveTool, classifyGate, buildIdempotencyKey, classifyVersionConflict). Pure
+        functions, no I/O, so they are unit-testable without a database.
+      - shopops-api/routes/desk-voice.js -- the HTTP surface.
+      - shopops-api/migrations/<YYYYMMDD>_desk_voice_log.sql -- append-only audit table.
+      - shopops-api/tests/test_desk_voice_tools.js -- the full matrix from the plan.
+
+      Run the tests yourself and iterate until they pass. Report the final count.
+
+  # ---------------------------------------------------------------------------
+  # 6. VERIFY -- grep assertions (structure) and tests (behavior), run in parallel
+  # ---------------------------------------------------------------------------
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -eo pipefail
+      FAIL=0
+      check() {
+        if grep -q "$1" "$2" 2>/dev/null; then
+          echo "OK   $2 <- $1"
+        else
+          echo "FAIL $2 <- $1"
+          FAIL=1
+        fi
+      }
+
+      check "deskVoiceTools"   shopops-api/routes/desk-voice.js
+      check "VOICE_BRIDGE_TOKEN" shopops-api/routes/desk-voice.js
+      check "idempotency"      shopops-api/services/deskVoiceTools.js
+      check "expected_version" shopops-api/services/deskVoiceTools.js
+      check "desk-voice"       shopops-api/index.js
+
+      # The gate table must be enforced in code, not just documented.
+      check "403" shopops-api/routes/desk-voice.js
+      check "409" shopops-api/routes/desk-voice.js
+
+      if ! ls shopops-api/migrations/*desk_voice_log.sql >/dev/null 2>&1; then
+        echo "FAIL missing desk_voice_log migration"
+        FAIL=1
+      else
+        echo "OK   desk_voice_log migration present"
+      fi
+
+      # Guard against the whitelist ever containing a forbidden endpoint.
+      if grep -nE "shipping/finalize|/shipping/:id" shopops-api/services/deskVoiceTools.js \
+         | grep -viE "forbidden|403|deny" >/dev/null 2>&1; then
+        echo "FAIL forbidden shipping endpoint appears in whitelist without a deny marker"
+        FAIL=1
+      else
+        echo "OK   no forbidden shipping endpoint in whitelist"
+      fi
+
+      if [ "$FAIL" -ne 0 ]; then
+        echo "verify-grep: FAIL"
+        exit 1
+      fi
+      echo "verify-grep: PASS"
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -eo pipefail
+      cd shopops-api
+      if [ -f bun.lock ] || [ -f package.json ]; then
+        bun install --frozen-lockfile 2>/dev/null || bun install || true
+      fi
+      bun test tests/test_desk_voice_tools.js 2>&1 | tail -30
+
+  # ---------------------------------------------------------------------------
+  # 7. COMMIT AND PUSH
+  # ---------------------------------------------------------------------------
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    load_bearing: true
+    bash: |
+      set -eo pipefail
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+
+      git add \
+        shopops-api/routes/desk-voice.js \
+        shopops-api/services/deskVoiceTools.js \
+        shopops-api/tests/test_desk_voice_tools.js
+      git add shopops-api/migrations/*desk_voice_log.sql
+      git add shopops-api/index.js
+
+      if git diff --cached --quiet; then
+        echo "commit-and-push: FATAL -- no staged changes; implement produced nothing."
+        exit 1
+      fi
+
+      git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+        commit -m "$(printf 'feat(api): WO-SHOPOPS-DESK-VOICE-TOOLS-01 -- desk voice tool surface\n\nAdds routes/desk-voice.js: whitelisted receiving/packing tool surface for the\nvoice front end (Phase 1 of Voice Desk Ops).\nAdds services/deskVoiceTools.js: whitelist, gate classification, idempotency\nkey derivation, version-conflict classification.\nAdds desk_voice_log migration (append-only audit).\n\nEnforces the ratified voice gate table: scan/count/flag/advance allowed;\nsubmit and commit typed-only (409); shipping-finalize and billing forbidden (403).\n\nDesign: bdc-harness:docs/architecture/2026-09-16-voice-desk-ops-design.md\nPhase 2 (voice-bridge front end) is a separate WO.')"
+
+      for attempt in 1 2 3 4 5; do
+        if git push -u origin "$BRANCH"; then
+          echo "BRANCH=${BRANCH}"
+          echo "BRANCH_SHA=$(git rev-parse HEAD)"
+          exit 0
+        fi
+        echo "push attempt ${attempt} failed; retrying"
+        sleep $((attempt * 2))
+      done
+      echo "commit-and-push: FATAL -- push failed after 5 attempts"
+      exit 1
+
+  # ---------------------------------------------------------------------------
+  # 8. OPEN PR
+  # ---------------------------------------------------------------------------
+  - id: open-pr
+    depends_on: [commit-and-push]
+    load_bearing: true
+    bash: |
+      set -eo pipefail
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      REPO="thinmansoftware/shopops"
+      BASE="master"
+      TITLE="feat(api): WO-SHOPOPS-DESK-VOICE-TOOLS-01 -- desk voice tool surface"
+      BODY_FILE=$(mktemp)
+      printf '## Summary\nPhase 1 of Voice Desk Ops. Adds the whitelisted ShopOps tool surface a voice\nfront end calls to do receiving and packing work.\n\nNo audio, no models, no voice-bridge code in this PR -- that is Phase 2 in\nbluedevilcollectibles/voice-bridge under a separate WO.\n\n## Gate table (ratified policy)\nVoice NEVER crosses a gate (2026-06-26 S10, restated 2026-09-07 rule 4).\n\n- ALLOWED: receiving open/scan/cancel, manual intake items, packing queue/metrics/advance, reads\n- TYPED-ONLY (409): receiving submit, inventory-receipt commit\n- FORBIDDEN (403): shipping finalize, shipping PATCH, anything billing\n\n## Safety properties\n- Idempotency keys on every voice-originated write (voice re-delivery is likelier than UI double-click)\n- expected_version pre-read on /packing/:id/advance; conflicts surface as a distinct spoken-safe error\n\n## Verification\nSee the manifest comment on the WO issue.\n\n## Design\nbdc-harness:docs/architecture/2026-09-16-voice-desk-ops-design.md\n\n## Review before merge\nApply the desk_voice_log migration to staging BEFORE rebuilding shopops-api.\n' > "$BODY_FILE"
+
+      existing_pr_url() {
+        gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+          --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null
+      }
+
+      PR_URL="$(existing_pr_url)"
+      if [ -n "$PR_URL" ]; then
+        echo "PR_URL=$PR_URL"
+        exit 0
+      fi
+
+      for attempt in 1 2 3 4 5; do
+        if PR_OUT=$(gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" \
+             --title "$TITLE" --body-file "$BODY_FILE" 2>&1); then
+          echo "PR_URL=$PR_OUT"
+          exit 0
+        fi
+        PR_URL="$(existing_pr_url)"
+        if [ -n "$PR_URL" ]; then
+          echo "PR_URL=$PR_URL"
+          exit 0
+        fi
+        echo "pr create attempt ${attempt} failed; retrying"
+        sleep 10
+      done
+      echo "open-pr: FATAL -- PR creation failed after 5 attempts"
+      exit 1
+
+  # ---------------------------------------------------------------------------
+  # 9. BUILD MANIFEST
+  # ---------------------------------------------------------------------------
+  - id: build-manifest
+    depends_on: [open-pr]
+    task_class: clerical
+    prompt: |
+      Build the review manifest for WO-SHOPOPS-DESK-VOICE-TOOLS-01. Report only what the
+      node outputs actually show. If something was not verified, write NOT VERIFIED --
+      never infer a pass.
+
+      Format:
+
+      ## WO-SHOPOPS-DESK-VOICE-TOOLS-01 -- REVIEW
+
+      Phase: 1 of 3 (ShopOps tool surface; no audio/models in this WO)
+      Files created (shopops):
+        shopops-api/routes/desk-voice.js
+        shopops-api/services/deskVoiceTools.js
+        shopops-api/migrations/<date>_desk_voice_log.sql
+        shopops-api/tests/test_desk_voice_tools.js
+      Files modified: shopops-api/index.js (router mount)
+      Tests: [count]/[total] via bun
+      PR: [PR URL from open-pr]
+      Grep assertions: [from verify-grep]
+      Gate table enforcement: [which gate-class tests passed -- allowed / 409 typed-only / 403 forbidden]
+      Idempotency test: [pass/fail]
+      Version-conflict test: [pass/fail]
+      Migration: apply <date>_desk_voice_log.sql to staging Supabase BEFORE rebuild.
+        Verify: SELECT table_name FROM information_schema.tables WHERE table_name = 'desk_voice_log'
+      VALIDATION: [PASS / PASS pending staging migration / FAIL]
+      Polish bar: HIGH
+
+      Phase 2 (NOT in this WO): voice-bridge front end -- IVoiceFrontEnd registry,
+      local-cascade provider, Lane A grammar, M-129 rail client, poller heartbeat,
+      native-Windows audio host. Needs its own WO in bluedevilcollectibles/voice-bridge.
+
+      ## Inputs
+      $read-spec.output / $route-audit.output / $plan.output / $verify-grep.output /
+      $verify-tests.output / $commit-and-push.output / $open-pr.output
+
+  # ---------------------------------------------------------------------------
+  # 10. FLIP-NOTION -- final node (Rule 5). Notion is a free-plan read-only archive,
+  #     so the real state flip is the GitHub issue label + manifest comment.
+  # ---------------------------------------------------------------------------
+  - id: flip-notion
+    depends_on: [build-manifest]
+    task_class: clerical
+    bash: |
+      set -eo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+
+      READ_SPEC_OUT=$read-spec.output
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" \
+            --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "flip-notion: no GitHub issue resolved; skipping status:review label + manifest comment."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 \
+        --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      COMMENT_FILE=$(mktemp)
+      printf '%s\n' "$MANIFEST" > "$COMMENT_FILE"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT_FILE"
+      echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review (manifest posted as comment)"
