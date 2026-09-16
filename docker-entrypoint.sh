@@ -36,6 +36,42 @@ if [ "$(id -u)" = "0" ]; then
       echo "[archon] WARN: failed to copy /run/secrets/cursor-config into /home/appuser/.cursor -- cursor judge rung / provider will report Authentication required unless CURSOR_API_KEY is set" >&2
     fi
   fi
+  # WO-HARNESS-CAULDRON-CREDS-BIND-MOUNT-01: seed the Claude OAuth credential from
+  # the read-only host mount at /run/secrets/claude-creds.
+  #
+  # Why this exists: the Claude SDK reads os.homedir()/.claude/.credentials.json.
+  # This container runs the server as appuser BUT the SDK resolves HOME=/root for
+  # the spawned Claude process (CLAUDE_USE_GLOBAL_AUTH=true), so the credential the
+  # lanes actually use is /root/.claude/.credentials.json. That path lives in the
+  # image layer with no volume behind it, so EVERY `docker compose build app` or
+  # --force-recreate wipes it and every build lane dies with "Not logged in".
+  #
+  # Anchor: 2026-09-16 -- two routine config recreates (a judge-ladder change and a
+  # judge-model change) silently killed the build lanes for 18 hours. Every health
+  # signal stayed green; a human reported it, not the machine. The fix was filed as
+  # this WO on 2026-05-28 and sat unbuilt for ~9 months while operators hand-copied
+  # credentials after each rebuild (doctrine/cauldron-creds-target-root-not-appuser).
+  #
+  # Same shape as the cursor seed above: a read-only mount is COPIED in rather than
+  # mounted over the live path, because the SDK rewrites .credentials.json in place
+  # when it refreshes the token. Mounting read-only would break that refresh; a
+  # writable mount would let the container's refreshed token flow back to the host,
+  # which is desirable but is a separate decision (see the WO's follow-up section).
+  # The /dev/null default is a char device, not a directory, so it is skipped.
+  if [ -d /run/secrets/claude-creds ] && [ -f /run/secrets/claude-creds/.credentials.json ]; then
+    mkdir -p /root/.claude
+    if cp -a /run/secrets/claude-creds/.credentials.json /root/.claude/.credentials.json 2>/dev/null; then
+      chown root:root /root/.claude/.credentials.json
+      chmod 600 /root/.claude/.credentials.json
+      echo "[archon] Claude credential seeded from /run/secrets/claude-creds" >&2
+    else
+      echo "[archon] WARN: failed to copy /run/secrets/claude-creds/.credentials.json to /root/.claude/ -- Claude build lanes will fail with 'Not logged in' until it is installed by hand" >&2
+    fi
+  elif [ -f /root/.claude/.credentials.json ]; then
+    echo "[archon] Claude credential present at /root/.claude (no host mount configured)" >&2
+  else
+    echo "[archon] WARN: no Claude credential at /root/.claude and no /run/secrets/claude-creds mount -- Claude build lanes will fail with 'Not logged in'. Set CLAUDE_CREDS_HOST_PATH in .env. See doctrine/cauldron-creds-target-root-not-appuser." >&2
+  fi
   # WO-168 Tier 1: /host-artifacts is a host bind mount for load-bearing
   # workflow output (git bundles, raw artifacts). Workflow nodes run as
   # appuser, so we must own it. Best-effort: if the mount is missing
