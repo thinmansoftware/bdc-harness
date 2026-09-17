@@ -2,6 +2,7 @@ import type { IndependentReviewFinding, ReviewAgentIdentity } from './independen
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
 import { classifyJudgeOutage, type JudgeOutage } from './judge-ladder-health';
+import { createLogger } from '@archon/paths';
 import {
   buildJudgeTransport,
   defaultJudgeChildSpawn,
@@ -12,6 +13,24 @@ import {
   type JudgeChildSpawn,
   type JudgeTransport,
 } from './judge-transport';
+
+/**
+ * Observability gap found 2026-09-17: this ladder loop classifies a per-rung
+ * reason precisely (`lastError = model_timeout:${binary}`,
+ * `model_exit_nonzero:${binary}`, etc.) but never logged it and never
+ * persisted it -- the dispatch result_body and the posted PR comment both
+ * collapse to one generic `indeterminate:model_timeout` with no way to tell,
+ * after the fact, which rung actually failed or why. That made a live "why is
+ * review failing, I thought it ran on Grok too" question undiagnosable from
+ * logs or the database; answering it required live process-spawn tracing.
+ * These log lines are the fix -- not a new mechanism, just making the
+ * classification that already exists observable.
+ */
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+function getLog(): ReturnType<typeof createLogger> {
+  if (!cachedLog) cachedLog = createLogger('overseer.pr-review-evaluator');
+  return cachedLog;
+}
 
 /**
  * CHECKS_UNAVAILABLE (#775) is TERMINAL and NON-APPROVING: the required
@@ -530,13 +549,20 @@ export async function evaluatePullRequest(
   let transportFailure: string | null = null;
   for (const binary of ladder) {
     if (!nonEmpty(binary)) continue;
+    const rungStartedAt = Date.now();
+    getLog().info(
+      { binary, promptBytes: prompt.length, prNumber: input.pr_number, headSha: input.head_sha },
+      'judge_rung_started'
+    );
     try {
       const result = await deps.invokeModel(binary, prompt);
+      const rungMs = Date.now() - rungStartedAt;
       if (result.timedOut) {
         // A timeout is transport, not judgment: the process started but never
         // delivered anything to judge, so this rung was not reached.
         lastError = `model_timeout:${binary}`;
         transportFailure ??= lastError;
+        getLog().warn({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_timeout');
         continue;
       }
       // The process ran and returned. Whatever happens below is judgment.
@@ -551,13 +577,25 @@ export async function evaluatePullRequest(
         const outage = classifyJudgeOutage(`${result.stderr ?? ''}\n${result.stdout}`);
         if (outage) deps.recordRungOutage?.(binary, outage);
         lastError = outage ? outage.code : `model_exit_nonzero:${binary}`;
+        getLog().warn(
+          {
+            binary,
+            rungMs,
+            exitCode: result.exitCode,
+            outageCode: outage?.code ?? null,
+            prNumber: input.pr_number,
+          },
+          'judge_rung_nonzero_exit'
+        );
         continue;
       }
       // A clean exit proves the rung has quota, credits, and credentials.
       deps.recordRungOutage?.(binary, null);
+      getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_clean_exit');
       const parsed = parseReviewVerdict(result.stdout);
       if (!parsed) {
         lastError = `model_output_invalid:${binary}`;
+        getLog().warn({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_output_invalid');
         continue;
       }
       try {
@@ -565,18 +603,23 @@ export async function evaluatePullRequest(
       } catch {
         return indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch');
       }
+      getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_verdict_produced');
       return {
         ...parsed,
         reviewer: { provider: deps.reviewer.provider, model: binary },
         acceptance_criteria_available: acceptanceCriteriaAvailable,
       };
     } catch (error) {
+      const rungMs = Date.now() - rungStartedAt;
       // A rate limit raised by the model seam (the judge CLIs read GitHub too)
       // is the same deferral, and must abandon the ladder immediately: walking
       // to the next binary would spend more of a budget that is already
       // exhausted and end at INDETERMINATE anyway.
       const rateLimit = classifyRateLimitError(error);
-      if (rateLimit) return rateLimited(input, deps, rateLimit, `invoke_model:${binary}`);
+      if (rateLimit) {
+        getLog().warn({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_rate_limited');
+        return rateLimited(input, deps, rateLimit, `invoke_model:${binary}`);
+      }
       // A thrown quota/credit/auth refusal (#847) is the same judgment failure
       // as a non-zero exit carrying that text: the rung was reachable and the
       // error will recur, so it is terminal and named. Classified on the FULL
@@ -589,6 +632,10 @@ export async function evaluatePullRequest(
         deps.recordRungOutage?.(binary, outage);
         lastError = outage.code;
         nonTransportFailure = true;
+        getLog().warn(
+          { binary, rungMs, outageCode: outage.code, prNumber: input.pr_number },
+          'judge_rung_thrown_outage'
+        );
         continue;
       }
       lastError = `model_error:${errorMessage(error)}`;
@@ -601,11 +648,25 @@ export async function evaluatePullRequest(
         // terminal even if another rung failed on transport.
         nonTransportFailure = true;
       }
+      getLog().warn(
+        {
+          binary,
+          rungMs,
+          errorMessage: error instanceof Error ? error.message : String(error),
+          isTransport: isTransportError(error),
+          prNumber: input.pr_number,
+        },
+        'judge_rung_thrown_error'
+      );
     }
   }
   // Defer ONLY when every rung failed on transport: nothing was ever judged
   // (`reachedAnyRung`) and nothing threw a non-transport error
   // (`nonTransportFailure`). Either one makes the outcome terminal.
+  getLog().info(
+    { prNumber: input.pr_number, lastError, transportFailure, reachedAnyRung, nonTransportFailure },
+    'judge_ladder_exhausted'
+  );
   if (transportFailure && !reachedAnyRung && !nonTransportFailure) {
     return transportError(input, deps, acceptanceCriteriaAvailable, transportFailure);
   }
