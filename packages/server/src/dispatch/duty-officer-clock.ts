@@ -79,18 +79,27 @@ function nudgeBody(): string {
   return `${DUTY_OFFICER_NUDGE_MARKER}\nDuty Officer nudge: this item has been idle. The next step is already in the spec or comments. Do not escalate to XO unless blocked.`;
 }
 
-async function githubJson<T>(path: string, init?: RequestInit): Promise<T> {
+async function githubJson<T>(
+  path: string,
+  options?: { method?: string; extraHeaders?: Record<string, string>; body?: string }
+): Promise<T> {
   const token = githubToken();
   if (!token) throw new Error('duty_officer_github_token_missing');
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+    Authorization: `Bearer ${token}`,
+    'User-Agent': 'bdc-harness-duty-officer-clock',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (options?.extraHeaders) {
+    for (const key of Object.keys(options.extraHeaders)) {
+      headers[key] = options.extraHeaders[key];
+    }
+  }
   const response = await fetch(`https://api.github.com${path}`, {
-    ...init,
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${token}`,
-      'User-Agent': 'bdc-harness-duty-officer-clock',
-      'X-GitHub-Api-Version': '2022-11-28',
-      ...(init?.headers ?? {}),
-    },
+    method: options?.method,
+    headers,
+    body: options?.body,
   });
   if (!response.ok) {
     throw new Error(`duty_officer_github_http_${response.status}`);
@@ -115,7 +124,7 @@ export async function listStaleGithubIssues(): Promise<DutyOfficerStaleIssue[]> 
   const idleHours = Math.max(1, Number(process.env.DUTY_OFFICER_IDLE_HOURS) || 24);
   const cutoff = Date.now() - idleHours * 60 * 60 * 1000;
   const issues = await githubJson<
-    Array<{ number: number; updated_at: string; pull_request?: unknown }>
+    { number: number; updated_at: string; pull_request?: unknown }[]
   >(
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/issues?state=open&labels=${encodeURIComponent('project')}&sort=updated&direction=asc&per_page=20`
   );
@@ -129,7 +138,7 @@ export async function postGithubIssueComment(
   body: string
 ): Promise<void> {
   if (!githubToken()) return;
-  const comments = await githubJson<Array<{ body?: string }>>(
+  const comments = await githubJson<{ body?: string }[]>(
     `/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments?per_page=30`
   );
   if (comments.some(comment => (comment.body ?? '').includes(DUTY_OFFICER_NUDGE_MARKER))) {
@@ -139,7 +148,7 @@ export async function postGithubIssueComment(
     `/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments`,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      extraHeaders: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body }),
     }
   );
