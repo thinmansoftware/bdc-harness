@@ -69,6 +69,7 @@ import {
   stopDispatchEscalationClock,
 } from './dispatch/escalation-clock';
 import { startReviewWorkerClock, stopReviewWorkerClock } from './dispatch/review-worker-clock';
+import { startDutyOfficerClock, stopDutyOfficerClock } from './dispatch/duty-officer-clock';
 import {
   observeStartupRecovery,
   reconcilePendingRunsAtBoot,
@@ -678,6 +679,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       'overseer_review_route_not_configured: set OVERSEER_REVIEW_WEBHOOK_SECRET and OVERSEER_REVIEW_IDENTITY to enable'
     );
   }
+  startDutyOfficerClock();
 
   // Gitea webhook endpoint
   if (gitea) {
@@ -834,6 +836,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopProviderWaitScheduler();
     stopDispatchEscalationClock();
     stopReviewWorkerClock();
+    stopDutyOfficerClock();
     persistence.stopPeriodicFlush();
 
     // Await overseer watcher abort before flushing; bounded by the watcher's own
