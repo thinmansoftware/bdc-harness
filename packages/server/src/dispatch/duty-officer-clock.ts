@@ -123,9 +123,7 @@ export async function listStaleGithubIssues(): Promise<DutyOfficerStaleIssue[]> 
   const name = repo.slice(slash + 1);
   const idleHours = Math.max(1, Number(process.env.DUTY_OFFICER_IDLE_HOURS) || 24);
   const cutoff = Date.now() - idleHours * 60 * 60 * 1000;
-  const issues = await githubJson<
-    { number: number; updated_at: string; pull_request?: unknown }[]
-  >(
+  const issues = await githubJson<{ number: number; updated_at: string; pull_request?: unknown }[]>(
     `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/issues?state=open&labels=${encodeURIComponent('project')}&sort=updated&direction=asc&per_page=20`
   );
   return issues
@@ -301,10 +299,7 @@ export function startDutyOfficerClock(
 ): void {
   if (!dutyOfficerClockEnabled() || timer) return;
   void tickDutyOfficerClock(deps);
-  const interval = Math.max(
-    1_000,
-    Number(process.env.DUTY_OFFICER_CLOCK_INTERVAL_MS) || 900_000
-  );
+  const interval = Math.max(1_000, Number(process.env.DUTY_OFFICER_CLOCK_INTERVAL_MS) || 900_000);
   timer = setInterval(() => void tickDutyOfficerClock(deps), interval);
   timer.unref?.();
 }

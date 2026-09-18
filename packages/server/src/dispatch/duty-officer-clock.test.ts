@@ -125,8 +125,9 @@ describe('duty officer clock', () => {
 
     expect(deps.claimMessage).toHaveBeenCalled();
     expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
-    const createCall = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
-      .mock.calls[0];
+    const createCall = (
+      deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls[0];
     expect(createCall[0]).toEqual({ kind: 'system', sender: 'dispatch' });
     expect(createCall[1]).toEqual(
       expect.objectContaining({
