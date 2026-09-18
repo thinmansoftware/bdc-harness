@@ -743,6 +743,42 @@ export class SqliteAdapter implements IDatabase {
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_supervisor_action_columns_failed');
     }
+
+    // Run-outcome scorecard columns (WO-HARNESS-RUN-OUTCOME-SCORECARD-01).
+    // ALTER the existing table -- no second outcomes table. All nullable so old
+    // rows stay valid until scored. Mirrors migrations/054_run_outcome_scorecard.sql.
+    try {
+      const outcomeCols = this.pragmaAll("PRAGMA table_info('remote_agent_run_outcomes')") as {
+        name: string;
+      }[];
+      const outcomeColNames = new Set(outcomeCols.map(c => c.name));
+      const scorecardAdditions: [string, string][] = [
+        ['score_version', 'TEXT'],
+        ['scored_at', 'TEXT'],
+        ['status_column', 'TEXT'],
+        ['terminal_event', 'TEXT'],
+        ['landing_ok', 'INTEGER CHECK (landing_ok IN (0, 1))'],
+        ['landing_skipped', 'INTEGER CHECK (landing_skipped IN (0, 1))'],
+        ['last_failed_step', 'TEXT'],
+        ['pipeline_axis', 'TEXT'],
+        ['module_axis', 'TEXT'],
+        ['honest_success', 'INTEGER CHECK (honest_success IN (0, 1))'],
+        ['score_partial', 'INTEGER CHECK (score_partial IN (0, 1))'],
+        ['gh_pr_url', 'TEXT'],
+        ['gh_join_complete', 'INTEGER CHECK (gh_join_complete IN (0, 1))'],
+        ['wo_id', 'TEXT'],
+      ];
+      for (const [name, definition] of scorecardAdditions) {
+        if (!outcomeColNames.has(name)) {
+          this.db.run(`ALTER TABLE remote_agent_run_outcomes ADD COLUMN ${name} ${definition}`);
+        }
+      }
+    } catch (e: unknown) {
+      getLog().warn(
+        { err: e as Error },
+        'db.sqlite_migration_run_outcome_scorecard_columns_failed'
+      );
+    }
   }
 
   /**
@@ -1278,7 +1314,24 @@ export class SqliteAdapter implements IDatabase {
         primary_reason TEXT NOT NULL,
         reason_codes TEXT NOT NULL DEFAULT '[]',
         evidence_refs TEXT NOT NULL DEFAULT '[]',
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        -- Honest run-outcome scorecard (WO-HARNESS-RUN-OUTCOME-SCORECARD-01).
+        -- All nullable so old/unscored rows stay valid until scored. Written by
+        -- upsertRunScorecard only; never wiped by a recovery upsertRunOutcome.
+        score_version TEXT,
+        scored_at TEXT,
+        status_column TEXT,
+        terminal_event TEXT,
+        landing_ok INTEGER CHECK (landing_ok IN (0, 1)),
+        landing_skipped INTEGER CHECK (landing_skipped IN (0, 1)),
+        last_failed_step TEXT,
+        pipeline_axis TEXT,
+        module_axis TEXT,
+        honest_success INTEGER CHECK (honest_success IN (0, 1)),
+        score_partial INTEGER CHECK (score_partial IN (0, 1)),
+        gh_pr_url TEXT,
+        gh_join_complete INTEGER CHECK (gh_join_complete IN (0, 1)),
+        wo_id TEXT
       );
 
       -- Durable quota/provider waits replace in-process sleeps

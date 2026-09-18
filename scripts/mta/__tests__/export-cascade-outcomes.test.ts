@@ -18,6 +18,12 @@ import {
   type WorkflowRunExportRow,
 } from '../lib/extract-cascade-outcome';
 import { parseCliArgs, recordsToJsonl, runExport } from '../export-cascade-outcomes';
+import { upsertRunOutcome, upsertRunScorecard } from '../../../packages/core/src/db/workflows';
+import {
+  scoreRunFromEvents,
+  type ScorecardEventInput,
+} from '../../../packages/core/src/run-scorecard';
+import type { RunOutcome } from '../../../packages/workflows/src/reliability/types';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const CLI_PATH = join(REPO_ROOT, 'scripts', 'mta', 'export-cascade-outcomes.ts');
@@ -373,6 +379,155 @@ describe('cascade outcome CLI', () => {
       write: true,
       out: '/tmp/mta.jsonl',
     });
+  });
+
+  // WO-HARNESS-RUN-OUTCOME-SCORECARD-01 Tests 1-3: the honest `status` in the
+  // JSONL is derived from the scored columns (landing_ok / landing_skipped /
+  // terminal_event), NEVER copied from runs.status. Each case seeds a run whose
+  // runs.status is a LIE ('completed'), scores it via scoreRunFromEvents, persists
+  // the scorecard, then exports and asserts the derived status.
+  const SCORE_OUTCOME: RunOutcome = {
+    executionState: 'completed',
+    deliverableState: 'none',
+    validationState: 'not_run',
+    recoveryState: 'not_needed',
+    routeState: 'current',
+    primaryReason: 'execution_completed',
+    reasonCodes: ['execution_completed'],
+    evidenceRefs: [],
+  };
+
+  async function seedScoredRun(opts: {
+    id: string;
+    conversationId: string;
+    userMessage: string;
+    status: string;
+    events: ScorecardEventInput[];
+  }): Promise<void> {
+    await seedRun({
+      id: opts.id,
+      conversationId: opts.conversationId,
+      workflowName: 'bdc-feature-development',
+      userMessage: opts.userMessage,
+      status: opts.status,
+      metadata: {},
+      startedAt: '2026-08-01 10:00:00',
+      completedAt: '2026-08-01 10:05:00',
+    });
+    // The scorecard writer is UPDATE-only, so the outcome row must exist first.
+    await upsertRunOutcome(opts.id, SCORE_OUTCOME, '2026-08-01T09:00:00.000Z');
+    const card = scoreRunFromEvents({
+      status: opts.status,
+      userMessage: opts.userMessage,
+      workflowName: 'bdc-feature-development',
+      events: opts.events,
+    });
+    const wrote = await upsertRunScorecard(opts.id, card, '2026-08-01T10:30:00.000Z');
+    expect(wrote).toBe(true);
+  }
+
+  async function exportOneRow(): Promise<CascadeOutcomeRecord> {
+    const outPath = join(testHome, 'scored.jsonl');
+    const result = await runExport({ since: null, out: outPath, write: true });
+    expect(result.count).toBe(1);
+    const raw = readFileSync(outPath, 'utf8').trim();
+    return JSON.parse(raw) as CascadeOutcomeRecord;
+  }
+
+  test('Test 1: landing success exports status=completed (not because runs.status was completed)', async () => {
+    const convId = await seedConversation();
+    await seedScoredRun({
+      id: 'run-score-landing',
+      conversationId: convId,
+      userMessage: 'WO_ID=WO-HARNESS-LAND-01 --project bdc-harness',
+      status: 'completed',
+      events: [
+        {
+          event_type: 'node_completed',
+          step_name: 'commit-and-push',
+          created_at: '2026-08-01T10:03:00.000Z',
+          data: null,
+        },
+        {
+          event_type: 'workflow_completed',
+          step_name: null,
+          created_at: '2026-08-01T10:05:00.000Z',
+          data: null,
+        },
+      ],
+    });
+    const row = await exportOneRow();
+    expect(row.status).toBe('completed');
+    expect(row.landing_ok).toBe(1);
+    expect(row.honest_success).toBe(1);
+    expect(row.pipeline_axis).toBe('success');
+    expect(row.format_version).toBe('1.0');
+    expect(row.status_column).toBe('completed');
+  });
+
+  test('Test 2: already-satisfied skip exports status=skipped (MTA will not count it as success)', async () => {
+    const convId = await seedConversation();
+    await seedScoredRun({
+      id: 'run-score-skip',
+      conversationId: convId,
+      userMessage: 'WO_ID=WO-HARNESS-SKIP-01 --project bdc-harness',
+      status: 'completed',
+      events: [
+        {
+          event_type: 'node_completed',
+          step_name: 'gate-already-satisfied',
+          created_at: '2026-08-01T10:01:30.000Z',
+          data: { output: '{"ALREADY_SATISFIED":true,"PRECHECK_VERDICT":"already-satisfied"}' },
+        },
+        {
+          event_type: 'workflow_completed',
+          step_name: null,
+          created_at: '2026-08-01T10:02:00.000Z',
+          data: null,
+        },
+      ],
+    });
+    const row = await exportOneRow();
+    expect(row.status).toBe('skipped');
+    expect(row.landing_ok).toBe(0);
+    expect(row.landing_skipped).toBe(1);
+    expect(row.honest_success).toBe(1);
+  });
+
+  test('Test 3: completed-without-landing exports status=failed with last_failed_step + pipeline_axis=spec', async () => {
+    const convId = await seedConversation();
+    await seedScoredRun({
+      id: 'run-score-nolanding',
+      conversationId: convId,
+      userMessage: 'WO_ID=WO-HARNESS-NOLAND-01 --project bdc-harness',
+      status: 'completed',
+      events: [
+        {
+          event_type: 'node_completed',
+          step_name: 'implement',
+          created_at: '2026-08-01T10:02:00.000Z',
+          data: null,
+        },
+        {
+          event_type: 'node_failed',
+          step_name: 'plan-review',
+          created_at: '2026-08-01T10:03:00.000Z',
+          data: null,
+        },
+        {
+          event_type: 'workflow_completed',
+          step_name: null,
+          created_at: '2026-08-01T10:05:00.000Z',
+          data: null,
+        },
+      ],
+    });
+    const row = await exportOneRow();
+    expect(row.status).toBe('failed');
+    expect(row.status_column).toBe('completed');
+    expect(row.honest_success).toBe(0);
+    expect(row.last_failed_step).toBe('plan-review');
+    expect(row.pipeline_axis).toBe('spec');
   });
 
   test('gap honesty CLI: --write emits attribution_complete false for failed unattributed run', async () => {

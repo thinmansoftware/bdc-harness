@@ -130,10 +130,18 @@ function describeDatabaseError(error: unknown): string {
 export async function loadWorkflowRunRows(): Promise<WorkflowRunExportRow[]> {
   try {
     const db = getDatabase();
+    // LEFT JOIN the honest scorecard columns (WO-HARNESS-RUN-OUTCOME-SCORECARD-01).
+    // Not every run has a scored outcome row; unscored rows yield null scorecard
+    // columns and map to honest status 'failed' in the extractor (never runs.status).
     const result = await db.query<WorkflowRunExportRow>(
-      `SELECT id, workflow_name, user_message, status, metadata, started_at, completed_at
-         FROM remote_agent_workflow_runs
-        ORDER BY started_at ASC, id ASC`
+      `SELECT r.id, r.workflow_name, r.user_message, r.status, r.metadata,
+              r.started_at, r.completed_at,
+              o.landing_ok, o.landing_skipped, o.terminal_event, o.pipeline_axis,
+              o.module_axis, o.last_failed_step, o.honest_success, o.score_partial,
+              o.score_version, o.gh_pr_url, o.gh_join_complete, o.status_column
+         FROM remote_agent_workflow_runs r
+         LEFT JOIN remote_agent_run_outcomes o ON o.run_id = r.id
+        ORDER BY r.started_at ASC, r.id ASC`
     );
     return [...result.rows];
   } catch (error: unknown) {

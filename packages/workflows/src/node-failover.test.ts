@@ -231,6 +231,7 @@ function createMockStore(
     listProviderAttempts: mock(() => Promise.resolve([])),
     upsertRunOutcome: mock(() => Promise.resolve(true)),
     getRunOutcome: mock(() => Promise.resolve(null)),
+    upsertRunScorecard: mock(() => Promise.resolve(true)),
     scheduleProviderWait: mock(() => Promise.resolve(true)),
     listDueProviderWaits: mock(() => Promise.resolve([])),
     claimProviderWait: mock(() => Promise.resolve(false)),

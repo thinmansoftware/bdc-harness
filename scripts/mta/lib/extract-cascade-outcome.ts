@@ -21,6 +21,21 @@ export interface WorkflowRunExportRow {
   metadata: unknown;
   started_at: string | Date | null;
   completed_at: string | Date | null;
+  // Honest run-outcome scorecard columns (WO-HARNESS-RUN-OUTCOME-SCORECARD-01),
+  // LEFT JOINed from remote_agent_run_outcomes. All optional/nullable because
+  // not every run has a scored outcome row (unscored -> honest status 'failed').
+  landing_ok?: number | string | null;
+  landing_skipped?: number | string | null;
+  terminal_event?: string | null;
+  pipeline_axis?: string | null;
+  module_axis?: string | null;
+  last_failed_step?: string | null;
+  honest_success?: number | string | null;
+  score_partial?: number | string | null;
+  score_version?: string | null;
+  gh_pr_url?: string | null;
+  gh_join_complete?: number | string | null;
+  status_column?: string | null;
 }
 
 export interface NodeCounts {
@@ -67,6 +82,21 @@ export interface CascadeOutcomeRecord {
   completed_at: string | null;
   duration_s: number | null;
   attribution_complete: boolean;
+  // Optional honest-scorecard extras (WO-HARNESS-RUN-OUTCOME-SCORECARD-01).
+  // MTA cascade_reader ignores unknown keys; format_version stays 1.0. The
+  // `status` field above is now DERIVED from landing_ok/landing_skipped/
+  // terminal_event -- never a copy of runs.status (that copy is `status_column`).
+  landing_ok: number | null;
+  landing_skipped: number | null;
+  pipeline_axis: string | null;
+  module_axis: string | null;
+  last_failed_step: string | null;
+  honest_success: number | null;
+  score_partial: number | null;
+  score_version: string | null;
+  gh_pr_url: string | null;
+  gh_join_complete: number | null;
+  status_column: string | null;
 }
 
 const WO_ID_ASSIGN_RE = /(?:^|\n)\s*WO_ID\s*=\s*(WO-[A-Z0-9-]+)/m;
@@ -258,6 +288,37 @@ export function computeAttributionComplete(
   return true;
 }
 
+/** Coerce a nullable INTEGER column (number or string across engines) to number | null. */
+export function nullableInt(value: number | string | null | undefined): number | null {
+  if (value == null) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function nullableString(value: string | null | undefined): string | null {
+  return value == null ? null : value;
+}
+
+/**
+ * Honest cascade `status` (WO-HARNESS-RUN-OUTCOME-SCORECARD-01). NEVER copies
+ * runs.status. Derived ONLY from the scored columns:
+ *   completed  iff landing_ok = 1
+ *   skipped    iff landing_skipped = 1 and landing_ok != 1
+ *   cancelled  iff terminal_event = workflow_cancelled (and not completed/skipped)
+ *   failed     otherwise (includes unscored rows and completed-without-landing)
+ * MTA cascade_reader counts only {completed, success, succeeded} as success, so a
+ * skip is correctly NOT counted as a build success.
+ */
+export function deriveHonestStatus(row: WorkflowRunExportRow): string {
+  const landingOk = nullableInt(row.landing_ok);
+  const landingSkipped = nullableInt(row.landing_skipped);
+  if (landingOk === 1) return 'completed';
+  if (landingSkipped === 1) return 'skipped';
+  if (row.terminal_event === 'workflow_cancelled') return 'cancelled';
+  return 'failed';
+}
+
 export function runRowToOutcomeRecord(row: WorkflowRunExportRow): CascadeOutcomeRecord {
   const metadata = parseMetadata(row.metadata);
   const userMessage = row.user_message ?? '';
@@ -278,7 +339,8 @@ export function runRowToOutcomeRecord(row: WorkflowRunExportRow): CascadeOutcome
     project: parseProject(userMessage),
     workflow_name: row.workflow_name,
     prior_tier: parsePriorTier(userMessage, metadata),
-    status: row.status,
+    // Honest status derived from the scorecard -- NEVER a copy of runs.status.
+    status: deriveHonestStatus(row),
     node_counts: nodeCounts,
     models_served: served.models,
     model_mismatches: served.mismatches,
@@ -288,5 +350,18 @@ export function runRowToOutcomeRecord(row: WorkflowRunExportRow): CascadeOutcome
     completed_at: completedAt,
     duration_s: durationS,
     attribution_complete: computeAttributionComplete(metadata, served),
+    // Optional scorecard extras (ignored by MTA cascade_reader).
+    landing_ok: nullableInt(row.landing_ok),
+    landing_skipped: nullableInt(row.landing_skipped),
+    pipeline_axis: nullableString(row.pipeline_axis),
+    module_axis: nullableString(row.module_axis),
+    last_failed_step: nullableString(row.last_failed_step),
+    honest_success: nullableInt(row.honest_success),
+    score_partial: nullableInt(row.score_partial),
+    score_version: nullableString(row.score_version),
+    gh_pr_url: nullableString(row.gh_pr_url),
+    gh_join_complete: nullableInt(row.gh_join_complete),
+    // status_column preserves runs.status for contrast only.
+    status_column: nullableString(row.status_column) ?? row.status,
   };
 }
