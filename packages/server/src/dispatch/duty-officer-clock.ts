@@ -12,6 +12,7 @@ import {
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
+import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
 
 const log = createLogger('dispatch/duty-officer-clock');
 
@@ -44,11 +45,27 @@ export interface DutyOfficerClockDeps {
   getCurrentXoLease: () => Promise<XoLease | null>;
   listStaleIssues: () => Promise<DutyOfficerStaleIssue[]>;
   postIssueComment: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
+  judge: (message: DispatchMessage) => Promise<DutyOfficerJudgeVerdict>;
 }
 
 function githubToken(): string | null {
   const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
   return token ? token : null;
+}
+
+export function githubNudgeEnabled(): boolean {
+  return process.env.DUTY_OFFICER_GH_NUDGE === 'true' && Boolean(githubToken());
+}
+
+export function isTaskmasterMailbox(message: DispatchMessage): boolean {
+  const subject = message.subject_key ?? '';
+  const key = message.idempotency_key ?? '';
+  return (
+    message.sender === 'taskmaster' ||
+    key.startsWith('tm:') ||
+    subject.startsWith('digest:') ||
+    subject.startsWith('taskmaster:')
+  );
 }
 
 function namedNextStep(body: string): string | null {
@@ -109,7 +126,7 @@ async function githubJson<T>(
 }
 
 export async function listStaleGithubIssues(): Promise<DutyOfficerStaleIssue[]> {
-  if (!githubToken()) {
+  if (!githubNudgeEnabled()) {
     log.info('duty_officer_github_nudge_skipped');
     return [];
   }
@@ -131,11 +148,27 @@ export async function listStaleGithubIssues(): Promise<DutyOfficerStaleIssue[]> 
     .map(issue => ({ owner, repo: name, number: issue.number }));
 }
 
+function allowedGithubRepo(): { owner: string; repo: string } | null {
+  const repo = process.env.DUTY_OFFICER_GH_REPO?.trim() || 'thinmansoftware/bdc-xo';
+  const slash = repo.indexOf('/');
+  if (slash <= 0) return null;
+  return { owner: repo.slice(0, slash), repo: repo.slice(slash + 1) };
+}
+
 export async function postGithubIssueComment(
   issue: DutyOfficerStaleIssue,
   body: string
 ): Promise<void> {
-  if (!githubToken()) return;
+  if (!githubNudgeEnabled()) return;
+  const allowed = allowedGithubRepo();
+  if (
+    !allowed ||
+    issue.owner.toLowerCase() !== allowed.owner.toLowerCase() ||
+    issue.repo.toLowerCase() !== allowed.repo.toLowerCase()
+  ) {
+    log.warn({ issue }, 'duty_officer_github_repo_refused');
+    return;
+  }
   const comments = await githubJson<{ body?: string }[]>(
     `/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments?per_page=30`
   );
@@ -163,6 +196,7 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
     getCurrentXoLease,
     listStaleIssues: listStaleGithubIssues,
     postIssueComment: postGithubIssueComment,
+    judge: judgeDutyOfficerItem,
   };
 }
 
@@ -189,7 +223,7 @@ async function cueGithubIfPresent(
 ): Promise<void> {
   const issue = parseGithubSubject(message.subject_key);
   if (!issue) return;
-  if (!githubToken()) return;
+  if (!githubNudgeEnabled()) return;
   await deps.postIssueComment(issue, nudgeBody());
 }
 
@@ -201,34 +235,89 @@ function escalationSubjectKey(subjectKey: string | null): string | undefined {
   return undefined;
 }
 
-async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
+function mechanicalVerdict(claimed: DispatchMessage): DutyOfficerJudgeVerdict {
+  if (isTaskmasterMailbox(claimed)) {
+    return {
+      status: 'unconfigured',
+      action: 'hold',
+      reason: 'taskmaster_mailbox',
+      body: '',
+      failures: [],
+    };
+  }
   if (shouldEscalate(claimed)) {
-    const excerpt = claimed.body.length > 500 ? `${claimed.body.slice(0, 500)}...` : claimed.body;
-    const subjectKey = escalationSubjectKey(claimed.subject_key);
-    await deps.createAuthenticatedMessage(DUTY_OFFICER_SENDER, {
-      correlation_id: claimed.correlation_id || `do-clock:${claimed.id}`,
-      idempotency_key: `do-clock-escalation:${claimed.id}`,
-      task_type: 'run_report',
-      recipient: 'xo',
-      priority: claimed.priority === 'blocker' ? 'blocker' : 'normal',
-      body: JSON.stringify({
-        kind: 'duty_officer_escalation',
-        source_id: claimed.id,
-        task_type: claimed.task_type,
-        subject_key: claimed.subject_key,
-        excerpt,
-      }),
-      ...(subjectKey
-        ? { subject_key: subjectKey, repeat_reason: `duty_officer_clock:${claimed.id}` }
-        : {}),
-    });
-    await finishItem(deps, claimed, 'done', 'succeeded', {
+    return {
+      status: 'unconfigured',
+      action: 'escalate_xo',
+      reason: 'mechanical_escalate',
+      body: claimed.body.slice(0, 500),
+      failures: [],
+    };
+  }
+  return {
+    status: 'unconfigured',
+    action: 'nudge',
+    reason: 'mechanical_nudge',
+    body: '',
+    failures: [],
+  };
+}
+
+async function escalateToXo(
+  deps: DutyOfficerClockDeps,
+  claimed: DispatchMessage,
+  verdict: DutyOfficerJudgeVerdict
+): Promise<void> {
+  const excerpt = (verdict.body || claimed.body).slice(0, 500);
+  const subjectKey = escalationSubjectKey(claimed.subject_key);
+  await deps.createAuthenticatedMessage(DUTY_OFFICER_SENDER, {
+    correlation_id: `do-clock:${claimed.id}`,
+    idempotency_key: `do-clock-escalation:${claimed.id}`,
+    task_type: 'agent_message',
+    recipient: 'xo',
+    priority: claimed.priority === 'blocker' ? 'blocker' : 'normal',
+    body: JSON.stringify({
+      kind: 'duty_officer_escalation',
+      source_id: claimed.id,
+      task_type: claimed.task_type,
+      subject_key: claimed.subject_key,
+      transport: verdict.transport ?? null,
+      reason: verdict.reason,
+      excerpt,
+    }),
+    ...(subjectKey
+      ? { subject_key: subjectKey, repeat_reason: `duty_officer_clock:${claimed.id}` }
+      : {}),
+  });
+}
+
+async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
+  let verdict = await deps.judge(claimed);
+  if (verdict.status === 'unconfigured') {
+    verdict = mechanicalVerdict(claimed);
+  }
+  if (verdict.action === 'escalate_xo') {
+    await escalateToXo(deps, claimed, verdict);
+    const outcome: DispatchTaskOutcome = isTaskmasterMailbox(claimed) ? 'blocked' : 'succeeded';
+    await finishItem(deps, claimed, outcome === 'blocked' ? 'failed' : 'done', outcome, {
       disposition: 'escalated_to_xo',
+      transport: verdict.transport ?? null,
     });
     return;
   }
-  await cueGithubIfPresent(deps, claimed);
-  await finishItem(deps, claimed, 'done', 'succeeded', { disposition: 'cued' });
+  if (verdict.action === 'nudge') {
+    await cueGithubIfPresent(deps, claimed);
+    await finishItem(deps, claimed, 'done', 'succeeded', {
+      disposition: 'cued',
+      transport: verdict.transport ?? null,
+    });
+    return;
+  }
+  await finishItem(deps, claimed, 'failed', 'blocked', {
+    disposition: 'held',
+    transport: verdict.transport ?? null,
+    reason: verdict.reason,
+  });
 }
 
 export async function tickDutyOfficerClock(
@@ -269,7 +358,7 @@ export async function tickDutyOfficerClock(
       }
     }
 
-    if (!githubToken()) {
+    if (!githubNudgeEnabled()) {
       log.info('duty_officer_github_nudge_skipped');
       return;
     }

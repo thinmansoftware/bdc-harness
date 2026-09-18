@@ -99,14 +99,23 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
       throw new Error('github_must_not_run_without_token');
     }),
     postIssueComment: mock(async () => {
-      throw new Error('github_must_not_run_without_token');
+      throw new Error('github_must_not_run_without_nudge_flag');
     }),
+    judge: mock(async (item: DispatchMessage) => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: item.task_type === 'run_report' ? ('escalate_xo' as const) : ('hold' as const),
+      reason: 'test',
+      body: item.body,
+      failures: [],
+    })),
   };
 }
 
 afterEach(() => {
   stopDutyOfficerClock();
   delete process.env.DUTY_OFFICER_CLOCK_ENABLED;
+  delete process.env.DUTY_OFFICER_GH_NUDGE;
   delete process.env.GH_TOKEN;
   delete process.env.GITHUB_TOKEN;
 });
@@ -132,7 +141,7 @@ describe('duty officer clock', () => {
     expect(createCall[1]).toEqual(
       expect.objectContaining({
         recipient: 'xo',
-        task_type: 'run_report',
+        task_type: 'agent_message',
         idempotency_key: 'do-clock-escalation:one',
       })
     );
@@ -168,16 +177,25 @@ describe('duty officer clock', () => {
     }
   });
 
-  test('missing GitHub token skips issue nudge and still drains inbox when lease is empty', async () => {
-    const queued = [message({ id: 'two' })];
+  test('GitHub token alone does not nudge; Taskmaster digest is held not succeeded', async () => {
+    const queued = [
+      message({
+        id: 'digest',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'digest:2026-09-18',
+        body: 'sent=0, parked=0',
+      }),
+    ];
     const deps = fakeDeps(queued);
-    delete process.env.GH_TOKEN;
-    delete process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = 'ghs_test_not_a_nudge_grant';
 
     await tickDutyOfficerClock(deps);
 
-    expect(deps.getCurrentXoLease).toHaveBeenCalled();
-    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+    expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'digest', status: 'failed', task_outcome: 'blocked' })
+    );
     expect(deps.listStaleIssues).not.toHaveBeenCalled();
     expect(deps.postIssueComment).not.toHaveBeenCalled();
   });
