@@ -162,9 +162,8 @@ export async function postGithubIssueComment(
   if (!githubNudgeEnabled()) return;
   const allowed = allowedGithubRepo();
   if (
-    !allowed ||
-    issue.owner.toLowerCase() !== allowed.owner.toLowerCase() ||
-    issue.repo.toLowerCase() !== allowed.repo.toLowerCase()
+    allowed?.owner.toLowerCase() !== issue.owner.toLowerCase() ||
+    allowed?.repo.toLowerCase() !== issue.repo.toLowerCase()
   ) {
     log.warn({ issue }, 'duty_officer_github_repo_refused');
     return;

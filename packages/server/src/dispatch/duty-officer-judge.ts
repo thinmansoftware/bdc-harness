@@ -83,7 +83,9 @@ async function chatCompletions(input: {
   extraHeaders?: Record<string, string>;
 }): Promise<string> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), input.timeoutMs);
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, input.timeoutMs);
   let response: Response;
   try {
     response = await input.fetchImpl(input.url, {
