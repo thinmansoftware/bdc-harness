@@ -1134,14 +1134,16 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
   const readHealth = deps.getHealthSample ?? taskmasterDb.getHealthSample;
+  // WO-HARNESS-RETIRE-XAI-DIRECT-LANE-01: the direct xAI health read was removed by decision.
+  // The xAI team account is credit-blocked (bdc-xo#2018) and can never sample healthy;
+  // Grok stays reachable over the Cursor rail. Do NOT restore a direct xAI health read here.
   let codexHealth: taskmasterDb.TmHealthSample | null = null;
-  let xaiHealth: taskmasterDb.TmHealthSample | null = null;
   try {
-    [codexHealth, xaiHealth] = await Promise.all([readHealth('codex'), readHealth('xai')]);
+    codexHealth = await readHealth('codex');
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.lane_health_read_failed');
   }
-  const laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+  const laneDecision = decideFireLane(headroom, { codex: codexHealth });
 
   // Grade previously sent actions against the external SOR.
   tickFailures += await gradeSentActions(

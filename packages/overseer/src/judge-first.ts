@@ -97,7 +97,7 @@ export interface JudgeSpawnResult {
 }
 
 export interface JudgeFirstOptions {
-  /** Ladder rung binaries, cheapest first. Default: env OVERSEER_JUDGE_LADDER or ['grok']. */
+  /** Ladder rung binaries, cheapest first. Default: env OVERSEER_JUDGE_LADDER or ['codex','cursor']. */
   ladder?: string[];
   timeoutMs?: number;
   spawn?: (binary: string, prompt: string) => Promise<JudgeSpawnResult>;
@@ -105,12 +105,17 @@ export interface JudgeFirstOptions {
 }
 
 export function defaultJudgeLadder(): string[] {
-  const raw = process.env.OVERSEER_JUDGE_LADDER ?? 'grok';
+  // WO-HARNESS-RETIRE-XAI-DIRECT-LANE-01: default ladder no longer includes the 'grok'
+  // rung. The xAI account is credit-blocked (bdc-xo#2018) so that rung shelled out to a
+  // dead account; codex + cursor remain. Grok is still reachable when explicitly named in
+  // OVERSEER_JUDGE_LADDER (honoured via judge-transport.ts's generic branch). Do NOT
+  // restore 'grok' as a default.
+  const raw = process.env.OVERSEER_JUDGE_LADDER ?? 'codex,cursor';
   const rungs = raw
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
-  return rungs.length > 0 ? rungs : ['grok'];
+  return rungs.length > 0 ? rungs : ['codex', 'cursor'];
 }
 
 function truncate(value: string, cap: number): string {

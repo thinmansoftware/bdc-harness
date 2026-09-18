@@ -144,9 +144,12 @@ function buildGrokPrompt(evidence: GrokJudgeEvidence): string {
  * fallback. Reads the SAME env var so one flip recovers both sites.
  */
 function secondOpinionBinary(): string {
-  const raw = process.env.OVERSEER_JUDGE_LADDER ?? 'grok';
+  // WO-HARNESS-RETIRE-XAI-DIRECT-LANE-01: default first rung is no longer 'grok' -- the
+  // xAI account is credit-blocked (bdc-xo#2018). Mirrors the primary judge default
+  // (judge-first.ts). Grok stays reachable when explicitly named in OVERSEER_JUDGE_LADDER.
+  const raw = process.env.OVERSEER_JUDGE_LADDER ?? 'codex,cursor';
   const first = raw.split(',')[0]?.trim();
-  return first && first.length > 0 ? first : 'grok';
+  return first && first.length > 0 ? first : 'codex';
 }
 
 /**
