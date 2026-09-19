@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import {
+  githubIssueInAllowList,
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
@@ -120,6 +121,7 @@ afterEach(() => {
   stopDutyOfficerClock();
   delete process.env.DUTY_OFFICER_CLOCK_ENABLED;
   delete process.env.DUTY_OFFICER_GH_NUDGE;
+  delete process.env.DUTY_OFFICER_GH_REPO;
   delete process.env.GH_TOKEN;
   delete process.env.GITHUB_TOKEN;
 });
@@ -182,10 +184,11 @@ describe('duty officer clock', () => {
     }
   });
 
-  test('GitHub token alone does not nudge; Taskmaster digest is held not succeeded', async () => {
+  test('GitHub token alone does not nudge; Taskmaster digest is succeeded not held', async () => {
     const queued = [
       message({
         id: 'digest',
+        correlation_id: 'tm-journal-digest',
         task_type: 'agent_message',
         sender: 'taskmaster',
         subject_key: 'digest:2026-09-18',
@@ -198,19 +201,19 @@ describe('duty officer clock', () => {
     await tickDutyOfficerClock(deps);
 
     expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
-    expect(deps.releaseMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'digest', worker_id: 'duty-officer-clock' })
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'digest', status: 'done', task_outcome: 'succeeded' })
     );
-    expect(deps.postResult).not.toHaveBeenCalled();
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
     expect(deps.listStaleIssues).not.toHaveBeenCalled();
     expect(deps.postIssueComment).not.toHaveBeenCalled();
   });
 
-  test('Taskmaster mailbox is held even when the judge returns nudge', async () => {
+  test('Taskmaster digest is succeeded even when the judge returns nudge', async () => {
     const queued = [
       message({
         id: 'digest-nudge',
-        correlation_id: 'taskmaster-digest-2026-09-18',
+        correlation_id: 'tm-journal-digest-nudge',
         task_type: 'agent_message',
         sender: 'taskmaster',
         subject_key: 'digest:2026-09-18',
@@ -230,10 +233,62 @@ describe('duty officer clock', () => {
     await tickDutyOfficerClock(deps);
 
     expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
-    expect(deps.releaseMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'digest-nudge', worker_id: 'duty-officer-clock' })
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'digest-nudge', status: 'done', task_outcome: 'succeeded' })
     );
-    expect(deps.postResult).not.toHaveBeenCalled();
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  test('Taskmaster self-pause copies to xo then succeeds the source row', async () => {
+    const queued = [
+      message({
+        id: 'pause',
+        correlation_id: 'tm-self-pause-3',
+        idempotency_key: 'tm:self-pause:3',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'taskmaster:self-pause',
+        body: 'Taskmaster self-paused',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledWith(
+      { kind: 'system', sender: 'dispatch' },
+      expect.objectContaining({
+        recipient: 'xo',
+        correlation_id: 'tm-self-pause-3',
+        subject_key: 'taskmaster:self-pause',
+      })
+    );
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'pause', status: 'done', task_outcome: 'succeeded' })
+    );
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  test('opt-in GitHub nudge posts stale issues; foreign repos are refused', async () => {
+    const deps = fakeDeps([]);
+    deps.listStaleIssues = mock(async () => [
+      { owner: 'thinmansoftware', repo: 'bdc-xo', number: 12 },
+    ]);
+    deps.postIssueComment = mock(async () => {});
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GITHUB_TOKEN = 'ghs_test';
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.listStaleIssues).toHaveBeenCalled();
+    expect(deps.postIssueComment).toHaveBeenCalledWith(
+      { owner: 'thinmansoftware', repo: 'bdc-xo', number: 12 },
+      expect.stringContaining('duty-officer-nudge')
+    );
+    expect(githubIssueInAllowList({ owner: 'thinmansoftware', repo: 'bdc-xo', number: 1 })).toBe(
+      true
+    );
+    expect(githubIssueInAllowList({ owner: 'other', repo: 'bdc-xo', number: 1 })).toBe(false);
   });
 
   test('judge outage holds the item instead of escalating to xo', async () => {

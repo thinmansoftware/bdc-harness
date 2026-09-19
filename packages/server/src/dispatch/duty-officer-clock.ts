@@ -59,6 +59,17 @@ export function githubNudgeEnabled(): boolean {
   return process.env.DUTY_OFFICER_GH_NUDGE === 'true' && Boolean(githubToken());
 }
 
+export function isTaskmasterSelfPause(message: DispatchMessage): boolean {
+  const subject = message.subject_key ?? '';
+  const key = message.idempotency_key ?? '';
+  const correlation = message.correlation_id ?? '';
+  return (
+    subject.startsWith('taskmaster:self-pause') ||
+    key.startsWith('tm:self-pause:') ||
+    correlation.startsWith('tm-self-pause-')
+  );
+}
+
 export function isTaskmasterMailbox(message: DispatchMessage): boolean {
   const subject = message.subject_key ?? '';
   const key = message.idempotency_key ?? '';
@@ -157,16 +168,20 @@ function allowedGithubRepo(): { owner: string; repo: string } | null {
   return { owner: repo.slice(0, slash), repo: repo.slice(slash + 1) };
 }
 
+export function githubIssueInAllowList(issue: DutyOfficerStaleIssue): boolean {
+  const allowed = allowedGithubRepo();
+  return (
+    allowed?.owner?.toLowerCase() === issue.owner.toLowerCase() &&
+    allowed?.repo?.toLowerCase() === issue.repo.toLowerCase()
+  );
+}
+
 export async function postGithubIssueComment(
   issue: DutyOfficerStaleIssue,
   body: string
 ): Promise<void> {
   if (!githubNudgeEnabled()) return;
-  const allowed = allowedGithubRepo();
-  if (
-    allowed?.owner?.toLowerCase() !== issue.owner.toLowerCase() ||
-    allowed?.repo?.toLowerCase() !== issue.repo.toLowerCase()
-  ) {
+  if (!githubIssueInAllowList(issue)) {
     log.warn({ issue }, 'duty_officer_github_repo_refused');
     return;
   }
@@ -234,15 +249,25 @@ function escalationSubjectKey(subjectKey: string | null): string | undefined {
   if (parseGithubSubject(subjectKey)) return subjectKey;
   if (/^wo:WO-[A-Z0-9]+(?:-[A-Z0-9]+)*$/.test(subjectKey)) return subjectKey;
   if (/^digest:\d{4}-\d{2}-\d{2}$/.test(subjectKey)) return subjectKey;
+  if (subjectKey.startsWith('taskmaster:')) return subjectKey;
   return undefined;
 }
 
 function mechanicalVerdict(claimed: DispatchMessage): DutyOfficerJudgeVerdict {
+  if (isTaskmasterSelfPause(claimed)) {
+    return {
+      status: 'unconfigured',
+      action: 'escalate_xo',
+      reason: 'taskmaster_self_pause',
+      body: claimed.body.slice(0, 500),
+      failures: [],
+    };
+  }
   if (isTaskmasterMailbox(claimed)) {
     return {
       status: 'unconfigured',
-      action: 'hold',
-      reason: 'taskmaster_mailbox',
+      action: 'nudge',
+      reason: 'taskmaster_digest',
       body: '',
       failures: [],
     };
@@ -311,14 +336,21 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
   if (verdict.status === 'unconfigured') {
     verdict = mechanicalVerdict(claimed);
   }
-  if (verdict.status === 'failed') {
-    await holdItem(deps, claimed);
-    return;
-  }
   if (isTaskmasterMailbox(claimed)) {
-    if (verdict.action === 'escalate_xo') {
+    if (
+      verdict.status === 'failed' ||
+      verdict.action === 'escalate_xo' ||
+      isTaskmasterSelfPause(claimed)
+    ) {
       await escalateToXo(deps, claimed, verdict);
     }
+    await finishItem(deps, claimed, 'done', 'succeeded', {
+      disposition: 'taskmaster_mailbox',
+      transport: verdict.transport ?? null,
+    });
+    return;
+  }
+  if (verdict.status === 'failed') {
     await holdItem(deps, claimed);
     return;
   }

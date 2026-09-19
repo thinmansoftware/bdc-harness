@@ -60,6 +60,9 @@ describe('duty officer judge', () => {
         '{"action":"escalate_xo","reason":"refund the customer","body":"x"}'
       )
     ).toThrow(/forbidden_verb/);
+    expect(() =>
+      parseDutyOfficerJudgeText('{"action":"escalate_xo","reason":"email the customer","body":"x"}')
+    ).toThrow(/forbidden_verb/);
   });
 
   test('falls back to xAI Grok when OpenRouter fails', async () => {

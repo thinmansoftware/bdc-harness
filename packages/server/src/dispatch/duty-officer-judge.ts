@@ -19,10 +19,10 @@ Reply with JSON only:
 {"action":"escalate_xo"|"nudge"|"hold","reason":"<short>","body":"<factual payload for xo or nudge>"}
 escalate_xo = post to recipient xo (the session holding the XO lease).
 nudge = idle work whose next step is already written.
-hold = Taskmaster digest/self-pause or mail that must stay open for XO, not marked succeeded.`;
+hold = park non-Taskmaster mail that is not yet actionable. Taskmaster digest and self-pause are never hold.`;
 
 const SPEND_SEND_DEPLOY_RE =
-  /\b(charge|bill|invoice(?:d)?|refund|pay(?:ment|out)?|wire|transfer\s+funds|withdraw|deposit|purchase|buy(?:\s+now)?|deploy|merge\s+(?:to|into)\s+(?:main|master|prod|production)|push\s+to\s+prod(?:uction)?)\b/i;
+  /\b(charge|bill|invoice(?:d)?|refund|pay(?:ment|out)?|wire|transfer\s+funds|withdraw|deposit|purchase|buy(?:\s+now)?|discount(?:ed)?(?:\s+\w+){0,3}?\s+(?:\d+\s*%|\d+\s*percent|percent)|discount(?:ed)?\s+\d|price\s+match|comp(?:\s+the\s+order)?|send\s+(?:the\s+)?(?:email|sms|text|message|dm|invoice|listing)|email\s+the\s+customer|text\s+the\s+customer|post\s+to\s+(?:whatnot|instagram|facebook|discord)|publish\s+the\s+listing|go\s+live|deploy|merge\s+(?:to|into)\s+(?:main|master|prod|production)|push\s+to\s+prod(?:uction)?|activate\s+the\s+listing|mark\s+(?:it\s+)?send-ready)\b/i;
 
 export type DutyOfficerJudgeAction = 'escalate_xo' | 'nudge' | 'hold';
 
