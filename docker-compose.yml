@@ -87,6 +87,7 @@ services:
       # from env_file), native xAI Grok backup (XAI_API_KEY). GitHub issue comments
       # stay off unless DUTY_OFFICER_GH_NUDGE=true -- do not treat GITHUB_TOKEN as consent.
       DUTY_OFFICER_OPENROUTER_MODEL: ${DUTY_OFFICER_OPENROUTER_MODEL:-x-ai/grok-4.6}
+      DUTY_OFFICER_JUDGE_ENABLED: ${DUTY_OFFICER_JUDGE_ENABLED:-true}
       DUTY_OFFICER_GH_NUDGE: ${DUTY_OFFICER_GH_NUDGE:-false}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"

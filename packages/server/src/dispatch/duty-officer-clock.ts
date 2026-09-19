@@ -5,6 +5,7 @@ import {
   listMessages,
   postResult,
   registerWorker,
+  releaseMessage,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
   type DispatchSenderContext,
@@ -38,6 +39,7 @@ export interface DutyOfficerClockDeps {
   listMessages: typeof listMessages;
   claimMessage: typeof claimMessage;
   postResult: typeof postResult;
+  releaseMessage: typeof releaseMessage;
   createAuthenticatedMessage: (
     context: DispatchSenderContext,
     data: CreateAuthenticatedMessageData
@@ -191,6 +193,7 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
     listMessages,
     claimMessage,
     postResult,
+    releaseMessage,
     createAuthenticatedMessage,
     getCurrentXoLease,
     listStaleIssues: listStaleGithubIssues,
@@ -290,6 +293,19 @@ async function escalateToXo(
   });
 }
 
+function holdBackoffMs(): number {
+  return Math.max(60_000, Number(process.env.DUTY_OFFICER_HOLD_BACKOFF_MS) || 6 * 60 * 60 * 1000);
+}
+
+async function holdItem(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
+  await deps.releaseMessage({
+    id: claimed.id,
+    worker_id: DUTY_OFFICER_WORKER_ID,
+    fencing_token: claimed.fencing_token,
+    not_before: new Date(Date.now() + holdBackoffMs()).toISOString(),
+  });
+}
+
 async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
   let verdict = await deps.judge(claimed);
   if (verdict.status === 'unconfigured') {
@@ -297,8 +313,11 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
   }
   if (verdict.action === 'escalate_xo') {
     await escalateToXo(deps, claimed, verdict);
-    const outcome: DispatchTaskOutcome = isTaskmasterMailbox(claimed) ? 'blocked' : 'succeeded';
-    await finishItem(deps, claimed, outcome === 'blocked' ? 'failed' : 'done', outcome, {
+    if (isTaskmasterMailbox(claimed)) {
+      await holdItem(deps, claimed);
+      return;
+    }
+    await finishItem(deps, claimed, 'done', 'succeeded', {
       disposition: 'escalated_to_xo',
       transport: verdict.transport ?? null,
     });
@@ -312,11 +331,7 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
     });
     return;
   }
-  await finishItem(deps, claimed, 'failed', 'blocked', {
-    disposition: 'held',
-    transport: verdict.transport ?? null,
-    reason: verdict.reason,
-  });
+  await holdItem(deps, claimed);
 }
 
 export async function tickDutyOfficerClock(

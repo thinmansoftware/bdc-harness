@@ -780,7 +780,8 @@ describe('tm_journal DAL', () => {
   test('reset winning before notice enqueue rejects the obsolete paused epoch', async () => {
     await db.query(`INSERT INTO dispatch_principals
       (principal_id, display_name, delivery_mode, active)
-      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)
+      ON CONFLICT (principal_id) DO NOTHING`);
     const paused = await setPauseState({
       pause_state: 'PAUSED',
       pause_scope: 'effects',
@@ -817,7 +818,8 @@ describe('tm_journal DAL', () => {
   test('notice enqueue holds the SQLite writer fence across control read and insert', async () => {
     await db.query(`INSERT INTO dispatch_principals
       (principal_id, display_name, delivery_mode, active)
-      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)
+      ON CONFLICT (principal_id) DO NOTHING`);
     const paused = await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects' });
     const other = new Database(currentDbPath);
     other.run('PRAGMA busy_timeout=0');
@@ -885,7 +887,8 @@ describe('tm_journal DAL', () => {
   test('notice fence accepts a paused epoch returned as text by the database driver', async () => {
     await db.query(`INSERT INTO dispatch_principals
       (principal_id, display_name, delivery_mode, active)
-      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)
+      ON CONFLICT (principal_id) DO NOTHING`);
     const paused = await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects' });
     const originalQuery = db.query.bind(db);
     db.query = <T>(sql: string, params?: unknown[]) =>
@@ -925,7 +928,8 @@ describe('tm_journal DAL', () => {
   test('notice fence refuses a concurrent HARD_PAUSE at the authorized epoch', async () => {
     await db.query(`INSERT INTO dispatch_principals
       (principal_id, display_name, delivery_mode, active)
-      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)
+      ON CONFLICT (principal_id) DO NOTHING`);
     const paused = await setPauseState({
       pause_state: 'PAUSED',
       pause_scope: 'effects',
@@ -966,7 +970,8 @@ describe('tm_journal DAL', () => {
   test('notice fence refuses a concurrent re-pause onto a different scope', async () => {
     await db.query(`INSERT INTO dispatch_principals
       (principal_id, display_name, delivery_mode, active)
-      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)
+      ON CONFLICT (principal_id) DO NOTHING`);
     const paused = await setPauseState({
       pause_state: 'PAUSED',
       pause_scope: 'effects',

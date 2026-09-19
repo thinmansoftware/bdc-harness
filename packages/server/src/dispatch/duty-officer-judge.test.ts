@@ -46,6 +46,7 @@ afterEach(() => {
   delete process.env.OPENROUTER_API_KEY;
   delete process.env.GLM_API_KEY;
   delete process.env.XAI_API_KEY;
+  delete process.env.DUTY_OFFICER_JUDGE_ENABLED;
 });
 
 describe('duty officer judge', () => {
@@ -62,6 +63,7 @@ describe('duty officer judge', () => {
   });
 
   test('falls back to xAI Grok when OpenRouter fails', async () => {
+    process.env.DUTY_OFFICER_JUDGE_ENABLED = 'true';
     process.env.OPENROUTER_API_KEY = 'or-test';
     process.env.XAI_API_KEY = 'xai-test';
     let calls = 0;
@@ -100,5 +102,12 @@ describe('duty officer judge', () => {
     const verdict = await judgeDutyOfficerItem(message());
     expect(verdict.status).toBe('unconfigured');
     expect(verdict.action).toBe('hold');
+  });
+
+  test('unconfigured when judge flag is off even with a key', async () => {
+    process.env.OPENROUTER_API_KEY = 'or-test';
+    const verdict = await judgeDutyOfficerItem(message());
+    expect(verdict.status).toBe('unconfigured');
+    expect(verdict.reason).toBe('judge_disabled');
   });
 });

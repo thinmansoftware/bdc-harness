@@ -93,6 +93,10 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
           }
         : null;
     }),
+    releaseMessage: mock(async input => {
+      const found = queued.find(item => item.id === input.id);
+      return found ? { ...found, status: 'queued' as const, lease_owner: null } : null;
+    }),
     createAuthenticatedMessage: mock(async () => ({ id: 'xo-msg' })),
     getCurrentXoLease: mock(async () => null),
     listStaleIssues: mock(async () => {
@@ -193,9 +197,10 @@ describe('duty officer clock', () => {
     await tickDutyOfficerClock(deps);
 
     expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
-    expect(deps.postResult).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'digest', status: 'failed', task_outcome: 'blocked' })
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'digest', worker_id: 'duty-officer-clock' })
     );
+    expect(deps.postResult).not.toHaveBeenCalled();
     expect(deps.listStaleIssues).not.toHaveBeenCalled();
     expect(deps.postIssueComment).not.toHaveBeenCalled();
   });

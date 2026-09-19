@@ -127,6 +127,13 @@ async function chatCompletions(input: {
   return content;
 }
 
+function redactSecrets(text: string): string {
+  return text
+    .replace(/sk-or-[A-Za-z0-9_-]+/g, '[redacted]')
+    .replace(/gh[pousr]_[A-Za-z0-9]+/g, '[redacted]')
+    .replace(/xai-[A-Za-z0-9_-]+/g, '[redacted]');
+}
+
 function briefFor(message: DispatchMessage): string {
   return JSON.stringify({
     id: message.id,
@@ -134,7 +141,7 @@ function briefFor(message: DispatchMessage): string {
     priority: message.priority,
     sender: message.sender,
     subject_key: message.subject_key,
-    body: message.body.slice(0, 4000),
+    body: redactSecrets(message.body).slice(0, 4000),
   });
 }
 
@@ -147,11 +154,14 @@ export async function judgeDutyOfficerItem(
   const failures: { transport: string; error: string }[] = [];
   const orKey = openRouterKey();
   const xKey = xaiKey();
-  if (!orKey && !xKey) {
+  if (process.env.DUTY_OFFICER_JUDGE_ENABLED !== 'true' || (!orKey && !xKey)) {
     return {
       status: 'unconfigured',
       action: 'hold',
-      reason: 'no_openrouter_or_xai_key',
+      reason:
+        process.env.DUTY_OFFICER_JUDGE_ENABLED !== 'true'
+          ? 'judge_disabled'
+          : 'no_openrouter_or_xai_key',
       body: '',
       failures,
     };
