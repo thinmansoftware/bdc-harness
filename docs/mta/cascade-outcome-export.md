@@ -142,6 +142,25 @@ persist) and by `scripts/mta/backfill-run-scorecard.ts`. Neither the export nor
 the scorer ever writes `remote_agent_workflow_events` or
 `remote_agent_workflow_runs.status`.
 
+### Test gate (Stop 2)
+
+`bunfig.toml` sets `[test] root = "./packages"`. Bare args to `bun test` are
+filters inside that root, so `scripts/mta/__tests__/*.test.ts` are never
+discovered and bun still exits 0. Use explicit `./` paths (same pattern as
+`test:dispatch-migration-smoke`):
+
+```bash
+bun run test:run-scorecard
+```
+
+That is:
+
+```bash
+bun test ./packages/core/src/run-scorecard.test.ts ./scripts/mta/__tests__/export-cascade-outcomes.test.ts ./scripts/mta/__tests__/backfill-run-scorecard.test.ts
+```
+
+Expected: 30 pass / 0 fail / 3 files. Do not treat a 12/12 on 1 file as this gate.
+
 ## Known gap -- failure attribution
 
 Live schema audit 2026-08-24: model attribution exists on `node_completed`
