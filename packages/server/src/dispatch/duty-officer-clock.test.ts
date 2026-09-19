@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
+import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import {
   githubIssueInAllowList,
   startDutyOfficerClock,
@@ -98,7 +99,10 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
       const found = queued.find(item => item.id === input.id);
       return found ? { ...found, status: 'queued' as const, lease_owner: null } : null;
     }),
-    createAuthenticatedMessage: mock(async () => ({ id: 'xo-msg' })),
+    createAuthenticatedMessage: mock(async (_context, data) => {
+      if (data.subject_key != null) normalizeDispatchSubjectKey(data.subject_key);
+      return { id: 'xo-msg' };
+    }),
     getCurrentXoLease: mock(async () => null),
     listStaleIssues: mock(async () => {
       throw new Error('github_must_not_run_without_token');
@@ -255,18 +259,53 @@ describe('duty officer clock', () => {
 
     await tickDutyOfficerClock(deps);
 
-    expect(deps.createAuthenticatedMessage).toHaveBeenCalledWith(
-      { kind: 'system', sender: 'dispatch' },
+    const createCall = (
+      deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls[0];
+    expect(createCall[0]).toEqual({ kind: 'system', sender: 'dispatch' });
+    expect(createCall[1]).toEqual(
       expect.objectContaining({
         recipient: 'xo',
         correlation_id: 'tm-self-pause-3',
-        subject_key: 'taskmaster:self-pause',
       })
     );
+    expect((createCall[1] as { subject_key?: string }).subject_key).toBeUndefined();
     expect(deps.postResult).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'pause', status: 'done', task_outcome: 'succeeded' })
     );
     expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  test('judge-disabled mechanical path copies self-pause to xo without a subject_key', async () => {
+    const queued = [
+      message({
+        id: 'pause-mech',
+        correlation_id: 'tm-self-pause-4',
+        idempotency_key: 'tm:self-pause:4',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'taskmaster:self-pause',
+        body: 'Taskmaster self-paused',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    deps.judge = mock(async () => ({
+      status: 'unconfigured' as const,
+      action: 'hold' as const,
+      reason: 'judge_disabled',
+      body: '',
+      failures: [],
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    const payload = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls[0][1] as { recipient: string; subject_key?: string };
+    expect(payload.recipient).toBe('xo');
+    expect(payload.subject_key).toBeUndefined();
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'pause-mech', status: 'done', task_outcome: 'succeeded' })
+    );
   });
 
   test('opt-in GitHub nudge posts stale issues; foreign repos are refused', async () => {

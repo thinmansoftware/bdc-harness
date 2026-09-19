@@ -249,7 +249,6 @@ function escalationSubjectKey(subjectKey: string | null): string | undefined {
   if (parseGithubSubject(subjectKey)) return subjectKey;
   if (/^wo:WO-[A-Z0-9]+(?:-[A-Z0-9]+)*$/.test(subjectKey)) return subjectKey;
   if (/^digest:\d{4}-\d{2}-\d{2}$/.test(subjectKey)) return subjectKey;
-  if (subjectKey.startsWith('taskmaster:')) return subjectKey;
   return undefined;
 }
 
@@ -342,7 +341,11 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
       verdict.action === 'escalate_xo' ||
       isTaskmasterSelfPause(claimed)
     ) {
-      await escalateToXo(deps, claimed, verdict);
+      try {
+        await escalateToXo(deps, claimed, verdict);
+      } catch (error) {
+        log.error({ err: error, messageId: claimed.id }, 'duty_officer_taskmaster_copy_failed');
+      }
     }
     await finishItem(deps, claimed, 'done', 'succeeded', {
       disposition: 'taskmaster_mailbox',
