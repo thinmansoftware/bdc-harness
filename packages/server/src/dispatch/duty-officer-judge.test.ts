@@ -110,4 +110,14 @@ describe('duty officer judge', () => {
     expect(verdict.status).toBe('unconfigured');
     expect(verdict.reason).toBe('judge_disabled');
   });
+
+  test('holds instead of escalating when every judge rung fails', async () => {
+    process.env.DUTY_OFFICER_JUDGE_ENABLED = 'true';
+    process.env.OPENROUTER_API_KEY = 'or-test';
+    const fetchImpl = (async () => new Response('nope', { status: 402 })) as typeof fetch;
+    const verdict = await judgeDutyOfficerItem(message(), { fetchImpl });
+    expect(verdict.status).toBe('failed');
+    expect(verdict.action).toBe('hold');
+    expect(verdict.reason).toBe('duty_officer_judge_outage');
+  });
 });

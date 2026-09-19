@@ -146,6 +146,7 @@ describe('duty officer clock', () => {
       expect.objectContaining({
         recipient: 'xo',
         task_type: 'agent_message',
+        correlation_id: 'correlation-one',
         idempotency_key: 'do-clock-escalation:one',
       })
     );
@@ -203,5 +204,55 @@ describe('duty officer clock', () => {
     expect(deps.postResult).not.toHaveBeenCalled();
     expect(deps.listStaleIssues).not.toHaveBeenCalled();
     expect(deps.postIssueComment).not.toHaveBeenCalled();
+  });
+
+  test('Taskmaster mailbox is held even when the judge returns nudge', async () => {
+    const queued = [
+      message({
+        id: 'digest-nudge',
+        correlation_id: 'taskmaster-digest-2026-09-18',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'digest:2026-09-18',
+        body: 'sent=0, parked=0',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    deps.judge = mock(async () => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: 'nudge' as const,
+      reason: 'judge_said_nudge',
+      body: '',
+      failures: [],
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'digest-nudge', worker_id: 'duty-officer-clock' })
+    );
+    expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  test('judge outage holds the item instead of escalating to xo', async () => {
+    const queued = [message({ id: 'outage' })];
+    const deps = fakeDeps(queued);
+    deps.judge = mock(async () => ({
+      status: 'failed' as const,
+      action: 'hold' as const,
+      reason: 'duty_officer_judge_outage',
+      body: 'DO judge outage',
+      failures: [{ transport: 'openrouter:x-ai/grok-4.6', error: '402' }],
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'outage', worker_id: 'duty-officer-clock' })
+    );
+    expect(deps.postResult).not.toHaveBeenCalled();
   });
 });

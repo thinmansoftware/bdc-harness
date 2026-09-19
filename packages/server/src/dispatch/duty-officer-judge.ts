@@ -232,7 +232,7 @@ export async function judgeDutyOfficerItem(
   log.error({ failures }, 'duty_officer_judge_all_rungs_failed');
   return {
     status: 'failed',
-    action: 'escalate_xo',
+    action: 'hold',
     reason: 'duty_officer_judge_outage',
     body: `DO judge outage. Source ${message.id} ${message.task_type}.`,
     failures,

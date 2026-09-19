@@ -164,8 +164,9 @@ export async function postGithubIssueComment(
   if (!githubNudgeEnabled()) return;
   const allowed = allowedGithubRepo();
   if (
-    allowed?.owner.toLowerCase() !== issue.owner.toLowerCase() ||
-    allowed?.repo.toLowerCase() !== issue.repo.toLowerCase()
+    !allowed ||
+    allowed.owner.toLowerCase() !== issue.owner.toLowerCase() ||
+    allowed.repo.toLowerCase() !== issue.repo.toLowerCase()
   ) {
     log.warn({ issue }, 'duty_officer_github_repo_refused');
     return;
@@ -273,7 +274,7 @@ async function escalateToXo(
   const excerpt = (verdict.body || claimed.body).slice(0, 500);
   const subjectKey = escalationSubjectKey(claimed.subject_key);
   await deps.createAuthenticatedMessage(DUTY_OFFICER_SENDER, {
-    correlation_id: `do-clock:${claimed.id}`,
+    correlation_id: claimed.correlation_id || `do-clock:${claimed.id}`,
     idempotency_key: `do-clock-escalation:${claimed.id}`,
     task_type: 'agent_message',
     recipient: 'xo',
@@ -311,12 +312,19 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
   if (verdict.status === 'unconfigured') {
     verdict = mechanicalVerdict(claimed);
   }
+  if (verdict.status === 'failed') {
+    await holdItem(deps, claimed);
+    return;
+  }
+  if (isTaskmasterMailbox(claimed)) {
+    if (verdict.action === 'escalate_xo') {
+      await escalateToXo(deps, claimed, verdict);
+    }
+    await holdItem(deps, claimed);
+    return;
+  }
   if (verdict.action === 'escalate_xo') {
     await escalateToXo(deps, claimed, verdict);
-    if (isTaskmasterMailbox(claimed)) {
-      await holdItem(deps, claimed);
-      return;
-    }
     await finishItem(deps, claimed, 'done', 'succeeded', {
       disposition: 'escalated_to_xo',
       transport: verdict.transport ?? null,
