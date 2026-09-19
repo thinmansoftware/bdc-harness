@@ -83,6 +83,12 @@ services:
       # from ~/.cursor, seeded from the read-only mount below. NEVER a literal
       # here -- value comes from .env (gitignored) or the host shell env.
       CURSOR_API_KEY: ${CURSOR_API_KEY:-}
+      # Duty Officer clock: OpenRouter primary (OPENROUTER_API_KEY or GLM_API_KEY
+      # from env_file), native xAI Grok backup (XAI_API_KEY). GitHub issue comments
+      # stay off unless DUTY_OFFICER_GH_NUDGE=true -- do not treat GITHUB_TOKEN as consent.
+      DUTY_OFFICER_OPENROUTER_MODEL: ${DUTY_OFFICER_OPENROUTER_MODEL:-x-ai/grok-4.6}
+      DUTY_OFFICER_JUDGE_ENABLED: ${DUTY_OFFICER_JUDGE_ENABLED:-false}
+      DUTY_OFFICER_GH_NUDGE: ${DUTY_OFFICER_GH_NUDGE:-false}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     volumes:

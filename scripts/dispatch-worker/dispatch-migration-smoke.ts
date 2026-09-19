@@ -43,6 +43,8 @@ const KNOWN_PRINCIPALS = [
   ['codex', 'Codex', 'worker_poll', 1],
   ['codex-mcp', 'Codex MCP', 'worker_poll', 1],
   ['cursor', 'Cursor', 'worker_poll', 1],
+  ['do', 'Duty Officer alias', 'worker_poll', 1],
+  ['duty-officer', 'Duty Officer', 'worker_poll', 1],
   ['fusion', 'Fusion', 'worker_poll', 1],
   ['grok', 'Grok', 'worker_poll', 1],
   ['grok-acp', 'Grok ACP', 'worker_poll', 1],

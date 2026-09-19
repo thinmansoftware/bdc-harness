@@ -157,6 +157,8 @@ describe('SqliteAdapter', () => {
         { principal_id: 'codex', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'codex-mcp', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'cursor', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'do', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'duty-officer', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'fusion', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'grok', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'grok-acp', delivery_mode: 'worker_poll', active: 1 },
