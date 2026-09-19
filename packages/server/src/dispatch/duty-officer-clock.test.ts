@@ -330,7 +330,7 @@ describe('duty officer clock', () => {
     expect(githubIssueInAllowList({ owner: 'other', repo: 'bdc-xo', number: 1 })).toBe(false);
   });
 
-  test('judge outage holds the item instead of escalating to xo', async () => {
+  test('judge outage on a run_report still mechanical-escalates to xo', async () => {
     const queued = [message({ id: 'outage' })];
     const deps = fakeDeps(queued);
     deps.judge = mock(async () => ({
@@ -343,9 +343,37 @@ describe('duty officer clock', () => {
 
     await tickDutyOfficerClock(deps);
 
-    expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledWith(
+      { kind: 'system', sender: 'dispatch' },
+      expect.objectContaining({ recipient: 'xo', idempotency_key: 'do-clock-escalation:outage' })
+    );
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'outage', status: 'done', task_outcome: 'succeeded' })
+    );
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  test('self-pause is held when the xo copy throws so Taskmaster can retry', async () => {
+    const queued = [
+      message({
+        id: 'pause-fail',
+        correlation_id: 'tm-self-pause-5',
+        idempotency_key: 'tm:self-pause:5',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'taskmaster:self-pause',
+        body: 'Taskmaster self-paused',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    deps.createAuthenticatedMessage = mock(async () => {
+      throw new Error('dispatch_unavailable');
+    });
+
+    await tickDutyOfficerClock(deps);
+
     expect(deps.releaseMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'outage', worker_id: 'duty-officer-clock' })
+      expect.objectContaining({ id: 'pause-fail', worker_id: 'duty-officer-clock' })
     );
     expect(deps.postResult).not.toHaveBeenCalled();
   });

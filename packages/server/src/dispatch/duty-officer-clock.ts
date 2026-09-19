@@ -71,14 +71,7 @@ export function isTaskmasterSelfPause(message: DispatchMessage): boolean {
 }
 
 export function isTaskmasterMailbox(message: DispatchMessage): boolean {
-  const subject = message.subject_key ?? '';
-  const key = message.idempotency_key ?? '';
-  return (
-    message.sender === 'taskmaster' ||
-    key.startsWith('tm:') ||
-    subject.startsWith('digest:') ||
-    subject.startsWith('taskmaster:')
-  );
+  return message.sender === 'taskmaster';
 }
 
 function namedNextStep(body: string): string | null {
@@ -336,15 +329,17 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
     verdict = mechanicalVerdict(claimed);
   }
   if (isTaskmasterMailbox(claimed)) {
-    if (
+    const copyToXo =
       verdict.status === 'failed' ||
       verdict.action === 'escalate_xo' ||
-      isTaskmasterSelfPause(claimed)
-    ) {
+      isTaskmasterSelfPause(claimed);
+    if (copyToXo) {
       try {
         await escalateToXo(deps, claimed, verdict);
       } catch (error) {
         log.error({ err: error, messageId: claimed.id }, 'duty_officer_taskmaster_copy_failed');
+        await holdItem(deps, claimed);
+        return;
       }
     }
     await finishItem(deps, claimed, 'done', 'succeeded', {
@@ -354,8 +349,7 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
     return;
   }
   if (verdict.status === 'failed') {
-    await holdItem(deps, claimed);
-    return;
+    verdict = mechanicalVerdict(claimed);
   }
   if (verdict.action === 'escalate_xo') {
     await escalateToXo(deps, claimed, verdict);
