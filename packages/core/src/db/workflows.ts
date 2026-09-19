@@ -17,6 +17,7 @@ import type {
   RunAuthorityRecord,
   RunLeaseRecord,
   RunOutcome,
+  RunScorecard,
   ScheduledProviderWaitRecord,
   SupervisorActionRecord,
   SupervisorIncidentRecord,
@@ -1378,6 +1379,65 @@ export async function getRunOutcome(runId: string): Promise<RunOutcome | null> {
   );
   const row = result.rows[0];
   return row ? normalizeRunOutcome(row) : null;
+}
+
+/**
+ * Persist the honest run-outcome scorecard (WO-HARNESS-RUN-OUTCOME-SCORECARD-01).
+ *
+ * UPDATE-ONLY by design: sets ONLY the scorecard columns (+ scored_at) and NEVER
+ * touches the legacy execution/deliverable/validation/recovery/route/primary_reason
+ * columns, so a score write cannot regress an outcome and a recovery
+ * upsertRunOutcome cannot wipe a score. Because it is UPDATE-only, a run with no
+ * pre-existing outcome row is a no-op returning false -- the backfill CLI
+ * skip-and-counts those runs (WO ambiguity resolution: option 1). The forward
+ * path always has a row (the terminal persist writes the outcome first), so it
+ * always updates. Idempotent: re-scoring overwrites the scorecard columns only.
+ *
+ * Engine-portable SQL: $N placeholders (SQLite adapter rewrites them); no BTRIM.
+ * No RETURNING (the SQLite adapter rejects RETURNING on UPDATE); the affected
+ * rowCount tells us whether an outcome row existed to update.
+ */
+export async function upsertRunScorecard(
+  runId: string,
+  scorecard: RunScorecard,
+  scoredAt: string
+): Promise<boolean> {
+  const result = await pool.query(
+    `UPDATE remote_agent_run_outcomes SET
+       score_version = $2,
+       scored_at = $3,
+       status_column = $4,
+       terminal_event = $5,
+       landing_ok = $6,
+       landing_skipped = $7,
+       last_failed_step = $8,
+       pipeline_axis = $9,
+       module_axis = $10,
+       honest_success = $11,
+       score_partial = $12,
+       gh_pr_url = $13,
+       gh_join_complete = $14,
+       wo_id = $15
+     WHERE run_id = $1`,
+    [
+      runId,
+      scorecard.scoreVersion,
+      scoredAt,
+      scorecard.statusColumn,
+      scorecard.terminalEvent,
+      scorecard.landingOk,
+      scorecard.landingSkipped,
+      scorecard.lastFailedStep,
+      scorecard.pipelineAxis,
+      scorecard.moduleAxis,
+      scorecard.honestSuccess,
+      scorecard.scorePartial,
+      scorecard.ghPrUrl,
+      scorecard.ghJoinComplete,
+      scorecard.woId,
+    ]
+  );
+  return (result.rowCount ?? 0) > 0;
 }
 
 export async function scheduleProviderWait(wait: ScheduledProviderWaitRecord): Promise<boolean> {

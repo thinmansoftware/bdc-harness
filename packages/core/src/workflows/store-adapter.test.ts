@@ -27,6 +27,7 @@ const mockCompleteProviderAttempt = mock(() => Promise.resolve(false));
 const mockListProviderAttempts = mock(() => Promise.resolve([]));
 const mockUpsertRunOutcome = mock(() => Promise.resolve(false));
 const mockGetRunOutcome = mock(() => Promise.resolve(null));
+const mockUpsertRunScorecard = mock(() => Promise.resolve(true));
 const mockScheduleProviderWait = mock(() => Promise.resolve(false));
 const mockListDueProviderWaits = mock(() => Promise.resolve([]));
 const mockClaimProviderWait = mock(() => Promise.resolve(false));
@@ -70,6 +71,7 @@ mock.module('../db/workflows', () => ({
   listProviderAttempts: mockListProviderAttempts,
   upsertRunOutcome: mockUpsertRunOutcome,
   getRunOutcome: mockGetRunOutcome,
+  upsertRunScorecard: mockUpsertRunScorecard,
   scheduleProviderWait: mockScheduleProviderWait,
   listDueProviderWaits: mockListDueProviderWaits,
   claimProviderWait: mockClaimProviderWait,
@@ -152,6 +154,7 @@ describe('createWorkflowStore', () => {
       'listProviderAttempts',
       'upsertRunOutcome',
       'getRunOutcome',
+      'upsertRunScorecard',
       'scheduleProviderWait',
       'listDueProviderWaits',
       'claimProviderWait',

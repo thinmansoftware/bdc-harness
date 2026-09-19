@@ -61,6 +61,7 @@ export function createWorkflowStore(): IWorkflowStore {
     listProviderAttempts: workflowDb.listProviderAttempts,
     upsertRunOutcome: workflowDb.upsertRunOutcome,
     getRunOutcome: workflowDb.getRunOutcome,
+    upsertRunScorecard: workflowDb.upsertRunScorecard,
     scheduleProviderWait: workflowDb.scheduleProviderWait,
     listDueProviderWaits: workflowDb.listDueProviderWaits,
     claimProviderWait: workflowDb.claimProviderWait,

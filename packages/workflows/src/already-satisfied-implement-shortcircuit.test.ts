@@ -88,6 +88,7 @@ function createMockStore(): IWorkflowStore {
     listProviderAttempts: mock(() => Promise.resolve([])),
     upsertRunOutcome: mock(() => Promise.resolve(false)),
     getRunOutcome: mock(() => Promise.resolve(null)),
+    upsertRunScorecard: mock(() => Promise.resolve(true)),
     scheduleProviderWait: mock(() => Promise.resolve(false)),
     listDueProviderWaits: mock(() => Promise.resolve([])),
     claimProviderWait: mock(() => Promise.resolve(false)),
