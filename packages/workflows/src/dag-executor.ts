@@ -1341,6 +1341,29 @@ function reduceToUnquotedUncommentedCode(line: string): string {
       continue;
     }
 
+    // Arithmetic context: $((...)) or a (( ... )) compound command at word start.
+    // Inside it "<<" is a left shift, not a heredoc (Overseer round 6 on #862:
+    // x=$((1 << 2)) was recorded as a heredoc with delimiter "2"). Blank the whole
+    // expression, balancing parentheses, offsets preserved.
+    const dollarArith = line.startsWith('$((', i);
+    const bareArith =
+      !dollarArith && line.startsWith('((', i) && (i === 0 || /[\s;&|(]/.test(line[i - 1]));
+    if (dollarArith || bareArith) {
+      let depth = 0;
+      let opened = false;
+      let j = i;
+      while (j < line.length) {
+        if (line[j] === '(') {
+          depth++;
+          opened = true;
+        } else if (line[j] === ')') depth--;
+        out += ' ';
+        j++;
+        if (opened && depth === 0) break;
+      }
+      i = j - 1;
+      continue;
+    }
     if (ch === '\\' && i + 1 < line.length) {
       // Backslash outside quotes escapes the next char (so \# is not a comment and
       // \' does not open a string); blank both.

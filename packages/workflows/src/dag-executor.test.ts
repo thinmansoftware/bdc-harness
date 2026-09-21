@@ -2156,6 +2156,62 @@ describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-
     expect(run(script)).toEqual(["cat <<'-A' <<-B", SUBST, '-A', `\t${SUBST}`, '\tB', TOKEN]);
   });
 
+  // Round 6 (f66db9e3): "<<" inside arithmetic is a left shift, never a heredoc.
+  it('round 6: x=$((1 << 2)) does not open a heredoc; following comment stays literal', () => {
+    expect(run(['x=$((1 << 2))', TOKEN].join('\n'))).toEqual(['x=$((1 << 2))', TOKEN]);
+  });
+  it('round 6: (( y = 1 << 3 )) compound command does not open a heredoc', () => {
+    expect(run(['(( y = 1 << 3 ))', TOKEN].join('\n'))).toEqual(['(( y = 1 << 3 ))', TOKEN]);
+  });
+  it('round 6: nested parens inside arithmetic $(( (1<<2) + 1 )) are balanced', () => {
+    expect(run(['z=$(( (1<<2) + 1 ))', TOKEN].join('\n'))).toEqual(['z=$(( (1<<2) + 1 ))', TOKEN]);
+  });
+  it('round 6: arithmetic followed by a real heredoc on the same line still opens it', () => {
+    expect(run(['echo $((1<<2)) <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo $((1<<2)) <<EOF',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 6: a real heredoc followed by arithmetic on the same line opens exactly one heredoc', () => {
+    expect(run(['cat <<EOF $((1<<2))', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<EOF $((1<<2))',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 6: a subshell $( ... ) is not arithmetic, so a heredoc inside it opens', () => {
+    expect(run(['X=$(cat <<EOF', TOKEN, 'EOF', ')', TOKEN].join('\n'))).toEqual([
+      'X=$(cat <<EOF',
+      SUBST,
+      'EOF',
+      ')',
+      TOKEN,
+    ]);
+  });
+  it('round 6: end-to-end -- multiline output in a comment after arithmetic never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = ['x=$((1 << 2))', '# note $spec.output', 'echo "x=$x"', ''].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result.split('\n')[1]).toBe('# note $spec.output');
+    const tempFile = `${tmpdir()}/test-862-arith-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('x=4\n');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return;
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+
   it('end-to-end: multi-line output after a mixed-quoted heredoc never executes (real bash)', async () => {
     const multi = 'line one\nexit 1\necho SPILLED';
     const outputs = new Map([['spec', makeOutput('completed', multi)]]);
