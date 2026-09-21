@@ -5,6 +5,7 @@ import {
   listMessages,
   postResult,
   registerWorker,
+  releaseMessage,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
   type DispatchSenderContext,
@@ -12,6 +13,7 @@ import {
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
+import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
 
 const log = createLogger('dispatch/duty-officer-clock');
 
@@ -37,6 +39,7 @@ export interface DutyOfficerClockDeps {
   listMessages: typeof listMessages;
   claimMessage: typeof claimMessage;
   postResult: typeof postResult;
+  releaseMessage: typeof releaseMessage;
   createAuthenticatedMessage: (
     context: DispatchSenderContext,
     data: CreateAuthenticatedMessageData
@@ -44,11 +47,31 @@ export interface DutyOfficerClockDeps {
   getCurrentXoLease: () => Promise<XoLease | null>;
   listStaleIssues: () => Promise<DutyOfficerStaleIssue[]>;
   postIssueComment: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
+  judge: (message: DispatchMessage) => Promise<DutyOfficerJudgeVerdict>;
 }
 
 function githubToken(): string | null {
   const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
   return token ? token : null;
+}
+
+export function githubNudgeEnabled(): boolean {
+  return process.env.DUTY_OFFICER_GH_NUDGE === 'true' && Boolean(githubToken());
+}
+
+export function isTaskmasterSelfPause(message: DispatchMessage): boolean {
+  const subject = message.subject_key ?? '';
+  const key = message.idempotency_key ?? '';
+  const correlation = message.correlation_id ?? '';
+  return (
+    subject.startsWith('taskmaster:self-pause') ||
+    key.startsWith('tm:self-pause:') ||
+    correlation.startsWith('tm-self-pause-')
+  );
+}
+
+export function isTaskmasterMailbox(message: DispatchMessage): boolean {
+  return message.sender === 'taskmaster';
 }
 
 function namedNextStep(body: string): string | null {
@@ -109,7 +132,7 @@ async function githubJson<T>(
 }
 
 export async function listStaleGithubIssues(): Promise<DutyOfficerStaleIssue[]> {
-  if (!githubToken()) {
+  if (!githubNudgeEnabled()) {
     log.info('duty_officer_github_nudge_skipped');
     return [];
   }
@@ -131,11 +154,30 @@ export async function listStaleGithubIssues(): Promise<DutyOfficerStaleIssue[]> 
     .map(issue => ({ owner, repo: name, number: issue.number }));
 }
 
+function allowedGithubRepo(): { owner: string; repo: string } | null {
+  const repo = process.env.DUTY_OFFICER_GH_REPO?.trim() || 'thinmansoftware/bdc-xo';
+  const slash = repo.indexOf('/');
+  if (slash <= 0) return null;
+  return { owner: repo.slice(0, slash), repo: repo.slice(slash + 1) };
+}
+
+export function githubIssueInAllowList(issue: DutyOfficerStaleIssue): boolean {
+  const allowed = allowedGithubRepo();
+  return (
+    allowed?.owner?.toLowerCase() === issue.owner.toLowerCase() &&
+    allowed?.repo?.toLowerCase() === issue.repo.toLowerCase()
+  );
+}
+
 export async function postGithubIssueComment(
   issue: DutyOfficerStaleIssue,
   body: string
 ): Promise<void> {
-  if (!githubToken()) return;
+  if (!githubNudgeEnabled()) return;
+  if (!githubIssueInAllowList(issue)) {
+    log.warn({ issue }, 'duty_officer_github_repo_refused');
+    return;
+  }
   const comments = await githubJson<{ body?: string }[]>(
     `/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments?per_page=30`
   );
@@ -159,10 +201,12 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
     listMessages,
     claimMessage,
     postResult,
+    releaseMessage,
     createAuthenticatedMessage,
     getCurrentXoLease,
     listStaleIssues: listStaleGithubIssues,
     postIssueComment: postGithubIssueComment,
+    judge: judgeDutyOfficerItem,
   };
 }
 
@@ -189,7 +233,7 @@ async function cueGithubIfPresent(
 ): Promise<void> {
   const issue = parseGithubSubject(message.subject_key);
   if (!issue) return;
-  if (!githubToken()) return;
+  if (!githubNudgeEnabled()) return;
   await deps.postIssueComment(issue, nudgeBody());
 }
 
@@ -201,34 +245,129 @@ function escalationSubjectKey(subjectKey: string | null): string | undefined {
   return undefined;
 }
 
-async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
+function mechanicalVerdict(claimed: DispatchMessage): DutyOfficerJudgeVerdict {
+  if (isTaskmasterSelfPause(claimed)) {
+    return {
+      status: 'unconfigured',
+      action: 'escalate_xo',
+      reason: 'taskmaster_self_pause',
+      body: claimed.body.slice(0, 500),
+      failures: [],
+    };
+  }
+  if (isTaskmasterMailbox(claimed)) {
+    return {
+      status: 'unconfigured',
+      action: 'nudge',
+      reason: 'taskmaster_digest',
+      body: '',
+      failures: [],
+    };
+  }
   if (shouldEscalate(claimed)) {
-    const excerpt = claimed.body.length > 500 ? `${claimed.body.slice(0, 500)}...` : claimed.body;
-    const subjectKey = escalationSubjectKey(claimed.subject_key);
-    await deps.createAuthenticatedMessage(DUTY_OFFICER_SENDER, {
-      correlation_id: claimed.correlation_id || `do-clock:${claimed.id}`,
-      idempotency_key: `do-clock-escalation:${claimed.id}`,
-      task_type: 'run_report',
-      recipient: 'xo',
-      priority: claimed.priority === 'blocker' ? 'blocker' : 'normal',
-      body: JSON.stringify({
-        kind: 'duty_officer_escalation',
-        source_id: claimed.id,
-        task_type: claimed.task_type,
-        subject_key: claimed.subject_key,
-        excerpt,
-      }),
-      ...(subjectKey
-        ? { subject_key: subjectKey, repeat_reason: `duty_officer_clock:${claimed.id}` }
-        : {}),
-    });
+    return {
+      status: 'unconfigured',
+      action: 'escalate_xo',
+      reason: 'mechanical_escalate',
+      body: claimed.body.slice(0, 500),
+      failures: [],
+    };
+  }
+  return {
+    status: 'unconfigured',
+    action: 'nudge',
+    reason: 'mechanical_nudge',
+    body: '',
+    failures: [],
+  };
+}
+
+async function escalateToXo(
+  deps: DutyOfficerClockDeps,
+  claimed: DispatchMessage,
+  verdict: DutyOfficerJudgeVerdict
+): Promise<void> {
+  const excerpt = (verdict.body || claimed.body).slice(0, 500);
+  const subjectKey = escalationSubjectKey(claimed.subject_key);
+  await deps.createAuthenticatedMessage(DUTY_OFFICER_SENDER, {
+    correlation_id: claimed.correlation_id || `do-clock:${claimed.id}`,
+    idempotency_key: `do-clock-escalation:${claimed.id}`,
+    task_type: 'agent_message',
+    recipient: 'xo',
+    priority: claimed.priority === 'blocker' ? 'blocker' : 'normal',
+    body: JSON.stringify({
+      kind: 'duty_officer_escalation',
+      source_id: claimed.id,
+      task_type: claimed.task_type,
+      subject_key: claimed.subject_key,
+      transport: verdict.transport ?? null,
+      reason: verdict.reason,
+      excerpt,
+    }),
+    ...(subjectKey
+      ? { subject_key: subjectKey, repeat_reason: `duty_officer_clock:${claimed.id}` }
+      : {}),
+  });
+}
+
+function holdBackoffMs(): number {
+  return Math.max(60_000, Number(process.env.DUTY_OFFICER_HOLD_BACKOFF_MS) || 6 * 60 * 60 * 1000);
+}
+
+async function holdItem(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
+  await deps.releaseMessage({
+    id: claimed.id,
+    worker_id: DUTY_OFFICER_WORKER_ID,
+    fencing_token: claimed.fencing_token,
+    not_before: new Date(Date.now() + holdBackoffMs()).toISOString(),
+  });
+}
+
+async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
+  let verdict = await deps.judge(claimed);
+  if (verdict.status === 'unconfigured') {
+    verdict = mechanicalVerdict(claimed);
+  }
+  if (isTaskmasterMailbox(claimed)) {
+    const copyToXo =
+      verdict.status === 'failed' ||
+      verdict.action === 'escalate_xo' ||
+      isTaskmasterSelfPause(claimed);
+    if (copyToXo) {
+      try {
+        await escalateToXo(deps, claimed, verdict);
+      } catch (error) {
+        log.error({ err: error, messageId: claimed.id }, 'duty_officer_taskmaster_copy_failed');
+        await holdItem(deps, claimed);
+        return;
+      }
+    }
     await finishItem(deps, claimed, 'done', 'succeeded', {
-      disposition: 'escalated_to_xo',
+      disposition: 'taskmaster_mailbox',
+      transport: verdict.transport ?? null,
     });
     return;
   }
-  await cueGithubIfPresent(deps, claimed);
-  await finishItem(deps, claimed, 'done', 'succeeded', { disposition: 'cued' });
+  if (verdict.status === 'failed') {
+    verdict = mechanicalVerdict(claimed);
+  }
+  if (verdict.action === 'escalate_xo') {
+    await escalateToXo(deps, claimed, verdict);
+    await finishItem(deps, claimed, 'done', 'succeeded', {
+      disposition: 'escalated_to_xo',
+      transport: verdict.transport ?? null,
+    });
+    return;
+  }
+  if (verdict.action === 'nudge') {
+    await cueGithubIfPresent(deps, claimed);
+    await finishItem(deps, claimed, 'done', 'succeeded', {
+      disposition: 'cued',
+      transport: verdict.transport ?? null,
+    });
+    return;
+  }
+  await holdItem(deps, claimed);
 }
 
 export async function tickDutyOfficerClock(
@@ -269,7 +408,7 @@ export async function tickDutyOfficerClock(
       }
     }
 
-    if (!githubToken()) {
+    if (!githubNudgeEnabled()) {
       log.info('duty_officer_github_nudge_skipped');
       return;
     }

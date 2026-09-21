@@ -1057,7 +1057,9 @@ export class SqliteAdapter implements IDatabase {
         -- SQLite seed in sync with 000_combined.sql -- this INSERT block is a
         -- hand-maintained mirror, not derived from the migration files.
         ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1),
-        ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1)
+        ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1),
+        ('duty-officer', 'Duty Officer', 'worker_poll', 1),
+        ('do', 'Duty Officer alias', 'worker_poll', 1)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`
@@ -1070,6 +1072,17 @@ export class SqliteAdapter implements IDatabase {
       FROM agent_dispatch_messages
       WHERE TRIM(recipient) <> ''
       ON CONFLICT (principal_id) DO NOTHING
+    `);
+    this.db.run(`
+      UPDATE dispatch_principals
+      SET delivery_mode = 'worker_poll',
+          active = 1,
+          display_name = CASE principal_id
+            WHEN 'duty-officer' THEN 'Duty Officer'
+            WHEN 'do' THEN 'Duty Officer alias'
+            ELSE display_name
+          END
+      WHERE principal_id IN ('duty-officer', 'do')
     `);
   }
 

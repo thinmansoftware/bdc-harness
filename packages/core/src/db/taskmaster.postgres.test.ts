@@ -55,7 +55,8 @@ beforeAll(async () => {
   }
   await primary.query(`INSERT INTO dispatch_principals
     (principal_id, display_name, delivery_mode, active)
-    VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', TRUE)`);
+    VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', TRUE)
+    ON CONFLICT (principal_id) DO NOTHING`);
   await primary.query(
     readFileSync(
       resolve(import.meta.dir, '../../../../migrations/041_taskmaster_slice1.sql'),

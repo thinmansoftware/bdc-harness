@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
+import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import {
+  githubIssueInAllowList,
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
@@ -93,20 +95,37 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
           }
         : null;
     }),
-    createAuthenticatedMessage: mock(async () => ({ id: 'xo-msg' })),
+    releaseMessage: mock(async input => {
+      const found = queued.find(item => item.id === input.id);
+      return found ? { ...found, status: 'queued' as const, lease_owner: null } : null;
+    }),
+    createAuthenticatedMessage: mock(async (_context, data) => {
+      if (data.subject_key != null) normalizeDispatchSubjectKey(data.subject_key);
+      return { id: 'xo-msg' };
+    }),
     getCurrentXoLease: mock(async () => null),
     listStaleIssues: mock(async () => {
       throw new Error('github_must_not_run_without_token');
     }),
     postIssueComment: mock(async () => {
-      throw new Error('github_must_not_run_without_token');
+      throw new Error('github_must_not_run_without_nudge_flag');
     }),
+    judge: mock(async (item: DispatchMessage) => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: item.task_type === 'run_report' ? ('escalate_xo' as const) : ('hold' as const),
+      reason: 'test',
+      body: item.body,
+      failures: [],
+    })),
   };
 }
 
 afterEach(() => {
   stopDutyOfficerClock();
   delete process.env.DUTY_OFFICER_CLOCK_ENABLED;
+  delete process.env.DUTY_OFFICER_GH_NUDGE;
+  delete process.env.DUTY_OFFICER_GH_REPO;
   delete process.env.GH_TOKEN;
   delete process.env.GITHUB_TOKEN;
 });
@@ -132,7 +151,8 @@ describe('duty officer clock', () => {
     expect(createCall[1]).toEqual(
       expect.objectContaining({
         recipient: 'xo',
-        task_type: 'run_report',
+        task_type: 'agent_message',
+        correlation_id: 'correlation-one',
         idempotency_key: 'do-clock-escalation:one',
       })
     );
@@ -168,17 +188,193 @@ describe('duty officer clock', () => {
     }
   });
 
-  test('missing GitHub token skips issue nudge and still drains inbox when lease is empty', async () => {
-    const queued = [message({ id: 'two' })];
+  test('GitHub token alone does not nudge; Taskmaster digest is succeeded not held', async () => {
+    const queued = [
+      message({
+        id: 'digest',
+        correlation_id: 'tm-journal-digest',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'digest:2026-09-18',
+        body: 'sent=0, parked=0',
+      }),
+    ];
     const deps = fakeDeps(queued);
-    delete process.env.GH_TOKEN;
-    delete process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = 'ghs_test_not_a_nudge_grant';
 
     await tickDutyOfficerClock(deps);
 
-    expect(deps.getCurrentXoLease).toHaveBeenCalled();
-    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+    expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'digest', status: 'done', task_outcome: 'succeeded' })
+    );
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
     expect(deps.listStaleIssues).not.toHaveBeenCalled();
     expect(deps.postIssueComment).not.toHaveBeenCalled();
+  });
+
+  test('Taskmaster digest is succeeded even when the judge returns nudge', async () => {
+    const queued = [
+      message({
+        id: 'digest-nudge',
+        correlation_id: 'tm-journal-digest-nudge',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'digest:2026-09-18',
+        body: 'sent=0, parked=0',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    deps.judge = mock(async () => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: 'nudge' as const,
+      reason: 'judge_said_nudge',
+      body: '',
+      failures: [],
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'digest-nudge', status: 'done', task_outcome: 'succeeded' })
+    );
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  test('Taskmaster self-pause copies to xo then succeeds the source row', async () => {
+    const queued = [
+      message({
+        id: 'pause',
+        correlation_id: 'tm-self-pause-3',
+        idempotency_key: 'tm:self-pause:3',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'taskmaster:self-pause',
+        body: 'Taskmaster self-paused',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+
+    await tickDutyOfficerClock(deps);
+
+    const createCall = (
+      deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls[0];
+    expect(createCall[0]).toEqual({ kind: 'system', sender: 'dispatch' });
+    expect(createCall[1]).toEqual(
+      expect.objectContaining({
+        recipient: 'xo',
+        correlation_id: 'tm-self-pause-3',
+      })
+    );
+    expect((createCall[1] as { subject_key?: string }).subject_key).toBeUndefined();
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'pause', status: 'done', task_outcome: 'succeeded' })
+    );
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  test('judge-disabled mechanical path copies self-pause to xo without a subject_key', async () => {
+    const queued = [
+      message({
+        id: 'pause-mech',
+        correlation_id: 'tm-self-pause-4',
+        idempotency_key: 'tm:self-pause:4',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'taskmaster:self-pause',
+        body: 'Taskmaster self-paused',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    deps.judge = mock(async () => ({
+      status: 'unconfigured' as const,
+      action: 'hold' as const,
+      reason: 'judge_disabled',
+      body: '',
+      failures: [],
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    const payload = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls[0][1] as { recipient: string; subject_key?: string };
+    expect(payload.recipient).toBe('xo');
+    expect(payload.subject_key).toBeUndefined();
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'pause-mech', status: 'done', task_outcome: 'succeeded' })
+    );
+  });
+
+  test('opt-in GitHub nudge posts stale issues; foreign repos are refused', async () => {
+    const deps = fakeDeps([]);
+    deps.listStaleIssues = mock(async () => [
+      { owner: 'thinmansoftware', repo: 'bdc-xo', number: 12 },
+    ]);
+    deps.postIssueComment = mock(async () => {});
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GITHUB_TOKEN = 'ghs_test';
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.listStaleIssues).toHaveBeenCalled();
+    expect(deps.postIssueComment).toHaveBeenCalledWith(
+      { owner: 'thinmansoftware', repo: 'bdc-xo', number: 12 },
+      expect.stringContaining('duty-officer-nudge')
+    );
+    expect(githubIssueInAllowList({ owner: 'thinmansoftware', repo: 'bdc-xo', number: 1 })).toBe(
+      true
+    );
+    expect(githubIssueInAllowList({ owner: 'other', repo: 'bdc-xo', number: 1 })).toBe(false);
+  });
+
+  test('judge outage on a run_report still mechanical-escalates to xo', async () => {
+    const queued = [message({ id: 'outage' })];
+    const deps = fakeDeps(queued);
+    deps.judge = mock(async () => ({
+      status: 'failed' as const,
+      action: 'hold' as const,
+      reason: 'duty_officer_judge_outage',
+      body: 'DO judge outage',
+      failures: [{ transport: 'openrouter:x-ai/grok-4.6', error: '402' }],
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledWith(
+      { kind: 'system', sender: 'dispatch' },
+      expect.objectContaining({ recipient: 'xo', idempotency_key: 'do-clock-escalation:outage' })
+    );
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'outage', status: 'done', task_outcome: 'succeeded' })
+    );
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  test('self-pause is held when the xo copy throws so Taskmaster can retry', async () => {
+    const queued = [
+      message({
+        id: 'pause-fail',
+        correlation_id: 'tm-self-pause-5',
+        idempotency_key: 'tm:self-pause:5',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'taskmaster:self-pause',
+        body: 'Taskmaster self-paused',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    deps.createAuthenticatedMessage = mock(async () => {
+      throw new Error('dispatch_unavailable');
+    });
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'pause-fail', worker_id: 'duty-officer-clock' })
+    );
+    expect(deps.postResult).not.toHaveBeenCalled();
   });
 });
