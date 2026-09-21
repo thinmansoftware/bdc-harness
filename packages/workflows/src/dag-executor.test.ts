@@ -1757,6 +1757,32 @@ describe('substituteNodeOutputRefs comment safety (bdc-xo#2141)', () => {
     expect(lines[3]).toBe('A');
     expect(lines[4]).toBe('B');
   });
+
+  it('a comment that mentions <<EOF does not open a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = '# example: cat <<EOF\n# $spec.output stays literal\nX=$spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('# example: cat <<EOF');
+    expect(lines[1]).toBe('# $spec.output stays literal');
+    expect(lines[2]).toBe("X='body'");
+  });
+
+  it('a <<< here-string is not a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'read -r X <<<word\n# $spec.output stays literal\nY=$spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[1]).toBe('# $spec.output stays literal');
+    expect(lines[2]).toBe("Y='body'");
+  });
+
+  it('heredoc bodies close in order of appearance, then comments are comments again', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<A <<B\n# $spec.output\nA\n# $spec.output\nB\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[1]).toBe("# 'body'");
+    expect(lines[3]).toBe("# 'body'");
+    expect(lines[5]).toBe('# $spec.output');
+  });
 });
 
 describe('checkTriggerRule -- missing upstream treated as failed', () => {

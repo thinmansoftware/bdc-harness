@@ -1339,19 +1339,36 @@ export function substituteNodeOutputRefs(
     const heredocStack: string[] = []; // Stack of open heredoc delimiters
 
     for (const line of lines) {
-      // Track heredoc opens on this line. Format: << [- | 'quote' | "quote"]? DELIMITER [whitespace|redirection]
-      // Capture each heredoc delimiter and push to stack; line content after << is still data until next line.
-      const heredocMatches = line.matchAll(/<<\s*(-)?(['"])?([a-zA-Z_][a-zA-Z0-9_]*)\2/g);
-      for (const match of heredocMatches) {
-        const isStripper = match[1] === '-'; // <<- allows tab indentation
-        const delimiter = match[3];
-        heredocStack.push(isStripper ? `-${delimiter}` : delimiter);
+      // Comment check first: bash ignores everything on a comment line, including a
+      // literal "<<EOF" in the comment text, so a comment must never open a heredoc.
+      let isCommentLine = false;
+      if (heredocStack.length === 0) {
+        let wsIndex = 0;
+        while (wsIndex < line.length && /\s/.test(line[wsIndex])) {
+          wsIndex++;
+        }
+        isCommentLine = wsIndex < line.length && line[wsIndex] === '#';
+      }
+
+      // Track heredoc opens on this line (only outside a heredoc body and not on a comment).
+      // Format: << [-]? ['"]? DELIMITER. "<<<" is a here-string, not a heredoc, so the
+      // operator must not be preceded or followed by another "<".
+      if (heredocStack.length === 0 && !isCommentLine) {
+        const heredocMatches = line.matchAll(
+          /(?<!<)<<(?!<)\s*(-)?(['"])?([a-zA-Z_][a-zA-Z0-9_]*)\2/g
+        );
+        for (const match of heredocMatches) {
+          const isStripper = match[1] === '-'; // <<- allows tab indentation
+          const delimiter = match[3];
+          heredocStack.push(isStripper ? `-${delimiter}` : delimiter);
+        }
       }
 
       // Check if this line closes a heredoc: content (with leading tabs stripped if stripper)
-      // must exactly match the delimiter.
+      // must exactly match the delimiter. Bash consumes bodies in order of appearance, so
+      // the FIRST opened delimiter is the one that closes next (queue, not stack).
       if (heredocStack.length > 0) {
-        const topHeredoc = heredocStack[heredocStack.length - 1];
+        const topHeredoc = heredocStack[0];
         const isStripper = topHeredoc.startsWith('-');
         const delimiter = isStripper ? topHeredoc.slice(1) : topHeredoc;
         let lineToCheck = line;
@@ -1361,7 +1378,7 @@ export function substituteNodeOutputRefs(
         }
         if (lineToCheck === delimiter) {
           // This line closes the heredoc
-          heredocStack.pop();
+          heredocStack.shift();
         }
       }
 
