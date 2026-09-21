@@ -2115,6 +2115,47 @@ describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-
     ]);
   });
 
+  // Round 5 (be881616): strip mode must not be inferred from a leading "-" in the delimiter.
+  it("round 5: cat <<'-EOF' is NOT a <<- heredoc; closes on -EOF, not EOF", () => {
+    expect(run(["cat <<'-EOF'", TOKEN, 'EOF', TOKEN, '-EOF', TOKEN].join('\n'))).toEqual([
+      "cat <<'-EOF'",
+      SUBST,
+      'EOF',
+      SUBST,
+      '-EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 5: unquoted cat <<-EOF-X (delimiter with hyphens) strips tabs and closes on EOF-X', () => {
+    expect(run(['cat <<-EOF-X', `\t${TOKEN}`, '\tEOF-X', TOKEN].join('\n'))).toEqual([
+      'cat <<-EOF-X',
+      `\t${SUBST}`,
+      '\tEOF-X',
+      TOKEN,
+    ]);
+  });
+  it('round 5: cat <<- -EOF (strip mode AND leading-hyphen delimiter) closes on tab-stripped -EOF', () => {
+    expect(run(['cat <<- -EOF', `\t${TOKEN}`, '\t-EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<- -EOF',
+      `\t${SUBST}`,
+      '\t-EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 5: cat <<\\-EOF (escaped leading hyphen) closes on -EOF, and a tab-indented -EOF does not close it', () => {
+    expect(run(['cat <<\\-EOF', '\t-EOF', TOKEN, '-EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<\\-EOF',
+      '\t-EOF',
+      SUBST,
+      '-EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 5: FIFO with a leading-hyphen delimiter first and a <<- second', () => {
+    const script = ["cat <<'-A' <<-B", TOKEN, '-A', `\t${TOKEN}`, '\tB', TOKEN].join('\n');
+    expect(run(script)).toEqual(["cat <<'-A' <<-B", SUBST, '-A', `\t${SUBST}`, '\tB', TOKEN]);
+  });
+
   it('end-to-end: multi-line output after a mixed-quoted heredoc never executes (real bash)', async () => {
     const multi = 'line one\nexit 1\necho SPILLED';
     const outputs = new Map([['spec', makeOutput('completed', multi)]]);

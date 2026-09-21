@@ -1476,7 +1476,10 @@ export function substituteNodeOutputRefs(
   if (escapedForBash) {
     const lines = prompt.split('\n');
     const processedLines: string[] = [];
-    const heredocStack: string[] = []; // Stack of open heredoc delimiters
+    // Open heredoc bodies in order of appearance (FIFO). Delimiter and strip-tabs
+    // mode are SEPARATE fields: Overseer round 5 on #862 -- encoding <<- as a "-"
+    // prefix collided with a delimiter that itself begins with "-" (cat <<'-EOF').
+    const heredocStack: { delimiter: string; stripTabs: boolean }[] = [];
 
     for (const line of lines) {
       // Comment check first: bash ignores everything on a comment line, including a
@@ -1518,7 +1521,7 @@ export function substituteNodeOutputRefs(
           const word = readHeredocDelimiter(line, pos);
           if (word === null) continue; // empty / unterminated quote / line continuation
           heredocOpRegex.lastIndex = word.end;
-          heredocStack.push(isStripper ? `-${word.delimiter}` : word.delimiter);
+          heredocStack.push({ delimiter: word.delimiter, stripTabs: isStripper });
         }
       }
 
@@ -1526,11 +1529,9 @@ export function substituteNodeOutputRefs(
       // must exactly match the delimiter. Bash consumes bodies in order of appearance, so
       // the FIRST opened delimiter is the one that closes next (queue, not stack).
       if (heredocStack.length > 0) {
-        const topHeredoc = heredocStack[0];
-        const isStripper = topHeredoc.startsWith('-');
-        const delimiter = isStripper ? topHeredoc.slice(1) : topHeredoc;
+        const { delimiter, stripTabs } = heredocStack[0];
         let lineToCheck = line;
-        if (isStripper) {
+        if (stripTabs) {
           // Strip leading tabs only (not spaces) per POSIX <<- behavior
           lineToCheck = line.replace(/^\t+/, '');
         }
