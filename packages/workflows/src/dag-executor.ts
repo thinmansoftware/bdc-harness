@@ -1442,21 +1442,59 @@ export function substituteNodeOutputRefs(
       }
 
       // Track heredoc opens on this line (only outside a heredoc body and not on a comment).
-      // Format: << [-]? ['"]? DELIMITER. "<<<" is a here-string, not a heredoc, so the
-      // operator must not be preceded or followed by another "<". Scan the reduced
-      // (unquoted, uncommented) form of the line so a trailing comment or a quoted
-      // "<<EOF" string is never mistaken for a real heredoc operator -- the delimiter's
-      // own quotes (e.g. <<'EOF') are preserved by the reducer since they immediately
-      // follow "<<" and are handled by the capture group below, not blanked as a string.
+      // Format: << [-]? WORD, where WORD is any shell word: a single- or double-quoted
+      // string, a backslash-prefixed word (<<\EOF), or an unquoted run up to whitespace
+      // or a shell metacharacter (| & ; ( ) < >). Bug (bdc-xo#2141, Overseer round 4 on
+      // #862): the prior regex only accepted a bare identifier as the delimiter, so
+      // "<<END-JSON" (hyphen) never matched, the heredoc never opened, and every
+      // subsequent line -- including real comment lines -- fell through to the
+      // top-level comment check and had refs substituted or skipped incorrectly.
+      // "<<<" is a here-string, not a heredoc, so the operator must not be preceded or
+      // followed by another "<". Scan the reduced (unquoted, uncommented) form of the
+      // line so a trailing comment or a quoted "<<EOF" string is never mistaken for a
+      // real heredoc operator -- the delimiter's own quotes (e.g. <<'EOF') are preserved
+      // by the reducer since they immediately follow "<<" and are parsed below, not
+      // blanked as a string.
       if (heredocStack.length === 0 && !isCommentLine) {
         const reducedLine = reduceToUnquotedUncommentedCode(line);
-        const heredocMatches = reducedLine.matchAll(
-          /(?<!<)<<(?!<)\s*(-)?(['"])?([a-zA-Z_][a-zA-Z0-9_]*)\2/g
-        );
-        for (const match of heredocMatches) {
-          const isStripper = match[1] === '-'; // <<- allows tab indentation
-          const delimiter = match[3];
-          heredocStack.push(isStripper ? `-${delimiter}` : delimiter);
+        const heredocOpRegex = /(?<!<)<<(?!<)(-)?/g;
+        let opMatch: RegExpExecArray | null;
+        while ((opMatch = heredocOpRegex.exec(reducedLine)) !== null) {
+          const isStripper = opMatch[1] === '-';
+          let pos = opMatch.index + opMatch[0].length;
+          while (pos < reducedLine.length && /\s/.test(reducedLine[pos])) pos++;
+          if (pos >= reducedLine.length) continue; // no word follows: not a heredoc
+
+          let delimiter: string | undefined;
+          const ch = reducedLine[pos];
+          if (ch === "'" || ch === '"') {
+            // Quoted delimiter: find the matching close quote. The reducer keeps
+            // heredoc-delimiter quoting literal (see isHeredocDelimiterQuote), so
+            // the interior is intact here.
+            const closeIdx = reducedLine.indexOf(ch, pos + 1);
+            if (closeIdx !== -1) {
+              delimiter = reducedLine.slice(pos + 1, closeIdx);
+              heredocOpRegex.lastIndex = closeIdx + 1;
+            }
+          } else if (ch === '\\') {
+            // Backslash-prefixed word (<<\EOF): terminator is the word itself.
+            let end = pos + 1;
+            while (end < reducedLine.length && !/[\s|&;()<>]/.test(reducedLine[end])) end++;
+            if (end > pos + 1) {
+              delimiter = reducedLine.slice(pos + 1, end);
+              heredocOpRegex.lastIndex = end;
+            }
+          } else if (!/[\s|&;()<>]/.test(ch)) {
+            // Unquoted word up to whitespace or a shell metacharacter.
+            let end = pos;
+            while (end < reducedLine.length && !/[\s|&;()<>]/.test(reducedLine[end])) end++;
+            delimiter = reducedLine.slice(pos, end);
+            heredocOpRegex.lastIndex = end;
+          }
+
+          if (delimiter !== undefined && delimiter.length > 0) {
+            heredocStack.push(isStripper ? `-${delimiter}` : delimiter);
+          }
         }
       }
 

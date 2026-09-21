@@ -1834,6 +1834,129 @@ describe('substituteNodeOutputRefs comment safety (bdc-xo#2141)', () => {
     expect(lines[0]).toBe('echo "a" # <<EOF');
     expect(lines[1]).toBe('# $spec.output');
   });
+
+  // Overseer round 4 on bdc-harness#862: the heredoc-open regex only accepted a bare
+  // identifier as the delimiter, so "<<END-JSON" (hyphen) never matched, the heredoc
+  // never opened, and a following "# $spec.output" line -- meant to be substituted as
+  // heredoc body -- was instead skipped as a top-level comment (or vice versa: a real
+  // comment after the terminator got substituted because the executor still thought a
+  // heredoc was open). Fixed by generalizing the delimiter grammar to any shell word.
+  it('<<END-JSON with a hyphenated delimiter: body line substituted, post-terminator comment left literal', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<END-JSON\n# $spec.output\nEND-JSON\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<END-JSON');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('END-JSON');
+    // Post-terminator: heredoc is closed, this is a real top-level comment line.
+    expect(lines[3]).toBe('# $spec.output');
+  });
+
+  it("<<'END-JSON' quoted hyphenated delimiter: body substituted, terminator closes", () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = "cat <<'END-JSON'\n# $spec.output\nEND-JSON";
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe("cat <<'END-JSON'");
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('END-JSON');
+  });
+
+  it('<<"END JSON" double-quoted delimiter with an embedded space: terminator is "END JSON"', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<"END JSON"\n# $spec.output\nEND JSON';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<"END JSON"');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('END JSON');
+  });
+
+  it('<<\\EOF backslash-prefixed delimiter: body substituted, terminator closes', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<\\EOF\n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<\\EOF');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('<<-  EOF with extra spaces before the delimiter: tab-stripped terminator closes', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<-  EOF\n\t# $spec.output\n\tEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<-  EOF');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('\tEOF');
+  });
+
+  it('<< EOF with a space after the operator: still opens a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat << EOF\n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat << EOF');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('<<EOF|cat with a pipe immediately after the delimiter: delimiter stops at the metacharacter', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<EOF|cat\n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<EOF|cat');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('<<EOF; with a semicolon immediately after the delimiter: delimiter stops at the metacharacter', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<EOF;\n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<EOF;');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('terminator with trailing spaces does not close the heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<EOF\nEOF \n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<EOF');
+    // "EOF " (trailing space) does not close -- still inside the heredoc, so the
+    // literal line passes through unchanged (no $ref to substitute).
+    expect(lines[1]).toBe('EOF ');
+    // Still inside the heredoc: substituted, not a top-level comment.
+    expect(lines[2]).toContain("# 'body'");
+    // This exact-match line finally closes it.
+    expect(lines[3]).toBe('EOF');
+  });
+
+  it('<<< here-string is ignored (not a heredoc)', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<<EOF\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    // No heredoc opened: line 0 unchanged (no $ref), line 1 is a top-level comment.
+    expect(lines[0]).toBe('cat <<<EOF');
+    expect(lines[1]).toBe('# $spec.output');
+  });
+
+  it('a comment line containing <<END-JSON does not open a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = '# see <<END-JSON below\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('# see <<END-JSON below');
+    // No heredoc was opened by the comment line, so this stays a top-level comment.
+    expect(lines[1]).toBe('# $spec.output');
+  });
+
+  it('two heredocs with hyphenated delimiters on one line close in FIFO order', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<A-1 <<B-2\nfirst body $spec.output\nA-1\nsecond body $spec.output\nB-2';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<A-1 <<B-2');
+    expect(lines[1]).toContain("'body'");
+    expect(lines[2]).toBe('A-1');
+    expect(lines[3]).toContain("'body'");
+    expect(lines[4]).toBe('B-2');
+  });
 });
 
 describe('checkTriggerRule -- missing upstream treated as failed', () => {
