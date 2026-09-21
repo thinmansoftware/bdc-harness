@@ -1959,6 +1959,192 @@ describe('substituteNodeOutputRefs comment safety (bdc-xo#2141)', () => {
   });
 });
 
+// Adversarial set assembled after four Overseer CHANGES_REQUESTED rounds on
+// bdc-harness#862. Every prior finding is here as an exact-line assertion, plus the
+// mixed-quoting delimiter forms bash accepts. Convention: `spec` = 'v', so a
+// substituted token renders as 'v' (shellQuote) and a skipped token stays literal.
+describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-harness#862)', () => {
+  const TOKEN = '# $spec.output';
+  const SUBST = "# 'v'";
+  const run = (script: string): string[] => {
+    const outputs = new Map([['spec', makeOutput('completed', 'v')]]);
+    return substituteNodeOutputRefs(script, outputs, true).split('\n');
+  };
+
+  // Round 1 (128b2d28): a heredoc data line that starts with # is data, not a comment.
+  it('round 1: leading-# line inside <<EOF body is substituted', () => {
+    expect(run(['cat <<EOF', TOKEN, 'EOF'].join('\n'))).toEqual(['cat <<EOF', SUBST, 'EOF']);
+  });
+
+  // Round 2 (ced4894e): <<EOF inside a trailing comment or a quoted string never opens.
+  it('round 2: <<EOF in a trailing comment does not open a heredoc', () => {
+    expect(run(['echo ok # example <<EOF', TOKEN].join('\n'))).toEqual([
+      'echo ok # example <<EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 2: <<EOF inside a double-quoted string does not open a heredoc', () => {
+    expect(run(['echo "<<EOF"', TOKEN].join('\n'))).toEqual(['echo "<<EOF"', TOKEN]);
+  });
+  it('round 2: <<EOF inside a single-quoted string does not open a heredoc', () => {
+    expect(run(["echo '<<EOF'", TOKEN].join('\n'))).toEqual(["echo '<<EOF'", TOKEN]);
+  });
+
+  // Round 3 (6b60dcf7): the delimiter is a full shell word, not an identifier.
+  it('round 3: <<END-JSON captures the whole word; END-JSON closes; later comment literal', () => {
+    expect(run(['cat <<END-JSON', TOKEN, 'END-JSON', TOKEN].join('\n'))).toEqual([
+      'cat <<END-JSON',
+      SUBST,
+      'END-JSON',
+      TOKEN,
+    ]);
+  });
+
+  // Round 4 (ff01f39d): bash quote removal over the whole delimiter word.
+  const mixedForms: Array<[string, string]> = [
+    ['<<E"OF"', 'EOF'],
+    ['<<EO\\F', 'EOF'],
+    ["<<'E'OF", 'EOF'],
+    ['<<"E"\'O\'F', 'EOF'],
+    ['<<E\'O\'"F"', 'EOF'],
+    ['<<\\E\\O\\F', 'EOF'],
+    ['<<"E\\"OF"', 'E"OF'],
+    ['<<"E\\$OF"', 'E$OF'],
+    ['<<"E\\xOF"', 'E\\xOF'],
+    ["<<'E\\'OF", 'E\\OF'],
+    ['<<-E"OF"', 'EOF'],
+  ];
+  for (const [operator, terminator] of mixedForms) {
+    it(`round 4: cat ${operator} terminates on ${JSON.stringify(terminator)}`, () => {
+      const script = [`cat ${operator}`, TOKEN, terminator, TOKEN].join('\n');
+      expect(run(script)).toEqual([`cat ${operator}`, SUBST, terminator, TOKEN]);
+    });
+  }
+
+  it('round 4: a delimiter that is NOT quote-equivalent to the terminator never closes', () => {
+    // <<E"OF" terminates on EOF; a line reading E"OF" is body data, not the terminator.
+    expect(run(['cat <<E"OF"', 'E"OF"', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<E"OF"',
+      'E"OF"',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+
+  it('unterminated single quote in the delimiter word is not a heredoc', () => {
+    expect(run(["cat <<'EOF", TOKEN].join('\n'))).toEqual(["cat <<'EOF", TOKEN]);
+  });
+  it('unterminated double quote in the delimiter word is not a heredoc', () => {
+    expect(run(['cat <<"EOF', TOKEN].join('\n'))).toEqual(['cat <<"EOF', TOKEN]);
+  });
+  it('a lone trailing backslash after << (line continuation) is not a heredoc', () => {
+    expect(run(['cat <<\\', TOKEN].join('\n'))).toEqual(['cat <<\\', TOKEN]);
+  });
+  it('<< with nothing after it is not a heredoc', () => {
+    expect(run(['cat <<', TOKEN].join('\n'))).toEqual(['cat <<', TOKEN]);
+  });
+
+  it('<<-E"OF" strips leading tabs from the terminator and the body', () => {
+    expect(run(['cat <<-E"OF"', `\t${TOKEN}`, '\tEOF', TOKEN].join('\n'))).toEqual([
+      'cat <<-E"OF"',
+      `\t${SUBST}`,
+      '\tEOF',
+      TOKEN,
+    ]);
+  });
+
+  it('<<< here-string with a quoted word is not a heredoc', () => {
+    expect(run(['cat <<<"x"', TOKEN].join('\n'))).toEqual(['cat <<<"x"', TOKEN]);
+  });
+
+  it('mixed-quoted delimiter followed by a trailing comment still opens', () => {
+    expect(run(['cat <<E"OF" # opens', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<E"OF" # opens',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('mixed-quoted delimiter immediately followed by a pipe stops at the metacharacter', () => {
+    expect(run(['cat <<E"OF"|cat', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<E"OF"|cat',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('a quoted string that merely contains <<E"OF" does not open a heredoc', () => {
+    const line = 'echo "x <<E\\"OF\\""';
+    expect(run([line, TOKEN].join('\n'))).toEqual([line, TOKEN]);
+  });
+  it('an escaped \\# is not a comment, so the << after it opens a heredoc', () => {
+    expect(run(['echo \\# <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo \\# <<EOF',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it("an escaped \\' does not open a string, so a later real trailing comment is honoured", () => {
+    // Without backslash handling in the reducer, \' would open a single-quoted region
+    // and the "# <<EOF" would be blanked for the wrong reason; with it, the # is a real
+    // comment and the <<EOF inside it must not open.
+    expect(run(["echo \\' # <<EOF", TOKEN].join('\n'))).toEqual(["echo \\' # <<EOF", TOKEN]);
+  });
+
+  it('two mixed-quoted heredocs on one line close FIFO', () => {
+    const script = ['cat <<\'A\'B <<C"D"', TOKEN, 'AB', TOKEN, 'CD', TOKEN].join('\n');
+    expect(run(script)).toEqual(['cat <<\'A\'B <<C"D"', SUBST, 'AB', SUBST, 'CD', TOKEN]);
+  });
+
+  it('comment-line check is unaffected by a heredoc whose body was already closed by a mixed form', () => {
+    const script = [
+      'cat <<EO\\F',
+      'data',
+      'EOF',
+      '    # indented $spec.output',
+      'X=$spec.output',
+    ].join('\n');
+    expect(run(script)).toEqual([
+      'cat <<EO\\F',
+      'data',
+      'EOF',
+      '    # indented $spec.output',
+      "X='v'",
+    ]);
+  });
+
+  it('end-to-end: multi-line output after a mixed-quoted heredoc never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = [
+      'cat <<E"OF"',
+      'body',
+      'EOF',
+      '# the executor substitutes $spec.output here',
+      'echo done',
+      '',
+    ].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result.split('\n')[3]).toBe('# the executor substitutes $spec.output here');
+    const tempFile = `${tmpdir()}/test-862-e2e-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('body\ndone\n');
+      expect(stdout).not.toContain('SPILLED');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return; // no bash
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+});
+
 describe('checkTriggerRule -- missing upstream treated as failed', () => {
   it('none_failed_min_one_success: skips when all deps skipped (no success)', () => {
     const n = node('implement', ['a', 'b'], { trigger_rule: 'none_failed_min_one_success' });

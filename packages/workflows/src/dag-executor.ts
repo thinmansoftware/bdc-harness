@@ -1297,6 +1297,146 @@ async function writeNodeOutputFile(
 }
 
 /**
+ * Reduce a bash script line to its unquoted, uncommented code portion, preserving
+ * the original character offsets (quoted and commented spans become spaces rather
+ * than being removed). This lets a plain regex scan for the "<<" heredoc operator
+ * without mistaking a trailing comment or a quoted string for real shell syntax.
+ *
+ * Tracks single-quote and double-quote state (backslash escapes apply only inside
+ * double quotes, matching bash). A "#" ends the code portion of the line only when
+ * it is outside any quote AND is either at the start of the line or preceded by
+ * whitespace, ";", "&", "|", or "(" -- matching bash's rule that "#" mid-word (e.g.
+ * inside `foo#bar`) is not a comment marker. Overseer CHANGES_REQUESTED on
+ * ced4894e (bdc-harness#862): `echo ok # example <<EOF` and `echo "<<EOF"` were
+ * misread as opening a heredoc because the prior scan was not shell-lexically aware.
+ * Quotes are blanked uniformly, including a heredoc delimiter's own quotes: the
+ * delimiter word is read from the ORIGINAL line by readHeredocDelimiter, never
+ * from the reduced form.
+ */
+function reduceToUnquotedUncommentedCode(line: string): string {
+  let out = '';
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+
+    if (inSingle) {
+      out += ch === "'" ? ch : ' ';
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+
+    if (inDouble) {
+      if (ch === '\\' && i + 1 < line.length) {
+        // Backslash escapes the next char inside double quotes; blank both -- we
+        // only care about "<<" and "#", neither of which needs the escaped char.
+        out += ' ';
+        i++;
+        out += ' ';
+        continue;
+      }
+      out += ch === '"' ? ch : ' ';
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+
+    if (ch === '\\' && i + 1 < line.length) {
+      // Backslash outside quotes escapes the next char (so \# is not a comment and
+      // \' does not open a string); blank both.
+      out += '  ';
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      if (ch === "'") inSingle = true;
+      else inDouble = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '#') {
+      const prev = i > 0 ? line[i - 1] : '';
+      const atCommentStart = i === 0 || /[\s;&|(]/.test(prev);
+      if (atCommentStart) {
+        // Rest of the line is a comment: blank it out and stop scanning.
+        out += ' '.repeat(line.length - i);
+        break;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Read one heredoc delimiter word from `line` starting at `start` (the first
+ * non-whitespace character after "<<" or "<<-"), applying bash quote removal
+ * across the WHOLE word the way bash itself derives the terminator:
+ *   - '...'  single-quoted segment: contents literal
+ *   - "..."  double-quoted segment: contents literal, except that a backslash
+ *            before one of  " \ $ `  is removed (bash double-quote rules)
+ *   - \x     backslash outside quotes: x literal
+ *   - any mix of the above (E"OF", EO\F, 'E'OF, "E"'O'F, E'O'"F")
+ * The word ends at unquoted whitespace or a shell metacharacter (| & ; ( ) < >).
+ * Returns null when there is no valid delimiter: empty word, an unterminated
+ * quote, or a trailing backslash (line continuation). Overseer round 4 on
+ * bdc-harness#862: `<<E"OF"` and `<<EO\F` both terminate on `EOF` in bash, but the
+ * previous parser only handled a wholly-quoted or leading-backslash word.
+ *
+ * Not modelled (documented limitation): an UNQUOTED delimiter containing `$`
+ * undergoes parameter expansion in bash; here it is taken literally.
+ */
+function readHeredocDelimiter(
+  line: string,
+  start: number
+): { delimiter: string; end: number } | null {
+  let delimiter = '';
+  let i = start;
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === "'") {
+      const close = line.indexOf("'", i + 1);
+      if (close === -1) return null; // unterminated single quote
+      delimiter += line.slice(i + 1, close);
+      i = close + 1;
+      continue;
+    }
+    if (ch === '"') {
+      let j = i + 1;
+      let closed = false;
+      while (j < line.length) {
+        const c = line[j];
+        if (c === '\\' && j + 1 < line.length && '"\\$`'.includes(line[j + 1])) {
+          delimiter += line[j + 1];
+          j += 2;
+          continue;
+        }
+        if (c === '"') {
+          closed = true;
+          break;
+        }
+        delimiter += c;
+        j++;
+      }
+      if (!closed) return null; // unterminated double quote
+      i = j + 1;
+      continue;
+    }
+    if (ch === '\\') {
+      if (i + 1 >= line.length) return null; // line continuation, not a delimiter
+      delimiter += line[i + 1];
+      i += 2;
+      continue;
+    }
+    if (/[\s|&;()<>]/.test(ch)) break;
+    delimiter += ch;
+    i++;
+  }
+  if (delimiter.length === 0) return null;
+  return { delimiter, end: i };
+}
+
+/**
  * Substitute $node_id.output and $node_id.output.field references in a prompt.
  * Called AFTER the standard substituteWorkflowVariables pass.
  *
@@ -1321,97 +1461,6 @@ async function writeNodeOutputFile(
  * every Cauldron lane died at commit-and-push. Prompt mode (escapedForBash=false)
  * is unchanged: # is not a comment in a prompt.
  */
-
-/**
- * Reduce a bash script line to its unquoted, uncommented code portion, preserving
- * the original character offsets (quoted and commented spans become spaces rather
- * than being removed). This lets a plain regex scan for the "<<" heredoc operator
- * without mistaking a trailing comment or a quoted string for real shell syntax.
- *
- * Tracks single-quote and double-quote state (backslash escapes apply only inside
- * double quotes, matching bash). A "#" ends the code portion of the line only when
- * it is outside any quote AND is either at the start of the line or preceded by
- * whitespace, ";", "&", "|", or "(" -- matching bash's rule that "#" mid-word (e.g.
- * inside `foo#bar`) is not a comment marker. Overseer CHANGES_REQUESTED on
- * ced4894e (bdc-harness#862): `echo ok # example <<EOF` and `echo "<<EOF"` were
- * misread as opening a heredoc because the prior scan was not shell-lexically aware.
- */
-function reduceToUnquotedUncommentedCode(line: string): string {
-  let out = '';
-  let inSingle = false;
-  let inDouble = false;
-  // While true, we are inside a heredoc DELIMITER quote (e.g. the 'EOF' in
-  // <<'EOF') -- kept byte-identical rather than blanked, so the delimiter name
-  // stays visible for the heredoc-open regex to capture below.
-  let inHeredocDelimQuote = false;
-  let heredocDelimQuoteChar = '';
-
-  // Is the quote character at index i immediately preceded (skipping any
-  // whitespace and an optional "-") by the "<<" heredoc operator? If so, it is
-  // the heredoc's own delimiter quoting (e.g. <<'EOF' or <<-"EOF") -- not a
-  // string literal.
-  const isHeredocDelimiterQuote = (i: number): boolean => {
-    let j = i - 1;
-    while (j >= 0 && (line[j] === ' ' || line[j] === '\t' || line[j] === '-')) j--;
-    return j >= 1 && line[j - 1] === '<' && line[j] === '<';
-  };
-
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-
-    if (inHeredocDelimQuote) {
-      out += ch;
-      if (ch === heredocDelimQuoteChar) inHeredocDelimQuote = false;
-      continue;
-    }
-
-    if (inSingle) {
-      out += ch === "'" ? ch : ' ';
-      if (ch === "'") inSingle = false;
-      continue;
-    }
-
-    if (inDouble) {
-      if (ch === '\\' && i + 1 < line.length) {
-        // Backslash escapes the next char inside double quotes; blank both -- we
-        // only care about "<<" and "#", neither of which needs the escaped char.
-        out += ' ';
-        i++;
-        out += ' ';
-        continue;
-      }
-      out += ch === '"' ? ch : ' ';
-      if (ch === '"') inDouble = false;
-      continue;
-    }
-
-    if (ch === "'" || ch === '"') {
-      if (isHeredocDelimiterQuote(i)) {
-        // Heredoc delimiter quoting: keep literal, do not blank the interior.
-        inHeredocDelimQuote = true;
-        heredocDelimQuoteChar = ch;
-        out += ch;
-        continue;
-      }
-      if (ch === "'") inSingle = true;
-      else inDouble = true;
-      out += ch;
-      continue;
-    }
-    if (ch === '#') {
-      const prev = i > 0 ? line[i - 1] : '';
-      const atCommentStart = i === 0 || /[\s;&|(]/.test(prev);
-      if (atCommentStart) {
-        // Rest of the line is a comment: blank it out and stop scanning.
-        out += ' '.repeat(line.length - i);
-        break;
-      }
-    }
-    out += ch;
-  }
-  return out;
-}
-
 export function substituteNodeOutputRefs(
   prompt: string,
   nodeOutputs: Map<string, NodeOutput>,
@@ -1450,11 +1499,12 @@ export function substituteNodeOutputRefs(
       // subsequent line -- including real comment lines -- fell through to the
       // top-level comment check and had refs substituted or skipped incorrectly.
       // "<<<" is a here-string, not a heredoc, so the operator must not be preceded or
-      // followed by another "<". Scan the reduced (unquoted, uncommented) form of the
-      // line so a trailing comment or a quoted "<<EOF" string is never mistaken for a
-      // real heredoc operator -- the delimiter's own quotes (e.g. <<'EOF') are preserved
-      // by the reducer since they immediately follow "<<" and are parsed below, not
-      // blanked as a string.
+      // followed by another "<". The OPERATOR is located on the reduced (unquoted,
+      // uncommented) form of the line so a trailing comment or a quoted "<<EOF" string
+      // is never mistaken for a real heredoc operator. The reducer preserves character
+      // offsets, so the DELIMITER WORD is then read from the original line at that
+      // offset by readHeredocDelimiter, which applies full bash quote removal
+      // (Overseer round 5 on #862: E"OF", EO\F, 'E'OF all terminate on EOF).
       if (heredocStack.length === 0 && !isCommentLine) {
         const reducedLine = reduceToUnquotedUncommentedCode(line);
         const heredocOpRegex = /(?<!<)<<(?!<)(-)?/g;
@@ -1462,39 +1512,13 @@ export function substituteNodeOutputRefs(
         while ((opMatch = heredocOpRegex.exec(reducedLine)) !== null) {
           const isStripper = opMatch[1] === '-';
           let pos = opMatch.index + opMatch[0].length;
-          while (pos < reducedLine.length && /\s/.test(reducedLine[pos])) pos++;
-          if (pos >= reducedLine.length) continue; // no word follows: not a heredoc
+          while (pos < line.length && /\s/.test(line[pos])) pos++;
+          if (pos >= line.length) continue; // no word follows: not a heredoc
 
-          let delimiter: string | undefined;
-          const ch = reducedLine[pos];
-          if (ch === "'" || ch === '"') {
-            // Quoted delimiter: find the matching close quote. The reducer keeps
-            // heredoc-delimiter quoting literal (see isHeredocDelimiterQuote), so
-            // the interior is intact here.
-            const closeIdx = reducedLine.indexOf(ch, pos + 1);
-            if (closeIdx !== -1) {
-              delimiter = reducedLine.slice(pos + 1, closeIdx);
-              heredocOpRegex.lastIndex = closeIdx + 1;
-            }
-          } else if (ch === '\\') {
-            // Backslash-prefixed word (<<\EOF): terminator is the word itself.
-            let end = pos + 1;
-            while (end < reducedLine.length && !/[\s|&;()<>]/.test(reducedLine[end])) end++;
-            if (end > pos + 1) {
-              delimiter = reducedLine.slice(pos + 1, end);
-              heredocOpRegex.lastIndex = end;
-            }
-          } else if (!/[\s|&;()<>]/.test(ch)) {
-            // Unquoted word up to whitespace or a shell metacharacter.
-            let end = pos;
-            while (end < reducedLine.length && !/[\s|&;()<>]/.test(reducedLine[end])) end++;
-            delimiter = reducedLine.slice(pos, end);
-            heredocOpRegex.lastIndex = end;
-          }
-
-          if (delimiter !== undefined && delimiter.length > 0) {
-            heredocStack.push(isStripper ? `-${delimiter}` : delimiter);
-          }
+          const word = readHeredocDelimiter(line, pos);
+          if (word === null) continue; // empty / unterminated quote / line continuation
+          heredocOpRegex.lastIndex = word.end;
+          heredocStack.push(isStripper ? `-${word.delimiter}` : word.delimiter);
         }
       }
 
