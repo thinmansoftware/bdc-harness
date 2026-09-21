@@ -1321,6 +1321,97 @@ async function writeNodeOutputFile(
  * every Cauldron lane died at commit-and-push. Prompt mode (escapedForBash=false)
  * is unchanged: # is not a comment in a prompt.
  */
+
+/**
+ * Reduce a bash script line to its unquoted, uncommented code portion, preserving
+ * the original character offsets (quoted and commented spans become spaces rather
+ * than being removed). This lets a plain regex scan for the "<<" heredoc operator
+ * without mistaking a trailing comment or a quoted string for real shell syntax.
+ *
+ * Tracks single-quote and double-quote state (backslash escapes apply only inside
+ * double quotes, matching bash). A "#" ends the code portion of the line only when
+ * it is outside any quote AND is either at the start of the line or preceded by
+ * whitespace, ";", "&", "|", or "(" -- matching bash's rule that "#" mid-word (e.g.
+ * inside `foo#bar`) is not a comment marker. Overseer CHANGES_REQUESTED on
+ * ced4894e (bdc-harness#862): `echo ok # example <<EOF` and `echo "<<EOF"` were
+ * misread as opening a heredoc because the prior scan was not shell-lexically aware.
+ */
+function reduceToUnquotedUncommentedCode(line: string): string {
+  let out = '';
+  let inSingle = false;
+  let inDouble = false;
+  // While true, we are inside a heredoc DELIMITER quote (e.g. the 'EOF' in
+  // <<'EOF') -- kept byte-identical rather than blanked, so the delimiter name
+  // stays visible for the heredoc-open regex to capture below.
+  let inHeredocDelimQuote = false;
+  let heredocDelimQuoteChar = '';
+
+  // Is the quote character at index i immediately preceded (skipping any
+  // whitespace and an optional "-") by the "<<" heredoc operator? If so, it is
+  // the heredoc's own delimiter quoting (e.g. <<'EOF' or <<-"EOF") -- not a
+  // string literal.
+  const isHeredocDelimiterQuote = (i: number): boolean => {
+    let j = i - 1;
+    while (j >= 0 && (line[j] === ' ' || line[j] === '\t' || line[j] === '-')) j--;
+    return j >= 1 && line[j - 1] === '<' && line[j] === '<';
+  };
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+
+    if (inHeredocDelimQuote) {
+      out += ch;
+      if (ch === heredocDelimQuoteChar) inHeredocDelimQuote = false;
+      continue;
+    }
+
+    if (inSingle) {
+      out += ch === "'" ? ch : ' ';
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+
+    if (inDouble) {
+      if (ch === '\\' && i + 1 < line.length) {
+        // Backslash escapes the next char inside double quotes; blank both -- we
+        // only care about "<<" and "#", neither of which needs the escaped char.
+        out += ' ';
+        i++;
+        out += ' ';
+        continue;
+      }
+      out += ch === '"' ? ch : ' ';
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+
+    if (ch === "'" || ch === '"') {
+      if (isHeredocDelimiterQuote(i)) {
+        // Heredoc delimiter quoting: keep literal, do not blank the interior.
+        inHeredocDelimQuote = true;
+        heredocDelimQuoteChar = ch;
+        out += ch;
+        continue;
+      }
+      if (ch === "'") inSingle = true;
+      else inDouble = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '#') {
+      const prev = i > 0 ? line[i - 1] : '';
+      const atCommentStart = i === 0 || /[\s;&|(]/.test(prev);
+      if (atCommentStart) {
+        // Rest of the line is a comment: blank it out and stop scanning.
+        out += ' '.repeat(line.length - i);
+        break;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
 export function substituteNodeOutputRefs(
   prompt: string,
   nodeOutputs: Map<string, NodeOutput>,
@@ -1352,9 +1443,14 @@ export function substituteNodeOutputRefs(
 
       // Track heredoc opens on this line (only outside a heredoc body and not on a comment).
       // Format: << [-]? ['"]? DELIMITER. "<<<" is a here-string, not a heredoc, so the
-      // operator must not be preceded or followed by another "<".
+      // operator must not be preceded or followed by another "<". Scan the reduced
+      // (unquoted, uncommented) form of the line so a trailing comment or a quoted
+      // "<<EOF" string is never mistaken for a real heredoc operator -- the delimiter's
+      // own quotes (e.g. <<'EOF') are preserved by the reducer since they immediately
+      // follow "<<" and are handled by the capture group below, not blanked as a string.
       if (heredocStack.length === 0 && !isCommentLine) {
-        const heredocMatches = line.matchAll(
+        const reducedLine = reduceToUnquotedUncommentedCode(line);
+        const heredocMatches = reducedLine.matchAll(
           /(?<!<)<<(?!<)\s*(-)?(['"])?([a-zA-Z_][a-zA-Z0-9_]*)\2/g
         );
         for (const match of heredocMatches) {

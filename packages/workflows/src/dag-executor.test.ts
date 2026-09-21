@@ -1783,6 +1783,57 @@ describe('substituteNodeOutputRefs comment safety (bdc-xo#2141)', () => {
     expect(lines[3]).toBe("# 'body'");
     expect(lines[5]).toBe('# $spec.output');
   });
+
+  // Overseer CHANGES_REQUESTED on ced4894e (bdc-harness#862): the heredoc-open scan
+  // was not shell-lexically aware, so a trailing comment or a quoted "<<EOF" string
+  // was misread as opening a heredoc, and the following "#" line was then wrongly
+  // substituted -- the exact bug this PR set out to fix.
+
+  it('a trailing comment containing <<EOF does not open a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'echo ok # example <<EOF\n# $spec.output\nX=$spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('echo ok # example <<EOF');
+    // Comment line stays literal (no heredoc was opened).
+    expect(lines[1]).toBe('# $spec.output');
+    // A following non-comment line still substitutes normally.
+    expect(lines[2]).toBe("X='body'");
+  });
+
+  it('a double-quoted "<<EOF" string does not open a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'echo "<<EOF"\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('echo "<<EOF"');
+    expect(lines[1]).toBe('# $spec.output');
+  });
+
+  it("a single-quoted '<<EOF' string does not open a heredoc", () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = "echo '<<EOF'\n# $spec.output";
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe("echo '<<EOF'");
+    expect(lines[1]).toBe('# $spec.output');
+  });
+
+  it('a real heredoc open followed by a trailing comment still opens the heredoc', () => {
+    const spec = 'body';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = 'cat <<EOF # trailing comment\n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<EOF # trailing comment');
+    // Inside the heredoc body: substituted, not treated as a comment.
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('a quoted string followed by a real trailing comment does not open a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'echo "a" # <<EOF\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('echo "a" # <<EOF');
+    expect(lines[1]).toBe('# $spec.output');
+  });
 });
 
 describe('checkTriggerRule -- missing upstream treated as failed', () => {
