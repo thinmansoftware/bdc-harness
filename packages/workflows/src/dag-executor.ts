@@ -1312,6 +1312,14 @@ async function writeNodeOutputFile(
  * commands. Anchor: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01 (bdc-xo#153) 2026-05-16.
  * YAMLs that write `"$node.output"` are now safe to author this natural way; the
  * older pattern of `VAR=$node.output ... "$VAR"` continues to work unchanged.
+ *
+ * When escapedForBash is on, bash COMMENT lines (first non-whitespace char is #)
+ * are left byte-identical -- no substitution. A multi-line output substituted into
+ * a comment spills past the # on line 2 and bash executes the rest. Anchor:
+ * bdc-xo#2141, 2026-09-21 -- a YAML comment reading "the executor substitutes
+ * $read-spec.output" expanded the whole 161-line WO spec into the script body and
+ * every Cauldron lane died at commit-and-push. Prompt mode (escapedForBash=false)
+ * is unchanged: # is not a comment in a prompt.
  */
 export function substituteNodeOutputRefs(
   prompt: string,
@@ -1399,18 +1407,6 @@ export function substituteNodeOutputRefs(
 // buildSDKHooksFromYAML moved to @archon/providers/src/claude/provider.ts
 // loadMcpConfig moved to @archon/providers/src/claude/provider.ts
 
-/**
- * Substitute $node.output tokens in prompts and bash scripts.
- *
- * When escapedForBash=true, bash comment lines (first non-whitespace char is #)
- * are left byte-identical. This prevents a multi-line $node.output substitution
- * from landing lines 2..N of the expansion into the script body unquoted and
- * bash-executed. Example: a YAML comment `# note: the executor substitutes
- * $read-spec.output` with a 161-line spec output would expand the spec into
- * the script's main text and bash would execute it. Anchor: bdc-xo#2141, 2026-09-21.
- * When escapedForBash=false (prompt mode), # is not a comment and tokens are
- * substituted normally.
- */
 /**
  * Resolve per-node provider and model.
  * Node-level overrides take precedence over workflow defaults.
