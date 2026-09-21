@@ -1322,7 +1322,29 @@ export function substituteNodeOutputRefs(
     ? /(")?\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?(")?/g
     : /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g;
 
-  return prompt.replace(pattern, (match: string, ...rest: (string | undefined)[]) => {
+  // When escapedForBash is true, split into lines and only substitute on non-comment lines
+  if (escapedForBash) {
+    const lines = prompt.split('\n');
+    const processedLines = lines.map(line => {
+      // Check if first non-whitespace char is # (bash comment)
+      let wsIndex = 0;
+      while (wsIndex < line.length && /\s/.test(line[wsIndex])) {
+        wsIndex++;
+      }
+      if (wsIndex < line.length && line[wsIndex] === '#') {
+        // Comment line: leave unchanged
+        return line;
+      }
+      // Non-comment line: apply substitution
+      return line.replace(pattern, substituteToken);
+    });
+    return processedLines.join('\n');
+  }
+
+  // Non-bash mode: substitute all tokens normally
+  return prompt.replace(pattern, substituteToken);
+
+  function substituteToken(match: string, ...rest: (string | undefined)[]): string {
     let leadingQuote: string;
     let nodeId: string;
     let field: string | undefined;
@@ -1371,12 +1393,24 @@ export function substituteNodeOutputRefs(
       );
       return escapedForBash ? wrap("''") : '';
     }
-  });
+  }
 }
 
 // buildSDKHooksFromYAML moved to @archon/providers/src/claude/provider.ts
 // loadMcpConfig moved to @archon/providers/src/claude/provider.ts
 
+/**
+ * Substitute $node.output tokens in prompts and bash scripts.
+ *
+ * When escapedForBash=true, bash comment lines (first non-whitespace char is #)
+ * are left byte-identical. This prevents a multi-line $node.output substitution
+ * from landing lines 2..N of the expansion into the script body unquoted and
+ * bash-executed. Example: a YAML comment `# note: the executor substitutes
+ * $read-spec.output` with a 161-line spec output would expand the spec into
+ * the script's main text and bash would execute it. Anchor: bdc-xo#2141, 2026-09-21.
+ * When escapedForBash=false (prompt mode), # is not a comment and tokens are
+ * substituted normally.
+ */
 /**
  * Resolve per-node provider and model.
  * Node-level overrides take precedence over workflow defaults.

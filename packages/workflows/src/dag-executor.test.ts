@@ -1605,6 +1605,81 @@ describe('substituteNodeOutputRefs -- shell escaping', () => {
   });
 });
 
+describe('substituteNodeOutputRefs comment safety (bdc-xo#2141)', () => {
+  it('skips substitution on bash comment lines when escapedForBash=true', () => {
+    const spec = '**Title:** foo\nLine2: content\nLine3: more';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = '# note: the executor substitutes $spec.output\n' + 'X=$spec.output\n';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // Comment line should be unchanged
+    expect(lines[0]).toBe('# note: the executor substitutes $spec.output');
+    // Non-comment line should be substituted
+    expect(lines[1]).toContain("X='**Title:**");
+  });
+
+  it('substitutes on comment lines when escapedForBash=false (prompt mode)', () => {
+    const spec = '**Title:** foo';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const text = '# note: the executor substitutes $spec.output';
+    const result = substituteNodeOutputRefs(text, outputs, false);
+    // In prompt mode, comment char is not special, so substitution happens
+    expect(result).toBe('# note: the executor substitutes **Title:** foo');
+  });
+
+  it('skips substitution on indented comment lines when escapedForBash=true', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'multiline\nvalue')]]);
+    const script = '    # $spec.output';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result).toBe('    # $spec.output');
+  });
+
+  it('substitutes token on lines where # appears after the token', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'hello')]]);
+    const script = 'Y=$spec.output # trailing comment';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    // Token IS substituted (only leading-# lines are comments)
+    expect(result).toContain("Y='hello'");
+    expect(result).toContain('# trailing comment');
+  });
+
+  it('regression: generated script passes bash -n (syntax check)', async () => {
+    const spec = '**Title:** foo\nSchema: bar\nDetails: baz';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script =
+      '#!/bin/bash\n' +
+      '# note: the executor substitutes $spec.output\n' +
+      'X=$spec.output\n' +
+      'echo "X is ${X}"\n';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+
+    // The result should have the comment unchanged and X substituted
+    expect(result).toContain('# note: the executor substitutes $spec.output');
+    expect(result).toContain("X='**Title:**");
+
+    // Try to run bash -n (syntax check) if bash is available
+    try {
+      const tempFile = `${tmpdir()}/test-syntax-${Date.now()}.sh`;
+      await writeFile(tempFile, result);
+      const checkResult = Bun.spawnSync(['bash', '-n', tempFile], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (checkResult.exitCode !== 0) {
+        const stderr = new TextDecoder().decode(checkResult.stderr);
+        throw new Error(`bash -n failed: ${stderr}`);
+      }
+      await rm(tempFile);
+    } catch (err) {
+      // Skip if bash is unavailable or fails
+      if (err instanceof Error && err.message.includes('spawn failed')) {
+        // bash not available in test env -- skip silently
+        return;
+      }
+      throw err;
+    }
+  });
+});
+
 describe('checkTriggerRule -- missing upstream treated as failed', () => {
   it('none_failed_min_one_success: skips when all deps skipped (no success)', () => {
     const n = node('implement', ['a', 'b'], { trigger_rule: 'none_failed_min_one_success' });
