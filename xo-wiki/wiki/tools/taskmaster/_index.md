@@ -136,6 +136,18 @@ When a nudge causes progress, record that evidence on the source GitHub issue
 with an exact first-line marker of `[PROGRESS]` or `[BLOCKED]`. Taskmaster ignores
 its own outbound dispatch row as proof of progress.
 
+### Action grades (M-155 Amendment 03)
+
+| Grade     | Meaning                                                                                                                                                    | Useful-rate floor         |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| `useful`  | A non-draining recipient acknowledged the dispatch and the external source of record shows qualifying downstream movement.                                 | Numerator and denominator |
+| `noise`   | A non-draining recipient acknowledged the dispatch, but qualifying movement was absent at the proof deadline.                                              | Denominator               |
+| `unheard` | The dispatch was not acknowledged, or its recipient uses `drain_on_start`; acknowledgement from an auto-draining mailbox is not evidence a human heard it. | Excluded                  |
+
+John's 2026-09-21 ruling in M-155 Amendment 03 requires `unheard` to be
+queryable in `tm_journal.grade` and excluded from the usefulness floor. Resume
+after a floor pause remains an operator decision.
+
 ## Pause (John or operator)
 
 ```bash

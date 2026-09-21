@@ -5,6 +5,9 @@
  * messages: delivering undelivered ratified rulings, nudging idle threads,
  * and escalating unclaimed P0s. All sends go through the dispatch DAL
  * (createAuthenticatedMessage) -- there is no second messaging path.
+ * Sent actions are graded unheard until their dispatch is acknowledged by a
+ * recipient whose delivery mode is not drain_on_start; unheard does not enter
+ * the useful-rate floor denominator.
  *
  * Tick order (spec Section 8): pause state + epoch -> headroom -> reads ->
  * classify -> propose -> two-tick confirm -> guard -> journal ROW FIRST ->
@@ -19,10 +22,12 @@ import { getDatabase } from '@archon/core';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import {
   createAuthenticatedMessage,
+  assessDispatchRecipient,
   getMessage,
   listMessages,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
+  type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
@@ -35,6 +40,7 @@ import {
   type ThreadPriority,
   type TmActionType,
   usefulRateFloorBreached,
+  TM_GRADE_UNHEARD,
 } from './rules';
 import { validateProposal, type TmAllowedRecipient } from './guard';
 import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
@@ -172,10 +178,15 @@ export interface TaskmasterDeps {
   listThreads?: () => Promise<ThreadSnapshot[] | ListedThreadResult>;
   headroom?: () => Promise<HeadroomReading>;
   /** External-SOR check: does a dispatch row exist for this key, and when was it sent? */
-  findEffectByIdempotencyKey?: (
-    key: string
-  ) => Promise<{ id: string; status: string; createdAt: string } | null>;
+  findEffectByIdempotencyKey?: (key: string) => Promise<{
+    id: string;
+    status: string;
+    createdAt: string;
+    recipient: string;
+    acknowledgedAt: string | null;
+  } | null>;
   getDispatchMessageById?: (id: string) => Promise<DispatchMessage | null>;
+  assessDispatchRecipient?: (recipient: string) => Promise<DispatchRecipientAssessment>;
   getGithubIssueEvidence?: (
     threadRef: string,
     sinceIso: string
@@ -213,8 +224,10 @@ function sha256(text: string): string {
 
 interface TaskmasterEffectRow {
   id: string;
+  recipient: string;
   status: string;
   created_at: string;
+  acknowledged_at: string | null;
 }
 type TaskmasterEffectQuery = (
   sql: string,
@@ -225,16 +238,30 @@ export async function defaultFindEffectByIdempotencyKey(
   key: string,
   query: TaskmasterEffectQuery = (sql, params) =>
     getDatabase().query<TaskmasterEffectRow>(sql, params)
-): Promise<{ id: string; status: string; createdAt: string } | null> {
+): Promise<{
+  id: string;
+  status: string;
+  createdAt: string;
+  recipient: string;
+  acknowledgedAt: string | null;
+} | null> {
   const result = await query(
-    `SELECT id, status, created_at FROM agent_dispatch_messages
+    `SELECT id, status, created_at, recipient, acknowledged_at FROM agent_dispatch_messages
      WHERE idempotency_key = $1
        AND sender_principal_id = 'system:taskmaster'
      LIMIT 1`,
     [key]
   );
   const row = result.rows[0];
-  return row ? { id: row.id, status: row.status, createdAt: row.created_at } : null;
+  return row
+    ? {
+        id: row.id,
+        status: row.status,
+        createdAt: row.created_at,
+        recipient: row.recipient,
+        acknowledgedAt: row.acknowledged_at,
+      }
+    : null;
 }
 
 /** Undelivered ratified rulings: queued board-motion mailbox rows not yet acknowledged. */
@@ -763,13 +790,27 @@ async function gradeSentActions(
   findEffect: NonNullable<TaskmasterDeps['findEffectByIdempotencyKey']>,
   getDispatchById: NonNullable<TaskmasterDeps['getDispatchMessageById']>,
   getIssueEvidence: NonNullable<TaskmasterDeps['getGithubIssueEvidence']>,
+  assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>,
   nowMs: number,
   getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>
 ): Promise<number> {
   let failures = 0;
   for (const action of actions) {
     if (action.outcome !== 'sent' || action.grade !== null || !action.idempotency_key) continue;
+    if (action.action_type === 'digest') continue;
     try {
+      const effect = await findEffect(action.idempotency_key);
+      if (!effect) continue;
+      const assessment = await assessRecipient(effect.recipient);
+      const heard =
+        effect.acknowledgedAt != null &&
+        assessment.ok &&
+        assessment.delivery_mode !== 'drain_on_start';
+      if (!heard) {
+        await dal.gradeAction(action.id, TM_GRADE_UNHEARD);
+        continue;
+      }
+
       if (action.action_type === 'fire_cauldron') {
         const proposal = JSON.parse(action.proposal_json) as ActionProposal & {
           cascadeId?: string;
@@ -794,14 +835,10 @@ async function gradeSentActions(
         }
         continue;
       }
-      const effect = await findEffect(action.idempotency_key);
-      if (!effect) continue;
       if (effect.status === 'cancelled') {
         await dal.gradeAction(action.id, 'noise');
         continue;
       }
-      if (action.action_type === 'digest') continue;
-
       const sentAtMs = Date.parse(effect.createdAt);
       if (!Number.isFinite(sentAtMs)) {
         failures += 1;
@@ -1043,6 +1080,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   const createTask = deps.createTask ?? createAuthenticatedMessage;
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
+  const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
   const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
   const executeCascade = deps.runCascade ?? runCascade;
@@ -1150,6 +1188,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     findEffect,
     getDispatchById,
     getIssueEvidence,
+    assessRecipient,
     nowMs,
     getFireRunEvidence
   );
@@ -1169,6 +1208,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       const gradedWindow = await dal.getActionsSince(new Date(floorStartMs).toISOString());
       let usefulCount = 0;
       let noiseCount = 0;
+      // Only useful/noise count; unheard (and any other grade) is excluded by design.
       for (const a of gradedWindow) {
         if (a.grade === 'useful') usefulCount += 1;
         else if (a.grade === 'noise') noiseCount += 1;

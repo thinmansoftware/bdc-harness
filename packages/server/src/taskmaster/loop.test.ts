@@ -388,8 +388,22 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     }) as unknown as TaskmasterDeps['createTask'],
     findEffectByIdempotencyKey: async (key: string) => {
       const found = world.sentMessages.find(m => m.idempotency_key === key);
-      return found ? { id: 'existing', status: 'queued', createdAt: found.createdAt } : null;
+      return found
+        ? {
+            id: 'existing',
+            status: 'queued',
+            createdAt: found.createdAt,
+            recipient: found.recipient,
+            acknowledgedAt: found.createdAt,
+          }
+        : null;
     },
+    assessDispatchRecipient: async recipient => ({
+      ok: true,
+      canonical_principal: recipient,
+      delivery_mode: 'worker_poll',
+      reason: null,
+    }),
     listUndeliveredRulings: async () => [],
     listThreads: async () => [],
     // Default no-op evidence so adoption refresh never hits the network in unit tests.
@@ -1208,6 +1222,12 @@ describe('fire_cauldron loop', () => {
         graded_at: null,
         grade: null,
       });
+      world.sentMessages.push({
+        idempotency_key: `tm:fire:${testCase.id}`,
+        recipient: 'operator',
+        body: 'fire notice',
+        createdAt: new Date(T0 - 45_000).toISOString(),
+      });
       let evidenceCalls = 0;
       await tick(
         createTaskmasterState(60_000),
@@ -1516,6 +1536,8 @@ describe('scenario 4: restart produces no double effect', () => {
                   id: 'legacy-taskmaster-dispatch',
                   status: 'queued',
                   created_at: new Date(T0 - 30_000).toISOString(),
+                  recipient: 'xo',
+                  acknowledged_at: new Date(T0 - 20_000).toISOString(),
                 },
               ],
             }
@@ -1741,6 +1763,118 @@ describe('failed effect reuse and successful-tick health', () => {
     expect(result.successful).toBe(false);
     expect(result.failed).toBe(1);
     expect(state.deadman.lastTickAtMs).toBeNull();
+  });
+});
+
+describe('M-155 Amendment 03 unheard grading', () => {
+  function seedSentNudge(world: FakeWorld, id: string): string {
+    const key = `tm:nudge:gh:test/repo#1:${id}`;
+    world.journal.push({
+      id,
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:test/repo#1',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'post-send source progress',
+      proof_deadline_at: new Date(T0 - 1).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'operator',
+      body: 'nudge',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+    });
+    return key;
+  }
+
+  test.each([
+    { name: 'unacknowledged dispatch', acknowledgedAt: null, mode: 'worker_poll' as const },
+    {
+      name: 'acknowledged dispatch to a draining principal',
+      acknowledgedAt: new Date(T0 - 30_000).toISOString(),
+      mode: 'drain_on_start' as const,
+    },
+  ])('grades $name unheard', async ({ acknowledgedAt, mode }) => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = seedSentNudge(world, `unheard-${mode}-${acknowledgedAt ?? 'null'}`);
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        findEffectByIdempotencyKey: async effectKey =>
+          effectKey === key
+            ? {
+                id: 'dispatch-1',
+                status: 'queued',
+                createdAt: new Date(T0 - 45_000).toISOString(),
+                recipient: 'operator',
+                acknowledgedAt,
+              }
+            : null,
+        assessDispatchRecipient: async recipient => ({
+          ok: true,
+          canonical_principal: recipient,
+          delivery_mode: mode,
+          reason: null,
+        }),
+      })
+    );
+    expect(world.journal.find(row => row.id.startsWith('unheard-'))?.grade).toBe('unheard');
+  });
+
+  test.each([
+    { movement: true, expected: 'useful' },
+    { movement: false, expected: 'noise' },
+  ] as const)('an acknowledged non-draining dispatch remains $expected', async testCase => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedSentNudge(world, `heard-${testCase.expected}`);
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        getGithubIssueEvidence: async () => ({
+          state: 'open',
+          updatedAt: new Date(T0 - 30_000).toISOString(),
+          labels: ['wo'],
+          assigneeCount: 0,
+          closedAt: null,
+          assignedAt: null,
+          activeStatusAt: null,
+          progressRecordedAt: testCase.movement ? new Date(T0 - 30_000).toISOString() : null,
+        }),
+      })
+    );
+    expect(world.journal.find(row => row.id === `heard-${testCase.expected}`)?.grade).toBe(
+      testCase.expected
+    );
+  });
+
+  test('62 unheard and one useful are a 100% counted sample and do not pause', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    for (let i = 0; i < 62; i += 1) {
+      world.journal.push({
+        ...world.journal[0]!,
+        id: `unheard-floor-${i}`,
+        action_type: 'nudge',
+        grade: 'unheard',
+        graded_at: new Date(T0).toISOString(),
+      });
+    }
+    world.journal.push({
+      ...world.journal[0]!,
+      id: 'useful-floor',
+      action_type: 'nudge',
+      grade: 'useful',
+      graded_at: new Date(T0).toISOString(),
+    });
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.control.pause_state).toBe('RUNNING');
   });
 });
 
@@ -1987,6 +2121,8 @@ describe('SC7 grading requires external source progress', () => {
               id: 'cancelled-effect',
               status: 'cancelled',
               createdAt: new Date(T0 - 45_000).toISOString(),
+              recipient: 'operator',
+              acknowledgedAt: new Date(T0 - 40_000).toISOString(),
             }
           : null,
       getGithubIssueEvidence: async () => ({

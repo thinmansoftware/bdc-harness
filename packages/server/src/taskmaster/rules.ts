@@ -110,9 +110,13 @@ export const USEFUL_RATE_FLOOR = 0.4;
  */
 export const USEFUL_RATE_MIN_GRADED = 20;
 
+/** A sent action whose dispatch was not acknowledged by a non-draining recipient. */
+export const TM_GRADE_UNHEARD = 'unheard' as const;
+
 /**
  * Pure floor test: true when the graded sample is large enough AND the
- * useful share of graded actions is strictly below USEFUL_RATE_FLOOR.
+ * useful share of graded actions is strictly below USEFUL_RATE_FLOOR. Only
+ * useful/noise enter this calculation; unheard is intentionally excluded.
  * Exactly 40% does not breach (the ruling says "floor", not "must exceed").
  */
 export function usefulRateFloorBreached(usefulCount: number, noiseCount: number): boolean {

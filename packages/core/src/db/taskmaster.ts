@@ -29,7 +29,7 @@ export type TmActionOutcome =
   | 'rejected'
   | 'expired'
   | 'failed';
-export type TmGrade = 'useful' | 'noise' | 'harmful';
+export type TmGrade = 'useful' | 'noise' | 'harmful' | 'unheard';
 export type TmPauseState = 'RUNNING' | 'PAUSED' | 'HARD_PAUSE';
 export type TmHealthState = 'healthy' | 'degraded' | 'dark' | 'unknown';
 export type TmUsageConfidence = 'high' | 'low' | 'none';

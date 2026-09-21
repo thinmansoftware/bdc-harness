@@ -463,12 +463,15 @@ export class SqliteAdapter implements IDatabase {
    * the columns were added to createSchema().
    */
   private migrateColumns(): void {
-    // Migration 045: SQLite cannot alter CHECK constraints. Rebuild existing
-    // four-verb journals transactionally before any fire_cauldron insert.
+    // Migrations 045/055: SQLite cannot alter CHECK constraints. Rebuild older
+    // journals before any fire_cauldron action or unheard grade is inserted.
     const journalSchema = this.db
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
       .get() as { sql?: string } | undefined;
-    if (journalSchema?.sql && !journalSchema.sql.includes('fire_cauldron')) {
+    if (
+      journalSchema?.sql &&
+      (!journalSchema.sql.includes('fire_cauldron') || !journalSchema.sql.includes('unheard'))
+    ) {
       this.db.run('BEGIN');
       try {
         this.db.run(`
@@ -484,7 +487,7 @@ export class SqliteAdapter implements IDatabase {
             proof_deadline_at TEXT,
             outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
             graded_at TEXT,
-            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful'))
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
           );
           INSERT INTO tm_journal_new SELECT * FROM tm_journal;
           DROP TABLE tm_journal;
@@ -2196,7 +2199,7 @@ export class SqliteAdapter implements IDatabase {
           outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')
         ),
         graded_at TEXT,
-        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful'))
+        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
       );
 
       CREATE TABLE IF NOT EXISTS tm_control (
