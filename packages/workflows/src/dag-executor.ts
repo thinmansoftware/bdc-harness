@@ -1330,22 +1330,59 @@ export function substituteNodeOutputRefs(
     ? /(")?\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?(")?/g
     : /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g;
 
-  // When escapedForBash is true, split into lines and only substitute on non-comment lines
+  // When escapedForBash is true, split into lines and track heredoc state.
+  // Skip substitution only on bash comment lines (first non-whitespace is #)
+  // that are NOT inside an open heredoc. Heredoc content is data, not comments.
   if (escapedForBash) {
     const lines = prompt.split('\n');
-    const processedLines = lines.map(line => {
-      // Check if first non-whitespace char is # (bash comment)
-      let wsIndex = 0;
-      while (wsIndex < line.length && /\s/.test(line[wsIndex])) {
-        wsIndex++;
+    const processedLines: string[] = [];
+    const heredocStack: string[] = []; // Stack of open heredoc delimiters
+
+    for (const line of lines) {
+      // Track heredoc opens on this line. Format: << [- | 'quote' | "quote"]? DELIMITER [whitespace|redirection]
+      // Capture each heredoc delimiter and push to stack; line content after << is still data until next line.
+      const heredocMatches = line.matchAll(/<<\s*(-)?(['"])?([a-zA-Z_][a-zA-Z0-9_]*)\2/g);
+      for (const match of heredocMatches) {
+        const isStripper = match[1] === '-'; // <<- allows tab indentation
+        const delimiter = match[3];
+        heredocStack.push(isStripper ? `-${delimiter}` : delimiter);
       }
-      if (wsIndex < line.length && line[wsIndex] === '#') {
-        // Comment line: leave unchanged
-        return line;
+
+      // Check if this line closes a heredoc: content (with leading tabs stripped if stripper)
+      // must exactly match the delimiter.
+      if (heredocStack.length > 0) {
+        const topHeredoc = heredocStack[heredocStack.length - 1];
+        const isStripper = topHeredoc.startsWith('-');
+        const delimiter = isStripper ? topHeredoc.slice(1) : topHeredoc;
+        let lineToCheck = line;
+        if (isStripper) {
+          // Strip leading tabs only (not spaces) per POSIX <<- behavior
+          lineToCheck = line.replace(/^\t+/, '');
+        }
+        if (lineToCheck === delimiter) {
+          // This line closes the heredoc
+          heredocStack.pop();
+        }
       }
-      // Non-comment line: apply substitution
-      return line.replace(pattern, substituteToken);
-    });
+
+      // Decide whether to substitute: skip only if (a) no heredoc is open AND
+      // (b) first non-whitespace char is # (bash comment).
+      let shouldSubstitute = true;
+      if (heredocStack.length === 0) {
+        // No open heredoc; apply comment check
+        let wsIndex = 0;
+        while (wsIndex < line.length && /\s/.test(line[wsIndex])) {
+          wsIndex++;
+        }
+        if (wsIndex < line.length && line[wsIndex] === '#') {
+          // Comment line outside heredoc: skip substitution
+          shouldSubstitute = false;
+        }
+      }
+      // If a heredoc IS open, always substitute (heredoc body is data)
+
+      processedLines.push(shouldSubstitute ? line.replace(pattern, substituteToken) : line);
+    }
     return processedLines.join('\n');
   }
 

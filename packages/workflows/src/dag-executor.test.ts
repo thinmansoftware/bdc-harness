@@ -1678,6 +1678,85 @@ describe('substituteNodeOutputRefs comment safety (bdc-xo#2141)', () => {
       throw err;
     }
   });
+
+  it('heredoc with EOF: substitutes inside heredoc body, not in leading comment', () => {
+    const spec = 'single line spec';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = 'cat <<EOF\n# $spec.output\nEOF';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // Line 1: cat <<EOF (unchanged)
+    expect(lines[0]).toBe('cat <<EOF');
+    // Line 2: # $spec.output should be SUBSTITUTED (inside heredoc, not a comment)
+    // The substitution produces shell-quoted output since escapedForBash=true
+    expect(lines[1]).toContain("# 'single line spec'");
+    // Line 3: EOF (unchanged, closes heredoc)
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('heredoc with <<-EOF: substitutes inside body with tab indentation', () => {
+    const spec = 'indented spec';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = 'cat <<-EOF\n\t# $spec.output\n\tEOF';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // Line 1: cat <<-EOF (unchanged)
+    expect(lines[0]).toBe('cat <<-EOF');
+    // Line 2: \t# $spec.output should be SUBSTITUTED (inside <<- heredoc)
+    // The substitution produces shell-quoted output since escapedForBash=true
+    expect(lines[1]).toContain("\t# 'indented spec'");
+    // Line 3: \tEOF (with leading tab stripped for comparison, closes heredoc)
+    expect(lines[2]).toBe('\tEOF');
+  });
+
+  it("heredoc with quoted delimiter <<'EOF': substitutes inside body", () => {
+    const spec = 'quoted delimiter spec';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = "cat <<'EOF'\n# $spec.output\nEOF";
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // Line 1: cat <<'EOF' (unchanged)
+    expect(lines[0]).toBe("cat <<'EOF'");
+    // Line 2: # $spec.output should be SUBSTITUTED (inside heredoc, not a comment)
+    // The substitution produces shell-quoted output since escapedForBash=true
+    expect(lines[1]).toContain("# 'quoted delimiter spec'");
+    // Line 3: EOF (unchanged, closes heredoc)
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('comment line after heredoc closes is skipped', () => {
+    const spec = 'spec content';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = 'cat <<EOF\ndata\nEOF\n# $spec.output';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // Lines 1-3: heredoc (data line stays as-is because no $ref)
+    expect(lines[0]).toBe('cat <<EOF');
+    expect(lines[1]).toBe('data');
+    expect(lines[2]).toBe('EOF');
+    // Line 4: # $spec.output should NOT be substituted (comment outside heredoc)
+    expect(lines[3]).toBe('# $spec.output');
+  });
+
+  it('two heredocs on one line', () => {
+    const spec1 = 'first';
+    const spec2 = 'second';
+    const outputs = new Map([
+      ['spec1', makeOutput('completed', spec1)],
+      ['spec2', makeOutput('completed', spec2)],
+    ]);
+    const script = 'cat <<A <<B\n$spec1.output\n$spec2.output\nA\nB';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // cat <<A <<B: both heredoc opens tracked
+    expect(lines[0]).toBe('cat <<A <<B');
+    // Inside first heredoc (opens tracked): both lines get substituted with shell quoting
+    expect(lines[1]).toContain("'first'");
+    expect(lines[2]).toContain("'second'");
+    // A closes first heredoc, B closes second
+    expect(lines[3]).toBe('A');
+    expect(lines[4]).toBe('B');
+  });
 });
 
 describe('checkTriggerRule -- missing upstream treated as failed', () => {
