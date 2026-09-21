@@ -18,11 +18,13 @@ import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import {
+  assessDispatchRecipient,
   createAuthenticatedMessage,
   getMessage,
   listMessages,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
+  type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
@@ -35,6 +37,7 @@ import {
   type ThreadPriority,
   type TmActionType,
   usefulRateFloorBreached,
+  UNHEARD_GRADE,
 } from './rules';
 import { validateProposal, type TmAllowedRecipient } from './guard';
 import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
@@ -176,6 +179,11 @@ export interface TaskmasterDeps {
     key: string
   ) => Promise<{ id: string; status: string; createdAt: string } | null>;
   getDispatchMessageById?: (id: string) => Promise<DispatchMessage | null>;
+  /**
+   * M-155 Amendment 03: resolve the acknowledging principal's delivery_mode so
+   * grading can tell "heard by a human-facing party" from "auto-drained".
+   */
+  assessDispatchRecipient?: (recipient: string) => Promise<DispatchRecipientAssessment>;
   getGithubIssueEvidence?: (
     threadRef: string,
     sinceIso: string
@@ -756,6 +764,18 @@ async function reconcilePendingActions(
  * Grade sent actions against action-specific external SOR evidence recorded
  * after the outbound dispatch send. The outbound row alone never proves
  * usefulness.
+ *
+ * M-155 Amendment 03 (2026-09-21) adds a third grade, `unheard`. An action is
+ * `unheard` unless its dispatch row (agent_dispatch_messages) carries an
+ * `acknowledged_at` from a principal whose `delivery_mode` is NOT
+ * `drain_on_start`. Mailboxes that drain on start (e.g. `operator`) are
+ * auto-addressed within seconds -- a human never reads them -- so an ack from
+ * such a principal does not count as human acknowledgement. `unheard` actions
+ * are excluded from the useful-rate floor denominator (only `useful` and
+ * `noise` count); this stops the supervisor from grading unread channel-deaf
+ * messages as `noise` and pausing itself for the M-129 Phase 2 gap. The check
+ * runs before the useful/noise evidence logic and is skipped for `digest`
+ * (ungraded) and `fire_cauldron` (graded earlier on run evidence).
  */
 async function gradeSentActions(
   actions: taskmasterDb.TmJournalEntry[],
@@ -764,7 +784,8 @@ async function gradeSentActions(
   getDispatchById: NonNullable<TaskmasterDeps['getDispatchMessageById']>,
   getIssueEvidence: NonNullable<TaskmasterDeps['getGithubIssueEvidence']>,
   nowMs: number,
-  getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>
+  getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>,
+  assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>
 ): Promise<number> {
   let failures = 0;
   for (const action of actions) {
@@ -796,6 +817,33 @@ async function gradeSentActions(
       }
       const effect = await findEffect(action.idempotency_key);
       if (!effect) continue;
+
+      // M-155 Amendment 03: `unheard` gate. Digest is never graded, so it is
+      // exempt (falls through to the ungraded `continue` below). For every
+      // other action, the dispatch row must have been acknowledged by a
+      // non-`drain_on_start` principal to count as heard; otherwise it is
+      // `unheard` and excluded from the useful-rate floor. This runs BEFORE
+      // the cancelled/useful/noise logic: a cancelled-but-unread order was
+      // still never seen by a human, so `unheard` wins over `noise` (spec gap
+      // resolved per plan; see PR notes). `acknowledged_by` -- NOT
+      // `recipient` -- gates "heard", since the ack row records who actually
+      // acknowledged (acknowledgeMessage requires acker == recipient today,
+      // but the schema does not guarantee it).
+      if (action.action_type !== 'digest') {
+        const dispatchRow = await getDispatchById(effect.id);
+        const ackedBy = dispatchRow?.acknowledged_at ? dispatchRow.acknowledged_by : null;
+        let heard = false;
+        if (ackedBy) {
+          const assessment = await assessRecipient(ackedBy);
+          heard =
+            assessment.delivery_mode !== null && assessment.delivery_mode !== 'drain_on_start';
+        }
+        if (!heard) {
+          await dal.gradeAction(action.id, UNHEARD_GRADE);
+          continue;
+        }
+      }
+
       if (effect.status === 'cancelled') {
         await dal.gradeAction(action.id, 'noise');
         continue;
@@ -1043,6 +1091,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   const createTask = deps.createTask ?? createAuthenticatedMessage;
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
+  const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
   const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
   const executeCascade = deps.runCascade ?? runCascade;
@@ -1151,7 +1200,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     getDispatchById,
     getIssueEvidence,
     nowMs,
-    getFireRunEvidence
+    getFireRunEvidence,
+    assessRecipient
   );
 
   // M-155 Q3: useful-rate floor with auto-PAUSE. Counted AFTER

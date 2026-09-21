@@ -111,9 +111,24 @@ export const USEFUL_RATE_FLOOR = 0.4;
 export const USEFUL_RATE_MIN_GRADED = 20;
 
 /**
+ * M-155 Amendment 03 (John's ruling 2026-09-21): the third journal grade.
+ * An action is `unheard` when its dispatch row was never acknowledged by a
+ * non-`drain_on_start` principal -- i.e. no human-facing party could have read
+ * it (the `operator` mailbox drains on start, so mail there is auto-addressed
+ * before a human sees it). `unheard` actions MUST be excluded from BOTH
+ * `usefulCount` and `noiseCount` before calling `usefulRateFloorBreached`;
+ * only `useful` and `noise` count toward the floor denominator. This stops the
+ * supervisor from punishing itself for a channel-deafness gap (M-129 Phase 2)
+ * it did not cause.
+ */
+export const UNHEARD_GRADE = 'unheard' as const;
+
+/**
  * Pure floor test: true when the graded sample is large enough AND the
  * useful share of graded actions is strictly below USEFUL_RATE_FLOOR.
  * Exactly 40% does not breach (the ruling says "floor", not "must exceed").
+ * Callers pass ONLY `useful`/`noise` counts; `unheard`-graded actions are
+ * excluded upstream (see UNHEARD_GRADE) so they never reach the denominator.
  */
 export function usefulRateFloorBreached(usefulCount: number, noiseCount: number): boolean {
   const graded = usefulCount + noiseCount;

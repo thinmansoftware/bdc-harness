@@ -394,6 +394,26 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     listThreads: async () => [],
     // Default no-op evidence so adoption refresh never hits the network in unit tests.
     getGithubIssueEvidence: async () => null,
+    // M-155 Amendment 03: default the unheard-gate dependencies to a "heard,
+    // non-draining" result so pre-existing useful/noise grading tests keep
+    // their current outcomes (they exercise the GitHub/addressing evidence
+    // logic, not the unheard gate). Tests that assert the unheard behavior
+    // override these two per-case.
+    getDispatchMessageById: (async () => ({
+      id: 'default-heard-dispatch',
+      recipient: 'xo',
+      resolved_recipient: 'xo',
+      acknowledged_at: new Date(world.nowMs - 40_000).toISOString(),
+      acknowledged_by: 'xo',
+      addressed_at: null,
+      addressed_by: null,
+    })) as unknown as TaskmasterDeps['getDispatchMessageById'],
+    assessDispatchRecipient: async () => ({
+      ok: true as const,
+      canonical_principal: 'xo',
+      delivery_mode: 'worker_poll' as const,
+      reason: null,
+    }),
     ...overrides,
   };
 }
@@ -1809,6 +1829,10 @@ describe('SC7 grading requires external source progress', () => {
         id: 'ruling-original',
         recipient: 'xo',
         resolved_recipient: 'xo',
+        // Heard: acked by xo (worker_poll, non-draining) so the unheard gate
+        // passes and the addressing-based useful logic is what is exercised.
+        acknowledged_at: new Date(T0 - 40_000).toISOString(),
+        acknowledged_by: 'xo',
         addressed_at: new Date(T0 - 30_000).toISOString(),
         addressed_by: 'xo',
       })) as unknown as TaskmasterDeps['getDispatchMessageById'],
@@ -1904,19 +1928,32 @@ describe('SC7 grading requires external source progress', () => {
   });
 
   test('unacknowledged, acknowledged-only, and auto-addressed rulings are not useful', async () => {
+    // M-155 Amendment 03: none of these three is `useful`. A ruling that was
+    // never acknowledged is `unheard` (no human-facing party read it); the
+    // acknowledged-but-unaddressed and auto-addressed cases were acked by a
+    // non-draining principal (xo) so they clear the unheard gate and remain
+    // ungraded (null) because the addressing proof never lands.
     const cases = [
-      { name: 'unacknowledged', acknowledged_at: null, addressed_at: null, addressed_by: null },
+      {
+        name: 'unacknowledged',
+        acknowledged_at: null,
+        addressed_at: null,
+        addressed_by: null,
+        expectedGrade: 'unheard' as const,
+      },
       {
         name: 'acknowledged-only',
         acknowledged_at: new Date(T0 - 20_000).toISOString(),
         addressed_at: null,
         addressed_by: null,
+        expectedGrade: null,
       },
       {
         name: 'auto-addressed',
         acknowledged_at: new Date(T0 - 20_000).toISOString(),
         addressed_at: new Date(T0 - 10_000).toISOString(),
         addressed_by: 'taskmaster:auto',
+        expectedGrade: null,
       },
     ];
 
@@ -1951,6 +1988,7 @@ describe('SC7 grading requires external source progress', () => {
           recipient: 'xo',
           resolved_recipient: 'xo',
           acknowledged_at: testCase.acknowledged_at,
+          acknowledged_by: testCase.acknowledged_at ? 'xo' : null,
           addressed_at: testCase.addressed_at,
           addressed_by: testCase.addressed_by,
         })) as unknown as TaskmasterDeps['getDispatchMessageById'],
@@ -1958,7 +1996,9 @@ describe('SC7 grading requires external source progress', () => {
 
       await tick(createTaskmasterState(60_000), deps);
 
-      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBeNull();
+      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBe(
+        testCase.expectedGrade
+      );
     }
   });
 
@@ -2090,6 +2130,204 @@ describe('SC7 grading requires external source progress', () => {
     expect(
       world.journal.find(row => row.id === 'preexisting-assignee-escalation')?.grade
     ).toBeNull();
+  });
+});
+
+describe('M-155 Amendment 03: unheard grade', () => {
+  // Seed one sent escalate_p0 whose GitHub source shows a post-send assignment
+  // (would grade `useful` if it cleared the unheard gate). Callers vary only
+  // the acknowledgement of the dispatch row to prove the gate.
+  function seedSentEscalation(world: FakeWorld, id: string, deadlineMs = T0 + 60_000): string {
+    const key = `tm:escalate_p0:gh:thinmansoftware/bdc-xo#${id}:1`;
+    world.journal.push({
+      id,
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: `gh:thinmansoftware/bdc-xo#${id}`,
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'P0 source claim after send',
+      proof_deadline_at: new Date(deadlineMs).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'operator',
+      body: 'escalate',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+    });
+    return key;
+  }
+
+  const movedIssue = {
+    state: 'open',
+    updatedAt: new Date(T0 - 30_000).toISOString(),
+    labels: ['wo', 'P0'],
+    assigneeCount: 1,
+    closedAt: null,
+    assignedAt: new Date(T0 - 30_000).toISOString(),
+    activeStatusAt: null,
+    progressRecordedAt: null,
+  };
+
+  // Scenario 1: dispatch row never acknowledged -> unheard (even with movement).
+  test('an unacknowledged operator dispatch is unheard', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedSentEscalation(world, '3001');
+    const deps = makeDeps(world, {
+      getDispatchMessageById: (async () => ({
+        id: 'existing',
+        recipient: 'operator',
+        resolved_recipient: 'operator',
+        acknowledged_at: null,
+        acknowledged_by: null,
+        addressed_at: null,
+        addressed_by: null,
+      })) as unknown as TaskmasterDeps['getDispatchMessageById'],
+      getGithubIssueEvidence: async () => movedIssue,
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(world.journal.find(row => row.id === '3001')?.grade).toBe('unheard');
+  });
+
+  // Scenario 2: acked, but by a drain_on_start principal -> still unheard.
+  test('an ack from a drain_on_start principal does not count as heard', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedSentEscalation(world, '3002');
+    const deps = makeDeps(world, {
+      getDispatchMessageById: (async () => ({
+        id: 'existing',
+        recipient: 'operator',
+        resolved_recipient: 'operator',
+        acknowledged_at: new Date(T0 - 30_000).toISOString(),
+        acknowledged_by: 'operator',
+        addressed_at: null,
+        addressed_by: null,
+      })) as unknown as TaskmasterDeps['getDispatchMessageById'],
+      assessDispatchRecipient: async () => ({
+        ok: true as const,
+        canonical_principal: 'operator',
+        delivery_mode: 'drain_on_start' as const,
+        reason: null,
+      }),
+      getGithubIssueEvidence: async () => movedIssue,
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(world.journal.find(row => row.id === '3002')?.grade).toBe('unheard');
+  });
+
+  // Scenario 3: acked by a non-draining principal -> heard, so normal
+  // useful/noise evidence logic applies (here: movement -> useful).
+  test('an ack from a non-draining principal clears the gate and grades useful', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedSentEscalation(world, '3003');
+    const deps = makeDeps(world, {
+      getDispatchMessageById: (async () => ({
+        id: 'existing',
+        recipient: 'operator',
+        resolved_recipient: 'operator',
+        acknowledged_at: new Date(T0 - 30_000).toISOString(),
+        acknowledged_by: 'xo',
+        addressed_at: null,
+        addressed_by: null,
+      })) as unknown as TaskmasterDeps['getDispatchMessageById'],
+      assessDispatchRecipient: async () => ({
+        ok: true as const,
+        canonical_principal: 'xo',
+        delivery_mode: 'worker_poll' as const,
+        reason: null,
+      }),
+      getGithubIssueEvidence: async () => movedIssue,
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(world.journal.find(row => row.id === '3003')?.grade).toBe('useful');
+  });
+
+  // Scenario 4: the floor denominator excludes unheard. The ONLY difference
+  // between the two worlds is unheard vs noise for the 62 unread rows; that
+  // single difference flips the auto-pause decision.
+  test('the useful-rate floor excludes unheard from its denominator', async () => {
+    function seedGraded(world: FakeWorld, grade: TmGrade, count: number, prefix: string): void {
+      for (let i = 0; i < count; i += 1) {
+        world.journal.push({
+          id: `${prefix}-${i}`,
+          created_at: new Date(world.nowMs).toISOString(),
+          thread_ref: `gh:thinmansoftware/bdc-xo#${prefix}${i}`,
+          action_type: 'escalate_p0',
+          proposal_json: '{}',
+          idempotency_key: `tm:${prefix}:${i}`,
+          before_hash: null,
+          proof_predicate: 'seeded',
+          proof_deadline_at: null,
+          outcome: 'sent',
+          graded_at: new Date(world.nowMs).toISOString(),
+          grade,
+        });
+      }
+    }
+
+    // World A: 62 unheard + 30 useful. Unheard excluded -> 30/30 = 100% -> no
+    // breach; the loop stays RUNNING.
+    const worldA = makeWorld();
+    seedDigestSent(worldA);
+    seedGraded(worldA, 'unheard', 62, 'unheardA');
+    seedGraded(worldA, 'useful', 30, 'usefulA');
+    await tick(createTaskmasterState(60_000), makeDeps(worldA, { listThreads: async () => [] }));
+    expect(worldA.control.pause_state).toBe('RUNNING');
+
+    // World B (contrast): identical except the 62 are `noise`. Now the
+    // denominator is 92, rate 30/92 = 32.6% < 40% -> breach -> auto-PAUSED.
+    const worldB = makeWorld();
+    seedDigestSent(worldB);
+    seedGraded(worldB, 'noise', 62, 'noiseB');
+    seedGraded(worldB, 'useful', 30, 'usefulB');
+    await tick(createTaskmasterState(60_000), makeDeps(worldB, { listThreads: async () => [] }));
+    expect(worldB.control.pause_state).toBe('PAUSED');
+  });
+
+  // Scenario 5: no regression on the useful/noise split for heard actions.
+  test('heard actions still split useful (movement) vs noise (deadline, no movement)', async () => {
+    const usefulWorld = makeWorld();
+    seedDigestSent(usefulWorld);
+    seedSentEscalation(usefulWorld, '3005');
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(usefulWorld, { getGithubIssueEvidence: async () => movedIssue })
+    );
+    expect(usefulWorld.journal.find(row => row.id === '3005')?.grade).toBe('useful');
+
+    const noiseWorld = makeWorld();
+    seedDigestSent(noiseWorld);
+    // Deadline already passed and no post-send movement -> noise.
+    seedSentEscalation(noiseWorld, '3006', T0 - 1_000);
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(noiseWorld, {
+        getGithubIssueEvidence: async () => ({
+          state: 'open',
+          updatedAt: new Date(T0 - 90_000).toISOString(),
+          labels: ['wo', 'P0'],
+          assigneeCount: 0,
+          closedAt: null,
+          assignedAt: null,
+          activeStatusAt: null,
+          progressRecordedAt: null,
+        }),
+      })
+    );
+    expect(noiseWorld.journal.find(row => row.id === '3006')?.grade).toBe('noise');
   });
 });
 

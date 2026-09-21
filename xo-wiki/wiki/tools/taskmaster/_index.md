@@ -166,6 +166,35 @@ than replaying them and writes its own audit (response includes
 `expired_proposals` and `audit_id`). An already-RUNNING reset preserves the
 epoch-start timestamp, so accumulated useful/noise grades remain in scope.
 
+## Grade chart (M-155 Amendment 03, John's ruling 2026-09-21)
+
+Every sent action (except `digest`, which is never graded) lands one of three
+grades in `tm_journal.grade`:
+
+| Grade     | Meaning                                                                                                                                                                                                                                      | Counts toward the useful-rate floor? |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `useful`  | Action-specific downstream movement landed in the source SOR after the send (ruling addressed by its recipient, nudge produced a close/marker, P0 escalation produced a close/assignee/active-status/marker, fire completed or opened a PR). | Yes (numerator + denominator)        |
+| `noise`   | The proof deadline passed with no qualifying movement, or the dispatch effect was cancelled.                                                                                                                                                 | Yes (denominator only)               |
+| `unheard` | The action's dispatch row (`agent_dispatch_messages`) was never acknowledged by a non-`drain_on_start` principal -- i.e. no human-facing party could have read it.                                                                           | **No -- excluded from both counts**  |
+
+`unheard` exists because the `operator` mailbox is `delivery_mode: drain_on_start`:
+mail sent there is auto-addressed within seconds and a human never sees it. Before
+Amendment 03, those unread messages were graded `noise`, which dragged the
+useful-rate floor down and auto-paused the loop for a channel-deafness gap
+(M-129 Phase 2 not yet landed) rather than genuine supervisor uselessness. An
+action is `unheard` UNLESS its dispatch row carries an `acknowledged_at` from a
+principal whose `delivery_mode != 'drain_on_start'`. Only `useful` and `noise`
+form the floor denominator; `unheard` is excluded so the supervisor stops
+punishing itself for a gap it did not cause. The floor value (40%) and the
+minimum graded sample (20) are unchanged.
+
+Grade split query:
+
+```bash
+sqlite3 /opt/bdc/archon-data/archon.db \
+  "SELECT grade, count(*) FROM tm_journal WHERE grade IS NOT NULL GROUP BY grade"
+```
+
 ## Journal queries (on archon-app-1)
 
 Activation-proof query (SC7 kill test -- binding condition 4):
