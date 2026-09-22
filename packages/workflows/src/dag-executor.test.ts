@@ -2394,6 +2394,57 @@ describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-
     }
   });
 
+  // Round 10 (083a8af1): arithmetic context persists across physical lines.
+  it('round 10: x=$((1 / << 2)) split across lines: the << on line 2 is a left shift', () => {
+    expect(run(['x=$((1', ' << 2))', TOKEN].join('\n'))).toEqual(['x=$((1', ' << 2))', TOKEN]);
+  });
+  it('round 10: (( y = 1 / << 3 )) compound command split across lines', () => {
+    expect(run(['(( y = 1', ' << 3 ))', TOKEN].join('\n'))).toEqual([
+      '(( y = 1',
+      ' << 3 ))',
+      TOKEN,
+    ]);
+  });
+  it('round 10: nested parens spanning lines are balanced before code resumes', () => {
+    expect(run(['z=$(( (1', '<<2) + 1 ))', 'cat <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'z=$(( (1',
+      '<<2) + 1 ))',
+      'cat <<EOF',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 10: a comment line while arithmetic is still open is expression text, not a comment', () => {
+    // Bash: inside $(( )) a "#" is not a comment marker; the token is substituted as
+    // expression text (garbage in bash either way, but it never becomes a spilled line).
+    expect(run(['x=$((1', '# $spec.output', '+ 2))'].join('\n'))).toEqual([
+      'x=$((1',
+      SUBST,
+      '+ 2))',
+    ]);
+  });
+  it('round 10: end-to-end -- multiline output in a comment after multi-line arithmetic never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = ['x=$((1', ' << 2))', '# note $spec.output', 'echo "x=$x"', ''].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result).toBe(script);
+    const tempFile = `${tmpdir()}/test-862-mlarith-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('x=4\n');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return;
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+
   it('end-to-end: multi-line output after a mixed-quoted heredoc never executes (real bash)', async () => {
     const multi = 'line one\nexit 1\necho SPILLED';
     const outputs = new Map([['spec', makeOutput('completed', multi)]]);

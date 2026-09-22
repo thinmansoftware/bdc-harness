@@ -1317,11 +1317,13 @@ async function writeNodeOutputFile(
 interface ShellQuoteState {
   inSingle: boolean;
   inDouble: boolean;
+  /** Unclosed "(" depth of an arithmetic $((...)) / ((...)) expression; 0 = none. */
+  arithDepth: number;
 }
 
 function reduceToUnquotedUncommentedCode(
   line: string,
-  initial: ShellQuoteState = { inSingle: false, inDouble: false }
+  initial: ShellQuoteState = { inSingle: false, inDouble: false, arithDepth: 0 }
 ): { code: string; commentStart: number; state: ShellQuoteState } {
   let out = '';
   let commentStart = line.length;
@@ -1332,8 +1334,18 @@ function reduceToUnquotedUncommentedCode(
   // comment as quoted because state reset every line).
   let inSingle = initial.inSingle;
   let inDouble = initial.inDouble;
+  // Arithmetic depth is carried across lines too (Overseer round 10 on #862:
+  // `x=$((1` / ` << 2))` -- the second line's "<<" is a left shift, not a heredoc).
+  let arithDepth = initial.arithDepth;
+  let i = 0;
+  while (i < line.length && arithDepth > 0) {
+    if (line[i] === '(') arithDepth++;
+    else if (line[i] === ')') arithDepth--;
+    out += ' ';
+    i++;
+  }
 
-  for (let i = 0; i < line.length; i++) {
+  for (; i < line.length; i++) {
     const ch = line[i];
 
     if (inSingle) {
@@ -1364,17 +1376,16 @@ function reduceToUnquotedUncommentedCode(
     const bareArith =
       !dollarArith && line.startsWith('((', i) && (i === 0 || /[\s;&|(]/.test(line[i - 1]));
     if (dollarArith || bareArith) {
-      let depth = 0;
       let opened = false;
       let j = i;
       while (j < line.length) {
         if (line[j] === '(') {
-          depth++;
+          arithDepth++;
           opened = true;
-        } else if (line[j] === ')') depth--;
+        } else if (line[j] === ')') arithDepth--;
         out += ' ';
         j++;
-        if (opened && depth === 0) break;
+        if (opened && arithDepth === 0) break;
       }
       i = j - 1;
       continue;
@@ -1407,7 +1418,7 @@ function reduceToUnquotedUncommentedCode(
     }
     out += ch;
   }
-  return { code: out, commentStart, state: { inSingle, inDouble } };
+  return { code: out, commentStart, state: { inSingle, inDouble, arithDepth } };
 }
 
 /**
@@ -1523,7 +1534,7 @@ export function substituteNodeOutputRefs(
     // prefix collided with a delimiter that itself begins with "-" (cat <<'-EOF').
     const heredocStack: { delimiter: string; stripTabs: boolean }[] = [];
     // Shell quote state at the end of the previous code line (see the reducer).
-    let quoteState: ShellQuoteState = { inSingle: false, inDouble: false };
+    let quoteState: ShellQuoteState = { inSingle: false, inDouble: false, arithDepth: 0 };
 
     for (const line of lines) {
       // Comment check first: bash ignores everything on a comment line, including a
