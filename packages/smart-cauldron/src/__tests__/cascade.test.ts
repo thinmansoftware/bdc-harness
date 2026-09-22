@@ -1081,8 +1081,28 @@ describe('wo claim + single-flight (#1546)', () => {
     const result = await runCascade(baseOpts({ deps }));
 
     expect(fireCalled).toBe(false);
-    expect(result.status).toBe('won');
+    expect(result.status).toBe('refused');
     expect(result.attempts.length).toBe(0);
+    expect(result.refusalReason?.reason).toBe('already-satisfied');
+    expect(result.refusalReason?.prNumber).toBe(99);
+  });
+
+  test('a genuine win still produces status won (not refused)', async () => {
+    const deps: CascadeDeps = {
+      findWoClaim: async () => null,
+      fire: async () => makeFireOk('run-1'),
+      poll: async () => makePollResult(),
+      judge: () => makePassVerdict(),
+      escalate: async () => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const result = await runCascade(baseOpts({ deps }));
+
+    expect(result.status).toBe('won');
+    expect(result.refusalReason).toBeUndefined();
+    expect(result.attempts.length).toBe(1);
+    expect(result.telemetry.wonCheap).toBe(true);
   });
 
   test('second concurrent cascade for same WO is blocked', async () => {
@@ -1194,6 +1214,47 @@ describe('wo claim + single-flight (#1546)', () => {
     const record = await runCascade(baseOpts({ deps }));
 
     expect(fireCalls.length).toBe(1);
-    expect(record.status).toBe('won');
+    expect(record.status).toBe('refused');
+    expect(record.attempts.length).toBe(1);
+    // The attempt itself genuinely gate-failed (a tier actually ran); the
+    // refusal is a cascade-level decision not to climb further, recorded at
+    // record.status/refusalReason, not by rewriting the attempt's outcome.
+    expect(record.attempts[0]?.outcome).toBe('gate-failed');
+    expect(record.refusalReason?.prNumber).toBe(42);
+  });
+
+  test('refuses (not wins) when claim appears immediately before a fire', async () => {
+    let claimCalls = 0;
+    const fireCalls: string[] = [];
+    const deps: CascadeDeps = {
+      findWoClaim: async () => {
+        claimCalls++;
+        // First check (pre-cascade) empty; claim lands between admission and
+        // the per-tier pre-fire re-check.
+        if (claimCalls === 1) return null;
+        return {
+          number: 77,
+          state: 'OPEN',
+          title: 'WO-TEST-001 landed just before fire',
+          url: 'https://github.com/org/repo/pull/77',
+          repo: 'thinmansoftware/test-project',
+        };
+      },
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      escalate: async () => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fireCalls.length).toBe(0);
+    expect(record.status).toBe('refused');
+    expect(record.attempts.length).toBe(1);
+    expect(record.attempts[0]?.outcome).toBe('refused');
+    expect(record.refusalReason?.prNumber).toBe(77);
+    expect(record.refusalReason?.checkedAtTier).not.toBeNull();
   });
 });

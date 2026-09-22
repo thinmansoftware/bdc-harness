@@ -84,9 +84,16 @@ describe('statusToExitCode', () => {
       'spec-repair',
       'infra-alert',
       'cancelled',
+      'refused',
     ];
     for (const status of statuses) {
       expect(Number.isInteger(statusToExitCode(status))).toBe(true);
     }
+  });
+
+  test('refused maps to a distinct non-zero code (bdc-xo#2140: refusal is not a win)', () => {
+    const code = statusToExitCode('refused');
+    expect(code).not.toBe(0);
+    expect(code).not.toBe(statusToExitCode('won'));
   });
 });

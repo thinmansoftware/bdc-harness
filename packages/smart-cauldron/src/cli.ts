@@ -15,6 +15,7 @@
  *   --token <token>            Operator token (default: ARCHON_OPERATOR_TOKEN env)
  *   --project <shortname>      Required codebase shortname for explicit binding
  *   --poll-timeout-ms <ms>     Per-attempt poll timeout override (default: 1800000 / 30 min)
+ *   --allow-satisfied          Bypass the already-satisfied guard (same as env SMART_CAULDRON_ALLOW_CLAIMED=1)
  *
  * Secret boundary: API URL and token come from env/flags. Never log token values.
  * ASCII only. No emojis.
@@ -43,6 +44,9 @@ import type { CascadeStatus } from './types.js';
  *   frontier-approved         -> 9 (operator approved the premium climb; the resumed cascade
  *                                   -- resumeCascadeId -- carries the outcome, so THIS record
  *                                   itself shipped nothing and must never read as won=0)
+ *   refused                   -> 10 (already-satisfied guard declined to fire; no tier ran,
+ *                                    attempts=0 -- a refusal is not a win and must never read
+ *                                    as won=0 (bdc-xo#2140))
  *
  * spec-repair MUST NOT collapse to 0 -- it is a distinct, visible outcome
  * (frontier tier gate-failed) and callers key off the exit code. cancelled
@@ -70,6 +74,8 @@ export function statusToExitCode(status: CascadeStatus): number {
       return 8;
     case 'frontier-approved':
       return 9;
+    case 'refused':
+      return 10;
     default:
       return 0;
   }
@@ -91,6 +97,7 @@ interface CliArgs {
   token?: string;
   project?: string;
   pollTimeoutMs?: number;
+  allowSatisfied: boolean;
 }
 
 function printHelp(): void {
@@ -113,6 +120,7 @@ Options:
   --token <token>    Operator token (default: ARCHON_OPERATOR_TOKEN env)
   --project <name>   Required codebase shortname for explicit binding
   --poll-timeout-ms <ms>  Per-attempt poll timeout override (default: 1800000 / 30 min)
+  --allow-satisfied  Bypass the already-satisfied guard (same as env SMART_CAULDRON_ALLOW_CLAIMED=1)
   --help, -h         Show this help
 
 Examples:
@@ -138,6 +146,7 @@ function parseArgs(argv: string[]): CliArgs {
     command,
     outDir: './cascade-runs',
     dryRun: false,
+    allowSatisfied: false,
   };
 
   const positional: string[] = [];
@@ -161,6 +170,9 @@ function parseArgs(argv: string[]): CliArgs {
       i += 2;
     } else if (arg === '--dry-run') {
       result.dryRun = true;
+      i++;
+    } else if (arg === '--allow-satisfied') {
+      result.allowSatisfied = true;
       i++;
     } else if (arg === '--api-url' && i + 1 < args.length) {
       result.apiUrl = args[i + 1];
@@ -261,6 +273,7 @@ async function main(): Promise<void> {
   if (args.dryRun) console.log('[smart-cauldron]   DRY RUN mode');
   if (args.pollTimeoutMs !== undefined)
     console.log(`[smart-cauldron]   poll timeout override=${args.pollTimeoutMs}ms`);
+  if (args.allowSatisfied) console.log('[smart-cauldron]   allow-satisfied override ENABLED');
 
   const { runCascade } = await import('./cascade.js');
   const record = await runCascade({
@@ -274,6 +287,7 @@ async function main(): Promise<void> {
     token: fireAuth?.token,
     project: fireAuth?.project,
     pollTimeoutMs: args.pollTimeoutMs,
+    allowClaimed: args.allowSatisfied,
   });
 
   console.log('');
