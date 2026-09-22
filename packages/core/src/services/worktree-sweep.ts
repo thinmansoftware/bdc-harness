@@ -82,6 +82,7 @@ export interface WorktreeSweepOptions {
   getActiveSession?: (conversationId: string) => Promise<object | null>;
   updateEnvStatus?: (envId: string, status: 'active' | 'destroyed') => Promise<void>;
   getLastCommitDateFn?: (worktreePath: string) => Promise<Date | null>;
+  hasUncommittedWorkFn?: (worktreePath: string) => Promise<boolean>;
   getCanonicalRepoPathFn?: (worktreePath: string) => Promise<string>;
   moveDir?: (from: string, to: string) => Promise<void>;
   pruneWorktree?: (repoPath: string) => Promise<void>;
@@ -186,6 +187,53 @@ async function getWorktreeLastCommitDate(
   } catch (error) {
     getLog().warn({ err: error, worktreePath }, 'worktree_sweep_last_commit_date_lookup_failed');
     return null;
+  }
+}
+
+/**
+ * Reliable "genuine work" signal: `git status --porcelain --untracked-files=all`.
+ *
+ * Directory mtime says a worktree was TOUCHED; git status says it HOLDS WORK.
+ * Any non-empty output -- modified tracked files, staged-but-uncommitted changes,
+ * or untracked files -- means a human or an agent left something in this worktree
+ * that exists nowhere else, and reclaiming it would destroy that work no matter how
+ * old the last commit or the env row is.
+ *
+ * Stashes are deliberately NOT consulted: `refs/stash` is repository-wide, not
+ * per-worktree, so one stash anywhere in the repo would preserve every worktree of
+ * that repo forever and reintroduce the never-sweep bug this file exists to fix.
+ */
+async function defaultHasUncommittedWork(worktreePath: string): Promise<boolean> {
+  const { stdout } = await execFileAsync(
+    'git',
+    ['-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
+    { timeout: 30000 }
+  );
+  return stdout.trim().length > 0;
+}
+
+type UncommittedWorkVerdict =
+  | { preserve: false }
+  | { preserve: true; reason: 'has_uncommitted_work' | 'dirty_check_failed'; error?: string };
+
+/**
+ * Wraps the dirty check so that FAILURE TO DETERMINE dirtiness fails safe toward
+ * preservation. A corrupt worktree, a missing gitdir, a git timeout -- none of
+ * these prove the tree is clean, so none of them may authorize reclamation. The
+ * only path to "reclaim" is a successful git status that returns nothing.
+ */
+async function checkUncommittedWork(
+  worktreePath: string,
+  hasUncommittedWorkFn: (worktreePath: string) => Promise<boolean>
+): Promise<UncommittedWorkVerdict> {
+  try {
+    if (await hasUncommittedWorkFn(worktreePath)) {
+      return { preserve: true, reason: 'has_uncommitted_work' };
+    }
+    return { preserve: false };
+  } catch (error) {
+    const err = error as Error;
+    return { preserve: true, reason: 'dirty_check_failed', error: err.message };
   }
 }
 
@@ -335,6 +383,7 @@ export async function sweepTerminalWorkflowWorktrees(
   const getLastCommitDateFn =
     opts.getLastCommitDateFn ??
     ((path: string): Promise<Date | null> => getLastCommitDate(toWorktreePath(path)));
+  const hasUncommittedWorkFn = opts.hasUncommittedWorkFn ?? defaultHasUncommittedWork;
   const getCanonicalRepoPathFn =
     opts.getCanonicalRepoPathFn ??
     ((path: string): Promise<string> => getCanonicalRepoPath(toWorktreePath(path)));
@@ -429,6 +478,26 @@ export async function sweepTerminalWorkflowWorktrees(
           continue;
         }
 
+        // Age says reclaim and no session owns it -- but session absence does not prove
+        // the tree holds no work. Genuine uncommitted changes (modified, staged, or
+        // untracked files) are valuable regardless of commit age and must be preserved.
+        // Only a clean tree, proven by a successful git status, may be reclaimed.
+        const workVerdict = await checkUncommittedWork(worktreeDir, hasUncommittedWorkFn);
+        if (workVerdict.preserve) {
+          const reason = `env_${workVerdict.reason}`;
+          report.skipped.push({ path: worktreeDir, reason });
+          getLog().warn(
+            {
+              worktreePath: worktreeDir,
+              envId: env.id,
+              reason,
+              ...(workVerdict.error ? { error: workVerdict.error } : {}),
+            },
+            'worktree_sweep_env_only_skipped'
+          );
+          continue;
+        }
+
         try {
           const quarantine = await quarantineWorktreeDir({
             workspacesRoot,
@@ -511,6 +580,24 @@ export async function sweepTerminalWorkflowWorktrees(
       if (now.getTime() - activityDate.getTime() <= orphanAgeMs) {
         report.orphaned.push(worktreeDir);
         getLog().warn({ worktreePath: worktreeDir }, 'worktree_sweep_orphaned_worktree');
+        continue;
+      }
+
+      // Same rule as the env-backed path: old is not the same as empty. A worktree
+      // Archon has no record of can still hold someone's uncommitted work.
+      const workVerdict = await checkUncommittedWork(worktreeDir, hasUncommittedWorkFn);
+      if (workVerdict.preserve) {
+        const reason = `unmatched_${workVerdict.reason}`;
+        report.orphaned.push(worktreeDir);
+        report.skipped.push({ path: worktreeDir, reason });
+        getLog().warn(
+          {
+            worktreePath: worktreeDir,
+            reason,
+            ...(workVerdict.error ? { error: workVerdict.error } : {}),
+          },
+          'worktree_sweep_orphaned_worktree'
+        );
         continue;
       }
 
