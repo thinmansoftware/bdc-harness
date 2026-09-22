@@ -18,11 +18,13 @@ import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import {
+  assessDispatchRecipient,
   createAuthenticatedMessage,
   getMessage,
   listMessages,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
+  type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
@@ -176,6 +178,12 @@ export interface TaskmasterDeps {
     key: string
   ) => Promise<{ id: string; status: string; createdAt: string } | null>;
   getDispatchMessageById?: (id: string) => Promise<DispatchMessage | null>;
+  /**
+   * Resolve a recipient principal to its delivery_mode (M-155 Amendment 03).
+   * Used to distinguish drain_on_start mailboxes (auto-addressed, never
+   * human-read) from human-facing channels when grading an action 'unheard'.
+   */
+  assessDispatchRecipient?: (recipient: string) => Promise<DispatchRecipientAssessment>;
   getGithubIssueEvidence?: (
     threadRef: string,
     sinceIso: string
@@ -756,6 +764,20 @@ async function reconcilePendingActions(
  * Grade sent actions against action-specific external SOR evidence recorded
  * after the outbound dispatch send. The outbound row alone never proves
  * usefulness.
+ *
+ * Grades (M-155 Amendment 03, John's ruling 2026-09-21):
+ *   - 'useful':  external SOR shows downstream movement caused by the send.
+ *   - 'unheard': the send went to a mailbox nobody could have read -- its
+ *                dispatch row was never acknowledged by a non-draining
+ *                principal (a drain_on_start recipient, e.g. 'operator',
+ *                auto-addresses within seconds and is never human-read).
+ *                'unheard' actions are excluded from the useful-rate floor
+ *                denominator (only 'useful'/'noise' are counted), so the
+ *                supervisor is not punished for a channel-deafness gap (M-129
+ *                Phase 2) it did not cause. Useful evidence still wins: an
+ *                action that provably moved the SOR is 'useful' regardless of
+ *                channel.
+ *   - 'noise':   heard channel, deadline passed, no downstream movement.
  */
 async function gradeSentActions(
   actions: taskmasterDb.TmJournalEntry[],
@@ -764,7 +786,8 @@ async function gradeSentActions(
   getDispatchById: NonNullable<TaskmasterDeps['getDispatchMessageById']>,
   getIssueEvidence: NonNullable<TaskmasterDeps['getGithubIssueEvidence']>,
   nowMs: number,
-  getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>
+  getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>,
+  assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>
 ): Promise<number> {
   let failures = 0;
   for (const action of actions) {
@@ -808,6 +831,25 @@ async function gradeSentActions(
         log.warn({ journalId: action.id }, 'taskmaster.effect_send_time_missing');
         continue;
       }
+
+      // M-155 Amendment 03 (John's ruling 2026-09-21): decide whether this
+      // action's dispatch row was ever "heard". An action is heard only when
+      // its dispatch row carries an acknowledged_at from a recipient whose
+      // delivery_mode is NOT drain_on_start. A drain_on_start mailbox (e.g.
+      // 'operator') auto-addresses within seconds and is never human-read, so a
+      // message sent there was never actually heard -- grading it 'noise' would
+      // punish the supervisor for a channel-deafness gap (M-129 Phase 2) it did
+      // not cause. Unheard actions are graded 'unheard' below and excluded from
+      // the useful-rate floor denominator by construction (only useful/noise
+      // are counted). Useful evidence still wins (checked first below).
+      const dispatchRow = await getDispatchById(effect.id);
+      const heardRecipient = dispatchRow?.resolved_recipient ?? dispatchRow?.recipient ?? null;
+      const recipientAssessment = heardRecipient ? await assessRecipient(heardRecipient) : null;
+      const heard =
+        dispatchRow?.acknowledged_at != null &&
+        recipientAssessment?.delivery_mode != null &&
+        recipientAssessment.delivery_mode !== 'drain_on_start';
+
       const deadlineMs = action.proof_deadline_at ? Date.parse(action.proof_deadline_at) : NaN;
       let usefulAtMs: number | null = null;
       if (action.action_type === 'deliver_ruling') {
@@ -851,6 +893,11 @@ async function gradeSentActions(
 
       if (usefulAtMs !== null && (!Number.isFinite(deadlineMs) || usefulAtMs <= deadlineMs)) {
         await dal.gradeAction(action.id, 'useful');
+      } else if (!heard) {
+        // Unheard: the dispatch row was never acknowledged by a non-draining
+        // principal, so no human could have read it. Graded immediately (no
+        // deadline wait) and excluded from the useful-rate floor denominator.
+        await dal.gradeAction(action.id, 'unheard');
       } else if (Number.isFinite(deadlineMs) && nowMs >= deadlineMs) {
         await dal.gradeAction(action.id, 'noise');
       }
@@ -1043,6 +1090,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   const createTask = deps.createTask ?? createAuthenticatedMessage;
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
+  const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
   const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
   const executeCascade = deps.runCascade ?? runCascade;
@@ -1151,7 +1199,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     getDispatchById,
     getIssueEvidence,
     nowMs,
-    getFireRunEvidence
+    getFireRunEvidence,
+    assessRecipient
   );
 
   // M-155 Q3: useful-rate floor with auto-PAUSE. Counted AFTER

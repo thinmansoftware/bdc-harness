@@ -28,6 +28,7 @@ import {
   type AdoptionRefreshResult,
 } from './loop';
 import { checkEvidence } from './expectations';
+import type { DispatchDeliveryMode } from '@archon/core/db/dispatch';
 import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
 import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal, NUDGE_CLOCK_MS } from './rules';
 import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
@@ -191,6 +192,9 @@ interface FakeWorld {
     recipient: string;
     body: string;
     createdAt: string;
+    // M-155 Amendment 03: optional ack timestamp for the sent dispatch row,
+    // used by the default getDispatchMessageById mock to drive 'unheard' grading.
+    acknowledged_at?: string | null;
   }>;
   nowMs: number;
   recordCalls: number;
@@ -388,8 +392,47 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     }) as unknown as TaskmasterDeps['createTask'],
     findEffectByIdempotencyKey: async (key: string) => {
       const found = world.sentMessages.find(m => m.idempotency_key === key);
-      return found ? { id: 'existing', status: 'queued', createdAt: found.createdAt } : null;
+      // Use the idempotency_key as the dispatch id so the default
+      // getDispatchMessageById below can map effect.id back to the sent row
+      // for M-155 Amendment 03 'unheard' grading.
+      return found
+        ? { id: found.idempotency_key, status: 'queued', createdAt: found.createdAt }
+        : null;
     },
+    // M-155 Amendment 03: synthesize the sent dispatch row from world.sentMessages
+    // (keyed by idempotency_key == effect.id). acknowledged_at defaults to null
+    // (unacked) unless a test seeds it.
+    getDispatchMessageById: (async (id: string) => {
+      const found = world.sentMessages.find(m => m.idempotency_key === id);
+      if (!found) return null;
+      return {
+        id,
+        recipient: found.recipient,
+        resolved_recipient: null,
+        acknowledged_at: found.acknowledged_at ?? null,
+        addressed_at: null,
+        addressed_by: null,
+      };
+    }) as unknown as TaskmasterDeps['getDispatchMessageById'],
+    // M-155 Amendment 03: mirror the seeded principal delivery modes
+    // (packages/core/src/db/adapters/sqlite.ts). operator + xo are
+    // drain_on_start; unknown recipients default to drain_on_start (matching
+    // the migration 040 backfill), so a message is 'heard' only when a test
+    // both seeds acknowledged_at AND routes to a non-draining recipient.
+    assessDispatchRecipient: (async (recipient: string) => {
+      const nonDrain: Record<string, DispatchDeliveryMode> = {
+        overseer: 'notify_only',
+        cauldron: 'notify_only',
+        claude: 'worker_poll',
+        codex: 'worker_poll',
+        'major-build': 'worker_poll',
+        'captain-ci': 'worker_poll',
+        board: 'alias_resolved',
+      };
+      const canonical = recipient.trim().toLowerCase();
+      const delivery_mode = nonDrain[canonical] ?? 'drain_on_start';
+      return { ok: true, canonical_principal: canonical, delivery_mode, reason: null };
+    }) as unknown as TaskmasterDeps['assessDispatchRecipient'],
     listUndeliveredRulings: async () => [],
     listThreads: async () => [],
     // Default no-op evidence so adoption refresh never hits the network in unit tests.
@@ -1764,9 +1807,14 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#1450:1',
-      recipient: 'xo',
+      // Heard channel (major-build is worker_poll, not drain_on_start) with an
+      // ack, so this test exercises the "no external progress -> not useful
+      // (stays ungraded until deadline)" gate rather than short-circuiting on
+      // the M-155 Amendment 03 'unheard' gate.
+      recipient: 'major-build',
       body: 'reminder',
       createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
     });
     world.sentMessages.push({
       idempotency_key: `tm:digest:${TODAY_KEY}`,
@@ -1881,9 +1929,13 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: key,
-      recipient: 'xo',
+      // Heard channel + ack so this test exercises the pre-send-timing gate
+      // (progress before the send is not useful) rather than the M-155
+      // Amendment 03 'unheard' gate.
+      recipient: 'major-build',
       body: 'nudge',
       createdAt: new Date(T0 - 30_000).toISOString(),
+      acknowledged_at: new Date(T0 - 25_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
@@ -1904,19 +1956,38 @@ describe('SC7 grading requires external source progress', () => {
   });
 
   test('unacknowledged, acknowledged-only, and auto-addressed rulings are not useful', async () => {
-    const cases = [
-      { name: 'unacknowledged', acknowledged_at: null, addressed_at: null, addressed_by: null },
+    // Routed to a non-draining recipient (major-build, worker_poll) so this
+    // test exercises the deliver_ruling addressed-by logic. M-155 Amendment 03:
+    // the unacknowledged case is 'unheard' (never acked); the acked-but-not-
+    // addressed cases stay ungraded (heard, but no useful proof yet). None are
+    // 'useful' -- the invariant this test protects.
+    const cases: Array<{
+      name: string;
+      acknowledged_at: string | null;
+      addressed_at: string | null;
+      addressed_by: string | null;
+      expected: TmGrade | null;
+    }> = [
+      {
+        name: 'unacknowledged',
+        acknowledged_at: null,
+        addressed_at: null,
+        addressed_by: null,
+        expected: 'unheard',
+      },
       {
         name: 'acknowledged-only',
         acknowledged_at: new Date(T0 - 20_000).toISOString(),
         addressed_at: null,
         addressed_by: null,
+        expected: null,
       },
       {
         name: 'auto-addressed',
         acknowledged_at: new Date(T0 - 20_000).toISOString(),
         addressed_at: new Date(T0 - 10_000).toISOString(),
         addressed_by: 'taskmaster:auto',
+        expected: null,
       },
     ];
 
@@ -1941,15 +2012,15 @@ describe('SC7 grading requires external source progress', () => {
       });
       world.sentMessages.push({
         idempotency_key: key,
-        recipient: 'xo',
+        recipient: 'major-build',
         body: 'ruling reminder',
         createdAt: new Date(T0 - 30_000).toISOString(),
       });
       const deps = makeDeps(world, {
         getDispatchMessageById: (async () => ({
           id: rulingId,
-          recipient: 'xo',
-          resolved_recipient: 'xo',
+          recipient: 'major-build',
+          resolved_recipient: 'major-build',
           acknowledged_at: testCase.acknowledged_at,
           addressed_at: testCase.addressed_at,
           addressed_by: testCase.addressed_by,
@@ -1958,7 +2029,9 @@ describe('SC7 grading requires external source progress', () => {
 
       await tick(createTaskmasterState(60_000), deps);
 
-      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBeNull();
+      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBe(
+        testCase.expected
+      );
     }
   });
 
@@ -2068,9 +2141,13 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: key,
-      recipient: 'operator',
+      // Heard channel + ack so this test exercises the "pre-existing assignee
+      // (no post-send event) is not useful proof" gate rather than the M-155
+      // Amendment 03 'unheard' gate.
+      recipient: 'major-build',
       body: 'escalate',
       createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
@@ -2090,6 +2167,225 @@ describe('SC7 grading requires external source progress', () => {
     expect(
       world.journal.find(row => row.id === 'preexisting-assignee-escalation')?.grade
     ).toBeNull();
+  });
+});
+
+describe('M-155 Amendment 03: unheard grade (WO-HARNESS-TASKMASTER-UNHEARD-GRADE-01)', () => {
+  // Helper: seed a single sent escalate_p0 action + its dispatch row.
+  function seedSentEscalation(
+    world: FakeWorld,
+    opts: {
+      id: string;
+      recipient: string;
+      acknowledged_at?: string | null;
+      deadlineMsFromNow?: number;
+    }
+  ): void {
+    const key = `tm:escalate_p0:gh:thinmansoftware/bdc-xo#${opts.id}:1`;
+    world.journal.push({
+      id: `journal-${opts.id}`,
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: `gh:thinmansoftware/bdc-xo#${opts.id}`,
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'P0 source claim after send',
+      proof_deadline_at: new Date(T0 + (opts.deadlineMsFromNow ?? 60_000)).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: opts.recipient,
+      body: 'escalate',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: opts.acknowledged_at ?? null,
+    });
+  }
+
+  test('scenario 1: an unread drain_on_start send with no ack is graded unheard', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    // recipient operator == drain_on_start; acknowledged_at null; deadline still
+    // in the future -> unheard is assigned immediately, without waiting.
+    seedSentEscalation(world, { id: '2200', recipient: 'operator', acknowledged_at: null });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.journal.find(row => row.id === 'journal-2200')?.grade).toBe('unheard');
+  });
+
+  test('scenario 2: an ack from a draining principal does not count -- still unheard', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    // operator is drain_on_start; even with acknowledged_at set, a drainer ack
+    // is not a human acknowledgement -> unheard.
+    seedSentEscalation(world, {
+      id: '2201',
+      recipient: 'operator',
+      acknowledged_at: new Date(T0 - 30_000).toISOString(),
+    });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.journal.find(row => row.id === 'journal-2201')?.grade).toBe('unheard');
+  });
+
+  test('scenario 3: an ack from a non-draining principal is heard (useful or noise)', async () => {
+    // 3a: heard + post-send movement -> useful.
+    const worldUseful = makeWorld();
+    seedDigestSent(worldUseful);
+    seedSentEscalation(worldUseful, {
+      id: '2202',
+      recipient: 'major-build', // worker_poll, not drain_on_start
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+    });
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(worldUseful, {
+        getGithubIssueEvidence: async () => ({
+          state: 'open',
+          updatedAt: new Date(T0 - 30_000).toISOString(),
+          labels: ['wo', 'P0'],
+          assigneeCount: 1,
+          closedAt: null,
+          assignedAt: new Date(T0 - 30_000).toISOString(),
+          activeStatusAt: null,
+          progressRecordedAt: null,
+        }),
+      })
+    );
+    expect(worldUseful.journal.find(row => row.id === 'journal-2202')?.grade).toBe('useful');
+
+    // 3b: heard + no movement + deadline passed -> noise (NOT unheard).
+    const worldNoise = makeWorld();
+    seedDigestSent(worldNoise);
+    seedSentEscalation(worldNoise, {
+      id: '2203',
+      recipient: 'major-build',
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+      deadlineMsFromNow: -1, // deadline already passed
+    });
+    await tick(createTaskmasterState(60_000), makeDeps(worldNoise));
+    expect(worldNoise.journal.find(row => row.id === 'journal-2203')?.grade).toBe('noise');
+  });
+
+  test('scenario 4: the useful-rate floor denominator excludes unheard (no auto-pause)', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    // 62 unheard + 1 useful, all already graded and inside the floor lookback.
+    // Only useful/noise count -> denominator = 1 (< USEFUL_RATE_MIN_GRADED),
+    // so the floor does not breach and the loop is NOT auto-paused. Were the 62
+    // unheard rows counted as noise instead, 1/63 = 1.6% < 40% would breach.
+    for (let i = 0; i < 62; i += 1) {
+      world.journal.push({
+        id: `unheard-${i}`,
+        created_at: new Date(T0).toISOString(),
+        thread_ref: `gh:thinmansoftware/bdc-xo#${3000 + i}`,
+        action_type: 'escalate_p0',
+        proposal_json: '{}',
+        idempotency_key: `tm:escalate_p0:unheard:${i}`,
+        before_hash: null,
+        proof_predicate: 'P0 source claim after send',
+        proof_deadline_at: null,
+        outcome: 'sent',
+        graded_at: new Date(T0).toISOString(),
+        grade: 'unheard',
+      });
+    }
+    world.journal.push({
+      id: 'useful-1',
+      created_at: new Date(T0).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#3100',
+      action_type: 'deliver_ruling',
+      proposal_json: '{}',
+      idempotency_key: 'tm:deliver_ruling:useful-1',
+      before_hash: null,
+      proof_predicate: 'original ruling addressed after send',
+      proof_deadline_at: null,
+      outcome: 'sent',
+      graded_at: new Date(T0).toISOString(),
+      grade: 'useful',
+    });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.control.pause_state).toBe('RUNNING');
+    expect(world.control.pause_actor).not.toBe('taskmaster:useful-rate-floor');
+  });
+
+  test('scenario 5: no regression on the useful/noise split for heard actions', async () => {
+    // Heard action (non-draining recipient + ack) with GitHub movement -> useful.
+    const worldUseful = makeWorld();
+    seedDigestSent(worldUseful);
+    const usefulKey = 'tm:nudge:gh:thinmansoftware/bdc-xo#2300:1';
+    worldUseful.journal.push({
+      id: 'heard-useful-nudge',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#2300',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: usefulKey,
+      before_hash: null,
+      proof_predicate: 'post-send source progress',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    worldUseful.sentMessages.push({
+      idempotency_key: usefulKey,
+      recipient: 'major-build',
+      body: 'nudge',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+    });
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(worldUseful, {
+        getGithubIssueEvidence: async () => ({
+          state: 'open',
+          updatedAt: new Date(T0 - 30_000).toISOString(),
+          labels: ['wo', 'prio:P1', 'status:building'],
+          assigneeCount: 0,
+          closedAt: null,
+          assignedAt: null,
+          activeStatusAt: null,
+          progressRecordedAt: new Date(T0 - 30_000).toISOString(),
+        }),
+      })
+    );
+    expect(worldUseful.journal.find(row => row.id === 'heard-useful-nudge')?.grade).toBe('useful');
+
+    // Heard action with no movement and deadline passed -> noise.
+    const worldNoise = makeWorld();
+    seedDigestSent(worldNoise);
+    const noiseKey = 'tm:nudge:gh:thinmansoftware/bdc-xo#2301:1';
+    worldNoise.journal.push({
+      id: 'heard-noise-nudge',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#2301',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: noiseKey,
+      before_hash: null,
+      proof_predicate: 'post-send source progress',
+      proof_deadline_at: new Date(T0 - 1).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    worldNoise.sentMessages.push({
+      idempotency_key: noiseKey,
+      recipient: 'major-build',
+      body: 'nudge',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+    });
+    await tick(createTaskmasterState(60_000), makeDeps(worldNoise));
+    expect(worldNoise.journal.find(row => row.id === 'heard-noise-nudge')?.grade).toBe('noise');
   });
 });
 
