@@ -1302,7 +1302,8 @@ async function writeNodeOutputFile(
  * than being removed). This lets a plain regex scan for the "<<" heredoc operator
  * without mistaking a trailing comment or a quoted string for real shell syntax.
  *
- * Tracks single-quote and double-quote state (backslash escapes apply only inside
+ * Tracks single-quote and double-quote state, seeded from and returned to the
+ * caller so it persists across physical lines (backslash escapes apply only inside
  * double quotes, matching bash). A "#" ends the code portion of the line only when
  * it is outside any quote AND is either at the start of the line or preceded by
  * whitespace or a bash metacharacter (| & ; ( ) < >) -- matching bash's rule that "#" mid-word (e.g.
@@ -1313,11 +1314,24 @@ async function writeNodeOutputFile(
  * delimiter word is read from the ORIGINAL line by readHeredocDelimiter, never
  * from the reduced form.
  */
-function reduceToUnquotedUncommentedCode(line: string): { code: string; commentStart: number } {
+interface ShellQuoteState {
+  inSingle: boolean;
+  inDouble: boolean;
+}
+
+function reduceToUnquotedUncommentedCode(
+  line: string,
+  initial: ShellQuoteState = { inSingle: false, inDouble: false }
+): { code: string; commentStart: number; state: ShellQuoteState } {
   let out = '';
   let commentStart = line.length;
-  let inSingle = false;
-  let inDouble = false;
+  // Quote state is carried ACROSS physical lines by the caller: a multi-line
+  // "..." or '...' string is one shell word, so a line that starts inside it is
+  // string data, and the closing quote on a later line re-enters code (Overseer
+  // round 9 on #862: `echo "start\nend" # $spec.output` misread the trailing
+  // comment as quoted because state reset every line).
+  let inSingle = initial.inSingle;
+  let inDouble = initial.inDouble;
 
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
@@ -1393,7 +1407,7 @@ function reduceToUnquotedUncommentedCode(line: string): { code: string; commentS
     }
     out += ch;
   }
-  return { code: out, commentStart };
+  return { code: out, commentStart, state: { inSingle, inDouble } };
 }
 
 /**
@@ -1508,6 +1522,8 @@ export function substituteNodeOutputRefs(
     // mode are SEPARATE fields: Overseer round 5 on #862 -- encoding <<- as a "-"
     // prefix collided with a delimiter that itself begins with "-" (cat <<'-EOF').
     const heredocStack: { delimiter: string; stripTabs: boolean }[] = [];
+    // Shell quote state at the end of the previous code line (see the reducer).
+    let quoteState: ShellQuoteState = { inSingle: false, inDouble: false };
 
     for (const line of lines) {
       // Comment check first: bash ignores everything on a comment line, including a
@@ -1518,8 +1534,9 @@ export function substituteNodeOutputRefs(
       // value into a TRAILING comment, and lines 2..N spilled into executable code.
       const reduced =
         heredocStack.length === 0
-          ? reduceToUnquotedUncommentedCode(line)
-          : { code: line, commentStart: line.length };
+          ? reduceToUnquotedUncommentedCode(line, quoteState)
+          : { code: line, commentStart: line.length, state: quoteState };
+      quoteState = reduced.state;
       const isCommentLine =
         heredocStack.length === 0 && line.slice(0, reduced.commentStart).trim() === '';
 

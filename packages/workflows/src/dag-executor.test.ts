@@ -2032,11 +2032,14 @@ describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-
     ]);
   });
 
+  // An unterminated quote continues onto the next physical line (round 9: quote state
+  // is carried across lines): the string closes on line 2, and NO heredoc opened, so
+  // line 3 is a real comment and stays literal.
   it('unterminated single quote in the delimiter word is not a heredoc', () => {
-    expect(run(["cat <<'EOF", TOKEN].join('\n'))).toEqual(["cat <<'EOF", TOKEN]);
+    expect(run(["cat <<'EOF", "x'", TOKEN].join('\n'))).toEqual(["cat <<'EOF", "x'", TOKEN]);
   });
   it('unterminated double quote in the delimiter word is not a heredoc', () => {
-    expect(run(['cat <<"EOF', TOKEN].join('\n'))).toEqual(['cat <<"EOF', TOKEN]);
+    expect(run(['cat <<"EOF', 'x"', TOKEN].join('\n'))).toEqual(['cat <<"EOF', 'x"', TOKEN]);
   });
   it('a lone trailing backslash after << (line continuation) is not a heredoc', () => {
     expect(run(['cat <<\\', TOKEN].join('\n'))).toEqual(['cat <<\\', TOKEN]);
@@ -2315,6 +2318,74 @@ describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-
       const stdout = new TextDecoder().decode(proc.stdout);
       expect(proc.exitCode).toBe(0);
       expect(stdout).toBe('ok\ndone\n');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return;
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+
+  // Round 9 (ea4a318a): quote state persists across physical lines.
+  it('round 9: trailing comment after the close of a multi-line double-quoted string is a comment', () => {
+    expect(run(['echo "start', 'end" # $spec.output', TOKEN].join('\n'))).toEqual([
+      'echo "start',
+      'end" # $spec.output',
+      TOKEN,
+    ]);
+  });
+  it('round 9: trailing comment after the close of a multi-line single-quoted string is a comment', () => {
+    expect(run(["echo 'start", "end' # $spec.output", TOKEN].join('\n'))).toEqual([
+      "echo 'start",
+      "end' # $spec.output",
+      TOKEN,
+    ]);
+  });
+  it('round 9: a line that starts inside a multi-line string is data: # is not a comment, token substitutes', () => {
+    expect(run(['echo "start', '# $spec.output', 'end"'].join('\n'))).toEqual([
+      'echo "start',
+      SUBST,
+      'end"',
+    ]);
+  });
+  it('round 9: <<EOF inside a multi-line string does not open a heredoc', () => {
+    expect(run(['echo "a', 'cat <<EOF', 'b"', TOKEN].join('\n'))).toEqual([
+      'echo "a',
+      'cat <<EOF',
+      'b"',
+      TOKEN,
+    ]);
+  });
+  it('round 9: after the string closes, a real heredoc on a later line opens normally', () => {
+    expect(run(['echo "a', 'b"', 'cat <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo "a',
+      'b"',
+      'cat <<EOF',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 9: an escaped \\" inside a multi-line string does not close it', () => {
+    expect(run(['echo "a \\"', 'b" # $spec.output', TOKEN].join('\n'))).toEqual([
+      'echo "a \\"',
+      'b" # $spec.output',
+      TOKEN,
+    ]);
+  });
+  it('round 9: end-to-end -- multiline output in a comment after a multi-line string never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = ['echo "start', 'end" # $spec.output', 'echo done', ''].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result).toBe(script);
+    const tempFile = `${tmpdir()}/test-862-mlstr-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('start\nend\ndone\n');
     } catch (err) {
       if (err instanceof Error && err.message.includes('spawn failed')) return;
       throw err;
