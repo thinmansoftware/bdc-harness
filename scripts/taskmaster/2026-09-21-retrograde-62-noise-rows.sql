@@ -26,8 +26,13 @@
 --     dispatch_principals (packages/core/src/db/dispatch.ts getDispatchPrincipal).
 
 -- Detail: every 'noise' row, with its recipient, ack timestamp, and delivery
--- mode. A row is "heard" (would remain gradeable, NOT unheard) only in the
--- last column.
+-- mode. A row is "heard" (would remain gradeable, NOT unheard) only when the
+-- last column is TRUE. LEFT JOIN to agent_dispatch_messages so noise rows with
+-- NO matching dispatch row are retained (a missing dispatch means the action
+-- was never delivered -- i.e. unheard -- and must still appear in the cohort).
+-- COALESCE(..., FALSE) collapses the three-valued result to a hard boolean so a
+-- NULL delivery_mode (LEFT JOIN miss on dispatch_principals) or a NULL dispatch
+-- row reads as "not heard" rather than NULL.
 SELECT
   tj.id AS journal_id,
   tj.thread_ref,
@@ -37,13 +42,14 @@ SELECT
   adm.resolved_recipient,
   adm.acknowledged_at,
   dp.delivery_mode,
-  (
+  COALESCE(
     adm.acknowledged_at IS NOT NULL
     AND dp.delivery_mode IS NOT NULL
-    AND dp.delivery_mode <> 'drain_on_start'
+    AND dp.delivery_mode <> 'drain_on_start',
+    FALSE
   ) AS heard_by_non_draining_principal
 FROM tm_journal tj
-JOIN agent_dispatch_messages adm
+LEFT JOIN agent_dispatch_messages adm
   ON adm.idempotency_key = tj.idempotency_key
 LEFT JOIN dispatch_principals dp
   ON dp.principal_id = LOWER(TRIM(COALESCE(adm.resolved_recipient, adm.recipient)))
@@ -54,22 +60,34 @@ ORDER BY tj.created_at DESC;
 -- would_stay_noise = rows genuinely heard by a non-draining principal;
 -- would_become_unheard = the rest (the channel-deafness cohort). Prediction:
 -- would_stay_noise ~= 0.
+--
+-- LEFT JOIN to agent_dispatch_messages keeps noise rows with no dispatch row in
+-- total_noise (absence of a dispatch = never delivered = unheard). The heard
+-- predicate is wrapped in COALESCE(..., FALSE) so both the LEFT JOIN miss on
+-- dispatch_principals (NULL delivery_mode) and the missing dispatch row (NULL
+-- acknowledged_at) collapse to FALSE. That guarantees
+-- would_stay_noise + would_become_unheard = total_noise for every row (NOT of a
+-- NULL would otherwise be NULL and land in NEITHER bucket).
 SELECT
   COUNT(*) AS total_noise,
   COUNT(*) FILTER (
-    WHERE adm.acknowledged_at IS NOT NULL
-      AND dp.delivery_mode IS NOT NULL
-      AND dp.delivery_mode <> 'drain_on_start'
-  ) AS would_stay_noise,
-  COUNT(*) FILTER (
-    WHERE NOT (
+    WHERE COALESCE(
       adm.acknowledged_at IS NOT NULL
       AND dp.delivery_mode IS NOT NULL
-      AND dp.delivery_mode <> 'drain_on_start'
+      AND dp.delivery_mode <> 'drain_on_start',
+      FALSE
+    )
+  ) AS would_stay_noise,
+  COUNT(*) FILTER (
+    WHERE NOT COALESCE(
+      adm.acknowledged_at IS NOT NULL
+      AND dp.delivery_mode IS NOT NULL
+      AND dp.delivery_mode <> 'drain_on_start',
+      FALSE
     )
   ) AS would_become_unheard
 FROM tm_journal tj
-JOIN agent_dispatch_messages adm
+LEFT JOIN agent_dispatch_messages adm
   ON adm.idempotency_key = tj.idempotency_key
 LEFT JOIN dispatch_principals dp
   ON dp.principal_id = LOWER(TRIM(COALESCE(adm.resolved_recipient, adm.recipient)))

@@ -766,18 +766,26 @@ async function reconcilePendingActions(
  * usefulness.
  *
  * Grades (M-155 Amendment 03, John's ruling 2026-09-21):
- *   - 'useful':  external SOR shows downstream movement caused by the send.
- *   - 'unheard': the send went to a mailbox nobody could have read -- its
- *                dispatch row was never acknowledged by a non-draining
- *                principal (a drain_on_start recipient, e.g. 'operator',
- *                auto-addresses within seconds and is never human-read).
- *                'unheard' actions are excluded from the useful-rate floor
- *                denominator (only 'useful'/'noise' are counted), so the
- *                supervisor is not punished for a channel-deafness gap (M-129
- *                Phase 2) it did not cause. Useful evidence still wins: an
- *                action that provably moved the SOR is 'useful' regardless of
- *                channel.
+ *   - 'unheard': the send was never heard -- its dispatch row was never
+ *                acknowledged by a non-draining principal (a drain_on_start
+ *                recipient, e.g. 'operator', auto-addresses within seconds and
+ *                is never human-read), or the dispatch was cancelled (never
+ *                delivered). The heard gate is applied FIRST, before any
+ *                useful/noise evaluation: a send nobody heard cannot have caused
+ *                any downstream SOR movement, so it is NEVER graded 'useful'
+ *                (that would falsely inflate the numerator) and NEVER 'noise'
+ *                (that would punish the supervisor for a channel-deafness gap,
+ *                M-129 Phase 2, it did not cause). 'unheard' actions are
+ *                excluded from the useful-rate floor denominator by construction
+ *                (only 'useful'/'noise' are counted).
+ *   - 'useful':  heard channel AND external SOR shows downstream movement
+ *                caused by the send.
  *   - 'noise':   heard channel, deadline passed, no downstream movement.
+ *
+ * fire_cauldron is exempt from the heard gate: it is a direct cascade trigger,
+ * not a mailbox message (it creates no agent_dispatch_messages row), so
+ * channel-deafness cannot apply. It is inherently heard and graded
+ * 'useful'/'noise' purely on cascade-run and issue-movement evidence.
  */
 async function gradeSentActions(
   actions: taskmasterDb.TmJournalEntry[],
@@ -794,6 +802,12 @@ async function gradeSentActions(
     if (action.outcome !== 'sent' || action.grade !== null || !action.idempotency_key) continue;
     try {
       if (action.action_type === 'fire_cauldron') {
+        // M-155 Amendment 03: fire_cauldron is exempt from the 'unheard' heard
+        // gate. It triggers a build cascade directly (executeCascade) and
+        // creates NO agent_dispatch_messages row, so there is no mailbox that
+        // could be drain-deaf -- it is inherently heard. Its usefulness is
+        // observed from cascade-run and issue-movement evidence, so it is graded
+        // 'useful'/'noise' here and correctly enters the floor denominator.
         const proposal = JSON.parse(action.proposal_json) as ActionProposal & {
           cascadeId?: string;
         };
@@ -820,7 +834,12 @@ async function gradeSentActions(
       const effect = await findEffect(action.idempotency_key);
       if (!effect) continue;
       if (effect.status === 'cancelled') {
-        await dal.gradeAction(action.id, 'noise');
+        // M-155 Amendment 03: a cancelled dispatch was never delivered, so no
+        // principal (draining or not) could have heard it. Grade 'unheard'
+        // (not 'noise') so a message that never went out is excluded from the
+        // useful-rate floor denominator rather than counted against the
+        // supervisor.
+        await dal.gradeAction(action.id, 'unheard');
         continue;
       }
       if (action.action_type === 'digest') continue;
@@ -832,16 +851,19 @@ async function gradeSentActions(
         continue;
       }
 
-      // M-155 Amendment 03 (John's ruling 2026-09-21): decide whether this
-      // action's dispatch row was ever "heard". An action is heard only when
+      // M-155 Amendment 03 (John's ruling 2026-09-21): apply the "heard" gate
+      // FIRST, before any useful/noise evaluation. An action is heard only when
       // its dispatch row carries an acknowledged_at from a recipient whose
       // delivery_mode is NOT drain_on_start. A drain_on_start mailbox (e.g.
       // 'operator') auto-addresses within seconds and is never human-read, so a
-      // message sent there was never actually heard -- grading it 'noise' would
-      // punish the supervisor for a channel-deafness gap (M-129 Phase 2) it did
-      // not cause. Unheard actions are graded 'unheard' below and excluded from
-      // the useful-rate floor denominator by construction (only useful/noise
-      // are counted). Useful evidence still wins (checked first below).
+      // message sent there was never actually heard. If a send was never heard,
+      // no human could have acted on it, so any downstream SOR movement cannot
+      // be attributed to it -- it must NOT be graded 'useful' (that would
+      // falsely inflate the numerator) nor 'noise' (that would punish the
+      // supervisor for a channel-deafness gap, M-129 Phase 2, it did not
+      // cause). It is graded 'unheard' immediately (no deadline wait) and
+      // excluded from the useful-rate floor denominator by construction (only
+      // useful/noise are counted).
       const dispatchRow = await getDispatchById(effect.id);
       const heardRecipient = dispatchRow?.resolved_recipient ?? dispatchRow?.recipient ?? null;
       const recipientAssessment = heardRecipient ? await assessRecipient(heardRecipient) : null;
@@ -891,13 +913,17 @@ async function gradeSentActions(
         }
       }
 
-      if (usefulAtMs !== null && (!Number.isFinite(deadlineMs) || usefulAtMs <= deadlineMs)) {
-        await dal.gradeAction(action.id, 'useful');
-      } else if (!heard) {
-        // Unheard: the dispatch row was never acknowledged by a non-draining
-        // principal, so no human could have read it. Graded immediately (no
-        // deadline wait) and excluded from the useful-rate floor denominator.
+      // Heard gate FIRST: a send nobody heard is 'unheard' regardless of any
+      // downstream SOR movement (which cannot be attributed to an unheard send)
+      // and regardless of the proof deadline. Only heard actions fall through to
+      // the useful/noise split.
+      if (!heard) {
         await dal.gradeAction(action.id, 'unheard');
+      } else if (
+        usefulAtMs !== null &&
+        (!Number.isFinite(deadlineMs) || usefulAtMs <= deadlineMs)
+      ) {
+        await dal.gradeAction(action.id, 'useful');
       } else if (Number.isFinite(deadlineMs) && nowMs >= deadlineMs) {
         await dal.gradeAction(action.id, 'noise');
       }
