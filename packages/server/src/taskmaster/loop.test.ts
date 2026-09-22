@@ -1848,17 +1848,22 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: 'tm:deliver_ruling:ruling-original',
-      recipient: 'xo',
+      // Heard channel (major-build is worker_poll, not drain_on_start) + ack so
+      // the M-155 Amendment 03 heard gate passes and this test exercises the
+      // deliver_ruling useful path rather than short-circuiting to 'unheard'.
+      recipient: 'major-build',
       body: 'ruling reminder',
       createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getDispatchMessageById: (async () => ({
         id: 'ruling-original',
-        recipient: 'xo',
-        resolved_recipient: 'xo',
+        recipient: 'major-build',
+        resolved_recipient: 'major-build',
+        acknowledged_at: new Date(T0 - 40_000).toISOString(),
         addressed_at: new Date(T0 - 30_000).toISOString(),
-        addressed_by: 'xo',
+        addressed_by: 'major-build',
       })) as unknown as TaskmasterDeps['getDispatchMessageById'],
     });
 
@@ -1887,9 +1892,12 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: key,
-      recipient: 'xo',
+      // Heard channel + ack so the M-155 Amendment 03 heard gate passes and this
+      // test exercises the nudge useful path (post-send progress marker).
+      recipient: 'major-build',
       body: 'nudge',
       createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
@@ -2035,7 +2043,7 @@ describe('SC7 grading requires external source progress', () => {
     }
   });
 
-  test('a cancelled effect is noise and an unchanged P0 source is not useful', async () => {
+  test('a cancelled effect is unheard (never delivered) and an unchanged P0 source is not useful', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     const key = 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#1600:1';
@@ -2076,7 +2084,9 @@ describe('SC7 grading requires external source progress', () => {
 
     await tick(createTaskmasterState(60_000), deps);
 
-    expect(world.journal.find(row => row.id === 'cancelled-escalation')?.grade).toBe('noise');
+    // M-155 Amendment 03: a cancelled dispatch was never delivered, so it is
+    // 'unheard' (excluded from the floor denominator), not 'noise'.
+    expect(world.journal.find(row => row.id === 'cancelled-escalation')?.grade).toBe('unheard');
   });
 
   test('a post-send assignment event makes a P0 escalation useful', async () => {
@@ -2099,9 +2109,12 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: key,
-      recipient: 'operator',
+      // Heard channel + ack so the M-155 Amendment 03 heard gate passes and this
+      // test exercises the P0 escalation useful path (post-send assignment).
+      recipient: 'major-build',
       body: 'escalate',
       createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
@@ -2386,6 +2399,67 @@ describe('M-155 Amendment 03: unheard grade (WO-HARNESS-TASKMASTER-UNHEARD-GRADE
     });
     await tick(createTaskmasterState(60_000), makeDeps(worldNoise));
     expect(worldNoise.journal.find(row => row.id === 'heard-noise-nudge')?.grade).toBe('noise');
+  });
+
+  test('scenario 6: downstream movement on an unheard send is unheard, NOT useful', async () => {
+    // The heard gate precedes the useful/noise split (M-155 Amendment 03,
+    // spec section 3.2). recipient=operator (drain_on_start) with no ack means
+    // the send was never heard, so even a post-send GitHub assignment (which
+    // would otherwise grade 'useful') cannot be attributed to it. Prior to the
+    // fix this row graded 'useful' and falsely inflated the floor numerator.
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedSentEscalation(world, { id: '2204', recipient: 'operator', acknowledged_at: null });
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        getGithubIssueEvidence: async () => ({
+          state: 'open',
+          updatedAt: new Date(T0 - 30_000).toISOString(),
+          labels: ['wo', 'P0'],
+          assigneeCount: 1,
+          closedAt: null,
+          assignedAt: new Date(T0 - 30_000).toISOString(),
+          activeStatusAt: null,
+          progressRecordedAt: null,
+        }),
+      })
+    );
+    expect(world.journal.find(row => row.id === 'journal-2204')?.grade).toBe('unheard');
+  });
+
+  test('scenario 7: a cancelled dispatch is graded unheard, NOT noise', async () => {
+    // A cancelled dispatch was never delivered, so no principal could have heard
+    // it. Deadline is already past, so the pre-fix path forced 'noise' (into the
+    // floor denominator); the fix grades 'unheard' (excluded).
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#2205:1';
+    world.journal.push({
+      id: 'journal-2205',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#2205',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'P0 source claim after send',
+      proof_deadline_at: new Date(T0 - 1).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        findEffectByIdempotencyKey: async () => ({
+          id: key,
+          status: 'cancelled',
+          createdAt: new Date(T0 - 45_000).toISOString(),
+        }),
+      })
+    );
+    expect(world.journal.find(row => row.id === 'journal-2205')?.grade).toBe('unheard');
   });
 });
 
