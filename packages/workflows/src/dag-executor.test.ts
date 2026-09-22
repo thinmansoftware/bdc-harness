@@ -2212,6 +2212,62 @@ describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-
     }
   });
 
+  // Round 7 (a1b6a214): "#" is a comment after ANY metacharacter, including ) < >.
+  it('round 7: case arm x)# <<EOF -- the # after ) is a comment, no heredoc opens', () => {
+    const script = ['case $v in', 'x)# <<EOF', ';;', 'esac', TOKEN].join('\n');
+    expect(run(script)).toEqual(['case $v in', 'x)# <<EOF', ';;', 'esac', TOKEN]);
+  });
+  it('round 7: subshell close (true)# <<EOF -- comment, no heredoc', () => {
+    expect(run(['(true)# <<EOF', TOKEN].join('\n'))).toEqual(['(true)# <<EOF', TOKEN]);
+  });
+  it('round 7: # after < is a comment, no heredoc', () => {
+    expect(run(['cat <# <<EOF', TOKEN].join('\n'))).toEqual(['cat <# <<EOF', TOKEN]);
+  });
+  it('round 7: # after > is a comment, no heredoc', () => {
+    expect(run(['echo ># <<EOF', TOKEN].join('\n'))).toEqual(['echo ># <<EOF', TOKEN]);
+  });
+  it('round 7: # after | and & is a comment, no heredoc', () => {
+    expect(run(['true |# <<EOF', TOKEN].join('\n'))).toEqual(['true |# <<EOF', TOKEN]);
+    expect(run(['true &# <<EOF', TOKEN].join('\n'))).toEqual(['true &# <<EOF', TOKEN]);
+  });
+  it('round 7: # mid-word (foo#bar) is NOT a comment, so a later real heredoc opens', () => {
+    expect(run(['echo foo#bar <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo foo#bar <<EOF',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 7: end-to-end -- multiline output in a comment after a case arm never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = [
+      'v=x',
+      'case $v in',
+      'x)# <<EOF',
+      'echo arm;;',
+      'esac',
+      '# note $spec.output',
+      'echo done',
+      '',
+    ].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result.split('\n')[5]).toBe('# note $spec.output');
+    const tempFile = `${tmpdir()}/test-862-case-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('arm\ndone\n');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return;
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+
   it('end-to-end: multi-line output after a mixed-quoted heredoc never executes (real bash)', async () => {
     const multi = 'line one\nexit 1\necho SPILLED';
     const outputs = new Map([['spec', makeOutput('completed', multi)]]);

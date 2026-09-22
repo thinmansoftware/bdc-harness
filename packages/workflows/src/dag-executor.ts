@@ -1305,7 +1305,7 @@ async function writeNodeOutputFile(
  * Tracks single-quote and double-quote state (backslash escapes apply only inside
  * double quotes, matching bash). A "#" ends the code portion of the line only when
  * it is outside any quote AND is either at the start of the line or preceded by
- * whitespace, ";", "&", "|", or "(" -- matching bash's rule that "#" mid-word (e.g.
+ * whitespace or a bash metacharacter (| & ; ( ) < >) -- matching bash's rule that "#" mid-word (e.g.
  * inside `foo#bar`) is not a comment marker. Overseer CHANGES_REQUESTED on
  * ced4894e (bdc-harness#862): `echo ok # example <<EOF` and `echo "<<EOF"` were
  * misread as opening a heredoc because the prior scan was not shell-lexically aware.
@@ -1379,7 +1379,10 @@ function reduceToUnquotedUncommentedCode(line: string): string {
     }
     if (ch === '#') {
       const prev = i > 0 ? line[i - 1] : '';
-      const atCommentStart = i === 0 || /[\s;&|(]/.test(prev);
+      // "#" starts a comment at the start of a word: after any bash metacharacter
+      // (whitespace | & ; ( ) < >). Overseer round 7 on #862: a case arm `x)# <<EOF`
+      // was misread because ")" "<" ">" were missing from the predecessor set.
+      const atCommentStart = i === 0 || /[\s;&|()<>]/.test(prev);
       if (atCommentStart) {
         // Rest of the line is a comment: blank it out and stop scanning.
         out += ' '.repeat(line.length - i);
