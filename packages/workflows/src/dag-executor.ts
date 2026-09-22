@@ -1313,8 +1313,9 @@ async function writeNodeOutputFile(
  * delimiter word is read from the ORIGINAL line by readHeredocDelimiter, never
  * from the reduced form.
  */
-function reduceToUnquotedUncommentedCode(line: string): string {
+function reduceToUnquotedUncommentedCode(line: string): { code: string; commentStart: number } {
   let out = '';
+  let commentStart = line.length;
   let inSingle = false;
   let inDouble = false;
 
@@ -1385,13 +1386,14 @@ function reduceToUnquotedUncommentedCode(line: string): string {
       const atCommentStart = i === 0 || /[\s;&|()<>]/.test(prev);
       if (atCommentStart) {
         // Rest of the line is a comment: blank it out and stop scanning.
+        commentStart = i;
         out += ' '.repeat(line.length - i);
         break;
       }
     }
     out += ch;
   }
-  return out;
+  return { code: out, commentStart };
 }
 
 /**
@@ -1479,8 +1481,8 @@ function readHeredocDelimiter(
  * YAMLs that write `"$node.output"` are now safe to author this natural way; the
  * older pattern of `VAR=$node.output ... "$VAR"` continues to work unchanged.
  *
- * When escapedForBash is on, bash COMMENT lines (first non-whitespace char is #)
- * are left byte-identical -- no substitution. A multi-line output substituted into
+ * When escapedForBash is on, bash COMMENTS -- whole comment lines AND trailing
+ * comments after an unquoted # -- are left byte-identical -- no substitution. A multi-line output substituted into
  * a comment spills past the # on line 2 and bash executes the rest. Anchor:
  * bdc-xo#2141, 2026-09-21 -- a YAML comment reading "the executor substitutes
  * $read-spec.output" expanded the whole 161-line WO spec into the script body and
@@ -1497,8 +1499,8 @@ export function substituteNodeOutputRefs(
     : /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g;
 
   // When escapedForBash is true, split into lines and track heredoc state.
-  // Skip substitution only on bash comment lines (first non-whitespace is #)
-  // that are NOT inside an open heredoc. Heredoc content is data, not comments.
+  // Skip substitution in bash comments (from an unquoted # to end of line) that are
+  // NOT inside an open heredoc. Heredoc content is data, not comments.
   if (escapedForBash) {
     const lines = prompt.split('\n');
     const processedLines: string[] = [];
@@ -1510,14 +1512,16 @@ export function substituteNodeOutputRefs(
     for (const line of lines) {
       // Comment check first: bash ignores everything on a comment line, including a
       // literal "<<EOF" in the comment text, so a comment must never open a heredoc.
-      let isCommentLine = false;
-      if (heredocStack.length === 0) {
-        let wsIndex = 0;
-        while (wsIndex < line.length && /\s/.test(line[wsIndex])) {
-          wsIndex++;
-        }
-        isCommentLine = wsIndex < line.length && line[wsIndex] === '#';
-      }
+      // Outside a heredoc body, `commentStart` is where an unquoted "#" comment begins
+      // (line.length when there is none). Everything from there on is left byte-identical
+      // -- Overseer round 8 on #862: `echo ok # $spec.output` substituted a multi-line
+      // value into a TRAILING comment, and lines 2..N spilled into executable code.
+      const reduced =
+        heredocStack.length === 0
+          ? reduceToUnquotedUncommentedCode(line)
+          : { code: line, commentStart: line.length };
+      const isCommentLine =
+        heredocStack.length === 0 && line.slice(0, reduced.commentStart).trim() === '';
 
       // Track heredoc opens on this line (only outside a heredoc body and not on a comment).
       // Format: << [-]? WORD, where WORD is any shell word: a single- or double-quoted
@@ -1535,7 +1539,7 @@ export function substituteNodeOutputRefs(
       // offset by readHeredocDelimiter, which applies full bash quote removal
       // (Overseer round 5 on #862: E"OF", EO\F, 'E'OF all terminate on EOF).
       if (heredocStack.length === 0 && !isCommentLine) {
-        const reducedLine = reduceToUnquotedUncommentedCode(line);
+        const reducedLine = reduced.code;
         const heredocOpRegex = /(?<!<)<<(?!<)(-)?/g;
         let opMatch: RegExpExecArray | null;
         while ((opMatch = heredocOpRegex.exec(reducedLine)) !== null) {
@@ -1567,23 +1571,14 @@ export function substituteNodeOutputRefs(
         }
       }
 
-      // Decide whether to substitute: skip only if (a) no heredoc is open AND
-      // (b) first non-whitespace char is # (bash comment).
-      let shouldSubstitute = true;
-      if (heredocStack.length === 0) {
-        // No open heredoc; apply comment check
-        let wsIndex = 0;
-        while (wsIndex < line.length && /\s/.test(line[wsIndex])) {
-          wsIndex++;
-        }
-        if (wsIndex < line.length && line[wsIndex] === '#') {
-          // Comment line outside heredoc: skip substitution
-          shouldSubstitute = false;
-        }
-      }
-      // If a heredoc IS open, always substitute (heredoc body is data)
-
-      processedLines.push(shouldSubstitute ? line.replace(pattern, substituteToken) : line);
+      // Substitute only the code portion. A heredoc body line has no comment (data), so
+      // the whole line is substituted; otherwise the text from the unquoted "#" onward
+      // (a full-line or trailing comment) is kept byte-identical. Note `reduced` was
+      // computed BEFORE this line could close a heredoc, which is what we want: the
+      // terminator line itself carries no token.
+      const codePart = line.slice(0, reduced.commentStart);
+      const commentPart = line.slice(reduced.commentStart);
+      processedLines.push(codePart.replace(pattern, substituteToken) + commentPart);
     }
     return processedLines.join('\n');
   }
