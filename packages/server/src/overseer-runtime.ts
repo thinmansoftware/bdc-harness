@@ -3,6 +3,7 @@ import { runOverseerService } from '@archon/overseer/service';
 import type { OverseerServiceOptions, OverseerWiredAdapterKind } from '@archon/overseer/service';
 import { PRODUCTION_EFFECT_HOLD_REASON } from '@archon/overseer/merge-manager';
 import { DEFAULT_WATCH_INTERVAL_MS } from '@archon/overseer/watch';
+import { logDiscoveryConfigurationAtStartup } from '@archon/overseer';
 
 const log = createLogger('server/overseer-runtime');
 
@@ -113,6 +114,10 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
   watcherState = 'running';
 
   log.info({ adapterKind }, 'overseer_runtime.watcher_starting');
+  // Announce the PR-discovery repo list BEFORE the first tick. An unset
+  // OVERSEER_MERGE_DISCOVERY_REPOS left the coordinator blind to every open PR
+  // for two weeks (2026-09-08..22) with nothing at startup saying so.
+  logDiscoveryConfigurationAtStartup();
 
   const runService = deps.runService ?? runOverseerService;
   watcherTask = runService({

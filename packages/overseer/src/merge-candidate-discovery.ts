@@ -121,6 +121,16 @@ export interface MergeCandidateDiscoveryResult {
    * lookup threw). Distinguishes "nothing to merge" from "we did not look".
    */
   readonly unavailable: boolean;
+  /**
+   * WHY discovery was unavailable, or null when it ran. Load-bearing: for two
+   * weeks (2026-09-08 to 2026-09-22) the running coordinator reported
+   * `prDiscoveryUnavailable:true prsTotalOpen:0` on every heartbeat against 30
+   * real open PRs, and nothing said why. The cause was `no_repos_configured`
+   * (OVERSEER_MERGE_DISCOVERY_REPOS was never set anywhere) -- a one-line fix
+   * that hid behind an anonymous boolean. Every unavailable result now names
+   * its reason and logs it at warn.
+   */
+  readonly unavailableReason: MergeCandidateDiscoveryUnavailableReason | null;
   /** Total open PRs listed across every repo, before the per-tick bound. */
   readonly totalOpen: number;
   /**
@@ -160,16 +170,140 @@ export interface DiscoveryCursor {
   readonly perRepo: Readonly<Record<string, number>>;
 }
 
-const EMPTY_RESULT: MergeCandidateDiscoveryResult = {
-  candidates: [],
-  exclusions: [],
-  evaluated: 0,
-  fallbackReviewDecisions: 0,
-  unavailable: true,
-  totalOpen: 0,
-  evaluationWindowTruncated: false,
-  cursorAfter: null,
-};
+/**
+ * Every way discovery can fail to run. Each is an operator-actionable fact:
+ *
+ *  - `no_list_dep`: the deps object carries no `listOpenPullRequests` -- a
+ *    wiring defect in the caller, not a config problem.
+ *  - `no_repos_configured`: OVERSEER_MERGE_DISCOVERY_REPOS is unset, empty, or
+ *    contained only malformed entries. THIS is the reason the coordinator sat
+ *    blind for two weeks after #776 shipped: the code was present and enabled,
+ *    the repo list it sweeps was never provided, and the empty list was
+ *    reported as "0 open PRs".
+ *  - `all_repo_listings_failed`: every configured repo's listing threw
+ *    (token invalid/revoked, network down). Individual failures are logged as
+ *    they happen; this reason is the aggregate.
+ *  - `not_run`: the watch tick did not invoke discovery (disabled by option).
+ *  - `sweep_threw`: discovery threw and the watch tick isolated the failure.
+ */
+export type MergeCandidateDiscoveryUnavailableReason =
+  | 'no_list_dep'
+  | 'no_repos_configured'
+  | 'all_repo_listings_failed'
+  | 'not_run'
+  | 'sweep_threw';
+
+/** Operator-facing remedy for each unavailable reason. Logged next to the reason. */
+export function describeDiscoveryUnavailableReason(
+  reason: MergeCandidateDiscoveryUnavailableReason
+): string {
+  switch (reason) {
+    case 'no_list_dep':
+      return 'caller wired no listOpenPullRequests dependency -- code defect, not config';
+    case 'no_repos_configured':
+      return (
+        `${DISCOVERY_REPOS_ENV} is unset or has no valid owner/repo entries -- ` +
+        'set it (comma-separated, e.g. thinmansoftware/bdc-xo,thinmansoftware/bdc-harness) ' +
+        'and restart; until then NO pull request can be discovered'
+      );
+    case 'all_repo_listings_failed':
+      return 'every configured repo listing threw -- check the GitHub token and connectivity';
+    case 'not_run':
+      return 'discovery was not invoked this tick (discoveryEnabled=false)';
+    case 'sweep_threw':
+      return 'discovery threw and was isolated -- see merge-coordinator.discovery_failed_isolated';
+    default:
+      return reason;
+  }
+}
+
+/** Build the result for a sweep that could not run, naming why. */
+export function unavailableDiscoveryResult(
+  reason: MergeCandidateDiscoveryUnavailableReason
+): MergeCandidateDiscoveryResult {
+  return {
+    candidates: [],
+    exclusions: [],
+    evaluated: 0,
+    fallbackReviewDecisions: 0,
+    unavailable: true,
+    unavailableReason: reason,
+    totalOpen: 0,
+    evaluationWindowTruncated: false,
+    cursorAfter: null,
+  };
+}
+
+export interface DiscoveryLogger {
+  info(obj: Record<string, unknown>, msg: string): void;
+  warn?(obj: Record<string, unknown>, msg: string): void;
+}
+
+/** Warn through the injected logger when it can, else through the module logger. */
+function warnVia(logger: DiscoveryLogger, obj: Record<string, unknown>, msg: string): void {
+  if (typeof logger.warn === 'function') logger.warn(obj, msg);
+  else log.warn(obj, msg);
+}
+
+/**
+ * Startup-time configuration report for the sweep. Called once when the
+ * watcher starts so an unset repo list is announced BEFORE the first tick,
+ * not inferred from a lifetime of prsTotalOpen:0 heartbeats. Reads env only
+ * through the same resolvers the sweep uses, so what it reports is what the
+ * sweep will do.
+ */
+export interface DiscoveryConfigurationReport {
+  readonly repos: readonly DiscoveryRepoTarget[];
+  readonly watchedBases: readonly string[];
+  readonly maxPullRequestsPerTick: number;
+  /** False when the sweep would return `no_repos_configured` on every tick. */
+  readonly configured: boolean;
+}
+
+export function describeDiscoveryConfiguration(
+  env: NodeJS.ProcessEnv = process.env
+): DiscoveryConfigurationReport {
+  const repos = resolveDiscoveryRepos(env[DISCOVERY_REPOS_ENV]);
+  return {
+    repos,
+    watchedBases: resolveWatchedBaseBranches(env[DISCOVERY_BASE_BRANCHES_ENV]),
+    maxPullRequestsPerTick: resolveDiscoveryMaxPrsPerTick(
+      env.OVERSEER_MERGE_DISCOVERY_MAX_PRS_PER_TICK
+    ),
+    configured: repos.length > 0,
+  };
+}
+
+/**
+ * Log the configuration report at startup: info when configured, WARN when
+ * the repo list is empty. Returns the report so callers can also surface it.
+ */
+export function logDiscoveryConfigurationAtStartup(
+  logger: DiscoveryLogger = log,
+  env: NodeJS.ProcessEnv = process.env
+): DiscoveryConfigurationReport {
+  const report = describeDiscoveryConfiguration(env);
+  const fields = {
+    repos: report.repos.map(target => `${target.owner}/${target.repo}`),
+    watchedBases: report.watchedBases,
+    maxPullRequestsPerTick: report.maxPullRequestsPerTick,
+    reposEnv: DISCOVERY_REPOS_ENV,
+  };
+  if (report.configured) {
+    logger.info(fields, 'merge-coordinator.discovery_configured');
+  } else {
+    warnVia(
+      logger,
+      {
+        ...fields,
+        reason: 'no_repos_configured',
+        remedy: describeDiscoveryUnavailableReason('no_repos_configured'),
+      },
+      'merge-coordinator.discovery_unconfigured_at_startup'
+    );
+  }
+  return report;
+}
 
 /**
  * Parse a comma-separated base-branch list. Reuses MERGE_MANAGER_ALLOWED_BASES
@@ -441,7 +575,7 @@ export interface DiscoverMergeCandidatesOptions {
    */
   readonly cursor?: DiscoveryCursor | null;
   /** Injectable for tests; defaults to this module's logger. */
-  readonly logger?: { info(obj: Record<string, unknown>, msg: string): void };
+  readonly logger?: DiscoveryLogger;
 }
 
 /**
@@ -590,6 +724,27 @@ export function isPullRequestDiscoveredCandidate(record: {
   );
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Every unavailable exit goes through here so none can be silent. The warn
+ * line carries the reason token, its remedy, and any amplifying fields.
+ */
+function unavailable(
+  logger: DiscoveryLogger,
+  reason: MergeCandidateDiscoveryUnavailableReason,
+  extra: Record<string, unknown> = {}
+): MergeCandidateDiscoveryResult {
+  warnVia(
+    logger,
+    { reason, remedy: describeDiscoveryUnavailableReason(reason), ...extra },
+    'merge-coordinator.discovery_unavailable'
+  );
+  return unavailableDiscoveryResult(reason);
+}
+
 /**
  * Sweep the watched repos for merge candidates.
  *
@@ -602,7 +757,8 @@ export async function discoverMergeCandidates(
   deps: MergeCandidateDiscoveryDeps,
   options: DiscoverMergeCandidatesOptions = {}
 ): Promise<MergeCandidateDiscoveryResult> {
-  if (!deps.listOpenPullRequests) return EMPTY_RESULT;
+  const logger = options.logger ?? log;
+  if (!deps.listOpenPullRequests) return unavailable(logger, 'no_list_dep');
   // Bound to `deps` rather than detached, so an implementation that is a real
   // method on a client object keeps its receiver.
   const listOpenPullRequests: NonNullable<
@@ -611,7 +767,7 @@ export async function discoverMergeCandidates(
 
   const watchedBases = options.watchedBases ?? resolveWatchedBaseBranches();
   const repos = options.repos ?? resolveDiscoveryRepos();
-  if (repos.length === 0) return EMPTY_RESULT;
+  if (repos.length === 0) return unavailable(logger, 'no_repos_configured');
 
   const maxPullRequests = options.maxPullRequestsPerTick ?? resolveDiscoveryMaxPrsPerTick();
   const alreadyCovered = options.alreadyCoveredPullRequests ?? new Set<string>();
@@ -621,6 +777,7 @@ export async function discoverMergeCandidates(
   let evaluated = 0;
   let fallbackReviewDecisions = 0;
   let anyRepoListed = false;
+  const failedRepos: string[] = [];
 
   // LIST EVERY REPO FIRST, then evaluate one interleaved sequence.
   //
@@ -639,11 +796,23 @@ export async function discoverMergeCandidates(
       });
       byRepo.set(repoKey(target.owner, target.repo), listed);
       anyRepoListed = true;
-    } catch {
+    } catch (error) {
       // One unreachable repo must not blind the sweep to every other repo.
-      // Reported through `unavailable` only if NO repo could be listed.
+      // Reported through `unavailable` only if NO repo could be listed -- but
+      // EVERY failure is logged with its cause here, because a swallowed
+      // listing error is exactly the kind of silence that hid the two-week
+      // discovery outage. A silent catch reads as "no PRs".
+      failedRepos.push(`${target.owner}/${target.repo}`);
+      warnVia(
+        logger,
+        { owner: target.owner, repo: target.repo, err: errorMessage(error) },
+        'merge-coordinator.discovery_repo_listing_failed'
+      );
       continue;
     }
+  }
+  if (!anyRepoListed) {
+    return unavailable(logger, 'all_repo_listings_failed', { failedRepos });
   }
 
   const startCursor = options.cursor === undefined ? processCursor : options.cursor;
@@ -773,7 +942,7 @@ export async function discoverMergeCandidates(
   // ONE line per tick naming exactly how much of the population was looked at.
   // A bounded window that says nothing is indistinguishable from a small
   // population -- the same class of silence #758 exists to end.
-  (options.logger ?? log).info(
+  logger.info(
     {
       evaluated,
       totalOpen,
@@ -788,7 +957,8 @@ export async function discoverMergeCandidates(
     exclusions,
     evaluated,
     fallbackReviewDecisions,
-    unavailable: !anyRepoListed,
+    unavailable: false,
+    unavailableReason: null,
     totalOpen,
     evaluationWindowTruncated,
     cursorAfter,

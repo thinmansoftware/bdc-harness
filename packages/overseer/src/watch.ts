@@ -5,7 +5,9 @@ import { classifyError } from './classify';
 import { decide } from './decide';
 import { isPrMergeReady, isPrGreen, judgePullRequest } from './judge-pr';
 import {
+  describeDiscoveryUnavailableReason,
   discoverMergeCandidates,
+  unavailableDiscoveryResult,
   pullRequestKey,
   summarizeExclusions,
   type DiscoverMergeCandidatesOptions,
@@ -265,6 +267,8 @@ async function assessRun(
  */
 export interface WatchHeartbeatLogger {
   info(obj: Record<string, unknown>, msg: string): void;
+  /** Optional so existing injected loggers keep working; falls back to the module logger. */
+  warn?(obj: Record<string, unknown>, msg: string): void;
 }
 
 export interface WatchOnceOptions {
@@ -344,16 +348,7 @@ export async function watchOnce(
   // authorization rule downstream (M-48 enablement, production-effect hold,
   // provenance, Review Gate exact-head approval, allowed bases, Grok judge) is
   // untouched and still applies to each candidate it produces.
-  let discovery: MergeCandidateDiscoveryResult = {
-    candidates: [],
-    exclusions: [],
-    evaluated: 0,
-    fallbackReviewDecisions: 0,
-    unavailable: true,
-    totalOpen: 0,
-    evaluationWindowTruncated: false,
-    cursorAfter: null,
-  };
+  let discovery: MergeCandidateDiscoveryResult = unavailableDiscoveryResult('not_run');
   if (options.discoveryEnabled !== false) {
     try {
       discovery = await discoverMergeCandidates(deps, {
@@ -365,6 +360,26 @@ export async function watchOnce(
       // A broken sweep must never take down the watch tick -- the run-derived
       // outcomes above are still valid work.
       log.error({ err: error as Error }, 'merge-coordinator.discovery_failed_isolated');
+      discovery = unavailableDiscoveryResult('sweep_threw');
+    }
+  }
+
+  // AN UNAVAILABLE SWEEP IS A WARN, EVERY TICK. From 2026-09-08 to 2026-09-22
+  // the heartbeat carried prDiscoveryUnavailable:true prsTotalOpen:0 on every
+  // cycle at info level, indistinguishable at a glance from "no open PRs", while
+  // 30 PRs sat open and four sat APPROVED + CLEAN. The reason (the repo list env
+  // var was never set) was knowable from the first tick; nothing said it.
+  if (discovery.unavailable) {
+    const reason = discovery.unavailableReason ?? 'not_run';
+    const warnFields = {
+      reason,
+      remedy: describeDiscoveryUnavailableReason(reason),
+      note: 'prsTotalOpen:0 on this heartbeat means WE DID NOT LOOK, not that no PRs exist',
+    };
+    if (typeof heartbeatLogger.warn === 'function') {
+      heartbeatLogger.warn(warnFields, 'merge-coordinator.discovery_unavailable_heartbeat');
+    } else {
+      log.warn(warnFields, 'merge-coordinator.discovery_unavailable_heartbeat');
     }
   }
 
@@ -406,6 +421,9 @@ export async function watchOnce(
       prsEvaluated: discovery.evaluated,
       prCandidates: discovery.candidates.length,
       prDiscoveryUnavailable: discovery.unavailable,
+      // Null when discovery ran. Otherwise the reason token; the matching warn
+      // line is 'merge-coordinator.discovery_unavailable_heartbeat'.
+      prDiscoveryUnavailableReason: discovery.unavailableReason,
       // Non-zero means GitHub's aggregate review decision was unavailable and
       // the stricter REST fallback ran instead, so approved PRs may be sitting
       // excluded. Reads as a DEGRADED GATE rather than a quiet backlog; the
