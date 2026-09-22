@@ -1,7 +1,7 @@
 -- Read-only falsifier for WO-HARNESS-TASKMASTER-UNHEARD-GRADE-01.
 -- Repository migration 041 confirms tm_journal.idempotency_key exists and is
 -- indexed. Verify the deployed columns with information_schema before running.
--- The 14-day bound reproduces the cohort sampled on 2026-09-21.
+-- The 15-day bound reproduces the cohort sampled on 2026-09-21.
 SELECT COUNT(*) AS acknowledged_by_non_draining_principal
 FROM tm_journal AS journal
 JOIN agent_dispatch_messages AS message

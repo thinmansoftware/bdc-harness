@@ -1953,7 +1953,7 @@ describe('SC7 grading requires external source progress', () => {
     expect(world.journal.find(row => row.id === 'pre-send-progress-nudge')?.grade).toBeNull();
   });
 
-  test('unacknowledged rulings are unheard; acknowledgement alone is not useful', async () => {
+  test('unacknowledged rulings stay pending before their deadline', async () => {
     const cases = [
       { name: 'unacknowledged', acknowledged_at: null, addressed_at: null, addressed_by: null },
       {
@@ -2008,9 +2008,99 @@ describe('SC7 grading requires external source progress', () => {
 
       await tick(createTaskmasterState(60_000), deps);
 
-      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBe(
-        testCase.acknowledged_at === null ? 'unheard' : null
+      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBeNull();
+    }
+  });
+
+  test('an action acknowledged and acted on before its deadline matures to useful', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:nudge:gh:test/repo#late-ack:1';
+    world.journal.push({
+      id: 'late-ack',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:test/repo#late-ack',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'progress after send',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    let acknowledgedAt: string | null = null;
+    const deps = makeDeps(world, {
+      findEffectByIdempotencyKey: async () => ({
+        id: 'late-ack-dispatch',
+        status: 'queued',
+        createdAt: new Date(T0 - 30_000).toISOString(),
+      }),
+      getDispatchMessageById: (async () => ({
+        id: 'late-ack-dispatch',
+        recipient: 'xo',
+        resolved_recipient: 'xo',
+        acknowledged_at: acknowledgedAt,
+      })) as unknown as TaskmasterDeps['getDispatchMessageById'],
+      getGithubIssueEvidence: async () =>
+        acknowledgedAt
+          ? {
+              state: 'open',
+              updatedAt: acknowledgedAt,
+              labels: [],
+              assigneeCount: 0,
+              closedAt: null,
+              assignedAt: null,
+              activeStatusAt: null,
+              progressRecordedAt: acknowledgedAt,
+            }
+          : null,
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+    expect(world.journal.find(row => row.id === 'late-ack')?.grade).toBeNull();
+
+    acknowledgedAt = new Date(T0 + 30_000).toISOString();
+    world.nowMs = T0 + 30_000;
+    await tick(createTaskmasterState(60_000), deps);
+    expect(world.journal.find(row => row.id === 'late-ack')?.grade).toBe('useful');
+  });
+
+  test('missing dispatch rows are reported as grading failures', async () => {
+    for (const actionType of ['fire_cauldron', 'nudge', 'deliver_ruling'] as const) {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const key = `tm:${actionType}:missing-dispatch`;
+      world.journal.push({
+        id: `missing-${actionType}`,
+        created_at: new Date(T0 - 60_000).toISOString(),
+        thread_ref:
+          actionType === 'deliver_ruling' ? 'dispatch:missing-ruling' : 'gh:test/repo#404',
+        action_type: actionType,
+        proposal_json: '{}',
+        idempotency_key: key,
+        before_hash: null,
+        proof_predicate: 'evidence after send',
+        proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+      const result = await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          findEffectByIdempotencyKey: async () => ({
+            id: 'missing-effect',
+            status: 'queued',
+            createdAt: new Date(T0 - 30_000).toISOString(),
+          }),
+          getDispatchMessageById: async () => null,
+        })
       );
+
+      expect(result.failed).toBe(1);
+      expect(world.journal.find(row => row.id === `missing-${actionType}`)?.grade).toBeNull();
     }
   });
 
@@ -2132,6 +2222,44 @@ describe('SC7 grading requires external source progress', () => {
     await tick(createTaskmasterState(60_000), deps);
 
     expect(world.journal.find(row => row.id === 'cancelled-escalation')?.grade).toBe('noise');
+  });
+
+  test('cancelled ruling and digest effects are noise', async () => {
+    for (const actionType of ['deliver_ruling', 'digest'] as const) {
+      const world = makeWorld();
+      const key = `tm:${actionType}:cancelled`;
+      world.journal.push({
+        id: `cancelled-${actionType}`,
+        created_at: new Date(T0 - 60_000).toISOString(),
+        thread_ref:
+          actionType === 'deliver_ruling' ? 'dispatch:ruling-cancelled' : 'digest:cancelled',
+        action_type: actionType,
+        proposal_json: '{}',
+        idempotency_key: key,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          findEffectByIdempotencyKey: async effectKey =>
+            effectKey === key
+              ? {
+                  id: `cancelled-${actionType}-effect`,
+                  status: 'cancelled',
+                  createdAt: new Date(T0 - 30_000).toISOString(),
+                }
+              : null,
+        })
+      );
+
+      expect(world.journal.find(row => row.id === `cancelled-${actionType}`)?.grade).toBe('noise');
+    }
   });
 
   test('a post-send assignment event makes a P0 escalation useful', async () => {

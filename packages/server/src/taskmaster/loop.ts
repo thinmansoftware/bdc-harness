@@ -783,15 +783,25 @@ async function gradeSentActions(
         const effect = await findEffect(action.idempotency_key);
         if (!effect) continue;
         const dispatchRow = await getDispatchById(effect.id);
-        if (!dispatchRow) continue;
+        if (!dispatchRow) {
+          failures += 1;
+          log.warn(
+            { journalId: action.id, dispatchId: effect.id },
+            'taskmaster.dispatch_message_missing'
+          );
+          continue;
+        }
         const recipient = dispatchRow.resolved_recipient ?? dispatchRow.recipient;
         const assessment = await assessRecipient(recipient);
-        if (
-          dispatchRow.acknowledged_at === null ||
-          !assessment.ok ||
-          assessment.delivery_mode === 'drain_on_start'
-        ) {
+        const deadlineMs = action.proof_deadline_at ? Date.parse(action.proof_deadline_at) : NaN;
+        if (!assessment.ok || assessment.delivery_mode === 'drain_on_start') {
           await dal.gradeAction(action.id, 'unheard');
+          continue;
+        }
+        if (dispatchRow.acknowledged_at === null) {
+          if (Number.isFinite(deadlineMs) && nowMs >= deadlineMs) {
+            await dal.gradeAction(action.id, 'unheard');
+          }
           continue;
         }
         const proposal = JSON.parse(action.proposal_json) as ActionProposal & {
@@ -803,7 +813,6 @@ async function gradeSentActions(
         const run = await getFireRunEvidence(woId, cascadeId);
         const issue = await getIssueEvidence(action.thread_ref, action.created_at);
         const buildingAtMs = issue?.activeStatusAt ? Date.parse(issue.activeStatusAt) : NaN;
-        const deadlineMs = action.proof_deadline_at ? Date.parse(action.proof_deadline_at) : NaN;
         if (
           run?.status === 'completed' ||
           run?.prOpened === true ||
@@ -819,6 +828,10 @@ async function gradeSentActions(
       }
       const effect = await findEffect(action.idempotency_key);
       if (!effect) continue;
+      if (effect.status === 'cancelled') {
+        await dal.gradeAction(action.id, 'noise');
+        continue;
+      }
       if (action.action_type === 'digest') continue;
 
       const sentAtMs = Date.parse(effect.createdAt);
@@ -834,15 +847,24 @@ async function gradeSentActions(
           ? action.thread_ref.slice('dispatch:'.length)
           : '';
         const ruling = rulingId ? await getDispatchById(rulingId) : null;
-        if (!ruling) continue;
+        if (!ruling) {
+          failures += 1;
+          log.warn(
+            { journalId: action.id, dispatchId: rulingId || null },
+            'taskmaster.dispatch_message_missing'
+          );
+          continue;
+        }
         const recipient = ruling.resolved_recipient ?? ruling.recipient;
         const assessment = await assessRecipient(recipient);
-        if (
-          ruling.acknowledged_at === null ||
-          !assessment.ok ||
-          assessment.delivery_mode === 'drain_on_start'
-        ) {
+        if (!assessment.ok || assessment.delivery_mode === 'drain_on_start') {
           await dal.gradeAction(action.id, 'unheard');
+          continue;
+        }
+        if (ruling.acknowledged_at === null) {
+          if (Number.isFinite(deadlineMs) && nowMs >= deadlineMs) {
+            await dal.gradeAction(action.id, 'unheard');
+          }
           continue;
         }
         const addressedAtMs = ruling?.addressed_at ? Date.parse(ruling.addressed_at) : NaN;
@@ -856,19 +878,24 @@ async function gradeSentActions(
         }
       } else {
         const dispatchRow = await getDispatchById(effect.id);
-        if (!dispatchRow) continue;
+        if (!dispatchRow) {
+          failures += 1;
+          log.warn(
+            { journalId: action.id, dispatchId: effect.id },
+            'taskmaster.dispatch_message_missing'
+          );
+          continue;
+        }
         const recipient = dispatchRow.resolved_recipient ?? dispatchRow.recipient;
         const assessment = await assessRecipient(recipient);
-        if (
-          dispatchRow.acknowledged_at === null ||
-          !assessment.ok ||
-          assessment.delivery_mode === 'drain_on_start'
-        ) {
+        if (!assessment.ok || assessment.delivery_mode === 'drain_on_start') {
           await dal.gradeAction(action.id, 'unheard');
           continue;
         }
-        if (effect.status === 'cancelled') {
-          await dal.gradeAction(action.id, 'noise');
+        if (dispatchRow.acknowledged_at === null) {
+          if (Number.isFinite(deadlineMs) && nowMs >= deadlineMs) {
+            await dal.gradeAction(action.id, 'unheard');
+          }
           continue;
         }
         const issue = await getIssueEvidence(action.thread_ref, effect.createdAt);
