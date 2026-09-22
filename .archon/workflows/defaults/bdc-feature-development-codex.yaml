@@ -118,7 +118,7 @@ nodes:
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
       }
 
-      READ_SPEC_OUT=$(cat "$ARCHON_NODE_OUT/read-spec.out")
+      READ_SPEC_OUT=$read-spec.output
       ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
@@ -150,7 +150,7 @@ nodes:
     load_bearing: true
     bash: |
       set -euo pipefail
-      SPEC_TEXT=$(cat "$ARCHON_NODE_OUT/read-spec.out")
+      SPEC_TEXT=$read-spec.output
       SPEC_REPAIR_PR=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #\([0-9][0-9]*\)[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
       SPEC_REPAIR_BRANCH=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #[0-9][0-9]*[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
       if [ -z "$SPEC_REPAIR_PR" ] || [ -z "$SPEC_REPAIR_BRANCH" ]; then
@@ -286,7 +286,7 @@ nodes:
       # always fell through to PRECHECK_VERDICT=needs-build and no skip ever
       # happened. Mirrors the direct-assignment pattern that already works in
       # the bdc-harness-*.yaml lanes.
-      CAS=$(cat "$ARCHON_NODE_OUT/check-already-satisfied.out")
+      CAS=$check-already-satisfied.output
       if [[ $'\n'"$CAS" == *$'\n'ALREADY_SATISFIED=true* ]]; then
         SATISFIED_EVIDENCE=$(printf '%s\n' "$CAS" | sed -n 's/^SATISFIED_EVIDENCE=//p' | head -1)
         if [[ $'\n'"$CAS" == *$'\n'SATISFIED_ON_BASE=true* ]]; then
@@ -724,7 +724,7 @@ nodes:
       fi
       # read-spec output arrives shellQuote-wrapped by the executor; a direct assignment
       # lets bash unquote it. Never wrap it in a fixed-delimiter heredoc (bdc-harness #841).
-      _RS_OUT=$(cat "$ARCHON_NODE_OUT/read-spec.out")
+      _RS_OUT=$read-spec.output
       if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
         WO_ID=$(printf '%s\n' "$_RS_OUT" | sed -n 's/^WO_ID=//p' | head -1 || true)
         WO_ID=$(printf '%s' "$WO_ID" | tr -d '\r' | head -c 200)
@@ -1551,7 +1551,7 @@ nodes:
       }
       # ---- END rst core ----
 
-      SPEC=$(cat "$ARCHON_NODE_OUT/read-spec.out")
+      SPEC=$read-spec.output
       CLASS="$(printf '%s\n' "$SPEC" | rst_class)"
       EVIDENCE_DIR="${ARTIFACTS_DIR:-.}/evidence"
       mkdir -p "$EVIDENCE_DIR" 2>/dev/null || true
@@ -1958,7 +1958,7 @@ nodes:
       }
       # ---- END rsg core ----
 
-      SPEC=$(cat "$ARCHON_NODE_OUT/read-spec.out")
+      SPEC=$read-spec.output
       printf '%s\n' "$SPEC" | rsg_extract | rsg_run
       exit 0
 
@@ -2047,7 +2047,7 @@ nodes:
     depends_on: [read-spec]
     bash: |
       set -uo pipefail
-      SPEC_TEXT=$(cat "$ARCHON_NODE_OUT/read-spec.out")
+      SPEC_TEXT=$read-spec.output
       # Same 3 patterns decide-push-target's Base Branch Override section already
       # documents (plain header, markdown-bold, YAML field), in priority order.
       DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '^Base branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^Base branch:[[:space:]]*//')
@@ -3178,8 +3178,8 @@ nodes:
       # Direct assignment, never a heredoc: the executor substitutes $read-spec.output
       # shellQuote-wrapped (single-quoted, embedded quotes escaped), so untrusted spec
       # text can neither terminate a delimiter nor be evaluated by this shell.
-      SPEC_TEXT=$(cat "$ARCHON_NODE_OUT/read-spec.out")
-      CHECKOUT_OUTPUT=$(cat "$ARCHON_NODE_OUT/checkout-repair-target.out")
+      SPEC_TEXT=$read-spec.output
+      CHECKOUT_OUTPUT=$checkout-repair-target.output
       REPAIR_TARGET_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       REPAIR_TARGET_PR=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_pr:[[:space:]]*#\{0,1\}\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
       REPAIR_TARGET_PR_PRESENT=false
@@ -4399,7 +4399,7 @@ nodes:
       # -- Resolve the source GitHub issue and append a closing keyword to the PR
       #    body. This is deliberately added only to the PR body (not issue status),
       #    so GitHub closes the issue on merge rather than during the build.
-      READ_SPEC_OUT=$(cat "$ARCHON_NODE_OUT/read-spec.out")
+      READ_SPEC_OUT=$read-spec.output
       ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
@@ -4476,7 +4476,7 @@ nodes:
         exit 0
       fi
 
-      READ_SPEC_OUT=$(cat "$ARCHON_NODE_OUT/read-spec.out")
+      READ_SPEC_OUT=$read-spec.output
       ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
@@ -4520,7 +4520,7 @@ nodes:
         exit 0
       fi
 
-      READ_SPEC_OUT=$(cat "$ARCHON_NODE_OUT/read-spec.out")
+      READ_SPEC_OUT=$read-spec.output
       ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
@@ -4589,7 +4589,7 @@ nodes:
       fi
 
       # -- Resolve WO_ID (read-spec first, USER_MESSAGE fallback).
-      READ_SPEC_OUT=$(cat "$ARCHON_NODE_OUT/read-spec.out")
+      READ_SPEC_OUT=$read-spec.output
       WO_ID=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
       [ -z "$WO_ID" ] && WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -1 || true)
       if [ -z "$WO_ID" ]; then
