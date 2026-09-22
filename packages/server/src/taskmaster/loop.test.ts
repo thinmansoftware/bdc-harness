@@ -390,6 +390,25 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
       const found = world.sentMessages.find(m => m.idempotency_key === key);
       return found ? { id: 'existing', status: 'queued', createdAt: found.createdAt } : null;
     },
+    getDispatchMessageById: (async (id: string) => {
+      const found = world.sentMessages.find(m => id === 'existing' || m.idempotency_key === id);
+      return found
+        ? {
+            id,
+            recipient: found.recipient,
+            resolved_recipient: found.recipient,
+            acknowledged_at: found.createdAt,
+            addressed_at: null,
+            addressed_by: null,
+          }
+        : null;
+    }) as unknown as TaskmasterDeps['getDispatchMessageById'],
+    assessDispatchRecipient: async recipient => ({
+      ok: true,
+      canonical_principal: recipient,
+      delivery_mode: 'worker_poll',
+      reason: null,
+    }),
     listUndeliveredRulings: async () => [],
     listThreads: async () => [],
     // Default no-op evidence so adoption refresh never hits the network in unit tests.
@@ -1185,8 +1204,27 @@ describe('fire_cauldron loop', () => {
 
   test('grades completed fire useful and overdue running fire noise', async () => {
     for (const testCase of [
-      { id: 'completed-fire', status: 'completed', deadline: T0 + 60_000, grade: 'useful' },
-      { id: 'overdue-running-fire', status: 'running', deadline: T0 - 1, grade: 'noise' },
+      {
+        id: 'completed-fire',
+        status: 'completed',
+        deadline: T0 + 60_000,
+        deliveryMode: 'worker_poll',
+        grade: 'useful',
+      },
+      {
+        id: 'overdue-running-fire',
+        status: 'running',
+        deadline: T0 - 1,
+        deliveryMode: 'worker_poll',
+        grade: 'noise',
+      },
+      {
+        id: 'unheard-completed-fire',
+        status: 'completed',
+        deadline: T0 + 60_000,
+        deliveryMode: 'drain_on_start',
+        grade: 'unheard',
+      },
     ] as const) {
       const world = makeWorld();
       seedDigestSent(world);
@@ -1208,6 +1246,12 @@ describe('fire_cauldron loop', () => {
         graded_at: null,
         grade: null,
       });
+      world.sentMessages.push({
+        idempotency_key: `tm:fire:${testCase.id}`,
+        recipient: 'operator',
+        body: 'fire',
+        createdAt: new Date(T0 - 45_000).toISOString(),
+      });
       let evidenceCalls = 0;
       await tick(
         createTaskmasterState(60_000),
@@ -1216,9 +1260,15 @@ describe('fire_cauldron loop', () => {
             evidenceCalls += 1;
             return { status: testCase.status, prOpened: false };
           },
+          assessDispatchRecipient: async recipient => ({
+            ok: true,
+            canonical_principal: recipient,
+            delivery_mode: testCase.deliveryMode,
+            reason: null,
+          }),
         })
       );
-      expect(evidenceCalls).toBe(1);
+      expect(evidenceCalls).toBe(testCase.grade === 'unheard' ? 0 : 1);
       expect(world.journal.find(row => row.id === testCase.id)?.grade).toBe(testCase.grade);
     }
   });
@@ -1903,7 +1953,7 @@ describe('SC7 grading requires external source progress', () => {
     expect(world.journal.find(row => row.id === 'pre-send-progress-nudge')?.grade).toBeNull();
   });
 
-  test('unacknowledged, acknowledged-only, and auto-addressed rulings are not useful', async () => {
+  test('unacknowledged rulings are unheard; acknowledgement alone is not useful', async () => {
     const cases = [
       { name: 'unacknowledged', acknowledged_at: null, addressed_at: null, addressed_by: null },
       {
@@ -1958,8 +2008,80 @@ describe('SC7 grading requires external source progress', () => {
 
       await tick(createTaskmasterState(60_000), deps);
 
-      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBeNull();
+      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBe(
+        testCase.acknowledged_at === null ? 'unheard' : null
+      );
     }
+  });
+
+  test('acknowledgement by a drain-on-start principal is unheard', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:nudge:gh:test/repo#unheard-drainer:1';
+    world.journal.push({
+      id: 'draining-ack',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:test/repo#unheard-drainer',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'progress after send',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'operator',
+      body: 'nudge',
+      createdAt: new Date(T0 - 30_000).toISOString(),
+    });
+
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        assessDispatchRecipient: async recipient => ({
+          ok: true,
+          canonical_principal: recipient,
+          delivery_mode: 'drain_on_start',
+          reason: null,
+        }),
+      })
+    );
+
+    expect(world.journal.find(row => row.id === 'draining-ack')?.grade).toBe('unheard');
+  });
+
+  test('unheard grades are excluded from the useful-rate floor denominator', async () => {
+    const world = makeWorld();
+    for (let i = 0; i < 62; i += 1) {
+      world.journal.push({
+        id: `unheard-${i}`,
+        created_at: new Date(T0 + i + 1).toISOString(),
+        thread_ref: `gh:test/repo#unheard-${i}`,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        idempotency_key: `unheard-${i}`,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: null,
+        outcome: 'sent',
+        graded_at: new Date(T0 + i + 1).toISOString(),
+        grade: 'unheard',
+      });
+    }
+    world.journal.push({
+      ...world.journal[0]!,
+      id: 'only-useful',
+      idempotency_key: 'only-useful',
+      grade: 'useful',
+    });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.control.pause_state).toBe('RUNNING');
   });
 
   test('a cancelled effect is noise and an unchanged P0 source is not useful', async () => {
@@ -1989,6 +2111,12 @@ describe('SC7 grading requires external source progress', () => {
               createdAt: new Date(T0 - 45_000).toISOString(),
             }
           : null,
+      getDispatchMessageById: (async () => ({
+        id: 'cancelled-effect',
+        recipient: 'operator',
+        resolved_recipient: 'operator',
+        acknowledged_at: new Date(T0 - 40_000).toISOString(),
+      })) as unknown as TaskmasterDeps['getDispatchMessageById'],
       getGithubIssueEvidence: async () => ({
         state: 'open',
         updatedAt: new Date(T0 - 60_000).toISOString(),

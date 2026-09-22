@@ -484,7 +484,7 @@ export class SqliteAdapter implements IDatabase {
             proof_deadline_at TEXT,
             outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
             graded_at TEXT,
-            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful'))
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
           );
           INSERT INTO tm_journal_new SELECT * FROM tm_journal;
           DROP TABLE tm_journal;
@@ -2196,7 +2196,7 @@ export class SqliteAdapter implements IDatabase {
           outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')
         ),
         graded_at TEXT,
-        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful'))
+        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
       );
 
       CREATE TABLE IF NOT EXISTS tm_control (

@@ -12,16 +12,23 @@
  *
  * Budgets (ratified Q1): max 10 effects/tick, 1 effect/item/tick, max 3
  * automated interventions per item per 24h.
+ *
+ * M-155 Amendment 03 adds the `unheard` grade: a sent action is unheard
+ * unless its dispatch was acknowledged by a principal whose delivery mode is
+ * not `drain_on_start`. The override applies uniformly to deliver_ruling,
+ * nudge, escalate_p0, and fire_cauldron actions.
  */
 import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import {
+  assessDispatchRecipient,
   createAuthenticatedMessage,
   getMessage,
   listMessages,
   type CreateAuthenticatedMessageData,
+  type DispatchRecipientAssessment,
   type DispatchMessage,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
@@ -176,6 +183,7 @@ export interface TaskmasterDeps {
     key: string
   ) => Promise<{ id: string; status: string; createdAt: string } | null>;
   getDispatchMessageById?: (id: string) => Promise<DispatchMessage | null>;
+  assessDispatchRecipient?: (recipient: string) => Promise<DispatchRecipientAssessment>;
   getGithubIssueEvidence?: (
     threadRef: string,
     sinceIso: string
@@ -764,13 +772,28 @@ async function gradeSentActions(
   getDispatchById: NonNullable<TaskmasterDeps['getDispatchMessageById']>,
   getIssueEvidence: NonNullable<TaskmasterDeps['getGithubIssueEvidence']>,
   nowMs: number,
-  getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>
+  getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>,
+  assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>
 ): Promise<number> {
   let failures = 0;
   for (const action of actions) {
     if (action.outcome !== 'sent' || action.grade !== null || !action.idempotency_key) continue;
     try {
       if (action.action_type === 'fire_cauldron') {
+        const effect = await findEffect(action.idempotency_key);
+        if (!effect) continue;
+        const dispatchRow = await getDispatchById(effect.id);
+        if (!dispatchRow) continue;
+        const recipient = dispatchRow.resolved_recipient ?? dispatchRow.recipient;
+        const assessment = await assessRecipient(recipient);
+        if (
+          dispatchRow.acknowledged_at === null ||
+          !assessment.ok ||
+          assessment.delivery_mode === 'drain_on_start'
+        ) {
+          await dal.gradeAction(action.id, 'unheard');
+          continue;
+        }
         const proposal = JSON.parse(action.proposal_json) as ActionProposal & {
           cascadeId?: string;
         };
@@ -796,10 +819,6 @@ async function gradeSentActions(
       }
       const effect = await findEffect(action.idempotency_key);
       if (!effect) continue;
-      if (effect.status === 'cancelled') {
-        await dal.gradeAction(action.id, 'noise');
-        continue;
-      }
       if (action.action_type === 'digest') continue;
 
       const sentAtMs = Date.parse(effect.createdAt);
@@ -815,10 +834,20 @@ async function gradeSentActions(
           ? action.thread_ref.slice('dispatch:'.length)
           : '';
         const ruling = rulingId ? await getDispatchById(rulingId) : null;
+        if (!ruling) continue;
+        const recipient = ruling.resolved_recipient ?? ruling.recipient;
+        const assessment = await assessRecipient(recipient);
+        if (
+          ruling.acknowledged_at === null ||
+          !assessment.ok ||
+          assessment.delivery_mode === 'drain_on_start'
+        ) {
+          await dal.gradeAction(action.id, 'unheard');
+          continue;
+        }
         const addressedAtMs = ruling?.addressed_at ? Date.parse(ruling.addressed_at) : NaN;
         const expectedRecipient = ruling?.resolved_recipient ?? ruling?.recipient;
         if (
-          ruling &&
           ruling.addressed_by === expectedRecipient &&
           Number.isFinite(addressedAtMs) &&
           addressedAtMs >= sentAtMs
@@ -826,6 +855,22 @@ async function gradeSentActions(
           usefulAtMs = addressedAtMs;
         }
       } else {
+        const dispatchRow = await getDispatchById(effect.id);
+        if (!dispatchRow) continue;
+        const recipient = dispatchRow.resolved_recipient ?? dispatchRow.recipient;
+        const assessment = await assessRecipient(recipient);
+        if (
+          dispatchRow.acknowledged_at === null ||
+          !assessment.ok ||
+          assessment.delivery_mode === 'drain_on_start'
+        ) {
+          await dal.gradeAction(action.id, 'unheard');
+          continue;
+        }
+        if (effect.status === 'cancelled') {
+          await dal.gradeAction(action.id, 'noise');
+          continue;
+        }
         const issue = await getIssueEvidence(action.thread_ref, effect.createdAt);
         if (issue) {
           const closedAtMs = issue.closedAt ? Date.parse(issue.closedAt) : NaN;
@@ -1043,6 +1088,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   const createTask = deps.createTask ?? createAuthenticatedMessage;
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
+  const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
   const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
   const executeCascade = deps.runCascade ?? runCascade;
@@ -1151,7 +1197,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     getDispatchById,
     getIssueEvidence,
     nowMs,
-    getFireRunEvidence
+    getFireRunEvidence,
+    assessRecipient
   );
 
   // M-155 Q3: useful-rate floor with auto-PAUSE. Counted AFTER

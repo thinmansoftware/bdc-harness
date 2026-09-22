@@ -136,6 +136,21 @@ When a nudge causes progress, record that evidence on the source GitHub issue
 with an exact first-line marker of `[PROGRESS]` or `[BLOCKED]`. Taskmaster ignores
 its own outbound dispatch row as proof of progress.
 
+### Action grades
+
+M-155 Amendment 03 distinguishes evidence quality from channel audibility:
+
+| Grade     | Meaning                                                                                                       | Useful-rate denominator |
+| --------- | ------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| `useful`  | A non-draining recipient acknowledged the dispatch and downstream evidence moved before the deadline.         | Included                |
+| `noise`   | A non-draining recipient acknowledged the dispatch, but downstream evidence did not move before the deadline. | Included                |
+| `unheard` | The dispatch was not acknowledged, or its principal uses `drain_on_start`.                                    | Excluded                |
+
+The `unheard` override applies uniformly to `deliver_ruling`, `nudge`,
+`escalate_p0`, and `fire_cauldron`. Digests remain ungraded. This keeps the 40%
+floor focused on messages a human-facing principal could actually evaluate;
+resuming after a floor pause remains an operator decision.
+
 ## Pause (John or operator)
 
 ```bash

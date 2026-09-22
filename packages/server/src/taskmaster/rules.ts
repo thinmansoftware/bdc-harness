@@ -114,6 +114,8 @@ export const USEFUL_RATE_MIN_GRADED = 20;
  * Pure floor test: true when the graded sample is large enough AND the
  * useful share of graded actions is strictly below USEFUL_RATE_FLOOR.
  * Exactly 40% does not breach (the ruling says "floor", not "must exceed").
+ * The caller counts only `useful` and `noise`; `unheard` actions are excluded
+ * from both counts and therefore from the floor denominator (M-155 Amendment 03).
  */
 export function usefulRateFloorBreached(usefulCount: number, noiseCount: number): boolean {
   const graded = usefulCount + noiseCount;
