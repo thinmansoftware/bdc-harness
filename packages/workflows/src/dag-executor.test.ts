@@ -2169,28 +2169,84 @@ describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-
   it('round 6: nested parens inside arithmetic $(( (1<<2) + 1 )) are balanced', () => {
     expect(run(['z=$(( (1<<2) + 1 ))', TOKEN].join('\n'))).toEqual(['z=$(( (1<<2) + 1 ))', TOKEN]);
   });
-  it('round 6: arithmetic followed by a real heredoc on the same line still opens it', () => {
+  // FAIL-SAFE (round 11): a line carrying "((", "$(" or a backtick is not plainly
+  // simple, so it never opens a heredoc; the body's "#"-leading token stays literal.
+  it('fail-safe: arithmetic beside a heredoc on the same line: heredoc NOT opened, token literal', () => {
     expect(run(['echo $((1<<2)) <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
       'echo $((1<<2)) <<EOF',
-      SUBST,
+      TOKEN,
       'EOF',
       TOKEN,
     ]);
   });
-  it('round 6: a real heredoc followed by arithmetic on the same line opens exactly one heredoc', () => {
+  it('fail-safe: heredoc followed by arithmetic on the same line: heredoc NOT opened, token literal', () => {
     expect(run(['cat <<EOF $((1<<2))', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
       'cat <<EOF $((1<<2))',
-      SUBST,
+      TOKEN,
       'EOF',
       TOKEN,
     ]);
   });
-  it('round 6: a subshell $( ... ) is not arithmetic, so a heredoc inside it opens', () => {
+  it('fail-safe: a heredoc inside a $( ... ) subshell is NOT tracked; leading-# body line stays literal', () => {
     expect(run(['X=$(cat <<EOF', TOKEN, 'EOF', ')', TOKEN].join('\n'))).toEqual([
       'X=$(cat <<EOF',
-      SUBST,
+      TOKEN,
       'EOF',
       ')',
+      TOKEN,
+    ]);
+  });
+  it('fail-safe: a heredoc inside a $( ... ) subshell still substitutes non-comment body lines (lane manifest shape)', () => {
+    const script = [
+      "MANIFEST=$(capture_node_output <<'M'",
+      '$spec.output',
+      'READ_SPEC_OUT=$spec.output',
+      'M',
+      ')',
+    ].join('\n');
+    expect(run(script)).toEqual([
+      "MANIFEST=$(capture_node_output <<'M'",
+      "'v'",
+      "READ_SPEC_OUT='v'",
+      'M',
+      ')',
+    ]);
+  });
+  it('fail-safe: a backtick on the line means no heredoc opens', () => {
+    expect(run(['echo `date` <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo `date` <<EOF',
+      TOKEN,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('fail-safe: the round-11 construct -- nested $( ) with quoted parens inside $(( )) -- never opens a heredoc', () => {
+    const line = "x=$(( $(printf '%s' '))' >/dev/null; echo 1) << 2 ))";
+    expect(run([line, TOKEN].join('\n'))).toEqual([line, TOKEN]);
+  });
+  it('fail-safe: a heredoc opened while carried state is unclean is NOT tracked', () => {
+    expect(run(['echo "a', 'b" ; cat <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo "a',
+      'b" ; cat <<EOF',
+      TOKEN,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('fail-safe: a heredoc open on a line that ENDS with an unclosed quote is NOT tracked', () => {
+    expect(run(['cat <<EOF "x', TOKEN, 'y"', 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<EOF "x',
+      TOKEN,
+      'y"',
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('fail-safe: a plainly simple heredoc still opens and its body is substituted (round 1 preserved)', () => {
+    expect(run(['cat <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<EOF',
+      SUBST,
+      'EOF',
       TOKEN,
     ]);
   });
@@ -2341,10 +2397,12 @@ describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-
       TOKEN,
     ]);
   });
-  it('round 9: a line that starts inside a multi-line string is data: # is not a comment, token substitutes', () => {
+  it('round 9 / fail-safe: a #-leading line inside a multi-line string is treated as a comment (token literal)', () => {
+    // Bash would treat it as string data, but the fresh-state parse calls it a comment
+    // and the conservative cut wins: literal, never a spill.
     expect(run(['echo "start', '# $spec.output', 'end"'].join('\n'))).toEqual([
       'echo "start',
-      SUBST,
+      TOKEN,
       'end"',
     ]);
   });
@@ -2415,12 +2473,10 @@ describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-
       TOKEN,
     ]);
   });
-  it('round 10: a comment line while arithmetic is still open is expression text, not a comment', () => {
-    // Bash: inside $(( )) a "#" is not a comment marker; the token is substituted as
-    // expression text (garbage in bash either way, but it never becomes a spilled line).
+  it('round 10 / fail-safe: a #-leading line inside open arithmetic is treated as a comment (token literal)', () => {
     expect(run(['x=$((1', '# $spec.output', '+ 2))'].join('\n'))).toEqual([
       'x=$((1',
-      SUBST,
+      TOKEN,
       '+ 2))',
     ]);
   });

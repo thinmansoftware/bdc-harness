@@ -1543,13 +1543,38 @@ export function substituteNodeOutputRefs(
       // (line.length when there is none). Everything from there on is left byte-identical
       // -- Overseer round 8 on #862: `echo ok # $spec.output` substituted a multi-line
       // value into a TRAILING comment, and lines 2..N spilled into executable code.
-      const reduced =
+      // FAIL-SAFE INVARIANT (round 11 on #862): every classification error must fall on
+      // the side of "token left literal", never "token substituted into a comment".
+      //   (a) Comment cut = the EARLIEST "#" that either the carried-state parse or a
+      //       fresh-state parse (quotes/arithmetic reset) calls a comment. If the two
+      //       disagree, the more conservative one wins: a real string containing "#"
+      //       may lose a substitution; a real comment can never gain one.
+      //   (b) A heredoc may open only on a plainly simple line: no "$(", "((", or
+      //       backtick anywhere, and clean quote/arithmetic state at both the start and
+      //       the end of the line. Anything more exotic never opens a heredoc, so its
+      //       body's "#"-leading lines are treated as comments (left literal) instead of
+      //       being substituted on the strength of a lexer guess.
+      const cleanState: ShellQuoteState = { inSingle: false, inDouble: false, arithDepth: 0 };
+      const isClean = (st: ShellQuoteState): boolean =>
+        !st.inSingle && !st.inDouble && st.arithDepth === 0;
+      const carried =
         heredocStack.length === 0
           ? reduceToUnquotedUncommentedCode(line, quoteState)
           : { code: line, commentStart: line.length, state: quoteState };
+      const fresh =
+        heredocStack.length === 0 && !isClean(quoteState)
+          ? reduceToUnquotedUncommentedCode(line, cleanState)
+          : carried;
+      const reduced = {
+        code: carried.code,
+        commentStart: Math.min(carried.commentStart, fresh.commentStart),
+        state: carried.state,
+      };
       quoteState = reduced.state;
       const isCommentLine =
         heredocStack.length === 0 && line.slice(0, reduced.commentStart).trim() === '';
+      const isPlainlySimpleLine =
+        !/\$\(|\(\(|`/.test(line) && isClean(carried.state) && isClean(fresh.state);
 
       // Track heredoc opens on this line (only outside a heredoc body and not on a comment).
       // Format: << [-]? WORD, where WORD is any shell word: a single- or double-quoted
@@ -1566,7 +1591,7 @@ export function substituteNodeOutputRefs(
       // offsets, so the DELIMITER WORD is then read from the original line at that
       // offset by readHeredocDelimiter, which applies full bash quote removal
       // (Overseer round 5 on #862: E"OF", EO\F, 'E'OF all terminate on EOF).
-      if (heredocStack.length === 0 && !isCommentLine) {
+      if (heredocStack.length === 0 && !isCommentLine && isPlainlySimpleLine) {
         const reducedLine = reduced.code;
         const heredocOpRegex = /(?<!<)<<(?!<)(-)?/g;
         let opMatch: RegExpExecArray | null;
