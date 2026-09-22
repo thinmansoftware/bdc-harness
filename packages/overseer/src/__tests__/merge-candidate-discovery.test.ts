@@ -15,7 +15,9 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import {
   classifyDiscoveredPullRequest,
   classifyPullRequestEvidence,
+  describeDiscoveryConfiguration,
   discoverMergeCandidates,
+  logDiscoveryConfigurationAtStartup,
   pullRequestKey,
   resetDiscoveryCursorForTests,
   resolveDiscoveryRepos,
@@ -1187,5 +1189,250 @@ describe('discovery evaluation window -- rotation and fairness', () => {
     expect(first.exclusions.map(e => e.prNumber)).toEqual([1000, 1001, 1002]);
     // Advanced on its own -- the defect was that this repeated 1000-1002 forever.
     expect(second.exclusions.map(e => e.prNumber)).toEqual([1003, 1004, 1005]);
+  });
+});
+
+/**
+ * SILENT UNAVAILABLE (2026-09-22, the two-week blind coordinator).
+ *
+ * From 2026-09-08 (bdc-harness#776 merged and deployed) to 2026-09-22 every
+ * heartbeat on archon-app-1 read `prsTotalOpen:0 prDiscoveryUnavailable:true`
+ * while `gh pr list` showed 30 open PRs, four of them APPROVED + CLEAN. The
+ * sweep was enabled, wired, and never threw: OVERSEER_MERGE_DISCOVERY_REPOS
+ * was simply never set, so `resolveDiscoveryRepos()` returned [] and the
+ * sweep returned an anonymous EMPTY_RESULT with no log line at all. The
+ * `discovery_failed_isolated` catch in watch.ts fired zero times because
+ * nothing failed -- the code did exactly what it was told, over zero repos.
+ *
+ * These tests pin that every unavailable exit NAMES its reason, WARNS, and is
+ * visibly distinct on the heartbeat from a healthy "no open PRs" tick.
+ */
+type LoggedLine = { level: 'info' | 'warn'; obj: Record<string, unknown>; msg: string };
+function captureLogger(): {
+  logged: LoggedLine[];
+  logger: {
+    info(obj: Record<string, unknown>, msg: string): void;
+    warn(obj: Record<string, unknown>, msg: string): void;
+  };
+} {
+  const logged: LoggedLine[] = [];
+  return {
+    logged,
+    logger: {
+      info: (obj, msg) => logged.push({ level: 'info', obj, msg }),
+      warn: (obj, msg) => logged.push({ level: 'warn', obj, msg }),
+    },
+  };
+}
+
+describe('merge candidate discovery -- unavailable is never silent', () => {
+  beforeEach(() => {
+    resetDiscoveryCursorForTests();
+  });
+
+  // THE ROOT CAUSE. An empty repo list must never read as "0 open PRs".
+  test('an empty repo list reports no_repos_configured at warn, not an empty healthy sweep', async () => {
+    const { logged, logger } = captureLogger();
+    let listed = 0;
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => {
+          listed += 1;
+          return [pr({ prNumber: 2172 })];
+        },
+        findPullRequest: async () => greenEvidence(2172),
+      },
+      { watchedBases: WATCHED_BASES, repos: [], logger }
+    );
+
+    expect(result.unavailable).toBe(true);
+    expect(result.unavailableReason).toBe('no_repos_configured');
+    expect(listed).toBe(0);
+    const warn = logged.find(entry => entry.msg === 'merge-coordinator.discovery_unavailable');
+    expect(warn?.level).toBe('warn');
+    expect(warn?.obj.reason).toBe('no_repos_configured');
+    expect(String(warn?.obj.remedy)).toContain('OVERSEER_MERGE_DISCOVERY_REPOS');
+  });
+
+  test('the env default with the repos var unset resolves to zero repos (the live 2026-09-22 state)', () => {
+    expect(resolveDiscoveryRepos(undefined)).toEqual([]);
+    expect(resolveDiscoveryRepos('')).toEqual([]);
+    const report = describeDiscoveryConfiguration({} as NodeJS.ProcessEnv);
+    expect(report.configured).toBe(false);
+    expect(report.repos).toEqual([]);
+  });
+
+  test('startup announces an unconfigured repo list at warn and a configured one at info', () => {
+    const unset = captureLogger();
+    logDiscoveryConfigurationAtStartup(unset.logger, {} as NodeJS.ProcessEnv);
+    const warn = unset.logged.find(
+      entry => entry.msg === 'merge-coordinator.discovery_unconfigured_at_startup'
+    );
+    expect(warn?.level).toBe('warn');
+    expect(warn?.obj.reason).toBe('no_repos_configured');
+
+    const set = captureLogger();
+    const report = logDiscoveryConfigurationAtStartup(set.logger, {
+      OVERSEER_MERGE_DISCOVERY_REPOS: 'thinmansoftware/bdc-xo,thinmansoftware/bdc-harness',
+      MERGE_MANAGER_ALLOWED_BASES: 'dev,staging',
+    } as NodeJS.ProcessEnv);
+    expect(report.configured).toBe(true);
+    expect(report.repos).toHaveLength(2);
+    const info = set.logged.find(entry => entry.msg === 'merge-coordinator.discovery_configured');
+    expect(info?.level).toBe('info');
+    expect(info?.obj.repos).toEqual(['thinmansoftware/bdc-xo', 'thinmansoftware/bdc-harness']);
+    expect(set.logged.some(entry => entry.level === 'warn')).toBe(false);
+  });
+
+  test('a missing list dep reports no_list_dep at warn', async () => {
+    const { logged, logger } = captureLogger();
+    const result = await discoverMergeCandidates(
+      { findPullRequest: async () => greenEvidence(1) },
+      { watchedBases: WATCHED_BASES, repos: REPOS, logger }
+    );
+    expect(result.unavailableReason).toBe('no_list_dep');
+    expect(
+      logged.find(entry => entry.msg === 'merge-coordinator.discovery_unavailable')?.obj.reason
+    ).toBe('no_list_dep');
+  });
+
+  // A swallowed listing error is the other way discovery could go quiet.
+  test('a repo listing that throws is logged with its cause, never swallowed', async () => {
+    const { logged, logger } = captureLogger();
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async input => {
+          if (input.repo === 'broken') throw new Error('Bad credentials (401)');
+          return [pr({ prNumber: 2166 })];
+        },
+        findPullRequest: async () => greenEvidence(2166),
+      },
+      {
+        watchedBases: WATCHED_BASES,
+        repos: [
+          { owner: OWNER, repo: 'broken' },
+          { owner: OWNER, repo: REPO },
+        ],
+        logger,
+      }
+    );
+
+    expect(result.unavailable).toBe(false);
+    expect(result.candidates).toHaveLength(1);
+    const failed = logged.find(
+      entry => entry.msg === 'merge-coordinator.discovery_repo_listing_failed'
+    );
+    expect(failed?.level).toBe('warn');
+    expect(failed?.obj.repo).toBe('broken');
+    expect(failed?.obj.err).toBe('Bad credentials (401)');
+  });
+
+  test('every repo listing failing reports all_repo_listings_failed with the repo names', async () => {
+    const { logged, logger } = captureLogger();
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => {
+          throw new Error('token revoked');
+        },
+        findPullRequest: async () => greenEvidence(1),
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS, logger }
+    );
+    expect(result.unavailable).toBe(true);
+    expect(result.unavailableReason).toBe('all_repo_listings_failed');
+    const warn = logged.find(entry => entry.msg === 'merge-coordinator.discovery_unavailable');
+    expect(warn?.obj.failedRepos).toEqual([`${OWNER}/${REPO}`]);
+  });
+
+  test('a healthy sweep reports unavailableReason null and no unavailable warn', async () => {
+    const { logged, logger } = captureLogger();
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [],
+        findPullRequest: async () => greenEvidence(1),
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS, logger }
+    );
+    expect(result.unavailable).toBe(false);
+    expect(result.unavailableReason).toBeNull();
+    expect(result.totalOpen).toBe(0);
+    expect(logged.some(entry => entry.msg === 'merge-coordinator.discovery_unavailable')).toBe(
+      false
+    );
+  });
+});
+
+describe('watchOnce -- an unavailable sweep is distinct from a healthy empty one', () => {
+  const baseDeps = {
+    listRunsForWatch: async () => [],
+    listRunEvents: async () => [],
+    findPullRequest: async () => greenEvidence(1),
+    mergePullRequest: async () => ({ merged: true }),
+  };
+
+  beforeEach(() => {
+    resetDiscoveryCursorForTests();
+  });
+
+  test('the live defect: zero configured repos warns every tick and names the reason on the heartbeat', async () => {
+    const { logged, logger } = captureLogger();
+    await watchOnce(
+      { ...baseDeps, listOpenPullRequests: async () => [pr({ prNumber: 2148 })] },
+      { logger, discovery: { watchedBases: WATCHED_BASES, repos: [] } }
+    );
+
+    const heartbeat = logged.find(entry => entry.msg === 'merge-coordinator.heartbeat_evaluated');
+    expect(heartbeat?.obj.prDiscoveryUnavailable).toBe(true);
+    expect(heartbeat?.obj.prDiscoveryUnavailableReason).toBe('no_repos_configured');
+    expect(heartbeat?.obj.prsTotalOpen).toBe(0);
+
+    const warn = logged.find(
+      entry => entry.msg === 'merge-coordinator.discovery_unavailable_heartbeat'
+    );
+    expect(warn?.level).toBe('warn');
+    expect(warn?.obj.reason).toBe('no_repos_configured');
+    expect(String(warn?.obj.remedy)).toContain('OVERSEER_MERGE_DISCOVERY_REPOS');
+  });
+
+  test('a genuinely empty repo produces NO unavailable warn and a null reason', async () => {
+    const { logged, logger } = captureLogger();
+    await watchOnce(
+      { ...baseDeps, listOpenPullRequests: async () => [] },
+      { logger, discovery: { watchedBases: WATCHED_BASES, repos: REPOS } }
+    );
+    const heartbeat = logged.find(entry => entry.msg === 'merge-coordinator.heartbeat_evaluated');
+    expect(heartbeat?.obj.prDiscoveryUnavailable).toBe(false);
+    expect(heartbeat?.obj.prDiscoveryUnavailableReason).toBeNull();
+    expect(heartbeat?.obj.prsTotalOpen).toBe(0);
+    expect(logged.some(entry => entry.level === 'warn')).toBe(false);
+  });
+
+  test('a throwing listing is reported as all_repo_listings_failed on the heartbeat, not as healthy', async () => {
+    const { logged, logger } = captureLogger();
+    await watchOnce(
+      {
+        ...baseDeps,
+        listOpenPullRequests: async () => {
+          throw new Error('sweep exploded');
+        },
+      },
+      { logger, discovery: { watchedBases: WATCHED_BASES, repos: REPOS } }
+    );
+    const heartbeat = logged.find(entry => entry.msg === 'merge-coordinator.heartbeat_evaluated');
+    expect(heartbeat?.obj.prDiscoveryUnavailable).toBe(true);
+    expect(heartbeat?.obj.prDiscoveryUnavailableReason).toBe('all_repo_listings_failed');
+    expect(
+      logged.some(entry => entry.msg === 'merge-coordinator.discovery_unavailable_heartbeat')
+    ).toBe(true);
+  });
+
+  test('discoveryEnabled=false reports not_run, never a healthy zero', async () => {
+    const { logged, logger } = captureLogger();
+    await watchOnce(
+      { ...baseDeps, listOpenPullRequests: async () => [pr({ prNumber: 2164 })] },
+      { logger, discoveryEnabled: false, discovery: { watchedBases: WATCHED_BASES, repos: REPOS } }
+    );
+    const heartbeat = logged.find(entry => entry.msg === 'merge-coordinator.heartbeat_evaluated');
+    expect(heartbeat?.obj.prDiscoveryUnavailableReason).toBe('not_run');
   });
 });

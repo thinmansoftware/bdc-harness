@@ -63,7 +63,10 @@ export { assembleQualifiedMergeEvidence, coordinateMergeReady } from './merge-co
 export {
   classifyDiscoveredPullRequest,
   classifyPullRequestEvidence,
+  describeDiscoveryConfiguration,
+  describeDiscoveryUnavailableReason,
   discoverMergeCandidates,
+  logDiscoveryConfigurationAtStartup,
   resolveDiscoveryRepos,
   resolveWatchedBaseBranches,
   summarizeExclusions,
