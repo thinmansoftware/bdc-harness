@@ -189,6 +189,29 @@ async function getWorktreeLastCommitDate(
   }
 }
 
+/**
+ * Decide the age of a worktree using DURABLE evidence only, never directory mtime.
+ *
+ * Directory mtime is not evidence of real activity: a git operation, a container
+ * restart, a filesystem scan, or any stray write refreshes it, which can make a
+ * months-dead worktree look brand new forever (the 2026-09-22 production incident --
+ * 70 worktrees scanned, 0 reclaimed, every one skipped with `env_inside_orphan_age`
+ * because dirStat.mtime kept outvoting the real signals).
+ *
+ * Precedence, most trustworthy first:
+ *   1. Last commit date -- real work happened, verified via git log.
+ *   2. Env row's created_at -- the environment is provably that old at minimum.
+ * If NEITHER exists (no commits ever made, no env row at all -- the "no-git"
+ * class from the incident), there is no durable signal: treat the worktree as
+ * having no recorded activity (returns null), which callers must treat as
+ * immediately eligible for reclamation once the active-session check has
+ * already cleared it. Directory mtime never participates in this decision --
+ * it cannot resurrect a dead worktree, and it cannot preserve one either.
+ */
+function durableActivityDate(lastCommitDate: Date | null, envCreatedAt: Date | null): Date | null {
+  return newestDate(lastCommitDate, envCreatedAt);
+}
+
 async function hasActiveSessionForEnvironment(
   envId: string,
   getConversationsUsingEnv: (envId: string) => Promise<string[]>,
@@ -390,8 +413,13 @@ export async function sweepTerminalWorkflowWorktrees(
         const lastCommitDate = await getWorktreeLastCommitDate(worktreeDir, getLastCommitDateFn);
         const envCreatedAt =
           env.created_at instanceof Date ? env.created_at : new Date(env.created_at);
-        const newestActivity = newestDate(envCreatedAt, lastCommitDate, dirStat.mtime);
-        const ageMs = newestActivity ? now.getTime() - newestActivity.getTime() : 0;
+        // Directory mtime deliberately does NOT participate here -- see durableActivityDate().
+        // A no-git worktree with no commits falls back to envCreatedAt, which is still real
+        // evidence (the environment row itself has a provable creation time); only in the
+        // theoretical case where neither exists does this collapse to "no evidence", and an
+        // absent active session (already checked above) means it is immediately reclaimable.
+        const activityDate = durableActivityDate(lastCommitDate, envCreatedAt);
+        const ageMs = activityDate ? now.getTime() - activityDate.getTime() : Infinity;
         if (ageMs <= orphanAgeMs) {
           report.skipped.push({ path: worktreeDir, reason: 'env_inside_orphan_age' });
           getLog().warn(
@@ -470,7 +498,17 @@ export async function sweepTerminalWorkflowWorktrees(
         continue;
       }
 
-      if (now.getTime() - dirStat.mtime.getTime() <= orphanAgeMs) {
+      // No run row AND no env row: Archon's own bookkeeping has nothing on this
+      // worktree at all. There is no created_at to fall back on here (that only
+      // exists on an env row), so the only durable signal available is the last
+      // commit date. A worktree with real commits is judged on those, never on
+      // mtime -- mtime cannot keep a committed-and-abandoned worktree alive past
+      // its real age. Only in the true no-git case (no commits ever made, e.g. a
+      // worktree that died mid-checkout or was never used) does mtime still apply,
+      // as a last resort, since there is no other evidence at all to judge it by.
+      const lastCommitDate = await getWorktreeLastCommitDate(worktreeDir, getLastCommitDateFn);
+      const activityDate = lastCommitDate ?? dirStat.mtime;
+      if (now.getTime() - activityDate.getTime() <= orphanAgeMs) {
         report.orphaned.push(worktreeDir);
         getLog().warn({ worktreePath: worktreeDir }, 'worktree_sweep_orphaned_worktree');
         continue;
@@ -541,20 +579,34 @@ export async function sweepTerminalWorkflowWorktrees(
     }
   }
 
-  getLog().info(
-    {
-      scanned: report.scanned,
-      removed: report.removed.length,
-      quarantined: report.quarantined.length,
-      quarantineDeleted: report.quarantineDeleted.length,
-      bytesFreed: report.bytesFreed,
-      quarantinedBytes: report.quarantinedBytes,
-      quarantineDeletedBytes: report.quarantineDeletedBytes,
-      errors: report.errors.length,
-      orphaned: report.orphaned.length,
-    },
-    'worktree_sweep_disk_report'
-  );
+  const reportPayload = {
+    scanned: report.scanned,
+    removed: report.removed.length,
+    quarantined: report.quarantined.length,
+    quarantineDeleted: report.quarantineDeleted.length,
+    skipped: report.skipped.length,
+    orphaned: report.orphaned.length,
+    bytesFreed: report.bytesFreed,
+    quarantinedBytes: report.quarantinedBytes,
+    quarantineDeletedBytes: report.quarantineDeletedBytes,
+    errors: report.errors.length,
+  };
+
+  // A sweep that scans real worktrees and reclaims nothing is a problem, not a clean
+  // run -- surface it at warn so it does not read as routine success in the logs
+  // (the exact shape of the 2026-09-22 incident: scanned:70, removed:0, quarantined:0,
+  // bytesFreed:0, every one silently skipped).
+  const didNothing =
+    report.scanned > 0 &&
+    report.removed.length === 0 &&
+    report.quarantined.length === 0 &&
+    report.bytesFreed === 0;
+
+  if (didNothing) {
+    getLog().warn(reportPayload, 'worktree_sweep_disk_report_noop');
+  } else {
+    getLog().info(reportPayload, 'worktree_sweep_disk_report');
+  }
 
   return report;
 }

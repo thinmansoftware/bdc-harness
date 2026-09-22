@@ -458,6 +458,178 @@ describe('sweepTerminalWorkflowWorktrees', () => {
     expect(report.quarantineDeleted).toEqual([]);
   });
 
+  test('quarantines an env-only worktree whose dir mtime is fresh but whose real evidence is old (2026-09-22 production bug)', async () => {
+    // This is the exact production defect: an incidental touch (git op, restart, scan)
+    // refreshes dirStat.mtime to "now", but the env was created long ago and the last
+    // real commit is also long ago. mtime must not be able to outvote that evidence.
+    const worktreePath = await createWorktree(
+      workspacesRoot,
+      'owner',
+      'repo',
+      'thread-fresh-mtime'
+    );
+    await setMtime(worktreePath, '2026-07-12T23:00:00Z'); // touched an hour before "now"
+    mockListActiveEnvironmentsForSweep.mockResolvedValueOnce([
+      {
+        id: 'env-stale',
+        working_path: worktreePath,
+        created_by_platform: 'web',
+        created_at: new Date('2026-06-01T00:00:00Z'), // 6+ weeks old
+        branch_name: 'thread-fresh-mtime',
+        codebase_id: 'codebase-1',
+      },
+    ]);
+    mockGetConversationsUsingEnv.mockResolvedValueOnce(['conv-1']);
+    mockGetActiveSession.mockResolvedValueOnce(null);
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: new Date('2026-07-13T00:00:00Z'),
+      orphanAgeMs: 7 * 24 * 60 * 60 * 1000,
+      getLastCommitDateFn: async () => new Date('2026-06-02T00:00:00Z'), // 6+ weeks old
+      getCanonicalRepoPathFn: async () => '/repos/owner/repo',
+      pruneWorktree: async () => undefined,
+    });
+
+    const quarantinePath = join(quarantineRoot, '2026-07-13', 'owner__repo__thread-fresh-mtime');
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(existsSync(quarantinePath)).toBe(true);
+    expect(report.quarantined).toEqual([quarantinePath]);
+    expect(report.skipped).toEqual([]);
+    expect(mockUpdateEnvStatus).toHaveBeenCalledWith('env-stale', 'destroyed');
+  });
+
+  test('never touches a worktree with an active session, however old its evidence', async () => {
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-active');
+    await setMtime(worktreePath, '2026-05-01T00:00:00Z');
+    mockListActiveEnvironmentsForSweep.mockResolvedValueOnce([
+      {
+        id: 'env-active',
+        working_path: worktreePath,
+        created_by_platform: 'web',
+        created_at: new Date('2026-05-01T00:00:00Z'),
+        branch_name: 'thread-active',
+        codebase_id: 'codebase-1',
+      },
+    ]);
+    mockGetConversationsUsingEnv.mockResolvedValueOnce(['conv-1']);
+    mockGetActiveSession.mockResolvedValueOnce({ id: 'session-1' });
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: new Date('2026-07-13T00:00:00Z'),
+      orphanAgeMs: 7 * 24 * 60 * 60 * 1000,
+      getLastCommitDateFn: async () => new Date('2026-05-02T00:00:00Z'),
+      getCanonicalRepoPathFn: async () => '/repos/owner/repo',
+      pruneWorktree: async () => undefined,
+    });
+
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(report.quarantined).toEqual([]);
+    expect(report.skipped).toEqual([{ path: worktreePath, reason: 'env_has_active_session' }]);
+  });
+
+  test('reclaims a no-commit, no-session worktree once it is older than the orphan age (the never-swept class)', async () => {
+    // No run row, no env row: exactly the class the incident found alive forever
+    // because getLastCommitDate returns null (no-git) and mtime was the only signal.
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-no-git');
+    await setMtime(worktreePath, '2026-06-01T00:00:00Z');
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: new Date('2026-07-13T00:00:00Z'),
+      orphanAgeMs: 7 * 24 * 60 * 60 * 1000,
+      getLastCommitDateFn: async () => null, // no-git: no commits ever made
+      getCanonicalRepoPathFn: async () => '/repos/owner/repo',
+      pruneWorktree: async () => undefined,
+    });
+
+    const quarantinePath = join(quarantineRoot, '2026-07-13', 'owner__repo__thread-no-git');
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(existsSync(quarantinePath)).toBe(true);
+    expect(report.quarantined).toEqual([quarantinePath]);
+    expect(report.orphaned).toEqual([]);
+  });
+
+  test('preserves a genuinely recent no-commit, no-session worktree (mtime still applies with zero other evidence)', async () => {
+    const worktreePath = await createWorktree(
+      workspacesRoot,
+      'owner',
+      'repo',
+      'thread-recent-no-git'
+    );
+    await setMtime(worktreePath, '2026-07-12T00:00:00Z'); // 1 day old
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: new Date('2026-07-13T00:00:00Z'),
+      orphanAgeMs: 7 * 24 * 60 * 60 * 1000,
+      getLastCommitDateFn: async () => null,
+      getCanonicalRepoPathFn: async () => '/repos/owner/repo',
+      pruneWorktree: async () => undefined,
+    });
+
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(report.quarantined).toEqual([]);
+    expect(report.orphaned).toEqual([worktreePath]);
+  });
+
+  test('quarantine retention deletes only date folders past its own window, keeping newer ones', async () => {
+    const expiredPath = join(quarantineRoot, '2026-07-01', 'owner__repo__thread-expired');
+    const retainedPath = join(quarantineRoot, '2026-07-08', 'owner__repo__thread-retained');
+    await mkdir(expiredPath, { recursive: true });
+    await writeFile(join(expiredPath, 'artifact.txt'), 'expired');
+    await mkdir(retainedPath, { recursive: true });
+    await writeFile(join(retainedPath, 'artifact.txt'), 'retained');
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: new Date('2026-07-13T00:00:00Z'),
+      quarantineRetentionMs: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    expect(existsSync(join(quarantineRoot, '2026-07-01'))).toBe(false);
+    expect(existsSync(retainedPath)).toBe(true);
+    expect(report.quarantineDeleted).toEqual([join(quarantineRoot, '2026-07-01')]);
+  });
+
+  test('logs a noop warning when a sweep scans worktrees but reclaims nothing', async () => {
+    const worktreePath = await createWorktree(
+      workspacesRoot,
+      'owner',
+      'repo',
+      'thread-running-noop'
+    );
+    mockListWorkflowRunsWithWorkingPath.mockResolvedValueOnce([
+      {
+        id: 'run-running',
+        status: 'running',
+        working_path: worktreePath,
+        completed_at: null,
+      },
+    ]);
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      workspacesRoot,
+      quarantineRoot,
+      now: new Date('2026-07-13T00:00:00Z'),
+      gracePeriodMs: 24 * 60 * 60 * 1000,
+    });
+
+    expect(report.removed).toEqual([]);
+    expect(report.quarantined).toEqual([]);
+    expect(report.bytesFreed).toBe(0);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ scanned: 1, removed: 0, quarantined: 0, bytesFreed: 0 }),
+      'worktree_sweep_disk_report_noop'
+    );
+  });
+
   test('logs total directories scanned, removed, and bytes freed on completion', async () => {
     const oldPath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-old');
     const runningPath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-running');
