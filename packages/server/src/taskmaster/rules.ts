@@ -114,6 +114,14 @@ export const USEFUL_RATE_MIN_GRADED = 20;
  * Pure floor test: true when the graded sample is large enough AND the
  * useful share of graded actions is strictly below USEFUL_RATE_FLOOR.
  * Exactly 40% does not breach (the ruling says "floor", not "must exceed").
+ *
+ * M-155 Amendment 03 (John's ruling 2026-09-21): only 'useful' and 'noise'
+ * grades feed usefulCount/noiseCount. Actions graded 'unheard' (sent to a
+ * drain_on_start mailbox that no non-draining principal ever acknowledged --
+ * i.e. nobody could have read them) are NEVER passed into this function by the
+ * caller in loop.ts, so 'unheard' is excluded from the floor denominator by
+ * construction. This function itself needs no new parameter or signature
+ * change; the exclusion happens upstream where grades are counted.
  */
 export function usefulRateFloorBreached(usefulCount: number, noiseCount: number): boolean {
   const graded = usefulCount + noiseCount;

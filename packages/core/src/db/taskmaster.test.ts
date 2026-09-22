@@ -1325,6 +1325,20 @@ describe('tm_journal DAL', () => {
     expect(graded?.graded_at).not.toBeNull();
   });
 
+  test("gradeAction accepts the 'unheard' grade (M-155 Amendment 03)", async () => {
+    const row = await recordAction({
+      thread_ref: 'thread-unheard',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      outcome: 'sent',
+    });
+    // 'unheard' must persist through the tm_journal grade CHECK constraint
+    // (widened to accept it in SQLite createSchema + Postgres migration 055).
+    const graded = await gradeAction(row.id, 'unheard');
+    expect(graded?.grade).toBe('unheard');
+    expect(graded?.graded_at).not.toBeNull();
+  });
+
   test('expireParkedActions expires parked and pending rows only', async () => {
     await recordAction({
       thread_ref: 't1',

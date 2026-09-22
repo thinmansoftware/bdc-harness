@@ -166,6 +166,46 @@ than replaying them and writes its own audit (response includes
 `expired_proposals` and `audit_id`). An already-RUNNING reset preserves the
 epoch-start timestamp, so accumulated useful/noise grades remain in scope.
 
+## Grading (useful / noise / unheard)
+
+`gradeSentActions` (`packages/server/src/taskmaster/loop.ts`) grades each sent
+action against action-specific external SOR evidence recorded after the send:
+
+| Grade     | Meaning                                                                                                     | Counts toward useful-rate floor? |
+| --------- | ----------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `useful`  | External SOR shows downstream movement caused by the send (ruling addressed, issue closed/assigned/marked). | Yes (numerator)                  |
+| `noise`   | Heard channel, proof deadline passed, no downstream movement.                                               | Yes (denominator)                |
+| `unheard` | The dispatch row was never acknowledged by a non-draining principal -- nobody could have read it.           | No (excluded from denominator)   |
+
+**M-155 Amendment 03 (John's ruling 2026-09-21).** An action is `unheard`
+unless its dispatch row carries an `acknowledged_at` from a recipient whose
+`delivery_mode` is NOT `drain_on_start`. A `drain_on_start` mailbox (e.g.
+`operator`, and `xo`) auto-addresses within seconds and is never human-read, so
+a message sent there was never actually heard. Grading such a message `noise`
+conflated **channel deafness** (the M-129 Phase 2 gap) with **supervisor
+uselessness** (the M-155 measurement), which triggered a false useful-rate
+floor breach and self-pause on 2026-09-17.
+
+`unheard` is excluded from the floor denominator by construction: only
+`useful` and `noise` grades feed `usefulRateFloorBreached(usefulCount,
+noiseCount)` (`packages/server/src/taskmaster/rules.ts`). The heard gate is
+applied FIRST, before any useful/noise evaluation: a send that was never heard
+is graded `unheard` immediately, even if downstream SOR movement exists,
+because that movement cannot be attributed to a send nobody received
+(`packages/server/src/taskmaster/loop.ts`, `gradeSentActions`). Only heard
+actions fall through to the useful/noise test. `fire_cauldron` is exempt from
+the heard gate -- it is a direct cascade trigger with no human-mailbox hop, so
+channel deafness cannot apply, and it is graded useful/noise like before. The
+40% floor value, `USEFUL_RATE_MIN_GRADED`, the auto-pause mechanism, and
+"resume is an operator decision" are all unchanged.
+
+Grade-split query:
+
+```bash
+sqlite3 /opt/bdc/archon-data/archon.db \
+  "SELECT grade, count(*) FROM tm_journal WHERE outcome='sent' GROUP BY grade"
+```
+
 ## Journal queries (on archon-app-1)
 
 Activation-proof query (SC7 kill test -- binding condition 4):
