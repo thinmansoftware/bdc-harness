@@ -31,6 +31,7 @@ const record: WatchedRunRecord = {
     filesChangedCount: 1,
     diffStat: '+1 -0',
     headSha: RUN_HEAD_SHA,
+    baseBranch: 'dev',
   },
 };
 
@@ -367,7 +368,6 @@ describe('merge manager', () => {
       ...record,
       headBranch: 'archon/thread-x',
       metadata: {
-        base_branch: 'main',
         head_sha: 'f'.repeat(40),
         base_sha: '1'.repeat(40),
         changed_files: 'packages/overseer/src/merge-manager.ts',
@@ -387,7 +387,7 @@ describe('merge manager', () => {
       judge,
       execute,
       insertOverseerAction,
-      findPullRequest: async () => productionTargetRecord.prEvidence,
+      findPullRequest: async () => ({ ...productionTargetRecord.prEvidence, baseBranch: 'master' }),
       mergePullRequest: async () => ({ merged: false }),
       readWorktreeHeadSha,
     });
@@ -407,6 +407,123 @@ describe('merge manager', () => {
         result: 'production_effect_held_for_john',
       })
     );
+  });
+
+  test('default evidence assembly uses a metadata-silent GitHub dev base and proceeds', async () => {
+    const target = { ...record, metadata: undefined };
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true, message: 'dev_merged' }));
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      judge,
+      execute,
+      insertOverseerAction: async () => undefined,
+      findPullRequest: async () => ({ ...target.prEvidence, baseBranch: 'dev' }),
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(target);
+
+    expect(result.status).toBe('executed');
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    ['missing base ref', async () => ({ ...record.prEvidence, baseBranch: undefined })],
+    ['failed GitHub read', async () => Promise.reject(new Error('github unavailable'))],
+  ])('holds when the PR base is undetermined: %s', async (_label, findPullRequest) => {
+    const insertOverseerAction = mock(async () => undefined);
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      mode: 'execute',
+      judge,
+      execute,
+      insertOverseerAction,
+      findPullRequest,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(record);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'base_branch_undetermined',
+      execution: null,
+    });
+    expect(judge).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'merge_denied', result: 'base_branch_undetermined' })
+    );
+  });
+
+  test('production metadata escalates a GitHub dev base', async () => {
+    const target = {
+      ...record,
+      metadata: { resulting_deployment_effect: 'production' },
+    };
+    const manager = createMergeManager({
+      mode: 'execute',
+      insertOverseerAction: async () => undefined,
+      findPullRequest: async () => ({ ...target.prEvidence, baseBranch: 'dev' }),
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+
+    expect(await manager(target)).toMatchObject({
+      status: 'held',
+      reason: 'production_effect_held_for_john',
+    });
+  });
+
+  test('dev metadata cannot downgrade a GitHub master base', async () => {
+    const target = { ...record, metadata: { environment: 'dev' } };
+    const manager = createMergeManager({
+      mode: 'execute',
+      insertOverseerAction: async () => undefined,
+      findPullRequest: async () => ({ ...target.prEvidence, baseBranch: 'master' }),
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+
+    expect(await manager(target)).toMatchObject({
+      status: 'held',
+      reason: 'production_effect_held_for_john',
+    });
+  });
+
+  test('allowlist evaluates the real GitHub base branch', async () => {
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      baseEffectOverrides: parseBaseEffectOverrides('thinmansoftware/bdc-harness:main=none'),
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      judge,
+      execute,
+      insertOverseerAction: async () => undefined,
+      findPullRequest: async () => ({ ...record.prEvidence, baseBranch: 'main' }),
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(record);
+
+    expect(result).toMatchObject({ status: 'held', reason: 'base_branch_not_allowed' });
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
   });
 
   test('a merge candidate from another repo is not denied for registry scope', async () => {
@@ -896,9 +1013,9 @@ describe('per-repo base effect overrides', () => {
       prEvidence: {
         ...record.prEvidence,
         pr: { owner: 'thinmansoftware', repo, number: 91 },
+        baseBranch: 'main',
       },
       metadata: {
-        base_branch: 'main',
         head_sha: RUN_HEAD_SHA,
         base_sha: '1'.repeat(40),
         changed_files: 'docs/work-orders/WO-EXAMPLE-01.md',
