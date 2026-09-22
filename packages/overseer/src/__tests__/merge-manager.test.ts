@@ -600,6 +600,92 @@ describe('merge manager', () => {
   });
 });
 
+describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
+  // These exercise defaultAssembleEvidence directly (no assembleEvidence /
+  // evidenceAssemblyDeps override) because the base-branch default lived
+  // there, not in any mockable seam the other describe blocks use.
+  test('run metadata WITHOUT a base branch is held, never silently defaulted to dev', async () => {
+    const insertOverseerAction = mock(async () => undefined);
+    const recordWithoutBase: WatchedRunRecord = {
+      ...record,
+      metadata: {},
+    };
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      insertOverseerAction,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(recordWithoutBase);
+
+    expect(result.status).toBe('held');
+    expect(result.reason).toBe('base_branch_missing_in_run_metadata');
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'merge_denied',
+        result: 'base_branch_missing_in_run_metadata',
+      })
+    );
+  });
+
+  test('run metadata WITH an explicit base branch merges as before (dev)', async () => {
+    const insertOverseerAction = mock(async () => undefined);
+    const judge = mock(async input => approveReceipt(input));
+    const mergePullRequest = mock(async () => ({ merged: true, sha: 'f'.repeat(40) }));
+    const recordWithBase: WatchedRunRecord = {
+      ...record,
+      metadata: { base_branch: 'dev' },
+    };
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      insertOverseerAction,
+      judge,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(recordWithBase);
+
+    expect(result.status).toBe('executed');
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(mergePullRequest).toHaveBeenCalledTimes(1);
+  });
+
+  test('a production base (main/master/release-ce) is still held by the existing regex guard, base present or not', async () => {
+    const insertOverseerAction = mock(async () => undefined);
+    const recordWithProdBase: WatchedRunRecord = {
+      ...record,
+      metadata: { base_branch: 'main' },
+    };
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      insertOverseerAction,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(recordWithProdBase);
+
+    expect(result.status).toBe('held');
+    expect(result.reason).toBe('production_effect_held_for_john');
+  });
+});
+
 /**
  * PR-DISCOVERED CANDIDATES AND PROVENANCE (John, 2026-09-07).
  *

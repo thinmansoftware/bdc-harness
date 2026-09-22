@@ -23,6 +23,19 @@ import type {
 
 export const MERGE_MANAGER_IDENTITY = 'overseer-merge-manager-v1';
 export const PRODUCTION_EFFECT_HOLD_REASON = 'production_effect_held_for_john' as const;
+export const BASE_BRANCH_MISSING_HOLD_REASON = 'base_branch_missing_in_run_metadata' as const;
+/**
+ * Sentinel error thrown by defaultAssembleEvidence when the run record carries no
+ * base_branch/baseBranch metadata (bdc-xo#2131). Caught by createMergeManager's
+ * returned handler and converted into a 'held' result -- never a silent default and
+ * never an uncaught throw that would kill the watch loop for every subsequent record.
+ */
+export class BaseBranchMissingError extends Error {
+  constructor() {
+    super(BASE_BRANCH_MISSING_HOLD_REASON);
+    this.name = 'BaseBranchMissingError';
+  }
+}
 export const MERGE_MANAGER_MODE_ENV = 'OVERSEER_MERGE_MANAGER_MODE' as const;
 export const MERGE_MANAGER_MUTATIONS_ENABLED_ENV = 'MERGE_MANAGER_MUTATIONS_ENABLED' as const;
 export const MERGE_MANAGER_ALLOWED_BASES_ENV = 'MERGE_MANAGER_ALLOWED_BASES' as const;
@@ -364,7 +377,16 @@ async function defaultAssembleEvidence(
   // up and explicitly documented as the provenance anchor -- is the truth.
   const headSha = metadataString(record, ['head_sha', 'headSha']) ?? prEvidence.headSha ?? '';
   const baseSha = metadataString(record, ['base_sha', 'baseSha']) ?? '';
-  const baseBranch = metadataString(record, ['base_branch', 'baseBranch']) ?? 'dev';
+  // Fail closed on unknown base branch (bdc-xo#2131): a merge is the one action that
+  // must never land against a branch nobody chose. This used to silently default to
+  // 'dev' whenever run metadata carried no base_branch/baseBranch key, which real run
+  // metadata usually does not -- see BaseBranchMissingError doc comment. A caller that
+  // legitimately wants 'dev' must pass it explicitly via deps.evidenceAssemblyDeps or
+  // record metadata; there is no implicit fallback branch here anymore.
+  const baseBranch = metadataString(record, ['base_branch', 'baseBranch']);
+  if (!baseBranch) {
+    throw new BaseBranchMissingError();
+  }
   const changedFiles = metadataString(record, ['changed_files', 'changedFiles'])
     ?.split(',')
     .map(path => path.trim())
@@ -592,7 +614,26 @@ export function createMergeManager(
   ).trim();
 
   return async (record: WatchedRunRecord): Promise<MergeManagerResult> => {
-    const assembled = await assembleEvidence(record);
+    let assembled: AssembledQualifiedMergeEvidence;
+    try {
+      assembled = await assembleEvidence(record);
+    } catch (error) {
+      if (error instanceof BaseBranchMissingError) {
+        await recordManagerAction(deps, record, 'merge_denied', BASE_BRANCH_MISSING_HOLD_REASON);
+        log.warn(
+          { runId: record.runId, woId: record.woId, mode },
+          'merge_manager.base_branch_missing_held -- run metadata carried no base_branch/baseBranch key'
+        );
+        return {
+          status: 'held',
+          receipt: null,
+          execution: null,
+          reason: BASE_BRANCH_MISSING_HOLD_REASON,
+          mode,
+        };
+      }
+      throw error;
+    }
     const { evidence, evidenceDigest } = assembled;
 
     if (evidence.resulting_deployment_effect === 'production') {
