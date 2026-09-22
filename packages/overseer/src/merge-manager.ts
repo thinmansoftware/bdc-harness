@@ -23,6 +23,7 @@ import type {
 
 export const MERGE_MANAGER_IDENTITY = 'overseer-merge-manager-v1';
 export const PRODUCTION_EFFECT_HOLD_REASON = 'production_effect_held_for_john' as const;
+export const BASE_BRANCH_UNDETERMINED_HOLD_REASON = 'base_branch_undetermined' as const;
 export const MERGE_MANAGER_MODE_ENV = 'OVERSEER_MERGE_MANAGER_MODE' as const;
 export const MERGE_MANAGER_MUTATIONS_ENABLED_ENV = 'MERGE_MANAGER_MUTATIONS_ENABLED' as const;
 export const MERGE_MANAGER_ALLOWED_BASES_ENV = 'MERGE_MANAGER_ALLOWED_BASES' as const;
@@ -39,6 +40,13 @@ const DEFAULT_OPERATOR: MergeOperatorIdentity = {
   modelFamily: 'merge-manager',
 };
 const log = createLogger('overseer/merge-manager');
+
+class BaseBranchUndeterminedError extends Error {
+  constructor() {
+    super(BASE_BRANCH_UNDETERMINED_HOLD_REASON);
+    this.name = 'BaseBranchUndeterminedError';
+  }
+}
 
 export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps {
   readonly assembleEvidence?: (
@@ -279,6 +287,7 @@ function determineDeploymentEffect(
   overrides: BaseEffectOverrides = new Map()
 ): OverseerDeploymentEffect {
   const branch = baseBranch?.toLowerCase() ?? '';
+  // AGD hold (M-09): production-named bases require John's production-effect hold.
   const branchEffect: OverseerDeploymentEffect =
     /^(main|master|release|prod|production)(\/|-|$)/.test(branch) ? 'production' : 'none';
 
@@ -364,7 +373,12 @@ async function defaultAssembleEvidence(
   // up and explicitly documented as the provenance anchor -- is the truth.
   const headSha = metadataString(record, ['head_sha', 'headSha']) ?? prEvidence.headSha ?? '';
   const baseSha = metadataString(record, ['base_sha', 'baseSha']) ?? '';
-  const baseBranch = metadataString(record, ['base_branch', 'baseBranch']) ?? 'dev';
+  // GitHub's PR base ref is authoritative; agent-written run metadata is not load-bearing.
+  const baseBranch = prEvidence.baseBranch?.trim();
+  if (!baseBranch) {
+    // AGD hold (M-09): an undetermined PR base must never default into an auto-merge path.
+    throw new BaseBranchUndeterminedError();
+  }
   const changedFiles = metadataString(record, ['changed_files', 'changedFiles'])
     ?.split(',')
     .map(path => path.trim())
@@ -507,6 +521,7 @@ function envFlagEnabled(raw: string | undefined): boolean {
 }
 
 function allowedBasesFromEnv(raw: string | undefined): readonly string[] {
+  // AGD merge (M-09): this allowlist governs which real PR bases may auto-merge.
   return (raw ?? 'dev,staging')
     .split(',')
     .map(value => value.trim().toLowerCase())
@@ -592,7 +607,24 @@ export function createMergeManager(
   ).trim();
 
   return async (record: WatchedRunRecord): Promise<MergeManagerResult> => {
-    const assembled = await assembleEvidence(record);
+    let assembled: AssembledQualifiedMergeEvidence;
+    try {
+      assembled = await assembleEvidence(record);
+    } catch (error) {
+      if (!(error instanceof BaseBranchUndeterminedError)) throw error;
+      await recordManagerAction(deps, record, 'merge_denied', BASE_BRANCH_UNDETERMINED_HOLD_REASON);
+      log.warn(
+        { runId: record.runId, woId: record.woId, mode },
+        'merge_manager.base_branch_undetermined'
+      );
+      return {
+        status: 'held',
+        receipt: null,
+        execution: null,
+        reason: BASE_BRANCH_UNDETERMINED_HOLD_REASON,
+        mode,
+      };
+    }
     const { evidence, evidenceDigest } = assembled;
 
     if (evidence.resulting_deployment_effect === 'production') {
