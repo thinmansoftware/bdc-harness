@@ -568,15 +568,17 @@ export async function sweepTerminalWorkflowWorktrees(
       }
 
       // No run row AND no env row: Archon's own bookkeeping has nothing on this
-      // worktree at all. There is no created_at to fall back on here (that only
-      // exists on an env row), so the only durable signal available is the last
-      // commit date. A worktree with real commits is judged on those, never on
-      // mtime -- mtime cannot keep a committed-and-abandoned worktree alive past
-      // its real age. Only in the true no-git case (no commits ever made, e.g. a
-      // worktree that died mid-checkout or was never used) does mtime still apply,
-      // as a last resort, since there is no other evidence at all to judge it by.
+      // worktree at all, so there is no created_at to prove how old it is. This is
+      // also the window a worktree sits in while it is still being provisioned --
+      // checked out (possibly at an OLD commit) but its env/run row not yet written.
+      // Judging it by commit date alone would quarantine it mid-provision, so here
+      // directory mtime DOES participate: the worktree is as recent as the newest of
+      // its last commit and its mtime. mtime only ever makes an unmatched worktree
+      // look newer, never older, and the uncommitted-work guard below still applies
+      // once it does age out. The env-backed path above keeps mtime out because it
+      // has created_at as durable evidence (the actual 2026-09-22 incident class).
       const lastCommitDate = await getWorktreeLastCommitDate(worktreeDir, getLastCommitDateFn);
-      const activityDate = lastCommitDate ?? dirStat.mtime;
+      const activityDate = newestDate(lastCommitDate, dirStat.mtime) ?? dirStat.mtime;
       if (now.getTime() - activityDate.getTime() <= orphanAgeMs) {
         report.orphaned.push(worktreeDir);
         getLog().warn({ worktreePath: worktreeDir }, 'worktree_sweep_orphaned_worktree');

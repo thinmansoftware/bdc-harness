@@ -759,6 +759,30 @@ describe('sweepTerminalWorkflowWorktrees', () => {
     ]);
   });
 
+  test('preserves a recent unmatched worktree whose checked-out commit is old (mid-provision, no rows yet)', async () => {
+    // Overseer finding on #870 (cfe7b124): a worktree cut moments ago from an old
+    // commit, before its env/run row lands, must not be quarantined on commit age.
+    const worktreePath = await createWorktree(
+      workspacesRoot,
+      'owner',
+      'repo',
+      'thread-provisioning'
+    );
+    await setMtime(worktreePath, '2026-07-12T23:30:00Z'); // created 30 minutes before "now"
+    const dirtyCheck = mock(async () => false);
+
+    const report = await sweepTerminalWorkflowWorktrees({
+      ...oldEnvSweepOpts(workspacesRoot, quarantineRoot),
+      getLastCommitDateFn: async () => new Date('2026-03-01T00:00:00Z'), // checked out at an old commit
+      hasUncommittedWorkFn: dirtyCheck,
+    });
+
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(report.quarantined).toEqual([]);
+    expect(report.orphaned).toEqual([worktreePath]);
+    expect(dirtyCheck).not.toHaveBeenCalled();
+  });
+
   test('logs a noop warning when a sweep scans worktrees but reclaims nothing', async () => {
     const worktreePath = await createWorktree(
       workspacesRoot,
