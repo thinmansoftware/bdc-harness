@@ -23,6 +23,22 @@ import type {
 
 export const MERGE_MANAGER_IDENTITY = 'overseer-merge-manager-v1';
 export const PRODUCTION_EFFECT_HOLD_REASON = 'production_effect_held_for_john' as const;
+// AGD M-09: effect=hold -- when the PR base branch cannot be determined from GitHub,
+// the manager holds under this reason instead of substituting a default; classification
+// must never proceed on an unknown base. See defaultAssembleEvidence / BaseBranchUndeterminedError.
+export const BASE_BRANCH_UNDETERMINED_REASON = 'base_branch_undetermined' as const;
+
+/**
+ * Raised by defaultAssembleEvidence when the PR's base branch cannot be sourced from
+ * GitHub PR evidence. Caught in createMergeManager's returned function and converted to a
+ * `held` result with reason BASE_BRANCH_UNDETERMINED_REASON. Never substitute a default.
+ */
+class BaseBranchUndeterminedError extends Error {
+  constructor() {
+    super(BASE_BRANCH_UNDETERMINED_REASON);
+    this.name = 'BaseBranchUndeterminedError';
+  }
+}
 export const MERGE_MANAGER_MODE_ENV = 'OVERSEER_MERGE_MANAGER_MODE' as const;
 export const MERGE_MANAGER_MUTATIONS_ENABLED_ENV = 'MERGE_MANAGER_MUTATIONS_ENABLED' as const;
 export const MERGE_MANAGER_ALLOWED_BASES_ENV = 'MERGE_MANAGER_ALLOWED_BASES' as const;
@@ -279,6 +295,8 @@ function determineDeploymentEffect(
   overrides: BaseEffectOverrides = new Map()
 ): OverseerDeploymentEffect {
   const branch = baseBranch?.toLowerCase() ?? '';
+  // AGD M-09: effect=hold -- this regex maps a production-named base to the 'production'
+  // effect, which downstream triggers John's production hold (no autonomous merge).
   const branchEffect: OverseerDeploymentEffect =
     /^(main|master|release|prod|production)(\/|-|$)/.test(branch) ? 'production' : 'none';
 
@@ -364,7 +382,19 @@ async function defaultAssembleEvidence(
   // up and explicitly documented as the provenance anchor -- is the truth.
   const headSha = metadataString(record, ['head_sha', 'headSha']) ?? prEvidence.headSha ?? '';
   const baseSha = metadataString(record, ['base_sha', 'baseSha']) ?? '';
-  const baseBranch = metadataString(record, ['base_branch', 'baseBranch']) ?? 'dev';
+  // The base branch that governs the deployment-effect classification comes ONLY from
+  // GitHub PR evidence (prEvidence.baseBranch, populated from pulls.get -> base.ref). It is
+  // NEVER inferred from run metadata, the head branch name, the WO id, or a literal default:
+  // agent-written metadata must not be load-bearing for whether a merge touches production.
+  // When GitHub cannot supply a base ref (PR missing, lookup failed, or empty base.ref) we
+  // throw BaseBranchUndeterminedError and fail closed -- the caller holds -- rather than
+  // substituting a default and proceeding. (18th canary defect, 2026-09-21: metadata never
+  // carries base_branch, so the old metadata-with-default-to-dev path classified every run
+  // as targeting dev and silently bypassed John's production hold.)
+  const baseBranch = prEvidence.baseBranch;
+  if (!baseBranch) {
+    throw new BaseBranchUndeterminedError();
+  }
   const changedFiles = metadataString(record, ['changed_files', 'changedFiles'])
     ?.split(',')
     .map(path => path.trim())
@@ -507,6 +537,8 @@ function envFlagEnabled(raw: string | undefined): boolean {
 }
 
 function allowedBasesFromEnv(raw: string | undefined): readonly string[] {
+  // AGD M-09: effect=merge -- bases in this allowlist may auto-merge; a base outside it
+  // yields base_branch_not_allowed (hold). Widening the default is a governance change (M-09).
   return (raw ?? 'dev,staging')
     .split(',')
     .map(value => value.trim().toLowerCase())
@@ -592,7 +624,28 @@ export function createMergeManager(
   ).trim();
 
   return async (record: WatchedRunRecord): Promise<MergeManagerResult> => {
-    const assembled = await assembleEvidence(record);
+    let assembled: AssembledQualifiedMergeEvidence;
+    try {
+      assembled = await assembleEvidence(record);
+    } catch (error) {
+      // AGD M-09: effect=hold -- an undetermined PR base branch holds under a distinct
+      // reason; the manager never substitutes a default and never proceeds to merge.
+      if (error instanceof BaseBranchUndeterminedError) {
+        await recordManagerAction(deps, record, 'merge_denied', BASE_BRANCH_UNDETERMINED_REASON);
+        log.warn(
+          { runId: record.runId, woId: record.woId, mode },
+          'merge_manager.base_branch_undetermined'
+        );
+        return {
+          status: 'held',
+          receipt: null,
+          execution: null,
+          reason: BASE_BRANCH_UNDETERMINED_REASON,
+          mode,
+        };
+      }
+      throw error;
+    }
     const { evidence, evidenceDigest } = assembled;
 
     if (evidence.resulting_deployment_effect === 'production') {

@@ -4,6 +4,7 @@ import {
   parseBaseEffectOverrides,
   resolveMergeManagerMode,
   DEFAULT_MERGE_MANAGER_MODE,
+  BASE_BRANCH_UNDETERMINED_REASON,
 } from '../merge-manager.ts';
 import type { QualifiedMergeEvidence } from '../actions/merge-ready.ts';
 import type { GrokDispositionReceipt, WatchedRunRecord } from '../types.ts';
@@ -366,8 +367,13 @@ describe('merge manager', () => {
     const productionTargetRecord: WatchedRunRecord = {
       ...record,
       headBranch: 'archon/thread-x',
+      // Base branch is now sourced from GitHub PR evidence, not run metadata. The
+      // metadata base_branch below is deliberately left off; prEvidence.baseBranch is truth.
+      prEvidence: {
+        ...record.prEvidence,
+        baseBranch: 'main',
+      },
       metadata: {
-        base_branch: 'main',
         head_sha: 'f'.repeat(40),
         base_sha: '1'.repeat(40),
         changed_files: 'packages/overseer/src/merge-manager.ts',
@@ -893,12 +899,13 @@ describe('per-repo base effect overrides', () => {
       ...record,
       repo,
       headBranch: 'archon/thread-effects',
+      // Base branch is sourced from GitHub PR evidence (base.ref), not run metadata.
       prEvidence: {
         ...record.prEvidence,
         pr: { owner: 'thinmansoftware', repo, number: 91 },
+        baseBranch: 'main',
       },
       metadata: {
-        base_branch: 'main',
         head_sha: RUN_HEAD_SHA,
         base_sha: '1'.repeat(40),
         changed_files: 'docs/work-orders/WO-EXAMPLE-01.md',
@@ -1037,5 +1044,247 @@ describe('per-repo base effect overrides', () => {
         result: 'production_effect_held_for_john',
       })
     );
+  });
+});
+
+/**
+ * WO-HARNESS-MERGE-BASE-BRANCH-NO-SILENT-DEFAULT-01.
+ *
+ * These tests exercise defaultAssembleEvidence FOR REAL (no `assembleEvidence` override),
+ * so the base branch flows from GitHub PR evidence (`prEvidence.baseBranch`) exactly as it
+ * does in production. They prove the manager never defaults the base branch to `dev` and
+ * fails closed when GitHub cannot supply a base ref.
+ */
+describe('base branch is sourced from GitHub PR evidence, never defaulted', () => {
+  /** A run whose PR targets `baseRef`, forcing default evidence assembly. */
+  function targetRecord(
+    baseRef: string | undefined,
+    metadata: Record<string, string> = {},
+    prEvidenceOverrides: Partial<WatchedRunRecord['prEvidence']> = {}
+  ): WatchedRunRecord {
+    return {
+      ...record,
+      headBranch: 'archon/thread-base-branch',
+      prEvidence: {
+        ...record.prEvidence,
+        baseBranch: baseRef,
+        ...prEvidenceOverrides,
+      },
+      // Metadata deliberately carries NO base_branch: real run metadata never does, which is
+      // the entire point of the fix. Any base_branch here must be ignored by the manager.
+      metadata: {
+        head_sha: RUN_HEAD_SHA,
+        base_sha: '1'.repeat(40),
+        changed_files: 'docs/work-orders/WO-EXAMPLE-01.md',
+        ...metadata,
+      },
+    };
+  }
+
+  // Scenario 1 (regression guard for the hole -- stop condition 5): metadata silent, PR base
+  // ref `master`. Even in the most permissive mode, this MUST hold for John, not classify none.
+  test('metadata silent + PR base master -> production effect held for John (regression guard)', async () => {
+    const target = targetRecord('master');
+    const insertOverseerAction = mock(async () => undefined);
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      judge,
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => target.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(target);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'production_effect_held_for_john',
+      execution: null,
+    });
+    expect(judge).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'merge_denied',
+        result: 'production_effect_held_for_john',
+      })
+    );
+  });
+
+  // Scenario 2: metadata silent, PR base ref `dev` -> effect none, proceeds as today.
+  test('metadata silent + PR base dev -> effect none, proceeds past the production gate', async () => {
+    const target = targetRecord('dev');
+    const insertOverseerAction = mock(async () => undefined);
+    const execute = mock(async () => ({ merged: true }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      mode: 'hold-canary',
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => target.prEvidence,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(target);
+
+    // Reaching hold_canary proves it passed the production-effect gate and the base was `dev`.
+    expect(result).toMatchObject({ status: 'held', reason: 'hold_canary', execution: null });
+    expect(execute).not.toHaveBeenCalled();
+    expect(mergePullRequest).not.toHaveBeenCalled();
+  });
+
+  // Scenario 3: base ref unavailable (lookup failed) -> held base_branch_undetermined, no merge.
+  test('PR base ref unavailable -> held base_branch_undetermined, never defaults or merges', async () => {
+    const target = targetRecord(undefined, {}, { exists: false, lookupFailed: true });
+    const insertOverseerAction = mock(async () => undefined);
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      judge,
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => target.prEvidence,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(target);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: BASE_BRANCH_UNDETERMINED_REASON,
+      execution: null,
+    });
+    expect(BASE_BRANCH_UNDETERMINED_REASON).toBe('base_branch_undetermined');
+    expect(judge).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'merge_denied',
+        result: BASE_BRANCH_UNDETERMINED_REASON,
+      })
+    );
+  });
+
+  // Scenario 4: metadata declares production, PR base ref dev -> effect stays production (escalation preserved).
+  test('metadata declares production + PR base dev -> effect escalates to production, held', async () => {
+    const target = targetRecord('dev', { deployment_effect: 'production' });
+    const insertOverseerAction = mock(async () => undefined);
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      judge,
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => target.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(target);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'production_effect_held_for_john',
+      execution: null,
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Scenario 5: metadata declares dev (less severe) + PR base ref master -> effect production; metadata cannot downgrade.
+  test('metadata declares dev + PR base master -> effect stays production; metadata cannot downgrade', async () => {
+    const target = targetRecord('master', { deployment_effect: 'dev' });
+    const insertOverseerAction = mock(async () => undefined);
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      judge,
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => target.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(target);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'production_effect_held_for_john',
+      execution: null,
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // Scenario 6: allowlist is evaluated against the real base. PR base `main` (effect held to
+  // `none` via a per-repo override so this isolates the allowlist check, not the production hold)
+  // with allowedBases dev,staging -> base_branch_not_allowed.
+  test('allowlist is evaluated against the real base branch -> base_branch_not_allowed', async () => {
+    const target = targetRecord('main');
+    const insertOverseerAction = mock(async () => undefined);
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      baseEffectOverrides: parseBaseEffectOverrides('thinmansoftware/bdc-harness:main=none'),
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      judge,
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => target.prEvidence,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(target);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'base_branch_not_allowed',
+      execution: null,
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(mergePullRequest).not.toHaveBeenCalled();
   });
 });
