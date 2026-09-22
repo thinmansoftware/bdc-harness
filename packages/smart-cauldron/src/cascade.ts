@@ -188,6 +188,12 @@ export interface RunCascadeOptions {
   pollStallTimeoutMs?: number;
   /** Poll interval per attempt in ms. Default: 30000 (30 seconds). */
   pollIntervalMs?: number;
+  /**
+   * Bypass the already-satisfied guard for this run. Defaults to the
+   * SMART_CAULDRON_ALLOW_CLAIMED env var when omitted (bdc-xo#2140: the
+   * CLI --allow-satisfied flag wires here explicitly).
+   */
+  allowClaimed?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +254,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const acquireWoLockImpl = opts.deps?.acquireWoLock ?? acquireWoLock;
   const releaseWoLockImpl = opts.deps?.releaseWoLock ?? releaseWoLock;
   const allowClaimed =
-    process.env.SMART_CAULDRON_ALLOW_CLAIMED === '1' ||
-    process.env.SMART_CAULDRON_ALLOW_CLAIMED === 'true';
+    opts.allowClaimed ??
+    (process.env.SMART_CAULDRON_ALLOW_CLAIMED === '1' ||
+      process.env.SMART_CAULDRON_ALLOW_CLAIMED === 'true');
 
   // Load config from files (never from inline constants)
   const tiers = loadLadder();
@@ -385,7 +392,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         `[smart-cauldron] ALREADY SATISFIED woId=${woId}: PR #${existingClaim.number} ` +
           `[${existingClaim.state}] ${existingClaim.url} -- skipping cascade`
       );
-      const won: CascadeRunRecord = {
+      const refused: CascadeRunRecord = {
         cascadeId,
         woId,
         project,
@@ -396,18 +403,25 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           dryRun: false,
         },
         createdAt,
-        status: 'won',
-        winningTier: entryTierName,
+        status: 'refused',
+        winningTier: null,
         attempts: [],
         totalCostUsd: null,
         telemetry: {
           entryTier: entryTierName,
           climbed: false,
           climbCount: 0,
-          wonCheap: true,
+          wonCheap: false,
+        },
+        refusalReason: {
+          reason: 'already-satisfied',
+          prNumber: existingClaim.number,
+          prState: existingClaim.state,
+          prUrl: existingClaim.url,
+          checkedAtTier: null,
         },
       };
-      const admissionEarly = await createRecordImpl(won, outDir);
+      const admissionEarly = await createRecordImpl(refused, outDir);
       onAdmission?.(admissionEarly.record, admissionEarly.created);
       await releaseWoLockImpl(woId, project, cascadeId, outDir);
       return admissionEarly.record;
@@ -442,6 +456,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let specRepairRecord: CascadeRunRecord['specRepair'];
     let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
+    let refusalReason: CascadeRunRecord['refusalReason'];
 
     function buildCurrentRecord(): CascadeRunRecord {
       const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
@@ -470,6 +485,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(specRepairRecord ? { specRepair: specRepairRecord } : {}),
         ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
+        ...(refusalReason ? { refusalReason } : {}),
       };
     }
 
@@ -721,13 +737,20 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         if (claimBeforeFire) {
           console.log(
             `[smart-cauldron] ALREADY SATISFIED before tier=${tier.name}: PR #${claimBeforeFire.number} ` +
-              `[${claimBeforeFire.state}] ${claimBeforeFire.url} -- stopping cascade`
+              `[${claimBeforeFire.state}] ${claimBeforeFire.url} -- stopping cascade (refused, not won)`
           );
-          status = 'won';
-          winningTier = tier.name;
-          attempt.outcome = 'won';
+          status = 'refused';
+          winningTier = null;
+          attempt.outcome = 'refused';
           attempt.gateFailReason = null;
           attempt.completedAt = new Date().toISOString();
+          refusalReason = {
+            reason: 'already-satisfied',
+            prNumber: claimBeforeFire.number,
+            prState: claimBeforeFire.state,
+            prUrl: claimBeforeFire.url,
+            checkedAtTier: tier.name,
+          };
           await checkpoint();
           break;
         }
@@ -907,10 +930,17 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           console.log(
             `[smart-cauldron] ALREADY SATISFIED after gate-fail on tier=${tier.name}: ` +
               `PR #${claimBeforeClimb.number} [${claimBeforeClimb.state}] ${claimBeforeClimb.url} ` +
-              '-- NOT climbing'
+              '-- NOT climbing (refused, not won)'
           );
-          status = 'won';
-          winningTier = tier.name;
+          status = 'refused';
+          winningTier = null;
+          refusalReason = {
+            reason: 'already-satisfied',
+            prNumber: claimBeforeClimb.number,
+            prState: claimBeforeClimb.state,
+            prUrl: claimBeforeClimb.url,
+            checkedAtTier: tier.name,
+          };
           await checkpoint();
           break;
         }

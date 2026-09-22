@@ -15,6 +15,7 @@
  *   --token <token>            Operator token (default: ARCHON_OPERATOR_TOKEN env)
  *   --project <shortname>      Required codebase shortname for explicit binding
  *   --poll-timeout-ms <ms>     Per-attempt poll timeout override (default: 1800000 / 30 min)
+ *   --allow-satisfied          Bypass the already-satisfied guard (same as env SMART_CAULDRON_ALLOW_CLAIMED=1)
  *
  * Secret boundary: API URL and token come from env/flags. Never log token values.
  * ASCII only. No emojis.
@@ -43,6 +44,9 @@ import type { CascadeStatus } from './types.js';
  *   frontier-approved         -> 9 (operator approved the premium climb; the resumed cascade
  *                                   -- resumeCascadeId -- carries the outcome, so THIS record
  *                                   itself shipped nothing and must never read as won=0)
+ *   refused                   -> 10 (already-satisfied guard declined to fire; no tier ran,
+ *                                    attempts=0 -- a refusal is not a win and must never read
+ *                                    as won=0 (bdc-xo#2140))
  *
  * spec-repair MUST NOT collapse to 0 -- it is a distinct, visible outcome
  * (frontier tier gate-failed) and callers key off the exit code. cancelled
@@ -70,6 +74,8 @@ export function statusToExitCode(status: CascadeStatus): number {
       return 8;
     case 'frontier-approved':
       return 9;
+    case 'refused':
+      return 10;
     default:
       return 0;
   }
@@ -91,6 +97,8 @@ interface CliArgs {
   token?: string;
   project?: string;
   pollTimeoutMs?: number;
+  /** undefined when --allow-satisfied was not passed (so the env fallback still applies). */
+  allowSatisfied?: boolean;
 }
 
 function printHelp(): void {
@@ -113,6 +121,7 @@ Options:
   --token <token>    Operator token (default: ARCHON_OPERATOR_TOKEN env)
   --project <name>   Required codebase shortname for explicit binding
   --poll-timeout-ms <ms>  Per-attempt poll timeout override (default: 1800000 / 30 min)
+  --allow-satisfied  Bypass the already-satisfied guard (same as env SMART_CAULDRON_ALLOW_CLAIMED=1)
   --help, -h         Show this help
 
 Examples:
@@ -125,7 +134,7 @@ Examples:
 `);
 }
 
-function parseArgs(argv: string[]): CliArgs {
+export function parseArgs(argv: string[]): CliArgs {
   const args = argv.slice(2); // remove 'bun' and script path
 
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
@@ -162,6 +171,9 @@ function parseArgs(argv: string[]): CliArgs {
     } else if (arg === '--dry-run') {
       result.dryRun = true;
       i++;
+    } else if (arg === '--allow-satisfied') {
+      result.allowSatisfied = true;
+      i++;
     } else if (arg === '--api-url' && i + 1 < args.length) {
       result.apiUrl = args[i + 1];
       i += 2;
@@ -197,6 +209,23 @@ function parseArgs(argv: string[]): CliArgs {
   }
 
   return result;
+}
+
+/**
+ * Combine the --allow-satisfied flag with the SMART_CAULDRON_ALLOW_CLAIMED env
+ * var. Either source enables the bypass; neither silently disables the other.
+ * (Overseer finding on #865: a `false` default passed as allowClaimed defeated
+ * runCascade's `??` env fallback, so the documented env var stopped working
+ * through the CLI.)
+ */
+export function resolveAllowSatisfied(
+  flag: boolean | undefined,
+  env: NodeJS.ProcessEnv = process.env
+): { enabled: boolean; source: 'flag' | 'env' | 'none' } {
+  if (flag === true) return { enabled: true, source: 'flag' };
+  const raw = env.SMART_CAULDRON_ALLOW_CLAIMED;
+  if (raw === '1' || raw === 'true') return { enabled: true, source: 'env' };
+  return { enabled: false, source: 'none' };
 }
 
 export function resolveFireAuth({
@@ -261,6 +290,11 @@ async function main(): Promise<void> {
   if (args.dryRun) console.log('[smart-cauldron]   DRY RUN mode');
   if (args.pollTimeoutMs !== undefined)
     console.log(`[smart-cauldron]   poll timeout override=${args.pollTimeoutMs}ms`);
+  const allowSatisfied = resolveAllowSatisfied(args.allowSatisfied);
+  if (allowSatisfied.enabled)
+    console.log(
+      `[smart-cauldron]   allow-satisfied override ENABLED (source: ${allowSatisfied.source === 'flag' ? '--allow-satisfied' : 'SMART_CAULDRON_ALLOW_CLAIMED'})`
+    );
 
   const { runCascade } = await import('./cascade.js');
   const record = await runCascade({
@@ -274,6 +308,7 @@ async function main(): Promise<void> {
     token: fireAuth?.token,
     project: fireAuth?.project,
     pollTimeoutMs: args.pollTimeoutMs,
+    allowClaimed: allowSatisfied.enabled,
   });
 
   console.log('');

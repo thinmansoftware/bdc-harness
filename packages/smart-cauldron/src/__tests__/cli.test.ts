@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { resolveFireAuth, statusToExitCode } from '../cli.js';
+import { parseArgs, resolveAllowSatisfied, resolveFireAuth, statusToExitCode } from '../cli.js';
 import type { CascadeStatus } from '../types.js';
 
 let originalToken: string | undefined;
@@ -84,9 +84,56 @@ describe('statusToExitCode', () => {
       'spec-repair',
       'infra-alert',
       'cancelled',
+      'refused',
     ];
     for (const status of statuses) {
       expect(Number.isInteger(statusToExitCode(status))).toBe(true);
     }
+  });
+
+  test('refused maps to a distinct non-zero code (bdc-xo#2140: refusal is not a win)', () => {
+    const code = statusToExitCode('refused');
+    expect(code).not.toBe(0);
+    expect(code).not.toBe(statusToExitCode('won'));
+  });
+});
+
+describe('allow-satisfied resolution (bdc-xo#2140 / #865 Overseer finding)', () => {
+  test('parseArgs leaves allowSatisfied undefined when the flag is absent', () => {
+    const args = parseArgs(['bun', 'cli.ts', 'fire', 'WO-X', '--dry-run']);
+    expect(args.allowSatisfied).toBeUndefined();
+  });
+
+  test('parseArgs sets allowSatisfied=true when --allow-satisfied is passed', () => {
+    const args = parseArgs(['bun', 'cli.ts', 'fire', 'WO-X', '--allow-satisfied']);
+    expect(args.allowSatisfied).toBe(true);
+  });
+
+  test('SMART_CAULDRON_ALLOW_CLAIMED=1 bypasses the guard through the CLI path with no flag', () => {
+    const noFlag = parseArgs(['bun', 'cli.ts', 'fire', 'WO-X']);
+    expect(
+      resolveAllowSatisfied(noFlag.allowSatisfied, { SMART_CAULDRON_ALLOW_CLAIMED: '1' })
+    ).toEqual({
+      enabled: true,
+      source: 'env',
+    });
+    expect(resolveAllowSatisfied(undefined, { SMART_CAULDRON_ALLOW_CLAIMED: 'true' }).enabled).toBe(
+      true
+    );
+  });
+
+  test('explicit --allow-satisfied works with the env var unset', () => {
+    const withFlag = parseArgs(['bun', 'cli.ts', 'fire', 'WO-X', '--allow-satisfied']);
+    expect(resolveAllowSatisfied(withFlag.allowSatisfied, {})).toEqual({
+      enabled: true,
+      source: 'flag',
+    });
+  });
+
+  test('neither flag nor env leaves the guard armed', () => {
+    expect(resolveAllowSatisfied(undefined, {})).toEqual({ enabled: false, source: 'none' });
+    expect(resolveAllowSatisfied(undefined, { SMART_CAULDRON_ALLOW_CLAIMED: '0' }).enabled).toBe(
+      false
+    );
   });
 });
