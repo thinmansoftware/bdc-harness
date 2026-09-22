@@ -214,6 +214,7 @@ describe('deployment effect precedence', () => {
         base_sha: 'b'.repeat(40),
       },
     });
+    record.prEvidence!.baseBranch = 'main';
     const judge = mock(async input => approveReceipt(input));
     const execute = mock(async () => ({ merged: true }));
     const insertOverseerAction = mock(async () => undefined);
@@ -247,6 +248,7 @@ describe('deployment effect precedence', () => {
         base_sha: 'b'.repeat(40),
       },
     });
+    record.prEvidence!.baseBranch = 'dev';
     const execute = mock(async () => ({ merged: true }));
 
     const manager = createMergeManager({
