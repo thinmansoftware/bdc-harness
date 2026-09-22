@@ -2461,6 +2461,45 @@ describe('M-155 Amendment 03: unheard grade (WO-HARNESS-TASKMASTER-UNHEARD-GRADE
     );
     expect(world.journal.find(row => row.id === 'journal-2205')?.grade).toBe('unheard');
   });
+
+  test('scenario 7b: a cancelled dispatch ACKED by a non-draining principal stays eligible for useful/noise', async () => {
+    // Cancellation is not itself proof of deafness. This row was acknowledged
+    // by 'major-build' (worker_poll => NOT drain_on_start) before it was
+    // cancelled, so a human provably read it. It must therefore receive the
+    // same heard classification as any other dispatch and fall through to the
+    // normal useful/noise evaluation -- here: heard, deadline passed, no
+    // downstream movement => 'noise' (in the floor denominator). Grading it
+    // 'unheard' would wrongly excuse a genuinely-heard send from the floor.
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#2206:1';
+    seedSentEscalation(world, {
+      id: '2206',
+      recipient: 'major-build',
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+      deadlineMsFromNow: -1, // deadline already passed
+    });
+
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        // Mirror the default effect lookup, but report THIS row as cancelled so
+        // the cancelled branch is the path under test. Other rows (the digest
+        // seed) keep their normal status.
+        findEffectByIdempotencyKey: async (k: string) => {
+          const found = world.sentMessages.find(m => m.idempotency_key === k);
+          if (!found) return null;
+          return {
+            id: found.idempotency_key,
+            status: k === key ? 'cancelled' : 'queued',
+            createdAt: found.createdAt,
+          };
+        },
+      })
+    );
+
+    expect(world.journal.find(row => row.id === 'journal-2206')?.grade).toBe('noise');
+  });
 });
 
 describe('scenario 5: budget ceiling holds', () => {
