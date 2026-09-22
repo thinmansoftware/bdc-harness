@@ -188,10 +188,16 @@ floor breach and self-pause on 2026-09-17.
 
 `unheard` is excluded from the floor denominator by construction: only
 `useful` and `noise` grades feed `usefulRateFloorBreached(usefulCount,
-noiseCount)` (`packages/server/src/taskmaster/rules.ts`). Useful evidence still
-wins -- an action that provably moved the SOR is graded `useful` regardless of
-channel. The 40% floor value, `USEFUL_RATE_MIN_GRADED`, the auto-pause
-mechanism, and "resume is an operator decision" are all unchanged.
+noiseCount)` (`packages/server/src/taskmaster/rules.ts`). The heard gate is
+applied FIRST, before any useful/noise evaluation: a send that was never heard
+is graded `unheard` immediately, even if downstream SOR movement exists,
+because that movement cannot be attributed to a send nobody received
+(`packages/server/src/taskmaster/loop.ts`, `gradeSentActions`). Only heard
+actions fall through to the useful/noise test. `fire_cauldron` is exempt from
+the heard gate -- it is a direct cascade trigger with no human-mailbox hop, so
+channel deafness cannot apply, and it is graded useful/noise like before. The
+40% floor value, `USEFUL_RATE_MIN_GRADED`, the auto-pause mechanism, and
+"resume is an operator decision" are all unchanged.
 
 Grade-split query:
 
