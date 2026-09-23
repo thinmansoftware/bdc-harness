@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
+import type { SecurityDetectorResult } from './duty-officer-security-detector';
 import {
   githubIssueInAllowList,
   startDutyOfficerClock,
@@ -134,7 +135,137 @@ afterEach(() => {
   delete process.env.ARCHON_BUILD_SHA;
 });
 
+const priorDetectorResult: SecurityDetectorResult = {
+  verdict: 'observation_error',
+  reasons: [{ code: 'scan_unavailable' }],
+  evaluated_at: '2026-09-23T12:00:00.000Z',
+  marker_home: 1,
+  wrote: [],
+  last_error: 'scan_fetch_failed',
+};
+
+function registeredDetector(deps: DutyOfficerClockDeps, call = -1): Record<string, unknown> {
+  const calls = (
+    deps.registerWorker as unknown as {
+      mock: { calls: [Parameters<DutyOfficerClockDeps['registerWorker']>[0]][] };
+    }
+  ).mock.calls;
+  return calls.at(call)![0].capabilities.security_detector as Record<string, unknown>;
+}
+
+async function seedDetector(): Promise<DutyOfficerClockDeps> {
+  const deps = fakeDeps([]);
+  process.env.ARCHON_BUILD_SHA = 'prior-build';
+  deps.now = () => new Date(priorDetectorResult.evaluated_at);
+  deps.securityDetector = mock(async () => priorDetectorResult);
+  await tickDutyOfficerClock(deps);
+  return deps;
+}
+
 describe('duty officer clock', () => {
+  test('completed detector evidence survives three throttled ticks and both registrations', async () => {
+    const deps = await seedDetector();
+    const prior = registeredDetector(deps);
+    deps.securityDetector = mock(async () => null);
+    process.env.ARCHON_BUILD_SHA = 'new-build';
+    for (let tick = 1; tick <= 3; tick++) {
+      const now = new Date(Date.parse(priorDetectorResult.evaluated_at) + tick * 900_000);
+      deps.now = () => now;
+      const before = registeredDetector(deps);
+      await tickDutyOfficerClock(deps);
+      expect(registeredDetector(deps, -2)).toEqual(before);
+      expect(registeredDetector(deps)).toEqual({
+        ...prior,
+        last_tick_detector_outcome: 'skipped_throttled',
+        last_tick_at: now.toISOString(),
+      });
+    }
+  });
+
+  test('timed-out detector increments errors and in-flight skip retains prior evidence', async () => {
+    const deps = await seedDetector();
+    const prior = registeredDetector(deps);
+    let finish!: (result: SecurityDetectorResult | null) => void;
+    let signal: AbortSignal | undefined;
+    deps.securityDetector = mock(received => {
+      signal = received;
+      return new Promise<SecurityDetectorResult | null>(resolve => {
+        finish = resolve;
+      });
+    });
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS = '10';
+    deps.now = () => new Date('2026-09-23T18:00:00.000Z');
+    try {
+      await tickDutyOfficerClock(deps);
+      expect(signal?.aborted).toBe(true);
+      const timedOut = registeredDetector(deps);
+      expect(timedOut).toEqual({
+        ...prior,
+        error_count: Number(prior.error_count) + 1,
+        last_error: 'duty_officer_security_detector_timeout',
+        last_tick_detector_outcome: 'timed_out',
+        last_tick_at: '2026-09-23T18:00:00.000Z',
+      });
+      deps.now = () => new Date('2026-09-23T18:15:00.000Z');
+      await tickDutyOfficerClock(deps);
+      expect(deps.securityDetector).toHaveBeenCalledTimes(1);
+      expect(registeredDetector(deps, -2)).toEqual(timedOut);
+      expect(registeredDetector(deps)).toEqual({
+        ...timedOut,
+        last_tick_detector_outcome: 'skipped_in_flight',
+        last_tick_at: '2026-09-23T18:15:00.000Z',
+      });
+    } finally {
+      finish({ ...priorDetectorResult, verdict: 'clean' });
+      await Promise.resolve();
+    }
+    // A late result from an aborted run must not replace completed evidence.
+    deps.securityDetector = mock(async () => null);
+    await tickDutyOfficerClock(deps);
+    expect(registeredDetector(deps).verdict).toBe(prior.verdict);
+  });
+
+  test('failed detector increments errors while retaining the prior verdict and run time', async () => {
+    const deps = await seedDetector();
+    const prior = registeredDetector(deps);
+    deps.securityDetector = mock(async () => {
+      throw new Error('detector_failed');
+    });
+    await tickDutyOfficerClock(deps);
+    expect(registeredDetector(deps)).toEqual({
+      ...prior,
+      error_count: Number(prior.error_count) + 1,
+      last_error: 'detector_failed',
+      last_tick_detector_outcome: 'error',
+    });
+  });
+
+  test('fresh completed detector result replaces the prior evidence', async () => {
+    const deps = await seedDetector();
+    const prior = registeredDetector(deps);
+    process.env.ARCHON_BUILD_SHA = 'fresh-build';
+    deps.now = () => new Date('2026-09-23T18:00:00.000Z');
+    deps.securityDetector = mock(async () => ({
+      verdict: 'clean' as const,
+      reasons: [],
+      evaluated_at: '2026-09-23T18:00:00.000Z',
+      marker_home: 1,
+      wrote: [],
+    }));
+    await tickDutyOfficerClock(deps);
+    expect(registeredDetector(deps, -2)).toEqual(prior);
+    expect(registeredDetector(deps)).toEqual({
+      last_run_at: '2026-09-23T18:00:00.000Z',
+      verdict: 'clean',
+      reasons: [],
+      error_count: 0,
+      last_error: null,
+      build_sha: 'fresh-build',
+      last_tick_detector_outcome: 'completed',
+      last_tick_at: '2026-09-23T18:00:00.000Z',
+    });
+  });
+
   test('escalates a queued run_report to xo with no LLM and no GitHub call', async () => {
     const queued = [message({ id: 'one' })];
     const deps = fakeDeps(queued);

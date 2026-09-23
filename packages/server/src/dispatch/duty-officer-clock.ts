@@ -32,6 +32,28 @@ const GH_SUBJECT =
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
 let detectorInFlight: Promise<SecurityDetectorResult | null> | null = null;
+let detectorStatus: {
+  last_run_at: string | null;
+  verdict: SecurityDetectorResult['verdict'] | null;
+  reasons: string[];
+  error_count: number;
+  last_error: string | null;
+  build_sha: string | null;
+  last_tick_detector_outcome?:
+    | 'skipped_throttled'
+    | 'skipped_in_flight'
+    | 'timed_out'
+    | 'error'
+    | 'completed';
+  last_tick_at?: string;
+} = {
+  last_run_at: null,
+  verdict: null,
+  reasons: [],
+  error_count: 0,
+  last_error: null,
+  build_sha: null,
+};
 const startedAt = new Date().toISOString();
 
 export interface DutyOfficerStaleIssue {
@@ -241,10 +263,10 @@ function detectorTimeoutMs(): number {
 
 async function detectorDeadline(
   deps: DutyOfficerClockDeps
-): Promise<SecurityDetectorResult | null> {
+): Promise<SecurityDetectorResult | null | undefined> {
   if (detectorInFlight) {
     log.info('duty_officer_security_detector_skipped_in_flight');
-    return null;
+    return undefined;
   }
   const controller = new AbortController();
   let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -438,12 +460,15 @@ export async function tickDutyOfficerClock(
 ): Promise<void> {
   if (inFlight) return;
   inFlight = true;
-  let detectorResult: SecurityDetectorResult | null = null;
   try {
     await deps.registerWorker({
       worker_id: DUTY_OFFICER_WORKER_ID,
       host: process.env.HOSTNAME ?? 'in-process',
-      capabilities: { task_types: ['run_report', 'agent_message'], principal: 'duty-officer' },
+      capabilities: {
+        task_types: ['run_report', 'agent_message'],
+        principal: 'duty-officer',
+        security_detector: detectorStatus,
+      },
       max_concurrency: 1,
     });
     await deps.heartbeatWorker({ worker_id: DUTY_OFFICER_WORKER_ID, status: 'available' });
@@ -473,9 +498,37 @@ export async function tickDutyOfficerClock(
     }
 
     try {
-      detectorResult = await detectorDeadline(deps);
+      const detectorResult = await detectorDeadline(deps);
+      detectorStatus = {
+        ...detectorStatus,
+        ...(detectorResult
+          ? {
+              last_run_at: detectorResult.evaluated_at,
+              verdict: detectorResult.verdict,
+              reasons: detectorResult.reasons.map(reason => reason.code),
+              error_count: detectorResult.last_error ? 1 : 0,
+              last_error: detectorResult.last_error ?? null,
+              build_sha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
+            }
+          : {}),
+        last_tick_detector_outcome: detectorResult
+          ? 'completed'
+          : detectorResult === null
+            ? 'skipped_throttled'
+            : 'skipped_in_flight',
+        last_tick_at: (deps.now?.() ?? new Date()).toISOString(),
+      };
     } catch (error) {
-      if ((error as Error).message === 'duty_officer_security_detector_timeout') {
+      const lastError = error instanceof Error ? error.message : String(error);
+      detectorStatus = {
+        ...detectorStatus,
+        error_count: detectorStatus.error_count + 1,
+        last_error: lastError,
+        last_tick_detector_outcome:
+          lastError === 'duty_officer_security_detector_timeout' ? 'timed_out' : 'error',
+        last_tick_at: (deps.now?.() ?? new Date()).toISOString(),
+      };
+      if (lastError === 'duty_officer_security_detector_timeout') {
         log.error('duty_officer_security_detector_timeout');
       } else {
         log.error({ err: error }, 'duty_officer_security_detector_failed');
@@ -508,15 +561,7 @@ export async function tickDutyOfficerClock(
           started_at: startedAt,
           build_sha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
           last_tick_completed_at: now.toISOString(),
-          security_detector: detectorResult
-            ? {
-                last_run_at: detectorResult.evaluated_at,
-                verdict: detectorResult.verdict,
-                reasons: detectorResult.reasons.map(reason => reason.code),
-                error_count: detectorResult.last_error ? 1 : 0,
-                last_error: detectorResult.last_error ?? null,
-              }
-            : { last_run_at: null, verdict: null, reasons: [], error_count: 0, last_error: null },
+          security_detector: detectorStatus,
         },
         max_concurrency: 1,
       });
