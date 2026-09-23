@@ -221,4 +221,102 @@ describe('pollForTerminal liveness', () => {
 
     expect(result.terminalStatus).toBe('completed');
   });
+
+  // ==== WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01: queue-time + open-node carve-outs ====
+  // Queue time is not stall time, and a single long open node is alive. Before
+  // this fix, a run that sat `pending` (anchor: run 1388511a, cancelled with
+  // zero events) or ran one long silent node (anchor: 95b27096, cancelled mid
+  // 25-minute run-stop-tests) was judged stalled and cancelled.
+
+  test('pending for 30 minutes, then starts: not stalled', async () => {
+    installFakeTimers();
+    const startBase = Date.now();
+    let ticks = 0;
+    // 60 polls * 30s = 30 minutes of `pending` with ZERO events (queue latency),
+    // then it starts (emits node_started) and completes. Under the pre-fix code
+    // this was cut at the 20-minute stall budget while still queued.
+    globalThis.fetch = (async () => {
+      ticks += 1;
+      if (ticks <= 60) {
+        return new Response(
+          JSON.stringify({ run: { id: 'r1', status: 'pending', metadata: {} }, events: [] }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+      }
+      const terminal = ticks > 62;
+      return new Response(
+        JSON.stringify({
+          run: { id: 'r1', status: terminal ? 'completed' : 'running', metadata: {} },
+          events: [eventAt(Date.now(), 'node_started')],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }) as typeof fetch;
+
+    const result = await pollForTerminal({
+      runId: 'r1',
+      apiBaseUrl: 'http://x',
+      token: 't',
+      stallTimeoutMs: 1_200_000,
+      intervalMs: 30_000,
+    });
+
+    expect(result.terminalStatus).toBe('completed');
+    // Proves it sat pending well past the 20-minute stall budget without a cut.
+    expect(Date.now() - startBase).toBeGreaterThan(1_800_000);
+  });
+
+  test('one node started 25 minutes ago and still open: not stalled', async () => {
+    installFakeTimers();
+    const started = Date.now();
+    // A single node_started that never gets a matching node_completed while it
+    // works -- the exact shape of a long test-run node that emits nothing. It
+    // stays open and SILENT for ~40 minutes (past the low 20-minute stall
+    // budget, under the 60-minute open-node budget), then completes.
+    const openEvent = eventAt(started, 'node_started');
+    let ticks = 0;
+    globalThis.fetch = (async () => {
+      ticks += 1;
+      const terminal = ticks > 80;
+      return new Response(
+        JSON.stringify({
+          run: { id: 'r1', status: terminal ? 'completed' : 'running', metadata: {} },
+          events: terminal ? [openEvent, eventAt(Date.now(), 'node_completed')] : [openEvent],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }) as typeof fetch;
+
+    const result = await pollForTerminal({
+      runId: 'r1',
+      apiBaseUrl: 'http://x',
+      token: 't',
+      stallTimeoutMs: 1_200_000,
+      openNodeBudgetMs: 3_600_000,
+      intervalMs: 30_000,
+    });
+
+    expect(result.terminalStatus).toBe('completed');
+    // Survived silence far past the 20-minute stall budget because the node was open.
+    expect(Date.now() - started).toBeGreaterThan(1_200_000);
+  });
+
+  test('truly silent after a node completed for longer than the budget: stalled', async () => {
+    installFakeTimers();
+    const t0 = Date.now();
+    // The node started AND completed -- no node is open -- then the run emits
+    // nothing further. With no open node the tight stall budget applies again.
+    const frozen: FakeEvent[] = [eventAt(t0, 'node_started'), eventAt(t0, 'node_completed')];
+    serveRun(() => frozen);
+
+    await expect(
+      pollForTerminal({
+        runId: 'r1',
+        apiBaseUrl: 'http://x',
+        token: 't',
+        stallTimeoutMs: 600_000,
+        intervalMs: 30_000,
+      })
+    ).rejects.toThrow(TimeoutError);
+  });
 });

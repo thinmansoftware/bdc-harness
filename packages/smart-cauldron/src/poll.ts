@@ -84,9 +84,30 @@ interface PollOptions {
    * is directly observable. If no new event arrives within this window, the run
    * is treated as stalled and the cascade climbs.
    *
+   * TWO CARVE-OUTS (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01) -- silence only
+   * counts as a stall once the run is actually WORKING:
+   *   1. Queue time is not stall time. A run still `pending` with no
+   *      `node_started` event has not begun; its silence is queue latency, not a
+   *      stuck build. Only the hard `timeoutMs` ceiling can end such a run.
+   *   2. An open node is alive. When a node has started but not yet
+   *      completed/failed, the run is granted that node's generous budget
+   *      (`openNodeBudgetMs`, default 60 min) of silence before it counts as
+   *      stalled -- a single long node (e.g. a 25-minute test run) legitimately
+   *      emits nothing while it works and must not be cut at 20 min.
+   *
    * Set to 0 to disable stall detection and fall back to duration-only.
    */
   stallTimeoutMs?: number;
+  /**
+   * OPEN-NODE SILENCE BUDGET (ms). Default: 3600000 (60 minutes).
+   *
+   * While a node has started but not yet completed/failed, the run is allowed
+   * this much silence before it is judged stalled, instead of the tighter
+   * `stallTimeoutMs`. No per-node `timeout` is available in the poll event feed
+   * (node_started events carry only nodeId/nodeName), so this generous default
+   * is the budget for every open node. Ignored when no node is open.
+   */
+  openNodeBudgetMs?: number;
   /** Poll interval (ms). Default: 30000 (30 seconds). */
   intervalMs?: number;
   /**
@@ -143,6 +164,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     token: tokenOverride,
     timeoutMs = 14_400_000,
     stallTimeoutMs = 1_200_000,
+    openNodeBudgetMs = 3_600_000,
     intervalMs = 30_000,
     prRetryAttempts = 3,
     prRetryDelayMs = 10_000,
@@ -233,13 +255,25 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
       };
     }
 
-    // Stall check: silence, not duration, is what indicates a stuck run.
-    if (stallTimeoutMs > 0) {
+    // Stall check: silence, not duration, is what indicates a stuck run -- but
+    // only once the run is actually WORKING. Two carve-outs (WO-HARNESS-
+    // CONDUCTOR-STALL-DETECTOR-FIX-01):
+    //   1. Queue time is not stall time. A run still `pending` with no
+    //      `node_started` event has not begun; skip the silence check entirely
+    //      (only the hard `timeoutMs` ceiling can end it). We do NOT advance
+    //      lastActivityAt while queued -- we simply do not judge it stalled.
+    //   2. An open node is alive. When a node has started and not yet
+    //      completed/failed, grant the generous open-node budget of silence
+    //      before judging the run stalled, instead of the tighter stall budget.
+    const events = detail.events ?? [];
+    if (stallTimeoutMs > 0 && hasRunStarted(detail.run.status, events)) {
+      const openNode = hasOpenNode(events);
+      const budget = openNode ? Math.max(stallTimeoutMs, openNodeBudgetMs) : stallTimeoutMs;
       const silentFor = Date.now() - lastActivityAt;
-      if (silentFor >= stallTimeoutMs) {
+      if (silentFor >= budget) {
         throw new TimeoutError(
           `[smart-cauldron/poll] Run ${runId} stalled: no new events for ${String(silentFor)}ms ` +
-            `(stall budget ${String(stallTimeoutMs)}ms). Last activity was at ` +
+            `(stall budget ${String(budget)}ms${openNode ? ', open-node budget' : ''}). Last activity was at ` +
             `${newestEventSeen === null ? 'no events observed' : new Date(newestEventSeen).toISOString()}.`
         );
       }
@@ -268,18 +302,73 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
 function newestEventTimestamp(events: { created_at?: string | null }[]): number | null {
   let newest: number | null = null;
   for (const ev of events) {
-    if (!ev.created_at) continue;
-    // SQLite emits "YYYY-MM-DD HH:MM:SS" (space-separated, UTC, no zone marker).
-    // Date.parse treats that as LOCAL time on some runtimes, which would skew
-    // every comparison. Normalize to ISO-8601 UTC before parsing.
-    const raw = ev.created_at.trim();
-    const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)
-      ? `${raw.replace(' ', 'T')}Z`
-      : raw;
-    const parsed = Date.parse(iso);
-    if (!Number.isNaN(parsed) && (newest === null || parsed > newest)) newest = parsed;
+    const parsed = parseEventTimestamp(ev.created_at);
+    if (parsed !== null && (newest === null || parsed > newest)) newest = parsed;
   }
   return newest;
+}
+
+/**
+ * Parse an event's `created_at` into epoch ms, or null when absent/unparseable.
+ *
+ * SQLite emits "YYYY-MM-DD HH:MM:SS" (space-separated, UTC, no zone marker).
+ * Date.parse treats that as LOCAL time on some runtimes, which would skew every
+ * comparison. Normalize to ISO-8601 UTC before parsing.
+ */
+function parseEventTimestamp(createdAt?: string | null): number | null {
+  if (!createdAt) return null;
+  const raw = createdAt.trim();
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw) ? `${raw.replace(' ', 'T')}Z` : raw;
+  const parsed = Date.parse(iso);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Has this run actually begun executing?
+ *
+ * A run that is still `pending` and has emitted no `node_started` event has not
+ * started -- its silence is queue latency, not a stuck build, so it must never be
+ * judged stalled by the silence budget (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01
+ * Scope IN item 1). Any non-pending status, or the presence of a node_started
+ * event, means work has begun and the silence budget applies.
+ */
+function hasRunStarted(status: string, events: { event_type: string }[]): boolean {
+  if (status !== 'pending') return true;
+  return events.some(ev => ev.event_type === 'node_started');
+}
+
+/**
+ * Is a node currently OPEN -- started but not yet completed or failed?
+ *
+ * Processes node lifecycle events (node_started / node_completed / node_failed)
+ * in chronological order, tracking the latest start per step and clearing it on
+ * completion/failure. A run with any open node is granted the generous open-node
+ * silence budget instead of the tighter stall budget, because a single long node
+ * (e.g. a 25-minute test run) legitimately emits nothing while it works
+ * (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN item 2). No per-node
+ * `timeout` is available in this feed, so the caller applies a fixed budget.
+ */
+function hasOpenNode(
+  events: { event_type: string; step_name: string | null; created_at?: string | null }[]
+): boolean {
+  const openStarts = new Set<string>();
+  const lifecycle = events
+    .filter(
+      ev =>
+        ev.event_type === 'node_started' ||
+        ev.event_type === 'node_completed' ||
+        ev.event_type === 'node_failed'
+    )
+    .map(ev => ({ ev, ts: parseEventTimestamp(ev.created_at) }))
+    .filter((x): x is { ev: (typeof x)['ev']; ts: number } => x.ts !== null)
+    .sort((a, b) => a.ts - b.ts);
+
+  for (const { ev } of lifecycle) {
+    const step = ev.step_name ?? '';
+    if (ev.event_type === 'node_started') openStarts.add(step);
+    else openStarts.delete(step);
+  }
+  return openStarts.size > 0;
 }
 
 async function fetchRunDetail(

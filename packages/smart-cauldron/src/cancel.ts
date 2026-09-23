@@ -23,6 +23,13 @@ export interface CancelRunOptions {
   apiBaseUrl: string;
   /** Overrides ARCHON_OPERATOR_TOKEN env var. */
   token?: string;
+  /**
+   * Human-readable reason recorded on the run_cancelled event
+   * (data.reason). The cancel route reads this body field and persists it, so
+   * a non-empty reason here is what makes `run_cancelled.data.reason` non-empty
+   * instead of "" (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01, Scope IN item 4).
+   */
+  reason?: string;
 }
 
 /**
@@ -32,14 +39,15 @@ export interface CancelRunOptions {
  *          Never throws -- network errors are caught and returned as a result.
  */
 export async function cancelRun(opts: CancelRunOptions): Promise<CancelResult> {
-  const { runId, apiBaseUrl } = opts;
+  const { runId, apiBaseUrl, reason } = opts;
   const token = opts.token ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
 
   let res: Response;
   try {
     res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}/cancel`, {
       method: 'POST',
-      headers: { 'x-archon-operator-token': token },
+      headers: { 'x-archon-operator-token': token, 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: reason ?? '' }),
     });
   } catch (err) {
     const msg = `[smart-cauldron/cancel] network error on POST /api/workflows/runs/${runId}/cancel: ${(err as Error).message}`;
