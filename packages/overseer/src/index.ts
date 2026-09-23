@@ -78,6 +78,7 @@ export {
   hasRepoPolicyEntry,
   MERGE_MANAGER_REPO_POLICY_ENV,
   parseMergeRepoPolicy,
+  resetWarnedLegacyEnvsForTests,
   resolveMergeRepoPolicy,
   unattendedBasesForRepo,
 } from './merge-repo-policy';

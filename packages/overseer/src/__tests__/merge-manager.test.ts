@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, test } from 'bun:test';
 import {
   createMergeManager,
   parseBaseEffectOverrides,
@@ -7,6 +7,11 @@ import {
 } from '../merge-manager.ts';
 import type { QualifiedMergeEvidence } from '../actions/merge-ready.ts';
 import type { GrokDispositionReceipt, WatchedRunRecord } from '../types.ts';
+import { resetWarnedLegacyEnvsForTests } from '../merge-repo-policy.ts';
+
+afterEach(() => {
+  resetWarnedLegacyEnvsForTests();
+});
 
 const RUN_HEAD_SHA = 'a'.repeat(40);
 

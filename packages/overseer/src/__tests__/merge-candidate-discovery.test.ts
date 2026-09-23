@@ -11,7 +11,7 @@
  * of the fix: WHICH enter the candidate set, and WHAT SPECIFIC REASON is
  * recorded for each one that does not. Silence for an excluded PR is the defect.
  */
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   classifyDiscoveredPullRequest,
   classifyPullRequestEvidence,
@@ -26,6 +26,7 @@ import {
   DEFAULT_WATCHED_BASE_BRANCHES,
 } from '../merge-candidate-discovery.ts';
 import type { DiscoveryCursor } from '../merge-candidate-discovery.ts';
+import { resetWarnedLegacyEnvsForTests } from '../merge-repo-policy.ts';
 import { watchLoop, watchOnce } from '../watch.ts';
 import { handleRecord } from '../service.ts';
 import type {
@@ -37,6 +38,10 @@ import type {
   PullRequestEvidence,
   WatchedRunRecord,
 } from '../types.ts';
+
+afterEach(() => {
+  resetWarnedLegacyEnvsForTests();
+});
 
 const OWNER = 'thinmansoftware';
 const REPO = 'bdc-harness';

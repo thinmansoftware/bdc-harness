@@ -4,7 +4,12 @@ import {
   runMergeExecutionBridgeOnce,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
-import { parseMergeRepoPolicy } from '../merge-repo-policy';
+import {
+  parseMergeRepoPolicy,
+  resetWarnedLegacyEnvsForTests,
+  resolveMergeRepoPolicy,
+  warnLegacyMergePolicy,
+} from '../merge-repo-policy';
 import type {
   GitHubClientDeps,
   GitHubPullRequestSearchInput,
@@ -135,6 +140,7 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
 }
 
 afterEach(() => {
+  resetWarnedLegacyEnvsForTests();
   delete process.env.OVERSEER_MAX_MERGES_PER_HOUR;
   delete process.env.OVERSEER_MERGE_REPO_CONFIG;
   delete process.env.MERGE_MANAGER_REPO_POLICY;
@@ -182,6 +188,57 @@ describe('merge execution bridge', () => {
     ).resolves.toBeUndefined();
     expect(h.merges).toBe(0);
     expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
+  });
+
+  test('malformed policy entries do not discard independent valid scopes', () => {
+    const warn = mock(() => undefined);
+    expect(
+      parseMergeRepoPolicy(
+        JSON.stringify({
+          ' ThinManSoftware/typo ': { main: { unattended: true, docs_only: 'merge' } },
+          'thinmansoftware/bdc-xo': {
+            Main: { unattended: true, docs_only: 'merge' },
+            main: { unattended: true, docs_only: 'merge' },
+          },
+        }),
+        { warn }
+      )
+    ).toEqual({
+      'thinmansoftware/bdc-xo': { main: { unattended: true, docsOnly: 'merge' } },
+    });
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  test('combined legacy policy sources merge bases for the same repo', () => {
+    expect(
+      resolveMergeRepoPolicy({
+        legacyRepos: ['thinmansoftware/bdc-xo'],
+        legacyAllowedBases: ['dev'],
+        legacyRepoConfig: { 'thinmansoftware/bdc-xo': { baseBranch: 'main' } },
+      })
+    ).toEqual({
+      'thinmansoftware/bdc-xo': {
+        dev: { unattended: true, docsOnly: 'skip' },
+        main: { unattended: true, docsOnly: 'skip' },
+      },
+    });
+  });
+
+  test('legacy policy emits one deprecation warning per environment key', () => {
+    const warn = mock(() => undefined);
+    const logger = { warn };
+
+    warnLegacyMergePolicy('OVERSEER_MERGE_REPO_CONFIG', logger);
+    warnLegacyMergePolicy('OVERSEER_MERGE_REPO_CONFIG', logger);
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]).toEqual([
+      {
+        env: 'OVERSEER_MERGE_REPO_CONFIG',
+        replacement: 'MERGE_MANAGER_REPO_POLICY',
+      },
+      'merge_manager.legacy_repo_policy_deprecated',
+    ]);
   });
 
   test('docs_only skip preserves the spec_only outcome and sends no mutation', async () => {

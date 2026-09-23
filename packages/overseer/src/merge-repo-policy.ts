@@ -59,58 +59,65 @@ function stringList(value: readonly string[] | string | undefined): readonly str
   return entries.map(entry => entry.trim().toLowerCase()).filter(Boolean);
 }
 
-// AGD Malformed policy always becomes an empty policy: configuration errors may never broaden merge authority.
+function warnMalformedPolicy(logger: PolicyLogger, error: string): void {
+  logger.warn(
+    { env: MERGE_MANAGER_REPO_POLICY_ENV, err: error },
+    'merge_manager.repo_policy_malformed -- ignoring malformed policy scope'
+  );
+}
+
+// AGD Malformed scopes are discarded independently: configuration errors may never broaden merge authority.
 export function parseMergeRepoPolicy(raw: string, logger: PolicyLogger = log): MergeRepoPolicy {
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
-      throw new Error('not_object');
-    const policy: Record<string, Record<string, RepoBasePolicy>> = {};
-    for (const [rawRepo, rawBases] of Object.entries(parsed)) {
-      const repo = normalizeOwnerRepo(rawRepo);
-      if (
-        !repo ||
-        rawRepo !== repo ||
-        !rawBases ||
-        typeof rawBases !== 'object' ||
-        Array.isArray(rawBases)
-      ) {
-        throw new Error('invalid_repo_entry');
-      }
-      const bases: Record<string, RepoBasePolicy> = {};
-      for (const [rawBase, rawRule] of Object.entries(rawBases)) {
-        const base = rawBase.trim().toLowerCase();
-        if (
-          !base ||
-          rawBase !== base ||
-          !rawRule ||
-          typeof rawRule !== 'object' ||
-          Array.isArray(rawRule)
-        ) {
-          throw new Error('invalid_base_entry');
-        }
-        const rule = rawRule as { unattended?: unknown; docs_only?: unknown };
-        if (
-          typeof rule.unattended !== 'boolean' ||
-          (rule.docs_only !== 'merge' && rule.docs_only !== 'skip')
-        ) {
-          throw new Error('invalid_base_rule');
-        }
-        bases[base] = { unattended: rule.unattended, docsOnly: rule.docs_only };
-      }
-      policy[repo] = bases;
-    }
-    return policy;
+    parsed = JSON.parse(raw);
   } catch (error) {
-    logger.warn(
-      {
-        env: MERGE_MANAGER_REPO_POLICY_ENV,
-        err: error instanceof Error ? error.message : 'invalid',
-      },
-      'merge_manager.repo_policy_malformed -- failing closed with an empty policy'
-    );
+    warnMalformedPolicy(logger, error instanceof Error ? error.message : 'invalid');
     return {};
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    warnMalformedPolicy(logger, 'not_object');
+    return {};
+  }
+  const policy: Record<string, Record<string, RepoBasePolicy>> = {};
+  for (const [rawRepo, rawBases] of Object.entries(parsed)) {
+    const repo = normalizeOwnerRepo(rawRepo);
+    if (
+      !repo ||
+      rawRepo !== repo ||
+      !rawBases ||
+      typeof rawBases !== 'object' ||
+      Array.isArray(rawBases)
+    ) {
+      warnMalformedPolicy(logger, 'invalid_repo_entry');
+      continue;
+    }
+    const bases: Record<string, RepoBasePolicy> = {};
+    for (const [rawBase, rawRule] of Object.entries(rawBases)) {
+      const base = rawBase.trim().toLowerCase();
+      if (
+        !base ||
+        rawBase !== base ||
+        !rawRule ||
+        typeof rawRule !== 'object' ||
+        Array.isArray(rawRule)
+      ) {
+        warnMalformedPolicy(logger, 'invalid_base_entry');
+        continue;
+      }
+      const rule = rawRule as { unattended?: unknown; docs_only?: unknown };
+      if (
+        typeof rule.unattended !== 'boolean' ||
+        (rule.docs_only !== 'merge' && rule.docs_only !== 'skip')
+      ) {
+        warnMalformedPolicy(logger, 'invalid_base_rule');
+        continue;
+      }
+      bases[base] = { unattended: rule.unattended, docsOnly: rule.docs_only };
+    }
+    policy[repo] = bases;
+  }
+  return policy;
 }
 
 function legacyPolicy(options: MergeRepoPolicyOptions): MergeRepoPolicy {
@@ -129,7 +136,12 @@ function legacyPolicy(options: MergeRepoPolicyOptions): MergeRepoPolicy {
   for (const [rawRepo, config] of Object.entries(options.legacyRepoConfig ?? {})) {
     const repo = normalizeOwnerRepo(rawRepo);
     const base = config.baseBranch.trim().toLowerCase();
-    if (repo && base) policy[repo] = { [base]: { unattended: true, docsOnly: 'skip' } };
+    if (repo && base) {
+      policy[repo] = {
+        ...policy[repo],
+        [base]: { unattended: true, docsOnly: 'skip' },
+      };
+    }
   }
   return policy;
 }
@@ -170,11 +182,15 @@ export function unattendedBasesForRepo(
     .map(([base]) => base);
 }
 
-export function warnLegacyMergePolicy(env: string): void {
+export function warnLegacyMergePolicy(env: string, logger: PolicyLogger = log): void {
   if (warnedLegacyEnvs.has(env)) return;
   warnedLegacyEnvs.add(env);
-  log.warn(
+  logger.warn(
     { env, replacement: MERGE_MANAGER_REPO_POLICY_ENV },
     'merge_manager.legacy_repo_policy_deprecated'
   );
+}
+
+export function resetWarnedLegacyEnvsForTests(): void {
+  warnedLegacyEnvs.clear();
 }
