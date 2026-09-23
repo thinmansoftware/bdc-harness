@@ -315,28 +315,29 @@ before; resolution now diverges at CHECK time by resolving the recipient's
 `delivery_mode` through the same `assessDispatchRecipient` the grader already
 uses (M-155 Amendment 03). No new evidence kind, no registration-site change.
 
-| recipient delivery_mode                                                      | what satisfies the expectation                                                              | on absence at due_at                                                                                                                                                                                       |
-| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| worker_poll (codex, claude, cursor, duty-officer, overseer-reviewer)         | a done/succeeded reply row for correlation `tm-<id>` (unchanged)                            | unchanged: redispatch up to max_retries, then escalate                                                                                                                                                     |
-| drain_on_start (operator, xo, fable, xo-fable)                               | the dispatched row is **addressed** (`addressed_at` set); pointer `dispatch:<id>:addressed` | escalate once to xo ONLY IF the row is also un-acknowledged; an acknowledged-but-unaddressed row is "read, in progress" -- neither met nor failed until due_at + one further PROOF_DEADLINE, then escalate |
-| notify_only (overseer, cauldron, overseer-review-route, john, merge-manager) | same as drain_on_start                                                                      | same as drain_on_start                                                                                                                                                                                     |
-| alias_resolved (board)                                                       | falls through to the unchanged done-reply query                                             | unchanged                                                                                                                                                                                                  |
-| unknown principal (not in dispatch_principals)                               | unchanged (done-reply query)                                                                | unchanged                                                                                                                                                                                                  |
+| recipient delivery_mode                                                      | what satisfies the expectation                                                                                                                                    | on absence at due_at                                                                                                                                                                                       |
+| ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| worker_poll (codex, claude, cursor, duty-officer, overseer-reviewer)         | a done/succeeded reply row for correlation `tm-<id>` (unchanged)                                                                                                  | unchanged: redispatch up to max_retries, then escalate                                                                                                                                                     |
+| drain_on_start (operator, xo, fable, xo-fable)                               | the dispatched row is **addressed** (`addressed_at` set); pointer `dispatch:<id>:addressed`                                                                       | escalate once to xo ONLY IF the row is also un-acknowledged; an acknowledged-but-unaddressed row is "read, in progress" -- neither met nor failed until due_at + one further PROOF_DEADLINE, then escalate |
+| notify_only (overseer, cauldron, overseer-review-route, john, merge-manager) | same as drain_on_start                                                                                                                                            | same as drain_on_start                                                                                                                                                                                     |
+| alias_resolved (board)                                                       | resolves to the dispatched row's `resolved_recipient` and applies THAT principal's mode (mailbox -> addressed-row proof; worker_poll/unknown -> done-reply query) | follows the resolved recipient's mode                                                                                                                                                                      |
+| unknown principal (not in dispatch_principals)                               | unchanged (done-reply query)                                                                                                                                      | unchanged                                                                                                                                                                                                  |
 
 A read is the proof. An acknowledged-but-unaddressed mailbox row is granted
 exactly **one** further `PROOF_DEADLINE_MS` (24h) extension of `due_at`
 (`due_extended` one-shot flag) before it may escalate.
 
-### Escalation suppression (once per evidence tuple)
+### Escalation dedupe (terminal status, not a per-tick tuple)
 
-An escalation for expectation E is sent at most once per (expectation id,
-evidence tuple). The tuple is the dispatched row's
-`(acknowledged_at, addressed_at, status)`, stored on `tm_expectations.last_escalation_state`
-after a confirmed escalation. If a later tick sees the SAME tuple it logs
-`taskmaster.escalation_suppressed_unchanged` and sends nothing; only a CHANGED
-tuple re-escalates. This makes the existing `idempotency_key`-based
-once-per-expectation guarantee explicit and tested, so an unchanged blocker is
-never re-filed into the xo mailbox tick after tick.
+An escalation for expectation E is sent at most once. A confirmed escalation
+moves the row to terminal `escalated`, and `listDueExpectations` only selects
+`pending`/`failed`/`escalating` -- so an escalated row is never reselected and
+no later tick can re-file the blocker. The terminal status IS the dedupe (an
+unconfirmed send stays `escalating` and is replayed under its deterministic
+escalation `idempotency_key`, which the dispatch DAL dedupes to exactly one
+operator task). An earlier `last_escalation_state` evidence-tuple suppression
+mechanism was removed as dead code: it could only ever be read from a reselected
+row, which the terminal status guarantees never happens.
 
 ### Grading (M-155 Amendment 03 kept, plus one mailbox refinement)
 
@@ -375,7 +376,7 @@ not duplicate the note. Test: `bun run test:taskmaster-regrade`.
 Taskmaster stays PAUSED through the deploy; resuming is John's action.
 
 1. Deploy: the change lands on `archon-app-1` on the next `rebuild-archon.sh`.
-   Migration 056 (`last_escalation_state`, `due_extended`) is additive; apply it
+   Migration 056 (`due_extended`) is additive; apply it
    to `/opt/bdc/archon-data/archon.db` with a `.backup` first (rebuild runbook).
 2. Regrade the history: run `regrade-unmeetable-expectations.ts --confirm` once
    against the live db (after the backup).

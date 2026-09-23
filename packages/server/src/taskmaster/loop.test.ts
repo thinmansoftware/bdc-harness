@@ -3483,8 +3483,20 @@ describe('M-155 exception push (loop)', () => {
   });
 
   test('fire verb environment defaults OFF without a calendar budget', () => {
-    expect(resolveFireVerbEnabled(undefined)).toBe(false);
-    expect(resolveFireVerbEnabled('true')).toBe(true);
+    // resolveFireVerbEnabled(undefined) resolves the DEFAULT parameter, which
+    // reads process.env.TASKMASTER_FIRE_VERB_ENABLED. If the container exports
+    // that var (as this build image does), the "absent" assertion would read the
+    // container value and flake. Isolate the env so the absent case is genuinely
+    // absent, then restore whatever the container had.
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    try {
+      expect(resolveFireVerbEnabled(undefined)).toBe(false);
+      expect(resolveFireVerbEnabled('true')).toBe(true);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
   });
 
   test('push: the loop never resumes itself -- no setPauseState RUNNING write', () => {

@@ -23,7 +23,6 @@ const base: TmExpectation = {
   evidence_pointer: null,
   registered_by: 'taskmaster',
   self_supervised: 0,
-  last_escalation_state: null,
   due_extended: 0,
   created_at: new Date(0).toISOString(),
   updated_at: new Date(0).toISOString(),
@@ -1475,9 +1474,16 @@ describe('mailbox expectation evidence (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-0
     expect(sends).toEqual([]);
   });
 
-  test('mailbox_expectation_absent_escalates_once', async () => {
+  test('mailbox_expectation_absent_escalates_once_then_terminal', async () => {
     // Un-acknowledged, overdue, extension already spent, on_absence escalate.
-    let row: TmExpectation = {
+    //
+    // A confirmed escalation moves the row to terminal 'escalated', and
+    // listDueExpectations only selects 'pending'/'failed'/'escalating' -- so
+    // later ticks never reselect it and escalate nothing. The terminal status
+    // IS the dedupe; there is no per-tick tuple suppression (that mechanism was
+    // dead code -- an escalated row is never reselected to read a tuple from).
+    let status: TmExpectation['status'] = 'pending';
+    const rowTemplate: TmExpectation = {
       ...mailboxBase,
       on_absence: 'escalate',
       max_retries: 0,
@@ -1493,20 +1499,28 @@ describe('mailbox expectation evidence (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-0
     const escalationSends: string[] = [];
     const claimEscalations: number[] = [];
     const deps = {
-      listDueExpectations: async () => [row],
+      // Model production selection exactly: a terminal 'escalated' row is gone.
+      listDueExpectations: async () =>
+        status === 'pending' || status === 'failed' || status === 'escalating'
+          ? [{ ...rowTemplate, status }]
+          : [],
       assessDispatchRecipient: assessAs('drain_on_start'),
       getMessage: async () => unreadRow,
       checkEvidence: async () => {
         throw new Error('checkEvidence must not run for a mailbox recipient');
       },
-      markFailed: async () => true,
-      claimEscalation: async () => {
-        claimEscalations.push(1);
+      markFailed: async () => {
+        status = 'failed';
         return true;
       },
-      markEscalated: async () => true,
-      setLastEscalationState: async (_id: string, tuple: string) => {
-        row = { ...row, last_escalation_state: tuple };
+      claimEscalation: async () => {
+        claimEscalations.push(1);
+        status = 'escalating';
+        return true;
+      },
+      markEscalated: async () => {
+        status = 'escalated';
+        return true;
       },
       createTask: async (_context: never, data: { recipient: string; idempotency_key: string }) => {
         escalationSends.push(`${data.recipient}:${data.idempotency_key}`);
@@ -1521,8 +1535,108 @@ describe('mailbox expectation evidence (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-0
 
     // Exactly one escalation to xo, under the deterministic escalation key.
     expect(escalationSends).toEqual(['xo:tm:expectation:expectation-1:escalate']);
-    // Ticks 2 and 3 suppressed: no second claim, no second send.
+    // Ticks 2 and 3 select nothing: the row is terminal 'escalated'.
     expect(claimEscalations).toEqual([1]);
+    expect(status).toBe('escalated');
+  });
+
+  test('alias_recipient_resolves_to_underlying_mailbox_mode', async () => {
+    // A 'board' alias is a principal whose OWN delivery_mode is 'alias_resolved'
+    // -- not itself a mailbox mode. The dispatched row's resolved_recipient names
+    // the real principal ('operator', drain_on_start), whose mailbox mode
+    // governs: an addressed row is the proof and the done-reply query never runs.
+    const closes: string[] = [];
+    const assessed: string[] = [];
+    await checkExpectations(new Date(1_000_000), {
+      listDueExpectations: async () => [
+        {
+          ...mailboxBase,
+          recipient: 'board',
+          dispatch_ref: 'R',
+          due_at: new Date(9_000_000).toISOString(),
+        },
+      ],
+      assessDispatchRecipient: async (recipient: string) => {
+        assessed.push(recipient);
+        return recipient === 'board'
+          ? {
+              ok: true,
+              canonical_principal: 'board',
+              delivery_mode: 'alias_resolved',
+              reason: null,
+            }
+          : {
+              ok: true,
+              canonical_principal: recipient,
+              delivery_mode: 'drain_on_start',
+              reason: null,
+            };
+      },
+      getMessage: async (id: string) =>
+        makeDispatchRow({
+          id,
+          status: 'queued',
+          resolved_recipient: 'operator',
+          acknowledged_at: new Date(500_000).toISOString(),
+          addressed_at: new Date(600_000).toISOString(),
+        }),
+      // The done-reply query must NEVER run once the alias resolves to a mailbox.
+      checkEvidence: async () => {
+        throw new Error('checkEvidence must not run for an alias resolving to a mailbox recipient');
+      },
+      markMet: async (_id: string, pointer: string) => {
+        closes.push(pointer);
+        return true;
+      },
+    });
+    // The alias is assessed first, then re-assessed via its resolved recipient.
+    expect(assessed).toEqual(['board', 'operator']);
+    // Resolved through the mailbox branch: the addressed row is the proof.
+    expect(closes).toEqual(['dispatch:R:addressed']);
+  });
+
+  test('alias_recipient_resolving_to_worker_poll_uses_done_reply_query', async () => {
+    // An alias whose resolved recipient is a worker_poll principal is NOT a
+    // mailbox: after resolving, it falls through to the unchanged done-reply
+    // query, exactly like a literal worker_poll recipient.
+    const closes: string[] = [];
+    let checkEvidenceCalls = 0;
+    await checkExpectations(new Date(1_000_000), {
+      listDueExpectations: async () => [
+        {
+          ...base,
+          recipient: 'board',
+          dispatch_ref: 'R',
+          due_at: new Date(9_000_000).toISOString(),
+        },
+      ],
+      assessDispatchRecipient: async (recipient: string) =>
+        recipient === 'board'
+          ? {
+              ok: true,
+              canonical_principal: 'board',
+              delivery_mode: 'alias_resolved',
+              reason: null,
+            }
+          : {
+              ok: true,
+              canonical_principal: recipient,
+              delivery_mode: 'worker_poll',
+              reason: null,
+            },
+      getMessage: async (id: string) =>
+        makeDispatchRow({ id, status: 'queued', resolved_recipient: 'codex' }),
+      checkEvidence: async () => {
+        checkEvidenceCalls += 1;
+        return { ok: true, pointer: 'dispatch:reply-1' };
+      },
+      markMet: async (_id: string, pointer: string) => {
+        closes.push(pointer);
+        return true;
+      },
+    });
+    expect(checkEvidenceCalls).toBe(1);
+    expect(closes).toEqual(['dispatch:reply-1']);
   });
 
   test('worker_poll_recipient_unchanged', async () => {
