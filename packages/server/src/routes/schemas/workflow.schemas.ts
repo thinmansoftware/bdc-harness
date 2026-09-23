@@ -367,14 +367,9 @@ export const runWorkflowBodySchema = z
     conductor: conductorDispatchSchema.optional(),
     modelOverride: z
       .object({
-        workflow: z
-          .object({ provider: z.string().optional(), model: z.string() })
-          .optional(),
+        workflow: z.object({ provider: z.string().optional(), model: z.string() }).optional(),
         nodes: z
-          .record(
-            z.string(),
-            z.object({ provider: z.string().optional(), model: z.string() })
-          )
+          .record(z.string(), z.object({ provider: z.string().optional(), model: z.string() }))
           .optional(),
       })
       .optional(),
