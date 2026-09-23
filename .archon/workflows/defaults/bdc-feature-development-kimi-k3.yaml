@@ -3598,17 +3598,20 @@ nodes:
       sme_field() {
         printf '%s\n' "$2" | grep -E "^${1}=" | head -1 | sed "s/^${1}=//" || true
       }
-      # sme_process <tests_line> <tests_status> <grep_line> <grep_status>
+      # sme_process <tests_line> <tests_status> <grep_line> <grep_status> [grep_unparsed] [grep_dropped]
       #   (manifest on stdin -> stdout). Rewrites the first "Tests:" and first
       #   "Grep assertions:" lines with the observed values; a manifest without a
       #   "Tests:" line is the short ALREADY_SATISFIED / BLOCKED form and passes through.
       #   Missing evidence (a skipped run-stop-* node) is stamped honestly as Tests: N/A
       #   or Grep assertions: MISSING. When tests failed or a grep stop condition
-      #   mismatched, "VALIDATION: PASS" becomes "VALIDATION: FAIL". A "Stop conditions:"
-      #   audit line is inserted after VALIDATION: (a non-label line there is outside
-      #   every bdc-ci section; OUTCOME: already lives there).
+      #   mismatched, "VALIDATION: PASS" becomes "VALIDATION: FAIL". grep_status=incomplete
+      #   (>=1 condition executed and none mismatched) is NOT a failure: it is admitted and
+      #   the unparsed condition names + dropped count are appended to the "Stop conditions:"
+      #   audit line (WO-HARNESS-MANIFEST-EVIDENCE-FALSE-POSITIVES-01). A "Stop conditions:"
+      #   audit line is inserted after VALIDATION: (a non-label line there is outside every
+      #   bdc-ci section; OUTCOME: already lives there).
       sme_process() {
-        local tests_line="$1" tests_status="$2" grep_line="$3" grep_status="$4" manifest verdict
+        local tests_line="$1" tests_status="$2" grep_line="$3" grep_status="$4" grep_unparsed="${5:-}" grep_dropped="${6:-}" manifest verdict stopx names
         manifest="$(cat)"
         if ! printf '%s\n' "$manifest" | grep -qE '^Tests:'; then
           printf '%s\n' "$manifest"
@@ -3619,10 +3622,16 @@ nodes:
         [ -n "$grep_line" ] || grep_line="MISSING (run-stop-greps produced no output)"
         [ -n "$grep_status" ] || grep_status="missing"
         verdict="keep"
-        if [ "$tests_status" = "failed" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "incomplete" ] || [ "$grep_status" = "missing" ]; then
+        if [ "$tests_status" = "failed" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "missing" ]; then
           verdict="fail"
         fi
-        printf '%s\n' "$manifest" | T_LINE="Tests: ${tests_line}" G_LINE="Grep assertions: ${grep_line}" S_LINE="Stop conditions: tests=${tests_status}; greps=${grep_status} (observed by run-stop-tests / run-stop-greps in the run worktree)" VERDICT="$verdict" awk '
+        stopx=""
+        if [ "$grep_status" = "incomplete" ]; then
+          names="$(printf '%s\n' "$grep_line" | sed -n 's/.*UNVERIFIED (unparsed): //p' | head -1)"
+          [ -n "$names" ] || names="${grep_unparsed:-0} unnamed"
+          stopx="; unparsed=${names}; dropped=${grep_dropped:-0}"
+        fi
+        printf '%s\n' "$manifest" | T_LINE="Tests: ${tests_line}" G_LINE="Grep assertions: ${grep_line}" S_LINE="Stop conditions: tests=${tests_status}; greps=${grep_status}${stopx} (observed by run-stop-tests / run-stop-greps in the run worktree)" VERDICT="$verdict" awk '
           !ts && /^Tests:/ { print ENVIRON["T_LINE"]; ts = 1; next }
           !gs && /^Grep assertions:/ { print ENVIRON["G_LINE"]; gs = 1; next }
           !vs && /^VALIDATION:/ {
@@ -3650,7 +3659,8 @@ nodes:
       )
       printf '%s\n' "$MANIFEST_OUT" | sme_process \
         "$(sme_field TESTS_LINE "$TESTS_OUT")" "$(sme_field TESTS_STATUS "$TESTS_OUT")" \
-        "$(sme_field GREP_LINE "$GREPS_OUT")" "$(sme_field GREP_STATUS "$GREPS_OUT")"
+        "$(sme_field GREP_LINE "$GREPS_OUT")" "$(sme_field GREP_STATUS "$GREPS_OUT")" \
+        "$(sme_field GREP_UNPARSED "$GREPS_OUT")" "$(sme_field GREP_DROPPED "$GREPS_OUT")"
 
   # bdc-xo #1940. manifest-evidence-check fails CLOSED (exit 1, no PR-body patch) when
   # a CODE or MIXED WO would publish "Tests: N/A ..." (Rule 10 / manifest v2 require
@@ -3675,14 +3685,26 @@ nodes:
       mec_field() {
         printf '%s\n' "$2" | grep -E "^${1}=" | head -1 | sed "s/^${1}=//" || true
       }
-      # mec_check <reclassify_status> <class> <tests_status> <grep_declared> <grep_status>
-      #   (stamped manifest on stdin -> "OK" rc 0, or "EVIDENCE_ERROR: ..." rc 1)
-      #   Only a PROCEED run (real build, real PR) is gated. CODE/MIXED: the Tests: line
-      #   must be "<n>/<n> ...". Any class: run-stop-greps must report its declaration
-      #   count and status, and declared greps may not publish N/A. A short manifest is
-      #   the ALREADY_SATISFIED / BLOCKED form and is not gated.
+      # mec_check <reclassify_status> <class> <tests_status> <tests_exit> <grep_declared> \
+      #           <grep_executed> <grep_dropped> <grep_unparsed> <grep_mismatch> <grep_status> [grep_detail]
+      #   (stamped manifest on stdin -> "OK" rc 0, or "EVIDENCE_ERROR: ..."/"SPEC_DEFECT: ..." rc 1)
+      #   Only a PROCEED run (real build, real PR) is gated. A short manifest (no Tests:
+      #   line) is the ALREADY_SATISFIED / BLOCKED form and is not gated.
+      #   Tests (CODE/MIXED): admit a "<n>/<n> ..." line, or tests_status=counts_unparsed
+      #   with tests_exit=0 -- the declared command ran and exited clean but printed no
+      #   parseable counts (ran, no counts, NOT "N/A"). A failed / declared-but-unrun /
+      #   nonzero-exit command is still refused (bdc-xo #1940).
+      #   Grep (any class, declared>0): passed or incomplete (>=1 executed, no mismatch)
+      #   -> OK; mismatch (an executed grep returned the wrong count) -> EVIDENCE_ERROR;
+      #   all_dropped (0 executed: prose / allowlist-refused / errored conditions) -> rc 1
+      #   with a SPEC_DEFECT: prefix naming the conditions, attributing the failure to the
+      #   spec's stop-condition shape (Rule 4) rather than the builder
+      #   (WO-HARNESS-MANIFEST-EVIDENCE-FALSE-POSITIVES-01). Every integer input is guarded
+      #   so an empty value (a skipped upstream node) cannot crash the arithmetic; an empty
+      #   tests_exit is treated as nonzero (unknown => not admitted); grep_detail defaults to
+      #   the empty string and its line is omitted when absent.
       mec_check() {
-        local status="$1" class="$2" tests_status="$3" grep_declared="$4" grep_status="$5" manifest tests_line grep_line
+        local status="$1" class="$2" tests_status="$3" tests_exit="$4" grep_declared="$5" grep_executed="$6" grep_dropped="$7" grep_unparsed="$8" grep_mismatch="$9" grep_status="${10}" grep_detail="${11:-}" manifest tests_line grep_line msg
         manifest="$(cat)"
         if [ "$status" != "PROCEED" ]; then
           echo "OK"
@@ -3697,8 +3719,12 @@ nodes:
         [ -n "$class" ] || class="CODE"
         case "$class" in
           CODE|MIXED)
-            if ! printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+'; then
-              echo "EVIDENCE_ERROR: Tests: \"${tests_line}\" on a ${class} WO (tests_status=${tests_status:-missing}). Manifest v2 / Rule 10 require \"Tests: <pass>/<total> (<command>)\" from an executed command; N/A is not admissible on a ${class} WO (bdc-xo #1940)." >&2
+            if printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+'; then
+              :
+            elif [ "$tests_status" = "counts_unparsed" ] && [ "${tests_exit:-1}" -eq 0 ] 2>/dev/null; then
+              :
+            else
+              echo "EVIDENCE_ERROR: Tests: \"${tests_line}\" on a ${class} WO (tests_status=${tests_status:-missing}, tests_exit=${tests_exit:-missing}). Manifest v2 / Rule 10 require \"Tests: <pass>/<total> (<command>)\" from an executed command, or an exit-0 run whose counts could not be parsed; a failed, unrun, or nonzero-exit command is not admissible on a ${class} WO (bdc-xo #1940)." >&2
               return 1
             fi
             ;;
@@ -3708,14 +3734,25 @@ nodes:
           return 1
         fi
         if [ "$grep_declared" -gt 0 ] 2>/dev/null; then
-          if [ "$grep_status" != "passed" ]; then
-            echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) were declared but grep_status=${grep_status:-missing}. Every declared grep stop condition must execute before manifest evidence can be published (bdc-xo #1940)." >&2
-            return 1
-          fi
-          if printf '%s\n' "$grep_line" | grep -qiE '^(n/a|none|\(none\)|\[list\]|\[\])'; then
-            echo "EVIDENCE_ERROR: Grep assertions: \"${grep_line}\" but the spec declares ${grep_declared} grep stop condition(s) (grep_status=${grep_status:-missing}). Declared grep stop conditions must be executed and their observed counts published (bdc-xo #1940)." >&2
-            return 1
-          fi
+          case "$grep_status" in
+            passed|incomplete)
+              :
+              ;;
+            mismatch)
+              echo "EVIDENCE_ERROR: ${grep_mismatch:-1} of ${grep_declared} declared grep stop condition(s) executed but returned the wrong count (grep_status=mismatch). An executed grep assertion that fails its expected count is real evidence against the work (bdc-xo #1940)." >&2
+              return 1
+              ;;
+            all_dropped)
+              msg="SPEC_DEFECT: ${grep_declared} grep stop condition(s) were declared but none were executable (grep_executed=${grep_executed:-0}): each was prose the parser could not read, refused by the read-only allowlist, or errored. Rule 4 requires a stop condition to be a runnable command; validate-wo-spec.sh check 7 should catch this at authoring. Attribute this to the spec's stop-condition shape, not the builder (bdc-xo #1940)."
+              [ -n "$grep_detail" ] && msg="${msg}"$'\n'"${grep_detail}"
+              printf '%s\n' "$msg" >&2
+              return 1
+              ;;
+            *)
+              echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) were declared but grep_status=${grep_status:-missing}. Every declared grep stop condition must execute before manifest evidence can be published (bdc-xo #1940)." >&2
+              return 1
+              ;;
+          esac
         fi
         echo "OK"
         return 0
@@ -3739,9 +3776,14 @@ nodes:
       $stamp-manifest-evidence.output
       BDC_NODE_OUTPUT_MANIFEST
       )
+      GREP_DETAIL=$(printf '%s\n' "$GREPS_OUT" | sed -n '/--- per-assertion detail ---/,$p' | grep -E '^(DROPPED|MISMATCH)' || true)
       printf '%s\n' "$MANIFEST_OUT" | mec_check "$STATUS" \
         "$(mec_field TESTS_CLASS "$TESTS_OUT")" "$(mec_field TESTS_STATUS "$TESTS_OUT")" \
-        "$(mec_field GREP_DECLARED "$GREPS_OUT")" "$(mec_field GREP_STATUS "$GREPS_OUT")"
+        "$(mec_field TESTS_EXIT "$TESTS_OUT")" \
+        "$(mec_field GREP_DECLARED "$GREPS_OUT")" "$(mec_field GREP_EXECUTED "$GREPS_OUT")" \
+        "$(mec_field GREP_DROPPED "$GREPS_OUT")" "$(mec_field GREP_UNPARSED "$GREPS_OUT")" \
+        "$(mec_field GREP_MISMATCH "$GREPS_OUT")" "$(mec_field GREP_STATUS "$GREPS_OUT")" \
+        "$GREP_DETAIL"
 
   - id: stamp-manifest-pr
     persona: major-build
