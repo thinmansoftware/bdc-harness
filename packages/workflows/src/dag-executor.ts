@@ -1849,12 +1849,16 @@ async function resolveNodeProviderAndModel(
     const registry = await getAgentRegistry(cwd);
     const persona = resolveAgent(agentName, registry);
     if (persona) {
-      // A per-node override owns the binding completely. In particular, a codex
-      // override must not be rejected merely because the YAML persona pins a
-      // Claude model; retain the persona prompt/tools while ignoring its model.
+      // A per-node override owns the binding completely. It must not be rejected
+      // because the persona pins a different provider's model, or because a
+      // Claude-targeted override is paired with a persona that has no model.
+      // Retain the persona prompt/tools while replacing its model binding with
+      // the override for Claude (whose persona resolver requires a model) and
+      // removing it for providers whose persona resolver does not.
+      const nodeBindingOverride = modelOverride?.nodes?.[node.id];
       const personaForResolution =
-        modelOverride?.nodes?.[node.id] && provider === 'codex'
-          ? { ...persona, model: undefined }
+        nodeBindingOverride
+          ? { ...persona, model: provider === 'claude' ? model : undefined }
           : persona;
       const personaResolution = resolveAgentPersona(personaForResolution, effectiveModel, provider);
       effectiveModel = resolveModelForNode({

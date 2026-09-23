@@ -11267,9 +11267,14 @@ describe('agent persona dispatch', () => {
     }
   });
 
-  async function writeAgentFile(name: string, model: string, tools?: string[]): Promise<void> {
+  async function writeAgentFile(
+    name: string,
+    model?: string,
+    tools?: string[]
+  ): Promise<void> {
     const toolsLine = tools ? `tools: [${tools.join(', ')}]` : '';
-    const content = `---\nname: ${name}\nmodel: ${model}\n${toolsLine}\n---\n\nYou are the ${name} agent.\n`;
+    const modelLine = model ? `model: ${model}` : '';
+    const content = `---\nname: ${name}\n${modelLine}\n${toolsLine}\n---\n\nYou are the ${name} agent.\n`;
     await writeFile(join(testDir, '.archon', 'agents', `${name}.md`), content, 'utf-8');
   }
 
@@ -11344,6 +11349,46 @@ describe('agent persona dispatch', () => {
     expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     // Persona model (sonnet) wins over node model (opus)
+    expect(optionsArg.model).toBe('sonnet');
+  });
+
+  it('Claude node override supplies the model for a persona without one', async () => {
+    await writeAgentFile('provider-agnostic-test-agent');
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-claude-override');
+    const nodes: DagNode[] = [
+      {
+        id: 'plan',
+        agent: 'provider-agnostic-test-agent',
+        prompt: 'Plan.',
+      } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'claude-override-test', nodes },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      { nodes: { plan: { provider: 'claude', model: 'sonnet' } } }
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalled();
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     expect(optionsArg.model).toBe('sonnet');
   });
 

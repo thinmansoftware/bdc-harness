@@ -49,5 +49,16 @@ describe('resolveModelForNode', () => {
     expect(
       resolveModelForNode({ ...defaults, nodeProvider: 'claude', personaModel: 'opus' })
     ).toEqual({ provider: 'claude', model: 'opus' });
+    expect(resolveModelForNode({ ...defaults, nodeProvider: 'claude' })).toEqual({
+      provider: 'claude',
+      model: 'assistant-sonnet',
+    });
+    expect(
+      resolveModelForNode({
+        ...defaults,
+        nodeProvider: 'opr',
+        fallbackModel: 'fallback-model',
+      })
+    ).toEqual({ provider: 'opr', model: 'fallback-model' });
   });
 });
