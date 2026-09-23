@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
 import { rootLogger } from '@archon/paths';
 import {
+  resetSecurityDetectorStateForTests,
   classifyRuns,
   isoWeekUtc,
   mintAppInstallationToken,
@@ -25,7 +26,10 @@ function deps(
   };
 }
 
+beforeEach(resetSecurityDetectorStateForTests);
+
 afterEach(() => {
+  resetSecurityDetectorStateForTests();
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS;
   delete process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS;
@@ -91,7 +95,8 @@ describe('duty officer security detector', () => {
         for (let run = 0; run < 2; run += 1) {
           if (allowList === undefined) delete process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS;
           else process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS = allowList;
-          // A fresh dependency object starts another evaluation at the same deterministic time.
+          // Each trust check is an independent evaluation at the same deterministic time.
+          resetSecurityDetectorStateForTests();
           const result = await runSecurityDetector({ ...d });
           expect(result?.verdict).toBe('alarm');
           const codes = result!.reasons.map(reason => reason.code);

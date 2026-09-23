@@ -2,7 +2,11 @@ import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
-import type { SecurityDetectorResult } from './duty-officer-security-detector';
+import {
+  resetSecurityDetectorStateForTests,
+  runSecurityDetector,
+  type SecurityDetectorResult,
+} from './duty-officer-security-detector';
 import {
   githubIssueInAllowList,
   startDutyOfficerClock,
@@ -126,6 +130,9 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
 
 afterEach(() => {
   stopDutyOfficerClock();
+  resetSecurityDetectorStateForTests();
+  delete process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS;
+  delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS;
   delete process.env.DUTY_OFFICER_CLOCK_ENABLED;
   delete process.env.DUTY_OFFICER_GH_NUDGE;
   delete process.env.DUTY_OFFICER_GH_REPO;
@@ -163,6 +170,61 @@ async function seedDetector(): Promise<DutyOfficerClockDeps> {
 }
 
 describe('duty officer clock', () => {
+  test('fresh deps each tick preserve detector throttle and verdict until the interval expires', async () => {
+    resetSecurityDetectorStateForTests();
+    process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
+    process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
+    const interval = 21_600_000;
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS = String(interval);
+    const start = Date.parse('2026-09-30T12:00:00Z');
+    let tickTime = start;
+    const fetchImpl = mock(async (url: string | URL | Request) =>
+      Response.json(String(url).includes('/runs?') ? { workflow_runs: [] } : [])
+    );
+    const writeTokenProvider = mock(async () => null);
+    // Mirror createRealDutyOfficerClockDeps: construct detector deps on every invocation.
+    const createTickDeps = (): DutyOfficerClockDeps => ({
+      ...fakeDeps([]),
+      now: () => new Date(tickTime),
+      securityDetector: signal =>
+        runSecurityDetector(
+          {
+            fetchImpl: fetchImpl as typeof fetch,
+            readToken: () => 'test-read-token',
+            writeTokenProvider,
+            now: () => new Date(tickTime),
+            buildSha: 'test-build',
+          },
+          signal
+        ),
+    });
+
+    const first = createTickDeps();
+    await tickDutyOfficerClock(first);
+    const prior = registeredDetector(first);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(writeTokenProvider).toHaveBeenCalledTimes(1);
+    expect(prior.last_run_at).toBe(new Date(start).toISOString());
+
+    tickTime += 900_000;
+    const second = createTickDeps();
+    await tickDutyOfficerClock(second);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(writeTokenProvider).toHaveBeenCalledTimes(1);
+    expect(registeredDetector(second)).toEqual({
+      ...prior,
+      last_tick_detector_outcome: 'skipped_throttled',
+      last_tick_at: new Date(tickTime).toISOString(),
+    });
+
+    tickTime = start + interval + 1;
+    const third = createTickDeps();
+    await tickDutyOfficerClock(third);
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+    expect(writeTokenProvider).toHaveBeenCalledTimes(2);
+    expect(registeredDetector(third).last_run_at).toBe(new Date(tickTime).toISOString());
+  });
+
   test('completed detector evidence survives three throttled ticks and both registrations', async () => {
     const deps = await seedDetector();
     const prior = registeredDetector(deps);
@@ -539,7 +601,7 @@ describe('duty officer clock', () => {
       await tickDutyOfficerClock(deps);
       expect(receivedSignal?.aborted).toBe(true);
       queued.push(message({ id: 'after-detector-timeout' }));
-      await tickDutyOfficerClock(deps);
+      await tickDutyOfficerClock({ ...deps });
       expect(deps.securityDetector).toHaveBeenCalledTimes(1);
       expect(
         lines.some(line => line.includes('duty_officer_security_detector_skipped_in_flight'))

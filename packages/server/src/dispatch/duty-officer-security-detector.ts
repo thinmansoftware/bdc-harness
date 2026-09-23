@@ -9,7 +9,12 @@ const API = 'https://api.github.com';
 const DETECTOR_MARKER = '<!-- security-detector-issue -->';
 const COMMENT_MARKER = '<!-- security-detector -->';
 const REPORT_TITLE = /^Security Scan -- (\d{4})-W(\d{2})$/;
-const PROCESS_RUNS = new WeakMap<object, number>();
+// Clock ticks create fresh deps; throttle state lives for the process lifetime.
+const PROCESS_RUNS = new Map<string, { last_run_at: number }>();
+
+export function resetSecurityDetectorStateForTests(): void {
+  PROCESS_RUNS.clear();
+}
 
 export type SecurityDetectorVerdict = 'clean' | 'alarm' | 'disarmed' | 'observation_error';
 export interface SecurityDetectorReason {
@@ -279,12 +284,14 @@ export async function runSecurityDetector(
   signal.throwIfAborted();
   const now = deps.now();
   const interval = positiveMs('DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS', 21_600_000);
-  const previous = PROCESS_RUNS.get(deps as object);
-  if (previous !== undefined && now.getTime() - previous < interval) {
+  const repo = targetRepo();
+  const stateKey = `duty-officer-clock:${repo.toLowerCase()}`;
+  const previous = PROCESS_RUNS.get(stateKey);
+  if (previous !== undefined && now.getTime() - previous.last_run_at < interval) {
     log.info('duty_officer_security_detector_skipped_throttle');
     return null;
   }
-  PROCESS_RUNS.set(deps as object, now.getTime());
+  PROCESS_RUNS.set(stateKey, { last_run_at: now.getTime() });
   const trustedLogins = new Set(
     (
       process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS ??
@@ -298,7 +305,6 @@ export async function runSecurityDetector(
   const evaluatedAt = now.toISOString();
   const armedAt = process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT?.trim() || '9999-12-31';
   const armed = now.getTime() >= Date.parse(`${armedAt}T00:00:00Z`);
-  const repo = targetRepo();
   const token = deps.readToken();
   const result: SecurityDetectorResult = {
     verdict: armed ? 'clean' : 'disarmed',
