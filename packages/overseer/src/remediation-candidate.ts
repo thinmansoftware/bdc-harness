@@ -392,45 +392,42 @@ export function decideRemediation(input: RemediationCandidateInput): Remediation
  * gate on this WO's own PR, 2026-08-28 -- fittingly, the very loop this WO
  * builds).
  *
- * THE KEY IS (PR, HEAD SHA) -- one candidate per reviewed head.
+ * THE KEY IS (PR, ATTEMPT) -- one row per attempt slot.
  *
- * This has been wrong twice, in opposite directions, and both failures are
- * worth keeping written down because the fix for one caused the other.
+ * This key has been wrong three times, in a cycle, so the whole reasoning is
+ * recorded here. Read it before changing the shape again.
  *
- * Round 1 keyed on (PR, head, attempt). Counting attempts and then inserting is
- * a read-then-write race, so two rejected reviews for DIFFERENT heads could each
- * read the same prior count, compute the same attempt number, and -- because
- * their keys differed by SHA -- both insert. That exceeded
- * MAX_REMEDIATION_ATTEMPTS.
+ *   Round 1: (PR, head, attempt). Counting attempts then inserting is a
+ *     read-then-write race, so two racers on DIFFERENT heads computed the same
+ *     attempt and -- their keys differing by SHA -- both inserted. Cap exceeded.
+ *   Round 2: (PR, attempt). Closed that race, but broke REDELIVERY: after
+ *     attempt 1 lands the count returns 1, so the SAME verdict replayed
+ *     computed attempt 2 and inserted a duplicate.
+ *   Round 3: (PR, head). Fixed redelivery, and reintroduced round 1 -- two
+ *     heads read the same below-cap count and each got its own key.
  *
- * Round 2 dropped the SHA, keying on (PR, attempt). That closed the race but
- * broke REDELIVERY, which the gate caught on this PR (2026-09-04): after
- * attempt 1 lands, `countPriorRemediationAttempts` returns 1, so replaying the
- * SAME verdict computes attempt 2 -- a different key, a second insert, and half
- * the cap consumed by a duplicate delivery. Spec safety rule 3 says re-delivery
- * of the same verdict must not enqueue a second candidate.
+ * The lesson is that ONE key cannot carry both properties, because the only
+ * atomic primitive available is a single UNIQUE index:
  *
- * Keying on the HEAD SHA satisfies both at once, because the head is what
- * actually identifies the verdict:
- *   - Redelivery of the same verdict -> same head -> same key -> DB no-op.
- *   - Two racers on DIFFERENT heads -> different keys, but each head can yield
- *     at most ONE row, so the count they race on cannot be inflated past the
- *     number of distinct reviewed heads.
- *   - A legitimate retry after a fix push -> new head -> new key -> allowed,
- *     and still bounded because `decideRemediation` refuses once the count
- *     reaches the cap.
+ *   - Atomic cap needs the key to be the SCARCE RESOURCE (the attempt slot).
+ *   - Idempotent redelivery needs the key to be the VERDICT IDENTITY (the head).
  *
- * The attempt NUMBER remains in the body for audit and for the builder's
- * context; it is deliberately no longer part of the uniqueness decision.
+ * Those are different things, so they are enforced in different places. The KEY
+ * is the attempt slot, which keeps the cap atomic. REDELIVERY is settled before
+ * the insert, by checking whether any existing candidate for this PR already
+ * names this head (see emitRemediationCandidate).
+ *
+ * Do not "simplify" this by folding the head back into the key. That is round 1
+ * and round 3, and it silently unbounds the reviewer-fix-reviewer loop.
  */
 export function remediationIdempotencyKey(input: {
   owner: string;
   repo: string;
   prNumber: number;
-  headSha: string;
+  attempt: number;
 }): string {
   const slug = `${input.owner.toLowerCase()}/${input.repo.toLowerCase()}#${input.prNumber}`;
-  return `overseer-remediation:${slug}:head-${input.headSha}`;
+  return `overseer-remediation:${slug}:attempt-${input.attempt}`;
 }
 
 /**

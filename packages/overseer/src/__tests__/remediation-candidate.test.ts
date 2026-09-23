@@ -166,33 +166,29 @@ describe('scenario 4: idempotency', () => {
    * verdict. Redelivery is a no-op; a genuinely new head is a new slot; the cap
    * is enforced by decideRemediation, not by key collision.
    */
-  test('REDELIVERY of the same verdict computes the SAME key even as the count moves', () => {
-    const first = decideRemediation(baseInput({ priorAttempts: 0 }));
-    // Production counts the row the first delivery just wrote.
-    const replay = decideRemediation(baseInput({ priorAttempts: 1 }));
-    if (!first.emit || !replay.emit) throw new Error('expected both to emit');
+  test('the key is the ATTEMPT SLOT, which is the scarce resource the cap needs', () => {
+    const slotOne = remediationIdempotencyKey({
+      owner: 'thinmansoftware',
+      repo: 'shopops',
+      prNumber: 650,
+      attempt: 1,
+    });
+    const slotTwo = remediationIdempotencyKey({
+      owner: 'thinmansoftware',
+      repo: 'shopops',
+      prNumber: 650,
+      attempt: 2,
+    });
 
-    // The attempt NUMBER legitimately advances -- it is audit metadata...
-    expect(first.body.attempt).toBe(1);
-    expect(replay.body.attempt).toBe(2);
-    // ...but the KEY does not, so the DB refuses the duplicate.
-    expect(remediationIdempotencyKey({ ...replay.body })).toBe(
-      remediationIdempotencyKey({ ...first.body })
-    );
-    expect(remediationIdempotencyKey({ ...first.body })).toContain(first.body.headSha);
+    expect(slotOne).not.toBe(slotTwo);
+    expect(slotOne).toContain('thinmansoftware/shopops#650');
+    // The head must NOT appear: folding it in gives every head its own key,
+    // which is how rounds 1 and 3 unbounded the loop. Redelivery is settled in
+    // emitRemediationCandidate by comparing heads BEFORE the insert, not here.
+    expect(slotOne).not.toContain('f868542e');
   });
 
-  test('a DIFFERENT head is a different key, and the cap still refuses past it', () => {
-    const headTwo = 'bbbb22220000000000000000000000000000cccc';
-    const first = decideRemediation(baseInput({ priorAttempts: 0 }));
-    const second = decideRemediation(baseInput({ priorAttempts: 1, headSha: headTwo }));
-    if (!first.emit || !second.emit) throw new Error('expected both to emit');
-
-    expect(remediationIdempotencyKey({ ...second.body })).not.toBe(
-      remediationIdempotencyKey({ ...first.body })
-    );
-
-    // Bounding is decideRemediation's job now, not the UNIQUE constraint's.
+  test('the cap refuses once the count reaches it, whatever the head', () => {
     const third = decideRemediation(
       baseInput({ priorAttempts: MAX_REMEDIATION_ATTEMPTS, headSha: 'cccc3333' })
     );

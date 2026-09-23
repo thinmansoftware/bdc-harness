@@ -1357,6 +1357,66 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
    * That is the thing worth testing, and this replaces the now-obsolete
    * collision assertion rather than deleting the coverage.
    */
+  /**
+   * REGRESSION -- PR #740 round 4 [major] (2026-09-04).
+   *
+   * The cap must hold when the count is read CONCURRENTLY, not just when
+   * deliveries are sequential. Under head-keyed idempotency three racers on
+   * three distinct heads each read prior count 0, each built a candidate, and
+   * each inserted under its own key -- three rows against a cap of two.
+   *
+   * This drives them with NO awaits in between (all decided from the same
+   * below-cap count, then emitted together), which is the interleaving the
+   * sequential test cannot produce. The attempt SLOT is the scarce resource, so
+   * however the reads interleave, at most MAX_REMEDIATION_ATTEMPTS rows exist.
+   */
+  test('CONCURRENT racers on distinct heads cannot exceed the cap', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    const count = deps.countPriorRemediationAttempts;
+    if (!emit || !count) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 652 };
+    const findings = [
+      {
+        scope: 'migrations/041.sql',
+        severity: 'blocker' as const,
+        summary:
+          'The migration updates the parent before the child rows; the composite foreign key rejects that ordering.',
+      },
+    ];
+
+    // Every racer decides from the SAME below-cap count -- the stale read.
+    const priorAttempts = await count(pr);
+    expect(priorAttempts).toBe(0);
+
+    const heads = ['1'.repeat(40), '2'.repeat(40), '3'.repeat(40), '4'.repeat(40)];
+    const bodies = heads.map(headSha => {
+      const decision = decideRemediation({
+        ...pr,
+        headSha,
+        verdict: 'CHANGES_REQUESTED',
+        findings,
+        verdictBody: `verdict at ${headSha}`,
+        priorAttempts,
+      });
+      if (!decision.emit) throw new Error('expected every racer to build a candidate');
+      return decision.body;
+    });
+
+    const results = await Promise.all(bodies.map(b => emit(b)));
+    const won = results.filter(r => r.claimed).length;
+
+    // At most the cap may win, and the durable rows must agree.
+    expect(won).toBe(MAX_REMEDIATION_ATTEMPTS);
+    expect(await count(pr)).toBe(MAX_REMEDIATION_ATTEMPTS);
+    const rows = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE recipient = $1',
+      [REMEDIATION_RECIPIENT]
+    );
+    expect(Number(rows.rows[0]?.n ?? 0)).toBe(MAX_REMEDIATION_ATTEMPTS);
+  });
+
   test('distinct heads each get a slot, but the CAP still bounds the loop', async () => {
     const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
     const emit = deps.emitRemediationCandidate;

@@ -171,36 +171,41 @@ credential" is non-auto).
    wildcard and no default-auto branch.
 3. **Mixed verdicts go to the human.** One blocking judgment-call finding among
    otherwise fixable ones refuses the whole verdict.
-4. **Idempotent per (PR, HEAD SHA)** -- one candidate per reviewed head. The
-   key is `overseer-remediation:owner/repo#N:head-<sha>`. `idempotency_key` is
-   UNIQUE and the insert uses `ON CONFLICT DO NOTHING`, so a redelivered verdict
-   is a database no-op.
+4. **Two properties, enforced in two places.** They cannot share one key.
 
-   **This has been wrong twice, in opposite directions.** Round 1 keyed on
-   (PR, head, attempt): counting attempts then inserting is a read-then-write
-   race, so two racers on different heads could read the same count, compute the
-   same attempt, and both insert -- the cap was exceeded. Round 2 dropped the
-   SHA to close that race, and thereby broke REDELIVERY: after attempt 1 lands
-   the count returns 1, so replaying the SAME verdict computed attempt 2, a new
-   key, and a duplicate row that also consumed half the cap (PR #740 round 3,
-   2026-09-04).
+   The only atomic primitive is the UNIQUE index on
+   `(sender_principal_id, idempotency_key)`, so one key buys one guarantee:
+   key it on the attempt slot and the cap is atomic but redelivery duplicates;
+   key it on the head and redelivery is a no-op but concurrent heads blow the
+   cap. This was learned the hard way THREE times on this PR:
 
-   The head satisfies both because **the head is what identifies a verdict**.
-   Redelivery -> same head -> same key -> no-op. A genuine retry after a fix
-   push -> new head -> new slot -> allowed. The attempt NUMBER stays in the body
-   for audit and builder context but is no longer part of uniqueness.
+   | Round | Key                                   | Fixed      | Broke                                 |
+   | ----- | ------------------------------------- | ---------- | ------------------------------------- |
+   | 1     | (PR, head, attempt)                   | --         | concurrent heads exceed the cap       |
+   | 2     | (PR, attempt)                         | the race   | redelivery duplicates                 |
+   | 3     | (PR, head)                            | redelivery | concurrent heads exceed the cap again |
+   | 4     | (PR, attempt) + pre-insert head check | both       | --                                    |
 
-   **Bounding is now `decideRemediation`'s job, not the constraint's.** It
-   refuses once the derived count reaches `MAX_REMEDIATION_ATTEMPTS`. Do not
-   re-add the attempt number to the key to "make the cap atomic" -- that is
-   exactly the round-2 mistake.
+   So `emitRemediationCandidate` does it in two steps against the same rows:
+   - **Redelivery** is settled FIRST, by identity: if any existing candidate for
+     this PR already names this head, return `claimed: false` without inserting.
+   - **The cap** is then enforced by the DATABASE: claim the next free attempt
+     slot, whose key is `overseer-remediation:owner/repo#N:attempt-K`. That
+     insert is atomic, so concurrent racers on different heads contend for one
+     row and exactly one wins. A loser tries the next slot; when all slots are
+     held the cap has genuinely been reached. The loop is bounded by
+     `MAX_REMEDIATION_ATTEMPTS` and cannot spin.
 
-   A losing concurrent emitter gets `claimed: false` and the receipt records
-   `attempt_slot_already_claimed`; it is never reported as a queued fix. The
-   emitter decides that by putting a per-call UUID nonce in `correlation_id`
-   (caller-controlled, stored verbatim, not part of the key) and checking that
-   it round-trips -- body comparison could not tell a fresh insert from a
-   byte-identical replay.
+   **Do not fold the head back into the key.** That is rounds 1 and 3, and it
+   silently unbounds the reviewer-fix-reviewer loop. A real-DB test fires four
+   concurrent racers on four distinct heads and asserts exactly two rows; it
+   fails with `Received: 4` against the round-3 design.
+
+   A losing racer gets `claimed: false` and the receipt records
+   `attempt_slot_already_claimed` -- never reported as a queued fix. That is
+   decided by a per-call UUID nonce in `correlation_id` (caller-controlled,
+   stored verbatim, not part of the key): body comparison could not tell a fresh
+   insert from a byte-identical replay.
 
 5. **Taskmaster still decides.** Budget, pause, backoff, and eligibility all
    still apply.
