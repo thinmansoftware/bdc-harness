@@ -50,6 +50,7 @@ import {
   markEscalated,
   markGivenUp,
   extendDueOnce,
+  setLastEscalationState,
   getExpectationCounts,
   setPauseState,
   updateActionOutcome,
@@ -253,8 +254,8 @@ describe('tm_expectations DAL', () => {
   test('additive_migration_old_shape_upgrade', async () => {
     // A database at the 049/050 shape (registration_key + escalating CHECK +
     // named unique index + front-door columns) but WITHOUT the migration-056
-    // mailbox column. The additive path must ADD due_extended by ALTER -- never a
-    // table recreate that would drop rows.
+    // mailbox columns. The additive path must ADD last_escalation_state and
+    // due_extended by ALTER -- never a table recreate that would drop rows.
     const legacyPath = join(tmpdir(), `taskmaster-056-${Date.now()}-${Math.random()}.db`);
     const seed = new Database(legacyPath);
     seed.run(`CREATE TABLE tm_expectations (
@@ -296,13 +297,15 @@ describe('tm_expectations DAL', () => {
       const previous = db;
       db = upgraded;
       try {
-        // The three rows survive with the new column defaulted.
+        // The three rows survive with the new columns defaulted.
         const rows = await upgraded.query<{
           id: string;
+          last_escalation_state: string | null;
           due_extended: number;
-        }>('SELECT id, due_extended FROM tm_expectations ORDER BY id');
+        }>('SELECT id, last_escalation_state, due_extended FROM tm_expectations ORDER BY id');
         expect(rows.rows.map(r => r.id)).toEqual(['row-1', 'row-2', 'row-3']);
         for (const r of rows.rows) {
+          expect(r.last_escalation_state).toBeNull();
           expect(Number(r.due_extended)).toBe(0);
         }
 
@@ -319,8 +322,9 @@ describe('tm_expectations DAL', () => {
         expect(typeof id).toBe('string');
         const due = await listDueExpectations(new Date().toISOString());
         expect(due.length).toBe(4);
-        // normalizeExpectation surfaces the new field with a safe default.
+        // normalizeExpectation surfaces the new fields with safe defaults.
         const seeded = due.find(e => e.id === 'row-1');
+        expect(seeded?.last_escalation_state).toBeNull();
         expect(seeded?.due_extended).toBe(0);
       } finally {
         db = previous;
@@ -331,7 +335,7 @@ describe('tm_expectations DAL', () => {
     }
   });
 
-  test('extendDueOnce is a one-shot compare-and-set', async () => {
+  test('extendDueOnce is a one-shot compare-and-set and setLastEscalationState records the tuple', async () => {
     const id = await registerExpectation({
       action_ref: 'mailbox-dal',
       dispatch_ref: 'mailbox-dispatch',
@@ -356,6 +360,11 @@ describe('tm_expectations DAL', () => {
     after = (await listExpectations({ limit: 10 })).rows.find(e => e.id === id);
     expect(after?.due_at).toBe(newDue);
     expect(after?.due_extended).toBe(1);
+
+    // The suppression tuple is persisted verbatim and read back.
+    await setLastEscalationState(id, '2026-09-22T00:00:00.000Z||queued');
+    after = (await listExpectations({ limit: 10 })).rows.find(e => e.id === id);
+    expect(after?.last_escalation_state).toBe('2026-09-22T00:00:00.000Z||queued');
   });
 
   test('registering twice for the same dispatch yields one row and the same id', async () => {

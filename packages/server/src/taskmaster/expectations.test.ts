@@ -23,10 +23,34 @@ const base: TmExpectation = {
   evidence_pointer: null,
   registered_by: 'taskmaster',
   self_supervised: 0,
+  last_escalation_state: null,
   due_extended: 0,
   created_at: new Date(0).toISOString(),
   updated_at: new Date(0).toISOString(),
 };
+
+/**
+ * Run `fn` with stdout captured, returning everything written. The suppression
+ * rule's observable contract is a LOG line (WO Test 3: "ticks 2 and 3 log
+ * taskmaster.escalation_suppressed_unchanged"), and the logger is module-private,
+ * so the assertion reads the NDJSON pino actually emits. The spy is restored in a
+ * finally block and is local to the call -- no module mocking, so nothing leaks
+ * into another test file.
+ */
+async function captureStdout(fn: () => Promise<void>): Promise<string> {
+  const chunks: string[] = [];
+  const original = process.stdout.write;
+  (process.stdout as unknown as { write: unknown }).write = (chunk: unknown): boolean => {
+    chunks.push(String(chunk));
+    return true;
+  };
+  try {
+    await fn();
+  } finally {
+    (process.stdout as unknown as { write: unknown }).write = original;
+  }
+  return chunks.join('');
+}
 
 /** A DispatchMessage double with only the fields the mailbox rule reads. */
 function makeDispatchRow(overrides: Partial<DispatchMessage> & { id: string }): DispatchMessage {
@@ -1474,15 +1498,22 @@ describe('mailbox expectation evidence (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-0
     expect(sends).toEqual([]);
   });
 
-  test('mailbox_expectation_absent_escalates_once_then_terminal', async () => {
-    // Un-acknowledged, overdue, extension already spent, on_absence escalate.
+  test('mailbox_expectation_absent_escalates_once', async () => {
+    // WO Test 3. Un-acknowledged, overdue, extension already spent, on_absence
+    // escalate, and the dispatched row is UNCHANGED across three consecutive
+    // ticks. Exactly one escalation may be sent; ticks 2 and 3 must log
+    // taskmaster.escalation_suppressed_unchanged and send nothing.
     //
-    // A confirmed escalation moves the row to terminal 'escalated', and
-    // listDueExpectations only selects 'pending'/'failed'/'escalating' -- so
-    // later ticks never reselect it and escalate nothing. The terminal status
-    // IS the dedupe; there is no per-tick tuple suppression (that mechanism was
-    // dead code -- an escalated row is never reselected to read a tuple from).
+    // The row stays SELECTABLE across all three ticks because tick 1's terminal
+    // transition is lost (markEscalated returns false -- a real, handled case:
+    // 'taskmaster.expectation_escalated_confirm_lost'). listDueExpectations
+    // selects 'pending' / 'failed' / 'escalating', so an 'escalating' row comes
+    // back every tick. That is precisely the state the suppression rule exists
+    // for: without it, each later tick re-files the same blocker in the xo
+    // mailbox. A row whose confirm SUCCEEDS is terminal 'escalated' and is never
+    // reselected at all -- covered by the sibling test below.
     let status: TmExpectation['status'] = 'pending';
+    let lastEscalationState: string | null = null;
     const rowTemplate: TmExpectation = {
       ...mailboxBase,
       on_absence: 'escalate',
@@ -1497,12 +1528,11 @@ describe('mailbox expectation evidence (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-0
       addressed_at: null,
     });
     const escalationSends: string[] = [];
-    const claimEscalations: number[] = [];
     const deps = {
-      // Model production selection exactly: a terminal 'escalated' row is gone.
+      // Production selection, modelled exactly.
       listDueExpectations: async () =>
         status === 'pending' || status === 'failed' || status === 'escalating'
-          ? [{ ...rowTemplate, status }]
+          ? [{ ...rowTemplate, status, last_escalation_state: lastEscalationState }]
           : [],
       assessDispatchRecipient: assessAs('drain_on_start'),
       getMessage: async () => unreadRow,
@@ -1514,10 +1544,74 @@ describe('mailbox expectation evidence (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-0
         return true;
       },
       claimEscalation: async () => {
-        claimEscalations.push(1);
         status = 'escalating';
         return true;
       },
+      setLastEscalationState: async (_id: string, tuple: string) => {
+        lastEscalationState = tuple;
+      },
+      // The confirm is LOST, so the row stays 'escalating' and is reselected.
+      markEscalated: async () => false,
+      createTask: async (_context: never, data: { recipient: string; idempotency_key: string }) => {
+        escalationSends.push(`${data.recipient}:${data.idempotency_key}`);
+        return { id: 'd' } as never;
+      },
+    };
+
+    const tick1 = await captureStdout(() => checkExpectations(new Date(5_000_000), deps as never));
+    const tick2 = await captureStdout(() => checkExpectations(new Date(6_000_000), deps as never));
+    const tick3 = await captureStdout(() => checkExpectations(new Date(7_000_000), deps as never));
+
+    // Exactly ONE escalation to xo, under the deterministic escalation key.
+    expect(escalationSends).toEqual(['xo:tm:expectation:expectation-1:escalate']);
+    // The tuple this escalation was sent against was persisted on tick 1 --
+    // BEFORE the (lost) terminal transition, which is what makes ticks 2 and 3
+    // able to read it at all.
+    expect(lastEscalationState).toBe('||queued');
+    // Tick 1 sent; it did not suppress.
+    expect(tick1).not.toContain('taskmaster.escalation_suppressed_unchanged');
+    // Ticks 2 and 3 suppressed, and are the only ticks that logged it.
+    expect(tick2).toContain('taskmaster.escalation_suppressed_unchanged');
+    expect(tick3).toContain('taskmaster.escalation_suppressed_unchanged');
+  });
+
+  test('mailbox_escalation_confirmed_goes_terminal_and_is_never_reselected', async () => {
+    // The other half of the dedupe: when the terminal transition DOES confirm,
+    // the row is 'escalated' and listDueExpectations never returns it again, so
+    // later ticks escalate nothing without needing the tuple at all.
+    let status: TmExpectation['status'] = 'pending';
+    const escalationSends: string[] = [];
+    const unreadRow = makeDispatchRow({
+      id: 'R',
+      status: 'queued',
+      acknowledged_at: null,
+      addressed_at: null,
+    });
+    const deps = {
+      listDueExpectations: async () =>
+        status === 'pending' || status === 'failed' || status === 'escalating'
+          ? [
+              {
+                ...mailboxBase,
+                on_absence: 'escalate' as const,
+                max_retries: 0,
+                due_at: new Date(0).toISOString(),
+                due_extended: 1,
+                status,
+              },
+            ]
+          : [],
+      assessDispatchRecipient: assessAs('drain_on_start'),
+      getMessage: async () => unreadRow,
+      markFailed: async () => {
+        status = 'failed';
+        return true;
+      },
+      claimEscalation: async () => {
+        status = 'escalating';
+        return true;
+      },
+      setLastEscalationState: async () => {},
       markEscalated: async () => {
         status = 'escalated';
         return true;
@@ -1528,16 +1622,66 @@ describe('mailbox expectation evidence (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-0
       },
     };
 
-    // Three consecutive ticks, dispatched row unchanged.
     await checkExpectations(new Date(5_000_000), deps as never);
     await checkExpectations(new Date(6_000_000), deps as never);
     await checkExpectations(new Date(7_000_000), deps as never);
 
-    // Exactly one escalation to xo, under the deterministic escalation key.
     expect(escalationSends).toEqual(['xo:tm:expectation:expectation-1:escalate']);
-    // Ticks 2 and 3 select nothing: the row is terminal 'escalated'.
-    expect(claimEscalations).toEqual([1]);
     expect(status).toBe('escalated');
+  });
+
+  test('mailbox_escalation_re_sends_when_the_evidence_tuple_CHANGES', async () => {
+    // The converse of the suppression rule (WO section 9): re-sending REQUIRES
+    // the (acknowledged_at, addressed_at, status) tuple to have changed. A row
+    // that was escalated while un-acknowledged and is later acknowledged (still
+    // unaddressed, extension spent) is a genuinely NEW evidence state, so the
+    // tick escalates again instead of suppressing.
+    let status: TmExpectation['status'] = 'escalating';
+    // Tick 1's escalation was sent against the un-acknowledged tuple.
+    const lastEscalationState = '||queued';
+    // The row has since been READ.
+    const acknowledgedRow = makeDispatchRow({
+      id: 'R',
+      status: 'queued',
+      acknowledged_at: new Date(1_000).toISOString(),
+      addressed_at: null,
+    });
+    const escalationSends: string[] = [];
+    const logs = await captureStdout(() =>
+      checkExpectations(new Date(9_000_000), {
+        listDueExpectations: async () => [
+          {
+            ...mailboxBase,
+            on_absence: 'escalate',
+            max_retries: 0,
+            due_at: new Date(0).toISOString(),
+            due_extended: 1,
+            status,
+            last_escalation_state: lastEscalationState,
+          },
+        ],
+        assessDispatchRecipient: assessAs('drain_on_start'),
+        getMessage: async () => acknowledgedRow,
+        markFailed: async () => true,
+        claimEscalation: async () => true,
+        setLastEscalationState: async () => {},
+        markEscalated: async () => {
+          status = 'escalated';
+          return true;
+        },
+        createTask: async (
+          _context: never,
+          data: { recipient: string; idempotency_key: string }
+        ) => {
+          escalationSends.push(`${data.recipient}:${data.idempotency_key}`);
+          return { id: 'd' } as never;
+        },
+      } as never)
+    );
+
+    // Changed tuple -> a new escalation, and NO suppression log.
+    expect(escalationSends).toEqual(['xo:tm:expectation:expectation-1:escalate']);
+    expect(logs).not.toContain('taskmaster.escalation_suppressed_unchanged');
   });
 
   test('alias_recipient_resolves_to_underlying_mailbox_mode', async () => {

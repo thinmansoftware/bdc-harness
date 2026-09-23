@@ -33,6 +33,25 @@ type EvidenceState = 'met' | 'in_progress' | 'absent';
 interface ResolvedEvidence {
   evidence: EvidenceResult;
   state: EvidenceState;
+  /**
+   * The dispatched row, loaded ONLY when a `dispatch_reply_exists` expectation
+   * was resolved through a MAILBOX recipient (drain_on_start / notify_only, or
+   * an alias that resolves to one); null for every other path. It carries the
+   * (acknowledged_at, addressed_at, status) tuple the escalation-suppression
+   * rule compares, so non-mailbox escalations keep their pre-change behaviour.
+   */
+  mailboxRow: DispatchMessage | null;
+}
+
+/**
+ * The dispatched row's evidence tuple, as a stable string. An escalation is
+ * re-sent only when this tuple has CHANGED since the last escalation; an
+ * unchanged tuple is suppressed (see checkExpectations). Deliberately includes
+ * status alongside the two mailbox timestamps so that, e.g., a cancel that
+ * leaves both timestamps null still counts as a change.
+ */
+function escalationStateTuple(row: DispatchMessage): string {
+  return `${row.acknowledged_at ?? ''}|${row.addressed_at ?? ''}|${row.status}`;
 }
 
 /** Mailbox delivery modes: a read is the proof, not a done-reply. */
@@ -125,6 +144,8 @@ export interface ExpectationDeps {
     newDueAt: string,
     expectedDueAt: string
   ) => Promise<boolean | undefined>;
+  /** Persist the evidence tuple an escalation was sent against (suppression bookkeeping). */
+  setLastEscalationState?: (id: string, tuple: string) => Promise<void>;
   /** Override the mailbox in-progress extension window (defaults to PROOF_DEADLINE_MS). */
   proofDeadlineMs?: number;
   createTask?: typeof createAuthenticatedMessage;
@@ -531,7 +552,7 @@ async function resolveEvidenceForRecipient(
   // recipient resolver there is no way (and no need) to diverge from the query.
   if (spec.kind !== 'dispatch_reply_exists' || !deps.assessDispatchRecipient) {
     const evidence = await runCheck(spec);
-    return { evidence, state: evidence.ok ? 'met' : 'absent' };
+    return { evidence, state: evidence.ok ? 'met' : 'absent', mailboxRow: null };
   }
 
   let assessment = await deps.assessDispatchRecipient(expectation.recipient);
@@ -549,7 +570,7 @@ async function resolveEvidenceForRecipient(
   if (!isMailboxMode(assessment.delivery_mode)) {
     // worker_poll / unresolved alias / unknown -> pre-change done-reply query.
     const evidence = await runCheck(spec);
-    return { evidence, state: evidence.ok ? 'met' : 'absent' };
+    return { evidence, state: evidence.ok ? 'met' : 'absent', mailboxRow: null };
   }
 
   // Mailbox recipient: the dispatched row itself is the evidence. Reuse the row
@@ -558,18 +579,19 @@ async function resolveEvidenceForRecipient(
   if (!row) {
     // The dispatched row is gone. Treat as absent so the existing
     // dispatch-missing handling (markGivenUp) runs; do NOT fabricate a met.
-    return { evidence: { ok: false, pointer: null }, state: 'absent' };
+    return { evidence: { ok: false, pointer: null }, state: 'absent', mailboxRow: null };
   }
   if (row.addressed_at) {
     return {
       evidence: { ok: true, pointer: `dispatch:${row.id}:addressed` },
       state: 'met',
+      mailboxRow: row,
     };
   }
   if (row.acknowledged_at) {
-    return { evidence: { ok: false, pointer: null }, state: 'in_progress' };
+    return { evidence: { ok: false, pointer: null }, state: 'in_progress', mailboxRow: row };
   }
-  return { evidence: { ok: false, pointer: null }, state: 'absent' };
+  return { evidence: { ok: false, pointer: null }, state: 'absent', mailboxRow: row };
 }
 
 export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): Promise<void> {
@@ -578,6 +600,7 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
   for (const expectation of active) {
     let evidence: EvidenceResult;
     let state: EvidenceState;
+    let mailboxRow: DispatchMessage | null;
     try {
       const resolved = await resolveEvidenceForRecipient(
         JSON.parse(expectation.evidence_json) as EvidenceSpec,
@@ -586,6 +609,7 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       );
       evidence = resolved.evidence;
       state = resolved.state;
+      mailboxRow = resolved.mailboxRow;
     } catch (error) {
       log.warn(
         { err: error as Error, expectationId: expectation.id },
@@ -614,16 +638,51 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       if (now.getTime() < Date.parse(expectation.due_at)) continue;
     }
 
-    // NO PER-TICK ESCALATION SUPPRESSION IS NEEDED.
+    // ESCALATION SUPPRESSION -- once per (expectation id, evidence tuple).
     //
-    // A confirmed escalation moves the row to terminal 'escalated' (markEscalated
-    // below), and listDueExpectations only selects 'pending' / 'failed' /
-    // 'escalating'. An escalated row is therefore never reselected, so there is
-    // no per-tick re-escalation to suppress -- the terminal status IS the
-    // dedupe. (An unconfirmed send stays 'escalating' and is replayed under its
-    // deterministic idempotency key, which the dispatch DAL dedupes to exactly
-    // one operator task.) The earlier last_escalation_state tuple mechanism was
-    // dead code: it could only be read from a reselected row, which never occurs.
+    // WO section 9: an escalation for expectation E is sent at most once per
+    // (expectation id, evidence-state). Re-sending REQUIRES the dispatched row's
+    // (acknowledged_at, addressed_at, status) tuple to have CHANGED since the
+    // last escalation; an unchanged tuple logs
+    // taskmaster.escalation_suppressed_unchanged and sends nothing.
+    //
+    // WHEN THIS IS REACHED -- and why the tuple is written where it is.
+    // last_escalation_state is persisted the moment the escalation SEND is
+    // confirmed, which is strictly BEFORE the terminal markEscalated. That
+    // ordering is the whole mechanism:
+    //
+    //   - send confirmed AND markEscalated confirmed -> the row is terminal
+    //     'escalated', listDueExpectations never reselects it, and this check is
+    //     simply never reached. The terminal status is the dedupe.
+    //   - send confirmed but the confirm LOST (markEscalated returned false, or
+    //     the process died between the send and the transition) -> the row is
+    //     still 'escalating' and IS reselected. Without this guard every later
+    //     tick re-sends the same blocker; with it, the tick logs and sends
+    //     nothing. This is the case the rule exists for.
+    //   - send threw before it was ever confirmed -> the tuple was never
+    //     written, so it is NULL, suppression does not fire, and the owed
+    //     escalation is replayed under its deterministic key exactly as before.
+    //
+    // A NULL tuple therefore means "no blocker is known to exist yet" and never
+    // suppresses. (Writing the tuple AFTER markEscalated instead would make this
+    // unreadable by construction -- it would only ever be set on a row that had
+    // just gone terminal and could never be reselected to read it.)
+    //
+    // Gated on a non-null mailboxRow, so it is a strict no-op for worker_poll
+    // and every other non-mailbox path (WO Test 4: worker_poll behaviour must be
+    // byte-for-byte unchanged). Those paths are already once-per-expectation via
+    // idempotency_key plus the terminal status.
+    if (
+      mailboxRow !== null &&
+      expectation.last_escalation_state !== null &&
+      escalationStateTuple(mailboxRow) === expectation.last_escalation_state
+    ) {
+      log.info(
+        { expectationId: expectation.id, tuple: expectation.last_escalation_state },
+        'taskmaster.escalation_suppressed_unchanged'
+      );
+      continue;
+    }
 
     // MAILBOX IN-PROGRESS -- read, but not yet closed.
     //
@@ -908,7 +967,19 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         body: renderEscalationBody(expectation),
       }
     );
-    // Confirmed sent: close the row.
+    // CONFIRMED SENT. Record the evidence tuple this escalation was sent
+    // against BEFORE the terminal transition, not after it. If the transition is
+    // then lost, the row stays 'escalating' and IS reselected -- and the tuple
+    // written here is what makes the next tick suppress the repeat instead of
+    // re-filing the same blocker in the xo mailbox. Only mailbox resolution
+    // carries a row here; the other paths need no tuple.
+    if (mailboxRow !== null) {
+      await (deps.setLastEscalationState ?? taskmasterDb.setLastEscalationState)(
+        expectation.id,
+        escalationStateTuple(mailboxRow)
+      );
+    }
+    // Close the row.
     const escalated = await (deps.markEscalated ?? taskmasterDb.markEscalated)(
       expectation.id,
       escalationPointer
@@ -917,8 +988,6 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       log.warn({ expectationId: expectation.id }, 'taskmaster.expectation_escalated_confirm_lost');
       continue;
     }
-    // Confirmed: the row is now terminal 'escalated' and listDueExpectations will
-    // never reselect it, so there is nothing further to persist for dedupe.
     log.error({ expectationId: expectation.id }, 'taskmaster.expectation_escalated');
   }
 }

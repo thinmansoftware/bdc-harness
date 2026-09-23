@@ -75,6 +75,15 @@ export interface TmExpectation {
   /** 1 when the registrant named ITSELF as the recipient. */
   self_supervised: number;
   /**
+   * The dispatched row's (acknowledged_at, addressed_at, status) tuple at the
+   * moment this expectation was last escalated (migration 056, bdc-xo#2028).
+   * NULL until a first escalation is sent. The escalation sender compares the
+   * current tuple against this before sending: an unchanged tuple is suppressed
+   * (logged taskmaster.escalation_suppressed_unchanged) instead of re-sending.
+   * Nullable, and defaulted to null for rows read from a pre-056 database.
+   */
+  last_escalation_state: string | null;
+  /**
    * 0/1 one-shot flag (migration 056). An acknowledged-but-unaddressed mailbox
    * row is granted exactly ONE further PROOF_DEADLINE_MS extension of due_at
    * before it can escalate; this records that the single extension is spent.
@@ -180,10 +189,12 @@ function normalizeExpectation(row: TmExpectation): TmExpectation {
     // double that omits the column) has no flag at all; absent means "not self
     // supervised", which is the safe reading -- it never widens what is allowed.
     self_supervised: row.self_supervised ?? 0,
-    // Mailbox-evidence column (migration 056). A row from a pre-056 database or a
-    // test double that omits it reads as "extension not spent" (0) -- the safe
-    // reading that preserves the pre-change behaviour: a due_extended of 0 grants
-    // the first (and only) extension.
+    // Mailbox-evidence columns (migration 056). A row from a pre-056 database or
+    // a test double that omits them reads as "never escalated yet" (null tuple)
+    // and "extension not spent" (0) -- the safe readings that preserve the
+    // pre-change behaviour: a null last_escalation_state never suppresses, and a
+    // due_extended of 0 grants the first (and only) extension.
+    last_escalation_state: row.last_escalation_state ?? null,
     due_extended: row.due_extended ?? 0,
     due_at: toIso(row.due_at),
     created_at: toIso(row.created_at),
@@ -867,6 +878,21 @@ export async function extendDueOnce(
     [newDueAt, new Date().toISOString(), id, expectedDueAt, ...ACTIVE_EXPECTATION_STATUSES]
   );
   return result.rowCount === 1;
+}
+
+/**
+ * Persist the dispatched row's evidence tuple that THIS escalation was sent
+ * against, so the next tick can suppress a repeat escalation whose evidence is
+ * unchanged (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-01). This is bookkeeping,
+ * not a guarded state transition -- it records what was already sent under the
+ * deterministic escalation idempotency key -- so it is an unconditional write
+ * rather than a compare-and-set. Written only after a confirmed escalation send.
+ */
+export async function setLastEscalationState(id: string, tuple: string): Promise<void> {
+  await getDatabase().query(
+    'UPDATE tm_expectations SET last_escalation_state = $1, updated_at = $2 WHERE id = $3',
+    [tuple, new Date().toISOString(), id]
+  );
 }
 
 export async function getExpectationCounts(): Promise<Record<TmExpectationStatus, number>> {

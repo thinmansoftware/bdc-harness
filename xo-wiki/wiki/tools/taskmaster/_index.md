@@ -327,17 +327,41 @@ A read is the proof. An acknowledged-but-unaddressed mailbox row is granted
 exactly **one** further `PROOF_DEADLINE_MS` (24h) extension of `due_at`
 (`due_extended` one-shot flag) before it may escalate.
 
-### Escalation dedupe (terminal status, not a per-tick tuple)
+### Escalation suppression (once per evidence tuple)
 
-An escalation for expectation E is sent at most once. A confirmed escalation
-moves the row to terminal `escalated`, and `listDueExpectations` only selects
-`pending`/`failed`/`escalating` -- so an escalated row is never reselected and
-no later tick can re-file the blocker. The terminal status IS the dedupe (an
-unconfirmed send stays `escalating` and is replayed under its deterministic
-escalation `idempotency_key`, which the dispatch DAL dedupes to exactly one
-operator task). An earlier `last_escalation_state` evidence-tuple suppression
-mechanism was removed as dead code: it could only ever be read from a reselected
-row, which the terminal status guarantees never happens.
+An escalation for expectation E is sent at most once per (expectation id,
+evidence tuple). The tuple is the dispatched row's
+`(acknowledged_at, addressed_at, status)`, stored on
+`tm_expectations.last_escalation_state`. If a later tick sees the SAME tuple it
+logs `taskmaster.escalation_suppressed_unchanged` and sends nothing; only a
+CHANGED tuple re-escalates. So an unchanged blocker is never re-filed into the
+xo mailbox tick after tick.
+
+**The tuple is written when the SEND is confirmed, which is strictly before the
+terminal `markEscalated`.** That ordering is the mechanism, and it is the whole
+reason the rule is reachable:
+
+- send confirmed AND the transition confirmed -- the row is terminal
+  `escalated`, `listDueExpectations` (which selects only
+  `pending`/`failed`/`escalating`) never returns it again, and the suppression
+  check is never reached. Here the terminal status is the dedupe.
+- send confirmed but the transition LOST (`markEscalated` returned false, or the
+  process died in between; logged `taskmaster.expectation_escalated_confirm_lost`)
+  -- the row is still `escalating` and IS reselected every tick. This is the case
+  the rule exists for: without it each later tick re-sends the same blocker.
+- send threw before it was ever confirmed -- the tuple was never written, so it
+  is NULL, suppression does not fire, and the owed escalation is replayed under
+  its deterministic `idempotency_key` exactly as before.
+
+A NULL tuple therefore means "no blocker is known to exist yet" and never
+suppresses. Writing the tuple AFTER the terminal transition instead would make
+it unreadable by construction -- it would only ever be set on a row that had
+just gone terminal and so could never be reselected to read it back.
+
+Suppression is gated on a mailbox-resolved row, so `worker_poll` behaviour is
+unchanged; those paths are already once-per-expectation via the escalation
+`idempotency_key` plus the terminal status. This rule makes that guarantee
+explicit and tested for mailbox recipients.
 
 ### Grading (M-155 Amendment 03 kept, plus one mailbox refinement)
 
@@ -376,7 +400,7 @@ not duplicate the note. Test: `bun run test:taskmaster-regrade`.
 Taskmaster stays PAUSED through the deploy; resuming is John's action.
 
 1. Deploy: the change lands on `archon-app-1` on the next `rebuild-archon.sh`.
-   Migration 056 (`due_extended`) is additive; apply it
+   Migration 056 (`last_escalation_state`, `due_extended`) is additive; apply it
    to `/opt/bdc/archon-data/archon.db` with a `.backup` first (rebuild runbook).
 2. Regrade the history: run `regrade-unmeetable-expectations.ts --confirm` once
    against the live db (after the backup).

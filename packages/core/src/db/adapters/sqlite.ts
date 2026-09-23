@@ -37,6 +37,7 @@ const TM_EXPECTATIONS_SCHEMA = `CREATE TABLE tm_expectations (
   evidence_pointer TEXT,
   registered_by TEXT,
   self_supervised INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1)),
+  last_escalation_state TEXT,
   due_extended INTEGER NOT NULL DEFAULT 0 CHECK (due_extended IN (0, 1)),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -58,12 +59,13 @@ const TM_EXPECTATIONS_FRONT_DOOR_COLUMNS: [string, string][] = [
 ];
 
 /**
- * Mailbox-evidence column (migration 056, bdc-xo#2028), applied ADDITIVELY for
+ * Mailbox-evidence columns (migration 056, bdc-xo#2028), applied ADDITIVELY for
  * the same reason as the front-door columns above: the live database is already
- * at 049/050 WITH rows, so this must be ALTER TABLE ADD COLUMN rather than a
+ * at 049/050 WITH rows, so these must be ALTER TABLE ADD COLUMN rather than a
  * shape-mismatch recreate that would trip the non-empty refusal.
  */
 const TM_EXPECTATIONS_MAILBOX_EVIDENCE_COLUMNS: [string, string][] = [
+  ['last_escalation_state', 'TEXT'],
   ['due_extended', 'INTEGER NOT NULL DEFAULT 0 CHECK (due_extended IN (0, 1))'],
 ];
 
@@ -2309,10 +2311,11 @@ export class SqliteAdapter implements IDatabase {
         -- supervision, and whether they named themselves as the recipient.
         registered_by TEXT,
         self_supervised INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1)),
-        -- Mailbox evidence (migration 056, bdc-xo#2028): the one-shot in-progress
-        -- extension flag. Kept in lockstep with TM_EXPECTATIONS_SCHEMA and the
-        -- additive-ALTER list above so the fresh-install and upgrade paths
-        -- converge on one shape.
+        -- Mailbox evidence (migration 056, bdc-xo#2028): the escalation-tuple
+        -- suppression state and the one-shot in-progress extension flag. Kept in
+        -- lockstep with TM_EXPECTATIONS_SCHEMA and the additive-ALTER list above
+        -- so the fresh-install and upgrade paths converge on one shape.
+        last_escalation_state TEXT,
         due_extended INTEGER NOT NULL DEFAULT 0 CHECK (due_extended IN (0, 1)),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
