@@ -310,6 +310,93 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('Plain prompt with no loop variable.');
   });
+
+  // --- WO-HARNESS-BASE-BRANCH-SUBSTITUTION-BOUNDARY-01 -----------------------
+  // Workflow variables must match only as whole identifiers, so a longer shell
+  // variable that begins with a workflow variable name (e.g. $BASE_BRANCH_OVERRIDE,
+  // $BASE_BRANCH_PR) is left verbatim for the bash node.
+
+  it('leaves prefix-longer variables ($BASE_BRANCH_OVERRIDE, $BASE_BRANCH_PR) intact', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'BASE_BRANCH_OVERRIDE=$BASE_BRANCH_OVERRIDE and BASE_BRANCH_PR=$BASE_BRANCH_PR',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe(
+      'BASE_BRANCH_OVERRIDE=$BASE_BRANCH_OVERRIDE and BASE_BRANCH_PR=$BASE_BRANCH_PR'
+    );
+    expect(prompt).not.toContain('dev_OVERRIDE');
+    expect(prompt).not.toContain('dev_PR');
+  });
+
+  it('still substitutes exact $BASE_BRANCH when followed by a non-identifier char', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'base=$BASE_BRANCH path=$BASE_BRANCH/x dot=$BASE_BRANCH. paren=$BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('base=dev path=dev/x dot=dev. paren=dev)');
+  });
+
+  it('bounds every $NAME workflow variable to whole identifiers (parametrized)', () => {
+    const cases: Array<{ name: string; value: string }> = [
+      { name: 'WORKFLOW_ID', value: 'WF1' },
+      { name: 'USER_MESSAGE', value: 'UMSG' },
+      { name: 'ARGUMENTS', value: 'UMSG' },
+      { name: 'ARTIFACTS_DIR', value: '/art' },
+      { name: 'DOCS_DIR', value: 'ds/' },
+      { name: 'LOOP_USER_INPUT', value: 'LUI' },
+      { name: 'REJECTION_REASON', value: 'RR' },
+      { name: 'LOOP_PREV_OUTPUT', value: 'LPO' },
+    ];
+    for (const { name, value } of cases) {
+      const { prompt } = substituteWorkflowVariables(
+        `exact=$${name} suffix=$${name}_SUFFIX`,
+        'WF1', // workflowId
+        'UMSG', // userMessage (feeds $USER_MESSAGE and $ARGUMENTS)
+        '/art', // artifactsDir
+        'dev', // baseBranch
+        'ds/', // docsDir
+        undefined, // issueContext
+        'LUI', // loopUserInput
+        'RR', // rejectionReason
+        'LPO' // loopPrevOutput
+      );
+      expect(prompt).toBe(`exact=${value} suffix=$${name}_SUFFIX`);
+    }
+  });
+
+  it('does not throw the empty-base guard on prefix-longer $BASE_BRANCH_OVERRIDE', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'override=$BASE_BRANCH_OVERRIDE',
+        'run-1',
+        'msg',
+        '/tmp',
+        '', // empty baseBranch
+        'docs/'
+      )
+    ).not.toThrow();
+  });
+
+  it('still throws the empty-base guard on exact $BASE_BRANCH', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'base=$BASE_BRANCH',
+        'run-1',
+        'msg',
+        '/tmp',
+        '', // empty baseBranch
+        'docs/'
+      )
+    ).toThrow();
+  });
 });
 
 describe('buildPromptWithContext', () => {
