@@ -24,7 +24,8 @@ import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
 import { fireTier, buildFireMessage } from './fire.js';
-import { pollForTerminal, TimeoutError } from './poll.js';
+import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './poll.js';
+import { fetchNodeTimeoutsMs } from './node-timeouts.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { createRecord, writeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
@@ -58,6 +59,12 @@ export interface CascadeDeps {
   preflight?: (tier: LadderTier) => Promise<void>;
   fire?: typeof fireTier;
   poll?: typeof pollForTerminal;
+  /**
+   * Resolves the fired workflow's per-node configured timeouts for poll's
+   * `nodeTimeoutsMs`. Best-effort: returns {} on any failure, which restores
+   * the generic open-node default. Injectable so tests do not need the API.
+   */
+  fetchNodeTimeouts?: typeof fetchNodeTimeoutsMs;
   judge?: typeof judgeGate;
   escalate?: (context: EscalationCallContext) => Promise<void>;
   writeRecord?: typeof writeRecord;
@@ -229,6 +236,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const fireImpl = opts.deps?.fire ?? fireTier;
   const preflightImpl = opts.deps?.preflight;
   const pollImpl = opts.deps?.poll ?? pollForTerminal;
+  const fetchNodeTimeoutsImpl = opts.deps?.fetchNodeTimeouts ?? fetchNodeTimeoutsMs;
   const judgeImpl = opts.deps?.judge ?? judgeGate;
   const escalateImpl = opts.deps?.escalate ?? defaultEscalate;
   const writeRecordImpl = opts.deps?.writeRecord ?? writeRecord;
@@ -843,6 +851,35 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       // Poll for terminal state (runId is guaranteed non-null since fireResult.ok is true)
       const resolvedRunId = fireResult.runId ?? '';
+
+      // Per-node configured timeouts for the watchdog. The run event feed carries
+      // no per-node `timeout`, so the workflow definition is the only source and
+      // this is the only production path that supplies it -- without this call
+      // poll's `nodeTimeoutsMs` is inert and a node configured ABOVE the 60-minute
+      // open-node default is still cut at 60 (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-
+      // FIX-01 Scope IN item 2). Resolved per attempt because each tier binds its
+      // own workflow. Best-effort: never throws, {} restores the prior default.
+      //
+      // Guarded: the run is ALREADY FIRED and live by this point. The real
+      // resolver never throws, but letting any future/injected resolver throw
+      // here would abandon a live run over a watchdog-tuning lookup. Degrade to
+      // the generic default instead.
+      let nodeTimeoutsMs: Record<string, number> = {};
+      try {
+        nodeTimeoutsMs = await fetchNodeTimeoutsImpl({
+          workflowName: tier.workflowName,
+          apiBaseUrl,
+          token,
+          floorMs: DEFAULT_OPEN_NODE_BUDGET_MS,
+        });
+      } catch (err) {
+        console.log(
+          `[smart-cauldron] node-timeout resolution failed for workflow ${tier.workflowName} ` +
+            `(${(err as Error).message}); open nodes use the ` +
+            `${String(DEFAULT_OPEN_NODE_BUDGET_MS)}ms default`
+        );
+      }
+
       let pollResult: PollResult;
       try {
         pollResult = await pollImpl({
@@ -852,6 +889,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           timeoutMs: pollTimeoutMs,
           stallTimeoutMs: pollStallTimeoutMs,
           intervalMs: pollIntervalMs,
+          nodeTimeoutsMs,
         });
       } catch (pollErr) {
         if (pollErr instanceof TimeoutError) {

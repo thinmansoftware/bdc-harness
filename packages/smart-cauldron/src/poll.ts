@@ -18,6 +18,15 @@ const execFileAsync = promisify(execFile);
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'escalated', 'cancelled']);
 
 /**
+ * Default OPEN-NODE silence budget (ms): 60 minutes.
+ *
+ * Exported so the production caller (cascade.ts) and the per-node timeout
+ * resolver agree on the same floor instead of duplicating a literal. See the
+ * `openNodeBudgetMs` option doc below for why the fallback is this generous.
+ */
+export const DEFAULT_OPEN_NODE_BUDGET_MS = 3_600_000;
+
+/**
  * Thrown by pollForTerminal when a run does not reach a terminal state within
  * the poll budget. Distinguishable from network/API errors so callers (the
  * cascade) can treat a progress-timeout as a quality-fail-and-climb signal
@@ -119,7 +128,9 @@ interface PollOptions {
    * item 2 of WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 ("the node's own
    * configured timeout from the workflow definition, when available"). This is
    * the ONLY channel by which a configured timeout becomes available: the poll
-   * event feed does not carry it. Nodes absent from this map fall back to
+   * event feed does not carry it. Production supplies it from cascade.ts via
+   * `fetchNodeTimeoutsMs` (node-timeouts.ts), which reads the fired tier's
+   * workflow definition. Nodes absent from this map fall back to
    * `openNodeBudgetMs`. When several nodes are open at once (a concurrent DAG
    * layer), the largest applicable budget is used so a healthy long node is
    * never cut short by a shorter sibling. Default: {} (every open node uses
@@ -182,7 +193,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     token: tokenOverride,
     timeoutMs = 14_400_000,
     stallTimeoutMs = 1_200_000,
-    openNodeBudgetMs = 3_600_000,
+    openNodeBudgetMs = DEFAULT_OPEN_NODE_BUDGET_MS,
     nodeTimeoutsMs = {},
     intervalMs = 30_000,
     prRetryAttempts = 3,
