@@ -12,17 +12,24 @@ mock.module('./connection', () => ({
 
 import {
   claimOverseerVerdict,
+  claimVerdictForMergeExecution,
   countRunsPendingOverseerJudgment,
   finalizeOverseerVerdict,
   getOverseerActionsForRun,
   getOverseerLastActionAt,
   getOverseerLastVerdictAt,
   getOverseerVerdictsForRun,
+  getOverseerWatchRunById,
   hasReconcileActionForPr,
   insertOverseerAction,
   insertReconcileAction,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
+  listUnactionedFlagMergeReadyVerdicts,
+  recordVerdictMergeOutcome,
+  releaseOverseerMergeSlot,
+  releaseVerdictClaimForMergeExecution,
+  reserveOverseerMergeSlot,
 } from './overseer';
 
 function cleanupDb(path: string): void {
@@ -57,6 +64,21 @@ async function seedRun(id: string, status = 'failed'): Promise<void> {
       }),
     ]
   );
+}
+
+async function mergeSlotRow(
+  verdictId: string
+): Promise<{ id: string; reserved_at: string; released_at: string | null } | undefined> {
+  const result = await db.query<{
+    id: string;
+    reserved_at: string;
+    released_at: string | null;
+  }>(
+    `SELECT id, reserved_at, released_at FROM overseer_merge_slot_reservations
+     WHERE verdict_id = $1`,
+    [verdictId]
+  );
+  return result.rows[0];
 }
 
 describe('overseer db', () => {
@@ -178,6 +200,35 @@ describe('overseer db', () => {
     expect(run?.owner).toBe('thinmansoftware');
     expect(run?.repo).toBe('bdc-harness');
     expect(run?.woId).toBe('WO-HARNESS-E2E-MERGE-CANARY-01');
+  });
+
+  test('getOverseerWatchRunById resolves repo identity from the codebase FK (bdc-harness #846)', async () => {
+    // The merge-execution bridge resolves a verdict's run through THIS query.
+    // Without the join it returns owner/repo undefined for every real run and
+    // the bridge records run_context_unresolvable.
+    await db.query(
+      `INSERT INTO remote_agent_codebases (id, name, default_cwd)
+       VALUES ('cb-by-id', 'thinmansoftware/bdc-harness', '/tmp/cb-by-id')`
+    );
+    await db.query(
+      `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
+       VALUES ('conv-by-id', 'test', 'conv-by-id', 'Test')`
+    );
+    await db.query(
+      `INSERT INTO remote_agent_workflow_runs
+       (id, conversation_id, codebase_id, workflow_name, user_message, status, metadata)
+       VALUES ('run-by-id', 'conv-by-id', 'cb-by-id', 'bdc-feature-development', $1, 'completed', $2)`,
+      [
+        'WO_ID=WO-HARNESS-846 --project bdc-harness',
+        JSON.stringify({ node_counts: { completed: 3 } }),
+      ]
+    );
+
+    const run = await getOverseerWatchRunById('run-by-id');
+    expect(run?.owner).toBe('thinmansoftware');
+    expect(run?.repo).toBe('bdc-harness');
+    expect(run?.woId).toBe('WO-HARNESS-846');
+    expect(await getOverseerWatchRunById('run-absent')).toBeNull();
   });
 
   test('reads latest action/verdict effect timestamps and pending judgment count', async () => {
@@ -409,5 +460,147 @@ describe('overseer db', () => {
         action: 'reconcile_skip_noted',
       })
     ).toBe(false);
+  });
+
+  test('reserves a merge slot under the ceiling and rejects the next at the limit', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    expect(await reserveOverseerMergeSlot('verdict-a', since, 1)).toBe(true);
+    expect(await reserveOverseerMergeSlot('verdict-b', since, 1)).toBe(false);
+    await releaseOverseerMergeSlot('verdict-a');
+    expect(await reserveOverseerMergeSlot('verdict-b', since, 1)).toBe(true);
+  });
+
+  test('revives a released merge slot for the same verdict', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    expect(await reserveOverseerMergeSlot('verdict-revive', since, 1)).toBe(true);
+    const first = await mergeSlotRow('verdict-revive');
+    expect(first).toBeDefined();
+    await releaseOverseerMergeSlot('verdict-revive');
+    const released = await mergeSlotRow('verdict-revive');
+    expect(released?.id).toBe(first?.id);
+    expect(released?.released_at).toBeTruthy();
+    expect(await reserveOverseerMergeSlot('verdict-revive', since, 1)).toBe(true);
+    const revived = await mergeSlotRow('verdict-revive');
+    expect(revived?.id).toBe(first?.id);
+    expect(revived?.released_at).toBeNull();
+    expect(revived?.reserved_at).toBeTruthy();
+    const count = await db.query<{ n: number | string }>(
+      'SELECT COUNT(*) AS n FROM overseer_merge_slot_reservations WHERE verdict_id = $1',
+      ['verdict-revive']
+    );
+    expect(Number(count.rows[0]?.n)).toBe(1);
+  });
+
+  test('refuses a second reserve of an active merge slot', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    expect(await reserveOverseerMergeSlot('verdict-active', since, 2)).toBe(true);
+    const first = await mergeSlotRow('verdict-active');
+    expect(await reserveOverseerMergeSlot('verdict-active', since, 2)).toBe(false);
+    expect(await mergeSlotRow('verdict-active')).toEqual(first);
+  });
+
+  test('counts a revived reservation toward occupancy again', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    expect(await reserveOverseerMergeSlot('verdict-a', since, 1)).toBe(true);
+    await releaseOverseerMergeSlot('verdict-a');
+    expect(await reserveOverseerMergeSlot('verdict-a', since, 1)).toBe(true);
+    expect(await reserveOverseerMergeSlot('verdict-b', since, 1)).toBe(false);
+  });
+
+  test('releaseOverseerMergeSlot is a no-op on a released row', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    expect(await reserveOverseerMergeSlot('verdict-noop', since, 1)).toBe(true);
+    await releaseOverseerMergeSlot('verdict-noop');
+    const first = await mergeSlotRow('verdict-noop');
+    expect(first?.released_at).toBeTruthy();
+    await releaseOverseerMergeSlot('verdict-noop');
+    expect(await mergeSlotRow('verdict-noop')).toEqual(first);
+  });
+
+  test('releaseVerdictClaimForMergeExecution restores a processing claim for a later cycle', async () => {
+    await seedRun('run-claim-release');
+    await db.query(
+      `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, proposed_action)
+       VALUES ('verdict-release', 'run-claim-release', 'WO-TEST-OVERSEER-01', 'sha', 'flag_merge_ready')`
+    );
+    expect(await listUnactionedFlagMergeReadyVerdicts()).toHaveLength(1);
+    expect(await claimVerdictForMergeExecution('verdict-release')).toBe(true);
+    expect(await listUnactionedFlagMergeReadyVerdicts()).toHaveLength(0);
+    expect(await releaseVerdictClaimForMergeExecution('verdict-release', 'db unavailable')).toBe(
+      true
+    );
+    const listed = await listUnactionedFlagMergeReadyVerdicts();
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.id).toBe('verdict-release');
+    expect(listed[0]?.actioned_at).toBeNull();
+    expect(listed[0]?.action_reason).toBeNull();
+    expect(await claimVerdictForMergeExecution('verdict-release')).toBe(true);
+  });
+
+  test('releaseVerdictClaimForMergeExecution never un-finalizes a recorded outcome', async () => {
+    await seedRun('run-claim-final');
+    await db.query(
+      `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, proposed_action)
+       VALUES ('verdict-final', 'run-claim-final', 'WO-TEST-OVERSEER-01', 'sha', 'flag_merge_ready')`
+    );
+    expect(await claimVerdictForMergeExecution('verdict-final')).toBe(true);
+    await recordVerdictMergeOutcome({
+      verdictId: 'verdict-final',
+      mutationSent: true,
+      reason: 'merge_executed',
+      mergeSha: 'abc',
+    });
+    expect(await releaseVerdictClaimForMergeExecution('verdict-final', 'should-not-clear')).toBe(
+      false
+    );
+    const merged = await getOverseerVerdictsForRun('run-claim-final');
+    expect(merged[0]?.action_reason).toBe('merge_executed');
+    expect(merged[0]?.actioned_at).toBeTruthy();
+    expect(await listUnactionedFlagMergeReadyVerdicts()).toHaveLength(0);
+
+    await seedRun('run-claim-skip');
+    await db.query(
+      `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, proposed_action)
+       VALUES ('verdict-skip', 'run-claim-skip', 'WO-TEST-OVERSEER-01', 'sha', 'flag_merge_ready')`
+    );
+    expect(await claimVerdictForMergeExecution('verdict-skip')).toBe(true);
+    await recordVerdictMergeOutcome({
+      verdictId: 'verdict-skip',
+      mutationSent: false,
+      reason: 'repo_not_allowed',
+    });
+    expect(await releaseVerdictClaimForMergeExecution('verdict-skip', 'should-not-clear')).toBe(
+      false
+    );
+    const skipped = await getOverseerVerdictsForRun('run-claim-skip');
+    expect(skipped[0]?.action_reason).toBe('repo_not_allowed');
+    expect(skipped[0]?.actioned_at).toBeTruthy();
+  });
+
+  test('recordVerdictMergeOutcome throws when action_reason is not processing', async () => {
+    await seedRun('run-outcome-mismatch');
+    await db.query(
+      `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, proposed_action)
+       VALUES ('verdict-mismatch', 'run-outcome-mismatch', 'WO-TEST-OVERSEER-01', 'sha', 'flag_merge_ready')`
+    );
+    expect(await claimVerdictForMergeExecution('verdict-mismatch')).toBe(true);
+    await recordVerdictMergeOutcome({
+      verdictId: 'verdict-mismatch',
+      mutationSent: false,
+      reason: 'repo_not_allowed',
+    });
+    await expect(
+      recordVerdictMergeOutcome({
+        verdictId: 'verdict-mismatch',
+        mutationSent: true,
+        reason: 'merge_executed',
+        mergeSha: 'should-not-write',
+      })
+    ).rejects.toThrow('overseer_verdict_outcome_not_recorded');
+    const rows = await getOverseerVerdictsForRun('run-outcome-mismatch');
+    expect(rows[0]?.action_reason).toBe('repo_not_allowed');
+    expect(rows[0]?.merge_sha).toBeNull();
+    expect(rows[0]?.mutation_sent === false || rows[0]?.mutation_sent === 0).toBe(true);
+    expect(await listUnactionedFlagMergeReadyVerdicts()).toHaveLength(0);
   });
 });

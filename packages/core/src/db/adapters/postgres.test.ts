@@ -233,6 +233,8 @@ describe('PostgresAdapter', () => {
       const laterMigrationPrincipals = [
         ['overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 'TRUE'],
         ['overseer-review-route', 'Overseer Review Route', 'notify_only', 'TRUE'],
+        ['duty-officer', 'Duty Officer', 'worker_poll', 'TRUE'],
+        ['do', 'Duty Officer alias', 'worker_poll', 'TRUE'],
         ['taskmaster', 'Taskmaster', 'worker_poll', 'TRUE'],
       ] as const;
 

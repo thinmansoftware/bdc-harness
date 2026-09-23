@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
+import {
+  validateProposal,
+  TM_ALLOWED_ACTION_TYPES,
+  TM_ALLOWED_RECIPIENTS,
+  WO_ID_RE,
+} from './guard';
 import type { ActionProposal } from './rules';
 
 function proposal(overrides: Partial<ActionProposal> = {}): ActionProposal {
@@ -19,6 +24,32 @@ function proposal(overrides: Partial<ActionProposal> = {}): ActionProposal {
     ...overrides,
   };
 }
+
+describe('WO_ID_RE', () => {
+  test.each([
+    'WO-WIRE',
+    'WO-DEPLOY',
+    'WO-WIRE-',
+    'WO-wire-01',
+    'XWO-FOO-01',
+    'WO-FOO-1',
+    'WO-FOO-01X',
+    'WO-FOO--01',
+    'WO-FOO-01-extra',
+    'X-WO-FOO-01',
+  ])('does not match an incomplete or embedded identifier: %s', id => {
+    expect(WO_ID_RE.test(id)).toBe(false);
+  });
+
+  test.each([
+    'WO-SOCIAL-WIRE-ALL-META-PAGES-01',
+    'WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01',
+    'WO-HARNESS-TASKMASTER-VERB-GUARD-TITLE-FALSE-POSITIVE-01',
+    'WO-1-ABC2-123',
+  ])('matches the complete identifier in clean prose: %s', id => {
+    expect(`Unclaimed P0: "${id}" has no owner`.match(WO_ID_RE)?.[0]).toBe(id);
+  });
+});
 
 describe('validateProposal', () => {
   test('allows a well-formed nudge', () => {
@@ -132,5 +163,141 @@ describe('validateProposal', () => {
       // Content rejections are journal-only, NOT hard-pause circuits.
       expect(result.forbiddenEffect).toBeUndefined();
     }
+  });
+
+  test.each([
+    'Please WO-WIRE $500 to the vendor',
+    'WO-DEPLOY production now',
+    'WO-WIRE- has no owner',
+    'WO-wire-01 has no owner',
+    'XWO-WIRE-01 has no owner',
+    'WO-WIRE-1 has no owner',
+    'WO-WIRE-01X has no owner',
+    'WO-WIRE--01 has no owner',
+    'WO-WIRE-01-extra has no owner',
+    'X-WO-WIRE-01 has no owner',
+  ])('rejects forbidden verbs in invalid WO tokens: %s', body => {
+    const result = validateProposal(proposal({ type: 'escalate_p0', body }));
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('spend_send_deploy_verb_rejected');
+  });
+
+  test.each([
+    'WO-WIRE-01',
+    'WO-SOCIAL-WIRE-ALL-META-PAGES-01',
+    'WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01',
+    'WO-HARNESS-TASKMASTER-VERB-GUARD-TITLE-FALSE-POSITIVE-01',
+  ])('allows a complete WO identifier quoted or unquoted: %s', id => {
+    for (const title of [id, `"${id}"`]) {
+      expect(
+        validateProposal(proposal({ type: 'escalate_p0', body: `${title} has no owner` }))
+      ).toEqual({ allowed: true });
+    }
+  });
+
+  test('allows WIRE in a quoted WO title', () => {
+    const result = validateProposal(
+      proposal({
+        type: 'escalate_p0',
+        body:
+          'Unclaimed P0: "WO-SOCIAL-WIRE-ALL-META-PAGES-01" ' +
+          '(gh:thinmansoftware/bdc-harness#208) [P0] has no owner. Last movement 85 days ago.',
+      })
+    );
+
+    expect(result.allowed).toBe(true);
+  });
+
+  test('rejects charge in the title suffix after a PAYMENT WO identifier', () => {
+    const result = validateProposal(
+      proposal({
+        type: 'escalate_p0',
+        body:
+          'Unclaimed P0: "WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01: ' +
+          'confirmed charge -> store_tenants -> hostname" ' +
+          '(gh:thinmansoftware/bdc-xo#1873) [P0] has no owner.',
+      })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("forbidden verb 'charge'");
+  });
+
+  test('rejects a wire instruction entirely inside quotes', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: '"Please wire $500 to the vendor"' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('spend_send_deploy_verb_rejected');
+  });
+
+  test('rejects a wire instruction in a quoted WO title suffix', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: '"WO-FOO-01: please wire $500 to the vendor"' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("forbidden verb 'wire'");
+  });
+
+  test('allows multiple unquoted WO identifiers containing forbidden words', () => {
+    const result = validateProposal(
+      proposal({
+        type: 'escalate_p0',
+        body: 'WO-SOCIAL-WIRE-ALL-META-PAGES-01 and WO-CSOS-SLICE1-PAYMENT-PROVISIONING-01 have no owner.',
+      })
+    );
+
+    expect(result.allowed).toBe(true);
+  });
+
+  test('rejects quoted payment prose that is not a WO title', () => {
+    const result = validateProposal(
+      proposal({
+        type: 'escalate_p0',
+        body: 'Unclaimed P0: "Send the payment now" has no owner',
+      })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('spend_send_deploy_verb_rejected');
+  });
+
+  test('still rejects an unquoted wire instruction', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: 'Please wire $500 to the vendor' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason?.toLowerCase()).toContain('spend_send_deploy_verb_rejected');
+    expect(result.reason?.toLowerCase()).toContain("'wire'");
+  });
+
+  test('still rejects an unquoted deploy instruction', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: 'Deploy this to production now' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('spend_send_deploy_verb_rejected');
+  });
+
+  test('still rejects a forbidden verb after a quoted title', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: '"WO-FOO-01" -- send the invoice' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason?.toLowerCase()).toContain("'send the invoice'");
+  });
+
+  test('does not hide a forbidden verb after an unclosed quote', () => {
+    const result = validateProposal(
+      proposal({ type: 'escalate_p0', body: '"WO-BAR-01 has no owner -- send the invoice' })
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(result.reason?.toLowerCase()).toContain("'send the invoice'");
   });
 });

@@ -157,6 +157,8 @@ describe('SqliteAdapter', () => {
         { principal_id: 'codex', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'codex-mcp', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'cursor', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'do', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'duty-officer', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'fusion', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'grok', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'grok-acp', delivery_mode: 'worker_poll', active: 1 },
@@ -414,6 +416,74 @@ describe('SqliteAdapter', () => {
       for (const column of expectedArchiveColumns) {
         expect(names.has(column)).toBe(true);
       }
+    });
+  });
+
+  describe('tm_journal unheard grade migration (migration 055 / WO-HARNESS-TASKMASTER-UNHEARD-GRADE-01)', () => {
+    test('an existing pre-unheard tm_journal table is rebuilt so it accepts the unheard grade', async () => {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      // Pre-migration shape: the grade CHECK does NOT list 'unheard' (matches
+      // the CHECK createSchema wrote before this WO widened it).
+      legacy.run(`
+        CREATE TABLE tm_journal (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          thread_ref TEXT NOT NULL,
+          action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+          proposal_json TEXT NOT NULL,
+          idempotency_key TEXT,
+          before_hash TEXT,
+          proof_predicate TEXT,
+          proof_deadline_at TEXT,
+          outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+          graded_at TEXT,
+          grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful'))
+        )
+      `);
+      legacy.run(`
+        INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome, grade)
+        VALUES ('legacy-journal-1', '2026-08-01T00:00:00.000Z', 'thread-1', 'nudge', '{}', 'sent', 'noise')
+      `);
+      legacy.close();
+
+      // Reopening through SqliteAdapter must run the migration and rebuild the
+      // table with the widened CHECK, without losing the pre-existing row.
+      db = new SqliteAdapter(currentDbPath);
+
+      const schema = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+      );
+      expect(schema.rows[0]?.sql).toContain('unheard');
+
+      const preserved = await db.query<{ id: string; grade: string | null }>(
+        `SELECT id, grade FROM tm_journal WHERE id = 'legacy-journal-1'`
+      );
+      expect(preserved.rows).toEqual([{ id: 'legacy-journal-1', grade: 'noise' }]);
+
+      // The whole point of the migration: an UPDATE grading a row 'unheard'
+      // must now succeed against the migrated (existing, not freshly created)
+      // database -- this is what PR #864 flagged as broken.
+      await db.query(
+        `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome, grade)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          'legacy-journal-2',
+          '2026-09-15T00:00:00.000Z',
+          'thread-2',
+          'escalate_p0',
+          '{}',
+          'sent',
+          'unheard',
+        ]
+      );
+      const graded = await db.query<{ grade: string | null }>(
+        `SELECT grade FROM tm_journal WHERE id = 'legacy-journal-2'`
+      );
+      expect(graded.rows).toEqual([{ grade: 'unheard' }]);
     });
   });
 

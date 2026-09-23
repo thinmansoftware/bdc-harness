@@ -81,13 +81,6 @@ function makeFailVerdict(reason: string): GateVerdict {
   };
 }
 
-/** Windows CI runners are slow enough that the first cascade test in the file
- *  (which pays module + config cold-start plus real wo-lock file IO) crosses
- *  Bun's 5000ms default (~5016ms observed on windows-latest, 2026-08-25: PRs
- *  #701/#703/#705/#710). Known timeout class: reference_windows-ci-timeout-class-bun-5000.
- *  Ubuntu is always green -- this is runner speed, not product code. */
-const SLOW_TEST_TIMEOUT_MS = 30_000;
-
 /** Root for this test run's outDirs -- removed after the suite. */
 const testOutRoot = join(tmpdir(), `smart-cauldron-test-runs-${randomUUID()}`);
 afterAll(async () => {
@@ -96,14 +89,10 @@ afterAll(async () => {
 
 /** Build base options pointing to the real config (entry defaults to codex).
  *
- *  outDir is UNIQUE PER CALL. Most tests here omit deps.acquireWoLock, so the
- *  REAL wo-lock runs against outDir keyed on the shared woId 'WO-TEST-001'.
- *  With a shared outDir, one test dying mid-cascade (e.g. a Windows timeout)
- *  leaves its lock file behind and every later cascade test fails with
- *  "REFUSING duplicate cascade" -- one flake poisoned the whole suite
- *  (2026-08-25 windows-latest). A per-test outDir makes each cascade's lock
- *  namespace disposable, so no test can contaminate another. */
+ * Claim lookup and WO locking default to in-memory stubs so tests cannot reach
+ * GitHub or the filesystem by omission. Tests can override individual deps. */
 function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
+  const { deps, ...options } = partial;
   return {
     woId: 'WO-TEST-001',
     woClass: 'CODE',
@@ -111,40 +100,83 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     outDir: join(testOutRoot, randomUUID()),
     token: 'test-token',
     project: 'test-project',
-    ...partial,
+    ...options,
+    deps: {
+      findWoClaim: async () => null,
+      acquireWoLock: async (woId, project, cascadeId) => ({
+        acquired: true,
+        path: 'in-memory-test-lock',
+        record: {
+          woId,
+          project,
+          cascadeId,
+          status: 'running',
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString(),
+        },
+      }),
+      releaseWoLock: async () => {},
+      ...deps,
+    },
   };
 }
+
+test('cascade preserves the eligibility identity on every attempted lane', async () => {
+  const expectedSpec = {
+    specSource: 'github:org/repo:docs/WO-TEST-001.md',
+    specRevision: 'a'.repeat(40),
+    specHash: `sha256:${'b'.repeat(64)}`,
+  };
+  const messages: string[] = [];
+  await runCascade(
+    baseOpts({
+      expectedSpec,
+      deps: {
+        findWoClaim: async () => null,
+        fire: async options => {
+          messages.push(options.message);
+          return makeFireOk('run-bound');
+        },
+        poll: async () => makePollResult(),
+        judge: async () => makePassVerdict(),
+        writeRecord: async () => {},
+      },
+    })
+  );
+  expect(messages.length).toBeGreaterThan(0);
+  for (const message of messages) {
+    const encoded = message.split('\n')[0].split(' --expected-spec=')[1];
+    expect(encoded).toBeDefined();
+    expect(JSON.parse(Buffer.from(encoded, 'base64url').toString())).toEqual(expectedSpec);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Auth/project binding guards
 // ---------------------------------------------------------------------------
 
 describe('auth/project binding guards', () => {
-  test(
-    'lane preflight failure is recorded and prevents provider fire',
-    async () => {
-      let fireCalled = false;
-      const deps: CascadeDeps = {
-        preflight: async tier => {
-          throw new Error(`workflow ${tier.workflowName} is unavailable`);
-        },
-        fire: async () => {
-          fireCalled = true;
-          return makeFireOk('should-not-fire');
-        },
-        escalate: async () => undefined,
-        writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
-      };
+  test('lane preflight failure is recorded and prevents provider fire', async () => {
+    let fireCalled = false;
+    const deps: CascadeDeps = {
+      preflight: async tier => {
+        throw new Error(`workflow ${tier.workflowName} is unavailable`);
+      },
+      fire: async () => {
+        fireCalled = true;
+        return makeFireOk('should-not-fire');
+      },
+      escalate: async () => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
 
-      const result = await runCascade(baseOpts({ deps }));
+    const result = await runCascade(baseOpts({ deps }));
 
-      expect(fireCalled).toBe(false);
-      expect(result.status).toBe('infra-alert');
-      expect(result.attempts[0]?.outcome).toBe('infra-error');
-      expect(result.attempts[0]?.infraErrorReason).toContain('is unavailable');
-    },
-    SLOW_TEST_TIMEOUT_MS
-  );
+    expect(fireCalled).toBe(false);
+    expect(result.status).toBe('infra-alert');
+    expect(result.attempts[0]?.outcome).toBe('infra-error');
+    expect(result.attempts[0]?.infraErrorReason).toContain('is unavailable');
+  });
 
   test('missing project throws before firing', async () => {
     let fireCalled = false;
@@ -926,7 +958,7 @@ describe('Test: cancelled stops the cascade (real gate)', () => {
     } finally {
       await rm(outDir, { recursive: true, force: true });
     }
-  }, 15000);
+  });
 
   test('cancelled is never pass:true under the real gate (otherwise-clean fields)', async () => {
     // Even with validator satisfied + PR mergeable, cancelled must fail the gate.
@@ -1049,8 +1081,28 @@ describe('wo claim + single-flight (#1546)', () => {
     const result = await runCascade(baseOpts({ deps }));
 
     expect(fireCalled).toBe(false);
-    expect(result.status).toBe('won');
+    expect(result.status).toBe('refused');
     expect(result.attempts.length).toBe(0);
+    expect(result.refusalReason?.reason).toBe('already-satisfied');
+    expect(result.refusalReason?.prNumber).toBe(99);
+  });
+
+  test('a genuine win still produces status won (not refused)', async () => {
+    const deps: CascadeDeps = {
+      findWoClaim: async () => null,
+      fire: async () => makeFireOk('run-1'),
+      poll: async () => makePollResult(),
+      judge: () => makePassVerdict(),
+      escalate: async () => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const result = await runCascade(baseOpts({ deps }));
+
+    expect(result.status).toBe('won');
+    expect(result.refusalReason).toBeUndefined();
+    expect(result.attempts.length).toBe(1);
+    expect(result.telemetry.wonCheap).toBe(true);
   });
 
   test('second concurrent cascade for same WO is blocked', async () => {
@@ -1162,6 +1214,47 @@ describe('wo claim + single-flight (#1546)', () => {
     const record = await runCascade(baseOpts({ deps }));
 
     expect(fireCalls.length).toBe(1);
-    expect(record.status).toBe('won');
+    expect(record.status).toBe('refused');
+    expect(record.attempts.length).toBe(1);
+    // The attempt itself genuinely gate-failed (a tier actually ran); the
+    // refusal is a cascade-level decision not to climb further, recorded at
+    // record.status/refusalReason, not by rewriting the attempt's outcome.
+    expect(record.attempts[0]?.outcome).toBe('gate-failed');
+    expect(record.refusalReason?.prNumber).toBe(42);
+  });
+
+  test('refuses (not wins) when claim appears immediately before a fire', async () => {
+    let claimCalls = 0;
+    const fireCalls: string[] = [];
+    const deps: CascadeDeps = {
+      findWoClaim: async () => {
+        claimCalls++;
+        // First check (pre-cascade) empty; claim lands between admission and
+        // the per-tier pre-fire re-check.
+        if (claimCalls === 1) return null;
+        return {
+          number: 77,
+          state: 'OPEN',
+          title: 'WO-TEST-001 landed just before fire',
+          url: 'https://github.com/org/repo/pull/77',
+          repo: 'thinmansoftware/test-project',
+        };
+      },
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      escalate: async () => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fireCalls.length).toBe(0);
+    expect(record.status).toBe('refused');
+    expect(record.attempts.length).toBe(1);
+    expect(record.attempts[0]?.outcome).toBe('refused');
+    expect(record.refusalReason?.prNumber).toBe(77);
+    expect(record.refusalReason?.checkedAtTier).not.toBeNull();
   });
 });

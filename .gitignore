@@ -144,5 +144,9 @@ fusion-runs/
 cascade-runs/*
 !cascade-runs/.gitkeep
 
+# Runtime artifacts produced inside package working directories
+packages/smart-cauldron/cascade-runs/
+packages/fusion/.fusion-budget-receipts-*.db
+
 scripts/dispatch-worker/config.local.json
 scripts/dispatch-worker/transcripts/

@@ -82,6 +82,7 @@ export interface WorktreeSweepOptions {
   getActiveSession?: (conversationId: string) => Promise<object | null>;
   updateEnvStatus?: (envId: string, status: 'active' | 'destroyed') => Promise<void>;
   getLastCommitDateFn?: (worktreePath: string) => Promise<Date | null>;
+  hasUncommittedWorkFn?: (worktreePath: string) => Promise<boolean>;
   getCanonicalRepoPathFn?: (worktreePath: string) => Promise<string>;
   moveDir?: (from: string, to: string) => Promise<void>;
   pruneWorktree?: (repoPath: string) => Promise<void>;
@@ -187,6 +188,76 @@ async function getWorktreeLastCommitDate(
     getLog().warn({ err: error, worktreePath }, 'worktree_sweep_last_commit_date_lookup_failed');
     return null;
   }
+}
+
+/**
+ * Reliable "genuine work" signal: `git status --porcelain --untracked-files=all`.
+ *
+ * Directory mtime says a worktree was TOUCHED; git status says it HOLDS WORK.
+ * Any non-empty output -- modified tracked files, staged-but-uncommitted changes,
+ * or untracked files -- means a human or an agent left something in this worktree
+ * that exists nowhere else, and reclaiming it would destroy that work no matter how
+ * old the last commit or the env row is.
+ *
+ * Stashes are deliberately NOT consulted: `refs/stash` is repository-wide, not
+ * per-worktree, so one stash anywhere in the repo would preserve every worktree of
+ * that repo forever and reintroduce the never-sweep bug this file exists to fix.
+ */
+async function defaultHasUncommittedWork(worktreePath: string): Promise<boolean> {
+  const { stdout } = await execFileAsync(
+    'git',
+    ['-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
+    { timeout: 30000 }
+  );
+  return stdout.trim().length > 0;
+}
+
+type UncommittedWorkVerdict =
+  | { preserve: false }
+  | { preserve: true; reason: 'has_uncommitted_work' | 'dirty_check_failed'; error?: string };
+
+/**
+ * Wraps the dirty check so that FAILURE TO DETERMINE dirtiness fails safe toward
+ * preservation. A corrupt worktree, a missing gitdir, a git timeout -- none of
+ * these prove the tree is clean, so none of them may authorize reclamation. The
+ * only path to "reclaim" is a successful git status that returns nothing.
+ */
+async function checkUncommittedWork(
+  worktreePath: string,
+  hasUncommittedWorkFn: (worktreePath: string) => Promise<boolean>
+): Promise<UncommittedWorkVerdict> {
+  try {
+    if (await hasUncommittedWorkFn(worktreePath)) {
+      return { preserve: true, reason: 'has_uncommitted_work' };
+    }
+    return { preserve: false };
+  } catch (error) {
+    const err = error as Error;
+    return { preserve: true, reason: 'dirty_check_failed', error: err.message };
+  }
+}
+
+/**
+ * Decide the age of a worktree using DURABLE evidence only, never directory mtime.
+ *
+ * Directory mtime is not evidence of real activity: a git operation, a container
+ * restart, a filesystem scan, or any stray write refreshes it, which can make a
+ * months-dead worktree look brand new forever (the 2026-09-22 production incident --
+ * 70 worktrees scanned, 0 reclaimed, every one skipped with `env_inside_orphan_age`
+ * because dirStat.mtime kept outvoting the real signals).
+ *
+ * Precedence, most trustworthy first:
+ *   1. Last commit date -- real work happened, verified via git log.
+ *   2. Env row's created_at -- the environment is provably that old at minimum.
+ * If NEITHER exists (no commits ever made, no env row at all -- the "no-git"
+ * class from the incident), there is no durable signal: treat the worktree as
+ * having no recorded activity (returns null), which callers must treat as
+ * immediately eligible for reclamation once the active-session check has
+ * already cleared it. Directory mtime never participates in this decision --
+ * it cannot resurrect a dead worktree, and it cannot preserve one either.
+ */
+function durableActivityDate(lastCommitDate: Date | null, envCreatedAt: Date | null): Date | null {
+  return newestDate(lastCommitDate, envCreatedAt);
 }
 
 async function hasActiveSessionForEnvironment(
@@ -312,6 +383,7 @@ export async function sweepTerminalWorkflowWorktrees(
   const getLastCommitDateFn =
     opts.getLastCommitDateFn ??
     ((path: string): Promise<Date | null> => getLastCommitDate(toWorktreePath(path)));
+  const hasUncommittedWorkFn = opts.hasUncommittedWorkFn ?? defaultHasUncommittedWork;
   const getCanonicalRepoPathFn =
     opts.getCanonicalRepoPathFn ??
     ((path: string): Promise<string> => getCanonicalRepoPath(toWorktreePath(path)));
@@ -390,12 +462,37 @@ export async function sweepTerminalWorkflowWorktrees(
         const lastCommitDate = await getWorktreeLastCommitDate(worktreeDir, getLastCommitDateFn);
         const envCreatedAt =
           env.created_at instanceof Date ? env.created_at : new Date(env.created_at);
-        const newestActivity = newestDate(envCreatedAt, lastCommitDate, dirStat.mtime);
-        const ageMs = newestActivity ? now.getTime() - newestActivity.getTime() : 0;
+        // Directory mtime deliberately does NOT participate here -- see durableActivityDate().
+        // A no-git worktree with no commits falls back to envCreatedAt, which is still real
+        // evidence (the environment row itself has a provable creation time); only in the
+        // theoretical case where neither exists does this collapse to "no evidence", and an
+        // absent active session (already checked above) means it is immediately reclaimable.
+        const activityDate = durableActivityDate(lastCommitDate, envCreatedAt);
+        const ageMs = activityDate ? now.getTime() - activityDate.getTime() : Infinity;
         if (ageMs <= orphanAgeMs) {
           report.skipped.push({ path: worktreeDir, reason: 'env_inside_orphan_age' });
           getLog().warn(
             { worktreePath: worktreeDir, envId: env.id, reason: 'env_inside_orphan_age' },
+            'worktree_sweep_env_only_skipped'
+          );
+          continue;
+        }
+
+        // Age says reclaim and no session owns it -- but session absence does not prove
+        // the tree holds no work. Genuine uncommitted changes (modified, staged, or
+        // untracked files) are valuable regardless of commit age and must be preserved.
+        // Only a clean tree, proven by a successful git status, may be reclaimed.
+        const workVerdict = await checkUncommittedWork(worktreeDir, hasUncommittedWorkFn);
+        if (workVerdict.preserve) {
+          const reason = `env_${workVerdict.reason}`;
+          report.skipped.push({ path: worktreeDir, reason });
+          getLog().warn(
+            {
+              worktreePath: worktreeDir,
+              envId: env.id,
+              reason,
+              ...(workVerdict.error ? { error: workVerdict.error } : {}),
+            },
             'worktree_sweep_env_only_skipped'
           );
           continue;
@@ -470,9 +567,39 @@ export async function sweepTerminalWorkflowWorktrees(
         continue;
       }
 
-      if (now.getTime() - dirStat.mtime.getTime() <= orphanAgeMs) {
+      // No run row AND no env row: Archon's own bookkeeping has nothing on this
+      // worktree at all, so there is no created_at to prove how old it is. This is
+      // also the window a worktree sits in while it is still being provisioned --
+      // checked out (possibly at an OLD commit) but its env/run row not yet written.
+      // Judging it by commit date alone would quarantine it mid-provision, so here
+      // directory mtime DOES participate: the worktree is as recent as the newest of
+      // its last commit and its mtime. mtime only ever makes an unmatched worktree
+      // look newer, never older, and the uncommitted-work guard below still applies
+      // once it does age out. The env-backed path above keeps mtime out because it
+      // has created_at as durable evidence (the actual 2026-09-22 incident class).
+      const lastCommitDate = await getWorktreeLastCommitDate(worktreeDir, getLastCommitDateFn);
+      const activityDate = newestDate(lastCommitDate, dirStat.mtime) ?? dirStat.mtime;
+      if (now.getTime() - activityDate.getTime() <= orphanAgeMs) {
         report.orphaned.push(worktreeDir);
         getLog().warn({ worktreePath: worktreeDir }, 'worktree_sweep_orphaned_worktree');
+        continue;
+      }
+
+      // Same rule as the env-backed path: old is not the same as empty. A worktree
+      // Archon has no record of can still hold someone's uncommitted work.
+      const workVerdict = await checkUncommittedWork(worktreeDir, hasUncommittedWorkFn);
+      if (workVerdict.preserve) {
+        const reason = `unmatched_${workVerdict.reason}`;
+        report.orphaned.push(worktreeDir);
+        report.skipped.push({ path: worktreeDir, reason });
+        getLog().warn(
+          {
+            worktreePath: worktreeDir,
+            reason,
+            ...(workVerdict.error ? { error: workVerdict.error } : {}),
+          },
+          'worktree_sweep_orphaned_worktree'
+        );
         continue;
       }
 
@@ -541,20 +668,34 @@ export async function sweepTerminalWorkflowWorktrees(
     }
   }
 
-  getLog().info(
-    {
-      scanned: report.scanned,
-      removed: report.removed.length,
-      quarantined: report.quarantined.length,
-      quarantineDeleted: report.quarantineDeleted.length,
-      bytesFreed: report.bytesFreed,
-      quarantinedBytes: report.quarantinedBytes,
-      quarantineDeletedBytes: report.quarantineDeletedBytes,
-      errors: report.errors.length,
-      orphaned: report.orphaned.length,
-    },
-    'worktree_sweep_disk_report'
-  );
+  const reportPayload = {
+    scanned: report.scanned,
+    removed: report.removed.length,
+    quarantined: report.quarantined.length,
+    quarantineDeleted: report.quarantineDeleted.length,
+    skipped: report.skipped.length,
+    orphaned: report.orphaned.length,
+    bytesFreed: report.bytesFreed,
+    quarantinedBytes: report.quarantinedBytes,
+    quarantineDeletedBytes: report.quarantineDeletedBytes,
+    errors: report.errors.length,
+  };
+
+  // A sweep that scans real worktrees and reclaims nothing is a problem, not a clean
+  // run -- surface it at warn so it does not read as routine success in the logs
+  // (the exact shape of the 2026-09-22 incident: scanned:70, removed:0, quarantined:0,
+  // bytesFreed:0, every one silently skipped).
+  const didNothing =
+    report.scanned > 0 &&
+    report.removed.length === 0 &&
+    report.quarantined.length === 0 &&
+    report.bytesFreed === 0;
+
+  if (didNothing) {
+    getLog().warn(reportPayload, 'worktree_sweep_disk_report_noop');
+  } else {
+    getLog().info(reportPayload, 'worktree_sweep_disk_report');
+  }
 
   return report;
 }

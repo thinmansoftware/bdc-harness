@@ -66,14 +66,16 @@ function loadLane(filename: string): LaneDef {
 }
 
 describe('lane registration and war-council-validator pin', () => {
-  it('S4: enumerates exactly the eleven governed feature lanes', () => {
+  it('S4: enumerates exactly the twelve governed feature lanes', () => {
     // Kimi canary lanes added 2026-07-20 (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01).
+    // Cursor lane added 2026-09-15 (PR #848): grok clone on the Cursor rail.
     // This enumeration is deliberately hardcoded: it is the tripwire that forces a
     // new lane to be acknowledged here AND given an explicit validator-pin branch
     // in S4b below, rather than silently inheriting a default.
     expect(LANE_FILES).toEqual([
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
+      'bdc-feature-development-cursor.yaml',
       'bdc-feature-development-fable.yaml',
       'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
@@ -139,6 +141,15 @@ describe('lane registration and war-council-validator pin', () => {
         // builder model is the point -- a lane must not grade its own work.
         // Dispatchable canaries only; NOT ladder-wired until John reviews results.
         expect(wcv.provider).toBe('codex-opr');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-cursor.yaml') {
+        // PR #848: Fable builds on the Cursor rail; Sol judges on the SAME rail
+        // but a different model, so the lane never grades its own work.
+        expect(wcv.provider).toBe('cursor');
+        expect(wcv.model).toBe('gpt-5.6-sol-high');
+        expect(wcv.model).not.toBe('claude-fable-5-1-thinking-high');
         return;
       }
 
@@ -257,6 +268,33 @@ describe('lane registration and war-council-validator pin', () => {
       expect(content, file).not.toMatch(/Co-Authored-By:\s*(Claude|paid-seat)/i);
       expect(content, file).not.toContain('agent: overseer-opus');
     }
+  });
+
+  it('S4l: the Cursor lane binds provider cursor at the root and Sol on the review seats', () => {
+    const file = 'bdc-feature-development-cursor.yaml';
+    const lane = loadLane(file);
+    const grok = loadLane('bdc-feature-development-grok.yaml');
+    const nodes = lane.nodes ?? [];
+    const node = (id: string) => nodes.find(candidate => candidate.id === id);
+
+    expect(lane.provider).toBe('cursor');
+    expect(lane.model).toBe('claude-fable-5-1-thinking-high');
+    // Same node ids, same order, as the grok lane it was cloned from.
+    expect(nodes.map(n => n.id)).toEqual((grok.nodes ?? []).map(n => n.id));
+
+    for (const id of ['diff-review', 'diff-review-final', 'opus-rereview']) {
+      const reviewNode = node(id);
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('cursor');
+      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-5.6-sol-high');
+    }
+    for (const id of ['implement', 'diff-repair', 'opus-repair']) {
+      const buildNode = node(id);
+      expect(buildNode?.provider, `${file}:${id}:provider`).toBe('cursor');
+      expect(buildNode?.model, `${file}:${id}:model`).toBe('claude-fable-5-1-thinking-high');
+    }
+    // No dead rail left in the lane.
+    const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+    expect(content).not.toMatch(/^\s*provider:\s*(grok|codex-opr|codex|claude)\b/m);
   });
 
   it('S4i: the dedicated Grok lane pins execution to Grok and review to non-Grok seats', () => {

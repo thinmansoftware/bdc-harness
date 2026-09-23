@@ -11,11 +11,17 @@ Operator-run watcher for `WO-HARNESS-DISPATCH-DROPBOX-V1-01`.
    (closes the plan's Dependency #1 / WO Stop Condition #4 CLI-shape check):
    - Claude Code: `claude --permission-mode plan -p <prompt>`.
    - Codex/Sol: `codex exec --skip-git-repo-check --sandbox read-only --ephemeral
-     --ignore-user-config <prompt>` -- the
+     --ignore-user-config -c windows.sandbox="unelevated" <prompt>` -- the
      `--skip-git-repo-check` flag is REQUIRED: without it codex exec refuses
      to run in any untrusted/non-git working directory ("Not inside a trusted
-     directory"), and dispatch tasks run in arbitrary workdirs. The example
-     config ships this flag.
+     directory"), and dispatch tasks run in arbitrary workdirs. The
+     `-c windows.sandbox="unelevated"` pair is REQUIRED TOO (#795): on Windows,
+     `--ignore-user-config` drops the `[windows] sandbox` key from
+     `~/.codex/config.toml`, this codex build cannot construct a Windows sandbox
+     without an explicit mode, and every command -- including a plain file read --
+     then fails with a misleading `Rejected(... "blocked by policy")`. It is inert
+     on Linux and macOS, so the default carries it unconditionally. The example
+     config ships both.
    - Grok: `grok --permission-mode plan --no-subagents -p <prompt>`.
    - Cursor: `cursor-agent --print --mode ask --trust <prompt>`.
    - Fusion accepts only a structured `run_review` JSON body containing `wo`, `diff`, `tests`,
@@ -38,6 +44,59 @@ The launcher maintains an SSH local forward to the Archon API. The scheduled tas
 interactive operator session and ignores duplicate starts.
 
 `config.local.json` and `scripts/dispatch-worker/transcripts/` are intentionally gitignored.
+
+## Per-agent working directory and environment (`cwd`, `env`)
+
+Every agent in `agents` accepts two optional fields:
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `cwd` | absolute path string | unset -> a fresh `mkdtemp` scratch directory per dispatch | Directory the agent process runs in. |
+| `env` | object of string -> string | unset -> the worker's own environment only | Extra environment variables merged over the worker environment for this agent's child process. |
+
+Both apply to all three transports (the `prompt` CLI path, `acp`, and `mcp`).
+
+### Why `cwd` exists
+
+John's directive 2026-09-08: board seats must get context. Without `cwd` every
+exec-transport agent runs in an empty temp directory, so a seat answering a
+board ballot has no repo, no wiki, and no skills, and reports "Oracle
+unavailable / skill read blocked" every round. Pointing a seat at a real
+checkout gives it the context the board packet already assumes it has.
+
+```json
+{
+  "agents": {
+    "codex": {
+      "command": "codex",
+      "args": ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--ignore-user-config", "-c", "windows.sandbox=\"unelevated\""],
+      "cwd": "C:/Users/pcmed/projects/BDC_XO/.worktrees/xo-main",
+      "env": { "ORACLE_URL": "https://oracle.bluedevilcollectibles.com" }
+    }
+  }
+}
+```
+
+Rules the worker enforces:
+
+- The worker never creates, writes into, or deletes a configured `cwd`. The
+  prompt file used by `promptDelivery: 'prompt-file'` seats still goes to a
+  per-run temp directory, so nothing untracked lands in a real checkout.
+- A `cwd` that is missing, is not a directory, or is not absolute falls back to
+  the `mkdtemp` scratch directory and logs a WARNING. A moved worktree degrades
+  to today's behaviour instead of taking a seat offline.
+- The effective directory is logged once per run:
+  `<transport> leg for <recipient> (<id>) cwd=<path> source=configured|temp`.
+- `cwd` changes where an agent runs; it changes no permission or sandbox flag.
+  The codex seat keeps `--sandbox read-only` regardless.
+
+### `env`
+
+`env` is merged over `process.env` for the child only. Use it for
+non-secret pointers a seat needs (an Oracle URL, a feature flag) or for a
+read-only token that is issued to one seat. Real secrets belong in the
+worker's own environment or a token file -- `config.local.json` is gitignored,
+but `config.example.json` is not.
 
 ## ACP conformance and promotion
 

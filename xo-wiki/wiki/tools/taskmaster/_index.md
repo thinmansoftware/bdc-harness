@@ -15,6 +15,78 @@ All effects are dispatch messages through the existing dispatch DAL
 (`agent_dispatch_messages`). It has NO spend, send-to-customer, deploy,
 merge, assignment, or WO-authoring authority (Slice 1 exclusions, ratified).
 
+## Fire source binding (PR746 source candidate, not activated)
+
+This subsection documents `WO-HARNESS-TASKMASTER-FIRE-ALL-PRIORITIES-01`
+source behavior. It does not certify deployment or authorize enabling fire.
+The older Slice 1 and P0-only descriptions elsewhere on this page are
+historical context, not evidence that this candidate is running.
+
+Eligible, unclaimed P0-P3 work can produce a fire proposal. Priority determines
+fire order, not permission. The fire cap is three per tick within the existing
+ten-effect cap; overflow remains deferred. Assigned, claimed, blocked, or held
+work cannot fire. Existing pause, backoff, and lane-budget checks still apply.
+Hold labels exclude fire without changing ordinary nudge classification.
+
+### Canonical source and trust boundary
+
+Eligibility reuses `freezeWorkOrderSource`, resolving bdc-xo `main` to an
+immutable commit before reading these exact paths in order:
+
+1. `docs/work-orders/<WO_ID>.md`
+2. `docs/superpowers/specs/<WO_ID>.md`
+
+There is no date-glob or issue-title-search fallback for Taskmaster fires.
+Issue-only specs fail closed: issue-authored `cauldron_compatible: true` and
+`target_repo` fields are not an execution grant. This follows the permitted
+safety alternative recorded on bdc-xo issue1843 and replaces the older WO
+scenario expecting issue-only automatic eligibility. The current feature
+lanes consume frozen authority artifacts, not their historical dead resolver.
+
+Eligibility records `expectedSpec` with the full canonical source, commit
+revision, and SHA-256 content hash. The legacy `specSource: repo-path` category
+covers either exact committed path; `expectedSpec.specSource` distinguishes
+them. Both the loop and direct proposal function require the identity to fire.
+The cascade carries it through retries. Runtime resolves its own authority
+policy and rejects a mismatch before worker creation or isolation.
+Prior-attempt prose cannot supply or replace the binding.
+
+Premium approval packets preserve the same constraint on resume. Original
+Taskmaster packets identified by `tm:fire:` without a binding are refused.
+Existing identity-less manual packets remain compatible; historical UUID
+descendants do not establish Taskmaster provenance.
+
+### Diagnose a blocked fire
+
+- `spec_missing`: verify a spec exists at one of the two committed paths,
+  rather than only in an issue body.
+- `authority_conflict`: compare journal `fireEvidence.expectedSpec` with the
+  canonical source and, when available, the run's authority manifest. A changed
+  source, revision, or hash requires fresh eligibility and governed re-dispatch.
+  Strict revision equality intentionally also refuses an unchanged spec after
+  an unrelated bdc-xo main commit, including a delayed premium resume. Do not
+  strip the binding to recover. This liveness tradeoff remains an activation
+  decision; this source repair does not relax the same-revision/hash contract.
+- A legacy Taskmaster approval packet missing its identity needs fresh
+  eligibility and governed re-dispatch, not fabricated approval metadata.
+
+Local verification from the bdc-harness checkout:
+
+```powershell
+bun test packages/server/src/taskmaster/
+bun test packages/core/src/workflows/work-order-source.test.ts
+bun test packages/smart-cauldron/src/__tests__/fire.test.ts
+bun test packages/smart-cauldron/src/__tests__/cascade.test.ts
+bun test packages/smart-cauldron/src/__tests__/frontier-approval-resume.test.ts
+bun run validate
+```
+
+These commands do not deploy, unpause Taskmaster, enable firing, or satisfy
+the WO's runtime stop condition. Source review and runtime acceptance are
+separate gates. A supplied `healthy` classification does not suppress an
+undelivered ruling; normal classification already marks that ruling ready.
+This preserves the existing governance-delivery behavior.
+
 ## Environment
 
 | Variable                       | Meaning                                                                                                             |
@@ -88,8 +160,51 @@ curl -s -X POST -H "x-archon-operator-token: $ARCHON_OPERATOR_TOKEN" \
   http://localhost:3090/api/taskmaster/resume
 ```
 
-Resume increments the pause epoch and EXPIRES stale parked/pending proposals
-rather than replaying them (response includes `expired_proposals`).
+Resume increments the pause epoch only when leaving PAUSED or HARD_PAUSE.
+Every successful invocation EXPIRES stale parked/pending proposals rather
+than replaying them and writes its own audit (response includes
+`expired_proposals` and `audit_id`). An already-RUNNING reset preserves the
+epoch-start timestamp, so accumulated useful/noise grades remain in scope.
+
+## Grading (useful / noise / unheard)
+
+`gradeSentActions` (`packages/server/src/taskmaster/loop.ts`) grades each sent
+action against action-specific external SOR evidence recorded after the send:
+
+| Grade     | Meaning                                                                                                     | Counts toward useful-rate floor? |
+| --------- | ----------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `useful`  | External SOR shows downstream movement caused by the send (ruling addressed, issue closed/assigned/marked). | Yes (numerator)                  |
+| `noise`   | Heard channel, proof deadline passed, no downstream movement.                                               | Yes (denominator)                |
+| `unheard` | The dispatch row was never acknowledged by a non-draining principal -- nobody could have read it.           | No (excluded from denominator)   |
+
+**M-155 Amendment 03 (John's ruling 2026-09-21).** An action is `unheard`
+unless its dispatch row carries an `acknowledged_at` from a recipient whose
+`delivery_mode` is NOT `drain_on_start`. A `drain_on_start` mailbox (e.g.
+`operator`, and `xo`) auto-addresses within seconds and is never human-read, so
+a message sent there was never actually heard. Grading such a message `noise`
+conflated **channel deafness** (the M-129 Phase 2 gap) with **supervisor
+uselessness** (the M-155 measurement), which triggered a false useful-rate
+floor breach and self-pause on 2026-09-17.
+
+`unheard` is excluded from the floor denominator by construction: only
+`useful` and `noise` grades feed `usefulRateFloorBreached(usefulCount,
+noiseCount)` (`packages/server/src/taskmaster/rules.ts`). The heard gate is
+applied FIRST, before any useful/noise evaluation: a send that was never heard
+is graded `unheard` immediately, even if downstream SOR movement exists,
+because that movement cannot be attributed to a send nobody received
+(`packages/server/src/taskmaster/loop.ts`, `gradeSentActions`). Only heard
+actions fall through to the useful/noise test. `fire_cauldron` is exempt from
+the heard gate -- it is a direct cascade trigger with no human-mailbox hop, so
+channel deafness cannot apply, and it is graded useful/noise like before. The
+40% floor value, `USEFUL_RATE_MIN_GRADED`, the auto-pause mechanism, and
+"resume is an operator decision" are all unchanged.
+
+Grade-split query:
+
+```bash
+sqlite3 /opt/bdc/archon-data/archon.db \
+  "SELECT grade, count(*) FROM tm_journal WHERE outcome='sent' GROUP BY grade"
+```
 
 ## Journal queries (on archon-app-1)
 
@@ -127,6 +242,34 @@ Pause state:
 ```bash
 sqlite3 /opt/bdc/archon-data/archon.db "SELECT * FROM tm_control WHERE id=1"
 ```
+
+## Registering an expectation
+
+Use the authenticated front door instead of writing `tm_expectations` directly.
+From the bdc-harness checkout, register a 24-hour PR expectation with:
+
+```powershell
+scripts/taskmaster/expect.ps1 -Ref bdc-xo#2006 -Recipient fable-cursor `
+  -Evidence pr_opened:thinmansoftware/fuelglass -DueIn 24h -OnAbsence escalate
+```
+
+The script calls `POST /api/taskmaster/expectations` with the operator token.
+Reuse the same registration key when retrying: the first request returns a new
+expectation and later requests return that stored expectation without consuming
+daily-cap headroom. See
+`docs/doctrine/taskmaster-expectation-registration.md` for the API contract and
+evidence forms.
+
+## Known issues
+
+WO-HARNESS-TM-HEALTH-UPSERT-CONFLICT-FIX-01 repairs legacy on-disk `tm_health`
+tables whose composite `PRIMARY KEY (provider, sampled_at)` made every
+provider health upsert fail. On connection, `migrateColumns()` preserves
+the table and its schema objects, retains the latest sample per provider,
+and adds a provider-only unique index using an unoccupied schema name.
+An existing compatible unique index makes the repair a no-op. This allows
+`/api/taskmaster/status` headroom to reflect recorded spawn evidence after
+the separately governed runtime rollout.
 
 ## Kill / rollback
 

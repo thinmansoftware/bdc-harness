@@ -7,7 +7,8 @@
  * stricter-of-two tier law, and permit-free Tier 0 escalation.
  */
 
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { rootLogger } from '@archon/paths';
 import {
   buildEvidenceEnvelope,
   buildJudgePrompt,
@@ -29,6 +30,31 @@ import type {
   OverseerWorkflowEvent,
   WatchedRunRecord,
 } from '../types.ts';
+
+interface LogDestination {
+  write(chunk: string): unknown;
+}
+
+const loggerStreamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+  symbol => String(symbol) === 'Symbol(pino.stream)'
+)!;
+const loggerDestination = (rootLogger as unknown as Record<symbol, LogDestination>)[
+  loggerStreamSymbol
+];
+const originalLogWrite = loggerDestination.write.bind(loggerDestination);
+
+afterEach(() => {
+  loggerDestination.write = originalLogWrite;
+});
+
+function captureLogOutput(): string[] {
+  const chunks: string[] = [];
+  loggerDestination.write = (chunk: string): boolean => {
+    chunks.push(chunk);
+    return true;
+  };
+  return chunks;
+}
 
 function makeRecord(overrides: Partial<WatchedRunRecord> = {}): WatchedRunRecord {
   return {
@@ -278,6 +304,34 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
     }
   });
 
+  // #852 (live 2026-09-15 13:47Z): OVERSEER_JUDGE_LADDER=codex,grok,cursor with
+  // codex out of quota and grok out of credits. cursor was the only live rung,
+  // so the ONLY acceptable outcome is its verdict -- never judge_unavailable.
+  test('#852: codex and grok dead, cursor answers -- determinate verdict, not judge_unavailable', async () => {
+    const spawned: string[] = [];
+    const outcome = await judgeTerminalRun(envelope, {
+      ladder: ['codex', 'grok', 'cursor'],
+      spawn: async (binary: string): Promise<JudgeSpawnResult> => {
+        spawned.push(binary);
+        if (binary !== 'cursor') return { exitCode: 1, stdout: '', timedOut: false };
+        return {
+          exitCode: 0,
+          stdout:
+            '{"verdict":"observe","confidence":0.7,"proposed_action":"none","reason":"uneventful terminal run"}',
+          timedOut: false,
+        };
+      },
+      recordOutcome: ignoreOutcome,
+    });
+    expect(spawned).toEqual(['codex', 'grok', 'cursor']);
+    expect(outcome).toMatchObject({
+      kind: 'verdict',
+      verdict: 'observe',
+      model: 'cursor',
+      modelRung: 2,
+    });
+  });
+
   test('records an unavailable outcome when spawning throws', async () => {
     const recorded: unknown[] = [];
     const outcome = await judgeTerminalRun(envelope, {
@@ -292,6 +346,31 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
     });
     expect(outcome.kind).toBe('judge_unavailable');
     expect(recorded).toEqual([['missing', { exitCode: -1, timedOut: false }, 'judge-first']]);
+  });
+
+  test('logs a health-write failure with serialized error details without crashing', async () => {
+    const output = captureLogOutput();
+    await expect(
+      judgeTerminalRun(envelope, {
+        ladder: ['healthy-spawn'],
+        spawn: async () => ({
+          exitCode: 0,
+          stdout:
+            '{"verdict":"observe","confidence":0.7,"proposed_action":"none","proposed_tier":0,"reason":"ok"}',
+          timedOut: false,
+        }),
+        recordOutcome: async () => {
+          throw new Error('health write failed');
+        },
+      })
+    ).resolves.toMatchObject({ kind: 'verdict' });
+    const entry = output
+      .flatMap(chunk => chunk.trim().split('\n'))
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+      .find(line => line.msg === 'overseer.judge_first.resource_health_record_failed');
+    expect(entry?.level).toBe(50);
+    expect(entry?.err).toMatchObject({ message: 'health write failed' });
+    expect((entry?.err as { stack?: string } | undefined)?.stack).toContain('health write failed');
   });
 });
 

@@ -11,6 +11,14 @@ import {
   type MergeProvenanceResult,
 } from './merge-provenance';
 import type { QualifiedMergeEvidence } from './actions/merge-ready';
+import {
+  getRepoBasePolicy,
+  hasRepoPolicyEntry,
+  LEGACY_ALLOWED_BASES_ENV,
+  MERGE_MANAGER_REPO_POLICY_ENV,
+  resolveMergeRepoPolicy,
+  warnLegacyMergePolicy,
+} from './merge-repo-policy';
 import type { OverseerDeploymentEffect } from './policy-registry';
 import type {
   GitHubClientDeps,
@@ -23,9 +31,24 @@ import type {
 
 export const MERGE_MANAGER_IDENTITY = 'overseer-merge-manager-v1';
 export const PRODUCTION_EFFECT_HOLD_REASON = 'production_effect_held_for_john' as const;
+export const BASE_BRANCH_MISSING_HOLD_REASON = 'base_branch_missing_in_run_metadata' as const;
+/**
+ * Sentinel error thrown by defaultAssembleEvidence when the run record carries no
+ * base_branch/baseBranch metadata (bdc-xo#2131). Caught by createMergeManager's
+ * returned handler and converted into a 'held' result -- never a silent default and
+ * never an uncaught throw that would kill the watch loop for every subsequent record.
+ */
+export class BaseBranchMissingError extends Error {
+  constructor() {
+    super(BASE_BRANCH_MISSING_HOLD_REASON);
+    this.name = 'BaseBranchMissingError';
+  }
+}
 export const MERGE_MANAGER_MODE_ENV = 'OVERSEER_MERGE_MANAGER_MODE' as const;
 export const MERGE_MANAGER_MUTATIONS_ENABLED_ENV = 'MERGE_MANAGER_MUTATIONS_ENABLED' as const;
 export const MERGE_MANAGER_ALLOWED_BASES_ENV = 'MERGE_MANAGER_ALLOWED_BASES' as const;
+export const MERGE_MANAGER_BASE_EFFECT_OVERRIDES_ENV =
+  'MERGE_MANAGER_BASE_EFFECT_OVERRIDES' as const;
 export const MERGE_MANAGER_REVIEW_GATE_LOGIN_ENV = 'MERGE_MANAGER_REVIEW_GATE_LOGIN' as const;
 export const MERGE_MANAGER_MODES = ['hold-canary', 'comment_findings', 'execute'] as const;
 export type MergeManagerMode = (typeof MERGE_MANAGER_MODES)[number];
@@ -62,6 +85,13 @@ export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps 
   /** Explicit activation/configuration overrides for tests and dependency injection. */
   readonly mutationsEnabled?: boolean;
   readonly allowedBases?: readonly string[];
+  /**
+   * Per-repo base-branch effect declarations, normally parsed from
+   * MERGE_MANAGER_BASE_EFFECT_OVERRIDES. Injected in tests. Distinct from allowedBases:
+   * allowedBases gates WHICH base names may be merged at all (repo-blind, unchanged);
+   * this reclassifies what merging into one named repo+branch actually DEPLOYS.
+   */
+  readonly baseEffectOverrides?: ReadonlyMap<string, OverseerDeploymentEffect>;
   readonly reviewGateLogin?: string;
 }
 
@@ -168,21 +198,106 @@ const EFFECT_SEVERITY: Record<OverseerDeploymentEffect, number> = {
 };
 
 /**
+ * A declared, per-repo classification of one base branch, keyed `owner/repo:branch`.
+ *
+ * The branch regex below is REPO-BLIND: it reads a base branch name and nothing else.
+ * That is correct for lspro-react `main` (auto-promotes to production), shopops
+ * `master`, and every `release/*` lineage -- and wrong for a repo whose `main` is not
+ * a deployed surface at all. thinmansoftware/bdc-xo is docs, specs and scripts; merging
+ * to its `main` deploys nothing, yet the regex called it production and the Merge
+ * Manager held every one of its PRs for John forever.
+ *
+ * John's 2026-09-07 ruling ("yes add main") is executed here as a NARROW, DECLARED
+ * exemption rather than a change to the regex: production mains stay production, and a
+ * repo is only reclassified when an operator names it explicitly in the environment.
+ */
+type BaseEffectOverrides = ReadonlyMap<string, OverseerDeploymentEffect>;
+
+function baseEffectOverrideKey(owner: string, repo: string, branch: string): string {
+  return `${owner.trim().toLowerCase()}/${repo.trim().toLowerCase()}:${branch.trim().toLowerCase()}`;
+}
+
+/**
+ * Parse MERGE_MANAGER_BASE_EFFECT_OVERRIDES: comma-separated `owner/repo:branch=effect`
+ * entries, e.g. `thinmansoftware/bdc-xo:main=none`. Effects are the normal vocabulary
+ * (none | staging | production; dev/prod/stage aliases accepted by normalizeEffect).
+ *
+ * NEVER THROWS. A malformed entry is dropped with a warn log naming it, so one bad
+ * character in an env var cannot take the Merge Manager down -- it only means that one
+ * repo keeps its branch-derived classification, which is the safe direction.
+ */
+export function parseBaseEffectOverrides(raw: string | undefined): BaseEffectOverrides {
+  const overrides = new Map<string, OverseerDeploymentEffect>();
+  if (!raw?.trim()) return overrides;
+
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.lastIndexOf('=');
+    if (eq <= 0) {
+      log.warn(
+        { entry: trimmed, env: MERGE_MANAGER_BASE_EFFECT_OVERRIDES_ENV },
+        'merge_manager.base_effect_override_malformed -- expected owner/repo:branch=effect'
+      );
+      continue;
+    }
+    const target = trimmed.slice(0, eq).trim();
+    const rawEffect = trimmed
+      .slice(eq + 1)
+      .trim()
+      .toLowerCase();
+    const slash = target.indexOf('/');
+    const colon = target.indexOf(':', slash + 1);
+    if (slash <= 0 || colon <= slash + 1 || colon === target.length - 1) {
+      log.warn(
+        { entry: trimmed, env: MERGE_MANAGER_BASE_EFFECT_OVERRIDES_ENV },
+        'merge_manager.base_effect_override_malformed -- expected owner/repo:branch=effect'
+      );
+      continue;
+    }
+    // normalizeEffect() falls back to 'none' for anything it does not recognize, which
+    // would silently turn a typo into the most permissive value. Validate the literal.
+    if (rawEffect !== 'none' && rawEffect !== 'staging' && rawEffect !== 'production') {
+      log.warn(
+        { entry: trimmed, effect: rawEffect, env: MERGE_MANAGER_BASE_EFFECT_OVERRIDES_ENV },
+        'merge_manager.base_effect_override_malformed -- effect must be none|staging|production'
+      );
+      continue;
+    }
+    const owner = target.slice(0, slash);
+    const repo = target.slice(slash + 1, colon);
+    const branch = target.slice(colon + 1);
+    overrides.set(baseEffectOverrideKey(owner, repo, branch), normalizeEffect(rawEffect));
+  }
+  return overrides;
+}
+
+/**
  * Classify the deployment effect of merging this PR.
  *
- * PRECEDENCE IS DELIBERATE. Run metadata is agent-written; the base branch comes from
- * the PR itself. Before 2026-07-25 metadata was consulted FIRST and returned outright,
- * so a run whose metadata said `environment: dev` while targeting `main` was classified
- * `none` and skipped John's production hold entirely -- an agent-authored string could
- * switch off the gate.
+ * PRECEDENCE IS DELIBERATE, and reads in one direction only -- toward the stricter value:
  *
- * Now branch evidence is computed first and metadata may only ESCALATE severity, never
- * downgrade it. An agent can declare something MORE dangerous than it looks (useful, and
- * safe), but can never declare a production-targeting merge harmless.
+ *   1. BRANCH REGEX (repo-blind) -- production for main/master/release/prod/production.
+ *   2. PER-REPO OVERRIDE (operator-declared env) -- replaces the branch verdict for the
+ *      one repo+branch it names. This is the only step that may LOWER severity, and it
+ *      exists because the regex cannot tell a deployed `main` from a docs `main`.
+ *   3. RUN METADATA (agent-written) -- may only ESCALATE, never downgrade.
+ *
+ * Before 2026-07-25 metadata was consulted FIRST and returned outright, so a run whose
+ * metadata said `environment: dev` while targeting `main` was classified `none` and
+ * skipped John's production hold entirely -- an agent-authored string could switch off
+ * the gate. That ordering is preserved: an agent can declare something MORE dangerous
+ * than it looks (useful, and safe), but can never declare a production merge harmless.
+ *
+ * The override is deliberately WEAKER than metadata: if run metadata already declares
+ * 'production', an override to 'none' is REFUSED with a warn log and 'production' stands.
+ * An operator's static env line never silently overrules a run that said, at build time,
+ * that it touches production.
  */
 function determineDeploymentEffect(
   record: WatchedRunRecord,
-  baseBranch: string | null
+  baseBranch: string | null,
+  overrides: BaseEffectOverrides = new Map()
 ): OverseerDeploymentEffect {
   const branch = baseBranch?.toLowerCase() ?? '';
   const branchEffect: OverseerDeploymentEffect =
@@ -195,12 +310,49 @@ function determineDeploymentEffect(
     'deploymentEffect',
     'environment',
   ]);
-  if (!declared) return branchEffect;
+  const declaredEffect = declared ? normalizeEffect(declared) : null;
 
-  const declaredEffect = normalizeEffect(declared);
-  return EFFECT_SEVERITY[declaredEffect] > EFFECT_SEVERITY[branchEffect]
-    ? declaredEffect
-    : branchEffect;
+  const override =
+    record.owner && record.repo && branch
+      ? overrides.get(baseEffectOverrideKey(record.owner, record.repo, branch))
+      : undefined;
+
+  let baseline: OverseerDeploymentEffect = branchEffect;
+  if (override !== undefined) {
+    if (declaredEffect === 'production' && EFFECT_SEVERITY[override] < EFFECT_SEVERITY.production) {
+      log.warn(
+        {
+          runId: record.runId,
+          woId: record.woId,
+          owner: record.owner,
+          repo: record.repo,
+          baseBranch: branch,
+          override,
+          env: MERGE_MANAGER_BASE_EFFECT_OVERRIDES_ENV,
+        },
+        'merge_manager.base_effect_override_refused -- run metadata declares production; keeping production'
+      );
+    } else {
+      if (override !== branchEffect) {
+        log.info(
+          {
+            runId: record.runId,
+            woId: record.woId,
+            owner: record.owner,
+            repo: record.repo,
+            baseBranch: branch,
+            branchEffect,
+            override,
+          },
+          'merge_manager.base_effect_override_applied'
+        );
+      }
+      baseline = override;
+    }
+  }
+
+  if (declaredEffect === null) return baseline;
+  return EFFECT_SEVERITY[declaredEffect] > EFFECT_SEVERITY[baseline] ? declaredEffect : baseline;
 }
 
 async function defaultAssembleEvidence(
@@ -233,7 +385,16 @@ async function defaultAssembleEvidence(
   // up and explicitly documented as the provenance anchor -- is the truth.
   const headSha = metadataString(record, ['head_sha', 'headSha']) ?? prEvidence.headSha ?? '';
   const baseSha = metadataString(record, ['base_sha', 'baseSha']) ?? '';
-  const baseBranch = metadataString(record, ['base_branch', 'baseBranch']) ?? 'dev';
+  // Fail closed on unknown base branch (bdc-xo#2131): a merge is the one action that
+  // must never land against a branch nobody chose. This used to silently default to
+  // 'dev' whenever run metadata carried no base_branch/baseBranch key, which real run
+  // metadata usually does not -- see BaseBranchMissingError doc comment. A caller that
+  // legitimately wants 'dev' must pass it explicitly via deps.evidenceAssemblyDeps or
+  // record metadata; there is no implicit fallback branch here anymore.
+  const baseBranch = metadataString(record, ['base_branch', 'baseBranch']);
+  if (!baseBranch) {
+    throw new BaseBranchMissingError();
+  }
   const changedFiles = metadataString(record, ['changed_files', 'changedFiles'])
     ?.split(',')
     .map(path => path.trim())
@@ -243,7 +404,12 @@ async function defaultAssembleEvidence(
     readPolicy: async () => ({
       registry: { schema_version: 'overseer-action-policy-v1', entries: [] },
       credentialPrincipal: deps.operator?.identity ?? MERGE_MANAGER_IDENTITY,
-      resultingDeploymentEffect: determineDeploymentEffect(record, baseBranch),
+      resultingDeploymentEffect: determineDeploymentEffect(
+        record,
+        baseBranch,
+        deps.baseEffectOverrides ??
+          parseBaseEffectOverrides(process.env[MERGE_MANAGER_BASE_EFFECT_OVERRIDES_ENV])
+      ),
     }),
     readPullRequest: async () => ({
       owner: pr?.owner ?? owner,
@@ -362,6 +528,7 @@ async function defaultExecute(
     repo: evidence.repository,
     number: evidence.pr_number,
     commitTitle: `Overseer merge ${evidence.record.woId}`,
+    expectedHeadSha: evidence.head_sha,
   });
 }
 
@@ -369,6 +536,7 @@ function envFlagEnabled(raw: string | undefined): boolean {
   return raw?.trim().toLowerCase() === 'true';
 }
 
+// AGD Keep this DI/legacy parser stable while its values feed the shared synthesized repo policy.
 function allowedBasesFromEnv(raw: string | undefined): readonly string[] {
   return (raw ?? 'dev,staging')
     .split(',')
@@ -380,6 +548,7 @@ async function mergePreconditionMiss(
   deps: MergeManagerDeps,
   evidence: QualifiedMergeEvidence,
   allowedBases: readonly string[],
+  useLegacyAllowedBases: boolean,
   reviewGateLogin: string
 ): Promise<string | null> {
   const headSha = evidence.head_sha;
@@ -390,7 +559,26 @@ async function mergePreconditionMiss(
   ) {
     return 'required_checks_not_green_on_head';
   }
-  if (!allowedBases.includes(evidence.base_branch.trim().toLowerCase())) {
+  const ownerRepo = `${evidence.owner}/${evidence.repository}`.toLowerCase();
+  const explicitPolicy = process.env[MERGE_MANAGER_REPO_POLICY_ENV];
+  const policy = resolveMergeRepoPolicy({
+    rawPolicy: explicitPolicy,
+    legacyAllowedBases:
+      explicitPolicy === undefined && useLegacyAllowedBases ? allowedBases : undefined,
+    legacyRepos: explicitPolicy === undefined && useLegacyAllowedBases ? [ownerRepo] : undefined,
+  });
+  if (explicitPolicy === undefined && process.env[LEGACY_ALLOWED_BASES_ENV] !== undefined) {
+    warnLegacyMergePolicy(LEGACY_ALLOWED_BASES_ENV);
+  }
+  // AGD Missing repo policy fails closed loudly; unattended:false keeps the existing base denial.
+  if (!hasRepoPolicyEntry(ownerRepo, policy)) {
+    log.warn(
+      { repo: ownerRepo, env: MERGE_MANAGER_REPO_POLICY_ENV },
+      'merge_manager.repo_policy_missing'
+    );
+    return 'repo_policy_missing';
+  }
+  if (!getRepoBasePolicy(ownerRepo, evidence.base_branch, policy)?.unattended) {
     return 'base_branch_not_allowed';
   }
   if (evidence.record.prEvidence.mergeable !== true) {
@@ -448,6 +636,8 @@ export function createMergeManager(
     deps.mutationsEnabled ?? envFlagEnabled(process.env[MERGE_MANAGER_MUTATIONS_ENABLED_ENV]);
   const allowedBases =
     deps.allowedBases ?? allowedBasesFromEnv(process.env[MERGE_MANAGER_ALLOWED_BASES_ENV]);
+  const useLegacyAllowedBases =
+    deps.allowedBases !== undefined || process.env[MERGE_MANAGER_ALLOWED_BASES_ENV] !== undefined;
   const reviewGateLogin = (
     deps.reviewGateLogin ??
     process.env[MERGE_MANAGER_REVIEW_GATE_LOGIN_ENV] ??
@@ -455,7 +645,26 @@ export function createMergeManager(
   ).trim();
 
   return async (record: WatchedRunRecord): Promise<MergeManagerResult> => {
-    const assembled = await assembleEvidence(record);
+    let assembled: AssembledQualifiedMergeEvidence;
+    try {
+      assembled = await assembleEvidence(record);
+    } catch (error) {
+      if (error instanceof BaseBranchMissingError) {
+        await recordManagerAction(deps, record, 'merge_denied', BASE_BRANCH_MISSING_HOLD_REASON);
+        log.warn(
+          { runId: record.runId, woId: record.woId, mode },
+          'merge_manager.base_branch_missing_held -- run metadata carried no base_branch/baseBranch key'
+        );
+        return {
+          status: 'held',
+          receipt: null,
+          execution: null,
+          reason: BASE_BRANCH_MISSING_HOLD_REASON,
+          mode,
+        };
+      }
+      throw error;
+    }
     const { evidence, evidenceDigest } = assembled;
 
     if (evidence.resulting_deployment_effect === 'production') {
@@ -476,9 +685,29 @@ export function createMergeManager(
     // Provenance gate (John, 2026-07-23: "only act on runs it actually oversaw").
     // Runs BEFORE the judge: if we cannot attribute this PR to this run, there is
     // nothing worth judging. Fails closed -- any unresolvable input holds.
+    //
+    // One exception, added on John's 2026-09-07 ruling ("always merge on green,
+    // you do not need to ask me"): a PR-first DISCOVERED candidate has no
+    // originating run and so no worktree to bind against. That is an ABSENT run,
+    // not an unverified one, and it does not hold -- see merge-provenance.ts.
+    // It is recorded and logged by name so the relaxation is never silent.
     const provenance = await verifyMergeProvenance(record, evidence.record.prEvidence.headSha, {
       readWorktreeHeadSha,
     });
+    if (provenance.verified && provenance.reason === 'no_run') {
+      await recordManagerAction(deps, record, 'provenance_no_run', 'provenance_no_run');
+      log.info(
+        {
+          runId: record.runId,
+          woId: record.woId,
+          prNumber: evidence.pr_number,
+          prHeadSha: provenance.prHeadSha,
+          baseBranch: evidence.base_branch,
+          mode,
+        },
+        'merge_manager.provenance_no_run -- PR-discovered candidate, no originating run; proceeding on green'
+      );
+    }
     if (!provenance.verified) {
       await recordManagerAction(deps, record, 'merge_denied', `provenance_${provenance.reason}`);
       log.warn(
@@ -625,6 +854,7 @@ export function createMergeManager(
       deps,
       evidence,
       allowedBases,
+      useLegacyAllowedBases,
       reviewGateLogin
     );
     if (preconditionMiss) {

@@ -40,8 +40,12 @@
         "read-only",
         "--ephemeral",
         "--ignore-user-config",
+        "-c",
+        "windows.sandbox=\"unelevated\"",
         "{{prompt}}"
-      ]
+      ],
+      "cwd": "C:/Users/pcmed/projects/BDC_XO/.worktrees/xo-main",
+      "env": {}
     },
     "grok": {
       "command": "grok",

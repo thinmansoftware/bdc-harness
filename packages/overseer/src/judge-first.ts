@@ -20,6 +20,14 @@ import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import type { OverseerWorkflowEvent, PullRequestEvidence, WatchedRunRecord } from './types.ts';
 import { recordSpawnOutcome } from './model-resource-health.js';
+import {
+  buildJudgeTransport,
+  defaultJudgeChildSpawn,
+  deliverStdin,
+  destroyStdin,
+  removeJudgeTransportFiles,
+  type JudgeChildSpawn,
+} from './judge-transport';
 
 const log = createLogger('overseer/judge-first');
 
@@ -274,44 +282,70 @@ export function parseJudgeOutput(stdout: string): ParsedJudgeVerdict | null {
   return { verdict: verdict as SemanticVerdict, confidence, proposedAction, proposedTier, reason };
 }
 
-async function spawnJudgeBinary(
+/**
+ * Spawn one ladder rung and collect its stdout. Exported for the transport
+ * regression test (#852); judgeTerminalRun is the API.
+ *
+ * argv and prompt delivery come from judge-transport.ts, shared with the
+ * PR-review judge. Before #852 this seam kept its own copy: codex got the
+ * prompt as a positional argument (M-48 fallback rung, John 2026-08-26: "Give
+ * it to codex") and every other rung got `[binary, '-p', prompt]`. Two
+ * defects: `cursor` is not a container binary (the CLI is `cursor-agent`, and
+ * it has no -p flag), so with codex out of quota and grok out of credits the
+ * only live rung died with "Executable not found in $PATH" (2026-09-15 13:47Z)
+ * while the PR-review judge answered on the same rung; and the prompt as ONE
+ * argv element is capped by Linux MAX_ARG_STRLEN (131,072 bytes) -- the E2BIG
+ * that #776/#786 fixed for PR review. parseJudgeOutput still scans for the
+ * first JSON object, so wrapper chatter and a markdown fence are tolerated.
+ *
+ * Timeout and kill behaviour are this seam's own and unchanged, except that
+ * the wall clock is armed BEFORE stdin delivery and tears the writer down when
+ * it fires: codex exec and cursor-agent read stdin to EOF before they answer,
+ * so the write must overlap the stdout read (a child that never reads would
+ * otherwise park the write past the ~64 KB pipe buffer forever). Same shape as
+ * runReviewModelProcess in pr-review-evaluator.ts.
+ */
+export async function spawnJudgeBinary(
   binary: string,
   prompt: string,
-  timeoutMs: number
+  timeoutMs: number,
+  spawnChild: JudgeChildSpawn = defaultJudgeChildSpawn
 ): Promise<JudgeSpawnResult> {
-  // Per-binary invocation: grok takes -p <prompt>; codex uses its exec
-  // subcommand (M-48 fallback rung, John 2026-08-26: "Give it to codex" --
-  // added when the xAI team ran out of credits and the single-rung ladder
-  // left the judge with no path to a verdict). parseJudgeOutput scans for
-  // the first JSON object, so codex's surrounding chatter is tolerated.
-  // 'codex' is not a container binary -- the CLI runs via bunx with the
-  // mounted /root/.codex/auth.json (live-verified 2026-08-26: returns clean
-  // JSON through `bunx @openai/codex exec`).
-  const argv =
-    binary === 'codex'
-      ? ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check', prompt]
-      : [binary, '-p', prompt];
-  const subprocess = Bun.spawn(argv, {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  let timeout: Timer | undefined;
-  const timeoutResult = new Promise<JudgeSpawnResult>(resolve => {
-    timeout = setTimeout(() => {
-      subprocess.kill();
-      resolve({ exitCode: 124, stdout: '', timedOut: true });
-    }, timeoutMs);
-  });
-  const processResult = (async (): Promise<JudgeSpawnResult> => {
-    const [exitCode, stdout] = await Promise.all([
-      subprocess.exited,
-      new Response(subprocess.stdout).text(),
-    ]);
-    return { exitCode, stdout, timedOut: false };
-  })();
-  const result = await Promise.race([processResult, timeoutResult]);
-  if (timeout) clearTimeout(timeout);
-  return result;
+  const transport = await buildJudgeTransport(binary, prompt);
+  try {
+    const subprocess = spawnChild(
+      transport.argv,
+      transport.stdinPrompt === undefined ? 'ignore' : 'pipe'
+    );
+    let timeout: Timer | undefined;
+    const timeoutResult = new Promise<JudgeSpawnResult>(resolve => {
+      timeout = setTimeout(() => {
+        subprocess.kill();
+        destroyStdin(subprocess.stdin);
+        resolve({ exitCode: 124, stdout: '', timedOut: true });
+      }, timeoutMs);
+    });
+    // Not awaited: the delivery races the wall clock alongside the process.
+    // deliverStdin swallows the EPIPE of a child that exits before draining.
+    if (transport.stdinPrompt !== undefined) {
+      void deliverStdin(subprocess.stdin, transport.stdinPrompt);
+    }
+    const processResult = (async (): Promise<JudgeSpawnResult> => {
+      const [exitCode, stdout] = await Promise.all([
+        subprocess.exited,
+        new Response(subprocess.stdout).text(),
+      ]);
+      return { exitCode, stdout, timedOut: false };
+    })();
+    const result = await Promise.race([processResult, timeoutResult]);
+    if (timeout) clearTimeout(timeout);
+    destroyStdin(subprocess.stdin);
+    return result;
+  } finally {
+    // The prompt file (grok rung) holds the private evidence envelope; it must
+    // not outlive the judge process on any path -- success, throw, or timeout.
+    await removeJudgeTransportFiles(transport);
+  }
 }
 
 /**
@@ -348,7 +382,10 @@ export async function judgeTerminalRun(
       try {
         await (options.recordOutcome ?? recordSpawnOutcome)(binary, result, 'judge-first');
       } catch (error) {
-        log.error({ binary, error }, 'overseer.judge_first.resource_health_record_failed');
+        log.error(
+          { binary, err: error as Error },
+          'overseer.judge_first.resource_health_record_failed'
+        );
       }
       if (result.timedOut || result.exitCode !== 0) {
         log.error(
@@ -392,7 +429,7 @@ export async function judgeTerminalRun(
           );
         } catch (recordError) {
           log.error(
-            { binary, error: recordError },
+            { binary, err: recordError as Error },
             'overseer.judge_first.resource_health_record_failed'
           );
         }

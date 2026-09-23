@@ -1,5 +1,6 @@
 import {
   claimMessage,
+  deferMessage,
   heartbeatWorker,
   listMessages,
   postResult,
@@ -7,8 +8,21 @@ import {
   releaseMessage,
   type DispatchTaskOutcome,
 } from '@archon/core/db/dispatch';
+import {
+  createDurableSweepCursor,
+  createRealStaleVerdictSweepDeps,
+  resolveStaleSweepMax,
+  runStaleVerdictSweep,
+} from './stale-verdict-sweep-wiring';
 import { createLogger } from '@archon/paths';
 import {
+  applyLadderRestoredRequest,
+  recoverParkedJudgeHeads,
+} from '@archon/overseer/judge-ladder-health';
+import { defaultReviewLadder } from '@archon/overseer/pr-review-evaluator';
+import type { IngestDeps } from '@archon/overseer/pr-review-ingest';
+import {
+  createRealIngestDeps,
   createRealSubmitDeps,
   parseReviewWorkBody,
   REVIEW_RECIPIENT,
@@ -40,8 +54,26 @@ export interface ReviewWorkerDeps {
   claimMessage: typeof claimMessage;
   postResult: typeof postResult;
   releaseMessage: typeof releaseMessage;
+  /**
+   * Fenced claimed->queued deferral with a future clock. Named per
+   * WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7; delegates to
+   * `releaseMessage`, which already carries the required fencing guards.
+   */
+  deferMessage: typeof deferMessage;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
+  /**
+   * Backstop for lost check-completion deliveries (#782 part 3). Optional so a
+   * test double can omit it; when absent the sweep simply does not run and the
+   * primary review path is untouched.
+   */
+  staleVerdictSweep?: (config: ReviewRouteConfig) => Promise<unknown>;
+  /**
+   * Re-enqueue heads parked by the judge-ladder breaker once the ladder is
+   * open again (#847). Optional for the same reason as the sweep; when absent
+   * parked heads wait for an operator `ladder_restored` row.
+   */
+  judgeLadderRecovery?: (config: ReviewRouteConfig) => Promise<unknown>;
 }
 
 interface ResultMapping {
@@ -50,15 +82,31 @@ interface ResultMapping {
 }
 
 function mapSubmitOutcome(
-  disposition: Exclude<SubmitDisposition, 'checks_pending'>
+  disposition: Exclude<SubmitDisposition, 'checks_pending' | 'transport_error' | 'rate_limited'>
 ): ResultMapping {
   switch (disposition) {
+    // `stale_head` and `superseded_head` both mean the head this item is BOUND
+    // to is no longer the live head. The item's payload carries that dead SHA
+    // and nothing rewrites it, so releasing it back to the queue would make
+    // every later tick re-evaluate the same stale SHA and return the same
+    // disposition forever (#777 review finding). Ingest already covers the new
+    // head: a push cancels every in-flight item bound to a different SHA and
+    // enqueues a fresh item bound to the exact new head, so this item retiring
+    // leaves no head unreviewed. TERMINAL, and `succeeded` rather than
+    // `blocked` because supersession is the system working, not a failure.
     case 'approved':
     case 'changes_requested':
     case 'stale_head':
+    case 'superseded_head':
       return { status: 'done', task_outcome: 'succeeded' };
+    // `blocked_required_contexts_unavailable` (#775): the required
+    // status-check contexts could not be read after the attempt bound.
+    // TERMINAL and blocked -- never released for another tick (unbounded
+    // release is what parked these rows at fencing_token 240) and never
+    // succeeded, because no review judgment was ever formed.
     case 'custody_conflict':
     case 'merge_custody_conflict':
+    case 'blocked_required_contexts_unavailable':
       return { status: 'failed', task_outcome: 'blocked' };
     case 'reviewer_failed':
     case 'submission_failed':
@@ -71,6 +119,9 @@ function mapSubmitOutcome(
 }
 
 export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
+  // Built once, lazily: createRealIngestDeps logs its configuration at
+  // construction and the recovery pass runs every tick.
+  let ingestDeps: IngestDeps | undefined;
   return {
     registerWorker,
     heartbeatWorker,
@@ -78,8 +129,22 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     claimMessage,
     postResult,
     releaseMessage,
+    deferMessage,
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
+    staleVerdictSweep: config =>
+      runStaleVerdictSweep(
+        createRealStaleVerdictSweepDeps(config),
+        resolveStaleSweepMax(),
+        // DURABLE, not process-local: archon-app-1 is rebuilt regularly, and a
+        // cursor that rewinds on restart can never walk a store larger than one
+        // process lifetime covers (#786 review @45aa739e).
+        createDurableSweepCursor()
+      ),
+    judgeLadderRecovery: (config): Promise<{ recovered: string[]; stillParked: number }> => {
+      ingestDeps ??= createRealIngestDeps(config);
+      return recoverParkedJudgeHeads(ingestDeps, defaultReviewLadder());
+    },
   };
 }
 
@@ -108,6 +173,13 @@ export async function tickReviewWorkerClock(
       try {
         const claimed = await deps.claimMessage({ id: message.id, worker_id: REVIEW_WORKER_ID });
         if (!claimed) continue;
+        // OPERATOR OVERRIDE (#847): a hand-enqueued run_review whose
+        // repeat_reason starts with `operator_request:ladder_restored` clears
+        // the judge-ladder breaker before the judge runs; the recovery pass at
+        // the end of this tick then re-enqueues every parked head.
+        if (applyLadderRestoredRequest(claimed.repeat_reason)) {
+          log.info({ messageId: claimed.id }, 'overseer_review_judge_ladder_restored_by_operator');
+        }
         const body = parseReviewWorkBody(claimed.body);
         if (!body) throw new Error('invalid_review_work_body');
         const work: ReviewWorkItem = {
@@ -123,15 +195,66 @@ export async function tickReviewWorkerClock(
           work,
           deps.createSubmitDeps(config.reviewerIdentity)
         );
-        // CHECKS PENDING is non-terminal: release the claim (not postResult) with
-        // a backoff so the item is retried on a later tick once CI concludes,
-        // rather than orphaned or re-polled every tick.
+        // CHECKS PENDING is the ONLY non-terminal disposition: the bound head is
+        // still live and CI on it has simply not concluded, so releasing the
+        // claim with a backoff retries the SAME head productively.
+        //
+        // `superseded_head` is deliberately NOT released here. Its bound head is
+        // dead, the payload still names that dead SHA, and a release would spin
+        // the item forever -- see mapSubmitOutcome for the full reasoning.
         if (outcome.disposition === 'checks_pending') {
+          // WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7 names this
+          // transition `deferMessage`; it is the same fenced claimed->queued
+          // transition, called by its WO name.
+          await deps.deferMessage({
+            id: claimed.id,
+            worker_id: REVIEW_WORKER_ID,
+            fencing_token: claimed.fencing_token,
+            defer_until: new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString(),
+          });
+          continue;
+        }
+        // RATE LIMITED (#782 part 2) is non-terminal for the same reason, but
+        // its backoff comes from GitHub's own reset clock rather than a fixed
+        // interval: retrying before the budget refills would just burn another
+        // request and re-defer (#774's spin). A response with no usable clock
+        // falls back to the checks-pending interval so the wait is always
+        // finite.
+        if (outcome.disposition === 'rate_limited') {
+          const deferUntil =
+            outcome.retryAfter ??
+            new Date(
+              Date.now() + (outcome.retryAfterMs ?? CHECKS_PENDING_BACKOFF_MS)
+            ).toISOString();
+          log.warn(
+            { messageId: claimed.id, reason: outcome.reason, deferUntil },
+            'overseer_review_rate_limited_deferred'
+          );
+          await deps.deferMessage({
+            id: claimed.id,
+            worker_id: REVIEW_WORKER_ID,
+            fencing_token: claimed.fencing_token,
+            defer_until: deferUntil,
+          });
+          continue;
+        }
+        // TRANSPORT ERROR (#789) is non-terminal for the same reason: the judge
+        // process was never reached, so nothing about the code was evaluated.
+        // Terminating here would post CHANGES_REQUESTED for a review that never
+        // ran -- the bug this fixes. The backoff comes from the evaluator so a
+        // persistent spawn failure cannot spin the worker every tick.
+        if (outcome.disposition === 'transport_error') {
+          log.warn(
+            { messageId: claimed.id, reason: outcome.reason },
+            'overseer_review_transport_error_deferred'
+          );
           await deps.releaseMessage({
             id: claimed.id,
             worker_id: REVIEW_WORKER_ID,
             fencing_token: claimed.fencing_token,
-            not_before: new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString(),
+            not_before: new Date(
+              Date.now() + (outcome.retryAfterMs ?? CHECKS_PENDING_BACKOFF_MS)
+            ).toISOString(),
           });
           continue;
         }
@@ -145,6 +268,30 @@ export async function tickReviewWorkerClock(
         });
       } catch (error) {
         log.error({ err: error, messageId: message.id }, 'overseer_review_work_item_failed');
+      }
+    }
+
+    // STALE-VERDICT SWEEP (#782 part 3). Runs AFTER the queue is drained so a
+    // sweep-enqueued re-review is picked up on the NEXT tick rather than
+    // extending this one, and so a sweep failure can never delay the primary
+    // review path. It is internally bounded and never throws.
+    if (deps.staleVerdictSweep) {
+      try {
+        await deps.staleVerdictSweep(config);
+      } catch (error) {
+        log.error({ err: error }, 'overseer_stale_verdict_sweep_failed');
+      }
+    }
+
+    // JUDGE LADDER RECOVERY (#847). Also after the drain: a head re-enqueued
+    // here is claimed on the NEXT tick, and a failure here never delays the
+    // primary review path. The pass is a no-op while any rung's outage record
+    // is still in force.
+    if (deps.judgeLadderRecovery) {
+      try {
+        await deps.judgeLadderRecovery(config);
+      } catch (error) {
+        log.error({ err: error }, 'overseer_judge_ladder_recovery_failed');
       }
     }
   } catch (error) {

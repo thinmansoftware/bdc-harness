@@ -103,6 +103,10 @@ function fakeDeps(
         : null;
     }),
     releaseMessage: mock(async () => null),
+    // WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7: the worker now
+    // calls the deferral by its WO name. It delegates to releaseMessage, so the
+    // fencing guards asserted below are unchanged.
+    deferMessage: mock(async () => null),
     runAndSubmitReview: mock(async work => outcomeFor(work.messageId)),
     createSubmitDeps: mock(() => ({ reviewerIdentity: CONFIG.reviewerIdentity }) as SubmitDeps),
   };
@@ -154,6 +158,10 @@ describe('review worker clock', () => {
     ['merge_custody_conflict', 'failed', 'blocked'],
     ['reviewer_failed', 'failed', 'failed'],
     ['submission_failed', 'failed', 'failed'],
+    // #775: the required status-check contexts could not be read after the
+    // attempt bound. TERMINAL and blocked -- it must be POSTED, not released,
+    // or the item goes back into the forever-defer loop it was blocked to end.
+    ['blocked_required_contexts_unavailable', 'failed', 'blocked'],
   ] as const)(
     'maps %s submissions to %s with a %s task outcome',
     async (disposition, status, taskOutcome) => {
@@ -171,10 +179,56 @@ describe('review worker clock', () => {
     }
   );
 
+  // #777 review finding (second pass): a superseded-head item is bound to a SHA
+  // that is no longer live, and nothing rewrites that payload. Releasing it back
+  // to the queue made every later tick re-evaluate the same dead SHA and return
+  // superseded_head again -- an indefinite retry loop. It must TERMINATE; ingest
+  // separately enqueues a fresh item bound to the exact new head.
+  test('terminates a superseded-head item instead of releasing it back to the queue', async () => {
+    const deps = fakeDeps([message('superseded', 'exact-head')], () => ({
+      disposition: 'superseded_head',
+      reason: 'head_advanced_before_required_contexts_block',
+    }));
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'superseded',
+        fencing_token: 1,
+        status: 'done',
+        task_outcome: 'succeeded',
+      })
+    );
+    // Releasing an item whose bound head is dead is what created the loop.
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  // The loop the finding names is only visible across TWO ticks: the first tick
+  // disposes of the item, the second must not evaluate it again.
+  test('does not re-evaluate a superseded-head item on the next tick', async () => {
+    const deps = fakeDeps([message('superseded', 'exact-head')], () => ({
+      disposition: 'superseded_head',
+      reason: 'head_advanced_before_required_contexts_block',
+    }));
+
+    await tickReviewWorkerClock(CONFIG, deps);
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    // One evaluation total: the stale SHA is never judged twice.
+    expect(deps.runAndSubmitReview).toHaveBeenCalledTimes(1);
+    expect(deps.runAndSubmitReview).toHaveBeenCalledWith(
+      expect.objectContaining({ headSha: 'exact-head', messageId: 'superseded' }),
+      expect.anything()
+    );
+    expect(deps.postResult).toHaveBeenCalledTimes(1);
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
   // WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01: a checks-pending item is
   // released (not posted as a result) with a future not_before, and is retried
   // until it reaches a terminal disposition.
-  test('releases (never posts) a checks-pending item with a future not_before', async () => {
+  test('defers (never posts) a checks-pending item with a future not_before', async () => {
     const deps = fakeDeps([message('pending', 'exact-head')], () => ({
       disposition: 'checks_pending',
       reason: 'checks_not_terminal',
@@ -183,17 +237,83 @@ describe('review worker clock', () => {
     const before = Date.now();
     await tickReviewWorkerClock(CONFIG, deps);
 
-    expect(deps.releaseMessage).toHaveBeenCalledTimes(1);
-    const releaseArg = (deps.releaseMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+    expect(deps.deferMessage).toHaveBeenCalledTimes(1);
+    const deferArg = (deps.deferMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
       id: string;
       fencing_token: number;
-      not_before: string;
+      defer_until: string;
     };
-    expect(releaseArg.id).toBe('pending');
-    expect(releaseArg.fencing_token).toBe(1);
-    expect(new Date(releaseArg.not_before).getTime()).toBeGreaterThan(before);
+    expect(deferArg.id).toBe('pending');
+    expect(deferArg.fencing_token).toBe(1);
+    expect(new Date(deferArg.defer_until).getTime()).toBeGreaterThan(before);
     // A defer is not a terminal result.
     expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  // bdc-harness #782 part 2: a rate limit is a deferral with GitHub's own reset
+  // clock, never a terminal verdict.
+  test('defers a rate-limited item until the reported retry instant', async () => {
+    const retryAfter = new Date(Date.now() + 900_000).toISOString();
+    const deps = fakeDeps([message('limited', 'exact-head')], () => ({
+      disposition: 'rate_limited',
+      reason: 'github_rate_limited',
+      retryAfter,
+      retryAfterMs: 900_000,
+    }));
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(deps.deferMessage).toHaveBeenCalledTimes(1);
+    const deferArg = (deps.deferMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      id: string;
+      defer_until: string;
+    };
+    expect(deferArg.id).toBe('limited');
+    // The reset instant is used verbatim: retrying earlier would just burn
+    // another request against a budget that is still exhausted (#774).
+    expect(deferArg.defer_until).toBe(retryAfter);
+    expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  test('a rate-limited item with no reported clock still gets a finite backoff', async () => {
+    const deps = fakeDeps([message('noclock', 'exact-head')], () => ({
+      disposition: 'rate_limited',
+      reason: 'github_rate_limited',
+    }));
+
+    const before = Date.now();
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    const deferArg = (deps.deferMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      defer_until: string;
+    };
+    expect(new Date(deferArg.defer_until).getTime()).toBeGreaterThan(before);
+    expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  // bdc-harness #782 part 3: the sweep runs on the heartbeat and never takes
+  // the primary review path down with it.
+  test('runs the stale-verdict sweep once per tick after the queue is drained', async () => {
+    const deps = fakeDeps([message('one', 'exact-head')]);
+    const sweep = mock(async () => ({ examined: 1, enqueued: 1, duplicates: 0 }));
+    deps.staleVerdictSweep = sweep;
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(sweep).toHaveBeenCalledTimes(1);
+    expect(sweep).toHaveBeenCalledWith(CONFIG);
+    // The queued item was still handled.
+    expect(deps.postResult).toHaveBeenCalledWith(expect.objectContaining({ id: 'one' }));
+  });
+
+  test('a sweep failure never fails the tick or the primary review path', async () => {
+    const deps = fakeDeps([message('one', 'exact-head')]);
+    deps.staleVerdictSweep = mock(async () => {
+      throw new Error('github_unavailable');
+    });
+
+    await expect(tickReviewWorkerClock(CONFIG, deps)).resolves.toBeUndefined();
+    expect(deps.postResult).toHaveBeenCalledWith(expect.objectContaining({ id: 'one' }));
   });
 
   test('retries a released item on a later tick until it reaches a terminal disposition', async () => {
@@ -203,9 +323,9 @@ describe('review worker clock', () => {
       () => ({ disposition }) as SubmitOutcome
     );
 
-    // Tick 1: checks still pending -> release, no result.
+    // Tick 1: checks still pending -> defer, no result.
     await tickReviewWorkerClock(CONFIG, deps);
-    expect(deps.releaseMessage).toHaveBeenCalledTimes(1);
+    expect(deps.deferMessage).toHaveBeenCalledTimes(1);
     expect(deps.postResult).not.toHaveBeenCalled();
 
     // Checks conclude; tick 2 picks up the same message and completes it.
@@ -213,7 +333,7 @@ describe('review worker clock', () => {
     await tickReviewWorkerClock(CONFIG, deps);
 
     expect(deps.runAndSubmitReview).toHaveBeenCalledTimes(2);
-    expect(deps.releaseMessage).toHaveBeenCalledTimes(1);
+    expect(deps.deferMessage).toHaveBeenCalledTimes(1);
     expect(deps.postResult).toHaveBeenCalledTimes(1);
     expect(deps.postResult).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'retry', status: 'done', task_outcome: 'succeeded' })

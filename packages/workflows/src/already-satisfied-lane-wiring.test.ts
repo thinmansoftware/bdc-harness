@@ -49,7 +49,7 @@ async function runGateScript(script: string, checkOutput: string) {
 }
 
 describe('already-satisfied lane wiring', () => {
-  it('discovers the 11 affected feature-development lanes', () => {
+  it('discovers the 12 affected feature-development lanes', () => {
     // This list is the ONLY hardcoded part of this file -- LANE_FILES itself is
     // glob-derived, so the per-lane assertions below automatically cover any new
     // lane. Adding a lane therefore fails HERE and nowhere else, which is the
@@ -60,6 +60,7 @@ describe('already-satisfied lane wiring', () => {
     expect(LANE_FILES).toEqual([
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
+      'bdc-feature-development-cursor.yaml',
       'bdc-feature-development-fable.yaml',
       'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
@@ -172,7 +173,7 @@ describe('already-satisfied lane wiring', () => {
       } else {
         expect(needsBuild.stderr).toBe('');
       }
-    }, 15000);
+    });
 
     it(`${file} preserves adversarial already-satisfied evidence through shell embedding`, async () => {
       const content = readFileSync(join(LANES_DIR, file), 'utf-8');

@@ -23,6 +23,29 @@ export interface AgentConfig {
   /** Defaults to 'stdin'. Set to 'prompt-file' for CLIs with no stdin prompt mode. */
   promptDelivery?: PromptDelivery;
   /**
+   * Absolute directory the agent process runs in. When unset (the default) the
+   * worker creates a fresh mkdtemp scratch directory per dispatch, which is
+   * what an agent that needs no repo context should get.
+   *
+   * John's directive 2026-09-08: a board seat answering a ballot in an empty
+   * temp dir has no repo, no wiki, and no skills, so it reports "Oracle
+   * unavailable / skill read blocked" every round. Pointing a seat at a real
+   * checkout gives it the context the board packet assumes it has.
+   *
+   * The worker NEVER writes into or deletes a configured cwd -- the prompt
+   * file still goes to a per-run temp directory. If the configured path does
+   * not exist, the worker warns and falls back to mkdtemp rather than failing
+   * the dispatch.
+   */
+  cwd?: string;
+  /**
+   * Extra environment variables merged over the worker's own environment for
+   * this agent's child process (e.g. ORACLE_URL, or a read-only token issued
+   * to one seat). Values are passed through unchanged; secrets belong in the
+   * worker's environment or a token file, never in a git-tracked config.
+   */
+  env?: Record<string, string>;
+  /**
    * ACP-only (kind: 'acp'), all optional with safe defaults.
    *
    * WO-HARNESS-ACP-DISPATCH-SLICE-01 / M-118: an ACP agent is spawned once per
@@ -84,6 +107,34 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
       'read-only',
       '--ephemeral',
       '--ignore-user-config',
+      // WINDOWS SANDBOX MODE (#795). Without this the seat cannot run ANY
+      // command on Windows -- not even a file read. Every tool call comes back
+      // as `exec_command failed: CreateProcess { message: "Rejected(... rejected:
+      // blocked by policy")}`, which reads like a permissions policy and is why
+      // this went unnoticed since the flag set landed in PR #462 (2026-07-10).
+      //
+      // Cause, reproduced 2026-09-08 with these exact args in the seat's cwd:
+      // `--ignore-user-config` drops `[windows] sandbox = "unelevated"` from
+      // ~/.codex/config.toml, and this codex build needs an explicit
+      // windows.sandbox mode to construct a Windows sandbox at all. With none,
+      // and `exec` running at approval `never`, every command falls through to
+      // "blocked by policy". It is NOT the execpolicy rules file (`--ignore-rules`
+      // changes nothing) and NOT the cwd (#792 fixed that).
+      //
+      // UNCONDITIONAL, not gated on process.platform: the key is inert on Linux
+      // and macOS, and a platform-dependent default would make the tracked
+      // config differ from what a reader sees, which is how a seat goes mute
+      // in one environment and works in another.
+      //
+      // The seat stays read-only and offline -- verified with the override in
+      // place: reads return real content, a forced `Set-Content` is denied by
+      // the OS and the file never appears, and `curl https://example.com`
+      // returns 000. Dropping `--ignore-user-config` instead would be far
+      // worse: it loads hooks, every MCP server, `sandbox_mode =
+      // "danger-full-access"`, and a `shell_environment_policy.set` block that
+      // injects live secrets into the seat.
+      '-c',
+      'windows.sandbox="unelevated"',
     ],
   },
   grok: {

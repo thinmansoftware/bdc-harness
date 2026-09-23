@@ -13,6 +13,10 @@ import { randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 import type { QueryResult } from './adapters/types';
+import {
+  withOverseerControlPlaneImmediateTransaction,
+  type OverseerControlPlaneQuery,
+} from './overseer-control-plane-sqlite';
 
 const log = createLogger('db/taskmaster');
 
@@ -25,10 +29,54 @@ export type TmActionOutcome =
   | 'rejected'
   | 'expired'
   | 'failed';
-export type TmGrade = 'useful' | 'noise' | 'harmful';
+// 'unheard' (M-155 Amendment 03, John's ruling 2026-09-21): an action whose
+// dispatch row was never acknowledged by a non-draining principal. Excluded
+// from the useful-rate floor denominator (only 'useful'/'noise' are counted).
+export type TmGrade = 'useful' | 'noise' | 'harmful' | 'unheard';
 export type TmPauseState = 'RUNNING' | 'PAUSED' | 'HARD_PAUSE';
 export type TmHealthState = 'healthy' | 'degraded' | 'dark' | 'unknown';
 export type TmUsageConfidence = 'high' | 'low' | 'none';
+export type TmExpectationAbsence = 'redispatch' | 'escalate' | 'give_up';
+/**
+ * `escalating` is an intermediate, NON-terminal state: the tick has exclusively
+ * claimed the right to send the operator escalation but the send is not yet
+ * confirmed. It remains selectable by listDueExpectations precisely so a send
+ * that threw (or a process that died mid-send) is replayed on a later tick
+ * under the deterministic escalation key. Only a confirmed send advances it to
+ * the terminal `escalated`.
+ */
+export type TmExpectationStatus =
+  | 'pending'
+  | 'met'
+  | 'failed'
+  | 'escalating'
+  | 'escalated'
+  | 'given_up';
+
+export interface TmExpectation {
+  id: string;
+  dispatch_ref: string;
+  recipient: string;
+  evidence_json: string;
+  due_at: string;
+  on_absence: TmExpectationAbsence;
+  max_retries: number;
+  retries: number;
+  status: TmExpectationStatus;
+  evidence_pointer: string | null;
+  /**
+   * WHO asked for this supervision. 'taskmaster' for rows the loop opened on
+   * its own dispatches; a caller identity for rows registered through the front
+   * door (bdc-xo#2007). Nullable only so a row written before migration 050 by
+   * some path the backfill did not see stays VISIBLE as unattributed rather
+   * than being silently relabelled as the loop's own work.
+   */
+  registered_by: string | null;
+  /** 1 when the registrant named ITSELF as the recipient. */
+  self_supervised: number;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface TmJournalEntry {
   id: string;
@@ -115,6 +163,677 @@ function normalizeControl(row: TmControlRow): TmControlState {
   };
 }
 
+function normalizeExpectation(row: TmExpectation): TmExpectation {
+  return {
+    ...row,
+    max_retries: row.max_retries,
+    retries: row.retries,
+    registered_by: row.registered_by ?? null,
+    // A row read back from a database that predates migration 050 (or a test
+    // double that omits the column) has no flag at all; absent means "not self
+    // supervised", which is the safe reading -- it never widens what is allowed.
+    self_supervised: row.self_supervised ?? 0,
+    due_at: toIso(row.due_at),
+    created_at: toIso(row.created_at),
+    updated_at: toIso(row.updated_at),
+  };
+}
+
+/**
+ * Read the registry. Read-only surface for the front door's GET, so a session
+ * can see what it has registered without opening the database -- the same
+ * reason the POST exists.
+ */
+export async function listExpectations(filter: {
+  status?: TmExpectationStatus;
+  registered_by?: string;
+  limit: number;
+}): Promise<{ rows: TmExpectation[]; total: number }> {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (filter.status) {
+    params.push(filter.status);
+    clauses.push(`status = $${String(params.length)}`);
+  }
+  if (filter.registered_by) {
+    params.push(filter.registered_by);
+    clauses.push(`registered_by = $${String(params.length)}`);
+  }
+  const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+  const db = getDatabase();
+  const total = await db.query<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM tm_expectations${where}`,
+    params
+  );
+  params.push(filter.limit);
+  const rows = await db.query<TmExpectation>(
+    `SELECT * FROM tm_expectations${where} ORDER BY created_at DESC LIMIT $${String(params.length)}`,
+    params
+  );
+  return {
+    rows: rows.rows.map(normalizeExpectation),
+    total: total.rows[0]?.count ?? 0,
+  };
+}
+
+/**
+ * How many expectations the FRONT DOOR has opened since `since`, across every
+ * registrant.
+ *
+ * This, not the per-registrant count, is the enforceable bound. `registered_by`
+ * is self-declared by the caller (see TmExpectation), so a per-registrant cap
+ * bounds nothing: a caller at its limit simply sends a different name. Counting
+ * the whole externally-registered population instead makes the cap a property of
+ * the thing that IS authenticated -- the operator token -- and therefore
+ * unevadeable by relabelling.
+ *
+ * Identified by the `ext:` key prefix the route applies, which is the same thing
+ * that keeps external keys from colliding with loop-derived ones. Loop rows carry
+ * no such prefix and are bounded by the loop's own per-tick budgets, so they are
+ * deliberately excluded: the front door must not be able to exhaust the
+ * supervisor's own headroom, nor the supervisor the front door's.
+ */
+export async function countExternalExpectationsSince(since: string): Promise<number> {
+  const result = await getDatabase().query<{ count: number }>(
+    "SELECT COUNT(*) AS count FROM tm_expectations WHERE registration_key LIKE 'ext:%' AND created_at >= $1",
+    [since]
+  );
+  return result.rows[0]?.count ?? 0;
+}
+
+/**
+ * Does an expectation already exist under this key?
+ *
+ * Lets the route distinguish a NEW registration from a RETRY before it consumes
+ * any budget. A retry of an existing key creates nothing, so charging it against
+ * the cap would turn a documented idempotent 200 into a 429 the moment a caller
+ * got busy -- punishing exactly the safe retry behaviour the key exists to make
+ * possible.
+ */
+export async function expectationKeyExists(registrationKey: string): Promise<boolean> {
+  const result = await getDatabase().query<{ id: string }>(
+    'SELECT id FROM tm_expectations WHERE registration_key = $1 LIMIT 1',
+    [registrationKey]
+  );
+  return result.rows.length > 0;
+}
+
+/**
+ * Stable identity for one expectation, derived from the work that caused it.
+ *
+ * `registration_key` is what makes registration idempotent. It is NOT the
+ * random row id: a UUID differs on every call, so replaying an action after a
+ * crash between the dispatch and the journal finalization used to register a
+ * SECOND expectation for the same dispatch -- with a different id, and
+ * therefore different retry and escalation idempotency keys, which is duplicate
+ * external work rather than a harmless duplicate row.
+ *
+ * The pair (action_ref, dispatch_ref) is the identity: the same journal action
+ * dispatching the same thing is the same expectation, however many times the
+ * tick replays it. Callers without a journal action pass the dispatch_ref alone.
+ */
+export function expectationRegistrationKey(actionRef: string | null, dispatchRef: string): string {
+  return actionRef ? `${actionRef}:${dispatchRef}` : dispatchRef;
+}
+
+/**
+ * Register an expectation IDEMPOTENTLY.
+ *
+ * Two mechanisms, deliberately both: a deterministic identity (see
+ * expectationRegistrationKey) AND a database-enforced UNIQUE index on it, so
+ * the invariant survives a caller that forgets to pass action_ref and holds
+ * under concurrent ticks rather than depending on read-then-write timing.
+ *
+ * INSERT ... ON CONFLICT DO NOTHING RETURNING gives the existing row's id back
+ * on a replay, so the caller's retry/escalation keys stay identical across
+ * attempts. Returns the id of the expectation that now exists -- new or
+ * pre-existing.
+ */
+export async function registerExpectation(data: {
+  dispatch_ref: string;
+  recipient: string;
+  evidence_json: string;
+  due_at: string;
+  on_absence: TmExpectationAbsence;
+  max_retries: number;
+  /** Journal action id, when the registration is caused by one. */
+  action_ref?: string | null;
+  /**
+   * CALLER-SUPPLIED identity, for registrations that do not originate in a
+   * journal action (the front door, bdc-xo#2007). When present it REPLACES the
+   * derived (action_ref, dispatch_ref) key entirely rather than being mixed
+   * with it: an external caller owns its own idempotency, and a key that was
+   * half caller-chosen and half derived would let the same logical request
+   * register twice under two different keys whenever the caller varied its
+   * dispatch_ref. Namespaced by the API so an external key can never collide
+   * with a loop-derived one.
+   */
+  registration_key?: string;
+  /** WHO asked for this supervision. The loop passes 'taskmaster'. */
+  registered_by?: string;
+  /** True when the registrant named itself as the recipient. */
+  self_supervised?: boolean;
+}): Promise<string> {
+  const registrationKey =
+    data.registration_key ?? expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
+  const db = getDatabase();
+  const now = new Date().toISOString();
+  const inserted = await db.query<{ id: string }>(
+    `INSERT INTO tm_expectations
+     (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
+      max_retries, retries, status, registered_by, self_supervised, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $10, $11, $11)
+     ON CONFLICT (registration_key) DO NOTHING
+     RETURNING id`,
+    [
+      randomUUID(),
+      registrationKey,
+      data.dispatch_ref,
+      data.recipient,
+      data.evidence_json,
+      data.due_at,
+      data.on_absence,
+      data.max_retries,
+      data.registered_by ?? 'taskmaster',
+      data.self_supervised ? 1 : 0,
+      now,
+    ]
+  );
+  const row = inserted.rows[0];
+  if (row) return row.id;
+  // The conflict fired: an expectation for this exact work already exists.
+  // Return ITS id so every downstream key matches the first registration.
+  const existing = await db.query<{ id: string }>(
+    'SELECT id FROM tm_expectations WHERE registration_key = $1',
+    [registrationKey]
+  );
+  const existingRow = existing.rows[0];
+  if (!existingRow)
+    throw new Error('tm_expectations registration conflict without an existing row');
+  return existingRow.id;
+}
+
+/**
+ * Outcome of a front-door registration.
+ *
+ * A discriminated union rather than a nullable row, because "the cap refused
+ * this" and "here is your expectation" have nothing in common to return: a
+ * capped call has no id, no deadline and no row. Forcing the caller to branch on
+ * `capped` is what stops a refusal being read as a registration.
+ */
+export type RegisterExpectationResult =
+  | { capped: false; id: string; created: boolean; expectation: TmExpectation }
+  | { capped: true; observed: number };
+
+export type ExpectationSemanticField =
+  | 'recipient'
+  | 'evidence'
+  | 'dispatch_ref'
+  | 'on_absence'
+  | 'max_retries';
+
+/**
+ * Fields that identify WHAT is being supervised. A retry under the same
+ * registration_key that differs in any of these is not an idempotent retry:
+ * it is a request to watch different work. Deadline is intentionally absent
+ * -- a caller may send a new due_at and still match; the stored deadline wins.
+ * max_retries is included because it is the supervision policy: a redispatch
+ * with a different retry limit is not the same expectation.
+ */
+export function expectationSemanticMismatches(
+  stored: Pick<
+    TmExpectation,
+    'recipient' | 'evidence_json' | 'dispatch_ref' | 'on_absence' | 'max_retries'
+  >,
+  requested: Pick<
+    TmExpectation,
+    'recipient' | 'evidence_json' | 'dispatch_ref' | 'on_absence' | 'max_retries'
+  >
+): ExpectationSemanticField[] {
+  const mismatched: ExpectationSemanticField[] = [];
+  if (stored.recipient !== requested.recipient) mismatched.push('recipient');
+  if (
+    canonicalizeJsonText(stored.evidence_json) !== canonicalizeJsonText(requested.evidence_json)
+  ) {
+    mismatched.push('evidence');
+  }
+  if (stored.dispatch_ref !== requested.dispatch_ref) mismatched.push('dispatch_ref');
+  if (stored.on_absence !== requested.on_absence) mismatched.push('on_absence');
+  if (stored.max_retries !== requested.max_retries) mismatched.push('max_retries');
+  return mismatched;
+}
+
+function canonicalizeJsonText(text: string): string {
+  try {
+    return canonicalizeJsonValue(JSON.parse(text) as unknown);
+  } catch {
+    return text;
+  }
+}
+
+function canonicalizeJsonValue(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(item => canonicalizeJsonValue(item)).join(',')}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map(key => `${JSON.stringify(key)}:${canonicalizeJsonValue(record[key])}`)
+    .join(',')}}`;
+}
+
+/**
+ * Register through the front door, ENFORCING THE DAILY CAP ATOMICALLY.
+ *
+ * Reports whether this call created the row: the bare id cannot distinguish "I
+ * opened supervision for this" from "an expectation under this key already
+ * existed and you are now looking at ITS deadline". For the loop that difference
+ * is immaterial -- idempotency is the whole point. For an external caller it is
+ * not: a session told it registered a 24-hour expectation, when in fact it
+ * matched a key whose deadline passed yesterday, believes work is supervised
+ * that is not. Creation is read from the INSERT's own RETURNING clause, never
+ * from a SELECT taken before it, so two simultaneous first-time callers cannot
+ * both be told they created the row.
+ *
+ * THE CAP IS A PREDICATE INSIDE THE INSERT, NOT A CHECK BEFORE IT.
+ *
+ * Counting rows and then inserting -- even with the count inside a transaction
+ * -- leaves a window under SQLite's default deferred locking: two writers can
+ * both take read locks, both observe a count below the cap, and both then
+ * insert, so the bound is exceeded by however many callers raced. That is a real
+ * hole in a bound whose whole job is to stop a runaway buying unbounded future
+ * escalations, and it is the kind of near-miss this registry exists to prevent
+ * rather than reproduce.
+ *
+ * So the count is evaluated by the database as part of the same statement that
+ * writes: `INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < cap`. On SQLite
+ * that is the whole answer -- one writer at a time, so the subquery cannot
+ * observe a state another writer is midway through changing.
+ *
+ * On PostgreSQL it is NOT, and atomic must not be confused with serializable:
+ * under READ COMMITTED each statement takes its own snapshot, so concurrent
+ * transactions with DISTINCT keys can each count the same below-cap total and
+ * each insert. The capped path therefore also takes a FOR UPDATE row lock on
+ * the tm_control singleton under Postgres, which orders the counts. See the
+ * comment at the insert for why that instrument and not SERIALIZABLE.
+ *
+ * A retry under an EXISTING key is admitted by the same statement even at the
+ * cap. The predicate explicitly admits an existing registration_key so it can
+ * reach ON CONFLICT; a genuinely new key must still have cap headroom. This is
+ * deliberately not decided by a pre-insert probe, which would race another
+ * request creating the same key.
+ */
+export async function registerExpectationReportingCreation(
+  data: Parameters<typeof registerExpectation>[0] & {
+    registration_key: string;
+    /** Per-24h bound on externally-registered rows. Omit to skip the cap. */
+    daily_cap?: number;
+  }
+): Promise<RegisterExpectationResult> {
+  const db = getDatabase();
+  const now = new Date().toISOString();
+  const applyCap = data.daily_cap !== undefined;
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const params: unknown[] = [
+    randomUUID(),
+    data.registration_key,
+    data.dispatch_ref,
+    data.recipient,
+    data.evidence_json,
+    data.due_at,
+    data.on_absence,
+    data.max_retries,
+    data.registered_by ?? 'taskmaster',
+    data.self_supervised ? 1 : 0,
+    now,
+  ];
+  // The guard reads the SAME `ext:` population the route's cap is defined over.
+  let capClause = '';
+  if (applyCap) {
+    params.push(dayAgo, data.daily_cap);
+    capClause =
+      ' WHERE EXISTS (SELECT 1 FROM tm_expectations WHERE registration_key = $2)' +
+      ' OR (SELECT COUNT(*) FROM tm_expectations' +
+      " WHERE registration_key LIKE 'ext:%' AND created_at >= $12) < $13";
+  }
+  const insertSql = `INSERT INTO tm_expectations
+     (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
+      max_retries, retries, status, registered_by, self_supervised, created_at, updated_at)
+     SELECT $1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $10, $11, $11${capClause}
+     ON CONFLICT (registration_key) DO NOTHING
+     RETURNING id`;
+
+  // POSTGRES NEEDS AN EXPLICIT LOCK; SQLITE DOES NOT.
+  //
+  // The cap predicate lives inside the INSERT, which is sufficient on SQLite:
+  // one writer at a time, so the subquery cannot observe a state another writer
+  // is midway through changing.
+  //
+  // It is NOT sufficient on PostgreSQL. Under the default READ COMMITTED
+  // isolation each statement takes its own snapshot, and rows inserted by a
+  // concurrent uncommitted transaction are invisible to it -- so N callers with
+  // DISTINCT registration keys can each count the same below-cap total and each
+  // insert, and ON CONFLICT cannot save the bound because the keys do not
+  // collide. A single statement is atomic; it is not serializable.
+  //
+  // So the capped path serializes on the tm_control singleton with FOR UPDATE,
+  // the same instrument this module already uses to fence pause state. Every
+  // capped registration takes that row lock first, which orders the counts:
+  // the second caller blocks until the first commits and then sees its row.
+  // SERIALIZABLE plus retry would also work, but costs a retry loop on a path
+  // that is not hot, and this repo already has the FOR UPDATE idiom.
+  //
+  // UNCAPPED registrations (the loop's own) take no lock: they are bounded
+  // elsewhere and must not queue behind the front door. Capped retries take the
+  // same serialized path as new keys so retry-vs-new is decided under the lock.
+  const runInsert = async (
+    query: <U>(sql: string, p?: unknown[]) => Promise<QueryResult<U>>
+  ): Promise<string | undefined> => {
+    if (applyCap && db.dialect === 'postgres')
+      await query('SELECT epoch FROM tm_control WHERE id = 1 FOR UPDATE');
+    const result = await query<{ id: string }>(insertSql, params);
+    return result.rows[0]?.id;
+  };
+  const createdId =
+    applyCap && db.dialect === 'postgres'
+      ? await db.withTransaction(runInsert)
+      : await runInsert(db.query.bind(db));
+  const existing = await db.query<TmExpectation>(
+    'SELECT * FROM tm_expectations WHERE registration_key = $1',
+    [data.registration_key]
+  );
+  const row = existing.rows[0];
+  // Nothing inserted AND nothing under this key: the cap predicate rejected it.
+  // Distinguishable from a conflict precisely because a conflict leaves a row.
+  if (!row) {
+    if (applyCap) return { capped: true, observed: await countExternalExpectationsSince(dayAgo) };
+    throw new Error('tm_expectations registration conflict without an existing row');
+  }
+  return {
+    capped: false,
+    id: row.id,
+    created: createdId !== undefined,
+    expectation: normalizeExpectation(row),
+  };
+}
+
+/**
+ * Active expectations are returned even before due_at so success can close early.
+ *
+ * `escalating` is included deliberately. It is the claimed-but-unconfirmed
+ * escalation state, and a row sitting there means a send was authorized but may
+ * never have gone out (it threw, or the process died). Leaving it unselected is
+ * exactly how an escalation gets permanently lost, so the tick must keep seeing
+ * it until the send is confirmed.
+ */
+export async function listDueExpectations(_now: string): Promise<TmExpectation[]> {
+  const result = await getDatabase().query<TmExpectation>(
+    "SELECT * FROM tm_expectations WHERE status IN ('pending', 'failed', 'escalating') ORDER BY due_at ASC"
+  );
+  return result.rows.map(normalizeExpectation);
+}
+
+/**
+ * The only statuses an expectation can be transitioned OUT of.
+ *
+ * `met`, `escalated` and `given_up` are TERMINAL: once a tick has closed an
+ * expectation, no other tick may reopen or overwrite it. Every transition below
+ * names this set (or a narrower one) in its WHERE clause, so a stale worker
+ * cannot regress a closed row -- and, because each returns rowCount, cannot
+ * silently proceed to the external action that transition was gating either.
+ */
+const ACTIVE_EXPECTATION_STATUSES = ['pending', 'failed'] as const;
+
+/**
+ * Conditional state transition. The prior status is named in the WHERE clause
+ * and the affected-row count IS the answer: true means this caller owns the
+ * transition, false means another tick got there first and the caller must not
+ * perform whatever external action the transition was gating.
+ *
+ * A plain `UPDATE ... WHERE id = $1` (the pre-repair shape) let two overlapping
+ * ticks stamp conflicting statuses onto the same row -- one verifying evidence
+ * and marking it met, the other stamping failed over the top and redispatching
+ * work that had already succeeded.
+ */
+async function transitionExpectation(
+  id: string,
+  status: TmExpectationStatus,
+  fromStatuses: readonly TmExpectationStatus[],
+  evidencePointer?: string | null
+): Promise<boolean> {
+  const placeholders = fromStatuses.map((_, index) => `$${String(index + 4)}`).join(', ');
+  const result = await getDatabase().query(
+    `UPDATE tm_expectations
+        SET status = $1, evidence_pointer = $2, updated_at = $3
+      WHERE id = $${String(fromStatuses.length + 4)}
+        AND status IN (${placeholders})`,
+    [status, evidencePointer ?? null, new Date().toISOString(), ...fromStatuses, id]
+  );
+  return result.rowCount === 1;
+}
+
+/**
+ * Close an expectation as met. Returns false when another tick already closed
+ * it -- evidence arriving twice is not an error, but the second observer must
+ * not re-close the row.
+ *
+ * `escalating` is accepted alongside the active set. Evidence can legitimately
+ * arrive after a tick has claimed the escalation but before the operator
+ * notification is confirmed, and success is success however far escalation had
+ * progressed. Excluding it was a real bug: markMet returned false, the
+ * supervisor continued past the rejected transition, and the row stayed
+ * `escalating` forever with every later tick repeating the same failed close.
+ *
+ * The terminal states (`met`, `escalated`, `given_up`) are still excluded, so a
+ * stale worker cannot reopen a row that is genuinely closed.
+ */
+export async function markMet(id: string, evidencePointer: string): Promise<boolean> {
+  return transitionExpectation(
+    id,
+    'met',
+    [...ACTIVE_EXPECTATION_STATUSES, 'escalating'],
+    evidencePointer
+  );
+}
+
+/**
+ * Record that the deadline passed with no evidence. Conditioned on the row
+ * still being active, so a concurrent tick that has already marked it met (or
+ * escalated it, or given up on it) cannot be overwritten with `failed`.
+ * Returns false when the row was already closed; the caller MUST then skip the
+ * redispatch/escalate work that follows.
+ */
+export async function markFailed(id: string): Promise<boolean> {
+  return transitionExpectation(id, 'failed', ACTIVE_EXPECTATION_STATUSES);
+}
+
+// NOTE: there is deliberately no unconditional incrementRetry(). It existed
+// until this repair and was exactly the unsafe primitive the review flagged --
+// a blind `WHERE id = $1` that let a stale tick advance the counter on a row
+// another tick had already closed. claimRedispatchAttempt() is the only way to
+// advance retries, and it is a compare-and-set. Do not reintroduce a
+// non-conditional variant.
+
+/**
+ * Atomically CLAIM the next redispatch attempt (WO review finding: redispatch
+ * was neither atomic nor idempotent).
+ *
+ * The counter is advanced BEFORE the send, under a compare-and-set on BOTH the
+ * retry count and the active status the caller observed, and bounded by
+ * max_retries in the same statement. Consequences the caller relies on:
+ *
+ *  - Two overlapping ticks: only one UPDATE matches `retries = $expected`;
+ *    the loser gets null and MUST NOT send. No double-dispatch.
+ *  - A tick that raced a successful verification: the row is already `met`, so
+ *    it is no longer in the active set, no row matches, and no redispatch is
+ *    sent for work that has already succeeded. The retry-counter CAS alone did
+ *    NOT prevent this -- the status predicate is what closes it.
+ *  - A crash after the claim and before the send: the count is already
+ *    advanced, so the budget can never be exceeded and the count is never
+ *    lost. The caller replays the attempt under its deterministic
+ *    idempotency key, so recovery cannot double-send either.
+ *  - retries >= max_retries: no row matches, null is returned, and the caller
+ *    falls through to escalation instead of looping.
+ *
+ * Returns the claimed attempt number (1-based), or null when the claim lost.
+ */
+export async function claimRedispatchAttempt(
+  id: string,
+  expectedRetries: number,
+  dueAt: string
+): Promise<number | null> {
+  // ONE statement decides the claim, and its affected-row count IS the answer.
+  //
+  // Doing this as an UPDATE followed by a separate SELECT would be wrong even
+  // inside a transaction on some engines and is outright unusable here: two
+  // ticks would both re-read expected+1 and both believe they won. Wrapping it
+  // in withTransaction is also not an option -- the sqlite adapter runs on a
+  // single connection and rejects a nested BEGIN, so a caller that already
+  // holds a transaction would crash.
+  //
+  // A conditional UPDATE needs neither: on Postgres the row lock serializes the
+  // two writers and the loser's `retries = $expected` predicate no longer
+  // matches; on the single-connection sqlite adapter the statement is atomic by
+  // construction. rowCount is 1 for the winner and 0 for everyone else.
+  const activePlaceholders = ACTIVE_EXPECTATION_STATUSES.map(
+    (_, index) => `$${String(index + 5)}`
+  ).join(', ');
+  const result = await getDatabase().query(
+    `UPDATE tm_expectations
+        SET status = 'failed', retries = retries + 1, due_at = $1, updated_at = $2
+      WHERE id = $3
+        AND retries = $4
+        AND retries < max_retries
+        AND status IN (${activePlaceholders})`,
+    [dueAt, new Date().toISOString(), id, expectedRetries, ...ACTIVE_EXPECTATION_STATUSES]
+  );
+  return result.rowCount === 1 ? expectedRetries + 1 : null;
+}
+/**
+ * Atomically CLAIM the recovery replay of an already-claimed-but-unsent attempt
+ * AND set the fresh evidence deadline for it, in one conditional UPDATE.
+ *
+ * Recovery only runs once due_at has already elapsed (that is what brought the
+ * tick here), so replaying the send without moving the deadline left the row
+ * instantly overdue again: the very next tick would judge the just-recovered
+ * dispatch a failure and burn another retry -- or escalate -- without ever
+ * giving the recipient the configured response interval. The deadline must move
+ * with the replay, not after it.
+ *
+ * Conditioned on the retry count the caller observed and on the row still being
+ * active, so this doubles as an exclusive claim: two ticks that both see the
+ * same unsent attempt cannot both replay it, and a tick racing a concurrent
+ * markMet loses and sends nothing. rowCount is 1 for the winner, 0 for the rest.
+ *
+ * NOTE the deliberate asymmetry with claimRedispatchAttempt: this does NOT
+ * advance `retries`. The attempt being recovered was already paid for when it
+ * was claimed; recovery finishes it rather than buying another.
+ */
+export async function claimRecoveryReplay(
+  id: string,
+  expectedRetries: number,
+  dueAt: string,
+  expectedDueAt: string
+): Promise<boolean> {
+  // The predicate MUST include the observed due_at, and the UPDATE changes it.
+  //
+  // claimRedispatchAttempt gets exclusivity for free: its `retries = $expected`
+  // predicate is invalidated by its own `retries + 1`. This statement does not
+  // touch retries, so conditioning on retries alone leaves the predicate TRUE
+  // after the winner commits and BOTH ticks match -- caught by the "two ticks
+  // race the recovery replay" test, which saw two winners. Matching on the
+  // deadline this tick observed, and then moving it, is what makes the claim
+  // self-invalidating and therefore exclusive.
+  const activePlaceholders = ACTIVE_EXPECTATION_STATUSES.map(
+    (_, index) => `$${String(index + 6)}`
+  ).join(', ');
+  const result = await getDatabase().query(
+    `UPDATE tm_expectations
+        SET due_at = $1, updated_at = $2
+      WHERE id = $3
+        AND retries = $4
+        AND due_at = $5
+        AND status IN (${activePlaceholders})`,
+    [
+      dueAt,
+      new Date().toISOString(),
+      id,
+      expectedRetries,
+      expectedDueAt,
+      ...ACTIVE_EXPECTATION_STATUSES,
+    ]
+  );
+  return result.rowCount === 1;
+}
+
+/**
+ * CLAIM the right to send the operator escalation, without closing the row.
+ *
+ * This is the first half of a two-phase escalation, and it exists because both
+ * single-phase orderings are broken:
+ *
+ *  - send THEN transition: a worker that loses the transition has already put
+ *    an operator blocker on the wire and cannot retract it.
+ *  - transition THEN send: the row is terminal the instant the transition
+ *    commits, so a send that throws (or a crash right after) loses the
+ *    escalation forever -- listDueExpectations would never select it again.
+ *
+ * Claiming an intermediate NON-terminal `escalating` state gives both
+ * guarantees at once: it is exclusive (conditional on the active set, so a
+ * worker racing a concurrent markMet loses and never sends), and it is still
+ * selectable, so an unconfirmed send is replayed by a later tick under the
+ * deterministic escalation key. Returns false when the claim was lost.
+ */
+export async function claimEscalation(id: string, evidencePointer?: string): Promise<boolean> {
+  return transitionExpectation(id, 'escalating', ACTIVE_EXPECTATION_STATUSES, evidencePointer);
+}
+
+/**
+ * Close an expectation as escalated to a human -- the second half of the
+ * two-phase escalation, run only once the operator notification is CONFIRMED
+ * sent.
+ *
+ * Accepts the active set as well as `escalating` so that a tick which claimed
+ * and sent in one pass can close the row, and so a replay tick can close a row
+ * another worker left in `escalating`. The escalation dispatch is written under
+ * a deterministic idempotency key, so a replay reuses the existing row rather
+ * than creating a second operator task.
+ */
+export async function markEscalated(id: string, evidencePointer?: string): Promise<boolean> {
+  return transitionExpectation(
+    id,
+    'escalated',
+    [...ACTIVE_EXPECTATION_STATUSES, 'escalating'],
+    evidencePointer
+  );
+}
+
+/**
+ * Close an expectation as abandoned, with the reason as the pointer.
+ * Conditioned on the row still being active for the same reason as
+ * markEscalated. Returns false when the row was already closed.
+ */
+export async function markGivenUp(id: string, reason: string): Promise<boolean> {
+  return transitionExpectation(id, 'given_up', ACTIVE_EXPECTATION_STATUSES, reason);
+}
+
+export async function getExpectationCounts(): Promise<Record<TmExpectationStatus, number>> {
+  const counts: Record<TmExpectationStatus, number> = {
+    pending: 0,
+    met: 0,
+    failed: 0,
+    escalating: 0,
+    escalated: 0,
+    given_up: 0,
+  };
+  const result = await getDatabase().query<{ status: TmExpectationStatus; count: number | string }>(
+    'SELECT status, COUNT(*) AS count FROM tm_expectations GROUP BY status'
+  );
+  for (const row of result.rows) counts[row.status] = Number(row.count);
+  return counts;
+}
+
 /**
  * Record a taskmaster action in the journal. ROW FIRST, always -- the loop
  * calls this BEFORE attempting any external effect, then updates the outcome
@@ -174,6 +893,106 @@ export async function recordAction(data: {
   }
   if (!row) throw new Error('Failed to record taskmaster action');
   return normalizeJournal(row);
+}
+
+interface ResetAuditData {
+  actor: string;
+  reason: string | null;
+  previousEpoch: number;
+  newEpoch: number;
+  transitioned: boolean;
+}
+
+async function insertResetAudit(
+  query: OverseerControlPlaneQuery,
+  data: ResetAuditData
+): Promise<TmJournalEntry> {
+  const result = await query<TmJournalRow>(
+    `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+     VALUES ($1, $2, 'taskmaster:reset', 'digest', $3, 'sent') RETURNING *`,
+    [
+      randomUUID(),
+      new Date().toISOString(),
+      JSON.stringify({
+        audit_type: 'taskmaster_reset',
+        actor: data.actor,
+        reason: data.reason,
+        previous_epoch: data.previousEpoch,
+        new_epoch: data.newEpoch,
+        transitioned: data.transitioned,
+      }),
+    ]
+  );
+  const row = result.rows[0];
+  if (!row) throw new Error('Failed to record taskmaster reset audit');
+  return normalizeJournal(row);
+}
+
+/** Record one audit row for every operator reset invocation. */
+export async function recordResetAudit(data: ResetAuditData): Promise<TmJournalEntry> {
+  const db = getDatabase();
+  return insertResetAudit(db.query.bind(db), data);
+}
+
+/** Execute the resume endpoint's idempotent reset sequence. */
+export async function resetTaskmaster(data: { actor: string; reason: string | null }): Promise<{
+  control: TmControlState;
+  expiredProposals: number;
+  audit: TmJournalEntry;
+}> {
+  const db = getDatabase();
+  const reset = async (
+    query: OverseerControlPlaneQuery
+  ): Promise<{
+    control: TmControlState;
+    expiredProposals: number;
+    audit: TmJournalEntry;
+  }> => {
+    await query(
+      `INSERT INTO tm_control (id, pause_state, epoch, updated_at)
+       VALUES (1, 'RUNNING', 0, $1) ON CONFLICT (id) DO NOTHING`,
+      [new Date().toISOString()]
+    );
+    const previousResult = await query<TmControlRow>(
+      'SELECT * FROM tm_control WHERE id = 1' + (db.dialect === 'postgres' ? ' FOR UPDATE' : '')
+    );
+    const previousRow = previousResult.rows[0];
+    if (!previousRow) throw new Error('tm_control singleton missing during reset');
+    const previous = normalizeControl(previousRow);
+    const expired = await query(
+      "UPDATE tm_journal SET outcome = 'expired' WHERE outcome IN ('parked', 'pending')"
+    );
+    const transition = await query(
+      `UPDATE tm_control SET pause_state = 'RUNNING', epoch = epoch + 1, updated_at = $1
+       WHERE id = 1 AND pause_state <> 'RUNNING'`,
+      [new Date().toISOString()]
+    );
+    const transitioned = transition.rowCount === 1;
+    // updated_at bounds the useful-rate epoch window. A repeated RUNNING
+    // reset must not move it forward and discard accumulated grade evidence.
+    await query(
+      `UPDATE tm_control SET pause_scope = NULL, pause_reason = NULL,
+       pause_actor = $1 WHERE id = 1`,
+      [data.actor]
+    );
+    const current = await query<TmControlRow>('SELECT * FROM tm_control WHERE id = 1');
+    const currentRow = current.rows[0];
+    if (!currentRow) throw new Error('tm_control singleton missing after reset');
+    const control = normalizeControl(currentRow);
+    const audit = await insertResetAudit(query, {
+      actor: data.actor,
+      reason: data.reason,
+      previousEpoch: previous.epoch,
+      newEpoch: control.epoch,
+      transitioned,
+    });
+    return { control, expiredProposals: expired.rowCount, audit };
+  };
+  // Reuse the existing SQLite writer-lock/async-serialization primitive;
+  // PostgreSQL pins a pool connection and locks the singleton inside its transaction.
+  return db.dialect === 'sqlite'
+    ? withOverseerControlPlaneImmediateTransaction(db, reset)
+    : db.withTransaction(reset);
 }
 
 /** Read one logical action by stable idempotency key without a time window. */
@@ -285,9 +1104,9 @@ export async function getPauseState(): Promise<TmControlState> {
 }
 
 /**
- * Set the pause state. incrementEpoch is used by resume (and by auto-circuit
- * transitions) so in-flight proposals confirmed under the old epoch expire
- * instead of replaying.
+ * Set pause state for direct control/circuit callers. An explicit epoch
+ * increment invalidates older in-flight proposals. The resume endpoint uses
+ * resetTaskmaster instead to atomically transition, expire and audit.
  */
 export async function setPauseState(data: {
   pause_state: TmPauseState;

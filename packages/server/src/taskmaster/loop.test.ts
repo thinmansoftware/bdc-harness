@@ -11,6 +11,7 @@ import {
   defaultFindEffectByIdempotencyKey,
   defaultGetGithubIssueEvidence,
   defaultListThreads,
+  priorityFromLabels,
   tick,
   resolveTaskmasterIntervalMs,
   resolveFireVerbEnabled,
@@ -19,12 +20,15 @@ import {
   resolveRecipient,
   MAX_EFFECTS_PER_TICK,
   OWNER_RECIPIENT_MAP,
+  isPauseEffectsExempt,
   TM_REPEAT_REASON_BY_TYPE,
   type TaskmasterDeps,
   type ListedThread,
   type GithubIssueEvidence,
   type AdoptionRefreshResult,
 } from './loop';
+import { checkEvidence } from './expectations';
+import type { DispatchDeliveryMode } from '@archon/core/db/dispatch';
 import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
 import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal, NUDGE_CLOCK_MS } from './rules';
 import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
@@ -38,6 +42,145 @@ import type {
 } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
 
+describe('Taskmaster reset visibility and canary', () => {
+  test('only the two WO-authorized monitoring signals escape an effects pause', () => {
+    expect(isPauseEffectsExempt('canary', 'effects')).toBe(true);
+    expect(isPauseEffectsExempt('self_pause_notice', 'effects')).toBe(true);
+    expect(isPauseEffectsExempt('digest', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('escalate_p0', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('nudge', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('fire_cauldron', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('deliver_ruling', 'effects')).toBe(false);
+  });
+
+  test('paused daily canary reaches duty-officer once and carries reset guidance', async () => {
+    const world = makeWorld();
+    world.control.pause_state = 'PAUSED';
+    world.control.pause_scope = 'effects';
+    world.control.pause_reason = 'operator safety pause';
+    const deps = makeDeps(world);
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    await tick(state, deps);
+
+    const canaries = world.sentMessages.filter(m => m.idempotency_key === `tm:digest:${TODAY_KEY}`);
+    expect(canaries).toHaveLength(1);
+    expect(canaries[0]?.recipient).toBe('duty-officer');
+    expect(canaries[0]?.body).toContain('operator safety pause');
+    expect(canaries[0]?.body).toContain('scripts/taskmaster/reset.sh');
+  });
+
+  test('healthy quiet day still sends a daily canary', async () => {
+    const world = makeWorld();
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.sentMessages).toHaveLength(1);
+    expect(world.sentMessages[0]?.recipient).toBe('duty-officer');
+    expect(world.sentMessages[0]?.body).toContain('no proposals today');
+  });
+
+  test('reset audit does not inflate a quiet daily canary outcome count', async () => {
+    const world = makeWorld();
+    world.journal.push({
+      id: 'reset-audit',
+      created_at: new Date(world.nowMs).toISOString(),
+      thread_ref: 'taskmaster:reset',
+      action_type: 'digest',
+      proposal_json: JSON.stringify({ audit_type: 'taskmaster_reset' }),
+      idempotency_key: null,
+      before_hash: null,
+      proof_predicate: null,
+      proof_deadline_at: null,
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.sentMessages).toHaveLength(1);
+    expect(world.sentMessages[0]?.body).toContain('sent=0, parked=0, rejected=0');
+    expect(world.sentMessages[0]?.body).toContain('no proposals today');
+  });
+
+  test('post-resume noise pauses and sends the Duty Officer reset notice', async () => {
+    const world = makeWorld();
+    for (let i = 0; i < 20; i += 1) {
+      world.journal.push({
+        id: `noise-${i}`,
+        created_at: new Date(T0 + i + 1).toISOString(),
+        thread_ref: `gh:test/repo#${i}`,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        idempotency_key: `noise-${i}`,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: null,
+        outcome: 'sent',
+        graded_at: new Date(T0 + i + 1).toISOString(),
+        grade: 'noise',
+      });
+    }
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.control.pause_state).toBe('PAUSED');
+    const notice = world.sentMessages.find(m => m.idempotency_key.startsWith('tm:self-pause:'));
+    expect(notice?.recipient).toBe('duty-officer');
+    expect(notice?.body).toContain('scripts/taskmaster/reset.sh');
+    expect(notice?.body).toContain('M-155 useful-rate floor auto-pause');
+  });
+
+  test.each(['epoch', 'pause state', 'enqueue'] as const)(
+    'a changed control %s prevents a stale self-pause notice',
+    async change => {
+      const world = makeWorld();
+      for (let i = 0; i < 20; i += 1) {
+        world.journal.push({
+          id: `noise-fenced-${i}`,
+          created_at: new Date(T0 + i + 1).toISOString(),
+          thread_ref: `gh:test/repo#${i}`,
+          action_type: 'nudge',
+          proposal_json: '{}',
+          idempotency_key: `noise-fenced-${i}`,
+          before_hash: null,
+          proof_predicate: null,
+          proof_deadline_at: null,
+          outcome: 'sent',
+          graded_at: new Date(T0 + i + 1).toISOString(),
+          grade: 'noise',
+        });
+      }
+      const deps = makeDeps(world);
+      const originalSetPauseState = deps.db!.setPauseState;
+      if (change === 'enqueue') {
+        const originalCreate = deps.createTask!;
+        deps.createTask = (async (context, data, fence) => {
+          if (data.idempotency_key.startsWith('tm:self-pause:')) {
+            world.control = {
+              ...world.control,
+              pause_state: 'RUNNING',
+              epoch: world.control.epoch + 1,
+            };
+          }
+          return fence ? originalCreate(context, data, fence) : originalCreate(context, data);
+        }) as TaskmasterDeps['createTask'];
+      } else
+        deps.db!.setPauseState = async data => {
+          const paused = await originalSetPauseState(data);
+          const snapshot = { ...paused };
+          world.control =
+            change === 'epoch'
+              ? { ...paused, epoch: paused.epoch + 1 }
+              : { ...paused, pause_state: 'RUNNING' };
+          return snapshot;
+        };
+      await tick(createTaskmasterState(60_000), deps);
+      expect(
+        world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:self-pause:'))
+      ).toHaveLength(0);
+    }
+  );
+});
+
 const T0 = Date.parse('2026-08-07T12:00:00.000Z');
 const TODAY_KEY = new Date(T0).toISOString().slice(0, 10);
 
@@ -49,6 +192,9 @@ interface FakeWorld {
     recipient: string;
     body: string;
     createdAt: string;
+    // M-155 Amendment 03: optional ack timestamp for the sent dispatch row,
+    // used by the default getDispatchMessageById mock to drive 'unheard' grading.
+    acknowledged_at?: string | null;
   }>;
   nowMs: number;
   recordCalls: number;
@@ -218,8 +364,24 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     headroom: async () => okHeadroom,
     createTask: (async (
       _context: unknown,
-      data: { idempotency_key: string; recipient: string; body: string }
+      data: { idempotency_key: string; recipient: string; body: string },
+      fence?: {
+        taskmasterPausedEpoch: number;
+        taskmasterPausedState?: string;
+        taskmasterPausedScope?: string | null;
+      }
     ) => {
+      // Fake the Dispatch boundary; its real SQLite/PG transaction has DAL
+      // tests. Mirror the real fence exactly: the notice is refused unless the
+      // live control row still matches the authorized state, scope and epoch.
+      if (
+        fence &&
+        (world.control.pause_state !== fence.taskmasterPausedState ||
+          (world.control.pause_scope ?? null) !== (fence.taskmasterPausedScope ?? null) ||
+          world.control.epoch !== fence.taskmasterPausedEpoch)
+      ) {
+        return null;
+      }
       world.sentMessages.push({
         idempotency_key: data.idempotency_key,
         recipient: data.recipient,
@@ -230,8 +392,47 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     }) as unknown as TaskmasterDeps['createTask'],
     findEffectByIdempotencyKey: async (key: string) => {
       const found = world.sentMessages.find(m => m.idempotency_key === key);
-      return found ? { id: 'existing', status: 'queued', createdAt: found.createdAt } : null;
+      // Use the idempotency_key as the dispatch id so the default
+      // getDispatchMessageById below can map effect.id back to the sent row
+      // for M-155 Amendment 03 'unheard' grading.
+      return found
+        ? { id: found.idempotency_key, status: 'queued', createdAt: found.createdAt }
+        : null;
     },
+    // M-155 Amendment 03: synthesize the sent dispatch row from world.sentMessages
+    // (keyed by idempotency_key == effect.id). acknowledged_at defaults to null
+    // (unacked) unless a test seeds it.
+    getDispatchMessageById: (async (id: string) => {
+      const found = world.sentMessages.find(m => m.idempotency_key === id);
+      if (!found) return null;
+      return {
+        id,
+        recipient: found.recipient,
+        resolved_recipient: null,
+        acknowledged_at: found.acknowledged_at ?? null,
+        addressed_at: null,
+        addressed_by: null,
+      };
+    }) as unknown as TaskmasterDeps['getDispatchMessageById'],
+    // M-155 Amendment 03: mirror the seeded principal delivery modes
+    // (packages/core/src/db/adapters/sqlite.ts). operator + xo are
+    // drain_on_start; unknown recipients default to drain_on_start (matching
+    // the migration 040 backfill), so a message is 'heard' only when a test
+    // both seeds acknowledged_at AND routes to a non-draining recipient.
+    assessDispatchRecipient: (async (recipient: string) => {
+      const nonDrain: Record<string, DispatchDeliveryMode> = {
+        overseer: 'notify_only',
+        cauldron: 'notify_only',
+        claude: 'worker_poll',
+        codex: 'worker_poll',
+        'major-build': 'worker_poll',
+        'captain-ci': 'worker_poll',
+        board: 'alias_resolved',
+      };
+      const canonical = recipient.trim().toLowerCase();
+      const delivery_mode = nonDrain[canonical] ?? 'drain_on_start';
+      return { ok: true, canonical_principal: canonical, delivery_mode, reason: null };
+    }) as unknown as TaskmasterDeps['assessDispatchRecipient'],
     listUndeliveredRulings: async () => [],
     listThreads: async () => [],
     // Default no-op evidence so adoption refresh never hits the network in unit tests.
@@ -268,6 +469,57 @@ function ruling(overrides: Partial<ThreadSnapshot> = {}): ThreadSnapshot {
     ...overrides,
   };
 }
+
+describe('expectation registry tick wiring', () => {
+  test('checks expectations, reports counts, and registers ordinary dispatch proof', async () => {
+    const world = makeWorld();
+    const checkedAt: Date[] = [];
+    const registered: Array<{ dispatch_ref: string; on_absence: string }> = [];
+    const deps = makeDeps(world, {
+      checkExpectations: async now => {
+        checkedAt.push(now);
+      },
+      listThreads: async () =>
+        Object.assign([], {
+          unlabelledPriorityTriage: ['gh:thinmansoftware/bdc-harness#404'],
+        }),
+    });
+    deps.db = {
+      ...deps.db!,
+      getExpectationCounts: async () => ({
+        pending: 2,
+        met: 3,
+        failed: 4,
+        escalating: 7,
+        escalated: 5,
+        given_up: 6,
+      }),
+      registerExpectation: async data => {
+        registered.push(data);
+        return 'expectation-digest';
+      },
+    };
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(checkedAt).toEqual([new Date(T0)]);
+    expect(registered).toHaveLength(1);
+    expect(registered[0]?.dispatch_ref).toBe('msg-1');
+    expect(registered[0]?.on_absence).toBe('escalate');
+    // The journal action id is the other half of the deterministic identity;
+    // without it a replayed action would register a second expectation.
+    expect(registered[0]?.action_ref).toBeTruthy();
+    const digest = world.sentMessages.find(message =>
+      message.idempotency_key.startsWith('tm:digest:')
+    );
+    // `escalating` is in the digest: a non-terminal claimed-but-unsent
+    // escalation is exactly the thing a human needs to see in the daily line.
+    expect(digest?.body).toContain(
+      'pending=2, met=3, failed=4, escalating=7, escalated=5, given_up=6'
+    );
+    expect(digest?.body).toContain('Needs priority triage: gh:thinmansoftware/bdc-harness#404');
+  });
+});
 
 describe('scenario 1: undelivered ruling is delivered exactly once (dedupe proven)', () => {
   test('two ticks produce one deliver_ruling row and one send; a third tick adds nothing', async () => {
@@ -396,7 +648,52 @@ describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation n
   });
 });
 
+const EXPECTED_SPEC = {
+  specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
+  specRevision: 'a'.repeat(40),
+  specHash: `sha256:${'b'.repeat(64)}`,
+};
 describe('fire_cauldron loop', () => {
+  test('legacy eligibility without immutable identity never dispatches a cascade', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => [
+            makeListedThread({ isUnclaimed: true, title: 'WO-HARNESS-EXAMPLE-01', priority: 'P1' }),
+          ],
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-01',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              noOpenOrMergedPr: true,
+              specVerifiedAt: new Date(T0).toISOString(),
+            },
+          }),
+          runCascade: async options => {
+            admissions++;
+            const record = { cascadeId: 'bad', status: 'running' } as never;
+            options.onAdmission?.(record, true);
+            return record;
+          },
+        })
+      );
+      expect(admissions).toBe(0);
+      expect(
+        world.journal.some(row => row.action_type === 'fire_cauldron' && row.outcome === 'sent')
+      ).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
   test('fire backoff still delivers an outstanding ruling for the P0', async () => {
     const world = makeWorld();
     seedDigestSent(world);
@@ -424,7 +721,7 @@ describe('fire_cauldron loop', () => {
     expect(world.journal.some(row => row.action_type === 'deliver_ruling')).toBe(true);
   });
 
-  test('qualified unclaimed P0 admits exactly one cascade and journals its run id', async () => {
+  test('qualified fresh unclaimed P1 admits exactly one cascade and journals its run id', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -432,9 +729,9 @@ describe('fire_cauldron loop', () => {
       seedDigestSent(world);
       const item: ListedThread = {
         ref: 'gh:thinmansoftware/bdc-harness#501',
-        priority: 'P0',
+        priority: 'P1',
         lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
-        isUnclaimedP0: true,
+        isUnclaimed: true,
         recipient: 'xo',
         title: 'WO-HARNESS-EXAMPLE-01 urgent build',
       };
@@ -453,14 +750,24 @@ describe('fire_cauldron loop', () => {
             project: 'bdc-harness',
             specVerifiedAt: new Date(T0).toISOString(),
             noOpenOrMergedPr: true,
+            expectedSpec: EXPECTED_SPEC,
           },
         }),
         runCascade: (async options => {
           admissions += 1;
+          expect(options.expectedSpec).toEqual(EXPECTED_SPEC);
           options.onAdmission?.(record, true);
           return record;
         }) as NonNullable<TaskmasterDeps['runCascade']>,
       });
+      const registered: Array<{ dispatch_ref: string; evidence_json: string }> = [];
+      deps.db = {
+        ...deps.db!,
+        registerExpectation: async data => {
+          registered.push(data);
+          return 'expectation-fire';
+        },
+      };
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
       await tick(state, deps);
@@ -469,7 +776,228 @@ describe('fire_cauldron loop', () => {
       expect(fires).toHaveLength(1);
       expect(fires[0]?.outcome).toBe('sent');
       expect(fires[0]?.proposal_json).toContain('cascade-501');
+      expect(registered).toHaveLength(1);
+      expect(registered[0]?.dispatch_ref).toBe('cascade-501');
+      expect(registered[0]?.evidence_json).toContain('remote_agent_workflow_runs');
+      // Deterministic identity: the journal action id is passed so a replayed
+      // fire reuses this expectation instead of registering a second one.
+      expect(registered[0]?.action_ref).toBe(fires[0]?.id);
+
+      // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching only on
+      // the admission row's existence is self-fulfilling -- admission creates
+      // that row -- so a failed or stalled cascade would never escalate.
+      const spec = JSON.parse(registered[0]!.evidence_json) as {
+        where: Record<string, unknown>;
+      };
+      expect(spec.where.status).toEqual(['completed']);
+
+      // Run the registered spec against a run table to prove it: admitted but
+      // unfinished is NOT met, failed is NOT met, completed IS met.
+      const runs = [{ id: 'cascade-501', status: 'running' }];
+      const query = async <T>(_sql: string, params?: unknown[]) => {
+        const [id, ...statuses] = (params ?? []) as string[];
+        return {
+          rows: runs.filter(
+            run => run.id === id && statuses.includes(run.status)
+          ) as unknown as T[],
+        };
+      };
+      const evidence = spec as unknown as Parameters<typeof checkEvidence>[0];
+      expect((await checkEvidence(evidence, { query })).ok).toBe(false);
+      runs[0]!.status = 'failed';
+      expect((await checkEvidence(evidence, { query })).ok).toBe(false);
+      runs[0]!.status = 'completed';
+      expect((await checkEvidence(evidence, { query })).ok).toBe(true);
       expect(world.sentMessages.some(message => message.body.includes('Unclaimed P0'))).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('hold-labeled unclaimed work is refused fire even when its blocker names a seat', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const item = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#509',
+        priority: 'P1',
+        isUnclaimed: true,
+        isBlocked: true,
+        labels: ['wo', 'status:hold'],
+        title: 'WO-HARNESS-EXAMPLE-509 held build',
+      });
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => [item],
+          getGithubIssueEvidence: async () =>
+            makeEvidence({
+              latestMarkerKind: 'BLOCKED',
+              latestMarkerText: 'major-build must resolve the hold',
+            }),
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-509',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+              specSource: 'issue-body',
+            },
+          }),
+          runCascade: (async () => {
+            admissions += 1;
+            return { cascadeId: 'unexpected', status: 'running' } as never;
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        })
+      );
+      expect(admissions).toBe(0);
+      expect(world.journal.some(row => row.action_type === 'fire_cauldron')).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('mixed immediate proposals keep exceptions ahead of priority-ordered fires', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const events: string[] = [];
+      const threads = [
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#523',
+          priority: 'P3',
+          isUnclaimed: true,
+          title: 'WO-HARNESS-EXAMPLE-523 build',
+        }),
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#520',
+          priority: 'P0',
+          isUnclaimed: true,
+          isUnclaimedP0: true,
+          title: 'WO-HARNESS-EXAMPLE-520 no spec',
+        }),
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#521',
+          priority: 'P1',
+          isUnclaimed: true,
+          title: 'WO-HARNESS-EXAMPLE-521 build',
+        }),
+      ];
+      const deps = makeDeps(world, {
+        listUndeliveredRulings: async () => [ruling()],
+        listThreads: async () => threads,
+        checkFireEligibility: async title => {
+          const woId = title.split(' ')[0]!;
+          if (woId.endsWith('-520')) return { eligible: false, reason: 'missing_spec' };
+          return {
+            eligible: true,
+            evidence: {
+              woId,
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+              specSource: 'repo-path',
+            },
+          };
+        },
+        createTask: (async (_context, data) => {
+          events.push(data.body.includes('Ratified ruling') ? 'deliver_ruling' : 'escalate_p0');
+          return { id: `msg-${events.length}`, status: 'queued' } as never;
+        }) as TaskmasterDeps['createTask'],
+        runCascade: (async options => {
+          events.push(`fire:${options.woId}`);
+          const record = { cascadeId: `cascade-${options.woId}`, status: 'running' } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      await tick(createTaskmasterState(60_000), deps);
+      expect(events).toEqual([
+        'deliver_ruling',
+        'escalate_p0',
+        'fire:WO-HARNESS-EXAMPLE-521',
+        'fire:WO-HARNESS-EXAMPLE-523',
+      ]);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('fire cap dispatches P0 through P2 first and defers overflow for the next tick', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const threads = [
+        ['P3', 513],
+        ['P2', 512],
+        ['P0', 510],
+        ['P3', 514],
+        ['P1', 511],
+      ].map(([priority, number]) =>
+        makeListedThread({
+          ref: `gh:thinmansoftware/bdc-harness#${number}`,
+          priority: priority as ThreadSnapshot['priority'],
+          isUnclaimed: true,
+          isUnclaimedP0: priority === 'P0',
+          title: `WO-HARNESS-EXAMPLE-${number} build`,
+          lastActivityAt: new Date(T0).toISOString(),
+        })
+      );
+      const admitted: string[] = [];
+      const deps = makeDeps(world, {
+        listThreads: async () => threads,
+        checkFireEligibility: async title => {
+          const woId = title.split(' ')[0]!;
+          return {
+            eligible: true,
+            evidence: {
+              woId,
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+              specSource: 'repo-path',
+            },
+          };
+        },
+        runCascade: (async options => {
+          admitted.push(options.woId);
+          const record = { cascadeId: `cascade-${options.woId}`, status: 'running' } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      expect(admitted).toEqual([
+        'WO-HARNESS-EXAMPLE-510',
+        'WO-HARNESS-EXAMPLE-511',
+        'WO-HARNESS-EXAMPLE-512',
+      ]);
+      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(2);
+
+      world.nowMs += 60_000;
+      await tick(state, deps);
+      expect(admitted.slice(3).sort()).toEqual([
+        'WO-HARNESS-EXAMPLE-513',
+        'WO-HARNESS-EXAMPLE-514',
+      ]);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
@@ -522,6 +1050,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
             },
           }),
           runCascade: (async options => {
@@ -595,6 +1124,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
             },
           }),
           runCascade: (async options => {
@@ -677,6 +1207,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
             },
           }),
           runCascade: (async () => {
@@ -1276,9 +1807,14 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: 'tm:nudge:gh:thinmansoftware/bdc-xo#1450:1',
-      recipient: 'xo',
+      // Heard channel (major-build is worker_poll, not drain_on_start) with an
+      // ack, so this test exercises the "no external progress -> not useful
+      // (stays ungraded until deadline)" gate rather than short-circuiting on
+      // the M-155 Amendment 03 'unheard' gate.
+      recipient: 'major-build',
       body: 'reminder',
       createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
     });
     world.sentMessages.push({
       idempotency_key: `tm:digest:${TODAY_KEY}`,
@@ -1312,17 +1848,22 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: 'tm:deliver_ruling:ruling-original',
-      recipient: 'xo',
+      // Heard channel (major-build is worker_poll, not drain_on_start) + ack so
+      // the M-155 Amendment 03 heard gate passes and this test exercises the
+      // deliver_ruling useful path rather than short-circuiting to 'unheard'.
+      recipient: 'major-build',
       body: 'ruling reminder',
       createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getDispatchMessageById: (async () => ({
         id: 'ruling-original',
-        recipient: 'xo',
-        resolved_recipient: 'xo',
+        recipient: 'major-build',
+        resolved_recipient: 'major-build',
+        acknowledged_at: new Date(T0 - 40_000).toISOString(),
         addressed_at: new Date(T0 - 30_000).toISOString(),
-        addressed_by: 'xo',
+        addressed_by: 'major-build',
       })) as unknown as TaskmasterDeps['getDispatchMessageById'],
     });
 
@@ -1351,9 +1892,12 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: key,
-      recipient: 'xo',
+      // Heard channel + ack so the M-155 Amendment 03 heard gate passes and this
+      // test exercises the nudge useful path (post-send progress marker).
+      recipient: 'major-build',
       body: 'nudge',
       createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
@@ -1393,9 +1937,13 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: key,
-      recipient: 'xo',
+      // Heard channel + ack so this test exercises the pre-send-timing gate
+      // (progress before the send is not useful) rather than the M-155
+      // Amendment 03 'unheard' gate.
+      recipient: 'major-build',
       body: 'nudge',
       createdAt: new Date(T0 - 30_000).toISOString(),
+      acknowledged_at: new Date(T0 - 25_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
@@ -1416,19 +1964,38 @@ describe('SC7 grading requires external source progress', () => {
   });
 
   test('unacknowledged, acknowledged-only, and auto-addressed rulings are not useful', async () => {
-    const cases = [
-      { name: 'unacknowledged', acknowledged_at: null, addressed_at: null, addressed_by: null },
+    // Routed to a non-draining recipient (major-build, worker_poll) so this
+    // test exercises the deliver_ruling addressed-by logic. M-155 Amendment 03:
+    // the unacknowledged case is 'unheard' (never acked); the acked-but-not-
+    // addressed cases stay ungraded (heard, but no useful proof yet). None are
+    // 'useful' -- the invariant this test protects.
+    const cases: Array<{
+      name: string;
+      acknowledged_at: string | null;
+      addressed_at: string | null;
+      addressed_by: string | null;
+      expected: TmGrade | null;
+    }> = [
+      {
+        name: 'unacknowledged',
+        acknowledged_at: null,
+        addressed_at: null,
+        addressed_by: null,
+        expected: 'unheard',
+      },
       {
         name: 'acknowledged-only',
         acknowledged_at: new Date(T0 - 20_000).toISOString(),
         addressed_at: null,
         addressed_by: null,
+        expected: null,
       },
       {
         name: 'auto-addressed',
         acknowledged_at: new Date(T0 - 20_000).toISOString(),
         addressed_at: new Date(T0 - 10_000).toISOString(),
         addressed_by: 'taskmaster:auto',
+        expected: null,
       },
     ];
 
@@ -1453,15 +2020,15 @@ describe('SC7 grading requires external source progress', () => {
       });
       world.sentMessages.push({
         idempotency_key: key,
-        recipient: 'xo',
+        recipient: 'major-build',
         body: 'ruling reminder',
         createdAt: new Date(T0 - 30_000).toISOString(),
       });
       const deps = makeDeps(world, {
         getDispatchMessageById: (async () => ({
           id: rulingId,
-          recipient: 'xo',
-          resolved_recipient: 'xo',
+          recipient: 'major-build',
+          resolved_recipient: 'major-build',
           acknowledged_at: testCase.acknowledged_at,
           addressed_at: testCase.addressed_at,
           addressed_by: testCase.addressed_by,
@@ -1470,11 +2037,13 @@ describe('SC7 grading requires external source progress', () => {
 
       await tick(createTaskmasterState(60_000), deps);
 
-      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBeNull();
+      expect(world.journal.find(row => row.id === `journal-${testCase.name}`)?.grade).toBe(
+        testCase.expected
+      );
     }
   });
 
-  test('a cancelled effect is noise and an unchanged P0 source is not useful', async () => {
+  test('a cancelled effect is unheard (never delivered) and an unchanged P0 source is not useful', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     const key = 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#1600:1';
@@ -1515,7 +2084,9 @@ describe('SC7 grading requires external source progress', () => {
 
     await tick(createTaskmasterState(60_000), deps);
 
-    expect(world.journal.find(row => row.id === 'cancelled-escalation')?.grade).toBe('noise');
+    // M-155 Amendment 03: a cancelled dispatch was never delivered, so it is
+    // 'unheard' (excluded from the floor denominator), not 'noise'.
+    expect(world.journal.find(row => row.id === 'cancelled-escalation')?.grade).toBe('unheard');
   });
 
   test('a post-send assignment event makes a P0 escalation useful', async () => {
@@ -1538,9 +2109,12 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: key,
-      recipient: 'operator',
+      // Heard channel + ack so the M-155 Amendment 03 heard gate passes and this
+      // test exercises the P0 escalation useful path (post-send assignment).
+      recipient: 'major-build',
       body: 'escalate',
       createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
@@ -1580,9 +2154,13 @@ describe('SC7 grading requires external source progress', () => {
     });
     world.sentMessages.push({
       idempotency_key: key,
-      recipient: 'operator',
+      // Heard channel + ack so this test exercises the "pre-existing assignee
+      // (no post-send event) is not useful proof" gate rather than the M-155
+      // Amendment 03 'unheard' gate.
+      recipient: 'major-build',
       body: 'escalate',
       createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
     });
     const deps = makeDeps(world, {
       getGithubIssueEvidence: async () => ({
@@ -1602,6 +2180,325 @@ describe('SC7 grading requires external source progress', () => {
     expect(
       world.journal.find(row => row.id === 'preexisting-assignee-escalation')?.grade
     ).toBeNull();
+  });
+});
+
+describe('M-155 Amendment 03: unheard grade (WO-HARNESS-TASKMASTER-UNHEARD-GRADE-01)', () => {
+  // Helper: seed a single sent escalate_p0 action + its dispatch row.
+  function seedSentEscalation(
+    world: FakeWorld,
+    opts: {
+      id: string;
+      recipient: string;
+      acknowledged_at?: string | null;
+      deadlineMsFromNow?: number;
+    }
+  ): void {
+    const key = `tm:escalate_p0:gh:thinmansoftware/bdc-xo#${opts.id}:1`;
+    world.journal.push({
+      id: `journal-${opts.id}`,
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: `gh:thinmansoftware/bdc-xo#${opts.id}`,
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'P0 source claim after send',
+      proof_deadline_at: new Date(T0 + (opts.deadlineMsFromNow ?? 60_000)).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: opts.recipient,
+      body: 'escalate',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: opts.acknowledged_at ?? null,
+    });
+  }
+
+  test('scenario 1: an unread drain_on_start send with no ack is graded unheard', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    // recipient operator == drain_on_start; acknowledged_at null; deadline still
+    // in the future -> unheard is assigned immediately, without waiting.
+    seedSentEscalation(world, { id: '2200', recipient: 'operator', acknowledged_at: null });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.journal.find(row => row.id === 'journal-2200')?.grade).toBe('unheard');
+  });
+
+  test('scenario 2: an ack from a draining principal does not count -- still unheard', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    // operator is drain_on_start; even with acknowledged_at set, a drainer ack
+    // is not a human acknowledgement -> unheard.
+    seedSentEscalation(world, {
+      id: '2201',
+      recipient: 'operator',
+      acknowledged_at: new Date(T0 - 30_000).toISOString(),
+    });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.journal.find(row => row.id === 'journal-2201')?.grade).toBe('unheard');
+  });
+
+  test('scenario 3: an ack from a non-draining principal is heard (useful or noise)', async () => {
+    // 3a: heard + post-send movement -> useful.
+    const worldUseful = makeWorld();
+    seedDigestSent(worldUseful);
+    seedSentEscalation(worldUseful, {
+      id: '2202',
+      recipient: 'major-build', // worker_poll, not drain_on_start
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+    });
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(worldUseful, {
+        getGithubIssueEvidence: async () => ({
+          state: 'open',
+          updatedAt: new Date(T0 - 30_000).toISOString(),
+          labels: ['wo', 'P0'],
+          assigneeCount: 1,
+          closedAt: null,
+          assignedAt: new Date(T0 - 30_000).toISOString(),
+          activeStatusAt: null,
+          progressRecordedAt: null,
+        }),
+      })
+    );
+    expect(worldUseful.journal.find(row => row.id === 'journal-2202')?.grade).toBe('useful');
+
+    // 3b: heard + no movement + deadline passed -> noise (NOT unheard).
+    const worldNoise = makeWorld();
+    seedDigestSent(worldNoise);
+    seedSentEscalation(worldNoise, {
+      id: '2203',
+      recipient: 'major-build',
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+      deadlineMsFromNow: -1, // deadline already passed
+    });
+    await tick(createTaskmasterState(60_000), makeDeps(worldNoise));
+    expect(worldNoise.journal.find(row => row.id === 'journal-2203')?.grade).toBe('noise');
+  });
+
+  test('scenario 4: the useful-rate floor denominator excludes unheard (no auto-pause)', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    // 62 unheard + 1 useful, all already graded and inside the floor lookback.
+    // Only useful/noise count -> denominator = 1 (< USEFUL_RATE_MIN_GRADED),
+    // so the floor does not breach and the loop is NOT auto-paused. Were the 62
+    // unheard rows counted as noise instead, 1/63 = 1.6% < 40% would breach.
+    for (let i = 0; i < 62; i += 1) {
+      world.journal.push({
+        id: `unheard-${i}`,
+        created_at: new Date(T0).toISOString(),
+        thread_ref: `gh:thinmansoftware/bdc-xo#${3000 + i}`,
+        action_type: 'escalate_p0',
+        proposal_json: '{}',
+        idempotency_key: `tm:escalate_p0:unheard:${i}`,
+        before_hash: null,
+        proof_predicate: 'P0 source claim after send',
+        proof_deadline_at: null,
+        outcome: 'sent',
+        graded_at: new Date(T0).toISOString(),
+        grade: 'unheard',
+      });
+    }
+    world.journal.push({
+      id: 'useful-1',
+      created_at: new Date(T0).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#3100',
+      action_type: 'deliver_ruling',
+      proposal_json: '{}',
+      idempotency_key: 'tm:deliver_ruling:useful-1',
+      before_hash: null,
+      proof_predicate: 'original ruling addressed after send',
+      proof_deadline_at: null,
+      outcome: 'sent',
+      graded_at: new Date(T0).toISOString(),
+      grade: 'useful',
+    });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.control.pause_state).toBe('RUNNING');
+    expect(world.control.pause_actor).not.toBe('taskmaster:useful-rate-floor');
+  });
+
+  test('scenario 5: no regression on the useful/noise split for heard actions', async () => {
+    // Heard action (non-draining recipient + ack) with GitHub movement -> useful.
+    const worldUseful = makeWorld();
+    seedDigestSent(worldUseful);
+    const usefulKey = 'tm:nudge:gh:thinmansoftware/bdc-xo#2300:1';
+    worldUseful.journal.push({
+      id: 'heard-useful-nudge',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#2300',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: usefulKey,
+      before_hash: null,
+      proof_predicate: 'post-send source progress',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    worldUseful.sentMessages.push({
+      idempotency_key: usefulKey,
+      recipient: 'major-build',
+      body: 'nudge',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+    });
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(worldUseful, {
+        getGithubIssueEvidence: async () => ({
+          state: 'open',
+          updatedAt: new Date(T0 - 30_000).toISOString(),
+          labels: ['wo', 'prio:P1', 'status:building'],
+          assigneeCount: 0,
+          closedAt: null,
+          assignedAt: null,
+          activeStatusAt: null,
+          progressRecordedAt: new Date(T0 - 30_000).toISOString(),
+        }),
+      })
+    );
+    expect(worldUseful.journal.find(row => row.id === 'heard-useful-nudge')?.grade).toBe('useful');
+
+    // Heard action with no movement and deadline passed -> noise.
+    const worldNoise = makeWorld();
+    seedDigestSent(worldNoise);
+    const noiseKey = 'tm:nudge:gh:thinmansoftware/bdc-xo#2301:1';
+    worldNoise.journal.push({
+      id: 'heard-noise-nudge',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#2301',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: noiseKey,
+      before_hash: null,
+      proof_predicate: 'post-send source progress',
+      proof_deadline_at: new Date(T0 - 1).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    worldNoise.sentMessages.push({
+      idempotency_key: noiseKey,
+      recipient: 'major-build',
+      body: 'nudge',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+    });
+    await tick(createTaskmasterState(60_000), makeDeps(worldNoise));
+    expect(worldNoise.journal.find(row => row.id === 'heard-noise-nudge')?.grade).toBe('noise');
+  });
+
+  test('scenario 6: downstream movement on an unheard send is unheard, NOT useful', async () => {
+    // The heard gate precedes the useful/noise split (M-155 Amendment 03,
+    // spec section 3.2). recipient=operator (drain_on_start) with no ack means
+    // the send was never heard, so even a post-send GitHub assignment (which
+    // would otherwise grade 'useful') cannot be attributed to it. Prior to the
+    // fix this row graded 'useful' and falsely inflated the floor numerator.
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedSentEscalation(world, { id: '2204', recipient: 'operator', acknowledged_at: null });
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        getGithubIssueEvidence: async () => ({
+          state: 'open',
+          updatedAt: new Date(T0 - 30_000).toISOString(),
+          labels: ['wo', 'P0'],
+          assigneeCount: 1,
+          closedAt: null,
+          assignedAt: new Date(T0 - 30_000).toISOString(),
+          activeStatusAt: null,
+          progressRecordedAt: null,
+        }),
+      })
+    );
+    expect(world.journal.find(row => row.id === 'journal-2204')?.grade).toBe('unheard');
+  });
+
+  test('scenario 7: a cancelled dispatch is graded unheard, NOT noise', async () => {
+    // A cancelled dispatch was never delivered, so no principal could have heard
+    // it. Deadline is already past, so the pre-fix path forced 'noise' (into the
+    // floor denominator); the fix grades 'unheard' (excluded).
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#2205:1';
+    world.journal.push({
+      id: 'journal-2205',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#2205',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'P0 source claim after send',
+      proof_deadline_at: new Date(T0 - 1).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        findEffectByIdempotencyKey: async () => ({
+          id: key,
+          status: 'cancelled',
+          createdAt: new Date(T0 - 45_000).toISOString(),
+        }),
+      })
+    );
+    expect(world.journal.find(row => row.id === 'journal-2205')?.grade).toBe('unheard');
+  });
+
+  test('scenario 7b: a cancelled dispatch ACKED by a non-draining principal stays eligible for useful/noise', async () => {
+    // Cancellation is not itself proof of deafness. This row was acknowledged
+    // by 'major-build' (worker_poll => NOT drain_on_start) before it was
+    // cancelled, so a human provably read it. It must therefore receive the
+    // same heard classification as any other dispatch and fall through to the
+    // normal useful/noise evaluation -- here: heard, deadline passed, no
+    // downstream movement => 'noise' (in the floor denominator). Grading it
+    // 'unheard' would wrongly excuse a genuinely-heard send from the floor.
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#2206:1';
+    seedSentEscalation(world, {
+      id: '2206',
+      recipient: 'major-build',
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+      deadlineMsFromNow: -1, // deadline already passed
+    });
+
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        // Mirror the default effect lookup, but report THIS row as cancelled so
+        // the cancelled branch is the path under test. Other rows (the digest
+        // seed) keep their normal status.
+        findEffectByIdempotencyKey: async (k: string) => {
+          const found = world.sentMessages.find(m => m.idempotency_key === k);
+          if (!found) return null;
+          return {
+            id: found.idempotency_key,
+            status: k === key ? 'cancelled' : 'queued',
+            createdAt: found.createdAt,
+          };
+        },
+      })
+    );
+
+    expect(world.journal.find(row => row.id === 'journal-2206')?.grade).toBe('noise');
   });
 });
 
@@ -1769,6 +2666,7 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     ]);
     const p0 = threads.find(t => t.ref.endsWith('#3'));
     expect(p0?.priority).toBe('P0');
+    expect(p0?.isUnclaimed).toBe(true);
     expect(p0?.isUnclaimedP0).toBe(true);
   });
 
@@ -1782,6 +2680,8 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
         ghIssue(14, ['wo', 'priority-ish:p1']),
         ghIssue(15, ['wo', 'P0', 'status:blocked']),
         ghIssue(16, ['wo', 'P0', 'status:review']),
+        ghIssue(17, ['wo', 'P2', 'status:hold']),
+        ghIssue(18, ['wo', 'P3', 'status:building']),
       ],
     });
 
@@ -1789,9 +2689,20 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     const byNumber = new Map(threads.map(thread => [Number(thread.ref.split('#')[1]), thread]));
     expect([10, 11, 12].map(number => byNumber.get(number)?.priority)).toEqual(['P1', 'P1', 'P1']);
     expect(byNumber.get(13)?.priority).toBe('P0');
-    expect(byNumber.get(14)?.priority).toBe('P2');
+    expect(byNumber.has(14)).toBe(false);
     expect(byNumber.get(15)?.isBlocked).toBe(true);
     expect(byNumber.get(16)?.isUnclaimedP0).toBe(false);
+    expect(byNumber.get(17)?.isBlocked).toBe(false);
+    expect(byNumber.get(17)?.isHeld).toBe(true);
+    expect(byNumber.get(18)?.isUnclaimed).toBe(false);
+  });
+
+  test('unlabelled_priority_surfaces_for_triage', async () => {
+    const { fetchImpl } = fakeGithubFetch({ wo: [ghIssue(44, ['wo'])] });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(0);
+    expect(threads.unlabelledPriorityTriage).toEqual(['gh:thinmansoftware/bdc-harness#44']);
+    expect(priorityFromLabels(['wo'])).toBeNull();
   });
 
   test('defaults to bdc-xo when TASKMASTER_GH_REPOS is unset', async () => {

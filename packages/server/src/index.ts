@@ -69,6 +69,7 @@ import {
   stopDispatchEscalationClock,
 } from './dispatch/escalation-clock';
 import { startReviewWorkerClock, stopReviewWorkerClock } from './dispatch/review-worker-clock';
+import { startDutyOfficerClock, stopDutyOfficerClock } from './dispatch/duty-officer-clock';
 import {
   observeStartupRecovery,
   reconcilePendingRunsAtBoot,
@@ -79,6 +80,8 @@ import { createMergeManager } from '@archon/overseer/merge-manager';
 import { resolveDefaultDeps } from '@archon/overseer/service';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
+import { ingestCheckCompletionEvent } from '@archon/overseer/pr-review-check-ingest';
+import { createRealRecheckIngestDeps } from '@archon/overseer/pr-review-check-wiring';
 import {
   handleMessage,
   pool,
@@ -192,7 +195,9 @@ function startOverseerRuntimeWithRealMergeManager(): void {
   }
   const deps = resolveDefaultDeps();
   const mergeManager = createMergeManager(deps);
-  startOverseerRuntime({ serviceOptions: { deps, mergeCoordinator: mergeManager } });
+  startOverseerRuntime({
+    serviceOptions: { deps, mergeCoordinator: mergeManager, mergeBridgeEnabled: true },
+  });
 }
 
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
@@ -608,6 +613,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   const reviewRouteConfig = resolveReviewRouteConfig();
   if (reviewRouteConfig) {
     const ingestDeps = createRealIngestDeps(reviewRouteConfig);
+    const recheckDeps = createRealRecheckIngestDeps(reviewRouteConfig);
     app.post('/webhooks/github/review', async c => {
       const eventType = c.req.header('x-github-event');
       const deliveryId = c.req.header('x-github-delivery');
@@ -615,15 +621,34 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // CRITICAL: raw body, never a re-serialized object -- the HMAC is
         // computed over the exact bytes GitHub sent.
         const rawBody = await c.req.text();
-        const result = await ingestPullRequestEvent(
-          {
-            rawBody,
-            signature: c.req.header('x-hub-signature-256'),
-            eventType,
-            deliveryId,
-          },
-          ingestDeps
-        );
+        // ONE ENDPOINT, TWO INGESTS (bdc-harness #782). GitHub delivers every
+        // subscribed event type to the same URL, so the split is by
+        // `x-github-event`, not by path: `pull_request` is the head-MOVED path
+        // (new commit -> new review), while `check_run` / `check_suite` /
+        // `workflow_run` completions are the SAME-head path (the code did not
+        // change, the evidence did). Each ingest verifies the signature itself
+        // over the raw body, so neither trusts the other's dispatch decision.
+        const isCheckCompletion =
+          eventType === 'check_run' || eventType === 'check_suite' || eventType === 'workflow_run';
+        const result = isCheckCompletion
+          ? await ingestCheckCompletionEvent(
+              {
+                rawBody,
+                signature: c.req.header('x-hub-signature-256'),
+                eventType,
+                deliveryId,
+              },
+              recheckDeps
+            )
+          : await ingestPullRequestEvent(
+              {
+                rawBody,
+                signature: c.req.header('x-hub-signature-256'),
+                eventType,
+                deliveryId,
+              },
+              ingestDeps
+            );
         getLog().info(
           {
             eventType,
@@ -654,6 +679,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       'overseer_review_route_not_configured: set OVERSEER_REVIEW_WEBHOOK_SECRET and OVERSEER_REVIEW_IDENTITY to enable'
     );
   }
+  startDutyOfficerClock();
 
   // Gitea webhook endpoint
   if (gitea) {
@@ -810,6 +836,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopProviderWaitScheduler();
     stopDispatchEscalationClock();
     stopReviewWorkerClock();
+    stopDutyOfficerClock();
     persistence.stopPeriodicFlush();
 
     // Await overseer watcher abort before flushing; bounded by the watcher's own

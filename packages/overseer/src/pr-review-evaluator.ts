@@ -1,7 +1,82 @@
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
+import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
+import { classifyJudgeOutage, type JudgeOutage } from './judge-ladder-health';
+import { createLogger } from '@archon/paths';
+import {
+  buildJudgeTransport,
+  defaultJudgeChildSpawn,
+  deliverStdin,
+  destroyStdin,
+  removeJudgeTransportFiles,
+  type JudgeChild,
+  type JudgeChildSpawn,
+  type JudgeTransport,
+} from './judge-transport';
 
-export type PrReviewVerdict = 'APPROVE' | 'REQUEST_CHANGES' | 'INDETERMINATE' | 'CHECKS_PENDING';
+/**
+ * Observability gap found 2026-09-17: this ladder loop classifies a per-rung
+ * reason precisely (`lastError = model_timeout:${binary}`,
+ * `model_exit_nonzero:${binary}`, etc.) but never logged it and never
+ * persisted it -- the dispatch result_body and the posted PR comment both
+ * collapse to one generic `indeterminate:model_timeout` with no way to tell,
+ * after the fact, which rung actually failed or why. That made a live "why is
+ * review failing, I thought it ran on Grok too" question undiagnosable from
+ * logs or the database; answering it required live process-spawn tracing.
+ * These log lines are the fix -- not a new mechanism, just making the
+ * classification that already exists observable.
+ */
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+function getLog(): ReturnType<typeof createLogger> {
+  if (!cachedLog) cachedLog = createLogger('overseer.pr-review-evaluator');
+  return cachedLog;
+}
+
+/**
+ * CHECKS_UNAVAILABLE (#775) is TERMINAL and NON-APPROVING: the required
+ * status-check contexts could not be read after the configured attempt bound,
+ * so no verdict can be formed and deferring further would park the PR forever.
+ * It is distinct from CHECKS_PENDING (retry later) and from REQUEST_CHANGES
+ * (a real code finding) -- nothing was found wrong with the code; the reviewer
+ * simply could not see what CI is mandatory.
+ *
+ * TRANSPORT_ERROR is NON-TERMINAL and NON-JUDGING: the judge process could not
+ * be reached at all (argument-list-too-long, spawn failure, timeout), so no
+ * evidence was ever read by a model and no verdict formed. It is distinct from
+ * INDETERMINATE (terminal -- the model looked and could not decide) and from
+ * CHECKS_PENDING (CI still running).
+ *
+ * The distinction IS the bug this fixes. Passing the whole prompt as one argv
+ * element hit Linux MAX_ARG_STRLEN (131,072 bytes per argument) on any PR whose
+ * diff exceeded roughly 128 KB; Bun.spawn raised E2BIG, both ladder binaries
+ * failed identically, and `indeterminate()` was returned -- a TERMINAL
+ * non-approving verdict posted as CHANGES_REQUESTED with no stated reason.
+ * Observed live 2026-09-07 on bdc-harness #776 (139,527-byte diff) and #786
+ * (140,491), three times each. A transport failure says nothing about the code,
+ * so it defers and retries instead of blocking the PR.
+ *
+ * RATE_LIMITED (#782 part 2) is NON-TERMINAL and NON-JUDGING: the GitHub client
+ * exhausted its rate budget mid-review, so no evidence could be read and no
+ * verdict formed. It is distinct from INDETERMINATE (terminal -- the reviewer
+ * looked and could not decide), from TRANSPORT_ERROR (the judge process itself
+ * was unreachable) and from CHECKS_PENDING (CI is still running).
+ *
+ * The distinction is the bug: a rate limit used to fall into the generic
+ * evidence-error branch and become INDETERMINATE, a TERMINAL non-approving
+ * verdict that retired the review and left the PR's stale verdict standing
+ * forever. Observed live 2026-09-07 on bdc-harness #776 @c3935e09 (two
+ * INDETERMINATE verdicts, the second during a per-user rate-limit exhaustion).
+ * A rate limit is "come back at T", so it carries a retry instant and the work
+ * item re-enters the queue then.
+ */
+export type PrReviewVerdict =
+  | 'APPROVE'
+  | 'REQUEST_CHANGES'
+  | 'INDETERMINATE'
+  | 'CHECKS_PENDING'
+  | 'CHECKS_UNAVAILABLE'
+  | 'TRANSPORT_ERROR'
+  | 'RATE_LIMITED';
 
 export interface PrReviewInput {
   owner: string;
@@ -24,12 +99,34 @@ export interface PrReviewResult {
   reviewer: ReviewAgentIdentity;
   acceptance_criteria_available: boolean;
   error?: string;
+  /**
+   * Set only on RATE_LIMITED. Absolute instant (ISO-8601) the GitHub budget is
+   * expected to have refilled, taken from the response's `retry-after` or
+   * `x-ratelimit-reset` header. The worker uses it verbatim as the work item's
+   * `not_before`, so the review resumes exactly when it can succeed rather than
+   * spinning against a limit that is still exhausted (#774).
+   */
+  retry_after?: string;
+  /**
+   * Milliseconds the caller should wait before re-attempting. Set on
+   * TRANSPORT_ERROR (the judge process was never reached, so retrying is the
+   * correct response -- but not instantly, or a persistent spawn failure would
+   * spin the worker every tick) and alongside `retry_after` on RATE_LIMITED for
+   * callers that prefer a duration to an instant.
+   */
+  retry_after_ms?: number;
 }
 
 export interface PrReviewModelResult {
   exitCode: number;
   stdout: string;
   timedOut: boolean;
+  /**
+   * Raw stderr of the judge process (#847). `stdout` falls back to stderr only
+   * when stdout is empty, so a refusal printed alongside partial stdout was
+   * invisible to classification. Optional so existing doubles keep compiling.
+   */
+  stderr?: string;
 }
 
 export interface PrReviewDeps {
@@ -63,10 +160,18 @@ export interface PrReviewDeps {
   fetchAcceptanceCriteria(woId: string): Promise<string | null>;
   invokeModel(binary: string, prompt: string): Promise<PrReviewModelResult>;
   ladder?: readonly string[];
+  /**
+   * Per-rung outage seam (#847). Called with the classified quota / credit /
+   * auth refusal when a rung is refused, and with `null` when a rung exits 0
+   * (proof the rung is back). The real binding is `recordJudgeRungOutage` in
+   * judge-ladder-health.ts; test doubles collect the calls. Optional so
+   * existing dependency doubles keep compiling.
+   */
+  recordRungOutage?(binary: string, outage: JudgeOutage | null): void;
 }
 
 interface ParsedReviewVerdict {
-  verdict: Exclude<PrReviewVerdict, 'INDETERMINATE' | 'CHECKS_PENDING'>;
+  verdict: Exclude<PrReviewVerdict, 'INDETERMINATE' | 'CHECKS_PENDING' | 'CHECKS_UNAVAILABLE'>;
   findings: IndependentReviewFinding[];
   reviewed_head_sha: string;
 }
@@ -166,6 +271,95 @@ function indeterminate(
 }
 
 /**
+ * Default backoff before a transport-failed review is re-attempted. Kept short
+ * relative to the worker tick: the usual cause (a transient spawn failure, a
+ * busy judge host) clears quickly, and a genuinely permanent one is visible in
+ * the receipt reason rather than hidden behind a long wait.
+ */
+export const TRANSPORT_ERROR_RETRY_MS = 60_000;
+
+/**
+ * Error text fragments that mark a failure of TRANSPORT rather than of
+ * judgment: the judge process was never successfully reached, so nothing about
+ * the code was evaluated.
+ *
+ * E2BIG / 'argument list too long' is the anchor case -- see the
+ * TRANSPORT_ERROR doc comment. The spawn-family codes are included because a
+ * missing or unlaunchable binary is the same class of failure from the PR's
+ * point of view: no review happened, so no verdict may be posted at the head.
+ */
+const TRANSPORT_ERROR_PATTERNS: readonly RegExp[] = [
+  /e2big/i,
+  /argument list too long/i,
+  /enoent/i,
+  /eacces/i,
+  /enomem/i,
+  /eagain/i,
+  /spawn/i,
+  /failed to (?:spawn|start)/i,
+  /posix_spawn/i,
+];
+
+/**
+ * True when an error raised out of the model seam is a transport failure.
+ *
+ * Deliberately conservative: an unrecognized error still maps to INDETERMINATE,
+ * so a real judgment failure (bad output, refused request) can never become an
+ * endless deferral loop.
+ */
+export function isTransportError(error: unknown): boolean {
+  const code =
+    error && typeof error === 'object' && 'code' in error
+      ? String((error as { code: unknown }).code)
+      : '';
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  const haystack = `${code} ${message}`;
+  return TRANSPORT_ERROR_PATTERNS.some(pattern => pattern.test(haystack));
+}
+
+/**
+ * Build the non-terminal TRANSPORT_ERROR result.
+ *
+ * `findings` is empty and `approved` is never derived from this verdict: the
+ * judge was never reached, so it says nothing about the code. The submit path
+ * must not collapse it into `approved: false`, which would post
+ * REQUEST_CHANGES on argument-size grounds -- the same class of bug as the
+ * CHECKS_PENDING collapse this codebase already fixed.
+ */
+function transportError(
+  input: PrReviewInput,
+  deps: PrReviewDeps,
+  acceptanceCriteriaAvailable: boolean,
+  error: string
+): PrReviewResult {
+  return {
+    verdict: 'TRANSPORT_ERROR',
+    findings: [],
+    reviewed_head_sha: input.head_sha,
+    reviewer: deps.reviewer,
+    acceptance_criteria_available: acceptanceCriteriaAvailable,
+    error,
+    retry_after_ms: TRANSPORT_ERROR_RETRY_MS,
+  };
+}
+
+/**
+ * The safe, postable half of an evaluator error string.
+ *
+ * Evaluator errors are shaped `code:detail` (`model_error:E2BIG ...`,
+ * `model_timeout:codex`, `evidence_error:<api message>`). Only the code before
+ * the FIRST colon may ever reach GitHub: the detail half carries model output,
+ * API messages, and binary names that can embed tokens or provider internals.
+ * Reduced to a conservative identifier charset so a malformed error can never
+ * smuggle text through.
+ */
+export function reviewErrorCode(error: string | undefined): string | null {
+  if (!nonEmpty(error)) return null;
+  const code = error.split(':', 1)[0]?.trim() ?? '';
+  return /^[a-z0-9_]{1,40}$/.test(code) ? code : null;
+}
+
+/**
  * Terminality of a PR's check suite for review purposes.
  *
  * The reviewer must not judge "did the tests pass" while checks are still
@@ -213,6 +407,33 @@ export function checksAreTerminal(
   return checks.length > 0 && allReportedCompleted;
 }
 
+/**
+ * Build the non-terminal RATE_LIMITED result.
+ *
+ * `findings` is empty and `approved` is never derived from this verdict: a rate
+ * limit says nothing about the code. The submit path must not collapse it into
+ * `approved: false`, which would post REQUEST_CHANGES on rate-limit grounds --
+ * the same class of bug as the CHECKS_PENDING collapse this codebase already
+ * fixed.
+ */
+function rateLimited(
+  input: PrReviewInput,
+  deps: PrReviewDeps,
+  classification: RateLimitClassification,
+  stage: string
+): PrReviewResult {
+  return {
+    verdict: 'RATE_LIMITED',
+    findings: [],
+    reviewed_head_sha: input.head_sha,
+    reviewer: deps.reviewer,
+    acceptance_criteria_available: false,
+    error: `rate_limited:${stage}:${classification.kind}:${classification.source}`,
+    retry_after: classification.retryAfter,
+    retry_after_ms: classification.retryAfterMs,
+  };
+}
+
 function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult {
   return {
     verdict: 'CHECKS_PENDING',
@@ -232,11 +453,45 @@ export async function evaluatePullRequest(
     return indeterminate(input, deps, false, 'reviewer_identity_missing');
   }
 
-  let evidence: { diff: string; checks: PrReviewCheck[]; requiredContexts?: string[] | null };
+  let evidence: {
+    diff: string;
+    checks: PrReviewCheck[];
+    requiredContexts?: string[] | null;
+    requiredContextsBlocked?: { reason: string; attempts: number; failureKind: string };
+  };
   try {
     evidence = await deps.fetchEvidence(input);
   } catch (error) {
+    // RATE LIMIT IS A DEFERRAL, NOT A VERDICT (#782 part 2). Checked BEFORE the
+    // generic evidence-error branch: a 403/429 carrying rate-limit headers used
+    // to fall through to INDETERMINATE, which is TERMINAL -- the review was
+    // retired and the PR kept whatever stale verdict it had, with nothing ever
+    // retrying (#776 @c3935e09, 2026-09-07). An unrecognized error still maps to
+    // INDETERMINATE, so a genuine permission failure cannot become an endless
+    // deferral loop (#774).
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) return rateLimited(input, deps, rateLimit, 'fetch_evidence');
     return indeterminate(input, deps, false, `evidence_error:${errorMessage(error)}`);
+  }
+
+  // BOUNDED DEFERRAL, ESCALATING (#775). The required-contexts lookup has now
+  // failed on consecutive attempts past its bound. Stop deferring -- but do NOT
+  // proceed to the reported-checks heuristic, which would approve on evidence
+  // the reviewer just admitted it cannot see. Terminal and non-approving; the
+  // submit path turns this into a PR comment plus an operator escalation.
+  //
+  // Checked BEFORE checksAreTerminal so the outcome cannot depend on what the
+  // reported checks happen to say: green reported checks with unknown mandatory
+  // contexts must block exactly like red ones.
+  if (evidence.requiredContextsBlocked) {
+    return {
+      verdict: 'CHECKS_UNAVAILABLE',
+      findings: [],
+      reviewed_head_sha: input.head_sha,
+      reviewer: deps.reviewer,
+      acceptance_criteria_available: false,
+      error: `${evidence.requiredContextsBlocked.reason}:attempts=${evidence.requiredContextsBlocked.attempts}:reason=${evidence.requiredContextsBlocked.failureKind}`,
+    };
   }
 
   // Defer (never REQUEST_CHANGES) until CI checks on the exact head are
@@ -267,21 +522,80 @@ export async function evaluatePullRequest(
   });
   const ladder = deps.ladder ?? defaultReviewLadder();
   let lastError = 'model_unavailable';
+  // TRANSPORT vs JUDGMENT across the whole ladder.
+  //
+  // Deferral requires that EVERY rung failed on transport. A single
+  // non-transport failure anywhere makes the whole attempt TERMINAL
+  // (INDETERMINATE), because a judgment failure that deferred would retry
+  // forever and never post a verdict.
+  //
+  // Two distinct ways a rung can prove the failure is NOT purely transport:
+  //   - `reachedAnyRung`: the process ran and returned output to judge, so
+  //     anything after that (bad output, non-zero exit) is judgment.
+  //   - `nonTransportFailure`: the rung threw, but `isTransportError` says the
+  //     throw was not a transport problem -- e.g. `401 unauthorized`. Nothing
+  //     was returned, so `reachedAnyRung` stays false, yet retrying forever is
+  //     still wrong because the error will recur.
+  //
+  // Review findings (Overseer, PR #790 then #799): a sticky "saw transport"
+  // flag was wrong twice over. First a dead rung (codex ENOENT) outvoted a
+  // later rung that ran and returned invalid output; `reachedAnyRung` fixed
+  // that. Then a dead rung still outvoted a later rung that threw a
+  // NON-transport error (ENOENT then 401), because a throw sets neither flag --
+  // which `nonTransportFailure` fixes. Both flags are set-once and never
+  // cleared, so rung ORDER cannot change the classification.
+  let reachedAnyRung = false;
+  let nonTransportFailure = false;
+  let transportFailure: string | null = null;
   for (const binary of ladder) {
     if (!nonEmpty(binary)) continue;
+    const rungStartedAt = Date.now();
+    getLog().info(
+      { binary, promptBytes: prompt.length, prNumber: input.pr_number, headSha: input.head_sha },
+      'judge_rung_started'
+    );
     try {
       const result = await deps.invokeModel(binary, prompt);
+      const rungMs = Date.now() - rungStartedAt;
       if (result.timedOut) {
+        // A timeout is transport, not judgment: the process started but never
+        // delivered anything to judge, so this rung was not reached.
         lastError = `model_timeout:${binary}`;
+        transportFailure ??= lastError;
+        getLog().warn({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_timeout');
         continue;
       }
+      // The process ran and returned. Whatever happens below is judgment.
+      reachedAnyRung = true;
       if (result.exitCode !== 0) {
-        lastError = `model_exit_nonzero:${binary}`;
+        // QUOTA / CREDIT / AUTH REFUSALS ARE NAMED, NOT HIDDEN (#847). The
+        // process ran, so this is still a JUDGMENT failure and still terminal
+        // exactly as before -- but `model_exit_nonzero` told nobody that codex
+        // had hit its usage limit and grok had no credits (2026-09-14, every
+        // review from ~20:45Z). The code now says which, and the rung's outage
+        // is reported so the ladder breaker can stop spawning dead rungs.
+        const outage = classifyJudgeOutage(`${result.stderr ?? ''}\n${result.stdout}`);
+        if (outage) deps.recordRungOutage?.(binary, outage);
+        lastError = outage ? outage.code : `model_exit_nonzero:${binary}`;
+        getLog().warn(
+          {
+            binary,
+            rungMs,
+            exitCode: result.exitCode,
+            outageCode: outage?.code ?? null,
+            prNumber: input.pr_number,
+          },
+          'judge_rung_nonzero_exit'
+        );
         continue;
       }
+      // A clean exit proves the rung has quota, credits, and credentials.
+      deps.recordRungOutage?.(binary, null);
+      getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_clean_exit');
       const parsed = parseReviewVerdict(result.stdout);
       if (!parsed) {
         lastError = `model_output_invalid:${binary}`;
+        getLog().warn({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_output_invalid');
         continue;
       }
       try {
@@ -289,19 +603,78 @@ export async function evaluatePullRequest(
       } catch {
         return indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch');
       }
+      getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_verdict_produced');
       return {
         ...parsed,
         reviewer: { provider: deps.reviewer.provider, model: binary },
         acceptance_criteria_available: acceptanceCriteriaAvailable,
       };
     } catch (error) {
+      const rungMs = Date.now() - rungStartedAt;
+      // A rate limit raised by the model seam (the judge CLIs read GitHub too)
+      // is the same deferral, and must abandon the ladder immediately: walking
+      // to the next binary would spend more of a budget that is already
+      // exhausted and end at INDETERMINATE anyway.
+      const rateLimit = classifyRateLimitError(error);
+      if (rateLimit) {
+        getLog().warn({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_rate_limited');
+        return rateLimited(input, deps, rateLimit, `invoke_model:${binary}`);
+      }
+      // A thrown quota/credit/auth refusal (#847) is the same judgment failure
+      // as a non-zero exit carrying that text: the rung was reachable and the
+      // error will recur, so it is terminal and named. Classified on the FULL
+      // message -- the Codex retry date sits past the 120-char slice that
+      // `errorMessage` keeps for the detail half.
+      const outage = classifyJudgeOutage(
+        error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+      );
+      if (outage) {
+        deps.recordRungOutage?.(binary, outage);
+        lastError = outage.code;
+        nonTransportFailure = true;
+        getLog().warn(
+          { binary, rungMs, outageCode: outage.code, prNumber: input.pr_number },
+          'judge_rung_thrown_outage'
+        );
+        continue;
+      }
       lastError = `model_error:${errorMessage(error)}`;
+      if (isTransportError(error)) {
+        // E2BIG and friends: the process never ran, so this rung was not reached.
+        transportFailure ??= lastError;
+      } else {
+        // A real error from a rung that was reachable (401, refused request,
+        // provider fault). Retrying cannot help, so this makes the attempt
+        // terminal even if another rung failed on transport.
+        nonTransportFailure = true;
+      }
+      getLog().warn(
+        {
+          binary,
+          rungMs,
+          errorMessage: error instanceof Error ? error.message : String(error),
+          isTransport: isTransportError(error),
+          prNumber: input.pr_number,
+        },
+        'judge_rung_thrown_error'
+      );
     }
+  }
+  // Defer ONLY when every rung failed on transport: nothing was ever judged
+  // (`reachedAnyRung`) and nothing threw a non-transport error
+  // (`nonTransportFailure`). Either one makes the outcome terminal.
+  getLog().info(
+    { prNumber: input.pr_number, lastError, transportFailure, reachedAnyRung, nonTransportFailure },
+    'judge_ladder_exhausted'
+  );
+  if (transportFailure && !reachedAnyRung && !nonTransportFailure) {
+    return transportError(input, deps, acceptanceCriteriaAvailable, transportFailure);
   }
   return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError);
 }
 
-function defaultReviewLadder(): string[] {
+/** The configured judge ladder, cheapest first. Exported for the breaker (#847). */
+export function defaultReviewLadder(): string[] {
   return (process.env.OVERSEER_JUDGE_LADDER ?? 'grok')
     .split(',')
     .map(value => value.trim())
@@ -314,38 +687,132 @@ export function configuredReviewIdentity(): ReviewAgentIdentity {
   return { provider: 'cli', model };
 }
 
+/** Default judge wall clock; override with OVERSEER_REVIEW_MODEL_TIMEOUT_MS. */
+export const DEFAULT_REVIEW_MODEL_TIMEOUT_MS = 60_000;
+
+export function resolveReviewModelTimeoutMs(
+  env: Record<string, string | undefined> = process.env
+): number {
+  const parsed = Number(env.OVERSEER_REVIEW_MODEL_TIMEOUT_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_REVIEW_MODEL_TIMEOUT_MS;
+}
+
+/**
+ * How one judge binary receives the review prompt: judge-transport.ts, shared
+ * with judge-first.ts and judge-second-opinion.ts since #852. The per-binary
+ * argv shapes, the never-in-argv rule (Linux MAX_ARG_STRLEN; #776/#786) and
+ * the private prompt-file hygiene are documented there. This path delegates
+ * and sends exactly what it sent before.
+ */
+export { DEFAULT_CURSOR_JUDGE_MODEL, resolveCursorJudgeModel } from './judge-transport';
+
+/** Exported for the permission test; not part of the review API surface. */
+export async function buildReviewModelTransport(
+  binary: string,
+  prompt: string
+): Promise<JudgeTransport> {
+  return buildJudgeTransport(binary, prompt);
+}
+
 export async function invokeConfiguredReviewModel(
   binary: string,
   prompt: string,
-  timeoutMs = 60_000
+  timeoutMs = resolveReviewModelTimeoutMs()
 ): Promise<PrReviewModelResult> {
-  const argv =
-    binary === 'codex'
-      ? ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check', prompt]
-      : [binary, '-p', prompt];
-  const subprocess = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
+  const transport = await buildReviewModelTransport(binary, prompt);
+  try {
+    return await runReviewModelProcess(transport, binary, timeoutMs);
+  } finally {
+    // Always in a finally: the prompt holds the private diff, so it must not
+    // outlive the judge process on any path -- success, throw, or timeout.
+    await removeJudgeTransportFiles(transport);
+  }
+}
+
+/**
+ * The subset of a spawned child this module uses (JudgeChild in
+ * judge-transport.ts, shared with the other two judge seams). Declared so a
+ * test can supply a double -- notably one that never READS stdin, which is the
+ * only way to exercise the pipe back-pressure path deterministically.
+ */
+export type ReviewModelChild = JudgeChild;
+
+export type ReviewModelSpawn = JudgeChildSpawn;
+
+/** Exported for the back-pressure test; not part of the review API surface. */
+export async function runReviewModelProcess(
+  transport: JudgeTransport,
+  binary: string,
+  timeoutMs: number,
+  spawn: ReviewModelSpawn = defaultJudgeChildSpawn
+): Promise<PrReviewModelResult> {
+  const subprocess = spawn(transport.argv, transport.stdinPrompt === undefined ? 'ignore' : 'pipe');
+
+  // ARM THE WALL CLOCK FIRST -- before any stdin delivery.
+  //
+  // Writing the prompt is itself a blocking operation that can hang forever: a
+  // child that starts but never READS stdin fills the OS pipe buffer (~64 KB on
+  // Linux) and the write back-pressures, so `await stdin.end()` never settles.
+  // The prompt here is a full PR diff, routinely far larger than that buffer.
+  // Arming the timer after the write -- as this did -- meant
+  // OVERSEER_REVIEW_MODEL_TIMEOUT_MS bounded only the model's THINKING time, not
+  // the call, and a non-consuming child hung the review worker indefinitely with
+  // no timeout, no verdict and no deferral.
   let timeout: Timer | undefined;
+  let timedOut = false;
   const timeoutResult = new Promise<PrReviewModelResult>(resolve => {
     timeout = setTimeout(() => {
+      timedOut = true;
+      // Kill the child AND tear down the writer. Killing alone is not enough:
+      // the pending write is parked on a pipe whose reader is gone, so the
+      // writer must be destroyed for the awaited write to settle (as an
+      // EPIPE/abort rejection, swallowed below) instead of hanging on.
       subprocess.kill();
+      destroyStdin(subprocess.stdin);
       resolve({ exitCode: 124, stdout: '', timedOut: true });
     }, timeoutMs);
   });
+
+  // Deliver the prompt WITHOUT awaiting it here: the delivery promise races the
+  // timeout alongside the process itself, so a stalled write can never outlive
+  // the wall clock. Its rejection is handled inside deliverStdin, which keeps a
+  // child that exits early (EPIPE on a closed pipe) from surfacing as an
+  // unhandled rejection.
+  const delivery =
+    transport.stdinPrompt === undefined
+      ? Promise.resolve()
+      : deliverStdin(subprocess.stdin, transport.stdinPrompt);
+
   const processResult = (async (): Promise<PrReviewModelResult> => {
+    // Never block on delivery completing: a child may legitimately exit before
+    // consuming the whole prompt, which settles this as an EPIPE no-op.
+    void delivery;
     const [exitCode, stdout, stderr] = await Promise.all([
       subprocess.exited,
       new Response(subprocess.stdout).text(),
       new Response(subprocess.stderr).text(),
     ]);
     const payload = stdout.trim().length > 0 ? stdout : stderr;
-    return { exitCode, stdout: normalizeModelOutput(binary, payload), timedOut: false };
+    // A kill fired by the timeout also settles `exited`; report that as the
+    // timeout it is rather than as a spurious non-zero exit.
+    if (timedOut) return { exitCode: 124, stdout: '', timedOut: true };
+    return { exitCode, stdout: normalizeModelOutput(binary, payload), stderr, timedOut: false };
   })();
   const result = await Promise.race([processResult, timeoutResult]);
   if (timeout) clearTimeout(timeout);
+  // The child must never outlive this call: on the timeout path the kill above
+  // already fired, but a race won by processResult can still leave the writer
+  // parked if the child exited without draining stdin.
+  destroyStdin(subprocess.stdin);
   return result;
 }
 
 function normalizeModelOutput(binary: string, stdout: string): string {
+  // cursor-agent --print returns the assistant's final text verbatim; models
+  // routinely wrap a JSON answer in a markdown fence, which JSON.parse rejects.
+  // Stripping ONE outer fence is presentation, not judgment: an answer that is
+  // not the required JSON object still fails parseReviewVerdict as before.
+  if (binary === 'cursor') return stripMarkdownFence(stdout);
   if (binary !== 'codex') return stdout;
   const lines = stdout.split(/\r?\n/);
   const start = lines.lastIndexOf('codex');
@@ -353,6 +820,12 @@ function normalizeModelOutput(binary: string, stdout: string): string {
   const rest = lines.slice(start + 1);
   const end = rest.findIndex(line => /^tokens used/i.test(line.trim()));
   return (end === -1 ? rest : rest.slice(0, end)).join('\n').trim();
+}
+
+function stripMarkdownFence(text: string): string {
+  const trimmed = text.trim();
+  const match = /^```[A-Za-z0-9_-]*\r?\n([\s\S]*?)\r?\n```$/.exec(trimmed);
+  return match?.[1]?.trim() ?? trimmed;
 }
 
 function errorMessage(error: unknown): string {

@@ -43,6 +43,8 @@ const KNOWN_PRINCIPALS = [
   ['codex', 'Codex', 'worker_poll', 1],
   ['codex-mcp', 'Codex MCP', 'worker_poll', 1],
   ['cursor', 'Cursor', 'worker_poll', 1],
+  ['do', 'Duty Officer alias', 'worker_poll', 1],
+  ['duty-officer', 'Duty Officer', 'worker_poll', 1],
   ['fusion', 'Fusion', 'worker_poll', 1],
   ['grok', 'Grok', 'worker_poll', 1],
   ['grok-acp', 'Grok ACP', 'worker_poll', 1],
@@ -804,7 +806,12 @@ function assertFirstMigration(
       `expected ${expectedHeartbeats} heartbeat rows, found ${after.heartbeatRows}`
     );
   }
-  if (after.otherHeartbeatRows !== 0 || after.otherNonNormalRows !== 0) {
+  // Backfill rules apply only when introducing priority. Existing priorities
+  // must instead remain unchanged, as verified by the state digest above.
+  if (
+    !before.messageColumns.includes('priority') &&
+    (after.otherHeartbeatRows !== 0 || after.otherNonNormalRows !== 0)
+  ) {
     throw new SmokeFailure('migration_priority_validation_failed');
   }
   if (after.missingLivePrincipalRows !== 0) {

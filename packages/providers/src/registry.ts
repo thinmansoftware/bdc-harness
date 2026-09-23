@@ -25,6 +25,7 @@ import {
   registerOprZeroProvider,
 } from './community/glm/registration';
 import { registerGrokAgentProvider } from './community/grok/registration';
+import { registerCursorAgentProvider } from './community/cursor/registration';
 import { GlmProvider } from './community/glm/provider';
 import { UnknownProviderError } from './errors';
 import { createLogger } from '@archon/paths';
@@ -201,6 +202,9 @@ export function registerCommunityProviders(): void {
   // WO-HARNESS-GROK-AGENT-PROVIDER-01: tool-capable Grok implement seat (OpenRouter
   // + local tool loop). Chat-only opr must NOT be used for implement.
   registerGrokAgentProvider();
+  // PR #848: Cursor rail -- local cursor-agent CLI on the operator's Cursor
+  // subscription. Build-capable; used by bdc-feature-development-cursor.
+  registerCursorAgentProvider();
 }
 
 /** @internal Test-only -- clears the registry. Not for production use. */

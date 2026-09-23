@@ -73,3 +73,10 @@ export {
   registerGrokAgentProvider,
   type GrokAgentProviderDefaults,
 } from './community/grok';
+
+export {
+  CursorAgentProvider,
+  parseCursorAgentConfig,
+  registerCursorAgentProvider,
+  type CursorAgentProviderDefaults,
+} from './community/cursor';

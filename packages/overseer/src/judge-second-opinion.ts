@@ -1,5 +1,13 @@
 import type { GrokDispositionReceipt, GrokJudgeEvidence } from './types.ts';
 import { recordSpawnOutcome } from './model-resource-health.js';
+import {
+  buildJudgeTransport,
+  defaultJudgeChildSpawn,
+  deliverStdin,
+  destroyStdin,
+  removeJudgeTransportFiles,
+  type JudgeChildSpawn,
+} from './judge-transport';
 import { createLogger } from '@archon/paths';
 
 const log = createLogger('overseer/judge-second-opinion');
@@ -41,7 +49,10 @@ export async function judgeWithGrok(
     try {
       await (options.recordOutcome ?? recordSpawnOutcome)(binary, result, 'judge-second-opinion');
     } catch (error) {
-      log.error({ binary, error }, 'overseer.judge_second_opinion.resource_health_record_failed');
+      log.error(
+        { binary, err: error as Error },
+        'overseer.judge_second_opinion.resource_health_record_failed'
+      );
     }
     if (result.timedOut) return receipt(evidence, 'hold', 'judge_timeout');
     if (result.exitCode !== 0) return receipt(evidence, 'hold', 'judge_exit_nonzero');
@@ -61,12 +72,12 @@ export async function judgeWithGrok(
         );
       } catch (recordError) {
         log.error(
-          { binary, error: recordError },
+          { binary, err: recordError as Error },
           'overseer.judge_second_opinion.resource_health_record_failed'
         );
       }
     }
-    log.error({ binary, error }, 'overseer.judge_second_opinion.spawn_failed');
+    log.error({ binary, err: error as Error }, 'overseer.judge_second_opinion.spawn_failed');
     return receipt(evidence, 'hold', 'judge_error');
   }
 }
@@ -164,42 +175,68 @@ export function normalizeWrapperStdout(binary: string, stdout: string): string {
   return body.join('\n').trim();
 }
 
-async function spawnGrok(prompt: string, timeoutMs: number): Promise<GrokSpawnResult> {
+/**
+ * Spawn the second-opinion rung and collect its answer. Exported for the
+ * transport regression test (#852); judgeWithGrok is the API.
+ *
+ * argv and prompt delivery come from judge-transport.ts (#852) -- see
+ * spawnJudgeBinary in judge-first.ts for the two defects the shared transport
+ * closes here too (literal `cursor` executable; prompt as ONE argv element,
+ * capped by Linux MAX_ARG_STRLEN). This seam's own timeout, kill, stderr
+ * fallback and wrapper normalization are unchanged; the wall clock is armed
+ * before stdin delivery and tears the writer down when it fires, because codex
+ * exec and cursor-agent read stdin to EOF before answering.
+ */
+export async function spawnGrok(
+  prompt: string,
+  timeoutMs: number,
+  spawnChild: JudgeChildSpawn = defaultJudgeChildSpawn
+): Promise<GrokSpawnResult> {
   const binary = secondOpinionBinary();
-  const argv =
-    binary === 'codex'
-      ? ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check', prompt]
-      : [binary, '-p', prompt];
-  const subprocess = Bun.spawn(argv, {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
+  const transport = await buildJudgeTransport(binary, prompt);
+  try {
+    const subprocess = spawnChild(
+      transport.argv,
+      transport.stdinPrompt === undefined ? 'ignore' : 'pipe'
+    );
 
-  let timeout: Timer | undefined;
-  const timeoutResult = new Promise<GrokSpawnResult>(resolve => {
-    timeout = setTimeout(() => {
-      subprocess.kill();
-      resolve({ exitCode: 124, stdout: '', timedOut: true });
-    }, timeoutMs);
-  });
+    let timeout: Timer | undefined;
+    const timeoutResult = new Promise<GrokSpawnResult>(resolve => {
+      timeout = setTimeout(() => {
+        subprocess.kill();
+        destroyStdin(subprocess.stdin);
+        resolve({ exitCode: 124, stdout: '', timedOut: true });
+      }, timeoutMs);
+    });
 
-  const processResult = (async (): Promise<GrokSpawnResult> => {
-    // Capture BOTH streams. 15th canary defect (2026-08-26): with no TTY,
-    // `bunx @openai/codex exec` writes its ENTIRE output -- verdict included
-    // -- to stderr; stdout arrives empty with exit 0, so every judgment
-    // parsed as HOLD. (Shell repros hid this behind 2>&1.) stdout wins when
-    // non-empty; stderr is the fallback payload, run through the same
-    // normalizer + strict parser, so fail-closed semantics are unchanged.
-    const [exitCode, stdout, stderr] = await Promise.all([
-      subprocess.exited,
-      new Response(subprocess.stdout).text(),
-      new Response(subprocess.stderr).text(),
-    ]);
-    const payload = stdout.trim().length > 0 ? stdout : stderr;
-    return { exitCode, stdout: normalizeWrapperStdout(binary, payload), timedOut: false };
-  })();
+    // Not awaited: the delivery races the wall clock alongside the process.
+    // deliverStdin swallows the EPIPE of a child that exits before draining.
+    if (transport.stdinPrompt !== undefined) {
+      void deliverStdin(subprocess.stdin, transport.stdinPrompt);
+    }
 
-  const result = await Promise.race([processResult, timeoutResult]);
-  if (timeout) clearTimeout(timeout);
-  return result;
+    const processResult = (async (): Promise<GrokSpawnResult> => {
+      // Capture BOTH streams. 15th canary defect (2026-08-26): with no TTY,
+      // `bunx @openai/codex exec` writes its ENTIRE output -- verdict included
+      // -- to stderr; stdout arrives empty with exit 0, so every judgment
+      // parsed as HOLD. (Shell repros hid this behind 2>&1.) stdout wins when
+      // non-empty; stderr is the fallback payload, run through the same
+      // normalizer + strict parser, so fail-closed semantics are unchanged.
+      const [exitCode, stdout, stderr] = await Promise.all([
+        subprocess.exited,
+        new Response(subprocess.stdout).text(),
+        new Response(subprocess.stderr).text(),
+      ]);
+      const payload = stdout.trim().length > 0 ? stdout : stderr;
+      return { exitCode, stdout: normalizeWrapperStdout(binary, payload), timedOut: false };
+    })();
+
+    const result = await Promise.race([processResult, timeoutResult]);
+    if (timeout) clearTimeout(timeout);
+    destroyStdin(subprocess.stdin);
+    return result;
+  } finally {
+    // The prompt file (grok rung) must not outlive the judge process.
+    await removeJudgeTransportFiles(transport);
+  }
 }

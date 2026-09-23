@@ -614,7 +614,9 @@ VALUES
   -- Taskmaster loop claims its own work on its tick.
   ('taskmaster', 'Taskmaster', 'worker_poll', TRUE),
   ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
-  ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE)
+  ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE),
+  ('duty-officer', 'Duty Officer', 'worker_poll', TRUE),
+  ('do', 'Duty Officer alias', 'worker_poll', TRUE)
 ON CONFLICT (principal_id) DO NOTHING;
 
 INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
