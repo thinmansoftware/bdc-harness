@@ -14,6 +14,11 @@ import {
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
+import {
+  mintAppInstallationToken,
+  runSecurityDetector,
+  type SecurityDetectorResult,
+} from './duty-officer-security-detector';
 
 const log = createLogger('dispatch/duty-officer-clock');
 
@@ -26,6 +31,7 @@ const GH_SUBJECT =
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
+const startedAt = new Date().toISOString();
 
 export interface DutyOfficerStaleIssue {
   owner: string;
@@ -48,6 +54,8 @@ export interface DutyOfficerClockDeps {
   listStaleIssues: () => Promise<DutyOfficerStaleIssue[]>;
   postIssueComment: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
   judge: (message: DispatchMessage) => Promise<DutyOfficerJudgeVerdict>;
+  securityDetector: () => Promise<SecurityDetectorResult | null>;
+  now?: () => Date;
 }
 
 function githubToken(): string | null {
@@ -57,6 +65,10 @@ function githubToken(): string | null {
 
 export function githubNudgeEnabled(): boolean {
   return process.env.DUTY_OFFICER_GH_NUDGE === 'true' && Boolean(githubToken());
+}
+
+function githubTimeoutMs(): number {
+  return Math.max(1_000, Number(process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS) || 15_000);
 }
 
 export function isTaskmasterSelfPause(message: DispatchMessage): boolean {
@@ -123,6 +135,7 @@ async function githubJson<T>(
     method: options?.method,
     headers,
     body: options?.body,
+    signal: AbortSignal.timeout(githubTimeoutMs()),
   });
   if (!response.ok) {
     throw new Error(`duty_officer_github_http_${response.status}`);
@@ -207,7 +220,24 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
     listStaleIssues: listStaleGithubIssues,
     postIssueComment: postGithubIssueComment,
     judge: judgeDutyOfficerItem,
+    securityDetector: () =>
+      runSecurityDetector({
+        fetchImpl: fetch,
+        readToken: githubToken,
+        writeTokenProvider: mintAppInstallationToken,
+        now: () => new Date(),
+        buildSha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
+      }),
   };
+}
+
+function detectorTimeoutMs(): number {
+  return Math.max(1, Number(process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS) || 30_000);
+}
+
+async function detectorDeadline(): Promise<never> {
+  await Bun.sleep(detectorTimeoutMs());
+  throw new Error('duty_officer_security_detector_timeout');
 }
 
 async function finishItem(
@@ -375,6 +405,7 @@ export async function tickDutyOfficerClock(
 ): Promise<void> {
   if (inFlight) return;
   inFlight = true;
+  let detectorResult: SecurityDetectorResult | null = null;
   try {
     await deps.registerWorker({
       worker_id: DUTY_OFFICER_WORKER_ID,
@@ -408,6 +439,16 @@ export async function tickDutyOfficerClock(
       }
     }
 
+    try {
+      detectorResult = await Promise.race([deps.securityDetector(), detectorDeadline()]);
+    } catch (error) {
+      if ((error as Error).message === 'duty_officer_security_detector_timeout') {
+        log.error('duty_officer_security_detector_timeout');
+      } else {
+        log.error({ err: error }, 'duty_officer_security_detector_failed');
+      }
+    }
+
     if (!githubNudgeEnabled()) {
       log.info('duty_officer_github_nudge_skipped');
       return;
@@ -423,6 +464,32 @@ export async function tickDutyOfficerClock(
   } catch (error) {
     log.error({ err: error }, 'duty_officer_clock_tick_failed');
   } finally {
+    try {
+      const now = deps.now?.() ?? new Date();
+      await deps.registerWorker({
+        worker_id: DUTY_OFFICER_WORKER_ID,
+        host: process.env.HOSTNAME ?? 'in-process',
+        capabilities: {
+          task_types: ['run_report', 'agent_message'],
+          principal: 'duty-officer',
+          started_at: startedAt,
+          build_sha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
+          last_tick_completed_at: now.toISOString(),
+          security_detector: detectorResult
+            ? {
+                last_run_at: detectorResult.evaluated_at,
+                verdict: detectorResult.verdict,
+                reasons: detectorResult.reasons.map(reason => reason.code),
+                error_count: detectorResult.last_error ? 1 : 0,
+                last_error: detectorResult.last_error ?? null,
+              }
+            : { last_run_at: null, verdict: null, reasons: [], error_count: 0, last_error: null },
+        },
+        max_concurrency: 1,
+      });
+    } catch (error) {
+      log.error({ err: error }, 'duty_officer_clock_completion_write_failed');
+    }
     inFlight = false;
   }
 }

@@ -46,7 +46,10 @@ services:
   # App (always runs)
   # -------------------------------------------------------------------------
   app:
-    build: .
+    build:
+      context: .
+      args:
+        ARCHON_BUILD_SHA: ${ARCHON_BUILD_SHA:-unknown}
     image: archon
     env_file: .env
     environment:
@@ -89,6 +92,9 @@ services:
       DUTY_OFFICER_OPENROUTER_MODEL: ${DUTY_OFFICER_OPENROUTER_MODEL:-x-ai/grok-4.6}
       DUTY_OFFICER_JUDGE_ENABLED: ${DUTY_OFFICER_JUDGE_ENABLED:-false}
       DUTY_OFFICER_GH_NUDGE: ${DUTY_OFFICER_GH_NUDGE:-false}
+      DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT: ${DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT:-2026-10-07}
+      DUTY_OFFICER_SECURITY_SCAN_REPOS: ${DUTY_OFFICER_SECURITY_SCAN_REPOS:-thinmansoftware/shopops,thinmansoftware/lspro-react,thinmansoftware/scout-service,thinmansoftware/bdc-harness}
+      DUTY_OFFICER_SECURITY_SCAN_WORKFLOW: ${DUTY_OFFICER_SECURITY_SCAN_WORKFLOW:-security-scan.yml}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     volumes:

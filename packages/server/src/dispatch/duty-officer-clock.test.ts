@@ -118,6 +118,7 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
       body: item.body,
       failures: [],
     })),
+    securityDetector: mock(async () => null),
   };
 }
 
@@ -128,6 +129,8 @@ afterEach(() => {
   delete process.env.DUTY_OFFICER_GH_REPO;
   delete process.env.GH_TOKEN;
   delete process.env.GITHUB_TOKEN;
+  delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS;
+  delete process.env.ARCHON_BUILD_SHA;
 });
 
 describe('duty officer clock', () => {
@@ -376,5 +379,49 @@ describe('duty officer clock', () => {
       expect.objectContaining({ id: 'pause-fail', worker_id: 'duty-officer-clock' })
     );
     expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  test('never resolving detector does not wedge tick', async () => {
+    const deps = fakeDeps([message({ id: 'detector-timeout' })]);
+    deps.securityDetector = mock(() => new Promise(() => {}));
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS = '50';
+    await tickDutyOfficerClock(deps);
+    await tickDutyOfficerClock(deps);
+    expect(deps.listMessages).toHaveBeenCalledTimes(4);
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test('detector runs before nudge gate and never touches judge', async () => {
+    const queued = [message({ id: 'detector-before-gate', task_type: 'agent_message' })];
+    const deps = fakeDeps(queued);
+    await tickDutyOfficerClock(deps);
+    expect(deps.securityDetector).toHaveBeenCalledTimes(1);
+    expect(deps.judge).toHaveBeenCalledTimes(1);
+    expect(deps.listStaleIssues).not.toHaveBeenCalled();
+  });
+
+  test('tick end writes completion fields to worker capabilities', async () => {
+    const deps = fakeDeps([]);
+    process.env.ARCHON_BUILD_SHA = 'abc1234';
+    deps.securityDetector = mock(async () => ({
+      verdict: 'clean' as const,
+      reasons: [],
+      evaluated_at: '2026-09-23T12:00:00.000Z',
+      marker_home: 1,
+      wrote: [],
+    }));
+    await tickDutyOfficerClock(deps);
+    expect(deps.registerWorker).toHaveBeenCalledTimes(2);
+    const calls = (deps.registerWorker as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    expect(calls[1][0]).toEqual(
+      expect.objectContaining({
+        capabilities: expect.objectContaining({
+          started_at: expect.any(String),
+          build_sha: 'abc1234',
+          last_tick_completed_at: expect.any(String),
+          security_detector: expect.objectContaining({ verdict: 'clean' }),
+        }),
+      })
+    );
   });
 });
