@@ -469,6 +469,20 @@ export async function runSecurityDetector(
     errorCount += 1;
     if (!lastError) lastError = message;
   };
+  // A write succeeded only on a 2xx status with no transport error. Any other
+  // outcome must surface in error_count / last_error rather than being recorded
+  // as a successful `wrote` entry.
+  const writeSucceeded = (res: GhResponse): boolean => {
+    if (res.error) {
+      recordError(res.error);
+      return false;
+    }
+    if (res.status < 200 || res.status >= 300) {
+      recordError(`duty_officer_github_http_${res.status}`);
+      return false;
+    }
+    return true;
+  };
 
   const readToken = deps.readToken();
   if (!readToken) {
@@ -540,9 +554,11 @@ export async function runSecurityDetector(
   const issuesPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=all&labels=${encodeURIComponent(SCAN_LABEL)}&sort=created&direction=desc&per_page=30`;
   const issuesRes = await ghRequest(deps, readToken, 'GET', issuesPath);
   let reports: IssueSummary[] = [];
-  if (issuesRes.error || issuesRes.status >= 500) {
+  // Any unexpected non-2xx read (401/403/404/5xx/...) is an observation error,
+  // never a silent empty result -- a silent empty here yields false alarms.
+  if (issuesRes.error || issuesRes.status < 200 || issuesRes.status >= 300) {
     recordError(issuesRes.error ?? `duty_officer_github_http_${issuesRes.status}`);
-  } else if (issuesRes.status < 400) {
+  } else {
     reports = asArray(issuesRes.body)
       .map(parseIssue)
       .filter((i): i is IssueSummary => i !== null)
@@ -557,17 +573,16 @@ export async function runSecurityDetector(
     if (cached) return cached;
     const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issueNumber}/comments?per_page=100`;
     const res = await ghRequest(deps, readToken, 'GET', path);
-    if (res.error || res.status >= 500) {
+    // Any unexpected non-2xx read (401/403/404/5xx/...) is an observation error,
+    // never a silent empty result.
+    if (res.error || res.status < 200 || res.status >= 300) {
       recordError(res.error ?? `duty_officer_github_http_${res.status}`);
       commentsCache.set(issueNumber, []);
       return [];
     }
-    const comments =
-      res.status < 400
-        ? asArray(res.body)
-            .map(parseComment)
-            .filter((c): c is CommentSummary => c !== null)
-        : [];
+    const comments = asArray(res.body)
+      .map(parseComment)
+      .filter((c): c is CommentSummary => c !== null);
     commentsCache.set(issueNumber, comments);
     return comments;
   };
@@ -611,9 +626,11 @@ export async function runSecurityDetector(
   const detectorPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=open&labels=${encodeURIComponent(DETECTOR_LABEL)}&per_page=30`;
   const detectorRes = await ghRequest(deps, readToken, 'GET', detectorPath);
   let detectorIssue: IssueSummary | null = null;
-  if (detectorRes.error || detectorRes.status >= 500) {
+  // Any unexpected non-2xx read (401/403/404/5xx/...) is an observation error.
+  // A silent empty here would create a duplicate DETECTOR issue every run.
+  if (detectorRes.error || detectorRes.status < 200 || detectorRes.status >= 300) {
     recordError(detectorRes.error ?? `duty_officer_github_http_${detectorRes.status}`);
-  } else if (detectorRes.status < 400) {
+  } else {
     detectorIssue =
       asArray(detectorRes.body)
         .map(parseIssue)
@@ -676,22 +693,24 @@ export async function runSecurityDetector(
     const comments = await getComments(home);
     const existing = comments.find(c => c.body.includes(MARKER_COMMENT) && c.login === APP_LOGIN);
     const body = markerBody(nowIso, buildSha, armedStr, verdict, reasons);
-    if (existing) {
-      await ghRequest(
-        deps,
-        appToken,
-        'PATCH',
-        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/comments/${existing.id}`,
-        { body }
-      );
-    } else {
-      await ghRequest(
-        deps,
-        appToken,
-        'POST',
-        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${home}/comments`,
-        { body }
-      );
+    const res = existing
+      ? await ghRequest(
+          deps,
+          appToken,
+          'PATCH',
+          `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/comments/${existing.id}`,
+          { body }
+        )
+      : await ghRequest(
+          deps,
+          appToken,
+          'POST',
+          `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${home}/comments`,
+          { body }
+        );
+    if (!writeSucceeded(res)) {
+      log.warn({ home, status: res.status }, 'duty_officer_security_detector_marker_write_failed');
+      return;
     }
     log.info({ home, verdict }, 'duty_officer_security_detector_marker_patched');
     wrote.push('marker');
@@ -703,11 +722,17 @@ export async function runSecurityDetector(
     const labels = detectorLabels(verdict, reasons);
     const createPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues`;
     let res = await ghRequest(deps, appToken, 'POST', createPath, { title, body, labels });
-    if (res.status === 422) {
-      // A required label may not exist yet (sibling WO creates them, N2). Retry
-      // once WITHOUT labels rather than fail the alarm outright.
+    if (res.status === 422 && labels.length > 1) {
+      // The volatile priority label (prio:P0/P1/P3) may not exist yet (sibling WO
+      // creates them, N2). Retry once preserving DETECTOR_LABEL -- dropping it
+      // would make this issue invisible to the label-filtered discovery query
+      // (C6), causing a duplicate DETECTOR issue on every subsequent run.
       log.warn({ labels }, 'duty_officer_security_detector_label_missing');
-      res = await ghRequest(deps, appToken, 'POST', createPath, { title, body, labels: [] });
+      res = await ghRequest(deps, appToken, 'POST', createPath, {
+        title,
+        body,
+        labels: [DETECTOR_LABEL],
+      });
     }
     if (res.status >= 200 && res.status < 300) {
       const created = parseIssue(res.body);
@@ -735,15 +760,22 @@ export async function runSecurityDetector(
         `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${detectorIssue.number}/comments`,
         { body: 'Security scan detector: full evaluation clean and armed; closing.' }
       );
-      await ghRequest(
+      const closeRes = await ghRequest(
         deps,
         appToken,
         'PATCH',
         `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${detectorIssue.number}`,
         { state: 'closed' }
       );
-      log.info({ number: detectorIssue.number }, 'duty_officer_security_detector_issue_closed');
-      wrote.push('issue_closed');
+      if (writeSucceeded(closeRes)) {
+        log.info({ number: detectorIssue.number }, 'duty_officer_security_detector_issue_closed');
+        wrote.push('issue_closed');
+      } else {
+        log.warn(
+          { number: detectorIssue.number, status: closeRes.status },
+          'duty_officer_security_detector_issue_close_failed'
+        );
+      }
     }
     const home = markerHomeNumber ?? detectorIssue?.number ?? null;
     if (home !== null) await patchMarker(home);
@@ -756,7 +788,7 @@ export async function runSecurityDetector(
     if (detectorIssue) {
       const existingJson = extractIssueJson(detectorIssue.body);
       if (!sameDetectorState(existingJson, verdict, reasons, buildSha, armedStr)) {
-        await ghRequest(
+        const updateRes = await ghRequest(
           deps,
           appToken,
           'PATCH',
@@ -768,8 +800,18 @@ export async function runSecurityDetector(
             labels: detectorLabels(verdict, reasons),
           }
         );
-        log.info({ number: detectorIssue.number }, 'duty_officer_security_detector_issue_updated');
-        wrote.push('issue_updated');
+        if (writeSucceeded(updateRes)) {
+          log.info(
+            { number: detectorIssue.number },
+            'duty_officer_security_detector_issue_updated'
+          );
+          wrote.push('issue_updated');
+        } else {
+          log.warn(
+            { number: detectorIssue.number, status: updateRes.status },
+            'duty_officer_security_detector_issue_update_failed'
+          );
+        }
       }
       if (homeNumber === null) homeNumber = detectorIssue.number;
     } else {

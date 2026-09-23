@@ -742,7 +742,66 @@ describe('security detector', () => {
       const labels = (post.body as { labels?: string[] }).labels ?? [];
       expect(labels).not.toContain('security-scan');
     }
-    // The retry dropped the missing label set.
-    expect((posts[1].body as { labels: string[] }).labels).toEqual([]);
+    // The retry drops only the volatile priority label but PRESERVES
+    // security-detector, so the label-filtered discovery query (C6) can still
+    // find this issue and never opens a duplicate on the next run.
+    expect((posts[1].body as { labels: string[] }).labels).toEqual(['security-detector']);
+  });
+
+  test('Test 15: a non-5xx read failure (403) yields observation_error, not a false alarm', async () => {
+    const routes: Route[] = [
+      ...cleanScanRoutes(),
+      // Weekly-report read is forbidden (403) -- an unexpected non-2xx that must
+      // NOT be silently treated as an empty report set (which would false-alarm).
+      (m, url) =>
+        m === 'GET' && url === weeklyIssuesUrl() ? { status: 403, body: {} } : undefined,
+      (m, url) =>
+        m === 'GET' && url === detectorIssuesUrl() ? { status: 200, body: [] } : undefined,
+    ];
+    const { fetchImpl, calls } = makeFetch(routes);
+    const result = await runSecurityDetector(deps(fetchImpl, FIXED));
+    expect(result?.verdict).toBe('observation_error');
+    expect(result?.error_count).toBeGreaterThanOrEqual(1);
+    expect(result?.last_error).toContain('403');
+    // observation_error never opens/closes an issue on a partial read.
+    const issuePosts = calls.filter(c => c.method === 'POST' && /\/issues$/.test(c.url));
+    expect(issuePosts.length).toBe(0);
+    expect(result?.wrote).not.toContain('issue_opened');
+    expect(result?.wrote).not.toContain('issue_closed');
+  });
+
+  test('Test 16: a failed marker write surfaces in error_count and is not recorded as wrote', async () => {
+    const week = isoWeekUtc(FIXED);
+    const report = weeklyReport(50, week, 1);
+    const routes: Route[] = [
+      (m, url) =>
+        m === 'GET' && url === runsUrl(SCAN_REPOS[0]) ? { status: 404, body: {} } : undefined,
+      successfulRunsRoute(SCAN_REPOS[1], 2),
+      successfulRunsRoute(SCAN_REPOS[2], 2),
+      successfulRunsRoute(SCAN_REPOS[3], 2),
+      (m, url) =>
+        m === 'GET' && url === weeklyIssuesUrl() ? { status: 200, body: [report] } : undefined,
+      (m, url) =>
+        m === 'GET' && url === commentsUrl(50)
+          ? { status: 200, body: [validReceipt(FIXED)] }
+          : undefined,
+      (m, url) =>
+        m === 'GET' && url === detectorIssuesUrl() ? { status: 200, body: [] } : undefined,
+      (m, url) =>
+        m === 'POST' && /\/issues$/.test(url) ? { status: 201, body: { number: 99 } } : undefined,
+      // The marker comment POST (onto the weekly report #50) fails hard (5xx).
+      (m, url) =>
+        m === 'POST' && url.endsWith('/issues/50/comments') ? { status: 500, body: {} } : undefined,
+    ];
+    const { fetchImpl } = makeFetch(routes);
+    const result = await runSecurityDetector(deps(fetchImpl, FIXED));
+    expect(result?.verdict).toBe('alarm');
+    // The issue opened successfully...
+    expect(result?.wrote).toContain('issue_opened');
+    // ...but the marker write failed, so it must NOT be recorded as wrote and
+    // MUST surface in error_count / last_error.
+    expect(result?.wrote).not.toContain('marker');
+    expect(result?.error_count).toBeGreaterThanOrEqual(1);
+    expect(result?.last_error).toContain('500');
   });
 });
