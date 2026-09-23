@@ -1047,7 +1047,7 @@ export function createRealSubmitDeps(
         owner: body.owner,
         repo: body.repo,
         prNumber: body.prNumber,
-        attempt: body.attempt,
+        headSha: body.headSha,
       });
       const serialized = JSON.stringify(body);
       // CREATION IDENTITY. Comparing the returned body to ours cannot tell a

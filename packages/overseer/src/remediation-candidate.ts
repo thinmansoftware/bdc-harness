@@ -133,20 +133,38 @@ export const AUTO_FIXABLE_CLASSES: readonly AutoFixableClass[] = [
   },
   {
     id: 'lint_or_format',
-    description: 'Lint, formatting, or style-rule violations.',
-    pattern: /\b(?:lint\w*|eslint|prettier|format\w*|style\s+violation)\b/i,
+    description:
+      'Lint/formatter violations a NAMED TOOL reported. Bare "format" or "style" is excluded -- those words describe data shape and behavior far more often than tooling.',
+    // Requires a named tool (eslint/prettier/lint/rustfmt/gofmt/ruff/black/
+    // clippy/stylelint/tsfmt), OR the literal phrase "style violation"/"lint
+    // error". "format" and "style" ALONE are deliberately not enough: PR #740
+    // round 3 (2026-09-04) showed "The API response format exposes internal
+    // identifiers" -- a security judgment -- classifying as lint_or_format,
+    // and "The date format shown to customers is wrong" is a behavioral bug,
+    // not a formatter complaint. Both now fall through to a human.
+    pattern:
+      /\b(?:es-?lint|prettier|stylelint|rustfmt|gofmt|ruff|black|clippy|biome|tsfmt|lint(?:er|ing)?)\b|\b(?:style|lint|formatting)\s+(?:violation|error|failure)s?\b|\bformat(?:ting)?\s+check\s+(?:fail\w*|error\w*)\b/i,
   },
   {
     id: 'migration_ordering',
     description:
-      'Migration statement ordering defects, including FK-violating parent/child update order.',
+      'Migration ordering defects the schema itself rejects (FK/constraint violations). Excludes "this migration should be redesigned" judgments.',
+    // Requires a CONSTRAINT the database enforces to be violated by the
+    // statement order. A migration plus a sequencing word is not enough:
+    // "this migration should run after the tenant backfill is redesigned" is a
+    // design call, and under the looser pattern it classified as auto-fixable.
     pattern:
-      /\bmigrat\w+\b[\s\S]*\b(?:order\w*|sequence\w*|before|after|foreign[-\s]?key|fk|constraint)\b/i,
+      /\bmigrat\w+\b[\s\S]{0,160}?\b(?:foreign[-\s]?key|composite\s+key|unique\s+(?:index|constraint)|not\s+null|check\s+constraint|constraint)\b[\s\S]{0,160}?\b(?:violat\w*|reject\w*|fail\w*|error\w*|block\w*)\b/i,
   },
   {
     id: 'ascii_violation',
-    description: 'Non-ASCII characters in files required to be ASCII-only.',
-    pattern: /\b(?:non[-\s]?ascii|ascii[-\s]?only|em[-\s]?dash|smart\s+quote|unicode)\b/i,
+    description:
+      'Non-ASCII where the ENCODING RULE is the defect. Excludes rendering bugs that merely involve Unicode.',
+    // A bare "unicode" mention is excluded: "Unicode names render incorrectly
+    // for customers" is a display bug needing human judgment, and it used to
+    // classify as auto-fixable.
+    pattern:
+      /\b(?:non[-\s]?ascii|ascii[-\s]?only)\b|\b(?:em[-\s]?dash|smart\s+quote|curly\s+quote|non[-\s]?breaking\s+space|unicode)\b[\s\S]{0,100}?\b(?:break\w*|fail\w*|pars\w*|corrupt\w*|reject\w*|violat\w*)\b/i,
   },
 ];
 
@@ -374,33 +392,45 @@ export function decideRemediation(input: RemediationCandidateInput): Remediation
  * gate on this WO's own PR, 2026-08-28 -- fittingly, the very loop this WO
  * builds).
  *
- * The bug: counting prior attempts and then inserting is a read-then-write
- * race. Two rejected reviews for DIFFERENT head SHAs could each read the same
- * prior count, each compute the same attempt number, and -- because their keys
- * differed by SHA -- each insert successfully. That yields more than
- * MAX_REMEDIATION_ATTEMPTS durable candidates and defeats the bounded-loop
- * guarantee, which is the single most important safety property here.
+ * THE KEY IS (PR, HEAD SHA) -- one candidate per reviewed head.
  *
- * Keying on (PR, attempt) makes the DATABASE the arbiter: `idempotency_key` is
- * UNIQUE and `createMessage` inserts with ON CONFLICT DO NOTHING, returning the
- * existing row. Two concurrent emitters racing for attempt 2 therefore collide
- * on the constraint and exactly one row exists. The cap cannot be exceeded no
- * matter how the reads interleave, because the slot itself is the unique
- * resource.
+ * This has been wrong twice, in opposite directions, and both failures are
+ * worth keeping written down because the fix for one caused the other.
  *
- * A legitimate second attempt after a fix push still works: it is a different
- * ATTEMPT NUMBER, not a different SHA. The head being remediated is carried in
- * the body (`headSha`), so the candidate still names exactly what was reviewed.
- * Re-delivery of the same verdict computes the same key and is still a no-op.
+ * Round 1 keyed on (PR, head, attempt). Counting attempts and then inserting is
+ * a read-then-write race, so two rejected reviews for DIFFERENT heads could each
+ * read the same prior count, compute the same attempt number, and -- because
+ * their keys differed by SHA -- both insert. That exceeded
+ * MAX_REMEDIATION_ATTEMPTS.
+ *
+ * Round 2 dropped the SHA, keying on (PR, attempt). That closed the race but
+ * broke REDELIVERY, which the gate caught on this PR (2026-09-04): after
+ * attempt 1 lands, `countPriorRemediationAttempts` returns 1, so replaying the
+ * SAME verdict computes attempt 2 -- a different key, a second insert, and half
+ * the cap consumed by a duplicate delivery. Spec safety rule 3 says re-delivery
+ * of the same verdict must not enqueue a second candidate.
+ *
+ * Keying on the HEAD SHA satisfies both at once, because the head is what
+ * actually identifies the verdict:
+ *   - Redelivery of the same verdict -> same head -> same key -> DB no-op.
+ *   - Two racers on DIFFERENT heads -> different keys, but each head can yield
+ *     at most ONE row, so the count they race on cannot be inflated past the
+ *     number of distinct reviewed heads.
+ *   - A legitimate retry after a fix push -> new head -> new key -> allowed,
+ *     and still bounded because `decideRemediation` refuses once the count
+ *     reaches the cap.
+ *
+ * The attempt NUMBER remains in the body for audit and for the builder's
+ * context; it is deliberately no longer part of the uniqueness decision.
  */
 export function remediationIdempotencyKey(input: {
   owner: string;
   repo: string;
   prNumber: number;
-  attempt: number;
+  headSha: string;
 }): string {
   const slug = `${input.owner.toLowerCase()}/${input.repo.toLowerCase()}#${input.prNumber}`;
-  return `overseer-remediation:${slug}:attempt-${input.attempt}`;
+  return `overseer-remediation:${slug}:head-${input.headSha}`;
 }
 
 /**

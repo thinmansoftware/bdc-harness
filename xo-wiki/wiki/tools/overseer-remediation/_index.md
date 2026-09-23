@@ -112,13 +112,13 @@ A finding is handed back only if its class is on this list. **Adding a class is
 routine work: edit `AUTO_FIXABLE_CLASSES` in `remediation-candidate.ts` and add
 a test.** Nothing else changes.
 
-| Class id             | Covers                                                                   |
-| -------------------- | ------------------------------------------------------------------------ |
-| `build_failure`      | Build / compile / type errors the toolchain ALREADY REPORTED.            |
-| `test_failure`       | Tests OBSERVED FAILING. Missing coverage is excluded -- see below.       |
-| `lint_or_format`     | Lint, formatting, style-rule violations.                                 |
-| `migration_ordering` | Migration statement ordering, including FK-violating parent/child order. |
-| `ascii_violation`    | Non-ASCII in files required to be ASCII-only.                            |
+| Class id             | Covers                                                                                  |
+| -------------------- | --------------------------------------------------------------------------------------- |
+| `build_failure`      | Build / compile / type errors the toolchain ALREADY REPORTED.                           |
+| `test_failure`       | Tests OBSERVED FAILING. Missing coverage is excluded -- see below.                      |
+| `lint_or_format`     | Violations a NAMED TOOL reported (eslint/prettier/...). Bare "format"/"style" excluded. |
+| `migration_ordering` | Ordering the SCHEMA rejects (FK/constraint violation). Excludes redesign judgments.     |
+| `ascii_violation`    | Non-ASCII where the ENCODING RULE is the defect. Excludes Unicode rendering bugs.       |
 
 ### The rule when adding a class: demand MECHANICAL EVIDENCE
 
@@ -138,6 +138,15 @@ deciding what it should assert requires knowing what the code ought to do. A
 **failing** test is mechanical, because the runner already said what broke. So
 coverage-gap phrasings ("missing", "absent", "no test for") now fall through to
 the fail-closed default and reach a human regardless of how they are worded.
+
+All five classes were audited against this rule after PR #740 round 3
+(2026-09-04) found `lint_or_format` still matching any mention of "format" or
+"style" -- it routed "The API response format exposes internal identifiers", a
+security judgment, for unattended remediation. The audit found two more of the
+same shape: a Unicode RENDERING bug reading as `ascii_violation`, and "this
+migration should be redesigned" reading as `migration_ordering`. Both fixed in
+the same pass. If you add a class, assume this flaw is present until you have
+written the counterexample that proves it is not.
 
 Watch precision when editing the blocklist too: an earlier attempt at this fix
 added a bare `sql` token, which matched the `.sql` extension of the migration
@@ -162,32 +171,36 @@ credential" is non-auto).
    wildcard and no default-auto branch.
 3. **Mixed verdicts go to the human.** One blocking judgment-call finding among
    otherwise fixable ones refuses the whole verdict.
-4. **Idempotent per (PR, attempt), and that is what makes the cap ATOMIC.** The
-   key is `overseer-remediation:owner/repo#N:attempt-K`. `idempotency_key` is
-   UNIQUE and `createMessage` inserts with `ON CONFLICT DO NOTHING`, so the
-   attempt slot itself is the unique resource and the database arbitrates.
+4. **Idempotent per (PR, HEAD SHA)** -- one candidate per reviewed head. The
+   key is `overseer-remediation:owner/repo#N:head-<sha>`. `idempotency_key` is
+   UNIQUE and the insert uses `ON CONFLICT DO NOTHING`, so a redelivered verdict
+   is a database no-op.
 
-   **The head SHA is deliberately NOT in the key.** It was, and that was a real
-   defect -- caught by this very review gate on this WO's own PR (#740,
-   2026-08-28). Counting prior attempts and then inserting is a read-then-write
-   race: two rejected reviews for DIFFERENT heads could each read the same prior
-   count, compute the same attempt number, and both insert because their keys
-   differed by SHA. That exceeded the cap and defeated the bounded-loop
-   guarantee. With the SHA excluded, concurrent racers collide on one key and
-   exactly one wins.
+   **This has been wrong twice, in opposite directions.** Round 1 keyed on
+   (PR, head, attempt): counting attempts then inserting is a read-then-write
+   race, so two racers on different heads could read the same count, compute the
+   same attempt, and both insert -- the cap was exceeded. Round 2 dropped the
+   SHA to close that race, and thereby broke REDELIVERY: after attempt 1 lands
+   the count returns 1, so replaying the SAME verdict computed attempt 2, a new
+   key, and a duplicate row that also consumed half the cap (PR #740 round 3,
+   2026-09-04).
 
-   The loser gets `claimed: false` and the receipt records
-   `attempt_slot_already_claimed` -- it is never reported as a queued fix. A
-   legitimate attempt 2 after a fix push still works: it is a different attempt
-   NUMBER, and the head being remediated travels in the body (`headSha`).
+   The head satisfies both because **the head is what identifies a verdict**.
+   Redelivery -> same head -> same key -> no-op. A genuine retry after a fix
+   push -> new head -> new slot -> allowed. The attempt NUMBER stays in the body
+   for audit and builder context but is no longer part of uniqueness.
 
-   **How `claimed` is decided:** the emitter puts a per-call UUID nonce in
-   `correlation_id` (caller-controlled, stored verbatim, NOT part of the
-   idempotency key) and checks whether it round-trips. Comparing bodies was not
-   enough -- an identical re-submission has a byte-equal stored body and so
-   reported `claimed: true`, recording a duplicate as a new attempt
-   (PR #740 [minor], 2026-09-04). The nonce comes back only when THIS call is
-   the insert that landed.
+   **Bounding is now `decideRemediation`'s job, not the constraint's.** It
+   refuses once the derived count reaches `MAX_REMEDIATION_ATTEMPTS`. Do not
+   re-add the attempt number to the key to "make the cap atomic" -- that is
+   exactly the round-2 mistake.
+
+   A losing concurrent emitter gets `claimed: false` and the receipt records
+   `attempt_slot_already_claimed`; it is never reported as a queued fix. The
+   emitter decides that by putting a per-call UUID nonce in `correlation_id`
+   (caller-controlled, stored verbatim, not part of the key) and checking that
+   it round-trips -- body comparison could not tell a fresh insert from a
+   byte-identical replay.
 
 5. **Taskmaster still decides.** Budget, pause, backoff, and eligibility all
    still apply.

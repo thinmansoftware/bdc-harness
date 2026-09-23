@@ -141,7 +141,7 @@ describe('scenario 4: idempotency', () => {
         owner: body.owner,
         repo: body.repo,
         prNumber: body.prNumber,
-        attempt: body.attempt,
+        headSha: body.headSha,
       });
 
     expect(keyOf(first.body)).toBe(keyOf(second.body));
@@ -151,34 +151,54 @@ describe('scenario 4: idempotency', () => {
   });
 
   /**
-   * REGRESSION -- the defect the Overseer review gate found on this WO's own
-   * PR (740, head bc30cae8, 2026-08-28).
+   * REGRESSION -- PR #740 round 3 [major] (2026-09-04). The key has now been
+   * wrong twice in OPPOSITE directions, so both are pinned here.
    *
-   * The key previously included the head SHA. Counting attempts and then
-   * inserting is a read-then-write race, so two rejected reviews for DIFFERENT
-   * heads could each read the same prior count, compute the SAME attempt
-   * number, and -- because their keys differed by SHA -- BOTH insert. That
-   * exceeded MAX_REMEDIATION_ATTEMPTS and defeated the bounded-loop guarantee.
+   * Round 1 keyed on (PR, head, attempt): two racers on different heads could
+   * read the same count, compute the same attempt, and both insert -- the cap
+   * was exceeded.
    *
-   * Excluding the SHA makes the attempt slot itself the unique resource, so the
-   * UNIQUE constraint arbitrates and only one of the racers can win.
+   * Round 2 keyed on (PR, attempt), which fixed that race but broke
+   * REDELIVERY: after attempt 1 lands the count returns 1, so replaying the
+   * SAME verdict computed attempt 2, a different key, and a duplicate row.
+   *
+   * Keying on the HEAD SHA satisfies both, because the head identifies the
+   * verdict. Redelivery is a no-op; a genuinely new head is a new slot; the cap
+   * is enforced by decideRemediation, not by key collision.
    */
-  test('two different heads racing for the SAME attempt collide on one key', () => {
-    const raceA = decideRemediation(baseInput({ priorAttempts: 1 }));
-    const raceB = decideRemediation(
-      baseInput({ priorAttempts: 1, headSha: 'bbbb22220000000000000000000000000000cccc' })
-    );
-    if (!raceA.emit || !raceB.emit) throw new Error('expected both to emit');
+  test('REDELIVERY of the same verdict computes the SAME key even as the count moves', () => {
+    const first = decideRemediation(baseInput({ priorAttempts: 0 }));
+    // Production counts the row the first delivery just wrote.
+    const replay = decideRemediation(baseInput({ priorAttempts: 1 }));
+    if (!first.emit || !replay.emit) throw new Error('expected both to emit');
 
-    // Both computed attempt 2 from the same stale count -- that is the race.
-    expect(raceA.body.attempt).toBe(2);
-    expect(raceB.body.attempt).toBe(2);
-
-    // The DB sees ONE key, so exactly one row can exist. The cap holds.
-    expect(remediationIdempotencyKey({ ...raceA.body })).toBe(
-      remediationIdempotencyKey({ ...raceB.body })
+    // The attempt NUMBER legitimately advances -- it is audit metadata...
+    expect(first.body.attempt).toBe(1);
+    expect(replay.body.attempt).toBe(2);
+    // ...but the KEY does not, so the DB refuses the duplicate.
+    expect(remediationIdempotencyKey({ ...replay.body })).toBe(
+      remediationIdempotencyKey({ ...first.body })
     );
-    expect(remediationIdempotencyKey({ ...raceA.body })).not.toContain(raceA.body.headSha);
+    expect(remediationIdempotencyKey({ ...first.body })).toContain(first.body.headSha);
+  });
+
+  test('a DIFFERENT head is a different key, and the cap still refuses past it', () => {
+    const headTwo = 'bbbb22220000000000000000000000000000cccc';
+    const first = decideRemediation(baseInput({ priorAttempts: 0 }));
+    const second = decideRemediation(baseInput({ priorAttempts: 1, headSha: headTwo }));
+    if (!first.emit || !second.emit) throw new Error('expected both to emit');
+
+    expect(remediationIdempotencyKey({ ...second.body })).not.toBe(
+      remediationIdempotencyKey({ ...first.body })
+    );
+
+    // Bounding is decideRemediation's job now, not the UNIQUE constraint's.
+    const third = decideRemediation(
+      baseInput({ priorAttempts: MAX_REMEDIATION_ATTEMPTS, headSha: 'cccc3333' })
+    );
+    expect(third.emit).toBe(false);
+    if (third.emit) throw new Error('unreachable');
+    expect(third.reason).toBe('remediation_attempts_exhausted');
   });
 });
 
@@ -298,6 +318,58 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
    * An earlier attempt at this fix DID break it -- a bare `sql` token in the
    * non-auto list matched the `.sql` extension of the migration filename.
    */
+  /**
+   * PR #740 round 3 [major], second half: the mechanical-evidence rule was
+   * applied to build_failure and test_failure but NOT to the other three
+   * classes, so lint_or_format still matched any mention of "format" or
+   * "style". The gate's example -- "The API response format exposes internal
+   * identifiers" -- is a security judgment and it classified as auto-fixable.
+   *
+   * Auditing the remaining classes for the same flaw found two more, which are
+   * covered here too: a Unicode RENDERING bug read as an ascii_violation, and
+   * "this migration should be redesigned" read as migration_ordering.
+   */
+  const overBroadCases: readonly { readonly label: string; readonly summary: string }[] = [
+    {
+      label: 'the gate example: response format is a security judgment',
+      summary: 'The API response format exposes internal identifiers',
+    },
+    {
+      label: '"format" as customer-visible behavior',
+      summary: 'The date format shown to customers is wrong',
+    },
+    { label: '"format" as data shape', summary: 'The CSV format drops the trailing column' },
+    {
+      label: 'Unicode RENDERING bug, not an encoding violation',
+      summary: 'Unicode names render incorrectly for customers',
+    },
+    {
+      label: 'migration REDESIGN is a judgment call',
+      summary: 'This migration should run after the tenant backfill is redesigned',
+    },
+  ];
+
+  for (const { label, summary } of overBroadCases) {
+    test(`NON-AUTO: ${label}`, () => {
+      expect(classifyFinding({ scope: 'src/x.ts', severity: 'blocker', summary }).autoFixable).toBe(
+        false
+      );
+    });
+  }
+
+  test('the real tool-reported versions of those classes DO auto-route', () => {
+    const mechanical: readonly [string, string, string][] = [
+      ['named linter', 'eslint reports 3 errors: prefer-const', 'lint_or_format'],
+      ['named formatter', 'prettier --check fails on this file', 'lint_or_format'],
+      ['ascii rule broken', 'Non-ASCII em-dash breaks PowerShell parsing', 'ascii_violation'],
+    ];
+    for (const [label, summary, expectedClass] of mechanical) {
+      const result = classifyFinding({ scope: 'src/x.ts', severity: 'blocker', summary });
+      expect(result.autoFixable, label).toBe(true);
+      expect(result.classId, label).toBe(expectedClass);
+    }
+  });
+
   test('genuinely mechanical findings still auto-route', () => {
     const mechanical: readonly [string, IndependentReviewFinding, string][] = [
       [
