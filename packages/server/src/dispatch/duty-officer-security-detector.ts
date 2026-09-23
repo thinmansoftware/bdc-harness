@@ -18,14 +18,41 @@
  *   a 5xx / network error (N7).
  * - This module makes ZERO LLM calls and never imports the duty officer judge (N6).
  */
-import { mintAppInstallationToken } from '@archon/overseer/adapters/github-real-deps';
+import {
+  resolveGitHubAppAuth,
+  resolveRealOctokitAuthOptions,
+} from '@archon/overseer/adapters/github-real-deps';
 import { createLogger } from '@archon/paths';
 
-// Re-exported so the clock's createRealDutyOfficerClockDeps can wire it as the
-// write-token provider. The mint itself lives in @archon/overseer where
-// @octokit/auth-app is a dependency (W6 / C10); this package reaches it through
-// the workspace export rather than depending on @octokit/auth-app directly.
-export { mintAppInstallationToken };
+/**
+ * Mint a GitHub App installation token string for the write path, or null when
+ * App auth is not configured at all (C10: the detector then performs NO writes
+ * and records `app_auth_missing`).
+ *
+ * Wired by the clock's createRealDutyOfficerClockDeps as `writeTokenProvider`.
+ *
+ * `createAppAuth` is reached through `resolveRealOctokitAuthOptions()` rather
+ * than imported directly: `@octokit/auth-app` is a dependency of
+ * packages/overseer and does NOT resolve from packages/server, and this WO must
+ * not add a dependency to packages/server. `resolveRealOctokitAuthOptions()`
+ * already returns the App strategy as a value, so the mint stays in this module
+ * without widening either package's dependency set.
+ *
+ * W6 -- never fall back to the PAT for a write: `resolveGitHubAppAuth()` is the
+ * authority. It returns null when no App var is set (-> null here, no writes)
+ * and THROWS on a partial/broken App config, so a half-configured App never
+ * silently degrades. The `authStrategy` guard below makes the PAT arm of
+ * `RealOctokitAuthOptions` provably unreachable on this path.
+ */
+export async function mintAppInstallationToken(): Promise<string | null> {
+  if (!resolveGitHubAppAuth()) return null;
+  const options = resolveRealOctokitAuthOptions();
+  // Unreachable in practice (resolveGitHubAppAuth() just returned non-null, so
+  // the App arm was selected); fail closed rather than write with a PAT.
+  if (!('authStrategy' in options)) return null;
+  const result = await options.authStrategy(options.auth)({ type: 'installation' });
+  return result.token;
+}
 
 const log = createLogger('dispatch/duty-officer-security-detector');
 
@@ -753,13 +780,27 @@ export async function runSecurityDetector(
 
   if (verdict === 'clean') {
     if (detectorIssue) {
-      await ghRequest(
+      // C6: the issue is "closed WITH a comment". The closing comment is part of
+      // the contract, not a courtesy -- if it does not land, do NOT close. A
+      // silent close here would drop the only human-readable record of why the
+      // alarm cleared, and would still be reported as `issue_closed`. Leaving
+      // the issue open lets the next tick retry the whole close sequence.
+      const commentRes = await ghRequest(
         deps,
         appToken,
         'POST',
         `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${detectorIssue.number}/comments`,
         { body: 'Security scan detector: full evaluation clean and armed; closing.' }
       );
+      if (!writeSucceeded(commentRes)) {
+        log.warn(
+          { number: detectorIssue.number, status: commentRes.status },
+          'duty_officer_security_detector_close_comment_failed'
+        );
+        const homeOnFailure = markerHomeNumber ?? detectorIssue.number;
+        await patchMarker(homeOnFailure);
+        return finalize(homeOnFailure);
+      }
       const closeRes = await ghRequest(
         deps,
         appToken,

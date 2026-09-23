@@ -581,30 +581,6 @@ export function resolveGitHubAppAuth(): GitHubAppAuthConfig | null {
 }
 
 /**
- * Mint a GitHub App installation token string, or null when App auth is not
- * configured at all (the "absent" case that falls back to the PAT elsewhere).
- *
- * Used by callers that speak raw HTTP (not Octokit) and need a bearer token for
- * the thinman-overseer[bot] identity -- e.g. the Duty Officer security detector
- * write path (WO-HARNESS-DO-SECURITY-DETECTOR-01, contract C10). Lives here
- * because @octokit/auth-app is a dependency of this package; server-side callers
- * reach it through the @archon/overseer workspace export rather than taking a
- * direct dependency on @octokit/auth-app. resolveGitHubAppAuth() still THROWS on
- * a partial/broken App config, so a half-configured App never silently degrades.
- */
-export async function mintAppInstallationToken(): Promise<string | null> {
-  const appAuth = resolveGitHubAppAuth();
-  if (!appAuth) return null;
-  const auth = createAppAuth({
-    appId: appAuth.appId,
-    privateKey: appAuth.privateKey,
-    installationId: appAuth.installationId,
-  });
-  const result = await auth({ type: 'installation' });
-  return result.token;
-}
-
-/**
  * Octokit constructor options for real mode. App installation auth wins when App
  * vars are complete; otherwise the PAT path. Exposed as a network-free seam so
  * tests can assert which identity was selected without constructing a live

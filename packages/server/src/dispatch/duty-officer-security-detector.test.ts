@@ -202,6 +202,59 @@ describe('security detector', () => {
     expect(calls.some(c => c.method === 'POST' && /\/issues$/.test(c.url))).toBe(false);
   });
 
+  test('Test 1b: a failed closing comment does NOT close the DETECTOR issue', async () => {
+    const week = isoWeekUtc(FIXED);
+    const report = weeklyReport(50, week, 1);
+    const routes: Route[] = [
+      ...cleanScanRoutes(),
+      (m, url) =>
+        m === 'GET' && url === weeklyIssuesUrl() ? { status: 200, body: [report] } : undefined,
+      (m, url) =>
+        m === 'GET' && url === commentsUrl(50)
+          ? {
+              status: 200,
+              body: [
+                validReceipt(FIXED),
+                { body: '<!-- security-detector -->\nverdict: alarm', user: { login: APP_LOGIN } },
+              ],
+            }
+          : undefined,
+      (m, url) =>
+        m === 'GET' && url === detectorIssuesUrl()
+          ? {
+              status: 200,
+              body: [
+                {
+                  number: 77,
+                  title: 'DETECTOR: security scan -- scan_missing',
+                  body: '<!-- security-detector-issue -->',
+                  created_at: FIXED.toISOString(),
+                  updated_at: FIXED.toISOString(),
+                  labels: [{ name: 'security-detector' }],
+                },
+              ],
+            }
+          : undefined,
+      // The required closing comment fails.
+      (m, url) =>
+        m === 'POST' && url.endsWith('/issues/77/comments') ? { status: 500 } : undefined,
+      (m, url) => (url.includes('/issues/comments/') ? { status: 200, body: {} } : undefined),
+      (m, url) =>
+        m === 'PATCH' && url.endsWith('/issues/77') ? { status: 200, body: {} } : undefined,
+    ];
+    const { fetchImpl, calls } = makeFetch(routes);
+    const result = await runSecurityDetector(deps(fetchImpl, FIXED));
+
+    // The close MUST NOT happen without its comment, and must not be reported.
+    expect(calls.some(c => c.method === 'PATCH' && c.url.endsWith('/issues/77'))).toBe(false);
+    expect(result?.wrote).not.toContain('issue_closed');
+    // The failure is surfaced, not swallowed.
+    expect(result?.error_count).toBeGreaterThan(0);
+    expect(result?.last_error).toBe('duty_officer_github_http_500');
+    // The marker still proves the detector ran.
+    expect(calls.some(c => c.method === 'PATCH' && c.url.includes('/issues/comments/'))).toBe(true);
+  });
+
   test('Test 2: a 404 on a scan workflow opens a P0 DETECTOR issue', async () => {
     const week = isoWeekUtc(FIXED);
     const report = weeklyReport(50, week, 1);
