@@ -62,6 +62,8 @@ mismatched; its Stop conditions line publishes `unparsed=<names>; dropped=<n>`.
 executed, fails with `SPEC_DEFECT:` and includes the unparsed condition names and any
 `DROPPED:` reasons so the failure is attributed to the stop-condition specification.
 
-The `mec core` block in
-`.archon/workflows/defaults/bdc-feature-development.yaml` is the source of truth; its
-mirrored lane copies must remain byte-identical.
+The `mec core` block and the `sme_process` / `mec_check` call sites in
+`.archon/workflows/defaults/bdc-feature-development.yaml` are the source of truth;
+their mirrored lane copies must remain byte-identical. The unit test checks both the
+function bodies and these separate argument-passing surfaces so new evidence fields
+cannot silently fall back to defaults in a subset of lanes.

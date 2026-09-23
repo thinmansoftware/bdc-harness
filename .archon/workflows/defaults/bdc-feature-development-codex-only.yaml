@@ -3848,6 +3848,7 @@ nodes:
       printf '%s\n' "$MANIFEST_OUT" | sme_process \
         "$(sme_field TESTS_LINE "$TESTS_OUT")" "$(sme_field TESTS_STATUS "$TESTS_OUT")" \
         "$(sme_field GREP_LINE "$GREPS_OUT")" "$(sme_field GREP_STATUS "$GREPS_OUT")" \
+        "$(sme_field GREP_DROPPED "$GREPS_OUT")"
 
   # bdc-xo #1940. manifest-evidence-check fails CLOSED (exit 1, no PR-body patch) when
   # a CODE or MIXED WO would publish "Tests: N/A ..." (Rule 10 / manifest v2 require
@@ -3956,6 +3957,10 @@ nodes:
       printf '%s\n' "$MANIFEST_OUT" | mec_check "$STATUS" \
         "$(mec_field TESTS_CLASS "$TESTS_OUT")" "$(mec_field TESTS_STATUS "$TESTS_OUT")" \
         "$(mec_field GREP_DECLARED "$GREPS_OUT")" "$(mec_field GREP_STATUS "$GREPS_OUT")" \
+        "$(mec_field TESTS_EXIT "$TESTS_OUT")" "$(mec_field GREP_EXECUTED "$GREPS_OUT")" \
+        "$(mec_field GREP_DROPPED "$GREPS_OUT")" "$(mec_field GREP_UNPARSED "$GREPS_OUT")" \
+        "$(mec_field GREP_MISMATCH "$GREPS_OUT")" \
+        "$(printf '%s\n' "$GREPS_OUT" | sed -n '/^--- per-assertion detail ---$/,$p' | grep '^DROPPED' || true)"
 
   - id: verify-manifest-assertions
     persona: major-build

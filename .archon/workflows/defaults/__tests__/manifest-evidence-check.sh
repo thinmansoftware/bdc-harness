@@ -59,6 +59,14 @@ extract_core() {
   ' | sed 's/^      //'
 }
 
+extract_call() {
+  tr -d '\r' < "$1" | awk -v fn="$2" '
+    index($0, "| " fn " ") { c = 1 }
+    c && NF == 0 { exit }
+    c
+  ' | sed 's/^      //'
+}
+
 MEC_CORE="$(extract_core "$CANONICAL_YAML" mec)"
 SME_CORE="$(extract_core "$CANONICAL_YAML" sme)"
 if [ -z "$MEC_CORE" ]; then
@@ -73,6 +81,14 @@ done
 echo "--- Parity: mec core byte-identical across all 12 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$MEC_CORE" "$(extract_core "$DEFAULTS/$lane" mec)"
+done
+
+echo "--- Parity: evidence call sites byte-identical across all 12 lanes ---"
+SME_CALL="$(extract_call "$CANONICAL_YAML" sme_process)"
+MEC_CALL="$(extract_call "$CANONICAL_YAML" mec_check)"
+for lane in $LANES; do
+  assert_eq "sme call parity $lane" "$SME_CALL" "$(extract_call "$DEFAULTS/$lane" sme_process)"
+  assert_eq "mec call parity $lane" "$MEC_CALL" "$(extract_call "$DEFAULTS/$lane" mec_check)"
 done
 
 GOOD='WO: WO-X
