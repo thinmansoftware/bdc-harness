@@ -155,6 +155,14 @@ const mockFindActiveKnownBadBinding = mock(async () => null);
 mock.module('@archon/core/db/known-bad-bindings', () => ({
   findActiveByBindingKey: mockFindActiveKnownBadBinding,
 }));
+const mockCheckCodexDispatchGate = mock(async () => ({ fresh: true as const }));
+mock.module('@archon/providers/auth-refresh/dispatch-gate', () => ({
+  checkCodexDispatchGate: mockCheckCodexDispatchGate,
+}));
+mock.module('@archon/providers', () => ({
+  isRegisteredProvider: (provider: string) => ['claude', 'codex'].includes(provider),
+  getProviderInfoList: () => [],
+}));
 
 const mockListCodebases = mock(async () => [{ default_cwd: '/tmp/project' }]);
 mock.module('@archon/core/db/codebases', () => ({
@@ -350,8 +358,9 @@ describe('POST /api/workflows/:name/run model overrides', () => {
     });
 
     expect(response.status).toBe(400);
-    expect((await response.json()) as { error: string }).toEqual({
-      error: 'modelOverride.workflow.model: String must contain at least 1 character(s)',
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_empty_model',
     });
   });
 
@@ -369,8 +378,9 @@ describe('POST /api/workflows/:name/run model overrides', () => {
     });
 
     expect(response.status).toBe(400);
-    expect((await response.json()) as { error: string }).toEqual({
-      error: 'modelOverride: model_override_conductor_conflict',
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_conductor_conflict',
     });
   });
 
@@ -381,6 +391,28 @@ describe('POST /api/workflows/:name/run model overrides', () => {
       modelOverride: { nodes: { default: { model: 'sonnet' } } },
     });
 
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: true, status: 'completed' });
+  });
+
+  test('accepts a codex workflow override when the codex dispatch gate is fresh', async () => {
+    mockDiscoverWorkflows.mockImplementationOnce(async () => ({
+      workflows: [
+        makeTestWorkflowWithSource(
+          { name: 'deploy', description: 'Deploy app', provider: 'claude' },
+          'bundled'
+        ),
+      ],
+      errors: [],
+    }));
+
+    const response = await request({
+      conversationId: 'override-codex',
+      message: 'run it',
+      modelOverride: { workflow: { provider: 'codex', model: 'gpt-5.5' } },
+    });
+
+    expect(mockCheckCodexDispatchGate).toHaveBeenCalled();
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ accepted: true, status: 'completed' });
   });

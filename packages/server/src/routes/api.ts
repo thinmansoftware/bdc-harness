@@ -2973,7 +2973,7 @@ export function registerApiRoutes(
       getLog().info({ workflowName }, 'codex_dispatch_gate_consult');
       try {
         const gate = await checkCodexDispatchGate();
-        if (gate.fresh) return { valid: true, isolationHints };
+        if (gate.fresh) return { valid: true, isolationHints, workflow };
         getLog().warn({ workflowName, reason: gate.reason }, 'codex_dispatch_gate_refused');
       } catch (error) {
         getLog().warn({ err: error, workflowName }, 'codex_dispatch_gate_failed');
@@ -5398,6 +5398,21 @@ export function registerApiRoutes(
         c,
         runWorkflowBodySchema
       );
+      if (modelOverride && conductor) {
+        return c.json({ accepted: false, error: 'model_override_conductor_conflict' }, 400);
+      }
+      const overrideBindings = modelOverride
+        ? [
+            ...(modelOverride.workflow ? [modelOverride.workflow] : []),
+            ...Object.values(modelOverride.nodes ?? {}),
+          ]
+        : [];
+      if (overrideBindings.some(binding => binding.model.length === 0)) {
+        return c.json({ accepted: false, error: 'model_override_empty_model' }, 400);
+      }
+      if (overrideBindings.some(binding => binding.provider === '')) {
+        return c.json({ accepted: false, error: 'model_override_empty_provider' }, 400);
+      }
       // Persist user message and register DB ID (same as message endpoint).
       // /run callers may provide a fresh platform conversation id; create that
       // row up front so workflow dispatch can attach a run and web persistence
@@ -5508,11 +5523,7 @@ export function registerApiRoutes(
         if (!check.workflow) {
           return c.json({ accepted: false, error: 'model_override_workflow_unavailable' }, 400);
         }
-        const bindings = [
-          ...(modelOverride.workflow ? [modelOverride.workflow] : []),
-          ...Object.values(modelOverride.nodes ?? {}),
-        ];
-        const unknownProvider = bindings.find(
+        const unknownProvider = overrideBindings.find(
           binding => binding.provider && !isRegisteredProvider(binding.provider)
         )?.provider;
         if (unknownProvider) {

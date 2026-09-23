@@ -368,20 +368,16 @@ export const runWorkflowBodySchema = z
     modelOverride: z
       .object({
         workflow: z
-          .object({ provider: z.string().min(1).optional(), model: z.string().min(1) })
+          .object({ provider: z.string().optional(), model: z.string() })
           .optional(),
         nodes: z
           .record(
             z.string(),
-            z.object({ provider: z.string().min(1).optional(), model: z.string().min(1) })
+            z.object({ provider: z.string().optional(), model: z.string() })
           )
           .optional(),
       })
       .optional(),
-  })
-  .refine(body => !(body.modelOverride && body.conductor), {
-    message: 'model_override_conductor_conflict',
-    path: ['modelOverride'],
   })
   .openapi('RunWorkflowBody');
 
