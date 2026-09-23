@@ -18,6 +18,7 @@ import {
 } from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
+import { resolveModelForNode, type ModelOverride } from './model-override';
 import type {
   IWorkflowPlatform,
   WorkflowMessageMetadata,
@@ -914,7 +915,7 @@ async function beginProviderAttempt(
     attemptNumber: (latest?.attemptNumber ?? 0) + 1,
     provider,
     model: requestedModel,
-    declaredProvider: node.provider ?? provider,
+    declaredProvider: provider,
     declaredModel: declaredModel ?? requestedModel,
     requiredCapabilities: deriveNodeExecutionRequirements(node).map(
       capability => EXECUTION_CAPABILITY_LEDGER_MAP[capability]
@@ -1711,7 +1712,8 @@ async function resolveNodeProviderAndModel(
   conversationId: string,
   workflowRunId: string,
   cwd: string,
-  workflowLevelOptions: WorkflowLevelOptions
+  workflowLevelOptions: WorkflowLevelOptions,
+  modelOverride?: ModelOverride
 ): Promise<{
   provider: string;
   model: string | undefined;
@@ -1739,7 +1741,22 @@ async function resolveNodeProviderAndModel(
 }> {
   // Provider is explicit: node.provider ?? workflow.provider. Model never
   // influences provider selection. Model strings pass through to the SDK.
-  const provider: string = node.provider ?? workflowProvider;
+  const assistantModels = Object.fromEntries(
+    Object.entries(config.assistants).map(([providerId, assistant]) => [
+      providerId,
+      assistant?.model as string | undefined,
+    ])
+  );
+  const resolvedBinding = resolveModelForNode({
+    nodeId: node.id,
+    nodeProvider: node.provider,
+    nodeModel: node.model,
+    workflowProvider,
+    workflowModel,
+    assistantModels,
+    modelOverride,
+  });
+  const provider = resolvedBinding.provider;
   if (!isRegisteredProvider(provider)) {
     throw new Error(
       `Node '${node.id}': unknown provider '${provider}'. ` +
@@ -1749,12 +1766,7 @@ async function resolveNodeProviderAndModel(
     );
   }
 
-  const providerAssistantConfig = config.assistants[provider];
-  const model: string | undefined =
-    node.model ??
-    (provider === workflowProvider
-      ? workflowModel
-      : (providerAssistantConfig?.model as string | undefined));
+  const model = resolvedBinding.model;
 
   // Get provider capabilities for capability warnings (static lookup, no instantiation)
   const caps = getProviderCapabilities(provider);
@@ -1837,8 +1849,24 @@ async function resolveNodeProviderAndModel(
     const registry = await getAgentRegistry(cwd);
     const persona = resolveAgent(agentName, registry);
     if (persona) {
-      const personaResolution = resolveAgentPersona(persona, effectiveModel, provider);
-      effectiveModel = personaResolution.model;
+      // A per-node override owns the binding completely. In particular, a codex
+      // override must not be rejected merely because the YAML persona pins a
+      // Claude model; retain the persona prompt/tools while ignoring its model.
+      const personaForResolution =
+        modelOverride?.nodes?.[node.id] && provider === 'codex'
+          ? { ...persona, model: undefined }
+          : persona;
+      const personaResolution = resolveAgentPersona(personaForResolution, effectiveModel, provider);
+      effectiveModel = resolveModelForNode({
+        nodeId: node.id,
+        nodeProvider: node.provider,
+        nodeModel: node.model,
+        personaModel: personaResolution.model,
+        workflowProvider,
+        workflowModel,
+        assistantModels,
+        modelOverride,
+      }).model;
       // Prepend agent system prompt (agent role comes before node task)
       effectiveSystemPrompt = effectiveSystemPrompt
         ? `${personaResolution.systemPrompt}\n\n${effectiveSystemPrompt}`
@@ -1922,7 +1950,7 @@ async function resolveNodeProviderAndModel(
     provider,
     model: effectiveModel,
     options,
-    declaredModelId: model,
+    declaredModelId: modelOverride?.nodes?.[node.id]?.model ?? model,
     personaContextState,
   };
 }
@@ -5092,7 +5120,8 @@ async function executeApprovalNode(
   workflowLevelOptions: WorkflowLevelOptions,
   workflowInteractive: boolean | undefined,
   configuredCommandFolder?: string,
-  issueContext?: string
+  issueContext?: string,
+  modelOverride?: ModelOverride
 ): Promise<NodeOutput> {
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
@@ -5185,7 +5214,8 @@ async function executeApprovalNode(
       conversationId,
       workflowRun.id,
       cwd,
-      workflowLevelOptions
+      workflowLevelOptions,
+      modelOverride
     );
 
     const output = await executeNodeInternal(
@@ -5417,7 +5447,8 @@ async function executeDagWorkflowInternal(
   config: WorkflowConfig,
   configuredCommandFolder?: string,
   issueContext?: string,
-  priorCompletedNodes?: Map<string, string>
+  priorCompletedNodes?: Map<string, string>,
+  modelOverride?: ModelOverride
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
 
@@ -5736,7 +5767,21 @@ async function executeDagWorkflowInternal(
             // unknown provider so the outer catch below emits the standard
             // node_failed event + user-facing message -- the same path
             // resolveNodeProviderAndModel uses for non-loop nodes.
-            const loopProvider: string = node.provider ?? workflowProvider;
+            const loopBinding = resolveModelForNode({
+              nodeId: node.id,
+              nodeProvider: node.provider,
+              nodeModel: node.model,
+              workflowProvider,
+              workflowModel,
+              assistantModels: Object.fromEntries(
+                Object.entries(config.assistants).map(([providerId, assistant]) => [
+                  providerId,
+                  assistant?.model as string | undefined,
+                ])
+              ),
+              modelOverride,
+            });
+            const loopProvider = loopBinding.provider;
             if (!isRegisteredProvider(loopProvider)) {
               throw new Error(
                 `Node '${node.id}': unknown provider '${loopProvider}'. Registered: ${getRegisteredProviders()
@@ -5744,12 +5789,7 @@ async function executeDagWorkflowInternal(
                   .join(', ')}`
               );
             }
-            const loopAssistantConfig = config.assistants[loopProvider];
-            const loopModel: string | undefined =
-              node.model ??
-              (loopProvider === workflowProvider
-                ? workflowModel
-                : (loopAssistantConfig?.model as string | undefined));
+            const loopModel = loopBinding.model;
 
             assertProviderCanExecuteNode(loopProvider, node);
             let output = await executeLoopNode(
@@ -5888,7 +5928,8 @@ async function executeDagWorkflowInternal(
               workflowLevelOptions,
               workflow.interactive,
               configuredCommandFolder,
-              issueContext
+              issueContext,
+              modelOverride
             );
             return { nodeId: node.id, output };
           }
@@ -5959,7 +6000,8 @@ async function executeDagWorkflowInternal(
             conversationId,
             workflowRun.id,
             cwd,
-            workflowLevelOptions
+            workflowLevelOptions,
+            modelOverride
           );
           assertProviderCanExecuteNode(provider, node);
 
@@ -6139,7 +6181,8 @@ async function executeDagWorkflowInternal(
                 conversationId,
                 workflowRun.id,
                 cwd,
-                workflowLevelOptions
+                workflowLevelOptions,
+                modelOverride
               );
               emitNodeFailover(
                 deps,
