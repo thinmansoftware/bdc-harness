@@ -18,6 +18,15 @@ const execFileAsync = promisify(execFile);
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'escalated', 'cancelled']);
 
 /**
+ * Default OPEN-NODE silence budget (ms): 60 minutes.
+ *
+ * Exported so the production caller (cascade.ts) and the per-node timeout
+ * resolver agree on the same floor instead of duplicating a literal. See the
+ * `openNodeBudgetMs` option doc below for why the fallback is this generous.
+ */
+export const DEFAULT_OPEN_NODE_BUDGET_MS = 3_600_000;
+
+/**
  * Thrown by pollForTerminal when a run does not reach a terminal state within
  * the poll budget. Distinguishable from network/API errors so callers (the
  * cascade) can treat a progress-timeout as a quality-fail-and-climb signal
@@ -84,9 +93,50 @@ interface PollOptions {
    * is directly observable. If no new event arrives within this window, the run
    * is treated as stalled and the cascade climbs.
    *
+   * TWO CARVE-OUTS (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01) -- silence only
+   * counts as a stall once the run is actually WORKING:
+   *   1. Queue time is not stall time. A run still `pending` with no
+   *      `node_started` event has not begun; its silence is queue latency, not a
+   *      stuck build. Only the hard `timeoutMs` ceiling can end such a run.
+   *   2. An open node is alive. When a node has started but not yet
+   *      completed/failed, the run is granted that node's own configured
+   *      `timeout` when available (see `nodeTimeoutsMs`), else a generous default
+   *      (`openNodeBudgetMs`, 60 min), of silence before it counts as stalled --
+   *      a single long node (e.g. a 25-minute test run) legitimately emits
+   *      nothing while it works and must not be cut at 20 min.
+   *
    * Set to 0 to disable stall detection and fall back to duration-only.
    */
   stallTimeoutMs?: number;
+  /**
+   * OPEN-NODE SILENCE BUDGET (ms). Default: 3600000 (60 minutes).
+   *
+   * FALLBACK budget for an open node whose configured `timeout` is not available
+   * (see `nodeTimeoutsMs`). While a node has started but not yet
+   * completed/failed, the run is allowed this much silence before it is judged
+   * stalled, instead of the tighter `stallTimeoutMs`. The poll event feed itself
+   * carries no per-node `timeout` (node_started events are nodeId/nodeName only),
+   * so this generous default applies to every open node the caller did not
+   * supply a configured timeout for. Ignored when no node is open.
+   */
+  openNodeBudgetMs?: number;
+  /**
+   * PER-NODE CONFIGURED TIMEOUTS (ms), keyed by node name (step_name), sourced
+   * from the workflow definition by the caller. When an open node's name is
+   * present here, its own configured `timeout` becomes the open-node silence
+   * budget instead of the generic `openNodeBudgetMs` default -- honoring Scope IN
+   * item 2 of WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 ("the node's own
+   * configured timeout from the workflow definition, when available"). This is
+   * the ONLY channel by which a configured timeout becomes available: the poll
+   * event feed does not carry it. Production supplies it from cascade.ts via
+   * `fetchNodeTimeoutsMs` (node-timeouts.ts), which reads the fired tier's
+   * workflow definition. Nodes absent from this map fall back to
+   * `openNodeBudgetMs`. When several nodes are open at once (a concurrent DAG
+   * layer), the largest applicable budget is used so a healthy long node is
+   * never cut short by a shorter sibling. Default: {} (every open node uses
+   * `openNodeBudgetMs`).
+   */
+  nodeTimeoutsMs?: Record<string, number>;
   /** Poll interval (ms). Default: 30000 (30 seconds). */
   intervalMs?: number;
   /**
@@ -143,6 +193,8 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     token: tokenOverride,
     timeoutMs = 14_400_000,
     stallTimeoutMs = 1_200_000,
+    openNodeBudgetMs = DEFAULT_OPEN_NODE_BUDGET_MS,
+    nodeTimeoutsMs = {},
     intervalMs = 30_000,
     prRetryAttempts = 3,
     prRetryDelayMs = 10_000,
@@ -233,13 +285,34 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
       };
     }
 
-    // Stall check: silence, not duration, is what indicates a stuck run.
-    if (stallTimeoutMs > 0) {
+    // Stall check: silence, not duration, is what indicates a stuck run -- but
+    // only once the run is actually WORKING. Two carve-outs (WO-HARNESS-
+    // CONDUCTOR-STALL-DETECTOR-FIX-01):
+    //   1. Queue time is not stall time. A run still `pending` with no
+    //      `node_started` event has not begun; skip the silence check entirely
+    //      (only the hard `timeoutMs` ceiling can end it). We do NOT advance
+    //      lastActivityAt while queued -- we simply do not judge it stalled.
+    //   2. An open node is alive. When a node has started and not yet
+    //      completed/failed, grant the generous open-node budget of silence
+    //      before judging the run stalled, instead of the tighter stall budget.
+    const events = detail.events ?? [];
+    if (stallTimeoutMs > 0 && hasRunStarted(detail.run.status, events)) {
+      const openNodes = openNodeNames(events);
+      const openNode = openNodes.length > 0;
+      // For an open node, use its own configured timeout from the workflow
+      // definition when the caller supplied one (nodeTimeoutsMs); otherwise the
+      // generous openNodeBudgetMs default. Across a concurrent DAG layer take the
+      // largest so a long healthy node is not cut short by a shorter sibling
+      // (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN item 2).
+      const openBudget = openNode
+        ? Math.max(...openNodes.map(name => nodeTimeoutsMs[name] ?? openNodeBudgetMs))
+        : 0;
+      const budget = openNode ? Math.max(stallTimeoutMs, openBudget) : stallTimeoutMs;
       const silentFor = Date.now() - lastActivityAt;
-      if (silentFor >= stallTimeoutMs) {
+      if (silentFor >= budget) {
         throw new TimeoutError(
           `[smart-cauldron/poll] Run ${runId} stalled: no new events for ${String(silentFor)}ms ` +
-            `(stall budget ${String(stallTimeoutMs)}ms). Last activity was at ` +
+            `(stall budget ${String(budget)}ms${openNode ? ', open-node budget' : ''}). Last activity was at ` +
             `${newestEventSeen === null ? 'no events observed' : new Date(newestEventSeen).toISOString()}.`
         );
       }
@@ -268,18 +341,75 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
 function newestEventTimestamp(events: { created_at?: string | null }[]): number | null {
   let newest: number | null = null;
   for (const ev of events) {
-    if (!ev.created_at) continue;
-    // SQLite emits "YYYY-MM-DD HH:MM:SS" (space-separated, UTC, no zone marker).
-    // Date.parse treats that as LOCAL time on some runtimes, which would skew
-    // every comparison. Normalize to ISO-8601 UTC before parsing.
-    const raw = ev.created_at.trim();
-    const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)
-      ? `${raw.replace(' ', 'T')}Z`
-      : raw;
-    const parsed = Date.parse(iso);
-    if (!Number.isNaN(parsed) && (newest === null || parsed > newest)) newest = parsed;
+    const parsed = parseEventTimestamp(ev.created_at);
+    if (parsed !== null && (newest === null || parsed > newest)) newest = parsed;
   }
   return newest;
+}
+
+/**
+ * Parse an event's `created_at` into epoch ms, or null when absent/unparseable.
+ *
+ * SQLite emits "YYYY-MM-DD HH:MM:SS" (space-separated, UTC, no zone marker).
+ * Date.parse treats that as LOCAL time on some runtimes, which would skew every
+ * comparison. Normalize to ISO-8601 UTC before parsing.
+ */
+function parseEventTimestamp(createdAt?: string | null): number | null {
+  if (!createdAt) return null;
+  const raw = createdAt.trim();
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw) ? `${raw.replace(' ', 'T')}Z` : raw;
+  const parsed = Date.parse(iso);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Has this run actually begun executing?
+ *
+ * A run that is still `pending` and has emitted no `node_started` event has not
+ * started -- its silence is queue latency, not a stuck build, so it must never be
+ * judged stalled by the silence budget (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01
+ * Scope IN item 1). Any non-pending status, or the presence of a node_started
+ * event, means work has begun and the silence budget applies.
+ */
+function hasRunStarted(status: string, events: { event_type: string }[]): boolean {
+  if (status !== 'pending') return true;
+  return events.some(ev => ev.event_type === 'node_started');
+}
+
+/**
+ * Names of nodes currently OPEN -- started but not yet completed or failed.
+ *
+ * Processes node lifecycle events (node_started / node_completed / node_failed)
+ * in chronological order, tracking the latest start per step and clearing it on
+ * completion/failure. A run with any open node is granted the generous open-node
+ * silence budget instead of the tighter stall budget, because a single long node
+ * (e.g. a 25-minute test run) legitimately emits nothing while it works
+ * (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN item 2). The feed itself
+ * carries no per-node `timeout`, so the caller maps these names to configured
+ * timeouts (poll's `nodeTimeoutsMs`) when available, falling back to a fixed
+ * budget otherwise. Returns the open node names so the caller can look each up.
+ */
+function openNodeNames(
+  events: { event_type: string; step_name: string | null; created_at?: string | null }[]
+): string[] {
+  const openStarts = new Set<string>();
+  const lifecycle = events
+    .filter(
+      ev =>
+        ev.event_type === 'node_started' ||
+        ev.event_type === 'node_completed' ||
+        ev.event_type === 'node_failed'
+    )
+    .map(ev => ({ ev, ts: parseEventTimestamp(ev.created_at) }))
+    .filter((x): x is { ev: (typeof x)['ev']; ts: number } => x.ts !== null)
+    .sort((a, b) => a.ts - b.ts);
+
+  for (const { ev } of lifecycle) {
+    const step = ev.step_name ?? '';
+    if (ev.event_type === 'node_started') openStarts.add(step);
+    else openStarts.delete(step);
+  }
+  return [...openStarts];
 }
 
 async function fetchRunDetail(

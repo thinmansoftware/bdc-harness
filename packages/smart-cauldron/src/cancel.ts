@@ -23,6 +23,16 @@ export interface CancelRunOptions {
   apiBaseUrl: string;
   /** Overrides ARCHON_OPERATOR_TOKEN env var. */
   token?: string;
+  /**
+   * Human-readable reason recorded on the run_cancelled event (data.reason).
+   * REQUIRED and validated non-empty. The cancel route reads this body field and
+   * persists it, so a non-empty reason here is what makes
+   * `run_cancelled.data.reason` non-empty instead of "" (WO-HARNESS-CONDUCTOR-
+   * STALL-DETECTOR-FIX-01, Scope IN item 4). cancelRun refuses to POST when the
+   * reason is missing or blank -- it returns { ok: false } rather than sending
+   * the forbidden empty reason.
+   */
+  reason: string;
 }
 
 /**
@@ -32,14 +42,28 @@ export interface CancelRunOptions {
  *          Never throws -- network errors are caught and returned as a result.
  */
 export async function cancelRun(opts: CancelRunOptions): Promise<CancelResult> {
-  const { runId, apiBaseUrl } = opts;
+  const { runId, apiBaseUrl, reason } = opts;
   const token = opts.token ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
+
+  // Scope IN item 4: a conductor cancel MUST carry a non-empty reason. Refuse to
+  // POST a blank reason rather than persisting the forbidden empty
+  // run_cancelled.data.reason. Fail-closed, consistent with the never-throw
+  // result contract (typeof guard also covers JS callers that pass undefined
+  // despite the required type).
+  const trimmedReason = typeof reason === 'string' ? reason.trim() : '';
+  if (trimmedReason.length === 0) {
+    return {
+      ok: false,
+      error: `[smart-cauldron/cancel] refusing to cancel run ${runId} with an empty reason (run_cancelled.data.reason must be non-empty)`,
+    };
+  }
 
   let res: Response;
   try {
     res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}/cancel`, {
       method: 'POST',
-      headers: { 'x-archon-operator-token': token },
+      headers: { 'x-archon-operator-token': token, 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: trimmedReason }),
     });
   } catch (err) {
     const msg = `[smart-cauldron/cancel] network error on POST /api/workflows/runs/${runId}/cancel: ${(err as Error).message}`;

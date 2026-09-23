@@ -394,6 +394,83 @@ describe('Test: PROGRESS-TIMEOUT climbs (does not stop as infra-error)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Test: PROGRESS-TIMEOUT into an unapproved premium tier does NOT cancel
+// (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN items 3 + 4)
+// ---------------------------------------------------------------------------
+
+describe('Test: progress-timeout respects the frontier approval gate + records a cancel reason', () => {
+  test('a frontier tier that needs approval: the current run is not cancelled', async () => {
+    let cancelCalls = 0;
+    const deps: CascadeDeps = {
+      // Enter at claude (non-premium, human-typed) so the climb target is the
+      // premium frontier tier.
+      fire: async () => makeFireOk('run-claude'),
+      poll: async () => {
+        throw new TimeoutError('[smart-cauldron/poll] Run run-claude stalled: no new events');
+      },
+      judge: () => makePassVerdict(),
+      escalate: async () => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async () => {
+        cancelCalls++;
+        return { ok: true, error: null };
+      },
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'claude' }));
+
+    // No cancel-to-nowhere: the hung run was left RUNNING, not cancelled, because
+    // the climb target (frontier) requires operator approval.
+    expect(cancelCalls).toBe(0);
+    expect(record.status).toBe('pending-frontier-approval');
+    expect(record.frontierApproval?.tierName).toBe('frontier');
+    // The timed-out claude attempt is recorded; frontier was never fired.
+    expect(record.attempts.length).toBe(1);
+    expect(record.attempts[0]?.outcome).toBe('progress-timeout');
+    expect(record.attempts.map(a => a.tier)).toEqual(['claude']);
+  });
+
+  test('the cancel reason is non-empty', async () => {
+    const cancelOpts: Array<Parameters<NonNullable<CascadeDeps['cancel']>>[0]> = [];
+    let pollCallIndex = 0;
+    const deps: CascadeDeps = {
+      // Enter at codex (default); the climb target (claude) is non-premium, so
+      // the run IS cancelled -- and the cancel must carry a non-empty reason.
+      fire: async opts => makeFireOk(`run-${opts.workflowName}`),
+      poll: async () => {
+        pollCallIndex++;
+        if (pollCallIndex === 1) {
+          throw new TimeoutError('[smart-cauldron/poll] Run run-1 stalled: no new events');
+        }
+        return makePollResult();
+      },
+      judge: () => makePassVerdict(),
+      escalate: async () => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async opts => {
+        cancelOpts.push(opts);
+        return { ok: true, error: null };
+      },
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(cancelOpts.length).toBe(1);
+    // Scope IN item 4: run_cancelled.data.reason must never be "".
+    expect(cancelOpts[0]?.reason).toBeDefined();
+    expect(cancelOpts[0]?.reason ?? '').not.toBe('');
+    expect(cancelOpts[0]?.reason).toMatch(/^smart-cauldron stall: .+; cascade .+$/);
+    // The cascade climbed and won on the next tier, as before.
+    expect(record.status).toBe('won');
+    expect(record.attempts[0]?.outcome).toBe('progress-timeout');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Test: non-timeout poll error still stops as infra-error (regression)
 // ---------------------------------------------------------------------------
 
