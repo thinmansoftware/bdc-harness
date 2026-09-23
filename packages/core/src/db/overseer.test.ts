@@ -14,6 +14,7 @@ import {
   claimOverseerVerdict,
   claimVerdictForMergeExecution,
   countRunsPendingOverseerJudgment,
+  ensureDiscoveryRunRow,
   finalizeOverseerVerdict,
   getOverseerActionsForRun,
   getOverseerLastActionAt,
@@ -326,6 +327,131 @@ describe('overseer db', () => {
     expect(first.claimed).toBe(true);
     expect(second.claimed).toBe(false);
     expect(await getOverseerVerdictsForRun('run-idem')).toHaveLength(1);
+  });
+
+  // WO-HARNESS-DISCOVERY-VERDICT-RECORD-01 / bdc-xo#2208: discovery-sourced PRs
+  // (runId `pr-discovery:<owner>/<repo>#<n>`) have no workflow run, so the verdict
+  // insert's NOT NULL FK to remote_agent_workflow_runs threw SQLITE_CONSTRAINT_FOREIGNKEY
+  // and zero discovery verdicts were ever recorded. claimOverseerVerdict now mints a
+  // synthetic terminal parent (conversation + run) first.
+  async function countRows(sql: string, params: unknown[] = []): Promise<number> {
+    const result = await db.query<{ n: number | string }>(sql, params);
+    return Number(result.rows[0]?.n ?? 0);
+  }
+
+  test('records a discovery-PR verdict by minting a synthetic terminal run row (no pre-existing run)', async () => {
+    const runId = 'pr-discovery:thinmansoftware/bdc-xo#1';
+    // NOTE: no seedRun() -- the whole point is that a discovery PR has no workflow run.
+    const claim = await claimOverseerVerdict({
+      runId,
+      woId: 'WO-DISCOVERY-1',
+      headSha: 'headsha-1',
+    });
+    expect(claim.claimed).toBe(true);
+
+    // The verdict row exists and is bound to the discovery runId.
+    const verdicts = await getOverseerVerdictsForRun(runId);
+    expect(verdicts).toHaveLength(1);
+    expect(verdicts[0].run_id).toBe(runId);
+
+    // A synthetic conversation + a TERMINAL synthetic run row were created for it.
+    expect(
+      await countRows('SELECT COUNT(*) AS n FROM remote_agent_conversations WHERE id = $1', [runId])
+    ).toBe(1);
+    const run = await db.query<{ workflow_name: string; status: string }>(
+      'SELECT workflow_name, status FROM remote_agent_workflow_runs WHERE id = $1',
+      [runId]
+    );
+    expect(run.rows[0]?.workflow_name).toBe('pr-discovery');
+    expect(run.rows[0]?.status).toBe('completed');
+  });
+
+  test('claiming a discovery verdict twice at the same head is idempotent (one run row, one verdict)', async () => {
+    const runId = 'pr-discovery:thinmansoftware/bdc-xo#2';
+    const first = await claimOverseerVerdict({ runId, woId: 'WO-DISCOVERY-2', headSha: 'h2' });
+    const second = await claimOverseerVerdict({ runId, woId: 'WO-DISCOVERY-2', headSha: 'h2' });
+    expect(first.claimed).toBe(true);
+    expect(second.claimed).toBe(false);
+    expect(await getOverseerVerdictsForRun(runId)).toHaveLength(1);
+    // Exactly one synthetic run row and one synthetic conversation survive the replay.
+    expect(
+      await countRows('SELECT COUNT(*) AS n FROM remote_agent_workflow_runs WHERE id = $1', [runId])
+    ).toBe(1);
+    expect(
+      await countRows('SELECT COUNT(*) AS n FROM remote_agent_conversations WHERE id = $1', [runId])
+    ).toBe(1);
+  });
+
+  test('an APPROVED discovery verdict surfaces to the merge bridge via listUnactionedFlagMergeReadyVerdicts', async () => {
+    const runId = 'pr-discovery:thinmansoftware/bdc-harness#3';
+    const claim = await claimOverseerVerdict({ runId, woId: 'WO-DISCOVERY-3', headSha: 'h3' });
+    await finalizeOverseerVerdict({
+      verdictId: claim.verdictId!,
+      status: 'verdict',
+      verdict: 'approved',
+      proposedAction: 'flag_merge_ready',
+    });
+    const ready = await listUnactionedFlagMergeReadyVerdicts();
+    expect(ready).toHaveLength(1);
+    expect(ready[0].run_id).toBe(runId);
+    expect(ready[0].proposed_action).toBe('flag_merge_ready');
+  });
+
+  test('the synthetic discovery run is terminal and excluded from the watch loop, pending count, and inflight count', async () => {
+    // A real terminal run coexists so we prove the discovery row is excluded, not that
+    // the queries are simply empty.
+    await seedRun('run-real', 'completed');
+    await claimOverseerVerdict({
+      runId: 'pr-discovery:thinmansoftware/bdc-harness#4',
+      woId: 'WO-DISCOVERY-4',
+      headSha: 'h4',
+    });
+
+    const watched = await listRunsForOverseerWatch();
+    expect(watched.map(r => r.id)).toContain('run-real');
+    expect(watched.some(r => r.id.startsWith('pr-discovery:'))).toBe(false);
+
+    // Pending-judgment backlog counts the real run but not the synthetic discovery row.
+    expect(await countRunsPendingOverseerJudgment()).toBe(1);
+
+    // Terminal status means the rebuild inflight guard never sees it as live work.
+    expect(
+      await countRows(
+        `SELECT COUNT(*) AS n FROM remote_agent_workflow_runs
+         WHERE workflow_name = 'pr-discovery' AND status IN ('pending', 'running')`
+      )
+    ).toBe(0);
+  });
+
+  test('a Cauldron-sourced verdict (real run id) is unchanged -- no synthetic row is minted', async () => {
+    await seedRun('run-cauldron', 'completed');
+    const claim = await claimOverseerVerdict({
+      runId: 'run-cauldron',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: 'cauldron-head',
+    });
+    expect(claim.claimed).toBe(true);
+    expect(await getOverseerVerdictsForRun('run-cauldron')).toHaveLength(1);
+    // No pr-discovery synthetic run was created for a real Cauldron run id.
+    expect(
+      await countRows(
+        "SELECT COUNT(*) AS n FROM remote_agent_workflow_runs WHERE workflow_name = 'pr-discovery'"
+      )
+    ).toBe(0);
+    // The real run still participates in the watch loop.
+    expect((await listRunsForOverseerWatch()).map(r => r.id)).toContain('run-cauldron');
+  });
+
+  test('ensureDiscoveryRunRow is directly idempotent', async () => {
+    const runId = 'pr-discovery:thinmansoftware/bdc-xo#9';
+    await ensureDiscoveryRunRow(runId);
+    await ensureDiscoveryRunRow(runId);
+    expect(
+      await countRows('SELECT COUNT(*) AS n FROM remote_agent_workflow_runs WHERE id = $1', [runId])
+    ).toBe(1);
+    expect(
+      await countRows('SELECT COUNT(*) AS n FROM remote_agent_conversations WHERE id = $1', [runId])
+    ).toBe(1);
   });
 
   // The retry path had the SAME RETURNING defect and would have killed the watcher
