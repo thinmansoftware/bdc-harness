@@ -565,7 +565,7 @@ nodes:
         Implementation per WO spec. Self-verified within implement loop.
         Workflow-time verify-* removed 2026-05-16 (Patch 1); PR-time gates handle validation.
 
-        Co-Authored-By: Cauldron major-build <noreply@bluedevilcollectibles.com>"
+        Co-Authored-By: Cauldron major-build <admin@bluedevilcollectibles.com>"
         git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed - operator must recover from worktree"
         ```
 
@@ -704,7 +704,7 @@ nodes:
       Cauldron resilience checkpoint. Not the final commit.
       Will be superseded by backstop commit-and-push node.
 
-      Co-Authored-By: Cauldron major-build <noreply@bluedevilcollectibles.com>" \
+      Co-Authored-By: Cauldron major-build <admin@bluedevilcollectibles.com>" \
         2>/dev/null || { echo "WARN: checkpoint commit failed -- continuing" >&2; exit 0; }
 
       if git push -u origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
@@ -2330,8 +2330,8 @@ nodes:
         exit 0
       fi
       N=$(git diff --cached --name-only | wc -l | tr -d ' ')
-      if git -c user.name='cauldron-checkpoint' -c user.email='noreply@bluedevilcollectibles.com' \
-        commit -q -m "checkpoint(diff-repair): ${N} files"; then
+      if git -c user.name="${CAULDRON_GIT_AUTHOR_NAME:-Thinman Cauldron}" -c user.email="${CAULDRON_GIT_AUTHOR_EMAIL:-admin@bluedevilcollectibles.com}" \
+        commit -q -m "checkpoint(diff-repair): ${N} files" -m "Cauldron-Role: checkpoint"; then
         echo "CHECKPOINT_DIFF_REPAIR=committed"
       else
         echo "WARN: checkpoint-diff-repair commit failed -- continuing" >&2
@@ -2735,8 +2735,8 @@ nodes:
         else
           COMMIT_MSG="salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)"
         fi
-        git -c user.name='cauldron-salvage' -c user.email='noreply@bluedevilcollectibles.com' \
-          commit -m "$COMMIT_MSG" 2>&1 | tail -1 || true
+        git -c user.name="${CAULDRON_GIT_AUTHOR_NAME:-Thinman Cauldron}" -c user.email="${CAULDRON_GIT_AUTHOR_EMAIL:-admin@bluedevilcollectibles.com}" \
+          commit -m "$COMMIT_MSG" -m "Cauldron-Role: salvage" 2>&1 | tail -1 || true
       fi
       if [ "$CHANGED" -gt 0 ]; then
         echo "SALVAGE=preserved_uncommitted:${CHANGED}"
