@@ -135,6 +135,27 @@ export async function getCurrentXoLease(): Promise<XoLease | null> {
   return result.rows[0] ? normalizeLease(result.rows[0]) : null;
 }
 
+/**
+ * WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 2): authenticate a
+ * presented XO holder token against the live lease at route-resolution time.
+ * Returns true only when a current (unreleased, unexpired) lease exists AND the
+ * token hashes to its stored holder_token_hash. Used by the mailbox actor
+ * binder so a wrong holder-token proof fails authentication (401) at the route
+ * instead of slipping through to the DAL turnover re-check (409). The stored
+ * hash is never exposed -- only the boolean verdict.
+ */
+export async function verifyXoLeaseHolderToken(holderToken: string): Promise<boolean> {
+  const now = await databaseNow();
+  const result = await getDatabase().query<XoLeaseRow>(
+    `SELECT * FROM board_xo_leases
+     WHERE id = 1 AND released_at IS NULL AND expires_at > $1`,
+    [now]
+  );
+  const row = result.rows[0];
+  if (!row) return false;
+  return row.holder_token_hash === hashHolderToken(holderToken);
+}
+
 export async function resolveBoardRecipient(): Promise<
   | { ok: true; principal_id: string; seat_id: BoardSeat; lease_id: string; fencing_token: number }
   | { ok: false; reason: 'no_valid_xo_lease' }

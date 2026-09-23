@@ -2507,13 +2507,18 @@ export function registerApiRoutes(
    * only. Never from the request body.
    *
    * Order, with NO fallback between branches:
-   *  1. Any identity header present -> the request MUST validate as one of the
-   *     two bindings below; a failed/partial identity request throws
-   *     MailboxActorUnboundError (401) even if a valid operator token is present.
+   *  1. Any identity header PRESENT (even if empty/whitespace) -> the request
+   *     MUST validate as one of the two bindings below; a failed/partial
+   *     identity request throws MailboxActorUnboundError (401) even if a valid
+   *     operator token is present. Presence is decided on the raw header, not on
+   *     the trimmed value's truthiness.
    *  2. xo binding: all four proofs (x-board-principal-token,
    *     x-xo-holder-token, x-xo-lease-id, x-xo-fencing-token) against the live
-   *     board XO lease. The holder-token hash is re-verified inside the DAL
-   *     transaction via the returned bind.
+   *     board XO lease. All four -- INCLUDING the holder-token hash -- are
+   *     authenticated here at route resolution; a wrong holder token is a 401,
+   *     not turnover. The DAL re-verifies the hash inside the write transaction
+   *     as a TOCTOU guard (409 lease_fence_stale) against a lease re-keyed
+   *     between this read and the write.
    *  3. principal-credential binding for any principal OTHER than xo.
    *  4. No identity header + a bare operator token -> actor 'operator'.
    *  5. Otherwise unbound.
@@ -2521,15 +2526,30 @@ export function registerApiRoutes(
   async function resolveDispatchMailboxActor(
     c: Context
   ): Promise<{ actor: string; bind?: dispatchDb.XoLeaseBind }> {
-    const boardToken = c.req.header('x-board-principal-token')?.trim();
-    const holderToken = c.req.header('x-xo-holder-token')?.trim();
-    const leaseIdHeader = c.req.header('x-xo-lease-id')?.trim();
-    const fencingHeader = c.req.header('x-xo-fencing-token')?.trim();
-    const principalIdHeader = c.req.header('x-dispatch-principal-id')?.trim();
-    const principalTokenHeader = c.req.header('x-dispatch-principal-token')?.trim();
+    // Presence is decided on the RAW header (present vs absent), not on the
+    // trimmed value's truthiness: an identity header that is present but empty
+    // (or whitespace) still counts as "identity asserted" and MUST validate --
+    // it can never silently fall through to the bare-operator branch below.
+    const rawBoardToken = c.req.header('x-board-principal-token');
+    const rawHolderToken = c.req.header('x-xo-holder-token');
+    const rawLeaseId = c.req.header('x-xo-lease-id');
+    const rawFencing = c.req.header('x-xo-fencing-token');
+    const rawPrincipalId = c.req.header('x-dispatch-principal-id');
+    const rawPrincipalToken = c.req.header('x-dispatch-principal-token');
 
-    const hasLeaseHeaders = Boolean(boardToken || holderToken || leaseIdHeader || fencingHeader);
-    const hasPrincipalHeaders = Boolean(principalIdHeader || principalTokenHeader);
+    const boardToken = rawBoardToken?.trim();
+    const holderToken = rawHolderToken?.trim();
+    const leaseIdHeader = rawLeaseId?.trim();
+    const fencingHeader = rawFencing?.trim();
+    const principalIdHeader = rawPrincipalId?.trim();
+    const principalTokenHeader = rawPrincipalToken?.trim();
+
+    const hasLeaseHeaders =
+      rawBoardToken !== undefined ||
+      rawHolderToken !== undefined ||
+      rawLeaseId !== undefined ||
+      rawFencing !== undefined;
+    const hasPrincipalHeaders = rawPrincipalId !== undefined || rawPrincipalToken !== undefined;
 
     if (hasLeaseHeaders) {
       // xo binding requires ALL FOUR proofs; any missing one is unbound.
@@ -2547,6 +2567,15 @@ export function registerApiRoutes(
       }
       const lease = await boardAuthorityDb.getCurrentXoLease();
       if (lease?.lease_id !== leaseIdHeader || lease.fencing_token !== fencingNum) {
+        throw new MailboxActorUnboundError();
+      }
+      // Authenticate the fourth proof (holder token) at route resolution: a
+      // token that does not hash to the live lease is a FAILED authentication
+      // (401 dispatch_actor_unbound), not lease turnover. The DAL still
+      // re-verifies the hash inside the write transaction as a TOCTOU guard
+      // against a lease re-keyed between this read and the write (409
+      // lease_fence_stale).
+      if (!(await boardAuthorityDb.verifyXoLeaseHolderToken(holderToken))) {
         throw new MailboxActorUnboundError();
       }
       return {

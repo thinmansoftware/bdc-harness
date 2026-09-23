@@ -1132,23 +1132,50 @@ describe('dispatch API', () => {
       expect(await ackedAt(relMsg.id)).toBeNull();
     });
 
-    test('a wrong holder token slips past the route but the DAL re-check rejects lease_fence_stale', async () => {
-      // The route verifies board principal + lease_id + fencing; the holder-token
-      // hash is the authoritative fourth proof re-checked INSIDE the DAL write
-      // transaction. A holder token that does not hash to the live lease (e.g. a
-      // lease re-keyed between the route read and the write) is lease_fence_stale.
+    test('a wrong holder token fails authentication at the route with 401 dispatch_actor_unbound', async () => {
+      // The holder token is the fourth proof and is authenticated at route
+      // resolution against the live lease's stored hash. A token that does not
+      // hash to the current lease is a FAILED authentication (401), not lease
+      // turnover -- it never reaches the DAL. (The DAL still re-checks the hash
+      // in-transaction as a TOCTOU guard for genuine concurrent re-keying.)
       await seedLease();
       const message = await createMessage({
         ...VALID_BODY,
-        idempotency_key: 'bind-stale',
+        idempotency_key: 'bind-wrong-holder',
         recipient: 'xo',
       });
       const response = await makeApp().request(`/api/dispatch/messages/${message.id}/ack`, {
         method: 'POST',
         headers: leaseHeaders({ holder: 'wrong-holder-token' }),
       });
-      expect(response.status).toBe(409);
-      expect(((await response.json()) as { error: string }).error).toBe('lease_fence_stale');
+      expect(response.status).toBe(401);
+      expect(((await response.json()) as { error: string }).error).toBe('dispatch_actor_unbound');
+      expect(await ackedAt(message.id)).toBeNull();
+    });
+
+    test('an empty identity header is not absent: it forces validation and 401 even with a valid operator token', async () => {
+      // Regression: presence must be decided on the raw header, not on the
+      // trimmed value's truthiness. A present-but-empty x-board-principal-token
+      // asserts an (invalid) xo identity and MUST NOT silently fall through to
+      // the bare-operator branch just because a valid operator token is present.
+      await seedLease();
+      const message = await createMessage({
+        ...VALID_BODY,
+        idempotency_key: 'bind-empty-identity',
+        recipient: 'xo',
+      });
+      const response = await makeApp('secret-token').request(
+        `/api/dispatch/messages/${message.id}/ack`,
+        {
+          method: 'POST',
+          headers: {
+            'x-archon-operator-token': 'secret-token',
+            'x-board-principal-token': '',
+          },
+        }
+      );
+      expect(response.status).toBe(401);
+      expect(((await response.json()) as { error: string }).error).toBe('dispatch_actor_unbound');
       expect(await ackedAt(message.id)).toBeNull();
     });
 
