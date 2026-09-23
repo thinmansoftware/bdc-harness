@@ -343,6 +343,22 @@ describe('bundled-defaults', () => {
         }
         expect(settingCount).toBeGreaterThan(0);
       });
+
+      it('routes every Cauldron co-author trailer through CAULDRON_GIT_AUTHOR_EMAIL', () => {
+        let trailerCount = 0;
+        const featureDevelopmentWorkflows = Object.entries(BUNDLED_WORKFLOWS).filter(([name]) =>
+          name.startsWith('bdc-feature-development')
+        );
+        for (const [, content] of featureDevelopmentWorkflows) {
+          const trailers = content.match(/Co-Authored-By: Cauldron major-build <[^>]+>/g) ?? [];
+          trailerCount += trailers.length;
+          for (const trailer of trailers) {
+            expect(trailer).toContain('CAULDRON_GIT_AUTHOR_EMAIL');
+            expect(trailer).toContain(':-admin@bluedevilcollectibles.com');
+          }
+        }
+        expect(trailerCount).toBeGreaterThan(0);
+      });
     });
   });
 });
