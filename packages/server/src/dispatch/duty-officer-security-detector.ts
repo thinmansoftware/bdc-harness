@@ -50,7 +50,7 @@ interface WorkflowRun {
   conclusion: string | null;
 }
 
-function positiveMs(name: string, fallback: number, floor = 1): number {
+export function positiveMs(name: string, fallback: number, floor = 1): number {
   return Math.max(floor, Number(process.env[name]) || fallback);
 }
 

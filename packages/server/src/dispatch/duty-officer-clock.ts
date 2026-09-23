@@ -67,7 +67,7 @@ export function githubNudgeEnabled(): boolean {
   return process.env.DUTY_OFFICER_GH_NUDGE === 'true' && Boolean(githubToken());
 }
 
-function githubTimeoutMs(): number {
+export function githubTimeoutMs(): number {
   return Math.max(1_000, Number(process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS) || 15_000);
 }
 
@@ -407,36 +407,40 @@ export async function tickDutyOfficerClock(
   inFlight = true;
   let detectorResult: SecurityDetectorResult | null = null;
   try {
-    await deps.registerWorker({
-      worker_id: DUTY_OFFICER_WORKER_ID,
-      host: process.env.HOSTNAME ?? 'in-process',
-      capabilities: { task_types: ['run_report', 'agent_message'], principal: 'duty-officer' },
-      max_concurrency: 1,
-    });
-    await deps.heartbeatWorker({ worker_id: DUTY_OFFICER_WORKER_ID, status: 'available' });
+    try {
+      await deps.registerWorker({
+        worker_id: DUTY_OFFICER_WORKER_ID,
+        host: process.env.HOSTNAME ?? 'in-process',
+        capabilities: { task_types: ['run_report', 'agent_message'], principal: 'duty-officer' },
+        max_concurrency: 1,
+      });
+      await deps.heartbeatWorker({ worker_id: DUTY_OFFICER_WORKER_ID, status: 'available' });
 
-    const lease = await deps.getCurrentXoLease();
-    if (!lease) {
-      log.warn('duty_officer_clock_lease_empty');
-    }
+      const lease = await deps.getCurrentXoLease();
+      if (!lease) {
+        log.warn('duty_officer_clock_lease_empty');
+      }
 
-    const seen = new Set<string>();
-    for (const recipient of DUTY_OFFICER_RECIPIENTS) {
-      const queued = await deps.listMessages({ recipient, status: 'queued' });
-      for (const message of queued) {
-        if (seen.has(message.id)) continue;
-        seen.add(message.id);
-        try {
-          const claimed = await deps.claimMessage({
-            id: message.id,
-            worker_id: DUTY_OFFICER_WORKER_ID,
-          });
-          if (!claimed) continue;
-          await handleClaimed(deps, claimed);
-        } catch (error) {
-          log.error({ err: error, messageId: message.id }, 'duty_officer_work_item_failed');
+      const seen = new Set<string>();
+      for (const recipient of DUTY_OFFICER_RECIPIENTS) {
+        const queued = await deps.listMessages({ recipient, status: 'queued' });
+        for (const message of queued) {
+          if (seen.has(message.id)) continue;
+          seen.add(message.id);
+          try {
+            const claimed = await deps.claimMessage({
+              id: message.id,
+              worker_id: DUTY_OFFICER_WORKER_ID,
+            });
+            if (!claimed) continue;
+            await handleClaimed(deps, claimed);
+          } catch (error) {
+            log.error({ err: error, messageId: message.id }, 'duty_officer_work_item_failed');
+          }
         }
       }
+    } catch (error) {
+      log.error({ err: error }, 'duty_officer_clock_inbox_failed');
     }
 
     try {
@@ -461,8 +465,6 @@ export async function tickDutyOfficerClock(
     } catch (error) {
       log.error({ err: error }, 'duty_officer_github_nudge_failed');
     }
-  } catch (error) {
-    log.error({ err: error }, 'duty_officer_clock_tick_failed');
   } finally {
     try {
       const now = deps.now?.() ?? new Date();

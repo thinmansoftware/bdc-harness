@@ -3,6 +3,7 @@ import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import {
   githubIssueInAllowList,
+  githubTimeoutMs,
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
@@ -130,6 +131,7 @@ afterEach(() => {
   delete process.env.GH_TOKEN;
   delete process.env.GITHUB_TOKEN;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS;
+  delete process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS;
   delete process.env.ARCHON_BUILD_SHA;
 });
 
@@ -398,6 +400,22 @@ describe('duty officer clock', () => {
     expect(deps.securityDetector).toHaveBeenCalledTimes(1);
     expect(deps.judge).toHaveBeenCalledTimes(1);
     expect(deps.listStaleIssues).not.toHaveBeenCalled();
+  });
+
+  test('detector still runs when inbox listing fails', async () => {
+    const deps = fakeDeps([]);
+    deps.listMessages = mock(async () => {
+      throw new Error('dispatch_unavailable');
+    });
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.securityDetector).toHaveBeenCalledTimes(1);
+  });
+
+  test('GitHub timeout is clamped to one second', () => {
+    process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS = '1';
+    expect(githubTimeoutMs()).toBe(1_000);
   });
 
   test('tick end writes completion fields to worker capabilities', async () => {
