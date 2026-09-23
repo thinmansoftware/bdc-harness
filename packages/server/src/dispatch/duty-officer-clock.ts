@@ -31,6 +31,7 @@ const GH_SUBJECT =
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
+let detectorInFlight: Promise<SecurityDetectorResult | null> | null = null;
 const startedAt = new Date().toISOString();
 
 export interface DutyOfficerStaleIssue {
@@ -54,7 +55,7 @@ export interface DutyOfficerClockDeps {
   listStaleIssues: () => Promise<DutyOfficerStaleIssue[]>;
   postIssueComment: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
   judge: (message: DispatchMessage) => Promise<DutyOfficerJudgeVerdict>;
-  securityDetector: () => Promise<SecurityDetectorResult | null>;
+  securityDetector: (signal: AbortSignal) => Promise<SecurityDetectorResult | null>;
   now?: () => Date;
 }
 
@@ -220,14 +221,17 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
     listStaleIssues: listStaleGithubIssues,
     postIssueComment: postGithubIssueComment,
     judge: judgeDutyOfficerItem,
-    securityDetector: () =>
-      runSecurityDetector({
-        fetchImpl: fetch,
-        readToken: githubToken,
-        writeTokenProvider: mintAppInstallationToken,
-        now: () => new Date(),
-        buildSha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
-      }),
+    securityDetector: signal =>
+      runSecurityDetector(
+        {
+          fetchImpl: fetch,
+          readToken: githubToken,
+          writeTokenProvider: mintAppInstallationToken,
+          now: () => new Date(),
+          buildSha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
+        },
+        signal
+      ),
   };
 }
 
@@ -235,9 +239,38 @@ function detectorTimeoutMs(): number {
   return Math.max(1, Number(process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS) || 30_000);
 }
 
-async function detectorDeadline(): Promise<never> {
-  await Bun.sleep(detectorTimeoutMs());
-  throw new Error('duty_officer_security_detector_timeout');
+async function detectorDeadline(
+  deps: DutyOfficerClockDeps
+): Promise<SecurityDetectorResult | null> {
+  if (detectorInFlight) {
+    log.info('duty_officer_security_detector_skipped_in_flight');
+    return null;
+  }
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      const error = new Error('duty_officer_security_detector_timeout');
+      controller.abort(error);
+      reject(error);
+    }, detectorTimeoutMs());
+  });
+  // Only settlement of the underlying run releases the guard, even after timeout.
+  detectorInFlight = Promise.resolve().then(() => deps.securityDetector(controller.signal));
+  const run = detectorInFlight;
+  void run.then(
+    () => {
+      detectorInFlight = null;
+    },
+    () => {
+      detectorInFlight = null;
+    }
+  );
+  try {
+    return await Promise.race([run, deadline]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function finishItem(
@@ -440,7 +473,7 @@ export async function tickDutyOfficerClock(
     }
 
     try {
-      detectorResult = await Promise.race([deps.securityDetector(), detectorDeadline()]);
+      detectorResult = await detectorDeadline(deps);
     } catch (error) {
       if ((error as Error).message === 'duty_officer_security_detector_timeout') {
         log.error('duty_officer_security_detector_timeout');

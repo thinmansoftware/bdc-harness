@@ -1,5 +1,7 @@
-import { createAppAuth } from '@octokit/auth-app';
-import { resolveGitHubAppAuth } from '@archon/overseer/adapters/github-real-deps';
+import {
+  resolveGitHubAppAuth,
+  resolveRealOctokitAuthOptions,
+} from '@archon/overseer/adapters/github-real-deps';
 import { createLogger } from '@archon/paths';
 
 const log = createLogger('dispatch/duty-officer-security-detector');
@@ -18,7 +20,8 @@ export interface SecurityDetectorReason {
 export interface SecurityDetectorDeps {
   fetchImpl: typeof fetch;
   readToken: () => string | null;
-  writeTokenProvider: () => Promise<string | null>;
+  writeTokenProvider: (signal: AbortSignal) => Promise<string | null>;
+  signal?: AbortSignal;
   now: () => Date;
   buildSha: string;
 }
@@ -100,18 +103,26 @@ async function request<T>(
   let lastError: Error | null = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const response = await deps.fetchImpl(`${API}${path}`, {
-        method,
-        signal: AbortSignal.timeout(positiveMs('DUTY_OFFICER_GITHUB_TIMEOUT_MS', 15_000, 1_000)),
-        headers: {
-          Accept: 'application/vnd.github+json',
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'User-Agent': 'bdc-harness-security-detector',
-          'X-GitHub-Api-Version': '2022-11-28',
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
+      deps.signal?.throwIfAborted();
+      const signal = AbortSignal.any([
+        ...(deps.signal ? [deps.signal] : []),
+        AbortSignal.timeout(positiveMs('DUTY_OFFICER_GITHUB_TIMEOUT_MS', 15_000, 1_000)),
+      ]);
+      const response = await abortable(
+        deps.fetchImpl(`${API}${path}`, {
+          method,
+          signal,
+          headers: {
+            Accept: 'application/vnd.github+json',
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'User-Agent': 'bdc-harness-security-detector',
+            'X-GitHub-Api-Version': '2022-11-28',
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        }),
+        signal
+      );
       if (!response.ok) {
         const error = new Error(`duty_officer_github_http_${response.status}`);
         if (response.status >= 500 && attempt === 0) {
@@ -121,8 +132,9 @@ async function request<T>(
         throw error;
       }
       if (response.status === 204) return undefined as T;
-      return (await response.json()) as T;
+      return (await abortable(response.json(), signal)) as T;
     } catch (error) {
+      deps.signal?.throwIfAborted();
       lastError = error instanceof Error ? error : new Error(String(error));
       if (attempt === 0 && !/http_(?!5\d\d)/.exec(lastError.message)) continue;
       throw lastError;
@@ -178,16 +190,39 @@ export function receiptValid(body: string, issueCreatedAt: string, now: Date): b
   );
 }
 
-export async function mintAppInstallationToken(): Promise<string | null> {
+export async function mintAppInstallationToken(signal: AbortSignal): Promise<string | null> {
+  signal.throwIfAborted();
   const config = resolveGitHubAppAuth();
   if (!config) return null;
-  const auth = createAppAuth({
-    appId: config.appId,
-    installationId: config.installationId,
-    privateKey: config.privateKey,
-  });
-  const result = await auth({ type: 'installation', installationId: config.installationId });
+  const options = resolveRealOctokitAuthOptions();
+  if (!('authStrategy' in options)) return null;
+  const auth = options.authStrategy(options.auth);
+  const app = await auth({ type: 'app' });
+  signal.throwIfAborted();
+  const response = await abortable(
+    fetch(`${API}/app/installations/${config.installationId}/access_tokens`, {
+      method: 'POST',
+      signal,
+      headers: { Authorization: `Bearer ${app.token}`, Accept: 'application/vnd.github+json' },
+    }),
+    signal
+  );
+  if (!response.ok) throw new Error(`duty_officer_github_http_${response.status}`);
+  const result = (await abortable(response.json(), signal)) as { token: string };
   return result.token;
+}
+
+function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason)));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    operation.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+    if (signal.aborted) onAbort();
+  });
 }
 
 function issueLabels(issue: Issue): string[] {
@@ -238,8 +273,10 @@ async function writeWithLabelFallback<T>(
 
 // runSecurityDetector is the clock's deterministic, zero-LLM detector entry point.
 export async function runSecurityDetector(
-  deps: SecurityDetectorDeps
+  deps: SecurityDetectorDeps,
+  signal: AbortSignal = deps.signal ?? new AbortController().signal
 ): Promise<SecurityDetectorResult | null> {
+  signal.throwIfAborted();
   const now = deps.now();
   const interval = positiveMs('DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS', 21_600_000);
   const previous = PROCESS_RUNS.get(deps as object);
@@ -248,6 +285,7 @@ export async function runSecurityDetector(
     return null;
   }
   PROCESS_RUNS.set(deps as object, now.getTime());
+  deps = { ...deps, signal };
   const evaluatedAt = now.toISOString();
   const armedAt = process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT?.trim() || '9999-12-31';
   const armed = now.getTime() >= Date.parse(`${armedAt}T00:00:00Z`);
@@ -285,6 +323,7 @@ export async function runSecurityDetector(
         const reason = classifyRuns(data.workflow_runs, scanRepo, now);
         if (reason) result.reasons.push(reason);
       } catch (error) {
+        signal.throwIfAborted();
         if ((error as Error).message === 'duty_officer_github_http_404') {
           result.reasons.push({
             code: 'scan_missing',
@@ -348,6 +387,7 @@ export async function runSecurityDetector(
       });
     }
   } catch (error) {
+    signal.throwIfAborted();
     result.verdict = 'observation_error';
     result.last_error = (error as Error).message;
     log.error({ err: error }, 'duty_officer_security_detector_observation_error');
@@ -362,8 +402,11 @@ export async function runSecurityDetector(
   result.marker_home = recentReport?.number ?? detector?.number ?? null;
   let writeToken: string | null;
   try {
-    writeToken = await deps.writeTokenProvider();
+    signal.throwIfAborted();
+    writeToken = await abortable(deps.writeTokenProvider(signal), signal);
+    signal.throwIfAborted();
   } catch (error) {
+    signal.throwIfAborted();
     result.last_error = (error as Error).message;
     log.error({ err: error }, 'duty_officer_security_detector_write_refused_no_app_auth');
     return result;

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { rootLogger } from '@archon/paths';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import {
@@ -382,13 +383,49 @@ describe('duty officer clock', () => {
   });
 
   test('never resolving detector does not wedge tick', async () => {
-    const deps = fakeDeps([message({ id: 'detector-timeout' })]);
-    deps.securityDetector = mock(() => new Promise(() => {}));
+    const queued = [message({ id: 'detector-timeout' })];
+    const deps = fakeDeps(queued);
+    let finish!: () => void;
+    let receivedSignal: AbortSignal | undefined;
+    deps.securityDetector = mock(signal => {
+      receivedSignal = signal;
+      return new Promise(resolve => {
+        finish = () => resolve(null);
+      });
+    });
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    )!;
+    const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+      streamSymbol
+    ];
+    const lines: string[] = [];
+    const write = spyOn(stream, 'write').mockImplementation(line => {
+      lines.push(line);
+    });
     process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS = '50';
+    try {
+      await tickDutyOfficerClock(deps);
+      expect(receivedSignal?.aborted).toBe(true);
+      queued.push(message({ id: 'after-detector-timeout' }));
+      await tickDutyOfficerClock(deps);
+      expect(deps.securityDetector).toHaveBeenCalledTimes(1);
+      expect(
+        lines.some(line => line.includes('duty_officer_security_detector_skipped_in_flight'))
+      ).toBe(true);
+      expect(deps.listMessages).toHaveBeenCalledTimes(4);
+      expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(2);
+      expect(deps.judge).toHaveBeenCalledTimes(2);
+      expect(deps.llm).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+      finish();
+      await Promise.resolve();
+    }
+    // The guard releases when the underlying run finally settles.
+    deps.securityDetector = mock(async () => null);
     await tickDutyOfficerClock(deps);
-    await tickDutyOfficerClock(deps);
-    expect(deps.listMessages).toHaveBeenCalledTimes(4);
-    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+    expect(deps.securityDetector).toHaveBeenCalledTimes(1);
   });
 
   test('detector runs before nudge gate and never touches judge', async () => {

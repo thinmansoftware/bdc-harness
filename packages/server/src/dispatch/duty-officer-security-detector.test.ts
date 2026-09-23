@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { generateKeyPairSync } from 'node:crypto';
 import {
   classifyRuns,
   isoWeekUtc,
+  mintAppInstallationToken,
   parseMarker,
   receiptValid,
   runSecurityDetector,
@@ -28,6 +30,108 @@ afterEach(() => {
 });
 
 describe('duty officer security detector', () => {
+  test('App token exchange uses the deadline signal', async () => {
+    const saved = {
+      GITHUB_APP_ID: process.env.GITHUB_APP_ID,
+      GITHUB_APP_INSTALLATION_ID: process.env.GITHUB_APP_INSTALLATION_ID,
+      GITHUB_APP_PRIVATE_KEY: process.env.GITHUB_APP_PRIVATE_KEY,
+    };
+    const controller = new AbortController();
+    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      expect(String(url)).toBe('https://api.github.com/app/installations/456/access_tokens');
+      expect(init?.signal).toBe(controller.signal);
+      expect(init?.method).toBe('POST');
+      return Response.json({ token: 'test-installation-token' });
+    });
+    try {
+      process.env.GITHUB_APP_ID = '123';
+      process.env.GITHUB_APP_INSTALLATION_ID = '456';
+      process.env.GITHUB_APP_PRIVATE_KEY = generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+      }).privateKey;
+      expect(await mintAppInstallationToken(controller.signal)).toBe('test-installation-token');
+      controller.abort(new Error('test_deadline'));
+      await expect(mintAppInstallationToken(controller.signal)).rejects.toThrow('test_deadline');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchMock.mockRestore();
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  test('deadline rejects a stuck fetch, aborts its signal, and prevents writes', async () => {
+    let receivedSignal: AbortSignal | null | undefined;
+    const writes: string[] = [];
+    const d = deps(
+      mock((_url, init) => {
+        receivedSignal = init?.signal;
+        if (init?.method !== 'GET') writes.push(init?.method ?? 'GET');
+        return new Promise<Response>(() => {});
+      }) as typeof fetch
+    );
+    d.readToken = () => 'read-token';
+    d.writeTokenProvider = mock(async () => 'app-token');
+    const controller = new AbortController();
+    const signal = controller.signal;
+    const deadline = setTimeout(() => controller.abort(new Error('test_deadline')), 30);
+    try {
+      await expect(runSecurityDetector(d, signal)).rejects.toThrow('test_deadline');
+    } finally {
+      clearTimeout(deadline);
+    }
+    expect(signal.aborted).toBe(true);
+    expect(receivedSignal?.aborted).toBe(true);
+    await Bun.sleep(10);
+    expect(writes).toEqual([]);
+    expect(d.fetchImpl).toHaveBeenCalledTimes(1);
+    expect(d.writeTokenProvider).not.toHaveBeenCalled();
+  });
+
+  test('abort during a write cancels its signal and prevents all later writes', async () => {
+    const controller = new AbortController();
+    const writes: string[] = [];
+    const signals: AbortSignal[] = [];
+    const d = deps(
+      mock(async (_url, init) => {
+        signals.push(init!.signal!);
+        if (init?.method === 'GET') {
+          return Response.json(String(_url).includes('/runs?') ? { workflow_runs: [] } : []);
+        }
+        writes.push(init!.method!);
+        controller.abort(new Error('test_deadline'));
+        // A transport that ignores cancellation must not cause a later marker write.
+        return Response.json({ number: 42 });
+      }) as typeof fetch
+    );
+    d.readToken = () => 'read-token';
+    d.writeTokenProvider = async () => 'app-token';
+    await expect(runSecurityDetector(d, controller.signal)).rejects.toThrow('test_deadline');
+    expect(writes).toEqual(['POST']);
+    expect(signals.every(signal => signal.aborted)).toBe(true);
+  });
+
+  test('abort while acquiring write auth prevents the first issue write', async () => {
+    const controller = new AbortController();
+    const d = deps(
+      mock(async (_url, init) => {
+        expect(init?.method).toBe('GET');
+        return Response.json(String(_url).includes('/runs?') ? { workflow_runs: [] } : []);
+      }) as typeof fetch
+    );
+    d.readToken = () => 'read-token';
+    d.writeTokenProvider = async signal => {
+      expect(signal).toBe(controller.signal);
+      controller.abort(new Error('test_deadline'));
+      return 'app-token';
+    };
+    await expect(runSecurityDetector(d, controller.signal)).rejects.toThrow('test_deadline');
+  });
+
   test('clean_evaluation_closes_detector_issue_and_patches_marker helper verdict', () => {
     expect(
       classifyRuns([{ created_at: '2026-09-28T00:00:00Z', conclusion: 'success' }], 'o/r', now)
