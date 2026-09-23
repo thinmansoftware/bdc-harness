@@ -11,6 +11,8 @@
  * No in-repo prior-tier narrative preamble exists; do not invent one.
  */
 
+import { parseWoId } from '../../../packages/core/src/parse-wo-id';
+
 export const CASCADE_OUTCOME_FORMAT_VERSION = '1.0';
 
 export interface WorkflowRunExportRow {
@@ -99,8 +101,6 @@ export interface CascadeOutcomeRecord {
   status_column: string | null;
 }
 
-const WO_ID_ASSIGN_RE = /(?:^|\n)\s*WO_ID\s*=\s*(WO-[A-Z0-9-]+)/m;
-const WO_ID_TOKEN_RE = /\bWO-[A-Z0-9-]+\b/;
 const PROJECT_RE = /--project(?:\s+|=)([A-Za-z0-9._/-]+)/;
 const PRIOR_TIER_TOKEN_RE =
   /(?:^|[\s,;|])(?:--)?prior[_-]?tier(?:\s*[:=]\s*|\s+)["']?([A-Za-z0-9._-]+)["']?/;
@@ -115,13 +115,7 @@ function asNonEmptyString(value: unknown): string | null {
   return trimmed === '' ? null : trimmed;
 }
 
-export function parseWoId(userMessage: string | null | undefined): string | null {
-  if (userMessage == null || userMessage === '') return null;
-  const assigned = WO_ID_ASSIGN_RE.exec(userMessage);
-  if (assigned?.[1]) return assigned[1];
-  const bare = WO_ID_TOKEN_RE.exec(userMessage);
-  return bare ? bare[0] : null;
-}
+export { parseWoId };
 
 export function parseProject(userMessage: string | null | undefined): string | null {
   if (userMessage == null || userMessage === '') return null;

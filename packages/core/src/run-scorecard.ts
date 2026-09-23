@@ -13,10 +13,10 @@
  * in here; the forward path and default backfill pass no gh result at all
  * (gh_join_complete = 0). A gh miss NEVER flips landing_ok or honest_success.
  *
- * wo_id parsing reuses the canonical parseWoId from the MTA extractor -- the
- * WO forbids forking that regex.
+ * wo_id parsing uses the one canonical parseWoId. It lives in this package so
+ * the runtime image does not import scripts/ (that tree is not in the image).
  */
-import { parseWoId } from '../../../scripts/mta/lib/extract-cascade-outcome';
+import { parseWoId } from './parse-wo-id';
 import type { ModuleAxis, PipelineAxis, RunScorecard } from '@archon/workflows/reliability/types';
 
 /** score_version 1.0 -- the rubric contract. Do not bump without a new rubric. */
