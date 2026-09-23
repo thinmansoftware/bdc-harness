@@ -36,7 +36,7 @@ const EXPECTED_LANES = [
 ];
 const tempDirs: string[] = [];
 
-function run(args: string[], cwd: string) {
+function run(args: string[], cwd: string, extraEnv: Record<string, string> = {}) {
   return Bun.spawnSync(args, {
     cwd,
     env: {
@@ -45,6 +45,7 @@ function run(args: string[], cwd: string) {
       GIT_AUTHOR_EMAIL: 'test@example.com',
       GIT_COMMITTER_NAME: 'Test',
       GIT_COMMITTER_EMAIL: 'test@example.com',
+      ...extraEnv,
     },
     stdout: 'pipe',
     stderr: 'pipe',
@@ -110,11 +111,16 @@ describe('diff-repair checkpoint and salvage', () => {
   it('uses the uncommitted salvage message and preservation sentinel', () => {
     const dir = makeRepo();
     writeFileSync(join(dir, 'README.md'), 'salvaged\n');
-    const script = nodeBash('noninteractive-salvage').replace(
-      '$block-reclassify.output',
-      '{"status":"BLOCKED"}'
-    );
-    const result = run(['bash', '-c', script], dir);
+    // The lane carries node output by FILE now, not inline substitution (#857):
+    // RECLASS=$(cat "$ARCHON_NODE_OUT/block-reclassify.out"). Exercise that real
+    // transport instead of string-replacing an inline ref that no longer exists.
+    // OUTSIDE the repo: anything inside it would be swept up as salvageable work.
+    const nodeOutDir = mkdtempSync(join(tmpdir(), 'node-out-'));
+    tempDirs.push(nodeOutDir);
+    writeFileSync(join(nodeOutDir, 'block-reclassify.out'), '{"status":"BLOCKED"}');
+    const result = run(['bash', '-c', nodeBash('noninteractive-salvage')], dir, {
+      ARCHON_NODE_OUT: nodeOutDir,
+    });
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toContain('SALVAGE=preserved_uncommitted:1');
     expect(git(['log', '-1', '--pretty=%s'], dir)).toBe('salvage(uncommitted): 1 files');

@@ -830,10 +830,7 @@ nodes:
         case "$(sed -n 's/^ALREADY_SATISFIED=//p' "$IMPL_ENV" | head -1)" in yes) SAID_ALREADY=true ;; esac
       fi
       GATE_ALREADY=false
-      GATE_JSON=$(cat <<'BDC_FEATURE_DEV_GATE_ALREADY_SATISFIED_20260713_A8E4D3'
-      $gate-already-satisfied.output
-      BDC_FEATURE_DEV_GATE_ALREADY_SATISFIED_20260713_A8E4D3
-      )
+      GATE_JSON=$(cat "$ARCHON_NODE_OUT/gate-already-satisfied.out")
       if [ -n "$GATE_JSON" ]; then
         GATE_ALREADY=$(GATE_JSON="$GATE_JSON" python3 - <<'PY' 2>/dev/null || printf 'false\n'
       import json
@@ -2077,10 +2074,7 @@ nodes:
       set -uo pipefail
       mkdir -p "$ARTIFACTS_DIR"
       OUT="$ARTIFACTS_DIR/diff.patch"
-      REVIEW_BASE_OUTPUT=$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL'
-      $resolve-review-base.output
-      RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
-      )
+      REVIEW_BASE_OUTPUT=$(cat "$ARCHON_NODE_OUT/resolve-review-base.out")
       REVIEW_BASE=$(printf '%s\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
       [ -n "$REVIEW_BASE" ] || REVIEW_BASE="${BASE_BRANCH:-master}"
       BASE_REF="origin/$REVIEW_BASE"
@@ -2153,10 +2147,7 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_DIFF_REVIEW_20260719_002'
-      $diff-review.output
-      BDC_FEATURE_DEV_REVIEW_DIFF_REVIEW_20260719_002
-      )
+      REVIEW=$(cat "$ARCHON_NODE_OUT/diff-review.out")
       verdict=$(printf '%s\n' "$REVIEW" | grep -oE 'DIFF_REVIEW=(satisfied|needs_revision)' | tail -n 1 | sed 's/DIFF_REVIEW=//')
       # Fail OPEN to needs_revision: if the sentinel is missing/unparseable, run the repair
       # loop (safer to over-repair than to skip a real finding). This is the OPPOSITE of the
@@ -2193,10 +2184,7 @@ nodes:
         # real feature diff: merge-base..HEAD (committed) PLUS HEAD..worktree (unstaged).
         # NF2: empty-tree fallback (not HEAD) so a single-commit/no-base repo still
         # produces a non-empty committed diff to scan for debug prints.
-        REVIEW_BASE_OUTPUT=$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL'
-        $resolve-review-base.output
-        RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
-        )
+        REVIEW_BASE_OUTPUT=$(cat "$ARCHON_NODE_OUT/resolve-review-base.out")
         REVIEW_BASE=$(printf '%s\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
         [ -n "$REVIEW_BASE" ] || REVIEW_BASE="${BASE_BRANCH:-master}"
         BASE_REF="origin/$REVIEW_BASE"
@@ -2341,10 +2329,7 @@ nodes:
       set -uo pipefail
       mkdir -p "$ARTIFACTS_DIR"
       OUT="$ARTIFACTS_DIR/diff-final.patch"
-      REVIEW_BASE_OUTPUT=$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL'
-      $resolve-review-base.output
-      RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
-      )
+      REVIEW_BASE_OUTPUT=$(cat "$ARCHON_NODE_OUT/resolve-review-base.out")
       REVIEW_BASE=$(printf '%s\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
       [ -n "$REVIEW_BASE" ] || REVIEW_BASE="${BASE_BRANCH:-master}"
       BASE_REF="origin/$REVIEW_BASE"
@@ -2433,18 +2418,9 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      DIFF_FINAL=$(cat <<'BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003'
-      $diff-review-final.output
-      BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003
-      )
-      BUILD=$(cat <<'BDC_FEATURE_DEV_BUILD_ASSERT_IMPLEMENT_PRODUCED_WORK_20260719_004'
-      $assert-implement-produced-work.output
-      BDC_FEATURE_DEV_BUILD_ASSERT_IMPLEMENT_PRODUCED_WORK_20260719_004
-      )
-      PRECHECK=$(cat <<'BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005'
-      $gate-already-satisfied.output
-      BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005
-      )
+      DIFF_FINAL=$(cat "$ARCHON_NODE_OUT/diff-review-final.out")
+      BUILD=$(cat "$ARCHON_NODE_OUT/assert-implement-produced-work.out")
+      PRECHECK=$(cat "$ARCHON_NODE_OUT/gate-already-satisfied.out")
       final_ok=false
       # Anchor-free parse: diff-review-final is Codex prose; sentinel appears inline,
       # not at column 0. Take LAST occurrence so the final verdict always wins.
@@ -2514,10 +2490,7 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      OPUS=$(cat <<'BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_006'
-      $opus-repair.output
-      BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_006
-      )
+      OPUS=$(cat "$ARCHON_NODE_OUT/opus-repair.out")
       if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed'; then
         printf '{"fixed":"true"}\n'
       else
@@ -2565,10 +2538,7 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_OPUS_REREVIEW_20260719_007'
-      $opus-rereview.output
-      BDC_FEATURE_DEV_REVIEW_OPUS_REREVIEW_20260719_007
-      )
+      REVIEW=$(cat "$ARCHON_NODE_OUT/opus-rereview.out")
       verdict=$(printf '%s\n' "$REVIEW" \
         | grep -oE 'OPUS_REREVIEW=(satisfied|needs_revision)' \
         | tail -n 1 \
@@ -2589,18 +2559,9 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      PRIOR=$(cat <<'BDC_FEATURE_DEV_PRIOR_BLOCK_CLASSIFY_20260719_008'
-      $block-classify.output
-      BDC_FEATURE_DEV_PRIOR_BLOCK_CLASSIFY_20260719_008
-      )
-      OPUS=$(cat <<'BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_009'
-      $opus-repair.output
-      BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_009
-      )
-      REREVIEW=$(cat <<'BDC_FEATURE_DEV_REREVIEW_CLASSIFY_OPUS_REREVIEW_20260719_010'
-      $classify-opus-rereview.output
-      BDC_FEATURE_DEV_REREVIEW_CLASSIFY_OPUS_REREVIEW_20260719_010
-      )
+      PRIOR=$(cat "$ARCHON_NODE_OUT/block-classify.out")
+      OPUS=$(cat "$ARCHON_NODE_OUT/opus-repair.out")
+      REREVIEW=$(cat "$ARCHON_NODE_OUT/classify-opus-rereview.out")
       prior_status=$(printf '%s\n' "$PRIOR" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
 
       # If it wasn't blocked, keep the prior status unchanged.
@@ -2663,10 +2624,7 @@ nodes:
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      RECLASS=$(cat <<'BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_011'
-      $block-reclassify.output
-      BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_011
-      )
+      RECLASS=$(cat "$ARCHON_NODE_OUT/block-reclassify.out")
       STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
       # Only act on a BLOCKED status.
       [ "$STATUS" = "BLOCKED" ] || { echo "SALVAGE=skip (status=$STATUS)"; exit 0; }
@@ -2912,10 +2870,7 @@ nodes:
     when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
     bash: |
       set -uo pipefail
-      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_APPLY_DIFF_REVIEW_FINAL_20260719_012'
-      $apply-diff-review-final.output
-      BDC_FEATURE_DEV_REVIEW_APPLY_DIFF_REVIEW_FINAL_20260719_012
-      )
+      REVIEW=$(cat "$ARCHON_NODE_OUT/apply-diff-review-final.out")
       verdict=$(printf '%s\n' "$REVIEW" \
         | grep -oE 'APPLY_DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
         | tail -n 1 \
@@ -3068,19 +3023,13 @@ nodes:
       # creates `"'multiline\nagent\noutput'"` which bash mis-tokenizes - line 2+ of
       # the agent output becomes bare commands. Assign directly to bash vars, then
       # quote the var reference. Engine-level fix tracked in WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      DECIDE_OUTPUT=$(cat <<'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013'
-      $decide-push-target.output
-      BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013
-      )
+      DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")
       # plan-review emits a fenced output. Extract ONLY the approved-plan block so the
       # changed-file allowlist + commit message never ingest reviewer critique (F8 fix).
       # Must be the revised plan (not pre-review) or a plan-review scope change would be
       # rejected by the allowlist. FAIL CLOSED if the fence is absent (NF1): never fall
       # back to raw output, or PLAN_REVIEW_FINDINGS critique would poison the allowlist.
-      PLAN_REVIEW_RAW=$(cat <<'BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_014'
-      $plan-review.output
-      BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_014
-      )
+      PLAN_REVIEW_RAW=$(cat "$ARCHON_NODE_OUT/plan-review.out")
       # Extract APPROVED_PLAN (single-line-safe; open-model canary 3604d5bcc7b2).
       PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | python3 -c 'import sys,re;t=sys.stdin.read();m=re.search(r"===\s*APPROVED_PLAN_BEGIN\s*===(.*?)===\s*APPROVED_PLAN_END\s*===",t,re.S|re.I);body=(m.group(1).strip() if m else "");body=re.sub(r"(?<!\n)(##)",r"\n\1",body);body=re.sub(r"(?<!\n)(```)",r"\n\1",body);print(body)')
       if [ -z "$PLAN_OUTPUT" ]; then
@@ -3089,26 +3038,11 @@ nodes:
         printf '%s\n' "$PLAN_REVIEW_RAW" >&2
         exit 1
       fi
-      DIFF_FINAL=$(cat <<'BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_015'
-      $diff-review-final.output
-      BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_015
-      )
-      RECLASS=$(cat <<'BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_016'
-      $block-reclassify.output
-      BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_016
-      )
-      PAUSE_GATE=$(cat <<'BDC_FEATURE_DEV_PAUSE_GATE_PAUSE_GATE_20260719_017'
-      $pause-gate.output
-      BDC_FEATURE_DEV_PAUSE_GATE_PAUSE_GATE_20260719_017
-      )
-      APPLY_REVIEW=$(cat <<'BDC_FEATURE_DEV_APPLY_REVIEW_CLASSIFY_APPLY_REVIEW_20260719_018'
-      $classify-apply-review.output
-      BDC_FEATURE_DEV_APPLY_REVIEW_CLASSIFY_APPLY_REVIEW_20260719_018
-      )
-      OPUS_REREVIEW_CLASS=$(cat <<'BDC_FEATURE_DEV_OPUS_REREVIEW_CLASS_CLASSIFY_OPUS_REREVIEW_20260719_019'
-      $classify-opus-rereview.output
-      BDC_FEATURE_DEV_OPUS_REREVIEW_CLASS_CLASSIFY_OPUS_REREVIEW_20260719_019
-      )
+      DIFF_FINAL=$(cat "$ARCHON_NODE_OUT/diff-review-final.out")
+      RECLASS=$(cat "$ARCHON_NODE_OUT/block-reclassify.out")
+      PAUSE_GATE=$(cat "$ARCHON_NODE_OUT/pause-gate.out")
+      APPLY_REVIEW=$(cat "$ARCHON_NODE_OUT/classify-apply-review.out")
+      OPUS_REREVIEW_CLASS=$(cat "$ARCHON_NODE_OUT/classify-opus-rereview.out")
       echo "$DECIDE_OUTPUT"
       if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
         echo "Out of scope for bdc-feature-development; failing closed." >&2
@@ -3505,24 +3439,15 @@ nodes:
       # Extract ONLY the approved-plan block for the PR title/body (F8 fix) -- keep
       # reviewer critique out of the customer-visible PR. FAIL CLOSED if the fence is
       # absent (NF1): never put raw critique-bearing output in the PR body.
-      PLAN_REVIEW_RAW=$(cat <<'BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_021'
-      $plan-review.output
-      BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_021
-      )
+      PLAN_REVIEW_RAW=$(cat "$ARCHON_NODE_OUT/plan-review.out")
       # Extract APPROVED_PLAN (single-line-safe; open-model canary 3604d5bcc7b2).
       PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | python3 -c 'import sys,re;t=sys.stdin.read();m=re.search(r"===\s*APPROVED_PLAN_BEGIN\s*===(.*?)===\s*APPROVED_PLAN_END\s*===",t,re.S|re.I);body=(m.group(1).strip() if m else "");body=re.sub(r"(?<!\n)(##)",r"\n\1",body);body=re.sub(r"(?<!\n)(```)",r"\n\1",body);print(body)')
       if [ -z "$PLAN_OUTPUT" ]; then
         echo "ERROR: plan-review output missing the APPROVED_PLAN fence -- cannot build PR body (NF1 fail-closed)." >&2
         exit 1
       fi
-      IMPLEMENT_OUTPUT=$(cat <<'BDC_FEATURE_DEV_IMPLEMENT_OUTPUT_IMPLEMENT_20260719_022'
-      $implement.output
-      BDC_FEATURE_DEV_IMPLEMENT_OUTPUT_IMPLEMENT_20260719_022
-      )
-      VALIDATOR_OUTPUT=$(cat <<'BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023'
-      $war-council-validator.output
-      BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023
-      )
+      IMPLEMENT_OUTPUT=$(cat "$ARCHON_NODE_OUT/implement.out")
+      VALIDATOR_OUTPUT=$(cat "$ARCHON_NODE_OUT/war-council-validator.out")
       COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")
       if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
@@ -4129,10 +4054,7 @@ nodes:
       }
       # ---- END vma core ----
 
-      MANIFEST_OUT="$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $stamp-manifest-evidence.output
-      BDC_NODE_OUTPUT_MANIFEST
-      )"
+      MANIFEST_OUT="$(cat "$ARCHON_NODE_OUT/stamp-manifest-evidence.out")"
       FILES_CREATED="$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^Files created:' | head -1 | sed 's/^Files created:[[:space:]]*//' || true)"
       printf '%s\n' "$MANIFEST_OUT" | vma_process "$FILES_CREATED"
 
