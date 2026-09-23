@@ -20,8 +20,8 @@
  * poll.ts derives its open-node names from those same `step_name` values, so
  * node id is the correct join key.
  *
- * THE FLOOR -- configured timeouts may only EXTEND, never shorten
- * --------------------------------------------------------------
+ * THE FLOOR -- only non-whole-node timeouts must exceed the default
+ * ---------------------------------------------------------------
  * The poll budget measures silence on the PERSISTED EVENT FEED. The workflow
  * timeout fields do not measure the same thing:
  *
@@ -35,15 +35,12 @@
  *     open across every iteration, so its total legitimate open time is a
  *     multiple of this value, not this value.
  *
- * Only the first is a safe upper bound on event-feed silence. Rather than
- * special-casing node kinds and betting on the other two, this resolver clamps
- * every resolved budget to `floorMs` (the caller's generous open-node default).
- * A configured timeout can therefore only RAISE a node's budget above the
- * default -- which is exactly the reported defect -- and can never lower it.
- * Lowering is the dangerous direction: it re-creates the original incident of
- * cancelling healthy long-running work, and `implement` (a loop with
- * idle_timeout 600000 / wall_timeout_ms 1800000 that legitimately runs for
- * hours) is precisely the node an unclamped mapping would cut at 30 minutes.
+ * A valid `timeout` is preserved as configured, even at or below `floorMs`.
+ * The other two fields may only extend a budget above `floorMs`, never shorten
+ * it. With a valid `timeout`, use the maximum of that bound and any valid
+ * non-whole-node value above `floorMs`. Without one, emit only the largest
+ * non-whole-node value if it exceeds `floorMs`; otherwise omit the node so poll
+ * uses its default. Only finite, strictly positive numbers are valid.
  *
  * FAIL-OPEN
  * ---------
@@ -91,11 +88,14 @@ function positiveMs(value: unknown): number | null {
  *
  * @param workflow Parsed workflow definition (the `workflow` field of GET
  *                 /api/workflows/:name).
- * @param floorMs  Minimum budget any node may be assigned. Resolved values are
- *                 clamped up to this. Defaults to the poll open-node default.
- * @returns Map of node id -> silence budget (ms). Only nodes whose configured
- *          budget EXCEEDS `floorMs` are included; every other node is omitted so
- *          poll applies `openNodeBudgetMs` unchanged.
+ * @param floorMs  Threshold that non-whole-node fields must exceed to extend a
+ *                 budget. Defaults to the poll open-node default.
+ * @returns Map of node id -> silence budget (ms). Valid `timeout` values are
+ *          preserved even at or below `floorMs`, taking the maximum with any
+ *          `idle_timeout` or `wall_timeout_ms` above `floorMs`. Without a valid
+ *          `timeout`, only the largest non-whole-node value above `floorMs` is
+ *          emitted. Invalid values (anything other than finite, positive
+ *          numbers) are ignored; nodes with no qualifying values are omitted.
  */
 export function extractNodeTimeoutsMs(
   workflow: unknown,
@@ -111,20 +111,16 @@ export function extractNodeTimeoutsMs(
     const id = typeof node.id === 'string' ? node.id.trim() : '';
     if (!id) continue;
 
-    // Take the LARGEST configured bound present on the node. A node carrying
-    // several (e.g. a loop with both idle_timeout and wall_timeout_ms) is alive
-    // as long as the most permissive one allows.
-    const configured = Math.max(
-      positiveMs(node.timeout) ?? 0,
+    const timeout = positiveMs(node.timeout);
+    const extension = Math.max(
       positiveMs(node.idle_timeout) ?? 0,
       positiveMs(node.wall_timeout_ms) ?? 0
     );
-    if (configured <= 0) continue;
-
-    // Clamp: only an ABOVE-floor configured timeout changes behavior. Emitting a
-    // below-floor value would shorten the budget and could cancel healthy work
-    // (see the module header).
-    if (configured > floorMs) out[id] = configured;
+    if (extension > 0 && extension > floorMs) {
+      out[id] = Math.max(timeout ?? 0, extension);
+    } else if (timeout !== null) {
+      out[id] = timeout;
+    }
   }
 
   return out;
@@ -137,7 +133,7 @@ export interface FetchNodeTimeoutsOptions {
   apiBaseUrl: string;
   /** Operator token. Defaults to ARCHON_OPERATOR_TOKEN env. */
   token?: string;
-  /** Minimum budget any node may be assigned. See extractNodeTimeoutsMs. */
+  /** Threshold for non-whole-node extensions. See extractNodeTimeoutsMs. */
   floorMs?: number;
 }
 
@@ -194,7 +190,7 @@ export async function fetchNodeTimeoutsMs(
   if (count > 0) {
     console.log(
       `[smart-cauldron/node-timeouts] workflow ${workflowName}: ${String(count)} node(s) ` +
-        `configured above the ${String(floorMs)}ms open-node default -- ` +
+        `with configured budgets (open-node default: ${String(floorMs)}ms) -- ` +
         Object.entries(map)
           .map(([id, ms]) => `${id}=${String(ms)}ms`)
           .join(', ')

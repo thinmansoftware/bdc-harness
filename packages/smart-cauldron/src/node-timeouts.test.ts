@@ -49,15 +49,68 @@ describe('extractNodeTimeoutsMs', () => {
     });
   });
 
-  test('a node configured BELOW the floor is omitted, so poll keeps the default', () => {
-    // Clamping direction matters: emitting 1800000 here would SHORTEN the budget
-    // from 60m to 30m and re-create the cancel-healthy-work incident. Omission
-    // leaves poll on openNodeBudgetMs exactly as before.
-    const workflow = {
-      nodes: [{ id: 'run-stop-tests', bash: 'bun test', timeout: 1_800_000 }],
-    };
-    expect(extractNodeTimeoutsMs(workflow, DEFAULT_OPEN_NODE_BUDGET_MS)).toEqual({});
+  test.each([600_000, 1_800_000, DEFAULT_OPEN_NODE_BUDGET_MS])(
+    'a whole-node timeout of %d is preserved at or below the floor',
+    timeout => {
+      const workflow = {
+        nodes: [{ id: 'run-stop-tests', bash: 'bun test', timeout }],
+      };
+      expect(extractNodeTimeoutsMs(workflow)).toEqual({ 'run-stop-tests': timeout });
+    }
+  );
+
+  test.each(['idle_timeout', 'wall_timeout_ms'])(
+    '%s only extends the budget above the floor',
+    field => {
+      for (const value of [600_000, 1_800_000, DEFAULT_OPEN_NODE_BUDGET_MS]) {
+        expect(extractNodeTimeoutsMs({ nodes: [{ id: 'node', [field]: value }] })).toEqual({});
+      }
+      expect(extractNodeTimeoutsMs({ nodes: [{ id: 'node', [field]: 7_200_000 }] })).toEqual({
+        node: 7_200_000,
+      });
+    }
+  );
+
+  test('a node with no timeout fields is omitted', () => {
+    expect(extractNodeTimeoutsMs({ nodes: [{ id: 'node' }] })).toEqual({});
   });
+
+  test.each(['timeout', 'idle_timeout', 'wall_timeout_ms'])(
+    'invalid %s values are ignored',
+    field => {
+      for (const value of [-5, 0, NaN, Infinity, '600000', null, true, {}]) {
+        expect(extractNodeTimeoutsMs({ nodes: [{ id: 'node', [field]: value }] })).toEqual({});
+      }
+    }
+  );
+
+  test.each(['idle_timeout', 'wall_timeout_ms'])(
+    '%s can extend a whole-node timeout only above the floor',
+    field => {
+      for (const value of [1_800_000, DEFAULT_OPEN_NODE_BUDGET_MS, NaN]) {
+        expect(
+          extractNodeTimeoutsMs({
+            nodes: [{ id: 'node', timeout: 600_000, [field]: value }],
+          })
+        ).toEqual({ node: 600_000 });
+      }
+      expect(
+        extractNodeTimeoutsMs({
+          nodes: [{ id: 'node', timeout: 600_000, [field]: 7_200_000 }],
+        })
+      ).toEqual({ node: 7_200_000 });
+      expect(
+        extractNodeTimeoutsMs({
+          nodes: [{ id: 'node', timeout: 9_000_000, [field]: 7_200_000 }],
+        })
+      ).toEqual({ node: 9_000_000 });
+      expect(
+        extractNodeTimeoutsMs({
+          nodes: [{ id: 'node', timeout: '600000', [field]: 7_200_000 }],
+        })
+      ).toEqual({ node: 7_200_000 });
+    }
+  );
 
   test("the real 'implement' loop is NOT tightened by its per-iteration caps", () => {
     // bdc-feature-development's implement node: idle_timeout 10m (enforced on SDK
@@ -84,7 +137,8 @@ describe('extractNodeTimeoutsMs', () => {
   });
 
   test('a lower floor lets more nodes through (floor is honored, not hardcoded)', () => {
-    const workflow = { nodes: [{ id: 'a', timeout: 1_800_000 }] };
+    const workflow = { nodes: [{ id: 'a', idle_timeout: 1_800_000 }] };
+    expect(extractNodeTimeoutsMs(workflow)).toEqual({});
     expect(extractNodeTimeoutsMs(workflow, 600_000)).toEqual({ a: 1_800_000 });
   });
 
