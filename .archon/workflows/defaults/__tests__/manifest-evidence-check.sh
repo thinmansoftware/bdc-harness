@@ -96,6 +96,18 @@ for fn in sme_field sme_process; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
+# The rsg core (run-stop-greps) is eval'd here too so Test 5 can exercise the REAL
+# all-unparsed output path end to end (rsg_run -> GREP_DETAIL extraction -> mec_check)
+# instead of fabricating a detail line (WO-HARNESS-MANIFEST-EVIDENCE-FALSE-POSITIVES-01).
+RSG_CORE="$(extract_core "$CANONICAL_YAML" rsg)"
+if [ -z "$RSG_CORE" ]; then
+  echo "FATAL: could not extract rsg core from $CANONICAL_YAML"; exit 1
+fi
+eval "$RSG_CORE"
+for fn in rsg_extract rsg_run; do
+  if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
+done
+
 echo "--- Parity: mec core byte-identical across all 12 lanes ---"
 for lane in $LANES; do
   assert_eq "mec parity $lane" "$MEC_CORE" "$(extract_core "$DEFAULTS/$lane" mec)"
@@ -175,14 +187,57 @@ assert_contains "Stop conditions line names the unparsed condition" "unparsed=gr
 assert_contains "Stop conditions line carries dropped count" "dropped=0" "$STAMPED"
 assert_contains "incomplete is not stamped as a validation failure" "VALIDATION: PASS" "$STAMPED"
 
+echo "--- Test 4b: incomplete must carry consistent inputs or it fails closed ---"
+# grep_status=incomplete is trusted ONLY when grep_executed>=1 and grep_mismatch=0.
+# A missing/inconsistent upstream (executed=0 or mismatch>0 under an 'incomplete'
+# label) fails closed rather than being admitted on the status string alone.
+R="$(run_check "$GOOD" PROCEED CODE passed 0 3 0 0 3 0 incomplete "")"
+assert_eq "incomplete + executed=0 rc 1" "1" "${R%%|*}"
+assert_contains "incomplete + executed=0 is EVIDENCE_ERROR" "EVIDENCE_ERROR" "$R"
+assert_contains "incomplete + executed=0 names grep_executed" "grep_executed=0" "$R"
+R="$(run_check "$GOOD" PROCEED CODE passed 0 3 2 0 1 1 incomplete "")"
+assert_eq "incomplete + mismatch>0 rc 1" "1" "${R%%|*}"
+assert_contains "incomplete + mismatch>0 is EVIDENCE_ERROR" "EVIDENCE_ERROR" "$R"
+assert_contains "incomplete + mismatch>0 names grep_mismatch" "grep_mismatch=1" "$R"
+R="$(run_check "$GOOD" PROCEED CODE passed 0 3 "" 0 3 "" incomplete "")"
+assert_eq "incomplete + missing executed/mismatch rc 1" "1" "${R%%|*}"
+assert_contains "incomplete + missing inputs is EVIDENCE_ERROR" "EVIDENCE_ERROR" "$R"
+
+# mec_grep_detail <GREPS_OUT>  -- verbatim replica of the manifest-evidence-check
+# node body's GREP_DETAIL extraction (the sed|grep that feeds mec_check's grep_detail
+# arg). Kept in lockstep with the node body line in every lane.
+mec_grep_detail() {
+  printf '%s\n' "$1" | sed -n '/--- per-assertion detail ---/,$p' | grep -E '^(DROPPED|MISMATCH|UNPARSED)' || true
+}
+
 echo "--- Test 5: zero executed greps is a SPEC_DEFECT, not an EVIDENCE_ERROR ---"
-# Fixture A: 3 declared, all unparsed prose (event-store 'all_dropped').
-DETAIL_A='DROPPED (not on read-only allowlist; not executed): the launcher opens => expected >= 1'
-R="$(run_check "$NA_GREPS" PROCEED CODE passed 0 3 0 0 3 0 all_dropped "$DETAIL_A")"
+# Fixture A: the REAL all-unparsed path. A spec whose only grep stop condition is a
+# header with no parseable expectation is UNPARSED (not DROPPED): rsg_run must carry
+# its name into the per-assertion detail so the node's GREP_DETAIL extraction preserves
+# it and mec's SPEC_DEFECT can name it. Exercised end to end (no fabricated detail).
+ALL_UNPARSED_SPEC='# WO-X
+
+WO Class: CODE
+
+## 8. Stop conditions (CI-executable)
+
+Stop 1 (grep assertion, header without an Expected line):
+  grep -c widgetFactory src/app.js
+'
+GREPS_OUT_A="$(printf '%s\n' "$ALL_UNPARSED_SPEC" | rsg_extract | rsg_run)"
+assert_contains "fixture A rsg_run reports all_dropped" "GREP_STATUS=all_dropped" "$GREPS_OUT_A"
+assert_contains "fixture A rsg_run declared exactly one condition" "GREP_DECLARED=1" "$GREPS_OUT_A"
+assert_contains "fixture A rsg_run executed nothing" "GREP_EXECUTED=0" "$GREPS_OUT_A"
+DETAIL_A="$(mec_grep_detail "$GREPS_OUT_A")"
+assert_contains "fixture A per-assertion detail names the UNPARSED condition" "grep -c widgetFactory src/app.js" "$DETAIL_A"
+DECLARED_A="$(mec_field GREP_DECLARED "$GREPS_OUT_A")"
+EXECUTED_A="$(mec_field GREP_EXECUTED "$GREPS_OUT_A")"
+UNPARSED_A="$(mec_field GREP_UNPARSED "$GREPS_OUT_A")"
+R="$(run_check "$NA_GREPS" PROCEED CODE passed 0 "$DECLARED_A" "$EXECUTED_A" 0 "$UNPARSED_A" 0 all_dropped "$DETAIL_A")"
 assert_eq "fixture A rc 1" "1" "${R%%|*}"
 assert_contains "fixture A prefix is SPEC_DEFECT" "SPEC_DEFECT:" "$R"
 assert_not_contains "fixture A does not blame builder with EVIDENCE_ERROR" "EVIDENCE_ERROR" "$R"
-assert_contains "fixture A names the condition via the DROPPED detail" "the launcher opens" "$R"
+assert_contains "fixture A names the real all-unparsed condition" "grep -c widgetFactory src/app.js" "$R"
 # Fixture B: 1 declared, allowlist-refused (event-store 'all_dropped', dropped=1).
 DETAIL_B='DROPPED (not on read-only allowlist; not executed): curl https://x => expected 200'
 R="$(run_check "$NA_GREPS" PROCEED INFRA not_required 0 1 0 1 0 0 all_dropped "$DETAIL_B")"

@@ -1877,6 +1877,9 @@ nodes:
           fi
           out="${out:+$out; }$cmd => $obs"
         done
+        if [ "$unparsed" -gt 0 ]; then
+          detail="${detail}UNPARSED (no parseable expectation; not executed): ${unparsed_names:-$unparsed unnamed assertion(s)}"$'\n'
+        fi
         if [ "$declared" -eq 0 ]; then
           status="none_declared"; out="N/A (spec declares no grep stop conditions)"
         elif [ "$executed" -eq 0 ]; then
@@ -3735,8 +3738,23 @@ nodes:
         fi
         if [ "$grep_declared" -gt 0 ] 2>/dev/null; then
           case "$grep_status" in
-            passed|incomplete)
+            passed)
               :
+              ;;
+            incomplete)
+              # 'incomplete' is admitted only when it carries real executed
+              # evidence and zero mismatches. A missing or inconsistent upstream
+              # (grep_executed<1 or grep_mismatch>0 under an 'incomplete' label)
+              # fails closed rather than being trusted on the status string alone
+              # (WO-HARNESS-MANIFEST-EVIDENCE-FALSE-POSITIVES-01).
+              if ! [ "${grep_executed:-0}" -ge 1 ] 2>/dev/null; then
+                echo "EVIDENCE_ERROR: grep_status=incomplete but grep_executed=${grep_executed:-missing} (<1). An incomplete grep result must have at least one executed assertion; missing or inconsistent upstream evidence fails closed (bdc-xo #1940)." >&2
+                return 1
+              fi
+              if ! [ "${grep_mismatch:-0}" -eq 0 ] 2>/dev/null; then
+                echo "EVIDENCE_ERROR: grep_status=incomplete but grep_mismatch=${grep_mismatch:-missing} (>0). An executed grep assertion that returned the wrong count is real evidence against the work; inconsistent upstream evidence fails closed (bdc-xo #1940)." >&2
+                return 1
+              fi
               ;;
             mismatch)
               echo "EVIDENCE_ERROR: ${grep_mismatch:-1} of ${grep_declared} declared grep stop condition(s) executed but returned the wrong count (grep_status=mismatch). An executed grep assertion that fails its expected count is real evidence against the work (bdc-xo #1940)." >&2
@@ -3776,7 +3794,7 @@ nodes:
       $stamp-manifest-evidence.output
       BDC_NODE_OUTPUT_MANIFEST
       )
-      GREP_DETAIL=$(printf '%s\n' "$GREPS_OUT" | sed -n '/--- per-assertion detail ---/,$p' | grep -E '^(DROPPED|MISMATCH)' || true)
+      GREP_DETAIL=$(printf '%s\n' "$GREPS_OUT" | sed -n '/--- per-assertion detail ---/,$p' | grep -E '^(DROPPED|MISMATCH|UNPARSED)' || true)
       printf '%s\n' "$MANIFEST_OUT" | mec_check "$STATUS" \
         "$(mec_field TESTS_CLASS "$TESTS_OUT")" "$(mec_field TESTS_STATUS "$TESTS_OUT")" \
         "$(mec_field TESTS_EXIT "$TESTS_OUT")" \
