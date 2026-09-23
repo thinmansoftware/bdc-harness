@@ -49,6 +49,8 @@ import {
   claimEscalation,
   markEscalated,
   markGivenUp,
+  extendDueOnce,
+  setLastEscalationState,
   getExpectationCounts,
   setPauseState,
   updateActionOutcome,
@@ -247,6 +249,122 @@ describe('tm_expectations DAL', () => {
       await second.close();
       cleanupDb(path);
     }
+  });
+
+  test('additive_migration_old_shape_upgrade', async () => {
+    // A database at the 049/050 shape (registration_key + escalating CHECK +
+    // named unique index + front-door columns) but WITHOUT the migration-056
+    // mailbox columns. The additive path must ADD last_escalation_state and
+    // due_extended by ALTER -- never a table recreate that would drop rows.
+    const legacyPath = join(tmpdir(), `taskmaster-056-${Date.now()}-${Math.random()}.db`);
+    const seed = new Database(legacyPath);
+    seed.run(`CREATE TABLE tm_expectations (
+      id TEXT PRIMARY KEY,
+      registration_key TEXT NOT NULL UNIQUE,
+      dispatch_ref TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      due_at TEXT NOT NULL,
+      on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
+      max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+      retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
+      ),
+      evidence_pointer TEXT,
+      registered_by TEXT,
+      self_supervised INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1)),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`);
+    seed.run(
+      'CREATE UNIQUE INDEX idx_tm_expectations_registration_key ON tm_expectations(registration_key)'
+    );
+    for (let i = 1; i <= 3; i += 1) {
+      seed.run(
+        `INSERT INTO tm_expectations
+         (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
+          max_retries, retries, status, registered_by, self_supervised, created_at, updated_at)
+         VALUES (?, ?, ?, 'xo', '{}', '1970-01-01T00:00:00.000Z', 'escalate', 0, 0, 'pending',
+                 'taskmaster', 0, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
+        [`row-${i}`, `key-${i}`, `dispatch-${i}`]
+      );
+    }
+    seed.close();
+
+    const upgraded = new SqliteAdapter(legacyPath);
+    try {
+      const previous = db;
+      db = upgraded;
+      try {
+        // The three rows survive with the new columns defaulted.
+        const rows = await upgraded.query<{
+          id: string;
+          last_escalation_state: string | null;
+          due_extended: number;
+        }>('SELECT id, last_escalation_state, due_extended FROM tm_expectations ORDER BY id');
+        expect(rows.rows.map(r => r.id)).toEqual(['row-1', 'row-2', 'row-3']);
+        for (const r of rows.rows) {
+          expect(r.last_escalation_state).toBeNull();
+          expect(Number(r.due_extended)).toBe(0);
+        }
+
+        // The server boots against it: registration and a due-scan both work.
+        const id = await registerExpectation({
+          action_ref: 'after-056',
+          dispatch_ref: 'post-056-dispatch',
+          recipient: 'xo',
+          evidence_json: '{}',
+          due_at: new Date(0).toISOString(),
+          on_absence: 'escalate',
+          max_retries: 0,
+        });
+        expect(typeof id).toBe('string');
+        const due = await listDueExpectations(new Date().toISOString());
+        expect(due.length).toBe(4);
+        // normalizeExpectation surfaces the new fields with safe defaults.
+        const seeded = due.find(e => e.id === 'row-1');
+        expect(seeded?.last_escalation_state).toBeNull();
+        expect(seeded?.due_extended).toBe(0);
+      } finally {
+        db = previous;
+      }
+    } finally {
+      await upgraded.close();
+      cleanupDb(legacyPath);
+    }
+  });
+
+  test('extendDueOnce is a one-shot compare-and-set and setLastEscalationState records the tuple', async () => {
+    const id = await registerExpectation({
+      action_ref: 'mailbox-dal',
+      dispatch_ref: 'mailbox-dispatch',
+      recipient: 'operator',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    const originalDue = new Date(0).toISOString();
+    const newDue = new Date(1_000_000).toISOString();
+
+    // First extension wins against the observed due_at.
+    expect(await extendDueOnce(id, newDue, originalDue)).toBe(true);
+    let after = (await listExpectations({ limit: 10 })).rows.find(e => e.id === id);
+    expect(after?.due_at).toBe(newDue);
+    expect(after?.due_extended).toBe(1);
+
+    // A second extension is refused: due_extended is already 1 AND the observed
+    // (original) deadline no longer matches. The row is not moved again.
+    expect(await extendDueOnce(id, new Date(2_000_000).toISOString(), newDue)).toBe(false);
+    after = (await listExpectations({ limit: 10 })).rows.find(e => e.id === id);
+    expect(after?.due_at).toBe(newDue);
+    expect(after?.due_extended).toBe(1);
+
+    // The suppression tuple is persisted verbatim and read back.
+    await setLastEscalationState(id, '2026-09-22T00:00:00.000Z||queued');
+    after = (await listExpectations({ limit: 10 })).rows.find(e => e.id === id);
+    expect(after?.last_escalation_state).toBe('2026-09-22T00:00:00.000Z||queued');
   });
 
   test('registering twice for the same dispatch yields one row and the same id', async () => {

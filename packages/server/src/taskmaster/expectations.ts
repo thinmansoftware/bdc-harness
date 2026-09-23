@@ -5,11 +5,59 @@ import {
   getMessage,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
+  type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 
 const log = createLogger('taskmaster/expectations');
 const DEFAULT_RETRY_DELAY_MS = 15 * 60 * 1000;
+/**
+ * The single extension a "read but not yet closed" mailbox row is granted
+ * (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-01). Kept equal to loop.ts's
+ * PROOF_DEADLINE_MS (24h) so the extended deadline matches the interval the
+ * original proof was granted. Overridable via deps for deterministic tests.
+ */
+const PROOF_DEADLINE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Resolution of a `dispatch_reply_exists` expectation against the recipient's
+ * delivery mode:
+ *  - 'met'         the proof exists (a done/succeeded reply for a worker_poll
+ *                  recipient, or an ADDRESSED dispatched row for a mailbox one).
+ *  - 'in_progress' mailbox only: the row was READ (acknowledged) but not yet
+ *                  CLOSED (addressed) -- neither met nor absent.
+ *  - 'absent'      no proof: redispatch/escalate per on_absence, as before.
+ */
+type EvidenceState = 'met' | 'in_progress' | 'absent';
+
+interface ResolvedEvidence {
+  evidence: EvidenceResult;
+  state: EvidenceState;
+  /**
+   * The dispatched row, loaded ONLY when a `dispatch_reply_exists` expectation
+   * was resolved through a MAILBOX recipient (drain_on_start / notify_only);
+   * null for every other path. It carries the (acknowledged_at, addressed_at,
+   * status) tuple the escalation-suppression rule compares, so non-mailbox
+   * escalations keep their pre-change behaviour untouched.
+   */
+  mailboxRow: DispatchMessage | null;
+}
+
+/**
+ * The dispatched row's evidence tuple, as a stable string. An escalation is
+ * re-sent only when this tuple has CHANGED since the last escalation; an
+ * unchanged tuple is suppressed (see checkExpectations). Deliberately includes
+ * status alongside the two mailbox timestamps so that, e.g., a cancel that
+ * leaves both timestamps null still counts as a change.
+ */
+function escalationStateTuple(row: DispatchMessage): string {
+  return `${row.acknowledged_at ?? ''}|${row.addressed_at ?? ''}|${row.status}`;
+}
+
+/** Mailbox delivery modes: a read is the proof, not a done-reply. */
+function isMailboxMode(mode: string | null | undefined): boolean {
+  return mode === 'drain_on_start' || mode === 'notify_only';
+}
 
 export type EvidenceSpec =
   | { kind: 'issue_comment_exists'; repo: string; number: number; author?: string; marker?: string }
@@ -72,6 +120,34 @@ export interface ExpectationDeps {
   markEscalated?: (id: string, evidencePointer?: string) => Promise<boolean | undefined>;
   markGivenUp?: (id: string, reason: string) => Promise<boolean | undefined>;
   getMessage?: (id: string) => Promise<DispatchMessage | null>;
+  /**
+   * Resolve a recipient's delivery mode, injected by loop.ts from the SAME
+   * `assessDispatchRecipient` it already uses for grading (M-155 Amendment 03).
+   * When PRESENT, a `dispatch_reply_exists` expectation owed by a mailbox
+   * principal (drain_on_start / notify_only) is satisfied by the dispatched row
+   * being ADDRESSED rather than by a done-reply that mailbox principals never
+   * produce. When ABSENT (unit tests that do not model recipients, or any caller
+   * that does not wire it), resolution falls back to the pre-change
+   * done-reply query for every recipient -- so the expectations unit suite stays
+   * hermetic and no code path silently opens a database. loop.ts (the sole
+   * production caller) always injects the real function.
+   */
+  assessDispatchRecipient?: (recipient: string) => Promise<DispatchRecipientAssessment>;
+  /**
+   * Grant the one due_at extension an acknowledged-but-unaddressed mailbox row
+   * is owed. `undefined` is accepted (like the other transition hooks) so a test
+   * double that does not model contention still compiles; only an explicit
+   * `false` is treated as a lost compare-and-set.
+   */
+  extendDueOnce?: (
+    id: string,
+    newDueAt: string,
+    expectedDueAt: string
+  ) => Promise<boolean | undefined>;
+  /** Persist the evidence tuple an escalation was sent against (suppression bookkeeping). */
+  setLastEscalationState?: (id: string, tuple: string) => Promise<void>;
+  /** Override the mailbox in-progress extension window (defaults to PROOF_DEADLINE_MS). */
+  proofDeadlineMs?: number;
   createTask?: typeof createAuthenticatedMessage;
   /**
    * Existence probe for an already-claimed attempt's deterministic key. Returns
@@ -435,16 +511,81 @@ function describeEvidence(spec: EvidenceSpec): string {
   }
 }
 
+/**
+ * Resolve one expectation's evidence, mailbox-aware.
+ *
+ * For every spec kind OTHER than `dispatch_reply_exists`, and for
+ * `dispatch_reply_exists` whenever no recipient resolver is wired, this is
+ * exactly the pre-change behaviour: run checkEvidence and map ok -> met /
+ * absent. The mailbox branch fires ONLY for a `dispatch_reply_exists` spec whose
+ * recipient resolves (through the injected assessDispatchRecipient) to a mailbox
+ * delivery mode -- drain_on_start or notify_only -- because those principals are
+ * read, never replied to, so a `status='done'` reply can never arrive. There the
+ * dispatched row's addressed_at / acknowledged_at decide the state:
+ *   addressed  -> met       (the consumer or a human closed it)
+ *   acknowledged, not addressed -> in_progress (read, still open)
+ *   neither    -> absent     (nobody has even read it)
+ * worker_poll, alias_resolved, and unknown/inactive principals fall through to
+ * the unchanged done-reply query (matrix rows in the WO section 9).
+ */
+async function resolveEvidenceForRecipient(
+  spec: EvidenceSpec,
+  expectation: taskmasterDb.TmExpectation,
+  deps: ExpectationDeps
+): Promise<ResolvedEvidence> {
+  const runCheck =
+    deps.checkEvidence ?? ((s: EvidenceSpec): Promise<EvidenceResult> => checkEvidence(s, deps));
+
+  // Only dispatch_reply_exists can be owed by a mailbox principal; and without a
+  // recipient resolver there is no way (and no need) to diverge from the query.
+  if (spec.kind !== 'dispatch_reply_exists' || !deps.assessDispatchRecipient) {
+    const evidence = await runCheck(spec);
+    return { evidence, state: evidence.ok ? 'met' : 'absent', mailboxRow: null };
+  }
+
+  const assessment = await deps.assessDispatchRecipient(expectation.recipient);
+  if (!isMailboxMode(assessment.delivery_mode)) {
+    // worker_poll / alias_resolved / unknown -> pre-change done-reply query.
+    const evidence = await runCheck(spec);
+    return { evidence, state: evidence.ok ? 'met' : 'absent', mailboxRow: null };
+  }
+
+  // Mailbox recipient: the dispatched row itself is the evidence.
+  const row = await (deps.getMessage ?? getMessage)(expectation.dispatch_ref);
+  if (!row) {
+    // The dispatched row is gone. Treat as absent so the existing
+    // dispatch-missing handling (markGivenUp) runs; do NOT fabricate a met.
+    return { evidence: { ok: false, pointer: null }, state: 'absent', mailboxRow: null };
+  }
+  if (row.addressed_at) {
+    return {
+      evidence: { ok: true, pointer: `dispatch:${row.id}:addressed` },
+      state: 'met',
+      mailboxRow: row,
+    };
+  }
+  if (row.acknowledged_at) {
+    return { evidence: { ok: false, pointer: null }, state: 'in_progress', mailboxRow: row };
+  }
+  return { evidence: { ok: false, pointer: null }, state: 'absent', mailboxRow: row };
+}
+
 export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): Promise<void> {
   const list = deps.listDueExpectations ?? taskmasterDb.listDueExpectations;
   const active = await list(now.toISOString());
   for (const expectation of active) {
     let evidence: EvidenceResult;
+    let state: EvidenceState;
+    let mailboxRow: DispatchMessage | null;
     try {
-      evidence = await (
-        deps.checkEvidence ??
-        ((spec: EvidenceSpec): Promise<EvidenceResult> => checkEvidence(spec, deps))
-      )(JSON.parse(expectation.evidence_json) as EvidenceSpec);
+      const resolved = await resolveEvidenceForRecipient(
+        JSON.parse(expectation.evidence_json) as EvidenceSpec,
+        expectation,
+        deps
+      );
+      evidence = resolved.evidence;
+      state = resolved.state;
+      mailboxRow = resolved.mailboxRow;
     } catch (error) {
       log.warn(
         { err: error as Error, expectationId: expectation.id },
@@ -452,7 +593,7 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       );
       continue;
     }
-    if (evidence.ok) {
+    if (state === 'met') {
       const closed = await (deps.markMet ?? taskmasterDb.markMet)(
         expectation.id,
         evidence.pointer ?? 'verified'
@@ -471,6 +612,65 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
     // those is how the owed escalation would be lost.
     if (expectation.status !== 'escalating') {
       if (now.getTime() < Date.parse(expectation.due_at)) continue;
+    }
+
+    // ESCALATION SUPPRESSION -- once per (expectation id, evidence tuple).
+    //
+    // An escalation was already sent for this expectation (last_escalation_state
+    // is set) and the dispatched row's (acknowledged_at, addressed_at, status)
+    // tuple has NOT changed since. Re-sending would file an identical blocker in
+    // the xo mailbox every tick -- the exact flood this WO removes. Log and skip.
+    //
+    // Gated on a non-null mailboxRow, so it is a strict no-op for worker_poll and
+    // every other non-mailbox path (those never set last_escalation_state, and
+    // their idempotency_key + terminal 'escalated' status already dedupe them).
+    // An 'escalating' row is exempt: it is an unconfirmed send owed a replay
+    // under its deterministic key, not a fresh escalation.
+    if (
+      expectation.status !== 'escalating' &&
+      mailboxRow !== null &&
+      expectation.last_escalation_state !== null &&
+      escalationStateTuple(mailboxRow) === expectation.last_escalation_state
+    ) {
+      log.info(
+        { expectationId: expectation.id, tuple: expectation.last_escalation_state },
+        'taskmaster.escalation_suppressed_unchanged'
+      );
+      continue;
+    }
+
+    // MAILBOX IN-PROGRESS -- read, but not yet closed.
+    //
+    // A mailbox recipient whose dispatched row was acknowledged (a human or the
+    // consumer has READ it) but not yet addressed is neither met nor absent: it
+    // is in progress. Grant it exactly ONE further PROOF_DEADLINE before it may
+    // escalate, then stop the tick. due_extended is the one-shot flag; a second
+    // in-progress observation finds it already 1 and falls through to the
+    // absent/escalation path below. Only mailbox resolution yields 'in_progress'.
+    if (state === 'in_progress' && expectation.status !== 'escalating') {
+      if (expectation.due_extended === 0) {
+        const extendedDueAt = new Date(
+          now.getTime() + (deps.proofDeadlineMs ?? PROOF_DEADLINE_MS)
+        ).toISOString();
+        const extended = await (deps.extendDueOnce ?? taskmasterDb.extendDueOnce)(
+          expectation.id,
+          extendedDueAt,
+          expectation.due_at
+        );
+        if (extended === false)
+          log.warn(
+            { expectationId: expectation.id },
+            'taskmaster.expectation_extend_transition_lost'
+          );
+        else
+          log.info(
+            { expectationId: expectation.id, dueAt: extendedDueAt },
+            'taskmaster.expectation_mailbox_in_progress_extended'
+          );
+        continue;
+      }
+      // due_extended === 1: the single extension is spent and the row is STILL
+      // only acknowledged. It now escalates like an absent row; fall through.
     }
 
     // RECOVERY FIRST, AND INDEPENDENT OF CLAIMING ANYTHING.
@@ -730,6 +930,16 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
     if (escalated === false) {
       log.warn({ expectationId: expectation.id }, 'taskmaster.expectation_escalated_confirm_lost');
       continue;
+    }
+    // Record the evidence tuple this escalation was sent against, so a later
+    // tick that sees the SAME tuple suppresses the repeat instead of re-filing
+    // the blocker. Only mailbox resolution carries a row here; other paths reach
+    // terminal 'escalated' and are never reselected, so they need no tuple.
+    if (mailboxRow !== null) {
+      await (deps.setLastEscalationState ?? taskmasterDb.setLastEscalationState)(
+        expectation.id,
+        escalationStateTuple(mailboxRow)
+      );
     }
     log.error({ expectationId: expectation.id }, 'taskmaster.expectation_escalated');
   }

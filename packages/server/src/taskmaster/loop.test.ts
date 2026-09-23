@@ -30,7 +30,12 @@ import {
 import { checkEvidence } from './expectations';
 import type { DispatchDeliveryMode } from '@archon/core/db/dispatch';
 import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
-import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal, NUDGE_CLOCK_MS } from './rules';
+import {
+  MAX_INTERVENTIONS_PER_ITEM_24H,
+  type ActionProposal,
+  NUDGE_CLOCK_MS,
+  usefulRateFloorBreached,
+} from './rules';
 import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
 import type { ThreadSnapshot } from './rules';
 import type {
@@ -3495,5 +3500,122 @@ describe('M-155 exception push (loop)', () => {
       }
       expect(/pause_state:\s*'RUNNING'/.test(source)).toBe(false);
     }
+  });
+});
+
+describe('mailbox grading (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-01)', () => {
+  test('grading_excludes_in_progress_and_counts_addressed_useful', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+
+    // Three nudges to mailbox (notify_only) recipients. notify_only is "heard"
+    // once acknowledged (M-155 Amendment 03 excludes only drain_on_start), so
+    // these exercise the mailbox refinement rather than the unheard gate.
+    //   A: acknowledged AND addressed before the deadline -> useful.
+    //   B: acknowledged, NOT addressed, deadline passed    -> in progress: ungraded.
+    //   C: never acknowledged, deadline passed             -> unheard (excluded).
+    const dispatchRows: Record<
+      string,
+      {
+        id: string;
+        recipient: string;
+        resolved_recipient: string | null;
+        acknowledged_at: string | null;
+        addressed_at: string | null;
+        addressed_by: string | null;
+      }
+    > = {
+      'tm:nudge:A': {
+        id: 'tm:nudge:A',
+        recipient: 'overseer',
+        resolved_recipient: null,
+        acknowledged_at: new Date(T0 - 40_000).toISOString(),
+        addressed_at: new Date(T0 - 20_000).toISOString(),
+        addressed_by: 'overseer',
+      },
+      'tm:nudge:B': {
+        id: 'tm:nudge:B',
+        recipient: 'cauldron',
+        resolved_recipient: null,
+        acknowledged_at: new Date(T0 - 40_000).toISOString(),
+        addressed_at: null,
+        addressed_by: null,
+      },
+      'tm:nudge:C': {
+        id: 'tm:nudge:C',
+        recipient: 'overseer',
+        resolved_recipient: null,
+        acknowledged_at: null,
+        addressed_at: null,
+        addressed_by: null,
+      },
+    };
+
+    const seedNudge = (
+      id: string,
+      key: string,
+      recipient: string,
+      deadlineFromNow: number
+    ): void => {
+      world.journal.push({
+        id,
+        created_at: new Date(T0 - 60_000).toISOString(),
+        thread_ref: `gh:thinmansoftware/bdc-xo#${id}`,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        idempotency_key: key,
+        before_hash: null,
+        proof_predicate: 'mailbox nudge',
+        proof_deadline_at: new Date(T0 + deadlineFromNow).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+      world.sentMessages.push({
+        idempotency_key: key,
+        recipient,
+        body: 'nudge',
+        createdAt: new Date(T0 - 45_000).toISOString(),
+        acknowledged_at: dispatchRows[key]!.acknowledged_at,
+      });
+    };
+    seedNudge('grade-A', 'tm:nudge:A', 'overseer', 60_000); // deadline in future
+    seedNudge('grade-B', 'tm:nudge:B', 'cauldron', -1); // deadline passed
+    seedNudge('grade-C', 'tm:nudge:C', 'overseer', -1); // deadline passed
+
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        getGithubIssueEvidence: async () => null, // no SOR movement for any of them
+        getDispatchMessageById: (async (id: string) =>
+          dispatchRows[id] ?? null) as unknown as TaskmasterDeps['getDispatchMessageById'],
+      })
+    );
+
+    const gradeOf = (id: string): string | null =>
+      world.journal.find(row => row.id === id)?.grade ?? null;
+
+    // A addressed -> useful (raises the numerator).
+    expect(gradeOf('grade-A')).toBe('useful');
+    // B read but not closed -> in progress, left UNGRADED (excluded, not noise).
+    expect(gradeOf('grade-B')).toBeNull();
+    // C never acknowledged -> unheard (M-155 Amendment 03; excluded from the
+    // floor denominator). The spec's Test 5 sketch calls C 'noise', but Section
+    // 9's binding "KEEP Amendment 03" rules an un-acknowledged mailbox send
+    // 'unheard'; either way it is excluded, so the floor is computed honestly.
+    expect(gradeOf('grade-C')).toBe('unheard');
+
+    // Floor denominator counts only useful/noise: useful=1, noise=0 -> not breached.
+    let usefulCount = 0;
+    let noiseCount = 0;
+    for (const row of world.journal) {
+      if (row.grade === 'useful') usefulCount += 1;
+      else if (row.grade === 'noise') noiseCount += 1;
+    }
+    expect(usefulCount).toBe(1);
+    expect(noiseCount).toBe(0);
+    expect(usefulRateFloorBreached(usefulCount, noiseCount)).toBe(false);
+    // The loop was NOT auto-paused by the useful-rate floor.
+    expect(world.control.pause_state).toBe('RUNNING');
   });
 });
