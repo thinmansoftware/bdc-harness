@@ -620,6 +620,8 @@ nodes:
   # any *-blocked.json exists.
   # ---------------------------------------------------------------------------
   - id: implement-pipeline
+    # CI-green gate waits exceed the 180 s default (run ce159483).
+    idle_timeout: 1800000
     persona: major-build
     depends_on: [allocate-stage-worktrees]
     agent: major-build
