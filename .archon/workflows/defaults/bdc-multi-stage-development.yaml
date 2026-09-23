@@ -542,12 +542,12 @@ nodes:
             codebaseName: st.repo,
             canonicalRepoPath: st.canonicalRepoPath,
             targetBranch: st.target_branch,
-            baseSha: result.baseSha,
           });
           out.push({
             stageId: result.stageId,
             branchName: result.branchName,
             worktreePath: result.worktreePath,
+            baseSha: result.baseSha,
             codebaseId: result.codebaseId,
             canonicalRepoPath: st.canonicalRepoPath,
             repo: st.repo,
@@ -620,6 +620,8 @@ nodes:
   # any *-blocked.json exists.
   # ---------------------------------------------------------------------------
   - id: implement-pipeline
+    # CI-green gate waits exceed the 180 s default (run ce159483).
+    idle_timeout: 1800000
     persona: major-build
     depends_on: [allocate-stage-worktrees]
     agent: major-build
