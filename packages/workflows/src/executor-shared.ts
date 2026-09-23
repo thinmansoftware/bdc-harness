@@ -451,8 +451,13 @@ export function substituteWorkflowVariables(
   // longer shell variable that begins with a workflow variable name (e.g.
   // $BASE_BRANCH_OVERRIDE, $BASE_BRANCH_PR) is left verbatim. ${run.id} is
   // brace-delimited and already exact, so it is replaced directly.
-  let result = prompt.replace(/\$\{run\.id\}/g, workflowId);
-  result = boundedReplace(result, 'WORKFLOW_ID', workflowId);
+  //
+  // Order is load-bearing: $WORKFLOW_ID is substituted BEFORE ${run.id} to
+  // preserve the pre-refactor cascading behavior. Both bind to `workflowId`,
+  // so the order only matters when `workflowId` itself contains one of these
+  // tokens; keeping $WORKFLOW_ID first matches the original replacement chain.
+  let result = boundedReplace(prompt, 'WORKFLOW_ID', workflowId);
+  result = result.replace(/\$\{run\.id\}/g, workflowId);
   result = boundedReplace(result, 'USER_MESSAGE', userMessage);
   result = boundedReplace(result, 'ARGUMENTS', userMessage);
   result = boundedReplace(result, 'ARTIFACTS_DIR', artifactsDir);

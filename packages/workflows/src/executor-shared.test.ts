@@ -54,6 +54,38 @@ describe('substituteWorkflowVariables', () => {
     expect(prompt).toBe('Run ID: run-123');
   });
 
+  it('replaces ${run.id} with the run ID', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Run ID: ${run.id}',
+      'run-123',
+      'hello',
+      '/tmp/artifacts',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Run ID: run-123');
+  });
+
+  // Regression (diff-review MEDIUM): $WORKFLOW_ID must be substituted BEFORE
+  // ${run.id}, preserving the pre-refactor cascading order. This is only
+  // observable when `workflowId` itself embeds the ${run.id} token: with the
+  // original order the $WORKFLOW_ID pass injects "a${run.id}b", and the
+  // subsequent ${run.id} pass expands that injected token again -> "aa${run.id}bb".
+  // The reversed order (run.id first) would run BEFORE the injection and leave
+  // "a${run.id}b" -- a different, incorrect result. Asserting the cascaded
+  // value locks the original ordering in place.
+  it('substitutes $WORKFLOW_ID before ${run.id} (cascading order is load-bearing)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'ID: $WORKFLOW_ID',
+      'a${run.id}b',
+      'hello',
+      '/tmp/artifacts',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('ID: aa${run.id}bb');
+  });
+
   it('replaces $ARTIFACTS_DIR with the resolved path', () => {
     const { prompt } = substituteWorkflowVariables(
       'Save to $ARTIFACTS_DIR/output.txt',
