@@ -1356,7 +1356,7 @@ export async function disposeMessageByMachineInTransaction(
     return { ok: false, reason: 'already_disposed' };
   }
 
-  await query(
+  const update = await query(
     `UPDATE agent_dispatch_messages
         SET route_disposition = $2,
             route_disposed_at = $3
@@ -1364,12 +1364,15 @@ export async function disposeMessageByMachineInTransaction(
         AND route_disposition IS NULL`,
     [data.id, data.disposition, now]
   );
-  const finalMessage = await readMessageInTransaction(query, data.id);
-  if (!finalMessage) return { ok: false, reason: 'not_found' };
-  if (finalMessage.route_disposition !== data.disposition) {
-    // Lost a race to another disposer between read and write.
+  // Trust the affected-row count, not a reread: if a concurrent disposer won the
+  // race between our read and this write, the guarded UPDATE matches zero rows.
+  // Rereading would see a non-null (possibly same-disposition) value and falsely
+  // report success for a disposition THIS call did not make.
+  if (update.rowCount === 0) {
     return { ok: false, reason: 'already_disposed' };
   }
+  const finalMessage = await readMessageInTransaction(query, data.id);
+  if (!finalMessage) return { ok: false, reason: 'not_found' };
   return { ok: true, message: finalMessage };
 }
 

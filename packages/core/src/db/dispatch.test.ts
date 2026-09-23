@@ -2756,6 +2756,63 @@ describe('dispatch db', () => {
         })
       ).resolves.toEqual({ ok: false, reason: 'not_found' });
     });
+
+    test('a concurrent same-disposition winner returns already_disposed, not a false success', async () => {
+      // Race window: the pre-read sees route_disposition IS NULL, but another
+      // disposer commits the SAME disposition before our guarded UPDATE runs, so
+      // the UPDATE matches zero rows. Rereading the row would show the winner's
+      // (identical) disposition -- the old code mistook that for our own success.
+      // The affected-row count is the only honest signal.
+      const message = await operatorRow('race-same-disposition');
+      const originalDb = db;
+      let messageReadCount = 0;
+      const query = async <T>(sql: string): Promise<{ rows: readonly T[]; rowCount: number }> => {
+        if (sql.startsWith('SELECT principal_id, delivery_mode, active')) {
+          // No principal collides with the machine actor.
+          return { rows: [], rowCount: 0 };
+        }
+        if (sql.startsWith('SELECT * FROM agent_dispatch_messages')) {
+          messageReadCount += 1;
+          if (messageReadCount === 1) {
+            // Pre-read: not yet disposed.
+            return { rows: [{ ...message, route_disposition: null } as T], rowCount: 1 };
+          }
+          // Post-UPDATE reread: the concurrent winner set the same disposition.
+          return {
+            rows: [
+              {
+                ...message,
+                route_disposition: 'expired',
+                route_disposed_at: '2026-01-01T00:00:00.000Z',
+              } as T,
+            ],
+            rowCount: 1,
+          };
+        }
+        if (sql.startsWith('UPDATE agent_dispatch_messages')) {
+          // Guarded UPDATE (... AND route_disposition IS NULL) matched nothing.
+          return { rows: [], rowCount: 0 };
+        }
+        throw new Error(`Unexpected SQL: ${sql}`);
+      };
+      db = {
+        ...originalDb,
+        query,
+        withTransaction: async fn => fn(query),
+      } as SqliteAdapter;
+
+      try {
+        await expect(
+          disposeMessageByMachine({
+            id: message.id,
+            actor: 'system:operator-inbox-consumer',
+            disposition: 'expired',
+          })
+        ).resolves.toEqual({ ok: false, reason: 'already_disposed' });
+      } finally {
+        db = originalDb;
+      }
+    });
   });
 });
 

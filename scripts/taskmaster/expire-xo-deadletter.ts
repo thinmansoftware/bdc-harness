@@ -99,6 +99,13 @@ async function main(): Promise<void> {
       [JOURNAL_IDEMPOTENCY_KEY]
     );
     if (existingNote.rows.length === 0) {
+      // M-187a contract: the machine actor is LOGGED for provenance but NEVER
+      // stored -- so it is emitted here and deliberately omitted from
+      // proposal_json below.
+      console.log(
+        `[m155] journaling dead-letter expiry (actor=${EXPIRY_ACTOR}, ` +
+          `expired_count=${expired}); actor is logged, never persisted.`
+      );
       await query(
         `INSERT INTO tm_journal
            (id, created_at, thread_ref, action_type, proposal_json, idempotency_key, outcome)
@@ -117,7 +124,6 @@ async function main(): Promise<void> {
               'One-shot operator action at Deploy 2; never run by the loop.',
             expired_count: expired,
             disposition: 'expired',
-            actor: EXPIRY_ACTOR,
           }),
           JOURNAL_IDEMPOTENCY_KEY,
         ]
