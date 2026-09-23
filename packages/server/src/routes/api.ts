@@ -9,7 +9,7 @@ import type { WebAdapter } from '../adapters/web';
 import { rm, readFile, writeFile, unlink, mkdir } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import type { Context } from 'hono';
 import type {
   ConversationLockManager,
@@ -199,11 +199,26 @@ import { authenticateDispatchWorkerCredential } from '../auth/dispatch-worker-cr
 import {
   DispatchNonSystemCapability,
   DispatchPrincipalAuthError,
+  authenticateDispatchPrincipal,
   type DispatchSenderAuthMode,
 } from '../auth/dispatch-principal';
 import { createLogger as createDispatchRouteLogger } from '@archon/paths';
 
 const dispatchSenderAuthLog = createDispatchRouteLogger('dispatch/sender-auth');
+
+/**
+ * WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 2): thrown by
+ * resolveDispatchMailboxActor when a request presents an identity header but
+ * fails (or only partially satisfies) one of the two accepted bindings. Mapped
+ * to HTTP 401 dispatch_actor_unbound at the route -- there is no fallback to the
+ * operator token.
+ */
+class MailboxActorUnboundError extends Error {
+  constructor() {
+    super('dispatch_actor_unbound');
+    this.name = 'MailboxActorUnboundError';
+  }
+}
 import { getOverseerRuntimeStatus } from '../overseer-runtime';
 import { listOverseerCapabilityStates } from '@archon/core/db/overseer-capabilities';
 import {
@@ -755,7 +770,7 @@ const acknowledgeDispatchMessageRoute = createRoute({
     params: dispatchMessageIdParamsSchema,
     body: {
       content: { 'application/json': { schema: dispatchMailboxPrincipalBodySchema } },
-      required: true,
+      required: false,
     },
   },
   responses: {
@@ -763,6 +778,7 @@ const acknowledgeDispatchMessageRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Acknowledged dispatch message',
     },
+    401: jsonError('Dispatch actor unbound'),
     404: jsonError('Dispatch message not found'),
     409: jsonError('Dispatch mailbox lifecycle conflict'),
     500: jsonError('Server error'),
@@ -778,7 +794,7 @@ const addressDispatchMessageRoute = createRoute({
     params: dispatchMessageIdParamsSchema,
     body: {
       content: { 'application/json': { schema: dispatchMailboxPrincipalBodySchema } },
-      required: true,
+      required: false,
     },
   },
   responses: {
@@ -786,6 +802,7 @@ const addressDispatchMessageRoute = createRoute({
       content: { 'application/json': { schema: dispatchMessageSchema } },
       description: 'Addressed dispatch message',
     },
+    401: jsonError('Dispatch actor unbound'),
     404: jsonError('Dispatch message not found'),
     409: jsonError('Dispatch mailbox lifecycle conflict'),
     500: jsonError('Server error'),
@@ -2484,6 +2501,90 @@ export function registerApiRoutes(
     return { principal_token: c.req.header('x-board-principal-token')?.trim() };
   }
 
+  /**
+   * WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 2): resolve the actor
+   * that a mailbox ack/address call is authorized to write, from PROVEN identity
+   * only. Never from the request body.
+   *
+   * Order, with NO fallback between branches:
+   *  1. Any identity header present -> the request MUST validate as one of the
+   *     two bindings below; a failed/partial identity request throws
+   *     MailboxActorUnboundError (401) even if a valid operator token is present.
+   *  2. xo binding: all four proofs (x-board-principal-token,
+   *     x-xo-holder-token, x-xo-lease-id, x-xo-fencing-token) against the live
+   *     board XO lease. The holder-token hash is re-verified inside the DAL
+   *     transaction via the returned bind.
+   *  3. principal-credential binding for any principal OTHER than xo.
+   *  4. No identity header + a bare operator token -> actor 'operator'.
+   *  5. Otherwise unbound.
+   */
+  async function resolveDispatchMailboxActor(
+    c: Context
+  ): Promise<{ actor: string; bind?: dispatchDb.XoLeaseBind }> {
+    const boardToken = c.req.header('x-board-principal-token')?.trim();
+    const holderToken = c.req.header('x-xo-holder-token')?.trim();
+    const leaseIdHeader = c.req.header('x-xo-lease-id')?.trim();
+    const fencingHeader = c.req.header('x-xo-fencing-token')?.trim();
+    const principalIdHeader = c.req.header('x-dispatch-principal-id')?.trim();
+    const principalTokenHeader = c.req.header('x-dispatch-principal-token')?.trim();
+
+    const hasLeaseHeaders = Boolean(boardToken || holderToken || leaseIdHeader || fencingHeader);
+    const hasPrincipalHeaders = Boolean(principalIdHeader || principalTokenHeader);
+
+    if (hasLeaseHeaders) {
+      // xo binding requires ALL FOUR proofs; any missing one is unbound.
+      if (!boardToken || !holderToken || !leaseIdHeader || !fencingHeader) {
+        throw new MailboxActorUnboundError();
+      }
+      const fencingNum = Number.parseInt(fencingHeader, 10);
+      if (!Number.isInteger(fencingNum) || String(fencingNum) !== fencingHeader) {
+        throw new MailboxActorUnboundError();
+      }
+      try {
+        await boardAuthorityDb.authenticateBoardPrincipal({ principal_token: boardToken });
+      } catch {
+        throw new MailboxActorUnboundError();
+      }
+      const lease = await boardAuthorityDb.getCurrentXoLease();
+      if (lease?.lease_id !== leaseIdHeader || lease.fencing_token !== fencingNum) {
+        throw new MailboxActorUnboundError();
+      }
+      return {
+        actor: 'xo',
+        bind: {
+          kind: 'xo_lease',
+          lease_id: leaseIdHeader,
+          fencing_token: fencingNum,
+          holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
+        },
+      };
+    }
+
+    if (hasPrincipalHeaders) {
+      // The xo receipt requires the seat -- never a dispatch-principal
+      // credential, even if DISPATCH_PRINCIPALS_JSON carries an 'xo' entry.
+      if ((principalIdHeader ?? '').toLowerCase() === 'xo') {
+        throw new MailboxActorUnboundError();
+      }
+      try {
+        const credential = authenticateDispatchPrincipal({
+          principal_id: principalIdHeader,
+          token: principalTokenHeader,
+          require_send_role: false,
+        });
+        return { actor: credential.principal_id };
+      } catch {
+        throw new MailboxActorUnboundError();
+      }
+    }
+
+    // No identity header at all: only the bare operator token binds 'operator'.
+    if (getPresentedOperatorToken(c)) {
+      return { actor: 'operator' };
+    }
+    throw new MailboxActorUnboundError();
+  }
+
   function parseDispatchJsonBody(body: string): unknown {
     try {
       return JSON.parse(body) as unknown;
@@ -4139,10 +4240,16 @@ export function registerApiRoutes(
   registerOpenApiRoute(listDispatchMessagesRoute, async c => {
     try {
       const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
+      // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01: forward the optional
+      // route_disposition filter to the DAL. The sibling WO owns the filter's
+      // semantics; this WO only passes it through so auto_surfaced rows are
+      // retrievable once the sibling lands.
+      const routeDisposition = c.req.query('route_disposition') ?? undefined;
       const messages = await dispatchDb.listMessages({
         recipient: c.req.query('recipient') ?? undefined,
         status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
         subject_key: c.req.query('subject_key') ?? undefined,
+        ...(routeDisposition !== undefined ? { route_disposition: routeDisposition } : {}),
         limit: Number.isFinite(rawLimit) ? rawLimit : 100,
         allowBoardAlias:
           c.req.query('recipient') !== undefined &&
@@ -4202,10 +4309,26 @@ export function registerApiRoutes(
 
   registerOpenApiRoute(acknowledgeDispatchMessageRoute, async c => {
     try {
-      const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const body = (getValidatedBody(c, dispatchMailboxPrincipalBodySchema) ?? {}) as {
+        principal_id?: string;
+      };
+      let resolution: { actor: string; bind?: dispatchDb.XoLeaseBind };
+      try {
+        resolution = await resolveDispatchMailboxActor(c);
+      } catch (error) {
+        if (error instanceof MailboxActorUnboundError) {
+          return apiError(c, 401, 'dispatch_actor_unbound');
+        }
+        throw error;
+      }
+      // The body principal_id is a cross-check only (retained one release).
+      if (body.principal_id !== undefined && body.principal_id !== resolution.actor) {
+        return apiError(c, 409, 'actor_mismatch');
+      }
       const result = await dispatchDb.acknowledgeMessage({
         id: c.req.param('id') ?? '',
-        principal_id: body.principal_id,
+        principal_id: resolution.actor,
+        bind: resolution.bind,
       });
       if (!result.ok) {
         return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
@@ -4219,10 +4342,25 @@ export function registerApiRoutes(
 
   registerOpenApiRoute(addressDispatchMessageRoute, async c => {
     try {
-      const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const body = (getValidatedBody(c, dispatchMailboxPrincipalBodySchema) ?? {}) as {
+        principal_id?: string;
+      };
+      let resolution: { actor: string; bind?: dispatchDb.XoLeaseBind };
+      try {
+        resolution = await resolveDispatchMailboxActor(c);
+      } catch (error) {
+        if (error instanceof MailboxActorUnboundError) {
+          return apiError(c, 401, 'dispatch_actor_unbound');
+        }
+        throw error;
+      }
+      if (body.principal_id !== undefined && body.principal_id !== resolution.actor) {
+        return apiError(c, 409, 'actor_mismatch');
+      }
       const result = await dispatchDb.addressMessage({
         id: c.req.param('id') ?? '',
-        principal_id: body.principal_id,
+        principal_id: resolution.actor,
+        bind: resolution.bind,
       });
       if (!result.ok) {
         return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
@@ -4352,9 +4490,10 @@ export function registerApiRoutes(
       const staleAfterMs = Number.isFinite(rawStaleAfterMs)
         ? Math.max(1, Math.min(rawStaleAfterMs, 86_400_000))
         : dispatchDb.DEFAULT_WORKER_STALE_AFTER_MS;
-      const [workers, messages] = await Promise.all([
+      const [workers, messages, mailboxDepth] = await Promise.all([
         dispatchDb.listWorkers(staleAfterMs),
         dispatchDb.listMessages({ limit: 500 }),
+        dispatchDb.mailboxDepthByPrincipal(),
       ]);
       const queue: Record<dispatchDb.DispatchMessageStatus, number> = {
         queued: 0,
@@ -4393,11 +4532,32 @@ export function registerApiRoutes(
           return false;
         }
       };
+      // Explicitly shape each principal's seven mailbox buckets so the response
+      // contract is stable regardless of the DAL's internal representation.
+      const mailbox: Record<string, dispatchDb.MailboxDepth> = {};
+      for (const [principalId, depth] of Object.entries(mailboxDepth.by_principal)) {
+        mailbox[principalId] = {
+          unread: depth.unread,
+          legacy_unverified: depth.legacy_unverified,
+          acked_open: depth.acked_open,
+          addressed_by_mind: depth.addressed_by_mind,
+          disposed_by_machine: depth.disposed_by_machine,
+          surfaced_unacked: depth.surfaced_unacked,
+          surfaced_acked: depth.surfaced_acked,
+        };
+      }
       return c.json({
         generated_at: new Date().toISOString(),
         worker_stale_after_ms: staleAfterMs,
         workers,
+        // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 5): the worker
+        // lifecycle counts, renamed from `queue`. `queue` retained as an alias
+        // for one release.
+        worker_lifecycle: queue,
         queue,
+        // Mailbox depth in seven cutover-split buckets, keyed by principal id.
+        mailbox,
+        cutover_at: mailboxDepth.cutover_at,
         operator_reports: messages
           .filter(message => message.task_type === 'run_report' && !isExecutionHandoff(message))
           .map(item),

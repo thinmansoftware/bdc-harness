@@ -184,6 +184,12 @@ export interface TaskmasterDeps {
    * human-read) from human-facing channels when grading an action 'unheard'.
    */
   assessDispatchRecipient?: (recipient: string) => Promise<DispatchRecipientAssessment>;
+  /**
+   * WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 5): the receipt
+   * cutover instant, read once per tick. Pre-cutover acknowledged_at /
+   * addressed_at stamps are legacy_unverified and never count as reads.
+   */
+  getReceiptCutoverAt?: () => Promise<string | null>;
   getGithubIssueEvidence?: (
     threadRef: string,
     sinceIso: string
@@ -506,6 +512,34 @@ function githubHeaders(): Record<string, string> {
 }
 
 /**
+ * WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 5): a receipt stamp
+ * counts as evidence only if it was written at or after the receipt cutover.
+ * Pre-cutover stamps are legacy_unverified (non-evidence) everywhere they are
+ * read. False when either value is null -- a missing cutover means NO receipt
+ * counts yet, and a missing stamp is trivially not post-cutover.
+ */
+export function isPostCutoverReceipt(stamp: string | null, cutoverAt: string | null): boolean {
+  if (stamp === null || cutoverAt === null) return false;
+  return stamp >= cutoverAt;
+}
+
+/**
+ * Read the receipt cutover instant (dispatch_receipt_cutover.applied_at) once
+ * per tick. Tolerates the sibling's table not existing yet -- returns null,
+ * which makes every stamp legacy_unverified (isPostCutoverReceipt always false).
+ */
+async function defaultGetReceiptCutoverAt(): Promise<string | null> {
+  try {
+    const result = await getDatabase().query<{ applied_at: string }>(
+      'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+    );
+    return result.rows[0]?.applied_at ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Human (non-bot) comment that starts with [PROGRESS] or [BLOCKED] plus
  * non-whitespace. Regex and bot-check appear exactly once in this file.
  */
@@ -799,7 +833,8 @@ async function gradeSentActions(
   getIssueEvidence: NonNullable<TaskmasterDeps['getGithubIssueEvidence']>,
   nowMs: number,
   getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>,
-  assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>
+  assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>,
+  cutoverAt: string | null
 ): Promise<number> {
   let failures = 0;
   for (const action of actions) {
@@ -852,8 +887,10 @@ async function gradeSentActions(
       const dispatchRow = await getDispatchById(effect.id);
       const heardRecipient = dispatchRow?.resolved_recipient ?? dispatchRow?.recipient ?? null;
       const recipientAssessment = heardRecipient ? await assessRecipient(heardRecipient) : null;
+      // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 5): a pre-cutover
+      // acknowledged_at is legacy_unverified and never counts as a read.
       const heard =
-        dispatchRow?.acknowledged_at != null &&
+        isPostCutoverReceipt(dispatchRow?.acknowledged_at ?? null, cutoverAt) &&
         recipientAssessment?.delivery_mode != null &&
         recipientAssessment.delivery_mode !== 'drain_on_start';
 
@@ -896,7 +933,13 @@ async function gradeSentActions(
           ? action.thread_ref.slice('dispatch:'.length)
           : '';
         const ruling = rulingId ? await getDispatchById(rulingId) : null;
-        const addressedAtMs = ruling?.addressed_at ? Date.parse(ruling.addressed_at) : NaN;
+        // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 5): a
+        // pre-cutover addressed_at is legacy_unverified and is NOT treated as an
+        // addressed ruling.
+        const addressedAtMs =
+          ruling && isPostCutoverReceipt(ruling.addressed_at ?? null, cutoverAt)
+            ? Date.parse(ruling.addressed_at ?? '')
+            : NaN;
         const expectedRecipient = ruling?.resolved_recipient ?? ruling?.recipient;
         if (
           ruling &&
@@ -1134,6 +1177,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
   const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
+  const getReceiptCutoverAt = deps.getReceiptCutoverAt ?? defaultGetReceiptCutoverAt;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
   const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
   const executeCascade = deps.runCascade ?? runCascade;
@@ -1234,6 +1278,15 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   }
   const laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
 
+  // Receipt cutover, read ONCE per tick (M-187a item 5). Failure to read is a
+  // null cutover, which makes every stamp legacy_unverified.
+  let cutoverAt: string | null = null;
+  try {
+    cutoverAt = await getReceiptCutoverAt();
+  } catch (error) {
+    log.warn({ err: error as Error }, 'taskmaster.receipt_cutover_read_failed');
+  }
+
   // Grade previously sent actions against the external SOR.
   tickFailures += await gradeSentActions(
     actions24h,
@@ -1243,7 +1296,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     getIssueEvidence,
     nowMs,
     getFireRunEvidence,
-    assessRecipient
+    assessRecipient,
+    cutoverAt
   );
 
   // M-155 Q3: useful-rate floor with auto-PAUSE. Counted AFTER

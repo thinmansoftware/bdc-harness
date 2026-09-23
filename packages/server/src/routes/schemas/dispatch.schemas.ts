@@ -89,7 +89,12 @@ export const supersedeDispatchMessageBodySchema = z
 
 export const dispatchMailboxPrincipalBodySchema = z
   .object({
-    principal_id: z.string().trim().toLowerCase().min(1),
+    // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 2): the body no
+    // longer supplies the actor -- the actor is the authenticated caller. The
+    // field is retained for ONE release as an optional cross-check only (a
+    // follow-on WO removes it). If present and not equal to the resolved actor
+    // the route returns 409 actor_mismatch.
+    principal_id: z.string().trim().toLowerCase().min(1).optional(),
   })
   .strict()
   .openapi('DispatchMailboxPrincipalBody');
@@ -99,6 +104,11 @@ export const listDispatchMessagesQuerySchema = z.object({
   status: dispatchMessageStatusSchema.optional(),
   limit: z.string().optional(),
   subject_key: z.string().optional(),
+  // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01: forward-compatible pass-through
+  // for the sibling's listMessages route_disposition filter. Kept as a loose
+  // string (not the enum) so this WO does not take a hard dependency on the
+  // sibling's widened disposition set when it merges first.
+  route_disposition: z.string().optional(),
 });
 
 export const claimDispatchMessageBodySchema = z
@@ -185,12 +195,33 @@ const dispatchStatusItemSchema = z.object({
   result_preview: z.string().nullable(),
 });
 
+export const mailboxDepthSchema = z
+  .object({
+    unread: z.number(),
+    legacy_unverified: z.number(),
+    acked_open: z.number(),
+    addressed_by_mind: z.number(),
+    disposed_by_machine: z.number(),
+    surfaced_unacked: z.number(),
+    surfaced_acked: z.number(),
+  })
+  .openapi('MailboxDepth');
+
 export const dispatchStatusResponseSchema = z
   .object({
     generated_at: z.string(),
     worker_stale_after_ms: z.number(),
     workers: z.array(dispatchWorkerSchema),
+    // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 5): the worker
+    // lifecycle status counts, renamed from `queue`. `queue` is retained as an
+    // alias for one release.
+    worker_lifecycle: z.record(z.number()),
     queue: z.record(z.number()),
+    // Mailbox depth in seven cutover-split buckets, keyed by principal id.
+    mailbox: z.record(mailboxDepthSchema),
+    // The receipt cutover instant (dispatch_receipt_cutover.applied_at), or null
+    // when the sibling's cutover table has not been applied yet.
+    cutover_at: z.string().nullable(),
     operator_reports: z.array(dispatchStatusItemSchema),
     execution_handoffs: z.array(dispatchStatusItemSchema),
   })

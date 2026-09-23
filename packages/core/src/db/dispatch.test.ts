@@ -41,6 +41,7 @@ import {
   listMessagesByCorrelationPrefixWithoutSubjectKey,
   listUnroutableQueuedMessages,
   listWorkers,
+  mailboxDepthByPrincipal,
   postResult,
   reconcileDispatchOutcomeNotices,
   registerWorker,
@@ -895,13 +896,135 @@ describe('dispatch db', () => {
       ok: false,
       reason: 'not_queued',
     });
-    expect((await acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).ok).toBe(true);
+    // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 2): acking as 'xo'
+    // now requires the live board XO lease bind. Without it the DAL rejects the
+    // caller before touching the row.
+    await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'xo_bind_required',
+    });
     await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo-fable' })).resolves.toEqual(
       {
         ok: false,
         reason: 'wrong_recipient',
       }
     );
+  });
+
+  // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 2): the xo receipt is
+  // bound to the live board XO lease, re-checked INSIDE the write transaction.
+  describe('xo lease bind on mailbox receipts', () => {
+    const LEASE_ID = 'lease-ack-bind';
+    const FENCING = 7;
+    const HOLDER_TOKEN = 'holder-secret-xo';
+    const HOLDER_TOKEN_HASH = createHash('sha256').update(HOLDER_TOKEN).digest('hex');
+
+    async function seedXoLease(overrides?: {
+      released?: boolean;
+      expiresInMs?: number;
+      fencing?: number;
+      leaseId?: string;
+      holderTokenHash?: string;
+    }): Promise<void> {
+      const now = new Date();
+      await db.query(
+        `INSERT INTO board_xo_leases (
+           id, lease_id, principal_id, seat_id, holder_id, holder_token_hash,
+           fencing_token, acquired_at, renewed_at, expires_at, released_at
+         )
+         VALUES (1, $1, 'xo', 'xo', 'holder-xo', $2, $3, $4, NULL, $5, $6)
+         ON CONFLICT(id) DO UPDATE SET
+           lease_id = excluded.lease_id,
+           holder_token_hash = excluded.holder_token_hash,
+           fencing_token = excluded.fencing_token,
+           expires_at = excluded.expires_at,
+           released_at = excluded.released_at`,
+        [
+          overrides?.leaseId ?? LEASE_ID,
+          overrides?.holderTokenHash ?? HOLDER_TOKEN_HASH,
+          overrides?.fencing ?? FENCING,
+          now.toISOString(),
+          new Date(now.getTime() + (overrides?.expiresInMs ?? 60_000)).toISOString(),
+          overrides?.released ? now.toISOString() : null,
+        ]
+      );
+    }
+
+    async function seedXoMailbox(idempotency: string): Promise<DispatchMessage> {
+      return createMessage({
+        correlation_id: `corr-${idempotency}`,
+        idempotency_key: idempotency,
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'Bind me.',
+      });
+    }
+
+    test('acknowledgeMessage as xo without a bind is rejected xo_bind_required', async () => {
+      const message = await seedXoMailbox('idem-bind-required');
+      await expect(acknowledgeMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
+        ok: false,
+        reason: 'xo_bind_required',
+      });
+      const stored = await getMessage(message.id);
+      expect(stored?.acknowledged_at).toBeNull();
+    });
+
+    test('acknowledgeMessage as xo with a matching bind succeeds', async () => {
+      await seedXoLease();
+      const message = await seedXoMailbox('idem-bind-ok');
+      const result = await acknowledgeMessage({
+        id: message.id,
+        principal_id: 'xo',
+        bind: {
+          kind: 'xo_lease',
+          lease_id: LEASE_ID,
+          fencing_token: FENCING,
+          holder_token_hash: HOLDER_TOKEN_HASH,
+        },
+      });
+      expect(result.ok).toBe(true);
+      const stored = await getMessage(message.id);
+      expect(stored?.acknowledged_by).toBe('xo');
+      expect(stored?.acknowledged_at).not.toBeNull();
+    });
+
+    test('acknowledgeMessage as xo with a stale fencing token is lease_fence_stale', async () => {
+      await seedXoLease();
+      const message = await seedXoMailbox('idem-bind-stale');
+      await expect(
+        acknowledgeMessage({
+          id: message.id,
+          principal_id: 'xo',
+          bind: {
+            kind: 'xo_lease',
+            lease_id: LEASE_ID,
+            fencing_token: FENCING - 1,
+            holder_token_hash: HOLDER_TOKEN_HASH,
+          },
+        })
+      ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+      const stored = await getMessage(message.id);
+      expect(stored?.acknowledged_at).toBeNull();
+    });
+
+    test('a released lease makes an otherwise-valid bind lease_fence_stale', async () => {
+      await seedXoLease({ released: true });
+      const message = await seedXoMailbox('idem-bind-released');
+      await expect(
+        acknowledgeMessage({
+          id: message.id,
+          principal_id: 'xo',
+          bind: {
+            kind: 'xo_lease',
+            lease_id: LEASE_ID,
+            fencing_token: FENCING,
+            holder_token_hash: HOLDER_TOKEN_HASH,
+          },
+        })
+      ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+    });
   });
 
   test('addresses only acknowledged mail by its acknowledger and is idempotent', async () => {
@@ -918,7 +1041,11 @@ describe('dispatch db', () => {
       reason: 'address_before_ack',
     });
     expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
-    await expect(addressMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
+    // A non-recipient mailbox principal ('xo-fable') cannot address an
+    // operator-owned message -- wrong_recipient. ('xo' would now short-circuit
+    // to xo_bind_required before the recipient check; see the dedicated bind
+    // tests below.)
+    await expect(addressMessage({ id: message.id, principal_id: 'xo-fable' })).resolves.toEqual({
       ok: false,
       reason: 'wrong_recipient',
     });
@@ -1082,7 +1209,7 @@ describe('dispatch db', () => {
       ok: false,
       reason: 'not_queued',
     });
-    await expect(addressMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
+    await expect(addressMessage({ id: mailbox.id, principal_id: 'xo-fable' })).resolves.toEqual({
       ok: false,
       reason: 'wrong_recipient',
     });
@@ -1093,6 +1220,53 @@ describe('dispatch db', () => {
       ok: false,
       reason: 'actor_mismatch',
     });
+  });
+
+  // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 5): with the sibling's
+  // dispatch_receipt_cutover table absent, every stamped mailbox row is
+  // legacy_unverified and cutover_at is null.
+  test('mailboxDepthByPrincipal with no cutover row buckets every stamp as legacy_unverified', async () => {
+    const unread = await createMessage({
+      correlation_id: 'corr-depth-unread',
+      idempotency_key: 'idem-depth-unread',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Unread.',
+    });
+    const acked = await createMessage({
+      correlation_id: 'corr-depth-acked',
+      idempotency_key: 'idem-depth-acked',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Acked.',
+    });
+    await acknowledgeMessage({ id: acked.id, principal_id: 'operator' });
+
+    const report = await mailboxDepthByPrincipal();
+    expect(report.cutover_at).toBeNull();
+    const operator = report.by_principal.operator;
+    expect(operator).toBeDefined();
+    // The acked row (stamp exists, no cutover) is legacy_unverified; the untouched
+    // row is unread. No post-cutover bucket is populated.
+    expect(operator?.legacy_unverified).toBe(1);
+    expect(operator?.unread).toBe(1);
+    expect(operator?.acked_open).toBe(0);
+    expect(operator?.addressed_by_mind).toBe(0);
+    // Every active mailbox principal is zero-filled, so xo is present with an
+    // empty inbox.
+    expect(report.by_principal.xo).toEqual({
+      unread: 0,
+      legacy_unverified: 0,
+      acked_open: 0,
+      addressed_by_mind: 0,
+      disposed_by_machine: 0,
+      surfaced_unacked: 0,
+      surfaced_acked: 0,
+    });
+    // Both seeded rows account for exactly one bucket each.
+    void unread;
   });
 
   test('lists only due unaddressed queued work by priority while retaining historical queries', async () => {

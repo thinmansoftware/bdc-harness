@@ -437,6 +437,11 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     listThreads: async () => [],
     // Default no-op evidence so adoption refresh never hits the network in unit tests.
     getGithubIssueEvidence: async () => null,
+    // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 5): default the
+    // receipt cutover to the epoch so pre-existing 'heard'/'useful' fixtures
+    // (all stamped well after 1970) stay post-cutover. Cutover-boundary tests
+    // override this with a value between their pre/post stamps.
+    getReceiptCutoverAt: async () => new Date(0).toISOString(),
     ...overrides,
   };
 }
@@ -3285,21 +3290,220 @@ describe('M-155 exception push (loop)', () => {
     } as TaskmasterDeps['db'];
   }
 
-  test('push: every owner resolves to xo in THIS WO (routing stub validation)', () => {
+  test('push: every owner resolves to a currently-mapped recipient (routing stub validation)', () => {
     // Only 'xo' (XO session-start reflex) and 'operator' (John) have a
-    // documented drainer; routing to any other mailbox would manufacture a
-    // second dead-letter box -- the failure this WO exists to end.
+    // documented drainer; unmapped logins fall back to 'xo'.
     for (const owner of ['major-build', 'captain-ci', 'unmapped-login', null]) {
       const resolved = resolveRecipient(owner);
-      expect(resolved).toBe('xo');
       expect(TM_ALLOWED_RECIPIENTS).toContain(resolved);
     }
-    // The map structure exists and every entry points at 'xo', so widening it
-    // later is a data change rather than a code change.
+  });
+
+  // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 6): replaces the
+  // literal collapse assertion. Every OWNER_RECIPIENT_MAP value must be
+  // allowlisted AND name an active dispatch_principals row whose delivery_mode
+  // drains (drain_on_start or worker_poll). The map VALUES are unchanged by this
+  // WO; the test now permits widening as a DATA change and forbids widening onto
+  // a mailbox with no draining principal (the precondition at
+  // OWNER_RECIPIENT_MAP's comment).
+  test('push: every OWNER_RECIPIENT_MAP value drains via an active principal', () => {
+    // Seeded like migration 040 (dispatch_principals).
+    const DISPATCH_PRINCIPAL_FIXTURE: Record<
+      string,
+      { delivery_mode: DispatchDeliveryMode; active: boolean }
+    > = {
+      claude: { delivery_mode: 'worker_poll', active: true },
+      codex: { delivery_mode: 'worker_poll', active: true },
+      operator: { delivery_mode: 'drain_on_start', active: true },
+      xo: { delivery_mode: 'drain_on_start', active: true },
+      overseer: { delivery_mode: 'notify_only', active: true },
+      cauldron: { delivery_mode: 'notify_only', active: true },
+      john: { delivery_mode: 'notify_only', active: false },
+    };
+    const drains = (mode: DispatchDeliveryMode): boolean =>
+      mode === 'drain_on_start' || mode === 'worker_poll';
+
     expect(Object.keys(OWNER_RECIPIENT_MAP).length).toBeGreaterThan(0);
     for (const target of Object.values(OWNER_RECIPIENT_MAP)) {
-      expect(target).toBe('xo');
+      expect(TM_ALLOWED_RECIPIENTS).toContain(target);
+      const principal = DISPATCH_PRINCIPAL_FIXTURE[target];
+      expect(principal).toBeDefined();
+      expect(principal?.active).toBe(true);
+      expect(drains(principal?.delivery_mode as DispatchDeliveryMode)).toBe(true);
     }
+  });
+
+  // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 5): the Taskmaster
+  // receipt readers treat a pre-cutover acknowledged_at / addressed_at as
+  // legacy_unverified (non-evidence). Proven by unit tests -- the Taskmaster
+  // stays PAUSED. The fake DAL holds the journal in memory, so no real
+  // tm_journal row is written by these tests.
+  describe('receipt cutover readers', () => {
+    test('a pre-cutover acknowledged_at is unheard; a post-cutover ack is heard', async () => {
+      const cutover = new Date(T0 - 30_000).toISOString();
+
+      // Pre-cutover ack on a non-draining channel -> legacy_unverified -> unheard.
+      const preWorld = makeWorld();
+      seedDigestSent(preWorld);
+      preWorld.journal.push({
+        id: 'journal-cut-pre',
+        created_at: new Date(T0 - 60_000).toISOString(),
+        thread_ref: 'gh:thinmansoftware/bdc-xo#5001',
+        action_type: 'escalate_p0',
+        proposal_json: '{}',
+        idempotency_key: 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#5001:1',
+        before_hash: null,
+        proof_predicate: 'P0 source claim after send',
+        proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+      preWorld.sentMessages.push({
+        idempotency_key: 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#5001:1',
+        recipient: 'major-build',
+        body: 'escalate',
+        createdAt: new Date(T0 - 45_000).toISOString(),
+        acknowledged_at: new Date(T0 - 40_000).toISOString(), // < cutover
+      });
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(preWorld, { getReceiptCutoverAt: async () => cutover })
+      );
+      expect(preWorld.journal.find(row => row.id === 'journal-cut-pre')?.grade).toBe('unheard');
+
+      // Post-cutover ack on the same non-draining channel + movement -> heard -> useful.
+      const postWorld = makeWorld();
+      seedDigestSent(postWorld);
+      postWorld.journal.push({
+        id: 'journal-cut-post',
+        created_at: new Date(T0 - 60_000).toISOString(),
+        thread_ref: 'gh:thinmansoftware/bdc-xo#5002',
+        action_type: 'escalate_p0',
+        proposal_json: '{}',
+        idempotency_key: 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#5002:1',
+        before_hash: null,
+        proof_predicate: 'P0 source claim after send',
+        proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+      postWorld.sentMessages.push({
+        idempotency_key: 'tm:escalate_p0:gh:thinmansoftware/bdc-xo#5002:1',
+        recipient: 'major-build',
+        body: 'escalate',
+        createdAt: new Date(T0 - 45_000).toISOString(),
+        acknowledged_at: new Date(T0 - 20_000).toISOString(), // >= cutover
+      });
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(postWorld, {
+          getReceiptCutoverAt: async () => cutover,
+          getGithubIssueEvidence: async () => ({
+            state: 'open',
+            updatedAt: new Date(T0 - 15_000).toISOString(),
+            labels: ['wo', 'P0'],
+            assigneeCount: 1,
+            closedAt: null,
+            assignedAt: new Date(T0 - 15_000).toISOString(),
+            activeStatusAt: null,
+            progressRecordedAt: null,
+          }),
+        })
+      );
+      expect(postWorld.journal.find(row => row.id === 'journal-cut-post')?.grade).toBe('useful');
+    });
+
+    test('a pre-cutover addressed_at ruling is not addressed; a post-cutover one is', async () => {
+      const cutover = new Date(T0 - 30_000).toISOString();
+      const key = 'tm:deliver_ruling:ruling-cut';
+
+      async function runRuling(addressedAt: string): Promise<TmGrade | null> {
+        const world = makeWorld();
+        seedDigestSent(world);
+        world.journal.push({
+          id: 'journal-ruling-cut',
+          created_at: new Date(T0 - 60_000).toISOString(),
+          thread_ref: 'dispatch:ruling-cut',
+          action_type: 'deliver_ruling',
+          proposal_json: '{}',
+          idempotency_key: key,
+          before_hash: null,
+          proof_predicate: null,
+          proof_deadline_at: new Date(T0 - 1).toISOString(), // deadline passed
+          outcome: 'sent',
+          graded_at: null,
+          grade: null,
+        });
+        world.sentMessages.push({
+          idempotency_key: key,
+          recipient: 'major-build',
+          body: 'ruling',
+          createdAt: new Date(T0 - 45_000).toISOString(),
+        });
+        const deps = makeDeps(world, {
+          getReceiptCutoverAt: async () => cutover,
+          getDispatchMessageById: (async (id: string) => {
+            if (id === key) {
+              // The effect row: heard (post-cutover ack on a non-draining channel).
+              return {
+                id,
+                recipient: 'major-build',
+                resolved_recipient: null,
+                acknowledged_at: new Date(T0 - 20_000).toISOString(),
+                addressed_at: null,
+                addressed_by: null,
+              };
+            }
+            if (id === 'ruling-cut') {
+              // The ruling row addressed by its recipient at addressedAt.
+              return {
+                id,
+                recipient: 'major-build',
+                resolved_recipient: null,
+                acknowledged_at: new Date(T0 - 20_000).toISOString(),
+                addressed_at: addressedAt,
+                addressed_by: 'major-build',
+              };
+            }
+            return null;
+          }) as unknown as TaskmasterDeps['getDispatchMessageById'],
+        });
+        await tick(createTaskmasterState(60_000), deps);
+        return world.journal.find(row => row.id === 'journal-ruling-cut')?.grade ?? null;
+      }
+
+      // Addressed pre-cutover -> not an addressed ruling -> no useful proof ->
+      // deadline passed -> noise.
+      expect(await runRuling(new Date(T0 - 35_000).toISOString())).toBe('noise');
+      // Addressed post-cutover -> addressed ruling -> useful.
+      expect(await runRuling(new Date(T0 - 20_000).toISOString())).toBe('useful');
+    });
+
+    test('a PAUSED tick writes no tm_journal send row (in-memory fake DAL)', async () => {
+      const world = makeWorld();
+      world.control.pause_state = 'PAUSED';
+      world.control.pause_scope = 'effects';
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, { getReceiptCutoverAt: async () => new Date(T0).toISOString() })
+      );
+      // The real tm_journal table is never touched here; the fake DAL holds the
+      // journal in memory. A PAUSED effects tick withholds every ordinary work
+      // verb -- only the WO-authorized monitoring signals (the daily
+      // canary/digest and the self-pause notice) may escape scope='effects'.
+      const ordinaryWorkVerbs = new Set([
+        'nudge',
+        'escalate_p0',
+        'deliver_ruling',
+        'fire_cauldron',
+      ]);
+      const sentOrdinary = world.journal.filter(
+        row => row.outcome === 'sent' && ordinaryWorkVerbs.has(row.action_type)
+      );
+      expect(sentOrdinary).toHaveLength(0);
+    });
   });
 
   test('push: content_incomplete is an ordinary reject, never a HARD_PAUSE', async () => {

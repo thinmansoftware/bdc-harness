@@ -136,8 +136,49 @@ export type DispatchMailboxResult =
         | 'wrong_recipient'
         | 'not_queued'
         | 'address_before_ack'
-        | 'actor_mismatch';
+        | 'actor_mismatch'
+        // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 2):
+        // principal_id === 'xo' presented to the DAL without a lease bind.
+        | 'xo_bind_required'
+        // The live board XO lease turned over (different lease_id, higher
+        // fencing_token, released, or expired) between the route's read and the
+        // transaction that writes the receipt.
+        | 'lease_fence_stale';
     };
+
+/**
+ * WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 2).
+ *
+ * Proof that the caller held the live board XO lease, re-verified INSIDE the
+ * same transaction that writes the mailbox receipt. The route resolves these
+ * four fields from the request headers against getCurrentXoLease(); the DAL
+ * re-reads board_xo_leases in the write transaction and rejects with
+ * lease_fence_stale on any turnover.
+ */
+export interface XoLeaseBind {
+  readonly kind: 'xo_lease';
+  readonly lease_id: string;
+  readonly fencing_token: number;
+  readonly holder_token_hash: string;
+}
+
+/** Seven exclusive, exhaustive mailbox-depth buckets, split at the receipt cutover. */
+export interface MailboxDepth {
+  unread: number;
+  legacy_unverified: number;
+  acked_open: number;
+  addressed_by_mind: number;
+  disposed_by_machine: number;
+  surfaced_unacked: number;
+  surfaced_acked: number;
+}
+
+export interface MailboxDepthReport {
+  /** dispatch_receipt_cutover.applied_at, or null when the cutover is not yet applied. */
+  cutover_at: string | null;
+  /** Depth buckets keyed by active drain_on_start / notify_only principal id. */
+  by_principal: Record<string, MailboxDepth>;
+}
 
 export interface UnroutableQueuedDispatchMessage {
   id: string;
@@ -721,6 +762,12 @@ export async function listMessages(filters: {
   limit?: number;
   allowBoardAlias?: boolean;
   subject_key?: string;
+  // WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01: optional disposition filter.
+  // Kept a loose string so the HTTP route can forward the sibling's
+  // route_disposition query param before the sibling widens the enum; a value
+  // with no matching rows (e.g. 'auto_surfaced' before the sibling lands)
+  // simply returns nothing.
+  route_disposition?: string;
 }): Promise<DispatchMessage[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -751,6 +798,10 @@ export async function listMessages(filters: {
   if (filters.subject_key !== undefined) {
     params.push(normalizeDispatchSubjectKey(filters.subject_key));
     clauses.push(`subject_key = $${params.length}`);
+  }
+  if (filters.route_disposition !== undefined) {
+    params.push(filters.route_disposition);
+    clauses.push(`route_disposition = $${params.length}`);
   }
   if (filters.status === 'queued') {
     params.push(nowIso());
@@ -1186,12 +1237,50 @@ async function withRetriedMailboxTransaction<T>(fn: () => Promise<T>): Promise<T
   throw new Error('mailbox_transaction_retry_exhausted');
 }
 
+/**
+ * WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 2): re-verify the live
+ * board XO lease inside the receipt-writing transaction. Returns
+ * `lease_fence_stale` if the current lease row differs from the bind the route
+ * proved against (turnover: different lease_id, changed fencing_token, changed
+ * holder token, released, or expired), and nothing is written.
+ */
+async function validateXoLeaseBind(
+  query: DispatchQueryExecutor,
+  bind: XoLeaseBind
+): Promise<Extract<DispatchMailboxResult, { ok: false }> | null> {
+  const result = await query<{
+    lease_id: string;
+    fencing_token: number | string;
+    holder_token_hash: string;
+    released_at: string | null;
+    expires_at: string;
+  }>(
+    `SELECT lease_id, fencing_token, holder_token_hash, released_at, expires_at
+     FROM board_xo_leases WHERE id = 1`,
+    []
+  );
+  const lease = result.rows[0];
+  const now = nowIso();
+  if (
+    lease?.released_at !== null ||
+    lease.expires_at <= now ||
+    lease.lease_id !== bind.lease_id ||
+    Number(lease.fencing_token) !== bind.fencing_token ||
+    lease.holder_token_hash !== bind.holder_token_hash
+  ) {
+    return { ok: false, reason: 'lease_fence_stale' };
+  }
+  return null;
+}
+
 export async function acknowledgeMessage(data: {
   id: string;
   principal_id: string;
+  bind?: XoLeaseBind;
 }): Promise<DispatchMailboxResult> {
   const db = getDatabase();
   const principalId = canonicalizePrincipal(data.principal_id);
+  if (principalId === 'xo' && !data.bind) return { ok: false, reason: 'xo_bind_required' };
   const now = nowIso();
   return withRetriedMailboxTransaction(() =>
     db.withTransaction(async txQuery => {
@@ -1199,6 +1288,10 @@ export async function acknowledgeMessage(data: {
       if (!message) return { ok: false, reason: 'not_found' };
       const invalid = await validateMailboxActor(txQuery, message, principalId);
       if (invalid) return invalid;
+      if (data.bind) {
+        const stale = await validateXoLeaseBind(txQuery, data.bind);
+        if (stale) return stale;
+      }
       if (message.acknowledged_by !== null) {
         return message.acknowledged_by === principalId
           ? { ok: true, message }
@@ -1239,9 +1332,11 @@ export async function acknowledgeMessage(data: {
 export async function addressMessage(data: {
   id: string;
   principal_id: string;
+  bind?: XoLeaseBind;
 }): Promise<DispatchMailboxResult> {
   const db = getDatabase();
   const principalId = canonicalizePrincipal(data.principal_id);
+  if (principalId === 'xo' && !data.bind) return { ok: false, reason: 'xo_bind_required' };
   const now = nowIso();
   return withRetriedMailboxTransaction(() =>
     db.withTransaction(async txQuery => {
@@ -1249,6 +1344,10 @@ export async function addressMessage(data: {
       if (!message) return { ok: false, reason: 'not_found' };
       const invalid = await validateMailboxActor(txQuery, message, principalId);
       if (invalid) return invalid;
+      if (data.bind) {
+        const stale = await validateXoLeaseBind(txQuery, data.bind);
+        if (stale) return stale;
+      }
       if (message.acknowledged_by === null) return { ok: false, reason: 'address_before_ack' };
       if (message.acknowledged_by !== principalId) return { ok: false, reason: 'actor_mismatch' };
       if (message.addressed_by !== null) {
@@ -1290,6 +1389,136 @@ export async function addressMessage(data: {
       return { ok: false, reason: 'actor_mismatch' };
     })
   );
+}
+
+function emptyMailboxDepth(): MailboxDepth {
+  return {
+    unread: 0,
+    legacy_unverified: 0,
+    acked_open: 0,
+    addressed_by_mind: 0,
+    disposed_by_machine: 0,
+    surfaced_unacked: 0,
+    surfaced_acked: 0,
+  };
+}
+
+function isMailboxBucket(value: string): value is keyof MailboxDepth {
+  return (
+    value === 'unread' ||
+    value === 'legacy_unverified' ||
+    value === 'acked_open' ||
+    value === 'addressed_by_mind' ||
+    value === 'disposed_by_machine' ||
+    value === 'surfaced_unacked' ||
+    value === 'surfaced_acked'
+  );
+}
+
+/**
+ * SQL CASE assigning each mailbox row to exactly one of the seven buckets when a
+ * cutover instant ($1 = C) is known. Ordering enforces exclusivity: a row with
+ * ANY pre-cutover stamp is legacy_unverified and counted in no other bucket
+ * (Grok #2). `route_disposed_at` is referenced via `rd` so the query is valid
+ * whether or not the sibling's column exists.
+ */
+function cutoverBucketCaseSql(rd: string): string {
+  return `CASE
+    WHEN (m.acknowledged_at IS NOT NULL AND m.acknowledged_at < $1)
+      OR (m.addressed_at IS NOT NULL AND m.addressed_at < $1)
+      OR (${rd} IS NOT NULL AND ${rd} < $1) THEN 'legacy_unverified'
+    WHEN m.route_disposition = 'auto_surfaced' AND m.acknowledged_at IS NULL THEN 'surfaced_unacked'
+    WHEN m.route_disposition = 'auto_surfaced'
+      AND m.acknowledged_at IS NOT NULL AND m.acknowledged_at >= $1 THEN 'surfaced_acked'
+    WHEN m.route_disposition = 'expired' AND m.acknowledged_at IS NULL AND m.addressed_at IS NULL
+      AND ${rd} IS NOT NULL AND ${rd} >= $1 THEN 'disposed_by_machine'
+    WHEN m.addressed_at IS NOT NULL AND m.addressed_at >= $1
+      AND m.acknowledged_at IS NOT NULL AND m.acknowledged_at >= $1
+      AND m.addressed_by NOT LIKE 'system:%' THEN 'addressed_by_mind'
+    WHEN m.acknowledged_at IS NOT NULL AND m.acknowledged_at >= $1
+      AND m.addressed_at IS NULL AND m.route_disposition IS NULL THEN 'acked_open'
+    WHEN m.acknowledged_at IS NULL AND m.addressed_at IS NULL AND m.route_disposition IS NULL
+      THEN 'unread'
+    ELSE 'other'
+  END`;
+}
+
+/**
+ * SQL CASE for the no-cutover posture (sibling not yet applied): every stamped
+ * row is legacy_unverified; an untouched row is unread (M-187a item 5).
+ */
+function nullCutoverBucketCaseSql(rd: string): string {
+  return `CASE
+    WHEN m.acknowledged_at IS NOT NULL OR m.addressed_at IS NOT NULL OR ${rd} IS NOT NULL
+      THEN 'legacy_unverified'
+    WHEN m.route_disposition = 'auto_surfaced' AND m.acknowledged_at IS NULL THEN 'surfaced_unacked'
+    WHEN m.acknowledged_at IS NULL AND m.addressed_at IS NULL AND m.route_disposition IS NULL
+      THEN 'unread'
+    ELSE 'other'
+  END`;
+}
+
+/**
+ * WO-HARNESS-DISPATCH-ACK-ACTOR-BINDING-01 (M-187a item 5): mailbox depth over
+ * ALL rows (a dedicated aggregate, not the 500-row status page) for every active
+ * drain_on_start / notify_only principal, in seven cutover-split buckets. The
+ * cutover instant and the sibling's `route_disposed_at` column are both guarded:
+ * if the cutover table is absent, cutover_at is null and every stamped row is
+ * legacy_unverified.
+ */
+export async function mailboxDepthByPrincipal(): Promise<MailboxDepthReport> {
+  const db = getDatabase();
+
+  let cutoverAt: string | null = null;
+  try {
+    const cutover = await db.query<{ applied_at: string }>(
+      'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+    );
+    cutoverAt = cutover.rows[0]?.applied_at ?? null;
+  } catch {
+    cutoverAt = null;
+  }
+
+  let hasRouteDisposedAt = false;
+  try {
+    await db.query('SELECT route_disposed_at FROM agent_dispatch_messages WHERE 1 = 0');
+    hasRouteDisposedAt = true;
+  } catch {
+    hasRouteDisposedAt = false;
+  }
+  const rd = hasRouteDisposedAt ? 'm.route_disposed_at' : 'NULL';
+
+  const principals = await db.query<{ principal_id: string }>(
+    `SELECT principal_id FROM dispatch_principals
+     WHERE CAST(active AS TEXT) IN ('1', 'true')
+       AND delivery_mode IN ('drain_on_start', 'notify_only')`
+  );
+  const byPrincipal: Record<string, MailboxDepth> = {};
+  for (const row of principals.rows) {
+    byPrincipal[row.principal_id] = emptyMailboxDepth();
+  }
+
+  const bucketCase = cutoverAt === null ? nullCutoverBucketCaseSql(rd) : cutoverBucketCaseSql(rd);
+  const params = cutoverAt === null ? [] : [cutoverAt];
+  const aggregate = await db.query<{ principal_id: string; bucket: string; n: number | string }>(
+    `SELECT LOWER(TRIM(COALESCE(m.resolved_recipient, m.recipient))) AS principal_id,
+            ${bucketCase} AS bucket,
+            COUNT(*) AS n
+     FROM agent_dispatch_messages m
+     JOIN dispatch_principals p
+       ON p.principal_id = LOWER(TRIM(COALESCE(m.resolved_recipient, m.recipient)))
+      AND CAST(p.active AS TEXT) IN ('1', 'true')
+      AND p.delivery_mode IN ('drain_on_start', 'notify_only')
+     GROUP BY principal_id, bucket`,
+    params
+  );
+  for (const row of aggregate.rows) {
+    const depth = byPrincipal[row.principal_id] ?? emptyMailboxDepth();
+    byPrincipal[row.principal_id] = depth;
+    if (isMailboxBucket(row.bucket)) depth[row.bucket] += Number(row.n);
+  }
+
+  return { cutover_at: cutoverAt, by_principal: byPrincipal };
 }
 
 interface UnroutableQueuedDispatchMessageRow extends Omit<
