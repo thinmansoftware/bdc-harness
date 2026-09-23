@@ -46,3 +46,22 @@ For non-interactive runs that remain blocked, `noninteractive-salvage` also pres
 any remaining working-tree changes in a `salvage(uncommitted): <n> files` commit and
 pushes the salvage branch for human review. This preservation does not authorize the
 normal `commit-and-push` node or bypass its blocked-run approval rules.
+
+## manifest-evidence-check admission policy (counts_unparsed, SPEC_DEFECT)
+
+For CODE and MIXED work orders, `manifest-evidence-check` admits an executed test
+command that reports `tests_status=counts_unparsed` only when `tests_exit=0`. The
+manifest keeps the existing N/A-style explanation because the command produced no
+parseable counts. A nonzero exit, `failed`, `no_command_declared`, or missing test
+evidence still fails closed with `EVIDENCE_ERROR`.
+
+Declared grep stop conditions are handled by their observed status. `passed` is
+admitted. `incomplete` is admitted only when at least one grep executed and no grep
+mismatched; its Stop conditions line publishes `unparsed=<names>; dropped=<n>`.
+`mismatch` remains an `EVIDENCE_ERROR`. `all_dropped`, meaning zero conditions
+executed, fails with `SPEC_DEFECT:` and includes the unparsed condition names and any
+`DROPPED:` reasons so the failure is attributed to the stop-condition specification.
+
+The `mec core` block in
+`.archon/workflows/defaults/bdc-feature-development.yaml` is the source of truth; its
+mirrored lane copies must remain byte-identical.
