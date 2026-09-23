@@ -1,10 +1,17 @@
 /**
- * One-shot M-155 dead-letter expiry (WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01).
+ * One-shot M-155 dead-letter expiry (WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01,
+ * receipt-honesty corrected by WO-HARNESS-DISPATCH-HONEST-RECEIPTS-01 / M-187a).
  *
- * Marks the ~920 queued, never-addressed recipient='xo' taskmaster messages
- * as addressed, with a tm_journal note citing M-155. The Taskmaster sent them
- * into a mailbox faster than it was drained; M-155 ruled the backlog
- * dead-letter (DoD D-4: messages must reach a surface someone reads).
+ * Marks the queued, never-heard recipient='xo' taskmaster messages as EXPIRED
+ * via route_disposition (a machine disposition, NOT a receipt), with a
+ * tm_journal note citing M-155. The Taskmaster sent them into a mailbox faster
+ * than it was drained; M-155 ruled the backlog dead-letter (DoD D-4: messages
+ * must reach a surface someone reads). Post-M-187a a machine records what it did
+ * in route_disposition + route_disposed_at and never in acknowledged_* /
+ * addressed_* -- so this script writes disposition 'expired' through the
+ * machine primitive disposeMessageByMachineInTransaction with actor
+ * 'system:m155-deadletter-expiry', per matching row inside the existing single
+ * transaction, and writes no receipt columns.
  *
  * Usage:
  *   bun scripts/taskmaster/expire-xo-deadletter.ts            # dry-run count
@@ -18,18 +25,21 @@
  * - NEVER invoked by the loop. Run once at Deploy 2 (M-155 gates G9/G10),
  *   operator-side, per the PR runbook section.
  */
-import { randomUUID } from 'node:crypto';
 import { closeDatabase, getDatabase } from '../../packages/core/src/db/connection';
+import { disposeMessageByMachineInTransaction } from '../../packages/core/src/db/dispatch';
+import { randomUUID } from 'node:crypto';
 
 const MATCH_WHERE = `
   sender = 'taskmaster'
   AND LOWER(TRIM(recipient)) = 'xo'
   AND status = 'queued'
+  AND acknowledged_at IS NULL
   AND addressed_at IS NULL
+  AND route_disposition IS NULL
 `;
 
 const JOURNAL_IDEMPOTENCY_KEY = 'tm:m155:deadletter-expiry';
-const ADDRESSED_BY = 'xo:m155-deadletter-expiry';
+const EXPIRY_ACTOR = 'system:m155-deadletter-expiry';
 
 async function countMatching(): Promise<number> {
   const result = await getDatabase().query<{ cnt: number | string }>(
@@ -45,8 +55,9 @@ async function main(): Promise<void> {
 
   if (!confirm) {
     console.log(
-      `[dry-run] ${matching} queued, never-addressed recipient='xo' taskmaster ` +
-        'messages match. Re-run with --confirm to mark them addressed (M-155).'
+      `[dry-run] ${matching} queued, never-heard recipient='xo' taskmaster ` +
+        'messages match. Re-run with --confirm to mark them expired via ' +
+        'route_disposition (M-155 / M-187a).'
     );
     return;
   }
@@ -57,17 +68,28 @@ async function main(): Promise<void> {
   }
 
   const nowIso = new Date().toISOString();
-  // Single transaction: the message update and the M-155 journal note commit
-  // together or not at all. Without this, a failed journal insert after a
-  // committed update would leave the expiry permanently unjournaled -- a
+  // Single transaction: the per-row dispositions and the M-155 journal note
+  // commit together or not at all. Without this, a failed journal insert after
+  // committed dispositions would leave the expiry permanently unjournaled -- a
   // rerun sees 0 matching rows and exits before ever reaching the insert.
+  let expired = 0;
   await db.withTransaction(async query => {
-    await query(
-      `UPDATE agent_dispatch_messages
-          SET addressed_at = $1, addressed_by = $2
-        WHERE ${MATCH_WHERE}`,
-      [nowIso, ADDRESSED_BY]
+    const rows = await query<{ id: string }>(
+      `SELECT id FROM agent_dispatch_messages WHERE ${MATCH_WHERE}`
     );
+    for (const row of rows.rows) {
+      // Machines write route_disposition + route_disposed_at only (M-187a). No
+      // receipt column is touched. already_disposed on a rerun is harmless.
+      const result = await disposeMessageByMachineInTransaction(
+        query,
+        { id: row.id, actor: EXPIRY_ACTOR, disposition: 'expired' },
+        nowIso
+      );
+      if (result.ok) expired += 1;
+      else if (result.reason !== 'already_disposed') {
+        throw new Error(`m155_expiry_dispose_failed:${result.reason}:${row.id}`);
+      }
+    }
 
     // Journal note citing M-155 (idempotent: skipped when the note already
     // exists from a prior completed run). action_type/outcome use existing
@@ -87,12 +109,15 @@ async function main(): Promise<void> {
           'm155:deadletter-expiry',
           JSON.stringify({
             note:
-              `M-155 dead-letter expiry: marked ${matching} queued, never-addressed ` +
-              "recipient='xo' taskmaster messages as addressed. Authority: " +
-              'M-20260817-155 (docs/board/motions/M-20260817-155-taskmaster-course-correction.md), ' +
-              'DoD D-4. One-shot operator action at Deploy 2; never run by the loop.',
-            expired_count: matching,
-            addressed_by: ADDRESSED_BY,
+              `M-155 dead-letter expiry: marked ${expired} queued, never-heard ` +
+              "recipient='xo' taskmaster messages expired via route_disposition. " +
+              'Authority: M-20260817-155 ' +
+              '(docs/board/motions/M-20260817-155-taskmaster-course-correction.md), ' +
+              'DoD D-4, and M-187a (machines write route_disposition, never receipts). ' +
+              'One-shot operator action at Deploy 2; never run by the loop.',
+            expired_count: expired,
+            disposition: 'expired',
+            actor: EXPIRY_ACTOR,
           }),
           JOURNAL_IDEMPOTENCY_KEY,
         ]
@@ -101,8 +126,8 @@ async function main(): Promise<void> {
   });
 
   console.log(
-    `Marked ${matching} taskmaster dead-letter messages addressed (addressed_by=${ADDRESSED_BY}) ` +
-      'and journaled the M-155 citation.'
+    `Marked ${expired} taskmaster dead-letter messages expired ` +
+      `(route_disposition=expired, actor=${EXPIRY_ACTOR}) and journaled the M-155 citation.`
   );
 }
 

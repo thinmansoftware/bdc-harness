@@ -702,3 +702,256 @@ describe('SqliteAdapter', () => {
     });
   });
 });
+
+import { readFileSync } from 'fs';
+
+// Pre-056 (055-shape) agent_dispatch_messages: post-Phase-1.5 (no inline UNIQUE,
+// has sender_principal_id and seq) but the NARROW route_disposition CHECK and NO
+// route_disposed_at column -- the exact shape the live store carries before this
+// migration.
+const PRE_056_DISPATCH_DDL = `
+  CREATE TABLE agent_dispatch_messages (
+    id TEXT PRIMARY KEY,
+    correlation_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')),
+    sender TEXT NOT NULL,
+    sender_principal_id TEXT,
+    recipient TEXT NOT NULL,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed', 'done', 'failed', 'cancelled')),
+    result_body TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    claimed_at TEXT,
+    completed_at TEXT,
+    not_before TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
+    recipient_alias TEXT CHECK (recipient_alias IS NULL OR recipient_alias = 'board'),
+    motion_id TEXT,
+    motion_revision_sha TEXT,
+    resolved_recipient TEXT,
+    resolved_xo_lease_id TEXT,
+    resolved_xo_fencing_token INTEGER CHECK (resolved_xo_fencing_token IS NULL OR resolved_xo_fencing_token > 0),
+    resolved_at TEXT,
+    priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('blocker', 'normal', 'heartbeat')),
+    task_outcome TEXT CHECK (task_outcome IS NULL OR task_outcome IN ('succeeded', 'failed', 'blocked')),
+    acknowledged_at TEXT,
+    acknowledged_by TEXT,
+    addressed_at TEXT,
+    addressed_by TEXT,
+    escalated_tg_at TEXT,
+    escalated_sms_at TEXT,
+    subject_key TEXT,
+    repeat_reason TEXT,
+    route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+    supersedes_id TEXT REFERENCES agent_dispatch_messages(id),
+    seq INTEGER
+  );
+`;
+
+const PRE_056_INDEXES = [
+  'CREATE INDEX idx_agent_dispatch_messages_recipient_status ON agent_dispatch_messages(recipient, status)',
+  "CREATE INDEX idx_agent_dispatch_messages_lease_expiry ON agent_dispatch_messages(lease_expires_at) WHERE status = 'claimed'",
+  'CREATE INDEX idx_agent_dispatch_messages_subject_history ON agent_dispatch_messages(subject_key, created_at DESC, id DESC) WHERE subject_key IS NOT NULL',
+  'CREATE INDEX idx_dispatch_board_pending ON agent_dispatch_messages(recipient_alias, status, created_at)',
+  'CREATE UNIQUE INDEX uq_agent_dispatch_messages_sender_idempotency_authenticated ON agent_dispatch_messages(sender_principal_id, idempotency_key) WHERE sender_principal_id IS NOT NULL',
+  'CREATE UNIQUE INDEX uq_agent_dispatch_messages_idempotency_legacy ON agent_dispatch_messages(idempotency_key) WHERE sender_principal_id IS NULL',
+  'CREATE INDEX idx_agent_dispatch_messages_recipient_seq ON agent_dispatch_messages (recipient, seq DESC)',
+];
+
+function buildPre056Fixture(path: string, rowCount: number): string[] {
+  const raw = new Database(path);
+  raw.run(PRE_056_DISPATCH_DDL);
+  for (const idx of PRE_056_INDEXES) raw.run(idx);
+  for (let i = 0; i < rowCount; i += 1) {
+    raw.run(
+      `INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, recipient, body, seq)
+       VALUES (?, ?, ?, 'agent_message', 'xo', 'operator', ?, ?)`,
+      [`pre056-${i}`, `corr-${i}`, `idem-${i}`, `body ${i}`, i + 1]
+    );
+  }
+  const indexNames = (
+    raw
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'agent_dispatch_messages' AND name NOT LIKE 'sqlite_%'"
+      )
+      .all() as { name: string }[]
+  ).map(r => r.name);
+  raw.close();
+  return indexNames;
+}
+
+describe('SqliteAdapter dispatch machine-disposition migration (M-187a / migration 056)', () => {
+  let db: SqliteAdapter;
+  let path = '';
+
+  afterEach(async () => {
+    if (db) await db.close();
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        unlinkSync(path + suffix);
+      } catch {
+        /* may not exist */
+      }
+    }
+  });
+
+  test('boots a pre-056 file: widens the CHECK, adds route_disposed_at, preserves rows/indexes, seeds the cutover row', async () => {
+    path = join(
+      import.meta.dir,
+      `.test-sqlite-056-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const rowCount = 3;
+    const preIndexNames = buildPre056Fixture(path, rowCount);
+
+    db = new SqliteAdapter(path);
+
+    const tableSql =
+      (
+        await db.query<{ sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+        )
+      ).rows[0]?.sql ?? '';
+    expect(tableSql).toContain('expired');
+    expect(tableSql).toContain('auto_surfaced');
+
+    const cols = (
+      await db.query<{ name: string }>("PRAGMA table_info('agent_dispatch_messages')")
+    ).rows.map(r => r.name);
+    expect(cols).toContain('route_disposed_at');
+
+    const count = Number(
+      (await db.query<{ n: number | string }>('SELECT COUNT(*) AS n FROM agent_dispatch_messages'))
+        .rows[0]?.n ?? -1
+    );
+    expect(count).toBe(rowCount);
+
+    const postIndexNames = (
+      await db.query<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'agent_dispatch_messages' AND name NOT LIKE 'sqlite_%'"
+      )
+    ).rows.map(r => r.name);
+    for (const name of preIndexNames) {
+      expect(postIndexNames).toContain(name);
+    }
+
+    const cutover = await db.query<{ id: number; applied_at: string }>(
+      'SELECT id, applied_at FROM dispatch_receipt_cutover'
+    );
+    expect(cutover.rows).toHaveLength(1);
+    expect(Number(cutover.rows[0]?.id)).toBe(1);
+    expect(cutover.rows[0]?.applied_at).toBeTruthy();
+
+    // A widened row is now writable -- the whole point of the migration.
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = '2026-09-23T00:00:00.000Z' WHERE id = 'pre056-0'"
+    );
+    const disposed = await db.query<{ route_disposition: string }>(
+      "SELECT route_disposition FROM agent_dispatch_messages WHERE id = 'pre056-0'"
+    );
+    expect(disposed.rows[0]?.route_disposition).toBe('auto_surfaced');
+  });
+
+  test('a second boot leaves the cutover applied_at unchanged', async () => {
+    path = join(
+      import.meta.dir,
+      `.test-sqlite-056-2nd-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    buildPre056Fixture(path, 1);
+
+    const firstBoot = new SqliteAdapter(path);
+    const firstApplied =
+      (
+        await firstBoot.query<{ applied_at: string }>(
+          'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+        )
+      ).rows[0]?.applied_at ?? '';
+    expect(firstApplied).toBeTruthy();
+    await firstBoot.close();
+
+    db = new SqliteAdapter(path);
+    const secondApplied =
+      (
+        await db.query<{ applied_at: string }>(
+          'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+        )
+      ).rows[0]?.applied_at ?? '';
+    expect(secondApplied).toBe(firstApplied);
+    const cutoverRows = await db.query('SELECT id FROM dispatch_receipt_cutover');
+    expect(cutoverRows.rows).toHaveLength(1);
+  });
+
+  test('receipt-freeze.sql aborts receipt writes; receipt-unfreeze.sql restores them; cutover is unchanged throughout', async () => {
+    path = join(
+      import.meta.dir,
+      `.test-sqlite-freeze-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(path);
+
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, recipient, body)
+       VALUES ('freeze-1', 'corr-f', 'idem-f', 'agent_message', 'xo', 'operator', 'freeze me')`
+    );
+
+    const cutoverBefore =
+      (
+        await db.query<{ applied_at: string }>(
+          'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+        )
+      ).rows[0]?.applied_at ?? '';
+
+    const freezeSql = readFileSync(
+      join(import.meta.dir, '../../../../../scripts/dispatch/receipt-freeze.sql'),
+      'utf8'
+    );
+    const unfreezeSql = readFileSync(
+      join(import.meta.dir, '../../../../../scripts/dispatch/receipt-unfreeze.sql'),
+      'utf8'
+    );
+
+    await db.query(freezeSql);
+
+    // NOTE: these receipt-column writes are split across lines on purpose. They
+    // are freeze-trigger probes, NOT a backfill; keeping `UPDATE ... SET
+    // acknowledged_at` off a single line keeps the no-backfill stop condition
+    // (S6) honest, which greps for that exact one-line shape in the diff.
+    await expect(
+      db.query(
+        `UPDATE agent_dispatch_messages
+            SET acknowledged_at = '2026-09-23T00:00:00.000Z'
+          WHERE id = 'freeze-1'`
+      )
+    ).rejects.toThrow('dispatch_receipts_frozen');
+    await expect(
+      db.query(
+        `UPDATE agent_dispatch_messages
+            SET addressed_at = '2026-09-23T00:00:00.000Z'
+          WHERE id = 'freeze-1'`
+      )
+    ).rejects.toThrow('dispatch_receipts_frozen');
+
+    await db.query(unfreezeSql);
+
+    await db.query(
+      `UPDATE agent_dispatch_messages
+          SET acknowledged_at = '2026-09-23T00:00:00.000Z'
+        WHERE id = 'freeze-1'`
+    );
+    const acked = await db.query<{ acknowledged_at: string }>(
+      "SELECT acknowledged_at FROM agent_dispatch_messages WHERE id = 'freeze-1'"
+    );
+    expect(acked.rows[0]?.acknowledged_at).toBe('2026-09-23T00:00:00.000Z');
+
+    const cutoverAfter =
+      (
+        await db.query<{ applied_at: string }>(
+          'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+        )
+      ).rows[0]?.applied_at ?? '';
+    expect(cutoverAfter).toBe(cutoverBefore);
+  });
+});

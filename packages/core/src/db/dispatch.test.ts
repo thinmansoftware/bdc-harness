@@ -28,6 +28,7 @@ mock.module('./connection', () => ({
 import {
   acknowledgeMessage,
   addressMessage,
+  disposeMessageByMachine,
   cancelMessage,
   claimDispatchEscalation,
   claimMessage,
@@ -2598,6 +2599,162 @@ describe('dispatch db', () => {
         correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#900@',
       });
       expect(found).toHaveLength(0);
+    });
+  });
+
+  describe('disposeMessageByMachine (M-187a honest receipts)', () => {
+    async function operatorRow(suffix: string): Promise<DispatchMessage> {
+      return createMessage({
+        correlation_id: `corr-disp-${suffix}`,
+        idempotency_key: `idem-disp-${suffix}`,
+        task_type: 'agent_message',
+        sender: 'xo',
+        recipient: 'operator',
+        body: `Dispose me: ${suffix}.`,
+      });
+    }
+
+    test('auto_surfaced sets only the disposition columns and leaves receipts null', async () => {
+      const message = await operatorRow('auto');
+      const result = await disposeMessageByMachine({
+        id: message.id,
+        actor: 'system:operator-inbox-consumer',
+        disposition: 'auto_surfaced',
+      });
+      expect(result.ok).toBe(true);
+
+      const stored = await getMessage(message.id);
+      expect(stored?.route_disposition).toBe('auto_surfaced');
+      expect(stored?.route_disposed_at).not.toBeNull();
+      expect(stored?.acknowledged_at).toBeNull();
+      expect(stored?.acknowledged_by).toBeNull();
+      expect(stored?.addressed_at).toBeNull();
+      expect(stored?.addressed_by).toBeNull();
+      expect(stored?.status).toBe('queued');
+    });
+
+    test('an auto_surfaced row stays ackable by a bound human without clearing the disposition', async () => {
+      const message = await operatorRow('ack-after');
+      await disposeMessageByMachine({
+        id: message.id,
+        actor: 'system:operator-inbox-consumer',
+        disposition: 'auto_surfaced',
+      });
+
+      const ack = await acknowledgeMessage({ id: message.id, principal_id: 'operator' });
+      expect(ack.ok).toBe(true);
+
+      const stored = await getMessage(message.id);
+      expect(stored?.acknowledged_by).toBe('operator');
+      expect(stored?.addressed_at).toBeNull();
+      expect(stored?.route_disposition).toBe('auto_surfaced');
+    });
+
+    test('terminal dispositions refuse ack and address (disposition_terminal)', async () => {
+      const expired = await operatorRow('terminal-expired');
+      await disposeMessageByMachine({
+        id: expired.id,
+        actor: 'system:m155-deadletter-expiry',
+        disposition: 'expired',
+      });
+      await expect(
+        acknowledgeMessage({ id: expired.id, principal_id: 'operator' })
+      ).resolves.toEqual({ ok: false, reason: 'disposition_terminal' });
+      await expect(addressMessage({ id: expired.id, principal_id: 'operator' })).resolves.toEqual({
+        ok: false,
+        reason: 'disposition_terminal',
+      });
+
+      // unroutable and superseded are terminal too.
+      const unroutable = await operatorRow('terminal-unroutable');
+      await db.query(
+        "UPDATE agent_dispatch_messages SET route_disposition = 'unroutable' WHERE id = $1",
+        [unroutable.id]
+      );
+      await expect(
+        acknowledgeMessage({ id: unroutable.id, principal_id: 'operator' })
+      ).resolves.toEqual({ ok: false, reason: 'disposition_terminal' });
+
+      const superseded = await operatorRow('terminal-superseded');
+      await db.query(
+        "UPDATE agent_dispatch_messages SET route_disposition = 'superseded' WHERE id = $1",
+        [superseded.id]
+      );
+      await expect(
+        acknowledgeMessage({ id: superseded.id, principal_id: 'operator' })
+      ).resolves.toEqual({ ok: false, reason: 'disposition_terminal' });
+    });
+
+    test('listMessages excludes disposed rows from queued drains but the route_disposition filter retrieves surfaced rows', async () => {
+      const surfaced = await operatorRow('list-surfaced');
+      const expired = await operatorRow('list-expired');
+      await disposeMessageByMachine({
+        id: surfaced.id,
+        actor: 'system:operator-inbox-consumer',
+        disposition: 'auto_surfaced',
+      });
+      await disposeMessageByMachine({
+        id: expired.id,
+        actor: 'system:operator-inbox-consumer',
+        disposition: 'expired',
+      });
+
+      const queued = await listMessages({ recipient: 'operator', status: 'queued' });
+      const queuedIds = queued.map(m => m.id);
+      expect(queuedIds).not.toContain(surfaced.id);
+      expect(queuedIds).not.toContain(expired.id);
+
+      const surfacedList = await listMessages({
+        recipient: 'operator',
+        route_disposition: 'auto_surfaced',
+      });
+      const surfacedIds = surfacedList.map(m => m.id);
+      expect(surfacedIds).toContain(surfaced.id);
+      expect(surfacedIds).not.toContain(expired.id);
+    });
+
+    test('rejects a non-machine actor, an already-disposed row, and an invalid disposition', async () => {
+      const nonMachine = await operatorRow('reject-actor');
+      await expect(
+        disposeMessageByMachine({
+          id: nonMachine.id,
+          actor: 'operator',
+          disposition: 'auto_surfaced',
+        })
+      ).resolves.toEqual({ ok: false, reason: 'machine_actor_required' });
+
+      const already = await operatorRow('reject-already');
+      await disposeMessageByMachine({
+        id: already.id,
+        actor: 'system:operator-inbox-consumer',
+        disposition: 'auto_surfaced',
+      });
+      await expect(
+        disposeMessageByMachine({
+          id: already.id,
+          actor: 'system:operator-inbox-consumer',
+          disposition: 'expired',
+        })
+      ).resolves.toEqual({ ok: false, reason: 'already_disposed' });
+
+      const invalid = await operatorRow('reject-invalid');
+      await expect(
+        disposeMessageByMachine({
+          id: invalid.id,
+          actor: 'system:operator-inbox-consumer',
+          // 'addressed' is not a machine disposition; the primitive rejects it
+          // and the CHECK would reject it too.
+          disposition: 'addressed' as unknown as 'expired',
+        })
+      ).resolves.toEqual({ ok: false, reason: 'disposition_invalid' });
+
+      await expect(
+        disposeMessageByMachine({
+          id: 'missing-row',
+          actor: 'system:operator-inbox-consumer',
+          disposition: 'expired',
+        })
+      ).resolves.toEqual({ ok: false, reason: 'not_found' });
     });
   });
 });

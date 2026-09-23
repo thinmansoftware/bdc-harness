@@ -22,7 +22,10 @@ export type DispatchMessageStatus = 'queued' | 'claimed' | 'done' | 'failed' | '
 export type DispatchWorkerStatus = 'available' | 'unavailable';
 export type DispatchMessagePriority = 'blocker' | 'normal' | 'heartbeat';
 export type DispatchTaskOutcome = 'succeeded' | 'failed' | 'blocked';
-export type DispatchRouteDisposition = 'unroutable' | 'superseded';
+export type DispatchRouteDisposition = 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced';
+
+/** Dispositions a machine primitive may write (item 3, M-187a). */
+export type DispatchMachineDisposition = 'expired' | 'auto_surfaced';
 export type DispatchDeliveryMode =
   | 'worker_poll'
   | 'drain_on_start'
@@ -64,6 +67,7 @@ export interface DispatchMessage {
   escalated_sms_at: string | null;
   subject_key: string | null;
   route_disposition: DispatchRouteDisposition | null;
+  route_disposed_at: string | null;
   supersedes_id: string | null;
   repeat_reason: string | null;
 }
@@ -136,7 +140,11 @@ export type DispatchMailboxResult =
         | 'wrong_recipient'
         | 'not_queued'
         | 'address_before_ack'
-        | 'actor_mismatch';
+        | 'actor_mismatch'
+        | 'disposition_terminal'
+        | 'machine_actor_required'
+        | 'already_disposed'
+        | 'disposition_invalid';
     };
 
 export interface UnroutableQueuedDispatchMessage {
@@ -721,6 +729,7 @@ export async function listMessages(filters: {
   limit?: number;
   allowBoardAlias?: boolean;
   subject_key?: string;
+  route_disposition?: DispatchRouteDisposition;
 }): Promise<DispatchMessage[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -752,10 +761,18 @@ export async function listMessages(filters: {
     params.push(normalizeDispatchSubjectKey(filters.subject_key));
     clauses.push(`subject_key = $${params.length}`);
   }
+  if (filters.route_disposition !== undefined) {
+    params.push(filters.route_disposition);
+    clauses.push(`route_disposition = $${params.length}`);
+  }
   if (filters.status === 'queued') {
     params.push(nowIso());
     clauses.push(`(not_before IS NULL OR not_before <= $${params.length})`);
     clauses.push('addressed_at IS NULL');
+    // Disposed rows (expired, auto_surfaced, unroutable, superseded) leave every
+    // status=queued drain list (item 3, M-187a). A machine-surfaced row is
+    // retrievable only through the explicit route_disposition filter above.
+    clauses.push('route_disposition IS NULL');
   }
   params.push(Math.max(1, Math.min(filters.limit ?? 100, 500)));
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1161,6 +1178,18 @@ async function validateMailboxActor(
     return { ok: false, reason: 'wrong_mode' };
   }
   if (message.status !== 'queued') return { ok: false, reason: 'not_queued' };
+  // Terminal machine dispositions refuse ack/address (item 3, M-187a). status
+  // stays 'queued' on disposed rows (no backfill), so this guard -- not the
+  // status check -- is what keeps a bound human from writing a receipt on an
+  // expired/unroutable/superseded row. 'auto_surfaced' is deliberately absent:
+  // a surfaced row stays ackable/addressable by a bound human actor.
+  if (
+    message.route_disposition === 'expired' ||
+    message.route_disposition === 'unroutable' ||
+    message.route_disposition === 'superseded'
+  ) {
+    return { ok: false, reason: 'disposition_terminal' };
+  }
   return null;
 }
 
@@ -1289,6 +1318,74 @@ export async function addressMessage(data: {
       }
       return { ok: false, reason: 'actor_mismatch' };
     })
+  );
+}
+
+/**
+ * Machine disposition primitive (item 3, M-187a). The ONLY write path a machine
+ * may use to record what it did with a mailbox row. Sets EXACTLY
+ * route_disposition + route_disposed_at and nothing else -- never a receipt
+ * column. `actor` is logged for provenance but NEVER stored: the store has no
+ * machine-actor column and this WO adds none.
+ *
+ * Transaction-scoped so the M-155 dead-letter expiry script can call it per row
+ * inside its existing single transaction alongside its journal note; the public
+ * disposeMessageByMachine wraps it in its own retried transaction.
+ */
+export async function disposeMessageByMachineInTransaction(
+  query: DispatchQueryExecutor,
+  data: { id: string; actor: string; disposition: DispatchMachineDisposition },
+  now: string
+): Promise<DispatchMailboxResult> {
+  if (!data.actor.startsWith('system:')) {
+    return { ok: false, reason: 'machine_actor_required' };
+  }
+  if (data.disposition !== 'expired' && data.disposition !== 'auto_surfaced') {
+    return { ok: false, reason: 'disposition_invalid' };
+  }
+  // Defense in depth: an actor that collides with a registered principal is not
+  // a machine actor. RESERVED_PREFIXES already forbid a 'system:'-prefixed
+  // principal, so this only fires on a misconfigured registry.
+  const principal = await getDispatchPrincipal(query, data.actor);
+  if (principal) {
+    return { ok: false, reason: 'machine_actor_required' };
+  }
+  const message = await readMessageInTransaction(query, data.id);
+  if (!message) return { ok: false, reason: 'not_found' };
+  if (message.route_disposition !== null) {
+    return { ok: false, reason: 'already_disposed' };
+  }
+
+  await query(
+    `UPDATE agent_dispatch_messages
+        SET route_disposition = $2,
+            route_disposed_at = $3
+      WHERE id = $1
+        AND route_disposition IS NULL`,
+    [data.id, data.disposition, now]
+  );
+  const finalMessage = await readMessageInTransaction(query, data.id);
+  if (!finalMessage) return { ok: false, reason: 'not_found' };
+  if (finalMessage.route_disposition !== data.disposition) {
+    // Lost a race to another disposer between read and write.
+    return { ok: false, reason: 'already_disposed' };
+  }
+  return { ok: true, message: finalMessage };
+}
+
+export async function disposeMessageByMachine(data: {
+  id: string;
+  actor: string;
+  disposition: DispatchMachineDisposition;
+}): Promise<DispatchMailboxResult> {
+  const db = getDatabase();
+  const now = nowIso();
+  log.info(
+    { messageId: data.id, actor: data.actor, disposition: data.disposition },
+    'dispatch.machine_disposition_requested'
+  );
+  return withRetriedMailboxTransaction(() =>
+    db.withTransaction(query => disposeMessageByMachineInTransaction(query, data, now))
   );
 }
 

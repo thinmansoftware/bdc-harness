@@ -552,9 +552,22 @@ CREATE TABLE IF NOT EXISTS agent_dispatch_messages (
   escalated_sms_at TIMESTAMPTZ,
   subject_key TEXT,
   repeat_reason TEXT,
-  route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+  route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+  route_disposed_at TEXT,
   supersedes_id UUID REFERENCES agent_dispatch_messages(id)
 );
+
+-- One-row cutover bookkeeping table (migration 056, M-187a). Separates
+-- pre-cutover machine stamps (non-evidence) from post-cutover receipts. Written
+-- once and preserved across every boot/rebuild/rollback.
+CREATE TABLE IF NOT EXISTS dispatch_receipt_cutover (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  applied_at TEXT NOT NULL
+);
+
+INSERT INTO dispatch_receipt_cutover (id, applied_at)
+VALUES (1, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
+ON CONFLICT (id) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status
   ON agent_dispatch_messages(recipient, status);

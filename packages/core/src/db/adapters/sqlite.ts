@@ -714,8 +714,9 @@ export class SqliteAdapter implements IDatabase {
         ['repeat_reason', 'TEXT'],
         [
           'route_disposition',
-          "TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))",
+          "TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced'))",
         ],
+        ['route_disposed_at', 'TEXT'],
         ['supersedes_id', 'TEXT REFERENCES agent_dispatch_messages(id)'],
       ];
       const boardDispatchCols = this.db
@@ -763,6 +764,7 @@ export class SqliteAdapter implements IDatabase {
 
     this.migrateDispatchSenderPrincipalIdempotency();
     this.migrateDispatchSeq();
+    this.migrateDispatchRouteDisposition();
 
     try {
       const actionCols = this.db
@@ -856,6 +858,208 @@ export class SqliteAdapter implements IDatabase {
       );
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_dispatch_seq_failed');
+    }
+  }
+
+  /**
+   * Migration 056 (M-187a, WO-HARNESS-DISPATCH-HONEST-RECEIPTS-01): widen the
+   * route_disposition CHECK to admit 'expired' and 'auto_surfaced', and add the
+   * route_disposed_at stamp column.
+   *
+   * SQLite cannot ALTER a CHECK in place, so a pre-056 table (narrow CHECK, no
+   * route_disposed_at) is rebuilt: a new table with the widened CHECK is created,
+   * every existing row is copied verbatim (route_disposed_at defaults to NULL for
+   * rows that predate the column -- no backfill of any receipt or disposition
+   * value), the old table is dropped and the new one renamed, and every index is
+   * recreated. Load-bearing: a failed rebuild throws (mirrors the Phase 1.5
+   * rebuild) rather than leaving a narrow CHECK that rejects honest machine
+   * dispositions at runtime.
+   *
+   * Idempotent: keyed on the presence of the 'auto_surfaced' token in the stored
+   * table SQL. A fresh database (createSchema built the widened shape) and a
+   * Phase 1.5-rebuilt database (its rebuild also emits the widened shape) both
+   * carry the token and skip. dispatch_receipt_cutover is a separate table and is
+   * never touched here.
+   */
+  private migrateDispatchRouteDisposition(): void {
+    const tableSqlRow = this.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+      )
+      .get() as { sql: string } | null;
+    if (!tableSqlRow?.sql) return;
+    // Already widened (fresh schema or Phase 1.5 rebuild emit the new token).
+    if (tableSqlRow.sql.includes('auto_surfaced')) return;
+    // Only fire once route_disposition exists with the narrow CHECK. A table
+    // that has not yet completed Phase 0 (e.g. a rolled-back backfill on the
+    // prior boot) has no route_disposition column and no priority column; its
+    // eventual successful Phase 0 adds route_disposition already widened (see
+    // phase0Columns above), so there is nothing to rebuild and copying a NULL
+    // into the NOT NULL priority column below would wrongly fail.
+    const colNames = new Set(
+      (
+        this.db.prepare("PRAGMA table_info('agent_dispatch_messages')").all() as {
+          name: string;
+        }[]
+      ).map(c => c.name)
+    );
+    if (!colNames.has('route_disposition')) return;
+
+    // Widened disposition set, built by join so the rebuild table's CHECK stays
+    // the single source of truth without duplicating the literal already present
+    // at the three canonical CHECK sites (phase0Columns, the Phase 1.5 rebuild
+    // table, and the initial CREATE TABLE).
+    const terminalDispositions = ['unroutable', 'superseded', 'expired'];
+    const nonTerminalDispositions = ['auto_surfaced'];
+    const routeDispositionInList = [...terminalDispositions, ...nonTerminalDispositions]
+      .map(v => `'${v}'`)
+      .join(', ');
+
+    this.db.run('PRAGMA foreign_keys = OFF');
+    try {
+      this.db.run('BEGIN');
+      try {
+        this.db.run(`
+          CREATE TABLE agent_dispatch_messages__disp056 (
+            id TEXT PRIMARY KEY,
+            correlation_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')),
+            sender TEXT NOT NULL,
+            sender_principal_id TEXT,
+            recipient TEXT NOT NULL,
+            body TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'claimed', 'done', 'failed', 'cancelled')),
+            result_body TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            claimed_at TEXT,
+            completed_at TEXT,
+            not_before TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
+            recipient_alias TEXT CHECK (recipient_alias IS NULL OR recipient_alias = 'board'),
+            motion_id TEXT,
+            motion_revision_sha TEXT CHECK (motion_revision_sha IS NULL OR motion_revision_sha GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
+            resolved_recipient TEXT,
+            resolved_xo_lease_id TEXT,
+            resolved_xo_fencing_token INTEGER CHECK (resolved_xo_fencing_token IS NULL OR resolved_xo_fencing_token > 0),
+            resolved_at TEXT,
+            priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('blocker', 'normal', 'heartbeat')),
+            task_outcome TEXT CHECK (task_outcome IS NULL OR task_outcome IN ('succeeded', 'failed', 'blocked')),
+            acknowledged_at TEXT,
+            acknowledged_by TEXT,
+            addressed_at TEXT,
+            addressed_by TEXT,
+            escalated_tg_at TEXT,
+            escalated_sms_at TEXT,
+            subject_key TEXT,
+            repeat_reason TEXT,
+            route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN (${routeDispositionInList})),
+            route_disposed_at TEXT,
+            supersedes_id TEXT REFERENCES agent_dispatch_messages__disp056(id),
+            seq INTEGER
+          )
+        `);
+
+        const sourceCols = this.db
+          .prepare("PRAGMA table_info('agent_dispatch_messages')")
+          .all() as { name: string }[];
+        const sourceNames = new Set(sourceCols.map(c => c.name));
+        const targetCols = [
+          'id',
+          'correlation_id',
+          'idempotency_key',
+          'task_type',
+          'sender',
+          'sender_principal_id',
+          'recipient',
+          'body',
+          'status',
+          'result_body',
+          'created_at',
+          'claimed_at',
+          'completed_at',
+          'not_before',
+          'lease_owner',
+          'lease_expires_at',
+          'fencing_token',
+          'recipient_alias',
+          'motion_id',
+          'motion_revision_sha',
+          'resolved_recipient',
+          'resolved_xo_lease_id',
+          'resolved_xo_fencing_token',
+          'resolved_at',
+          'priority',
+          'task_outcome',
+          'acknowledged_at',
+          'acknowledged_by',
+          'addressed_at',
+          'addressed_by',
+          'escalated_tg_at',
+          'escalated_sms_at',
+          'subject_key',
+          'repeat_reason',
+          'route_disposition',
+          'route_disposed_at',
+          'supersedes_id',
+          'seq',
+        ];
+        const selectExprs = targetCols.map(name =>
+          sourceNames.has(name) ? name : 'NULL AS ' + name
+        );
+        this.db.run(
+          `INSERT INTO agent_dispatch_messages__disp056 (${targetCols.join(', ')})
+           SELECT ${selectExprs.join(', ')} FROM agent_dispatch_messages`
+        );
+        this.db.run('DROP TABLE agent_dispatch_messages');
+        this.db.run(
+          'ALTER TABLE agent_dispatch_messages__disp056 RENAME TO agent_dispatch_messages'
+        );
+
+        this.db.run(
+          'CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status ON agent_dispatch_messages(recipient, status)'
+        );
+        this.db.run(
+          "CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_lease_expiry ON agent_dispatch_messages(lease_expires_at) WHERE status = 'claimed'"
+        );
+        this.db.run(
+          'CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_subject_history ON agent_dispatch_messages(subject_key, created_at DESC, id DESC) WHERE subject_key IS NOT NULL'
+        );
+        this.db.run(
+          'CREATE INDEX IF NOT EXISTS idx_dispatch_board_pending ON agent_dispatch_messages(recipient_alias, status, created_at)'
+        );
+        this.db.run(
+          `CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_dispatch_messages_sender_idempotency_authenticated
+           ON agent_dispatch_messages(sender_principal_id, idempotency_key)
+           WHERE sender_principal_id IS NOT NULL`
+        );
+        this.db.run(
+          `CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_dispatch_messages_idempotency_legacy
+           ON agent_dispatch_messages(idempotency_key)
+           WHERE sender_principal_id IS NULL`
+        );
+        this.db.run(
+          `CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_seq
+             ON agent_dispatch_messages (recipient, seq DESC)`
+        );
+        this.db.run('COMMIT');
+      } catch (error: unknown) {
+        try {
+          this.db.run('ROLLBACK');
+        } catch {
+          /* ignore rollback failure; surface original */
+        }
+        throw error;
+      }
+
+      const fkCheck = this.db.prepare('PRAGMA foreign_key_check').all();
+      if (fkCheck.length > 0) {
+        throw new Error('dispatch_route_disposition_foreign_key_check_failed');
+      }
+    } finally {
+      this.db.run('PRAGMA foreign_keys = ON');
     }
   }
 
@@ -971,7 +1175,8 @@ export class SqliteAdapter implements IDatabase {
             escalated_sms_at TEXT,
             subject_key TEXT,
             repeat_reason TEXT,
-            route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+            route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+            route_disposed_at TEXT,
             supersedes_id TEXT REFERENCES agent_dispatch_messages__phase15(id)
           )
         `);
@@ -1016,6 +1221,7 @@ export class SqliteAdapter implements IDatabase {
           'subject_key',
           'repeat_reason',
           'route_disposition',
+          'route_disposed_at',
           'supersedes_id',
         ];
         const selectExprs = targetCols.map(name =>
@@ -1459,7 +1665,8 @@ export class SqliteAdapter implements IDatabase {
         escalated_sms_at TEXT,
         subject_key TEXT,
         repeat_reason TEXT,
-        route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+        route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+        route_disposed_at TEXT,
         supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
       );
 
@@ -2347,6 +2554,20 @@ export class SqliteAdapter implements IDatabase {
       );
 
       INSERT OR IGNORE INTO tm_adoption_meta (id) VALUES (1);
+
+      -- One-row cutover bookkeeping table (migration 056, M-187a,
+      -- WO-HARNESS-DISPATCH-HONEST-RECEIPTS-01). Separates pre-cutover machine
+      -- stamps (non-evidence) from post-cutover receipts. Row 1 is written once
+      -- via INSERT OR IGNORE and PRESERVED across every later boot -- a second
+      -- boot leaves applied_at unchanged. migrateDispatchRouteDisposition()'s
+      -- agent_dispatch_messages rebuild never touches dispatch_receipt_cutover.
+      CREATE TABLE IF NOT EXISTS dispatch_receipt_cutover (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        applied_at TEXT NOT NULL
+      );
+
+      INSERT OR IGNORE INTO dispatch_receipt_cutover (id, applied_at)
+      VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
       -- Taskmaster noise suppression (migration 044,
       -- WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01). Durable standalone table --

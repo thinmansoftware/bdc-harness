@@ -415,8 +415,10 @@ describe('dispatch-migration-smoke CLI', () => {
   });
 
   test('rejects a pre-existing dispatch index with the right name but wrong definition', async () => {
-    // Use a Phase 1.5-shaped table (no inline UNIQUE) so rebuild does not heal
-    // a wrong-definition leftover via IF NOT EXISTS.
+    // Use a post-056-shaped table (no inline UNIQUE, route_disposition already
+    // widened + route_disposed_at present) so NO rebuild path fires -- neither
+    // Phase 1.5 nor the migration-056 route_disposition rebuild -- and a
+    // wrong-definition index leftover survives to be detected rather than healed.
     const dir = await mkdtemp(join(tmpdir(), 'dispatch-migration-smoke-test-'));
     temporaryDirectories.push(dir);
     const dbPath = join(dir, 'source-copy.db');
@@ -457,7 +459,8 @@ describe('dispatch-migration-smoke CLI', () => {
         escalated_sms_at TEXT,
         subject_key TEXT,
         repeat_reason TEXT,
-        route_disposition TEXT,
+        route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+        route_disposed_at TEXT,
         supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
       );
     `);
