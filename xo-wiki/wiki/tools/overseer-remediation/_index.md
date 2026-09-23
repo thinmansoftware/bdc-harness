@@ -60,9 +60,18 @@ a scratch script.
 ## The wire contract
 
 Written to `agent_dispatch_messages` with `task_type: 'run_review'`, recipient
-`taskmaster`, sender `overseer-review-route`, subject key
+`taskmaster`, **authenticated sender `overseer`**, subject key
 `gh:owner/repo#number`. The body is JSON discriminated by
 `kind: "overseer_remediation_candidate"`:
+
+> The sender is `overseer`, NOT `overseer-review-route`. M-129 Phase 1.5
+> (PR #669) replaced `createMessage` with `createAuthenticatedMessage`, whose
+> `bindSenderContext` admits exactly three system senders -- `dispatch`,
+> `overseer`, `taskmaster`. `REMEDIATION_SENDER` names the real one and the
+> emitter binds that constant, so the two cannot drift; an integration test
+> asserts the sender on the **stored row**, not just on the constant. This doc
+> and the constant both said `overseer-review-route` until PR #740 [minor]
+> (2026-09-04).
 
 | Field                         | Meaning                                                                    |
 | ----------------------------- | -------------------------------------------------------------------------- |
@@ -105,11 +114,35 @@ a test.** Nothing else changes.
 
 | Class id             | Covers                                                                   |
 | -------------------- | ------------------------------------------------------------------------ |
-| `build_failure`      | Compilation / build / type errors named by the reviewer.                 |
-| `test_failure`       | Failing or missing tests.                                                |
+| `build_failure`      | Build / compile / type errors the toolchain ALREADY REPORTED.            |
+| `test_failure`       | Tests OBSERVED FAILING. Missing coverage is excluded -- see below.       |
 | `lint_or_format`     | Lint, formatting, style-rule violations.                                 |
 | `migration_ordering` | Migration statement ordering, including FK-violating parent/child order. |
 | `ascii_violation`    | Non-ASCII in files required to be ASCII-only.                            |
+
+### The rule when adding a class: demand MECHANICAL EVIDENCE
+
+A pattern must require evidence of an ALREADY-OBSERVED failure (a runner said
+which assertion broke, a compiler named a line), not merely mention a mechanical
+noun. **This is the actual security boundary** -- not the keyword blocklist
+below it.
+
+PR #740's `[major]` finding (2026-09-04) is the anchor. `test_failure` used to
+mean "the word _test_ followed by a failure word", which matched
+_"Test missing for unescaped user content rendered into the page"_ -- an XSS
+defect wearing a coverage-gap costume -- and routed it for unattended
+remediation.
+
+The distinction that fixed it: a **missing** test is a judgment call, because
+deciding what it should assert requires knowing what the code ought to do. A
+**failing** test is mechanical, because the runner already said what broke. So
+coverage-gap phrasings ("missing", "absent", "no test for") now fall through to
+the fail-closed default and reach a human regardless of how they are worded.
+
+Watch precision when editing the blocklist too: an earlier attempt at this fix
+added a bare `sql` token, which matched the `.sql` extension of the migration
+filename and sent the live shopops#650 anchor -- the case this whole WO exists
+for -- to a human.
 
 ### What must NEVER be added
 
@@ -148,6 +181,14 @@ credential" is non-auto).
    legitimate attempt 2 after a fix push still works: it is a different attempt
    NUMBER, and the head being remediated travels in the body (`headSha`).
 
+   **How `claimed` is decided:** the emitter puts a per-call UUID nonce in
+   `correlation_id` (caller-controlled, stored verbatim, NOT part of the
+   idempotency key) and checks whether it round-trips. Comparing bodies was not
+   enough -- an identical re-submission has a byte-equal stored body and so
+   reported `claimed: true`, recording a duplicate as a new attempt
+   (PR #740 [minor], 2026-09-04). The nonce comes back only when THIS call is
+   the insert that landed.
+
 5. **Taskmaster still decides.** Budget, pause, backoff, and eligibility all
    still apply.
 6. **A hand-back failure never un-lands a review.** If the counter or the emit
@@ -177,12 +218,16 @@ WO.
 
 ## Taskmaster consumer status
 
-**NOT YET BUILT.** `packages/server/src/taskmaster/*` was frozen pending
-bdc-harness PR #669 (M-129 Phase 1.5), which was still OPEN when this landed.
-The Overseer half and the message contract are complete and tested; the
-consumer that reads candidates and subjects them to budget/backoff/eligibility
-is the follow-on work. Spec Section 11 scenario 8 is skipped for this reason
-and unskips when #669 merges and the consumer lands.
+**NOT YET BUILT -- and no longer blocked.** The freeze is OVER: bdc-harness
+PR #669 (M-129 Phase 1.5) merged **2026-08-30**, so
+`packages/server/src/taskmaster/*` is editable again.
+
+The Overseer half and the message contract are complete and tested. What remains
+is the consumer that reads candidates and subjects them to
+budget/backoff/eligibility -- unblocked, unowned, follow-on work. Spec Section 11
+scenario 8 stays skipped only because there is no consumer to assert a refusal
+against (verified by grep: nothing in `packages/server/src/taskmaster/` reads
+`overseer_remediation_candidate`). It unskips when that lands.
 
 Until the consumer exists, candidates accumulate as queued dispatch rows
 addressed to `taskmaster` and nothing fires -- which is the safe direction.

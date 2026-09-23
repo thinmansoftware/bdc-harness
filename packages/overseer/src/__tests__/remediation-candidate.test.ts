@@ -2,10 +2,12 @@
  * WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01, Section 11.
  *
  * Scenarios 1-7 and 9 are covered here. Scenario 8 (Taskmaster refusal) is
- * GATED on bdc-harness PR #669 (M-129), which was still OPEN when this landed
- * -- packages/server/src/taskmaster/* is frozen, so the consumer that would
- * make scenario 8 assertable does not exist yet. It is skipped with that
- * reason stated, per the spec's own instruction.
+ * still skipped, but the REASON changed on 2026-08-30: bdc-harness PR #669
+ * (M-129) has MERGED, so packages/server/src/taskmaster/* is no longer frozen.
+ * What blocks scenario 8 now is simply that the Taskmaster-side consumer for
+ * `overseer_remediation_candidate` has not been built yet -- verified by grep
+ * against packages/server/src/taskmaster/. There is no refusal to assert
+ * against until it exists, and building it is follow-on work, not this WO.
  *
  * No mock.module anywhere: every dependency is injected, so these tests cannot
  * pollute the process-wide module cache for other files in the package.
@@ -221,6 +223,111 @@ describe('scenario 5: a new head SHA permits a second attempt', () => {
   });
 });
 
+/**
+ * REGRESSION -- PR #740 [major] (2026-09-04). The Overseer gate found that the
+ * fail-closed security boundary was really a keyword blocklist, and that a
+ * security-sensitive finding phrased without any of those keywords would be
+ * auto-routed for unattended remediation.
+ *
+ * The root cause was pattern breadth, not a missing keyword: `test_failure`
+ * matched "the word test ... then a failure word anywhere after it", which
+ * swallowed coverage-gap phrasings. A MISSING test is a judgment call (deciding
+ * what it should assert requires knowing what the code ought to do); a FAILING
+ * test is mechanical (the runner already named the broken assertion). The
+ * classes now require observed failure, so coverage gaps fall through to the
+ * fail-closed default and reach a human regardless of wording.
+ *
+ * A blocklist cannot enumerate every phrasing, so these cases deliberately omit
+ * the security keywords entirely -- they must be HUMAN on pattern shape alone.
+ */
+describe('regression: security-shaped findings never auto-route (PR #740 major)', () => {
+  const mustBeHuman: readonly {
+    readonly label: string;
+    readonly finding: IndependentReviewFinding;
+  }[] = [
+    {
+      label: "the reviewer's own counterexample",
+      finding: {
+        scope: 'packages/api/src/query.ts',
+        severity: 'blocker',
+        summary: 'Missing test for a query that concatenates user input',
+      },
+    },
+    {
+      label: 'SQL-injection shaped, no security keyword',
+      finding: {
+        scope: 'src/db.ts',
+        severity: 'blocker',
+        summary: 'No test covers the string-built WHERE clause from request params',
+      },
+    },
+    {
+      label: 'XSS shaped, no security keyword',
+      finding: {
+        scope: 'src/render.ts',
+        severity: 'blocker',
+        summary: 'Test missing for unescaped user content rendered into the page',
+      },
+    },
+    {
+      label: 'a plain coverage gap is a judgment call, not a mechanical fix',
+      finding: {
+        scope: 'src/a.ts',
+        severity: 'blocker',
+        summary: 'Missing test for the new branch',
+      },
+    },
+  ];
+
+  for (const { label, finding } of mustBeHuman) {
+    test(`NON-AUTO: ${label}`, () => {
+      expect(classifyFinding(finding).autoFixable).toBe(false);
+    });
+  }
+
+  test('a verdict containing one of these emits NO candidate', () => {
+    const decision = decideRemediation(baseInput({ findings: [mustBeHuman[2]!.finding] }));
+    expect(decision.emit).toBe(false);
+    if (decision.emit) throw new Error('unreachable');
+    expect(decision.reason).toBe('non_auto_finding_present');
+  });
+
+  /**
+   * The other half of the fix: narrowing must not break the mechanical cases,
+   * and above all not the live shopops#650 anchor this whole WO exists for.
+   * An earlier attempt at this fix DID break it -- a bare `sql` token in the
+   * non-auto list matched the `.sql` extension of the migration filename.
+   */
+  test('genuinely mechanical findings still auto-route', () => {
+    const mechanical: readonly [string, IndependentReviewFinding, string][] = [
+      [
+        'observed failing tests',
+        {
+          scope: 'packages/core/src/x.test.ts',
+          severity: 'major',
+          summary: 'Two tests fail against the new column name',
+        },
+        'test_failure',
+      ],
+      [
+        'build error',
+        {
+          scope: 'src/y.ts',
+          severity: 'blocker',
+          summary: 'The build fails: tsc reports an error on line 40',
+        },
+        'build_failure',
+      ],
+      ['the live shopops#650 anchor', MIGRATION_ORDERING_FINDING, 'migration_ordering'],
+    ];
+    for (const [label, finding, expectedClass] of mechanical) {
+      const result = classifyFinding(finding);
+      expect(result.autoFixable, `${label} must stay auto-fixable`).toBe(true);
+      expect(result.classId, label).toBe(expectedClass);
+    }
+  });
+});
+
 describe('scenario 6: fail-closed classification', () => {
   test('a finding matching no known class is NON-AUTO', () => {
     const classification = classifyFinding({
@@ -269,14 +376,17 @@ describe('scenario 7: an APPROVED verdict never remediates', () => {
   });
 });
 
-describe('scenario 8: Taskmaster refusal (GATED on PR #669)', () => {
-  // SKIPPED WITH REASON, per the spec. bdc-harness PR #669 (M-129 Phase 1.5)
-  // was OPEN at implementation time, freezing packages/server/src/taskmaster/*.
-  // The consumer that would accept a candidate and record a
-  // budget/pause/eligibility refusal does not exist yet, so there is nothing to
-  // assert against. This test unskips when #669 merges and the consumer lands.
+describe('scenario 8: Taskmaster refusal (consumer not yet built)', () => {
+  // SKIPPED WITH REASON, per the spec.
+  //
+  // The freeze is OVER: PR #669 (M-129 Phase 1.5) merged 2026-08-30, so
+  // packages/server/src/taskmaster/* is editable again. What is still missing
+  // is the consumer itself -- nothing in packages/server/src/taskmaster/ reads
+  // `overseer_remediation_candidate`, so there is no budget/pause/eligibility
+  // refusal to assert against. Building that consumer is follow-on work
+  // (tracked separately); this test unskips when it lands.
   test.skip('a candidate arriving while paused or over budget is not fired', () => {
-    throw new Error('unreachable: gated on PR #669');
+    throw new Error('unreachable: Taskmaster remediation consumer not yet built');
   });
 });
 

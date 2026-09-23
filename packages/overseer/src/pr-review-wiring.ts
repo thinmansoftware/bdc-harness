@@ -15,6 +15,7 @@
  * events when it is not configured. Enabling the App's `pull_request` event
  * subscription remains a separate, external step.
  */
+import { randomUUID } from 'node:crypto';
 import * as dispatch from '@archon/core/db/dispatch';
 import {
   createRealFetchExactHeadPullRequestEvidence,
@@ -33,6 +34,7 @@ import {
   countPriorRemediationAttempts,
   remediationIdempotencyKey,
   REMEDIATION_RECIPIENT,
+  REMEDIATION_SENDER,
 } from './remediation-candidate';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
@@ -377,17 +379,29 @@ export function createRealSubmitDeps(
         attempt: body.attempt,
       });
       const serialized = JSON.stringify(body);
+      // CREATION IDENTITY. Comparing the returned body to ours cannot tell a
+      // fresh insert from an idempotent replay whose stored body is byte-equal
+      // -- both look identical, so both reported claimed:true and a duplicate
+      // submission was recorded as a newly emitted attempt (PR #740 [minor],
+      // 2026-09-04). correlation_id is caller-controlled, stored verbatim, and
+      // NOT part of the idempotency key, so a per-call nonce round-trips only
+      // when THIS call is the one that inserted the row.
+      const attemptNonce = randomUUID();
+      const correlationId = `overseer-remediation:${body.owner}/${body.repo}#${body.prNumber}:${attemptNonce}`;
       // Sender authentication (PR #669) replaced the unauthenticated
       // createMessage with createAuthenticatedMessage, which binds an explicit
       // sender context. bindSenderContext admits exactly three system senders
-      // -- 'dispatch', 'overseer', 'taskmaster' -- so REVIEW_SENDER ('overseer')
-      // is used here, matching every other emit on this route. The seeded
-      // 'overseer-review-route' principal remains the recipient-side identity
-      // recorded in the body, not the authenticated sender.
+      // -- 'dispatch', 'overseer', 'taskmaster'.
+      //
+      // REMEDIATION_SENDER (not REVIEW_SENDER) is bound here deliberately: the
+      // exported constant IS the wire contract, so binding it is what keeps the
+      // declared sender and the authenticated sender from drifting apart again.
+      // Both resolve to 'overseer' today; if the contract ever changes, this
+      // call site changes with it instead of silently disagreeing.
       const message = await dispatch.createAuthenticatedMessage(
-        { kind: 'system', sender: REVIEW_SENDER },
+        { kind: 'system', sender: REMEDIATION_SENDER },
         {
-          correlation_id: `overseer-remediation:${body.owner}/${body.repo}#${body.prNumber}`,
+          correlation_id: correlationId,
           idempotency_key: idempotencyKey,
           // Reuses the existing run_review task type: this is queued review-loop
           // work, and adding a task_type would require a DB CHECK-constraint
@@ -406,11 +420,11 @@ export function createRealSubmitDeps(
           repeat_reason: `remediation attempt ${body.attempt} of ${body.maxAttempts} for head ${body.headSha}`,
         }
       );
-      // createAuthenticatedMessage returns the EXISTING row on conflict rather than
-      // throwing, so the stored body is what distinguishes "I claimed this
-      // attempt slot" from "someone else already had it". Comparing bodies is
-      // exact here because both sides serialize the same interface.
-      return { claimed: message.body === serialized };
+      // createAuthenticatedMessage returns the EXISTING row on conflict rather
+      // than throwing. Our nonce is present only if OUR insert is the row that
+      // landed, so this distinguishes a genuine claim from a replay even when
+      // the two bodies are byte-identical.
+      return { claimed: message.correlation_id === correlationId };
     },
   };
 }

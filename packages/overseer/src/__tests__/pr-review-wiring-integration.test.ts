@@ -508,6 +508,81 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
     expect(found.has(REMEDIATION_SENDER)).toBe(true);
   });
 
+  /**
+   * REGRESSION -- PR #740 [minor] (2026-09-04): the declared REMEDIATION_SENDER
+   * was 'overseer-review-route' while the emitter authenticated as 'overseer',
+   * so the exported wire contract and this suite's principal assertion were
+   * both describing a sender that never sent anything.
+   *
+   * Asserting against the STORED row is what makes the contract honest -- a
+   * constant can be edited to agree with itself, but the database records who
+   * actually authenticated.
+   */
+  test('the stored sender equals the declared REMEDIATION_SENDER', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    if (!emit) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 660 };
+    await emit({
+      kind: 'overseer_remediation_candidate' as const,
+      ...pr,
+      headSha: 'e'.repeat(40),
+      attempt: 1,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['migration_ordering'],
+      verdictBody: 'verdict',
+      woId: null,
+      owningLane: 'cauldron-lane-a',
+    });
+
+    const row = await db.query<{ sender: string; recipient: string }>(
+      'SELECT sender, recipient FROM agent_dispatch_messages WHERE recipient = $1',
+      [REMEDIATION_RECIPIENT]
+    );
+    expect(row.rows[0]?.sender).toBe(REMEDIATION_SENDER);
+    expect(row.rows[0]?.recipient).toBe(REMEDIATION_RECIPIENT);
+  });
+
+  /**
+   * REGRESSION -- PR #740 [minor] (2026-09-04): `claimed` compared the returned
+   * body to the submitted one, so an idempotent replay whose stored body was
+   * byte-identical also reported claimed:true. A duplicate submission was then
+   * recorded as a newly emitted attempt, contradicting the documented
+   * claimed:false / attempt_slot_already_claimed contract.
+   *
+   * This is the case the earlier race test could NOT catch: there the two
+   * bodies differed by headSha, so body comparison happened to work. Here the
+   * SAME candidate is submitted twice and the bodies are equal.
+   */
+  test('an IDENTICAL re-submission reports claimed:false, not a new attempt', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    const count = deps.countPriorRemediationAttempts;
+    if (!emit || !count) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 661 };
+    const candidate = {
+      kind: 'overseer_remediation_candidate' as const,
+      ...pr,
+      headSha: 'f'.repeat(40),
+      attempt: 1,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['migration_ordering'],
+      verdictBody: 'byte-identical verdict body',
+      woId: null,
+      owningLane: 'cauldron-lane-a',
+    };
+
+    const first = await emit(candidate);
+    const replay = await emit(candidate);
+
+    expect(first.claimed).toBe(true);
+    expect(replay.claimed).toBe(false);
+    // And the cap accounting must not double-count the replay.
+    expect(await count(pr)).toBe(1);
+  });
+
   test('attempt 1 and attempt 2 BOTH enqueue for the same PR (repeat_reason honored)', async () => {
     const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
     const emit = deps.emitRemediationCandidate;

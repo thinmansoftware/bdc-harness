@@ -33,8 +33,22 @@ import type { IndependentReviewFinding } from './independent-review-evidence.ts'
  */
 export const MAX_REMEDIATION_ATTEMPTS = 2;
 
-/** Dispatch principals for the remediation hand-back. */
-export const REMEDIATION_SENDER = 'overseer-review-route';
+/**
+ * Dispatch principals for the remediation hand-back.
+ *
+ * REMEDIATION_SENDER is the AUTHENTICATED sender, and it must stay equal to
+ * what the emitter actually binds. M-129 Phase 1.5 (PR #669) replaced the
+ * unauthenticated createMessage with createAuthenticatedMessage, whose
+ * bindSenderContext admits exactly three system senders -- 'dispatch',
+ * 'overseer', 'taskmaster'. 'overseer-review-route' is NOT among them, so the
+ * emitter binds 'overseer'.
+ *
+ * This constant previously still said 'overseer-review-route', which made the
+ * documented wire contract and the integration test that asserted on it both
+ * inaccurate -- the test seeded and checked a principal that was never the
+ * sender (PR #740 [minor], 2026-09-04). It now names the real one.
+ */
+export const REMEDIATION_SENDER = 'overseer';
 export const REMEDIATION_RECIPIENT = 'taskmaster';
 
 /**
@@ -85,19 +99,37 @@ export interface AutoFixableClass {
  * questions, governance objections, and security judgments. Those are the cases
  * where a human must decide, and routing them to a builder would launder a
  * judgment call into a code change.
+ *
+ * EACH PATTERN MUST DEMAND MECHANICAL EVIDENCE -- a failure a tool already
+ * reported -- not merely a mechanical noun. This is the actual security
+ * boundary, and it is where PR #740's [major] finding landed (2026-09-04).
+ *
+ * The old `test_failure` pattern was "the word test ... then a failure word
+ * anywhere after it", which matched "Test missing for unescaped user content
+ * rendered into the page" -- an XSS defect dressed as a coverage gap, routed
+ * for unattended remediation. A MISSING test is a judgment call: deciding what
+ * a test should assert requires knowing what the code ought to do, which is
+ * exactly the reasoning a human must own. A FAILING test is mechanical: the
+ * runner already said which assertion broke.
+ *
+ * So these patterns now require an observed failure (failing/erroring/red), and
+ * coverage-gap phrasings ("missing", "absent", "no test for") are deliberately
+ * excluded -- they fall through to the fail-closed default and reach a human.
  */
 export const AUTO_FIXABLE_CLASSES: readonly AutoFixableClass[] = [
   {
     id: 'build_failure',
-    description: 'Compilation or build errors named by the reviewer.',
+    description:
+      'Compilation or build errors the toolchain already reported. Excludes "should be typed better" style judgments.',
     pattern:
-      /\b(?:build|compil\w*|type[-\s]?(?:error|check)|tsc)\b[\s\S]*\b(?:fail\w*|error\w*|break\w*)\b/i,
+      /\b(?:build|compil\w*|type[-\s]?check|tsc|tsserver)\b[\s\S]{0,80}?\b(?:fails?|failing|failed|failure|errors?|erroring|broken|breaks)\b/i,
   },
   {
     id: 'test_failure',
-    description: 'Failing or missing tests the reviewer identified.',
+    description:
+      'Tests that are OBSERVED FAILING. Deliberately excludes missing/absent coverage, which is a judgment call for a human.',
     pattern:
-      /\b(?:test|spec|assertion)s?\b[\s\S]*\b(?:fail\w*|error\w*|missing|absent|not\s+run)\b/i,
+      /\b(?:test|tests|spec|specs|suite|assertion)\b[\s\S]{0,80}?\b(?:fails?|failing|failed|failure|red|erroring)\b|\b(?:fails?|failing|failed)\b[\s\S]{0,40}?\b(?:test|tests|spec|specs|suite|assertion)\b/i,
   },
   {
     id: 'lint_or_format',
@@ -122,13 +154,26 @@ export const AUTO_FIXABLE_CLASSES: readonly AutoFixableClass[] = [
  * Findings that must NEVER be auto-remediated, regardless of whether their text
  * happens to also match an auto-fixable pattern.
  *
- * This is an OVERRIDE, not a filter applied in isolation: it is checked FIRST in
+ * DEFENSE IN DEPTH, NOT THE BOUNDARY. This is an OVERRIDE checked FIRST in
  * classifyFinding, so "the migration ordering here is a security concern" is
- * non-auto even though it matches migration_ordering. Fail-closed means the
- * safer classification wins ties, always.
+ * non-auto even though it matches migration_ordering.
+ *
+ * It is deliberately NOT the security boundary, because a blocklist cannot
+ * enumerate every way a reviewer might phrase a security defect. The Overseer
+ * gate proved that on this WO's own PR #740 (2026-09-04): a blocking finding
+ * reading "Test missing for unescaped user content rendered into the page" is
+ * XSS-shaped, trips none of these words, and was auto-routed for unattended
+ * remediation. The real boundary is that each AUTO_FIXABLE_CLASSES pattern must
+ * demand MECHANICAL EVIDENCE (a named failure, a tool's verdict) rather than
+ * merely mentioning a mechanical noun -- see the note on that table.
+ *
+ * NOTE ON PRECISION: a bare `sql` token is deliberately NOT listed. It matched
+ * the `.sql` extension of the migration filename in the live shopops#650
+ * anchor and sent the WO's own reference case to a human. `sql injection` is
+ * the security signal; a `.sql` file is just a file.
  */
 const NON_AUTO_PATTERN =
-  /\b(?:securit\w*|vulnerab\w*|auth\w*|credential\w*|secret\w*|injection|design|architect\w*|scope|governance|policy|approv\w*|judgment|judgement|intent|breaking\s+change|data\s+loss|privacy)\b/i;
+  /\b(?:securit\w*|vulnerab\w*|auth\w*|credential\w*|secret\w*|injection|inject(?:s|ed|ing)?|escap\w*|sanitiz\w*|sanitis\w*|xss|csrf|ssrf|rce|traversal|untrusted|user[-\s]input|request\s+param\w*|design|architect\w*|scope|governance|policy|approv\w*|judgment|judgement|intent|breaking\s+change|data\s+loss|privacy|pii)\b/i;
 
 /** Severities that block a merge and therefore justify remediation work. */
 const BLOCKING_SEVERITIES: ReadonlySet<IndependentReviewFinding['severity']> = new Set([
