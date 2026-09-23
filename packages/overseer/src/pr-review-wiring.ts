@@ -45,6 +45,13 @@ import {
 import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-health';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
+import {
+  countPriorRemediationAttempts,
+  parseRemediationCandidateBody,
+  remediationIdempotencyKey,
+  REMEDIATION_RECIPIENT,
+  REMEDIATION_SENDER,
+} from './remediation-candidate';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -958,6 +965,10 @@ export function createRealSubmitDeps(
         approved: result.verdict === 'APPROVE',
         summary,
         reviewedHeadSha: result.reviewed_head_sha,
+        // Structured findings ride alongside the flattened summary so
+        // remediation classification can read severity per finding. The
+        // summary string has already lost that.
+        findings: result.findings,
         ...(indeterminateCode ? { reasonCode: indeterminateCode } : {}),
       };
     },
@@ -1004,6 +1015,118 @@ export function createRealSubmitDeps(
           }),
         }
       );
+    },
+
+    /**
+     * Attempts are derived from the durable dispatch rows themselves rather
+     * than from a separate counter table: every prior candidate IS a row under
+     * this PR's subject key, so the count cannot drift out of agreement with
+     * the queue it is supposed to bound.
+     */
+    async countPriorRemediationAttempts(input): Promise<number> {
+      const messages = await dispatch.listMessages({
+        recipient: REMEDIATION_RECIPIENT,
+        subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+      });
+      return countPriorRemediationAttempts(messages, input);
+    },
+
+    /**
+     * Writes the proposal onto the seam Taskmaster already reads.
+     *
+     * TWO PROPERTIES MUST HOLD AT ONCE, and the key alone cannot give both.
+     * The only atomic primitive available is the UNIQUE index on
+     * (sender_principal_id, idempotency_key), so one key buys one guarantee:
+     *
+     *   - Key on the ATTEMPT SLOT -> the cap is atomic (concurrent racers
+     *     collide), but a redelivered verdict computes a HIGHER attempt from
+     *     the moved count and inserts a duplicate. That was PR #740 round 3.
+     *   - Key on the HEAD -> redelivery is a no-op, but two racers on distinct
+     *     heads read the same below-cap count and both insert, exceeding the
+     *     cap. That was PR #740 round 4.
+     *
+     * So the claim is done in two steps against the SAME durable rows:
+     *
+     *   1. Read this PR's existing candidates. If one already names THIS head,
+     *      the verdict has been handed back before -- return it, claimed:false.
+     *      Redelivery is settled by identity, not by the constraint.
+     *   2. Otherwise claim the next free ATTEMPT SLOT, whose key is
+     *      (PR, attempt). That insert is atomic, so two racers on different
+     *      heads contend for one row and exactly one wins. A loser retries the
+     *      next slot, and once slots are exhausted the cap has genuinely been
+     *      reached -- the bound holds no matter how the reads interleave.
+     *
+     * Step 2 is bounded by MAX_REMEDIATION_ATTEMPTS, so this loop cannot spin.
+     */
+    async emitRemediationCandidate(body): Promise<{ claimed: boolean }> {
+      const subjectKey = reviewSubjectKey(body.owner, body.repo, body.prNumber);
+
+      // STEP 1 -- redelivery check. Settled by the head the candidate names,
+      // which is what identifies a verdict.
+      const existing = await dispatch.listMessages({
+        recipient: REMEDIATION_RECIPIENT,
+        subject_key: subjectKey,
+      });
+      for (const message of existing) {
+        // `?.` is safe here: an unparseable row yields undefined, which cannot
+        // equal body.headSha (always a non-empty SHA string).
+        if (parseRemediationCandidateBody(message.body)?.headSha === body.headSha) {
+          return { claimed: false };
+        }
+      }
+
+      // STEP 2 -- claim an attempt slot atomically. Slots are tried in order;
+      // a slot already held by a concurrent racer (or by an earlier head) is
+      // skipped, because the stored row will not carry our nonce.
+      for (let attempt = 1; attempt <= body.maxAttempts; attempt += 1) {
+        const idempotencyKey = remediationIdempotencyKey({
+          owner: body.owner,
+          repo: body.repo,
+          prNumber: body.prNumber,
+          attempt,
+        });
+        // CREATION IDENTITY. Comparing the returned body to ours cannot tell a
+        // fresh insert from a replay whose stored body is byte-equal -- both
+        // look identical (PR #740 round 2). correlation_id is caller-controlled,
+        // stored verbatim, and NOT part of the idempotency key, so a per-call
+        // nonce round-trips only when THIS call performed the insert.
+        const nonce = randomUUID();
+        const correlationId = `overseer-remediation:${body.owner}/${body.repo}#${body.prNumber}:${nonce}`;
+        // The body records the slot actually won, which may differ from the
+        // attempt the caller predicted if a racer took an earlier slot.
+        const claimedBody = JSON.stringify({ ...body, attempt });
+        // Sender authentication (PR #669) binds an explicit sender context.
+        // bindSenderContext admits exactly three system senders -- 'dispatch',
+        // 'overseer', 'taskmaster'. REMEDIATION_SENDER (not REVIEW_SENDER) is
+        // bound deliberately: the exported constant IS the wire contract, so
+        // binding it keeps the declared and authenticated senders from drifting.
+        const message = await dispatch.createAuthenticatedMessage(
+          { kind: 'system', sender: REMEDIATION_SENDER },
+          {
+            correlation_id: correlationId,
+            idempotency_key: idempotencyKey,
+            // Reuses the existing run_review task type: this is queued
+            // review-loop work, and a new task_type would need a DB
+            // CHECK-constraint migration for no behavioral gain. The `kind`
+            // discriminator in the body identifies a remediation candidate.
+            task_type: 'run_review',
+            recipient: REMEDIATION_RECIPIENT,
+            body: claimedBody,
+            subject_key: subjectKey,
+            // REQUIRED for attempt 2+. Once any earlier message under this
+            // subject key is terminal, createAuthenticatedMessage throws
+            // `repeat_reason_required` -- the dispatch layer refuses to
+            // silently re-open a settled subject. Without this the cap of 2
+            // would effectively be a cap of 1.
+            repeat_reason: `remediation attempt ${attempt} of ${body.maxAttempts} for head ${body.headSha}`,
+          }
+        );
+        if (message.correlation_id === correlationId) return { claimed: true };
+        // Slot taken by someone else; try the next one.
+      }
+
+      // Every slot is held -> the cap is genuinely reached.
+      return { claimed: false };
     },
   };
 }

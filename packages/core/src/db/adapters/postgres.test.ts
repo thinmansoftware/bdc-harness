@@ -226,11 +226,16 @@ describe('PostgresAdapter', () => {
       // Phase 0 set; migration 040 itself must not, or this migration's own
       // history would be rewritten. Checked only against `combined` below,
       // never against `migration` (040).
+      // WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01 (migration
+      // 046) adds 'taskmaster' the same way, for the same reason: Overseer
+      // hands CHANGES_REQUESTED verdicts back to it as remediation candidates,
+      // and createMessage rejects any unseeded recipient.
       const laterMigrationPrincipals = [
         ['overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 'TRUE'],
         ['overseer-review-route', 'Overseer Review Route', 'notify_only', 'TRUE'],
         ['duty-officer', 'Duty Officer', 'worker_poll', 'TRUE'],
         ['do', 'Duty Officer alias', 'worker_poll', 'TRUE'],
+        ['taskmaster', 'Taskmaster', 'worker_poll', 'TRUE'],
       ] as const;
 
       for (const schema of [migration, combined]) {

@@ -1096,7 +1096,13 @@ export class SqliteAdapter implements IDatabase {
         ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1),
         ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1),
         ('duty-officer', 'Duty Officer', 'worker_poll', 1),
-        ('do', 'Duty Officer alias', 'worker_poll', 1)
+        ('do', 'Duty Officer alias', 'worker_poll', 1),
+        -- WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
+        -- (migration 046 parity): Overseer hands CHANGES_REQUESTED verdicts
+        -- back as remediation candidates addressed to 'taskmaster'. Without
+        -- this row createAuthenticatedMessage rejects every one with
+        -- missing_principal.
+        ('taskmaster', 'Taskmaster', 'worker_poll', 1)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`
