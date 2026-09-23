@@ -1326,7 +1326,8 @@ export async function addressMessage(data: {
  * may use to record what it did with a mailbox row. Sets EXACTLY
  * route_disposition + route_disposed_at and nothing else -- never a receipt
  * column. `actor` is logged for provenance but NEVER stored: the store has no
- * machine-actor column and this WO adds none.
+ * machine-actor column and this WO adds none. The provenance log is emitted by
+ * THIS function, so every caller gets it -- see the note at the top of the body.
  *
  * Transaction-scoped so the M-155 dead-letter expiry script can call it per row
  * inside its existing single transaction alongside its journal note; the public
@@ -1337,6 +1338,16 @@ export async function disposeMessageByMachineInTransaction(
   data: { id: string; actor: string; disposition: DispatchMachineDisposition },
   now: string
 ): Promise<DispatchMailboxResult> {
+  // Provenance lives HERE, not in the public wrapper, so that direct
+  // transaction-scoped callers are covered too: the M-155 dead-letter expiry
+  // script invokes this primitive per row inside its own transaction and would
+  // otherwise disposition rows with no actor recorded anywhere. Logged before
+  // validation so rejected attempts are attributable as well. The actor is
+  // logged and NEVER persisted -- the store has no machine-actor column.
+  log.info(
+    { messageId: data.id, actor: data.actor, disposition: data.disposition },
+    'dispatch.machine_disposition_requested'
+  );
   if (!data.actor.startsWith('system:')) {
     return { ok: false, reason: 'machine_actor_required' };
   }
@@ -1383,10 +1394,8 @@ export async function disposeMessageByMachine(data: {
 }): Promise<DispatchMailboxResult> {
   const db = getDatabase();
   const now = nowIso();
-  log.info(
-    { messageId: data.id, actor: data.actor, disposition: data.disposition },
-    'dispatch.machine_disposition_requested'
-  );
+  // Do NOT log here: disposeMessageByMachineInTransaction emits the provenance
+  // record for every invocation, including retried attempts.
   return withRetriedMailboxTransaction(() =>
     db.withTransaction(query => disposeMessageByMachineInTransaction(query, data, now))
   );

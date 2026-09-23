@@ -99,9 +99,11 @@ async function main(): Promise<void> {
       [JOURNAL_IDEMPOTENCY_KEY]
     );
     if (existingNote.rows.length === 0) {
-      // M-187a contract: the machine actor is LOGGED for provenance but NEVER
-      // stored -- so it is emitted here and deliberately omitted from
-      // proposal_json below.
+      // M-187a contract: the machine actor is NEVER stored, so it is omitted
+      // from proposal_json below. The required provenance log is emitted per
+      // row by disposeMessageByMachineInTransaction (one structured record per
+      // message carrying messageId + actor + disposition); the line below is
+      // only an operator-facing run summary, not the contract's log.
       console.log(
         `[m155] journaling dead-letter expiry (actor=${EXPIRY_ACTOR}, ` +
           `expired_count=${expired}); actor is logged, never persisted.`
