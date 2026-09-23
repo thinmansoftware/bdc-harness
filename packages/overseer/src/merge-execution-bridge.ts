@@ -2,13 +2,8 @@
  * Unattended merge execution: claim a flag_merge_ready verdict, re-check GitHub,
  * and squash-merge when policy, allowlist, and the hourly ceiling all pass.
  *
- * Allowlist (OVERSEER_MERGE_REPO_CONFIG): JSON object keyed by the full GitHub
- * identity `owner/repo` (exactly one slash, both sides non-empty), each value
- * `{ "baseBranch": "<integration-branch>" }`. Repo-only keys are invalid and
- * fail closed (empty allowlist). Defaults:
- *   thinmansoftware/bdc-harness -> dev
- *   thinmansoftware/shopops -> staging
- *   thinmansoftware/lspro-react -> dev
+ * Policy (MERGE_MANAGER_REPO_POLICY) is keyed by full GitHub identity and base.
+ * OVERSEER_MERGE_REPO_CONFIG remains a deprecated one-release compatibility input.
  * Lookup compares BOTH run.owner and run.repo; mismatch -> skip('repo_not_allowed').
  *
  * Run-less verdicts (bdc-harness #846): a PR-first candidate has no run row, so
@@ -26,19 +21,22 @@ import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
+import {
+  getRepoBasePolicy,
+  hasRepoPolicyEntry,
+  LEGACY_REPO_CONFIG_ENV,
+  MERGE_MANAGER_REPO_POLICY_ENV,
+  resolveMergeRepoPolicy,
+  type MergeRepoPolicy,
+  type RepoBasePolicy,
+  warnLegacyMergePolicy,
+} from './merge-repo-policy';
 import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
 
 const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
 const FLAG_MERGE_READY = 'flag_merge_ready';
-const DEFAULT_REPO_CONFIG: Readonly<Record<string, { baseBranch: string }>> = Object.freeze({
-  'thinmansoftware/bdc-harness': { baseBranch: 'dev' },
-  'thinmansoftware/shopops': { baseBranch: 'staging' },
-  'thinmansoftware/lspro-react': { baseBranch: 'dev' },
-});
-const REPO_CONFIG_ENV = 'OVERSEER_MERGE_REPO_CONFIG';
-
 export type MergeExecutionRepoConfig = Readonly<Record<string, { readonly baseBranch: string }>>;
 
 export interface MergeExecutionBridgeStore {
@@ -77,10 +75,7 @@ function isOwnerRepoIdentity(key: string): boolean {
   return slash > 0 && !key.includes('/', slash + 1) && slash < key.length - 1;
 }
 
-function configuredRepos(override?: MergeExecutionRepoConfig): MergeExecutionRepoConfig {
-  if (override !== undefined) return override;
-  const raw = process.env[REPO_CONFIG_ENV];
-  if (raw === undefined) return DEFAULT_REPO_CONFIG;
+function parseLegacyRepoConfig(raw: string): MergeExecutionRepoConfig {
   try {
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
@@ -106,6 +101,15 @@ function configuredRepos(override?: MergeExecutionRepoConfig): MergeExecutionRep
     // A malformed unattended-merge allowlist must fail closed.
     return {};
   }
+}
+
+function configuredPolicy(override?: MergeExecutionRepoConfig): MergeRepoPolicy {
+  if (process.env[MERGE_MANAGER_REPO_POLICY_ENV] !== undefined) return resolveMergeRepoPolicy();
+  if (override !== undefined) return resolveMergeRepoPolicy({ legacyRepoConfig: override });
+  const raw = process.env[LEGACY_REPO_CONFIG_ENV];
+  if (raw === undefined) return resolveMergeRepoPolicy();
+  warnLegacyMergePolicy(LEGACY_REPO_CONFIG_ENV);
+  return resolveMergeRepoPolicy({ legacyRepoConfig: parseLegacyRepoConfig(raw) });
 }
 
 function isDocumentationOnly(paths: readonly string[]): boolean {
@@ -163,7 +167,7 @@ type SkipVerdict = (reason: string, prUrl?: string) => Promise<void>;
 
 interface MergeTarget {
   pr: PullRequestEvidence;
-  config: { readonly baseBranch: string };
+  basePolicy?: RepoBasePolicy;
 }
 
 interface RunlessPullRef {
@@ -218,7 +222,7 @@ function runlessPullRef(verdict: OverseerVerdictRow): RunlessPullRef | null {
 async function resolveRunlessTarget(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
-  repoConfig: MergeExecutionRepoConfig,
+  repoPolicy: MergeRepoPolicy,
   skip: SkipVerdict
 ): Promise<MergeTarget | null> {
   const ref = runlessPullRef(verdict);
@@ -226,8 +230,8 @@ async function resolveRunlessTarget(
     await skip('pr_context_unresolvable');
     return null;
   }
-  const config = repoConfig[`${ref.owner}/${ref.repo}`];
-  if (!config) {
+  const ownerRepo = `${ref.owner}/${ref.repo}`.toLowerCase();
+  if (!hasRepoPolicyEntry(ownerRepo, repoPolicy)) {
     await skip('repo_not_allowed');
     return null;
   }
@@ -283,11 +287,12 @@ async function resolveRunlessTarget(
     await skip('head_moved', pr.htmlUrl);
     return null;
   }
-  if (pr.baseBranch !== config.baseBranch) {
+  const basePolicy = getRepoBasePolicy(ownerRepo, pr.baseBranch ?? '', repoPolicy);
+  if (!basePolicy?.unattended) {
     await skip('base_not_allowlisted', pr.htmlUrl);
     return null;
   }
-  return { pr, config };
+  return { pr, basePolicy };
 }
 
 /**
@@ -300,17 +305,17 @@ async function resolveRunlessTarget(
 async function resolveMergeTarget(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
-  repoConfig: MergeExecutionRepoConfig,
+  repoPolicy: MergeRepoPolicy,
   skip: SkipVerdict
 ): Promise<MergeTarget | null> {
-  if (isRunlessVerdict(verdict)) return resolveRunlessTarget(options, verdict, repoConfig, skip);
+  if (isRunlessVerdict(verdict)) return resolveRunlessTarget(options, verdict, repoPolicy, skip);
   const run = await options.store.getRunById(verdict.run_id);
   if (!run?.owner || !run.repo) {
     await skip('run_context_unresolvable');
     return null;
   }
-  const config = repoConfig[`${run.owner}/${run.repo}`];
-  if (!config) {
+  const ownerRepo = `${run.owner}/${run.repo}`.toLowerCase();
+  if (!hasRepoPolicyEntry(ownerRepo, repoPolicy)) {
     await skip('repo_not_allowed');
     return null;
   }
@@ -321,13 +326,16 @@ async function resolveMergeTarget(
     woId: run.woId,
     includeChangedFiles: true,
   });
-  return { pr, config };
+  return {
+    pr,
+    basePolicy: getRepoBasePolicy(ownerRepo, pr.baseBranch ?? '', repoPolicy),
+  };
 }
 
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
-  repoConfig: MergeExecutionRepoConfig
+  repoPolicy: MergeRepoPolicy
 ): Promise<'stop' | undefined> {
   const skip = async (reason: string, prUrl?: string): Promise<void> => {
     await options.store.recordOutcome({
@@ -360,9 +368,9 @@ async function mergeClaimedVerdict(
     return undefined;
   }
 
-  const target = await resolveMergeTarget(options, verdict, repoConfig, skip);
+  const target = await resolveMergeTarget(options, verdict, repoPolicy, skip);
   if (!target) return undefined;
-  const { pr, config } = target;
+  const { pr, basePolicy } = target;
   if (!pr.exists || !pr.pr) {
     await skip(pr.lookupFailed ? 'pr_lookup_failed' : 'open_pr_not_found', pr.htmlUrl);
     return undefined;
@@ -393,11 +401,11 @@ async function mergeClaimedVerdict(
     await skip('changed_files_unresolved', pr.htmlUrl);
     return undefined;
   }
-  if (isDocumentationOnly(pr.changedFilePaths)) {
+  if (isDocumentationOnly(pr.changedFilePaths) && (basePolicy?.docsOnly ?? 'skip') === 'skip') {
     await skip('spec_only', pr.htmlUrl);
     return undefined;
   }
-  if (pr.baseBranch !== config.baseBranch) {
+  if (!basePolicy?.unattended) {
     await skip('integration_base_mismatch', pr.htmlUrl);
     return undefined;
   }
@@ -489,13 +497,13 @@ async function mergeClaimedVerdict(
 export async function runMergeExecutionBridgeOnce(
   options: MergeExecutionBridgeOptions
 ): Promise<void> {
-  const repoConfig = configuredRepos(options.repoConfig);
+  const repoPolicy = configuredPolicy(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
   for (const verdict of verdicts) {
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
     if (!(await options.store.claimVerdict(verdict.id))) continue;
     try {
-      if ((await mergeClaimedVerdict(options, verdict, repoConfig)) === 'stop') break;
+      if ((await mergeClaimedVerdict(options, verdict, repoPolicy)) === 'stop') break;
     } catch (error) {
       await options.store.releaseMergeSlot(verdict.id);
       await options.store.releaseVerdictClaim(

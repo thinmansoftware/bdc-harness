@@ -1125,3 +1125,80 @@ describe('per-repo base effect overrides', () => {
     );
   });
 });
+
+describe('per-repo merge base policy', () => {
+  test('production hold, missing policy, and legacy allowed bases remain fail-closed', async () => {
+    const execute = mock(async () => ({ merged: true, message: 'merged' }));
+    const managerForEvidence = (
+      assembled: QualifiedMergeEvidence,
+      allowedBases?: readonly string[]
+    ): ReturnType<typeof createMergeManager> =>
+      createMergeManager({
+        mode: 'execute',
+        mutationsEnabled: true,
+        allowedBases,
+        reviewGateLogin: 'thinman-review-gate[bot]',
+        listPullRequestReviews: async () => [
+          { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+        ],
+        assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'f'.repeat(64) }),
+        judge: async input => approveReceipt(input),
+        execute,
+        insertOverseerAction: async () => undefined,
+        findPullRequest: async () => record.prEvidence,
+        mergePullRequest: async () => ({ merged: false }),
+        readWorktreeHeadSha,
+      });
+
+    process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
+      'thinmansoftware/lspro-react': {
+        main: { unattended: true, docs_only: 'merge' },
+      },
+    });
+    try {
+      const production = evidence({
+        repository: 'lspro-react',
+        base_branch: 'main',
+        resulting_deployment_effect: 'production',
+      });
+      expect(await managerForEvidence(production)(record)).toMatchObject({
+        status: 'held',
+        reason: 'production_effect_held_for_john',
+      });
+
+      const missing = evidence({ repository: 'fuelglass', base_branch: 'sandbox' });
+      expect(await managerForEvidence(missing)(record)).toMatchObject({
+        status: 'held',
+        reason: 'repo_policy_missing',
+      });
+
+      process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
+        'thinmansoftware/bdc-xo': {
+          main: { unattended: true, docs_only: 'merge' },
+        },
+      });
+      const xoMain = evidence({
+        repository: 'bdc-xo',
+        base_branch: 'main',
+        resulting_deployment_effect: 'none',
+      });
+      expect((await managerForEvidence(xoMain)(record)).status).toBe('executed');
+    } finally {
+      delete process.env.MERGE_MANAGER_REPO_POLICY;
+    }
+
+    process.env.MERGE_MANAGER_ALLOWED_BASES = 'dev,staging';
+    try {
+      const devResult = await managerForEvidence(evidence(), ['dev', 'staging'])(record);
+      expect(devResult.status).toBe('executed');
+
+      const main = evidence({ base_branch: 'main', resulting_deployment_effect: 'none' });
+      expect(await managerForEvidence(main, ['dev', 'staging'])(record)).toMatchObject({
+        status: 'held',
+        reason: 'base_branch_not_allowed',
+      });
+    } finally {
+      delete process.env.MERGE_MANAGER_ALLOWED_BASES;
+    }
+  });
+});

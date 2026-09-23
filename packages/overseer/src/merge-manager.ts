@@ -11,6 +11,14 @@ import {
   type MergeProvenanceResult,
 } from './merge-provenance';
 import type { QualifiedMergeEvidence } from './actions/merge-ready';
+import {
+  getRepoBasePolicy,
+  hasRepoPolicyEntry,
+  LEGACY_ALLOWED_BASES_ENV,
+  MERGE_MANAGER_REPO_POLICY_ENV,
+  resolveMergeRepoPolicy,
+  warnLegacyMergePolicy,
+} from './merge-repo-policy';
 import type { OverseerDeploymentEffect } from './policy-registry';
 import type {
   GitHubClientDeps,
@@ -528,6 +536,7 @@ function envFlagEnabled(raw: string | undefined): boolean {
   return raw?.trim().toLowerCase() === 'true';
 }
 
+// AGD Keep this DI/legacy parser stable while its values feed the shared synthesized repo policy.
 function allowedBasesFromEnv(raw: string | undefined): readonly string[] {
   return (raw ?? 'dev,staging')
     .split(',')
@@ -539,6 +548,7 @@ async function mergePreconditionMiss(
   deps: MergeManagerDeps,
   evidence: QualifiedMergeEvidence,
   allowedBases: readonly string[],
+  useLegacyAllowedBases: boolean,
   reviewGateLogin: string
 ): Promise<string | null> {
   const headSha = evidence.head_sha;
@@ -549,7 +559,26 @@ async function mergePreconditionMiss(
   ) {
     return 'required_checks_not_green_on_head';
   }
-  if (!allowedBases.includes(evidence.base_branch.trim().toLowerCase())) {
+  const ownerRepo = `${evidence.owner}/${evidence.repository}`.toLowerCase();
+  const explicitPolicy = process.env[MERGE_MANAGER_REPO_POLICY_ENV];
+  const policy = resolveMergeRepoPolicy({
+    rawPolicy: explicitPolicy,
+    legacyAllowedBases:
+      explicitPolicy === undefined && useLegacyAllowedBases ? allowedBases : undefined,
+    legacyRepos: explicitPolicy === undefined && useLegacyAllowedBases ? [ownerRepo] : undefined,
+  });
+  if (explicitPolicy === undefined && process.env[LEGACY_ALLOWED_BASES_ENV] !== undefined) {
+    warnLegacyMergePolicy(LEGACY_ALLOWED_BASES_ENV);
+  }
+  // AGD Missing repo policy fails closed loudly; unattended:false keeps the existing base denial.
+  if (!hasRepoPolicyEntry(ownerRepo, policy)) {
+    log.warn(
+      { repo: ownerRepo, env: MERGE_MANAGER_REPO_POLICY_ENV },
+      'merge_manager.repo_policy_missing'
+    );
+    return 'repo_policy_missing';
+  }
+  if (!getRepoBasePolicy(ownerRepo, evidence.base_branch, policy)?.unattended) {
     return 'base_branch_not_allowed';
   }
   if (evidence.record.prEvidence.mergeable !== true) {
@@ -607,6 +636,8 @@ export function createMergeManager(
     deps.mutationsEnabled ?? envFlagEnabled(process.env[MERGE_MANAGER_MUTATIONS_ENABLED_ENV]);
   const allowedBases =
     deps.allowedBases ?? allowedBasesFromEnv(process.env[MERGE_MANAGER_ALLOWED_BASES_ENV]);
+  const useLegacyAllowedBases =
+    deps.allowedBases !== undefined || process.env[MERGE_MANAGER_ALLOWED_BASES_ENV] !== undefined;
   const reviewGateLogin = (
     deps.reviewGateLogin ??
     process.env[MERGE_MANAGER_REVIEW_GATE_LOGIN_ENV] ??
@@ -823,6 +854,7 @@ export function createMergeManager(
       deps,
       evidence,
       allowedBases,
+      useLegacyAllowedBases,
       reviewGateLogin
     );
     if (preconditionMiss) {

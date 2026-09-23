@@ -330,6 +330,61 @@ describe('merge candidate discovery -- classification units', () => {
 });
 
 describe('merge candidate discovery -- configuration resolution', () => {
+  test('docs-only bdc-xo main is a candidate under the shipped per-repo policy', async () => {
+    const xoPr = pr({ prNumber: 2175, repo: 'bdc-xo', baseRef: 'main' });
+    const result = await discoverMergeCandidates(
+      discoveryDeps([xoPr], {
+        2175: { ...greenEvidence(2175), pr: { owner: OWNER, repo: 'bdc-xo', number: 2175 } },
+      }),
+      { repos: [{ owner: OWNER, repo: 'bdc-xo' }] }
+    );
+
+    expect(result.candidates).toHaveLength(1);
+    expect(result.exclusions).toHaveLength(0);
+  });
+
+  test('repo_policy_missing is loud while legacy env preserves watched-base reasons', async () => {
+    process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
+      'thinmansoftware/bdc-harness': { dev: { unattended: true, docs_only: 'skip' } },
+    });
+    const warnings: { obj: Record<string, unknown>; msg: string }[] = [];
+    try {
+      const missing = await discoverMergeCandidates(
+        discoveryDeps([pr({ prNumber: 2012, repo: 'fuelglass', baseRef: 'main' })], {
+          2012: { ...greenEvidence(2012), pr: { owner: OWNER, repo: 'fuelglass', number: 2012 } },
+        }),
+        {
+          repos: [{ owner: OWNER, repo: 'fuelglass' }],
+          logger: {
+            info: () => undefined,
+            warn: (obj, msg) => warnings.push({ obj, msg }),
+          },
+        }
+      );
+      expect(missing.exclusions[0]?.reason).toBe('repo_policy_missing');
+      expect(missing.exclusions[0]?.detail).toContain('thinmansoftware/fuelglass');
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.obj.env).toBe('MERGE_MANAGER_REPO_POLICY');
+    } finally {
+      delete process.env.MERGE_MANAGER_REPO_POLICY;
+    }
+
+    process.env.MERGE_MANAGER_ALLOWED_BASES = 'dev,staging';
+    try {
+      const legacy = await discoverMergeCandidates(
+        discoveryDeps([pr({ prNumber: 2013 }), pr({ prNumber: 2014, baseRef: 'main' })], {
+          2013: greenEvidence(2013),
+          2014: greenEvidence(2014),
+        }),
+        { repos: REPOS }
+      );
+      expect(legacy.candidates.map(candidate => candidate.prEvidence.pr?.number)).toEqual([2013]);
+      expect(legacy.exclusions[0]?.reason).toBe('base_branch_not_watched');
+    } finally {
+      delete process.env.MERGE_MANAGER_ALLOWED_BASES;
+    }
+  });
+
   test('base branches default to the merge manager allowed bases', () => {
     expect(resolveWatchedBaseBranches(undefined)).toEqual([...DEFAULT_WATCHED_BASE_BRANCHES]);
     expect(resolveWatchedBaseBranches('')).toEqual([...DEFAULT_WATCHED_BASE_BRANCHES]);

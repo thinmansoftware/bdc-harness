@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, mock, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import {
   runMergeExecutionBridgeOnce,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
+import { parseMergeRepoPolicy } from '../merge-repo-policy';
 import type {
   GitHubClientDeps,
   GitHubPullRequestSearchInput,
@@ -136,9 +137,69 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
 afterEach(() => {
   delete process.env.OVERSEER_MAX_MERGES_PER_HOUR;
   delete process.env.OVERSEER_MERGE_REPO_CONFIG;
+  delete process.env.MERGE_MANAGER_REPO_POLICY;
 });
 
 describe('merge execution bridge', () => {
+  test('docs-only PR into bdc-xo main merges when docs_only is merge', async () => {
+    process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
+      'thinmansoftware/bdc-xo': { main: { unattended: true, docs_only: 'merge' } },
+    });
+    const h = harness(
+      [verdict('xo-docs')],
+      greenPr({
+        baseBranch: 'main',
+        changedFilePaths: ['docs/work-orders/WO.md', 'README.md'],
+        pr: { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2175 },
+      })
+    );
+    h.store.getRunById = async () => ({ ...run('xo-docs'), repo: 'bdc-xo' });
+
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('malformed MERGE_MANAGER_REPO_POLICY warns once and fails closed', async () => {
+    const warn = mock(() => undefined);
+    expect(parseMergeRepoPolicy('{"thinmansoftware/bdc-xo": {"main": nope', { warn })).toEqual({});
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({ env: 'MERGE_MANAGER_REPO_POLICY' })
+    );
+
+    process.env.MERGE_MANAGER_REPO_POLICY = '{"thinmansoftware/bdc-xo": {"main": nope';
+    const h = harness([verdict('malformed')]);
+    await expect(
+      runMergeExecutionBridgeOnce({ store: h.store, github: h.github, readPolicy: () => policy() })
+    ).resolves.toBeUndefined();
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
+  });
+
+  test('docs_only skip preserves the spec_only outcome and sends no mutation', async () => {
+    process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
+      'thinmansoftware/bdc-harness': { dev: { unattended: true, docs_only: 'skip' } },
+    });
+    const h = harness([verdict('docs-skip')], greenPr({ changedFilePaths: ['docs/WO.md'] }));
+
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('spec_only');
+  });
+
   test('merges an eligible verdict exactly once across two cycles', async () => {
     const h = harness([verdict('eligible')]);
     const options = { store: h.store, github: h.github, readPolicy: () => policy() };

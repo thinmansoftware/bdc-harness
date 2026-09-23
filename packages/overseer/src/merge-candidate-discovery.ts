@@ -48,6 +48,15 @@
  * still the Merge Manager's call, on exactly the rules it had before.
  */
 import { createLogger } from '@archon/paths';
+import {
+  hasRepoPolicyEntry,
+  LEGACY_ALLOWED_BASES_ENV,
+  MERGE_MANAGER_REPO_POLICY_ENV,
+  resolveMergeRepoPolicy,
+  type MergeRepoPolicy,
+  unattendedBasesForRepo,
+  warnLegacyMergePolicy,
+} from './merge-repo-policy';
 import type {
   DiscoveredPullRequest,
   MergeCandidateDiscoveryDeps,
@@ -81,6 +90,7 @@ export const DEFAULT_DISCOVERY_MAX_PRS_PER_TICK = 100;
 export type MergeCandidateExclusionReason =
   | 'draft'
   | 'not_open'
+  | 'repo_policy_missing'
   | 'base_branch_not_watched'
   | 'review_not_approved'
   | 'checks_failing'
@@ -320,6 +330,13 @@ export function resolveWatchedBaseBranches(
   return parsed.length > 0 ? parsed : [...DEFAULT_WATCHED_BASE_BRANCHES];
 }
 
+export function resolveWatchedBaseBranchesForRepo(
+  ownerRepo: string,
+  policy: MergeRepoPolicy = resolveMergeRepoPolicy()
+): readonly string[] {
+  return unattendedBasesForRepo(ownerRepo, policy);
+}
+
 export interface DiscoveryRepoTarget {
   readonly owner: string;
   readonly repo: string;
@@ -369,11 +386,17 @@ export function resolveDiscoveryMaxPrsPerTick(
  */
 export function classifyDiscoveredPullRequest(
   pr: DiscoveredPullRequest,
-  watchedBases: readonly string[]
+  watchedBases?: readonly string[],
+  policy: MergeRepoPolicy = resolveMergeRepoPolicy()
 ): MergeCandidateExclusionReason | null {
   if (pr.draft) return 'draft';
   if (pr.state.toLowerCase() !== 'open') return 'not_open';
-  if (!watchedBases.includes(pr.baseRef.trim().toLowerCase())) return 'base_branch_not_watched';
+  const ownerRepo = `${pr.owner}/${pr.repo}`.toLowerCase();
+  if (watchedBases === undefined && !hasRepoPolicyEntry(ownerRepo, policy)) {
+    return 'repo_policy_missing';
+  }
+  const resolvedBases = watchedBases ?? resolveWatchedBaseBranchesForRepo(ownerRepo, policy);
+  if (!resolvedBases.includes(pr.baseRef.trim().toLowerCase())) return 'base_branch_not_watched';
   if (pr.reviewDecision !== 'APPROVED') return 'review_not_approved';
   return null;
 }
@@ -467,6 +490,8 @@ function detailFor(reason: MergeCandidateExclusionReason, pr: DiscoveredPullRequ
       return 'pull request is a draft';
     case 'not_open':
       return `pull request state is ${pr.state}`;
+    case 'repo_policy_missing':
+      return `repo ${pr.owner}/${pr.repo} has no policy entry in ${MERGE_MANAGER_REPO_POLICY_ENV}`;
     case 'base_branch_not_watched':
       return `base ${pr.baseRef} is not a watched base branch`;
     case 'review_not_approved':
@@ -765,9 +790,21 @@ export async function discoverMergeCandidates(
     MergeCandidateDiscoveryDeps['listOpenPullRequests']
   > = input => deps.listOpenPullRequests?.(input) ?? Promise.resolve([]);
 
-  const watchedBases = options.watchedBases ?? resolveWatchedBaseBranches();
   const repos = options.repos ?? resolveDiscoveryRepos();
   if (repos.length === 0) return unavailable(logger, 'no_repos_configured');
+  const explicitWatchedBases = options.watchedBases;
+  const explicitPolicy = process.env[MERGE_MANAGER_REPO_POLICY_ENV];
+  const policy = resolveMergeRepoPolicy({
+    rawPolicy: explicitPolicy,
+    legacyAllowedBases:
+      explicitPolicy === undefined && process.env[LEGACY_ALLOWED_BASES_ENV] !== undefined
+        ? resolveWatchedBaseBranches()
+        : undefined,
+    legacyRepos: repos.map(target => `${target.owner}/${target.repo}`),
+  });
+  if (explicitPolicy === undefined && process.env[LEGACY_ALLOWED_BASES_ENV] !== undefined) {
+    warnLegacyMergePolicy(LEGACY_ALLOWED_BASES_ENV);
+  }
 
   const maxPullRequests = options.maxPullRequestsPerTick ?? resolveDiscoveryMaxPrsPerTick();
   const alreadyCovered = options.alreadyCoveredPullRequests ?? new Set<string>();
@@ -789,6 +826,16 @@ export async function discoverMergeCandidates(
   const byRepo = new Map<string, readonly DiscoveredPullRequest[]>();
   for (const target of repos) {
     try {
+      const ownerRepo = repoKey(target.owner, target.repo);
+      const watchedBases =
+        explicitWatchedBases ?? resolveWatchedBaseBranchesForRepo(ownerRepo, policy);
+      if (explicitWatchedBases === undefined && !hasRepoPolicyEntry(ownerRepo, policy)) {
+        warnVia(
+          logger,
+          { owner: target.owner, repo: target.repo, env: MERGE_MANAGER_REPO_POLICY_ENV },
+          'merge-coordinator.repo_policy_missing'
+        );
+      }
       const listed = await listOpenPullRequests({
         owner: target.owner,
         repo: target.repo,
@@ -849,7 +896,7 @@ export async function discoverMergeCandidates(
         continue;
       }
 
-      const structural = classifyDiscoveredPullRequest(pr, watchedBases);
+      const structural = classifyDiscoveredPullRequest(pr, explicitWatchedBases, policy);
       if (structural) {
         exclusions.push({
           owner: pr.owner,

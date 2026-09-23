@@ -69,8 +69,19 @@ export {
   logDiscoveryConfigurationAtStartup,
   resolveDiscoveryRepos,
   resolveWatchedBaseBranches,
+  resolveWatchedBaseBranchesForRepo,
   summarizeExclusions,
 } from './merge-candidate-discovery';
+export {
+  DEFAULT_MERGE_REPO_POLICY,
+  getRepoBasePolicy,
+  hasRepoPolicyEntry,
+  MERGE_MANAGER_REPO_POLICY_ENV,
+  parseMergeRepoPolicy,
+  resolveMergeRepoPolicy,
+  unattendedBasesForRepo,
+} from './merge-repo-policy';
+export type { DocsOnlyPolicy, MergeRepoPolicy, RepoBasePolicy } from './merge-repo-policy';
 export { MERGE_MANAGER_IDENTITY, createMergeManager } from './merge-manager';
 export { createGitHubQualifiedMergeAdapter } from './adapters/github-qualified-merge';
 export { resolveDefaultDeps, runOverseerService } from './service';
