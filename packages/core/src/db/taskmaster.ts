@@ -32,7 +32,13 @@ export type TmActionOutcome =
 // 'unheard' (M-155 Amendment 03, John's ruling 2026-09-21): an action whose
 // dispatch row was never acknowledged by a non-draining principal. Excluded
 // from the useful-rate floor denominator (only 'useful'/'noise' are counted).
-export type TmGrade = 'useful' | 'noise' | 'harmful' | 'unheard';
+// 'delivered_to_issue' (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01): a
+// gh:owner/repo#N escalate_p0 that was delivered as a GitHub issue comment
+// (marker '<!-- taskmaster-escalation -->') rather than the operator dispatch
+// mailbox. Set at SEND time (not by gradeSentActions), and excluded from the
+// useful-rate floor denominator by the same "only 'useful'/'noise' are counted"
+// rule as 'unheard'.
+export type TmGrade = 'useful' | 'noise' | 'harmful' | 'unheard' | 'delivered_to_issue';
 export type TmPauseState = 'RUNNING' | 'PAUSED' | 'HARD_PAUSE';
 export type TmHealthState = 'healthy' | 'degraded' | 'dark' | 'unknown';
 export type TmUsageConfidence = 'high' | 'low' | 'none';

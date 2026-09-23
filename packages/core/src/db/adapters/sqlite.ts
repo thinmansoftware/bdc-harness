@@ -533,6 +533,43 @@ export class SqliteAdapter implements IDatabase {
         throw error;
       }
     }
+    // Migration 056 (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01): widen
+    // tm_journal.grade CHECK to accept 'delivered_to_issue'. Re-read the schema
+    // fresh -- the migration-055 rebuild above may have just recreated the table
+    // with a CHECK that still lacks 'delivered_to_issue', so the stale schema
+    // string from that block cannot be reused here. Separate block (do not edit
+    // the 045/055 CHECK literals) so each widen is independently idempotent.
+    const journalSchema3 = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
+      .get() as { sql?: string } | undefined;
+    if (journalSchema3?.sql && !journalSchema3.sql.includes('delivered_to_issue')) {
+      this.db.run('BEGIN');
+      try {
+        this.db.run(`
+          CREATE TABLE tm_journal_new (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            thread_ref TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+            proposal_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            before_hash TEXT,
+            proof_predicate TEXT,
+            proof_deadline_at TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+            graded_at TEXT,
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+          );
+          INSERT INTO tm_journal_new SELECT * FROM tm_journal;
+          DROP TABLE tm_journal;
+          ALTER TABLE tm_journal_new RENAME TO tm_journal;
+        `);
+        this.db.run('COMMIT');
+      } catch (error: unknown) {
+        this.db.run('ROLLBACK');
+        throw error;
+      }
+    }
     // Migration 046: older on-disk databases used a composite primary key for
     // tm_health. Add a provider-only UNIQUE index (allowed by the WO) instead
     // of rebuilding: table constraints, columns, indexes and triggers survive.
@@ -2233,7 +2270,7 @@ export class SqliteAdapter implements IDatabase {
           outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')
         ),
         graded_at TEXT,
-        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
+        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
       );
 
       CREATE TABLE IF NOT EXISTS tm_control (

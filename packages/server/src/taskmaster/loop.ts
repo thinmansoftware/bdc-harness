@@ -39,6 +39,15 @@ import {
   usefulRateFloorBreached,
 } from './rules';
 import { validateProposal, type TmAllowedRecipient } from './guard';
+import {
+  buildEscalationCommentBody,
+  createRealEscalationDeliveryDeps,
+  deliverEscalationToIssue,
+  parseGithubThreadRef,
+  parseOwnerLabel,
+  resolveEscalateToIssueEnabled,
+  type EscalationDeliveryDeps,
+} from './escalation-delivery';
 import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
@@ -198,6 +207,13 @@ export interface TaskmasterDeps {
   /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
   onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
   checkExpectations?: (now: Date) => Promise<void>;
+  /**
+   * GitHub-issue escalation delivery seam
+   * (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). Tests inject fake
+   * listIssueComments/postIssueComment; production defaults to
+   * createRealEscalationDeliveryDeps().
+   */
+  escalationDelivery?: EscalationDeliveryDeps;
 }
 
 export interface TickResult {
@@ -1682,7 +1698,37 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
 
     try {
-      if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
+      const escalationIssue =
+        proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
+          ? parseGithubThreadRef(proposal.threadRef)
+          : null;
+      if (escalationIssue) {
+        // WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01: deliver the escalation as
+        // a GitHub issue comment (where the owner and Duty Officer look), not to
+        // the operator dispatch mailbox (a drain_on_start principal with no
+        // reader). The body is built from adoption content, NOT proposal.body,
+        // which is written for the operator-mailbox audience. Whether a fresh
+        // comment was posted or a within-cooldown marker already covered it, the
+        // row is journaled sent + graded 'delivered_to_issue' (excluded from the
+        // M-155 useful-rate floor, like 'unheard'); no dispatch row exists for a
+        // GitHub-comment effect, so no expectation is registered.
+        const adoptionRow = adoptionByRef.get(canonicalizeThreadRef(proposal.threadRef));
+        const body = buildEscalationCommentBody({
+          title: adoptionRow?.title ?? null,
+          threadRef: proposal.threadRef,
+          sinceIso: adoptionRow?.last_movement_at ?? adoptionRow?.source_updated_at ?? null,
+          nextAction: adoptionRow?.next_action ?? null,
+          ownerLabelLogin: parseOwnerLabel(adoptionRow?.labels_json),
+          nowMs,
+        });
+        const delivery = deps.escalationDelivery ?? createRealEscalationDeliveryDeps();
+        await deliverEscalationToIssue(
+          { issue: escalationIssue, threadRef: proposal.threadRef, body },
+          delivery
+        );
+        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.gradeAction(journalRow.id, 'delivered_to_issue');
+      } else if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
         let resolveAdmission: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
           null;
         let rejectAdmission: ((error: unknown) => void) | null = null;

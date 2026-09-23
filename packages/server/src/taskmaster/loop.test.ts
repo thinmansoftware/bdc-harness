@@ -28,6 +28,12 @@ import {
   type AdoptionRefreshResult,
 } from './loop';
 import { checkEvidence } from './expectations';
+import {
+  TASKMASTER_ESCALATION_MARKER,
+  TASKMASTER_ESCALATION_COOLDOWN_MS,
+  type EscalationDeliveryDeps,
+  type EscalationIssueComment,
+} from './escalation-delivery';
 import type { DispatchDeliveryMode } from '@archon/core/db/dispatch';
 import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
 import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal, NUDGE_CLOCK_MS } from './rules';
@@ -438,6 +444,42 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     // Default no-op evidence so adoption refresh never hits the network in unit tests.
     getGithubIssueEvidence: async () => null,
     ...overrides,
+  };
+}
+
+/**
+ * Fake GitHub-issue escalation delivery seam
+ * (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). Records posted comments; its
+ * clock tracks world.nowMs so the module's 72h cooldown is evaluated against the
+ * same virtual time the tick uses. `onPost` lets ordering tests observe the post.
+ */
+function makeIssueCommentSink(
+  world: FakeWorld,
+  onPost?: (body: string) => void
+): { delivery: EscalationDeliveryDeps; posts: () => number; comments: EscalationIssueComment[] } {
+  // Comments are keyed per issue (owner/repo#number) so distinct issues do not
+  // share a dedupe window; `comments` is the flat aggregate for assertions.
+  const byIssue = new Map<string, EscalationIssueComment[]>();
+  const all: EscalationIssueComment[] = [];
+  let posts = 0;
+  const keyOf = (issue: { owner: string; repo: string; number: number }): string =>
+    `${issue.owner}/${issue.repo}#${issue.number}`;
+  return {
+    comments: all,
+    posts: () => posts,
+    delivery: {
+      listIssueComments: async issue => byIssue.get(keyOf(issue)) ?? [],
+      postIssueComment: async (issue, body) => {
+        posts += 1;
+        const comment = { body, created_at: new Date(world.nowMs).toISOString() };
+        const list = byIssue.get(keyOf(issue)) ?? [];
+        list.push(comment);
+        byIssue.set(keyOf(issue), list);
+        all.push(comment);
+        onPost?.(body);
+      },
+      now: () => new Date(world.nowMs),
+    },
   };
 }
 
@@ -916,6 +958,10 @@ describe('fire_cauldron loop', () => {
           events.push(data.body.includes('Ratified ruling') ? 'deliver_ruling' : 'escalate_p0');
           return { id: `msg-${events.length}`, status: 'queued' } as never;
         }) as TaskmasterDeps['createTask'],
+        // The unclaimed-P0 escalation (#520) now delivers as a GitHub issue
+        // comment, not a dispatch message; record it in the same ordering trace
+        // (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01).
+        escalationDelivery: makeIssueCommentSink(world, () => events.push('escalate_p0')).delivery,
         runCascade: (async options => {
           events.push(`fire:${options.woId}`);
           const record = { cascadeId: `cascade-${options.woId}`, status: 'running' } as never;
@@ -1336,18 +1382,23 @@ describe('WO pause-gate enforcement (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01
     // pause_state defaults to RUNNING, pause_scope null.
 
     const { rulings, threads, refs } = threeDeliverables();
+    const sink = makeIssueCommentSink(world);
     const deps = makeDeps(world, {
       listUndeliveredRulings: async () => rulings,
       listThreads: async () => threads,
+      escalationDelivery: sink.delivery,
     });
     const state = createTaskmasterState(60_000);
 
     const result = await tick(state, deps);
 
-    // All 3 deliver exactly as before the gate WO.
+    // All 3 deliver exactly as before the gate WO -- but the two gh-ref P0
+    // escalations now land on their GitHub issues, not the operator mailbox
+    // (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). The ruling still dispatches.
     expect(result.effects).toBe(3);
     expect(result.parked).toBe(0);
-    expect(world.sentMessages.length).toBe(3);
+    expect(world.sentMessages.length).toBe(1);
+    expect(sink.posts()).toBe(2);
     const sent = world.journal.filter(j => j.outcome === 'sent' && refs.includes(j.thread_ref));
     expect(sent.length).toBe(3);
   });
@@ -3494,6 +3545,148 @@ describe('M-155 exception push (loop)', () => {
         expect(site.slice(0, 300)).not.toContain("'RUNNING'");
       }
       expect(/pause_state:\s*'RUNNING'/.test(source)).toBe(false);
+    }
+  });
+});
+
+describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01)', () => {
+  const P0_REF = 'gh:thinmansoftware/bdc-harness#194';
+
+  function unclaimedP0(ref = P0_REF): ListedThread {
+    return makeListedThread({
+      ref,
+      priority: 'P0',
+      isUnclaimed: true,
+      isUnclaimedP0: true,
+      lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
+      title: 'WO-HARNESS-EXAMPLE-194 stuck P0',
+    });
+  }
+
+  test('gh-ref escalation posts exactly one marked comment and sends NO dispatch message', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      // Ambient TASKMASTER_FIRE_VERB_ENABLED must not turn these into fire cascades.
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    // One marked issue comment; zero operator-mailbox dispatch messages.
+    expect(gh.posts()).toBe(1);
+    expect(gh.comments).toHaveLength(1);
+    expect(gh.comments[0]?.body).toContain(TASKMASTER_ESCALATION_MARKER);
+    expect(gh.comments[0]?.body).toContain('Escalated by Taskmaster (M-155).');
+    expect(world.sentMessages).toHaveLength(0);
+
+    // Journal: the escalate_p0 row is sent + graded delivered_to_issue.
+    const row = world.journal.find(j => j.thread_ref === P0_REF && j.action_type === 'escalate_p0');
+    expect(row?.outcome).toBe('sent');
+    expect(row?.grade).toBe('delivered_to_issue');
+  });
+
+  test('a later tick with no new activity (within cooldown) posts nothing more', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      // Ambient TASKMASTER_FIRE_VERB_ENABLED must not turn these into fire cascades.
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    // Tick 1 posts.
+    await tick(createTaskmasterState(60_000), deps);
+    expect(gh.posts()).toBe(1);
+
+    // Advance past the P0 bucket (30m) so a fresh escalate_p0 proposal is made,
+    // but stay well inside the 72h cooldown. The module suppresses the repeat.
+    world.nowMs += 45 * 60_000;
+    await tick(createTaskmasterState(60_000), deps);
+    expect(gh.posts()).toBe(1);
+    expect(gh.comments).toHaveLength(1);
+    expect(world.sentMessages).toHaveLength(0);
+  });
+
+  test('after the 72h cooldown, the next tick escalates again', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      // Ambient TASKMASTER_FIRE_VERB_ENABLED must not turn these into fire cascades.
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+    expect(gh.posts()).toBe(1);
+
+    // Advance beyond the cooldown (new bucket, new idempotency key): re-escalate.
+    // Crossing >72h lands on a new UTC day, so a fresh digest legitimately
+    // dispatches; assert only that NO escalate_p0 went to the operator mailbox.
+    world.nowMs += TASKMASTER_ESCALATION_COOLDOWN_MS + 60 * 60_000;
+    await tick(createTaskmasterState(60_000), deps);
+    expect(gh.posts()).toBe(2);
+    expect(gh.comments).toHaveLength(2);
+    expect(
+      world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:escalate_p0:'))
+    ).toHaveLength(0);
+  });
+
+  test('a non-gh escalate_p0 thread keeps the operator-mailbox dispatch path', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0('dispatch:orphan-p0-1')],
+      escalationDelivery: gh.delivery,
+      // Ambient TASKMASTER_FIRE_VERB_ENABLED must not turn these into fire cascades.
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    // No issue comment; the escalation goes out as a dispatch message as before.
+    expect(gh.posts()).toBe(0);
+    const escalations = world.sentMessages.filter(m =>
+      m.idempotency_key.startsWith('tm:escalate_p0:')
+    );
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]?.recipient).toBe('operator');
+    expect(escalations[0]?.body).toContain('Unclaimed P0');
+  });
+
+  test('kill switch TASKMASTER_ESCALATE_TO_ISSUE=false restores the dispatch path for a gh-ref', async () => {
+    const prior = process.env.TASKMASTER_ESCALATE_TO_ISSUE;
+    process.env.TASKMASTER_ESCALATE_TO_ISSUE = 'false';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const gh = makeIssueCommentSink(world);
+      const deps = makeDeps(world, {
+        listThreads: async () => [unclaimedP0()],
+        escalationDelivery: gh.delivery,
+        checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+      });
+
+      await tick(createTaskmasterState(60_000), deps);
+
+      // Kill switch off => no issue comment; old dispatch-mailbox path used.
+      expect(gh.posts()).toBe(0);
+      const escalations = world.sentMessages.filter(m =>
+        m.idempotency_key.startsWith('tm:escalate_p0:')
+      );
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]?.recipient).toBe('operator');
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_ESCALATE_TO_ISSUE;
+      else process.env.TASKMASTER_ESCALATE_TO_ISSUE = prior;
     }
   });
 });

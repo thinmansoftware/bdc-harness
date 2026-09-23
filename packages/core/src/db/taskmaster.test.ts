@@ -1339,6 +1339,20 @@ describe('tm_journal DAL', () => {
     expect(graded?.graded_at).not.toBeNull();
   });
 
+  test("gradeAction accepts the 'delivered_to_issue' grade (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01)", async () => {
+    const row = await recordAction({
+      thread_ref: 'gh:thinmansoftware/bdc-harness#194',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      outcome: 'sent',
+    });
+    // 'delivered_to_issue' must persist through the tm_journal grade CHECK
+    // (widened in SQLite createSchema + migration 056 for Postgres).
+    const graded = await gradeAction(row.id, 'delivered_to_issue');
+    expect(graded?.grade).toBe('delivered_to_issue');
+    expect(graded?.graded_at).not.toBeNull();
+  });
+
   test('expireParkedActions expires parked and pending rows only', async () => {
     await recordAction({
       thread_ref: 't1',

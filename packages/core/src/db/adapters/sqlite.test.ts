@@ -484,6 +484,73 @@ describe('SqliteAdapter', () => {
     });
   });
 
+  describe('tm_journal delivered_to_issue grade migration (migration 056 / WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01)', () => {
+    test('a pre-delivered_to_issue tm_journal table is rebuilt so it accepts the delivered_to_issue grade', async () => {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      // Pre-056 shape: the grade CHECK includes 'unheard' (post-055) but NOT
+      // 'delivered_to_issue' -- the exact on-disk shape migration 056 must widen.
+      legacy.run(`
+        CREATE TABLE tm_journal (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          thread_ref TEXT NOT NULL,
+          action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+          proposal_json TEXT NOT NULL,
+          idempotency_key TEXT,
+          before_hash TEXT,
+          proof_predicate TEXT,
+          proof_deadline_at TEXT,
+          outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+          graded_at TEXT,
+          grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
+        )
+      `);
+      legacy.run(`
+        INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome, grade)
+        VALUES ('legacy-056-1', '2026-09-01T00:00:00.000Z', 'thread-1', 'escalate_p0', '{}', 'sent', 'unheard')
+      `);
+      legacy.close();
+
+      // Reopening through SqliteAdapter must run the migration and rebuild the
+      // table with the widened CHECK, without losing the pre-existing row.
+      db = new SqliteAdapter(currentDbPath);
+
+      const schema = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+      );
+      expect(schema.rows[0]?.sql).toContain('delivered_to_issue');
+
+      const preserved = await db.query<{ id: string; grade: string | null }>(
+        `SELECT id, grade FROM tm_journal WHERE id = 'legacy-056-1'`
+      );
+      expect(preserved.rows).toEqual([{ id: 'legacy-056-1', grade: 'unheard' }]);
+
+      // The whole point of the migration: an INSERT grading a row
+      // 'delivered_to_issue' must now succeed against the migrated database.
+      await db.query(
+        `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome, grade)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          'legacy-056-2',
+          '2026-09-23T00:00:00.000Z',
+          'gh:thinmansoftware/bdc-harness#194',
+          'escalate_p0',
+          '{}',
+          'sent',
+          'delivered_to_issue',
+        ]
+      );
+      const graded = await db.query<{ grade: string | null }>(
+        `SELECT grade FROM tm_journal WHERE id = 'legacy-056-2'`
+      );
+      expect(graded.rows).toEqual([{ grade: 'delivered_to_issue' }]);
+    });
+  });
+
   describe('INSERT with RETURNING', () => {
     test('returns inserted row via native RETURNING', async () => {
       db = createTestDb();
