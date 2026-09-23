@@ -95,6 +95,8 @@ services:
       DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT: ${DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT:-2026-10-07}
       DUTY_OFFICER_SECURITY_SCAN_REPOS: ${DUTY_OFFICER_SECURITY_SCAN_REPOS:-thinmansoftware/shopops,thinmansoftware/lspro-react,thinmansoftware/scout-service,thinmansoftware/bdc-harness}
       DUTY_OFFICER_SECURITY_SCAN_WORKFLOW: ${DUTY_OFFICER_SECURITY_SCAN_WORKFLOW:-security-scan.yml}
+      # Comma-separated GitHub logins trusted for receipts and TRIAGED acknowledgements.
+      DUTY_OFFICER_SECURITY_TRUSTED_LOGINS: ${DUTY_OFFICER_SECURITY_TRUSTED_LOGINS:-bluedevilcollectibles,thinman-overseer[bot]}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     volumes:

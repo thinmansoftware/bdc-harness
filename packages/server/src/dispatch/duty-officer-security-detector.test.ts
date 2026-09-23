@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
+import { rootLogger } from '@archon/paths';
 import {
   classifyRuns,
   isoWeekUtc,
@@ -27,9 +28,93 @@ function deps(
 afterEach(() => {
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS;
+  delete process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS;
 });
 
 describe('duty officer security detector', () => {
+  for (const { login, allowList, trusted } of [
+    { login: 'other-collaborator', allowList: undefined, trusted: false },
+    { login: undefined, allowList: undefined, trusted: false },
+    { login: 'bluedevilcollectibles', allowList: undefined, trusted: true },
+    { login: 'thinman-overseer[bot]', allowList: undefined, trusted: true },
+    { login: 'custom-reviewer', allowList: ' , CUSTOM-reviewer , ', trusted: true },
+    { login: 'bluedevilcollectibles', allowList: 'custom-reviewer', trusted: false },
+    { login: 'bluedevilcollectibles', allowList: '', trusted: false },
+  ]) {
+    test(`receipt and TRIAGED author ${login} with allow-list ${allowList}: trusted=${trusted}`, async () => {
+      if (allowList === undefined) delete process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS;
+      else process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS = allowList;
+      process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+      const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+        symbol => symbol.description === 'pino.stream'
+      )!;
+      const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+        streamSymbol
+      ];
+      const lines: string[] = [];
+      const write = spyOn(stream, 'write').mockImplementation(line => {
+        lines.push(line);
+      });
+      const d = deps(
+        mock(async (url, init) => {
+          expect(init?.method).toBe('GET');
+          // Changing configuration during I/O must not change this run's trust decision.
+          process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS = 'other-collaborator';
+          if (String(url).includes('/runs?')) {
+            return Response.json({
+              workflow_runs: [{ created_at: '2026-09-29T00:00:00Z', conclusion: 'success' }],
+            });
+          }
+          if (String(url).includes('/comments?')) {
+            return Response.json([
+              {
+                id: 101,
+                user: { login },
+                body: '<!-- host-inventory -->\nposted_at: 2026-09-29T00:00:00Z\nprivate-receipt-body',
+              },
+              { id: 102, user: { login }, body: 'TRIAGED private-triage-body' },
+            ]);
+          }
+          return Response.json([
+            {
+              number: 42,
+              title: 'Security Scan -- 2026-W39',
+              labels: ['security-scan'],
+              created_at: '2026-09-21T00:00:00Z',
+              updated_at: '2026-09-29T00:00:00Z',
+            },
+          ]);
+        }) as typeof fetch
+      );
+      d.readToken = () => 'read-token';
+      try {
+        for (let run = 0; run < 2; run += 1) {
+          if (allowList === undefined) delete process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS;
+          else process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS = allowList;
+          // A fresh dependency object starts another evaluation at the same deterministic time.
+          const result = await runSecurityDetector({ ...d });
+          expect(result?.verdict).toBe('alarm');
+          const codes = result!.reasons.map(reason => reason.code);
+          expect(codes.includes('receipt_missing')).toBe(!trusted);
+          expect(codes.includes('unread')).toBe(!trusted);
+          const ignored = lines.filter(line =>
+            line.includes('duty_officer_security_detector_untrusted_marker_ignored')
+          );
+          expect(ignored).toHaveLength(trusted ? 0 : run + 1);
+          if (!trusted) {
+            expect(JSON.parse(ignored[run])).toEqual(
+              expect.objectContaining({ issue: 42, login: login ?? null, comment_id: 101 })
+            );
+          }
+          expect(lines.join('')).not.toContain('private-receipt-body');
+          expect(lines.join('')).not.toContain('private-triage-body');
+        }
+      } finally {
+        write.mockRestore();
+      }
+    });
+  }
+
   test('App token exchange uses the deadline signal', async () => {
     const saved = {
       GITHUB_APP_ID: process.env.GITHUB_APP_ID,

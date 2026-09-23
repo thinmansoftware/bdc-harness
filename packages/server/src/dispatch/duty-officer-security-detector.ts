@@ -285,6 +285,15 @@ export async function runSecurityDetector(
     return null;
   }
   PROCESS_RUNS.set(deps as object, now.getTime());
+  const trustedLogins = new Set(
+    (
+      process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS ??
+      'bluedevilcollectibles,thinman-overseer[bot]'
+    )
+      .split(',')
+      .map(login => login.trim().toLowerCase())
+      .filter(Boolean)
+  );
   deps = { ...deps, signal };
   const evaluatedAt = now.toISOString();
   const armedAt = process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT?.trim() || '9999-12-31';
@@ -309,6 +318,7 @@ export async function runSecurityDetector(
   let detector: Issue | undefined;
   let reports: Issue[] = [];
   const comments = new Map<number, Comment[]>();
+  const trustedComments = new Map<number, Comment[]>();
   try {
     for (const scanRepo of configuredRepos()) {
       try {
@@ -365,9 +375,30 @@ export async function runSecurityDetector(
         token
       );
       comments.set(report.number, list);
+      let loggedUntrustedMarker = false;
+      const trustedMarkers = list.filter(comment => {
+        const body = comment.body ?? '';
+        if (!body.includes('<!-- host-inventory -->') && !/^TRIAGED\b/.test(body.split('\n')[0])) {
+          return false;
+        }
+        // Board M-190 J4 (2026-09-23) accepts that all humans and agents share
+        // bluedevilcollectibles: this allow-list excludes other collaborators,
+        // but cannot distinguish John from an agent on that login. That residual
+        // is accepted on the record; the detector's own outputs use App identity.
+        if (trustedLogins.has((comment.user?.login ?? '').toLowerCase())) return true;
+        if (!loggedUntrustedMarker) {
+          log.warn(
+            { issue: report.number, login: comment.user?.login ?? null, comment_id: comment.id },
+            'duty_officer_security_detector_untrusted_marker_ignored'
+          );
+          loggedUntrustedMarker = true;
+        }
+        return false;
+      });
+      trustedComments.set(report.number, trustedMarkers);
       if (
         now.getTime() > Date.parse(report.created_at) + 7 * 86_400_000 &&
-        !list.some(comment => /^TRIAGED\b/.test((comment.body ?? '').split('\n')[0]))
+        !trustedMarkers.some(comment => /^TRIAGED\b/.test((comment.body ?? '').split('\n')[0]))
       ) {
         result.reasons.push({ code: 'unread', detail: `issue ${report.number}` });
       }
@@ -377,7 +408,7 @@ export async function runSecurityDetector(
     )[0];
     if (
       !newest ||
-      !(comments.get(newest.number) ?? []).some(comment =>
+      !(trustedComments.get(newest.number) ?? []).some(comment =>
         receiptValid(comment.body ?? '', newest.created_at, now)
       )
     ) {
