@@ -599,6 +599,10 @@ VALUES
   ('claude-acp', 'Claude ACP', 'worker_poll', TRUE),
   ('codex-mcp', 'Codex MCP', 'worker_poll', TRUE),
   ('grok-acp', 'Grok ACP', 'worker_poll', TRUE),
+  -- WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01 (migration 056): the Astra Codex
+  -- desktop Board/XO seat. drain_on_start (mailbox) like operator/xo -- no
+  -- worker ever claims it; the desktop automation reads and addresses it.
+  ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', TRUE),
   ('operator', 'Operator', 'drain_on_start', TRUE),
   ('xo', 'XO', 'drain_on_start', TRUE),
   ('board', 'Board', 'alias_resolved', TRUE),

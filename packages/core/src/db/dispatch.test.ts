@@ -464,6 +464,60 @@ describe('dispatch db', () => {
     ).toBeNull();
   });
 
+  // WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01: astra is a drain_on_start mailbox
+  // principal. It must be a valid recipient, must never be claimed by any
+  // worker, must ack/address as 'astra', and must refuse a 'codex' actor.
+  test('astra is an unclaimable mailbox principal that only its own actor may address', async () => {
+    await expect(assessDispatchRecipient(' Astra ')).resolves.toEqual({
+      ok: true,
+      canonical_principal: 'astra',
+      delivery_mode: 'drain_on_start',
+      reason: null,
+    });
+
+    await registerWorker({
+      worker_id: 'worker-astra-guard',
+      host: 'host',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const astraMessage = await createMessage({
+      correlation_id: 'corr-astra-mailbox',
+      idempotency_key: 'idem-astra-mailbox',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'astra',
+      body: 'Arc D ruling for Astra.',
+    });
+
+    // (b) no worker ever claims an astra row -- it stays queued, unleased.
+    expect(await claimMessage({ id: astraMessage.id, worker_id: 'worker-astra-guard' })).toBeNull();
+    const afterClaim = await getMessage(astraMessage.id);
+    expect(afterClaim?.status).toBe('queued');
+    expect(afterClaim?.lease_owner).toBeNull();
+
+    // (d) a wrong-recipient actor (codex) is refused for ack and address.
+    await expect(
+      acknowledgeMessage({ id: astraMessage.id, principal_id: 'codex' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_recipient' });
+    await expect(addressMessage({ id: astraMessage.id, principal_id: 'codex' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_recipient',
+    });
+
+    // (c) astra acks its own mail, then addresses it, both idempotent.
+    expect((await acknowledgeMessage({ id: astraMessage.id, principal_id: 'astra' })).ok).toBe(
+      true
+    );
+    expect((await addressMessage({ id: astraMessage.id, principal_id: ' Astra ' })).ok).toBe(true);
+    const stored = await getMessage(astraMessage.id);
+    expect(stored).toMatchObject({
+      status: 'queued',
+      acknowledged_by: 'astra',
+      addressed_by: 'astra',
+    });
+  });
+
   test('rejects missing and inactive concrete principals before claim', async () => {
     await registerWorker({
       worker_id: 'worker-registry-guard',

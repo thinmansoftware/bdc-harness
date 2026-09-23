@@ -36,6 +36,7 @@ const REQUIRED_DISPATCH_INDEXES = [
   'idx_dispatch_board_pending',
 ] as const;
 const KNOWN_PRINCIPALS = [
+  ['astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1],
   ['board', 'Board', 'alias_resolved', 1],
   ['cauldron', 'Cauldron', 'notify_only', 1],
   ['claude', 'Claude', 'worker_poll', 1],
