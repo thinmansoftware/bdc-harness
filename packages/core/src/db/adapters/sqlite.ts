@@ -1083,6 +1083,10 @@ export class SqliteAdapter implements IDatabase {
         ('claude-acp', 'Claude ACP', 'worker_poll', 1),
         ('codex-mcp', 'Codex MCP', 'worker_poll', 1),
         ('grok-acp', 'Grok ACP', 'worker_poll', 1),
+        -- WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01: the Astra Codex desktop
+        -- Board/XO seat. drain_on_start (mailbox) like operator/xo -- no worker
+        -- ever claims it; the desktop automation reads and addresses it directly.
+        ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1),
         ('operator', 'Operator', 'drain_on_start', 1),
         ('xo', 'XO', 'drain_on_start', 1),
         ('board', 'Board', 'alias_resolved', 1),

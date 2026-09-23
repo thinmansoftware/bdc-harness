@@ -150,6 +150,8 @@ describe('SqliteAdapter', () => {
          ORDER BY principal_id`
       );
       expect(principals.rows).toEqual([
+        // WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01: Astra Codex desktop Board/XO seat.
+        { principal_id: 'astra', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 'board', delivery_mode: 'alias_resolved', active: 1 },
         { principal_id: 'cauldron', delivery_mode: 'notify_only', active: 1 },
         { principal_id: 'claude', delivery_mode: 'worker_poll', active: 1 },

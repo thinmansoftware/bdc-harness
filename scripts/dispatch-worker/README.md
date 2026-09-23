@@ -337,3 +337,32 @@ container (or set `"seat": null` and restart for a non-container worker) and
 Dispatch simply stops seeing the seat advertise; queued messages stay queued
 or lease-expire for a new fenced attempt. No schema, server, or router
 change ships with a seat, so rollback never touches the drop-box server.
+
+# Mailbox principals (`astra`, `xo`, `operator`)
+
+Not every recipient is a worker. Some principals are `delivery_mode:
+drain_on_start` **mailboxes**: no dispatch worker ever claims their mail. The
+owning automation reads the queued rows on its own heartbeat, acts, and then
+acks/addresses them as that principal. `claimMessage()` structurally refuses a
+non-`worker_poll` principal, and the worker's poll loop only iterates the
+concrete local agents in its `agents` config -- so a mailbox principal is never
+even queried, let alone claimed.
+
+Recipients that are mailboxes:
+
+- `xo` -- XO command seat.
+- `operator` -- operator drop-box.
+- `astra` -- the Astra Codex desktop Board/XO seat (Arc D owner). Registered by
+  migration `056_dispatch_astra_mailbox.sql`
+  (WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01). Send to it with `recipient: "astra"`
+  on `POST /api/dispatch/messages`. The Astra desktop automation
+  (`monitor-claude-astra-mailbox`) reads its inbox with:
+
+  ```sql
+  SELECT * FROM agent_dispatch_messages
+  WHERE recipient = 'astra' AND acknowledged_at IS NULL;
+  ```
+
+  then acts in its own thread and acks/addresses the row as `astra`. Because
+  `astra` is `drain_on_start`, the desktop dispatch worker's generic `codex`
+  leg can never claim it -- the message reaches only the Astra seat.

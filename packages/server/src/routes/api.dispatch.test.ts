@@ -367,6 +367,74 @@ describe('dispatch API', () => {
     expect(((await second.json()) as { body: string }).body).toBe('Please summarize this.');
   });
 
+  // WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01: a message to astra is accepted,
+  // never claimed by any worker, and only its own actor may ack/address it.
+  test('routes astra as an unclaimable mailbox recipient over HTTP', async () => {
+    const app = makeApp('secret-token');
+    await registerWorker({
+      worker_id: 'worker-a',
+      host: 'host',
+      capabilities: { providers: ['claude', 'codex', 'grok', 'cursor'] },
+      max_concurrency: 1,
+    });
+
+    // (a) posting to astra succeeds and queues the row.
+    const created = await app.request('/api/dispatch/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+      body: JSON.stringify({
+        ...VALID_BODY,
+        idempotency_key: 'idem-astra-http',
+        recipient: 'astra',
+        body: 'Arc D ruling for Astra.',
+      }),
+    });
+    expect(created.status).toBe(200);
+    const message = (await created.json()) as { id: string; recipient: string; status: string };
+    expect(message.recipient).toBe('astra');
+    expect(message.status).toBe('queued');
+
+    // (b) a worker with every agent configured cannot claim the astra row --
+    // claimMessage refuses any non-worker_poll principal, so the drop-box
+    // desktop worker's generic codex leg never takes it. It stays queued/unleased.
+    const claim = await app.request(`/api/dispatch/messages/${message.id}/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+      body: JSON.stringify({ worker_id: 'worker-a' }),
+    });
+    expect(claim.status).toBe(404);
+    const stored = await db.query<{ status: string; lease_owner: string | null }>(
+      'SELECT status, lease_owner FROM agent_dispatch_messages WHERE id = $1',
+      [message.id]
+    );
+    expect(stored.rows[0]).toEqual({ status: 'queued', lease_owner: null });
+
+    // (d) a wrong-recipient actor (codex) is refused.
+    const wrongAck = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+      body: JSON.stringify({ principal_id: 'codex' }),
+    });
+    expect(wrongAck.status).toBe(409);
+    expect(((await wrongAck.json()) as { error: string }).error).toBe('wrong_recipient');
+
+    // (c) astra acks and addresses its own mail.
+    const ack = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+      body: JSON.stringify({ principal_id: ' Astra ' }),
+    });
+    expect(ack.status).toBe(200);
+    expect(((await ack.json()) as { acknowledged_by: string }).acknowledged_by).toBe('astra');
+    const address = await app.request(`/api/dispatch/messages/${message.id}/address`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+      body: JSON.stringify({ principal_id: 'astra' }),
+    });
+    expect(address.status).toBe(200);
+    expect(((await address.json()) as { addressed_by: string }).addressed_by).toBe('astra');
+  });
+
   test('returns an existing HTTP idempotency row after its recipient becomes inactive', async () => {
     const app = makeApp('secret-token');
     const first = await app.request('/api/dispatch/messages', {
