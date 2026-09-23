@@ -14,8 +14,17 @@ import {
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
+import {
+  mintAppInstallationToken,
+  runSecurityDetector,
+  type SecurityDetectorResult,
+} from './duty-officer-security-detector';
 
 const log = createLogger('dispatch/duty-officer-clock');
+
+// Captured once at module load so a container recreate is observable in the
+// worker row (N5). Written into capabilities.started_at at tick end.
+const CLOCK_STARTED_AT = new Date().toISOString();
 
 export const DUTY_OFFICER_WORKER_ID = 'duty-officer-clock';
 export const DUTY_OFFICER_RECIPIENTS = ['duty-officer', 'do'] as const;
@@ -48,11 +57,21 @@ export interface DutyOfficerClockDeps {
   listStaleIssues: () => Promise<DutyOfficerStaleIssue[]>;
   postIssueComment: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
   judge: (message: DispatchMessage) => Promise<DutyOfficerJudgeVerdict>;
+  securityDetector: () => Promise<SecurityDetectorResult | null>;
+  now?: () => Date;
 }
 
 function githubToken(): string | null {
   const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
   return token ? token : null;
+}
+
+function githubTimeoutMs(): number {
+  return Math.max(1000, Number(process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS) || 15_000);
+}
+
+function securityDetectorTimeoutMs(): number {
+  return Math.max(1, Number(process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS) || 30_000);
 }
 
 export function githubNudgeEnabled(): boolean {
@@ -123,6 +142,7 @@ async function githubJson<T>(
     method: options?.method,
     headers,
     body: options?.body,
+    signal: AbortSignal.timeout(githubTimeoutMs()),
   });
   if (!response.ok) {
     throw new Error(`duty_officer_github_http_${response.status}`);
@@ -207,6 +227,15 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
     listStaleIssues: listStaleGithubIssues,
     postIssueComment: postGithubIssueComment,
     judge: judgeDutyOfficerItem,
+    securityDetector: () =>
+      runSecurityDetector({
+        fetchImpl: fetch,
+        readToken: githubToken,
+        writeTokenProvider: mintAppInstallationToken,
+        now: () => new Date(),
+        buildSha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
+      }),
+    now: () => new Date(),
   };
 }
 
@@ -375,6 +404,7 @@ export async function tickDutyOfficerClock(
 ): Promise<void> {
   if (inFlight) return;
   inFlight = true;
+  let detectorResult: SecurityDetectorResult | null = null;
   try {
     await deps.registerWorker({
       worker_id: DUTY_OFFICER_WORKER_ID,
@@ -408,6 +438,30 @@ export async function tickDutyOfficerClock(
       }
     }
 
+    // Fourth deterministic check: the zero-LLM security-scan detector. Wrapped
+    // in a race deadline so a hung GitHub read cannot hold inFlight and wedge the
+    // whole tick (W1). Runs BEFORE the nudge gate so it fires even when
+    // DUTY_OFFICER_GH_NUDGE is off. It never touches deps.judge (N6).
+    try {
+      const timedOut = Symbol('duty_officer_security_detector_timeout');
+      const raced = await Promise.race<SecurityDetectorResult | null | typeof timedOut>([
+        deps.securityDetector(),
+        new Promise<typeof timedOut>(resolve => {
+          const handle = setTimeout(() => {
+            resolve(timedOut);
+          }, securityDetectorTimeoutMs());
+          handle.unref?.();
+        }),
+      ]);
+      if (raced === timedOut) {
+        log.warn('duty_officer_security_detector_timeout');
+      } else {
+        detectorResult = raced;
+      }
+    } catch (error) {
+      log.error({ err: error }, 'duty_officer_security_detector_failed');
+    }
+
     if (!githubNudgeEnabled()) {
       log.info('duty_officer_github_nudge_skipped');
       return;
@@ -423,6 +477,38 @@ export async function tickDutyOfficerClock(
   } catch (error) {
     log.error({ err: error }, 'duty_officer_clock_tick_failed');
   } finally {
+    // Heartbeat via tick COMPLETION (W1 item 2 / C9): write started_at, build_sha,
+    // last_tick_completed_at and the detector summary into the worker row. This
+    // runs even when the inbox drain threw, so the completion field is honest.
+    try {
+      const securityCapabilities = detectorResult
+        ? {
+            security_detector: {
+              last_run_at: detectorResult.evaluated_at,
+              verdict: detectorResult.verdict,
+              reasons: detectorResult.reasons.map(reason => reason.code),
+              error_count: detectorResult.error_count,
+              last_error: detectorResult.last_error,
+            },
+          }
+        : {};
+      const completedAt = (deps.now?.() ?? new Date()).toISOString();
+      await deps.registerWorker({
+        worker_id: DUTY_OFFICER_WORKER_ID,
+        host: process.env.HOSTNAME ?? 'in-process',
+        capabilities: {
+          task_types: ['run_report', 'agent_message'],
+          principal: 'duty-officer',
+          started_at: CLOCK_STARTED_AT,
+          build_sha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
+          last_tick_completed_at: completedAt,
+          ...securityCapabilities,
+        },
+        max_concurrency: 1,
+      });
+    } catch (error) {
+      log.error({ err: error }, 'duty_officer_clock_completion_write_failed');
+    }
     inFlight = false;
   }
 }

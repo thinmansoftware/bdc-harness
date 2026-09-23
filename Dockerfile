@@ -1,6 +1,6 @@
 # =============================================================================
 # Archon - Remote Agentic Coding Platform
-# Multi-stage build: deps → web build → production image
+# Multi-stage build: deps -> web build -> production image
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -19,7 +19,7 @@ COPY packages/canary-suite/package.json ./packages/canary-suite/
 COPY packages/cli/package.json ./packages/cli/
 COPY packages/core/package.json ./packages/core/
 COPY packages/security-watchdog/package.json ./packages/security-watchdog/
-# docs-web source is NOT copied — it's a static site deployed separately
+# docs-web source is NOT copied -- it's a static site deployed separately
 # (see .github/workflows/deploy-docs.yml). package.json is included only
 # so Bun's workspace lockfile resolves correctly.
 COPY packages/docs-web/package.json ./packages/docs-web/
@@ -50,7 +50,7 @@ FROM deps AS web-build
 # Copy full source (needed for workspace resolution and web build)
 COPY . .
 
-# Build the web frontend — output goes to packages/web/dist/
+# Build the web frontend -- output goes to packages/web/dist/
 RUN bun run build:web && \
     test -f packages/web/dist/index.html || \
     (echo "ERROR: Web build produced no index.html" >&2 && exit 1)
@@ -68,6 +68,12 @@ LABEL org.opencontainers.image.licenses="MIT"
 # Prevent interactive prompts during installation
 ENV DEBIAN_FRONTEND=noninteractive
 ARG TERRAFORM_VERSION=1.8.5
+
+# Build SHA baked into the image so the running container can report which build
+# it is (W2 / C7 / C9). Supplied at build time via
+# --build-arg ARCHON_BUILD_SHA=$(git rev-parse --short HEAD); defaults to unknown.
+ARG ARCHON_BUILD_SHA=unknown
+ENV ARCHON_BUILD_SHA=${ARCHON_BUILD_SHA}
 
 WORKDIR /app
 
@@ -186,7 +192,7 @@ COPY packages/canary-suite/package.json ./packages/canary-suite/
 COPY packages/cli/package.json ./packages/cli/
 COPY packages/core/package.json ./packages/core/
 COPY packages/security-watchdog/package.json ./packages/security-watchdog/
-# docs-web source is NOT copied — it's a static site deployed separately
+# docs-web source is NOT copied -- it's a static site deployed separately
 # (see .github/workflows/deploy-docs.yml). package.json is included only
 # so Bun's workspace lockfile resolves correctly.
 COPY packages/docs-web/package.json ./packages/docs-web/

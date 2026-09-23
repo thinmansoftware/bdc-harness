@@ -118,6 +118,8 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
       body: item.body,
       failures: [],
     })),
+    securityDetector: mock(async () => null),
+    now: () => new Date(0),
   };
 }
 
@@ -128,6 +130,8 @@ afterEach(() => {
   delete process.env.DUTY_OFFICER_GH_REPO;
   delete process.env.GH_TOKEN;
   delete process.env.GITHUB_TOKEN;
+  delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS;
+  delete process.env.ARCHON_BUILD_SHA;
 });
 
 describe('duty officer clock', () => {
@@ -376,5 +380,98 @@ describe('duty officer clock', () => {
       expect.objectContaining({ id: 'pause-fail', worker_id: 'duty-officer-clock' })
     );
     expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  test('a never-resolving detector does not wedge the tick (W1)', async () => {
+    const queued = [message({ id: 'wedge' })];
+    const deps = fakeDeps(queued);
+    deps.securityDetector = mock(() => new Promise<never>(() => {}));
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS = '50';
+
+    const started = Date.now();
+    await tickDutyOfficerClock(deps);
+    const firstElapsed = Date.now() - started;
+    await tickDutyOfficerClock(deps);
+
+    expect(firstElapsed).toBeLessThan(1000);
+    // listMessages is called once per recipient (duty-officer, do) each tick, so
+    // two ticks means it ran on both -- the second tick did NOT return early.
+    const listCalls = (deps.listMessages as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .length;
+    expect(listCalls).toBeGreaterThanOrEqual(4);
+    // The run_report escalated on the first tick (inbox drain ran before the detector).
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledWith(
+      { kind: 'system', sender: 'dispatch' },
+      expect.objectContaining({ recipient: 'xo', idempotency_key: 'do-clock-escalation:wedge' })
+    );
+  });
+
+  test('the detector runs before the nudge gate and never touches the judge (N6)', async () => {
+    const queued = [
+      message({ id: 'agent', task_type: 'agent_message', body: JSON.stringify({ detail: 'x' }) }),
+    ];
+    const deps = fakeDeps(queued);
+    deps.securityDetector = mock(async () => null);
+    // Nudge disabled: no token, flag unset -> the nudge gate returns early.
+    delete process.env.DUTY_OFFICER_GH_NUDGE;
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.securityDetector).toHaveBeenCalledTimes(1);
+    // The one queued agent_message drives exactly one judge call; the detector adds none.
+    expect(deps.judge).toHaveBeenCalledTimes(1);
+    expect(deps.listStaleIssues).not.toHaveBeenCalled();
+  });
+
+  test('tick end writes completion fields into the worker capabilities (C9, N5)', async () => {
+    const fixedNow = new Date('2026-09-23T12:00:00.000Z');
+    process.env.ARCHON_BUILD_SHA = 'abc1234';
+
+    const deps = fakeDeps([message({ id: 'complete' })]);
+    deps.now = () => fixedNow;
+    deps.securityDetector = mock(async () => ({
+      verdict: 'clean' as const,
+      reasons: [],
+      evaluated_at: fixedNow.toISOString(),
+      marker_home: null,
+      wrote: [],
+      error_count: 0,
+      last_error: null,
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    const calls = (deps.registerWorker as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    expect(calls.length).toBe(2);
+    const lastCapabilities = (
+      calls[calls.length - 1][0] as { capabilities: Record<string, unknown> }
+    ).capabilities;
+    expect(lastCapabilities.task_types).toEqual(['run_report', 'agent_message']);
+    expect(lastCapabilities.principal).toBe('duty-officer');
+    expect(typeof lastCapabilities.started_at).toBe('string');
+    expect(lastCapabilities.build_sha).toBe('abc1234');
+    expect(lastCapabilities.last_tick_completed_at).toBe(fixedNow.toISOString());
+    expect((lastCapabilities.security_detector as { verdict: string }).verdict).toBe('clean');
+
+    // A tick whose inbox drain throws still writes last_tick_completed_at in finally.
+    const throwingNow = new Date('2026-09-23T13:00:00.000Z');
+    const throwing = fakeDeps([]);
+    throwing.now = () => throwingNow;
+    throwing.listMessages = mock(async () => {
+      throw new Error('inbox_drain_boom');
+    });
+
+    await tickDutyOfficerClock(throwing);
+
+    const throwingCalls = (throwing.registerWorker as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls;
+    expect(throwingCalls.length).toBe(2);
+    const throwingCapabilities = (
+      throwingCalls[throwingCalls.length - 1][0] as { capabilities: Record<string, unknown> }
+    ).capabilities;
+    expect(throwingCapabilities.last_tick_completed_at).toBe(throwingNow.toISOString());
   });
 });
