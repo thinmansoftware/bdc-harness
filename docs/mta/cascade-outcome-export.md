@@ -37,9 +37,12 @@ string that contains `T`.
 
 ## Database
 
-Read-only SELECT from `remote_agent_workflow_runs`. No join to
-`remote_agent_run_outcomes` (required JSONL fields do not need it). Archived
-and non-archived rows are both exported.
+Read-only SELECT from `remote_agent_workflow_runs` LEFT JOINed to
+`remote_agent_run_outcomes` on `run_id`
+(WO-HARNESS-RUN-OUTCOME-SCORECARD-01). The join supplies the honest scorecard
+columns that now DERIVE the `status` field (see "Honest status source" below).
+Runs with no scored outcome row yield null scorecard columns and map to
+`status: "failed"`. Archived and non-archived rows are both exported.
 
 Connection resolution is existing behavior only:
 
@@ -82,7 +85,7 @@ tokens above populate `prior_tier`.
 | `project` | string | yes | parsed from `user_message` |
 | `workflow_name` | string | no | `workflow_name` (this is the entry lane) |
 | `prior_tier` | string | yes | parsed from `user_message`; omit-as-null when absent |
-| `status` | string | no | `status` |
+| `status` | string | no | DERIVED from the scorecard (see "Honest status source") -- NEVER `runs.status` |
 | `node_counts` | object | yes | `metadata.node_counts` when present |
 | `models_served` | string[] | no | served models from `metadata.node_model_summary` only |
 | `model_mismatches` | number | no | count of mismatch flags in `node_model_summary` (0 if none) |
@@ -94,6 +97,69 @@ tokens above populate `prior_tier`.
 | `attribution_complete` | boolean | no | see known gap |
 
 Do not emit `class`, `tags`, or `entry_lane`. `workflow_name` already covers lane.
+
+## Honest status source (WO-HARNESS-RUN-OUTCOME-SCORECARD-01)
+
+`format_version` stays `1.0`. What changed is the SOURCE of the existing
+`status` field. It is NO LONGER a copy of `remote_agent_workflow_runs.status`
+(that column lies: `completed` does not mean the deliverable landed). It is now
+derived from the honest scorecard columns on `remote_agent_run_outcomes`:
+
+- `completed` iff `landing_ok = 1` (a landing node -- `commit-and-push` or
+  `open-pr-if-needed` -- actually completed)
+- `skipped` iff `landing_skipped = 1` and `landing_ok != 1` (build correctly
+  short-circuited as already-satisfied)
+- `cancelled` iff `terminal_event = workflow_cancelled` (and not completed/skipped)
+- `failed` otherwise (includes `runs.status = completed` with no landing and no
+  skip, and any run with no scored outcome row yet)
+
+MTA `cascade_reader` counts only `status in {completed, success, succeeded}` as
+success, so a `skipped` run is correctly NOT counted as a build success, and a
+lying `completed` run is now honestly `failed`.
+
+### Optional extra keys
+
+These OPTIONAL keys are appended to every row. MTA `cascade_reader` IGNORES
+unknown keys, so they do not affect the frozen `1.0` contract. All are null when
+the run has no scored outcome row.
+
+| Field | Type | Source |
+| --- | --- | --- |
+| `landing_ok` | number\|null | 1 iff a landing node `node_completed` exists |
+| `landing_skipped` | number\|null | 1 iff `landing_ok=0` and an already-satisfied skip signal exists |
+| `pipeline_axis` | string\|null | success\|skip\|spec\|build\|landing\|review\|deploy\|unknown |
+| `module_axis` | string\|null | loop\|tools\|observation\|context\|stop\|unknown\|none |
+| `last_failed_step` | string\|null | step_name of the latest `node_failed` |
+| `honest_success` | number\|null | 1 iff `landing_ok=1` or `landing_skipped=1` |
+| `score_partial` | number\|null | 1 when the score is incomplete (no terminal event, tie, no gh join, or non-feature-dev lane) |
+| `score_version` | string\|null | scorecard rubric version (`1.0`) |
+| `gh_pr_url` | string\|null | PR url from an optional `--gh` join (never flips landing/honest_success) |
+| `gh_join_complete` | number\|null | 1 iff a gh lookup ran or was not applicable |
+| `status_column` | string\|null | copy of `runs.status` at score time (contrast only) |
+
+The scorecard columns are written by the forward path (workflow terminal
+persist) and by `scripts/mta/backfill-run-scorecard.ts`. Neither the export nor
+the scorer ever writes `remote_agent_workflow_events` or
+`remote_agent_workflow_runs.status`.
+
+### Test gate (Stop 2)
+
+`bunfig.toml` sets `[test] root = "./packages"`. Bare args to `bun test` are
+filters inside that root, so `scripts/mta/__tests__/*.test.ts` are never
+discovered and bun still exits 0. Use explicit `./` paths (same pattern as
+`test:dispatch-migration-smoke`):
+
+```bash
+bun run test:run-scorecard
+```
+
+That is:
+
+```bash
+bun test ./packages/core/src/run-scorecard.test.ts ./scripts/mta/__tests__/export-cascade-outcomes.test.ts ./scripts/mta/__tests__/backfill-run-scorecard.test.ts
+```
+
+Expected: 30 pass / 0 fail / 3 files. Do not treat a 12/12 on 1 file as this gate.
 
 ## Known gap -- failure attribution
 
@@ -138,6 +204,20 @@ Never invent served models.
   "started_at": "2026-08-01T10:00:00.000Z",
   "completed_at": "2026-08-01T10:10:00.000Z",
   "duration_s": 600,
-  "attribution_complete": true
+  "attribution_complete": true,
+  "landing_ok": 1,
+  "landing_skipped": 0,
+  "pipeline_axis": "success",
+  "module_axis": "none",
+  "last_failed_step": null,
+  "honest_success": 1,
+  "score_partial": 1,
+  "score_version": "1.0",
+  "gh_pr_url": null,
+  "gh_join_complete": 0,
+  "status_column": "completed"
 }
 ```
+
+The `status` above is `completed` because `landing_ok = 1`, NOT because
+`status_column` (runs.status) was `completed`.

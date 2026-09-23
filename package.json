@@ -22,6 +22,7 @@
     "check:workflow-shadow-collision": "bun run scripts/check-workflow-shadow-collision.ts --check",
     "test": "bun --filter '*' --parallel test",
     "test:dispatch-migration-smoke": "bun test ./scripts/dispatch-worker/dispatch-migration-smoke.test.ts",
+    "test:run-scorecard": "bun test ./packages/core/src/run-scorecard.test.ts ./scripts/mta/__tests__/export-cascade-outcomes.test.ts ./scripts/mta/__tests__/backfill-run-scorecard.test.ts",
     "test:watch": "bun --filter @archon/server test:watch",
     "type-check": "bun --filter '*' type-check && bun x tsc --noEmit -p scripts/tsconfig.json",
     "lint": "bun x eslint . --cache",

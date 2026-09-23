@@ -132,6 +132,44 @@ import type {
   TerminalWorkflowPersistence,
 } from './reliability/types';
 import { withRunLease } from './run-lease';
+import { scoreRunFromEvents } from '@archon/core/run-scorecard';
+
+/**
+ * Forward-path honest scorecard write (WO-HARNESS-RUN-OUTCOME-SCORECARD-01).
+ *
+ * Called immediately AFTER a terminal persist succeeds (complete / fail /
+ * cancel), when the outcome row already exists. Reads the run's events (which
+ * now include the just-written terminal workflow_* event), scores them, and
+ * writes the scorecard columns. NEVER throws and NEVER calls GitHub
+ * (gh_join_complete = 0); a scoring failure must not break terminal
+ * persistence. Missing/partial events simply yield score_partial = 1.
+ */
+async function persistForwardScorecard(
+  deps: WorkflowDeps,
+  runId: string,
+  userMessage: string | null,
+  workflowName: string,
+  statusColumn: string
+): Promise<void> {
+  try {
+    const events = await deps.store.listWorkflowEvents(runId);
+    const scorecard = scoreRunFromEvents({
+      status: statusColumn,
+      userMessage,
+      workflowName,
+      events: events.map(event => ({
+        event_type: event.event_type,
+        step_name: event.step_name,
+        data: event.data,
+        created_at: event.created_at,
+      })),
+      // Forward path never calls GitHub: gh_join_complete = 0, score_partial = 1.
+    });
+    await deps.store.upsertRunScorecard(runId, scorecard, new Date().toISOString());
+  } catch (err) {
+    getLog().warn({ err: err as Error, workflowRunId: runId }, 'dag.run_scorecard_persist_failed');
+  }
+}
 
 function cancellationPersistence(
   runId: string,
@@ -167,6 +205,13 @@ async function persistCancellation(
     await deps.store.cancelWorkflowRun(
       workflowRun.id,
       cancellationPersistence(workflowRun.id, reason, nodeId)
+    );
+    await persistForwardScorecard(
+      deps,
+      workflowRun.id,
+      workflowRun.user_message,
+      workflowRun.workflow_name,
+      'cancelled'
     );
     return true;
   } catch (error) {
@@ -6530,6 +6575,13 @@ async function executeDagWorkflowInternal(
     }
     // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
     emitTerminalRunTokenTotals();
+    await persistForwardScorecard(
+      deps,
+      workflowRun.id,
+      workflowRun.user_message,
+      workflowRun.workflow_name,
+      'failed'
+    );
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
       getLog().error(
         { err: logErr, workflowRunId: workflowRun.id },
@@ -6608,6 +6660,13 @@ async function executeDagWorkflowInternal(
         await handleTerminalPersistenceFailure('completed', degradedOutcome, dbErr as Error);
         return;
       }
+      await persistForwardScorecard(
+        deps,
+        workflowRun.id,
+        workflowRun.user_message,
+        workflowRun.workflow_name,
+        'completed'
+      );
       await logWorkflowComplete(logDir, workflowRun.id).catch((logErr: Error) => {
         getLog().error(
           { err: logErr, workflowRunId: workflowRun.id },
@@ -6659,6 +6718,13 @@ async function executeDagWorkflowInternal(
     }
     // Terminal state reached: emit 'run_token_totals' rollup event (see token-rollup.ts).
     emitTerminalRunTokenTotals();
+    await persistForwardScorecard(
+      deps,
+      workflowRun.id,
+      workflowRun.user_message,
+      workflowRun.workflow_name,
+      'failed'
+    );
     await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
       getLog().error(
         { err: logErr, workflowRunId: workflowRun.id },
@@ -6722,6 +6788,13 @@ async function executeDagWorkflowInternal(
     await handleTerminalPersistenceFailure('completed', completedOutcome, dbErr as Error);
     return;
   }
+  await persistForwardScorecard(
+    deps,
+    workflowRun.id,
+    workflowRun.user_message,
+    workflowRun.workflow_name,
+    'completed'
+  );
   await logWorkflowComplete(logDir, workflowRun.id);
   const emitter = getWorkflowEventEmitter();
   emitter.emit({

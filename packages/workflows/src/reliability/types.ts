@@ -292,6 +292,46 @@ export interface TerminalWorkflowPersistence {
   readonly metadata?: Readonly<Record<string, unknown>>;
 }
 
+/**
+ * Honest run-outcome scorecard (WO-HARNESS-RUN-OUTCOME-SCORECARD-01).
+ *
+ * A durable per-run score derived from the run's events -- NOT from
+ * remote_agent_workflow_runs.status (that column lies: 'completed' does not
+ * mean the deliverable landed). Persisted as extra columns on the SAME
+ * remote_agent_run_outcomes row (never a second table). All axis/flag fields
+ * are computed by scoreRunFromEvents in @archon/core/run-scorecard.
+ *
+ * Flag ints are 0 | 1 (or null only for gh/landing on unscored rows -- the
+ * scorer always emits 0/1). score_version pins the rubric contract.
+ */
+export type PipelineAxis =
+  | 'success'
+  | 'skip'
+  | 'spec'
+  | 'build'
+  | 'landing'
+  | 'review'
+  | 'deploy'
+  | 'unknown';
+
+export type ModuleAxis = 'loop' | 'tools' | 'observation' | 'context' | 'stop' | 'unknown' | 'none';
+
+export interface RunScorecard {
+  readonly scoreVersion: string;
+  readonly statusColumn: string;
+  readonly terminalEvent: string;
+  readonly landingOk: 0 | 1;
+  readonly landingSkipped: 0 | 1;
+  readonly lastFailedStep: string | null;
+  readonly pipelineAxis: PipelineAxis;
+  readonly moduleAxis: ModuleAxis;
+  readonly honestSuccess: 0 | 1;
+  readonly scorePartial: 0 | 1;
+  readonly ghPrUrl: string | null;
+  readonly ghJoinComplete: 0 | 1;
+  readonly woId: string | null;
+}
+
 export type RunOutcomeProjection =
   | 'pending'
   | 'running'

@@ -12,6 +12,7 @@ import type {
   RunAuthorityRecord,
   RunLeaseRecord,
   RunOutcome,
+  RunScorecard,
   ScheduledProviderWaitRecord,
   SupervisorActionRecord,
   SupervisorIncidentRecord,
@@ -180,6 +181,13 @@ export interface IWorkflowStore {
   listProviderAttempts(runId: string, nodeId?: string): Promise<ProviderAttemptRecord[]>;
   upsertRunOutcome(runId: string, outcome: RunOutcome, updatedAt: string): Promise<boolean>;
   getRunOutcome(runId: string): Promise<RunOutcome | null>;
+  /**
+   * Persist the honest run-outcome scorecard onto the existing outcome row
+   * (WO-HARNESS-RUN-OUTCOME-SCORECARD-01). UPDATE-only: returns false when no
+   * outcome row exists for the run (never creates one, never touches legacy
+   * outcome columns or workflow status).
+   */
+  upsertRunScorecard(runId: string, scorecard: RunScorecard, scoredAt: string): Promise<boolean>;
   scheduleProviderWait(wait: ScheduledProviderWaitRecord): Promise<boolean>;
   listDueProviderWaits(dueAt: string, limit: number): Promise<ScheduledProviderWaitRecord[]>;
   claimProviderWait(data: {
