@@ -33,6 +33,15 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  if printf '%s\n' "$haystack" | grep -Fq "$needle"; then
+    FAIL=$((FAIL + 1)); echo "FAIL: $label"; echo "  unexpected: $needle"; echo "  haystack:   $haystack"
+  else
+    PASS=$((PASS + 1)); echo "PASS: $label"
+  fi
+}
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
@@ -81,6 +90,11 @@ done
 echo "--- Parity: mec core byte-identical across all 12 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$MEC_CORE" "$(extract_core "$DEFAULTS/$lane" mec)"
+done
+
+echo "--- Parity: sme core byte-identical across all 12 lanes ---"
+for lane in $LANES; do
+  assert_eq "sme parity $lane" "$SME_CORE" "$(extract_core "$DEFAULTS/$lane" sme)"
 done
 
 echo "--- Parity: evidence call sites byte-identical across all 12 lanes ---"
@@ -141,11 +155,11 @@ assert_eq "INFRA OK" "0|OK|" "$R"
 R="$(run_check "$NA_TESTS" PROCEED DOCUMENTATION not_required 0 none_declared)"
 assert_eq "DOCUMENTATION OK" "0|OK|" "$R"
 
-echo "--- Test 6: declared greps but Grep assertions: N/A -> SPEC_DEFECT (any class) ---"
+echo "--- Test 6: declared allowlist-dropped greps -> HARNESS_REFUSED (any class) ---"
 R="$(run_check "$NA_GREPS" PROCEED CODE passed 9 all_dropped 0 0 9 0 0 'DROPPED (not on read-only allowlist; not executed): grep -c x f')"
 assert_eq "rc 1" "1" "${R%%|*}"
 assert_contains "error names the declared count" "9 grep stop condition(s) were declared but none executed" "$R"
-assert_contains "all_dropped attributed to spec" "SPEC_DEFECT:" "$R"
+assert_contains "all_dropped attributed to harness" "HARNESS_REFUSED:" "$R"
 R="$(run_check "$NA_GREPS" PROCEED INFRA not_required 2 all_dropped 0 0 2)"
 assert_eq "INFRA with declared greps and N/A also rc 1" "1" "${R%%|*}"
 
@@ -193,14 +207,22 @@ R="$(run_check "$GOOD" PROCEED CODE passed 3 incomplete 0 2 0 1 0)"
 assert_eq "FP-4 partial greps admitted" "0|OK|" "$R"
 STAMPED="$(printf '%s\n' "$GOOD" | sme_process '27/27 (cmd)' passed "$PARTIAL_LINE" incomplete 0)"
 assert_contains "FP-4 unparsed names stamped" "unparsed=prose condition one; dropped=0" "$STAMPED"
+assert_contains "FP-4 incomplete stamps validation pass" "VALIDATION: PASS" "$STAMPED"
+assert_not_contains "FP-4 incomplete does not stamp validation fail" "VALIDATION: FAIL" "$STAMPED"
 
 echo "--- Test FP-5: zero executed greps are SPEC_DEFECT and named ---"
 R="$(run_check "$NA_GREPS" PROCEED CODE passed 3 all_dropped 0 0 0 3 0 'UNVERIFIED (unparsed): prose one; prose two; prose three')"
 assert_eq "FP-5 unparsed all_dropped rc" "1" "${R%%|*}"
 assert_contains "FP-5 SPEC_DEFECT prefix" "SPEC_DEFECT:" "$R"
+assert_not_contains "FP-5 unparsed is not HARNESS_REFUSED" "HARNESS_REFUSED:" "$R"
 assert_contains "FP-5 names unparsed conditions" "prose one" "$R"
 R="$(run_check "$NA_GREPS" PROCEED CODE passed 1 all_dropped 0 0 1 0 0 'DROPPED (not on read-only allowlist; not executed): rm unsafe')"
+assert_eq "FP-5 allowlist all_dropped rc" "1" "${R%%|*}"
+assert_contains "FP-5 allowlist HARNESS_REFUSED prefix" "HARNESS_REFUSED:" "$R"
+assert_not_contains "FP-5 allowlist is not SPEC_DEFECT" "SPEC_DEFECT:" "$R"
 assert_contains "FP-5 allowlist reason named" "not on read-only allowlist; not executed" "$R"
+ALL_DROPPED_STAMPED="$(printf '%s\n' "$GOOD" | sme_process '27/27 (cmd)' passed 'N/A (1 declared grep stop condition(s) but none executable under the read-only allowlist)' all_dropped 1)"
+assert_contains "FP-5 all_dropped stamps validation fail" "VALIDATION: FAIL" "$ALL_DROPPED_STAMPED"
 
 echo "--- Test FP-6: mismatch remains EVIDENCE_ERROR ---"
 R="$(run_check "$GOOD" PROCEED CODE passed 2 mismatch 0 2 0 0 1)"

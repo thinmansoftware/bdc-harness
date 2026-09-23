@@ -3833,7 +3833,7 @@ nodes:
         [ -n "$grep_line" ] || grep_line="MISSING (run-stop-greps produced no output)"
         [ -n "$grep_status" ] || grep_status="missing"
         verdict="keep"
-        if [ "$tests_status" = "failed" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "incomplete" ] || [ "$grep_status" = "missing" ]; then
+        if [ "$tests_status" = "failed" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "missing" ] || [ "$grep_status" = "all_dropped" ]; then
           verdict="fail"
         fi
         if [ "$grep_status" = "incomplete" ]; then
@@ -3939,7 +3939,11 @@ nodes:
               return 1
               ;;
             all_dropped)
-              echo "SPEC_DEFECT: ${grep_declared} grep stop condition(s) were declared but none executed (grep_executed=${grep_executed:-0}, grep_dropped=${grep_dropped:-0}, grep_unparsed=${grep_unparsed:-0}). Conditions: ${grep_line}${grep_detail:+; $grep_detail}" >&2
+              if [ "${grep_unparsed:-0}" -gt 0 ] 2>/dev/null; then
+                echo "SPEC_DEFECT: ${grep_declared} grep stop condition(s) were declared but none executed (grep_executed=${grep_executed:-0}, grep_dropped=${grep_dropped:-0}, grep_unparsed=${grep_unparsed:-0}). Conditions: ${grep_line}${grep_detail:+; $grep_detail}" >&2
+              else
+                echo "HARNESS_REFUSED: ${grep_declared} grep stop condition(s) were declared but none executed (grep_executed=${grep_executed:-0}, grep_dropped=${grep_dropped:-0}, grep_unparsed=${grep_unparsed:-0}). Conditions: ${grep_line}${grep_detail:+; $grep_detail}" >&2
+              fi
               return 1
               ;;
             *)
