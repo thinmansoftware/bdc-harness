@@ -542,12 +542,12 @@ nodes:
             codebaseName: st.repo,
             canonicalRepoPath: st.canonicalRepoPath,
             targetBranch: st.target_branch,
-            baseSha: result.baseSha,
           });
           out.push({
             stageId: result.stageId,
             branchName: result.branchName,
             worktreePath: result.worktreePath,
+            baseSha: result.baseSha,
             codebaseId: result.codebaseId,
             canonicalRepoPath: st.canonicalRepoPath,
             repo: st.repo,
