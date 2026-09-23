@@ -51,6 +51,7 @@ import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { parseDeclaredBaseBranch } from '@archon/workflows/reliability/run-authority';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import type { ModelOverride } from '@archon/workflows/model-override';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createWorkflowDeps } from '../workflows/store-adapter';
@@ -250,6 +251,7 @@ export interface WorkflowRoutingContext {
    * Hints for isolation environment (PR review context, etc.)
    */
   readonly isolationHints?: IsolationHints;
+  readonly modelOverride?: ModelOverride;
 }
 
 const execFileAsync = promisify(execFile);
@@ -461,7 +463,10 @@ export async function dispatchBackgroundWorkflow(
       codebase_id: ctx.codebaseId,
       user_message: effectiveUserMessage,
       working_path: workerCwd,
-      metadata: ctx.issueContext ? { github_context: ctx.issueContext } : {},
+      metadata: {
+        ...(ctx.issueContext ? { github_context: ctx.issueContext } : {}),
+        ...(ctx.modelOverride ? { model_override: ctx.modelOverride } : {}),
+      },
       parent_conversation_id: ctx.conversationDbId,
     });
   } catch (error) {
@@ -487,7 +492,8 @@ export async function dispatchBackgroundWorkflow(
           isolationContext,
           ctx.conversationDbId,
           preCreatedRun,
-          authoritySource
+          authoritySource,
+          ctx.modelOverride
         );
         // Surface workflow output to parent conversation as a result card
         if ('paused' in result) {

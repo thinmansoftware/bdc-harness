@@ -365,6 +365,23 @@ export const runWorkflowBodySchema = z
     conversationId: z.string(),
     message: z.string(),
     conductor: conductorDispatchSchema.optional(),
+    modelOverride: z
+      .object({
+        workflow: z
+          .object({ provider: z.string().min(1).optional(), model: z.string().min(1) })
+          .optional(),
+        nodes: z
+          .record(
+            z.string(),
+            z.object({ provider: z.string().min(1).optional(), model: z.string().min(1) })
+          )
+          .optional(),
+      })
+      .optional(),
+  })
+  .refine(body => !(body.modelOverride && body.conductor), {
+    message: 'model_override_conductor_conflict',
+    path: ['modelOverride'],
   })
   .openapi('RunWorkflowBody');
 
