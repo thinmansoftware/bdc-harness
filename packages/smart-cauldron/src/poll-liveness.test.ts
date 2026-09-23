@@ -301,6 +301,75 @@ describe('pollForTerminal liveness', () => {
     expect(Date.now() - started).toBeGreaterThan(1_200_000);
   });
 
+  test("an open node's configured timeout (from the workflow) is honored above the 60m default", async () => {
+    installFakeTimers();
+    const started = Date.now();
+    // The 'implement' node is configured with a 90-minute timeout in its workflow
+    // definition. It stays open and SILENT for ~75 minutes -- past BOTH the
+    // 20-minute stall budget AND the 60-minute open-node default -- then
+    // completes. Under the fixed-60m code this healthy long node was cut at 60m
+    // (Scope IN item 2: use the node's own configured timeout when available).
+    const openEvent = eventAt(started, 'node_started'); // step_name === 'implement'
+    let ticks = 0;
+    globalThis.fetch = (async () => {
+      ticks += 1;
+      const terminal = ticks > 150; // 150 * 30s = 75 minutes of silence
+      return new Response(
+        JSON.stringify({
+          run: { id: 'r1', status: terminal ? 'completed' : 'running', metadata: {} },
+          events: terminal ? [openEvent, eventAt(Date.now(), 'node_completed')] : [openEvent],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }) as typeof fetch;
+
+    const result = await pollForTerminal({
+      runId: 'r1',
+      apiBaseUrl: 'http://x',
+      token: 't',
+      stallTimeoutMs: 1_200_000,
+      openNodeBudgetMs: 3_600_000, // 60m default that would have cut it
+      nodeTimeoutsMs: { implement: 5_400_000 }, // 90m configured -- must win
+      intervalMs: 30_000,
+    });
+
+    expect(result.terminalStatus).toBe('completed');
+    // Survived silence past the 60-minute default because the configured 90m won.
+    expect(Date.now() - started).toBeGreaterThan(3_600_000);
+  });
+
+  test('a configured timeout shorter than the 60m default governs: node is cut before 60m', async () => {
+    installFakeTimers();
+    const started = Date.now();
+    // The 'implement' node is configured with a 10-minute timeout -- shorter than
+    // the 60-minute open-node default but above the 2-minute stall floor. A silent
+    // open node must be cut at ~10 minutes, not made to wait the full 60m default
+    // (the configured timeout governs, it does not merely extend to the default).
+    const openEvent = eventAt(started, 'node_started'); // step_name === 'implement'
+    serveRun(() => [openEvent]);
+
+    let message = '';
+    try {
+      await pollForTerminal({
+        runId: 'r1',
+        apiBaseUrl: 'http://x',
+        token: 't',
+        stallTimeoutMs: 120_000, // 2m stall floor
+        openNodeBudgetMs: 3_600_000, // 60m default that must NOT govern here
+        nodeTimeoutsMs: { implement: 600_000 }, // 10m configured -- governs
+        timeoutMs: 7_200_000,
+        intervalMs: 30_000,
+      });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+
+    expect(message).toContain('stalled');
+    // Cut at the 10-minute configured budget, well before the 60-minute default.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(600_000);
+    expect(Date.now() - started).toBeLessThan(3_600_000);
+  });
+
   test('truly silent after a node completed for longer than the budget: stalled', async () => {
     installFakeTimers();
     const t0 = Date.now();
