@@ -1893,9 +1893,6 @@ nodes:
           fi
           out="${out:+$out; }$cmd => $obs"
         done
-        if [ "$unparsed" -gt 0 ]; then
-          detail="${detail}UNPARSED (no parseable expectation; not executed): ${unparsed_names:-$unparsed unnamed assertion(s)}"$'\n'
-        fi
         if [ "$declared" -eq 0 ]; then
           status="none_declared"; out="N/A (spec declares no grep stop conditions)"
         elif [ "$executed" -eq 0 ]; then
@@ -3921,8 +3918,16 @@ nodes:
               return 1
               ;;
             all_dropped)
-              msg="SPEC_DEFECT: ${grep_declared} grep stop condition(s) were declared but none were executable (grep_executed=${grep_executed:-0}): each was prose the parser could not read, refused by the read-only allowlist, or errored. Rule 4 requires a stop condition to be a runnable command; validate-wo-spec.sh check 7 should catch this at authoring. Attribute this to the spec's stop-condition shape, not the builder (bdc-xo #1940)."
+              msg="SPEC_DEFECT: ${grep_declared} grep stop condition(s) were declared but none were executable (grep_executed=${grep_executed:-0}; unparsed=${grep_unparsed:-0}, dropped=${grep_dropped:-0}): each was prose the parser could not read, refused by the read-only allowlist, or errored. Rule 4 requires a stop condition to be a runnable command; validate-wo-spec.sh check 7 should catch this at authoring. Attribute this to the spec's stop-condition shape, not the builder (bdc-xo #1940)."
+              # run-stop-greps only builds a per-assertion detail line for a condition it
+              # turned into an assertion row (DROPPED/MISMATCH). A condition with no
+              # parseable expectation never becomes a row, so its text is absent from the
+              # GREP_* values this node consumes (run-stop-greps is Scope OUT: values only,
+              # never modified). Report the unparsed count and where to look rather than
+              # implying the names were withheld
+              # (WO-HARNESS-MANIFEST-EVIDENCE-FALSE-POSITIVES-01).
               [ -n "$grep_detail" ] && msg="${msg}"$'\n'"${grep_detail}"
+              [ "${grep_unparsed:-0}" -gt 0 ] 2>/dev/null && msg="${msg}"$'\n'"NOTE: ${grep_unparsed} of the ${grep_declared} declared condition(s) had no parseable expectation and therefore have no per-assertion detail line above; re-read the spec's stop-condition block to identify them."
               printf '%s\n' "$msg" >&2
               return 1
               ;;
@@ -3954,7 +3959,7 @@ nodes:
       $stamp-manifest-evidence.output
       BDC_NODE_OUTPUT_MANIFEST
       )
-      GREP_DETAIL=$(printf '%s\n' "$GREPS_OUT" | sed -n '/--- per-assertion detail ---/,$p' | grep -E '^(DROPPED|MISMATCH|UNPARSED)' || true)
+      GREP_DETAIL=$(printf '%s\n' "$GREPS_OUT" | sed -n '/--- per-assertion detail ---/,$p' | grep -E '^(DROPPED|MISMATCH)' || true)
       printf '%s\n' "$MANIFEST_OUT" | mec_check "$STATUS" \
         "$(mec_field TESTS_CLASS "$TESTS_OUT")" "$(mec_field TESTS_STATUS "$TESTS_OUT")" \
         "$(mec_field TESTS_EXIT "$TESTS_OUT")" \

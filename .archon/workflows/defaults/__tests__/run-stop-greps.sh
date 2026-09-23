@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run-stop-greps.sh -- unit tests for the run-stop-greps node core (rsg_*) in
 # .archon/workflows/defaults/bdc-feature-development-codex.yaml and its byte-identical
-# mirrors in the other 11 bdc-feature-development lanes.
+# mirrors in the other 10 bdc-feature-development lanes.
 #
 # bdc-xo #1940: the manifest "Grep assertions:" line was stamped "N/A (no declared
 # mechanical assertions)" for every WO, including specs that declared grep stop
@@ -9,7 +9,7 @@
 # it under the read-only allowlist, and emits OBSERVED counts.
 #
 # Cores are EXTRACTED from the canonical YAML (never re-typed). A parity test asserts
-# the core is byte-identical across all 12 lanes.
+# the core is byte-identical across all 11 lanes.
 #
 # Run: bash .archon/workflows/defaults/__tests__/run-stop-greps.sh
 # Exits 0 on all-pass, 1 on any failure. ASCII only.
@@ -43,7 +43,6 @@ CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
-bdc-feature-development-cursor.yaml
 bdc-feature-development-fable.yaml
 bdc-feature-development-fusion-cx-kimi.yaml
 bdc-feature-development-fusion-cx-qwen.yaml
@@ -72,7 +71,7 @@ for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: rsg core byte-identical across all 12 lanes ---"
+echo "--- Parity: rsg core byte-identical across all 11 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$RSG_CORE" "$(extract_core "$DEFAULTS/$lane" rsg)"
 done
@@ -166,7 +165,6 @@ assert_contains "manifest line names the dropped assertion" 'UNVERIFIED (dropped
 assert_contains "manifest line names the unparsed assertion" 'UNVERIFIED (unparsed): grep -c gamma fixture.txt' "$OUT"
 assert_contains "GREP_LINE carries observed counts in manifest v2 form" 'GREP_LINE=grep -c alpha fixture.txt => 2; grep -c beta fixture.txt => 2; grep -n delta fixture.txt => 0' "$OUT"
 assert_contains "dropped assertion is named in detail" 'DROPPED (not on read-only allowlist; not executed): grep -rciE password src 2>/dev/null | awk' "$OUT"
-assert_contains "unparsed assertion is named in per-assertion detail" 'UNPARSED (no parseable expectation; not executed): grep -c gamma fixture.txt' "$OUT"
 
 OUT="$(printf 'grep -c alpha fixture.txt\teq\t2\nUNPARSED\t0\nDECLARED\t2\n' | rsg_run)"
 assert_contains "executed below declared with no unparsed is incomplete" "GREP_STATUS=incomplete" "$OUT"
@@ -189,16 +187,6 @@ assert_contains "none declared -> N/A line" "GREP_LINE=N/A (spec declares no gre
 OUT="$(printf 'Stop 1 (grep assertion):\n  grep a b | awk "{print}"\n  Expected: 1\n' | rsg_extract | rsg_run)"
 assert_contains "all dropped -> all_dropped" "GREP_STATUS=all_dropped" "$OUT"
 assert_contains "all dropped -> N/A line names the count" "GREP_LINE=N/A (1 declared grep stop condition(s) but none executable under the read-only allowlist)" "$OUT"
-
-# All-UNPARSED (header with no Expected line) is also all_dropped (0 executed), but its
-# name lives in unparsed_names, not a DROPPED detail line. rsg_run must still carry it
-# into the per-assertion detail so manifest-evidence-check can name it in its SPEC_DEFECT
-# message (WO-HARNESS-MANIFEST-EVIDENCE-FALSE-POSITIVES-01).
-OUT="$(printf 'Stop 1 (grep assertion, no Expected):\n  grep -c widgetFactory src/app.js\n' | rsg_extract | rsg_run)"
-assert_contains "all unparsed -> all_dropped" "GREP_STATUS=all_dropped" "$OUT"
-assert_contains "all unparsed -> executed 0" "GREP_EXECUTED=0" "$OUT"
-assert_contains "all unparsed -> unparsed 1" "GREP_UNPARSED=1" "$OUT"
-assert_contains "all unparsed names the condition in per-assertion detail" 'UNPARSED (no parseable expectation; not executed): grep -c widgetFactory src/app.js' "$OUT"
 
 OUT="$(printf 'Stop 1 (grep assertion):\n  LC_ALL=C grep -c alpha fixture.txt\n  Expected: 1\n' | rsg_extract | rsg_run)"
 assert_contains "LC_ALL prefix passes the gate and executes" "GREP_EXECUTED=1" "$OUT"

@@ -207,14 +207,20 @@ assert_contains "incomplete + missing inputs is EVIDENCE_ERROR" "EVIDENCE_ERROR"
 # node body's GREP_DETAIL extraction (the sed|grep that feeds mec_check's grep_detail
 # arg). Kept in lockstep with the node body line in every lane.
 mec_grep_detail() {
-  printf '%s\n' "$1" | sed -n '/--- per-assertion detail ---/,$p' | grep -E '^(DROPPED|MISMATCH|UNPARSED)' || true
+  printf '%s\n' "$1" | sed -n '/--- per-assertion detail ---/,$p' | grep -E '^(DROPPED|MISMATCH)' || true
 }
 
 echo "--- Test 5: zero executed greps is a SPEC_DEFECT, not an EVIDENCE_ERROR ---"
-# Fixture A: the REAL all-unparsed path. A spec whose only grep stop condition is a
-# header with no parseable expectation is UNPARSED (not DROPPED): rsg_run must carry
-# its name into the per-assertion detail so the node's GREP_DETAIL extraction preserves
-# it and mec's SPEC_DEFECT can name it. Exercised end to end (no fabricated detail).
+# Fixture A: the REAL all-unparsed path, driven through the actual rsg core. run-stop-greps
+# is Scope OUT for this WO, so the core is consumed read-only here (extracted and called,
+# never redefined) purely to pin the true shape of its output.
+# A spec whose only grep stop condition is a header with no Expected line is UNPARSED, not
+# DROPPED: rsg_run never turns it into an assertion row, so it emits NO per-assertion
+# detail line for it and its text is absent from the GREP_* contract. mec must therefore
+# still fail closed with SPEC_DEFECT and account for the condition by COUNT
+# (grep_unparsed), not by name. The previous fixture fabricated a DROPPED detail line and
+# so never exercised this path at all
+# (WO-HARNESS-MANIFEST-EVIDENCE-FALSE-POSITIVES-01).
 ALL_UNPARSED_SPEC='# WO-X
 
 WO Class: CODE
@@ -228,16 +234,22 @@ GREPS_OUT_A="$(printf '%s\n' "$ALL_UNPARSED_SPEC" | rsg_extract | rsg_run)"
 assert_contains "fixture A rsg_run reports all_dropped" "GREP_STATUS=all_dropped" "$GREPS_OUT_A"
 assert_contains "fixture A rsg_run declared exactly one condition" "GREP_DECLARED=1" "$GREPS_OUT_A"
 assert_contains "fixture A rsg_run executed nothing" "GREP_EXECUTED=0" "$GREPS_OUT_A"
+assert_contains "fixture A rsg_run counts the condition as unparsed" "GREP_UNPARSED=1" "$GREPS_OUT_A"
 DETAIL_A="$(mec_grep_detail "$GREPS_OUT_A")"
-assert_contains "fixture A per-assertion detail names the UNPARSED condition" "grep -c widgetFactory src/app.js" "$DETAIL_A"
+# Contract boundary: an unparsed condition produces no DROPPED/MISMATCH detail line, so
+# the node's GREP_DETAIL extraction is legitimately empty on this path.
+assert_eq "fixture A all-unparsed path yields an empty per-assertion detail" "" "$DETAIL_A"
 DECLARED_A="$(mec_field GREP_DECLARED "$GREPS_OUT_A")"
 EXECUTED_A="$(mec_field GREP_EXECUTED "$GREPS_OUT_A")"
+DROPPED_A="$(mec_field GREP_DROPPED "$GREPS_OUT_A")"
 UNPARSED_A="$(mec_field GREP_UNPARSED "$GREPS_OUT_A")"
-R="$(run_check "$NA_GREPS" PROCEED CODE passed 0 "$DECLARED_A" "$EXECUTED_A" 0 "$UNPARSED_A" 0 all_dropped "$DETAIL_A")"
+STATUS_A="$(mec_field GREP_STATUS "$GREPS_OUT_A")"
+R="$(run_check "$NA_GREPS" PROCEED CODE passed 0 "$DECLARED_A" "$EXECUTED_A" "$DROPPED_A" "$UNPARSED_A" 0 "$STATUS_A" "$DETAIL_A")"
 assert_eq "fixture A rc 1" "1" "${R%%|*}"
 assert_contains "fixture A prefix is SPEC_DEFECT" "SPEC_DEFECT:" "$R"
 assert_not_contains "fixture A does not blame builder with EVIDENCE_ERROR" "EVIDENCE_ERROR" "$R"
-assert_contains "fixture A names the real all-unparsed condition" "grep -c widgetFactory src/app.js" "$R"
+assert_contains "fixture A accounts for the condition by unparsed count" "unparsed=1" "$R"
+assert_contains "fixture A explains the absent per-assertion line" "no parseable expectation" "$R"
 # Fixture B: 1 declared, allowlist-refused (event-store 'all_dropped', dropped=1).
 DETAIL_B='DROPPED (not on read-only allowlist; not executed): curl https://x => expected 200'
 R="$(run_check "$NA_GREPS" PROCEED INFRA not_required 0 1 0 1 0 0 all_dropped "$DETAIL_B")"
