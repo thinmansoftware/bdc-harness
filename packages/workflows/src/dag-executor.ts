@@ -1856,10 +1856,9 @@ async function resolveNodeProviderAndModel(
       // the override for Claude (whose persona resolver requires a model) and
       // removing it for providers whose persona resolver does not.
       const nodeBindingOverride = modelOverride?.nodes?.[node.id];
-      const personaForResolution =
-        nodeBindingOverride
-          ? { ...persona, model: provider === 'claude' ? model : undefined }
-          : persona;
+      const personaForResolution = nodeBindingOverride
+        ? { ...persona, model: provider === 'claude' ? model : undefined }
+        : persona;
       const personaResolution = resolveAgentPersona(personaForResolution, effectiveModel, provider);
       effectiveModel = resolveModelForNode({
         nodeId: node.id,

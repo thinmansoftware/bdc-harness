@@ -11267,11 +11267,7 @@ describe('agent persona dispatch', () => {
     }
   });
 
-  async function writeAgentFile(
-    name: string,
-    model?: string,
-    tools?: string[]
-  ): Promise<void> {
+  async function writeAgentFile(name: string, model?: string, tools?: string[]): Promise<void> {
     const toolsLine = tools ? `tools: [${tools.join(', ')}]` : '';
     const modelLine = model ? `model: ${model}` : '';
     const content = `---\nname: ${name}\n${modelLine}\n${toolsLine}\n---\n\nYou are the ${name} agent.\n`;
