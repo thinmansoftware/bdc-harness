@@ -310,7 +310,7 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('Plain prompt with no loop variable.');
   });
-// --- WO-MATRIX-M1-MINIMAX-01 (WO-HARNESS-BASE-BRANCH-SUBSTITUTION-BOUNDARY-01) ---
+  // --- WO-MATRIX-M1-MINIMAX-01 (WO-HARNESS-BASE-BRANCH-SUBSTITUTION-BOUNDARY-01) ---
   // Workflow variables must match only as whole identifiers, so a longer shell
   // variable that begins with a workflow variable name (e.g. $BASE_BRANCH_OVERRIDE,
   // $BASE_BRANCH_PR) is left verbatim for the bash node. bdc-harness#877.
@@ -405,6 +405,46 @@ describe('substituteWorkflowVariables', () => {
         'docs/'
       )
     ).toThrow();
+  });
+
+  // Test 5: every bounded $NAME variable also substitutes when followed by a
+  // non-identifier character (mirrors the mechanism Test 2 proves for
+  // $BASE_BRANCH). Closes the "Test 3 only covered word-suffix" coverage gap
+  // framed in Test 3's own Given clause.
+  it('substitutes every bounded $NAME variable when followed by a non-identifier char (parametrized)', () => {
+    const cases = [
+      { name: 'WORKFLOW_ID', value: 'WF1', pos: 1 },
+      { name: 'USER_MESSAGE', value: 'UMSG', pos: 2 },
+      { name: 'ARGUMENTS', value: 'UMSG', pos: 2 },
+      { name: 'ARTIFACTS_DIR', value: '/art', pos: 3 },
+      { name: 'DOCS_DIR', value: 'ds', pos: 5 },
+      { name: 'LOOP_USER_INPUT', value: 'LUI', pos: 7 },
+      { name: 'REJECTION_REASON', value: 'RR', pos: 8 },
+      { name: 'LOOP_PREV_OUTPUT', value: 'LPO', pos: 9 },
+    ];
+    for (const c of cases) {
+      const name = c.name;
+      const value = c.value;
+      // Build the prompt template to test ONLY this variable's non-word-
+      // boundary behavior, then assert each substitution.
+      const promptTemplate =
+        'slash=$' + name + '/x dot=$' + name + '. paren=$' + name + ') suffix=$' + name + '_SUFFIX';
+      const expected =
+        'slash=' + value + '/x dot=' + value + '. paren=' + value + ') suffix=$' + name + '_SUFFIX';
+      const { prompt } = substituteWorkflowVariables(
+        promptTemplate,
+        'WF1', // 1 workflowId
+        'UMSG', // 2 userMessage
+        '/art', // 3 artifactsDir
+        'dev', // 4 baseBranch
+        'ds', // 5 docsDir
+        undefined, // 6 issueContext
+        'LUI', // 7 loopUserInput
+        'RR', // 8 rejectionReason
+        'LPO' // 9 loopPrevOutput
+      );
+      expect(prompt).toBe(expected);
+    }
   });
 });
 
