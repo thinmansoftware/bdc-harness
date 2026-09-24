@@ -815,15 +815,13 @@ describe('POST /api/workflows/:name/run', () => {
       throw new CauldronDrainingError();
     });
     mockGetCauldronDrainState.mockReset();
-    mockGetCauldronDrainState
-      .mockResolvedValueOnce(normalDrainState)
-      .mockResolvedValueOnce({
-        ...normalDrainState,
-        mode: 'draining',
-        activeLeaseCount: 1,
-        activeRunCount: 1,
-        activeRunIds: ['run-race'],
-      });
+    mockGetCauldronDrainState.mockResolvedValueOnce(normalDrainState).mockResolvedValueOnce({
+      ...normalDrainState,
+      mode: 'draining',
+      activeLeaseCount: 1,
+      activeRunCount: 1,
+      activeRunIds: ['run-race'],
+    });
     const { app } = makeApp();
     const response = await app.request('/api/workflows/deploy/run', {
       method: 'POST',
