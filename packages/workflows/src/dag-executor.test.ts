@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } from 'bun:test';
 import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
-import { join, sep } from 'path';
+import { delimiter, join, sep } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
 
@@ -9033,7 +9033,7 @@ describe('executeDagWorkflow -- env var injection', () => {
     const flagged = envs.find(env => env?.ARCHON_DENY_PR_MUTATIONS === '1');
     const plain = envs.find(env => env?.ARCHON_DENY_PR_MUTATIONS !== '1');
     expect(flagged?.MY_SECRET).toBe('abc123');
-    expect(flagged?.PATH?.split(':')[0]?.endsWith(`${sep}shims`)).toBe(true);
+    expect(flagged?.PATH?.split(delimiter)[0]?.endsWith(`${sep}shims`)).toBe(true);
     expect(plain).toEqual({ MY_SECRET: 'abc123' });
   });
 });

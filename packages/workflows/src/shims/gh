@@ -1,4 +1,5 @@
 #!/bin/sh
+# This extensionless executable must remain LF-only; see the repository attributes.
 # Refuse pull-request mutations from builder nodes: pr create, pr merge,
 # pr ready, and gh api POST/PATCH/PUT to a path containing /pulls.
 # Every other gh invocation execs the next gh on PATH. The shim directory is
