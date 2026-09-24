@@ -128,7 +128,7 @@ for lane in "${LANES[@]}"; do
   } | grep -c 'git merge-base HEAD.*HEAD~1' || true)
   if [ "$CAPTURE_COUNT" -ne 1 ] || [ "$DERIVE_COUNT" -ne 1 ] \
     || [ "$IMPLEMENT_DEP_COUNT" -ne 1 ] \
-    || [ "$LIST_COUNT" -ne 3 ] || [ "$FALLBACK_COUNT" -ne 0 ]; then
+    || [ "$LIST_COUNT" -ne 4 ] || [ "$FALLBACK_COUNT" -ne 0 ]; then
     WIRING_FAILURES+="$lane($CAPTURE_COUNT/$DERIVE_COUNT/$IMPLEMENT_DEP_COUNT/$LIST_COUNT/$FALLBACK_COUNT) "
   fi
 done

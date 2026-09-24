@@ -1093,6 +1093,56 @@ nodes:
       COUNT=$(grep -c . "$SCOPE_FILE" || true)
       echo "ascii-gate PASS (scanned $COUNT changed source file(s), all ASCII)"
       exit 0
+
+  - id: format-autofix
+    persona: major-build
+    depends_on: [ascii-gate]
+    bash: |
+      set -uo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      SCOPE_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"
+      if [ ! -f "$SCOPE_FILE" ]; then
+        echo "scope_authority_missing: changed-source list is missing" >&2
+        exit 1
+      fi
+      HAS_PRETTIER=0
+      if [ -f package.json ] && grep -q '"prettier"' package.json; then HAS_PRETTIER=1; fi
+      if ls .prettierrc* prettier.config.* >/dev/null 2>&1; then HAS_PRETTIER=1; fi
+      if [ "$HAS_PRETTIER" -eq 0 ]; then
+        echo "format-autofix: WARN -- prettier not found in target repo, skipping"
+        echo "FORMAT_STATUS=skipped"
+        exit 0
+      fi
+      RUNNER="${RUNNER:-bunx prettier}"
+      if [ "$RUNNER" = "bunx prettier" ]; then
+        command -v bunx >/dev/null 2>&1 || RUNNER="npx prettier"
+      fi
+      FILES=$(cat "$SCOPE_FILE")
+      COUNT=$(printf '%s\n' "$FILES" | sed '/^$/d' | wc -l | tr -d ' ')
+      if [ "$COUNT" -eq 0 ]; then
+        echo "FORMAT_FILES_CHANGED=0"
+        echo "FORMAT_STATUS=clean"
+        exit 0
+      fi
+      # shellcheck disable=SC2086
+      $RUNNER --write $FILES >/dev/null 2>&1 || true
+      # shellcheck disable=SC2086
+      if $RUNNER --check $FILES >/dev/null 2>&1; then
+        DIRTY=$(git status --porcelain -- $FILES | wc -l | tr -d ' ')
+        if [ "$DIRTY" -gt 0 ]; then
+          echo "FORMAT_FILES_CHANGED=$DIRTY"
+          echo "FORMAT_STATUS=fixed"
+        else
+          echo "FORMAT_FILES_CHANGED=0"
+          echo "FORMAT_STATUS=clean"
+        fi
+      else
+        echo "FORMAT_FILES_CHANGED=$COUNT"
+        echo "FORMAT_STATUS=failed"
+      fi
+      exit 0
+
   # bdc-xo #1940 (harness defect 2026-09-05: shopops #674 run 69f9d306, lspro-react #580
   # run d31037ff). The engine-side build-manifest renders "Tests: N/A (required gates are
   # reported separately)" and "Grep assertions: N/A" for every WO, and the validator's
@@ -1106,7 +1156,7 @@ nodes:
   - id: run-stop-tests
     persona: major-build
     load_bearing: true
-    depends_on: [ascii-gate]
+    depends_on: [format-autofix]
     task_class: clerical
     timeout: 1800000
     bash: |
