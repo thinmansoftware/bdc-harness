@@ -96,6 +96,95 @@ describe('substituteWorkflowVariables', () => {
     expect(prompt).toBe('No branch reference here');
   });
 
+  // WO-MATRIX-M1-DSPRO-01 -- whole-identifier variable substitution
+  it('Test 1: leaves prefix-longer variables BASE_BRANCH_OVERRIDE and BASE_BRANCH_PR intact', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Override: X. PR: Y',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('Override: X. PR: Y');
+  });
+
+  it('Test 2: substitutes exact BASE_BRANCH even when followed by non-identifier chars', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'BASE_BRANCH BASE_BRANCH/x BASE_BRANCH. BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('dev dev/x dev. dev)');
+  });
+
+  it('Test 3: bounds every non-brace variable to whole identifiers', () => {
+    const cases = [
+      { name: 'WORKFLOW_ID', value: 'run-1' },
+      { name: 'USER_MESSAGE', value: 'user-msg' },
+      { name: 'ARGUMENTS', value: 'user-msg' },
+      { name: 'ARTIFACTS_DIR', value: '/tmp/artifacts' },
+      { name: 'DOCS_DIR', value: 'docs-custom' },
+      { name: 'LOOP_USER_INPUT', value: 'loop-input' },
+      { name: 'REJECTION_REASON', value: 'reject-reason' },
+      { name: 'LOOP_PREV_OUTPUT', value: 'prev-output' },
+    ];
+    const dollar = String.fromCharCode(36);
+
+    for (const { name, value } of cases) {
+      const exactVar = dollar + name;
+      const exactPrompt = substituteWorkflowVariables(
+        exactVar + ' ' + exactVar,
+        'run-1',
+        'user-msg',
+        '/tmp/artifacts',
+        'dev',
+        'docs-custom',
+        undefined,
+        'loop-input',
+        'reject-reason',
+        'prev-output'
+      ).prompt;
+      expect(exactPrompt).toBe(value + ' ' + value);
+
+      const suffixVar = exactVar + '_SUFFIX';
+      const suffixPrompt = substituteWorkflowVariables(
+        exactVar + ' ' + suffixVar,
+        'run-1',
+        'user-msg',
+        '/tmp/artifacts',
+        'dev',
+        'docs-custom',
+        undefined,
+        'loop-input',
+        'reject-reason',
+        'prev-output'
+      ).prompt;
+      expect(suffixPrompt).toBe(value + ' ' + dollar + name + '_SUFFIX');
+    }
+  });
+
+  it('Test 4: empty baseBranch does not throw for prefix-longer BASE_BRANCH_OVERRIDE only', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'BASE_BRANCH_OVERRIDE_ONLY',
+      'run-1',
+      'msg',
+      '/tmp',
+      '',
+      'docs/'
+    );
+    expect(prompt).toBe('BASE_BRANCH_OVERRIDE_ONLY');
+  });
+
+  it('Test 4: empty baseBranch still throws for a real BASE_BRANCH reference', () => {
+    expect(() =>
+      substituteWorkflowVariables('BASE_BRANCH', 'run-1', 'msg', '/tmp', '', 'docs/')
+    ).toThrow('No base branch could be resolved');
+  });
+
   it('replaces $USER_MESSAGE and $ARGUMENTS with user message', () => {
     const { prompt } = substituteWorkflowVariables(
       'Goal: $USER_MESSAGE. Args: $ARGUMENTS',
