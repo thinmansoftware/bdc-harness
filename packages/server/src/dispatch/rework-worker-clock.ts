@@ -13,6 +13,7 @@ import {
   type DispatchMessage,
 } from '@archon/core/db/dispatch';
 import { pool } from '@archon/core/db/connection';
+import { getRepoBasePolicy, type RepoBasePolicy } from '@archon/overseer';
 import { createLogger } from '@archon/paths';
 import {
   createRealReworkDeps,
@@ -64,6 +65,7 @@ export interface ReworkWorkerDeps {
     repo: string;
     prNumber: number;
   }): Promise<ReworkPullRequest>;
+  getRepoBasePolicy(ownerRepo: string, baseRef: string): RepoBasePolicy | undefined;
   hasActiveRun(woId: string): Promise<boolean>;
   fire(request: ReworkFireRequest): Promise<{ status: number; body: unknown }>;
   escalate(input: {
@@ -112,6 +114,7 @@ export function createRealReworkWorkerDeps(): ReworkWorkerDeps {
     releaseMessage,
     deferMessage,
     getPullRequest: input => rework.getPullRequest(input),
+    getRepoBasePolicy,
     async hasActiveRun(woId: string): Promise<boolean> {
       const result = await pool.query<{ user_message: string }>(
         `SELECT user_message FROM remote_agent_workflow_runs
@@ -237,6 +240,19 @@ async function handleReworkItem(
         status: 'done',
         task_outcome: 'succeeded',
         result_body: JSON.stringify({ reason: 'superseded_head' }),
+      });
+      return true;
+    }
+
+    const ownerRepo = `${body.owner}/${body.repo}`;
+    if (deps.getRepoBasePolicy(ownerRepo, pr.baseRef)?.unattended !== true) {
+      await deps.postResult({
+        id: claimed.id,
+        worker_id: REWORK_WORKER_ID,
+        fencing_token: claimed.fencing_token,
+        status: 'done',
+        task_outcome: 'succeeded',
+        result_body: JSON.stringify({ reason: 'production_or_unlisted_base' }),
       });
       return true;
     }

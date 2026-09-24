@@ -75,7 +75,12 @@ function message(fencingToken = 0): DispatchMessage {
 
 function workerStub(): Pick<
   ReworkWorkerDeps,
-  'registerWorker' | 'heartbeatWorker' | 'listMessages' | 'getPullRequest' | 'hasActiveRun'
+  | 'registerWorker'
+  | 'heartbeatWorker'
+  | 'listMessages'
+  | 'getPullRequest'
+  | 'getRepoBasePolicy'
+  | 'hasActiveRun'
 > {
   return {
     registerWorker: mock(async data => ({
@@ -95,11 +100,61 @@ function workerStub(): Pick<
     })),
     listMessages: mock(async () => [message()]),
     getPullRequest: mock(async () => OPEN_PR),
+    getRepoBasePolicy: mock(() => ({ unattended: true, docsOnly: 'skip' })),
     hasActiveRun: mock(async () => false),
   };
 }
 
 describe('rework worker clock', () => {
+  test('fails closed when the live PR base is production or unlisted', async () => {
+    for (const liveBaseRef of ['main', 'release/unlisted']) {
+      const item = message();
+      const getRepoBasePolicy = mock((ownerRepo: string, baseRef: string) => {
+        if (ownerRepo === 'thinmansoftware/bdc-harness' && baseRef === 'main') {
+          return { unattended: false, docsOnly: 'skip' as const };
+        }
+        return undefined;
+      });
+      const deps = {
+        ...workerStub(),
+        getPullRequest: mock(async () => ({ ...OPEN_PR, baseRef: liveBaseRef })),
+        getRepoBasePolicy,
+        listMessages: mock(async () => [item]),
+        claimMessage: mock(async ({ worker_id }) => ({
+          ...item,
+          status: 'claimed' as const,
+          lease_owner: worker_id,
+          fencing_token: item.fencing_token + 1,
+        })),
+        postResult: mock(async () => item),
+        releaseMessage: mock(async () => item),
+        deferMessage: mock(async () => item),
+        fire: mock(async () => ({ status: 200, body: { runId: 'must-not-fire' } })),
+        escalate: mock(async () => ({})),
+        env: { ARCHON_OPERATOR_TOKEN: 'injected-token' },
+      } as ReworkWorkerDeps & {
+        getRepoBasePolicy: typeof getRepoBasePolicy;
+      };
+
+      await tickReworkWorkerClock(deps);
+
+      expect(getRepoBasePolicy).toHaveBeenCalledWith('thinmansoftware/bdc-harness', liveBaseRef);
+      expect(deps.postResult).toHaveBeenCalledWith(
+        expect.objectContaining({
+          fencing_token: 1,
+          status: 'done',
+          task_outcome: 'succeeded',
+          result_body: JSON.stringify({ reason: 'production_or_unlisted_base' }),
+        })
+      );
+      expect(deps.hasActiveRun).not.toHaveBeenCalled();
+      expect(deps.fire).not.toHaveBeenCalled();
+      expect(deps.releaseMessage).not.toHaveBeenCalled();
+      expect(deps.deferMessage).not.toHaveBeenCalled();
+      expect(deps.escalate).not.toHaveBeenCalled();
+    }
+  });
+
   test('sends the operator token from deps.env on the fire request', async () => {
     let seen: ReworkFireRequest | undefined;
     const item = message();

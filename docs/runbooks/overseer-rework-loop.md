@@ -137,6 +137,13 @@ The rework worker clock fires a DIRECT POST to
 `${ARCHON_API_BASE_URL}/api/workflows/${OVERSEER_REWORK_WORKFLOW}/run` with a
 message of the form:
 
+Immediately before that POST, the worker refreshes the pull request and
+requires it to remain open at the queued head SHA and on a base whose live
+`getRepoBasePolicy(owner/repo, base).unattended` value is `true`. A same-head
+retarget to a production or unlisted base is terminalized as
+`production_or_unlisted_base` without firing, deferring, retrying, or
+escalating.
+
 ```
 WO_ID=<woId> --project <project> --rework=<base64url JSON {prNumber, branch, headSha, reviewMessageId}>
 ```
