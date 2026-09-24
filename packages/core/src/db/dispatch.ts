@@ -1284,6 +1284,9 @@ async function validateXoLeaseBind(
 ): Promise<Extract<DispatchMailboxResult, { ok: false }> | null> {
   if (principalId !== 'xo') return bind ? { ok: false, reason: 'lease_fence_stale' } : null;
   if (bind?.kind !== 'xo_lease') return { ok: false, reason: 'xo_bind_required' };
+  // PostgreSQL holds this row lock through the receipt transaction's commit, blocking turnover.
+  // SQLite serializes writers; the receipt UPDATE's EXISTS runs under its write lock.
+  const leaseLock = getDatabase().dialect === 'postgres' ? ' FOR UPDATE' : '';
   const result = await query<{
     lease_id: string;
     fencing_token: number | string;
@@ -1292,7 +1295,7 @@ async function validateXoLeaseBind(
     `SELECT lease_id, fencing_token, holder_token_hash
      FROM board_xo_leases
      WHERE id = 1 AND principal_id = 'xo' AND seat_id = 'xo'
-       AND released_at IS NULL AND expires_at > $1`,
+       AND released_at IS NULL AND expires_at > $1${leaseLock}`,
     [nowIso()]
   );
   const lease = result.rows[0];

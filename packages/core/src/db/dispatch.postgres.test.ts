@@ -191,83 +191,169 @@ describe('dispatch Phase 1.5 PostgreSQL integration', () => {
 
   for (const action of ['acknowledge', 'address'] as const) {
     for (const turnover of ['replace', 'release'] as const) {
-      test(`${action} rejects XO lease ${turnover} between validation and UPDATE`, async () => {
-        const message = await createAuthenticatedMessage(
-          { kind: 'system', sender: 'dispatch' },
-          {
-            correlation_id: randomUUID(),
-            idempotency_key: randomUUID(),
-            task_type: 'agent_message',
-            recipient: 'xo',
-            body: 'XO lease turnover.',
-          }
-        );
-        const bind: XoLeaseBind = {
-          kind: 'xo_lease',
-          lease_id: '11111111-1111-4111-8111-111111111111',
-          fencing_token: 9,
-          holder_token_hash: createHash('sha256').update('test-holder').digest('hex'),
-        };
-        await db.query(
-          `INSERT INTO board_xo_leases
+      for (const receiptFirst of [true, false]) {
+        test(`${action} serializes XO lease ${turnover} (${receiptFirst ? 'receipt' : 'turnover'} first)`, async () => {
+          const message = await createAuthenticatedMessage(
+            { kind: 'system', sender: 'dispatch' },
+            {
+              correlation_id: randomUUID(),
+              idempotency_key: randomUUID(),
+              task_type: 'agent_message',
+              recipient: 'xo',
+              body: 'XO lease turnover.',
+            }
+          );
+          const bind: XoLeaseBind = {
+            kind: 'xo_lease',
+            lease_id: '11111111-1111-4111-8111-111111111111',
+            fencing_token: 9,
+            holder_token_hash: createHash('sha256').update('test-holder').digest('hex'),
+          };
+          await db.query(
+            `INSERT INTO board_xo_leases
            (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
             acquired_at, expires_at)
            VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, $5)`,
-          [
-            bind.lease_id,
-            bind.holder_token_hash,
-            bind.fencing_token,
-            new Date().toISOString(),
-            new Date(Date.now() + 60_000).toISOString(),
-          ]
-        );
-        const data = { id: message.id, principal_id: 'xo', bind };
-        if (action === 'address') expect((await acknowledgeMessage(data)).ok).toBe(true);
-        const before = await getMessage(message.id);
-        const withTransaction = db.withTransaction.bind(db);
-        let leaseValidated = false;
-        let turnoverInjected = false;
-        const transactionSpy = spyOn(db, 'withTransaction').mockImplementation(fn =>
-          withTransaction(query => {
-            const wrappedQuery: DispatchQueryExecutor = async <T>(
-              sql: string,
-              params?: unknown[]
-            ) => {
-              if (sql.startsWith('UPDATE agent_dispatch_messages') && !turnoverInjected) {
-                expect(leaseValidated).toBe(true);
-                // Inject turnover only after the pre-check has read the valid lease.
-                await db.query(
-                  turnover === 'replace'
-                    ? "UPDATE board_xo_leases SET lease_id = '22222222-2222-4222-8222-222222222222', fencing_token = fencing_token + 1 WHERE id = 1"
-                    : 'UPDATE board_xo_leases SET released_at = $1 WHERE id = 1',
-                  turnover === 'release' ? [new Date().toISOString()] : []
-                );
-                turnoverInjected = true;
-              }
-              const result = await query<T>(sql, params);
-              if (sql.startsWith('SELECT lease_id, fencing_token, holder_token_hash')) {
-                expect(result.rowCount).toBe(turnoverInjected && turnover === 'release' ? 0 : 1);
-                leaseValidated = true;
+            [
+              bind.lease_id,
+              bind.holder_token_hash,
+              bind.fencing_token,
+              new Date().toISOString(),
+              new Date(Date.now() + 60_000).toISOString(),
+            ]
+          );
+          const data = { id: message.id, principal_id: 'xo', bind };
+          if (action === 'address') expect((await acknowledgeMessage(data)).ok).toBe(true);
+          const before = await getMessage(message.id);
+          const turnoverDb = new PostgresAdapter(
+            withSchemaSearchPath(
+              requireLoopbackUrl(process.env.DISPATCH_POSTGRES_PHASE15_TEST_URL),
+              schemaName
+            )
+          );
+          const turnoverSql =
+            turnover === 'replace'
+              ? "UPDATE board_xo_leases SET lease_id = '22222222-2222-4222-8222-222222222222', fencing_token = fencing_token + 1 WHERE id = 1"
+              : 'UPDATE board_xo_leases SET released_at = $1 WHERE id = 1';
+          const turnoverParams = turnover === 'release' ? [new Date().toISOString()] : [];
+          const mutate = action === 'acknowledge' ? acknowledgeMessage : addressMessage;
+          const withTransaction = db.withTransaction.bind(db);
+          let releaseReceipt!: () => void;
+          const receiptGate = new Promise<void>(resolve => {
+            releaseReceipt = resolve;
+          });
+          let signalLeaseLocked!: () => void;
+          const leaseLocked = new Promise<void>(resolve => {
+            signalLeaseLocked = resolve;
+          });
+          let releaseCommit!: () => void;
+          const commitGate = new Promise<void>(resolve => {
+            releaseCommit = resolve;
+          });
+          let signalBeforeCommit!: () => void;
+          const beforeCommit = new Promise<void>(resolve => {
+            signalBeforeCommit = resolve;
+          });
+          const transactionSpy = spyOn(db, 'withTransaction').mockImplementation(fn =>
+            withTransaction(async query => {
+              const wrappedQuery: DispatchQueryExecutor = async <T>(
+                sql: string,
+                params?: unknown[]
+              ) => {
+                const result = await query<T>(sql, params);
+                if (sql.startsWith('SELECT lease_id, fencing_token, holder_token_hash')) {
+                  expect(sql).toContain('FOR UPDATE');
+                  if (receiptFirst) {
+                    expect(result.rowCount).toBe(1);
+                    signalLeaseLocked();
+                    await receiptGate;
+                  }
+                }
+                return result;
+              };
+              const result = await fn(wrappedQuery);
+              if (receiptFirst) {
+                signalBeforeCommit();
+                await commitGate;
               }
               return result;
-            };
-            return fn(wrappedQuery);
-          })
-        );
-        try {
-          const mutate = action === 'acknowledge' ? acknowledgeMessage : addressMessage;
-          await expect(mutate(data)).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
-          expect(turnoverInjected).toBe(true);
-          const stored = await getMessage(message.id);
-          expect(stored?.acknowledged_at).toBe(before?.acknowledged_at ?? null);
-          expect(stored?.acknowledged_by).toBe(before?.acknowledged_by ?? null);
-          expect(stored?.addressed_at).toBeNull();
-          expect(stored?.addressed_by).toBeNull();
-        } finally {
-          transactionSpy.mockRestore();
-          await db.query('DELETE FROM board_xo_leases WHERE id = 1');
-        }
-      });
+            })
+          );
+          let receiptPending: ReturnType<typeof mutate> | undefined;
+          let turnoverPending: Promise<void> | undefined;
+          try {
+            if (receiptFirst) {
+              receiptPending = mutate(data);
+              // Fail promptly if the receipt errors or returns without acquiring the lock.
+              await Promise.race([
+                leaseLocked,
+                receiptPending.then(() => {
+                  throw new Error('Receipt completed before lease lock hook');
+                }),
+              ]);
+              let turnoverPid = 0;
+              let turnoverCompleted = false;
+              turnoverPending = turnoverDb
+                .withTransaction(async query => {
+                  await query("SET LOCAL lock_timeout = '3s'");
+                  const pid = await query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+                  turnoverPid = pid.rows[0].pid;
+                  await query(turnoverSql, turnoverParams);
+                })
+                .then(() => {
+                  turnoverCompleted = true;
+                });
+              // Observe the server-side lock wait so an idle connection cannot pass this test.
+              const deadline = Date.now() + 1500;
+              let turnoverBlocked = false;
+              while (Date.now() < deadline && !turnoverBlocked) {
+                await Promise.race([Bun.sleep(10), turnoverPending]);
+                const blockers = await db.query<{ blocked: boolean }>(
+                  'SELECT cardinality(pg_blocking_pids($1)) > 0 AS blocked',
+                  [turnoverPid]
+                );
+                turnoverBlocked = blockers.rows[0].blocked;
+                if (turnoverCompleted) break;
+              }
+              expect(turnoverBlocked).toBe(true);
+              await Promise.race([Bun.sleep(100), turnoverPending]);
+              expect(turnoverCompleted).toBe(false);
+              releaseReceipt();
+              await Promise.race([beforeCommit, receiptPending]);
+              // The receipt UPDATE has finished, but turnover must still wait for COMMIT.
+              await Promise.race([Bun.sleep(100), turnoverPending]);
+              expect(turnoverCompleted).toBe(false);
+              releaseCommit();
+              expect((await receiptPending).ok).toBe(true);
+              await turnoverPending;
+              expect(turnoverCompleted).toBe(true);
+              const stored = await getMessage(message.id);
+              expect(stored?.acknowledged_by).toBe('xo');
+              expect(stored?.acknowledged_at).not.toBeNull();
+              if (action === 'address') {
+                expect(stored?.addressed_by).toBe('xo');
+                expect(stored?.addressed_at).not.toBeNull();
+              }
+            } else {
+              await turnoverDb.withTransaction(async query => {
+                await query(turnoverSql, turnoverParams);
+              });
+              await expect(mutate(data)).resolves.toEqual({
+                ok: false,
+                reason: 'lease_fence_stale',
+              });
+              expect(await getMessage(message.id)).toEqual(before);
+            }
+          } finally {
+            releaseReceipt();
+            releaseCommit();
+            await Promise.allSettled([receiptPending, turnoverPending]);
+            transactionSpy.mockRestore();
+            await turnoverDb.close();
+            await db.query('DELETE FROM board_xo_leases WHERE id = 1');
+          }
+        });
+      }
     }
   }
 
