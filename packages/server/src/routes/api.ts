@@ -62,6 +62,7 @@ import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
 import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
 import { resolveWorkflowProbeBindings } from '@archon/workflows/reliability/resolve-binding';
+import type { ModelOverride } from '@archon/workflows/model-override';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
@@ -2843,11 +2844,15 @@ export function registerApiRoutes(
   const DEFAULT_BUILDER_MONITOR_URL =
     'https://n8n.bluedevilcollectibles.com/webhook/builder-status';
 
-  function workflowHasCodexNode(workflow: WorkflowDefinition): boolean {
-    return (
-      workflow.provider === 'codex' ||
-      (workflow.nodes ?? []).some(node => 'provider' in node && node.provider === 'codex')
-    );
+  function workflowHasCodexNode(
+    workflow: WorkflowDefinition,
+    modelOverride?: ModelOverride
+  ): boolean {
+    const workflowProvider = modelOverride?.workflow?.provider ?? workflow.provider;
+    return (workflow.nodes ?? []).some(node => {
+      const nodeOverride = modelOverride?.nodes?.[node.id];
+      return (nodeOverride?.provider ?? node.provider ?? workflowProvider) === 'codex';
+    });
   }
 
   async function postBuilderStatusAlert(
@@ -2880,9 +2885,14 @@ export function registerApiRoutes(
 
   async function validateWorkflowRunTarget(
     message: string,
-    codebaseId?: string | null
+    codebaseId?: string | null,
+    modelOverride?: ModelOverride
   ): Promise<
-    | { valid: true; isolationHints?: HandleMessageContext['isolationHints'] }
+    | {
+        valid: true;
+        isolationHints?: HandleMessageContext['isolationHints'];
+        workflow?: WorkflowDefinition;
+      }
     | { valid: false; error: string; httpStatus?: number }
   > {
     const match = WORKFLOW_RUN_COMMAND.exec(message.trim());
@@ -2959,18 +2969,18 @@ export function registerApiRoutes(
         error: `Workflow "${workflowName}" runs in the live checkout (worktree.enabled: false); --from/--from-branch cannot be applied.`,
       };
     }
-    if (workflowHasCodexNode(workflow)) {
+    if (workflowHasCodexNode(workflow, modelOverride)) {
       getLog().info({ workflowName }, 'codex_dispatch_gate_consult');
       try {
         const gate = await checkCodexDispatchGate();
-        if (gate.fresh) return { valid: true, isolationHints };
+        if (gate.fresh) return { valid: true, isolationHints, workflow };
         getLog().warn({ workflowName, reason: gate.reason }, 'codex_dispatch_gate_refused');
       } catch (error) {
         getLog().warn({ err: error, workflowName }, 'codex_dispatch_gate_failed');
       }
       return { valid: false, error: 'codex_auth_stale', httpStatus: 503 };
     }
-    return { valid: true, isolationHints };
+    return { valid: true, isolationHints, workflow };
   }
 
   async function dispatchToOrchestrator(
@@ -5384,7 +5394,25 @@ export function registerApiRoutes(
     try {
       const drainRejection = await rejectNewDispatchIfDraining(c);
       if (drainRejection) return drainRejection;
-      const { conversationId, message, conductor } = getValidatedBody(c, runWorkflowBodySchema);
+      const { conversationId, message, conductor, modelOverride } = getValidatedBody(
+        c,
+        runWorkflowBodySchema
+      );
+      if (modelOverride && conductor) {
+        return c.json({ accepted: false, error: 'model_override_conductor_conflict' }, 400);
+      }
+      const overrideBindings = modelOverride
+        ? [
+            ...(modelOverride.workflow ? [modelOverride.workflow] : []),
+            ...Object.values(modelOverride.nodes ?? {}),
+          ]
+        : [];
+      if (overrideBindings.some(binding => binding.model.length === 0)) {
+        return c.json({ accepted: false, error: 'model_override_empty_model' }, 400);
+      }
+      if (overrideBindings.some(binding => binding.provider === '')) {
+        return c.json({ accepted: false, error: 'model_override_empty_provider' }, 400);
+      }
       // Persist user message and register DB ID (same as message endpoint).
       // /run callers may provide a fresh platform conversation id; create that
       // row up front so workflow dispatch can attach a run and web persistence
@@ -5479,7 +5507,7 @@ export function registerApiRoutes(
       }
 
       const fullMessage = `/workflow run ${workflowName} ${message}`;
-      const check = await validateWorkflowRunTarget(fullMessage, conv?.codebase_id);
+      const check = await validateWorkflowRunTarget(fullMessage, conv?.codebase_id, modelOverride);
       if (!check.valid) {
         if (check.httpStatus === 503 && check.error === 'codex_auth_stale') {
           void postBuilderStatusAlert(
@@ -5490,6 +5518,31 @@ export function registerApiRoutes(
           return c.json({ error: 'codex_auth_stale' }, 503);
         }
         return c.json({ accepted: false, error: check.error }, 400);
+      }
+      if (modelOverride) {
+        if (!check.workflow) {
+          return c.json({ accepted: false, error: 'model_override_workflow_unavailable' }, 400);
+        }
+        const unknownProvider = overrideBindings.find(
+          binding => binding.provider && !isRegisteredProvider(binding.provider)
+        )?.provider;
+        if (unknownProvider) {
+          return c.json(
+            {
+              accepted: false,
+              error: `model_override_unknown_provider:${unknownProvider}`,
+            },
+            400
+          );
+        }
+        const nodeIds = new Set(check.workflow.nodes.map(node => node.id));
+        const unknownNode = Object.keys(modelOverride.nodes ?? {}).find(id => !nodeIds.has(id));
+        if (unknownNode) {
+          return c.json(
+            { accepted: false, error: `model_override_unknown_node:${unknownNode}` },
+            400
+          );
+        }
       }
 
       // Duplicate-fire guard (bdc-xo#1546): refuse a NEW independent fire while
@@ -5521,7 +5574,7 @@ export function registerApiRoutes(
         }
       }
 
-      const result = await dispatchToOrchestrator(conversationId, fullMessage);
+      const result = await dispatchToOrchestrator(conversationId, fullMessage, { modelOverride });
       return c.json(result);
     } catch (error) {
       getLog().error({ err: error }, 'run_workflow_failed');

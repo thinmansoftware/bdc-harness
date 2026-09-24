@@ -3,6 +3,7 @@
  */
 import type { TransitionTrigger } from '../state/session-transitions';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import type { ModelOverride } from '@archon/workflows/model-override';
 import { z } from 'zod';
 
 // MessageChunk imported for use in IPlatformAdapter/IWebPlatformAdapter below
@@ -51,6 +52,7 @@ export interface HandleMessageContext {
   readonly parentConversationId?: string;
   readonly isolationHints?: IsolationHints;
   readonly attachedFiles?: AttachedFile[];
+  readonly modelOverride?: ModelOverride;
 }
 
 export interface Codebase {

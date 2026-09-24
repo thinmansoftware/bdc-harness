@@ -135,14 +135,33 @@ mock.module('@archon/workflows/defaults', () => ({
 // the filesystem paths used by the routes point to non-existent directories, so access/readFile/unlink
 // calls naturally fail with ENOENT without needing to mock fs/promises (which would leak globally).
 
-mock.module('@archon/core/db/conversations', () => ({}));
+const mockFindConversationByPlatformId = mock(async () => ({
+  id: 'conversation-db-id',
+  platform_conversation_id: 'conversation-platform-id',
+  platform_type: 'web',
+  title: 'Existing conversation',
+  codebase_id: null,
+  ai_assistant_type: 'claude',
+}));
+mock.module('@archon/core/db/conversations', () => ({
+  findConversationByPlatformId: mockFindConversationByPlatformId,
+  getOrCreateConversation: mockFindConversationByPlatformId,
+}));
 mock.module('@archon/core/db/isolation-environments', () => ({}));
 mock.module('@archon/core/db/workflows', () => ({}));
 mock.module('@archon/core/db/workflow-events', () => ({}));
-mock.module('@archon/core/db/messages', () => ({}));
+mock.module('@archon/core/db/messages', () => ({ addMessage: mock(async () => undefined) }));
 const mockFindActiveKnownBadBinding = mock(async () => null);
 mock.module('@archon/core/db/known-bad-bindings', () => ({
   findActiveByBindingKey: mockFindActiveKnownBadBinding,
+}));
+const mockCheckCodexDispatchGate = mock(async () => ({ fresh: true as const }));
+mock.module('@archon/providers/auth-refresh/dispatch-gate', () => ({
+  checkCodexDispatchGate: mockCheckCodexDispatchGate,
+}));
+mock.module('@archon/providers', () => ({
+  isRegisteredProvider: (provider: string) => ['claude', 'codex'].includes(provider),
+  getProviderInfoList: () => [],
 }));
 
 const mockListCodebases = mock(async () => [{ default_cwd: '/tmp/project' }]);
@@ -151,6 +170,23 @@ mock.module('@archon/core/db/codebases', () => ({
 }));
 
 import { registerApiRoutes } from './api';
+
+function createRunTestApp(): OpenAPIHono {
+  const app = createTestApp();
+  const webAdapter = {
+    setConversationDbId: mock(() => undefined),
+    emitLockEvent: mock(async () => undefined),
+    emitSSE: mock(async () => undefined),
+  } as unknown as WebAdapter;
+  const lockManager = {
+    acquireLock: mock(async (_id: string, task: () => Promise<void>) => {
+      await task();
+      return { status: 'completed' };
+    }),
+  } as unknown as ConversationLockManager;
+  registerApiRoutes(app, webAdapter, lockManager);
+  return app;
+}
 
 describe('GET /api/workflows', () => {
   test('requires operator token when ARCHON_OPERATOR_TOKEN is configured', async () => {
@@ -275,6 +311,124 @@ describe('GET /api/workflows/errors', () => {
     expect(body.errors[0].filename).toBe('bad.yaml');
     expect(body.errors[0].error_type).toBe('dag_invalid');
     expect(body.errors[0].message).toContain('loop.until');
+  });
+});
+
+describe('POST /api/workflows/:name/run model overrides', () => {
+  const request = (body: unknown) =>
+    createRunTestApp().request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  test('rejects an unregistered override provider', async () => {
+    const response = await request({
+      conversationId: 'override-provider',
+      message: 'run it',
+      modelOverride: { workflow: { provider: 'not-registered', model: 'model-x' } },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_unknown_provider:not-registered',
+    });
+  });
+
+  test('rejects an override for an unknown node id', async () => {
+    const response = await request({
+      conversationId: 'override-node',
+      message: 'run it',
+      modelOverride: { nodes: { missing: { model: 'sonnet' } } },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_unknown_node:missing',
+    });
+  });
+
+  test('rejects an empty override model', async () => {
+    const response = await request({
+      conversationId: 'override-empty-model',
+      message: 'run it',
+      modelOverride: { workflow: { provider: 'claude', model: '' } },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_empty_model',
+    });
+  });
+
+  test('rejects an empty override provider', async () => {
+    const response = await request({
+      conversationId: 'override-empty-provider',
+      message: 'run it',
+      modelOverride: { workflow: { provider: '', model: 'sonnet' } },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_empty_provider',
+    });
+  });
+
+  test('rejects modelOverride combined with conductor dispatch', async () => {
+    const response = await request({
+      conversationId: 'override-conductor',
+      message: 'run it',
+      modelOverride: { workflow: { provider: 'claude', model: 'sonnet' } },
+      conductor: {
+        enabled: true,
+        woId: 'WO-TEST-1',
+        project: 'test',
+        idempotencyKey: 'override-conductor',
+      },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_conductor_conflict',
+    });
+  });
+
+  test('accepts a valid node override', async () => {
+    const response = await request({
+      conversationId: 'override-valid',
+      message: 'run it',
+      modelOverride: { nodes: { default: { model: 'sonnet' } } },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: true, status: 'completed' });
+  });
+
+  test('accepts a codex workflow override when the codex dispatch gate is fresh', async () => {
+    mockDiscoverWorkflows.mockImplementationOnce(async () => ({
+      workflows: [
+        makeTestWorkflowWithSource(
+          { name: 'deploy', description: 'Deploy app', provider: 'claude' },
+          'bundled'
+        ),
+      ],
+      errors: [],
+    }));
+
+    const response = await request({
+      conversationId: 'override-codex',
+      message: 'run it',
+      modelOverride: { workflow: { provider: 'codex', model: 'gpt-5.5' } },
+    });
+
+    expect(mockCheckCodexDispatchGate).toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: true, status: 'completed' });
   });
 });
 

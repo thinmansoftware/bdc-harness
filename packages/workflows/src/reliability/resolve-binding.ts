@@ -3,12 +3,14 @@ import { stableHash, withBindingKey, type ProviderProbeBinding } from '@archon/p
 import { getRegisteredProviders, isRegisteredProvider } from '@archon/providers';
 import type { WorkflowConfig } from '../deps';
 import type { DagNode, WorkflowDefinition } from '../schemas';
+import { resolveModelForNode, type ModelOverride } from '../model-override';
 
 export interface ResolveWorkflowBindingsInput {
   readonly workflow: WorkflowDefinition;
   readonly workflowProvider: string;
   readonly workflowModel: string | undefined;
   readonly config: WorkflowConfig;
+  readonly modelOverride?: ModelOverride;
 }
 
 function authContextId(providerId: string): string {
@@ -66,7 +68,22 @@ export function resolveWorkflowProbeBindings(
   const bindings = new Map<string, ProviderProbeBinding>();
   for (const node of input.workflow.nodes) {
     if (!('prompt' in node) && !('command' in node)) continue;
-    const providerId = node.provider ?? input.workflowProvider;
+    const binding = resolveModelForNode({
+      nodeId: node.id,
+      nodeProvider: node.provider,
+      nodeModel: node.model,
+      workflowProvider: input.workflowProvider,
+      workflowModel: input.workflowModel,
+      assistantModels: Object.fromEntries(
+        Object.entries(input.config.assistants).map(([provider, assistant]) => [
+          provider,
+          assistant?.model as string | undefined,
+        ])
+      ),
+      modelOverride: input.modelOverride,
+      fallbackModel: 'default',
+    });
+    const providerId = binding.provider;
     if (!isRegisteredProvider(providerId)) {
       throw new Error(
         `Workflow '${input.workflow.name}': unknown provider '${providerId}'. Registered: ${getRegisteredProviders()
@@ -75,13 +92,8 @@ export function resolveWorkflowProbeBindings(
       );
     }
     const assistantConfig = input.config.assistants[providerId] ?? {};
-    const modelId =
-      node.model ??
-      (providerId === input.workflowProvider
-        ? input.workflowModel
-        : (assistantConfig.model as string | undefined)) ??
-      'default';
-    const binding = withBindingKey({
+    const modelId = binding.model ?? 'default';
+    const probeBinding = withBindingKey({
       providerId,
       modelId,
       authContextId: authContextId(providerId),
@@ -89,7 +101,7 @@ export function resolveWorkflowProbeBindings(
       nodeOverrideHash: stableHash(nodeOverrides(node)),
       options: optionsForNode(node, providerId, modelId, input.config) as Record<string, unknown>,
     });
-    bindings.set(binding.bindingKey ?? '', binding);
+    bindings.set(probeBinding.bindingKey ?? '', probeBinding);
   }
   return [...bindings.values()];
 }

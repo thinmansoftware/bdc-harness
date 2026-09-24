@@ -10,6 +10,7 @@ import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/p
 import { execFileAsync, getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
 import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
+import { resolveModelForNode, type ModelOverride } from './model-override';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
@@ -507,7 +508,8 @@ export async function executeWorkflow(
   },
   parentConversationId?: string,
   preCreatedRun?: WorkflowRun,
-  authoritySource?: RunAuthorityDispatch
+  authoritySource?: RunAuthorityDispatch,
+  modelOverride?: ModelOverride
 ): Promise<WorkflowExecutionResult> {
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
@@ -538,33 +540,6 @@ export async function executeWorkflow(
   }
 
   const docsDir = config.docsPath ?? 'docs/';
-
-  // Resolve provider and model once (used by all nodes).
-  // Provider is explicit: node.provider ?? workflow.provider ?? config.assistant.
-  // Model strings pass through to the SDK as-is -- the SDK validates at request time.
-  const resolvedProvider: string = workflow.provider ?? config.assistant;
-  const providerSource = workflow.provider ? 'workflow definition' : 'config';
-  if (!isRegisteredProvider(resolvedProvider)) {
-    throw new Error(
-      `Workflow '${workflow.name}': unknown provider '${resolvedProvider}'. ` +
-        `Registered: ${getRegisteredProviders()
-          .map(p => p.id)
-          .join(', ')}`
-    );
-  }
-  const assistantDefaults = config.assistants[resolvedProvider];
-  const resolvedModel =
-    workflow.model ?? (assistantDefaults?.model as string | undefined) ?? 'claude-sonnet-4-5';
-
-  getLog().info(
-    {
-      workflowName: workflow.name,
-      provider: resolvedProvider,
-      providerSource,
-      model: resolvedModel,
-    },
-    'workflow_provider_resolved'
-  );
 
   if (configuredCommandFolder) {
     getLog().debug({ configuredCommandFolder }, 'command_folder_configured');
@@ -729,7 +704,10 @@ export async function executeWorkflow(
         codebase_id: codebaseId,
         user_message: userMessage,
         working_path: cwd,
-        metadata: issueContext ? { github_context: issueContext } : {},
+        metadata: {
+          ...(issueContext ? { github_context: issueContext } : {}),
+          ...(modelOverride ? { model_override: modelOverride } : {}),
+        },
         parent_conversation_id: parentConversationId,
       });
     } catch (error) {
@@ -746,6 +724,46 @@ export async function executeWorkflow(
       return { success: false, error: 'Database error creating workflow run' };
     }
   }
+
+  // A resumed run always keeps the binding selected when it was first fired.
+  const persistedModelOverride = workflowRun.metadata?.model_override;
+  if (persistedModelOverride && typeof persistedModelOverride === 'object') {
+    modelOverride = persistedModelOverride as ModelOverride;
+  }
+
+  const assistantModels = Object.fromEntries(
+    Object.entries(config.assistants).map(([provider, assistant]) => [
+      provider,
+      assistant?.model as string | undefined,
+    ])
+  );
+  const workflowBinding = resolveModelForNode({
+    nodeId: '__workflow__',
+    workflowProvider: workflow.provider ?? config.assistant,
+    workflowModel: workflow.model,
+    assistantModels,
+    modelOverride,
+    fallbackModel: 'claude-sonnet-4-5',
+  });
+  const resolvedProvider = workflowBinding.provider;
+  const resolvedModel = workflowBinding.model;
+  if (!isRegisteredProvider(resolvedProvider)) {
+    throw new Error(
+      `Workflow '${workflow.name}': unknown provider '${resolvedProvider}'. ` +
+        `Registered: ${getRegisteredProviders()
+          .map(p => p.id)
+          .join(', ')}`
+    );
+  }
+  getLog().info(
+    {
+      workflowName: workflow.name,
+      provider: resolvedProvider,
+      providerSource: modelOverride?.workflow ? 'run override' : 'workflow definition or config',
+      model: resolvedModel,
+    },
+    'workflow_provider_resolved'
+  );
 
   // Path-lock guard: ensure no other workflow run holds this working_path.
   //
@@ -1002,6 +1020,7 @@ export async function executeWorkflow(
       cwd,
       source: 'fire_probe',
       allowFireReprobeClear: true,
+      modelOverride,
     });
     for (const warning of probeDecision.warnings) {
       if (!warning.ok) {
@@ -1219,7 +1238,8 @@ export async function executeWorkflow(
       config,
       configuredCommandFolder,
       issueContext,
-      dagPriorCompletedNodes
+      dagPriorCompletedNodes,
+      modelOverride
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result
