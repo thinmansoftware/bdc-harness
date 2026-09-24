@@ -310,6 +310,73 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('Plain prompt with no loop variable.');
   });
+
+  it('leaves $BASE_BRANCH_OVERRIDE and $BASE_BRANCH_PR intact', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'override=$BASE_BRANCH_OVERRIDE pr=$BASE_BRANCH_PR',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('override=$BASE_BRANCH_OVERRIDE pr=$BASE_BRANCH_PR');
+    expect(prompt).not.toContain('dev_OVERRIDE');
+    expect(prompt).not.toContain('dev_PR');
+  });
+
+  it('substitutes $BASE_BRANCH at non-identifier boundaries', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH $BASE_BRANCH/x $BASE_BRANCH. $BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('dev dev/x dev. dev)');
+  });
+
+  it.each([
+    ['WORKFLOW_ID', 'wf-value-9'],
+    ['USER_MESSAGE', 'user-value-9'],
+    ['ARGUMENTS', 'args-value-9'],
+    ['ARTIFACTS_DIR', 'artifacts-value-9'],
+    ['DOCS_DIR', 'docs-value-9'],
+    ['LOOP_USER_INPUT', 'loop-input-value-9'],
+    ['REJECTION_REASON', 'reject-value-9'],
+    ['LOOP_PREV_OUTPUT', 'prev-output-value-9'],
+  ] as const)(
+    'substitutes $%s exactly and leaves the suffix identifier intact',
+    (name, value) => {
+      const source = `before $${name} mid $${name}_SUFFIX after`;
+      const { prompt } = substituteWorkflowVariables(
+        source,
+        name === 'WORKFLOW_ID' ? value : 'run-1',
+        name === 'USER_MESSAGE' || name === 'ARGUMENTS' ? value : 'msg',
+        name === 'ARTIFACTS_DIR' ? value : '/tmp',
+        'dev',
+        name === 'DOCS_DIR' ? value : 'docs/',
+        undefined,
+        name === 'LOOP_USER_INPUT' ? value : undefined,
+        name === 'REJECTION_REASON' ? value : undefined,
+        name === 'LOOP_PREV_OUTPUT' ? value : undefined
+      );
+      expect(prompt).toBe(`before ${value} mid $${name}_SUFFIX after`);
+    }
+  );
+
+  it('does not throw when only $BASE_BRANCH_OVERRIDE is present and baseBranch is empty', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH_OVERRIDE',
+      'run-1',
+      'msg',
+      '/tmp',
+      '',
+      'docs/'
+    );
+    expect(prompt).toBe('$BASE_BRANCH_OVERRIDE');
+  });
 });
 
 describe('buildPromptWithContext', () => {
