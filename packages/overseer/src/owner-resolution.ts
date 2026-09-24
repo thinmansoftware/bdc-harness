@@ -51,15 +51,51 @@ function seatFromText(value: string): BoardSeat | null {
   return seats.size === 1 ? ([...seats][0] ?? null) : null;
 }
 
+const PROPOSER_LINE_RE = /^\*{0,2}(?:Proposed by|Mover):\*{0,2}(.*)$/i;
+const APPROVAL_HEADING_PREFIX_RE = /^#{2,4}\s/;
+const APPROVE_MARKER = ' -- approve';
+
+function extractProposer(motion: string): string | null {
+  for (const raw of motion.split('\n')) {
+    const match = PROPOSER_LINE_RE.exec(raw.trim());
+    if (!match) continue;
+    const value = (match[1] ?? '').trim();
+    if (value.length > 0) return value;
+  }
+  return null;
+}
+
+function approvalHeadingText(line: string): string | null {
+  const trimmed = line.trim();
+  if (!APPROVAL_HEADING_PREFIX_RE.test(trimmed)) return null;
+  const collapsed = trimmed.replace(/\s+/g, ' ');
+  const lower = collapsed.toLowerCase();
+  let searchFrom = 0;
+  while (searchFrom < lower.length) {
+    const index = lower.indexOf(APPROVE_MARKER, searchFrom);
+    if (index === -1) return null;
+    const next = collapsed.charAt(index + APPROVE_MARKER.length);
+    if (next === '' || /\s/.test(next)) {
+      const prefix = APPROVAL_HEADING_PREFIX_RE.exec(collapsed);
+      if (!prefix) return null;
+      const heading = collapsed.slice(prefix[0].length, index).trim();
+      return heading.length > 0 ? heading : null;
+    }
+    searchFrom = index + 1;
+  }
+  return null;
+}
+
 export function extractBoardSeat(motion: string): BoardSeat | null {
-  const proposer = /^\s*\*{0,2}(?:Proposed by|Mover):\*{0,2}\s*(.+?)\s*$/im.exec(motion)?.[1];
+  const proposer = extractProposer(motion);
   const proposedSeat = proposer ? seatFromText(proposer) : null;
   if (proposedSeat) return proposedSeat;
 
   const approvingSeats = new Set<BoardSeat>();
-  const approvalHeading = /^#{2,4}\s+(.+?)\s+--\s+APPROVE(?:\s|$)/gim;
-  for (const match of motion.matchAll(approvalHeading)) {
-    const seat = seatFromText(match[1] ?? '');
+  for (const raw of motion.split('\n')) {
+    const heading = approvalHeadingText(raw);
+    if (!heading) continue;
+    const seat = seatFromText(heading);
     if (seat) approvingSeats.add(seat);
   }
   return approvingSeats.size === 1 ? ([...approvingSeats][0] ?? null) : null;

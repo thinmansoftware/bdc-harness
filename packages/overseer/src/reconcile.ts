@@ -16,14 +16,14 @@ export const WO_STEM_PATTERN = /\bWO-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]{2}\b/g;
  * anchored so a sentence that merely TALKS about the marker does not fire it.
  * Tolerates CRLF bodies (GitHub returns `\r\n` for PRs edited in the web UI).
  */
-export const RECONCILE_SKIP_PATTERN = /^[ \t]*reconcile-skip[ \t]*:[ \t]*(\S[^\r\n]*?)[ \t]*$/gim;
+export const RECONCILE_SKIP_PATTERN = /^reconcile-skip[ \t]*:[ \t]*(\S.*)$/i;
 /**
  * Manifest v2 `WO: <WO-ID>` declaration line. The PR body manifest is the
  * canonical completion record (CLAUDE.md Rule 2), so when a PR declares its
  * WO(s) this way, that list -- not every stem mentioned in prose -- is what the
  * PR is evidence for. See classifyPullRequestStems.
  */
-export const WO_DECLARATION_PATTERN = /^[ \t]*WO[ \t]*:[ \t]*(\S[^\r\n]*?)[ \t]*$/gim;
+export const WO_DECLARATION_PATTERN = /^WO[ \t]*:[ \t]*(\S.*)$/i;
 const DEFAULT_ORG = 'thinmansoftware';
 const DEFAULT_TRACKER_REPO = 'bdc-xo';
 const DEFAULT_LOOKBACK_DAYS = 14;
@@ -349,10 +349,14 @@ export function extractDeclaredWoStems(input: string): string[] {
   return [...collectStemsFromLines(input, WO_DECLARATION_PATTERN)];
 }
 
+const RECONCILE_LINE_MAX = 4096;
+
 function collectStemsFromLines(input: string, linePattern: RegExp): Set<string> {
   const stems = new Set<string>();
-  for (const match of input.matchAll(linePattern)) {
-    const list = match[1];
+  for (const line of input.split('\n')) {
+    if (line.length > RECONCILE_LINE_MAX) continue;
+    const match = linePattern.exec(line.trim());
+    const list = match?.[1];
     if (!list) continue;
     // Upper-case before stem matching so `reconcile-skip: wo-foo-01` names the
     // same tracker as `WO-FOO-01`. Comma/space separation falls out of the stem

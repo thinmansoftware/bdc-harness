@@ -9,6 +9,14 @@
  */
 
 const READ_SPEC_SCOPE_AUTHORITY_MISSING = 'read_spec_scope_authority_missing' as const;
+const CLASSIFY_MESSAGE_CAP = 8192;
+const CLASSIFY_MESSAGE_HALF = 4096;
+
+/** Keep the head and tail of a long failure message so regex tests stay linear. */
+function capClassifyMessage(message: string): string {
+  if (message.length <= CLASSIFY_MESSAGE_CAP) return message;
+  return `${message.slice(0, CLASSIFY_MESSAGE_HALF)}\n${message.slice(-CLASSIFY_MESSAGE_HALF)}`;
+}
 
 export type ErrorClass =
   // Provider/network errors (ported from router.py)
@@ -81,10 +89,10 @@ export interface ClassifyInput {
  * markers (e.g. "command not found: npm") that won't appear in provider errors.
  */
 export function classifyError(input: ClassifyInput): ErrorClass {
-  const msg = (input.message ?? '').toLowerCase();
+  const rawMessage = capClassifyMessage(input.message ?? '');
+  const msg = rawMessage.toLowerCase();
   const status = input.statusCode;
   const exit = input.exitCode;
-  const rawMessage = input.message ?? '';
   const validatorText = input.validatorOutput ?? '';
 
   // --- Silent-dead-end classes (BDC-specific, 2026-05-18 Wave A anchor incidents) ---
@@ -146,22 +154,22 @@ export function classifyError(input: ClassifyInput): ErrorClass {
 
   // npm-not-found: bun container missing npm/npx/pnpm/yarn
   if (
-    /command not found:?\s+(npm|npx|pnpm|yarn)/i.test(input.message ?? '') ||
-    /bash:.*:\s+(npm|npx|pnpm|yarn):\s+command not found/i.test(input.message ?? '')
+    /command not found:?\s+(npm|npx|pnpm|yarn)/i.test(rawMessage) ||
+    /(?:^|\s|:)(npm|npx|pnpm|yarn):\s+command not found/i.test(rawMessage)
   ) {
     return 'npm_not_found';
   }
 
   // Worktree collision: git: branch already used
   if (
-    /is already used by worktree/i.test(input.message ?? '') ||
-    /fatal: a branch named .* already exists/i.test(input.message ?? '')
+    /is already used by worktree/i.test(rawMessage) ||
+    /fatal: a branch named '[^'\n]*' already exists/i.test(rawMessage)
   ) {
     return 'worktree_collision';
   }
 
   // Branch ref missing: master/main hardcoded but doesn't exist
-  if (/fatal: couldn't find remote ref/i.test(input.message ?? '')) {
+  if (/fatal: couldn't find remote ref/i.test(rawMessage)) {
     return 'branch_ref_missing';
   }
 
@@ -216,7 +224,7 @@ export function classifyError(input: ClassifyInput): ErrorClass {
 
   // Spec lookup failed
   if (
-    /spec not found for wo_id/i.test(input.message ?? '') ||
+    /spec not found for wo_id/i.test(rawMessage) ||
     (input.nodeId === 'read-spec' && exit === 1)
   ) {
     return 'spec_lookup_failed';
