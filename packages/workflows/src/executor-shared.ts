@@ -390,12 +390,85 @@ export const CONTEXT_VAR_PATTERN_STR =
 const VAR_BOUNDARY = '(?![A-Za-z0-9_])';
 
 /**
+ * Workflow variables whose values are attacker-controlled text. Executable
+ * nodes (bash, until_bash, script) receive them only as ARCHON_<NAME> env
+ * vars. They are never spliced into script source.
+ */
+export const UNTRUSTED_TEXT_VARIABLES = [
+  'USER_MESSAGE',
+  'ARGUMENTS',
+  'CONTEXT',
+  'EXTERNAL_CONTEXT',
+  'ISSUE_CONTEXT',
+  'LOOP_USER_INPUT',
+  'REJECTION_REASON',
+  'LOOP_PREV_OUTPUT',
+] as const;
+
+export type UntrustedTextVariable = (typeof UNTRUSTED_TEXT_VARIABLES)[number];
+
+const UNTRUSTED_NAME_ALT = UNTRUSTED_TEXT_VARIABLES.join('|');
+
+export interface UntrustedTextEnvInput {
+  userMessage: string;
+  issueContext?: string;
+  loopUserInput?: string;
+  rejectionReason?: string;
+  loopPrevOutput?: string;
+}
+
+/**
+ * Env block for bash, until_bash, and script subprocesses. ARCHON_ARGUMENTS
+ * is the user message. The three context names share issueContext. Absent
+ * values are empty strings.
+ */
+export function buildUntrustedTextEnv(input: UntrustedTextEnvInput): Record<string, string> {
+  const issue = input.issueContext ?? '';
+  return {
+    ARCHON_USER_MESSAGE: input.userMessage,
+    ARCHON_ARGUMENTS: input.userMessage,
+    ARCHON_CONTEXT: issue,
+    ARCHON_EXTERNAL_CONTEXT: issue,
+    ARCHON_ISSUE_CONTEXT: issue,
+    ARCHON_LOOP_USER_INPUT: input.loopUserInput ?? '',
+    ARCHON_REJECTION_REASON: input.rejectionReason ?? '',
+    ARCHON_LOOP_PREV_OUTPUT: input.loopPrevOutput ?? '',
+  };
+}
+
+/**
+ * Rewrite whole-identifier `$NAME` / `${NAME...}` references of the eight
+ * untrusted variables to `${ARCHON_NAME}` / `${ARCHON_NAME...}`. The value is
+ * never inserted. Longer identifiers (`$USER_MESSAGE_SUFFIX`, `${CONTEXTUAL}`)
+ * are left untouched. Parameter-expansion suffixes (`${NAME:-}`) are kept.
+ */
+export function rewriteUntrustedTextRefs(source: string): string {
+  const braced = new RegExp('\\$\\{(' + UNTRUSTED_NAME_ALT + ')' + VAR_BOUNDARY, 'g');
+  const bare = new RegExp('\\$(' + UNTRUSTED_NAME_ALT + ')' + VAR_BOUNDARY, 'g');
+  return source
+    .replace(braced, (_match, name: string) => '${ARCHON_' + name)
+    .replace(bare, (_match, name: string) => '${ARCHON_' + name + '}');
+}
+
+/**
+ * First whole-identifier raw token (`$NAME` or `${NAME`) of an untrusted
+ * variable, or null. ARCHON_ forms and longer identifiers do not match.
+ */
+export function findUntrustedTextToken(source: string): string | null {
+  const re = new RegExp('\\$(?:\\{)?(' + UNTRUSTED_NAME_ALT + ')' + VAR_BOUNDARY);
+  const match = re.exec(source);
+  return match?.[1] ?? null;
+}
+
+/**
  * Replace every whole-identifier occurrence of `$<name>` in `str` with `value`.
  * Bounds the match so a longer shell variable that begins with `<name>`
  * (e.g. `$BASE_BRANCH_OVERRIDE` when name is `BASE_BRANCH`) is left untouched.
+ * A function replacer inserts `value` byte-for-byte (`$&`, `$'`, `$`` , `$1`
+ * are not reinterpreted).
  */
 function boundedReplace(str: string, name: string, value: string): string {
-  return str.replace(new RegExp('\\$' + name + VAR_BOUNDARY, 'g'), value);
+  return str.replace(new RegExp('\\$' + name + VAR_BOUNDARY, 'g'), () => value);
 }
 
 /** True if `prompt` references `$<name>` as a whole identifier. */
@@ -422,6 +495,10 @@ function referencesVariable(prompt: string, name: string): boolean {
  *
  * When issueContext is undefined, context variables are replaced with empty string
  * to avoid sending literal "$CONTEXT" to the AI.
+ *
+ * `mode: 'shell'` is for bash and until_bash text. Trusted variables are still
+ * substituted. The eight untrusted names are rewritten to `${ARCHON_<NAME>}`
+ * references and the values are not inserted.
  */
 export function substituteWorkflowVariables(
   prompt: string,
@@ -433,7 +510,8 @@ export function substituteWorkflowVariables(
   issueContext?: string,
   loopUserInput?: string,
   rejectionReason?: string,
-  loopPrevOutput?: string
+  loopPrevOutput?: string,
+  mode: 'prompt' | 'shell' = 'prompt'
 ): { prompt: string; contextSubstituted: boolean } {
   // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved.
   // Bounded so $BASE_BRANCH_OVERRIDE (a shell variable, not a workflow variable) does not trip it.
@@ -456,21 +534,33 @@ export function substituteWorkflowVariables(
   // preserve the pre-refactor cascading behavior. Both bind to `workflowId`,
   // so the order only matters when `workflowId` itself contains one of these
   // tokens; keeping $WORKFLOW_ID first matches the original replacement chain.
+  const shell = mode === 'shell';
+
   let result = boundedReplace(prompt, 'WORKFLOW_ID', workflowId);
-  result = result.replace(/\$\{run\.id\}/g, workflowId);
-  result = boundedReplace(result, 'USER_MESSAGE', userMessage);
-  result = boundedReplace(result, 'ARGUMENTS', userMessage);
+  result = result.replace(/\$\{run\.id\}/g, () => workflowId);
+  if (!shell) {
+    result = boundedReplace(result, 'USER_MESSAGE', userMessage);
+    result = boundedReplace(result, 'ARGUMENTS', userMessage);
+  }
   result = boundedReplace(result, 'ARTIFACTS_DIR', artifactsDir);
   result = boundedReplace(result, 'BASE_BRANCH', baseBranch);
   result = boundedReplace(result, 'DOCS_DIR', resolvedDocsDir);
-  result = boundedReplace(result, 'LOOP_USER_INPUT', loopUserInput ?? '');
-  result = boundedReplace(result, 'REJECTION_REASON', rejectionReason ?? '');
-  result = boundedReplace(result, 'LOOP_PREV_OUTPUT', loopPrevOutput ?? '');
+  if (!shell) {
+    result = boundedReplace(result, 'LOOP_USER_INPUT', loopUserInput ?? '');
+    result = boundedReplace(result, 'REJECTION_REASON', rejectionReason ?? '');
+    result = boundedReplace(result, 'LOOP_PREV_OUTPUT', loopPrevOutput ?? '');
+  }
+
+  if (shell) {
+    result = rewriteUntrustedTextRefs(result);
+    return { prompt: result, contextSubstituted: false };
+  }
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)
   const hasContextVariables = new RegExp(CONTEXT_VAR_PATTERN_STR).test(result);
 
-  // Substitute or clear context variables (use fresh global regex for replace)
+  // Substitute or clear context variables (use fresh global regex for replace).
+  // Function replacer so `$&` / `$'` / `$`` / `$1` inside issueContext stay literal.
   if (!issueContext && hasContextVariables) {
     getLog().debug(
       {
@@ -480,7 +570,8 @@ export function substituteWorkflowVariables(
       'context_variables_cleared'
     );
   }
-  result = result.replace(new RegExp(CONTEXT_VAR_PATTERN_STR, 'g'), issueContext ?? '');
+  const contextValue = issueContext ?? '';
+  result = result.replace(new RegExp(CONTEXT_VAR_PATTERN_STR, 'g'), () => contextValue);
 
   return {
     prompt: result,

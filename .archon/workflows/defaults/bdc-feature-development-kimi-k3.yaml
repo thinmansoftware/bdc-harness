@@ -66,7 +66,7 @@ nodes:
       exit 0
       WO_ID="${WO_ID:-}"
       if [ -z "$WO_ID" ]; then
-        WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+        WO_ID=$(printf '%s\n' "${ARCHON_USER_MESSAGE}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
       fi
       if [ -z "$WO_ID" ]; then
         echo "WO_ID missing. Provide WO_ID in environment or user message." >&2
@@ -91,7 +91,7 @@ nodes:
       fi
       if [ -z "$SPEC_CONTENT" ]; then
         # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
-        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        ISSUE_NUM=$(printf '%s\n' "${ARCHON_USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
         if [ -z "$ISSUE_NUM" ]; then
           ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
             --search "${WO_ID} in:title" --json number,title \
@@ -567,7 +567,7 @@ nodes:
         ```bash
         BRANCH=$(git rev-parse --abbrev-ref HEAD)
         # Re-derive WO_ID locally (don't interpolate spec output - quote-safety)
-        WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+        WO_ID="${WO_ID:-$(printf '%s\n' "${ARCHON_USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
         git add -A
         git diff --cached --quiet || git commit -m "feat: implement ${WO_ID}
 
@@ -679,10 +679,10 @@ nodes:
 
       # ---- BEGIN checkpoint-wo-id-derive ----
       # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
-      # Re-derive WO_ID: env -> USER_MESSAGE -> read-spec.output. Fail closed (no wip/unknown-*).
+      # Re-derive WO_ID: env -> ARCHON_USER_MESSAGE -> read-spec.output. Fail closed (no wip/unknown-*).
       WO_ID="${WO_ID:-}"
       if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
-        WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+        WO_ID=$(printf '%s\n' "${ARCHON_USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
       fi
       # read-spec output arrives shellQuote-wrapped by the executor; a direct assignment
       # lets bash unquote it. Never wrap it in a fixed-delimiter heredoc (bdc-harness #841).
@@ -3399,7 +3399,7 @@ nodes:
         COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
         if [ -z "$COMMIT_MESSAGE" ]; then
           # Re-derive WO_ID locally - see post-started for rationale
-          WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+          WO_ID="${WO_ID:-$(printf '%s\n' "${ARCHON_USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
           COMMIT_MESSAGE="feat: ${WO_ID} implementation"
         fi
         git commit -m "$COMMIT_MESSAGE"
@@ -4288,7 +4288,7 @@ nodes:
 
       READ_SPEC_OUT=$read-spec.output
       ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
-      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      ISSUE_NUM=$(printf '%s\n' "${ARCHON_USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
       fi
@@ -4365,7 +4365,7 @@ nodes:
 
       READ_SPEC_OUT=$read-spec.output
       ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
-      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      ISSUE_NUM=$(printf '%s\n' "${ARCHON_USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
       fi

@@ -1,6 +1,7 @@
 import { describe, it, expect, mock } from 'bun:test';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
+import { tmpdir } from 'os';
 
 // Mock logger before importing module under test
 const mockLogFn = mock(() => {});
@@ -23,6 +24,7 @@ mock.module('@archon/paths', () => ({
 import type { AgentPersona } from './agents/registry';
 import {
   substituteWorkflowVariables,
+  buildUntrustedTextEnv,
   buildPromptWithContext,
   detectCreditExhaustion,
   detectCompletionSignal,
@@ -1113,5 +1115,122 @@ describe('fable apex lane -- build-critical nodes serve claude-fable-5 (M-121 ap
     const diffReview = byId('diff-review');
     expect(diffReview?.provider).toBe('codex');
     expect(diffReview?.model).toBe('gpt-5.6-sol');
+  });
+});
+
+describe('untrusted text stays out of shell source', () => {
+  const injection = 'WO-X-01" ; echo INJECTED-$((6*7)) >&2 ; echo "';
+
+  function shellSub(source: string, userMessage: string, issueContext?: string): string {
+    return substituteWorkflowVariables(
+      source,
+      'run-1',
+      userMessage,
+      '/tmp/artifacts',
+      'main',
+      'docs/',
+      issueContext,
+      'loop-in',
+      'rejected',
+      'prev-out',
+      'shell'
+    ).prompt;
+  }
+
+  it('bash injection reproduction does not execute', () => {
+    const script = shellSub('printf \'%s\\n\' "$USER_MESSAGE"', injection);
+    const dir = mkdtempSync(join(tmpdir(), 'archon-shell-'));
+    const file = join(dir, 'node.sh');
+    try {
+      writeFileSync(file, script);
+      const env = {
+        ...process.env,
+        ...buildUntrustedTextEnv({ userMessage: injection }),
+      };
+      const result = Bun.spawnSync(['bash', file], { env, stdout: 'pipe', stderr: 'pipe' });
+      const stdout = result.stdout.toString();
+      const stderr = result.stderr.toString();
+      expect(stdout).toBe(injection + '\n');
+      expect(stdout).not.toContain('INJECTED-42');
+      expect(stderr).not.toContain('INJECTED-42');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rewrites every untrusted name and keeps expansion suffixes', () => {
+    const source = [
+      '$USER_MESSAGE',
+      '${USER_MESSAGE:-}',
+      '$ARGUMENTS',
+      '$CONTEXT',
+      '${EXTERNAL_CONTEXT:-fallback}',
+      '$ISSUE_CONTEXT',
+      '$LOOP_USER_INPUT',
+      '${REJECTION_REASON}',
+      '$LOOP_PREV_OUTPUT',
+      '$USER_MESSAGE_SUFFIX',
+      '${CONTEXTUAL}',
+      '$WORKFLOW_ID',
+      '$BASE_BRANCH_OVERRIDE',
+    ].join('\n');
+    const prompt = shellSub(source, 'hello', 'ctx');
+    expect(prompt).toBe(
+      [
+        '${ARCHON_USER_MESSAGE}',
+        '${ARCHON_USER_MESSAGE:-}',
+        '${ARCHON_ARGUMENTS}',
+        '${ARCHON_CONTEXT}',
+        '${ARCHON_EXTERNAL_CONTEXT:-fallback}',
+        '${ARCHON_ISSUE_CONTEXT}',
+        '${ARCHON_LOOP_USER_INPUT}',
+        '${ARCHON_REJECTION_REASON}',
+        '${ARCHON_LOOP_PREV_OUTPUT}',
+        '$USER_MESSAGE_SUFFIX',
+        '${CONTEXTUAL}',
+        'run-1',
+        '$BASE_BRANCH_OVERRIDE',
+      ].join('\n')
+    );
+    const env = buildUntrustedTextEnv({
+      userMessage: 'hello',
+      issueContext: 'ctx',
+      loopUserInput: 'loop-in',
+      rejectionReason: 'rejected',
+      loopPrevOutput: 'prev-out',
+    });
+    expect(env.ARCHON_USER_MESSAGE).toBe('hello');
+    expect(env.ARCHON_ARGUMENTS).toBe('hello');
+    expect(env.ARCHON_CONTEXT).toBe('ctx');
+    expect(env.ARCHON_EXTERNAL_CONTEXT).toBe('ctx');
+    expect(env.ARCHON_ISSUE_CONTEXT).toBe('ctx');
+    expect(env.ARCHON_LOOP_USER_INPUT).toBe('loop-in');
+    expect(env.ARCHON_REJECTION_REASON).toBe('rejected');
+    expect(env.ARCHON_LOOP_PREV_OUTPUT).toBe('prev-out');
+  });
+
+  it('inserts replacement-pattern characters literally in prompt mode', () => {
+    const userMessage = "a$&b$'c$`d$1";
+    const { prompt } = substituteWorkflowVariables(
+      '$USER_MESSAGE',
+      'run-1',
+      userMessage,
+      '/tmp',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe(userMessage);
+  });
+
+  it('keeps prompt substitution and leaves $BASE_BRANCH_OVERRIDE verbatim', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Do: $USER_MESSAGE ($ARGUMENTS) $BASE_BRANCH_OVERRIDE',
+      'run-1',
+      'hello',
+      '/tmp',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Do: hello (hello) $BASE_BRANCH_OVERRIDE');
   });
 });

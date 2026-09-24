@@ -118,7 +118,7 @@ run_case() {
       echo 'unset WO_ID 2>/dev/null || true'
       echo 'WO_ID=""'
     fi
-    echo "export USER_MESSAGE=$(printf '%q' "$um")"
+    echo "export ARCHON_USER_MESSAGE=$(printf '%q' "$um")"
     echo "export READ_SPEC_FIXTURE=$(printf '%q' "$rs")"
     printf '%s\n' "$TESTABLE"
     echo 'printf "RESOLVED=%s\n" "$WO_ID"'

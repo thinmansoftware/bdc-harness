@@ -74,7 +74,7 @@ Archon uses structured logging (Pino) with explicit rules about what is and is n
 
 ## Adapter Authorization
 
-Each platform adapter supports an optional user whitelist via environment variables. When a whitelist is configured, only listed users can interact with the bot. When the whitelist is empty or unset, the adapter operates in open access mode.
+Each platform adapter supports an optional user whitelist via environment variables. When a whitelist is configured, only listed users can interact with the bot. Telegram and GitHub deny every sender when their allowlist is empty or unset. Set `ARCHON_CHAT_OPEN_ACCESS=true` to opt in to open access for those two adapters. Other adapters are unchanged.
 
 | Platform | Whitelist Variable | Format |
 | --- | --- | --- |

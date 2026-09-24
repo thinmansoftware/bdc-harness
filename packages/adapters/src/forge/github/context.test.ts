@@ -252,11 +252,15 @@ function createTestAdapter(): GitHubAdapter {
 describe('GitHubAdapter non-slash command context passing', () => {
   let adapter: GitHubAdapter;
   let originalAllowedUsers: string | undefined;
+  let originalOpenAccess: string | undefined;
 
   beforeEach(() => {
-    // Clear env var so auth doesn't reject test senders
+    // Empty allowlist denies every sender. These tests are about comment context,
+    // so opt in explicitly.
     originalAllowedUsers = process.env.GITHUB_ALLOWED_USERS;
+    originalOpenAccess = process.env.ARCHON_CHAT_OPEN_ACCESS;
     delete process.env.GITHUB_ALLOWED_USERS;
+    process.env.ARCHON_CHAT_OPEN_ACCESS = 'true';
 
     mockHandleMessage.mockClear();
     mockGetOrCreateConversation.mockClear();
@@ -272,6 +276,11 @@ describe('GitHubAdapter non-slash command context passing', () => {
       process.env.GITHUB_ALLOWED_USERS = originalAllowedUsers;
     } else {
       delete process.env.GITHUB_ALLOWED_USERS;
+    }
+    if (originalOpenAccess !== undefined) {
+      process.env.ARCHON_CHAT_OPEN_ACCESS = originalOpenAccess;
+    } else {
+      delete process.env.ARCHON_CHAT_OPEN_ACCESS;
     }
   });
 

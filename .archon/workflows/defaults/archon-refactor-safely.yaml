@@ -25,7 +25,7 @@ nodes:
   - id: scan-scope
     bash: |
       echo "=== REFACTORING TARGET ==="
-      echo "User request: $ARGUMENTS"
+      echo "User request: ${ARCHON_ARGUMENTS}"
       echo ""
 
       echo "=== FILE SIZE ANALYSIS (source files by size) ==="

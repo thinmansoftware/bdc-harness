@@ -21,10 +21,10 @@ nodes:
   - id: fetch-pr
     bash: |
       # Extract PR number from arguments
-      PR_NUMBER=$(echo "$ARGUMENTS" | grep -oE '/pull/[0-9]+' | grep -oE '[0-9]+' | head -1)
+      PR_NUMBER=$(echo "${ARCHON_ARGUMENTS}" | grep -oE '/pull/[0-9]+' | grep -oE '[0-9]+' | head -1)
       # Fallback: extract first number if no URL path found (e.g., "validate PR 42")
       if [ -z "$PR_NUMBER" ]; then
-        PR_NUMBER=$(echo "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
+        PR_NUMBER=$(echo "${ARCHON_ARGUMENTS}" | grep -oE '[0-9]+' | head -1)
       fi
       if [ -z "$PR_NUMBER" ]; then
         # Try getting PR from current branch
@@ -32,7 +32,7 @@ nodes:
       fi
 
       if [ -z "$PR_NUMBER" ]; then
-        echo "ERROR: No PR number found in arguments: $ARGUMENTS"
+        echo "ERROR: No PR number found in arguments: ${ARCHON_ARGUMENTS}"
         exit 1
       fi
 

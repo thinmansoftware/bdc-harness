@@ -14787,3 +14787,176 @@ describe('cancel-poll interval cleanup (WO-HARNESS-SILENT-NODE-DETECTION-01)', (
     }
   });
 });
+
+describe('untrusted workflow text is env-only', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-untrusted-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockReset();
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'DAG AI response' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
+  });
+
+  afterEach(async () => {
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  it('bash node writes the user message and does not execute injected shell', async () => {
+    const userMessage = 'x" ; touch "$ARTIFACTS_DIR/pwned" ; echo "';
+    const artifacts = join(testDir, 'artifacts');
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-env-run', { user_message: userMessage });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-bash-env',
+      testDir,
+      {
+        name: 'bash-env',
+        nodes: [
+          {
+            id: 'echo-msg',
+            bash: 'printf \'%s\' "$USER_MESSAGE" > "$ARTIFACTS_DIR/echo.txt"',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifacts,
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const echoed = await readFile(join(artifacts, 'echo.txt'), 'utf8');
+    expect(echoed).toBe(userMessage);
+    await expect(stat(join(artifacts, 'pwned'))).rejects.toThrow();
+  });
+
+  it('executor-owned ARCHON_USER_MESSAGE wins over a hostile env var', async () => {
+    const artifacts = join(testDir, 'artifacts');
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-shadow-run', { user_message: 'real-message' });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-bash-shadow',
+      testDir,
+      {
+        name: 'bash-shadow',
+        nodes: [{ id: 'echo-msg', bash: 'printf \'%s\' "$USER_MESSAGE"' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifacts,
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, envVars: { ARCHON_USER_MESSAGE: 'shadowed' } }
+    );
+
+    const calls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'echo-msg'
+    );
+    expect(completed).toBeDefined();
+    expect((completed![0] as { data: { node_output: string } }).data.node_output).toBe(
+      'real-message'
+    );
+  });
+
+  it('until_bash sees the message via env and does not execute injected shell', async () => {
+    const userMessage = 'x" ] ; touch "$ARTIFACTS_DIR/pwned" ; [ "';
+    const artifacts = join(testDir, 'artifacts');
+    await mkdir(artifacts, { recursive: true });
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('until-bash-run', { user_message: userMessage });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-until',
+      testDir,
+      {
+        name: 'until-bash-env',
+        nodes: [
+          {
+            id: 'gate',
+            loop: {
+              prompt: 'work',
+              until: 'NEVER_MATCH_THIS',
+              until_bash: '[ -n "$USER_MESSAGE" ] && touch "$ARTIFACTS_DIR/done-marker"',
+              max_iterations: 1,
+            },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifacts,
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    await stat(join(artifacts, 'done-marker'));
+    await expect(stat(join(artifacts, 'pwned'))).rejects.toThrow();
+  });
+
+  it('script node reads ARCHON_ARGUMENTS from the environment', async () => {
+    const artifacts = join(testDir, 'artifacts');
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('script-arg-run', { user_message: 'hello' });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-script-arg',
+      testDir,
+      {
+        name: 'script-arg',
+        nodes: [
+          {
+            id: 'read-args',
+            runtime: 'bun',
+            script: 'console.log(process.env.ARCHON_ARGUMENTS)',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      artifacts,
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, envVars: { ARCHON_ARGUMENTS: 'shadowed' } }
+    );
+
+    const calls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_completed' &&
+        (call[0] as { step_name: string }).step_name === 'read-args'
+    );
+    expect(completed).toBeDefined();
+    expect((completed![0] as { data: { node_output: string } }).data.node_output).toBe('hello');
+  });
+});

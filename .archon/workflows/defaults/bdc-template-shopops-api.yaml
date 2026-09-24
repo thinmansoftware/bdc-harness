@@ -295,7 +295,7 @@ nodes:
 
       READ_SPEC_OUT=$read-spec.output
       ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
-      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      ISSUE_NUM=$(printf '%s\n' "${ARCHON_USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
       fi

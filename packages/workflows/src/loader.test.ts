@@ -3071,3 +3071,55 @@ nodes:
     );
   });
 });
+
+describe('script nodes reject spliced untrusted tokens', () => {
+  it('rejects String.raw $ARGUMENTS and names the node and token', () => {
+    const yaml = `
+name: bad-script
+description: rejects a spliced token
+nodes:
+  - id: parse-args
+    runtime: bun
+    script: |
+      const raw = String.raw\`$ARGUMENTS\`.trim().toLowerCase();
+      console.log(raw);
+`;
+    const result = parseWorkflow(yaml, 'bad-script.yaml');
+    expect(result.workflow).toBeNull();
+    expect(result.error?.error).toContain("Node 'parse-args'");
+    expect(result.error?.error).toContain('ARGUMENTS');
+    expect(result.error?.error).toContain('process.env.ARCHON_ARGUMENTS');
+  });
+
+  it('loads a script that reads process.env.ARCHON_ARGUMENTS', () => {
+    const yaml = `
+name: good-script
+description: reads the env var
+nodes:
+  - id: parse-args
+    runtime: bun
+    script: |
+      console.log(process.env.ARCHON_ARGUMENTS);
+`;
+    const result = parseWorkflow(yaml, 'good-script.yaml');
+    expect(result.error).toBeNull();
+    expect(result.workflow).not.toBeNull();
+  });
+
+  it('does not reject ARCHON_ forms, longer identifiers, or plain prose', () => {
+    const yaml = `
+name: boundary-script
+description: boundary cases
+nodes:
+  - id: parse-args
+    runtime: bun
+    script: |
+      const archon = process.env.ARCHON_ARGUMENTS;
+      const longer = process.env.ARGUMENTS_EXTRA;
+      console.log('ARGUMENTS is documentation', archon, longer);
+`;
+    const result = parseWorkflow(yaml, 'boundary-script.yaml');
+    expect(result.error).toBeNull();
+    expect(result.workflow).not.toBeNull();
+  });
+});

@@ -80,6 +80,22 @@ describe('extractWoId', () => {
   test('returns null when absent', () => {
     expect(extractWoId('no work order here')).toBeNull();
   });
+
+  test('reads an indented assignment and a CRLF assignment', () => {
+    expect(extractWoId('foo\n  WO_ID = WO-ABC-01')).toBe('WO-ABC-01');
+    expect(extractWoId('x\r\nWO_ID=WO-ABC-01\r\n')).toBe('WO-ABC-01');
+  });
+
+  test('reads a bare WO token', () => {
+    expect(extractWoId('see WO-DEF-02 now')).toBe('WO-DEF-02');
+  });
+
+  test('newline-heavy input returns null within 100ms', () => {
+    const input = '\n'.repeat(65536);
+    const start = performance.now();
+    expect(extractWoId(input)).toBeNull();
+    expect(performance.now() - start).toBeLessThan(100);
+  });
 });
 
 describe('hasValidatorRejectionSignal', () => {

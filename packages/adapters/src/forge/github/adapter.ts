@@ -30,6 +30,7 @@ import * as db from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
 import { createLogger } from '@archon/paths';
 import { parseAllowedUsers as parseGitHubAllowedUsers, isGitHubUserAuthorized } from './auth';
+import { isOpenAccessEnabled } from '../../utils/open-access';
 import { splitIntoParagraphChunks } from '../../utils/message-splitting';
 import type { WebhookEvent } from './types';
 
@@ -49,6 +50,7 @@ export class GitHubAdapter implements IPlatformAdapter {
   private octokit: Octokit;
   private webhookSecret: string;
   private allowedUsers: string[];
+  private openAccess: boolean;
   private botMention: string;
   private lockManager: ConversationLockManager;
   private readonly retryDelayFn: (attempt: number) => number;
@@ -65,12 +67,15 @@ export class GitHubAdapter implements IPlatformAdapter {
     this.lockManager = lockManager;
     this.botMention = botMention ?? 'Archon';
 
-    // Parse GitHub user whitelist (optional - empty = open access)
+    // Empty allowlist denies every sender unless ARCHON_CHAT_OPEN_ACCESS=true.
     this.allowedUsers = parseGitHubAllowedUsers(process.env.GITHUB_ALLOWED_USERS);
+    this.openAccess = isOpenAccessEnabled(process.env.ARCHON_CHAT_OPEN_ACCESS);
     if (this.allowedUsers.length > 0) {
       getLog().info({ userCount: this.allowedUsers.length }, 'github.whitelist_enabled');
+    } else if (this.openAccess) {
+      getLog().warn('github.open_access_enabled');
     } else {
-      getLog().info('github.whitelist_disabled');
+      getLog().warn('github.whitelist_empty_denying_all');
     }
 
     this.retryDelayFn = options?.retryDelayMs ?? ((attempt: number): number => 1000 * attempt);
@@ -697,7 +702,7 @@ ${userComment}`;
 
     // 2b. Authorization check - verify sender is in whitelist
     const senderUsername = event.sender?.login;
-    if (!isGitHubUserAuthorized(senderUsername, this.allowedUsers)) {
+    if (!isGitHubUserAuthorized(senderUsername, this.allowedUsers, this.openAccess)) {
       // Log unauthorized attempt (mask username for privacy)
       const maskedUser = senderUsername ? `${senderUsername.slice(0, 3)}***` : 'unknown';
       getLog().info({ maskedUser }, 'github.unauthorized_webhook');
