@@ -14491,3 +14491,186 @@ describe('executeDagWorkflow -- node output file handoff (ARCHON_NODE_OUT)', () 
     expect(secondWrite).toBe('stable output');
   });
 });
+
+describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-silent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  function eventsOf(store: IWorkflowStore): Array<{
+    event_type: string;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  }> {
+    return (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+    );
+  }
+
+  async function runPromptNode(
+    store: IWorkflowStore,
+    nodeId: string,
+    idleTimeout: number,
+    runId: string
+  ): Promise<void> {
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun(runId);
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-silent',
+      testDir,
+      {
+        name: 'silent-node',
+        nodes: [{ id: nodeId, prompt: 'work', idle_timeout: idleTimeout }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts-' + runId),
+      join(testDir, 'logs-' + runId),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+  }
+
+  it('provider_never_started fails the node with the named reason', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      await new Promise<void>(() => {});
+      yield { type: 'assistant', content: 'never' };
+    });
+
+    const store = createMockStore();
+    let runStatus = 'running';
+    (store.failWorkflowRun as ReturnType<typeof mock>).mockImplementation(() => {
+      runStatus = 'failed';
+      return Promise.resolve();
+    });
+
+    const run = runPromptNode(store, 'silent-node', 200, 'silent-never-started');
+    const timeout = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error('silent node did not finish within 5000ms')), 5000);
+    });
+    await Promise.race([run, timeout]);
+
+    expect(runStatus).not.toBe('running');
+    const failed = eventsOf(store).filter(
+      e => e.event_type === 'node_failed' && e.step_name === 'silent-node'
+    );
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.data?.reason).toBe('provider_never_started');
+    expect(failed[0]?.data?.reason_code).toBe('progress_timeout');
+  });
+
+  it('provider_silent after a first chunk', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'working' };
+      await new Promise<void>(() => {});
+    });
+
+    const store = createMockStore();
+    const run = runPromptNode(store, 'silent-after-chunk', 200, 'silent-after-chunk');
+    const timeout = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error('silent node did not finish within 5000ms')), 5000);
+    });
+    await Promise.race([run, timeout]);
+
+    const events = eventsOf(store);
+    const failed = events.filter(
+      e => e.event_type === 'node_failed' && e.step_name === 'silent-after-chunk'
+    );
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.data?.reason).toBe('provider_silent');
+    const progressIdx = events.findIndex(
+      e => e.event_type === 'node_progress' && e.step_name === 'silent-after-chunk'
+    );
+    const failedIdx = events.findIndex(
+      e => e.event_type === 'node_failed' && e.step_name === 'silent-after-chunk'
+    );
+    expect(progressIdx).toBeGreaterThanOrEqual(0);
+    expect(progressIdx).toBeLessThan(failedIdx);
+  });
+
+  it('a chatty healthy node is not killed and its progress is throttled', async () => {
+    const prev = process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
+    process.env.ARCHON_NODE_PROGRESS_EVENT_MS = '50';
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        const started = Date.now();
+        while (Date.now() - started < 400) {
+          yield { type: 'assistant', content: 'working' };
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        yield { type: 'result', sessionId: 'chatty-session' };
+      });
+
+      const store = createMockStore();
+      await runPromptNode(store, 'chatty-node', 200, 'silent-chatty');
+
+      const events = eventsOf(store);
+      const progress = events.filter(
+        e => e.event_type === 'node_progress' && e.step_name === 'chatty-node'
+      );
+      const failed = events.filter(
+        e => e.event_type === 'node_failed' && e.step_name === 'chatty-node'
+      );
+      const completed = events.filter(
+        e => e.event_type === 'node_completed' && e.step_name === 'chatty-node'
+      );
+      expect(failed).toHaveLength(0);
+      expect(completed).toHaveLength(1);
+      expect(progress.length).toBeGreaterThanOrEqual(2);
+      expect(progress.length).toBeLessThanOrEqual(10);
+    } finally {
+      if (prev === undefined) delete process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
+      else process.env.ARCHON_NODE_PROGRESS_EVENT_MS = prev;
+    }
+  });
+
+  it('cancel lands while the provider is silent', async () => {
+    const prev = process.env.ARCHON_NODE_CANCEL_POLL_MS;
+    process.env.ARCHON_NODE_CANCEL_POLL_MS = '50';
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        await new Promise<void>(() => {});
+        yield { type: 'assistant', content: 'never' };
+      });
+
+      const store = createMockStore();
+      let statusCalls = 0;
+      (store.getWorkflowRunStatus as ReturnType<typeof mock>).mockImplementation(() => {
+        statusCalls += 1;
+        return Promise.resolve(statusCalls === 1 ? ('running' as const) : ('cancelled' as const));
+      });
+
+      const run = runPromptNode(store, 'cancel-silent', 60000, 'silent-cancel');
+      const timeout = new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error('cancel did not land within 3000ms')), 3000);
+      });
+      await Promise.race([run, timeout]);
+
+      const failed = eventsOf(store).filter(
+        e => e.event_type === 'node_failed' && e.step_name === 'cancel-silent'
+      );
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.data?.error).toBe('Cancelled by user');
+      expect(failed[0]?.data?.reason).not.toBe('provider_never_started');
+    } finally {
+      if (prev === undefined) delete process.env.ARCHON_NODE_CANCEL_POLL_MS;
+      else process.env.ARCHON_NODE_CANCEL_POLL_MS = prev;
+    }
+  });
+});

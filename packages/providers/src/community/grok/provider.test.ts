@@ -1,4 +1,28 @@
-import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
+import { describe, expect, test, beforeEach, afterEach, mock } from 'bun:test';
+
+const mockCreate = mock(
+  async (_body: unknown, _options?: { signal?: AbortSignal }) =>
+    ({
+      model: 'x-ai/grok-4.5',
+      choices: [{ message: { content: 'ok', tool_calls: [] } }],
+    }) as const
+);
+
+const mockOpenAI = mock(function () {
+  return {
+    chat: {
+      completions: {
+        create: mockCreate,
+      },
+    },
+  };
+});
+
+mock.module('openai', () => ({
+  default: mockOpenAI,
+  OpenAI: mockOpenAI,
+}));
+
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -88,6 +112,66 @@ describe('GrokAgentProvider', () => {
       const gen = p.sendQuery('hi', '');
       await gen.next();
     }).toThrow(/cwd/);
+  });
+
+  test('yields tool chunks and forwards abortSignal', async () => {
+    process.env.GLM_API_KEY = 'test-key';
+    mockCreate.mockReset();
+    let calls = 0;
+    mockCreate.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          model: 'deepseek/deepseek-v4.1-flash',
+          choices: [
+            {
+              message: {
+                content: null,
+                tool_calls: [
+                  {
+                    id: 'call_read',
+                    type: 'function',
+                    function: {
+                      name: 'read_file',
+                      arguments: JSON.stringify({ path: 'missing.txt' }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+      }
+      return {
+        model: 'deepseek/deepseek-v4.1-flash',
+        choices: [{ message: { content: 'done', tool_calls: [] } }],
+      };
+    });
+
+    const cwd = mkdtempSync(join(tmpdir(), 'grok-abort-'));
+    const signal = new AbortController().signal;
+    try {
+      const provider = new GrokAgentProvider();
+      const chunks: Array<{ type: string; toolName?: string; content?: string }> = [];
+      for await (const chunk of provider.sendQuery('read a file', cwd, undefined, {
+        abortSignal: signal,
+      })) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks.some(chunk => chunk.type === 'tool' && chunk.toolName === 'read_file')).toBe(
+        true
+      );
+      expect(
+        chunks.some(
+          chunk => typeof chunk.content === 'string' && chunk.content.startsWith('[grok-agent tool]')
+        )
+      ).toBe(false);
+      const firstOptions = mockCreate.mock.calls[0]?.[1] as { signal?: AbortSignal } | undefined;
+      expect(firstOptions?.signal).toBe(signal);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test('getType and capabilities', () => {
