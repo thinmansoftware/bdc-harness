@@ -35,6 +35,10 @@ import {
 const ISSUE: EscalationIssueRef = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 194 };
 const T0 = Date.parse('2026-09-23T12:00:00.000Z');
 
+/** The login Taskmaster posts as in these tests. */
+const POSTER = 'taskmaster-bot';
+const posterLogin = async (): Promise<string> => POSTER;
+
 // Non-ASCII test inputs built from char codes so this source file stays
 // ASCII-only (the formatter rewrites \u escapes into literal characters).
 const E_ACUTE = String.fromCharCode(0xe9);
@@ -266,14 +270,20 @@ function fakeGithubComments(comments: EscalationIssueComment[]): {
   fetchImpl: (input: string, init?: RequestInit) => Promise<Response>;
   gets: string[];
   posts: string[];
+  userLookups: () => number;
 } {
   const gets: string[] = [];
   const posts: string[] = [];
+  let userLookups = 0;
   const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
     const url = new URL(input);
     if ((init?.method ?? 'GET') === 'POST') {
       posts.push(String(init?.body ?? ''));
       return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+    }
+    if (url.pathname === '/user') {
+      userLookups += 1;
+      return new Response(JSON.stringify({ login: POSTER }), { status: 200 });
     }
     gets.push(input);
     const perPage = Number(url.searchParams.get('per_page') ?? '30');
@@ -285,9 +295,15 @@ function fakeGithubComments(comments: EscalationIssueComment[]): {
       next.searchParams.set('page', String(page + 1));
       headers.set('link', `<${next.toString()}>; rel="next"`);
     }
-    return new Response(JSON.stringify(slice), { status: 200, headers });
+    // GitHub's shape: the author is user.login (user null when absent).
+    const payload = slice.map(c => ({
+      body: c.body,
+      created_at: c.created_at,
+      user: c.authorLogin ? { login: c.authorLogin } : null,
+    }));
+    return new Response(JSON.stringify(payload), { status: 200, headers });
   };
-  return { fetchImpl, gets, posts };
+  return { fetchImpl, gets, posts, userLookups: () => userLookups };
 }
 
 describe('deliverEscalationToIssue', () => {
@@ -295,14 +311,19 @@ describe('deliverEscalationToIssue', () => {
     const nowMs = T0;
     let posts = 0;
     const comments: EscalationIssueComment[] = [
-      { body: 'a human comment', created_at: new Date(T0 - 1000).toISOString() },
+      {
+        body: 'a human comment',
+        created_at: new Date(T0 - 1000).toISOString(),
+        authorLogin: 'someone',
+      },
     ];
     const deps = {
       listIssueComments: async () => comments,
       postIssueComment: async (_i: EscalationIssueRef, body: string) => {
         posts += 1;
-        comments.push({ body, created_at: new Date(nowMs).toISOString() });
+        comments.push({ body, created_at: new Date(nowMs).toISOString(), authorLogin: POSTER });
       },
+      posterLogin,
       now: () => new Date(nowMs),
     };
     const result = await deliverEscalationToIssue(
@@ -324,6 +345,7 @@ describe('deliverEscalationToIssue', () => {
       {
         body: `${TASKMASTER_ESCALATION_MARKER}\n\nprevious escalation`,
         created_at: new Date(T0 - (TASKMASTER_ESCALATION_COOLDOWN_MS - 60_000)).toISOString(),
+        authorLogin: POSTER,
       },
     ];
     const deps = {
@@ -331,6 +353,7 @@ describe('deliverEscalationToIssue', () => {
       postIssueComment: async () => {
         posts += 1;
       },
+      posterLogin,
       now: () => new Date(nowMs),
     };
     const result = await deliverEscalationToIssue(
@@ -348,6 +371,7 @@ describe('deliverEscalationToIssue', () => {
       {
         body: `${TASKMASTER_ESCALATION_MARKER}\n\nstale escalation`,
         created_at: new Date(T0 - (TASKMASTER_ESCALATION_COOLDOWN_MS + 60_000)).toISOString(),
+        authorLogin: POSTER,
       },
     ];
     const deps = {
@@ -355,6 +379,7 @@ describe('deliverEscalationToIssue', () => {
       postIssueComment: async () => {
         posts += 1;
       },
+      posterLogin,
       now: () => new Date(nowMs),
     };
     const result = await deliverEscalationToIssue(
@@ -375,6 +400,7 @@ describe('deliverEscalationToIssue', () => {
           return [];
         },
         postIssueComment: async () => {},
+        posterLogin,
         now: () => new Date(T0),
       }
     );
@@ -389,11 +415,13 @@ describe('createRealEscalationDeliveryDeps (fake fetch)', () => {
       comments.push({
         body: `human comment ${i}`,
         created_at: new Date(T0 - (400 - i) * 60 * 60 * 1000).toISOString(),
+        authorLogin: 'human-user',
       });
     }
     comments[140] = {
       body: `${TASKMASTER_ESCALATION_MARKER}\n\nrecent escalation`,
       created_at: new Date(T0 - 60 * 60 * 1000).toISOString(),
+      authorLogin: POSTER,
     };
     const fake = fakeGithubComments(comments);
     const deps = {
@@ -408,6 +436,8 @@ describe('createRealEscalationDeliveryDeps (fake fetch)', () => {
     expect(fake.posts.length).toBe(0);
     // Both pages were read, and the first request asked for the cooldown window.
     expect(fake.gets.length).toBe(2);
+    // The genuine marker was checked against the token's own login (GET /user).
+    expect(fake.userLookups()).toBe(1);
     const first = new URL(fake.gets[0]);
     expect(first.searchParams.get('per_page')).toBe('100');
     expect(first.searchParams.get('since')).toBe(
@@ -418,7 +448,11 @@ describe('createRealEscalationDeliveryDeps (fake fetch)', () => {
   test('>100 comments with no marker -> reads every page and posts exactly once', async () => {
     const comments: EscalationIssueComment[] = [];
     for (let i = 0; i < 250; i += 1) {
-      comments.push({ body: `c${i}`, created_at: new Date(T0 - 1000).toISOString() });
+      comments.push({
+        body: `c${i}`,
+        created_at: new Date(T0 - 1000).toISOString(),
+        authorLogin: 'human-user',
+      });
     }
     const fake = fakeGithubComments(comments);
     const deps = {
@@ -431,6 +465,8 @@ describe('createRealEscalationDeliveryDeps (fake fetch)', () => {
     );
     expect(result.posted).toBe(true);
     expect(fake.gets.length).toBe(3);
+    // No marker comment at all: the poster identity is never looked up.
+    expect(fake.userLookups()).toBe(0);
     expect(fake.posts).toEqual([JSON.stringify({ body: 'hello' })]);
   });
 
@@ -533,9 +569,10 @@ describe('per-issue delivery claim (tm_escalation_claims, real SQLite)', () => {
         postIssueComment: async (issue, body) => {
           posts.push(issue);
           const list = byIssue.get(escalationIssueKey(issue)) ?? [];
-          list.push({ body, created_at: new Date(clock()).toISOString() });
+          list.push({ body, created_at: new Date(clock()).toISOString(), authorLogin: POSTER });
           byIssue.set(escalationIssueKey(issue), list);
         },
+        posterLogin,
         now: () => new Date(clock()),
       }),
     };
@@ -638,6 +675,7 @@ describe('per-issue delivery claim (tm_escalation_claims, real SQLite)', () => {
       postIssueComment: async () => {
         posts += 1;
       },
+      posterLogin,
       now: () => new Date(nowMs),
       claim: createDbEscalationDeliveryClaim(processA),
     };
@@ -656,9 +694,14 @@ describe('per-issue delivery claim (tm_escalation_claims, real SQLite)', () => {
     const claim = createDbEscalationDeliveryClaim(processA);
     const suppressedByMarker = await deliverEscalationToIssue(params(ISSUE), {
       listIssueComments: async () => [
-        { body: TASKMASTER_ESCALATION_MARKER, created_at: new Date(T0 - 60_000).toISOString() },
+        {
+          body: TASKMASTER_ESCALATION_MARKER,
+          created_at: new Date(T0 - 60_000).toISOString(),
+          authorLogin: POSTER,
+        },
       ],
       postIssueComment: async () => {},
+      posterLogin,
       now: () => new Date(T0),
       claim,
     });
@@ -674,10 +717,171 @@ describe('per-issue delivery claim (tm_escalation_claims, real SQLite)', () => {
         postIssueComment: async () => {
           throw new Error('github_down');
         },
+        posterLogin,
         now: () => new Date(T0 + 2),
         claim,
       })
     ).rejects.toThrow('github_down');
     expect(await claim.claim(escalationIssueKey(ISSUE), T0 + 3)).not.toBeNull();
+  });
+});
+
+describe('marker trust: only the poster identity suppresses', () => {
+  const RECENT = new Date(T0 - 60_000).toISOString();
+  const markerBy = (authorLogin: string | null, createdAt = RECENT): EscalationIssueComment => ({
+    body: `${TASKMASTER_ESCALATION_MARKER}\n\nlooks like an escalation`,
+    created_at: createdAt,
+    authorLogin,
+  });
+
+  async function deliverWith(
+    comments: EscalationIssueComment[],
+    login: () => Promise<string> = posterLogin
+  ): Promise<{ posted: boolean; suppressedBy?: string; posts: number }> {
+    let posts = 0;
+    const result = await deliverEscalationToIssue(
+      { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'x' },
+      {
+        listIssueComments: async () => comments,
+        postIssueComment: async () => {
+          posts += 1;
+        },
+        posterLogin: login,
+        now: () => new Date(T0),
+      }
+    );
+    return { ...result, posts };
+  }
+
+  test('a forged marker (right text, wrong author) does not suppress the escalation', async () => {
+    const result = await deliverWith([markerBy('drive-by-user')]);
+    expect(result.posted).toBe(true);
+    expect(result.posts).toBe(1);
+  });
+
+  test('a genuine marker (poster author, any case) still suppresses', async () => {
+    expect(await deliverWith([markerBy(POSTER)])).toEqual({
+      posted: false,
+      suppressedBy: 'cooldown_marker',
+      posts: 0,
+    });
+    expect((await deliverWith([markerBy('TaskMaster-Bot')])).posted).toBe(false);
+  });
+
+  test('a marker comment with no author is untrusted and does not suppress', async () => {
+    const result = await deliverWith([markerBy(null)]);
+    expect(result.posted).toBe(true);
+    expect(result.posts).toBe(1);
+  });
+
+  test('a forged marker never resets the clock past a stale genuine marker', async () => {
+    const staleGenuine = markerBy(
+      POSTER,
+      new Date(T0 - (TASKMASTER_ESCALATION_COOLDOWN_MS + 60_000)).toISOString()
+    );
+    const result = await deliverWith([staleGenuine, markerBy('drive-by-user')]);
+    expect(result.posted).toBe(true);
+  });
+
+  test('the poster identity is only looked up when a marker comment exists', async () => {
+    let lookups = 0;
+    const counting = async (): Promise<string> => {
+      lookups += 1;
+      return POSTER;
+    };
+    const plain: EscalationIssueComment = {
+      body: 'just a human comment',
+      created_at: RECENT,
+      authorLogin: 'someone',
+    };
+    expect((await deliverWith([plain], counting)).posted).toBe(true);
+    expect(lookups).toBe(0);
+    expect((await deliverWith([markerBy(POSTER)], counting)).posted).toBe(false);
+    expect(lookups).toBe(1);
+  });
+
+  test('an unresolved (empty) poster identity fails closed: throws, nothing posted', async () => {
+    let posts = 0;
+    await expect(
+      deliverEscalationToIssue(
+        { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'x' },
+        {
+          listIssueComments: async () => [markerBy(POSTER)],
+          postIssueComment: async () => {
+            posts += 1;
+          },
+          posterLogin: async () => '  ',
+          now: () => new Date(T0),
+        }
+      )
+    ).rejects.toThrow('taskmaster_github_poster_login_unresolved');
+    expect(posts).toBe(0);
+  });
+
+  test('real deps: a forged marker from the GitHub API (wrong user.login) does not suppress', async () => {
+    const fake = fakeGithubComments([
+      markerBy('drive-by-user'),
+      { body: 'no user on this one', created_at: RECENT, authorLogin: null },
+    ]);
+    const deps = {
+      ...createRealEscalationDeliveryDeps({ fetchImpl: fake.fetchImpl, token: 'test-token' }),
+      now: () => new Date(T0),
+    };
+    const result = await deliverEscalationToIssue(
+      { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'hello' },
+      deps
+    );
+    expect(result.posted).toBe(true);
+    expect(fake.posts).toEqual([JSON.stringify({ body: 'hello' })]);
+  });
+
+  test('real deps: GET /user is resolved once per token and cached across deliveries', async () => {
+    const fake = fakeGithubComments([markerBy(POSTER)]);
+    const deps = {
+      ...createRealEscalationDeliveryDeps({ fetchImpl: fake.fetchImpl, token: 'test-token' }),
+      now: () => new Date(T0),
+    };
+    const params = {
+      issue: ISSUE,
+      threadRef: 'gh:thinmansoftware/bdc-harness#194',
+      body: 'x',
+    };
+    expect((await deliverEscalationToIssue(params, deps)).posted).toBe(false);
+    expect((await deliverEscalationToIssue(params, deps)).posted).toBe(false);
+    expect(fake.userLookups()).toBe(1);
+  });
+
+  test('real deps: a failed GET /user throws, posts nothing, and is retried next time', async () => {
+    let userCalls = 0;
+    let posts = 0;
+    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input);
+      if ((init?.method ?? 'GET') === 'POST') {
+        posts += 1;
+        return new Response('{}', { status: 201 });
+      }
+      if (url.pathname === '/user') {
+        userCalls += 1;
+        return userCalls === 1
+          ? new Response('{}', { status: 502 })
+          : new Response(JSON.stringify({ login: POSTER }), { status: 200 });
+      }
+      const payload = [
+        { body: TASKMASTER_ESCALATION_MARKER, created_at: RECENT, user: { login: POSTER } },
+      ];
+      return new Response(JSON.stringify(payload), { status: 200 });
+    };
+    const deps = {
+      ...createRealEscalationDeliveryDeps({ fetchImpl, token: 'test-token' }),
+      now: () => new Date(T0),
+    };
+    const params = { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'x' };
+    await expect(deliverEscalationToIssue(params, deps)).rejects.toThrow(
+      'taskmaster_github_http_502'
+    );
+    expect(posts).toBe(0);
+    expect((await deliverEscalationToIssue(params, deps)).posted).toBe(false);
+    expect(userCalls).toBe(2);
+    expect(posts).toBe(0);
   });
 });

@@ -25,6 +25,12 @@
  *     first tick's comment.
  * Re-escalation therefore happens only after 72h has elapsed since the last
  * Taskmaster escalation comment on that issue.
+ *
+ * MARKER TRUST. The marker is public text, so a marker comment counts only
+ * when its author is the login Taskmaster posts as (deps.posterLogin; the real
+ * deps resolve it once with GET /user using the same token that posts). A
+ * copied marker from anyone else is ignored and cannot suppress or delay an
+ * escalation.
  */
 import { createLogger } from '@archon/paths';
 import type { IDatabase } from '@archon/core/db/adapters/types';
@@ -206,6 +212,11 @@ export function buildEscalationCommentBody(params: {
 export interface EscalationIssueComment {
   body: string;
   created_at: string;
+  /**
+   * Login of the comment's author (GitHub `user.login`). null when the API
+   * response carried no user; such a comment is never trusted as a marker.
+   */
+  authorLogin: string | null;
 }
 
 export interface EscalationDeliveryDeps {
@@ -221,6 +232,12 @@ export interface EscalationDeliveryDeps {
     sinceIso?: string
   ): Promise<EscalationIssueComment[]>;
   postIssueComment(issue: EscalationIssueRef, body: string): Promise<void>;
+  /**
+   * The GitHub login postIssueComment posts as. A marker comment counts toward
+   * the cooldown only when its authorLogin matches (case-insensitive). Called
+   * only when the listing contains a marker comment.
+   */
+  posterLogin(): Promise<string>;
   now?: () => Date;
   /**
    * Per-issue delivery claim taken BEFORE the GitHub list+post, so two ticks or
@@ -283,11 +300,23 @@ export async function deliverEscalationToIssue(
   try {
     const windowStartIso = new Date(nowMs - TASKMASTER_ESCALATION_COOLDOWN_MS).toISOString();
     const comments = await deps.listIssueComments(params.issue, windowStartIso);
+    // The marker text is public, so anyone who can comment can copy it. Only a
+    // marker comment AUTHORED BY the identity Taskmaster posts as counts toward
+    // the cooldown; any other marker comment (wrong author, or no author) is
+    // ignored entirely -- it never suppresses and never resets the 72h clock.
+    // The poster identity is resolved only when a marker comment exists.
+    const markerComments = comments.filter(comment =>
+      (comment.body ?? '').includes(TASKMASTER_ESCALATION_MARKER)
+    );
     let latestMarkerMs = Number.NEGATIVE_INFINITY;
-    for (const comment of comments) {
-      if (!(comment.body ?? '').includes(TASKMASTER_ESCALATION_MARKER)) continue;
-      const createdMs = Date.parse(comment.created_at);
-      if (Number.isFinite(createdMs) && createdMs > latestMarkerMs) latestMarkerMs = createdMs;
+    if (markerComments.length > 0) {
+      const poster = (await deps.posterLogin()).trim().toLowerCase();
+      if (!poster) throw new Error('taskmaster_github_poster_login_unresolved');
+      for (const comment of markerComments) {
+        if (comment.authorLogin?.trim().toLowerCase() !== poster) continue;
+        const createdMs = Date.parse(comment.created_at);
+        if (Number.isFinite(createdMs) && createdMs > latestMarkerMs) latestMarkerMs = createdMs;
+      }
     }
     if (
       latestMarkerMs > Number.NEGATIVE_INFINITY &&
@@ -468,10 +497,54 @@ async function listAllIssueComments(
     const response = await githubRequest(url, options);
     const page: unknown = await response.json();
     if (!Array.isArray(page)) throw new Error('taskmaster_github_comments_not_array');
-    for (const comment of page) all.push(comment);
+    for (const raw of page) all.push(toEscalationComment(raw));
     url = page.length > 0 ? parseNextLink(response.headers.get('link')) : null;
   }
   return all;
+}
+
+/** Map one GitHub issue-comment JSON object, keeping its author's login. */
+function toEscalationComment(raw: unknown): EscalationIssueComment {
+  const comment = (raw ?? {}) as {
+    body?: unknown;
+    created_at?: unknown;
+    user?: { login?: unknown } | null;
+  };
+  const login = comment.user?.login;
+  return {
+    body: typeof comment.body === 'string' ? comment.body : '',
+    created_at: typeof comment.created_at === 'string' ? comment.created_at : '',
+    authorLogin: typeof login === 'string' && login.trim() ? login : null,
+  };
+}
+
+/**
+ * The login the token authenticates as (GET /user), cached per token for the
+ * life of the deps object so the lookup costs one call, not one per
+ * escalation. A failed lookup is not cached; it throws, so the escalation
+ * fails this tick and is retried rather than trusting or distrusting markers
+ * blindly.
+ */
+function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () => Promise<string> {
+  let cached: { token: string | null; login: Promise<string> } | null = null;
+  return (): Promise<string> => {
+    const token = options.token !== undefined ? options.token : githubToken();
+    if (cached?.token === token) return cached.login;
+    const login = (async (): Promise<string> => {
+      const response = await githubRequest(`${GITHUB_API_ORIGIN}/user`, options);
+      const user = (await response.json()) as { login?: unknown } | null;
+      const value = user?.login;
+      if (typeof value !== 'string' || !value.trim()) {
+        throw new Error('taskmaster_github_poster_login_unresolved');
+      }
+      return value;
+    })();
+    cached = { token, login };
+    login.catch(() => {
+      if (cached?.login === login) cached = null;
+    });
+    return login;
+  };
 }
 
 /**
@@ -493,5 +566,6 @@ export function createRealEscalationDeliveryDeps(
         body: JSON.stringify({ body }),
       });
     },
+    posterLogin: createPosterLoginResolver(options),
   };
 }

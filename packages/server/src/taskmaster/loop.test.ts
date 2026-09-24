@@ -471,13 +471,18 @@ function makeIssueCommentSink(
       listIssueComments: async issue => byIssue.get(keyOf(issue)) ?? [],
       postIssueComment: async (issue, body) => {
         posts += 1;
-        const comment = { body, created_at: new Date(world.nowMs).toISOString() };
+        const comment = {
+          body,
+          created_at: new Date(world.nowMs).toISOString(),
+          authorLogin: 'taskmaster-bot',
+        };
         const list = byIssue.get(keyOf(issue)) ?? [];
         list.push(comment);
         byIssue.set(keyOf(issue), list);
         all.push(comment);
         onPost?.(body);
       },
+      posterLogin: async () => 'taskmaster-bot',
       now: () => new Date(world.nowMs),
     },
   };

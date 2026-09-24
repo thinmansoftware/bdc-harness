@@ -65,6 +65,17 @@ import {
 
 const log = createLogger('taskmaster/loop');
 
+/**
+ * One process-wide real escalation-delivery deps object, so its cached
+ * poster-login lookup (GET /user, used to trust only Taskmaster's own marker
+ * comments) runs once per token rather than once per escalation.
+ */
+let realEscalationDelivery: EscalationDeliveryDeps | null = null;
+function defaultEscalationDelivery(): EscalationDeliveryDeps {
+  realEscalationDelivery ??= createRealEscalationDeliveryDeps();
+  return realEscalationDelivery;
+}
+
 /** Ratified Q1 budgets. */
 export const MAX_EFFECTS_PER_TICK = 10;
 /** Conservative faucet bound for newly eligible work, within the shared cap. */
@@ -1741,7 +1752,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           ownerLabelLogin: parseOwnerLabel(adoptionRow?.labels_json),
           nowMs,
         });
-        const baseDelivery = deps.escalationDelivery ?? createRealEscalationDeliveryDeps();
+        const baseDelivery = deps.escalationDelivery ?? defaultEscalationDelivery();
         const delivery: EscalationDeliveryDeps =
           baseDelivery.claim || deps.db
             ? baseDelivery
