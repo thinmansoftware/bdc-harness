@@ -1,3 +1,4 @@
+import { Octokit } from '@octokit/rest';
 import { createRealOctokitClient, resolveGitHubAppAuth } from './adapters/github-real-deps';
 import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
 
@@ -195,6 +196,26 @@ export interface ReconcileResult {
   scanned: number;
   closed: number;
   skipped: boolean;
+  /**
+   * Classified rate-limit deadline, present only when `skipped` is a deferral.
+   * The reconcile scheduler waits at least this long before the next pass.
+   */
+  retryAfterMs?: number;
+  /** Absolute ISO-8601 instant matching `retryAfterMs`. */
+  retryAfter?: string;
+}
+
+/**
+ * How long the reconcile scheduler should sleep after one pass.
+ * A classified rate-limit skip extends the normal interval; it never shortens it.
+ */
+export function reconcileSchedulerWaitMs(intervalMs: number, result: unknown): number {
+  if (!result || typeof result !== 'object') return intervalMs;
+  const retryAfterMs = (result as { retryAfterMs?: unknown }).retryAfterMs;
+  if (typeof retryAfterMs !== 'number' || !Number.isFinite(retryAfterMs) || retryAfterMs < 0) {
+    return intervalMs;
+  }
+  return Math.max(intervalMs, retryAfterMs);
 }
 
 export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<ReconcileResult> {
@@ -212,7 +233,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
         identity: deps.githubIdentity,
         operation: 'searchMergedPullRequests',
       });
-      return { scanned: 0, closed: 0, skipped: true };
+      return rateLimitSkipResult(error, 0, 0);
     }
     if (isAuthError(error)) {
       logger.warn({ err: error as Error, authError: true }, 'overseer.reconcile.auth_error_skip');
@@ -272,7 +293,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
             operation: 'findTrackerIssueByStem',
             stem,
           });
-          return { scanned: seen.size, closed, skipped: true };
+          return rateLimitSkipResult(error, seen.size, closed);
         }
         if (isAuthError(error)) {
           logger.warn(
@@ -321,7 +342,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
               operation: 'listPullRequestFiles',
               stem,
             });
-            return { scanned: seen.size, closed, skipped: true };
+            return rateLimitSkipResult(error, seen.size, closed);
           }
           // Fail OPEN on any other file-listing error: leave the tracker alone
           // rather than closing on unverified evidence. A tracker left open is
@@ -575,6 +596,33 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     octokit ??= createRealOctokitClient() as unknown as OctokitLike;
     return octokit;
   };
+  // The App installation has no Issues permission. Comment, label, and close
+  // therefore 403 with "Resource not accessible by integration" when served as
+  // the App. Reads stay on the App. Mutations retry once on the configured PAT.
+  let patOctokit: OctokitLike | null = null;
+  const getIssueFallbackClient = (): OctokitLike | null => {
+    if (identity !== 'app' || !pat) return null;
+    patOctokit ??= new Octokit({ auth: pat }) as unknown as OctokitLike;
+    return patOctokit;
+  };
+  const mutateTrackerIssue = async (
+    operation: string,
+    call: (client: OctokitLike) => Promise<unknown>
+  ): Promise<void> => {
+    const primary = getOctokit();
+    try {
+      await invokeGitHub(scope, operation, () => call(primary));
+    } catch (error) {
+      if (!isIssuesPermissionGap(error)) throw error;
+      const fallback = getIssueFallbackClient();
+      if (!fallback) throw error;
+      log.info(
+        { operation, from: 'app', to: 'pat' },
+        'overseer.reconcile.issue_mutation_pat_fallback'
+      );
+      await invokeGitHub({ identity: 'pat', log }, operation, () => call(fallback));
+    }
+  };
   return {
     readCursor: readReconcileCursorFromActions,
     githubIdentity: identity,
@@ -596,8 +644,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       return res.data.map(f => f.filename);
     },
     addTrackerEvidenceComment: async (input): Promise<void> => {
-      const client = getOctokit();
-      await invokeGitHub(scope, 'addTrackerEvidenceComment', () =>
+      await mutateTrackerIssue('addTrackerEvidenceComment', client =>
         client.issues.createComment({
           owner: input.issue.owner,
           repo: input.issue.repo,
@@ -607,8 +654,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       );
     },
     addTrackerLabel: async (input): Promise<void> => {
-      const client = getOctokit();
-      await invokeGitHub(scope, 'addTrackerLabel', () =>
+      await mutateTrackerIssue('addTrackerLabel', client =>
         client.issues.addLabels({
           owner: input.issue.owner,
           repo: input.issue.repo,
@@ -618,8 +664,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       );
     },
     closeTrackerIssue: async (input): Promise<void> => {
-      const client = getOctokit();
-      await invokeGitHub(scope, 'closeTrackerIssue', () =>
+      await mutateTrackerIssue('closeTrackerIssue', client =>
         client.issues.update({
           owner: input.issue.owner,
           repo: input.issue.repo,
@@ -838,8 +883,28 @@ async function deferOnRateLimit(
   } catch (error) {
     if (!shouldDeferForRateLimit(error)) throw error;
     logRateLimitSkip(logger, error, { identity: deps.githubIdentity, operation, stem });
-    return { scanned, closed, skipped: true };
+    return rateLimitSkipResult(error, scanned, closed);
   }
+}
+
+function rateLimitSkipResult(error: unknown, scanned: number, closed: number): ReconcileResult {
+  const deferral = isReconcileRateLimitDeferral(error) ? error : null;
+  const classification = deferral ?? classifyRateLimitError(error);
+  if (!classification) return { scanned, closed, skipped: true };
+  return {
+    scanned,
+    closed,
+    skipped: true,
+    retryAfterMs: classification.retryAfterMs,
+    retryAfter: classification.retryAfter,
+  };
+}
+
+/** App Issues-permission gap: a 403 that is not a rate limit. */
+function isIssuesPermissionGap(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const status = (error as { status?: number }).status;
+  return status === 403 && !isRateLimitError(error);
 }
 
 function isRateLimitError(error: unknown): boolean {

@@ -1,5 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test';
+import { DEFAULT_RATE_LIMIT_RETRY_MS } from '../github-rate-limit';
 import {
+  reconcileSchedulerWaitMs,
   runReconcileOnce,
   type ReconcileActionRecord,
   type ReconcileDeps,
@@ -176,7 +178,8 @@ describe('reconcile', () => {
 
     const result = await runReconcileOnce({ deps });
 
-    expect(result).toEqual({ scanned: 0, closed: 0, skipped: true });
+    expect(result).toMatchObject({ scanned: 0, closed: 0, skipped: true });
+    expect(result.retryAfterMs).toBe(DEFAULT_RATE_LIMIT_RETRY_MS);
     expect(deps.warnings).toEqual(['overseer.reconcile.rate_limit_skip']);
     expect(deps.findTrackerIssueByStem).not.toHaveBeenCalled();
     expect(deps.comments).toEqual([]);
@@ -219,7 +222,8 @@ describe('reconcile', () => {
 
     const result = await runReconcileOnce({ deps });
 
-    expect(result).toEqual({ scanned: 1, closed: 0, skipped: true });
+    expect(result).toMatchObject({ scanned: 1, closed: 0, skipped: true });
+    expect(result.retryAfterMs).toBe(DEFAULT_RATE_LIMIT_RETRY_MS);
     expect(deps.warnings).toEqual(['overseer.reconcile.rate_limit_skip']);
     expect(deps.comments).toEqual([]);
     expect(deps.closes).toEqual([]);
@@ -251,7 +255,8 @@ describe('reconcile', () => {
 
     const result = await runReconcileOnce({ deps });
 
-    expect(result).toEqual({ scanned: 0, closed: 0, skipped: true });
+    expect(result).toMatchObject({ scanned: 0, closed: 0, skipped: true });
+    expect(result.retryAfterMs).toBe(DEFAULT_RATE_LIMIT_RETRY_MS);
     expect(deps.warnings).toEqual(['overseer.reconcile.rate_limit_skip']);
     expect(deps.warnings).not.toContain('overseer.reconcile.iteration_failed_isolated');
     const fields = deps.warningFields[0];
@@ -280,7 +285,8 @@ describe('reconcile', () => {
 
     const result = await runReconcileOnce({ deps });
 
-    expect(result).toEqual({ scanned: 1, closed: 0, skipped: true });
+    expect(result).toMatchObject({ scanned: 1, closed: 0, skipped: true });
+    expect(result.retryAfterMs).toBe(DEFAULT_RATE_LIMIT_RETRY_MS);
     expect(deps.warnings).toContain('overseer.reconcile.rate_limit_skip');
     expect(deps.warnings).not.toContain('overseer.reconcile.file_list_failed_leaving_tracker_open');
     expect(deps.closes).toEqual([]);
@@ -304,7 +310,8 @@ describe('reconcile', () => {
 
     const result = await runReconcileOnce({ deps });
 
-    expect(result).toEqual({ scanned: 1, closed: 0, skipped: true });
+    expect(result).toMatchObject({ scanned: 1, closed: 0, skipped: true });
+    expect(result.retryAfterMs).toBe(DEFAULT_RATE_LIMIT_RETRY_MS);
     expect(deps.closes).toEqual([]);
     expect(deps.warningFields.at(-1)).toMatchObject({
       identity: 'app',
@@ -347,11 +354,15 @@ interface AuthProbeResult {
   }[];
   logs: { message: string; identity?: string; operation?: string; rateLimitRemaining?: string }[];
   missingCredentials: boolean;
+  issueCalls?: { operation: string; authIsString: boolean }[];
 }
 
-function runAuthProbe(mode: 'app-and-pat' | 'pat-only' | 'app-only'): AuthProbeResult {
+function runAuthProbe(
+  mode: 'app-and-pat' | 'pat-only' | 'app-only' | 'issue-mutations',
+  issueFailure: 'none' | 'permission' | 'rate-limit' = 'none'
+): AuthProbeResult {
   const probe = new URL('./fixtures/reconcile-auth-probe.ts', import.meta.url);
-  const child = Bun.spawnSync([process.execPath, probe.pathname, mode], {
+  const child = Bun.spawnSync([process.execPath, probe.pathname, mode, issueFailure], {
     stdout: 'pipe',
     stderr: 'pipe',
     env: process.env,
@@ -369,6 +380,30 @@ function runAuthProbe(mode: 'app-and-pat' | 'pat-only' | 'app-only'): AuthProbeR
   }
   return JSON.parse(line) as AuthProbeResult;
 }
+
+describe('reconcile scheduler wait', () => {
+  test('a classified skip extends the interval to retryAfterMs', () => {
+    expect(
+      reconcileSchedulerWaitMs(30_000, {
+        scanned: 0,
+        closed: 0,
+        skipped: true,
+        retryAfterMs: 900_000,
+      })
+    ).toBe(900_000);
+  });
+
+  test('a shorter deadline does not retry before the normal interval', () => {
+    expect(
+      reconcileSchedulerWaitMs(30_000, { scanned: 0, closed: 0, skipped: true, retryAfterMs: 5_000 })
+    ).toBe(30_000);
+  });
+
+  test('auth and transport skips keep the normal interval', () => {
+    expect(reconcileSchedulerWaitMs(30_000, { scanned: 0, closed: 0, skipped: true })).toBe(30_000);
+    expect(reconcileSchedulerWaitMs(30_000, undefined)).toBe(30_000);
+  });
+});
 
 describe('reconcile default client auth', () => {
   test('App and PAT configured: client uses App auth and logs identity app', () => {
@@ -405,5 +440,28 @@ describe('reconcile default client auth', () => {
     expect(result.constructions.length).toBeGreaterThan(0);
     expect(result.constructions[0]?.hasAuthStrategy).toBe(true);
     expect(result.logs.some(entry => entry.identity === 'app')).toBe(true);
+  });
+
+  test('App Issues-permission 403 falls back to the configured PAT for comment, label, and close', () => {
+    const result = runAuthProbe('issue-mutations', 'permission');
+    expect(result.ok).toBe(true);
+    expect(result.constructions.some(item => item.hasAuthStrategy)).toBe(true);
+    expect(result.constructions.some(item => item.authIsString)).toBe(true);
+    const calls = result.issueCalls ?? [];
+    expect(calls.filter(call => call.authIsString).map(call => call.operation)).toEqual([
+      'createComment',
+      'addLabels',
+      'update',
+    ]);
+    expect(result.logs.some(entry => entry.identity === 'pat')).toBe(true);
+  });
+
+  test('a classified rate limit on an issue mutation does not fall back to the PAT', () => {
+    const result = runAuthProbe('issue-mutations', 'rate-limit');
+    expect(result.ok).toBe(false);
+    expect(result.constructions.some(item => item.authIsString)).toBe(false);
+    expect(result.issueCalls ?? []).toEqual([
+      { operation: 'createComment', authIsString: false },
+    ]);
   });
 });

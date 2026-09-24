@@ -23,7 +23,14 @@ interface ConstructionSummary {
   authIsString: boolean;
 }
 
+interface IssueCall {
+  operation: string;
+  authIsString: boolean;
+}
+
 const constructions: ConstructionSummary[] = [];
+const issueCalls: IssueCall[] = [];
+const issueFailure = process.argv[3] ?? 'none';
 
 mock.module('@octokit/rest', () => ({
   Octokit: class Octokit {
@@ -34,14 +41,31 @@ mock.module('@octokit/rest', () => ({
           ? (auth as { appId?: unknown; installationId?: unknown })
           : null;
       const strategy = options.authStrategy;
-      constructions.push({
+      const summary: ConstructionSummary = {
         hasAuthStrategy: typeof strategy === 'function',
         authStrategyName: typeof strategy === 'function' ? strategy.name : null,
         appId: typeof authObject?.appId === 'string' ? authObject.appId : null,
         installationId:
           typeof authObject?.installationId === 'string' ? authObject.installationId : null,
         authIsString: typeof auth === 'string',
-      });
+      };
+      constructions.push(summary);
+      const recordIssue = (operation: string): Record<string, never> => {
+        issueCalls.push({ operation, authIsString: summary.authIsString });
+        if (summary.authIsString || issueFailure === 'none') return {};
+        if (issueFailure === 'rate-limit') {
+          throw Object.assign(new Error('API rate limit exceeded'), {
+            status: 403,
+            response: { headers: { 'x-ratelimit-remaining': '0' } },
+          });
+        }
+        throw Object.assign(new Error('Resource not accessible by integration'), { status: 403 });
+      };
+      this.issues = {
+        createComment: async (): Promise<Record<string, never>> => recordIssue('createComment'),
+        addLabels: async (): Promise<Record<string, never>> => recordIssue('addLabels'),
+        update: async (): Promise<Record<string, never>> => recordIssue('update'),
+      };
     }
 
     search = {
@@ -65,10 +89,10 @@ mock.module('@octokit/rest', () => ({
       }),
     };
 
-    issues = {
-      createComment: async (): Promise<Record<string, never>> => ({}),
-      addLabels: async (): Promise<Record<string, never>> => ({}),
-      update: async (): Promise<Record<string, never>> => ({}),
+    issues!: {
+      createComment(input: Record<string, unknown>): Promise<unknown>;
+      addLabels(input: Record<string, unknown>): Promise<unknown>;
+      update(input: Record<string, unknown>): Promise<unknown>;
     };
   },
 }));
@@ -113,7 +137,7 @@ function applyMode(mode: string): void {
   process.env.GITHUB_APP_ID = '4574893';
   process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
   process.env.GITHUB_APP_PRIVATE_KEY = pem();
-  if (mode === 'app-and-pat') {
+  if (mode === 'app-and-pat' || mode === 'issue-mutations') {
     process.env.GITHUB_TOKEN = 'ghp_probe_pat';
   }
 }
@@ -130,14 +154,26 @@ try {
   const missingCredentials = deps.githubIdentity === undefined;
   if (!missingCredentials) {
     await deps.searchMergedPullRequests({ org: 'thinmansoftware', since: '2026-01-01' });
+    if (mode === 'issue-mutations') {
+      const issue = {
+        owner: 'thinmansoftware',
+        repo: 'bdc-xo',
+        number: 1,
+        title: 'WO-PROBE-01',
+        state: 'open' as const,
+      };
+      await deps.addTrackerEvidenceComment({ issue, body: 'evidence' });
+      await deps.addTrackerLabel({ issue, label: 'wo:done' });
+      await deps.closeTrackerIssue({ issue });
+    }
   }
   process.stdout.write(
-    `${JSON.stringify({ ok: true, constructions, logs, missingCredentials })}\n`
+    `${JSON.stringify({ ok: true, constructions, logs, missingCredentials, issueCalls })}\n`
   );
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   process.stdout.write(
-    `${JSON.stringify({ ok: false, error: message, constructions, logs, missingCredentials: false })}\n`
+    `${JSON.stringify({ ok: false, error: message, constructions, logs, missingCredentials: false, issueCalls })}\n`
   );
 } finally {
   for (const key of ENV_KEYS) {

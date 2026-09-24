@@ -23,7 +23,7 @@ import {
   type OperatorCardChannel,
 } from './escalation-delivery';
 import { permitFromMetadata } from './permit';
-import { runReconcileOnce } from './reconcile';
+import { reconcileSchedulerWaitMs, runReconcileOnce } from './reconcile';
 import { watchLoop } from './watch';
 import type {
   GitHubClientDeps,
@@ -118,15 +118,18 @@ export async function runReconcileScheduler(input: {
   reconcile?: () => Promise<unknown>;
 }): Promise<void> {
   const reconcile = input.reconcile ?? ((): Promise<unknown> => runReconcileOnce());
+  const intervalMs = input.intervalMs ?? 30_000;
   for (;;) {
     if (input.signal?.aborted) return;
+    let waitMs = intervalMs;
     try {
-      await reconcile();
+      const result = await reconcile();
+      waitMs = reconcileSchedulerWaitMs(intervalMs, result);
     } catch (error) {
       log.error({ err: error as Error }, 'overseer.reconcile.iteration_failed_isolated');
     }
     if (input.once || input.signal?.aborted) return;
-    await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
+    await waitForDeliveryInterval(waitMs, input.signal);
   }
 }
 
