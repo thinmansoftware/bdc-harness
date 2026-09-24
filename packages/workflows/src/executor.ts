@@ -28,6 +28,16 @@ import {
 import { captureRuntimeRevisions } from './reliability/runtime-revisions';
 import { formatProbeBlock, runFireTimeProbe } from './reliability/fire-time-probe';
 import {
+  decideSeatGate,
+  getSeatCutoff,
+  getSeatUsageReader,
+  isSeatGateEnabled,
+  seatsForBindings,
+  unknownSeatReading,
+  type SeatId,
+  type SeatReading,
+} from './reliability/seat-usage';
+import {
   renderCanaryProbeRed,
   renderCanaryProbeWarn,
   sendCanaryTelegramAlert,
@@ -38,6 +48,28 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.executor');
   return cachedLog;
+}
+
+async function readBoundSeats(
+  seatIds: readonly SeatId[]
+): Promise<Partial<Record<SeatId, SeatReading>>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>(resolve => {
+    timer = setTimeout(() => resolve(null), 12_000);
+  });
+  try {
+    const result = await Promise.race([getSeatUsageReader()(seatIds), timeout]);
+    if (result) return result;
+  } catch (err) {
+    getLog().warn({ err: err as Error }, 'workflow.seat_usage_unknown');
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  const unknown: Partial<Record<SeatId, SeatReading>> = {};
+  for (const seat of seatIds) {
+    unknown[seat] = unknownSeatReading(seat, 'seat read timed out');
+  }
+  return unknown;
 }
 
 async function pageCanaryTelegram(text: string, context: Record<string, unknown>): Promise<void> {
@@ -1086,6 +1118,62 @@ export async function executeWorkflow(
       await deps.store.failWorkflowRun(workflowRun.id, reason);
       await sendCriticalMessage(platform, conversationId, `[ ] **Workflow blocked**: ${reason}`);
       return { success: false, workflowRunId: workflowRun.id, error: reason };
+    }
+
+    if (isSeatGateEnabled()) {
+      const seatIds = seatsForBindings(probeDecision.bindings);
+      if (seatIds.length > 0) {
+        const readings = await readBoundSeats(seatIds);
+        const cutoff = getSeatCutoff();
+        const seatDecision = decideSeatGate(probeDecision.bindings, readings, cutoff.percent);
+        if (seatDecision.refused) {
+          const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}`;
+          getLog().warn(
+            {
+              workflowName: executableWorkflow.name,
+              workflowRunId: workflowRun.id,
+              seat: seatDecision.seat,
+              window: seatDecision.window,
+              usedPercent: seatDecision.usedPercent,
+              cutoffPercent: seatDecision.cutoffPercent,
+            },
+            'workflow.seat_usage_refused'
+          );
+          await deps.store
+            .createWorkflowEvent({
+              workflow_run_id: workflowRun.id,
+              event_type: 'dag_workflow_failed',
+              data: {
+                reason: 'seat_usage_refused',
+                detail,
+              },
+            })
+            .catch((err: Error) => {
+              getLog().error(
+                { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
+                'workflow_event_persist_failed'
+              );
+            });
+          await deps.store.failWorkflowRun(workflowRun.id, detail);
+          await sendCriticalMessage(
+            platform,
+            conversationId,
+            `Workflow refused: seat ${seatDecision.seat} at ${String(seatDecision.usedPercent)}% of ${seatDecision.window} (cutoff ${String(seatDecision.cutoffPercent)}%)`
+          );
+          return { success: false, workflowRunId: workflowRun.id, error: detail };
+        }
+        for (const seat of seatDecision.unknownSeats) {
+          getLog().warn(
+            {
+              workflowName: executableWorkflow.name,
+              workflowRunId: workflowRun.id,
+              seat,
+              note: readings[seat]?.note ?? 'UNKNOWN',
+            },
+            'workflow.seat_usage_unknown'
+          );
+        }
+      }
     }
 
     getLog().info(
