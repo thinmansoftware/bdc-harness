@@ -186,6 +186,30 @@ describe('deploy drift detector', () => {
     expect(body.behind_by).toBe(3);
     expect((body.undeployed_prs as { number: number }[]).map(pr => pr.number)).toEqual([901, 902]);
     expect(body.commits_without_pr).toBe(1);
+    expect(
+      (body.undeployed_prs as unknown[]).length + (body.commits_without_pr as number)
+    ).toBe(body.behind_by);
+  });
+
+  test('pr_list_cap_still_counts_every_commit', async () => {
+    runningSha = SHA_A;
+    headSha = SHA_B;
+    const commits = [];
+    for (let i = 1; i <= 22; i++) {
+      commits.push(commit(`Fix ${i} (#${900 + i})`, hoursBefore(3)));
+    }
+    commits.push(commit('chore no pr a', hoursBefore(2)));
+    commits.push(commit('chore no pr b', hoursBefore(1)));
+    compareBody = { status: 'ahead', ahead_by: 24, commits };
+    const result = await run();
+    expect(result?.verdict).toBe('drift_alerted');
+    const body = bodyOf();
+    const prs = body.undeployed_prs as { number: number }[];
+    expect(prs).toHaveLength(20);
+    expect(prs.map(pr => pr.number)).toEqual(Array.from({ length: 20 }, (_, i) => 901 + i));
+    expect(body.commits_without_pr).toBe(4);
+    expect(body.behind_by).toBe(24);
+    expect(prs.length + (body.commits_without_pr as number)).toBe(body.behind_by);
   });
 
   test('repeated_ticks_stay_deduplicated', async () => {
@@ -277,14 +301,53 @@ describe('deploy drift detector', () => {
     runningSha = SHA_A;
     headSha = SHA_B;
     processStartedAt = new Date(NOW - 3 * 60 * 60 * 1000);
-    compareBody = { status: 'diverged', ahead_by: 1, behind_by: 1, commits: [] };
+    compareBody = {
+      status: 'diverged',
+      ahead_by: 4,
+      behind_by: 7,
+      commits: [commit('Fix on dev (#910)', hoursBefore(1))],
+    };
     const result = await run();
     expect(result?.verdict).toBe('drift_alerted');
+    expect(result?.behind_by).toBe(7);
     expect(store.size).toBe(1);
     const body = bodyOf();
     expect(body.reason).toBe('running_not_on_dev');
     expect(body.running_sha).toBe(SHA_A);
     expect(body.target_sha).toBe(SHA_B);
+    expect(body.behind_by).toBe(7);
+  });
+
+  test('two_episodes_beyond_grace_one_alert_each', async () => {
+    runningSha = SHA_A;
+    headSha = SHA_B;
+    processStartedAt = new Date(NOW - 3 * 60 * 60 * 1000);
+    compareBody = {
+      status: 'ahead',
+      ahead_by: 1,
+      commits: [commit('Fix x (#901)', hoursBefore(3))],
+    };
+    lanes = {
+      baked: { 'lane-a.yaml': 'h1' },
+      served: { 'lane-a.yaml': 'h9' },
+    };
+    const result = await run();
+    expect(result?.verdict).toBe('drift_alerted');
+    expect(result?.reasons).toEqual(['behind_dev', 'served_lane_differs']);
+    expect(createMessage).toHaveBeenCalledTimes(2);
+    expect(store.size).toBe(2);
+    const keys = [...store.keys()];
+    expect(keys.filter(key => key.startsWith('do-clock:deploy-drift:'))).toHaveLength(1);
+    expect(keys.filter(key => key.startsWith('do-clock:lane-drift:'))).toHaveLength(1);
+    const reasons = [...store.values()].map(row => {
+      const parsed = JSON.parse(row.body) as { reason: string };
+      return parsed.reason;
+    });
+    expect(reasons.sort()).toEqual(['behind_dev', 'served_lane_differs']);
+    nowMs += 60_000;
+    await run();
+    expect(createMessage).toHaveBeenCalledTimes(2);
+    expect(store.size).toBe(2);
   });
 
   test('served_lane_drift', async () => {

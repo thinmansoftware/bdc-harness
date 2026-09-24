@@ -67,6 +67,7 @@ interface GhCommit {
 interface CompareResponse {
   status?: string;
   ahead_by?: number;
+  behind_by?: number;
   commits?: GhCommit[];
 }
 
@@ -327,12 +328,14 @@ export async function runDeployDriftDetector(
             const number = lastPrNumber(title);
             if (number === null) commitsWithoutPr += 1;
             else if (undeployedPrs.length < 20) undeployedPrs.push({ number, title });
+            else commitsWithoutPr += 1;
             const date = commit.commit?.committer?.date;
             const parsed = date ? Date.parse(date) : Number.NaN;
             if (Number.isFinite(parsed) && (oldestMs === null || parsed < oldestMs))
               oldestMs = parsed;
           }
-          behindBy = typeof compare.ahead_by === 'number' ? compare.ahead_by : commits.length;
+          const compareCount = reason === 'behind_dev' ? compare.ahead_by : compare.behind_by;
+          behindBy = typeof compareCount === 'number' ? compareCount : commits.length;
           let beyondGrace = false;
           let oldestUndeployedAt: string | null = null;
           if (reason === 'behind_dev') {
