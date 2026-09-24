@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { existsSync, mkdtempSync, unlinkSync } from 'fs';
 import { removeTempDirWithRetry } from '../test/temp-dir';
 import { tmpdir } from 'os';
@@ -58,6 +58,7 @@ import {
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
   type XoLeaseBind,
+  type DispatchQueryExecutor,
 } from './dispatch';
 
 /** Test-local fixture constructor -- production path is createAuthenticatedMessage. */
@@ -963,6 +964,85 @@ describe('dispatch db', () => {
       }
     );
   });
+
+  for (const action of ['acknowledge', 'address'] as const) {
+    for (const turnover of ['replace', 'release'] as const) {
+      test(`${action} rejects XO lease ${turnover} between validation and UPDATE`, async () => {
+        const message = await createMessage({
+          correlation_id: 'corr-xo-turnover',
+          idempotency_key: 'idem-xo-turnover',
+          task_type: 'agent_message',
+          sender: 'operator',
+          recipient: 'xo',
+          body: 'XO lease turnover.',
+        });
+        const bind: XoLeaseBind = {
+          kind: 'xo_lease',
+          lease_id: '11111111-1111-4111-8111-111111111111',
+          fencing_token: 9,
+          holder_token_hash: createHash('sha256').update('test-holder').digest('hex'),
+        };
+        await db.query(
+          `INSERT INTO board_xo_leases
+           (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+            acquired_at, expires_at)
+           VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, $5)`,
+          [
+            bind.lease_id,
+            bind.holder_token_hash,
+            bind.fencing_token,
+            new Date().toISOString(),
+            new Date(Date.now() + 60_000).toISOString(),
+          ]
+        );
+        const data = { id: message.id, principal_id: 'xo', bind };
+        if (action === 'address') expect((await acknowledgeMessage(data)).ok).toBe(true);
+        const before = await getMessage(message.id);
+        const withTransaction = db.withTransaction.bind(db);
+        let leaseValidated = false;
+        let turnoverInjected = false;
+        const transactionSpy = spyOn(db, 'withTransaction').mockImplementation(fn =>
+          withTransaction(query => {
+            const wrappedQuery: DispatchQueryExecutor = async <T>(
+              sql: string,
+              params?: unknown[]
+            ) => {
+              if (sql.startsWith('UPDATE agent_dispatch_messages') && !turnoverInjected) {
+                expect(leaseValidated).toBe(true);
+                // Inject turnover only after the pre-check has read the valid lease.
+                await query(
+                  turnover === 'replace'
+                    ? "UPDATE board_xo_leases SET lease_id = '22222222-2222-4222-8222-222222222222', fencing_token = fencing_token + 1 WHERE id = 1"
+                    : 'UPDATE board_xo_leases SET released_at = $1 WHERE id = 1',
+                  turnover === 'release' ? [new Date().toISOString()] : []
+                );
+                turnoverInjected = true;
+              }
+              const result = await query<T>(sql, params);
+              if (sql.startsWith('SELECT lease_id, fencing_token, holder_token_hash')) {
+                expect(result.rowCount).toBe(turnoverInjected && turnover === 'release' ? 0 : 1);
+                leaseValidated = true;
+              }
+              return result;
+            };
+            return fn(wrappedQuery);
+          })
+        );
+        try {
+          const mutate = action === 'acknowledge' ? acknowledgeMessage : addressMessage;
+          await expect(mutate(data)).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+          expect(turnoverInjected).toBe(true);
+          const stored = await getMessage(message.id);
+          expect(stored?.acknowledged_at).toBe(before?.acknowledged_at ?? null);
+          expect(stored?.acknowledged_by).toBe(before?.acknowledged_by ?? null);
+          expect(stored?.addressed_at).toBeNull();
+          expect(stored?.addressed_by).toBeNull();
+        } finally {
+          transactionSpy.mockRestore();
+        }
+      });
+    }
+  }
 
   test('requires and transactionally fences the XO mailbox lease binding', async () => {
     const message = await createMessage({

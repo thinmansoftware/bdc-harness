@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import { createHash, randomUUID } from 'crypto';
@@ -39,7 +39,9 @@ mock.module('./connection', () => ({
   getDatabase: () => db,
 }));
 
-const { createAuthenticatedMessage } = await import('./dispatch');
+const { createAuthenticatedMessage, acknowledgeMessage, addressMessage, getMessage } =
+  await import('./dispatch');
+import type { DispatchQueryExecutor, XoLeaseBind } from './dispatch';
 
 function setSenderAuthMode(mode: 'enforce'): void {
   process.env.DISPATCH_SENDER_AUTH_MODE = mode;
@@ -135,6 +137,21 @@ beforeAll(async () => {
       supersedes_id UUID
     )
   `);
+  await db.query(`
+    CREATE TABLE board_xo_leases (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      lease_id UUID NOT NULL UNIQUE,
+      principal_id TEXT NOT NULL,
+      seat_id TEXT NOT NULL,
+      holder_id TEXT NOT NULL,
+      holder_token_hash TEXT NOT NULL,
+      fencing_token BIGINT NOT NULL,
+      acquired_at TIMESTAMPTZ NOT NULL,
+      renewed_at TIMESTAMPTZ,
+      expires_at TIMESTAMPTZ NOT NULL,
+      released_at TIMESTAMPTZ
+    )
+  `);
   const migration = readFileSync(
     resolve(import.meta.dir, '../../../../migrations/043_agent_messaging_phase15.sql'),
     'utf8'
@@ -171,6 +188,88 @@ describe('dispatch Phase 1.5 PostgreSQL integration', () => {
       'must target a test database'
     );
   });
+
+  for (const action of ['acknowledge', 'address'] as const) {
+    for (const turnover of ['replace', 'release'] as const) {
+      test(`${action} rejects XO lease ${turnover} between validation and UPDATE`, async () => {
+        const message = await createAuthenticatedMessage(
+          { kind: 'system', sender: 'dispatch' },
+          {
+            correlation_id: randomUUID(),
+            idempotency_key: randomUUID(),
+            task_type: 'agent_message',
+            recipient: 'xo',
+            body: 'XO lease turnover.',
+          }
+        );
+        const bind: XoLeaseBind = {
+          kind: 'xo_lease',
+          lease_id: '11111111-1111-4111-8111-111111111111',
+          fencing_token: 9,
+          holder_token_hash: createHash('sha256').update('test-holder').digest('hex'),
+        };
+        await db.query(
+          `INSERT INTO board_xo_leases
+           (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+            acquired_at, expires_at)
+           VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, $5)`,
+          [
+            bind.lease_id,
+            bind.holder_token_hash,
+            bind.fencing_token,
+            new Date().toISOString(),
+            new Date(Date.now() + 60_000).toISOString(),
+          ]
+        );
+        const data = { id: message.id, principal_id: 'xo', bind };
+        if (action === 'address') expect((await acknowledgeMessage(data)).ok).toBe(true);
+        const before = await getMessage(message.id);
+        const withTransaction = db.withTransaction.bind(db);
+        let leaseValidated = false;
+        let turnoverInjected = false;
+        const transactionSpy = spyOn(db, 'withTransaction').mockImplementation(fn =>
+          withTransaction(query => {
+            const wrappedQuery: DispatchQueryExecutor = async <T>(
+              sql: string,
+              params?: unknown[]
+            ) => {
+              if (sql.startsWith('UPDATE agent_dispatch_messages') && !turnoverInjected) {
+                expect(leaseValidated).toBe(true);
+                // Inject turnover only after the pre-check has read the valid lease.
+                await db.query(
+                  turnover === 'replace'
+                    ? "UPDATE board_xo_leases SET lease_id = '22222222-2222-4222-8222-222222222222', fencing_token = fencing_token + 1 WHERE id = 1"
+                    : 'UPDATE board_xo_leases SET released_at = $1 WHERE id = 1',
+                  turnover === 'release' ? [new Date().toISOString()] : []
+                );
+                turnoverInjected = true;
+              }
+              const result = await query<T>(sql, params);
+              if (sql.startsWith('SELECT lease_id, fencing_token, holder_token_hash')) {
+                expect(result.rowCount).toBe(turnoverInjected && turnover === 'release' ? 0 : 1);
+                leaseValidated = true;
+              }
+              return result;
+            };
+            return fn(wrappedQuery);
+          })
+        );
+        try {
+          const mutate = action === 'acknowledge' ? acknowledgeMessage : addressMessage;
+          await expect(mutate(data)).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+          expect(turnoverInjected).toBe(true);
+          const stored = await getMessage(message.id);
+          expect(stored?.acknowledged_at).toBe(before?.acknowledged_at ?? null);
+          expect(stored?.acknowledged_by).toBe(before?.acknowledged_by ?? null);
+          expect(stored?.addressed_at).toBeNull();
+          expect(stored?.addressed_by).toBeNull();
+        } finally {
+          transactionSpy.mockRestore();
+          await db.query('DELETE FROM board_xo_leases WHERE id = 1');
+        }
+      });
+    }
+  }
 
   test('migration 043 removes global unique and installs both partial indexes', async () => {
     const schemaChecks = await Promise.all(

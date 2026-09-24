@@ -1306,6 +1306,22 @@ async function validateXoLeaseBind(
   return null;
 }
 
+function xoLeaseBindPredicate(
+  principalId: string,
+  bind?: XoLeaseBind
+): { sql: string; params: unknown[] } {
+  if (principalId !== 'xo') return { sql: '', params: [] };
+  if (!bind) throw new Error('xo_bind_required');
+  // Receipt UPDATEs reserve $1-$3. Check the live lease in the write itself.
+  return {
+    sql: ` AND EXISTS (SELECT 1 FROM board_xo_leases
+      WHERE id = 1 AND principal_id = 'xo' AND seat_id = 'xo'
+        AND lease_id = $4 AND fencing_token = $5 AND holder_token_hash = $6
+        AND released_at IS NULL AND expires_at > $7)`,
+    params: [bind.lease_id, bind.fencing_token, bind.holder_token_hash, nowIso()],
+  };
+}
+
 export async function mailboxDepthByPrincipal(): Promise<MailboxDepthResult> {
   const result = await getDatabase().query<{
     principal_id: string;
@@ -1381,6 +1397,7 @@ export async function acknowledgeMessage(data: {
           : { ok: false, reason: 'actor_mismatch' };
       }
 
+      const leasePredicate = xoLeaseBindPredicate(principalId, data.bind);
       const update = await txQuery(
         `UPDATE agent_dispatch_messages
        SET acknowledged_at = $2,
@@ -1396,9 +1413,13 @@ export async function acknowledgeMessage(data: {
            WHERE recipient_principal.principal_id = LOWER(TRIM(COALESCE(resolved_recipient, recipient)))
              AND CAST(recipient_principal.active AS TEXT) IN ('1', 'true')
              AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
-         )`,
-        [data.id, now, principalId]
+         )${leasePredicate.sql}`,
+        [data.id, now, principalId, ...leasePredicate.params]
       );
+      if (update.rowCount === 0 && principalId === 'xo') {
+        const staleBind = await validateXoLeaseBind(txQuery, principalId, data.bind);
+        if (staleBind) return staleBind;
+      }
       const finalMessage = await readMessageInTransaction(txQuery, data.id);
       if (!finalMessage) return { ok: false, reason: 'not_found' };
       const finalInvalid = await validateMailboxActor(txQuery, finalMessage, principalId);
@@ -1436,6 +1457,7 @@ export async function addressMessage(data: {
           : { ok: false, reason: 'actor_mismatch' };
       }
 
+      const leasePredicate = xoLeaseBindPredicate(principalId, data.bind);
       const update = await txQuery(
         `UPDATE agent_dispatch_messages
        SET addressed_at = $2,
@@ -1452,9 +1474,13 @@ export async function addressMessage(data: {
            WHERE recipient_principal.principal_id = LOWER(TRIM(COALESCE(resolved_recipient, recipient)))
              AND CAST(recipient_principal.active AS TEXT) IN ('1', 'true')
              AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
-         )`,
-        [data.id, now, principalId]
+         )${leasePredicate.sql}`,
+        [data.id, now, principalId, ...leasePredicate.params]
       );
+      if (update.rowCount === 0 && principalId === 'xo') {
+        const staleBind = await validateXoLeaseBind(txQuery, principalId, data.bind);
+        if (staleBind) return staleBind;
+      }
       const finalMessage = await readMessageInTransaction(txQuery, data.id);
       if (!finalMessage) return { ok: false, reason: 'not_found' };
       const finalInvalid = await validateMailboxActor(txQuery, finalMessage, principalId);
