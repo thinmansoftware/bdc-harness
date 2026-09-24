@@ -100,7 +100,11 @@ export type MergeCandidateExclusionReason =
   | 'mergeable_unknown'
   | 'evidence_lookup_failed'
   | 'evidence_mismatch'
-  | 'already_a_run_candidate';
+  | 'already_a_run_candidate'
+  | 'builder_worktree_head'
+  | 'superseded_by_lane_pr'
+  | 'lane_run_in_flight'
+  | 'lane_provenance_unknown';
 
 export interface MergeCandidateExclusion {
   readonly owner: string;
@@ -368,6 +372,28 @@ export function resolveDiscoveryRepos(
   return targets;
 }
 
+/**
+ * Engine worktree branches. A lane never opens its canonical PR from one of
+ * these; the head is always UNIQUE_BRANCH (`feat|fix|wip/...-thread-...`).
+ * Shared with the merge manager so both gates use one predicate (bdc-xo#2307).
+ */
+const BUILDER_WORKTREE_HEAD = /^archon\/(task|thread)-/;
+
+/**
+ * The lane's own PR head, as commit-and-push builds it:
+ * `UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"` with BRANCH matching
+ * `^(feat|fix|wip)/[A-Za-z0-9_-]+$`.
+ */
+const CANONICAL_LANE_HEAD = /^(feat|fix|wip)\/[A-Za-z0-9_-]+-thread-[A-Za-z0-9_-]+$/;
+
+export function isBuilderWorktreeHead(headRef: string | undefined): boolean {
+  return typeof headRef === 'string' && BUILDER_WORKTREE_HEAD.test(headRef);
+}
+
+export function isCanonicalLaneHead(headRef: string | undefined): boolean {
+  return typeof headRef === 'string' && CANONICAL_LANE_HEAD.test(headRef);
+}
+
 export function resolveDiscoveryMaxPrsPerTick(
   raw: string | undefined = process.env.OVERSEER_MERGE_DISCOVERY_MAX_PRS_PER_TICK
 ): number {
@@ -391,6 +417,9 @@ export function classifyDiscoveredPullRequest(
 ): MergeCandidateExclusionReason | null {
   if (pr.draft) return 'draft';
   if (pr.state.toLowerCase() !== 'open') return 'not_open';
+  // Engine worktree heads are builder-opened PRs. Exclude before review,
+  // checks, or evidence so they never reach a merge (bdc-xo#2307).
+  if (isBuilderWorktreeHead(pr.headRef)) return 'builder_worktree_head';
   const ownerRepo = `${pr.owner}/${pr.repo}`.toLowerCase();
   if (watchedBases === undefined && !hasRepoPolicyEntry(ownerRepo, policy)) {
     return 'repo_policy_missing';
@@ -484,7 +513,11 @@ function bindingDetail(
   return `evidence head ${found} does not match listed head ${pr.headSha} -- stale evidence for a moved head`;
 }
 
-function detailFor(reason: MergeCandidateExclusionReason, pr: DiscoveredPullRequest): string {
+function detailFor(
+  reason: MergeCandidateExclusionReason,
+  pr: DiscoveredPullRequest,
+  extra?: { canonicalPrNumber?: number }
+): string {
   switch (reason) {
     case 'draft':
       return 'pull request is a draft';
@@ -496,6 +529,14 @@ function detailFor(reason: MergeCandidateExclusionReason, pr: DiscoveredPullRequ
       return `base ${pr.baseRef} is not a watched base branch`;
     case 'review_not_approved':
       return `review decision is ${pr.reviewDecision ?? 'none'}`;
+    case 'builder_worktree_head':
+      return `head ${pr.headRef} is an engine worktree branch (archon/task-* or archon/thread-*)`;
+    case 'superseded_by_lane_pr':
+      return `superseded by canonical lane pull request #${String(extra?.canonicalPrNumber ?? '?')}`;
+    case 'lane_run_in_flight':
+      return `WO ${pr.woId ?? 'unknown'} has a non-terminal workflow run for ${pr.owner}/${pr.repo}`;
+    case 'lane_provenance_unknown':
+      return `in-flight run lookup failed for WO ${pr.woId ?? 'unknown'}; failing closed`;
     default:
       return reason;
   }
@@ -862,6 +903,61 @@ export async function discoverMergeCandidates(
     return unavailable(logger, 'all_repo_listings_failed', { failedRepos });
   }
 
+  // Rules 2 and 3 (bdc-xo#2307) are pure functions of the full listing and the
+  // in-flight set, computed once per tick before any evidence fetch.
+  const canonicalLanePrByWo = new Map<string, number>();
+  for (const [key, listed] of byRepo) {
+    for (const listedPr of listed) {
+      if (!listedPr.woId || !isCanonicalLaneHead(listedPr.headRef)) continue;
+      const mapKey = `${key}|${listedPr.woId}`;
+      const existing = canonicalLanePrByWo.get(mapKey);
+      if (existing === undefined || listedPr.prNumber < existing) {
+        canonicalLanePrByWo.set(mapKey, listedPr.prNumber);
+      }
+    }
+  }
+
+  type InFlightLookup = ReadonlySet<string> | 'threw' | 'skipped';
+  const inFlightByRepo = new Map<string, InFlightLookup>();
+  let warnedInFlightUnwired = false;
+  const needsInFlightCheck = [...byRepo.values()].some(listed =>
+    listed.some(listedPr => Boolean(listedPr.woId) && !isCanonicalLaneHead(listedPr.headRef))
+  );
+  for (const target of repos) {
+    const key = repoKey(target.owner, target.repo);
+    if (!byRepo.has(key)) continue;
+    if (!deps.listInFlightWoIds) {
+      inFlightByRepo.set(key, 'skipped');
+      // One warn per tick, and only when a listed PR would be subject to the
+      // hold. Ticks with no such PR have nothing to skip.
+      if (needsInFlightCheck && !warnedInFlightUnwired) {
+        warnedInFlightUnwired = true;
+        warnVia(
+          logger,
+          {
+            remedy:
+              'listInFlightWoIds is not wired; non-canonical PRs are not held for in-flight lane runs this tick',
+          },
+          'merge-coordinator.lane_provenance_unwired'
+        );
+      }
+      continue;
+    }
+    try {
+      inFlightByRepo.set(
+        key,
+        await deps.listInFlightWoIds({ owner: target.owner, repo: target.repo })
+      );
+    } catch (error) {
+      inFlightByRepo.set(key, 'threw');
+      warnVia(
+        logger,
+        { owner: target.owner, repo: target.repo, err: errorMessage(error) },
+        'merge-coordinator.lane_provenance_lookup_failed'
+      );
+    }
+  }
+
   const startCursor = options.cursor === undefined ? processCursor : options.cursor;
   const queues = rotatedQueues(repos, byRepo, startCursor);
   const totalOpen = queues.reduce((sum, entry) => sum + entry.queue.length, 0);
@@ -906,6 +1002,45 @@ export async function discoverMergeCandidates(
           detail: detailFor(structural, pr),
         });
         continue;
+      }
+
+      // Non-canonical heads stay mergeable for hand PRs. Hold them only when
+      // the same WO already has a lane PR, or its lane run is still in flight.
+      if (!isCanonicalLaneHead(pr.headRef)) {
+        const lanePrNumber = pr.woId
+          ? canonicalLanePrByWo.get(`${repoKey(pr.owner, pr.repo)}|${pr.woId}`)
+          : undefined;
+        if (lanePrNumber !== undefined && lanePrNumber !== pr.prNumber) {
+          exclusions.push({
+            owner: pr.owner,
+            repo: pr.repo,
+            prNumber: pr.prNumber,
+            reason: 'superseded_by_lane_pr',
+            detail: detailFor('superseded_by_lane_pr', pr, { canonicalPrNumber: lanePrNumber }),
+          });
+          continue;
+        }
+        const inFlight = inFlightByRepo.get(repoKey(pr.owner, pr.repo)) ?? 'skipped';
+        if (inFlight === 'threw' && pr.woId) {
+          exclusions.push({
+            owner: pr.owner,
+            repo: pr.repo,
+            prNumber: pr.prNumber,
+            reason: 'lane_provenance_unknown',
+            detail: detailFor('lane_provenance_unknown', pr),
+          });
+          continue;
+        }
+        if (inFlight !== 'threw' && inFlight !== 'skipped' && pr.woId && inFlight.has(pr.woId)) {
+          exclusions.push({
+            owner: pr.owner,
+            repo: pr.repo,
+            prNumber: pr.prNumber,
+            reason: 'lane_run_in_flight',
+            detail: detailFor('lane_run_in_flight', pr),
+          });
+          continue;
+        }
       }
 
       let evidence: PullRequestEvidence;

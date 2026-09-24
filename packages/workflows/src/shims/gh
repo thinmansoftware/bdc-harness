@@ -1,0 +1,75 @@
+#!/bin/sh
+# This extensionless executable must remain LF-only; see the repository attributes.
+# Refuse pull-request mutations from builder nodes: pr create, pr merge,
+# pr ready, and gh api POST/PATCH/PUT to a path containing /pulls.
+# Every other gh invocation execs the next gh on PATH. The shim directory is
+# removed from PATH first so this script cannot recurse. ASCII only. Exit 3
+# on a refusal. No external commands before that exec: a builder PATH may
+# contain only this directory plus the real gh.
+set -u
+
+case $0 in
+  */*) shim_dir=${0%/*} ;;
+  *) shim_dir=. ;;
+esac
+
+new_path=""
+old_ifs=$IFS
+IFS=:
+for entry in ${PATH:-}; do
+  if [ "$entry" = "$shim_dir" ]; then
+    continue
+  fi
+  if [ -z "$new_path" ]; then
+    new_path=$entry
+  else
+    new_path="$new_path:$entry"
+  fi
+done
+IFS=$old_ifs
+PATH=$new_path
+export PATH
+
+refuse() {
+  echo "gh: pull request mutations are denied for this node (ARCHON_DENY_PR_MUTATIONS)" >&2
+  exit 3
+}
+
+is_mutating_method() {
+  case "$1" in
+    POST|PATCH|PUT|post|patch|put|Post|Patch|Put) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ "${1:-}" = "pr" ]; then
+  case "${2:-}" in
+    create|merge|ready) refuse ;;
+  esac
+fi
+
+if [ "${1:-}" = "api" ]; then
+  method=""
+  prev=""
+  path_has_pulls=0
+  for arg in "$@"; do
+    case "$prev" in
+      -X|--method) method=$arg ;;
+    esac
+    case "$arg" in
+      --method=*) method=${arg#--method=} ;;
+      */pulls*) path_has_pulls=1 ;;
+    esac
+    prev=$arg
+  done
+  if [ "$path_has_pulls" = 1 ] && is_mutating_method "$method"; then
+    refuse
+  fi
+fi
+
+next_gh=$(command -v gh 2>/dev/null || true)
+if [ -z "$next_gh" ]; then
+  echo "gh: not found on PATH" >&2
+  exit 127
+fi
+exec "$next_gh" "$@"

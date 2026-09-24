@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } from 'bun:test';
 import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
-import { join } from 'path';
+import { delimiter, join, sep } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
 
@@ -56,7 +56,14 @@ import {
   resolveBunRuntimeExecutable,
 } from './dag-executor';
 import { loadMcpConfig } from '@archon/providers/claude/provider';
-import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
+import {
+  dagNodeSchema,
+  type DagNode,
+  type BashNode,
+  type ScriptNode,
+  type NodeOutput,
+  type WorkflowRun,
+} from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
 import { parseWorkflow } from './loader';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
@@ -8987,6 +8994,47 @@ describe('executeDagWorkflow -- env var injection', () => {
     expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
     const optionsArg = mockSendQueryDag.mock.calls[0]?.[3] as Record<string, unknown> | undefined;
     expect(optionsArg?.env).toBeUndefined();
+  });
+
+  it('wires the gh shim only for nodes that deny pull request mutations', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-pr-guard',
+        nodes: [
+          dagNodeSchema.parse({
+            id: 'guarded',
+            command: 'my-cmd',
+            deny_pull_request_mutations: true,
+          }),
+          dagNodeSchema.parse({ id: 'plain', command: 'my-cmd' }),
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, envVars: { MY_SECRET: 'abc123' } }
+    );
+
+    const envs = mockSendQueryDag.mock.calls.map(
+      call => (call[3] as { env?: Record<string, string> } | undefined)?.env
+    );
+    const flagged = envs.find(env => env?.ARCHON_DENY_PR_MUTATIONS === '1');
+    const plain = envs.find(env => env?.ARCHON_DENY_PR_MUTATIONS !== '1');
+    expect(flagged?.MY_SECRET).toBe('abc123');
+    expect(flagged?.PATH?.split(delimiter)[0]?.endsWith(`${sep}shims`)).toBe(true);
+    expect(plain).toEqual({ MY_SECRET: 'abc123' });
   });
 });
 

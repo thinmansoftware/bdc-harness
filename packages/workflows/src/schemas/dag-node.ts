@@ -209,6 +209,15 @@ export const dagNodeBaseSchema = z.object({
    * how the node was authored.
    */
   load_bearing: z.boolean().optional(),
+  /**
+   * When true on an AI node, the executor prepends the harness gh shim
+   * directory to PATH and sets ARCHON_DENY_PR_MUTATIONS=1. The shim is
+   * packages/workflows/src/shims/gh (POSIX sh). It refuses `gh pr create`,
+   * `gh pr merge`, `gh pr ready`, and `gh api` POST/PATCH/PUT calls whose
+   * path contains /pulls (exit 3). Every other gh invocation is passed
+   * through. Bash nodes that legitimately open PRs must leave this unset.
+   */
+  deny_pull_request_mutations: z.boolean().optional(),
 });
 
 export type DagNodeBase = z.infer<typeof dagNodeBaseSchema>;
@@ -756,6 +765,13 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.failover_agent !== undefined ? { failover_agent: data.failover_agent } : {}),
       ...(data.agent !== undefined ? { agent: data.agent } : {}),
       ...(data.persona !== undefined ? { persona: data.persona } : {}),
+      // Lives on dagNodeBaseSchema, so CommandNode/PromptNode/LoopNode types
+      // include it. Copy it here or .transform() drops it and the gh shim
+      // never arms. Bash and script nodes omit aiOnly on purpose: they open
+      // PRs only when this flag is left unset.
+      ...(data.deny_pull_request_mutations !== undefined
+        ? { deny_pull_request_mutations: data.deny_pull_request_mutations }
+        : {}),
     };
 
     if (data.command !== undefined && data.command.trim().length > 0) {

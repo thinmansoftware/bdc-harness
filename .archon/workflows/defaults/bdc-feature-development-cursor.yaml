@@ -491,6 +491,7 @@ nodes:
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
   - id: implement
+    deny_pull_request_mutations: true
     # Dedicated Cursor builder seat. The provider contract supplies repository write
     # and shell capabilities; downstream Sol seats independently review it.
     provider: cursor
@@ -503,6 +504,8 @@ nodes:
     wall_timeout_ms: 1800000
     loop:
       prompt: |
+        Do NOT open, merge, or mark ready any pull request (no gh pr create, gh pr merge, gh pr ready, or GitHub API pulls calls). The lane opens the PR after review.
+
         Implement the approved plan for this BDC feature Work Order.
 
         ## Spec
@@ -2277,6 +2280,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
+    deny_pull_request_mutations: true
     provider: cursor
     model: grok-4.7-high
     persona: major-build-opr
@@ -2338,6 +2342,8 @@ nodes:
         fi
         exit 0
       prompt: |
+        Do NOT open, merge, or mark ready any pull request (no gh pr create, gh pr merge, gh pr ready, or GitHub API pulls calls). The lane opens the PR after review.
+
         You are major-build. The Codex diff reviewer raised findings on your diff.
         Fix every fixable finding in place. You are the BUILDER; Codex does not edit.
 
@@ -2595,12 +2601,15 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
+    deny_pull_request_mutations: true
     provider: cursor
     model: grok-4.7-high
     persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
+      Do NOT open, merge, or mark ready any pull request (no gh pr create, gh pr merge, gh pr ready, or GitHub API pulls calls). The lane opens the PR after review.
+
       The bdc-feature-development run is BLOCKED before the irreversible commit. Before a
       human is paused, you get ONE autonomous repair pass. Diagnose and, if you can,
       resolve it so the build can proceed safely.
