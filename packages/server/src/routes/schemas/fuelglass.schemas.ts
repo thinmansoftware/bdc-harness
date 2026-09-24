@@ -58,10 +58,19 @@ export const fuelglassSeatsResponseSchema = z
   })
   .openapi('FuelglassSeatsResponse');
 
-/** POST /api/fuelglass/cutoff. percent null clears the operator override. */
+const CUTOFF_RANGE_ERROR = 'seat_cutoff_out_of_range: percent must be between 1 and 95';
+
+/**
+ * POST /api/fuelglass/cutoff. percent null clears the operator override.
+ * The range is 1-95: a higher cutoff would switch the gate off in effect.
+ */
 export const fuelglassCutoffBodySchema = z
   .object({
-    percent: z.number().min(1).max(100).nullable(),
+    percent: z
+      .number()
+      .min(1, { message: CUTOFF_RANGE_ERROR })
+      .max(95, { message: CUTOFF_RANGE_ERROR })
+      .nullable(),
   })
   .openapi('FuelglassCutoffBody');
 

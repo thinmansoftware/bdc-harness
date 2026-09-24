@@ -63,8 +63,9 @@ import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-
 import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
 import {
   getSeatCutoff,
-  isSeatGateEnabled,
+  isValidSeatCutoff,
   readAllSeats,
+  SEAT_CUTOFF_OUT_OF_RANGE,
   setSeatCutoffOverride,
 } from '@archon/workflows/reliability/seat-usage';
 import { resolveWorkflowProbeBindings } from '@archon/workflows/reliability/resolve-binding';
@@ -6066,7 +6067,8 @@ export function registerApiRoutes(
         success: true,
         generated_at: new Date().toISOString(),
         cutoff: getSeatCutoff(),
-        gate_enabled: isSeatGateEnabled(),
+        // The gate has no off switch (John Ranson, 2026-09-24).
+        gate_enabled: true,
         seats,
       });
     } catch (error) {
@@ -6078,6 +6080,9 @@ export function registerApiRoutes(
   registerOpenApiRoute(postFuelglassCutoffRoute, async c => {
     try {
       const body = getValidatedBody(c, fuelglassCutoffBodySchema);
+      if (body.percent !== null && !isValidSeatCutoff(body.percent)) {
+        return apiError(c, 400, `${SEAT_CUTOFF_OUT_OF_RANGE}: percent must be between 1 and 95`);
+      }
       setSeatCutoffOverride(body.percent);
       return c.json({ success: true, cutoff: getSeatCutoff() });
     } catch (error) {

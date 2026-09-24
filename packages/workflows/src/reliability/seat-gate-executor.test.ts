@@ -9,15 +9,19 @@ import { executeWorkflow } from '../executor';
 import type { IWorkflowPlatform, WorkflowConfig, WorkflowDeps } from '../deps';
 import type { IWorkflowStore } from '../store';
 import type { WorkflowDefinition, WorkflowRun } from '../schemas';
+import type { CreateAuthenticatedMessageData } from '@archon/core/db/dispatch';
 import {
   resetSeatUsageCacheForTests,
+  setSeatAlertSendForTests,
   setSeatCutoffOverride,
   setSeatUsageReaderForTests,
+  unknownSeatReading,
   type SeatReading,
 } from './seat-usage';
 
 const prompts: string[] = [];
 const warnings: Array<{ obj: Record<string, unknown>; msg: string }> = [];
+const alerts: CreateAuthenticatedMessageData[] = [];
 const origChild = rootLogger.child.bind(rootLogger);
 
 function reading(seat: SeatReading['seat'], windowName: string, used: number): SeatReading {
@@ -109,11 +113,15 @@ function workflow(): WorkflowDefinition {
 beforeEach(() => {
   prompts.length = 0;
   warnings.length = 0;
+  alerts.length = 0;
   clearRegistry();
   registerBuiltinProviders();
   resetSeatUsageCacheForTests();
+  setSeatAlertSendForTests(async (_context, data) => {
+    alerts.push(data);
+    return null;
+  });
   delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
-  delete process.env.FUELGLASS_SEAT_GATE;
   rootLogger.child = ((bindings?: object) => {
     const child = origChild(bindings as never);
     const origWarn = child.warn.bind(child);
@@ -131,9 +139,14 @@ afterEach(() => {
   rootLogger.child = origChild as typeof rootLogger.child;
   resetSeatUsageCacheForTests();
   delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
-  delete process.env.FUELGLASS_SEAT_GATE;
   clearRegistry();
 });
+
+function eventTypes(store: ReturnType<typeof makeStore>): string[] {
+  return store.createWorkflowEvent.mock.calls.map(
+    call => (call[0] as { event_type: string }).event_type
+  );
+}
 
 async function runWorkflow(): Promise<{
   result: Awaited<ReturnType<typeof executeWorkflow>>;
@@ -204,28 +217,73 @@ describe('executor seat gate', () => {
     expect(prompts.filter(prompt => prompt !== 'Reply with exactly: OK')).toEqual([]);
   });
 
-  test('kill switch off proceeds even when a seat would refuse', async () => {
-    process.env.FUELGLASS_SEAT_GATE = 'off';
+  test('default cutoff 90 refuses a seat at 91 and names it', async () => {
     let reads = 0;
     setSeatUsageReaderForTests(async () => {
       reads += 1;
       return {
-        claude: reading('claude', 'seven_day', 10),
-        codex: reading('codex', 'primary', 95),
+        claude: reading('claude', 'seven_day', 91),
+        codex: reading('codex', 'primary', 10),
       };
     });
-    setSeatCutoffOverride(90);
     const { result, store } = await runWorkflow();
-    expect(reads).toBe(0);
-    expect(result.error ?? '').not.toContain('seat_usage_refused');
-    const events = store.createWorkflowEvent.mock.calls.map(
-      call =>
-        call[0] as {
-          event_type: string;
-        }
+    expect(reads).toBe(1);
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('seat_usage_refused:claude:seven_day:91:90');
+    expect(eventTypes(store)).toContain('dag_workflow_failed');
+    expect(eventTypes(store)).not.toContain('workflow_started');
+    expect(store.failWorkflowRun).toHaveBeenCalledWith(
+      'run-seat-gate',
+      'seat_usage_refused:claude:seven_day:91:90'
     );
-    expect(events.some(event => event.event_type === 'workflow_started')).toBe(true);
-    expect(warnings.some(entry => entry.msg === 'workflow.seat_usage_refused')).toBe(false);
+    expect(
+      warnings.some(
+        entry =>
+          entry.msg === 'workflow.seat_usage_refused' &&
+          entry.obj.seat === 'claude' &&
+          entry.obj.cutoffPercent === 90
+      )
+    ).toBe(true);
+    expect(prompts.filter(prompt => prompt !== 'Reply with exactly: OK')).toEqual([]);
+    expect(alerts).toHaveLength(0);
+  });
+
+  test('UNKNOWN proceeds and enqueues exactly one operator alert per seat per hour', async () => {
+    setSeatUsageReaderForTests(async () => ({
+      claude: unknownSeatReading('claude', 'Claude limit probe rejected (HTTP 401)', 401),
+      codex: reading('codex', 'primary', 10),
+    }));
+    const first = await runWorkflow();
+    expect(first.result.error ?? '').not.toContain('seat_usage_refused');
+    expect(eventTypes(first.store)).toContain('workflow_started');
+    expect(
+      warnings.some(
+        entry =>
+          entry.msg === 'workflow.seat_usage_unknown' &&
+          entry.obj.seat === 'claude' &&
+          entry.obj.note === 'Claude limit probe rejected (HTTP 401)'
+      )
+    ).toBe(true);
+    expect(alerts).toHaveLength(1);
+    const alert = alerts[0];
+    expect(alert?.recipient).toBe('operator');
+    expect(alert?.task_type).toBe('agent_message');
+    expect(alert?.idempotency_key).toMatch(
+      /^fuelglass-seat-unknown:claude:\d{4}-\d{2}-\d{2}T\d{2}$/
+    );
+    expect(alert?.body.split('\n')[0]).toBe('Fuelglass seat gate could not measure seat claude');
+    expect(alert?.body).toContain('Claude limit probe rejected (HTTP 401)');
+    expect(alert?.body).toContain('run-seat-gate');
+
+    // A second UNKNOWN in the same hour: the run still proceeds, no new alert.
+    const second = await runWorkflow();
+    expect(eventTypes(second.store)).toContain('workflow_started');
+    expect(
+      warnings.filter(
+        entry => entry.msg === 'workflow.seat_usage_unknown' && entry.obj.seat === 'claude'
+      )
+    ).toHaveLength(2);
+    expect(alerts).toHaveLength(1);
   });
 
   test('a hanging seat read falls back to UNKNOWN at the 12s ceiling', async () => {
@@ -271,6 +329,12 @@ describe('executor seat gate', () => {
         entry => entry.msg === 'workflow.seat_usage_unknown' && entry.obj.note === 'reader exploded'
       )
     ).toBe(true);
+    // Both bound seats are unmeasured: one operator alert each.
+    expect(alerts.map(alert => alert.idempotency_key.split(':')[1]).sort()).toEqual([
+      'claude',
+      'codex',
+    ]);
+    expect(alerts.every(alert => alert.body.includes('reader exploded'))).toBe(true);
     expect(
       warnings.some(
         entry =>
@@ -279,20 +343,16 @@ describe('executor seat gate', () => {
     ).toBe(false);
   });
 
-  test('proceeds past the gate when usage is under the default cutoff', async () => {
+  test('a seat at 89 proceeds past the default cutoff 90', async () => {
     setSeatUsageReaderForTests(async () => ({
       claude: reading('claude', 'seven_day', 10),
-      codex: reading('codex', 'primary', 95),
+      codex: reading('codex', 'primary', 89),
     }));
     setSeatCutoffOverride(null);
     const { result, store } = await runWorkflow();
     expect(result.error ?? '').not.toContain('seat_usage_refused');
-    const events = store.createWorkflowEvent.mock.calls.map(
-      call =>
-        call[0] as {
-          event_type: string;
-        }
-    );
-    expect(events.some(event => event.event_type === 'workflow_started')).toBe(true);
+    expect(eventTypes(store)).toContain('workflow_started');
+    expect(warnings.some(entry => entry.msg === 'workflow.seat_usage_refused')).toBe(false);
+    expect(alerts).toHaveLength(0);
   });
 });

@@ -177,7 +177,6 @@ describe('fuelglass seat routes', () => {
   beforeEach(() => {
     resetSeatUsageCacheForTests();
     delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
-    delete process.env.FUELGLASS_SEAT_GATE;
     setSeatUsageReaderForTests(async () => ({
       claude: seat(
         'claude',
@@ -197,7 +196,51 @@ describe('fuelglass seat routes', () => {
   afterEach(() => {
     resetSeatUsageCacheForTests();
     delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
-    delete process.env.FUELGLASS_SEAT_GATE;
+  });
+
+  function postCutoff(percent: unknown): Promise<Response> {
+    return Promise.resolve(
+      app.request('/api/fuelglass/cutoff', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ percent }),
+      })
+    );
+  }
+
+  test('default cutoff is 90 with no env and no override', async () => {
+    const res = await app.request('/api/fuelglass/seats');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      gate_enabled: boolean;
+      cutoff: { percent: number; source: string };
+    };
+    expect(body.cutoff).toEqual({ percent: 90, source: 'default' });
+    expect(body.gate_enabled).toBe(true);
+  });
+
+  test('invalid env cutoff falls back to 90', async () => {
+    process.env.FUELGLASS_SEAT_CUTOFF_PERCENT = '100';
+    const res = await app.request('/api/fuelglass/seats');
+    const body = (await res.json()) as { cutoff: { percent: number; source: string } };
+    expect(body.cutoff).toEqual({ percent: 90, source: 'default' });
+  });
+
+  test('cutoff override above 95 or below 1 is a named 400', async () => {
+    for (const bad of [96, 100, 150, 0]) {
+      const res = await postCutoff(bad);
+      expect(res.status).toBe(400);
+      const err = (await res.json()) as { error: string };
+      expect(err.error).toContain('seat_cutoff_out_of_range');
+    }
+    const after = (await (await app.request('/api/fuelglass/seats')).json()) as {
+      cutoff: { percent: number; source: string };
+    };
+    expect(after.cutoff).toEqual({ percent: 90, source: 'default' });
+    const ok = await postCutoff(95);
+    expect(ok.status).toBe(200);
+    const okBody = (await ok.json()) as { cutoff: { percent: number; source: string } };
+    expect(okBody.cutoff).toEqual({ percent: 95, source: 'operator' });
   });
 
   test('api_seats_and_cutoff_routes', async () => {
@@ -227,10 +270,6 @@ describe('fuelglass seat routes', () => {
     };
     expect(after.cutoff).toEqual({ percent: 90, source: 'operator' });
     expect(after.gate_enabled).toBe(true);
-    process.env.FUELGLASS_SEAT_GATE = 'off';
-    const gatedOff = await app.request('/api/fuelglass/seats');
-    const offBody = (await gatedOff.json()) as { gate_enabled: boolean };
-    expect(offBody.gate_enabled).toBe(false);
 
     const tooHigh = await app.request('/api/fuelglass/cutoff', {
       method: 'POST',
@@ -252,9 +291,7 @@ describe('fuelglass seat routes', () => {
       body: JSON.stringify({ percent: null }),
     });
     expect(cleared.status).toBe(200);
-    const clearedBody = (await cleared.json()) as { cutoff: { source: string } };
-    expect(clearedBody.cutoff.source === 'default' || clearedBody.cutoff.source === 'env').toBe(
-      true
-    );
+    const clearedBody = (await cleared.json()) as { cutoff: { percent: number; source: string } };
+    expect(clearedBody.cutoff).toEqual({ percent: 90, source: 'default' });
   });
 });

@@ -28,10 +28,10 @@ import {
 import { captureRuntimeRevisions } from './reliability/runtime-revisions';
 import { formatProbeBlock, runFireTimeProbe } from './reliability/fire-time-probe';
 import {
+  alertUnknownSeat,
   decideSeatGate,
   getSeatCutoff,
   getSeatUsageReader,
-  isSeatGateEnabled,
   seatsForBindings,
   unknownSeatReading,
   type SeatId,
@@ -1124,59 +1124,65 @@ export async function executeWorkflow(
       return { success: false, workflowRunId: workflowRun.id, error: reason };
     }
 
-    if (isSeatGateEnabled()) {
-      const seatIds = seatsForBindings(probeDecision.bindings);
-      if (seatIds.length > 0) {
-        const readings = await readBoundSeats(seatIds);
-        const cutoff = getSeatCutoff();
-        const seatDecision = decideSeatGate(probeDecision.bindings, readings, cutoff.percent);
-        if (seatDecision.refused) {
-          const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}`;
-          getLog().warn(
-            {
-              workflowName: executableWorkflow.name,
-              workflowRunId: workflowRun.id,
-              seat: seatDecision.seat,
-              window: seatDecision.window,
-              usedPercent: seatDecision.usedPercent,
-              cutoffPercent: seatDecision.cutoffPercent,
+    // Seat gate: always on (John Ranson, 2026-09-24). There is no off switch.
+    const seatIds = seatsForBindings(probeDecision.bindings);
+    if (seatIds.length > 0) {
+      const readings = await readBoundSeats(seatIds);
+      const cutoff = getSeatCutoff();
+      const seatDecision = decideSeatGate(probeDecision.bindings, readings, cutoff.percent);
+      if (seatDecision.refused) {
+        const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}`;
+        getLog().warn(
+          {
+            workflowName: executableWorkflow.name,
+            workflowRunId: workflowRun.id,
+            seat: seatDecision.seat,
+            window: seatDecision.window,
+            usedPercent: seatDecision.usedPercent,
+            cutoffPercent: seatDecision.cutoffPercent,
+          },
+          'workflow.seat_usage_refused'
+        );
+        await deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'dag_workflow_failed',
+            data: {
+              reason: 'seat_usage_refused',
+              detail,
             },
-            'workflow.seat_usage_refused'
-          );
-          await deps.store
-            .createWorkflowEvent({
-              workflow_run_id: workflowRun.id,
-              event_type: 'dag_workflow_failed',
-              data: {
-                reason: 'seat_usage_refused',
-                detail,
-              },
-            })
-            .catch((err: Error) => {
-              getLog().error(
-                { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
-                'workflow_event_persist_failed'
-              );
-            });
-          await deps.store.failWorkflowRun(workflowRun.id, detail);
-          await sendCriticalMessage(
-            platform,
-            conversationId,
-            `Workflow refused: seat ${seatDecision.seat} at ${String(seatDecision.usedPercent)}% of ${seatDecision.window} (cutoff ${String(seatDecision.cutoffPercent)}%)`
-          );
-          return { success: false, workflowRunId: workflowRun.id, error: detail };
-        }
-        for (const seat of seatDecision.unknownSeats) {
-          getLog().warn(
-            {
-              workflowName: executableWorkflow.name,
-              workflowRunId: workflowRun.id,
-              seat,
-              note: readings[seat]?.note ?? 'UNKNOWN',
-            },
-            'workflow.seat_usage_unknown'
-          );
-        }
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
+              'workflow_event_persist_failed'
+            );
+          });
+        await deps.store.failWorkflowRun(workflowRun.id, detail);
+        await sendCriticalMessage(
+          platform,
+          conversationId,
+          `Workflow refused: seat ${seatDecision.seat} at ${String(seatDecision.usedPercent)}% of ${seatDecision.window} (cutoff ${String(seatDecision.cutoffPercent)}%)`
+        );
+        return { success: false, workflowRunId: workflowRun.id, error: detail };
+      }
+      // UNKNOWN never refuses (a broken probe must not stop all work), but it is
+      // never silent either: log it and raise an operator alert (deduplicated).
+      for (const seat of seatDecision.unknownSeats) {
+        const note = readings[seat]?.note ?? 'UNKNOWN';
+        getLog().warn(
+          {
+            workflowName: executableWorkflow.name,
+            workflowRunId: workflowRun.id,
+            seat,
+            note,
+          },
+          'workflow.seat_usage_unknown'
+        );
+        await alertUnknownSeat(seat, note, {
+          workflowName: executableWorkflow.name,
+          workflowRunId: workflowRun.id,
+        });
       }
     }
 

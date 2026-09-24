@@ -4,7 +4,11 @@
  * Ports the Fuelglass claude/codex/cursor probe contracts (measurement only).
  * A measured 0 is a number. UNKNOWN means the probe could not measure.
  * NOT_APPLICABLE means the seat has no such window. Only a measurement at or
- * above the cutoff refuses a run. Credentials never appear in results or logs.
+ * above the cutoff refuses a run. An UNKNOWN reading lets the run proceed and
+ * raises an operator alert (at most one per seat per hour). Credentials never
+ * appear in results, logs or alerts.
+ *
+ * The gate is always on: there is no off switch (John Ranson, 2026-09-24).
  *
  * WO-HARNESS-FUELGLASS-SEAT-GATE-01
  */
@@ -12,12 +16,23 @@ import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { createLogger } from '@archon/paths';
+import {
+  createAuthenticatedMessage,
+  type CreateAuthenticatedMessageData,
+} from '@archon/core/db/dispatch';
 
 export const SEAT_IDS = ['claude', 'codex', 'cursor'] as const;
 export type SeatId = (typeof SEAT_IDS)[number];
 
-/** Hard exhaustion. Lowering this is a board decision, not a builder decision. */
-export const DEFAULT_SEAT_CUTOFF_PERCENT = 100;
+/** Default cutoff (John Ranson, 2026-09-24; supersedes the M-171 default of 100). */
+export const DEFAULT_SEAT_CUTOFF_PERCENT = 90;
+/** Lowest accepted cutoff. */
+export const MIN_SEAT_CUTOFF_PERCENT = 1;
+/** Highest accepted cutoff. Anything higher would switch the gate off in effect. */
+export const MAX_SEAT_CUTOFF_PERCENT = 95;
+export const SEAT_CUTOFF_OUT_OF_RANGE = 'seat_cutoff_out_of_range';
+
+const UNKNOWN_ALERT_WINDOW_MS = 60 * 60 * 1000;
 
 const CACHE_TTL_MS = 55_000;
 const PROBE_TIMEOUT_MS = 10_000;
@@ -69,14 +84,17 @@ export interface SeatReading {
   limit_reached?: boolean;
 }
 
-export type SeatGateAllow = { refused: false; unknownSeats: SeatId[] };
-export type SeatGateRefuse = {
+export interface SeatGateAllow {
+  refused: false;
+  unknownSeats: SeatId[];
+}
+export interface SeatGateRefuse {
   refused: true;
   seat: SeatId;
   window: string;
   usedPercent: number;
   cutoffPercent: number;
-};
+}
 export type SeatGateDecision = SeatGateAllow | SeatGateRefuse;
 
 export interface SeatCutoff {
@@ -99,8 +117,15 @@ export type SeatUsageReader = (
 
 type WarnLog = (obj: Record<string, unknown>, msg: string) => void;
 
+/** Same shape as createAuthenticatedMessage for a fixed system sender. */
+export type SeatAlertSend = (
+  context: { kind: 'system'; sender: 'dispatch' },
+  data: CreateAuthenticatedMessageData
+) => Promise<unknown>;
+
 const cache = new Map<SeatId, { at: number; reading: SeatReading }>();
 const inflight = new Map<SeatId, Promise<SeatReading>>();
+const unknownAlertBucket = new Map<SeatId, number>();
 let cutoffOverride: number | null = null;
 let invalidCutoffLogged = false;
 let readerOverride: SeatUsageReader | null = null;
@@ -109,6 +134,10 @@ const defaultWarn: WarnLog = (obj, msg) => {
   createLogger('fuelglass.seat').warn(obj, msg);
 };
 let warnLog: WarnLog = defaultWarn;
+
+const defaultAlertSend: SeatAlertSend = (context, data) =>
+  createAuthenticatedMessage(context, data);
+let alertSend: SeatAlertSend = defaultAlertSend;
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -210,7 +239,7 @@ function asResetsAt(value: unknown): string {
   return 'UNKNOWN';
 }
 
-async function readJsonFile(path: string): Promise<unknown | null> {
+async function readJsonFile(path: string): Promise<unknown> {
   try {
     const text = await readFile(path, 'utf8');
     return JSON.parse(text) as unknown;
@@ -227,7 +256,9 @@ async function fetchJson(
   url: string,
   headers: Record<string, string>,
   deps?: SeatReadDeps
-): Promise<{ ok: true; status: number; body: unknown } | { ok: false; status: number; note: string }> {
+): Promise<
+  { ok: true; status: number; body: unknown } | { ok: false; status: number; note: string }
+> {
   const response = await probeFetch(deps)(url, {
     headers,
     signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
@@ -256,7 +287,8 @@ async function probeClaude(deps?: SeatReadDeps): Promise<SeatReading> {
   if (typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt < nowMs(deps)) {
     return unknownSeatReading('claude', 'Claude token expired');
   }
-  const plan = oauth && typeof oauth.subscriptionType === 'string' ? oauth.subscriptionType : undefined;
+  const plan =
+    oauth && typeof oauth.subscriptionType === 'string' ? oauth.subscriptionType : undefined;
   let result: Awaited<ReturnType<typeof fetchJson>>;
   try {
     result = await fetchJson(
@@ -283,7 +315,11 @@ async function probeClaude(deps?: SeatReadDeps): Promise<SeatReading> {
   }
   const windows: SeatWindow[] = [];
   for (const [name, value] of Object.entries(result.body)) {
-    if (!isRecord(value) || typeof value.utilization !== 'number' || !Number.isFinite(value.utilization)) {
+    if (
+      !isRecord(value) ||
+      typeof value.utilization !== 'number' ||
+      !Number.isFinite(value.utilization)
+    ) {
       continue;
     }
     const used = clampPercent(value.utilization);
@@ -338,7 +374,11 @@ async function probeCodex(deps?: SeatReadDeps): Promise<SeatReading> {
     return unknownSeatReading('codex', 'Codex limit probe failed');
   }
   if (!result.ok) {
-    return unknownSeatReading('codex', `Codex limit probe rejected (${result.note})`, result.status);
+    return unknownSeatReading(
+      'codex',
+      `Codex limit probe rejected (${result.note})`,
+      result.status
+    );
   }
   if (!isRecord(result.body) || !isRecord(result.body.rate_limit)) {
     return unknownSeatReading('codex', 'unrecognized shape');
@@ -495,9 +535,7 @@ export function setSeatUsageLogForTests(log: WarnLog | null): void {
   warnLog = log ?? defaultWarn;
 }
 
-export async function readAllSeats(
-  deps?: SeatReadDeps
-): Promise<Record<SeatId, SeatReading>> {
+export async function readAllSeats(deps?: SeatReadDeps): Promise<Record<SeatId, SeatReading>> {
   const partial = await getSeatUsageReader()([...SEAT_IDS], deps);
   const out = {} as Record<SeatId, SeatReading>;
   for (const seat of SEAT_IDS) {
@@ -506,13 +544,19 @@ export async function readAllSeats(
   return out;
 }
 
+export function setSeatAlertSendForTests(send: SeatAlertSend | null): void {
+  alertSend = send ?? defaultAlertSend;
+}
+
 export function resetSeatUsageCacheForTests(): void {
   cache.clear();
   inflight.clear();
+  unknownAlertBucket.clear();
   cutoffOverride = null;
   invalidCutoffLogged = false;
   readerOverride = null;
   warnLog = defaultWarn;
+  alertSend = defaultAlertSend;
 }
 
 export function decideSeatGate(
@@ -523,7 +567,7 @@ export function decideSeatGate(
   const unknownSeats: SeatId[] = [];
   for (const seat of seatsForBindings(bindings)) {
     const reading = readings[seat];
-    if (!reading || reading.limit_source !== 'measured') {
+    if (reading?.limit_source !== 'measured') {
       unknownSeats.push(seat);
       continue;
     }
@@ -541,8 +585,7 @@ export function decideSeatGate(
       }
     }
     if (seat === 'codex' && reading.limit_reached === true) {
-      const window =
-        reading.windows.find(w => gateNames.includes(w.name)) ?? reading.windows[0];
+      const window = reading.windows.find(w => gateNames.includes(w.name)) ?? reading.windows[0];
       return {
         refused: true,
         seat,
@@ -555,13 +598,22 @@ export function decideSeatGate(
   return { refused: false, unknownSeats };
 }
 
+/** True when percent is a finite number inside the accepted 1-95 range. */
+export function isValidSeatCutoff(percent: number): boolean {
+  return (
+    Number.isFinite(percent) &&
+    percent >= MIN_SEAT_CUTOFF_PERCENT &&
+    percent <= MAX_SEAT_CUTOFF_PERCENT
+  );
+}
+
 function cutoffFromEnv(): { percent: number; valid: boolean; raw: string | undefined } {
   const raw = process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
   if (raw === undefined || raw.trim() === '') {
     return { percent: DEFAULT_SEAT_CUTOFF_PERCENT, valid: true, raw };
   }
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 100) {
+  if (!isValidSeatCutoff(parsed)) {
     return { percent: DEFAULT_SEAT_CUTOFF_PERCENT, valid: false, raw };
   }
   return { percent: parsed, valid: true, raw };
@@ -586,12 +638,72 @@ export function setSeatCutoffOverride(percent: number | null): void {
     cutoffOverride = null;
     return;
   }
-  if (!Number.isFinite(percent) || percent < 1 || percent > 100) {
-    throw new Error('seat cutoff percent must be between 1 and 100');
+  if (!isValidSeatCutoff(percent)) {
+    throw new Error(
+      `${SEAT_CUTOFF_OUT_OF_RANGE}: seat cutoff percent must be between ${String(MIN_SEAT_CUTOFF_PERCENT)} and ${String(MAX_SEAT_CUTOFF_PERCENT)}`
+    );
   }
   cutoffOverride = percent;
 }
 
-export function isSeatGateEnabled(): boolean {
-  return process.env.FUELGLASS_SEAT_GATE !== 'off';
+/** UTC hour bucket, e.g. 2026-09-24T10. */
+function hourBucketLabel(bucket: number): string {
+  return new Date(bucket * UNKNOWN_ALERT_WINDOW_MS).toISOString().slice(0, 13);
+}
+
+export interface SeatUnknownAlertContext {
+  workflowName?: string;
+  workflowRunId?: string;
+  now?: number;
+}
+
+/**
+ * Tell the operator that the gate could not measure a seat. The run is NOT
+ * stopped (a broken probe must not stop all work). At most one alert per seat
+ * per UTC hour: an in-memory marker, plus a Dispatch idempotency key derived
+ * from the seat and the hour bucket so a restart inside the same hour does not
+ * send a second one. Never throws. Returns true when a message was enqueued.
+ */
+export async function alertUnknownSeat(
+  seat: SeatId,
+  note: string,
+  context: SeatUnknownAlertContext = {}
+): Promise<boolean> {
+  const bucket = Math.floor((context.now ?? Date.now()) / UNKNOWN_ALERT_WINDOW_MS);
+  if (unknownAlertBucket.get(seat) === bucket) return false;
+  unknownAlertBucket.set(seat, bucket);
+  const hour = hourBucketLabel(bucket);
+  const key = `fuelglass-seat-unknown:${seat}:${hour}`;
+  const runLine =
+    context.workflowRunId !== undefined
+      ? `\nFirst affected run: ${context.workflowName ?? 'unknown workflow'} (${context.workflowRunId}).`
+      : '';
+  const body =
+    `Fuelglass seat gate could not measure seat ${seat}\n` +
+    `The seat gate could not measure the ${seat} seat, so runs on it are proceeding without the usage cutoff.\n` +
+    `Note: ${note || 'UNKNOWN'}\n` +
+    `Hour (UTC): ${hour}. At most one alert per seat per hour.${runLine}\n` +
+    'Check: GET /api/fuelglass/seats';
+  try {
+    await alertSend(
+      { kind: 'system', sender: 'dispatch' },
+      {
+        correlation_id: key,
+        idempotency_key: key,
+        task_type: 'agent_message',
+        recipient: 'operator',
+        priority: 'normal',
+        body,
+      }
+    );
+    return true;
+  } catch (err) {
+    // Clear the marker so the next unmeasured run retries the alert.
+    unknownAlertBucket.delete(seat);
+    warnLog(
+      { seat, error: err instanceof Error ? err.message : String(err) },
+      'fuelglass.seat_unknown_alert_failed'
+    );
+    return false;
+  }
 }
