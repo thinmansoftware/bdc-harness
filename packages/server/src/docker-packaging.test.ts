@@ -53,6 +53,10 @@ describe('production Docker packaging', () => {
     'build-app-image.sh stamps HEAD and refuses a dirty tree',
     async () => {
       const dir = await mkdtemp(join(tmpdir(), 'build-app-image-'));
+      // Stub docker binary and its log live OUTSIDE the git worktree under test,
+      // so writing/updating them never shows up in `git status --porcelain` for
+      // `dir` (untracked files there are now correctly DIRTY per the fix below).
+      const stubDir = await mkdtemp(join(tmpdir(), 'build-app-image-stub-'));
       try {
         const scriptDir = join(dir, 'scripts', 'container');
         await Bun.spawn(['mkdir', '-p', scriptDir]).exited;
@@ -100,8 +104,8 @@ describe('production Docker packaging', () => {
         const head = (await new Response(headProc.stdout).text()).trim();
         expect(await headProc.exited).toBe(0);
 
-        const stubLog = join(dir, 'stub.log');
-        const stub = join(dir, 'stub-docker.sh');
+        const stubLog = join(stubDir, 'stub.log');
+        const stub = join(stubDir, 'stub-docker.sh');
         await writeFile(
           stub,
           `#!/usr/bin/env bash\nprintf '%s %s\\n' "$ARCHON_BUILD_SHA" "$*" > "${stubLog}"\nexit 0\n`
@@ -154,6 +158,7 @@ describe('production Docker packaging', () => {
         expect(untrackedErr).toContain('DIRTY');
       } finally {
         await rm(dir, { recursive: true, force: true });
+        await rm(stubDir, { recursive: true, force: true });
       }
     }
   );
