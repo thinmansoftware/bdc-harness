@@ -12206,10 +12206,10 @@ describe('executeDagWorkflow -- tier/entry_rung + frontier_cost_usd', () => {
   });
 
   it('T2: frontier_cost_usd == tokens.input * INPUT_RATE + tokens.output * OUTPUT_RATE', async () => {
-    // Known token counts; published frontier rates (claude-opus-4-7):
-    //   INPUT_RATE  = 0.000015 USD/token
-    //   OUTPUT_RATE = 0.000075 USD/token
-    // 1000 * 0.000015 + 200 * 0.000075 = 0.015 + 0.015 = 0.030
+    // Known token counts; Opus 5.5 list rates (OpenRouter 2026-09-22):
+    //   INPUT_RATE  = 0.000004 USD/token
+    //   OUTPUT_RATE = 0.00002 USD/token
+    // 1000 * 0.000004 + 200 * 0.00002 = 0.004 + 0.004 = 0.008
     mockSendQueryDag.mockImplementation(function* () {
       yield { type: 'assistant', content: 'done' };
       yield {
@@ -12242,7 +12242,7 @@ describe('executeDagWorkflow -- tier/entry_rung + frontier_cost_usd', () => {
 
     const data = getNodeCompletedData(store);
     expect(typeof data.frontier_cost_usd).toBe('number');
-    expect(data.frontier_cost_usd as number).toBeCloseTo(0.03, 10);
+    expect(data.frontier_cost_usd as number).toBeCloseTo(0.008, 10);
   });
 
   it('T3: run metadata carries both total_cost_usd and total_frontier_cost_usd', async () => {

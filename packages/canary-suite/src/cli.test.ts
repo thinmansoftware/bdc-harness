@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'bun:test';
 import { runCanaryCli } from './cli';
+import type { IAgentProvider, MessageChunk } from '@archon/providers';
 import type { CanaryReport, RunCanaryResult } from './types';
 import type { TaskmasterCanaryResult } from './taskmaster-canary';
 
@@ -147,6 +148,61 @@ test('taskmaster accepts TASKMASTER_INTERVAL_MS=0 and wires token and artifacts'
   });
   expect(deps.taskmasterArtifactWriter).toHaveBeenCalledWith('artifacts', taskmasterReport);
   expect(deps.stdout).toHaveBeenCalledWith(JSON.stringify(taskmasterReport, null, 2));
+});
+
+function fakeProvider(behavior: 'ok' | 'auth'): IAgentProvider {
+  return {
+    getType: () => 'claude',
+    getCapabilities: () => ({}) as ReturnType<IAgentProvider['getCapabilities']>,
+    sendQuery: async function* (): AsyncGenerator<MessageChunk> {
+      if (behavior === 'auth') {
+        throw Object.assign(new Error('authentication_failed'), { httpStatus: 401 });
+      }
+      yield { type: 'assistant', content: 'OK' };
+    },
+  };
+}
+
+test('probe-binding exits 0 and prints ok when the injected provider returns an assistant chunk', async () => {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const exit = await runCanaryCli(
+    ['probe-binding', '--provider', 'claude', '--model', 'claude-opus-5-5'],
+    {},
+    {
+      runner: mock(async () => ({}) as RunCanaryResult),
+      stdout: value => stdout.push(value),
+      stderr: value => stderr.push(value),
+      probeBindingDeps: {
+        getAgentProvider: () => fakeProvider('ok'),
+        sleep: async () => {},
+      },
+    }
+  );
+  expect(exit).toBe(0);
+  expect(stdout).toEqual(['ok']);
+  expect(stderr).toEqual([]);
+});
+
+test('probe-binding exits 2 and prints the classification when the injected provider throws an auth error', async () => {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const exit = await runCanaryCli(
+    ['probe-binding', '--provider', 'claude', '--model', 'claude-opus-5-5'],
+    {},
+    {
+      runner: mock(async () => ({}) as RunCanaryResult),
+      stdout: value => stdout.push(value),
+      stderr: value => stderr.push(value),
+      probeBindingDeps: {
+        getAgentProvider: () => fakeProvider('auth'),
+        sleep: async () => {},
+      },
+    }
+  );
+  expect(exit).toBe(2);
+  expect(stdout.join('\n')).toContain('unknown_400');
+  expect(stderr.join('\n')).toContain('authentication_failed');
 });
 
 test('taskmaster maps a failed report to exit 2 after writing its artifact', async () => {

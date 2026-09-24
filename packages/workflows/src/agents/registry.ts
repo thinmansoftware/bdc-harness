@@ -55,6 +55,7 @@ export const KNOWN_MODEL_ALIASES: ReadonlySet<string> = new Set([
   'fable',
   // Full model IDs are also accepted
   'claude-opus-5',
+  'claude-opus-5-5',
   'claude-opus-5[1m]',
   'claude-opus-4-7',
   'claude-sonnet-4-6',

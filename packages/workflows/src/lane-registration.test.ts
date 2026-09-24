@@ -174,7 +174,7 @@ describe('lane registration and war-council-validator pin', () => {
         // of subscription quota). Superseded by the apex-rung WO (bdc-xo issue
         // #575) when it lands.
         expect(wcv.provider).toBe('claude');
-        expect(wcv.model).toBe('claude-opus-5');
+        expect(wcv.model).toBe('claude-opus-5-5');
         return;
       }
 

@@ -7,6 +7,8 @@ import {
   type TaskmasterCanaryDeps,
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
+import { getAgentProvider, registerBuiltinProviders } from '@archon/providers';
+import { runProbeBinding, type ProbeBindingDeps } from './probe-binding';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
@@ -17,6 +19,8 @@ interface CanaryCliDeps {
     outputRoot: string,
     report: TaskmasterCanaryResult
   ) => Promise<readonly string[]>;
+  readonly probeBindingRunner?: ProbeBindingDeps['probe'];
+  readonly probeBindingDeps?: Pick<ProbeBindingDeps, 'getAgentProvider' | 'sleep'>;
 }
 
 function flag(args: readonly string[], name: string): string | undefined {
@@ -80,9 +84,38 @@ export async function runCanaryCli(
     deps.stdout(JSON.stringify(report, null, 2));
     return exitFor(report.verdict);
   }
+  if (command === 'probe-binding') {
+    const providerId = flag(args, '--provider');
+    const modelId = flag(args, '--model');
+    if (!providerId || !modelId) {
+      deps.stderr('probe_binding_missing_required_argument');
+      return 3;
+    }
+    const probeDeps = deps.probeBindingDeps ?? {
+      getAgentProvider: (id: string): ReturnType<typeof getAgentProvider> => {
+        registerBuiltinProviders();
+        return getAgentProvider(id);
+      },
+    };
+    const result = await runProbeBinding(
+      { providerId, modelId },
+      {
+        getAgentProvider: probeDeps.getAgentProvider,
+        sleep: probeDeps.sleep,
+        probe: deps.probeBindingRunner,
+      }
+    );
+    if (result.ok) {
+      deps.stdout('ok');
+      return 0;
+    }
+    deps.stdout(result.classification.errorClass);
+    deps.stderr(result.classification.excerpt);
+    return 2;
+  }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster> [options]');
+    deps.stderr('Usage: archon-canary <check|plan|taskmaster|probe-binding> [options]');
     return 3;
   }
   const manifestPath = flag(args, '--manifest');

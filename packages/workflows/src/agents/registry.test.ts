@@ -23,6 +23,7 @@ import {
   parseFrontmatter,
   AgentRegistryError,
 } from './registry';
+import { KNOWN_MODEL_ALIASES } from './registry';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -111,7 +112,25 @@ Prompt.`;
 // loadAgentFile -- happy path
 // ---------------------------------------------------------------------------
 
+describe('KNOWN_MODEL_ALIASES', () => {
+  test('includes claude-opus-5-5', () => {
+    expect(KNOWN_MODEL_ALIASES.has('claude-opus-5-5')).toBe(true);
+  });
+});
+
 describe('loadAgentFile happy path', () => {
+  test('accepts model claude-opus-5-5 in frontmatter', async () => {
+    const filePath = await writeAgent(
+      'opus-55-agent.md',
+      VALID_AGENT.replace('name: test-agent', 'name: opus-55-agent').replace(
+        'model: sonnet',
+        'model: claude-opus-5-5'
+      )
+    );
+    const persona = await loadAgentFile(filePath);
+    expect(persona.model).toBe('claude-opus-5-5');
+  });
+
   test('loads a valid agent file', async () => {
     const filePath = await writeAgent('test-agent.md', VALID_AGENT);
     const persona = await loadAgentFile(filePath);
