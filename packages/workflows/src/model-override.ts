@@ -27,17 +27,18 @@ export interface ResolvedModelBinding {
 
 /** Resolve the effective provider/model pair for one workflow node. */
 export function resolveModelForNode(input: ResolveModelForNodeInput): ResolvedModelBinding {
+  const workflowOverride = input.modelOverride?.workflow;
+  const workflowProvider = workflowOverride?.provider ?? input.workflowProvider;
+  const workflowModel = workflowOverride?.model ?? input.workflowModel;
+
   const nodeOverride = input.modelOverride?.nodes?.[input.nodeId];
   if (nodeOverride) {
     return {
-      provider: nodeOverride.provider ?? input.nodeProvider ?? input.workflowProvider,
+      provider: nodeOverride.provider ?? input.nodeProvider ?? workflowProvider,
       model: nodeOverride.model,
     };
   }
 
-  const workflowOverride = input.modelOverride?.workflow;
-  const workflowProvider = workflowOverride?.provider ?? input.workflowProvider;
-  const workflowModel = workflowOverride?.model ?? input.workflowModel;
   const provider = input.nodeProvider ?? workflowProvider;
   const assistantModel = input.assistantModels?.[provider];
 

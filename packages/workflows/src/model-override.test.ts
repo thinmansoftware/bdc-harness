@@ -41,6 +41,39 @@ describe('resolveModelForNode', () => {
     ).toEqual({ provider: 'codex', model: 'gpt-5.6-sol' });
   });
 
+  it('node override with only a model inherits the overridden workflow provider', () => {
+    expect(
+      resolveModelForNode({
+        ...defaults,
+        modelOverride: {
+          workflow: { provider: 'opr', model: 'x-ai/grok-4.7' },
+          nodes: { build: { model: 'custom-model' } },
+        },
+      })
+    ).toEqual({ provider: 'opr', model: 'custom-model' });
+  });
+
+  it('node override with its own provider keeps it under a workflow override', () => {
+    expect(
+      resolveModelForNode({
+        ...defaults,
+        modelOverride: {
+          workflow: { provider: 'opr', model: 'x-ai/grok-4.7' },
+          nodes: { build: { provider: 'claude', model: 'sonnet' } },
+        },
+      })
+    ).toEqual({ provider: 'claude', model: 'sonnet' });
+  });
+
+  it("node override with only a model and no workflow override keeps today's provider", () => {
+    expect(
+      resolveModelForNode({
+        ...defaults,
+        modelOverride: { nodes: { build: { model: 'custom-model' } } },
+      })
+    ).toEqual({ provider: defaults.workflowProvider, model: 'custom-model' });
+  });
+
   it('preserves the existing resolution chain without an override', () => {
     expect(resolveModelForNode(defaults)).toEqual({ provider: 'codex', model: 'gpt-5.6-sol' });
     expect(
