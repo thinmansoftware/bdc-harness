@@ -507,6 +507,61 @@ assert_contains "Test 13 DEPS_STATUS=failed" "DEPS_STATUS=failed" "$OUT13"
 assert_contains "Test 13 failed_mutation" ".:failed_mutation" "$OUT13"
 assert_eq "Test 13 content left as install left it" "install-clobbered-scratch" "$(cat "$T13/repo/scratch.local.md")"
 
+echo "--- Test 14: install-created special-character paths are removed losslessly ---"
+# Overseer review, bdc-harness#946, [major]: porcelain v1 C-quotes special
+# filenames, and a literal " -> " is valid filename content. Cleanup must use
+# NUL-delimited paths instead of decoding line-oriented porcelain text.
+reset_wdi_env
+T14="$(newtmp)"
+ART14="$(newtmp)"
+export ARTIFACTS_DIR="$ART14"
+mkdir -p "$T14/repo"
+printf '%s\n' '{"name":"wdi-fixture","private":true}' > "$T14/repo/package.json"
+printf '%s\n' 'lock-v1' > "$T14/repo/bun.lock"
+printf '%s\n' 'node_modules' > "$T14/repo/.gitignore"
+init_repo "$T14/repo"
+BIN14="$(make_stub_bin)"
+arm_stub_logs "$BIN14"
+write_stub "$BIN14" bun 'tab_name="$(printf "tab\\tname.txt")"; newline_name="$(printf "line\\nname.txt")"; utf8_name="$(printf "byte-\\303\\251.txt")"; printf x > "literal -> arrow.txt"; printf x > "$tab_name"; printf x > "$newline_name"; printf x > '\''quote"name.txt'\''; printf x > '\''back\\slash.txt'\''; printf x > "$utf8_name"'
+export PATH="$BIN14:$ORIG_PATH"
+OUT14="$(cd "$T14/repo" && wdi_main </dev/null)"
+assert_contains "Test 14 dirty_reverted" ".:dirty_reverted" "$OUT14"
+TAB14="$(printf 'tab\tname.txt')"
+NEWLINE14="$(printf 'line\nname.txt')"
+UTF814="$(printf 'byte-\303\251.txt')"
+for SPECIAL14 in "literal -> arrow.txt" "$TAB14" "$NEWLINE14" 'quote"name.txt' 'back\slash.txt' "$UTF814"; do
+  if [ ! -e "$T14/repo/$SPECIAL14" ]; then
+    PASS=$((PASS+1)); printf 'PASS: Test 14 removed %q\n' "$SPECIAL14"
+  else
+    FAIL=$((FAIL+1)); printf 'FAIL: Test 14 removed %q\n' "$SPECIAL14"
+  fi
+done
+
+echo "--- Test 15: install-created rename with a special destination is fully reverted ---"
+# In porcelain v1 -z, a rename emits the destination first and the source as
+# a second NUL record. Cleanup needs both actual paths: remove the destination
+# and restore the source without line parsing or C-quote decoding.
+reset_wdi_env
+T15="$(newtmp)"
+ART15="$(newtmp)"
+export ARTIFACTS_DIR="$ART15"
+mkdir -p "$T15/repo"
+printf '%s\n' '{"name":"wdi-fixture","private":true}' > "$T15/repo/package.json"
+printf '%s\n' 'lock-v1' > "$T15/repo/bun.lock"
+printf '%s\n' 'node_modules' > "$T15/repo/.gitignore"
+printf '%s\n' 'committed-content' > "$T15/repo/rename-source.txt"
+init_repo "$T15/repo"
+RENAME15="$(printf 'renamed -> line\nname.txt')"
+BIN15="$(make_stub_bin)"
+arm_stub_logs "$BIN15"
+write_stub "$BIN15" bun 'target_name="$(printf "renamed -> line\\nname.txt")"; mv -- rename-source.txt "$target_name"; git add -A'
+export PATH="$BIN15:$ORIG_PATH"
+OUT15="$(cd "$T15/repo" && wdi_main </dev/null)"
+assert_contains "Test 15 dirty_reverted" ".:dirty_reverted" "$OUT15"
+assert_eq "Test 15 source restored" "committed-content" "$(cat "$T15/repo/rename-source.txt")"
+[ ! -e "$T15/repo/$RENAME15" ] && echo "PASS: Test 15 destination removed" && PASS=$((PASS+1)) || { echo "FAIL: Test 15 destination removed"; FAIL=$((FAIL+1)); }
+assert_eq "Test 15 repository clean" "" "$(cd "$T15/repo" && git status --porcelain=v1 --untracked-files=all)"
+
 echo
 echo "install-worktree-deps.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
