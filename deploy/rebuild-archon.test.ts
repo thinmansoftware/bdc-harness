@@ -26,6 +26,8 @@ async function setup(opts: {
   readyOn?: number;
   dirty?: boolean;
   postUpDraining?: boolean;
+  upFails?: boolean;
+  userName?: string;
 }): Promise<void> {
   root = await mkdtemp(join(tmpdir(), 'rebuild-archon-'));
   bin = join(root, 'bin');
@@ -38,6 +40,7 @@ async function setup(opts: {
   const lockHeld = opts.lockHeld ? '1' : '0';
   const dirty = opts.dirty ? '1' : '0';
   const postUp = opts.postUpDraining === false ? 'normal' : 'draining';
+  const upFails = opts.upFails ? '1' : '0';
 
   await writeStub(
     'flock',
@@ -53,6 +56,7 @@ exit 0
 printf '%s\\n' "docker $*" >> "${log}"
 if [[ "$*" == *printenv* ]]; then printf '%s\\n' 'tok-SENTINEL-123'; exit 0; fi
 if [[ "$*" == *inspect* ]]; then printf '%s\\n' 'sha256:img'; exit 0; fi
+if [[ "$*" == *"compose up -d app"* ]] && [ "${upFails}" = "1" ]; then exit 1; fi
 exit 0
 `
   );
@@ -201,6 +205,52 @@ describe('rebuild-archon.sh', () => {
     expect(foreign.exitCode).toBe(3);
     expect(foreign.calls).not.toContain('draining":false');
     expect(foreign.calls).not.toContain('compose build app');
+  });
+
+  // Overseer review, bdc-harness#949, [major]: RECREATED used to be set
+  // BEFORE `docker compose up -d app` ran, so a failing `up -d` tripped the
+  // ERR trap with RECREATED already 1 -- undrain_if_mine's guard then
+  // suppressed undraining even though no replacement container ever booted
+  // to run clearOnBoot, leaving Cauldron drained indefinitely.
+  test('rebuild_script_undrains_when_compose_up_fails', async () => {
+    await setup({ upFails: true });
+    const { exitCode, calls } = await runScript(['--poll-sec', '0', '--drain-timeout-min', '5']);
+    // set -euo pipefail means the script exits non-zero via the ERR trap
+    // when `docker compose up -d app` fails; it never reaches the script's
+    // own explicit exit codes (0/1/3/75) for this path.
+    expect(exitCode).not.toBe(0);
+    expect(calls).toContain('compose build app');
+    expect(calls).toContain('compose up -d app');
+    // The undrain call was actually made -- not suppressed by a
+    // prematurely-set RECREATED guard.
+    expect(calls).toContain('draining":false');
+    const buildAt = calls.indexOf('compose build app');
+    const upAt = calls.indexOf('compose up -d app');
+    const undrainAt = calls.lastIndexOf('draining":false');
+    expect(upAt).toBeGreaterThan(buildAt);
+    expect(undrainAt).toBeGreaterThan(upAt);
+    // Never reached the post-recreate drain-clear branch or the pruning
+    // tail -- the script aborted at the failed `up -d`, before any of that.
+    expect(calls).not.toContain('DRAIN_CLEARED_BY_SCRIPT');
+    expect(calls).not.toContain('builder prune');
+  });
+
+  test('rebuild_script_json_escapes_the_drain_reason', async () => {
+    // A USER value containing a double quote and a backslash must not
+    // produce malformed JSON or inject a field into the drain request body.
+    await setup({});
+    const { exitCode, calls } = await runScript(['--poll-sec', '0', '--drain-timeout-min', '5'], {
+      USER: 'j"o\\hn',
+    });
+    expect(exitCode).toBe(0);
+    const drainCall = calls
+      .split('\n')
+      .find(line => line.startsWith('curl ') && line.includes('clearOnBoot'));
+    expect(drainCall).toBeDefined();
+    // The quote and backslash are escaped, not left raw -- a raw '"' here
+    // would terminate the JSON string value early and corrupt the payload.
+    expect(drainCall).toContain('j\\"o\\\\hn');
+    expect(drainCall).not.toMatch(/reason":"rebuild [^\\]*j"o/);
   });
 
   test('rebuild_script_never_prints_token', async () => {

@@ -53,6 +53,21 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+json_escape() {
+  # Escapes a string for safe use inside a JSON double-quoted value: backslash
+  # and double-quote first (order matters -- escaping the backslash first
+  # would double-escape the backslashes just added for the quote), then the
+  # control characters JSON forbids raw inside a string. USER is
+  # attacker-influenced in principle (any value the running account's shell
+  # environment sets) and was previously interpolated unescaped into
+  # DRAIN_BODY, which could inject JSON fields or read as malformed JSON.
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')"
+  printf '%s' "$s"
+}
+
 undrain_if_mine() {
   if [ "$DRAIN_SET_BY_ME" = "1" ] && [ "$RECREATED" = "0" ] && [ -n "$TOKEN" ]; then
     curl -sS -X POST "$API_BASE/api/admin/drain" \
@@ -79,8 +94,9 @@ TOKEN="$(docker exec archon-app-1 printenv ARCHON_OPERATOR_TOKEN)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 USER_NAME="${USER:-unknown}"
 REASON="rebuild ${STAMP} by ${USER_NAME}"
+REASON_JSON="$(json_escape "$REASON")"
 
-DRAIN_BODY="$(printf '{"draining":true,"clearOnBoot":true,"reason":"%s"}' "$REASON")"
+DRAIN_BODY="$(printf '{"draining":true,"clearOnBoot":true,"reason":"%s"}' "$REASON_JSON")"
 DRAIN_RESP="$(curl -sS -X POST "$API_BASE/api/admin/drain" \
   -H "Content-Type: application/json" \
   -H "x-archon-operator-token: $TOKEN" \
@@ -145,8 +161,16 @@ AVAIL="$(df --output=avail -BG / | tail -1 | tr -dc 0-9)"
 [ "${AVAIL:-0}" -ge 15 ] || { printf '%s\n' ABORT_DISK; false; }
 
 docker compose build app
-RECREATED=1
 docker compose up -d app
+# RECREATED is set ONLY after `up -d` itself has returned success -- a new
+# container now exists (whether or not it goes on to pass the health check
+# below). Setting it earlier (Overseer review, bdc-harness#949 [major]) meant
+# a failed `up -d` tripped the ERR trap with RECREATED already 1: the guard
+# in undrain_if_mine then suppressed undraining even though no replacement
+# container had booted to ever run clearOnBoot, leaving Cauldron drained
+# indefinitely. `set -euo pipefail` means a non-zero `up -d` exit reaches the
+# trap before this assignment is ever reached.
+RECREATED=1
 
 health_deadline=$(( $(date +%s) + 120 ))
 healthy=0
