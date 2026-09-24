@@ -124,13 +124,9 @@ export function createRealReworkWorkerDeps(): ReworkWorkerDeps {
       return result.rows.some(row => boundary.test(row.user_message));
     },
     async fire(request): Promise<{ status: number; body: unknown }> {
-      const token = process.env.ARCHON_OPERATOR_TOKEN ?? '';
       const response = await fetch(request.url, {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-archon-operator-token': token,
-        },
+        headers: request.headers,
         body: JSON.stringify(request.body),
       });
       let parsed: unknown = null;
@@ -261,10 +257,14 @@ async function handleReworkItem(
         reviewMessageId: body.reviewMessageId,
       })
     ).toString('base64url');
-    const apiBase = (deps.env ?? process.env).ARCHON_API_BASE_URL?.replace(/\/$/, '') || DEFAULT_API_BASE;
+    const env = deps.env ?? process.env;
+    const apiBase = env.ARCHON_API_BASE_URL?.replace(/\/$/, '') || DEFAULT_API_BASE;
     const request: ReworkFireRequest = {
       url: `${apiBase}/api/workflows/${workflow}/run`,
-      headers: { 'x-archon-operator-token': 'present' },
+      headers: {
+        'content-type': 'application/json',
+        'x-archon-operator-token': env.ARCHON_OPERATOR_TOKEN ?? '',
+      },
       body: {
         conversationId: `rework-${body.repo}-${body.prNumber}-${body.headSha.slice(0, 8)}`,
         message: `WO_ID=${body.woId} --project ${body.project} --rework=${directive}`,
@@ -299,6 +299,10 @@ async function failOrBackoff(
   deps: ReworkWorkerDeps,
   detail: string
 ): Promise<void> {
+  // claimMessage increments fencing_token by 1 on each successful claim.
+  // releaseMessage does not change it, so the value is this item's fire
+  // attempt count (packages/core/src/db/dispatch.ts). The 3-attempt cap
+  // depends on that increment staying claim-only.
   if (claimed.fencing_token >= FIRE_ATTEMPT_LIMIT) {
     await deps.postResult({
       id: claimed.id,

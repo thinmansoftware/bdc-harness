@@ -127,10 +127,7 @@ function eligibilityDetail(pr: ReworkPullRequest, headSha: string): string | nul
   if (pr.draft) return 'draft';
   if (pr.labels.some(label => label.toLowerCase() === OPT_OUT_LABEL)) return 'opt_out';
   if (pr.headSha !== headSha) return 'head_moved';
-  if (pr.headRepoFullName.trim().toLowerCase() !== '') {
-    return null;
-  }
-  return 'fork';
+  return null;
 }
 
 function sameRepoHead(pr: ReworkPullRequest, owner: string, repo: string): boolean {
