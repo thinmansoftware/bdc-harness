@@ -113,6 +113,7 @@ describe('stripMatrixSuffix and completionIsRelevantToVerdict', () => {
     expect(stripMatrixSuffix('test (windows-latest)')).toBe('test');
     expect(stripMatrixSuffix('a (b) (c)')).toBe('a (b)');
     expect(stripMatrixSuffix('x ((y)')).toBe('x');
+    expect(stripMatrixSuffix('foo (bar (baz))')).toBe('foo (bar (baz))');
     expect(stripMatrixSuffix('plain')).toBe('plain');
 
     const verdict = changesRequestedVerdict('[blocker] checks/test failed: x');
@@ -152,6 +153,7 @@ describe('extractBoardSeat', () => {
     expect(extractBoardSeat('## Codex -- approve')).toBe('Codex');
     expect(extractBoardSeat('## Grok -- APPROVED')).toBeNull();
     expect(extractBoardSeat('##### Grok -- APPROVE')).toBeNull();
+    expect(extractBoardSeat('  ## Claude -- APPROVE')).toBeNull();
   });
 });
 

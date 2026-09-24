@@ -84,6 +84,12 @@ describe('resolveWoBoardSeatOwner', () => {
     ).toBeNull();
   });
 
+  test('does not assign a seat from an indented approval heading', () => {
+    expect(extractBoardSeat('  ## Claude -- APPROVE\n')).toBeNull();
+    expect(extractBoardSeat('\t## Codex -- APPROVE\n')).toBeNull();
+    expect(extractBoardSeat('## Claude -- APPROVE\n')).toBe('Claude');
+  });
+
   test('returns null for an ambiguous or unparseable motion', async () => {
     const ambiguous =
       '# Motion\n\n**Proposed by:** Board\n\n### Claude -- APPROVE\n### GPT -- APPROVE\n';

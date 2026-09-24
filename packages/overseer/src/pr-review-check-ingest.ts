@@ -336,8 +336,10 @@ function isSuiteLevelCheckId(checkId: string): boolean {
 }
 
 /**
- * Drop a trailing matrix cell `(label)` from a check name. Linear in the
- * length of `s`: only the final `(...)` group is removed.
+ * Drop a trailing matrix cell `(label)` from a check name. Same contract as
+ * `/\s*\([^)]*\)\s*$/`: the final group's interior may contain `(`, but a `)`
+ * inside it means the suffix is not a matrix cell and the name is unchanged.
+ * Linear in the length of `s`.
  */
 export function stripMatrixSuffix(s: string): string {
   const t = s.trimEnd();
