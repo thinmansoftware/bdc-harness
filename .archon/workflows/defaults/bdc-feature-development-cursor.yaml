@@ -347,14 +347,14 @@ nodes:
     agent: war-council-architect-opr
     # Cross-model boundary: Grok 4.7 authors the plan on the Cursor rail;
     # Codex (gpt-5.6-sol) reviews it. The builder never grades its own work.
-    depends_on: [plan]
+    depends_on: [plan, checkout-repair-target]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
     loop:
       fresh_context: true
       # Success-only sentinel. The war-council-architect persona is READ-ONLY
-      # (tools: [Read,Grep,Glob,WebFetch] -- no Write), so this loop is STDOUT-ONLY:
+      # (tools: [Read,Grep,Glob] -- no Write), so this loop is STDOUT-ONLY:
       # no until_bash, no findings file. Completion = the architect emits the
       # PLAN_REVIEW_APPROVED token, which it is instructed to emit ONLY when the plan
       # truly passes (never on a failing/escalation iteration). On the final iteration
@@ -381,6 +381,8 @@ nodes:
         worktree. Ensure the approved plan remains a minimal plan that VERIFIES the
         existing state rather than re-creating it.
         Spec: $read-spec.output
+        Lane-verified repair-target record (verified by the lane with the GitHub CLI before plan-review ran):
+        $checkout-repair-target.output
 
         ## Attack the plan on these dimensions
         1. Scope creep -- any file not justified by the spec.
@@ -391,13 +393,16 @@ nodes:
            and shopops-storefront have NO staging branch (verified 2026-07-07;
            their PRs target the repo default branch).
         4b. Repair target -- when the spec declares `Repair target: PR #N (branch X)`,
-           use WebFetch to verify that PR #N is open on the target repo and its head
-           branch is X. An open matching PR is self-authorizing: preserve it in the
-           approved plan as `repair_target_authorized_by_spec: #N`; never ask whether
-           it is canonical or whether to close it and rebuild fresh. If it is closed,
-           fail this plan iteration with the literal reason `declared repair target #N
-           is closed`. If it is not on the target repo, its branch does not match X, or
-           it cannot be verified, fail with `declared repair target #N is not on <repo>`.
+           parse REPAIR_TARGET and REPAIR_TARGET_BRANCH from the lane-verified
+           repair-target record supplied above. When both the PR number and the branch
+           match, that match is self-authorizing: preserve it in the approved plan as
+           `repair_target_authorized_by_spec: #N`; never ask whether it is canonical or
+           whether to close it and rebuild fresh. When REPAIR_TARGET=none despite a
+           declared target, fail this plan iteration with the literal reason
+           `declared repair target #N was not verified by the lane`. When either the PR
+           number or the branch differs, fail this plan iteration with the literal
+           reason `declared repair target #N does not match the lane-verified record`.
+           Decide only from that record. Do not access the network in this step.
         5. Out-of-scope list present and correct.
 
         ## Self-repair (the point -- do not just report)
