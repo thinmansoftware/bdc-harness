@@ -86,8 +86,8 @@ export interface FusionReviewRequest {
 }
 
 /**
- * Grok model id as exposed by Cursor. Verified live 2026-08-26 against
- * `cursor-agent --list-models` on the target host. Overridable by env because
+ * Grok model id as exposed by Cursor. Verified live 2026-09-22/2026-09-23
+ * via `cursor-agent --list-models` on archon-app-1. Overridable by env because
  * Cursor's roster moves (Grok 4.3 -> 4.5 -> 4.6 inside two months); a moved id
  * must be a config change, not a code change.
  */
@@ -187,11 +187,9 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
    * admitted under the grok family, so a separately-installed Grok builder
    * slots in alongside these without changing this entry.
    *
-   * Model id verified live 2026-08-26 via `cursor-agent --list-models` on the
-   * target host, then proven end-to-end in a scratch container:
-   *   cursor-agent -f -p --model grok-4.7-high "..." -> rc 0,
-   *   non-empty response. The 2026-07-22 feasibility doc had listed the exact
-   *   Grok model-id string as UNCONFIRMED; this resolves it.
+   * Model id verified live 2026-09-22/2026-09-23 via `cursor-agent --list-models`
+   * on archon-app-1. The 2026-08-26 scratch-container run proved
+   * cursor-grok-4.6-high-fast, not this id.
    *
    * Same three CLI traps as cursor-build apply (no --mode: both choices are
    * read-only; --force to run commands; --trust or the CLI exits 0 with EMPTY
