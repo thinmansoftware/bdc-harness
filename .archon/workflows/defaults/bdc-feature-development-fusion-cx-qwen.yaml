@@ -1137,18 +1137,21 @@ nodes:
       if [ "$RUNNER" = "bunx prettier" ]; then
         command -v bunx >/dev/null 2>&1 || RUNNER="npx prettier"
       fi
-      FILES=$(cat "$SCOPE_FILE")
-      COUNT=$(printf '%s\n' "$FILES" | sed '/^$/d' | wc -l | tr -d ' ')
+      FILES=()
+      while IFS= read -r f || [ -n "$f" ]; do
+        [ -n "$f" ] || continue
+        [ -f "$f" ] || continue
+        FILES+=("$f")
+      done < "$SCOPE_FILE"
+      COUNT=${#FILES[@]}
       if [ "$COUNT" -eq 0 ]; then
         echo "FORMAT_FILES_CHANGED=0"
         echo "FORMAT_STATUS=clean"
         exit 0
       fi
-      # shellcheck disable=SC2086
-      $RUNNER --write $FILES >/dev/null 2>&1 || true
-      # shellcheck disable=SC2086
-      if $RUNNER --check $FILES >/dev/null 2>&1; then
-        DIRTY=$(git status --porcelain -- $FILES | wc -l | tr -d ' ')
+      $RUNNER --write -- "${FILES[@]}" >/dev/null 2>&1 || true
+      if $RUNNER --check -- "${FILES[@]}" >/dev/null 2>&1; then
+        DIRTY=$(git status --porcelain -- "${FILES[@]}" | wc -l | tr -d ' ')
         if [ "$DIRTY" -gt 0 ]; then
           echo "FORMAT_FILES_CHANGED=$DIRTY"
           echo "FORMAT_STATUS=fixed"

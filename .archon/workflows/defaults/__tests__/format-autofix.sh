@@ -203,6 +203,74 @@ else
   fail "12 lanes with ascii-autofix also have format-autofix; run-stop-tests and run-stop-greps both depend on it" "ascii=$ASCII_N format=$FORMAT_N rewire=$REWIRE_N rsg=$RSG_REWIRE_N"
 fi
 
+# 7. Filename with a space is one path; files outside the list stay untouched.
+REPO7="$TMP/space-name"
+ART7="$TMP/art7"
+mkdir -p "$ART7"
+init_repo "$REPO7"
+write_prettier_pkg "$REPO7"
+printf 'export const value={a:1,b:2}\n' > "$REPO7/a b.ts"
+printf 'export const other={c:3,d:4}\n' > "$REPO7/outside.ts"
+cp "$REPO7/outside.ts" "$TMP/space-outside-before.ts"
+git -C "$REPO7" add -- package.json "a b.ts" outside.ts
+git -C "$REPO7" commit -qm baseline
+printf '%s\n' 'a b.ts' > "$ART7/run-changed-source-files.txt"
+OUT=$(cd "$REPO7" && ARTIFACTS_DIR="$ART7" RUNNER="$PRETTIER_BIN" bash "$SCRIPT" 2>&1)
+RC=$?
+if [ "$RC" -eq 0 ] \
+  && grep -qx 'FORMAT_STATUS=fixed' <<< "$OUT" \
+  && "$PRETTIER_BIN" --check -- "$REPO7/a b.ts" >/dev/null 2>&1 \
+  && cmp -s "$TMP/space-outside-before.ts" "$REPO7/outside.ts" \
+  && [ ! -e "$REPO7/b.ts" ]; then
+  pass "filename with a space is formatted and files outside the list stay untouched"
+else
+  fail "filename with a space is formatted and files outside the list stay untouched" "rc=$RC output=[$OUT]"
+fi
+
+# 8. A literal glob metacharacter is not expanded to other matching files.
+REPO8="$TMP/glob-name"
+ART8="$TMP/art8"
+mkdir -p "$ART8"
+init_repo "$REPO8"
+write_prettier_pkg "$REPO8"
+printf 'export const value={a:1,b:2}\n' > "$REPO8/glob*.ts"
+printf 'export const other={c:3,d:4}\n' > "$REPO8/glob-other.ts"
+cp "$REPO8/glob-other.ts" "$TMP/glob-other-before.ts"
+git -C "$REPO8" add -- package.json "glob*.ts" glob-other.ts
+git -C "$REPO8" commit -qm baseline
+printf '%s\n' 'glob*.ts' > "$ART8/run-changed-source-files.txt"
+OUT=$(cd "$REPO8" && ARTIFACTS_DIR="$ART8" RUNNER="$PRETTIER_BIN" bash "$SCRIPT" 2>&1)
+RC=$?
+if [ "$RC" -eq 0 ] \
+  && grep -qx 'FORMAT_STATUS=fixed' <<< "$OUT" \
+  && "$PRETTIER_BIN" --check -- "$REPO8/glob*.ts" >/dev/null 2>&1 \
+  && cmp -s "$TMP/glob-other-before.ts" "$REPO8/glob-other.ts" \
+  && ! "$PRETTIER_BIN" --check -- "$REPO8/glob-other.ts" >/dev/null 2>&1; then
+  pass "literal glob filename is formatted and other glob matches stay untouched"
+else
+  fail "literal glob filename is formatted and other glob matches stay untouched" "rc=$RC output=[$OUT]"
+fi
+
+# 9. A leading dash is a path, not a Prettier CLI option.
+REPO9="$TMP/dash-name"
+ART9="$TMP/art9"
+mkdir -p "$ART9"
+init_repo "$REPO9"
+write_prettier_pkg "$REPO9"
+printf 'export const value={a:1,b:2}\n' > "$REPO9/-leading.ts"
+git -C "$REPO9" add -- package.json "-leading.ts"
+git -C "$REPO9" commit -qm baseline
+printf '%s\n' '-leading.ts' > "$ART9/run-changed-source-files.txt"
+OUT=$(cd "$REPO9" && ARTIFACTS_DIR="$ART9" RUNNER="$PRETTIER_BIN" bash "$SCRIPT" 2>&1)
+RC=$?
+if [ "$RC" -eq 0 ] \
+  && grep -qx 'FORMAT_STATUS=fixed' <<< "$OUT" \
+  && "$PRETTIER_BIN" --check -- "$REPO9/-leading.ts" >/dev/null 2>&1; then
+  pass "leading-dash filename is formatted and is not read as a Prettier option"
+else
+  fail "leading-dash filename is formatted and is not read as a Prettier option" "rc=$RC output=[$OUT]"
+fi
+
 echo ""
 echo "RESULTS: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
