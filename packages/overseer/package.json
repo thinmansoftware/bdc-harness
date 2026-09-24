@@ -42,6 +42,7 @@
     "./pr-review-ingest": "./src/pr-review-ingest.ts",
     "./pr-review-evaluator": "./src/pr-review-evaluator.ts",
     "./pr-review-submit": "./src/pr-review-submit.ts",
+    "./pr-rework": "./src/pr-rework.ts",
     "./pr-review-wiring": "./src/pr-review-wiring.ts",
     "./pr-review-check-ingest": "./src/pr-review-check-ingest.ts",
     "./pr-review-check-wiring": "./src/pr-review-check-wiring.ts",

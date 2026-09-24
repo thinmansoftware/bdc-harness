@@ -69,6 +69,7 @@ import {
   stopDispatchEscalationClock,
 } from './dispatch/escalation-clock';
 import { startReviewWorkerClock, stopReviewWorkerClock } from './dispatch/review-worker-clock';
+import { startReworkWorkerClock, stopReworkWorkerClock } from './dispatch/rework-worker-clock';
 import { startDutyOfficerClock, stopDutyOfficerClock } from './dispatch/duty-officer-clock';
 import {
   observeStartupRecovery,
@@ -674,6 +675,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     });
     getLog().info('overseer_review_route_registered');
     startReviewWorkerClock(reviewRouteConfig);
+    startReworkWorkerClock();
   } else {
     getLog().info(
       'overseer_review_route_not_configured: set OVERSEER_REVIEW_WEBHOOK_SECRET and OVERSEER_REVIEW_IDENTITY to enable'
@@ -836,6 +838,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopProviderWaitScheduler();
     stopDispatchEscalationClock();
     stopReviewWorkerClock();
+    stopReworkWorkerClock();
     stopDutyOfficerClock();
     persistence.stopPeriodicFlush();
 
