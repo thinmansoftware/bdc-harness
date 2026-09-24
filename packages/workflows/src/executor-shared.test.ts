@@ -351,9 +351,9 @@ describe('substituteWorkflowVariables', () => {
     ['LOOP_PREV_OUTPUT', 'previous output'],
   ])('substitutes $NAME but not $NAME_SUFFIX for %s', (name, value) => {
     const { prompt } = substituteWorkflowVariables(
-      `Test ${name} and ${name}_SUFFIX`,
-      'run-1',
-      'msg',
+      `Test $${name} and ${name}_SUFFIX`,
+      value,
+      value,
       '/tmp',
       'main',
       'docs/',
@@ -376,7 +376,7 @@ describe('substituteWorkflowVariables', () => {
         '',
         'docs/'
       )
-    ).not.toThrow('No base branch could be resolved');
+    ).not.toThrow();
   });
 
   it('still throws when $BASE_BRANCH appears with empty baseBranch', () => {

@@ -387,7 +387,7 @@ export const CONTEXT_VAR_PATTERN_STR =
  * Matches $NAME only when NOT followed by [A-Za-z0-9_] (whole identifier).
  */
 function boundedVarRegex(name: string): RegExp {
-  return new RegExp("\\$" + name + "(?![A-Za-z0-9_])", "g");
+  return new RegExp('\\$' + name + '(?![A-Za-z0-9_])', 'g');
 }
 
 /**
