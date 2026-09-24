@@ -1,4 +1,5 @@
 import { readFile } from 'fs/promises';
+import { getAgentProvider, registerBuiltinProviders, type IAgentProvider } from '@archon/providers';
 import { runCanary, type RunCanaryOptions } from './runner';
 import type { RunCanaryResult } from './types';
 import {
@@ -7,6 +8,7 @@ import {
   type TaskmasterCanaryDeps,
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
+import { formatProbeBindingResult, runProbeBinding } from './probe-binding';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
@@ -17,6 +19,7 @@ interface CanaryCliDeps {
     outputRoot: string,
     report: TaskmasterCanaryResult
   ) => Promise<readonly string[]>;
+  readonly getAgentProvider?: (providerId: string) => IAgentProvider;
 }
 
 function flag(args: readonly string[], name: string): string | undefined {
@@ -47,6 +50,20 @@ export async function runCanaryCli(
   }
 ): Promise<number> {
   const command = args[0];
+  if (command === 'probe-binding') {
+    const providerId = flag(args, '--provider');
+    const modelId = flag(args, '--model');
+    if (!providerId || !modelId) {
+      deps.stderr('probe_binding_missing_required_argument');
+      return 3;
+    }
+    if (!deps.getAgentProvider) registerBuiltinProviders();
+    const result = await runProbeBinding(providerId, modelId, process.cwd(), {
+      getAgentProvider: deps.getAgentProvider ?? getAgentProvider,
+    });
+    deps.stdout(formatProbeBindingResult(result));
+    return result.ok ? 0 : 2;
+  }
   if (command === 'taskmaster') {
     const dbPath = flag(args, '--db-path');
     const statusUrl = flag(args, '--status-url');
@@ -82,7 +99,7 @@ export async function runCanaryCli(
   }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster> [options]');
+    deps.stderr('Usage: archon-canary <check|plan|taskmaster|probe-binding> [options]');
     return 3;
   }
   const manifestPath = flag(args, '--manifest');

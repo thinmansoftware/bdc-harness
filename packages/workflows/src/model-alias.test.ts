@@ -37,6 +37,10 @@ describe('isDeclaredServedMatch -- against the real bundled config', () => {
     expect(isDeclaredServedMatch('opus', 'claude-opus-4-7')).toBe(true);
   });
 
+  it('Opus 5.5 resolves through the opus family', () => {
+    expect(isDeclaredServedMatch('opus', 'claude-opus-5-5')).toBe(true);
+  });
+
   it('fable family resolves', () => {
     expect(isDeclaredServedMatch('fable', 'claude-fable-5')).toBe(true);
   });

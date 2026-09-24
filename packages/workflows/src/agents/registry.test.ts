@@ -17,12 +17,17 @@ mock.module('@archon/paths', () => ({
 }));
 
 import {
+  KNOWN_MODEL_ALIASES,
   loadAgentRegistry,
   loadAgentFile,
   resolveAgent,
   parseFrontmatter,
   AgentRegistryError,
 } from './registry';
+
+test('KNOWN_MODEL_ALIASES includes Claude Opus 5.5', () => {
+  expect(KNOWN_MODEL_ALIASES.has('claude-opus-5-5')).toBe(true);
+});
 
 // ---------------------------------------------------------------------------
 // Helpers

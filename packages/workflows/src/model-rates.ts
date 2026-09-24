@@ -11,19 +11,17 @@
 // override model's rates differ meaningfully from Opus's, update the rate
 // constants too.
 //
-// Claude Opus 5 (claude-opus-5) list rates as of 2026-07-28 (swept from
-// claude-opus-4-7 per M-20260726-87; rates carried forward from Opus 4 --
-// update when Opus 5 pricing is confirmed published):
-//   Input:  $15.00 per million tokens = 0.000015 USD/token
-//   Output: $75.00 per million tokens = 0.000075 USD/token
-// Source: https://www.anthropic.com/pricing
+// Claude Opus 5.5 (claude-opus-5-5) list rates as of 2026-09-22:
+//   Input:  $4.00 per million tokens = 0.000004 USD/token
+//   Output: $20.00 per million tokens = 0.000020 USD/token
+// Source: OpenRouter /api/v1/models (anthropic/claude-opus-5.5).
 
-const DEFAULT_FRONTIER_MODEL_ID = 'claude-opus-5';
+const DEFAULT_FRONTIER_MODEL_ID = 'claude-opus-5-5';
 
 export const FRONTIER_MODEL_ID: string =
   process.env.ARCHON_FRONTIER_MODEL_ID ?? DEFAULT_FRONTIER_MODEL_ID;
-export const FRONTIER_INPUT_RATE_PER_TOKEN = 0.000015; // USD
-export const FRONTIER_OUTPUT_RATE_PER_TOKEN = 0.000075; // USD
+export const FRONTIER_INPUT_RATE_PER_TOKEN = 0.000004; // USD
+export const FRONTIER_OUTPUT_RATE_PER_TOKEN = 0.00002; // USD
 
 /**
  * Derive the entry-rung label for a node.
