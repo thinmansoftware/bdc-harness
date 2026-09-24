@@ -378,6 +378,507 @@ export async function loadCommandPrompt(
 
 // --- Variable Substitution ---------------------------------------------------
 
+/**
+ * Regex matching `$<name>` only as a whole identifier: the negative lookahead
+ * ensures longer shell variables sharing the prefix (e.g. `$BASE_BRANCH_OVERRIDE`)
+ * are left verbatim. Returns a fresh global regex per call (no lastIndex sharing).
+ */
+function boundedVarRegex(name: string): RegExp {
+  return new RegExp('\\
+export const CONTEXT_VAR_PATTERN_STR =
+  '\\$(?:CONTEXT|EXTERNAL_CONTEXT|ISSUE_CONTEXT)(?![A-Za-z0-9_])';
+
+/**
+ * Substitute workflow variables in a prompt.
+ *
+ * Supported variables:
+ * - $WORKFLOW_ID - The workflow run ID
+ * - $USER_MESSAGE, $ARGUMENTS - The user's trigger message
+ * - $ARTIFACTS_DIR - External artifacts directory for this workflow run
+ * - $BASE_BRANCH - The base branch (from config or auto-detected)
+ * - $CONTEXT, $EXTERNAL_CONTEXT, $ISSUE_CONTEXT - GitHub issue/PR context (if available)
+ * - $DOCS_DIR - Documentation directory path (configured or default 'docs/')
+ * - $LOOP_USER_INPUT - User feedback from interactive loop approval. Only populated on the
+ *   first iteration of a resumed interactive loop; empty string on all other iterations.
+ * - $REJECTION_REASON - Reviewer feedback from approval node rejection (on_reject prompts only).
+ * - $LOOP_PREV_OUTPUT - Cleaned output of the previous loop iteration. Empty string on the
+ *   first iteration (no prior output exists). Useful for fresh_context loops that need
+ *   to reference what the previous pass produced or why it failed.
+ *
+ * When issueContext is undefined, context variables are replaced with empty string
+ * to avoid sending literal "$CONTEXT" to the AI.
+ */
+export function substituteWorkflowVariables(
+  prompt: string,
+  workflowId: string,
+  userMessage: string,
+  artifactsDir: string,
+  baseBranch: string,
+  docsDir: string,
+  issueContext?: string,
+  loopUserInput?: string,
+  rejectionReason?: string,
+  loopPrevOutput?: string
+): { prompt: string; contextSubstituted: boolean } {
+  // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
+  if (!baseBranch && boundedVarRegex('BASE_BRANCH').test(prompt)) {
+    throw new Error(
+      'No base branch could be resolved. Auto-detection failed and `worktree.baseBranch` is not set in .archon/config.yaml. ' +
+        'Set the config value or use the --from flag to select a branch (e.g., --from dev).'
+    );
+  }
+
+  // Defensive: ensure docsDir always has a value (callers should resolve, but guard here)
+  const resolvedDocsDir = docsDir || 'docs/';
+
+  // Substitute basic variables
+  let result = prompt
+    .replace(boundedVarRegex('WORKFLOW_ID'), workflowId)
+    .replace(/\$\{run\.id\}/g, workflowId)
+    .replace(boundedVarRegex('USER_MESSAGE'), userMessage)
+    .replace(boundedVarRegex('ARGUMENTS'), userMessage)
+    .replace(boundedVarRegex('ARTIFACTS_DIR'), artifactsDir)
+    .replace(boundedVarRegex('BASE_BRANCH'), baseBranch)
+    .replace(boundedVarRegex('DOCS_DIR'), resolvedDocsDir)
+    .replace(boundedVarRegex('LOOP_USER_INPUT'), loopUserInput ?? '')
+    .replace(boundedVarRegex('REJECTION_REASON'), rejectionReason ?? '')
+    .replace(boundedVarRegex('LOOP_PREV_OUTPUT'), loopPrevOutput ?? '');
+
+  // Check if context variables exist (use fresh regex to avoid lastIndex issues)
+  const hasContextVariables = new RegExp(CONTEXT_VAR_PATTERN_STR).test(result);
+
+  // Substitute or clear context variables (use fresh global regex for replace)
+  if (!issueContext && hasContextVariables) {
+    getLog().debug(
+      {
+        action: 'clearing variables',
+        variables: ['$CONTEXT', '$EXTERNAL_CONTEXT', '$ISSUE_CONTEXT'],
+      },
+      'context_variables_cleared'
+    );
+  }
+  result = result.replace(new RegExp(CONTEXT_VAR_PATTERN_STR, 'g'), issueContext ?? '');
+
+  return {
+    prompt: result,
+    contextSubstituted: hasContextVariables && !!issueContext,
+  };
+}
+
+/**
+ * Substitute `${input.name}` references in bash scripts with resolved workflow
+ * input values.
+ *
+ * Safe in bash: '.' is not a valid bash identifier character, so `${input.name}`
+ * can never be a real bash variable expansion -- no false positives exist.
+ * Any reference whose name is not in resolvedInputs is left unchanged so the
+ * shell's own `bad substitution` surfaces the misconfiguration clearly.
+ */
+export function substituteInputRefs(
+  script: string,
+  resolvedInputs: Record<string, string>
+): string {
+  return script.replace(/\$\{input\.([a-zA-Z_][a-zA-Z0-9_]*)\}/g, (match, name) =>
+    name in resolvedInputs ? resolvedInputs[name] : match
+  );
+}
+
+/**
+ * Apply variable substitution and optionally append issue context.
+ * Appends context only if it wasn't already substituted via $CONTEXT variables.
+ * This prevents duplicate context being sent to the AI.
+ *
+ * @param template - The command prompt template with variable placeholders
+ * @param workflowId - The workflow run ID for variable substitution
+ * @param userMessage - The user's trigger message for variable substitution
+ * @param artifactsDir - The external artifacts directory for $ARTIFACTS_DIR substitution
+ * @param baseBranch - The resolved base branch for $BASE_BRANCH substitution
+ * @param docsDir - The resolved docs directory for $DOCS_DIR substitution
+ * @param issueContext - Optional GitHub issue/PR context to substitute or append
+ * @param logLabel - Human-readable label for logging (e.g., 'workflow step prompt')
+ * @returns The final prompt with variables substituted and context optionally appended
+ */
+export function buildPromptWithContext(
+  template: string,
+  workflowId: string,
+  userMessage: string,
+  artifactsDir: string,
+  baseBranch: string,
+  docsDir: string,
+  issueContext: string | undefined,
+  logLabel: string
+): string {
+  const { prompt, contextSubstituted } = substituteWorkflowVariables(
+    template,
+    workflowId,
+    userMessage,
+    artifactsDir,
+    baseBranch,
+    docsDir,
+    issueContext
+  );
+
+  if (issueContext && !contextSubstituted) {
+    getLog().debug({ logLabel }, 'issue_context_appended');
+    return prompt + '\n\n---\n\n' + issueContext;
+  }
+
+  return prompt;
+}
+
+// --- Completion Signal Detection --------------------------------------------
+
+/**
+ * Escape special regex characters in string
+ */
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Detect whether the AI output contains a completion signal.
+ *
+ * Supports three formats, checked in order:
+ * 1. <promise>SIGNAL</promise> - Recommended; prevents false positives in prose
+ * 2. <anytag>SIGNAL</anytag> - Any XML-wrapped tag; case-insensitive on tag names
+ * 3. Plain SIGNAL - Backwards compatibility; only at end of output or on own line
+ *
+ * Tag matching uses a backreference (\1) so opening and closing tag names must
+ * agree -- `<COMPLETE>X</done>` is not treated as a completion, which avoids
+ * false positives when the AI interleaves tags in prose.
+ *
+ * Plain signal detection is restrictive to prevent false positives like "not SIGNAL yet".
+ */
+export function detectCompletionSignal(output: string, signal: string): boolean {
+  // Check for XML-like tag wrapping with matching open/close names: <tag>SIGNAL</tag>.
+  // Catches <promise>COMPLETE</promise>, <COMPLETE>ALL_CLEAN</COMPLETE>, <done>X</done>.
+  // The `([a-zA-Z][\w-]*)` capture plus `</\1>` backreference requires tag names to match.
+  const xmlWrappedPattern = new RegExp(
+    `<([a-zA-Z][\\w-]*)[^>]*>\\s*${escapeRegExp(signal)}\\s*</\\1>`,
+    'i'
+  );
+  if (xmlWrappedPattern.test(output)) {
+    return true;
+  }
+  // Plain signal detection - restrictive to prevent false positives like "not COMPLETE yet"
+  // Only matches if signal is:
+  // 1. At the very end of output (with optional trailing whitespace/punctuation)
+  // 2. On its own line
+  const endPattern = new RegExp(`${escapeRegExp(signal)}[\\s.,;:!?]*$`);
+  const ownLinePattern = new RegExp(`^\\s*${escapeRegExp(signal)}\\s*$`, 'm');
+  return endPattern.test(output) || ownLinePattern.test(output);
+}
+
+/**
+ * Result of BLOCKED-signal detection for implement-loop terminal stops
+ * (WO-HARNESS-BLOCKED-BUILDER-STOPS-01 / bdc-xo#1349).
+ *
+ * A correct BLOCKED is a terminal outcome -- not a retryable failure. Without
+ * this detector the loop only accepts COMPLETE and retries honest blockers
+ * until the iteration cap burns the budget.
+ */
+export interface BlockedSignal {
+  blocked: boolean;
+  reason: string;
+}
+
+/**
+ * Detect an explicit builder BLOCKED signal.
+ *
+ * Accepted forms (restrictive -- prose like "not blocked yet" must NOT match):
+ * 1. Own-line / end-of-output `BLOCKED: <reason>` (live shape on run 630ac7ea)
+ * 2. Own-line `BLOCKED=true` with optional own-line `BLOCKED_REASON=<text>`
+ * 3. XML-wrapped `<promise>BLOCKED</promise>` / `<blocked>BLOCKED</blocked>`
+ *
+ * When COMPLETE (or the loop's `until` signal) is also present, callers should
+ * prefer COMPLETE -- this helper does not rank signals.
+ */
+export function detectBlockedSignal(output: string): BlockedSignal {
+  if (!output?.trim()) {
+    return { blocked: false, reason: '' };
+  }
+
+  // Form 1: BLOCKED: reason (own line or at end). Capture the rest of the line.
+  const colonLine = /^[ \t]*BLOCKED:[ \t]*(.+?)\s*$/im.exec(output);
+  if (colonLine?.[1]?.trim()) {
+    return { blocked: true, reason: colonLine[1].trim() };
+  }
+
+  // Form 2: BLOCKED=true (+ optional BLOCKED_REASON=)
+  const blockedTrue = /^[ \t]*BLOCKED[ \t]*=[ \t]*true[ \t]*$/im.test(output);
+  if (blockedTrue) {
+    const reasonMatch = /^[ \t]*BLOCKED_REASON[ \t]*=[ \t]*(.+?)\s*$/im.exec(output);
+    const reason = reasonMatch?.[1]?.trim()
+      ? reasonMatch[1].trim()
+      : 'builder reported BLOCKED=true without BLOCKED_REASON';
+    return { blocked: true, reason };
+  }
+
+  // Form 3: XML-wrapped BLOCKED token (same matching rules as completion)
+  if (detectCompletionSignal(output, 'BLOCKED')) {
+    // Prefer an accompanying BLOCKED_REASON / BLOCKED: line if present
+    const reasonMatch =
+      /^[ \t]*BLOCKED_REASON[ \t]*=[ \t]*(.+?)\s*$/im.exec(output) ??
+      /^[ \t]*BLOCKED:[ \t]*(.+?)\s*$/im.exec(output);
+    const reason = reasonMatch?.[1]?.trim()
+      ? reasonMatch[1].trim()
+      : 'builder emitted BLOCKED completion token';
+    return { blocked: true, reason };
+  }
+
+  return { blocked: false, reason: '' };
+}
+
+/**
+ * Result of ESCALATION_REQUIRED detection for loop terminal stops
+ * (WO-HARNESS-REPAIR-NODE-ESCALATION-OVERRIDE-01 / bdc-xo#1460).
+ *
+ * Once a loop node (plan-review, diff-repair, ...) records escalation, later
+ * invocations in the SAME run must not silently override that decision and
+ * attempt the previously-forbidden work. Distinct from BLOCKED (#1349): this
+ * is the repair/review escalation protocol (key=value block), not the
+ * implement-loop BLOCKED: reason form.
+ */
+export interface EscalationSignal {
+  required: boolean;
+  reason: string;
+  singleDecisionNeeded: string | null;
+}
+
+/**
+ * Detect an explicit ESCALATION_REQUIRED=true protocol block.
+ *
+ * Restrictive own-line key=value form only -- prose like "Escalated with
+ * ESCALATION_REASON=..." without the required key does NOT match. Callers
+ * that need file-artifact binding should also read
+ * `$ARTIFACTS_DIR/${nodeId}-escalation.txt` (see dag-executor).
+ */
+export function detectEscalationRequired(output: string): EscalationSignal {
+  if (!output?.trim()) {
+    return { required: false, reason: '', singleDecisionNeeded: null };
+  }
+
+  const required = /^[ \t]*ESCALATION_REQUIRED[ \t]*=[ \t]*true[ \t]*$/im.test(output);
+  if (!required) {
+    return { required: false, reason: '', singleDecisionNeeded: null };
+  }
+
+  const reasonMatch = /^[ \t]*ESCALATION_REASON[ \t]*=[ \t]*(.+?)\s*$/im.exec(output);
+  const decisionMatch = /^[ \t]*SINGLE_DECISION_NEEDED[ \t]*=[ \t]*(.+?)\s*$/im.exec(output);
+  return {
+    required: true,
+    reason: reasonMatch?.[1]?.trim()
+      ? reasonMatch[1].trim()
+      : 'ESCALATION_REQUIRED=true without ESCALATION_REASON',
+    singleDecisionNeeded: decisionMatch?.[1]?.trim() ?? null,
+  };
+}
+
+/**
+ * Canonical within-run escalation artifact path written by repair/review
+ * nodes (e.g. `$ARTIFACTS_DIR/diff-repair-escalation.txt`). Binding is
+ * within-run only: a new run gets a fresh artifactsDir.
+ */
+export function nodeEscalationArtifactPath(artifactsDir: string, nodeId: string): string {
+  return join(artifactsDir, `${nodeId}-escalation.txt`);
+}
+
+/**
+ * Normalize loop/open-model plan-review output for signal detection only.
+ * Open models and some stream paths emit multi-field output on one line
+ * (anchor: zero-open canary 3604d5 / re-fire 42ee6575, Fable diagnosis).
+ * Inserts line breaks before PLAN_REVIEW_* keys and === fences so
+ * line-anchored detectors still work. Does NOT mutate stored node output.
+ */
+export function normalizePlanReviewOutputForSignalDetection(output: string): string {
+  return output.replace(/(PLAN_REVIEW_[A-Z_]+)/g, '\n$1').replace(/(===)/g, '\n$1');
+}
+
+/**
+ * Plan-review approval detection (F3, 2026-07-09; hardened F5 2026-07-09).
+ * Canonical: bare PLAN_REVIEW_APPROVED via detectCompletionSignal rules.
+ * Also accepts key=value forms open models emit, including single-line mashed
+ * output (normalize then line-anchored match).
+ */
+export function detectPlanReviewApproval(output: string): boolean {
+  if (detectCompletionSignal(output, 'PLAN_REVIEW_APPROVED')) {
+    return true;
+  }
+  // Line-anchored on raw multi-line output
+  if (/^[ \t]*PLAN_REVIEW_PASS[ \t]*=[ \t]*true[ \t]*$/im.test(output)) {
+    return true;
+  }
+  if (/^[ \t]*PLAN_REVIEW_APPROVED[ \t]*=[ \t]*true[ \t]*$/im.test(output)) {
+    return true;
+  }
+  // Mashed single-line / flattened loop output: normalize then re-check
+  const normalized = normalizePlanReviewOutputForSignalDetection(output);
+  if (normalized !== output) {
+    if (detectCompletionSignal(normalized, 'PLAN_REVIEW_APPROVED')) {
+      return true;
+    }
+    if (/^[ \t]*PLAN_REVIEW_PASS[ \t]*=[ \t]*true[ \t]*$/im.test(normalized)) {
+      return true;
+    }
+    if (/^[ \t]*PLAN_REVIEW_APPROVED[ \t]*=[ \t]*true[ \t]*$/im.test(normalized)) {
+      return true;
+    }
+  }
+  // Token form without requiring end-of-line: PASS=true followed by next field,
+  // fence, or end (rejects "not PLAN_REVIEW_PASS=true yet").
+  if (
+    /(?:^|[^A-Za-z0-9_])PLAN_REVIEW_PASS[ \t]*=[ \t]*true(?=\s*(?:PLAN_REVIEW_[A-Z_]+\s*=|===|\s*$))/i.test(
+      output
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Strip internal completion signal tags before sending to user-facing output.
+ * Always strips `<promise>...</promise>` (any content). When `until` is provided,
+ * also strips any XML-wrapped form of that signal with matching tag names
+ * (e.g. `<COMPLETE>ALL_CLEAN</COMPLETE>`). Mismatched tag names are left alone
+ * so regular prose (`<note>ALL_CLEAN</warning>`) isn't accidentally rewritten.
+ */
+export function stripCompletionTags(content: string, until?: string): string {
+  let result = content.replace(/<promise>[\s\S]*?<\/promise>/gi, '');
+  if (until) {
+    // Strip XML-tagged completion signals with matching open/close tag names.
+    const escapedSignal = escapeRegExp(until);
+    result = result.replace(
+      new RegExp(`<([a-zA-Z][\\w-]*)[^>]*>\\s*${escapedSignal}\\s*</\\1>`, 'gi'),
+      ''
+    );
+  }
+  return result.trim();
+}
+
+/**
+ * Determine whether a script string is "inline" code or a named script reference.
+ * A named script is a simple identifier (no newlines, no whitespace, no shell metacharacters).
+ * Used by both the DAG executor (runtime dispatch) and the validator (resource checks).
+ */
+export function isInlineScript(script: string): boolean {
+  return script.includes('\n') || /[;(){}&|<>$`"' ]/.test(script);
+}
+
+// --- Agent Persona Resolution ------------------------------------------------
+
+import type { AgentPersona } from './agents/registry';
+
+/**
+ * Result of resolving an agent persona for a DAG node dispatch.
+ *
+ * When an agent persona is resolved:
+ * - `model` overrides the node's model (agent wins, log a warning if different).
+ *   May be undefined for a `provider: codex` persona, in which case the codex
+ *   provider falls back to assistants.codex.model or the account default.
+ * - `systemPrompt` is prepended to the node's prompt
+ * - `tools` is set as `allowed_tools` on the dispatch options (if the agent declares tools)
+ */
+export interface AgentPersonaResolution {
+  model?: string;
+  systemPrompt: string;
+  allowedTools?: string[];
+  agentName: string;
+}
+
+/**
+ * Error raised when a persona/provider combination cannot be resolved because
+ * the fix is a harness/persona/config change, not a runtime/approve-reject
+ * decision. The dag-executor surfaces `infraCode` in the failure message so an
+ * operator is told "fix the substrate" rather than "approve or reject."
+ */
+export class InfrastructureClassBlock extends Error {
+  readonly infraCode = 'INFRASTRUCTURE_CLASS_BLOCK' as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'InfrastructureClassBlock';
+  }
+}
+
+/**
+ * Apply an agent persona to node dispatch options, provider-aware.
+ *
+ * INVARIANT: a `provider: codex` node MUST NEVER receive `persona.model`.
+ *
+ * - provider === 'codex': persona.model MUST be absent. If present, throw
+ *   InfrastructureClassBlock (a codex persona declaring an Anthropic model is a
+ *   config bug). If absent, resolution.model is undefined and the codex provider
+ *   uses assistants.codex.model or the account default.
+ * - provider === 'claude' (default): persona.model is REQUIRED. If absent, throw
+ *   InfrastructureClassBlock. If present, the persona model wins over the node
+ *   model (today's behavior), and a mismatch is logged.
+ * - any other provider (e.g. pi): pass persona.model through unchanged. Do NOT
+ *   apply the codex constraint -- providers such as pi require a model.
+ */
+export function resolveAgentPersona(
+  persona: AgentPersona,
+  currentModel: string | undefined,
+  provider: string
+): AgentPersonaResolution {
+  if (provider === 'codex') {
+    if (persona.model !== undefined) {
+      throw new InfrastructureClassBlock(
+        `Codex persona '${persona.name}' must not declare 'model:'. A 'provider: codex' ` +
+          "node cannot receive an Anthropic model alias. Remove the 'model:' line from the " +
+          'persona; configure the Codex model at assistant/account level (assistants.codex.model) ' +
+          'if deterministic routing is needed.'
+      );
+    }
+  } else if (provider === 'claude') {
+    if (persona.model === undefined) {
+      throw new InfrastructureClassBlock(
+        `Claude persona '${persona.name}' must declare a 'model:' in its front matter.`
+      );
+    }
+    // Persona model wins over the node model; surface a mismatch (claude only --
+    // for codex, persona.model is undefined and this comparison is meaningless).
+    if (currentModel !== undefined && currentModel !== persona.model) {
+      getLog().warn(
+        { agentName: persona.name, agentModel: persona.model, nodeModel: currentModel },
+        'agent.model_mismatch_agent_wins'
+      );
+    }
+  }
+  // else (pi / future providers): leave persona.model as-is, no constraint.
+
+  // For non-codex/non-claude providers (e.g. pi), fall back to the node's
+  // currentModel when the persona omits `model:`.  Providers such as pi
+  // require a model; without this fallback they throw "requires a model".
+  // For claude: persona.model was validated non-undefined above.
+  // For codex: persona.model is undefined (the codex branch throws if set).
+  const resolvedModel =
+    provider !== 'codex' && provider !== 'claude' ? (persona.model ?? currentModel) : persona.model;
+
+  const resolution: AgentPersonaResolution = {
+    model: resolvedModel,
+    systemPrompt: persona.systemPrompt,
+    agentName: persona.name,
+  };
+
+  if (persona.tools && persona.tools.length > 0) {
+    resolution.allowedTools = persona.tools;
+  }
+
+  getLog().info(
+    {
+      name: persona.name,
+      model: persona.model ?? '(provider-default)',
+      provider,
+      tools: persona.tools ?? [],
+    },
+    'agent.resolved'
+  );
+
+  return resolution;
+}
+ + name + '(?![A-Za-z0-9_])', 'g');
+}
+
 /** Pattern string for context variables - used to create fresh regex instances */
 export const CONTEXT_VAR_PATTERN_STR =
   '\\$(?:CONTEXT|EXTERNAL_CONTEXT|ISSUE_CONTEXT)(?![A-Za-z0-9_])';

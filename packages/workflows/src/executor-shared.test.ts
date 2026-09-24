@@ -310,6 +310,89 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('Plain prompt with no loop variable.');
   });
+
+  it('leaves longer identifiers intact ($BASE_BRANCH_OVERRIDE, $BASE_BRANCH_PR)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'OVERRIDE=$BASE_BRANCH_OVERRIDE\nPR=$BASE_BRANCH_PR\nBASE=$BASE_BRANCH',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toContain('$BASE_BRANCH_OVERRIDE');
+    expect(prompt).toContain('$BASE_BRANCH_PR');
+    expect(prompt).not.toContain('dev_OVERRIDE');
+    expect(prompt).not.toContain('dev_PR');
+    expect(prompt).toContain('BASE=dev');
+  });
+
+  it('substitutes $BASE_BRANCH when followed by non-identifier delimiters', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH $BASE_BRANCH/x $BASE_BRANCH. $BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('dev dev/x dev. dev)');
+  });
+
+  const boundedVarCases: Array<[string, string]> = [
+    ['WORKFLOW_ID', 'WF_VAL'],
+    ['USER_MESSAGE', 'MSG_VAL'],
+    ['ARGUMENTS', 'MSG_VAL'],
+    ['ARTIFACTS_DIR', '/artifacts'],
+    ['DOCS_DIR', 'docs-val/'],
+    ['LOOP_USER_INPUT', 'LOOP_VAL'],
+    ['REJECTION_REASON', 'REJECT_VAL'],
+    ['LOOP_PREV_OUTPUT', 'PREV_VAL'],
+  ];
+
+  for (const [name, value] of boundedVarCases) {
+    it(`substitutes ${name} exactly and leaves ${name}_SUFFIX verbatim`, () => {
+      const { prompt } = substituteWorkflowVariables(
+        `a=${name} b=${name}_SUFFIX`,
+        'WF_VAL',
+        'MSG_VAL',
+        '/artifacts',
+        'dev',
+        'docs-val/',
+        undefined,
+        'LOOP_VAL',
+        'REJECT_VAL',
+        'PREV_VAL'
+      );
+      expect(prompt).toBe(`a=${value} b=${name}_SUFFIX`);
+      expect(prompt).toContain(`${name}_SUFFIX`);
+    });
+  }
+
+  it('does not throw on a $BASE_BRANCH_OVERRIDE-only prompt when baseBranch is empty', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'BASE_BRANCH_OVERRIDE=$(printf %s "$BASE_BRANCH_OVERRIDE")',
+      'run-1',
+      'msg',
+      '/tmp',
+      '',
+      'docs/'
+    );
+    expect(prompt).toContain('$BASE_BRANCH_OVERRIDE');
+  });
+
+  it('still throws when $BASE_BRANCH is referenced and baseBranch is empty', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'OVERRIDE=$BASE_BRANCH_OVERRIDE base=$BASE_BRANCH',
+        'run-1',
+        'msg',
+        '/tmp',
+        '',
+        'docs/'
+      )
+    ).toThrow('No base branch could be resolved');
+  });
 });
 
 describe('buildPromptWithContext', () => {
