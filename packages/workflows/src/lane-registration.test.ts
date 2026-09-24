@@ -38,6 +38,8 @@ interface NodeDef {
   id: string;
   provider?: string;
   model?: string;
+  persona?: string;
+  agent?: string;
   fallbackModel?: string;
   bash?: string;
   prompt?: string;
@@ -145,11 +147,11 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-cursor.yaml') {
-        // PR #848: Fable builds on the Cursor rail; Sol judges on the SAME rail
-        // but a different model, so the lane never grades its own work.
-        expect(wcv.provider).toBe('cursor');
-        expect(wcv.model).toBe('gpt-5.6-sol-high');
-        expect(wcv.model).not.toBe('claude-fable-5-1-thinking-high');
+        // Grok 4.7 builds on the Cursor rail; the judge is the codex lane's
+        // Claude pin so the lane never grades its own work.
+        expect(wcv.provider).toBe('claude');
+        expect(wcv.model).toBe('claude-opus-5');
+        expect(wcv.persona).toBe('captain-ci-validator-fable');
         return;
       }
 
@@ -270,31 +272,63 @@ describe('lane registration and war-council-validator pin', () => {
     }
   });
 
-  it('S4l: the Cursor lane binds provider cursor at the root and Sol on the review seats', () => {
+  it('S4l: the Cursor lane builds on grok-4.7 and reviews with the codex lane Claude pins', () => {
     const file = 'bdc-feature-development-cursor.yaml';
     const lane = loadLane(file);
     const grok = loadLane('bdc-feature-development-grok.yaml');
+    const codex = loadLane('bdc-feature-development-codex.yaml');
     const nodes = lane.nodes ?? [];
     const node = (id: string) => nodes.find(candidate => candidate.id === id);
+    const codexNode = (id: string) => (codex.nodes ?? []).find(candidate => candidate.id === id);
 
     expect(lane.provider).toBe('cursor');
-    expect(lane.model).toBe('claude-fable-5-1-thinking-high');
+    expect(lane.model).toBe('grok-4.7-high');
+    expect(lane.model?.toLowerCase()).not.toContain('fable');
     // Same node ids, same order, as the grok lane it was cloned from.
     expect(nodes.map(n => n.id)).toEqual((grok.nodes ?? []).map(n => n.id));
 
-    for (const id of ['diff-review', 'diff-review-final', 'opus-rereview']) {
-      const reviewNode = node(id);
-      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('cursor');
-      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-5.6-sol-high');
+    for (const candidate of nodes) {
+      if (typeof candidate.model === 'string') {
+        expect(candidate.model.toLowerCase(), `${candidate.id}:model`).not.toContain('fable');
+      }
+      if (candidate.provider === 'cursor') {
+        expect(candidate.model?.startsWith('grok-4.7'), `${candidate.id}:model`).toBe(true);
+      }
     }
-    for (const id of ['implement', 'diff-repair', 'opus-repair']) {
+
+    const reviewIds = [
+      'plan-review',
+      'war-council-validator',
+      'diff-review',
+      'diff-review-final',
+      'opus-rereview',
+      'findings-consolidate',
+      'apply-diff-review-final',
+    ];
+    for (const id of reviewIds) {
+      const reviewNode = node(id);
+      const source = codexNode(id);
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('claude');
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe(source?.provider);
+      expect(reviewNode?.model, `${file}:${id}:model`).toBe(source?.model);
+      expect(reviewNode?.persona, `${file}:${id}:persona`).toBe(source?.persona);
+      expect(reviewNode?.agent, `${file}:${id}:agent`).toBe(source?.agent);
+    }
+    for (const id of [
+      'check-already-satisfied',
+      'plan',
+      'implement',
+      'diff-repair',
+      'opus-repair',
+      'apply-suggested-fix',
+    ]) {
       const buildNode = node(id);
       expect(buildNode?.provider, `${file}:${id}:provider`).toBe('cursor');
-      expect(buildNode?.model, `${file}:${id}:model`).toBe('claude-fable-5-1-thinking-high');
+      expect(buildNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
     }
-    // No dead rail left in the lane.
     const content = readFileSync(join(LANES_DIR, file), 'utf-8');
-    expect(content).not.toMatch(/^\s*provider:\s*(grok|codex-opr|codex|claude)\b/m);
+    expect(content).not.toMatch(/^\s*provider:\s*codex\b/m);
+    expect(content).not.toMatch(/^\s*provider:\s*(grok|codex-opr)\b/m);
   });
 
   it('S4i: the dedicated Grok lane pins execution to Grok and review to non-Grok seats', () => {

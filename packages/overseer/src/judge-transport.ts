@@ -96,7 +96,7 @@ async function writePrivatePromptFile(
  * 2026-09-15). Override with OVERSEER_CURSOR_JUDGE_MODEL; a blank value falls
  * back to the default rather than producing `--model ''`.
  */
-export const DEFAULT_CURSOR_JUDGE_MODEL = 'claude-fable-5-1-thinking-high';
+export const DEFAULT_CURSOR_JUDGE_MODEL = 'grok-4.7-high';
 
 export function resolveCursorJudgeModel(
   env: Record<string, string | undefined> = process.env

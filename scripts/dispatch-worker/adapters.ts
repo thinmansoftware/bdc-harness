@@ -91,7 +91,7 @@ export interface FusionReviewRequest {
  * Cursor's roster moves (Grok 4.3 -> 4.5 -> 4.6 inside two months); a moved id
  * must be a config change, not a code change.
  */
-export const CURSOR_GROK_MODEL = process.env.CURSOR_GROK_MODEL ?? 'cursor-grok-4.6-high-fast';
+export const CURSOR_GROK_MODEL = process.env.CURSOR_GROK_MODEL ?? 'grok-4.7-high';
 
 export const defaultAgentConfigs: Record<string, AgentConfig> = {
   claude: {
@@ -189,7 +189,7 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
    *
    * Model id verified live 2026-08-26 via `cursor-agent --list-models` on the
    * target host, then proven end-to-end in a scratch container:
-   *   cursor-agent -f -p --model cursor-grok-4.6-high-fast "..." -> rc 0,
+   *   cursor-agent -f -p --model grok-4.7-high "..." -> rc 0,
    *   non-empty response. The 2026-07-22 feasibility doc had listed the exact
    *   Grok model-id string as UNCONFIRMED; this resolves it.
    *
