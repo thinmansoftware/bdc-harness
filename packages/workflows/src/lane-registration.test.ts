@@ -14,6 +14,7 @@ import { describe, it, expect } from 'bun:test';
 import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { parseWorkflow } from './loader';
+import { findUntrustedTextToken } from './executor-shared';
 import {
   clearRegistry,
   getMissingProviderExecutionCapabilities,
@@ -578,5 +579,54 @@ describe('plan-review repair-target record', () => {
       return extractStep4b(prompt);
     });
     expect(blocks[0]).toBe(blocks[1]);
+  });
+});
+
+describe('active lanes do not splice untrusted text into executable fields', () => {
+  const WORKFLOWS_DIR = join(REPO_ROOT, '.archon/workflows');
+
+  function listYaml(dir: string): string[] {
+    const out: string[] = [];
+    for (const ent of readdirSync(dir, { withFileTypes: true })) {
+      if (ent.name === 'retired') continue;
+      const full = join(dir, ent.name);
+      if (ent.isDirectory()) {
+        out.push(...listYaml(full));
+      } else if (ent.name.endsWith('.yaml') || ent.name.endsWith('.yml')) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+
+  function walkFields(node: unknown, hits: string[], path: string): void {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      node.forEach((item, index) => walkFields(item, hits, `${path}[${String(index)}]`));
+      return;
+    }
+    const rec = node as Record<string, unknown>;
+    const id = typeof rec.id === 'string' ? rec.id : path;
+    for (const field of ['bash', 'until_bash', 'script'] as const) {
+      const value = rec[field];
+      if (typeof value !== 'string') continue;
+      const token = findUntrustedTextToken(value);
+      if (token) hits.push(`${path} node=${id} field=${field} token=${token}`);
+    }
+    for (const [key, value] of Object.entries(rec)) {
+      if (key === 'bash' || key === 'until_bash' || key === 'script') continue;
+      if (value && typeof value === 'object') walkFields(value, hits, `${path}.${key}`);
+    }
+  }
+
+  it('no bash, until_bash, or script field contains a raw untrusted token', () => {
+    const hits: string[] = [];
+    for (const file of listYaml(WORKFLOWS_DIR)) {
+      const raw = Bun.YAML.parse(readFileSync(file, 'utf8')) as unknown;
+      const fileHits: string[] = [];
+      walkFields(raw, fileHits, file);
+      hits.push(...fileHits);
+    }
+    expect(hits).toEqual([]);
   });
 });

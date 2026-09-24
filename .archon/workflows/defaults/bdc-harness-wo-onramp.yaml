@@ -81,14 +81,14 @@ nodes:
       META="$ARTIFACTS_DIR/source-spec.meta"
 
       # Parse WO_ID from USER_MESSAGE
-      WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z][A-Z0-9-]+-[0-9]+' | head -n 1 || true)
+      WO_ID=$(printf '%s\n' "${ARCHON_USER_MESSAGE}" | grep -Eo 'WO-[A-Z][A-Z0-9-]+-[0-9]+' | head -n 1 || true)
       if [ -z "$WO_ID" ]; then
         echo "ERROR: no WO_ID matching WO-[A-Z][A-Z0-9-]+-[0-9]+ in USER_MESSAGE" >&2
         exit 1
       fi
 
       # Parse --project override (optional)
-      TARGET_HINT=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo -- '--project[[:space:]]+[A-Za-z0-9._-]+' | head -n 1 | awk '{print $2}' || true)
+      TARGET_HINT=$(printf '%s\n' "${ARCHON_USER_MESSAGE}" | grep -Eo -- '--project[[:space:]]+[A-Za-z0-9._-]+' | head -n 1 | awk '{print $2}' || true)
 
       SPEC_CONTENT=""
       SPEC_PATH=""

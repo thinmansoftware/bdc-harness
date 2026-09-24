@@ -228,6 +228,8 @@ when: "$classify.output.complexity != 'trivial'"
 | `$PLAN` | Previous plan from session metadata |
 | `$IMPLEMENTATION_SUMMARY` | Previous execution summary |
 
+In `bash` and `until_bash` nodes, `$USER_MESSAGE`, `$ARGUMENTS`, `$CONTEXT`, `$EXTERNAL_CONTEXT`, `$ISSUE_CONTEXT`, `$LOOP_USER_INPUT`, `$REJECTION_REASON`, and `$LOOP_PREV_OUTPUT` are rewritten to `${ARCHON_<NAME>}` and supplied as environment variables. `script` nodes must read `process.env.ARCHON_<NAME>` (or `os.environ` in Python). Raw tokens in a `script` node fail workflow load. Prompt fields still receive the values as text.
+
 ### Positional Variables (command handler)
 
 | Variable | Replaced With |

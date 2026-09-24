@@ -14,7 +14,7 @@ nodes:
       set -euo pipefail
       WO_ID="WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01"
       USER_MESSAGE="WO_ID=${WO_ID} issue=193"
-      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+      ISSUE_NUM=$(printf '%s\n' "${ARCHON_USER_MESSAGE}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
         echo "FAIL: could not extract issue number from USER_MESSAGE" >&2; exit 1
       fi

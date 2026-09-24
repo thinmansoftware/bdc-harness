@@ -50,17 +50,26 @@ function getLog(): {
 /** WO_ID pattern: WO- followed by uppercase alnum / hyphens ending in digits. */
 const WO_ID_RE = /\bWO-[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-\d+\b/;
 
+/** Assigned-line match. Anchored per line so newline-heavy input stays linear. */
+const ASSIGNED_WO_ID_RE = /^WO_ID[ \t]*=[ \t]*(WO-[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-\d+)/;
+
+const WO_ID_SCAN_LIMIT = 65536;
+
 /**
  * Extract a Work Order ID from a user_message / dispatch payload.
  * Looks for WO_ID=<id> first, then any WO-... token.
+ * Scans at most the first 65,536 characters.
  */
 export function extractWoId(userMessage: string | null | undefined): string | null {
   if (!userMessage) return null;
-  const assigned = /(?:^|\n)\s*WO_ID\s*=\s*(WO-[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-\d+)/m.exec(
-    userMessage
-  );
-  if (assigned?.[1]) return assigned[1];
-  const bare = WO_ID_RE.exec(userMessage);
+  const bounded =
+    userMessage.length > WO_ID_SCAN_LIMIT ? userMessage.slice(0, WO_ID_SCAN_LIMIT) : userMessage;
+  for (const rawLine of bounded.split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    const assigned = ASSIGNED_WO_ID_RE.exec(line.trimStart());
+    if (assigned?.[1]) return assigned[1];
+  }
+  const bare = WO_ID_RE.exec(bounded);
   return bare ? bare[0] : null;
 }
 

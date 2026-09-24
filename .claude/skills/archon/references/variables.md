@@ -7,7 +7,7 @@ Variables are placeholders in command files and workflow prompts that get replac
 | Variable | Scope | Description |
 |----------|-------|-------------|
 | `$ARGUMENTS` | All modes | The user's original message passed to the workflow |
-| `$USER_MESSAGE` | All modes | Same as `$ARGUMENTS` — both resolve to the user's message |
+| `$USER_MESSAGE` | All modes | Same as `$ARGUMENTS`. Both resolve to the user's message |
 | `$WORKFLOW_ID` | All modes | Unique workflow run ID (for tracking and logging) |
 | `$ARTIFACTS_DIR` | All modes | Pre-created directory for this workflow run's artifacts. Write outputs here |
 | `$BASE_BRANCH` | All modes | Base branch name. Auto-detected from git, or set via `worktree.baseBranch` in config. Throws if referenced but unresolvable |
@@ -16,6 +16,8 @@ Variables are placeholders in command files and workflow prompts that get replac
 | `$ISSUE_CONTEXT` | All modes | Alias for `$CONTEXT` |
 | `$nodeId.output` | DAG only | Full text output of a completed upstream node |
 | `$nodeId.output.field` | DAG only | JSON field access on structured output from upstream node (string/number/boolean) |
+
+In `bash` and `until_bash` nodes the eight untrusted names (`USER_MESSAGE`, `ARGUMENTS`, `CONTEXT`, `EXTERNAL_CONTEXT`, `ISSUE_CONTEXT`, `LOOP_USER_INPUT`, `REJECTION_REASON`, `LOOP_PREV_OUTPUT`) are rewritten to `${ARCHON_<NAME>}` environment references. `script` nodes read `process.env.ARCHON_<NAME>` or `os.environ["ARCHON_<NAME>"]`. A raw token in a `script` node is rejected at load. Prompt substitution is unchanged.
 
 ## Variable Availability
 

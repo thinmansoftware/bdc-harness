@@ -95,6 +95,7 @@ import {
   loadCommandPrompt,
   substituteWorkflowVariables,
   substituteInputRefs,
+  buildUntrustedTextEnv,
   buildPromptWithContext,
   detectCompletionSignal,
   detectBlockedSignal,
@@ -3234,7 +3235,11 @@ async function executeBashNode(
     artifactsDir,
     baseBranch,
     docsDir,
-    issueContext
+    issueContext,
+    undefined,
+    undefined,
+    undefined,
+    'shell'
   );
   const nodeRefResolved = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true);
   // Substitute ${input.X} references from workflow inputs (safe: '.' is not a valid bash
@@ -3273,6 +3278,11 @@ async function executeBashNode(
     ARCHON_NODE_OUT: join(artifactsDir || tmpdir(), 'node-out'),
     ...inputEnvVars,
     ...(envVars ?? {}),
+    // Last so process.env and codebase env vars cannot shadow executor-owned values.
+    ...buildUntrustedTextEnv({
+      userMessage: workflowRun.user_message,
+      issueContext,
+    }),
   };
 
   const safeNodeId = node.id.replace(/[^A-Za-z0-9._-]/g, '_');
@@ -3558,8 +3568,15 @@ async function executeScriptNode(
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const subprocessEnv =
-    envVars && Object.keys(envVars).length > 0 ? { ...process.env, ...envVars } : undefined;
+  // Always set env. Untrusted text is last so project/process vars cannot shadow it.
+  const subprocessEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...(envVars ?? {}),
+    ...buildUntrustedTextEnv({
+      userMessage: workflowRun.user_message,
+      issueContext,
+    }),
+  };
 
   // Build the command and args based on runtime and inline vs named
   let cmd = '';
@@ -4780,6 +4797,8 @@ async function executeLoopNode(
       await safeSendMessage(platform, conversationId, cleanOutput, msgContext);
     }
 
+    const loopPrevOutputForShell = i === startIteration ? '' : lastIterationOutput;
+    const loopUserInputForShell = i === startIteration ? loopUserInput : '';
     lastIterationOutput = cleanOutput || fullOutput;
 
     // Check LLM completion signal -- the AI decides whether the user approved.
@@ -4808,14 +4827,29 @@ async function executeLoopNode(
           artifactsDir,
           baseBranch,
           docsDir,
-          issueContext
+          issueContext,
+          loopUserInputForShell,
+          undefined,
+          loopPrevOutputForShell,
+          'shell'
         );
         const substitutedBash = substituteNodeOutputRefs(
           bashPrompt,
           nodeOutputs,
           true // escapedForBash
         );
-        await execFileAsync('bash', ['-c', substitutedBash], { cwd });
+        await execFileAsync('bash', ['-c', substitutedBash], {
+          cwd,
+          env: {
+            ...process.env,
+            ...buildUntrustedTextEnv({
+              userMessage: workflowRun.user_message,
+              issueContext,
+              loopUserInput: loopUserInputForShell,
+              loopPrevOutput: loopPrevOutputForShell,
+            }),
+          },
+        });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
