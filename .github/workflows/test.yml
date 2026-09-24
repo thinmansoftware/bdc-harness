@@ -82,6 +82,9 @@ jobs:
       - name: Taskmaster health migration and atomic reset PostgreSQL integration
         run: bun test packages/core/src/db/taskmaster.postgres.test.ts
 
+      - name: Rebuild script drain tests
+        run: bun test ./deploy/rebuild-archon.test.ts
+
   docker-build:
     runs-on: ubuntu-latest
     permissions:

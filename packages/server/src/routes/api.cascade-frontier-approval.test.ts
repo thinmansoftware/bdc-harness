@@ -166,6 +166,15 @@ mock.module('@archon/core/db/isolation-environments', () => ({
   updateStatus: mock(async () => {}),
 }));
 
+const mockGetCauldronDrainState = mock(async () => ({
+  mode: 'normal' as const,
+  activeLeaseCount: 0,
+  activeRunCount: 0,
+  activeRunIds: [] as string[],
+  drained: false,
+  updatedAt: null as string | null,
+}));
+
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mock(async () => []),
   listDashboardRuns: mock(async () => ({
@@ -179,6 +188,7 @@ mock.module('@archon/core/db/workflows', () => ({
   deleteWorkflowRun: mock(async () => {}),
   updateWorkflowRun: mock(async () => {}),
   getWorkflowRunByWorkerPlatformId: mock(async () => null),
+  getCauldronDrainState: mockGetCauldronDrainState,
 }));
 
 mock.module('@archon/core/db/workflow-events', () => ({
@@ -427,5 +437,32 @@ describe('operator-token gate on cascade endpoints', () => {
     } finally {
       delete process.env.ARCHON_OPERATOR_TOKEN;
     }
+  });
+});
+
+describe('drain refuses frontier approval before claim', () => {
+  test('fire_refused_while_draining_every_path', async () => {
+    mockGetCauldronDrainState.mockResolvedValueOnce({
+      mode: 'draining',
+      activeLeaseCount: 1,
+      activeRunCount: 1,
+      activeRunIds: ['run-1'],
+      drained: false,
+      updatedAt: '2026-09-24T00:00:00.000Z',
+    });
+    mockReadCascadeRecordById.mockResolvedValueOnce({
+      cascadeId: 'cascade-1',
+      woId: 'WO-TEST',
+      status: 'pending-frontier-approval',
+      frontierApproval: { tierName: 'frontier' },
+    });
+    const res = await makeApp().request('/api/cascades/cascade-1/approve-frontier', {
+      method: 'POST',
+    });
+    expect(res.status).toBe(503);
+    expect(res.headers.get('Retry-After')).toBe('60');
+    const body = (await res.json()) as { code: string };
+    expect(body.code).toBe('cauldron_draining');
+    expect(mockClaimFrontierResolution).not.toHaveBeenCalled();
   });
 });

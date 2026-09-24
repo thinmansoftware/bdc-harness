@@ -388,23 +388,33 @@ export async function createWorkflowRun(data: {
     metadataJson = '{}';
   }
 
+  const db = getDatabase();
   try {
-    const result = await pool.query<WorkflowRun>(
-      `INSERT INTO remote_agent_workflow_runs
-       (workflow_name, conversation_id, codebase_id, user_message, metadata, working_path, parent_conversation_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING *`,
-      [
-        data.workflow_name,
-        data.conversation_id,
-        data.codebase_id ?? null,
-        data.user_message,
-        metadataJson,
-        data.working_path ?? null,
-        data.parent_conversation_id ?? null,
-      ]
-    );
-    const row = result.rows[0];
+    const row = await db.withTransaction(async query => {
+      const lockSuffix = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
+      const control = await query<{ mode: string }>(
+        `SELECT mode FROM remote_agent_cauldron_control WHERE id = 1${lockSuffix}`
+      );
+      if (control.rows[0]?.mode === 'draining') {
+        throw new CauldronDrainingError();
+      }
+      const result = await query<WorkflowRun>(
+        `INSERT INTO remote_agent_workflow_runs
+         (workflow_name, conversation_id, codebase_id, user_message, metadata, working_path, parent_conversation_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *`,
+        [
+          data.workflow_name,
+          data.conversation_id,
+          data.codebase_id ?? null,
+          data.user_message,
+          metadataJson,
+          data.working_path ?? null,
+          data.parent_conversation_id ?? null,
+        ]
+      );
+      return result.rows[0];
+    });
     if (!row) {
       throw new Error(
         `Failed to create workflow run: INSERT returned no rows (workflow: ${data.workflow_name})`
@@ -412,6 +422,7 @@ export async function createWorkflowRun(data: {
     }
     return normalizeWorkflowRun(row);
   } catch (error) {
+    if (error instanceof CauldronDrainingError) throw error;
     const err = error as Error;
     getLog().error({ err }, 'db.workflow_run_create_failed');
     throw new Error(`Failed to create workflow run: ${err.message}`);
@@ -903,12 +914,27 @@ export async function releaseSupervisorRepairLease(data: {
 
 export type CauldronDrainMode = 'normal' | 'draining';
 
+/** Thrown when createWorkflowRun refuses a new row because mode is draining. */
+export class CauldronDrainingError extends Error {
+  readonly code = 'cauldron_draining' as const;
+  constructor() {
+    super('cauldron_draining');
+    this.name = 'CauldronDrainingError';
+  }
+}
+
 export interface CauldronDrainState {
   mode: CauldronDrainMode;
   activeLeaseCount: number;
   activeRunCount: number;
+  pendingRunCount: number;
+  runningRunCount: number;
+  survivingRunCount: number;
   activeRunIds: string[];
   drained: boolean;
+  /** True only while draining with zero pending, zero running, and zero live leases. */
+  recreateSafe: boolean;
+  clearOnBoot: boolean;
   updatedAt: string | null;
 }
 
@@ -921,9 +947,11 @@ export async function getCauldronDrainState(
   observedAt = new Date().toISOString()
 ): Promise<CauldronDrainState> {
   return getDatabase().withTransaction(async query => {
-    const control = await query<{ mode: CauldronDrainMode; updated_at: string | Date | null }>(
-      'SELECT mode, updated_at FROM remote_agent_cauldron_control WHERE id = 1'
-    );
+    const control = await query<{
+      mode: CauldronDrainMode;
+      updated_at: string | Date | null;
+      clear_on_boot: number | boolean | null;
+    }>('SELECT mode, updated_at, clear_on_boot FROM remote_agent_cauldron_control WHERE id = 1');
     const leases = await query<{ active_lease_count: number | string }>(
       `SELECT COUNT(*) AS active_lease_count
        FROM remote_agent_run_leases l
@@ -933,6 +961,19 @@ export async function getCauldronDrainState(
     );
     const runs = await query<{ active_run_count: number | string }>(
       `SELECT COUNT(*) AS active_run_count
+       FROM remote_agent_workflow_runs
+       WHERE status IN ('pending', 'running', 'waiting_provider', 'paused')`,
+      []
+    );
+    const buckets = await query<{
+      pending_run_count: number | string | null;
+      running_run_count: number | string | null;
+      surviving_run_count: number | string | null;
+    }>(
+      `SELECT
+         SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_run_count,
+         SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running_run_count,
+         SUM(CASE WHEN status IN ('paused', 'waiting_provider') THEN 1 ELSE 0 END) AS surviving_run_count
        FROM remote_agent_workflow_runs
        WHERE status IN ('pending', 'running', 'waiting_provider', 'paused')`,
       []
@@ -947,12 +988,25 @@ export async function getCauldronDrainState(
     const mode = controlRow?.mode ?? 'normal';
     const activeLeaseCount = numericCount(leases.rows[0]?.active_lease_count);
     const activeRunCount = numericCount(runs.rows[0]?.active_run_count);
+    const pendingRunCount = numericCount(buckets.rows[0]?.pending_run_count);
+    const runningRunCount = numericCount(buckets.rows[0]?.running_run_count);
+    const survivingRunCount = numericCount(buckets.rows[0]?.surviving_run_count);
+    const clearOnBoot = numericCount(controlRow?.clear_on_boot) === 1;
     return {
       mode,
       activeLeaseCount,
       activeRunCount,
+      pendingRunCount,
+      runningRunCount,
+      survivingRunCount,
       activeRunIds: runIds.rows.map(row => row.id),
       drained: mode === 'draining' && activeLeaseCount === 0 && activeRunCount === 0,
+      recreateSafe:
+        mode === 'draining' &&
+        pendingRunCount === 0 &&
+        runningRunCount === 0 &&
+        activeLeaseCount === 0,
+      clearOnBoot,
       updatedAt:
         controlRow?.updated_at instanceof Date
           ? controlRow.updated_at.toISOString()
@@ -961,13 +1015,31 @@ export async function getCauldronDrainState(
   });
 }
 
+export async function applyCauldronDrainClearOnBoot(
+  updatedAt = new Date().toISOString()
+): Promise<'cleared' | 'persisted' | 'normal'> {
+  const state = await getCauldronDrainState(updatedAt);
+  if (state.mode !== 'draining') return 'normal';
+  if (!state.clearOnBoot) return 'persisted';
+  await setCauldronDrainMode({
+    mode: 'normal',
+    actor: 'boot',
+    reason: 'clear_on_boot after restart',
+    updatedAt,
+    clearOnBoot: false,
+  });
+  return 'cleared';
+}
+
 export async function setCauldronDrainMode(data: {
   mode: CauldronDrainMode;
   actor: string;
   reason: string | null;
   updatedAt: string;
+  clearOnBoot?: boolean;
 }): Promise<{ changed: boolean; mode: CauldronDrainMode }> {
   const db = getDatabase();
+  const clearOnBoot = data.mode === 'normal' ? 0 : data.clearOnBoot ? 1 : 0;
   return db.withTransaction(async query => {
     const lockSuffix = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
     const current = await query<{ mode: CauldronDrainMode }>(
@@ -976,13 +1048,14 @@ export async function setCauldronDrainMode(data: {
     const currentMode = current.rows[0]?.mode ?? 'normal';
     if (currentMode === data.mode) return { changed: false, mode: data.mode };
     await query(
-      `INSERT INTO remote_agent_cauldron_control (id, mode, updated_at, updated_by)
-       VALUES (1, $1, $2, $3)
+      `INSERT INTO remote_agent_cauldron_control (id, mode, updated_at, updated_by, clear_on_boot)
+       VALUES (1, $1, $2, $3, $4)
        ON CONFLICT (id) DO UPDATE SET
          mode = EXCLUDED.mode,
          updated_at = EXCLUDED.updated_at,
-         updated_by = EXCLUDED.updated_by`,
-      [data.mode, data.updatedAt, data.actor]
+         updated_by = EXCLUDED.updated_by,
+         clear_on_boot = EXCLUDED.clear_on_boot`,
+      [data.mode, data.updatedAt, data.actor, clearOnBoot]
     );
     await query(
       `INSERT INTO remote_agent_cauldron_control_events

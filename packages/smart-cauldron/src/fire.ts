@@ -172,11 +172,22 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
   }
 
   if (!fireResponse.ok) {
+    const raw = await fireResponse.text().catch(() => '');
+    let drainRefused = false;
+    if (fireResponse.status === 503) {
+      try {
+        const parsed = JSON.parse(raw) as { code?: string };
+        drainRefused = parsed.code === 'cauldron_draining';
+      } catch {
+        drainRefused = false;
+      }
+    }
     return {
       ok: false,
       runId: null,
       conversationId: null,
-      infraError: `HTTP ${fireResponse.status}: ${await responseSummary(fireResponse)}`,
+      infraError: `HTTP ${fireResponse.status}: ${raw.slice(0, 200)}`,
+      drainRefused,
     };
   }
 

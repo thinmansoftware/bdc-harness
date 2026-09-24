@@ -777,6 +777,29 @@ describe('POST /api/workflows/:name/run', () => {
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
   });
 
+  test('named_reason_in_http_body', async () => {
+    mockGetCauldronDrainState.mockResolvedValueOnce({
+      ...normalDrainState,
+      mode: 'draining',
+      activeLeaseCount: 2,
+      activeRunCount: 2,
+      activeRunIds: ['run-a', 'run-b'],
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'WO-TEST-001' }),
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('60');
+    expect(await response.json()).toEqual({
+      error: 'Cauldron is draining; new dispatch is disabled',
+      code: 'cauldron_draining',
+      detail: 'active_leases=2 active_runs=2',
+    });
+  });
+
   test('sends /workflow run <name> <message> to orchestrator', async () => {
     mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
     mockAddMessage.mockImplementationOnce(async () => ({

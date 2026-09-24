@@ -711,6 +711,18 @@ export async function executeWorkflow(
         parent_conversation_id: parentConversationId,
       });
     } catch (error) {
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        (error as { code?: string }).code === 'cauldron_draining'
+      ) {
+        await sendCriticalMessage(
+          platform,
+          conversationId,
+          '[ ] **Workflow failed**: cauldron_draining. The workflow was not started.'
+        );
+        return { success: false, error: 'cauldron_draining' };
+      }
       const err = error as Error;
       getLog().error(
         { err, workflowName: workflow.name, conversationId },

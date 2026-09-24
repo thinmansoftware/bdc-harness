@@ -37,6 +37,7 @@ import {
   ConversationNotFoundError,
   isWebAdapter,
 } from '../types';
+import { CauldronDrainingError } from '../db/workflows';
 import type { IsolationHints, IsolationEnvironmentRow } from '@archon/isolation';
 import {
   IsolationBlockedError,
@@ -470,6 +471,13 @@ export async function dispatchBackgroundWorkflow(
       parent_conversation_id: ctx.conversationDbId,
     });
   } catch (error) {
+    if (error instanceof CauldronDrainingError) {
+      await ctx.platform.sendMessage(
+        ctx.conversationId,
+        'cauldron_draining: workflow not started. New dispatch is disabled until drain clears.'
+      );
+      return;
+    }
     const err = error as Error;
     getLog().error({ err, workflowName: workflow.name }, 'pre_create_workflow_run_failed');
     // Non-fatal: executeWorkflow will create its own row as fallback

@@ -4,6 +4,7 @@
  * fake dispatch); no mock.module.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
+import { fireBackoffDecision } from './backoff';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import {
@@ -875,6 +876,73 @@ describe('fire_cauldron loop', () => {
       runs[0]!.status = 'completed';
       expect((await checkEvidence(evidence, { query })).ok).toBe(true);
       expect(world.sentMessages.some(message => message.body.includes('Unclaimed P0'))).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('taskmaster_defers_fire_while_draining', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const item: ListedThread = {
+        ref: 'gh:thinmansoftware/bdc-harness#901',
+        priority: 'P1',
+        lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
+        isUnclaimed: true,
+        recipient: 'xo',
+        title: 'WO-HARNESS-EXAMPLE-01 drain hold',
+      };
+      let admissions = 0;
+      let mode: 'draining' | 'normal' = 'draining';
+      const deps = makeDeps(world, {
+        listUndeliveredRulings: async () => [],
+        listThreads: async () => [item],
+        checkFireEligibility: async () => ({
+          eligible: true,
+          evidence: {
+            woId: 'WO-HARNESS-EXAMPLE-01',
+            targetRepo: 'thinmansoftware/bdc-harness',
+            project: 'bdc-harness',
+            specVerifiedAt: new Date(T0).toISOString(),
+            noOpenOrMergedPr: true,
+            expectedSpec: EXPECTED_SPEC,
+          },
+        }),
+        getCauldronDrainState: async () =>
+          ({ mode, activeLeaseCount: 0, activeRunCount: 0 }) as never,
+        runCascade: (async options => {
+          admissions += 1;
+          const record = { cascadeId: 'cascade-901', status: 'running' } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      await tick(state, deps);
+      expect(admissions).toBe(0);
+      const deferred = world.journal.filter(row => row.action_type === 'fire_cauldron');
+      expect(deferred.some(row => row.outcome === 'failed')).toBe(false);
+      expect(deferred.some(row => row.outcome === 'deferred')).toBe(true);
+      expect(deferred.map(row => row.proposal_json).join('\n')).toContain(
+        '"deferred_reason":"cauldron_draining"'
+      );
+      expect(
+        fireBackoffDecision(
+          deferred.map(row => ({ ...row, outcome: row.outcome })),
+          item.ref,
+          state.tickIndex,
+          state.deadman.intervalMs,
+          T0
+        ).kind
+      ).not.toBe('backoff');
+      mode = 'normal';
+      await tick(state, deps);
+      expect(admissions).toBe(1);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
