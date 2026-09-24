@@ -314,9 +314,12 @@ describe('lane registration and war-council-validator pin', () => {
       expect(reviewNode?.persona, `${file}:${id}:persona`).toBe(source?.persona);
       expect(reviewNode?.agent, `${file}:${id}:agent`).toBe(source?.agent);
     }
-    expect(nodes.filter(n => n.provider === 'claude').map(n => n.id).sort()).toEqual(
-      [...reviewIds].sort()
-    );
+    expect(
+      nodes
+        .filter(n => n.provider === 'claude')
+        .map(n => n.id)
+        .sort()
+    ).toEqual([...reviewIds].sort());
     for (const id of [
       'check-already-satisfied',
       'plan',
