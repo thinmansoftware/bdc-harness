@@ -49,6 +49,7 @@ describe('deploy drift detector', () => {
   let runningSha: string;
   let processStartedAt: Date;
   let compareBody: Record<string, unknown> | null;
+  let reverseCompareBody: Record<string, unknown> | null;
   let headSha: string;
   let fetchMode: 'ok' | 'reject' | '403';
 
@@ -61,6 +62,7 @@ describe('deploy drift detector', () => {
     runningSha = SHA_A;
     processStartedAt = new Date(NOW);
     compareBody = null;
+    reverseCompareBody = null;
     headSha = SHA_A;
     fetchMode = 'ok';
     delete process.env.DUTY_OFFICER_DEPLOY_DRIFT_ENABLED;
@@ -91,6 +93,9 @@ describe('deploy drift detector', () => {
       urls.push(url);
       if (fetchMode === 'reject') throw new Error('network_down');
       if (fetchMode === '403') return new Response('forbidden', { status: 403 });
+      if (url.includes(`/compare/${headSha}...${runningSha}`)) {
+        return Response.json(reverseCompareBody ?? {});
+      }
       if (url.includes('/compare/')) return Response.json(compareBody ?? {});
       return Response.json({ sha: headSha });
     });
@@ -175,7 +180,7 @@ describe('deploy drift detector', () => {
     expect(result?.verdict).toBe('drift_alerted');
     expect(createMessage).toHaveBeenCalledTimes(1);
     expect(store.size).toBe(1);
-    const key = `do-clock:deploy-drift:${SHA_A.slice(0, 12)}`;
+    const key = `do-clock:deploy-drift:${SHA_A.slice(0, 12)}:${SHA_B.slice(0, 12)}`;
     const row = store.get(key);
     expect(row?.recipient).toBe('xo');
     expect(row?.task_type).toBe('agent_message');
@@ -212,6 +217,22 @@ describe('deploy drift detector', () => {
     expect(prs.length + (body.commits_without_pr as number)).toBe(body.behind_by);
   });
 
+  test('rejects a compare count smaller than its commit evidence', async () => {
+    runningSha = SHA_A;
+    headSha = SHA_B;
+    compareBody = {
+      status: 'ahead',
+      ahead_by: 1,
+      commits: [commit('Fix x (#901)', hoursBefore(3)), commit('Fix y (#902)', hoursBefore(2.5))],
+    };
+
+    const result = await run();
+
+    expect(result?.verdict).toBe('observation_error');
+    expect(result?.last_error).toBe('duty_officer_github_compare_count_invalid');
+    expect(createMessage).toHaveBeenCalledTimes(0);
+  });
+
   test('repeated_ticks_stay_deduplicated', async () => {
     runningSha = SHA_A;
     headSha = SHA_B;
@@ -231,7 +252,7 @@ describe('deploy drift detector', () => {
     await run();
     expect(createMessage).toHaveBeenCalledTimes(1);
     expect(store.size).toBe(1);
-    const key = `do-clock:deploy-drift:${SHA_A.slice(0, 12)}`;
+    const key = `do-clock:deploy-drift:${SHA_A.slice(0, 12)}:${SHA_B.slice(0, 12)}`;
     resetDeployDriftStateForTests();
     nowMs += 60_000;
     await run();
@@ -244,7 +265,7 @@ describe('deploy drift detector', () => {
     expect(store.size).toBe(1);
   });
 
-  test('recovery_then_new_episode', async () => {
+  test('same running sha alerts again after recovery when target advances', async () => {
     runningSha = SHA_A;
     headSha = SHA_B;
     compareBody = {
@@ -256,16 +277,14 @@ describe('deploy drift detector', () => {
     expect(store.size).toBe(1);
 
     nowMs += 60_000;
-    runningSha = SHA_C;
-    headSha = SHA_C;
+    headSha = SHA_A;
     compareBody = null;
     const recovered = await run();
     expect(recovered?.verdict).toBe('in_sync');
     expect(createMessage).toHaveBeenCalledTimes(1);
 
     nowMs += 60_000;
-    runningSha = SHA_C;
-    headSha = SHA_D;
+    headSha = SHA_C;
     compareBody = {
       status: 'ahead',
       ahead_by: 1,
@@ -273,9 +292,8 @@ describe('deploy drift detector', () => {
     };
     await run();
     expect(createMessage).toHaveBeenCalledTimes(2);
-    const key = `do-clock:deploy-drift:${SHA_C.slice(0, 12)}`;
-    expect(store.has(key)).toBe(true);
     expect(store.size).toBe(2);
+    expect([...store.values()].map(row => JSON.parse(row.body).target_sha)).toEqual([SHA_B, SHA_C]);
   });
 
   test('build_sha_unknown_beyond_grace', async () => {
@@ -297,25 +315,89 @@ describe('deploy drift detector', () => {
     expect(createMessage).toHaveBeenCalledTimes(0);
   });
 
-  test('running_not_on_dev', async () => {
+  test('running_not_on_dev uses running-side commits and preserves the count invariant', async () => {
     runningSha = SHA_A;
     headSha = SHA_B;
     processStartedAt = new Date(NOW - 3 * 60 * 60 * 1000);
     compareBody = {
       status: 'diverged',
       ahead_by: 4,
-      behind_by: 7,
-      commits: [commit('Fix on dev (#910)', hoursBefore(1))],
+      behind_by: 2,
+      commits: [
+        commit('Target-only one (#910)', hoursBefore(1)),
+        commit('Target-only two (#911)', hoursBefore(1)),
+        commit('Target-only three (#912)', hoursBefore(1)),
+        commit('target-only no pr', hoursBefore(1)),
+      ],
+    };
+    reverseCompareBody = {
+      status: 'diverged',
+      ahead_by: 2,
+      behind_by: 4,
+      commits: [
+        commit('Running-only change (#920)', hoursBefore(1)),
+        commit('running-only no pr', hoursBefore(1)),
+      ],
     };
     const result = await run();
     expect(result?.verdict).toBe('drift_alerted');
-    expect(result?.behind_by).toBe(7);
+    expect(result?.behind_by).toBe(2);
     expect(store.size).toBe(1);
     const body = bodyOf();
     expect(body.reason).toBe('running_not_on_dev');
     expect(body.running_sha).toBe(SHA_A);
     expect(body.target_sha).toBe(SHA_B);
-    expect(body.behind_by).toBe(7);
+    expect(body.behind_by).toBe(2);
+    expect(body.undeployed_prs).toEqual([{ number: 920, title: 'Running-only change (#920)' }]);
+    expect(body.commits_without_pr).toBe(1);
+    expect((body.undeployed_prs as unknown[]).length + (body.commits_without_pr as number)).toBe(
+      body.behind_by
+    );
+    expect(urls).toContain(
+      `https://api.github.com/repos/thinmansoftware/bdc-harness/compare/${SHA_B}...${SHA_A}`
+    );
+  });
+
+  test('running_not_on_dev rejects a reverse comparison with the wrong status', async () => {
+    runningSha = SHA_A;
+    headSha = SHA_B;
+    processStartedAt = new Date(NOW - 3 * 60 * 60 * 1000);
+    compareBody = { status: 'behind', ahead_by: 0, behind_by: 1, commits: [] };
+    reverseCompareBody = {
+      status: 'behind',
+      ahead_by: 1,
+      behind_by: 0,
+      commits: [commit('Running-only change (#920)', hoursBefore(1))],
+    };
+
+    const result = await run();
+
+    expect(result?.verdict).toBe('observation_error');
+    expect(result?.last_error).toBe('duty_officer_github_reverse_compare_status_invalid');
+    expect(createMessage).toHaveBeenCalledTimes(0);
+  });
+
+  test('running_not_on_dev rejects disagreement between immutable sha comparisons', async () => {
+    runningSha = SHA_A;
+    headSha = SHA_B;
+    processStartedAt = new Date(NOW - 3 * 60 * 60 * 1000);
+    compareBody = { status: 'diverged', ahead_by: 1, behind_by: 2, commits: [] };
+    reverseCompareBody = {
+      status: 'diverged',
+      ahead_by: 3,
+      behind_by: 1,
+      commits: [
+        commit('Running-only one (#920)', hoursBefore(1)),
+        commit('Running-only two (#921)', hoursBefore(1)),
+        commit('running-only no pr', hoursBefore(1)),
+      ],
+    };
+
+    const result = await run();
+
+    expect(result?.verdict).toBe('observation_error');
+    expect(result?.last_error).toBe('duty_officer_github_reverse_compare_count_mismatch');
+    expect(createMessage).toHaveBeenCalledTimes(0);
   });
 
   test('two_episodes_beyond_grace_one_alert_each', async () => {

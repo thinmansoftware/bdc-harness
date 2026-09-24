@@ -42,7 +42,7 @@ GitHub reads use `GH_TOKEN` or `GITHUB_TOKEN`, the same token as the rest of the
 
 ## Alert body
 
-`behind_by` is the GitHub compare `ahead_by` for `behind_dev` (commits on the target that are not in the running SHA) and the compare `behind_by` for `running_not_on_dev` (commits on the running SHA that are not on the target). `undeployed_prs` lists at most 20 pull requests. Further PR commits are counted in `commits_without_pr`, so `undeployed_prs.length + commits_without_pr` equals the number of compare commits.
+`behind_by` is the GitHub compare `ahead_by` for `behind_dev` (commits on the target that are not in the running SHA). For `running_not_on_dev`, the detector performs a reverse comparison from the target SHA to the running SHA so the count and commit evidence both describe commits on the running side. `undeployed_prs` lists at most 20 pull requests. Further PR commits and commits omitted from the compare response are counted in `commits_without_pr`, so `undeployed_prs.length + commits_without_pr` equals `behind_by`.
 
 `task_type` is `agent_message`, `priority` is `normal`, and `body` is JSON:
 
@@ -66,7 +66,7 @@ GitHub reads use `GH_TOKEN` or `GITHUB_TOKEN`, the same token as the rest of the
 
 Idempotency keys:
 
-- `do-clock:deploy-drift:<first 12 of running sha>` for `behind_dev` and `running_not_on_dev`
+- `do-clock:deploy-drift:<first 12 of running sha>:<first 12 of target sha>` for `behind_dev` and `running_not_on_dev`
 - `do-clock:deploy-drift:build-sha-unknown:<process start time>`
 - `do-clock:lane-drift:<first 12 of running sha>:<first 12 hex of the drifted lane digest>`
 

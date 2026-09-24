@@ -186,6 +186,10 @@ function laneKey(runningSha: string, differing: { name: string; served: string }
   return `do-clock:lane-drift:${runningSha.slice(0, 12)}:${digest}`;
 }
 
+function shaDriftKey(runningSha: string, targetSha: string): string {
+  return `do-clock:deploy-drift:${runningSha.slice(0, 12)}:${targetSha.slice(0, 12)}`;
+}
+
 function differingLanes(maps: LaneFileMaps): { name: string; served: string }[] {
   const found: { name: string; served: string }[] = [];
   for (const name of Object.keys(maps.baked)) {
@@ -319,9 +323,50 @@ export async function runDeployDriftDetector(
         }
         if (status === 'ahead' || status === 'behind' || status === 'diverged') {
           const reason = status === 'ahead' ? 'behind_dev' : 'running_not_on_dev';
-          const commits = compare.commits ?? [];
+          let evidenceCompare = compare;
+          let compareCount = compare.ahead_by;
+          if (reason === 'running_not_on_dev') {
+            const reverse = await githubGet<CompareResponse>(
+              deps,
+              token,
+              `/repos/${repo}/compare/${targetSha}...${runningSha}`,
+              signal
+            );
+            if (reverse.status !== 'ahead' && reverse.status !== 'diverged') {
+              return observation(
+                'duty_officer_github_reverse_compare_status_invalid',
+                evaluatedAt,
+                runningSha,
+                targetSha
+              );
+            }
+            if (
+              typeof compare.behind_by === 'number' &&
+              typeof reverse.ahead_by === 'number' &&
+              compare.behind_by !== reverse.ahead_by
+            ) {
+              return observation(
+                'duty_officer_github_reverse_compare_count_mismatch',
+                evaluatedAt,
+                runningSha,
+                targetSha
+              );
+            }
+            evidenceCompare = reverse;
+            compareCount = reverse.ahead_by ?? compare.behind_by;
+          }
+          const commits = evidenceCompare.commits ?? [];
+          const evidenceCount = typeof compareCount === 'number' ? compareCount : commits.length;
+          if (evidenceCount < commits.length) {
+            return observation(
+              'duty_officer_github_compare_count_invalid',
+              evaluatedAt,
+              runningSha,
+              targetSha
+            );
+          }
           const undeployedPrs: { number: number; title: string }[] = [];
-          let commitsWithoutPr = 0;
+          let commitsWithoutPr = evidenceCount - commits.length;
           let oldestMs: number | null = null;
           for (const commit of commits) {
             const title = subjectOf(commit);
@@ -334,8 +379,7 @@ export async function runDeployDriftDetector(
             if (Number.isFinite(parsed) && (oldestMs === null || parsed < oldestMs))
               oldestMs = parsed;
           }
-          const compareCount = reason === 'behind_dev' ? compare.ahead_by : compare.behind_by;
-          behindBy = typeof compareCount === 'number' ? compareCount : commits.length;
+          behindBy = evidenceCount;
           let beyondGrace = false;
           let oldestUndeployedAt: string | null = null;
           if (reason === 'behind_dev') {
@@ -354,7 +398,7 @@ export async function runDeployDriftDetector(
           }
           episodes.push({
             reason,
-            idempotencyKey: `do-clock:deploy-drift:${runningSha.slice(0, 12)}`,
+            idempotencyKey: shaDriftKey(runningSha, targetSha),
             beyondGrace,
             behindBy,
             undeployedPrs,
