@@ -56,6 +56,7 @@ const KNOWN_PRINCIPALS = [
   ['overseer', 'Overseer', 'notify_only', 1],
   ['overseer-review-route', 'Overseer Review Route', 'notify_only', 1],
   ['overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1],
+  ['overseer-rework', 'Overseer Rework Dispatcher', 'worker_poll', 1],
   ['xo', 'XO', 'drain_on_start', 1],
 ] as const;
 

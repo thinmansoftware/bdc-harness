@@ -966,7 +966,8 @@ export class SqliteAdapter implements IDatabase {
 
     const hasMachineDispositions =
       tableSql.includes("'expired'") && tableSql.includes("'auto_surfaced'");
-    if (!hasInlineUnique && hasMachineDispositions) {
+    const hasReworkTaskType = tableSql.includes("'run_rework'");
+    if (!hasInlineUnique && hasMachineDispositions && hasReworkTaskType) {
       // Column present and no inline UNIQUE -- only ensure partial indexes.
       // Do not recreate or redefine non-unique helper indexes here; smoke validation
       // catches wrong-definition leftovers on already-migrated schemas.
@@ -997,7 +998,7 @@ export class SqliteAdapter implements IDatabase {
             id TEXT PRIMARY KEY,
             correlation_id TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
-            task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')),
+            task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'run_rework', 'draft_spec', 'run_report', 'board_motion')),
             sender TEXT NOT NULL,
             sender_principal_id TEXT,
             recipient TEXT NOT NULL,
@@ -1166,6 +1167,7 @@ export class SqliteAdapter implements IDatabase {
         -- SQLite seed in sync with 000_combined.sql -- this INSERT block is a
         -- hand-maintained mirror, not derived from the migration files.
         ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1),
+        ('overseer-rework', 'Overseer Rework Dispatcher', 'worker_poll', 1),
         ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1),
         ('duty-officer', 'Duty Officer', 'worker_poll', 1),
         ('do', 'Duty Officer alias', 'worker_poll', 1)
@@ -1500,7 +1502,7 @@ export class SqliteAdapter implements IDatabase {
         id TEXT PRIMARY KEY,
         correlation_id TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
-        task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')),
+        task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'run_rework', 'draft_spec', 'run_report', 'board_motion')),
         sender TEXT NOT NULL,
         sender_principal_id TEXT,
         recipient TEXT NOT NULL,

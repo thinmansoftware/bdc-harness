@@ -172,6 +172,9 @@ describe('SqliteAdapter', () => {
         // alphabetically by principal_id, same as the query's ORDER BY.
         { principal_id: 'overseer-review-route', delivery_mode: 'notify_only', active: 1 },
         { principal_id: 'overseer-reviewer', delivery_mode: 'worker_poll', active: 1 },
+        // WO-HARNESS-OVERSEER-REWORK-LOOP-01 (migration 059): worker-poll
+        // recipient for run_rework.
+        { principal_id: 'overseer-rework', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'xo', delivery_mode: 'drain_on_start', active: 1 },
       ]);
     });
@@ -910,6 +913,94 @@ describe('SqliteAdapter', () => {
         'uq_agent_dispatch_messages_idempotency_legacy',
         'uq_agent_dispatch_messages_sender_idempotency_authenticated',
       ]);
+    });
+
+    test('rebuilds a Phase 1.5-shaped database whose task_type CHECK predates run_rework (WO-HARNESS-OVERSEER-REWORK-LOOP-01)', async () => {
+      // hasReworkTaskType in migrateDispatchSenderPrincipalIdempotency gates
+      // the fast no-rebuild path on the CHECK already listing 'run_rework'.
+      // Build a database that already has machine dispositions (so it would
+      // take the fast path on every earlier check) but predates this WO, to
+      // prove the rebuild still fires and run_rework becomes insertable.
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      legacy.run(`
+        CREATE TABLE agent_dispatch_messages (
+          id TEXT PRIMARY KEY,
+          correlation_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          task_type TEXT NOT NULL CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')),
+          sender TEXT NOT NULL,
+          sender_principal_id TEXT,
+          recipient TEXT NOT NULL,
+          body TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'queued',
+          result_body TEXT,
+          created_at TEXT NOT NULL,
+          claimed_at TEXT,
+          completed_at TEXT,
+          not_before TEXT,
+          lease_owner TEXT,
+          lease_expires_at TEXT,
+          fencing_token INTEGER NOT NULL DEFAULT 0,
+          recipient_alias TEXT,
+          motion_id TEXT,
+          motion_revision_sha TEXT,
+          resolved_recipient TEXT,
+          resolved_xo_lease_id TEXT,
+          resolved_xo_fencing_token INTEGER,
+          resolved_at TEXT,
+          priority TEXT NOT NULL DEFAULT 'normal',
+          task_outcome TEXT,
+          acknowledged_at TEXT,
+          acknowledged_by TEXT,
+          addressed_at TEXT,
+          addressed_by TEXT,
+          escalated_tg_at TEXT,
+          escalated_sms_at TEXT,
+          subject_key TEXT,
+          repeat_reason TEXT,
+          route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+          supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
+        )
+      `);
+      legacy.run(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient, body, created_at, priority)
+         VALUES
+           ('pre058-1', 'c1', 'k1', 'agent_message', 'claude', 'codex', 'hello', '2026-08-05T00:00:00.000Z', 'normal')`
+      );
+      expect(() =>
+        legacy.run(
+          `INSERT INTO agent_dispatch_messages
+             (id, correlation_id, idempotency_key, task_type, sender, recipient, body, created_at, priority)
+           VALUES
+             ('pre058-rework', 'c2', 'k2', 'run_rework', 'overseer', 'codex', 'blocked pre-058', '2026-08-05T00:00:01.000Z', 'normal')`
+        )
+      ).toThrow();
+      legacy.close();
+
+      db = new SqliteAdapter(currentDbPath);
+      const schema = await db.query<{ sql: string }>(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+      );
+      expect(schema.rows[0]?.sql).toContain('run_rework');
+      const existing = await db.query<{ id: string }>(
+        `SELECT id FROM agent_dispatch_messages ORDER BY id`
+      );
+      expect(existing.rows).toEqual([{ id: 'pre058-1' }]);
+
+      await db.query(`
+        INSERT INTO agent_dispatch_messages
+          (id, correlation_id, idempotency_key, task_type, sender, recipient, body)
+        VALUES ('post058-rework', 'c3', 'k3', 'run_rework', 'overseer', 'codex', 'rework enqueued')
+      `);
+      const reworkRow = await db.query<{ task_type: string }>(
+        `SELECT task_type FROM agent_dispatch_messages WHERE id = 'post058-rework'`
+      );
+      expect(reworkRow.rows).toEqual([{ task_type: 'run_rework' }]);
     });
 
     test('receipt freeze blocks receipt updates and unfreeze restores them without changing cutover', async () => {

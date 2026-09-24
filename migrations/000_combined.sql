@@ -520,7 +520,7 @@ CREATE TABLE IF NOT EXISTS agent_dispatch_messages (
   correlation_id TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
   task_type TEXT NOT NULL CHECK (
-    task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion')
+    task_type IN ('agent_message', 'run_review', 'run_rework', 'draft_spec', 'run_report', 'board_motion')
   ),
   sender TEXT NOT NULL,
   sender_principal_id TEXT,
@@ -624,6 +624,7 @@ VALUES
   -- route's sender and worker-poll recipient. Without these rows every
   -- review enqueue is rejected as missing_principal.
   ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
+  ('overseer-rework', 'Overseer Rework Dispatcher', 'worker_poll', TRUE),
   ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE),
   ('duty-officer', 'Duty Officer', 'worker_poll', TRUE),
   ('do', 'Duty Officer alias', 'worker_poll', TRUE)
