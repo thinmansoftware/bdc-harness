@@ -310,6 +310,87 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('Plain prompt with no loop variable.');
   });
+
+  // Test 1: prefix-longer variable is left intact (WO-MATRIX-M1-QWENCN-01)
+  it('does not substitute $BASE_BRANCH_OVERRIDE or $BASE_BRANCH_PR when they appear in prompt', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Branch: $BASE_BRANCH_OVERRIDE and $BASE_BRANCH_PR are not substituted',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    // These should remain verbatim, not become dev_OVERRIDE or dev_PR
+    expect(prompt).toBe('Branch: $BASE_BRANCH_OVERRIDE and $BASE_BRANCH_PR are not substituted');
+  });
+
+  // Test 2: exact variable is still substituted
+  it('substitutes $BASE_BRANCH exactly and leaves suffixed variants intact', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Branch: $BASE_BRANCH, $BASE_BRANCH/x, $BASE_BRANCH., $BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('Branch: dev, dev/x, dev., dev)');
+  });
+
+  // Test 3: every bounded variable, parametrized (all 9 variables)
+  it.each([
+    ['WORKFLOW_ID', 'run-abc'],
+    ['USER_MESSAGE', 'add feature'],
+    ['ARGUMENTS', 'add feature'],
+    ['ARTIFACTS_DIR', '/tmp/artifacts'],
+    ['BASE_BRANCH', 'main'],
+    ['DOCS_DIR', 'docs/'],
+    ['LOOP_USER_INPUT', 'feedback'],
+    ['REJECTION_REASON', 'missing tests'],
+    ['LOOP_PREV_OUTPUT', 'previous output'],
+  ])('substitutes $NAME but not $NAME_SUFFIX for %s', (name, value) => {
+    const { prompt } = substituteWorkflowVariables(
+      `Test ${name} and ${name}_SUFFIX`,
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/',
+      undefined,
+      name === 'LOOP_USER_INPUT' ? value : undefined,
+      name === 'REJECTION_REASON' ? value : undefined,
+      name === 'LOOP_PREV_OUTPUT' ? value : undefined
+    );
+    expect(prompt).toBe(`Test ${value} and ${name}_SUFFIX`);
+  });
+
+  // Test 4: fail-fast guard unchanged
+  it('does not throw when $BASE_BRANCH_OVERRIDE appears with empty baseBranch', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'Branch: $BASE_BRANCH_OVERRIDE',
+        'run-1',
+        'msg',
+        '/tmp',
+        '',
+        'docs/'
+      )
+    ).not.toThrow('No base branch could be resolved');
+  });
+
+  it('still throws when $BASE_BRANCH appears with empty baseBranch', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'Branch: $BASE_BRANCH',
+        'run-1',
+        'msg',
+        '/tmp',
+        '',
+        'docs/'
+      )
+    ).toThrow('No base branch could be resolved');
+  });
 });
 
 describe('buildPromptWithContext', () => {
