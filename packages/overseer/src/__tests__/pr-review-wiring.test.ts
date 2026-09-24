@@ -139,21 +139,24 @@ describe('PR review approval verdict recording', () => {
     expect(finalized).toBe(0);
   });
 
-  test.each(['changes_requested', 'indeterminate'])(
-    '%s does not record a verdict',
-    async disposition => {
-      let recorded = 0;
-      await maybeRecordReviewApprovalVerdict(
-        { disposition, owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
-        {
-          record: async () => {
-            recorded += 1;
-          },
-        }
-      );
-      expect(recorded).toBe(0);
-    }
-  );
+  test.each([
+    ['REQUEST_CHANGES', { disposition: 'changes_requested' }],
+    [
+      'INDETERMINATE',
+      { disposition: 'changes_requested', reason: 'indeterminate:usage_limit_until' },
+    ],
+  ] as const)('%s does not record a verdict', async (_verdict, outcome) => {
+    let recorded = 0;
+    await maybeRecordReviewApprovalVerdict(
+      { ...outcome, owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
+      {
+        record: async () => {
+          recorded += 1;
+        },
+      }
+    );
+    expect(recorded).toBe(0);
+  });
 
   test('kill switch false suppresses an approved verdict', async () => {
     let recorded = 0;
@@ -188,6 +191,36 @@ describe('PR review approval verdict recording', () => {
 });
 
 describe('createRealSubmitDeps -- evaluator binding', () => {
+  test('records an approved receipt with the resolved review model', async () => {
+    const recorded: Parameters<typeof recordReviewApprovalVerdict>[0][] = [];
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      reviewerModel: 'resolved-review-model',
+      recordApprovalVerdict: async input => {
+        recorded.push(input);
+      },
+    });
+
+    await deps.recordReceipt({
+      correlationId: 'correlation-1',
+      messageId: 'message-1',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 42,
+      headSha: HEAD,
+      disposition: 'approved',
+    });
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toMatchObject({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 42,
+      headSha: HEAD,
+      model: 'resolved-review-model',
+    });
+  });
+
   test.each([
     ['APPROVE', true],
     ['REQUEST_CHANGES', false],

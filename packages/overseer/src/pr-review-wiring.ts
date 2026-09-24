@@ -1035,21 +1035,24 @@ export function createRealSubmitDeps(
       // additionally logs at error level and marks the body `needsOperator` so
       // a blocked-for-permissions PR is not just one more receipt in the list.
       const blocked = input.disposition === 'blocked_required_contexts_unavailable';
-      await maybeRecordReviewApprovalVerdict(input, {
-        record: overrides.recordApprovalVerdict,
-        onError: error => {
-          log.error(
-            {
-              error,
-              owner: input.owner,
-              repo: input.repo,
-              prNumber: input.prNumber,
-              headSha: input.headSha,
-            },
-            'overseer.pr_review.verdict_record_failed'
-          );
-        },
-      });
+      await maybeRecordReviewApprovalVerdict(
+        { ...input, model: modelReviewer.model },
+        {
+          record: overrides.recordApprovalVerdict,
+          onError: error => {
+            log.error(
+              {
+                error,
+                owner: input.owner,
+                repo: input.repo,
+                prNumber: input.prNumber,
+                headSha: input.headSha,
+              },
+              'overseer.pr_review.verdict_record_failed'
+            );
+          },
+        }
+      );
       if (blocked) {
         log.error(
           {
