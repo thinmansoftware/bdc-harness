@@ -10,6 +10,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   createRealSubmitDeps,
   isExactHeadCiGreen,
+  maybeRecordReviewApprovalVerdict,
+  recordReviewApprovalVerdict,
   REVIEW_REVIEWER_IDENTITY_ENV,
   REVIEW_WEBHOOK_SECRET_ENV,
   parseReviewWorkBody,
@@ -78,6 +80,112 @@ const work = {
   headSha: HEAD,
   author: 'contributor',
 };
+
+describe('PR review approval verdict recording', () => {
+  test('records one merge-ready runless verdict with the reviewed head and PR URL', async () => {
+    const claims: unknown[] = [];
+    const finalizations: unknown[] = [];
+    await recordReviewApprovalVerdict(
+      {
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 42,
+        headSha: HEAD,
+        model: 'review-model',
+      },
+      {
+        claimVerdict: async input => {
+          claims.push(input);
+          return { claimed: true, verdictId: 'verdict-1', retryCount: 0 };
+        },
+        finalizeVerdict: async input => {
+          finalizations.push(input);
+          return {} as never;
+        },
+      }
+    );
+
+    expect(claims).toEqual([
+      {
+        runId: 'pr-discovery:thinmansoftware/bdc-harness#42',
+        woId: 'pr-discovery:thinmansoftware/bdc-harness#42',
+        headSha: HEAD,
+      },
+    ]);
+    expect(finalizations).toEqual([
+      {
+        verdictId: 'verdict-1',
+        status: 'verdict',
+        verdict: 'merge_candidate',
+        proposedAction: 'flag_merge_ready',
+        model: 'review-model',
+        prUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/42',
+      },
+    ]);
+  });
+
+  test('a repeated approval at the same head is a no-op after the claim loses', async () => {
+    let finalized = 0;
+    await recordReviewApprovalVerdict(
+      { owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
+      {
+        claimVerdict: async () => ({ claimed: false }),
+        finalizeVerdict: async () => {
+          finalized += 1;
+          return {} as never;
+        },
+      }
+    );
+    expect(finalized).toBe(0);
+  });
+
+  test.each(['changes_requested', 'indeterminate'])(
+    '%s does not record a verdict',
+    async disposition => {
+      let recorded = 0;
+      await maybeRecordReviewApprovalVerdict(
+        { disposition, owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
+        {
+          record: async () => {
+            recorded += 1;
+          },
+        }
+      );
+      expect(recorded).toBe(0);
+    }
+  );
+
+  test('kill switch false suppresses an approved verdict', async () => {
+    let recorded = 0;
+    await maybeRecordReviewApprovalVerdict(
+      { disposition: 'approved', owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
+      {
+        env: { OVERSEER_REVIEW_RECORDS_VERDICT: ' false ' },
+        record: async () => {
+          recorded += 1;
+        },
+      }
+    );
+    expect(recorded).toBe(0);
+  });
+
+  test('store errors are reported and swallowed', async () => {
+    const errors: unknown[] = [];
+    await expect(
+      maybeRecordReviewApprovalVerdict(
+        { disposition: 'approved', owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
+        {
+          record: async () => {
+            throw new Error('db unavailable');
+          },
+          onError: error => errors.push(error),
+        }
+      )
+    ).resolves.toBeUndefined();
+    expect(errors).toHaveLength(1);
+    expect(String(errors[0])).toContain('db unavailable');
+  });
+});
 
 describe('createRealSubmitDeps -- evaluator binding', () => {
   test.each([

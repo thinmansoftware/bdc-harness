@@ -622,6 +622,7 @@ export async function finalizeOverseerVerdict(input: {
   reason?: string;
   evidenceDigest?: string;
   evidence?: string;
+  prUrl?: string;
 }): Promise<OverseerVerdictRow> {
   const db = getDatabase();
   // No RETURNING: the SQLite adapter rejects it on UPDATE, and this throw took
@@ -633,7 +634,7 @@ export async function finalizeOverseerVerdict(input: {
      SET status = $2, verdict = $3, confidence = $4, model = $5, model_rung = $6,
          proposed_action = $7, proposed_tier = $8, required_tier = $9, effective_tier = $10,
          reason = $11, evidence_digest = COALESCE($12, evidence_digest),
-         evidence = $13, updated_at = $14
+         evidence = $13, pr_url = COALESCE($14, pr_url), updated_at = $15
      WHERE id = $1`,
     [
       input.verdictId,
@@ -649,6 +650,7 @@ export async function finalizeOverseerVerdict(input: {
       input.reason ?? null,
       input.evidenceDigest ?? null,
       input.evidence ?? null,
+      input.prUrl ?? null,
       new Date().toISOString(),
     ]
   );

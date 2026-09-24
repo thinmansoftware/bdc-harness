@@ -17,6 +17,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import * as dispatch from '@archon/core/db/dispatch';
+import { claimOverseerVerdict, finalizeOverseerVerdict } from '@archon/core/db/overseer';
 import { createLogger } from '@archon/paths';
 import {
   createRealFetchExactHeadPullRequestEvidence,
@@ -45,11 +46,14 @@ import {
 import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-health';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
+import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
 /** Env var naming the reviewer bot identity, e.g. 'thinman-overseer[bot]'. */
 export const REVIEW_REVIEWER_IDENTITY_ENV = 'OVERSEER_REVIEW_IDENTITY';
+/** Kill switch for recording submitted APPROVE reviews as merge-ready verdicts. */
+export const OVERSEER_REVIEW_RECORDS_VERDICT_ENV = 'OVERSEER_REVIEW_RECORDS_VERDICT';
 const REVIEW_WEBHOOK_SECRET_FALLBACK_ENV = 'WEBHOOK_SECRET';
 const REVIEW_REVIEWER_IDENTITY_FALLBACK_ENV = 'MERGE_MANAGER_REVIEW_GATE_LOGIN';
 const REVIEW_REVIEWER_IDENTITY_DEFAULT = 'thinman-overseer[bot]';
@@ -57,6 +61,60 @@ const REVIEW_REVIEWER_IDENTITY_DEFAULT = 'thinman-overseer[bot]';
 /** Code-fixed Overseer sender that owns queued review work. */
 export const REVIEW_SENDER = 'overseer';
 const log = createLogger('overseer/pr-review-wiring');
+
+export function reviewRecordsVerdictEnabled(
+  env: Record<string, string | undefined> = process.env
+): boolean {
+  return env[OVERSEER_REVIEW_RECORDS_VERDICT_ENV]?.trim().toLowerCase() !== 'false';
+}
+
+interface ReviewApprovalVerdictDeps {
+  claimVerdict: typeof claimOverseerVerdict;
+  finalizeVerdict: typeof finalizeOverseerVerdict;
+}
+
+export async function recordReviewApprovalVerdict(
+  input: { owner: string; repo: string; prNumber: number; headSha: string; model?: string },
+  deps: ReviewApprovalVerdictDeps = {
+    claimVerdict: claimOverseerVerdict,
+    finalizeVerdict: finalizeOverseerVerdict,
+  }
+): Promise<void> {
+  const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
+  const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
+  if (!claim.claimed || !claim.verdictId) return;
+  await deps.finalizeVerdict({
+    verdictId: claim.verdictId,
+    status: 'verdict',
+    verdict: 'merge_candidate',
+    proposedAction: 'flag_merge_ready',
+    model: input.model,
+    prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+  });
+}
+
+export async function maybeRecordReviewApprovalVerdict(
+  input: {
+    disposition: string;
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    model?: string;
+  },
+  options: {
+    env?: Record<string, string | undefined>;
+    record?: typeof recordReviewApprovalVerdict;
+    onError?: (error: unknown) => void;
+  } = {}
+): Promise<void> {
+  if (input.disposition !== 'approved' || !reviewRecordsVerdictEnabled(options.env)) return;
+  try {
+    await (options.record ?? recordReviewApprovalVerdict)(input);
+  } catch (error) {
+    options.onError?.(error);
+  }
+}
 
 export const REVIEW_RECIPIENT = 'overseer-reviewer';
 
@@ -776,6 +834,7 @@ interface RealSubmitWiringOverrides {
   reviewerModel?: string;
   evaluate?: (input: PrReviewInput, deps: PrReviewDeps) => Promise<PrReviewResult>;
   invokeModel?: PrReviewDeps['invokeModel'];
+  recordApprovalVerdict?: typeof recordReviewApprovalVerdict;
 }
 
 const INDETERMINATE_REVIEW_SUMMARY =
@@ -976,6 +1035,21 @@ export function createRealSubmitDeps(
       // additionally logs at error level and marks the body `needsOperator` so
       // a blocked-for-permissions PR is not just one more receipt in the list.
       const blocked = input.disposition === 'blocked_required_contexts_unavailable';
+      await maybeRecordReviewApprovalVerdict(input, {
+        record: overrides.recordApprovalVerdict,
+        onError: error => {
+          log.error(
+            {
+              error,
+              owner: input.owner,
+              repo: input.repo,
+              prNumber: input.prNumber,
+              headSha: input.headSha,
+            },
+            'overseer.pr_review.verdict_record_failed'
+          );
+        },
+      });
       if (blocked) {
         log.error(
           {
