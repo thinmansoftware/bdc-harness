@@ -30,7 +30,7 @@ import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { createRecord, writeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
-import { findWoClaim, type WoClaim } from './already-satisfied.js';
+import { findWoClaim, resolveGithubRepo, type WoClaim } from './already-satisfied.js';
 import { acquireWoLock, releaseWoLock } from './wo-lock.js';
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
 import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
@@ -890,6 +890,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           stallTimeoutMs: pollStallTimeoutMs,
           intervalMs: pollIntervalMs,
           nodeTimeoutsMs,
+          repo: resolveGithubRepo(project),
         });
       } catch (pollErr) {
         if (pollErr instanceof TimeoutError) {

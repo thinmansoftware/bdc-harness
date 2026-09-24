@@ -168,11 +168,17 @@ interface PollOptions {
   /** Delay between findExistingPrForBranch `gh pr list` retries (ms). Default: 10000. */
   prBranchLookupDelayMs?: number;
   /**
+   * GitHub "owner/repo" for the branch fallback's `gh pr list --repo` call.
+   * When unknown, the fallback is skipped because the conductor's cwd is not
+   * a git checkout and gh cannot safely infer the repository.
+   */
+  repo?: string | null;
+  /**
    * Injectable seam for the `gh pr list --head <branch>` lookup. Test-only:
    * production always uses the real gh CLI (ghPrListForBranchDefault). Returns
    * the PR URL for the branch, or null when gh is unavailable / no PR is found.
    */
-  ghPrListForBranch?: (branch: string) => Promise<string | null>;
+  ghPrListForBranch?: (branch: string, repo: string | null) => Promise<string | null>;
   /**
    * Injectable seam for `gh pr view --json mergeable`. Test-only:
    * production always uses the real gh CLI (checkPrMergeableDefault).
@@ -200,6 +206,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     prRetryDelayMs = 10_000,
     prBranchLookupAttempts = 3,
     prBranchLookupDelayMs = 10_000,
+    repo = null,
     ghPrListForBranch = ghPrListForBranchDefault,
     checkPrMergeable: checkPrMergeableFn = checkPrMergeableDefault,
   } = opts;
@@ -261,7 +268,8 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
             events,
             ghPrListForBranch,
             prBranchLookupAttempts,
-            prBranchLookupDelayMs
+            prBranchLookupDelayMs,
+            repo
           );
           if (prUrl !== null) {
             console.log(
@@ -456,28 +464,37 @@ function extractValidatorVerdict(
   return 'unknown';
 }
 
+/** Read current node text while retaining compatibility with legacy events. */
+function extractEventText(data: Record<string, unknown>): string {
+  if (typeof data.node_output === 'string') return data.node_output;
+  if (typeof data.output === 'string') return data.output;
+  return '';
+}
+
 /**
  * Extract PR URL from node_completed events.
  *
  * Looks for node with step_name matching "open-pr" or containing "pr".
- * Parses PR_URL=https://... pattern from data.output.
+ * Parses an explicit PR_URL= value first, then a bare trailing GitHub pull URL.
  */
 function extractPrUrl(
   events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
 ): string | null {
-  const prUrlPattern = /PR_URL=(https?:\/\/\S+)/i;
+  const prUrlPattern = /PR_URL=(https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+)/i;
 
   for (const ev of events) {
     if (ev.event_type !== 'node_completed') continue;
     const stepName = ev.step_name ?? '';
     if (stepName !== 'open-pr' && !stepName.toLowerCase().includes('pr')) continue;
 
-    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+    const output = extractEventText(ev.data);
     const match = prUrlPattern.exec(output);
     if (match?.[1]) return match[1];
 
     // Also check for raw GitHub PR URL in output
-    const rawMatch = /(https:\/\/github\.com\/[^\s]+\/pull\/\d+)/.exec(output);
+    const rawMatch = /(?:^|\n)\s*(https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+)\s*$/.exec(
+      output
+    );
     if (rawMatch?.[1]) return rawMatch[1];
   }
 
@@ -518,14 +535,15 @@ function extractPrUrl(
  */
 async function findExistingPrForBranch(
   events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[],
-  lookup: (branch: string) => Promise<string | null>,
+  lookup: (branch: string, repo: string | null) => Promise<string | null>,
   attempts: number,
-  delayMs: number
+  delayMs: number,
+  repo: string | null
 ): Promise<string | null> {
   // The commit-and-push node reports its final target as unique_branch=<name>.
   let branch: string | null = null;
   for (const ev of events) {
-    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+    const output = extractEventText(ev.data);
     const m = /unique_branch=(\S+)/.exec(output);
     if (m?.[1]) branch = m[1];
   }
@@ -537,22 +555,37 @@ async function findExistingPrForBranch(
     if (attempt > 0) {
       await new Promise<void>(resolve => setTimeout(resolve, delayMs));
     }
-    const url = await lookup(branch);
+    const url = await lookup(branch, repo);
     if (url !== null) return url;
   }
   return null;
 }
 
 /**
- * Default `gh pr list --head <branch>` lookup used in production. Returns the
- * open PR URL for the branch, or null when gh is unavailable or nothing matches.
- * Callers must treat null as "unknown", never as "confirmed absent".
+ * Injectable exec seam for testing the exact gh invocation without replacing
+ * child_process globally.
  */
-async function ghPrListForBranchDefault(branch: string): Promise<string | null> {
+type ExecFileFn = (command: string, args: string[]) => Promise<{ stdout: string; stderr: string }>;
+
+/** Default `gh pr list --head <branch> --repo <repo>` production lookup. */
+export async function ghPrListForBranchDefault(
+  branch: string,
+  repo: string | null,
+  execFn: ExecFileFn = execFileAsync
+): Promise<string | null> {
+  if (!repo) {
+    console.log(
+      '[smart-cauldron/poll] skipping gh pr list --head branch lookup: repo is unknown -- ' +
+        'gh cannot infer a repository from /app (not a git checkout) without --repo'
+    );
+    return null;
+  }
   try {
-    const { stdout } = await execFileAsync('gh', [
+    const { stdout } = await execFn('gh', [
       'pr',
       'list',
+      '--repo',
+      repo,
       '--head',
       branch,
       '--state',
@@ -564,7 +597,10 @@ async function ghPrListForBranchDefault(branch: string): Promise<string | null> 
     ]);
     const url = stdout.trim();
     return url.length > 0 ? url : null;
-  } catch {
+  } catch (err) {
+    const stderr = (err as { stderr?: string }).stderr;
+    const firstLine = (stderr ?? (err as Error).message ?? '').split('\n')[0];
+    console.log(`[smart-cauldron/poll] gh pr list --head failed: ${firstLine}`);
     return null;
   }
 }
@@ -597,7 +633,10 @@ async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
     if (val === 'MERGEABLE') return true;
     if (val === 'CONFLICTING' || val === 'BLOCKED') return false;
     return null;
-  } catch {
+  } catch (err) {
+    const stderr = (err as { stderr?: string }).stderr;
+    const firstLine = (stderr ?? (err as Error).message ?? '').split('\n')[0];
+    console.log(`[smart-cauldron/poll] gh pr view --json mergeable failed: ${firstLine}`);
     return null;
   }
 }
