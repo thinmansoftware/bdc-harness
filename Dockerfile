@@ -67,8 +67,6 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 # Prevent interactive prompts during installation
 ENV DEBIAN_FRONTEND=noninteractive
-ARG ARCHON_BUILD_SHA=unknown
-ENV ARCHON_BUILD_SHA=${ARCHON_BUILD_SHA}
 ARG TERRAFORM_VERSION=1.8.5
 
 WORKDIR /app
@@ -260,6 +258,11 @@ RUN git config --global --add safe.directory '*' && \
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
     && chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Build SHA is declared last so a new revision invalidates only these layers.
+ARG ARCHON_BUILD_SHA=unknown
+ENV ARCHON_BUILD_SHA=${ARCHON_BUILD_SHA}
+LABEL org.opencontainers.image.revision=${ARCHON_BUILD_SHA}
 
 # Default port (matches .env.example PORT=3000)
 EXPOSE 3000

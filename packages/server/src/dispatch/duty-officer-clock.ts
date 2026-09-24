@@ -19,6 +19,11 @@ import {
   runSecurityDetector,
   type SecurityDetectorResult,
 } from './duty-officer-security-detector';
+import {
+  readLaneFiles,
+  runDeployDriftDetector,
+  type DeployDriftResult,
+} from './duty-officer-deploy-drift-detector';
 
 const log = createLogger('dispatch/duty-officer-clock');
 
@@ -32,6 +37,7 @@ const GH_SUBJECT =
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
 let detectorInFlight: Promise<SecurityDetectorResult | null> | null = null;
+let deployDriftInFlight: Promise<DeployDriftResult | null> | null = null;
 let detectorStatus: {
   last_run_at: string | null;
   verdict: SecurityDetectorResult['verdict'] | null;
@@ -55,6 +61,30 @@ let detectorStatus: {
   build_sha: null,
 };
 const startedAt = new Date().toISOString();
+const processStartedAt = new Date();
+let deployDriftStatus: {
+  last_run_at: string | null;
+  verdict: DeployDriftResult['verdict'] | null;
+  reasons: string[];
+  running_sha: string | null;
+  target_sha: string | null;
+  behind_by: number | null;
+  last_error: string | null;
+  last_tick_outcome?:
+    | 'skipped_throttled'
+    | 'skipped_in_flight'
+    | 'timed_out'
+    | 'error'
+    | 'completed';
+} = {
+  last_run_at: null,
+  verdict: null,
+  reasons: [],
+  running_sha: null,
+  target_sha: null,
+  behind_by: null,
+  last_error: null,
+};
 
 export interface DutyOfficerStaleIssue {
   owner: string;
@@ -78,6 +108,7 @@ export interface DutyOfficerClockDeps {
   postIssueComment: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
   judge: (message: DispatchMessage) => Promise<DutyOfficerJudgeVerdict>;
   securityDetector: (signal: AbortSignal) => Promise<SecurityDetectorResult | null>;
+  deployDriftDetector?: (signal: AbortSignal) => Promise<DeployDriftResult | null>;
   now?: () => Date;
 }
 
@@ -254,11 +285,28 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
         },
         signal
       ),
+    deployDriftDetector: signal =>
+      runDeployDriftDetector(
+        {
+          readBuildSha: () => process.env.ARCHON_BUILD_SHA ?? 'unknown',
+          fetchImpl: fetch,
+          readToken: githubToken,
+          readLaneFiles,
+          createMessage: createAuthenticatedMessage,
+          now: () => new Date(),
+          processStartedAt,
+        },
+        signal
+      ),
   };
 }
 
 function detectorTimeoutMs(): number {
   return Math.max(1, Number(process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS) || 30_000);
+}
+
+function deployDriftTimeoutMs(): number {
+  return Math.max(1, Number(process.env.DUTY_OFFICER_DEPLOY_DRIFT_TIMEOUT_MS) || 30_000);
 }
 
 async function detectorDeadline(
@@ -286,6 +334,41 @@ async function detectorDeadline(
     },
     () => {
       detectorInFlight = null;
+    }
+  );
+  try {
+    return await Promise.race([run, deadline]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function deployDriftDeadline(
+  deps: DutyOfficerClockDeps
+): Promise<DeployDriftResult | null | undefined> {
+  if (!deps.deployDriftDetector) return undefined;
+  if (deployDriftInFlight) {
+    log.info('duty_officer_deploy_drift_skipped_in_flight');
+    return undefined;
+  }
+  const detector = deps.deployDriftDetector;
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      const error = new Error('duty_officer_deploy_drift_timeout');
+      controller.abort(error);
+      reject(error);
+    }, deployDriftTimeoutMs());
+  });
+  deployDriftInFlight = Promise.resolve().then(() => detector(controller.signal));
+  const run = deployDriftInFlight;
+  void run.then(
+    () => {
+      deployDriftInFlight = null;
+    },
+    () => {
+      deployDriftInFlight = null;
     }
   );
   try {
@@ -468,6 +551,7 @@ export async function tickDutyOfficerClock(
         task_types: ['run_report', 'agent_message'],
         principal: 'duty-officer',
         security_detector: detectorStatus,
+        deploy_drift: deployDriftStatus,
       },
       max_concurrency: 1,
     });
@@ -535,6 +619,40 @@ export async function tickDutyOfficerClock(
       }
     }
 
+    if (deps.deployDriftDetector) {
+      try {
+        const driftResult = await deployDriftDeadline(deps);
+        deployDriftStatus = {
+          ...deployDriftStatus,
+          ...(driftResult
+            ? {
+                last_run_at: driftResult.evaluated_at,
+                verdict: driftResult.verdict,
+                reasons: driftResult.reasons,
+                running_sha: driftResult.running_sha,
+                target_sha: driftResult.target_sha,
+                behind_by: driftResult.behind_by,
+                last_error: driftResult.last_error,
+              }
+            : {}),
+          last_tick_outcome: driftResult
+            ? 'completed'
+            : driftResult === null
+              ? 'skipped_throttled'
+              : 'skipped_in_flight',
+        };
+      } catch (error) {
+        const lastError = error instanceof Error ? error.message : String(error);
+        deployDriftStatus = {
+          ...deployDriftStatus,
+          last_error: lastError,
+          last_tick_outcome:
+            lastError === 'duty_officer_deploy_drift_timeout' ? 'timed_out' : 'error',
+        };
+        log.error({ err: error }, 'duty_officer_deploy_drift_failed');
+      }
+    }
+
     if (!githubNudgeEnabled()) {
       log.info('duty_officer_github_nudge_skipped');
       return;
@@ -562,6 +680,7 @@ export async function tickDutyOfficerClock(
           build_sha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
           last_tick_completed_at: now.toISOString(),
           security_detector: detectorStatus,
+          deploy_drift: deployDriftStatus,
         },
         max_concurrency: 1,
       });
