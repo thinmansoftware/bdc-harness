@@ -37,6 +37,8 @@ import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
 const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
 const FLAG_MERGE_READY = 'flag_merge_ready';
+const RECEIPT_MARKER = '<!-- merge-manager-receipt -->';
+const RECEIPT_KEY_PREFIX = '<!-- merge-manager-receipt-key';
 export type MergeExecutionRepoConfig = Readonly<Record<string, { readonly baseBranch: string }>>;
 
 export interface MergeExecutionBridgeStore {
@@ -332,6 +334,85 @@ async function resolveMergeTarget(
   };
 }
 
+/**
+ * The receipt body is a documented ASCII/no-at-sign artifact (see the test
+ * `receipt body is ASCII and contains no at-sign`): it must never let a
+ * dynamic field trigger a GitHub @mention or inject non-ASCII bytes. Branch
+ * names and repo identities are attacker-influenced (a PR author picks their
+ * own branch name), so every dynamic field is sanitized before interpolation:
+ * '@' is replaced (GitHub mentions trigger on a bare '@handle', including
+ * inside inline code spans -- backticks alone are not a safe boundary), and
+ * any byte outside printable ASCII (0x20-0x7E) is stripped.
+ */
+function sanitizeReceiptField(value: string): string {
+  return value
+    .replace(/@/g, '(at)')
+    .split('')
+    .filter(ch => {
+      const code = ch.codePointAt(0) ?? 0;
+      return code >= 0x20 && code <= 0x7e;
+    })
+    .join('');
+}
+
+function receiptKey(verdict: OverseerVerdictRow): string {
+  const keyField = (value: string): string =>
+    sanitizeReceiptField(value).replace(/[^A-Za-z0-9._:-]/g, '_');
+  return `${RECEIPT_KEY_PREFIX} verdict=${keyField(verdict.id)} head=${keyField(
+    verdict.head_sha
+  )} -->`;
+}
+
+async function postMergeReceiptComment(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  pr: PullRequestEvidence,
+  input: { mergeSha?: string; baseBranch?: string; policyLabel?: string }
+): Promise<void> {
+  if (!options.github.commentOnPullRequest) {
+    log.warn(
+      { verdictId: verdict.id, prUrl: pr.htmlUrl },
+      'merge-coordinator.receipt_comment_unavailable'
+    );
+    return;
+  }
+  if (!pr.pr) return;
+  try {
+    const expectedReceiptKey = receiptKey(verdict);
+    const commentAuthorLogin = options.github.commentAuthorLogin?.trim().toLowerCase();
+    if (options.github.listPullRequestComments && commentAuthorLogin) {
+      const existing = await options.github.listPullRequestComments(pr.pr);
+      if (
+        existing.some(
+          comment =>
+            comment.authorLogin.trim().toLowerCase() === commentAuthorLogin &&
+            comment.body.split(/\r?\n/).some(line => line.trim() === expectedReceiptKey)
+        )
+      ) {
+        return;
+      }
+    }
+    const mergeShort = sanitizeReceiptField((input.mergeSha ?? 'unknown').slice(0, 8));
+    const baseBranch = sanitizeReceiptField(
+      input.baseBranch && input.baseBranch.length > 0 ? input.baseBranch : 'unknown'
+    );
+    const policyLabel = sanitizeReceiptField(
+      input.policyLabel && input.policyLabel.length > 0 ? input.policyLabel : 'unknown'
+    );
+    const body = [
+      RECEIPT_MARKER,
+      expectedReceiptKey,
+      `Merged by the merge manager (unattended): Overseer verdict ${verdict.id.slice(0, 8)} APPROVED at head ${verdict.head_sha.slice(0, 8)}, checks green, base ${baseBranch}, policy ${policyLabel}. Merge commit ${mergeShort}.`,
+    ].join('\n');
+    await options.github.commentOnPullRequest({ ...pr.pr, body });
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+      'merge-coordinator.receipt_comment_failed'
+    );
+  }
+}
+
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
@@ -491,6 +572,12 @@ async function mergeClaimedVerdict(
     },
     'merge-coordinator.merge_executed'
   );
+  const ownerRepo = pr.pr !== undefined ? `${pr.pr.owner}/${pr.pr.repo}` : 'unknown';
+  await postMergeReceiptComment(options, verdict, pr, {
+    mergeSha: merged.mergeSha ?? merged.sha,
+    baseBranch: pr.baseBranch,
+    policyLabel: `${ownerRepo}:${pr.baseBranch ?? 'unknown'}`,
+  });
   return undefined;
 }
 

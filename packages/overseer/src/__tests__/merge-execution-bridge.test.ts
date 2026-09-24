@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
+import { rootLogger } from '@archon/paths';
 import {
   runMergeExecutionBridgeOnce,
   type MergeExecutionBridgeStore,
@@ -59,7 +60,12 @@ function policy(merge = true, emergencyStop = false, serviceEnabled = true, lega
   } as const;
 }
 
-function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges = 0) {
+function harness(
+  rows: OverseerVerdictRow[],
+  evidence = greenPr(),
+  recentMerges = 0,
+  githubExtras: Partial<GitHubClientDeps> = {}
+) {
   const pending = [...rows];
   const outcomes: { verdictId: string; mutationSent: boolean; reason: string }[] = [];
   const claimReleases: { verdictId: string; reason: string }[] = [];
@@ -116,6 +122,7 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
       merges += 1;
       return { merged: true, mergeSha: 'merge-sha' };
     },
+    ...githubExtras,
   };
   return {
     store,
@@ -132,6 +139,36 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
       return occupied;
     },
   };
+}
+
+function captureRootLogLines(): { lines: string[]; restore: () => void } {
+  const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+    symbol => symbol.description === 'pino.stream'
+  );
+  if (!streamSymbol) throw new Error('pino.stream symbol missing on rootLogger');
+  const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+    streamSymbol
+  ];
+  const lines: string[] = [];
+  const write = spyOn(stream, 'write').mockImplementation(line => {
+    lines.push(String(line));
+  });
+  return { lines, restore: () => write.mockRestore() };
+}
+
+function expectCoordinatorWarn(
+  lines: string[],
+  msg: string,
+  fields: Record<string, unknown>
+): Record<string, unknown> {
+  const raw = lines.find(line => line.includes(msg));
+  expect(raw).toBeDefined();
+  const start = raw!.indexOf('{');
+  expect(start).toBeGreaterThanOrEqual(0);
+  const parsed = JSON.parse(raw!.slice(start)) as Record<string, unknown>;
+  expect(parsed.msg).toBe(msg);
+  expect(parsed).toEqual(expect.objectContaining(fields));
+  return parsed;
 }
 
 afterEach(() => {
@@ -778,5 +815,292 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(searches).toEqual([]);
     expect(h.merges).toBe(0);
     expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
+  });
+
+  test('receipt posts one comment with marker, head sha, and merge sha', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-once')], greenPr(), 0, {
+      listPullRequestComments: async () => [],
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain('<!-- merge-manager-receipt -->');
+    expect(bodies[0]).toContain('judged-s');
+    expect(bodies[0]).toContain('merge-sh');
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('receipt replay posts nothing when the marker comment already exists', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-replay')], greenPr(), 0, {
+      commentAuthorLogin: 'thinman-overseer[bot]',
+      listPullRequestComments: async () => [
+        {
+          body: [
+            '<!-- merge-manager-receipt -->',
+            '<!-- merge-manager-receipt-key verdict=receipt-replay head=judged-sha -->',
+          ].join('\n'),
+          authorLogin: 'thinman-overseer[bot]',
+        },
+      ],
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(bodies).toEqual([]);
+    expect(h.outcomes[0]?.reason).toBe('merge_executed');
+  });
+
+  test('a forged receipt marker from another author cannot suppress the authoritative receipt', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-forged-author')], greenPr(), 0, {
+      commentAuthorLogin: 'thinman-overseer[bot]',
+      listPullRequestComments: async () => [
+        {
+          body: '<!-- merge-manager-receipt -->\nforged receipt',
+          authorLogin: 'pull-request-author',
+        },
+      ],
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+
+    expect(bodies).toHaveLength(1);
+  });
+
+  test('a trusted receipt marker for a different verdict and head cannot suppress this receipt', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-bound')], greenPr(), 0, {
+      commentAuthorLogin: 'thinman-overseer[bot]',
+      listPullRequestComments: async () => [
+        {
+          body: [
+            '<!-- merge-manager-receipt -->',
+            '<!-- merge-manager-receipt-key verdict=other-verdict head=other-head -->',
+          ].join('\n'),
+          authorLogin: 'thinman-overseer[bot]',
+        },
+      ],
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain(
+      '<!-- merge-manager-receipt-key verdict=receipt-bound head=judged-sha -->'
+    );
+  });
+
+  test('receipt comment failure stays non-fatal and keeps merge_executed', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness([verdict('receipt-fail')], greenPr(), 0, {
+        listPullRequestComments: async () => [],
+        commentOnPullRequest: async () => {
+          throw new Error('comment rejected');
+        },
+      });
+      await expect(
+        runMergeExecutionBridgeOnce({
+          store: h.store,
+          github: h.github,
+          readPolicy: () => policy(),
+        })
+      ).resolves.toBeUndefined();
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+      );
+      expect(h.claimReleases).toEqual([]);
+      expect(h.occupied).toBe(1);
+      const failed = expectCoordinatorWarn(
+        captured.lines,
+        'merge-coordinator.receipt_comment_failed',
+        {
+          verdictId: 'receipt-fail',
+          prUrl: 'https://github.test/pr/1',
+          module: 'overseer/merge-coordinator',
+        }
+      );
+      expect(failed.err).toEqual(expect.objectContaining({ message: 'comment rejected' }));
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('receipt is a no-throw when commentOnPullRequest is absent', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness([verdict('receipt-absent')]);
+      expect(h.github.commentOnPullRequest).toBeUndefined();
+      await expect(
+        runMergeExecutionBridgeOnce({
+          store: h.store,
+          github: h.github,
+          readPolicy: () => policy(),
+        })
+      ).resolves.toBeUndefined();
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+      );
+      expect(h.claimReleases).toEqual([]);
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.receipt_comment_unavailable', {
+        verdictId: 'receipt-absent',
+        prUrl: 'https://github.test/pr/1',
+        module: 'overseer/merge-coordinator',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('receipt skip, hold, and failed merge post no comment', async () => {
+    const bodies: string[] = [];
+    const commentOnPullRequest = async (input: {
+      body: string;
+    }): Promise<{ commented: boolean }> => {
+      bodies.push(input.body);
+      return { commented: true };
+    };
+    const skipped = harness(
+      [verdict('receipt-skip')],
+      greenPr({ checks: { total: 1, passed: 0, failed: 0, pending: 1 } }),
+      0,
+      { commentOnPullRequest }
+    );
+    await runMergeExecutionBridgeOnce({
+      store: skipped.store,
+      github: skipped.github,
+      readPolicy: () => policy(),
+    });
+    const held = harness([verdict('receipt-hold')], greenPr(), 4, { commentOnPullRequest });
+    await runMergeExecutionBridgeOnce({
+      store: held.store,
+      github: held.github,
+      readPolicy: () => policy(),
+      maxMergesPerHour: 4,
+    });
+    const failed = harness([verdict('receipt-failed')], greenPr(), 0, {
+      commentOnPullRequest,
+      mergePullRequest: async () => ({ merged: false, message: 'merge_failed' }),
+    });
+    await runMergeExecutionBridgeOnce({
+      store: failed.store,
+      github: failed.github,
+      readPolicy: () => policy(),
+    });
+    expect(bodies).toEqual([]);
+    expect(skipped.outcomes[0]?.reason).toBe('required_checks_not_success');
+    expect(held.claimReleases).toEqual([
+      { verdictId: 'receipt-hold', reason: 'rate_ceiling_deferred' },
+    ]);
+    expect(failed.outcomes[0]?.reason).toBe('merge_failed');
+  });
+
+  test('receipt body is ASCII and contains no at-sign', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-ascii')], greenPr(), 0, {
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(bodies).toHaveLength(1);
+    const body = bodies[0] ?? '';
+    expect(/^[\x00-\x7F]*$/.test(body)).toBe(true);
+    expect(body.includes('@')).toBe(false);
+    expect(body).toContain('policy thinmansoftware/bdc-harness:dev');
+  });
+
+  // Overseer review, PR #918, [major]: baseBranch and policyLabel are
+  // interpolated from live GitHub data. baseBranch itself is constrained by
+  // the repo allowlist gate (only 'dev'/'staging'/'main' reach the receipt),
+  // but policyLabel embeds the owner/repo identity, which is attacker-
+  // influenced on the run-less PR-discovery path (bdc-harness #846) -- a
+  // fork can be opened as 'owner' string content the bridge never validates
+  // as a GitHub handle shape. Unsanitized, this either breaks the documented
+  // ASCII/no-at-sign receipt contract or triggers an unwanted GitHub @mention.
+  test('receipt sanitizes an at-sign in the policy label owner/repo identity', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-adversarial-policy')], greenPr(), 0, {
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+      findPullRequest: async () => ({
+        ...greenPr(),
+        // A run/PR identity string is still attacker-influenced data flowing
+        // into policyLabel via `${ownerRepo}:${baseBranch}`.
+        pr: { owner: '@evil-owner', repo: 'bdc-harness', number: 1 },
+      }),
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(bodies).toHaveLength(1);
+    const body = bodies[0] ?? '';
+    expect(/^[\x00-\x7F]*$/.test(body)).toBe(true);
+    expect(body.includes('@')).toBe(false);
+    expect(body).toContain('policy (at)evil-owner/bdc-harness:dev');
+  });
+
+  test('receipt strips non-ASCII bytes from the policy label owner/repo identity', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-non-ascii-policy')], greenPr(), 0, {
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+      findPullRequest: async () => ({
+        ...greenPr(),
+        pr: { owner: 'thinman\u00e9soft\u00e8ware', repo: 'bdc-harness', number: 1 },
+      }),
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(bodies).toHaveLength(1);
+    const body = bodies[0] ?? '';
+    expect(/^[\x00-\x7F]*$/.test(body)).toBe(true);
+    expect(body).toContain('policy thinmansoftware/bdc-harness:dev');
   });
 });
