@@ -941,8 +941,9 @@ describe('moveDirAcrossDevices', () => {
     await symlink('a.txt', join(src, 'link'));
 
     const deps: MoveDirAcrossDevicesDeps = {
-      rename: async () => {
-        throw exdevError();
+      rename: async (from, to) => {
+        if (from === src) throw exdevError();
+        await rename(from, to);
       },
       cp,
       rm,
@@ -1002,6 +1003,7 @@ describe('moveDirAcrossDevices', () => {
     await writeFile(join(src, 'a.txt'), 'alpha');
     const cpError = new Error('disk full');
     const rmError = new Error('EACCES removing partial copy');
+    let partialDst = '';
     mockLogger.warn.mockClear();
 
     await expect(
@@ -1010,6 +1012,7 @@ describe('moveDirAcrossDevices', () => {
           throw exdevError();
         },
         cp: async (_from, to) => {
+          partialDst = to;
           await mkdir(to, { recursive: true });
           await writeFile(join(to, 'partial.txt'), 'x');
           throw cpError;
@@ -1020,12 +1023,74 @@ describe('moveDirAcrossDevices', () => {
       })
     ).rejects.toBe(cpError);
 
-    expect(existsSync(join(dst, 'partial.txt'))).toBe(true);
+    expect(partialDst).not.toBe(dst);
+    expect(existsSync(join(partialDst, 'partial.txt'))).toBe(true);
     expect(await readFile(join(src, 'a.txt'), 'utf8')).toBe('alpha');
     expect(mockLogger.warn).toHaveBeenCalledWith(
-      { err: rmError, path: dst },
+      { err: rmError, path: partialDst },
       'worktree_sweep_partial_copy_cleanup_failed'
     );
+  });
+
+  test('never cleans a destination another actor creates after fallback begins', async () => {
+    const src = join(root, 'src');
+    const dst = join(root, 'dst');
+    await mkdir(src);
+    await writeFile(join(src, 'a.txt'), 'alpha');
+    const cpError = new Error('copy interrupted by destination race');
+    let copyTarget = '';
+
+    await expect(
+      moveDirAcrossDevices(src, dst, {
+        rename: async () => {
+          throw exdevError();
+        },
+        cp: async (_from, to) => {
+          copyTarget = to;
+          await mkdir(dst);
+          await writeFile(join(dst, 'other-owner.txt'), 'do not delete');
+          if (to !== dst) {
+            await writeFile(join(to, 'partial.txt'), 'owned partial copy');
+          }
+          throw cpError;
+        },
+        rm,
+      })
+    ).rejects.toBe(cpError);
+
+    expect(await readFile(join(dst, 'other-owner.txt'), 'utf8')).toBe('do not delete');
+    expect(await readFile(join(src, 'a.txt'), 'utf8')).toBe('alpha');
+    expect(copyTarget).not.toBe(dst);
+    expect(existsSync(copyTarget)).toBe(false);
+  });
+
+  test('does not publish over a destination another actor creates during copy', async () => {
+    const src = join(root, 'src');
+    const dst = join(root, 'dst');
+    await mkdir(src);
+    await writeFile(join(src, 'a.txt'), 'alpha');
+    let copyTarget = '';
+
+    await expect(
+      moveDirAcrossDevices(src, dst, {
+        rename: async (from, to) => {
+          if (from === src) throw exdevError();
+          await rename(from, to);
+        },
+        cp: async (from, to, options) => {
+          copyTarget = to;
+          await cp(from, to, options);
+          await mkdir(dst);
+          await writeFile(join(dst, 'other-owner.txt'), 'do not replace');
+        },
+        rm,
+      })
+    ).rejects.toBeInstanceOf(MoveDirDestinationExistsError);
+
+    expect(await readFile(join(dst, 'other-owner.txt'), 'utf8')).toBe('do not replace');
+    expect(await readFile(join(src, 'a.txt'), 'utf8')).toBe('alpha');
+    expect(copyTarget).not.toBe(dst);
+    expect(existsSync(copyTarget)).toBe(false);
   });
 
   // Overseer review, bdc-harness#947, [major]: the EXDEV fallback used to
@@ -1044,22 +1109,25 @@ describe('moveDirAcrossDevices', () => {
     await mkdir(dst);
     await writeFile(join(dst, 'pre-existing.txt'), 'do not touch me');
     const cpSpy = mock(async () => undefined);
-    const rmSpy = mock(rm);
+    const removedPaths: string[] = [];
 
     await expect(
       moveDirAcrossDevices(src, dst, {
-        rename: async () => {
-          throw exdevError();
+        rename: async (from, to) => {
+          if (from === src) throw exdevError();
+          await rename(from, to);
         },
         cp: cpSpy,
-        rm: rmSpy,
+        rm: async (path, options) => {
+          removedPaths.push(path);
+          await rm(path, options);
+        },
       })
     ).rejects.toBeInstanceOf(MoveDirDestinationExistsError);
 
-    // cp/rm are never called on the pre-existing destination: no attempt was
-    // made to write onto it, and nothing was deleted trying to clean it up.
-    expect(cpSpy).not.toHaveBeenCalled();
-    expect(rmSpy).not.toHaveBeenCalled();
+    expect(cpSpy).toHaveBeenCalledTimes(1);
+    expect(removedPaths).toHaveLength(1);
+    expect(removedPaths[0]).not.toBe(dst);
     expect(await readFile(join(dst, 'pre-existing.txt'), 'utf8')).toBe('do not touch me');
     // The source is left in place too -- this failed move is a no-op, not a
     // partial one.
@@ -1075,8 +1143,9 @@ describe('moveDirAcrossDevices', () => {
     let caught: unknown;
     try {
       await moveDirAcrossDevices(src, dst, {
-        rename: async () => {
-          throw exdevError();
+        rename: async (from, to) => {
+          if (from === src) throw exdevError();
+          await rename(from, to);
         },
         cp,
         rm,
@@ -1121,8 +1190,10 @@ describe('sweepTerminalWorkflowWorktrees EXDEV fallback', () => {
   test('quarantines through the default move when rename returns EXDEV', async () => {
     const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-exdev');
     await setMtime(worktreePath, '2026-07-01T00:00:00Z');
-    const renameSpy = spyOn(fsPromises, 'rename').mockImplementation(async () => {
-      throw exdevError();
+    const realRename = fsPromises.rename;
+    const renameSpy = spyOn(fsPromises, 'rename').mockImplementation(async (from, to) => {
+      if (from === worktreePath) throw exdevError();
+      await realRename(from, to);
     });
 
     try {
