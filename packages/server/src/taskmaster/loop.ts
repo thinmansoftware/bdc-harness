@@ -39,6 +39,16 @@ import {
   usefulRateFloorBreached,
 } from './rules';
 import { validateProposal, type TmAllowedRecipient } from './guard';
+import {
+  buildEscalationCommentBody,
+  createDbEscalationDeliveryClaim,
+  createRealEscalationDeliveryDeps,
+  deliverEscalationToIssue,
+  parseGithubThreadRef,
+  parseOwnerLabel,
+  resolveEscalateToIssueEnabled,
+  type EscalationDeliveryDeps,
+} from './escalation-delivery';
 import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
@@ -54,6 +64,17 @@ import {
 } from './deadman';
 
 const log = createLogger('taskmaster/loop');
+
+/**
+ * One process-wide real escalation-delivery deps object, so its cached
+ * poster-login lookup (GET /user, used to trust only Taskmaster's own marker
+ * comments) runs once per token rather than once per escalation.
+ */
+let realEscalationDelivery: EscalationDeliveryDeps | null = null;
+function defaultEscalationDelivery(): EscalationDeliveryDeps {
+  realEscalationDelivery ??= createRealEscalationDeliveryDeps();
+  return realEscalationDelivery;
+}
 
 /** Ratified Q1 budgets. */
 export const MAX_EFFECTS_PER_TICK = 10;
@@ -199,6 +220,15 @@ export interface TaskmasterDeps {
   /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
   onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
   checkExpectations?: (now: Date) => Promise<void>;
+  /**
+   * GitHub-issue escalation delivery seam
+   * (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). Tests inject fake
+   * listIssueComments/postIssueComment; production defaults to
+   * createRealEscalationDeliveryDeps(). The per-issue delivery claim comes
+   * from escalationDelivery.claim when provided, else the database-backed
+   * claim when the real DAL is in use (no deps.db), else none.
+   */
+  escalationDelivery?: EscalationDeliveryDeps;
 }
 
 export interface TickResult {
@@ -1700,7 +1730,78 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
 
     try {
-      if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
+      const escalationIssue =
+        proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
+          ? parseGithubThreadRef(proposal.threadRef)
+          : null;
+      if (escalationIssue) {
+        // WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01: deliver the escalation as
+        // a GitHub issue comment (where the owner and Duty Officer look), not to
+        // the operator dispatch mailbox (a drain_on_start principal with no
+        // reader). The body is built from adoption content, NOT proposal.body,
+        // which is written for the operator-mailbox audience. No dispatch row
+        // exists for a GitHub-comment effect, so no expectation is registered.
+        //
+        // The two delivery results are journaled differently:
+        //   - posted:true  -> the row is 'sent' + graded 'delivered_to_issue'
+        //     (excluded from the M-155 useful-rate floor, like 'unheard') and
+        //     counts as a tick effect.
+        //   - posted:false -> NOTHING was delivered: either another attempt holds
+        //     the issue's delivery claim (suppressedBy 'claim_held') or a marker
+        //     comment inside the 72h cooldown already covers the issue
+        //     ('cooldown_marker'). The row is closed as 'expired' (the existing
+        //     "journaled, never performed, terminal for this key" outcome) with
+        //     proposal_json.suppressed=<reason>, and is NOT graded. It is not a
+        //     tick effect, does not mark the thread touched, and -- because the
+        //     per-item 24h intervention cap (interventions24hByThread), the
+        //     adoption attempt counts, and gradeSentActions all read only
+        //     outcome='sent' -- it consumes no intervention budget and never
+        //     enters the useful-rate floor.
+        //
+        // The per-issue claim (tm_escalation_claims, migration 057) is taken
+        // BEFORE the GitHub list+post, so two ticks or processes sharing the
+        // database cannot both pass the marker check and both post.
+        const adoptionRow = adoptionByRef.get(canonicalizeThreadRef(proposal.threadRef));
+        const body = buildEscalationCommentBody({
+          title: adoptionRow?.title ?? null,
+          threadRef: proposal.threadRef,
+          sinceIso: adoptionRow?.last_movement_at ?? adoptionRow?.source_updated_at ?? null,
+          nextAction: adoptionRow?.next_action ?? null,
+          ownerLabelLogin: parseOwnerLabel(adoptionRow?.labels_json),
+          nowMs,
+        });
+        const baseDelivery = deps.escalationDelivery ?? defaultEscalationDelivery();
+        const delivery: EscalationDeliveryDeps =
+          baseDelivery.claim || deps.db
+            ? baseDelivery
+            : { ...baseDelivery, claim: createDbEscalationDeliveryClaim() };
+        const delivered = await deliverEscalationToIssue(
+          { issue: escalationIssue, threadRef: proposal.threadRef, body },
+          delivery
+        );
+        if (!delivered.posted) {
+          const suppressed = delivered.suppressedBy ?? 'cooldown_marker';
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'expired',
+            JSON.stringify({ ...proposal, suppressed })
+          );
+          journalRow.outcome = 'expired';
+          result.expired += 1;
+          log.info(
+            {
+              actionType: proposal.type,
+              threadRef: proposal.threadRef,
+              idempotencyKey: proposal.idempotencyKey,
+              suppressed,
+            },
+            'taskmaster.escalation_suppressed'
+          );
+          continue;
+        }
+        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.gradeAction(journalRow.id, 'delivered_to_issue');
+      } else if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
         let resolveAdmission: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
           null;
         let rejectAdmission: ((error: unknown) => void) | null = null;

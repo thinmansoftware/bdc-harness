@@ -81,7 +81,7 @@ export interface DutyOfficerClockDeps {
   now?: () => Date;
 }
 
-function githubToken(): string | null {
+export function githubToken(): string | null {
   const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
   return token ? token : null;
 }
