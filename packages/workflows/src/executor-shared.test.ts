@@ -310,6 +310,156 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('Plain prompt with no loop variable.');
   });
+
+  it('does not substitute longer shell variables that start with $BASE_BRANCH', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'BASE_BRANCH_OVERRIDE=$(printf \'%s\' "$DECIDE_OUTPUT"); echo "$BASE_BRANCH_OVERRIDE" "$BASE_BRANCH_PR"',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toContain('$BASE_BRANCH_OVERRIDE');
+    expect(prompt).toContain('$BASE_BRANCH_PR');
+    expect(prompt).not.toContain('dev_OVERRIDE');
+    expect(prompt).not.toContain('dev_PR');
+  });
+
+  it('still substitutes exact $BASE_BRANCH with punctuation or slash boundaries', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'a: $BASE_BRANCH b: $BASE_BRANCH/x c: $BASE_BRANCH. d: $BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('a: dev b: dev/x c: dev. d: dev)');
+  });
+
+  it('substitutes $WORKFLOW_ID but leaves $WORKFLOW_ID_SUFFIX verbatim', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'ID: $WORKFLOW_ID and $WORKFLOW_ID_SUFFIX',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('ID: run-1 and $WORKFLOW_ID_SUFFIX');
+  });
+
+  it('substitutes $USER_MESSAGE but leaves $USER_MESSAGE_SUFFIX verbatim', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Msg: $USER_MESSAGE and $USER_MESSAGE_SUFFIX',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Msg: msg and $USER_MESSAGE_SUFFIX');
+  });
+
+  it('substitutes $ARGUMENTS but leaves $ARGUMENTS_SUFFIX verbatim', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Args: $ARGUMENTS and $ARGUMENTS_SUFFIX',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Args: msg and $ARGUMENTS_SUFFIX');
+  });
+
+  it('substitutes $ARTIFACTS_DIR but leaves $ARTIFACTS_DIR_SUFFIX verbatim', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Dir: $ARTIFACTS_DIR and $ARTIFACTS_DIR_SUFFIX',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Dir: /tmp/artifacts and $ARTIFACTS_DIR_SUFFIX');
+  });
+
+  it('substitutes $DOCS_DIR but leaves $DOCS_DIR_SUFFIX verbatim', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Docs: $DOCS_DIR and $DOCS_DIR_SUFFIX',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Docs: docs/ and $DOCS_DIR_SUFFIX');
+  });
+
+  it('substitutes $LOOP_USER_INPUT but leaves $LOOP_USER_INPUT_SUFFIX verbatim', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Input: $LOOP_USER_INPUT and $LOOP_USER_INPUT_SUFFIX',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/',
+      undefined,
+      'feedback'
+    );
+    expect(prompt).toBe('Input: feedback and $LOOP_USER_INPUT_SUFFIX');
+  });
+
+  it('substitutes $REJECTION_REASON but leaves $REJECTION_REASON_SUFFIX verbatim', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Reason: $REJECTION_REASON and $REJECTION_REASON_SUFFIX',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      'too wide'
+    );
+    expect(prompt).toBe('Reason: too wide and $REJECTION_REASON_SUFFIX');
+  });
+
+  it('substitutes $LOOP_PREV_OUTPUT but leaves $LOOP_PREV_OUTPUT_SUFFIX verbatim', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Prev: $LOOP_PREV_OUTPUT and $LOOP_PREV_OUTPUT_SUFFIX',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      'previous'
+    );
+    expect(prompt).toBe('Prev: previous and $LOOP_PREV_OUTPUT_SUFFIX');
+  });
+
+  it('does not throw on $BASE_BRANCH_OVERRIDE when baseBranch is empty', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Override only: $BASE_BRANCH_OVERRIDE',
+      'run-1',
+      'msg',
+      '/tmp',
+      '',
+      'docs/'
+    );
+    expect(prompt).toBe('Override only: $BASE_BRANCH_OVERRIDE');
+  });
+
+  it('still throws on exact $BASE_BRANCH when baseBranch is empty', () => {
+    expect(() =>
+      substituteWorkflowVariables('Merge into $BASE_BRANCH', 'run-1', 'msg', '/tmp', '', 'docs/')
+    ).toThrow('No base branch could be resolved');
+  });
 });
 
 describe('buildPromptWithContext', () => {
