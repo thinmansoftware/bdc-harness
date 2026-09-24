@@ -1646,7 +1646,7 @@ nodes:
   - id: run-stop-greps
     persona: major-build
     load_bearing: true
-    depends_on: [ascii-gate]
+    depends_on: [format-autofix]
     task_class: clerical
     timeout: 600000
     bash: |
