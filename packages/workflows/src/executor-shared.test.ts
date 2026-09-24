@@ -353,7 +353,7 @@ describe('substituteWorkflowVariables', () => {
   for (const [name, value] of boundedVarCases) {
     it(`substitutes ${name} exactly and leaves ${name}_SUFFIX verbatim`, () => {
       const { prompt } = substituteWorkflowVariables(
-        `a=${name} b=${name}_SUFFIX`,
+        `a=$${name} b=$${name}_SUFFIX`,
         'WF_VAL',
         'MSG_VAL',
         '/artifacts',
@@ -364,7 +364,7 @@ describe('substituteWorkflowVariables', () => {
         'REJECT_VAL',
         'PREV_VAL'
       );
-      expect(prompt).toBe(`a=${value} b=${name}_SUFFIX`);
+      expect(prompt).toBe(`a=${value} b=$${name}_SUFFIX`);
       expect(prompt).toContain(`${name}_SUFFIX`);
     });
   }
