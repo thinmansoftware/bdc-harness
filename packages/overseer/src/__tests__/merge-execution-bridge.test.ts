@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
+import { rootLogger } from '@archon/paths';
 import {
   runMergeExecutionBridgeOnce,
   type MergeExecutionBridgeStore,
@@ -138,6 +139,36 @@ function harness(
       return occupied;
     },
   };
+}
+
+function captureRootLogLines(): { lines: string[]; restore: () => void } {
+  const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+    symbol => symbol.description === 'pino.stream'
+  );
+  if (!streamSymbol) throw new Error('pino.stream symbol missing on rootLogger');
+  const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+    streamSymbol
+  ];
+  const lines: string[] = [];
+  const write = spyOn(stream, 'write').mockImplementation(line => {
+    lines.push(String(line));
+  });
+  return { lines, restore: () => write.mockRestore() };
+}
+
+function expectCoordinatorWarn(
+  lines: string[],
+  msg: string,
+  fields: Record<string, unknown>
+): Record<string, unknown> {
+  const raw = lines.find(line => line.includes(msg));
+  expect(raw).toBeDefined();
+  const start = raw!.indexOf('{');
+  expect(start).toBeGreaterThanOrEqual(0);
+  const parsed = JSON.parse(raw!.slice(start)) as Record<string, unknown>;
+  expect(parsed.msg).toBe(msg);
+  expect(parsed).toEqual(expect.objectContaining(fields));
+  return parsed;
 }
 
 afterEach(() => {
@@ -829,40 +860,65 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
   });
 
   test('receipt comment failure stays non-fatal and keeps merge_executed', async () => {
-    const h = harness([verdict('receipt-fail')], greenPr(), 0, {
-      listPullRequestComments: async () => [],
-      commentOnPullRequest: async () => {
-        throw new Error('comment rejected');
-      },
-    });
-    await expect(
-      runMergeExecutionBridgeOnce({
-        store: h.store,
-        github: h.github,
-        readPolicy: () => policy(),
-      })
-    ).resolves.toBeUndefined();
-    expect(h.outcomes[0]).toEqual(
-      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
-    );
-    expect(h.claimReleases).toEqual([]);
-    expect(h.occupied).toBe(1);
+    const captured = captureRootLogLines();
+    try {
+      const h = harness([verdict('receipt-fail')], greenPr(), 0, {
+        listPullRequestComments: async () => [],
+        commentOnPullRequest: async () => {
+          throw new Error('comment rejected');
+        },
+      });
+      await expect(
+        runMergeExecutionBridgeOnce({
+          store: h.store,
+          github: h.github,
+          readPolicy: () => policy(),
+        })
+      ).resolves.toBeUndefined();
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+      );
+      expect(h.claimReleases).toEqual([]);
+      expect(h.occupied).toBe(1);
+      const failed = expectCoordinatorWarn(
+        captured.lines,
+        'merge-coordinator.receipt_comment_failed',
+        {
+          verdictId: 'receipt-fail',
+          prUrl: 'https://github.test/pr/1',
+          module: 'overseer/merge-coordinator',
+        }
+      );
+      expect(failed.err).toEqual(expect.objectContaining({ message: 'comment rejected' }));
+    } finally {
+      captured.restore();
+    }
   });
 
   test('receipt is a no-throw when commentOnPullRequest is absent', async () => {
-    const h = harness([verdict('receipt-absent')]);
-    expect(h.github.commentOnPullRequest).toBeUndefined();
-    await expect(
-      runMergeExecutionBridgeOnce({
-        store: h.store,
-        github: h.github,
-        readPolicy: () => policy(),
-      })
-    ).resolves.toBeUndefined();
-    expect(h.outcomes[0]).toEqual(
-      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
-    );
-    expect(h.claimReleases).toEqual([]);
+    const captured = captureRootLogLines();
+    try {
+      const h = harness([verdict('receipt-absent')]);
+      expect(h.github.commentOnPullRequest).toBeUndefined();
+      await expect(
+        runMergeExecutionBridgeOnce({
+          store: h.store,
+          github: h.github,
+          readPolicy: () => policy(),
+        })
+      ).resolves.toBeUndefined();
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+      );
+      expect(h.claimReleases).toEqual([]);
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.receipt_comment_unavailable', {
+        verdictId: 'receipt-absent',
+        prUrl: 'https://github.test/pr/1',
+        module: 'overseer/merge-coordinator',
+      });
+    } finally {
+      captured.restore();
+    }
   });
 
   test('receipt skip, hold, and failed merge post no comment', async () => {
