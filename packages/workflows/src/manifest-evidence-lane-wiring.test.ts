@@ -114,9 +114,9 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         }
       });
 
-      it('run-stop-tests runs after format-autofix with a 30-minute budget', () => {
+      it('run-stop-tests runs after format-autofix and install-worktree-deps with a 30-minute budget', () => {
         const n = node(nodes, 'run-stop-tests', file);
-        expect(n.depends_on).toEqual(['format-autofix']);
+        expect(n.depends_on).toEqual(['format-autofix', 'install-worktree-deps']);
         expect(n.timeout).toBe(1800000);
         expect(n.bash).toContain(
           "case \"$cmd\" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1"

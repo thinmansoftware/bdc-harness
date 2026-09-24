@@ -1185,6 +1185,344 @@ nodes:
       fi
       exit 0
 
+  - id: install-worktree-deps
+    persona: major-build
+    depends_on: [format-autofix]
+    task_class: clerical
+    timeout: 960000
+    bash: |
+      set -uo pipefail
+      # ---- BEGIN wdi core ----
+      # wdi_class   (spec on stdin -> CODE|INFRA|MIXED|DOCUMENTATION|OPERATOR; default CODE)
+      wdi_class() {
+        local c
+        c="$(grep -m1 -E '^[[:space:]]*(WO )?[Cc]lass:[[:space:]]*(CODE|INFRA|MIXED|DOCUMENTATION|DOCS|OPERATOR)' | sed -E 's/^[[:space:]]*(WO )?[Cc]lass:[[:space:]]*//' | grep -oE '^[A-Z]+' | head -1 || true)"
+        case "$c" in
+          CODE|INFRA|MIXED|DOCUMENTATION|OPERATOR) printf '%s' "$c" ;;
+          DOCS) printf 'DOCUMENTATION' ;;
+          *) printf 'CODE' ;;
+        esac
+      }
+      # Resolve ARTIFACTS_DIR without a literal $ARTIFACTS_DIR token, so workflow
+      # variable substitution leaves the bash default intact.
+      wdi_artifacts_dir() {
+        local name=ARTIFACTS_DIR
+        eval "printf '%s' \"\${$name:-.}\""
+      }
+      wdi_dir_has_lock() {
+        local d="$1"
+        [ -f "$d/bun.lock" ] || [ -f "$d/bun.lockb" ] || [ -f "$d/package-lock.json" ] || [ -f "$d/npm-shrinkwrap.json" ] || [ -f "$d/yarn.lock" ] || [ -f "$d/pnpm-lock.yaml" ]
+      }
+      # wdi_candidate_dirs   (-> "." then depth-1 lockfile dirs, LC_ALL=C by name, at most 4)
+      wdi_candidate_dirs() {
+        local d n=1 list
+        printf '.\n'
+        list="$(find . -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort)"
+        while IFS= read -r d; do
+          [ -z "$d" ] && continue
+          case "$d" in
+            node_modules|.git|dist|build) continue ;;
+          esac
+          wdi_dir_has_lock "$d" || continue
+          [ "$n" -ge 4 ] && break
+          printf '%s\n' "$d"
+          n=$((n + 1))
+        done <<< "$list"
+      }
+      # wdi_pick_manager <dir>   (-> bun|npm|yarn|pnpm|none; requires package.json)
+      wdi_pick_manager() {
+        local dir="$1"
+        [ -f "$dir/package.json" ] || { printf 'none'; return 0; }
+        if [ -f "$dir/bun.lock" ] || [ -f "$dir/bun.lockb" ]; then printf 'bun'
+        elif [ -f "$dir/package-lock.json" ] || [ -f "$dir/npm-shrinkwrap.json" ]; then printf 'npm'
+        elif [ -f "$dir/yarn.lock" ]; then printf 'yarn'
+        elif [ -f "$dir/pnpm-lock.yaml" ]; then printf 'pnpm'
+        else printf 'none'
+        fi
+      }
+      wdi_lock_path() {
+        local dir="$1" mgr="$2"
+        case "$mgr" in
+          bun)
+            if [ -f "$dir/bun.lock" ]; then printf '%s\n' "$dir/bun.lock"; else printf '%s\n' "$dir/bun.lockb"; fi
+            ;;
+          npm)
+            if [ -f "$dir/package-lock.json" ]; then printf '%s\n' "$dir/package-lock.json"; else printf '%s\n' "$dir/npm-shrinkwrap.json"; fi
+            ;;
+          yarn) printf '%s\n' "$dir/yarn.lock" ;;
+          pnpm) printf '%s\n' "$dir/pnpm-lock.yaml" ;;
+        esac
+      }
+      # wdi_scrub_env   (same credential set as rst_scrub_env; call inside a subshell)
+      wdi_scrub_env() {
+        local name
+        for name in $(env | sed -n 's/=.*//p'); do
+          case "$name" in
+            *_TEST_*) continue ;;
+            OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL)
+              unset "$name"
+              ;;
+          esac
+        done
+      }
+      # wdi_status_paths   (-> NUL-delimited worktree paths on stdout, sorted+deduped)
+      #
+      # Porcelain v1 (even with --untracked-files=all) C-quotes any filename
+      # containing a tab, newline, quote, backslash, or (with default
+      # core.quotepath) a non-ASCII byte, and a literal " -> " inside a
+      # filename is indistinguishable from the rename-arrow separator when
+      # parsed as text. `-z` disables both quoting and the text separator:
+      # each record is <status><space><path>\0, and for a rename/copy record
+      # the destination path is followed by a SECOND NUL-terminated record
+      # holding the source path (not "status -> path" on one line). Both the
+      # destination and the rename source are real worktree paths that must
+      # be tracked for fingerprinting/cleanup.
+      wdi_status_paths() {
+        local entry status path source
+        while IFS= read -r -d '' entry; do
+          [ "${#entry}" -ge 4 ] || continue
+          status="${entry:0:2}"
+          path="${entry:3}"
+          printf '%s\0' "$path"
+          case "$status" in
+            R*|C*|?R|?C)
+              # With -z, Git emits the destination in entry and the source
+              # as the next NUL record. Both paths must participate in
+              # cleanup so an install-created rename restores the source and
+              # removes the destination.
+              if IFS= read -r -d '' source; then
+                printf '%s\0' "$source"
+              fi
+              ;;
+          esac
+        done < <(git status --porcelain=v1 -z --untracked-files=all) |
+          LC_ALL=C sort -zu
+      }
+      # wdi_fingerprint_paths <paths-file>
+      # stdout is repeating NUL-delimited path/hash record pairs.
+      #
+      # A porcelain PATH SET alone cannot see a lifecycle script that mutates
+      # the CONTENT of a path already dirty before install, or an existing
+      # untracked path -- the path was already in the before/after set either
+      # way, so a pure path-set diff is silent on this class of corruption.
+      # `git hash-object` covers a tracked-or-untracked file identically (it
+      # hashes whatever bytes are on disk right now, independent of the index);
+      # a path that no longer exists (deleted mid-install) fingerprints as the
+      # literal token "missing" so a delete is still a detected difference.
+      wdi_fingerprint_paths() {
+        local pathsfile="$1" path hash
+        while IFS= read -r -d '' path; do
+          if [ -e "$path" ] && [ ! -d "$path" ]; then
+            hash="$(git hash-object -- "$path" 2>/dev/null || echo unreadable)"
+          else
+            hash="missing"
+          fi
+          printf '%s\0%s\0' "$path" "$hash"
+        done < "$pathsfile"
+      }
+      # wdi_revert_new <before-paths> <after-paths> <before-fp> <after-fp>
+      #
+      # Walks the UNION of both porcelain snapshots (not just paths added
+      # during install) so a path already dirty (or already untracked) before
+      # install, whose CONTENT changed during install, is visited too -- a
+      # pure "new paths only" sweep never looks at that path at all, which is
+      # the gap this fix closes.
+      #
+      # A path present in BOTH snapshots with an unchanged fingerprint needs
+      # no action. A path present in both snapshots with a CHANGED
+      # fingerprint is a mutation of pre-existing content (already-dirty
+      # tracked, or an existing untracked file) -- `git checkout` would
+      # restore HEAD's copy, not the pre-install DIRTY copy, so silently
+      # "reverting" it would destroy real work the caller never asked to
+      # touch. There is no safe local revert for that case: the path is left
+      # exactly as the install left it and recorded in WDI_UNSAFE_MUTATIONS as
+      # newline-separated, shell-escaped display paths so the caller
+      # (wdi_install_dir) can fail loudly instead of installing over it.
+      #
+      # A brand-new path (in `after` only) is safe to remove/restore --
+      # nothing existed there before this install touched it. A path that
+      # disappeared (in `before` only) is an unsafe mutation because its
+      # pre-install bytes are no longer available to restore.
+      wdi_revert_new() {
+        local before="$1" after="$2" beforefp="$3" afterfp="$4"
+        local path hash before_present after_present quoted
+        declare -A before_hash=() after_hash=() before_seen=() after_seen=()
+        WDI_UNSAFE_MUTATIONS=""
+        while IFS= read -r -d '' path && IFS= read -r -d '' hash; do
+          before_seen["$path"]=1
+          before_hash["$path"]="$hash"
+        done < "$beforefp"
+        while IFS= read -r -d '' path && IFS= read -r -d '' hash; do
+          after_seen["$path"]=1
+          after_hash["$path"]="$hash"
+        done < "$afterfp"
+        while IFS= read -r -d '' path; do
+          before_present="${before_seen[$path]+yes}"
+          after_present="${after_seen[$path]+yes}"
+          if [ -n "$before_present" ] && [ -n "$after_present" ]; then
+            if [ "${before_hash[$path]}" != "${after_hash[$path]}" ]; then
+              printf -v quoted '%q' "$path"
+              WDI_UNSAFE_MUTATIONS="$(printf '%s\n%s' "$WDI_UNSAFE_MUTATIONS" "$quoted")"
+            fi
+            continue
+          fi
+          if [ -z "$before_present" ] && [ -n "$after_present" ]; then
+            # Added-only: safe to remove/restore.
+            if git checkout HEAD -- "$path" >/dev/null 2>&1; then
+              :
+            else
+              git reset -q HEAD -- "$path" >/dev/null 2>&1 || true
+              rm -rf -- "$path"
+            fi
+          fi
+          if [ -n "$before_present" ] && [ -z "$after_present" ]; then
+            # A pre-existing untracked path disappeared. Its original bytes
+            # are unavailable, so claiming dirty_reverted would be false.
+            printf -v quoted '%q' "$path"
+            WDI_UNSAFE_MUTATIONS="$(printf '%s\n%s' "$WDI_UNSAFE_MUTATIONS" "$quoted")"
+          fi
+        done < <(LC_ALL=C sort -zu "$before" "$after")
+        WDI_UNSAFE_MUTATIONS="${WDI_UNSAFE_MUTATIONS#$'\n'}"
+      }
+      wdi_cache_report() {
+        local wt a b
+        wt="$(pwd -P)"
+        WDI_BUN_CACHE=""
+        if printf '%s\n' "$wt" | grep -q '/worktrees/'; then
+          WDI_BUN_CACHE="${wt%%/worktrees/*}/.deps-cache/bun"
+          DEPS_CACHE_DIR="$WDI_BUN_CACHE"
+          mkdir -p "$WDI_BUN_CACHE"
+          a="$(stat -c %d "$wt" 2>/dev/null || true)"
+          b="$(stat -c %d "$WDI_BUN_CACHE" 2>/dev/null || true)"
+          if [ -z "$a" ] || [ -z "$b" ]; then DEPS_CACHE_SAME_FS=unknown
+          elif [ "$a" = "$b" ]; then DEPS_CACHE_SAME_FS=true
+          else DEPS_CACHE_SAME_FS=false
+          fi
+        else
+          DEPS_CACHE_DIR=default
+          DEPS_CACHE_SAME_FS=unknown
+        fi
+      }
+      # wdi_install_dir <dir> <log>   (-> one status word on stdout)
+      wdi_install_dir() {
+        local dir="$1" log="$2" mgr ign free min lock hash stamp want
+        local before after beforefp afterfp tout rc dirty=0 mutated=0
+        WDI_UNSAFE_MUTATIONS=""
+        if [ ! -f "$dir/package.json" ]; then printf 'skipped_no_package_json'; return 0; fi
+        mgr="$(wdi_pick_manager "$dir")"
+        if [ "$mgr" = "none" ]; then printf 'skipped_no_lockfile'; return 0; fi
+        if ! command -v "$mgr" >/dev/null 2>&1; then printf 'skipped_no_tool'; return 0; fi
+        if [ "$dir" = "." ]; then ign="node_modules"; else ign="$dir/node_modules"; fi
+        if ! git check-ignore -q -- "$ign"; then printf 'skipped_not_ignored'; return 0; fi
+        free="$(df -Pk . | awk 'NR==2 { print $4 }')"
+        min="${WDI_MIN_FREE_KB:-2097152}"
+        if [ "${free:-0}" -lt "$min" ]; then printf 'skipped_low_disk'; return 0; fi
+        lock="$(wdi_lock_path "$dir" "$mgr")"
+        hash="$(sha256sum "$lock" | awk '{ print $1 }')"
+        stamp="$dir/node_modules/.archon-wdi-stamp"
+        want="$mgr $hash"
+        if [ -f "$stamp" ] && [ "$(tr -d '\n' < "$stamp")" = "$want" ]; then printf 'cached'; return 0; fi
+        before="$(mktemp)"
+        after="$(mktemp)"
+        beforefp="$(mktemp)"
+        afterfp="$(mktemp)"
+        wdi_status_paths > "$before"
+        wdi_fingerprint_paths "$before" > "$beforefp"
+        tout="${WDI_TIMEOUT_SECS:-600}"
+        printf '### wdi: dir=%s manager=%s\n' "$dir" "$mgr" >> "$log"
+        (
+          wdi_scrub_env
+          cd "$dir" || exit 97
+          if [ "$mgr" = "bun" ] && [ -n "${WDI_BUN_CACHE:-}" ]; then
+            export BUN_INSTALL_CACHE_DIR="$WDI_BUN_CACHE"
+          fi
+          case "$mgr" in
+            bun) timeout "$tout" bun install --frozen-lockfile ;;
+            npm) timeout "$tout" npm ci --no-audit --no-fund ;;
+            yarn) timeout "$tout" yarn install --frozen-lockfile ;;
+            pnpm) timeout "$tout" pnpm install --frozen-lockfile ;;
+          esac
+        ) >> "$log" 2>&1
+        rc=$?
+        wdi_status_paths > "$after"
+        # Fingerprint the UNION of both path snapshots, read from disk as it
+        # stands right now (post-install): a short-circuit on
+        # `cmp -s "$before" "$after"` here would be the exact gap this fix
+        # closes -- an unchanged PATH SET says nothing about whether a path's
+        # CONTENT moved, so the fingerprint pass always runs, not only when
+        # the path set itself differs.
+        LC_ALL=C sort -zu "$before" "$after" > "$afterfp.union"
+        wdi_fingerprint_paths "$afterfp.union" > "$afterfp"
+        rm -f "$afterfp.union"
+        if ! cmp -s "$before" "$after" || ! cmp -s "$beforefp" "$afterfp"; then
+          dirty=1
+          wdi_revert_new "$before" "$after" "$beforefp" "$afterfp"
+        fi
+        if [ -n "${WDI_UNSAFE_MUTATIONS:-}" ]; then
+          mutated=1
+          printf 'wdi: unsafe content mutation, left as-is (not reverted): %s\n' "$WDI_UNSAFE_MUTATIONS" >> "$log"
+        fi
+        rm -f "$before" "$after" "$beforefp" "$afterfp"
+        if [ "$mutated" -eq 1 ]; then printf 'failed_mutation'; return 0; fi
+        if [ "$rc" -eq 124 ]; then printf 'failed_timeout'; return 0; fi
+        if [ "$rc" -ne 0 ]; then printf 'failed_exit_%s' "$rc"; return 0; fi
+        if [ "$dirty" -eq 1 ]; then printf 'dirty_reverted'; return 0; fi
+        mkdir -p "$dir/node_modules"
+        printf '%s\n' "$want" > "$stamp"
+        printf 'installed'
+      }
+      # wdi_main   (spec on stdin; always returns 0; prints DEPS_* keys then log tail)
+      wdi_main() {
+        local spec class logdir log t0 t1 budget start dir st elapsed
+        local dirs_out="" status="skipped" any_fail=0 any_ok=0
+        spec="$(cat)"
+        class="$(printf '%s\n' "$spec" | wdi_class)"
+        logdir="$(wdi_artifacts_dir)/evidence"
+        mkdir -p "$logdir"
+        log="$logdir/deps-install.log"
+        : > "$log"
+        t0="$(date +%s)"
+        wdi_cache_report
+        if [ "$class" = "DOCUMENTATION" ] || [ "$class" = "OPERATOR" ]; then
+          status="not_required"
+        else
+          budget="${WDI_BUDGET_SECS:-900}"
+          start="$(date +%s)"
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            elapsed=$(( $(date +%s) - start ))
+            if [ "$elapsed" -ge "$budget" ]; then
+              st="skipped_budget"
+            else
+              st="$(wdi_install_dir "$dir" "$log")"
+            fi
+            if [ -n "$dirs_out" ]; then dirs_out="$dirs_out;$dir:$st"; else dirs_out="$dir:$st"; fi
+            case "$st" in
+              failed_*) any_fail=1 ;;
+              installed|cached) any_ok=1 ;;
+            esac
+          done <<< "$(wdi_candidate_dirs)"
+          if [ "$any_fail" -eq 1 ]; then status="failed"
+          elif [ "$any_ok" -eq 1 ]; then status="installed"
+          else status="skipped"
+          fi
+        fi
+        t1="$(date +%s)"
+        printf 'DEPS_CLASS=%s\n' "$class"
+        printf 'DEPS_STATUS=%s\n' "$status"
+        printf 'DEPS_DIRS=%s\n' "$dirs_out"
+        printf 'DEPS_SECONDS=%s\n' "$((t1 - t0))"
+        printf 'DEPS_CACHE_DIR=%s\n' "$DEPS_CACHE_DIR"
+        printf 'DEPS_CACHE_SAME_FS=%s\n' "$DEPS_CACHE_SAME_FS"
+        printf 'DEPS_LOG=%s\n' "$log"
+        tail -n 40 "$log"
+        return 0
+      }
+      # ---- END wdi core ----
+      SPEC=$read-spec.output
+      printf '%s\n' "$SPEC" | wdi_main || true
+      exit 0
+
   # bdc-xo #1940 (harness defect 2026-09-05: shopops #674 run 69f9d306, lspro-react #580
   # run d31037ff). The engine-side build-manifest renders "Tests: N/A (required gates are
   # reported separately)" and "Grep assertions: N/A" for every WO, and the validator's
@@ -1198,7 +1536,7 @@ nodes:
   - id: run-stop-tests
     persona: major-build
     load_bearing: true
-    depends_on: [format-autofix]
+    depends_on: [format-autofix, install-worktree-deps]
     task_class: clerical
     timeout: 1800000
     bash: |
@@ -1354,13 +1692,14 @@ nodes:
       rst_extract_commands() {
         awk -v RUNNER='(^|[ /&|;(])(node|bun|bunx|npm|npm[.]cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)( |$)' '
           function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
-          function emit(c) { c = clean(c); if (c != "" && !(c in seen)) { seen[c] = 1; print c } }
+          function emit_a(c) { c = clean(c); if (c != "" && !(c in aseen)) { aseen[c] = 1; acmd[++an] = c } }
+          function emit_bc(c) { c = clean(c); if (c != "" && !(c in bcseen)) { bcseen[c] = 1; bccmd[++bcn] = c } }
           tstate == 1 {
             if ($0 ~ /^[ \t]*```/) next
             line = clean($0)
             if (line == "") next
-            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0; next }
-            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0 }
+            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit_a(tcmd); tcmd = ""; tstate = 0; next }
+            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { if (tcmd != "") emit_a(tcmd); tcmd = ""; tstate = 0 }
             else { tcmd = (tcmd == "" ? line : tcmd " " line); sub(/[ \t]*\\$/, "", tcmd); next }
           }
           tstate == 0 && /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Tt]est|[Uu]nit|[Ss]uite)/ { tstate = 1; tcmd = ""; next }
@@ -1369,17 +1708,21 @@ nodes:
             s = $0
             while (match(s, /`[^`]+`/)) {
               g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
-              if (g ~ RUNNER) emit(g)
+              if (g ~ RUNNER) emit_bc(g)
             }
           }
           /^[ \t]*Tests:[ \t]/ {
             s = $0
             while (match(s, /\([^)]*\)/)) {
               g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
-              if (g ~ RUNNER) emit(g)
+              if (g ~ RUNNER) emit_bc(g)
             }
           }
-          END { if (tstate == 1 && tcmd != "") emit(tcmd) }
+          END {
+            if (tstate == 1 && tcmd != "") emit_a(tcmd)
+            if (an > 0) { for (i = 1; i <= an; i++) print acmd[i] }
+            else { for (i = 1; i <= bcn; i++) print bccmd[i] }
+          }
         ' | head -n 8
       }
       # rst_rescue_subdir <cmd>   (-> cmd, or "cd <dir> && <cmd>" when the command's first
