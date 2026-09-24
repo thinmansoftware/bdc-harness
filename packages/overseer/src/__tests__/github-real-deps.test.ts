@@ -7,6 +7,7 @@ import { createAppAuth } from '@octokit/auth-app';
 import {
   createRealApprovePullRequest,
   createRealFindPullRequest,
+  createRealGitHubClientDeps,
   createRealMergePullRequest,
   resolveGitHubAppAuth,
   resolveRealOctokitAuthOptions,
@@ -701,4 +702,70 @@ dNull('mergeable:null retry', () => {
     },
     15000
   );
+});
+
+// THE PAGINATION HOLE (Overseer review, PR #918, [minor]): `per_page: 100`
+// unpaginated on listPullRequestComments meant a receipt marker posted before
+// comment 101 was invisible to the idempotency check, letting a redelivery
+// duplicate the merge receipt on any PR with a busy comment thread.
+describe('createRealGitHubClientDeps listPullRequestComments -- pagination', () => {
+  function octokitWithComments(bodies: string[]): {
+    octokit: RealGitHubOctokitLike;
+    pageLog: number[];
+  } {
+    const pageLog: number[] = [];
+    const octokit = {
+      pulls: {
+        list: async () => ({ data: [] }),
+        get: async () => {
+          throw new Error('pulls.get not used by this test');
+        },
+        merge: async () => ({ data: { merged: false } }),
+      },
+      issues: {
+        createComment: async () => ({ data: { html_url: 'https://github.test/comment' } }),
+        listComments: async (input: { per_page: number; page?: number }) => {
+          const page = input.page ?? 1;
+          pageLog.push(page);
+          const start = (page - 1) * input.per_page;
+          return { data: bodies.slice(start, start + input.per_page).map(body => ({ body })) };
+        },
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+      search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
+    } as unknown as RealGitHubOctokitLike;
+    return { octokit, pageLog };
+  }
+
+  test('reads past comment 100 and finds a marker on page 2', async () => {
+    // createRealGitHubClientDeps also constructs a merge-identity client
+    // (M-153) that resolves a token at construction time, unrelated to the
+    // listPullRequestComments path under test here.
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+    const bodies = Array.from({ length: 100 }, (_, i) => `filler ${i}`);
+    bodies.push('<!-- merge-manager-receipt -->\nalready posted');
+    const { octokit, pageLog } = octokitWithComments(bodies);
+    const deps = createRealGitHubClientDeps(octokit);
+    const comments = await deps.listPullRequestComments?.({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 1,
+    });
+    expect(comments).toHaveLength(101);
+    expect(comments?.some(c => c.body.includes('<!-- merge-manager-receipt -->'))).toBe(true);
+    expect(pageLog).toEqual([1, 2]);
+  });
+
+  test('stops paginating on the first short page', async () => {
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+    const { octokit, pageLog } = octokitWithComments(['one comment']);
+    const deps = createRealGitHubClientDeps(octokit);
+    const comments = await deps.listPullRequestComments?.({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 1,
+    });
+    expect(comments).toHaveLength(1);
+    expect(pageLog).toEqual([1]);
+  });
 });

@@ -1200,6 +1200,14 @@ export function extractWoId(title: string, body: string | null | undefined): str
 const MAX_REVIEW_PAGES = 10;
 const REVIEW_PAGE_SIZE = 100;
 
+/**
+ * Hard ceiling on issue-comment pages read per idempotency check, so one
+ * pathological thread cannot spin the tick. 10 pages x 100 = 1000 comments,
+ * far above any real merge-manager-receipt PR thread.
+ */
+const MAX_ISSUE_COMMENT_PAGES = 10;
+const ISSUE_COMMENT_PAGE_SIZE = 100;
+
 interface GraphQLReviewDecisionNode {
   number?: number;
   reviewDecision?: string | null;
@@ -1683,13 +1691,35 @@ export function createRealGitHubClientDeps(
       if (!octokit.issues?.listComments) {
         throw new Error('overseer_real_adapter_missing_list_comments_api');
       }
-      const response = await octokit.issues.listComments({
-        owner: input.owner,
-        repo: input.repo,
-        issue_number: input.number,
-        per_page: 100,
-      });
-      return response.data.map(comment => ({ body: comment.body ?? '' }));
+      // Narrowed once outside the closure (octokit.issues is optional on the
+      // interface) so the call below can go through the receiver -- as a real
+      // client method requires -- without a forbidden non-null assertion.
+      const issuesApi = octokit.issues;
+      const listComments = (args: {
+        owner: string;
+        repo: string;
+        issue_number: number;
+        per_page: number;
+        page?: number;
+      }): Promise<{ data: { body?: string | null }[] }> =>
+        issuesApi.listComments?.(args) ?? Promise.resolve({ data: [] });
+      const comments: { body: string }[] = [];
+      for (let page = 1; page <= MAX_ISSUE_COMMENT_PAGES; page += 1) {
+        const response = await listComments({
+          owner: input.owner,
+          repo: input.repo,
+          issue_number: input.number,
+          per_page: ISSUE_COMMENT_PAGE_SIZE,
+          page,
+        });
+        const data = response.data ?? [];
+        for (const comment of data) {
+          comments.push({ body: comment.body ?? '' });
+        }
+        // A short page is the last page.
+        if (data.length < ISSUE_COMMENT_PAGE_SIZE) break;
+      }
+      return comments;
     },
     approvePullRequest: createRealApprovePullRequest(octokit),
     listOpenPullRequests: createRealListOpenPullRequests(octokit),

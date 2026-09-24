@@ -333,6 +333,27 @@ async function resolveMergeTarget(
   };
 }
 
+/**
+ * The receipt body is a documented ASCII/no-at-sign artifact (see the test
+ * `receipt body is ASCII and contains no at-sign`): it must never let a
+ * dynamic field trigger a GitHub @mention or inject non-ASCII bytes. Branch
+ * names and repo identities are attacker-influenced (a PR author picks their
+ * own branch name), so every dynamic field is sanitized before interpolation:
+ * '@' is replaced (GitHub mentions trigger on a bare '@handle', including
+ * inside inline code spans -- backticks alone are not a safe boundary), and
+ * any byte outside printable ASCII (0x20-0x7E) is stripped.
+ */
+function sanitizeReceiptField(value: string): string {
+  return value
+    .replace(/@/g, '(at)')
+    .split('')
+    .filter(ch => {
+      const code = ch.codePointAt(0) ?? 0;
+      return code >= 0x20 && code <= 0x7e;
+    })
+    .join('');
+}
+
 async function postMergeReceiptComment(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
@@ -352,11 +373,13 @@ async function postMergeReceiptComment(
       const existing = await options.github.listPullRequestComments(pr.pr);
       if (existing.some(comment => comment.body.includes(RECEIPT_MARKER))) return;
     }
-    const mergeShort = (input.mergeSha ?? 'unknown').slice(0, 8);
-    const baseBranch =
-      input.baseBranch && input.baseBranch.length > 0 ? input.baseBranch : 'unknown';
-    const policyLabel =
-      input.policyLabel && input.policyLabel.length > 0 ? input.policyLabel : 'unknown';
+    const mergeShort = sanitizeReceiptField((input.mergeSha ?? 'unknown').slice(0, 8));
+    const baseBranch = sanitizeReceiptField(
+      input.baseBranch && input.baseBranch.length > 0 ? input.baseBranch : 'unknown'
+    );
+    const policyLabel = sanitizeReceiptField(
+      input.policyLabel && input.policyLabel.length > 0 ? input.policyLabel : 'unknown'
+    );
     const body = [
       RECEIPT_MARKER,
       `Merged by the merge manager (unattended): Overseer verdict ${verdict.id.slice(0, 8)} APPROVED at head ${verdict.head_sha.slice(0, 8)}, checks green, base ${baseBranch}, policy ${policyLabel}. Merge commit ${mergeShort}.`,

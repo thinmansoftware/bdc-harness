@@ -983,4 +983,61 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(body.includes('@')).toBe(false);
     expect(body).toContain('policy thinmansoftware/bdc-harness:dev');
   });
+
+  // Overseer review, PR #918, [major]: baseBranch and policyLabel are
+  // interpolated from live GitHub data. baseBranch itself is constrained by
+  // the repo allowlist gate (only 'dev'/'staging'/'main' reach the receipt),
+  // but policyLabel embeds the owner/repo identity, which is attacker-
+  // influenced on the run-less PR-discovery path (bdc-harness #846) -- a
+  // fork can be opened as 'owner' string content the bridge never validates
+  // as a GitHub handle shape. Unsanitized, this either breaks the documented
+  // ASCII/no-at-sign receipt contract or triggers an unwanted GitHub @mention.
+  test('receipt sanitizes an at-sign in the policy label owner/repo identity', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-adversarial-policy')], greenPr(), 0, {
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+      findPullRequest: async () => ({
+        ...greenPr(),
+        // A run/PR identity string is still attacker-influenced data flowing
+        // into policyLabel via `${ownerRepo}:${baseBranch}`.
+        pr: { owner: '@evil-owner', repo: 'bdc-harness', number: 1 },
+      }),
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(bodies).toHaveLength(1);
+    const body = bodies[0] ?? '';
+    expect(/^[\x00-\x7F]*$/.test(body)).toBe(true);
+    expect(body.includes('@')).toBe(false);
+    expect(body).toContain('policy (at)evil-owner/bdc-harness:dev');
+  });
+
+  test('receipt strips non-ASCII bytes from the policy label owner/repo identity', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-non-ascii-policy')], greenPr(), 0, {
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+      findPullRequest: async () => ({
+        ...greenPr(),
+        pr: { owner: 'thinmanésoftèware', repo: 'bdc-harness', number: 1 },
+      }),
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(bodies).toHaveLength(1);
+    const body = bodies[0] ?? '';
+    expect(/^[\x00-\x7F]*$/.test(body)).toBe(true);
+    expect(body).toContain('policy thinmansoftware/bdc-harness:dev');
+  });
 });
