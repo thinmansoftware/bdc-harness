@@ -486,6 +486,210 @@ describe('SqliteAdapter', () => {
     });
   });
 
+  describe('tm_journal delivered_to_issue grade migration (migration 056 / WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01)', () => {
+    test('a pre-delivered_to_issue tm_journal table is rebuilt so it accepts the delivered_to_issue grade', async () => {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      // Pre-056 shape: the grade CHECK includes 'unheard' (post-055) but NOT
+      // 'delivered_to_issue' -- the exact on-disk shape migration 056 must widen.
+      legacy.run(`
+        CREATE TABLE tm_journal (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          thread_ref TEXT NOT NULL,
+          action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+          proposal_json TEXT NOT NULL,
+          idempotency_key TEXT,
+          before_hash TEXT,
+          proof_predicate TEXT,
+          proof_deadline_at TEXT,
+          outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+          graded_at TEXT,
+          grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
+        )
+      `);
+      legacy.run(`
+        INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome, grade)
+        VALUES ('legacy-056-1', '2026-09-01T00:00:00.000Z', 'thread-1', 'escalate_p0', '{}', 'sent', 'unheard')
+      `);
+      legacy.close();
+
+      // Reopening through SqliteAdapter must run the migration and rebuild the
+      // table with the widened CHECK, without losing the pre-existing row.
+      db = new SqliteAdapter(currentDbPath);
+
+      const schema = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+      );
+      expect(schema.rows[0]?.sql).toContain('delivered_to_issue');
+
+      const preserved = await db.query<{ id: string; grade: string | null }>(
+        `SELECT id, grade FROM tm_journal WHERE id = 'legacy-056-1'`
+      );
+      expect(preserved.rows).toEqual([{ id: 'legacy-056-1', grade: 'unheard' }]);
+
+      // The whole point of the migration: an INSERT grading a row
+      // 'delivered_to_issue' must now succeed against the migrated database.
+      await db.query(
+        `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome, grade)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          'legacy-056-2',
+          '2026-09-23T00:00:00.000Z',
+          'gh:thinmansoftware/bdc-harness#194',
+          'escalate_p0',
+          '{}',
+          'sent',
+          'delivered_to_issue',
+        ]
+      );
+      const graded = await db.query<{ grade: string | null }>(
+        `SELECT grade FROM tm_journal WHERE id = 'legacy-056-2'`
+      );
+      expect(graded.rows).toEqual([{ grade: 'delivered_to_issue' }]);
+    });
+
+    // Overseer review of PR #889 (head 84a8f479): DROP TABLE inside the
+    // CHECK-widening rebuild drops every index and trigger on tm_journal. The
+    // rebuild must recreate all of them in its own transaction. These tests
+    // build OLD-shape databases WITH their indexes and a trigger, upgrade them
+    // through SqliteAdapter, and inspect sqlite_master in the same process.
+    const CANONICAL_TM_JOURNAL_INDEXES = [
+      'idx_tm_journal_created',
+      'idx_tm_journal_idem',
+      'idx_tm_journal_thread',
+    ];
+
+    function legacyTmJournalDbWithDependents(createTableSql: string): void {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      legacy.run(createTableSql);
+      // The migration-041 indexes, exactly as a pre-rebuild database has them.
+      legacy.run(
+        'CREATE INDEX IF NOT EXISTS idx_tm_journal_thread ON tm_journal(thread_ref, created_at)'
+      );
+      legacy.run('CREATE INDEX IF NOT EXISTS idx_tm_journal_idem ON tm_journal(idempotency_key)');
+      legacy.run('CREATE INDEX IF NOT EXISTS idx_tm_journal_created ON tm_journal(created_at)');
+      // Objects createSchema() does not know about: they survive only if the
+      // rebuild replays what was on the table, not just a hardcoded list.
+      legacy.run('CREATE INDEX idx_tm_journal_outcome_legacy ON tm_journal(outcome)');
+      legacy.run(`
+        CREATE TRIGGER trg_tm_journal_no_delete_legacy BEFORE DELETE ON tm_journal
+        BEGIN SELECT RAISE(ABORT, 'tm_journal is append-only'); END
+      `);
+      legacy.run(`
+        INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, idempotency_key, outcome)
+        VALUES ('legacy-dep-1', '2026-09-01T00:00:00.000Z', 'thread-1', 'nudge', '{}', 'idem-1', 'sent')
+      `);
+      legacy.close();
+    }
+
+    async function expectTmJournalDependentsPreserved(adapter: SqliteAdapter): Promise<void> {
+      const indexes = await adapter.query<{ name: string }>(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'index' AND tbl_name = 'tm_journal' AND sql IS NOT NULL
+         ORDER BY name`
+      );
+      expect(indexes.rows.map(r => r.name)).toEqual(
+        [...CANONICAL_TM_JOURNAL_INDEXES, 'idx_tm_journal_outcome_legacy'].sort()
+      );
+      const triggers = await adapter.query<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'tm_journal'`
+      );
+      expect(triggers.rows.map(r => r.name)).toEqual(['trg_tm_journal_no_delete_legacy']);
+
+      // The replayed trigger is live, not just listed.
+      let deleteError: unknown;
+      try {
+        await adapter.query(`DELETE FROM tm_journal WHERE id = 'legacy-dep-1'`);
+      } catch (error: unknown) {
+        deleteError = error;
+      }
+      expect(String(deleteError)).toContain('tm_journal is append-only');
+
+      // The Taskmaster idempotency lookup is an index search, not a scan.
+      // SqliteAdapter.query() only returns rows for SELECT/RETURNING, so read
+      // the plan through a second handle on the same file, in this process.
+      const planDb = new Database(currentDbPath, { readonly: true });
+      try {
+        const plan = planDb
+          .prepare('EXPLAIN QUERY PLAN SELECT id FROM tm_journal WHERE idempotency_key = ?')
+          .all('idem-1') as { detail: string }[];
+        expect(plan.map(r => r.detail).join('\n')).toContain('USING INDEX idx_tm_journal_idem');
+      } finally {
+        planDb.close();
+      }
+
+      const preserved = await adapter.query<{ id: string }>(
+        `SELECT id FROM tm_journal WHERE idempotency_key = 'idem-1'`
+      );
+      expect(preserved.rows).toEqual([{ id: 'legacy-dep-1' }]);
+    }
+
+    test('the 056 rebuild of a pre-056 tm_journal preserves every index and trigger on the table', async () => {
+      legacyTmJournalDbWithDependents(`
+        CREATE TABLE tm_journal (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          thread_ref TEXT NOT NULL,
+          action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+          proposal_json TEXT NOT NULL,
+          idempotency_key TEXT,
+          before_hash TEXT,
+          proof_predicate TEXT,
+          proof_deadline_at TEXT,
+          outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+          graded_at TEXT,
+          grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
+        )
+      `);
+
+      db = new SqliteAdapter(currentDbPath);
+
+      const schema = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+      );
+      expect(schema.rows[0]?.sql).toContain('delivered_to_issue');
+      await expectTmJournalDependentsPreserved(db);
+    });
+
+    test('a pre-045 tm_journal upgraded through the 045, 055 and 056 rebuilds keeps every index and trigger', async () => {
+      // Four-verb, pre-'unheard' shape: all three rebuilds fire back to back,
+      // so each must hand the next one a table that still has its dependents.
+      legacyTmJournalDbWithDependents(`
+        CREATE TABLE tm_journal (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          thread_ref TEXT NOT NULL,
+          action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest')),
+          proposal_json TEXT NOT NULL,
+          idempotency_key TEXT,
+          before_hash TEXT,
+          proof_predicate TEXT,
+          proof_deadline_at TEXT,
+          outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+          graded_at TEXT,
+          grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful'))
+        )
+      `);
+
+      db = new SqliteAdapter(currentDbPath);
+
+      const schema = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+      );
+      expect(schema.rows[0]?.sql).toContain('fire_cauldron');
+      expect(schema.rows[0]?.sql).toContain('delivered_to_issue');
+      await expectTmJournalDependentsPreserved(db);
+    });
+  });
+
   describe('INSERT with RETURNING', () => {
     test('returns inserted row via native RETURNING', async () => {
       db = createTestDb();
