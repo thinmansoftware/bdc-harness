@@ -157,7 +157,27 @@ else
   fail "file outside the run scope stays unformatted" "rc=$RC output=[$OUT]"
 fi
 
-# 5. Static parity: every feature-dev lane with ascii-autofix also has format-autofix.
+# 5. A syntax error Prettier cannot rewrite -> FORMAT_STATUS=failed, exit 0.
+REPO5="$TMP/unfixable"
+ART5="$TMP/art5"
+mkdir -p "$ART5"
+init_repo "$REPO5"
+write_prettier_pkg "$REPO5"
+printf 'export const value = 1;\n' > "$REPO5/baseline.ts"
+git -C "$REPO5" add package.json baseline.ts
+git -C "$REPO5" commit -qm baseline
+printf 'export const value = {\n' > "$REPO5/broken.ts"
+git -C "$REPO5" add broken.ts
+printf '%s\n' 'broken.ts' > "$ART5/run-changed-source-files.txt"
+OUT=$(cd "$REPO5" && ARTIFACTS_DIR="$ART5" RUNNER="$PRETTIER_BIN" bash "$SCRIPT" 2>&1)
+RC=$?
+if [ "$RC" -eq 0 ] && grep -qx 'FORMAT_STATUS=failed' <<< "$OUT"; then
+  pass "unfixable syntax error prints FORMAT_STATUS=failed and does not block"
+else
+  fail "unfixable syntax error prints FORMAT_STATUS=failed and does not block" "rc=$RC output=[$OUT]"
+fi
+
+# 6. Static parity: every feature-dev lane with ascii-autofix also has format-autofix.
 ASCII_LIST="$TMP/ascii-lanes.txt"
 FORMAT_LIST="$TMP/format-lanes.txt"
 git -C "$ROOT" grep -l "id: ascii-autofix" -- .archon/workflows/defaults/bdc-feature-development*.yaml | sort > "$ASCII_LIST"
@@ -165,10 +185,22 @@ git -C "$ROOT" grep -l "id: format-autofix" -- .archon/workflows/defaults/bdc-fe
 ASCII_N=$(wc -l < "$ASCII_LIST" | tr -d ' ')
 FORMAT_N=$(wc -l < "$FORMAT_LIST" | tr -d ' ')
 REWIRE_N=$(git -C "$ROOT" grep -l "depends_on: \[format-autofix\]" -- .archon/workflows/defaults/bdc-feature-development*.yaml | wc -l | tr -d ' ')
-if [ "$ASCII_N" = "12" ] && [ "$FORMAT_N" = "12" ] && cmp -s "$ASCII_LIST" "$FORMAT_LIST" && [ "$REWIRE_N" = "12" ]; then
-  pass "12 lanes with ascii-autofix also have format-autofix and the run-stop-tests rewire"
+RSG_REWIRE_N=0
+for lane in "${LANES[@]}"; do
+  if awk '
+    $0 == "  - id: run-stop-greps" { grab=1; next }
+    grab && $0 == "    depends_on: [format-autofix]" { found=1; exit }
+    grab && $0 ~ /^  - id: / { exit }
+    END { exit found ? 0 : 1 }
+  ' "$DEFAULTS/$lane"; then
+    RSG_REWIRE_N=$((RSG_REWIRE_N + 1))
+  fi
+done
+if [ "$ASCII_N" = "12" ] && [ "$FORMAT_N" = "12" ] && cmp -s "$ASCII_LIST" "$FORMAT_LIST" \
+  && [ "$REWIRE_N" = "12" ] && [ "$RSG_REWIRE_N" = "12" ]; then
+  pass "12 lanes with ascii-autofix also have format-autofix; run-stop-tests and run-stop-greps both depend on it"
 else
-  fail "12 lanes with ascii-autofix also have format-autofix and the run-stop-tests rewire" "ascii=$ASCII_N format=$FORMAT_N rewire=$REWIRE_N"
+  fail "12 lanes with ascii-autofix also have format-autofix; run-stop-tests and run-stop-greps both depend on it" "ascii=$ASCII_N format=$FORMAT_N rewire=$REWIRE_N rsg=$RSG_REWIRE_N"
 fi
 
 echo ""

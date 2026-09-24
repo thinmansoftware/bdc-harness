@@ -121,6 +121,12 @@ for lane in "${LANES[@]}"; do
   CAPTURE_COUNT=$(grep -c '^  - id: capture-run-scope$' "$path" || true)
   DERIVE_COUNT=$(grep -c '^  - id: derive-run-source-scope$' "$path" || true)
   IMPLEMENT_DEP_COUNT=$(grep -c 'depends_on: \[capture-run-scope\]' "$path" || true)
+  # DISCLOSURE (WO-HARNESS-LANE-FORMAT-AUTOFIX-01, PR body): LIST_COUNT is 4.
+  # The approved plan said do not modify existing assertions in this file.
+  # format-autofix is a fourth consumer of run-changed-source-files.txt
+  # (derive-run-source-scope, ascii-autofix, ascii-gate, format-autofix), so
+  # the prior count of 3 would fail every lane. This bump is required and is
+  # called out here so the PR body can restate it.
   LIST_COUNT=$(grep -c 'run-changed-source-files.txt' "$path" || true)
   FALLBACK_COUNT=$({
     extract_node_script "$path" ascii-autofix

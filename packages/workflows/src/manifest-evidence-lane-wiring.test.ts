@@ -114,9 +114,9 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         }
       });
 
-      it('run-stop-tests runs after ascii-gate with a 30-minute budget', () => {
+      it('run-stop-tests runs after format-autofix with a 30-minute budget', () => {
         const n = node(nodes, 'run-stop-tests', file);
-        expect(n.depends_on).toEqual(['ascii-gate']);
+        expect(n.depends_on).toEqual(['format-autofix']);
         expect(n.timeout).toBe(1800000);
         expect(n.bash).toContain(
           "case \"$cmd\" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1"
@@ -130,7 +130,7 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
 
       it('run-stop-greps tokenizes argv pipelines and rejects find -execdir', () => {
         const n = node(nodes, 'run-stop-greps', file);
-        expect(n.depends_on).toEqual(['ascii-gate']);
+        expect(n.depends_on).toEqual(['format-autofix']);
         expect(n.timeout).toBe(600000);
         expect(n.bash).toContain('rsg_tokens_safe');
         expect(n.bash).toContain('rsg_exec_pipeline');
