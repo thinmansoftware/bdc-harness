@@ -388,13 +388,17 @@ describe('overseer db', () => {
     await finalizeOverseerVerdict({
       verdictId: claim.verdictId!,
       status: 'verdict',
-      verdict: 'approved',
+      verdict: 'merge_candidate',
       proposedAction: 'flag_merge_ready',
+      prUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/3',
     });
     const ready = await listUnactionedFlagMergeReadyVerdicts();
     expect(ready).toHaveLength(1);
     expect(ready[0].run_id).toBe(runId);
     expect(ready[0].proposed_action).toBe('flag_merge_ready');
+    expect(ready[0].verdict).toBe('merge_candidate');
+    expect(ready[0].head_sha).toBe('h3');
+    expect(ready[0].pr_url).toBe('https://github.com/thinmansoftware/bdc-harness/pull/3');
   });
 
   test('the synthetic discovery run is terminal and excluded from the watch loop, pending count, and inflight count', async () => {
