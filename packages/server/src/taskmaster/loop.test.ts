@@ -3613,6 +3613,103 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     expect(world.sentMessages).toHaveLength(0);
   });
 
+  test('posted:true -> row sent + delivered_to_issue and counted as one tick effect', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    const result = await tick(createTaskmasterState(60_000), deps);
+
+    expect(gh.posts()).toBe(1);
+    expect(result.effects).toBe(1);
+    expect(result.expired).toBe(0);
+    const rows = world.journal.filter(
+      j => j.thread_ref === P0_REF && j.action_type === 'escalate_p0'
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.outcome).toBe('sent');
+    expect(rows[0]?.grade).toBe('delivered_to_issue');
+    expect(JSON.parse(rows[0]?.proposal_json ?? '{}').suppressed).toBeUndefined();
+  });
+
+  test('posted:false (cooldown marker) -> expired + suppressed detail, ungraded, not an effect', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+    expect(gh.posts()).toBe(1);
+
+    // New P0 bucket (30m), same 72h cooldown window: the module suppresses.
+    world.nowMs += 45 * 60_000;
+    const result = await tick(createTaskmasterState(60_000), deps);
+
+    expect(gh.posts()).toBe(1);
+    expect(result.effects).toBe(0);
+    expect(result.expired).toBe(1);
+    const rows = world.journal.filter(
+      j => j.thread_ref === P0_REF && j.action_type === 'escalate_p0'
+    );
+    expect(rows).toHaveLength(2);
+    const suppressed = rows.find(r => r.outcome !== 'sent');
+    expect(suppressed?.outcome).toBe('expired');
+    expect(suppressed?.grade).toBeNull();
+    expect(JSON.parse(suppressed?.proposal_json ?? '{}').suppressed).toBe('cooldown_marker');
+    // Exactly one row is 'sent' + delivered_to_issue: the real post.
+    const sent = rows.filter(r => r.outcome === 'sent');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.grade).toBe('delivered_to_issue');
+  });
+
+  test('suppressed escalations do not consume the per-item 24h intervention cap or the floor', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    // Tick 1 posts (1 intervention). Then MORE suppressed buckets than the
+    // cap allows. If a suppressed row were journaled 'sent', the cap would
+    // be reached after MAX_INTERVENTIONS_PER_ITEM_24H - 1 more buckets and
+    // computeNextAction would stop proposing -- so later buckets would add no
+    // rows. Every bucket still producing a (suppressed) row proves the cap
+    // was not consumed.
+    await tick(createTaskmasterState(60_000), deps);
+    const suppressedTicks = MAX_INTERVENTIONS_PER_ITEM_24H + 2;
+    for (let i = 0; i < suppressedTicks; i += 1) {
+      world.nowMs += 31 * 60_000;
+      const result = await tick(createTaskmasterState(60_000), deps);
+      expect(result.effects).toBe(0);
+      expect(result.expired).toBe(1);
+    }
+
+    expect(gh.posts()).toBe(1);
+    const rows = world.journal.filter(
+      j => j.thread_ref === P0_REF && j.action_type === 'escalate_p0'
+    );
+    expect(rows).toHaveLength(1 + suppressedTicks);
+    expect(rows.filter(r => r.outcome === 'sent')).toHaveLength(1);
+    expect(rows.filter(r => r.outcome === 'expired')).toHaveLength(suppressedTicks);
+    // Never graded: not in the useful-rate floor (only 'useful'/'noise' count)
+    // and never 'delivered_to_issue'.
+    for (const row of rows.filter(r => r.outcome === 'expired')) {
+      expect(row.grade).toBeNull();
+    }
+  });
+
   test('after the 72h cooldown, the next tick escalates again', async () => {
     const world = makeWorld();
     seedDigestSent(world);

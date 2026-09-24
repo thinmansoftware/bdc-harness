@@ -1707,11 +1707,22 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         // a GitHub issue comment (where the owner and Duty Officer look), not to
         // the operator dispatch mailbox (a drain_on_start principal with no
         // reader). The body is built from adoption content, NOT proposal.body,
-        // which is written for the operator-mailbox audience. Whether a fresh
-        // comment was posted or a within-cooldown marker already covered it, the
-        // row is journaled sent + graded 'delivered_to_issue' (excluded from the
-        // M-155 useful-rate floor, like 'unheard'); no dispatch row exists for a
-        // GitHub-comment effect, so no expectation is registered.
+        // which is written for the operator-mailbox audience. No dispatch row
+        // exists for a GitHub-comment effect, so no expectation is registered.
+        //
+        // The two delivery results are journaled differently:
+        //   - posted:true  -> the row is 'sent' + graded 'delivered_to_issue'
+        //     (excluded from the M-155 useful-rate floor, like 'unheard') and
+        //     counts as a tick effect.
+        //   - posted:false -> a marker comment inside the 72h cooldown already
+        //     covers this issue, so NOTHING was delivered. The row is closed as
+        //     'expired' (the existing "journaled, never performed, terminal for
+        //     this key" outcome) with proposal_json.suppressed='cooldown_marker',
+        //     and is NOT graded. It is not a tick effect, does not mark the
+        //     thread touched, and -- because the per-item 24h intervention cap
+        //     (interventions24hByThread), the adoption attempt counts, and
+        //     gradeSentActions all read only outcome='sent' -- it consumes no
+        //     intervention budget and never enters the useful-rate floor.
         const adoptionRow = adoptionByRef.get(canonicalizeThreadRef(proposal.threadRef));
         const body = buildEscalationCommentBody({
           title: adoptionRow?.title ?? null,
@@ -1722,10 +1733,28 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           nowMs,
         });
         const delivery = deps.escalationDelivery ?? createRealEscalationDeliveryDeps();
-        await deliverEscalationToIssue(
+        const delivered = await deliverEscalationToIssue(
           { issue: escalationIssue, threadRef: proposal.threadRef, body },
           delivery
         );
+        if (!delivered.posted) {
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'expired',
+            JSON.stringify({ ...proposal, suppressed: 'cooldown_marker' })
+          );
+          journalRow.outcome = 'expired';
+          result.expired += 1;
+          log.info(
+            {
+              actionType: proposal.type,
+              threadRef: proposal.threadRef,
+              idempotencyKey: proposal.idempotencyKey,
+            },
+            'taskmaster.escalation_suppressed_cooldown'
+          );
+          continue;
+        }
         await dal.updateActionOutcome(journalRow.id, 'sent');
         await dal.gradeAction(journalRow.id, 'delivered_to_issue');
       } else if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
