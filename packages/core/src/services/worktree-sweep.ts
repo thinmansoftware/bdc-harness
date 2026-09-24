@@ -435,6 +435,18 @@ export async function moveDirAcrossDevices(
 
   try {
     await deps.cp(from, stagingPath, MOVE_DIR_CP_OPTIONS);
+    // POSIX rename(2) silently replaces an EMPTY existing directory instead
+    // of throwing -- on Linux, `deps.rename(stagingPath, to)` alone would
+    // clobber a `to` that already exists but happens to be empty, with no
+    // error at all. Checking existence immediately before the publish
+    // closes that hole: the rename is only attempted once we have just
+    // observed `to` does not exist. A publish error after that check still
+    // falls back to a pathExists probe, so a genuine race (something else
+    // creates `to` in the gap) is still reported as a collision rather than
+    // a generic rename failure.
+    if (await pathExists(to)) {
+      throw new MoveDirDestinationExistsError(to);
+    }
     try {
       await deps.rename(stagingPath, to);
     } catch (publishError) {

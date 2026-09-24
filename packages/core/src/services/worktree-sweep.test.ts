@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   readlink,
   rename,
@@ -1134,10 +1135,18 @@ describe('moveDirAcrossDevices', () => {
     expect(await readFile(join(src, 'a.txt'), 'utf8')).toBe('alpha');
   });
 
+  // Overseer review, bdc-harness#947, [major]: POSIX rename(2) replaces an
+  // EMPTY existing directory instead of throwing, so a same-mount publish
+  // rename onto an empty `to` succeeds silently on Linux -- catching a
+  // thrown error at the publish step alone never sees this case and the
+  // fallback ends up clobbering a destination it did not create. The
+  // existence check now runs before the publish attempt, closing that hole
+  // for both an empty and a non-empty pre-existing destination.
   test('MoveDirDestinationExistsError names the colliding path', async () => {
     const src = join(root, 'src');
     const dst = join(root, 'dst');
     await mkdir(src);
+    await writeFile(join(src, 'a.txt'), 'alpha');
     await mkdir(dst);
 
     let caught: unknown;
@@ -1157,6 +1166,11 @@ describe('moveDirAcrossDevices', () => {
     expect(caught).toBeInstanceOf(MoveDirDestinationExistsError);
     expect((caught as MoveDirDestinationExistsError).path).toBe(dst);
     expect((caught as Error).message).toContain(dst);
+    // `dst` was empty and must stay exactly that -- not silently replaced by
+    // the staged copy of `src` (the real-rename POSIX hole this fix closes).
+    expect(await readdir(dst)).toEqual([]);
+    // The failed move is a no-op: source is left in place too.
+    expect(await readFile(join(src, 'a.txt'), 'utf8')).toBe('alpha');
   });
 });
 
