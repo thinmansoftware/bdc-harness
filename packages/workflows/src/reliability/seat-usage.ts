@@ -94,6 +94,7 @@ export interface SeatGateRefuse {
   window: string;
   usedPercent: number;
   cutoffPercent: number;
+  unknownSeats: SeatId[];
 }
 export type SeatGateDecision = SeatGateAllow | SeatGateRefuse;
 
@@ -564,37 +565,49 @@ export function decideSeatGate(
   readings: Partial<Record<SeatId, SeatReading>>,
   cutoffPercent: number
 ): SeatGateDecision {
+  // Collect every unknown seat and the first refusal in one pass over ALL
+  // bound seats, independently of each other. A seat that trips the cutoff
+  // must not swallow the UNKNOWN diagnostics for other bound seats -- both
+  // are reported: the run still refuses (that semantics is unchanged), but
+  // the unknown-seat log line and operator alert still fire for every seat
+  // that could not be measured, refusal or not.
   const unknownSeats: SeatId[] = [];
+  let refusal: SeatGateRefuse | null = null;
   for (const seat of seatsForBindings(bindings)) {
     const reading = readings[seat];
     if (reading?.limit_source !== 'measured') {
       unknownSeats.push(seat);
       continue;
     }
+    if (refusal) continue;
     const gateNames = GATE_WINDOWS[seat];
     for (const name of gateNames) {
       const window = reading.windows.find(w => w.name === name);
       if (window && window.used_percent >= cutoffPercent) {
-        return {
+        refusal = {
           refused: true,
           seat,
           window: name,
           usedPercent: window.used_percent,
           cutoffPercent,
+          unknownSeats: [],
         };
+        break;
       }
     }
-    if (seat === 'codex' && reading.limit_reached === true) {
+    if (!refusal && seat === 'codex' && reading.limit_reached === true) {
       const window = reading.windows.find(w => gateNames.includes(w.name)) ?? reading.windows[0];
-      return {
+      refusal = {
         refused: true,
         seat,
         window: window?.name ?? 'primary',
         usedPercent: window?.used_percent ?? 0,
         cutoffPercent,
+        unknownSeats: [],
       };
     }
   }
+  if (refusal) return { ...refusal, unknownSeats };
   return { refused: false, unknownSeats };
 }
 

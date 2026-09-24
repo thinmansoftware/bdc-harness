@@ -248,6 +248,34 @@ describe('executor seat gate', () => {
     expect(alerts).toHaveLength(0);
   });
 
+  test('a refused seat does not swallow the UNKNOWN alert for the other bound seat', async () => {
+    // codex is over cutoff (refuses the run); claude could not be measured.
+    // The Overseer's finding: decideSeatGate used to return early on the
+    // first refusal, so claude's UNKNOWN reading was never logged or
+    // alerted. Both must happen even though the run is refused.
+    setSeatUsageReaderForTests(async () => ({
+      claude: unknownSeatReading('claude', 'Claude limit probe rejected (HTTP 401)', 401),
+      codex: reading('codex', 'primary', 95),
+    }));
+    const { result, store } = await runWorkflow();
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('seat_usage_refused:codex:primary:95:90');
+    expect(eventTypes(store)).toContain('dag_workflow_failed');
+    expect(eventTypes(store)).not.toContain('workflow_started');
+    expect(
+      warnings.some(
+        entry => entry.msg === 'workflow.seat_usage_unknown' && entry.obj.seat === 'claude'
+      )
+    ).toBe(true);
+    expect(
+      warnings.some(
+        entry => entry.msg === 'workflow.seat_usage_refused' && entry.obj.seat === 'codex'
+      )
+    ).toBe(true);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.body).toContain('claude');
+  });
+
   test('UNKNOWN proceeds and enqueues exactly one operator alert per seat per hour', async () => {
     setSeatUsageReaderForTests(async () => ({
       claude: unknownSeatReading('claude', 'Claude limit probe rejected (HTTP 401)', 401),

@@ -1130,6 +1130,26 @@ export async function executeWorkflow(
       const readings = await readBoundSeats(seatIds);
       const cutoff = getSeatCutoff();
       const seatDecision = decideSeatGate(probeDecision.bindings, readings, cutoff.percent);
+      // UNKNOWN never refuses on its own (a broken probe must not stop all
+      // work), and it is never silent either: log + alert for every bound
+      // seat that could not be measured, regardless of whether ANOTHER seat
+      // in this same run causes a refusal below.
+      for (const seat of seatDecision.unknownSeats) {
+        const note = readings[seat]?.note ?? 'UNKNOWN';
+        getLog().warn(
+          {
+            workflowName: executableWorkflow.name,
+            workflowRunId: workflowRun.id,
+            seat,
+            note,
+          },
+          'workflow.seat_usage_unknown'
+        );
+        await alertUnknownSeat(seat, note, {
+          workflowName: executableWorkflow.name,
+          workflowRunId: workflowRun.id,
+        });
+      }
       if (seatDecision.refused) {
         const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}`;
         getLog().warn(
@@ -1165,24 +1185,6 @@ export async function executeWorkflow(
           `Workflow refused: seat ${seatDecision.seat} at ${String(seatDecision.usedPercent)}% of ${seatDecision.window} (cutoff ${String(seatDecision.cutoffPercent)}%)`
         );
         return { success: false, workflowRunId: workflowRun.id, error: detail };
-      }
-      // UNKNOWN never refuses (a broken probe must not stop all work), but it is
-      // never silent either: log it and raise an operator alert (deduplicated).
-      for (const seat of seatDecision.unknownSeats) {
-        const note = readings[seat]?.note ?? 'UNKNOWN';
-        getLog().warn(
-          {
-            workflowName: executableWorkflow.name,
-            workflowRunId: workflowRun.id,
-            seat,
-            note,
-          },
-          'workflow.seat_usage_unknown'
-        );
-        await alertUnknownSeat(seat, note, {
-          workflowName: executableWorkflow.name,
-          workflowRunId: workflowRun.id,
-        });
       }
     }
 

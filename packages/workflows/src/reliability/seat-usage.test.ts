@@ -328,6 +328,35 @@ describe('seat usage', () => {
       window: 'primary',
       usedPercent: 92,
       cutoffPercent: 90,
+      unknownSeats: [],
+    });
+  });
+
+  test('gate_refuses_and_still_reports_the_unrelated_unknown_seat', () => {
+    // codex is over cutoff (refuses); claude could not be measured (UNKNOWN).
+    // The refusal must not swallow claude's UNKNOWN diagnostics.
+    const codex = measured('codex', [
+      {
+        name: 'primary',
+        used_percent: 92,
+        remaining_percent: 8,
+        resets_at: 'x',
+        window_seconds: 604800,
+      },
+    ]);
+    const claude = unknownSeatReading('claude', 'probe failed');
+    const decision = decideSeatGate(
+      [{ providerId: 'codex' }, { providerId: 'claude' }],
+      { codex, claude },
+      90
+    );
+    expect(decision).toEqual({
+      refused: true,
+      seat: 'codex',
+      window: 'primary',
+      usedPercent: 92,
+      cutoffPercent: 90,
+      unknownSeats: ['claude'],
     });
   });
 
@@ -412,6 +441,7 @@ describe('seat usage', () => {
       window: 'seven_day',
       usedPercent: 91,
       cutoffPercent: 90,
+      unknownSeats: [],
     });
   });
 
