@@ -595,7 +595,7 @@ describe('cursor judge rung', () => {
     try {
       const prompt = `review this ${'x'.repeat(150_000)}`;
       const transport = await buildReviewModelTransport('cursor', prompt);
-      expect(DEFAULT_CURSOR_JUDGE_MODEL).toBe('claude-fable-5-1-thinking-high');
+      expect(DEFAULT_CURSOR_JUDGE_MODEL).toBe('grok-4.7-high');
       expect(transport.argv).toEqual([
         'cursor-agent',
         '--print',

@@ -96,7 +96,7 @@ describe('CursorAgentProvider', () => {
     }
   });
 
-  test('defaults to claude-fable-5-1-thinking-high and honours a per-call model override', async () => {
+  test('defaults to grok-4.7-high and honours a per-call model override', async () => {
     const argvs: string[][] = [];
     const spawn: CursorAgentSpawn = argv => {
       argvs.push(argv);
@@ -105,7 +105,7 @@ describe('CursorAgentProvider', () => {
     const provider = new CursorAgentProvider({ spawn });
     await collect(provider.sendQuery('a', '/w'));
     await collect(provider.sendQuery('b', '/w', undefined, { model: 'cursor-grok-4.6-high' }));
-    expect(DEFAULT_CURSOR_AGENT_MODEL).toBe('claude-fable-5-1-thinking-high');
+    expect(DEFAULT_CURSOR_AGENT_MODEL).toBe('grok-4.7-high');
     expect(argvs[0]?.slice(-2)).toEqual(['--model', DEFAULT_CURSOR_AGENT_MODEL]);
     expect(argvs[1]?.slice(-2)).toEqual(['--model', 'cursor-grok-4.6-high']);
     expect(buildCursorAgentArgv('cursor-agent', 'm', '/w')).toContain('--workspace');

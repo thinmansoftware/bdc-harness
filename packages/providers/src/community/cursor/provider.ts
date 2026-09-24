@@ -31,7 +31,7 @@ import type {
 import { CURSOR_AGENT_CAPABILITIES } from './capabilities';
 import { parseCursorAgentConfig } from './config';
 
-export const DEFAULT_CURSOR_AGENT_MODEL = 'claude-fable-5-1-thinking-high';
+export const DEFAULT_CURSOR_AGENT_MODEL = 'grok-4.7-high';
 export const DEFAULT_CURSOR_AGENT_BINARY = 'cursor-agent';
 
 /** The subset of a spawned child this provider uses; a test supplies a double. */

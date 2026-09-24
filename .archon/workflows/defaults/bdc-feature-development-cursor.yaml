@@ -2,9 +2,10 @@ name: bdc-feature-development-cursor
 description: |
   Dedicated Cursor-rail lane for feature Work Orders. Planning, implementation,
   and repair seats run through provider cursor (local cursor-agent CLI on the
-  operator's Cursor subscription) with claude-fable-5-1-thinking-high. Every
-  review and judge seat is pinned to the SAME rail on a DIFFERENT model,
-  gpt-5.6-sol-high, so the builder never grades its own output. Node graph,
+  operator's Cursor subscription) with grok-4.7-high. Every review and
+  judge seat runs on provider claude with the codex lane's pins, so the
+  builder never grades its own output and the lane spends no Codex budget.
+  Node graph,
   bash bodies and sentinels are byte-identical to bdc-feature-development-grok.
   Directly invokable; bound to the ladder's dark `cursor` tier (refusedTiers).
 
@@ -17,9 +18,9 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Dedicated Cursor execution default. Review nodes override the MODEL (same rail).
+# Dedicated Cursor execution default. Review nodes override to provider claude.
 provider: cursor
-model: claude-fable-5-1-thinking-high
+model: grok-4.7-high
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -189,7 +190,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     provider: cursor
-    model: claude-fable-5-1-thinking-high
+    model: grok-4.7-high
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     depends_on: [checkout-repair-target]
@@ -294,7 +295,7 @@ nodes:
 
   - id: plan
     provider: cursor
-    model: claude-fable-5-1-thinking-high
+    model: grok-4.7-high
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -340,12 +341,12 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
-    provider: cursor
-    persona: war-council-architect-opr
-    agent: war-council-architect-opr
-    # Cross-model boundary: Fable authors the plan; Sol reviews it on the same
-    # Cursor rail. The builder never grades its own work.
-    model: gpt-5.6-sol-high
+    provider: claude
+    persona: war-council-architect
+    agent: war-council-architect
+    # Cross-model boundary: Grok 4.7 authors the plan on the Cursor rail;
+    # Claude (sonnet) reviews it. The builder never grades its own work.
+    model: sonnet
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -493,7 +494,7 @@ nodes:
     # Dedicated Cursor builder seat. The provider contract supplies repository write
     # and shell capabilities; downstream Sol seats independently review it.
     provider: cursor
-    model: claude-fable-5-1-thinking-high
+    model: grok-4.7-high
     persona: major-build-opr
     depends_on: [capture-run-scope]
     trigger_rule: all_done
@@ -2027,10 +2028,10 @@ nodes:
       exit 0
 
   - id: war-council-validator
-    # Sol judge on the Cursor rail; never the builder model.
-    provider: cursor
-    persona: captain-ci-validator-codex
-    model: gpt-5.6-sol-high
+    # Claude judge (codex-lane pin); never the Cursor builder model.
+    provider: claude
+    model: claude-opus-5
+    persona: captain-ci-validator-fable
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
     prompt: |
@@ -2166,9 +2167,9 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: cursor
-    model: gpt-5.6-sol-high
-    agent: codex-adversarial-reviewer
+    provider: claude
+    model: sonnet
+    agent: claude-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
     prompt: |
@@ -2223,7 +2224,7 @@ nodes:
 
   - id: diff-repair
     provider: cursor
-    model: claude-fable-5-1-thinking-high
+    model: grok-4.7-high
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
@@ -2434,9 +2435,9 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: cursor
-    model: gpt-5.6-sol-high
-    agent: codex-adversarial-reviewer
+    provider: claude
+    model: sonnet
+    agent: claude-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
@@ -2540,7 +2541,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: cursor
-    model: claude-fable-5-1-thinking-high
+    model: grok-4.7-high
     persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
@@ -2600,9 +2601,9 @@ nodes:
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: cursor
-    model: gpt-5.6-sol-high
-    agent: codex-adversarial-reviewer
+    provider: claude
+    model: sonnet
+    agent: claude-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
     when: "$classify-opus-repair.output.fixed == 'true'"
@@ -2818,9 +2819,9 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
-    provider: cursor
-    model: gpt-5.6-sol-high
-    persona: xo-opr
+    persona: xo
+    provider: claude
+    model: sonnet
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -2912,7 +2913,7 @@ nodes:
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     provider: cursor
-    model: claude-fable-5-1-thinking-high
+    model: grok-4.7-high
     agent: major-build-opr
     effort: xhigh
     context: fresh
@@ -2948,9 +2949,9 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: cursor
-    model: gpt-5.6-sol-high
-    agent: codex-adversarial-reviewer
+    provider: claude
+    model: sonnet
+    agent: claude-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
