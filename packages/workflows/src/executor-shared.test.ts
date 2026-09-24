@@ -310,6 +310,87 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('Plain prompt with no loop variable.');
   });
+
+  // -- Prefix-defect regression cases (bdc-harness #877) ----------------------
+  // Every $NAME replace matches only as a whole identifier, so longer shell
+  // variables sharing a workflow-variable prefix pass through to bash nodes
+  // unchanged instead of being corrupted into literals like "dev_OVERRIDE".
+
+  it('leaves prefix-longer shell variables $BASE_BRANCH_OVERRIDE and $BASE_BRANCH_PR intact', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH_OVERRIDE=$(parse "$DECIDE_OUTPUT") && pr="$BASE_BRANCH_PR" && base="$BASE_BRANCH"',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    // The unbraced longer variables must survive verbatim; only the exact
+    // $BASE_BRANCH reference is substituted.
+    expect(prompt).toContain('$BASE_BRANCH_OVERRIDE');
+    expect(prompt).toContain('$BASE_BRANCH_PR');
+    expect(prompt).toContain('base="dev"');
+    expect(prompt).not.toContain('dev_OVERRIDE');
+    expect(prompt).not.toContain('dev_PR');
+  });
+
+  it('still substitutes exact $BASE_BRANCH followed by non-identifier characters', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH $BASE_BRANCH/x $BASE_BRANCH. $BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('dev dev/x dev. dev)');
+  });
+
+  it('bounds every $NAME variable: exact match substituted, $NAME_SUFFIX left verbatim', () => {
+    const cases: ReadonlyArray<{ name: string; expected: string }> = [
+      { name: 'WORKFLOW_ID', expected: 'run-param' },
+      { name: 'USER_MESSAGE', expected: 'user message param' },
+      { name: 'ARGUMENTS', expected: 'user message param' },
+      { name: 'ARTIFACTS_DIR', expected: '/tmp/artifacts-param' },
+      { name: 'DOCS_DIR', expected: 'docs-param/' },
+      { name: 'LOOP_USER_INPUT', expected: 'loop input param' },
+      { name: 'REJECTION_REASON', expected: 'rejection param' },
+      { name: 'LOOP_PREV_OUTPUT', expected: 'prev output param' },
+    ];
+    for (const { name, expected } of cases) {
+      const { prompt } = substituteWorkflowVariables(
+        `$${name} vs $${name}_SUFFIX`,
+        'run-param',
+        'user message param',
+        '/tmp/artifacts-param',
+        'dev',
+        'docs-param/',
+        undefined,
+        'loop input param',
+        'rejection param',
+        'prev output param'
+      );
+      expect(prompt).toBe(`${expected} vs $${name}_SUFFIX`);
+    }
+  });
+
+  it('does not throw on empty baseBranch when only $BASE_BRANCH_OVERRIDE is referenced', () => {
+    // The fail-fast guard is bounded too: $BASE_BRANCH_OVERRIDE is not a
+    // reference to $BASE_BRANCH, so an empty baseBranch is fine here.
+    const { prompt } = substituteWorkflowVariables(
+      'BASE_BRANCH_OVERRIDE="$BASE_BRANCH_OVERRIDE"',
+      'run-1',
+      'msg',
+      '/tmp',
+      '',
+      'docs/'
+    );
+    expect(prompt).toBe('BASE_BRANCH_OVERRIDE="$BASE_BRANCH_OVERRIDE"');
+    // ...but an exact $BASE_BRANCH reference with empty baseBranch still throws.
+    expect(() =>
+      substituteWorkflowVariables('Merge into $BASE_BRANCH', 'run-1', 'msg', '/tmp', '', 'docs/')
+    ).toThrow('No base branch could be resolved');
+  });
 });
 
 describe('buildPromptWithContext', () => {
