@@ -300,10 +300,47 @@ Baseline on untouched tree: scenario 1 FAILS.
 Stops 1-3 evidenced; status:review; Captain CI closes.
 '
 assert_eq "prose-only stop section declares no command" "" "$(printf '%s\n' "$SPEC_PROSE" | rst_extract_commands)"
+# WO-HARNESS-LANE-WORKTREE-DEPS-01 / E2: rung A is authoritative, so the
+# Stop-conditions backtick and the Section 9 line are not consulted once a
+# Stop block yields a command.
 assert_eq "template block first, Section 9 duplicate deduped" \
-  "$(printf 'bun test packages/foo\nbun test packages/bar')" \
+  "bun test packages/foo" \
   "$(printf 'Stop 2 (test suite):\n  bun test packages/foo\n  Expected: 3 passing\n\n## Stop conditions\n- `bun test packages/bar` exits 0\n\nTests: 3/3 (bun test packages/foo)\n' | rst_extract_commands)"
 assert_eq "cap at 8 commands" "8" "$(for i in 1 2 3 4 5 6 7 8 9 10; do printf -- '## Stop conditions\n- `node tests/t%s.js` exits 0\n' "$i"; done | rst_extract_commands | grep -c .)"
+
+echo "--- Test 12: declared Stop blocks are authoritative over prose (E2) ---"
+SPEC_E2='# WO-HARNESS-DEPLOY-DRIFT-DETECTOR-01
+
+## 8. Stop conditions
+
+All commands run from the bdc-harness repo root. Single-file test commands only
+(whole-package `bun test` cannot load in lane worktrees, bdc-harness#882).
+
+Stop 1 (grep assertion):
+  grep -c install-worktree-deps .archon/workflows/defaults/bdc-feature-development.yaml
+  Expected: at least 2
+
+Stop 10 (test suite -- a):
+  cd packages/server && bun test --timeout 30000 src/a.test.ts
+  Expected: pass
+
+Stop 11 (test suite -- b):
+  cd packages/server && bun test --timeout 30000 src/b.test.ts
+  Expected: pass
+
+Stop 12 (test suite -- c):
+  cd packages/server && bun test --timeout 30000 src/c.test.ts
+  Expected: pass
+'
+OUT="$(printf '%s\n' "$SPEC_E2" | rst_extract_commands)"
+assert_eq "Test 12 E2: three Stop-block commands in document order" \
+  "$(printf 'cd packages/server && bun test --timeout 30000 src/a.test.ts\ncd packages/server && bun test --timeout 30000 src/b.test.ts\ncd packages/server && bun test --timeout 30000 src/c.test.ts')" \
+  "$OUT"
+if printf '%s\n' "$OUT" | grep -Fxq 'bun test'; then
+  FAIL=$((FAIL + 1)); echo "FAIL: Test 12 E2 output contains a bare bun test line"
+else
+  PASS=$((PASS + 1)); echo "PASS: Test 12 E2 output has no bare bun test line"
+fi
 
 echo "--- rst_rescue_subdir ---"
 TMP="$(mktemp -d)"
