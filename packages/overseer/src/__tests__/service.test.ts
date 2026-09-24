@@ -185,7 +185,14 @@ function enableFakeCapability(capability: 'merge' | 'escalation'): void {
   process.env[`OVERSEER_${capability.toUpperCase()}_ACTIONS_ENABLED`] = 'true';
 }
 
-describe('service', () => {
+// This suite owns process-global database state. Bun runs files concurrently for
+// directory invocations, so execute it in its own process in that invocation
+// shape; direct/package-script runs continue to execute the suite normally.
+const invokedDirectly = process.argv.some(arg => /service\.test\.ts$/.test(arg));
+
+const serviceSuite: typeof describe = invokedDirectly ? describe : (_name, _tests) => undefined;
+
+serviceSuite('service', () => {
   test('resolveDefaultDeps preserves the fake GitHub adapter behavior', async () => {
     process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'true';
     const realFactory = mock(() => {
@@ -939,3 +946,16 @@ describe('service', () => {
     expect(drains).toBe(drainsAfterReject);
   });
 });
+
+if (!invokedDirectly) {
+  test('service suite passes with isolated database state', () => {
+    const child = Bun.spawnSync(['bun', 'test', import.meta.path, '--timeout', '30000'], {
+      cwd: process.cwd(),
+      env: process.env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const output = new TextDecoder().decode(child.stdout) + new TextDecoder().decode(child.stderr);
+    expect(child.exitCode, output).toBe(0);
+  });
+}

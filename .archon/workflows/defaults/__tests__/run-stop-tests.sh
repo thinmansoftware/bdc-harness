@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run-stop-tests.sh -- unit tests for the run-stop-tests node core (rst_*) in
 # .archon/workflows/defaults/bdc-feature-development-codex.yaml and its byte-identical
-# mirrors in the other 10 bdc-feature-development lanes.
+# mirrors in the other 11 bdc-feature-development lanes.
 #
 # bdc-xo #1940 (harness defect 2026-09-05): the manifest "Tests:" line was stamped
 # "N/A (required gates are reported separately)" on CODE WOs and the validator's test
@@ -11,7 +11,7 @@
 # Rather than re-typing that logic (which would drift), these tests EXTRACT the real
 # core functions from the canonical YAML (awk range-match on the BEGIN/END markers)
 # and exercise them against fixtures. A parity test asserts the core is byte-identical
-# across all 11 lanes (this repo has no shared-include mechanism for workflow YAMLs).
+# across all 12 lanes (this repo has no shared-include mechanism for workflow YAMLs).
 #
 # Run: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh
 # Exits 0 on all-pass, 1 on any failure. ASCII only.
@@ -45,6 +45,7 @@ CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
+bdc-feature-development-cursor.yaml
 bdc-feature-development-fable.yaml
 bdc-feature-development-fusion-cx-kimi.yaml
 bdc-feature-development-fusion-cx-qwen.yaml
@@ -71,11 +72,11 @@ if [ -z "$RST_CORE" ]; then
   echo "FATAL: could not extract rst core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RST_CORE"
-for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_subdir rst_tests_in_diff rst_repo_test_script rst_parse_counts rst_run_commands rst_report; do
+for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_subdir rst_tests_in_diff rst_repo_test_script rst_parse_counts rst_scrub_env rst_run_commands rst_report; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: rst core byte-identical across all 11 lanes ---"
+echo "--- Parity: rst core byte-identical across all 12 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$RST_CORE" "$(extract_core "$DEFAULTS/$lane" rst)"
 done
@@ -360,6 +361,13 @@ assert_eq "test script + bun.lock -> bun run test" "bun run test" "$(cd "$TMP" &
 rm -rf "$TMP"
 
 echo "--- rst_run_commands: two commands, counts summed, first nonzero exit kept ---"
+export OVERSEER_FOO=production-shaped-test-value
+export MERGE_MANAGER_GH_TOKEN=production-shaped-test-value
+export GH_TOKEN=production-shaped-test-value
+rst_scrub_env
+assert_eq "scrub removes OVERSEER_ prefix" "unset" "${OVERSEER_FOO:-unset}"
+assert_eq "scrub removes MERGE_MANAGER_ prefix" "unset" "${MERGE_MANAGER_GH_TOKEN:-unset}"
+assert_eq "scrub removes exact GH_TOKEN" "unset" "${GH_TOKEN:-unset}"
 TMP="$(mktemp -d)"
 cat > "$TMP/ok.sh" <<'EOF'
 #!/usr/bin/env bash

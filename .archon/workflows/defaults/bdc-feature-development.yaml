@@ -1446,6 +1446,17 @@ nodes:
         fi
         printf '%s' "$counts"
       }
+      # Remove production credentials and switches before any test command is spawned.
+      rst_scrub_env() {
+        local name
+        for name in $(env | sed -n 's/=.*//p'); do
+          case "$name" in
+            OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL)
+              unset "$name"
+              ;;
+          esac
+        done
+      }
       # rst_run_commands <commands-file> <log>   (runs each command line in the CWD under a
       #   1500 s budget as tokenized argv -- no bash -c -- appends every command's output
       #   to <log> under a "### run-stop-tests:" header, and prints "<exit> <passed>
@@ -1456,6 +1467,7 @@ nodes:
       rst_run_commands() {
         local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
         local saved_pwd work segment d
+        rst_scrub_env
         saved_pwd="$(pwd)"
         seg="$(mktemp)"
         while IFS= read -r cmd; do
