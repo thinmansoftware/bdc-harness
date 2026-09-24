@@ -9,7 +9,8 @@
 # it under the read-only allowlist, and emits OBSERVED counts.
 #
 # Cores are EXTRACTED from the canonical YAML (never re-typed). A parity test asserts
-# the core is byte-identical across all 12 lanes.
+# the other 11 lanes match that source. The source file is not a member of LANES:
+# comparing it to itself cannot fail.
 #
 # Run: bash .archon/workflows/defaults/__tests__/run-stop-greps.sh
 # Exits 0 on all-pass, 1 on any failure. ASCII only.
@@ -42,7 +43,6 @@ DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-codex-only.yaml
-bdc-feature-development-codex.yaml
 bdc-feature-development-cursor.yaml
 bdc-feature-development-fable.yaml
 bdc-feature-development-fusion-cx-kimi.yaml
@@ -72,7 +72,14 @@ for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: rsg core byte-identical across all 12 lanes (parity-all-12-lanes) ---"
+echo "--- Parity: 11 lanes match canonical rsg core; source excluded (parity-all-12-lanes) ---"
+assert_eq "parity compares 11 lanes, not the canonical source" "11" "$(printf '%s\n' $LANES | grep -c .)"
+case " $LANES " in
+  *" $(basename "$CANONICAL_YAML") "*)
+    FAIL=$((FAIL + 1)); echo "FAIL: canonical source is in LANES" ;;
+  *)
+    PASS=$((PASS + 1)); echo "PASS: canonical source excluded from LANES" ;;
+esac
 for lane in $LANES; do
   assert_eq "parity $lane" "$RSG_CORE" "$(extract_core "$DEFAULTS/$lane" rsg)"
 done
@@ -161,7 +168,7 @@ c='grep -c "needle" fixture.txt'
 if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: double-quoted-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: double-quoted-still-dropped: $c"; fi
 
 echo "--- unsafe-quoted-content-still-dropped ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
+for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c 'a'b' f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
   if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: unsafe-quoted-content-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: unsafe-quoted-content-still-dropped: $c"; fi
 done
 
@@ -241,7 +248,7 @@ assert_contains "double-quoted-still-dropped" "GREP_DROPPED=1" "$OUT"
 assert_contains "double-quoted-still-dropped not executed" "GREP_EXECUTED=0" "$OUT"
 
 echo "--- unsafe-quoted-content-still-dropped (run) ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f"; do
+for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c 'a'b' f" "grep -c '' f"; do
   OUT="$(printf '%s\teq\t1\nUNPARSED\t0\nDECLARED\t1\n' "$c" | rsg_run)"
   assert_contains "unsafe-quoted-content-still-dropped: $c" "DROPPED (not on read-only allowlist; not executed): $c" "$OUT"
   assert_contains "unsafe-quoted-content-still-dropped not executed: $c" "GREP_EXECUTED=0" "$OUT"
