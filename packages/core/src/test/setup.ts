@@ -4,6 +4,32 @@ import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
+// TEST ENVIRONMENT SCRUB (WO-HARNESS-TEST-ENV-HERMETIC-01).
+//
+// Tests must never inherit production credentials or switches. Before any test
+// module loads, remove variables prefixed with OVERSEER_, MERGE_MANAGER_,
+// ARCHON_, DUTY_OFFICER_, TASKMASTER_, DISPATCH_, SMART_CAULDRON_, BOARD_, or
+// GITHUB_APP_, plus GH_TOKEN, GITHUB_TOKEN, and GH_AUTH_TOKEN_INTERNAL.
+// Tests that need one of these values must set it explicitly themselves.
+const TEST_ENV_PREFIXES = [
+  'OVERSEER_',
+  'MERGE_MANAGER_',
+  'ARCHON_',
+  'DUTY_OFFICER_',
+  'TASKMASTER_',
+  'DISPATCH_',
+  'SMART_CAULDRON_',
+  'BOARD_',
+  'GITHUB_APP_',
+];
+const TEST_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN', 'GH_AUTH_TOKEN_INTERNAL']);
+
+for (const name of Object.keys(process.env)) {
+  if (TEST_ENV_NAMES.has(name) || TEST_ENV_PREFIXES.some(prefix => name.startsWith(prefix))) {
+    delete process.env[name];
+  }
+}
+
 // PRODUCTION-DB SAFETY GUARD (anchor: 2026-07-21, two production DB wipes).
 //
 // Inside the Archon container, getArchonHome() resolves to /.archon -- the

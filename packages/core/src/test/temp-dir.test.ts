@@ -1,5 +1,44 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { removeTempDirWithRetry } from './temp-dir';
+
+test('preload scrub removes production credentials and switches inherited by a child test', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'archon-preload-scrub-'));
+  const childTest = join(dir, 'preload-scrub.test.ts');
+  writeFileSync(
+    childTest,
+    [
+      "import { expect, test } from 'bun:test';",
+      "test('scrubbed', () => {",
+      '  expect(process.env.MERGE_MANAGER_GH_TOKEN).toBeUndefined();',
+      '  expect(process.env.GH_TOKEN).toBeUndefined();',
+      '  expect(process.env.OVERSEER_MAX_REREVIEW_ATTEMPTS).toBeUndefined();',
+      '  expect(process.env.BOARD_PRINCIPALS_JSON).toBeUndefined();',
+      '});',
+    ].join('\n')
+  );
+
+  try {
+    const child = Bun.spawnSync(['bun', 'test', childTest], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        MERGE_MANAGER_GH_TOKEN: 'production-shaped-test-value',
+        GH_TOKEN: 'production-shaped-test-value',
+        OVERSEER_MAX_REREVIEW_ATTEMPTS: '3',
+        BOARD_PRINCIPALS_JSON: '{"production":"principal"}',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(new TextDecoder().decode(child.stderr)).toContain('1 pass');
+    expect(child.exitCode).toBe(0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 function ebusy(): NodeJS.ErrnoException {
   const error = new Error('EBUSY: resource busy or locked') as NodeJS.ErrnoException;
