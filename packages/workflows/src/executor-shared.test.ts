@@ -351,7 +351,7 @@ describe('substituteWorkflowVariables', () => {
     ['LOOP_PREV_OUTPUT', 'previous output'],
   ])('substitutes $NAME but not $NAME_SUFFIX for %s', (name, value) => {
     const { prompt } = substituteWorkflowVariables(
-      `Test $${name} and ${name}_SUFFIX`,
+      `Test $${name} and $${name}_SUFFIX`,
       value,
       value,
       '/tmp',
@@ -362,7 +362,7 @@ describe('substituteWorkflowVariables', () => {
       name === 'REJECTION_REASON' ? value : undefined,
       name === 'LOOP_PREV_OUTPUT' ? value : undefined
     );
-    expect(prompt).toBe(`Test ${value} and ${name}_SUFFIX`);
+    expect(prompt).toBe(`Test ${value} and $${name}_SUFFIX`);
   });
 
   // Test 4: fail-fast guard unchanged
