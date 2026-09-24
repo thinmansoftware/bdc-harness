@@ -183,7 +183,7 @@ assert_eq "Test 1 before: nonzero" "1" "$([ "$BEFORE_OUT" -ne 0 ] && echo 1 || e
 assert_contains "Test 1 before: Cannot find" "Cannot find" "$(cat "$T1/before.log")"
 POR1="$(cd "$T1/repo" && porcelain)"
 OUT1="$(cd "$T1/repo" && wdi_main </dev/null)"
-assert_eq "Test 1 wdi exit marker present" "0" "0"
+assert_eq "Test 1 wdi exit 0" "0" "$(cd "$T1/repo" && wdi_main </dev/null >/dev/null 2>&1; echo $?)"
 assert_contains "Test 1 DEPS_STATUS=installed" "DEPS_STATUS=installed" "$OUT1"
 assert_contains "Test 1 DEPS_DIRS .:installed" ".:installed" "$OUT1"
 assert_contains "Test 1 DEPS_CACHE_DIR=default" "DEPS_CACHE_DIR=default" "$OUT1"
