@@ -890,6 +890,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           stallTimeoutMs: pollStallTimeoutMs,
           intervalMs: pollIntervalMs,
           nodeTimeoutsMs,
+          // owner/repo for poll's `gh pr list --repo` branch-lookup fallback.
+          // `project` is guaranteed non-empty by the guard above (WO-HARNESS-
+          // CONDUCTOR-PR-DETECTION-REPO-01 Fix C).
+          repo: project,
         });
       } catch (pollErr) {
         if (pollErr instanceof TimeoutError) {

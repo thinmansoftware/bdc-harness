@@ -168,11 +168,21 @@ interface PollOptions {
   /** Delay between findExistingPrForBranch `gh pr list` retries (ms). Default: 10000. */
   prBranchLookupDelayMs?: number;
   /**
-   * Injectable seam for the `gh pr list --head <branch>` lookup. Test-only:
-   * production always uses the real gh CLI (ghPrListForBranchDefault). Returns
-   * the PR URL for the branch, or null when gh is unavailable / no PR is found.
+   * owner/repo for the `gh pr list --repo` branch-lookup fallback. Sourced from
+   * the cascade's `project` value (the WO's target_repo / canonical repo). The
+   * conductor's cwd (/app) is NOT a git checkout, so gh cannot infer the repo
+   * and `gh pr list --head` fails without --repo (WO-HARNESS-CONDUCTOR-PR-
+   * DETECTION-REPO-01 Fix C). When absent, the branch-lookup fallback is skipped
+   * entirely and logged -- gh is never called without --repo.
    */
-  ghPrListForBranch?: (branch: string) => Promise<string | null>;
+  repo?: string;
+  /**
+   * Injectable seam for the `gh pr list --head <branch> --repo <repo>` lookup.
+   * Test-only: production always uses the real gh CLI (ghPrListForBranchDefault).
+   * Returns the PR URL for the branch, or null when gh is unavailable / no PR is
+   * found. Receives the repo so the real gh call can pass --repo.
+   */
+  ghPrListForBranch?: (branch: string, repo: string) => Promise<string | null>;
   /**
    * Injectable seam for `gh pr view --json mergeable`. Test-only:
    * production always uses the real gh CLI (checkPrMergeableDefault).
@@ -200,6 +210,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     prRetryDelayMs = 10_000,
     prBranchLookupAttempts = 3,
     prBranchLookupDelayMs = 10_000,
+    repo,
     ghPrListForBranch = ghPrListForBranchDefault,
     checkPrMergeable: checkPrMergeableFn = checkPrMergeableDefault,
   } = opts;
@@ -261,7 +272,8 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
             events,
             ghPrListForBranch,
             prBranchLookupAttempts,
-            prBranchLookupDelayMs
+            prBranchLookupDelayMs,
+            repo
           );
           if (prUrl !== null) {
             console.log(
@@ -472,7 +484,17 @@ function extractPrUrl(
     const stepName = ev.step_name ?? '';
     if (stepName !== 'open-pr' && !stepName.toLowerCase().includes('pr')) continue;
 
-    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+    // The executor stores node text under data.node_output; older events used
+    // data.output. Read node_output first, falling back to output (WO-HARNESS-
+    // CONDUCTOR-PR-DETECTION-REPO-01 Fix A). This also subsumes Fix B: once the
+    // real node text is read, the bare github pull URL that open-pr-if-needed
+    // prints as its final line is matched by the raw-URL fallback below.
+    const output =
+      typeof ev.data.node_output === 'string'
+        ? ev.data.node_output
+        : typeof ev.data.output === 'string'
+          ? ev.data.output
+          : '';
     const match = prUrlPattern.exec(output);
     if (match?.[1]) return match[1];
 
@@ -518,14 +540,30 @@ function extractPrUrl(
  */
 async function findExistingPrForBranch(
   events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[],
-  lookup: (branch: string) => Promise<string | null>,
+  lookup: (branch: string, repo: string) => Promise<string | null>,
   attempts: number,
-  delayMs: number
+  delayMs: number,
+  repo: string | undefined
 ): Promise<string | null> {
+  // Without a repo, the default gh lookup cannot run (the conductor's cwd is not
+  // a git checkout, so gh cannot infer the repo). Skip the fallback and log why
+  // rather than calling gh without --repo (WO-HARNESS-CONDUCTOR-PR-DETECTION-
+  // REPO-01 Fix C). Fail-closed: the gate reads this as "no PR" and climbs.
+  if (!repo) {
+    console.log('[smart-cauldron/poll] skipping branch-lookup fallback: no repo available');
+    return null;
+  }
+
   // The commit-and-push node reports its final target as unique_branch=<name>.
+  // Read node_output first (the executor's key), falling back to output.
   let branch: string | null = null;
   for (const ev of events) {
-    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+    const output =
+      typeof ev.data.node_output === 'string'
+        ? ev.data.node_output
+        : typeof ev.data.output === 'string'
+          ? ev.data.output
+          : '';
     const m = /unique_branch=(\S+)/.exec(output);
     if (m?.[1]) branch = m[1];
   }
@@ -537,24 +575,40 @@ async function findExistingPrForBranch(
     if (attempt > 0) {
       await new Promise<void>(resolve => setTimeout(resolve, delayMs));
     }
-    const url = await lookup(branch);
+    const url = await lookup(branch, repo);
     if (url !== null) return url;
   }
   return null;
 }
 
 /**
- * Default `gh pr list --head <branch>` lookup used in production. Returns the
- * open PR URL for the branch, or null when gh is unavailable or nothing matches.
- * Callers must treat null as "unknown", never as "confirmed absent".
+ * Default `gh pr list --head <branch> --repo <repo>` lookup used in production.
+ * Returns the open PR URL for the branch, or null when gh is unavailable or
+ * nothing matches. Callers must treat null as "unknown", never as "confirmed
+ * absent".
+ *
+ * --repo is REQUIRED (WO-HARNESS-CONDUCTOR-PR-DETECTION-REPO-01 Fix C): the
+ * conductor's cwd (/app) is not a git checkout, so gh cannot infer the repo and
+ * the call fails without it. On failure the gh stderr first line is logged
+ * (not swallowed) so an environment failure is visible.
+ *
+ * `exec` is an injectable seam (test-only): production always uses the module's
+ * real execFileAsync. Exported so tests can assert the constructed argv without
+ * resorting to process-global mock.module().
  */
-async function ghPrListForBranchDefault(branch: string): Promise<string | null> {
+export async function ghPrListForBranchDefault(
+  branch: string,
+  repo: string,
+  exec: typeof execFileAsync = execFileAsync
+): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync('gh', [
+    const { stdout } = await exec('gh', [
       'pr',
       'list',
       '--head',
       branch,
+      '--repo',
+      repo,
       '--state',
       'open',
       '--json',
@@ -564,7 +618,10 @@ async function ghPrListForBranchDefault(branch: string): Promise<string | null> 
     ]);
     const url = stdout.trim();
     return url.length > 0 ? url : null;
-  } catch {
+  } catch (err) {
+    console.log(
+      `[smart-cauldron/poll] gh pr list --repo ${repo} --head ${branch} failed: ${(err as Error).message.split('\n')[0]}`
+    );
     return null;
   }
 }
@@ -597,7 +654,10 @@ async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
     if (val === 'MERGEABLE') return true;
     if (val === 'CONFLICTING' || val === 'BLOCKED') return false;
     return null;
-  } catch {
+  } catch (err) {
+    console.log(
+      `[smart-cauldron/poll] gh pr view ${prUrl} failed: ${(err as Error).message.split('\n')[0]}`
+    );
     return null;
   }
 }
