@@ -96,6 +96,84 @@ describe('substituteWorkflowVariables', () => {
     expect(prompt).toBe('No branch reference here');
   });
 
+  // WO-MATRIX-M1-DSFLASH-01 / bdc-harness #877 -- a longer shell variable that merely
+  // starts with a workflow variable name must reach the bash node unchanged.
+  it('leaves prefix-extended names $BASE_BRANCH_OVERRIDE and $BASE_BRANCH_PR intact', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'BASE_BRANCH_OVERRIDE=$(printf %s "$BASE_BRANCH_OVERRIDE")\nPR_BASE=$BASE_BRANCH_PR\n',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toContain('$BASE_BRANCH_OVERRIDE');
+    expect(prompt).toContain('$BASE_BRANCH_PR');
+    expect(prompt).not.toContain('dev_OVERRIDE');
+    expect(prompt).not.toContain('dev_PR');
+  });
+
+  it('still substitutes $BASE_BRANCH when followed by a non-identifier character', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'a $BASE_BRANCH b $BASE_BRANCH/x c $BASE_BRANCH. d $BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('a dev b dev/x c dev. d dev)');
+  });
+
+  it('does not throw for an empty baseBranch when only $BASE_BRANCH_OVERRIDE is referenced', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'only $BASE_BRANCH_OVERRIDE here',
+      'run-1',
+      'msg',
+      '/tmp',
+      '',
+      'docs/'
+    );
+    expect(prompt).toBe('only $BASE_BRANCH_OVERRIDE here');
+  });
+
+  it('still throws for an empty baseBranch when $BASE_BRANCH is referenced', () => {
+    expect(() =>
+      substituteWorkflowVariables('merge into $BASE_BRANCH now', 'run-1', 'msg', '/tmp', '', 'docs/')
+    ).toThrow('No base branch could be resolved');
+  });
+
+  const boundedVariableNames = [
+    'WORKFLOW_ID',
+    'USER_MESSAGE',
+    'ARGUMENTS',
+    'ARTIFACTS_DIR',
+    'DOCS_DIR',
+    'LOOP_USER_INPUT',
+    'REJECTION_REASON',
+    'LOOP_PREV_OUTPUT',
+  ];
+
+  for (const name of boundedVariableNames) {
+    it('bounds $' + name + ' so a suffix-extended name is left verbatim', () => {
+      const { prompt } = substituteWorkflowVariables(
+        'exact=$' + name + ' suffix=$' + name + '_SUFFIX',
+        'run-9',
+        'hello',
+        '/tmp/artifacts',
+        'dev',
+        'docs/'
+      );
+      expect(prompt).toContain('$' + name + '_SUFFIX');
+      expect(prompt).not.toMatch(new RegExp('\\$' + name + '(?![A-Za-z0-9_])'));
+      expect(prompt).not.toContain('hello_SUFFIX');
+      expect(prompt).not.toContain('run-9_SUFFIX');
+      expect(prompt).not.toContain('dev_SUFFIX');
+      expect(prompt).not.toContain('/tmp/artifacts_SUFFIX');
+      expect(prompt).not.toContain('docs/_SUFFIX');
+    });
+  }
+
   it('replaces $USER_MESSAGE and $ARGUMENTS with user message', () => {
     const { prompt } = substituteWorkflowVariables(
       'Goal: $USER_MESSAGE. Args: $ARGUMENTS',
