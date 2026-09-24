@@ -364,6 +364,20 @@ describe('POST /api/workflows/:name/run model overrides', () => {
     });
   });
 
+  test('rejects an empty override provider', async () => {
+    const response = await request({
+      conversationId: 'override-empty-provider',
+      message: 'run it',
+      modelOverride: { workflow: { provider: '', model: 'sonnet' } },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_empty_provider',
+    });
+  });
+
   test('rejects modelOverride combined with conductor dispatch', async () => {
     const response = await request({
       conversationId: 'override-conductor',
