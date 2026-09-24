@@ -2211,35 +2211,16 @@ async function executeNodeInternal(
   const effectiveIdleTimeout = resolveStepIdleTimeoutMs(node.idle_timeout);
   let nodeChunksSeen = 0;
   let lastNodeProgressEventAt = 0;
-  const nodeProgressEventMs = (() => {
+  const nodeProgressEventMs = ((): number => {
     const fromEnv = Number.parseInt(process.env.ARCHON_NODE_PROGRESS_EVENT_MS ?? '', 10);
     if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
     return 60_000;
   })();
-  const cancelPollMs = (() => {
+  const cancelPollMs = ((): number => {
     const fromEnv = Number.parseInt(process.env.ARCHON_NODE_CANCEL_POLL_MS ?? '', 10);
     if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
     return CANCEL_CHECK_INTERVAL_MS;
   })();
-  const cancelPoll = setInterval(() => {
-    void deps.store
-      .getWorkflowRunStatus(workflowRun.id)
-      .then(status => {
-        if (!shouldContinueStreamingForStatus(status)) {
-          getLog().info(
-            { workflowRunId: workflowRun.id, nodeId: node.id, status: status ?? 'deleted' },
-            'dag.stop_detected_during_streaming'
-          );
-          nodeAbortController.abort();
-        }
-      })
-      .catch((cancelCheckErr: unknown) => {
-        getLog().warn(
-          { err: cancelCheckErr as Error, workflowRunId: workflowRun.id, nodeId: node.id },
-          'dag.status_check_failed'
-        );
-      });
-  }, cancelPollMs);
   let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
   let providerAttempt = await beginProviderAttempt(
     deps,
@@ -2250,8 +2231,31 @@ async function executeNodeInternal(
     declaredModelId
   );
   let providerAttemptCompleted = false;
+  // Started only after the attempt is reserved. beginProviderAttempt throws on
+  // ceiling, persist failure, and a rejecting listProviderAttempts; those paths
+  // must not leave this interval alive for the process lifetime.
+  let cancelPoll: ReturnType<typeof setInterval> | undefined;
 
   try {
+    cancelPoll = setInterval(() => {
+      void deps.store
+        .getWorkflowRunStatus(workflowRun.id)
+        .then(status => {
+          if (!shouldContinueStreamingForStatus(status)) {
+            getLog().info(
+              { workflowRunId: workflowRun.id, nodeId: node.id, status: status ?? 'deleted' },
+              'dag.stop_detected_during_streaming'
+            );
+            nodeAbortController.abort();
+          }
+        })
+        .catch((cancelCheckErr: unknown) => {
+          getLog().warn(
+            { err: cancelCheckErr as Error, workflowRunId: workflowRun.id, nodeId: node.id },
+            'dag.status_check_failed'
+          );
+        });
+    }, cancelPollMs);
     for await (const msg of withIdleTimeout(
       aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, nodeOptionsWithAbort),
       effectiveIdleTimeout,
@@ -3163,7 +3167,7 @@ async function executeNodeInternal(
         : {}),
     };
   } finally {
-    clearInterval(cancelPoll);
+    if (cancelPoll !== undefined) clearInterval(cancelPoll);
   }
 }
 

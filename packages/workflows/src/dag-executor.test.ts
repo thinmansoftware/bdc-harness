@@ -14602,6 +14602,10 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
     );
     expect(progressIdx).toBeGreaterThanOrEqual(0);
     expect(progressIdx).toBeLessThan(failedIdx);
+    const progress = events[progressIdx];
+    expect(progress?.data?.provider).toBe('claude');
+    expect(progress?.data?.last_chunk_type).toBe('assistant');
+    expect(progress?.data?.chunks_seen).toBe(1);
   });
 
   it('a chatty healthy node is not killed and its progress is throttled', async () => {
@@ -14634,6 +14638,14 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
       expect(completed).toHaveLength(1);
       expect(progress.length).toBeGreaterThanOrEqual(2);
       expect(progress.length).toBeLessThanOrEqual(10);
+      expect(progress[0]?.data?.provider).toBe('claude');
+      expect(progress[0]?.data?.last_chunk_type).toBe('assistant');
+      expect(progress[0]?.data?.chunks_seen).toBe(1);
+      for (const event of progress) {
+        expect(event.data?.provider).toBe('claude');
+        expect(typeof event.data?.last_chunk_type).toBe('string');
+        expect(event.data?.last_chunk_type).not.toBe('');
+      }
     } finally {
       if (prev === undefined) delete process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
       else process.env.ARCHON_NODE_PROGRESS_EVENT_MS = prev;

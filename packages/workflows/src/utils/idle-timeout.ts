@@ -144,7 +144,7 @@ export async function* withIdleTimeout<T>(
               resolve(ABORT_SENTINEL);
             };
             abortSignal.addEventListener('abort', onAbort);
-            removeAbortListener = () => {
+            removeAbortListener = (): void => {
               abortSignal.removeEventListener('abort', onAbort);
             };
             if (abortSignal.aborted) resolve(ABORT_SENTINEL);

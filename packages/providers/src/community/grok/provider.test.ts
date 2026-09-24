@@ -164,7 +164,8 @@ describe('GrokAgentProvider', () => {
       );
       expect(
         chunks.some(
-          chunk => typeof chunk.content === 'string' && chunk.content.startsWith('[grok-agent tool]')
+          chunk =>
+            typeof chunk.content === 'string' && chunk.content.startsWith('[grok-agent tool]')
         )
       ).toBe(false);
       const firstOptions = mockCreate.mock.calls[0]?.[1] as { signal?: AbortSignal } | undefined;
