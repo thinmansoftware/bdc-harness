@@ -12,7 +12,7 @@
 import { randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
-import type { QueryResult } from './adapters/types';
+import type { IDatabase, QueryResult } from './adapters/types';
 import {
   withOverseerControlPlaneImmediateTransaction,
   type OverseerControlPlaneQuery,
@@ -1583,4 +1583,94 @@ export async function setSuppression(threadRef: string, hash: string): Promise<v
 /** Delete a suppression row (suppression lift: the work moved). */
 export async function clearSuppression(threadRef: string): Promise<void> {
   await getDatabase().query('DELETE FROM tm_suppression WHERE thread_ref = $1', [threadRef]);
+}
+
+// ---------------------------------------------------------------------------
+// Escalation delivery claims (migration 057,
+// WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01)
+// ---------------------------------------------------------------------------
+
+/** Anything with the IDatabase query signature (an adapter or a test double). */
+type TmClaimQuery = Pick<IDatabase, 'query'>;
+
+/**
+ * Atomically CLAIM the right to deliver a Taskmaster escalation comment to one
+ * GitHub issue. Returns the new claim id, or null when another attempt holds
+ * the issue.
+ *
+ * The row for an issue is taken over only when it is FREE:
+ *   - no row exists, or
+ *   - it is an in-flight claim (posted_at NULL) whose lease has expired -- a
+ *     crashed attempt never locks the issue past its lease, or
+ *   - it recorded a post (posted_at set) older than the cooldown hold.
+ * A released claim is deleted, so it is free immediately.
+ *
+ * ONE statement decides the claim: INSERT ... ON CONFLICT DO UPDATE ... WHERE
+ * <free> RETURNING. SQLite runs it under its single-writer lock; PostgreSQL
+ * row-locks the conflicting row and re-evaluates the WHERE against the latest
+ * committed version, so two processes sharing the database cannot both win.
+ * Timestamps are ISO-8601 UTC strings (Date#toISOString), which compare
+ * correctly as text on both adapters.
+ */
+export async function claimEscalationDelivery(
+  data: {
+    issue_key: string;
+    now_iso: string;
+    lease_expires_at: string;
+    /** A recorded post older than this no longer holds the issue. */
+    hold_cutoff_iso: string;
+  },
+  database: TmClaimQuery = getDatabase()
+): Promise<string | null> {
+  const claimId = randomUUID();
+  const result = await database.query<{ claim_id: string }>(
+    `INSERT INTO tm_escalation_claims (issue_key, claim_id, claimed_at, lease_expires_at, posted_at)
+     VALUES ($1, $2, $3, $4, NULL)
+     ON CONFLICT (issue_key) DO UPDATE SET
+       claim_id = excluded.claim_id,
+       claimed_at = excluded.claimed_at,
+       lease_expires_at = excluded.lease_expires_at,
+       posted_at = NULL
+     WHERE (tm_escalation_claims.posted_at IS NULL
+            AND tm_escalation_claims.lease_expires_at <= $3)
+        OR (tm_escalation_claims.posted_at IS NOT NULL
+            AND tm_escalation_claims.posted_at <= $5)
+     RETURNING claim_id`,
+    [data.issue_key, claimId, data.now_iso, data.lease_expires_at, data.hold_cutoff_iso]
+  );
+  return result.rows[0]?.claim_id === claimId ? claimId : null;
+}
+
+/**
+ * Record that the claim's comment was posted: the row now holds the issue
+ * until posted_at + cooldown. Fenced on claim_id, so a claim whose lease
+ * expired and was taken over cannot overwrite the new holder. Returns whether
+ * the row was updated.
+ */
+export async function completeEscalationDelivery(
+  data: { issue_key: string; claim_id: string; posted_at: string },
+  database: TmClaimQuery = getDatabase()
+): Promise<boolean> {
+  const result = await database.query(
+    `UPDATE tm_escalation_claims SET posted_at = $3
+     WHERE issue_key = $1 AND claim_id = $2 AND posted_at IS NULL`,
+    [data.issue_key, data.claim_id, data.posted_at]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * Release an in-flight claim that posted nothing (suppressed or failed).
+ * Fenced on claim_id and posted_at IS NULL so it can never free a claim that
+ * another attempt now holds or one that recorded a post.
+ */
+export async function releaseEscalationDelivery(
+  data: { issue_key: string; claim_id: string },
+  database: TmClaimQuery = getDatabase()
+): Promise<void> {
+  await database.query(
+    `DELETE FROM tm_escalation_claims
+     WHERE issue_key = $1 AND claim_id = $2 AND posted_at IS NULL`,
+    [data.issue_key, data.claim_id]
+  );
 }

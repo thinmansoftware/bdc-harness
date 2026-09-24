@@ -3671,6 +3671,41 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     expect(sent[0]?.grade).toBe('delivered_to_issue');
   });
 
+  test('claim held by another attempt -> expired with suppressed=claim_held, nothing posted', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    let lists = 0;
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: {
+        ...gh.delivery,
+        listIssueComments: async (...args) => {
+          lists += 1;
+          return gh.delivery.listIssueComments(...args);
+        },
+        claim: {
+          claim: async () => null,
+          complete: async () => {},
+          release: async () => {},
+        },
+      },
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    const result = await tick(createTaskmasterState(60_000), deps);
+
+    // The claim is taken BEFORE the GitHub list+post: neither happens.
+    expect(lists).toBe(0);
+    expect(gh.posts()).toBe(0);
+    expect(result.effects).toBe(0);
+    expect(result.expired).toBe(1);
+    const row = world.journal.find(j => j.thread_ref === P0_REF && j.action_type === 'escalate_p0');
+    expect(row?.outcome).toBe('expired');
+    expect(row?.grade).toBeNull();
+    expect(JSON.parse(row?.proposal_json ?? '{}').suppressed).toBe('claim_held');
+  });
+
   test('suppressed escalations do not consume the per-item 24h intervention cap or the floor', async () => {
     const world = makeWorld();
     seedDigestSent(world);

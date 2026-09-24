@@ -41,6 +41,7 @@ import {
 import { validateProposal, type TmAllowedRecipient } from './guard';
 import {
   buildEscalationCommentBody,
+  createDbEscalationDeliveryClaim,
   createRealEscalationDeliveryDeps,
   deliverEscalationToIssue,
   parseGithubThreadRef,
@@ -211,7 +212,9 @@ export interface TaskmasterDeps {
    * GitHub-issue escalation delivery seam
    * (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). Tests inject fake
    * listIssueComments/postIssueComment; production defaults to
-   * createRealEscalationDeliveryDeps().
+   * createRealEscalationDeliveryDeps(). The per-issue delivery claim comes
+   * from escalationDelivery.claim when provided, else the database-backed
+   * claim when the real DAL is in use (no deps.db), else none.
    */
   escalationDelivery?: EscalationDeliveryDeps;
 }
@@ -1714,15 +1717,21 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         //   - posted:true  -> the row is 'sent' + graded 'delivered_to_issue'
         //     (excluded from the M-155 useful-rate floor, like 'unheard') and
         //     counts as a tick effect.
-        //   - posted:false -> a marker comment inside the 72h cooldown already
-        //     covers this issue, so NOTHING was delivered. The row is closed as
-        //     'expired' (the existing "journaled, never performed, terminal for
-        //     this key" outcome) with proposal_json.suppressed='cooldown_marker',
-        //     and is NOT graded. It is not a tick effect, does not mark the
-        //     thread touched, and -- because the per-item 24h intervention cap
-        //     (interventions24hByThread), the adoption attempt counts, and
-        //     gradeSentActions all read only outcome='sent' -- it consumes no
-        //     intervention budget and never enters the useful-rate floor.
+        //   - posted:false -> NOTHING was delivered: either another attempt holds
+        //     the issue's delivery claim (suppressedBy 'claim_held') or a marker
+        //     comment inside the 72h cooldown already covers the issue
+        //     ('cooldown_marker'). The row is closed as 'expired' (the existing
+        //     "journaled, never performed, terminal for this key" outcome) with
+        //     proposal_json.suppressed=<reason>, and is NOT graded. It is not a
+        //     tick effect, does not mark the thread touched, and -- because the
+        //     per-item 24h intervention cap (interventions24hByThread), the
+        //     adoption attempt counts, and gradeSentActions all read only
+        //     outcome='sent' -- it consumes no intervention budget and never
+        //     enters the useful-rate floor.
+        //
+        // The per-issue claim (tm_escalation_claims, migration 057) is taken
+        // BEFORE the GitHub list+post, so two ticks or processes sharing the
+        // database cannot both pass the marker check and both post.
         const adoptionRow = adoptionByRef.get(canonicalizeThreadRef(proposal.threadRef));
         const body = buildEscalationCommentBody({
           title: adoptionRow?.title ?? null,
@@ -1732,16 +1741,21 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           ownerLabelLogin: parseOwnerLabel(adoptionRow?.labels_json),
           nowMs,
         });
-        const delivery = deps.escalationDelivery ?? createRealEscalationDeliveryDeps();
+        const baseDelivery = deps.escalationDelivery ?? createRealEscalationDeliveryDeps();
+        const delivery: EscalationDeliveryDeps =
+          baseDelivery.claim || deps.db
+            ? baseDelivery
+            : { ...baseDelivery, claim: createDbEscalationDeliveryClaim() };
         const delivered = await deliverEscalationToIssue(
           { issue: escalationIssue, threadRef: proposal.threadRef, body },
           delivery
         );
         if (!delivered.posted) {
+          const suppressed = delivered.suppressedBy ?? 'cooldown_marker';
           await dal.updateActionOutcome(
             journalRow.id,
             'expired',
-            JSON.stringify({ ...proposal, suppressed: 'cooldown_marker' })
+            JSON.stringify({ ...proposal, suppressed })
           );
           journalRow.outcome = 'expired';
           result.expired += 1;
@@ -1750,8 +1764,9 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
               actionType: proposal.type,
               threadRef: proposal.threadRef,
               idempotencyKey: proposal.idempotencyKey,
+              suppressed,
             },
-            'taskmaster.escalation_suppressed_cooldown'
+            'taskmaster.escalation_suppressed'
           );
           continue;
         }

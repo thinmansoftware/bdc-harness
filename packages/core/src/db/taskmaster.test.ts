@@ -16,7 +16,10 @@ import { createAuthenticatedMessage } from './dispatch';
 import {
   abandonAdoptionSnapshot,
   beginAdoptionSnapshot,
+  claimEscalationDelivery,
   clearSuppression,
+  completeEscalationDelivery,
+  releaseEscalationDelivery,
   commitAdoptionSnapshot,
   expireParkedActions,
   getSuppression,
@@ -2578,5 +2581,125 @@ describe('front door cap serializes on PostgreSQL (Overseer PR 810 round 3)', ()
       const insert = spy.statements.find(s => s.startsWith('INSERT INTO tm_expectations')) ?? '';
       expect(insert).not.toContain('SELECT COUNT(*)');
     });
+  });
+});
+
+describe('tm_escalation_claims DAL (migration 057)', () => {
+  const T = Date.parse('2026-09-24T12:00:00.000Z');
+  const LEASE_MS = 30 * 60 * 1000;
+  const HOLD_MS = 72 * 60 * 60 * 1000;
+  const iso = (ms: number): string => new Date(ms).toISOString();
+  const claimAt = (issueKey: string, nowMs: number, database?: SqliteAdapter) =>
+    claimEscalationDelivery(
+      {
+        issue_key: issueKey,
+        now_iso: iso(nowMs),
+        lease_expires_at: iso(nowMs + LEASE_MS),
+        hold_cutoff_iso: iso(nowMs - HOLD_MS),
+      },
+      database
+    );
+
+  test('a second claim on the same issue loses while the first is in flight', async () => {
+    const first = await claimAt('o/r#1', T);
+    expect(first).not.toBeNull();
+    expect(await claimAt('o/r#1', T + 60_000)).toBeNull();
+  });
+
+  test('concurrent claims from two adapters on one database file: exactly one wins', async () => {
+    const second = new SqliteAdapter(currentDbPath);
+    try {
+      const results = await Promise.all([claimAt('o/r#1', T, db), claimAt('o/r#1', T, second)]);
+      expect(results.filter(r => r !== null)).toHaveLength(1);
+    } finally {
+      await second.close();
+    }
+  });
+
+  test('different issues never block each other', async () => {
+    expect(await claimAt('o/r#1', T)).not.toBeNull();
+    expect(await claimAt('o/r#2', T)).not.toBeNull();
+    expect(await claimAt('o/other#1', T)).not.toBeNull();
+  });
+
+  test('a crashed in-flight claim expires at its lease and can be re-claimed', async () => {
+    const crashed = await claimAt('o/r#1', T);
+    expect(crashed).not.toBeNull();
+    expect(await claimAt('o/r#1', T + LEASE_MS - 1)).toBeNull();
+    const next = await claimAt('o/r#1', T + LEASE_MS);
+    expect(next).not.toBeNull();
+    expect(next).not.toBe(crashed);
+    // The stale claim is fenced: it can neither complete nor release the new one.
+    expect(
+      await completeEscalationDelivery({
+        issue_key: 'o/r#1',
+        claim_id: crashed as string,
+        posted_at: iso(T + LEASE_MS),
+      })
+    ).toBe(false);
+    await releaseEscalationDelivery({ issue_key: 'o/r#1', claim_id: crashed as string });
+    expect(await claimAt('o/r#1', T + LEASE_MS + 1)).toBeNull();
+  });
+
+  test('a completed claim holds the issue for the cooldown, then frees it', async () => {
+    const id = await claimAt('o/r#1', T);
+    expect(
+      await completeEscalationDelivery({
+        issue_key: 'o/r#1',
+        claim_id: id as string,
+        posted_at: iso(T),
+      })
+    ).toBe(true);
+    // Past the in-flight lease but inside the hold: still held.
+    expect(await claimAt('o/r#1', T + LEASE_MS + 60_000)).toBeNull();
+    // A completed claim cannot be released (release is for posts that never happened).
+    await releaseEscalationDelivery({ issue_key: 'o/r#1', claim_id: id as string });
+    expect(await claimAt('o/r#1', T + HOLD_MS - 1)).toBeNull();
+    expect(await claimAt('o/r#1', T + HOLD_MS)).not.toBeNull();
+  });
+
+  test('a released claim frees the issue immediately', async () => {
+    const id = await claimAt('o/r#1', T);
+    await releaseEscalationDelivery({ issue_key: 'o/r#1', claim_id: id as string });
+    expect(await claimAt('o/r#1', T + 1)).not.toBeNull();
+  });
+
+  test('old-shape upgrade: a pre-057 database gains the table without losing rows', async () => {
+    const legacyPath = join(tmpdir(), `taskmaster-pre057-${Date.now()}-${Math.random()}.db`);
+    // Build the shape the previous release leaves on disk: full schema, then
+    // drop the table this migration adds, and keep live journal data in it.
+    const seedAdapter = new SqliteAdapter(legacyPath);
+    await seedAdapter.close();
+    const seed = new Database(legacyPath);
+    seed.run('DROP TABLE tm_escalation_claims');
+    seed.run(
+      `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome, grade)
+       VALUES ('pre057-journal-1', '2026-09-20T00:00:00.000Z', 'gh:o/r#1', 'escalate_p0', '{}', 'sent', 'delivered_to_issue')`
+    );
+    const before = seed
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tm_escalation_claims'"
+      )
+      .all();
+    expect(before).toHaveLength(0);
+    seed.close();
+
+    const upgraded = new SqliteAdapter(legacyPath);
+    try {
+      const table = await upgraded.query<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tm_escalation_claims'"
+      );
+      expect(table.rows).toHaveLength(1);
+      const preserved = await upgraded.query<{ id: string; grade: string | null }>(
+        "SELECT id, grade FROM tm_journal WHERE id = 'pre057-journal-1'"
+      );
+      expect(preserved.rows).toEqual([{ id: 'pre057-journal-1', grade: 'delivered_to_issue' }]);
+      // The claim path works against the upgraded (not freshly created) database.
+      expect(await claimAt('o/r#1', T, upgraded)).not.toBeNull();
+      expect(await claimAt('o/r#1', T, upgraded)).toBeNull();
+    } finally {
+      await upgraded.close();
+      cleanupDb(legacyPath);
+    }
   });
 });

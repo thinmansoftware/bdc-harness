@@ -2395,6 +2395,18 @@ export class SqliteAdapter implements IDatabase {
         suppressed_at TEXT NOT NULL,
         noise_grade_count INTEGER NOT NULL DEFAULT 2
       );
+
+      -- Taskmaster escalation delivery claims (migration 057,
+      -- WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). One row per GitHub issue;
+      -- serializes the list-then-post escalation comment. Additive: existing
+      -- databases gain the table here because createSchema runs on every open.
+      CREATE TABLE IF NOT EXISTS tm_escalation_claims (
+        issue_key TEXT PRIMARY KEY,
+        claim_id TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL,
+        posted_at TEXT
+      );
     `);
     getLog().info('db.sqlite_schema_initialized');
   }

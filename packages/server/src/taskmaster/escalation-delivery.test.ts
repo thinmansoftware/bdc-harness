@@ -1,23 +1,33 @@
 /**
  * Unit tests for the Taskmaster escalation-delivery module
  * (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). Everything is
- * dependency-injected (fake comment store, fake clock); no network.
+ * dependency-injected (fake comment store, fake clock); no network. The
+ * delivery-claim tests use the REAL database-backed claim on a temp SQLite
+ * file (two adapters on one file model two processes sharing the DB).
  */
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { unlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
   ESCALATION_COMMENT_MAX_PAGES,
   ESCALATION_TITLE_MAX_CHARS,
   buildEscalationCommentBody,
+  createDbEscalationDeliveryClaim,
   createRealEscalationDeliveryDeps,
   deliverEscalationToIssue,
+  escalationClaimLeaseMs,
+  escalationIssueKey,
   isValidGithubLogin,
   parseGithubThreadRef,
   parseNextLink,
   parseOwnerLabel,
   resolveEscalateToIssueEnabled,
   sanitizeExternalText,
+  type EscalationDeliveryDeps,
   type EscalationIssueComment,
   type EscalationIssueRef,
 } from './escalation-delivery';
@@ -468,5 +478,206 @@ describe('createRealEscalationDeliveryDeps (fake fetch)', () => {
     ).rejects.toThrow('taskmaster_github_comment_pages_exceeded');
     expect(gets).toBe(ESCALATION_COMMENT_MAX_PAGES);
     expect(posts).toBe(0);
+  });
+});
+
+describe('per-issue delivery claim (tm_escalation_claims, real SQLite)', () => {
+  const ISSUE_B: EscalationIssueRef = {
+    owner: 'thinmansoftware',
+    repo: 'bdc-harness',
+    number: 195,
+  };
+  let dbPath = '';
+  let processA: SqliteAdapter;
+  let processB: SqliteAdapter;
+
+  beforeEach(() => {
+    dbPath = join(tmpdir(), `escalation-claim-${Date.now()}-${Math.random()}.db`);
+    // Two adapters on ONE file: two Taskmaster processes sharing the database.
+    processA = new SqliteAdapter(dbPath);
+    processB = new SqliteAdapter(dbPath);
+  });
+
+  afterEach(async () => {
+    await processA.close();
+    await processB.close();
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        unlinkSync(dbPath + suffix);
+      } catch {
+        /* file may not exist */
+      }
+    }
+  });
+
+  /**
+   * Fake GitHub shared by both "processes". listIssueComments yields to the
+   * event loop before answering, so two unserialized deliveries BOTH see no
+   * marker -- the exact list-then-post race the claim exists to close.
+   */
+  function sharedGithub(): {
+    posts: EscalationIssueRef[];
+    deps: (clock: () => number) => EscalationDeliveryDeps;
+  } {
+    const byIssue = new Map<string, EscalationIssueComment[]>();
+    const posts: EscalationIssueRef[] = [];
+    return {
+      posts,
+      deps: clock => ({
+        listIssueComments: async issue => {
+          // Read now, answer later: a concurrent caller reads the same state.
+          const snapshot = [...(byIssue.get(escalationIssueKey(issue)) ?? [])];
+          await new Promise(resolve => setTimeout(resolve, 5));
+          return snapshot;
+        },
+        postIssueComment: async (issue, body) => {
+          posts.push(issue);
+          const list = byIssue.get(escalationIssueKey(issue)) ?? [];
+          list.push({ body, created_at: new Date(clock()).toISOString() });
+          byIssue.set(escalationIssueKey(issue), list);
+        },
+        now: () => new Date(clock()),
+      }),
+    };
+  }
+
+  function params(issue: EscalationIssueRef): {
+    issue: EscalationIssueRef;
+    threadRef: string;
+    body: string;
+  } {
+    return {
+      issue,
+      threadRef: `gh:${issue.owner}/${issue.repo}#${issue.number}`,
+      body: `${TASKMASTER_ESCALATION_MARKER}\n\nbody`,
+    };
+  }
+
+  test('control: without a claim, two concurrent deliveries both post (the race is real)', async () => {
+    const gh = sharedGithub();
+    const clock = (): number => T0;
+    const results = await Promise.all([
+      deliverEscalationToIssue(params(ISSUE), gh.deps(clock)),
+      deliverEscalationToIssue(params(ISSUE), gh.deps(clock)),
+    ]);
+    expect(results.every(r => r.posted)).toBe(true);
+    expect(gh.posts).toHaveLength(2);
+  });
+
+  test('two concurrent deliveries for the same issue from two processes -> exactly one post', async () => {
+    const gh = sharedGithub();
+    const clock = (): number => T0;
+    const results = await Promise.all([
+      deliverEscalationToIssue(params(ISSUE), {
+        ...gh.deps(clock),
+        claim: createDbEscalationDeliveryClaim(processA),
+      }),
+      deliverEscalationToIssue(params(ISSUE), {
+        ...gh.deps(clock),
+        claim: createDbEscalationDeliveryClaim(processB),
+      }),
+    ]);
+    expect(gh.posts).toHaveLength(1);
+    expect(results.filter(r => r.posted)).toHaveLength(1);
+    expect(results.find(r => !r.posted)?.suppressedBy).toBe('claim_held');
+  });
+
+  test('a crashed attempt holds the issue only until its lease expires', async () => {
+    const gh = sharedGithub();
+    let nowMs = T0;
+    const clock = (): number => nowMs;
+    // Process A claims and "crashes": no list, no post, no release.
+    const crashed = await createDbEscalationDeliveryClaim(processA).claim(
+      escalationIssueKey(ISSUE),
+      T0
+    );
+    expect(crashed).not.toBeNull();
+
+    // Inside the lease: process B must not post.
+    nowMs = T0 + 60_000;
+    const blocked = await deliverEscalationToIssue(params(ISSUE), {
+      ...gh.deps(clock),
+      claim: createDbEscalationDeliveryClaim(processB),
+    });
+    expect(blocked).toEqual({ posted: false, suppressedBy: 'claim_held' });
+    expect(gh.posts).toHaveLength(0);
+
+    // After the lease: the next attempt claims and posts.
+    nowMs = T0 + escalationClaimLeaseMs() + 1;
+    const recovered = await deliverEscalationToIssue(params(ISSUE), {
+      ...gh.deps(clock),
+      claim: createDbEscalationDeliveryClaim(processB),
+    });
+    expect(recovered.posted).toBe(true);
+    expect(gh.posts).toHaveLength(1);
+  });
+
+  test('different issues are not serialized against each other', async () => {
+    const gh = sharedGithub();
+    const clock = (): number => T0;
+    const results = await Promise.all([
+      deliverEscalationToIssue(params(ISSUE), {
+        ...gh.deps(clock),
+        claim: createDbEscalationDeliveryClaim(processA),
+      }),
+      deliverEscalationToIssue(params(ISSUE_B), {
+        ...gh.deps(clock),
+        claim: createDbEscalationDeliveryClaim(processB),
+      }),
+    ]);
+    expect(results.every(r => r.posted)).toBe(true);
+    expect(gh.posts.map(i => i.number).sort()).toEqual([194, 195]);
+  });
+
+  test('a posted claim holds for the cooldown even if the marker is not listed yet', async () => {
+    let nowMs = T0;
+    let posts = 0;
+    // GitHub listing that never shows the comment (e.g. read-after-write lag).
+    const blindGithub: EscalationDeliveryDeps = {
+      listIssueComments: async () => [],
+      postIssueComment: async () => {
+        posts += 1;
+      },
+      now: () => new Date(nowMs),
+      claim: createDbEscalationDeliveryClaim(processA),
+    };
+    expect((await deliverEscalationToIssue(params(ISSUE), blindGithub)).posted).toBe(true);
+    nowMs = T0 + escalationClaimLeaseMs() + 60_000;
+    expect(await deliverEscalationToIssue(params(ISSUE), blindGithub)).toEqual({
+      posted: false,
+      suppressedBy: 'claim_held',
+    });
+    nowMs = T0 + TASKMASTER_ESCALATION_COOLDOWN_MS;
+    expect((await deliverEscalationToIssue(params(ISSUE), blindGithub)).posted).toBe(true);
+    expect(posts).toBe(2);
+  });
+
+  test('marker suppression and a failed post both release the claim immediately', async () => {
+    const claim = createDbEscalationDeliveryClaim(processA);
+    const suppressedByMarker = await deliverEscalationToIssue(params(ISSUE), {
+      listIssueComments: async () => [
+        { body: TASKMASTER_ESCALATION_MARKER, created_at: new Date(T0 - 60_000).toISOString() },
+      ],
+      postIssueComment: async () => {},
+      now: () => new Date(T0),
+      claim,
+    });
+    expect(suppressedByMarker).toEqual({ posted: false, suppressedBy: 'cooldown_marker' });
+    // Released: a fresh claim succeeds at once (no lease wait).
+    const probe = await claim.claim(escalationIssueKey(ISSUE), T0 + 1);
+    expect(probe).not.toBeNull();
+    await claim.release(escalationIssueKey(ISSUE), probe as string);
+
+    await expect(
+      deliverEscalationToIssue(params(ISSUE), {
+        listIssueComments: async () => [],
+        postIssueComment: async () => {
+          throw new Error('github_down');
+        },
+        now: () => new Date(T0 + 2),
+        claim,
+      })
+    ).rejects.toThrow('github_down');
+    expect(await claim.claim(escalationIssueKey(ISSUE), T0 + 3)).not.toBeNull();
   });
 });

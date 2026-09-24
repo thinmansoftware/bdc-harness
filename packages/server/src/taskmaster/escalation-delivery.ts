@@ -26,7 +26,12 @@
  * Re-escalation therefore happens only after 72h has elapsed since the last
  * Taskmaster escalation comment on that issue.
  */
+import { createLogger } from '@archon/paths';
+import type { IDatabase } from '@archon/core/db/adapters/types';
+import * as taskmasterDb from '@archon/core/db/taskmaster';
 import { githubToken } from '../dispatch/duty-officer-clock';
+
+const log = createLogger('taskmaster/escalation-delivery');
 
 /** Hidden marker that identifies a Taskmaster escalation comment on an issue. */
 export const TASKMASTER_ESCALATION_MARKER = '<!-- taskmaster-escalation -->';
@@ -217,39 +222,150 @@ export interface EscalationDeliveryDeps {
   ): Promise<EscalationIssueComment[]>;
   postIssueComment(issue: EscalationIssueRef, body: string): Promise<void>;
   now?: () => Date;
+  /**
+   * Per-issue delivery claim taken BEFORE the GitHub list+post, so two ticks or
+   * processes cannot both pass the marker check and both post. Production
+   * wires the database-backed claim (createDbEscalationDeliveryClaim); when
+   * absent, only the marker dedupe applies.
+   */
+  claim?: EscalationDeliveryClaim;
+}
+
+/**
+ * An atomic per-issue claim. `claim` returns a claim id, or null when another
+ * attempt holds the issue (in flight, or posted inside the cooldown).
+ * `complete` records the post so the claim holds the issue for the cooldown;
+ * `release` frees a claim that posted nothing. Both are fenced on the claim id.
+ * A claim that is neither completed nor released (a crash) expires after its
+ * lease.
+ */
+export interface EscalationDeliveryClaim {
+  claim(issueKey: string, nowMs: number): Promise<string | null>;
+  complete(issueKey: string, claimId: string, postedAtIso: string): Promise<void>;
+  release(issueKey: string, claimId: string): Promise<void>;
+}
+
+/** Why an escalation was not posted. */
+export type EscalationSuppressionReason = 'cooldown_marker' | 'claim_held';
+
+export interface EscalationDeliveryResult {
+  posted: boolean;
+  /** Set when posted is false. */
+  suppressedBy?: EscalationSuppressionReason;
+}
+
+/** Stable per-issue claim key: lowercased `owner/repo#N` (GitHub names are case-insensitive). */
+export function escalationIssueKey(issue: EscalationIssueRef): string {
+  return `${issue.owner}/${issue.repo}#${issue.number}`.toLowerCase();
 }
 
 /**
  * Deliver an escalation as a GitHub issue comment, deduped on the 72h cooldown
- * documented above. Returns `{ posted: true }` when a fresh comment was posted,
- * `{ posted: false }` when a marker comment newer than the cooldown already
+ * documented above and serialized per issue by deps.claim. Returns
+ * `{ posted: true }` when a fresh comment was posted; `{ posted: false }` with
+ * suppressedBy 'claim_held' when another attempt holds the issue's claim, or
+ * 'cooldown_marker' when a marker comment newer than the cooldown already
  * covers this issue.
  */
 export async function deliverEscalationToIssue(
   params: { issue: EscalationIssueRef; threadRef: string; body: string },
   deps: EscalationDeliveryDeps
-): Promise<{ posted: boolean }> {
+): Promise<EscalationDeliveryResult> {
   const nowMs = (deps.now?.() ?? new Date()).getTime();
-  const windowStartIso = new Date(nowMs - TASKMASTER_ESCALATION_COOLDOWN_MS).toISOString();
-  const comments = await deps.listIssueComments(params.issue, windowStartIso);
-  let latestMarkerMs = Number.NEGATIVE_INFINITY;
-  for (const comment of comments) {
-    if (!(comment.body ?? '').includes(TASKMASTER_ESCALATION_MARKER)) continue;
-    const createdMs = Date.parse(comment.created_at);
-    if (Number.isFinite(createdMs) && createdMs > latestMarkerMs) latestMarkerMs = createdMs;
+  const issueKey = escalationIssueKey(params.issue);
+  const claim = deps.claim;
+  const claimId = claim ? await claim.claim(issueKey, nowMs) : null;
+  if (claim && claimId === null) {
+    return { posted: false, suppressedBy: 'claim_held' };
   }
-  if (
-    latestMarkerMs > Number.NEGATIVE_INFINITY &&
-    nowMs - latestMarkerMs < TASKMASTER_ESCALATION_COOLDOWN_MS
-  ) {
-    return { posted: false };
+
+  let posted = false;
+  try {
+    const windowStartIso = new Date(nowMs - TASKMASTER_ESCALATION_COOLDOWN_MS).toISOString();
+    const comments = await deps.listIssueComments(params.issue, windowStartIso);
+    let latestMarkerMs = Number.NEGATIVE_INFINITY;
+    for (const comment of comments) {
+      if (!(comment.body ?? '').includes(TASKMASTER_ESCALATION_MARKER)) continue;
+      const createdMs = Date.parse(comment.created_at);
+      if (Number.isFinite(createdMs) && createdMs > latestMarkerMs) latestMarkerMs = createdMs;
+    }
+    if (
+      latestMarkerMs > Number.NEGATIVE_INFINITY &&
+      nowMs - latestMarkerMs < TASKMASTER_ESCALATION_COOLDOWN_MS
+    ) {
+      return { posted: false, suppressedBy: 'cooldown_marker' };
+    }
+    await deps.postIssueComment(params.issue, params.body);
+    posted = true;
+  } finally {
+    // Nothing was posted (suppressed or an error): free the issue now. A
+    // failed release is not fatal -- the claim's lease expires on its own.
+    if (claim && claimId !== null && !posted) {
+      try {
+        await claim.release(issueKey, claimId);
+      } catch (error) {
+        log.warn({ err: error as Error, issueKey }, 'taskmaster.escalation_claim_release_failed');
+      }
+    }
   }
-  await deps.postIssueComment(params.issue, params.body);
+
+  if (claim && claimId !== null) {
+    // The comment IS posted, so this never turns the delivery into a failure.
+    // If recording it fails, the claim expires after its lease and the marker
+    // comment that now exists on the issue suppresses the next attempt.
+    try {
+      await claim.complete(issueKey, claimId, new Date(nowMs).toISOString());
+    } catch (error) {
+      log.warn({ err: error as Error, issueKey }, 'taskmaster.escalation_claim_complete_failed');
+    }
+  }
   return { posted: true };
 }
 
 function githubTimeoutMs(): number {
   return Math.max(1_000, Number(process.env.TASKMASTER_GITHUB_TIMEOUT_MS) || 15_000);
+}
+
+/**
+ * Lease on an in-flight claim. It must outlast the slowest possible delivery
+ * (every comment page plus the post, each at the GitHub request timeout), or
+ * a live-but-slow attempt could lose its claim to a second one. Floor 30
+ * minutes: after a crash the issue is re-claimable within one P0 bucket.
+ */
+export function escalationClaimLeaseMs(): number {
+  return Math.max(30 * 60 * 1000, (ESCALATION_COMMENT_MAX_PAGES + 2) * githubTimeoutMs());
+}
+
+/**
+ * The database-backed claim (tm_escalation_claims, migration 057). One
+ * atomic statement per claim; see taskmasterDb.claimEscalationDelivery. A
+ * recorded post holds the issue for TASKMASTER_ESCALATION_COOLDOWN_MS.
+ * `database` is injectable for tests (e.g. two adapters on one file to model
+ * two processes); production uses the shared connection.
+ */
+export function createDbEscalationDeliveryClaim(
+  database?: Pick<IDatabase, 'query'>
+): EscalationDeliveryClaim {
+  return {
+    claim: (issueKey, nowMs): Promise<string | null> =>
+      taskmasterDb.claimEscalationDelivery(
+        {
+          issue_key: issueKey,
+          now_iso: new Date(nowMs).toISOString(),
+          lease_expires_at: new Date(nowMs + escalationClaimLeaseMs()).toISOString(),
+          hold_cutoff_iso: new Date(nowMs - TASKMASTER_ESCALATION_COOLDOWN_MS).toISOString(),
+        },
+        database
+      ),
+    complete: async (issueKey, claimId, postedAtIso): Promise<void> => {
+      await taskmasterDb.completeEscalationDelivery(
+        { issue_key: issueKey, claim_id: claimId, posted_at: postedAtIso },
+        database
+      );
+    },
+    release: (issueKey, claimId): Promise<void> =>
+      taskmasterDb.releaseEscalationDelivery({ issue_key: issueKey, claim_id: claimId }, database),
+  };
 }
 
 const GITHUB_API_ORIGIN = 'https://api.github.com';
