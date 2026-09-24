@@ -174,6 +174,50 @@ describe('substituteWorkflowVariables', () => {
     });
   }
 
+  // Positive coverage for $LOOP_USER_INPUT: the bounded loop above only asserts
+  // the variable is cleared/left verbatim, where the caller value ('') is
+  // indistinguishable from an implementation that ignores loopUserInput
+  // entirely. This case pins the resolved value through the public signature.
+  it('replaces $LOOP_USER_INPUT with the caller-supplied loop input', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'exact=$LOOP_USER_INPUT',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/',
+      undefined,
+      'approve this'
+    );
+    expect(prompt).toBe('exact=approve this');
+  });
+
+  it('bounds $LOOP_USER_INPUT to a whole identifier while still substituting a real value', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'exact=$LOOP_USER_INPUT suffix=$LOOP_USER_INPUT_SUFFIX',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/',
+      undefined,
+      'approve this'
+    );
+    expect(prompt).toBe('exact=approve this suffix=$LOOP_USER_INPUT_SUFFIX');
+  });
+
+  it('clears $LOOP_USER_INPUT when no loop input is supplied', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Loop input: $LOOP_USER_INPUT (end)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'main',
+      'docs/'
+    );
+    expect(prompt).toBe('Loop input:  (end)');
+  });
+
   it('replaces $USER_MESSAGE and $ARGUMENTS with user message', () => {
     const { prompt } = substituteWorkflowVariables(
       'Goal: $USER_MESSAGE. Args: $ARGUMENTS',
