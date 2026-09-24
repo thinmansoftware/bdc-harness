@@ -274,6 +274,41 @@ describe('dispatch Phase 1.5 PostgreSQL integration', () => {
     }
   });
 
+  test('migration 056 replaces every stale route-disposition check', async () => {
+    await db.query(`
+      ALTER TABLE agent_dispatch_messages
+        ADD CONSTRAINT route_disposition_stale_a
+          CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+        ADD CONSTRAINT route_disposition_stale_b
+          CHECK (route_disposition IS NULL OR route_disposition <> 'expired')
+    `);
+    const migration = readFileSync(
+      resolve(import.meta.dir, '../../../../migrations/056_dispatch_machine_disposition.sql'),
+      'utf8'
+    );
+    await db.query(migration);
+
+    const checks = await db.query<{ conname: string; definition: string }>(
+      `SELECT c.conname, pg_get_constraintdef(c.oid) AS definition
+         FROM pg_constraint c
+        WHERE c.conrelid = to_regclass('agent_dispatch_messages')
+          AND c.contype = 'c'
+          AND pg_get_constraintdef(c.oid) LIKE '%route_disposition%'`
+    );
+    expect(checks.rows).toHaveLength(1);
+    expect(checks.rows[0]?.conname).not.toBe('route_disposition_stale_a');
+    expect(checks.rows[0]?.conname).not.toBe('route_disposition_stale_b');
+    expect(checks.rows[0]?.definition).toContain('auto_surfaced');
+    expect(checks.rows[0]?.definition).toContain('expired');
+
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, sender, recipient, body, route_disposition)
+       VALUES ($1, $2, $3, 'agent_message', 'xo', 'codex', 'migration 056', 'auto_surfaced')`,
+      [randomUUID(), randomUUID(), `migration-056-${randomUUID()}`]
+    );
+  });
+
   test('same-principal concurrent retries return one row; different principals share keys', async () => {
     const key = `race-${randomUUID()}`;
     const mk = (principal: string, sender: string, body: string) =>

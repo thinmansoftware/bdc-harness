@@ -768,7 +768,9 @@ export async function listMessages(filters: {
     params.push(nowIso());
     clauses.push(`(not_before IS NULL OR not_before <= $${params.length})`);
     clauses.push('addressed_at IS NULL');
-    clauses.push('route_disposition IS NULL');
+    if (filters.route_disposition === undefined) {
+      clauses.push('route_disposition IS NULL');
+    }
   }
   params.push(Math.max(1, Math.min(filters.limit ?? 100, 500)));
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';

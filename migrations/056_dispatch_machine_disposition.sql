@@ -2,21 +2,24 @@
 DO $$
 DECLARE
   target_oid oid := to_regclass('agent_dispatch_messages');
-  constraint_name text;
+  constraint_record record;
 BEGIN
   IF target_oid IS NULL THEN
     RAISE EXCEPTION 'migration 056: agent_dispatch_messages not found via to_regclass on current search_path';
   END IF;
 
-  SELECT c.conname INTO constraint_name
-  FROM pg_constraint c
-  WHERE c.conrelid = target_oid
-    AND c.contype = 'c'
-    AND pg_get_constraintdef(c.oid) LIKE '%route_disposition%';
-
-  IF constraint_name IS NOT NULL THEN
-    EXECUTE format('ALTER TABLE agent_dispatch_messages DROP CONSTRAINT %I', constraint_name);
-  END IF;
+  FOR constraint_record IN
+    SELECT c.conname
+    FROM pg_constraint c
+    WHERE c.conrelid = target_oid
+      AND c.contype = 'c'
+      AND pg_get_constraintdef(c.oid) LIKE '%route_disposition%'
+  LOOP
+    EXECUTE format(
+      'ALTER TABLE agent_dispatch_messages DROP CONSTRAINT %I',
+      constraint_record.conname
+    );
+  END LOOP;
   ALTER TABLE agent_dispatch_messages ADD CHECK (
     route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')
   );

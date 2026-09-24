@@ -1061,6 +1061,15 @@ describe('dispatch db', () => {
         row => row.id
       )
     ).toContain(surfaced.id);
+    expect(
+      (
+        await listMessages({
+          recipient: 'operator',
+          status: 'queued',
+          route_disposition: 'auto_surfaced',
+        })
+      ).map(row => row.id)
+    ).toContain(surfaced.id);
   });
 
   test('machine disposition validates actor, value, and one-shot behavior', async () => {
