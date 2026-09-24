@@ -396,7 +396,8 @@ export interface MoveDirAcrossDevicesDeps {
  * returns EXDEV even when both mounts are the same filesystem type, so that
  * case copies then deletes the source. Any other rename error is rethrown.
  * If the copy fails, the partial destination is removed and the source is left
- * in place.
+ * in place. If that cleanup removal also fails, the cleanup error is logged and
+ * the original copy error is still rethrown.
  *
  * Default deps read the fs/promises bindings at call time so tests can spy on
  * rename without injecting moveDir into the sweep.
@@ -418,7 +419,11 @@ export async function moveDirAcrossDevices(
   try {
     await deps.cp(from, to, MOVE_DIR_CP_OPTIONS);
   } catch (cpError) {
-    await deps.rm(to, { recursive: true, force: true });
+    try {
+      await deps.rm(to, { recursive: true, force: true });
+    } catch (rmError) {
+      getLog().warn({ err: rmError, path: to }, 'worktree_sweep_partial_copy_cleanup_failed');
+    }
     throw cpError;
   }
 

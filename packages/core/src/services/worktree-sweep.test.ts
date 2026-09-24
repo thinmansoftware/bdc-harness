@@ -991,6 +991,39 @@ describe('moveDirAcrossDevices', () => {
     expect(existsSync(partialDst)).toBe(false);
     expect(await readFile(join(src, 'a.txt'), 'utf8')).toBe('alpha');
   });
+
+  test('rethrows the copy error when partial-copy cleanup also fails', async () => {
+    const src = join(root, 'src');
+    const dst = join(root, 'dst');
+    await mkdir(src);
+    await writeFile(join(src, 'a.txt'), 'alpha');
+    const cpError = new Error('disk full');
+    const rmError = new Error('EACCES removing partial copy');
+    mockLogger.warn.mockClear();
+
+    await expect(
+      moveDirAcrossDevices(src, dst, {
+        rename: async () => {
+          throw exdevError();
+        },
+        cp: async (_from, to) => {
+          await mkdir(to, { recursive: true });
+          await writeFile(join(to, 'partial.txt'), 'x');
+          throw cpError;
+        },
+        rm: async () => {
+          throw rmError;
+        },
+      })
+    ).rejects.toBe(cpError);
+
+    expect(existsSync(join(dst, 'partial.txt'))).toBe(true);
+    expect(await readFile(join(src, 'a.txt'), 'utf8')).toBe('alpha');
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      { err: rmError, path: dst },
+      'worktree_sweep_partial_copy_cleanup_failed'
+    );
+  });
 });
 
 describe('sweepTerminalWorkflowWorktrees EXDEV fallback', () => {
