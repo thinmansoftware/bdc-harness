@@ -310,6 +310,127 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('Plain prompt with no loop variable.');
   });
+
+  // --- Whole-identifier bounding (WO-MATRIX-M1-GLM53F-01 / bdc-harness #877) ---
+
+  it('leaves prefix-longer shell variables intact (#877: $BASE_BRANCH_OVERRIDE, $BASE_BRANCH_PR)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'BASE_BRANCH_OVERRIDE=$(printf "%s" "$BASE_BRANCH_OVERRIDE" | tr -d "\\r\\t")\n' +
+        'PR branch: $BASE_BRANCH_PR',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'dev',
+      'docs/'
+    );
+    // The unbraced "$BASE_BRANCH_OVERRIDE" / "$BASE_BRANCH_PR" must NOT be
+    // prefix-corrupted into "dev_OVERRIDE" / "dev_PR".
+    expect(prompt).toContain('$BASE_BRANCH_OVERRIDE');
+    expect(prompt).toContain('$BASE_BRANCH_PR');
+    expect(prompt).not.toContain('dev_OVERRIDE');
+    expect(prompt).not.toContain('dev_PR');
+  });
+
+  it('still substitutes exact $BASE_BRANCH in boundary contexts', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH|$BASE_BRANCH/x|$BASE_BRANCH.|$BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp/artifacts',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('dev|dev/x|dev.|dev)');
+  });
+
+  it('substitutes each exact variable but leaves $NAME_SUFFIX variants verbatim', () => {
+    const cases: Array<[string, string, string, string]> = [
+      // [variable, substitution value, prompt with $NAME, prompt with $NAME_SUFFIX]
+      ['WORKFLOW_ID', 'run-1', 'Run: $WORKFLOW_ID', 'Run: $WORKFLOW_ID_SUFFIX'],
+      ['USER_MESSAGE', 'hello world', 'Msg: $USER_MESSAGE', 'Msg: $USER_MESSAGE_SUFFIX'],
+      ['ARGUMENTS', 'hello world', 'Args: $ARGUMENTS', 'Args: $ARGUMENTS_SUFFIX'],
+      ['ARTIFACTS_DIR', '/tmp/artifacts', 'Dir: $ARTIFACTS_DIR', 'Dir: $ARTIFACTS_DIR_SUFFIX'],
+      ['BASE_BRANCH', 'dev', 'Branch: $BASE_BRANCH', 'Branch: $BASE_BRANCH_SUFFIX'],
+      ['DOCS_DIR', 'docs/', 'Docs: $DOCS_DIR', 'Docs: $DOCS_DIR_SUFFIX'],
+      [
+        'LOOP_USER_INPUT',
+        'fix the flake',
+        'Input: $LOOP_USER_INPUT',
+        'Input: $LOOP_USER_INPUT_SUFFIX',
+      ],
+      [
+        'REJECTION_REASON',
+        'missing tests',
+        'Reason: $REJECTION_REASON',
+        'Reason: $REJECTION_REASON_SUFFIX',
+      ],
+      [
+        'LOOP_PREV_OUTPUT',
+        'previous output text',
+        'Out: $LOOP_PREV_OUTPUT',
+        'Out: $LOOP_PREV_OUTPUT_SUFFIX',
+      ],
+    ];
+    for (const [name, value, exactPrompt, suffixPrompt] of cases) {
+      const loopInput = name === 'LOOP_USER_INPUT' ? value : undefined;
+      const rejection = name === 'REJECTION_REASON' ? value : undefined;
+      const prevOutput = name === 'LOOP_PREV_OUTPUT' ? value : undefined;
+      const docsDir = name === 'DOCS_DIR' ? value : 'docs/';
+      const artifactsDir = name === 'ARTIFACTS_DIR' ? value : '/tmp/artifacts';
+      const baseBranch = name === 'BASE_BRANCH' ? value : 'dev';
+      const workflowId = name === 'WORKFLOW_ID' ? value : 'run-1';
+      const userMessage = name === 'USER_MESSAGE' || name === 'ARGUMENTS' ? value : 'msg';
+      const { prompt: exact } = substituteWorkflowVariables(
+        exactPrompt,
+        workflowId,
+        userMessage,
+        artifactsDir,
+        baseBranch,
+        docsDir,
+        undefined,
+        loopInput,
+        rejection,
+        prevOutput
+      );
+      expect(exact).toBe(exactPrompt.replace('$' + name, value));
+      const { prompt: suffix } = substituteWorkflowVariables(
+        suffixPrompt,
+        workflowId,
+        userMessage,
+        artifactsDir,
+        baseBranch,
+        docsDir,
+        undefined,
+        loopInput,
+        rejection,
+        prevOutput
+      );
+      expect(suffix).toBe(suffixPrompt);
+    }
+  });
+
+  it('fail-fast guard is bounded: $BASE_BRANCH_OVERRIDE alone does not throw on empty base', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'Use $BASE_BRANCH_OVERRIDE as the base',
+        'run-1',
+        'msg',
+        '/tmp',
+        '',
+        'docs/'
+      )
+    ).not.toThrow();
+    expect(() =>
+      substituteWorkflowVariables(
+        'Use $BASE_BRANCH as the base',
+        'run-1',
+        'msg',
+        '/tmp',
+        '',
+        'docs/'
+      )
+    ).toThrow('No base branch could be resolved');
+  });
 });
 
 describe('buildPromptWithContext', () => {

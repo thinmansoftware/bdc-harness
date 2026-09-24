@@ -383,6 +383,18 @@ export const CONTEXT_VAR_PATTERN_STR =
   '\\$(?:CONTEXT|EXTERNAL_CONTEXT|ISSUE_CONTEXT)(?![A-Za-z0-9_])';
 
 /**
+ * Regex matching a workflow variable as a WHOLE identifier only: the literal
+ * $NAME not immediately followed by [A-Za-z0-9_]. Without the lookahead,
+ * /$BASE_BRANCH/g also consumes the prefix of longer shell variables such as
+ * "$BASE_BRANCH_OVERRIDE" / "$BASE_BRANCH_PR", corrupting them at substitution
+ * time (e.g. rewritten to "dev_OVERRIDE" -- bdc-harness #877). A fresh RegExp
+ * is built per call so neither the replace chain nor a .test() guard can be
+ * affected by shared lastIndex state.
+ */
+const wholeWorkflowVar = (name: string): RegExp =>
+  new RegExp('\\$' + name + '(?![A-Za-z0-9_])', 'g');
+
+/**
  * Substitute workflow variables in a prompt.
  *
  * Supported variables:
@@ -414,8 +426,12 @@ export function substituteWorkflowVariables(
   rejectionReason?: string,
   loopPrevOutput?: string
 ): { prompt: string; contextSubstituted: boolean } {
-  // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
-  if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
+  // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved.
+  // Bounded the same way as the replace chain below: "$BASE_BRANCH_OVERRIDE" /
+  // "$BASE_BRANCH_PR" are NOT references to $BASE_BRANCH and must not trip this guard
+  // (bdc-harness #877 -- the open-pr-if-needed lane would otherwise hard-fail on
+  // prompts that only reference the longer variable).
+  if (!baseBranch && new RegExp('\\$BASE_BRANCH(?![A-Za-z0-9_])').test(prompt)) {
     throw new Error(
       'No base branch could be resolved. Auto-detection failed and `worktree.baseBranch` is not set in .archon/config.yaml. ' +
         'Set the config value or use the --from flag to select a branch (e.g., --from dev).'
@@ -425,18 +441,22 @@ export function substituteWorkflowVariables(
   // Defensive: ensure docsDir always has a value (callers should resolve, but guard here)
   const resolvedDocsDir = docsDir || 'docs/';
 
-  // Substitute basic variables
+  // Substitute basic variables. Each $NAME is bounded by wholeWorkflowVar so it
+  // matches only as a whole identifier -- longer shell variables that merely BEGIN
+  // with a workflow variable name (e.g. $BASE_BRANCH_OVERRIDE, $BASE_BRANCH_PR)
+  // reach bash nodes unchanged instead of being prefix-corrupted (#877).
+  // ${run.id} is left unbounded: it is already brace-delimited and exact.
   let result = prompt
-    .replace(/\$WORKFLOW_ID/g, workflowId)
+    .replace(wholeWorkflowVar('WORKFLOW_ID'), workflowId)
     .replace(/\$\{run\.id\}/g, workflowId)
-    .replace(/\$USER_MESSAGE/g, userMessage)
-    .replace(/\$ARGUMENTS/g, userMessage)
-    .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
-    .replace(/\$BASE_BRANCH/g, baseBranch)
-    .replace(/\$DOCS_DIR/g, resolvedDocsDir)
-    .replace(/\$LOOP_USER_INPUT/g, loopUserInput ?? '')
-    .replace(/\$REJECTION_REASON/g, rejectionReason ?? '')
-    .replace(/\$LOOP_PREV_OUTPUT/g, loopPrevOutput ?? '');
+    .replace(wholeWorkflowVar('USER_MESSAGE'), userMessage)
+    .replace(wholeWorkflowVar('ARGUMENTS'), userMessage)
+    .replace(wholeWorkflowVar('ARTIFACTS_DIR'), artifactsDir)
+    .replace(wholeWorkflowVar('BASE_BRANCH'), baseBranch)
+    .replace(wholeWorkflowVar('DOCS_DIR'), resolvedDocsDir)
+    .replace(wholeWorkflowVar('LOOP_USER_INPUT'), loopUserInput ?? '')
+    .replace(wholeWorkflowVar('REJECTION_REASON'), rejectionReason ?? '')
+    .replace(wholeWorkflowVar('LOOP_PREV_OUTPUT'), loopPrevOutput ?? '');
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)
   const hasContextVariables = new RegExp(CONTEXT_VAR_PATTERN_STR).test(result);
