@@ -4,7 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { removeTempDirWithRetry } from './temp-dir';
 
-test('preload scrub removes production credentials and switches inherited by a child test', () => {
+test('preload scrub preserves test fixtures and removes inherited production credentials and switches', () => {
   const dir = mkdtempSync(join(tmpdir(), 'archon-preload-scrub-'));
   const childTest = join(dir, 'preload-scrub.test.ts');
   writeFileSync(
@@ -14,6 +14,7 @@ test('preload scrub removes production credentials and switches inherited by a c
       "test('scrubbed', () => {",
       '  expect(process.env.MERGE_MANAGER_GH_TOKEN).toBeUndefined();',
       '  expect(process.env.GH_TOKEN).toBeUndefined();',
+      "  expect(process.env.DISPATCH_POSTGRES_PHASE15_TEST_URL).toBe('postgresql://localhost/phase15');",
       '  expect(process.env.OVERSEER_MAX_REREVIEW_ATTEMPTS).toBeUndefined();',
       '  expect(process.env.BOARD_PRINCIPALS_JSON).toBeUndefined();',
       '});',
@@ -27,6 +28,7 @@ test('preload scrub removes production credentials and switches inherited by a c
         ...process.env,
         MERGE_MANAGER_GH_TOKEN: 'production-shaped-test-value',
         GH_TOKEN: 'production-shaped-test-value',
+        DISPATCH_POSTGRES_PHASE15_TEST_URL: 'postgresql://localhost/phase15',
         OVERSEER_MAX_REREVIEW_ATTEMPTS: '3',
         BOARD_PRINCIPALS_JSON: '{"production":"principal"}',
       },

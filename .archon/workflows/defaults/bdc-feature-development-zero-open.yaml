@@ -1483,10 +1483,12 @@ nodes:
         printf '%s' "$counts"
       }
       # Remove production credentials and switches before any test command is spawned.
+      # Preserve _TEST_ names: CI supplies disposable fixtures; production never uses them.
       rst_scrub_env() {
         local name
         for name in $(env | sed -n 's/=.*//p'); do
           case "$name" in
+            *_TEST_*) continue ;;
             OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL)
               unset "$name"
               ;;

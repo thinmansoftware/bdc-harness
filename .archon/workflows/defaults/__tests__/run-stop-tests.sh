@@ -365,11 +365,13 @@ export OVERSEER_FOO=production-shaped-test-value
 export MERGE_MANAGER_GH_TOKEN=production-shaped-test-value
 export BOARD_PRINCIPALS_JSON=production-shaped-test-value
 export GH_TOKEN=production-shaped-test-value
+export DISPATCH_POSTGRES_PHASE15_TEST_URL=postgresql://localhost/phase15
 rst_scrub_env
 assert_eq "scrub removes OVERSEER_ prefix" "unset" "${OVERSEER_FOO:-unset}"
 assert_eq "scrub removes MERGE_MANAGER_ prefix" "unset" "${MERGE_MANAGER_GH_TOKEN:-unset}"
 assert_eq "scrub removes BOARD_ prefix" "unset" "${BOARD_PRINCIPALS_JSON:-unset}"
 assert_eq "scrub removes exact GH_TOKEN" "unset" "${GH_TOKEN:-unset}"
+assert_eq "scrub preserves disposable test fixtures" "postgresql://localhost/phase15" "${DISPATCH_POSTGRES_PHASE15_TEST_URL:-unset}"
 TMP="$(mktemp -d)"
 cat > "$TMP/ok.sh" <<'EOF'
 #!/usr/bin/env bash
