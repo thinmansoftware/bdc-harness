@@ -96,6 +96,71 @@ describe('substituteWorkflowVariables', () => {
     expect(prompt).toBe('No branch reference here');
   });
 
+  it('leaves longer variable names that prefix-extend $BASE_BRANCH intact (bdc-harness #877)', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'BASE_BRANCH_OVERRIDE=$(printf $BASE_BRANCH_OVERRIDE) && BASE_BRANCH_PR=$BASE_BRANCH_PR',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toContain('$BASE_BRANCH_OVERRIDE');
+    expect(prompt).toContain('$BASE_BRANCH_PR');
+    expect(prompt).not.toContain('dev_OVERRIDE');
+    expect(prompt).not.toContain('dev_PR');
+  });
+
+  it('substitutes $BASE_BRANCH when followed by a non-identifier character', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'into $BASE_BRANCH, $BASE_BRANCH/x, $BASE_BRANCH. and $BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('into dev, dev/x, dev. and dev)');
+  });
+
+  it('does not throw for a prompt containing only $BASE_BRANCH_OVERRIDE with empty baseBranch', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'only $BASE_BRANCH_OVERRIDE here',
+      'run-1',
+      'msg',
+      '/tmp',
+      '',
+      'docs/'
+    );
+    expect(prompt).toBe('only $BASE_BRANCH_OVERRIDE here');
+  });
+
+  const boundedVariables = [
+    'WORKFLOW_ID',
+    'USER_MESSAGE',
+    'ARGUMENTS',
+    'ARTIFACTS_DIR',
+    'DOCS_DIR',
+    'LOOP_USER_INPUT',
+    'REJECTION_REASON',
+    'LOOP_PREV_OUTPUT',
+  ];
+
+  for (const name of boundedVariables) {
+    it('bounds $' + name + ' so a suffix-extended name is left verbatim', () => {
+      const { prompt } = substituteWorkflowVariables(
+        'exact: $' + name + ' suffix: $' + name + '_SUFFIX',
+        'run-7',
+        'hello',
+        '/tmp/artifacts',
+        'dev',
+        'docs/'
+      );
+      expect(prompt).toContain('$' + name + '_SUFFIX');
+      expect(prompt).not.toMatch(new RegExp('\\$' + name + '(?![A-Za-z0-9_])'));
+    });
+  }
+
   it('replaces $USER_MESSAGE and $ARGUMENTS with user message', () => {
     const { prompt } = substituteWorkflowVariables(
       'Goal: $USER_MESSAGE. Args: $ARGUMENTS',
