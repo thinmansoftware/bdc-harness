@@ -74,12 +74,13 @@ done
 
 echo "--- Parity: 11 lanes match canonical rsg core; source excluded (parity-all-12-lanes) ---"
 assert_eq "parity compares 11 lanes, not the canonical source" "11" "$(printf '%s\n' $LANES | grep -c .)"
-case " $LANES " in
-  *" $(basename "$CANONICAL_YAML") "*)
-    FAIL=$((FAIL + 1)); echo "FAIL: canonical source is in LANES" ;;
-  *)
-    PASS=$((PASS + 1)); echo "PASS: canonical source excluded from LANES" ;;
-esac
+# Unquoted $LANES word-splits on the embedded newlines (same as the loop below).
+# A space-bounded substring of the quoted assignment can never see an entry name.
+if printf '%s\n' $LANES | grep -qxF "$(basename "$CANONICAL_YAML")"; then
+  FAIL=$((FAIL + 1)); echo "FAIL: canonical source is in LANES"
+else
+  PASS=$((PASS + 1)); echo "PASS: canonical source excluded from LANES"
+fi
 for lane in $LANES; do
   assert_eq "parity $lane" "$RSG_CORE" "$(extract_core "$DEFAULTS/$lane" rsg)"
 done
