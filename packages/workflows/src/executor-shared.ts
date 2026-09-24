@@ -385,7 +385,6 @@ export async function loadCommandPrompt(
  */
 function boundedVarRegex(name: string): RegExp {
   return new RegExp('\\
-export const CONTEXT_VAR_PATTERN_STR =
   '\\$(?:CONTEXT|EXTERNAL_CONTEXT|ISSUE_CONTEXT)(?![A-Za-z0-9_])';
 
 /**
@@ -916,7 +915,7 @@ export function substituteWorkflowVariables(
   loopPrevOutput?: string
 ): { prompt: string; contextSubstituted: boolean } {
   // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
-  if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
+  if (!baseBranch && boundedVarRegex('BASE_BRANCH').test(prompt)) {
     throw new Error(
       'No base branch could be resolved. Auto-detection failed and `worktree.baseBranch` is not set in .archon/config.yaml. ' +
         'Set the config value or use the --from flag to select a branch (e.g., --from dev).'
@@ -928,16 +927,16 @@ export function substituteWorkflowVariables(
 
   // Substitute basic variables
   let result = prompt
-    .replace(/\$WORKFLOW_ID/g, workflowId)
+    .replace(boundedVarRegex('WORKFLOW_ID'), workflowId)
     .replace(/\$\{run\.id\}/g, workflowId)
-    .replace(/\$USER_MESSAGE/g, userMessage)
-    .replace(/\$ARGUMENTS/g, userMessage)
-    .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
-    .replace(/\$BASE_BRANCH/g, baseBranch)
-    .replace(/\$DOCS_DIR/g, resolvedDocsDir)
-    .replace(/\$LOOP_USER_INPUT/g, loopUserInput ?? '')
-    .replace(/\$REJECTION_REASON/g, rejectionReason ?? '')
-    .replace(/\$LOOP_PREV_OUTPUT/g, loopPrevOutput ?? '');
+    .replace(boundedVarRegex('USER_MESSAGE'), userMessage)
+    .replace(boundedVarRegex('ARGUMENTS'), userMessage)
+    .replace(boundedVarRegex('ARTIFACTS_DIR'), artifactsDir)
+    .replace(boundedVarRegex('BASE_BRANCH'), baseBranch)
+    .replace(boundedVarRegex('DOCS_DIR'), resolvedDocsDir)
+    .replace(boundedVarRegex('LOOP_USER_INPUT'), loopUserInput ?? '')
+    .replace(boundedVarRegex('REJECTION_REASON'), rejectionReason ?? '')
+    .replace(boundedVarRegex('LOOP_PREV_OUTPUT'), loopPrevOutput ?? '');
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)
   const hasContextVariables = new RegExp(CONTEXT_VAR_PATTERN_STR).test(result);
