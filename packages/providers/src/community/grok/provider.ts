@@ -109,12 +109,15 @@ export class GrokAgentProvider implements IAgentProvider {
     for (let turn = 0; turn < this.maxTurns; turn++) {
       let completion: OpenAI.Chat.Completions.ChatCompletion;
       try {
-        completion = await client.chat.completions.create({
-          model: resolvedModel,
-          messages,
-          tools: GROK_AGENT_TOOLS,
-          tool_choice: 'auto',
-        });
+        completion = await client.chat.completions.create(
+          {
+            model: resolvedModel,
+            messages,
+            tools: GROK_AGENT_TOOLS,
+            tool_choice: 'auto',
+          },
+          { signal: options?.abortSignal }
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         throw new Error(`Grok/OpenRouter request failed: ${msg}`);
@@ -156,9 +159,21 @@ export class GrokAgentProvider implements IAgentProvider {
         if (call.type !== 'function') continue;
         const name = call.function.name;
         const args = call.function.arguments ?? '{}';
+        let toolInput: Record<string, unknown>;
+        try {
+          const parsed: unknown = JSON.parse(args);
+          toolInput =
+            parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+              ? (parsed as Record<string, unknown>)
+              : { raw: args };
+        } catch {
+          toolInput = { raw: args };
+        }
         yield {
-          type: 'system',
-          content: `[grok-agent tool] ${name} ${args.slice(0, 200)}`,
+          type: 'tool',
+          toolName: name,
+          toolInput,
+          toolCallId: call.id,
         };
         const result = await executeGrokTool(cwd, name, args, {
           bashTimeoutMs: this.bashTimeoutMs,
