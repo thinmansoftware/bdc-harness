@@ -1028,6 +1028,73 @@ describe('dispatch db', () => {
     expect(operator.acked_open).toBe(0);
   });
 
+  test('mailbox depth assigns an eight-row fixture to exclusive exact buckets', async () => {
+    const cutover = new Date(Date.now() - 60_000).toISOString();
+    const before = new Date(Date.now() - 120_000).toISOString();
+    const after = new Date(Date.now() - 30_000).toISOString();
+    await db.query('DELETE FROM dispatch_receipt_cutover');
+    await db.query('INSERT INTO dispatch_receipt_cutover (id, applied_at) VALUES (1, $1)', [
+      cutover,
+    ]);
+    const rows = await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        createMessage({
+          correlation_id: `depth-corr-${index}`,
+          idempotency_key: `depth-idem-${index}`,
+          task_type: 'agent_message',
+          sender: 'xo',
+          recipient: 'operator',
+          body: `depth ${index}`,
+        })
+      )
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [rows[2]!.id, before, 'operator']
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [rows[3]!.id, after, 'operator']
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3, addressed_at = $2, addressed_by = $3 WHERE id = $1',
+      [rows[4]!.id, after, 'operator']
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'expired', route_disposed_at = $2 WHERE id = $1",
+      [rows[5]!.id, after]
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [rows[6]!.id, after]
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3, route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [rows[7]!.id, after, 'operator']
+    );
+
+    const depth = (await mailboxDepthByPrincipal()).operator as import('./dispatch').MailboxDepth;
+    expect(depth).toEqual({
+      unread: 2,
+      legacy_unverified: 1,
+      acked_open: 1,
+      addressed_by_mind: 1,
+      disposed_by_machine: 1,
+      surfaced_unacked: 1,
+      surfaced_acked: 1,
+    });
+    expect(Object.values(depth).reduce((sum, count) => sum + count, 0)).toBe(8);
+  });
+
+  test('mailbox depth rejects a principal that collides with the cutover_at metadata key', async () => {
+    await db.query(
+      "INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active) VALUES ('cutover_at', 'Reserved', 'notify_only', 1)"
+    );
+    await expect(mailboxDepthByPrincipal()).rejects.toThrow(
+      'dispatch_principal_reserved:cutover_at'
+    );
+  });
+
   test('machine disposition writes only routing evidence and auto_surfaced stays ackable', async () => {
     const message = await createMessage({
       correlation_id: 'corr-machine-surface',

@@ -1343,6 +1343,9 @@ export async function mailboxDepthByPrincipal(): Promise<MailboxDepthResult> {
   let cutoverAt: string | null = null;
   for (const row of result.rows) {
     cutoverAt = row.cutover_at ?? cutoverAt;
+    if (row.principal_id === 'cutover_at') {
+      throw new Error('dispatch_principal_reserved:cutover_at');
+    }
     principals[row.principal_id] = {
       unread: Number(row.unread),
       legacy_unverified: Number(row.legacy_unverified),

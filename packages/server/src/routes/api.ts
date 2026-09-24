@@ -2423,7 +2423,8 @@ export function registerApiRoutes(
   webAdapter: WebAdapter,
   lockManager: ConversationLockManager,
   activePlatforms?: readonly string[],
-  canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot
+  canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
+  dispatchMailboxActorResolvedHook?: () => Promise<void>
 ): void {
   function apiError(
     c: Context,
@@ -2530,6 +2531,7 @@ export function registerApiRoutes(
           lease.fencing_token !== fencingToken
         )
           throw new DispatchActorUnboundError();
+        await dispatchMailboxActorResolvedHook?.();
       } catch {
         throw new DispatchActorUnboundError();
       }

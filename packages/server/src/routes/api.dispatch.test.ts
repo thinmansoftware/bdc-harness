@@ -214,7 +214,10 @@ function cleanupDb(path: string): void {
   }
 }
 
-function makeApp(token?: string): OpenAPIHono {
+function makeApp(
+  token?: string,
+  dispatchMailboxActorResolvedHook?: () => Promise<void>
+): OpenAPIHono {
   if (token) process.env.ARCHON_OPERATOR_TOKEN = token;
   else delete process.env.ARCHON_OPERATOR_TOKEN;
   const app = new OpenAPIHono({ defaultHook: validationErrorHook });
@@ -233,7 +236,10 @@ function makeApp(token?: string): OpenAPIHono {
         return { status: 'started' };
       }),
       getStats: mock(() => ({ active: 0, queued: 0 })),
-    } as unknown as ConversationLockManager
+    } as unknown as ConversationLockManager,
+    undefined,
+    undefined,
+    dispatchMailboxActorResolvedHook
   );
   return app;
 }
@@ -365,6 +371,31 @@ describe('dispatch API', () => {
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
     expect(((await second.json()) as { body: string }).body).toBe('Please summarize this.');
+  });
+
+  test('passes route_disposition through the HTTP list route', async () => {
+    const surfaced = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'list-surfaced',
+      recipient: 'operator',
+    });
+    await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'list-undisposed',
+      recipient: 'operator',
+    });
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [surfaced.id, new Date().toISOString()]
+    );
+
+    const response = await makeApp().request(
+      '/api/dispatch/messages?recipient=operator&route_disposition=auto_surfaced'
+    );
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as Array<{ id: string }>).map(row => row.id)).toEqual([
+      surfaced.id,
+    ]);
   });
 
   // WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01: a message to astra is accepted,
@@ -1025,6 +1056,136 @@ describe('dispatch API', () => {
     });
     expect(acknowledged.status).toBe(200);
     expect(((await acknowledged.json()) as { acknowledged_by: string }).acknowledged_by).toBe('xo');
+  });
+
+  test('rejects expired and released XO leases before mailbox mutation', async () => {
+    principal = { principal_id: 'xo', seat_id: 'xo', roles: [] };
+    const holderToken = 'xo-expiry-holder';
+    const leaseId = 'xo-expiry-lease';
+    const message = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'xo-expiry',
+      recipient: 'xo',
+    });
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-board-principal-token': 'board-proof',
+      'x-xo-holder-token': holderToken,
+      'x-xo-lease-id': leaseId,
+      'x-xo-fencing-token': '21',
+    };
+    const insertLease = async (expiresAt: string, releasedAt: string | null) => {
+      await db.query('DELETE FROM board_xo_leases');
+      await db.query(
+        `INSERT INTO board_xo_leases
+         (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+          acquired_at, renewed_at, expires_at, released_at)
+         VALUES (1, $1, 'xo', 'xo', 'holder', $2, 21, $3, NULL, $4, $5)`,
+        [leaseId, sha(holderToken), new Date().toISOString(), expiresAt, releasedAt]
+      );
+    };
+    await insertLease(new Date(Date.now() - 1_000).toISOString(), null);
+    expect(
+      (
+        await makeApp().request(`/api/dispatch/messages/${message.id}/ack`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+        })
+      ).status
+    ).toBe(401);
+    await insertLease(new Date(Date.now() + 60_000).toISOString(), new Date().toISOString());
+    expect(
+      (
+        await makeApp().request(`/api/dispatch/messages/${message.id}/ack`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+        })
+      ).status
+    ).toBe(401);
+    expect(
+      (
+        await db.query<{ acknowledged_at: string | null }>(
+          'SELECT acknowledged_at FROM agent_dispatch_messages WHERE id = $1',
+          [message.id]
+        )
+      ).rows[0]?.acknowledged_at
+    ).toBeNull();
+  });
+
+  test('rejects an unregistered fable identity and leaves its mailbox row untouched', async () => {
+    await db.query(
+      "INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active) VALUES ('fable', 'Fable', 'drain_on_start', 1)"
+    );
+    const message = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'fable-unbound',
+      recipient: 'fable',
+    });
+    const response = await makeApp().request(`/api/dispatch/messages/${message.id}/ack`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-dispatch-principal-id': 'fable',
+        'x-dispatch-principal-token': 'no-registry-entry',
+      },
+      body: JSON.stringify({ principal_id: 'fable' }),
+    });
+    expect(response.status).toBe(401);
+    expect(
+      (
+        await db.query<{ acknowledged_at: string | null }>(
+          'SELECT acknowledged_at FROM agent_dispatch_messages WHERE id = $1',
+          [message.id]
+        )
+      ).rows[0]?.acknowledged_at
+    ).toBeNull();
+  });
+
+  test('transactional lease re-read rejects a fencing-token turnover after actor resolution', async () => {
+    principal = { principal_id: 'xo', seat_id: 'xo', roles: [] };
+    const holderToken = 'xo-race-holder';
+    const message = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'xo-race',
+      recipient: 'xo',
+    });
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, 'lease-old', 'xo', 'xo', 'holder', $1, 30, $2, NULL, $3, NULL)`,
+      [sha(holderToken), new Date().toISOString(), new Date(Date.now() + 60_000).toISOString()]
+    );
+    const app = makeApp(undefined, async () => {
+      await db.query(
+        `UPDATE board_xo_leases SET lease_id = 'lease-new', fencing_token = 31,
+         acquired_at = $1, expires_at = $2, released_at = NULL WHERE id = 1`,
+        [new Date().toISOString(), new Date(Date.now() + 60_000).toISOString()]
+      );
+    });
+    const response = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-board-principal-token': 'board-proof',
+        'x-xo-holder-token': holderToken,
+        'x-xo-lease-id': 'lease-old',
+        'x-xo-fencing-token': '30',
+      },
+      body: '{}',
+    });
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toBe('lease_fence_stale');
+    expect(
+      (
+        await db.query<{ acknowledged_at: string | null }>(
+          'SELECT acknowledged_at FROM agent_dispatch_messages WHERE id = $1',
+          [message.id]
+        )
+      ).rows[0]?.acknowledged_at
+    ).toBeNull();
   });
 
   test('never falls back from an invalid identity request to the operator token', async () => {
