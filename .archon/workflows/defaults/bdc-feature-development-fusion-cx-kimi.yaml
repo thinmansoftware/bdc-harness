@@ -6,7 +6,7 @@ description: |
   provider, node, edge, and bash block is identical to that template. Canary
   status: DISPATCHABLE but NOT ladder-wired -- earns a roster seat only after John
   reviews canary results (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01, 2026-07-20).
-  Plan on Kimi via OpenRouter; implement + repair on provider:grok (OpenRouter +
+  Plan on Kimi via OpenRouter; implement + repair on provider:openrouter (OpenRouter +
   local tool loop) when Codex/Claude seats are exhausted (John 2026-07-09). Diff
   review stays DeepSeek (cross-model, not self-grading). Root provider is
   OpenRouter so bare tails never fall through to Anthropic SDK.
@@ -190,7 +190,7 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: war-council-architect-opr
     depends_on: [checkout-repair-target]
@@ -498,7 +498,7 @@ nodes:
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
   - id: implement
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [capture-run-scope]
@@ -2128,7 +2128,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review]
@@ -2418,7 +2418,7 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [block-classify]
@@ -2790,7 +2790,7 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     agent: overseer-opus
     effort: xhigh

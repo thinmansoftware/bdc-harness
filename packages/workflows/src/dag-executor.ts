@@ -36,6 +36,7 @@ import {
   getProviderCapabilities,
   getRegisteredProviders,
   isRegisteredProvider,
+  resolveProviderId,
 } from '@archon/providers';
 import type {
   DagNode,
@@ -908,14 +909,15 @@ async function beginProviderAttempt(
     null
   );
   const requestedModel = model ?? declaredModel ?? 'provider-default';
+  const canonicalProvider = resolveProviderId(provider);
   const attempt: ProviderAttemptRecord = {
     attemptId: randomUUID(),
     runId: workflowRun.id,
     nodeId: node.id,
     attemptNumber: (latest?.attemptNumber ?? 0) + 1,
-    provider,
+    provider: canonicalProvider,
     model: requestedModel,
-    declaredProvider: provider,
+    declaredProvider: canonicalProvider,
     declaredModel: declaredModel ?? requestedModel,
     requiredCapabilities: deriveNodeExecutionRequirements(node).map(
       capability => EXECUTION_CAPABILITY_LEDGER_MAP[capability]
@@ -1940,8 +1942,9 @@ async function resolveNodeProviderAndModel(
     fallbackModel: fb,
   };
 
-  // Pass assistantConfig from config -- provider parses internally
+  // Assistant config stays keyed by the id as written (assistants.grok still applies).
   const assistantConfig = config.assistants[provider] ?? {};
+  const canonicalProvider = resolveProviderId(provider);
 
   const options: SendQueryOptions = {
     ...baseOptions,
@@ -1950,7 +1953,7 @@ async function resolveNodeProviderAndModel(
   };
 
   return {
-    provider,
+    provider: canonicalProvider,
     model: effectiveModel,
     options,
     declaredModelId: modelOverride?.nodes?.[node.id]?.model ?? model,
@@ -4574,7 +4577,7 @@ async function executeLoopNode(
               attemptId: iterationAttempt.attemptId,
               attemptNumber: iterationAttempt.attemptNumber,
               attemptStartedAt: iterationAttempt.startedAt,
-              provider: workflowProvider,
+              provider: resolveProviderId(workflowProvider),
               info: error.info,
               iteration: i,
             },
@@ -5901,7 +5904,7 @@ async function executeDagWorkflowInternal(
               output.state === 'failed' &&
               output.error !== undefined &&
               loopFailoverTarget !== null &&
-              loopFailoverTarget.provider !== loopProvider &&
+              resolveProviderId(loopFailoverTarget.provider) !== resolveProviderId(loopProvider) &&
               isRegisteredProvider(loopFailoverTarget.provider) &&
               (loopQuotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
             ) {
@@ -5918,8 +5921,11 @@ async function executeDagWorkflowInternal(
                   deps,
                   workflowRun.id,
                   node.id,
-                  { provider: loopProvider, model: loopModel },
-                  { provider: loopFailoverTarget.provider, model: loopFailoverModel },
+                  { provider: resolveProviderId(loopProvider), model: loopModel },
+                  {
+                    provider: resolveProviderId(loopFailoverTarget.provider),
+                    model: loopFailoverModel,
+                  },
                   loopFailoverErrorClass
                 );
                 await safeSendMessage(
@@ -6220,7 +6226,7 @@ async function executeDagWorkflowInternal(
             output.state === 'failed' &&
             output.error !== undefined &&
             failoverTarget !== null &&
-            failoverTarget.provider !== provider && // never "failover" to the same provider
+            resolveProviderId(failoverTarget.provider) !== provider && // never "failover" to the same provider
             (quotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
           ) {
             try {

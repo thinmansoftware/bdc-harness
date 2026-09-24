@@ -100,7 +100,9 @@ describe('GrokAgentProvider', () => {
     delete process.env.OPENROUTER_API_KEY;
     const p = new GrokAgentProvider();
     await expect(async () => {
-      const gen = p.sendQuery('hi', '/tmp');
+      const gen = p.sendQuery('hi', '/tmp', undefined, {
+        model: 'deepseek/deepseek-v4.1-flash',
+      });
       await gen.next();
     }).toThrow(/GLM_API_KEY|OPENROUTER_API_KEY/);
   });
@@ -109,9 +111,33 @@ describe('GrokAgentProvider', () => {
     process.env.GLM_API_KEY = 'test-key';
     const p = new GrokAgentProvider();
     await expect(async () => {
-      const gen = p.sendQuery('hi', '');
+      const gen = p.sendQuery('hi', '', undefined, { model: 'deepseek/deepseek-v4.1-flash' });
       await gen.next();
     }).toThrow(/cwd/);
+  });
+
+  test('refuses xAI models before any network call', async () => {
+    process.env.GLM_API_KEY = 'test-key';
+    mockCreate.mockClear();
+    const p = new GrokAgentProvider();
+    for (const model of ['x-ai/grok-4.7', 'grok-4.7']) {
+      await expect(async () => {
+        const gen = p.sendQuery('hi', '/tmp', undefined, { model });
+        await gen.next();
+      }).toThrow(/^openrouter_xai_refused/);
+    }
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  test('requires an explicit model', async () => {
+    process.env.GLM_API_KEY = 'test-key';
+    mockCreate.mockClear();
+    const p = new GrokAgentProvider();
+    await expect(async () => {
+      const gen = p.sendQuery('hi', '/tmp');
+      await gen.next();
+    }).toThrow(/^openrouter_model_required/);
+    expect(mockCreate).not.toHaveBeenCalled();
   });
 
   test('yields tool chunks and forwards abortSignal', async () => {
@@ -155,6 +181,7 @@ describe('GrokAgentProvider', () => {
       const chunks: Array<{ type: string; toolName?: string; content?: string }> = [];
       for await (const chunk of provider.sendQuery('read a file', cwd, undefined, {
         abortSignal: signal,
+        model: 'deepseek/deepseek-v4.1-flash',
       })) {
         chunks.push(chunk);
       }
@@ -177,7 +204,7 @@ describe('GrokAgentProvider', () => {
 
   test('getType and capabilities', () => {
     const p = new GrokAgentProvider();
-    expect(p.getType()).toBe('grok');
+    expect(p.getType()).toBe('openrouter');
     const caps = p.getCapabilities();
     expect(caps.structuredOutput).toBe(true);
     expect(caps.sessionResume).toBe(false);
@@ -193,8 +220,9 @@ describe('registerGrokAgentProvider', () => {
     registerGrokAgentProvider();
     registerGrokAgentProvider();
     expect(isRegisteredProvider('grok')).toBe(true);
+    expect(isRegisteredProvider('openrouter')).toBe(true);
     const p = getAgentProvider('grok');
-    expect(p.getType()).toBe('grok');
+    expect(p.getType()).toBe('openrouter');
     expect(getProviderCapabilities('grok').structuredOutput).toBe(true);
   });
 

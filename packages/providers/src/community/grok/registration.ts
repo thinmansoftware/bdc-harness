@@ -1,20 +1,36 @@
-import { isRegisteredProvider, registerProvider } from '../../registry';
+import { registerProvider, registerProviderAlias, resolveProviderId } from '../../registry';
+import { setOpenRouterProviderIdResolver } from '../../openrouter-guard';
 import { GROK_AGENT_CAPABILITIES } from './capabilities';
 import { GrokAgentProvider } from './provider';
 
 /**
- * Register tool-capable Grok agent provider (OpenRouter + local tool loop).
- * Idempotent. Id: `grok`.
+ * Register the tool-loop OpenRouter agent (open models + local tool loop).
+ * Idempotent. Id: `openrouter`. `grok` remains a deprecated alias.
  *
  * Use for implement/repair seats. Do not confuse with chat-only `opr`.
+ *
+ * Idempotency is a local flag, not isRegisteredProvider('openrouter'). A caller
+ * that stubs isRegisteredProvider to true (the /run route tests do) would
+ * otherwise skip the grok alias and leave xAI checks blind to that id.
  */
+let grokAgentRegistered = false;
+
+/** @internal Test-only -- clearRegistry calls this so a later register is not a no-op. */
+export function resetGrokAgentProviderRegistration(): void {
+  grokAgentRegistered = false;
+}
+
 export function registerGrokAgentProvider(): void {
-  if (isRegisteredProvider('grok')) return;
+  setOpenRouterProviderIdResolver(resolveProviderId);
+  if (grokAgentRegistered) return;
+  grokAgentRegistered = true;
   registerProvider({
-    id: 'grok',
-    displayName: 'Grok agent (OpenRouter + local tools)',
+    id: 'openrouter',
+    displayName: 'OpenRouter agent (open models + local tools)',
     factory: () => new GrokAgentProvider(),
     capabilities: GROK_AGENT_CAPABILITIES,
     builtIn: false,
   });
+  // @deprecated Legacy id. New YAML and events use `openrouter`.
+  registerProviderAlias('grok', 'openrouter');
 }
