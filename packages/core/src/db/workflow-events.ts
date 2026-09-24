@@ -184,6 +184,66 @@ export async function listRecentEvents(
  * Used by the DAG executor to restore node outputs when resuming a failed run.
  * Throws on DB error -- caller owns the degradation policy.
  */
+export interface OriginatingPullRequestRun {
+  runId: string;
+  workflowName: string;
+  userMessage: string;
+  workingPath: string;
+}
+
+/**
+ * Newest Cauldron feature-lane run that opened this exact pull request URL.
+ *
+ * A URL is not a prefix match: /pull/91 does not match an event that only
+ * names /pull/914. The trailing character must be absent or not a digit.
+ */
+export async function findOriginatingRunForPullRequest(
+  prUrl: string
+): Promise<OriginatingPullRequestRun | null> {
+  const result = await pool.query<{
+    run_id: string;
+    workflow_name: string;
+    user_message: string;
+    working_path: string;
+    data: string | Record<string, unknown>;
+  }>(
+    `SELECT r.id AS run_id, r.workflow_name, r.user_message, r.working_path, e.data AS data
+     FROM remote_agent_workflow_runs r
+     INNER JOIN remote_agent_workflow_events e ON e.workflow_run_id = r.id
+     WHERE r.working_path IS NOT NULL
+       AND TRIM(r.working_path) <> ''
+       AND r.workflow_name LIKE $1
+       AND e.event_type = $2
+       AND e.step_name = $3
+       AND CAST(e.data AS TEXT) LIKE $4
+     ORDER BY r.started_at DESC`,
+    ['bdc-feature-development%', 'node_completed', 'open-pr-if-needed', `%${prUrl}%`]
+  );
+  for (const row of result.rows) {
+    const dataText = typeof row.data === 'string' ? row.data : JSON.stringify(row.data);
+    if (!containsExactPullUrl(dataText, prUrl)) continue;
+    return {
+      runId: row.run_id,
+      workflowName: row.workflow_name,
+      userMessage: row.user_message,
+      workingPath: row.working_path,
+    };
+  }
+  return null;
+}
+
+function containsExactPullUrl(dataText: string, prUrl: string): boolean {
+  let from = 0;
+  while (from <= dataText.length) {
+    const at = dataText.indexOf(prUrl, from);
+    if (at < 0) return false;
+    const next = dataText.charAt(at + prUrl.length);
+    if (next === '' || !/[0-9]/.test(next)) return true;
+    from = at + prUrl.length;
+  }
+  return false;
+}
+
 export async function getCompletedDagNodeOutputs(
   workflowRunId: string
 ): Promise<Map<string, string>> {

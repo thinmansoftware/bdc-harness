@@ -1,10 +1,23 @@
 import { createHash } from 'crypto';
+import { getMessage, type DispatchMessage } from '../db/dispatch';
 import type { RunAuthorityPolicy } from '@archon/workflows/schemas/workflow';
 import type { FrozenSpecSource } from '@archon/workflows/reliability/run-authority';
 
 export interface WorkOrderSourceDependencies {
   readonly fetcher?: typeof fetch;
   readonly githubToken?: string;
+  readonly loadReviewMessage?: (id: string) => Promise<DispatchMessage | null>;
+}
+
+export interface ReworkDirectiveRef {
+  readonly prNumber: number;
+  readonly branch: string;
+  readonly headSha: string;
+  readonly reviewMessageId: string;
+}
+
+export interface ReworkDirectiveReview {
+  readonly summary: string;
 }
 
 /** A constraint on policy-resolved authority, never an alternate authority source. */
@@ -12,6 +25,59 @@ export interface ExpectedSpecIdentity {
   readonly specSource: string;
   readonly specRevision: string;
   readonly specHash: string;
+}
+
+const REWORK_REF_KEYS = ['prNumber', 'branch', 'headSha', 'reviewMessageId'] as const;
+
+export function readReworkDirectiveRef(userMessage: string): ReworkDirectiveRef | undefined {
+  const header = userMessage.split(/\r?\n/, 1)[0] ?? '';
+  const match = /(?:^|\s)--rework=([A-Za-z0-9_-]*)/.exec(header);
+  if (!match) return undefined;
+  const token = match[1] ?? '';
+  if (!token) throw new Error('authority_conflict: malformed rework directive');
+  try {
+    const value: unknown = JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error();
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (keys.length !== REWORK_REF_KEYS.length || REWORK_REF_KEYS.some(key => !keys.includes(key))) {
+      throw new Error();
+    }
+    const prNumber = record.prNumber;
+    const branch = record.branch;
+    const headSha = record.headSha;
+    const reviewMessageId = record.reviewMessageId;
+    if (
+      typeof prNumber !== 'number' ||
+      !Number.isInteger(prNumber) ||
+      prNumber <= 0 ||
+      typeof branch !== 'string' ||
+      branch.length === 0 ||
+      typeof headSha !== 'string' ||
+      !/^[0-9a-fA-F]{40}$/.test(headSha) ||
+      typeof reviewMessageId !== 'string' ||
+      reviewMessageId.length === 0
+    ) {
+      throw new Error();
+    }
+    return { prNumber, branch, headSha, reviewMessageId };
+  } catch {
+    throw new Error('authority_conflict: malformed rework directive');
+  }
+}
+
+export function renderReworkDirective(ref: ReworkDirectiveRef, review: ReworkDirectiveReview): string {
+  return [
+    '',
+    '## Rework directive (engine-appended, do not edit)',
+    'REWORK_DIRECTIVE: overseer-changes-requested',
+    `Repair target: PR #${ref.prNumber} (branch ${ref.branch})`,
+    `Rework head: ${ref.headSha}`,
+    `Review message: ${ref.reviewMessageId}`,
+    'The Overseer rejected this exact head. Every finding below is an unmet requirement of this WO. Fix each one on this branch; do not open a new PR.',
+    '### Overseer findings',
+    review.summary,
+  ].join('\n');
 }
 
 function readExpectedSpecIdentity(userMessage: string): ExpectedSpecIdentity | undefined {
@@ -114,7 +180,58 @@ export async function freezeWorkOrderSource(
       `sha256:${createHash('sha256').update(source.specBytes).digest('hex')}` !== expected.specHash)
   )
     throw new Error('authority_conflict: canonical spec changed since eligibility');
-  return source;
+  const ref = readReworkDirectiveRef(userMessage);
+  if (!ref) return source;
+  const loadReviewMessage = dependencies.loadReviewMessage ?? getMessage;
+  const row = await loadReviewMessage(ref.reviewMessageId);
+  const summary = verifiedReworkSummary(row, ref);
+  const directive = Buffer.from(renderReworkDirective(ref, { summary }), 'utf8');
+  const canonical = source.specBytes;
+  const separator =
+    canonical.byteLength > 0 && canonical[canonical.byteLength - 1] === 0x0a
+      ? Buffer.alloc(0)
+      : Buffer.from('\n');
+  return {
+    ...source,
+    specBytes: Buffer.concat([canonical, separator, directive]),
+  };
+}
+
+function verifiedReworkSummary(
+  row: DispatchMessage | null,
+  ref: ReworkDirectiveRef
+): string {
+  if (!row) throw new Error('authority_conflict: rework directive');
+  if (row.task_type !== 'run_review' || row.recipient !== 'overseer-reviewer') {
+    throw new Error('authority_conflict: rework directive');
+  }
+  const subject = row.subject_key ?? '';
+  if (!subject.endsWith(`#${ref.prNumber}`)) {
+    throw new Error('authority_conflict: rework directive');
+  }
+  let body: Record<string, unknown>;
+  let result: Record<string, unknown>;
+  try {
+    const parsedBody: unknown = JSON.parse(row.body);
+    const parsedResult: unknown = JSON.parse(row.result_body ?? '');
+    if (
+      typeof parsedBody !== 'object' ||
+      parsedBody === null ||
+      typeof parsedResult !== 'object' ||
+      parsedResult === null
+    ) {
+      throw new Error();
+    }
+    body = parsedBody as Record<string, unknown>;
+    result = parsedResult as Record<string, unknown>;
+  } catch {
+    throw new Error('authority_conflict: rework directive');
+  }
+  if (body.headSha !== ref.headSha || result.disposition !== 'changes_requested') {
+    throw new Error('authority_conflict: rework directive');
+  }
+  if (typeof result.summary !== 'string') throw new Error('authority_conflict: rework directive');
+  return result.summary;
 }
 
 async function resolveWorkOrderSource(

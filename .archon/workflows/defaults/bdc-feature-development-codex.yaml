@@ -287,6 +287,19 @@ nodes:
       # happened. Mirrors the direct-assignment pattern that already works in
       # the bdc-harness-*.yaml lanes.
       CAS=$check-already-satisfied.output
+      SPEC=$read-spec.output
+      if printf '%s\n' "$SPEC" | grep -qx 'REWORK_DIRECTIVE: overseer-changes-requested'; then
+        echo "rework directive present -- forcing needs-build" >&2
+        ALREADY_VALUE=false PRECHECK_VERDICT=needs-build python3 - <<'PY'
+      import json
+      import os
+      print(json.dumps({
+          "ALREADY_SATISFIED": os.environ.get("ALREADY_VALUE") == "true",
+          "PRECHECK_VERDICT": os.environ.get("PRECHECK_VERDICT", "needs-build"),
+      }, separators=(",", ":")))
+      PY
+        exit 0
+      fi
       if [[ $'\n'"$CAS" == *$'\n'ALREADY_SATISFIED=true* ]]; then
         SATISFIED_EVIDENCE=$(printf '%s\n' "$CAS" | sed -n 's/^SATISFIED_EVIDENCE=//p' | head -1)
         if [[ $'\n'"$CAS" == *$'\n'SATISFIED_ON_BASE=true* ]]; then
