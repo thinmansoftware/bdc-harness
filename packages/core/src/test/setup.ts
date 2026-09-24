@@ -8,7 +8,7 @@ import { join } from 'path';
 //
 // Tests must never inherit production credentials or switches. Before any test
 // module loads, remove variables prefixed with OVERSEER_, MERGE_MANAGER_,
-// ARCHON_, DUTY_OFFICER_, TASKMASTER_, DISPATCH_, SMART_CAULDRON_, or
+// ARCHON_, DUTY_OFFICER_, TASKMASTER_, DISPATCH_, SMART_CAULDRON_, BOARD_, or
 // GITHUB_APP_, plus GH_TOKEN, GITHUB_TOKEN, and GH_AUTH_TOKEN_INTERNAL.
 // Tests that need one of these values must set it explicitly themselves.
 const TEST_ENV_PREFIXES = [
@@ -19,6 +19,7 @@ const TEST_ENV_PREFIXES = [
   'TASKMASTER_',
   'DISPATCH_',
   'SMART_CAULDRON_',
+  'BOARD_',
   'GITHUB_APP_',
 ];
 const TEST_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN', 'GH_AUTH_TOKEN_INTERNAL']);

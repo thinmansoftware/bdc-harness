@@ -15,6 +15,7 @@ test('preload scrub removes production credentials and switches inherited by a c
       '  expect(process.env.MERGE_MANAGER_GH_TOKEN).toBeUndefined();',
       '  expect(process.env.GH_TOKEN).toBeUndefined();',
       '  expect(process.env.OVERSEER_MAX_REREVIEW_ATTEMPTS).toBeUndefined();',
+      '  expect(process.env.BOARD_PRINCIPALS_JSON).toBeUndefined();',
       '});',
     ].join('\n')
   );
@@ -27,6 +28,7 @@ test('preload scrub removes production credentials and switches inherited by a c
         MERGE_MANAGER_GH_TOKEN: 'production-shaped-test-value',
         GH_TOKEN: 'production-shaped-test-value',
         OVERSEER_MAX_REREVIEW_ATTEMPTS: '3',
+        BOARD_PRINCIPALS_JSON: '{"production":"principal"}',
       },
       stdout: 'pipe',
       stderr: 'pipe',

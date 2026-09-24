@@ -363,10 +363,12 @@ rm -rf "$TMP"
 echo "--- rst_run_commands: two commands, counts summed, first nonzero exit kept ---"
 export OVERSEER_FOO=production-shaped-test-value
 export MERGE_MANAGER_GH_TOKEN=production-shaped-test-value
+export BOARD_PRINCIPALS_JSON=production-shaped-test-value
 export GH_TOKEN=production-shaped-test-value
 rst_scrub_env
 assert_eq "scrub removes OVERSEER_ prefix" "unset" "${OVERSEER_FOO:-unset}"
 assert_eq "scrub removes MERGE_MANAGER_ prefix" "unset" "${MERGE_MANAGER_GH_TOKEN:-unset}"
+assert_eq "scrub removes BOARD_ prefix" "unset" "${BOARD_PRINCIPALS_JSON:-unset}"
 assert_eq "scrub removes exact GH_TOKEN" "unset" "${GH_TOKEN:-unset}"
 TMP="$(mktemp -d)"
 cat > "$TMP/ok.sh" <<'EOF'
