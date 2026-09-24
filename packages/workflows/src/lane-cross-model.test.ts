@@ -3,7 +3,9 @@
  *
  * Test scenarios 1-2 from WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01:
  *
- * S1: Cross-model review in codex lane -- the 4 review nodes must NOT use provider: codex.
+ * S1 removed (WO-HARNESS-LANE-REVIEWERS-SOL-TERRA-01): the codex lane's review
+ * seats are provider codex on purpose. Model inequality (S2) is the self-review
+ * guarantee -- gpt-5.6-terra reviews, gpt-5.6-sol builds.
  * S2: No self-review (general) -- for every lane, builder-model != reviewer-model
  *     (model ID differs between implement and the review nodes diff-review / diff-review-final /
  *     opus-rereview / apply-diff-review-final).
@@ -63,15 +65,6 @@ const LANE_FILES = readdirSync(LANES_DIR)
   .sort();
 
 describe('lane cross-model review', () => {
-  it('S1: codex lane has 0 review nodes with provider: codex', () => {
-    const lane = loadLane('bdc-feature-development-codex.yaml');
-    const nodes = lane.nodes ?? [];
-    const reviewNodesWithCodex = nodes.filter(
-      n => REVIEW_NODE_IDS.has(n.id) && resolveProvider(n, lane) === 'codex'
-    );
-    expect(reviewNodesWithCodex).toHaveLength(0);
-  });
-
   it('S2: every lane -- builder-model differs from reviewer-model (no self-review)', () => {
     const violations: string[] = [];
 

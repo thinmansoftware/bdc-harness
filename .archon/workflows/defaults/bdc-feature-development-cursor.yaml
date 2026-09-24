@@ -3,8 +3,8 @@ description: |
   Dedicated Cursor-rail lane for feature Work Orders. Planning, implementation,
   and repair seats run through provider cursor (local cursor-agent CLI on the
   operator's Cursor subscription) with grok-4.7-high. Every review and
-  judge seat runs on provider claude with the codex lane's pins, so the
-  builder never grades its own output and the lane spends no Codex budget.
+  judge seat runs on provider codex with gpt-5.6-sol, so the
+  builder never grades its own output.
   Node graph,
   bash bodies and sentinels are byte-identical to bdc-feature-development-grok.
   Directly invokable; bound to the ladder's dark `cursor` tier (refusedTiers).
@@ -18,7 +18,7 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Dedicated Cursor execution default. Review nodes override to provider claude.
+# Dedicated Cursor execution default. Review nodes override to provider codex / gpt-5.6-sol.
 provider: cursor
 model: grok-4.7-high
 
@@ -341,12 +341,12 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
-    provider: claude
-    persona: war-council-architect
-    agent: war-council-architect
+    persona: war-council-architect-opr
+    provider: codex
+    model: gpt-5.6-sol
+    agent: war-council-architect-opr
     # Cross-model boundary: Grok 4.7 authors the plan on the Cursor rail;
-    # Claude (sonnet) reviews it. The builder never grades its own work.
-    model: sonnet
+    # Codex (gpt-5.6-sol) reviews it. The builder never grades its own work.
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -2081,10 +2081,10 @@ nodes:
       exit 0
 
   - id: war-council-validator
-    # Claude judge (codex-lane pin); never the Cursor builder model.
-    provider: claude
-    model: claude-opus-5-5
-    persona: captain-ci-validator-fable
+    # Codex/Sol judge; never the Cursor builder model.
+    provider: codex
+    model: gpt-5.6-sol
+    persona: captain-ci-validator-codex
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
     prompt: |
@@ -2220,9 +2220,10 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    model: gpt-5.6-sol
+    agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
     prompt: |
@@ -2488,9 +2489,10 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    model: gpt-5.6-sol
+    agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
@@ -2654,9 +2656,10 @@ nodes:
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    model: gpt-5.6-sol
+    agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
     when: "$classify-opus-repair.output.fixed == 'true'"
@@ -2872,9 +2875,9 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
-    persona: xo
-    provider: claude
-    model: sonnet
+    persona: xo-opr
+    provider: codex
+    model: gpt-5.6-sol
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -3002,9 +3005,10 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    model: gpt-5.6-sol
+    agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
