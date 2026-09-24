@@ -98,10 +98,14 @@ export async function syncWorkspace(
 ): Promise<WorkspaceSyncResult> {
   const shouldReset = options?.resetAfterFetch ?? true;
   const branchToSync = baseBranch ?? (await getDefaultBranch(workspacePath));
+  if (branchToSync.startsWith('-')) {
+    throw new Error(`unsupported branch: ${branchToSync}`);
+  }
 
-  // Fetch from origin to ensure origin/<branchToSync> is up-to-date
+  // Fetch from origin to ensure origin/<branchToSync> is up-to-date.
+  // `--` keeps a ref that starts with '-' from being read as a git option.
   try {
-    await execFileAsync('git', ['-C', workspacePath, 'fetch', 'origin', branchToSync], {
+    await execFileAsync('git', ['-C', workspacePath, 'fetch', '--', 'origin', branchToSync], {
       timeout: 60000,
     });
   } catch (error) {
@@ -225,7 +229,7 @@ export async function cloneRepository(
       cloneUrl = parsed.toString();
     }
 
-    await execFileAsync('git', ['clone', cloneUrl, targetPath], { timeout: 120000 });
+    await execFileAsync('git', ['clone', '--', cloneUrl, targetPath], { timeout: 120000 });
     return { ok: true, value: undefined };
   } catch (error) {
     const err = error as Error;
