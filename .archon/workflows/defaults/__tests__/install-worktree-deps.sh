@@ -440,6 +440,73 @@ else
 fi
 echo "Test 11 lanes: $(printf '%s\n' "$SCAN1" | grep '^LANE_COUNT' | awk '{print $2}')"
 
+echo "--- Test 12: content mutation of an already-dirty tracked file is detected, not reverted or silently accepted ---"
+# Overseer review, bdc-harness#946, [major]: the before/after comparison only
+# diffed the PATH SET, so a lifecycle script that mutates the CONTENT of a
+# path already dirty before install went undetected: the path was in both
+# snapshots either way, so a pure path-set diff sees no difference, the
+# install is reported as a clean 'installed', and the pre-existing dirty edit
+# a builder never asked the install to touch is silently clobbered.
+reset_wdi_env
+T12="$(newtmp)"
+ART12="$(newtmp)"
+export ARTIFACTS_DIR="$ART12"
+mkdir -p "$T12/repo/src"
+printf '%s\n' '{"name":"wdi-fixture","private":true}' > "$T12/repo/package.json"
+printf '%s\n' 'lock-v1' > "$T12/repo/bun.lock"
+printf '%s\n' 'node_modules' > "$T12/repo/.gitignore"
+printf '%s\n' 'base' > "$T12/repo/src/a.ts"
+init_repo "$T12/repo"
+# Dirty the tracked file BEFORE install -- this is the builder's own
+# in-progress edit, never committed, that the install must not touch.
+printf '%s\n' 'builder-in-progress-edit' > "$T12/repo/src/a.ts"
+BIN12="$(make_stub_bin)"
+arm_stub_logs "$BIN12"
+LOG12="$CALL_LOG"
+# The fake install mutates that SAME already-dirty path -- same path set
+# before/after, different content. bun.lock itself is untouched, so the old
+# path-set-only comparison would see IDENTICAL before/after snapshots.
+write_stub "$BIN12" bun 'printf "%s\n" "install-clobbered-it" > src/a.ts'
+export PATH="$BIN12:$ORIG_PATH"
+DIRTY_BEFORE="$(cat "$T12/repo/src/a.ts")"
+OUT12="$(cd "$T12/repo" && wdi_main </dev/null)"
+assert_contains "Test 12 DEPS_STATUS=failed" "DEPS_STATUS=failed" "$OUT12"
+assert_contains "Test 12 failed_mutation" ".:failed_mutation" "$OUT12"
+assert_eq "Test 12 stub was called" "1" "$(grep -c . "$LOG12" || true)"
+# The mutated content is left EXACTLY as the install left it (not reverted
+# to HEAD's copy, which would silently discard the builder's real edit under
+# the disguise of a "clean revert"; not silently accepted as a clean pass).
+assert_eq "Test 12 content left as install left it" "install-clobbered-it" "$(cat "$T12/repo/src/a.ts")"
+[ "$(cat "$T12/repo/src/a.ts")" != "$DIRTY_BEFORE" ] && echo "PASS: Test 12 not silently reverted to pre-install dirty state" && PASS=$((PASS+1)) || { echo "FAIL: Test 12 not silently reverted to pre-install dirty state"; FAIL=$((FAIL+1)); }
+[ ! -e "$T12/repo/node_modules/.archon-wdi-stamp" ] && echo "PASS: Test 12 no cache stamp on a failed install" && PASS=$((PASS+1)) || { echo "FAIL: Test 12 no cache stamp on a failed install"; FAIL=$((FAIL+1)); }
+
+echo "--- Test 13: content mutation of an existing untracked file is detected ---"
+# Same bug class, untracked variant: an existing untracked path (never
+# committed at all) whose content the install script mutates. The path was
+# in the before AND after porcelain snapshot either way (untracked files show
+# up in git status regardless of whether their content changed), so this is
+# the second half of the finding's two named victim classes.
+reset_wdi_env
+T13="$(newtmp)"
+ART13="$(newtmp)"
+export ARTIFACTS_DIR="$ART13"
+mkdir -p "$T13/repo"
+printf '%s\n' '{"name":"wdi-fixture","private":true}' > "$T13/repo/package.json"
+printf '%s\n' 'lock-v1' > "$T13/repo/bun.lock"
+printf '%s\n' 'node_modules' > "$T13/repo/.gitignore"
+init_repo "$T13/repo"
+# An untracked scratch file the builder is mid-edit on, never added to git.
+printf '%s\n' 'scratch-in-progress' > "$T13/repo/scratch.local.md"
+BIN13="$(make_stub_bin)"
+arm_stub_logs "$BIN13"
+LOG13="$CALL_LOG"
+write_stub "$BIN13" bun 'printf "%s\n" "install-clobbered-scratch" > scratch.local.md'
+export PATH="$BIN13:$ORIG_PATH"
+OUT13="$(cd "$T13/repo" && wdi_main </dev/null)"
+assert_contains "Test 13 DEPS_STATUS=failed" "DEPS_STATUS=failed" "$OUT13"
+assert_contains "Test 13 failed_mutation" ".:failed_mutation" "$OUT13"
+assert_eq "Test 13 content left as install left it" "install-clobbered-scratch" "$(cat "$T13/repo/scratch.local.md")"
+
 echo
 echo "install-worktree-deps.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

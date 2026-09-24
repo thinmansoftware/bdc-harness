@@ -1301,16 +1301,80 @@ nodes:
           }
         ' | LC_ALL=C sort -u
       }
-      wdi_revert_new() {
-        local before="$1" after="$2" path
+      # wdi_fingerprint_paths <paths-file>   (path + content hash, one per line, stdout)
+      #
+      # A porcelain PATH SET alone cannot see a lifecycle script that mutates
+      # the CONTENT of a path already dirty before install, or an existing
+      # untracked path -- the path was already in the before/after set either
+      # way, so a pure path-set diff is silent on this class of corruption.
+      # `git hash-object` covers a tracked-or-untracked file identically (it
+      # hashes whatever bytes are on disk right now, independent of the index);
+      # a path that no longer exists (deleted mid-install) fingerprints as the
+      # literal token "missing" so a delete is still a detected difference.
+      wdi_fingerprint_paths() {
+        local pathsfile="$1" path hash
         while IFS= read -r path; do
           [ -z "$path" ] && continue
-          if git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
-            git checkout -- "$path" || true
+          if [ -e "$path" ] && [ ! -d "$path" ]; then
+            hash="$(git hash-object -- "$path" 2>/dev/null || echo unreadable)"
           else
-            rm -rf -- "$path"
+            hash="missing"
           fi
-        done < <(comm -13 "$before" "$after")
+          printf '%s\t%s\n' "$path" "$hash"
+        done < "$pathsfile" | LC_ALL=C sort -u
+      }
+      # wdi_revert_new <before-paths> <after-paths> <before-fp> <after-fp>
+      #
+      # Walks the UNION of both porcelain snapshots (not just paths added
+      # during install) so a path already dirty (or already untracked) before
+      # install, whose CONTENT changed during install, is visited too -- a
+      # pure "new paths only" sweep never looks at that path at all, which is
+      # the gap this fix closes.
+      #
+      # A path present in BOTH snapshots with an unchanged fingerprint needs
+      # no action. A path present in both snapshots with a CHANGED
+      # fingerprint is a mutation of pre-existing content (already-dirty
+      # tracked, or an existing untracked file) -- `git checkout` would
+      # restore HEAD's copy, not the pre-install DIRTY copy, so silently
+      # "reverting" it would destroy real work the caller never asked to
+      # touch. There is no safe local revert for that case: the path is left
+      # exactly as the install left it and recorded in WDI_UNSAFE_MUTATIONS
+      # (newline-separated) so the caller (wdi_install_dir) can fail loudly
+      # instead of installing over it.
+      #
+      # A brand-new path (in `after` only) is safe to remove/restore --
+      # nothing existed there before this install touched it. A path that
+      # disappeared (in `before` only) needs no revert of its own; its
+      # deletion is exactly the pre-install/post-install path-set difference,
+      # already accounted for by the caller having observed before != after.
+      wdi_revert_new() {
+        local before="$1" after="$2" beforefp="$3" afterfp="$4"
+        local path beforeline afterline
+        WDI_UNSAFE_MUTATIONS=""
+        while IFS= read -r path; do
+          [ -z "$path" ] && continue
+          beforeline="$(grep -F -- "$path	" "$beforefp" || true)"
+          afterline="$(grep -F -- "$path	" "$afterfp" || true)"
+          if [ -n "$beforeline" ] && [ -n "$afterline" ]; then
+            if [ "$beforeline" != "$afterline" ]; then
+              WDI_UNSAFE_MUTATIONS="$(printf '%s\n%s' "$WDI_UNSAFE_MUTATIONS" "$path")"
+            fi
+            continue
+          fi
+          if [ -z "$beforeline" ] && [ -n "$afterline" ]; then
+            # Added-only: safe to remove/restore.
+            if git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+              git checkout -- "$path" || true
+            else
+              rm -rf -- "$path"
+            fi
+          fi
+          # beforeline set, afterline empty: path disappeared -- nothing to
+          # revert (there is no content left to check or restore here; a
+          # lifecycle script deleting a pre-existing path is exactly the kind
+          # of mutation the path-set diff already caught upstream).
+        done < <(sort -u -m "$before" "$after" | LC_ALL=C sort -u)
+        WDI_UNSAFE_MUTATIONS="${WDI_UNSAFE_MUTATIONS#$'\n'}"
       }
       wdi_cache_report() {
         local wt a b
@@ -1334,7 +1398,8 @@ nodes:
       # wdi_install_dir <dir> <log>   (-> one status word on stdout)
       wdi_install_dir() {
         local dir="$1" log="$2" mgr ign free min lock hash stamp want
-        local before after tout rc dirty=0
+        local before after beforefp afterfp tout rc dirty=0 mutated=0
+        WDI_UNSAFE_MUTATIONS=""
         if [ ! -f "$dir/package.json" ]; then printf 'skipped_no_package_json'; return 0; fi
         mgr="$(wdi_pick_manager "$dir")"
         if [ "$mgr" = "none" ]; then printf 'skipped_no_lockfile'; return 0; fi
@@ -1351,7 +1416,10 @@ nodes:
         if [ -f "$stamp" ] && [ "$(tr -d '\n' < "$stamp")" = "$want" ]; then printf 'cached'; return 0; fi
         before="$(mktemp)"
         after="$(mktemp)"
+        beforefp="$(mktemp)"
+        afterfp="$(mktemp)"
         wdi_status_paths > "$before"
+        wdi_fingerprint_paths "$before" > "$beforefp"
         tout="${WDI_TIMEOUT_SECS:-600}"
         printf '### wdi: dir=%s manager=%s\n' "$dir" "$mgr" >> "$log"
         (
@@ -1369,11 +1437,25 @@ nodes:
         ) >> "$log" 2>&1
         rc=$?
         wdi_status_paths > "$after"
-        if ! cmp -s "$before" "$after"; then
+        # Fingerprint the UNION of both path snapshots, read from disk as it
+        # stands right now (post-install): a short-circuit on
+        # `cmp -s "$before" "$after"` here would be the exact gap this fix
+        # closes -- an unchanged PATH SET says nothing about whether a path's
+        # CONTENT moved, so the fingerprint pass always runs, not only when
+        # the path set itself differs.
+        sort -u -m "$before" "$after" | LC_ALL=C sort -u > "$afterfp.union"
+        wdi_fingerprint_paths "$afterfp.union" > "$afterfp"
+        rm -f "$afterfp.union"
+        if ! cmp -s "$before" "$after" || ! cmp -s "$beforefp" "$afterfp"; then
           dirty=1
-          wdi_revert_new "$before" "$after"
+          wdi_revert_new "$before" "$after" "$beforefp" "$afterfp"
         fi
-        rm -f "$before" "$after"
+        if [ -n "${WDI_UNSAFE_MUTATIONS:-}" ]; then
+          mutated=1
+          printf 'wdi: unsafe content mutation, left as-is (not reverted): %s\n' "$WDI_UNSAFE_MUTATIONS" >> "$log"
+        fi
+        rm -f "$before" "$after" "$beforefp" "$afterfp"
+        if [ "$mutated" -eq 1 ]; then printf 'failed_mutation'; return 0; fi
         if [ "$rc" -eq 124 ]; then printf 'failed_timeout'; return 0; fi
         if [ "$rc" -ne 0 ]; then printf 'failed_exit_%s' "$rc"; return 0; fi
         if [ "$dirty" -eq 1 ]; then printf 'dirty_reverted'; return 0; fi
