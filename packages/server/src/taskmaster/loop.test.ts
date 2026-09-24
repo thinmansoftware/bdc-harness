@@ -4,7 +4,7 @@
  * fake dispatch); no mock.module.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
-import { readFileSync } from 'fs';
+import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import {
   createTaskmasterState,
@@ -22,6 +22,7 @@ import {
   OWNER_RECIPIENT_MAP,
   isPauseEffectsExempt,
   TM_REPEAT_REASON_BY_TYPE,
+  isPostCutoverReceipt,
   type TaskmasterDeps,
   type ListedThread,
   type GithubIssueEvidence,
@@ -41,8 +42,25 @@ import type {
   TmJournalEntry,
 } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
+import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 
 describe('Taskmaster reset visibility and canary', () => {
+  test('legacy_unverified receipts are never post-cutover evidence', () => {
+    const cutover = '2026-09-23T16:00:00.000Z';
+    expect(isPostCutoverReceipt('2026-09-23T15:59:59.999Z', cutover)).toBe(false);
+    expect(isPostCutoverReceipt(cutover, cutover)).toBe(true);
+    expect(isPostCutoverReceipt(null, cutover)).toBe(false);
+  });
+
+  test('PAUSED ticks do not write a tm_journal effect', async () => {
+    const world = makeWorld();
+    world.control.pause_state = 'PAUSED';
+    seedDigestSent(world);
+    const before = world.journal.length;
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.journal).toHaveLength(before);
+  });
+
   test('only the two WO-authorized monitoring signals escape an effects pause', () => {
     expect(isPauseEffectsExempt('canary', 'effects')).toBe(true);
     expect(isPauseEffectsExempt('self_pause_notice', 'effects')).toBe(true);
@@ -361,6 +379,7 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
   return {
     now: () => new Date(world.nowMs),
     db: dal,
+    getDispatchReceiptCutoverAt: async () => new Date(T0 - 86_400_000).toISOString(),
     headroom: async () => okHeadroom,
     createTask: (async (
       _context: unknown,
@@ -1788,6 +1807,90 @@ describe('failed effect reuse and successful-tick health', () => {
 });
 
 describe('SC7 grading requires external source progress', () => {
+  test('a pre-cutover acknowledgement is graded unheard through tick', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:nudge:gh:thinmansoftware/bdc-xo#1448:1';
+    world.journal.push({
+      id: 'pre-cutover-ack',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-xo#1448',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'source issue progress after send',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'major-build',
+      body: 'reminder',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 40_000).toISOString(),
+    });
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        getDispatchReceiptCutoverAt: async () => new Date(T0 - 20_000).toISOString(),
+      })
+    );
+    expect(world.journal.find(row => row.id === 'pre-cutover-ack')?.grade).toBe('unheard');
+  });
+
+  test('a pre-cutover addressed_at does not make a ruling delivery useful through tick', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const key = 'tm:deliver_ruling:ruling-pre-cutover-address';
+    world.journal.push({
+      id: 'pre-cutover-address',
+      created_at: new Date(T0 - 60_000).toISOString(),
+      thread_ref: 'dispatch:ruling-pre-cutover-address',
+      action_type: 'deliver_ruling',
+      proposal_json: '{}',
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'original ruling addressed after send',
+      proof_deadline_at: new Date(T0 + 60_000).toISOString(),
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+    world.sentMessages.push({
+      idempotency_key: key,
+      recipient: 'major-build',
+      body: 'ruling reminder',
+      createdAt: new Date(T0 - 45_000).toISOString(),
+      acknowledged_at: new Date(T0 - 10_000).toISOString(),
+    });
+    const deps = makeDeps(world, {
+      getDispatchReceiptCutoverAt: async () => new Date(T0 - 20_000).toISOString(),
+      getDispatchMessageById: (async (id: string) =>
+        id === key
+          ? {
+              id,
+              recipient: 'major-build',
+              resolved_recipient: 'major-build',
+              acknowledged_at: new Date(T0 - 10_000).toISOString(),
+              addressed_at: null,
+              addressed_by: null,
+            }
+          : {
+              id,
+              recipient: 'major-build',
+              resolved_recipient: 'major-build',
+              acknowledged_at: new Date(T0 - 30_000).toISOString(),
+              addressed_at: new Date(T0 - 25_000).toISOString(),
+              addressed_by: 'major-build',
+            }) as unknown as TaskmasterDeps['getDispatchMessageById'],
+    });
+    await tick(createTaskmasterState(60_000), deps);
+    expect(world.journal.find(row => row.id === 'pre-cutover-address')?.grade).toBeNull();
+  });
+
   test('a queued outbound reminder row alone remains ungraded', async () => {
     const world = makeWorld();
     seedDigestSent(world);
@@ -3285,7 +3388,7 @@ describe('M-155 exception push (loop)', () => {
     } as TaskmasterDeps['db'];
   }
 
-  test('push: every owner resolves to xo in THIS WO (routing stub validation)', () => {
+  test('push: every owner resolves to an allowed active draining principal', async () => {
     // Only 'xo' (XO session-start reflex) and 'operator' (John) have a
     // documented drainer; routing to any other mailbox would manufacture a
     // second dead-letter box -- the failure this WO exists to end.
@@ -3297,8 +3400,27 @@ describe('M-155 exception push (loop)', () => {
     // The map structure exists and every entry points at 'xo', so widening it
     // later is a data change rather than a code change.
     expect(Object.keys(OWNER_RECIPIENT_MAP).length).toBeGreaterThan(0);
-    for (const target of Object.values(OWNER_RECIPIENT_MAP)) {
-      expect(target).toBe('xo');
+    const dbPath = join(import.meta.dir, `.test-taskmaster-principals-${Date.now()}.db`);
+    const principalDb = new SqliteAdapter(dbPath);
+    try {
+      for (const target of Object.values(OWNER_RECIPIENT_MAP)) {
+        expect(TM_ALLOWED_RECIPIENTS).toContain(target);
+        const result = await principalDb.query<{ active: number; delivery_mode: string }>(
+          'SELECT active, delivery_mode FROM dispatch_principals WHERE principal_id = $1',
+          [target]
+        );
+        expect(result.rows[0]?.active).toBe(1);
+        expect(['drain_on_start', 'worker_poll']).toContain(result.rows[0]?.delivery_mode);
+      }
+    } finally {
+      await principalDb.close();
+      for (const suffix of ['', '-wal', '-shm']) {
+        try {
+          unlinkSync(dbPath + suffix);
+        } catch {
+          // SQLite may not create sidecars for this read-only fixture.
+        }
+      }
     }
   });
 

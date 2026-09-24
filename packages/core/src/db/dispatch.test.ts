@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { existsSync, mkdtempSync, unlinkSync } from 'fs';
 import { removeTempDirWithRetry } from '../test/temp-dir';
 import { tmpdir } from 'os';
@@ -53,9 +53,12 @@ import {
   resolveDispatchRecipient,
   assessDispatchRecipient,
   normalizeDispatchSubjectKey,
+  mailboxDepthByPrincipal,
   supersedeMessage,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
+  type XoLeaseBind,
+  type DispatchQueryExecutor,
 } from './dispatch';
 
 /** Test-local fixture constructor -- production path is createAuthenticatedMessage. */
@@ -950,12 +953,225 @@ describe('dispatch db', () => {
       ok: false,
       reason: 'not_queued',
     });
-    expect((await acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).ok).toBe(true);
+    await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'xo_bind_required',
+    });
     await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo-fable' })).resolves.toEqual(
       {
         ok: false,
         reason: 'wrong_recipient',
       }
+    );
+  });
+
+  for (const action of ['acknowledge', 'address'] as const) {
+    for (const turnover of ['replace', 'release'] as const) {
+      test(`${action} rejects XO lease ${turnover} between validation and UPDATE`, async () => {
+        const message = await createMessage({
+          correlation_id: 'corr-xo-turnover',
+          idempotency_key: 'idem-xo-turnover',
+          task_type: 'agent_message',
+          sender: 'operator',
+          recipient: 'xo',
+          body: 'XO lease turnover.',
+        });
+        const bind: XoLeaseBind = {
+          kind: 'xo_lease',
+          lease_id: '11111111-1111-4111-8111-111111111111',
+          fencing_token: 9,
+          holder_token_hash: createHash('sha256').update('test-holder').digest('hex'),
+        };
+        await db.query(
+          `INSERT INTO board_xo_leases
+           (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+            acquired_at, expires_at)
+           VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, $5)`,
+          [
+            bind.lease_id,
+            bind.holder_token_hash,
+            bind.fencing_token,
+            new Date().toISOString(),
+            new Date(Date.now() + 60_000).toISOString(),
+          ]
+        );
+        const data = { id: message.id, principal_id: 'xo', bind };
+        if (action === 'address') expect((await acknowledgeMessage(data)).ok).toBe(true);
+        const before = await getMessage(message.id);
+        const withTransaction = db.withTransaction.bind(db);
+        let leaseValidated = false;
+        let turnoverInjected = false;
+        const transactionSpy = spyOn(db, 'withTransaction').mockImplementation(fn =>
+          withTransaction(query => {
+            const wrappedQuery: DispatchQueryExecutor = async <T>(
+              sql: string,
+              params?: unknown[]
+            ) => {
+              if (sql.startsWith('UPDATE agent_dispatch_messages') && !turnoverInjected) {
+                expect(leaseValidated).toBe(true);
+                // Inject turnover only after the pre-check has read the valid lease.
+                await query(
+                  turnover === 'replace'
+                    ? "UPDATE board_xo_leases SET lease_id = '22222222-2222-4222-8222-222222222222', fencing_token = fencing_token + 1 WHERE id = 1"
+                    : 'UPDATE board_xo_leases SET released_at = $1 WHERE id = 1',
+                  turnover === 'release' ? [new Date().toISOString()] : []
+                );
+                turnoverInjected = true;
+              }
+              const result = await query<T>(sql, params);
+              if (sql.startsWith('SELECT lease_id, fencing_token, holder_token_hash')) {
+                expect(result.rowCount).toBe(turnoverInjected && turnover === 'release' ? 0 : 1);
+                leaseValidated = true;
+              }
+              return result;
+            };
+            return fn(wrappedQuery);
+          })
+        );
+        try {
+          const mutate = action === 'acknowledge' ? acknowledgeMessage : addressMessage;
+          await expect(mutate(data)).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+          expect(turnoverInjected).toBe(true);
+          const stored = await getMessage(message.id);
+          expect(stored?.acknowledged_at).toBe(before?.acknowledged_at ?? null);
+          expect(stored?.acknowledged_by).toBe(before?.acknowledged_by ?? null);
+          expect(stored?.addressed_at).toBeNull();
+          expect(stored?.addressed_by).toBeNull();
+        } finally {
+          transactionSpy.mockRestore();
+        }
+      });
+    }
+  }
+
+  test('requires and transactionally fences the XO mailbox lease binding', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-xo-bind',
+      idempotency_key: 'idem-xo-bind',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'XO binding test.',
+    });
+    await expect(acknowledgeMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'xo_bind_required',
+    });
+    const holderToken = 'holder-secret';
+    const bind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-current',
+      fencing_token: 9,
+      holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
+    };
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, NULL, $5, NULL)`,
+      [
+        bind.lease_id,
+        bind.holder_token_hash,
+        bind.fencing_token,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    await expect(
+      acknowledgeMessage({
+        id: message.id,
+        principal_id: 'xo',
+        bind: { ...bind, fencing_token: 8 },
+      })
+    ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind })).ok).toBe(true);
+  });
+
+  test('mailbox depth treats all stamped rows as legacy_unverified without a cutover', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-legacy-depth',
+      idempotency_key: 'idem-legacy-depth',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Legacy depth test.',
+    });
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [message.id, new Date().toISOString(), 'operator']
+    );
+    await db.query('DELETE FROM dispatch_receipt_cutover');
+    const depth = await mailboxDepthByPrincipal();
+    expect(depth.cutover_at).toBeNull();
+    const operator = depth.operator as import('./dispatch').MailboxDepth;
+    expect(operator.legacy_unverified).toBe(1);
+    expect(operator.acked_open).toBe(0);
+  });
+
+  test('mailbox depth assigns an eight-row fixture to exclusive exact buckets', async () => {
+    const cutover = new Date(Date.now() - 60_000).toISOString();
+    const before = new Date(Date.now() - 120_000).toISOString();
+    const after = new Date(Date.now() - 30_000).toISOString();
+    await db.query('DELETE FROM dispatch_receipt_cutover');
+    await db.query('INSERT INTO dispatch_receipt_cutover (id, applied_at) VALUES (1, $1)', [
+      cutover,
+    ]);
+    const rows = await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        createMessage({
+          correlation_id: `depth-corr-${index}`,
+          idempotency_key: `depth-idem-${index}`,
+          task_type: 'agent_message',
+          sender: 'xo',
+          recipient: 'operator',
+          body: `depth ${index}`,
+        })
+      )
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [rows[2]!.id, before, 'operator']
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [rows[3]!.id, after, 'operator']
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3, addressed_at = $2, addressed_by = $3 WHERE id = $1',
+      [rows[4]!.id, after, 'operator']
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'expired', route_disposed_at = $2 WHERE id = $1",
+      [rows[5]!.id, after]
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [rows[6]!.id, after]
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3, route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [rows[7]!.id, after, 'operator']
+    );
+
+    const depth = (await mailboxDepthByPrincipal()).operator as import('./dispatch').MailboxDepth;
+    expect(depth).toEqual({
+      unread: 2,
+      legacy_unverified: 1,
+      acked_open: 1,
+      addressed_by_mind: 1,
+      disposed_by_machine: 1,
+      surfaced_unacked: 1,
+      surfaced_acked: 1,
+    });
+    expect(Object.values(depth).reduce((sum, count) => sum + count, 0)).toBe(8);
+  });
+
+  test('mailbox depth rejects a principal that collides with the cutover_at metadata key', async () => {
+    await db.query(
+      "INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active) VALUES ('cutover_at', 'Reserved', 'notify_only', 1)"
+    );
+    await expect(mailboxDepthByPrincipal()).rejects.toThrow(
+      'dispatch_principal_reserved:cutover_at'
     );
   });
 
@@ -1121,7 +1337,7 @@ describe('dispatch db', () => {
     expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
     await expect(addressMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
       ok: false,
-      reason: 'wrong_recipient',
+      reason: 'xo_bind_required',
     });
     await expect(
       addressMessage({ id: message.id, principal_id: 'operator' })
@@ -1285,7 +1501,7 @@ describe('dispatch db', () => {
     });
     await expect(addressMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
       ok: false,
-      reason: 'wrong_recipient',
+      reason: 'xo_bind_required',
     });
     await db.query("UPDATE agent_dispatch_messages SET acknowledged_by = 'xo' WHERE id = $1", [
       mailbox.id,

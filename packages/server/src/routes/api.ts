@@ -9,7 +9,7 @@ import type { WebAdapter } from '../adapters/web';
 import { rm, readFile, writeFile, unlink, mkdir } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import type { Context } from 'hono';
 import type {
   ConversationLockManager,
@@ -200,6 +200,7 @@ import { authenticateDispatchWorkerCredential } from '../auth/dispatch-worker-cr
 import {
   DispatchNonSystemCapability,
   DispatchPrincipalAuthError,
+  authenticateDispatchPrincipal,
   type DispatchSenderAuthMode,
 } from '../auth/dispatch-principal';
 import { createLogger as createDispatchRouteLogger } from '@archon/paths';
@@ -2422,7 +2423,8 @@ export function registerApiRoutes(
   webAdapter: WebAdapter,
   lockManager: ConversationLockManager,
   activePlatforms?: readonly string[],
-  canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot
+  canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
+  dispatchMailboxActorResolvedHook?: () => Promise<void>
 ): void {
   function apiError(
     c: Context,
@@ -2483,6 +2485,78 @@ export function registerApiRoutes(
 
   function boardPrincipalProofFromHeaders(c: Context): boardAuthorityDb.BoardPrincipalProof {
     return { principal_token: c.req.header('x-board-principal-token')?.trim() };
+  }
+
+  class DispatchActorUnboundError extends Error {
+    constructor() {
+      super('dispatch_actor_unbound');
+    }
+  }
+
+  async function resolveDispatchMailboxActor(
+    c: Context
+  ): Promise<{ actor: string; bind?: dispatchDb.XoLeaseBind }> {
+    const identityHeaders = [
+      'x-dispatch-principal-id',
+      'x-dispatch-principal-token',
+      'x-board-principal-token',
+      'x-xo-holder-token',
+      'x-xo-lease-id',
+      'x-xo-fencing-token',
+    ];
+    const identityRequest = identityHeaders.some(name => c.req.header(name) !== undefined);
+    if (!identityRequest) return { actor: 'operator' };
+
+    const boardToken = c.req.header('x-board-principal-token')?.trim();
+    const holderToken = c.req.header('x-xo-holder-token')?.trim();
+    const leaseId = c.req.header('x-xo-lease-id')?.trim();
+    const fencingText = c.req.header('x-xo-fencing-token')?.trim();
+    if (boardToken || holderToken || leaseId || fencingText) {
+      if (!boardToken || !holderToken || !leaseId || !fencingText)
+        throw new DispatchActorUnboundError();
+      const fencingToken = Number(fencingText);
+      if (!Number.isSafeInteger(fencingToken) || fencingToken <= 0)
+        throw new DispatchActorUnboundError();
+      try {
+        const principal = await boardAuthorityDb.authenticateBoardPrincipal(
+          boardPrincipalProofFromHeaders(c)
+        );
+        const lease = await boardAuthorityDb.getCurrentXoLease();
+        if (
+          principal.seat_id !== 'xo' ||
+          principal.principal_id !== 'xo' ||
+          lease?.principal_id !== 'xo' ||
+          lease.seat_id !== 'xo' ||
+          lease.lease_id !== leaseId ||
+          lease.fencing_token !== fencingToken
+        )
+          throw new DispatchActorUnboundError();
+        await dispatchMailboxActorResolvedHook?.();
+      } catch {
+        throw new DispatchActorUnboundError();
+      }
+      return {
+        actor: 'xo',
+        bind: {
+          kind: 'xo_lease',
+          lease_id: leaseId,
+          fencing_token: fencingToken,
+          holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
+        },
+      };
+    }
+
+    try {
+      const credential = authenticateDispatchPrincipal({
+        principal_id: c.req.header('x-dispatch-principal-id'),
+        token: c.req.header('x-dispatch-principal-token'),
+        require_send_role: false,
+      });
+      if (credential.principal_id === 'xo') throw new DispatchActorUnboundError();
+      return { actor: credential.principal_id };
+    } catch {
+      throw new DispatchActorUnboundError();
+    }
   }
 
   function parseDispatchJsonBody(body: string): unknown {
@@ -4153,6 +4227,9 @@ export function registerApiRoutes(
         recipient: c.req.query('recipient') ?? undefined,
         status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
         subject_key: c.req.query('subject_key') ?? undefined,
+        route_disposition: c.req.query('route_disposition') as
+          | dispatchDb.DispatchRouteDisposition
+          | undefined,
         limit: Number.isFinite(rawLimit) ? rawLimit : 100,
         allowBoardAlias:
           c.req.query('recipient') !== undefined &&
@@ -4172,6 +4249,9 @@ export function registerApiRoutes(
           recipient: c.req.query('recipient') ?? undefined,
           status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
           subject_key: c.req.query('subject_key') ?? undefined,
+          route_disposition: c.req.query('route_disposition') as
+            | dispatchDb.DispatchRouteDisposition
+            | undefined,
           limit: Number.isFinite(rawLimit) ? rawLimit : 100,
           allowBoardAlias: false,
         });
@@ -4213,15 +4293,21 @@ export function registerApiRoutes(
   registerOpenApiRoute(acknowledgeDispatchMessageRoute, async c => {
     try {
       const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const { actor, bind } = await resolveDispatchMailboxActor(c);
+      if (body.principal_id !== undefined && body.principal_id !== actor)
+        return apiError(c, 409, 'actor_mismatch');
       const result = await dispatchDb.acknowledgeMessage({
         id: c.req.param('id') ?? '',
-        principal_id: body.principal_id,
+        principal_id: actor,
+        bind,
       });
       if (!result.ok) {
         return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
       }
       return c.json(result.message);
     } catch (error) {
+      if (error instanceof DispatchActorUnboundError)
+        return apiError(c, 401, 'dispatch_actor_unbound');
       getLog().error({ err: error }, 'dispatch_acknowledge_message_failed');
       return apiError(c, 500, 'Failed to acknowledge dispatch message');
     }
@@ -4230,15 +4316,21 @@ export function registerApiRoutes(
   registerOpenApiRoute(addressDispatchMessageRoute, async c => {
     try {
       const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const { actor, bind } = await resolveDispatchMailboxActor(c);
+      if (body.principal_id !== undefined && body.principal_id !== actor)
+        return apiError(c, 409, 'actor_mismatch');
       const result = await dispatchDb.addressMessage({
         id: c.req.param('id') ?? '',
-        principal_id: body.principal_id,
+        principal_id: actor,
+        bind,
       });
       if (!result.ok) {
         return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
       }
       return c.json(result.message);
     } catch (error) {
+      if (error instanceof DispatchActorUnboundError)
+        return apiError(c, 401, 'dispatch_actor_unbound');
       getLog().error({ err: error }, 'dispatch_address_message_failed');
       return apiError(c, 500, 'Failed to address dispatch message');
     }
@@ -4362,9 +4454,12 @@ export function registerApiRoutes(
       const staleAfterMs = Number.isFinite(rawStaleAfterMs)
         ? Math.max(1, Math.min(rawStaleAfterMs, 86_400_000))
         : dispatchDb.DEFAULT_WORKER_STALE_AFTER_MS;
-      const [workers, messages] = await Promise.all([
+      // mailboxDepthByPrincipal supplies the exclusive cutover buckets, including
+      // surfaced_unacked and surfaced_acked, over the full table rather than this page.
+      const [workers, messages, mailbox] = await Promise.all([
         dispatchDb.listWorkers(staleAfterMs),
         dispatchDb.listMessages({ limit: 500 }),
+        dispatchDb.mailboxDepthByPrincipal(),
       ]);
       const queue: Record<dispatchDb.DispatchMessageStatus, number> = {
         queued: 0,
@@ -4408,6 +4503,8 @@ export function registerApiRoutes(
         worker_stale_after_ms: staleAfterMs,
         workers,
         queue,
+        worker_lifecycle: queue,
+        mailbox,
         operator_reports: messages
           .filter(message => message.task_type === 'run_report' && !isExecutionHandoff(message))
           .map(item),

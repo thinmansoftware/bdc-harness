@@ -214,7 +214,10 @@ function cleanupDb(path: string): void {
   }
 }
 
-function makeApp(token?: string): OpenAPIHono {
+function makeApp(
+  token?: string,
+  dispatchMailboxActorResolvedHook?: () => Promise<void>
+): OpenAPIHono {
   if (token) process.env.ARCHON_OPERATOR_TOKEN = token;
   else delete process.env.ARCHON_OPERATOR_TOKEN;
   const app = new OpenAPIHono({ defaultHook: validationErrorHook });
@@ -233,7 +236,10 @@ function makeApp(token?: string): OpenAPIHono {
         return { status: 'started' };
       }),
       getStats: mock(() => ({ active: 0, queued: 0 })),
-    } as unknown as ConversationLockManager
+    } as unknown as ConversationLockManager,
+    undefined,
+    undefined,
+    dispatchMailboxActorResolvedHook
   );
   return app;
 }
@@ -367,6 +373,31 @@ describe('dispatch API', () => {
     expect(((await second.json()) as { body: string }).body).toBe('Please summarize this.');
   });
 
+  test('passes route_disposition through the HTTP list route', async () => {
+    const surfaced = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'list-surfaced',
+      recipient: 'operator',
+    });
+    await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'list-undisposed',
+      recipient: 'operator',
+    });
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [surfaced.id, new Date().toISOString()]
+    );
+
+    const response = await makeApp().request(
+      '/api/dispatch/messages?recipient=operator&route_disposition=auto_surfaced'
+    );
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as Array<{ id: string }>).map(row => row.id)).toEqual([
+      surfaced.id,
+    ]);
+  });
+
   // WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01: a message to astra is accepted,
   // never claimed by any worker, and only its own actor may ack/address it.
   test('routes astra as an unclaimable mailbox recipient over HTTP', async () => {
@@ -409,30 +440,23 @@ describe('dispatch API', () => {
     );
     expect(stored.rows[0]).toEqual({ status: 'queued', lease_owner: null });
 
-    // (d) a wrong-recipient actor (codex) is refused.
+    // A body principal is only a cross-check against the authenticated operator actor.
     const wrongAck = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
       body: JSON.stringify({ principal_id: 'codex' }),
     });
     expect(wrongAck.status).toBe(409);
-    expect(((await wrongAck.json()) as { error: string }).error).toBe('wrong_recipient');
+    expect(((await wrongAck.json()) as { error: string }).error).toBe('actor_mismatch');
 
-    // (c) astra acks and addresses its own mail.
+    // No credential binding exists for astra, so the operator token cannot sign for it.
     const ack = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
       body: JSON.stringify({ principal_id: ' Astra ' }),
     });
-    expect(ack.status).toBe(200);
-    expect(((await ack.json()) as { acknowledged_by: string }).acknowledged_by).toBe('astra');
-    const address = await app.request(`/api/dispatch/messages/${message.id}/address`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
-      body: JSON.stringify({ principal_id: 'astra' }),
-    });
-    expect(address.status).toBe(200);
-    expect(((await address.json()) as { addressed_by: string }).addressed_by).toBe('astra');
+    expect(ack.status).toBe(409);
+    expect(((await ack.json()) as { error: string }).error).toBe('actor_mismatch');
   });
 
   test('returns an existing HTTP idempotency row after its recipient becomes inactive', async () => {
@@ -723,10 +747,24 @@ describe('dispatch API', () => {
     expect(response.status).toBe(200);
     const status = (await response.json()) as {
       queue: Record<string, number>;
+      worker_lifecycle: Record<string, number>;
+      mailbox: Record<string, unknown>;
       workers: { worker_id: string; status: string }[];
       operator_reports: { recipient: string; body_preview: string }[];
     };
     expect(status.queue.queued).toBe(1);
+    expect(status.worker_lifecycle).toEqual(status.queue);
+    expect(status.mailbox.xo).toEqual(
+      expect.objectContaining({
+        unread: 1,
+        legacy_unverified: expect.any(Number),
+        acked_open: expect.any(Number),
+        addressed_by_mind: expect.any(Number),
+        disposed_by_machine: expect.any(Number),
+        surfaced_unacked: expect.any(Number),
+        surfaced_acked: expect.any(Number),
+      })
+    );
     expect(status.workers[0]?.status).toBe('unavailable');
     expect(status.operator_reports).toEqual([
       expect.objectContaining({
@@ -793,7 +831,7 @@ describe('dispatch API', () => {
     const app = makeApp('secret-token');
     const cases = [
       { id: 'missing', principal_id: 'operator', status: 404, error: 'not_found' },
-      { id: wrongMode.id, principal_id: 'codex', status: 409, error: 'wrong_mode' },
+      { id: wrongMode.id, principal_id: 'operator', status: 409, error: 'wrong_recipient' },
       { id: wrongRecipient.id, principal_id: 'operator', status: 409, error: 'wrong_recipient' },
       { id: notQueued.id, principal_id: 'operator', status: 409, error: 'not_queued' },
       { id: actorMismatch.id, principal_id: 'operator', status: 409, error: 'actor_mismatch' },
@@ -844,6 +882,43 @@ describe('dispatch API', () => {
     });
   });
 
+  test('rejects disposition_terminal but permits acknowledgement after auto_surfaced', async () => {
+    const expired = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'expired-ack',
+      recipient: 'operator',
+    });
+    const surfaced = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'surfaced-ack',
+      recipient: 'operator',
+    });
+    const stamp = new Date().toISOString();
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'expired', route_disposed_at = $2 WHERE id = $1",
+      [expired.id, stamp]
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [surfaced.id, stamp]
+    );
+    const app = makeApp('secret-token');
+    const requestAck = (id: string) =>
+      app.request(`/api/dispatch/messages/${id}/ack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+        body: '{}',
+      });
+    const refused = await requestAck(expired.id);
+    expect(refused.status).toBe(409);
+    expect(((await refused.json()) as { error: string }).error).toBe('disposition_terminal');
+    const accepted = await requestAck(surfaced.id);
+    expect(accepted.status).toBe(200);
+    expect(((await accepted.json()) as { route_disposition: string }).route_disposition).toBe(
+      'auto_surfaced'
+    );
+  });
+
   test('maps address lifecycle outcomes without cancellation side effects', async () => {
     const wrongMode = await createMessage({ ...VALID_BODY, idempotency_key: 'address-wrong-mode' });
     const wrongRecipient = await createMessage({
@@ -876,7 +951,7 @@ describe('dispatch API', () => {
     const app = makeApp('secret-token');
     const cases = [
       { id: 'missing', principal_id: 'operator', status: 404, error: 'not_found' },
-      { id: wrongMode.id, principal_id: 'codex', status: 409, error: 'wrong_mode' },
+      { id: wrongMode.id, principal_id: 'operator', status: 409, error: 'wrong_recipient' },
       { id: wrongRecipient.id, principal_id: 'operator', status: 409, error: 'wrong_recipient' },
       { id: notQueued.id, principal_id: 'operator', status: 409, error: 'not_queued' },
       { id: beforeAck.id, principal_id: 'operator', status: 409, error: 'address_before_ack' },
@@ -924,6 +999,228 @@ describe('dispatch API', () => {
       [message.id]
     );
     expect(stored.rows[0]?.acknowledged_by).toBeNull();
+  });
+
+  test('binds XO receipts to all four live lease proofs and rejects stale fences', async () => {
+    principal = { principal_id: 'xo', seat_id: 'xo', roles: [] };
+    const holderToken = 'xo-holder-secret';
+    const leaseId = 'xo-lease-current';
+    const fencingToken = 17;
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, NULL, $5, NULL)`,
+      [
+        leaseId,
+        sha(holderToken),
+        fencingToken,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    const message = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'xo-bound-ack',
+      recipient: 'xo',
+    });
+    const app = makeApp('secret-token');
+    const baseHeaders = {
+      'Content-Type': 'application/json',
+      'x-archon-operator-token': 'secret-token',
+      'x-board-principal-token': 'board-proof',
+      'x-xo-holder-token': holderToken,
+      'x-xo-lease-id': leaseId,
+      'x-xo-fencing-token': String(fencingToken),
+    };
+    const missingProof = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+      method: 'POST',
+      headers: { ...baseHeaders, 'x-xo-lease-id': '' },
+      body: '{}',
+    });
+    expect(missingProof.status).toBe(401);
+    expect(((await missingProof.json()) as { error: string }).error).toBe('dispatch_actor_unbound');
+
+    const staleHolder = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+      method: 'POST',
+      headers: { ...baseHeaders, 'x-xo-holder-token': 'turned-over-holder' },
+      body: '{}',
+    });
+    expect(staleHolder.status).toBe(409);
+    expect(((await staleHolder.json()) as { error: string }).error).toBe('lease_fence_stale');
+
+    const acknowledged = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+      method: 'POST',
+      headers: baseHeaders,
+      body: '{}',
+    });
+    expect(acknowledged.status).toBe(200);
+    expect(((await acknowledged.json()) as { acknowledged_by: string }).acknowledged_by).toBe('xo');
+  });
+
+  test('rejects expired and released XO leases before mailbox mutation', async () => {
+    principal = { principal_id: 'xo', seat_id: 'xo', roles: [] };
+    const holderToken = 'xo-expiry-holder';
+    const leaseId = 'xo-expiry-lease';
+    const message = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'xo-expiry',
+      recipient: 'xo',
+    });
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-board-principal-token': 'board-proof',
+      'x-xo-holder-token': holderToken,
+      'x-xo-lease-id': leaseId,
+      'x-xo-fencing-token': '21',
+    };
+    const insertLease = async (expiresAt: string, releasedAt: string | null) => {
+      await db.query('DELETE FROM board_xo_leases');
+      await db.query(
+        `INSERT INTO board_xo_leases
+         (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+          acquired_at, renewed_at, expires_at, released_at)
+         VALUES (1, $1, 'xo', 'xo', 'holder', $2, 21, $3, NULL, $4, $5)`,
+        [leaseId, sha(holderToken), new Date().toISOString(), expiresAt, releasedAt]
+      );
+    };
+    await insertLease(new Date(Date.now() - 1_000).toISOString(), null);
+    expect(
+      (
+        await makeApp().request(`/api/dispatch/messages/${message.id}/ack`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+        })
+      ).status
+    ).toBe(401);
+    await insertLease(new Date(Date.now() + 60_000).toISOString(), new Date().toISOString());
+    expect(
+      (
+        await makeApp().request(`/api/dispatch/messages/${message.id}/ack`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+        })
+      ).status
+    ).toBe(401);
+    expect(
+      (
+        await db.query<{ acknowledged_at: string | null }>(
+          'SELECT acknowledged_at FROM agent_dispatch_messages WHERE id = $1',
+          [message.id]
+        )
+      ).rows[0]?.acknowledged_at
+    ).toBeNull();
+  });
+
+  test('rejects an unregistered fable identity and leaves its mailbox row untouched', async () => {
+    await db.query(
+      "INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active) VALUES ('fable', 'Fable', 'drain_on_start', 1)"
+    );
+    const message = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'fable-unbound',
+      recipient: 'fable',
+    });
+    const response = await makeApp().request(`/api/dispatch/messages/${message.id}/ack`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-dispatch-principal-id': 'fable',
+        'x-dispatch-principal-token': 'no-registry-entry',
+      },
+      body: JSON.stringify({ principal_id: 'fable' }),
+    });
+    expect(response.status).toBe(401);
+    expect(
+      (
+        await db.query<{ acknowledged_at: string | null }>(
+          'SELECT acknowledged_at FROM agent_dispatch_messages WHERE id = $1',
+          [message.id]
+        )
+      ).rows[0]?.acknowledged_at
+    ).toBeNull();
+  });
+
+  test('transactional lease re-read rejects a fencing-token turnover after actor resolution', async () => {
+    principal = { principal_id: 'xo', seat_id: 'xo', roles: [] };
+    const holderToken = 'xo-race-holder';
+    const message = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'xo-race',
+      recipient: 'xo',
+    });
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, 'lease-old', 'xo', 'xo', 'holder', $1, 30, $2, NULL, $3, NULL)`,
+      [sha(holderToken), new Date().toISOString(), new Date(Date.now() + 60_000).toISOString()]
+    );
+    const app = makeApp(undefined, async () => {
+      await db.query(
+        `UPDATE board_xo_leases SET lease_id = 'lease-new', fencing_token = 31,
+         acquired_at = $1, expires_at = $2, released_at = NULL WHERE id = 1`,
+        [new Date().toISOString(), new Date(Date.now() + 60_000).toISOString()]
+      );
+    });
+    const response = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-board-principal-token': 'board-proof',
+        'x-xo-holder-token': holderToken,
+        'x-xo-lease-id': 'lease-old',
+        'x-xo-fencing-token': '30',
+      },
+      body: '{}',
+    });
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toBe('lease_fence_stale');
+    expect(
+      (
+        await db.query<{ acknowledged_at: string | null }>(
+          'SELECT acknowledged_at FROM agent_dispatch_messages WHERE id = $1',
+          [message.id]
+        )
+      ).rows[0]?.acknowledged_at
+    ).toBeNull();
+  });
+
+  test('never falls back from an invalid identity request to the operator token', async () => {
+    // Both credential-only XO and invalid-credential-plus-operator paths are dispatch_actor_unbound.
+    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+      {
+        credential_id: 'credential-xo',
+        principal_id: 'xo',
+        token_sha256: sha('xo-token'),
+        status: 'active',
+        send_as: ['xo'],
+        receive_as: ['xo'],
+        roles: ['receive'],
+      },
+    ]);
+    const message = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'identity-no-fallback',
+      recipient: 'operator',
+    });
+    const app = makeApp('secret-token');
+    for (const token of ['xo-token', 'invalid-token']) {
+      const response = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-archon-operator-token': 'secret-token',
+          'x-dispatch-principal-id': 'xo',
+          'x-dispatch-principal-token': token,
+        },
+        body: '{}',
+      });
+      expect(response.status).toBe(401);
+      expect(((await response.json()) as { error: string }).error).toBe('dispatch_actor_unbound');
+    }
   });
 
   test('accepts only approved structured non-production execution handoffs', async () => {
