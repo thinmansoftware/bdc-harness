@@ -37,6 +37,8 @@ const TM_EXPECTATIONS_SCHEMA = `CREATE TABLE tm_expectations (
   evidence_pointer TEXT,
   registered_by TEXT,
   self_supervised INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1)),
+  last_escalation_state TEXT,
+  due_extended INTEGER NOT NULL DEFAULT 0 CHECK (due_extended IN (0, 1)),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 )`;
@@ -54,6 +56,17 @@ const TM_EXPECTATIONS_SCHEMA = `CREATE TABLE tm_expectations (
 const TM_EXPECTATIONS_FRONT_DOOR_COLUMNS: [string, string][] = [
   ['registered_by', 'TEXT'],
   ['self_supervised', 'INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1))'],
+];
+
+/**
+ * Mailbox-evidence columns (migration 056, bdc-xo#2028), applied ADDITIVELY for
+ * the same reason as the front-door columns above: the live database is already
+ * at 049/050 WITH rows, so these must be ALTER TABLE ADD COLUMN rather than a
+ * shape-mismatch recreate that would trip the non-empty refusal.
+ */
+const TM_EXPECTATIONS_MAILBOX_EVIDENCE_COLUMNS: [string, string][] = [
+  ['last_escalation_state', 'TEXT'],
+  ['due_extended', 'INTEGER NOT NULL DEFAULT 0 CHECK (due_extended IN (0, 1))'],
 ];
 
 const TM_EXPECTATIONS_REGISTERED_BY_INDEX =
@@ -397,6 +410,14 @@ export class SqliteAdapter implements IDatabase {
             this.db.run(
               "UPDATE tm_expectations SET registered_by = 'taskmaster' WHERE registered_by IS NULL"
             );
+        }
+        // Mailbox-evidence columns (migration 056). Re-read is unnecessary: the
+        // recreate branch already produced the current schema (which includes
+        // these), so this loop only fires on a table that has registration_key
+        // but predates 056, and every such column is simply absent.
+        for (const [name, definition] of TM_EXPECTATIONS_MAILBOX_EVIDENCE_COLUMNS) {
+          if (currentColumns.has(name)) continue;
+          this.db.run(`ALTER TABLE tm_expectations ADD COLUMN ${name} ${definition}`);
         }
         this.db.run(TM_EXPECTATIONS_REGISTERED_BY_INDEX);
       }
@@ -2309,6 +2330,12 @@ export class SqliteAdapter implements IDatabase {
         -- supervision, and whether they named themselves as the recipient.
         registered_by TEXT,
         self_supervised INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1)),
+        -- Mailbox evidence (migration 056, bdc-xo#2028): the escalation-tuple
+        -- suppression state and the one-shot in-progress extension flag. Kept in
+        -- lockstep with TM_EXPECTATIONS_SCHEMA and the additive-ALTER list above
+        -- so the fresh-install and upgrade paths converge on one shape.
+        last_escalation_state TEXT,
+        due_extended INTEGER NOT NULL DEFAULT 0 CHECK (due_extended IN (0, 1)),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );

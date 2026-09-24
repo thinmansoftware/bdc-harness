@@ -288,3 +288,105 @@ existing table was altered.
 - Each logical effect has one journal row. A failed or deferred attempt reuses
   that row on the next eligible tick; retries are bounded by the original
   deadline, and expired rows are terminal.
+
+## Mailbox expectation evidence (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-01)
+
+Authority: bdc-xo#2028 (owner:claude, John 2026-09-22). Related: bdc-xo#2007,
+#2170, #2171.
+
+### The problem it fixes
+
+Every Taskmaster send registers a `dispatch_reply_exists` expectation demanding
+a `status='done'` reply for its correlation. That is correct for a **worker_poll**
+recipient (codex, claude, cursor, duty-officer, overseer-reviewer) -- those seats
+poll, work, and post a result. It is structurally impossible for a **mailbox**
+recipient (`drain_on_start` / `notify_only`: operator, xo, fable, overseer,
+cauldron, ...), which is READ, never replied to. So a send to a mailbox could
+never be "met": it exhausted its retries, escalated a blocker to the xo mailbox,
+and -- before M-155 Amendment 03 -- counted the send as 'noise', dragging the
+useful-rate floor down until Taskmaster paused itself. Live on 2026-09-22: 66
+unread `Taskmaster expectation EXHAUSTED` blockers in the xo mailbox, and
+`tm_control` PAUSED since 2026-09-17 by `taskmaster:useful-rate-floor`.
+
+### The evidence rule (resolved at check time, by recipient delivery_mode)
+
+The expectation is registered with the SAME `dispatch_reply_exists` spec as
+before; resolution now diverges at CHECK time by resolving the recipient's
+`delivery_mode` through the same `assessDispatchRecipient` the grader already
+uses (M-155 Amendment 03). No new evidence kind, no registration-site change.
+
+| recipient delivery_mode                                                      | what satisfies the expectation                                                              | on absence at due_at                                                                                                                                                                                       |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| worker_poll (codex, claude, cursor, duty-officer, overseer-reviewer)         | a done/succeeded reply row for correlation `tm-<id>` (unchanged)                            | unchanged: redispatch up to max_retries, then escalate                                                                                                                                                     |
+| drain_on_start (operator, xo, fable, xo-fable)                               | the dispatched row is **addressed** (`addressed_at` set); pointer `dispatch:<id>:addressed` | escalate once to xo ONLY IF the row is also un-acknowledged; an acknowledged-but-unaddressed row is "read, in progress" -- neither met nor failed until due_at + one further PROOF_DEADLINE, then escalate |
+| notify_only (overseer, cauldron, overseer-review-route, john, merge-manager) | same as drain_on_start                                                                      | same as drain_on_start                                                                                                                                                                                     |
+| alias_resolved (board)                                                       | falls through to the unchanged done-reply query                                             | unchanged                                                                                                                                                                                                  |
+| unknown principal (not in dispatch_principals)                               | unchanged (done-reply query)                                                                | unchanged                                                                                                                                                                                                  |
+
+A read is the proof. An acknowledged-but-unaddressed mailbox row is granted
+exactly **one** further `PROOF_DEADLINE_MS` (24h) extension of `due_at`
+(`due_extended` one-shot flag) before it may escalate.
+
+### Escalation suppression (once per evidence tuple)
+
+An escalation for expectation E is sent at most once per (expectation id,
+evidence tuple). The tuple is the dispatched row's
+`(acknowledged_at, addressed_at, status)`, stored on `tm_expectations.last_escalation_state`
+after a confirmed escalation. If a later tick sees the SAME tuple it logs
+`taskmaster.escalation_suppressed_unchanged` and sends nothing; only a CHANGED
+tuple re-escalates. This makes the existing `idempotency_key`-based
+once-per-expectation guarantee explicit and tested, so an unchanged blocker is
+never re-filed into the xo mailbox tick after tick.
+
+### Grading (M-155 Amendment 03 kept, plus one mailbox refinement)
+
+Amendment 03 stands: a `drain_on_start` send never acknowledged by a
+non-draining principal is graded `unheard` and excluded from the useful-rate
+floor denominator. Added refinement, scoped to heard mailbox (`notify_only`)
+nudges/escalations: a row that is **addressed** before its deadline is graded
+`useful` (mailbox work can raise the numerator, not only avoid the denominator),
+and a row only **acknowledged** (read, still open) is left ungraded (in progress)
+rather than counted noise.
+
+### Regrade script -- `regrade-unmeetable-expectations`
+
+Historical rows graded before Amendment 03 still count in the epoch-bounded
+lookback on resume. This one-shot script repairs them so the floor is computed
+honestly. It is **dry-run by default** and NEVER run by the loop.
+
+```
+# Dry run -- prints the count of matching rows, mutates nothing:
+bun scripts/taskmaster/regrade-unmeetable-expectations.ts
+
+# Confirm -- give up the matched expectations and regrade their journal actions:
+bun scripts/taskmaster/regrade-unmeetable-expectations.ts --confirm
+```
+
+It selects `tm_expectations` rows in status `escalated`/`failed` whose recipient
+resolves (via `dispatch_principals`) to a mailbox principal and whose evidence
+kind is `dispatch_reply_exists`; on `--confirm` it sets those rows `given_up`
+with reason `unmeetable_mailbox_reply_spec`, clears the linked `tm_journal`
+action's `grade` to NULL, and writes exactly one `tm_journal` note citing
+bdc-xo#2028. It is idempotent: a second `--confirm` run matches 0 rows and does
+not duplicate the note. Test: `bun run test:taskmaster-regrade`.
+
+### Resume procedure (operator, after the rebuild)
+
+Taskmaster stays PAUSED through the deploy; resuming is John's action.
+
+1. Deploy: the change lands on `archon-app-1` on the next `rebuild-archon.sh`.
+   Migration 056 (`last_escalation_state`, `due_extended`) is additive; apply it
+   to `/opt/bdc/archon-data/archon.db` with a `.backup` first (rebuild runbook).
+2. Regrade the history: run `regrade-unmeetable-expectations.ts --confirm` once
+   against the live db (after the backup).
+3. Verify the floor is honest over the 2026-09-15..21 window
+   (`usefulRateFloorBreached` returns false, or graded < `USEFUL_RATE_MIN_GRADED`).
+4. John resumes Taskmaster (`POST /api/taskmaster/resume`, or the reset DAL).
+5. Verify within 24h of RUNNING:
+   - no new mailbox `dispatch_reply_exists` expectation is `escalated`
+     (Stop 7 sqlite count returns 0);
+   - at least one mailbox expectation is `met` with an `evidence_pointer` ending
+     `:addressed`.
+
+Acceptance: Taskmaster does not pause itself again within 24h, and the xo mailbox
+receives at most one blocker per genuinely unmet expectation.

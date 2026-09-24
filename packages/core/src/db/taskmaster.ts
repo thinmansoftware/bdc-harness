@@ -74,6 +74,22 @@ export interface TmExpectation {
   registered_by: string | null;
   /** 1 when the registrant named ITSELF as the recipient. */
   self_supervised: number;
+  /**
+   * The dispatched row's (acknowledged_at, addressed_at, status) tuple at the
+   * moment this expectation was last escalated (migration 056, bdc-xo#2028).
+   * NULL until a first escalation is sent. The escalation sender compares the
+   * current tuple against this before sending: an unchanged tuple is suppressed
+   * (logged taskmaster.escalation_suppressed_unchanged) instead of re-sending.
+   * Nullable, and defaulted to null for rows read from a pre-056 database.
+   */
+  last_escalation_state: string | null;
+  /**
+   * 0/1 one-shot flag (migration 056). An acknowledged-but-unaddressed mailbox
+   * row is granted exactly ONE further PROOF_DEADLINE_MS extension of due_at
+   * before it can escalate; this records that the single extension is spent.
+   * Defaulted to 0 for rows read from a pre-056 database.
+   */
+  due_extended: number;
   created_at: string;
   updated_at: string;
 }
@@ -173,6 +189,13 @@ function normalizeExpectation(row: TmExpectation): TmExpectation {
     // double that omits the column) has no flag at all; absent means "not self
     // supervised", which is the safe reading -- it never widens what is allowed.
     self_supervised: row.self_supervised ?? 0,
+    // Mailbox-evidence columns (migration 056). A row from a pre-056 database or
+    // a test double that omits them reads as "never escalated yet" (null tuple)
+    // and "extension not spent" (0) -- the safe readings that preserve the
+    // pre-change behaviour: a null last_escalation_state never suppresses, and a
+    // due_extended of 0 grants the first (and only) extension.
+    last_escalation_state: row.last_escalation_state ?? null,
+    due_extended: row.due_extended ?? 0,
     due_at: toIso(row.due_at),
     created_at: toIso(row.created_at),
     updated_at: toIso(row.updated_at),
@@ -816,6 +839,60 @@ export async function markEscalated(id: string, evidencePointer?: string): Promi
  */
 export async function markGivenUp(id: string, reason: string): Promise<boolean> {
   return transitionExpectation(id, 'given_up', ACTIVE_EXPECTATION_STATUSES, reason);
+}
+
+/**
+ * Grant the ONE due_at extension an acknowledged-but-unaddressed mailbox row is
+ * owed (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-01). A mailbox recipient's
+ * dispatched row that has been read (acknowledged_at set) but not yet closed
+ * (addressed_at still null) is "in progress", not absent: it is granted a single
+ * further PROOF_DEADLINE_MS before it may escalate.
+ *
+ * A COMPARE-AND-SET, deliberately, for the same reason claimRecoveryReplay is
+ * (see the NOTE above claimRedispatchAttempt forbidding unconditional writers):
+ *  - `due_extended = 0` in the WHERE guarantees the extension fires AT MOST ONCE
+ *    -- a second in-progress observation finds due_extended already 1 and no row
+ *    matches, so the deadline is never pushed out a second time.
+ *  - matching on the observed `due_at` and then moving it makes the claim
+ *    self-invalidating, so two ticks that both see the same unextended row
+ *    cannot both extend it.
+ *  - conditioning on the active set means a tick racing a concurrent markMet /
+ *    escalation loses and does not resurrect a closed row's deadline.
+ * Returns true for the winner, false for everyone else.
+ */
+export async function extendDueOnce(
+  id: string,
+  newDueAt: string,
+  expectedDueAt: string
+): Promise<boolean> {
+  const activePlaceholders = ACTIVE_EXPECTATION_STATUSES.map(
+    (_, index) => `$${String(index + 5)}`
+  ).join(', ');
+  const result = await getDatabase().query(
+    `UPDATE tm_expectations
+        SET due_at = $1, due_extended = 1, updated_at = $2
+      WHERE id = $3
+        AND due_at = $4
+        AND due_extended = 0
+        AND status IN (${activePlaceholders})`,
+    [newDueAt, new Date().toISOString(), id, expectedDueAt, ...ACTIVE_EXPECTATION_STATUSES]
+  );
+  return result.rowCount === 1;
+}
+
+/**
+ * Persist the dispatched row's evidence tuple that THIS escalation was sent
+ * against, so the next tick can suppress a repeat escalation whose evidence is
+ * unchanged (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-01). This is bookkeeping,
+ * not a guarded state transition -- it records what was already sent under the
+ * deterministic escalation idempotency key -- so it is an unconditional write
+ * rather than a compare-and-set. Written only after a confirmed escalation send.
+ */
+export async function setLastEscalationState(id: string, tuple: string): Promise<void> {
+  await getDatabase().query(
+    'UPDATE tm_expectations SET last_escalation_state = $1, updated_at = $2 WHERE id = $3',
+    [tuple, new Date().toISOString(), id]
+  );
 }
 
 export async function getExpectationCounts(): Promise<Record<TmExpectationStatus, number>> {

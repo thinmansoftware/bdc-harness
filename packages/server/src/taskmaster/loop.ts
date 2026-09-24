@@ -897,6 +897,20 @@ async function gradeSentActions(
       // useful/noise are counted).
       const deadlineMs = action.proof_deadline_at ? Date.parse(action.proof_deadline_at) : NaN;
       let usefulAtMs: number | null = null;
+      // Mailbox refinement (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-01): for a
+      // nudge/escalate_p0 to a MAILBOX recipient (drain_on_start / notify_only),
+      // the action's own dispatched row being ADDRESSED is itself the useful
+      // signal -- mirroring the expectation met-rule -- and a row only
+      // ACKNOWLEDGED (read, not yet closed) is in progress, not noise. This does
+      // NOT override the M-155 Amendment 03 heard gate below: a drain_on_start
+      // send is never 'heard', so it still grades 'unheard' regardless. The
+      // refinement only reaches heard mailbox sends (notify_only + ack), where
+      // it lets an addressed row raise the numerator and leaves a still-open one
+      // ungraded instead of counting it noise.
+      const recipientMode = recipientAssessment?.delivery_mode ?? null;
+      const isMailboxRecipient =
+        recipientMode === 'drain_on_start' || recipientMode === 'notify_only';
+      let mailboxInProgress = false;
       if (action.action_type === 'deliver_ruling') {
         const rulingId = action.thread_ref.startsWith('dispatch:')
           ? action.thread_ref.slice('dispatch:'.length)
@@ -936,6 +950,20 @@ async function gradeSentActions(
             }
           }
         }
+        // Mailbox refinement: the addressed_at of the action's OWN dispatched
+        // row is a useful signal on par with issue movement; acknowledged-only
+        // is in progress. Applied after the issue-evidence sweep so genuine SOR
+        // movement still wins when both are present.
+        if (isMailboxRecipient && dispatchRow) {
+          const addressedAtMs = dispatchRow.addressed_at
+            ? Date.parse(dispatchRow.addressed_at)
+            : NaN;
+          if (Number.isFinite(addressedAtMs) && addressedAtMs >= sentAtMs) {
+            usefulAtMs = addressedAtMs;
+          } else if (dispatchRow.addressed_at == null && dispatchRow.acknowledged_at != null) {
+            mailboxInProgress = true;
+          }
+        }
       }
 
       // Heard gate FIRST: a send nobody heard is 'unheard' regardless of any
@@ -949,6 +977,12 @@ async function gradeSentActions(
         (!Number.isFinite(deadlineMs) || usefulAtMs <= deadlineMs)
       ) {
         await dal.gradeAction(action.id, 'useful');
+      } else if (mailboxInProgress && usefulAtMs === null) {
+        // Heard mailbox recipient, read but not yet closed, with no other useful
+        // signal: in progress. Leave UNGRADED (neither useful nor noise) so a
+        // still-open mailbox item is not counted against the useful-rate floor
+        // before it has had its full response window -- the grading mirror of the
+        // expectation in-progress extension.
       } else if (Number.isFinite(deadlineMs) && nowMs >= deadlineMs) {
         await dal.gradeAction(action.id, 'noise');
       }
@@ -1181,7 +1215,12 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   try {
     if (deps.checkExpectations) await deps.checkExpectations(new Date(nowMs));
-    else if (!deps.db) await checkExpectations(new Date(nowMs));
+    // Inject the SAME recipient resolver the grader uses (M-155 Amendment 03) so
+    // a dispatch_reply_exists expectation owed by a mailbox principal is
+    // satisfied by an addressed row, not by a done-reply mailboxes never send
+    // (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-01).
+    else if (!deps.db)
+      await checkExpectations(new Date(nowMs), { assessDispatchRecipient: assessRecipient });
   } catch (error) {
     tickFailures += 1;
     log.warn({ err: error as Error }, 'taskmaster.expectations_tick_failed');

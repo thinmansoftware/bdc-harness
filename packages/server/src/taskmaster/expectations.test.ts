@@ -8,6 +8,7 @@ import {
   type EvidenceSpec,
 } from './expectations';
 import type { TmExpectation } from '@archon/core/db/taskmaster';
+import type { DispatchMessage, DispatchRecipientAssessment } from '@archon/core/db/dispatch';
 
 const base: TmExpectation = {
   id: 'expectation-1',
@@ -22,9 +23,65 @@ const base: TmExpectation = {
   evidence_pointer: null,
   registered_by: 'taskmaster',
   self_supervised: 0,
+  last_escalation_state: null,
+  due_extended: 0,
   created_at: new Date(0).toISOString(),
   updated_at: new Date(0).toISOString(),
 };
+
+/** A DispatchMessage double with only the fields the mailbox rule reads. */
+function makeDispatchRow(overrides: Partial<DispatchMessage> & { id: string }): DispatchMessage {
+  return {
+    correlation_id: 'c1',
+    idempotency_key: 'k1',
+    task_type: 'agent_message',
+    sender: 'taskmaster',
+    sender_principal_id: 'system:taskmaster',
+    recipient: 'operator',
+    body: 'work',
+    status: 'queued',
+    result_body: null,
+    created_at: new Date(0).toISOString(),
+    claimed_at: null,
+    completed_at: null,
+    not_before: null,
+    lease_owner: null,
+    lease_expires_at: null,
+    fencing_token: 0,
+    recipient_alias: null,
+    motion_id: null,
+    motion_revision_sha: null,
+    resolved_recipient: null,
+    resolved_xo_lease_id: null,
+    resolved_xo_fencing_token: null,
+    resolved_at: null,
+    priority: 'normal',
+    task_outcome: null,
+    acknowledged_at: null,
+    acknowledged_by: null,
+    addressed_at: null,
+    addressed_by: null,
+    escalated_tg_at: null,
+    escalated_sms_at: null,
+    subject_key: null,
+    route_disposition: null,
+    supersedes_id: null,
+    repeat_reason: null,
+    ...overrides,
+  };
+}
+
+/** Recipient assessment double for a given delivery mode. */
+function assessAs(
+  mode: 'drain_on_start' | 'notify_only' | 'worker_poll' | 'alias_resolved'
+): (recipient: string) => Promise<DispatchRecipientAssessment> {
+  return async (recipient: string) => ({
+    ok: true,
+    canonical_principal: recipient,
+    delivery_mode: mode,
+    reason: null,
+  });
+}
 
 describe('expectation evidence', () => {
   test('issue_comment_exists returns the comment URL pointer', async () => {
@@ -1315,5 +1372,189 @@ describe('escalation reaches a human (bdc-xo#2007)', () => {
     const body = renderEscalationBody({ ...base, evidence_json: 'not json' });
     expect(body).toContain('unparseable evidence spec');
     expect(body).toContain('EXHAUSTED');
+  });
+});
+
+describe('mailbox expectation evidence (WO-HARNESS-TASKMASTER-MAILBOX-EVIDENCE-01)', () => {
+  // A mailbox expectation is registered with the SAME dispatch_reply_exists spec
+  // as any other send; resolution diverges at CHECK time by recipient mode.
+  const mailboxBase: TmExpectation = {
+    ...base,
+    recipient: 'operator',
+    dispatch_ref: 'R',
+    evidence_json: JSON.stringify({
+      kind: 'dispatch_reply_exists',
+      correlation_id: 'tm-X',
+      classification: 'succeeded',
+    }),
+  };
+
+  test('mailbox_expectation_met_by_addressed_at', async () => {
+    const closes: string[] = [];
+    const sends: string[] = [];
+    await checkExpectations(new Date(1_000_000), {
+      listDueExpectations: async () => [
+        { ...mailboxBase, due_at: new Date(9_000_000).toISOString() },
+      ],
+      assessDispatchRecipient: assessAs('drain_on_start'),
+      getMessage: async (id: string) =>
+        makeDispatchRow({
+          id,
+          status: 'queued',
+          acknowledged_at: new Date(500_000).toISOString(),
+          addressed_at: new Date(600_000).toISOString(),
+        }),
+      // The done-reply query must NEVER run for a mailbox recipient.
+      checkEvidence: async () => {
+        throw new Error('checkEvidence must not run for a mailbox recipient');
+      },
+      markMet: async (_id: string, pointer: string) => {
+        closes.push(pointer);
+        return true;
+      },
+      createTask: async (_context, data) => {
+        sends.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+    });
+    // An addressed row is the proof: met, pointer names the addressed dispatch.
+    expect(closes).toEqual(['dispatch:R:addressed']);
+    // No redispatch/escalation row was put on the wire.
+    expect(sends).toEqual([]);
+  });
+
+  test('mailbox_expectation_in_progress_extends_once', async () => {
+    // Acknowledged (read) but not addressed (still open), overdue, never extended.
+    let row: TmExpectation = {
+      ...mailboxBase,
+      due_at: new Date(0).toISOString(),
+      due_extended: 0,
+    };
+    const extensions: { newDueAt: string; expectedDueAt: string }[] = [];
+    const sends: string[] = [];
+    const PROOF_MS = 24 * 60 * 60 * 1000;
+    const ackRow = makeDispatchRow({
+      id: 'R',
+      status: 'queued',
+      acknowledged_at: new Date(0).toISOString(),
+      addressed_at: null,
+    });
+    const deps = {
+      listDueExpectations: async () => [row],
+      assessDispatchRecipient: assessAs('drain_on_start'),
+      getMessage: async () => ackRow,
+      checkEvidence: async () => {
+        throw new Error('checkEvidence must not run for a mailbox recipient');
+      },
+      // Model the compare-and-set: mutate the shared row so the next tick sees
+      // the extended deadline and the spent flag.
+      extendDueOnce: async (_id: string, newDueAt: string, expectedDueAt: string) => {
+        extensions.push({ newDueAt, expectedDueAt });
+        row = { ...row, due_at: newDueAt, due_extended: 1 };
+        return true;
+      },
+      createTask: async (_context: never, data: { idempotency_key: string }) => {
+        sends.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      proofDeadlineMs: PROOF_MS,
+    };
+
+    const now = new Date(10_000);
+    await checkExpectations(now, deps as never);
+    // First run: extended exactly once, deadline moved by PROOF_MS, no escalation.
+    expect(extensions).toHaveLength(1);
+    expect(Date.parse(extensions[0]!.newDueAt)).toBe(now.getTime() + PROOF_MS);
+    expect(extensions[0]!.expectedDueAt).toBe(new Date(0).toISOString());
+    expect(row.due_extended).toBe(1);
+    expect(sends).toEqual([]);
+
+    // Second run inside the fresh window: now < new due_at, so nothing changes.
+    await checkExpectations(now, deps as never);
+    expect(extensions).toHaveLength(1);
+    expect(sends).toEqual([]);
+  });
+
+  test('mailbox_expectation_absent_escalates_once', async () => {
+    // Un-acknowledged, overdue, extension already spent, on_absence escalate.
+    let row: TmExpectation = {
+      ...mailboxBase,
+      on_absence: 'escalate',
+      max_retries: 0,
+      due_at: new Date(0).toISOString(),
+      due_extended: 1,
+    };
+    const unreadRow = makeDispatchRow({
+      id: 'R',
+      status: 'queued',
+      acknowledged_at: null,
+      addressed_at: null,
+    });
+    const escalationSends: string[] = [];
+    const claimEscalations: number[] = [];
+    const deps = {
+      listDueExpectations: async () => [row],
+      assessDispatchRecipient: assessAs('drain_on_start'),
+      getMessage: async () => unreadRow,
+      checkEvidence: async () => {
+        throw new Error('checkEvidence must not run for a mailbox recipient');
+      },
+      markFailed: async () => true,
+      claimEscalation: async () => {
+        claimEscalations.push(1);
+        return true;
+      },
+      markEscalated: async () => true,
+      setLastEscalationState: async (_id: string, tuple: string) => {
+        row = { ...row, last_escalation_state: tuple };
+      },
+      createTask: async (_context: never, data: { recipient: string; idempotency_key: string }) => {
+        escalationSends.push(`${data.recipient}:${data.idempotency_key}`);
+        return { id: 'd' } as never;
+      },
+    };
+
+    // Three consecutive ticks, dispatched row unchanged.
+    await checkExpectations(new Date(5_000_000), deps as never);
+    await checkExpectations(new Date(6_000_000), deps as never);
+    await checkExpectations(new Date(7_000_000), deps as never);
+
+    // Exactly one escalation to xo, under the deterministic escalation key.
+    expect(escalationSends).toEqual(['xo:tm:expectation:expectation-1:escalate']);
+    // Ticks 2 and 3 suppressed: no second claim, no second send.
+    expect(claimEscalations).toEqual([1]);
+  });
+
+  test('worker_poll_recipient_unchanged', async () => {
+    // A worker_poll recipient still resolves through the done-reply query, and a
+    // done/succeeded reply closes it with the reply pointer, exactly as before.
+    const closes: string[] = [];
+    let checkEvidenceCalls = 0;
+    await checkExpectations(new Date(1_000_000), {
+      listDueExpectations: async () => [
+        {
+          ...base,
+          recipient: 'codex',
+          dispatch_ref: 'R',
+          due_at: new Date(9_000_000).toISOString(),
+        },
+      ],
+      assessDispatchRecipient: assessAs('worker_poll'),
+      // Simulates the done-reply query hitting a completed reply row.
+      checkEvidence: async () => {
+        checkEvidenceCalls += 1;
+        return { ok: true, pointer: 'dispatch:reply-1' };
+      },
+      // getMessage must NOT be consulted for a worker_poll recipient.
+      getMessage: async () => {
+        throw new Error('getMessage must not run for a worker_poll recipient');
+      },
+      markMet: async (_id: string, pointer: string) => {
+        closes.push(pointer);
+        return true;
+      },
+    });
+    expect(checkEvidenceCalls).toBe(1);
+    expect(closes).toEqual(['dispatch:reply-1']);
   });
 });
