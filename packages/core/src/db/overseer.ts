@@ -219,6 +219,40 @@ const TERMINAL_OVERSEER_ACTIONS = [
   'comment_findings',
 ] as const;
 
+/**
+ * WO ids of non-terminal runs whose recovered repo matches `owner/repo`.
+ *
+ * Same columns and the same parseWoId/parseRepo recovery as
+ * listRunsForOverseerWatch. The WHERE clause is the complement of that
+ * function: in-flight means status is not completed/failed/escalated/cancelled.
+ * Used by PR-first discovery to hold a builder-opened PR while its lane is
+ * still running (bdc-xo#2307). Repo filtering happens after parseRepo because
+ * identity lives on the codebase name or metadata, not a dedicated column.
+ */
+export async function listInFlightWoIdsForRepo(input: {
+  owner: string;
+  repo: string;
+}): Promise<ReadonlySet<string>> {
+  const result = await getDatabase().query<WorkflowRunRow>(
+    `SELECT r.id, r.status, r.metadata, r.user_message, r.working_path,
+            c.name AS codebase_name
+     FROM remote_agent_workflow_runs r
+     LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
+     WHERE r.status NOT IN ('completed', 'failed', 'escalated', 'cancelled')
+       AND r.workflow_name != 'pr-discovery'`
+  );
+  const wanted = `${input.owner}/${input.repo}`.toLowerCase();
+  const woIds = new Set<string>();
+  for (const row of result.rows) {
+    const run = normalizeRun(row);
+    if (!run.owner || !run.repo) continue;
+    if (`${run.owner}/${run.repo}`.toLowerCase() !== wanted) continue;
+    if (!run.woId || run.woId === 'unknown') continue;
+    woIds.add(run.woId);
+  }
+  return woIds;
+}
+
 export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
   const placeholders = TERMINAL_OVERSEER_ACTIONS.map(() => '?').join(', ');
   const result = await getDatabase().query<WorkflowRunRow>(

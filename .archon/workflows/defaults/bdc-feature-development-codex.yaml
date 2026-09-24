@@ -539,6 +539,7 @@ nodes:
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
   - id: implement
+    deny_pull_request_mutations: true
     idle_timeout: 600000
     provider: codex
     model: gpt-5.6-sol
@@ -549,6 +550,8 @@ nodes:
     wall_timeout_ms: 1800000
     loop:
       prompt: |
+        Do NOT open, merge, or mark ready any pull request (no gh pr create, gh pr merge, gh pr ready, or GitHub API pulls calls). The lane opens the PR after review.
+
         Implement the approved plan for this BDC feature Work Order.
 
         ## Spec
@@ -2282,6 +2285,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
+    deny_pull_request_mutations: true
     provider: codex
     model: gpt-5.6-sol
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
@@ -2327,6 +2331,8 @@ nodes:
         fi
         exit 0
       prompt: |
+        Do NOT open, merge, or mark ready any pull request (no gh pr create, gh pr merge, gh pr ready, or GitHub API pulls calls). The lane opens the PR after review.
+
         You are major-build. The Codex diff reviewer raised findings on your diff.
         Fix every fixable finding in place. You are the BUILDER; Codex does not edit.
 
@@ -2588,11 +2594,14 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
+    deny_pull_request_mutations: true
     provider: codex
     model: gpt-5.6-sol
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
+      Do NOT open, merge, or mark ready any pull request (no gh pr create, gh pr merge, gh pr ready, or GitHub API pulls calls). The lane opens the PR after review.
+
       The bdc-feature-development run is BLOCKED before the irreversible commit. Before a
       human is paused, you get ONE autonomous repair pass. Diagnose and, if you can,
       resolve it so the build can proceed safely.
@@ -3822,6 +3831,38 @@ nodes:
         echo "RECOVERY: open the PR manually -> gh pr create --repo ${REPO} --head ${UNIQUE_BRANCH} ${BASE_BRANCH:+--base ${BASE_BRANCH}}" >&2
         exit 1
       fi
+      # bdc-xo#2307: close builder PRs whose headRefName is exactly this run's
+      # worktree branch. Exact match only. A failure here logs WARN and must
+      # not fail the node -- the canonical PR is already open.
+      set +e
+      PR_URL=$(gh pr list --head "$UNIQUE_BRANCH" --repo "$REPO" --state open \
+        --json url --jq '.[0].url // empty' 2>/dev/null)
+      list_status=$?
+      if [ "$list_status" -ne 0 ] || [ -z "$PR_URL" ]; then
+        echo "WARN: could not resolve PR_URL for lane head ${UNIQUE_BRANCH}; skipping builder-PR cleanup (bdc-xo#2307)" >&2
+      else
+        echo "PR_URL=$PR_URL"
+        CURRENT_REF=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [ -n "$CURRENT_REF" ]; then
+          STRAY_NUMS=$(gh pr list --head "$CURRENT_REF" --repo "$REPO" --state open \
+            --json number,headRefName \
+            --jq ".[] | select(.headRefName == \"$CURRENT_REF\") | .number" 2>/dev/null)
+          stray_status=$?
+          if [ "$stray_status" -ne 0 ]; then
+            echo "WARN: could not list open PRs on worktree branch ${CURRENT_REF} (bdc-xo#2307)" >&2
+          else
+            for num in $STRAY_NUMS; do
+              if gh pr close "$num" --repo "$REPO" \
+                --comment "Superseded by the lane's reviewed PR ${PR_URL} (bdc-xo#2307)" >/dev/null 2>&1; then
+                echo "Closed superseded builder PR #${num} on ${CURRENT_REF}"
+              else
+                echo "WARN: failed to close superseded PR #${num} on ${CURRENT_REF} (bdc-xo#2307)" >&2
+              fi
+            done
+          fi
+        fi
+      fi
+      set -e
 
   - id: build-manifest
     persona: major-build
