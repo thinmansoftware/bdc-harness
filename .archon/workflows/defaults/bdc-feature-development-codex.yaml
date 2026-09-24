@@ -1,8 +1,8 @@
 name: bdc-feature-development-codex
 description: |
   Codex-implement variant of bdc-feature-development. Identical DAG; implement +
-  diff-repair use Codex gpt-5.6-sol instead of Claude. Fire when Claude usage is capped.
-  All other nodes (plan, review, validator, manifest, notion) are unchanged.
+  diff-repair use Codex gpt-5.6-sol. Review and judge seats run on Codex
+  gpt-5.6-terra so the builder never grades its own output.
 
 policyFile: harness/policies/agent-behavior.md
 run_authority:
@@ -13,8 +13,8 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Codex build lane: Codex/gpt-5.6-sol is the build default. war-council-validator is
-# pinned to claude/sonnet on the node. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
+# Codex build lane: Codex/gpt-5.6-sol is the build default. Review and judge
+# seats override to gpt-5.6-terra. WO-HARNESS-LANE-REVIEWERS-SOL-TERRA-01.
 provider: codex
 model: gpt-5.6-sol
 
@@ -379,14 +379,10 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     idle_timeout: 600000
-    persona: war-council-architect
-    # Provider pin: persona war-council-architect declares model: sonnet; the lane
-    # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
-    # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
-    # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
-    provider: claude
-    model: sonnet
-    agent: war-council-architect
+    persona: war-council-architect-opr
+    provider: codex
+    model: gpt-5.6-terra
+    agent: war-council-architect-opr
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -2083,14 +2079,9 @@ nodes:
       exit 0
 
   - id: war-council-validator
-    # FABLE TEST SEAT (John 2026-07-02: "add fable in to one for testing for now").
-    # Trusted judge upgraded sonnet -> claude-opus-5-5 on this lane. Persona VARIANT
-    # required because persona model WINS over node model on provider claude
-    # (persona pin law, wiki doctrine/archon-yaml-authoring 2026-07-02).
-    # Superseded by the apex-rung WO (bdc-xo issue #575) when it lands.
-    provider: claude
-    model: claude-opus-5-5
-    persona: captain-ci-validator-fable
+    provider: codex
+    model: gpt-5.6-terra
+    persona: captain-ci-validator-codex
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
     prompt: |
@@ -2158,7 +2149,7 @@ nodes:
   # executor-honest: Codex is read-only and CANNOT write files; until_bash CANNOT prove a
   # semantic Codex objection was fixed. So: codex reviews (stdout only) -> major-build repairs
   # (reads codex stdout in-prompt, until_bash checks MECHANICAL invariants only) -> codex
-  # RE-REVIEWS for real and decides. Cross-model: Codex attacks Claude-authored code.
+  # RE-REVIEWS for real and decides. Cross-model: Terra (gpt-5.6-terra) reviews Sol-authored code.
   # capture-diff: the Codex reviewer persona is read-only [Read,Grep,Glob] with NO Bash,
   # so it cannot run `git diff` itself (F5 fix). This bash node captures the full feature
   # diff (merge-base..HEAD plus any unstaged working-tree changes) to an artifact the
@@ -2226,9 +2217,10 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    model: gpt-5.6-terra
+    agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
     prompt: |
@@ -2483,9 +2475,10 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    model: gpt-5.6-terra
+    agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
@@ -2641,16 +2634,17 @@ nodes:
         printf '{"fixed":"false"}\n'
       fi
 
-  # opus-rereview: autonomous Claude adversarial re-review of the opus-repair diff.
+  # opus-rereview: autonomous Codex adversarial re-review of the opus-repair diff.
   # Only runs when classify-opus-repair reports fixed=true. Mirrors apply-diff-review-final.
   # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01) -- this is the AUTONOMOUS rung of the
   # autonomy ladder: a passing re-review here lets block-reclassify emit PROCEED so the
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    model: gpt-5.6-terra
+    agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
     when: "$classify-opus-repair.output.fixed == 'true'"
@@ -2866,9 +2860,9 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
-    persona: xo
-    provider: claude
-    model: sonnet
+    persona: xo-opr
+    provider: codex
+    model: gpt-5.6-terra
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -2995,9 +2989,10 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: claude
-    model: sonnet
-    agent: claude-adversarial-reviewer
+    persona: codex-adversarial-reviewer
+    provider: codex
+    model: gpt-5.6-terra
+    agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb == 'approve_with_fix'"

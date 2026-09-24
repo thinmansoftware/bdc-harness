@@ -147,11 +147,11 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-cursor.yaml') {
-        // Grok 4.7 builds on the Cursor rail; the judge is the codex lane's
-        // Claude pin so the lane never grades its own work.
-        expect(wcv.provider).toBe('claude');
-        expect(wcv.model).toBe('claude-opus-5-5');
-        expect(wcv.persona).toBe('captain-ci-validator-fable');
+        // Grok 4.7 builds on the Cursor rail; the judge is Codex gpt-5.6-sol
+        // so the lane never grades its own work.
+        expect(wcv.provider).toBe('codex');
+        expect(wcv.model).toBe('gpt-5.6-sol');
+        expect(wcv.persona).toBe('captain-ci-validator-codex');
         return;
       }
 
@@ -169,14 +169,11 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-codex.yaml') {
-        // Fable test seat (John 2026-07-02: "add fable in to one for testing for
-        // now"). Model swept claude-fable-5 -> claude-opus-5 by M-20260726-87
-        // (this exact node, fusion-cx-qwen's sole Claude binding, was the
-        // validator that hard-failed WO #1284 and #1274 the week Fable ran out
-        // of subscription quota). Superseded by the apex-rung WO (bdc-xo issue
-        // #575) when it lands.
-        expect(wcv.provider).toBe('claude');
-        expect(wcv.model).toBe('claude-opus-5-5');
+        // This lane builds with gpt-5.6-sol. The judge is gpt-5.6-terra so
+        // the builder never grades its own work.
+        expect(wcv.provider).toBe('codex');
+        expect(wcv.model).toBe('gpt-5.6-terra');
+        expect(wcv.persona).toBe('captain-ci-validator-codex');
         return;
       }
 
@@ -272,7 +269,28 @@ describe('lane registration and war-council-validator pin', () => {
     }
   });
 
-  it('S4l: the Cursor lane builds on grok-4.7 and reviews with the codex lane Claude pins', () => {
+  const REVIEW_SEAT_IDS = [
+    'plan-review',
+    'war-council-validator',
+    'diff-review',
+    'diff-review-final',
+    'opus-rereview',
+    'findings-consolidate',
+    'apply-diff-review-final',
+  ] as const;
+
+  const REVIEW_PERSONA_ALLOWLIST = new Set<string>([
+    'codex-adversarial-reviewer',
+    'captain-ci-validator-codex',
+    'war-council-architect-opr',
+    'xo-opr',
+  ]);
+
+  function reviewPersona(node: NodeDef | undefined): string | undefined {
+    return node?.persona ?? node?.agent;
+  }
+
+  it('S4l: the Cursor lane builds on grok-4.7 and reviews on Codex gpt-5.6-sol', () => {
     const file = 'bdc-feature-development-cursor.yaml';
     const lane = loadLane(file);
     const grok = loadLane('bdc-feature-development-grok.yaml');
@@ -296,30 +314,18 @@ describe('lane registration and war-council-validator pin', () => {
       }
     }
 
-    const reviewIds = [
-      'plan-review',
-      'war-council-validator',
-      'diff-review',
-      'diff-review-final',
-      'opus-rereview',
-      'findings-consolidate',
-      'apply-diff-review-final',
-    ];
-    for (const id of reviewIds) {
+    for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = node(id);
       const source = codexNode(id);
-      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('claude');
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex');
       expect(reviewNode?.provider, `${file}:${id}:provider`).toBe(source?.provider);
-      expect(reviewNode?.model, `${file}:${id}:model`).toBe(source?.model);
+      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-5.6-sol');
+      expect(source?.model, `codex:${id}:model`).toBe('gpt-5.6-terra');
       expect(reviewNode?.persona, `${file}:${id}:persona`).toBe(source?.persona);
       expect(reviewNode?.agent, `${file}:${id}:agent`).toBe(source?.agent);
+      expect(REVIEW_PERSONA_ALLOWLIST.has(reviewPersona(reviewNode) ?? '')).toBe(true);
     }
-    expect(
-      nodes
-        .filter(n => n.provider === 'claude')
-        .map(n => n.id)
-        .sort()
-    ).toEqual([...reviewIds].sort());
+    expect(nodes.filter(n => n.provider === 'claude').map(n => n.id)).toEqual([]);
     for (const id of [
       'check-already-satisfied',
       'plan',
@@ -333,8 +339,68 @@ describe('lane registration and war-council-validator pin', () => {
       expect(buildNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
     }
     const content = readFileSync(join(LANES_DIR, file), 'utf-8');
-    expect(content).not.toMatch(/^\s*provider:\s*codex\b/m);
+    expect(content).not.toMatch(/^\s*provider:\s*claude\b/m);
     expect(content).not.toMatch(/^\s*provider:\s*(grok|codex-opr)\b/m);
+  });
+
+  it('Test 1: cursor-lane review seats are Codex gpt-5.6-sol with model-free personas', () => {
+    const lane = loadLane('bdc-feature-development-cursor.yaml');
+    const nodes = lane.nodes ?? [];
+    for (const id of REVIEW_SEAT_IDS) {
+      const reviewNode = nodes.find(candidate => candidate.id === id);
+      expect(reviewNode?.provider, id).toBe('codex');
+      expect(reviewNode?.model, id).toBe('gpt-5.6-sol');
+      expect(reviewNode?.provider, id).not.toBe('claude');
+      expect(reviewNode?.provider, id).not.toBe('cursor');
+      expect(reviewNode?.model ?? '', id).not.toMatch(/grok/i);
+      const persona = reviewPersona(reviewNode);
+      expect(REVIEW_PERSONA_ALLOWLIST.has(persona ?? ''), id).toBe(true);
+      const personaFile = readFileSync(join(REPO_ROOT, '.archon/agents', `${persona}.md`), 'utf-8');
+      const frontmatter = personaFile.split('---')[1] ?? '';
+      expect(frontmatter, persona).not.toMatch(/^model:/m);
+    }
+  });
+
+  it('Test 2: codex-lane review seats are Codex gpt-5.6-terra', () => {
+    const lane = loadLane('bdc-feature-development-codex.yaml');
+    const nodes = lane.nodes ?? [];
+    for (const id of REVIEW_SEAT_IDS) {
+      const reviewNode = nodes.find(candidate => candidate.id === id);
+      expect(reviewNode?.provider, id).toBe('codex');
+      expect(reviewNode?.model, id).toBe('gpt-5.6-terra');
+      expect(reviewNode?.model, id).not.toBe('gpt-5.6-sol');
+      expect(reviewNode?.provider, id).not.toBe('claude');
+      const persona = reviewPersona(reviewNode);
+      expect(REVIEW_PERSONA_ALLOWLIST.has(persona ?? ''), id).toBe(true);
+    }
+  });
+
+  it('Test 3: no review seat shares its lane build model', () => {
+    const cursor = loadLane('bdc-feature-development-cursor.yaml');
+    const codex = loadLane('bdc-feature-development-codex.yaml');
+    const buildIds = ['implement', 'diff-repair', 'opus-repair'];
+
+    for (const id of buildIds) {
+      const buildNode = (cursor.nodes ?? []).find(candidate => candidate.id === id);
+      expect(buildNode?.model, `cursor:${id}`).toMatch(/^grok-4\.7-/);
+    }
+    for (const id of REVIEW_SEAT_IDS) {
+      const reviewNode = (cursor.nodes ?? []).find(candidate => candidate.id === id);
+      expect(reviewNode?.model, `cursor:${id}`).toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, `cursor:${id}`).not.toBe(cursor.model);
+    }
+
+    for (const id of buildIds) {
+      const buildNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
+      const model = buildNode?.model ?? codex.model;
+      expect(model, `codex:${id}`).toBe('gpt-5.6-sol');
+    }
+    for (const id of REVIEW_SEAT_IDS) {
+      const reviewNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
+      expect(reviewNode?.model, `codex:${id}`).toBe('gpt-5.6-terra');
+      expect(reviewNode?.model, `codex:${id}`).not.toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, `codex:${id}`).not.toBe(codex.model);
+    }
   });
 
   it('S4i: the dedicated Grok lane pins execution to Grok and review to non-Grok seats', () => {
