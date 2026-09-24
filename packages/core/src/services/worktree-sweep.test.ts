@@ -67,7 +67,6 @@ mock.module('../db/sessions', () => ({
 
 import { moveDirAcrossDevices, sweepTerminalWorkflowWorktrees } from './worktree-sweep';
 
-
 async function createWorktree(
   root: string,
   owner: string,
