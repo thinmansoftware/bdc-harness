@@ -1177,8 +1177,8 @@ nodes:
       BR="salvage/opus-repair-$(basename "$WT")-$$"
       git add -A 2>/dev/null || true
       if ! git diff --cached --quiet 2>/dev/null; then
-        git -c user.name='cauldron-salvage' -c user.email='noreply@bluedevilcollectibles.com' \
-          commit -m "salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)" 2>&1 | tail -1 || true
+        git -c user.name="${CAULDRON_GIT_AUTHOR_NAME:-Thinman Cauldron}" -c user.email="${CAULDRON_GIT_AUTHOR_EMAIL:-admin@bluedevilcollectibles.com}" \
+          commit -m "salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)" -m "Cauldron-Role: salvage" 2>&1 | tail -1 || true
       fi
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
