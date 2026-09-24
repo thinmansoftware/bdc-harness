@@ -150,7 +150,7 @@ describe('lane registration and war-council-validator pin', () => {
         // Grok 4.7 builds on the Cursor rail; the judge is the codex lane's
         // Claude pin so the lane never grades its own work.
         expect(wcv.provider).toBe('claude');
-        expect(wcv.model).toBe('claude-opus-5');
+        expect(wcv.model).toBe('claude-opus-5-5');
         expect(wcv.persona).toBe('captain-ci-validator-fable');
         return;
       }
@@ -176,7 +176,7 @@ describe('lane registration and war-council-validator pin', () => {
         // of subscription quota). Superseded by the apex-rung WO (bdc-xo issue
         // #575) when it lands.
         expect(wcv.provider).toBe('claude');
-        expect(wcv.model).toBe('claude-opus-5');
+        expect(wcv.model).toBe('claude-opus-5-5');
         return;
       }
 
