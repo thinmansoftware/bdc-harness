@@ -196,6 +196,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
       reviewerModel: 'resolved-review-model',
+      createReceiptMessage: async () => ({}) as never,
       recordApprovalVerdict: async input => {
         recorded.push(input);
       },
@@ -221,6 +222,35 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     });
   });
 
+  test('records an approved receipt and resolves when the verdict store throws or rejects', async () => {
+    for (const asyncFailure of [false, true]) {
+      const receipts: unknown[] = [];
+      let verdictAttempts = 0;
+      const deps = createRealSubmitDeps('review-app[bot]', {
+        octokit: submitOctokit(),
+        recordApprovalVerdict: () => {
+          verdictAttempts += 1;
+          const error = new Error('verdict store unavailable');
+          if (asyncFailure) return Promise.reject(error);
+          throw error;
+        },
+        createReceiptMessage: async (_authority, input) => {
+          receipts.push(JSON.parse(input.body));
+          return {} as never;
+        },
+      });
+      const receipt = {
+        ...work,
+        disposition: 'approved' as const,
+        event: 'APPROVE' as const,
+      };
+
+      await expect(deps.recordReceipt(receipt)).resolves.toBeUndefined();
+      expect(verdictAttempts).toBe(1);
+      expect(receipts).toEqual([{ kind: 'pr_review_submit_receipt', ...receipt }]);
+    }
+  });
+
   test.each([
     ['APPROVE', true],
     ['REQUEST_CHANGES', false],
@@ -228,6 +258,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
   ] as const)('maps %s to approved=%s', async (verdict, approved) => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       evaluate: async () =>
         reviewResult({
           verdict,
@@ -244,6 +275,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
   test('maps CHECKS_PENDING to a distinct checksPending signal, not approved=false', async () => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       evaluate: async () => reviewResult({ verdict: 'CHECKS_PENDING', error: 'checks_pending' }),
     });
 
@@ -259,6 +291,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
   test('maps CHECKS_UNAVAILABLE to a terminal, non-approving blocked signal (#775)', async () => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       patOctokit: null,
       evaluate: async () =>
         reviewResult({
@@ -283,6 +316,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
   test('the blocked summary names the transient cause when that is what failed', async () => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       patOctokit: null,
       evaluate: async () =>
         reviewResult({
@@ -302,6 +336,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     const secretError = 'model_error:token=super-secret-provider-detail';
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       evaluate: async () => reviewResult({ verdict: 'INDETERMINATE', error: secretError }),
     });
 
@@ -316,6 +351,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     let observedReviewer: unknown;
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       reviewerModel: 'review-model',
       evaluate: async (_input, evaluatorDeps) => {
         observedReviewer = evaluatorDeps.reviewer;

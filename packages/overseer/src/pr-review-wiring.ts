@@ -835,6 +835,7 @@ interface RealSubmitWiringOverrides {
   evaluate?: (input: PrReviewInput, deps: PrReviewDeps) => Promise<PrReviewResult>;
   invokeModel?: PrReviewDeps['invokeModel'];
   recordApprovalVerdict?: typeof recordReviewApprovalVerdict;
+  createReceiptMessage?: typeof dispatch.createAuthenticatedMessage;
 }
 
 const INDETERMINATE_REVIEW_SUMMARY =
@@ -1065,7 +1066,7 @@ export function createRealSubmitDeps(
           'overseer.pr_review.required_contexts_unavailable_blocked'
         );
       }
-      await dispatch.createAuthenticatedMessage(
+      await (overrides.createReceiptMessage ?? dispatch.createAuthenticatedMessage)(
         { kind: 'system', sender: REVIEW_SENDER },
         {
           correlation_id: input.correlationId,
