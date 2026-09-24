@@ -714,8 +714,9 @@ export class SqliteAdapter implements IDatabase {
         ['repeat_reason', 'TEXT'],
         [
           'route_disposition',
-          "TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))",
+          "TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced'))",
         ],
+        ['route_disposed_at', 'TEXT'],
         ['supersedes_id', 'TEXT REFERENCES agent_dispatch_messages(id)'],
       ];
       const boardDispatchCols = this.db
@@ -909,7 +910,9 @@ export class SqliteAdapter implements IDatabase {
       /idempotency_key\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(tableSql) ||
       /UNIQUE\s*\(\s*idempotency_key\s*\)/i.test(tableSql);
 
-    if (!hasInlineUnique) {
+    const hasMachineDispositions =
+      tableSql.includes("'expired'") && tableSql.includes("'auto_surfaced'");
+    if (!hasInlineUnique && hasMachineDispositions) {
       // Column present and no inline UNIQUE -- only ensure partial indexes.
       // Do not recreate or redefine non-unique helper indexes here; smoke validation
       // catches wrong-definition leftovers on already-migrated schemas.
@@ -971,8 +974,10 @@ export class SqliteAdapter implements IDatabase {
             escalated_sms_at TEXT,
             subject_key TEXT,
             repeat_reason TEXT,
-            route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
-            supersedes_id TEXT REFERENCES agent_dispatch_messages__phase15(id)
+            route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+            route_disposed_at TEXT,
+            supersedes_id TEXT REFERENCES agent_dispatch_messages__phase15(id),
+            seq INTEGER
           )
         `);
 
@@ -1016,7 +1021,9 @@ export class SqliteAdapter implements IDatabase {
           'subject_key',
           'repeat_reason',
           'route_disposition',
+          'route_disposed_at',
           'supersedes_id',
+          'seq',
         ];
         const selectExprs = targetCols.map(name =>
           sourceNames.has(name) ? name : 'NULL AS ' + name
@@ -1029,6 +1036,13 @@ export class SqliteAdapter implements IDatabase {
         this.db.run(
           'ALTER TABLE agent_dispatch_messages__phase15 RENAME TO agent_dispatch_messages'
         );
+
+        // Preserve every caller-defined and historical index exactly across the
+        // CHECK-changing rebuild. Canonical CREATE IF NOT EXISTS statements
+        // below fill only indexes that were genuinely absent.
+        for (const index of indexRows) {
+          if (index.sql) this.db.run(index.sql);
+        }
 
         this.db.run(
           'CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status ON agent_dispatch_messages(recipient, status)'
@@ -1463,7 +1477,8 @@ export class SqliteAdapter implements IDatabase {
         escalated_sms_at TEXT,
         subject_key TEXT,
         repeat_reason TEXT,
-        route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+        route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+        route_disposed_at TEXT,
         supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
       );
 
@@ -2351,6 +2366,14 @@ export class SqliteAdapter implements IDatabase {
       );
 
       INSERT OR IGNORE INTO tm_adoption_meta (id) VALUES (1);
+
+      CREATE TABLE IF NOT EXISTS dispatch_receipt_cutover (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        applied_at TEXT NOT NULL
+      );
+
+      INSERT OR IGNORE INTO dispatch_receipt_cutover (id, applied_at)
+      VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
       -- Taskmaster noise suppression (migration 044,
       -- WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01). Durable standalone table --

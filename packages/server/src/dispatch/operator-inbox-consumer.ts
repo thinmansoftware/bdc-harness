@@ -2,10 +2,10 @@
  * Operator inbox consumer (WO-HARNESS-OPERATOR-INBOX-CONSUMER-01 / bdc-xo#1455).
  *
  * Drains agent_dispatch_messages where recipient='operator' AND status='queued'
- * (listMessages also requires addressed_at IS NULL). Classifies each message,
+ * (listMessages also requires addressed_at and route_disposition to be NULL). Classifies each message,
  * surfaces needs-human items to a durable JSONL log (NOT Telegram/SMS -- that
- * gate stays dark per #1456), and marks handled via the existing DAL
- * acknowledgeMessage + addressMessage primitives.
+ * gate stays dark per #1456), and records a machine route disposition without
+ * writing human receipt columns.
  *
  * Scheduler skeleton cloned from packages/server/src/taskmaster/loop.ts
  * startTaskmaster (singleton timer, inFlight guard, env interval, 0 = off)
@@ -14,8 +14,7 @@
 import { appendFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import {
-  acknowledgeMessage,
-  addressMessage,
+  disposeMessageByMachine,
   listMessages,
   type DispatchMessage,
   type DispatchMailboxResult,
@@ -40,6 +39,7 @@ export interface OperatorInboxMessage {
   acknowledged_by: string | null;
   addressed_at: string | null;
   addressed_by: string | null;
+  route_disposition: 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced' | null;
 }
 
 export type ClassificationKind = 'digest_only' | 'code_actionable' | 'needs_human';
@@ -82,24 +82,16 @@ export interface OperatorInboxDeps {
     status?: 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
     limit?: number;
   }) => Promise<OperatorInboxMessage[]>;
-  acknowledgeMessage?: (data: {
+  disposeMessageByMachine?: (data: {
     id: string;
-    principal_id: string;
-  }) => Promise<
-    | DispatchMailboxResult
-    | { ok: true; message: OperatorInboxMessage }
-    | { ok: false; reason: string }
-  >;
-  addressMessage?: (data: {
-    id: string;
-    principal_id: string;
+    actor: string;
+    disposition: 'expired' | 'auto_surfaced';
   }) => Promise<
     | DispatchMailboxResult
     | { ok: true; message: OperatorInboxMessage }
     | { ok: false; reason: string }
   >;
   surface?: (entry: SurfaceEntry) => Promise<void>;
-  principalId?: string;
   now?: () => Date;
   /**
    * Optional code-actionable hook: comment/link on a findable GitHub issue.
@@ -237,21 +229,16 @@ function toInboxMessage(message: DispatchMessage | OperatorInboxMessage): Operat
     acknowledged_by: message.acknowledged_by,
     addressed_at: message.addressed_at,
     addressed_by: message.addressed_by,
+    route_disposition: message.route_disposition,
   };
 }
 
 async function processOne(
   message: OperatorInboxMessage,
-  deps: Required<
-    Pick<
-      OperatorInboxDeps,
-      'acknowledgeMessage' | 'addressMessage' | 'surface' | 'principalId' | 'now'
-    >
-  > &
+  deps: Required<Pick<OperatorInboxDeps, 'disposeMessageByMachine' | 'surface' | 'now'>> &
     Pick<OperatorInboxDeps, 'commentOnIssue'>
 ): Promise<{ classification: ClassificationKind }> {
   const classification = classifyOperatorMessage(message);
-  const principalId = deps.principalId;
   const surfacedAt = deps.now().toISOString();
 
   if (classification.kind !== 'digest_only') {
@@ -304,13 +291,13 @@ async function processOne(
     }
   }
 
-  const ack = await deps.acknowledgeMessage({ id: message.id, principal_id: principalId });
-  if (!ack.ok) {
-    throw new Error(`acknowledge_failed:${ack.reason}:${message.id}`);
-  }
-  const addressed = await deps.addressMessage({ id: message.id, principal_id: principalId });
-  if (!addressed.ok) {
-    throw new Error(`address_failed:${addressed.reason}:${message.id}`);
+  const disposed = await deps.disposeMessageByMachine({
+    id: message.id,
+    actor: 'system:operator-inbox-consumer',
+    disposition: classification.kind === 'digest_only' ? 'expired' : 'auto_surfaced',
+  });
+  if (!disposed.ok) {
+    throw new Error(`dispose_failed:${disposed.reason}:${message.id}`);
   }
 
   log.info(
@@ -327,7 +314,7 @@ async function processOne(
 }
 
 /**
- * One drain tick: list queued operator messages, classify, surface, ack+address.
+ * One drain tick: list queued operator messages, classify, surface, then dispose.
  * Failures on individual messages are collected; the tick continues so a single
  * bad row cannot permanently stop the drain (mirror of the failure mode this
  * WO exists to eliminate).
@@ -347,16 +334,14 @@ export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<
       });
       return rows.map(toInboxMessage);
     });
-  const ack =
-    deps.acknowledgeMessage ??
-    ((data: { id: string; principal_id: string }): Promise<DispatchMailboxResult> =>
-      acknowledgeMessage(data));
-  const address =
-    deps.addressMessage ??
-    ((data: { id: string; principal_id: string }): Promise<DispatchMailboxResult> =>
-      addressMessage(data));
+  const dispose =
+    deps.disposeMessageByMachine ??
+    ((data: {
+      id: string;
+      actor: string;
+      disposition: 'expired' | 'auto_surfaced';
+    }): Promise<DispatchMailboxResult> => disposeMessageByMachine(data));
   const surface = deps.surface ?? appendDurableSurfaceLog;
-  const principalId = deps.principalId ?? OPERATOR_INBOX_PRINCIPAL;
   const now = deps.now ?? ((): Date => new Date());
 
   const result: DrainResult = {
@@ -390,14 +375,12 @@ export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<
   for (const message of messages) {
     // Already addressed elsewhere -- listMessages should exclude these, but
     // keep the guard for injected/stale views.
-    if (message.addressed_at !== null) continue;
+    if (message.addressed_at !== null || message.route_disposition !== null) continue;
 
     try {
       const { classification } = await processOne(message, {
-        acknowledgeMessage: ack,
-        addressMessage: address,
+        disposeMessageByMachine: dispose,
         surface,
-        principalId,
         now,
         commentOnIssue: deps.commentOnIssue,
       });

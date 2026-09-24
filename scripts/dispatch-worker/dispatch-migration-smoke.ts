@@ -28,6 +28,7 @@ const PHASE_0_NULLABLE_COLUMNS = [
   'escalated_sms_at',
   'subject_key',
   'route_disposition',
+  'route_disposed_at',
   'supersedes_id',
 ] as const;
 const REQUIRED_DISPATCH_INDEXES = [
@@ -679,7 +680,7 @@ function validateMessageSchema(table: TableSnapshot): void {
   assertSqlContains(tableSql, [
     "check (priority in ('blocker', 'normal', 'heartbeat'))",
     "check (task_outcome is null or task_outcome in ('succeeded', 'failed', 'blocked'))",
-    "check (route_disposition is null or route_disposition in ('unroutable', 'superseded'))",
+    "check (route_disposition is null or route_disposition in ('unroutable', 'superseded', 'expired', 'auto_surfaced'))",
     'supersedes_id text references agent_dispatch_messages(id)',
     'sender_principal_id',
   ]);

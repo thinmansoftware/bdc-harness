@@ -45,6 +45,7 @@ function makeMessage(overrides: Partial<OperatorInboxMessage> = {}): OperatorInb
     acknowledged_by: null,
     addressed_at: null,
     addressed_by: null,
+    route_disposition: null,
     ...overrides,
   };
 }
@@ -52,16 +53,14 @@ function makeMessage(overrides: Partial<OperatorInboxMessage> = {}): OperatorInb
 interface FakeWorld {
   messages: OperatorInboxMessage[];
   surfaces: SurfaceEntry[];
-  ackCalls: string[];
-  addressCalls: string[];
+  disposeCalls: string[];
 }
 
 function makeWorld(seed: OperatorInboxMessage[] = []): FakeWorld {
   return {
     messages: seed.map(m => ({ ...m })),
     surfaces: [],
-    ackCalls: [],
-    addressCalls: [],
+    disposeCalls: [],
   };
 }
 
@@ -73,38 +72,23 @@ function makeDeps(world: FakeWorld, overrides: Partial<OperatorInboxDeps> = {}):
         if (filters.status === 'queued') {
           if (m.status !== 'queued') return false;
           if (m.addressed_at !== null) return false;
+          if (m.route_disposition !== null) return false;
         }
         return true;
       });
     },
-    acknowledgeMessage: async data => {
-      world.ackCalls.push(data.id);
+    disposeMessageByMachine: async data => {
+      world.disposeCalls.push(data.id);
       const msg = world.messages.find(m => m.id === data.id);
       if (!msg) return { ok: false as const, reason: 'not_found' as const };
-      if (msg.acknowledged_by !== null && msg.acknowledged_by !== data.principal_id) {
-        return { ok: false as const, reason: 'actor_mismatch' as const };
-      }
-      msg.acknowledged_at = msg.acknowledged_at ?? new Date().toISOString();
-      msg.acknowledged_by = data.principal_id;
-      return { ok: true as const, message: msg };
-    },
-    addressMessage: async data => {
-      world.addressCalls.push(data.id);
-      const msg = world.messages.find(m => m.id === data.id);
-      if (!msg) return { ok: false as const, reason: 'not_found' as const };
-      if (msg.acknowledged_by === null)
-        return { ok: false as const, reason: 'address_before_ack' as const };
-      if (msg.acknowledged_by !== data.principal_id) {
-        return { ok: false as const, reason: 'actor_mismatch' as const };
-      }
-      msg.addressed_at = msg.addressed_at ?? new Date().toISOString();
-      msg.addressed_by = data.principal_id;
+      if (msg.route_disposition !== null)
+        return { ok: false as const, reason: 'already_disposed' as const };
+      msg.route_disposition = data.disposition;
       return { ok: true as const, message: msg };
     },
     surface: async entry => {
       world.surfaces.push(entry);
     },
-    principalId: 'operator',
     ...overrides,
   };
 }
@@ -114,7 +98,7 @@ describe('operator inbox consumer (WO-HARNESS-OPERATOR-INBOX-CONSUMER-01)', () =
     stopOperatorInboxConsumer();
   });
 
-  test('backlog drain: every seeded queued operator row leaves queued (ack+address)', async () => {
+  test('backlog drain: every seeded queued operator row receives an honest disposition', async () => {
     // Seed shape matches live 2026-08-07 evidence: many run_report + one digest.
     const seed: OperatorInboxMessage[] = [
       makeMessage({
@@ -159,11 +143,10 @@ describe('operator inbox consumer (WO-HARNESS-OPERATOR-INBOX-CONSUMER-01)', () =
     expect(result.failed).toBe(0);
 
     const stillQueued = world.messages.filter(
-      m => m.status === 'queued' && m.addressed_at === null
+      m => m.status === 'queued' && m.route_disposition === null
     );
     expect(stillQueued).toHaveLength(0);
-    expect(world.ackCalls.sort()).toEqual(['digest-1', 'rr-1', 'rr-2', 'rr-unknown'].sort());
-    expect(world.addressCalls.sort()).toEqual(['digest-1', 'rr-1', 'rr-2', 'rr-unknown'].sort());
+    expect(world.disposeCalls.sort()).toEqual(['digest-1', 'rr-1', 'rr-2', 'rr-unknown'].sort());
   });
 
   test('idempotent re-run: already-addressed messages are not reprocessed', async () => {
@@ -181,12 +164,13 @@ describe('operator inbox consumer (WO-HARNESS-OPERATOR-INBOX-CONSUMER-01)', () =
     const first = await drainOperatorInbox(deps);
     expect(first.found).toBe(1);
     expect(first.processed).toBe(1);
-    expect(world.addressCalls).toEqual(['pending-1']);
+    expect(world.disposeCalls).toEqual(['pending-1']);
 
+    // A second tick must not surface or dispose the same row twice.
     const second = await drainOperatorInbox(deps);
     expect(second.found).toBe(0);
     expect(second.processed).toBe(0);
-    expect(world.addressCalls).toEqual(['pending-1']);
+    expect(world.disposeCalls).toEqual(['pending-1']);
     expect(world.surfaces.filter(s => s.messageId === 'pending-1').length).toBeLessThanOrEqual(1);
   });
 
@@ -205,10 +189,12 @@ describe('operator inbox consumer (WO-HARNESS-OPERATOR-INBOX-CONSUMER-01)', () =
     expect(entry.classification).toBe('needs_human');
     expect(entry.originalBody).toContain(originalBlocker);
     expect(entry.originalBody).toBe(body);
-    expect(world.messages[0]!.addressed_at).not.toBeNull();
+    expect(world.messages[0]!.route_disposition).toBe('auto_surfaced');
+    expect(world.messages[0]!.acknowledged_at).toBeNull();
+    expect(world.messages[0]!.addressed_at).toBeNull();
   });
 
-  test('digest-only message is acknowledged without human-surface escalation', async () => {
+  test('digest-only message is expired without human-surface escalation', async () => {
     const world = makeWorld([
       makeMessage({
         id: 'digest-only',
@@ -221,18 +207,19 @@ describe('operator inbox consumer (WO-HARNESS-OPERATOR-INBOX-CONSUMER-01)', () =
     ]);
     await drainOperatorInbox(makeDeps(world));
 
-    expect(world.ackCalls).toEqual(['digest-only']);
-    expect(world.addressCalls).toEqual(['digest-only']);
+    expect(world.disposeCalls).toEqual(['digest-only']);
     expect(world.surfaces).toHaveLength(0);
-    expect(world.messages[0]!.addressed_at).not.toBeNull();
+    expect(world.messages[0]!.route_disposition).toBe('expired');
+    expect(world.messages[0]!.acknowledged_at).toBeNull();
+    expect(world.messages[0]!.addressed_at).toBeNull();
   });
 
   test('consumer failure is loud: mid-drain throw is reported, not swallowed', async () => {
     const world = makeWorld([makeMessage({ id: 'boom-1' }), makeMessage({ id: 'ok-2' })]);
     const deps = makeDeps(world, {
-      acknowledgeMessage: async data => {
+      disposeMessageByMachine: async data => {
         if (data.id === 'boom-1') throw new Error('simulated_mid_drain_failure');
-        return makeDeps(world).acknowledgeMessage!(data);
+        return makeDeps(world).disposeMessageByMachine!(data);
       },
     });
 
@@ -240,7 +227,25 @@ describe('operator inbox consumer (WO-HARNESS-OPERATOR-INBOX-CONSUMER-01)', () =
     expect(result.failed).toBeGreaterThanOrEqual(1);
     expect(result.errors.some(e => e.includes('simulated_mid_drain_failure'))).toBe(true);
     // Other messages still process -- one failure must not permanently stop drain.
-    expect(world.addressCalls).toContain('ok-2');
+    expect(world.disposeCalls).toContain('ok-2');
+  });
+
+  test('rollback freeze makes legacy-style receipt processing fail without receipt writes', async () => {
+    const world = makeWorld([makeMessage({ id: 'legacy-frozen' })]);
+    const result = await drainOperatorInbox(
+      makeDeps(world, {
+        disposeMessageByMachine: async () => {
+          throw new Error('dispatch_receipts_frozen');
+        },
+      })
+    );
+    expect(result.failed).toBe(world.messages.length);
+    expect(world.messages[0]).toMatchObject({
+      acknowledged_at: null,
+      acknowledged_by: null,
+      addressed_at: null,
+      addressed_by: null,
+    });
   });
 
   test('classifier: known budget/PR patterns are code_actionable; novel is needs_human; digest is digest_only', () => {

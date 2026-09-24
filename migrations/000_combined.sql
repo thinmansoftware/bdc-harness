@@ -552,7 +552,8 @@ CREATE TABLE IF NOT EXISTS agent_dispatch_messages (
   escalated_sms_at TIMESTAMPTZ,
   subject_key TEXT,
   repeat_reason TEXT,
-  route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+        route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+        route_disposed_at TEXT,
   supersedes_id UUID REFERENCES agent_dispatch_messages(id)
 );
 
@@ -588,6 +589,15 @@ CREATE TABLE IF NOT EXISTS dispatch_principals (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS dispatch_receipt_cutover (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  applied_at TEXT NOT NULL
+);
+
+INSERT INTO dispatch_receipt_cutover (id, applied_at)
+VALUES (1, CURRENT_TIMESTAMP)
+ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
 VALUES

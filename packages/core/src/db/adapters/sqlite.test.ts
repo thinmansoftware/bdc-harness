@@ -6,7 +6,7 @@ import { SqliteAdapter } from './sqlite';
 // package so both the pinned Phase 1.5 command and ordinary package CI grade it.
 await import('../../../../../scripts/dispatch-worker/dispatch-migration-smoke.test');
 import { Database } from 'bun:sqlite';
-import { unlinkSync } from 'fs';
+import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 
 let currentDbPath = '';
@@ -674,6 +674,20 @@ describe('SqliteAdapter', () => {
         { id: 'p15-1', sender_principal_id: null },
         { id: 'p15-2', sender_principal_id: null },
       ]);
+      const schema = await db.query<{ sql: string }>(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+      );
+      expect(schema.rows[0]?.sql).toContain("'expired', 'auto_surfaced'");
+      const columns = await db.query<{ name: string }>(
+        "PRAGMA table_info('agent_dispatch_messages')"
+      );
+      expect(columns.rows.map(row => row.name)).toContain('route_disposed_at');
+      const cutover = await db.query<{ id: number; applied_at: string }>(
+        'SELECT id, applied_at FROM dispatch_receipt_cutover'
+      );
+      expect(cutover.rows).toHaveLength(1);
+      expect(cutover.rows[0]?.id).toBe(1);
+      const appliedAt = cutover.rows[0]?.applied_at;
       await db.close();
 
       db = new SqliteAdapter(currentDbPath);
@@ -681,6 +695,10 @@ describe('SqliteAdapter', () => {
         `SELECT COUNT(*) as count FROM agent_dispatch_messages`
       );
       expect(second.rows[0]?.count).toBe(2);
+      const secondCutover = await db.query<{ applied_at: string }>(
+        'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+      );
+      expect(secondCutover.rows[0]?.applied_at).toBe(appliedAt);
       const indexes = await db.query<{ name: string }>(
         `SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'uq_agent_dispatch_messages_%' ORDER BY name`
       );
@@ -688,6 +706,38 @@ describe('SqliteAdapter', () => {
         'uq_agent_dispatch_messages_idempotency_legacy',
         'uq_agent_dispatch_messages_sender_idempotency_authenticated',
       ]);
+    });
+
+    test('receipt freeze blocks receipt updates and unfreeze restores them without changing cutover', async () => {
+      db = createTestDb();
+      await db.query(`INSERT INTO agent_dispatch_messages
+        (id, correlation_id, idempotency_key, task_type, sender, recipient, body)
+        VALUES ('freeze-1', 'freeze-corr', 'freeze-key', 'agent_message', 'xo', 'operator', 'body')`);
+      const before = await db.query<{ applied_at: string }>(
+        'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+      );
+      const freezeSql = readFileSync(
+        join(import.meta.dir, '../../../../../scripts/dispatch/receipt-freeze.sql'),
+        'utf8'
+      );
+      const raw = new Database(currentDbPath);
+      raw.exec(freezeSql);
+      raw.close();
+      await expect(
+        db.query(`UPDATE agent_dispatch_messages
+          SET acknowledged_at = '2026-09-23' WHERE id = 'freeze-1'`)
+      ).rejects.toThrow('dispatch_receipts_frozen');
+      const unfreezeSql = readFileSync(
+        join(import.meta.dir, '../../../../../scripts/dispatch/receipt-unfreeze.sql'),
+        'utf8'
+      );
+      await db.query(unfreezeSql);
+      await db.query(`UPDATE agent_dispatch_messages
+        SET acknowledged_at = '2026-09-23' WHERE id = 'freeze-1'`);
+      const after = await db.query<{ applied_at: string }>(
+        'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+      );
+      expect(after.rows[0]?.applied_at).toBe(before.rows[0]?.applied_at);
     });
 
     test('phase15 rebuild path is outside the best-effort warn block', async () => {

@@ -45,6 +45,7 @@ import {
   reconcileDispatchOutcomeNotices,
   registerWorker,
   deferMessage,
+  disposeMessageByMachine,
   listMessagesByCorrelationId,
   releaseDispatchEscalationClaim,
   releaseMessage,
@@ -956,6 +957,143 @@ describe('dispatch db', () => {
         reason: 'wrong_recipient',
       }
     );
+  });
+
+  test('machine disposition writes only routing evidence and auto_surfaced stays ackable', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-machine-surface',
+      idempotency_key: 'idem-machine-surface',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Surface me.',
+    });
+    const disposed = await disposeMessageByMachine({
+      id: message.id,
+      actor: 'system:operator-inbox-consumer',
+      disposition: 'auto_surfaced',
+    });
+    expect(disposed).toMatchObject({
+      ok: true,
+      message: {
+        status: 'queued',
+        route_disposition: 'auto_surfaced',
+        acknowledged_at: null,
+        acknowledged_by: null,
+        addressed_at: null,
+        addressed_by: null,
+      },
+    });
+    if (disposed.ok) expect(disposed.message.route_disposed_at).not.toBeNull();
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+    expect(await getMessage(message.id)).toMatchObject({
+      acknowledged_by: 'operator',
+      addressed_at: null,
+      route_disposition: 'auto_surfaced',
+    });
+  });
+
+  test('terminal dispositions refuse acknowledgement with disposition_terminal', async () => {
+    // expired -> disposition_terminal; unroutable -> disposition_terminal;
+    // superseded is covered by the same terminal-receipt contract.
+    for (const disposition of ['expired', 'unroutable', 'superseded'] as const) {
+      const message = await createMessage({
+        correlation_id: `corr-terminal-${disposition}`,
+        idempotency_key: `idem-terminal-${disposition}`,
+        task_type: 'agent_message',
+        sender: 'xo',
+        recipient: 'operator',
+        body: disposition,
+      });
+      if (disposition === 'expired') {
+        expect(
+          (
+            await disposeMessageByMachine({
+              id: message.id,
+              actor: 'system:test-expirer',
+              disposition,
+            })
+          ).ok
+        ).toBe(true);
+      } else {
+        await db.query(
+          'UPDATE agent_dispatch_messages SET route_disposition = $2, route_disposed_at = $3 WHERE id = $1',
+          [message.id, disposition, '2026-09-23T00:00:00.000Z']
+        );
+      }
+      await expect(
+        acknowledgeMessage({ id: message.id, principal_id: 'operator' })
+      ).resolves.toEqual({ ok: false, reason: 'disposition_terminal' });
+    }
+  });
+
+  test('queued listing excludes disposed rows and route_disposition retrieves surfaced rows', async () => {
+    const surfaced = await createMessage({
+      correlation_id: 'corr-list-surfaced',
+      idempotency_key: 'idem-list-surfaced',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'surface',
+    });
+    const expired = await createMessage({
+      correlation_id: 'corr-list-expired',
+      idempotency_key: 'idem-list-expired',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'expire',
+    });
+    await disposeMessageByMachine({
+      id: surfaced.id,
+      actor: 'system:test',
+      disposition: 'auto_surfaced',
+    });
+    await disposeMessageByMachine({ id: expired.id, actor: 'system:test', disposition: 'expired' });
+    expect(
+      (await listMessages({ recipient: 'operator', status: 'queued' })).map(row => row.id)
+    ).not.toContain(surfaced.id);
+    expect(
+      (await listMessages({ recipient: 'operator', status: 'queued' })).map(row => row.id)
+    ).not.toContain(expired.id);
+    expect(
+      (await listMessages({ recipient: 'operator', route_disposition: 'auto_surfaced' })).map(
+        row => row.id
+      )
+    ).toContain(surfaced.id);
+  });
+
+  test('machine disposition validates actor, value, and one-shot behavior', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-machine-errors',
+      idempotency_key: 'idem-machine-errors',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'errors',
+    });
+    await expect(
+      disposeMessageByMachine({ id: message.id, actor: 'operator', disposition: 'expired' })
+    ).resolves.toEqual({ ok: false, reason: 'machine_actor_required' });
+    await expect(
+      disposeMessageByMachine({
+        id: message.id,
+        actor: 'system:test',
+        disposition: 'addressed' as 'expired',
+      })
+    ).resolves.toEqual({ ok: false, reason: 'disposition_invalid' });
+    expect(
+      (
+        await disposeMessageByMachine({
+          id: message.id,
+          actor: 'system:test',
+          disposition: 'expired',
+        })
+      ).ok
+    ).toBe(true);
+    await expect(
+      disposeMessageByMachine({ id: message.id, actor: 'system:test', disposition: 'expired' })
+    ).resolves.toEqual({ ok: false, reason: 'already_disposed' });
   });
 
   test('addresses only acknowledged mail by its acknowledger and is idempotent', async () => {
