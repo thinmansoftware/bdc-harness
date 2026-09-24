@@ -186,9 +186,9 @@ describe('deploy drift detector', () => {
     expect(body.behind_by).toBe(3);
     expect((body.undeployed_prs as { number: number }[]).map(pr => pr.number)).toEqual([901, 902]);
     expect(body.commits_without_pr).toBe(1);
-    expect(
-      (body.undeployed_prs as unknown[]).length + (body.commits_without_pr as number)
-    ).toBe(body.behind_by);
+    expect((body.undeployed_prs as unknown[]).length + (body.commits_without_pr as number)).toBe(
+      body.behind_by
+    );
   });
 
   test('pr_list_cap_still_counts_every_commit', async () => {

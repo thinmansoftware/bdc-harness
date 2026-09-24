@@ -7,7 +7,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-dirty="$(git status --porcelain --untracked-files=no)"
+dirty="$(git status --porcelain)"
 if [ -n "$dirty" ]; then
   echo "DIRTY" >&2
   exit 3

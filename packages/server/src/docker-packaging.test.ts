@@ -129,6 +129,29 @@ describe('production Docker packaging', () => {
         const dirtyErr = await new Response(dirty.stderr).text();
         expect(dirtyCode).toBe(3);
         expect(dirtyErr).toContain('DIRTY');
+
+        // Restore the tracked file to a clean state, then prove an UNTRACKED
+        // file alone also refuses the build -- Docker's build context includes
+        // untracked files, so the guard must not ignore them (Overseer finding
+        // on PR #933: --untracked-files=no let an untracked file slip through).
+        const restore = Bun.spawn(['git', 'checkout', '--', 'README'], {
+          cwd: dir,
+          env: gitEnv,
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        expect(await restore.exited).toBe(0);
+        await writeFile(join(dir, 'untracked.txt'), 'new file\n');
+        const untrackedDirty = Bun.spawn(['bash', scriptPath], {
+          cwd: dir,
+          env: { ...gitEnv, ARCHON_DOCKER_BIN: stub },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        const untrackedCode = await untrackedDirty.exited;
+        const untrackedErr = await new Response(untrackedDirty.stderr).text();
+        expect(untrackedCode).toBe(3);
+        expect(untrackedErr).toContain('DIRTY');
       } finally {
         await rm(dir, { recursive: true, force: true });
       }
