@@ -5,6 +5,7 @@ import { join } from 'path';
 import {
   decideSeatGate,
   getSeatCutoff,
+  isSeatGateEnabled,
   readAllSeats,
   readSeat,
   resetSeatUsageCacheForTests,
@@ -50,7 +51,11 @@ function jsonResponse(status: number, body: string): Response {
 
 async function claudeDeps(
   fetchImpl: typeof fetch
-): Promise<{ claudeCredentialsFile: string; fetch: typeof fetch; env: Record<string, string | undefined> }> {
+): Promise<{
+  claudeCredentialsFile: string;
+  fetch: typeof fetch;
+  env: Record<string, string | undefined>;
+}> {
   const dir = await mkdtemp(join(tmpdir(), 'seat-claude-'));
   const claudeCredentialsFile = join(dir, 'credentials.json');
   await writeFile(
@@ -68,7 +73,11 @@ async function claudeDeps(
 
 async function codexDeps(
   fetchImpl: typeof fetch
-): Promise<{ codexAuthFile: string; fetch: typeof fetch; env: Record<string, string | undefined> }> {
+): Promise<{
+  codexAuthFile: string;
+  fetch: typeof fetch;
+  env: Record<string, string | undefined>;
+}> {
   const dir = await mkdtemp(join(tmpdir(), 'seat-codex-'));
   const codexAuthFile = join(dir, 'auth.json');
   await writeFile(
@@ -212,7 +221,11 @@ describe('seat usage', () => {
             rate_limit: {
               allowed: true,
               limit_reached: false,
-              primary_window: { used_percent: 10, limit_window_seconds: 604800, reset_at: 1790514812 },
+              primary_window: {
+                used_percent: 10,
+                limit_window_seconds: 604800,
+                reset_at: 1790514812,
+              },
             },
           })
         );
@@ -289,7 +302,9 @@ describe('seat usage', () => {
   });
 
   test('gate_refuses_maxed_seat_and_names_it', () => {
-    const claude = measured('claude', [{ name: 'seven_day', used_percent: 41, remaining_percent: 59, resets_at: 'x' }]);
+    const claude = measured('claude', [
+      { name: 'seven_day', used_percent: 41, remaining_percent: 59, resets_at: 'x' },
+    ]);
     const codex = measured('codex', [
       {
         name: 'primary',
@@ -333,6 +348,16 @@ describe('seat usage', () => {
     expect(decision).toEqual({ refused: false, unknownSeats: [] });
   });
 
+  test('kill_switch_off_disables_gate', () => {
+    expect(isSeatGateEnabled()).toBe(true);
+    process.env.FUELGLASS_SEAT_GATE = 'off';
+    expect(isSeatGateEnabled()).toBe(false);
+    process.env.FUELGLASS_SEAT_GATE = 'on';
+    expect(isSeatGateEnabled()).toBe(true);
+    delete process.env.FUELGLASS_SEAT_GATE;
+    expect(isSeatGateEnabled()).toBe(true);
+  });
+
   test('cutoff_resolution_order', () => {
     expect(getSeatCutoff()).toEqual({ percent: 100, source: 'default' });
     process.env.FUELGLASS_SEAT_CUTOFF_PERCENT = '95';
@@ -369,7 +394,11 @@ describe('seat usage', () => {
           rate_limit: {
             allowed: true,
             limit_reached: false,
-            primary_window: { used_percent: 92, limit_window_seconds: 604800, reset_at: 1790514812 },
+            primary_window: {
+              used_percent: 92,
+              limit_window_seconds: 604800,
+              reset_at: 1790514812,
+            },
           },
         })
       );
@@ -405,7 +434,15 @@ describe('seat usage', () => {
   test('codex_limit_reached_refuses_below_cutoff', () => {
     const codex = measured(
       'codex',
-      [{ name: 'primary', used_percent: 70, remaining_percent: 30, resets_at: 'x', window_seconds: 604800 }],
+      [
+        {
+          name: 'primary',
+          used_percent: 70,
+          remaining_percent: 30,
+          resets_at: 'x',
+          window_seconds: 604800,
+        },
+      ],
       { limit_reached: true }
     );
     const decision = decideSeatGate([{ providerId: 'codex' }], { codex }, 100);

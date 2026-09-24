@@ -177,6 +177,7 @@ describe('fuelglass seat routes', () => {
   beforeEach(() => {
     resetSeatUsageCacheForTests();
     delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
+    delete process.env.FUELGLASS_SEAT_GATE;
     setSeatUsageReaderForTests(async () => ({
       claude: seat(
         'claude',
@@ -196,14 +197,17 @@ describe('fuelglass seat routes', () => {
   afterEach(() => {
     resetSeatUsageCacheForTests();
     delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
+    delete process.env.FUELGLASS_SEAT_GATE;
   });
 
   test('api_seats_and_cutoff_routes', async () => {
     const first = await app.request('/api/fuelglass/seats');
     expect(first.status).toBe(200);
     const body = (await first.json()) as {
+      gate_enabled: boolean;
       seats: Record<string, { seven_day: { used_percent?: number } | string }>;
     };
+    expect(body.gate_enabled).toBe(true);
     expect(Object.keys(body.seats).sort()).toEqual(['claude', 'codex', 'cursor']);
     expect(body.seats.claude?.seven_day).toMatchObject({ used_percent: 41 });
     expect(body.seats.codex?.seven_day).toMatchObject({ used_percent: 92 });
@@ -217,8 +221,16 @@ describe('fuelglass seat routes', () => {
     expect(setCutoff.status).toBe(200);
 
     const second = await app.request('/api/fuelglass/seats');
-    const after = (await second.json()) as { cutoff: { percent: number; source: string } };
+    const after = (await second.json()) as {
+      gate_enabled: boolean;
+      cutoff: { percent: number; source: string };
+    };
     expect(after.cutoff).toEqual({ percent: 90, source: 'operator' });
+    expect(after.gate_enabled).toBe(true);
+    process.env.FUELGLASS_SEAT_GATE = 'off';
+    const gatedOff = await app.request('/api/fuelglass/seats');
+    const offBody = (await gatedOff.json()) as { gate_enabled: boolean };
+    expect(offBody.gate_enabled).toBe(false);
 
     const tooHigh = await app.request('/api/fuelglass/cutoff', {
       method: 'POST',

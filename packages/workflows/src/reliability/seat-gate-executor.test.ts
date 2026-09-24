@@ -20,11 +20,7 @@ const prompts: string[] = [];
 const warnings: Array<{ obj: Record<string, unknown>; msg: string }> = [];
 const origChild = rootLogger.child.bind(rootLogger);
 
-function reading(
-  seat: SeatReading['seat'],
-  windowName: string,
-  used: number
-): SeatReading {
+function reading(seat: SeatReading['seat'], windowName: string, used: number): SeatReading {
   return {
     seat,
     limit_source: 'measured',
@@ -186,10 +182,13 @@ describe('executor seat gate', () => {
     const { result, store } = await runWorkflow();
     expect(result.success).toBe(false);
     expect(result.error).toBe('seat_usage_refused:codex:primary:95:90');
-    const events = store.createWorkflowEvent.mock.calls.map(call => call[0] as {
-      event_type: string;
-      data: { reason?: string };
-    });
+    const events = store.createWorkflowEvent.mock.calls.map(
+      call =>
+        call[0] as {
+          event_type: string;
+          data: { reason?: string };
+        }
+    );
     expect(
       events.some(
         event =>
@@ -205,6 +204,81 @@ describe('executor seat gate', () => {
     expect(prompts.filter(prompt => prompt !== 'Reply with exactly: OK')).toEqual([]);
   });
 
+  test('kill switch off proceeds even when a seat would refuse', async () => {
+    process.env.FUELGLASS_SEAT_GATE = 'off';
+    let reads = 0;
+    setSeatUsageReaderForTests(async () => {
+      reads += 1;
+      return {
+        claude: reading('claude', 'seven_day', 10),
+        codex: reading('codex', 'primary', 95),
+      };
+    });
+    setSeatCutoffOverride(90);
+    const { result, store } = await runWorkflow();
+    expect(reads).toBe(0);
+    expect(result.error ?? '').not.toContain('seat_usage_refused');
+    const events = store.createWorkflowEvent.mock.calls.map(
+      call =>
+        call[0] as {
+          event_type: string;
+        }
+    );
+    expect(events.some(event => event.event_type === 'workflow_started')).toBe(true);
+    expect(warnings.some(entry => entry.msg === 'workflow.seat_usage_refused')).toBe(false);
+  });
+
+  test('a hanging seat read falls back to UNKNOWN at the 12s ceiling', async () => {
+    setSeatUsageReaderForTests(() => new Promise(() => {}));
+    setSeatCutoffOverride(90);
+    const started = Date.now();
+    const { result, store } = await runWorkflow();
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(12_000);
+    expect(elapsed).toBeLessThan(16_000);
+    expect(result.error ?? '').not.toContain('seat_usage_refused');
+    const events = store.createWorkflowEvent.mock.calls.map(
+      call =>
+        call[0] as {
+          event_type: string;
+        }
+    );
+    expect(events.some(event => event.event_type === 'workflow_started')).toBe(true);
+    expect(
+      warnings.some(
+        entry =>
+          entry.msg === 'workflow.seat_usage_unknown' && entry.obj.note === 'seat read timed out'
+      )
+    ).toBe(true);
+  }, 20_000);
+
+  test('a thrown seat read is labeled with the error, not a timeout', async () => {
+    setSeatUsageReaderForTests(async () => {
+      throw new Error('reader exploded');
+    });
+    setSeatCutoffOverride(90);
+    const { result, store } = await runWorkflow();
+    expect(result.error ?? '').not.toContain('seat_usage_refused');
+    const events = store.createWorkflowEvent.mock.calls.map(
+      call =>
+        call[0] as {
+          event_type: string;
+        }
+    );
+    expect(events.some(event => event.event_type === 'workflow_started')).toBe(true);
+    expect(
+      warnings.some(
+        entry => entry.msg === 'workflow.seat_usage_unknown' && entry.obj.note === 'reader exploded'
+      )
+    ).toBe(true);
+    expect(
+      warnings.some(
+        entry =>
+          entry.msg === 'workflow.seat_usage_unknown' && entry.obj.note === 'seat read timed out'
+      )
+    ).toBe(false);
+  });
+
   test('proceeds past the gate when usage is under the default cutoff', async () => {
     setSeatUsageReaderForTests(async () => ({
       claude: reading('claude', 'seven_day', 10),
@@ -213,9 +287,12 @@ describe('executor seat gate', () => {
     setSeatCutoffOverride(null);
     const { result, store } = await runWorkflow();
     expect(result.error ?? '').not.toContain('seat_usage_refused');
-    const events = store.createWorkflowEvent.mock.calls.map(call => call[0] as {
-      event_type: string;
-    });
+    const events = store.createWorkflowEvent.mock.calls.map(
+      call =>
+        call[0] as {
+          event_type: string;
+        }
+    );
     expect(events.some(event => event.event_type === 'workflow_started')).toBe(true);
   });
 });

@@ -55,19 +55,23 @@ async function readBoundSeats(
 ): Promise<Partial<Record<SeatId, SeatReading>>> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<null>(resolve => {
-    timer = setTimeout(() => resolve(null), 12_000);
+    timer = setTimeout(() => {
+      resolve(null);
+    }, 12_000);
   });
+  let note = 'seat read timed out';
   try {
     const result = await Promise.race([getSeatUsageReader()(seatIds), timeout]);
     if (result) return result;
   } catch (err) {
     getLog().warn({ err: err as Error }, 'workflow.seat_usage_unknown');
+    note = err instanceof Error ? err.message : 'seat read failed';
   } finally {
     if (timer) clearTimeout(timer);
   }
   const unknown: Partial<Record<SeatId, SeatReading>> = {};
   for (const seat of seatIds) {
-    unknown[seat] = unknownSeatReading(seat, 'seat read timed out');
+    unknown[seat] = unknownSeatReading(seat, note);
   }
   return unknown;
 }
