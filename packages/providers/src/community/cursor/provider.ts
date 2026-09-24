@@ -221,10 +221,11 @@ function createCursorStreamState(): CursorStreamState {
 }
 
 /**
- * One stream-json line. Bad JSON is recorded and skipped. thinking and
- * tool_call yield an empty thinking chunk: any yield resets the DAG idle
- * timer, and MessageChunk's tool variant requires toolName that cursor-agent
- * nests differently per tool. Their text is not part of the node output.
+ * One stream-json line. Bad JSON is recorded and skipped.
+ * thinking yields its `text` delta (idle-timer reset plus live progress).
+ * tool_call yields an empty thinking chunk: MessageChunk's tool variant
+ * requires toolName, which cursor-agent nests differently per tool.
+ * Neither event's text is appended to the node output (assistant texts only).
  */
 function chunksForStreamLine(line: string, state: CursorStreamState): MessageChunk[] {
   const raw = line.endsWith('\r') ? line.slice(0, -1) : line;
@@ -245,7 +246,11 @@ function chunksForStreamLine(line: string, state: CursorStreamState): MessageChu
     state.finalText += text;
     return [{ type: 'assistant', content: text }];
   }
-  if (event.type === 'thinking' || event.type === 'tool_call') {
+  if (event.type === 'thinking') {
+    const text = typeof event.text === 'string' ? event.text : '';
+    return [{ type: 'thinking', content: text }];
+  }
+  if (event.type === 'tool_call') {
     return [{ type: 'thinking', content: '' }];
   }
   if (event.type === 'system' && event.subtype === 'init') {

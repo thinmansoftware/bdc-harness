@@ -115,6 +115,9 @@ describe('CursorAgentProvider', () => {
     if (last?.type === 'result') {
       expect(last.stopReason).toBe('stop');
       expect(last.servedModelId).toBeNull();
+      expect(last.servedModelMissingReason).toBe(
+        'cursor-agent stream-json output had no system/init model field'
+      );
     }
   });
 
@@ -244,10 +247,12 @@ describe('CursorAgentProvider', () => {
     await Promise.race([done, timeout]);
     expect(exitReleased).toBe(true);
     expect(assistantText(chunks)).toBe('DONE');
-    const rendered = chunks
-      .map(c => (c.type === 'assistant' || c.type === 'thinking' ? c.content : ''))
-      .join('');
-    expect(rendered).not.toContain('Listing the files');
+    const thinking = chunks.flatMap(c => (c.type === 'thinking' ? [c.content] : []));
+    expect(thinking.filter(text => text.length > 0).join('')).toBe(
+      'Listing the files in the worktree now'
+    );
+    expect(thinking.filter(text => text.length === 0)).toHaveLength(2);
+    expect(assistantText(chunks)).not.toContain('Listing the files');
   });
 
   test('error-result-throws', async () => {
@@ -279,6 +284,17 @@ describe('CursorAgentProvider', () => {
     expect(assistantText(chunks)).toBe('kept-text');
   });
 
+  test('success result text is the node output when no assistant text was seen', async () => {
+    const { child } = fakeChild({
+      stdout: streamJson([successResult('only-from-result')]),
+    });
+    const provider = new CursorAgentProvider({ spawn: () => child });
+    const chunks = await collect(provider.sendQuery('hi', '/w'));
+    expect(assistantText(chunks)).toBe('only-from-result');
+    const last = chunks[chunks.length - 1];
+    expect(last?.type).toBe('result');
+  });
+
   test('served-model-recorded', async () => {
     const { child } = fakeChild({
       stdout: streamJson([
@@ -293,6 +309,7 @@ describe('CursorAgentProvider', () => {
     expect(last?.type).toBe('result');
     if (last?.type === 'result') {
       expect(last.servedModelId).toBe('Grok 4.7 256K High');
+      expect(last.servedModelMissingReason).toBeUndefined();
     }
   });
 
