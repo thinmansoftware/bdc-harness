@@ -11,9 +11,14 @@ export const OPENROUTER_XAI_REFUSED_CODE = 'openrouter_xai_refused';
 export const OPENROUTER_XAI_REFUSED_REASON =
   'Grok is reached via provider cursor (grok-4.7-high)';
 
-/** Tool-loop client plus the text-only OpenRouter seats. `grok` is an alias of `openrouter`. */
+/**
+ * Tool-loop client plus the text-only OpenRouter seats.
+ * `grok` is the deprecated alias. It is listed here so a refusal still
+ * fires when the registry alias resolver has not been wired yet.
+ */
 export const OPENROUTER_BACKED_PROVIDER_IDS: readonly string[] = [
   'openrouter',
+  'grok',
   'opr',
   'opr-zero',
   'glm',
@@ -22,7 +27,12 @@ export const OPENROUTER_BACKED_PROVIDER_IDS: readonly string[] = [
 const XAI_MODEL = /(^|\/)x-ai\//i;
 const BARE_GROK_MODEL = /^grok[-.]/i;
 
-let resolveProviderId: (id: string) => string = id => id;
+/** Fail closed for the legacy id even before registration wires the registry resolver. */
+function defaultResolveProviderId(id: string): string {
+  return id === 'grok' ? 'openrouter' : id;
+}
+
+let resolveProviderId: (id: string) => string = defaultResolveProviderId;
 
 /** Wired from provider registration so `grok` resolves to `openrouter`. */
 export function setOpenRouterProviderIdResolver(resolve: (id: string) => string): void {

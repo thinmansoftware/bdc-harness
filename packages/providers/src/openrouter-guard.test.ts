@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { getOpenRouterXaiRefusal } from './openrouter-guard';
+import { getOpenRouterXaiRefusal, setOpenRouterProviderIdResolver } from './openrouter-guard';
 import { registerBuiltinProviders, registerCommunityProviders } from './registry';
 
 const REFUSAL = 'openrouter_xai_refused: Grok is reached via provider cursor (grok-4.7-high)';
@@ -28,6 +28,18 @@ describe('getOpenRouterXaiRefusal', () => {
     ];
     for (const [provider, model] of accepted) {
       expect(getOpenRouterXaiRefusal(provider, model)).toBeNull();
+    }
+  });
+
+  test('refuses grok xAI before the alias resolver is wired', () => {
+    setOpenRouterProviderIdResolver(id => id);
+    try {
+      expect(getOpenRouterXaiRefusal('grok', 'x-ai/grok-4.7')).toBe(REFUSAL);
+      expect(getOpenRouterXaiRefusal('grok', 'grok-4.7')).toBe(REFUSAL);
+      expect(getOpenRouterXaiRefusal('grok', 'deepseek/deepseek-v4.1-flash')).toBeNull();
+    } finally {
+      registerBuiltinProviders();
+      registerCommunityProviders();
     }
   });
 

@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach, mock } from 'bun:test';
+import { describe, expect, test, beforeEach, afterEach, mock, spyOn } from 'bun:test';
 
 const mockCreate = mock(
   async (_body: unknown, _options?: { signal?: AbortSignal }) =>
@@ -29,6 +29,7 @@ import { join } from 'node:path';
 import { GrokAgentProvider } from './provider';
 import { executeGrokTool } from './tools';
 import { registerGrokAgentProvider } from './registration';
+import * as registry from '../../registry';
 import {
   clearRegistry,
   isRegisteredProvider,
@@ -224,6 +225,27 @@ describe('registerGrokAgentProvider', () => {
     const p = getAgentProvider('grok');
     expect(p.getType()).toBe('openrouter');
     expect(getProviderCapabilities('grok').structuredOutput).toBe(true);
+  });
+
+  test('a thrown registration does not latch the idempotency flag', () => {
+    const original = registry.registerProvider;
+    let attempts = 0;
+    const spy = spyOn(registry, 'registerProvider').mockImplementation(entry => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error(`Provider '${entry.id}' is already registered`);
+      }
+      return original(entry);
+    });
+    try {
+      expect(() => registerGrokAgentProvider()).toThrow(/already registered/);
+      registerGrokAgentProvider();
+      expect(attempts).toBe(2);
+      expect(isRegisteredProvider('openrouter')).toBe(true);
+      expect(isRegisteredProvider('grok')).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test('community bootstrap includes grok', () => {

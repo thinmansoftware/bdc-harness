@@ -23,7 +23,6 @@ export function resetGrokAgentProviderRegistration(): void {
 export function registerGrokAgentProvider(): void {
   setOpenRouterProviderIdResolver(resolveProviderId);
   if (grokAgentRegistered) return;
-  grokAgentRegistered = true;
   registerProvider({
     id: 'openrouter',
     displayName: 'OpenRouter agent (open models + local tools)',
@@ -33,4 +32,5 @@ export function registerGrokAgentProvider(): void {
   });
   // @deprecated Legacy id. New YAML and events use `openrouter`.
   registerProviderAlias('grok', 'openrouter');
+  grokAgentRegistered = true;
 }
