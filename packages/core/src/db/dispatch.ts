@@ -22,7 +22,7 @@ export type DispatchMessageStatus = 'queued' | 'claimed' | 'done' | 'failed' | '
 export type DispatchWorkerStatus = 'available' | 'unavailable';
 export type DispatchMessagePriority = 'blocker' | 'normal' | 'heartbeat';
 export type DispatchTaskOutcome = 'succeeded' | 'failed' | 'blocked';
-export type DispatchRouteDisposition = 'unroutable' | 'superseded';
+export type DispatchRouteDisposition = 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced';
 export type DispatchDeliveryMode =
   | 'worker_poll'
   | 'drain_on_start'
@@ -64,6 +64,7 @@ export interface DispatchMessage {
   escalated_sms_at: string | null;
   subject_key: string | null;
   route_disposition: DispatchRouteDisposition | null;
+  route_disposed_at: string | null;
   supersedes_id: string | null;
   repeat_reason: string | null;
 }
@@ -136,7 +137,12 @@ export type DispatchMailboxResult =
         | 'wrong_recipient'
         | 'not_queued'
         | 'address_before_ack'
-        | 'actor_mismatch';
+        | 'actor_mismatch'
+        | 'machine_actor_required'
+        | 'machine_actor_conflict'
+        | 'already_disposed'
+        | 'disposition_invalid'
+        | 'disposition_terminal';
     };
 
 export interface UnroutableQueuedDispatchMessage {
@@ -203,6 +209,7 @@ function normalizeMessage(row: DispatchMessageRow): DispatchMessage {
     addressed_at: normalizeNullableTimestamp(row.addressed_at),
     escalated_tg_at: normalizeNullableTimestamp(row.escalated_tg_at),
     escalated_sms_at: normalizeNullableTimestamp(row.escalated_sms_at),
+    route_disposed_at: normalizeNullableTimestamp(row.route_disposed_at),
   };
 }
 
@@ -721,6 +728,7 @@ export async function listMessages(filters: {
   limit?: number;
   allowBoardAlias?: boolean;
   subject_key?: string;
+  route_disposition?: DispatchRouteDisposition;
 }): Promise<DispatchMessage[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -752,10 +760,17 @@ export async function listMessages(filters: {
     params.push(normalizeDispatchSubjectKey(filters.subject_key));
     clauses.push(`subject_key = $${params.length}`);
   }
+  if (filters.route_disposition !== undefined) {
+    params.push(filters.route_disposition);
+    clauses.push(`route_disposition = $${params.length}`);
+  }
   if (filters.status === 'queued') {
     params.push(nowIso());
     clauses.push(`(not_before IS NULL OR not_before <= $${params.length})`);
     clauses.push('addressed_at IS NULL');
+    if (filters.route_disposition === undefined) {
+      clauses.push('route_disposition IS NULL');
+    }
   }
   params.push(Math.max(1, Math.min(filters.limit ?? 100, 500)));
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1150,6 +1165,13 @@ async function validateMailboxActor(
   message: DispatchMessage,
   principalId: string
 ): Promise<Exclude<DispatchMailboxResult, { ok: true }> | null> {
+  if (
+    message.route_disposition === 'expired' ||
+    message.route_disposition === 'unroutable' ||
+    message.route_disposition === 'superseded'
+  ) {
+    return { ok: false, reason: 'disposition_terminal' };
+  }
   const resolvedRecipient = canonicalizePrincipal(message.resolved_recipient ?? message.recipient);
   if (resolvedRecipient !== principalId) return { ok: false, reason: 'wrong_recipient' };
   const recipientPrincipal = await getDispatchPrincipal(query, resolvedRecipient);
@@ -1162,6 +1184,45 @@ async function validateMailboxActor(
   }
   if (message.status !== 'queued') return { ok: false, reason: 'not_queued' };
   return null;
+}
+
+export async function disposeMessageByMachine(
+  data: { id: string; actor: string; disposition: 'expired' | 'auto_surfaced' },
+  transactionQuery?: DispatchQueryExecutor
+): Promise<DispatchMailboxResult> {
+  if (!data.actor.startsWith('system:')) return { ok: false, reason: 'machine_actor_required' };
+  if (data.disposition !== 'expired' && data.disposition !== 'auto_surfaced') {
+    return { ok: false, reason: 'disposition_invalid' };
+  }
+
+  const execute = async (query: DispatchQueryExecutor): Promise<DispatchMailboxResult> => {
+    const principal = await getDispatchPrincipal(query, canonicalizePrincipal(data.actor));
+    if (principal) return { ok: false, reason: 'machine_actor_conflict' };
+    const message = await readMessageInTransaction(query, data.id);
+    if (!message) return { ok: false, reason: 'not_found' };
+    if (message.route_disposition !== null) return { ok: false, reason: 'already_disposed' };
+
+    const now = nowIso();
+    const update = await query(
+      `UPDATE agent_dispatch_messages
+       SET route_disposition = $2, route_disposed_at = $3
+       WHERE id = $1 AND route_disposition IS NULL`,
+      [data.id, data.disposition, now]
+    );
+    const finalMessage = await readMessageInTransaction(query, data.id);
+    if (!finalMessage) return { ok: false, reason: 'not_found' };
+    if (update.rowCount === 0 || finalMessage.route_disposition !== data.disposition) {
+      return { ok: false, reason: 'already_disposed' };
+    }
+    log.info(
+      { messageId: data.id, actor: data.actor, disposition: data.disposition },
+      'dispatch.message_disposed_by_machine'
+    );
+    return { ok: true, message: finalMessage };
+  };
+
+  if (transactionQuery) return execute(transactionQuery);
+  return withRetriedMailboxTransaction(() => getDatabase().withTransaction(execute));
 }
 
 function isRetriableMailboxTransactionError(error: unknown): boolean {
