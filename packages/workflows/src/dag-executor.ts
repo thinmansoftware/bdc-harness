@@ -9,7 +9,10 @@ import { existsSync } from 'fs';
 import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
+import { fileURLToPath } from 'node:url';
 import {
+  delimiter,
+  dirname,
   isAbsolute,
   join,
   posix as posixPath,
@@ -1695,6 +1698,33 @@ export function substituteNodeOutputRefs(
 // buildSDKHooksFromYAML moved to @archon/providers/src/claude/provider.ts
 // loadMcpConfig moved to @archon/providers/src/claude/provider.ts
 
+/** Directory containing the POSIX `gh` shim that refuses pull-request mutations. */
+function pullRequestMutationShimDir(): string {
+  return dirname(fileURLToPath(new URL('./shims/gh', import.meta.url)));
+}
+
+/**
+ * When deny_pull_request_mutations is set, prepend the shim dir to PATH and
+ * set ARCHON_DENY_PR_MUTATIONS=1. Request env is layered over process.env by
+ * the codex and cursor providers, so PATH must include the rest of the
+ * inherited path or the builder loses every other tool. Codebase envVars are
+ * preserved. Unflagged nodes keep today's env unchanged.
+ */
+function envWithDeniedPullRequestMutations(
+  env: Record<string, string> | undefined,
+  deny: boolean | undefined
+): Record<string, string> | undefined {
+  if (deny !== true) return env;
+  const shimDir = pullRequestMutationShimDir();
+  const inherited = env?.PATH ?? process.env.PATH ?? '';
+  const pathValue = inherited.length > 0 ? `${shimDir}${delimiter}${inherited}` : shimDir;
+  return {
+    ...(env ?? {}),
+    PATH: pathValue,
+    ARCHON_DENY_PR_MUTATIONS: '1',
+  };
+}
+
 /**
  * Resolve per-node provider and model.
  * Node-level overrides take precedence over workflow defaults.
@@ -1914,6 +1944,11 @@ async function resolveNodeProviderAndModel(
   if (config.envVars && Object.keys(config.envVars).length > 0) {
     baseOptions.env = config.envVars;
   }
+  const guardedEnv = envWithDeniedPullRequestMutations(
+    baseOptions.env,
+    node.deny_pull_request_mutations
+  );
+  if (guardedEnv) baseOptions.env = guardedEnv;
   if (effectiveSystemPrompt !== undefined) baseOptions.systemPrompt = effectiveSystemPrompt;
   if (node.maxBudgetUsd !== undefined) baseOptions.maxBudgetUsd = node.maxBudgetUsd;
   const fb = node.fallbackModel ?? workflowLevelOptions.fallbackModel;
@@ -3857,6 +3892,11 @@ function buildLoopNodeOptions(
   if (config.envVars && Object.keys(config.envVars).length > 0) {
     options.env = config.envVars;
   }
+  const guardedEnv = envWithDeniedPullRequestMutations(
+    options.env,
+    node.deny_pull_request_mutations
+  );
+  if (guardedEnv) options.env = guardedEnv;
   if (node.systemPrompt !== undefined) options.systemPrompt = node.systemPrompt;
   options.assistantConfig = config.assistants[provider] ?? {};
   // Pass workflow-level options as nodeConfig so providers can apply them

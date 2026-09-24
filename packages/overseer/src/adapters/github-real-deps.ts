@@ -3,6 +3,7 @@ import { createPrivateKey } from 'node:crypto';
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
+import { listInFlightWoIdsForRepo } from '@archon/core/db/overseer';
 import type {
   DiscoveredPullRequest,
   GitHubClientDeps,
@@ -1681,5 +1682,6 @@ export function createRealGitHubClientDeps(
     },
     approvePullRequest: createRealApprovePullRequest(octokit),
     listOpenPullRequests: createRealListOpenPullRequests(octokit),
+    listInFlightWoIds: input => listInFlightWoIdsForRepo(input),
   };
 }

@@ -238,6 +238,12 @@ export interface MergeCandidateDiscoveryDeps {
   listOpenPullRequests?(
     input: GitHubOpenPullRequestListInput
   ): Promise<readonly DiscoveredPullRequest[]>;
+  /**
+   * WO ids of non-terminal workflow runs for one repo (bdc-xo#2307). Optional:
+   * when absent, discovery logs one warn per tick and skips the in-flight hold.
+   * When the call throws, non-canonical PRs that carry a WO id fail closed.
+   */
+  listInFlightWoIds?(input: { owner: string; repo: string }): Promise<ReadonlySet<string>>;
 }
 
 export interface GitHubClientDeps {
@@ -277,6 +283,11 @@ export interface GitHubClientDeps {
   listOpenPullRequests?(
     input: GitHubOpenPullRequestListInput
   ): Promise<readonly DiscoveredPullRequest[]>;
+  /**
+   * WO ids of non-terminal workflow runs for one repo (bdc-xo#2307). Wired
+   * beside listOpenPullRequests so watchOnce passes it into discovery.
+   */
+  listInFlightWoIds?(input: { owner: string; repo: string }): Promise<ReadonlySet<string>>;
 }
 
 /**
