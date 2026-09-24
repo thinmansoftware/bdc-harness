@@ -7,17 +7,30 @@ import { describe, expect, test } from 'bun:test';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
+  ESCALATION_COMMENT_MAX_PAGES,
+  ESCALATION_TITLE_MAX_CHARS,
   buildEscalationCommentBody,
+  createRealEscalationDeliveryDeps,
   deliverEscalationToIssue,
+  isValidGithubLogin,
   parseGithubThreadRef,
+  parseNextLink,
   parseOwnerLabel,
   resolveEscalateToIssueEnabled,
+  sanitizeExternalText,
   type EscalationIssueComment,
   type EscalationIssueRef,
 } from './escalation-delivery';
 
 const ISSUE: EscalationIssueRef = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 194 };
 const T0 = Date.parse('2026-09-23T12:00:00.000Z');
+
+// Non-ASCII test inputs built from char codes so this source file stays
+// ASCII-only (the formatter rewrites \u escapes into literal characters).
+const E_ACUTE = String.fromCharCode(0xe9);
+const EM_DASH = String.fromCharCode(0x2014);
+const RIGHT_ARROW = String.fromCharCode(0x2192);
+const SNOWMAN = String.fromCharCode(0x2603);
 
 describe('parseGithubThreadRef', () => {
   test('parses gh:owner/repo#N with owner and repo split', () => {
@@ -67,6 +80,60 @@ describe('parseOwnerLabel', () => {
     expect(parseOwnerLabel(null)).toBeNull();
     expect(parseOwnerLabel(undefined)).toBeNull();
   });
+
+  test("rejects 'owner:user @team' (not a single login) -> no mention", () => {
+    expect(parseOwnerLabel(JSON.stringify(['owner:user @team']))).toBeNull();
+  });
+
+  test('rejects an owner label containing a newline -> no mention', () => {
+    expect(parseOwnerLabel(JSON.stringify(['owner:user\n@evil']))).toBeNull();
+    expect(parseOwnerLabel(JSON.stringify(['owner:user\nInjected line']))).toBeNull();
+  });
+
+  test('rejects hyphen-edged, double-hyphen, punctuated, and over-length logins', () => {
+    expect(parseOwnerLabel(JSON.stringify(['owner:-user']))).toBeNull();
+    expect(parseOwnerLabel(JSON.stringify(['owner:user-']))).toBeNull();
+    expect(parseOwnerLabel(JSON.stringify(['owner:us--er']))).toBeNull();
+    expect(parseOwnerLabel(JSON.stringify(['owner:user.name']))).toBeNull();
+    expect(parseOwnerLabel(JSON.stringify([`owner:${'a'.repeat(40)}`]))).toBeNull();
+    expect(parseOwnerLabel(JSON.stringify([`owner:${'a'.repeat(39)}`]))).toBe('a'.repeat(39));
+  });
+
+  test('skips an invalid owner label and takes the first valid one', () => {
+    expect(parseOwnerLabel(JSON.stringify(['owner:user @team', 'owner:major-build']))).toBe(
+      'major-build'
+    );
+  });
+});
+
+describe('isValidGithubLogin', () => {
+  test('accepts single logins and rejects everything else', () => {
+    expect(isValidGithubLogin('a')).toBe(true);
+    expect(isValidGithubLogin('major-build')).toBe(true);
+    expect(isValidGithubLogin('')).toBe(false);
+    expect(isValidGithubLogin('user @team')).toBe(false);
+    expect(isValidGithubLogin('@user')).toBe(false);
+    expect(isValidGithubLogin(null)).toBe(false);
+  });
+});
+
+describe('sanitizeExternalText', () => {
+  test('strips newlines, non-ASCII, @, and angle brackets; collapses whitespace', () => {
+    const raw = `  caf${E_ACUTE} ${EM_DASH} ping @team\n\tnow <!-- x -->  `;
+    expect(sanitizeExternalText(raw, 100)).toBe('caf ping team now !-- x --');
+  });
+
+  test('caps length with a trailing ellipsis', () => {
+    const out = sanitizeExternalText('x'.repeat(500), 50);
+    expect(out).toBe(`${'x'.repeat(47)}...`);
+    expect(out?.length).toBe(50);
+  });
+
+  test('returns null for empty-after-sanitize and non-string input', () => {
+    expect(sanitizeExternalText(`${SNOWMAN}\n@`, 50)).toBeNull();
+    expect(sanitizeExternalText(null, 50)).toBeNull();
+    expect(sanitizeExternalText(undefined, 50)).toBeNull();
+  });
 });
 
 describe('buildEscalationCommentBody', () => {
@@ -104,7 +171,114 @@ describe('buildEscalationCommentBody', () => {
     expect(body).not.toContain('Next step:');
     expect((body.match(/@/g) ?? []).length).toBe(0);
   });
+
+  test('title with non-ASCII and @ is sanitized to printable ASCII with no mention', () => {
+    const body = buildEscalationCommentBody({
+      title: `Caf${E_ACUTE} ${EM_DASH} ping @everyone\nOwner: @attacker`,
+      threadRef: 'gh:thinmansoftware/bdc-harness#194',
+      sinceIso: null,
+      nextAction: `Tell @team ${RIGHT_ARROW} fix it\r\n<!-- taskmaster-escalation -->`,
+      ownerLabelLogin: null,
+      nowMs: T0,
+    });
+    expect(/^[\x20-\x7E\n]*$/.test(body)).toBe(true);
+    expect((body.match(/@/g) ?? []).length).toBe(0);
+    // Exactly one marker (the real one); the injected copy is defanged.
+    expect(body.split(TASKMASTER_ESCALATION_MARKER).length - 1).toBe(1);
+    // The title stays on one line, so it cannot forge an Owner: line.
+    expect(body).toContain('Stuck P0: Caf ping everyone Owner: attacker has no owner');
+    expect(body).toContain('Next step: Tell team fix it !-- taskmaster-escalation --');
+  });
+
+  test('over-long title is capped', () => {
+    const body = buildEscalationCommentBody({
+      title: 'T'.repeat(1000),
+      threadRef: 'gh:thinmansoftware/bdc-harness#194',
+      sinceIso: null,
+      nextAction: null,
+      ownerLabelLogin: null,
+      nowMs: T0,
+    });
+    expect(body).toContain(`${'T'.repeat(ESCALATION_TITLE_MAX_CHARS - 3)}...`);
+    expect(body).not.toContain('T'.repeat(ESCALATION_TITLE_MAX_CHARS));
+  });
+
+  test('a valid owner login from an owner label yields exactly one mention', () => {
+    const body = buildEscalationCommentBody({
+      title: 'WO-HARNESS-EXAMPLE-01',
+      threadRef: 'gh:thinmansoftware/bdc-harness#194',
+      sinceIso: null,
+      nextAction: null,
+      ownerLabelLogin: parseOwnerLabel(JSON.stringify(['wo', 'owner:major-build'])),
+      nowMs: T0,
+    });
+    expect((body.match(/@/g) ?? []).length).toBe(1);
+    expect(body).toContain('Owner: @major-build');
+  });
+
+  test('an invalid ownerLabelLogin passed directly still produces no mention', () => {
+    const body = buildEscalationCommentBody({
+      title: 'x',
+      threadRef: 'gh:thinmansoftware/bdc-harness#194',
+      sinceIso: null,
+      nextAction: null,
+      ownerLabelLogin: 'user @team',
+      nowMs: T0,
+    });
+    expect((body.match(/@/g) ?? []).length).toBe(0);
+    expect(body).not.toContain('Owner:');
+  });
 });
+
+describe('parseNextLink', () => {
+  test('extracts rel="next" and ignores other rels', () => {
+    const header =
+      '<https://api.github.com/repositories/1/issues/2/comments?page=3>; rel="next", ' +
+      '<https://api.github.com/repositories/1/issues/2/comments?page=9>; rel="last"';
+    expect(parseNextLink(header)).toBe(
+      'https://api.github.com/repositories/1/issues/2/comments?page=3'
+    );
+    expect(
+      parseNextLink(
+        '<https://api.github.com/x?page=1>; rel="prev", <https://api.github.com/x?page=9>; rel="last"'
+      )
+    ).toBeNull();
+    expect(parseNextLink(null)).toBeNull();
+  });
+});
+
+/**
+ * Fake GitHub issue-comments endpoint: oldest-first, 100 per page, Link
+ * rel="next" pagination. Deliberately IGNORES `since`, so the tests prove the
+ * pagination alone finds a marker past comment #100.
+ */
+function fakeGithubComments(comments: EscalationIssueComment[]): {
+  fetchImpl: (input: string, init?: RequestInit) => Promise<Response>;
+  gets: string[];
+  posts: string[];
+} {
+  const gets: string[] = [];
+  const posts: string[] = [];
+  const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+    const url = new URL(input);
+    if ((init?.method ?? 'GET') === 'POST') {
+      posts.push(String(init?.body ?? ''));
+      return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+    }
+    gets.push(input);
+    const perPage = Number(url.searchParams.get('per_page') ?? '30');
+    const page = Number(url.searchParams.get('page') ?? '1');
+    const slice = comments.slice((page - 1) * perPage, page * perPage);
+    const headers = new Headers({ 'content-type': 'application/json' });
+    if (page * perPage < comments.length) {
+      const next = new URL(url.toString());
+      next.searchParams.set('page', String(page + 1));
+      headers.set('link', `<${next.toString()}>; rel="next"`);
+    }
+    return new Response(JSON.stringify(slice), { status: 200, headers });
+  };
+  return { fetchImpl, gets, posts };
+}
 
 describe('deliverEscalationToIssue', () => {
   test('no prior marker comment -> posts and returns posted:true', async () => {
@@ -179,5 +353,120 @@ describe('deliverEscalationToIssue', () => {
     );
     expect(result.posted).toBe(true);
     expect(posts).toBe(1);
+  });
+
+  test('passes the cooldown-window start to listIssueComments', async () => {
+    let seenSince: string | undefined;
+    await deliverEscalationToIssue(
+      { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'x' },
+      {
+        listIssueComments: async (_i, sinceIso) => {
+          seenSince = sinceIso;
+          return [];
+        },
+        postIssueComment: async () => {},
+        now: () => new Date(T0),
+      }
+    );
+    expect(seenSince).toBe(new Date(T0 - TASKMASTER_ESCALATION_COOLDOWN_MS).toISOString());
+  });
+});
+
+describe('createRealEscalationDeliveryDeps (fake fetch)', () => {
+  test('>100 comments with the only marker recent (#141 of 150) -> no new comment posted', async () => {
+    const comments: EscalationIssueComment[] = [];
+    for (let i = 0; i < 150; i += 1) {
+      comments.push({
+        body: `human comment ${i}`,
+        created_at: new Date(T0 - (400 - i) * 60 * 60 * 1000).toISOString(),
+      });
+    }
+    comments[140] = {
+      body: `${TASKMASTER_ESCALATION_MARKER}\n\nrecent escalation`,
+      created_at: new Date(T0 - 60 * 60 * 1000).toISOString(),
+    };
+    const fake = fakeGithubComments(comments);
+    const deps = {
+      ...createRealEscalationDeliveryDeps({ fetchImpl: fake.fetchImpl, token: 'test-token' }),
+      now: () => new Date(T0),
+    };
+    const result = await deliverEscalationToIssue(
+      { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'x' },
+      deps
+    );
+    expect(result.posted).toBe(false);
+    expect(fake.posts.length).toBe(0);
+    // Both pages were read, and the first request asked for the cooldown window.
+    expect(fake.gets.length).toBe(2);
+    const first = new URL(fake.gets[0]);
+    expect(first.searchParams.get('per_page')).toBe('100');
+    expect(first.searchParams.get('since')).toBe(
+      new Date(T0 - TASKMASTER_ESCALATION_COOLDOWN_MS).toISOString()
+    );
+  });
+
+  test('>100 comments with no marker -> reads every page and posts exactly once', async () => {
+    const comments: EscalationIssueComment[] = [];
+    for (let i = 0; i < 250; i += 1) {
+      comments.push({ body: `c${i}`, created_at: new Date(T0 - 1000).toISOString() });
+    }
+    const fake = fakeGithubComments(comments);
+    const deps = {
+      ...createRealEscalationDeliveryDeps({ fetchImpl: fake.fetchImpl, token: 'test-token' }),
+      now: () => new Date(T0),
+    };
+    const result = await deliverEscalationToIssue(
+      { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'hello' },
+      deps
+    );
+    expect(result.posted).toBe(true);
+    expect(fake.gets.length).toBe(3);
+    expect(fake.posts).toEqual([JSON.stringify({ body: 'hello' })]);
+  });
+
+  test('refuses to follow a next link off api.github.com (token never leaves)', async () => {
+    const requested: string[] = [];
+    const fetchImpl = async (input: string): Promise<Response> => {
+      requested.push(input);
+      return new Response(JSON.stringify([{ body: 'c', created_at: new Date(T0).toISOString() }]), {
+        status: 200,
+        headers: { link: '<https://evil.example.com/steal?page=2>; rel="next"' },
+      });
+    };
+    const deps = createRealEscalationDeliveryDeps({ fetchImpl, token: 'test-token' });
+    await expect(deps.listIssueComments(ISSUE)).rejects.toThrow(
+      'taskmaster_github_url_not_api_origin'
+    );
+    expect(requested.length).toBe(1);
+  });
+
+  test('fails closed (throws, no post) when the page ceiling is reached', async () => {
+    let gets = 0;
+    let posts = 0;
+    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+      if ((init?.method ?? 'GET') === 'POST') {
+        posts += 1;
+        return new Response('{}', { status: 201 });
+      }
+      gets += 1;
+      const next = new URL(input);
+      next.searchParams.set('page', String(gets + 1));
+      return new Response(JSON.stringify([{ body: 'c', created_at: new Date(T0).toISOString() }]), {
+        status: 200,
+        headers: { link: `<${next.toString()}>; rel="next"` },
+      });
+    };
+    const deps = {
+      ...createRealEscalationDeliveryDeps({ fetchImpl, token: 'test-token' }),
+      now: () => new Date(T0),
+    };
+    await expect(
+      deliverEscalationToIssue(
+        { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'x' },
+        deps
+      )
+    ).rejects.toThrow('taskmaster_github_comment_pages_exceeded');
+    expect(gets).toBe(ESCALATION_COMMENT_MAX_PAGES);
+    expect(posts).toBe(0);
   });
 });
