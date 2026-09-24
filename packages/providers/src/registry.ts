@@ -24,7 +24,7 @@ import {
   registerOprProvider,
   registerOprZeroProvider,
 } from './community/glm/registration';
-import { registerGrokAgentProvider } from './community/grok/registration';
+import { registerGrokAgentProvider, resetGrokAgentProviderRegistration } from './community/grok/registration';
 import { registerCursorAgentProvider } from './community/cursor/registration';
 import { GlmProvider } from './community/glm/provider';
 import { UnknownProviderError } from './errors';
@@ -40,10 +40,32 @@ function getLog(): ReturnType<typeof createLogger> {
 /** Backing store for registered providers. */
 const registry = new Map<string, ProviderRegistration>();
 
+/** Legacy ids that resolve to a real provider. Never listed as their own provider. */
+const aliases = new Map<string, string>();
+
 /**
- * Register a provider. Throws on duplicate registration.
+ * Map a legacy provider id onto an already-registered id.
+ * Throws if `alias` is already a provider id or an alias.
+ */
+export function registerProviderAlias(alias: string, targetId: string): void {
+  if (registry.has(alias) || aliases.has(alias)) {
+    throw new Error(`Provider alias '${alias}' is already registered`);
+  }
+  aliases.set(alias, targetId);
+}
+
+/** Alias to its target id. An unknown or real id is returned unchanged. */
+export function resolveProviderId(id: string): string {
+  return aliases.get(id) ?? id;
+}
+
+/**
+ * Register a provider. Throws on duplicate registration or if the id is an alias.
  */
 export function registerProvider(entry: ProviderRegistration): void {
+  if (aliases.has(entry.id)) {
+    throw new Error(`Provider '${entry.id}' is already registered as an alias`);
+  }
   if (registry.has(entry.id)) {
     throw new Error(`Provider '${entry.id}' is already registered`);
   }
@@ -56,11 +78,12 @@ export function registerProvider(entry: ProviderRegistration): void {
  * @throws UnknownProviderError if not registered
  */
 export function getAgentProvider(id: string): IAgentProvider {
-  const entry = registry.get(id);
+  const resolved = resolveProviderId(id);
+  const entry = registry.get(resolved);
   if (!entry) {
     throw new UnknownProviderError(id, [...registry.keys()]);
   }
-  getLog().debug({ provider: id }, 'provider_selected');
+  getLog().debug({ provider: resolved }, 'provider_selected');
   return entry.factory();
 }
 
@@ -69,7 +92,8 @@ export function getAgentProvider(id: string): IAgentProvider {
  * @throws UnknownProviderError if not registered
  */
 export function getRegistration(id: string): ProviderRegistration {
-  const entry = registry.get(id);
+  const resolved = resolveProviderId(id);
+  const entry = registry.get(resolved);
   if (!entry) {
     throw new UnknownProviderError(id, [...registry.keys()]);
   }
@@ -116,7 +140,7 @@ export function getProviderInfoList(): ProviderInfo[] {
  * Check if a provider is registered.
  */
 export function isRegisteredProvider(id: string): boolean {
-  return registry.has(id);
+  return registry.has(resolveProviderId(id));
 }
 
 /**
@@ -210,4 +234,6 @@ export function registerCommunityProviders(): void {
 /** @internal Test-only -- clears the registry. Not for production use. */
 export function clearRegistry(): void {
   registry.clear();
+  aliases.clear();
+  resetGrokAgentProviderRegistration();
 }

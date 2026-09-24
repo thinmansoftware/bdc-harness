@@ -1,12 +1,13 @@
 /**
- * GrokAgentProvider -- OpenRouter Grok with a LOCAL tool loop in the worktree.
+ * GrokAgentProvider -- OpenRouter chat completions with a LOCAL tool loop.
  *
  * Chat-only GlmProvider/opr cannot implement WOs (no bash/files). This provider
  * calls OpenRouter chat completions with tools, executes tool calls under cwd,
  * and loops until the model stops calling tools or maxTurns is hit.
  *
  * Auth: reuses GLM_API_KEY (OpenRouter key; same as opr).
- * Default model: x-ai/grok-4.5
+ * Model: required. Pass an explicit vendor/model id (for example
+ * deepseek/deepseek-v4.1-flash). xAI ids are refused.
  *
  * Anchor: run 2ef0aa43 -- chat-only Grok claimed COMPLETE with no tools.
  */
@@ -18,32 +19,32 @@ import type {
   SendQueryOptions,
   TokenUsage,
 } from '../../types';
+import { getOpenRouterXaiRefusal } from '../../openrouter-guard';
 import { GROK_AGENT_CAPABILITIES } from './capabilities';
 import { parseGrokAgentConfig } from './config';
 import { executeGrokTool, GROK_AGENT_TOOLS } from './tools';
 
-const DEFAULT_MODEL = 'x-ai/grok-4.5';
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const DEFAULT_MAX_TURNS = 40;
 
 type ChatMessage = OpenAI.Chat.ChatCompletionMessageParam;
 
 export class GrokAgentProvider implements IAgentProvider {
-  private readonly model: string;
+  private readonly model: string | undefined;
   private readonly baseURL: string;
   private readonly maxTurns: number;
   private readonly bashTimeoutMs: number;
 
   constructor(options?: { assistantConfig?: Record<string, unknown> }) {
     const config = parseGrokAgentConfig(options?.assistantConfig ?? {});
-    this.model = config.model ?? DEFAULT_MODEL;
+    this.model = config.model;
     this.baseURL = config.baseURL ?? DEFAULT_BASE_URL;
     this.maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
     this.bashTimeoutMs = config.bashTimeoutMs ?? 120_000;
   }
 
   getType(): string {
-    return 'grok';
+    return 'openrouter';
   }
 
   getCapabilities(): ProviderCapabilities {
@@ -56,15 +57,26 @@ export class GrokAgentProvider implements IAgentProvider {
     _resumeSessionId?: string,
     options?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
+    const resolvedModel = (options?.model ?? this.model ?? '').trim();
+    if (!resolvedModel) {
+      throw new Error(
+        'openrouter_model_required: provider openrouter needs an explicit vendor/model id'
+      );
+    }
+    const refusal = getOpenRouterXaiRefusal('openrouter', resolvedModel);
+    if (refusal) {
+      throw new Error(refusal);
+    }
+
     const apiKey = process.env.GLM_API_KEY || process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
       throw new Error(
-        'GLM_API_KEY or OPENROUTER_API_KEY required for provider:grok ' +
+        'GLM_API_KEY or OPENROUTER_API_KEY required for provider:openrouter ' +
           '(OpenRouter key; same env as opr). Set in archon-app-1 env before firing implement.'
       );
     }
     if (!cwd) {
-      throw new Error('provider:grok requires a non-empty cwd (worktree path)');
+      throw new Error('provider:openrouter requires a non-empty cwd (worktree path)');
     }
 
     const client = new OpenAI({
@@ -75,9 +87,6 @@ export class GrokAgentProvider implements IAgentProvider {
         'X-Title': 'BDC Archon Grok Agent',
       },
     });
-
-    const model = options?.model ?? this.model;
-    const resolvedModel = model.includes('/') ? model : `x-ai/${model}`;
 
     const messages: ChatMessage[] = [];
     const systemParts: string[] = [

@@ -210,12 +210,12 @@ describe('lane registration and war-council-validator pin', () => {
       expect(lane.model?.startsWith('qwen/')).toBe(true);
 
       const planReview = node('plan-review');
-      expect(planReview?.provider, `${file}:plan-review:provider`).toBe('grok');
+      expect(planReview?.provider, `${file}:plan-review:provider`).toBe('openrouter');
       expect(planReview?.model, `${file}:plan-review:model`).toBe('x-ai/grok-4.6');
 
       for (const id of ['implement', 'diff-repair', 'opus-repair', 'apply-suggested-fix']) {
         const executionNode = node(id);
-        expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
+        expect(executionNode?.provider, `${file}:${id}:provider`).toBe('openrouter');
         expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.6');
       }
 
@@ -344,7 +344,7 @@ describe('lane registration and war-council-validator pin', () => {
     const nodes = lane.nodes ?? [];
     const node = (id: string) => nodes.find(candidate => candidate.id === id);
 
-    expect(lane.provider).toBe('grok');
+    expect(lane.provider).toBe('openrouter');
     expect(lane.model).toBe('x-ai/grok-4.6');
     expect(content).not.toContain('provider: claude');
     expect(content).not.toContain('model: claude');
@@ -359,7 +359,7 @@ describe('lane registration and war-council-validator pin', () => {
       'apply-suggested-fix',
     ]) {
       const executionNode = node(id);
-      expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
+      expect(executionNode?.provider, `${file}:${id}:provider`).toBe('openrouter');
       expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.6');
       expect(executionNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }

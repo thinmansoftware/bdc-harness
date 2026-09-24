@@ -219,7 +219,7 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: war-council-architect-opr
     agent: war-council-architect-opr
@@ -338,7 +338,7 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
-    provider: grok
+    provider: openrouter
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     # Claude-free recovery (WO-HARNESS-CLAUDE-FREE-LANE-RECOVERY-01): Qwen authors
@@ -510,7 +510,7 @@ nodes:
     # trial has a self-grading confound (it plans/reviews its own implement output).
     # A PASS here is weaker evidence than a clean trial; a FAIL is still informative.
     # Builder seats require repository write and shell capabilities.
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [capture-run-scope]
@@ -2302,7 +2302,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
@@ -2619,7 +2619,7 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [block-classify]
@@ -2989,7 +2989,7 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     agent: major-build-opr
     effort: xhigh

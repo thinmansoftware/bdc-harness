@@ -14,7 +14,7 @@ import { resolveModelForNode, type ModelOverride } from './model-override';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
-import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
+import { isRegisteredProvider, getRegisteredProviders, resolveProviderId } from '@archon/providers';
 import { classifyError } from './executor-shared';
 import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
 import { resolveEntryLane, DEFAULT_ENGINE_TO_LANE } from './router-dispatcher';
@@ -745,11 +745,14 @@ export async function executeWorkflow(
     modelOverride,
     fallbackModel: 'claude-sonnet-4-5',
   });
-  const resolvedProvider = workflowBinding.provider;
+  // Model resolution above used the id as written (assistants.grok still applies).
+  // Recorded provider ids use the canonical id.
+  const writtenProvider = workflowBinding.provider;
+  const resolvedProvider = resolveProviderId(writtenProvider);
   const resolvedModel = workflowBinding.model;
-  if (!isRegisteredProvider(resolvedProvider)) {
+  if (!isRegisteredProvider(writtenProvider)) {
     throw new Error(
-      `Workflow '${workflow.name}': unknown provider '${resolvedProvider}'. ` +
+      `Workflow '${workflow.name}': unknown provider '${writtenProvider}'. ` +
         `Registered: ${getRegisteredProviders()
           .map(p => p.id)
           .join(', ')}`
@@ -1014,7 +1017,7 @@ export async function executeWorkflow(
 
     const probeDecision = await runFireTimeProbe(deps, {
       workflow: executableWorkflow,
-      workflowProvider: resolvedProvider,
+      workflowProvider: writtenProvider,
       workflowModel: resolvedModel,
       config,
       cwd,
@@ -1229,7 +1232,7 @@ export async function executeWorkflow(
       cwd,
       executableWorkflow,
       workflowRun,
-      resolvedProvider,
+      writtenProvider,
       resolvedModel,
       artifactsDir,
       logDir,

@@ -8,6 +8,8 @@ import {
   getRegisteredProviders,
   getProviderInfoList,
   isRegisteredProvider,
+  registerProviderAlias,
+  resolveProviderId,
   registerBuiltinProviders,
   registerCommunityProviders,
   clearRegistry,
@@ -187,9 +189,9 @@ describe('registry', () => {
       }
     });
 
-    test('declares Pi and Grok as repository execution providers', () => {
+    test('declares Pi and OpenRouter as repository execution providers', () => {
       registerCommunityProviders();
-      for (const id of ['pi', 'grok']) {
+      for (const id of ['pi', 'openrouter']) {
         expect(getProviderCapabilities(id).execution).toEqual({
           text: true,
           repositoryRead: true,
@@ -197,6 +199,20 @@ describe('registry', () => {
           shell: true,
         });
       }
+    });
+
+    test('grok alias resolves to openrouter', () => {
+      registerBuiltinProviders();
+      registerCommunityProviders();
+      expect(isRegisteredProvider('grok')).toBe(true);
+      expect(resolveProviderId('grok')).toBe('openrouter');
+      expect(getAgentProvider('grok').getType()).toBe('openrouter');
+      expect(getRegistration('grok').id).toBe('openrouter');
+      const ids = getProviderInfoList().map(info => info.id);
+      expect(ids.filter(id => id === 'openrouter')).toHaveLength(1);
+      expect(ids).not.toContain('grok');
+      expect(() => registerProviderAlias('grok', 'openrouter')).toThrow();
+      expect(() => registerProvider(makeMockRegistration('grok'))).toThrow();
     });
 
     test('reports missing execution capabilities mechanically', () => {

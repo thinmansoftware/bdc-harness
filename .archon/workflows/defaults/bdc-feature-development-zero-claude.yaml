@@ -3,7 +3,7 @@ description: |
   ZERO PAID-SEAT lane cloned from bdc-feature-development-fusion-cx-qwen. Seat
   roster is identical to that lane except apply-diff-review-final uses Codex via
   OpenRouter instead of the paid-seat reviewer. Plan remains Qwen via OpenRouter;
-  implement + repair remain provider:grok (OpenRouter + local tool loop). Reviews
+  implement + repair remain provider:openrouter (OpenRouter + local tool loop). Reviews
   stay DeepSeek or Codex/OpenRouter, with explicit OpenRouter failover on Codex
   review/tail seats.
   Honest gate label: removing the paid-seat validator/tail seat weakens the gate.
@@ -189,7 +189,7 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: war-council-architect-opr
     depends_on: [checkout-repair-target]
@@ -354,7 +354,7 @@ nodes:
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813  # REVIEWER seat, not builder: qwen (the builder model) is not servable by codex-opr on a ChatGPT account (HTTP 400), and plan-review is a cross-model adversarial REVIEW of qwen's plan -- so it must be a different model anyway (never self-grade). deepseek matches the other review seats (diff-review, opus-rereview). Fixes every fusion-cx-qwen run dying at plan-review 2026-07-11.
     # Codex quota exhaustion routes sideways through the OpenRouter tool-loop provider via node-failover.ts.
-    failover_provider: grok
+    failover_provider: openrouter
     failover_model: deepseek/deepseek-v4-pro-0813
     persona: war-council-architect-opr
     depends_on: [plan]
@@ -499,7 +499,7 @@ nodes:
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
   - id: implement
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [capture-run-scope]
@@ -2022,7 +2022,7 @@ nodes:
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813
     # Codex quota exhaustion routes sideways through the OpenRouter tool-loop provider via node-failover.ts.
-    failover_provider: grok
+    failover_provider: openrouter
     failover_model: deepseek/deepseek-v4-pro-0813
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
@@ -2132,7 +2132,7 @@ nodes:
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading (John 2026-07-07: DeepSeek's strong suit is review, not authoring code; never mark its own qwen-authored homework)
     # Codex quota exhaustion routes sideways through the OpenRouter tool-loop provider via node-failover.ts.
-    failover_provider: grok
+    failover_provider: openrouter
     failover_model: deepseek/deepseek-v4-pro-0813
     agent: opr-adversarial-reviewer
     depends_on: [capture-diff]
@@ -2185,7 +2185,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review]
@@ -2373,7 +2373,7 @@ nodes:
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading -- see diff-review
     # Codex quota exhaustion routes sideways through the OpenRouter tool-loop provider via node-failover.ts.
-    failover_provider: grok
+    failover_provider: openrouter
     failover_model: deepseek/deepseek-v4-pro-0813
     agent: opr-adversarial-reviewer
     depends_on: [capture-diff-final]
@@ -2470,7 +2470,7 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [block-classify]
@@ -2531,7 +2531,7 @@ nodes:
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading -- see diff-review
     # Codex quota exhaustion routes sideways through the OpenRouter tool-loop provider via node-failover.ts.
-    failover_provider: grok
+    failover_provider: openrouter
     failover_model: deepseek/deepseek-v4-pro-0813
     agent: opr-adversarial-reviewer
     depends_on: [classify-opus-repair]
@@ -2827,7 +2827,7 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     agent: overseer-opus
     effort: xhigh
@@ -2867,7 +2867,7 @@ nodes:
     provider: codex-opr
     model: gpt-5.6-sol
     # Codex quota exhaustion routes sideways through the OpenRouter tool-loop provider via node-failover.ts.
-    failover_provider: grok
+    failover_provider: openrouter
     failover_model: deepseek/deepseek-v4-pro-0813
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]

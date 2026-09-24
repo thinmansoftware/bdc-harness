@@ -1,7 +1,7 @@
 name: bdc-feature-development-grok
 description: |
   Dedicated tool-capable Grok lane for feature Work Orders. Grok owns planning,
-  implementation, and repair seats through provider grok with x-ai/grok-4.6.
+  implementation, and repair seats through provider openrouter with x-ai/grok-4.6.
   Every review and judge seat is explicitly pinned to codex-opr so Grok never
   grades its own output. This lane is directly invokable but is intentionally
   absent from the Smart Cauldron ladder and production router mapping.
@@ -16,7 +16,7 @@ run_authority:
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
 # Dedicated Grok execution default. Review nodes override this with codex-opr.
-provider: grok
+provider: openrouter
 model: x-ai/grok-4.6
 
 nodes:
@@ -186,7 +186,7 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: war-council-architect-opr
     agent: war-council-architect-opr
@@ -291,7 +291,7 @@ nodes:
       exit 0
 
   - id: plan
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
@@ -490,7 +490,7 @@ nodes:
   - id: implement
     # Dedicated Grok builder seat. The provider contract supplies repository write
     # and shell capabilities; downstream codex-opr seats independently review it.
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [capture-run-scope]
@@ -2273,7 +2273,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
@@ -2590,7 +2590,7 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     persona: major-build-opr
     depends_on: [block-classify]
@@ -2962,7 +2962,7 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
-    provider: grok
+    provider: openrouter
     model: x-ai/grok-4.6
     agent: major-build-opr
     effort: xhigh

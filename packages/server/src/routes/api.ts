@@ -355,7 +355,12 @@ import {
   providerAttemptsQuerySchema,
   providerAttemptsResponseSchema,
 } from './schemas/provider-attempts.schemas';
-import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
+import {
+  getOpenRouterXaiRefusal,
+  getProviderInfoList,
+  isRegisteredProvider,
+  OPENROUTER_XAI_REFUSED_REASON,
+} from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 import { buildProductionCanarySnapshot } from '../services/canary-snapshot';
 
@@ -2957,6 +2962,52 @@ export function registerApiRoutes(
     }
   }
 
+  function openRouterXaiRefusalForRun(
+    workflow: WorkflowDefinition,
+    modelOverride?: ModelOverride
+  ): string | null {
+    const checks: Array<{ nodeId: string; provider?: string; model?: string }> = [];
+    checks.push({
+      nodeId: 'workflow',
+      provider: modelOverride?.workflow?.provider ?? workflow.provider,
+      model: modelOverride?.workflow?.model ?? workflow.model,
+    });
+    if (workflow.failover_provider && workflow.failover_model) {
+      checks.push({
+        nodeId: 'workflow',
+        provider: workflow.failover_provider,
+        model: workflow.failover_model,
+      });
+    }
+    for (const node of workflow.nodes ?? []) {
+      const nodeOverride = modelOverride?.nodes?.[node.id];
+      const failover = node as { failover_provider?: string; failover_model?: string };
+      checks.push({
+        nodeId: node.id,
+        provider:
+          nodeOverride?.provider ??
+          node.provider ??
+          modelOverride?.workflow?.provider ??
+          workflow.provider,
+        model:
+          nodeOverride?.model ?? node.model ?? modelOverride?.workflow?.model ?? workflow.model,
+      });
+      if (failover.failover_provider && failover.failover_model) {
+        checks.push({
+          nodeId: node.id,
+          provider: failover.failover_provider,
+          model: failover.failover_model,
+        });
+      }
+    }
+    for (const check of checks) {
+      if (getOpenRouterXaiRefusal(check.provider, check.model)) {
+        return `openrouter_xai_refused:${check.nodeId}: ${OPENROUTER_XAI_REFUSED_REASON}`;
+      }
+    }
+    return null;
+  }
+
   async function validateWorkflowRunTarget(
     message: string,
     codebaseId?: string | null,
@@ -3029,6 +3080,10 @@ export function registerApiRoutes(
         valid: false,
         error: `Workflow "${workflowName}" not found. Use GET /api/workflows to list available workflows.`,
       };
+    }
+    const xaiRefusal = openRouterXaiRefusalForRun(workflow, modelOverride);
+    if (xaiRefusal) {
+      return { valid: false, error: xaiRefusal };
     }
     // A branch override requests task-worktree isolation. A workflow that pins
     // `worktree.enabled: false` would run in the live checkout, so honoring the
