@@ -2030,7 +2030,7 @@ nodes:
   - id: war-council-validator
     # Claude judge (codex-lane pin); never the Cursor builder model.
     provider: claude
-    model: claude-opus-5
+    model: claude-opus-5-5
     persona: captain-ci-validator-fable
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
