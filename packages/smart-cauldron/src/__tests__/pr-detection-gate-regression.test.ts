@@ -36,7 +36,7 @@
 
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 
-import { pollForTerminal, ghPrListForBranchDefault } from '../poll.js';
+import { pollForTerminal, ghPrListForBranchDefault, checkPrMergeableDefault } from '../poll.js';
 import { judgeGate } from '../judge.js';
 import { runCascade } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
@@ -104,6 +104,22 @@ const openPrEventNonGithubUrl = {
   event_type: 'node_completed',
   step_name: 'open-pr-if-needed',
   data: { node_output: 'see https://gitlab.com/acme/repo/-/merge_requests/7' },
+};
+
+// A pr-step event whose node_output carries PR_URL= pointing at a NON-github
+// host -- the PR_URL= path must reject it (it is not a github pull URL).
+const openPrEventPrUrlNonGithub = {
+  event_type: 'node_completed',
+  step_name: 'open-pr-if-needed',
+  data: { node_output: 'PR_URL=https://gitlab.com/acme/repo/-/merge_requests/7' },
+};
+
+// A pr-step event whose node_output carries PR_URL= pointing at a github URL
+// that is NOT a pull (issues) -- the PR_URL= path must reject it too.
+const openPrEventPrUrlNonPull = {
+  event_type: 'node_completed',
+  step_name: 'open-pr-if-needed',
+  data: { node_output: 'PR_URL=https://github.com/thinmansoftware/bdc-harness/issues/898' },
 };
 
 // A github pull URL that lives in a node WITHOUT "pr" in its step name -- the
@@ -321,6 +337,48 @@ describe('PR detection reads node_output, accepts bare URLs, requires --repo (is
     expect(lookupCalls).toBe(0); // no unique_branch => lookup never reached
   });
 
+  test('PR_URL= carrying a non-github host is NOT taken', async () => {
+    globalThis.fetch = (async () =>
+      completedRun([openPrEventPrUrlNonGithub])) as unknown as typeof fetch;
+
+    const result = await pollForTerminal({
+      runId: 'run-2288',
+      apiBaseUrl: 'http://archon.test',
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      prRetryAttempts: 1,
+      prRetryDelayMs: 1,
+      prBranchLookupAttempts: 1,
+      prBranchLookupDelayMs: 1,
+      repo: 'thinmansoftware/bdc-harness',
+      ghPrListForBranch: async () => null,
+    });
+
+    // PR_URL=https://gitlab.com/... must be rejected by the anchored pattern.
+    expect(result.prUrl).toBeNull();
+  });
+
+  test('PR_URL= carrying a github non-pull (issues) URL is NOT taken', async () => {
+    globalThis.fetch = (async () =>
+      completedRun([openPrEventPrUrlNonPull])) as unknown as typeof fetch;
+
+    const result = await pollForTerminal({
+      runId: 'run-2288',
+      apiBaseUrl: 'http://archon.test',
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      prRetryAttempts: 1,
+      prRetryDelayMs: 1,
+      prBranchLookupAttempts: 1,
+      prBranchLookupDelayMs: 1,
+      repo: 'thinmansoftware/bdc-harness',
+      ghPrListForBranch: async () => null,
+    });
+
+    // PR_URL=https://github.com/<owner>/<repo>/issues/<n> is not a pull URL.
+    expect(result.prUrl).toBeNull();
+  });
+
   test('default branch lookup calls gh with --repo <owner>/<repo> in argv', async () => {
     let capturedArgs: readonly string[] = [];
     const fakeExec = (async (_cmd: string, argv: string[]) => {
@@ -376,6 +434,56 @@ describe('PR detection reads node_output, accepts bare URLs, requires --repo (is
         String(c[0]).includes('skipping branch-lookup fallback: no repo available')
       )
     ).toBe(true);
+    logSpy.mockRestore();
+  });
+
+  test('ghPrListForBranchDefault logs the first stderr line (not Error.message) on failure', async () => {
+    // A promisified execFile rejection carries the child's stderr; Error.message
+    // is only the generic "Command failed: ..." envelope. The log must surface
+    // the real gh diagnostic.
+    const err = Object.assign(new Error('Command failed: gh pr list ...'), {
+      stderr: 'gh: Not Found (HTTP 404)\nsecond line should not appear',
+      stdout: '',
+    });
+    const failingExec = (async () => {
+      throw err;
+    }) as unknown as Parameters<typeof ghPrListForBranchDefault>[2];
+
+    const logSpy = spyOn(console, 'log');
+    const url = await ghPrListForBranchDefault(UNIQUE_BRANCH, REPO, failingExec);
+
+    expect(url).toBeNull();
+    const logged = logSpy.mock.calls.map(c => String(c[0]));
+    expect(logged.some(l => l.includes('gh: Not Found (HTTP 404)'))).toBe(true);
+    // The generic envelope must NOT be what gets surfaced.
+    expect(logged.some(l => l.includes('Command failed'))).toBe(false);
+    // Only the FIRST stderr line is logged.
+    expect(logged.some(l => l.includes('second line should not appear'))).toBe(false);
+    logSpy.mockRestore();
+  });
+
+  test('checkPrMergeableDefault logs the first stderr line (not Error.message) on failure', async () => {
+    const err = Object.assign(new Error('Command failed: gh pr view ...'), {
+      stderr: 'gh: Could not resolve to a PullRequest (HTTP 404)\ntrailing detail',
+      stdout: '',
+    });
+    const failingExec = (async () => {
+      throw err;
+    }) as unknown as Parameters<typeof checkPrMergeableDefault>[1];
+
+    const logSpy = spyOn(console, 'log');
+    const mergeable = await checkPrMergeableDefault(
+      'https://github.com/thinmansoftware/bdc-harness/pull/898',
+      failingExec
+    );
+
+    expect(mergeable).toBeNull();
+    const logged = logSpy.mock.calls.map(c => String(c[0]));
+    expect(logged.some(l => l.includes('gh: Could not resolve to a PullRequest (HTTP 404)'))).toBe(
+      true
+    );
+    expect(logged.some(l => l.includes('Command failed'))).toBe(false);
+    expect(logged.some(l => l.includes('trailing detail'))).toBe(false);
     logSpy.mockRestore();
   });
 });

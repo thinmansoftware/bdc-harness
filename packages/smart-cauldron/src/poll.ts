@@ -12,6 +12,24 @@ import type { PollResult } from './types.js';
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Extract the first non-empty line of a failed command's stderr for logging.
+ *
+ * A promisified execFile rejection carries the child's `stderr` (the actual
+ * diagnostic) as a property; `Error.message` is only the generic
+ * "Command failed: ..." envelope. When a gh invocation fails we want the real
+ * first stderr line (e.g. "gh: Not Found (HTTP 404)"), falling back to the
+ * message envelope only when stderr is empty.
+ */
+function firstStderrLine(err: unknown): string {
+  const e = err as { stderr?: unknown; message?: unknown };
+  const stderr = typeof e.stderr === 'string' ? e.stderr : '';
+  const firstStderr = stderr.split('\n').find(line => line.trim().length > 0);
+  if (firstStderr) return firstStderr.trim();
+  const message = typeof e.message === 'string' ? e.message : String(err);
+  return message.split('\n')[0];
+}
+
 // escalated is terminal (gate-rejection re-label) -- include for status robustness;
 // smart-cauldron still treats it like a non-success terminal for climb decisions via
 // the returned terminalStatus string.
@@ -477,7 +495,11 @@ function extractValidatorVerdict(
 function extractPrUrl(
   events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
 ): string | null {
-  const prUrlPattern = /PR_URL=(https?:\/\/\S+)/i;
+  // PR_URL= must carry a real GitHub pull URL of the form
+  // https://github.com/<owner>/<repo>/pull/<n>. A bare https?://... accepted any
+  // host/path (e.g. PR_URL=https://gitlab.com/... or a github issues URL), which
+  // would false-positive the gate; anchor to the github pull shape instead.
+  const prUrlPattern = /PR_URL=(https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+)/i;
 
   for (const ev of events) {
     if (ev.event_type !== 'node_completed') continue;
@@ -620,7 +642,7 @@ export async function ghPrListForBranchDefault(
     return url.length > 0 ? url : null;
   } catch (err) {
     console.log(
-      `[smart-cauldron/poll] gh pr list --repo ${repo} --head ${branch} failed: ${(err as Error).message.split('\n')[0]}`
+      `[smart-cauldron/poll] gh pr list --repo ${repo} --head ${branch} failed: ${firstStderrLine(err)}`
     );
     return null;
   }
@@ -637,11 +659,20 @@ function extractServedModelId(metadata: Record<string, unknown>): string | null 
 
 /**
  * Check if a PR is mergeable via the gh CLI.
- * Returns null if gh is unavailable or returns non-zero.
+ * Returns null if gh is unavailable or returns non-zero. On failure the gh
+ * stderr first line is logged (not swallowed) so an environment failure is
+ * visible.
+ *
+ * `exec` is an injectable seam (test-only): production always uses the module's
+ * real execFileAsync. Exported so tests can assert the failure-log contract
+ * without resorting to process-global mock.module().
  */
-async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
+export async function checkPrMergeableDefault(
+  prUrl: string,
+  exec: typeof execFileAsync = execFileAsync
+): Promise<boolean | null> {
   try {
-    const { stdout } = await execFileAsync('gh', [
+    const { stdout } = await exec('gh', [
       'pr',
       'view',
       prUrl,
@@ -655,9 +686,7 @@ async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
     if (val === 'CONFLICTING' || val === 'BLOCKED') return false;
     return null;
   } catch (err) {
-    console.log(
-      `[smart-cauldron/poll] gh pr view ${prUrl} failed: ${(err as Error).message.split('\n')[0]}`
-    );
+    console.log(`[smart-cauldron/poll] gh pr view ${prUrl} failed: ${firstStderrLine(err)}`);
     return null;
   }
 }
