@@ -1,10 +1,27 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { mkdtemp, rm, writeFile, mkdir, utimes, rename } from 'fs/promises';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import {
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readlink,
+  rename,
+  rm,
+  symlink,
+  utimes,
+  writeFile,
+} from 'fs/promises';
+import * as fsPromises from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createMockLogger } from '../test/mocks/logger';
-import type { WorktreeSweepEnvironment, WorktreeSweepRun } from './worktree-sweep';
+import type {
+  MoveDirAcrossDevicesDeps,
+  WorktreeSweepEnvironment,
+  WorktreeSweepRun,
+} from './worktree-sweep';
 
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
@@ -48,7 +65,8 @@ mock.module('../db/sessions', () => ({
   getActiveSession: mockGetActiveSession,
 }));
 
-import { sweepTerminalWorkflowWorktrees } from './worktree-sweep';
+import { moveDirAcrossDevices, sweepTerminalWorkflowWorktrees } from './worktree-sweep';
+
 
 async function createWorktree(
   root: string,
@@ -873,5 +891,160 @@ describe('sweepTerminalWorkflowWorktrees', () => {
       }),
       'worktree_sweep_disk_report'
     );
+  });
+});
+
+function exdevError(): NodeJS.ErrnoException {
+  const error = new Error('EXDEV: cross-device link not permitted') as NodeJS.ErrnoException;
+  error.code = 'EXDEV';
+  return error;
+}
+
+describe('moveDirAcrossDevices', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'archon-move-dir-'));
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  test('same-device rename moves the directory and does not copy', async () => {
+    const src = join(root, 'src');
+    const dst = join(root, 'dst');
+    await mkdir(src);
+    await writeFile(join(src, 'a.txt'), 'alpha');
+    const cpSpy = mock(async () => undefined);
+
+    await moveDirAcrossDevices(src, dst, {
+      rename,
+      cp: cpSpy,
+      rm,
+    });
+
+    expect(await readFile(join(dst, 'a.txt'), 'utf8')).toBe('alpha');
+    expect(existsSync(src)).toBe(false);
+    expect(cpSpy).toHaveBeenCalledTimes(0);
+  });
+
+  test('EXDEV falls back to copy then delete and keeps symlinks', async () => {
+    const src = join(root, 'src');
+    const dst = join(root, 'dst');
+    await mkdir(join(src, 'sub'), { recursive: true });
+    await writeFile(join(src, 'a.txt'), 'alpha');
+    await writeFile(join(src, 'sub', 'b.txt'), 'beta');
+    await symlink('a.txt', join(src, 'link'));
+
+    const deps: MoveDirAcrossDevicesDeps = {
+      rename: async () => {
+        throw exdevError();
+      },
+      cp,
+      rm,
+    };
+
+    await moveDirAcrossDevices(src, dst, deps);
+
+    expect(await readFile(join(dst, 'a.txt'), 'utf8')).toBe('alpha');
+    expect(await readFile(join(dst, 'sub', 'b.txt'), 'utf8')).toBe('beta');
+    expect((await lstat(join(dst, 'link'))).isSymbolicLink()).toBe(true);
+    expect(await readlink(join(dst, 'link'))).toBe('a.txt');
+    expect(existsSync(src)).toBe(false);
+  });
+
+  test('rethrows non-EXDEV rename errors and cleans a partial copy', async () => {
+    const src = join(root, 'src');
+    const dst = join(root, 'dst');
+    await mkdir(src);
+    await writeFile(join(src, 'a.txt'), 'alpha');
+    const cpSpy = mock(async () => undefined);
+    const denied = Object.assign(new Error('EACCES'), { code: 'EACCES' });
+
+    await expect(
+      moveDirAcrossDevices(src, dst, {
+        rename: async () => {
+          throw denied;
+        },
+        cp: cpSpy,
+        rm,
+      })
+    ).rejects.toBe(denied);
+    expect(cpSpy).not.toHaveBeenCalled();
+    expect(existsSync(join(src, 'a.txt'))).toBe(true);
+
+    const partialDst = join(root, 'partial-dst');
+    await expect(
+      moveDirAcrossDevices(src, partialDst, {
+        rename: async () => {
+          throw exdevError();
+        },
+        cp: async (_from, to) => {
+          await mkdir(to, { recursive: true });
+          await writeFile(join(to, 'partial.txt'), 'x');
+          throw new Error('disk full');
+        },
+        rm,
+      })
+    ).rejects.toThrow('disk full');
+    expect(existsSync(partialDst)).toBe(false);
+    expect(await readFile(join(src, 'a.txt'), 'utf8')).toBe('alpha');
+  });
+});
+
+describe('sweepTerminalWorkflowWorktrees EXDEV fallback', () => {
+  let workspacesRoot: string;
+  let quarantineRoot: string;
+
+  beforeEach(async () => {
+    workspacesRoot = await mkdtemp(join(tmpdir(), 'archon-worktree-sweep-'));
+    quarantineRoot = await mkdtemp(join(tmpdir(), 'archon-worktree-quarantine-'));
+    mockDestroy.mockClear();
+    mockListWorkflowRunsWithWorkingPath.mockClear();
+    mockListWorkflowRunsWithWorkingPath.mockResolvedValue([]);
+    mockListActiveEnvironmentsForSweep.mockClear();
+    mockListActiveEnvironmentsForSweep.mockResolvedValue([]);
+    mockGetConversationsUsingEnv.mockClear();
+    mockGetConversationsUsingEnv.mockResolvedValue([]);
+    mockGetActiveSession.mockClear();
+    mockGetActiveSession.mockResolvedValue(null);
+    mockUpdateEnvStatus.mockClear();
+    mockLogger.warn.mockClear();
+    mockLogger.info.mockClear();
+    mockLogger.error.mockClear();
+  });
+
+  afterEach(async () => {
+    await rm(workspacesRoot, { recursive: true, force: true });
+    await rm(quarantineRoot, { recursive: true, force: true });
+  });
+
+  test('quarantines through the default move when rename returns EXDEV', async () => {
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-exdev');
+    await setMtime(worktreePath, '2026-07-01T00:00:00Z');
+    const renameSpy = spyOn(fsPromises, 'rename').mockImplementation(async () => {
+      throw exdevError();
+    });
+
+    try {
+      const report = await sweepTerminalWorkflowWorktrees({
+        workspacesRoot,
+        quarantineRoot,
+        now: new Date('2026-07-13T00:00:00Z'),
+        orphanAgeMs: 7 * 24 * 60 * 60 * 1000,
+        getCanonicalRepoPathFn: async () => '/repos/owner/repo',
+        pruneWorktree: async () => undefined,
+      });
+
+      const quarantinePath = join(quarantineRoot, '2026-07-13', 'owner__repo__thread-exdev');
+      expect(renameSpy).toHaveBeenCalled();
+      expect(report.errors).toEqual([]);
+      expect(report.quarantined).toEqual([quarantinePath]);
+      expect(existsSync(worktreePath)).toBe(false);
+      expect(await readFile(join(quarantinePath, 'artifact.txt'), 'utf8')).toBe('debug artifact');
+    } finally {
+      renameSpy.mockRestore();
+    }
   });
 });

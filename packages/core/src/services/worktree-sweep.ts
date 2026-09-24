@@ -1,4 +1,4 @@
-import { mkdir, readdir, rename, rm, stat } from 'fs/promises';
+import { cp, mkdir, readdir, rename, rm, stat } from 'fs/promises';
 import { basename, dirname, join, relative, resolve } from 'path';
 import {
   execFileAsync,
@@ -366,6 +366,65 @@ async function defaultPruneWorktree(repoPath: string): Promise<void> {
   await execFileAsync('git', ['-C', repoPath, 'worktree', 'prune'], { timeout: 30000 });
 }
 
+/** Options passed to fs.cp when rename(2) fails with EXDEV (cross-mount move). */
+const MOVE_DIR_CP_OPTIONS = {
+  recursive: true,
+  preserveTimestamps: true,
+  verbatimSymlinks: true,
+  errorOnExist: true,
+  force: false,
+} as const;
+
+export interface MoveDirAcrossDevicesDeps {
+  rename: (from: string, to: string) => Promise<void>;
+  cp: (
+    from: string,
+    to: string,
+    options: {
+      recursive: true;
+      preserveTimestamps: true;
+      verbatimSymlinks: true;
+      errorOnExist: true;
+      force: false;
+    }
+  ) => Promise<void>;
+  rm: (path: string, options: { recursive: true; force: true }) => Promise<void>;
+}
+
+/**
+ * Move a directory. rename(2) is used first. Between two mount points rename
+ * returns EXDEV even when both mounts are the same filesystem type, so that
+ * case copies then deletes the source. Any other rename error is rethrown.
+ * If the copy fails, the partial destination is removed and the source is left
+ * in place.
+ *
+ * Default deps read the fs/promises bindings at call time so tests can spy on
+ * rename without injecting moveDir into the sweep.
+ */
+export async function moveDirAcrossDevices(
+  from: string,
+  to: string,
+  deps: MoveDirAcrossDevicesDeps = { rename, cp, rm }
+): Promise<void> {
+  try {
+    await deps.rename(from, to);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EXDEV') {
+      throw error;
+    }
+  }
+
+  try {
+    await deps.cp(from, to, MOVE_DIR_CP_OPTIONS);
+  } catch (cpError) {
+    await deps.rm(to, { recursive: true, force: true });
+    throw cpError;
+  }
+
+  await deps.rm(from, { recursive: true, force: true });
+}
+
 export async function sweepTerminalWorkflowWorktrees(
   opts: WorktreeSweepOptions = {}
 ): Promise<WorktreeSweepReport> {
@@ -387,7 +446,7 @@ export async function sweepTerminalWorkflowWorktrees(
   const getCanonicalRepoPathFn =
     opts.getCanonicalRepoPathFn ??
     ((path: string): Promise<string> => getCanonicalRepoPath(toWorktreePath(path)));
-  const moveDir = opts.moveDir ?? rename;
+  const moveDir = opts.moveDir ?? moveDirAcrossDevices;
   const pruneWorktree = opts.pruneWorktree ?? defaultPruneWorktree;
   const removeQuarantineDir =
     opts.removeQuarantineDir ??
