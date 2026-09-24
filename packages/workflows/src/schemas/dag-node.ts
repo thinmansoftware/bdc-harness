@@ -765,6 +765,13 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.failover_agent !== undefined ? { failover_agent: data.failover_agent } : {}),
       ...(data.agent !== undefined ? { agent: data.agent } : {}),
       ...(data.persona !== undefined ? { persona: data.persona } : {}),
+      // Lives on dagNodeBaseSchema, so CommandNode/PromptNode/LoopNode types
+      // include it. Copy it here or .transform() drops it and the gh shim
+      // never arms. Bash and script nodes omit aiOnly on purpose: they open
+      // PRs only when this flag is left unset.
+      ...(data.deny_pull_request_mutations !== undefined
+        ? { deny_pull_request_mutations: data.deny_pull_request_mutations }
+        : {}),
     };
 
     if (data.command !== undefined && data.command.trim().length > 0) {

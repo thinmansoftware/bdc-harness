@@ -56,7 +56,14 @@ import {
   resolveBunRuntimeExecutable,
 } from './dag-executor';
 import { loadMcpConfig } from '@archon/providers/claude/provider';
-import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
+import {
+  dagNodeSchema,
+  type DagNode,
+  type BashNode,
+  type ScriptNode,
+  type NodeOutput,
+  type WorkflowRun,
+} from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
 import { parseWorkflow } from './loader';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
@@ -9002,8 +9009,12 @@ describe('executeDagWorkflow -- env var injection', () => {
       {
         name: 'dag-pr-guard',
         nodes: [
-          { id: 'guarded', command: 'my-cmd', deny_pull_request_mutations: true },
-          { id: 'plain', command: 'my-cmd' },
+          dagNodeSchema.parse({
+            id: 'guarded',
+            command: 'my-cmd',
+            deny_pull_request_mutations: true,
+          }),
+          dagNodeSchema.parse({ id: 'plain', command: 'my-cmd' }),
         ],
       },
       workflowRun,
