@@ -1,4 +1,4 @@
-import { beforeEach, describe, test, expect, mock } from 'bun:test';
+import { beforeEach, afterEach, describe, test, expect, mock } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -30,6 +30,16 @@ const realFsPromises = createRequire(import.meta.url)(
 mock.module('fs/promises', () => ({ ...realFsPromises }));
 import { validationErrorHook } from './openapi-defaults';
 import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
+import {
+  getOpenRouterXaiRefusal,
+  OPENROUTER_XAI_REFUSED_REASON,
+  setOpenRouterProviderIdResolver,
+} from '../../../providers/src/openrouter-guard';
+import {
+  registerBuiltinProviders,
+  registerCommunityProviders,
+  resolveProviderId,
+} from '../../../providers/src/registry';
 
 /** Test app factory: includes defaultHook to format validation errors as { error: string }. */
 function createTestApp(): OpenAPIHono {
@@ -61,8 +71,9 @@ const mockGetLoaderErrors = mock(() => [
   },
 ]);
 
+const mockHandleMessage = mock(async () => {});
 mock.module('@archon/core', () => ({
-  handleMessage: mock(async () => {}),
+  handleMessage: mockHandleMessage,
   getDatabaseType: () => 'sqlite',
   loadConfig: mockLoadConfig,
   getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
@@ -160,8 +171,13 @@ mock.module('@archon/providers/auth-refresh/dispatch-gate', () => ({
   checkCodexDispatchGate: mockCheckCodexDispatchGate,
 }));
 mock.module('@archon/providers', () => ({
-  isRegisteredProvider: (provider: string) => ['claude', 'codex'].includes(provider),
+  isRegisteredProvider: (provider: string) =>
+    ['claude', 'codex', 'cursor', 'openrouter', 'grok', 'opr', 'opr-zero', 'glm', 'pi'].includes(
+      provider
+    ),
   getProviderInfoList: () => [],
+  getOpenRouterXaiRefusal,
+  OPENROUTER_XAI_REFUSED_REASON,
 }));
 
 const mockListCodebases = mock(async () => [{ default_cwd: '/tmp/project' }]);
@@ -961,5 +977,152 @@ describe('GET /api/commands', () => {
     const archonAssist = body.commands.find(c => c.name === 'archon-assist');
     expect(archonAssist).toBeDefined();
     expect(archonAssist?.source).toBe('bundled');
+  });
+});
+
+const XAI_REFUSAL = 'Grok is reached via provider cursor (grok-4.7-high)';
+
+describe('POST /api/workflows/:name/run openrouter xAI guard', () => {
+  registerBuiltinProviders();
+  registerCommunityProviders();
+  setOpenRouterProviderIdResolver(resolveProviderId);
+
+  const defaultDiscovery = async () => ({
+    workflows: [
+      makeTestWorkflowWithSource({ name: 'deploy', description: 'Deploy app' }, 'bundled'),
+    ],
+    errors: [
+      { filename: '/tmp/.archon/workflows/bad.md', error: 'invalid', errorType: 'parse_error' },
+    ],
+  });
+
+  beforeEach(() => {
+    mockHandleMessage.mockClear();
+  });
+
+  afterEach(() => {
+    mockDiscoverWorkflows.mockImplementation(defaultDiscovery);
+  });
+
+  const request = (body: unknown) =>
+    createRunTestApp().request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  function useWorkflow(overrides: Parameters<typeof makeTestWorkflowWithSource>[0]): void {
+    mockDiscoverWorkflows.mockImplementation(async () => ({
+      workflows: [makeTestWorkflowWithSource({ name: 'deploy', ...overrides }, 'bundled')],
+      errors: [],
+    }));
+  }
+
+  test('refuses an OpenRouter xAI modelOverride at /run', async () => {
+    useWorkflow({
+      nodes: [{ id: 'implement', prompt: 'do the work', provider: 'claude', model: 'sonnet' }],
+    });
+    for (const provider of ['openrouter', 'grok', 'opr']) {
+      mockHandleMessage.mockClear();
+      const response = await request({
+        conversationId: `refuse-${provider}`,
+        message: 'run it',
+        modelOverride: { nodes: { implement: { provider, model: 'x-ai/grok-4.7' } } },
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        accepted: false,
+        error: `openrouter_xai_refused:implement: ${XAI_REFUSAL}`,
+      });
+      expect(mockHandleMessage).not.toHaveBeenCalled();
+    }
+  });
+
+  test('accepts an open model on openrouter and grok on cursor', async () => {
+    useWorkflow({
+      nodes: [{ id: 'implement', prompt: 'do the work', provider: 'claude', model: 'sonnet' }],
+    });
+    const overrides = [
+      { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash' },
+      { provider: 'cursor', model: 'grok-4.7-high' },
+    ];
+    for (const binding of overrides) {
+      mockHandleMessage.mockClear();
+      const response = await request({
+        conversationId: `allow-${binding.provider}`,
+        message: 'run it',
+        modelOverride: { nodes: { implement: binding } },
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ accepted: true, status: 'completed' });
+      expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  test('refuses a YAML-pinned xAI binding and accepts an overriding open model', async () => {
+    useWorkflow({
+      nodes: [
+        {
+          id: 'build',
+          prompt: 'build',
+          provider: 'openrouter',
+          model: 'x-ai/grok-4.6',
+        },
+      ],
+    });
+    const pinned = await request({ conversationId: 'yaml-a', message: 'run it' });
+    expect(pinned.status).toBe(400);
+    const pinnedBody = (await pinned.json()) as { accepted: boolean; error: string };
+    expect(pinnedBody.accepted).toBe(false);
+    expect(pinnedBody.error.startsWith('openrouter_xai_refused:build:')).toBe(true);
+
+    useWorkflow({
+      nodes: [
+        {
+          id: 'build',
+          prompt: 'build',
+          provider: 'claude',
+          model: 'sonnet',
+          failover_provider: 'grok',
+          failover_model: 'x-ai/grok-4.6',
+        },
+      ],
+    });
+    const failover = await request({ conversationId: 'yaml-b', message: 'run it' });
+    expect(failover.status).toBe(400);
+    const failoverBody = (await failover.json()) as { error: string };
+    expect(failoverBody.error.startsWith('openrouter_xai_refused:build:')).toBe(true);
+
+    useWorkflow({
+      provider: 'grok',
+      model: 'x-ai/grok-4.6',
+      nodes: [{ id: 'build', prompt: 'build' }],
+    });
+    const root = await request({ conversationId: 'yaml-c', message: 'run it' });
+    expect(root.status).toBe(400);
+    const rootBody = (await root.json()) as { error: string };
+    expect(rootBody.error.startsWith('openrouter_xai_refused:')).toBe(true);
+
+    useWorkflow({
+      nodes: [
+        {
+          id: 'build',
+          prompt: 'build',
+          provider: 'openrouter',
+          model: 'x-ai/grok-4.6',
+        },
+      ],
+    });
+    mockHandleMessage.mockClear();
+    const overridden = await request({
+      conversationId: 'yaml-a-override',
+      message: 'run it',
+      modelOverride: {
+        nodes: { build: { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash' } },
+      },
+    });
+    expect(overridden.status).toBe(200);
+    expect(await overridden.json()).toEqual({ accepted: true, status: 'completed' });
+    expect(mockHandleMessage).toHaveBeenCalledTimes(1);
   });
 });

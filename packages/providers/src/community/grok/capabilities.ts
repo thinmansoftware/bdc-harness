@@ -7,7 +7,7 @@ import type { ProviderCapabilities } from '../../types';
  * worktree cwd (bash, read/write/edit files). That is the minimum required for
  * implement loops on fusion lanes when Codex/Claude seats are exhausted.
  *
- * Anchor: run 2ef0aa43 -- chat-only opr + x-ai/grok-4.5 reported
+ * Anchor: run 2ef0aa43 -- chat-only opr reported
  * "no shell/filesystem tools" and never wrote files.
  */
 export const GROK_AGENT_CAPABILITIES: ProviderCapabilities = {

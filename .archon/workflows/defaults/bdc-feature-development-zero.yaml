@@ -6,8 +6,8 @@ description: |
   of DIFFERENT open models attacking each other's work -- cross-model
   diversity is the quality mechanism that replaces the always-Claude judge:
     plan (architect seat)        = Qwen qwen/qwen3-coder-next (root default)
-    plan-review (attack seat)    = Grok x-ai/grok-4.6
-    implement + repairs (builder)= Grok x-ai/grok-4.6
+    plan-review (attack seat)    = Grok grok-4.7-high (via provider cursor)
+    implement + repairs (builder)= Grok grok-4.7-high (via provider cursor)
     diff reviews (attack seats)  = DeepSeek deepseek-v4-pro-0813
     war-council-validator (judge)= DeepSeek via OpenRouter (dual-cap; no Codex required)
   No model ever grades its own output; NO node consumes Claude usage. All
@@ -200,8 +200,8 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    provider: grok
-    model: x-ai/grok-4.6
+    provider: cursor
+    model: grok-4.7-high
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     depends_on: [checkout-repair-target]
@@ -324,13 +324,16 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
-    provider: grok
+    provider: cursor
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     # Claude-free recovery (WO-HARNESS-CLAUDE-FREE-LANE-RECOVERY-01): Qwen authors
-    # the plan; Grok 4.5 holds the blocking plan-review seat. DeepSeek remains the
-    # independent post-implementation reviewer. Never self-graded.
-    model: x-ai/grok-4.6
+    # the plan; Grok holds the blocking plan-review seat, reached via provider
+    # cursor per John's 2026-09-23/24 ruling (Grok 4.7 only on Cursor until
+    # 10/13; the OpenRouter guard permanently refuses x-ai/* on OpenRouter-backed
+    # providers). DeepSeek remains the independent post-implementation reviewer.
+    # Never self-graded.
+    model: grok-4.7-high
     depends_on: [plan]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -501,8 +504,8 @@ nodes:
     # A PASS here is weaker evidence than a clean trial; a FAIL is still informative.
     # Chat-only opr-zero cannot write files or run tests. Route the builder seat
     # through the proven OpenRouter local-tool-loop provider instead.
-    provider: grok
-    model: x-ai/grok-4.6
+    provider: cursor
+    model: grok-4.7-high
     persona: major-build-opr
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: builder node on OpenRouter. If
     # OpenRouter throttles/drops (429/timeout/5xx/connection), fall SIDEWAYS to
@@ -2248,8 +2251,8 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: grok
-    model: x-ai/grok-4.6
+    provider: cursor
+    model: grok-4.7-high
     persona: major-build-opr
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: repair-tier builder node on the
     # OpenRouter local-tool-loop provider. Fail sideways to Codex once
@@ -2554,8 +2557,8 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: grok
-    model: x-ai/grok-4.6
+    provider: cursor
+    model: grok-4.7-high
     persona: major-build-opr
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: last-chance repair builder on
     # OpenRouter local-tool-loop provider. Same rationale as `implement`/`diff-repair` above.
@@ -2928,8 +2931,8 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
-    provider: grok
-    model: x-ai/grok-4.6
+    provider: cursor
+    model: grok-4.7-high
     agent: major-build-opr
     effort: xhigh
     context: fresh

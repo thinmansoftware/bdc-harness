@@ -207,13 +207,13 @@ describe('lane registration and war-council-validator pin', () => {
       expect(lane.model?.startsWith('qwen/')).toBe(true);
 
       const planReview = node('plan-review');
-      expect(planReview?.provider, `${file}:plan-review:provider`).toBe('grok');
-      expect(planReview?.model, `${file}:plan-review:model`).toBe('x-ai/grok-4.6');
+      expect(planReview?.provider, `${file}:plan-review:provider`).toBe('cursor');
+      expect(planReview?.model, `${file}:plan-review:model`).toBe('grok-4.7-high');
 
       for (const id of ['implement', 'diff-repair', 'opus-repair', 'apply-suggested-fix']) {
         const executionNode = node(id);
-        expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
-        expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.6');
+        expect(executionNode?.provider, `${file}:${id}:provider`).toBe('cursor');
+        expect(executionNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
       }
 
       expect(node('apply-suggested-fix')?.agent, `${file}:apply-suggested-fix:agent`).toBe(
@@ -410,8 +410,8 @@ describe('lane registration and war-council-validator pin', () => {
     const nodes = lane.nodes ?? [];
     const node = (id: string) => nodes.find(candidate => candidate.id === id);
 
-    expect(lane.provider).toBe('grok');
-    expect(lane.model).toBe('x-ai/grok-4.6');
+    expect(lane.provider).toBe('cursor');
+    expect(lane.model).toBe('grok-4.7-high');
     expect(content).not.toContain('provider: claude');
     expect(content).not.toContain('model: claude');
     expect(content).not.toContain('agent: overseer-opus');
@@ -425,8 +425,8 @@ describe('lane registration and war-council-validator pin', () => {
       'apply-suggested-fix',
     ]) {
       const executionNode = node(id);
-      expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
-      expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.6');
+      expect(executionNode?.provider, `${file}:${id}:provider`).toBe('cursor');
+      expect(executionNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
       expect(executionNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }
 
@@ -441,7 +441,7 @@ describe('lane registration and war-council-validator pin', () => {
     ]) {
       const reviewNode = node(id);
       expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-opr');
-      expect(reviewNode?.model, `${file}:${id}:model`).not.toBe('x-ai/grok-4.6');
+      expect(reviewNode?.model, `${file}:${id}:model`).not.toBe('grok-4.7-high');
       expect(reviewNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }
   });

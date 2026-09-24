@@ -6,7 +6,7 @@ description: |
   provider, node, edge, and bash block is identical to that template. Canary
   status: DISPATCHABLE but NOT ladder-wired -- earns a roster seat only after John
   reviews canary results (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01, 2026-07-20).
-  Plan on Kimi via OpenRouter; implement + repair on provider:grok (OpenRouter +
+  Plan on Kimi via OpenRouter; implement + repair on provider:openrouter (OpenRouter +
   local tool loop) when Codex/Claude seats are exhausted (John 2026-07-09). Diff
   review stays DeepSeek (cross-model, not self-grading). Root provider is
   OpenRouter so bare tails never fall through to Anthropic SDK.
@@ -21,7 +21,7 @@ run_authority:
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
 provider: opr  # root: bare AI tails use OpenRouter, not Codex/Claude (Codex exhausted 2026-07-09)
-model: x-ai/grok-4.6  # Grok substitute for prior root gpt-5.5/Codex default
+model: moonshotai/kimi-k2.7-code  # matches lane builder model; x-ai is refused on OpenRouter-backed providers (WO-HARNESS-OPENROUTER-PROVIDER-GUARD-01)
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -190,8 +190,8 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    provider: grok
-    model: x-ai/grok-4.6
+    provider: openrouter
+    model: moonshotai/kimi-k2.7-code
     persona: war-council-architect-opr
     depends_on: [checkout-repair-target]
     task_class: clerical
@@ -306,7 +306,7 @@ nodes:
     # diff-review*, war-council-validator) are intentionally NOT wired -- a gate
     # that silently switches models undermines gate integrity (spec doctrine).
     failover_provider: opr
-    failover_model: x-ai/grok-4.6
+    failover_model: moonshotai/kimi-k2.7-code
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -498,8 +498,8 @@ nodes:
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
   - id: implement
-    provider: grok
-    model: x-ai/grok-4.6
+    provider: openrouter
+    model: moonshotai/kimi-k2.7-code
     persona: major-build-opr
     depends_on: [capture-run-scope]
     trigger_rule: all_done
@@ -2181,8 +2181,8 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: grok
-    model: x-ai/grok-4.6
+    provider: openrouter
+    model: moonshotai/kimi-k2.7-code
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
@@ -2471,8 +2471,8 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: grok
-    model: x-ai/grok-4.6
+    provider: openrouter
+    model: moonshotai/kimi-k2.7-code
     persona: major-build-opr
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
@@ -2843,8 +2843,8 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
-    provider: grok
-    model: x-ai/grok-4.6
+    provider: openrouter
+    model: moonshotai/kimi-k2.7-code
     agent: overseer-opus
     effort: xhigh
     context: fresh
