@@ -99,19 +99,19 @@ describe('substituteWorkflowVariables', () => {
   // WO-MATRIX-M1-DSPRO-01 -- whole-identifier variable substitution
   it('Test 1: leaves prefix-longer variables BASE_BRANCH_OVERRIDE and BASE_BRANCH_PR intact', () => {
     const { prompt } = substituteWorkflowVariables(
-      'Override: X. PR: Y',
+      'Override: $BASE_BRANCH_OVERRIDE. PR: $BASE_BRANCH_PR',
       'run-1',
       'msg',
       '/tmp',
       'dev',
       'docs/'
     );
-    expect(prompt).toBe('Override: X. PR: Y');
+    expect(prompt).toBe('Override: $BASE_BRANCH_OVERRIDE. PR: $BASE_BRANCH_PR');
   });
 
   it('Test 2: substitutes exact BASE_BRANCH even when followed by non-identifier chars', () => {
     const { prompt } = substituteWorkflowVariables(
-      'BASE_BRANCH BASE_BRANCH/x BASE_BRANCH. BASE_BRANCH)',
+      '$BASE_BRANCH $BASE_BRANCH/x $BASE_BRANCH. $BASE_BRANCH)',
       'run-1',
       'msg',
       '/tmp',
@@ -124,6 +124,7 @@ describe('substituteWorkflowVariables', () => {
   it('Test 3: bounds every non-brace variable to whole identifiers', () => {
     const cases = [
       { name: 'WORKFLOW_ID', value: 'run-1' },
+      { name: 'BASE_BRANCH', value: 'dev' },
       { name: 'USER_MESSAGE', value: 'user-msg' },
       { name: 'ARGUMENTS', value: 'user-msg' },
       { name: 'ARTIFACTS_DIR', value: '/tmp/artifacts' },
@@ -169,19 +170,19 @@ describe('substituteWorkflowVariables', () => {
 
   it('Test 4: empty baseBranch does not throw for prefix-longer BASE_BRANCH_OVERRIDE only', () => {
     const { prompt } = substituteWorkflowVariables(
-      'BASE_BRANCH_OVERRIDE_ONLY',
+      '$BASE_BRANCH_OVERRIDE_ONLY',
       'run-1',
       'msg',
       '/tmp',
       '',
       'docs/'
     );
-    expect(prompt).toBe('BASE_BRANCH_OVERRIDE_ONLY');
+    expect(prompt).toBe('$BASE_BRANCH_OVERRIDE_ONLY');
   });
 
   it('Test 4: empty baseBranch still throws for a real BASE_BRANCH reference', () => {
     expect(() =>
-      substituteWorkflowVariables('BASE_BRANCH', 'run-1', 'msg', '/tmp', '', 'docs/')
+      substituteWorkflowVariables('$BASE_BRANCH', 'run-1', 'msg', '/tmp', '', 'docs/')
     ).toThrow('No base branch could be resolved');
   });
 
