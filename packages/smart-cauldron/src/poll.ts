@@ -475,7 +475,7 @@ function extractEventText(data: Record<string, unknown>): string {
  * Extract PR URL from node_completed events.
  *
  * Looks for node with step_name matching "open-pr" or containing "pr".
- * Parses an explicit PR_URL= value first, then a bare trailing GitHub pull URL.
+ * Parses an explicit PR_URL= value first, then a bare GitHub pull URL.
  */
 function extractPrUrl(
   events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
@@ -492,9 +492,7 @@ function extractPrUrl(
     if (match?.[1]) return match[1];
 
     // Also check for raw GitHub PR URL in output
-    const rawMatch = /(?:^|\n)\s*(https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+)\s*$/.exec(
-      output
-    );
+    const rawMatch = /(https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+)/.exec(output);
     if (rawMatch?.[1]) return rawMatch[1];
   }
 

@@ -150,6 +150,46 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
     expect(result.prUrl).toBe('https://github.com/thinmansoftware/bdc-harness/pull/898');
   });
 
+  test('reads a bare GitHub pull URL followed by another output line', async () => {
+    const url = 'https://github.com/thinmansoftware/bdc-harness/pull/898';
+    globalThis.fetch = (async () =>
+      completedRun([
+        {
+          event_type: 'node_completed',
+          step_name: 'open-pr-if-needed',
+          data: { node_output: `${url}\nDone.` },
+        },
+      ])) as unknown as typeof fetch;
+
+    const result = await pollForTerminal({
+      runId: 'run-node-output-bare-with-trailing-line',
+      apiBaseUrl: 'http://archon.test',
+      checkPrMergeable: async () => true,
+    });
+
+    expect(result.prUrl).toBe(url);
+  });
+
+  test('ignores a non-GitHub URL assigned to PR_URL', async () => {
+    globalThis.fetch = (async () =>
+      completedRun([
+        {
+          event_type: 'node_completed',
+          step_name: 'open-pr-if-needed',
+          data: { node_output: 'PR_URL=https://gitlab.com/owner/repo/-/merge_requests/1' },
+        },
+      ])) as unknown as typeof fetch;
+
+    const result = await pollForTerminal({
+      runId: 'run-node-output-explicit-non-github',
+      apiBaseUrl: 'http://archon.test',
+      prRetryAttempts: 0,
+      ghPrListForBranch: async () => null,
+    });
+
+    expect(result.prUrl).toBeNull();
+  });
+
   test('ignores non-GitHub URLs and GitHub pull URLs from non-PR nodes', async () => {
     globalThis.fetch = (async () =>
       completedRun([
