@@ -92,7 +92,25 @@ mock.module('@archon/core/db/conversations', () => ({
 }));
 
 mock.module('@archon/core/db/isolation-environments', () => ({}));
-mock.module('@archon/core/db/workflows', () => ({}));
+class CauldronDrainingError extends Error {
+  readonly code = 'cauldron_draining' as const;
+  constructor() {
+    super('cauldron_draining');
+    this.name = 'CauldronDrainingError';
+  }
+}
+const mockGetCauldronDrainState = mock(async () => ({
+  mode: 'normal' as const,
+  activeLeaseCount: 0,
+  activeRunCount: 0,
+  activeRunIds: [] as string[],
+  drained: false,
+  updatedAt: null as string | null,
+}));
+mock.module('@archon/core/db/workflows', () => ({
+  getCauldronDrainState: mockGetCauldronDrainState,
+  CauldronDrainingError,
+}));
 mock.module('@archon/core/db/workflow-events', () => ({}));
 const mockAddMessage = mock(async (_convId: string, _role: string, _content: string) => ({
   id: 'msg-uuid-1',
@@ -351,6 +369,49 @@ describe('POST /api/conversations with message (atomic create+send)', () => {
     expect(body.conversationId).toBe('web-test-abc');
     expect(body.id).toBe('internal-uuid-123');
     expect(body.dispatched).toBe(true);
+  });
+
+  test('maps a post-check drain race to 503', async () => {
+    mockHandleMessage.mockImplementationOnce(async () => {
+      throw new CauldronDrainingError();
+    });
+    mockGetCauldronDrainState.mockReset();
+    mockGetCauldronDrainState
+      .mockResolvedValueOnce({
+        mode: 'normal',
+        activeLeaseCount: 0,
+        activeRunCount: 0,
+        activeRunIds: [],
+        drained: false,
+        updatedAt: null,
+      })
+      .mockResolvedValueOnce({
+        mode: 'draining',
+        activeLeaseCount: 2,
+        activeRunCount: 2,
+        activeRunIds: ['run-race'],
+        drained: false,
+        updatedAt: '2026-09-24T00:00:00.000Z',
+      });
+    const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+    registerApiRoutes(app, mockWebAdapter, mockLockManager);
+    const response = await app.request('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hello' }),
+    });
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { code: string; detail: string };
+    expect(body.code).toBe('cauldron_draining');
+    expect(body.detail).toBe('active_leases=2 active_runs=2');
+    mockGetCauldronDrainState.mockResolvedValue({
+      mode: 'normal',
+      activeLeaseCount: 0,
+      activeRunCount: 0,
+      activeRunIds: [],
+      drained: false,
+      updatedAt: null,
+    });
   });
 
   test('persists user message during atomic creation', async () => {

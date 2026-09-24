@@ -2855,6 +2855,23 @@ describe('WO-HARNESS-REBUILD-DRAIN-MODE-01 drain create and recreateSafe', () =>
         mode: 'draining',
         clearOnBoot: false,
       });
+      await expect(
+        setCauldronDrainMode({
+          mode: 'draining',
+          actor: 'operator',
+          reason: 'upgrade incident freeze to rebuild scope',
+          updatedAt: '2026-09-24T02:00:00.000Z',
+          clearOnBoot: true,
+        })
+      ).resolves.toEqual({ changed: true, mode: 'draining' });
+      await expect(getCauldronDrainState()).resolves.toMatchObject({
+        mode: 'draining',
+        clearOnBoot: true,
+      });
+      const events = await sqlite.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM remote_agent_cauldron_control_events'
+      );
+      expect(events.rows[0]?.count).toBe(1);
     } finally {
       await sqlite.close();
     }

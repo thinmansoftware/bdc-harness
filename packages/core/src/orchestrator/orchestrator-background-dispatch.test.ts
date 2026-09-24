@@ -378,7 +378,9 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
   test('orchestrator_precreate_does_not_swallow_drain', async () => {
     mockCreateWorkflowRun.mockImplementation(() => Promise.reject(new CauldronDrainingError()));
     const ctx = makeCtx();
-    await dispatchBackgroundWorkflow(ctx as never, makeWorkflow());
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toBeInstanceOf(
+      CauldronDrainingError
+    );
     expect(mockExecuteWorkflow).not.toHaveBeenCalled();
     const sent = (ctx.platform as MockPlatformAdapter).sendMessage.mock.calls
       .map(call => String(call[1]))

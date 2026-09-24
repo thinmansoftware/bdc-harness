@@ -56,6 +56,6 @@ export const drainDispatchErrorSchema = z
   .object({
     error: z.string(),
     detail: z.string().optional(),
-    code: z.literal('cauldron_draining').optional(),
+    code: z.literal('cauldron_draining'),
   })
   .openapi('DrainDispatchError');

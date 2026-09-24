@@ -3111,6 +3111,7 @@ export function registerApiRoutes(
           ...extraContext,
         });
       } catch (error) {
+        if (error instanceof workflowDb.CauldronDrainingError) throw error;
         getLog().error({ err: error, conversationId }, 'handle_message_failed');
         try {
           await webAdapter.emitSSE(
@@ -5917,6 +5918,10 @@ export function registerApiRoutes(
       const resumePromise = resumeFrontierTier(record, {
         token,
         onAdmission: r => resolveAdmission?.(r),
+        assertDispatchAllowed: async () => {
+          const drain = await workflowDb.getCauldronDrainState();
+          if (drain.mode === 'draining') throw new workflowDb.CauldronDrainingError();
+        },
       });
       void resumePromise.catch((error: unknown) => {
         getLog().error(
@@ -5956,7 +5961,15 @@ export function registerApiRoutes(
       });
     } catch (error) {
       const draining = await mapCauldronDrainingError(c, error);
-      if (draining) return draining;
+      if (draining) {
+        await releaseFrontierClaim(cascadeId).catch((releaseError: unknown) => {
+          getLog().error(
+            { err: releaseError, cascadeId },
+            'frontier_approval_drain_claim_release_failed'
+          );
+        });
+        return draining;
+      }
       getLog().error({ err: error, cascadeId }, 'frontier_approval_approve_failed');
       return apiError(c, 500, 'Failed to approve frontier climb');
     }

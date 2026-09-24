@@ -172,7 +172,10 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
   }
 
   if (!fireResponse.ok) {
-    const raw = await fireResponse.text().catch(() => '');
+    const raw = await fireResponse
+      .clone()
+      .text()
+      .catch(() => '');
     let drainRefused = false;
     if (fireResponse.status === 503) {
       try {
@@ -186,7 +189,7 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
       ok: false,
       runId: null,
       conversationId: null,
-      infraError: `HTTP ${fireResponse.status}: ${raw.slice(0, 200)}`,
+      infraError: `HTTP ${fireResponse.status}: ${await responseSummary(fireResponse)}`,
       drainRefused,
     };
   }

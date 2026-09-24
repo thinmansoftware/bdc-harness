@@ -150,6 +150,12 @@ export interface ResumeFrontierOptions {
   deps?: CascadeDeps;
   /** Admission callback passthrough (endpoint returns after the resumed record is durable). */
   onAdmission?: RunCascadeOptions['onAdmission'];
+  /**
+   * Called before runCascade. The HTTP approve route uses this to re-check
+   * drain after the claim and throw CauldronDrainingError so the route can
+   * answer 503. A throw here happens before onAdmission.
+   */
+  assertDispatchAllowed?: () => Promise<void>;
 }
 
 /**
@@ -193,6 +199,8 @@ export async function resumeFrontierTier(
     );
   }
 
+  if (opts.assertDispatchAllowed) await opts.assertDispatchAllowed();
+
   // Stable id for the resumed cascade so the back-reference is deterministic and
   // the resumed fire is itself idempotent under replay (dispatchId).
   const resumeCascadeId = randomUUID();
@@ -216,7 +224,9 @@ export async function resumeFrontierTier(
   // actually fired. A 'blocked' result means nothing fired (WO lock held by a
   // live duplicate) -- leaving the record pending lets a retry succeed once the
   // duplicate clears, instead of stranding it 'approved' with no fire.
-  if (result.status !== 'blocked') {
+  if (result.status === 'drain-deferred') {
+    await releaseFrontierClaim(record.cascadeId, outDir);
+  } else if (result.status !== 'blocked') {
     await annotateResolution(record, 'approved', outDir, { resumeCascadeId });
   }
 

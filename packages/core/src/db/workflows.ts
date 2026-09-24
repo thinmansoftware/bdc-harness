@@ -1042,11 +1042,16 @@ export async function setCauldronDrainMode(data: {
   const clearOnBoot = data.mode === 'normal' ? 0 : data.clearOnBoot ? 1 : 0;
   return db.withTransaction(async query => {
     const lockSuffix = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
-    const current = await query<{ mode: CauldronDrainMode }>(
-      `SELECT mode FROM remote_agent_cauldron_control WHERE id = 1${lockSuffix}`
-    );
+    const current = await query<{
+      mode: CauldronDrainMode;
+      clear_on_boot: number | boolean | null;
+    }>(`SELECT mode, clear_on_boot FROM remote_agent_cauldron_control WHERE id = 1${lockSuffix}`);
     const currentMode = current.rows[0]?.mode ?? 'normal';
-    if (currentMode === data.mode) return { changed: false, mode: data.mode };
+    const currentClearOnBoot = numericCount(current.rows[0]?.clear_on_boot) === 1 ? 1 : 0;
+    if (currentMode === data.mode && currentClearOnBoot === clearOnBoot) {
+      return { changed: false, mode: data.mode };
+    }
+    const modeChanged = currentMode !== data.mode;
     await query(
       `INSERT INTO remote_agent_cauldron_control (id, mode, updated_at, updated_by, clear_on_boot)
        VALUES (1, $1, $2, $3, $4)
@@ -1057,12 +1062,14 @@ export async function setCauldronDrainMode(data: {
          clear_on_boot = EXCLUDED.clear_on_boot`,
       [data.mode, data.updatedAt, data.actor, clearOnBoot]
     );
-    await query(
-      `INSERT INTO remote_agent_cauldron_control_events
-       (from_mode, to_mode, actor, reason, created_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [currentMode, data.mode, data.actor, data.reason, data.updatedAt]
-    );
+    if (modeChanged) {
+      await query(
+        `INSERT INTO remote_agent_cauldron_control_events
+         (from_mode, to_mode, actor, reason, created_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [currentMode, data.mode, data.actor, data.reason, data.updatedAt]
+      );
+    }
     return { changed: true, mode: data.mode };
   });
 }
