@@ -52,6 +52,7 @@ export function fakeDeps(
   closes: number[];
   actions: ReconcileActionRecord[];
   warnings: string[];
+  warningFields: Record<string, unknown>[];
   infos: string[];
 } {
   const comments: string[] = [];
@@ -59,6 +60,7 @@ export function fakeDeps(
   const closes: number[] = [];
   const actions: ReconcileActionRecord[] = [];
   const warnings: string[] = [];
+  const warningFields: Record<string, unknown>[] = [];
   const infos: string[] = [];
   return {
     comments,
@@ -66,6 +68,7 @@ export function fakeDeps(
     closes,
     actions,
     warnings,
+    warningFields,
     infos,
     readCursor: mock(async () => null),
     now: () => new Date('2026-07-17T12:00:00Z'),
@@ -93,8 +96,9 @@ export function fakeDeps(
       actions.push(record);
     }),
     log: {
-      warn: (_fields, message) => {
+      warn: (fields, message) => {
         warnings.push(message);
+        warningFields.push(fields);
       },
       info: (_fields, message) => {
         infos.push(message);
@@ -236,6 +240,88 @@ describe('reconcile', () => {
     expect(deps.actions).toEqual([]);
   });
 
+  test('403 with x-ratelimit-remaining 0 defers with classified fields and does not throw', async () => {
+    const deps = fakeDeps({
+      searchError: Object.assign(new Error('Forbidden'), {
+        status: 403,
+        response: { headers: { 'x-ratelimit-remaining': '0' } },
+      }),
+    });
+    deps.githubIdentity = 'pat';
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result).toEqual({ scanned: 0, closed: 0, skipped: true });
+    expect(deps.warnings).toEqual(['overseer.reconcile.rate_limit_skip']);
+    expect(deps.warnings).not.toContain('overseer.reconcile.iteration_failed_isolated');
+    const fields = deps.warningFields[0];
+    expect(fields).toMatchObject({
+      identity: 'pat',
+      operation: 'searchMergedPullRequests',
+      rateLimitRemaining: '0',
+      source: 'default',
+      kind: 'primary',
+    });
+    expect(typeof fields?.retryAfterMs).toBe('number');
+    expect(fields?.retryAfter).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(deps.findTrackerIssueByStem).not.toHaveBeenCalled();
+    expect(deps.closes).toEqual([]);
+  });
+
+  test('classified rate limit from listPullRequestFiles defers instead of failing open', async () => {
+    const deps = fakeDeps();
+    deps.githubIdentity = 'app';
+    deps.listPullRequestFiles = async () => {
+      throw Object.assign(new Error('Forbidden'), {
+        status: 403,
+        response: { headers: { 'x-ratelimit-remaining': '0' } },
+      });
+    };
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result).toEqual({ scanned: 1, closed: 0, skipped: true });
+    expect(deps.warnings).toContain('overseer.reconcile.rate_limit_skip');
+    expect(deps.warnings).not.toContain('overseer.reconcile.file_list_failed_leaving_tracker_open');
+    expect(deps.closes).toEqual([]);
+    expect(deps.warningFields[0]).toMatchObject({
+      identity: 'app',
+      operation: 'listPullRequestFiles',
+      rateLimitRemaining: '0',
+      kind: 'primary',
+    });
+  });
+
+  test('classified rate limit from addTrackerEvidenceComment defers and keeps prior counts', async () => {
+    const deps = fakeDeps();
+    deps.githubIdentity = 'app';
+    deps.addTrackerEvidenceComment = async () => {
+      throw Object.assign(new Error('Forbidden'), {
+        status: 403,
+        response: { headers: { 'x-ratelimit-remaining': '0' } },
+      });
+    };
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result).toEqual({ scanned: 1, closed: 0, skipped: true });
+    expect(deps.closes).toEqual([]);
+    expect(deps.warningFields.at(-1)).toMatchObject({
+      identity: 'app',
+      operation: 'addTrackerEvidenceComment',
+      kind: 'primary',
+    });
+  });
+
+  test('non-rate-limit evidence comment failure still throws', async () => {
+    const deps = fakeDeps();
+    deps.addTrackerEvidenceComment = async () => {
+      throw new Error('boom');
+    };
+
+    await expect(runReconcileOnce({ deps })).rejects.toThrow('boom');
+  });
+
   test('tracker already closed no-ops with no duplicate comment', async () => {
     const deps = fakeDeps({ tracker: trackerIssue('closed') });
 
@@ -246,5 +332,78 @@ describe('reconcile', () => {
     expect(deps.labels).toEqual([]);
     expect(deps.closes).toEqual([]);
     expect(deps.actions).toEqual([]);
+  });
+});
+
+interface AuthProbeResult {
+  ok: boolean;
+  error?: string;
+  constructions: {
+    hasAuthStrategy: boolean;
+    authStrategyName: string | null;
+    appId: string | null;
+    installationId: string | null;
+    authIsString: boolean;
+  }[];
+  logs: { message: string; identity?: string; operation?: string; rateLimitRemaining?: string }[];
+  missingCredentials: boolean;
+}
+
+function runAuthProbe(mode: 'app-and-pat' | 'pat-only' | 'app-only'): AuthProbeResult {
+  const probe = new URL('./fixtures/reconcile-auth-probe.ts', import.meta.url);
+  const child = Bun.spawnSync([process.execPath, probe.pathname, mode], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: process.env,
+  });
+  const stdout = child.stdout.toString();
+  const line = stdout
+    .trim()
+    .split('\n')
+    .filter(row => row.startsWith('{'))
+    .at(-1);
+  if (!line) {
+    throw new Error(
+      `auth probe produced no JSON (exit ${child.exitCode}): ${child.stderr.toString()}\n${stdout}`
+    );
+  }
+  return JSON.parse(line) as AuthProbeResult;
+}
+
+describe('reconcile default client auth', () => {
+  test('App and PAT configured: client uses App auth and logs identity app', () => {
+    const result = runAuthProbe('app-and-pat');
+    expect(result.ok).toBe(true);
+    expect(result.missingCredentials).toBe(false);
+    expect(result.constructions.length).toBeGreaterThan(0);
+    expect(result.constructions[0]).toMatchObject({
+      hasAuthStrategy: true,
+      authStrategyName: 'createAppAuth',
+      appId: '4574893',
+      installationId: '153295654',
+      authIsString: false,
+    });
+    expect(result.constructions.some(item => item.authIsString)).toBe(false);
+    expect(result.logs.some(entry => entry.identity === 'app')).toBe(true);
+  });
+
+  test('App vars absent and PAT present: client falls back to PAT and logs identity pat', () => {
+    const result = runAuthProbe('pat-only');
+    expect(result.ok).toBe(true);
+    expect(result.missingCredentials).toBe(false);
+    expect(result.constructions[0]).toMatchObject({
+      hasAuthStrategy: false,
+      authIsString: true,
+    });
+    expect(result.logs.some(entry => entry.identity === 'pat')).toBe(true);
+  });
+
+  test('App configured with no PAT: default deps construct a client instead of the missing-credentials stub', () => {
+    const result = runAuthProbe('app-only');
+    expect(result.ok).toBe(true);
+    expect(result.missingCredentials).toBe(false);
+    expect(result.constructions.length).toBeGreaterThan(0);
+    expect(result.constructions[0]?.hasAuthStrategy).toBe(true);
+    expect(result.logs.some(entry => entry.identity === 'app')).toBe(true);
   });
 });
