@@ -59,7 +59,12 @@ function policy(merge = true, emergencyStop = false, serviceEnabled = true, lega
   } as const;
 }
 
-function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges = 0) {
+function harness(
+  rows: OverseerVerdictRow[],
+  evidence = greenPr(),
+  recentMerges = 0,
+  githubExtras: Partial<GitHubClientDeps> = {}
+) {
   const pending = [...rows];
   const outcomes: { verdictId: string; mutationSent: boolean; reason: string }[] = [];
   const claimReleases: { verdictId: string; reason: string }[] = [];
@@ -116,6 +121,7 @@ function harness(rows: OverseerVerdictRow[], evidence = greenPr(), recentMerges 
       merges += 1;
       return { merged: true, mergeSha: 'merge-sha' };
     },
+    ...githubExtras,
   };
   return {
     store,
@@ -778,5 +784,147 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(searches).toEqual([]);
     expect(h.merges).toBe(0);
     expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
+  });
+
+  test('receipt posts one comment with marker, head sha, and merge sha', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-once')], greenPr(), 0, {
+      listPullRequestComments: async () => [],
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain('<!-- merge-manager-receipt -->');
+    expect(bodies[0]).toContain('judged-s');
+    expect(bodies[0]).toContain('merge-sh');
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('receipt replay posts nothing when the marker comment already exists', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-replay')], greenPr(), 0, {
+      listPullRequestComments: async () => [{ body: '<!-- merge-manager-receipt -->\nalready' }],
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(bodies).toEqual([]);
+    expect(h.outcomes[0]?.reason).toBe('merge_executed');
+  });
+
+  test('receipt comment failure stays non-fatal and keeps merge_executed', async () => {
+    const h = harness([verdict('receipt-fail')], greenPr(), 0, {
+      listPullRequestComments: async () => [],
+      commentOnPullRequest: async () => {
+        throw new Error('comment rejected');
+      },
+    });
+    await expect(
+      runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+      })
+    ).resolves.toBeUndefined();
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+    expect(h.claimReleases).toEqual([]);
+    expect(h.occupied).toBe(1);
+  });
+
+  test('receipt is a no-throw when commentOnPullRequest is absent', async () => {
+    const h = harness([verdict('receipt-absent')]);
+    expect(h.github.commentOnPullRequest).toBeUndefined();
+    await expect(
+      runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+      })
+    ).resolves.toBeUndefined();
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+    expect(h.claimReleases).toEqual([]);
+  });
+
+  test('receipt skip, hold, and failed merge post no comment', async () => {
+    const bodies: string[] = [];
+    const commentOnPullRequest = async (input: {
+      body: string;
+    }): Promise<{ commented: boolean }> => {
+      bodies.push(input.body);
+      return { commented: true };
+    };
+    const skipped = harness(
+      [verdict('receipt-skip')],
+      greenPr({ checks: { total: 1, passed: 0, failed: 0, pending: 1 } }),
+      0,
+      { commentOnPullRequest }
+    );
+    await runMergeExecutionBridgeOnce({
+      store: skipped.store,
+      github: skipped.github,
+      readPolicy: () => policy(),
+    });
+    const held = harness([verdict('receipt-hold')], greenPr(), 4, { commentOnPullRequest });
+    await runMergeExecutionBridgeOnce({
+      store: held.store,
+      github: held.github,
+      readPolicy: () => policy(),
+      maxMergesPerHour: 4,
+    });
+    const failed = harness([verdict('receipt-failed')], greenPr(), 0, {
+      commentOnPullRequest,
+      mergePullRequest: async () => ({ merged: false, message: 'merge_failed' }),
+    });
+    await runMergeExecutionBridgeOnce({
+      store: failed.store,
+      github: failed.github,
+      readPolicy: () => policy(),
+    });
+    expect(bodies).toEqual([]);
+    expect(skipped.outcomes[0]?.reason).toBe('required_checks_not_success');
+    expect(held.claimReleases).toEqual([
+      { verdictId: 'receipt-hold', reason: 'rate_ceiling_deferred' },
+    ]);
+    expect(failed.outcomes[0]?.reason).toBe('merge_failed');
+  });
+
+  test('receipt body is ASCII and contains no at-sign', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-ascii')], greenPr(), 0, {
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(bodies).toHaveLength(1);
+    const body = bodies[0] ?? '';
+    expect(/^[\x00-\x7F]*$/.test(body)).toBe(true);
+    expect(body.includes('@')).toBe(false);
+    expect(body).toContain('policy thinmansoftware/bdc-harness:dev');
   });
 });

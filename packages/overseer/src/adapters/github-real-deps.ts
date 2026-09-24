@@ -1679,6 +1679,18 @@ export function createRealGitHubClientDeps(
       });
       return { commented: true, url: response.data.html_url };
     },
+    listPullRequestComments: async (input): Promise<readonly { body: string }[]> => {
+      if (!octokit.issues?.listComments) {
+        throw new Error('overseer_real_adapter_missing_list_comments_api');
+      }
+      const response = await octokit.issues.listComments({
+        owner: input.owner,
+        repo: input.repo,
+        issue_number: input.number,
+        per_page: 100,
+      });
+      return response.data.map(comment => ({ body: comment.body ?? '' }));
+    },
     approvePullRequest: createRealApprovePullRequest(octokit),
     listOpenPullRequests: createRealListOpenPullRequests(octokit),
   };

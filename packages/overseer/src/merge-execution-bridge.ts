@@ -37,6 +37,7 @@ import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
 const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
 const FLAG_MERGE_READY = 'flag_merge_ready';
+const RECEIPT_MARKER = '<!-- merge-manager-receipt -->';
 export type MergeExecutionRepoConfig = Readonly<Record<string, { readonly baseBranch: string }>>;
 
 export interface MergeExecutionBridgeStore {
@@ -332,6 +333,43 @@ async function resolveMergeTarget(
   };
 }
 
+async function postMergeReceiptComment(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  pr: PullRequestEvidence,
+  input: { mergeSha?: string; baseBranch?: string; policyLabel?: string }
+): Promise<void> {
+  if (!options.github.commentOnPullRequest) {
+    log.warn(
+      { verdictId: verdict.id, prUrl: pr.htmlUrl },
+      'merge-coordinator.receipt_comment_unavailable'
+    );
+    return;
+  }
+  if (!pr.pr) return;
+  try {
+    if (options.github.listPullRequestComments) {
+      const existing = await options.github.listPullRequestComments(pr.pr);
+      if (existing.some(comment => comment.body.includes(RECEIPT_MARKER))) return;
+    }
+    const mergeShort = (input.mergeSha ?? 'unknown').slice(0, 8);
+    const baseBranch =
+      input.baseBranch && input.baseBranch.length > 0 ? input.baseBranch : 'unknown';
+    const policyLabel =
+      input.policyLabel && input.policyLabel.length > 0 ? input.policyLabel : 'unknown';
+    const body = [
+      RECEIPT_MARKER,
+      `Merged by the merge manager (unattended): Overseer verdict ${verdict.id.slice(0, 8)} APPROVED at head ${verdict.head_sha.slice(0, 8)}, checks green, base ${baseBranch}, policy ${policyLabel}. Merge commit ${mergeShort}.`,
+    ].join('\n');
+    await options.github.commentOnPullRequest({ ...pr.pr, body });
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+      'merge-coordinator.receipt_comment_failed'
+    );
+  }
+}
+
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
@@ -491,6 +529,12 @@ async function mergeClaimedVerdict(
     },
     'merge-coordinator.merge_executed'
   );
+  const ownerRepo = pr.pr !== undefined ? `${pr.pr.owner}/${pr.pr.repo}` : 'unknown';
+  await postMergeReceiptComment(options, verdict, pr, {
+    mergeSha: merged.mergeSha ?? merged.sha,
+    baseBranch: pr.baseBranch,
+    policyLabel: `${ownerRepo}:${pr.baseBranch ?? 'unknown'}`,
+  });
   return undefined;
 }
 

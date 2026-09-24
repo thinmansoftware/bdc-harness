@@ -258,6 +258,12 @@ export interface GitHubClientDeps {
     input: PullRequestRef & { body: string }
   ): Promise<{ commented: boolean; url?: string }>;
   /**
+   * Existing PR issue comments, used to keep the merge-manager receipt
+   * idempotent. Optional so existing fakes and compositions keep compiling.
+   * When absent, the bridge posts without a marker scan.
+   */
+  listPullRequestComments?(input: PullRequestRef): Promise<readonly { body: string }[]>;
+  /**
    * Approve a pull request as the configured identity (the Thinman Overseer
    * GitHub App when App auth is active; otherwise the PAT identity). Optional so
    * existing GitHubClientDeps implementers (fakes, legacy compositions) keep
