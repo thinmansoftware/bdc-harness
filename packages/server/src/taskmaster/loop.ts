@@ -184,6 +184,7 @@ export interface TaskmasterDeps {
    * human-read) from human-facing channels when grading an action 'unheard'.
    */
   assessDispatchRecipient?: (recipient: string) => Promise<DispatchRecipientAssessment>;
+  getDispatchReceiptCutoverAt?: () => Promise<string | null>;
   getGithubIssueEvidence?: (
     threadRef: string,
     sinceIso: string
@@ -791,6 +792,10 @@ async function reconcilePendingActions(
  * channel-deafness cannot apply. It is inherently heard and graded
  * 'useful'/'noise' purely on cascade-run and issue-movement evidence.
  */
+export function isPostCutoverReceipt(stamp: string | null, cutoverAt: string | null): boolean {
+  return stamp !== null && cutoverAt !== null && stamp >= cutoverAt;
+}
+
 async function gradeSentActions(
   actions: taskmasterDb.TmJournalEntry[],
   dal: TaskmasterDal,
@@ -799,7 +804,8 @@ async function gradeSentActions(
   getIssueEvidence: NonNullable<TaskmasterDeps['getGithubIssueEvidence']>,
   nowMs: number,
   getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>,
-  assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>
+  assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>,
+  cutoverAt: string | null
 ): Promise<number> {
   let failures = 0;
   for (const action of actions) {
@@ -853,7 +859,7 @@ async function gradeSentActions(
       const heardRecipient = dispatchRow?.resolved_recipient ?? dispatchRow?.recipient ?? null;
       const recipientAssessment = heardRecipient ? await assessRecipient(heardRecipient) : null;
       const heard =
-        dispatchRow?.acknowledged_at != null &&
+        isPostCutoverReceipt(dispatchRow?.acknowledged_at ?? null, cutoverAt) &&
         recipientAssessment?.delivery_mode != null &&
         recipientAssessment.delivery_mode !== 'drain_on_start';
 
@@ -896,7 +902,9 @@ async function gradeSentActions(
           ? action.thread_ref.slice('dispatch:'.length)
           : '';
         const ruling = rulingId ? await getDispatchById(rulingId) : null;
-        const addressedAtMs = ruling?.addressed_at ? Date.parse(ruling.addressed_at) : NaN;
+        const addressedAtMs = isPostCutoverReceipt(ruling?.addressed_at ?? null, cutoverAt)
+          ? Date.parse(ruling?.addressed_at ?? '')
+          : NaN;
         const expectedRecipient = ruling?.resolved_recipient ?? ruling?.recipient;
         if (
           ruling &&
@@ -1157,6 +1165,15 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       return { status: row.status, prOpened };
     });
   const nowMs = now().getTime();
+  const cutoverAt = await (
+    deps.getDispatchReceiptCutoverAt ??
+    (async (): Promise<string | null> => {
+      const result = await getDatabase().query<{ applied_at: string }>(
+        'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+      );
+      return result.rows[0]?.applied_at ?? null;
+    })
+  )();
 
   state.tickIndex += 1;
   recordTickAttempt(state.deadman, nowMs);
@@ -1243,7 +1260,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     getIssueEvidence,
     nowMs,
     getFireRunEvidence,
-    assessRecipient
+    assessRecipient,
+    cutoverAt
   );
 
   // M-155 Q3: useful-rate floor with auto-PAUSE. Counted AFTER

@@ -53,9 +53,11 @@ import {
   resolveDispatchRecipient,
   assessDispatchRecipient,
   normalizeDispatchSubjectKey,
+  mailboxDepthByPrincipal,
   supersedeMessage,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
+  type XoLeaseBind,
 } from './dispatch';
 
 /** Test-local fixture constructor -- production path is createAuthenticatedMessage. */
@@ -950,13 +952,80 @@ describe('dispatch db', () => {
       ok: false,
       reason: 'not_queued',
     });
-    expect((await acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).ok).toBe(true);
+    await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'xo_bind_required',
+    });
     await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo-fable' })).resolves.toEqual(
       {
         ok: false,
         reason: 'wrong_recipient',
       }
     );
+  });
+
+  test('requires and transactionally fences the XO mailbox lease binding', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-xo-bind',
+      idempotency_key: 'idem-xo-bind',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'XO binding test.',
+    });
+    await expect(acknowledgeMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'xo_bind_required',
+    });
+    const holderToken = 'holder-secret';
+    const bind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-current',
+      fencing_token: 9,
+      holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
+    };
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, NULL, $5, NULL)`,
+      [
+        bind.lease_id,
+        bind.holder_token_hash,
+        bind.fencing_token,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    await expect(
+      acknowledgeMessage({
+        id: message.id,
+        principal_id: 'xo',
+        bind: { ...bind, fencing_token: 8 },
+      })
+    ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind })).ok).toBe(true);
+  });
+
+  test('mailbox depth treats all stamped rows as legacy_unverified without a cutover', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-legacy-depth',
+      idempotency_key: 'idem-legacy-depth',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Legacy depth test.',
+    });
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [message.id, new Date().toISOString(), 'operator']
+    );
+    await db.query('DELETE FROM dispatch_receipt_cutover');
+    const depth = await mailboxDepthByPrincipal();
+    expect(depth.cutover_at).toBeNull();
+    const operator = depth.operator as import('./dispatch').MailboxDepth;
+    expect(operator.legacy_unverified).toBe(1);
+    expect(operator.acked_open).toBe(0);
   });
 
   test('machine disposition writes only routing evidence and auto_surfaced stays ackable', async () => {
@@ -1121,7 +1190,7 @@ describe('dispatch db', () => {
     expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
     await expect(addressMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
       ok: false,
-      reason: 'wrong_recipient',
+      reason: 'xo_bind_required',
     });
     await expect(
       addressMessage({ id: message.id, principal_id: 'operator' })
@@ -1285,7 +1354,7 @@ describe('dispatch db', () => {
     });
     await expect(addressMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
       ok: false,
-      reason: 'wrong_recipient',
+      reason: 'xo_bind_required',
     });
     await db.query("UPDATE agent_dispatch_messages SET acknowledged_by = 'xo' WHERE id = $1", [
       mailbox.id,

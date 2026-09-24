@@ -22,6 +22,7 @@ import {
   OWNER_RECIPIENT_MAP,
   isPauseEffectsExempt,
   TM_REPEAT_REASON_BY_TYPE,
+  isPostCutoverReceipt,
   type TaskmasterDeps,
   type ListedThread,
   type GithubIssueEvidence,
@@ -43,6 +44,22 @@ import type {
 import type { HeadroomReading } from './ledger';
 
 describe('Taskmaster reset visibility and canary', () => {
+  test('legacy_unverified receipts are never post-cutover evidence', () => {
+    const cutover = '2026-09-23T16:00:00.000Z';
+    expect(isPostCutoverReceipt('2026-09-23T15:59:59.999Z', cutover)).toBe(false);
+    expect(isPostCutoverReceipt(cutover, cutover)).toBe(true);
+    expect(isPostCutoverReceipt(null, cutover)).toBe(false);
+  });
+
+  test('PAUSED ticks do not write a tm_journal effect', async () => {
+    const world = makeWorld();
+    world.control.pause_state = 'PAUSED';
+    seedDigestSent(world);
+    const before = world.journal.length;
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.journal).toHaveLength(before);
+  });
+
   test('only the two WO-authorized monitoring signals escape an effects pause', () => {
     expect(isPauseEffectsExempt('canary', 'effects')).toBe(true);
     expect(isPauseEffectsExempt('self_pause_notice', 'effects')).toBe(true);
@@ -361,6 +378,7 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
   return {
     now: () => new Date(world.nowMs),
     db: dal,
+    getDispatchReceiptCutoverAt: async () => new Date(T0 - 86_400_000).toISOString(),
     headroom: async () => okHeadroom,
     createTask: (async (
       _context: unknown,
@@ -3285,7 +3303,7 @@ describe('M-155 exception push (loop)', () => {
     } as TaskmasterDeps['db'];
   }
 
-  test('push: every owner resolves to xo in THIS WO (routing stub validation)', () => {
+  test('push: every owner resolves to an allowed active draining principal', () => {
     // Only 'xo' (XO session-start reflex) and 'operator' (John) have a
     // documented drainer; routing to any other mailbox would manufacture a
     // second dead-letter box -- the failure this WO exists to end.
@@ -3297,8 +3315,13 @@ describe('M-155 exception push (loop)', () => {
     // The map structure exists and every entry points at 'xo', so widening it
     // later is a data change rather than a code change.
     expect(Object.keys(OWNER_RECIPIENT_MAP).length).toBeGreaterThan(0);
+    const seededPrincipals: Record<string, { active: boolean; delivery_mode: string }> = {
+      xo: { active: true, delivery_mode: 'drain_on_start' },
+    };
     for (const target of Object.values(OWNER_RECIPIENT_MAP)) {
-      expect(target).toBe('xo');
+      expect(TM_ALLOWED_RECIPIENTS).toContain(target);
+      expect(seededPrincipals[target]?.active).toBe(true);
+      expect(['drain_on_start', 'worker_poll']).toContain(seededPrincipals[target]?.delivery_mode);
     }
   });
 
