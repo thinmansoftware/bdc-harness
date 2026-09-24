@@ -198,7 +198,9 @@ export interface RealGitHubOctokitLike {
       issue_number: number;
       per_page: number;
       page?: number;
-    }): Promise<{ data: { body?: string | null }[] }>;
+    }): Promise<{
+      data: { body?: string | null; user?: { login?: string | null } | null }[];
+    }>;
   };
   checks: {
     listForRef(input: Record<string, unknown>): Promise<{
@@ -1200,12 +1202,6 @@ export function extractWoId(title: string, body: string | null | undefined): str
 const MAX_REVIEW_PAGES = 10;
 const REVIEW_PAGE_SIZE = 100;
 
-/**
- * Hard ceiling on issue-comment pages read per idempotency check, so one
- * pathological thread cannot spin the tick. 10 pages x 100 = 1000 comments,
- * far above any real merge-manager-receipt PR thread.
- */
-const MAX_ISSUE_COMMENT_PAGES = 10;
 const ISSUE_COMMENT_PAGE_SIZE = 100;
 
 interface GraphQLReviewDecisionNode {
@@ -1652,6 +1648,7 @@ export function createRealListOpenPullRequests(
 export function createRealGitHubClientDeps(
   octokit: RealGitHubOctokitLike = createRealOctokitClient()
 ): GitHubClientDeps {
+  const commentAuthorLogin = resolveReviewGateLogin();
   return {
     findPullRequest: createRealFindPullRequest(octokit),
     // Merge mutations go through the distinct merge identity when configured
@@ -1687,7 +1684,10 @@ export function createRealGitHubClientDeps(
       });
       return { commented: true, url: response.data.html_url };
     },
-    listPullRequestComments: async (input): Promise<readonly { body: string }[]> => {
+    commentAuthorLogin,
+    listPullRequestComments: async (
+      input
+    ): Promise<readonly { body: string; authorLogin: string }[]> => {
       if (!octokit.issues?.listComments) {
         throw new Error('overseer_real_adapter_missing_list_comments_api');
       }
@@ -1701,10 +1701,11 @@ export function createRealGitHubClientDeps(
         issue_number: number;
         per_page: number;
         page?: number;
-      }): Promise<{ data: { body?: string | null }[] }> =>
-        issuesApi.listComments?.(args) ?? Promise.resolve({ data: [] });
-      const comments: { body: string }[] = [];
-      for (let page = 1; page <= MAX_ISSUE_COMMENT_PAGES; page += 1) {
+      }): Promise<{
+        data: { body?: string | null; user?: { login?: string | null } | null }[];
+      }> => issuesApi.listComments?.(args) ?? Promise.resolve({ data: [] });
+      const comments: { body: string; authorLogin: string }[] = [];
+      for (let page = 1; ; page += 1) {
         const response = await listComments({
           owner: input.owner,
           repo: input.repo,
@@ -1714,7 +1715,10 @@ export function createRealGitHubClientDeps(
         });
         const data = response.data ?? [];
         for (const comment of data) {
-          comments.push({ body: comment.body ?? '' });
+          comments.push({
+            body: comment.body ?? '',
+            authorLogin: comment.user?.login ?? '',
+          });
         }
         // A short page is the last page.
         if (data.length < ISSUE_COMMENT_PAGE_SIZE) break;

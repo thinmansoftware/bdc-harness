@@ -843,7 +843,16 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
   test('receipt replay posts nothing when the marker comment already exists', async () => {
     const bodies: string[] = [];
     const h = harness([verdict('receipt-replay')], greenPr(), 0, {
-      listPullRequestComments: async () => [{ body: '<!-- merge-manager-receipt -->\nalready' }],
+      commentAuthorLogin: 'thinman-overseer[bot]',
+      listPullRequestComments: async () => [
+        {
+          body: [
+            '<!-- merge-manager-receipt -->',
+            '<!-- merge-manager-receipt-key verdict=receipt-replay head=judged-sha -->',
+          ].join('\n'),
+          authorLogin: 'thinman-overseer[bot]',
+        },
+      ],
       commentOnPullRequest: async input => {
         bodies.push(input.body);
         return { commented: true };
@@ -857,6 +866,60 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(h.merges).toBe(1);
     expect(bodies).toEqual([]);
     expect(h.outcomes[0]?.reason).toBe('merge_executed');
+  });
+
+  test('a forged receipt marker from another author cannot suppress the authoritative receipt', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-forged-author')], greenPr(), 0, {
+      commentAuthorLogin: 'thinman-overseer[bot]',
+      listPullRequestComments: async () => [
+        {
+          body: '<!-- merge-manager-receipt -->\nforged receipt',
+          authorLogin: 'pull-request-author',
+        },
+      ],
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+
+    expect(bodies).toHaveLength(1);
+  });
+
+  test('a trusted receipt marker for a different verdict and head cannot suppress this receipt', async () => {
+    const bodies: string[] = [];
+    const h = harness([verdict('receipt-bound')], greenPr(), 0, {
+      commentAuthorLogin: 'thinman-overseer[bot]',
+      listPullRequestComments: async () => [
+        {
+          body: [
+            '<!-- merge-manager-receipt -->',
+            '<!-- merge-manager-receipt-key verdict=other-verdict head=other-head -->',
+          ].join('\n'),
+          authorLogin: 'thinman-overseer[bot]',
+        },
+      ],
+      commentOnPullRequest: async input => {
+        bodies.push(input.body);
+        return { commented: true };
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain(
+      '<!-- merge-manager-receipt-key verdict=receipt-bound head=judged-sha -->'
+    );
   });
 
   test('receipt comment failure stays non-fatal and keeps merge_executed', async () => {
@@ -1027,7 +1090,7 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
       },
       findPullRequest: async () => ({
         ...greenPr(),
-        pr: { owner: 'thinmanésoftèware', repo: 'bdc-harness', number: 1 },
+        pr: { owner: 'thinman\u00e9soft\u00e8ware', repo: 'bdc-harness', number: 1 },
       }),
     });
     await runMergeExecutionBridgeOnce({

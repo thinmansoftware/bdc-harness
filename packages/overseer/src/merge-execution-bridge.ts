@@ -38,6 +38,7 @@ const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
 const FLAG_MERGE_READY = 'flag_merge_ready';
 const RECEIPT_MARKER = '<!-- merge-manager-receipt -->';
+const RECEIPT_KEY_PREFIX = '<!-- merge-manager-receipt-key';
 export type MergeExecutionRepoConfig = Readonly<Record<string, { readonly baseBranch: string }>>;
 
 export interface MergeExecutionBridgeStore {
@@ -354,6 +355,14 @@ function sanitizeReceiptField(value: string): string {
     .join('');
 }
 
+function receiptKey(verdict: OverseerVerdictRow): string {
+  const keyField = (value: string): string =>
+    sanitizeReceiptField(value).replace(/[^A-Za-z0-9._:-]/g, '_');
+  return `${RECEIPT_KEY_PREFIX} verdict=${keyField(verdict.id)} head=${keyField(
+    verdict.head_sha
+  )} -->`;
+}
+
 async function postMergeReceiptComment(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
@@ -369,9 +378,19 @@ async function postMergeReceiptComment(
   }
   if (!pr.pr) return;
   try {
-    if (options.github.listPullRequestComments) {
+    const expectedReceiptKey = receiptKey(verdict);
+    const commentAuthorLogin = options.github.commentAuthorLogin?.trim().toLowerCase();
+    if (options.github.listPullRequestComments && commentAuthorLogin) {
       const existing = await options.github.listPullRequestComments(pr.pr);
-      if (existing.some(comment => comment.body.includes(RECEIPT_MARKER))) return;
+      if (
+        existing.some(
+          comment =>
+            comment.authorLogin.trim().toLowerCase() === commentAuthorLogin &&
+            comment.body.split(/\r?\n/).some(line => line.trim() === expectedReceiptKey)
+        )
+      ) {
+        return;
+      }
     }
     const mergeShort = sanitizeReceiptField((input.mergeSha ?? 'unknown').slice(0, 8));
     const baseBranch = sanitizeReceiptField(
@@ -382,6 +401,7 @@ async function postMergeReceiptComment(
     );
     const body = [
       RECEIPT_MARKER,
+      expectedReceiptKey,
       `Merged by the merge manager (unattended): Overseer verdict ${verdict.id.slice(0, 8)} APPROVED at head ${verdict.head_sha.slice(0, 8)}, checks green, base ${baseBranch}, policy ${policyLabel}. Merge commit ${mergeShort}.`,
     ].join('\n');
     await options.github.commentOnPullRequest({ ...pr.pr, body });
