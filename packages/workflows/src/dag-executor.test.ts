@@ -14686,3 +14686,104 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
     }
   });
 });
+
+// Kept outside the 'silent node detection' block so that block's Stop 2 count
+// (4 passing / 4 total) stays exactly as the WO spec declares.
+describe('cancel-poll interval cleanup (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-cancelpoll-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  it('a rejecting beginProviderAttempt leaves no live cancel-poll interval', async () => {
+    // An unusual poll period lets the spies pick out the cancel-poll interval
+    // from every other timer the executor starts.
+    const pollMs = 37;
+    const prev = process.env.ARCHON_NODE_CANCEL_POLL_MS;
+    process.env.ARCHON_NODE_CANCEL_POLL_MS = String(pollMs);
+    const created = new Set<unknown>();
+    const cleared = new Set<unknown>();
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const setSpy = spyOn(globalThis, 'setInterval').mockImplementation(((
+      handler: () => void,
+      ms?: number
+    ) => {
+      const handle = realSetInterval(handler, ms);
+      if (ms === pollMs) created.add(handle);
+      return handle;
+    }) as typeof setInterval);
+    const clearSpy = spyOn(globalThis, 'clearInterval').mockImplementation(((
+      handle?: Parameters<typeof clearInterval>[0]
+    ) => {
+      cleared.add(handle);
+      realClearInterval(handle);
+    }) as typeof clearInterval);
+    try {
+      mockSendQueryDag.mockClear();
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield { type: 'assistant', content: 'unreachable' };
+      });
+
+      const store = createMockStore();
+      // provider_attempt_persist_failed: beginProviderAttempt throws before
+      // the node stream starts.
+      (store.createProviderAttempt as Mock<() => Promise<boolean>>).mockResolvedValue(false);
+
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-cancelpoll',
+        testDir,
+        {
+          name: 'cancel-poll-cleanup',
+          nodes: [{ id: 'attempt-rejects', prompt: 'work', idle_timeout: 60000 }],
+        },
+        makeWorkflowRun('cancelpoll-attempt-rejects'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag).not.toHaveBeenCalled();
+      const failed = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls
+        .map(
+          call => call[0] as { event_type: string; step_name?: string; data?: { error?: unknown } }
+        )
+        .filter(e => e.event_type === 'node_failed' && e.step_name === 'attempt-rejects');
+      expect(failed).toHaveLength(1);
+      expect(String(failed[0]?.data?.error)).toContain('provider_attempt_persist_failed');
+
+      // Every cancel-poll interval that was started must have been cleared.
+      const live = [...created].filter(handle => !cleared.has(handle));
+      expect(live).toHaveLength(0);
+
+      // Behavioral check: nothing keeps polling run status after the node exits.
+      const statusMock = store.getWorkflowRunStatus as ReturnType<typeof mock>;
+      const pollsAtExit = statusMock.mock.calls.length;
+      await new Promise(resolve => setTimeout(resolve, pollMs * 5));
+      expect(statusMock.mock.calls.length).toBe(pollsAtExit);
+    } finally {
+      for (const handle of created)
+        realClearInterval(handle as Parameters<typeof clearInterval>[0]);
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+      if (prev === undefined) delete process.env.ARCHON_NODE_CANCEL_POLL_MS;
+      else process.env.ARCHON_NODE_CANCEL_POLL_MS = prev;
+    }
+  });
+});
