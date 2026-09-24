@@ -61,6 +61,13 @@ import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
 import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
+import {
+  getSeatCutoff,
+  isValidSeatCutoff,
+  readAllSeats,
+  SEAT_CUTOFF_OUT_OF_RANGE,
+  setSeatCutoffOverride,
+} from '@archon/workflows/reliability/seat-usage';
 import { resolveWorkflowProbeBindings } from '@archon/workflows/reliability/resolve-binding';
 import type { ModelOverride } from '@archon/workflows/model-override';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
@@ -289,6 +296,11 @@ import {
   throttleBodySchema,
   throttleResponseSchema,
 } from './schemas/admin.schemas';
+import {
+  fuelglassCutoffBodySchema,
+  fuelglassCutoffResponseSchema,
+  fuelglassSeatsResponseSchema,
+} from './schemas/fuelglass.schemas';
 import {
   claimDispatchMessageBodySchema,
   createDispatchMessageBodySchema,
@@ -1791,6 +1803,38 @@ const getAdminThrottleRoute = createRoute({
       content: { 'application/json': { schema: throttleResponseSchema } },
       description: 'Current throttle state',
     },
+    500: jsonError('Server error'),
+  },
+});
+
+const getFuelglassSeatsRoute = createRoute({
+  method: 'get',
+  path: '/api/fuelglass/seats',
+  tags: ['Admin'],
+  summary: 'Read measured subscription seat usage',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: fuelglassSeatsResponseSchema } },
+      description: 'Current seat readings and cutoff',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const postFuelglassCutoffRoute = createRoute({
+  method: 'post',
+  path: '/api/fuelglass/cutoff',
+  tags: ['Admin'],
+  summary: 'Set or clear the subscription seat cutoff override',
+  request: {
+    body: { content: { 'application/json': { schema: fuelglassCutoffBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: fuelglassCutoffResponseSchema } },
+      description: 'Cutoff updated',
+    },
+    400: jsonError('Bad request'),
     500: jsonError('Server error'),
   },
 });
@@ -6013,6 +6057,37 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'admin_throttle_api_failed');
       return apiError(c, 500, 'Failed to update throttle state');
+    }
+  });
+
+  registerOpenApiRoute(getFuelglassSeatsRoute, async c => {
+    try {
+      const seats = await readAllSeats();
+      return c.json({
+        success: true,
+        generated_at: new Date().toISOString(),
+        cutoff: getSeatCutoff(),
+        // The gate has no off switch (John Ranson, 2026-09-24).
+        gate_enabled: true,
+        seats,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'get_fuelglass_seats_api_failed');
+      return apiError(c, 500, 'Failed to read seat usage');
+    }
+  });
+
+  registerOpenApiRoute(postFuelglassCutoffRoute, async c => {
+    try {
+      const body = getValidatedBody(c, fuelglassCutoffBodySchema);
+      if (body.percent !== null && !isValidSeatCutoff(body.percent)) {
+        return apiError(c, 400, `${SEAT_CUTOFF_OUT_OF_RANGE}: percent must be between 1 and 95`);
+      }
+      setSeatCutoffOverride(body.percent);
+      return c.json({ success: true, cutoff: getSeatCutoff() });
+    } catch (error) {
+      getLog().error({ err: error }, 'fuelglass_cutoff_api_failed');
+      return apiError(c, 500, 'Failed to update seat cutoff');
     }
   });
 
