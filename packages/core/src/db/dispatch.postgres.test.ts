@@ -494,6 +494,65 @@ describe('dispatch Phase 1.5 PostgreSQL integration', () => {
     );
   });
 
+  test('migration 060 widens an old-shape task_type CHECK to admit run_rework', async () => {
+    // Reproduce a pre-058 Postgres database: a task_type CHECK that predates
+    // this WO and does not list 'run_rework' (WO-HARNESS-OVERSEER-REWORK-LOOP-01,
+    // Overseer CHANGES_REQUESTED on PR #936: "Existing PostgreSQL databases
+    // retain the agent_dispatch_messages task_type CHECK constraint without
+    // 'run_rework' ... production enqueue attempts will therefore violate the
+    // existing constraint"). Migration 059 only seeds the dispatch_principals
+    // row; it does not touch this CHECK, so an old-shape database stays broken
+    // until 058 runs.
+    await db.query(`
+      ALTER TABLE agent_dispatch_messages
+        ADD CONSTRAINT task_type_stale_pre058
+          CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion'))
+    `);
+
+    const rejected = await db
+      .query(
+        `INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, recipient, body)
+         VALUES ($1, $2, $3, 'run_rework', 'overseer', 'codex', 'pre-058 rework attempt')`,
+        [randomUUID(), randomUUID(), `migration-058-pre-${randomUUID()}`]
+      )
+      .then(() => null)
+      .catch((error: unknown) => error);
+    expect(rejected).not.toBeNull();
+    expect(String((rejected as Error)?.message ?? rejected)).toMatch(
+      /task_type_stale_pre058|check constraint/i
+    );
+
+    const migration = readFileSync(
+      resolve(import.meta.dir, '../../../../migrations/060_dispatch_run_rework_task_type.sql'),
+      'utf8'
+    );
+    await db.query(migration);
+
+    const checks = await db.query<{ conname: string; definition: string }>(
+      `SELECT c.conname, pg_get_constraintdef(c.oid) AS definition
+         FROM pg_constraint c
+        WHERE c.conrelid = to_regclass('agent_dispatch_messages')
+          AND c.contype = 'c'
+          AND pg_get_constraintdef(c.oid) LIKE '%task_type%'`
+    );
+    expect(checks.rows).toHaveLength(1);
+    expect(checks.rows[0]?.conname).not.toBe('task_type_stale_pre058');
+    expect(checks.rows[0]?.definition).toContain('run_rework');
+
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, sender, recipient, body)
+       VALUES ($1, $2, $3, 'run_rework', 'overseer', 'codex', 'migration 060')`,
+      [randomUUID(), randomUUID(), `migration-058-post-${randomUUID()}`]
+    );
+
+    // Re-running the migration must stay idempotent (production applies
+    // migrations in order exactly once, but a rebuild-then-reapply path must
+    // not fail if 058 is ever re-run against an already-migrated database).
+    await db.query(migration);
+  });
+
   test('same-principal concurrent retries return one row; different principals share keys', async () => {
     const key = `race-${randomUUID()}`;
     const mk = (principal: string, sender: string, body: string) =>

@@ -279,10 +279,7 @@ export async function tickReviewWorkerClock(
           try {
             await deps.reworkOnChangesRequested(work, outcome);
           } catch (error) {
-            log.error(
-              { err: error, messageId: claimed.id },
-              'overseer_rework_enqueue_failed'
-            );
+            log.error({ err: error, messageId: claimed.id }, 'overseer_rework_enqueue_failed');
           }
         }
       } catch (error) {

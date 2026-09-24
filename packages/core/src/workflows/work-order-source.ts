@@ -40,7 +40,10 @@ export function readReworkDirectiveRef(userMessage: string): ReworkDirectiveRef 
     if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error();
     const record = value as Record<string, unknown>;
     const keys = Object.keys(record);
-    if (keys.length !== REWORK_REF_KEYS.length || REWORK_REF_KEYS.some(key => !keys.includes(key))) {
+    if (
+      keys.length !== REWORK_REF_KEYS.length ||
+      REWORK_REF_KEYS.some(key => !keys.includes(key))
+    ) {
       throw new Error();
     }
     const prNumber = record.prNumber;
@@ -66,7 +69,10 @@ export function readReworkDirectiveRef(userMessage: string): ReworkDirectiveRef 
   }
 }
 
-export function renderReworkDirective(ref: ReworkDirectiveRef, review: ReworkDirectiveReview): string {
+export function renderReworkDirective(
+  ref: ReworkDirectiveRef,
+  review: ReworkDirectiveReview
+): string {
   return [
     '',
     '## Rework directive (engine-appended, do not edit)',
@@ -197,10 +203,7 @@ export async function freezeWorkOrderSource(
   };
 }
 
-function verifiedReworkSummary(
-  row: DispatchMessage | null,
-  ref: ReworkDirectiveRef
-): string {
+function verifiedReworkSummary(row: DispatchMessage | null, ref: ReworkDirectiveRef): string {
   if (!row) throw new Error('authority_conflict: rework directive');
   if (row.task_type !== 'run_review' || row.recipient !== 'overseer-reviewer') {
     throw new Error('authority_conflict: rework directive');

@@ -120,7 +120,9 @@ export function createRealReworkWorkerDeps(): ReworkWorkerDeps {
          LIMIT 50`,
         [`%WO_ID=${woId}%`]
       );
-      const boundary = new RegExp(`WO_ID=${woId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Z0-9-])`);
+      const boundary = new RegExp(
+        `WO_ID=${woId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Z0-9-])`
+      );
       return result.rows.some(row => boundary.test(row.user_message));
     },
     async fire(request): Promise<{ status: number; body: unknown }> {
@@ -137,7 +139,7 @@ export function createRealReworkWorkerDeps(): ReworkWorkerDeps {
       }
       return { status: response.status, body: parsed };
     },
-    escalate(input) {
+    escalate(input): Promise<unknown> {
       return escalateRework(rework, {
         owner: input.body.owner,
         repo: input.body.repo,
@@ -328,10 +330,15 @@ async function failOrBackoff(
   });
 }
 
-export function startReworkWorkerClock(deps: ReworkWorkerDeps = createRealReworkWorkerDeps()): void {
+export function startReworkWorkerClock(
+  deps: ReworkWorkerDeps = createRealReworkWorkerDeps()
+): void {
   if (timer || process.env.NODE_ENV === 'test') return;
   void tickReworkWorkerClock(deps);
-  const interval = Math.max(1_000, Number(process.env.OVERSEER_REWORK_WORKER_INTERVAL_MS) || 60_000);
+  const interval = Math.max(
+    1_000,
+    Number(process.env.OVERSEER_REWORK_WORKER_INTERVAL_MS) || 60_000
+  );
   timer = setInterval(() => void tickReworkWorkerClock(deps), interval);
   timer.unref?.();
 }

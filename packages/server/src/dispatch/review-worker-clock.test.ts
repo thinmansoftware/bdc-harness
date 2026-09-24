@@ -391,4 +391,62 @@ describe('review worker clock', () => {
       else process.env.NODE_ENV = originalNodeEnv;
     }
   });
+
+  // Test 9 (WO-HARNESS-OVERSEER-REWORK-LOOP-01): reworkOnChangesRequested is
+  // an optional post-postResult hook, mirroring the staleVerdictSweep pattern
+  // above -- called only on a terminal changes_requested verdict, after the
+  // result is already posted, and a hook failure never fails the tick.
+  test('calls reworkOnChangesRequested exactly once after postResult on a changes_requested verdict', async () => {
+    const deps = fakeDeps([message('one', 'exact-head')], () => ({
+      disposition: 'changes_requested',
+      summary: '[major] example finding',
+    }));
+    const rework = mock(async () => ({ action: 'enqueued' as const, reason: 'changes_requested' }));
+    deps.reworkOnChangesRequested = rework;
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(deps.postResult).toHaveBeenCalledWith(expect.objectContaining({ id: 'one' }));
+    expect(rework).toHaveBeenCalledTimes(1);
+    expect(rework).toHaveBeenCalledWith(
+      expect.objectContaining({ headSha: 'exact-head', messageId: 'one' }),
+      expect.objectContaining({ disposition: 'changes_requested' })
+    );
+  });
+
+  test('never calls reworkOnChangesRequested for a non-changes_requested terminal disposition', async () => {
+    const deps = fakeDeps([message('one', 'exact-head')], () => ({ disposition: 'approved' }));
+    const rework = mock(async () => ({ action: 'enqueued' as const, reason: 'changes_requested' }));
+    deps.reworkOnChangesRequested = rework;
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(rework).not.toHaveBeenCalled();
+  });
+
+  test('a reworkOnChangesRequested failure never fails the tick or the already-posted result', async () => {
+    const deps = fakeDeps([message('one', 'exact-head')], () => ({
+      disposition: 'changes_requested',
+      summary: '[major] example finding',
+    }));
+    deps.reworkOnChangesRequested = mock(async () => {
+      throw new Error('overseer_rework_enqueue_failed');
+    });
+
+    await expect(tickReviewWorkerClock(CONFIG, deps)).resolves.toBeUndefined();
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'one', status: 'done', task_outcome: 'succeeded' })
+    );
+  });
+
+  test('omitting reworkOnChangesRequested is safe -- a changes_requested verdict still terminates cleanly', async () => {
+    const deps = fakeDeps([message('one', 'exact-head')], () => ({
+      disposition: 'changes_requested',
+      summary: '[major] example finding',
+    }));
+    expect(deps.reworkOnChangesRequested).toBeUndefined();
+
+    await expect(tickReviewWorkerClock(CONFIG, deps)).resolves.toBeUndefined();
+    expect(deps.postResult).toHaveBeenCalledWith(expect.objectContaining({ id: 'one' }));
+  });
 });

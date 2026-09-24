@@ -76,7 +76,7 @@ export interface ReworkDeps {
     owner: string;
     repo: string;
     prNumber: number;
-  }): Promise<Array<{ body: string }>>;
+  }): Promise<{ body: string }[]>;
   createComment(input: {
     owner: string;
     repo: string;
@@ -143,7 +143,13 @@ export async function assessAndEnqueueRework(
   if (outcome.disposition !== 'changes_requested' || summary.length === 0) {
     return skipped('not_changes_requested');
   }
-  if (verdictAuthorizesRecheck({ disposition: outcome.disposition, summary: outcome.summary })) {
+  if (
+    verdictAuthorizesRecheck({
+      headSha: work.headSha,
+      disposition: outcome.disposition,
+      summary: outcome.summary,
+    })
+  ) {
     return skipped('check_caused_verdict');
   }
 
@@ -165,7 +171,7 @@ export async function assessAndEnqueueRework(
   if (detail) return skipped(`pr_not_eligible:${detail}`);
 
   const basePolicy = getRepoBasePolicy(ownerRepo, pr.baseRef);
-  if (!basePolicy || basePolicy.unattended !== true) {
+  if (basePolicy?.unattended !== true) {
     return skipped('production_or_unlisted_base');
   }
 
@@ -334,7 +340,7 @@ interface OctokitPull {
   draft?: boolean;
   base?: { ref?: string };
   head?: { sha?: string; ref?: string; repo?: { full_name?: string } | null };
-  labels?: Array<{ name?: string }>;
+  labels?: { name?: string }[];
 }
 
 export function createRealReworkDeps(): ReworkDeps {
@@ -360,9 +366,9 @@ export function createRealReworkDeps(): ReworkDeps {
     findOriginatingRun: findOriginatingRunForPullRequest,
     listMessages,
     createAuthenticatedMessage,
-    async listComments(input): Promise<Array<{ body: string }>> {
+    async listComments(input): Promise<{ body: string }[]> {
       const octokit = createRealOctokitClient();
-      const comments: Array<{ body: string }> = [];
+      const comments: { body: string }[] = [];
       const issues = octokit.issues;
       if (!issues?.listComments) return comments;
       for (let page = 1; page <= 10; page += 1) {
@@ -373,7 +379,7 @@ export function createRealReworkDeps(): ReworkDeps {
           per_page: 100,
           page,
         });
-        const pageComments = response.data as Array<{ body?: string | null }>;
+        const pageComments = response.data as { body?: string | null }[];
         for (const comment of pageComments) comments.push({ body: comment.body ?? '' });
         if (pageComments.length < 100) break;
       }
@@ -381,7 +387,9 @@ export function createRealReworkDeps(): ReworkDeps {
     },
     async createComment(input): Promise<void> {
       const octokit = createRealOctokitClient();
-      await octokit.issues.createComment({
+      const issues = octokit.issues;
+      if (!issues?.createComment) return;
+      await issues.createComment({
         owner: input.owner,
         repo: input.repo,
         issue_number: input.prNumber,
