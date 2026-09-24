@@ -310,6 +310,97 @@ describe('substituteWorkflowVariables', () => {
     );
     expect(prompt).toBe('Plain prompt with no loop variable.');
   });
+
+  it('leaves $BASE_BRANCH_OVERRIDE and $BASE_BRANCH_PR intact when substituting $BASE_BRANCH', () => {
+    // Regression for bdc-harness #877: the open-pr-if-needed shell node reassigned
+    // BASE_BRANCH_OVERRIDE to a literal like dev_OVERRIDE when the unbraced
+    // $BASE_BRANCH_OVERRIDE reference was partially rewritten.
+    const { prompt } = substituteWorkflowVariables(
+      'Base: $BASE_BRANCH. Override: $BASE_BRANCH_OVERRIDE. Pr: $BASE_BRANCH_PR',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe(
+      'Base: dev. Override: $BASE_BRANCH_OVERRIDE. Pr: $BASE_BRANCH_PR'
+    );
+  });
+
+  it('substitutes $BASE_BRANCH in non-identifier positions', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Bare: $BASE_BRANCH. Path: $BASE_BRANCH/x. Dot: $BASE_BRANCH. Parens: ($BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe(
+      'Bare: dev. Path: dev/x. Dot: dev. Parens: (dev)'
+    );
+  });
+
+  // Test 3: every bounded variable must match only as a whole identifier.
+  const boundedVars: Array<[string, string]> = [
+    ['WORKFLOW_ID', 'run-1'],
+    ['USER_MESSAGE', 'msg'],
+    ['ARGUMENTS', 'msg'],
+    ['ARTIFACTS_DIR', '/tmp/artifacts'],
+    ['DOCS_DIR', 'docs/'],
+    ['LOOP_USER_INPUT', 'feedback'],
+    ['REJECTION_REASON', 'reason'],
+    ['LOOP_PREV_OUTPUT', 'prev'],
+  ];
+
+  it.each(boundedVars)(
+    'substitutes $%s but leaves $%s_SUFFIX intact',
+    (name, value) => {
+      const { prompt } = substituteWorkflowVariables(
+        'First: $' + name + ' Then: $' + name + '_SUFFIX',
+        'run-1',
+        'msg',
+        '/tmp/artifacts',
+        'main',
+        'docs/',
+        undefined,
+        name === 'LOOP_USER_INPUT' ? 'feedback' : undefined,
+        name === 'REJECTION_REASON' ? 'reason' : undefined,
+        name === 'LOOP_PREV_OUTPUT' ? 'prev' : undefined
+      );
+      expect(prompt).toBe(
+        'First: ' + value + ' Then: $' + name + '_SUFFIX'
+      );
+    }
+  );
+
+  it('does not throw on $BASE_BRANCH_OVERRIDE when baseBranch is empty', () => {
+    // $BASE_BRANCH_OVERRIDE is a different variable; the empty-base guard must
+    // not fire on it.
+    const { prompt } = substituteWorkflowVariables(
+      'Override only: $BASE_BRANCH_OVERRIDE',
+      'run-1',
+      'msg',
+      '/tmp',
+      '',
+      'docs/'
+    );
+    expect(prompt).toBe('Override only: $BASE_BRANCH_OVERRIDE');
+  });
+
+  it('still throws on a real $BASE_BRANCH reference when baseBranch is empty', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        'Merge into $BASE_BRANCH now',
+        'run-1',
+        'msg',
+        '/tmp',
+        '',
+        'docs/'
+      )
+    ).toThrow('No base branch could be resolved');
+  });
 });
 
 describe('buildPromptWithContext', () => {

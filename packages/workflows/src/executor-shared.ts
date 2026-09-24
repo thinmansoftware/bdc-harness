@@ -414,8 +414,9 @@ export function substituteWorkflowVariables(
   rejectionReason?: string,
   loopPrevOutput?: string
 ): { prompt: string; contextSubstituted: boolean } {
-  // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
-  if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
+  // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved.
+  // Bounded to the whole identifier so longer variables like $BASE_BRANCH_OVERRIDE do not trip it.
+  if (!baseBranch && /\$BASE_BRANCH(?![A-Za-z0-9_])/.test(prompt)) {
     throw new Error(
       'No base branch could be resolved. Auto-detection failed and `worktree.baseBranch` is not set in .archon/config.yaml. ' +
         'Set the config value or use the --from flag to select a branch (e.g., --from dev).'
@@ -425,18 +426,20 @@ export function substituteWorkflowVariables(
   // Defensive: ensure docsDir always has a value (callers should resolve, but guard here)
   const resolvedDocsDir = docsDir || 'docs/';
 
-  // Substitute basic variables
+  // Substitute basic variables. Each $NAME is matched only as a whole identifier:
+  // the negative lookahead rejects matches where the name continues with [A-Za-z0-9_],
+  // so longer shell variables like $BASE_BRANCH_OVERRIDE reach the node unchanged.
   let result = prompt
-    .replace(/\$WORKFLOW_ID/g, workflowId)
+    .replace(/\$WORKFLOW_ID(?![A-Za-z0-9_])/g, workflowId)
     .replace(/\$\{run\.id\}/g, workflowId)
-    .replace(/\$USER_MESSAGE/g, userMessage)
-    .replace(/\$ARGUMENTS/g, userMessage)
-    .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
-    .replace(/\$BASE_BRANCH/g, baseBranch)
-    .replace(/\$DOCS_DIR/g, resolvedDocsDir)
-    .replace(/\$LOOP_USER_INPUT/g, loopUserInput ?? '')
-    .replace(/\$REJECTION_REASON/g, rejectionReason ?? '')
-    .replace(/\$LOOP_PREV_OUTPUT/g, loopPrevOutput ?? '');
+    .replace(/\$USER_MESSAGE(?![A-Za-z0-9_])/g, userMessage)
+    .replace(/\$ARGUMENTS(?![A-Za-z0-9_])/g, userMessage)
+    .replace(/\$ARTIFACTS_DIR(?![A-Za-z0-9_])/g, artifactsDir)
+    .replace(/\$BASE_BRANCH(?![A-Za-z0-9_])/g, baseBranch)
+    .replace(/\$DOCS_DIR(?![A-Za-z0-9_])/g, resolvedDocsDir)
+    .replace(/\$LOOP_USER_INPUT(?![A-Za-z0-9_])/g, loopUserInput ?? '')
+    .replace(/\$REJECTION_REASON(?![A-Za-z0-9_])/g, rejectionReason ?? '')
+    .replace(/\$LOOP_PREV_OUTPUT(?![A-Za-z0-9_])/g, loopPrevOutput ?? '');
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)
   const hasContextVariables = new RegExp(CONTEXT_VAR_PATTERN_STR).test(result);
