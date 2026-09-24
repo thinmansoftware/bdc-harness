@@ -2966,7 +2966,7 @@ export function registerApiRoutes(
     workflow: WorkflowDefinition,
     modelOverride?: ModelOverride
   ): string | null {
-    const checks: Array<{ nodeId: string; provider?: string; model?: string }> = [];
+    const checks: { nodeId: string; provider?: string; model?: string }[] = [];
     checks.push({
       nodeId: 'workflow',
       provider: modelOverride?.workflow?.provider ?? workflow.provider,

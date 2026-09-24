@@ -24,7 +24,10 @@ import {
   registerOprProvider,
   registerOprZeroProvider,
 } from './community/glm/registration';
-import { registerGrokAgentProvider, resetGrokAgentProviderRegistration } from './community/grok/registration';
+import {
+  registerGrokAgentProvider,
+  resetGrokAgentProviderRegistration,
+} from './community/grok/registration';
 import { registerCursorAgentProvider } from './community/cursor/registration';
 import { GlmProvider } from './community/glm/provider';
 import { UnknownProviderError } from './errors';

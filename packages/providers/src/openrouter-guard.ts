@@ -8,8 +8,7 @@
  */
 export const OPENROUTER_XAI_REFUSED_CODE = 'openrouter_xai_refused';
 
-export const OPENROUTER_XAI_REFUSED_REASON =
-  'Grok is reached via provider cursor (grok-4.7-high)';
+export const OPENROUTER_XAI_REFUSED_REASON = 'Grok is reached via provider cursor (grok-4.7-high)';
 
 /**
  * Tool-loop client plus the text-only OpenRouter seats.

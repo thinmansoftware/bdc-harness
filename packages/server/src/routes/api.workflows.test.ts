@@ -172,17 +172,9 @@ mock.module('@archon/providers/auth-refresh/dispatch-gate', () => ({
 }));
 mock.module('@archon/providers', () => ({
   isRegisteredProvider: (provider: string) =>
-    [
-      'claude',
-      'codex',
-      'cursor',
-      'openrouter',
-      'grok',
-      'opr',
-      'opr-zero',
-      'glm',
-      'pi',
-    ].includes(provider),
+    ['claude', 'codex', 'cursor', 'openrouter', 'grok', 'opr', 'opr-zero', 'glm', 'pi'].includes(
+      provider
+    ),
   getProviderInfoList: () => [],
   getOpenRouterXaiRefusal,
   OPENROUTER_XAI_REFUSED_REASON,
