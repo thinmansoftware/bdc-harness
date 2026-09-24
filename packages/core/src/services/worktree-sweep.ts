@@ -392,12 +392,35 @@ export interface MoveDirAcrossDevicesDeps {
 }
 
 /**
+ * Thrown by moveDirAcrossDevices when `to` already exists at call time. There
+ * is no safe move onto an occupied destination: the EXDEV fallback copies
+ * then deletes, and if the destination already held unrelated content (a
+ * name collision, or a retry landing on the same quarantine path a prior
+ * attempt already partially populated), a failed copy's cleanup would delete
+ * that pre-existing content, not just what this call wrote. Refusing up
+ * front means the caller decides the collision, rather than this function
+ * silently destroying data it did not create.
+ */
+export class MoveDirDestinationExistsError extends Error {
+  constructor(public readonly path: string) {
+    super(`worktree_sweep_move_dir_destination_exists: ${path}`);
+    this.name = 'MoveDirDestinationExistsError';
+  }
+}
+
+/**
  * Move a directory. rename(2) is used first. Between two mount points rename
  * returns EXDEV even when both mounts are the same filesystem type, so that
  * case copies then deletes the source. Any other rename error is rethrown.
- * If the copy fails, the partial destination is removed and the source is left
- * in place. If that cleanup removal also fails, the cleanup error is logged and
- * the original copy error is still rethrown.
+ *
+ * Before the EXDEV fallback touches `to`, it refuses to proceed if `to`
+ * already exists (throws MoveDirDestinationExistsError) -- this call did not
+ * create that content, so it must not be the one to delete it on a later
+ * failure. Only once `to` is confirmed absent does this call "own" it: from
+ * that point, if the copy fails, the destination this call created is
+ * removed and the source is left in place. If that cleanup removal also
+ * fails, the cleanup error is logged and the original copy error is still
+ * rethrown.
  *
  * Default deps read the fs/promises bindings at call time so tests can spy on
  * rename without injecting moveDir into the sweep.
@@ -416,9 +439,17 @@ export async function moveDirAcrossDevices(
     }
   }
 
+  if (await pathExists(to)) {
+    throw new MoveDirDestinationExistsError(to);
+  }
+
   try {
     await deps.cp(from, to, MOVE_DIR_CP_OPTIONS);
   } catch (cpError) {
+    // `to` did not exist a moment ago (checked above) and cp failed, so
+    // whatever now sits at `to` is only what THIS call's failed copy wrote --
+    // safe to remove. errorOnExist means cp never partially overwrites
+    // pre-existing content it did not itself create.
     try {
       await deps.rm(to, { recursive: true, force: true });
     } catch (rmError) {

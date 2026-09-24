@@ -65,7 +65,11 @@ mock.module('../db/sessions', () => ({
   getActiveSession: mockGetActiveSession,
 }));
 
-import { moveDirAcrossDevices, sweepTerminalWorkflowWorktrees } from './worktree-sweep';
+import {
+  MoveDirDestinationExistsError,
+  moveDirAcrossDevices,
+  sweepTerminalWorkflowWorktrees,
+} from './worktree-sweep';
 
 async function createWorktree(
   root: string,
@@ -1022,6 +1026,68 @@ describe('moveDirAcrossDevices', () => {
       { err: rmError, path: dst },
       'worktree_sweep_partial_copy_cleanup_failed'
     );
+  });
+
+  // Overseer review, bdc-harness#947, [major]: the EXDEV fallback used to
+  // unconditionally rm `to` on a failed cp, regardless of whether `to`
+  // already held content this call did not create -- a name collision or a
+  // retry landing on a destination a prior attempt already populated. That
+  // deleted pre-existing quarantine content, not just a partial copy this
+  // call itself wrote.
+  test('refuses to move onto an existing destination and leaves its content untouched', async () => {
+    const src = join(root, 'src');
+    const dst = join(root, 'dst');
+    await mkdir(src);
+    await writeFile(join(src, 'a.txt'), 'alpha');
+    // `dst` already holds unrelated content this call did not create --
+    // e.g. a prior quarantine attempt, or a name collision.
+    await mkdir(dst);
+    await writeFile(join(dst, 'pre-existing.txt'), 'do not touch me');
+    const cpSpy = mock(async () => undefined);
+    const rmSpy = mock(rm);
+
+    await expect(
+      moveDirAcrossDevices(src, dst, {
+        rename: async () => {
+          throw exdevError();
+        },
+        cp: cpSpy,
+        rm: rmSpy,
+      })
+    ).rejects.toBeInstanceOf(MoveDirDestinationExistsError);
+
+    // cp/rm are never called on the pre-existing destination: no attempt was
+    // made to write onto it, and nothing was deleted trying to clean it up.
+    expect(cpSpy).not.toHaveBeenCalled();
+    expect(rmSpy).not.toHaveBeenCalled();
+    expect(await readFile(join(dst, 'pre-existing.txt'), 'utf8')).toBe('do not touch me');
+    // The source is left in place too -- this failed move is a no-op, not a
+    // partial one.
+    expect(await readFile(join(src, 'a.txt'), 'utf8')).toBe('alpha');
+  });
+
+  test('MoveDirDestinationExistsError names the colliding path', async () => {
+    const src = join(root, 'src');
+    const dst = join(root, 'dst');
+    await mkdir(src);
+    await mkdir(dst);
+
+    let caught: unknown;
+    try {
+      await moveDirAcrossDevices(src, dst, {
+        rename: async () => {
+          throw exdevError();
+        },
+        cp,
+        rm,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(MoveDirDestinationExistsError);
+    expect((caught as MoveDirDestinationExistsError).path).toBe(dst);
+    expect((caught as Error).message).toContain(dst);
   });
 });
 
