@@ -33,6 +33,9 @@ export interface PullRequestRef {
   owner: string;
   repo: string;
   number: number;
+  headRef?: string;
+  author?: string;
+  createdAt?: string;
 }
 
 export type PullRequestState = string;
@@ -69,6 +72,18 @@ export interface PullRequestEvidence {
    * exists so the watcher stops reporting an unverified absence as a fact.
    */
   lookupFailed?: boolean;
+  /**
+   * Other open PRs for the same WO, excluding the selected PR. Bounded to five.
+   * Present so the judge can see a builder pre-review PR beside the run's own PR.
+   */
+  otherOpenPrsForWo?: { number: number; headRef: string; createdAt: string }[];
+  /**
+   * True when the optional sibling WO search failed after the primary PR was
+   * already resolved. The primary `lookupFailed` flag stays unset: the run's
+   * own PR is known, and `otherOpenPrsForWo` is empty because siblings were
+   * not loaded.
+   */
+  otherOpenPrsForWoLookupFailed?: boolean;
 }
 
 export interface GrokJudgeEvidence {
