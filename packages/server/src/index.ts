@@ -13,7 +13,10 @@ import '@archon/paths/strip-cwd-env-boot';
 import { config } from 'dotenv';
 import { resolve, join } from 'path';
 import { existsSync } from 'fs';
-import { BUNDLED_IS_BINARY, getArchonEnvPath } from '@archon/paths';
+import { mkdir, writeFile } from 'fs/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { BUNDLED_IS_BINARY, getArchonEnvPath, getArchonHome } from '@archon/paths';
 
 // In dev/source mode, load the repo root .env (platform tokens, API keys, etc.)
 // import.meta.dir is frozen at build time, so skip in compiled binaries.
@@ -78,6 +81,42 @@ import {
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import { createMergeManager } from '@archon/overseer/merge-manager';
 import { resolveDefaultDeps } from '@archon/overseer/service';
+import {
+  countOverseerAutomaticRecoveryAttempts,
+  getOverseerActionsForRun,
+  getOverseerWatchRunByWorkingPath,
+} from '@archon/core/db/overseer';
+import { getOverseerCapabilityState } from '@archon/core/db/overseer-capabilities';
+import { createOverseerFireWorkflowRun } from './overseer-fire';
+import { executeAutomaticRefire } from '@archon/overseer/actions/automatic-refire';
+import { releaseTerminalWorktree } from '@archon/overseer/actions/automatic-refire';
+import {
+  assessRepairRefireCandidate,
+  executeRepairRefire,
+} from '@archon/overseer/actions/repair-refire';
+import { createRepairRefireAdapter } from '@archon/overseer/adapters/repair-refire';
+import { authorizeOverseerActionV2 } from '@archon/overseer/action-policy-v2';
+import { readOverseerActionPolicyFromEnv } from '@archon/overseer/action-policy';
+import {
+  appendM31ExecutionOutcomeV2,
+  compareAndConsumeM31ProposalV2,
+  createM31ActionProposalV2,
+  getM31ActionProposalV2,
+  getM31ChainAssessmentV2,
+  getM31SnapshotV2,
+  registerM31SnapshotV2,
+  reserveM31ExecutionEffectV2,
+  targetDigestV2,
+  type M31ActionPermitV2,
+  type M31WorkflowRunTargetV2,
+} from '@archon/core/db/m31-target-v2';
+import {
+  appendOverseerCapabilityEvent,
+  openOverseerCapabilityCircuit,
+} from '@archon/core/db/overseer-capabilities';
+import { createHash } from 'crypto';
+import { removeWorktreeForce, getCanonicalRepoPath, toWorktreePath } from '@archon/git';
+import { findLiveRunsForWo } from './routes/wo-fire-guard';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import { ingestCheckCompletionEvent } from '@archon/overseer/pr-review-check-ingest';
@@ -185,7 +224,7 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function startOverseerRuntimeWithRealMergeManager(): void {
+function startOverseerRuntimeWithRealMergeManager(port: number): void {
   const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
   const realAdapterRequested =
     !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) && token.length > 0;
@@ -195,8 +234,414 @@ function startOverseerRuntimeWithRealMergeManager(): void {
   }
   const deps = resolveDefaultDeps();
   const mergeManager = createMergeManager(deps);
+  const fireWorkflowRun = createOverseerFireWorkflowRun({
+    port,
+    operatorToken: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+  });
+  const automaticRefire = (
+    record: Parameters<typeof executeAutomaticRefire>[0],
+    events: Parameters<typeof executeAutomaticRefire>[1]
+  ) =>
+    executeAutomaticRefire(record, events, {
+      countAutomaticAttempts: countOverseerAutomaticRecoveryAttempts,
+      findLiveRunsForWo,
+      findConfirmedSuccessor: async runId => {
+        const row = (await getOverseerActionsForRun(runId)).find(
+          action =>
+            action.action === 'repair_refire' && action.result.startsWith('fired:successor:')
+        );
+        if (!row) return null;
+        const match = /^fired:successor:([^:]+):attempt:(\d+)/.exec(row.result);
+        return match?.[1] ? { runId: match[1], attempt: Number(match[2] ?? 1) } : null;
+      },
+      releaseTerminalWorktree: async (_failed, events) => {
+        const collision = [...events]
+          .reverse()
+          .map(event => String(event.data?.error ?? event.data?.message ?? ''))
+          .find(message => message.includes('is already used by worktree'));
+        if (!collision) return { ok: false, reason: 'worktree_owner_unknown' };
+        const runGit = promisify(execFile);
+        return releaseTerminalWorktree(collision, {
+          getRunByWorkingPath: getOverseerWatchRunByWorkingPath,
+          inspect: async path => {
+            const status = await runGit('git', ['-C', path, 'status', '--porcelain']);
+            const diff = await runGit('git', ['-C', path, 'diff', 'HEAD']);
+            return {
+              dirty: status.stdout.trim().length > 0,
+              diff: diff.stdout,
+              untracked: status.stdout
+                .split('\n')
+                .filter(line => line.startsWith('?? '))
+                .map(line => line.slice(3)),
+            };
+          },
+          persistPatch: async (ownerRunId, contents) => {
+            const directory = join(getArchonHome(), 'runs', ownerRunId);
+            await mkdir(directory, { recursive: true });
+            await writeFile(join(directory, 'overseer-salvage.patch'), contents, {
+              encoding: 'utf8',
+              flag: 'wx',
+            });
+          },
+          removeForce: async path => {
+            const repository = await getCanonicalRepoPath(path);
+            await removeWorktreeForce(repository, toWorktreePath(path));
+          },
+        });
+      },
+      execute: async (failed, _events, attempt) => {
+        const capability = await getOverseerCapabilityState('repair');
+        if (!failed.workflowName || !failed.repo || !_events.length || !capability) {
+          return {
+            disposition: 'escalate',
+            outcome: 'salvage_missing',
+            successor_run_id: null,
+            predecessor_run_id: failed.runId,
+            external_effect_reference: null,
+            reason: 'salvage_missing',
+          };
+        }
+        const sha256hex = (value: string) => createHash('sha256').update(value).digest('hex');
+        const nowRow = await pool.query<{ now: string }>(
+          process.env.DATABASE_URL
+            ? 'SELECT to_char(now() AT TIME ZONE \'UTC\',\'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"\') AS now'
+            : "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS now"
+        );
+        const observedAt = String(nowRow.rows[0]?.now);
+        const target: M31WorkflowRunTargetV2 = {
+          target_kind: 'workflow_run',
+          repository: failed.repo,
+          run_id: failed.runId,
+          wo_id: failed.woId,
+          workflow_name: failed.workflowName,
+          codebase_id: null,
+          status: failed.status,
+          event_tip: _events.at(-1)?.id ?? sha256hex(JSON.stringify(_events)),
+          head_sha: failed.prEvidence.headSha ?? null,
+          base_sha: null,
+        };
+        const runStartSha = (() => {
+          const metadata = failed.metadata ?? {};
+          const fromMetadata =
+            metadata.RUN_START_SHA ?? metadata.run_start_sha ?? metadata.runStartSha;
+          if (typeof fromMetadata === 'string' && /^[0-9a-f]{40,64}$/i.test(fromMetadata)) {
+            return fromMetadata;
+          }
+          for (const event of _events) {
+            const data = event.data ?? {};
+            const candidate = data.RUN_START_SHA ?? data.run_start_sha ?? data.runStartSha;
+            if (typeof candidate === 'string' && /^[0-9a-f]{40,64}$/i.test(candidate)) {
+              return candidate;
+            }
+          }
+          return null;
+        })();
+        if (!failed.workingPath || !failed.headBranch || !runStartSha) {
+          return {
+            disposition: 'reconcile_only',
+            outcome: 'salvage_missing',
+            successor_run_id: null,
+            predecessor_run_id: failed.runId,
+            external_effect_reference: null,
+            reason: 'salvage_missing',
+          };
+        }
+        const runGit = promisify(execFile);
+        let worktreeHead: string;
+        let originTip: string;
+        try {
+          worktreeHead = (
+            await runGit('git', ['-C', failed.workingPath, 'rev-parse', '--verify', 'HEAD'])
+          ).stdout.trim();
+          originTip = (
+            await runGit('git', [
+              '-C',
+              failed.workingPath,
+              'rev-parse',
+              '--verify',
+              `refs/remotes/origin/${failed.headBranch}`,
+            ])
+          ).stdout.trim();
+        } catch {
+          return {
+            disposition: 'reconcile_only',
+            outcome: 'salvage_missing',
+            successor_run_id: null,
+            predecessor_run_id: failed.runId,
+            external_effect_reference: null,
+            reason: 'salvage_missing',
+          };
+        }
+        if (
+          ![worktreeHead, originTip, runStartSha].every(value =>
+            /^[0-9a-f]{40,64}$/i.test(value)
+          )
+        ) {
+          throw new Error('invalid_salvage_git_lineage');
+        }
+        const evidence = JSON.stringify({
+          events: _events,
+          salvage: {
+            worktree_head: worktreeHead,
+            origin_tip: originTip,
+            run_start_sha: runStartSha,
+          },
+        });
+        const evidenceBlob = sha256hex(evidence);
+        const evidenceDirectory = join(getArchonHome(), 'runs', failed.runId);
+        const evidencePath = join(evidenceDirectory, 'overseer-refire-evidence.json');
+        await mkdir(evidenceDirectory, { recursive: true });
+        await writeFile(evidencePath, evidence, { encoding: 'utf8' });
+        const chain = await getM31ChainAssessmentV2(failed.repo);
+        const predecessor = chain.tip_snapshot_id
+          ? await getM31SnapshotV2(chain.tip_snapshot_id)
+          : null;
+        const snapshot = await registerM31SnapshotV2({
+          repository: failed.repo,
+          capture_started_at: observedAt,
+          capture_completed_at: observedAt,
+          operator_actor: 'overseer-refire',
+          operator_model: 'deterministic',
+          read_only_query_method: 'workflow_event_tail',
+          evidence_artifact_path: evidencePath,
+          git_object_format: 'sha256',
+          evidence_git_blob: evidenceBlob,
+          predecessor_snapshot_id: predecessor?.snapshot_id ?? null,
+          predecessor_evidence_git_blob: predecessor?.evidence_git_blob ?? null,
+          targets: [
+            {
+              target,
+              evidence_artifact_path: evidencePath,
+              git_object_format: 'sha256',
+              evidence_git_blob: evidenceBlob,
+              observed_at: observedAt,
+            },
+          ],
+        });
+        const proposalResult = await createM31ActionProposalV2({
+          repository: failed.repo,
+          snapshot_id: snapshot.snapshot_id,
+          target,
+          evidence_path: evidencePath,
+          action_kind: 'REFIRE',
+          action_parameters: { attempt, predecessor_run_id: failed.runId },
+          actor: 'overseer-refire',
+          ttl_ms: 900_000,
+          policy_digest: capability.policy_digest,
+          verifier_registry_digest: capability.verifier_registry_digest,
+        });
+        if (!proposalResult.ok) throw new Error(`m31_proposal_failed:${proposalResult.failure}`);
+        const proposal = proposalResult.value;
+        let permit: M31ActionPermitV2 | null = null;
+        const adapter = createRepairRefireAdapter({
+          onRamp: { startFirstRefire: async request => fireAsOnRamp(request) },
+          conductor: {
+            pickEntryTier: () => 'same-lane',
+            runCascade: async ({ request }) => fireAsOnRamp(request),
+          },
+          inPlaceRepair: {
+            startInPlaceRepair: async () => {
+              throw new Error('in_place_repair_not_wired');
+            },
+          },
+        });
+        async function fireAsOnRamp(request: { workflow_name: string }) {
+          try {
+            const fired = await fireWorkflowRun({
+              workflowName: request.workflow_name,
+              woId: failed.woId,
+              project: failed.repo!,
+              predecessorRunId: failed.runId,
+            });
+            return fired.ok
+              ? {
+                  schema_version: 'overseer-first-refire-on-ramp-result-v1' as const,
+                  status: 'succeeded' as const,
+                  successor_run_id: fired.runId,
+                  external_effect_reference: fired.conversationId,
+                  evidence_digest: sha256hex(fired.runId),
+                  reason: 'fired',
+                }
+              : 'indeterminate' in fired && fired.indeterminate
+                ? {
+                    schema_version: 'overseer-first-refire-on-ramp-result-v1' as const,
+                    status: 'indeterminate' as const,
+                    successor_run_id: null,
+                    external_effect_reference: fired.conversationId,
+                    evidence_digest: sha256hex(fired.error),
+                    reason: fired.error,
+                  }
+                : {
+                    schema_version: 'overseer-first-refire-on-ramp-result-v1' as const,
+                    status: 'failed' as const,
+                    successor_run_id: null,
+                    external_effect_reference: null,
+                    evidence_digest: sha256hex(fired.error),
+                    reason: `fire_failed:${fired.error}`,
+                  };
+          } catch (error) {
+            return {
+              schema_version: 'overseer-first-refire-on-ramp-result-v1' as const,
+              status: 'indeterminate' as const,
+              successor_run_id: null,
+              external_effect_reference: proposal.execution_id,
+              evidence_digest: sha256hex(String(error)),
+              reason: 'fire_indeterminate',
+            };
+          }
+        }
+        return executeRepairRefire(
+          {
+            assessment: assessRepairRefireCandidate({
+              action_gate_enabled: true,
+              evidence_complete: true,
+              has_exact_target: true,
+              has_active_owner_or_run: false,
+              has_indeterminate_prior_effect: false,
+              salvage_complete: true,
+              automatic_attempt_count: attempt - 1,
+              scope_changed: false,
+              semantic_dispute: false,
+              fusion_available: false,
+              repairable_in_place: false,
+            }),
+            proposal_id: proposal.proposal_id,
+            execution_id: proposal.execution_id,
+            idempotency_key: `${failed.runId}:${attempt}`,
+            repository: failed.repo,
+            wo_id: failed.woId,
+            workflow_name: failed.workflowName,
+            target_digest: targetDigestV2(target),
+            scope_digest: sha256hex(`${failed.repo}:${failed.woId}:${failed.workflowName}`),
+            failure_digest: evidenceBlob,
+            source_run_id: failed.runId,
+            salvage_receipt: {
+              schema_version: 'overseer-salvage-receipt-v1',
+              repository: failed.repo,
+              wo_id: failed.woId,
+              source_target_kind: 'workflow_run',
+              source_target_key: failed.runId,
+              source_target_digest: targetDigestV2(target),
+              source_run_id: failed.runId,
+              worktree_path: failed.workingPath ?? '',
+              artifact_kind: 'patch',
+              git_object_format: null,
+              git_object_id: null,
+              patch_path: evidencePath,
+              patch_sha256: evidenceBlob,
+              scope_digest: sha256hex(`${failed.repo}:${failed.woId}:${failed.workflowName}`),
+              captured_at: observedAt,
+              verified_at: observedAt,
+            },
+            actor: 'overseer-refire',
+            correlation_id: `overseer-refire:${failed.runId}`,
+          },
+          {
+            gate: {
+              preparePermit: async () => {
+                const prepared = await compareAndConsumeM31ProposalV2({
+                  proposal_id: proposal.proposal_id,
+                  observation: {
+                    known: true,
+                    target,
+                    policy_digest: capability.policy_digest,
+                    verifier_registry_digest: capability.verifier_registry_digest,
+                    observed_at: observedAt,
+                  },
+                });
+                if (prepared.ok) permit = prepared.permit;
+                return {
+                  ok: prepared.ok,
+                  reason: prepared.ok ? 'permit_issued' : prepared.failure,
+                };
+              },
+              authorizeAction: async input =>
+                authorizeOverseerActionV2(
+                  {
+                    requested_capability: 'repair',
+                    permit: permit!,
+                    actor: input.actor,
+                    correlation_id: input.correlation_id,
+                  },
+                  {
+                    getPolicy: async () => readOverseerActionPolicyFromEnv(),
+                    getCapabilityState: getOverseerCapabilityState,
+                    getProposal: getM31ActionProposalV2,
+                    getCurrentTime: async () => observedAt,
+                    recordDecision: async ({ decision }) => {
+                      await appendOverseerCapabilityEvent({
+                        capability: 'repair',
+                        event_type: decision.allowed ? 'gate_allowed' : 'gate_denied',
+                        reason: decision.reason,
+                        actor: input.actor,
+                        correlation_id: input.correlation_id,
+                        proposal_id: proposal.proposal_id,
+                        execution_id: proposal.execution_id,
+                        policy_digest: capability.policy_digest,
+                        verifier_registry_digest: capability.verifier_registry_digest,
+                      });
+                    },
+                  }
+                ),
+              reserveEffect: async input => {
+                const reserved = await reserveM31ExecutionEffectV2({
+                  permit: permit!,
+                  adapter_name: input.adapter_name,
+                  provider_operation: 'workflow_refire',
+                  reason: 'automatic_refire',
+                  evidence: { run_id: failed.runId },
+                });
+                return {
+                  ok: reserved.ok,
+                  reason: reserved.ok ? 'effect_reserved' : reserved.failure,
+                };
+              },
+              appendOutcome: async input => {
+                const appended = await appendM31ExecutionOutcomeV2({
+                  execution_id: input.execution_id,
+                  outcome: input.outcome,
+                  reason: input.reason,
+                  external_effect_reference: input.external_effect_reference,
+                  evidence: { run_id: failed.runId },
+                });
+                return { ok: appended.ok };
+              },
+            },
+            adapter,
+            idempotency: {
+              begin: async () => ({ status: 'fresh' }),
+              commit: async () => undefined,
+            },
+            circuit: {
+              openRepairCircuit: async reason => {
+                await openOverseerCapabilityCircuit({
+                  capability: 'repair',
+                  reason,
+                  actor: 'overseer-refire',
+                  correlation_id: `overseer-refire:${failed.runId}`,
+                  proposal_id: proposal.proposal_id,
+                  execution_id: proposal.execution_id,
+                  policy_digest: capability.policy_digest,
+                  verifier_registry_digest: capability.verifier_registry_digest,
+                });
+              },
+            },
+            recorder: { recordDisposition: async () => undefined },
+            sha256hex,
+            adapterName: 'overseer-fire-loopback',
+          }
+        );
+      },
+    });
   startOverseerRuntime({
-    serviceOptions: { deps, mergeCoordinator: mergeManager, mergeBridgeEnabled: true },
+    serviceOptions: {
+      deps,
+      mergeCoordinator: mergeManager,
+      mergeBridgeEnabled: true,
+      fireWorkflowRun,
+      countAutomaticAttempts: countOverseerAutomaticRecoveryAttempts,
+      executeAutomaticRefire: automaticRefire,
+    },
   });
 }
 
@@ -288,8 +733,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().fatal({ err: error }, 'startup_running_reconciliation_failed');
     process.exit(1);
   }
-
-  startOverseerRuntimeWithRealMergeManager();
 
   const config = await loadConfig();
   logConfig(config);
@@ -796,6 +1239,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     idleTimeout: 255, // Max value (seconds) - prevents SSE connections from being killed
   });
   getLog().info({ port: server.port, hostname }, 'server_listening');
+  startOverseerRuntimeWithRealMergeManager(server.port ?? port);
   startDispatchEscalationClock();
 
   // Initialize Telegram adapter (conditional, skipped in CLI serve mode)

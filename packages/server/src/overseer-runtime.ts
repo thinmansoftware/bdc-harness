@@ -40,7 +40,13 @@ interface OverseerRuntimeDeps {
   readonly runService?: typeof runOverseerService;
   readonly serviceOptions?: Pick<
     OverseerServiceOptions,
-    'deps' | 'mergeCoordinator' | 'mergeBridgeEnabled'
+    | 'deps'
+    | 'mergeCoordinator'
+    | 'mergeBridgeEnabled'
+    | 'fireWorkflowRun'
+    | 'countAutomaticAttempts'
+    | 'releaseTerminalWorktree'
+    | 'executeAutomaticRefire'
   >;
 }
 
