@@ -265,24 +265,34 @@ async function retireInactiveOperatorCardChannel(input: {
   now: string;
   store: DeliveryStore;
 }): Promise<DeliveryJobRecord> {
-  await input.store.appendDeliveryReceipt({
-    card_id: input.job.card_id,
-    channel: input.job.channel,
-    attempt_number: input.job.attempts_started,
-    phase: 'terminal',
-    started_at: input.now,
-    completed_at: input.now,
-    outcome: 'permanent_failure',
-    sanitized_status: 'channel_retired',
-    fencing_token: input.job.fencing_token,
-    lease_owner: input.owner,
-  });
+  const card = await input.store.getOperatorCard(input.job.card_id);
+  if (!card) throw new Error('operator_card_not_found');
+  const priorTerminal = card.receipts.find(
+    receipt =>
+      receipt.channel === input.job.channel &&
+      receipt.attempt_number === input.job.attempts_started &&
+      receipt.phase === 'terminal'
+  );
+  if (!priorTerminal) {
+    await input.store.appendDeliveryReceipt({
+      card_id: input.job.card_id,
+      channel: input.job.channel,
+      attempt_number: input.job.attempts_started,
+      phase: 'terminal',
+      started_at: input.now,
+      completed_at: input.now,
+      outcome: 'permanent_failure',
+      sanitized_status: 'channel_retired',
+      fencing_token: input.job.fencing_token,
+      lease_owner: input.owner,
+    });
+  }
   return input.store.completeDeliveryJob({
     card_id: input.job.card_id,
     channel: input.job.channel,
     owner: input.owner,
     fencing_token: input.job.fencing_token,
-    outcome: 'permanent_failure',
+    outcome: priorTerminal?.outcome ?? 'permanent_failure',
     now: input.now,
   });
 }

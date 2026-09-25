@@ -712,6 +712,69 @@ describe('default informational channel adapters', () => {
     expect(injected).not.toHaveBeenCalled();
   });
 
+  test('reclaimed notion job with an existing terminal receipt completes without a duplicate', async () => {
+    const view = await defaultCardView();
+    const dueAt = view.card.created_at;
+    await getDatabase().query(
+      `INSERT INTO overseer_operator_card_delivery_jobs (
+        card_id, channel, state, attempts_started, next_attempt_at, fencing_token, updated_at
+      ) VALUES ($1, 'notion', 'pending', 0, $2, 0, $2)`,
+      [view.card.card_id, dueAt]
+    );
+    const crashed = await claimDueDeliveryJob({
+      channel: 'notion',
+      owner: 'notion-crashed',
+      now: dueAt,
+      lease_duration_ms: 1_000,
+    });
+    expect(crashed).not.toBeNull();
+    if (!crashed) throw new Error('notion_job_not_claimed');
+    await appendDeliveryReceipt({
+      card_id: view.card.card_id,
+      channel: 'notion',
+      attempt_number: crashed.attempts_started,
+      phase: 'terminal',
+      started_at: dueAt,
+      completed_at: dueAt,
+      outcome: 'permanent_failure',
+      sanitized_status: 'channel_retired',
+      fencing_token: crashed.fencing_token,
+      lease_owner: 'notion-crashed',
+    });
+
+    const delivered: string[] = [];
+    const channels: OperatorCardChannel[] = ['builder_monitor', 'dispatch'].map(channel => ({
+      channel,
+      deliver: async () => {
+        delivered.push(channel);
+        return { outcome: 'succeeded' as const, sanitized_status: 'delivered' };
+      },
+      reconcile: async () => ({ outcome: 'indeterminate' as const, sanitized_status: 'unknown' }),
+    }));
+    const recoveredAt = new Date(new Date(dueAt).getTime() + 1_001).toISOString();
+    const completed = await runDueOperatorCardDeliveries({
+      channels,
+      owner: 'notion-recovery',
+      now: recoveredAt,
+    });
+
+    expect(completed.map(job => job.channel)).toContain('notion');
+    const after = await getOperatorCard(view.card.card_id);
+    const notionJob = after?.jobs.find(job => job.channel === 'notion');
+    const notionReceipts = after?.receipts.filter(receipt => receipt.channel === 'notion') ?? [];
+    expect(notionJob?.state).toBe('exhausted');
+    expect(notionJob?.lease_owner).toBeNull();
+    expect(notionReceipts).toHaveLength(1);
+    expect(notionReceipts[0]).toMatchObject({
+      phase: 'terminal',
+      outcome: 'permanent_failure',
+      sanitized_status: 'channel_retired',
+      attempt_number: crashed.attempts_started,
+      fencing_token: crashed.fencing_token,
+    });
+    expect(delivered.sort()).toEqual(['builder_monitor', 'dispatch']);
+  });
+
   test('active-channel-missing-still-errors', async () => {
     await defaultCardView();
     await expect(
