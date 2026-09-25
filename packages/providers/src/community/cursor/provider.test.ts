@@ -207,8 +207,10 @@ describe('CursorAgentProvider', () => {
     const gen = new CursorAgentProvider({ spawn: () => child }).sendQuery('hi', '/w');
     const observed: MessageChunk[] = [];
     for (let i = 0; i < 6; i++) observed.push((await gen.next()).value as MessageChunk);
-    expect(observed.filter(chunk => chunk.type === 'thinking')).toHaveLength(3);
-    expect(observed.filter(chunk => chunk.type === 'tool')).toHaveLength(2);
+    // A completed tool call is activity, not a second invocation. The DAG
+    // executor treats every tool chunk as a distinct tool_started event.
+    expect(observed.filter(chunk => chunk.type === 'thinking')).toHaveLength(4);
+    expect(observed.filter(chunk => chunk.type === 'tool')).toHaveLength(1);
     expect(assistantText(observed)).toBe('final answer');
     exit.resolve(0);
     const rest: MessageChunk[] = [];

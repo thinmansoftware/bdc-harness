@@ -165,7 +165,12 @@ export class CursorAgentProvider implements IAgentProvider {
             return { type: 'thinking', content: '' };
           }
           if (event.type === 'tool_call') {
-            return { type: 'tool', toolName: extractToolName(event) };
+            if (event.subtype === 'started') {
+              return { type: 'tool', toolName: extractToolName(event) };
+            }
+            // A tool chunk denotes an invocation to the DAG executor. Keep
+            // completion visible as activity without fabricating a second call.
+            return { type: 'thinking', content: '' };
           }
           if (event.type === 'result') {
             resultText = typeof event.result === 'string' ? event.result : '';
