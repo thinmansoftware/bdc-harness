@@ -838,8 +838,28 @@ describe('evidence envelope: bounded by construction', () => {
     ]);
     const prompt = buildJudgePrompt(envelope);
     expect(prompt).toContain('archon/task-');
+    expect(prompt).toContain('runWindow');
     expect(prompt).toContain('never duplicate_work');
     expect(prompt).toContain('never needs_human');
+    expect(envelope.runWindow).toEqual({ startedAt: null, endedAt: null });
+  });
+
+  test('bounds the run window to the earliest and latest event timestamps', () => {
+    const envelope = buildEvidenceEnvelope(makeRecord(), [
+      makeEvent('e1', 'first'),
+      makeEvent('e9', 'last'),
+      {
+        id: 'e-blank',
+        workflow_run_id: 'run-1',
+        event_type: 'node_completed',
+        step_name: 'commit-and-push',
+        data: {},
+      },
+    ]);
+    expect(envelope.runWindow).toEqual({
+      startedAt: '2026-07-28T00:00:01Z',
+      endedAt: '2026-07-28T00:00:09Z',
+    });
   });
 
   test('defaults missing PR identity to null and an empty other-PR list', () => {

@@ -70,6 +70,11 @@ export interface JudgeEvidenceEnvelope {
     createdAt: string | null;
   };
   otherOpenPrsForWo: { number: number; headRef: string; createdAt: string }[];
+  /**
+   * Inclusive bounds of this run, taken from event timestamps. The judge
+   * compares PR createdAt against this window. Null when no event has a timestamp.
+   */
+  runWindow: { startedAt: string | null; endedAt: string | null };
   /** Classifier output, demoted to advisory hint fields (binding term: no gate). */
   hint: { action: string; errorClass: string | null; reason: string };
   eventTail: { type: string; step: string | null; at: string; message: string }[];
@@ -120,6 +125,22 @@ export function defaultJudgeLadder(): string[] {
 
 function truncate(value: string, cap: number): string {
   return value.length > cap ? `${value.slice(0, cap)}...` : value;
+}
+
+/** Earliest and latest event timestamps. Two strings, never the event list. */
+function runWindowFromEvents(events: OverseerWorkflowEvent[]): {
+  startedAt: string | null;
+  endedAt: string | null;
+} {
+  let startedAt: string | null = null;
+  let endedAt: string | null = null;
+  for (const event of events) {
+    const at = event.created_at;
+    if (typeof at !== 'string' || at === '') continue;
+    if (startedAt === null || at < startedAt) startedAt = at;
+    if (endedAt === null || at > endedAt) endedAt = at;
+  }
+  return { startedAt, endedAt };
 }
 
 function eventMessage(data: Record<string, unknown>): string {
@@ -174,6 +195,7 @@ export function buildEvidenceEnvelope(
       createdAt: record.prEvidence.pr?.createdAt ?? null,
     },
     otherOpenPrsForWo: (record.prEvidence.otherOpenPrsForWo ?? []).slice(0, 5),
+    runWindow: runWindowFromEvents(events),
     hint: {
       action: record.action,
       errorClass: record.errorClass ?? null,
@@ -206,8 +228,10 @@ export function buildJudgePrompt(envelope: JudgeEvidenceEnvelope): string {
     'run; failed_genuine when the run failed and no salvageable work exists;',
     'duplicate_work when the evidence shows this WO already has an equivalent open PR;',
     'needs_human when evidence conflicts or the failure shape is unrecognized;',
-    'A PR whose headRef starts with "archon/task-" and whose createdAt falls during the',
-    "run is that run's builder-created pre-review byproduct, never duplicate_work.",
+    'A PR whose headRef starts with "archon/task-" and whose createdAt falls inside',
+    'runWindow (startedAt through endedAt, inclusive) is that run\'s builder-created',
+    'pre-review byproduct, never duplicate_work. If either runWindow bound is null,',
+    'do not treat createdAt as during the run.',
     'A completed run whose own PR exists and whose event tail contains no failed node',
     'must be classified as healthy or observe, never needs_human.',
     'observe/healthy for uneventful terminal runs. The deterministic classifier hint',

@@ -130,14 +130,16 @@ export function recoverHeadBranchFromEvents(events: OverseerWorkflowEvent[]): st
   let branch: string | undefined;
   for (const event of events) {
     const nodeOutput = event.data.node_output;
-    const output =
-      typeof nodeOutput === 'string'
-        ? nodeOutput
-        : typeof event.data.output === 'string'
-          ? event.data.output
-          : '';
-    const match = /unique_branch=(\S+)/.exec(output);
-    if (match?.[1]) branch = match[1];
+    const fromNodeOutput =
+      typeof nodeOutput === 'string' ? /unique_branch=(\S+)/.exec(nodeOutput)?.[1] : undefined;
+    const fromOutput =
+      typeof event.data.output === 'string'
+        ? /unique_branch=(\S+)/.exec(event.data.output)?.[1]
+        : undefined;
+    // A string node_output that does not carry unique_branch= must not hide
+    // a branch reported on data.output. node_output wins only when it parses.
+    const found = fromNodeOutput ?? fromOutput;
+    if (found) branch = found;
   }
   return branch;
 }

@@ -370,6 +370,16 @@ describe('run PR identity', () => {
     expect(recovered).toBe(branch);
   });
 
+  test('falls back to data.output when node_output has no unique_branch', () => {
+    const recovered = recoverHeadBranchFromEvents([
+      event({
+        node_output: 'pushed without a branch token',
+        output: `unique_branch=${branch}`,
+      }),
+    ]);
+    expect(recovered).toBe(branch);
+  });
+
   test('node_output wins over output on the same event', () => {
     const recovered = recoverHeadBranchFromEvents([
       event({

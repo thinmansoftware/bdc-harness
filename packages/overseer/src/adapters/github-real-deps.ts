@@ -719,10 +719,13 @@ export function summarizeChecks(
 }
 
 /**
- * Real findPullRequest: looks up an open PR by head branch first (fast path),
- * falling back to a WO-ID title/body search (mirrors reconcile.ts's approach)
- * when no headBranch is supplied. Evidence fields are populated only from
- * live API data -- no invented defaults beyond the documented "missing" shape.
+ * Real findPullRequest: looks up an open PR by head branch first (the run's
+ * own PR), then a WO-ID title/body search (mirrors reconcile.ts's approach).
+ * A recovered head branch still runs the WO search so sibling open PRs
+ * (including archon/task-* pre-review PRs) land in otherOpenPrsForWo. The
+ * search selects a PR only when the head branch did not. Evidence fields are
+ * populated only from live API data -- no invented defaults beyond the
+ * documented "missing" shape.
  */
 export function createRealFindPullRequest(
   octokit: RealGitHubOctokitLike,
@@ -752,9 +755,16 @@ export function createRealFindPullRequest(
         prNumber = list.data[0]?.number ?? null;
       }
 
+      // Head-branch recovery is the normal path (runs do not store headBranch).
+      // That lookup must not skip the WO search: sibling open PRs are the only
+      // source for otherOpenPrsForWo. An explicit prNumber stays unique and
+      // still skips the search. Selection runs only when the head did not resolve.
+      const resolvedByHeadBranch =
+        input.prNumber == null && Boolean(input.headBranch) && prNumber !== null;
+
       // 'unknown' is parseWoId's could-not-parse fallback, not a WO id --
       // searching for the literal word would return garbage matches.
-      if (prNumber === null && input.woId && input.woId !== 'unknown') {
+      if (input.woId && input.woId !== 'unknown' && (prNumber === null || resolvedByHeadBranch)) {
         const search = await octokit.search.issuesAndPullRequests({
           // Title AND body: lanes title PRs freely (anchor: canary PR #705,
           // 'docs(canary): add e2e merge canary marker' -- WO id only in the
@@ -782,16 +792,18 @@ export function createRealFindPullRequest(
             createdAt: fetched.data.created_at ?? '',
           });
         }
-        const selected = selectWoSearchCandidate(woSearchCandidates);
-        if (selected) {
-          prNumber = selected.number;
-        } else if (woSearchCandidates.length > 0) {
-          rateLimitBackoffUntil = 0;
-          rateLimitLastLoggedAt = 0;
-          return {
-            ...MISSING_EVIDENCE,
-            otherOpenPrsForWo: otherOpenPrsForWo(woSearchCandidates, null),
-          };
+        if (prNumber === null) {
+          const selected = selectWoSearchCandidate(woSearchCandidates);
+          if (selected) {
+            prNumber = selected.number;
+          } else if (woSearchCandidates.length > 0) {
+            rateLimitBackoffUntil = 0;
+            rateLimitLastLoggedAt = 0;
+            return {
+              ...MISSING_EVIDENCE,
+              otherOpenPrsForWo: otherOpenPrsForWo(woSearchCandidates, null),
+            };
+          }
         }
       }
 
