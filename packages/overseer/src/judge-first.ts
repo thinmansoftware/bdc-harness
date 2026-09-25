@@ -69,7 +69,12 @@ export interface JudgeEvidenceEnvelope {
     author: string | null;
     createdAt: string | null;
   };
-  otherOpenPrsForWo: { number: number; headRef: string; createdAt: string }[];
+  otherOpenPrsForWo: { number: number; headRef: string; createdAt: string }[] | null;
+  /**
+   * True when the best-effort sibling search failed. otherOpenPrsForWo is
+   * then null and must not be read as an authoritative empty list.
+   */
+  otherOpenPrsForWoLookupFailed: boolean;
   /**
    * Inclusive bounds of this run, taken from event timestamps. The judge
    * compares PR createdAt against this window. Null when no event has a timestamp.
@@ -175,6 +180,7 @@ export function buildEvidenceEnvelope(
     at: event.created_at ?? '',
     message: truncate(eventMessage(event.data), EVENT_MESSAGE_CAP),
   }));
+  const siblingLookupFailed = record.prEvidence.otherOpenPrsForWoLookupFailed === true;
   return {
     runId: record.runId,
     woId: record.woId,
@@ -194,7 +200,10 @@ export function buildEvidenceEnvelope(
       author: record.prEvidence.pr?.author ?? null,
       createdAt: record.prEvidence.pr?.createdAt ?? null,
     },
-    otherOpenPrsForWo: (record.prEvidence.otherOpenPrsForWo ?? []).slice(0, 5),
+    otherOpenPrsForWo: siblingLookupFailed
+      ? null
+      : (record.prEvidence.otherOpenPrsForWo ?? []).slice(0, 5),
+    otherOpenPrsForWoLookupFailed: siblingLookupFailed,
     runWindow: runWindowFromEvents(events),
     hint: {
       action: record.action,
@@ -234,6 +243,9 @@ export function buildJudgePrompt(envelope: JudgeEvidenceEnvelope): string {
     'do not treat createdAt as during the run.',
     'A completed run whose own PR exists and whose event tail contains no failed node',
     'must be classified as healthy or observe, never needs_human.',
+    'otherOpenPrsForWoLookupFailed: true together with otherOpenPrsForWo: null means',
+    'the sibling list is unavailable. A null sibling list is not evidence that no',
+    'duplicate or sibling PR exists and must not be treated as proof of exclusivity.',
     'observe/healthy for uneventful terminal runs. The deterministic classifier hint',
     'below is ADVISORY ONLY -- you may contradict it, and say so in reason when you do.',
     '',

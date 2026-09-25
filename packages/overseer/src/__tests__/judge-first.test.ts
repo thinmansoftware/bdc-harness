@@ -836,6 +836,7 @@ describe('evidence envelope: bounded by construction', () => {
         createdAt: '2026-09-25T00:30:00Z',
       },
     ]);
+    expect(envelope.otherOpenPrsForWoLookupFailed).toBe(false);
     const prompt = buildJudgePrompt(envelope);
     expect(prompt).toContain('archon/task-');
     expect(prompt).toContain('runWindow');
@@ -869,6 +870,7 @@ describe('evidence envelope: bounded by construction', () => {
     expect(envelope.pr.author).toBeNull();
     expect(envelope.pr.createdAt).toBeNull();
     expect(envelope.otherOpenPrsForWo).toEqual([]);
+    expect(envelope.otherOpenPrsForWoLookupFailed).toBe(false);
   });
 
   test('truncates otherOpenPrsForWo to five entries', () => {
@@ -890,9 +892,49 @@ describe('evidence envelope: bounded by construction', () => {
       }),
       []
     );
+    expect(envelope.otherOpenPrsForWoLookupFailed).toBe(false);
     expect(envelope.otherOpenPrsForWo).toHaveLength(5);
-    expect(envelope.otherOpenPrsForWo[0]?.number).toBe(100);
-    expect(envelope.otherOpenPrsForWo[4]?.number).toBe(104);
+    expect(envelope.otherOpenPrsForWo?.[0]?.number).toBe(100);
+    expect(envelope.otherOpenPrsForWo?.[4]?.number).toBe(104);
+  });
+
+  test('marks a failed sibling lookup as unavailable and drops stale siblings', () => {
+    const envelope = buildEvidenceEnvelope(
+      makeRecord({
+        prEvidence: {
+          exists: true,
+          state: 'open',
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          mergeable: true,
+          pr: {
+            owner: 'thinmansoftware',
+            repo: 'bdc-harness',
+            number: 968,
+            headRef: 'feat/wo-x-01-thread-abc',
+            author: 'builder',
+            createdAt: '2026-09-25T01:00:00Z',
+          },
+          otherOpenPrsForWoLookupFailed: true,
+          otherOpenPrsForWo: [
+            {
+              number: 967,
+              headRef: 'archon/task-web-worker-1',
+              createdAt: '2026-09-25T00:30:00Z',
+            },
+          ],
+        },
+      }),
+      []
+    );
+    expect(envelope.otherOpenPrsForWo).toBeNull();
+    expect(envelope.otherOpenPrsForWoLookupFailed).toBe(true);
+    expect(JSON.stringify(envelope)).not.toContain('archon/task-web-worker-1');
+    const prompt = buildJudgePrompt(envelope);
+    expect(prompt).toContain('otherOpenPrsForWoLookupFailed: true');
+    expect(prompt).toContain('otherOpenPrsForWo: null');
+    expect(prompt).toContain('sibling list is unavailable');
+    expect(prompt).toContain('not evidence that no');
+    expect(prompt).toContain('proof of exclusivity');
   });
 
   test('builds the same envelope and digest twice', () => {
