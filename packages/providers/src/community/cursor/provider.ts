@@ -208,6 +208,13 @@ export class CursorAgentProvider implements IAgentProvider {
       structuredOutput = parseJsonBestEffort(finalText);
     }
 
+    // Node output is built only from assistant chunks. A success stream with
+    // no assistant text still carries the answer on result.result; yield it
+    // or $nodeId.output stays empty.
+    if (stream.assistantText.trim().length === 0) {
+      yield { type: 'assistant', content: finalText };
+    }
+
     const servedModelId = stream.servedModelId;
     yield {
       type: 'result',

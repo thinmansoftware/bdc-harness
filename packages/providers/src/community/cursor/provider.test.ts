@@ -273,6 +273,28 @@ describe('CursorAgentProvider', () => {
     await expect(collect(provider.sendQuery('hi', '/w'))).rejects.toThrow(/model refused/);
   });
 
+  test('result.result fallback is yielded as an assistant chunk', async () => {
+    const answer = 'shipped the patch';
+    const { child } = fakeChild({
+      stdout: jsonl([
+        { type: 'system', subtype: 'init', model: 'Grok 4.7 256K High' },
+        { type: 'thinking', subtype: 'delta', text: 'working' },
+        successResult(answer),
+      ]),
+    });
+    const provider = new CursorAgentProvider({ spawn: () => child });
+    const chunks = await collect(provider.sendQuery('hi', '/w'));
+    expect(assistantText(chunks)).toBe(answer);
+    expect(chunks.filter(chunk => chunk.type === 'assistant')).toEqual([
+      { type: 'assistant', content: answer },
+    ]);
+    const last = chunks[chunks.length - 1];
+    expect(last?.type).toBe('result');
+    if (last?.type === 'result') {
+      expect(last.structuredOutput).toBeUndefined();
+    }
+  });
+
   test('empty-and-garbage-guards', async () => {
     const empty = fakeChild({
       stdout: jsonl([successResult('   ')]),
