@@ -501,7 +501,7 @@ serviceSuite('service', () => {
       const cards = await listOperatorCards();
       expect(cards.items).toHaveLength(1);
       expect(cards.items[0]?.card.run_id).toBe('run-default-escalation');
-      expect(cards.items[0]?.jobs).toHaveLength(3);
+      expect(cards.items[0]?.jobs).toHaveLength(2);
     });
   });
 
