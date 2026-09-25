@@ -206,6 +206,22 @@ export const ATTEMPT_COUNTER_TTL_MS = 24 * 60 * 60 * 1000;
  */
 export const ATTEMPT_COUNTER_MAX_ENTRIES = 512;
 
+/**
+ * How long a known required-contexts answer is reused for one owner/repo/base.
+ * Repeated PR-review ticks were re-asking GitHub for the same unprotected base
+ * about every five seconds and draining the shared quota (#993).
+ */
+export const REQUIRED_CONTEXTS_CACHE_TTL_MS = 10 * 60 * 1000;
+
+/** Back-off when a 403 names a rate limit and `x-ratelimit-reset` is unusable. */
+export const REQUIRED_CONTEXTS_RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000;
+
+/**
+ * Combined ceiling for known-result entries and rate-limit back-off entries.
+ * The two kinds share one budget so neither map can grow to this size alone.
+ */
+export const REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES = 512;
+
 interface AttemptCounterEntry {
   attempts: number;
   /** Epoch ms of the last write, used solely for staleness pruning. */
@@ -357,6 +373,148 @@ const loggedSources = new Set<string>();
 /** Test seam: forget which source lines have already been logged. */
 export function resetRequiredContextsSourceLog(): void {
   loggedSources.clear();
+}
+
+type KnownRequiredContextsResolution = Extract<RequiredContextsResolution, { state: 'known' }>;
+
+interface RequiredContextsCacheResultEntry {
+  kind: 'result';
+  resolution: KnownRequiredContextsResolution;
+  expiresAt: number;
+  touchedAt: number;
+  touchSeq: number;
+}
+
+interface RequiredContextsCacheBackoffEntry {
+  kind: 'backoff';
+  until: number;
+  touchedAt: number;
+  touchSeq: number;
+}
+
+type RequiredContextsCacheEntry =
+  | RequiredContextsCacheResultEntry
+  | RequiredContextsCacheBackoffEntry;
+
+/**
+ * Known answers and rate-limit back-offs, keyed by owner/repo@base (no head).
+ * Module scope matches the attempt counters: the evidence fetcher closure is
+ * rebuilt on every review tick, so a closure-local cache would never hit.
+ */
+const requiredContextsCache = new Map<string, RequiredContextsCacheEntry>();
+
+/** Monotonic tie-break so equal `Date.now()` values still evict oldest-first. */
+let requiredContextsCacheTouchSeq = 0;
+
+/** Test seam: drop cached resolutions and rate-limit back-offs. Attempt counters stay. */
+export function resetRequiredContextsCache(): void {
+  requiredContextsCache.clear();
+  requiredContextsCacheTouchSeq = 0;
+}
+
+function nextCacheTouch(now: number): { touchedAt: number; touchSeq: number } {
+  requiredContextsCacheTouchSeq += 1;
+  return { touchedAt: now, touchSeq: requiredContextsCacheTouchSeq };
+}
+
+function cacheEntryExpired(entry: RequiredContextsCacheEntry, now: number): boolean {
+  return entry.kind === 'result' ? now >= entry.expiresAt : now >= entry.until;
+}
+
+/**
+ * Drop expired entries, then evict oldest-touched survivors until the combined
+ * result and back-off population fits. When `incomingKey` is new, leave one
+ * free slot so the write that follows stays inside the ceiling.
+ */
+function pruneRequiredContextsCache(now: number, incomingKey?: string): void {
+  for (const [key, entry] of requiredContextsCache) {
+    if (cacheEntryExpired(entry, now)) requiredContextsCache.delete(key);
+  }
+  const updatingExisting = incomingKey !== undefined && requiredContextsCache.has(incomingKey);
+  const budget =
+    incomingKey === undefined || updatingExisting
+      ? REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES
+      : REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES - 1;
+  if (requiredContextsCache.size <= budget) return;
+  const oldestFirst = [...requiredContextsCache.entries()].sort(
+    (a, b) => a[1].touchedAt - b[1].touchedAt || a[1].touchSeq - b[1].touchSeq
+  );
+  const excess = requiredContextsCache.size - budget;
+  for (let index = 0; index < excess; index += 1) {
+    const oldest = oldestFirst[index];
+    if (oldest) requiredContextsCache.delete(oldest[0]);
+  }
+}
+
+function rememberKnownResult(
+  key: string,
+  resolution: KnownRequiredContextsResolution,
+  now: number
+): void {
+  if (resolution.source === 'env_override') return;
+  pruneRequiredContextsCache(now, key);
+  requiredContextsCache.set(key, {
+    kind: 'result',
+    resolution: { ...resolution, contexts: [...resolution.contexts] },
+    expiresAt: now + REQUIRED_CONTEXTS_CACHE_TTL_MS,
+    ...nextCacheTouch(now),
+  });
+}
+
+function rememberRateLimitBackoff(key: string, until: number, now: number): void {
+  pruneRequiredContextsCache(now, key);
+  requiredContextsCache.set(key, {
+    kind: 'backoff',
+    until,
+    ...nextCacheTouch(now),
+  });
+}
+
+function readFreshCachedResult(key: string, now: number): KnownRequiredContextsResolution | null {
+  const entry = requiredContextsCache.get(key);
+  if (entry?.kind !== 'result') return null;
+  if (cacheEntryExpired(entry, now)) return null;
+  entry.touchedAt = now;
+  entry.touchSeq = nextCacheTouch(now).touchSeq;
+  return { ...entry.resolution, contexts: [...entry.resolution.contexts] };
+}
+
+function hasActiveRateLimitBackoff(key: string, now: number): boolean {
+  const entry = requiredContextsCache.get(key);
+  if (entry?.kind !== 'backoff') return false;
+  if (cacheEntryExpired(entry, now)) return false;
+  entry.touchedAt = now;
+  entry.touchSeq = nextCacheTouch(now).touchSeq;
+  return true;
+}
+
+/**
+ * HTTP 403 whose message names a rate limit. Permission 403s ("Resource not
+ * accessible by integration") must not match: those still fall through to the
+ * PAT identity.
+ */
+function isRateLimitError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { status?: unknown; message?: unknown };
+  if (candidate.status !== 403) return false;
+  return typeof candidate.message === 'string' && /rate limit/i.test(candidate.message);
+}
+
+/**
+ * `x-ratelimit-reset` is epoch seconds. A missing, non-finite, or already-past
+ * value falls back to the fixed five-minute back-off.
+ */
+function rateLimitBackoffUntil(error: unknown, now: number): number {
+  const fallback = now + REQUIRED_CONTEXTS_RATE_LIMIT_BACKOFF_MS;
+  if (!error || typeof error !== 'object') return fallback;
+  const headers = (error as { response?: { headers?: Record<string, unknown> } }).response?.headers;
+  const raw = headers?.['x-ratelimit-reset'];
+  const seconds =
+    typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : Number.NaN;
+  if (!Number.isFinite(seconds)) return fallback;
+  const resetAt = seconds * 1000;
+  if (resetAt <= now) return fallback;
+  return resetAt;
 }
 
 function branchKey(owner: string, repo: string, baseRef: string): string {
@@ -548,6 +706,14 @@ export async function resolveRequiredContexts(
     return { state: 'known', contexts: overrideContexts, source: 'env_override' };
   }
 
+  const now = Date.now();
+  pruneRequiredContextsCache(now);
+  const cached = readFreshCachedResult(key, now);
+  if (cached) return cached;
+  if (hasActiveRateLimitBackoff(key, now)) {
+    return deferOrBlock(counterKey, 'rate_limited_backoff', 'transient', env, store);
+  }
+
   const attempts: { source: 'app_client' | 'pat_client'; fetch: StatusCheckContextsFetcher }[] = [];
   if (input.fetchWithAppClient) {
     attempts.push({ source: 'app_client', fetch: input.fetchWithAppClient });
@@ -558,6 +724,7 @@ export async function resolveRequiredContexts(
 
   let lastReason = attempts.length === 0 ? 'protection_api_unavailable' : 'lookup_failed';
   let failureKind: RequiredContextsFailureKind = attempts.length === 0 ? 'permission' : 'transient';
+  let rateLimited = false;
 
   for (let index = 0; index < attempts.length; index += 1) {
     const attempt = attempts[index];
@@ -575,8 +742,26 @@ export async function resolveRequiredContexts(
         { owner, repo, baseRef, contexts, source: attempt.source },
         'overseer.required_contexts.resolved'
       );
-      return { state: 'known', contexts, source: attempt.source };
+      const resolution: KnownRequiredContextsResolution = {
+        state: 'known',
+        contexts,
+        source: attempt.source,
+      };
+      rememberKnownResult(key, resolution, Date.now());
+      return resolution;
     } catch (error) {
+      if (isRateLimitError(error)) {
+        const limitedAt = Date.now();
+        rememberRateLimitBackoff(key, rateLimitBackoffUntil(error, limitedAt), limitedAt);
+        lastReason = 'rate_limited_backoff';
+        failureKind = 'transient';
+        rateLimited = true;
+        log.warn(
+          { err: error, owner, repo, baseRef, source: attempt.source, reason: lastReason },
+          'overseer.required_contexts.rate_limited'
+        );
+        break;
+      }
       const permission = isPermissionFailure(error);
       lastReason = permission ? 'permission_denied' : 'lookup_failed';
       failureKind = permission ? 'permission' : 'transient';
@@ -602,14 +787,20 @@ export async function resolveRequiredContexts(
   // whether the branch is genuinely unprotected -- bdc-xo main is, and mapping
   // that to UNKNOWN is what parked its PRs forever. An authoritative EMPTY set
   // is a real answer, not a fallback: it says "nothing is required here".
-  if (await hasPositiveUnprotectedEvidence(input, baseRef)) {
+  if (!rateLimited && (await hasPositiveUnprotectedEvidence(input, baseRef))) {
     await store.clear(counterKey);
     logSourceOnce(
       `unprotected:${key}`,
       { owner, repo, baseRef, source: 'unprotected_branch', lastReason },
       'overseer.required_contexts.branch_unprotected_no_required_contexts'
     );
-    return { state: 'known', contexts: [], source: 'unprotected_branch' };
+    const resolution: KnownRequiredContextsResolution = {
+      state: 'known',
+      contexts: [],
+      source: 'unprotected_branch',
+    };
+    rememberKnownResult(key, resolution, Date.now());
+    return resolution;
   }
 
   return deferOrBlock(counterKey, lastReason, failureKind, env, store);

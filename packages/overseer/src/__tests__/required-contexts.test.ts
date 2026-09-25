@@ -13,6 +13,8 @@ import {
   ATTEMPT_COUNTER_TTL_MS,
   DEFAULT_MAX_ATTEMPTS,
   NO_BASE_REF_SENTINEL,
+  REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES,
+  REQUIRED_CONTEXTS_CACHE_TTL_MS,
   REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
   REQUIRED_CONTEXTS_OVERRIDE_ENV,
   inMemoryAttemptCounterStore,
@@ -22,6 +24,7 @@ import {
   peekRequiredContextsAttempts,
   requiredContextsAttemptCounterSize,
   resetRequiredContextsAttemptCounters,
+  resetRequiredContextsCache,
   resetRequiredContextsSourceLog,
   resolveMaxAttempts,
   resolveRequiredContexts,
@@ -64,6 +67,7 @@ function baseInput(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   resetRequiredContextsAttemptCounters();
+  resetRequiredContextsCache();
   resetRequiredContextsSourceLog();
 });
 
@@ -401,7 +405,9 @@ describe('resolveRequiredContexts -- bounded deferral ESCALATES, never downgrade
       baseInput({ fetchWithAppClient: async () => ({ data: ['test'] }) }),
       env
     );
-    // Counter reset by the success: we are back to failing closed.
+    // The success is cached for the base. Drop that entry so this assertion
+    // still observes the counter, which the success cleared.
+    resetRequiredContextsCache();
     expect((await resolveRequiredContexts(alwaysFails(), env)).state).toBe('unknown');
   });
 
@@ -492,6 +498,9 @@ describe('resolveRequiredContexts -- concurrent PRs on one base keep separate bo
     expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(2);
     expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_B)).toBe(0);
 
+    // Head B's success cached this base. Drop it so head A's own failures
+    // still reach the counter the sibling must not have cleared.
+    resetRequiredContextsCache();
     // Head A therefore still exhausts on its own third, fourth and fifth ticks.
     expect((await resolveRequiredContexts(failingFor(HEAD_A), env)).state).toBe('unknown');
     expect((await resolveRequiredContexts(failingFor(HEAD_A), env)).state).toBe('unknown');
@@ -810,6 +819,203 @@ describe('createRealFetchExactHeadPullRequestEvidence -- adapter boundary', () =
     expect(result.verdict).not.toBe('APPROVE');
     expect(result.findings).toEqual([]);
     expect(result.error).toContain('required_contexts_unavailable_blocked');
+  });
+});
+
+describe('resolveRequiredContexts -- lookup cache (#993)', () => {
+  const known = { state: 'known', contexts: [], source: 'unprotected_branch' } as const;
+
+  test('38 an unprotected base is queried once inside the TTL', async () => {
+    let appCalls = 0;
+    let rulesCalls = 0;
+    let branchCalls = 0;
+    const input = baseInput({
+      baseRef: 'main',
+      repo: 'bdc-xo',
+      fetchWithAppClient: async () => {
+        appCalls += 1;
+        throw branchNotProtectedError();
+      },
+      fetchBranchRules: async () => {
+        rulesCalls += 1;
+        return { data: [] };
+      },
+      fetchBranch: async () => {
+        branchCalls += 1;
+        return { data: { protected: false, protection: { enabled: false } } };
+      },
+    });
+
+    const results = [];
+    for (let index = 0; index < 50; index += 1) {
+      results.push(await resolveRequiredContexts(input, {}));
+    }
+
+    expect(appCalls).toBe(1);
+    expect(rulesCalls).toBe(1);
+    expect(branchCalls).toBe(1);
+    for (const resolution of results) {
+      expect(resolution).toEqual(known);
+    }
+  });
+
+  test('39 a protected base is cached', async () => {
+    let appCalls = 0;
+    const input = baseInput({
+      fetchWithAppClient: async () => {
+        appCalls += 1;
+        return { data: ['test (ubuntu-latest)'] };
+      },
+    });
+    const first = await resolveRequiredContexts(input, {});
+    const second = await resolveRequiredContexts(input, {});
+    expect(appCalls).toBe(1);
+    expect(first).toEqual({
+      state: 'known',
+      contexts: ['test (ubuntu-latest)'],
+      source: 'app_client',
+    });
+    expect(second).toEqual(first);
+  });
+
+  test('40 a cached result is re-fetched after the TTL', async () => {
+    const realNow = Date.now;
+    let appCalls = 0;
+    const input = baseInput({
+      fetchWithAppClient: async () => {
+        appCalls += 1;
+        return { data: ['test (ubuntu-latest)'] };
+      },
+    });
+    try {
+      let clock = realNow();
+      Date.now = () => clock;
+      await resolveRequiredContexts(input, {});
+      expect(appCalls).toBe(1);
+      clock += REQUIRED_CONTEXTS_CACHE_TTL_MS + 1;
+      await resolveRequiredContexts(input, {});
+      expect(appCalls).toBe(2);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test('41 a rate-limit 403 backs off without a second fetch or a PAT probe', async () => {
+    const realNow = Date.now;
+    let appCalls = 0;
+    let patCalls = 0;
+    let rulesCalls = 0;
+    let branchCalls = 0;
+    try {
+      let clock = realNow();
+      Date.now = () => clock;
+      const resetSeconds = Math.floor((clock + 10 * 60 * 1000) / 1000);
+      const input = baseInput({
+        fetchWithAppClient: async () => {
+          appCalls += 1;
+          throw Object.assign(new Error('API rate limit exceeded'), {
+            status: 403,
+            response: { headers: { 'x-ratelimit-reset': String(resetSeconds) } },
+          });
+        },
+        fetchWithPatClient: async () => {
+          patCalls += 1;
+          return { data: ['should-not-run'] };
+        },
+        fetchBranchRules: async () => {
+          rulesCalls += 1;
+          return { data: [] };
+        },
+        fetchBranch: async () => {
+          branchCalls += 1;
+          return { data: { protected: false } };
+        },
+      });
+      const first = await resolveRequiredContexts(input, {});
+      clock += 60 * 1000;
+      const second = await resolveRequiredContexts(input, {});
+      expect(appCalls).toBe(1);
+      expect(patCalls).toBe(0);
+      expect(rulesCalls).toBe(0);
+      expect(branchCalls).toBe(0);
+      expect(first.state).toBe('unknown');
+      expect(second.state).toBe('unknown');
+      if (first.state === 'unknown') expect(first.failureKind).toBe('transient');
+      if (second.state === 'unknown') {
+        expect(second.reason).toBe('rate_limited_backoff');
+        expect(second.failureKind).toBe('transient');
+      }
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test('42 a permission-masked 404 is not cached', async () => {
+    let appCalls = 0;
+    const input = baseInput({
+      fetchWithAppClient: async () => {
+        appCalls += 1;
+        throw maskedNotFoundError();
+      },
+    });
+    const first = await resolveRequiredContexts(input, {});
+    const second = await resolveRequiredContexts(input, {});
+    expect(appCalls).toBe(2);
+    expect(first.state).toBe('unknown');
+    expect(second.state).toBe('unknown');
+  });
+
+  test('43 resetRequiredContextsCache forces a second lookup with the same resolution', async () => {
+    let appCalls = 0;
+    const input = baseInput({
+      fetchWithAppClient: async () => {
+        appCalls += 1;
+        return { data: ['test (ubuntu-latest)'] };
+      },
+    });
+    const first = await resolveRequiredContexts(input, {});
+    resetRequiredContextsCache();
+    const second = await resolveRequiredContexts(input, {});
+    expect(appCalls).toBe(2);
+    expect(second).toEqual(first);
+  });
+
+  test('44 the cache evicts the oldest key once the combined ceiling is passed', async () => {
+    const calls = new Map<string, number>();
+    async function resolveBase(baseRef: string) {
+      return resolveRequiredContexts(
+        baseInput({
+          baseRef,
+          fetchWithAppClient: async () => {
+            calls.set(baseRef, (calls.get(baseRef) ?? 0) + 1);
+            return { data: [`check-${baseRef}`] };
+          },
+        }),
+        {}
+      );
+    }
+
+    const oldest = 'base-0';
+    await resolveBase(oldest);
+    for (let index = 1; index < REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES; index += 1) {
+      await resolveBase(`base-${index}`);
+    }
+    // One past the ceiling: the oldest insertion is the one that must leave.
+    await resolveBase(`base-${REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES}`);
+    expect(calls.get(oldest)).toBe(1);
+
+    await resolveBase(oldest);
+    expect(calls.get(oldest)).toBe(2);
+
+    const recent = `base-${REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES}`;
+    const before = calls.get(recent) ?? 0;
+    const again = await resolveBase(recent);
+    expect(calls.get(recent)).toBe(before);
+    expect(again).toEqual({
+      state: 'known',
+      contexts: [`check-${recent}`],
+      source: 'app_client',
+    });
   });
 });
 
