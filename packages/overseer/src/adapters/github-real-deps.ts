@@ -52,6 +52,22 @@ function isGitHubRateLimitError(error: unknown): boolean {
   );
 }
 
+function noteRateLimitBackoff(
+  error: unknown,
+  timestamp: number,
+  logger: FindPullRequestLogger,
+  input: GitHubPullRequestSearchInput
+): void {
+  rateLimitBackoffUntil = timestamp + RATE_LIMIT_BACKOFF_MS;
+  if (timestamp - rateLimitLastLoggedAt >= RATE_LIMIT_BACKOFF_MS || rateLimitLastLoggedAt === 0) {
+    rateLimitLastLoggedAt = timestamp;
+    logger.warn(
+      { err: error, input, backoffMs: RATE_LIMIT_BACKOFF_MS },
+      'overseer.github_real_deps.rate_limit_backoff'
+    );
+  }
+}
+
 /** The lookup ran and found nothing. A genuine "this PR does not exist". */
 const MISSING_EVIDENCE: PullRequestEvidence = {
   exists: false,
@@ -761,10 +777,10 @@ export function createRealFindPullRequest(
       // still skips the search. Selection runs only when the head did not resolve.
       const resolvedByHeadBranch =
         input.prNumber == null && Boolean(input.headBranch) && prNumber !== null;
+      let siblingLookupFailed = false;
+      let preserveRateLimitBackoff = false;
 
-      // 'unknown' is parseWoId's could-not-parse fallback, not a WO id --
-      // searching for the literal word would return garbage matches.
-      if (input.woId && input.woId !== 'unknown' && (prNumber === null || resolvedByHeadBranch)) {
+      const loadWoSearchCandidates = async (): Promise<void> => {
         const search = await octokit.search.issuesAndPullRequests({
           // Title AND body: lanes title PRs freely (anchor: canary PR #705,
           // 'docs(canary): add e2e merge canary marker' -- WO id only in the
@@ -792,17 +808,40 @@ export function createRealFindPullRequest(
             createdAt: fetched.data.created_at ?? '',
           });
         }
-        if (prNumber === null) {
-          const selected = selectWoSearchCandidate(woSearchCandidates);
-          if (selected) {
-            prNumber = selected.number;
-          } else if (woSearchCandidates.length > 0) {
-            rateLimitBackoffUntil = 0;
-            rateLimitLastLoggedAt = 0;
-            return {
-              ...MISSING_EVIDENCE,
-              otherOpenPrsForWo: otherOpenPrsForWo(woSearchCandidates, null),
-            };
+      };
+
+      // 'unknown' is parseWoId's could-not-parse fallback, not a WO id --
+      // searching for the literal word would return garbage matches.
+      // Primary fallback (no PR yet) still throws into the outer catch.
+      // Sibling search after a head-branch hit is best-effort: a search or
+      // pulls.get failure must not replace the resolved PR with lookup-failed.
+      if (input.woId && input.woId !== 'unknown' && prNumber === null) {
+        await loadWoSearchCandidates();
+        const selected = selectWoSearchCandidate(woSearchCandidates);
+        if (selected) {
+          prNumber = selected.number;
+        } else if (woSearchCandidates.length > 0) {
+          rateLimitBackoffUntil = 0;
+          rateLimitLastLoggedAt = 0;
+          return {
+            ...MISSING_EVIDENCE,
+            otherOpenPrsForWo: otherOpenPrsForWo(woSearchCandidates, null),
+          };
+        }
+      } else if (resolvedByHeadBranch && input.woId && input.woId !== 'unknown') {
+        try {
+          await loadWoSearchCandidates();
+        } catch (error) {
+          woSearchCandidates.length = 0;
+          siblingLookupFailed = true;
+          if (isGitHubRateLimitError(error)) {
+            noteRateLimitBackoff(error, now(), logger, input);
+            preserveRateLimitBackoff = true;
+          } else {
+            logger.warn(
+              { err: error, input },
+              'overseer.github_real_deps.sibling_pr_lookup_failed'
+            );
           }
         }
       }
@@ -882,7 +921,10 @@ export function createRealFindPullRequest(
           ...(typeof author === 'string' && author !== '' ? { author } : {}),
           ...(typeof createdAt === 'string' && createdAt !== '' ? { createdAt } : {}),
         },
-        otherOpenPrsForWo: otherOpenPrsForWo(woSearchCandidates, pr.data.number),
+        otherOpenPrsForWo: siblingLookupFailed
+          ? []
+          : otherOpenPrsForWo(woSearchCandidates, pr.data.number),
+        ...(siblingLookupFailed ? { otherOpenPrsForWoLookupFailed: true } : {}),
         prTitle: pr.data.title,
         filesChangedCount: pr.data.changed_files,
         // 16th canary defect (2026-08-26): diffStat was never populated
@@ -906,23 +948,15 @@ export function createRealFindPullRequest(
         mergeableState: pr.data.mergeable_state,
         changedFilePaths,
       };
-      rateLimitBackoffUntil = 0;
-      rateLimitLastLoggedAt = 0;
+      if (!preserveRateLimitBackoff) {
+        rateLimitBackoffUntil = 0;
+        rateLimitLastLoggedAt = 0;
+      }
       return evidence;
     } catch (error) {
       const timestamp = now();
       if (isGitHubRateLimitError(error)) {
-        rateLimitBackoffUntil = timestamp + RATE_LIMIT_BACKOFF_MS;
-        if (
-          timestamp - rateLimitLastLoggedAt >= RATE_LIMIT_BACKOFF_MS ||
-          rateLimitLastLoggedAt === 0
-        ) {
-          rateLimitLastLoggedAt = timestamp;
-          logger.warn(
-            { err: error, input, backoffMs: RATE_LIMIT_BACKOFF_MS },
-            'overseer.github_real_deps.rate_limit_backoff'
-          );
-        }
+        noteRateLimitBackoff(error, timestamp, logger, input);
         return LOOKUP_FAILED_EVIDENCE;
       }
       // 422 'cannot be searched' = the repo does not exist or this credential

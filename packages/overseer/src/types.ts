@@ -77,6 +77,13 @@ export interface PullRequestEvidence {
    * Present so the judge can see a builder pre-review PR beside the run's own PR.
    */
   otherOpenPrsForWo?: { number: number; headRef: string; createdAt: string }[];
+  /**
+   * True when the optional sibling WO search failed after the primary PR was
+   * already resolved. The primary `lookupFailed` flag stays unset: the run's
+   * own PR is known, and `otherOpenPrsForWo` is empty because siblings were
+   * not loaded.
+   */
+  otherOpenPrsForWoLookupFailed?: boolean;
 }
 
 export interface GrokJudgeEvidence {

@@ -960,5 +960,104 @@ describe('WO-search prefers the run PR over an early archon/task PR', () => {
         createdAt: '2026-09-25T00:30:00Z',
       },
     ]);
+    expect(evidence.otherOpenPrsForWoLookupFailed).toBeUndefined();
+  });
+
+  test('resolved head-branch PR survives a throwing sibling search', async () => {
+    const { octokit } = octokitFor([early, own], own.number);
+    octokit.search.issuesAndPullRequests = async () => {
+      throw new Error('search unavailable');
+    };
+
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+      headBranch: own.headRef,
+    });
+
+    expect(evidence.exists).toBe(true);
+    expect(evidence.lookupFailed).toBeUndefined();
+    expect(evidence.state).not.toBe('lookup_failed');
+    expect(evidence.pr).toMatchObject({
+      number: 968,
+      headRef: 'feat/wo-x-01-thread-abc',
+      author: 'builder',
+      createdAt: '2026-09-25T01:00:00Z',
+    });
+    expect(evidence.otherOpenPrsForWo).toEqual([]);
+    expect(evidence.otherOpenPrsForWoLookupFailed).toBe(true);
+  });
+
+  test('resolved head-branch PR survives a sibling pulls.get rejection', async () => {
+    const { octokit } = octokitFor([early, own], own.number);
+    const get = octokit.pulls.get;
+    octokit.pulls.get = async input => {
+      if (Number(input.pull_number) === early.number) {
+        throw new Error('sibling pulls.get failed');
+      }
+      return get(input);
+    };
+
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+      headBranch: own.headRef,
+    });
+
+    expect(evidence.exists).toBe(true);
+    expect(evidence.lookupFailed).toBeUndefined();
+    expect(evidence.pr?.number).toBe(968);
+    expect(evidence.otherOpenPrsForWo).toEqual([]);
+    expect(evidence.otherOpenPrsForWoLookupFailed).toBe(true);
+  });
+
+  test('sibling search rate limit keeps the resolved PR and starts backoff', async () => {
+    const { octokit } = octokitFor([own], own.number);
+    let limited = true;
+    octokit.search.issuesAndPullRequests = async () => {
+      if (limited) {
+        throw Object.assign(new Error('API rate limit exceeded for installation'), {
+          status: 403,
+          response: { headers: { 'x-ratelimit-remaining': '0' } },
+        });
+      }
+      return { data: { items: [] } };
+    };
+    const warnings: string[] = [];
+    let now = 500_000;
+    const find = createRealFindPullRequest(octokit, {
+      now: () => now,
+      logger: {
+        warn: (_obj, msg) => warnings.push(msg),
+        error: (_obj, msg) => {
+          throw new Error(`unexpected error log: ${msg}`);
+        },
+      },
+    });
+    const input = {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+      headBranch: own.headRef,
+    };
+
+    const first = await find(input);
+    expect(first.exists).toBe(true);
+    expect(first.lookupFailed).toBeUndefined();
+    expect(first.pr?.number).toBe(968);
+    expect(first.otherOpenPrsForWo).toEqual([]);
+    expect(first.otherOpenPrsForWoLookupFailed).toBe(true);
+    expect(warnings).toEqual(['overseer.github_real_deps.rate_limit_backoff']);
+
+    const suppressed = await find(input);
+    expect(suppressed.lookupFailed).toBe(true);
+
+    now = 560_000;
+    limited = false;
+    const cleared = await find(input);
+    expect(cleared.exists).toBe(true);
+    expect(cleared.otherOpenPrsForWoLookupFailed).toBeUndefined();
   });
 });
