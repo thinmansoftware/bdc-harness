@@ -1175,6 +1175,75 @@ describe('resolveRequiredContexts -- lookup cache (#993)', () => {
     }
   });
 
+  test('51 an active rate-limit backoff survives unrelated cache writes until reset', async () => {
+    const realNow = Date.now;
+    try {
+      let clock = realNow();
+      Date.now = () => clock;
+      const limitedBase = 'rate-limited-base';
+      let limitedCalls = 0;
+      const resetAt = clock + 30 * 60 * 1000;
+      await resolveRequiredContexts(
+        baseInput({
+          baseRef: limitedBase,
+          fetchWithAppClient: async () => {
+            limitedCalls += 1;
+            throw Object.assign(new Error('API rate limit exceeded'), {
+              status: 403,
+              response: { headers: { 'x-ratelimit-reset': String(Math.floor(resetAt / 1000)) } },
+            });
+          },
+        }),
+        {}
+      );
+      expect(limitedCalls).toBe(1);
+
+      for (let index = 0; index < REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES; index += 1) {
+        await resolveRequiredContexts(
+          baseInput({
+            baseRef: `fill-${index}`,
+            fetchWithAppClient: async () => ({ data: [`check-${index}`] }),
+          }),
+          {}
+        );
+      }
+      expect(requiredContextsCacheSize()).toBeLessThanOrEqual(REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES);
+
+      clock += 60 * 1000;
+      const during = await resolveRequiredContexts(
+        baseInput({
+          baseRef: limitedBase,
+          fetchWithAppClient: async () => {
+            limitedCalls += 1;
+            throw new Error('backoff must not call GitHub');
+          },
+        }),
+        {}
+      );
+      expect(limitedCalls).toBe(1);
+      expect(during).toEqual({
+        state: 'unknown',
+        reason: 'rate_limited_backoff',
+        failureKind: 'transient',
+      });
+
+      clock = resetAt + 1;
+      await resolveRequiredContexts(
+        baseInput({
+          baseRef: limitedBase,
+          fetchWithAppClient: async () => {
+            limitedCalls += 1;
+            return { data: ['test (ubuntu-latest)'] };
+          },
+        }),
+        {}
+      );
+      expect(limitedCalls).toBe(2);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   test('47 concurrent misses for one base share a single GitHub request', async () => {
     let appCalls = 0;
     let releaseFetch: () => void = () => {};

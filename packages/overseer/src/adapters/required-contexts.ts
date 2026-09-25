@@ -217,9 +217,12 @@ export const REQUIRED_CONTEXTS_CACHE_TTL_MS = 10 * 60 * 1000;
 export const REQUIRED_CONTEXTS_RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000;
 
 /**
- * Combined ceiling for known results, rate-limit back-offs, and shared-miss
- * records. All three share one budget so none of them can grow to this size
- * alone.
+ * Ceiling for known results and shared-miss records. Active rate-limit
+ * back-offs are not eviction candidates: dropping one before its reset would
+ * send the next lookup to GitHub inside the required back-off. They still
+ * occupy slots, so results and misses are evicted first. If active back-offs
+ * alone already fill the map, it may sit above this ceiling until those
+ * windows end.
  */
 export const REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES = 512;
 
@@ -417,7 +420,8 @@ type RequiredContextsCacheEntry =
  * owner/repo@base (no head). Module scope matches the attempt counters: the
  * evidence fetcher closure is rebuilt on every review tick, so a closure-local
  * cache would never hit. Misses share this map so they are TTL-pruned and
- * size-bounded with the other entries.
+ * size-bounded with known results. Active back-offs share the map but stay
+ * until reset; size eviction never drops them early.
  */
 const requiredContextsCache = new Map<string, RequiredContextsCacheEntry>();
 
@@ -463,9 +467,10 @@ function cacheEntryExpired(entry: RequiredContextsCacheEntry, now: number): bool
 }
 
 /**
- * Drop expired entries, then evict oldest-touched survivors until the combined
- * result and back-off population fits. When `incomingKey` is new, leave one
- * free slot so the write that follows stays inside the ceiling.
+ * Drop expired entries, then evict the oldest-touched results and misses until
+ * the population fits. Active rate-limit back-offs stay until `until` (the
+ * reset). When `incomingKey` is new, leave one free slot so the write that
+ * follows stays inside the ceiling when an evictable entry exists.
  */
 function pruneRequiredContextsCache(now: number, incomingKey?: string): void {
   for (const [key, entry] of requiredContextsCache) {
@@ -480,10 +485,14 @@ function pruneRequiredContextsCache(now: number, incomingKey?: string): void {
   const oldestFirst = [...requiredContextsCache.entries()].sort(
     (a, b) => a[1].touchedAt - b[1].touchedAt || a[1].touchSeq - b[1].touchSeq
   );
-  const excess = requiredContextsCache.size - budget;
-  for (let index = 0; index < excess; index += 1) {
-    const oldest = oldestFirst[index];
-    if (oldest) requiredContextsCache.delete(oldest[0]);
+  let excess = requiredContextsCache.size - budget;
+  for (const [key, entry] of oldestFirst) {
+    if (excess <= 0) break;
+    // A live back-off must outlast unrelated cache and miss writes. Evicting
+    // it here would make the next lookup call GitHub before reset.
+    if (entry.kind === 'backoff') continue;
+    requiredContextsCache.delete(key);
+    excess -= 1;
   }
 }
 
