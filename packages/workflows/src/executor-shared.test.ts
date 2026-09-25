@@ -96,6 +96,78 @@ describe('substituteWorkflowVariables', () => {
     expect(prompt).toBe('No branch reference here');
   });
 
+  it('leaves longer base branch shell variables unchanged', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH_OVERRIDE $BASE_BRANCH_PR',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('$BASE_BRANCH_OVERRIDE $BASE_BRANCH_PR');
+  });
+
+  it('replaces exact $BASE_BRANCH tokens before delimiters', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH $BASE_BRANCH/x $BASE_BRANCH. $BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('dev dev/x dev. dev)');
+  });
+
+  it('substitutes each workflow variable without matching longer identifiers', () => {
+    const variables = [
+      ['$WORKFLOW_ID', 'run-1'],
+      ['$USER_MESSAGE', 'message'],
+      ['$ARGUMENTS', 'message'],
+      ['$ARTIFACTS_DIR', '/tmp/artifacts'],
+      ['$BASE_BRANCH', 'dev'],
+      ['$DOCS_DIR', 'docs/'],
+      ['$LOOP_USER_INPUT', 'feedback'],
+      ['$REJECTION_REASON', 'reason'],
+      ['$LOOP_PREV_OUTPUT', 'previous output'],
+    ] as const;
+    const source = variables.flatMap(([name]) => [name, `${name}_SUFFIX`]).join(' | ');
+    const expected = variables
+      .flatMap(([name, value]) => [value, `${name}_SUFFIX`])
+      .join(' | ');
+
+    const { prompt } = substituteWorkflowVariables(
+      source,
+      'run-1',
+      'message',
+      '/tmp/artifacts',
+      'dev',
+      'docs/',
+      undefined,
+      'feedback',
+      'reason',
+      'previous output'
+    );
+    expect(prompt).toBe(expected);
+  });
+
+  it('does not treat longer base branch shell variables as base branch references', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        '$BASE_BRANCH_OVERRIDE $BASE_BRANCH_PR',
+        'run-1',
+        'msg',
+        '/tmp',
+        '',
+        'docs/'
+      )
+    ).not.toThrow();
+    expect(() =>
+      substituteWorkflowVariables('$BASE_BRANCH', 'run-1', 'msg', '/tmp', '', 'docs/')
+    ).toThrow('No base branch could be resolved');
+  });
+
   it('replaces $USER_MESSAGE and $ARGUMENTS with user message', () => {
     const { prompt } = substituteWorkflowVariables(
       'Goal: $USER_MESSAGE. Args: $ARGUMENTS',
