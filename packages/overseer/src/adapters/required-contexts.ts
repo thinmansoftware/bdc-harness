@@ -413,11 +413,19 @@ let requiredContextsCacheTouchSeq = 0;
  */
 const requiredContextsInflight = new Map<string, Promise<void>>();
 
-/** Why the in-flight lookup failed, so a waiter counts its own head with the same reason. */
-const requiredContextsSharedMiss = new Map<
-  string,
-  { reason: string; failureKind: RequiredContextsFailureKind }
->();
+/**
+ * Why the in-flight lookup failed, so a waiter counts its own head with the same reason.
+ * Bounded like the result cache: a failed owner/repo/base must not be retained forever.
+ */
+interface RequiredContextsSharedMissEntry {
+  reason: string;
+  failureKind: RequiredContextsFailureKind;
+  expiresAt: number;
+  touchedAt: number;
+  touchSeq: number;
+}
+
+const requiredContextsSharedMiss = new Map<string, RequiredContextsSharedMissEntry>();
 
 /**
  * Plan amendment for WO-HARNESS-REQUIRED-CONTEXTS-CACHE-01.
@@ -434,6 +442,11 @@ export function resetRequiredContextsCache(): void {
   requiredContextsCacheTouchSeq = 0;
   requiredContextsInflight.clear();
   requiredContextsSharedMiss.clear();
+}
+
+/** Test seam: how many failed owner/repo/base miss records are currently retained. */
+export function requiredContextsSharedMissSize(): number {
+  return requiredContextsSharedMiss.size;
 }
 
 function nextCacheTouch(now: number): { touchedAt: number; touchSeq: number } {
@@ -501,6 +514,58 @@ function readFreshCachedResult(key: string, now: number): KnownRequiredContextsR
   entry.touchedAt = now;
   entry.touchSeq = nextCacheTouch(now).touchSeq;
   return { ...entry.resolution, contexts: [...entry.resolution.contexts] };
+}
+
+/**
+ * Drop expired miss records, then evict oldest-touched survivors until the
+ * population fits. When `incomingKey` is new, leave one free slot so the write
+ * that follows stays inside the ceiling.
+ */
+function pruneRequiredContextsSharedMiss(now: number, incomingKey?: string): void {
+  for (const [key, entry] of requiredContextsSharedMiss) {
+    if (now >= entry.expiresAt) requiredContextsSharedMiss.delete(key);
+  }
+  const updatingExisting = incomingKey !== undefined && requiredContextsSharedMiss.has(incomingKey);
+  const budget =
+    incomingKey === undefined || updatingExisting
+      ? REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES
+      : REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES - 1;
+  if (requiredContextsSharedMiss.size <= budget) return;
+  const oldestFirst = [...requiredContextsSharedMiss.entries()].sort(
+    (a, b) => a[1].touchedAt - b[1].touchedAt || a[1].touchSeq - b[1].touchSeq
+  );
+  const excess = requiredContextsSharedMiss.size - budget;
+  for (let index = 0; index < excess; index += 1) {
+    const oldest = oldestFirst[index];
+    if (oldest) requiredContextsSharedMiss.delete(oldest[0]);
+  }
+}
+
+function rememberSharedMiss(
+  key: string,
+  reason: string,
+  failureKind: RequiredContextsFailureKind,
+  now: number
+): void {
+  pruneRequiredContextsSharedMiss(now, key);
+  requiredContextsSharedMiss.set(key, {
+    reason,
+    failureKind,
+    expiresAt: now + REQUIRED_CONTEXTS_CACHE_TTL_MS,
+    ...nextCacheTouch(now),
+  });
+}
+
+function readFreshSharedMiss(
+  key: string,
+  now: number
+): { reason: string; failureKind: RequiredContextsFailureKind } | undefined {
+  pruneRequiredContextsSharedMiss(now);
+  const miss = requiredContextsSharedMiss.get(key);
+  if (!miss || now >= miss.expiresAt) return undefined;
+  miss.touchedAt = now;
+  miss.touchSeq = nextCacheTouch(now).touchSeq;
+  return { reason: miss.reason, failureKind: miss.failureKind };
 }
 
 function hasActiveRateLimitBackoff(key: string, now: number): boolean {
@@ -607,11 +672,28 @@ async function hasPositiveUnprotectedEvidence(
 ): Promise<boolean> {
   const { owner, repo, fetchBranchRules, fetchBranch } = input;
   if (!fetchBranchRules || !fetchBranch) return false;
+  const [rulesOutcome, branchOutcome] = await Promise.allSettled([
+    fetchBranchRules({ owner, repo, branch: baseRef }),
+    fetchBranch({ owner, repo, branch: baseRef }),
+  ]);
+  for (const outcome of [rulesOutcome, branchOutcome]) {
+    // A rate-limit 403 must reach the caller so it records back-off. Swallowing
+    // it here would keep the next tick hitting GitHub.
+    if (outcome.status === 'rejected' && isRateLimitError(outcome.reason)) {
+      throw outcome.reason;
+    }
+  }
+  if (rulesOutcome.status === 'rejected' || branchOutcome.status === 'rejected') {
+    const error = rulesOutcome.status === 'rejected' ? rulesOutcome.reason : branchOutcome.reason;
+    log.warn(
+      { err: error, owner, repo, baseRef },
+      'overseer.required_contexts.unprotected_probe_failed'
+    );
+    return false;
+  }
   try {
-    const [rules, branch] = await Promise.all([
-      fetchBranchRules({ owner, repo, branch: baseRef }),
-      fetchBranch({ owner, repo, branch: baseRef }),
-    ]);
+    const rules = rulesOutcome.value;
+    const branch = branchOutcome.value;
     if (!Array.isArray(rules?.data) || rules.data.length > 0) return false;
     const data = branch?.data;
     if (!data || typeof data !== 'object') return false;
@@ -732,6 +814,7 @@ export async function resolveRequiredContexts(
 
   const now = Date.now();
   pruneRequiredContextsCache(now);
+  pruneRequiredContextsSharedMiss(now);
   const cached = readFreshCachedResult(key, now);
   if (cached) {
     // A cache hit is an authoritative answer for this head, same as a fresh
@@ -784,7 +867,7 @@ async function settleSharedLookup(
   if (hasActiveRateLimitBackoff(key, settledAt)) {
     return rateLimitBackoffUnknown(key, counterKey.headSha);
   }
-  const miss = requiredContextsSharedMiss.get(key);
+  const miss = readFreshSharedMiss(key, settledAt);
   return deferOrBlock(
     counterKey,
     miss?.reason ?? 'lookup_failed',
@@ -888,24 +971,38 @@ async function lookupRequiredContexts(
   // whether the branch is genuinely unprotected -- bdc-xo main is, and mapping
   // that to UNKNOWN is what parked its PRs forever. An authoritative EMPTY set
   // is a real answer, not a fallback: it says "nothing is required here".
-  if (!rateLimited && (await hasPositiveUnprotectedEvidence(input, baseRef))) {
-    await store.clear(counterKey);
-    logSourceOnce(
-      `unprotected:${key}`,
-      { owner, repo, baseRef, source: 'unprotected_branch', lastReason },
-      'overseer.required_contexts.branch_unprotected_no_required_contexts'
-    );
-    const resolution: KnownRequiredContextsResolution = {
-      state: 'known',
-      contexts: [],
-      source: 'unprotected_branch',
-    };
-    requiredContextsSharedMiss.delete(key);
-    rememberKnownResult(key, resolution, Date.now());
-    return resolution;
+  if (!rateLimited) {
+    try {
+      if (await hasPositiveUnprotectedEvidence(input, baseRef)) {
+        await store.clear(counterKey);
+        logSourceOnce(
+          `unprotected:${key}`,
+          { owner, repo, baseRef, source: 'unprotected_branch', lastReason },
+          'overseer.required_contexts.branch_unprotected_no_required_contexts'
+        );
+        const resolution: KnownRequiredContextsResolution = {
+          state: 'known',
+          contexts: [],
+          source: 'unprotected_branch',
+        };
+        requiredContextsSharedMiss.delete(key);
+        rememberKnownResult(key, resolution, Date.now());
+        return resolution;
+      }
+    } catch (error) {
+      if (!isRateLimitError(error)) throw error;
+      const limitedAt = Date.now();
+      rememberRateLimitBackoff(key, rateLimitBackoffUntil(error, limitedAt), limitedAt);
+      lastReason = 'rate_limited_backoff';
+      failureKind = 'transient';
+      log.warn(
+        { err: error, owner, repo, baseRef, reason: lastReason },
+        'overseer.required_contexts.rate_limited'
+      );
+    }
   }
 
-  requiredContextsSharedMiss.set(key, { reason: lastReason, failureKind });
+  rememberSharedMiss(key, lastReason, failureKind, Date.now());
   return deferOrBlock(counterKey, lastReason, failureKind, env, store);
 }
 

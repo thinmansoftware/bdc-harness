@@ -27,14 +27,28 @@
  * same ground statically; this file covers it at runtime, because the cast means
  * only one of those two is load-bearing on its own.
  */
-import { describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
 import { Octokit } from '@octokit/rest';
 import {
   BOUND_REPOS_METHODS,
   createRealFetchExactHeadPullRequestEvidence,
   type RealGitHubOctokitLike,
 } from '../adapters/github-real-deps.ts';
-import { inMemoryAttemptCounterStore } from '../adapters/required-contexts.ts';
+import {
+  inMemoryAttemptCounterStore,
+  resetRequiredContextsAttemptCounters,
+  resetRequiredContextsCache,
+  resetRequiredContextsSourceLog,
+} from '../adapters/required-contexts.ts';
+
+// This suite reaches resolveRequiredContexts through the real evidence adapter.
+// The resolver's module cache must start empty on every test so a prior file
+// or case cannot answer from a cached base.
+beforeEach(() => {
+  resetRequiredContextsAttemptCounters();
+  resetRequiredContextsCache();
+  resetRequiredContextsSourceLog();
+});
 
 /**
  * Imported, never re-declared. A local copy of the list could drift from the one

@@ -23,6 +23,7 @@ import {
   parseRequiredContextsOverride,
   peekRequiredContextsAttempts,
   requiredContextsAttemptCounterSize,
+  requiredContextsSharedMissSize,
   resetRequiredContextsAttemptCounters,
   resetRequiredContextsCache,
   resetRequiredContextsSourceLog,
@@ -1148,6 +1149,125 @@ describe('resolveRequiredContexts -- lookup cache (#993)', () => {
     expect(appCalls).toBe(1);
     expect(first.state).toBe('known');
     expect(second).toEqual(first);
+  });
+
+  test('48 a rate-limit 403 from fetchBranchRules records backoff and skips the next probe', async () => {
+    const realNow = Date.now;
+    let appCalls = 0;
+    let rulesCalls = 0;
+    let branchCalls = 0;
+    try {
+      let clock = realNow();
+      Date.now = () => clock;
+      const input = baseInput({
+        fetchWithAppClient: async () => {
+          appCalls += 1;
+          throw appPermissionError();
+        },
+        fetchBranchRules: async () => {
+          rulesCalls += 1;
+          throw Object.assign(new Error('API rate limit exceeded'), { status: 403 });
+        },
+        fetchBranch: async () => {
+          branchCalls += 1;
+          return { data: { protected: false } };
+        },
+      });
+      const first = await resolveRequiredContexts(input, {});
+      clock += 60 * 1000;
+      const second = await resolveRequiredContexts(input, {});
+      expect(appCalls).toBe(1);
+      expect(rulesCalls).toBe(1);
+      expect(branchCalls).toBe(1);
+      expect(first.state).toBe('unknown');
+      if (first.state === 'unknown') expect(first.failureKind).toBe('transient');
+      expect(second.state).toBe('unknown');
+      if (second.state === 'unknown') expect(second.reason).toBe('rate_limited_backoff');
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test('49 a rate-limit 403 from fetchBranch records backoff and skips the next probe', async () => {
+    const realNow = Date.now;
+    let appCalls = 0;
+    let rulesCalls = 0;
+    let branchCalls = 0;
+    try {
+      let clock = realNow();
+      Date.now = () => clock;
+      const input = baseInput({
+        fetchWithAppClient: async () => {
+          appCalls += 1;
+          throw appPermissionError();
+        },
+        fetchBranchRules: async () => {
+          rulesCalls += 1;
+          return { data: [] };
+        },
+        fetchBranch: async () => {
+          branchCalls += 1;
+          throw Object.assign(new Error('API rate limit exceeded'), { status: 403 });
+        },
+      });
+      const first = await resolveRequiredContexts(input, {});
+      clock += 60 * 1000;
+      const second = await resolveRequiredContexts(input, {});
+      expect(appCalls).toBe(1);
+      expect(rulesCalls).toBe(1);
+      expect(branchCalls).toBe(1);
+      expect(first.state).toBe('unknown');
+      if (first.state === 'unknown') expect(first.failureKind).toBe('transient');
+      expect(second.state).toBe('unknown');
+      if (second.state === 'unknown') expect(second.reason).toBe('rate_limited_backoff');
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test('50 shared misses are pruned once the cache ceiling is passed', async () => {
+    for (let index = 0; index < REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES + 1; index += 1) {
+      await resolveRequiredContexts(
+        baseInput({
+          baseRef: `miss-base-${index}`,
+          fetchWithAppClient: async () => {
+            throw appPermissionError();
+          },
+        }),
+        {}
+      );
+    }
+    expect(requiredContextsSharedMissSize()).toBe(REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES);
+  });
+
+  test('51 a shared miss expires with the cache TTL', async () => {
+    const realNow = Date.now;
+    try {
+      let clock = realNow();
+      Date.now = () => clock;
+      await resolveRequiredContexts(
+        baseInput({
+          fetchWithAppClient: async () => {
+            throw appPermissionError();
+          },
+        }),
+        {}
+      );
+      expect(requiredContextsSharedMissSize()).toBe(1);
+      clock += REQUIRED_CONTEXTS_CACHE_TTL_MS + 1;
+      await resolveRequiredContexts(
+        baseInput({
+          baseRef: 'other',
+          fetchWithAppClient: async () => {
+            throw appPermissionError();
+          },
+        }),
+        {}
+      );
+      expect(requiredContextsSharedMissSize()).toBe(1);
+    } finally {
+      Date.now = realNow;
+    }
   });
 });
 
