@@ -205,6 +205,12 @@ export class CursorAgentProvider implements IAgentProvider {
           'cursor-agent exited 0 with empty output (workspace trust or authentication not granted)'
         );
       }
+      if (finalText.trim().length === 0 && resultText.length > 0) {
+        // The DAG executor accumulates node output ONLY from assistant chunks
+        // (dag-executor.ts: nodeOutputText += msg.content), so without this
+        // fallback a result-only stream would leave the node output empty.
+        yield { type: 'assistant', content: resultText };
+      }
     } finally {
       options?.abortSignal?.removeEventListener('abort', onAbort);
     }
@@ -417,12 +423,13 @@ function* processStreamLine(line: string, handlers: StreamLineHandlers): Generat
     const text = typeof event.result === 'string' ? event.result : '';
     const isError = event.is_error === true;
     const subtype = event.subtype;
-    if (isError || (typeof subtype === 'string' && subtype !== 'success')) {
-      throw new Error(
-        `cursor-agent stream result reported failure${
-          typeof subtype === 'string' ? ` (${subtype})` : ''
-        }: ${text.slice(-400) || 'no result text'}`
-      );
+    // Only the exact subtype "success" is a success. An omitted or non-string
+    // subtype is a malformed terminal event and must fail closed, never pass.
+    if (isError || subtype !== 'success') {
+      const label =
+        typeof subtype === 'string' ? subtype : `invalid subtype ${JSON.stringify(subtype)}`;
+      const detail = text.slice(-400) || 'no result text';
+      throw new Error(`cursor-agent stream result reported failure (${label}): ${detail}`);
     }
     handlers.onResultText(text);
     return;

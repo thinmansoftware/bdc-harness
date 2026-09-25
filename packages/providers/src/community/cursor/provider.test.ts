@@ -289,6 +289,26 @@ describe('CursorAgentProvider', () => {
     await expect(collect(provider.sendQuery('hi', '/w'))).rejects.toThrow(/stopped/);
   });
 
+  test('error-result-throws: a result event with an OMITTED subtype is a thrown error, not success', async () => {
+    const { child } = fakeChild({
+      stdout: streamLine({
+        type: 'result',
+        is_error: false,
+        result: 'looks fine but has no subtype',
+      }),
+    });
+    const provider = new CursorAgentProvider({ spawn: () => child });
+    await expect(collect(provider.sendQuery('hi', '/w'))).rejects.toThrow(/invalid subtype/);
+  });
+
+  test('error-result-throws: a result event with a non-string subtype is a thrown error', async () => {
+    const { child } = fakeChild({
+      stdout: streamLine({ type: 'result', subtype: 7, is_error: false, result: 'bad shape' }),
+    });
+    const provider = new CursorAgentProvider({ spawn: () => child });
+    await expect(collect(provider.sendQuery('hi', '/w'))).rejects.toThrow(/invalid subtype/);
+  });
+
   test('empty-and-garbage-guards: success with no assistant text and empty result still fails closed', async () => {
     const { child } = fakeChild({
       stdout: streamLine(initEvent()) + streamLine(successResultEvent('')),
@@ -347,14 +367,16 @@ describe('CursorAgentProvider', () => {
   });
 
   test('a JSON line split across stdout chunks is parsed once; a tail line without a final newline still lands', async () => {
-    const { child } = fakeChild({
-      stdout:
-        '{"type":"ass' +
-        'istant","message":{"role":"assistant","cont' +
-        'ent":[{"type":"text","text":"split line ok"}]}}\n' +
-        streamLine(successResultEvent('split line ok')),
-    });
+    const { child, resolveExit } = manualChild([
+      // Three separate stdout chunks for ONE assistant line: the line is only
+      // complete after the third fragment, so the framing must buffer.
+      '{"type":"ass',
+      'istant","message":{"role":"assistant","cont',
+      'ent":[{"type":"text","text":"split line ok"}]}}\n',
+      streamLine(successResultEvent('split line ok')),
+    ]);
     const provider = new CursorAgentProvider({ spawn: () => child });
+    resolveExit(0);
     const chunks = await collect(provider.sendQuery('hi', '/w'));
     expect(assistantText(chunks)).toBe('split line ok');
   });
@@ -368,7 +390,7 @@ describe('CursorAgentProvider', () => {
     const provider = new CursorAgentProvider({ spawn: () => child });
     const chunks = await collect(provider.sendQuery('hi', '/w'));
     // No assistant text was seen, so the successful result text is the fallback.
-    expect(assistantText(chunks)).toBe('');
+    expect(assistantText(chunks)).toBe('tail result');
     expect(chunks[chunks.length - 1]?.type).toBe('result');
   });
 
@@ -378,11 +400,13 @@ describe('CursorAgentProvider', () => {
     });
     const provider = new CursorAgentProvider({ spawn: () => child });
     const chunks = await collect(provider.sendQuery('hi', '/w'));
-    expect(assistantText(chunks)).toBe('');
+    // The fallback MUST be emitted as an assistant chunk: the DAG executor
+    // accumulates node output only from assistant chunks, so a result-only
+    // stream would otherwise produce an empty $node_id.output.
+    expect(assistantText(chunks)).toBe('fallback answer');
     const last = chunks[chunks.length - 1];
     expect(last?.type).toBe('result');
     if (last?.type === 'result') {
-      // The fallback is applied to structured extraction, not to assistant chunks.
       expect(last.structuredOutput).toBeUndefined();
     }
     // Re-run with json_schema to prove the fallback feeds structured parsing.
