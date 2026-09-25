@@ -406,10 +406,25 @@ const requiredContextsCache = new Map<string, RequiredContextsCacheEntry>();
 /** Monotonic tie-break so equal `Date.now()` values still evict oldest-first. */
 let requiredContextsCacheTouchSeq = 0;
 
+/**
+ * In-flight lookups, keyed by owner/repo@base. Concurrent reviews of the same
+ * base share one GitHub round trip; a closure-local promise would not, because
+ * each review builds its own evidence fetcher.
+ */
+const requiredContextsInflight = new Map<string, Promise<void>>();
+
+/** Why the in-flight lookup failed, so a waiter counts its own head with the same reason. */
+const requiredContextsSharedMiss = new Map<
+  string,
+  { reason: string; failureKind: RequiredContextsFailureKind }
+>();
+
 /** Test seam: drop cached resolutions and rate-limit back-offs. Attempt counters stay. */
 export function resetRequiredContextsCache(): void {
   requiredContextsCache.clear();
   requiredContextsCacheTouchSeq = 0;
+  requiredContextsInflight.clear();
+  requiredContextsSharedMiss.clear();
 }
 
 function nextCacheTouch(now: number): { touchedAt: number; touchSeq: number } {
@@ -709,9 +724,85 @@ export async function resolveRequiredContexts(
   const now = Date.now();
   pruneRequiredContextsCache(now);
   const cached = readFreshCachedResult(key, now);
-  if (cached) return cached;
+  if (cached) {
+    // A cache hit is an authoritative answer for this head, same as a fresh
+    // lookup. Leaving a prior UNKNOWN streak in place would let later misses
+    // trip EXHAUSTED from failures this success already superseded.
+    await store.clear(counterKey);
+    return cached;
+  }
   if (hasActiveRateLimitBackoff(key, now)) {
-    return deferOrBlock(counterKey, 'rate_limited_backoff', 'transient', env, store);
+    // The window was opened by a real 403. Further ticks make no API call and
+    // must stay fail-closed UNKNOWN until reset, without spending the bound.
+    return rateLimitBackoffUnknown(key, headSha);
+  }
+
+  const inflight = requiredContextsInflight.get(key);
+  if (inflight) {
+    await inflight;
+    return settleSharedLookup(key, counterKey, env, store);
+  }
+
+  let releaseInflight: () => void = () => {};
+  const gate = new Promise<void>(resolve => {
+    releaseInflight = resolve;
+  });
+  requiredContextsInflight.set(key, gate);
+  try {
+    return await lookupRequiredContexts(input, key, counterKey, env, store);
+  } finally {
+    requiredContextsInflight.delete(key);
+    releaseInflight();
+  }
+}
+
+/**
+ * Apply one shared lookup to this head. The leader already wrote the cache or
+ * the back-off; this caller must not issue another GitHub request.
+ */
+async function settleSharedLookup(
+  key: string,
+  counterKey: AttemptCounterKey,
+  env: NodeJS.ProcessEnv,
+  store: AttemptCounterStore
+): Promise<RequiredContextsResolution> {
+  const settledAt = Date.now();
+  const cached = readFreshCachedResult(key, settledAt);
+  if (cached) {
+    await store.clear(counterKey);
+    return cached;
+  }
+  if (hasActiveRateLimitBackoff(key, settledAt)) {
+    return rateLimitBackoffUnknown(key, counterKey.headSha);
+  }
+  const miss = requiredContextsSharedMiss.get(key);
+  return deferOrBlock(
+    counterKey,
+    miss?.reason ?? 'lookup_failed',
+    miss?.failureKind ?? 'transient',
+    env,
+    store
+  );
+}
+
+function rateLimitBackoffUnknown(key: string, headSha: string): RequiredContextsResolution {
+  log.warn(
+    { key, headSha, reason: 'rate_limited_backoff', failureKind: 'transient' },
+    'overseer.required_contexts.rate_limit_backoff_deferring'
+  );
+  return { state: 'unknown', reason: 'rate_limited_backoff', failureKind: 'transient' };
+}
+
+async function lookupRequiredContexts(
+  input: ResolveRequiredContextsInput,
+  key: string,
+  counterKey: AttemptCounterKey,
+  env: NodeJS.ProcessEnv,
+  store: AttemptCounterStore
+): Promise<RequiredContextsResolution> {
+  const { owner, repo, baseRef } = input;
+  if (!baseRef) {
+    return deferOrBlock(counterKey, 'base_ref_unavailable', 'transient', env, store);
   }
 
   const attempts: { source: 'app_client' | 'pat_client'; fetch: StatusCheckContextsFetcher }[] = [];
@@ -747,6 +838,7 @@ export async function resolveRequiredContexts(
         contexts,
         source: attempt.source,
       };
+      requiredContextsSharedMiss.delete(key);
       rememberKnownResult(key, resolution, Date.now());
       return resolution;
     } catch (error) {
@@ -799,10 +891,12 @@ export async function resolveRequiredContexts(
       contexts: [],
       source: 'unprotected_branch',
     };
+    requiredContextsSharedMiss.delete(key);
     rememberKnownResult(key, resolution, Date.now());
     return resolution;
   }
 
+  requiredContextsSharedMiss.set(key, { reason: lastReason, failureKind });
   return deferOrBlock(counterKey, lastReason, failureKind, env, store);
 }
 

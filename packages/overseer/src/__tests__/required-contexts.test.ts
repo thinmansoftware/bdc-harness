@@ -1017,6 +1017,104 @@ describe('resolveRequiredContexts -- lookup cache (#993)', () => {
       source: 'app_client',
     });
   });
+
+  test('45 a cache hit clears this head counter left by earlier UNKNOWN attempts', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '3' };
+    const headA = 'a'.repeat(40);
+    const headB = 'b'.repeat(40);
+    await resolveRequiredContexts(
+      baseInput({
+        headSha: headA,
+        fetchWithAppClient: async () => {
+          throw appPermissionError();
+        },
+      }),
+      env
+    );
+    await resolveRequiredContexts(
+      baseInput({
+        headSha: headA,
+        fetchWithAppClient: async () => {
+          throw appPermissionError();
+        },
+      }),
+      env
+    );
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, headA)).toBe(2);
+
+    await resolveRequiredContexts(
+      baseInput({
+        headSha: headB,
+        fetchWithAppClient: async () => ({ data: ['test (ubuntu-latest)'] }),
+      }),
+      env
+    );
+    const hit = await resolveRequiredContexts(
+      baseInput({
+        headSha: headA,
+        fetchWithAppClient: async () => {
+          throw new Error('cache hit must not call GitHub');
+        },
+      }),
+      env
+    );
+    expect(hit).toEqual({
+      state: 'known',
+      contexts: ['test (ubuntu-latest)'],
+      source: 'app_client',
+    });
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, headA)).toBe(0);
+  });
+
+  test('46 rate-limit backoff stays UNKNOWN and does not spend the attempt bound', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '2' };
+    let appCalls = 0;
+    const input = baseInput({
+      fetchWithAppClient: async () => {
+        appCalls += 1;
+        throw Object.assign(new Error('API rate limit exceeded'), { status: 403 });
+      },
+    });
+    const first = await resolveRequiredContexts(input, env);
+    expect(first.state).toBe('unknown');
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD)).toBe(1);
+
+    for (let index = 0; index < 5; index += 1) {
+      const again = await resolveRequiredContexts(input, env);
+      expect(again.state).toBe('unknown');
+      if (again.state === 'unknown') expect(again.reason).toBe('rate_limited_backoff');
+    }
+    expect(appCalls).toBe(1);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD)).toBe(1);
+  });
+
+  test('47 concurrent misses for one base share a single GitHub request', async () => {
+    let appCalls = 0;
+    let releaseFetch: () => void = () => {};
+    const fetchEntered = new Promise<void>(resolve => {
+      releaseFetch = resolve;
+    });
+    const inputFor = (headSha: string) =>
+      baseInput({
+        headSha,
+        fetchWithAppClient: async () => {
+          appCalls += 1;
+          if (appCalls === 1) await fetchEntered;
+          return { data: ['test (ubuntu-latest)'] };
+        },
+      });
+
+    const pending = Promise.all([
+      resolveRequiredContexts(inputFor('a'.repeat(40)), {}),
+      resolveRequiredContexts(inputFor('b'.repeat(40)), {}),
+    ]);
+    await Promise.resolve();
+    releaseFetch();
+    const [first, second] = await pending;
+    expect(appCalls).toBe(1);
+    expect(first.state).toBe('known');
+    expect(second).toEqual(first);
+  });
 });
 
 describe('resolveRequiredContexts -- helpers', () => {
