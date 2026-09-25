@@ -254,7 +254,7 @@ nodes:
   # inspect and log, but MUST NOT skip build-only nodes. A real no-op is decided later
   # by the implementation mailbox plus real-diff guard.
   - id: gate-already-satisfied
-    depends_on: [check-already-satisfied]
+    depends_on: [check-already-satisfied, checkout-repair-target]
     bash: |
       set -uo pipefail
       # Direct assignment (not heredoc). The executor's substituteNodeOutputRefs
@@ -262,6 +262,24 @@ nodes:
       # a valid multi-line bash assignment: CAS='line1\nline2\n...'.
       # Force-build policy (zero-lane recovery): keep the advisory text for
       # diagnostics only; machine output consumed by when: is always needs-build.
+      # Repair-in-place: a complete REPAIR_TARGET=#<digits> line from
+      # checkout-repair-target means the PR still needs work. Short-circuit
+      # before the precheck so already-satisfied cannot skip plan/implement.
+      # REPAIR_TARGET=none, substrings, and malformed values do not match.
+      CRT=$checkout-repair-target.output
+      REPAIR_NUM=$(printf '%s\n' "$CRT" | sed -n 's/^REPAIR_TARGET=#\([0-9][0-9]*\)$/\1/p' | head -1)
+      if [[ -n "$REPAIR_NUM" ]]; then
+        REPAIR_TARGET="#${REPAIR_NUM}" python3 - <<'PY'
+      import json
+      import os
+      print(json.dumps({
+          "ALREADY_SATISFIED": False,
+          "PRECHECK_VERDICT": "repair-in-place",
+          "REPAIR_TARGET": os.environ.get("REPAIR_TARGET", ""),
+      }, separators=(",", ":")))
+      PY
+        exit 0
+      fi
       CAS=$check-already-satisfied.output
       echo "gate-already-satisfied: advisory precheck (diagnostics only; zero-lane forces needs-build):" >&2
       printf '%s\n' "$CAS" | head -n 20 >&2
