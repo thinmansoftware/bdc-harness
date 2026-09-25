@@ -90,7 +90,10 @@ import { getOverseerCapabilityState } from '@archon/core/db/overseer-capabilitie
 import { createOverseerFireWorkflowRun } from './overseer-fire';
 import { executeAutomaticRefire } from '@archon/overseer/actions/automatic-refire';
 import { releaseTerminalWorktree } from '@archon/overseer/actions/automatic-refire';
-import { executeRepairRefire } from '@archon/overseer/actions/repair-refire';
+import {
+  assessRepairRefireCandidate,
+  executeRepairRefire,
+} from '@archon/overseer/actions/repair-refire';
 import { createRepairRefireAdapter } from '@archon/overseer/adapters/repair-refire';
 import { authorizeOverseerActionV2 } from '@archon/overseer/action-policy-v2';
 import { readOverseerActionPolicyFromEnv } from '@archon/overseer/action-policy';
@@ -317,7 +320,73 @@ function startOverseerRuntimeWithRealMergeManager(port: number): void {
           head_sha: failed.prEvidence.headSha ?? null,
           base_sha: null,
         };
-        const evidence = JSON.stringify(_events);
+        const runStartSha = (() => {
+          const metadata = failed.metadata ?? {};
+          const fromMetadata =
+            metadata.RUN_START_SHA ?? metadata.run_start_sha ?? metadata.runStartSha;
+          if (typeof fromMetadata === 'string' && /^[0-9a-f]{40,64}$/i.test(fromMetadata)) {
+            return fromMetadata;
+          }
+          for (const event of _events) {
+            const data = event.data ?? {};
+            const candidate = data.RUN_START_SHA ?? data.run_start_sha ?? data.runStartSha;
+            if (typeof candidate === 'string' && /^[0-9a-f]{40,64}$/i.test(candidate)) {
+              return candidate;
+            }
+          }
+          return null;
+        })();
+        if (!failed.workingPath || !failed.headBranch || !runStartSha) {
+          return {
+            disposition: 'reconcile_only',
+            outcome: 'salvage_missing',
+            successor_run_id: null,
+            predecessor_run_id: failed.runId,
+            external_effect_reference: null,
+            reason: 'salvage_missing',
+          };
+        }
+        const runGit = promisify(execFile);
+        let worktreeHead: string;
+        let originTip: string;
+        try {
+          worktreeHead = (
+            await runGit('git', ['-C', failed.workingPath, 'rev-parse', '--verify', 'HEAD'])
+          ).stdout.trim();
+          originTip = (
+            await runGit('git', [
+              '-C',
+              failed.workingPath,
+              'rev-parse',
+              '--verify',
+              `refs/remotes/origin/${failed.headBranch}`,
+            ])
+          ).stdout.trim();
+        } catch {
+          return {
+            disposition: 'reconcile_only',
+            outcome: 'salvage_missing',
+            successor_run_id: null,
+            predecessor_run_id: failed.runId,
+            external_effect_reference: null,
+            reason: 'salvage_missing',
+          };
+        }
+        if (
+          ![worktreeHead, originTip, runStartSha].every(value =>
+            /^[0-9a-f]{40,64}$/i.test(value)
+          )
+        ) {
+          throw new Error('invalid_salvage_git_lineage');
+        }
+        const evidence = JSON.stringify({
+          events: _events,
+          salvage: {
+            worktree_head: worktreeHead,
+            origin_tip: originTip,
+            run_start_sha: runStartSha,
+          },
+        });
         const evidenceBlob = sha256hex(evidence);
         const evidenceDirectory = join(getArchonHome(), 'runs', failed.runId);
         const evidencePath = join(evidenceDirectory, 'overseer-refire-evidence.json');
@@ -393,14 +462,23 @@ function startOverseerRuntimeWithRealMergeManager(port: number): void {
                   evidence_digest: sha256hex(fired.runId),
                   reason: 'fired',
                 }
-              : {
-                  schema_version: 'overseer-first-refire-on-ramp-result-v1' as const,
-                  status: 'failed' as const,
-                  successor_run_id: null,
-                  external_effect_reference: null,
-                  evidence_digest: sha256hex(fired.error),
-                  reason: `fire_failed:${fired.error}`,
-                };
+              : 'indeterminate' in fired && fired.indeterminate
+                ? {
+                    schema_version: 'overseer-first-refire-on-ramp-result-v1' as const,
+                    status: 'indeterminate' as const,
+                    successor_run_id: null,
+                    external_effect_reference: fired.conversationId,
+                    evidence_digest: sha256hex(fired.error),
+                    reason: fired.error,
+                  }
+                : {
+                    schema_version: 'overseer-first-refire-on-ramp-result-v1' as const,
+                    status: 'failed' as const,
+                    successor_run_id: null,
+                    external_effect_reference: null,
+                    evidence_digest: sha256hex(fired.error),
+                    reason: `fire_failed:${fired.error}`,
+                  };
           } catch (error) {
             return {
               schema_version: 'overseer-first-refire-on-ramp-result-v1' as const,
@@ -414,12 +492,19 @@ function startOverseerRuntimeWithRealMergeManager(port: number): void {
         }
         return executeRepairRefire(
           {
-            assessment: {
-              disposition: attempt === 1 ? 'refire_first' : 'refire_later',
-              escalation_reason: null,
-              requires_circuit_open: false,
-              no_mutation: false,
-            },
+            assessment: assessRepairRefireCandidate({
+              action_gate_enabled: true,
+              evidence_complete: true,
+              has_exact_target: true,
+              has_active_owner_or_run: false,
+              has_indeterminate_prior_effect: false,
+              salvage_complete: true,
+              automatic_attempt_count: attempt - 1,
+              scope_changed: false,
+              semantic_dispute: false,
+              fusion_available: false,
+              repairable_in_place: false,
+            }),
             proposal_id: proposal.proposal_id,
             execution_id: proposal.execution_id,
             idempotency_key: `${failed.runId}:${attempt}`,
@@ -439,11 +524,11 @@ function startOverseerRuntimeWithRealMergeManager(port: number): void {
               source_target_digest: targetDigestV2(target),
               source_run_id: failed.runId,
               worktree_path: failed.workingPath ?? '',
-              artifact_kind: 'git_object',
-              git_object_format: 'sha256',
-              git_object_id: evidenceBlob,
-              patch_path: null,
-              patch_sha256: null,
+              artifact_kind: 'patch',
+              git_object_format: null,
+              git_object_id: null,
+              patch_path: evidencePath,
+              patch_sha256: evidenceBlob,
               scope_digest: sha256hex(`${failed.repo}:${failed.woId}:${failed.workflowName}`),
               captured_at: observedAt,
               verified_at: observedAt,

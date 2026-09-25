@@ -11,6 +11,7 @@ export interface OverseerFireInput {
 
 export type OverseerFireResult =
   | { ok: true; runId: string; conversationId: string }
+  | { ok: false; indeterminate: true; error: string; conversationId: string }
   | { ok: false; error: string };
 
 interface FireDeps {
@@ -109,6 +110,11 @@ export function createOverseerFireWorkflowRun(options: {
       if (deps.now() >= deadline) break;
       await deps.wait(interval);
     } while (deps.now() <= deadline);
-    return { ok: false, error: 'successor_discovery_timeout' };
+    return {
+      ok: false,
+      indeterminate: true,
+      error: 'successor_discovery_timeout',
+      conversationId: body.conversationId,
+    };
   };
 }

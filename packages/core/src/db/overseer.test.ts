@@ -145,11 +145,11 @@ describe('overseer db', () => {
     expect(await listRunsForOverseerWatch()).toHaveLength(0);
   });
 
-  test('counts fired and indeterminate repair_refire receipts, but not refusals', async () => {
+  test('counts fired and non-terminal indeterminate refire receipts, but not refusals', async () => {
     await seedRun('run-attempts');
     for (const [action, result] of [
       ['repair_refire', 'fired:successor:r2:attempt:1'],
-      ['repair_refire', 'indeterminate:network_after_reservation'],
+      ['repair_refire_indeterminate', 'indeterminate:network_after_reservation'],
       ['repair_refire_refused', 'indeterminate:legacy-row-must-not-count'],
       ['repair_refire_refused', 'refused:attempt_ceiling'],
     ] as const) {

@@ -299,8 +299,8 @@ export async function countOverseerAutomaticRecoveryAttempts(woId: string): Prom
   const result = await db.query<AttemptCountRow>(
     `SELECT COUNT(*) AS attempt_count FROM overseer_actions
      WHERE wo_id = $1 AND created_at >= ${cutoff}
-       AND action = 'repair_refire'
-       AND (result LIKE 'fired:%' OR result LIKE 'indeterminate:%')`,
+       AND ((action = 'repair_refire' AND result LIKE 'fired:%')
+         OR (action = 'repair_refire_indeterminate' AND result LIKE 'indeterminate:%'))`,
     [woId]
   );
   return Number(result.rows[0]?.attempt_count ?? 0);

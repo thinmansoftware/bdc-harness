@@ -446,7 +446,7 @@ export async function handleRecordJudgeFirst(
       {
         verdictId: claim.verdictId,
         reason: 'spec_tests_line_defect',
-        blocker: `spec Tests-line defect: run-stop-tests found no runnable spec-declared test command (TESTS_SOURCE=${source}, TESTS_STATUS=${status}); the WO's own stop tests passed; the code is not the failure; a spec amendment is required (WO-HARNESS-OVERSEER-REPAIR-IN-PLACE-01)`,
+        blocker: `spec Tests-line defect: run-stop-tests found no runnable spec-declared test command (TESTS_SOURCE=${source}, TESTS_STATUS=${status}); the available evidence does not establish that the WO's own stop tests passed; a spec amendment is required (WO-HARNESS-OVERSEER-REPAIR-IN-PLACE-01)`,
       },
       options.escalate
     );
@@ -483,7 +483,10 @@ export async function handleRecordJudgeFirst(
         runId: record.runId,
         woId: record.woId,
         class: actionClass(record),
-        action: indeterminate ? 'repair_refire' : 'repair_refire_refused',
+        // An uncertain external effect must consume attempt budget without
+        // retiring the predecessor from the watch queue. Only a confirmed
+        // successor receives the terminal repair_refire action.
+        action: indeterminate ? 'repair_refire_indeterminate' : 'repair_refire_refused',
         result: `${indeterminate ? 'indeterminate' : 'refused'}:${refusalReason}:verdict:${claim.verdictId}`,
       });
       await escalateWithEvidence(

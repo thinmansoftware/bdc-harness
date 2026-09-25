@@ -83,4 +83,32 @@ describe('overseer loopback fire', () => {
     );
     expect(request?.body).not.toContain('--expected-spec');
   });
+
+  test('reports indeterminate after dispatch is confirmed but successor discovery times out', async () => {
+    const fire = createOverseerFireWorkflowRun({
+      port: 3090,
+      operatorToken: 'secret',
+      discoverTimeoutMs: 0,
+      deps: {
+        findCodebasesByName: async () => [{ id: 'cb' } as never],
+        findLiveRunsForWo: async () => [],
+        fetch: async () =>
+          Response.json({ dispatched: true, id: 'parent', conversationId: 'worker' }),
+        discoverRuns: async () => [],
+      },
+    });
+    expect(
+      await fire({
+        workflowName: 'lane',
+        woId: 'WO-X',
+        project: 'bdc-harness',
+        predecessorRunId: 'r1',
+      })
+    ).toEqual({
+      ok: false,
+      indeterminate: true,
+      error: 'successor_discovery_timeout',
+      conversationId: 'worker',
+    });
+  });
 });
