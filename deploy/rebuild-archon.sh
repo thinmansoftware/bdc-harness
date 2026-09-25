@@ -14,8 +14,10 @@ PRUNE_SCRIPT="${REBUILD_PRUNE_SCRIPT:-/opt/bdc/scripts/prune-rebuild-artifacts.s
 
 DRAIN_SET_BY_ME=0
 RECREATED=0
+CLEANED=0
 TOKEN=""
 ACTIVE_IDS=""
+CURL_MAX_TIME=30
 
 usage() {
   cat <<'EOF'
@@ -27,7 +29,7 @@ Exit codes:
   0  rebuild completed
   3  drain timed out before recreateSafe
   75 lock already held (LOCKED)
-  1  guard abort (dirty tree, disk, sha mismatch, or health)
+  1  guard or drain-request abort (dirty tree, disk, sha mismatch, health, or ABORT_DRAIN_REQUEST_FAILED)
 EOF
 }
 
@@ -56,31 +58,43 @@ done
 json_escape() {
   # Escapes a string for safe use inside a JSON double-quoted value: backslash
   # and double-quote first (order matters -- escaping the backslash first
-  # would double-escape the backslashes just added for the quote), then the
-  # control characters JSON forbids raw inside a string. USER is
-  # attacker-influenced in principle (any value the running account's shell
-  # environment sets) and was previously interpolated unescaped into
-  # DRAIN_BODY, which could inject JSON fields or read as malformed JSON.
+  # would double-escape the backslashes just added for the quote), then tab,
+  # CR, and LF as JSON escapes. Other control characters JSON forbids raw
+  # are dropped. USER is attacker-influenced in principle (any value the
+  # running account's shell environment sets) and was previously interpolated
+  # unescaped into DRAIN_BODY, which could inject JSON fields or read as
+  # malformed JSON. Tab, CR, and LF must be escaped rather than deleted:
+  # leaving them raw makes the drain body invalid JSON.
   local s="$1"
   s="${s//\\/\\\\}"
   s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\n'/\\n}"
   s="$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')"
   printf '%s' "$s"
 }
 
 undrain_if_mine() {
   if [ "$DRAIN_SET_BY_ME" = "1" ] && [ "$RECREATED" = "0" ] && [ -n "$TOKEN" ]; then
-    curl -sS -X POST "$API_BASE/api/admin/drain" \
+    curl -sS --max-time "$CURL_MAX_TIME" -X POST "$API_BASE/api/admin/drain" \
       -H "Content-Type: application/json" \
       -H "x-archon-operator-token: $TOKEN" \
       -d '{"draining":false,"reason":"rebuild aborted"}' >/dev/null || true
+    DRAIN_SET_BY_ME=0
   fi
 }
 
 on_abort() {
+  if [ "$CLEANED" = "1" ]; then
+    return 0
+  fi
+  CLEANED=1
   undrain_if_mine
 }
-trap on_abort ERR INT TERM
+trap 'status=$?; on_abort; exit "$status"' ERR
+trap 'on_abort; exit 130' INT
+trap 'on_abort; exit 143' TERM
 
 mkdir -p "$(dirname "$LOCK_FILE")"
 exec 9>"$LOCK_FILE"
@@ -91,25 +105,55 @@ fi
 
 TOKEN="$(docker exec archon-app-1 printenv ARCHON_OPERATOR_TOKEN)"
 
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-USER_NAME="${USER:-unknown}"
-REASON="rebuild ${STAMP} by ${USER_NAME}"
-REASON_JSON="$(json_escape "$REASON")"
-
-DRAIN_BODY="$(printf '{"draining":true,"clearOnBoot":true,"reason":"%s"}' "$REASON_JSON")"
-DRAIN_RESP="$(curl -sS -X POST "$API_BASE/api/admin/drain" \
-  -H "Content-Type: application/json" \
-  -H "x-archon-operator-token: $TOKEN" \
-  -d "$DRAIN_BODY")"
-case "$DRAIN_RESP" in
-  *'"changed":true'*|*'\"changed\":true'*) DRAIN_SET_BY_ME=1 ;;
-  *) DRAIN_SET_BY_ME=0 ;;
+INITIAL_STATE="$(curl -sS --max-time "$CURL_MAX_TIME" "$API_BASE/api/admin/drain" \
+  -H "x-archon-operator-token: $TOKEN")"
+case "$INITIAL_STATE" in
+  *'"mode":"draining"'*)
+    # Someone else already drained (incident freeze or another operator).
+    # Do not post clearOnBoot and do not clear it later.
+    DRAIN_SET_BY_ME=0
+    ;;
+  *)
+    STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+    USER_NAME="${USER:-unknown}"
+    REASON="rebuild ${STAMP} by ${USER_NAME}"
+    REASON_JSON="$(json_escape "$REASON")"
+    DRAIN_BODY="$(printf '{"draining":true,"clearOnBoot":true,"reason":"%s"}' "$REASON_JSON")"
+    DRAIN_RESP_FILE="$(mktemp)"
+    DRAIN_HTTP="$(curl -sS --max-time "$CURL_MAX_TIME" -o "$DRAIN_RESP_FILE" -w '%{http_code}' \
+      -X POST "$API_BASE/api/admin/drain" \
+      -H "Content-Type: application/json" \
+      -H "x-archon-operator-token: $TOKEN" \
+      -d "$DRAIN_BODY")" || {
+      rm -f "$DRAIN_RESP_FILE"
+      printf '%s\n' ABORT_DRAIN_REQUEST_FAILED
+      exit 1
+    }
+    DRAIN_RESP="$(cat "$DRAIN_RESP_FILE")"
+    rm -f "$DRAIN_RESP_FILE"
+    case "$DRAIN_HTTP" in
+      4*|5*)
+        printf '%s\n' ABORT_DRAIN_REQUEST_FAILED
+        exit 1
+        ;;
+    esac
+    case "$DRAIN_RESP" in
+      *'"changed":true'*|*'\"changed\":true'*) DRAIN_SET_BY_ME=1 ;;
+      *) DRAIN_SET_BY_ME=0 ;;
+    esac
+    ;;
 esac
+
+# STAMP is also used by the backup and rollback pin. A foreign drain skips
+# the POST above, so mint it here when that path did not.
+if [ -z "${STAMP:-}" ]; then
+  STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+fi
 
 deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
 ready=0
 while true; do
-  STATE="$(curl -sS "$API_BASE/api/admin/drain" \
+  STATE="$(curl -sS --max-time "$CURL_MAX_TIME" "$API_BASE/api/admin/drain" \
     -H "x-archon-operator-token: $TOKEN")"
   RUNNING="$(printf '%s' "$STATE" | sed -n 's/.*"runningRunCount":\([0-9][0-9]*\).*/\1/p')"
   PENDING="$(printf '%s' "$STATE" | sed -n 's/.*"pendingRunCount":\([0-9][0-9]*\).*/\1/p')"
@@ -126,12 +170,17 @@ while true; do
   if [ "$now" -ge "$deadline" ]; then
     break
   fi
-  sleep "$POLL_SEC"
+  # wait is a builtin, so an INT/TERM trap runs now instead of being
+  # deferred until an external sleep exits (and then falling through).
+  if [ "$POLL_SEC" != "0" ]; then
+    sleep "$POLL_SEC" &
+    wait $! || true
+  fi
 done
 
 if [ "$ready" != "1" ]; then
   if [ "$DRAIN_SET_BY_ME" = "1" ]; then
-    curl -sS -X POST "$API_BASE/api/admin/drain" \
+    curl -sS --max-time "$CURL_MAX_TIME" -X POST "$API_BASE/api/admin/drain" \
       -H "Content-Type: application/json" \
       -H "x-archon-operator-token: $TOKEN" \
       -d '{"draining":false,"reason":"ABORT_DRAIN_TIMEOUT"}' >/dev/null || true
@@ -175,7 +224,7 @@ RECREATED=1
 health_deadline=$(( $(date +%s) + 120 ))
 healthy=0
 while [ "$(date +%s)" -lt "$health_deadline" ]; do
-  if curl -sS -o /dev/null -w '%{http_code}' "$API_BASE/api/health" | grep -q '^200$'; then
+  if curl -sS --max-time "$CURL_MAX_TIME" -o /dev/null -w '%{http_code}' "$API_BASE/api/health" | grep -q '^200$'; then
     healthy=1
     break
   fi
@@ -186,17 +235,22 @@ if [ "$healthy" != "1" ]; then
   exit 1
 fi
 
-POST_STATE="$(curl -sS "$API_BASE/api/admin/drain" \
+POST_STATE="$(curl -sS --max-time "$CURL_MAX_TIME" "$API_BASE/api/admin/drain" \
   -H "x-archon-operator-token: $TOKEN")"
-case "$POST_STATE" in
-  *'"mode":"draining"'*)
-    curl -sS -X POST "$API_BASE/api/admin/drain" \
-      -H "Content-Type: application/json" \
-      -H "x-archon-operator-token: $TOKEN" \
-      -d '{"draining":false,"reason":"cleared after recreate"}' >/dev/null || true
-    printf '%s\n' DRAIN_CLEARED_BY_SCRIPT
-    ;;
-esac
+# Only clear a drain this invocation set. A foreign drain (already draining
+# before we started, including an incident freeze) must still be draining
+# after a successful rebuild.
+if [ "$DRAIN_SET_BY_ME" = "1" ]; then
+  case "$POST_STATE" in
+    *'"mode":"draining"'*)
+      curl -sS --max-time "$CURL_MAX_TIME" -X POST "$API_BASE/api/admin/drain" \
+        -H "Content-Type: application/json" \
+        -H "x-archon-operator-token: $TOKEN" \
+        -d '{"draining":false,"reason":"cleared after recreate"}' >/dev/null || true
+      printf '%s\n' DRAIN_CLEARED_BY_SCRIPT
+      ;;
+  esac
+fi
 
 printf '%s\n' "docker tag archon:rollback-$STAMP archon:latest && docker compose up -d app"
 

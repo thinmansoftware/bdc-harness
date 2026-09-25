@@ -2830,6 +2830,55 @@ describe('WO-HARNESS-REBUILD-DRAIN-MODE-01 drain create and recreateSafe', () =>
     }
   });
 
+  test('refuses clear_on_boot takeover of an existing drain', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-drain-foreign-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sqlText: string, params?: unknown[]) =>
+      sqlite.query(sqlText, params)
+    );
+    try {
+      await setCauldronDrainMode({
+        mode: 'draining',
+        actor: 'incident-operator',
+        reason: 'incident freeze',
+        updatedAt: '2026-09-24T00:00:00.000Z',
+        clearOnBoot: false,
+      });
+      await expect(
+        setCauldronDrainMode({
+          mode: 'draining',
+          actor: 'rebuild-script',
+          reason: 'rebuild takeover',
+          updatedAt: '2026-09-24T02:00:00.000Z',
+          clearOnBoot: true,
+        })
+      ).resolves.toEqual({ changed: false, mode: 'draining' });
+      const row = await sqlite.query<{
+        mode: string;
+        clear_on_boot: number;
+        updated_by: string;
+      }>('SELECT mode, clear_on_boot, updated_by FROM remote_agent_cauldron_control WHERE id = 1');
+      expect(row.rows[0]?.mode).toBe('draining');
+      expect(Number(row.rows[0]?.clear_on_boot)).toBe(0);
+      expect(row.rows[0]?.updated_by).toBe('incident-operator');
+      const events = await sqlite.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM remote_agent_cauldron_control_events'
+      );
+      expect(events.rows[0]?.count).toBe(1);
+    } finally {
+      await sqlite.close();
+      try {
+        unlinkSync(dbPath);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
   test('incident_drain_persists_and_old_shape_upgrades', async () => {
     const dbPath = join(
       import.meta.dir,
@@ -2858,15 +2907,15 @@ describe('WO-HARNESS-REBUILD-DRAIN-MODE-01 drain create and recreateSafe', () =>
       await expect(
         setCauldronDrainMode({
           mode: 'draining',
-          actor: 'operator',
+          actor: 'rebuild-script',
           reason: 'upgrade incident freeze to rebuild scope',
           updatedAt: '2026-09-24T02:00:00.000Z',
           clearOnBoot: true,
         })
-      ).resolves.toEqual({ changed: true, mode: 'draining' });
+      ).resolves.toEqual({ changed: false, mode: 'draining' });
       await expect(getCauldronDrainState()).resolves.toMatchObject({
         mode: 'draining',
-        clearOnBoot: true,
+        clearOnBoot: false,
       });
       const events = await sqlite.query<{ count: number }>(
         'SELECT COUNT(*) AS count FROM remote_agent_cauldron_control_events'

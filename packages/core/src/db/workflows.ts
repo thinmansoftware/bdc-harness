@@ -1048,6 +1048,12 @@ export async function setCauldronDrainMode(data: {
     }>(`SELECT mode, clear_on_boot FROM remote_agent_cauldron_control WHERE id = 1${lockSuffix}`);
     const currentMode = current.rows[0]?.mode ?? 'normal';
     const currentClearOnBoot = numericCount(current.rows[0]?.clear_on_boot) === 1 ? 1 : 0;
+    // An existing drain is not ours to retarget. A second draining request,
+    // including clearOnBoot:true from a rebuild script, must not adopt the
+    // row, rewrite clear_on_boot, or append a transition event.
+    if (currentMode === 'draining' && data.mode === 'draining') {
+      return { changed: false, mode: data.mode };
+    }
     if (currentMode === data.mode && currentClearOnBoot === clearOnBoot) {
       return { changed: false, mode: data.mode };
     }

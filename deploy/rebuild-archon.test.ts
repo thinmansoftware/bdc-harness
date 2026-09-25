@@ -28,19 +28,26 @@ async function setup(opts: {
   postUpDraining?: boolean;
   upFails?: boolean;
   userName?: string;
+  initialMode?: 'normal' | 'draining';
+  drainStatus?: number;
 }): Promise<void> {
   root = await mkdtemp(join(tmpdir(), 'rebuild-archon-'));
   bin = join(root, 'bin');
   log = join(root, 'calls.log');
   curlCount = join(root, 'curl.count');
+  const getCount = join(root, 'get.count');
+  const bodyFile = join(root, 'last-drain-body.json');
   await mkdir(bin);
   await writeFile(curlCount, '0');
+  await writeFile(getCount, '0');
   const readyOn = opts.readyOn ?? 3;
   const changed = opts.changed === false ? 'false' : 'true';
   const lockHeld = opts.lockHeld ? '1' : '0';
   const dirty = opts.dirty ? '1' : '0';
   const postUp = opts.postUpDraining === false ? 'normal' : 'draining';
   const upFails = opts.upFails ? '1' : '0';
+  const initialMode = opts.initialMode ?? 'normal';
+  const drainStatus = opts.drainStatus ?? 200;
 
   await writeStub(
     'flock',
@@ -64,18 +71,44 @@ exit 0
     'curl',
     `#!/usr/bin/env bash
 printf '%s\\n' "curl $*" >> "${log}"
-args="$*"
-if [[ "$args" == *"/api/health"* ]]; then printf '%s' 200; exit 0; fi
-if [[ "$args" == *"-d"* ]]; then
-  if [[ "$args" == *'clearOnBoot":true'* || "$args" == *'clearOnBoot:true'* ]]; then
-    printf '%s' '{"changed":${changed},"mode":"draining"}'
-  elif [[ "$args" == *'draining":false'* || "$args" == *'draining": false'* ]]; then
-    printf '%s' '{"changed":true,"mode":"normal"}'
+out=""
+want_code=0
+data=""
+is_health=0
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$arg"; prev=""; continue; fi
+  if [ "$prev" = "-d" ]; then data="$arg"; prev=""; continue; fi
+  if [ "$prev" = "-w" ]; then want_code=1; prev=""; continue; fi
+  if [ "$prev" = "-H" ] || [ "$prev" = "-X" ] || [ "$prev" = "--max-time" ]; then prev=""; continue; fi
+  case "$arg" in
+    -o|-d|-w|-H|-X|--max-time) prev="$arg"; continue ;;
+    *"/api/health"*) is_health=1 ;;
+  esac
+done
+if [ "$is_health" = "1" ]; then printf '%s' 200; exit 0; fi
+if [ -n "$data" ]; then
+  if [[ "$data" == *clearOnBoot* ]]; then printf '%s' "$data" > "${bodyFile}"; fi
+  status=200
+  if [[ "$data" == *'clearOnBoot":true'* || "$data" == *'clearOnBoot:true'* ]]; then
+    status=${drainStatus}
+    resp='{"changed":${changed},"mode":"draining"}'
+  elif [[ "$data" == *'draining":false'* || "$data" == *'draining": false'* ]]; then
+    resp='{"changed":true,"mode":"normal"}'
   else
-    printf '%s' '{"changed":${changed},"mode":"draining"}'
+    resp='{"changed":${changed},"mode":"draining"}'
   fi
+  if [ -n "$out" ] && [ "$out" != "/dev/null" ]; then printf '%s' "$resp" > "$out"; fi
+  if [ "$want_code" = "1" ]; then printf '%s' "$status"; else printf '%s' "$resp"; fi
   exit 0
 fi
+seen=$(cat "${getCount}")
+if [ "$seen" = "0" ]; then
+  printf '%s' 1 > "${getCount}"
+  printf '%s' '{"mode":"${initialMode}","recreateSafe":false,"runningRunCount":0,"pendingRunCount":0,"activeRunIds":[]}'
+  exit 0
+fi
+printf '%s\\n' POLL_LOOP >> "${log}"
 n=$(cat "${curlCount}")
 n=$((n + 1))
 printf '%s' "$n" > "${curlCount}"
@@ -266,5 +299,100 @@ describe('rebuild-archon.sh', () => {
     expect(aborted.stdout).not.toContain('tok-SENTINEL-123');
     expect(aborted.stderr).not.toContain('tok-SENTINEL-123');
     expect(aborted.calls).toContain('draining":false');
+  });
+
+  test('rebuild_script_never_touches_a_foreign_drain', async () => {
+    await setup({ initialMode: 'draining', readyOn: 1 });
+    const ok = await runScript(['--poll-sec', '0', '--drain-timeout-min', '5']);
+    expect(ok.exitCode).toBe(0);
+    expect(ok.calls).not.toContain('clearOnBoot');
+    expect(ok.calls).not.toContain('draining":false');
+    expect(ok.stdout).not.toContain('DRAIN_CLEARED_BY_SCRIPT');
+
+    await setup({ initialMode: 'draining', dirty: true, readyOn: 1 });
+    const aborted = await runScript(['--poll-sec', '0', '--drain-timeout-min', '5']);
+    expect(aborted.exitCode).toBe(1);
+    expect(aborted.stdout).toContain('ABORT_DIRTY');
+    expect(aborted.calls).not.toContain('clearOnBoot');
+    expect(aborted.calls).not.toContain('draining":false');
+    expect(aborted.calls).not.toContain('compose build app');
+  });
+
+  test('rebuild_script_interrupt_exits_and_never_builds', async () => {
+    for (const [signal, code] of [
+      ['SIGINT', 130],
+      ['SIGTERM', 143],
+    ] as const) {
+      await setup({ readyOn: 99 });
+      const proc = Bun.spawn(['bash', SCRIPT, '--poll-sec', '30', '--drain-timeout-min', '10'], {
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          REBUILD_LOCK_FILE: join(root, 'rebuild.lock'),
+          REBUILD_REPO_DIR: root,
+          REBUILD_DB: join(root, 'archon.db'),
+          REBUILD_PRUNE_SCRIPT: join(root, 'prune.sh'),
+          REBUILD_API_BASE: 'http://127.0.0.1:3090',
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const started = Date.now();
+      let sawPoll = false;
+      while (Date.now() - started < 10000) {
+        const calls = await readFile(log, 'utf8').catch(() => '');
+        if (calls.includes('POLL_LOOP')) {
+          sawPoll = true;
+          break;
+        }
+        await Bun.sleep(50);
+      }
+      expect(sawPoll).toBe(true);
+      proc.kill(signal);
+      const exitCode = await proc.exited;
+      const calls = await readFile(log, 'utf8');
+      expect(exitCode).toBe(code);
+      const undrains = calls.split('\n').filter(line => line.includes('draining":false'));
+      expect(undrains).toHaveLength(1);
+      expect(calls).not.toContain('compose build app');
+      expect(calls).not.toContain('compose up -d app');
+    }
+  });
+
+  test('json_escape_control_chars', async () => {
+    await setup({});
+    const user = 'op\tcr\rnl\nend';
+    const { exitCode } = await runScript(['--poll-sec', '0', '--drain-timeout-min', '5'], {
+      USER: user,
+    });
+    expect(exitCode).toBe(0);
+    const bodyText = await readFile(join(root, 'last-drain-body.json'), 'utf8');
+    const parsed = JSON.parse(bodyText) as { reason: string };
+    expect(parsed.reason).toContain('\t');
+    expect(parsed.reason).toContain('\r');
+    expect(parsed.reason).toContain('\n');
+    expect(bodyText).toContain('\\t');
+    expect(bodyText).toContain('\\r');
+    expect(bodyText).toContain('\\n');
+  });
+
+  test('rebuild_script_drain_request_failure_fails_fast', async () => {
+    for (const status of [401, 500]) {
+      await setup({ drainStatus: status });
+      const started = Date.now();
+      const { exitCode, stdout, calls } = await runScript([
+        '--poll-sec',
+        '30',
+        '--drain-timeout-min',
+        '120',
+      ]);
+      expect(Date.now() - started).toBeLessThan(10000);
+      expect(exitCode).toBe(1);
+      expect(stdout).toContain('ABORT_DRAIN_REQUEST_FAILED');
+      expect(calls).not.toContain('POLL_LOOP');
+      expect(calls).not.toContain('git status');
+      expect(calls).not.toContain('compose build app');
+      expect(calls).not.toContain('compose up -d app');
+    }
   });
 });

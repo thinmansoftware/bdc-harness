@@ -71,3 +71,10 @@ Exit codes:
 
 Host install of this script to `/opt/bdc/scripts/rebuild-archon.sh`, the
 rebuild log, and pin retention stay with bdc-xo#2306.
+
+## PR #949 rollout
+
+PR #949's own rollout needs a manual M-181 rebuild. The running pre-#949
+container reports no `recreateSafe` field, so this script would poll for 120
+minutes, undrain, and exit 3. Draining before that manual rebuild leaves a
+drain the old container's boot cannot clear.
