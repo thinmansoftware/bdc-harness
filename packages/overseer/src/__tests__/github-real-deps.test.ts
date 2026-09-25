@@ -938,6 +938,53 @@ describe('WO-search prefers the run PR over an early archon/task PR', () => {
     ]);
   });
 
+  test('sibling search failure after a head match keeps the resolved PR', async () => {
+    const { octokit } = octokitFor([early, own], own.number);
+    octokit.search.issuesAndPullRequests = async () => {
+      throw Object.assign(new Error('API rate limit exceeded for installation'), {
+        status: 403,
+        response: { headers: { 'x-ratelimit-remaining': '0' } },
+      });
+    };
+    const warnings: string[] = [];
+    const evidence = await createRealFindPullRequest(octokit, {
+      now: () => 400_000,
+      logger: {
+        warn: (_obj, msg) => warnings.push(msg),
+        error: () => {},
+      },
+    })({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+      headBranch: own.headRef,
+    });
+
+    expect(evidence.exists).toBe(true);
+    expect(evidence.lookupFailed).toBeUndefined();
+    expect(evidence.pr).toMatchObject({
+      number: 968,
+      headRef: 'feat/wo-x-01-thread-abc',
+    });
+    expect(evidence.otherOpenPrsForWo).toEqual([]);
+    expect(warnings).toEqual(['overseer.github_real_deps.sibling_search_failed']);
+
+    // Sibling rate-limit must not arm the process-wide backoff that would
+    // turn the next head lookup into LOOKUP_FAILED_EVIDENCE.
+    octokit.search.issuesAndPullRequests = async () => ({ data: { items: [] } });
+    const again = await createRealFindPullRequest(octokit, {
+      now: () => 400_001,
+      logger: { warn: () => {}, error: () => {} },
+    })({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+      headBranch: own.headRef,
+    });
+    expect(again.exists).toBe(true);
+    expect(again.pr?.number).toBe(968);
+  });
+
   test('recovered head branch keeps its own PR and lists the archon/task sibling', async () => {
     const { octokit, gets } = octokitFor([early, own], own.number);
     const evidence = await createRealFindPullRequest(octokit)({

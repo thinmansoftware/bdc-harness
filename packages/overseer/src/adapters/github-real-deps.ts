@@ -722,10 +722,11 @@ export function summarizeChecks(
  * Real findPullRequest: looks up an open PR by head branch first (the run's
  * own PR), then a WO-ID title/body search (mirrors reconcile.ts's approach).
  * A recovered head branch still runs the WO search so sibling open PRs
- * (including archon/task-* pre-review PRs) land in otherOpenPrsForWo. The
- * search selects a PR only when the head branch did not. Evidence fields are
- * populated only from live API data -- no invented defaults beyond the
- * documented "missing" shape.
+ * (including archon/task-* pre-review PRs) land in otherOpenPrsForWo. That
+ * search is best-effort once the head matched: a sibling lookup failure keeps
+ * the resolved PR. The search selects a PR only when the head branch did not.
+ * Evidence fields are populated only from live API data -- no invented
+ * defaults beyond the documented "missing" shape.
  */
 export function createRealFindPullRequest(
   octokit: RealGitHubOctokitLike,
@@ -765,45 +766,57 @@ export function createRealFindPullRequest(
       // 'unknown' is parseWoId's could-not-parse fallback, not a WO id --
       // searching for the literal word would return garbage matches.
       if (input.woId && input.woId !== 'unknown' && (prNumber === null || resolvedByHeadBranch)) {
-        const search = await octokit.search.issuesAndPullRequests({
-          // Title AND body: lanes title PRs freely (anchor: canary PR #705,
-          // 'docs(canary): add e2e merge canary marker' -- WO id only in the
-          // body; in:title returned nothing and the run was wrongly closed as
-          // 'no PR'. 9th canary defect, 2026-08-26).
-          // is:open: a closed PR is not this run's current head.
-          q: `repo:${input.owner}/${input.repo} is:pr is:open "${input.woId}"`,
-          per_page: WO_SEARCH_CANDIDATE_LIMIT,
-        });
-        const items = search.data.items
-          .filter(item => item.pull_request)
-          .slice(0, WO_SEARCH_CANDIDATE_LIMIT);
-        for (const item of items) {
-          const fetched = await octokit.pulls.get({
-            owner: input.owner,
-            repo: input.repo,
-            pull_number: item.number,
+        try {
+          const search = await octokit.search.issuesAndPullRequests({
+            // Title AND body: lanes title PRs freely (anchor: canary PR #705,
+            // 'docs(canary): add e2e merge canary marker' -- WO id only in the
+            // body; in:title returned nothing and the run was wrongly closed as
+            // 'no PR'. 9th canary defect, 2026-08-26).
+            // is:open: a closed PR is not this run's current head.
+            q: `repo:${input.owner}/${input.repo} is:pr is:open "${input.woId}"`,
+            per_page: WO_SEARCH_CANDIDATE_LIMIT,
           });
-          if (fetched.data.state !== 'open') continue;
-          const login = fetched.data.user?.login;
-          woSearchCandidates.push({
-            number: fetched.data.number,
-            headRef: fetched.data.head.ref ?? '',
-            author: typeof login === 'string' ? login : '',
-            createdAt: fetched.data.created_at ?? '',
-          });
-        }
-        if (prNumber === null) {
-          const selected = selectWoSearchCandidate(woSearchCandidates);
-          if (selected) {
-            prNumber = selected.number;
-          } else if (woSearchCandidates.length > 0) {
-            rateLimitBackoffUntil = 0;
-            rateLimitLastLoggedAt = 0;
-            return {
-              ...MISSING_EVIDENCE,
-              otherOpenPrsForWo: otherOpenPrsForWo(woSearchCandidates, null),
-            };
+          const items = search.data.items
+            .filter(item => item.pull_request)
+            .slice(0, WO_SEARCH_CANDIDATE_LIMIT);
+          for (const item of items) {
+            const fetched = await octokit.pulls.get({
+              owner: input.owner,
+              repo: input.repo,
+              pull_number: item.number,
+            });
+            if (fetched.data.state !== 'open') continue;
+            const login = fetched.data.user?.login;
+            woSearchCandidates.push({
+              number: fetched.data.number,
+              headRef: fetched.data.head.ref ?? '',
+              author: typeof login === 'string' ? login : '',
+              createdAt: fetched.data.created_at ?? '',
+            });
           }
+          if (prNumber === null) {
+            const selected = selectWoSearchCandidate(woSearchCandidates);
+            if (selected) {
+              prNumber = selected.number;
+            } else if (woSearchCandidates.length > 0) {
+              rateLimitBackoffUntil = 0;
+              rateLimitLastLoggedAt = 0;
+              return {
+                ...MISSING_EVIDENCE,
+                otherOpenPrsForWo: otherOpenPrsForWo(woSearchCandidates, null),
+              };
+            }
+          }
+        } catch (error) {
+          // Sibling search is enrichment after a head match. A rate limit or
+          // search failure must not discard the PR pulls.list already resolved.
+          // Without a head match the search is the only way to find the PR, so
+          // that failure still falls through to LOOKUP_FAILED_EVIDENCE.
+          if (!resolvedByHeadBranch) throw error;
+          logger.warn(
+            { err: error, owner: input.owner, repo: input.repo, woId: input.woId, prNumber },
+            'overseer.github_real_deps.sibling_search_failed'
+          );
         }
       }
 
