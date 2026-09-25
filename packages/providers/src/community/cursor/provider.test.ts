@@ -26,6 +26,10 @@ interface FakeChildOptions {
   exitCode?: number;
 }
 
+function stream(...events: unknown[]): string {
+  return `${events.map(event => JSON.stringify(event)).join('\n')}\n`;
+}
+
 function fakeChild(opts: FakeChildOptions = {}): { child: CursorAgentChild; writes: string[] } {
   const writes: string[] = [];
   const child: CursorAgentChild = {
@@ -58,7 +62,13 @@ describe('CursorAgentProvider', () => {
   test('spawns cursor-agent with --workspace <cwd> and the configured model; prompt on stdin', async () => {
     let seenArgv: string[] = [];
     let seenCwd = '';
-    const { child, writes } = fakeChild({ stdout: 'edited two files\nCOMPLETE\n' });
+    const { child, writes } = fakeChild({
+      stdout: stream(
+        { type: 'system', subtype: 'init', model: 'Grok 4.7 256K High' },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'edited two files\nCOMPLETE\n' }] } },
+        { type: 'result', subtype: 'success', is_error: false, result: 'ignored fallback' }
+      ),
+    });
     const spawn: CursorAgentSpawn = (argv, options) => {
       seenArgv = argv;
       seenCwd = options.cwd;
@@ -81,6 +91,8 @@ describe('CursorAgentProvider', () => {
       '/work/tree',
       '--model',
       'gpt-5.6-sol-high',
+      '--output-format',
+      'stream-json',
     ]);
     expect(seenCwd).toBe('/work/tree');
     // The prompt reaches the child on stdin and never as an argv element.
@@ -92,7 +104,7 @@ describe('CursorAgentProvider', () => {
     expect(last?.type).toBe('result');
     if (last?.type === 'result') {
       expect(last.stopReason).toBe('stop');
-      expect(last.servedModelId).toBeNull();
+      expect(last.servedModelId).toBe('Grok 4.7 256K High');
     }
   });
 
@@ -100,7 +112,12 @@ describe('CursorAgentProvider', () => {
     const argvs: string[][] = [];
     const spawn: CursorAgentSpawn = argv => {
       argvs.push(argv);
-      return fakeChild({ stdout: 'ok' }).child;
+      return fakeChild({
+        stdout: stream(
+          { type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } },
+          { type: 'result', subtype: 'success', is_error: false, result: 'ok' }
+        ),
+      }).child;
     };
     const provider = new CursorAgentProvider({ spawn });
     await collect(provider.sendQuery('a', '/w'));
@@ -112,7 +129,12 @@ describe('CursorAgentProvider', () => {
   });
 
   test('prepends systemPrompt and extracts fenced JSON for json_schema output', async () => {
-    const { child, writes } = fakeChild({ stdout: '```json\n{"verdict":"PASS"}\n```' });
+    const { child, writes } = fakeChild({
+      stdout: stream(
+        { type: 'assistant', message: { content: [{ type: 'text', text: '{"verdict":"PASS"}' }] } },
+        { type: 'result', subtype: 'success', is_error: false, result: '' }
+      ),
+    });
     const provider = new CursorAgentProvider({ spawn: () => child });
     const chunks = await collect(
       provider.sendQuery('judge it', '/w', undefined, {
@@ -142,9 +164,83 @@ describe('CursorAgentProvider', () => {
   });
 
   test('exit 0 with empty output (workspace-trust no-op) is a failure, not success', async () => {
-    const { child } = fakeChild({ exitCode: 0, stdout: '   \n' });
+    const { child } = fakeChild({
+      exitCode: 0,
+      stdout: stream({ type: 'result', subtype: 'success', is_error: false, result: '' }),
+    });
     const provider = new CursorAgentProvider({ spawn: () => child });
     await expect(collect(provider.sendQuery('hi', '/w'))).rejects.toThrow(/empty output/);
+  });
+
+  test('requests stream-json explicitly', () => {
+    const argv = buildCursorAgentArgv('cursor-agent', 'grok-4.7-high', '/w');
+    expect(argv).toContain('--output-format');
+    expect(argv[argv.indexOf('--output-format') + 1]).toBe('stream-json');
+  });
+
+  test('streams progress before exit and keeps thinking and tools out of final text', async () => {
+    let resolveExit!: (code: number) => void;
+    const exited = new Promise<number>(resolve => {
+      resolveExit = resolve;
+    });
+    const stdout = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const text = stream(
+          { type: 'system', subtype: 'init', model: 'served-model' },
+          { type: 'thinking', subtype: 'delta', text: 'one' },
+          { type: 'thinking', subtype: 'delta', text: 'two' },
+          { type: 'thinking', subtype: 'delta', text: 'three' },
+          { type: 'tool_call', subtype: 'started' },
+          { type: 'tool_call', subtype: 'completed' },
+          { type: 'assistant', message: { content: [{ type: 'text', text: 'answer' }] } },
+          { type: 'result', subtype: 'success', is_error: false, result: 'fallback' }
+        );
+        const bytes = new TextEncoder().encode(text);
+        controller.enqueue(bytes.slice(0, 31));
+        controller.enqueue(bytes.slice(31));
+        controller.close();
+      },
+    });
+    const child: CursorAgentChild = {
+      stdin: { write: () => 0, end: () => undefined },
+      stdout,
+      stderr: new Response('').body,
+      exited,
+      kill: () => undefined,
+    };
+    const provider = new CursorAgentProvider({ spawn: () => child });
+    const pending = collect(provider.sendQuery('hi', '/w'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    resolveExit(0);
+    const chunks = await pending;
+    expect(chunks.filter(chunk => chunk.type === 'thinking')).toHaveLength(3);
+    expect(chunks.filter(chunk => chunk.type === 'tool')).toHaveLength(2);
+    expect(assistantText(chunks)).toBe('answer');
+  });
+
+  test('handles result errors, malformed lines, fallback text, and missing model', async () => {
+    const provider = new CursorAgentProvider({
+      spawn: () =>
+        fakeChild({
+          stdout: `garbage\n${stream({ type: 'result', subtype: 'success', is_error: false, result: 'fallback text' })}`,
+        }).child,
+    });
+    const chunks = await collect(provider.sendQuery('hi', '/w'));
+    expect(assistantText(chunks)).toBe('fallback text');
+    const result = chunks.at(-1);
+    expect(result?.type).toBe('result');
+    if (result?.type === 'result') {
+      expect(result.servedModelId).toBeNull();
+      expect(result.servedModelMissingReason).toContain('no model');
+    }
+
+    const errorProvider = new CursorAgentProvider({
+      spawn: () =>
+        fakeChild({
+          stdout: stream({ type: 'result', subtype: 'error', is_error: true, result: 'model refused' }),
+        }).child,
+    });
+    await expect(collect(errorProvider.sendQuery('hi', '/w'))).rejects.toThrow(/model refused/);
   });
 
   test('getType and capabilities', () => {

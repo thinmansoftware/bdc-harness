@@ -64,7 +64,18 @@ const defaultCursorAgentSpawn: CursorAgentSpawn = (argv, options) =>
 
 /** Exported for tests: the exact argv, with the prompt deliberately absent. */
 export function buildCursorAgentArgv(binary: string, model: string, cwd: string): string[] {
-  return [binary, '--print', '--force', '--trust', '--workspace', cwd, '--model', model];
+  return [
+    binary,
+    '--print',
+    '--force',
+    '--trust',
+    '--workspace',
+    cwd,
+    '--model',
+    model,
+    '--output-format',
+    'stream-json',
+  ];
 }
 
 export class CursorAgentProvider implements IAgentProvider {
@@ -111,23 +122,107 @@ export class CursorAgentProvider implements IAgentProvider {
     const delivery = deliverPrompt(child.stdin, buildCursorPrompt(prompt, options));
 
     let finalText = '';
+    let assistantTextSeen = false;
+    let servedModelId: string | null = null;
+    let resultText = '';
+    let resultError: Error | undefined;
     try {
       if (child.stdout) {
         const decoder = new TextDecoder();
         const reader = child.stdout.getReader();
+        let carry = '';
+        const processLine = (line: string): MessageChunk | undefined => {
+          if (!line.trim()) return undefined;
+          let event: unknown;
+          try {
+            event = JSON.parse(line);
+          } catch {
+            // Cursor occasionally writes diagnostics outside the JSON stream.
+            // Keep consuming valid events after such a line.
+            return undefined;
+          }
+          if (!event || typeof event !== 'object') return undefined;
+          const record = event as Record<string, unknown>;
+          switch (record.type) {
+            case 'system': {
+              const modelValue = record.model;
+              if (typeof modelValue === 'string' && modelValue.length > 0) {
+                servedModelId = modelValue;
+              }
+              return undefined;
+            }
+            case 'thinking':
+              return {
+                type: 'thinking',
+                content: typeof record.text === 'string' ? record.text : '',
+              };
+            case 'tool_call':
+              return { type: 'tool', toolName: 'cursor-agent' };
+            case 'assistant': {
+              const message = record.message;
+              const content =
+                message && typeof message === 'object'
+                  ? (message as Record<string, unknown>).content
+                  : undefined;
+              const parts = Array.isArray(content)
+                ? content.flatMap(item => {
+                    if (!item || typeof item !== 'object') return [];
+                    const text = (item as Record<string, unknown>).text;
+                    return typeof text === 'string' ? [text] : [];
+                  })
+                : [];
+              const text = parts.join('');
+              assistantTextSeen = text.length > 0;
+              finalText += text;
+              return { type: 'assistant', content: text };
+            }
+            case 'result': {
+              resultText = typeof record.result === 'string' ? record.result : '';
+              const subtype = record.subtype;
+              const isError = record.is_error === true || subtype !== 'success';
+              if (isError) {
+                resultError = new Error(
+                  `cursor-agent result failed: ${resultText.slice(-400) || 'unknown error'}`
+                );
+              } else if (!assistantTextSeen) {
+                finalText = resultText;
+              }
+              return undefined;
+            }
+            default:
+              return undefined;
+          }
+        };
+        const processCompleteLines = (): void => {
+          const lines = carry.split(/\r?\n/);
+          carry = lines.pop() ?? '';
+          for (const line of lines) {
+            const chunk = processLine(line);
+            if (chunk) yieldChunk(chunk);
+          }
+        };
+        let pendingChunks: MessageChunk[] = [];
+        const yieldChunk = (chunk: MessageChunk): void => {
+          pendingChunks.push(chunk);
+        };
+        const drainPending = function* (): Generator<MessageChunk> {
+          while (pendingChunks.length > 0) yield pendingChunks.shift() as MessageChunk;
+        };
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          const text = decoder.decode(value, { stream: true });
-          if (text.length === 0) continue;
-          finalText += text;
-          yield { type: 'assistant', content: text };
+          carry += decoder.decode(value, { stream: true });
+          processCompleteLines();
+          for (const chunk of drainPending()) yield chunk;
         }
-        const tail = decoder.decode();
-        if (tail.length > 0) {
-          finalText += tail;
-          yield { type: 'assistant', content: tail };
+        carry += decoder.decode();
+        const lines = carry.split(/\r?\n/);
+        carry = '';
+        for (const line of lines) {
+          const chunk = processLine(line);
+          if (chunk) pendingChunks.push(chunk);
         }
+        for (const chunk of drainPending()) yield chunk;
       }
       const [exitCode, stderr] = await Promise.all([child.exited, stderrText]);
       await delivery;
@@ -135,6 +230,7 @@ export class CursorAgentProvider implements IAgentProvider {
         const detail = stderr.trim().slice(-400) || 'no stderr';
         throw new Error(`cursor-agent exited ${exitCode} (model ${model}): ${detail}`);
       }
+      if (resultError) throw resultError;
       if (finalText.trim().length === 0) {
         // rc 0 with no output is the Workspace Trust / auth no-op
         // (scripts/dispatch-worker/seat-preflight.ts cursorBuildResultIsEmpty).
@@ -156,8 +252,10 @@ export class CursorAgentProvider implements IAgentProvider {
       type: 'result',
       stopReason: 'stop',
       structuredOutput,
-      servedModelId: null,
-      servedModelMissingReason: 'cursor-agent --print text output carries no served-model field',
+      servedModelId,
+      ...(servedModelId === null
+        ? { servedModelMissingReason: 'cursor-agent stream-json init event carried no model' }
+        : {}),
     };
   }
 }
