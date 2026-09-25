@@ -1,3 +1,6 @@
+import { createRealOctokitClient, resolveGitHubAppAuth } from './adapters/github-real-deps';
+import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
+
 const log: ReconcileLogger = {
   warn(fields, message) {
     console.warn('[overseer/reconcile]', message, fields);
@@ -63,6 +66,46 @@ export interface ReconcileLogger {
   info?(fields: Record<string, unknown>, message: string): void;
 }
 
+/** Serving credential for a reconcile GitHub call. */
+export type GitHubIdentity = 'app' | 'pat';
+
+interface GitHubCallScope {
+  identity: GitHubIdentity;
+  log: ReconcileLogger;
+}
+
+/**
+ * Internal signal: a classified 403/429 from a reconcile GitHub call. Carries
+ * the classifier contract so runReconcileOnce can defer the iteration instead
+ * of letting the raw error reach the scheduler.
+ */
+class ReconcileRateLimitDeferral extends Error {
+  readonly identity: GitHubIdentity;
+  readonly operation: string;
+  readonly rateLimitRemaining: string | undefined;
+  readonly retryAfterMs: number;
+  readonly retryAfter: string;
+  readonly source: RateLimitClassification['source'];
+  readonly kind: RateLimitClassification['kind'];
+
+  constructor(input: {
+    identity: GitHubIdentity;
+    operation: string;
+    rateLimitRemaining: string | undefined;
+    classification: RateLimitClassification;
+  }) {
+    super('overseer.reconcile.rate_limit_deferral');
+    this.name = 'ReconcileRateLimitDeferral';
+    this.identity = input.identity;
+    this.operation = input.operation;
+    this.rateLimitRemaining = input.rateLimitRemaining;
+    this.retryAfterMs = input.classification.retryAfterMs;
+    this.retryAfter = input.classification.retryAfter;
+    this.source = input.classification.source;
+    this.kind = input.classification.kind;
+  }
+}
+
 export interface ReconcileDeps {
   readCursor?: () => Promise<string | null>;
   searchMergedPullRequests: (input: {
@@ -95,6 +138,12 @@ export interface ReconcileDeps {
   listPullRequestFiles?: (pr: ReconcileMergedPullRequest) => Promise<string[]>;
   now?: () => Date;
   log?: ReconcileLogger;
+  /**
+   * Identity that served reconcile GitHub calls: `app` when installation auth
+   * resolved, otherwise `pat`. Set by createDefaultReconcileDeps(); injected
+   * tests may set it so rate-limit deferral logs name the caller.
+   */
+  githubIdentity?: GitHubIdentity;
 }
 
 interface OctokitLike {
@@ -158,8 +207,11 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
   try {
     pullRequests = await deps.searchMergedPullRequests({ org, since });
   } catch (error) {
-    if (isRateLimitError(error)) {
-      logger.warn({ err: error as Error, rateLimit: true }, 'overseer.reconcile.rate_limit_skip');
+    if (shouldDeferForRateLimit(error)) {
+      logRateLimitSkip(logger, error, {
+        identity: deps.githubIdentity,
+        operation: 'searchMergedPullRequests',
+      });
       return { scanned: 0, closed: 0, skipped: true };
     }
     if (isAuthError(error)) {
@@ -214,11 +266,12 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       try {
         tracker = await deps.findTrackerIssueByStem(stem);
       } catch (error) {
-        if (isRateLimitError(error)) {
-          logger.warn(
-            { err: error as Error, rateLimit: true, stem },
-            'overseer.reconcile.rate_limit_skip'
-          );
+        if (shouldDeferForRateLimit(error)) {
+          logRateLimitSkip(logger, error, {
+            identity: deps.githubIdentity,
+            operation: 'findTrackerIssueByStem',
+            stem,
+          });
           return { scanned: seen.size, closed, skipped: true };
         }
         if (isAuthError(error)) {
@@ -260,9 +313,19 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
         try {
           changedPaths = await listFiles(pr);
         } catch (error) {
-          // Fail OPEN on a file-listing error: leave the tracker alone rather
-          // than closing on unverified evidence. A tracker left open is visible
-          // and fixable; one falsely closed is invisible.
+          // A classified rate limit is a budget signal for the whole iteration,
+          // not a per-PR file-list miss. Defer and retry later.
+          if (shouldDeferForRateLimit(error)) {
+            logRateLimitSkip(logger, error, {
+              identity: deps.githubIdentity,
+              operation: 'listPullRequestFiles',
+              stem,
+            });
+            return { scanned: seen.size, closed, skipped: true };
+          }
+          // Fail OPEN on any other file-listing error: leave the tracker alone
+          // rather than closing on unverified evidence. A tracker left open is
+          // visible and fixable; one falsely closed is invisible.
           logger.warn(
             { err: error as Error, prRef, stem },
             'overseer.reconcile.file_list_failed_leaving_tracker_open'
@@ -285,12 +348,40 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
         }
       }
 
-      await deps.addTrackerEvidenceComment({
-        issue: tracker,
-        body: buildEvidenceComment({ pr, stem }),
-      });
-      await deps.addTrackerLabel({ issue: tracker, label: DONE_LABEL });
-      await deps.closeTrackerIssue({ issue: tracker });
+      const evidenceDeferred = await deferOnRateLimit(
+        logger,
+        deps,
+        stem,
+        seen.size,
+        closed,
+        'addTrackerEvidenceComment',
+        () =>
+          deps.addTrackerEvidenceComment({
+            issue: tracker,
+            body: buildEvidenceComment({ pr, stem }),
+          })
+      );
+      if (evidenceDeferred) return evidenceDeferred;
+      const labelDeferred = await deferOnRateLimit(
+        logger,
+        deps,
+        stem,
+        seen.size,
+        closed,
+        'addTrackerLabel',
+        () => deps.addTrackerLabel({ issue: tracker, label: DONE_LABEL })
+      );
+      if (labelDeferred) return labelDeferred;
+      const closeDeferred = await deferOnRateLimit(
+        logger,
+        deps,
+        stem,
+        seen.size,
+        closed,
+        'closeTrackerIssue',
+        () => deps.closeTrackerIssue({ issue: tracker })
+      );
+      if (closeDeferred) return closeDeferred;
       await (deps.insertAction ?? insertDefaultOverseerAction)({
         prRef,
         woId: stem,
@@ -460,8 +551,10 @@ async function hasDefaultCloseBeenRecorded(input: {
 }
 
 export function createDefaultReconcileDeps(): ReconcileDeps {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  if (!token) {
+  // Throws when App vars are only partly set. Never downgrade that case to PAT.
+  const appAuth = resolveGitHubAppAuth();
+  const pat = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  if (!appAuth && !pat) {
     return {
       readCursor: async () => null,
       searchMergedPullRequests: async (): Promise<ReconcileMergedPullRequest[]> => {
@@ -479,57 +572,66 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     };
   }
 
-  let octokit: Promise<OctokitLike> | null = null;
-  const getOctokit = async (): Promise<OctokitLike> => {
-    octokit ??= import('@octokit/rest').then(
-      module => new module.Octokit({ auth: token }) as unknown as OctokitLike
-    );
+  const identity: GitHubIdentity = appAuth ? 'app' : 'pat';
+  const scope: GitHubCallScope = { identity, log };
+  let octokit: OctokitLike | null = null;
+  const getOctokit = (): OctokitLike => {
+    octokit ??= createRealOctokitClient() as unknown as OctokitLike;
     return octokit;
   };
   return {
     readCursor: readReconcileCursorFromActions,
-    searchMergedPullRequests: async input => searchMergedPullRequests(await getOctokit(), input),
-    findTrackerIssueByStem: async stem => findTrackerIssueByStem(await getOctokit(), stem),
+    githubIdentity: identity,
+    searchMergedPullRequests: async input => searchMergedPullRequests(getOctokit(), input, scope),
+    findTrackerIssueByStem: async stem => findTrackerIssueByStem(getOctokit(), stem, scope),
     listPullRequestFiles: async (pr): Promise<string[]> => {
-      const client = await getOctokit();
+      const client = getOctokit();
       // per_page 100: a spec-only PR is 1-2 files, so the first page is always
       // enough to prove NOT-spec-only. A large PR truncated at 100 still contains
       // a source file, so isSpecOnlyChangeSet correctly returns false.
-      const res = await client.pulls.listFiles({
-        owner: pr.owner,
-        repo: pr.repo,
-        pull_number: pr.number,
-        per_page: 100,
-      });
+      const res = await invokeGitHub(scope, 'listPullRequestFiles', () =>
+        client.pulls.listFiles({
+          owner: pr.owner,
+          repo: pr.repo,
+          pull_number: pr.number,
+          per_page: 100,
+        })
+      );
       return res.data.map(f => f.filename);
     },
     addTrackerEvidenceComment: async (input): Promise<void> => {
-      const client = await getOctokit();
-      await client.issues.createComment({
-        owner: input.issue.owner,
-        repo: input.issue.repo,
-        issue_number: input.issue.number,
-        body: input.body,
-      });
+      const client = getOctokit();
+      await invokeGitHub(scope, 'addTrackerEvidenceComment', () =>
+        client.issues.createComment({
+          owner: input.issue.owner,
+          repo: input.issue.repo,
+          issue_number: input.issue.number,
+          body: input.body,
+        })
+      );
     },
     addTrackerLabel: async (input): Promise<void> => {
-      const client = await getOctokit();
-      await client.issues.addLabels({
-        owner: input.issue.owner,
-        repo: input.issue.repo,
-        issue_number: input.issue.number,
-        labels: [input.label],
-      });
+      const client = getOctokit();
+      await invokeGitHub(scope, 'addTrackerLabel', () =>
+        client.issues.addLabels({
+          owner: input.issue.owner,
+          repo: input.issue.repo,
+          issue_number: input.issue.number,
+          labels: [input.label],
+        })
+      );
     },
     closeTrackerIssue: async (input): Promise<void> => {
-      const client = await getOctokit();
-      await client.issues.update({
-        owner: input.issue.owner,
-        repo: input.issue.repo,
-        issue_number: input.issue.number,
-        state: 'closed',
-        state_reason: 'completed',
-      });
+      const client = getOctokit();
+      await invokeGitHub(scope, 'closeTrackerIssue', () =>
+        client.issues.update({
+          owner: input.issue.owner,
+          repo: input.issue.repo,
+          issue_number: input.issue.number,
+          state: 'closed',
+          state_reason: 'completed',
+        })
+      );
     },
     hasSkipBeenNoted: hasDefaultSkipBeenNoted,
     hasCloseBeenRecorded: hasDefaultCloseBeenRecorded,
@@ -550,7 +652,8 @@ async function resolveSearchSince(input: RunReconcileInput, deps: ReconcileDeps)
 
 async function searchMergedPullRequests(
   octokit: OctokitLike,
-  input: { org: string; since: string }
+  input: { org: string; since: string },
+  scope: GitHubCallScope
 ): Promise<ReconcileMergedPullRequest[]> {
   const queries = [
     `org:${input.org} is:pr is:merged merged:>=${input.since} WO- in:title`,
@@ -559,21 +662,25 @@ async function searchMergedPullRequests(
   const results = new Map<string, ReconcileMergedPullRequest>();
 
   for (const q of queries) {
-    const search = await octokit.search.issuesAndPullRequests({
-      q,
-      per_page: 100,
-      sort: 'updated',
-      order: 'desc',
-    });
+    const search = await invokeGitHub(scope, 'searchMergedPullRequests', () =>
+      octokit.search.issuesAndPullRequests({
+        q,
+        per_page: 100,
+        sort: 'updated',
+        order: 'desc',
+      })
+    );
     for (const item of search.data.items) {
       if (!item.pull_request) continue;
       const repo = parseRepositoryFromUrl(item.repository_url);
       if (!repo) continue;
-      const pr = await octokit.pulls.get({
-        owner: repo.owner,
-        repo: repo.repo,
-        pull_number: item.number,
-      });
+      const pr = await invokeGitHub(scope, 'searchMergedPullRequests.pulls.get', () =>
+        octokit.pulls.get({
+          owner: repo.owner,
+          repo: repo.repo,
+          pull_number: item.number,
+        })
+      );
       results.set(`${repo.owner}/${repo.repo}#${item.number}`, {
         owner: repo.owner,
         repo: repo.repo,
@@ -594,12 +701,15 @@ async function searchMergedPullRequests(
 
 async function findTrackerIssueByStem(
   octokit: OctokitLike,
-  stem: string
+  stem: string,
+  scope: GitHubCallScope
 ): Promise<ReconcileTrackerIssue | null> {
-  const search = await octokit.search.issuesAndPullRequests({
-    q: `repo:${DEFAULT_ORG}/${DEFAULT_TRACKER_REPO} is:issue ${stem} in:title`,
-    per_page: 10,
-  });
+  const search = await invokeGitHub(scope, 'findTrackerIssueByStem', () =>
+    octokit.search.issuesAndPullRequests({
+      q: `repo:${DEFAULT_ORG}/${DEFAULT_TRACKER_REPO} is:issue ${stem} in:title`,
+      per_page: 10,
+    })
+  );
   const exact = search.data.items.find(item => item.title === stem && !item.pull_request);
   if (!exact) return null;
   return {
@@ -615,6 +725,125 @@ function parseRepositoryFromUrl(url?: string): { owner: string; repo: string } |
   const match = /\/repos\/([^/]+)\/([^/]+)$/.exec(url ?? '');
   if (!match) return null;
   return { owner: match[1] ?? '', repo: match[2] ?? '' };
+}
+
+function readRateLimitRemaining(source: unknown): string | undefined {
+  if (!source || typeof source !== 'object') return undefined;
+  const record = source as { headers?: unknown; response?: { headers?: unknown } };
+  const headers = record.headers ?? record.response?.headers;
+  if (!headers || typeof headers !== 'object') return undefined;
+  const bag = headers as {
+    get?: (name: string) => string | null | undefined;
+    [key: string]: unknown;
+  };
+  if (typeof bag.get === 'function') {
+    const value = bag.get('x-ratelimit-remaining');
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  for (const [key, value] of Object.entries(bag)) {
+    if (key.toLowerCase() !== 'x-ratelimit-remaining') continue;
+    if (typeof value === 'string' && value.length > 0) return value;
+    if (typeof value === 'number') return String(value);
+  }
+  return undefined;
+}
+
+function isReconcileRateLimitDeferral(error: unknown): error is ReconcileRateLimitDeferral {
+  return error instanceof ReconcileRateLimitDeferral;
+}
+
+function shouldDeferForRateLimit(error: unknown): boolean {
+  return (
+    isReconcileRateLimitDeferral(error) ||
+    classifyRateLimitError(error) !== null ||
+    isRateLimitError(error)
+  );
+}
+
+async function invokeGitHub<T>(
+  scope: GitHubCallScope,
+  operation: string,
+  call: () => Promise<T>
+): Promise<T> {
+  try {
+    const result = await call();
+    scope.log.info?.(
+      {
+        identity: scope.identity,
+        operation,
+        rateLimitRemaining: readRateLimitRemaining(result),
+      },
+      'overseer.reconcile.github_call'
+    );
+    return result;
+  } catch (error) {
+    const rateLimitRemaining = readRateLimitRemaining(error);
+    scope.log.info?.(
+      {
+        identity: scope.identity,
+        operation,
+        rateLimitRemaining,
+      },
+      'overseer.reconcile.github_call'
+    );
+    const classification = classifyRateLimitError(error);
+    if (classification) {
+      throw new ReconcileRateLimitDeferral({
+        identity: scope.identity,
+        operation,
+        rateLimitRemaining,
+        classification,
+      });
+    }
+    throw error;
+  }
+}
+
+function logRateLimitSkip(
+  logger: ReconcileLogger,
+  error: unknown,
+  fields: { identity?: GitHubIdentity; operation: string; stem?: string }
+): void {
+  const deferral = isReconcileRateLimitDeferral(error) ? error : null;
+  const classification = deferral ?? classifyRateLimitError(error);
+  logger.warn(
+    {
+      err: error instanceof Error ? error : new Error('reconcile rate limit'),
+      rateLimit: true,
+      identity: deferral?.identity ?? fields.identity,
+      operation: deferral?.operation ?? fields.operation,
+      rateLimitRemaining: deferral?.rateLimitRemaining ?? readRateLimitRemaining(error),
+      ...(fields.stem ? { stem: fields.stem } : {}),
+      ...(classification
+        ? {
+            retryAfterMs: classification.retryAfterMs,
+            retryAfter: classification.retryAfter,
+            source: classification.source,
+            kind: classification.kind,
+          }
+        : {}),
+    },
+    'overseer.reconcile.rate_limit_skip'
+  );
+}
+
+async function deferOnRateLimit(
+  logger: ReconcileLogger,
+  deps: ReconcileDeps,
+  stem: string,
+  scanned: number,
+  closed: number,
+  operation: string,
+  call: () => Promise<void>
+): Promise<ReconcileResult | null> {
+  try {
+    await call();
+    return null;
+  } catch (error) {
+    if (!shouldDeferForRateLimit(error)) throw error;
+    logRateLimitSkip(logger, error, { identity: deps.githubIdentity, operation, stem });
+    return { scanned, closed, skipped: true };
+  }
 }
 
 function isRateLimitError(error: unknown): boolean {
