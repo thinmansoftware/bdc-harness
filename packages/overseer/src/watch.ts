@@ -85,10 +85,17 @@ export function selectFailureEvent(
   return newestEvent(events);
 }
 
-function eventMessage(event: OverseerWorkflowEvent | undefined): string {
+export function eventMessage(event: OverseerWorkflowEvent | undefined): string {
   if (!event) return '';
   const data = event.data;
-  const candidates = [data.error, data.message, data.stderr, data.output, data.reason];
+  const candidates = [
+    data.error,
+    data.message,
+    data.stderr,
+    data.node_output,
+    data.output,
+    data.reason,
+  ];
   const found = candidates.find(value => typeof value === 'string');
   return typeof found === 'string' ? found : JSON.stringify(data);
 }
@@ -122,7 +129,13 @@ function prNotMergeReadyDetail(evidence: PullRequestEvidence): string {
 export function recoverHeadBranchFromEvents(events: OverseerWorkflowEvent[]): string | undefined {
   let branch: string | undefined;
   for (const event of events) {
-    const output = typeof event.data.output === 'string' ? event.data.output : '';
+    const nodeOutput = event.data.node_output;
+    const output =
+      typeof nodeOutput === 'string'
+        ? nodeOutput
+        : typeof event.data.output === 'string'
+          ? event.data.output
+          : '';
     const match = /unique_branch=(\S+)/.exec(output);
     if (match?.[1]) branch = match[1];
   }

@@ -12,6 +12,7 @@ import { rootLogger } from '@archon/paths';
 import {
   buildEvidenceEnvelope,
   buildJudgePrompt,
+  envelopeDigest,
   judgeTerminalRun,
   parseJudgeOutput,
   type JudgeOutcome,
@@ -780,6 +781,128 @@ describe('evidence envelope: bounded by construction', () => {
     expect(envelope.eventTail).toHaveLength(20);
     expect(envelope.eventTail[0]!.message.length).toBeLessThanOrEqual(403);
     expect(envelope.hint.action).toBe('ignore');
+  });
+
+  test('event tail reads node_output instead of serialized JSON', () => {
+    const envelope = buildEvidenceEnvelope(makeRecord(), [
+      {
+        id: 'evt-node-output',
+        workflow_run_id: 'run-1',
+        event_type: 'node_completed',
+        step_name: 'commit-and-push',
+        data: { node_output: 'EVIDENCE_ERROR: Tests: 969/980' },
+        created_at: '2026-09-25T00:00:00Z',
+      },
+    ]);
+    expect(envelope.eventTail[0]?.message).toBe('EVIDENCE_ERROR: Tests: 969/980');
+  });
+
+  test('carries selected PR identity and other open PRs for the WO', () => {
+    const envelope = buildEvidenceEnvelope(
+      makeRecord({
+        prEvidence: {
+          exists: true,
+          state: 'open',
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          mergeable: true,
+          htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/968',
+          pr: {
+            owner: 'thinmansoftware',
+            repo: 'bdc-harness',
+            number: 968,
+            headRef: 'feat/wo-x-01-thread-abc',
+            author: 'builder',
+            createdAt: '2026-09-25T01:00:00Z',
+          },
+          otherOpenPrsForWo: [
+            {
+              number: 967,
+              headRef: 'archon/task-web-worker-1',
+              createdAt: '2026-09-25T00:30:00Z',
+            },
+          ],
+        },
+      }),
+      []
+    );
+    expect(envelope.pr.number).toBe(968);
+    expect(envelope.pr.headRef).toBe('feat/wo-x-01-thread-abc');
+    expect(envelope.pr.author).toBe('builder');
+    expect(envelope.pr.createdAt).toBe('2026-09-25T01:00:00Z');
+    expect(envelope.otherOpenPrsForWo).toEqual([
+      {
+        number: 967,
+        headRef: 'archon/task-web-worker-1',
+        createdAt: '2026-09-25T00:30:00Z',
+      },
+    ]);
+    const prompt = buildJudgePrompt(envelope);
+    expect(prompt).toContain('archon/task-');
+    expect(prompt).toContain('never duplicate_work');
+    expect(prompt).toContain('never needs_human');
+  });
+
+  test('defaults missing PR identity to null and an empty other-PR list', () => {
+    const envelope = buildEvidenceEnvelope(makeRecord(), []);
+    expect(envelope.pr.number).toBeNull();
+    expect(envelope.pr.headRef).toBeNull();
+    expect(envelope.pr.author).toBeNull();
+    expect(envelope.pr.createdAt).toBeNull();
+    expect(envelope.otherOpenPrsForWo).toEqual([]);
+  });
+
+  test('truncates otherOpenPrsForWo to five entries', () => {
+    const otherOpenPrsForWo = Array.from({ length: 6 }, (_, index) => ({
+      number: 100 + index,
+      headRef: `feat/extra-${index}`,
+      createdAt: `2026-09-25T00:0${index}:00Z`,
+    }));
+    const envelope = buildEvidenceEnvelope(
+      makeRecord({
+        prEvidence: {
+          exists: true,
+          state: 'open',
+          checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+          mergeable: null,
+          pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1 },
+          otherOpenPrsForWo,
+        },
+      }),
+      []
+    );
+    expect(envelope.otherOpenPrsForWo).toHaveLength(5);
+    expect(envelope.otherOpenPrsForWo[0]?.number).toBe(100);
+    expect(envelope.otherOpenPrsForWo[4]?.number).toBe(104);
+  });
+
+  test('builds the same envelope and digest twice', () => {
+    const record = makeRecord({
+      prEvidence: {
+        exists: true,
+        state: 'open',
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        mergeable: true,
+        pr: {
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          number: 968,
+          headRef: 'feat/wo-x-01-thread-abc',
+          author: 'builder',
+          createdAt: '2026-09-25T01:00:00Z',
+        },
+        otherOpenPrsForWo: [
+          {
+            number: 967,
+            headRef: 'archon/task-web-worker-1',
+            createdAt: '2026-09-25T00:30:00Z',
+          },
+        ],
+      },
+    });
+    const first = buildEvidenceEnvelope(record, []);
+    const second = buildEvidenceEnvelope(record, []);
+    expect(second).toEqual(first);
+    expect(envelopeDigest(second)).toBe(envelopeDigest(first));
   });
 });
 

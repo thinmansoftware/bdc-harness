@@ -1,10 +1,17 @@
 import { describe, expect, test } from 'bun:test';
 import {
   DEFAULT_WATCH_MAX_RUNS_PER_TICK,
+  eventMessage,
+  recoverHeadBranchFromEvents,
   resolveWatchMaxRunsPerTick,
   watchOnce,
 } from '../watch.ts';
-import type { GitHubClientDeps, OverseerRunStoreDeps, PullRequestEvidence } from '../types.ts';
+import type {
+  GitHubClientDeps,
+  OverseerRunStoreDeps,
+  OverseerWorkflowEvent,
+  PullRequestEvidence,
+} from '../types.ts';
 
 const greenPr: PullRequestEvidence = {
   exists: true,
@@ -335,5 +342,105 @@ describe('watch -- completed-run merge candidates', () => {
     );
 
     expect(record.action).not.toBe('merge_ready');
+  });
+});
+
+describe('run PR identity', () => {
+  const branch = 'feat/wo-x-01-thread-abc';
+
+  function event(data: Record<string, unknown>, id = 'evt-1'): OverseerWorkflowEvent {
+    return {
+      id,
+      workflow_run_id: 'run-identity',
+      event_type: 'node_completed',
+      step_name: 'commit-and-push',
+      data,
+    };
+  }
+
+  test('recovers unique_branch from node_output when output is absent', () => {
+    const recovered = recoverHeadBranchFromEvents([
+      event({ node_output: `pushed\nunique_branch=${branch}\n` }),
+    ]);
+    expect(recovered).toBe(branch);
+  });
+
+  test('falls back to data.output when node_output is not a string', () => {
+    const recovered = recoverHeadBranchFromEvents([event({ output: `unique_branch=${branch}` })]);
+    expect(recovered).toBe(branch);
+  });
+
+  test('node_output wins over output on the same event', () => {
+    const recovered = recoverHeadBranchFromEvents([
+      event({
+        node_output: 'unique_branch=from-node-output',
+        output: 'unique_branch=from-output',
+      }),
+    ]);
+    expect(recovered).toBe('from-node-output');
+  });
+
+  test('last writer wins across events', () => {
+    const recovered = recoverHeadBranchFromEvents([
+      event({ node_output: 'unique_branch=first-branch' }, 'evt-a'),
+      event({ node_output: 'unique_branch=second-branch' }, 'evt-b'),
+    ]);
+    expect(recovered).toBe('second-branch');
+  });
+
+  test('eventMessage returns node_output instead of serialized JSON', () => {
+    const message = eventMessage(event({ node_output: 'EVIDENCE_ERROR: Tests: 969/980' }));
+    expect(message).toBe('EVIDENCE_ERROR: Tests: 969/980');
+    expect(message.startsWith('{')).toBe(false);
+  });
+
+  test('a completed run recovers its own PR from node_output, not the early archon/task PR', async () => {
+    const ownPr: PullRequestEvidence = {
+      exists: true,
+      state: 'open',
+      checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+      mergeable: false,
+      pr: {
+        owner: 'thinmansoftware',
+        repo: 'bdc-xo',
+        number: 2406,
+        headRef: branch,
+      },
+    };
+    const earlyPr: PullRequestEvidence = {
+      ...ownPr,
+      pr: {
+        owner: 'thinmansoftware',
+        repo: 'bdc-xo',
+        number: 2403,
+        headRef: 'archon/task-web-worker-1',
+      },
+    };
+    const lookedUp: string[] = [];
+    const runDeps: OverseerRunStoreDeps & GitHubClientDeps = {
+      listRunsForWatch: async () => [
+        {
+          id: 'run-ea483647',
+          woId: 'WO-HARNESS-OVERSEER-RUN-IDENTITY-01',
+          owner: 'thinmansoftware',
+          repo: 'bdc-xo',
+          status: 'completed',
+        },
+      ],
+      listRunEvents: async () => [event({ node_output: `unique_branch=${branch}` }, 'commit-push')],
+      findPullRequest: async input => {
+        lookedUp.push(input.headBranch ?? 'missing');
+        return input.headBranch === branch ? ownPr : earlyPr;
+      },
+      mergePullRequest: async () => ({ merged: false }),
+    };
+
+    const [first] = await watchOnce(runDeps, { discoveryEnabled: false });
+    const [second] = await watchOnce(runDeps, { discoveryEnabled: false });
+
+    expect(lookedUp).toEqual([branch, branch]);
+    expect(first?.headBranch).toBe(branch);
+    expect(first?.prEvidence.pr?.number).toBe(2406);
+    expect(second).toEqual(first);
   });
 });

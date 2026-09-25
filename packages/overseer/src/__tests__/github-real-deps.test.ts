@@ -798,3 +798,130 @@ describe('createRealGitHubClientDeps listPullRequestComments -- pagination', () 
     expect(pageLog).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
   });
 });
+
+describe('WO-search prefers the run PR over an early archon/task PR', () => {
+  interface FixturePr {
+    number: number;
+    headRef: string;
+    author: string;
+    createdAt: string;
+  }
+
+  function octokitFor(prs: FixturePr[]) {
+    const gets: number[] = [];
+    const octokit: RealGitHubOctokitLike = {
+      pulls: {
+        list: async () => ({ data: [] }),
+        get: async input => {
+          const number = Number(input.pull_number);
+          gets.push(number);
+          const match = prs.find(pr => pr.number === number);
+          if (!match) throw new Error(`unexpected pull ${number}`);
+          return {
+            data: {
+              number: match.number,
+              title: `WO ${match.number}`,
+              state: 'open',
+              mergeable: true,
+              html_url: `https://github.test/pull/${match.number}`,
+              head: { sha: 'a'.repeat(40), ref: match.headRef },
+              user: { login: match.author },
+              created_at: match.createdAt,
+            },
+          };
+        },
+        merge: async () => ({ data: { merged: false } }),
+      },
+      search: {
+        issuesAndPullRequests: async () => ({
+          data: {
+            items: prs.map(pr => ({ number: pr.number, pull_request: {} })),
+          },
+        }),
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+    };
+    return { octokit, gets };
+  }
+
+  const early: FixturePr = {
+    number: 967,
+    headRef: 'archon/task-web-worker-1',
+    author: 'builder',
+    createdAt: '2026-09-25T00:30:00Z',
+  };
+  const own: FixturePr = {
+    number: 968,
+    headRef: 'feat/wo-x-01-thread-abc',
+    author: 'builder',
+    createdAt: '2026-09-25T01:00:00Z',
+  };
+
+  test('selects the non-archon/task PR and lists the early PR beside it', async () => {
+    const { octokit, gets } = octokitFor([early, own]);
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+    });
+
+    expect(gets).toContain(967);
+    expect(gets).toContain(968);
+    expect(evidence.pr).toMatchObject({
+      number: 968,
+      headRef: 'feat/wo-x-01-thread-abc',
+      author: 'builder',
+      createdAt: '2026-09-25T01:00:00Z',
+    });
+    expect(evidence.otherOpenPrsForWo).toEqual([
+      {
+        number: 967,
+        headRef: 'archon/task-web-worker-1',
+        createdAt: '2026-09-25T00:30:00Z',
+      },
+    ]);
+  });
+
+  test('selects the archon/task PR when it is the only match', async () => {
+    const { octokit } = octokitFor([early]);
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+    });
+
+    expect(evidence.pr?.number).toBe(967);
+    expect(evidence.pr?.headRef).toBe('archon/task-web-worker-1');
+    expect(evidence.otherOpenPrsForWo).toEqual([]);
+  });
+
+  test('selects none when every match is an archon/task PR', async () => {
+    const second: FixturePr = {
+      number: 969,
+      headRef: 'archon/task-web-worker-2',
+      author: 'builder',
+      createdAt: '2026-09-25T01:10:00Z',
+    };
+    const { octokit } = octokitFor([early, second]);
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+    });
+
+    expect(evidence.exists).toBe(false);
+    expect(evidence.pr).toBeUndefined();
+    expect(evidence.otherOpenPrsForWo).toEqual([
+      {
+        number: 967,
+        headRef: 'archon/task-web-worker-1',
+        createdAt: '2026-09-25T00:30:00Z',
+      },
+      {
+        number: 969,
+        headRef: 'archon/task-web-worker-2',
+        createdAt: '2026-09-25T01:10:00Z',
+      },
+    ]);
+  });
+});

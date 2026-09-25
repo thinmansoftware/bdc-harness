@@ -75,6 +75,43 @@ const LOOKUP_FAILED_EVIDENCE: PullRequestEvidence = {
   lookupFailed: true,
 };
 
+/** Builder pre-review PRs use this head prefix. Selected only when they are the sole match. */
+const BUILDER_PR_HEAD_PREFIX = 'archon/task-';
+const WO_SEARCH_CANDIDATE_LIMIT = 5;
+
+interface WoSearchCandidate {
+  number: number;
+  headRef: string;
+  author: string;
+  createdAt: string;
+}
+
+function otherOpenPrsForWo(
+  candidates: readonly WoSearchCandidate[],
+  selectedNumber: number | null
+): { number: number; headRef: string; createdAt: string }[] {
+  return candidates
+    .filter(candidate => candidate.number !== selectedNumber)
+    .slice(0, WO_SEARCH_CANDIDATE_LIMIT)
+    .map(candidate => ({
+      number: candidate.number,
+      headRef: candidate.headRef,
+      createdAt: candidate.createdAt,
+    }));
+}
+
+/**
+ * One open match is the run's PR even when its head is archon/task-.
+ * Several matches: the first non-archon/task- head in search order.
+ * Several matches that are all archon/task-: select none.
+ */
+function selectWoSearchCandidate(
+  candidates: readonly WoSearchCandidate[]
+): WoSearchCandidate | undefined {
+  if (candidates.length === 1) return candidates[0];
+  return candidates.find(candidate => !candidate.headRef.startsWith(BUILDER_PR_HEAD_PREFIX));
+}
+
 /**
  * Minimal Octokit surface this module depends on. Kept narrow and structurally
  * typed (not `import type { Octokit }` directly) so tests can pass a plain
@@ -108,7 +145,9 @@ export interface RealGitHubOctokitLike {
         deletions?: number;
         html_url: string;
         changed_files?: number;
-        head: { sha: string };
+        head: { sha: string; ref?: string };
+        user?: { login?: string | null } | null;
+        created_at?: string;
         base?: { sha: string; ref?: string };
         mergeable_state?: string;
       };
@@ -700,6 +739,7 @@ export function createRealFindPullRequest(
       // takes `data[0]` of up to 5 matches, so a branch name shared across forks
       // resolves to whichever GitHub happened to order first.
       let prNumber: number | null = input.prNumber ?? null;
+      const woSearchCandidates: WoSearchCandidate[] = [];
 
       if (prNumber === null && input.headBranch) {
         const list = await octokit.pulls.list({
@@ -720,11 +760,39 @@ export function createRealFindPullRequest(
           // 'docs(canary): add e2e merge canary marker' -- WO id only in the
           // body; in:title returned nothing and the run was wrongly closed as
           // 'no PR'. 9th canary defect, 2026-08-26).
-          q: `repo:${input.owner}/${input.repo} is:pr "${input.woId}"`,
-          per_page: 5,
+          // is:open: a closed PR is not this run's current head.
+          q: `repo:${input.owner}/${input.repo} is:pr is:open "${input.woId}"`,
+          per_page: WO_SEARCH_CANDIDATE_LIMIT,
         });
-        const match = search.data.items.find(item => item.pull_request);
-        prNumber = match?.number ?? null;
+        const items = search.data.items
+          .filter(item => item.pull_request)
+          .slice(0, WO_SEARCH_CANDIDATE_LIMIT);
+        for (const item of items) {
+          const fetched = await octokit.pulls.get({
+            owner: input.owner,
+            repo: input.repo,
+            pull_number: item.number,
+          });
+          if (fetched.data.state !== 'open') continue;
+          const login = fetched.data.user?.login;
+          woSearchCandidates.push({
+            number: fetched.data.number,
+            headRef: fetched.data.head.ref ?? '',
+            author: typeof login === 'string' ? login : '',
+            createdAt: fetched.data.created_at ?? '',
+          });
+        }
+        const selected = selectWoSearchCandidate(woSearchCandidates);
+        if (selected) {
+          prNumber = selected.number;
+        } else if (woSearchCandidates.length > 0) {
+          rateLimitBackoffUntil = 0;
+          rateLimitLastLoggedAt = 0;
+          return {
+            ...MISSING_EVIDENCE,
+            otherOpenPrsForWo: otherOpenPrsForWo(woSearchCandidates, null),
+          };
+        }
       }
 
       if (prNumber === null) {
@@ -786,12 +854,23 @@ export function createRealFindPullRequest(
 
       const state = pr.data.merged ? 'merged' : pr.data.state;
 
+      const headRef = pr.data.head.ref;
+      const author = pr.data.user?.login;
+      const createdAt = pr.data.created_at;
       const evidence: PullRequestEvidence = {
         exists: true,
         state,
         checks,
         mergeable: pr.data.mergeable ?? null,
-        pr: { owner: input.owner, repo: input.repo, number: pr.data.number },
+        pr: {
+          owner: input.owner,
+          repo: input.repo,
+          number: pr.data.number,
+          ...(typeof headRef === 'string' && headRef !== '' ? { headRef } : {}),
+          ...(typeof author === 'string' && author !== '' ? { author } : {}),
+          ...(typeof createdAt === 'string' && createdAt !== '' ? { createdAt } : {}),
+        },
+        otherOpenPrsForWo: otherOpenPrsForWo(woSearchCandidates, pr.data.number),
         prTitle: pr.data.title,
         filesChangedCount: pr.data.changed_files,
         // 16th canary defect (2026-08-26): diffStat was never populated
