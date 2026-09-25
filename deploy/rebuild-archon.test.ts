@@ -29,6 +29,7 @@ async function setup(opts: {
   upFails?: boolean;
   userName?: string;
   initialMode?: 'normal' | 'draining';
+  initialWhitespace?: boolean;
   drainStatus?: number;
   healthOk?: boolean;
 }): Promise<void> {
@@ -48,6 +49,7 @@ async function setup(opts: {
   const postUp = opts.postUpDraining === false ? 'normal' : 'draining';
   const upFails = opts.upFails ? '1' : '0';
   const initialMode = opts.initialMode ?? 'normal';
+  const initialWhitespace = opts.initialWhitespace ? '1' : '0';
   const drainStatus = opts.drainStatus ?? 200;
   const healthCode = opts.healthOk === false ? '503' : '200';
 
@@ -107,7 +109,19 @@ fi
 seen=$(cat "${getCount}")
 if [ "$seen" = "0" ]; then
   printf '%s' 1 > "${getCount}"
-  printf '%s' '{"mode":"${initialMode}","recreateSafe":false,"runningRunCount":0,"pendingRunCount":0,"activeRunIds":[]}'
+  if [ "${initialWhitespace}" = "1" ]; then
+    cat <<EOF
+{
+  "mode": "${initialMode}",
+  "recreateSafe": false,
+  "runningRunCount": 0,
+  "pendingRunCount": 0,
+  "activeRunIds": []
+}
+EOF
+  else
+    printf '%s' '{"mode":"${initialMode}","recreateSafe":false,"runningRunCount":0,"pendingRunCount":0,"activeRunIds":[]}'
+  fi
   exit 0
 fi
 printf '%s\\n' POLL_LOOP >> "${log}"
@@ -301,6 +315,15 @@ describe('rebuild-archon.sh', () => {
     expect(aborted.stdout).not.toContain('tok-SENTINEL-123');
     expect(aborted.stderr).not.toContain('tok-SENTINEL-123');
     expect(aborted.calls).toContain('draining":false');
+  });
+
+  test('rebuild_script_whitespace_foreign_drain_is_not_adopted', async () => {
+    await setup({ initialMode: 'draining', initialWhitespace: true, readyOn: 1 });
+    const ok = await runScript(['--poll-sec', '0', '--drain-timeout-min', '5']);
+    expect(ok.exitCode).toBe(0);
+    expect(ok.calls).not.toContain('clearOnBoot');
+    expect(ok.calls).not.toContain('draining":false');
+    expect(ok.stdout).not.toContain('DRAIN_CLEARED_BY_SCRIPT');
   });
 
   test('rebuild_script_never_touches_a_foreign_drain', async () => {

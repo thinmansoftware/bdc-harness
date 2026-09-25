@@ -476,9 +476,14 @@ export async function dispatchBackgroundWorkflow(
         ctx.conversationId,
         'cauldron_draining: workflow not started. New dispatch is disabled until drain clears.'
       );
-      // Rethrow so the synchronous HTTP caller can map the race (pre-check
-      // passed, createWorkflowRun then refused) to the same 503 body.
-      throw error;
+      // HTTP callers map this race (pre-check passed, createWorkflowRun then
+      // refused) to the same 503 body. Non-HTTP adapters already received the
+      // single refusal above; rethrowing would hit createMessageErrorHandler
+      // and send a second generic error.
+      if (isWebAdapter(ctx.platform)) {
+        throw error;
+      }
+      return;
     }
     const err = error as Error;
     getLog().error({ err, workflowName: workflow.name }, 'pre_create_workflow_run_failed');

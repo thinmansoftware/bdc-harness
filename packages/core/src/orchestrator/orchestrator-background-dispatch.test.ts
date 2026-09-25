@@ -377,15 +377,36 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
 
   test('orchestrator_precreate_does_not_swallow_drain', async () => {
     mockCreateWorkflowRun.mockImplementation(() => Promise.reject(new CauldronDrainingError()));
-    const ctx = makeCtx();
+    const platform = new MockPlatformAdapter();
+    platform.getPlatformType.mockImplementation(() => 'web');
+    const webPlatform = Object.assign(platform, {
+      sendStructuredEvent: mock(() => Promise.resolve()),
+      setConversationDbId: mock(() => undefined),
+      setupEventBridge: mock(() => () => undefined),
+    });
+    const ctx = makeCtx({ platform: webPlatform });
     await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toBeInstanceOf(
       CauldronDrainingError
     );
     expect(mockExecuteWorkflow).not.toHaveBeenCalled();
-    const sent = (ctx.platform as MockPlatformAdapter).sendMessage.mock.calls
-      .map(call => String(call[1]))
-      .join('\n');
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
     expect(sent).toContain('cauldron_draining');
     expect(sent).toContain('not started');
+  });
+
+  test('orchestrator_precreate_drain_refusal_is_one_message_off_web', async () => {
+    mockCreateWorkflowRun.mockImplementation(() => Promise.reject(new CauldronDrainingError()));
+    const platform = new MockPlatformAdapter();
+    platform.getPlatformType.mockImplementation(() => 'slack');
+    const ctx = makeCtx({ platform });
+    await expect(
+      dispatchBackgroundWorkflow(ctx as never, makeWorkflow())
+    ).resolves.toBeUndefined();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    const refusals = platform.sendMessage.mock.calls.filter(call =>
+      String(call[1]).includes('cauldron_draining')
+    );
+    expect(refusals).toHaveLength(1);
+    expect(String(refusals[0]?.[1])).toContain('not started');
   });
 });

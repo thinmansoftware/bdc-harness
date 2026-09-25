@@ -61,6 +61,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Top-level string field. Whitespace around the colon is ignored. Empty when
+# the field is missing. Mode is an enum, so a value has no escaped quotes.
+json_string_field() {
+  local key="$1"
+  local doc="$2"
+  printf '%s\n' "$doc" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
+}
+
 json_escape() {
   # Escapes a string for safe use inside a JSON double-quoted value: backslash
   # and double-quote first (order matters -- escaping the backslash first
@@ -116,13 +124,21 @@ TOKEN="$(docker exec archon-app-1 printenv ARCHON_OPERATOR_TOKEN)"
 
 INITIAL_STATE="$(curl -sS --max-time "$CURL_MAX_TIME" "$API_BASE/api/admin/drain" \
   -H "x-archon-operator-token: $TOKEN")"
-case "$INITIAL_STATE" in
-  *'"mode":"draining"'*)
+INITIAL_MODE="$(json_string_field mode "$INITIAL_STATE")"
+case "$INITIAL_MODE" in
+  draining)
     # Someone else already drained (incident freeze or another operator).
     # Do not post clearOnBoot and do not clear it later.
     DRAIN_SET_BY_ME=0
     ;;
+  normal)
+    ;;
   *)
+    printf '%s\n' ABORT_DRAIN_STATE_UNREADABLE
+    exit 1
+    ;;
+esac
+if [ "$DRAIN_SET_BY_ME" = "0" ] && [ "$INITIAL_MODE" = "normal" ]; then
     STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
     USER_NAME="${USER:-unknown}"
     REASON="rebuild ${STAMP} by ${USER_NAME}"
@@ -150,8 +166,7 @@ case "$INITIAL_STATE" in
       *'"changed":true'*|*'\"changed\":true'*) DRAIN_SET_BY_ME=1 ;;
       *) DRAIN_SET_BY_ME=0 ;;
     esac
-    ;;
-esac
+fi
 
 # STAMP is also used by the backup and rollback pin. A foreign drain skips
 # the POST above, so mint it here when that path did not.
@@ -254,8 +269,9 @@ POST_STATE="$(curl -sS --max-time "$CURL_MAX_TIME" "$API_BASE/api/admin/drain" \
 # before we started, including an incident freeze) must still be draining
 # after a successful rebuild.
 if [ "$DRAIN_SET_BY_ME" = "1" ]; then
-  case "$POST_STATE" in
-    *'"mode":"draining"'*)
+  POST_MODE="$(json_string_field mode "$POST_STATE")"
+  case "$POST_MODE" in
+    draining)
       curl -sS --max-time "$CURL_MAX_TIME" -X POST "$API_BASE/api/admin/drain" \
         -H "Content-Type: application/json" \
         -H "x-archon-operator-token: $TOKEN" \
