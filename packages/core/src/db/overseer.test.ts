@@ -13,6 +13,7 @@ mock.module('./connection', () => ({
 import {
   claimOverseerVerdict,
   claimVerdictForMergeExecution,
+  countOverseerAutomaticRecoveryAttempts,
   countRunsPendingOverseerJudgment,
   ensureDiscoveryRunRow,
   finalizeOverseerVerdict,
@@ -142,6 +143,25 @@ describe('overseer db', () => {
       result: JSON.stringify({ mutation_sent: true, merged_sha: 'deadbeef' }),
     });
     expect(await listRunsForOverseerWatch()).toHaveLength(0);
+  });
+
+  test('counts fired and indeterminate repair_refire receipts, but not refusals', async () => {
+    await seedRun('run-attempts');
+    for (const [action, result] of [
+      ['repair_refire', 'fired:successor:r2:attempt:1'],
+      ['repair_refire', 'indeterminate:network_after_reservation'],
+      ['repair_refire_refused', 'indeterminate:legacy-row-must-not-count'],
+      ['repair_refire_refused', 'refused:attempt_ceiling'],
+    ] as const) {
+      await insertOverseerAction({
+        runId: 'run-attempts',
+        woId: 'WO-TEST-OVERSEER-01',
+        class: 'failed',
+        action,
+        result,
+      });
+    }
+    expect(await countOverseerAutomaticRecoveryAttempts('WO-TEST-OVERSEER-01')).toBe(2);
   });
 
   test('watch_closed is terminal; provisional merge_denied is not (window drain, 5th canary defect)', async () => {

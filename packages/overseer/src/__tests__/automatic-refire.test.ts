@@ -52,4 +52,52 @@ describe('automatic refire', () => {
     expect(result.ok).toBe(true);
     expect(order).toEqual(['salvage', 'remove']);
   });
+  test('runs the composed policy/effect executor only after replay, cap, and owner gates', async () => {
+    const order: string[] = [];
+    const result = await executeAutomaticRefire(record, [], {
+      findConfirmedSuccessor: async () => {
+        order.push('replay');
+        return null;
+      },
+      countAutomaticAttempts: async () => {
+        order.push('cap');
+        return 0;
+      },
+      findLiveRunsForWo: async () => {
+        order.push('owner');
+        return [];
+      },
+      execute: async (_record, _events, attempt) => {
+        order.push('m31-policy-reservation-claim-fence-outcome');
+        expect(attempt).toBe(1);
+        return {
+          disposition: 'refire_first',
+          outcome: 'succeeded',
+          successor_run_id: 'r2',
+          predecessor_run_id: 'r1',
+          external_effect_reference: 'conversation-1',
+          reason: 'fired',
+        };
+      },
+    });
+    expect(order).toEqual(['replay', 'cap', 'owner', 'm31-policy-reservation-claim-fence-outcome']);
+    expect(result).toEqual({ status: 'fired', runId: 'r2', attempt: 1 });
+  });
+
+  test('preserves indeterminate effects for durable cap accounting', async () => {
+    const result = await executeAutomaticRefire(record, [], {
+      findConfirmedSuccessor: async () => null,
+      countAutomaticAttempts: async () => 1,
+      findLiveRunsForWo: async () => [],
+      execute: async () => ({
+        disposition: 'refire_later',
+        outcome: 'indeterminate',
+        successor_run_id: null,
+        predecessor_run_id: 'r1',
+        external_effect_reference: 'effect-1',
+        reason: 'network_after_reservation',
+      }),
+    });
+    expect(result).toEqual({ status: 'indeterminate', reason: 'network_after_reservation' });
+  });
 });

@@ -2,13 +2,30 @@ import { describe, expect, test } from 'bun:test';
 import { createOverseerFireWorkflowRun } from './overseer-fire';
 
 describe('overseer loopback fire', () => {
+  test('refuses an ambiguous project shortname', async () => {
+    const fire = createOverseerFireWorkflowRun({
+      port: 3090,
+      operatorToken: 'secret',
+      deps: {
+        findCodebasesByName: async () => [{ id: 'a' } as never, { id: 'b' } as never],
+      },
+    });
+    expect(
+      await fire({
+        workflowName: 'lane',
+        woId: 'WO-X',
+        project: 'bdc-harness',
+        predecessorRunId: 'r1',
+      })
+    ).toEqual({ ok: false, error: 'project_resolution_failed' });
+  });
   test('guards live WOs without posting', async () => {
     let posted = false;
     const fire = createOverseerFireWorkflowRun({
       port: 3090,
       operatorToken: 'secret',
       deps: {
-        findCodebaseByName: async () => ({ id: 'cb' }) as never,
+        findCodebasesByName: async () => [{ id: 'cb' } as never],
         findLiveRunsForWo: async () => [{ id: 'live', status: 'running', workflow_name: 'lane' }],
         fetch: async () => {
           posted = true;
@@ -33,7 +50,7 @@ describe('overseer loopback fire', () => {
       operatorToken: 'secret',
       discoverTimeoutMs: 10,
       deps: {
-        findCodebaseByName: async () => ({ id: 'cb' }) as never,
+        findCodebasesByName: async () => [{ id: 'cb' } as never],
         findLiveRunsForWo: async () => [],
         fetch: async (_url, init) => {
           request = init;

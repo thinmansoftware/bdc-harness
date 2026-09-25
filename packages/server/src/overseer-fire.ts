@@ -1,4 +1,4 @@
-import { findCodebaseByName } from '@archon/core/db/codebases';
+import { findCodebasesByName } from '@archon/core/db/codebases';
 import { listWorkflowRuns } from '@archon/core/db/workflows';
 import { findLiveRunsForWo } from './routes/wo-fire-guard';
 
@@ -14,7 +14,7 @@ export type OverseerFireResult =
   | { ok: false; error: string };
 
 interface FireDeps {
-  findCodebaseByName: typeof findCodebaseByName;
+  findCodebasesByName: typeof findCodebasesByName;
   findLiveRunsForWo: typeof findLiveRunsForWo;
   fetch: typeof fetch;
   discoverRuns: (codebaseId: string) => Promise<
@@ -38,7 +38,7 @@ export function createOverseerFireWorkflowRun(options: {
   deps?: Partial<FireDeps>;
 }): (input: OverseerFireInput) => Promise<OverseerFireResult> {
   const deps: FireDeps = {
-    findCodebaseByName,
+    findCodebasesByName,
     findLiveRunsForWo,
     fetch,
     discoverRuns: async codebaseId => {
@@ -65,8 +65,9 @@ export function createOverseerFireWorkflowRun(options: {
     ) {
       return { ok: false, error: 'forbidden_workflow_target' };
     }
-    const codebase = await deps.findCodebaseByName(input.project);
-    if (!codebase) return { ok: false, error: 'project_resolution_failed' };
+    const codebases = await deps.findCodebasesByName(input.project);
+    if (codebases.length !== 1) return { ok: false, error: 'project_resolution_failed' };
+    const codebase = codebases[0]!;
     if ((await deps.findLiveRunsForWo(input.woId)).length > 0) {
       return { ok: false, error: 'duplicate_wo_live' };
     }

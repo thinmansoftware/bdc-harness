@@ -126,6 +126,15 @@ export async function findCodebaseByName(name: string): Promise<Codebase | null>
   return result.rows[0] || null;
 }
 
+/** Return every exact short-name match so security-sensitive callers can reject ambiguity. */
+export async function findCodebasesByName(name: string): Promise<readonly Codebase[]> {
+  const result = await pool.query<Codebase>(
+    'SELECT * FROM remote_agent_codebases WHERE name = $1 ORDER BY created_at DESC',
+    [name]
+  );
+  return result.rows;
+}
+
 export async function updateCodebase(
   id: string,
   data: { default_cwd?: string; repository_url?: string | null }
