@@ -140,6 +140,13 @@ afterEach(() => {
   delete process.env.GITHUB_TOKEN;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS;
   delete process.env.ARCHON_BUILD_SHA;
+  delete process.env.DUTY_OFFICER_DEPLOY_DRIFT_ENABLED;
+  delete process.env.DUTY_OFFICER_DEPLOY_DRIFT_REPO;
+  delete process.env.DUTY_OFFICER_DEPLOY_DRIFT_BRANCH;
+  delete process.env.DUTY_OFFICER_DEPLOY_DRIFT_GRACE_MS;
+  delete process.env.DUTY_OFFICER_DEPLOY_DRIFT_INTERVAL_MS;
+  delete process.env.DUTY_OFFICER_DEPLOY_DRIFT_TIMEOUT_MS;
+  delete process.env.DUTY_OFFICER_DEPLOY_DRIFT_RECIPIENT;
 });
 
 const priorDetectorResult: SecurityDetectorResult = {
@@ -653,5 +660,43 @@ describe('duty officer clock', () => {
         }),
       })
     );
+  });
+
+  test('clock wiring records deploy drift status and survives a throw', async () => {
+    const deps = fakeDeps([]);
+    deps.deployDriftDetector = mock(async () => ({
+      verdict: 'drift_alerted' as const,
+      reasons: ['behind_dev'],
+      running_sha: 'a'.repeat(40),
+      target_sha: 'b'.repeat(40),
+      behind_by: 3,
+      last_error: null,
+      evaluated_at: '2026-09-24T12:00:00.000Z',
+    }));
+    await tickDutyOfficerClock(deps);
+    expect(deps.deployDriftDetector).toHaveBeenCalledTimes(1);
+    const calls = (deps.registerWorker as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    const finalCaps = (calls.at(-1)?.[0] as { capabilities: { deploy_drift: { verdict: string } } })
+      .capabilities;
+    expect(finalCaps.deploy_drift.verdict).toBe('drift_alerted');
+
+    const throwing = fakeDeps([]);
+    throwing.deployDriftDetector = mock(async () => {
+      throw new Error('detector_boom');
+    });
+    await tickDutyOfficerClock(throwing);
+    expect(throwing.deployDriftDetector).toHaveBeenCalledTimes(1);
+    const throwCalls = (throwing.registerWorker as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls;
+    const throwCaps = (
+      throwCalls.at(-1)?.[0] as {
+        capabilities: {
+          last_tick_completed_at: string;
+          deploy_drift: { last_tick_outcome: string };
+        };
+      }
+    ).capabilities;
+    expect(throwCaps.last_tick_completed_at).toEqual(expect.any(String));
+    expect(throwCaps.deploy_drift.last_tick_outcome).toBe('error');
   });
 });
