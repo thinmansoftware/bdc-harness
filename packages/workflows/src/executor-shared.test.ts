@@ -84,6 +84,69 @@ describe('substituteWorkflowVariables', () => {
     ).toThrow('No base branch could be resolved');
   });
 
+  it('preserves longer base branch variables', () => {
+    const { prompt } = substituteWorkflowVariables(
+      'Override: $BASE_BRANCH_OVERRIDE. PR: $BASE_BRANCH_PR',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('Override: $BASE_BRANCH_OVERRIDE. PR: $BASE_BRANCH_PR');
+  });
+
+  it('substitutes base branch before delimiters', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH $BASE_BRANCH/x $BASE_BRANCH. $BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('dev dev/x dev. dev)');
+  });
+
+  it('bounds every unbraced workflow variable to a complete identifier', () => {
+    const variables = [
+      ['$WORKFLOW_ID', 'run-1'],
+      ['$USER_MESSAGE', 'msg'],
+      ['$ARGUMENTS', 'msg'],
+      ['$ARTIFACTS_DIR', '/tmp'],
+      ['$DOCS_DIR', 'docs/'],
+      ['$LOOP_USER_INPUT', ''],
+      ['$REJECTION_REASON', ''],
+      ['$LOOP_PREV_OUTPUT', ''],
+    ] as const;
+
+    for (const [variable, replacement] of variables) {
+      const suffix = `${variable}_SUFFIX`;
+      const { prompt } = substituteWorkflowVariables(
+        `${variable} ${suffix}`,
+        'run-1',
+        'msg',
+        '/tmp',
+        'dev',
+        'docs/'
+      );
+      expect(prompt).toBe(`${replacement} ${suffix}`);
+    }
+  });
+
+  it('does not fail for longer base branch variables when base branch is empty', () => {
+    expect(() =>
+      substituteWorkflowVariables(
+        '$BASE_BRANCH_OVERRIDE $BASE_BRANCH_PR',
+        'run-1',
+        'msg',
+        '/tmp',
+        '',
+        'docs/'
+      )
+    ).not.toThrow();
+  });
+
   it('does not throw when $BASE_BRANCH is not referenced and baseBranch is empty', () => {
     const { prompt } = substituteWorkflowVariables(
       'No branch reference here',
