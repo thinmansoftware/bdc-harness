@@ -64,7 +64,18 @@ const defaultCursorAgentSpawn: CursorAgentSpawn = (argv, options) =>
 
 /** Exported for tests: the exact argv, with the prompt deliberately absent. */
 export function buildCursorAgentArgv(binary: string, model: string, cwd: string): string[] {
-  return [binary, '--print', '--force', '--trust', '--workspace', cwd, '--model', model];
+  return [
+    binary,
+    '--print',
+    '--force',
+    '--trust',
+    '--output-format',
+    'stream-json',
+    '--workspace',
+    cwd,
+    '--model',
+    model,
+  ];
 }
 
 export class CursorAgentProvider implements IAgentProvider {
@@ -110,31 +121,86 @@ export class CursorAgentProvider implements IAgentProvider {
     // reads stdin to EOF before answering, so writing and reading must overlap.
     const delivery = deliverPrompt(child.stdin, buildCursorPrompt(prompt, options));
 
+    const assistantParts: string[] = [];
+    let servedModelId: string | undefined;
+    let resultEvent: CursorStreamEvent | undefined;
+    let resultError: Error | undefined;
+    let malformedOutput = '';
     let finalText = '';
     try {
       if (child.stdout) {
         const decoder = new TextDecoder();
         const reader = child.stdout.getReader();
+        let lineBuffer = '';
+        const processLine = (line: string): MessageChunk | undefined => {
+          if (line.trim().length === 0) return undefined;
+          let event: CursorStreamEvent;
+          try {
+            const parsed: unknown = JSON.parse(line);
+            if (!parsed || typeof parsed !== 'object') throw new Error('not an event object');
+            event = parsed as CursorStreamEvent;
+          } catch {
+            malformedOutput = `${malformedOutput}\n${line}`.slice(-400);
+            return undefined;
+          }
+
+          if (event.type === 'system' && event.subtype === 'init') {
+            if (typeof event.model === 'string' && event.model.trim().length > 0) {
+              servedModelId = event.model;
+            }
+          } else if (event.type === 'assistant') {
+            const text = extractAssistantText(event);
+            if (text.length > 0) {
+              assistantParts.push(text);
+              return { type: 'assistant', content: text };
+            }
+          } else if (event.type === 'thinking') {
+            return { type: 'thinking', content: typeof event.text === 'string' ? event.text : '' };
+          } else if (event.type === 'tool_call') {
+            return {
+              type: 'tool',
+              toolName: event.subtype ? `cursor:${event.subtype}` : 'cursor:tool_call',
+              ...(typeof event.call_id === 'string' ? { toolCallId: event.call_id } : {}),
+            };
+          } else if (event.type === 'result') {
+            resultEvent = event;
+            if (event.is_error === true || event.subtype !== 'success') {
+              const detail = typeof event.result === 'string' ? event.result.slice(-400) : '';
+              resultError = new Error(
+                `cursor-agent result failed${detail.length > 0 ? `: ${detail}` : ''}`
+              );
+            }
+          }
+          return undefined;
+        };
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          const text = decoder.decode(value, { stream: true });
-          if (text.length === 0) continue;
-          finalText += text;
-          yield { type: 'assistant', content: text };
+          lineBuffer += decoder.decode(value, { stream: true });
+          const lines = lineBuffer.split(/\r?\n/);
+          lineBuffer = lines.pop() ?? '';
+          for (const line of lines) {
+            const chunk = processLine(line);
+            if (chunk) yield chunk;
+          }
         }
-        const tail = decoder.decode();
-        if (tail.length > 0) {
-          finalText += tail;
-          yield { type: 'assistant', content: tail };
+        lineBuffer += decoder.decode();
+        if (lineBuffer.length > 0) {
+          const chunk = processLine(lineBuffer);
+          if (chunk) yield chunk;
         }
       }
       const [exitCode, stderr] = await Promise.all([child.exited, stderrText]);
       await delivery;
       if (exitCode !== 0) {
-        const detail = stderr.trim().slice(-400) || 'no stderr';
+        const detail = stderr.trim().slice(-400) || malformedOutput.trim() || 'no stderr';
         throw new Error(`cursor-agent exited ${exitCode} (model ${model}): ${detail}`);
       }
+      if (resultError) throw resultError;
+
+      const assistantText = assistantParts.join('');
+      const resultText = typeof resultEvent?.result === 'string' ? resultEvent.result : '';
+      finalText = assistantText.length > 0 ? assistantText : resultText;
       if (finalText.trim().length === 0) {
         // rc 0 with no output is the Workspace Trust / auth no-op
         // (scripts/dispatch-worker/seat-preflight.ts cursorBuildResultIsEmpty).
@@ -142,6 +208,9 @@ export class CursorAgentProvider implements IAgentProvider {
         throw new Error(
           'cursor-agent exited 0 with empty output (workspace trust or authentication not granted)'
         );
+      }
+      if (assistantText.length === 0) {
+        yield { type: 'assistant', content: resultText };
       }
     } finally {
       options?.abortSignal?.removeEventListener('abort', onAbort);
@@ -156,10 +225,34 @@ export class CursorAgentProvider implements IAgentProvider {
       type: 'result',
       stopReason: 'stop',
       structuredOutput,
-      servedModelId: null,
-      servedModelMissingReason: 'cursor-agent --print text output carries no served-model field',
+      servedModelId: servedModelId ?? null,
+      ...(servedModelId === undefined
+        ? { servedModelMissingReason: 'cursor_stream_init_model_missing' }
+        : {}),
     };
   }
+}
+
+interface CursorStreamEvent {
+  type?: string;
+  subtype?: string;
+  model?: unknown;
+  text?: unknown;
+  call_id?: unknown;
+  is_error?: unknown;
+  result?: unknown;
+  message?: { content?: unknown };
+}
+
+function extractAssistantText(event: CursorStreamEvent): string {
+  if (!Array.isArray(event.message?.content)) return '';
+  return event.message.content
+    .flatMap(part => {
+      if (!part || typeof part !== 'object') return [];
+      const value = part as { type?: unknown; text?: unknown };
+      return value.type === 'text' && typeof value.text === 'string' ? [value.text] : [];
+    })
+    .join('');
 }
 
 function buildCursorPrompt(prompt: string, options?: SendQueryOptions): string {
