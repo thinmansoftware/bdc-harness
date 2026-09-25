@@ -23,6 +23,7 @@ import {
   parseRequiredContextsOverride,
   peekRequiredContextsAttempts,
   requiredContextsAttemptCounterSize,
+  requiredContextsCacheSize,
   resetRequiredContextsAttemptCounters,
   resetRequiredContextsCache,
   resetRequiredContextsSourceLog,
@@ -1076,8 +1077,12 @@ describe('resolveRequiredContexts -- lookup cache (#993)', () => {
       },
     });
     const first = await resolveRequiredContexts(input, env);
-    expect(first.state).toBe('unknown');
-    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD)).toBe(1);
+    expect(first).toEqual({
+      state: 'unknown',
+      reason: 'rate_limited_backoff',
+      failureKind: 'transient',
+    });
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD)).toBe(0);
 
     for (let index = 0; index < 5; index += 1) {
       const again = await resolveRequiredContexts(input, env);
@@ -1085,7 +1090,89 @@ describe('resolveRequiredContexts -- lookup cache (#993)', () => {
       if (again.state === 'unknown') expect(again.reason).toBe('rate_limited_backoff');
     }
     expect(appCalls).toBe(1);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD)).toBe(0);
+  });
+
+  test('48 a rate-limit 403 stays UNKNOWN when the attempt bound is 1', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '1' };
+    const resolution = await resolveRequiredContexts(
+      baseInput({
+        fetchWithAppClient: async () => {
+          throw Object.assign(new Error('API rate limit exceeded'), { status: 403 });
+        },
+      }),
+      env
+    );
+    expect(resolution).toEqual({
+      state: 'unknown',
+      reason: 'rate_limited_backoff',
+      failureKind: 'transient',
+    });
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD)).toBe(0);
+  });
+
+  test('49 a rate-limit 403 does not exhaust a head that already failed', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '2' };
+    const prior = await resolveRequiredContexts(
+      baseInput({
+        fetchWithAppClient: async () => {
+          throw Object.assign(new Error('Bad gateway'), { status: 502 });
+        },
+      }),
+      env
+    );
+    expect(prior.state).toBe('unknown');
     expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD)).toBe(1);
+
+    const limited = await resolveRequiredContexts(
+      baseInput({
+        fetchWithAppClient: async () => {
+          throw Object.assign(new Error('API rate limit exceeded'), { status: 403 });
+        },
+      }),
+      env
+    );
+    expect(limited).toEqual({
+      state: 'unknown',
+      reason: 'rate_limited_backoff',
+      failureKind: 'transient',
+    });
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD)).toBe(1);
+  });
+
+  test('50 shared misses stay inside the cache ceiling and expire with the TTL', async () => {
+    const realNow = Date.now;
+    try {
+      let clock = realNow();
+      Date.now = () => clock;
+      for (let index = 0; index < REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES + 40; index += 1) {
+        await resolveRequiredContexts(
+          baseInput({
+            baseRef: `miss-base-${index}`,
+            fetchWithAppClient: async () => {
+              throw appPermissionError();
+            },
+          }),
+          {}
+        );
+      }
+      expect(requiredContextsCacheSize()).toBeLessThanOrEqual(REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES);
+      expect(requiredContextsCacheSize()).toBe(REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES);
+
+      clock += REQUIRED_CONTEXTS_CACHE_TTL_MS + 1;
+      await resolveRequiredContexts(
+        baseInput({
+          baseRef: 'miss-base-after-ttl',
+          fetchWithAppClient: async () => {
+            throw appPermissionError();
+          },
+        }),
+        {}
+      );
+      expect(requiredContextsCacheSize()).toBe(1);
+    } finally {
+      Date.now = realNow;
+    }
   });
 
   test('47 concurrent misses for one base share a single GitHub request', async () => {

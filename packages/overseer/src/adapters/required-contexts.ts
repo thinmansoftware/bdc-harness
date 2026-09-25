@@ -217,8 +217,9 @@ export const REQUIRED_CONTEXTS_CACHE_TTL_MS = 10 * 60 * 1000;
 export const REQUIRED_CONTEXTS_RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000;
 
 /**
- * Combined ceiling for known-result entries and rate-limit back-off entries.
- * The two kinds share one budget so neither map can grow to this size alone.
+ * Combined ceiling for known results, rate-limit back-offs, and shared-miss
+ * records. All three share one budget so none of them can grow to this size
+ * alone.
  */
 export const REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES = 512;
 
@@ -392,14 +393,31 @@ interface RequiredContextsCacheBackoffEntry {
   touchSeq: number;
 }
 
+/**
+ * Why an in-flight lookup failed, so a waiter can count its own head with the
+ * same reason. Stored in the shared cache (not a second map) so permission and
+ * error keys share the TTL and the combined ceiling.
+ */
+interface RequiredContextsCacheMissEntry {
+  kind: 'miss';
+  reason: string;
+  failureKind: RequiredContextsFailureKind;
+  expiresAt: number;
+  touchedAt: number;
+  touchSeq: number;
+}
+
 type RequiredContextsCacheEntry =
   | RequiredContextsCacheResultEntry
-  | RequiredContextsCacheBackoffEntry;
+  | RequiredContextsCacheBackoffEntry
+  | RequiredContextsCacheMissEntry;
 
 /**
- * Known answers and rate-limit back-offs, keyed by owner/repo@base (no head).
- * Module scope matches the attempt counters: the evidence fetcher closure is
- * rebuilt on every review tick, so a closure-local cache would never hit.
+ * Known answers, rate-limit back-offs, and shared-miss records, keyed by
+ * owner/repo@base (no head). Module scope matches the attempt counters: the
+ * evidence fetcher closure is rebuilt on every review tick, so a closure-local
+ * cache would never hit. Misses share this map so they are TTL-pruned and
+ * size-bounded with the other entries.
  */
 const requiredContextsCache = new Map<string, RequiredContextsCacheEntry>();
 
@@ -412,12 +430,6 @@ let requiredContextsCacheTouchSeq = 0;
  * each review builds its own evidence fetcher.
  */
 const requiredContextsInflight = new Map<string, Promise<void>>();
-
-/** Why the in-flight lookup failed, so a waiter counts its own head with the same reason. */
-const requiredContextsSharedMiss = new Map<
-  string,
-  { reason: string; failureKind: RequiredContextsFailureKind }
->();
 
 /**
  * Plan amendment for WO-HARNESS-REQUIRED-CONTEXTS-CACHE-01.
@@ -433,7 +445,11 @@ export function resetRequiredContextsCache(): void {
   requiredContextsCache.clear();
   requiredContextsCacheTouchSeq = 0;
   requiredContextsInflight.clear();
-  requiredContextsSharedMiss.clear();
+}
+
+/** Test seam: how many cache entries (results, back-offs, and misses) are retained. */
+export function requiredContextsCacheSize(): number {
+  return requiredContextsCache.size;
 }
 
 function nextCacheTouch(now: number): { touchedAt: number; touchSeq: number } {
@@ -442,7 +458,8 @@ function nextCacheTouch(now: number): { touchedAt: number; touchSeq: number } {
 }
 
 function cacheEntryExpired(entry: RequiredContextsCacheEntry, now: number): boolean {
-  return entry.kind === 'result' ? now >= entry.expiresAt : now >= entry.until;
+  if (entry.kind === 'backoff') return now >= entry.until;
+  return now >= entry.expiresAt;
 }
 
 /**
@@ -492,6 +509,34 @@ function rememberRateLimitBackoff(key: string, until: number, now: number): void
     until,
     ...nextCacheTouch(now),
   });
+}
+
+function rememberSharedMiss(
+  key: string,
+  reason: string,
+  failureKind: RequiredContextsFailureKind,
+  now: number
+): void {
+  pruneRequiredContextsCache(now, key);
+  requiredContextsCache.set(key, {
+    kind: 'miss',
+    reason,
+    failureKind,
+    expiresAt: now + REQUIRED_CONTEXTS_CACHE_TTL_MS,
+    ...nextCacheTouch(now),
+  });
+}
+
+function readSharedMiss(
+  key: string,
+  now: number
+): { reason: string; failureKind: RequiredContextsFailureKind } | null {
+  const entry = requiredContextsCache.get(key);
+  if (entry?.kind !== 'miss') return null;
+  if (cacheEntryExpired(entry, now)) return null;
+  entry.touchedAt = now;
+  entry.touchSeq = nextCacheTouch(now).touchSeq;
+  return { reason: entry.reason, failureKind: entry.failureKind };
 }
 
 function readFreshCachedResult(key: string, now: number): KnownRequiredContextsResolution | null {
@@ -784,7 +829,7 @@ async function settleSharedLookup(
   if (hasActiveRateLimitBackoff(key, settledAt)) {
     return rateLimitBackoffUnknown(key, counterKey.headSha);
   }
-  const miss = requiredContextsSharedMiss.get(key);
+  const miss = readSharedMiss(key, settledAt);
   return deferOrBlock(
     counterKey,
     miss?.reason ?? 'lookup_failed',
@@ -847,7 +892,6 @@ async function lookupRequiredContexts(
         contexts,
         source: attempt.source,
       };
-      requiredContextsSharedMiss.delete(key);
       rememberKnownResult(key, resolution, Date.now());
       return resolution;
     } catch (error) {
@@ -900,12 +944,18 @@ async function lookupRequiredContexts(
       contexts: [],
       source: 'unprotected_branch',
     };
-    requiredContextsSharedMiss.delete(key);
     rememberKnownResult(key, resolution, Date.now());
     return resolution;
   }
 
-  requiredContextsSharedMiss.set(key, { reason: lastReason, failureKind });
+  // A rate-limit 403 is fail-closed UNKNOWN until reset. It must not enter
+  // deferOrBlock: max attempts of 1, or a head that already has failures,
+  // would otherwise escalate to EXHAUSTED.
+  if (rateLimited) {
+    return rateLimitBackoffUnknown(key, counterKey.headSha);
+  }
+
+  rememberSharedMiss(key, lastReason, failureKind, Date.now());
   return deferOrBlock(counterKey, lastReason, failureKind, env, store);
 }
 
