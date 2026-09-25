@@ -66,31 +66,12 @@ echo "REPAIR_BRANCH_VALID=$SPEC_REPAIR_BRANCH"
 `;
 
 // ---------------------------------------------------------------------------
-// Snippet 1c: the push-destination decision the Mode Behavior Matrix describes.
-// A promotion-form branch is an acceptable push destination ONLY when the lane
-// verified a repair target (REPAIR_TARGET != none) whose branch equals it
-// exactly; otherwise only the standard feat/|fix/|wip/ forms are accepted. This
-// mirrors the invariant enforced structurally in commit-and-push (the push-BRANCH
-// check stays feat/|fix/|wip/, and the promotion branch only becomes the push
-// destination via the fully-authorized REPAIR_TARGET_BRANCH path).
+// The push-destination decision is NOT re-implemented here as a surrogate.
+// WO-HARNESS-REPAIR-TARGET-PROMOTION-BRANCHES-01: Tests 4-6 below exercise the
+// ACTUAL production snippet extracted verbatim from commit-and-push via
+// extractPushBranchDecision() (defined after DEFAULTS_DIR). A hand-written copy
+// could drift from the YAML and certify behavior the workflow does not have.
 // ---------------------------------------------------------------------------
-const PUSH_DESTINATION_DECISION = `
-set -euo pipefail
-BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
-REPAIR_BRANCH_PATTERN='${REPAIR_BRANCH_PATTERN}'
-if printf '%s\\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
-  echo "PUSH_DECISION=accept:standard"
-  exit 0
-fi
-if [ "\${REPAIR_TARGET:-none}" != none ] \\
-  && [ "$BRANCH" = "\${REPAIR_TARGET_BRANCH:-}" ] \\
-  && printf '%s\\n' "$BRANCH" | grep -Eq "$REPAIR_BRANCH_PATTERN"; then
-  echo "PUSH_DECISION=accept:verified-repair-target"
-  exit 0
-fi
-echo "PUSH_DECISION=reject" >&2
-exit 1
-`;
 
 // ---------------------------------------------------------------------------
 // Snippet 2 (F-7C): COMMITS_AHEAD=0 fallback that searches git ls-remote.
@@ -249,6 +230,40 @@ echo "UNIQUE_BRANCH=$UNIQUE_BRANCH"
 
 const REPAIR_TARGET_SELECTION = extractRepairTargetSelection();
 
+// WO-HARNESS-REPAIR-TARGET-PROMOTION-BRANCHES-01: extract the ACTUAL push-BRANCH
+// decision block from commit-and-push (the conditional acceptance of a widened
+// promotion/|promotion/ce/|hotfix/ce/ BRANCH only when it equals the declared
+// repair_target_branch). This is the second `      BRANCH_PATTERN=` occurrence
+// (the first guards SPEC_REPAIR_BRANCH in checkout-repair-target); it spans from
+// that line through the closing `fi`, immediately before the
+// WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01 comment. BRANCH and
+// DECIDE_OUTPUT_CLEAN are injected via env; on accept the wrapper prints
+// BRANCH_VALID, on reject the block exits 1 with "Malformed branch name".
+function extractPushBranchDecision(): string {
+  const yaml = readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8').replace(
+    /\r\n/g,
+    '\n'
+  );
+  const anchor =
+    "      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'\n";
+  const first = yaml.indexOf(anchor);
+  const start = first < 0 ? -1 : yaml.indexOf(anchor, first + 1);
+  const end =
+    start < 0
+      ? -1
+      : yaml.indexOf('      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01\n', start);
+  if (first < 0 || start < 0 || end < 0) {
+    throw new Error('commit-and-push push-BRANCH decision block not found');
+  }
+  const block = yaml.slice(start, end).replace(/^      /gm, '');
+  return `set -euo pipefail
+DECIDE_OUTPUT_CLEAN="\${DECIDE_OUTPUT_CLEAN:-}"
+${block}echo "BRANCH_VALID=$BRANCH"
+`;
+}
+
+const PUSH_BRANCH_DECISION = extractPushBranchDecision();
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -403,50 +418,73 @@ describe('F-6A: BRANCH allowlist regex validator', () => {
     }
   });
 
-  it('Test 4: accepts a promotion-form push BRANCH only when it equals the verified repair target', () => {
-    const branch = 'promotion/scanslab-backend-20260924';
-    const result = bash(PUSH_DESTINATION_DECISION, worktreeDir, {
-      BRANCH: branch,
-      REPAIR_TARGET: '#743',
-      REPAIR_TARGET_BRANCH: branch,
+  // Tests 4-6 exercise the ACTUAL commit-and-push push-BRANCH decision snippet
+  // (PUSH_BRANCH_DECISION, extracted verbatim from the YAML), not a surrogate.
+  // decide-push-target's repair_target_branch is delivered via DECIDE_OUTPUT_CLEAN,
+  // exactly as the production node reads it.
+  it('Test 4a: accepts a standard feat/ push BRANCH with no repair target', () => {
+    const result = bash(PUSH_BRANCH_DECISION, worktreeDir, {
+      BRANCH: 'feat/wo-foo-bar-01',
+      DECIDE_OUTPUT_CLEAN: 'push_target: feature-branch:feat/wo-foo-bar-01\n',
     });
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain('PUSH_DECISION=accept:verified-repair-target');
+    expect(result.stdout).toContain('BRANCH_VALID=feat/wo-foo-bar-01');
+  });
+
+  it('Test 4b: accepts a promotion-form push BRANCH only when it equals the verified repair target', () => {
+    const branch = 'promotion/scanslab-backend-20260924';
+    const result = bash(PUSH_BRANCH_DECISION, worktreeDir, {
+      BRANCH: branch,
+      DECIDE_OUTPUT_CLEAN: [
+        `push_target: feature-branch:${branch}`,
+        'repair_target_pr: #743',
+        `repair_target_branch: ${branch}`,
+        'repair_target_authorized_by_spec: #743',
+      ].join('\n'),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(`BRANCH_VALID=${branch}`);
   });
 
   it('Test 5: rejects a promotion-form push BRANCH with no repair target or a mismatched one', () => {
     const branch = 'promotion/scanslab-backend-20260924';
 
-    const noTarget = bash(PUSH_DESTINATION_DECISION, worktreeDir, {
+    // No repair_target_branch emitted at all: promotion BRANCH must fail closed.
+    const noTarget = bash(PUSH_BRANCH_DECISION, worktreeDir, {
       BRANCH: branch,
-      REPAIR_TARGET: 'none',
-      REPAIR_TARGET_BRANCH: '',
+      DECIDE_OUTPUT_CLEAN: `push_target: feature-branch:${branch}\n`,
     });
     expect(noTarget.exitCode).toBe(1);
-    expect(noTarget.stderr).toContain('PUSH_DECISION=reject');
-    expect(noTarget.stdout).not.toContain('accept');
+    expect(noTarget.stderr).toContain('Malformed branch name');
+    expect(noTarget.stdout).not.toContain('BRANCH_VALID=');
 
-    const mismatch = bash(PUSH_DESTINATION_DECISION, worktreeDir, {
+    // repair_target_branch present but not equal to BRANCH: still fail closed.
+    const mismatch = bash(PUSH_BRANCH_DECISION, worktreeDir, {
       BRANCH: branch,
-      REPAIR_TARGET: '#743',
-      REPAIR_TARGET_BRANCH: 'promotion/other',
+      DECIDE_OUTPUT_CLEAN: [
+        `push_target: feature-branch:${branch}`,
+        'repair_target_branch: promotion/other',
+      ].join('\n'),
     });
     expect(mismatch.exitCode).toBe(1);
-    expect(mismatch.stderr).toContain('PUSH_DECISION=reject');
-    expect(mismatch.stdout).not.toContain('accept');
+    expect(mismatch.stderr).toContain('Malformed branch name');
+    expect(mismatch.stdout).not.toContain('BRANCH_VALID=');
   });
 
-  it('Test 6: the push-destination decision is idempotent across repeated runs', () => {
+  it('Test 6: the push-BRANCH decision is idempotent across repeated runs', () => {
+    const branch = 'promotion/scanslab-backend-20260924';
     const env = {
-      BRANCH: 'promotion/scanslab-backend-20260924',
-      REPAIR_TARGET: '#743',
-      REPAIR_TARGET_BRANCH: 'promotion/scanslab-backend-20260924',
+      BRANCH: branch,
+      DECIDE_OUTPUT_CLEAN: [
+        `push_target: feature-branch:${branch}`,
+        `repair_target_branch: ${branch}`,
+      ].join('\n'),
     };
-    const first = bash(PUSH_DESTINATION_DECISION, worktreeDir, env);
-    const second = bash(PUSH_DESTINATION_DECISION, worktreeDir, env);
+    const first = bash(PUSH_BRANCH_DECISION, worktreeDir, env);
+    const second = bash(PUSH_BRANCH_DECISION, worktreeDir, env);
     expect(first.exitCode).toBe(second.exitCode);
     expect(first.stdout).toBe(second.stdout);
-    expect(first.stdout).toContain('PUSH_DECISION=accept:verified-repair-target');
+    expect(first.stdout).toContain(`BRANCH_VALID=${branch}`);
   });
 });
 
