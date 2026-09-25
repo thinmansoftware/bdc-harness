@@ -167,10 +167,9 @@ describe('CursorAgentProvider', () => {
 
   test('requests stream-json output while preserving all required flags', () => {
     const argv = buildCursorAgentArgv('cursor-agent', 'grok-4.7-high', '/w');
-    expect(argv.slice(argv.indexOf('--output-format'), argv.indexOf('--output-format') + 2)).toEqual([
-      '--output-format',
-      'stream-json',
-    ]);
+    expect(
+      argv.slice(argv.indexOf('--output-format'), argv.indexOf('--output-format') + 2)
+    ).toEqual(['--output-format', 'stream-json']);
     expect(argv).toEqual([
       'cursor-agent',
       '--print',
@@ -196,9 +195,19 @@ describe('CursorAgentProvider', () => {
       assistantEvent('final answer'),
       successEvent('result fallback must not be used')
     );
-    const chunks = await collect(
-      new CursorAgentProvider({ spawn: () => fakeChild({ stdout }).child }).sendQuery('go', '/w')
-    );
+    let resolveExit!: (exitCode: number) => void;
+    const exited = new Promise<number>(resolve => {
+      resolveExit = resolve;
+    });
+    const { child } = fakeChild({ stdout });
+    child.exited = exited;
+    const stream = new CursorAgentProvider({ spawn: () => child }).sendQuery('go', '/w');
+
+    const first = await stream.next();
+    expect(first).toEqual({ done: false, value: { type: 'thinking', content: 'one' } });
+
+    resolveExit(0);
+    const chunks = first.done ? [] : [first.value, ...(await collect(stream))];
 
     expect(chunks.filter(chunk => chunk.type === 'thinking')).toHaveLength(3);
     expect(chunks.filter(chunk => chunk.type === 'tool')).toHaveLength(2);
@@ -220,7 +229,9 @@ describe('CursorAgentProvider', () => {
     });
     const { child } = fakeChild();
     child.stdout = stdout;
-    const chunks = await collect(new CursorAgentProvider({ spawn: () => child }).sendQuery('go', '/w'));
+    const chunks = await collect(
+      new CursorAgentProvider({ spawn: () => child }).sendQuery('go', '/w')
+    );
     expect(assistantText(chunks)).toBe('onetwo');
   });
 
@@ -230,10 +241,9 @@ describe('CursorAgentProvider', () => {
       { type: 'result', subtype: 'cancelled', is_error: false, result: `${'x'.repeat(450)}tail` },
     ]) {
       const run = collect(
-        new CursorAgentProvider({ spawn: () => fakeChild({ stdout: streamLines(event) }).child }).sendQuery(
-          'go',
-          '/w'
-        )
+        new CursorAgentProvider({
+          spawn: () => fakeChild({ stdout: streamLines(event) }).child,
+        }).sendQuery('go', '/w')
       );
       if (event.result === 'model refused') {
         await expect(run).rejects.toThrow(/model refused/);
