@@ -39,6 +39,8 @@ export interface OverseerWatchRun {
    */
   workingPath?: string;
   metadata: Record<string, unknown>;
+  workflowName?: string;
+  codebaseId?: string;
 }
 
 export interface OverseerWorkflowEventRow {
@@ -73,6 +75,8 @@ interface WorkflowRunRow {
   // codebase name below because it is the AUTHORITATIVE repo identity: metadata
   // is agent-authorable and, in practice, never carries a repo key at all.
   codebase_name: string | null;
+  workflow_name: string;
+  codebase_id: string | null;
 }
 
 interface WorkflowEventRow {
@@ -179,6 +183,8 @@ function normalizeRun(row: WorkflowRunRow): OverseerWatchRun {
     headBranch: stringField(metadata, ['headBranch', 'head_branch', 'branch']),
     workingPath: row.working_path ?? undefined,
     metadata,
+    workflowName: row.workflow_name,
+    codebaseId: row.codebase_id ?? undefined,
   };
 }
 
@@ -217,12 +223,14 @@ const TERMINAL_OVERSEER_ACTIONS = [
   'escalation_denied',
   'tier_refused',
   'comment_findings',
+  'repair_refire',
 ] as const;
 
 export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
   const placeholders = TERMINAL_OVERSEER_ACTIONS.map(() => '?').join(', ');
   const result = await getDatabase().query<WorkflowRunRow>(
     `SELECT r.id, r.status, r.metadata, r.user_message, r.working_path,
+            r.workflow_name, r.codebase_id,
             c.name AS codebase_name
      FROM remote_agent_workflow_runs r
      LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
@@ -249,6 +257,7 @@ export async function getOverseerWatchRunById(runId: string): Promise<OverseerWa
   // run_context_unresolvable (bdc-harness #846: 141 skipped, 0 merged).
   const result = await getDatabase().query<WorkflowRunRow>(
     `SELECT r.id, r.status, r.metadata, r.user_message, r.working_path,
+            r.workflow_name, r.codebase_id,
             c.name AS codebase_name
      FROM remote_agent_workflow_runs r
      LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
@@ -256,6 +265,45 @@ export async function getOverseerWatchRunById(runId: string): Promise<OverseerWa
     [runId]
   );
   return result.rows[0] ? normalizeRun(result.rows[0]) : null;
+}
+
+export async function getOverseerWatchRunByWorkingPath(
+  workingPath: string
+): Promise<OverseerWatchRun | null> {
+  if (!workingPath.trim()) throw new Error('workingPath is required');
+  const result = await getDatabase().query<WorkflowRunRow>(
+    `SELECT r.id, r.status, r.metadata, r.user_message, r.working_path,
+            r.workflow_name, r.codebase_id, c.name AS codebase_name
+     FROM remote_agent_workflow_runs r
+     LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
+     WHERE r.working_path = $1
+     ORDER BY COALESCE(r.completed_at, r.last_activity_at, r.started_at) DESC
+     LIMIT 1`,
+    [workingPath]
+  );
+  return result.rows[0] ? normalizeRun(result.rows[0]) : null;
+}
+
+interface AttemptCountRow {
+  attempt_count: number | string;
+}
+
+/** Database-clock rolling window; callers cannot widen it by supplying a time. */
+export async function countOverseerAutomaticRecoveryAttempts(woId: string): Promise<number> {
+  if (!woId.trim()) throw new Error('woId is required');
+  const db = getDatabase();
+  const cutoff =
+    db.dialect === 'postgres'
+      ? "now() - interval '24 hours'"
+      : "strftime('%Y-%m-%dT%H:%M:%fZ','now','-24 hours')";
+  const result = await db.query<AttemptCountRow>(
+    `SELECT COUNT(*) AS attempt_count FROM overseer_actions
+     WHERE wo_id = $1 AND created_at >= ${cutoff}
+       AND ((action = 'repair_refire' AND result LIKE 'fired:%')
+         OR (action = 'repair_refire_refused' AND result LIKE 'indeterminate:%'))`,
+    [woId]
+  );
+  return Number(result.rows[0]?.attempt_count ?? 0);
 }
 
 interface OverseerEffectTimestampRow {

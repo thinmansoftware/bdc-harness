@@ -30,6 +30,8 @@ export type ErrorClass =
   | 'npm_not_found' // bun-only container, npm/npx/pnpm/yarn missing
   | 'verify_pre_existing' // verify-* failed on rot unrelated to WO diff
   | 'worktree_collision' // git: branch already used by another worktree
+  | 'bash_node_timeout'
+  | 'evidence_check_failed'
   // Failure Classes E-J (2026-07-17): six doctrine classes split into eight code values
   | 'scope_dirty_at_capture'
   | 'commit_blocked_no_authorization'
@@ -133,6 +135,14 @@ export function classifyError(input: ClassifyInput): ErrorClass {
   }
 
   // --- Workflow-runtime classes (BDC-specific, 2026-05-16) ---
+
+  if (/^Bash node '[^']+' timed out after \d+ms/.test(rawMessage)) {
+    return 'bash_node_timeout';
+  }
+
+  if (input.nodeId === 'manifest-evidence-check' || rawMessage.startsWith('EVIDENCE_ERROR:')) {
+    return 'evidence_check_failed';
+  }
 
   // Validator SDK contradiction: the Anthropic SDK returned isError=true +
   // errorSubtype='success' on a NON-loop node (e.g. war-council-validator), a
@@ -284,5 +294,51 @@ export function classifyError(input: ClassifyInput): ErrorClass {
     return 'invalid_request';
   }
 
+  return 'unknown';
+}
+
+export type EvidenceFailureSignal =
+  | 'spec_tests_line_defect'
+  | 'real_test_failure'
+  | 'grep_evidence'
+  | 'unknown';
+
+interface EvidenceEvent {
+  event_type: string;
+  step_name: string | null;
+  data: Record<string, unknown>;
+  created_at?: string;
+}
+
+/** Classify only the lane-owned run-stop-tests evidence; other event text is untrusted. */
+export function classifyEvidenceFailure(events: readonly EvidenceEvent[]): EvidenceFailureSignal {
+  const evidenceMessage = events
+    .filter(event => event.step_name === 'manifest-evidence-check')
+    .map(event => [event.data.error, event.data.message].find(value => typeof value === 'string'))
+    .find(value => typeof value === 'string');
+  if (typeof evidenceMessage === 'string' && /grep_status/i.test(evidenceMessage)) {
+    return 'grep_evidence';
+  }
+
+  const event = [...events]
+    .filter(event => event.event_type === 'node_completed' && event.step_name === 'run-stop-tests')
+    .sort((a, b) => (a.created_at ?? '').localeCompare(b.created_at ?? ''))
+    .at(-1);
+  const output = event?.data.node_output;
+  if (typeof output !== 'string') return 'unknown';
+  const fields = new Map<string, string>();
+  for (const line of output.split(/\r?\n/)) {
+    const match = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line);
+    if (match?.[1] !== undefined && match[2] !== undefined) fields.set(match[1], match[2]);
+  }
+  const status = fields.get('TESTS_STATUS');
+  const source = fields.get('TESTS_SOURCE');
+  if (status === 'no_command_declared' || status === 'counts_unparsed') {
+    return 'spec_tests_line_defect';
+  }
+  if (source !== undefined && !source.startsWith('spec_declared')) {
+    return 'spec_tests_line_defect';
+  }
+  if (source?.startsWith('spec_declared') && status === 'failed') return 'real_test_failure';
   return 'unknown';
 }

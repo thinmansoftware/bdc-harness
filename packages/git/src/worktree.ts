@@ -275,6 +275,19 @@ export async function removeWorktree(
   });
 }
 
+/** Force-remove a specifically resolved worktree after the caller has salvaged it. */
+export async function removeWorktreeForce(
+  repoPath: RepoPath,
+  worktreePath: WorktreePath
+): Promise<void> {
+  if (!resolve(worktreePath) || resolve(worktreePath) === resolve('/')) {
+    throw new Error('removeWorktreeForce requires an explicit worktree path');
+  }
+  await execFileAsync('git', ['-C', repoPath, 'worktree', 'remove', '--force', worktreePath], {
+    timeout: 30000,
+  });
+}
+
 /**
  * Get canonical repo path from a worktree path
  * If already canonical, returns the same path

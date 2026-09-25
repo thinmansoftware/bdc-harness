@@ -18,6 +18,8 @@ export interface OverseerRunRecord {
   /** Engine-written worktree path. Provenance anchor -- not agent-authored. */
   workingPath?: string;
   metadata?: Record<string, unknown>;
+  workflowName?: string;
+  codebaseId?: string;
 }
 
 export interface OverseerWorkflowEvent {
@@ -119,12 +121,21 @@ export interface WatchedRunRecord {
   /** Engine-written worktree path. Provenance anchor -- not agent-authored. */
   workingPath?: string;
   metadata?: Record<string, unknown>;
+  workflowName?: string;
+  codebaseId?: string;
   errorClass?: ErrorClass | 'tail_node_false_fail';
   action: 'success' | 'merge_ready' | 'escalate' | 'ignore';
   reason: string;
   prEvidence: PullRequestEvidence;
   decision?: DecisionResult;
   lastEvent?: OverseerWorkflowEvent;
+  recovery?: {
+    plan: 'refire' | 'operator_card' | 'none';
+    reason: string;
+    precondition?: 'release_terminal_worktree';
+    evidenceSource?: string;
+    evidenceStatus?: string;
+  };
 }
 
 export interface OverseerRunStoreDeps {

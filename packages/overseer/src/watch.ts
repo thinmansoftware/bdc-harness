@@ -1,7 +1,12 @@
 import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import { createLogger } from '@archon/paths';
-import { classifyError } from './classify';
+import {
+  classifyError,
+  classifyEvidenceFailure,
+  type EvidenceFailureSignal,
+  type ErrorClass,
+} from './classify';
 import { decide } from './decide';
 import { isPrMergeReady, isPrGreen, judgePullRequest } from './judge-pr';
 import {
@@ -129,7 +134,23 @@ export function recoverHeadBranchFromEvents(events: OverseerWorkflowEvent[]): st
   return branch;
 }
 
-async function assessRun(
+export function planRecovery(
+  errorClass: ErrorClass,
+  evidenceSubSignal: EvidenceFailureSignal = 'unknown'
+): NonNullable<WatchedRunRecord['recovery']> {
+  if (errorClass === 'loop_idle_timeout' || errorClass === 'bash_node_timeout') {
+    return { plan: 'refire', reason: errorClass };
+  }
+  if (errorClass === 'worktree_collision') {
+    return { plan: 'refire', reason: errorClass, precondition: 'release_terminal_worktree' };
+  }
+  if (errorClass === 'evidence_check_failed' && evidenceSubSignal === 'spec_tests_line_defect') {
+    return { plan: 'operator_card', reason: 'spec_tests_line_defect' };
+  }
+  return { plan: 'none', reason: evidenceSubSignal === 'unknown' ? errorClass : evidenceSubSignal };
+}
+
+export async function assessRun(
   run: OverseerRunRecord,
   deps: OverseerRunStoreDeps & GitHubClientDeps
 ): Promise<WatchedRunRecord> {
@@ -149,6 +170,8 @@ async function assessRun(
       headBranch: run.headBranch,
       workingPath: run.workingPath,
       metadata: run.metadata,
+      workflowName: run.workflowName,
+      codebaseId: run.codebaseId,
       action: 'success',
       reason: 'PR is already merged; judging run successful by PR evidence',
       prEvidence,
@@ -240,6 +263,21 @@ async function assessRun(
     nodeId: lastEvent?.step_name ?? undefined,
     woId: run.woId,
   });
+  const evidenceSignal =
+    errorClass === 'evidence_check_failed' ? classifyEvidenceFailure(events) : 'unknown';
+  const recovery = planRecovery(errorClass, evidenceSignal);
+  if (errorClass === 'evidence_check_failed') {
+    const output = [...events]
+      .filter(
+        event => event.event_type === 'node_completed' && event.step_name === 'run-stop-tests'
+      )
+      .sort((a, b) => (a.created_at ?? '').localeCompare(b.created_at ?? ''))
+      .at(-1)?.data.node_output;
+    if (typeof output === 'string') {
+      recovery.evidenceSource = /^TESTS_SOURCE=(.*)$/m.exec(output)?.[1];
+      recovery.evidenceStatus = /^TESTS_STATUS=(.*)$/m.exec(output)?.[1];
+    }
+  }
 
   return {
     runId: run.id,
@@ -250,12 +288,15 @@ async function assessRun(
     headBranch: run.headBranch,
     workingPath: run.workingPath,
     metadata: run.metadata,
+    workflowName: run.workflowName,
+    codebaseId: run.codebaseId,
     errorClass,
     action: 'escalate',
     reason: decision.reason,
     prEvidence,
     decision,
     lastEvent,
+    recovery,
   };
 }
 

@@ -78,6 +78,14 @@ import {
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import { createMergeManager } from '@archon/overseer/merge-manager';
 import { resolveDefaultDeps } from '@archon/overseer/service';
+import {
+  countOverseerAutomaticRecoveryAttempts,
+  getOverseerActionsForRun,
+} from '@archon/core/db/overseer';
+import { getOverseerCapabilityState } from '@archon/core/db/overseer-capabilities';
+import { createOverseerFireWorkflowRun } from './overseer-fire';
+import { executeAutomaticRefire } from '@archon/overseer/actions/automatic-refire';
+import { findLiveRunsForWo } from './routes/wo-fire-guard';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import { ingestCheckCompletionEvent } from '@archon/overseer/pr-review-check-ingest';
@@ -185,7 +193,7 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function startOverseerRuntimeWithRealMergeManager(): void {
+function startOverseerRuntimeWithRealMergeManager(port: number): void {
   const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
   const realAdapterRequested =
     !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) && token.length > 0;
@@ -195,8 +203,101 @@ function startOverseerRuntimeWithRealMergeManager(): void {
   }
   const deps = resolveDefaultDeps();
   const mergeManager = createMergeManager(deps);
+  const fireWorkflowRun = createOverseerFireWorkflowRun({
+    port,
+    operatorToken: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+  });
+  const automaticRefire = (
+    record: Parameters<typeof executeAutomaticRefire>[0],
+    events: Parameters<typeof executeAutomaticRefire>[1]
+  ) =>
+    executeAutomaticRefire(record, events, {
+      countAutomaticAttempts: countOverseerAutomaticRecoveryAttempts,
+      findLiveRunsForWo,
+      findConfirmedSuccessor: async runId => {
+        const row = (await getOverseerActionsForRun(runId)).find(
+          action =>
+            action.action === 'repair_refire' && action.result.startsWith('fired:successor:')
+        );
+        if (!row) return null;
+        const match = /^fired:successor:([^:]+):attempt:(\d+)/.exec(row.result);
+        return match?.[1] ? { runId: match[1], attempt: Number(match[2] ?? 1) } : null;
+      },
+      execute: async (failed, _events, attempt) => {
+        const capability = await getOverseerCapabilityState('repair');
+        const enabled = envEnabled(process.env.OVERSEER_REPAIR_ACTIONS_ENABLED);
+        if (envEnabled(process.env.OVERSEER_DRY_RUN)) {
+          return {
+            disposition: 'escalate',
+            outcome: 'denied',
+            successor_run_id: null,
+            predecessor_run_id: failed.runId,
+            external_effect_reference: null,
+            reason: 'legacy_dry_run',
+          };
+        }
+        if (!enabled || !capability?.action_enabled || capability.circuit_state !== 'closed') {
+          const reason = !enabled
+            ? 'capability_flag_disabled'
+            : !capability
+              ? 'capability_state_missing'
+              : capability.circuit_state !== 'closed'
+                ? 'circuit_open'
+                : 'capability_state_disabled';
+          return {
+            disposition: 'escalate',
+            outcome: 'denied',
+            successor_run_id: null,
+            predecessor_run_id: failed.runId,
+            external_effect_reference: null,
+            reason,
+          };
+        }
+        if (!failed.workflowName || !failed.repo) {
+          return {
+            disposition: 'escalate',
+            outcome: 'salvage_missing',
+            successor_run_id: null,
+            predecessor_run_id: failed.runId,
+            external_effect_reference: null,
+            reason: 'salvage_missing',
+          };
+        }
+        const fired = await fireWorkflowRun({
+          workflowName: failed.workflowName,
+          woId: failed.woId,
+          project: failed.repo,
+          predecessorRunId: failed.runId,
+        });
+        if (!fired.ok) {
+          return {
+            disposition: attempt === 1 ? 'refire_first' : 'refire_later',
+            outcome: 'failed',
+            successor_run_id: null,
+            predecessor_run_id: failed.runId,
+            external_effect_reference: null,
+            reason: `fire_failed:${fired.error}`,
+          };
+        }
+        return {
+          disposition: attempt === 1 ? 'refire_first' : 'refire_later',
+          outcome: 'succeeded',
+          successor_run_id: fired.runId,
+          predecessor_run_id: failed.runId,
+          external_effect_reference: fired.conversationId,
+          reason: 'fired',
+        };
+      },
+    });
   startOverseerRuntime({
-    serviceOptions: { deps, mergeCoordinator: mergeManager, mergeBridgeEnabled: true },
+    serviceOptions: {
+      deps,
+      mergeCoordinator: mergeManager,
+      mergeBridgeEnabled: true,
+      fireWorkflowRun,
+      countAutomaticAttempts: countOverseerAutomaticRecoveryAttempts,
+      executeAutomaticRefire: automaticRefire,
+    },
   });
 }
 
@@ -288,8 +389,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().fatal({ err: error }, 'startup_running_reconciliation_failed');
     process.exit(1);
   }
-
-  startOverseerRuntimeWithRealMergeManager();
 
   const config = await loadConfig();
   logConfig(config);
@@ -796,6 +895,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     idleTimeout: 255, // Max value (seconds) - prevents SSE connections from being killed
   });
   getLog().info({ port: server.port, hostname }, 'server_listening');
+  startOverseerRuntimeWithRealMergeManager(server.port ?? port);
   startDispatchEscalationClock();
 
   // Initialize Telegram adapter (conditional, skipped in CLI serve mode)
