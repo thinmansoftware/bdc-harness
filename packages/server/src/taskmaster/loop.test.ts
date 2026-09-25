@@ -949,6 +949,79 @@ describe('fire_cauldron loop', () => {
     }
   });
 
+  test('terminal drain-deferred after a running admission journals deferred without an expectation', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const item: ListedThread = {
+        ref: 'gh:thinmansoftware/bdc-harness#902',
+        priority: 'P1',
+        lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
+        isUnclaimed: true,
+        recipient: 'xo',
+        title: 'WO-HARNESS-EXAMPLE-01 post-admission drain',
+      };
+      let releaseTerminal: (record: { cascadeId: string; status: string }) => void = () => {};
+      const terminal = new Promise<{ cascadeId: string; status: string }>(resolve => {
+        releaseTerminal = resolve;
+      });
+      let markAdmitted: () => void = () => {};
+      const admissionSeen = new Promise<void>(resolve => {
+        markAdmitted = resolve;
+      });
+      const registered: Array<{ dispatch_ref: string }> = [];
+      const deps = makeDeps(world, {
+        listUndeliveredRulings: async () => [],
+        listThreads: async () => [item],
+        checkFireEligibility: async () => ({
+          eligible: true,
+          evidence: {
+            woId: 'WO-HARNESS-EXAMPLE-01',
+            targetRepo: 'thinmansoftware/bdc-harness',
+            project: 'bdc-harness',
+            specVerifiedAt: new Date(T0).toISOString(),
+            noOpenOrMergedPr: true,
+            expectedSpec: EXPECTED_SPEC,
+          },
+        }),
+        runCascade: (async options => {
+          const running = { cascadeId: 'cascade-902', status: 'running' };
+          options.onAdmission?.(running as never, true);
+          markAdmitted();
+          return terminal;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      deps.db = {
+        ...deps.db!,
+        registerExpectation: async data => {
+          registered.push(data);
+          return 'expectation-should-not-exist';
+        },
+      };
+      const state = createTaskmasterState(60_000);
+      const tickPromise = tick(state, deps);
+      await admissionSeen;
+      const pending = world.journal.filter(row => row.action_type === 'fire_cauldron');
+      expect(pending.some(row => row.outcome === 'sent')).toBe(false);
+      expect(registered).toHaveLength(0);
+      releaseTerminal({ cascadeId: 'cascade-902', status: 'drain-deferred' });
+      const result = await tickPromise;
+      const fires = world.journal.filter(row => row.action_type === 'fire_cauldron');
+      expect(fires).toHaveLength(1);
+      expect(fires[0]?.outcome).toBe('deferred');
+      expect(fires[0]?.proposal_json).toContain('"deferred_reason":"cauldron_draining"');
+      expect(fires[0]?.proposal_json).toContain('cascade-902');
+      expect(registered).toHaveLength(0);
+      expect(result.deferred).toBe(1);
+      expect(result.effects).toBe(0);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
   test('hold-labeled unclaimed work is refused fire even when its blocker names a seat', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';

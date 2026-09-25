@@ -1854,8 +1854,13 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             'taskmaster.fire_cascade_failed'
           );
         });
-        const admitted = await admission;
-        if (admitted.status === 'drain-deferred') {
+        // onAdmission runs before the lane fire, while the record is still
+        // `running`. Drain refusal is applied later and only the settled
+        // cascade result carries `drain-deferred`. Journal from that result
+        // so a post-admission drain does not become `sent` plus an expectation.
+        await admission;
+        const settled = await cascadePromise;
+        if (settled.status === 'drain-deferred') {
           result.deferred += 1;
           await dal.updateActionOutcome(
             journalRow.id,
@@ -1864,7 +1869,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
               ...proposal,
               deferred: true,
               deferred_reason: 'cauldron_draining',
-              cascadeId: admitted.cascadeId,
+              cascadeId: settled.cascadeId,
             })
           );
           journalRow.outcome = 'deferred';
@@ -1878,7 +1883,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           // SAME expectation rather than registering a second one with
           // different retry/escalation keys.
           action_ref: journalRow.id,
-          dispatch_ref: admitted.cascadeId,
+          dispatch_ref: settled.cascadeId,
           recipient: proposal.recipient,
           // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching on
           // the admission row's existence alone is not evidence of anything:
@@ -1888,7 +1893,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           evidence_json: JSON.stringify({
             kind: 'db_row_exists',
             table: 'remote_agent_workflow_runs',
-            where: { id: admitted.cascadeId, status: CASCADE_SUCCESS_STATUSES },
+            where: { id: settled.cascadeId, status: CASCADE_SUCCESS_STATUSES },
           }),
           due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
           on_absence: 'escalate',
@@ -1897,7 +1902,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         await dal.updateActionOutcome(
           journalRow.id,
           'sent',
-          JSON.stringify({ ...proposal, cascadeId: admitted.cascadeId, runId: admitted.cascadeId })
+          JSON.stringify({ ...proposal, cascadeId: settled.cascadeId, runId: settled.cascadeId })
         );
       } else {
         const dispatched = await createTask(
