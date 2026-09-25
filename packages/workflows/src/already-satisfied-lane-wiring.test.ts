@@ -26,13 +26,32 @@ const ALL_GATE_FILES = readdirSync(LANES_DIR)
 
 const LANE_FILES = ALL_GATE_FILES.filter(file => file.startsWith('bdc-feature-development'));
 
-async function runGateScript(script: string, checkOutput: string) {
+const NONE_REPAIR = 'REPAIR_TARGET=none';
+
+const REPAIR_RECORD = [
+  'REPAIR_TARGET=#977',
+  'REPAIR_TARGET_BRANCH=feat/wo-harness-overseer-run-identity-01-thread-6d7729a4',
+  'REPAIR_TARGET_LEASE_SHA=5b847195ff458df7710eb565f53cc2334f95ddc4',
+].join('\n');
+
+const REPAIR_JSON = {
+  ALREADY_SATISFIED: false,
+  PRECHECK_VERDICT: 'repair-in-place',
+  REPAIR_TARGET: '#977',
+};
+
+async function runGateScript(
+  script: string,
+  checkOutput: string,
+  checkoutOutput: string = NONE_REPAIR
+) {
   // Mirror the production executor's bash-node substitution (see
   // dag-executor.ts substituteNodeOutputRefs with escapedForBash=true). A naive
   // String.prototype.replace here would hide the shellQuote wrapping that broke
   // the previous heredoc-based gate at runtime.
   const nodeOutputs = new Map([
     ['check-already-satisfied', { state: 'completed' as const, output: checkOutput }],
+    ['checkout-repair-target', { state: 'completed' as const, output: checkoutOutput }],
   ]);
   const rendered = substituteNodeOutputRefs(script, nodeOutputs, true);
   const proc = Bun.spawn(['bash', '-c', rendered], {
@@ -123,6 +142,50 @@ describe('already-satisfied lane wiring', () => {
       expect(node('assert-implement-produced-work')?.bash).toContain(
         'BUILD_OUTCOME=ALREADY_SATISFIED'
       );
+
+      const gate = node('gate-already-satisfied');
+      expect(gate?.depends_on).toContain('checkout-repair-target');
+      expect(gate?.bash).toContain('$checkout-repair-target.output');
+    });
+
+    it(`${file} repair record overrides a satisfied precheck`, async () => {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
+      const gate = result.workflow.nodes.find(node => node.id === 'gate-already-satisfied');
+      const ran = await runGateScript(
+        gate?.bash ?? '',
+        ['ALREADY_SATISFIED=true', 'SATISFIED_EVIDENCE=already present'].join('\n'),
+        REPAIR_RECORD
+      );
+      expect(ran.exitCode).toBe(0);
+      const lines = ran.stdout.split('\n').filter(line => line.length > 0);
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0] ?? '')).toEqual(REPAIR_JSON);
+    });
+
+    it(`${file} repair record overrides a needs-build precheck`, async () => {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
+      const gate = result.workflow.nodes.find(node => node.id === 'gate-already-satisfied');
+      const ran = await runGateScript(gate?.bash ?? '', 'ALREADY_SATISFIED=false', REPAIR_RECORD);
+      expect(ran.exitCode).toBe(0);
+      const lines = ran.stdout.split('\n').filter(line => line.length > 0);
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0] ?? '')).toEqual(REPAIR_JSON);
+    });
+
+    it(`${file} repair short-circuit is idempotent`, async () => {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
+      const gate = result.workflow.nodes.find(node => node.id === 'gate-already-satisfied');
+      const first = await runGateScript(gate?.bash ?? '', 'ALREADY_SATISFIED=true', REPAIR_RECORD);
+      const second = await runGateScript(gate?.bash ?? '', 'ALREADY_SATISFIED=true', REPAIR_RECORD);
+      expect(first.exitCode).toBe(0);
+      expect(second.stdout).toBe(first.stdout);
+      expect(JSON.parse(first.stdout)).toEqual(REPAIR_JSON);
     });
 
     it(`${file} emits exactly one JSON document from gate-already-satisfied stdout`, async () => {
