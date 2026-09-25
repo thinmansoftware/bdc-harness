@@ -98,7 +98,7 @@ function createOctokitMock(overrides: Partial<RealGitHubOctokitLike> = {}): Real
 }
 
 describe('real GitHub deps', () => {
-  test('finds a pull request by head branch and summarizes check runs', async () => {
+  test('finds a pull request by head branch, records WO siblings, and summarizes check runs', async () => {
     const list = mock(async () => ({
       data: [
         {
@@ -110,9 +110,42 @@ describe('real GitHub deps', () => {
         },
       ],
     }));
-    const search = mock(async () => ({ data: { items: [] } }));
+    const search = mock(async () => ({
+      data: { items: [{ number: 99, pull_request: {} }] },
+    }));
+    const get = mock(async (input: Record<string, unknown>) => {
+      const number = Number(input.pull_number);
+      if (number === 99) {
+        return {
+          data: {
+            number: 99,
+            title: 'WO-42 sibling',
+            state: 'open',
+            mergeable: true,
+            html_url: 'https://github.test/pull/99',
+            changed_files: 1,
+            head: { sha: 'c'.repeat(40), ref: 'archon/task-web-worker-sibling' },
+            user: { login: 'builder' },
+            created_at: '2026-09-25T00:30:00Z',
+          },
+        };
+      }
+      return {
+        data: {
+          number: 42,
+          title: 'WO-42 real merge',
+          state: 'open',
+          mergeable: true,
+          html_url: 'https://github.test/pull/42',
+          changed_files: 3,
+          head: { sha: 'a'.repeat(40), ref: 'fix/wo-42' },
+          user: { login: 'builder' },
+          created_at: '2026-09-25T01:00:00Z',
+        },
+      };
+    });
     const octokit = createOctokitMock({
-      pulls: { ...createOctokitMock().pulls, list },
+      pulls: { ...createOctokitMock().pulls, list, get },
       search: { issuesAndPullRequests: search },
       checks: {
         listForRef: async () => ({
@@ -142,12 +175,22 @@ describe('real GitHub deps', () => {
       state: 'all',
       per_page: 5,
     });
-    expect(search).not.toHaveBeenCalled();
+    expect(search).toHaveBeenCalledWith({
+      q: 'repo:thinmansoftware/bdc-harness is:pr is:open "WO-42"',
+      per_page: 5,
+    });
     expect(result).toMatchObject({
       exists: true,
       state: 'open',
       checks: { total: 4, passed: 2, failed: 1, pending: 1 },
       pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
+      otherOpenPrsForWo: [
+        {
+          number: 99,
+          headRef: 'archon/task-web-worker-sibling',
+          createdAt: '2026-09-25T00:30:00Z',
+        },
+      ],
     });
   });
 
