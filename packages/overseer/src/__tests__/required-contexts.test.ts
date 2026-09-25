@@ -23,6 +23,7 @@ import {
   parseRequiredContextsOverride,
   peekRequiredContextsAttempts,
   requiredContextsAttemptCounterSize,
+  requiredContextsSharedMissSizeForTests,
   resetRequiredContextsAttemptCounters,
   resetRequiredContextsCache,
   resetRequiredContextsSourceLog,
@@ -1148,6 +1149,28 @@ describe('resolveRequiredContexts -- lookup cache (#993)', () => {
     expect(appCalls).toBe(1);
     expect(first.state).toBe('known');
     expect(second).toEqual(first);
+  });
+
+  test('48 one thousand distinct failing keys leave the shared-miss map at the ceiling', async () => {
+    resetRequiredContextsCache();
+    for (let index = 0; index < 1000; index += 1) {
+      const resolution = await resolveRequiredContexts(
+        baseInput({
+          owner: `owner-${index}`,
+          repo: `repo-${index}`,
+          baseRef: `base-${index}`,
+          fetchWithAppClient: async () => {
+            throw maskedNotFoundError();
+          },
+        }),
+        {}
+      );
+      expect(resolution.state).toBe('unknown');
+    }
+    expect(requiredContextsSharedMissSizeForTests()).toBeLessThanOrEqual(
+      REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES
+    );
+    expect(requiredContextsSharedMissSizeForTests()).toBeGreaterThan(0);
   });
 });
 

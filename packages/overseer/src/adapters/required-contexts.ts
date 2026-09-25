@@ -413,11 +413,25 @@ let requiredContextsCacheTouchSeq = 0;
  */
 const requiredContextsInflight = new Map<string, Promise<void>>();
 
-/** Why the in-flight lookup failed, so a waiter counts its own head with the same reason. */
-const requiredContextsSharedMiss = new Map<
-  string,
-  { reason: string; failureKind: RequiredContextsFailureKind }
->();
+/**
+ * Why an in-flight lookup failed, so a waiter counts its own head with the same
+ * reason. Retained after the lookup settles so joined callers can still read it,
+ * but only for REQUIRED_CONTEXTS_CACHE_TTL_MS and only up to
+ * REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES. A distinct failing owner/repo/base used
+ * to stay forever, because deletion happened only on a later success.
+ */
+interface RequiredContextsSharedMissEntry {
+  reason: string;
+  failureKind: RequiredContextsFailureKind;
+  expiresAt: number;
+  touchedAt: number;
+  touchSeq: number;
+}
+
+const requiredContextsSharedMiss = new Map<string, RequiredContextsSharedMissEntry>();
+
+/** Monotonic tie-break for shared-miss eviction. Independent of the result cache. */
+let requiredContextsSharedMissTouchSeq = 0;
 
 /**
  * Plan amendment for WO-HARNESS-REQUIRED-CONTEXTS-CACHE-01.
@@ -434,6 +448,83 @@ export function resetRequiredContextsCache(): void {
   requiredContextsCacheTouchSeq = 0;
   requiredContextsInflight.clear();
   requiredContextsSharedMiss.clear();
+  requiredContextsSharedMissTouchSeq = 0;
+}
+
+function nextSharedMissTouch(now: number): { touchedAt: number; touchSeq: number } {
+  requiredContextsSharedMissTouchSeq += 1;
+  return { touchedAt: now, touchSeq: requiredContextsSharedMissTouchSeq };
+}
+
+/** Drop shared-miss entries whose TTL has elapsed. Does not apply the ceiling. */
+function pruneExpiredRequiredContextsSharedMiss(now: number): void {
+  for (const [key, entry] of requiredContextsSharedMiss) {
+    if (now >= entry.expiresAt) requiredContextsSharedMiss.delete(key);
+  }
+}
+
+/**
+ * Drop expired shared-miss entries, then evict oldest-touched survivors until
+ * the map fits. When `incomingKey` is new, leave one free slot so the write
+ * that follows stays inside REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES.
+ */
+function pruneRequiredContextsSharedMiss(now: number, incomingKey?: string): void {
+  pruneExpiredRequiredContextsSharedMiss(now);
+  const updatingExisting = incomingKey !== undefined && requiredContextsSharedMiss.has(incomingKey);
+  const budget =
+    incomingKey === undefined || updatingExisting
+      ? REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES
+      : REQUIRED_CONTEXTS_CACHE_MAX_ENTRIES - 1;
+  if (requiredContextsSharedMiss.size <= budget) return;
+  const oldestFirst = [...requiredContextsSharedMiss.entries()].sort(
+    (a, b) => a[1].touchedAt - b[1].touchedAt || a[1].touchSeq - b[1].touchSeq
+  );
+  const excess = requiredContextsSharedMiss.size - budget;
+  for (let index = 0; index < excess; index += 1) {
+    const oldest = oldestFirst[index];
+    if (oldest) requiredContextsSharedMiss.delete(oldest[0]);
+  }
+}
+
+function rememberSharedMiss(
+  key: string,
+  reason: string,
+  failureKind: RequiredContextsFailureKind,
+  now: number
+): void {
+  pruneRequiredContextsSharedMiss(now, key);
+  requiredContextsSharedMiss.set(key, {
+    reason,
+    failureKind,
+    expiresAt: now + REQUIRED_CONTEXTS_CACHE_TTL_MS,
+    ...nextSharedMissTouch(now),
+  });
+}
+
+/**
+ * Fresh shared failure for a joined caller. Expired entries are not returned.
+ * A hit refreshes recency so oldest-touched eviction prefers idle keys.
+ */
+function readFreshSharedMiss(
+  key: string,
+  now: number
+): { reason: string; failureKind: RequiredContextsFailureKind } | undefined {
+  pruneExpiredRequiredContextsSharedMiss(now);
+  const entry = requiredContextsSharedMiss.get(key);
+  if (!entry) return undefined;
+  const touch = nextSharedMissTouch(now);
+  entry.touchedAt = touch.touchedAt;
+  entry.touchSeq = touch.touchSeq;
+  return { reason: entry.reason, failureKind: entry.failureKind };
+}
+
+/**
+ * Test-only. Effective shared-miss footprint after expiry pruning. The ceiling
+ * is not applied here, so a test can prove insertions themselves stay bounded.
+ */
+export function requiredContextsSharedMissSizeForTests(): number {
+  pruneExpiredRequiredContextsSharedMiss(Date.now());
+  return requiredContextsSharedMiss.size;
 }
 
 function nextCacheTouch(now: number): { touchedAt: number; touchSeq: number } {
@@ -784,7 +875,7 @@ async function settleSharedLookup(
   if (hasActiveRateLimitBackoff(key, settledAt)) {
     return rateLimitBackoffUnknown(key, counterKey.headSha);
   }
-  const miss = requiredContextsSharedMiss.get(key);
+  const miss = readFreshSharedMiss(key, settledAt);
   return deferOrBlock(
     counterKey,
     miss?.reason ?? 'lookup_failed',
@@ -905,7 +996,7 @@ async function lookupRequiredContexts(
     return resolution;
   }
 
-  requiredContextsSharedMiss.set(key, { reason: lastReason, failureKind });
+  rememberSharedMiss(key, lastReason, failureKind, Date.now());
   return deferOrBlock(counterKey, lastReason, failureKind, env, store);
 }
 
