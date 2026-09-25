@@ -133,9 +133,7 @@ describe('substituteWorkflowVariables', () => {
       ['$LOOP_PREV_OUTPUT', 'previous output'],
     ] as const;
     const source = variables.flatMap(([name]) => [name, `${name}_SUFFIX`]).join(' | ');
-    const expected = variables
-      .flatMap(([name, value]) => [value, `${name}_SUFFIX`])
-      .join(' | ');
+    const expected = variables.flatMap(([name, value]) => [value, `${name}_SUFFIX`]).join(' | ');
 
     const { prompt } = substituteWorkflowVariables(
       source,
