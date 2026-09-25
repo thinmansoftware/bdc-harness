@@ -1042,6 +1042,125 @@ describe('fire_cauldron loop', () => {
     }
   });
 
+  test('accepted tier that later drain-defers on climb journals deferred', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const item: ListedThread = {
+        ref: 'gh:thinmansoftware/bdc-harness#903',
+        priority: 'P1',
+        lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
+        isUnclaimed: true,
+        recipient: 'xo',
+        title: 'WO-HARNESS-EXAMPLE-01 climb drain',
+      };
+      const expectations: { id: string; dispatchRef: string }[] = [];
+      const givenUp: { id: string; reason: string }[] = [];
+      let fires = 0;
+      let cascadeDone: Promise<unknown> = Promise.resolve();
+      const deps = makeDeps(world, {
+        listUndeliveredRulings: async () => [],
+        listThreads: async () => [item],
+        checkFireEligibility: async () => ({
+          eligible: true,
+          evidence: {
+            woId: 'WO-HARNESS-EXAMPLE-01',
+            targetRepo: 'thinmansoftware/bdc-harness',
+            project: 'bdc-harness',
+            specVerifiedAt: new Date(T0).toISOString(),
+            noOpenOrMergedPr: true,
+            expectedSpec: EXPECTED_SPEC,
+          },
+        }),
+        getCauldronDrainState: async () =>
+          ({ mode: 'normal', activeLeaseCount: 0, activeRunCount: 0 }) as never,
+        runCascade: (async options => {
+          const pending = realRunCascade({
+            ...options,
+            allowClaimed: true,
+            entryOverride: 'codex',
+            deps: {
+              findWoClaim: async () => null,
+              acquireWoLock: async (woId, project, cascadeId) => ({
+                acquired: true,
+                path: 'in-memory-test-lock',
+                record: {
+                  woId,
+                  project,
+                  cascadeId,
+                  status: 'running',
+                  createdAt: new Date(0).toISOString(),
+                  updatedAt: new Date(0).toISOString(),
+                },
+              }),
+              releaseWoLock: async () => {},
+              writeRecord: async wrote => `/tmp/cascade-record-${wrote.cascadeId}.json`,
+              fetchNodeTimeouts: async () => ({}),
+              escalate: async () => undefined,
+              poll: async () => ({
+                runId: 'run-tier-1',
+                terminalStatus: 'failed' as const,
+                validatorVerdict: 'unknown' as const,
+                prUrl: null,
+                prMergeable: null,
+                servedModelId: null,
+                rawMetadata: {},
+              }),
+              fire: async () => {
+                fires += 1;
+                if (fires === 1) {
+                  return {
+                    ok: true,
+                    runId: 'run-tier-1',
+                    conversationId: null,
+                    infraError: null,
+                  };
+                }
+                return {
+                  ok: false,
+                  runId: null,
+                  conversationId: null,
+                  infraError: 'HTTP 503: {"code":"cauldron_draining"}',
+                  drainRefused: true,
+                };
+              },
+            },
+          });
+          cascadeDone = pending;
+          return pending;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      deps.db = {
+        ...deps.db!,
+        registerExpectation: async data => {
+          const id = `expectation-${expectations.length + 1}`;
+          expectations.push({ id, dispatchRef: data.dispatch_ref });
+          return id;
+        },
+        markGivenUp: async (id, reason) => {
+          givenUp.push({ id, reason });
+          return true;
+        },
+      };
+      const result = await tick(createTaskmasterState(60_000), deps);
+      await cascadeDone;
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      const firesJournal = world.journal.filter(row => row.action_type === 'fire_cauldron');
+      expect(fires).toBe(2);
+      expect(firesJournal).toHaveLength(1);
+      expect(firesJournal[0]?.outcome).toBe('deferred');
+      expect(firesJournal[0]?.proposal_json).toContain('"deferred_reason":"cauldron_draining"');
+      expect(expectations).toHaveLength(1);
+      expect(givenUp).toEqual([{ id: 'expectation-1', reason: 'cauldron_draining' }]);
+      expect(result.effects).toBe(1);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
   test('hold-labeled unclaimed work is refused fire even when its blocker names a seat', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
