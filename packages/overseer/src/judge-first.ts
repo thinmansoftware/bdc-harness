@@ -229,7 +229,7 @@ export function buildJudgePrompt(envelope: JudgeEvidenceEnvelope): string {
     'duplicate_work when the evidence shows this WO already has an equivalent open PR;',
     'needs_human when evidence conflicts or the failure shape is unrecognized;',
     'A PR whose headRef starts with "archon/task-" and whose createdAt falls inside',
-    'runWindow (startedAt through endedAt, inclusive) is that run\'s builder-created',
+    "runWindow (startedAt through endedAt, inclusive) is that run's builder-created",
     'pre-review byproduct, never duplicate_work. If either runWindow bound is null,',
     'do not treat createdAt as during the run.',
     'A completed run whose own PR exists and whose event tail contains no failed node',
