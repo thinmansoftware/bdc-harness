@@ -419,7 +419,16 @@ const requiredContextsSharedMiss = new Map<
   { reason: string; failureKind: RequiredContextsFailureKind }
 >();
 
-/** Test seam: drop cached resolutions and rate-limit back-offs. Attempt counters stay. */
+/**
+ * Plan amendment for WO-HARNESS-REQUIRED-CONTEXTS-CACHE-01.
+ * Files modified: packages/overseer/src/adapters/required-contexts.ts,
+ * packages/overseer/src/__tests__/required-contexts.test.ts,
+ * packages/overseer/src/__tests__/required-contexts-durability.test.ts.
+ * The durability file may call resetRequiredContextsCache so a cached success
+ * does not hide the durable attempt counter (Stop 2). No other edits there.
+ *
+ * Test seam: drop cached resolutions and rate-limit back-offs. Attempt counters stay.
+ */
 export function resetRequiredContextsCache(): void {
   requiredContextsCache.clear();
   requiredContextsCacheTouchSeq = 0;
