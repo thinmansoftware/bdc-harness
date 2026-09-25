@@ -8,6 +8,7 @@ import {
   claimDueDeliveryJob,
   closeDatabase,
   completeDeliveryJob,
+  getDatabase,
   getOperatorCard,
   listMessages,
   resetDatabase,
@@ -23,7 +24,7 @@ import {
   runDueOperatorCardDeliveries,
   type OperatorCardChannel,
 } from '../escalation-delivery';
-import { lookupNotionPageId, runEscalation } from '../escalate';
+import { runEscalation } from '../escalate';
 
 const identity: ActionableEventIdentity = {
   identity_version: 'overseer-actionable-event-v1',
@@ -156,22 +157,20 @@ describe('durable operator-card delivery', () => {
   test('survives restart and succeeds only on the fixed third attempt', async () => {
     const cardId = await persistCard();
     const calls: string[] = [];
-    const channels: OperatorCardChannel[] = ['builder_monitor', 'dispatch', 'notion'].map(
-      channel => ({
-        channel: channel as OperatorCardChannel['channel'],
-        deliver: async (_card, key) => {
-          calls.push(`${channel}:${key}`);
-          if (
-            channel === 'dispatch' &&
-            calls.filter(value => value.startsWith('dispatch:')).length < 3
-          ) {
-            return { outcome: 'transient_failure' as const, sanitized_status: 'retryable' };
-          }
-          return { outcome: 'succeeded' as const, sanitized_status: 'delivered' };
-        },
-        reconcile: async () => ({ outcome: 'indeterminate', sanitized_status: 'unknown' }),
-      })
-    );
+    const channels: OperatorCardChannel[] = ['builder_monitor', 'dispatch'].map(channel => ({
+      channel: channel as OperatorCardChannel['channel'],
+      deliver: async (_card, key) => {
+        calls.push(`${channel}:${key}`);
+        if (
+          channel === 'dispatch' &&
+          calls.filter(value => value.startsWith('dispatch:')).length < 3
+        ) {
+          return { outcome: 'transient_failure' as const, sanitized_status: 'retryable' };
+        }
+        return { outcome: 'succeeded' as const, sanitized_status: 'delivered' };
+      },
+      reconcile: async () => ({ outcome: 'indeterminate', sanitized_status: 'unknown' }),
+    }));
 
     await runDueOperatorCardDeliveries({
       channels,
@@ -202,7 +201,7 @@ describe('durable operator-card delivery', () => {
     expect(view?.receipts.filter(receipt => receipt.channel === 'dispatch')).toHaveLength(6);
     expect(
       view?.receipts.map(receipt => receipt.phase).filter(phase => phase === 'started')
-    ).toHaveLength(5);
+    ).toHaveLength(4);
   });
 
   test('reconciles an expired STARTED attempt to indeterminate without blind delivery', async () => {
@@ -501,56 +500,6 @@ describe('durable operator-card delivery', () => {
   });
 });
 
-describe('Notion WO lookup', () => {
-  const originalFetch = globalThis.fetch;
-
-  afterEach(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  test('queries separate candidates in frozen order and returns first success', async () => {
-    const queried: string[] = [];
-    globalThis.fetch = mock(async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
-      queried.push(body.filter.property);
-      if (body.filter.property === 'Name') {
-        return Response.json({ results: [{ id: 'page-1' }] });
-      }
-      return new Response('unknown property', { status: 400 });
-    }) as typeof fetch;
-
-    expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBe('page-1');
-    expect(queried).toEqual(['Task', 'WO ID', 'Name']);
-  });
-
-  test('resolves on the "Task" title property as the first candidate', async () => {
-    const queried: string[] = [];
-    globalThis.fetch = mock(async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
-      queried.push(body.filter.property);
-      if (body.filter.property === 'Task') {
-        return Response.json({ results: [{ id: 'task-page' }] });
-      }
-      return new Response('unknown property', { status: 400 });
-    }) as typeof fetch;
-
-    expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBe('task-page');
-    expect(queried).toEqual(['Task']);
-  });
-
-  test('fails soft after all candidate queries fail', async () => {
-    const queried: string[] = [];
-    globalThis.fetch = mock(async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
-      queried.push(body.filter.property);
-      return new Response('unknown property', { status: 400 });
-    }) as typeof fetch;
-
-    expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBeNull();
-    expect(queried).toEqual(['Task', 'WO ID', 'Name', 'Title', 'WO_ID']);
-  });
-});
-
 describe('default informational channel adapters', () => {
   let home = '';
   const oldHome = process.env.ARCHON_HOME;
@@ -688,59 +637,152 @@ describe('default informational channel adapters', () => {
     }
   });
 
-  test('default Notion adapter uses injected fetch for lookup and comment', async () => {
-    const view = await defaultCardView();
-    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
-    const injected = mock(async (input: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      calls.push({ url: String(input), body });
-      return String(input).includes('/query')
-        ? Response.json({ results: [{ id: 'notion-page-1' }] })
-        : new Response('ok', { status: 200 });
+  test('no-notion-network: default channels are dispatch and builder_monitor only', async () => {
+    const urls: string[] = [];
+    const injected = mock(async (input: string | URL | Request) => {
+      urls.push(String(input));
+      return new Response('ok', { status: 200 });
     }) as typeof fetch;
-    const notion = createDefaultOperatorCardChannels({
+    const channels = createDefaultOperatorCardChannels({
       fetch: injected,
-      notion_api_key: 'test-notion-key',
-      notion_database_id: 'notion-db-1',
-    }).find(channel => channel.channel === 'notion');
-    if (!notion) throw new Error('notion_channel_missing');
-    const result = await notion.deliver(view, 'unused');
-    expect(result.outcome).toBe('succeeded');
-    expect(calls).toHaveLength(2);
-    expect(calls[0]?.body).toMatchObject({ filter: { property: 'Task' } });
-    expect(calls[1]?.body).toMatchObject({ parent: { page_id: 'notion-page-1' } });
+      resolve_owner: async () => 'operator',
+    });
+    expect(channels.map(channel => channel.channel).sort()).toEqual([
+      'builder_monitor',
+      'dispatch',
+    ]);
+    const view = await defaultCardView();
+    await runDueOperatorCardDeliveries({
+      channels,
+      owner: 'no-notion-runner',
+      now: new Date(Date.now() + 1_000).toISOString(),
+    });
+    expect(urls.some(url => url.includes('api.notion.com'))).toBe(false);
+    const delivered = await getOperatorCard(view.card.card_id);
+    expect(delivered?.jobs.map(job => job.channel).sort()).toEqual(['builder_monitor', 'dispatch']);
   });
 
-  test('default Notion adapter retries only 429 and treats comment 5xx as indeterminate', async () => {
+  test('leftover-notion-job-retired closes the legacy job and continues', async () => {
     const view = await defaultCardView();
-    for (const [status, outcome] of [
-      [401, 'permanent_failure'],
-      [422, 'permanent_failure'],
-      [429, 'transient_failure'],
-      [500, 'indeterminate'],
-      [503, 'indeterminate'],
-    ] as const) {
-      const injected = mock(async (input: string | URL | Request) =>
-        String(input).includes('/query')
-          ? Response.json({ results: [{ id: 'notion-page-1' }] })
-          : new Response('failure', { status })
-      ) as typeof fetch;
-      const notion = createDefaultOperatorCardChannels({
-        fetch: injected,
-        notion_api_key: 'test-notion-key',
-      }).find(channel => channel.channel === 'notion');
-      if (!notion) throw new Error('notion_channel_missing');
-      expect((await notion.deliver(view, 'unused')).outcome).toBe(outcome);
-    }
+    const dueAt = view.card.created_at;
+    await getDatabase().query(
+      `INSERT INTO overseer_operator_card_delivery_jobs (
+        card_id, channel, state, attempts_started, next_attempt_at, fencing_token, updated_at
+      ) VALUES ($1, 'notion', 'pending', 0, $2, 0, $2)`,
+      [view.card.card_id, dueAt]
+    );
+    const delivered: string[] = [];
+    const channels: OperatorCardChannel[] = ['builder_monitor', 'dispatch'].map(channel => ({
+      channel,
+      deliver: async () => {
+        delivered.push(channel);
+        return { outcome: 'succeeded' as const, sanitized_status: 'delivered' };
+      },
+      reconcile: async () => ({ outcome: 'indeterminate' as const, sanitized_status: 'unknown' }),
+    }));
+    const injected = mock(async () => {
+      throw new Error('network_must_not_be_called');
+    }) as typeof fetch;
+    globalThis.fetch = injected;
+
+    const completed = await runDueOperatorCardDeliveries({
+      channels,
+      owner: 'retire-runner',
+      now: dueAt,
+    });
+
+    expect(completed.map(job => job.channel).sort()).toEqual([
+      'builder_monitor',
+      'dispatch',
+      'notion',
+    ]);
+    const after = await getOperatorCard(view.card.card_id);
+    const notionJob = after?.jobs.find(job => job.channel === 'notion');
+    const notionReceipts = after?.receipts.filter(receipt => receipt.channel === 'notion') ?? [];
+    expect(notionJob?.state).toBe('exhausted');
+    expect(notionReceipts).toHaveLength(1);
+    expect(notionReceipts[0]).toMatchObject({
+      phase: 'terminal',
+      outcome: 'permanent_failure',
+      sanitized_status: 'channel_retired',
+      attempt_number: notionJob?.attempts_started,
+      fencing_token: notionJob?.fencing_token,
+    });
+    expect(delivered.sort()).toEqual(['builder_monitor', 'dispatch']);
+    expect(injected).not.toHaveBeenCalled();
   });
 
-  test('default Notion adapter treats exhausted 4xx lookup responses as permanent', async () => {
+  test('reclaimed notion job with an existing terminal receipt completes without a duplicate', async () => {
     const view = await defaultCardView();
-    const notion = createDefaultOperatorCardChannels({
-      fetch: mock(async () => new Response('unauthorized', { status: 401 })) as typeof fetch,
-      notion_api_key: 'test-notion-key',
-    }).find(channel => channel.channel === 'notion');
-    if (!notion) throw new Error('notion_channel_missing');
-    expect((await notion.deliver(view, 'unused')).outcome).toBe('permanent_failure');
+    const dueAt = view.card.created_at;
+    await getDatabase().query(
+      `INSERT INTO overseer_operator_card_delivery_jobs (
+        card_id, channel, state, attempts_started, next_attempt_at, fencing_token, updated_at
+      ) VALUES ($1, 'notion', 'pending', 0, $2, 0, $2)`,
+      [view.card.card_id, dueAt]
+    );
+    const crashed = await claimDueDeliveryJob({
+      channel: 'notion',
+      owner: 'notion-crashed',
+      now: dueAt,
+      lease_duration_ms: 1_000,
+    });
+    expect(crashed).not.toBeNull();
+    if (!crashed) throw new Error('notion_job_not_claimed');
+    await appendDeliveryReceipt({
+      card_id: view.card.card_id,
+      channel: 'notion',
+      attempt_number: crashed.attempts_started,
+      phase: 'terminal',
+      started_at: dueAt,
+      completed_at: dueAt,
+      outcome: 'permanent_failure',
+      sanitized_status: 'channel_retired',
+      fencing_token: crashed.fencing_token,
+      lease_owner: 'notion-crashed',
+    });
+
+    const delivered: string[] = [];
+    const channels: OperatorCardChannel[] = ['builder_monitor', 'dispatch'].map(channel => ({
+      channel,
+      deliver: async () => {
+        delivered.push(channel);
+        return { outcome: 'succeeded' as const, sanitized_status: 'delivered' };
+      },
+      reconcile: async () => ({ outcome: 'indeterminate' as const, sanitized_status: 'unknown' }),
+    }));
+    const recoveredAt = new Date(new Date(dueAt).getTime() + 1_001).toISOString();
+    const completed = await runDueOperatorCardDeliveries({
+      channels,
+      owner: 'notion-recovery',
+      now: recoveredAt,
+    });
+
+    expect(completed.map(job => job.channel)).toContain('notion');
+    const after = await getOperatorCard(view.card.card_id);
+    const notionJob = after?.jobs.find(job => job.channel === 'notion');
+    const notionReceipts = after?.receipts.filter(receipt => receipt.channel === 'notion') ?? [];
+    expect(notionJob?.state).toBe('exhausted');
+    expect(notionJob?.lease_owner).toBeNull();
+    expect(notionReceipts).toHaveLength(1);
+    expect(notionReceipts[0]).toMatchObject({
+      phase: 'terminal',
+      outcome: 'permanent_failure',
+      sanitized_status: 'channel_retired',
+      attempt_number: crashed.attempts_started,
+      fencing_token: crashed.fencing_token,
+    });
+    expect(delivered.sort()).toEqual(['builder_monitor', 'dispatch']);
+  });
+
+  test('active-channel-missing-still-errors', async () => {
+    await defaultCardView();
+    await expect(
+      runDueOperatorCardDeliveries({
+        channels: [],
+        owner: 'missing-adapter-runner',
+        now: new Date(Date.now() + 1_000).toISOString(),
+      })
+    ).rejects.toThrow(/^operator_card_channel_missing:(dispatch|builder_monitor)$/);
   });
 });

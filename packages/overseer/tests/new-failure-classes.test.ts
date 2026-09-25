@@ -12,7 +12,7 @@
  *   1. classify implement_loop_no_output (stderr alone, no validator context)
  *   2. classify validator_feedback_not_applied (stderr + validator action verbs)
  *   3. classify validator_rejected (validator stdout begins with REJECT)
- *   4. runEscalation durable-card integration (card + three channel jobs)
+ *   4. runEscalation durable-card integration (card + dispatch and builder_monitor jobs)
  *   5. end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay through decide+escalate
  */
 
@@ -192,7 +192,7 @@ describe('runEscalation: durable operator card', () => {
     removeTempDirWithRetry(tmpHome);
   });
 
-  test('runEscalation preserves diagnostics and queues all three channel jobs', async () => {
+  test('runEscalation preserves diagnostics and queues dispatch and builder_monitor jobs', async () => {
     const runId = 'test-run-123';
     const context: EscalationContext = {
       errorClass: 'validator_feedback_not_applied',
@@ -220,11 +220,7 @@ describe('runEscalation: durable operator card', () => {
     expect(view?.card.run_id).toBe(runId);
     expect(view?.card.wo_id).toBe('WO-FOO-01');
     expect(view?.card.mechanical_evidence.validator_output).toContain('lspro_token');
-    expect(view?.jobs.map(job => job.channel).sort()).toEqual([
-      'builder_monitor',
-      'dispatch',
-      'notion',
-    ]);
+    expect(view?.jobs.map(job => job.channel).sort()).toEqual(['builder_monitor', 'dispatch']);
     expect(fetchSpy).toHaveBeenCalledTimes(0);
   });
 
@@ -249,7 +245,8 @@ describe('runEscalation: durable operator card', () => {
     );
     const view = await getOperatorCard(card.card_id);
     expect(view?.card.canonical_event_identity.error_class).toBe('implement_loop_no_output');
-    expect(view?.delivery_summary.notion.state).toBe('pending');
+    expect(view?.jobs.map(job => job.channel).sort()).toEqual(['builder_monitor', 'dispatch']);
+    expect(view?.delivery_summary.notion).toBeUndefined();
     expect(fetchSpy).toHaveBeenCalledTimes(0);
   });
 });
@@ -340,7 +337,7 @@ describe('end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay', () => {
       "Add lspro_token to scenario 6b's addInitScript (currently causes redirect to /login)",
       'PR body must include the local run command per stop condition 5',
     ]);
-    expect(view?.jobs).toHaveLength(3);
+    expect(view?.jobs).toHaveLength(2);
     expect(fetchSpy).toHaveBeenCalledTimes(0);
   });
 });

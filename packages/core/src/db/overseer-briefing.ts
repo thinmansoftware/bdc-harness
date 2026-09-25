@@ -4,6 +4,7 @@ import type { IDatabase } from './adapters/types';
 
 export const OPERATOR_CARD_CHANNELS = ['dispatch', 'builder_monitor', 'notion'] as const;
 export type OperatorCardChannelName = (typeof OPERATOR_CARD_CHANNELS)[number];
+export const ACTIVE_OPERATOR_CARD_CHANNELS = ['dispatch', 'builder_monitor'] as const;
 export type DeliveryJobState = 'pending' | 'leased' | 'succeeded' | 'exhausted' | 'indeterminate';
 export type DeliveryOutcome =
   | 'succeeded'
@@ -291,7 +292,7 @@ export async function appendOperatorCard(input: AppendOperatorCardInput): Promis
     if (card.payload_digest !== input.payload_digest) {
       throw new Error('operator_card_digest_conflict');
     }
-    for (const channel of OPERATOR_CARD_CHANNELS) {
+    for (const channel of ACTIVE_OPERATOR_CARD_CHANNELS) {
       await query(
         `INSERT INTO overseer_operator_card_delivery_jobs (
           card_id, channel, state, attempts_started, next_attempt_at, fencing_token, updated_at
