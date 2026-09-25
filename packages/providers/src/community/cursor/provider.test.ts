@@ -65,7 +65,10 @@ describe('CursorAgentProvider', () => {
     const { child, writes } = fakeChild({
       stdout: stream(
         { type: 'system', subtype: 'init', model: 'Grok 4.7 256K High' },
-        { type: 'assistant', message: { content: [{ type: 'text', text: 'edited two files\nCOMPLETE\n' }] } },
+        {
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'edited two files\nCOMPLETE\n' }] },
+        },
         { type: 'result', subtype: 'success', is_error: false, result: 'ignored fallback' }
       ),
     });
@@ -123,8 +126,12 @@ describe('CursorAgentProvider', () => {
     await collect(provider.sendQuery('a', '/w'));
     await collect(provider.sendQuery('b', '/w', undefined, { model: 'cursor-grok-4.6-high' }));
     expect(DEFAULT_CURSOR_AGENT_MODEL).toBe('grok-4.7-high');
-    expect(argvs[0]?.slice(-2)).toEqual(['--model', DEFAULT_CURSOR_AGENT_MODEL]);
-    expect(argvs[1]?.slice(-2)).toEqual(['--model', 'cursor-grok-4.6-high']);
+    const modelArg = (argv: string[]): string[] => {
+      const index = argv.indexOf('--model');
+      return argv.slice(index, index + 2);
+    };
+    expect(modelArg(argvs[0] ?? [])).toEqual(['--model', DEFAULT_CURSOR_AGENT_MODEL]);
+    expect(modelArg(argvs[1] ?? [])).toEqual(['--model', 'cursor-grok-4.6-high']);
     expect(buildCursorAgentArgv('cursor-agent', 'm', '/w')).toContain('--workspace');
   });
 
@@ -209,10 +216,17 @@ describe('CursorAgentProvider', () => {
       kill: () => undefined,
     };
     const provider = new CursorAgentProvider({ spawn: () => child });
-    const pending = collect(provider.sendQuery('hi', '/w'));
-    await new Promise(resolve => setTimeout(resolve, 0));
+    const iterator = provider.sendQuery('hi', '/w');
+    const first = await iterator.next();
+    expect(first.done).toBe(false);
+    expect(first.value?.type).toBe('thinking');
     resolveExit(0);
-    const chunks = await pending;
+    const chunks: MessageChunk[] = first.value ? [first.value] : [];
+    for (;;) {
+      const next = await iterator.next();
+      if (next.done) break;
+      chunks.push(next.value);
+    }
     expect(chunks.filter(chunk => chunk.type === 'thinking')).toHaveLength(3);
     expect(chunks.filter(chunk => chunk.type === 'tool')).toHaveLength(2);
     expect(assistantText(chunks)).toBe('answer');
@@ -237,10 +251,36 @@ describe('CursorAgentProvider', () => {
     const errorProvider = new CursorAgentProvider({
       spawn: () =>
         fakeChild({
-          stdout: stream({ type: 'result', subtype: 'error', is_error: true, result: 'model refused' }),
+          stdout: stream({
+            type: 'result',
+            subtype: 'error',
+            is_error: true,
+            result: 'model refused',
+          }),
         }).child,
     });
     await expect(collect(errorProvider.sendQuery('hi', '/w'))).rejects.toThrow(/model refused/);
+  });
+
+  test('preserves earlier assistant text when a later assistant event is empty', async () => {
+    const provider = new CursorAgentProvider({
+      spawn: () =>
+        fakeChild({
+          stdout: stream(
+            { type: 'assistant', message: { content: [{ type: 'text', text: 'kept' }] } },
+            { type: 'assistant', message: { content: [] } },
+            { type: 'result', subtype: 'success', is_error: false, result: 'fallback' }
+          ),
+        }).child,
+    });
+    expect(assistantText(await collect(provider.sendQuery('hi', '/w')))).toBe('kept');
+  });
+
+  test('includes malformed stream lines in diagnostics', async () => {
+    const provider = new CursorAgentProvider({
+      spawn: () => fakeChild({ stdout: 'malformed diagnostic\n', exitCode: 1 }).child,
+    });
+    await expect(collect(provider.sendQuery('hi', '/w'))).rejects.toThrow(/malformed diagnostic/);
   });
 
   test('getType and capabilities', () => {

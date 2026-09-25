@@ -123,6 +123,7 @@ export class CursorAgentProvider implements IAgentProvider {
 
     let finalText = '';
     let assistantTextSeen = false;
+    let diagnosticText = '';
     let servedModelId: string | null = null;
     let resultText = '';
     let resultError: Error | undefined;
@@ -139,6 +140,7 @@ export class CursorAgentProvider implements IAgentProvider {
           } catch {
             // Cursor occasionally writes diagnostics outside the JSON stream.
             // Keep consuming valid events after such a line.
+            diagnosticText += `${line}\n`;
             return undefined;
           }
           if (!event || typeof event !== 'object') return undefined;
@@ -172,7 +174,7 @@ export class CursorAgentProvider implements IAgentProvider {
                   })
                 : [];
               const text = parts.join('');
-              assistantTextSeen = text.length > 0;
+              assistantTextSeen ||= text.length > 0;
               finalText += text;
               return { type: 'assistant', content: text };
             }
@@ -186,6 +188,9 @@ export class CursorAgentProvider implements IAgentProvider {
                 );
               } else if (!assistantTextSeen) {
                 finalText = resultText;
+                if (resultText.length > 0) {
+                  return { type: 'assistant', content: resultText };
+                }
               }
               return undefined;
             }
@@ -227,7 +232,9 @@ export class CursorAgentProvider implements IAgentProvider {
       const [exitCode, stderr] = await Promise.all([child.exited, stderrText]);
       await delivery;
       if (exitCode !== 0) {
-        const detail = stderr.trim().slice(-400) || 'no stderr';
+        const detail =
+          [stderr.trim(), diagnosticText.trim()].filter(Boolean).join('\n').slice(-400) ||
+          'no stderr';
         throw new Error(`cursor-agent exited ${exitCode} (model ${model}): ${detail}`);
       }
       if (resultError) throw resultError;
@@ -236,7 +243,9 @@ export class CursorAgentProvider implements IAgentProvider {
         // (scripts/dispatch-worker/seat-preflight.ts cursorBuildResultIsEmpty).
         // Never report it as success.
         throw new Error(
-          'cursor-agent exited 0 with empty output (workspace trust or authentication not granted)'
+          `cursor-agent exited 0 with empty output (workspace trust or authentication not granted)${
+            diagnosticText.trim() ? `: ${diagnosticText.trim().slice(-400)}` : ''
+          }`
         );
       }
     } finally {
