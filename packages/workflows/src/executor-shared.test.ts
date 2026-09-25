@@ -78,6 +78,32 @@ describe('substituteWorkflowVariables', () => {
     expect(prompt).toBe('Merge into develop');
   });
 
+  it('leaves longer shell variables beginning with $BASE_BRANCH unchanged', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH_OVERRIDE $BASE_BRANCH_PR',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('$BASE_BRANCH_OVERRIDE $BASE_BRANCH_PR');
+    expect(prompt).not.toContain('dev_OVERRIDE');
+    expect(prompt).not.toContain('dev_PR');
+  });
+
+  it('replaces exact $BASE_BRANCH tokens before non-identifier characters', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$BASE_BRANCH $BASE_BRANCH/x $BASE_BRANCH. $BASE_BRANCH)',
+      'run-1',
+      'msg',
+      '/tmp',
+      'dev',
+      'docs/'
+    );
+    expect(prompt).toBe('dev dev/x dev. dev)');
+  });
+
   it('throws when $BASE_BRANCH is referenced but empty', () => {
     expect(() =>
       substituteWorkflowVariables('Merge into $BASE_BRANCH', 'run-1', 'msg', '/tmp', '', 'docs/')
@@ -94,6 +120,41 @@ describe('substituteWorkflowVariables', () => {
       'docs/'
     );
     expect(prompt).toBe('No branch reference here');
+  });
+
+  it('does not throw for a longer $BASE_BRANCH variable when baseBranch is empty', () => {
+    expect(() =>
+      substituteWorkflowVariables('$BASE_BRANCH_OVERRIDE', 'run-1', 'msg', '/tmp', '', 'docs/')
+    ).not.toThrow();
+  });
+
+  it('substitutes each exact workflow variable without altering suffix-extended names', () => {
+    const cases = [
+      { name: 'WORKFLOW_ID', value: 'run-1' },
+      { name: 'USER_MESSAGE', value: 'message' },
+      { name: 'ARGUMENTS', value: 'message' },
+      { name: 'ARTIFACTS_DIR', value: '/tmp/artifacts' },
+      { name: 'DOCS_DIR', value: 'docs/' },
+      { name: 'LOOP_USER_INPUT', value: 'feedback' },
+      { name: 'REJECTION_REASON', value: 'reason' },
+      { name: 'LOOP_PREV_OUTPUT', value: 'previous' },
+    ];
+
+    for (const { name, value } of cases) {
+      const { prompt } = substituteWorkflowVariables(
+        `$${name} $${name}_SUFFIX`,
+        'run-1',
+        'message',
+        '/tmp/artifacts',
+        'dev',
+        'docs/',
+        undefined,
+        'feedback',
+        'reason',
+        'previous'
+      );
+      expect(prompt).toBe(`${value} $${name}_SUFFIX`);
+    }
   });
 
   it('replaces $USER_MESSAGE and $ARGUMENTS with user message', () => {
