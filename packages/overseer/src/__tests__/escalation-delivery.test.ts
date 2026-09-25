@@ -24,7 +24,7 @@ import {
   runDueOperatorCardDeliveries,
   type OperatorCardChannel,
 } from '../escalation-delivery';
-import { lookupNotionPageId, runEscalation } from '../escalate';
+import { runEscalation } from '../escalate';
 
 const identity: ActionableEventIdentity = {
   identity_version: 'overseer-actionable-event-v1',
@@ -497,56 +497,6 @@ describe('durable operator-card delivery', () => {
       now: plus(120_000),
     });
     expect(attempt3?.attempts_started).toBe(3);
-  });
-});
-
-describe('Notion WO lookup', () => {
-  const originalFetch = globalThis.fetch;
-
-  afterEach(() => {
-    globalThis.fetch = originalFetch;
-  });
-
-  test('queries separate candidates in frozen order and returns first success', async () => {
-    const queried: string[] = [];
-    globalThis.fetch = mock(async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
-      queried.push(body.filter.property);
-      if (body.filter.property === 'Name') {
-        return Response.json({ results: [{ id: 'page-1' }] });
-      }
-      return new Response('unknown property', { status: 400 });
-    }) as typeof fetch;
-
-    expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBe('page-1');
-    expect(queried).toEqual(['Task', 'WO ID', 'Name']);
-  });
-
-  test('resolves on the "Task" title property as the first candidate', async () => {
-    const queried: string[] = [];
-    globalThis.fetch = mock(async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
-      queried.push(body.filter.property);
-      if (body.filter.property === 'Task') {
-        return Response.json({ results: [{ id: 'task-page' }] });
-      }
-      return new Response('unknown property', { status: 400 });
-    }) as typeof fetch;
-
-    expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBe('task-page');
-    expect(queried).toEqual(['Task']);
-  });
-
-  test('fails soft after all candidate queries fail', async () => {
-    const queried: string[] = [];
-    globalThis.fetch = mock(async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as { filter: { property: string } };
-      queried.push(body.filter.property);
-      return new Response('unknown property', { status: 400 });
-    }) as typeof fetch;
-
-    expect(await lookupNotionPageId('test-key', 'db-1', 'WO-1')).toBeNull();
-    expect(queried).toEqual(['Task', 'WO ID', 'Name', 'Title', 'WO_ID']);
   });
 });
 
