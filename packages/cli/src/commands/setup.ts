@@ -1480,7 +1480,7 @@ export function writeScopedEnv(
 function trySpawn(
   command: string,
   args: string[],
-  options: { detached: boolean; stdio: 'ignore' }
+  options: { detached: boolean; stdio: 'ignore'; cwd?: string }
 ): boolean {
   try {
     const child: ChildProcess = spawn(command, args, options);
@@ -1495,105 +1495,86 @@ function trySpawn(
   }
 }
 
-/**
- * Spawn a new terminal window with the setup command on Windows
- * Tries: Windows Terminal -> cmd.exe with start
- */
-function spawnWindowsTerminal(repoPath: string): SpawnResult {
-  // Try Windows Terminal first (modern Windows 10/11)
-  if (
-    trySpawn('wt.exe', ['-d', repoPath, 'cmd', '/k', 'archon setup'], {
-      detached: true,
-      stdio: 'ignore',
-    })
-  ) {
-    return { success: true };
-  }
-
-  // Fallback to cmd.exe with start command (works on all Windows)
-  if (
-    trySpawn('cmd.exe', ['/c', 'start', '""', '/D', repoPath, 'cmd', '/k', 'archon setup'], {
-      detached: true,
-      stdio: 'ignore',
-    })
-  ) {
-    return { success: true };
-  }
-
-  return { success: false, error: 'Could not open terminal. Please run `archon setup` manually.' };
+export interface TerminalLaunchCandidate {
+  command: string;
+  args: string[];
+  cwd: string;
 }
 
 /**
- * Spawn terminal on macOS
- * Uses osascript to open Terminal.app (works with default terminal)
+ * Ordered terminal launch candidates. repoPath is cwd for every candidate
+ * and is never interpolated into a string that cmd.exe, a shell, or
+ * AppleScript parses. Dedicated directory flags (wt -d, gnome-terminal
+ * --working-directory, konsole --workdir) keep the path as its own argv value.
  */
-function spawnMacTerminal(repoPath: string): SpawnResult {
-  // Escape single quotes in path for AppleScript
-  const escapedPath = repoPath.replace(/'/g, "'\"'\"'");
-  const script = `tell application "Terminal" to do script "cd '${escapedPath}' && archon setup"`;
-
-  if (trySpawn('osascript', ['-e', script], { detached: true, stdio: 'ignore' })) {
-    return { success: true };
-  }
-
-  return { success: false, error: 'Could not open Terminal. Please run `archon setup` manually.' };
-}
-
-/**
- * Spawn terminal on Linux
- * Tries: x-terminal-emulator -> gnome-terminal -> konsole -> xterm
- */
-function spawnLinuxTerminal(repoPath: string): SpawnResult {
-  const setupCmd = 'archon setup; exec bash';
-
-  // Try x-terminal-emulator first (Debian/Ubuntu default)
-  if (
-    trySpawn(
-      'x-terminal-emulator',
-      ['--working-directory=' + repoPath, '-e', `bash -c "${setupCmd}"`],
+export function buildTerminalLaunchPlan(
+  platform: NodeJS.Platform,
+  repoPath: string
+): TerminalLaunchCandidate[] {
+  if (platform === 'win32') {
+    return [
       {
-        detached: true,
-        stdio: 'ignore',
-      }
-    )
-  ) {
-    return { success: true };
+        command: 'wt.exe',
+        args: ['-d', repoPath, 'cmd', '/k', 'archon setup'],
+        cwd: repoPath,
+      },
+      {
+        command: 'cmd.exe',
+        args: ['/c', 'start', '""', 'cmd', '/k', 'archon setup'],
+        cwd: repoPath,
+      },
+    ];
   }
 
-  // Try gnome-terminal (GNOME)
-  if (
-    trySpawn('gnome-terminal', ['--working-directory=' + repoPath, '--', 'bash', '-c', setupCmd], {
-      detached: true,
-      stdio: 'ignore',
-    })
-  ) {
-    return { success: true };
+  if (platform === 'darwin') {
+    return [
+      {
+        command: 'osascript',
+        args: [
+          '-e',
+          'on run argv',
+          '-e',
+          'tell application "Terminal" to do script "cd " & quoted form of (item 1 of argv) & " && archon setup"',
+          '-e',
+          'end run',
+          repoPath,
+        ],
+        cwd: repoPath,
+      },
+    ];
   }
 
-  // Try konsole (KDE)
-  if (
-    trySpawn('konsole', ['--workdir', repoPath, '-e', 'bash', '-c', setupCmd], {
-      detached: true,
-      stdio: 'ignore',
-    })
-  ) {
-    return { success: true };
-  }
+  const setupCmd = 'archon setup; exec bash';
+  return [
+    {
+      command: 'x-terminal-emulator',
+      args: ['--working-directory=' + repoPath, '-e', `bash -c "${setupCmd}"`],
+      cwd: repoPath,
+    },
+    {
+      command: 'gnome-terminal',
+      args: ['--working-directory=' + repoPath, '--', 'bash', '-c', setupCmd],
+      cwd: repoPath,
+    },
+    {
+      command: 'konsole',
+      args: ['--workdir', repoPath, '-e', 'bash', '-c', setupCmd],
+      cwd: repoPath,
+    },
+    {
+      command: 'xterm',
+      args: ['-e', 'archon', 'setup'],
+      cwd: repoPath,
+    },
+  ];
+}
 
-  // Try xterm (fallback, available on most systems)
-  if (
-    trySpawn('xterm', ['-e', `cd "${repoPath}" && ${setupCmd}`], {
-      detached: true,
-      stdio: 'ignore',
-    })
-  ) {
-    return { success: true };
-  }
-
-  return {
-    success: false,
-    error: 'Could not find a terminal emulator. Please run `archon setup` manually.',
-  };
+/**
+ * YAML double-quoted scalar for docs.path. JSON.stringify escapes
+ * backslashes before quotes, so Windows paths round-trip.
+ */
+export function buildDocsConfigBlock(docsPath: string): string {
+  return `\ndocs:\n  path: ${JSON.stringify(docsPath.trim())}\n`;
 }
 
 /**
@@ -1601,14 +1582,36 @@ function spawnLinuxTerminal(repoPath: string): SpawnResult {
  */
 export function spawnTerminalWithSetup(repoPath: string): SpawnResult {
   const platform = process.platform;
+  const plan = buildTerminalLaunchPlan(platform, repoPath);
 
-  if (platform === 'win32') {
-    return spawnWindowsTerminal(repoPath);
-  } else if (platform === 'darwin') {
-    return spawnMacTerminal(repoPath);
-  } else {
-    return spawnLinuxTerminal(repoPath);
+  for (const candidate of plan) {
+    if (
+      trySpawn(candidate.command, candidate.args, {
+        detached: true,
+        stdio: 'ignore',
+        cwd: candidate.cwd,
+      })
+    ) {
+      return { success: true };
+    }
   }
+
+  if (platform === 'darwin') {
+    return {
+      success: false,
+      error: 'Could not open Terminal. Please run `archon setup` manually.',
+    };
+  }
+  if (platform === 'win32') {
+    return {
+      success: false,
+      error: 'Could not open terminal. Please run `archon setup` manually.',
+    };
+  }
+  return {
+    success: false,
+    error: 'Could not find a terminal emulator. Please run `archon setup` manually.',
+  };
 }
 
 // =============================================================================
@@ -1875,8 +1878,7 @@ export async function setupCommand(options: SetupOptions): Promise<void> {
         const configPath = join(archonDir, 'config.yaml');
         const existing = existsSync(configPath) ? readFileSync(configPath, 'utf-8') : '';
         if (!existing.includes('docs:')) {
-          const escaped = docsPath.trim().replace(/"/g, '\\"');
-          writeFileSync(configPath, existing + `\ndocs:\n  path: "${escaped}"\n`);
+          writeFileSync(configPath, existing + buildDocsConfigBlock(docsPath));
         } else {
           note(
             `A "docs:" key already exists in ${configPath}.\nEdit it manually to set path: ${docsPath.trim()}`,
