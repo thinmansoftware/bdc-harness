@@ -965,6 +965,40 @@ describe('resolveRequiredContexts -- lookup cache (#993)', () => {
     expect(second.state).toBe('unknown');
   });
 
+  test('42a a masked 404 is not cached; a later confirmed unprotected result is', async () => {
+    let appCalls = 0;
+    const input = baseInput({
+      fetchWithAppClient: async () => {
+        appCalls += 1;
+        if (appCalls === 1) throw maskedNotFoundError();
+        throw branchNotProtectedError();
+      },
+      // The masked 404 is a permission failure, not isBranchNotProtectedError.
+      // Probes must disagree on that first lookup or positive unprotected
+      // evidence would answer it as known. They agree only after the
+      // authoritative "Branch not protected" 404.
+      fetchBranchRules: async () => {
+        if (appCalls === 1) throw new Error('rules unavailable');
+        return { data: [] };
+      },
+      fetchBranch: async () => {
+        if (appCalls === 1) throw new Error('branch unavailable');
+        return { data: { protected: false, protection: { enabled: false } } };
+      },
+    });
+
+    const first = await resolveRequiredContexts(input, {});
+    expect(first.state).toBe('unknown');
+    expect(isBranchNotProtectedError(maskedNotFoundError())).toBe(false);
+
+    const second = await resolveRequiredContexts(input, {});
+    expect(second).toEqual({ state: 'known', contexts: [], source: 'unprotected_branch' });
+
+    const third = await resolveRequiredContexts(input, {});
+    expect(third).toEqual(second);
+    expect(appCalls).toBe(2);
+  });
+
   test('43 resetRequiredContextsCache forces a second lookup with the same resolution', async () => {
     let appCalls = 0;
     const input = baseInput({
