@@ -752,7 +752,7 @@ export async function resolveRequiredContexts(
     return settleSharedLookup(key, counterKey, env, store);
   }
 
-  let releaseInflight: () => void = () => {};
+  let releaseInflight: () => void = () => undefined;
   const gate = new Promise<void>(resolve => {
     releaseInflight = resolve;
   });
