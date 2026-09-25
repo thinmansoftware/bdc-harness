@@ -30,6 +30,7 @@ async function setup(opts: {
   userName?: string;
   initialMode?: 'normal' | 'draining';
   drainStatus?: number;
+  healthOk?: boolean;
 }): Promise<void> {
   root = await mkdtemp(join(tmpdir(), 'rebuild-archon-'));
   bin = join(root, 'bin');
@@ -48,6 +49,7 @@ async function setup(opts: {
   const upFails = opts.upFails ? '1' : '0';
   const initialMode = opts.initialMode ?? 'normal';
   const drainStatus = opts.drainStatus ?? 200;
+  const healthCode = opts.healthOk === false ? '503' : '200';
 
   await writeStub(
     'flock',
@@ -86,7 +88,7 @@ for arg in "$@"; do
     *"/api/health"*) is_health=1 ;;
   esac
 done
-if [ "$is_health" = "1" ]; then printf '%s' 200; exit 0; fi
+if [ "$is_health" = "1" ]; then printf '%s' ${healthCode}; exit 0; fi
 if [ -n "$data" ]; then
   if [[ "$data" == *clearOnBoot* ]]; then printf '%s' "$data" > "${bodyFile}"; fi
   status=200
@@ -374,6 +376,47 @@ describe('rebuild-archon.sh', () => {
     expect(bodyText).toContain('\\t');
     expect(bodyText).toContain('\\r');
     expect(bodyText).toContain('\\n');
+  });
+
+  // Overseer review, bdc-harness#949, 5af0c893: RECREATED flipped as soon as
+  // `up -d` returned, so a replacement that never became healthy left a
+  // script-owned drain in place. Cleanup must run on ABORT_HEALTH.
+  test('rebuild_script_health_never_ready_releases_drain', async () => {
+    await setup({ healthOk: false });
+    const pruneLog = join(root, 'prune.log');
+    await writeFile(
+      join(root, 'prune.sh'),
+      `#!/usr/bin/env bash\nprintf '%s\\n' pruned >> "${pruneLog}"\n`,
+      { mode: 0o755 }
+    );
+    await chmod(join(root, 'prune.sh'), 0o755);
+    await writeStub(
+      'sleep',
+      `#!/usr/bin/env bash
+printf '%s\\n' "sleep $*" >> "${log}"
+exit 0
+`
+    );
+    const { exitCode, stdout, calls } = await runScript(
+      ['--poll-sec', '0', '--drain-timeout-min', '5'],
+      { REBUILD_HEALTH_TIMEOUT_SEC: '2' }
+    );
+    expect(exitCode).toBe(1);
+    expect(stdout).toContain('ABORT_HEALTH');
+    expect(stdout).not.toContain('DRAIN_CLEARED_BY_SCRIPT');
+    expect(stdout).not.toContain('archon:latest');
+    expect(calls).toContain('/api/health');
+    const undrains = calls.split('\n').filter(line => line.includes('draining":false'));
+    expect(undrains).toHaveLength(1);
+    expect(undrains[0]).toContain('rebuild aborted');
+    const upAt = calls.indexOf('compose up -d app');
+    const undrainAt = calls.lastIndexOf('draining":false');
+    expect(upAt).toBeGreaterThanOrEqual(0);
+    expect(undrainAt).toBeGreaterThan(upAt);
+    expect(calls).not.toContain('builder prune');
+    expect(calls).not.toContain('cleared after recreate');
+    const pruneRan = await readFile(pruneLog, 'utf8').catch(() => '');
+    expect(pruneRan).toBe('');
   });
 
   test('rebuild_script_drain_request_failure_fails_fast', async () => {

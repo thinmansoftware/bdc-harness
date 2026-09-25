@@ -6,6 +6,9 @@ set -euo pipefail
 
 POLL_SEC=30
 TIMEOUT_MIN=120
+# Seconds to wait for /api/health after recreate. Production leaves this unset
+# (120). Tests may set REBUILD_HEALTH_TIMEOUT_SEC; that does not change the default.
+HEALTH_TIMEOUT_SEC="${REBUILD_HEALTH_TIMEOUT_SEC:-120}"
 API_BASE="${REBUILD_API_BASE:-http://127.0.0.1:3090}"
 LOCK_FILE="${REBUILD_LOCK_FILE:-/opt/bdc/archon-data/.rebuild.lock}"
 REPO_DIR="${REBUILD_REPO_DIR:-/opt/bdc/archon}"
@@ -14,6 +17,9 @@ PRUNE_SCRIPT="${REBUILD_PRUNE_SCRIPT:-/opt/bdc/scripts/prune-rebuild-artifacts.s
 
 DRAIN_SET_BY_ME=0
 RECREATED=0
+# 1 only after the replacement container's /api/health returns HTTP 200.
+# Owned-drain cleanup stays eligible until then: `up -d` success is not boot.
+CONFIRMED_BOOT=0
 CLEANED=0
 TOKEN=""
 ACTIVE_IDS=""
@@ -76,7 +82,10 @@ json_escape() {
 }
 
 undrain_if_mine() {
-  if [ "$DRAIN_SET_BY_ME" = "1" ] && [ "$RECREATED" = "0" ] && [ -n "$TOKEN" ]; then
+  # Gate on confirmed boot, not RECREATED. RECREATED flips as soon as
+  # `up -d` returns, which is before clear-on-boot can run. A foreign drain
+  # (DRAIN_SET_BY_ME=0) is never cleared.
+  if [ "$DRAIN_SET_BY_ME" = "1" ] && [ "$CONFIRMED_BOOT" = "0" ] && [ -n "$TOKEN" ]; then
     curl -sS --max-time "$CURL_MAX_TIME" -X POST "$API_BASE/api/admin/drain" \
       -H "Content-Type: application/json" \
       -H "x-archon-operator-token: $TOKEN" \
@@ -211,26 +220,30 @@ AVAIL="$(df --output=avail -BG / | tail -1 | tr -dc 0-9)"
 
 docker compose build app
 docker compose up -d app
-# RECREATED is set ONLY after `up -d` itself has returned success -- a new
-# container now exists (whether or not it goes on to pass the health check
-# below). Setting it earlier (Overseer review, bdc-harness#949 [major]) meant
-# a failed `up -d` tripped the ERR trap with RECREATED already 1: the guard
-# in undrain_if_mine then suppressed undraining even though no replacement
-# container had booted to ever run clearOnBoot, leaving Cauldron drained
-# indefinitely. `set -euo pipefail` means a non-zero `up -d` exit reaches the
-# trap before this assignment is ever reached.
+# RECREATED is set ONLY after `up -d` itself has returned success. Setting it
+# earlier (Overseer review, bdc-harness#949 [major]) made a failed `up -d`
+# look like a recreate. Drain cleanup does not key off RECREATED: it keys off
+# CONFIRMED_BOOT, which stays 0 until /api/health returns 200. A non-zero
+# `up -d` still hits the ERR trap before this assignment (`set -euo pipefail`).
 RECREATED=1
 
-health_deadline=$(( $(date +%s) + 120 ))
+health_deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SEC ))
 healthy=0
 while [ "$(date +%s)" -lt "$health_deadline" ]; do
   if curl -sS --max-time "$CURL_MAX_TIME" -o /dev/null -w '%{http_code}' "$API_BASE/api/health" | grep -q '^200$'; then
+    # Close the cleanup gate before leaving the loop so a later abort cannot
+    # release a drain once the replacement has actually booted.
+    CONFIRMED_BOOT=1
     healthy=1
     break
   fi
   sleep 2
 done
 if [ "$healthy" != "1" ]; then
+  # `exit` does not run the ERR trap. Release an owned drain explicitly.
+  # CLEANED keeps a later trap from posting a second release.
+  undrain_if_mine
+  CLEANED=1
   printf '%s\n' ABORT_HEALTH
   exit 1
 fi
