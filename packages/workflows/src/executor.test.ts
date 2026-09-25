@@ -1912,3 +1912,76 @@ task_classes:
     expect(lane).toBe('bdc-feature-development');
   });
 });
+
+describe('cauldron drain', () => {
+  it('inflight_runs_unaffected_by_drain', async () => {
+    const createWorkflowRun = mock(async () => {
+      const error = new Error('cauldron_draining') as Error & { code: string };
+      error.code = 'cauldron_draining';
+      throw error;
+    });
+    const updateWorkflowRun = mock(async () => {});
+    const resumeWorkflowRun = mock(async (id: string) =>
+      makeRun({ id, status: 'running' as const })
+    );
+    const store = makeStore({ createWorkflowRun, updateWorkflowRun, resumeWorkflowRun });
+    const platform = makePlatform();
+    const running = await executeWorkflow(
+      makeDeps(store),
+      platform,
+      'conv-1',
+      '/tmp/live',
+      makeWorkflow(),
+      'continue',
+      'db-conv-1',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makeRun({ id: 'run-live', status: 'running' })
+    );
+    expect(createWorkflowRun).not.toHaveBeenCalled();
+    expect(running.success).toBe(true);
+
+    const waitingStore = makeStore({
+      createWorkflowRun,
+      resumeWorkflowRun,
+      getCompletedDagNodeOutputs: mock(async () => new Map()),
+    });
+    const waiting = await executeWorkflow(
+      makeDeps(waitingStore),
+      makePlatform(),
+      'conv-2',
+      '/tmp/wait',
+      makeWorkflow(),
+      'resume',
+      'db-conv-2',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makeRun({ id: 'run-wait', status: 'waiting_provider' })
+    );
+    expect(resumeWorkflowRun).toHaveBeenCalled();
+    expect(waiting.success).toBe(true);
+
+    const messages: string[] = [];
+    const drainPlatform = makePlatform();
+    (drainPlatform.sendMessage as ReturnType<typeof mock>).mockImplementation(
+      async (_id: string, text: string) => {
+        messages.push(text);
+      }
+    );
+    const refused = await executeWorkflow(
+      makeDeps(makeStore({ createWorkflowRun })),
+      drainPlatform,
+      'conv-3',
+      '/tmp/new',
+      makeWorkflow(),
+      'new fire',
+      'db-conv-3'
+    );
+    expect(refused).toEqual({ success: false, error: 'cauldron_draining' });
+    expect(messages.join('\n')).toContain('cauldron_draining');
+  });
+});

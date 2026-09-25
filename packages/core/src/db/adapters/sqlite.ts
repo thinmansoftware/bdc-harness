@@ -1193,6 +1193,20 @@ export class SqliteAdapter implements IDatabase {
           END
       WHERE principal_id IN ('duty-officer', 'do')
     `);
+
+    try {
+      const controlCols = this.pragmaAll("PRAGMA table_info('remote_agent_cauldron_control')") as {
+        name: string;
+      }[];
+      const controlColNames = new Set(controlCols.map(c => c.name));
+      if (controlCols.length > 0 && !controlColNames.has('clear_on_boot')) {
+        this.db.run(
+          'ALTER TABLE remote_agent_cauldron_control ADD COLUMN clear_on_boot INTEGER NOT NULL DEFAULT 0'
+        );
+      }
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_cauldron_clear_on_boot_failed');
+    }
   }
 
   /**
@@ -1470,7 +1484,8 @@ export class SqliteAdapter implements IDatabase {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         mode TEXT NOT NULL CHECK (mode IN ('normal', 'draining')),
         updated_at TEXT,
-        updated_by TEXT
+        updated_by TEXT,
+        clear_on_boot INTEGER NOT NULL DEFAULT 0
       );
       INSERT INTO remote_agent_cauldron_control (id, mode)
       VALUES (1, 'normal')

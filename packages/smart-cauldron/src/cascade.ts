@@ -157,6 +157,13 @@ export interface RunCascadeOptions {
   dispatchId?: string;
   /** Resolves only after the initial record is durable; used by async API dispatch. */
   onAdmission?: (record: CascadeRunRecord, created: boolean) => void;
+  /**
+   * Fires once, after the first provider fire is accepted and before polling.
+   * Admission is earlier and still `running`, so a drain refusal is not visible
+   * there. Callers that must not treat admission as delivery wait on this or
+   * on the returned record, whichever settles first.
+   */
+  onFireAccepted?: (record: CascadeRunRecord) => void;
   woClass?: string;
   tags?: string[];
   /** Override the entry tier (skips conductor ruleset). */
@@ -465,6 +472,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
     let refusalReason: CascadeRunRecord['refusalReason'];
+    let fireAcceptedNotified = false;
 
     function buildCurrentRecord(): CascadeRunRecord {
       const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
@@ -801,6 +809,15 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       });
       attempt.runId = fireResult.runId;
 
+      if (fireResult.drainRefused) {
+        attempt.outcome = 'drain-deferred';
+        attempt.infraErrorReason = fireResult.infraError;
+        attempt.completedAt = new Date().toISOString();
+        status = 'drain-deferred';
+        await checkpoint();
+        break;
+      }
+
       // Infra error: alert + stop (do NOT count as "too hard")
       if (!fireResult.ok) {
         const errorClass = classifyError({
@@ -848,6 +865,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       // The workflow run identity is durable before polling begins.
       await checkpoint();
+      if (!fireAcceptedNotified) {
+        fireAcceptedNotified = true;
+        opts.onFireAccepted?.(buildCurrentRecord());
+      }
 
       // Poll for terminal state (runId is guaranteed non-null since fireResult.ok is true)
       const resolvedRunId = fireResult.runId ?? '';

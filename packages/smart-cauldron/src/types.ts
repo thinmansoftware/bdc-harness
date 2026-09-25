@@ -12,6 +12,7 @@ export type TierOutcome =
   | 'won' // gate passed -- cascade stops
   | 'gate-failed' // ran, built, gate failed -- climb
   | 'infra-error' // auth/transport failure -- alert, do not count as "too hard"
+  | 'drain-deferred' // planned drain refusal; defer, do not alert
   | 'progress-timeout' // poll watchdog kill -- run never reached terminal; climb like gate-failed
   | 'cancelled' // externally cancelled; stop, do not climb
   | 'refused'; // already-satisfied guard refused to fire this attempt; distinct from won (bdc-xo#2140)
@@ -54,6 +55,7 @@ export type CascadeStatus =
   | 'spec-repair' // frontier (fable) tier gate-failed -> SPEC-REPAIR escalation, not a dead end
   | 'recovery-delegated' // an explicitly injected fenced supervisor accepted recovery ownership
   | 'infra-alert' // infra-error on a tier (escalate/alert, not climb silently)
+  | 'drain-deferred' // fire refused because Cauldron is draining; no alert
   | 'pending-frontier-approval' // auto-climb reached a premium tier; paused for operator approval, not fired
   | 'frontier-rejected' // operator rejected the premium-tier climb; terminated as needs-human, no fire
   | 'frontier-approved' // operator approved the premium climb; original record handed off to the resumed cascade (resumeCascadeId)
@@ -188,6 +190,8 @@ export interface FireResult {
   runId: string | null; // resolved via discovery poll; null only on infra-error
   conversationId: string | null; // server-issued parent platform conversation id
   infraError: string | null; // set when HTTP != 200 or discovery times out
+  /** True when HTTP 503 body code is cauldron_draining. Not an infra failure. */
+  drainRefused?: boolean;
 }
 
 export interface PollResult {

@@ -16,6 +16,7 @@
 import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
+import { getCauldronDrainState } from '@archon/core/db/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import {
   assessDispatchRecipient,
@@ -164,6 +165,7 @@ type TaskmasterDal = Pick<
       | 'setSuppression'
       | 'clearSuppression'
       | 'registerExpectation'
+      | 'markGivenUp'
       | 'getExpectationCounts'
     >
   >;
@@ -212,6 +214,7 @@ export interface TaskmasterDeps {
   ) => Promise<GithubIssueEvidence | null>;
   checkFireEligibility?: (issueTitle: string) => Promise<FireEligibilityResult>;
   runCascade?: typeof runCascade;
+  getCauldronDrainState?: typeof getCauldronDrainState;
   getFireRunEvidence?: (
     woId: string,
     cascadeId: string
@@ -1679,6 +1682,34 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       continue;
     }
 
+    if (proposal.type === 'fire_cauldron') {
+      const drain = await (deps.getCauldronDrainState ?? getCauldronDrainState)();
+      if (drain.mode === 'draining') {
+        result.deferred += 1;
+        const deferredJson = JSON.stringify({
+          ...proposal,
+          deferred: true,
+          deferred_reason: 'cauldron_draining',
+        });
+        if (!existingAction) {
+          existingAction = await dal.recordAction({
+            thread_ref: proposal.threadRef,
+            action_type: proposal.type,
+            proposal_json: deferredJson,
+            idempotency_key: proposal.idempotencyKey,
+            before_hash: sha256(proposal.body),
+            proof_predicate: proofPredicate(proposal),
+            proof_deadline_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+            outcome: 'deferred',
+          });
+          actionsByKey.set(proposal.idempotencyKey, existingAction);
+        } else {
+          await dal.updateActionOutcome(existingAction.id, 'deferred', deferredJson);
+        }
+        continue;
+      }
+    }
+
     // ROW FIRST, always -- then the effect.
     let journalRow: taskmasterDb.TmJournalEntry;
     if (existingAction && retrying) {
@@ -1729,6 +1760,18 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       continue;
     }
 
+    // Resolved once this iteration decides whether a fire was journaled sent.
+    // The cascade promise can settle drain-deferred after that decision (a
+    // later tier refused while an earlier tier was already accepted), and the
+    // completion handler waits on this so it cannot miss that update.
+    let settleFireDecision: ((decision: { sent: boolean; expectationId?: string }) => void) | null =
+      null;
+    let fireDecisionSettled = false;
+    const publishFireDecision = (decision: { sent: boolean; expectationId?: string }): void => {
+      if (fireDecisionSettled) return;
+      fireDecisionSettled = true;
+      settleFireDecision?.(decision);
+    };
     try {
       const escalationIssue =
         proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
@@ -1805,9 +1848,14 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         let resolveAdmission: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
           null;
         let rejectAdmission: ((error: unknown) => void) | null = null;
+        let resolveFireAccepted: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
+          null;
         const admission = new Promise<Awaited<ReturnType<typeof runCascade>>>((resolve, reject) => {
           resolveAdmission = resolve;
           rejectAdmission = reject;
+        });
+        const fireAccepted = new Promise<Awaited<ReturnType<typeof runCascade>>>(resolve => {
+          resolveFireAccepted = resolve;
         });
         const cascadePromise = executeCascade({
           woId: proposal.fireEvidence.woId,
@@ -1816,6 +1864,41 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           dispatchId: proposal.idempotencyKey,
           token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
           onAdmission: record => resolveAdmission?.(record),
+          onFireAccepted: record => resolveFireAccepted?.(record),
+        });
+        const settled = cascadePromise.then(record => record);
+        const fireDecision = new Promise<{ sent: boolean; expectationId?: string }>(resolve => {
+          settleFireDecision = resolve;
+        });
+        const journalId = journalRow.id;
+        const fireProposal = proposal;
+        // A later tier can still drain-refuse after onFireAccepted. That
+        // terminal result arrives only when the cascade promise settles, which
+        // may be after this tick has already journaled the accepted fire.
+        void settled.then(async terminal => {
+          const decision = await fireDecision;
+          if (!decision.sent || terminal.status !== 'drain-deferred') return;
+          try {
+            await dal.updateActionOutcome(
+              journalId,
+              'deferred',
+              JSON.stringify({
+                ...fireProposal,
+                deferred: true,
+                deferred_reason: 'cauldron_draining',
+                cascadeId: terminal.cascadeId,
+              })
+            );
+            if (decision.expectationId) {
+              const giveUp = dal.markGivenUp ?? (!deps.db ? taskmasterDb.markGivenUp : undefined);
+              await giveUp?.(decision.expectationId, 'cauldron_draining');
+            }
+          } catch (error) {
+            log.error(
+              { err: error, woId: fireProposal.fireEvidence?.woId, cascadeId: terminal.cascadeId },
+              'taskmaster.fire_drain_deferred_update_failed'
+            );
+          }
         });
         void cascadePromise.catch((error: unknown) => {
           rejectAdmission?.(error);
@@ -1825,15 +1908,37 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           );
         });
         const admitted = await admission;
+        // onAdmission runs when the initial record is persisted, still
+        // `running`, and before fireTier can refuse a drain. A real drain
+        // refusal settles the cascade promise. An accepted fire signals
+        // onFireAccepted and then polls in the background.
+        const observed =
+          admitted.status === 'running' ? await Promise.race([fireAccepted, settled]) : admitted;
+        if (observed.status === 'drain-deferred') {
+          publishFireDecision({ sent: false });
+          result.deferred += 1;
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'deferred',
+            JSON.stringify({
+              ...proposal,
+              deferred: true,
+              deferred_reason: 'cauldron_draining',
+              cascadeId: observed.cascadeId,
+            })
+          );
+          journalRow.outcome = 'deferred';
+          continue;
+        }
         const registerExpectation =
           dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
-        await registerExpectation?.({
+        const expectationId = await registerExpectation?.({
           // Deterministic identity: replaying this journal action after a crash
           // between the cascade admission and updateActionOutcome reuses the
           // SAME expectation rather than registering a second one with
           // different retry/escalation keys.
           action_ref: journalRow.id,
-          dispatch_ref: admitted.cascadeId,
+          dispatch_ref: observed.cascadeId,
           recipient: proposal.recipient,
           // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching on
           // the admission row's existence alone is not evidence of anything:
@@ -1843,7 +1948,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           evidence_json: JSON.stringify({
             kind: 'db_row_exists',
             table: 'remote_agent_workflow_runs',
-            where: { id: admitted.cascadeId, status: CASCADE_SUCCESS_STATUSES },
+            where: { id: observed.cascadeId, status: CASCADE_SUCCESS_STATUSES },
           }),
           due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
           on_absence: 'escalate',
@@ -1852,8 +1957,9 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         await dal.updateActionOutcome(
           journalRow.id,
           'sent',
-          JSON.stringify({ ...proposal, cascadeId: admitted.cascadeId, runId: admitted.cascadeId })
+          JSON.stringify({ ...proposal, cascadeId: observed.cascadeId, runId: observed.cascadeId })
         );
+        publishFireDecision({ sent: true, expectationId });
       } else {
         const dispatched = await createTask(
           { kind: 'system', sender: 'taskmaster' },
@@ -1900,6 +2006,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         'taskmaster.effect_sent'
       );
     } catch (error) {
+      publishFireDecision({ sent: false });
       await dal.updateActionOutcome(journalRow.id, 'failed');
       journalRow.outcome = 'failed';
       tickFailures += 1;
