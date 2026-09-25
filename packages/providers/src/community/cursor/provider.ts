@@ -33,6 +33,7 @@ import { parseCursorAgentConfig } from './config';
 
 export const DEFAULT_CURSOR_AGENT_MODEL = 'grok-4.7-high';
 export const DEFAULT_CURSOR_AGENT_BINARY = 'cursor-agent';
+const MAX_DIAGNOSTIC_TEXT_LENGTH = 4_000;
 
 /** The subset of a spawned child this provider uses; a test supplies a double. */
 export interface CursorAgentChild {
@@ -140,7 +141,7 @@ export class CursorAgentProvider implements IAgentProvider {
           } catch {
             // Cursor occasionally writes diagnostics outside the JSON stream.
             // Keep consuming valid events after such a line.
-            diagnosticText += `${line}\n`;
+            diagnosticText = `${diagnosticText}${line}\n`.slice(-MAX_DIAGNOSTIC_TEXT_LENGTH);
             return undefined;
           }
           if (!event || typeof event !== 'object') return undefined;

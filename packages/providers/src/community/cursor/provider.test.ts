@@ -187,8 +187,12 @@ describe('CursorAgentProvider', () => {
 
   test('streams progress before exit and keeps thinking and tools out of final text', async () => {
     let resolveExit!: (code: number) => void;
+    let exitResolved = false;
     const exited = new Promise<number>(resolve => {
-      resolveExit = resolve;
+      resolveExit = code => {
+        exitResolved = true;
+        resolve(code);
+      };
     });
     const stdout = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -220,16 +224,22 @@ describe('CursorAgentProvider', () => {
     const first = await iterator.next();
     expect(first.done).toBe(false);
     expect(first.value?.type).toBe('thinking');
-    resolveExit(0);
     const chunks: MessageChunk[] = first.value ? [first.value] : [];
-    for (;;) {
+    while (chunks.length < 6) {
       const next = await iterator.next();
-      if (next.done) break;
+      expect(next.done).toBe(false);
       chunks.push(next.value);
     }
+    expect(exitResolved).toBe(false);
     expect(chunks.filter(chunk => chunk.type === 'thinking')).toHaveLength(3);
     expect(chunks.filter(chunk => chunk.type === 'tool')).toHaveLength(2);
     expect(assistantText(chunks)).toBe('answer');
+
+    resolveExit(0);
+    const result = await iterator.next();
+    expect(result.done).toBe(false);
+    expect(result.value?.type).toBe('result');
+    expect((await iterator.next()).done).toBe(true);
   });
 
   test('handles result errors, malformed lines, fallback text, and missing model', async () => {
