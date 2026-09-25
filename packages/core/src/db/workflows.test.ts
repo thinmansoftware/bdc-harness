@@ -2,6 +2,7 @@ import { mock, describe, test, expect, beforeEach } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
+import { rootLogger } from '@archon/paths';
 import { SqliteAdapter } from './adapters/sqlite';
 import type { IDatabase } from './adapters/types';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
@@ -2821,6 +2822,115 @@ describe('WO-HARNESS-REBUILD-DRAIN-MODE-01 drain create and recreateSafe', () =>
       expect(boot).toHaveLength(1);
       expect(boot[0]?.reason).toBe('clear_on_boot after restart');
     } finally {
+      await sqlite.close();
+      try {
+        unlinkSync(dbPath);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  test('boot clear leaves a foreign drain that replaces the rebuild drain after the read', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-drain-boot-race-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sqlText: string, params?: unknown[]) =>
+      sqlite.query(sqlText, params)
+    );
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    const stream = rootLogger[streamSymbol as keyof typeof rootLogger] as {
+      write: (chunk: string | Uint8Array) => boolean;
+    };
+    const logged: string[] = [];
+    const originalWrite = stream.write.bind(stream);
+    stream.write = (chunk: string | Uint8Array): boolean => {
+      logged.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return originalWrite(chunk);
+    };
+    const originalQuery = sqlite.query.bind(sqlite);
+    let interleaved = false;
+    try {
+      await setCauldronDrainMode({
+        mode: 'draining',
+        actor: 'rebuild-script',
+        reason: 'rebuild',
+        updatedAt: '2026-09-24T00:00:00.000Z',
+        clearOnBoot: true,
+      });
+      sqlite.query = (async (sql: string, params?: unknown[]) => {
+        const result = await originalQuery(sql, params);
+        const trimmed = sql.trim().toUpperCase();
+        if (
+          !interleaved &&
+          trimmed.startsWith('SELECT') &&
+          sql.includes('remote_agent_cauldron_control') &&
+          !sql.includes('remote_agent_cauldron_control_events')
+        ) {
+          interleaved = true;
+          await originalQuery(
+            `UPDATE remote_agent_cauldron_control
+             SET mode = 'normal', updated_at = $1, updated_by = $2, clear_on_boot = 0
+             WHERE id = 1`,
+            ['2026-09-24T00:30:00.000Z', 'clearing-operator']
+          );
+          await originalQuery(
+            `UPDATE remote_agent_cauldron_control
+             SET mode = 'draining', updated_at = $1, updated_by = $2, clear_on_boot = 0
+             WHERE id = 1`,
+            ['2026-09-24T00:45:00.000Z', 'incident-operator']
+          );
+          await originalQuery(
+            `INSERT INTO remote_agent_cauldron_control_events
+             (from_mode, to_mode, actor, reason, created_at)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+              'normal',
+              'draining',
+              'incident-operator',
+              'incident freeze',
+              '2026-09-24T00:45:00.000Z',
+            ]
+          );
+        }
+        return result;
+      }) as typeof sqlite.query;
+      await expect(applyCauldronDrainClearOnBoot('2026-09-24T01:00:00.000Z')).resolves.toBe(
+        'persisted'
+      );
+      const row = await originalQuery<{
+        mode: string;
+        clear_on_boot: number;
+        updated_by: string;
+        updated_at: string;
+      }>(
+        'SELECT mode, clear_on_boot, updated_by, updated_at FROM remote_agent_cauldron_control WHERE id = 1'
+      );
+      expect(row.rows[0]?.mode).toBe('draining');
+      expect(row.rows[0]?.updated_by).toBe('incident-operator');
+      expect(Number(row.rows[0]?.clear_on_boot)).toBe(0);
+      expect(row.rows[0]?.updated_at).toBe('2026-09-24T00:45:00.000Z');
+      const events = await originalQuery<{ actor: string; to_mode: string; reason: string | null }>(
+        'SELECT actor, to_mode, reason FROM remote_agent_cauldron_control_events'
+      );
+      expect(events.rows.some(event => event.reason === 'clear_on_boot after restart')).toBe(false);
+      expect(events.rows.some(event => event.actor === 'boot')).toBe(false);
+      expect(events.rows.some(event => event.to_mode === 'normal' && event.actor === 'boot')).toBe(
+        false
+      );
+      const freeze = events.rows.find(event => event.actor === 'incident-operator');
+      expect(freeze?.reason).toBe('incident freeze');
+      expect(freeze?.to_mode).toBe('draining');
+      expect(logged.join('')).toContain('drain_clear_skipped_foreign_drain');
+      expect(interleaved).toBe(true);
+    } finally {
+      stream.write = originalWrite;
+      sqlite.query = originalQuery;
       await sqlite.close();
       try {
         unlinkSync(dbPath);

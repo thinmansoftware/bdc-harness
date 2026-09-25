@@ -1018,17 +1018,52 @@ export async function getCauldronDrainState(
 export async function applyCauldronDrainClearOnBoot(
   updatedAt = new Date().toISOString()
 ): Promise<'cleared' | 'persisted' | 'normal'> {
-  const state = await getCauldronDrainState(updatedAt);
-  if (state.mode !== 'draining') return 'normal';
-  if (!state.clearOnBoot) return 'persisted';
-  await setCauldronDrainMode({
-    mode: 'normal',
-    actor: 'boot',
-    reason: 'clear_on_boot after restart',
-    updatedAt,
-    clearOnBoot: false,
+  const db = getDatabase();
+  // Read and conditional clear share one transaction. A foreign actor can
+  // replace the rebuild drain between two transactions; matching the values
+  // just read refuses to clear that newer drain.
+  return db.withTransaction(async query => {
+    const lockSuffix = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
+    const current = await query<{
+      mode: CauldronDrainMode;
+      clear_on_boot: number | boolean | null;
+      updated_at: string | Date | null;
+      updated_by: string | null;
+    }>(
+      `SELECT mode, clear_on_boot, updated_at, updated_by
+       FROM remote_agent_cauldron_control
+       WHERE id = 1${lockSuffix}`
+    );
+    const row = current.rows[0];
+    const mode = row?.mode ?? 'normal';
+    if (mode !== 'draining') return 'normal';
+    if (numericCount(row?.clear_on_boot) !== 1) return 'persisted';
+
+    const update = await query(
+      `UPDATE remote_agent_cauldron_control
+       SET mode = 'normal',
+           updated_at = $1,
+           updated_by = $2,
+           clear_on_boot = 0
+       WHERE id = 1
+         AND mode = 'draining'
+         AND clear_on_boot = 1
+         AND updated_at = $3
+         AND updated_by = $4`,
+      [updatedAt, 'boot', row?.updated_at ?? null, row?.updated_by ?? null]
+    );
+    if (update.rowCount !== 1) {
+      getLog().warn({}, 'drain_clear_skipped_foreign_drain');
+      return 'persisted';
+    }
+    await query(
+      `INSERT INTO remote_agent_cauldron_control_events
+       (from_mode, to_mode, actor, reason, created_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      ['draining', 'normal', 'boot', 'clear_on_boot after restart', updatedAt]
+    );
+    return 'cleared';
   });
-  return 'cleared';
 }
 
 export async function setCauldronDrainMode(data: {
