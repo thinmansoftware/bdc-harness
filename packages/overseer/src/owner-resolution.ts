@@ -66,9 +66,10 @@ function extractProposer(motion: string): string | null {
 }
 
 function approvalHeadingText(line: string): string | null {
-  const trimmed = line.trim();
-  if (!APPROVAL_HEADING_PREFIX_RE.test(trimmed)) return null;
-  const collapsed = trimmed.replace(/\s+/g, ' ');
+  // Require the heading marker at column 0. Trimming first would accept an
+  // indented "## Seat -- APPROVE" line that the anchored parser rejected.
+  if (!APPROVAL_HEADING_PREFIX_RE.test(line)) return null;
+  const collapsed = line.trim().replace(/\s+/g, ' ');
   const lower = collapsed.toLowerCase();
   let searchFrom = 0;
   while (searchFrom < lower.length) {

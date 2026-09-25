@@ -150,6 +150,9 @@ describe('extractBoardSeat', () => {
     expect(extractBoardSeat('Mover: Codex')).toBe('Codex');
     expect(extractBoardSeat('## Codex (Sol) -- APPROVE with notes')).toBe('Codex');
     expect(extractBoardSeat('## Codex -- approve')).toBe('Codex');
+    expect(extractBoardSeat('## Codex  --  APPROVE')).toBe('Codex');
+    expect(extractBoardSeat('  ## Claude -- APPROVE')).toBeNull();
+    expect(extractBoardSeat('\t## Claude -- APPROVE')).toBeNull();
     expect(extractBoardSeat('## Grok -- APPROVED')).toBeNull();
     expect(extractBoardSeat('##### Grok -- APPROVE')).toBeNull();
   });
