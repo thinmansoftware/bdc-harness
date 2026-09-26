@@ -194,6 +194,11 @@ export class CursorAgentProvider implements IAgentProvider {
       finalText = stream.assistantText;
       if (finalText.trim().length === 0 && stream.resultText !== undefined) {
         finalText = stream.resultText;
+        if (finalText.trim().length > 0) {
+          // The DAG executor reads node output from assistant chunks, so the
+          // result-only fallback must be yielded, not merely accumulated.
+          yield { type: 'assistant', content: finalText };
+        }
       }
       if (finalText.trim().length === 0) {
         // rc 0 with no output is the Workspace Trust / auth no-op

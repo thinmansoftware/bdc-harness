@@ -284,7 +284,8 @@ describe('CursorAgentProvider', () => {
     const provider = new CursorAgentProvider({ spawn: () => child });
     const chunks = await collect(provider.sendQuery('hi', '/w'));
     expect(chunks[chunks.length - 1]?.type).toBe('result');
-    expect(chunks.some(chunk => chunk.type === 'assistant')).toBe(false);
+    // The fallback must reach the node output, not just internal state.
+    expect(assistantText(chunks)).toBe('fallback body only');
   });
 
   test('error-result-throws', async () => {
