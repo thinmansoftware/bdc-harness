@@ -232,6 +232,9 @@ export class CursorAgentProvider implements IAgentProvider {
       }
       // The final node text is the concatenation of assistant texts; fall back
       // to the success result text when the stream carried no assistant events.
+      // The DAG accumulates node output from assistant chunks ONLY, so the
+      // fallback must be yielded as an assistant chunk -- assigning finalText
+      // alone would leave $node_id.output empty for a result-only stream.
       finalText = assistantText.length > 0 ? assistantText : (resultText ?? '');
       if (finalText.trim().length === 0) {
         // rc 0 with no output is the Workspace Trust / auth no-op
@@ -240,6 +243,9 @@ export class CursorAgentProvider implements IAgentProvider {
         throw new Error(
           'cursor-agent exited 0 with empty output (workspace trust or authentication not granted)'
         );
+      }
+      if (assistantText.length === 0) {
+        yield { type: 'assistant', content: finalText };
       }
       if (malformedCount > 0) {
         console.warn(

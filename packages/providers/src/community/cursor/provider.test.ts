@@ -277,10 +277,25 @@ describe('CursorAgentProvider', () => {
     const stdout = initEvent() + successResult('final answer from result');
     const provider = new CursorAgentProvider({ spawn: () => fakeChild({ stdout }).child });
     const chunks = await collect(provider.sendQuery('hi', '/w'));
-    // No assistant chunk is yielded for result-only text; the node output (the
-    // assistant-text accumulator) is empty but the run still succeeds.
-    expect(chunks.some(c => c.type === 'assistant')).toBe(false);
-    expect(finalResult(chunks).type).toBe('result');
+    // The fallback text must be DAG-consumable: the DAG accumulates node output
+    // ($node_id.output) from assistant chunks only, so the provider synthesizes
+    // one assistant chunk carrying the result text before the terminal result.
+    expect(assistantText(chunks)).toBe('final answer from result');
+    const assistantIdx = chunks.findIndex(c => c.type === 'assistant');
+    expect(assistantIdx).toBeGreaterThanOrEqual(0);
+    expect(chunks.findLastIndex(c => c.type === 'result')).toBeGreaterThan(assistantIdx);
+  });
+
+  test('json_schema output parses the result-only fallback text', async () => {
+    const stdout = initEvent() + successResult('{"verdict":"PASS"}');
+    const provider = new CursorAgentProvider({ spawn: () => fakeChild({ stdout }).child });
+    const chunks = await collect(
+      provider.sendQuery('judge it', '/w', undefined, {
+        outputFormat: { type: 'json_schema', schema: { type: 'object' } },
+      })
+    );
+    expect(assistantText(chunks)).toBe('{"verdict":"PASS"}');
+    expect(finalResult(chunks).structuredOutput).toEqual({ verdict: 'PASS' });
   });
 
   test('a stream-json error result throws with the bounded result tail', async () => {
