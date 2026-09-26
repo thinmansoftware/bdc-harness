@@ -64,7 +64,18 @@ const defaultCursorAgentSpawn: CursorAgentSpawn = (argv, options) =>
 
 /** Exported for tests: the exact argv, with the prompt deliberately absent. */
 export function buildCursorAgentArgv(binary: string, model: string, cwd: string): string[] {
-  return [binary, '--print', '--force', '--trust', '--workspace', cwd, '--model', model];
+  return [
+    binary,
+    '--print',
+    '--output-format',
+    'stream-json',
+    '--force',
+    '--trust',
+    '--workspace',
+    cwd,
+    '--model',
+    model,
+  ];
 }
 
 export class CursorAgentProvider implements IAgentProvider {
@@ -111,40 +122,134 @@ export class CursorAgentProvider implements IAgentProvider {
     const delivery = deliverPrompt(child.stdin, buildCursorPrompt(prompt, options));
 
     let finalText = '';
+    let resultResultText = '';
+    let servedModelId: string | null = null;
+    const diagnosticBuffer: string[] = [];
+    let resultIsError = false;
+    let resultSubtype: string | undefined;
+
     try {
       if (child.stdout) {
         const decoder = new TextDecoder();
         const reader = child.stdout.getReader();
+        let incompleteLine = '';
+
         for (;;) {
           const { done, value } = await reader.read();
-          if (done) break;
           const text = decoder.decode(value, { stream: true });
-          if (text.length === 0) continue;
-          finalText += text;
-          yield { type: 'assistant', content: text };
+          if (text.length === 0 && !done) continue;
+
+          // Combine with any incomplete line from previous read
+          const fullData = incompleteLine + text;
+          const lines = fullData.split('\n');
+          // The last element may be an incomplete line
+          incompleteLine = lines.pop() ?? '';
+
+          for (const line of lines) {
+            if (line.trim().length === 0) continue;
+
+            try {
+              const event = JSON.parse(line);
+              const chunk = processStreamEvent(event, diagnosticBuffer, () => {
+                // Capture model from init event
+                if (typeof event === 'object' && event !== null && 'model' in event && typeof (event as { model?: string }).model === 'string') {
+                  servedModelId = (event as { model: string }).model;
+                }
+              });
+              if (chunk) {
+                yield chunk;
+                if (chunk.type === 'assistant') {
+                  finalText += chunk.content;
+                }
+              }
+              
+              // Capture result event data for fallback and error checking
+              if (event && typeof event === 'object' && 'type' in event && event.type === 'result') {
+                const resultEvent = event as { result?: string; is_error?: boolean; subtype?: string };
+                if (typeof resultEvent.result === 'string') {
+                  resultResultText = resultEvent.result;
+                }
+                if (typeof resultEvent.is_error === 'boolean') {
+                  resultIsError = resultEvent.is_error;
+                }
+                if (typeof resultEvent.subtype === 'string') {
+                  resultSubtype = resultEvent.subtype;
+                }
+              }
+            } catch (e) {
+              diagnosticBuffer.push(`Invalid JSON line: ${line.slice(0, 200)}`);
+            }
+          }
+
+          if (done) break;
         }
-        const tail = decoder.decode();
-        if (tail.length > 0) {
-          finalText += tail;
-          yield { type: 'assistant', content: tail };
+
+        // Process any remaining incomplete line at EOF
+        if (incompleteLine.trim().length > 0) {
+          try {
+            const event = JSON.parse(incompleteLine);
+            const chunk = processStreamEvent(event, diagnosticBuffer, () => {
+              // Capture model from init event
+              if (typeof event === 'object' && event !== null && 'model' in event && typeof (event as { model?: string }).model === 'string') {
+                servedModelId = (event as { model: string }).model;
+              }
+            });
+            if (chunk) {
+              yield chunk;
+              if (chunk.type === 'assistant') {
+                finalText += chunk.content;
+              }
+            }
+            
+            // Capture result event data for fallback and error checking
+            if (event && typeof event === 'object' && 'type' in event && event.type === 'result') {
+              const resultEvent = event as { result?: string; is_error?: boolean; subtype?: string };
+              if (typeof resultEvent.result === 'string') {
+                resultResultText = resultEvent.result;
+              }
+              if (typeof resultEvent.is_error === 'boolean') {
+                resultIsError = resultEvent.is_error;
+              }
+              if (typeof resultEvent.subtype === 'string') {
+                resultSubtype = resultEvent.subtype;
+              }
+            }
+          } catch {
+            diagnosticBuffer.push(`Invalid JSON line at EOF: ${incompleteLine.slice(0, 200)}`);
+          }
         }
       }
       const [exitCode, stderr] = await Promise.all([child.exited, stderrText]);
       await delivery;
       if (exitCode !== 0) {
         const detail = stderr.trim().slice(-400) || 'no stderr';
-        throw new Error(`cursor-agent exited ${exitCode} (model ${model}): ${detail}`);
-      }
-      if (finalText.trim().length === 0) {
-        // rc 0 with no output is the Workspace Trust / auth no-op
-        // (scripts/dispatch-worker/seat-preflight.ts cursorBuildResultIsEmpty).
-        // Never report it as success.
-        throw new Error(
-          'cursor-agent exited 0 with empty output (workspace trust or authentication not granted)'
-        );
+        const diagnostics = diagnosticBuffer.length > 0 ? `; ${diagnosticBuffer.join(' ')}` : '';
+        throw new Error(`cursor-agent exited ${exitCode} (model ${model}): ${detail}${diagnostics}`);
       }
     } finally {
       options?.abortSignal?.removeEventListener('abort', onAbort);
+    }
+
+    // Handle result event error check
+    if (resultIsError || (resultSubtype !== undefined && resultSubtype !== 'success')) {
+      const last400 = resultResultText.slice(-400);
+      const diagnostics = diagnosticBuffer.length > 0 ? `; ${diagnosticBuffer.join(' ')}` : '';
+      throw new Error(last400 + diagnostics);
+    }
+
+    // Use result.result as fallback if no assistant text was seen
+    if (finalText.trim().length === 0) {
+      finalText = resultResultText;
+    }
+
+    // finalText contains only assistant text (no thinking/tool text)
+    if (finalText.trim().length === 0) {
+      // rc 0 with no output is the Workspace Trust / auth no-op
+      // (scripts/dispatch-worker/seat-preflight.ts cursorBuildResultIsEmpty).
+      // Never report it as success.
+      throw new Error(
+        'cursor-agent exited 0 with empty output (workspace trust or authentication not granted)'
+      );
     }
 
     let structuredOutput: unknown;
@@ -156,9 +261,139 @@ export class CursorAgentProvider implements IAgentProvider {
       type: 'result',
       stopReason: 'stop',
       structuredOutput,
-      servedModelId: null,
-      servedModelMissingReason: 'cursor-agent --print text output carries no served-model field',
+      servedModelId,
+      servedModelMissingReason: servedModelId === null ? 'cursor-agent init event did not include model field' : undefined,
     };
+  }
+}
+
+/**
+ * Process a single stream-json event and return a provider chunk if one should be yielded.
+ * Returns null for events that don't need to be yielded (system/init).
+ */
+function processStreamEvent(
+  event: unknown,
+  diagnosticBuffer: string[],
+  onInit?: () => void
+): MessageChunk | null {
+  if (typeof event !== 'object' || event === null) {
+    diagnosticBuffer.push('Event is not an object');
+    return null;
+  }
+
+  const { type, subtype } = event as { type?: string; subtype?: string };
+
+  switch (type) {
+    case 'system':
+      // system/init events carry the served model; capture it but don't yield
+      if (subtype === 'init') {
+        onInit?.();
+        return null;
+      }
+      return null;
+
+    case 'assistant':
+      // Join text parts from assistant messages
+      const { message } = event as { message?: { content?: { type?: string; text?: string }[] } };
+      const content = message?.content;
+      if (Array.isArray(content)) {
+        const textParts = content
+          .filter((c): c is { type: string; text: string } => c.type === 'text' && typeof c.text === 'string')
+          .map(c => c.text)
+          .join('');
+        if (textParts.length > 0) {
+          return { type: 'assistant', content: textParts };
+        }
+      }
+      return null;
+
+    case 'thinking':
+      // thinking events reset the idle timer but don't contribute to node output
+      const { text } = event as { text?: string };
+      if (typeof text === 'string' && text.length > 0) {
+        return { type: 'thinking', content: text };
+      }
+      // Yield an empty progress chunk if no text
+      return { type: 'thinking', content: '' };
+
+    case 'tool_call':
+      // tool_call events reset the idle timer; represent as tool/tool_result chunks
+      const { subtype: toolSubtype, call_id } = event as { subtype?: string; call_id?: string };
+      if (toolSubtype === 'started') {
+        const toolCall = (event as { tool_call?: unknown }).tool_call;
+        if (toolCall && typeof toolCall === 'object') {
+          const toolName = detectToolName(toolCall);
+          return { type: 'tool', toolName, toolCallId: typeof call_id === 'string' ? call_id : undefined };
+        }
+        return { type: 'tool', toolName: 'unknown_tool', toolCallId: typeof call_id === 'string' ? call_id : undefined };
+      } else if (toolSubtype === 'completed') {
+        const toolCall = (event as { tool_call?: unknown }).tool_call;
+        if (toolCall && typeof toolCall === 'object') {
+          const toolName = detectToolName(toolCall);
+          const toolOutput = formatToolOutput(toolCall);
+          return { type: 'tool_result', toolName, toolOutput, toolCallId: typeof call_id === 'string' ? call_id : undefined };
+        }
+        return { type: 'tool_result', toolName: 'unknown_tool', toolOutput: '' };
+      }
+      return null;
+
+    case 'result':
+      // result events are handled after the stream ends
+      return null;
+
+    default:
+      // Unsupported event types are logged but don't fail the run
+      diagnosticBuffer.push(`Unknown event type: ${String(type)}`);
+      return null;
+  }
+}
+
+/**
+ * Detect the tool name from a tool_call object.
+ */
+function detectToolName(toolCall: unknown): string {
+  if (typeof toolCall !== 'object' || toolCall === null) return 'unknown_tool';
+
+  // Check for shellToolCall, editToolCall, etc.
+  for (const key of Object.keys(toolCall as object)) {
+    if (key.endsWith('ToolCall') && typeof (toolCall as Record<string, unknown>)[key] === 'object') {
+      const inner = (toolCall as Record<string, unknown>)[key];
+      if (inner && typeof inner === 'object') {
+        // Return the base name without 'ToolCall' suffix
+        return key.slice(0, -'ToolCall'.length).toLowerCase();
+      }
+    }
+  }
+
+  // Fallback: return the first property name
+  for (const key of Object.keys(toolCall as object)) {
+    return key;
+  }
+  return 'unknown_tool';
+}
+
+/**
+ * Format tool output from a tool_call object.
+ */
+function formatToolOutput(toolCall: unknown): string {
+  if (typeof toolCall !== 'object' || toolCall === null) return '';
+
+  // For shell tool calls, include the command
+  if ('shellToolCall' in toolCall && typeof (toolCall as { shellToolCall?: unknown }).shellToolCall === 'object') {
+    const shell = (toolCall as { shellToolCall?: unknown }).shellToolCall;
+    if (shell && typeof shell === 'object' && 'args' in shell && typeof (shell as { args?: unknown }).args === 'object') {
+      const args = (shell as { args?: unknown }).args;
+      if (args && typeof args === 'object' && 'command' in args && typeof (args as { command?: string }).command === 'string') {
+        return (args as { command: string }).command;
+      }
+    }
+  }
+
+  // Fallback: JSON-serialize the tool_call
+  try {
+    return JSON.stringify(toolCall);
+  } catch {
+    return '';
   }
 }
 
