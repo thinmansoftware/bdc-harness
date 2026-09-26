@@ -50,6 +50,11 @@ async function collect(gen: AsyncGenerator<MessageChunk>): Promise<MessageChunk[
   return chunks;
 }
 
+/** Build a stream-json stdout payload: one JSON object per line. */
+function jsonl(...events: unknown[]): string {
+  return events.map(e => `${JSON.stringify(e)}\n`).join('');
+}
+
 function assistantText(chunks: MessageChunk[]): string {
   return chunks.flatMap(c => (c.type === 'assistant' ? [c.content] : [])).join('');
 }
@@ -58,7 +63,26 @@ describe('CursorAgentProvider', () => {
   test('spawns cursor-agent with --workspace <cwd> and the configured model; prompt on stdin', async () => {
     let seenArgv: string[] = [];
     let seenCwd = '';
-    const { child, writes } = fakeChild({ stdout: 'edited two files\nCOMPLETE\n' });
+    const { child, writes } = fakeChild({
+      stdout: jsonl(
+        { type: 'system', subtype: 'init', model: 'Grok 4.7 256K High', session_id: 's1' },
+        {
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'edited two files\nCOMPLETE\n' }],
+          },
+          session_id: 's1',
+        },
+        {
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          result: 'edited two files\nCOMPLETE\n',
+          session_id: 's1',
+        }
+      ),
+    });
     const spawn: CursorAgentSpawn = (argv, options) => {
       seenArgv = argv;
       seenCwd = options.cwd;
@@ -75,6 +99,8 @@ describe('CursorAgentProvider', () => {
     expect(seenArgv).toEqual([
       'cursor-agent',
       '--print',
+      '--output-format',
+      'stream-json',
       '--force',
       '--trust',
       '--workspace',
@@ -92,7 +118,8 @@ describe('CursorAgentProvider', () => {
     expect(last?.type).toBe('result');
     if (last?.type === 'result') {
       expect(last.stopReason).toBe('stop');
-      expect(last.servedModelId).toBeNull();
+      // Served model captured from the stream-json init event.
+      expect(last.servedModelId).toBe('Grok 4.7 256K High');
     }
   });
 
@@ -100,7 +127,9 @@ describe('CursorAgentProvider', () => {
     const argvs: string[][] = [];
     const spawn: CursorAgentSpawn = argv => {
       argvs.push(argv);
-      return fakeChild({ stdout: 'ok' }).child;
+      return fakeChild({
+        stdout: jsonl({ type: 'result', subtype: 'success', is_error: false, result: 'ok' }),
+      }).child;
     };
     const provider = new CursorAgentProvider({ spawn });
     await collect(provider.sendQuery('a', '/w'));
@@ -112,7 +141,17 @@ describe('CursorAgentProvider', () => {
   });
 
   test('prepends systemPrompt and extracts fenced JSON for json_schema output', async () => {
-    const { child, writes } = fakeChild({ stdout: '```json\n{"verdict":"PASS"}\n```' });
+    const fenced = '```json\n{"verdict":"PASS"}\n```';
+    const { child, writes } = fakeChild({
+      stdout: jsonl(
+        { type: 'system', subtype: 'init', model: 'grok-4.7-high' },
+        {
+          type: 'assistant',
+          message: { role: 'assistant', content: [{ type: 'text', text: fenced }] },
+        },
+        { type: 'result', subtype: 'success', is_error: false, result: fenced }
+      ),
+    });
     const provider = new CursorAgentProvider({ spawn: () => child });
     const chunks = await collect(
       provider.sendQuery('judge it', '/w', undefined, {
@@ -158,6 +197,160 @@ describe('CursorAgentProvider', () => {
       shell: true,
     });
     expect(caps.sessionResume).toBe(false);
+  });
+});
+
+describe('CursorAgentProvider stream-json', () => {
+  test('stream-json: JSON-line streaming yields assistant text and captures the init model', async () => {
+    const { child } = fakeChild({
+      stdout: jsonl(
+        { type: 'system', subtype: 'init', model: 'Grok 4.7 256K High', session_id: 's1' },
+        {
+          type: 'assistant',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'part one ' }] },
+          session_id: 's1',
+        },
+        {
+          type: 'assistant',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'part two' }] },
+          session_id: 's1',
+        },
+        { type: 'result', subtype: 'success', is_error: false, result: 'part one part two' }
+      ),
+    });
+    const provider = new CursorAgentProvider({ spawn: () => child });
+    const chunks = await collect(provider.sendQuery('hi', '/w'));
+
+    expect(assistantText(chunks)).toBe('part one part two');
+    const last = chunks[chunks.length - 1];
+    expect(last?.type).toBe('result');
+    if (last?.type === 'result') {
+      expect(last.stopReason).toBe('stop');
+      expect(last.servedModelId).toBe('Grok 4.7 256K High');
+    }
+  });
+
+  test('stream-json: progress events (thinking deltas, tool calls) surface as chunks', async () => {
+    const { child } = fakeChild({
+      stdout: jsonl(
+        { type: 'system', subtype: 'init', model: 'grok-4.7-high' },
+        { type: 'thinking', subtype: 'delta', text: 'planning the edit', session_id: 's1' },
+        { type: 'thinking', subtype: 'completed', session_id: 's1' },
+        {
+          type: 'tool_call',
+          subtype: 'started',
+          call_id: 'call-1',
+          tool_call: { shellToolCall: { args: { command: 'ls' }, toolCallId: 'call-1' } },
+        },
+        {
+          type: 'tool_call',
+          subtype: 'completed',
+          call_id: 'call-1',
+          tool_call: {
+            shellToolCall: {
+              args: { command: 'ls' },
+              result: { success: { exitCode: 0 } },
+              toolCallId: 'call-1',
+            },
+          },
+        },
+        {
+          type: 'assistant',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+        },
+        { type: 'result', subtype: 'success', is_error: false, result: 'done' }
+      ),
+    });
+    const provider = new CursorAgentProvider({ spawn: () => child });
+    const chunks = await collect(provider.sendQuery('hi', '/w'));
+
+    expect(chunks.some(c => c.type === 'thinking' && c.content === 'planning the edit')).toBe(true);
+    expect(
+      chunks.some(c => c.type === 'tool' && c.toolName === 'shell' && c.toolCallId === 'call-1')
+    ).toBe(true);
+    expect(
+      chunks.some(
+        c =>
+          c.type === 'tool_result' &&
+          c.toolName === 'shell' &&
+          c.toolOutput.includes('"exitCode":0')
+      )
+    ).toBe(true);
+  });
+
+  test('stream-json: malformed lines are skipped without dropping valid events', async () => {
+    const { child } = fakeChild({
+      stdout: [
+        'not json at all',
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"survived"}}</truncated',
+        jsonl(
+          {
+            type: 'assistant',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'survived' }] },
+          },
+          { type: 'result', subtype: 'success', is_error: false, result: 'survived' }
+        ),
+        '{"also": "not a known event"',
+        '',
+      ].join('\n'),
+    });
+    const provider = new CursorAgentProvider({ spawn: () => child });
+    const chunks = await collect(provider.sendQuery('hi', '/w'));
+
+    expect(assistantText(chunks)).toBe('survived');
+    const last = chunks[chunks.length - 1];
+    expect(last?.type).toBe('result');
+    if (last?.type === 'result') expect(last.stopReason).toBe('stop');
+  });
+
+  test('stream-json: a result error becomes an isError result chunk, never a silent success', async () => {
+    const { child } = fakeChild({
+      stdout: jsonl(
+        { type: 'system', subtype: 'init', model: 'grok-4.7-high' },
+        {
+          type: 'result',
+          subtype: 'error_during_execution',
+          is_error: true,
+          result: 'tool exploded',
+        }
+      ),
+    });
+    const provider = new CursorAgentProvider({ spawn: () => child });
+    const chunks = await collect(provider.sendQuery('hi', '/w'));
+
+    const last = chunks[chunks.length - 1];
+    expect(last?.type).toBe('result');
+    if (last?.type === 'result') {
+      expect(last.isError).toBe(true);
+      expect(last.errorSubtype).toBe('error_during_execution');
+      expect(last.errors).toEqual(['tool exploded']);
+      expect(last.stopReason).toBeUndefined();
+    }
+  });
+
+  test('stream-json: falls back to the result event text when no assistant text streamed', async () => {
+    const { child } = fakeChild({
+      stdout: jsonl(
+        { type: 'system', subtype: 'init', session_id: 's1' },
+        { type: 'result', subtype: 'success', is_error: false, result: '{"verdict":"PASS"}' }
+      ),
+    });
+    const provider = new CursorAgentProvider({ spawn: () => child });
+    const chunks = await collect(
+      provider.sendQuery('judge it', '/w', undefined, {
+        outputFormat: { type: 'json_schema', schema: { type: 'object' } },
+      })
+    );
+
+    expect(assistantText(chunks)).toBe('{"verdict":"PASS"}');
+    const last = chunks[chunks.length - 1];
+    expect(last?.type).toBe('result');
+    if (last?.type === 'result') {
+      expect(last.structuredOutput).toEqual({ verdict: 'PASS' });
+      // Init event carried no model: report null WITH a machine-readable reason.
+      expect(last.servedModelId).toBeNull();
+      expect(last.servedModelMissingReason).toContain('init-event');
+    }
   });
 });
 
