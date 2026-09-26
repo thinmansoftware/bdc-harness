@@ -85,8 +85,15 @@ describe('CursorAgentProvider', () => {
     expect(argv[formatIndex + 1]).toBe('stream-json');
   });
 
-  test('progress chunks (init / thinking / tool_call / assistant) are yielded before the subprocess exits', async () => {
-    const streamJson = [
+  test('progress chunks (init / thinking / tool_call / assistant) are yielded before stdout closes and before the subprocess exits', async () => {
+    // The cursor-agent stream-json contract is one JSON object per line,
+    // followed by a trailing newline. The test feeds the provider a
+    // controllable ReadableStream that stays OPEN while we assert each
+    // activity chunk is yielded, then closes (and releases the exit gate)
+    // only after the assertion is satisfied. A buffering-until-EOF bug
+    // would surface here as a 50ms timeout on every pull, because the
+    // provider would have no chunks to yield until the stream closed.
+    const streamEvents = [
       '{"type":"system","subtype":"init","model":"Grok 4.7 256K High","session_id":"s1"}',
       '{"type":"thinking","subtype":"delta","text":"Listing the files"}',
       '{"type":"thinking","subtype":"delta","text":" and counting them"}',
@@ -95,53 +102,133 @@ describe('CursorAgentProvider', () => {
       '{"type":"tool_call","subtype":"completed","tool_call":{"shellToolCall":{"args":{"command":"ls -la"}}}}',
       '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"DONE"}]}}',
       '{"type":"result","subtype":"success","is_error":false,"duration_ms":4558,"result":"DONE"}',
-    ].join('\n');
-    const { child, writes } = fakeChild({ stdout: streamJson });
+    ];
+    const encoder = new TextEncoder();
+    let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
+    const stdoutStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        stdoutController = controller;
+      },
+    });
 
-    // Gate `exited` behind a manual resolve. The provider must yield its
-    // pre-exit activity chunks BEFORE awaiting child.exited. We release the
-    // gate after seeing the assistant chunk (the LAST pre-exit activity
-    // chunk); the final `result` chunk is then yielded post-exit, so by the
-    // time for-await finishes the result chunk is in `collected`.
+    // Gate `exited` behind a manual resolve. We will NOT release this gate
+    // until after we have drained all the pre-exit activity chunks -- so
+    // any chunk we collect has demonstrably been yielded before the child
+    // is allowed to "exit".
     let resolveExit!: (code: number) => void;
     const gatedExit = new Promise<number>(r => {
       resolveExit = r;
     });
-    const gatedChild: CursorAgentChild = { ...child, exited: gatedExit };
+    let exitResolved = false;
+
+    // The fakeChild helper does not understand our gated exit / controllable
+    // stdout combination, so we wire the test seam directly: a manual writes
+    // buffer for the prompt-on-stdin assertion and a fixed-stream child
+    // surface that matches CursorAgentChild.
+    const writes: string[] = [];
+    const gatedChild: CursorAgentChild = {
+      stdin: {
+        write: (chunk: string): number => {
+          writes.push(chunk);
+          return chunk.length;
+        },
+        end: (): void => undefined,
+      },
+      stdout: stdoutStream,
+      stderr: new Response('').body,
+      exited: gatedExit.then(code => {
+        exitResolved = true;
+        return code;
+      }),
+      kill: (): void => undefined,
+    };
 
     const spawn: CursorAgentSpawn = () => gatedChild;
     const provider = new CursorAgentProvider({ spawn });
 
-    const collected: MessageChunk[] = [];
-    let exitGateReleasedAfterAssistant = false;
-    let gateReleasedAtChunkIndex = -1;
+    // pullWithGuard races iter.next() against a short timeout. The guard is
+    // a SAFETY against hangs -- the test logic does not depend on it firing.
+    // Crucially, we always await the prior pullWithGuard before starting the
+    // next one, so at most one iter.next() Promise is pending at a time;
+    // abandoned Promises cannot silently consume yields.
+    async function pullWithGuard(iter: AsyncIterator<MessageChunk>, ms: number) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<{ kind: 'timeout' }>(r => {
+        timer = setTimeout(() => r({ kind: 'timeout' }), ms);
+      });
+      const nextPromise = iter.next().then(value => ({ kind: 'next' as const, value }));
+      const raceWinner = await Promise.race([nextPromise, timeout]);
+      if (timer) clearTimeout(timer);
+      return { raceWinner, nextPromise };
+    }
+
     const gen = provider.sendQuery('list and finish', '/work/tree');
-    let assistantSeen = false;
-    for await (const chunk of gen) {
-      collected.push(chunk);
-      if (chunk.type === 'assistant') {
-        assistantSeen = true;
-        // Release the exit gate AFTER collecting the assistant chunk but
-        // BEFORE the generator has awaited child.exited. This guarantees
-        // every chunk pushed so far was yielded while the child was still
-        // "running" by the generator's contract.
-        resolveExit(0);
-        exitGateReleasedAfterAssistant = assistantSeen;
-        gateReleasedAtChunkIndex = collected.length - 1;
+    const iter = gen[Symbol.asyncIterator]();
+
+    // Feed the controllable stream one event at a time, asserting a yield
+    // (or no-yield for init/result) after each enqueue. The stream stays
+    // OPEN across the entire drain -- it is closed only once we have
+    // already collected every pre-exit activity chunk.
+    const collected: MessageChunk[] = [];
+    // The 6 events below yield one chunk each; the init and result events
+    // set state without yielding.
+    const yieldCounts = [0, 1, 1, 1, 1, 1, 1, 0];
+    for (let i = 0; i < streamEvents.length; i++) {
+      stdoutController.enqueue(encoder.encode(`${streamEvents[i]}\n`));
+      const expected = yieldCounts[i];
+      for (let k = 0; k < expected; k++) {
+        const { raceWinner } = await pullWithGuard(iter, 200);
+        if (raceWinner.kind !== 'next') {
+          throw new Error(
+            `expected a chunk for event #${i} but timed out after 200ms ` +
+              `(this means the provider is buffering until stdout closes)`
+          );
+        }
+        if (raceWinner.value.done) {
+          throw new Error(`unexpected generator completion at event #${i}`);
+        }
+        collected.push(raceWinner.value.value);
       }
     }
 
-    // The exit gate was released only after the assistant chunk was
-    // collected -- so every chunk collected before the release is a
-    // pre-exit chunk.
-    expect(exitGateReleasedAfterAssistant).toBe(true);
-    expect(gateReleasedAtChunkIndex).toBeGreaterThanOrEqual(0);
+    // After the last enqueue (the result event, which yields nothing), the
+    // provider is blocked on reader.read(): the stream is OPEN, no more
+    // data has been queued, and the read loop has already drained every
+    // complete line. A pull with a short timeout MUST time out -- that is
+    // the smoking-gun assertion that "chunks were yielded before close".
+    const blocked = await pullWithGuard(iter, 50);
+    expect(blocked.raceWinner.kind).toBe('timeout');
+    expect(exitResolved).toBe(false); // exit gate still held
+
+    // Now -- and ONLY now -- close the stream and release the exit gate.
+    // After this, the provider's read returns done=true, it breaks out of
+    // the read loop, awaits child.exited (now resolved with 0), and yields
+    // the final result chunk. The probe's nextPromise consumes that yield.
+    resolveExit(0);
+    stdoutController.close();
+
+    const resultResolution = await blocked.nextPromise;
+    expect(resultResolution.kind).toBe('next');
+    if (resultResolution.kind === 'next') {
+      expect(resultResolution.value.done).toBe(false);
+      collected.push(resultResolution.value.value);
+    }
+
+    const terminal = await iter.next();
+    expect(terminal.done).toBe(true);
+
+    // Sanity: 6 pre-exit activity chunks (3 thinking, 2 tool, 1 assistant)
+    // + 1 result chunk. The pre-exit ones arrived BEFORE stdoutController.close()
+    // and BEFORE the exit gate resolved; the result chunk arrived after.
+    expect(collected.length).toBe(7);
 
     // At least one chunk per event type must appear in the collected stream.
     const types = new Set(collected.map(c => c.type));
     expect(types.has('thinking')).toBe(true);
     expect(types.has('tool')).toBe(true);
     expect(types.has('assistant')).toBe(true);
+    expect(types.has('result')).toBe(true);
+
     // Thinking/tool events come BEFORE assistant text (per the stream-json
     // emission order). The exact order is preserved by `collected`.
     const firstAssistantIdx = collected.findIndex(c => c.type === 'assistant');
@@ -149,6 +236,8 @@ describe('CursorAgentProvider', () => {
     expect(lastThinkingIdx).toBeLessThan(firstAssistantIdx);
     const firstToolIdx = collected.findIndex(c => c.type === 'tool');
     expect(firstToolIdx).toBeLessThan(firstAssistantIdx);
+    // Result chunk is last.
+    expect(collected[collected.length - 1]?.type).toBe('result');
 
     // Final node text = concatenated assistant texts only (no thinking text).
     const assistantTextValue = assistantText(collected);

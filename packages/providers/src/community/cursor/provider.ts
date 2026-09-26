@@ -174,17 +174,25 @@ export class CursorAgentProvider implements IAgentProvider {
         const decoder = new TextDecoder();
         const reader = child.stdout.getReader();
         let pending = '';
-        const queuedChunks: MessageChunk[] = [];
-        const dispatchLine = (raw: string): void => {
+        // dispatchLine runs side effects on finalText / resultFallbackText /
+        // servedModelId / garbageLineBuffer synchronously and returns the
+        // activity chunks that the caller must yield. Yielding them inline
+        // (between `await reader.read()` calls) is what keeps the DAG
+        // executor's per-chunk idle timer alive during a long run; the
+        // cursor-agent stream-json contract is "one JSON object per line",
+        // so yielding per-line preserves ordering without needing to wait
+        // for the stream to close (anchor: a4923f64 idle-timeout run).
+        const dispatchLine = (raw: string): MessageChunk[] => {
           const line = raw.replace(/\r$/, '');
-          if (line.length === 0) return;
+          if (line.length === 0) return [];
           let event: CursorStreamEvent | undefined;
           try {
             event = JSON.parse(line) as CursorStreamEvent;
           } catch {
             garbageLineBuffer = appendGarbage(garbageLineBuffer, line);
-            return;
+            return [];
           }
+          const yieldChunks: MessageChunk[] = [];
           for (const chunk of processStreamEvent(event)) {
             switch (chunk.kind) {
               case 'final_text':
@@ -202,10 +210,11 @@ export class CursorAgentProvider implements IAgentProvider {
                 garbageLineBuffer = appendGarbage(garbageLineBuffer, line);
                 break;
               case 'yield':
-                queuedChunks.push(chunk.chunk);
+                yieldChunks.push(chunk.chunk);
                 break;
             }
           }
+          return yieldChunks;
         };
         for (;;) {
           const { done, value } = await reader.read();
@@ -224,7 +233,9 @@ export class CursorAgentProvider implements IAgentProvider {
           while (newlineIndex !== -1) {
             const rawLine = pending.slice(0, newlineIndex);
             pending = pending.slice(newlineIndex + 1);
-            dispatchLine(rawLine);
+            for (const activityChunk of dispatchLine(rawLine)) {
+              yield activityChunk;
+            }
             newlineIndex = pending.indexOf('\n');
           }
 
@@ -234,17 +245,12 @@ export class CursorAgentProvider implements IAgentProvider {
             const tail = pending;
             pending = '';
             if (tail.length > 0) {
-              dispatchLine(tail);
+              for (const activityChunk of dispatchLine(tail)) {
+                yield activityChunk;
+              }
             }
             break;
           }
-        }
-        // Yield queued chunks AFTER the synchronous read loop returns to the
-        // generator. Doing it inline (inside dispatchLine) would require yield
-        // inside a non-generator closure; the consumer still sees each chunk
-        // one iteration at a time, so the idle-timer reset contract holds.
-        while (queuedChunks.length > 0) {
-          yield queuedChunks.shift() as MessageChunk;
         }
       }
       const [exitCode, stderr] = await Promise.all([child.exited, stderrText]);
