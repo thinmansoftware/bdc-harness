@@ -194,7 +194,7 @@ export class CursorAgentProvider implements IAgentProvider {
         resultText = result;
         resultError = event.is_error === true;
         resultSubtype = typeof event.subtype === 'string' ? event.subtype : null;
-        if (!resultError && resultSubtype !== null && resultSubtype !== 'success') {
+        if (!resultError && resultSubtype !== 'success') {
           resultError = true;
         }
         return;

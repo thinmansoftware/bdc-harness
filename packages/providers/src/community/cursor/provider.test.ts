@@ -156,9 +156,11 @@ describe('CursorAgentProvider', () => {
     let seenArgv: string[] = [];
     let seenCwd = '';
     const { child, writes } = fakeChild({
-      stdout: [initEvent('gpt-5.6-sol-high'), assistantEvent('edited two files\nCOMPLETE\n'), successResult()].join(
-        '\n'
-      ),
+      stdout: [
+        initEvent('gpt-5.6-sol-high'),
+        assistantEvent('edited two files\nCOMPLETE\n'),
+        successResult(),
+      ].join('\n'),
     });
     const spawn: CursorAgentSpawn = (argv, options) => {
       seenArgv = argv;
@@ -208,9 +210,11 @@ describe('CursorAgentProvider', () => {
 
   test('prepends systemPrompt and extracts fenced JSON for json_schema output', async () => {
     const { child, writes } = fakeChild({
-      stdout: [initEvent(), assistantEvent('```json\n{"verdict":"PASS"}\n```'), successResult()].join(
-        '\n'
-      ),
+      stdout: [
+        initEvent(),
+        assistantEvent('```json\n{"verdict":"PASS"}\n```'),
+        successResult(),
+      ].join('\n'),
     });
     const provider = new CursorAgentProvider({ spawn: () => child });
     const chunks = await collect(
@@ -265,9 +269,10 @@ describe('CursorAgentProvider', () => {
 
     // The assistant progress was yielded while exit was still unresolved.
     const progressTypes = collected.map(c => c.type);
-    expect(progressTypes).toContain('thinking');
-    expect(progressTypes).toContain('tool');
-    expect(progressTypes).toContain('assistant');
+    // Exactly one `thinking` chunk and one `tool` chunk per event: the two
+    // thinking records and the two tool-call records must each yield exactly
+    // once, in order.
+    expect(progressTypes).toEqual(['thinking', 'thinking', 'tool', 'tool', 'assistant']);
     expect(assistantText(collected)).toBe('I will list the files then reply DONE');
     expect(assistantText(collected)).not.toContain('Listing the files in');
     expect(assistantText(collected)).not.toContain('ls -la');
@@ -284,14 +289,15 @@ describe('CursorAgentProvider', () => {
   test('Test 2: a JSON record split across chunks and multiple records per chunk are both handled', async () => {
     // Frame the full stream so a single JSON line straddles a chunk boundary
     // and another chunk carries several complete lines at once.
-    const text = [
-      initEvent(),
-      thinkingEvent('split across a boundary'),
-      assistantEvent('one'),
-      assistantEvent('two'),
-      assistantEvent('three'),
-      successResult('one two three'),
-    ].join('\n') + '\n';
+    const text =
+      [
+        initEvent(),
+        thinkingEvent('split across a boundary'),
+        assistantEvent('one'),
+        assistantEvent('two'),
+        assistantEvent('three'),
+        successResult('one two three'),
+      ].join('\n') + '\n';
 
     let child: CursorAgentChild;
     const spawn: CursorAgentSpawn = () => {
@@ -311,29 +317,60 @@ describe('CursorAgentProvider', () => {
 
   test('Test 3: error result throws and a non-success subtype also throws', async () => {
     const errorStream =
-      [initEvent(), assistantEvent('about to fail'), JSON.stringify({ type: 'result', subtype: 'error', is_error: true, result: 'model refused' })].join(
-        '\n'
-      ) + '\n';
+      [
+        initEvent(),
+        assistantEvent('about to fail'),
+        JSON.stringify({
+          type: 'result',
+          subtype: 'error',
+          is_error: true,
+          result: 'model refused',
+        }),
+      ].join('\n') + '\n';
     const provider1 = new CursorAgentProvider({
       spawn: () => fakeChild({ stdout: errorStream }).child,
     });
     await expect(collect(provider1.sendQuery('hi', '/w'))).rejects.toThrow(/model refused/);
 
     const subtypeOnly =
-      [initEvent(), assistantEvent('x'), JSON.stringify({ type: 'result', subtype: 'cancelled', is_error: false, result: 'stopped early' })].join(
-        '\n'
-      ) + '\n';
+      [
+        initEvent(),
+        assistantEvent('x'),
+        JSON.stringify({
+          type: 'result',
+          subtype: 'cancelled',
+          is_error: false,
+          result: 'stopped early',
+        }),
+      ].join('\n') + '\n';
     const provider2 = new CursorAgentProvider({
       spawn: () => fakeChild({ stdout: subtypeOnly }).child,
     });
     await expect(collect(provider2.sendQuery('hi', '/w'))).rejects.toThrow(/stopped early/);
+
+    // A result event with is_error=false but NO subtype at all must also throw.
+    const noSubtype =
+      [
+        initEvent(),
+        assistantEvent('x'),
+        JSON.stringify({
+          type: 'result',
+          is_error: false,
+          result: 'missing subtype',
+        }),
+      ].join('\n') + '\n';
+    const provider3 = new CursorAgentProvider({
+      spawn: () => fakeChild({ stdout: noSubtype }).child,
+    });
+    await expect(collect(provider3.sendQuery('hi', '/w'))).rejects.toThrow(/missing subtype/);
   });
 
   test('Test 4: empty result with no assistant text throws the empty-output error', async () => {
     const emptySuccess =
-      [initEvent(), JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: '' })].join(
-        '\n'
-      ) + '\n';
+      [
+        initEvent(),
+        JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: '' }),
+      ].join('\n') + '\n';
     const provider = new CursorAgentProvider({
       spawn: () => fakeChild({ stdout: emptySuccess, exitCode: 0 }).child,
     });
