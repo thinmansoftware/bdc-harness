@@ -64,7 +64,18 @@ const defaultCursorAgentSpawn: CursorAgentSpawn = (argv, options) =>
 
 /** Exported for tests: the exact argv, with the prompt deliberately absent. */
 export function buildCursorAgentArgv(binary: string, model: string, cwd: string): string[] {
-  return [binary, '--print', '--force', '--trust', '--workspace', cwd, '--model', model];
+  return [
+    binary,
+    '--print',
+    '--force',
+    '--trust',
+    '--output-format',
+    'stream-json',
+    '--workspace',
+    cwd,
+    '--model',
+    model,
+  ];
 }
 
 export class CursorAgentProvider implements IAgentProvider {
@@ -110,30 +121,116 @@ export class CursorAgentProvider implements IAgentProvider {
     // reads stdin to EOF before answering, so writing and reading must overlap.
     const delivery = deliverPrompt(child.stdin, buildCursorPrompt(prompt, options));
 
+    // cursor-agent stream-json emits one JSON object per line. We consume
+    // stdout incrementally (complete lines only) so progress events are yielded
+    // while the child is still working -- keeping the DAG executor's idle timer
+    // alive across a long build -- instead of waiting for process exit.
     let finalText = '';
+    let servedModelId: string | null = null;
+    let servedModelMissingReason: string | null =
+      'cursor-agent stream init event carried no served-model field';
+    let resultText: string | null = null;
+    let resultError = false;
+    let resultSubtype: string | null = null;
+    // Bounded diagnostic buffer for lines that are not valid JSON.
+    const diagnosticLines: string[] = [];
+    const DIAGNOSTIC_MAX_LINES = 20;
+
+    // Nested async generator so each parsed event can itself yield a chunk.
+    async function* processLine(line: string): AsyncGenerator<MessageChunk> {
+      if (line.length === 0) return;
+      let event: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(line);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          throw new Error('not an object');
+        }
+        event = parsed as Record<string, unknown>;
+      } catch {
+        // A non-JSON line must never crash the stream; retain a bounded record.
+        if (diagnosticLines.length < DIAGNOSTIC_MAX_LINES) {
+          diagnosticLines.push(line.slice(0, 400));
+        }
+        return;
+      }
+
+      const type = event.type;
+      if (type === 'system' || type === 'init') {
+        const modelField = event.model;
+        if (typeof modelField === 'string' && modelField.length > 0) {
+          servedModelId = modelField;
+          servedModelMissingReason = null;
+        }
+        return;
+      }
+      if (type === 'thinking') {
+        // Yield an activity-counting chunk so the idle timer keeps resetting;
+        // thinking text must never enter the final node output.
+        yield { type: 'thinking', content: extractText(event.text) };
+        return;
+      }
+      if (type === 'tool_call') {
+        const call = asRecord(event.tool_call);
+        const toolName = extractToolName(call);
+        yield {
+          type: 'tool',
+          toolName: toolName.length > 0 ? toolName : 'cursor-agent-tool',
+          ...(typeof event.call_id === 'string' && event.call_id.length > 0
+            ? { toolCallId: event.call_id }
+            : {}),
+        };
+        return;
+      }
+      if (type === 'assistant') {
+        const text = extractAssistantText(event);
+        if (text.length > 0) {
+          finalText += text;
+          yield { type: 'assistant', content: text };
+        }
+        return;
+      }
+      if (type === 'result') {
+        const result = typeof event.result === 'string' ? event.result : '';
+        resultText = result;
+        resultError = event.is_error === true;
+        resultSubtype = typeof event.subtype === 'string' ? event.subtype : null;
+        if (!resultError && resultSubtype !== null && resultSubtype !== 'success') {
+          resultError = true;
+        }
+        return;
+      }
+      // Unknown valid event types are ignored safely.
+    }
+
     try {
       if (child.stdout) {
         const decoder = new TextDecoder();
         const reader = child.stdout.getReader();
+        let pending = '';
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          const text = decoder.decode(value, { stream: true });
-          if (text.length === 0) continue;
-          finalText += text;
-          yield { type: 'assistant', content: text };
+          pending += decoder.decode(value, { stream: true });
+          const lines = pending.split('\n');
+          pending = lines.pop() ?? '';
+          for (const line of lines) yield* processLine(line);
         }
-        const tail = decoder.decode();
-        if (tail.length > 0) {
-          finalText += tail;
-          yield { type: 'assistant', content: tail };
-        }
+        pending += decoder.decode();
+        if (pending.length > 0) yield* processLine(pending);
       }
+
       const [exitCode, stderr] = await Promise.all([child.exited, stderrText]);
       await delivery;
       if (exitCode !== 0) {
         const detail = stderr.trim().slice(-400) || 'no stderr';
         throw new Error(`cursor-agent exited ${exitCode} (model ${model}): ${detail}`);
+      }
+      if (resultError) {
+        const detail = (resultText ?? '').slice(-400) || `subtype ${resultSubtype ?? 'unknown'}`;
+        throw new Error(`cursor-agent reported an error result: ${detail}`);
+      }
+      if (finalText.trim().length === 0) {
+        finalText = resultText ?? '';
       }
       if (finalText.trim().length === 0) {
         // rc 0 with no output is the Workspace Trust / auth no-op
@@ -156,10 +253,53 @@ export class CursorAgentProvider implements IAgentProvider {
       type: 'result',
       stopReason: 'stop',
       structuredOutput,
-      servedModelId: null,
-      servedModelMissingReason: 'cursor-agent --print text output carries no served-model field',
+      servedModelId,
+      servedModelMissingReason: servedModelMissingReason ?? undefined,
     };
   }
+}
+
+function extractText(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/** Join the text parts of an assistant message in order, exactly once. */
+function extractAssistantText(event: Record<string, unknown>): string {
+  const message = asRecord(event.message);
+  const content = message.content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map(part => {
+      if (typeof part === 'string') return part;
+      const obj = asRecord(part);
+      return typeof obj.text === 'string' ? obj.text : '';
+    })
+    .join('');
+}
+
+/**
+ * Best-effort tool-name extraction from a cursor-agent tool_call object. The
+ * live event wraps the actual call under a provider-specific key (e.g.
+ * `shellToolCall`) whose value has an `args` shape. Fall back to the wrapper
+ * key when the command cannot be determined.
+ */
+function extractToolName(call: Record<string, unknown>): string {
+  for (const [key, value] of Object.entries(call)) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue;
+    const args = asRecord(asRecord(value).args);
+    const command = args.command;
+    if (typeof command === 'string' && command.trim().length > 0) {
+      return command.trim().split(/\s+/)[0] ?? `cursor-${key}`;
+    }
+    return `cursor-${key}`;
+  }
+  return 'cursor-agent-tool';
 }
 
 function buildCursorPrompt(prompt: string, options?: SendQueryOptions): string {
