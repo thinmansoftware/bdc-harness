@@ -11,6 +11,10 @@
  *  - `--print`  non-interactive; "Has access to all tools, including write and
  *               shell". No `--mode`: both `plan` and `ask` are READ-ONLY, which
  *               is right for the judge rung and wrong for a build seat.
+ *  - `--output-format stream-json`  one JSON event per line while the agent
+ *               works, so the DAG idle timer resets. The default `text` format
+ *               prints only the final answer at exit, leaving the stream silent
+ *               for the whole run and tripping the lane idle timeout.
  *  - `--force`  run commands without prompting.
  *  - `--trust`  suppress the Workspace Trust prompt; without it the CLI exits 0
  *               with EMPTY output, so empty output is treated as failure below.
@@ -64,7 +68,18 @@ const defaultCursorAgentSpawn: CursorAgentSpawn = (argv, options) =>
 
 /** Exported for tests: the exact argv, with the prompt deliberately absent. */
 export function buildCursorAgentArgv(binary: string, model: string, cwd: string): string[] {
-  return [binary, '--print', '--force', '--trust', '--workspace', cwd, '--model', model];
+  return [
+    binary,
+    '--print',
+    '--output-format',
+    'stream-json',
+    '--force',
+    '--trust',
+    '--workspace',
+    cwd,
+    '--model',
+    model,
+  ];
 }
 
 export class CursorAgentProvider implements IAgentProvider {
@@ -105,42 +120,90 @@ export class CursorAgentProvider implements IAgentProvider {
     options?.abortSignal?.addEventListener('abort', onAbort, { once: true });
 
     // Drain stderr from the start so a chatty child can never block on a full pipe.
-    const stderrText = child.stderr ? new Response(child.stderr).text() : Promise.resolve('');
+    // The catch is attached immediately: a stream-json error result throws before
+    // this promise is awaited, and must not surface as an unhandled rejection.
+    const stderrText = (
+      child.stderr ? new Response(child.stderr).text() : Promise.resolve('')
+    ).catch(() => undefined);
     // Deliver the prompt WITHOUT awaiting it before reading stdout: the child
     // reads stdin to EOF before answering, so writing and reading must overlap.
     const delivery = deliverPrompt(child.stdin, buildCursorPrompt(prompt, options));
 
+    const stream: CursorStreamAccum = {
+      assistantText: '',
+      servedModelId: null,
+    };
+    let diagnostics = '';
     let finalText = '';
     try {
       if (child.stdout) {
         const decoder = new TextDecoder();
         const reader = child.stdout.getReader();
+        // Newline-delimited JSON: a record may be split across stdout chunks or
+        // arrive without a trailing newline, so buffer the partial tail.
+        let remainder = '';
+        const consumeLine = (line: string): MessageChunk | undefined => {
+          const stripped = line.endsWith('\r') ? line.slice(0, -1) : line;
+          if (stripped.trim().length === 0) return undefined;
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(stripped);
+          } catch {
+            // One bad line is a diagnostic, never fatal. Keep only a bounded
+            // tail so a pathological stream cannot grow this without limit.
+            diagnostics = `${diagnostics}${stripped}\n`.slice(-DIAGNOSTIC_BUFFER_LIMIT);
+            return undefined;
+          }
+          try {
+            return interpretCursorStreamEvent(parsed, stream);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            throw new Error(attachDiagnostics(message, diagnostics));
+          }
+        };
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
-          const text = decoder.decode(value, { stream: true });
-          if (text.length === 0) continue;
-          finalText += text;
-          yield { type: 'assistant', content: text };
+          remainder += decoder.decode(value, { stream: true });
+          const lines = remainder.split('\n');
+          remainder = lines.pop() ?? '';
+          for (const line of lines) {
+            const chunk = consumeLine(line);
+            if (chunk !== undefined) yield chunk;
+          }
         }
-        const tail = decoder.decode();
-        if (tail.length > 0) {
-          finalText += tail;
-          yield { type: 'assistant', content: tail };
+        remainder += decoder.decode();
+        if (remainder.length > 0) {
+          const chunk = consumeLine(remainder);
+          if (chunk !== undefined) yield chunk;
         }
       }
       const [exitCode, stderr] = await Promise.all([child.exited, stderrText]);
       await delivery;
       if (exitCode !== 0) {
-        const detail = stderr.trim().slice(-400) || 'no stderr';
-        throw new Error(`cursor-agent exited ${exitCode} (model ${model}): ${detail}`);
+        const detail = (stderr ?? '').trim().slice(-400) || 'no stderr';
+        throw new Error(
+          attachDiagnostics(
+            `cursor-agent exited ${exitCode} (model ${model}): ${detail}`,
+            diagnostics
+          )
+        );
+      }
+      // Assistant text is the node output; the result payload is only a fallback
+      // for a stream that never emitted assistant text.
+      finalText = stream.assistantText;
+      if (finalText.trim().length === 0 && stream.resultText !== undefined) {
+        finalText = stream.resultText;
       }
       if (finalText.trim().length === 0) {
         // rc 0 with no output is the Workspace Trust / auth no-op
         // (scripts/dispatch-worker/seat-preflight.ts cursorBuildResultIsEmpty).
         // Never report it as success.
         throw new Error(
-          'cursor-agent exited 0 with empty output (workspace trust or authentication not granted)'
+          attachDiagnostics(
+            'cursor-agent exited 0 with empty output (workspace trust or authentication not granted)',
+            diagnostics
+          )
         );
       }
     } finally {
@@ -152,14 +215,101 @@ export class CursorAgentProvider implements IAgentProvider {
       structuredOutput = parseJsonBestEffort(finalText);
     }
 
+    const servedModelId = stream.servedModelId;
     yield {
       type: 'result',
       stopReason: 'stop',
       structuredOutput,
-      servedModelId: null,
-      servedModelMissingReason: 'cursor-agent --print text output carries no served-model field',
+      servedModelId,
+      ...(servedModelId === null
+        ? {
+            servedModelMissingReason: 'cursor-agent stream-json init event did not include a model',
+          }
+        : {}),
     };
   }
+}
+
+interface CursorStreamAccum {
+  assistantText: string;
+  servedModelId: string | null;
+  resultText?: string;
+}
+
+/** Cap on retained non-JSON diagnostic text; attaches are sliced to 400. */
+const DIAGNOSTIC_BUFFER_LIMIT = 4096;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function attachDiagnostics(message: string, diagnostics: string): string {
+  if (diagnostics.length === 0) return message;
+  return `${message}\n${diagnostics.slice(-400)}`;
+}
+
+/** Join the text parts of an assistant event message; ignore anything else. */
+function assistantTextFrom(event: Record<string, unknown>): string {
+  const message = event.message;
+  if (!isRecord(message)) return '';
+  const content = message.content;
+  if (!Array.isArray(content)) return '';
+  let text = '';
+  for (const part of content) {
+    if (!isRecord(part)) continue;
+    if (part.type === 'text' && typeof part.text === 'string') text += part.text;
+  }
+  return text;
+}
+
+/** The tool_call payload is keyed by the tool variant name (shellToolCall, ...). */
+function toolNameFrom(toolCall: unknown): string {
+  if (!isRecord(toolCall)) return 'tool_call';
+  const key = Object.keys(toolCall)[0];
+  return key !== undefined && key.length > 0 ? key : 'tool_call';
+}
+
+/**
+ * Interpret one stream-json event. Returns the chunk to yield, or undefined for
+ * events that only update accumulator state. Throws on a failed result event.
+ */
+function interpretCursorStreamEvent(
+  value: unknown,
+  state: CursorStreamAccum
+): MessageChunk | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.type === 'assistant') {
+    const content = assistantTextFrom(value);
+    state.assistantText += content;
+    return { type: 'assistant', content };
+  }
+  if (value.type === 'thinking') {
+    // Progress only: thinking text must never reach the node output.
+    const text = typeof value.text === 'string' ? value.text : '';
+    return { type: 'thinking', content: text };
+  }
+  if (value.type === 'tool_call') {
+    const toolName = toolNameFrom(value.tool_call);
+    const toolCallId = typeof value.call_id === 'string' ? value.call_id : undefined;
+    return toolCallId !== undefined
+      ? { type: 'tool', toolName, toolCallId }
+      : { type: 'tool', toolName };
+  }
+  if (value.type === 'system' && value.subtype === 'init') {
+    if (typeof value.model === 'string' && value.model.length > 0) {
+      state.servedModelId = value.model;
+    }
+    return undefined;
+  }
+  if (value.type === 'result') {
+    if (typeof value.result === 'string') state.resultText = value.result;
+    if (value.is_error === true || value.subtype !== 'success') {
+      const raw = typeof value.result === 'string' ? value.result : '';
+      throw new Error(`cursor-agent result error: ${raw.slice(-400)}`);
+    }
+    return undefined;
+  }
+  return undefined;
 }
 
 function buildCursorPrompt(prompt: string, options?: SendQueryOptions): string {
