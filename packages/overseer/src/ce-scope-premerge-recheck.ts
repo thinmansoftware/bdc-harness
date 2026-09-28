@@ -11,6 +11,7 @@ export type CeScopeRefusalReason =
   | 'compare_failed'
   | 'compare_truncated'
   | 'approval_missing'
+  | 'pr_mismatch'
   | 'revoked'
   | 'approval_malformed'
   | 'approval_error'
@@ -96,8 +97,11 @@ const defaultGitHub: CeScopeGitHub = {
     const data = await request(`repos/${repo}/compare/${base}...${head}?per_page=100&page=${page}`);
     return {
       files: data.files ?? [],
-      truncated: data.status === 'diverged' && data.files?.length >= 300,
-      hasNext: (data.files?.length ?? 0) === 100,
+      // GitHub caps the compare response's files array at 300. It is not a
+      // pageable file collection (pagination applies to commits), so reaching
+      // the cap can never be treated as a complete scope calculation.
+      truncated: (data.files?.length ?? 0) >= 300,
+      hasNext: false,
     };
   },
   listWorkflowRuns: async (repo, head, event, page) => {
@@ -181,11 +185,10 @@ export async function recheckCeScopeBeforeMerge(
         return { ok: false, reason: decision.other_base ? 'base_moved' : 'approval_missing' };
       }
       const a = decision.approval;
+      if (a.repo !== input.repo || a.pr_number !== input.pr_number || a.head_sha !== pr.head.sha)
+        return { ok: false, reason: 'pr_mismatch' };
+      if (a.base_sha !== base) return { ok: false, reason: 'base_moved' };
       if (
-        a.repo !== input.repo ||
-        a.pr_number !== input.pr_number ||
-        a.head_sha !== pr.head.sha ||
-        a.base_sha !== base ||
         a.target_branch !== 'release/ce'
       )
         return { ok: false, reason: 'approval_malformed' };
@@ -201,7 +204,10 @@ export async function recheckCeScopeBeforeMerge(
       for (let page = 1; page <= 100; page++) {
         const result = await gh.listWorkflowRuns(input.repo, pr.head.sha, event, page);
         const selected = result.runs.filter(
-          run => run.path === GATE_PATH && run.head_branch === pr.head.ref
+          run =>
+            run.path === GATE_PATH &&
+            run.event === event &&
+            run.head_branch === pr.head.ref
         );
         (event === 'pull_request_target' ? targetRuns : legacyRuns).push(...selected);
         if (!result.hasNext) break;
@@ -212,13 +218,21 @@ export async function recheckCeScopeBeforeMerge(
   }
   if (!targetRuns.length)
     return { ok: false, reason: legacyRuns.length ? 'wrong_gate_event' : 'gate_not_green' };
-  targetRuns.sort(
+  // The API may return multiple attempts for one run. Only that run's latest
+  // attempt is authoritative; an earlier green attempt must not bridge a red
+  // rerun of the same workflow run.
+  const latestTargetAttempts = [...targetRuns.reduce((byId, run) => {
+    const prior = byId.get(run.id);
+    if (!prior || run.run_attempt > prior.run_attempt) byId.set(run.id, run);
+    return byId;
+  }, new Map<number, (typeof targetRuns)[number]>()).values()];
+  latestTargetAttempts.sort(
     (a, b) => b.run_started_at.localeCompare(a.run_started_at) || b.run_attempt - a.run_attempt
   );
-  const selected = targetRuns[0];
+  const selected = latestTargetAttempts[0];
   if (selected.conclusion !== 'success') return { ok: false, reason: 'gate_not_green' };
   const allowedSuites = new Set<number>([
-    selected.check_suite_id,
+    ...targetRuns.map(run => run.check_suite_id),
     ...legacyRuns.map(run => run.check_suite_id),
   ]);
   try {

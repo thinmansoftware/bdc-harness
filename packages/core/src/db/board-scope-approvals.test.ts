@@ -78,4 +78,19 @@ describe('CE scope approval store', () => {
     expect(reruns).toEqual([2]);
     await db.close();
   });
+
+  test('fails closed when stored approval details do not match the indexed identity', async () => {
+    const { db, github } = await fixture();
+    const input = { ...proof, repo: 'thinmansoftware/lspro-react', pr_number: 12, head_sha: head, conditions: 'ok', evidence_url: 'https://example.test/e' };
+    const recorded = await recordScopeApproval(input, { db, github, now: async () => now });
+    if (!recorded.ok) throw new Error('expected approval');
+    await db.query('DROP TRIGGER IF EXISTS board_audit_events_no_update');
+    await db.query('DROP TRIGGER IF EXISTS trg_board_audit_events_no_update');
+    await db.query("UPDATE board_audit_events SET details=$1 WHERE event_type='ce_scope_approval_recorded'", [
+      JSON.stringify({ ...recorded.approval, head_sha: 'c'.repeat(40) }),
+    ]);
+    expect(await getScopeApprovalDecision({ repo: input.repo, pr_number: 12, head_sha: head, base_sha: base }, { db }))
+      .toEqual({ decision: 'deny', reason: 'malformed' });
+    await db.close();
+  });
 });

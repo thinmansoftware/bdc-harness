@@ -100,6 +100,21 @@ function parseDetails(value: string | ScopeApproval): ScopeApproval | null {
   }
 }
 
+function approvalMatchesIdentity(
+  approval: ScopeApproval,
+  input: { repo: string; pr_number: number; head_sha: string; base_sha: string }
+): boolean {
+  return (
+    approval.repo === input.repo &&
+    approval.pr_number === input.pr_number &&
+    approval.head_sha === input.head_sha &&
+    approval.base_sha === input.base_sha &&
+    approval.authority === 'john' &&
+    typeof approval.approval_id === 'string' &&
+    approval.approval_id.length > 0
+  );
+}
+
 async function dbNow(db: IDatabase): Promise<string> {
   const sql =
     db.dialect === 'sqlite'
@@ -313,7 +328,8 @@ export async function getScopeApprovalDecision(
     return { decision: 'deny', reason: 'no_record', other_base: Number(other?.n ?? 0) > 0 };
   }
   const approval = parseDetails(row.details);
-  if (!approval) return { decision: 'deny', reason: 'malformed' };
+  if (!approval || !approvalMatchesIdentity(approval, input))
+    return { decision: 'deny', reason: 'malformed' };
   if (!approval.conditions?.trim()) return { decision: 'deny', reason: 'empty_conditions' };
   const revoked = (
     await db.query<{ n: number | string }>(

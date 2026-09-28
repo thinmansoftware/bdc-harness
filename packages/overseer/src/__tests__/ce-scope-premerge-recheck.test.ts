@@ -36,4 +36,27 @@ describe('CE scope premerge recheck', () => {
     expect(decisions).toBe(1);
     expect(result).toEqual({ ok: false, reason: 'approval_missing' });
   });
+
+  test('fails closed when compare reports a truncated file set', async () => {
+    const truncated = github({ compare: async () => ({ files: [], truncated: true }) });
+    expect(await recheckCeScopeBeforeMerge({ repo: 'r', pr_number: 1 }, { github: truncated }))
+      .toEqual({ ok: false, reason: 'compare_truncated' });
+  });
+
+  test('rejects a mismatched target event and an earlier green rerun attempt', async () => {
+    const run = (attempt: number, conclusion: string, event = 'pull_request_target') => ({
+      id: 1, check_suite_id: 10, path: '.github/workflows/ce-change-scope-gate.yml', event,
+      head_branch: 'feature', run_started_at: '2026-01-02T00:00:00Z', run_attempt: attempt, conclusion,
+    });
+    const mismatched = github({ listWorkflowRuns: async (_repo, _head, event) => ({
+      runs: event === 'pull_request_target' ? [run(1, 'success', 'pull_request')] : [],
+    }) });
+    expect(await recheckCeScopeBeforeMerge({ repo: 'r', pr_number: 1 }, { github: mismatched }))
+      .toEqual({ ok: false, reason: 'gate_not_green' });
+    const rerun = github({ listWorkflowRuns: async (_repo, _head, event) => ({
+      runs: event === 'pull_request_target' ? [run(1, 'success'), run(2, 'failure')] : [],
+    }) });
+    expect(await recheckCeScopeBeforeMerge({ repo: 'r', pr_number: 1 }, { github: rerun }))
+      .toEqual({ ok: false, reason: 'gate_not_green' });
+  });
 });
