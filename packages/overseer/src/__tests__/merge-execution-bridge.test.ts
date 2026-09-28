@@ -88,6 +88,15 @@ function harness(
       return true;
     },
     getRunById: async runId => run(runId.replace('run-', '')),
+    listRunEvents: async runId => [
+      {
+        id: `event-${runId}`,
+        workflow_run_id: runId,
+        event_type: 'node_completed',
+        step_name: 'implement',
+        data: {},
+      },
+    ],
     reserveMergeSlot: async (verdictId, _since, limit) => {
       const existing = slots.get(verdictId);
       if (existing && !existing.released) return false;
@@ -111,6 +120,9 @@ function harness(
   };
   const github: GitHubClientDeps = {
     findPullRequest: async () => evidence,
+    listPullRequestReviews: async () => [
+      { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: evidence.headSha ?? '' },
+    ],
     approvePullRequest: async input => {
       expect(input.expectedHeadSha).toBe('judged-sha');
       approvals += 1;
@@ -140,6 +152,34 @@ function harness(
     },
   };
 }
+
+test('merge execution bridge blocks mutation for a standing rejection in reversed API order', async () => {
+  const h = harness([verdict('standing-rejection')], greenPr(), 0, {
+    listPullRequestReviews: async () => [
+      {
+        login: 'thinman-overseer[bot]',
+        state: 'CHANGES_REQUESTED',
+        commitId: 'judged-sha',
+        submittedAt: '2026-09-28T00:01:00Z',
+      },
+      {
+        login: 'thinman-overseer[bot]',
+        state: 'APPROVED',
+        commitId: 'judged-sha',
+        submittedAt: '2026-09-28T00:00:00Z',
+      },
+    ],
+  });
+
+  await runMergeExecutionBridgeOnce({
+    store: h.store,
+    github: h.github,
+    readPolicy: () => policy(),
+  });
+
+  expect(h.merges).toBe(0);
+  expect(h.outcomes[0]?.reason).toBe('review_gate_approval_missing_for_head');
+});
 
 function captureRootLogLines(): { lines: string[]; restore: () => void } {
   const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
@@ -405,6 +445,15 @@ describe('merge execution bridge', () => {
         return true;
       },
       getRunById: async () => run(id),
+      listRunEvents: async () => [
+        {
+          id: `event-${id}`,
+          workflow_run_id: `run-${id}`,
+          event_type: 'node_completed',
+          step_name: 'implement',
+          data: {},
+        },
+      ],
       reserveMergeSlot,
       releaseMergeSlot,
       recordOutcome: async input => {
@@ -413,6 +462,9 @@ describe('merge execution bridge', () => {
     });
     const github: GitHubClientDeps = {
       findPullRequest: async () => greenPr(),
+      listPullRequestReviews: async () => [
+        { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: 'judged-sha' },
+      ],
       approvePullRequest: async () => ({ approved: true }),
       mergePullRequest: async input => {
         expect(input.mergeMethod).toBe('squash');
