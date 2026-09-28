@@ -40,6 +40,7 @@ import { assessLifecycleCandidate } from './actions/lifecycle';
 import { assessQualifiedMerge } from './actions/merge-ready';
 import { assertOverseerDefaultOff } from './integration-scenarios';
 import { createRealGitHubClientDeps } from './adapters/github-real-deps';
+import { resolveReviewGateLogin } from './adapters/github-real-deps';
 import { runMergeExecutionBridgeOnce } from './merge-execution-bridge';
 
 /**
@@ -426,6 +427,8 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
       ((): Promise<void> =>
         runMergeExecutionBridgeOnce({
           github: deps,
+          reviewGateLogin: resolveReviewGateLogin(),
+          listRunEvents: listRunEventsForOverseer,
           store: {
             listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
             claimVerdict: claimVerdictForMergeExecution,

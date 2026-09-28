@@ -34,6 +34,8 @@ import type {
 } from './types.ts';
 import type { MergeReadyCoordinator } from './service';
 import type { ErrorClass } from './classify.ts';
+import { deriveReviewDecision, resolveReviewGateLogin } from './adapters/github-real-deps';
+import { isPullRequestDiscoveredCandidate } from './merge-candidate-discovery';
 
 const log = createLogger('overseer/judge-first-pipeline');
 
@@ -130,7 +132,10 @@ export interface JudgeFirstPipelineOptions {
   maxRetries?: number;
   /** Injectable escalation executor; defaults to runEscalation (operator card rail). */
   escalate?: typeof runEscalation;
+  reviewGateLogin?: string;
 }
+
+const EXECUTION_EVENT_TYPES = new Set(['node_started', 'node_completed', 'node_failed']);
 
 function actionClass(record: WatchedRunRecord): string {
   return record.errorClass ?? 'none';
@@ -340,7 +345,62 @@ export async function handleRecordJudgeFirst(
   }
 
   const events = await deps.listRunEvents(record.runId);
-  const envelope = buildEvidenceEnvelope(record, events);
+  const hasRecordedExecutionEvidence = events.some(event =>
+    EXECUTION_EVENT_TYPES.has(event.event_type)
+  );
+  let reviewEvidence: ReturnType<typeof buildEvidenceEnvelope>['reviewEvidence'] = {
+    status: 'unavailable',
+    reason: 'review_evidence_unavailable',
+  };
+  let currentPrEvidence = record.prEvidence;
+  if (record.owner && record.repo) {
+    try {
+      currentPrEvidence = await deps.findPullRequest({
+        owner: record.owner,
+        repo: record.repo,
+        headBranch: record.headBranch,
+        woId: record.woId,
+      });
+    } catch {
+      currentPrEvidence = {
+        exists: false,
+        state: 'unknown',
+        checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+        mergeable: null,
+        lookupFailed: true,
+      };
+    }
+  }
+  const pr = currentPrEvidence?.pr;
+  const currentHeadSha = currentPrEvidence?.headSha;
+  const reviewGateLogin = options.reviewGateLogin ?? resolveReviewGateLogin();
+  if (currentHeadSha && currentHeadSha !== headSha) {
+    reviewEvidence = { status: 'unavailable', reason: 'pull_request_head_moved' };
+  } else if (pr && currentHeadSha && reviewGateLogin && deps.listPullRequestReviews) {
+    try {
+      const reviews = await deps.listPullRequestReviews(pr);
+      const decision = deriveReviewDecision(reviews, {
+        headSha: currentHeadSha,
+        reviewGateLogin,
+      });
+      reviewEvidence =
+        decision === 'APPROVED'
+          ? { status: 'approved', reason: 'review_gate_approved_for_head' }
+          : {
+              status: decision === 'CHANGES_REQUESTED' ? 'blocked' : 'unavailable',
+              reason:
+                decision === 'CHANGES_REQUESTED'
+                  ? 'standing_review_objection'
+                  : 'review_gate_approval_missing_for_head',
+            };
+    } catch {
+      reviewEvidence = { status: 'unavailable', reason: 'review_gate_reviews_lookup_failed' };
+    }
+  }
+  const envelope = buildEvidenceEnvelope(record, events, {
+    reviewEvidence,
+    hasRecordedExecutionEvidence,
+  });
   const digest = envelopeDigest(envelope);
 
   const judge = options.judge ?? judgeTerminalRun;
@@ -391,19 +451,35 @@ export async function handleRecordJudgeFirst(
     return;
   }
 
-  const ruling: TierRuling = ruleOnAction(outcome.proposedAction, outcome.proposedTier);
+  const genuineDiscovery = isPullRequestDiscoveredCandidate(record);
+  const unsafeMergeProposal =
+    (outcome.proposedAction === 'flag_merge_ready' || outcome.verdict === 'merge_candidate') &&
+    (reviewEvidence.status !== 'approved' || (!genuineDiscovery && !hasRecordedExecutionEvidence));
+  const safeOutcome = unsafeMergeProposal
+    ? {
+        ...outcome,
+        verdict: 'observe' as const,
+        proposedAction: 'none',
+        proposedTier: 0,
+        reason:
+          reviewEvidence.status !== 'approved'
+            ? reviewEvidence.reason
+            : 'recorded_execution_evidence_unavailable',
+      }
+    : outcome;
+  const ruling: TierRuling = ruleOnAction(safeOutcome.proposedAction, safeOutcome.proposedTier);
   await options.verdictStore.finalizeVerdict({
     verdictId: claim.verdictId,
     status: 'verdict',
-    verdict: outcome.verdict,
-    confidence: outcome.confidence,
-    model: outcome.model,
-    modelRung: outcome.modelRung,
-    proposedAction: outcome.proposedAction,
-    proposedTier: outcome.proposedTier,
+    verdict: safeOutcome.verdict,
+    confidence: safeOutcome.confidence,
+    model: safeOutcome.model,
+    modelRung: safeOutcome.modelRung,
+    proposedAction: safeOutcome.proposedAction,
+    proposedTier: safeOutcome.proposedTier,
     requiredTier: ruling.requiredTier,
     effectiveTier: ruling.effectiveTier,
-    reason: outcome.reason,
+    reason: safeOutcome.reason,
     evidenceDigest: digest,
     evidence: JSON.stringify(envelope),
   });
@@ -415,17 +491,17 @@ export async function handleRecordJudgeFirst(
     woId: record.woId,
     class: actionClass(record),
     action: 'verdict_write',
-    result: `verdict:${claim.verdictId}:${outcome.verdict}:confidence:${outcome.confidence}`,
+    result: `verdict:${claim.verdictId}:${safeOutcome.verdict}:confidence:${safeOutcome.confidence}`,
   });
   log.info(
     {
       runId: record.runId,
       woId: record.woId,
       verdictId: claim.verdictId,
-      verdict: outcome.verdict,
-      confidence: outcome.confidence,
-      model: outcome.model,
-      proposedAction: outcome.proposedAction,
+      verdict: safeOutcome.verdict,
+      confidence: safeOutcome.confidence,
+      model: safeOutcome.model,
+      proposedAction: safeOutcome.proposedAction,
       effectiveTier: ruling.effectiveTier,
     },
     'overseer.judge_first.verdict_completed'
@@ -434,8 +510,8 @@ export async function handleRecordJudgeFirst(
   // Tier >= 1 proposals are refused with a recorded refusal (v1 = Tier 0 only).
   if (
     !ruling.executableInV1 &&
-    outcome.proposedAction !== 'none' &&
-    outcome.proposedAction !== 'verdict_write'
+    safeOutcome.proposedAction !== 'none' &&
+    safeOutcome.proposedAction !== 'verdict_write'
   ) {
     if (ruling.effectiveTier > 0) {
       await deps.insertOverseerAction({
@@ -443,7 +519,7 @@ export async function handleRecordJudgeFirst(
         woId: record.woId,
         class: actionClass(record),
         action: 'tier_refused',
-        result: `action:${outcome.proposedAction}:required_tier:${ruling.requiredTier}:effective_tier:${ruling.effectiveTier}:verdict:${claim.verdictId}`,
+        result: `action:${safeOutcome.proposedAction}:required_tier:${ruling.requiredTier}:effective_tier:${ruling.effectiveTier}:verdict:${claim.verdictId}`,
       });
       return;
     }
@@ -453,7 +529,7 @@ export async function handleRecordJudgeFirst(
   // necessary but not sufficient -- the deterministic PR gate must ALSO hold
   // (fail-closed remains correct for merge). No merge happens here; the
   // coordinator path keeps every downstream guard including merge=0.
-  if (outcome.verdict === 'merge_candidate' && isPrMergeReady(record.prEvidence)) {
+  if (safeOutcome.verdict === 'merge_candidate' && isPrMergeReady(record.prEvidence)) {
     await deps.insertOverseerAction({
       runId: record.runId,
       woId: record.woId,
@@ -468,9 +544,9 @@ export async function handleRecordJudgeFirst(
   }
 
   if (
-    outcome.verdict === 'needs_human' ||
-    outcome.verdict === 'failed_genuine' ||
-    outcome.proposedAction === 'escalate_with_evidence'
+    safeOutcome.verdict === 'needs_human' ||
+    safeOutcome.verdict === 'failed_genuine' ||
+    safeOutcome.proposedAction === 'escalate_with_evidence'
   ) {
     await escalateWithEvidence(
       record,
@@ -478,19 +554,23 @@ export async function handleRecordJudgeFirst(
       events,
       {
         verdictId: claim.verdictId,
-        reason: `verdict_${outcome.verdict}`,
-        blocker: outcome.reason || `Overseer verdict ${outcome.verdict} on run ${record.runId}`,
+        reason: `verdict_${safeOutcome.verdict}`,
+        blocker:
+          safeOutcome.reason || `Overseer verdict ${safeOutcome.verdict} on run ${record.runId}`,
       },
       options.escalate
     );
     return;
   }
 
-  if (outcome.proposedAction === 'comment_findings' || outcome.verdict === 'duplicate_work') {
+  if (
+    safeOutcome.proposedAction === 'comment_findings' ||
+    safeOutcome.verdict === 'duplicate_work'
+  ) {
     await commentFindings(record, deps, {
       verdictId: claim.verdictId,
-      verdict: outcome.verdict,
-      reason: outcome.reason,
+      verdict: safeOutcome.verdict,
+      reason: safeOutcome.reason,
       dryRun: options.dryRun,
     });
     return;
