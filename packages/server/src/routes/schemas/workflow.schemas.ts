@@ -365,6 +365,14 @@ export const runWorkflowBodySchema = z
     conversationId: z.string(),
     message: z.string(),
     conductor: conductorDispatchSchema.optional(),
+    modelOverride: z
+      .object({
+        workflow: z.object({ provider: z.string().optional(), model: z.string() }).optional(),
+        nodes: z
+          .record(z.string(), z.object({ provider: z.string().optional(), model: z.string() }))
+          .optional(),
+      })
+      .optional(),
   })
   .openapi('RunWorkflowBody');
 

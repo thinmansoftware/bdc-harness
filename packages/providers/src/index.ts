@@ -28,10 +28,20 @@ export {
   getRegisteredProviders,
   getProviderInfoList,
   isRegisteredProvider,
+  registerProviderAlias,
+  resolveProviderId,
   registerBuiltinProviders,
   registerCommunityProviders,
   clearRegistry,
 } from './registry';
+
+export {
+  OPENROUTER_XAI_REFUSED_CODE,
+  OPENROUTER_XAI_REFUSED_REASON,
+  OPENROUTER_BACKED_PROVIDER_IDS,
+  getOpenRouterXaiRefusal,
+  setOpenRouterProviderIdResolver,
+} from './openrouter-guard';
 
 // Error
 export { UnknownProviderError } from './errors';
@@ -73,3 +83,10 @@ export {
   registerGrokAgentProvider,
   type GrokAgentProviderDefaults,
 } from './community/grok';
+
+export {
+  CursorAgentProvider,
+  parseCursorAgentConfig,
+  registerCursorAgentProvider,
+  type CursorAgentProviderDefaults,
+} from './community/cursor';

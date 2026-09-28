@@ -21,8 +21,22 @@ async function outDir(): Promise<string> {
 }
 
 async function persistedRecord(dir: string): Promise<CascadeRunRecord> {
-  const [runDir] = await readdir(dir);
-  if (!runDir) throw new Error('cascade record directory missing');
+  const entries = await readdir(dir, { withFileTypes: true });
+  const runDirs: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === 'wo-locks') continue;
+    const files = await readdir(join(dir, entry.name), { withFileTypes: true });
+    if (files.some(file => file.isFile() && file.name === 'cascade-record.json')) {
+      runDirs.push(entry.name);
+    }
+  }
+  if (runDirs.length !== 1) {
+    throw new Error(
+      `Expected exactly one cascade record directory in ${dir}; found ${runDirs.length}. ` +
+        `Entries seen: ${JSON.stringify(entries.map(entry => entry.name).sort())}`
+    );
+  }
+  const [runDir] = runDirs;
   return JSON.parse(
     await readFile(join(dir, runDir, 'cascade-record.json'), 'utf8')
   ) as CascadeRunRecord;

@@ -13,6 +13,7 @@ import {
 import type { WorkflowConfig, WorkflowDeps } from '../deps';
 import type { WorkflowDefinition } from '../schemas';
 import { resolveWorkflowProbeBindings } from './resolve-binding';
+import type { ModelOverride } from '../model-override';
 
 export interface FireTimeProbeInput {
   readonly workflow: WorkflowDefinition;
@@ -22,6 +23,7 @@ export interface FireTimeProbeInput {
   readonly cwd: string;
   readonly source: 'fire_probe' | 'binding_change' | 'operator';
   readonly allowFireReprobeClear?: boolean;
+  readonly modelOverride?: ModelOverride;
 }
 
 export interface FireTimeProbeDecision {

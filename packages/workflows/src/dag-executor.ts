@@ -18,6 +18,7 @@ import {
 } from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
+import { resolveModelForNode, type ModelOverride } from './model-override';
 import type {
   IWorkflowPlatform,
   WorkflowMessageMetadata,
@@ -35,6 +36,7 @@ import {
   getProviderCapabilities,
   getRegisteredProviders,
   isRegisteredProvider,
+  resolveProviderId,
 } from '@archon/providers';
 import type {
   DagNode,
@@ -83,9 +85,9 @@ import {
 } from './logger';
 import {
   withIdleTimeout,
-  STEP_IDLE_TIMEOUT_MS,
   resolveLoopIterationIdleTimeoutMs,
   resolveLoopIterationWallTimeoutMs,
+  resolveStepIdleTimeoutMs,
 } from './utils/idle-timeout';
 import {
   classifyError,
@@ -907,14 +909,15 @@ async function beginProviderAttempt(
     null
   );
   const requestedModel = model ?? declaredModel ?? 'provider-default';
+  const canonicalProvider = resolveProviderId(provider);
   const attempt: ProviderAttemptRecord = {
     attemptId: randomUUID(),
     runId: workflowRun.id,
     nodeId: node.id,
     attemptNumber: (latest?.attemptNumber ?? 0) + 1,
-    provider,
+    provider: canonicalProvider,
     model: requestedModel,
-    declaredProvider: node.provider ?? provider,
+    declaredProvider: canonicalProvider,
     declaredModel: declaredModel ?? requestedModel,
     requiredCapabilities: deriveNodeExecutionRequirements(node).map(
       capability => EXECUTION_CAPABILITY_LEDGER_MAP[capability]
@@ -1297,6 +1300,199 @@ async function writeNodeOutputFile(
 }
 
 /**
+ * Reduce a bash script line to its unquoted, uncommented code portion, preserving
+ * the original character offsets (quoted and commented spans become spaces rather
+ * than being removed). This lets a plain regex scan for the "<<" heredoc operator
+ * without mistaking a trailing comment or a quoted string for real shell syntax.
+ *
+ * Tracks single-quote and double-quote state, seeded from and returned to the
+ * caller so it persists across physical lines (backslash escapes apply only inside
+ * double quotes, matching bash). A "#" ends the code portion of the line only when
+ * it is outside any quote AND is either at the start of the line or preceded by
+ * whitespace or a bash metacharacter (| & ; ( ) < >) -- matching bash's rule that "#" mid-word (e.g.
+ * inside `foo#bar`) is not a comment marker. Overseer CHANGES_REQUESTED on
+ * ced4894e (bdc-harness#862): `echo ok # example <<EOF` and `echo "<<EOF"` were
+ * misread as opening a heredoc because the prior scan was not shell-lexically aware.
+ * Quotes are blanked uniformly, including a heredoc delimiter's own quotes: the
+ * delimiter word is read from the ORIGINAL line by readHeredocDelimiter, never
+ * from the reduced form.
+ */
+interface ShellQuoteState {
+  inSingle: boolean;
+  inDouble: boolean;
+  /** Unclosed "(" depth of an arithmetic $((...)) / ((...)) expression; 0 = none. */
+  arithDepth: number;
+}
+
+function reduceToUnquotedUncommentedCode(
+  line: string,
+  initial: ShellQuoteState = { inSingle: false, inDouble: false, arithDepth: 0 }
+): { code: string; commentStart: number; state: ShellQuoteState } {
+  let out = '';
+  let commentStart = line.length;
+  // Quote state is carried ACROSS physical lines by the caller: a multi-line
+  // "..." or '...' string is one shell word, so a line that starts inside it is
+  // string data, and the closing quote on a later line re-enters code (Overseer
+  // round 9 on #862: `echo "start\nend" # $spec.output` misread the trailing
+  // comment as quoted because state reset every line).
+  let inSingle = initial.inSingle;
+  let inDouble = initial.inDouble;
+  // Arithmetic depth is carried across lines too (Overseer round 10 on #862:
+  // `x=$((1` / ` << 2))` -- the second line's "<<" is a left shift, not a heredoc).
+  let arithDepth = initial.arithDepth;
+  let i = 0;
+  while (i < line.length && arithDepth > 0) {
+    if (line[i] === '(') arithDepth++;
+    else if (line[i] === ')') arithDepth--;
+    out += ' ';
+    i++;
+  }
+
+  for (; i < line.length; i++) {
+    const ch = line[i];
+
+    if (inSingle) {
+      out += ch === "'" ? ch : ' ';
+      if (ch === "'") inSingle = false;
+      continue;
+    }
+
+    if (inDouble) {
+      if (ch === '\\' && i + 1 < line.length) {
+        // Backslash escapes the next char inside double quotes; blank both -- we
+        // only care about "<<" and "#", neither of which needs the escaped char.
+        out += ' ';
+        i++;
+        out += ' ';
+        continue;
+      }
+      out += ch === '"' ? ch : ' ';
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+
+    // Arithmetic context: $((...)) or a (( ... )) compound command at word start.
+    // Inside it "<<" is a left shift, not a heredoc (Overseer round 6 on #862:
+    // x=$((1 << 2)) was recorded as a heredoc with delimiter "2"). Blank the whole
+    // expression, balancing parentheses, offsets preserved.
+    const dollarArith = line.startsWith('$((', i);
+    const bareArith =
+      !dollarArith && line.startsWith('((', i) && (i === 0 || /[\s;&|(]/.test(line[i - 1]));
+    if (dollarArith || bareArith) {
+      let opened = false;
+      let j = i;
+      while (j < line.length) {
+        if (line[j] === '(') {
+          arithDepth++;
+          opened = true;
+        } else if (line[j] === ')') arithDepth--;
+        out += ' ';
+        j++;
+        if (opened && arithDepth === 0) break;
+      }
+      i = j - 1;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < line.length) {
+      // Backslash outside quotes escapes the next char (so \# is not a comment and
+      // \' does not open a string); blank both.
+      out += '  ';
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      if (ch === "'") inSingle = true;
+      else inDouble = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '#') {
+      const prev = i > 0 ? line[i - 1] : '';
+      // "#" starts a comment at the start of a word: after any bash metacharacter
+      // (whitespace | & ; ( ) < >). Overseer round 7 on #862: a case arm `x)# <<EOF`
+      // was misread because ")" "<" ">" were missing from the predecessor set.
+      const atCommentStart = i === 0 || /[\s;&|()<>]/.test(prev);
+      if (atCommentStart) {
+        // Rest of the line is a comment: blank it out and stop scanning.
+        commentStart = i;
+        out += ' '.repeat(line.length - i);
+        break;
+      }
+    }
+    out += ch;
+  }
+  return { code: out, commentStart, state: { inSingle, inDouble, arithDepth } };
+}
+
+/**
+ * Read one heredoc delimiter word from `line` starting at `start` (the first
+ * non-whitespace character after "<<" or "<<-"), applying bash quote removal
+ * across the WHOLE word the way bash itself derives the terminator:
+ *   - '...'  single-quoted segment: contents literal
+ *   - "..."  double-quoted segment: contents literal, except that a backslash
+ *            before one of  " \ $ `  is removed (bash double-quote rules)
+ *   - \x     backslash outside quotes: x literal
+ *   - any mix of the above (E"OF", EO\F, 'E'OF, "E"'O'F, E'O'"F")
+ * The word ends at unquoted whitespace or a shell metacharacter (| & ; ( ) < >).
+ * Returns null when there is no valid delimiter: empty word, an unterminated
+ * quote, or a trailing backslash (line continuation). Overseer round 4 on
+ * bdc-harness#862: `<<E"OF"` and `<<EO\F` both terminate on `EOF` in bash, but the
+ * previous parser only handled a wholly-quoted or leading-backslash word.
+ *
+ * Not modelled (documented limitation): an UNQUOTED delimiter containing `$`
+ * undergoes parameter expansion in bash; here it is taken literally.
+ */
+function readHeredocDelimiter(
+  line: string,
+  start: number
+): { delimiter: string; end: number } | null {
+  let delimiter = '';
+  let i = start;
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === "'") {
+      const close = line.indexOf("'", i + 1);
+      if (close === -1) return null; // unterminated single quote
+      delimiter += line.slice(i + 1, close);
+      i = close + 1;
+      continue;
+    }
+    if (ch === '"') {
+      let j = i + 1;
+      let closed = false;
+      while (j < line.length) {
+        const c = line[j];
+        if (c === '\\' && j + 1 < line.length && '"\\$`'.includes(line[j + 1])) {
+          delimiter += line[j + 1];
+          j += 2;
+          continue;
+        }
+        if (c === '"') {
+          closed = true;
+          break;
+        }
+        delimiter += c;
+        j++;
+      }
+      if (!closed) return null; // unterminated double quote
+      i = j + 1;
+      continue;
+    }
+    if (ch === '\\') {
+      if (i + 1 >= line.length) return null; // line continuation, not a delimiter
+      delimiter += line[i + 1];
+      i += 2;
+      continue;
+    }
+    if (/[\s|&;()<>]/.test(ch)) break;
+    delimiter += ch;
+    i++;
+  }
+  if (delimiter.length === 0) return null;
+  return { delimiter, end: i };
+}
+
+/**
  * Substitute $node_id.output and $node_id.output.field references in a prompt.
  * Called AFTER the standard substituteWorkflowVariables pass.
  *
@@ -1312,6 +1508,14 @@ async function writeNodeOutputFile(
  * commands. Anchor: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01 (bdc-xo#153) 2026-05-16.
  * YAMLs that write `"$node.output"` are now safe to author this natural way; the
  * older pattern of `VAR=$node.output ... "$VAR"` continues to work unchanged.
+ *
+ * When escapedForBash is on, bash COMMENTS -- whole comment lines AND trailing
+ * comments after an unquoted # -- are left byte-identical -- no substitution. A multi-line output substituted into
+ * a comment spills past the # on line 2 and bash executes the rest. Anchor:
+ * bdc-xo#2141, 2026-09-21 -- a YAML comment reading "the executor substitutes
+ * $read-spec.output" expanded the whole 161-line WO spec into the script body and
+ * every Cauldron lane died at commit-and-push. Prompt mode (escapedForBash=false)
+ * is unchanged: # is not a comment in a prompt.
  */
 export function substituteNodeOutputRefs(
   prompt: string,
@@ -1322,7 +1526,123 @@ export function substituteNodeOutputRefs(
     ? /(")?\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?(")?/g
     : /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g;
 
-  return prompt.replace(pattern, (match: string, ...rest: (string | undefined)[]) => {
+  // When escapedForBash is true, split into lines and track heredoc state.
+  // Skip substitution in bash comments (from an unquoted # to end of line) that are
+  // NOT inside an open heredoc. Heredoc content is data, not comments.
+  if (escapedForBash) {
+    const lines = prompt.split('\n');
+    const processedLines: string[] = [];
+    // Open heredoc bodies in order of appearance (FIFO). Delimiter and strip-tabs
+    // mode are SEPARATE fields: Overseer round 5 on #862 -- encoding <<- as a "-"
+    // prefix collided with a delimiter that itself begins with "-" (cat <<'-EOF').
+    const heredocStack: { delimiter: string; stripTabs: boolean }[] = [];
+    // Shell quote state at the end of the previous code line (see the reducer).
+    let quoteState: ShellQuoteState = { inSingle: false, inDouble: false, arithDepth: 0 };
+
+    for (const line of lines) {
+      // Comment check first: bash ignores everything on a comment line, including a
+      // literal "<<EOF" in the comment text, so a comment must never open a heredoc.
+      // Outside a heredoc body, `commentStart` is where an unquoted "#" comment begins
+      // (line.length when there is none). Everything from there on is left byte-identical
+      // -- Overseer round 8 on #862: `echo ok # $spec.output` substituted a multi-line
+      // value into a TRAILING comment, and lines 2..N spilled into executable code.
+      // FAIL-SAFE INVARIANT (round 11 on #862): every classification error must fall on
+      // the side of "token left literal", never "token substituted into a comment".
+      //   (a) Comment cut = the EARLIEST "#" that either the carried-state parse or a
+      //       fresh-state parse (quotes/arithmetic reset) calls a comment. If the two
+      //       disagree, the more conservative one wins: a real string containing "#"
+      //       may lose a substitution; a real comment can never gain one.
+      //   (b) A heredoc may open only on a plainly simple line: no "$(", "((", or
+      //       backtick anywhere, and clean quote/arithmetic state at both the start and
+      //       the end of the line. Anything more exotic never opens a heredoc, so its
+      //       body's "#"-leading lines are treated as comments (left literal) instead of
+      //       being substituted on the strength of a lexer guess.
+      const cleanState: ShellQuoteState = { inSingle: false, inDouble: false, arithDepth: 0 };
+      const isClean = (st: ShellQuoteState): boolean =>
+        !st.inSingle && !st.inDouble && st.arithDepth === 0;
+      const carried =
+        heredocStack.length === 0
+          ? reduceToUnquotedUncommentedCode(line, quoteState)
+          : { code: line, commentStart: line.length, state: quoteState };
+      const fresh =
+        heredocStack.length === 0 && !isClean(quoteState)
+          ? reduceToUnquotedUncommentedCode(line, cleanState)
+          : carried;
+      const reduced = {
+        code: carried.code,
+        commentStart: Math.min(carried.commentStart, fresh.commentStart),
+        state: carried.state,
+      };
+      quoteState = reduced.state;
+      const isCommentLine =
+        heredocStack.length === 0 && line.slice(0, reduced.commentStart).trim() === '';
+      const isPlainlySimpleLine =
+        !/\$\(|\(\(|`/.test(line) && isClean(carried.state) && isClean(fresh.state);
+
+      // Track heredoc opens on this line (only outside a heredoc body and not on a comment).
+      // Format: << [-]? WORD, where WORD is any shell word: a single- or double-quoted
+      // string, a backslash-prefixed word (<<\EOF), or an unquoted run up to whitespace
+      // or a shell metacharacter (| & ; ( ) < >). Bug (bdc-xo#2141, Overseer round 4 on
+      // #862): the prior regex only accepted a bare identifier as the delimiter, so
+      // "<<END-JSON" (hyphen) never matched, the heredoc never opened, and every
+      // subsequent line -- including real comment lines -- fell through to the
+      // top-level comment check and had refs substituted or skipped incorrectly.
+      // "<<<" is a here-string, not a heredoc, so the operator must not be preceded or
+      // followed by another "<". The OPERATOR is located on the reduced (unquoted,
+      // uncommented) form of the line so a trailing comment or a quoted "<<EOF" string
+      // is never mistaken for a real heredoc operator. The reducer preserves character
+      // offsets, so the DELIMITER WORD is then read from the original line at that
+      // offset by readHeredocDelimiter, which applies full bash quote removal
+      // (Overseer round 5 on #862: E"OF", EO\F, 'E'OF all terminate on EOF).
+      if (heredocStack.length === 0 && !isCommentLine && isPlainlySimpleLine) {
+        const reducedLine = reduced.code;
+        const heredocOpRegex = /(?<!<)<<(?!<)(-)?/g;
+        let opMatch: RegExpExecArray | null;
+        while ((opMatch = heredocOpRegex.exec(reducedLine)) !== null) {
+          const isStripper = opMatch[1] === '-';
+          let pos = opMatch.index + opMatch[0].length;
+          while (pos < line.length && /\s/.test(line[pos])) pos++;
+          if (pos >= line.length) continue; // no word follows: not a heredoc
+
+          const word = readHeredocDelimiter(line, pos);
+          if (word === null) continue; // empty / unterminated quote / line continuation
+          heredocOpRegex.lastIndex = word.end;
+          heredocStack.push({ delimiter: word.delimiter, stripTabs: isStripper });
+        }
+      }
+
+      // Check if this line closes a heredoc: content (with leading tabs stripped if stripper)
+      // must exactly match the delimiter. Bash consumes bodies in order of appearance, so
+      // the FIRST opened delimiter is the one that closes next (queue, not stack).
+      if (heredocStack.length > 0) {
+        const { delimiter, stripTabs } = heredocStack[0];
+        let lineToCheck = line;
+        if (stripTabs) {
+          // Strip leading tabs only (not spaces) per POSIX <<- behavior
+          lineToCheck = line.replace(/^\t+/, '');
+        }
+        if (lineToCheck === delimiter) {
+          // This line closes the heredoc
+          heredocStack.shift();
+        }
+      }
+
+      // Substitute only the code portion. A heredoc body line has no comment (data), so
+      // the whole line is substituted; otherwise the text from the unquoted "#" onward
+      // (a full-line or trailing comment) is kept byte-identical. Note `reduced` was
+      // computed BEFORE this line could close a heredoc, which is what we want: the
+      // terminator line itself carries no token.
+      const codePart = line.slice(0, reduced.commentStart);
+      const commentPart = line.slice(reduced.commentStart);
+      processedLines.push(codePart.replace(pattern, substituteToken) + commentPart);
+    }
+    return processedLines.join('\n');
+  }
+
+  // Non-bash mode: substitute all tokens normally
+  return prompt.replace(pattern, substituteToken);
+
+  function substituteToken(match: string, ...rest: (string | undefined)[]): string {
     let leadingQuote: string;
     let nodeId: string;
     let field: string | undefined;
@@ -1371,7 +1691,7 @@ export function substituteNodeOutputRefs(
       );
       return escapedForBash ? wrap("''") : '';
     }
-  });
+  }
 }
 
 // buildSDKHooksFromYAML moved to @archon/providers/src/claude/provider.ts
@@ -1394,7 +1714,8 @@ async function resolveNodeProviderAndModel(
   conversationId: string,
   workflowRunId: string,
   cwd: string,
-  workflowLevelOptions: WorkflowLevelOptions
+  workflowLevelOptions: WorkflowLevelOptions,
+  modelOverride?: ModelOverride
 ): Promise<{
   provider: string;
   model: string | undefined;
@@ -1422,7 +1743,22 @@ async function resolveNodeProviderAndModel(
 }> {
   // Provider is explicit: node.provider ?? workflow.provider. Model never
   // influences provider selection. Model strings pass through to the SDK.
-  const provider: string = node.provider ?? workflowProvider;
+  const assistantModels = Object.fromEntries(
+    Object.entries(config.assistants).map(([providerId, assistant]) => [
+      providerId,
+      assistant?.model as string | undefined,
+    ])
+  );
+  const resolvedBinding = resolveModelForNode({
+    nodeId: node.id,
+    nodeProvider: node.provider,
+    nodeModel: node.model,
+    workflowProvider,
+    workflowModel,
+    assistantModels,
+    modelOverride,
+  });
+  const provider = resolvedBinding.provider;
   if (!isRegisteredProvider(provider)) {
     throw new Error(
       `Node '${node.id}': unknown provider '${provider}'. ` +
@@ -1432,12 +1768,7 @@ async function resolveNodeProviderAndModel(
     );
   }
 
-  const providerAssistantConfig = config.assistants[provider];
-  const model: string | undefined =
-    node.model ??
-    (provider === workflowProvider
-      ? workflowModel
-      : (providerAssistantConfig?.model as string | undefined));
+  const model = resolvedBinding.model;
 
   // Get provider capabilities for capability warnings (static lookup, no instantiation)
   const caps = getProviderCapabilities(provider);
@@ -1520,8 +1851,27 @@ async function resolveNodeProviderAndModel(
     const registry = await getAgentRegistry(cwd);
     const persona = resolveAgent(agentName, registry);
     if (persona) {
-      const personaResolution = resolveAgentPersona(persona, effectiveModel, provider);
-      effectiveModel = personaResolution.model;
+      // A per-node override owns the binding completely. It must not be rejected
+      // because the persona pins a different provider's model, or because a
+      // Claude-targeted override is paired with a persona that has no model.
+      // Retain the persona prompt/tools while replacing its model binding with
+      // the override for Claude (whose persona resolver requires a model) and
+      // removing it for providers whose persona resolver does not.
+      const nodeBindingOverride = modelOverride?.nodes?.[node.id];
+      const personaForResolution = nodeBindingOverride
+        ? { ...persona, model: provider === 'claude' ? model : undefined }
+        : persona;
+      const personaResolution = resolveAgentPersona(personaForResolution, effectiveModel, provider);
+      effectiveModel = resolveModelForNode({
+        nodeId: node.id,
+        nodeProvider: node.provider,
+        nodeModel: node.model,
+        personaModel: personaResolution.model,
+        workflowProvider,
+        workflowModel,
+        assistantModels,
+        modelOverride,
+      }).model;
       // Prepend agent system prompt (agent role comes before node task)
       effectiveSystemPrompt = effectiveSystemPrompt
         ? `${personaResolution.systemPrompt}\n\n${effectiveSystemPrompt}`
@@ -1592,8 +1942,9 @@ async function resolveNodeProviderAndModel(
     fallbackModel: fb,
   };
 
-  // Pass assistantConfig from config -- provider parses internally
+  // Assistant config stays keyed by the id as written (assistants.grok still applies).
   const assistantConfig = config.assistants[provider] ?? {};
+  const canonicalProvider = resolveProviderId(provider);
 
   const options: SendQueryOptions = {
     ...baseOptions,
@@ -1602,10 +1953,10 @@ async function resolveNodeProviderAndModel(
   };
 
   return {
-    provider,
+    provider: canonicalProvider,
     model: effectiveModel,
     options,
-    declaredModelId: model,
+    declaredModelId: modelOverride?.nodes?.[node.id]?.model ?? model,
     personaContextState,
   };
 }
@@ -1860,7 +2211,19 @@ async function executeNodeInternal(
     ...(shouldForkSession ? { forkSession: true } : {}),
   };
   let nodeIdleTimedOut = false;
-  const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
+  const effectiveIdleTimeout = resolveStepIdleTimeoutMs(node.idle_timeout);
+  let nodeChunksSeen = 0;
+  let lastNodeProgressEventAt = 0;
+  const nodeProgressEventMs = ((): number => {
+    const fromEnv = Number.parseInt(process.env.ARCHON_NODE_PROGRESS_EVENT_MS ?? '', 10);
+    if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+    return 60_000;
+  })();
+  const cancelPollMs = ((): number => {
+    const fromEnv = Number.parseInt(process.env.ARCHON_NODE_CANCEL_POLL_MS ?? '', 10);
+    if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+    return CANCEL_CHECK_INTERVAL_MS;
+  })();
   let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
   let providerAttempt = await beginProviderAttempt(
     deps,
@@ -1871,8 +2234,31 @@ async function executeNodeInternal(
     declaredModelId
   );
   let providerAttemptCompleted = false;
+  // Started only after the attempt is reserved. beginProviderAttempt throws on
+  // ceiling, persist failure, and a rejecting listProviderAttempts; those paths
+  // must not leave this interval alive for the process lifetime.
+  let cancelPoll: ReturnType<typeof setInterval> | undefined;
 
   try {
+    cancelPoll = setInterval(() => {
+      void deps.store
+        .getWorkflowRunStatus(workflowRun.id)
+        .then(status => {
+          if (!shouldContinueStreamingForStatus(status)) {
+            getLog().info(
+              { workflowRunId: workflowRun.id, nodeId: node.id, status: status ?? 'deleted' },
+              'dag.stop_detected_during_streaming'
+            );
+            nodeAbortController.abort();
+          }
+        })
+        .catch((cancelCheckErr: unknown) => {
+          getLog().warn(
+            { err: cancelCheckErr as Error, workflowRunId: workflowRun.id, nodeId: node.id },
+            'dag.status_check_failed'
+          );
+        });
+    }, cancelPollMs);
     for await (const msg of withIdleTimeout(
       aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, nodeOptionsWithAbort),
       effectiveIdleTimeout,
@@ -1883,10 +2269,34 @@ async function executeNodeInternal(
           'dag_node_idle_timeout_reached'
         );
         nodeAbortController.abort();
-      }
+      },
+      undefined,
+      nodeAbortController.signal
     )) {
       const tickNow = Date.now();
       const nodeKey = `${workflowRun.id}:${node.id}`;
+      nodeChunksSeen += 1;
+      if (nodeChunksSeen === 1 || tickNow - lastNodeProgressEventAt >= nodeProgressEventMs) {
+        lastNodeProgressEventAt = tickNow;
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'node_progress',
+            step_name: node.id,
+            data: {
+              provider,
+              chunks_seen: nodeChunksSeen,
+              last_chunk_type: msg.type,
+              since_node_start_ms: tickNow - nodeStartTime,
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'node_progress' },
+              'workflow_event_persist_failed'
+            );
+          });
+      }
 
       // Cancel/pause check -- read-only, no write contention in WAL mode (every 10s).
       //
@@ -2305,7 +2715,9 @@ async function executeNodeInternal(
         });
         providerAttemptCompleted = true;
       }
-      const progressError = `Node '${node.id}' exceeded idle timeout (${String(effectiveIdleTimeout)}ms) without meaningful progress`;
+      const silenceReason: 'provider_never_started' | 'provider_silent' =
+        nodeChunksSeen === 0 ? 'provider_never_started' : 'provider_silent';
+      const progressError = `Node '${node.id}' ${silenceReason}: no provider output for ${String(effectiveIdleTimeout)}ms`;
       await safeSendMessage(
         platform,
         conversationId,
@@ -2325,6 +2737,7 @@ async function executeNodeInternal(
           extraEventData: {
             reason_code: 'progress_timeout',
             idle_timeout_ms: effectiveIdleTimeout,
+            reason: silenceReason,
           },
         }
       );
@@ -2756,6 +3169,8 @@ async function executeNodeInternal(
         ? { modelMismatch: !isDeclaredServedMatch(declaredModelId, nodeServedModelId) }
         : {}),
     };
+  } finally {
+    if (cancelPoll !== undefined) clearInterval(cancelPoll);
   }
 }
 
@@ -4162,7 +4577,7 @@ async function executeLoopNode(
               attemptId: iterationAttempt.attemptId,
               attemptNumber: iterationAttempt.attemptNumber,
               attemptStartedAt: iterationAttempt.startedAt,
-              provider: workflowProvider,
+              provider: resolveProviderId(workflowProvider),
               info: error.info,
               iteration: i,
             },
@@ -4775,7 +5190,8 @@ async function executeApprovalNode(
   workflowLevelOptions: WorkflowLevelOptions,
   workflowInteractive: boolean | undefined,
   configuredCommandFolder?: string,
-  issueContext?: string
+  issueContext?: string,
+  modelOverride?: ModelOverride
 ): Promise<NodeOutput> {
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
@@ -4868,7 +5284,8 @@ async function executeApprovalNode(
       conversationId,
       workflowRun.id,
       cwd,
-      workflowLevelOptions
+      workflowLevelOptions,
+      modelOverride
     );
 
     const output = await executeNodeInternal(
@@ -5100,7 +5517,8 @@ async function executeDagWorkflowInternal(
   config: WorkflowConfig,
   configuredCommandFolder?: string,
   issueContext?: string,
-  priorCompletedNodes?: Map<string, string>
+  priorCompletedNodes?: Map<string, string>,
+  modelOverride?: ModelOverride
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
 
@@ -5419,7 +5837,21 @@ async function executeDagWorkflowInternal(
             // unknown provider so the outer catch below emits the standard
             // node_failed event + user-facing message -- the same path
             // resolveNodeProviderAndModel uses for non-loop nodes.
-            const loopProvider: string = node.provider ?? workflowProvider;
+            const loopBinding = resolveModelForNode({
+              nodeId: node.id,
+              nodeProvider: node.provider,
+              nodeModel: node.model,
+              workflowProvider,
+              workflowModel,
+              assistantModels: Object.fromEntries(
+                Object.entries(config.assistants).map(([providerId, assistant]) => [
+                  providerId,
+                  assistant?.model as string | undefined,
+                ])
+              ),
+              modelOverride,
+            });
+            const loopProvider = loopBinding.provider;
             if (!isRegisteredProvider(loopProvider)) {
               throw new Error(
                 `Node '${node.id}': unknown provider '${loopProvider}'. Registered: ${getRegisteredProviders()
@@ -5427,12 +5859,7 @@ async function executeDagWorkflowInternal(
                   .join(', ')}`
               );
             }
-            const loopAssistantConfig = config.assistants[loopProvider];
-            const loopModel: string | undefined =
-              node.model ??
-              (loopProvider === workflowProvider
-                ? workflowModel
-                : (loopAssistantConfig?.model as string | undefined));
+            const loopModel = loopBinding.model;
 
             assertProviderCanExecuteNode(loopProvider, node);
             let output = await executeLoopNode(
@@ -5477,7 +5904,7 @@ async function executeDagWorkflowInternal(
               output.state === 'failed' &&
               output.error !== undefined &&
               loopFailoverTarget !== null &&
-              loopFailoverTarget.provider !== loopProvider &&
+              resolveProviderId(loopFailoverTarget.provider) !== resolveProviderId(loopProvider) &&
               isRegisteredProvider(loopFailoverTarget.provider) &&
               (loopQuotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
             ) {
@@ -5494,8 +5921,11 @@ async function executeDagWorkflowInternal(
                   deps,
                   workflowRun.id,
                   node.id,
-                  { provider: loopProvider, model: loopModel },
-                  { provider: loopFailoverTarget.provider, model: loopFailoverModel },
+                  { provider: resolveProviderId(loopProvider), model: loopModel },
+                  {
+                    provider: resolveProviderId(loopFailoverTarget.provider),
+                    model: loopFailoverModel,
+                  },
                   loopFailoverErrorClass
                 );
                 await safeSendMessage(
@@ -5571,7 +6001,8 @@ async function executeDagWorkflowInternal(
               workflowLevelOptions,
               workflow.interactive,
               configuredCommandFolder,
-              issueContext
+              issueContext,
+              modelOverride
             );
             return { nodeId: node.id, output };
           }
@@ -5642,7 +6073,8 @@ async function executeDagWorkflowInternal(
             conversationId,
             workflowRun.id,
             cwd,
-            workflowLevelOptions
+            workflowLevelOptions,
+            modelOverride
           );
           assertProviderCanExecuteNode(provider, node);
 
@@ -5794,7 +6226,7 @@ async function executeDagWorkflowInternal(
             output.state === 'failed' &&
             output.error !== undefined &&
             failoverTarget !== null &&
-            failoverTarget.provider !== provider && // never "failover" to the same provider
+            resolveProviderId(failoverTarget.provider) !== provider && // never "failover" to the same provider
             (quotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
           ) {
             try {
@@ -5822,7 +6254,8 @@ async function executeDagWorkflowInternal(
                 conversationId,
                 workflowRun.id,
                 cwd,
-                workflowLevelOptions
+                workflowLevelOptions,
+                modelOverride
               );
               emitNodeFailover(
                 deps,

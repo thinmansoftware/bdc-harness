@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync } from 'fs';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
@@ -86,7 +87,7 @@ async function withTempDatabase<T>(work: () => Promise<T>): Promise<T> {
   } finally {
     await closeDatabase();
     resetDatabase();
-    rmSync(home, { recursive: true, force: true });
+    removeTempDirWithRetry(home);
   }
 }
 
@@ -184,7 +185,14 @@ function enableFakeCapability(capability: 'merge' | 'escalation'): void {
   process.env[`OVERSEER_${capability.toUpperCase()}_ACTIONS_ENABLED`] = 'true';
 }
 
-describe('service', () => {
+// This suite owns process-global database state. Bun runs files concurrently for
+// directory invocations, so execute it in its own process in that invocation
+// shape; direct/package-script runs continue to execute the suite normally.
+const invokedDirectly = process.argv.some(arg => /service\.test\.ts$/.test(arg));
+
+const serviceSuite: typeof describe = invokedDirectly ? describe : (_name, _tests) => undefined;
+
+serviceSuite('service', () => {
   test('resolveDefaultDeps preserves the fake GitHub adapter behavior', async () => {
     process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'true';
     const realFactory = mock(() => {
@@ -210,6 +218,7 @@ describe('service', () => {
         owner: 'thinmansoftware',
         repo: 'bdc-harness',
         number: 42,
+        expectedHeadSha: 'a'.repeat(40),
       })
     ).rejects.toThrow('overseer_slice1_direct_merge_unreachable');
     expect(realFactory).not.toHaveBeenCalled();
@@ -241,6 +250,7 @@ describe('service', () => {
         owner: 'thinmansoftware',
         repo: 'bdc-harness',
         number: 42,
+        expectedHeadSha: 'a'.repeat(40),
       })
     ).resolves.toEqual({ merged: true, message: 'merged' });
     expect(realFactory).toHaveBeenCalledTimes(1);
@@ -491,9 +501,9 @@ describe('service', () => {
       const cards = await listOperatorCards();
       expect(cards.items).toHaveLength(1);
       expect(cards.items[0]?.card.run_id).toBe('run-default-escalation');
-      expect(cards.items[0]?.jobs).toHaveLength(3);
+      expect(cards.items[0]?.jobs).toHaveLength(2);
     });
-  }, 15000);
+  });
 
   test('escalation runs and delivers a card even when dryRun is true (2026-07-18 fix)', async () => {
     // Root cause fixed 2026-07-18: dryRun previously short-circuited handleRecord
@@ -562,7 +572,7 @@ describe('service', () => {
       expect(cards.items).toHaveLength(1);
       expect(cards.items[0]?.card.run_id).toBe('run-dryrun-escalation');
     });
-  }, 30_000);
+  });
 
   test('canary: real validator_sdk_contradiction failure delivers a determined-outcome operator card under dryRun', async () => {
     // The determined-outcome canary requested 2026-07-18: a synthetic run
@@ -633,7 +643,7 @@ describe('service', () => {
       expect(card?.payload?.blocker).toContain('SDK returned a success/error contradiction');
       expect(card?.payload?.next_permitted_action).toBe('await operator ruling');
     });
-  }, 30_000);
+  });
 
   test('merge_ready stays fully gated by dryRun (no regression)', async () => {
     await withTempDatabase(async () => {
@@ -936,3 +946,16 @@ describe('service', () => {
     expect(drains).toBe(drainsAfterReject);
   });
 });
+
+if (!invokedDirectly) {
+  test('service suite passes with isolated database state', () => {
+    const child = Bun.spawnSync(['bun', 'test', import.meta.path, '--timeout', '30000'], {
+      cwd: process.cwd(),
+      env: process.env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const output = new TextDecoder().decode(child.stdout) + new TextDecoder().decode(child.stderr);
+    expect(child.exitCode, output).toBe(0);
+  });
+}

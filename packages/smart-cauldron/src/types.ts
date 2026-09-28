@@ -13,7 +13,8 @@ export type TierOutcome =
   | 'gate-failed' // ran, built, gate failed -- climb
   | 'infra-error' // auth/transport failure -- alert, do not count as "too hard"
   | 'progress-timeout' // poll watchdog kill -- run never reached terminal; climb like gate-failed
-  | 'cancelled'; // externally cancelled; stop, do not climb
+  | 'cancelled' // externally cancelled; stop, do not climb
+  | 'refused'; // already-satisfied guard refused to fire this attempt; distinct from won (bdc-xo#2140)
 
 export interface LadderTier {
   name: TierName;
@@ -56,7 +57,9 @@ export type CascadeStatus =
   | 'pending-frontier-approval' // auto-climb reached a premium tier; paused for operator approval, not fired
   | 'frontier-rejected' // operator rejected the premium-tier climb; terminated as needs-human, no fire
   | 'frontier-approved' // operator approved the premium climb; original record handed off to the resumed cascade (resumeCascadeId)
-  | 'cancelled'; // an attempt was externally cancelled; cascade stopped
+  | 'cancelled' // an attempt was externally cancelled; cascade stopped
+  | 'refused'; // the already-satisfied guard refused to fire (WO already has a landed PR); attempts stays 0. Distinct from 'won': no tier ran, no gate passed --
+// a refusal is not a win and must never be reported as one (bdc-xo#2140).
 
 /**
  * FrontierApprovalPacket -- the preserved escalation packet stored when an
@@ -72,6 +75,8 @@ export type CascadeStatus =
  * cascade/cli secret boundary). The resume endpoint re-supplies the token.
  */
 export interface FrontierApprovalPacket {
+  /** Preserve the dispatch-time canonical source constraint across approval. */
+  expectedSpec?: import('@archon/core/workflows/work-order-source').ExpectedSpecIdentity;
   /** The premium tier the cascade would have fired next (e.g. 'frontier'). */
   tierName: TierName;
   /** The workflow lane bound to that premium tier (e.g. 'bdc-feature-development-fable'). */
@@ -134,6 +139,19 @@ export interface CascadeRunRecord {
     posted: boolean;
     whatMustChange: string;
     evidence: string;
+  };
+  /**
+   * Populated ONLY when status === 'refused': the already-satisfied guard
+   * declined to fire because the WO already has a landed PR (bdc-xo#2140).
+   * Distinguishes a genuine refusal from a won cascade -- attempts stays 0
+   * and no tier ever ran.
+   */
+  refusalReason?: {
+    reason: 'already-satisfied';
+    prNumber: number;
+    prState: string;
+    prUrl: string;
+    checkedAtTier: TierName | null;
   };
   supervisorRecovery?: {
     ownerId: string;

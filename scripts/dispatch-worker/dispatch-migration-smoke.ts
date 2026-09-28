@@ -28,6 +28,7 @@ const PHASE_0_NULLABLE_COLUMNS = [
   'escalated_sms_at',
   'subject_key',
   'route_disposition',
+  'route_disposed_at',
   'supersedes_id',
 ] as const;
 const REQUIRED_DISPATCH_INDEXES = [
@@ -36,6 +37,7 @@ const REQUIRED_DISPATCH_INDEXES = [
   'idx_dispatch_board_pending',
 ] as const;
 const KNOWN_PRINCIPALS = [
+  ['astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1],
   ['board', 'Board', 'alias_resolved', 1],
   ['cauldron', 'Cauldron', 'notify_only', 1],
   ['claude', 'Claude', 'worker_poll', 1],
@@ -43,6 +45,8 @@ const KNOWN_PRINCIPALS = [
   ['codex', 'Codex', 'worker_poll', 1],
   ['codex-mcp', 'Codex MCP', 'worker_poll', 1],
   ['cursor', 'Cursor', 'worker_poll', 1],
+  ['do', 'Duty Officer alias', 'worker_poll', 1],
+  ['duty-officer', 'Duty Officer', 'worker_poll', 1],
   ['fusion', 'Fusion', 'worker_poll', 1],
   ['grok', 'Grok', 'worker_poll', 1],
   ['grok-acp', 'Grok ACP', 'worker_poll', 1],
@@ -676,7 +680,7 @@ function validateMessageSchema(table: TableSnapshot): void {
   assertSqlContains(tableSql, [
     "check (priority in ('blocker', 'normal', 'heartbeat'))",
     "check (task_outcome is null or task_outcome in ('succeeded', 'failed', 'blocked'))",
-    "check (route_disposition is null or route_disposition in ('unroutable', 'superseded'))",
+    "check (route_disposition is null or route_disposition in ('unroutable', 'superseded', 'expired', 'auto_surfaced'))",
     'supersedes_id text references agent_dispatch_messages(id)',
     'sender_principal_id',
   ]);
@@ -799,7 +803,12 @@ function assertFirstMigration(
       `expected ${expectedHeartbeats} heartbeat rows, found ${after.heartbeatRows}`
     );
   }
-  if (after.otherHeartbeatRows !== 0 || after.otherNonNormalRows !== 0) {
+  // Backfill rules apply only when introducing priority. Existing priorities
+  // must instead remain unchanged, as verified by the state digest above.
+  if (
+    !before.messageColumns.includes('priority') &&
+    (after.otherHeartbeatRows !== 0 || after.otherNonNormalRows !== 0)
+  ) {
     throw new SmokeFailure('migration_priority_validation_failed');
   }
   if (after.missingLivePrincipalRows !== 0) {

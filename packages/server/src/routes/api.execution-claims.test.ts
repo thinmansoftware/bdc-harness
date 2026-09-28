@@ -226,6 +226,7 @@ mock.module('@archon/core/utils/commands', () => ({
 import { registerApiRoutes } from './api';
 import { setBoardPrincipalResolverForTests } from '@archon/core/db/board-authority';
 import * as executionClaimsDb from '@archon/core/db/execution-claims';
+import * as taskmasterDb from '@archon/core/db/taskmaster';
 
 function makeApp(token?: string): OpenAPIHono {
   if (token) {
@@ -466,5 +467,175 @@ describe('execution claims API', () => {
       headers: { 'x-archon-operator-token': TOKEN },
     });
     expect(missing.status).toBe(404);
+  });
+});
+
+describe('expectation front door HTTP contract', () => {
+  let registerExpectationSpy: Spy;
+
+  beforeEach(() => {
+    registerExpectationSpy = spyOn(
+      taskmasterDb,
+      'registerExpectationReportingCreation'
+    ).mockImplementation((async () => {
+      throw new Error('test must configure the registration result');
+    }) as never);
+  });
+
+  afterEach(() => {
+    registerExpectationSpy.mockRestore();
+    delete process.env.ARCHON_OPERATOR_TOKEN;
+  });
+
+  function expectationBody(over: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      registration_key: 'integration-creation',
+      dispatch_ref: 'bdc-xo#2007',
+      recipient: 'assigned-seat',
+      registered_by: 'assigning-seat',
+      evidence: { kind: 'pr_opened', repo: 'thinmansoftware/bdc-harness' },
+      due_in_minutes: 60,
+      on_absence: 'give_up',
+      ...over,
+    });
+  }
+
+  function registrationResult(created: boolean, over: Record<string, unknown> = {}) {
+    return {
+      capped: false as const,
+      id: 'expectation-1',
+      created,
+      expectation: {
+        id: 'expectation-1',
+        dispatch_ref: 'bdc-xo#2007',
+        recipient: 'assigned-seat',
+        evidence_json: JSON.stringify({
+          kind: 'pr_opened',
+          repo: 'thinmansoftware/bdc-harness',
+        }),
+        due_at: '2026-07-14T01:00:00.000Z',
+        on_absence: 'give_up' as const,
+        max_retries: 0,
+        retries: 0,
+        status: 'pending' as const,
+        evidence_pointer: null,
+        registered_by: 'assigning-seat',
+        self_supervised: 0,
+        created_at: '2026-07-13T00:00:00.000Z',
+        updated_at: '2026-07-13T00:00:00.000Z',
+        ...over,
+      },
+    };
+  }
+
+  const storedBody = {
+    id: 'expectation-1',
+    recipient: 'assigned-seat',
+    dispatch_ref: 'bdc-xo#2007',
+    evidence: { kind: 'pr_opened', repo: 'thinmansoftware/bdc-harness' },
+    due_at: '2026-07-14T01:00:00.000Z',
+    on_absence: 'give_up',
+    max_retries: 0,
+    created_at: '2026-07-13T00:00:00.000Z',
+  };
+
+  test('returns 201 for creation and 200 for an idempotent retry', async () => {
+    const app = makeApp(TOKEN);
+    registerExpectationSpy.mockImplementation((async () => registrationResult(true)) as never);
+    const created = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody(),
+    });
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ ...storedBody, created: true });
+
+    registerExpectationSpy.mockImplementation((async () => registrationResult(false)) as never);
+    const retried = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody(),
+    });
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toMatchObject({ ...storedBody, created: false });
+  });
+
+  test('same-key retry with a different recipient is 409', async () => {
+    const app = makeApp(TOKEN);
+    registerExpectationSpy.mockImplementation((async () =>
+      registrationResult(false, { recipient: 'original-seat' })) as never);
+    const conflicted = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody(),
+    });
+    expect(conflicted.status).toBe(409);
+    expect(await conflicted.json()).toMatchObject({
+      mismatched_fields: ['recipient'],
+      stored: { recipient: 'original-seat' },
+    });
+  });
+
+  test('same-key retry with different evidence is 409', async () => {
+    const app = makeApp(TOKEN);
+    registerExpectationSpy.mockImplementation((async () =>
+      registrationResult(false, {
+        evidence_json: JSON.stringify({ kind: 'pr_opened', repo: 'other/repo' }),
+      })) as never);
+    const conflicted = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody(),
+    });
+    expect(conflicted.status).toBe(409);
+    expect(await conflicted.json()).toMatchObject({
+      mismatched_fields: ['evidence'],
+      stored: { evidence: { kind: 'pr_opened', repo: 'other/repo' } },
+    });
+  });
+
+  test('same-key retry with a different max_retries is 409', async () => {
+    const app = makeApp(TOKEN);
+    registerExpectationSpy.mockImplementation((async () => registrationResult(false)) as never);
+    const conflicted = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody({ max_retries: 2 }),
+    });
+    expect(conflicted.status).toBe(409);
+    expect(await conflicted.json()).toMatchObject({
+      mismatched_fields: ['max_retries'],
+      stored: { max_retries: 0 },
+    });
+  });
+
+  test('same-key retry that only changes the deadline is 200 with the stored deadline', async () => {
+    const app = makeApp(TOKEN);
+    registerExpectationSpy.mockImplementation((async () => registrationResult(false)) as never);
+    const retried = await app.request('/api/taskmaster/expectations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': TOKEN },
+      body: expectationBody({ due_in_minutes: 1440 }),
+    });
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toMatchObject({
+      ...storedBody,
+      created: false,
+      due_at: '2026-07-14T01:00:00.000Z',
+    });
+  });
+
+  test('publishes both success statuses with the same response schema', async () => {
+    const response = await makeApp(TOKEN).request('/api/openapi.json');
+    expect(response.status).toBe(200);
+    const spec = (await response.json()) as {
+      paths: Record<string, { post?: { responses?: Record<string, unknown> } }>;
+    };
+    const responses = spec.paths['/api/taskmaster/expectations']?.post?.responses;
+    expect(responses).toMatchObject({
+      '200': { description: expect.any(String) },
+      '201': { description: 'New expectation created.' },
+      '409': { description: expect.any(String) },
+    });
   });
 });

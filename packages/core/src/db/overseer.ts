@@ -4,6 +4,22 @@ import { getDatabase } from './connection';
 
 const log = createLogger('db/overseer');
 
+/**
+ * Run-id prefix for discovery-sourced PR verdicts (hand-opened spec/diary PRs).
+ *
+ * This MUST stay byte-for-byte in sync with PR_DISCOVERY_RUN_ID_PREFIX in
+ * packages/overseer/src/merge-candidate-discovery.ts, which is the canonical
+ * owner that mints these run ids and the value the merge-execution bridge parses
+ * PR identity back out of. It is re-declared here rather than imported because
+ * @archon/overseer depends on @archon/core (overseer/src/service.ts imports
+ * claimOverseerVerdict from this module); importing the constant back would be a
+ * circular workspace dependency and a layering inversion (core is the
+ * foundational layer). The value is a fixed contract
+ * (WO-HARNESS-DISCOVERY-VERDICT-RECORD-01 "keep the prefix"); any divergence
+ * would break the discovery -> verdict -> bridge round-trip and be caught there.
+ */
+const DISCOVERY_RUN_ID_PREFIX = 'pr-discovery:';
+
 export interface OverseerWatchRun {
   id: string;
   woId: string;
@@ -211,6 +227,10 @@ export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
      FROM remote_agent_workflow_runs r
      LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
      WHERE r.status IN ('completed', 'failed', 'escalated', 'cancelled')
+       -- Synthetic discovery-PR parent rows (workflow_name = 'pr-discovery') are
+       -- not real work: excluding them keeps the watch loop from re-judging a
+       -- hand-opened PR that already has its own verdict recorded directly.
+       AND r.workflow_name != 'pr-discovery'
        AND NOT EXISTS (
          SELECT 1 FROM overseer_actions oa
          WHERE oa.run_id = r.id
@@ -220,6 +240,22 @@ export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
     [...TERMINAL_OVERSEER_ACTIONS]
   );
   return result.rows.map(normalizeRun);
+}
+
+export async function getOverseerWatchRunById(runId: string): Promise<OverseerWatchRun | null> {
+  // Same codebase JOIN as listRunsForOverseerWatch. Without it codebase_name is
+  // never selected, parseRepo falls back to metadata (which no run writes), and
+  // the merge-execution bridge skips every run-backed verdict as
+  // run_context_unresolvable (bdc-harness #846: 141 skipped, 0 merged).
+  const result = await getDatabase().query<WorkflowRunRow>(
+    `SELECT r.id, r.status, r.metadata, r.user_message, r.working_path,
+            c.name AS codebase_name
+     FROM remote_agent_workflow_runs r
+     LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
+     WHERE r.id = $1`,
+    [runId]
+  );
+  return result.rows[0] ? normalizeRun(result.rows[0]) : null;
 }
 
 interface OverseerEffectTimestampRow {
@@ -249,6 +285,9 @@ export async function countRunsPendingOverseerJudgment(): Promise<number> {
     `SELECT COUNT(*) AS pending_count
      FROM remote_agent_workflow_runs
      WHERE status IN ('completed', 'failed', 'escalated', 'cancelled')
+       -- Exclude synthetic discovery-PR parent rows so backlog metrics are not
+       -- inflated forever (they never receive an overseer_actions row this path).
+       AND workflow_name != 'pr-discovery'
        AND NOT EXISTS (
          SELECT 1 FROM overseer_actions oa WHERE oa.run_id = remote_agent_workflow_runs.id
        )`
@@ -329,6 +368,136 @@ export interface OverseerVerdictRow {
   retry_count: number;
   created_at: string;
   updated_at: string;
+  actioned_at: string | null;
+  mutation_sent: boolean | number | null;
+  action_reason: string | null;
+  merge_sha: string | null;
+  pr_url: string | null;
+}
+
+export async function listUnactionedFlagMergeReadyVerdicts(): Promise<OverseerVerdictRow[]> {
+  const result = await getDatabase().query<OverseerVerdictRow>(
+    `SELECT * FROM overseer_verdicts
+     WHERE proposed_action = 'flag_merge_ready' AND actioned_at IS NULL
+     ORDER BY created_at ASC`
+  );
+  return [...result.rows];
+}
+
+export async function countRecentOverseerVerdictMerges(since: string): Promise<number> {
+  const result = await getDatabase().query<{ merge_count: number | string }>(
+    `SELECT COUNT(*) AS merge_count FROM overseer_verdicts
+     WHERE mutation_sent = true AND actioned_at >= $1`,
+    [since]
+  );
+  return Number(result.rows[0]?.merge_count ?? 0);
+}
+
+export async function reserveOverseerMergeSlot(
+  verdictId: string,
+  since: string,
+  limit: number
+): Promise<boolean> {
+  const db = getDatabase();
+  const now = new Date().toISOString();
+  return db.withTransaction(async query => {
+    const locked = await query('UPDATE overseer_merge_slot_lock SET id = 1 WHERE id = 1');
+    if (locked.rowCount !== 1) {
+      throw new Error('overseer_merge_slot_lock_missing');
+    }
+    const occupiedResult = await query<{ occupied: number | string }>(
+      `SELECT COUNT(*) AS occupied FROM (
+         SELECT verdict_id AS slot_key FROM overseer_merge_slot_reservations
+         WHERE reserved_at >= $1 AND released_at IS NULL
+         UNION
+         SELECT id FROM overseer_verdicts
+         WHERE mutation_sent = true AND actioned_at >= $1
+       ) slots`,
+      [since]
+    );
+    const occupied = Number(occupiedResult.rows[0]?.occupied ?? 0);
+    if (!Number.isFinite(occupied) || occupied >= limit) return false;
+    // Revival of a released row succeeds (rowCount 1). An active reservation
+    // for the same verdict is a no-op (rowCount 0); the bridge never re-reserves
+    // an active slot.
+    const inserted = await query(
+      `INSERT INTO overseer_merge_slot_reservations (id, verdict_id, reserved_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (verdict_id) DO UPDATE SET
+         reserved_at = excluded.reserved_at,
+         released_at = NULL
+       WHERE overseer_merge_slot_reservations.released_at IS NOT NULL`,
+      [randomUUID(), verdictId, now]
+    );
+    return inserted.rowCount === 1;
+  });
+}
+
+export async function releaseOverseerMergeSlot(verdictId: string): Promise<void> {
+  await getDatabase().query(
+    `UPDATE overseer_merge_slot_reservations
+     SET released_at = $2
+     WHERE verdict_id = $1 AND released_at IS NULL`,
+    [verdictId, new Date().toISOString()]
+  );
+}
+
+export async function claimVerdictForMergeExecution(verdictId: string): Promise<boolean> {
+  const now = new Date().toISOString();
+  const result = await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET actioned_at = $2, mutation_sent = false, action_reason = 'processing', updated_at = $2
+     WHERE id = $1 AND actioned_at IS NULL`,
+    [verdictId, now]
+  );
+  return result.rowCount === 1;
+}
+
+export async function releaseVerdictClaimForMergeExecution(
+  verdictId: string,
+  _reason: string
+): Promise<boolean> {
+  const result = await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET actioned_at = NULL, mutation_sent = NULL, action_reason = NULL, updated_at = $2
+     WHERE id = $1 AND actioned_at IS NOT NULL AND action_reason = 'processing'`,
+    [verdictId, new Date().toISOString()]
+  );
+  return result.rowCount === 1;
+}
+
+export async function recordVerdictMergeOutcome(input: {
+  verdictId: string;
+  mutationSent: boolean;
+  reason: string;
+  mergeSha?: string;
+  prUrl?: string;
+}): Promise<OverseerVerdictRow> {
+  const db = getDatabase();
+  const updated = await db.query(
+    `UPDATE overseer_verdicts
+     SET mutation_sent = $2, action_reason = $3,
+         merge_sha = $4, pr_url = $5, updated_at = $6
+     WHERE id = $1 AND actioned_at IS NOT NULL AND action_reason = 'processing'`,
+    [
+      input.verdictId,
+      input.mutationSent,
+      input.reason,
+      input.mergeSha ?? null,
+      input.prUrl ?? null,
+      new Date().toISOString(),
+    ]
+  );
+  if (updated.rowCount !== 1) {
+    throw new Error(`overseer_verdict_outcome_not_recorded:${input.verdictId}`);
+  }
+  const result = await db.query<OverseerVerdictRow>(
+    'SELECT * FROM overseer_verdicts WHERE id = $1',
+    [input.verdictId]
+  );
+  const row = result.rows[0];
+  if (!row) throw new Error(`overseer_verdict_merge_outcome_missing_row:${input.verdictId}`);
+  return row;
 }
 
 export interface OverseerVerdictClaim {
@@ -346,6 +515,45 @@ export interface OverseerVerdictClaim {
  * health-alarm state may be re-claimed until maxRetries is exhausted. A slot
  * holding a semantic verdict (or an in-flight claim) is never re-claimed.
  */
+/**
+ * Idempotently ensure the synthetic parent rows a discovery-PR verdict FKs to.
+ *
+ * `overseer_verdicts.run_id` has a NOT NULL FK to remote_agent_workflow_runs, but
+ * discovery-sourced PRs (runId `pr-discovery:<owner>/<repo>#<n>`) are hand-opened
+ * PRs with no workflow run -- so every claimOverseerVerdict for one previously
+ * threw SQLITE_CONSTRAINT_FOREIGNKEY and no discovery verdict was ever recorded
+ * (bdc-xo#2208: 0 rows table-wide, 500 FK errors in 3h).
+ *
+ * On SQLite (the production dialect) remote_agent_workflow_runs.conversation_id
+ * is itself NOT NULL with an FK to remote_agent_conversations, so we ensure a
+ * synthetic conversation first, then the run. Both inserts are deterministic from
+ * runId and idempotent (ON CONFLICT (id) DO NOTHING), so a replay at the same head
+ * leaves exactly one conversation and one run row.
+ *
+ * The run is TERMINAL ('completed') so the rebuild inflight guard
+ * (status IN ('pending','running')), dashboards and backlog counts never treat it
+ * as live work. It carries workflow_name = 'pr-discovery' so the watch loop and
+ * pending-judgment count exclude it by name (see listRunsForOverseerWatch and
+ * countRunsPendingOverseerJudgment); user_message is the runId, never a WO token,
+ * so WO-substring run scans do not collide with it.
+ */
+export async function ensureDiscoveryRunRow(runId: string): Promise<void> {
+  const db = getDatabase();
+  await db.query(
+    `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
+     VALUES ($1, 'pr-discovery', $1, 'PR discovery')
+     ON CONFLICT (id) DO NOTHING`,
+    [runId]
+  );
+  await db.query(
+    `INSERT INTO remote_agent_workflow_runs
+       (id, conversation_id, workflow_name, user_message, status, completed_at)
+     VALUES ($1, $1, 'pr-discovery', $1, 'completed', $2)
+     ON CONFLICT (id) DO NOTHING`,
+    [runId, new Date().toISOString()]
+  );
+}
+
 export async function claimOverseerVerdict(input: {
   runId: string;
   woId: string;
@@ -357,6 +565,11 @@ export async function claimOverseerVerdict(input: {
   const db = getDatabase();
   const id = randomUUID();
   const headSha = input.headSha ?? '';
+  // Discovery-sourced PRs have no workflow run; mint the synthetic terminal
+  // parent row before the FK'd verdict insert so it does not throw.
+  if (input.runId.startsWith(DISCOVERY_RUN_ID_PREFIX)) {
+    await ensureDiscoveryRunRow(input.runId);
+  }
   const inserted = await db.query<{ id: string }>(
     `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, status, hint_action, hint_error_class)
      VALUES ($1, $2, $3, $4, 'claimed', $5, $6)
@@ -409,6 +622,7 @@ export async function finalizeOverseerVerdict(input: {
   reason?: string;
   evidenceDigest?: string;
   evidence?: string;
+  prUrl?: string;
 }): Promise<OverseerVerdictRow> {
   const db = getDatabase();
   // No RETURNING: the SQLite adapter rejects it on UPDATE, and this throw took
@@ -420,7 +634,7 @@ export async function finalizeOverseerVerdict(input: {
      SET status = $2, verdict = $3, confidence = $4, model = $5, model_rung = $6,
          proposed_action = $7, proposed_tier = $8, required_tier = $9, effective_tier = $10,
          reason = $11, evidence_digest = COALESCE($12, evidence_digest),
-         evidence = $13, updated_at = $14
+         evidence = $13, pr_url = COALESCE($14, pr_url), updated_at = $15
      WHERE id = $1`,
     [
       input.verdictId,
@@ -436,6 +650,7 @@ export async function finalizeOverseerVerdict(input: {
       input.reason ?? null,
       input.evidenceDigest ?? null,
       input.evidence ?? null,
+      input.prUrl ?? null,
       new Date().toISOString(),
     ]
   );

@@ -142,7 +142,10 @@ describe('real GitHub deps', () => {
       state: 'all',
       per_page: 5,
     });
-    expect(search).not.toHaveBeenCalled();
+    expect(search).toHaveBeenCalledWith({
+      q: 'repo:thinmansoftware/bdc-harness is:pr is:open "WO-42"',
+      per_page: 5,
+    });
     expect(result).toMatchObject({
       exists: true,
       state: 'open',
@@ -179,7 +182,7 @@ describe('real GitHub deps', () => {
     });
 
     expect(search).toHaveBeenCalledWith({
-      q: 'repo:thinmansoftware/bdc-harness is:pr "WO-FALLBACK-77"',
+      q: 'repo:thinmansoftware/bdc-harness is:pr is:open "WO-FALLBACK-77"',
       per_page: 5,
     });
     expect(get).toHaveBeenCalledWith({
@@ -233,7 +236,7 @@ describe('real GitHub deps', () => {
     expect(result.state).toBe('lookup_failed');
   });
 
-  test('merges with the current pull request head SHA', async () => {
+  test('merges with the expected head SHA, not a substituted refetch', async () => {
     const merge = mock(async () => ({ data: { merged: true, sha: 'a'.repeat(40) } }));
     const result = await createRealMergePullRequest(
       createOctokitMock({ pulls: { ...createOctokitMock().pulls, merge } })
@@ -242,6 +245,7 @@ describe('real GitHub deps', () => {
       repo: 'bdc-harness',
       number: 42,
       commitTitle: 'Overseer merge WO-42',
+      expectedHeadSha: 'a'.repeat(40),
     });
 
     expect(merge).toHaveBeenCalledWith({
@@ -255,6 +259,7 @@ describe('real GitHub deps', () => {
       merged: true,
       message: 'Overseer merge WO-42',
       sha: 'a'.repeat(40),
+      mergeSha: 'a'.repeat(40),
     });
   });
 
@@ -271,6 +276,7 @@ describe('real GitHub deps', () => {
           owner: 'thinmansoftware',
           repo: 'bdc-harness',
           number: 42,
+          expectedHeadSha: 'a'.repeat(40),
         })
       ).resolves.toEqual({ merged: false, message: `github_merge_rejected_${status}` });
     }
@@ -288,10 +294,65 @@ describe('real GitHub deps', () => {
         owner: 'thinmansoftware',
         repo: 'bdc-harness',
         number: 42,
+        expectedHeadSha: 'a'.repeat(40),
       })
     ).resolves.toEqual({
       merged: false,
       message: 'github_merge_transport_ambiguous',
+    });
+  });
+
+  test('does not merge when the refetched head differs from expectedHeadSha', async () => {
+    const live = 'c'.repeat(40);
+    const merge = mock(async () => ({ data: { merged: true, sha: live } }));
+    const octokit = createOctokitMock({
+      pulls: {
+        ...createOctokitMock().pulls,
+        get: async () => ({
+          data: {
+            number: 42,
+            title: 'WO-42 real merge',
+            state: 'open',
+            mergeable: true,
+            html_url: 'https://github.test/pull/42',
+            changed_files: 3,
+            head: { sha: live },
+          },
+        }),
+        merge,
+      },
+    });
+    await expect(
+      createRealMergePullRequest(octokit)({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        number: 42,
+        expectedHeadSha: 'a'.repeat(40),
+      })
+    ).resolves.toEqual({ merged: false, message: `head_moved:${live}` });
+    expect(merge).not.toHaveBeenCalled();
+  });
+
+  test('maps 405 merge precondition rejection to the API message', async () => {
+    const octokit = createOctokitMock({
+      pulls: {
+        ...createOctokitMock().pulls,
+        merge: async () =>
+          Promise.reject(
+            Object.assign(new Error('Pull Request is not mergeable'), { status: 405 })
+          ),
+      },
+    });
+    await expect(
+      createRealMergePullRequest(octokit)({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        number: 42,
+        expectedHeadSha: 'a'.repeat(40),
+      })
+    ).resolves.toEqual({
+      merged: false,
+      message: 'Pull Request is not mergeable',
     });
   });
 });

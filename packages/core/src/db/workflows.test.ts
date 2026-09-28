@@ -52,6 +52,7 @@ import {
   resumeWorkflowRun,
   failOrphanedRuns,
   listWorkflowRuns,
+  listDashboardRuns,
   listWorkflowRunsWithWorkingPath,
   sumWorkflowTokensInWindow,
   deleteOldWorkflowRuns,
@@ -922,6 +923,32 @@ describe('workflows database', () => {
       expect(query).toContain('archived_at IS NULL');
     });
 
+    // bdc-xo#2208 / diff-review: synthetic discovery-PR parent rows
+    // (workflow_name = 'pr-discovery') exist only to satisfy the overseer_verdicts
+    // FK. They must never be exposed through /api/workflow-runs.
+    test('excludes synthetic pr-discovery rows', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await listWorkflowRuns();
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('workflow_name != $');
+      expect(params).toContain('pr-discovery');
+    });
+
+    test('does not return synthetic pr-discovery rows even if the query yields them', async () => {
+      // The exclusion is a WHERE clause; prove callers never see a discovery row by
+      // asserting the clause is present alongside real filters (status + archived).
+      mockQuery.mockResolvedValueOnce(createQueryResult([mockWorkflowRun]));
+
+      await listWorkflowRuns({ status: ['completed'], includeArchived: false });
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('archived_at IS NULL');
+      expect(query).toContain('workflow_name != $');
+      expect(params).toContain('pr-discovery');
+    });
+
     test('filters by single status string', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
@@ -959,6 +986,44 @@ describe('workflows database', () => {
       const result = await listWorkflowRuns();
 
       expect(result).toEqual([mockWorkflowRun]);
+    });
+  });
+
+  describe('listDashboardRuns', () => {
+    // bdc-xo#2208 / diff-review: synthetic discovery-PR parent rows must not appear
+    // in the dashboard run list NOR inflate the per-status (completed/all) counts.
+    // Both the list query and the count query are built from
+    // buildDashboardWhereClauses, so both must carry the exclusion.
+    test('excludes synthetic pr-discovery rows from both the list and count queries', async () => {
+      // listDashboardRuns fires two queries via Promise.all (list, then counts).
+      mockQuery.mockResolvedValue(createQueryResult([]));
+
+      await listDashboardRuns({ limit: 10 });
+
+      expect(mockQuery.mock.calls.length).toBeGreaterThanOrEqual(2);
+      const [listQuery, listParams] = mockQuery.mock.calls[0] as [string, unknown[]];
+      const [countQuery, countParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+
+      expect(listQuery).toContain('r.workflow_name != $');
+      expect(listParams).toContain('pr-discovery');
+
+      expect(countQuery).toContain('r.workflow_name != $');
+      expect(countParams).toContain('pr-discovery');
+    });
+
+    test('keeps the exclusion when a status filter is applied', async () => {
+      mockQuery.mockResolvedValue(createQueryResult([]));
+
+      await listDashboardRuns({ status: 'completed', limit: 10 });
+
+      const [listQuery, listParams] = mockQuery.mock.calls[0] as [string, unknown[]];
+      const [, countParams] = mockQuery.mock.calls[1] as [string, unknown[]];
+
+      expect(listQuery).toContain('r.status = $');
+      expect(listQuery).toContain('r.workflow_name != $');
+      expect(listParams).toContain('pr-discovery');
+      // Count query drops the status filter but must still exclude discovery rows.
+      expect(countParams).toContain('pr-discovery');
     });
   });
 

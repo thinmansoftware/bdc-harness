@@ -33,6 +33,9 @@ export interface PullRequestRef {
   owner: string;
   repo: string;
   number: number;
+  headRef?: string;
+  author?: string;
+  createdAt?: string;
 }
 
 export type PullRequestState = string;
@@ -60,12 +63,27 @@ export interface PullRequestEvidence {
    * merge provenance compares this against the run's own worktree tip.
    */
   headSha?: string;
+  baseBranch?: string;
+  mergeableState?: string;
+  changedFilePaths?: readonly string[];
   /**
    * True when the lookup itself failed, so `exists: false` means "unknown", not
    * "no PR". Never widens the merge gate (both cases stay `exists: false`); it
    * exists so the watcher stops reporting an unverified absence as a fact.
    */
   lookupFailed?: boolean;
+  /**
+   * Other open PRs for the same WO, excluding the selected PR. Bounded to five.
+   * Present so the judge can see a builder pre-review PR beside the run's own PR.
+   */
+  otherOpenPrsForWo?: { number: number; headRef: string; createdAt: string }[];
+  /**
+   * True when the optional sibling WO search failed after the primary PR was
+   * already resolved. The primary `lookupFailed` flag stays unset: the run's
+   * own PR is known, and `otherOpenPrsForWo` is empty because siblings were
+   * not loaded.
+   */
+  otherOpenPrsForWoLookupFailed?: boolean;
 }
 
 export interface GrokJudgeEvidence {
@@ -148,17 +166,100 @@ export interface GitHubPullRequestSearchInput {
   repo: string;
   headBranch?: string;
   woId?: string;
+  /**
+   * Exact pull request number, when the caller already knows it (PR-first
+   * discovery does). `headBranch` and `woId` are both NON-UNIQUE -- two forks
+   * can push the same branch name and one WO id can span several PRs -- so an
+   * implementation that can address a PR directly should prefer this. Optional:
+   * implementations may ignore it, and callers verify the returned evidence
+   * binds to the PR they asked about regardless.
+   */
+  prNumber?: number;
+  includeChangedFiles?: boolean;
 }
 
 export interface GitHubPullRequestMergeInput extends PullRequestRef {
   commitTitle?: string;
+  mergeMethod?: 'merge' | 'squash' | 'rebase';
+  /**
+   * Reviewed head SHA. Passed through to GitHub as the merge `sha`
+   * precondition. Callers must not omit it; adapters must not replace it
+   * with a refetched head.
+   */
+  expectedHeadSha: string;
+}
+
+/**
+ * One open pull request as returned by PR-first candidate discovery
+ * (bdc-harness#758). Deliberately carries only what the discovery predicates
+ * read -- the full evidence fetch (checks, mergeability) stays with
+ * findPullRequest so a PR excluded on structural grounds costs no extra call.
+ */
+export interface DiscoveredPullRequest {
+  owner: string;
+  repo: string;
+  prNumber: number;
+  title: string;
+  /** GitHub's PR state, e.g. 'open'. */
+  state: string;
+  draft: boolean;
+  baseRef: string;
+  headRef: string;
+  headSha: string;
+  /**
+   * GitHub's aggregate review decision: 'APPROVED', 'CHANGES_REQUESTED',
+   * 'REVIEW_REQUIRED', or null when the repo/API reports none. Never inferred
+   * from individual reviews here -- an absent decision stays absent.
+   */
+  reviewDecision: string | null;
+  /** WO id when one is recoverable from the PR, used to sharpen evidence lookup. */
+  woId?: string;
+  /**
+   * True when `reviewDecision` came from the conservative REST derivation
+   * because GitHub's aggregate was unavailable for this sweep. That derivation
+   * is STRICTER than GitHub's own answer, so a PR excluded while this is set
+   * may in fact be approved -- the heartbeat counts these so a degraded gate is
+   * visible instead of looking like a quiet backlog.
+   */
+  reviewDecisionFromFallback?: boolean;
+  /**
+   * True when the repo's open-PR listing hit the page ceiling, so PRs beyond it
+   * were never read on this tick. Set on every PR the truncated sweep DID
+   * return, because the flag's job is to make the omission visible somewhere a
+   * caller can see it: an unread PR has no record of its own to carry it.
+   *
+   * The PRs carrying this flag are still fully evaluated candidates -- the flag
+   * is about what is MISSING from the sweep, never a defect in the PR it rides
+   * on, and must not be read as a reason to hold it.
+   */
+  listingTruncated?: boolean;
+}
+
+export interface GitHubOpenPullRequestListInput {
+  owner: string;
+  repo: string;
+  /** Base branches to restrict the listing to; empty means every base. */
+  baseBranches?: readonly string[];
+}
+
+/**
+ * PR-first discovery seam. OPTIONAL on GitHubClientDeps so every existing
+ * composition (fakes, legacy wiring, tests) keeps compiling; when it is absent
+ * discovery reports `unavailable` rather than reporting an empty candidate set,
+ * because "we did not look" and "nothing to merge" are different facts.
+ */
+export interface MergeCandidateDiscoveryDeps {
+  findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
+  listOpenPullRequests?(
+    input: GitHubOpenPullRequestListInput
+  ): Promise<readonly DiscoveredPullRequest[]>;
 }
 
 export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
   mergePullRequest(
     input: GitHubPullRequestMergeInput
-  ): Promise<{ merged: boolean; message?: string; sha?: string }>;
+  ): Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }>;
   /** Reviews used by the Merge Manager's distinct Review Gate approval check. */
   listPullRequestReviews?(
     input: PullRequestRef
@@ -171,14 +272,36 @@ export interface GitHubClientDeps {
   commentOnPullRequest?(
     input: PullRequestRef & { body: string }
   ): Promise<{ commented: boolean; url?: string }>;
+  /** Login expected to own comments created through `commentOnPullRequest`. */
+  commentAuthorLogin?: string;
+  /**
+   * Existing PR issue comments, used to keep the merge-manager receipt
+   * idempotent. Optional so existing fakes and compositions keep compiling.
+   * When absent, the bridge posts without a marker scan.
+   */
+  listPullRequestComments?(
+    input: PullRequestRef
+  ): Promise<readonly { body: string; authorLogin: string }[]>;
   /**
    * Approve a pull request as the configured identity (the Thinman Overseer
    * GitHub App when App auth is active; otherwise the PAT identity). Optional so
    * existing GitHubClientDeps implementers (fakes, legacy compositions) keep
    * compiling. GitHub rejects self-approval regardless of identity -- the real
    * implementation surfaces a usable message rather than throwing in that case.
+   * When `expectedHeadSha` is set it is pinned as GitHub review `commit_id`.
    */
-  approvePullRequest?(input: PullRequestRef): Promise<{ approved: boolean; message?: string }>;
+  approvePullRequest?(
+    input: PullRequestRef & { expectedHeadSha?: string }
+  ): Promise<{ approved: boolean; message?: string }>;
+  /**
+   * List open pull requests for PR-first merge candidate discovery
+   * (bdc-harness#758). Optional: when absent the watcher keeps its
+   * run-derived candidate set and logs that discovery was unavailable, rather
+   * than silently reporting an empty sweep.
+   */
+  listOpenPullRequests?(
+    input: GitHubOpenPullRequestListInput
+  ): Promise<readonly DiscoveredPullRequest[]>;
 }
 
 /**

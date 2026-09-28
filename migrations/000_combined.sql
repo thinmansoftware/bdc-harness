@@ -552,7 +552,8 @@ CREATE TABLE IF NOT EXISTS agent_dispatch_messages (
   escalated_sms_at TIMESTAMPTZ,
   subject_key TEXT,
   repeat_reason TEXT,
-  route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+        route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+        route_disposed_at TEXT,
   supersedes_id UUID REFERENCES agent_dispatch_messages(id)
 );
 
@@ -589,6 +590,15 @@ CREATE TABLE IF NOT EXISTS dispatch_principals (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS dispatch_receipt_cutover (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  applied_at TEXT NOT NULL
+);
+
+INSERT INTO dispatch_receipt_cutover (id, applied_at)
+VALUES (1, CURRENT_TIMESTAMP)
+ON CONFLICT (id) DO NOTHING;
+
 INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
 VALUES
   ('claude', 'Claude', 'worker_poll', TRUE),
@@ -599,6 +609,10 @@ VALUES
   ('claude-acp', 'Claude ACP', 'worker_poll', TRUE),
   ('codex-mcp', 'Codex MCP', 'worker_poll', TRUE),
   ('grok-acp', 'Grok ACP', 'worker_poll', TRUE),
+  -- WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01 (migration 056): the Astra Codex
+  -- desktop Board/XO seat. drain_on_start (mailbox) like operator/xo -- no
+  -- worker ever claims it; the desktop automation reads and addresses it.
+  ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', TRUE),
   ('operator', 'Operator', 'drain_on_start', TRUE),
   ('xo', 'XO', 'drain_on_start', TRUE),
   ('board', 'Board', 'alias_resolved', TRUE),
@@ -610,7 +624,9 @@ VALUES
   -- route's sender and worker-poll recipient. Without these rows every
   -- review enqueue is rejected as missing_principal.
   ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
-  ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE)
+  ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE),
+  ('duty-officer', 'Duty Officer', 'worker_poll', TRUE),
+  ('do', 'Duty Officer alias', 'worker_poll', TRUE)
 ON CONFLICT (principal_id) DO NOTHING;
 
 INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)

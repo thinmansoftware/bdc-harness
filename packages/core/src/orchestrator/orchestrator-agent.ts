@@ -64,6 +64,7 @@ import * as workflowDb from '../db/workflows';
 import * as workflowEventDb from '../db/workflow-events';
 import { getCodebaseEnvVars } from '../db/env-vars';
 import type { ApprovalContext } from '@archon/workflows/schemas/workflow-run';
+import type { ModelOverride } from '@archon/workflows/model-override';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -246,7 +247,8 @@ async function dispatchOrchestratorWorkflow(
   codebase: Codebase,
   workflow: WorkflowDefinition,
   userMessage: string,
-  isolationHints?: HandleMessageContext['isolationHints']
+  isolationHints?: HandleMessageContext['isolationHints'],
+  modelOverride?: ModelOverride
 ): Promise<void> {
   // Auto-attach project to conversation
   await db.updateConversation(conversation.id, {
@@ -347,7 +349,10 @@ async function dispatchOrchestratorWorkflow(
         codebase.id,
         undefined, // issueContext
         undefined, // isolationContext
-        conversation.id // parentConversationId -- enables approve/reject auto-resume
+        conversation.id, // parentConversationId -- enables approve/reject auto-resume
+        undefined,
+        undefined,
+        modelOverride
       );
     } else {
       await dispatchBackgroundWorkflow(
@@ -360,6 +365,7 @@ async function dispatchOrchestratorWorkflow(
           codebaseId: codebase.id,
           availableWorkflows: [workflow],
           isolationHints,
+          modelOverride,
         },
         workflow
       );
@@ -376,7 +382,10 @@ async function dispatchOrchestratorWorkflow(
       codebase.id,
       undefined, // issueContext
       undefined, // isolationContext
-      conversation.id // parentConversationId -- enables approve/reject auto-resume
+      conversation.id, // parentConversationId -- enables approve/reject auto-resume
+      undefined,
+      undefined,
+      modelOverride
     );
   }
 }
@@ -588,8 +597,14 @@ export async function handleMessage(
   message: string,
   context?: HandleMessageContext
 ): Promise<void> {
-  const { issueContext, threadContext, parentConversationId, isolationHints, attachedFiles } =
-    context ?? {};
+  const {
+    issueContext,
+    threadContext,
+    parentConversationId,
+    isolationHints,
+    attachedFiles,
+    modelOverride,
+  } = context ?? {};
   try {
     getLog().debug({ conversationId }, 'orchestrator_message_received');
 
@@ -777,7 +792,8 @@ export async function handleMessage(
             conversationId,
             conversation,
             parsedCommand.args,
-            isolationHints
+            isolationHints,
+            modelOverride
           );
           if (handledWorkflowRun) {
             return;
@@ -795,7 +811,8 @@ export async function handleMessage(
             conversation,
             result.workflow.definition,
             result.workflow.args ?? message,
-            isolationHints
+            isolationHints,
+            modelOverride
           );
         }
         return;
@@ -1762,7 +1779,8 @@ async function handleWorkflowRunSlashCommand(
   conversationId: string,
   conversation: Conversation,
   args: string[],
-  isolationHints?: HandleMessageContext['isolationHints']
+  isolationHints?: HandleMessageContext['isolationHints'],
+  modelOverride?: ModelOverride
 ): Promise<boolean> {
   if (args[0] !== 'run') {
     return false;
@@ -1821,7 +1839,8 @@ async function handleWorkflowRunSlashCommand(
         codebase,
         globalWorkflow,
         binding.userMessage,
-        isolationHints
+        isolationHints,
+        modelOverride
       );
       return true;
     }
@@ -1867,7 +1886,8 @@ async function handleWorkflowRunSlashCommand(
       codebase,
       workflow,
       binding.userMessage,
-      isolationHints
+      isolationHints,
+      modelOverride
     );
     return true;
   }
@@ -1898,7 +1918,8 @@ async function handleWorkflowRunSlashCommand(
           binding.codebase,
           match.workflow,
           binding.userMessage,
-          isolationHints
+          isolationHints,
+          modelOverride
         );
         return true;
       }
@@ -1948,7 +1969,8 @@ async function handleWorkflowRunCommand(
   conversation: Conversation,
   workflow: WorkflowDefinition,
   userMessage: string,
-  isolationHints?: HandleMessageContext['isolationHints']
+  isolationHints?: HandleMessageContext['isolationHints'],
+  modelOverride?: ModelOverride
 ): Promise<void> {
   // Check if conversation has a project
   if (conversation.codebase_id) {
@@ -1968,7 +1990,8 @@ async function handleWorkflowRunCommand(
       codebase,
       workflow,
       userMessage,
-      isolationHints
+      isolationHints,
+      modelOverride
     );
     return;
   }
@@ -2055,7 +2078,8 @@ async function handleWorkflowRunCommand(
       codebase,
       resolvedWorkflow,
       binding.userMessage,
-      isolationHints
+      isolationHints,
+      modelOverride
     );
     return;
   }
@@ -2078,7 +2102,8 @@ async function handleWorkflowRunCommand(
       binding.codebase,
       workflow,
       binding.userMessage,
-      isolationHints
+      isolationHints,
+      modelOverride
     );
     return;
   }

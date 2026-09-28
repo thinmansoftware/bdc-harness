@@ -1,6 +1,6 @@
 # =============================================================================
 # Archon - Remote Agentic Coding Platform
-# Multi-stage build: deps → web build → production image
+# Multi-stage build: deps -> web build -> production image
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -19,7 +19,7 @@ COPY packages/canary-suite/package.json ./packages/canary-suite/
 COPY packages/cli/package.json ./packages/cli/
 COPY packages/core/package.json ./packages/core/
 COPY packages/security-watchdog/package.json ./packages/security-watchdog/
-# docs-web source is NOT copied — it's a static site deployed separately
+# docs-web source is NOT copied - it's a static site deployed separately
 # (see .github/workflows/deploy-docs.yml). package.json is included only
 # so Bun's workspace lockfile resolves correctly.
 COPY packages/docs-web/package.json ./packages/docs-web/
@@ -50,7 +50,7 @@ FROM deps AS web-build
 # Copy full source (needed for workspace resolution and web build)
 COPY . .
 
-# Build the web frontend — output goes to packages/web/dist/
+# Build the web frontend - output goes to packages/web/dist/
 RUN bun run build:web && \
     test -f packages/web/dist/index.html || \
     (echo "ERROR: Web build produced no index.html" >&2 && exit 1)
@@ -67,6 +67,8 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 # Prevent interactive prompts during installation
 ENV DEBIAN_FRONTEND=noninteractive
+ARG ARCHON_BUILD_SHA=unknown
+ENV ARCHON_BUILD_SHA=${ARCHON_BUILD_SHA}
 ARG TERRAFORM_VERSION=1.8.5
 
 WORKDIR /app
@@ -150,6 +152,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 
+# Install the Cursor CLI (cursor-agent) for the Overseer `cursor` judge rung and
+# the `cursor` agent provider (PR #848). The official installer drops a
+# self-contained bundle (it ships its own node runtime, so the nodejs purge above
+# does not affect it) under $HOME/.local/share/cursor-agent plus a launcher at
+# $HOME/.local/bin/cursor-agent. Install under a fixed, world-readable HOME so
+# appuser can execute it, then expose it on PATH. No credential is baked in:
+# auth comes at runtime from ~/.cursor (seeded by the entrypoint) or CURSOR_API_KEY.
+ARG CURSOR_AGENT_INSTALL_URL=https://cursor.com/install
+RUN mkdir -p /opt/cursor-agent \
+    && HOME=/opt/cursor-agent bash -c "curl -fsSL '${CURSOR_AGENT_INSTALL_URL}' | bash" \
+    && test -x /opt/cursor-agent/.local/bin/cursor-agent \
+    && ln -sf /opt/cursor-agent/.local/bin/cursor-agent /usr/local/bin/cursor-agent \
+    && chmod -R a+rX /opt/cursor-agent \
+    && cursor-agent --version
+
 # CLAUDE_BIN_PATH is set at container startup (docker-entrypoint.sh).
 # The entrypoint pins the glibc variant to bypass the SDK's musl-first resolver.
 
@@ -171,7 +188,7 @@ COPY packages/canary-suite/package.json ./packages/canary-suite/
 COPY packages/cli/package.json ./packages/cli/
 COPY packages/core/package.json ./packages/core/
 COPY packages/security-watchdog/package.json ./packages/security-watchdog/
-# docs-web source is NOT copied — it's a static site deployed separately
+# docs-web source is NOT copied - it's a static site deployed separately
 # (see .github/workflows/deploy-docs.yml). package.json is included only
 # so Bun's workspace lockfile resolves correctly.
 COPY packages/docs-web/package.json ./packages/docs-web/
@@ -223,6 +240,11 @@ RUN chown -R appuser:appuser /app
 
 # Create .codex directory for Codex authentication
 RUN mkdir -p /home/appuser/.codex && chown appuser:appuser /home/appuser/.codex
+
+# Create .cursor directory for cursor-agent authentication. Populated at startup
+# from the read-only host mount /run/secrets/cursor-config (docker-entrypoint.sh)
+# or left empty when CURSOR_API_KEY is used instead.
+RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.cursor
 
 # Configure git to trust all directories for both root and appuser.
 # Uses the git-native '*' wildcard (standalone token, not a shell glob) which

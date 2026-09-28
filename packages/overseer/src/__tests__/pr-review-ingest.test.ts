@@ -269,8 +269,22 @@ describe('duplicate delivery', () => {
 describe('stale-head invalidation', () => {
   test('in-flight work on an older head is cancelled when the head advances', async () => {
     const prior: PriorReviewWork[] = [
-      { messageId: 'old-1', headSha: OLD_HEAD, status: 'queued' },
-      { messageId: 'old-2', headSha: OLD_HEAD, status: 'claimed' },
+      {
+        messageId: 'old-1',
+        headSha: OLD_HEAD,
+        status: 'queued',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
+      {
+        messageId: 'old-2',
+        headSha: OLD_HEAD,
+        status: 'claimed',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
     ];
     const { deps, rec } = makeDeps({}, prior);
     const result = await ingestPullRequestEvent(req(prPayload()), deps);
@@ -281,9 +295,30 @@ describe('stale-head invalidation', () => {
 
   test('terminal prior work is NOT cancelled', async () => {
     const prior: PriorReviewWork[] = [
-      { messageId: 'done-1', headSha: OLD_HEAD, status: 'done' },
-      { messageId: 'failed-1', headSha: OLD_HEAD, status: 'failed' },
-      { messageId: 'cancelled-1', headSha: OLD_HEAD, status: 'cancelled' },
+      {
+        messageId: 'done-1',
+        headSha: OLD_HEAD,
+        status: 'done',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
+      {
+        messageId: 'failed-1',
+        headSha: OLD_HEAD,
+        status: 'failed',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
+      {
+        messageId: 'cancelled-1',
+        headSha: OLD_HEAD,
+        status: 'cancelled',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
     ];
     const { deps, rec } = makeDeps({}, prior);
     const result = await ingestPullRequestEvent(req(prPayload()), deps);
@@ -292,7 +327,16 @@ describe('stale-head invalidation', () => {
   });
 
   test('prior work on the SAME head is not treated as stale', async () => {
-    const prior: PriorReviewWork[] = [{ messageId: 'same-1', headSha: HEAD, status: 'queued' }];
+    const prior: PriorReviewWork[] = [
+      {
+        messageId: 'same-1',
+        headSha: HEAD,
+        status: 'queued',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
+    ];
     const { deps, rec } = makeDeps({}, prior);
     await ingestPullRequestEvent(req(prPayload()), deps);
     expect(rec.cancelled).toHaveLength(0);
@@ -406,5 +450,71 @@ describe('failure handling and receipts', () => {
     });
     const result = await ingestPullRequestEvent(req(prPayload()), deps);
     expect(result.disposition).toBe('queued');
+  });
+});
+
+describe('dirty mergeable_state (#845)', () => {
+  const LIVE_BASE_SHA = 'd'.repeat(40);
+
+  function mergeabilityDeps(
+    state: string | undefined,
+    throws = false
+  ): { deps: IngestDeps; rec: Recorded } {
+    return makeDeps({
+      fetchPullRequestMergeability: async () => {
+        if (throws) throw new Error('github_unavailable');
+        return { mergeableState: state, baseRef: 'dev', baseSha: LIVE_BASE_SHA };
+      },
+    });
+  }
+
+  test('dirty writes a blocked base_not_incorporated receipt and does not enqueue', async () => {
+    const { deps, rec } = mergeabilityDeps('dirty');
+    const result = await ingestPullRequestEvent(req(prPayload()), deps);
+    const reason = `base_not_incorporated:dev@${LIVE_BASE_SHA}`;
+    expect(result.disposition).toBe('blocked');
+    expect(result.status).toBe(200);
+    expect(result.reason).toBe(reason);
+    expect(rec.enqueued).toHaveLength(0);
+    expect(rec.receipts).toHaveLength(1);
+    expect(rec.receipts[0]?.disposition).toBe('blocked');
+    expect(rec.receipts[0]?.reason).toBe(reason);
+    expect(rec.receipts[0]?.headSha).toBe(HEAD);
+    expect(rec.receipts[0]?.prNumber).toBe(673);
+  });
+
+  test.each(['unknown', 'clean'] as const)('mergeable_state %s still enqueues', async state => {
+    const { deps, rec } = mergeabilityDeps(state);
+    const result = await ingestPullRequestEvent(req(prPayload()), deps);
+    expect(result.disposition).toBe('queued');
+    expect(rec.enqueued).toHaveLength(1);
+  });
+
+  test('a fetch error is treated as unknown and still enqueues', async () => {
+    const { deps, rec } = mergeabilityDeps('dirty', true);
+    const result = await ingestPullRequestEvent(req(prPayload()), deps);
+    expect(result.disposition).toBe('queued');
+    expect(rec.enqueued).toHaveLength(1);
+  });
+
+  test('re-ingest of the same head after the PR is mergeable enqueues', async () => {
+    let state = 'dirty';
+    const { deps, rec } = makeDeps({
+      fetchPullRequestMergeability: async () => ({
+        mergeableState: state,
+        baseRef: 'dev',
+        baseSha: LIVE_BASE_SHA,
+      }),
+    });
+    const first = await ingestPullRequestEvent(req(prPayload()), deps);
+    expect(first.disposition).toBe('blocked');
+    expect(rec.enqueued).toHaveLength(0);
+    state = 'clean';
+    const second = await ingestPullRequestEvent(
+      req(prPayload(), { deliveryId: 'delivery-2' }),
+      deps
+    );
+    expect(second.disposition).toBe('queued');
+    expect(rec.enqueued).toHaveLength(1);
   });
 });

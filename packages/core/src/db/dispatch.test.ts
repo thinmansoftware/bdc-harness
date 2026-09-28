@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { existsSync, mkdtempSync, rmSync, unlinkSync } from 'fs';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { existsSync, mkdtempSync, unlinkSync } from 'fs';
+import { removeTempDirWithRetry } from '../test/temp-dir';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { pathToFileURL } from 'url';
@@ -37,20 +38,27 @@ import {
   heartbeatWorker,
   listEligibleXoEscalations,
   listMessages,
+  listMessagesByCorrelationPrefixWithoutSubjectKey,
   listUnroutableQueuedMessages,
   listWorkers,
   postResult,
   reconcileDispatchOutcomeNotices,
   registerWorker,
+  deferMessage,
+  disposeMessageByMachine,
+  listMessagesByCorrelationId,
   releaseDispatchEscalationClaim,
   releaseMessage,
   renewMessageLease,
   resolveDispatchRecipient,
   assessDispatchRecipient,
   normalizeDispatchSubjectKey,
+  mailboxDepthByPrincipal,
   supersedeMessage,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
+  type XoLeaseBind,
+  type DispatchQueryExecutor,
 } from './dispatch';
 
 /** Test-local fixture constructor -- production path is createAuthenticatedMessage. */
@@ -258,7 +266,7 @@ describe('dispatch db', () => {
     cleanupDb(currentDbPath);
     while (raceHomes.length > 0) {
       const raceHome = raceHomes.pop();
-      if (raceHome) rmSync(raceHome, { recursive: true, force: true });
+      if (raceHome) removeTempDirWithRetry(raceHome);
     }
   });
 
@@ -458,6 +466,60 @@ describe('dispatch db', () => {
     expect(
       await claimMessage({ id: mailboxMessage.id, worker_id: 'worker-mode-guard' })
     ).toBeNull();
+  });
+
+  // WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01: astra is a drain_on_start mailbox
+  // principal. It must be a valid recipient, must never be claimed by any
+  // worker, must ack/address as 'astra', and must refuse a 'codex' actor.
+  test('astra is an unclaimable mailbox principal that only its own actor may address', async () => {
+    await expect(assessDispatchRecipient(' Astra ')).resolves.toEqual({
+      ok: true,
+      canonical_principal: 'astra',
+      delivery_mode: 'drain_on_start',
+      reason: null,
+    });
+
+    await registerWorker({
+      worker_id: 'worker-astra-guard',
+      host: 'host',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const astraMessage = await createMessage({
+      correlation_id: 'corr-astra-mailbox',
+      idempotency_key: 'idem-astra-mailbox',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'astra',
+      body: 'Arc D ruling for Astra.',
+    });
+
+    // (b) no worker ever claims an astra row -- it stays queued, unleased.
+    expect(await claimMessage({ id: astraMessage.id, worker_id: 'worker-astra-guard' })).toBeNull();
+    const afterClaim = await getMessage(astraMessage.id);
+    expect(afterClaim?.status).toBe('queued');
+    expect(afterClaim?.lease_owner).toBeNull();
+
+    // (d) a wrong-recipient actor (codex) is refused for ack and address.
+    await expect(
+      acknowledgeMessage({ id: astraMessage.id, principal_id: 'codex' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_recipient' });
+    await expect(addressMessage({ id: astraMessage.id, principal_id: 'codex' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_recipient',
+    });
+
+    // (c) astra acks its own mail, then addresses it, both idempotent.
+    expect((await acknowledgeMessage({ id: astraMessage.id, principal_id: 'astra' })).ok).toBe(
+      true
+    );
+    expect((await addressMessage({ id: astraMessage.id, principal_id: ' Astra ' })).ok).toBe(true);
+    const stored = await getMessage(astraMessage.id);
+    expect(stored).toMatchObject({
+      status: 'queued',
+      acknowledged_by: 'astra',
+      addressed_by: 'astra',
+    });
   });
 
   test('rejects missing and inactive concrete principals before claim', async () => {
@@ -840,7 +902,7 @@ describe('dispatch db', () => {
     } finally {
       await inspectionDb.close();
     }
-  }, 30_000);
+  });
 
   test('returns every acknowledgement conflict outcome', async () => {
     const mailbox = await createMessage({
@@ -891,13 +953,372 @@ describe('dispatch db', () => {
       ok: false,
       reason: 'not_queued',
     });
-    expect((await acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).ok).toBe(true);
+    await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'xo_bind_required',
+    });
     await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo-fable' })).resolves.toEqual(
       {
         ok: false,
         reason: 'wrong_recipient',
       }
     );
+  });
+
+  for (const action of ['acknowledge', 'address'] as const) {
+    for (const turnover of ['replace', 'release'] as const) {
+      test(`${action} rejects XO lease ${turnover} between validation and UPDATE`, async () => {
+        const message = await createMessage({
+          correlation_id: 'corr-xo-turnover',
+          idempotency_key: 'idem-xo-turnover',
+          task_type: 'agent_message',
+          sender: 'operator',
+          recipient: 'xo',
+          body: 'XO lease turnover.',
+        });
+        const bind: XoLeaseBind = {
+          kind: 'xo_lease',
+          lease_id: '11111111-1111-4111-8111-111111111111',
+          fencing_token: 9,
+          holder_token_hash: createHash('sha256').update('test-holder').digest('hex'),
+        };
+        await db.query(
+          `INSERT INTO board_xo_leases
+           (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+            acquired_at, expires_at)
+           VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, $5)`,
+          [
+            bind.lease_id,
+            bind.holder_token_hash,
+            bind.fencing_token,
+            new Date().toISOString(),
+            new Date(Date.now() + 60_000).toISOString(),
+          ]
+        );
+        const data = { id: message.id, principal_id: 'xo', bind };
+        if (action === 'address') expect((await acknowledgeMessage(data)).ok).toBe(true);
+        const before = await getMessage(message.id);
+        const withTransaction = db.withTransaction.bind(db);
+        let leaseValidated = false;
+        let turnoverInjected = false;
+        const transactionSpy = spyOn(db, 'withTransaction').mockImplementation(fn =>
+          withTransaction(query => {
+            const wrappedQuery: DispatchQueryExecutor = async <T>(
+              sql: string,
+              params?: unknown[]
+            ) => {
+              if (sql.startsWith('UPDATE agent_dispatch_messages') && !turnoverInjected) {
+                expect(leaseValidated).toBe(true);
+                // Inject turnover only after the pre-check has read the valid lease.
+                await query(
+                  turnover === 'replace'
+                    ? "UPDATE board_xo_leases SET lease_id = '22222222-2222-4222-8222-222222222222', fencing_token = fencing_token + 1 WHERE id = 1"
+                    : 'UPDATE board_xo_leases SET released_at = $1 WHERE id = 1',
+                  turnover === 'release' ? [new Date().toISOString()] : []
+                );
+                turnoverInjected = true;
+              }
+              const result = await query<T>(sql, params);
+              if (sql.startsWith('SELECT lease_id, fencing_token, holder_token_hash')) {
+                expect(result.rowCount).toBe(turnoverInjected && turnover === 'release' ? 0 : 1);
+                leaseValidated = true;
+              }
+              return result;
+            };
+            return fn(wrappedQuery);
+          })
+        );
+        try {
+          const mutate = action === 'acknowledge' ? acknowledgeMessage : addressMessage;
+          await expect(mutate(data)).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+          expect(turnoverInjected).toBe(true);
+          const stored = await getMessage(message.id);
+          expect(stored?.acknowledged_at).toBe(before?.acknowledged_at ?? null);
+          expect(stored?.acknowledged_by).toBe(before?.acknowledged_by ?? null);
+          expect(stored?.addressed_at).toBeNull();
+          expect(stored?.addressed_by).toBeNull();
+        } finally {
+          transactionSpy.mockRestore();
+        }
+      });
+    }
+  }
+
+  test('requires and transactionally fences the XO mailbox lease binding', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-xo-bind',
+      idempotency_key: 'idem-xo-bind',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'XO binding test.',
+    });
+    await expect(acknowledgeMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'xo_bind_required',
+    });
+    const holderToken = 'holder-secret';
+    const bind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-current',
+      fencing_token: 9,
+      holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
+    };
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, NULL, $5, NULL)`,
+      [
+        bind.lease_id,
+        bind.holder_token_hash,
+        bind.fencing_token,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    await expect(
+      acknowledgeMessage({
+        id: message.id,
+        principal_id: 'xo',
+        bind: { ...bind, fencing_token: 8 },
+      })
+    ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind })).ok).toBe(true);
+  });
+
+  test('mailbox depth treats all stamped rows as legacy_unverified without a cutover', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-legacy-depth',
+      idempotency_key: 'idem-legacy-depth',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Legacy depth test.',
+    });
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [message.id, new Date().toISOString(), 'operator']
+    );
+    await db.query('DELETE FROM dispatch_receipt_cutover');
+    const depth = await mailboxDepthByPrincipal();
+    expect(depth.cutover_at).toBeNull();
+    const operator = depth.operator as import('./dispatch').MailboxDepth;
+    expect(operator.legacy_unverified).toBe(1);
+    expect(operator.acked_open).toBe(0);
+  });
+
+  test('mailbox depth assigns an eight-row fixture to exclusive exact buckets', async () => {
+    const cutover = new Date(Date.now() - 60_000).toISOString();
+    const before = new Date(Date.now() - 120_000).toISOString();
+    const after = new Date(Date.now() - 30_000).toISOString();
+    await db.query('DELETE FROM dispatch_receipt_cutover');
+    await db.query('INSERT INTO dispatch_receipt_cutover (id, applied_at) VALUES (1, $1)', [
+      cutover,
+    ]);
+    const rows = await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        createMessage({
+          correlation_id: `depth-corr-${index}`,
+          idempotency_key: `depth-idem-${index}`,
+          task_type: 'agent_message',
+          sender: 'xo',
+          recipient: 'operator',
+          body: `depth ${index}`,
+        })
+      )
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [rows[2]!.id, before, 'operator']
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [rows[3]!.id, after, 'operator']
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3, addressed_at = $2, addressed_by = $3 WHERE id = $1',
+      [rows[4]!.id, after, 'operator']
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'expired', route_disposed_at = $2 WHERE id = $1",
+      [rows[5]!.id, after]
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [rows[6]!.id, after]
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3, route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [rows[7]!.id, after, 'operator']
+    );
+
+    const depth = (await mailboxDepthByPrincipal()).operator as import('./dispatch').MailboxDepth;
+    expect(depth).toEqual({
+      unread: 2,
+      legacy_unverified: 1,
+      acked_open: 1,
+      addressed_by_mind: 1,
+      disposed_by_machine: 1,
+      surfaced_unacked: 1,
+      surfaced_acked: 1,
+    });
+    expect(Object.values(depth).reduce((sum, count) => sum + count, 0)).toBe(8);
+  });
+
+  test('mailbox depth rejects a principal that collides with the cutover_at metadata key', async () => {
+    await db.query(
+      "INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active) VALUES ('cutover_at', 'Reserved', 'notify_only', 1)"
+    );
+    await expect(mailboxDepthByPrincipal()).rejects.toThrow(
+      'dispatch_principal_reserved:cutover_at'
+    );
+  });
+
+  test('machine disposition writes only routing evidence and auto_surfaced stays ackable', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-machine-surface',
+      idempotency_key: 'idem-machine-surface',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Surface me.',
+    });
+    const disposed = await disposeMessageByMachine({
+      id: message.id,
+      actor: 'system:operator-inbox-consumer',
+      disposition: 'auto_surfaced',
+    });
+    expect(disposed).toMatchObject({
+      ok: true,
+      message: {
+        status: 'queued',
+        route_disposition: 'auto_surfaced',
+        acknowledged_at: null,
+        acknowledged_by: null,
+        addressed_at: null,
+        addressed_by: null,
+      },
+    });
+    if (disposed.ok) expect(disposed.message.route_disposed_at).not.toBeNull();
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+    expect(await getMessage(message.id)).toMatchObject({
+      acknowledged_by: 'operator',
+      addressed_at: null,
+      route_disposition: 'auto_surfaced',
+    });
+  });
+
+  test('terminal dispositions refuse acknowledgement with disposition_terminal', async () => {
+    // expired -> disposition_terminal; unroutable -> disposition_terminal;
+    // superseded is covered by the same terminal-receipt contract.
+    for (const disposition of ['expired', 'unroutable', 'superseded'] as const) {
+      const message = await createMessage({
+        correlation_id: `corr-terminal-${disposition}`,
+        idempotency_key: `idem-terminal-${disposition}`,
+        task_type: 'agent_message',
+        sender: 'xo',
+        recipient: 'operator',
+        body: disposition,
+      });
+      if (disposition === 'expired') {
+        expect(
+          (
+            await disposeMessageByMachine({
+              id: message.id,
+              actor: 'system:test-expirer',
+              disposition,
+            })
+          ).ok
+        ).toBe(true);
+      } else {
+        await db.query(
+          'UPDATE agent_dispatch_messages SET route_disposition = $2, route_disposed_at = $3 WHERE id = $1',
+          [message.id, disposition, '2026-09-23T00:00:00.000Z']
+        );
+      }
+      await expect(
+        acknowledgeMessage({ id: message.id, principal_id: 'operator' })
+      ).resolves.toEqual({ ok: false, reason: 'disposition_terminal' });
+    }
+  });
+
+  test('queued listing excludes disposed rows and route_disposition retrieves surfaced rows', async () => {
+    const surfaced = await createMessage({
+      correlation_id: 'corr-list-surfaced',
+      idempotency_key: 'idem-list-surfaced',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'surface',
+    });
+    const expired = await createMessage({
+      correlation_id: 'corr-list-expired',
+      idempotency_key: 'idem-list-expired',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'expire',
+    });
+    await disposeMessageByMachine({
+      id: surfaced.id,
+      actor: 'system:test',
+      disposition: 'auto_surfaced',
+    });
+    await disposeMessageByMachine({ id: expired.id, actor: 'system:test', disposition: 'expired' });
+    expect(
+      (await listMessages({ recipient: 'operator', status: 'queued' })).map(row => row.id)
+    ).not.toContain(surfaced.id);
+    expect(
+      (await listMessages({ recipient: 'operator', status: 'queued' })).map(row => row.id)
+    ).not.toContain(expired.id);
+    expect(
+      (await listMessages({ recipient: 'operator', route_disposition: 'auto_surfaced' })).map(
+        row => row.id
+      )
+    ).toContain(surfaced.id);
+    expect(
+      (
+        await listMessages({
+          recipient: 'operator',
+          status: 'queued',
+          route_disposition: 'auto_surfaced',
+        })
+      ).map(row => row.id)
+    ).toContain(surfaced.id);
+  });
+
+  test('machine disposition validates actor, value, and one-shot behavior', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-machine-errors',
+      idempotency_key: 'idem-machine-errors',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'errors',
+    });
+    await expect(
+      disposeMessageByMachine({ id: message.id, actor: 'operator', disposition: 'expired' })
+    ).resolves.toEqual({ ok: false, reason: 'machine_actor_required' });
+    await expect(
+      disposeMessageByMachine({
+        id: message.id,
+        actor: 'system:test',
+        disposition: 'addressed' as 'expired',
+      })
+    ).resolves.toEqual({ ok: false, reason: 'disposition_invalid' });
+    expect(
+      (
+        await disposeMessageByMachine({
+          id: message.id,
+          actor: 'system:test',
+          disposition: 'expired',
+        })
+      ).ok
+    ).toBe(true);
+    await expect(
+      disposeMessageByMachine({ id: message.id, actor: 'system:test', disposition: 'expired' })
+    ).resolves.toEqual({ ok: false, reason: 'already_disposed' });
   });
 
   test('addresses only acknowledged mail by its acknowledger and is idempotent', async () => {
@@ -916,7 +1337,7 @@ describe('dispatch db', () => {
     expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
     await expect(addressMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
       ok: false,
-      reason: 'wrong_recipient',
+      reason: 'xo_bind_required',
     });
     await expect(
       addressMessage({ id: message.id, principal_id: 'operator' })
@@ -979,7 +1400,7 @@ describe('dispatch db', () => {
     } finally {
       await inspectionDb.close();
     }
-  }, 30_000);
+  });
 
   test('addressing revalidates final status when a guarded update loses to cancellation', async () => {
     const message = await createMessage({
@@ -1080,7 +1501,7 @@ describe('dispatch db', () => {
     });
     await expect(addressMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
       ok: false,
-      reason: 'wrong_recipient',
+      reason: 'xo_bind_required',
     });
     await db.query("UPDATE agent_dispatch_messages SET acknowledged_by = 'xo' WHERE id = $1", [
       mailbox.id,
@@ -1402,6 +1823,114 @@ describe('dispatch db', () => {
     const reclaim = await claimMessage({ id: message.id, worker_id: 'worker-b' });
     expect(reclaim?.status).toBe('claimed');
     expect(reclaim?.fencing_token).toBe(2);
+  });
+
+  // WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Test 3 (fenced dispatch
+  // deferral), asserted through the WO's own function name.
+  test('deferMessage requeues with a future clock, preserves the exact-head body, refuses a stale fence, and bumps only on the next claim', async () => {
+    await registerWorker({
+      worker_id: 'worker-a',
+      host: 'host-a',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    await registerWorker({
+      worker_id: 'worker-b',
+      host: 'host-b',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    const body = JSON.stringify({ owner: 'thinmansoftware', repo: 'bdc-harness', headSha: 'abc' });
+    const message = await createMessage({
+      correlation_id: 'corr-defer',
+      idempotency_key: 'idem-defer',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body,
+    });
+
+    const claim = await claimMessage({ id: message.id, worker_id: 'worker-a' });
+    expect(claim?.fencing_token).toBe(1);
+
+    // A stale worker/fence combination cannot defer the row.
+    expect(
+      await deferMessage({
+        id: message.id,
+        worker_id: 'worker-b',
+        fencing_token: 1,
+        defer_until: new Date(Date.now() + 60_000).toISOString(),
+      })
+    ).toBeNull();
+    expect(
+      await deferMessage({
+        id: message.id,
+        worker_id: 'worker-a',
+        fencing_token: 99,
+        defer_until: new Date(Date.now() + 60_000).toISOString(),
+      })
+    ).toBeNull();
+
+    const deferUntil = new Date(Date.now() + 60_000).toISOString();
+    const deferred = await deferMessage({
+      id: message.id,
+      worker_id: 'worker-a',
+      fencing_token: claim?.fencing_token ?? 0,
+      defer_until: deferUntil,
+    });
+    expect(deferred?.status).toBe('queued');
+    expect(deferred?.not_before).toBe(deferUntil);
+    expect(deferred?.lease_owner).toBeNull();
+    expect(deferred?.completed_at).toBeNull();
+    expect(deferred?.task_outcome).toBeNull();
+    // The exact-head body and identity survive the deferral untouched.
+    expect(deferred?.body).toBe(body);
+    expect(deferred?.idempotency_key).toBe('idem-defer');
+    // The fence is bumped by the NEXT claim, not by the deferral.
+    expect(deferred?.fencing_token).toBe(1);
+
+    // Not reclaimable before the clock, and invisible to the queued listing.
+    expect(await claimMessage({ id: message.id, worker_id: 'worker-b' })).toBeNull();
+    const queued = await listMessages({ recipient: 'grok', status: 'queued' });
+    expect(queued.some(item => item.id === message.id)).toBe(false);
+  });
+
+  // bdc-harness #782: the recheck ingest reads the standing verdict by the
+  // exact head-bound correlation id, because those receipts carry no
+  // subject_key on this lineage and sit far outside any listMessages page.
+  test('listMessagesByCorrelationId returns only the exact correlation, newest first', async () => {
+    const wanted = 'pr-review:thinmansoftware/bdc-harness#777@5ac93b76';
+    await createMessage({
+      correlation_id: wanted,
+      idempotency_key: 'idem-corr-1',
+      task_type: 'run_report',
+      sender: 'xo',
+      recipient: 'operator',
+      body: JSON.stringify({ kind: 'pr_review_submit_receipt', disposition: 'changes_requested' }),
+    });
+    await createMessage({
+      correlation_id: `${wanted}-other`,
+      idempotency_key: 'idem-corr-2',
+      task_type: 'run_report',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'unrelated',
+    });
+
+    const rows = await listMessagesByCorrelationId({
+      correlationId: wanted,
+      recipient: 'operator',
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.correlation_id).toBe(wanted);
+
+    // A prefix is not a match: the head is part of the identity.
+    expect(
+      await listMessagesByCorrelationId({
+        correlationId: 'pr-review:thinmansoftware/bdc-harness#777@',
+        recipient: 'operator',
+      })
+    ).toHaveLength(0);
   });
 
   test('releaseMessage with a future not_before defers reclaim and queued visibility', async () => {
@@ -2212,6 +2741,281 @@ describe('dispatch db', () => {
       now: new Date().toISOString(),
     });
     expect(claimedAuth?.id).toBe(authed.id);
+  });
+  /**
+   * listMessagesByCorrelationPrefixWithoutSubjectKey exists for the Overseer
+   * legacy-receipt fallback (PR #772). subject_key was added to submit
+   * receipts in 2026-09; receipts written before that carry only a
+   * correlation_id, and `listMessages` cannot reach them -- it caps limit at
+   * 500 and exposes no offset, while the live store holds thousands of
+   * operator rows.
+   */
+  describe('listMessagesByCorrelationPrefixWithoutSubjectKey', () => {
+    async function legacyReceipt(id: string, correlationId: string): Promise<string> {
+      const message = await createMessage({
+        correlation_id: correlationId,
+        idempotency_key: `idem-${id}`,
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: `legacy receipt ${id}`,
+      });
+      return message.id;
+    }
+
+    /**
+     * Write scale and read scale must be the SAME scale.
+     *
+     * Review finding (Overseer, PR #800): newest-first reads order by
+     * COALESCE(seq, rowid), so a raw/fixture/import row inserted with
+     * seq = NULL has an effective ordering value of its rowid. Computing the
+     * next seq from MAX(seq) alone ignored those rows entirely, so a NULL-seq
+     * row with a high rowid could tie or outrank the next normally-inserted
+     * row -- an undefined tie in the total order this column exists to
+     * guarantee.
+     *
+     * Runs against the real SqliteAdapter, not a double: the bug lives in the
+     * SQL expression, so only real SQL can pin it.
+     */
+    test('a normal insert outranks a raw NULL-seq row, by seq and by read order', async () => {
+      // A writer that bypasses createMessage entirely -- fixture, import, or
+      // hand-written SQL -- leaving seq NULL.
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, seq)
+         VALUES ($1, $2, $3, 'run_report', 'overseer', 'operator', '{}', 'queued', $4, NULL)`,
+        [
+          '11111111-1111-4111-8111-111111111111',
+          'pr-review:o/r#903@raw',
+          'idem-raw-null-seq',
+          '2026-09-08T00:00:00.000Z',
+        ]
+      );
+      const rawRow = await db.query<{ rowid: number; seq: number | null }>(
+        `SELECT rowid, seq FROM agent_dispatch_messages WHERE id = $1`,
+        ['11111111-1111-4111-8111-111111111111']
+      );
+      const rawRowid = rawRow.rows[0]!.rowid;
+      // Premise guard: the row really is NULL-seq, so the read path falls back
+      // to its rowid. Without this the test could pass vacuously.
+      expect(rawRow.rows[0]!.seq).toBeNull();
+
+      const later = await createMessage({
+        correlation_id: 'pr-review:o/r#903@normal',
+        idempotency_key: 'idem-after-raw',
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: 'written through createMessage',
+      });
+      const laterRow = await db.query<{ seq: number }>(
+        `SELECT seq FROM agent_dispatch_messages WHERE id = $1`,
+        [later.id]
+      );
+
+      // STRICTLY greater than the raw row's effective ordering value, not equal
+      // to it -- equality is the undefined tie this fix removes.
+      expect(laterRow.rows[0]!.seq).toBeGreaterThan(rawRowid);
+
+      // And the read path agrees: the later write comes back first.
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#903@',
+      });
+      expect(found.map(message => message.id)).toEqual([
+        later.id,
+        '11111111-1111-4111-8111-111111111111',
+      ]);
+    });
+
+    test('returns only subject_key-less rows matching the prefix, newest-first', async () => {
+      const first = await legacyReceipt('a', 'pr-review:thinmansoftware/bdc-harness#800@aaa');
+      const second = await legacyReceipt('b', 'pr-review:thinmansoftware/bdc-harness#800@bbb');
+      // Same prefix but already indexed by subject_key: the indexed query
+      // reaches it, so the legacy path must not also return it.
+      await createMessage({
+        correlation_id: 'pr-review:thinmansoftware/bdc-harness#800@ccc',
+        idempotency_key: 'idem-c',
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: 'indexed receipt',
+        subject_key: 'gh:thinmansoftware/bdc-harness#800',
+      });
+      // A PR whose number merely STARTS with 800, and a different repo.
+      await legacyReceipt('d', 'pr-review:thinmansoftware/bdc-harness#8001@ddd');
+      await legacyReceipt('e', 'pr-review:thinmansoftware/shopops#800@eee');
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#800@',
+      });
+
+      expect(found.map(message => message.id)).toEqual([second, first]);
+    });
+
+    /**
+     * Regression: receipts written inside the same wall-clock millisecond must
+     * still come back newest-first.
+     *
+     * Ordering is guaranteed by the database-assigned `seq` column, NOT by the
+     * client clock -- a process-local monotonic timestamp cannot order writes
+     * from concurrent writers or survive a restart. `collectVerdicts` depends
+     * on this newest-first contract to keep an older failed attempt from
+     * outranking a later authoritative verdict.
+     */
+    test('orders same-millisecond rows newest-first, not by random UUID', async () => {
+      const ids: string[] = [];
+      for (let index = 0; index < 12; index++) {
+        ids.push(await legacyReceipt(`tie-${index}`, `pr-review:o/r#900@${index}`));
+      }
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#900@',
+      });
+
+      // Exact reverse insertion order, every time -- no dependence on how the
+      // UUIDs happened to sort.
+      expect(found.map(message => message.id)).toEqual([...ids].reverse());
+      // And the timestamps are strictly decreasing, which is what makes the
+      // ordering real rather than incidental.
+      const timestamps = found.map(message => message.created_at);
+      expect([...timestamps].sort().reverse()).toEqual(timestamps);
+      expect(new Set(timestamps).size).toBe(timestamps.length);
+    });
+
+    /**
+     * The multi-writer case, which is why the ordering key must be assigned by
+     * the DATABASE rather than by any client clock (Overseer review, PR #790).
+     *
+     * Two processes -- or one process before and after a restart -- can stamp
+     * the SAME created_at, and a restarted writer can even stamp an older one.
+     * A process-local monotonic clock cannot prevent either. Here every row is
+     * forced to an identical created_at, so `seq` is the only thing that can
+     * order them; measured over 2,000 trials, seq is correct 100% of the time
+     * where the old `id DESC` tiebreak was correct 0.9%.
+     */
+    test('orders rows sharing one created_at by DB seq, across writers', async () => {
+      const sharedCreatedAt = '2026-09-08T00:00:00.000Z';
+      const ids: string[] = [];
+      for (let index = 0; index < 8; index++) {
+        const id = await legacyReceipt(`concurrent-${index}`, `pr-review:o/r#901@${index}`);
+        ids.push(id);
+      }
+      // Collapse every timestamp to one value, simulating concurrent writers
+      // whose clocks agree (or a restart that rewound the clock).
+      await db.query(
+        `UPDATE agent_dispatch_messages SET created_at = $1
+          WHERE correlation_id LIKE 'pr-review:o/r#901@%'`,
+        [sharedCreatedAt]
+      );
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#901@',
+      });
+
+      expect(found.map(message => message.created_at)).toEqual(
+        Array(ids.length).fill(sharedCreatedAt)
+      );
+      // Still exact reverse insertion order -- decided purely by seq.
+      expect(found.map(message => message.id)).toEqual([...ids].reverse());
+    });
+
+    /**
+     * seq must be the PRIMARY ordering key, not a tiebreak after created_at
+     * (Overseer review, PR #790).
+     *
+     * A writer that restarted, or whose clock skewed backwards, stamps a LOWER
+     * created_at than rows already committed -- while still taking a HIGHER
+     * seq, because seq comes from the database. Ordering by created_at first
+     * would sort that later write behind earlier rows, which is not an
+     * insertion order. The last row written must come back first regardless of
+     * what its clock said.
+     */
+    test('a row with an older created_at but higher seq still sorts first', async () => {
+      const earlier = await legacyReceipt('skew-old', 'pr-review:o/r#902@1');
+      const later = await legacyReceipt('skew-new', 'pr-review:o/r#902@2');
+
+      // Simulate the clock-skewed / restarted writer: the LATER row (higher
+      // seq) carries a created_at a full day BEFORE the earlier row.
+      await db.query(`UPDATE agent_dispatch_messages SET created_at = $1 WHERE id = $2`, [
+        '2026-09-07T00:00:00.000Z',
+        earlier,
+      ]);
+      await db.query(`UPDATE agent_dispatch_messages SET created_at = $1 WHERE id = $2`, [
+        '2026-09-06T00:00:00.000Z',
+        later,
+      ]);
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#902@',
+      });
+
+      const rows = found.map(message => message.id);
+      // The genuinely-last write leads, even though its timestamp is older.
+      expect(rows).toEqual([later, earlier]);
+      // Guard the premise: this test is only meaningful while the timestamps
+      // actually disagree with insertion order.
+      const byId = new Map(found.map(message => [message.id, message.created_at]));
+      expect(byId.get(later)! < byId.get(earlier)!).toBe(true);
+    });
+
+    test('reaches a row far beyond the listMessages page cap', async () => {
+      // listMessages caps limit at 500 and has no offset, so a client-side
+      // scan cannot see this row. The SQL predicate can.
+      for (let index = 0; index < 520; index += 1) {
+        await createMessage({
+          correlation_id: `unrelated:${index}`,
+          idempotency_key: `idem-noise-${index}`,
+          task_type: 'run_report',
+          sender: 'overseer',
+          recipient: 'operator',
+          body: `noise ${index}`,
+        });
+      }
+      const buried = await legacyReceipt('buried', 'pr-review:thinmansoftware/bdc-harness#761@aaa');
+
+      const page = await listMessages({ recipient: 'operator', limit: 500 });
+      expect(page.length).toBe(500);
+      expect(page.some(message => message.id === buried)).toBe(false);
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#761@',
+      });
+      expect(found.map(message => message.id)).toEqual([buried]);
+    });
+
+    test('treats LIKE metacharacters in the prefix as literals', async () => {
+      // '_' is a single-character LIKE wildcard and '%' matches anything.
+      // Unescaped, a prefix for repo 'a_c' would also match repo 'abc' and
+      // leak a foreign PR verdict into the re-review decision.
+      await legacyReceipt('decoy', 'pr-review:thinmansoftware/abc#1@aaa');
+      expect(
+        await listMessagesByCorrelationPrefixWithoutSubjectKey({
+          recipient: 'operator',
+          correlationPrefix: 'pr-review:thinmansoftware/a_c#1@',
+        })
+      ).toHaveLength(0);
+      expect(
+        await listMessagesByCorrelationPrefixWithoutSubjectKey({
+          recipient: 'operator',
+          correlationPrefix: '%',
+        })
+      ).toHaveLength(0);
+    });
+
+    test('is scoped to the requested recipient', async () => {
+      await legacyReceipt('operator-row', 'pr-review:thinmansoftware/bdc-harness#900@aaa');
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'grok',
+        correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#900@',
+      });
+      expect(found).toHaveLength(0);
+    });
   });
 });
 

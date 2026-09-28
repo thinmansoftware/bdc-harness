@@ -7,10 +7,12 @@
  * stricter-of-two tier law, and permit-free Tier 0 escalation.
  */
 
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { rootLogger } from '@archon/paths';
 import {
   buildEvidenceEnvelope,
   buildJudgePrompt,
+  envelopeDigest,
   judgeTerminalRun,
   parseJudgeOutput,
   type JudgeOutcome,
@@ -29,6 +31,31 @@ import type {
   OverseerWorkflowEvent,
   WatchedRunRecord,
 } from '../types.ts';
+
+interface LogDestination {
+  write(chunk: string): unknown;
+}
+
+const loggerStreamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+  symbol => String(symbol) === 'Symbol(pino.stream)'
+)!;
+const loggerDestination = (rootLogger as unknown as Record<symbol, LogDestination>)[
+  loggerStreamSymbol
+];
+const originalLogWrite = loggerDestination.write.bind(loggerDestination);
+
+afterEach(() => {
+  loggerDestination.write = originalLogWrite;
+});
+
+function captureLogOutput(): string[] {
+  const chunks: string[] = [];
+  loggerDestination.write = (chunk: string): boolean => {
+    chunks.push(chunk);
+    return true;
+  };
+  return chunks;
+}
 
 function makeRecord(overrides: Partial<WatchedRunRecord> = {}): WatchedRunRecord {
   return {
@@ -278,6 +305,34 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
     }
   });
 
+  // #852 (live 2026-09-15 13:47Z): OVERSEER_JUDGE_LADDER=codex,grok,cursor with
+  // codex out of quota and grok out of credits. cursor was the only live rung,
+  // so the ONLY acceptable outcome is its verdict -- never judge_unavailable.
+  test('#852: codex and grok dead, cursor answers -- determinate verdict, not judge_unavailable', async () => {
+    const spawned: string[] = [];
+    const outcome = await judgeTerminalRun(envelope, {
+      ladder: ['codex', 'grok', 'cursor'],
+      spawn: async (binary: string): Promise<JudgeSpawnResult> => {
+        spawned.push(binary);
+        if (binary !== 'cursor') return { exitCode: 1, stdout: '', timedOut: false };
+        return {
+          exitCode: 0,
+          stdout:
+            '{"verdict":"observe","confidence":0.7,"proposed_action":"none","reason":"uneventful terminal run"}',
+          timedOut: false,
+        };
+      },
+      recordOutcome: ignoreOutcome,
+    });
+    expect(spawned).toEqual(['codex', 'grok', 'cursor']);
+    expect(outcome).toMatchObject({
+      kind: 'verdict',
+      verdict: 'observe',
+      model: 'cursor',
+      modelRung: 2,
+    });
+  });
+
   test('records an unavailable outcome when spawning throws', async () => {
     const recorded: unknown[] = [];
     const outcome = await judgeTerminalRun(envelope, {
@@ -292,6 +347,31 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
     });
     expect(outcome.kind).toBe('judge_unavailable');
     expect(recorded).toEqual([['missing', { exitCode: -1, timedOut: false }, 'judge-first']]);
+  });
+
+  test('logs a health-write failure with serialized error details without crashing', async () => {
+    const output = captureLogOutput();
+    await expect(
+      judgeTerminalRun(envelope, {
+        ladder: ['healthy-spawn'],
+        spawn: async () => ({
+          exitCode: 0,
+          stdout:
+            '{"verdict":"observe","confidence":0.7,"proposed_action":"none","proposed_tier":0,"reason":"ok"}',
+          timedOut: false,
+        }),
+        recordOutcome: async () => {
+          throw new Error('health write failed');
+        },
+      })
+    ).resolves.toMatchObject({ kind: 'verdict' });
+    const entry = output
+      .flatMap(chunk => chunk.trim().split('\n'))
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+      .find(line => line.msg === 'overseer.judge_first.resource_health_record_failed');
+    expect(entry?.level).toBe(50);
+    expect(entry?.err).toMatchObject({ message: 'health write failed' });
+    expect((entry?.err as { stack?: string } | undefined)?.stack).toContain('health write failed');
   });
 });
 
@@ -701,6 +781,190 @@ describe('evidence envelope: bounded by construction', () => {
     expect(envelope.eventTail).toHaveLength(20);
     expect(envelope.eventTail[0]!.message.length).toBeLessThanOrEqual(403);
     expect(envelope.hint.action).toBe('ignore');
+  });
+
+  test('event tail reads node_output instead of serialized JSON', () => {
+    const envelope = buildEvidenceEnvelope(makeRecord(), [
+      {
+        id: 'evt-node-output',
+        workflow_run_id: 'run-1',
+        event_type: 'node_completed',
+        step_name: 'commit-and-push',
+        data: { node_output: 'EVIDENCE_ERROR: Tests: 969/980' },
+        created_at: '2026-09-25T00:00:00Z',
+      },
+    ]);
+    expect(envelope.eventTail[0]?.message).toBe('EVIDENCE_ERROR: Tests: 969/980');
+  });
+
+  test('carries selected PR identity and other open PRs for the WO', () => {
+    const envelope = buildEvidenceEnvelope(
+      makeRecord({
+        prEvidence: {
+          exists: true,
+          state: 'open',
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          mergeable: true,
+          htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/968',
+          pr: {
+            owner: 'thinmansoftware',
+            repo: 'bdc-harness',
+            number: 968,
+            headRef: 'feat/wo-x-01-thread-abc',
+            author: 'builder',
+            createdAt: '2026-09-25T01:00:00Z',
+          },
+          otherOpenPrsForWo: [
+            {
+              number: 967,
+              headRef: 'archon/task-web-worker-1',
+              createdAt: '2026-09-25T00:30:00Z',
+            },
+          ],
+        },
+      }),
+      []
+    );
+    expect(envelope.pr.number).toBe(968);
+    expect(envelope.pr.headRef).toBe('feat/wo-x-01-thread-abc');
+    expect(envelope.pr.author).toBe('builder');
+    expect(envelope.pr.createdAt).toBe('2026-09-25T01:00:00Z');
+    expect(envelope.otherOpenPrsForWo).toEqual([
+      {
+        number: 967,
+        headRef: 'archon/task-web-worker-1',
+        createdAt: '2026-09-25T00:30:00Z',
+      },
+    ]);
+    expect(envelope.otherOpenPrsForWoLookupFailed).toBe(false);
+    const prompt = buildJudgePrompt(envelope);
+    expect(prompt).toContain('archon/task-');
+    expect(prompt).toContain('runWindow');
+    expect(prompt).toContain('never duplicate_work');
+    expect(prompt).toContain('never needs_human');
+    expect(envelope.runWindow).toEqual({ startedAt: null, endedAt: null });
+  });
+
+  test('bounds the run window to the earliest and latest event timestamps', () => {
+    const envelope = buildEvidenceEnvelope(makeRecord(), [
+      makeEvent('e1', 'first'),
+      makeEvent('e9', 'last'),
+      {
+        id: 'e-blank',
+        workflow_run_id: 'run-1',
+        event_type: 'node_completed',
+        step_name: 'commit-and-push',
+        data: {},
+      },
+    ]);
+    expect(envelope.runWindow).toEqual({
+      startedAt: '2026-07-28T00:00:01Z',
+      endedAt: '2026-07-28T00:00:09Z',
+    });
+  });
+
+  test('defaults missing PR identity to null and an empty other-PR list', () => {
+    const envelope = buildEvidenceEnvelope(makeRecord(), []);
+    expect(envelope.pr.number).toBeNull();
+    expect(envelope.pr.headRef).toBeNull();
+    expect(envelope.pr.author).toBeNull();
+    expect(envelope.pr.createdAt).toBeNull();
+    expect(envelope.otherOpenPrsForWo).toEqual([]);
+    expect(envelope.otherOpenPrsForWoLookupFailed).toBe(false);
+  });
+
+  test('truncates otherOpenPrsForWo to five entries', () => {
+    const otherOpenPrsForWo = Array.from({ length: 6 }, (_, index) => ({
+      number: 100 + index,
+      headRef: `feat/extra-${index}`,
+      createdAt: `2026-09-25T00:0${index}:00Z`,
+    }));
+    const envelope = buildEvidenceEnvelope(
+      makeRecord({
+        prEvidence: {
+          exists: true,
+          state: 'open',
+          checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+          mergeable: null,
+          pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1 },
+          otherOpenPrsForWo,
+        },
+      }),
+      []
+    );
+    expect(envelope.otherOpenPrsForWoLookupFailed).toBe(false);
+    expect(envelope.otherOpenPrsForWo).toHaveLength(5);
+    expect(envelope.otherOpenPrsForWo?.[0]?.number).toBe(100);
+    expect(envelope.otherOpenPrsForWo?.[4]?.number).toBe(104);
+  });
+
+  test('marks a failed sibling lookup as unavailable and drops stale siblings', () => {
+    const envelope = buildEvidenceEnvelope(
+      makeRecord({
+        prEvidence: {
+          exists: true,
+          state: 'open',
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          mergeable: true,
+          pr: {
+            owner: 'thinmansoftware',
+            repo: 'bdc-harness',
+            number: 968,
+            headRef: 'feat/wo-x-01-thread-abc',
+            author: 'builder',
+            createdAt: '2026-09-25T01:00:00Z',
+          },
+          otherOpenPrsForWoLookupFailed: true,
+          otherOpenPrsForWo: [
+            {
+              number: 967,
+              headRef: 'archon/task-web-worker-1',
+              createdAt: '2026-09-25T00:30:00Z',
+            },
+          ],
+        },
+      }),
+      []
+    );
+    expect(envelope.otherOpenPrsForWo).toBeNull();
+    expect(envelope.otherOpenPrsForWoLookupFailed).toBe(true);
+    expect(JSON.stringify(envelope)).not.toContain('archon/task-web-worker-1');
+    const prompt = buildJudgePrompt(envelope);
+    expect(prompt).toContain('otherOpenPrsForWoLookupFailed: true');
+    expect(prompt).toContain('otherOpenPrsForWo: null');
+    expect(prompt).toContain('sibling list is unavailable');
+    expect(prompt).toContain('not evidence that no');
+    expect(prompt).toContain('proof of exclusivity');
+  });
+
+  test('builds the same envelope and digest twice', () => {
+    const record = makeRecord({
+      prEvidence: {
+        exists: true,
+        state: 'open',
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        mergeable: true,
+        pr: {
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          number: 968,
+          headRef: 'feat/wo-x-01-thread-abc',
+          author: 'builder',
+          createdAt: '2026-09-25T01:00:00Z',
+        },
+        otherOpenPrsForWo: [
+          {
+            number: 967,
+            headRef: 'archon/task-web-worker-1',
+            createdAt: '2026-09-25T00:30:00Z',
+          },
+        ],
+      },
+    });
+    const first = buildEvidenceEnvelope(record, []);
+    const second = buildEvidenceEnvelope(record, []);
+    expect(second).toEqual(first);
+    expect(envelopeDigest(second)).toBe(envelopeDigest(first));
   });
 });
 

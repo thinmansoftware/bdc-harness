@@ -1605,6 +1605,932 @@ describe('substituteNodeOutputRefs -- shell escaping', () => {
   });
 });
 
+describe('substituteNodeOutputRefs comment safety (bdc-xo#2141)', () => {
+  it('skips substitution on bash comment lines when escapedForBash=true', () => {
+    const spec = '**Title:** foo\nLine2: content\nLine3: more';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = '# note: the executor substitutes $spec.output\n' + 'X=$spec.output\n';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // Comment line should be unchanged
+    expect(lines[0]).toBe('# note: the executor substitutes $spec.output');
+    // Non-comment line should be substituted
+    expect(lines[1]).toContain("X='**Title:**");
+  });
+
+  it('substitutes on comment lines when escapedForBash=false (prompt mode)', () => {
+    const spec = '**Title:** foo';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const text = '# note: the executor substitutes $spec.output';
+    const result = substituteNodeOutputRefs(text, outputs, false);
+    // In prompt mode, comment char is not special, so substitution happens
+    expect(result).toBe('# note: the executor substitutes **Title:** foo');
+  });
+
+  it('skips substitution on indented comment lines when escapedForBash=true', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'multiline\nvalue')]]);
+    const script = '    # $spec.output';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result).toBe('    # $spec.output');
+  });
+
+  it('substitutes token on lines where # appears after the token', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'hello')]]);
+    const script = 'Y=$spec.output # trailing comment';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    // Token IS substituted (only leading-# lines are comments)
+    expect(result).toContain("Y='hello'");
+    expect(result).toContain('# trailing comment');
+  });
+
+  it('regression: generated script passes bash -n (syntax check)', async () => {
+    const spec = '**Title:** foo\nSchema: bar\nDetails: baz';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script =
+      '#!/bin/bash\n' +
+      '# note: the executor substitutes $spec.output\n' +
+      'X=$spec.output\n' +
+      'echo "X is ${X}"\n';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+
+    // The result should have the comment unchanged and X substituted
+    expect(result).toContain('# note: the executor substitutes $spec.output');
+    expect(result).toContain("X='**Title:**");
+
+    // Try to run bash -n (syntax check) if bash is available
+    try {
+      const tempFile = `${tmpdir()}/test-syntax-${Date.now()}.sh`;
+      await writeFile(tempFile, result);
+      const checkResult = Bun.spawnSync(['bash', '-n', tempFile], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (checkResult.exitCode !== 0) {
+        const stderr = new TextDecoder().decode(checkResult.stderr);
+        throw new Error(`bash -n failed: ${stderr}`);
+      }
+      await rm(tempFile);
+    } catch (err) {
+      // Skip if bash is unavailable or fails
+      if (err instanceof Error && err.message.includes('spawn failed')) {
+        // bash not available in test env -- skip silently
+        return;
+      }
+      throw err;
+    }
+  });
+
+  it('heredoc with EOF: substitutes inside heredoc body, not in leading comment', () => {
+    const spec = 'single line spec';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = 'cat <<EOF\n# $spec.output\nEOF';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // Line 1: cat <<EOF (unchanged)
+    expect(lines[0]).toBe('cat <<EOF');
+    // Line 2: # $spec.output should be SUBSTITUTED (inside heredoc, not a comment)
+    // The substitution produces shell-quoted output since escapedForBash=true
+    expect(lines[1]).toContain("# 'single line spec'");
+    // Line 3: EOF (unchanged, closes heredoc)
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('heredoc with <<-EOF: substitutes inside body with tab indentation', () => {
+    const spec = 'indented spec';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = 'cat <<-EOF\n\t# $spec.output\n\tEOF';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // Line 1: cat <<-EOF (unchanged)
+    expect(lines[0]).toBe('cat <<-EOF');
+    // Line 2: \t# $spec.output should be SUBSTITUTED (inside <<- heredoc)
+    // The substitution produces shell-quoted output since escapedForBash=true
+    expect(lines[1]).toContain("\t# 'indented spec'");
+    // Line 3: \tEOF (with leading tab stripped for comparison, closes heredoc)
+    expect(lines[2]).toBe('\tEOF');
+  });
+
+  it("heredoc with quoted delimiter <<'EOF': substitutes inside body", () => {
+    const spec = 'quoted delimiter spec';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = "cat <<'EOF'\n# $spec.output\nEOF";
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // Line 1: cat <<'EOF' (unchanged)
+    expect(lines[0]).toBe("cat <<'EOF'");
+    // Line 2: # $spec.output should be SUBSTITUTED (inside heredoc, not a comment)
+    // The substitution produces shell-quoted output since escapedForBash=true
+    expect(lines[1]).toContain("# 'quoted delimiter spec'");
+    // Line 3: EOF (unchanged, closes heredoc)
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('comment line after heredoc closes is skipped', () => {
+    const spec = 'spec content';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = 'cat <<EOF\ndata\nEOF\n# $spec.output';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // Lines 1-3: heredoc (data line stays as-is because no $ref)
+    expect(lines[0]).toBe('cat <<EOF');
+    expect(lines[1]).toBe('data');
+    expect(lines[2]).toBe('EOF');
+    // Line 4: # $spec.output should NOT be substituted (comment outside heredoc)
+    expect(lines[3]).toBe('# $spec.output');
+  });
+
+  it('two heredocs on one line', () => {
+    const spec1 = 'first';
+    const spec2 = 'second';
+    const outputs = new Map([
+      ['spec1', makeOutput('completed', spec1)],
+      ['spec2', makeOutput('completed', spec2)],
+    ]);
+    const script = 'cat <<A <<B\n$spec1.output\n$spec2.output\nA\nB';
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    const lines = result.split('\n');
+    // cat <<A <<B: both heredoc opens tracked
+    expect(lines[0]).toBe('cat <<A <<B');
+    // Inside first heredoc (opens tracked): both lines get substituted with shell quoting
+    expect(lines[1]).toContain("'first'");
+    expect(lines[2]).toContain("'second'");
+    // A closes first heredoc, B closes second
+    expect(lines[3]).toBe('A');
+    expect(lines[4]).toBe('B');
+  });
+
+  it('a comment that mentions <<EOF does not open a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = '# example: cat <<EOF\n# $spec.output stays literal\nX=$spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('# example: cat <<EOF');
+    expect(lines[1]).toBe('# $spec.output stays literal');
+    expect(lines[2]).toBe("X='body'");
+  });
+
+  it('a <<< here-string is not a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'read -r X <<<word\n# $spec.output stays literal\nY=$spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[1]).toBe('# $spec.output stays literal');
+    expect(lines[2]).toBe("Y='body'");
+  });
+
+  it('heredoc bodies close in order of appearance, then comments are comments again', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<A <<B\n# $spec.output\nA\n# $spec.output\nB\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[1]).toBe("# 'body'");
+    expect(lines[3]).toBe("# 'body'");
+    expect(lines[5]).toBe('# $spec.output');
+  });
+
+  // Overseer CHANGES_REQUESTED on ced4894e (bdc-harness#862): the heredoc-open scan
+  // was not shell-lexically aware, so a trailing comment or a quoted "<<EOF" string
+  // was misread as opening a heredoc, and the following "#" line was then wrongly
+  // substituted -- the exact bug this PR set out to fix.
+
+  it('a trailing comment containing <<EOF does not open a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'echo ok # example <<EOF\n# $spec.output\nX=$spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('echo ok # example <<EOF');
+    // Comment line stays literal (no heredoc was opened).
+    expect(lines[1]).toBe('# $spec.output');
+    // A following non-comment line still substitutes normally.
+    expect(lines[2]).toBe("X='body'");
+  });
+
+  it('a double-quoted "<<EOF" string does not open a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'echo "<<EOF"\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('echo "<<EOF"');
+    expect(lines[1]).toBe('# $spec.output');
+  });
+
+  it("a single-quoted '<<EOF' string does not open a heredoc", () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = "echo '<<EOF'\n# $spec.output";
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe("echo '<<EOF'");
+    expect(lines[1]).toBe('# $spec.output');
+  });
+
+  it('a real heredoc open followed by a trailing comment still opens the heredoc', () => {
+    const spec = 'body';
+    const outputs = new Map([['spec', makeOutput('completed', spec)]]);
+    const script = 'cat <<EOF # trailing comment\n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<EOF # trailing comment');
+    // Inside the heredoc body: substituted, not treated as a comment.
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('a quoted string followed by a real trailing comment does not open a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'echo "a" # <<EOF\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('echo "a" # <<EOF');
+    expect(lines[1]).toBe('# $spec.output');
+  });
+
+  // Overseer round 4 on bdc-harness#862: the heredoc-open regex only accepted a bare
+  // identifier as the delimiter, so "<<END-JSON" (hyphen) never matched, the heredoc
+  // never opened, and a following "# $spec.output" line -- meant to be substituted as
+  // heredoc body -- was instead skipped as a top-level comment (or vice versa: a real
+  // comment after the terminator got substituted because the executor still thought a
+  // heredoc was open). Fixed by generalizing the delimiter grammar to any shell word.
+  it('<<END-JSON with a hyphenated delimiter: body line substituted, post-terminator comment left literal', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<END-JSON\n# $spec.output\nEND-JSON\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<END-JSON');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('END-JSON');
+    // Post-terminator: heredoc is closed, this is a real top-level comment line.
+    expect(lines[3]).toBe('# $spec.output');
+  });
+
+  it("<<'END-JSON' quoted hyphenated delimiter: body substituted, terminator closes", () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = "cat <<'END-JSON'\n# $spec.output\nEND-JSON";
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe("cat <<'END-JSON'");
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('END-JSON');
+  });
+
+  it('<<"END JSON" double-quoted delimiter with an embedded space: terminator is "END JSON"', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<"END JSON"\n# $spec.output\nEND JSON';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<"END JSON"');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('END JSON');
+  });
+
+  it('<<\\EOF backslash-prefixed delimiter: body substituted, terminator closes', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<\\EOF\n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<\\EOF');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('<<-  EOF with extra spaces before the delimiter: tab-stripped terminator closes', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<-  EOF\n\t# $spec.output\n\tEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<-  EOF');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('\tEOF');
+  });
+
+  it('<< EOF with a space after the operator: still opens a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat << EOF\n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat << EOF');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('<<EOF|cat with a pipe immediately after the delimiter: delimiter stops at the metacharacter', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<EOF|cat\n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<EOF|cat');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('<<EOF; with a semicolon immediately after the delimiter: delimiter stops at the metacharacter', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<EOF;\n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<EOF;');
+    expect(lines[1]).toContain("# 'body'");
+    expect(lines[2]).toBe('EOF');
+  });
+
+  it('terminator with trailing spaces does not close the heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<EOF\nEOF \n# $spec.output\nEOF';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<EOF');
+    // "EOF " (trailing space) does not close -- still inside the heredoc, so the
+    // literal line passes through unchanged (no $ref to substitute).
+    expect(lines[1]).toBe('EOF ');
+    // Still inside the heredoc: substituted, not a top-level comment.
+    expect(lines[2]).toContain("# 'body'");
+    // This exact-match line finally closes it.
+    expect(lines[3]).toBe('EOF');
+  });
+
+  it('<<< here-string is ignored (not a heredoc)', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<<EOF\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    // No heredoc opened: line 0 unchanged (no $ref), line 1 is a top-level comment.
+    expect(lines[0]).toBe('cat <<<EOF');
+    expect(lines[1]).toBe('# $spec.output');
+  });
+
+  it('a comment line containing <<END-JSON does not open a heredoc', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = '# see <<END-JSON below\n# $spec.output';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('# see <<END-JSON below');
+    // No heredoc was opened by the comment line, so this stays a top-level comment.
+    expect(lines[1]).toBe('# $spec.output');
+  });
+
+  it('two heredocs with hyphenated delimiters on one line close in FIFO order', () => {
+    const outputs = new Map([['spec', makeOutput('completed', 'body')]]);
+    const script = 'cat <<A-1 <<B-2\nfirst body $spec.output\nA-1\nsecond body $spec.output\nB-2';
+    const lines = substituteNodeOutputRefs(script, outputs, true).split('\n');
+    expect(lines[0]).toBe('cat <<A-1 <<B-2');
+    expect(lines[1]).toContain("'body'");
+    expect(lines[2]).toBe('A-1');
+    expect(lines[3]).toContain("'body'");
+    expect(lines[4]).toBe('B-2');
+  });
+});
+
+// Adversarial set assembled after four Overseer CHANGES_REQUESTED rounds on
+// bdc-harness#862. Every prior finding is here as an exact-line assertion, plus the
+// mixed-quoting delimiter forms bash accepts. Convention: `spec` = 'v', so a
+// substituted token renders as 'v' (shellQuote) and a skipped token stays literal.
+describe('substituteNodeOutputRefs heredoc delimiter lexing -- adversarial (bdc-harness#862)', () => {
+  const TOKEN = '# $spec.output';
+  const SUBST = "# 'v'";
+  const run = (script: string): string[] => {
+    const outputs = new Map([['spec', makeOutput('completed', 'v')]]);
+    return substituteNodeOutputRefs(script, outputs, true).split('\n');
+  };
+
+  // Round 1 (128b2d28): a heredoc data line that starts with # is data, not a comment.
+  it('round 1: leading-# line inside <<EOF body is substituted', () => {
+    expect(run(['cat <<EOF', TOKEN, 'EOF'].join('\n'))).toEqual(['cat <<EOF', SUBST, 'EOF']);
+  });
+
+  // Round 2 (ced4894e): <<EOF inside a trailing comment or a quoted string never opens.
+  it('round 2: <<EOF in a trailing comment does not open a heredoc', () => {
+    expect(run(['echo ok # example <<EOF', TOKEN].join('\n'))).toEqual([
+      'echo ok # example <<EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 2: <<EOF inside a double-quoted string does not open a heredoc', () => {
+    expect(run(['echo "<<EOF"', TOKEN].join('\n'))).toEqual(['echo "<<EOF"', TOKEN]);
+  });
+  it('round 2: <<EOF inside a single-quoted string does not open a heredoc', () => {
+    expect(run(["echo '<<EOF'", TOKEN].join('\n'))).toEqual(["echo '<<EOF'", TOKEN]);
+  });
+
+  // Round 3 (6b60dcf7): the delimiter is a full shell word, not an identifier.
+  it('round 3: <<END-JSON captures the whole word; END-JSON closes; later comment literal', () => {
+    expect(run(['cat <<END-JSON', TOKEN, 'END-JSON', TOKEN].join('\n'))).toEqual([
+      'cat <<END-JSON',
+      SUBST,
+      'END-JSON',
+      TOKEN,
+    ]);
+  });
+
+  // Round 4 (ff01f39d): bash quote removal over the whole delimiter word.
+  const mixedForms: Array<[string, string]> = [
+    ['<<E"OF"', 'EOF'],
+    ['<<EO\\F', 'EOF'],
+    ["<<'E'OF", 'EOF'],
+    ['<<"E"\'O\'F', 'EOF'],
+    ['<<E\'O\'"F"', 'EOF'],
+    ['<<\\E\\O\\F', 'EOF'],
+    ['<<"E\\"OF"', 'E"OF'],
+    ['<<"E\\$OF"', 'E$OF'],
+    ['<<"E\\xOF"', 'E\\xOF'],
+    ["<<'E\\'OF", 'E\\OF'],
+    ['<<-E"OF"', 'EOF'],
+  ];
+  for (const [operator, terminator] of mixedForms) {
+    it(`round 4: cat ${operator} terminates on ${JSON.stringify(terminator)}`, () => {
+      const script = [`cat ${operator}`, TOKEN, terminator, TOKEN].join('\n');
+      expect(run(script)).toEqual([`cat ${operator}`, SUBST, terminator, TOKEN]);
+    });
+  }
+
+  it('round 4: a delimiter that is NOT quote-equivalent to the terminator never closes', () => {
+    // <<E"OF" terminates on EOF; a line reading E"OF" is body data, not the terminator.
+    expect(run(['cat <<E"OF"', 'E"OF"', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<E"OF"',
+      'E"OF"',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+
+  // An unterminated quote continues onto the next physical line (round 9: quote state
+  // is carried across lines): the string closes on line 2, and NO heredoc opened, so
+  // line 3 is a real comment and stays literal.
+  it('unterminated single quote in the delimiter word is not a heredoc', () => {
+    expect(run(["cat <<'EOF", "x'", TOKEN].join('\n'))).toEqual(["cat <<'EOF", "x'", TOKEN]);
+  });
+  it('unterminated double quote in the delimiter word is not a heredoc', () => {
+    expect(run(['cat <<"EOF', 'x"', TOKEN].join('\n'))).toEqual(['cat <<"EOF', 'x"', TOKEN]);
+  });
+  it('a lone trailing backslash after << (line continuation) is not a heredoc', () => {
+    expect(run(['cat <<\\', TOKEN].join('\n'))).toEqual(['cat <<\\', TOKEN]);
+  });
+  it('<< with nothing after it is not a heredoc', () => {
+    expect(run(['cat <<', TOKEN].join('\n'))).toEqual(['cat <<', TOKEN]);
+  });
+
+  it('<<-E"OF" strips leading tabs from the terminator and the body', () => {
+    expect(run(['cat <<-E"OF"', `\t${TOKEN}`, '\tEOF', TOKEN].join('\n'))).toEqual([
+      'cat <<-E"OF"',
+      `\t${SUBST}`,
+      '\tEOF',
+      TOKEN,
+    ]);
+  });
+
+  it('<<< here-string with a quoted word is not a heredoc', () => {
+    expect(run(['cat <<<"x"', TOKEN].join('\n'))).toEqual(['cat <<<"x"', TOKEN]);
+  });
+
+  it('mixed-quoted delimiter followed by a trailing comment still opens', () => {
+    expect(run(['cat <<E"OF" # opens', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<E"OF" # opens',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('mixed-quoted delimiter immediately followed by a pipe stops at the metacharacter', () => {
+    expect(run(['cat <<E"OF"|cat', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<E"OF"|cat',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('a quoted string that merely contains <<E"OF" does not open a heredoc', () => {
+    const line = 'echo "x <<E\\"OF\\""';
+    expect(run([line, TOKEN].join('\n'))).toEqual([line, TOKEN]);
+  });
+  it('an escaped \\# is not a comment, so the << after it opens a heredoc', () => {
+    expect(run(['echo \\# <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo \\# <<EOF',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it("an escaped \\' does not open a string, so a later real trailing comment is honoured", () => {
+    // Without backslash handling in the reducer, \' would open a single-quoted region
+    // and the "# <<EOF" would be blanked for the wrong reason; with it, the # is a real
+    // comment and the <<EOF inside it must not open.
+    expect(run(["echo \\' # <<EOF", TOKEN].join('\n'))).toEqual(["echo \\' # <<EOF", TOKEN]);
+  });
+
+  it('two mixed-quoted heredocs on one line close FIFO', () => {
+    const script = ['cat <<\'A\'B <<C"D"', TOKEN, 'AB', TOKEN, 'CD', TOKEN].join('\n');
+    expect(run(script)).toEqual(['cat <<\'A\'B <<C"D"', SUBST, 'AB', SUBST, 'CD', TOKEN]);
+  });
+
+  it('comment-line check is unaffected by a heredoc whose body was already closed by a mixed form', () => {
+    const script = [
+      'cat <<EO\\F',
+      'data',
+      'EOF',
+      '    # indented $spec.output',
+      'X=$spec.output',
+    ].join('\n');
+    expect(run(script)).toEqual([
+      'cat <<EO\\F',
+      'data',
+      'EOF',
+      '    # indented $spec.output',
+      "X='v'",
+    ]);
+  });
+
+  // Round 5 (be881616): strip mode must not be inferred from a leading "-" in the delimiter.
+  it("round 5: cat <<'-EOF' is NOT a <<- heredoc; closes on -EOF, not EOF", () => {
+    expect(run(["cat <<'-EOF'", TOKEN, 'EOF', TOKEN, '-EOF', TOKEN].join('\n'))).toEqual([
+      "cat <<'-EOF'",
+      SUBST,
+      'EOF',
+      SUBST,
+      '-EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 5: unquoted cat <<-EOF-X (delimiter with hyphens) strips tabs and closes on EOF-X', () => {
+    expect(run(['cat <<-EOF-X', `\t${TOKEN}`, '\tEOF-X', TOKEN].join('\n'))).toEqual([
+      'cat <<-EOF-X',
+      `\t${SUBST}`,
+      '\tEOF-X',
+      TOKEN,
+    ]);
+  });
+  it('round 5: cat <<- -EOF (strip mode AND leading-hyphen delimiter) closes on tab-stripped -EOF', () => {
+    expect(run(['cat <<- -EOF', `\t${TOKEN}`, '\t-EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<- -EOF',
+      `\t${SUBST}`,
+      '\t-EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 5: cat <<\\-EOF (escaped leading hyphen) closes on -EOF, and a tab-indented -EOF does not close it', () => {
+    expect(run(['cat <<\\-EOF', '\t-EOF', TOKEN, '-EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<\\-EOF',
+      '\t-EOF',
+      SUBST,
+      '-EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 5: FIFO with a leading-hyphen delimiter first and a <<- second', () => {
+    const script = ["cat <<'-A' <<-B", TOKEN, '-A', `\t${TOKEN}`, '\tB', TOKEN].join('\n');
+    expect(run(script)).toEqual(["cat <<'-A' <<-B", SUBST, '-A', `\t${SUBST}`, '\tB', TOKEN]);
+  });
+
+  // Round 6 (f66db9e3): "<<" inside arithmetic is a left shift, never a heredoc.
+  it('round 6: x=$((1 << 2)) does not open a heredoc; following comment stays literal', () => {
+    expect(run(['x=$((1 << 2))', TOKEN].join('\n'))).toEqual(['x=$((1 << 2))', TOKEN]);
+  });
+  it('round 6: (( y = 1 << 3 )) compound command does not open a heredoc', () => {
+    expect(run(['(( y = 1 << 3 ))', TOKEN].join('\n'))).toEqual(['(( y = 1 << 3 ))', TOKEN]);
+  });
+  it('round 6: nested parens inside arithmetic $(( (1<<2) + 1 )) are balanced', () => {
+    expect(run(['z=$(( (1<<2) + 1 ))', TOKEN].join('\n'))).toEqual(['z=$(( (1<<2) + 1 ))', TOKEN]);
+  });
+  // FAIL-SAFE (round 11): a line carrying "((", "$(" or a backtick is not plainly
+  // simple, so it never opens a heredoc; the body's "#"-leading token stays literal.
+  it('fail-safe: arithmetic beside a heredoc on the same line: heredoc NOT opened, token literal', () => {
+    expect(run(['echo $((1<<2)) <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo $((1<<2)) <<EOF',
+      TOKEN,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('fail-safe: heredoc followed by arithmetic on the same line: heredoc NOT opened, token literal', () => {
+    expect(run(['cat <<EOF $((1<<2))', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<EOF $((1<<2))',
+      TOKEN,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('fail-safe: a heredoc inside a $( ... ) subshell is NOT tracked; leading-# body line stays literal', () => {
+    expect(run(['X=$(cat <<EOF', TOKEN, 'EOF', ')', TOKEN].join('\n'))).toEqual([
+      'X=$(cat <<EOF',
+      TOKEN,
+      'EOF',
+      ')',
+      TOKEN,
+    ]);
+  });
+  it('fail-safe: a heredoc inside a $( ... ) subshell still substitutes non-comment body lines (lane manifest shape)', () => {
+    const script = [
+      "MANIFEST=$(capture_node_output <<'M'",
+      '$spec.output',
+      'READ_SPEC_OUT=$spec.output',
+      'M',
+      ')',
+    ].join('\n');
+    expect(run(script)).toEqual([
+      "MANIFEST=$(capture_node_output <<'M'",
+      "'v'",
+      "READ_SPEC_OUT='v'",
+      'M',
+      ')',
+    ]);
+  });
+  it('fail-safe: a backtick on the line means no heredoc opens', () => {
+    expect(run(['echo `date` <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo `date` <<EOF',
+      TOKEN,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('fail-safe: the round-11 construct -- nested $( ) with quoted parens inside $(( )) -- never opens a heredoc', () => {
+    const line = "x=$(( $(printf '%s' '))' >/dev/null; echo 1) << 2 ))";
+    expect(run([line, TOKEN].join('\n'))).toEqual([line, TOKEN]);
+  });
+  it('fail-safe: a heredoc opened while carried state is unclean is NOT tracked', () => {
+    expect(run(['echo "a', 'b" ; cat <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo "a',
+      'b" ; cat <<EOF',
+      TOKEN,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('fail-safe: a heredoc open on a line that ENDS with an unclosed quote is NOT tracked', () => {
+    expect(run(['cat <<EOF "x', TOKEN, 'y"', 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<EOF "x',
+      TOKEN,
+      'y"',
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('fail-safe: a plainly simple heredoc still opens and its body is substituted (round 1 preserved)', () => {
+    expect(run(['cat <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<EOF',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 6: end-to-end -- multiline output in a comment after arithmetic never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = ['x=$((1 << 2))', '# note $spec.output', 'echo "x=$x"', ''].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result.split('\n')[1]).toBe('# note $spec.output');
+    const tempFile = `${tmpdir()}/test-862-arith-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('x=4\n');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return;
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+
+  // Round 7 (a1b6a214): "#" is a comment after ANY metacharacter, including ) < >.
+  it('round 7: case arm x)# <<EOF -- the # after ) is a comment, no heredoc opens', () => {
+    const script = ['case $v in', 'x)# <<EOF', ';;', 'esac', TOKEN].join('\n');
+    expect(run(script)).toEqual(['case $v in', 'x)# <<EOF', ';;', 'esac', TOKEN]);
+  });
+  it('round 7: subshell close (true)# <<EOF -- comment, no heredoc', () => {
+    expect(run(['(true)# <<EOF', TOKEN].join('\n'))).toEqual(['(true)# <<EOF', TOKEN]);
+  });
+  it('round 7: # after < is a comment, no heredoc', () => {
+    expect(run(['cat <# <<EOF', TOKEN].join('\n'))).toEqual(['cat <# <<EOF', TOKEN]);
+  });
+  it('round 7: # after > is a comment, no heredoc', () => {
+    expect(run(['echo ># <<EOF', TOKEN].join('\n'))).toEqual(['echo ># <<EOF', TOKEN]);
+  });
+  it('round 7: # after | and & is a comment, no heredoc', () => {
+    expect(run(['true |# <<EOF', TOKEN].join('\n'))).toEqual(['true |# <<EOF', TOKEN]);
+    expect(run(['true &# <<EOF', TOKEN].join('\n'))).toEqual(['true &# <<EOF', TOKEN]);
+  });
+  it('round 7: # mid-word (foo#bar) is NOT a comment, so a later real heredoc opens', () => {
+    expect(run(['echo foo#bar <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo foo#bar <<EOF',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 7: end-to-end -- multiline output in a comment after a case arm never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = [
+      'v=x',
+      'case $v in',
+      'x)# <<EOF',
+      'echo arm;;',
+      'esac',
+      '# note $spec.output',
+      'echo done',
+      '',
+    ].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result.split('\n')[5]).toBe('# note $spec.output');
+    const tempFile = `${tmpdir()}/test-862-case-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('arm\ndone\n');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return;
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+
+  // Round 8 (b5c90c63): a TRAILING comment is a comment too.
+  it('round 8: echo ok # $spec.output -- token after an unquoted # is left literal', () => {
+    expect(run('echo ok # $spec.output')).toEqual(['echo ok # $spec.output']);
+  });
+  it('round 8: code before the # is substituted, the comment after it is not', () => {
+    expect(run('Y=$spec.output # was $spec.output')).toEqual(["Y='v' # was $spec.output"]);
+  });
+  it('round 8: a # inside double quotes is not a comment, so the token is substituted', () => {
+    expect(run('echo "# $spec.output"')).toEqual(['echo "# \'v\'"']);
+  });
+  it('round 8: a # inside single quotes is not a comment, so the token is substituted', () => {
+    expect(run("echo '# $spec.output'")).toEqual(["echo '# 'v''"]);
+  });
+  it('round 8: # mid-word is not a comment, so the token after it is substituted', () => {
+    expect(run('echo a#$spec.output')).toEqual(["echo a#'v'"]);
+  });
+  it('round 8: a heredoc body line with # and a token is data and is substituted', () => {
+    expect(run(['cat <<EOF', 'x # $spec.output', 'EOF'].join('\n'))).toEqual([
+      'cat <<EOF',
+      "x # 'v'",
+      'EOF',
+    ]);
+  });
+  it('round 8: a heredoc open with a trailing comment: comment literal, heredoc opens', () => {
+    expect(run(['cat <<EOF # $spec.output', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'cat <<EOF # $spec.output',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 8: case arm x)# $spec.output is a comment', () => {
+    expect(run('x)# $spec.output')).toEqual(['x)# $spec.output']);
+  });
+  it('round 8: end-to-end -- multiline output in a TRAILING comment never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = ['echo ok # $spec.output', 'echo done', ''].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result).toBe(script);
+    const tempFile = `${tmpdir()}/test-862-trailing-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('ok\ndone\n');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return;
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+
+  // Round 9 (ea4a318a): quote state persists across physical lines.
+  it('round 9: trailing comment after the close of a multi-line double-quoted string is a comment', () => {
+    expect(run(['echo "start', 'end" # $spec.output', TOKEN].join('\n'))).toEqual([
+      'echo "start',
+      'end" # $spec.output',
+      TOKEN,
+    ]);
+  });
+  it('round 9: trailing comment after the close of a multi-line single-quoted string is a comment', () => {
+    expect(run(["echo 'start", "end' # $spec.output", TOKEN].join('\n'))).toEqual([
+      "echo 'start",
+      "end' # $spec.output",
+      TOKEN,
+    ]);
+  });
+  it('round 9 / fail-safe: a #-leading line inside a multi-line string is treated as a comment (token literal)', () => {
+    // Bash would treat it as string data, but the fresh-state parse calls it a comment
+    // and the conservative cut wins: literal, never a spill.
+    expect(run(['echo "start', '# $spec.output', 'end"'].join('\n'))).toEqual([
+      'echo "start',
+      TOKEN,
+      'end"',
+    ]);
+  });
+  it('round 9: <<EOF inside a multi-line string does not open a heredoc', () => {
+    expect(run(['echo "a', 'cat <<EOF', 'b"', TOKEN].join('\n'))).toEqual([
+      'echo "a',
+      'cat <<EOF',
+      'b"',
+      TOKEN,
+    ]);
+  });
+  it('round 9: after the string closes, a real heredoc on a later line opens normally', () => {
+    expect(run(['echo "a', 'b"', 'cat <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'echo "a',
+      'b"',
+      'cat <<EOF',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 9: an escaped \\" inside a multi-line string does not close it', () => {
+    expect(run(['echo "a \\"', 'b" # $spec.output', TOKEN].join('\n'))).toEqual([
+      'echo "a \\"',
+      'b" # $spec.output',
+      TOKEN,
+    ]);
+  });
+  it('round 9: end-to-end -- multiline output in a comment after a multi-line string never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = ['echo "start', 'end" # $spec.output', 'echo done', ''].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result).toBe(script);
+    const tempFile = `${tmpdir()}/test-862-mlstr-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('start\nend\ndone\n');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return;
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+
+  // Round 10 (083a8af1): arithmetic context persists across physical lines.
+  it('round 10: x=$((1 / << 2)) split across lines: the << on line 2 is a left shift', () => {
+    expect(run(['x=$((1', ' << 2))', TOKEN].join('\n'))).toEqual(['x=$((1', ' << 2))', TOKEN]);
+  });
+  it('round 10: (( y = 1 / << 3 )) compound command split across lines', () => {
+    expect(run(['(( y = 1', ' << 3 ))', TOKEN].join('\n'))).toEqual([
+      '(( y = 1',
+      ' << 3 ))',
+      TOKEN,
+    ]);
+  });
+  it('round 10: nested parens spanning lines are balanced before code resumes', () => {
+    expect(run(['z=$(( (1', '<<2) + 1 ))', 'cat <<EOF', TOKEN, 'EOF', TOKEN].join('\n'))).toEqual([
+      'z=$(( (1',
+      '<<2) + 1 ))',
+      'cat <<EOF',
+      SUBST,
+      'EOF',
+      TOKEN,
+    ]);
+  });
+  it('round 10 / fail-safe: a #-leading line inside open arithmetic is treated as a comment (token literal)', () => {
+    expect(run(['x=$((1', '# $spec.output', '+ 2))'].join('\n'))).toEqual([
+      'x=$((1',
+      TOKEN,
+      '+ 2))',
+    ]);
+  });
+  it('round 10: end-to-end -- multiline output in a comment after multi-line arithmetic never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = ['x=$((1', ' << 2))', '# note $spec.output', 'echo "x=$x"', ''].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result).toBe(script);
+    const tempFile = `${tmpdir()}/test-862-mlarith-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('x=4\n');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return;
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+
+  it('end-to-end: multi-line output after a mixed-quoted heredoc never executes (real bash)', async () => {
+    const multi = 'line one\nexit 1\necho SPILLED';
+    const outputs = new Map([['spec', makeOutput('completed', multi)]]);
+    const script = [
+      'cat <<E"OF"',
+      'body',
+      'EOF',
+      '# the executor substitutes $spec.output here',
+      'echo done',
+      '',
+    ].join('\n');
+    const result = substituteNodeOutputRefs(script, outputs, true);
+    expect(result.split('\n')[3]).toBe('# the executor substitutes $spec.output here');
+    const tempFile = `${tmpdir()}/test-862-e2e-${Date.now()}.sh`;
+    await writeFile(tempFile, result);
+    try {
+      const proc = Bun.spawnSync(['bash', tempFile], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const stdout = new TextDecoder().decode(proc.stdout);
+      expect(proc.exitCode).toBe(0);
+      expect(stdout).toBe('body\ndone\n');
+      expect(stdout).not.toContain('SPILLED');
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('spawn failed')) return; // no bash
+      throw err;
+    } finally {
+      await rm(tempFile, { force: true });
+    }
+  });
+});
+
 describe('checkTriggerRule -- missing upstream treated as failed', () => {
   it('none_failed_min_one_success: skips when all deps skipped (no success)', () => {
     const n = node('implement', ['a', 'b'], { trigger_rule: 'none_failed_min_one_success' });
@@ -2925,7 +3851,7 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     // Node was called at least twice (first fails transiently, second succeeds)
     expect(callCount).toBeGreaterThanOrEqual(2);
     expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
-  }, 5_000);
+  });
 
   it('workflow fails after exhausting all node retries', async () => {
     let callCount = 0;
@@ -2961,7 +3887,7 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     // max_attempts: 2 = 2 retries -> 3 total attempts (delay_ms: 1 keeps test fast)
     expect(callCount).toBe(3);
     expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
-  }, 5_000);
+  });
 
   it('node with FATAL error does not retry (call count = 1)', async () => {
     let callCount = 0;
@@ -3040,7 +3966,7 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
         typeof call[1] === 'string' && (call[1] as string).includes('transient error')
     );
     expect(retryMessages.length).toBeGreaterThan(0);
-  }, 5_000);
+  });
 });
 
 describe('executeDagWorkflow -- tool_called event persistence', () => {
@@ -9495,7 +10421,7 @@ describe('executeDagWorkflow -- script nodes', () => {
     // Workflow fails because the only node failed (timeout)
     const failMsg = messages.find((m: string) => m.includes('no successful nodes'));
     expect(failMsg).toBeDefined();
-  }, 10000);
+  });
 
   it('stderr output is sent to the user', async () => {
     const mockDeps = createMockDeps();
@@ -10343,8 +11269,8 @@ describe('agent persona dispatch', () => {
 
   async function writeAgentFile(name: string, model?: string, tools?: string[]): Promise<void> {
     const toolsLine = tools ? `tools: [${tools.join(', ')}]` : '';
-    const modelLine = model === undefined ? '' : `model: ${model}\n`;
-    const content = `---\nname: ${name}\n${modelLine}${toolsLine}\n---\n\nYou are the ${name} agent.\n`;
+    const modelLine = model ? `model: ${model}` : '';
+    const content = `---\nname: ${name}\n${modelLine}\n${toolsLine}\n---\n\nYou are the ${name} agent.\n`;
     await writeFile(join(testDir, '.archon', 'agents', `${name}.md`), content, 'utf-8');
   }
 
@@ -10474,6 +11400,140 @@ describe('agent persona dispatch', () => {
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     // Persona model (sonnet) wins over node model (opus)
     expect(optionsArg.model).toBe('sonnet');
+  });
+
+  it('Claude node override supplies the model for a persona without one', async () => {
+    await writeAgentFile('provider-agnostic-test-agent');
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-claude-override');
+    const nodes: DagNode[] = [
+      {
+        id: 'plan',
+        agent: 'provider-agnostic-test-agent',
+        prompt: 'Plan.',
+      } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'claude-override-test', nodes },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      { nodes: { plan: { provider: 'claude', model: 'sonnet' } } }
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalled();
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    expect(optionsArg.model).toBe('sonnet');
+  });
+
+  it('Claude node override replaces a persona model pin and records the effective binding', async () => {
+    await writeAgentFile('opus-test-agent', 'opus');
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-claude-pin-override');
+    const nodes: DagNode[] = [
+      {
+        id: 'plan',
+        agent: 'opus-test-agent',
+        prompt: 'Plan.',
+      } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'claude-pin-override-test', nodes },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      { nodes: { plan: { provider: 'claude', model: 'sonnet' } } }
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    expect(optionsArg.model).toBe('sonnet');
+    expect(mockStore.createProviderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'claude',
+        model: 'sonnet',
+        declaredProvider: 'claude',
+        declaredModel: 'sonnet',
+      })
+    );
+  });
+
+  it('non-Claude node override ignores a persona model pin', async () => {
+    await writeAgentFile('claude-pinned-test-agent', 'opus');
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-codex-override');
+    const nodes: DagNode[] = [
+      {
+        id: 'plan',
+        agent: 'claude-pinned-test-agent',
+        prompt: 'Plan.',
+      } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'codex-persona-override-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      { nodes: { plan: { provider: 'codex', model: 'gpt-5.5' } } }
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    expect(optionsArg.model).toBe('gpt-5.5');
+    expect(mockStore.createProviderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'codex',
+        model: 'gpt-5.5',
+        declaredProvider: 'codex',
+        declaredModel: 'gpt-5.5',
+      })
+    );
   });
 
   it('backward compat: node without agent: does not inject persona allowed_tools', async () => {
@@ -11200,10 +12260,10 @@ describe('executeDagWorkflow -- tier/entry_rung + frontier_cost_usd', () => {
   });
 
   it('T2: frontier_cost_usd == tokens.input * INPUT_RATE + tokens.output * OUTPUT_RATE', async () => {
-    // Known token counts; published frontier rates (claude-opus-4-7):
-    //   INPUT_RATE  = 0.000015 USD/token
-    //   OUTPUT_RATE = 0.000075 USD/token
-    // 1000 * 0.000015 + 200 * 0.000075 = 0.015 + 0.015 = 0.030
+    // Known token counts; published frontier rates (claude-opus-5-5):
+    //   INPUT_RATE  = 0.000004 USD/token
+    //   OUTPUT_RATE = 0.00002 USD/token
+    // 1000 * 0.000004 + 200 * 0.00002 = 0.004 + 0.004 = 0.008
     mockSendQueryDag.mockImplementation(function* () {
       yield { type: 'assistant', content: 'done' };
       yield {
@@ -11236,7 +12296,7 @@ describe('executeDagWorkflow -- tier/entry_rung + frontier_cost_usd', () => {
 
     const data = getNodeCompletedData(store);
     expect(typeof data.frontier_cost_usd).toBe('number');
-    expect(data.frontier_cost_usd as number).toBeCloseTo(0.03, 10);
+    expect(data.frontier_cost_usd as number).toBeCloseTo(0.008, 10);
   });
 
   it('T3: run metadata carries both total_cost_usd and total_frontier_cost_usd', async () => {
@@ -13483,5 +14543,301 @@ describe('executeDagWorkflow -- node output file handoff (ARCHON_NODE_OUT)', () 
 
     expect(firstWrite).toBe('stable output');
     expect(secondWrite).toBe('stable output');
+  });
+});
+
+describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-silent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  function eventsOf(store: IWorkflowStore): Array<{
+    event_type: string;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  }> {
+    return (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+    );
+  }
+
+  async function runPromptNode(
+    store: IWorkflowStore,
+    nodeId: string,
+    idleTimeout: number,
+    runId: string
+  ): Promise<void> {
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun(runId);
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-silent',
+      testDir,
+      {
+        name: 'silent-node',
+        nodes: [{ id: nodeId, prompt: 'work', idle_timeout: idleTimeout }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts-' + runId),
+      join(testDir, 'logs-' + runId),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+  }
+
+  it('provider_never_started fails the node with the named reason', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      await new Promise<void>(() => {});
+      yield { type: 'assistant', content: 'never' };
+    });
+
+    const store = createMockStore();
+    let runStatus = 'running';
+    (store.failWorkflowRun as ReturnType<typeof mock>).mockImplementation(() => {
+      runStatus = 'failed';
+      return Promise.resolve();
+    });
+
+    const run = runPromptNode(store, 'silent-node', 200, 'silent-never-started');
+    const timeout = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error('silent node did not finish within 5000ms')), 5000);
+    });
+    await Promise.race([run, timeout]);
+
+    expect(runStatus).not.toBe('running');
+    const failed = eventsOf(store).filter(
+      e => e.event_type === 'node_failed' && e.step_name === 'silent-node'
+    );
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.data?.reason).toBe('provider_never_started');
+    expect(failed[0]?.data?.reason_code).toBe('progress_timeout');
+  });
+
+  it('provider_silent after a first chunk', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'working' };
+      await new Promise<void>(() => {});
+    });
+
+    const store = createMockStore();
+    const run = runPromptNode(store, 'silent-after-chunk', 200, 'silent-after-chunk');
+    const timeout = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error('silent node did not finish within 5000ms')), 5000);
+    });
+    await Promise.race([run, timeout]);
+
+    const events = eventsOf(store);
+    const failed = events.filter(
+      e => e.event_type === 'node_failed' && e.step_name === 'silent-after-chunk'
+    );
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.data?.reason).toBe('provider_silent');
+    const progressIdx = events.findIndex(
+      e => e.event_type === 'node_progress' && e.step_name === 'silent-after-chunk'
+    );
+    const failedIdx = events.findIndex(
+      e => e.event_type === 'node_failed' && e.step_name === 'silent-after-chunk'
+    );
+    expect(progressIdx).toBeGreaterThanOrEqual(0);
+    expect(progressIdx).toBeLessThan(failedIdx);
+    const progress = events[progressIdx];
+    expect(progress?.data?.provider).toBe('claude');
+    expect(progress?.data?.last_chunk_type).toBe('assistant');
+    expect(progress?.data?.chunks_seen).toBe(1);
+  });
+
+  it('a chatty healthy node is not killed and its progress is throttled', async () => {
+    const prev = process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
+    process.env.ARCHON_NODE_PROGRESS_EVENT_MS = '50';
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        const started = Date.now();
+        while (Date.now() - started < 400) {
+          yield { type: 'assistant', content: 'working' };
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        yield { type: 'result', sessionId: 'chatty-session' };
+      });
+
+      const store = createMockStore();
+      await runPromptNode(store, 'chatty-node', 200, 'silent-chatty');
+
+      const events = eventsOf(store);
+      const progress = events.filter(
+        e => e.event_type === 'node_progress' && e.step_name === 'chatty-node'
+      );
+      const failed = events.filter(
+        e => e.event_type === 'node_failed' && e.step_name === 'chatty-node'
+      );
+      const completed = events.filter(
+        e => e.event_type === 'node_completed' && e.step_name === 'chatty-node'
+      );
+      expect(failed).toHaveLength(0);
+      expect(completed).toHaveLength(1);
+      expect(progress.length).toBeGreaterThanOrEqual(2);
+      expect(progress.length).toBeLessThanOrEqual(10);
+      expect(progress[0]?.data?.provider).toBe('claude');
+      expect(progress[0]?.data?.last_chunk_type).toBe('assistant');
+      expect(progress[0]?.data?.chunks_seen).toBe(1);
+      for (const event of progress) {
+        expect(event.data?.provider).toBe('claude');
+        expect(typeof event.data?.last_chunk_type).toBe('string');
+        expect(event.data?.last_chunk_type).not.toBe('');
+      }
+    } finally {
+      if (prev === undefined) delete process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
+      else process.env.ARCHON_NODE_PROGRESS_EVENT_MS = prev;
+    }
+  });
+
+  it('cancel lands while the provider is silent', async () => {
+    const prev = process.env.ARCHON_NODE_CANCEL_POLL_MS;
+    process.env.ARCHON_NODE_CANCEL_POLL_MS = '50';
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        await new Promise<void>(() => {});
+        yield { type: 'assistant', content: 'never' };
+      });
+
+      const store = createMockStore();
+      let statusCalls = 0;
+      (store.getWorkflowRunStatus as ReturnType<typeof mock>).mockImplementation(() => {
+        statusCalls += 1;
+        return Promise.resolve(statusCalls === 1 ? ('running' as const) : ('cancelled' as const));
+      });
+
+      const run = runPromptNode(store, 'cancel-silent', 60000, 'silent-cancel');
+      const timeout = new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error('cancel did not land within 3000ms')), 3000);
+      });
+      await Promise.race([run, timeout]);
+
+      const failed = eventsOf(store).filter(
+        e => e.event_type === 'node_failed' && e.step_name === 'cancel-silent'
+      );
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.data?.error).toBe('Cancelled by user');
+      expect(failed[0]?.data?.reason).not.toBe('provider_never_started');
+    } finally {
+      if (prev === undefined) delete process.env.ARCHON_NODE_CANCEL_POLL_MS;
+      else process.env.ARCHON_NODE_CANCEL_POLL_MS = prev;
+    }
+  });
+});
+
+// Kept outside the 'silent node detection' block so that block's Stop 2 count
+// (4 passing / 4 total) stays exactly as the WO spec declares.
+describe('cancel-poll interval cleanup (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-cancelpoll-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  it('a rejecting beginProviderAttempt leaves no live cancel-poll interval', async () => {
+    // An unusual poll period lets the spies pick out the cancel-poll interval
+    // from every other timer the executor starts.
+    const pollMs = 37;
+    const prev = process.env.ARCHON_NODE_CANCEL_POLL_MS;
+    process.env.ARCHON_NODE_CANCEL_POLL_MS = String(pollMs);
+    const created = new Set<unknown>();
+    const cleared = new Set<unknown>();
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const setSpy = spyOn(globalThis, 'setInterval').mockImplementation(((
+      handler: () => void,
+      ms?: number
+    ) => {
+      const handle = realSetInterval(handler, ms);
+      if (ms === pollMs) created.add(handle);
+      return handle;
+    }) as typeof setInterval);
+    const clearSpy = spyOn(globalThis, 'clearInterval').mockImplementation(((
+      handle?: Parameters<typeof clearInterval>[0]
+    ) => {
+      cleared.add(handle);
+      realClearInterval(handle);
+    }) as typeof clearInterval);
+    try {
+      mockSendQueryDag.mockClear();
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield { type: 'assistant', content: 'unreachable' };
+      });
+
+      const store = createMockStore();
+      // provider_attempt_persist_failed: beginProviderAttempt throws before
+      // the node stream starts.
+      (store.createProviderAttempt as Mock<() => Promise<boolean>>).mockResolvedValue(false);
+
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-cancelpoll',
+        testDir,
+        {
+          name: 'cancel-poll-cleanup',
+          nodes: [{ id: 'attempt-rejects', prompt: 'work', idle_timeout: 60000 }],
+        },
+        makeWorkflowRun('cancelpoll-attempt-rejects'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag).not.toHaveBeenCalled();
+      const failed = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls
+        .map(
+          call => call[0] as { event_type: string; step_name?: string; data?: { error?: unknown } }
+        )
+        .filter(e => e.event_type === 'node_failed' && e.step_name === 'attempt-rejects');
+      expect(failed).toHaveLength(1);
+      expect(String(failed[0]?.data?.error)).toContain('provider_attempt_persist_failed');
+
+      // Every cancel-poll interval that was started must have been cleared.
+      const live = [...created].filter(handle => !cleared.has(handle));
+      expect(live).toHaveLength(0);
+
+      // Behavioral check: nothing keeps polling run status after the node exits.
+      const statusMock = store.getWorkflowRunStatus as ReturnType<typeof mock>;
+      const pollsAtExit = statusMock.mock.calls.length;
+      await new Promise(resolve => setTimeout(resolve, pollMs * 5));
+      expect(statusMock.mock.calls.length).toBe(pollsAtExit);
+    } finally {
+      for (const handle of created)
+        realClearInterval(handle as Parameters<typeof clearInterval>[0]);
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+      if (prev === undefined) delete process.env.ARCHON_NODE_CANCEL_POLL_MS;
+      else process.env.ARCHON_NODE_CANCEL_POLL_MS = prev;
+    }
   });
 });

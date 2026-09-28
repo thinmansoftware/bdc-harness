@@ -50,7 +50,14 @@ mock.module('openai', () => ({
 
 // --- Import under test (after mocks) ---------------------------------------
 
-import { clearRegistry, isRegisteredProvider, registerBuiltinProviders } from '../../registry';
+import {
+  clearRegistry,
+  getProviderCapabilities,
+  isRegisteredProvider,
+  registerBuiltinProviders,
+  registerCommunityProviders,
+  resolveProviderId,
+} from '../../registry';
 import { GlmProvider } from './provider';
 import { registerGlmProvider } from './registration';
 
@@ -231,5 +238,35 @@ describe('GlmProvider', () => {
     // Auth error should re-throw, NOT invoke failback
     await expect(consumeGenerator()).rejects.toThrow('401 Unauthorized');
     expect(failbackFactory).not.toHaveBeenCalled();
+  });
+
+  test('refuses xAI before any network call and does not fail back', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+    mockCreate.mockClear();
+    const failbackFactory = mock(() => {
+      throw new Error('failback must not run for an xAI refusal');
+    });
+    const provider = new GlmProvider({
+      failbackProviderFactory: failbackFactory as unknown as () => GlmProvider,
+    });
+    await expect(async () => {
+      for await (const _chunk of provider.sendQuery('hello', '/tmp', undefined, {
+        model: 'x-ai/grok-4.7',
+      })) {
+        // consume
+      }
+    }).toThrow(/^openrouter_xai_refused/);
+    expect(failbackFactory).not.toHaveBeenCalled();
+    expect(mockCreate).not.toHaveBeenCalled();
+
+    registerCommunityProviders();
+    expect(resolveProviderId('opr')).toBe('opr');
+    expect(getProviderCapabilities('opr')).toEqual(getProviderCapabilities('glm'));
+    expect(getProviderCapabilities('opr').execution).toEqual({
+      text: true,
+      repositoryRead: false,
+      repositoryWrite: false,
+      shell: false,
+    });
   });
 });

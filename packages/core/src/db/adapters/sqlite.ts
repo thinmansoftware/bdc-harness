@@ -16,6 +16,69 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+/**
+ * Canonical tm_expectations schema (migration 049), shared by the fresh-table
+ * path in initSchema and the empty-table recreate in migrateColumns so the two
+ * cannot drift apart.
+ */
+const TM_EXPECTATIONS_SCHEMA = `CREATE TABLE tm_expectations (
+  id TEXT PRIMARY KEY,
+  registration_key TEXT NOT NULL UNIQUE,
+  dispatch_ref TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  due_at TEXT NOT NULL,
+  on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
+  max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+  retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (
+    status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
+  ),
+  evidence_pointer TEXT,
+  registered_by TEXT,
+  self_supervised INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`;
+
+/**
+ * Front-door columns (migration 050, bdc-xo#2007), applied ADDITIVELY.
+ *
+ * These cannot ride the recreate path above: that path only fires on a table
+ * whose shape predates 049, and the live database is already at 049 WITH rows.
+ * A shape check that treated a missing `registered_by` as "outdated" would hit
+ * the non-empty refusal and block startup on a database that is merely one
+ * additive migration behind -- so these are ALTER TABLE ADD COLUMN, matching how
+ * agent_dispatch_messages has taken every column since phase 0.
+ */
+const TM_EXPECTATIONS_FRONT_DOOR_COLUMNS: [string, string][] = [
+  ['registered_by', 'TEXT'],
+  ['self_supervised', 'INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1))'],
+];
+
+const TM_EXPECTATIONS_REGISTERED_BY_INDEX =
+  'CREATE INDEX IF NOT EXISTS idx_tm_expectations_registered_by ON tm_expectations(registered_by, created_at)';
+
+const TM_EXPECTATIONS_UNIQUE_INDEX =
+  'CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key ON tm_expectations(registration_key)';
+const TM_EXPECTATIONS_DUE_INDEX =
+  'CREATE INDEX IF NOT EXISTS idx_tm_expectations_due ON tm_expectations(status, due_at)';
+const TM_EXPECTATIONS_DISPATCH_REF_INDEX =
+  'CREATE INDEX IF NOT EXISTS idx_tm_expectations_dispatch_ref ON tm_expectations(dispatch_ref)';
+
+/**
+ * Canonical tm_journal indexes (migration 041). Shared by initSchema and the
+ * CHECK-widening table rebuilds in migrateColumns, so a rebuild recreates them
+ * in its own transaction instead of leaving the table unindexed until the
+ * initSchema tail runs. idx_tm_journal_idem backs the Taskmaster idempotency
+ * lookup (`WHERE idempotency_key = ?`) that migration 057 relies on.
+ */
+const TM_JOURNAL_INDEXES: readonly string[] = [
+  'CREATE INDEX IF NOT EXISTS idx_tm_journal_thread ON tm_journal(thread_ref, created_at)',
+  'CREATE INDEX IF NOT EXISTS idx_tm_journal_idem ON tm_journal(idempotency_key)',
+  'CREATE INDEX IF NOT EXISTS idx_tm_journal_created ON tm_journal(created_at)',
+];
+
 export class SqliteAdapter implements IDatabase {
   private db: Database;
   readonly dialect = 'sqlite' as const;
@@ -42,6 +105,10 @@ export class SqliteAdapter implements IDatabase {
 
     // Enable foreign keys
     this.db.run('PRAGMA foreign_keys = ON');
+
+    // Settle any outdated tm_expectations shape BEFORE initSchema, whose
+    // index creation would otherwise fail against the old table.
+    this.ensureTmExpectationsShape();
 
     // Initialize schema if needed
     this.initSchema();
@@ -173,6 +240,15 @@ export class SqliteAdapter implements IDatabase {
     // on Windows this makes rmSync on the db directory fail with EBUSY until a
     // collection runs. Force one so close() means closed. (Verified 2026-07-13:
     // rm fails after close(), succeeds after Bun.gc(true).)
+    //
+    // DO NOT remove this to chase a slow-CI hook timeout. Measured 2026-09-07
+    // while diagnosing the windows-latest taskmaster flake: this forced GC costs
+    // ~3ms per close (2.3ms at a 3.5MB heap, 3.8ms at 17MB), against ~82ms for
+    // the constructor's initSchema() in the same cycle. It is not the cost, and
+    // dropping it re-opens the EBUSY class above. The flake's actual cause was
+    // filesystem contention from running many sqlite-backed test files
+    // concurrently in one `bun test` invocation -- fixed in this package's
+    // "test" script, not here.
     if (typeof Bun !== 'undefined' && typeof Bun.gc === 'function') {
       Bun.gc(true);
     }
@@ -222,6 +298,130 @@ export class SqliteAdapter implements IDatabase {
    * Always runs createSchema() since all statements use IF NOT EXISTS,
    * ensuring new tables from migrations are created in existing databases.
    */
+  /**
+   * Resolve an outdated tm_expectations BEFORE initSchema runs.
+   *
+   * Ordering matters: initSchema's CREATE TABLE IF NOT EXISTS is a no-op on
+   * an existing table, but its CREATE UNIQUE INDEX on registration_key is
+   * not -- against an outdated table that statement fails with
+   * "no such column: registration_key" before any check could run. So the
+   * shape is settled first.
+   */
+  private ensureTmExpectationsShape(): void {
+    // Taskmaster expectation registry shape check (migration 049).
+    //
+    // DESIGN NOTE -- why there is no automatic key-derivation repair here.
+    //
+    // tm_expectations ships for the FIRST TIME in this WO. It exists in no
+    // commit on origin/dev (`git log -S tm_expectations` returns only this
+    // branch's commits) and the live archon.db answers TABLE_ABSENT for
+    // `SELECT sql FROM sqlite_master WHERE name='tm_expectations'`. No deployed
+    // database can hold a legacy shape, so a backfill that derives
+    // registration_key values for pre-existing rows is surface with no caller --
+    // and five successive attempts to make such a derivation collision-free for
+    // every starting state each left another hole. Deriving keys is simply the
+    // wrong tool: any scheme that mixes preserved keys with derived ones can
+    // collide, and a collision fails index creation and blocks startup.
+    //
+    // So: recognise the current shape, recreate an EMPTY mismatched table, and
+    // REFUSE LOUDLY on a non-empty mismatched table rather than guessing. A
+    // human with the one-off script can inspect and decide; a startup path
+    // cannot. Refusing is safe because the only way to reach it is a database
+    // built from an intermediate revision of this branch.
+    try {
+      const expectationCols = this.pragmaAll("PRAGMA table_info('tm_expectations')") as {
+        name: string;
+      }[];
+      if (expectationCols.length > 0) {
+        const createSql =
+          (
+            this.pragmaAll(
+              "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
+            ) as { sql?: string }[]
+          )[0]?.sql ?? '';
+        const uniqueIndex = this.pragmaAll(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_tm_expectations_registration_key'"
+        ) as { name?: string }[];
+
+        // Three independent facts define the current shape. The CHECK is only
+        // reachable through the stored CREATE TABLE text -- PRAGMA table_info
+        // does not expose it.
+        const hasRegistrationKey = expectationCols.some(c => c.name === 'registration_key');
+        const checkAllowsEscalating = createSql.includes('escalating');
+        const hasUniqueIndex = uniqueIndex.length > 0;
+        const shapeIsCurrent = hasRegistrationKey && checkAllowsEscalating && hasUniqueIndex;
+
+        if (!shapeIsCurrent) {
+          const rowCount =
+            (this.pragmaAll('SELECT COUNT(*) AS cnt FROM tm_expectations') as { cnt?: number }[])[0]
+              ?.cnt ?? 0;
+
+          if (rowCount > 0) {
+            // REFUSE. Never guess at keys for rows a human has not seen.
+            throw new Error(
+              `tm_expectations has an outdated schema and ${String(rowCount)} row(s), so startup ` +
+                'cannot continue: deriving registration_key values automatically risks ' +
+                'collisions that would silently break expectation registration. Run ' +
+                '`bun scripts/db/repair-tm-expectations.ts <path-to-db>` to inspect the rows, ' +
+                'export them to JSON, and recreate the table with the current schema. ' +
+                `Missing: ${[
+                  hasRegistrationKey ? null : 'registration_key column',
+                  checkAllowsEscalating ? null : "status CHECK allowing 'escalating'",
+                  hasUniqueIndex ? null : 'unique index on registration_key',
+                ]
+                  .filter(Boolean)
+                  .join(', ')}.`
+            );
+          }
+
+          // Empty and mismatched: recreating is lossless, so just do it.
+          this.db.run('BEGIN');
+          try {
+            this.db.run('DROP TABLE tm_expectations');
+            this.db.run(TM_EXPECTATIONS_SCHEMA);
+            this.db.run(TM_EXPECTATIONS_UNIQUE_INDEX);
+            this.db.run(TM_EXPECTATIONS_DUE_INDEX);
+            this.db.run(TM_EXPECTATIONS_DISPATCH_REF_INDEX);
+            this.db.run('COMMIT');
+          } catch (recreateError) {
+            this.db.run('ROLLBACK');
+            throw recreateError;
+          }
+          getLog().warn(
+            { table: 'tm_expectations' },
+            'db.sqlite_tm_expectations_empty_table_recreated'
+          );
+        }
+
+        // Front door (migration 050): add the registrant columns to a table
+        // that is otherwise current. Re-read the column list, because the
+        // recreate branch above may have just replaced the table.
+        const currentColumns = new Set(
+          (this.pragmaAll("PRAGMA table_info('tm_expectations')") as { name: string }[]).map(
+            c => c.name
+          )
+        );
+        for (const [name, definition] of TM_EXPECTATIONS_FRONT_DOOR_COLUMNS) {
+          if (currentColumns.has(name)) continue;
+          this.db.run(`ALTER TABLE tm_expectations ADD COLUMN ${name} ${definition}`);
+          // Every row that predates the front door was written by the loop, so
+          // this is the one registrant it can have been -- not a guess.
+          if (name === 'registered_by')
+            this.db.run(
+              "UPDATE tm_expectations SET registered_by = 'taskmaster' WHERE registered_by IS NULL"
+            );
+        }
+        this.db.run(TM_EXPECTATIONS_REGISTERED_BY_INDEX);
+      }
+    } catch (e: unknown) {
+      // FAIL LOUDLY. A mismatched schema breaks expectation registration for
+      // the life of the process; a warning in a log nobody reads is not an
+      // acceptable outcome for a constraint the write path depends on.
+      getLog().error({ err: e as Error }, 'db.sqlite_tm_expectations_schema_check_failed');
+      throw e instanceof Error ? e : new Error(String(e));
+    }
+  }
+
   private initSchema(): void {
     this.createSchema();
     this.migrateColumns();
@@ -255,11 +455,7 @@ export class SqliteAdapter implements IDatabase {
     }
     // Taskmaster Slice 1 indexes (migration 041) -- after migrateColumns()
     // per the established pattern.
-    this.db.run(
-      'CREATE INDEX IF NOT EXISTS idx_tm_journal_thread ON tm_journal(thread_ref, created_at)'
-    );
-    this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_journal_idem ON tm_journal(idempotency_key)');
-    this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_journal_created ON tm_journal(created_at)');
+    for (const indexSql of TM_JOURNAL_INDEXES) this.db.run(indexSql);
     this.db.run(
       'CREATE INDEX IF NOT EXISTS idx_tm_usage_provider ON tm_usage_sample(provider, observed_at)'
     );
@@ -267,6 +463,44 @@ export class SqliteAdapter implements IDatabase {
     // per the established pattern.
     this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_snapshot ON tm_adoption(snapshot_id)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_thread ON tm_adoption(thread_ref)');
+  }
+
+  /**
+   * Rebuild tm_journal from `createNewTableSql` (a CREATE TABLE tm_journal_new
+   * statement) because SQLite cannot ALTER a CHECK constraint.
+   *
+   * DROP TABLE silently drops every index and trigger attached to the table.
+   * So, inside one IMMEDIATE transaction: capture the DDL of every index and
+   * trigger on tm_journal from sqlite_master, copy the rows, swap the tables,
+   * replay the captured DDL, then ensure the canonical migration-041 indexes.
+   * The upgraded table never becomes visible without its indexes and triggers
+   * (no unbounded idempotency lookups in the window before initSchema's tail),
+   * and objects created outside createSchema() are preserved rather than lost.
+   * Indexes with NULL sql are SQLite autoindexes (PRIMARY KEY / UNIQUE); the new
+   * CREATE TABLE recreates those itself. Rows are copied BEFORE the triggers are
+   * replayed, so an INSERT trigger never fires on the copy.
+   */
+  private rebuildTmJournal(createNewTableSql: string): void {
+    this.db.run('BEGIN IMMEDIATE');
+    try {
+      const dependents = this.db
+        .prepare(
+          `SELECT type, name, sql FROM sqlite_master
+           WHERE tbl_name = 'tm_journal' AND type IN ('index', 'trigger') AND sql IS NOT NULL
+           ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name`
+        )
+        .all() as { type: string; name: string; sql: string }[];
+      this.db.run(createNewTableSql);
+      this.db.run('INSERT INTO tm_journal_new SELECT * FROM tm_journal');
+      this.db.run('DROP TABLE tm_journal');
+      this.db.run('ALTER TABLE tm_journal_new RENAME TO tm_journal');
+      for (const dependent of dependents) this.db.run(dependent.sql);
+      for (const indexSql of TM_JOURNAL_INDEXES) this.db.run(indexSql);
+      this.db.run('COMMIT');
+    } catch (error: unknown) {
+      this.db.run('ROLLBACK');
+      throw error;
+    }
   }
 
   /**
@@ -282,9 +516,7 @@ export class SqliteAdapter implements IDatabase {
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
       .get() as { sql?: string } | undefined;
     if (journalSchema?.sql && !journalSchema.sql.includes('fire_cauldron')) {
-      this.db.run('BEGIN');
-      try {
-        this.db.run(`
+      this.rebuildTmJournal(`
           CREATE TABLE tm_journal_new (
             id TEXT PRIMARY KEY,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -297,18 +529,143 @@ export class SqliteAdapter implements IDatabase {
             proof_deadline_at TEXT,
             outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
             graded_at TEXT,
-            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful'))
-          );
-          INSERT INTO tm_journal_new SELECT * FROM tm_journal;
-          DROP TABLE tm_journal;
-          ALTER TABLE tm_journal_new RENAME TO tm_journal;
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
+          )
         `);
+    }
+    // Migration 055 (M-155 Amendment 03, WO-HARNESS-TASKMASTER-UNHEARD-GRADE-01):
+    // widen tm_journal.grade CHECK to accept 'unheard'. SQLite cannot ALTER a
+    // CHECK, so rebuild transactionally. Re-read the schema fresh -- the
+    // fire_cauldron rebuild above may have just recreated the table (still with
+    // the pre-'unheard' grade CHECK), so the stale journalSchema string cannot
+    // be reused here.
+    const journalSchema2 = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
+      .get() as { sql?: string } | undefined;
+    if (journalSchema2?.sql && !journalSchema2.sql.includes('unheard')) {
+      this.rebuildTmJournal(`
+          CREATE TABLE tm_journal_new (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            thread_ref TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+            proposal_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            before_hash TEXT,
+            proof_predicate TEXT,
+            proof_deadline_at TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+            graded_at TEXT,
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
+          )
+        `);
+    }
+    // Migration 056 (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01): widen
+    // tm_journal.grade CHECK to accept 'delivered_to_issue'. Re-read the schema
+    // fresh -- the migration-055 rebuild above may have just recreated the table
+    // with a CHECK that still lacks 'delivered_to_issue', so the stale schema
+    // string from that block cannot be reused here. Separate block (do not edit
+    // the 045/055 CHECK literals) so each widen is independently idempotent.
+    const journalSchema3 = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
+      .get() as { sql?: string } | undefined;
+    if (journalSchema3?.sql && !journalSchema3.sql.includes('delivered_to_issue')) {
+      this.rebuildTmJournal(`
+          CREATE TABLE tm_journal_new (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            thread_ref TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+            proposal_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            before_hash TEXT,
+            proof_predicate TEXT,
+            proof_deadline_at TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+            graded_at TEXT,
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+          )
+        `);
+    }
+    // Migration 046: older on-disk databases used a composite primary key for
+    // tm_health. Add a provider-only UNIQUE index (allowed by the WO) instead
+    // of rebuilding: table constraints, columns, indexes and triggers survive.
+    const hasHealthConflictTarget = (): boolean =>
+      this.db
+        .prepare(
+          `
+          SELECT 1 FROM pragma_index_list('tm_health') AS idx
+          WHERE idx."unique" = 1 AND idx.partial = 0
+            AND (SELECT COUNT(*) FROM pragma_index_info(idx.name)) = 1
+            AND (SELECT name FROM pragma_index_info(idx.name)) = 'provider'
+          LIMIT 1
+        `
+        )
+        .get() != null;
+    if (!hasHealthConflictTarget()) {
+      this.db.run('BEGIN IMMEDIATE');
+      try {
+        // Another connection may have repaired it while this one awaited the
+        // writer lock. Recheck before deleting rows or creating the index.
+        if (!hasHealthConflictTarget()) {
+          const occupiedNames = new Set(
+            (this.db.query('SELECT name FROM sqlite_schema').all() as { name: string }[]).map(row =>
+              row.name.toLowerCase()
+            )
+          );
+          const indexBase = 'tm_health_provider_unique';
+          let indexName = indexBase;
+          for (let suffix = 1; occupiedNames.has(indexName); suffix++) {
+            indexName = `${indexBase}_${String(suffix)}`;
+          }
+          // Execute the deletion separately so trigger failures reach rollback
+          // before attempting the index DDL.
+          this.db
+            .query(
+              `
+            DELETE FROM tm_health AS older
+            WHERE EXISTS (
+              SELECT 1 FROM tm_health AS newer
+              WHERE newer.provider = older.provider
+                AND (newer.sampled_at > older.sampled_at
+                  OR (newer.sampled_at = older.sampled_at AND newer.rowid > older.rowid))
+            );
+          `
+            )
+            .run();
+          this.db.run(`CREATE UNIQUE INDEX "${indexName}" ON tm_health(provider)`);
+        }
         this.db.run('COMMIT');
       } catch (error: unknown) {
         this.db.run('ROLLBACK');
         throw error;
       }
     }
+    // Verdict merge-execution bookkeeping (migration 052).
+    try {
+      const verdictCols = this.pragmaAll("PRAGMA table_info('overseer_verdicts')") as {
+        name: string;
+      }[];
+      const verdictColNames = new Set(verdictCols.map(column => column.name));
+      const additions: [string, string][] = [
+        ['actioned_at', 'TEXT'],
+        ['mutation_sent', 'INTEGER'],
+        ['action_reason', 'TEXT'],
+        ['merge_sha', 'TEXT'],
+        ['pr_url', 'TEXT'],
+      ];
+      for (const [name, definition] of additions) {
+        if (!verdictColNames.has(name)) {
+          this.db.run(`ALTER TABLE overseer_verdicts ADD COLUMN ${name} ${definition}`);
+        }
+      }
+      this.db.run(
+        "CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_merge_action ON overseer_verdicts(created_at) WHERE proposed_action = 'flag_merge_ready' AND actioned_at IS NULL"
+      );
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_overseer_verdict_columns_failed');
+    }
+
     // Conversations columns
     try {
       const cols = this.pragmaAll("PRAGMA table_info('remote_agent_conversations')") as {
@@ -411,8 +768,9 @@ export class SqliteAdapter implements IDatabase {
         ['repeat_reason', 'TEXT'],
         [
           'route_disposition',
-          "TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))",
+          "TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced'))",
         ],
+        ['route_disposed_at', 'TEXT'],
         ['supersedes_id', 'TEXT REFERENCES agent_dispatch_messages(id)'],
       ];
       const boardDispatchCols = this.db
@@ -459,6 +817,7 @@ export class SqliteAdapter implements IDatabase {
     }
 
     this.migrateDispatchSenderPrincipalIdempotency();
+    this.migrateDispatchSeq();
 
     try {
       const actionCols = this.db
@@ -483,6 +842,78 @@ export class SqliteAdapter implements IDatabase {
    * idempotency constraint with two partial unique indexes. Rebuild is fatal on
    * failure -- it must not be swallowed by the best-effort migration warn path.
    */
+  /**
+   * Database-assigned total order for the dispatch queue (mirrors Postgres
+   * migration 047_agent_dispatch_seq.sql).
+   *
+   * `created_at` has millisecond resolution while consecutive inserts finish
+   * inside one millisecond, and `id` is a random UUID, so newest-first ordering
+   * used to be decided at random on a tie. A process-local monotonic clock
+   * cannot fix that: concurrent writers still collide and a restarted writer can
+   * emit timestamps older than rows already committed. Only the database sees
+   * every writer, so the database assigns the order.
+   *
+   * SQLite's implicit `rowid` is already a monotonically increasing insertion
+   * key (the table is not WITHOUT ROWID), so it is the natural source. It cannot
+   * be exposed by adding an AUTOINCREMENT column -- SQLite's ALTER TABLE ADD
+   * COLUMN rejects AUTOINCREMENT and non-constant defaults -- so `seq` is a
+   * plain INTEGER backfilled from rowid, and inserts stamp it from rowid via
+   * the trigger below. That keeps a single source of truth for the order rather
+   * than a second counter that could drift.
+   */
+  private migrateDispatchSeq(): void {
+    try {
+      const tableExists = this.db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+        )
+        .get() as { name?: string } | null;
+      if (!tableExists?.name) return;
+
+      const colNames = new Set(
+        (
+          this.db.prepare("PRAGMA table_info('agent_dispatch_messages')").all() as {
+            name: string;
+          }[]
+        ).map(c => c.name)
+      );
+      if (!colNames.has('seq')) {
+        this.db.run('ALTER TABLE agent_dispatch_messages ADD COLUMN seq INTEGER');
+      }
+
+      // Backfill in rowid order -- the order the rows were actually inserted.
+      //
+      // This heals NULL seq at every open, but it is NOT sufficient on its own:
+      // a raw/fixture/import insert can land AFTER this ran and before the next
+      // open. That is why the read path orders by COALESCE(seq, rowid) and
+      // seqValueExpression() takes MAX over COALESCE(seq, rowid) -- read scale,
+      // write scale and this backfill all agree on rowid as the fallback, so a
+      // NULL-seq row can never tie or outrank a later normal insert.
+      this.db.run('UPDATE agent_dispatch_messages SET seq = rowid WHERE seq IS NULL');
+
+      // Retired: an AFTER INSERT trigger populated the stored row, but SQLite
+      // evaluates `RETURNING *` BEFORE the trigger fires, so callers were handed
+      // seq = NULL while the stored row held a value (real CI failure: a server
+      // route test compared a create response against a later re-read).
+      this.db.run('DROP TRIGGER IF EXISTS trg_agent_dispatch_messages_seq');
+
+      // Ordering must not depend on the writer remembering to set seq: raw SQL
+      // inserts, fixtures and imports bypass createMessage, and a NULL seq
+      // would make `ORDER BY seq DESC` an undefined order for those rows.
+      // SQLite cannot ALTER an existing column to add a DEFAULT, so seq is
+      // NULL-healed here on open and the ordering query coalesces NULLs to
+      // rowid, which is itself the insertion counter.
+
+      // seq leads: it is the newest-first ordering key, not a tiebreak.
+      this.db.run(
+        `CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_seq
+           ON agent_dispatch_messages (recipient, seq DESC)`
+      );
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_dispatch_seq_failed');
+    }
+  }
+
   private migrateDispatchSenderPrincipalIdempotency(): void {
     const tableExists = this.db
       .prepare(
@@ -533,7 +964,9 @@ export class SqliteAdapter implements IDatabase {
       /idempotency_key\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(tableSql) ||
       /UNIQUE\s*\(\s*idempotency_key\s*\)/i.test(tableSql);
 
-    if (!hasInlineUnique) {
+    const hasMachineDispositions =
+      tableSql.includes("'expired'") && tableSql.includes("'auto_surfaced'");
+    if (!hasInlineUnique && hasMachineDispositions) {
       // Column present and no inline UNIQUE -- only ensure partial indexes.
       // Do not recreate or redefine non-unique helper indexes here; smoke validation
       // catches wrong-definition leftovers on already-migrated schemas.
@@ -595,8 +1028,10 @@ export class SqliteAdapter implements IDatabase {
             escalated_sms_at TEXT,
             subject_key TEXT,
             repeat_reason TEXT,
-            route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
-            supersedes_id TEXT REFERENCES agent_dispatch_messages__phase15(id)
+            route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+            route_disposed_at TEXT,
+            supersedes_id TEXT REFERENCES agent_dispatch_messages__phase15(id),
+            seq INTEGER
           )
         `);
 
@@ -640,7 +1075,9 @@ export class SqliteAdapter implements IDatabase {
           'subject_key',
           'repeat_reason',
           'route_disposition',
+          'route_disposed_at',
           'supersedes_id',
+          'seq',
         ];
         const selectExprs = targetCols.map(name =>
           sourceNames.has(name) ? name : 'NULL AS ' + name
@@ -653,6 +1090,13 @@ export class SqliteAdapter implements IDatabase {
         this.db.run(
           'ALTER TABLE agent_dispatch_messages__phase15 RENAME TO agent_dispatch_messages'
         );
+
+        // Preserve every caller-defined and historical index exactly across the
+        // CHECK-changing rebuild. Canonical CREATE IF NOT EXISTS statements
+        // below fill only indexes that were genuinely absent.
+        for (const index of indexRows) {
+          if (index.sql) this.db.run(index.sql);
+        }
 
         this.db.run(
           'CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_status ON agent_dispatch_messages(recipient, status)'
@@ -707,6 +1151,10 @@ export class SqliteAdapter implements IDatabase {
         ('claude-acp', 'Claude ACP', 'worker_poll', 1),
         ('codex-mcp', 'Codex MCP', 'worker_poll', 1),
         ('grok-acp', 'Grok ACP', 'worker_poll', 1),
+        -- WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01: the Astra Codex desktop
+        -- Board/XO seat. drain_on_start (mailbox) like operator/xo -- no worker
+        -- ever claims it; the desktop automation reads and addresses it directly.
+        ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1),
         ('operator', 'Operator', 'drain_on_start', 1),
         ('xo', 'XO', 'drain_on_start', 1),
         ('board', 'Board', 'alias_resolved', 1),
@@ -718,7 +1166,9 @@ export class SqliteAdapter implements IDatabase {
         -- SQLite seed in sync with 000_combined.sql -- this INSERT block is a
         -- hand-maintained mirror, not derived from the migration files.
         ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1),
-        ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1)
+        ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1),
+        ('duty-officer', 'Duty Officer', 'worker_poll', 1),
+        ('do', 'Duty Officer alias', 'worker_poll', 1)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`
@@ -731,6 +1181,17 @@ export class SqliteAdapter implements IDatabase {
       FROM agent_dispatch_messages
       WHERE TRIM(recipient) <> ''
       ON CONFLICT (principal_id) DO NOTHING
+    `);
+    this.db.run(`
+      UPDATE dispatch_principals
+      SET delivery_mode = 'worker_poll',
+          active = 1,
+          display_name = CASE principal_id
+            WHEN 'duty-officer' THEN 'Duty Officer'
+            WHEN 'do' THEN 'Duty Officer alias'
+            ELSE display_name
+          END
+      WHERE principal_id IN ('duty-officer', 'do')
     `);
   }
 
@@ -1070,7 +1531,8 @@ export class SqliteAdapter implements IDatabase {
         escalated_sms_at TEXT,
         subject_key TEXT,
         repeat_reason TEXT,
-        route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded')),
+        route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced')),
+        route_disposed_at TEXT,
         supersedes_id TEXT REFERENCES agent_dispatch_messages(id)
       );
 
@@ -1701,13 +2163,70 @@ export class SqliteAdapter implements IDatabase {
         reason TEXT,
         evidence TEXT,
         retry_count INTEGER NOT NULL DEFAULT 0,
+        actioned_at TEXT,
+        mutation_sent INTEGER,
+        action_reason TEXT,
+        merge_sha TEXT,
+        pr_url TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
 
+      -- overseer_required_contexts_attempts: durable consecutive-UNKNOWN counters
+      -- for the PR reviewer's required-status-check-context lookup (migration 048,
+      -- bdc-harness #777 review). The bound it enforces used to live in a
+      -- process-local Map, which reset on every container rebuild and counted
+      -- independently per worker process -- so the "bound" never actually arrived
+      -- and unreadable contexts still deferred forever.
+      --
+      -- All four key parts are load-bearing: owner/repo because identical commits
+      -- exist across forks; base_ref because required contexts are BASE-specific;
+      -- head_sha because a new push is a new question and a sibling PR on the same
+      -- base must not share (hence reset) this head's slot. Rows are deleted on a
+      -- successful lookup; touched_at exists only so abandoned heads can be retired
+      -- by age.
+      CREATE TABLE IF NOT EXISTS overseer_required_contexts_attempts (
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        base_ref TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        touched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (owner, repo, base_ref, head_sha)
+      );
+
+      -- overseer_merge_slot_reservations: atomic hourly merge ceiling (migration 053).
+      CREATE TABLE IF NOT EXISTS overseer_merge_slot_lock (
+        id INTEGER PRIMARY KEY CHECK (id = 1)
+      );
+      INSERT INTO overseer_merge_slot_lock (id) VALUES (1)
+      ON CONFLICT (id) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS overseer_merge_slot_reservations (
+        id TEXT PRIMARY KEY,
+        verdict_id TEXT NOT NULL UNIQUE,
+        reserved_at TEXT NOT NULL,
+        released_at TEXT
+      );
+
+      -- Mirror of migration 050. Durable keyset cursor for the stale-verdict
+      -- sweep: a process-local cursor rewound to the head of the store on every
+      -- archon-app-1 rebuild, so rows past the first page were never reached.
+      CREATE TABLE IF NOT EXISTS overseer_sweep_cursor (
+        sweep TEXT PRIMARY KEY CHECK (sweep = 'stale_verdict'),
+        after_seq INTEGER NOT NULL DEFAULT 0 CHECK (after_seq >= 0),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
       -- Indexes
+      CREATE INDEX IF NOT EXISTS idx_overseer_required_contexts_attempts_touched
+        ON overseer_required_contexts_attempts(touched_at);
       CREATE UNIQUE INDEX IF NOT EXISTS uq_overseer_verdicts_run_head ON overseer_verdicts(run_id, head_sha);
       CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_status ON overseer_verdicts(status, created_at);
+      -- idx_overseer_verdicts_merge_action is created by the additive "migration 052" block
+      -- AFTER actioned_at exists on a pre-existing table. Creating it here broke every
+      -- upgrade of a database that predates that column (bdc-harness #842, rebuild 11).
+      CREATE INDEX IF NOT EXISTS idx_overseer_merge_slot_reservations_window
+        ON overseer_merge_slot_reservations(reserved_at);
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_conversation ON remote_agent_sessions(conversation_id);
@@ -1787,7 +2306,7 @@ export class SqliteAdapter implements IDatabase {
           outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')
         ),
         graded_at TEXT,
-        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful'))
+        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
       );
 
       CREATE TABLE IF NOT EXISTS tm_control (
@@ -1820,6 +2339,42 @@ export class SqliteAdapter implements IDatabase {
         confidence TEXT,
         is_unknown INTEGER NOT NULL DEFAULT 0 CHECK (is_unknown IN (0, 1))
       );
+
+      -- Taskmaster expectation registry (migration 049).
+      CREATE TABLE IF NOT EXISTS tm_expectations (
+        id TEXT PRIMARY KEY,
+        -- Stable identity for the causing work, normally
+        -- "<journal action id>:<dispatch_ref>". UNIQUE so a replayed action
+        -- cannot register a second expectation for the same dispatch (mirror
+        -- of migration 049).
+        registration_key TEXT NOT NULL UNIQUE,
+        dispatch_ref TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        due_at TEXT NOT NULL,
+        on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
+        max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+        retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (
+          status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
+        ),
+        evidence_pointer TEXT,
+        -- Front door (migration 050, bdc-xo#2007): WHO asked for this
+        -- supervision, and whether they named themselves as the recipient.
+        registered_by TEXT,
+        self_supervised INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key
+        ON tm_expectations(registration_key);
+      CREATE INDEX IF NOT EXISTS idx_tm_expectations_due
+        ON tm_expectations(status, due_at);
+      CREATE INDEX IF NOT EXISTS idx_tm_expectations_dispatch_ref
+        ON tm_expectations(dispatch_ref);
+      CREATE INDEX IF NOT EXISTS idx_tm_expectations_registered_by
+        ON tm_expectations(registered_by, created_at);
 
       INSERT OR IGNORE INTO tm_control (id, pause_state, epoch) VALUES (1, 'RUNNING', 0);
 
@@ -1866,6 +2421,14 @@ export class SqliteAdapter implements IDatabase {
 
       INSERT OR IGNORE INTO tm_adoption_meta (id) VALUES (1);
 
+      CREATE TABLE IF NOT EXISTS dispatch_receipt_cutover (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        applied_at TEXT NOT NULL
+      );
+
+      INSERT OR IGNORE INTO dispatch_receipt_cutover (id, applied_at)
+      VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
       -- Taskmaster noise suppression (migration 044,
       -- WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01). Durable standalone table --
       -- deliberately NOT a column on the disposable tm_adoption projection,
@@ -1875,6 +2438,18 @@ export class SqliteAdapter implements IDatabase {
         suppressed_until_hash TEXT NOT NULL,
         suppressed_at TEXT NOT NULL,
         noise_grade_count INTEGER NOT NULL DEFAULT 2
+      );
+
+      -- Taskmaster escalation delivery claims (migration 057,
+      -- WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). One row per GitHub issue;
+      -- serializes the list-then-post escalation comment. Additive: existing
+      -- databases gain the table here because createSchema runs on every open.
+      CREATE TABLE IF NOT EXISTS tm_escalation_claims (
+        issue_key TEXT PRIMARY KEY,
+        claim_id TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL,
+        posted_at TEXT
       );
     `);
     getLog().info('db.sqlite_schema_initialized');

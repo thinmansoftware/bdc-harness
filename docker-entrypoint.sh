@@ -21,6 +21,21 @@ if [ "$(id -u)" = "0" ]; then
     echo "ERROR: Failed to fix ownership of /home/appuser -- volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
+  # PR #848: seed cursor-agent auth state from the read-only host mount.
+  # docker-compose.yml binds ${CURSOR_CONFIG_HOST_PATH:-/dev/null} at
+  # /run/secrets/cursor-config. Only a non-empty DIRECTORY is copied; the
+  # /dev/null default (a char device) is skipped silently. Copying (rather than
+  # mounting over ~/.cursor) keeps ~/.cursor writable for cursor-agent's own
+  # state. CURSOR_API_KEY in the environment needs no files at all.
+  if [ -d /run/secrets/cursor-config ] && [ -n "$(ls -A /run/secrets/cursor-config 2>/dev/null)" ]; then
+    mkdir -p /home/appuser/.cursor
+    if cp -a /run/secrets/cursor-config/. /home/appuser/.cursor/ 2>/dev/null; then
+      chown -Rh appuser:appuser /home/appuser/.cursor
+      echo "[archon] cursor-agent auth state seeded from /run/secrets/cursor-config" >&2
+    else
+      echo "[archon] WARN: failed to copy /run/secrets/cursor-config into /home/appuser/.cursor -- cursor judge rung / provider will report Authentication required unless CURSOR_API_KEY is set" >&2
+    fi
+  fi
   # WO-168 Tier 1: /host-artifacts is a host bind mount for load-bearing
   # workflow output (git bundles, raw artifacts). Workflow nodes run as
   # appuser, so we must own it. Best-effort: if the mount is missing

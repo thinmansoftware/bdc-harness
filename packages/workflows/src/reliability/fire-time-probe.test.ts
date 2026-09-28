@@ -3,6 +3,7 @@ import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
 import type { IAgentProvider, MessageChunk } from '@archon/providers/types';
 import { runFireTimeProbe } from './fire-time-probe';
 import type { WorkflowConfig } from '../deps';
+import type { ModelOverride } from '../model-override';
 import type { WorkflowDefinition } from '../schemas';
 
 const upsert = mock(async () => ({}));
@@ -53,16 +54,20 @@ function provider(errors: readonly Error[]): IAgentProvider {
   };
 }
 
-async function run(errors: readonly Error[]) {
+async function run(
+  errors: readonly Error[],
+  options: { workflow?: WorkflowDefinition; modelOverride?: ModelOverride } = {}
+) {
   return runFireTimeProbe(
     { getAgentProvider: () => provider(errors), sleep: async () => {} },
     {
-      workflow,
+      workflow: options.workflow ?? workflow,
       workflowProvider: 'codex',
       workflowModel: 'qwen/qwen3-coder',
       config,
       cwd: '/tmp',
       source: 'fire_probe',
+      modelOverride: options.modelOverride,
     }
   );
 }
@@ -96,5 +101,48 @@ describe('fire-time probe', () => {
     expect(decision.blocked).toBe(false);
     expect(decision.warnings).toHaveLength(1);
     expect(decision.warnings[0]?.ok).toBe(false);
+  });
+
+  describe('modelOverride', () => {
+    const workflowWithPinnedNode: WorkflowDefinition = {
+      ...workflow,
+      nodes: [
+        { id: 'build', prompt: 'build' },
+        { id: 'review', prompt: 'review', provider: 'claude', model: 'sonnet' },
+      ],
+    };
+
+    test('probes overridden bindings for unpinned nodes and original bindings for pinned nodes', async () => {
+      const decision = await run([], {
+        workflow: workflowWithPinnedNode,
+        modelOverride: {
+          workflow: { provider: 'claude', model: 'override-model' },
+        },
+      });
+
+      expect(
+        decision.bindings.map(binding => ({
+          providerId: binding.providerId,
+          modelId: binding.modelId,
+        }))
+      ).toEqual([
+        { providerId: 'claude', modelId: 'override-model' },
+        { providerId: 'claude', modelId: 'sonnet' },
+      ]);
+    });
+
+    test('keeps the existing binding set without an override', async () => {
+      const decision = await run([], { workflow: workflowWithPinnedNode });
+
+      expect(
+        decision.bindings.map(binding => ({
+          providerId: binding.providerId,
+          modelId: binding.modelId,
+        }))
+      ).toEqual([
+        { providerId: 'codex', modelId: 'qwen/qwen3-coder' },
+        { providerId: 'claude', modelId: 'sonnet' },
+      ]);
+    });
   });
 });

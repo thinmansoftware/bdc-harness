@@ -20,6 +20,14 @@ import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import type { OverseerWorkflowEvent, PullRequestEvidence, WatchedRunRecord } from './types.ts';
 import { recordSpawnOutcome } from './model-resource-health.js';
+import {
+  buildJudgeTransport,
+  defaultJudgeChildSpawn,
+  deliverStdin,
+  destroyStdin,
+  removeJudgeTransportFiles,
+  type JudgeChildSpawn,
+} from './judge-transport';
 
 const log = createLogger('overseer/judge-first');
 
@@ -56,7 +64,22 @@ export interface JudgeEvidenceEnvelope {
     lookupFailed: boolean;
     checks: PullRequestEvidence['checks'];
     url: string | null;
+    number: number | null;
+    headRef: string | null;
+    author: string | null;
+    createdAt: string | null;
   };
+  otherOpenPrsForWo: { number: number; headRef: string; createdAt: string }[] | null;
+  /**
+   * True when the best-effort sibling search failed. otherOpenPrsForWo is
+   * then null and must not be read as an authoritative empty list.
+   */
+  otherOpenPrsForWoLookupFailed: boolean;
+  /**
+   * Inclusive bounds of this run, taken from event timestamps. The judge
+   * compares PR createdAt against this window. Null when no event has a timestamp.
+   */
+  runWindow: { startedAt: string | null; endedAt: string | null };
   /** Classifier output, demoted to advisory hint fields (binding term: no gate). */
   hint: { action: string; errorClass: string | null; reason: string };
   eventTail: { type: string; step: string | null; at: string; message: string }[];
@@ -109,8 +132,31 @@ function truncate(value: string, cap: number): string {
   return value.length > cap ? `${value.slice(0, cap)}...` : value;
 }
 
+/** Earliest and latest event timestamps. Two strings, never the event list. */
+function runWindowFromEvents(events: OverseerWorkflowEvent[]): {
+  startedAt: string | null;
+  endedAt: string | null;
+} {
+  let startedAt: string | null = null;
+  let endedAt: string | null = null;
+  for (const event of events) {
+    const at = event.created_at;
+    if (typeof at !== 'string' || at === '') continue;
+    if (startedAt === null || at < startedAt) startedAt = at;
+    if (endedAt === null || at > endedAt) endedAt = at;
+  }
+  return { startedAt, endedAt };
+}
+
 function eventMessage(data: Record<string, unknown>): string {
-  const candidates = [data.error, data.message, data.stderr, data.output, data.reason];
+  const candidates = [
+    data.error,
+    data.message,
+    data.stderr,
+    data.node_output,
+    data.output,
+    data.reason,
+  ];
   const found = candidates.find(value => typeof value === 'string' && value.trim());
   if (typeof found === 'string') return found;
   try {
@@ -134,6 +180,7 @@ export function buildEvidenceEnvelope(
     at: event.created_at ?? '',
     message: truncate(eventMessage(event.data), EVENT_MESSAGE_CAP),
   }));
+  const siblingLookupFailed = record.prEvidence.otherOpenPrsForWoLookupFailed === true;
   return {
     runId: record.runId,
     woId: record.woId,
@@ -148,7 +195,16 @@ export function buildEvidenceEnvelope(
       lookupFailed: record.prEvidence.lookupFailed ?? false,
       checks: record.prEvidence.checks,
       url: record.prEvidence.htmlUrl ?? null,
+      number: record.prEvidence.pr?.number ?? null,
+      headRef: record.prEvidence.pr?.headRef ?? null,
+      author: record.prEvidence.pr?.author ?? null,
+      createdAt: record.prEvidence.pr?.createdAt ?? null,
     },
+    otherOpenPrsForWo: siblingLookupFailed
+      ? null
+      : (record.prEvidence.otherOpenPrsForWo ?? []).slice(0, 5),
+    otherOpenPrsForWoLookupFailed: siblingLookupFailed,
+    runWindow: runWindowFromEvents(events),
     hint: {
       action: record.action,
       errorClass: record.errorClass ?? null,
@@ -181,6 +237,15 @@ export function buildJudgePrompt(envelope: JudgeEvidenceEnvelope): string {
     'run; failed_genuine when the run failed and no salvageable work exists;',
     'duplicate_work when the evidence shows this WO already has an equivalent open PR;',
     'needs_human when evidence conflicts or the failure shape is unrecognized;',
+    'A PR whose headRef starts with "archon/task-" and whose createdAt falls inside',
+    "runWindow (startedAt through endedAt, inclusive) is that run's builder-created",
+    'pre-review byproduct, never duplicate_work. If either runWindow bound is null,',
+    'do not treat createdAt as during the run.',
+    'A completed run whose own PR exists and whose event tail contains no failed node',
+    'must be classified as healthy or observe, never needs_human.',
+    'otherOpenPrsForWoLookupFailed: true together with otherOpenPrsForWo: null means',
+    'the sibling list is unavailable. A null sibling list is not evidence that no',
+    'duplicate or sibling PR exists and must not be treated as proof of exclusivity.',
     'observe/healthy for uneventful terminal runs. The deterministic classifier hint',
     'below is ADVISORY ONLY -- you may contradict it, and say so in reason when you do.',
     '',
@@ -274,44 +339,70 @@ export function parseJudgeOutput(stdout: string): ParsedJudgeVerdict | null {
   return { verdict: verdict as SemanticVerdict, confidence, proposedAction, proposedTier, reason };
 }
 
-async function spawnJudgeBinary(
+/**
+ * Spawn one ladder rung and collect its stdout. Exported for the transport
+ * regression test (#852); judgeTerminalRun is the API.
+ *
+ * argv and prompt delivery come from judge-transport.ts, shared with the
+ * PR-review judge. Before #852 this seam kept its own copy: codex got the
+ * prompt as a positional argument (M-48 fallback rung, John 2026-08-26: "Give
+ * it to codex") and every other rung got `[binary, '-p', prompt]`. Two
+ * defects: `cursor` is not a container binary (the CLI is `cursor-agent`, and
+ * it has no -p flag), so with codex out of quota and grok out of credits the
+ * only live rung died with "Executable not found in $PATH" (2026-09-15 13:47Z)
+ * while the PR-review judge answered on the same rung; and the prompt as ONE
+ * argv element is capped by Linux MAX_ARG_STRLEN (131,072 bytes) -- the E2BIG
+ * that #776/#786 fixed for PR review. parseJudgeOutput still scans for the
+ * first JSON object, so wrapper chatter and a markdown fence are tolerated.
+ *
+ * Timeout and kill behaviour are this seam's own and unchanged, except that
+ * the wall clock is armed BEFORE stdin delivery and tears the writer down when
+ * it fires: codex exec and cursor-agent read stdin to EOF before they answer,
+ * so the write must overlap the stdout read (a child that never reads would
+ * otherwise park the write past the ~64 KB pipe buffer forever). Same shape as
+ * runReviewModelProcess in pr-review-evaluator.ts.
+ */
+export async function spawnJudgeBinary(
   binary: string,
   prompt: string,
-  timeoutMs: number
+  timeoutMs: number,
+  spawnChild: JudgeChildSpawn = defaultJudgeChildSpawn
 ): Promise<JudgeSpawnResult> {
-  // Per-binary invocation: grok takes -p <prompt>; codex uses its exec
-  // subcommand (M-48 fallback rung, John 2026-08-26: "Give it to codex" --
-  // added when the xAI team ran out of credits and the single-rung ladder
-  // left the judge with no path to a verdict). parseJudgeOutput scans for
-  // the first JSON object, so codex's surrounding chatter is tolerated.
-  // 'codex' is not a container binary -- the CLI runs via bunx with the
-  // mounted /root/.codex/auth.json (live-verified 2026-08-26: returns clean
-  // JSON through `bunx @openai/codex exec`).
-  const argv =
-    binary === 'codex'
-      ? ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check', prompt]
-      : [binary, '-p', prompt];
-  const subprocess = Bun.spawn(argv, {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  let timeout: Timer | undefined;
-  const timeoutResult = new Promise<JudgeSpawnResult>(resolve => {
-    timeout = setTimeout(() => {
-      subprocess.kill();
-      resolve({ exitCode: 124, stdout: '', timedOut: true });
-    }, timeoutMs);
-  });
-  const processResult = (async (): Promise<JudgeSpawnResult> => {
-    const [exitCode, stdout] = await Promise.all([
-      subprocess.exited,
-      new Response(subprocess.stdout).text(),
-    ]);
-    return { exitCode, stdout, timedOut: false };
-  })();
-  const result = await Promise.race([processResult, timeoutResult]);
-  if (timeout) clearTimeout(timeout);
-  return result;
+  const transport = await buildJudgeTransport(binary, prompt);
+  try {
+    const subprocess = spawnChild(
+      transport.argv,
+      transport.stdinPrompt === undefined ? 'ignore' : 'pipe'
+    );
+    let timeout: Timer | undefined;
+    const timeoutResult = new Promise<JudgeSpawnResult>(resolve => {
+      timeout = setTimeout(() => {
+        subprocess.kill();
+        destroyStdin(subprocess.stdin);
+        resolve({ exitCode: 124, stdout: '', timedOut: true });
+      }, timeoutMs);
+    });
+    // Not awaited: the delivery races the wall clock alongside the process.
+    // deliverStdin swallows the EPIPE of a child that exits before draining.
+    if (transport.stdinPrompt !== undefined) {
+      void deliverStdin(subprocess.stdin, transport.stdinPrompt);
+    }
+    const processResult = (async (): Promise<JudgeSpawnResult> => {
+      const [exitCode, stdout] = await Promise.all([
+        subprocess.exited,
+        new Response(subprocess.stdout).text(),
+      ]);
+      return { exitCode, stdout, timedOut: false };
+    })();
+    const result = await Promise.race([processResult, timeoutResult]);
+    if (timeout) clearTimeout(timeout);
+    destroyStdin(subprocess.stdin);
+    return result;
+  } finally {
+    // The prompt file (grok rung) holds the private evidence envelope; it must
+    // not outlive the judge process on any path -- success, throw, or timeout.
+    await removeJudgeTransportFiles(transport);
+  }
 }
 
 /**
@@ -348,7 +439,10 @@ export async function judgeTerminalRun(
       try {
         await (options.recordOutcome ?? recordSpawnOutcome)(binary, result, 'judge-first');
       } catch (error) {
-        log.error({ binary, error }, 'overseer.judge_first.resource_health_record_failed');
+        log.error(
+          { binary, err: error as Error },
+          'overseer.judge_first.resource_health_record_failed'
+        );
       }
       if (result.timedOut || result.exitCode !== 0) {
         log.error(
@@ -392,7 +486,7 @@ export async function judgeTerminalRun(
           );
         } catch (recordError) {
           log.error(
-            { binary, error: recordError },
+            { binary, err: recordError as Error },
             'overseer.judge_first.resource_health_record_failed'
           );
         }

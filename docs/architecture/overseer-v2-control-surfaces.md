@@ -15,6 +15,8 @@ opens. Nothing on this list is flipped autonomously, ever.
 | `OVERSEER_JUDGE_P0_MAX_RETRIES` | env (config) | `0` | Per-run P0 judge-health retry ceiling. Default 0 = escalate on first health failure (mode matrix: P0 must not wait the routine budget). Detected via `metadata.priority`/`prio`/`labels` or `WO-P0-*` id marker. |
 | `OVERSEER_USE_FAKE_GITHUB_ADAPTER` | env (legacy) | off (real) | Test/dev only. Fake adapter cannot reach GitHub. |
 | `OVERSEER_WATCH_MAX_RUNS_PER_TICK` | env (load bound) | `25` | Maximum oldest-first terminal runs evaluated per 60-second watcher tick. Invalid or non-positive values fall back to 25, keeping worst-case search lookups below GitHub's 30/minute search limit. |
+| `OVERSEER_MAX_REREVIEW_ATTEMPTS` | env (config) | `3` | Maximum CONSECUTIVE automatic re-reviews of one PR after a `changes_requested` verdict; the initial review is not an attempt. Counted since the last NON-automatic review that actually produced a verdict, so a hand-requested review (Dispatch nudge) re-arms the budget and a converging PR is not locked out forever. Invalid, zero or negative values fall back to 3 -- the guard never disables itself on a typo. When the budget is exhausted the push is blocked and ONE comment is posted on the PR per head (idempotent via an HTML-comment marker). Effective value is logged at boot as `overseer.pr_review.rereview_budget_configured`. (#797) |
+| `OVERSEER_MAX_TOTAL_REREVIEWS` | env (config) | `10` | Lifetime hard ceiling on judged automatic re-reviews for one PR. Green fixed pushes and human reviews can re-arm the consecutive budget but never this ceiling. Invalid, zero, or negative values fall back to 10. At the ceiling ingest blocks with `rereview_total_ceiling_reached`; the receipt and PR comment report both lifetime and consecutive counts. (#797 item 4) |
 | `OVERSEER_MERGE_MANAGER_MODE` | env (Merge Manager mode) | `hold-canary` | Fail-closed default. `hold-canary` logs `would_comment` / `would_merge` with association proof (run/WO/PR/SHA) and performs **no GitHub write**. `comment_findings` may post one PR review comment via `commentOnPullRequest`; **merge stays hard-off**. `execute` is explicit opt-in only (still subject to production-effect hold + provenance gate). Unknown/empty values resolve to `hold-canary`. Soft-merge / production merge authority are NOT opened by this surface. |
 | `overseer_capability_state.merge.action_enabled` | DB row | `0` (writer `migration-034`) | JOHN ONLY, on the Arc B evidence package ((a)+(b) proven separately). The judge-first path never reads or writes it; the steward path keeps all its guards. |
 | `overseer_capability_state.{escalation,repair,branch,lifecycle}` | DB rows | per migration-034 | Legacy v1 capability rows. Preserved read-only for history; the judge-first path does not consult them. Tier >= 1 execution tickets are a later M-99 slice. |
@@ -47,3 +49,62 @@ merge-steward path, where fail-closed remains correct.
 
 One primary verdict per `(run_id, head_sha)` (unique index, claim-before-call in
 `claimOverseerVerdict`). Replay never re-bills a model call and never re-acts.
+
+## Judge ladder outages and the ladder-exhausted breaker (#847)
+
+When a PR-review judge rung exits non-zero or throws, `pr-review-evaluator.ts`
+classifies its stderr/stdout tail (`classifyJudgeOutage` in
+`judge-ladder-health.ts`) before falling back to `model_exit_nonzero:<binary>`:
+
+| Rung text | Reason code |
+|---|---|
+| Codex `You've hit your usage limit ... try again at <date>` | `usage_limit_until:<ISO-8601 UTC>` (`usage_limit` when the date cannot be parsed) |
+| xAI / grok `insufficient credits`, `402`, `payment required` | `provider_credits_exhausted` |
+| `401`, `unauthorized`, `Authentication required`, invalid API key | `auth_expired` |
+
+These are JUDGMENT failures (the process ran), so the attempt is terminal
+exactly as before: the PR review says `Reason code: <code>` and the submit
+receipt carries `reason: indeterminate:<code>`.
+
+**Breaker.** Each classified refusal is recorded per rung binary in process
+memory (`judge-ladder-health.ts`: a Map keyed by binary, a Map of parked heads
+keyed by correlation id, and the hour of the last notice; a clean exit clears
+the rung). When EVERY rung in `OVERSEER_JUDGE_LADDER` has a record in force --
+stated retry time in the future, or a credit/auth record under 60 minutes old
+-- `pr-review-ingest` parks the head instead of enqueueing: ingest receipt
+`blocked` / `judge_ladder_exhausted_until:<earliest ISO>`, no `run_review`
+row, no review on the PR, and one Dispatch `agent_message` to `operator`
+(priority `blocker`, idempotency key `judge-ladder-exhausted:<YYYY-MM-DDTHH>`)
+per hour naming the rungs, their codes, the earliest retry, and the parked
+heads. Recovery: the review worker tick re-enqueues parked heads
+(`repeat_reason` `judge_ladder_recovered:<sha>`) once the ladder is open; an
+operator `run_review` whose `repeat_reason` starts
+`operator_request:ladder_restored` clears the records and runs immediately.
+On restart all records are empty: one review re-spawns the ladder, the breaker
+re-trips, and heads parked before the restart are not auto-recovered (their
+trail is the `blocked` receipt and the notice). The check-completion ingest and
+the stale-verdict sweep do not consult the breaker.
+
+## PR review ingest receipts
+
+Every `pull_request` ingest writes one `pr_review_ingest_receipt` into
+`agent_dispatch_messages` (`task_type: run_report`, `recipient: operator`).
+Dispositions: `queued`, `duplicate_delivery`, `superseded_head`,
+`ignored_event`, `ignored_draft`, `rejected_signature`, `custody_conflict`,
+`blocked`.
+
+`blocked` reasons include the existing fail-closed codes (`webhook_secret_not_configured`,
+`payload_unparseable`, `incomplete_pull_request_context`, `rereview_attempts_exhausted`,
+`rereview_total_ceiling_reached`, `enqueue_failed:...`) and:
+
+- `base_not_incorporated:<baseRef>@<baseSha>` -- GitHub `pulls.get` reported
+  `mergeable_state: dirty` (content conflict with the current base). Review is
+  not queued. Base ref and SHA come from that `pulls.get` payload. The receipt
+  is per delivery, not sticky: a later ingest of the same head after the PR is
+  mergeable enqueues normally. `unknown` / omitted `mergeable_state` must not
+  block: GitHub returns those while it is still computing mergeability, and
+  treating them as conflicts would drop every fresh PR from review. (#845)
+- `judge_ladder_exhausted_until:<ISO>` -- every configured judge rung is out of
+  quota, credits, or credentials, so the head is parked rather than reviewed.
+  See the breaker section above. Checked BEFORE the mergeability read: a parked
+  head does not spend a GitHub call. (#847)

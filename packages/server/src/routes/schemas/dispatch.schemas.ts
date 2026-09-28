@@ -18,7 +18,12 @@ export const dispatchMessageStatusSchema = z.enum([
 
 export const dispatchMessagePrioritySchema = z.enum(['blocker', 'normal', 'heartbeat']);
 export const dispatchTaskOutcomeSchema = z.enum(['succeeded', 'failed', 'blocked']);
-export const dispatchRouteDispositionSchema = z.enum(['unroutable', 'superseded']);
+export const dispatchRouteDispositionSchema = z.enum([
+  'unroutable',
+  'superseded',
+  'expired',
+  'auto_surfaced',
+]);
 
 export const dispatchMessageSchema = z
   .object({
@@ -89,7 +94,7 @@ export const supersedeDispatchMessageBodySchema = z
 
 export const dispatchMailboxPrincipalBodySchema = z
   .object({
-    principal_id: z.string().trim().toLowerCase().min(1),
+    principal_id: z.string().trim().toLowerCase().min(1).optional(),
   })
   .strict()
   .openapi('DispatchMailboxPrincipalBody');
@@ -99,6 +104,7 @@ export const listDispatchMessagesQuerySchema = z.object({
   status: dispatchMessageStatusSchema.optional(),
   limit: z.string().optional(),
   subject_key: z.string().optional(),
+  route_disposition: dispatchRouteDispositionSchema.optional(),
 });
 
 export const claimDispatchMessageBodySchema = z
@@ -191,6 +197,18 @@ export const dispatchStatusResponseSchema = z
     worker_stale_after_ms: z.number(),
     workers: z.array(dispatchWorkerSchema),
     queue: z.record(z.number()),
+    worker_lifecycle: z.record(z.number()),
+    mailbox: z.object({ cutover_at: z.string().nullable() }).catchall(
+      z.object({
+        unread: z.number(),
+        legacy_unverified: z.number(),
+        acked_open: z.number(),
+        addressed_by_mind: z.number(),
+        disposed_by_machine: z.number(),
+        surfaced_unacked: z.number(),
+        surfaced_acked: z.number(),
+      })
+    ),
     operator_reports: z.array(dispatchStatusItemSchema),
     execution_handoffs: z.array(dispatchStatusItemSchema),
   })

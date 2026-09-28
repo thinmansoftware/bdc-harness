@@ -34,6 +34,7 @@ const EXPECTED_PRECHECK_LANES = [
   'bdc-feature-development-astra.yaml',
   'bdc-feature-development-codex-only.yaml',
   'bdc-feature-development-codex.yaml',
+  'bdc-feature-development-cursor.yaml',
   'bdc-feature-development-fable.yaml',
   'bdc-feature-development-fusion-cx-kimi.yaml',
   'bdc-feature-development-fusion-cx-qwen.yaml',
@@ -188,6 +189,16 @@ function gateBash(file: string): string {
   return node.bash;
 }
 
+async function spawnGateOnce(rendered: string) {
+  const proc = Bun.spawn(['bash', '-c', rendered], { stdout: 'pipe', stderr: 'pipe' });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+}
+
 async function runGate(file: string, checkOutput: string) {
   // Real production substitution: dag-executor wraps `$node.output` refs in
   // `escapedForBash=true` mode, which shellQuote-wraps the multi-line value.
@@ -197,13 +208,33 @@ async function runGate(file: string, checkOutput: string) {
     ['check-already-satisfied', { state: 'completed' as const, output: checkOutput }],
   ]);
   const rendered = substituteNodeOutputRefs(gateBash(file), nodeOutputs, true);
-  const proc = Bun.spawn(['bash', '-c', rendered], { stdout: 'pipe', stderr: 'pipe' });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+
+  // SUBPROCESS CONTENTION RETRY (2026-09-07, PR #777 / run 34145535780).
+  //
+  // Each of these cases spawns a real `bash` which in turn spawns `python3`:
+  // 11 lanes x 4 outcomes = 44 interpreter startups from ONE test file. On
+  // ubuntu CI that file runs while `bun run test` executes all 18 packages'
+  // suites concurrently (.github/workflows/test.yml runs the parallel
+  // `bun run test` on non-Windows; only Windows gets --sequential), so those
+  // spawns compete with every other package for process slots and IO.
+  //
+  // Under that contention a spawn can die from a SIGNAL before the gate script
+  // produces any output -- observed as exit 130 (128+SIGINT) with the bun
+  // runner then reporting `script "test" exited with code 130`. The failure
+  // lands on a DIFFERENT lane each run, which is the same signature #784
+  // documented for the sqlite suites ("failing on a different test each run",
+  // green locally, green on the serial Windows job). It is contention, not a
+  // verdict: the gate logic is unchanged and passes on every rerun.
+  //
+  // A signal death is therefore retried once. This is deliberately NARROW --
+  // only a signalled exit with no stdout is retried. Any exit the gate script
+  // itself produced (including a non-zero exit WITH output) is returned
+  // unchanged, so a genuine regression in the gate still fails the assertions
+  // below rather than being papered over by the retry.
+  const first = await spawnGateOnce(rendered);
+  const diedFromSignal = first.exitCode > 128 && first.stdout === '';
+  if (!diedFromSignal) return first;
+  return spawnGateOnce(rendered);
 }
 
 describe('gate-already-satisfied disposition (behavioral)', () => {
@@ -217,6 +248,7 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       'bdc-feature-development-astra.yaml',
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
+      'bdc-feature-development-cursor.yaml',
       'bdc-feature-development-fable.yaml',
       'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
@@ -326,4 +358,37 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       });
     });
   }
+
+  // SIGPIPE / pipefail flake (issue #837): eleven concurrent bash gates, five
+  // rounds. Skip-capable lanes must stay already-merged-on-base (45/45). Zero
+  // lanes keep the force-build contract (10/10 needs-build). No assertion retry.
+  it('base-present is stable across concurrent lane spawns (5 rounds x 11 lanes)', async () => {
+    const checkOutput = [
+      'ALREADY_SATISFIED=true',
+      'SATISFIED_ON_BASE=true',
+      'SATISFIED_EVIDENCE=deliverable merged on origin/dev by concurrent sibling run',
+    ].join('\n');
+    const forceBuild = (file: string): boolean =>
+      file === 'bdc-feature-development-zero.yaml' ||
+      file === 'bdc-feature-development-zero-open.yaml';
+    for (let round = 0; round < 5; round++) {
+      const results = await Promise.all(
+        JSON_GATE_FEATURE_LANES.map(async (file: string) => ({
+          file,
+          ...(await runGate(file, checkOutput)),
+        }))
+      );
+      for (const { file, stdout, exitCode } of results) {
+        expect(exitCode).toBe(0);
+        const doc: { ALREADY_SATISFIED: boolean; PRECHECK_VERDICT: string } = JSON.parse(stdout);
+        if (forceBuild(file)) {
+          expect(doc.ALREADY_SATISFIED).toBe(false);
+          expect(doc.PRECHECK_VERDICT).toBe('needs-build');
+        } else {
+          expect(doc.ALREADY_SATISFIED).toBe(true);
+          expect(doc.PRECHECK_VERDICT).toBe('already-merged-on-base');
+        }
+      }
+    }
+  });
 });

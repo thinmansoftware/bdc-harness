@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 
+// Snapshot before mocking: sibling dispatch tests load @archon/paths, which
+// imports other fs/promises exports (including symlink) in the same process.
+const realFsPromises = { ...(await import('node:fs/promises')) };
 mock.module('fs/promises', () => ({
+  ...realFsPromises,
   readFile: mock(async (path: string) => {
     if (!path.startsWith('/run/bdc-secrets/')) throw new Error('unexpected secret path');
     return 'file-token\n';

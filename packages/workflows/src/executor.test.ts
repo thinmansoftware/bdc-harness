@@ -910,6 +910,35 @@ describe('executeWorkflow', () => {
   // -------------------------------------------------------------------------
 
   describe('resume logic', () => {
+    it('rehydrates a persisted model override for resumed DAG execution', async () => {
+      const modelOverride = {
+        workflow: { provider: 'codex', model: 'gpt-5.6-sol' },
+      };
+      const resumable = makeRun({
+        status: 'failed',
+        metadata: { model_override: modelOverride },
+      });
+      const store = makeStore({
+        findResumableRun: mock(async () => resumable),
+        getCompletedDagNodeOutputs: mock(async () => new Map([['node0', 'done']])),
+        resumeWorkflowRun: mock(async () => ({ ...resumable, status: 'running' })),
+      });
+
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1'
+      );
+
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('gpt-5.6-sol');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[16]).toEqual(modelOverride);
+    });
+
     it('resumes the exact waiting-provider run even when it has no completed nodes', async () => {
       const waitingRun = makeRun({ id: 'waiting-run', status: 'waiting_provider' });
       const resumedRun = makeRun({ id: 'waiting-run', status: 'running' });

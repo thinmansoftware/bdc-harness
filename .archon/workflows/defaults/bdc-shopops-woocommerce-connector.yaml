@@ -765,10 +765,7 @@ nodes:
       BDC_NODE_OUTPUT_MANIFEST
       )
 
-      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
-      $read-spec.output
-      BDC_NODE_OUTPUT_READ_SPEC
-      )
+      READ_SPEC_OUT=$read-spec.output
       ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
       ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
       if [ -z "$ISSUE_NUM" ]; then
