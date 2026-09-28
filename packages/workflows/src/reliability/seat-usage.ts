@@ -162,6 +162,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function seatForProvider(providerId: string): SeatId | null {
+  if (providerId === 'codex-native-strict') return 'codex';
   if (providerId === 'claude' || providerId === 'codex' || providerId === 'cursor') {
     return providerId;
   }
