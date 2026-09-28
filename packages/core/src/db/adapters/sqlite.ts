@@ -79,6 +79,12 @@ const TM_JOURNAL_INDEXES: readonly string[] = [
   'CREATE INDEX IF NOT EXISTS idx_tm_journal_created ON tm_journal(created_at)',
 ];
 
+const BOARD_AUDIT_INDEXES: readonly string[] = [
+  'CREATE INDEX IF NOT EXISTS idx_board_audit_events_created ON board_audit_events(created_at)',
+  'CREATE INDEX IF NOT EXISTS idx_board_audit_events_motion ON board_audit_events(motion_id, motion_revision_sha) WHERE motion_id IS NOT NULL',
+  'CREATE UNIQUE INDEX IF NOT EXISTS uq_board_audit_events_subject ON board_audit_events(event_type, subject_key) WHERE subject_key IS NOT NULL',
+];
+
 export class SqliteAdapter implements IDatabase {
   private db: Database;
   readonly dialect = 'sqlite' as const;
@@ -109,6 +115,9 @@ export class SqliteAdapter implements IDatabase {
     // Settle any outdated tm_expectations shape BEFORE initSchema, whose
     // index creation would otherwise fail against the old table.
     this.ensureTmExpectationsShape();
+    // The fresh-schema batch creates an index on subject_key. Upgrade an old
+    // board audit table first so that batch never references a missing column.
+    this.ensureBoardAuditEventsShape();
 
     // Initialize schema if needed
     this.initSchema();
@@ -509,7 +518,21 @@ export class SqliteAdapter implements IDatabase {
    * so new columns must be added via ALTER TABLE for databases created before
    * the columns were added to createSchema().
    */
+  private ensureBoardAuditEventsShape(): void {
+    const boardAuditSchema = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'board_audit_events'")
+      .get() as { sql?: string } | undefined;
+    if (
+      boardAuditSchema?.sql &&
+      (!boardAuditSchema.sql.includes('ce_scope_approval_recorded') ||
+        !boardAuditSchema.sql.includes('manual_initiation_recorded'))
+    ) {
+      this.rebuildBoardAuditEvents(boardAuditSchema.sql.includes('subject_key'));
+    }
+  }
+
   private migrateColumns(): void {
+    this.ensureBoardAuditEventsShape();
     // Migration 045: SQLite cannot alter CHECK constraints. Rebuild existing
     // four-verb journals transactionally before any fire_cauldron insert.
     const journalSchema = this.db
@@ -834,6 +857,55 @@ export class SqliteAdapter implements IDatabase {
       }
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_supervisor_action_columns_failed');
+    }
+  }
+
+  private rebuildBoardAuditEvents(hasSubjectKey: boolean): void {
+    this.db.run('BEGIN IMMEDIATE');
+    try {
+      const dependents = this.db
+        .prepare(
+          `SELECT sql FROM sqlite_master WHERE tbl_name = 'board_audit_events'
+           AND type IN ('index', 'trigger') AND sql IS NOT NULL
+           ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name`
+        )
+        .all() as { sql: string }[];
+      this.db.run(`CREATE TABLE board_audit_events_new (
+        id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL CHECK (event_type IN (
+          'xo_lease_acquired','xo_lease_acquire_rejected','xo_lease_renewed',
+          'xo_lease_renew_rejected','xo_lease_released','xo_lease_release_rejected',
+          'board_recipient_resolved','board_recipient_deferred','canonical_motion_frozen',
+          'canonical_approval_accepted','canonical_approval_rejected',
+          'motion_notification_enqueued','motion_notification_deduplicated',
+          'board_alias_resolved','board_petition_delivered','execution_claim_authority_rejected',
+          'manual_initiation_recorded','ce_scope_approval_recorded',
+          'ce_scope_approval_revoked','ce_scope_approval_rejected'
+        )),
+        actor_principal_id TEXT,
+        actor_seat_id TEXT CHECK (actor_seat_id IS NULL OR actor_seat_id IN ('john','general','xo')),
+        xo_lease_id TEXT,
+        xo_fencing_token INTEGER CHECK (xo_fencing_token IS NULL OR xo_fencing_token > 0),
+        motion_id TEXT,
+        motion_revision_sha TEXT,
+        details TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        subject_key TEXT
+      )`);
+      this.db.run(`INSERT INTO board_audit_events_new
+        (id,event_type,actor_principal_id,actor_seat_id,xo_lease_id,xo_fencing_token,
+         motion_id,motion_revision_sha,details,created_at,subject_key)
+        SELECT id,event_type,actor_principal_id,actor_seat_id,xo_lease_id,xo_fencing_token,
+         motion_id,motion_revision_sha,details,created_at,${hasSubjectKey ? 'subject_key' : 'NULL'}
+        FROM board_audit_events`);
+      this.db.run('DROP TABLE board_audit_events');
+      this.db.run('ALTER TABLE board_audit_events_new RENAME TO board_audit_events');
+      for (const dependent of dependents) this.db.run(dependent.sql);
+      for (const indexSql of BOARD_AUDIT_INDEXES) this.db.run(indexSql);
+      this.db.run('COMMIT');
+    } catch (error: unknown) {
+      this.db.run('ROLLBACK');
+      throw error;
     }
   }
 
@@ -1609,7 +1681,10 @@ export class SqliteAdapter implements IDatabase {
             'board_alias_resolved',
             'board_petition_delivered',
             'execution_claim_authority_rejected',
-            'manual_initiation_recorded'
+            'manual_initiation_recorded',
+            'ce_scope_approval_recorded',
+            'ce_scope_approval_revoked',
+            'ce_scope_approval_rejected'
           )
         ),
         actor_principal_id TEXT,
@@ -1619,7 +1694,8 @@ export class SqliteAdapter implements IDatabase {
         motion_id TEXT,
         motion_revision_sha TEXT,
         details TEXT NOT NULL DEFAULT '{}',
-        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        subject_key TEXT
       );
 
       CREATE TRIGGER IF NOT EXISTS trg_board_audit_events_no_update
@@ -2267,6 +2343,8 @@ export class SqliteAdapter implements IDatabase {
         ON board_audit_events(created_at);
       CREATE INDEX IF NOT EXISTS idx_board_audit_events_motion
         ON board_audit_events(motion_id, motion_revision_sha) WHERE motion_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_board_audit_events_subject
+        ON board_audit_events(event_type, subject_key) WHERE subject_key IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_overseer_actions_run_id ON overseer_actions(run_id);
       CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_pr_ref ON overseer_reconcile_actions(pr_ref);
       CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_action ON overseer_reconcile_actions(action);

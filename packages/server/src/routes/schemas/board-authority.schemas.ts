@@ -57,3 +57,38 @@ export const boardRecipientResponseSchema = z
     fencing_token: z.number().optional(),
   })
   .openapi('BoardRecipientResponse');
+
+export const scopeApprovalRecordBodySchema = z.object({
+  principal_token: z.string().min(1).optional(),
+  holder_id: z.string().min(1), holder_token: z.string().min(1),
+  fencing_token: z.number().int().positive(),
+  repo: z.literal('thinmansoftware/lspro-react'), pr_number: z.number().int().positive(),
+  head_sha: z.string().regex(/^[0-9a-f]{40}$/),
+  conditions: z.string().min(1).max(4000).refine(value => value.trim().length > 0),
+  evidence_url: z.string().url().refine(value => value.startsWith('https://')),
+}).strict().openapi('ScopeApprovalRecordBody');
+
+export const scopeApprovalRevokeParamsSchema = z.object({ approval_id: z.string().uuid() });
+export const scopeApprovalRevokeBodySchema = z.object({
+  principal_token: z.string().min(1).optional(), holder_id: z.string().min(1),
+  holder_token: z.string().min(1), fencing_token: z.number().int().positive(),
+  reason: z.string().min(1).refine(value => value.trim().length > 0),
+}).strict().openapi('ScopeApprovalRevokeBody');
+
+export const scopeApprovalPublicQuerySchema = z.object({
+  repo: z.string().min(1), pr_number: z.coerce.number().int().positive(),
+  head_sha: z.string().regex(/^[0-9a-f]{40}$/), base_sha: z.string().regex(/^[0-9a-f]{40}$/),
+}).strict();
+
+export const scopeApprovalResponseSchema = z.object({
+  approval_id: z.string().uuid(), repo: z.string(), pr_number: z.number().int(),
+  target_branch: z.string(), head_sha: z.string(), base_sha: z.string(),
+  authority: z.literal('john'), recorded_by_principal_id: z.string(),
+  recorded_by_seat: boardSeatSchema, xo_lease_id: z.string(), xo_fencing_token: z.number(),
+  conditions: z.string(), evidence_url: z.string(), recorded_at: z.string(),
+}).openapi('ScopeApproval');
+
+export const scopeApprovalDecisionSchema = z.object({
+  decision: z.enum(['allow', 'deny']), approval: scopeApprovalResponseSchema.optional(),
+  reason: z.string().optional(),
+}).openapi('ScopeApprovalDecision');

@@ -33,6 +33,7 @@ import {
 } from './merge-repo-policy';
 import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
+import { recheckCeScopeBeforeMerge } from './ce-scope-premerge-recheck';
 
 const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
@@ -64,6 +65,7 @@ export interface MergeExecutionBridgeOptions {
   now?: () => Date;
   maxMergesPerHour?: number;
   repoConfig?: MergeExecutionRepoConfig;
+  ceScopePremergeRecheck?: typeof recheckCeScopeBeforeMerge;
 }
 
 function configuredLimit(override?: number): number {
@@ -528,6 +530,17 @@ async function mergeClaimedVerdict(
   }
   let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
   try {
+    if (`${pr.pr?.owner}/${pr.pr?.repo}`.toLowerCase() === 'thinmansoftware/lspro-react' && pr.baseBranch === 'release/ce') {
+      const recheck = await (options.ceScopePremergeRecheck ?? recheckCeScopeBeforeMerge)({
+        repo: 'thinmansoftware/lspro-react', pr_number: pr.pr.number,
+        expected_head_sha: verdict.head_sha,
+      });
+      if (!recheck.ok) {
+        await options.store.releaseMergeSlot(verdict.id);
+        await skip(recheck.reason, pr.htmlUrl);
+        return undefined;
+      }
+    }
     merged = await options.github.mergePullRequest({
       ...pr.pr,
       mergeMethod: 'squash',

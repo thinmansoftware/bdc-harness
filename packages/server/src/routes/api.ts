@@ -189,6 +189,7 @@ import * as messageDb from '@archon/core/db/messages';
 import * as dispatchDb from '@archon/core/db/dispatch';
 import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
 import * as boardAuthorityDb from '@archon/core/db/board-authority';
+import * as boardScopeApprovalDb from '@archon/core/db/board-scope-approvals';
 import * as executionClaimsDb from '@archon/core/db/execution-claims';
 import * as mergeStewardDb from '@archon/core/db/merge-steward';
 import * as overseerBriefingDb from '@archon/core/db/overseer-briefing';
@@ -326,6 +327,12 @@ import {
   xoLeaseReleaseBodySchema,
   xoLeaseRenewBodySchema,
   xoLeaseSchema,
+  scopeApprovalRecordBodySchema,
+  scopeApprovalRevokeBodySchema,
+  scopeApprovalRevokeParamsSchema,
+  scopeApprovalPublicQuerySchema,
+  scopeApprovalResponseSchema,
+  scopeApprovalDecisionSchema,
 } from './schemas/board-authority.schemas';
 import {
   acquireExecutionClaimBodySchema,
@@ -1054,6 +1061,38 @@ const boardRecipientRoute = createRoute({
       description: 'Board recipient resolution',
     },
     500: jsonError('Server error'),
+  },
+});
+
+const recordScopeApprovalRoute = createRoute({
+  method: 'post', path: '/api/board/scope-approvals', tags: ['Board Authority'],
+  request: { body: { content: { 'application/json': { schema: scopeApprovalRecordBodySchema } }, required: true } },
+  responses: {
+    200: { content: { 'application/json': { schema: scopeApprovalResponseSchema } }, description: 'Existing approval' },
+    201: { content: { 'application/json': { schema: scopeApprovalResponseSchema } }, description: 'Recorded approval' },
+    400: jsonError('Bad request'), 401: jsonError('Principal rejected'),
+    403: jsonError('Seat forbidden'), 409: jsonError('Conflict'), 500: jsonError('Server error'),
+  },
+});
+
+const revokeScopeApprovalRoute = createRoute({
+  method: 'post', path: '/api/board/scope-approvals/{approval_id}/revoke', tags: ['Board Authority'],
+  request: { params: scopeApprovalRevokeParamsSchema,
+    body: { content: { 'application/json': { schema: scopeApprovalRevokeBodySchema } }, required: true } },
+  responses: {
+    200: { content: { 'application/json': { schema: z.object({ rerun: z.enum(['requested','unavailable','failed']), credential_class: z.string() }) } }, description: 'Revoked' },
+    400: jsonError('Bad request'), 401: jsonError('Principal rejected'),
+    403: jsonError('Seat forbidden'), 404: jsonError('Not found'), 409: jsonError('Conflict'), 500: jsonError('Server error'),
+  },
+});
+
+const readScopeApprovalRoute = createRoute({
+  method: 'get', path: '/api/public/board/scope-approvals', tags: ['Board Authority'],
+  request: { query: scopeApprovalPublicQuerySchema },
+  responses: {
+    200: { content: { 'application/json': { schema: scopeApprovalDecisionSchema } }, description: 'Fail-closed decision' },
+    400: { content: { 'application/json': { schema: scopeApprovalDecisionSchema } }, description: 'Invalid query' },
+    500: { content: { 'application/json': { schema: scopeApprovalDecisionSchema } }, description: 'Store failure' },
   },
 });
 
@@ -4727,6 +4766,57 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'board_recipient_resolve_failed');
       return apiError(c, 500, 'Failed to resolve board recipient');
+    }
+  });
+
+  registerOpenApiRoute(recordScopeApprovalRoute, async c => {
+    try {
+      const body = getValidatedBody(c, scopeApprovalRecordBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
+      const result = await boardScopeApprovalDb.recordScopeApproval({ ...body, principal });
+      if (!result.ok) {
+        const status = result.reason === 'seat_not_permitted' ? 403
+          : result.reason === 'repo_not_allowed' || result.reason === 'invalid_request' ? 400 : 409;
+        return apiError(c, status, result.reason);
+      }
+      return c.json(result.approval, result.created ? 201 : 200);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'scope_approval_record_failed');
+      return apiError(c, 500, 'scope_approval_record_failed');
+    }
+  });
+
+  registerOpenApiRoute(revokeScopeApprovalRoute, async c => {
+    try {
+      const body = getValidatedBody(c, scopeApprovalRevokeBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
+      const result = await boardScopeApprovalDb.revokeScopeApproval({
+        ...body, approval_id: c.req.param('approval_id'), principal,
+      });
+      if (!result.ok) {
+        const status = result.reason === 'invalid_request' ? 400 : result.reason === 'not_found' ? 404
+          : result.reason === 'seat_not_permitted' ? 403 : 409;
+        return apiError(c, status, result.reason);
+      }
+      return c.json({ rerun: result.rerun, credential_class: result.credential_class });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'scope_approval_revoke_failed');
+      return apiError(c, 500, 'scope_approval_revoke_failed');
+    }
+  });
+
+  registerOpenApiRoute(readScopeApprovalRoute, async c => {
+    try {
+      const query = c.req.valid('query');
+      const decision = await boardScopeApprovalDb.getScopeApprovalDecision(query);
+      if (decision.decision === 'allow') return c.json(decision);
+      const reason = decision.reason === 'malformed' ? 'no_record' : decision.reason;
+      return c.json({ decision: 'deny' as const, reason });
+    } catch (error) {
+      getLog().error({ err: error }, 'scope_approval_read_failed');
+      return c.json({ decision: 'deny' as const, reason: 'server_error' }, 500);
     }
   });
 
