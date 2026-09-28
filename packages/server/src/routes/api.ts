@@ -4944,10 +4944,25 @@ export function registerApiRoutes(
             ? 'unavailable'
             : 'failed';
       }
+      const credentialClass = 'existing_github_credential';
+      // Secret-free audit trail: record the credential class used for the
+      // gate rerun and the rerun outcome. No tokens or secrets are logged --
+      // only the credential class label, the rerun status, and non-sensitive
+      // approval identifiers.
+      getLog().info(
+        {
+          approvalId: result.approval.approval_id,
+          repo: result.approval.repo,
+          prNumber: result.approval.pr_number,
+          credentialClass,
+          rerun,
+        },
+        'board_scope_approval_revoke_completed'
+      );
       return c.json({
         approval: result.approval,
         rerun,
-        credential_class: 'existing_github_credential',
+        credential_class: credentialClass,
       });
     } catch (error) {
       if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);

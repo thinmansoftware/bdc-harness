@@ -610,10 +610,11 @@ async function mergeClaimedVerdict(
     return undefined;
   }
 
-  if (
+  const isCeReleasePr =
     `${pr.pr.owner}/${pr.pr.repo}`.toLowerCase() === 'thinmansoftware/lspro-react' &&
-    pr.baseBranch === 'release/ce'
-  ) {
+    pr.baseBranch === 'release/ce';
+
+  if (isCeReleasePr) {
     const recheck = await ceScopePremergeRecheck({
       owner: pr.pr.owner,
       repo: pr.pr.repo,
@@ -659,6 +660,24 @@ async function mergeClaimedVerdict(
         { err: error as Error, verdictId: verdict.id },
         'merge-coordinator.approval_failed_nonfatal'
       );
+    }
+  }
+  // Fail-closed re-verify of the CE approval/gate immediately before merge.
+  // The earlier recheck runs before merge-slot reservation and the async
+  // approvePullRequest call; an operator could revoke approval in that window.
+  // Re-running the recheck here closes that revocation race so a revoked
+  // approval cannot slip through between the first recheck and the merge.
+  if (isCeReleasePr) {
+    const premergeRecheck = await ceScopePremergeRecheck({
+      owner: pr.pr.owner,
+      repo: pr.pr.repo,
+      prNumber: pr.pr.number,
+      deps: options.ceScopeRecheckDeps ?? productionCeScopeRecheckDeps(),
+    });
+    if (!premergeRecheck.ok) {
+      await options.store.releaseMergeSlot(verdict.id);
+      await skip(premergeRecheck.reason, pr.htmlUrl);
+      return undefined;
     }
   }
   let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
