@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -20,6 +20,11 @@ const record = mock(async () => ({ ok: false as const, reason: 'invalid_request'
 const revoke = mock(async () => ({ ok: false as const, reason: 'approval_not_found' as const }));
 const listRuns = mock(async () => ({ data: { workflow_runs: [] as Record<string, unknown>[] } }));
 const rerun = mock(async () => ({}));
+const actualScopeApprovals = await import('@archon/core/db/board-scope-approvals');
+const actualGetScopeApprovalDecision = actualScopeApprovals.getScopeApprovalDecision;
+const actualGetScopeApprovalMetadata = actualScopeApprovals.getScopeApprovalMetadata;
+const actualRecordScopeApproval = actualScopeApprovals.recordScopeApproval;
+const actualRevokeScopeApproval = actualScopeApprovals.revokeScopeApproval;
 
 mock.module('@archon/core/db/board-authority', () => ({
   authenticateBoardPrincipal: authenticate,
@@ -27,9 +32,13 @@ mock.module('@archon/core/db/board-authority', () => ({
   resolveBoardRecipient: mock(async () => ({ ok: false, reason: 'no_valid_xo_lease' })),
 }));
 mock.module('@archon/core/db/board-scope-approvals', () => ({
-  getScopeApprovalDecision: read,
-  recordScopeApproval: record,
-  revokeScopeApproval: revoke,
+  getScopeApprovalDecision: (input: Record<string, unknown>) =>
+    input.database ? actualGetScopeApprovalDecision(input as never) : read(),
+  getScopeApprovalMetadata: actualGetScopeApprovalMetadata,
+  recordScopeApproval: (input: Record<string, unknown>) =>
+    input.database ? actualRecordScopeApproval(input as never) : record(),
+  revokeScopeApproval: (input: Record<string, unknown>) =>
+    input.database ? actualRevokeScopeApproval(input as never) : revoke(),
 }));
 mock.module('@archon/overseer/adapters/github-real-deps', () => ({
   createRealOctokitClient: () => ({
@@ -48,6 +57,8 @@ mock.module('@archon/overseer/adapters/github-real-deps', () => ({
 
 import { registerApiRoutes } from './api';
 
+afterAll(() => mock.restore());
+
 const valid = {
   holder_id: 'h',
   holder_token: 't',
@@ -59,8 +70,8 @@ const valid = {
   evidence_url: 'https://example.test/e',
 };
 
-function makeApp(): OpenAPIHono {
-  delete process.env.ARCHON_OPERATOR_TOKEN;
+function makeApp(options: { preserveOperatorToken?: boolean } = {}): OpenAPIHono {
+  if (!options.preserveOperatorToken) delete process.env.ARCHON_OPERATOR_TOKEN;
   const app = new OpenAPIHono({ defaultHook: validationErrorHook });
   const web = {
     setConversationDbId: mock(() => {}),
@@ -94,28 +105,28 @@ describe('scope approval routes', () => {
     rerun.mockClear();
   });
 
-  test('uses production schemas and validates the registered mutation routes', async () => {
-    expect(
-      scopeApprovalRecordBodySchema.safeParse({ ...valid, authority: 'general' }).success
-    ).toBe(false);
-    expect(
-      scopeApprovalRevokeBodySchema.safeParse({
-        holder_id: 'h',
-        holder_token: 't',
-        fencing_token: 1,
-        reason: '',
-      }).success
-    ).toBe(false);
-    const response = await makeApp().request('/api/board/scope-approvals', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...valid, recorded_by: 'forged' }),
-    });
-    expect(response.status).toBe(400);
+  test('record_rejects_forged_body_fields', async () => {
+    const app = makeApp();
+    const invalidBodies = [
+      { ...valid, authority: 'general' },
+      { ...valid, recorded_by: 'john' },
+      { ...valid, conditions: '   ' },
+      Object.fromEntries(Object.entries(valid).filter(([key]) => key !== 'evidence_url')),
+    ];
+
+    for (const body of invalidBodies) {
+      const response = await app.request('/api/board/scope-approvals', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(400);
+    }
     expect(authenticate).not.toHaveBeenCalled();
+    expect(record).not.toHaveBeenCalled();
   });
 
-  test('public read is unauthenticated and maps invalid queries and store failures', async () => {
+  test('public_read_needs_no_operator_token_and_rejects_bad_input', async () => {
     expect(
       scopeApprovalPublicReadQuerySchema.safeParse({
         repo: valid.repo,
@@ -124,54 +135,80 @@ describe('scope approval routes', () => {
         base_sha: B,
       }).success
     ).toBe(true);
-    const app = makeApp();
-    const invalid = await app.request('/api/public/board/scope-approvals?repo=x&pr_number=nope');
-    expect(invalid.status).toBe(400);
-    expect(await invalid.json()).toEqual({ decision: 'deny', reason: 'invalid_query' });
-    const malformedRepo = await app.request(
-      `/api/public/board/scope-approvals?repo=x&pr_number=626&head_sha=${S}&base_sha=${B}`
-    );
-    expect(malformedRepo.status).toBe(400);
-    expect(await malformedRepo.json()).toEqual({ decision: 'deny', reason: 'invalid_query' });
-    const query = `repo=${encodeURIComponent(valid.repo)}&pr_number=626&head_sha=${S}&base_sha=${B}`;
-    expect((await app.request(`/api/public/board/scope-approvals?${query}`)).status).toBe(200);
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    process.env.ARCHON_OPERATOR_TOKEN = 'operator-secret';
+    try {
+      const app = makeApp({ preserveOperatorToken: true });
+      const query = `repo=${encodeURIComponent(valid.repo)}&pr_number=626&head_sha=${S}&base_sha=${B}`;
+      const publicResponse = await app.request(`/api/public/board/scope-approvals?${query}`);
+      expect(publicResponse.status).toBe(200);
+      expect(publicResponse.headers.get('content-type')).toContain('application/json');
+
+      const malformed = [
+        `repo=x&pr_number=626&head_sha=${S}&base_sha=${B}`,
+        `repo=${encodeURIComponent(valid.repo)}&pr_number=x&head_sha=${S}&base_sha=${B}`,
+        `repo=${encodeURIComponent(valid.repo)}&pr_number=626&head_sha=abc&base_sha=${B}`,
+        `repo=${encodeURIComponent(valid.repo)}&pr_number=626&head_sha=${S}&base_sha=abc`,
+      ];
+      for (const invalidQuery of malformed) {
+        const response = await app.request(`/api/public/board/scope-approvals?${invalidQuery}`);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ decision: 'deny', reason: 'invalid_query' });
+      }
+
+      for (const path of [
+        '/api/board/scope-approvals',
+        '/api/board/scope-approvals/approval-1/revoke',
+      ]) {
+        const response = await app.request(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(
+            path.endsWith('/revoke')
+              ? {
+                  holder_id: 'h',
+                  holder_token: 't',
+                  fencing_token: 1,
+                  reason: 'withdraw',
+                }
+              : valid
+          ),
+        });
+        expect(response.status).toBe(401);
+      }
+    } finally {
+      if (previousToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+    }
+  });
+
+  test('public_read_fails_closed_on_store_error', async () => {
     read.mockImplementationOnce(async () => {
       throw new Error('store down');
     });
-    const failed = await app.request(`/api/public/board/scope-approvals?${query}`);
-    expect(failed.status).toBe(500);
-    expect(await failed.json()).toEqual({ decision: 'deny', reason: 'server_error' });
+    const query = `repo=${encodeURIComponent(valid.repo)}&pr_number=626&head_sha=${S}&base_sha=${B}`;
+    const response = await makeApp().request(`/api/public/board/scope-approvals?${query}`);
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ decision: 'deny', reason: 'server_error' });
   });
 
-  test('maps authentication and store refusal statuses', async () => {
+  test('revoke_requires_lease_proof_and_requests_rerun', async () => {
     const app = makeApp();
-    const unauthorized = await app.request('/api/board/scope-approvals', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...valid, principal_token: 'bad' }),
-    });
-    expect(unauthorized.status).toBe(401);
-    record.mockImplementationOnce(async () => ({ ok: false, reason: 'seat_not_permitted' }));
-    const forbidden = await app.request('/api/board/scope-approvals', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(valid),
-    });
-    expect(forbidden.status).toBe(403);
-    const missing = await app.request('/api/board/scope-approvals/unknown/revoke', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        holder_id: 'h',
-        holder_token: 't',
-        fencing_token: 1,
-        reason: 'withdraw',
-      }),
-    });
-    expect(missing.status).toBe(404);
-  });
+    const revokeBody = { holder_id: 'h', holder_token: 't', fencing_token: 1, reason: 'withdraw' };
+    revoke.mockImplementation(async () => ({ ok: false, reason: 'stale_xo_lease_token' }));
+    for (const body of [
+      { ...revokeBody, holder_token: 'missing-proof' },
+      { ...revokeBody, holder_token: 'wrong' },
+      { ...revokeBody, fencing_token: 2 },
+    ]) {
+      const response = await app.request('/api/board/scope-approvals/approval-1/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(409);
+    }
 
-  test('revoke reruns only a returned run matching head SHA and live branch', async () => {
     revoke.mockImplementation(async () => ({
       ok: true,
       approval: {
@@ -185,13 +222,6 @@ describe('scope approval routes', () => {
       data: {
         workflow_runs: [
           {
-            id: 1,
-            path: '.github/workflows/ce-change-scope-gate.yml',
-            head_sha: B,
-            head_branch: 'feature',
-            run_started_at: '2026-01-02',
-          },
-          {
             id: 2,
             path: '.github/workflows/ce-change-scope-gate.yml',
             head_sha: S,
@@ -201,6 +231,62 @@ describe('scope approval routes', () => {
         ],
       },
     }));
+    const response = await app.request('/api/board/scope-approvals/approval-1/revoke', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(revokeBody),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()).rerun).toBe('requested');
+    expect(rerun).toHaveBeenCalledTimes(1);
+    expect(rerun).toHaveBeenCalledWith(expect.objectContaining({ run_id: 2 }));
+
+    rerun.mockImplementationOnce(async () => {
+      throw new Error('network failed');
+    });
+    const failed = await app.request('/api/board/scope-approvals/approval-1/revoke', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(revokeBody),
+    });
+    expect(failed.status).toBe(200);
+    expect((await failed.json()).rerun).toBe('failed');
+  });
+
+  test('revoke_rerun_selects_trusted_run_and_survives_denied_permission', async () => {
+    revoke.mockImplementation(async () => ({
+      ok: true,
+      approval: {
+        ...valid,
+        approval_id: 'approval-1',
+        base_sha: B,
+        target_branch: 'release/ce',
+      },
+    }));
+    listRuns.mockImplementation(async () => ({
+      data: {
+        workflow_runs: [
+          {
+            id: 20,
+            path: '.github/workflows/sneaky.yml',
+            head_sha: S,
+            head_branch: 'feature',
+            run_started_at: '2026-01-02',
+          },
+          {
+            id: 10,
+            path: '.github/workflows/ce-change-scope-gate.yml',
+            head_sha: S,
+            head_branch: 'feature',
+            run_started_at: '2026-01-01',
+          },
+        ],
+      },
+    }));
+    rerun.mockImplementationOnce(async () => {
+      throw { status: 403 };
+    });
+
     const response = await makeApp().request('/api/board/scope-approvals/approval-1/revoke', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -212,7 +298,8 @@ describe('scope approval routes', () => {
       }),
     });
     expect(response.status).toBe(200);
-    expect((await response.json()).rerun).toBe('requested');
-    expect(rerun).toHaveBeenCalledWith(expect.objectContaining({ run_id: 2 }));
+    expect((await response.json()).rerun).toBe('unavailable');
+    expect(rerun).toHaveBeenCalledTimes(1);
+    expect(rerun).toHaveBeenCalledWith(expect.objectContaining({ run_id: 10 }));
   });
 });

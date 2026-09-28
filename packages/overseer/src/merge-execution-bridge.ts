@@ -77,6 +77,26 @@ export interface MergeExecutionBridgeOptions {
   ceScopeRecheckDeps?: CeScopeRecheckDeps;
 }
 
+export interface MinimalCompareClient {
+  repos: {
+    compareCommits(input: Record<string, unknown>): Promise<{
+      data: { files?: { filename: string; status: string }[] };
+    }>;
+  };
+}
+
+export function buildCeScopeCompareAdapter(
+  client: MinimalCompareClient
+): CeScopeRecheckDeps['compare'] {
+  return async (owner, repo, base, head) => {
+    const data = (
+      await client.repos.compareCommits({ owner, repo, base, head, per_page: 100, page: 1 })
+    ).data;
+    if (!data.files) return { complete: false };
+    return { files: data.files, complete: data.files.length < 300 };
+  };
+}
+
 function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
   const client = createRealOctokitClient() as unknown as {
     pulls: {
@@ -117,23 +137,7 @@ function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
       (await client.pulls.get({ owner, repo, pull_number: number })).data,
     getBranchTip: async (owner, repo, branch) =>
       (await client.repos.getBranch({ owner, repo, branch })).data.commit.sha,
-    compare: async (
-      owner,
-      repo,
-      base,
-      head
-    ): Promise<{ files?: readonly { filename: string; status: string }[]; complete?: boolean }> => {
-      const files: { filename: string; status: string }[] = [];
-      for (let page = 1; ; page++) {
-        const data = (
-          await client.repos.compareCommits({ owner, repo, base, head, per_page: 100, page })
-        ).data;
-        if (!data.files) return { complete: false };
-        files.push(...data.files);
-        if (files.length >= 300) return { files, complete: false };
-        if (data.files.length < 100) return { files, complete: true };
-      }
-    },
+    compare: buildCeScopeCompareAdapter(client),
     listWorkflowRuns: async (
       owner,
       repo,
