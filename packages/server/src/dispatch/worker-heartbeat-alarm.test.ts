@@ -1,15 +1,55 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { DispatchWorker } from '@archon/core/db/dispatch';
+import { rootLogger } from '@archon/paths';
 import {
   evaluateWorkerHeartbeats,
+  postWorkerAlarmComment,
   runWorkerHeartbeatAlarm,
   type WorkerAlarmIssueComment,
   type WorkerHeartbeatAlarmDeps,
 } from './worker-heartbeat-alarm';
-import { tickDutyOfficerClock, type DutyOfficerClockDeps } from './duty-officer-clock';
+import {
+  tickDutyOfficerClock,
+  type DutyOfficerClockDeps,
+  type DutyOfficerStaleIssue,
+} from './duty-officer-clock';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
+
+// Capture NDJSON log lines emitted through the shared root Pino stream, so tests
+// can assert a specific event fired at a specific level. Mirrors the stream-spy
+// pattern in duty-officer-clock.test.ts. Child loggers created via
+// createLogger() write through this same stream, so alarm-module logs are seen.
+function captureLogLines(): { lines: string[]; restore: () => void } {
+  const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+    symbol => symbol.description === 'pino.stream'
+  )!;
+  const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+    streamSymbol
+  ];
+  const lines: string[] = [];
+  const write = spyOn(stream, 'write').mockImplementation(line => {
+    lines.push(line);
+  });
+  return { lines, restore: () => write.mockRestore() };
+}
+
+// Count captured log lines whose Pino `msg` matches `event` at the given numeric
+// level (error = 50, warn = 40). Non-JSON lines are ignored.
+function logCount(lines: string[], event: string, level: number): number {
+  return lines.filter(line => {
+    try {
+      const parsed = JSON.parse(line) as { msg?: unknown; level?: unknown };
+      return parsed.msg === event && parsed.level === level;
+    } catch {
+      return false;
+    }
+  }).length;
+}
+
+const ERROR_LEVEL = 50;
+const WARN_LEVEL = 40;
 
 function worker(workerId: string, lastHeartbeatMs: number): DispatchWorker {
   return {
@@ -253,5 +293,114 @@ describe('worker heartbeat alarm inside the Duty Officer tick', () => {
     // Next tick: C is still stale and the post now succeeds.
     await expect(tickDutyOfficerClock(deps)).resolves.toBeUndefined();
     expect(downCount(alarm.comments, 'C')).toBe(1);
+  });
+});
+
+// These tests exercise the REAL production posting path (postWorkerAlarmComment)
+// with global fetch stubbed, instead of the injected in-memory stub used above.
+// They prove the three contract guarantees Codex flagged as unverified: the path
+// never consults DUTY_OFFICER_GH_NUDGE, it enforces the repo allowlist, and it
+// fails closed (throws) when no GitHub token is present.
+const ALLOWED_ISSUE: DutyOfficerStaleIssue = {
+  owner: 'thinmansoftware',
+  repo: 'bdc-xo',
+  number: 2489,
+};
+
+describe('postWorkerAlarmComment (real GitHub posting path)', () => {
+  test('Test 6: posts_regardless_of_disabled_nudge_switch', async () => {
+    // DUTY_OFFICER_GH_NUDGE=false disables the Duty Officer nudge, but the alarm
+    // path must ignore that switch entirely and still POST.
+    process.env.DUTY_OFFICER_GH_NUDGE = 'false';
+    process.env.GITHUB_TOKEN = 'ghs_test';
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response(null, { status: 201 })
+    );
+    try {
+      await postWorkerAlarmComment(ALLOWED_ISSUE, 'body-under-test');
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe('https://api.github.com/repos/thinmansoftware/bdc-xo/issues/2489/comments');
+      expect(init.method).toBe('POST');
+      const headers = init.headers as Record<string, string>;
+      expect(headers.Authorization).toBe('Bearer ghs_test');
+      expect(JSON.parse(init.body as string)).toEqual({ body: 'body-under-test' });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test('Test 7: refuses_repo_outside_allowlist_without_posting', async () => {
+    process.env.GITHUB_TOKEN = 'ghs_test';
+    // Allowlist is derived from DUTY_OFFICER_GH_REPO (default thinmansoftware/bdc-xo).
+    const outsideIssue: DutyOfficerStaleIssue = { owner: 'evil', repo: 'nope', number: 1 };
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response(null, { status: 201 })
+    );
+    const captured = captureLogLines();
+    try {
+      // Resolves (does not throw) but never touches the network.
+      await expect(
+        postWorkerAlarmComment(outsideIssue, 'should-not-send')
+      ).resolves.toBeUndefined();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(logCount(captured.lines, 'worker_heartbeat_alarm_repo_refused', WARN_LEVEL)).toBe(1);
+    } finally {
+      captured.restore();
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test('Test 8: throws_when_no_github_token', async () => {
+    // No GH_TOKEN / GITHUB_TOKEN in env (afterEach clears them).
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response(null, { status: 201 })
+    );
+    try {
+      await expect(postWorkerAlarmComment(ALLOWED_ISSUE, 'body')).rejects.toThrow(
+        'worker_heartbeat_alarm_token_missing'
+      );
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test('Test 9: throws_on_non_ok_github_response', async () => {
+    process.env.GITHUB_TOKEN = 'ghs_test';
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response('forbidden', { status: 403 })
+    );
+    try {
+      await expect(postWorkerAlarmComment(ALLOWED_ISSUE, 'body')).rejects.toThrow(
+        'worker_heartbeat_alarm_http_403'
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+});
+
+describe('runWorkerHeartbeatAlarm token gate', () => {
+  test('Test 10: logs_no_token_error_each_tick_and_never_calls_deps', async () => {
+    // Enabled, watched worker set, issue in allowlist -- but NO token present.
+    // The alarm must fail loud (error-level log) on EVERY tick and must not touch
+    // the injected getWorker / listIssueComments / postAlarmComment deps.
+    process.env.DISPATCH_WORKER_ALARM_WORKERS = 'A';
+    const nowMs = Date.parse('2026-09-28T12:00:00.000Z');
+    const deps = alarmDeps({ workers: { A: worker('A', nowMs - 11 * MINUTE) }, now: () => nowMs });
+    const captured = captureLogLines();
+    try {
+      await runWorkerHeartbeatAlarm(deps);
+      await runWorkerHeartbeatAlarm(deps);
+      expect(logCount(captured.lines, 'worker_heartbeat_alarm_no_token', ERROR_LEVEL)).toBe(2);
+    } finally {
+      captured.restore();
+    }
+    expect(deps.getWorker).not.toHaveBeenCalled();
+    expect(deps.listIssueComments).not.toHaveBeenCalled();
+    expect(deps.postAlarmComment).not.toHaveBeenCalled();
+    expect(deps.comments.length).toBe(0);
   });
 });
