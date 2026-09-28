@@ -23,7 +23,7 @@ mock.module('openai', () => ({
   OpenAI: mockOpenAI,
 }));
 
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { GrokAgentProvider } from './provider';
@@ -198,6 +198,52 @@ describe('GrokAgentProvider', () => {
       ).toBe(false);
       const firstOptions = mockCreate.mock.calls[0]?.[1] as { signal?: AbortSignal } | undefined;
       expect(firstOptions?.signal).toBe(signal);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('read-only tool list rejects a model-requested write before execution', async () => {
+    process.env.GLM_API_KEY = 'test-key';
+    mockCreate.mockReset();
+    mockCreate.mockImplementation(async () => ({
+      model: 'moonshotai/kimi-k3',
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: 'call_write',
+                type: 'function',
+                function: {
+                  name: 'write_file',
+                  arguments: JSON.stringify({ path: 'proof.txt', content: 'changed' }),
+                },
+              },
+            ],
+          },
+        },
+      ],
+    }));
+
+    const cwd = mkdtempSync(join(tmpdir(), 'openrouter-readonly-'));
+    try {
+      const provider = new GrokAgentProvider();
+      await expect(async () => {
+        for await (const _chunk of provider.sendQuery('review', cwd, undefined, {
+          model: 'moonshotai/kimi-k3',
+          nodeConfig: { allowed_tools: ['read_file', 'list_dir'] },
+        })) {
+          // Drain until the provider rejects the prohibited tool call.
+        }
+      }).toThrow(/openrouter_tool_refused: write_file/);
+      expect(mockCreate).toHaveBeenCalledTimes(1);
+      const request = mockCreate.mock.calls[0]?.[0] as {
+        tools?: Array<{ function: { name: string } }>;
+      };
+      expect(request.tools?.map(tool => tool.function.name)).toEqual(['read_file', 'list_dir']);
+      expect(existsSync(join(cwd, 'proof.txt'))).toBe(false);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
