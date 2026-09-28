@@ -40,6 +40,7 @@ const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 // Hardcoded on purpose: a NEW lane that carries an evidence: manifest_v2
 // build-manifest must be added here AND given the evidence nodes.
 const EXPECTED_LANES = [
+  'bdc-feature-development-astra.yaml',
   'bdc-feature-development-codex-only.yaml',
   'bdc-feature-development-codex.yaml',
   'bdc-feature-development-cursor.yaml',

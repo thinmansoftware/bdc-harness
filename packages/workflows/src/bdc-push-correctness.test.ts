@@ -175,6 +175,7 @@ fi
 const DEFAULTS_DIR = join(import.meta.dir, '..', '..', '..', '.archon', 'workflows', 'defaults');
 const FEATURE_DEV_LANES = [
   join(DEFAULTS_DIR, 'bdc-feature-development.yaml'),
+  join(DEFAULTS_DIR, 'bdc-feature-development-astra.yaml'),
   join(DEFAULTS_DIR, 'bdc-feature-development-codex-only.yaml'),
   join(DEFAULTS_DIR, 'bdc-feature-development-codex.yaml'),
   join(DEFAULTS_DIR, 'bdc-feature-development-fable.yaml'),
@@ -662,6 +663,7 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
   it('verifies repair-target head repository identity in every feature-development lane', () => {
     const lanes = [
       'bdc-feature-development.yaml',
+      'bdc-feature-development-astra.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-fable.yaml',
@@ -673,7 +675,7 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
     ].map(file => join(DEFAULTS_DIR, file));
-    expect(lanes).toHaveLength(11);
+    expect(lanes).toHaveLength(12);
     for (const lane of lanes) {
       const yaml = readFileSync(lane, 'utf8');
       expect(yaml).toContain(
@@ -709,6 +711,7 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
   it('checks out the repair-target head before capture-run-scope and never rebases at push', () => {
     const lanes = [
       'bdc-feature-development.yaml',
+      'bdc-feature-development-astra.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-fable.yaml',
@@ -720,7 +723,7 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
     ].map(file => join(DEFAULTS_DIR, file));
-    expect(lanes).toHaveLength(11);
+    expect(lanes).toHaveLength(12);
     for (const lane of lanes) {
       const yaml = readFileSync(lane, 'utf8');
       const result = parseWorkflow(yaml, basename(lane));
