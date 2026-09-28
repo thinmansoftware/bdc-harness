@@ -489,6 +489,7 @@ export interface RepairRefireExecutionDeps {
   readonly executionClaim?: RepairRefireExecutionClaimDeps;
   /** Injected lower-case 64-hex SHA-256 over a canonical string. */
   readonly sha256hex: (input: string) => string;
+  readonly adapterName?: string;
 }
 
 const ADAPTER_NAME = 'fake-repair-refire';
@@ -604,7 +605,7 @@ export async function executeRepairRefire(
   const reservation = await deps.gate.reserveEffect({
     proposal_id: input.proposal_id,
     execution_id: input.execution_id,
-    adapter_name: ADAPTER_NAME,
+    adapter_name: deps.adapterName ?? ADAPTER_NAME,
   });
   if (!reservation.ok) {
     return record(

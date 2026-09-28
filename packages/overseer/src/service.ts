@@ -41,6 +41,7 @@ import { assessQualifiedMerge } from './actions/merge-ready';
 import { assertOverseerDefaultOff } from './integration-scenarios';
 import { createRealGitHubClientDeps } from './adapters/github-real-deps';
 import { runMergeExecutionBridgeOnce } from './merge-execution-bridge';
+import type { AutomaticRefireResult } from './actions/automatic-refire.ts';
 
 /**
  * Integrated S4-S7 assessment surface for Slice 8 wiring.
@@ -86,6 +87,21 @@ export interface OverseerServiceOptions {
   mergeBridgeIntervalMs?: number;
   mergeBridgeRun?: () => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
+  fireWorkflowRun?: (input: {
+    workflowName: string;
+    woId: string;
+    project: string;
+    predecessorRunId: string;
+  }) => Promise<unknown>;
+  countAutomaticAttempts?: (woId: string) => Promise<number>;
+  releaseTerminalWorktree?: (
+    record: WatchedRunRecord,
+    events: import('./types.ts').OverseerWorkflowEvent[]
+  ) => Promise<{ ok: boolean; reason?: string }>;
+  executeAutomaticRefire?: (
+    record: WatchedRunRecord,
+    events: import('./types.ts').OverseerWorkflowEvent[]
+  ) => Promise<AutomaticRefireResult>;
 }
 
 export async function runOperatorCardDeliveryScheduler(input: {
@@ -203,7 +219,8 @@ export async function handleRecord(
   deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
   dryRun: boolean,
   actor: string,
-  mergeCoordinator?: MergeReadyCoordinator
+  mergeCoordinator?: MergeReadyCoordinator,
+  executeAutomaticRefire?: OverseerServiceOptions['executeAutomaticRefire']
 ): Promise<void> {
   if (emergencyStopEngaged()) {
     log.warn({ runId: record.runId }, 'overseer.emergency_stop_engaged');
@@ -221,6 +238,7 @@ export async function handleRecord(
         actor,
         mergeCoordinator,
         verdictStore: defaultVerdictStore,
+        executeAutomaticRefire,
       });
     } catch (error) {
       log.error(
@@ -412,7 +430,15 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (options.signal?.aborted) coupledAbort.abort();
   const watcher = watchLoop(
     deps,
-    record => handleRecord(record, deps, dryRun, 'overseer-service', options.mergeCoordinator),
+    record =>
+      handleRecord(
+        record,
+        deps,
+        dryRun,
+        'overseer-service',
+        options.mergeCoordinator,
+        options.executeAutomaticRefire
+      ),
     {
       intervalMs: options.intervalMs,
       once: options.once,
