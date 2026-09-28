@@ -170,7 +170,8 @@ export async function recordScopeApproval(input: {
   return db.withTransaction(async query => {
     const at = await now(query, db);
     const auth = await authorize(query, input.principal, input.proof, at);
-    if (!auth.seatAllowed || !auth.valid) {
+    const lease = auth.lease;
+    if (!auth.seatAllowed || !auth.valid || !lease) {
       const reason = auth.seatAllowed ? 'stale_xo_lease_token' : 'seat_not_permitted';
       await append(query, {
         eventType: 'ce_scope_approval_rejected',
@@ -192,7 +193,7 @@ export async function recordScopeApproval(input: {
       authority: 'john',
       recorded_by_principal_id: input.principal.principal_id,
       recorded_by_seat: input.principal.seat_id,
-      xo_lease_id: auth.lease.lease_id,
+      xo_lease_id: lease.lease_id,
       xo_fencing_token: input.proof.fencing_token,
       conditions: input.conditions,
       evidence_url: input.evidence_url,
@@ -201,7 +202,7 @@ export async function recordScopeApproval(input: {
     const inserted = await append(query, {
       eventType: 'ce_scope_approval_recorded',
       principal: input.principal,
-      leaseId: auth.lease.lease_id,
+      leaseId: lease.lease_id,
       fencingToken: input.proof.fencing_token,
       subjectKey: subject,
       details: approval as unknown as Record<string, unknown>,
@@ -235,7 +236,8 @@ export async function revokeScopeApproval(input: {
   return db.withTransaction(async query => {
     const at = await now(query, db);
     const auth = await authorize(query, input.principal, input.proof, at);
-    if (!auth.seatAllowed || !auth.valid) {
+    const lease = auth.lease;
+    if (!auth.seatAllowed || !auth.valid || !lease) {
       const reason = auth.seatAllowed ? 'stale_xo_lease_token' : 'seat_not_permitted';
       await append(query, {
         eventType: 'ce_scope_approval_rejected',
@@ -256,7 +258,7 @@ export async function revokeScopeApproval(input: {
     const created = await append(query, {
       eventType: 'ce_scope_approval_revoked',
       principal: input.principal,
-      leaseId: auth.lease.lease_id,
+      leaseId: lease.lease_id,
       fencingToken: input.proof.fencing_token,
       subjectKey: `revoke:${input.approval_id}`,
       details: {
