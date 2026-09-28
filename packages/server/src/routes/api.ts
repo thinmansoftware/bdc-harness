@@ -4918,6 +4918,8 @@ export function registerApiRoutes(
           const runs = await actions.listWorkflowRunsForRepo({
             owner: owner,
             repo: repo,
+            // PR HEAD, not base: pull_request_target run objects carry the PR head sha
+            // (live-verified; packages/overseer/src/__tests__/fixtures/pull-request-target-run.live-2026-09-28.json).
             head_sha: result.approval.head_sha,
             event: 'pull_request_target',
             per_page: 100,

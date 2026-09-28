@@ -145,7 +145,9 @@ function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
     ): Promise<readonly import('./ce-scope-premerge-recheck').CeWorkflowRun[]> => {
       const all: import('./ce-scope-premerge-recheck').CeWorkflowRun[] = [];
       for (let page = 1; ; page++) {
-        const data = (
+        const data = // head_sha = PR HEAD is correct for pull_request_target runs: verified on the
+        // live API (see __tests__/fixtures/pull-request-target-run.live-2026-09-28.json).
+        (
           await client.actions.listWorkflowRunsForRepo({
             owner,
             repo,

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { ceScopePremergeRecheck, type CeScopeRecheckDeps } from '../ce-scope-premerge-recheck';
+import live from './fixtures/pull-request-target-run.live-2026-09-28.json';
 const S = '1'.repeat(40),
   B = '2'.repeat(40),
   started = '2026-09-28T10:00:00Z';
@@ -145,4 +146,64 @@ describe('CE scope premerge recheck', () => {
     expect(
       await check(deps({ compare: async () => ({ complete: true, files: wideFiles }) }))
     ).toEqual({ ok: true }));
+  test('live_api_pull_request_target_run_carries_pr_head_sha', () => {
+    // Verbatim live GitHub API data (see fixture _source). A pull_request_target
+    // run's head_sha is the PR HEAD, not the base; its check run sits on that head
+    // with the same check suite; pull_requests[] is empty, so association uses
+    // head_sha + head_branch.
+    expect(live.workflow_run.event).toBe('pull_request_target');
+    expect(live.workflow_run.head_sha).toBe(live.pull_request.head.sha);
+    expect(live.workflow_run.head_sha).not.toBe(live.pull_request.base.sha);
+    expect(live.workflow_run.head_branch).toBe(live.pull_request.head.ref);
+    expect(live.workflow_run.pull_requests).toEqual([]);
+    expect(live.check_runs_on_pr_head[0].head_sha).toBe(live.pull_request.head.sha);
+    expect(live.check_runs_on_pr_head[0].check_suite.id).toBe(live.workflow_run.check_suite_id);
+  });
+  test('live_api_shaped_gate_run_is_found_by_pr_head_lookup', async () => {
+    // Same field semantics as the live run; only the workflow path, name and
+    // conclusion are those of the scope gate.
+    const headSha = live.pull_request.head.sha;
+    const run = {
+      id: live.workflow_run.id,
+      path: '.github/workflows/ce-change-scope-gate.yml',
+      event: live.workflow_run.event,
+      head_sha: live.workflow_run.head_sha,
+      head_branch: live.workflow_run.head_branch,
+      run_started_at: live.workflow_run.run_started_at,
+      run_attempt: live.workflow_run.run_attempt,
+      conclusion: 'success',
+      check_suite_id: live.workflow_run.check_suite_id,
+    };
+    let queriedHead = '';
+    const result = await ceScopePremergeRecheck({
+      owner: 'thinmansoftware',
+      repo: 'lspro-react',
+      prNumber: live.pull_request.number,
+      deps: deps({
+        getPullRequest: async () => ({
+          state: live.pull_request.state,
+          number: live.pull_request.number,
+          head: live.pull_request.head,
+          base: { ref: live.pull_request.base.ref },
+        }),
+        getBranchTip: async () => live.pull_request.base.sha,
+        listWorkflowRuns: async (_o, _r, head) => {
+          queriedHead = head;
+          return head === run.head_sha ? [run] : [];
+        },
+        listCheckRuns: async (_o, _r, head) =>
+          head === headSha
+            ? [
+                {
+                  name: 'CE Change Scope Gate',
+                  conclusion: 'success',
+                  check_suite: { id: live.check_runs_on_pr_head[0].check_suite.id },
+                },
+              ]
+            : [],
+      }),
+    });
+    expect(queriedHead).toBe(headSha);
+    expect(result).toEqual({ ok: true });
+  });
 });
