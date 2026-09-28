@@ -33,6 +33,8 @@ import {
 } from './merge-repo-policy';
 import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
+import type { OverseerWorkflowEvent } from './types.ts';
+import { deriveReviewDecision, resolveReviewGateLogin } from './adapters/github-real-deps';
 
 const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
@@ -46,6 +48,7 @@ export interface MergeExecutionBridgeStore {
   claimVerdict(verdictId: string): Promise<boolean>;
   releaseVerdictClaim(verdictId: string, reason: string): Promise<boolean>;
   getRunById(runId: string): Promise<OverseerWatchRun | null>;
+  listRunEvents?(runId: string): Promise<OverseerWorkflowEvent[]>;
   reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
   releaseMergeSlot(verdictId: string): Promise<void>;
   recordOutcome(input: {
@@ -64,6 +67,8 @@ export interface MergeExecutionBridgeOptions {
   now?: () => Date;
   maxMergesPerHour?: number;
   repoConfig?: MergeExecutionRepoConfig;
+  reviewGateLogin?: string;
+  listRunEvents?: (runId: string) => Promise<OverseerWorkflowEvent[]>;
 }
 
 function configuredLimit(override?: number): number {
@@ -489,6 +494,44 @@ async function mergeClaimedVerdict(
   if (!basePolicy?.unattended) {
     await skip('integration_base_mismatch', pr.htmlUrl);
     return undefined;
+  }
+
+  const reviewGateLogin = options.reviewGateLogin ?? resolveReviewGateLogin();
+  if (!reviewGateLogin || !options.github.listPullRequestReviews) {
+    await skip('review_gate_reviews_unavailable', pr.htmlUrl);
+    return undefined;
+  }
+  let reviews: Awaited<ReturnType<NonNullable<GitHubClientDeps['listPullRequestReviews']>>>;
+  try {
+    reviews = await options.github.listPullRequestReviews(pr.pr);
+  } catch {
+    await skip('review_gate_reviews_lookup_failed', pr.htmlUrl);
+    return undefined;
+  }
+  if (deriveReviewDecision(reviews, { headSha: pr.headSha, reviewGateLogin }) !== 'APPROVED') {
+    await skip('review_gate_approval_missing_for_head', pr.htmlUrl);
+    return undefined;
+  }
+  if (!isRunlessVerdict(verdict)) {
+    const listRunEvents = options.listRunEvents ?? options.store.listRunEvents;
+    if (!listRunEvents) {
+      await skip('execution_evidence_unavailable', pr.htmlUrl);
+      return undefined;
+    }
+    try {
+      const events = await listRunEvents(verdict.run_id);
+      if (
+        !events.some(event =>
+          ['node_started', 'node_completed', 'node_failed'].includes(event.event_type)
+        )
+      ) {
+        await skip('execution_evidence_unavailable', pr.htmlUrl);
+        return undefined;
+      }
+    } catch {
+      await skip('execution_evidence_unavailable', pr.htmlUrl);
+      return undefined;
+    }
   }
 
   const now = (options.now ?? ((): Date => new Date()))();

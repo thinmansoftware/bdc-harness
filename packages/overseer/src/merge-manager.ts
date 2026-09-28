@@ -1,4 +1,5 @@
 import { createLogger } from '@archon/paths';
+import { deriveReviewDecision } from './adapters/github-real-deps';
 import {
   assembleQualifiedMergeEvidence,
   type AssembledQualifiedMergeEvidence,
@@ -597,13 +598,7 @@ async function mergePreconditionMiss(
   } catch {
     return 'review_gate_reviews_lookup_failed';
   }
-  const normalizedLogin = reviewGateLogin.toLowerCase();
-  return reviews.some(
-    review =>
-      review.login.toLowerCase() === normalizedLogin &&
-      review.state.toUpperCase() === 'APPROVED' &&
-      review.commitId === headSha
-  )
+  return deriveReviewDecision(reviews, { headSha, reviewGateLogin }) === 'APPROVED'
     ? null
     : 'review_gate_approval_missing_for_head';
 }

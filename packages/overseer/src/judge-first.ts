@@ -46,9 +46,7 @@ export const SEMANTIC_VERDICTS = [
 export type SemanticVerdict = (typeof SEMANTIC_VERDICTS)[number];
 
 export type JudgeHealthState =
-  | 'judge_unavailable'
-  | 'judge_invalid_output'
-  | 'evidence_unavailable';
+  'judge_unavailable' | 'judge_invalid_output' | 'evidence_unavailable';
 
 export interface JudgeEvidenceEnvelope {
   runId: string;
@@ -80,6 +78,11 @@ export interface JudgeEvidenceEnvelope {
    * compares PR createdAt against this window. Null when no event has a timestamp.
    */
   runWindow: { startedAt: string | null; endedAt: string | null };
+  reviewEvidence: {
+    status: 'approved' | 'blocked' | 'unavailable';
+    reason: string;
+  };
+  recordedExecutionEvidence: { present: boolean };
   /** Classifier output, demoted to advisory hint fields (binding term: no gate). */
   hint: { action: string; errorClass: string | null; reason: string };
   eventTail: { type: string; step: string | null; at: string; message: string }[];
@@ -172,7 +175,11 @@ function eventMessage(data: Record<string, unknown>): string {
  */
 export function buildEvidenceEnvelope(
   record: WatchedRunRecord,
-  events: OverseerWorkflowEvent[]
+  events: OverseerWorkflowEvent[],
+  extra: {
+    reviewEvidence?: JudgeEvidenceEnvelope['reviewEvidence'];
+    hasRecordedExecutionEvidence?: boolean;
+  } = {}
 ): JudgeEvidenceEnvelope {
   const tail = events.slice(-EVENT_TAIL_LIMIT).map(event => ({
     type: event.event_type,
@@ -205,6 +212,11 @@ export function buildEvidenceEnvelope(
       : (record.prEvidence.otherOpenPrsForWo ?? []).slice(0, 5),
     otherOpenPrsForWoLookupFailed: siblingLookupFailed,
     runWindow: runWindowFromEvents(events),
+    reviewEvidence: extra.reviewEvidence ?? {
+      status: 'unavailable',
+      reason: 'review_evidence_unavailable',
+    },
+    recordedExecutionEvidence: { present: extra.hasRecordedExecutionEvidence ?? false },
     hint: {
       action: record.action,
       errorClass: record.errorClass ?? null,
