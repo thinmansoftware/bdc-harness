@@ -263,7 +263,7 @@ export interface GitHubClientDeps {
   /** Reviews used by the Merge Manager's distinct Review Gate approval check. */
   listPullRequestReviews?(
     input: PullRequestRef
-  ): Promise<{ login: string; state: string; commitId: string }[]>;
+  ): Promise<{ login: string; state: string; commitId: string; submittedAt?: string }[]>;
   /**
    * Tier 0 comment_findings channel (judge-first path). Optional: when absent
    * the pipeline records a loud 'comment_channel_unavailable' receipt rather

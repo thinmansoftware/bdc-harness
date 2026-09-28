@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  createRealGitHubClientDeps,
   deriveReviewDecision,
   fetchAllPullRequestReviews,
   type RealGitHubOctokitLike,
@@ -53,6 +54,44 @@ describe('WO-HARNESS-BLOCKING-REVIEW-01 contract', () => {
         { headSha: head, reviewGateLogin: gate }
       )
     ).toBeNull();
+  });
+
+  test('Test 2a: the production GitHub dependency preserves chronology for downstream gates', async () => {
+    process.env.GH_TOKEN = 'test-token';
+    const octokit = {
+      pulls: {
+        listReviews: async () => ({
+          data: [
+            {
+              user: { login: gate },
+              state: 'CHANGES_REQUESTED',
+              commit_id: head,
+              submitted_at: '2026-09-28T00:00:00Z',
+            },
+            {
+              user: { login: gate },
+              state: 'APPROVED',
+              commit_id: head,
+              submitted_at: '2026-09-28T00:01:00Z',
+            },
+          ],
+        }),
+      },
+    } as unknown as RealGitHubOctokitLike;
+    const deps = createRealGitHubClientDeps(octokit);
+    const reviews = await deps.listPullRequestReviews?.({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 1,
+    });
+
+    expect(reviews?.map(item => item.submittedAt)).toEqual([
+      '2026-09-28T00:00:00Z',
+      '2026-09-28T00:01:00Z',
+    ]);
+    expect(deriveReviewDecision(reviews ?? [], { headSha: head, reviewGateLogin: gate })).toBe(
+      'APPROVED'
+    );
   });
 
   test('Test 3: complete pagination includes a page-two rejection', async () => {

@@ -1818,7 +1818,7 @@ export function createRealGitHubClientDeps(
     mergePullRequest: createRealMergePullRequest(createRealMergeOctokitClient()),
     listPullRequestReviews: async (
       input
-    ): Promise<{ login: string; state: string; commitId: string }[]> => {
+    ): Promise<{ login: string; state: string; commitId: string; submittedAt?: string }[]> => {
       const result = await fetchAllPullRequestReviews(octokit, {
         owner: input.owner,
         repo: input.repo,
@@ -1829,6 +1829,7 @@ export function createRealGitHubClientDeps(
         login: review.login,
         state: review.state,
         commitId: review.commitId ?? '',
+        submittedAt: review.submittedAt,
       }));
     },
     commentOnPullRequest: async (input): Promise<{ commented: boolean; url?: string }> => {
