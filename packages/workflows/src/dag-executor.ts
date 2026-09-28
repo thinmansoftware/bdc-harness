@@ -3862,16 +3862,16 @@ function buildLoopNodeOptions(
   }
   if (node.systemPrompt !== undefined) options.systemPrompt = node.systemPrompt;
   options.assistantConfig = config.assistants[provider] ?? {};
-  // Pass workflow-level options as nodeConfig so providers can apply them
-  if (workflowLevelOptions) {
-    options.nodeConfig = {
-      effort: workflowLevelOptions.effort,
-      thinking: workflowLevelOptions.thinking,
-      sandbox: workflowLevelOptions.sandbox,
-      betas: workflowLevelOptions.betas,
-      fallbackModel: workflowLevelOptions.fallbackModel,
-    };
-  }
+  // Loop nodes must carry the same tool boundary as single-shot AI nodes.
+  options.nodeConfig = {
+    allowed_tools: node.allowed_tools,
+    denied_tools: node.denied_tools,
+    effort: workflowLevelOptions?.effort,
+    thinking: workflowLevelOptions?.thinking,
+    sandbox: workflowLevelOptions?.sandbox,
+    betas: workflowLevelOptions?.betas,
+    fallbackModel: workflowLevelOptions?.fallbackModel,
+  };
   return options;
 }
 

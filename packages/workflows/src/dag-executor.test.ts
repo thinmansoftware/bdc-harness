@@ -507,6 +507,7 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
         nodes: [
           {
             id: 'plan-review',
+            allowed_tools: ['read_file', 'list_dir'],
             loop: {
               prompt: 'review the plan',
               until: 'PLAN_REVIEW_APPROVED',
@@ -539,6 +540,10 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
     );
 
     expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    const loopOptions = mockSendQueryDag.mock.calls[0]?.[3] as {
+      nodeConfig?: { allowed_tools?: string[] };
+    };
+    expect(loopOptions.nodeConfig?.allowed_tools).toEqual(['read_file', 'list_dir']);
     const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
       call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
     );
