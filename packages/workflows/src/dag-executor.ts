@@ -6127,8 +6127,22 @@ async function executeDagWorkflowInternal(
           // FATAL guard on the outer check below preserves the "FATAL is never
           // retried" invariant.
           let sdkContradictionRetryUsed = false;
+          let consumedNodeCostUsd = 0;
           sdkContradictionRetry: for (;;) {
             for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
+              const remainingBudgetUsd =
+                nodeOptions?.maxBudgetUsd !== undefined
+                  ? nodeOptions.maxBudgetUsd - consumedNodeCostUsd
+                  : undefined;
+              if (remainingBudgetUsd !== undefined && remainingBudgetUsd <= 0) {
+                output = {
+                  state: 'failed',
+                  output: '',
+                  error: 'openrouter_node_budget_reached_before_retry',
+                  costUsd: consumedNodeCostUsd,
+                };
+                break;
+              }
               output = await executeNodeInternal(
                 deps,
                 platform,
@@ -6137,7 +6151,9 @@ async function executeDagWorkflowInternal(
                 workflowRun,
                 node,
                 provider,
-                nodeOptions,
+                remainingBudgetUsd !== undefined
+                  ? { ...nodeOptions, maxBudgetUsd: remainingBudgetUsd }
+                  : nodeOptions,
                 declaredModelId,
                 artifactsDir,
                 logDir,
@@ -6152,6 +6168,8 @@ async function executeDagWorkflowInternal(
                 personaContextState
               );
 
+              if (output.costUsd !== undefined) consumedNodeCostUsd += output.costUsd;
+
               if (output.state !== 'failed') break;
 
               // Check if retryable.
@@ -6164,6 +6182,8 @@ async function executeDagWorkflowInternal(
                 ? output.error.startsWith('resource_exhausted_timeout')
                 : false;
               const isQuotaExhausted = output.quotaExhausted !== undefined;
+              const hasUnknownCost =
+                nodeOptions?.maxBudgetUsd !== undefined && output.costUsd === undefined;
               // SDK success-contradictions are NEVER retried by this transient
               // budget -- the outer `sdkContradictionRetry` loop grants them
               // exactly one whole-node re-run. Without this exclusion,
@@ -6177,6 +6197,7 @@ async function executeDagWorkflowInternal(
                 !isFatal &&
                 !isResourceExhaustedTimeout &&
                 !isQuotaExhausted &&
+                !hasUnknownCost &&
                 !isContradiction &&
                 (retryConfig.onError === 'all' ||
                   (retryConfig.onError === 'transient' && isTransient));
@@ -6227,6 +6248,7 @@ async function executeDagWorkflowInternal(
             }
             break;
           }
+          if (consumedNodeCostUsd > 0) output.costUsd = consumedNodeCostUsd;
 
           // AVAILABILITY failover (WO-HARNESS-NODE-PROVIDER-FAILOVER-01): the
           // primary provider (and any transient retries above) is exhausted and

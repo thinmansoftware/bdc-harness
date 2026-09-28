@@ -8139,6 +8139,96 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
   });
 
+  it('carries remaining loop budget into the next iteration', async () => {
+    let iteration = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      iteration += 1;
+      yield { type: 'assistant', content: iteration === 2 ? 'DONE' : 'working' };
+      yield { type: 'result', cost: iteration === 2 ? 0.1 : 0.3 };
+    });
+    const store = createMockStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-budget-loop',
+      testDir,
+      {
+        name: 'budget-loop-test',
+        nodes: [
+          {
+            id: 'iterative',
+            maxBudgetUsd: 0.5,
+            loop: { prompt: 'work', until: 'DONE', max_iterations: 2 },
+          },
+        ],
+      },
+      makeWorkflowRun('budget-loop-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(2);
+    const secondOptions = mockSendQueryDag.mock.calls[1]?.[3] as { maxBudgetUsd?: number };
+    expect(secondOptions.maxBudgetUsd).toBeCloseTo(0.2);
+  });
+
+  it('carries remaining node budget into a retry', async () => {
+    let attempt = 0;
+    const budgetedQuery = mock(function* () {
+      attempt += 1;
+      if (attempt === 1) {
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'rate_limit_error',
+          errors: ['429 rate limit reached; try again'],
+          cost: 0.06,
+        };
+      } else {
+        yield { type: 'assistant', content: 'COMPLETE' };
+        yield { type: 'result', cost: 0.01 };
+      }
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: budgetedQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    });
+    const store = createMockStore();
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-budget-retry',
+      testDir,
+      {
+        name: 'budget-retry-test',
+        nodes: [
+          {
+            id: 'investigate',
+            prompt: 'Investigate the issue',
+            maxBudgetUsd: 0.1,
+            retry: { max_attempts: 2, delay_ms: 1, on_error: 'all' },
+          },
+        ],
+      },
+      makeWorkflowRun('budget-retry-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    expect(budgetedQuery).toHaveBeenCalledTimes(2);
+    const secondOptions = budgetedQuery.mock.calls[1]?.[3] as { maxBudgetUsd?: number };
+    expect(secondOptions.maxBudgetUsd).toBeCloseTo(0.04);
+  });
+
   it('keeps real validator SDK errors with nonzero usage on the normal failure path', async () => {
     process.env.ARCHON_RESOURCE_EXHAUSTED_BACKOFF_MS = '1';
     process.env.ARCHON_RESOURCE_EXHAUSTED_MAX_WAIT_MS = '1000';
