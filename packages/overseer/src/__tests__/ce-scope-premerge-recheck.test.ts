@@ -65,6 +65,28 @@ describe('CE scope premerge recheck', () => {
     );
     expect(result).toEqual({ ok: false, reason: 'duplicate_gate_check' });
   });
+  test('legacy pull_request run authenticates its same-name check suite', async () => {
+    const base = deps();
+    const target = await base.listWorkflowRuns('', '', '');
+    const result = await check(
+      deps({
+        listWorkflowRuns: async () => [
+          ...target,
+          {
+            ...target[0]!,
+            id: 2,
+            event: 'pull_request',
+            check_suite_id: 11,
+          },
+        ],
+        listCheckRuns: async () => [
+          { name: 'CE Change Scope Gate', conclusion: 'success', check_suite: { id: 10 } },
+          { name: 'CE Change Scope Gate', conclusion: 'success', check_suite: { id: 11 } },
+        ],
+      })
+    );
+    expect(result).toEqual({ ok: true });
+  });
   test('premerge_recheck_refuses_green_older_than_revoke', async () =>
     expect(
       await check(

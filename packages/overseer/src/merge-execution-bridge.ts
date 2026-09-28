@@ -123,10 +123,16 @@ function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
       base,
       head
     ): Promise<{ files?: readonly { filename: string; status: string }[]; complete?: boolean }> => {
-      const data = (
-        await client.repos.compareCommits({ owner, repo, base, head, per_page: 100, page: 1 })
-      ).data;
-      return { files: data.files, complete: Boolean(data.files && data.files.length < 300) };
+      const files: { filename: string; status: string }[] = [];
+      for (let page = 1; ; page++) {
+        const data = (
+          await client.repos.compareCommits({ owner, repo, base, head, per_page: 100, page })
+        ).data;
+        if (!data.files) return { complete: false };
+        files.push(...data.files);
+        if (files.length >= 300) return { files, complete: false };
+        if (data.files.length < 100) return { files, complete: true };
+      }
     },
     listWorkflowRuns: async (
       owner,
@@ -140,7 +146,6 @@ function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
             owner,
             repo,
             head_sha: head,
-            event: 'pull_request_target',
             per_page: 100,
             page,
           })

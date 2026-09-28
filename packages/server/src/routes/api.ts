@@ -4897,6 +4897,7 @@ export function registerApiRoutes(
                   workflow_runs: {
                     id: number;
                     path?: string;
+                    head_sha?: string | null;
                     head_branch?: string | null;
                     run_started_at?: string | null;
                   }[];
@@ -4909,6 +4910,7 @@ export function registerApiRoutes(
         const workflowRuns: {
           id: number;
           path?: string;
+          head_sha?: string | null;
           head_branch?: string | null;
           run_started_at?: string | null;
         }[] = [];
@@ -4928,6 +4930,7 @@ export function registerApiRoutes(
           .filter(
             run =>
               run.path === '.github/workflows/ce-change-scope-gate.yml' &&
+              run.head_sha === result.approval.head_sha &&
               run.head_branch === pr.data.head.ref
           )
           .sort((a, b) => String(b.run_started_at).localeCompare(String(a.run_started_at)))[0];
@@ -4953,16 +4956,28 @@ export function registerApiRoutes(
     }
   });
 
-  registerOpenApiRoute(readScopeApprovalRoute, async c => {
-    try {
-      const url = new URL(c.req.url);
-      const query = scopeApprovalPublicReadQuerySchema.parse(Object.fromEntries(url.searchParams));
-      return c.json(await boardScopeApprovalDb.getScopeApprovalDecision(query));
-    } catch (error) {
-      getLog().error({ err: error }, 'board_scope_approval_read_failed');
-      return c.json({ decision: 'deny' as const, reason: 'server_error' as const }, 500);
+  app.openapi(
+    readScopeApprovalRoute,
+    async c => {
+      try {
+        const url = new URL(c.req.url);
+        const query = scopeApprovalPublicReadQuerySchema.parse(
+          Object.fromEntries(url.searchParams)
+        );
+        return c.json(await boardScopeApprovalDb.getScopeApprovalDecision(query));
+      } catch (error) {
+        if (error instanceof z.ZodError)
+          return c.json({ decision: 'deny' as const, reason: 'invalid_query' as const }, 400);
+        getLog().error({ err: error }, 'board_scope_approval_read_failed');
+        return c.json({ decision: 'deny' as const, reason: 'server_error' as const }, 500);
+      }
+    },
+    (result, c) => {
+      if (!result.success)
+        return c.json({ decision: 'deny' as const, reason: 'invalid_query' as const }, 400);
+      return undefined;
     }
-  });
+  );
 
   // =======================================================================
   // Execution claim handlers (M-27B)
