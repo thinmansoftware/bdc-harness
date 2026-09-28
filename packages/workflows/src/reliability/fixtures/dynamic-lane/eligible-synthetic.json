@@ -21,9 +21,9 @@
   "activeWriter": false, "cancellationAcknowledged": true,
   "candidates": [
     { "candidateId": "codex-plan", "provider": "codex", "model": "gpt-synthetic", "routerAccountId": "jev",
-      "workerAccountId": "codex", "registered": true, "capabilities": ["text"], "nextStepCost": 2, "family": "openai" },
+      "workerAccountId": "codex", "registered": true, "capabilities": ["text"], "nextStepCost": 2, "family": "openai", "familyMappingEvidence": { "family": "openai", "sourceRef": "registry:codex-plan", "availableAt": "2026-09-26T11:00:00.000Z" } },
     { "candidateId": "claude-plan", "provider": "claude", "model": "claude-synthetic", "routerAccountId": "jev",
-      "workerAccountId": "claude", "registered": true, "capabilities": ["text"], "nextStepCost": 2, "family": "anthropic" }
+      "workerAccountId": "claude", "registered": true, "capabilities": ["text"], "nextStepCost": 2, "family": "anthropic", "familyMappingEvidence": { "family": "anthropic", "sourceRef": "registry:claude-plan", "availableAt": "2026-09-26T11:00:00.000Z" } }
   ],
   "modelResolution": { "workflowProvider": "codex", "workflowModel": "gpt-synthetic", "operatorBinding": null },
   "accounts": [

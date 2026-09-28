@@ -96,7 +96,10 @@ const candidateSchema = z.object({
   registered: z.boolean(),
   capabilities: z.array(z.enum(['text', 'repositoryRead', 'repositoryWrite', 'shell'])),
   nextStepCost: finiteNonnegative.nullable(),
-  family: z.string().nullable(),
+  family: nonblank.nullable(),
+  familyMappingEvidence: z
+    .object({ family: nonblank, sourceRef: nonblank, availableAt: timestamp })
+    .nullable(),
 });
 
 const accountSchema = z.object({
@@ -147,7 +150,14 @@ const dynamicLaneSnapshotStructuralSchema = z.object({
   runId: nonblank,
   nodeId: nonblank,
   scopeId: nonblank,
-  aiRole: z.enum(['understand', 'plan', 'build', 'independent_review', 'verify', 'evidence_return']),
+  aiRole: z.enum([
+    'understand',
+    'plan',
+    'build',
+    'independent_review',
+    'verify',
+    'evidence_return',
+  ]),
   node: dagNodeSchema,
   authority: authoritySchema.nullable(),
   expectedAuthority: z.object({ runScopeSha: nonblank, headBranch: nonblank }),
@@ -158,7 +168,19 @@ const dynamicLaneSnapshotStructuralSchema = z.object({
   paused: z.boolean(),
   activeWriter: z.boolean(),
   cancellationAcknowledged: z.boolean(),
-  candidates: z.array(candidateSchema),
+  candidates: z.array(candidateSchema).superRefine((candidates, ctx) => {
+    const seen = new Set<string>();
+    candidates.forEach((candidate, index) => {
+      if (seen.has(candidate.candidateId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `duplicate candidateId: ${candidate.candidateId}`,
+          path: [index, 'candidateId'],
+        });
+      }
+      seen.add(candidate.candidateId);
+    });
+  }),
   modelResolution: z.object({
     workflowProvider: nonblank,
     workflowModel: z.string().optional(),
@@ -210,7 +232,8 @@ export type DynamicLaneSnapshot = Omit<
   z.infer<typeof dynamicLaneSnapshotStructuralSchema>,
   'jevExchange'
 > & { jevExchange?: JevExchange | null };
-export const dynamicLaneSnapshotSchema = dynamicLaneSnapshotStructuralSchema as unknown as z.ZodType<DynamicLaneSnapshot>;
+export const dynamicLaneSnapshotSchema =
+  dynamicLaneSnapshotStructuralSchema as unknown as z.ZodType<DynamicLaneSnapshot>;
 export type DynamicLaneDecision = 'propose' | 'wait' | 'abstain';
 export interface DynamicLaneReceipt {
   schemaVersion: 'dynamic-lane-receipt/v3';
@@ -250,7 +273,9 @@ export function canonicalDynamicLaneJson(value: unknown): string {
 }
 
 function hash(value: unknown): string {
-  return `sha256:${createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex')}`;
+  return `sha256:${createHash('sha256')
+    .update(JSON.stringify(canonical(value)))
+    .digest('hex')}`;
 }
 
 function atOrBefore(value: string, evaluationTime: string): boolean {
@@ -308,7 +333,8 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
   if (!objective?.text.trim()) globalReasons.push('role_objective_missing');
   if (!objective?.acceptanceCriteria.some(item => item.trim()))
     globalReasons.push('acceptance_criteria_missing');
-  if (objective && objective.role !== snapshot.aiRole) globalReasons.push('role_objective_mismatch');
+  if (objective && objective.role !== snapshot.aiRole)
+    globalReasons.push('role_objective_mismatch');
   if (!evidence) globalReasons.push('decision_evidence_missing');
   else if (evidence.version !== PACKET_VERSION) globalReasons.push('unsupported_evidence_version');
   else if (
@@ -324,7 +350,10 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
     globalReasons.push('future_evidence');
   for (const item of evidence?.items ?? []) {
     if (item.kind === 'later_outcome') globalReasons.push('later_outcome_evidence');
-    if (!atOrBefore(item.availableAt, snapshot.evaluationTime) || !atOrBefore(item.observedAt, snapshot.evaluationTime))
+    if (
+      !atOrBefore(item.availableAt, snapshot.evaluationTime) ||
+      !atOrBefore(item.observedAt, snapshot.evaluationTime)
+    )
       globalReasons.push('future_evidence');
     out.evidenceReferences.push(item.evidenceId);
   }
@@ -340,12 +369,16 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
   });
   const required = deriveNodeExecutionRequirements(snapshot.node);
   const accounts = new Map(snapshot.accounts.map(account => [account.accountId, account]));
-  const profiles = new Map((snapshot.candidateProfiles ?? []).map(profile => [profile.candidateId, profile]));
+  const profiles = new Map(
+    (snapshot.candidateProfiles ?? []).map(profile => [profile.candidateId, profile])
+  );
   const attempts = snapshot.providerAttempts.filter(
     attempt => attempt.runId === snapshot.runId && attempt.nodeId === snapshot.nodeId
   );
 
-  for (const candidate of [...snapshot.candidates].sort((a, b) => asciiCompare(a.candidateId, b.candidateId))) {
+  for (const candidate of [...snapshot.candidates].sort((a, b) =>
+    asciiCompare(a.candidateId, b.candidateId)
+  )) {
     const reasons = [...globalReasons];
     const profile = profiles.get(candidate.candidateId);
     if (!candidate.registered) reasons.push('provider_unregistered');
@@ -354,7 +387,11 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
     const binding = snapshot.modelResolution.operatorBinding;
     if (binding && (candidate.provider !== binding.provider || candidate.model !== binding.model))
       reasons.push('operator_binding_mismatch');
-    if (!binding && snapshot.modelResolution.nodeProvider && candidate.provider !== resolved.provider)
+    if (
+      !binding &&
+      snapshot.modelResolution.nodeProvider &&
+      candidate.provider !== resolved.provider
+    )
       reasons.push('resolved_provider_mismatch');
     if (!binding && snapshot.modelResolution.nodeModel && candidate.model !== resolved.model)
       reasons.push('resolved_model_mismatch');
@@ -371,32 +408,67 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
     else {
       const total = candidate.nextStepCost + snapshot.budget.routerCallAllowance;
       if (
-        snapshot.budget.spend + snapshot.budget.commitments +
-          snapshot.budget.verificationAllowance + total > snapshot.budget.limit
-      ) reasons.push('run_budget_exhausted');
+        snapshot.budget.spend +
+          snapshot.budget.commitments +
+          snapshot.budget.verificationAllowance +
+          total >
+        snapshot.budget.limit
+      )
+        reasons.push('run_budget_exhausted');
       const charges = new Map<string, number>();
       charges.set(candidate.routerAccountId, snapshot.budget.routerCallAllowance);
-      charges.set(candidate.workerAccountId, (charges.get(candidate.workerAccountId) ?? 0) + candidate.nextStepCost);
+      charges.set(
+        candidate.workerAccountId,
+        (charges.get(candidate.workerAccountId) ?? 0) + candidate.nextStepCost
+      );
       for (const [accountId, charge] of charges) {
         const account = accounts.get(accountId);
-        if (!account) { reasons.push(`account_missing:${accountId}`); continue; }
-        if (account.capacity !== 'healthy') reasons.push(`capacity_${account.capacity}:${accountId}`);
-        if (!account.observedAt || !account.expiresAt) reasons.push(`capacity_unknown:${accountId}`);
-        else if (!atOrBefore(account.observedAt, snapshot.evaluationTime)) reasons.push(`capacity_future:${accountId}`);
-        else if (Date.parse(snapshot.evaluationTime) >= Date.parse(account.expiresAt) ||
-          Date.parse(snapshot.evaluationTime) - Date.parse(account.observedAt) > snapshot.policy.maxCapacityAgeMs)
+        if (!account) {
+          reasons.push(`account_missing:${accountId}`);
+          continue;
+        }
+        if (account.capacity !== 'healthy')
+          reasons.push(`capacity_${account.capacity}:${accountId}`);
+        if (!account.observedAt || !account.expiresAt)
+          reasons.push(`capacity_unknown:${accountId}`);
+        else if (!atOrBefore(account.observedAt, snapshot.evaluationTime))
+          reasons.push(`capacity_future:${accountId}`);
+        else if (
+          Date.parse(snapshot.evaluationTime) >= Date.parse(account.expiresAt) ||
+          Date.parse(snapshot.evaluationTime) - Date.parse(account.observedAt) >
+            snapshot.policy.maxCapacityAgeMs
+        )
           reasons.push(`capacity_stale:${accountId}`);
-        if (account.spend + account.commitments + account.verificationAllowance + charge > account.limit)
+        if (
+          account.spend + account.commitments + account.verificationAllowance + charge >
+          account.limit
+        )
           reasons.push(`account_budget_exhausted:${accountId}`);
       }
     }
-    if (attempts.length >= snapshot.providerAttemptCeiling) reasons.push('provider_attempt_ceiling');
+    if (attempts.length >= snapshot.providerAttemptCeiling)
+      reasons.push('provider_attempt_ceiling');
     if (snapshot.aiRole === 'independent_review') {
-      if (!snapshot.currentArtifactHash || snapshot.currentArtifactHash !== snapshot.reviewTargetHash)
+      if (
+        !snapshot.currentArtifactHash ||
+        snapshot.currentArtifactHash !== snapshot.reviewTargetHash
+      )
         reasons.push('review_artifact_mismatch');
       if (!candidate.family) reasons.push('reviewer_family_unknown');
-      if (snapshot.contributingFamilies.some(item => !item.family)) reasons.push('contributor_family_unknown');
-      if (candidate.family && snapshot.contributingFamilies.some(item => item.family === candidate.family))
+      if (!candidate.familyMappingEvidence)
+        reasons.push('reviewer_family_mapping_evidence_missing');
+      else {
+        if (candidate.familyMappingEvidence.family !== candidate.family)
+          reasons.push('reviewer_family_mapping_mismatch');
+        if (!atOrBefore(candidate.familyMappingEvidence.availableAt, snapshot.evaluationTime))
+          reasons.push('future_reviewer_family_mapping');
+      }
+      if (snapshot.contributingFamilies.some(item => !item.family))
+        reasons.push('contributor_family_unknown');
+      if (
+        candidate.family &&
+        snapshot.contributingFamilies.some(item => item.family === candidate.family)
+      )
         reasons.push('review_family_overlap');
     }
     out.candidateRejections[candidate.candidateId] = [...new Set(reasons)].sort();
@@ -424,9 +496,15 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
   };
   out.requestHash = hash(request);
   const rawExchange: unknown = snapshot.jevExchange;
-  if (!rawExchange) { out.jevDisposition = 'missing_exchange'; return out; }
+  if (!rawExchange) {
+    out.jevDisposition = 'missing_exchange';
+    return out;
+  }
   const parsedExchange = jevExchangeSchema.safeParse(rawExchange);
-  if (!parsedExchange.success) { out.jevDisposition = 'malformed_exchange'; return out; }
+  if (!parsedExchange.success) {
+    out.jevDisposition = 'malformed_exchange';
+    return out;
+  }
   const exchange = parsedExchange.data;
   out.decisionOrigin = exchange.origin;
   out.returnedJevModel = exchange.returnedModel;
@@ -437,15 +515,24 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
   if (exchange.version !== QUESTION_VERSION) invalid.push('wrong_exchange_version');
   if (exchange.snapshotHash !== snapshotHash) invalid.push('wrong_snapshot');
   if (exchange.requestHash !== out.requestHash) invalid.push('wrong_request');
-  if (exchange.requestedModel !== snapshot.policy.requestedJevModel || exchange.returnedModel !== snapshot.policy.requestedJevModel)
+  if (
+    exchange.requestedModel !== snapshot.policy.requestedJevModel ||
+    exchange.returnedModel !== snapshot.policy.requestedJevModel
+  )
     invalid.push('wrong_jev_model');
   if (exchange.rubricVersion !== snapshot.policy.rubricVersion) invalid.push('wrong_rubric');
-  if (Date.parse(snapshot.evaluationTime) - Date.parse(exchange.decidedAt) > snapshot.policy.maxJevAgeMs || !atOrBefore(exchange.decidedAt, snapshot.evaluationTime))
+  if (
+    Date.parse(snapshot.evaluationTime) - Date.parse(exchange.decidedAt) >
+      snapshot.policy.maxJevAgeMs ||
+    !atOrBefore(exchange.decidedAt, snapshot.evaluationTime)
+  )
     invalid.push('stale_or_future_exchange');
   if (exchange.tied) invalid.push('tied');
-  if (exchange.vendorConfidence < snapshot.policy.minimumVendorConfidence) invalid.push('low_vendor_confidence');
+  if (exchange.vendorConfidence < snapshot.policy.minimumVendorConfidence)
+    invalid.push('low_vendor_confidence');
   if (exchange.abstain || exchange.choice === null) invalid.push('jev_abstained');
-  if (exchange.choice && !out.eligibleCandidateIds.includes(exchange.choice)) invalid.push('choice_not_eligible');
+  if (exchange.choice && !out.eligibleCandidateIds.includes(exchange.choice))
+    invalid.push('choice_not_eligible');
   const probability = exchange.choice ? exchange.distribution[exchange.choice] : undefined;
   if (probability === undefined || probability < snapshot.policy.minimumWinningProbability)
     invalid.push('low_winning_probability');
@@ -456,11 +543,17 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
   if (Math.abs(sum - 1) > 0.000001) invalid.push('invalid_distribution');
   const selected = snapshot.candidates.find(item => item.candidateId === exchange.choice);
   if (invalid.length || !selected) {
-    out.jevDisposition = [...new Set(invalid.length ? invalid : ['choice_not_found'])].sort().join(',');
+    out.jevDisposition = [...new Set(invalid.length ? invalid : ['choice_not_found'])]
+      .sort()
+      .join(',');
     return out;
   }
   out.decision = 'propose';
-  out.proposedBinding = { candidateId: selected.candidateId, provider: selected.provider, model: selected.model };
+  out.proposedBinding = {
+    candidateId: selected.candidateId,
+    provider: selected.provider,
+    model: selected.model,
+  };
   out.jevDisposition = 'accepted';
   return out;
 }

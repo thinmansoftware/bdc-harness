@@ -23,13 +23,16 @@ export async function replayDynamicLane(argv: string[]): Promise<number> {
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
       const path = issue?.path.join('.') || '<root>';
-      process.stderr.write(`dynamic-lane-replay: invalid envelope at ${path}: ${issue?.message ?? 'invalid input'}\n`);
+      process.stderr.write(
+        `dynamic-lane-replay: invalid envelope at ${path}: ${issue?.message ?? 'invalid input'}\n`
+      );
       return 2;
     }
     process.stdout.write(canonicalDynamicLaneJson(evaluateDynamicLane(parsed.data)));
     return 0;
   } catch (error) {
-    const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : 'read_failed';
+    const code =
+      error && typeof error === 'object' && 'code' in error ? String(error.code) : 'read_failed';
     process.stderr.write(`dynamic-lane-replay: unable to read input (${code})\n`);
     return 2;
   }
