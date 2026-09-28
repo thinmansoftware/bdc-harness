@@ -22,9 +22,13 @@ or live capacity data.
 
 For a structurally valid envelope, stdout contains exactly one canonical, single-line JSON receipt
 and a newline. The receipt is `dynamic-lane-receipt/v3` and includes the policy, snapshot and request
-hashes, sorted eligible candidates and rejections, decision, optional proposed binding, Jev origin
-and disposition, evidence references, distribution, usage/latency, and an explicitly `unissued`
-post-execution review. A valid wait or abstention exits 0 with empty stderr.
+hashes, the nullable offline-only `JevChoiceRequest`, sorted eligible candidates and rejections,
+decision, optional proposed binding, Jev origin and disposition, evidence references,
+distribution, usage/latency, and an explicitly `unissued` post-execution review. The request is the
+exact normalized value hashed by `requestHash`; it contains only eligible bindings plus abstain,
+sanitized effective account identifiers, sourced profiles, and code-computed capacity, cost, and
+budget facts. This local representation does not claim conformance with the live OpenRouter Jev
+wire schema. A valid wait or abstention exits 0 with empty stderr.
 
 Unreadable JSON and malformed required envelopes emit one deterministic
 `dynamic-lane-replay: ...` diagnostic to stderr, emit no stdout, and exit 2. Missing or invalid Jev
@@ -33,28 +37,39 @@ does not modify its input, create an output file, contact the network, call a pr
 capacity, execute a node, acquire a lease, or access a store/database.
 
 Identical input bytes with the same explicit evaluation time produce byte-identical receipt bytes.
-Capacity predicted reset times do not restore eligibility; a fresh healthy observation is required.
+The candidate allowlist is a required structural field. Only listed candidates can be eligible; an
+empty allowlist is valid but yields an evaluated abstention, while omission or duplicate entries are
+malformed. Task-brief and role-objective packet versions are explicit gates. Node identity must
+match the embedded node before resolver or capability evaluation. Duplicate account IDs and profile
+candidate IDs are rejected before lookup-map construction.
+
+Capacity predicted reset times do not restore eligibility; `resetAt` is informational and a fresh
+healthy observation is required. Verification allowance remains part of both run and applicable
+account budget calculations. Unknown contributor identity uses the existing `family: null` state;
+no new identity field is introduced.
 
 ## Scenario-to-fixture mapping
 
 `eligible-synthetic.json` is the sanitized base for scenarios 1-12. The evaluator test clones it and
-applies named, in-memory variants for: all six AI roles; cancellation/pause/dependencies; authority
-and capacity; budgets and account sharing; attempt ceiling; writer/cancellation acknowledgement;
-independent review; operator binding/capabilities; all Jev dispositions; availability/reset;
-future/expired evidence; and semantic/profile evidence. `malformed-envelope.json` covers structural
-CLI failure. Exact expected receipts are asserted in the tests rather than embedded self-referential
-Jev request hashes in fixtures.
+applies named, in-memory variants for: all six AI roles; allowlisting; duplicate identities; node
+identity; semantic-packet versions; cancellation/pause/dependencies; authority and capacity;
+separate router/worker budgets and verification allowance; attempt ceiling; writer/cancellation
+acknowledgement; independent review; operator binding/capabilities; all Jev dispositions;
+FuelGlass healthy/exhausted/stale/reset behavior; future/expired evidence; and profile completeness.
+`malformed-envelope.json` covers structural CLI failure. Exact request shapes, request hashes, and
+receipts are asserted in tests rather than embedded self-referential hashes in fixtures.
 
 ## Targeted verification
 
 ```bash
 bun test packages/workflows/src/reliability/dynamic-lane-admission.test.ts
-bun test scripts/replay-dynamic-lane.test.ts
+bun test ./scripts/replay-dynamic-lane.test.ts
 bun test packages/workflows/src/model-override.test.ts
 bun test packages/workflows/src/node-failover.test.ts
 bun run --filter @archon/workflows type-check
 bun x tsc --noEmit -p scripts/tsconfig.json
 bun run lint --max-warnings 0
+bun run format:check
 git diff --check
 ```
 

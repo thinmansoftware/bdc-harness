@@ -14,6 +14,8 @@ export const DYNAMIC_LANE_POLICY_VERSION = 'offline-jev-admission/v3' as const;
 const QUESTION_VERSION = 'jev-choice/v1';
 const PROFILE_VERSION = 'candidate-profile/v1';
 const PACKET_VERSION = 'decision-evidence/v1';
+const TASK_BRIEF_VERSION = 'task-brief/v1';
+const ROLE_OBJECTIVE_VERSION = 'role-objective/v1';
 const asciiCompare = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 const finiteNonnegative = z.number().finite().nonnegative();
@@ -144,6 +146,20 @@ const jevExchangeSchema = z.object({
   latencyMs: finiteNonnegative.nullable(),
 });
 
+const candidateAllowlistSchema = z.array(nonblank).superRefine((values, ctx) => {
+  const seen = new Set<string>();
+  values.forEach((value, index) => {
+    if (seen.has(value)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `duplicate candidateId: ${value}`,
+        path: [index],
+      });
+    }
+    seen.add(value);
+  });
+});
+
 const dynamicLaneSnapshotStructuralSchema = z.object({
   schemaVersion: z.literal(DYNAMIC_LANE_SCHEMA_VERSION),
   evaluationTime: timestamp,
@@ -168,6 +184,7 @@ const dynamicLaneSnapshotStructuralSchema = z.object({
   paused: z.boolean(),
   activeWriter: z.boolean(),
   cancellationAcknowledged: z.boolean(),
+  candidateAllowlist: candidateAllowlistSchema,
   candidates: z.array(candidateSchema).superRefine((candidates, ctx) => {
     const seen = new Set<string>();
     candidates.forEach((candidate, index) => {
@@ -190,7 +207,19 @@ const dynamicLaneSnapshotStructuralSchema = z.object({
     assistantModels: z.record(z.string()).optional(),
     operatorBinding: z.object({ provider: nonblank, model: nonblank }).nullable(),
   }),
-  accounts: z.array(accountSchema),
+  accounts: z.array(accountSchema).superRefine((accounts, ctx) => {
+    const seen = new Set<string>();
+    accounts.forEach((account, index) => {
+      if (seen.has(account.accountId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `duplicate accountId: ${account.accountId}`,
+          path: [index, 'accountId'],
+        });
+      }
+      seen.add(account.accountId);
+    });
+  }),
   budget: z.object({
     limit: finiteNonnegative,
     spend: finiteNonnegative,
@@ -215,7 +244,22 @@ const dynamicLaneSnapshotStructuralSchema = z.object({
       noPriorArtifactReason: z.string().nullable(),
     })
     .nullable(),
-  candidateProfiles: z.array(profileSchema).nullable(),
+  candidateProfiles: z
+    .array(profileSchema)
+    .superRefine((profiles, ctx) => {
+      const seen = new Set<string>();
+      profiles.forEach((profile, index) => {
+        if (seen.has(profile.candidateId)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `duplicate candidateId: ${profile.candidateId}`,
+            path: [index, 'candidateId'],
+          });
+        }
+        seen.add(profile.candidateId);
+      });
+    })
+    .nullable(),
   policy: z.object({
     maxCapacityAgeMs: finiteNonnegative,
     maxJevAgeMs: finiteNonnegative,
@@ -237,11 +281,46 @@ export type DynamicLaneSnapshot = Omit<
 export const dynamicLaneSnapshotSchema =
   dynamicLaneSnapshotStructuralSchema as unknown as z.ZodType<DynamicLaneSnapshot>;
 export type DynamicLaneDecision = 'propose' | 'wait' | 'abstain';
+type CandidateProfile = NonNullable<DynamicLaneSnapshot['candidateProfiles']>[number];
+export interface JevChoiceRequest {
+  questionVersion: typeof QUESTION_VERSION;
+  requestedModel: string;
+  snapshotHash: string;
+  instructions: string[];
+  state: {
+    runId: string;
+    nodeId: string;
+    scopeId: string;
+    aiRole: DynamicLaneSnapshot['aiRole'];
+    evaluationTime: string;
+  };
+  question: {
+    type: 'Choice';
+    prompt: string;
+    options: {
+      optionId: string;
+      candidateId: string | null;
+      criteria: string[];
+      binding: {
+        provider: string;
+        model: string;
+        routerAccountId: string;
+        workerAccountId: string;
+      } | null;
+      facts: Record<string, unknown> | null;
+      profile: CandidateProfile | null;
+    }[];
+  };
+  taskBrief: NonNullable<DynamicLaneSnapshot['taskBrief']>;
+  roleObjective: NonNullable<DynamicLaneSnapshot['roleObjective']>;
+  decisionEvidence: NonNullable<DynamicLaneSnapshot['decisionEvidence']>;
+}
 export interface DynamicLaneReceipt {
   schemaVersion: 'dynamic-lane-receipt/v3';
   policyVersion: typeof DYNAMIC_LANE_POLICY_VERSION;
   snapshotHash: string;
   requestHash: string | null;
+  request: JevChoiceRequest | null;
   eligibleCandidateIds: string[];
   decision: DynamicLaneDecision;
   proposedBinding: { candidateId: string; provider: string; model: string } | null;
@@ -280,6 +359,13 @@ function hash(value: unknown): string {
     .digest('hex')}`;
 }
 
+function requiredValue<T>(value: T | null | undefined, label: string): T {
+  if (value === null || value === undefined) {
+    throw new Error(`invariant violated: eligible request missing ${label}`);
+  }
+  return value;
+}
+
 function atOrBefore(value: string, evaluationTime: string): boolean {
   return Date.parse(value) <= Date.parse(evaluationTime);
 }
@@ -290,6 +376,7 @@ function receiptBase(snapshot: DynamicLaneSnapshot, snapshotHash: string): Dynam
     policyVersion: DYNAMIC_LANE_POLICY_VERSION,
     snapshotHash,
     requestHash: null,
+    request: null,
     eligibleCandidateIds: [],
     decision: 'abstain',
     proposedBinding: null,
@@ -316,6 +403,15 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
   const objective = snapshot.roleObjective;
   const evidence = snapshot.decisionEvidence;
 
+  if (snapshot.nodeId !== snapshot.node.id) {
+    for (const candidate of snapshot.candidates) {
+      out.candidateRejections[candidate.candidateId] = ['node_identity_mismatch'];
+    }
+    out.decision = 'wait';
+    out.jevDisposition = 'no_eligible_candidates';
+    return out;
+  }
+
   if (snapshot.cancelled) globalReasons.push('cancelled');
   if (snapshot.paused) globalReasons.push('paused_for_human');
   if (!snapshot.ready) globalReasons.push('step_not_ready');
@@ -332,7 +428,11 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
       globalReasons.push('authority_branch_mismatch');
   }
   if (!semantic?.text.trim()) globalReasons.push('task_brief_missing');
+  else if (semantic.version !== TASK_BRIEF_VERSION)
+    globalReasons.push('unsupported_task_brief_version');
   if (!objective?.text.trim()) globalReasons.push('role_objective_missing');
+  else if (objective.version !== ROLE_OBJECTIVE_VERSION)
+    globalReasons.push('unsupported_role_objective_version');
   if (!objective?.acceptanceCriteria.some(item => item.trim()))
     globalReasons.push('acceptance_criteria_missing');
   if (objective && objective.role !== snapshot.aiRole)
@@ -383,6 +483,8 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
   )) {
     const reasons = [...globalReasons];
     const profile = profiles.get(candidate.candidateId);
+    if (!snapshot.candidateAllowlist.includes(candidate.candidateId))
+      reasons.push('candidate_not_authorized');
     if (!candidate.registered) reasons.push('provider_unregistered');
     if (required.some(capability => !candidate.capabilities.includes(capability)))
       reasons.push('capability_mismatch');
@@ -400,6 +502,9 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
     if (!profile) reasons.push('candidate_profile_missing');
     else {
       if (profile.profileVersion !== PROFILE_VERSION) reasons.push('unsupported_profile_version');
+      if (profile.observations.length === 0) reasons.push('profile_observations_missing');
+      if (profile.sourceRefs.length === 0) reasons.push('profile_sources_missing');
+      if (profile.limitations.length === 0) reasons.push('profile_limitations_missing');
       if (!profile.applicableRoles.includes(snapshot.aiRole)) reasons.push('profile_role_mismatch');
       if (!atOrBefore(profile.availableAt, snapshot.evaluationTime)) reasons.push('future_profile');
       if (profile.observations.some(item => !atOrBefore(item.availableAt, snapshot.evaluationTime)))
@@ -492,16 +597,96 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
     return out;
   }
 
-  const request = {
+  const request: JevChoiceRequest = {
     questionVersion: QUESTION_VERSION,
-    snapshotHash,
     requestedModel: snapshot.policy.requestedJevModel,
-    options: [...out.eligibleCandidateIds, 'abstain'],
-    taskBrief: semantic,
-    roleObjective: objective,
-    decisionEvidence: evidence,
-    profiles: out.eligibleCandidateIds.map(id => profiles.get(id)),
+    snapshotHash,
+    instructions: [
+      'Choose exactly one eligible candidate or abstain.',
+      'Do not relax authorization, capability, capacity, budget, or binding constraints.',
+    ],
+    state: {
+      runId: snapshot.runId,
+      nodeId: snapshot.nodeId,
+      scopeId: snapshot.scopeId,
+      aiRole: snapshot.aiRole,
+      evaluationTime: snapshot.evaluationTime,
+    },
+    question: {
+      type: 'Choice',
+      prompt: 'Which eligible provider/model binding should execute this AI lane step?',
+      options: [
+        ...out.eligibleCandidateIds.map(candidateId => {
+          const candidate = requiredValue(
+            snapshot.candidates.find(item => item.candidateId === candidateId),
+            'candidate'
+          );
+          const router = requiredValue(accounts.get(candidate.routerAccountId), 'router account');
+          const worker = requiredValue(accounts.get(candidate.workerAccountId), 'worker account');
+          return {
+            optionId: candidateId,
+            candidateId,
+            criteria: ['eligible', 'authorized', 'capable', 'within_budget', 'fresh_capacity'],
+            binding: {
+              provider: candidate.provider,
+              model: candidate.model,
+              routerAccountId: candidate.routerAccountId,
+              workerAccountId: candidate.workerAccountId,
+            },
+            facts: {
+              nextStepCost: candidate.nextStepCost,
+              routerCallAllowance: snapshot.budget.routerCallAllowance,
+              runHeadroomBeforeStep:
+                snapshot.budget.limit -
+                snapshot.budget.spend -
+                snapshot.budget.commitments -
+                snapshot.budget.verificationAllowance,
+              runBudget: snapshot.budget,
+              routerAccount: {
+                accountId: router.accountId,
+                capacity: router.capacity,
+                observedAt: router.observedAt,
+                expiresAt: router.expiresAt,
+                limit: router.limit,
+                spend: router.spend,
+                commitments: router.commitments,
+                verificationAllowance: router.verificationAllowance,
+                headroomBeforeStep:
+                  router.limit - router.spend - router.commitments - router.verificationAllowance,
+                fresh: true,
+              },
+              workerAccount: {
+                accountId: worker.accountId,
+                capacity: worker.capacity,
+                observedAt: worker.observedAt,
+                expiresAt: worker.expiresAt,
+                limit: worker.limit,
+                spend: worker.spend,
+                commitments: worker.commitments,
+                verificationAllowance: worker.verificationAllowance,
+                headroomBeforeStep:
+                  worker.limit - worker.spend - worker.commitments - worker.verificationAllowance,
+                fresh: true,
+              },
+            },
+            profile: requiredValue(profiles.get(candidateId), 'candidate profile'),
+          };
+        }),
+        {
+          optionId: 'abstain',
+          candidateId: null,
+          criteria: ['insufficient_confidence_or_evidence'],
+          binding: null,
+          facts: null,
+          profile: null,
+        },
+      ],
+    },
+    taskBrief: requiredValue(semantic, 'task brief'),
+    roleObjective: requiredValue(objective, 'role objective'),
+    decisionEvidence: requiredValue(evidence, 'decision evidence'),
   };
+  out.request = request;
   out.requestHash = hash(request);
   const rawExchange: unknown = snapshot.jevExchange;
   if (!rawExchange) {

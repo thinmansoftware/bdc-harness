@@ -76,6 +76,27 @@ describe('replay-dynamic-lane CLI', () => {
     expect(JSON.parse(result.stdout).jevDisposition).toBe('malformed_exchange');
   });
 
+  test('unsupported semantic packet is a deterministic zero-exit abstention with no request', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dynamic-lane-'));
+    temporary.push(dir);
+    const input = JSON.parse(await readFile(fixture, 'utf8')) as Record<string, unknown>;
+    (input.taskBrief as Record<string, unknown>).version = 'task-brief/v999';
+    const path = join(dir, 'unsupported-version.json');
+    const bytes = `${JSON.stringify(input)}\n`;
+    await writeFile(path, bytes);
+    const first = await run(path, dir);
+    const second = await run(path, dir);
+    expect(first.exitCode).toBe(0);
+    expect(first.stderr).toBe('');
+    expect(first.stdout).toBe(second.stdout);
+    const receipt = JSON.parse(first.stdout);
+    expect(receipt.candidateRejections['codex-plan']).toContain('unsupported_task_brief_version');
+    expect(receipt.request).toBeNull();
+    expect(receipt.requestHash).toBeNull();
+    expect(await readFile(path, 'utf8')).toBe(bytes);
+    expect(await readdir(dir)).toEqual(['unsupported-version.json']);
+  });
+
   test('invalid JSON, unreadable input, and arguments are public deterministic errors', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'dynamic-lane-'));
     temporary.push(dir);

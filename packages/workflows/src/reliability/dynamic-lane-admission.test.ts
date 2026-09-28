@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import fixtureJson from './fixtures/dynamic-lane/eligible-synthetic.json';
 import {
   canonicalDynamicLaneJson,
@@ -42,6 +43,178 @@ function withAcceptedExchange(
 }
 
 describe('dynamic lane offline admission scenarios', () => {
+  test('explicit authorization admits only allowlisted candidates', () => {
+    const input = clone();
+    input.candidateAllowlist = ['codex-plan'];
+    const out = evaluateDynamicLane(input);
+    expect(out.eligibleCandidateIds).toEqual(['codex-plan']);
+    expect(out.candidateRejections['claude-plan']).toContain('candidate_not_authorized');
+    expect(out.request?.question.options.map(option => option.optionId)).toEqual([
+      'codex-plan',
+      'abstain',
+    ]);
+
+    input.candidateAllowlist = [];
+    const empty = evaluateDynamicLane(input);
+    expect(empty.eligibleCandidateIds).toEqual([]);
+    expect(empty.request).toBeNull();
+    expect(empty.requestHash).toBeNull();
+  });
+
+  test('authorization omission and duplicate authorization fail structural validation', () => {
+    const missing = structuredClone(fixtureJson) as Record<string, unknown>;
+    delete missing.candidateAllowlist;
+    expect(dynamicLaneSnapshotSchema.safeParse(missing).success).toBe(false);
+    const duplicate = structuredClone(fixtureJson);
+    duplicate.candidateAllowlist.push(duplicate.candidateAllowlist[0]!);
+    expect(dynamicLaneSnapshotSchema.safeParse(duplicate).success).toBe(false);
+  });
+
+  test('duplicate account and profile identities fail in both record orders', () => {
+    for (const reverse of [false, true]) {
+      const accounts = structuredClone(fixtureJson);
+      const conflictingAccount = { ...accounts.accounts[0]!, capacity: 'exhausted' as const };
+      accounts.accounts = reverse
+        ? [conflictingAccount, ...accounts.accounts]
+        : [...accounts.accounts, conflictingAccount];
+      expect(dynamicLaneSnapshotSchema.safeParse(accounts).success).toBe(false);
+
+      const profiles = structuredClone(fixtureJson);
+      const conflictingProfile = {
+        ...profiles.candidateProfiles[0]!,
+        applicableRoles: ['build'],
+      };
+      profiles.candidateProfiles = reverse
+        ? [conflictingProfile, ...profiles.candidateProfiles]
+        : [...profiles.candidateProfiles, conflictingProfile];
+      expect(dynamicLaneSnapshotSchema.safeParse(profiles).success).toBe(false);
+    }
+  });
+
+  test('node identity and semantic packet versions fail before request construction', () => {
+    const mismatch = clone();
+    mismatch.nodeId = 'different-node';
+    const mismatchOut = evaluateDynamicLane(mismatch);
+    expect(mismatchOut.candidateRejections['codex-plan']).toEqual(['node_identity_mismatch']);
+    expect(mismatchOut.request).toBeNull();
+
+    const task = clone();
+    task.taskBrief!.version = 'task-brief/v999';
+    expect(evaluateDynamicLane(task).candidateRejections['codex-plan']).toContain(
+      'unsupported_task_brief_version'
+    );
+    expect(evaluateDynamicLane(task).request).toBeNull();
+    const role = clone();
+    role.roleObjective!.version = 'role-objective/v999';
+    expect(evaluateDynamicLane(role).candidateRejections['codex-plan']).toContain(
+      'unsupported_role_objective_version'
+    );
+    expect(evaluateDynamicLane(role).request).toBeNull();
+  });
+
+  test('profiles require observations, sources, and limitations', () => {
+    for (const [field, reason] of [
+      ['observations', 'profile_observations_missing'],
+      ['sourceRefs', 'profile_sources_missing'],
+      ['limitations', 'profile_limitations_missing'],
+    ] as const) {
+      const input = clone();
+      input.candidateProfiles![0]![field] = [];
+      expect(evaluateDynamicLane(input).candidateRejections['codex-plan']).toContain(reason);
+    }
+    expect(evaluateDynamicLane(clone()).candidateRejections['codex-plan']).toEqual([]);
+  });
+
+  test('exposed offline Choice request is deterministic, sanitized, and hashes exactly', () => {
+    const first = evaluateDynamicLane(clone());
+    const second = evaluateDynamicLane(clone());
+    expect(first.request).toEqual(second.request);
+    expect(first.requestHash).toBe(second.requestHash);
+    expect(first.request?.question.type).toBe('Choice');
+    const requestBytes = canonicalDynamicLaneJson(first.request).trimEnd();
+    expect(first.requestHash).toBe(
+      `sha256:${createHash('sha256').update(requestBytes).digest('hex')}`
+    );
+    expect(first.request?.question.options.map(option => option.optionId)).toEqual([
+      'claude-plan',
+      'codex-plan',
+      'abstain',
+    ]);
+    const codex = first.request?.question.options.find(option => option.optionId === 'codex-plan');
+    expect(codex?.binding).toEqual({
+      provider: 'codex',
+      model: 'gpt-synthetic',
+      routerAccountId: 'jev',
+      workerAccountId: 'codex',
+    });
+    expect(codex?.facts).toMatchObject({
+      nextStepCost: 2,
+      routerCallAllowance: 1,
+      runBudget: { verificationAllowance: 2 },
+      routerAccount: { accountId: 'jev', capacity: 'healthy' },
+      workerAccount: { accountId: 'codex', capacity: 'healthy' },
+    });
+    const rebound = withAcceptedExchange(clone());
+    rebound.jevExchange!.requestHash = 'wrong';
+    expect(evaluateDynamicLane(rebound).jevDisposition).toContain('wrong_request');
+    const wrongRequested = withAcceptedExchange(clone());
+    wrongRequested.jevExchange!.requestedModel = 'wrong';
+    expect(evaluateDynamicLane(wrongRequested).jevDisposition).toContain('wrong_jev_model');
+    const wrongReturned = withAcceptedExchange(clone());
+    wrongReturned.jevExchange!.returnedModel = 'wrong';
+    expect(evaluateDynamicLane(wrongReturned).jevDisposition).toContain('wrong_jev_model');
+  });
+
+  test('verification allowance and FuelGlass freshness remain hard gates', () => {
+    const verification = clone();
+    verification.budget.limit = 5;
+    expect(evaluateDynamicLane(verification).candidateRejections['codex-plan']).toContain(
+      'run_budget_exhausted'
+    );
+    for (const resetAt of ['2026-09-26T11:00:00.000Z', '2026-09-26T13:00:00.000Z']) {
+      const stale = clone();
+      stale.accounts[1]!.capacity = 'exhausted';
+      stale.accounts[1]!.resetAt = resetAt;
+      expect(evaluateDynamicLane(stale).eligibleCandidateIds).not.toContain('codex-plan');
+    }
+    const healthy = clone();
+    healthy.accounts[1]!.capacity = 'healthy';
+    healthy.accounts[1]!.observedAt = '2026-09-26T11:59:30.000Z';
+    healthy.accounts[1]!.expiresAt = '2026-09-26T12:10:00.000Z';
+    expect(evaluateDynamicLane(healthy).eligibleCandidateIds).toContain('codex-plan');
+  });
+
+  test('independent review rejects unknown contributor identity and keeps verdict unissued', () => {
+    const input = clone();
+    input.aiRole = 'independent_review';
+    input.roleObjective!.role = 'independent_review';
+    input.candidateProfiles!.forEach(profile => profile.applicableRoles.push('independent_review'));
+    input.currentArtifactHash = input.reviewTargetHash = 'sha256:artifact';
+    input.contributingFamilies = [
+      {
+        family: null,
+        evidenceRef: 'fixture:unknown-served-identity',
+        availableAt: '2026-09-26T11:00:00.000Z',
+      },
+    ];
+    const out = evaluateDynamicLane(input);
+    expect(out.candidateRejections['codex-plan']).toContain('contributor_family_unknown');
+    expect(out.postExecutionReview).toBe('unissued');
+  });
+
+  test('router and worker account budgets are evaluated separately', () => {
+    const router = clone();
+    router.accounts[0]!.limit = 2;
+    expect(evaluateDynamicLane(router).candidateRejections['codex-plan']).toContain(
+      'account_budget_exhausted:jev'
+    );
+    const worker = clone();
+    worker.accounts[1]!.limit = 3;
+    expect(evaluateDynamicLane(worker).candidateRejections['codex-plan']).toContain(
+      'account_budget_exhausted:codex'
+    );
+  });
+
   test('1: every AI role deterministically accepts an eligible Jev choice', () => {
     for (const role of [
       'understand',
@@ -181,9 +354,7 @@ describe('dynamic lane offline admission scenarios', () => {
     ];
 
     const out = evaluateDynamicLane(input);
-    expect(out.candidateRejections['codex-plan']).toContain(
-      'future_contributor_family_mapping'
-    );
+    expect(out.candidateRejections['codex-plan']).toContain('future_contributor_family_mapping');
     expect(out.eligibleCandidateIds).not.toContain('codex-plan');
   });
 
