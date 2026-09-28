@@ -503,6 +503,77 @@ export class SqliteAdapter implements IDatabase {
     }
   }
 
+  private upgradeBoardAuditEvents(): void {
+    const row = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'board_audit_events'")
+      .get() as { sql?: string } | undefined;
+    if (!row?.sql) return;
+    const columns = this.db.prepare("PRAGMA table_info('board_audit_events')").all() as {
+      name: string;
+    }[];
+    const hasSubjectKey = columns.some(column => column.name === 'subject_key');
+    const requiredTypes = [
+      'execution_claim_authority_rejected',
+      'manual_initiation_recorded',
+      'ce_scope_approval_recorded',
+      'ce_scope_approval_revoked',
+      'ce_scope_approval_rejected',
+    ];
+    const tableSql = row.sql;
+    if (!hasSubjectKey || requiredTypes.some(type => !tableSql.includes(type))) {
+      this.db.run('BEGIN IMMEDIATE');
+      try {
+        const dependents = this.db
+          .prepare(
+            `SELECT name, sql FROM sqlite_master
+             WHERE tbl_name = 'board_audit_events' AND type IN ('index', 'trigger')
+               AND sql IS NOT NULL AND name != 'uq_board_audit_events_subject'
+             ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name`
+          )
+          .all() as { name: string; sql: string }[];
+        this.db.run(`CREATE TABLE board_audit_events_new (
+          id TEXT PRIMARY KEY,
+          event_type TEXT NOT NULL CHECK (event_type IN (
+            'xo_lease_acquired','xo_lease_acquire_rejected','xo_lease_renewed',
+            'xo_lease_renew_rejected','xo_lease_released','xo_lease_release_rejected',
+            'board_recipient_resolved','board_recipient_deferred','canonical_motion_frozen',
+            'canonical_approval_accepted','canonical_approval_rejected',
+            'motion_notification_enqueued','motion_notification_deduplicated',
+            'board_alias_resolved','board_petition_delivered',
+            'execution_claim_authority_rejected','manual_initiation_recorded',
+            'ce_scope_approval_recorded','ce_scope_approval_revoked','ce_scope_approval_rejected'
+          )),
+          actor_principal_id TEXT,
+          actor_seat_id TEXT CHECK (actor_seat_id IS NULL OR actor_seat_id IN ('john','general','xo')),
+          xo_lease_id TEXT,
+          xo_fencing_token INTEGER CHECK (xo_fencing_token IS NULL OR xo_fencing_token > 0),
+          motion_id TEXT, motion_revision_sha TEXT, details TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          subject_key TEXT
+        )`);
+        const subjectExpression = hasSubjectKey ? 'subject_key' : 'NULL';
+        this.db.run(`INSERT INTO board_audit_events_new
+          (id,event_type,actor_principal_id,actor_seat_id,xo_lease_id,xo_fencing_token,
+           motion_id,motion_revision_sha,details,created_at,subject_key)
+          SELECT id,event_type,actor_principal_id,actor_seat_id,xo_lease_id,xo_fencing_token,
+           motion_id,motion_revision_sha,details,created_at,${subjectExpression}
+          FROM board_audit_events`);
+        this.db.run('DROP TABLE board_audit_events');
+        this.db.run('ALTER TABLE board_audit_events_new RENAME TO board_audit_events');
+        for (const dependent of dependents) this.db.run(dependent.sql);
+        this.db.run(`CREATE UNIQUE INDEX uq_board_audit_events_subject
+          ON board_audit_events(event_type, subject_key) WHERE subject_key IS NOT NULL`);
+        this.db.run('COMMIT');
+      } catch (error) {
+        this.db.run('ROLLBACK');
+        throw error;
+      }
+    } else {
+      this.db.run(`CREATE UNIQUE INDEX IF NOT EXISTS uq_board_audit_events_subject
+        ON board_audit_events(event_type, subject_key) WHERE subject_key IS NOT NULL`);
+    }
+  }
+
   /**
    * Add columns to existing tables that predate newer schema additions.
    * SQLite's CREATE TABLE IF NOT EXISTS skips entirely for existing tables,
@@ -510,6 +581,7 @@ export class SqliteAdapter implements IDatabase {
    * the columns were added to createSchema().
    */
   private migrateColumns(): void {
+    this.upgradeBoardAuditEvents();
     // Migration 045: SQLite cannot alter CHECK constraints. Rebuild existing
     // four-verb journals transactionally before any fire_cauldron insert.
     const journalSchema = this.db
@@ -1609,7 +1681,10 @@ export class SqliteAdapter implements IDatabase {
             'board_alias_resolved',
             'board_petition_delivered',
             'execution_claim_authority_rejected',
-            'manual_initiation_recorded'
+            'manual_initiation_recorded',
+            'ce_scope_approval_recorded',
+            'ce_scope_approval_revoked',
+            'ce_scope_approval_rejected'
           )
         ),
         actor_principal_id TEXT,
@@ -1619,7 +1694,8 @@ export class SqliteAdapter implements IDatabase {
         motion_id TEXT,
         motion_revision_sha TEXT,
         details TEXT NOT NULL DEFAULT '{}',
-        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        subject_key TEXT
       );
 
       CREATE TRIGGER IF NOT EXISTS trg_board_audit_events_no_update

@@ -57,3 +57,78 @@ export const boardRecipientResponseSchema = z
     fencing_token: z.number().optional(),
   })
   .openapi('BoardRecipientResponse');
+
+const sha40Schema = z.string().regex(/^[0-9a-f]{40}$/i);
+const leaseProofShape = {
+  principal_token: z.string().min(1).optional(),
+  holder_id: z.string().min(1),
+  holder_token: z.string().min(1),
+  fencing_token: z.number().int().positive(),
+};
+
+export const scopeApprovalRecordBodySchema = z
+  .object({
+    ...leaseProofShape,
+    repo: z.string().min(1),
+    pr_number: z.number().int().positive(),
+    head_sha: sha40Schema,
+    conditions: z
+      .string()
+      .max(4000)
+      .refine(value => value.trim().length > 0),
+    evidence_url: z
+      .string()
+      .url()
+      .refine(value => value.startsWith('https://')),
+  })
+  .strict()
+  .openapi('ScopeApprovalRecordBody');
+
+export const scopeApprovalRevokeBodySchema = z
+  .object({
+    ...leaseProofShape,
+    reason: z
+      .string()
+      .max(4000)
+      .refine(value => value.trim().length > 0),
+  })
+  .strict()
+  .openapi('ScopeApprovalRevokeBody');
+
+export const scopeApprovalSchema = z.object({
+  approval_id: z.string(),
+  repo: z.string(),
+  pr_number: z.number(),
+  target_branch: z.string(),
+  head_sha: sha40Schema,
+  base_sha: sha40Schema,
+  authority: z.literal('john'),
+  recorded_by_principal_id: z.string(),
+  recorded_by_seat: boardSeatSchema,
+  xo_lease_id: z.string(),
+  xo_fencing_token: z.number(),
+  conditions: z.string(),
+  evidence_url: z.string(),
+  recorded_at: z.string(),
+});
+
+export const scopeApprovalResponseSchema = z.object({
+  approval: scopeApprovalSchema,
+  rerun: z.enum(['requested', 'unavailable', 'failed']).optional(),
+  credential_class: z.string().optional(),
+});
+
+export const scopeApprovalPublicReadQuerySchema = z.object({
+  repo: z.string().min(1),
+  pr_number: z.coerce.number().int().positive(),
+  head_sha: sha40Schema,
+  base_sha: sha40Schema,
+});
+
+export const scopeApprovalPublicReadResponseSchema = z.union([
+  z.object({ decision: z.literal('allow'), approval: scopeApprovalSchema }),
+  z.object({
+    decision: z.literal('deny'),
+    reason: z.enum(['no_record', 'revoked', 'empty_conditions', 'invalid_query', 'server_error']),
+  }),
+]);

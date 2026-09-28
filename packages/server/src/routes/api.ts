@@ -189,6 +189,8 @@ import * as messageDb from '@archon/core/db/messages';
 import * as dispatchDb from '@archon/core/db/dispatch';
 import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
 import * as boardAuthorityDb from '@archon/core/db/board-authority';
+import * as boardScopeApprovalDb from '@archon/core/db/board-scope-approvals';
+import { createRealOctokitClient } from '@archon/overseer/adapters/github-real-deps';
 import * as executionClaimsDb from '@archon/core/db/execution-claims';
 import * as mergeStewardDb from '@archon/core/db/merge-steward';
 import * as overseerBriefingDb from '@archon/core/db/overseer-briefing';
@@ -326,6 +328,11 @@ import {
   xoLeaseReleaseBodySchema,
   xoLeaseRenewBodySchema,
   xoLeaseSchema,
+  scopeApprovalRecordBodySchema,
+  scopeApprovalRevokeBodySchema,
+  scopeApprovalResponseSchema,
+  scopeApprovalPublicReadQuerySchema,
+  scopeApprovalPublicReadResponseSchema,
 } from './schemas/board-authority.schemas';
 import {
   acquireExecutionClaimBodySchema,
@@ -1054,6 +1061,82 @@ const boardRecipientRoute = createRoute({
       description: 'Board recipient resolution',
     },
     500: jsonError('Server error'),
+  },
+});
+
+const recordScopeApprovalRoute = createRoute({
+  method: 'post',
+  path: '/api/board/scope-approvals',
+  tags: ['Board Authority'],
+  summary: 'Record an exact-commit CE scope approval',
+  request: {
+    body: {
+      content: { 'application/json': { schema: scopeApprovalRecordBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: scopeApprovalResponseSchema } },
+      description: 'Existing approval',
+    },
+    201: {
+      content: { 'application/json': { schema: scopeApprovalResponseSchema } },
+      description: 'Approval recorded',
+    },
+    400: jsonError('Invalid request'),
+    401: jsonError('Principal rejected'),
+    403: jsonError('Seat not permitted'),
+    409: jsonError('Conflict'),
+    500: jsonError('Server error'),
+  },
+});
+
+const revokeScopeApprovalRoute = createRoute({
+  method: 'post',
+  path: '/api/board/scope-approvals/{approval_id}/revoke',
+  tags: ['Board Authority'],
+  summary: 'Revoke a CE scope approval',
+  request: {
+    params: z.object({ approval_id: z.string().min(1) }),
+    body: {
+      content: { 'application/json': { schema: scopeApprovalRevokeBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: scopeApprovalResponseSchema } },
+      description: 'Approval revoked',
+    },
+    400: jsonError('Invalid request'),
+    401: jsonError('Principal rejected'),
+    403: jsonError('Seat not permitted'),
+    404: jsonError('Approval not found'),
+    409: jsonError('Conflict'),
+    500: jsonError('Server error'),
+  },
+});
+
+const readScopeApprovalRoute = createRoute({
+  method: 'get',
+  path: '/api/public/board/scope-approvals',
+  tags: ['Board Authority'],
+  summary: 'Read an exact-commit CE scope approval decision',
+  request: { query: scopeApprovalPublicReadQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: scopeApprovalPublicReadResponseSchema } },
+      description: 'Decision',
+    },
+    400: {
+      content: { 'application/json': { schema: scopeApprovalPublicReadResponseSchema } },
+      description: 'Invalid query',
+    },
+    500: {
+      content: { 'application/json': { schema: scopeApprovalPublicReadResponseSchema } },
+      description: 'Store error',
+    },
   },
 });
 
@@ -4727,6 +4810,157 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'board_recipient_resolve_failed');
       return apiError(c, 500, 'Failed to resolve board recipient');
+    }
+  });
+
+  registerOpenApiRoute(recordScopeApprovalRoute, async c => {
+    try {
+      const body = getValidatedBody(c, scopeApprovalRecordBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
+      const octokit = createRealOctokitClient();
+      const result = await boardScopeApprovalDb.recordScopeApproval({
+        principal,
+        proof: body,
+        repo: body.repo,
+        pr_number: body.pr_number,
+        head_sha: body.head_sha,
+        conditions: body.conditions,
+        evidence_url: body.evidence_url,
+        github: {
+          getPullRequest: async (repo, prNumber) => {
+            const [owner, name] = repo.split('/');
+            const response = await octokit.pulls.get({
+              owner: owner,
+              repo: name,
+              pull_number: prNumber,
+            });
+            if (!response.data.head.ref || !response.data.base?.sha || !response.data.base.ref)
+              throw new Error('github_pr_facts_incomplete');
+            return {
+              state: response.data.state,
+              head: { sha: response.data.head.sha, ref: response.data.head.ref },
+              base: { sha: response.data.base.sha, ref: response.data.base.ref },
+            };
+          },
+        },
+      });
+      if (!result.ok) {
+        const status =
+          result.reason === 'seat_not_permitted'
+            ? 403
+            : result.reason === 'repo_not_allowed' || result.reason === 'invalid_request'
+              ? 400
+              : 409;
+        return apiError(c, status, result.reason);
+      }
+      return c.json({ approval: result.approval }, result.created ? 201 : 200);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'board_scope_approval_record_failed');
+      return apiError(c, 500, 'Failed to record scope approval');
+    }
+  });
+
+  registerOpenApiRoute(revokeScopeApprovalRoute, async c => {
+    try {
+      const body = getValidatedBody(c, scopeApprovalRevokeBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
+      const approvalId = c.req.param('approval_id');
+      if (!approvalId) return apiError(c, 400, 'invalid_approval_id');
+      const result = await boardScopeApprovalDb.revokeScopeApproval({
+        principal,
+        proof: body,
+        approval_id: approvalId,
+        reason: body.reason,
+      });
+      if (!result.ok) {
+        if (result.reason === 'invalid_request') return apiError(c, 400, result.reason);
+        if (result.reason === 'seat_not_permitted') return apiError(c, 403, result.reason);
+        if (result.reason === 'approval_not_found') return apiError(c, 404, result.reason);
+        return apiError(c, 409, result.reason);
+      }
+      let rerun: 'requested' | 'unavailable' | 'failed' = 'unavailable';
+      try {
+        const octokit = createRealOctokitClient();
+        const [owner, repo] = result.approval.repo.split('/');
+        const pr = await octokit.pulls.get({
+          owner: owner,
+          repo: repo,
+          pull_number: result.approval.pr_number,
+        });
+        if (!pr.data.head.ref) throw new Error('github_pr_head_ref_missing');
+        const actions = (
+          octokit as unknown as {
+            actions: {
+              listWorkflowRunsForRepo(input: Record<string, unknown>): Promise<{
+                data: {
+                  workflow_runs: {
+                    id: number;
+                    path?: string;
+                    head_branch?: string | null;
+                    run_started_at?: string | null;
+                  }[];
+                };
+              }>;
+              reRunWorkflow(input: Record<string, unknown>): Promise<unknown>;
+            };
+          }
+        ).actions;
+        const workflowRuns: {
+          id: number;
+          path?: string;
+          head_branch?: string | null;
+          run_started_at?: string | null;
+        }[] = [];
+        for (let page = 1; ; page++) {
+          const runs = await actions.listWorkflowRunsForRepo({
+            owner: owner,
+            repo: repo,
+            head_sha: result.approval.head_sha,
+            event: 'pull_request_target',
+            per_page: 100,
+            page,
+          });
+          workflowRuns.push(...runs.data.workflow_runs);
+          if (runs.data.workflow_runs.length < 100) break;
+        }
+        const trusted = workflowRuns
+          .filter(
+            run =>
+              run.path === '.github/workflows/ce-change-scope-gate.yml' &&
+              run.head_branch === pr.data.head.ref
+          )
+          .sort((a, b) => String(b.run_started_at).localeCompare(String(a.run_started_at)))[0];
+        if (trusted) {
+          await actions.reRunWorkflow({ owner: owner, repo: repo, run_id: trusted.id });
+          rerun = 'requested';
+        }
+      } catch (error) {
+        rerun =
+          typeof error === 'object' && error !== null && 'status' in error && error.status === 403
+            ? 'unavailable'
+            : 'failed';
+      }
+      return c.json({
+        approval: result.approval,
+        rerun,
+        credential_class: 'existing_github_credential',
+      });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'board_scope_approval_revoke_failed');
+      return apiError(c, 500, 'Failed to revoke scope approval');
+    }
+  });
+
+  registerOpenApiRoute(readScopeApprovalRoute, async c => {
+    try {
+      const url = new URL(c.req.url);
+      const query = scopeApprovalPublicReadQuerySchema.parse(Object.fromEntries(url.searchParams));
+      return c.json(await boardScopeApprovalDb.getScopeApprovalDecision(query));
+    } catch (error) {
+      getLog().error({ err: error }, 'board_scope_approval_read_failed');
+      return c.json({ decision: 'deny' as const, reason: 'server_error' as const }, 500);
     }
   });
 

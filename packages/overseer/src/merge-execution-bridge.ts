@@ -33,6 +33,16 @@ import {
 } from './merge-repo-policy';
 import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
+import { createRealOctokitClient } from './adapters/github-real-deps';
+import {
+  getScopeApprovalDecision,
+  getScopeApprovalMetadata,
+} from '@archon/core/db/board-scope-approvals';
+import {
+  ceScopePremergeRecheck,
+  CE_GATE_NAME,
+  type CeScopeRecheckDeps,
+} from './ce-scope-premerge-recheck';
 
 const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
@@ -64,6 +74,106 @@ export interface MergeExecutionBridgeOptions {
   now?: () => Date;
   maxMergesPerHour?: number;
   repoConfig?: MergeExecutionRepoConfig;
+  ceScopeRecheckDeps?: CeScopeRecheckDeps;
+}
+
+function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
+  const client = createRealOctokitClient() as unknown as {
+    pulls: {
+      get(input: Record<string, unknown>): Promise<{
+        data: {
+          number: number;
+          state: string;
+          head: { sha: string; ref: string };
+          base: { ref: string };
+        };
+      }>;
+    };
+    repos: {
+      getBranch(input: Record<string, unknown>): Promise<{ data: { commit: { sha: string } } }>;
+      compareCommits(
+        input: Record<string, unknown>
+      ): Promise<{ data: { files?: { filename: string; status: string }[] } }>;
+    };
+    actions: {
+      listWorkflowRunsForRepo(input: Record<string, unknown>): Promise<{
+        data: {
+          total_count: number;
+          workflow_runs: import('./ce-scope-premerge-recheck').CeWorkflowRun[];
+        };
+      }>;
+    };
+    checks: {
+      listForRef(input: Record<string, unknown>): Promise<{
+        data: {
+          total_count: number;
+          check_runs: import('./ce-scope-premerge-recheck').CeCheckRun[];
+        };
+      }>;
+    };
+  };
+  return {
+    getPullRequest: async (owner, repo, number) =>
+      (await client.pulls.get({ owner, repo, pull_number: number })).data,
+    getBranchTip: async (owner, repo, branch) =>
+      (await client.repos.getBranch({ owner, repo, branch })).data.commit.sha,
+    compare: async (
+      owner,
+      repo,
+      base,
+      head
+    ): Promise<{ files?: readonly { filename: string; status: string }[]; complete?: boolean }> => {
+      const data = (
+        await client.repos.compareCommits({ owner, repo, base, head, per_page: 100, page: 1 })
+      ).data;
+      return { files: data.files, complete: Boolean(data.files && data.files.length < 300) };
+    },
+    listWorkflowRuns: async (
+      owner,
+      repo,
+      head
+    ): Promise<readonly import('./ce-scope-premerge-recheck').CeWorkflowRun[]> => {
+      const all: import('./ce-scope-premerge-recheck').CeWorkflowRun[] = [];
+      for (let page = 1; ; page++) {
+        const data = (
+          await client.actions.listWorkflowRunsForRepo({
+            owner,
+            repo,
+            head_sha: head,
+            event: 'pull_request_target',
+            per_page: 100,
+            page,
+          })
+        ).data;
+        all.push(...data.workflow_runs);
+        if (all.length >= data.total_count || data.workflow_runs.length < 100) return all;
+      }
+    },
+    listCheckRuns: async (
+      owner,
+      repo,
+      head
+    ): Promise<readonly import('./ce-scope-premerge-recheck').CeCheckRun[]> => {
+      const all: import('./ce-scope-premerge-recheck').CeCheckRun[] = [];
+      for (let page = 1; ; page++) {
+        const data = (
+          await client.checks.listForRef({
+            owner,
+            repo,
+            ref: head,
+            check_name: CE_GATE_NAME,
+            filter: 'all',
+            per_page: 100,
+            page,
+          })
+        ).data;
+        all.push(...data.check_runs);
+        if (all.length >= data.total_count || data.check_runs.length < 100) return all;
+      }
+    },
+    getApproval: getScopeApprovalDecision,
+    getMetadata: getScopeApprovalMetadata,
+  };
 }
 
 function configuredLimit(override?: number): number {
@@ -489,6 +599,22 @@ async function mergeClaimedVerdict(
   if (!basePolicy?.unattended) {
     await skip('integration_base_mismatch', pr.htmlUrl);
     return undefined;
+  }
+
+  if (
+    `${pr.pr.owner}/${pr.pr.repo}`.toLowerCase() === 'thinmansoftware/lspro-react' &&
+    pr.baseBranch === 'release/ce'
+  ) {
+    const recheck = await ceScopePremergeRecheck({
+      owner: pr.pr.owner,
+      repo: pr.pr.repo,
+      prNumber: pr.pr.number,
+      deps: options.ceScopeRecheckDeps ?? productionCeScopeRecheckDeps(),
+    });
+    if (!recheck.ok) {
+      await skip(recheck.reason, pr.htmlUrl);
+      return undefined;
+    }
   }
 
   const now = (options.now ?? ((): Date => new Date()))();

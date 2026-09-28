@@ -1,0 +1,193 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { createHash } from 'crypto';
+import { unlinkSync } from 'fs';
+import { join } from 'path';
+import { SqliteAdapter } from './adapters/sqlite';
+import {
+  getScopeApprovalDecision,
+  recordScopeApproval,
+  revokeScopeApproval,
+} from './board-scope-approvals';
+
+const S = '1'.repeat(40),
+  B = '2'.repeat(40),
+  B2 = '3'.repeat(40);
+const principal = { principal_id: 'p', seat_id: 'xo' as const, roles: [] };
+const proof = { holder_id: 'h', holder_token: 't', fencing_token: 1 };
+let db: SqliteAdapter, path: string;
+const github = (base = B, head = S, state = 'open') => ({
+  getPullRequest: async () => ({
+    state,
+    head: { sha: head, ref: 'feature' },
+    base: { sha: base, ref: 'release/ce' },
+  }),
+});
+
+beforeEach(async () => {
+  path = join(import.meta.dir, `.scope-${crypto.randomUUID()}.db`);
+  db = new SqliteAdapter(path);
+  await db.query(
+    `INSERT INTO board_xo_leases
+    (id,lease_id,principal_id,seat_id,holder_id,holder_token_hash,fencing_token,acquired_at,expires_at)
+    VALUES (1,$1,$2,'xo',$3,$4,1,$5,$6)`,
+    [
+      'lease',
+      'p',
+      'h',
+      createHash('sha256').update('t').digest('hex'),
+      new Date().toISOString(),
+      '2999-01-01T00:00:00.000Z',
+    ]
+  );
+});
+afterEach(async () => {
+  await db.close();
+  for (const suffix of ['', '-wal', '-shm'])
+    try {
+      unlinkSync(path + suffix);
+    } catch {}
+});
+const record = (overrides: Record<string, unknown> = {}) =>
+  recordScopeApproval({
+    principal,
+    proof,
+    repo: 'thinmansoftware/lspro-react',
+    pr_number: 626,
+    head_sha: S,
+    conditions: 'keep safe',
+    evidence_url: 'https://example.test/e',
+    github: github(),
+    database: db,
+    ...overrides,
+  });
+
+describe('board scope approvals', () => {
+  test('record_valid_xo_holder_stamps_server_fields', async () => {
+    const result = await record();
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.created).toBe(true);
+      expect(result.approval.authority).toBe('john');
+      expect(result.approval.base_sha).toBe(B);
+    }
+  });
+  test('record_rejects_general_seat', async () => {
+    const result = await record({ principal: { ...principal, seat_id: 'general' } });
+    expect(result).toEqual({ ok: false, reason: 'seat_not_permitted' });
+  });
+  test('record_rejects_stale_or_wrong_lease_proof', async () => {
+    expect(await record({ proof: { ...proof, fencing_token: 2 } })).toEqual({
+      ok: false,
+      reason: 'stale_xo_lease_token',
+    });
+  });
+  test('record_authority_is_constant_john', async () => {
+    const result = await record();
+    if (!result.ok) throw new Error('record failed');
+    expect(result.approval.authority).toBe('john');
+    expect(result.approval.recorded_by_seat).toBe('xo');
+  });
+  test('record_rejects_moved_head_and_closed_pr', async () => {
+    expect(await record({ github: github(B, '4'.repeat(40)) })).toEqual({
+      ok: false,
+      reason: 'head_moved',
+    });
+    expect(await record({ github: github(B, S, 'closed') })).toEqual({
+      ok: false,
+      reason: 'pr_not_open',
+    });
+  });
+  test('record_rejects_repo_outside_allowlist', async () => {
+    expect(await record({ repo: 'thinmansoftware/shopops' })).toEqual({
+      ok: false,
+      reason: 'repo_not_allowed',
+    });
+  });
+  test('record_is_idempotent_and_not_rewritable', async () => {
+    const first = await record(),
+      second = await record({ conditions: 'different' });
+    if (!first.ok || !second.ok) throw new Error('record failed');
+    expect(second.created).toBe(false);
+    expect(second.approval.approval_id).toBe(first.approval.approval_id);
+    expect(second.approval.conditions).toBe('keep safe');
+  });
+  test('revoke_denies_subsequent_reads', async () => {
+    const made = await record();
+    if (!made.ok) throw new Error('record failed');
+    expect(
+      (
+        await revokeScopeApproval({
+          principal,
+          proof,
+          approval_id: made.approval.approval_id,
+          reason: 'withdrawn',
+          database: db,
+        })
+      ).ok
+    ).toBe(true);
+    expect(
+      await getScopeApprovalDecision({
+        repo: 'thinmansoftware/lspro-react',
+        pr_number: 626,
+        head_sha: S,
+        base_sha: B,
+        database: db,
+      })
+    ).toEqual({ decision: 'deny', reason: 'revoked' });
+  });
+  test('public_read_allows_only_exact_match', async () => {
+    await record();
+    expect(
+      (
+        await getScopeApprovalDecision({
+          repo: 'thinmansoftware/lspro-react',
+          pr_number: 626,
+          head_sha: S,
+          base_sha: B,
+          database: db,
+        })
+      ).decision
+    ).toBe('allow');
+    expect(
+      await getScopeApprovalDecision({
+        repo: 'thinmansoftware/lspro-react',
+        pr_number: 626,
+        head_sha: S,
+        base_sha: B2,
+        database: db,
+      })
+    ).toEqual({ decision: 'deny', reason: 'no_record' });
+  });
+  test('force_push_back_requires_unchanged_base', async () => {
+    await record();
+    expect(
+      (
+        await getScopeApprovalDecision({
+          repo: 'thinmansoftware/lspro-react',
+          pr_number: 626,
+          head_sha: S,
+          base_sha: B,
+          database: db,
+        })
+      ).decision
+    ).toBe('allow');
+    expect(
+      (
+        await getScopeApprovalDecision({
+          repo: 'thinmansoftware/lspro-react',
+          pr_number: 626,
+          head_sha: S,
+          base_sha: B2,
+          database: db,
+        })
+      ).decision
+    ).toBe('deny');
+  });
+  test('reapproval_after_base_advance_creates_new_record', async () => {
+    const one = await record(),
+      two = await record({ github: github(B2) });
+    if (!one.ok || !two.ok) throw new Error('record failed');
+    expect(two.created).toBe(true);
+    expect(two.approval.approval_id).not.toBe(one.approval.approval_id);
+  });
+});
