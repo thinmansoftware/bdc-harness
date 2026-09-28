@@ -344,7 +344,15 @@ export async function handleRecordJudgeFirst(
     return;
   }
 
-  const events = await deps.listRunEvents(record.runId);
+  let events: OverseerWorkflowEvent[] = [];
+  let executionEvidenceLookupFailed = false;
+  try {
+    events = await deps.listRunEvents(record.runId);
+  } catch {
+    // The claim is already durable. Finalize it fail-closed rather than leaving
+    // an in-flight verdict that can neither retire nor safely authorize work.
+    executionEvidenceLookupFailed = true;
+  }
   const hasRecordedExecutionEvidence = events.some(event =>
     EXECUTION_EVENT_TYPES.has(event.event_type)
   );
@@ -455,7 +463,15 @@ export async function handleRecordJudgeFirst(
   const unsafeMergeProposal =
     (outcome.proposedAction === 'flag_merge_ready' || outcome.verdict === 'merge_candidate') &&
     (reviewEvidence.status !== 'approved' || (!genuineDiscovery && !hasRecordedExecutionEvidence));
-  const safeOutcome = unsafeMergeProposal
+  const safeOutcome = executionEvidenceLookupFailed
+    ? {
+        ...outcome,
+        verdict: 'observe' as const,
+        proposedAction: 'none',
+        proposedTier: 0,
+        reason: 'execution_evidence_unavailable',
+      }
+    : unsafeMergeProposal
     ? {
         ...outcome,
         verdict: 'observe' as const,

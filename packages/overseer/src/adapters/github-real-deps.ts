@@ -218,7 +218,12 @@ export interface RealGitHubOctokitLike {
        */
       page?: number;
     }): Promise<{
-      data: { user: { login?: string | null } | null; state: string; commit_id: string }[];
+      data: {
+        user: { login?: string | null } | null;
+        state: string;
+        commit_id: string;
+        submitted_at?: string | null;
+      }[];
     }>;
   };
   /**
@@ -1221,6 +1226,8 @@ export interface ReviewForDecision {
   readonly login: string;
   readonly state: string;
   readonly commitId?: string;
+  /** GitHub submission time. Required to order a reviewer's state transitions safely. */
+  readonly submittedAt?: string;
 }
 
 export interface DeriveReviewDecisionOptions {
@@ -1283,17 +1290,46 @@ export function deriveReviewDecision(
   reviews: readonly ReviewForDecision[],
   options: DeriveReviewDecisionOptions = {}
 ): string | null {
-  const latestByReviewer = new Map<string, ReviewForDecision>();
+  const byReviewer = new Map<string, ReviewForDecision[]>();
   for (const review of reviews) {
     const state = review.state.toUpperCase();
     // COMMENTED and PENDING never replace a reviewer's standing verdict --
     // that is GitHub's own rule, and collapsing them would silently clear a
     // CHANGES_REQUESTED when the same reviewer later left a plain comment.
     if (state !== 'APPROVED' && state !== 'CHANGES_REQUESTED' && state !== 'DISMISSED') continue;
-    latestByReviewer.set(review.login.toLowerCase(), { ...review, state });
+    const login = review.login.toLowerCase();
+    const reviewerReviews = byReviewer.get(login) ?? [];
+    reviewerReviews.push({ ...review, state });
+    byReviewer.set(login, reviewerReviews);
   }
 
-  const latest = [...latestByReviewer.values()];
+  const latest = [...byReviewer.values()].map(reviewerReviews => {
+    const timestamps = reviewerReviews.map(review => {
+      const timestamp = review.submittedAt ? Date.parse(review.submittedAt) : Number.NaN;
+      return { review, timestamp };
+    });
+    if (timestamps.every(entry => Number.isFinite(entry.timestamp))) {
+      const newest = Math.max(...timestamps.map(entry => entry.timestamp));
+      const tied = timestamps
+        .filter(entry => entry.timestamp === newest)
+        .map(entry => entry.review);
+      // Equal timestamps do not establish which transition was later. Resolve
+      // the ambiguity toward the state that cannot authorize a merge.
+      return (
+        tied.find(review => review.state === 'CHANGES_REQUESTED') ??
+        tied.find(review => review.state === 'DISMISSED') ??
+        tied[0]!
+      );
+    }
+
+    // Array order is not an API contract. If chronology is absent or only
+    // partially known, contradictory states are ambiguous and must fail closed.
+    return (
+      reviewerReviews.find(review => review.state === 'CHANGES_REQUESTED') ??
+      reviewerReviews.find(review => review.state === 'DISMISSED') ??
+      reviewerReviews[0]!
+    );
+  });
 
   // A standing objection blocks even on an incomplete read: seeing one is
   // proof, unlike not seeing one.
@@ -1336,7 +1372,9 @@ interface GraphQLReviewDecisionNode {
 
 /** Why GitHub's aggregate review decision was not usable for a sweep. */
 export type ReviewDecisionUnavailableReason =
-  'graphql_client_absent' | 'graphql_error' | 'graphql_empty_response';
+  | 'graphql_client_absent'
+  | 'graphql_error'
+  | 'graphql_empty_response';
 
 export interface ReviewDecisionLookup {
   /**
@@ -1529,6 +1567,7 @@ export async function fetchAllPullRequestReviews(
         login: review.user?.login ?? '',
         state: review.state,
         commitId: review.commit_id,
+        submittedAt: review.submitted_at ?? undefined,
       });
     }
     // A short page is the last page.

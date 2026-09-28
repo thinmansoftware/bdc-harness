@@ -46,7 +46,9 @@ export const SEMANTIC_VERDICTS = [
 export type SemanticVerdict = (typeof SEMANTIC_VERDICTS)[number];
 
 export type JudgeHealthState =
-  'judge_unavailable' | 'judge_invalid_output' | 'evidence_unavailable';
+  | 'judge_unavailable'
+  | 'judge_invalid_output'
+  | 'evidence_unavailable';
 
 export interface JudgeEvidenceEnvelope {
   runId: string;

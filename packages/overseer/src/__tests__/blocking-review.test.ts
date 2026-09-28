@@ -10,30 +10,48 @@ import type { OverseerWorkflowEvent, WatchedRunRecord } from '../types.ts';
 
 const head = 'head-sha';
 const gate = 'review-gate';
-const review = (state: string, login = gate, commitId = head) => ({ login, state, commitId });
+const review = (
+  state: string,
+  login = gate,
+  commitId = head,
+  submittedAt = '2026-09-28T00:00:00Z'
+) => ({ login, state, commitId, submittedAt });
 
 describe('WO-HARNESS-BLOCKING-REVIEW-01 contract', () => {
   test('Test 1: a later rejection and later comments preserve the standing objection', () => {
     expect(
-      deriveReviewDecision([review('APPROVED'), review('CHANGES_REQUESTED'), review('COMMENTED')], {
-        headSha: head,
-        reviewGateLogin: gate,
-      })
+      deriveReviewDecision(
+        [
+          review('APPROVED', gate, head, '2026-09-28T00:00:00Z'),
+          review('CHANGES_REQUESTED', gate, head, '2026-09-28T00:01:00Z'),
+          review('COMMENTED', gate, head, '2026-09-28T00:02:00Z'),
+        ],
+        {
+          headSha: head,
+          reviewGateLogin: gate,
+        }
+      )
     ).toBe('CHANGES_REQUESTED');
   });
 
   test('Test 2: same-reviewer approval supersedes rejection while dismissal removes approval', () => {
     expect(
-      deriveReviewDecision([review('CHANGES_REQUESTED'), review('APPROVED')], {
-        headSha: head,
-        reviewGateLogin: gate,
-      })
+      deriveReviewDecision(
+        [
+          review('APPROVED', gate, head, '2026-09-28T00:01:00Z'),
+          review('CHANGES_REQUESTED', gate, head, '2026-09-28T00:00:00Z'),
+        ],
+        { headSha: head, reviewGateLogin: gate }
+      )
     ).toBe('APPROVED');
     expect(
-      deriveReviewDecision([review('APPROVED'), review('DISMISSED')], {
-        headSha: head,
-        reviewGateLogin: gate,
-      })
+      deriveReviewDecision(
+        [
+          review('DISMISSED', gate, head, '2026-09-28T00:01:00Z'),
+          review('APPROVED', gate, head, '2026-09-28T00:00:00Z'),
+        ],
+        { headSha: head, reviewGateLogin: gate }
+      )
     ).toBeNull();
   });
 
@@ -42,6 +60,7 @@ describe('WO-HARNESS-BLOCKING-REVIEW-01 contract', () => {
       user: { login: gate },
       state: 'APPROVED',
       commit_id: head,
+      submitted_at: '2026-09-28T00:00:00Z',
     }));
     const octokit = {
       pulls: {
@@ -49,7 +68,14 @@ describe('WO-HARNESS-BLOCKING-REVIEW-01 contract', () => {
           data:
             page === 1
               ? first
-              : [{ user: { login: gate }, state: 'CHANGES_REQUESTED', commit_id: head }],
+              : [
+                  {
+                    user: { login: gate },
+                    state: 'CHANGES_REQUESTED',
+                    commit_id: head,
+                    submitted_at: '2026-09-28T00:01:00Z',
+                  },
+                ],
         }),
       },
     } as unknown as RealGitHubOctokitLike;
@@ -127,6 +153,30 @@ describe('WO-HARNESS-BLOCKING-REVIEW-01 contract', () => {
         reviewGateLogin: gate,
       })
     ).toBeNull();
+  });
+
+  test('Test 11: reversed API order uses submission chronology', () => {
+    expect(
+      deriveReviewDecision(
+        [
+          review('APPROVED', gate, head, '2026-09-28T00:00:00Z'),
+          review('CHANGES_REQUESTED', gate, head, '2026-09-28T00:01:00Z'),
+        ].reverse(),
+        { headSha: head, reviewGateLogin: gate }
+      )
+    ).toBe('CHANGES_REQUESTED');
+  });
+
+  test('Test 12: ambiguous chronology cannot let approval supersede rejection', () => {
+    expect(
+      deriveReviewDecision(
+        [
+          { login: gate, state: 'CHANGES_REQUESTED', commitId: head },
+          { login: gate, state: 'APPROVED', commitId: head },
+        ],
+        { headSha: head, reviewGateLogin: gate }
+      )
+    ).toBe('CHANGES_REQUESTED');
   });
 });
 

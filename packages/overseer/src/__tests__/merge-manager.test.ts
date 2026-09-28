@@ -539,6 +539,31 @@ describe('merge manager', () => {
       expect(mergePullRequest).not.toHaveBeenCalled();
     });
 
+    test('denies when a later rejection is returned before an older approval', async () => {
+      const { manager, mergePullRequest } = activatedManager({
+        reviews: [
+          {
+            login: 'thinman-review-gate[bot]',
+            state: 'CHANGES_REQUESTED',
+            commitId: RUN_HEAD_SHA,
+            submittedAt: '2026-09-28T00:01:00Z',
+          },
+          {
+            login: 'thinman-review-gate[bot]',
+            state: 'APPROVED',
+            commitId: RUN_HEAD_SHA,
+            submittedAt: '2026-09-28T00:00:00Z',
+          },
+        ],
+      });
+
+      expect(await manager(record)).toMatchObject({
+        status: 'held',
+        reason: 'review_gate_approval_missing_for_head',
+      });
+      expect(mergePullRequest).not.toHaveBeenCalled();
+    });
+
     test('denies production base even when checks and approval are green', async () => {
       const { manager, mergePullRequest } = activatedManager({
         assembled: evidence({ base_branch: 'master', resulting_deployment_effect: 'none' }),

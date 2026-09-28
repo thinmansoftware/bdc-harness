@@ -376,6 +376,29 @@ describe('judgeTerminalRun: model ladder + fail-loud health', () => {
 });
 
 describe('handleRecordJudgeFirst: pipeline', () => {
+  test('event lookup failure finalizes a terminal non-merge verdict', async () => {
+    const state: FakeStoreState = { claims: [], finalized: [] };
+    const { actions, deps } = makeDeps();
+    deps.listRunEvents = async () => {
+      throw new Error('database unavailable');
+    };
+    await handleRecordJudgeFirst(makeRecord(), deps, {
+      dryRun: false,
+      actor: 'test',
+      verdictStore: makeVerdictStore({ claimed: true, verdictId: 'v-events', retryCount: 0 }, state),
+      judge: async () =>
+        verdictOutcome({ verdict: 'merge_candidate', proposedAction: 'flag_merge_ready' }),
+      escalate: fakeEscalate,
+    });
+    expect(state.finalized[0]).toMatchObject({
+      status: 'verdict',
+      verdict: 'observe',
+      proposedAction: 'none',
+      reason: 'execution_evidence_unavailable',
+    });
+    expect(actions.map(action => action.action)).toEqual(['verdict_write']);
+  });
+
   test('Test 1: healthy run gets mandatory verdict row + verdict_write receipt', async () => {
     const state: FakeStoreState = { claims: [], finalized: [] };
     const { actions, deps } = makeDeps();
