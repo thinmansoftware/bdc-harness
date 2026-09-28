@@ -84,7 +84,7 @@ export class GrokAgentProvider implements IAgentProvider {
       baseURL: this.baseURL,
       defaultHeaders: {
         'HTTP-Referer': 'https://bluedevilcollectibles.com',
-        'X-Title': 'BDC Archon Grok Agent',
+        'X-Title': 'BDC Archon OpenRouter Agent',
       },
     });
 
@@ -92,6 +92,7 @@ export class GrokAgentProvider implements IAgentProvider {
     const deniedTools = new Set(options?.nodeConfig?.denied_tools ?? []);
     const tools = GROK_AGENT_TOOLS.filter(
       tool =>
+        (tool.function.name !== 'read_artifact' || configuredTools?.includes('read_artifact')) &&
         (configuredTools === undefined || configuredTools.includes(tool.function.name)) &&
         !deniedTools.has(tool.function.name)
     );
@@ -125,6 +126,12 @@ export class GrokAgentProvider implements IAgentProvider {
 
     let totalIn = 0;
     let totalOut = 0;
+    let totalCost = 0;
+    let costReported = true;
+    const budgetUsd = options?.maxBudgetUsd;
+    if (budgetUsd !== undefined && (!Number.isFinite(budgetUsd) || budgetUsd <= 0)) {
+      throw new Error('openrouter_invalid_node_budget');
+    }
     let servedModelId: string | undefined;
     let finalText = '';
 
@@ -135,6 +142,7 @@ export class GrokAgentProvider implements IAgentProvider {
           {
             model: resolvedModel,
             messages,
+            ...(budgetUsd !== undefined ? { max_tokens: 2048, usage: { include: true } } : {}),
             ...(tools.length > 0
               ? { tools, tool_choice: 'auto' as const }
               : { tool_choice: 'none' as const }),
@@ -152,6 +160,29 @@ export class GrokAgentProvider implements IAgentProvider {
       if (completion.usage) {
         totalIn += completion.usage.prompt_tokens ?? 0;
         totalOut += completion.usage.completion_tokens ?? 0;
+        const cost = (completion.usage as { cost?: unknown }).cost;
+        if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
+          totalCost += cost;
+        } else {
+          costReported = false;
+        }
+      } else {
+        costReported = false;
+      }
+      if (budgetUsd !== undefined) {
+        if (!costReported) throw new Error('openrouter_cost_missing_for_budgeted_node');
+        if (totalCost >= budgetUsd) {
+          yield {
+            type: 'result',
+            isError: true,
+            errorSubtype: 'error_max_budget_usd',
+            errors: [`openrouter_node_budget_reached: ${totalCost} >= ${budgetUsd}`],
+            cost: totalCost,
+            tokens: { input: totalIn, output: totalOut, total: totalIn + totalOut },
+            ...(servedModelId !== undefined ? { servedModelId } : {}),
+          };
+          return;
+        }
       }
 
       const choice = completion.choices[0];
@@ -203,6 +234,7 @@ export class GrokAgentProvider implements IAgentProvider {
         };
         const result = await executeGrokTool(cwd, name, args, {
           bashTimeoutMs: this.bashTimeoutMs,
+          artifactsDir: options?.nodeConfig?.artifacts_dir,
         });
         messages.push({
           role: 'tool',
@@ -229,6 +261,7 @@ export class GrokAgentProvider implements IAgentProvider {
     yield {
       type: 'result',
       tokens,
+      ...(costReported ? { cost: totalCost } : {}),
       stopReason: 'stop',
       structuredOutput,
       ...(servedModelId !== undefined ? { servedModelId } : {}),

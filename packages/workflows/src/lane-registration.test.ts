@@ -69,7 +69,7 @@ function loadLane(filename: string): LaneDef {
 }
 
 describe('lane registration and war-council-validator pin', () => {
-  it('S4: enumerates exactly the twelve governed feature lanes', () => {
+  it('S4: enumerates exactly the governed feature lanes', () => {
     // Kimi canary lanes added 2026-07-20 (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01).
     // Cursor lane added 2026-09-15 (PR #848): grok clone on the Cursor rail.
     // This enumeration is deliberately hardcoded: it is the tripwire that forces a
@@ -85,6 +85,8 @@ describe('lane registration and war-council-validator pin', () => {
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
       'bdc-feature-development-kimi-k3.yaml',
+      'bdc-feature-development-open-a.yaml',
+      'bdc-feature-development-open-b.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
@@ -107,6 +109,18 @@ describe('lane registration and war-council-validator pin', () => {
 
       if (!wcv) {
         // Some lanes may not have the validator (skip gracefully)
+        return;
+      }
+
+      if (file === 'bdc-feature-development-open-a.yaml') {
+        expect(wcv.provider).toBe('openrouter');
+        expect(wcv.model).toBe('moonshotai/kimi-k3');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-open-b.yaml') {
+        expect(wcv.provider).toBe('openrouter');
+        expect(wcv.model).toBe('z-ai/glm-5.3');
         return;
       }
 

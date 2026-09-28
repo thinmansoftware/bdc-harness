@@ -508,6 +508,7 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
           {
             id: 'plan-review',
             allowed_tools: ['read_file', 'list_dir'],
+            maxBudgetUsd: 0.5,
             loop: {
               prompt: 'review the plan',
               until: 'PLAN_REVIEW_APPROVED',
@@ -541,9 +542,13 @@ describe('executeDagWorkflow -- plan-review terminal safety', () => {
 
     expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
     const loopOptions = mockSendQueryDag.mock.calls[0]?.[3] as {
-      nodeConfig?: { allowed_tools?: string[] };
+      maxBudgetUsd?: number;
+      nodeConfig?: { allowed_tools?: string[]; artifacts_dir?: string; maxBudgetUsd?: number };
     };
     expect(loopOptions.nodeConfig?.allowed_tools).toEqual(['read_file', 'list_dir']);
+    expect(loopOptions.nodeConfig?.artifacts_dir).toBe(artifactsDir);
+    expect(loopOptions.maxBudgetUsd).toBe(0.5);
+    expect(loopOptions.nodeConfig?.maxBudgetUsd).toBe(0.5);
     const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
       call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
     );

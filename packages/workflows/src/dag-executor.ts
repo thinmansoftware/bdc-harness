@@ -1715,7 +1715,8 @@ async function resolveNodeProviderAndModel(
   workflowRunId: string,
   cwd: string,
   workflowLevelOptions: WorkflowLevelOptions,
-  modelOverride?: ModelOverride
+  modelOverride?: ModelOverride,
+  artifactsDir?: string
 ): Promise<{
   provider: string;
   model: string | undefined;
@@ -1932,6 +1933,7 @@ async function resolveNodeProviderAndModel(
     agents: node.agents,
     allowed_tools: effectiveAllowedTools,
     denied_tools: node.denied_tools,
+    artifacts_dir: artifactsDir,
     effort: node.effort ?? workflowLevelOptions.effort,
     thinking: node.thinking ?? workflowLevelOptions.thinking,
     sandbox: node.sandbox ?? workflowLevelOptions.sandbox,
@@ -3853,7 +3855,8 @@ function buildLoopNodeOptions(
   provider: string,
   model: string | undefined,
   config: WorkflowConfig,
-  workflowLevelOptions?: WorkflowLevelOptions
+  workflowLevelOptions?: WorkflowLevelOptions,
+  artifactsDir?: string
 ): SendQueryOptions {
   const options: SendQueryOptions = {};
   if (model) options.model = model;
@@ -3861,11 +3864,14 @@ function buildLoopNodeOptions(
     options.env = config.envVars;
   }
   if (node.systemPrompt !== undefined) options.systemPrompt = node.systemPrompt;
+  if (node.maxBudgetUsd !== undefined) options.maxBudgetUsd = node.maxBudgetUsd;
   options.assistantConfig = config.assistants[provider] ?? {};
   // Loop nodes must carry the same tool boundary as single-shot AI nodes.
   options.nodeConfig = {
     allowed_tools: node.allowed_tools,
     denied_tools: node.denied_tools,
+    artifacts_dir: artifactsDir,
+    maxBudgetUsd: node.maxBudgetUsd,
     effort: workflowLevelOptions?.effort,
     thinking: workflowLevelOptions?.thinking,
     sandbox: workflowLevelOptions?.sandbox,
@@ -3945,7 +3951,8 @@ async function executeLoopNode(
     workflowProvider,
     workflowModel,
     config,
-    workflowLevelOptions
+    workflowLevelOptions,
+    artifactsDir
   );
 
   // Resolve agent persona for loop node (if `agent:` or `persona:` is declared).
@@ -4340,6 +4347,21 @@ async function executeLoopNode(
           ...resolvedOptions,
           abortSignal: iterationAbortController.signal,
         };
+        if (resolvedOptions.maxBudgetUsd !== undefined) {
+          const remainingBudget = resolvedOptions.maxBudgetUsd - (loopTotalCostUsd ?? 0);
+          if (remainingBudget <= 0) {
+            const error = `Loop node '${node.id}' exhausted its OpenRouter node budget`;
+            await persistLoopNodeFailed(error);
+            return {
+              state: 'failed',
+              output: lastIterationOutput,
+              error,
+              costUsd: loopTotalCostUsd,
+              ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+            };
+          }
+          iterationOptions.maxBudgetUsd = remainingBudget;
+        }
 
         iterationAttempt = await beginProviderAttempt(
           deps,
@@ -5285,7 +5307,8 @@ async function executeApprovalNode(
       workflowRun.id,
       cwd,
       workflowLevelOptions,
-      modelOverride
+      modelOverride,
+      artifactsDir
     );
 
     const output = await executeNodeInternal(
@@ -6074,7 +6097,8 @@ async function executeDagWorkflowInternal(
             workflowRun.id,
             cwd,
             workflowLevelOptions,
-            modelOverride
+            modelOverride,
+            artifactsDir
           );
           assertProviderCanExecuteNode(provider, node);
 
@@ -6255,7 +6279,8 @@ async function executeDagWorkflowInternal(
                 workflowRun.id,
                 cwd,
                 workflowLevelOptions,
-                modelOverride
+                modelOverride,
+                artifactsDir
               );
               emitNodeFailover(
                 deps,
