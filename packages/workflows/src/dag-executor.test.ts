@@ -14776,7 +14776,9 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
       });
 
       const store = createMockStore();
-      await runPromptNode(store, 'chatty-node', 200, 'silent-chatty');
+      // The mock finishes after 400ms of activity. Allow CI scheduler pauses
+      // without turning this progress-throttling test into a silence alarm.
+      await runPromptNode(store, 'chatty-node', 1000, 'silent-chatty');
 
       const events = eventsOf(store);
       const progress = events.filter(
