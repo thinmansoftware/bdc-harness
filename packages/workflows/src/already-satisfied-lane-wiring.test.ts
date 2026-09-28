@@ -77,6 +77,7 @@ describe('already-satisfied lane wiring', () => {
     // Kimi canary lanes added 2026-07-20 (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01):
     // dispatchable canaries, NOT ladder-wired until John reviews canary results.
     expect(LANE_FILES).toEqual([
+      'bdc-feature-development-astra.yaml',
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-cursor.yaml',

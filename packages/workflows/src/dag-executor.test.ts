@@ -11274,6 +11274,60 @@ describe('agent persona dispatch', () => {
     await writeFile(join(testDir, '.archon', 'agents', `${name}.md`), content, 'utf-8');
   }
 
+  for (const provider of ['codex-native-strict', 'claude']) {
+    for (const loop of [false, true]) {
+      it(`Astra lane binds ${provider} ${loop ? 'loop' : 'prompt'} with a separate persona`, async () => {
+        const model = provider === 'claude' ? 'claude-fable-5' : 'gpt-6-astra';
+        await writeAgentFile('lane-probe', provider === 'claude' ? model : undefined, ['Read']);
+        const store = createMockStore();
+        const deps = createMockDeps(store);
+        const captured = mock(async function* () {
+          yield { type: 'assistant' as const, content: '<promise>COMPLETE</promise>' };
+          yield { type: 'result' as const, sessionId: 'isolated-probe-session' };
+        });
+        const originalProvider = deps.getAgentProvider;
+        deps.getAgentProvider = mock((id: string) => ({
+          ...originalProvider(id),
+          sendQuery: captured,
+        }));
+        const node = {
+          id: 'lane-probe',
+          provider,
+          model: provider === 'claude' ? 'sonnet' : model,
+          persona: 'lane-probe',
+          context: 'fresh',
+          ...(loop
+            ? { loop: { prompt: 'Probe only.', until: 'COMPLETE', max_iterations: 1 } }
+            : { prompt: 'Probe only.' }),
+        } as DagNode;
+        await executeDagWorkflow(
+          deps,
+          createMockPlatform(),
+          'probe-conversation',
+          testDir,
+          { name: 'isolated-model-probe', nodes: [node] },
+          makeWorkflowRun(),
+          provider,
+          model,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          {
+            ...minimalConfig,
+            assistants: { ...minimalConfig.assistants, [provider]: { model: 'gpt-5.6-sol' } },
+          }
+        );
+        expect(deps.getAgentProvider).toHaveBeenCalledWith(provider);
+        expect(captured).toHaveBeenCalledTimes(1);
+        const options = (captured.mock.calls as unknown[][])[0][3] as Record<string, unknown>;
+        expect(options.model).toBe(model);
+        expect(options.systemPrompt).toContain('lane-probe agent');
+        expect(store.completeWorkflowRun).toHaveBeenCalled();
+      });
+    }
+  }
+
   it('prompt node with agent: applies persona allowed_tools to nodeConfig', async () => {
     await writeAgentFile('read-only-test-agent', 'sonnet', ['Read', 'Grep']);
 

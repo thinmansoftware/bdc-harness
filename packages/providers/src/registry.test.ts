@@ -86,6 +86,17 @@ describe('registry', () => {
       expect(typeof provider.sendQuery).toBe('function');
     });
 
+    test('strict native Codex disables failback while the ordinary provider retains it', () => {
+      const strict = getRegistration('codex-native-strict').factory();
+      const ordinary = getRegistration('codex').factory();
+      expect(strict.getType()).toBe('codex');
+      expect(strict.getCapabilities()).toEqual(ordinary.getCapabilities());
+      expect(Object.getOwnPropertyDescriptor(strict, 'failbackProviderFactory')?.value).toBeNull();
+      expect(
+        typeof Object.getOwnPropertyDescriptor(ordinary, 'failbackProviderFactory')?.value
+      ).toBe('function');
+    });
+
     test('throws UnknownProviderError for unknown type', () => {
       expect(() => getAgentProvider('unknown')).toThrow(UnknownProviderError);
       expect(() => getAgentProvider('unknown')).toThrow(
@@ -260,7 +271,7 @@ describe('registry', () => {
   describe('getRegisteredProviders', () => {
     test('returns all registered providers', () => {
       const all = getRegisteredProviders();
-      expect(all.length).toBe(3);
+      expect(all.length).toBe(4);
       const ids = all.map(r => r.id);
       expect(ids).toContain('claude');
       expect(ids).toContain('codex');
@@ -270,14 +281,14 @@ describe('registry', () => {
     test('includes community providers after registration', () => {
       registerProvider(makeMockRegistration('my-llm'));
       const all = getRegisteredProviders();
-      expect(all.length).toBe(4);
+      expect(all.length).toBe(5);
     });
   });
 
   describe('getProviderInfoList', () => {
     test('returns API-safe projection without factory', () => {
       const infos = getProviderInfoList();
-      expect(infos.length).toBe(3);
+      expect(infos.length).toBe(4);
       for (const info of infos) {
         expect(info).toHaveProperty('id');
         expect(info).toHaveProperty('displayName');
@@ -306,7 +317,7 @@ describe('registry', () => {
       registerBuiltinProviders();
       registerBuiltinProviders();
       const all = getRegisteredProviders();
-      expect(all.length).toBe(3);
+      expect(all.length).toBe(4);
     });
   });
 
@@ -392,7 +403,7 @@ describe('registry', () => {
       const ids = getRegisteredProviders()
         .map(p => p.id)
         .sort();
-      expect(ids).toEqual(['claude', 'codex', 'codex-opr', 'pi']);
+      expect(ids).toEqual(['claude', 'codex', 'codex-native-strict', 'codex-opr', 'pi']);
     });
   });
 
@@ -450,7 +461,7 @@ describe('registry', () => {
       const ids = getRegisteredProviders()
         .map(p => p.id)
         .sort();
-      expect(ids).toEqual(['claude', 'codex', 'codex-opr', 'glm', 'opr']);
+      expect(ids).toEqual(['claude', 'codex', 'codex-native-strict', 'codex-opr', 'glm', 'opr']);
     });
   });
 

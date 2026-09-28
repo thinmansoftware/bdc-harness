@@ -380,6 +380,30 @@ describe('seat usage', () => {
     expect(decision).toEqual({ refused: false, unknownSeats: [] });
   });
 
+  test('strict native Codex binding uses the Codex seat cutoff', () => {
+    const bindings = [{ providerId: 'codex-native-strict' }];
+    const codex = measured('codex', [
+      {
+        name: 'primary',
+        used_percent: 95,
+        remaining_percent: 5,
+        resets_at: 'x',
+        window_seconds: 604800,
+      },
+    ]);
+
+    expect(seatsForBindings(bindings)).toEqual(['codex']);
+    expect(seatsForBindings([...bindings, { providerId: 'codex' }])).toEqual(['codex']);
+    expect(decideSeatGate(bindings, { codex }, 90)).toEqual({
+      refused: true,
+      seat: 'codex',
+      window: 'primary',
+      usedPercent: 95,
+      cutoffPercent: 90,
+      unknownSeats: [],
+    });
+  });
+
   test('default_cutoff_is_90_with_no_env_and_no_override', () => {
     expect(DEFAULT_SEAT_CUTOFF_PERCENT).toBe(90);
     expect(process.env.FUELGLASS_SEAT_CUTOFF_PERCENT).toBeUndefined();
