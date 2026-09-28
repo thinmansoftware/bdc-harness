@@ -1,6 +1,7 @@
 import {
   claimMessage,
   createAuthenticatedMessage,
+  getWorker,
   heartbeatWorker,
   listMessages,
   postResult,
@@ -10,6 +11,7 @@ import {
   type DispatchMessage,
   type DispatchSenderContext,
   type DispatchTaskOutcome,
+  type DispatchWorker,
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
@@ -19,6 +21,12 @@ import {
   runSecurityDetector,
   type SecurityDetectorResult,
 } from './duty-officer-security-detector';
+import {
+  listWorkerAlarmIssueComments,
+  postWorkerAlarmComment,
+  runWorkerHeartbeatAlarm,
+  type WorkerAlarmIssueComment,
+} from './worker-heartbeat-alarm';
 
 const log = createLogger('dispatch/duty-officer-clock');
 
@@ -78,6 +86,12 @@ export interface DutyOfficerClockDeps {
   postIssueComment: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
   judge: (message: DispatchMessage) => Promise<DutyOfficerJudgeVerdict>;
   securityDetector: (signal: AbortSignal) => Promise<SecurityDetectorResult | null>;
+  // Worker heartbeat alarm deps (independent of DUTY_OFFICER_GH_NUDGE). Optional
+  // so legacy fixtures need not provide them; createRealDutyOfficerClockDeps
+  // always wires them and the tick only runs the alarm when all three exist.
+  getWorker?: (workerId: string) => Promise<DispatchWorker | null>;
+  postAlarmComment?: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
+  listAlarmIssueComments?: (issue: DutyOfficerStaleIssue) => Promise<WorkerAlarmIssueComment[]>;
   now?: () => Date;
 }
 
@@ -126,7 +140,7 @@ function shouldEscalate(message: DispatchMessage): boolean {
   return namedNextStep(message.body) === null;
 }
 
-function parseGithubSubject(subjectKey: string | null): DutyOfficerStaleIssue | null {
+export function parseGithubSubject(subjectKey: string | null): DutyOfficerStaleIssue | null {
   if (!subjectKey) return null;
   const match = GH_SUBJECT.exec(subjectKey);
   if (!match) return null;
@@ -242,6 +256,9 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
     getCurrentXoLease,
     listStaleIssues: listStaleGithubIssues,
     postIssueComment: postGithubIssueComment,
+    getWorker,
+    postAlarmComment: postWorkerAlarmComment,
+    listAlarmIssueComments: listWorkerAlarmIssueComments,
     judge: judgeDutyOfficerItem,
     securityDetector: signal =>
       runSecurityDetector(
@@ -472,6 +489,24 @@ export async function tickDutyOfficerClock(
       max_concurrency: 1,
     });
     await deps.heartbeatWorker({ worker_id: DUTY_OFFICER_WORKER_ID, status: 'available' });
+
+    // Watch registered Dispatch workers for heartbeat staleness. This runs on its
+    // own switch (DISPATCH_WORKER_ALARM_ENABLED, default ON), independent of the
+    // production-disabled DUTY_OFFICER_GH_NUDGE. Failures are caught here so a
+    // GitHub/DB hiccup can never break the rest of the tick (queued-message loop,
+    // security detector, existing nudge block still run below).
+    if (deps.getWorker && deps.postAlarmComment && deps.listAlarmIssueComments) {
+      try {
+        await runWorkerHeartbeatAlarm({
+          getWorker: deps.getWorker,
+          postAlarmComment: deps.postAlarmComment,
+          listIssueComments: deps.listAlarmIssueComments,
+          now: deps.now,
+        });
+      } catch (error) {
+        log.error({ err: error }, 'worker_heartbeat_alarm_failed');
+      }
+    }
 
     const lease = await deps.getCurrentXoLease();
     if (!lease) {
