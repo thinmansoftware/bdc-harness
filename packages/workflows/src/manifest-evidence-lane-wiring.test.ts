@@ -49,6 +49,8 @@ const EXPECTED_LANES = [
   'bdc-feature-development-fusion-cx-qwen.yaml',
   'bdc-feature-development-grok.yaml',
   'bdc-feature-development-kimi-k3.yaml',
+  'bdc-feature-development-open-a.yaml',
+  'bdc-feature-development-open-b.yaml',
   'bdc-feature-development-zero-claude.yaml',
   'bdc-feature-development-zero-open.yaml',
   'bdc-feature-development-zero.yaml',
@@ -140,15 +142,28 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         expect(n.bash).not.toContain('bash -c "$1"');
       });
 
-      it('war-council-validator depends on both evidence nodes and carries the executed-command contract', () => {
+      it('war-council-validator depends on mechanical evidence and reports observed tests', () => {
         const n = node(nodes, 'war-council-validator', file);
-        expect(n.depends_on).toEqual(['ascii-gate', 'run-stop-tests', 'run-stop-greps']);
         expect(n.prompt).toContain('$run-stop-tests.output');
         expect(n.prompt).toContain('$run-stop-greps.output');
-        expect(n.prompt).toContain('TESTS_OBSERVED: <passed>/<total> (<command you executed>)');
-        expect(n.prompt).toContain('TESTS_OBSERVED: not_run (<reason>)');
-        expect(n.prompt).toContain('without an executed command');
         expect(n.prompt).toContain('needs_revision');
+        if (file.endsWith('-open-a.yaml') || file.endsWith('-open-b.yaml')) {
+          expect(n.prompt).toMatch(/TESTS_OBSERVED: not_run\s+\(<reason>\)/);
+          expect(n.depends_on).toEqual([
+            'ascii-gate',
+            'run-stop-tests',
+            'run-stop-greps',
+            'capture-diff',
+          ]);
+          expect(n.prompt).toContain('TESTS_OBSERVED: <passed>/<total> (<harness command>)');
+          expect(n.prompt).toContain('Do not claim you ran a command');
+          expect(n.prompt).toContain('Read diff.patch with read_artifact');
+        } else {
+          expect(n.prompt).toContain('TESTS_OBSERVED: not_run (<reason>)');
+          expect(n.depends_on).toEqual(['ascii-gate', 'run-stop-tests', 'run-stop-greps']);
+          expect(n.prompt).toContain('TESTS_OBSERVED: <passed>/<total> (<command you executed>)');
+          expect(n.prompt).toContain('without an executed command');
+        }
       });
 
       it('stamp-manifest-evidence rewrites the raw engine manifest from both evidence nodes', () => {
