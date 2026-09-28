@@ -200,7 +200,9 @@ const dynamicLaneSnapshotStructuralSchema = z.object({
   }),
   providerAttempts: z.array(attemptSchema),
   providerAttemptCeiling: z.number().int().nonnegative(),
-  contributingFamilies: z.array(z.object({ family: z.string().nullable(), evidenceRef: nonblank })),
+  contributingFamilies: z.array(
+    z.object({ family: z.string().nullable(), evidenceRef: nonblank, availableAt: timestamp })
+  ),
   currentArtifactHash: z.string().nullable(),
   reviewTargetHash: z.string().nullable(),
   taskBrief: semanticTextSchema.nullable(),
@@ -465,6 +467,12 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
       }
       if (snapshot.contributingFamilies.some(item => !item.family))
         reasons.push('contributor_family_unknown');
+      if (
+        snapshot.contributingFamilies.some(
+          item => !atOrBefore(item.availableAt, snapshot.evaluationTime)
+        )
+      )
+        reasons.push('future_contributor_family_mapping');
       if (
         candidate.family &&
         snapshot.contributingFamilies.some(item => item.family === candidate.family)

@@ -130,7 +130,13 @@ describe('dynamic lane offline admission scenarios', () => {
     input.aiRole = 'independent_review';
     input.roleObjective!.role = 'independent_review';
     input.candidateProfiles!.forEach(p => p.applicableRoles.push('independent_review'));
-    input.contributingFamilies = [{ family: 'openai', evidenceRef: 'fixture:served' }];
+    input.contributingFamilies = [
+      {
+        family: 'openai',
+        evidenceRef: 'fixture:served',
+        availableAt: '2026-09-26T11:00:00.000Z',
+      },
+    ];
     input.currentArtifactHash = 'sha256:a';
     input.reviewTargetHash = 'sha256:b';
     const out = evaluateDynamicLane(input);
@@ -156,6 +162,27 @@ describe('dynamic lane offline admission scenarios', () => {
     const out = evaluateDynamicLane(input);
     expect(out.candidateRejections['codex-plan']).toContain(
       'reviewer_family_mapping_evidence_missing'
+    );
+    expect(out.eligibleCandidateIds).not.toContain('codex-plan');
+  });
+
+  test('7c: independent review rejects future contributing-family evidence', () => {
+    const input = clone();
+    input.aiRole = 'independent_review';
+    input.roleObjective!.role = 'independent_review';
+    input.candidateProfiles!.forEach(profile => profile.applicableRoles.push('independent_review'));
+    input.currentArtifactHash = input.reviewTargetHash = 'sha256:artifact';
+    input.contributingFamilies = [
+      {
+        family: 'anthropic',
+        evidenceRef: 'fixture:future-served-identity',
+        availableAt: '2026-09-26T13:00:00.000Z',
+      },
+    ];
+
+    const out = evaluateDynamicLane(input);
+    expect(out.candidateRejections['codex-plan']).toContain(
+      'future_contributor_family_mapping'
     );
     expect(out.eligibleCandidateIds).not.toContain('codex-plan');
   });
