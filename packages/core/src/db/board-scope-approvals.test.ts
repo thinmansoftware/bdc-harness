@@ -5,6 +5,7 @@ import { join } from 'path';
 import { SqliteAdapter } from './adapters/sqlite';
 import {
   getScopeApprovalDecision,
+  getScopeApprovalMetadata,
   recordScopeApproval,
   revokeScopeApproval,
 } from './board-scope-approvals';
@@ -134,6 +135,25 @@ describe('board scope approvals', () => {
         database: db,
       })
     ).toEqual({ decision: 'deny', reason: 'revoked' });
+  });
+  test('revoked approvals do not count as an approval at another base', async () => {
+    const made = await record();
+    if (!made.ok) throw new Error('record failed');
+    await revokeScopeApproval({
+      principal,
+      proof,
+      approval_id: made.approval.approval_id,
+      reason: 'withdrawn',
+      database: db,
+    });
+    const metadata = await getScopeApprovalMetadata({
+      repo: 'thinmansoftware/lspro-react',
+      pr_number: 626,
+      head_sha: S,
+      database: db,
+    });
+    expect(metadata.hasOtherBase).toBe(false);
+    expect(metadata.newestRevokedAt).not.toBeNull();
   });
   test('public_read_allows_only_exact_match', async () => {
     await record();

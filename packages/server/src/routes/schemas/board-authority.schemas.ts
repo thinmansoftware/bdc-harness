@@ -119,7 +119,7 @@ export const scopeApprovalResponseSchema = z.object({
 });
 
 export const scopeApprovalPublicReadQuerySchema = z.object({
-  repo: z.string().min(1),
+  repo: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/),
   pr_number: z.coerce.number().int().positive(),
   head_sha: sha40Schema,
   base_sha: sha40Schema,

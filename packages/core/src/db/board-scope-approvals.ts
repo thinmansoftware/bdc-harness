@@ -65,6 +65,12 @@ function jsonField(db: IDatabase, field: string): string {
   return db.dialect === 'sqlite' ? `json_extract(details, '$.${field}')` : `details->>'${field}'`;
 }
 
+function qualifiedJsonField(db: IDatabase, alias: string, field: string): string {
+  return db.dialect === 'sqlite'
+    ? `json_extract(${alias}.details, '$.${field}')`
+    : `${alias}.details->>'${field}'`;
+}
+
 async function now(query: Tx, db: IDatabase): Promise<string> {
   const result = await query<{ value: string }>(
     db.dialect === 'sqlite'
@@ -316,8 +322,14 @@ export async function getScopeApprovalMetadata(input: {
 }): Promise<{ hasOtherBase: boolean; newestRevokedAt: string | null }> {
   const db = input.database ?? getDatabase();
   const approvals = await db.query(
-    `SELECT 1 FROM board_audit_events WHERE event_type=$1 AND ${jsonField(db, 'repo')}=$2
-      AND ${jsonField(db, 'pr_number')}=$3 AND ${jsonField(db, 'head_sha')}=$4 LIMIT 1`,
+    `SELECT 1 FROM board_audit_events recorded WHERE recorded.event_type=$1
+      AND ${qualifiedJsonField(db, 'recorded', 'repo')}=$2
+      AND ${qualifiedJsonField(db, 'recorded', 'pr_number')}=$3
+      AND ${qualifiedJsonField(db, 'recorded', 'head_sha')}=$4
+      AND NOT EXISTS (
+        SELECT 1 FROM board_audit_events revoked WHERE revoked.event_type='ce_scope_approval_revoked'
+          AND ${qualifiedJsonField(db, 'revoked', 'approval_id')}=${qualifiedJsonField(db, 'recorded', 'approval_id')}
+      ) LIMIT 1`,
     ['ce_scope_approval_recorded', input.repo, input.pr_number, input.head_sha]
   );
   const revoked = await db.query<{ created_at: string }>(

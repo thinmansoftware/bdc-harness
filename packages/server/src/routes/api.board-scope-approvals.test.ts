@@ -128,6 +128,11 @@ describe('scope approval routes', () => {
     const invalid = await app.request('/api/public/board/scope-approvals?repo=x&pr_number=nope');
     expect(invalid.status).toBe(400);
     expect(await invalid.json()).toEqual({ decision: 'deny', reason: 'invalid_query' });
+    const malformedRepo = await app.request(
+      `/api/public/board/scope-approvals?repo=x&pr_number=626&head_sha=${S}&base_sha=${B}`
+    );
+    expect(malformedRepo.status).toBe(400);
+    expect(await malformedRepo.json()).toEqual({ decision: 'deny', reason: 'invalid_query' });
     const query = `repo=${encodeURIComponent(valid.repo)}&pr_number=626&head_sha=${S}&base_sha=${B}`;
     expect((await app.request(`/api/public/board/scope-approvals?${query}`)).status).toBe(200);
     read.mockImplementationOnce(async () => {
