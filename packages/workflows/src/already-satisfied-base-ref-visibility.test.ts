@@ -23,7 +23,7 @@ registerCommunityProviders();
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 
-// The 15 lanes that carry the check-already-satisfied precheck node (spec Section 5).
+// Lanes that carry the check-already-satisfied precheck node (spec Section 5).
 // Hardcoded on purpose: this is the tripwire that forces a NEW lane to be given the
 // base-ref precheck rather than silently inheriting the old worktree-only prompt.
 // Kimi canary lanes added here 2026-07-25 -- they were cloned from fusion-cx-qwen
@@ -40,6 +40,8 @@ const EXPECTED_PRECHECK_LANES = [
   'bdc-feature-development-fusion-cx-qwen.yaml',
   'bdc-feature-development-grok.yaml',
   'bdc-feature-development-kimi-k3.yaml',
+  'bdc-feature-development-open-a.yaml',
+  'bdc-feature-development-open-b.yaml',
   'bdc-feature-development-zero-claude.yaml',
   'bdc-feature-development-zero-open.yaml',
   'bdc-feature-development-zero.yaml',
@@ -73,7 +75,7 @@ function precheckPrompt(file: string): string {
 }
 
 describe('already-satisfied base-ref visibility (WO-HARNESS-PRECHECK-BASE-REF-VISIBILITY-01)', () => {
-  it('discovers exactly the 15 expected precheck lanes', () => {
+  it('discovers exactly the expected precheck lanes', () => {
     expect(PRECHECK_LANE_FILES).toEqual(EXPECTED_PRECHECK_LANES);
   });
 
@@ -237,8 +239,15 @@ async function runGate(file: string, checkOutput: string) {
   return spawnGateOnce(rendered);
 }
 
+const FORCE_BUILD_LANES = new Set([
+  'bdc-feature-development-open-a.yaml',
+  'bdc-feature-development-open-b.yaml',
+  'bdc-feature-development-zero-open.yaml',
+  'bdc-feature-development-zero.yaml',
+]);
+
 describe('gate-already-satisfied disposition (behavioral)', () => {
-  it('executes exactly the 12 JSON-gate feature-development lanes', () => {
+  it('executes exactly the expected JSON-gate feature-development lanes', () => {
     // The two Kimi canary lanes appear here only because they now carry the MODERN
     // gate node. They were cloned from fusion-cx-qwen before both the M-85 base-ref
     // fix AND the heredoc-to-shellQuote gate fix landed, so on arrival they had the
@@ -254,6 +263,8 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
       'bdc-feature-development-kimi-k3.yaml',
+      'bdc-feature-development-open-a.yaml',
+      'bdc-feature-development-open-b.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
@@ -267,9 +278,7 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       // build skip guards still fire, but the disposition is the distinct
       // already-merged-on-base and the diagnostic must NOT claim local satisfaction.
       it('local-absent/base-present -> skip with already-merged-on-base', async () => {
-        const forceBuild =
-          file === 'bdc-feature-development-zero.yaml' ||
-          file === 'bdc-feature-development-zero-open.yaml';
+        const forceBuild = FORCE_BUILD_LANES.has(file);
         const { stdout, stderr, exitCode } = await runGate(
           file,
           [
@@ -300,9 +309,7 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
 
       // Outcome 2: both-absent -> the run must build.
       it('both-absent -> needs-build', async () => {
-        const forceBuild =
-          file === 'bdc-feature-development-zero.yaml' ||
-          file === 'bdc-feature-development-zero-open.yaml';
+        const forceBuild = FORCE_BUILD_LANES.has(file);
         const { stdout, stderr, exitCode } = await runGate(file, 'ALREADY_SATISFIED=false');
         expect(exitCode).toBe(0);
         expect(JSON.parse(stdout)).toEqual({
@@ -319,9 +326,7 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       // Outcome 3: local-present -> the pre-existing fast path is preserved verbatim
       // (already-satisfied, no SATISFIED_ON_BASE key, worktree diagnostic).
       it('local-present -> retains the already-satisfied fast path', async () => {
-        const forceBuild =
-          file === 'bdc-feature-development-zero.yaml' ||
-          file === 'bdc-feature-development-zero-open.yaml';
+        const forceBuild = FORCE_BUILD_LANES.has(file);
         const { stdout, stderr, exitCode } = await runGate(
           file,
           ['ALREADY_SATISFIED=true', 'SATISFIED_EVIDENCE=present in this worktree HEAD'].join('\n')
@@ -359,18 +364,14 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
     });
   }
 
-  // SIGPIPE / pipefail flake (issue #837): eleven concurrent bash gates, five
-  // rounds. Skip-capable lanes must stay already-merged-on-base (45/45). Zero
-  // lanes keep the force-build contract (10/10 needs-build). No assertion retry.
-  it('base-present is stable across concurrent lane spawns (5 rounds x 11 lanes)', async () => {
+  // SIGPIPE / pipefail flake (issue #837): concurrent bash gates, five rounds.
+  // Skip-capable lanes preserve their skip verdict; force-build lanes proceed.
+  it('base-present is stable across concurrent lane spawns', async () => {
     const checkOutput = [
       'ALREADY_SATISFIED=true',
       'SATISFIED_ON_BASE=true',
       'SATISFIED_EVIDENCE=deliverable merged on origin/dev by concurrent sibling run',
     ].join('\n');
-    const forceBuild = (file: string): boolean =>
-      file === 'bdc-feature-development-zero.yaml' ||
-      file === 'bdc-feature-development-zero-open.yaml';
     for (let round = 0; round < 5; round++) {
       const results = await Promise.all(
         JSON_GATE_FEATURE_LANES.map(async (file: string) => ({
@@ -381,7 +382,7 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       for (const { file, stdout, exitCode } of results) {
         expect(exitCode).toBe(0);
         const doc: { ALREADY_SATISFIED: boolean; PRECHECK_VERDICT: string } = JSON.parse(stdout);
-        if (forceBuild(file)) {
+        if (FORCE_BUILD_LANES.has(file)) {
           expect(doc.ALREADY_SATISFIED).toBe(false);
           expect(doc.PRECHECK_VERDICT).toBe('needs-build');
         } else {
