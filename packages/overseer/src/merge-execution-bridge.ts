@@ -530,9 +530,13 @@ async function mergeClaimedVerdict(
   }
   let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
   try {
-    if (`${pr.pr?.owner}/${pr.pr?.repo}`.toLowerCase() === 'thinmansoftware/lspro-react' && pr.baseBranch === 'release/ce') {
+    if (
+      `${pr.pr?.owner}/${pr.pr?.repo}`.toLowerCase() === 'thinmansoftware/lspro-react' &&
+      pr.baseBranch === 'release/ce'
+    ) {
       const recheck = await (options.ceScopePremergeRecheck ?? recheckCeScopeBeforeMerge)({
-        repo: 'thinmansoftware/lspro-react', pr_number: pr.pr.number,
+        repo: 'thinmansoftware/lspro-react',
+        pr_number: pr.pr.number,
         expected_head_sha: verdict.head_sha,
       });
       if (!recheck.ok) {

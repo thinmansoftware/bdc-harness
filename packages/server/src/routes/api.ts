@@ -1065,34 +1065,82 @@ const boardRecipientRoute = createRoute({
 });
 
 const recordScopeApprovalRoute = createRoute({
-  method: 'post', path: '/api/board/scope-approvals', tags: ['Board Authority'],
-  request: { body: { content: { 'application/json': { schema: scopeApprovalRecordBodySchema } }, required: true } },
+  method: 'post',
+  path: '/api/board/scope-approvals',
+  tags: ['Board Authority'],
+  request: {
+    body: {
+      content: { 'application/json': { schema: scopeApprovalRecordBodySchema } },
+      required: true,
+    },
+  },
   responses: {
-    200: { content: { 'application/json': { schema: scopeApprovalResponseSchema } }, description: 'Existing approval' },
-    201: { content: { 'application/json': { schema: scopeApprovalResponseSchema } }, description: 'Recorded approval' },
-    400: jsonError('Bad request'), 401: jsonError('Principal rejected'),
-    403: jsonError('Seat forbidden'), 409: jsonError('Conflict'), 500: jsonError('Server error'),
+    200: {
+      content: { 'application/json': { schema: scopeApprovalResponseSchema } },
+      description: 'Existing approval',
+    },
+    201: {
+      content: { 'application/json': { schema: scopeApprovalResponseSchema } },
+      description: 'Recorded approval',
+    },
+    400: jsonError('Bad request'),
+    401: jsonError('Principal rejected'),
+    403: jsonError('Seat forbidden'),
+    409: jsonError('Conflict'),
+    500: jsonError('Server error'),
   },
 });
 
 const revokeScopeApprovalRoute = createRoute({
-  method: 'post', path: '/api/board/scope-approvals/{approval_id}/revoke', tags: ['Board Authority'],
-  request: { params: scopeApprovalRevokeParamsSchema,
-    body: { content: { 'application/json': { schema: scopeApprovalRevokeBodySchema } }, required: true } },
+  method: 'post',
+  path: '/api/board/scope-approvals/{approval_id}/revoke',
+  tags: ['Board Authority'],
+  request: {
+    params: scopeApprovalRevokeParamsSchema,
+    body: {
+      content: { 'application/json': { schema: scopeApprovalRevokeBodySchema } },
+      required: true,
+    },
+  },
   responses: {
-    200: { content: { 'application/json': { schema: z.object({ rerun: z.enum(['requested','unavailable','failed']), credential_class: z.string() }) } }, description: 'Revoked' },
-    400: jsonError('Bad request'), 401: jsonError('Principal rejected'),
-    403: jsonError('Seat forbidden'), 404: jsonError('Not found'), 409: jsonError('Conflict'), 500: jsonError('Server error'),
+    200: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            rerun: z.enum(['requested', 'unavailable', 'failed']),
+            credential_class: z.string(),
+          }),
+        },
+      },
+      description: 'Revoked',
+    },
+    400: jsonError('Bad request'),
+    401: jsonError('Principal rejected'),
+    403: jsonError('Seat forbidden'),
+    404: jsonError('Not found'),
+    409: jsonError('Conflict'),
+    500: jsonError('Server error'),
   },
 });
 
 const readScopeApprovalRoute = createRoute({
-  method: 'get', path: '/api/public/board/scope-approvals', tags: ['Board Authority'],
+  method: 'get',
+  path: '/api/public/board/scope-approvals',
+  tags: ['Board Authority'],
   request: { query: scopeApprovalPublicQuerySchema },
   responses: {
-    200: { content: { 'application/json': { schema: scopeApprovalDecisionSchema } }, description: 'Fail-closed decision' },
-    400: { content: { 'application/json': { schema: scopeApprovalDecisionSchema } }, description: 'Invalid query' },
-    500: { content: { 'application/json': { schema: scopeApprovalDecisionSchema } }, description: 'Store failure' },
+    200: {
+      content: { 'application/json': { schema: scopeApprovalDecisionSchema } },
+      description: 'Fail-closed decision',
+    },
+    400: {
+      content: { 'application/json': { schema: scopeApprovalDecisionSchema } },
+      description: 'Invalid query',
+    },
+    500: {
+      content: { 'application/json': { schema: scopeApprovalDecisionSchema } },
+      description: 'Store failure',
+    },
   },
 });
 
@@ -4366,8 +4414,7 @@ export function registerApiRoutes(
         status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
         subject_key: c.req.query('subject_key') ?? undefined,
         route_disposition: c.req.query('route_disposition') as
-          | dispatchDb.DispatchRouteDisposition
-          | undefined,
+          dispatchDb.DispatchRouteDisposition | undefined,
         limit: Number.isFinite(rawLimit) ? rawLimit : 100,
         allowBoardAlias:
           c.req.query('recipient') !== undefined &&
@@ -4388,8 +4435,7 @@ export function registerApiRoutes(
           status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
           subject_key: c.req.query('subject_key') ?? undefined,
           route_disposition: c.req.query('route_disposition') as
-            | dispatchDb.DispatchRouteDisposition
-            | undefined,
+            dispatchDb.DispatchRouteDisposition | undefined,
           limit: Number.isFinite(rawLimit) ? rawLimit : 100,
           allowBoardAlias: false,
         });
@@ -4775,8 +4821,12 @@ export function registerApiRoutes(
       const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
       const result = await boardScopeApprovalDb.recordScopeApproval({ ...body, principal });
       if (!result.ok) {
-        const status = result.reason === 'seat_not_permitted' ? 403
-          : result.reason === 'repo_not_allowed' || result.reason === 'invalid_request' ? 400 : 409;
+        const status =
+          result.reason === 'seat_not_permitted'
+            ? 403
+            : result.reason === 'repo_not_allowed' || result.reason === 'invalid_request'
+              ? 400
+              : 409;
         return apiError(c, status, result.reason);
       }
       return c.json(result.approval, result.created ? 201 : 200);
@@ -4792,11 +4842,19 @@ export function registerApiRoutes(
       const body = getValidatedBody(c, scopeApprovalRevokeBodySchema);
       const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
       const result = await boardScopeApprovalDb.revokeScopeApproval({
-        ...body, approval_id: c.req.param('approval_id'), principal,
+        ...body,
+        approval_id: c.req.param('approval_id') ?? '',
+        principal,
       });
       if (!result.ok) {
-        const status = result.reason === 'invalid_request' ? 400 : result.reason === 'not_found' ? 404
-          : result.reason === 'seat_not_permitted' ? 403 : 409;
+        const status =
+          result.reason === 'invalid_request'
+            ? 400
+            : result.reason === 'not_found'
+              ? 404
+              : result.reason === 'seat_not_permitted'
+                ? 403
+                : 409;
         return apiError(c, status, result.reason);
       }
       return c.json({ rerun: result.rerun, credential_class: result.credential_class });
@@ -4809,7 +4867,7 @@ export function registerApiRoutes(
 
   registerOpenApiRoute(readScopeApprovalRoute, async c => {
     try {
-      const query = c.req.valid('query');
+      const query = getValidatedQuery(c, scopeApprovalPublicQuerySchema);
       const decision = await boardScopeApprovalDb.getScopeApprovalDecision(query);
       if (decision.decision === 'allow') return c.json(decision);
       const reason = decision.reason === 'malformed' ? 'no_record' : decision.reason;
@@ -4818,6 +4876,10 @@ export function registerApiRoutes(
       getLog().error({ err: error }, 'scope_approval_read_failed');
       return c.json({ decision: 'deny' as const, reason: 'server_error' }, 500);
     }
+  }, (result, c) => {
+    if (!result.success)
+      return c.json({ decision: 'deny' as const, reason: 'invalid_query' as const }, 400);
+    return undefined;
   });
 
   // =======================================================================
@@ -5556,9 +5618,10 @@ export function registerApiRoutes(
    */
   function registerOpenApiRoute(
     route: ReturnType<typeof createRoute>,
-    handler: (c: Context) => Response | Promise<Response>
+    handler: (c: Context) => Response | Promise<Response>,
+    hook?: Parameters<OpenAPIHono['openapi']>[2]
   ): void {
-    app.openapi(route, handler as never);
+    app.openapi(route, handler as never, hook);
   }
 
   /**

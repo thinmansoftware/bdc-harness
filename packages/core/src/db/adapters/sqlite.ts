@@ -893,9 +893,9 @@ export class SqliteAdapter implements IDatabase {
         subject_key TEXT
       )`);
       this.db.run(`INSERT INTO board_audit_events_new
-        (id,event_type,actor_principal_id,actor_seat_id,xo_lease_id,xo_fencing_token,
+        (rowid,id,event_type,actor_principal_id,actor_seat_id,xo_lease_id,xo_fencing_token,
          motion_id,motion_revision_sha,details,created_at,subject_key)
-        SELECT id,event_type,actor_principal_id,actor_seat_id,xo_lease_id,xo_fencing_token,
+        SELECT rowid,id,event_type,actor_principal_id,actor_seat_id,xo_lease_id,xo_fencing_token,
          motion_id,motion_revision_sha,details,created_at,${hasSubjectKey ? 'subject_key' : 'NULL'}
         FROM board_audit_events`);
       this.db.run('DROP TABLE board_audit_events');
