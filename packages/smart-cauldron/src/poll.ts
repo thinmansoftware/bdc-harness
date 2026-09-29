@@ -232,10 +232,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
 
     if (TERMINAL_STATUSES.has(detail.run.status)) {
       const terminalStatus = detail.run.status as
-        | 'completed'
-        | 'failed'
-        | 'escalated'
-        | 'cancelled';
+        'completed' | 'failed' | 'escalated' | 'cancelled';
       let events = detail.events ?? [];
 
       let validatorVerdict = extractValidatorVerdict(events);

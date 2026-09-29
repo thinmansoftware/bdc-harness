@@ -4415,8 +4415,7 @@ export function registerApiRoutes(
         status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
         subject_key: c.req.query('subject_key') ?? undefined,
         route_disposition: c.req.query('route_disposition') as
-          | dispatchDb.DispatchRouteDisposition
-          | undefined,
+          dispatchDb.DispatchRouteDisposition | undefined,
         limit: Number.isFinite(rawLimit) ? rawLimit : 100,
         allowBoardAlias:
           c.req.query('recipient') !== undefined &&
@@ -4437,8 +4436,7 @@ export function registerApiRoutes(
           status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
           subject_key: c.req.query('subject_key') ?? undefined,
           route_disposition: c.req.query('route_disposition') as
-            | dispatchDb.DispatchRouteDisposition
-            | undefined,
+            dispatchDb.DispatchRouteDisposition | undefined,
           limit: Number.isFinite(rawLimit) ? rawLimit : 100,
           allowBoardAlias: false,
         });

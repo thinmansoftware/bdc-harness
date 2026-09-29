@@ -1098,11 +1098,7 @@ export async function refreshAdoption(
         state: null as string | null,
         last_movement_at: null as string | null,
         last_movement_kind: null as
-          | 'closed'
-          | 'assigned'
-          | 'status_label'
-          | 'progress_comment'
-          | null,
+          'closed' | 'assigned' | 'status_label' | 'progress_comment' | null,
         attempts_24h: attempts24h.get(ref) ?? 0,
         attempts_total: attemptsTotal.get(ref) ?? 0,
         evidence_observed_at: null as string | null,

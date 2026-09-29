@@ -76,8 +76,7 @@ export function chooseHeadroomEntry(input: {
   pinned: boolean;
 }): EntrySelection {
   const { picked, tiers, refusedTiers, premiumTiers, usage, thresholdPercent, pinned } = input;
-  const seats =
-    usage === null || usage === undefined ? {} : seatsFromPick(picked, tiers, usage);
+  const seats = usage === null || usage === undefined ? {} : seatsFromPick(picked, tiers, usage);
   const keep = (reason: string): EntrySelection => ({
     picked,
     entry: picked,
@@ -119,19 +118,33 @@ export function chooseHeadroomEntry(input: {
   return keep(`no_known_headroom:${seat}:${percent}`);
 }
 
+function isSeatId(value: string): value is SeatId {
+  return value === 'claude' || value === 'codex' || value === 'cursor';
+}
+
+/**
+ * Audit record for the entry decision.
+ * Every seat on the snapshot is recorded, including rungs below the pick.
+ * A reading that does not bind is UNKNOWN. Candidate seats at or after the
+ * picked rung that the snapshot omitted are also UNKNOWN.
+ */
 function seatsFromPick(
   picked: string,
   tiers: { name: string }[],
   usage: SeatUsageSnapshot
 ): Partial<Record<SeatId, number | 'UNKNOWN'>> {
   const seats: Partial<Record<SeatId, number | 'UNKNOWN'>> = {};
+  for (const key of Object.keys(usage)) {
+    if (!isSeatId(key)) continue;
+    const binding = bindingUsedPercent(usage[key]);
+    seats[key] = binding === null ? 'UNKNOWN' : binding;
+  }
   const start = tiers.findIndex(tier => tier.name === picked);
   const names = start === -1 ? [picked] : tiers.slice(start).map(tier => tier.name);
   for (const name of names) {
     const seat = seatForTier(name);
     if (seat === null || seats[seat] !== undefined) continue;
-    const binding = bindingUsedPercent(usage[seat]);
-    seats[seat] = binding === null ? 'UNKNOWN' : binding;
+    seats[seat] = 'UNKNOWN';
   }
   return seats;
 }
