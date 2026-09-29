@@ -259,10 +259,19 @@ async function lookupPullRequestByHeadSha(
   baseBranch: string
 ): Promise<PullRequestEvidence | null> {
   try {
-    const result = await run('gh', ['api', `repos/${repository}/commits/${headSha}/pulls`], cwd);
+    // --paginate --slurp returns every page as an array of arrays, so the
+    // uniqueness check below sees all commit-associated PRs, not just page one.
+    const result = await run(
+      'gh',
+      ['api', `repos/${repository}/commits/${headSha}/pulls`, '--paginate', '--slurp'],
+      cwd
+    );
     const parsed: unknown = JSON.parse(result.stdout);
     if (!Array.isArray(parsed)) return null;
-    const matches = parsed.filter(entry => {
+    const entries: unknown[] = parsed.flatMap((page: unknown) =>
+      Array.isArray(page) ? (page as unknown[]) : [page]
+    );
+    const matches = entries.filter(entry => {
       if (typeof entry !== 'object' || entry === null) return false;
       const record = entry as Record<string, unknown>;
       const state = record.state;
@@ -297,7 +306,7 @@ async function lookupPullRequestByHeadSha(
     );
     const viewed = parsePullRequest(view.stdout);
     // headSha is the PR headRefOid. It must be the commit this lookup queried.
-    if (viewed === null || viewed.headSha !== headSha) return null;
+    if (viewed?.headSha !== headSha) return null;
     return viewed;
   } catch {
     return null;

@@ -190,14 +190,21 @@ function headShaLookupGh(options: {
       if (options.list === 'throw') throw new Error('gh api failed');
       const expected = `repos/${options.repository}/commits/${options.headSha}/pulls`;
       if (args[1] !== expected) throw new Error(`unexpected api path ${String(args[1])}`);
+      // Mirror `gh api --paginate --slurp`: one array per page, 1 entry per page
+      // so any uniqueness check that only read page one would be fooled.
+      if (!args.includes('--paginate') || !args.includes('--slurp')) {
+        throw new Error('commit pulls lookup must paginate with --paginate --slurp');
+      }
       return {
         stdout: JSON.stringify(
-          options.list.map(entry => ({
-            number: entry.number,
-            state: 'open',
-            head: { sha: entry.sha, ref: entry.ref },
-            base: { ref: entry.base },
-          }))
+          options.list.map(entry => [
+            {
+              number: entry.number,
+              state: 'open',
+              head: { sha: entry.sha, ref: entry.ref },
+              base: { ref: entry.base },
+            },
+          ])
         ),
       };
     }
