@@ -30,6 +30,7 @@ import {
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
+import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import {
   readCascadeRecordById,
   claimFrontierResolution,
@@ -5934,7 +5935,10 @@ export function registerApiRoutes(
           token: c.req.header('x-archon-operator-token') ?? process.env.ARCHON_OPERATOR_TOKEN ?? '',
         };
         if (cascadeOptions.dryRun) {
-          const record = await runCascade(cascadeOptions);
+          const record = await runCascade({
+            ...cascadeOptions,
+            deps: { seatUsage: conductorSeatUsage },
+          });
           return c.json({
             accepted: true,
             status: record.status,
@@ -5961,6 +5965,7 @@ export function registerApiRoutes(
               );
               if (!check.valid) throw new Error(check.error);
             },
+            seatUsage: conductorSeatUsage,
           },
           onAdmission: record => resolveAdmission?.(record),
         });
