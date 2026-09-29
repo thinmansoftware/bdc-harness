@@ -56,6 +56,9 @@ export interface MergeExecutionBridgeStore {
   claimVerdict(verdictId: string): Promise<boolean>;
   releaseVerdictClaim(verdictId: string, reason: string): Promise<boolean>;
   getRunById(runId: string): Promise<OverseerWatchRun | null>;
+  // Optional so older/test stores that predate the active-run guard keep prior
+  // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
+  hasActiveRunForWo?(woId: string): Promise<boolean>;
   reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
   releaseMergeSlot(verdictId: string): Promise<void>;
   recordOutcome(input: {
@@ -610,6 +613,52 @@ async function mergeClaimedVerdict(
   if (!basePolicy?.unattended) {
     await skip('integration_base_mismatch', pr.htmlUrl);
     return undefined;
+  }
+
+  // Defer the merge while a Cauldron run for the SAME WO is still executing, so
+  // the run is never failed by its own PR being merged underneath it
+  // (bdc-harness #1046). Only run-backed verdicts whose wo_id is a real WO id
+  // participate; run-less pull-ref verdicts (gh:owner/repo#N, run id
+  // pr-discovery:...) match no run and must never call the helper (Test 6). A
+  // deferral releases the claim and returns undefined -- NOT 'stop' -- so later
+  // verdicts in the same pass still process (only the rate ceiling stops the
+  // loop). The check fails safe: an error defers rather than merges.
+  if (
+    options.store.hasActiveRunForWo &&
+    !isRunlessVerdict(verdict) &&
+    typeof verdict.wo_id === 'string' &&
+    verdict.wo_id.startsWith('WO-')
+  ) {
+    let activeRun: boolean;
+    try {
+      activeRun = await options.store.hasActiveRunForWo(verdict.wo_id);
+    } catch (error) {
+      await options.store.releaseVerdictClaim(verdict.id, 'active_run_check_failed');
+      log.warn(
+        {
+          err: error as Error,
+          verdictId: verdict.id,
+          runId: verdict.run_id,
+          woId: verdict.wo_id,
+          prUrl: pr.htmlUrl,
+        },
+        'merge-coordinator.active_run_check_failed'
+      );
+      return undefined;
+    }
+    if (activeRun) {
+      await options.store.releaseVerdictClaim(verdict.id, 'active_run_deferred');
+      log.info(
+        {
+          verdictId: verdict.id,
+          runId: verdict.run_id,
+          woId: verdict.wo_id,
+          prUrl: pr.htmlUrl,
+        },
+        'merge-coordinator.active_run_deferred'
+      );
+      return undefined;
+    }
   }
 
   const isCeReleasePr =

@@ -258,6 +258,26 @@ export async function getOverseerWatchRunById(runId: string): Promise<OverseerWa
   return result.rows[0] ? normalizeRun(result.rows[0]) : null;
 }
 
+/**
+ * The user_message of every currently ACTIVE workflow run, so the merge bridge
+ * can defer merging a PR while a run for the same WO is still executing
+ * (bdc-harness #1046). Active statuses match the in-flight set used elsewhere
+ * (packages/core/src/db/workflows.ts): pending, running, waiting_provider,
+ * paused. Synthetic discovery-PR parent rows (workflow_name = 'pr-discovery')
+ * are excluded -- they are not real work and never carry a WO_ID marker.
+ */
+export async function listActiveRunUserMessages(): Promise<string[]> {
+  const result = await getDatabase().query<{ user_message: string | null }>(
+    `SELECT user_message
+     FROM remote_agent_workflow_runs
+     WHERE status IN ('pending', 'running', 'waiting_provider', 'paused')
+       AND workflow_name != 'pr-discovery'`
+  );
+  return result.rows
+    .map(row => (typeof row.user_message === 'string' ? row.user_message : ''))
+    .filter(message => message.length > 0);
+}
+
 interface OverseerEffectTimestampRow {
   last_effect_at: string | null;
 }
