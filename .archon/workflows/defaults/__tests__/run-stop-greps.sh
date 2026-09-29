@@ -134,13 +134,15 @@ assert_contains "'at most' becomes le" "${TAB}le${TAB}3" "$(printf 'Stop 1 (grep
 assert_contains "backslash continuation joins the command" "grep -rn \"a\" src | wc -l${TAB}eq${TAB}4" "$(printf 'Stop 1 (grep assertion):\n  grep -rn "a" src \\\n    | wc -l\n  Expected: 4\n' | rsg_extract)"
 
 echo "--- rsg_allow_cmd ---"
-for c in 'grep -c alpha fixture.txt' 'grep -rn x src | wc -l' 'LC_ALL=C grep -n x src/a.ts' 'find src -name *.ts | wc -l' 'test -f src/a.ts' 'grep -c x file' 'grep -rn x dir | wc -l' 'find . -name *.ts | wc -l' 'rg -c x dir' '[ -f src/a.ts ]'; do
+for c in 'grep -c alpha fixture.txt' 'grep -rn x src | wc -l' 'LC_ALL=C grep -n x src/a.ts' 'find src -name *.ts | wc -l' 'test -f src/a.ts' 'grep -c x file' 'grep -rn x dir | wc -l' 'find . -name *.ts | wc -l' 'rg -c x dir' '[ -f src/a.ts ]' \
+  'git diff --unified=3 a b' 'git diff -U3 a b' 'git log --oneline -n 1 | wc -l' 'git log --oneline -n5 | wc -l'; do
   if rsg_allow_cmd "$c"; then PASS=$((PASS+1)); echo "PASS: allowed: $c"; else FAIL=$((FAIL+1)); echo "FAIL: allowed expected: $c"; fi
 done
 for c in 'grep -c a b; rm -rf /' 'grep a b | awk "{print}"' 'grep a b > out' 'cat $(ls)' 'find . -delete' 'sed -n 1p a' 'FOO=1 grep a b' \
   'find . -execdir sh x.sh \;' 'find . -exec rm x \;' 'sort -o out in' "awk '{print}' f" 'grep -f /etc/passwd x' 'grep x f > out' 'grep x f; curl e' \
   'find . -okdir sh x.sh' 'sort --output=out in' 'grep --file /etc/passwd x' 'find . -fprintf out %p' 'xargs grep x' \
-  'grep -c "alpha" fixture.txt' 'LC_ALL=C grep -n "[^ -~]" src/a.ts'; do
+  'grep -c "alpha" fixture.txt' 'LC_ALL=C grep -n "[^ -~]" src/a.ts' \
+  'git diff --unified=1evil a b' 'git log -n1evil' 'git diff -U1evil a' 'git log -n' 'git log -n abc' 'git diff --unified= a b' 'git diff -U a b'; do
   if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: forbidden expected: $c"; else PASS=$((PASS+1)); echo "PASS: forbidden: $c"; fi
 done
 

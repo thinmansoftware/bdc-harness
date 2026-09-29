@@ -344,6 +344,9 @@ ACCEPT=(
   "git log --oneline -n 1 | wc -l"
   "git show $V2:f | grep -c line"
   "git diff --stat $V1 $V2 -- f | wc -l"
+  "git diff --unified=3 $V1 $V2 -- f | wc -l"
+  "git diff -U3 $V1 $V2 -- f | wc -l"
+  "git log --oneline -n5 | wc -l"
 )
 # Commands every lane's vma AND rsg must REJECT (Tests 4,5,7 + Test 16 a-j).
 REJECT=(
@@ -369,6 +372,13 @@ REJECT=(
   "find . -ex\"\"ec rm"
   "git diff --output* $V1"
   "git diff -Oout $V1"
+  "git diff --unified=1evil $V1 $V2"
+  "git log -n1evil"
+  "git diff -U1evil $V1"
+  "git log -n"
+  "git log -n abc"
+  "git diff --unified= $V1 $V2"
+  "git diff -U $V1"
 )
 
 for lane in $VMA_LANES; do

@@ -1882,7 +1882,7 @@ nodes:
       #   unknown flags all fail closed); a non-hyphen token is a revision/path. The
       #   flag check runs on the STRIPPED argv the executor also runs.)
       rsg_git_readonly() {
-        local sub="${1:-}" tok seen_ddash=0
+        local sub="${1:-}" tok seen_ddash=0 expect_count=0
         case "$sub" in
           diff|log|show) ;;
           *) return 1 ;;
@@ -1890,20 +1890,27 @@ nodes:
         shift
         for tok in "$@"; do
           if [ "$seen_ddash" -eq 1 ]; then continue; fi
+          if [ "$expect_count" -eq 1 ]; then
+            case "$tok" in ''|*[!0-9]*) return 1 ;; esac
+            expect_count=0
+            continue
+          fi
           if [ "$tok" = "--" ]; then seen_ddash=1; continue; fi
           case "$tok" in
             -*)
               case "$tok" in
                 --stat|--numstat|--shortstat|--name-only|--name-status|--oneline|--no-merges|--cached|--staged|--summary) ;;
-                --unified=[0-9]*) ;;
-                -n|-n[0-9]*) ;;
-                -U[0-9]*) ;;
+                --unified=*) case "${tok#--unified=}" in ''|*[!0-9]*) return 1 ;; esac ;;
+                -U*) case "${tok#-U}" in ''|*[!0-9]*) return 1 ;; esac ;;
+                -n) expect_count=1 ;;
+                -n*) case "${tok#-n}" in ''|*[!0-9]*) return 1 ;; esac ;;
                 *) return 1 ;;
               esac
               ;;
             *) : ;;
           esac
         done
+        if [ "$expect_count" -eq 1 ]; then return 1; fi
         return 0
       }
       # rsg_tokens_safe <tokens...>   (rc 0 when every token is admissible; populates
