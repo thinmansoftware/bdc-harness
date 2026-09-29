@@ -1291,6 +1291,12 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       if (typeof used === 'number' && used >= thresholdPercent) overThreshold[lane] = true;
     }
     laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth }, overThreshold);
+    // The routing threshold only steers between lanes; it must never hold a fire that the
+    // unfiltered decision would dispatch (seats below the run-start cutoff stay usable).
+    if (laneDecision.holding) {
+      const unfiltered = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+      if (!unfiltered.holding) laneDecision = unfiltered;
+    }
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.seat_headroom_read_failed');
     laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });

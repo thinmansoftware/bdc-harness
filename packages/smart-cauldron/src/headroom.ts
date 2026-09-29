@@ -76,8 +76,7 @@ export function chooseHeadroomEntry(input: {
   pinned: boolean;
 }): EntrySelection {
   const { picked, tiers, refusedTiers, premiumTiers, usage, thresholdPercent, pinned } = input;
-  const seats =
-    usage === null || usage === undefined ? {} : seatsFromPick(picked, tiers, usage);
+  const seats = usage === null || usage === undefined ? {} : seatsFromPick(picked, tiers, usage);
   const keep = (reason: string): EntrySelection => ({
     picked,
     entry: picked,
