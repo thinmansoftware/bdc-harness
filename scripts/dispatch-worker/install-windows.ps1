@@ -64,7 +64,14 @@ if ($PSCmdlet.ShouldProcess($WatchdogTaskName, 'Register repeating dispatch work
     # duration -- effectively an indefinite 5-minute heartbeat check.
     $watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::MaxValue)
     $watchdogSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-    $watchdogPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+    # LogonType S4U (Service-For-User), not Interactive: the watchdog's whole job
+    # is non-logon-gated recovery (see comment above), so it must run whether or
+    # not an interactive session exists. Interactive only runs while the user is
+    # logged on, which would defeat the recovery guarantee. S4U runs as the user
+    # without a stored password and without requiring an interactive logon; the
+    # local-only access token it grants is sufficient for checking the local PID
+    # lockfile and restarting the local worker task.
+    $watchdogPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
     Register-ScheduledTask -TaskName $WatchdogTaskName -Action $watchdogAction -Trigger $watchdogTrigger -Settings $watchdogSettings -Principal $watchdogPrincipal -Force | Out-Null
     Write-Output "DISPATCH_WINDOWS_WATCHDOG_TASK_REGISTERED=$WatchdogTaskName"
 }

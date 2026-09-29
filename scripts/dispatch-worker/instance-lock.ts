@@ -110,7 +110,13 @@ export async function acquireInstanceLock(
 
   const existing = await readLockContents(options.lockFile);
   const existingPid = existing.pid;
-  if (existingPid !== null && existingPid !== pid && isAlive(existingPid)) {
+  // Take exactly one liveness reading and reuse it for both the reject and the
+  // reclaim decision. Calling isAlive twice would let liveness change (or a PID
+  // be reused) between calls, which could reclaim a lock held by a live process
+  // -- or throw for one that has since died -- with no matching evidence logged.
+  const existingIsForeign = existingPid !== null && existingPid !== pid;
+  const existingAlive = existingIsForeign ? isAlive(existingPid) : false;
+  if (existingIsForeign && existingAlive) {
     throw new Error(
       `dispatch_worker_already_running: pid ${existingPid} holds ${options.lockFile}`
     );
@@ -120,7 +126,7 @@ export async function acquireInstanceLock(
   // to the append-only death log BEFORE the lock is overwritten -- otherwise a
   // watchdog restart erases the only trace that the previous process died.
   let reclaimed: RestartEvidenceEntry | null = null;
-  if (existingPid !== null && existingPid !== pid && !isAlive(existingPid)) {
+  if (existingIsForeign && !existingAlive) {
     reclaimed = {
       previous_pid: existingPid,
       previous_started_at: existing.started_at ?? '',
@@ -207,7 +213,10 @@ export async function readRestartEvidence(
     if (typeof reclaimedAt !== 'string') continue;
     if (cutoffMs !== null) {
       const reclaimedMs = Date.parse(reclaimedAt);
-      if (Number.isFinite(reclaimedMs) && reclaimedMs < cutoffMs) continue;
+      // The retention contract keeps only entries demonstrably newer than the
+      // cutoff. An unparseable timestamp (NaN) cannot demonstrate that, so it
+      // is rejected rather than silently retained.
+      if (!Number.isFinite(reclaimedMs) || reclaimedMs < cutoffMs) continue;
     }
     entries.push({ previous_pid: pid, previous_started_at: startedAt, reclaimed_at: reclaimedAt });
   }
