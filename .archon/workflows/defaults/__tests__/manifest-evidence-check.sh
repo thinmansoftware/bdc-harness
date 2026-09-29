@@ -46,6 +46,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
+bdc-feature-development-astra.yaml
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
 bdc-feature-development-cursor.yaml
@@ -87,17 +88,17 @@ for fn in mec_field mec_check sme_field sme_process; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: mec core byte-identical across all 12 lanes ---"
+echo "--- Parity: mec core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$MEC_CORE" "$(extract_core "$DEFAULTS/$lane" mec)"
 done
 
-echo "--- Parity: sme core byte-identical across all 12 lanes ---"
+echo "--- Parity: sme core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "sme parity $lane" "$SME_CORE" "$(extract_core "$DEFAULTS/$lane" sme)"
 done
 
-echo "--- Parity: evidence call sites byte-identical across all 12 lanes ---"
+echo "--- Parity: evidence call sites byte-identical across all 13 lanes ---"
 SME_CALL="$(extract_call "$CANONICAL_YAML" sme_process)"
 MEC_CALL="$(extract_call "$CANONICAL_YAML" mec_check)"
 for lane in $LANES; do
@@ -167,9 +168,15 @@ echo "--- Test 7: no greps declared, Grep assertions: N/A -> OK ---"
 R="$(run_check "$NA_GREPS" PROCEED CODE passed 0 none_declared)"
 assert_eq "rc 0 / OK" "0|OK|" "$R"
 
-echo "--- Test 7b: declared greps with incomplete execution -> admitted ---"
-R="$(run_check "$GOOD" PROCEED CODE passed 5 incomplete 0 2 2 1 0)"
-assert_eq "incomplete greps admitted" "0|OK|" "$R"
+# WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01 REVERSES this case. A declared stop
+# grep the allowlist REJECTED is not evidence, so incomplete WITH grep_dropped > 0
+# is refused and every rejected command is named. Incomplete caused ONLY by
+# unparsed prose (dropped 0) is still admitted -- see Test FP-4 and Test 11.
+echo "--- Test 7b: declared greps incomplete WITH dropped -> refused ---"
+R="$(run_check "$GOOD" PROCEED CODE passed 5 incomplete 0 2 2 1 0 'DROPPED (not on read-only allowlist; not executed): grep -c '"'"'a b'"'"' f => expected eq 1')"
+assert_eq "incomplete greps with dropped now refused" "1" "${R%%|*}"
+assert_contains "refusal is HARNESS_REFUSED" "HARNESS_REFUSED" "$R"
+assert_contains "refusal names the rejected command" "STOP_GREP_REJECTED: grep -c 'a b' f" "$R"
 
 echo "--- Test 7c: declared greps with a mismatch -> error ---"
 R="$(run_check "$GOOD" PROCEED CODE passed 5 mismatch 0 5 0 0 1)"
@@ -230,7 +237,7 @@ assert_contains "FP-6 mismatch evidence error" "EVIDENCE_ERROR:" "$R"
 if printf '%s\n' "$R" | grep -Fq 'SPEC_DEFECT'; then FAIL=$((FAIL + 1)); echo "FAIL: FP-6 must not be SPEC_DEFECT"; else PASS=$((PASS + 1)); echo "PASS: FP-6 must not be SPEC_DEFECT"; fi
 
 echo "--- Test FP-7: lane parity is deterministic ---"
-assert_eq "FP-7 lane count" "12" "$(printf '%s\n' $LANES | grep -c .)"
+assert_eq "FP-7 lane count" "13" "$(printf '%s\n' $LANES | grep -c .)"
 
 echo "--- Test 9: non-PROCEED paths are not gated ---"
 R="$(run_check "$NA_TESTS" ALREADY_SATISFIED CODE "" 0 "")"
@@ -248,6 +255,61 @@ echo "--- mec_field ---"
 assert_eq "TESTS_CLASS" "CODE" "$(mec_field TESTS_CLASS "$(printf 'TESTS_CLASS=CODE\nTESTS_STATUS=passed')")"
 assert_eq "GREP_DECLARED" "9" "$(mec_field GREP_DECLARED "$(printf 'GREP_DECLARED=9\nGREP_STATUS=passed')")"
 assert_eq "missing -> empty" "" "$(mec_field GREP_DECLARED "")"
+
+# =============================================================================
+# WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01 -- a rejected stop grep FAILS the
+# manifest-evidence gate and is named, instead of passing the run green with the
+# stop condition silently skipped (bdc-harness issue 1047).
+# =============================================================================
+echo "--- Test 10: dropped-stop-grep-fails-the-gate-naming-the-command ---"
+# Modelled on live run ea46da63: 5 declared, 1 executed, 4 dropped by the allowlist.
+EA_DETAIL="$(printf '%s\n' \
+  "DROPPED (not on read-only allowlist; not executed): grep -c 'INSERT INTO stripe_webhook_events' shopops-api/routes/webhooks.js => expected eq 2" \
+  "DROPPED (not on read-only allowlist; not executed): grep -c 'paid_at) VALUES' shopops-api/routes/webhooks.js => expected eq 0" \
+  "DROPPED (not on read-only allowlist; not executed): grep -c 'ON CONFLICT (tenant_id, stripe_payment_id)' shopops-api/routes/webhooks.js => expected eq 2" \
+  "DROPPED (not on read-only allowlist; not executed): grep -c 'CREATE TABLE IF NOT EXISTS stripe_webhook_events' shopops-api/migrations/20260928_stripe_webhook_events_ledger.sql => expected eq 1")"
+R="$(run_check "$GOOD" PROCEED CODE passed 5 incomplete 0 1 4 0 0 "$EA_DETAIL")"
+assert_eq "T10 rc 1 (the live run went green; it must not)" "1" "${R%%|*}"
+assert_contains "T10 HARNESS_REFUSED" "HARNESS_REFUSED" "$R"
+assert_contains "T10 counts the rejections" "4 of 5 declared grep stop condition(s) were REJECTED" "$R"
+assert_contains "T10 names dropped 1 verbatim" "STOP_GREP_REJECTED: grep -c 'INSERT INTO stripe_webhook_events' shopops-api/routes/webhooks.js" "$R"
+assert_contains "T10 names dropped 2 verbatim" "STOP_GREP_REJECTED: grep -c 'paid_at) VALUES' shopops-api/routes/webhooks.js" "$R"
+assert_contains "T10 names dropped 3 verbatim" "STOP_GREP_REJECTED: grep -c 'ON CONFLICT (tenant_id, stripe_payment_id)' shopops-api/routes/webhooks.js" "$R"
+assert_contains "T10 names dropped 4 verbatim" "STOP_GREP_REJECTED: grep -c 'CREATE TABLE IF NOT EXISTS stripe_webhook_events' shopops-api/migrations/20260928_stripe_webhook_events_ledger.sql" "$R"
+assert_eq "T10 emits exactly four STOP_GREP_REJECTED lines" "4" "$(printf '%s\n' "$R" | grep -c 'STOP_GREP_REJECTED:')"
+assert_not_contains "T10 the expected-count suffix is stripped" "=> expected eq 2" "$(printf '%s\n' "$R" | grep 'STOP_GREP_REJECTED:' || true)"
+
+echo "--- Test 10b: all_dropped also names every rejected command ---"
+# Modelled on live run 8ab3032a: 3 declared, 0 executed, 3 dropped.
+AD_DETAIL="$(printf '%s\n' \
+  "DROPPED (not on read-only allowlist; not executed): grep -c 'SET LOCAL app.tenant_id' shopops-api/migrations/20260706c_orderlines_exempt_inventory_ratio.sql => expected eq 1" \
+  "DROPPED (not on read-only allowlist; not executed): grep -c 'SET LOCAL app.tenant_id' shopops-api/migrations/20260619_clear_unresolved_cover_sources.sql => expected eq 1" \
+  "DROPPED (not on read-only allowlist; not executed): grep -c '^<<<<<<<' shopops-api/tests/test_ci_staging_migrations.js => expected eq 0")"
+R="$(run_check "$GOOD" PROCEED CODE passed 3 all_dropped 0 0 3 0 0 "$AD_DETAIL")"
+assert_eq "T10b rc 1" "1" "${R%%|*}"
+assert_contains "T10b HARNESS_REFUSED" "HARNESS_REFUSED" "$R"
+assert_eq "T10b emits exactly three STOP_GREP_REJECTED lines" "3" "$(printf '%s\n' "$R" | grep -c 'STOP_GREP_REJECTED:')"
+assert_contains "T10b names the conflict-marker grep" "STOP_GREP_REJECTED: grep -c '^<<<<<<<' shopops-api/tests/test_ci_staging_migrations.js" "$R"
+
+echo "--- Test 11: unparsed-only-incomplete-still-admitted ---"
+R="$(run_check "$GOOD" PROCEED CODE passed 3 incomplete 0 2 0 1 0)"
+assert_eq "T11 unparsed-only incomplete still admitted (FP-4 preserved)" "0|OK|" "$R"
+R="$(run_check "$GOOD" PROCEED CODE passed 5 mismatch 0 5 0 0 1)"
+assert_eq "T11 a mismatch input still refuses" "1" "${R%%|*}"
+R="$(run_check "$GOOD" PROCEED CODE passed 5 incomplete 0 0 0 5 0)"
+assert_eq "T11 an executed-0 incomplete input still refuses" "1" "${R%%|*}"
+R="$(run_check "$GOOD" PROCEED CODE passed 0 none_declared)"
+assert_eq "T11 no declared greps is untouched" "0|OK|" "$R"
+
+echo "--- Test 11b: mec_rejected_lines parses only DROPPED lines ---"
+MIXED="$(printf '%s\n' \
+  "OK: grep -c alpha f => 2 (expected eq 2)" \
+  "DROPPED (command errored): grep -c x missing.txt => expected ge 1" \
+  "MISMATCH: grep -c beta f => 1 (expected eq 2)")"
+OUT="$(mec_rejected_lines "$MIXED")"
+assert_eq "T11b only the DROPPED line is reported" "1" "$(printf '%s\n' "$OUT" | grep -c 'STOP_GREP_REJECTED:')"
+assert_contains "T11b errored-command reason prefix is stripped too" "STOP_GREP_REJECTED: grep -c x missing.txt" "$OUT"
+assert_eq "T11b empty detail yields nothing" "" "$(mec_rejected_lines '')"
 
 echo
 echo "manifest-evidence-check.sh: $PASS passed, $FAIL failed"

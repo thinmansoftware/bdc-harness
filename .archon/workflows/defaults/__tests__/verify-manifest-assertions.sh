@@ -289,6 +289,172 @@ OUTOK="$(vma_process_assertions "grep -c alpha $FIX/data.txt | wc -l => 1" "" 2>
 assert_eq "piped read-only command kept" "grep -c alpha $FIX/data.txt | wc -l => 1" "$OUTOK"
 
 # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Test 14 (WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01): vma is the SECOND
+# allowlist on the same assertions run-stop-greps already judged. If the two
+# disagree, an assertion rsg admits is silently dropped here and vanishes from
+# the PR-body "Grep assertions:" line. This test pins the two verdicts EQUAL for
+# every command in Tests 1-7, proves a quoted pipe does not split, proves read-only
+# git executes with the same count as a direct run, and proves the hardened
+# executor never runs a repository textconv / diff.external program.
+# -----------------------------------------------------------------------------
+echo "--- Test 14: vma-allowlist-parity-and-quote-aware ---"
+
+extract_rsg_core() {
+  awk '
+    /# ---- BEGIN rsg core/ { c=1; next }
+    /# ---- END rsg core/   { c=0 }
+    c
+  ' "$1" | sed 's/^      //'
+}
+RSG_CORE="$(extract_rsg_core "$CANONICAL_YAML")"
+if [ -z "$RSG_CORE" ]; then
+  echo "FATAL: could not extract rsg core from $CANONICAL_YAML"
+  exit 1
+fi
+eval "$RSG_CORE"
+if ! declare -F rsg_allow_cmd >/dev/null; then
+  echo "FATAL: rsg_allow_cmd not defined after eval"
+  exit 1
+fi
+for fn in vma_split_pipe vma_tokenize vma_quoted_inner_ok vma_git_readonly vma_harden_git; do
+  if declare -F "$fn" >/dev/null; then
+    PASS=$((PASS + 1)); echo "PASS: vma core defines $fn"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL: vma core defines $fn"
+  fi
+done
+
+# Fixture git repo with an ARMED textconv / external-diff payload (Test 6 + 8).
+GFIX="$(mktemp -d)"
+(
+  cd "$GFIX" && git init -q . && git config user.email t@example.com && git config user.name t
+  printf 'line one\na b\n' > f && git add f && git commit -qm one
+  printf 'line one\na b\nline three\n' > f && git commit -qam two
+  printf 'f diff=evil\n' > .gitattributes
+  printf '#!/bin/sh\ntouch "%s/pwned-rsg"\ncat "$1"\n' "$GFIX" > ev.sh && chmod +x ev.sh
+  git config diff.evil.textconv "$GFIX/ev.sh"
+  git config diff.external "$GFIX/ev.sh"
+) >/dev/null 2>&1
+GA="$(cd "$GFIX" && git rev-parse HEAD~1)"
+GB="$(cd "$GFIX" && git rev-parse HEAD)"
+
+# Rows both gates must ADMIT (Tests 1, 2, 3, 6).
+while IFS= read -r c; do
+  [ -z "$c" ] && continue
+  c="${c//@GA@/$GA}"; c="${c//@GB@/$GB}"
+  r=0; v=0
+  rsg_allow_cmd "$c" || r=1
+  allow_cmd "$c" || v=1
+  if [ "$r" = 0 ] && [ "$v" = 0 ]; then
+    PASS=$((PASS + 1)); echo "PASS: T14 both gates admit: $c"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL: T14 verdicts differ (rsg=$r vma=$v): $c"
+  fi
+done <<'ADMIT_ROWS'
+grep -c 'SET LOCAL app.tenant_id' store.sql
+grep -c '^foo bar' anchor.txt
+grep -c '^<<<<<<<' markers.txt
+grep -c 'alpha|beta' rx.txt
+grep -c '[0-9]' rx.txt
+grep -c 'a\.b' rx.txt
+grep -c 'end$' rx.txt
+grep -c '(paren)' rx.txt
+grep -c 'x  y' rx.txt
+grep -c 'a b' spaced.txt
+grep -c '^x' caret.txt
+git diff --name-only @GA@ @GB@ -- f | wc -l
+git log --oneline -1 | wc -l
+git show @GB@:f | grep -c line
+ADMIT_ROWS
+
+# Rows both gates must REJECT (Tests 4, 5, 7).
+while IFS= read -r c; do
+  [ -z "$c" ] && continue
+  r=0; v=0
+  rsg_allow_cmd "$c" || r=1
+  allow_cmd "$c" || v=1
+  if [ "$r" = 1 ] && [ "$v" = 1 ]; then
+    PASS=$((PASS + 1)); echo "PASS: T14 both gates reject: $c"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL: T14 verdicts differ (rsg=$r vma=$v): $c"
+  fi
+done <<'REJECT_ROWS'
+grep -c "needle" f
+grep -c needle f > out
+grep -c needle f; rm x
+grep -c needle f && ls
+cat $(ls)
+grep -c 'a;b' f
+grep -c '$(id)' f
+grep -c 'x => y' f
+grep -c 'x f
+grep -c '' f
+grep -c a'b' f
+grep '--file=/etc/passwd' x
+grep -c '-f x' f
+find . '-exec' rm
+sort '-o' out
+awk '{print}' f
+grep a b | awk '{print}'
+git diff --output=out
+git -c core.pager=x diff
+git push origin x
+git checkout HEAD~1
+git config user.name x
+git diff --ext-diff
+git diff -O x
+git log --exec-path
+git commit -m x
+REJECT_ROWS
+
+# A quoted pipe is data: it must not fragment the assertion.
+assert_eq "T14 a quoted pipe does not split into segments" "1" \
+  "$(vma_split_pipe "grep -c 'a|b' f" | grep -c .)"
+assert_eq "T14 a real pipe still splits into two segments" "2" \
+  "$(vma_split_pipe 'grep -c a f | wc -l' | grep -c .)"
+assert_eq "T14 a double pipe outside quotes is rejected" "1" \
+  "$(vma_split_pipe 'grep a f || ls' >/dev/null 2>&1; echo $?)"
+
+# git hardening: the executed string always carries the safety flags.
+assert_eq "T14 git segment is hardened before execution" \
+  "git --no-pager diff --no-ext-diff --no-textconv --name-only $GA $GB -- f | wc -l" \
+  "$(vma_harden_git "git diff --name-only $GA $GB -- f | wc -l")"
+assert_eq "T14 a non-git segment is passed through unchanged" \
+  "grep -c 'a|b' rx.txt" "$(vma_harden_git "grep -c 'a|b' rx.txt")"
+
+# The fixture is real: an UNGUARDED git diff runs the payload.
+rm -f "$GFIX/pwned-rsg"
+(cd "$GFIX" && git diff "$GA" "$GB" -- f >/dev/null 2>&1) || true
+assert_eq "T14 fixture is armed (unguarded git diff runs the payload)" "1" \
+  "$(test -e "$GFIX/pwned-rsg" && echo 1 || echo 0)"
+
+# The vma executor runs git through vma_process_assertions with the same count a
+# direct hardened run gives, and never creates pwned-rsg.
+rm -f "$GFIX/pwned-rsg"
+REF="$(cd "$GFIX" && git --no-pager diff --no-ext-diff --no-textconv "$GA" "$GB" -- f | wc -l | tr -d ' ')"
+OUT="$(cd "$GFIX" && vma_process_assertions "git diff $GA $GB -- f | wc -l => $REF" "" 2>/dev/null)"
+assert_eq "T14 vma executes read-only git with the direct-run count" \
+  "git diff $GA $GB -- f | wc -l => $REF" "$OUT"
+assert_eq "T14 pwned-rsg is NOT created by the vma executor" "0" \
+  "$(test -e "$GFIX/pwned-rsg" && echo 1 || echo 0)"
+
+# A quoted-space assertion survives vma instead of being dropped.
+printf 'a b\na b\nc d\n' > "$GFIX/spaced.txt"
+OUT="$(cd "$GFIX" && vma_process_assertions "grep -c 'a b' spaced.txt => 2" "" 2>/dev/null)"
+assert_eq "T14 a quoted-space assertion survives vma with its count" \
+  "grep -c 'a b' spaced.txt => 2" "$OUT"
+OUT="$(cd "$GFIX" && vma_process_assertions "grep -c 'a b' spaced.txt => 9" "" 2>/dev/null)"
+assert_eq "T14 vma still CORRECTS a wrong count on a quoted assertion" \
+  "grep -c 'a b' spaced.txt => 2" "$OUT"
+# A mutating git assertion is still dropped, leaving the N/A fallback.
+OUT="$(cd "$GFIX" && vma_process_assertions "git commit -m x => 1" "" 2>/dev/null)"
+assert_contains "T14 a mutating git assertion is dropped by vma" "N/A (all emitted grep assertions dropped" "$OUT"
+
+rm -rf "$GFIX"
+
+# -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
 echo ""

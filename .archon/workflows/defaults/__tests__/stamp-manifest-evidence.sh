@@ -48,8 +48,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
+bdc-feature-development-astra.yaml
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
+bdc-feature-development-cursor.yaml
 bdc-feature-development-fable.yaml
 bdc-feature-development-fusion-cx-kimi.yaml
 bdc-feature-development-fusion-cx-qwen.yaml
@@ -78,7 +80,7 @@ for fn in sme_field sme_process; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: sme core byte-identical across all 11 lanes ---"
+echo "--- Parity: sme core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$SME_CORE" "$(extract_core "$DEFAULTS/$lane" sme)"
 done
@@ -141,10 +143,15 @@ OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c 
 assert_contains "VALIDATION: FAIL on grep mismatch" "VALIDATION: FAIL" "$OUT"
 assert_contains "audit line says greps=mismatch" "greps=mismatch" "$OUT"
 
-echo "--- Test 3b: incomplete greps flip VALIDATION to FAIL ---"
-OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c "a" b => 1; 1/2 declared grep assertions executed' incomplete)"
-assert_contains "VALIDATION: FAIL on incomplete greps" "VALIDATION: FAIL" "$OUT"
+# WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01 repairs this test: it is RED on dev
+# because it never passed a grep_dropped count, so it asserted a FAIL that the
+# code did not (and per FP-4 must not) produce for unparsed-only incompleteness.
+# What flips VALIDATION is a DROPPED condition, so the test now passes dropped=1.
+echo "--- Test 3b: incomplete greps WITH a dropped condition flip VALIDATION to FAIL ---"
+OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c "a" b => 1; 1/2 declared grep assertions executed' incomplete 1)"
+assert_contains "VALIDATION: FAIL on incomplete greps with dropped=1" "VALIDATION: FAIL" "$OUT"
 assert_contains "audit line says greps=incomplete" "greps=incomplete" "$OUT"
+assert_contains "audit line carries dropped=1" "dropped=1" "$OUT"
 
 echo "--- Test 4: short ALREADY_SATISFIED manifest passes through untouched ---"
 SHORT='WO: WO-X
@@ -170,6 +177,33 @@ echo "--- Test 7: manifest with Tests: but no Grep/VALIDATION lines gets both ap
 OUT="$(printf 'WO: WO-X\nTests: N/A\nPRs: x\n' | sme_process "3/3 (bun test)" passed "grep -c a b => 1" passed)"
 assert_contains "Tests stamped" "Tests: 3/3 (bun test)" "$OUT"
 assert_eq "Grep line appended at end, then audit line" "$(printf 'WO: WO-X\nTests: 3/3 (bun test)\nPRs: x\nGrep assertions: grep -c a b => 1\nStop conditions: tests=passed; greps=passed (observed by run-stop-tests / run-stop-greps in the run worktree)')" "$OUT"
+
+# =============================================================================
+# Test 12 (WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01): a DROPPED stop grep makes
+# the stamped manifest say FAIL. An UNPARSED-only incomplete keeps PASS (FP-4).
+# =============================================================================
+echo "--- Test 12: stamp-flips-validation-on-dropped ---"
+# Case A: incomplete BECAUSE a declared condition was dropped.
+OUT_A="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "27/27 (node t.js)" passed "grep -c alpha f => 2; UNVERIFIED (dropped): grep -c 'a b' f" incomplete 1)"
+assert_contains "T12 case A stamps VALIDATION: FAIL" "VALIDATION: FAIL" "$OUT_A"
+assert_not_contains "T12 case A does not stamp PASS" "VALIDATION: PASS" "$OUT_A"
+assert_contains "T12 case A audit says greps=incomplete" "greps=incomplete" "$OUT_A"
+assert_contains "T12 case A audit carries dropped=1" "dropped=1" "$OUT_A"
+
+# Case B: incomplete ONLY because a prose condition could not be parsed (FP-4).
+OUT_B="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "27/27 (node t.js)" passed 'grep -c alpha f => 2; UNVERIFIED (unparsed): prose condition one' incomplete 0)"
+assert_contains "T12 case B stamps VALIDATION: PASS" "VALIDATION: PASS" "$OUT_B"
+assert_not_contains "T12 case B does not flip to FAIL" "VALIDATION: FAIL" "$OUT_B"
+assert_contains "T12 case B audit carries dropped=0" "dropped=0" "$OUT_B"
+assert_contains "T12 case B names the unparsed condition" "unparsed=prose condition one" "$OUT_B"
+
+# A dropped count with a NON-incomplete status must not change the verdict path.
+OUT_C="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "27/27 (node t.js)" passed 'grep -c alpha f => 2' passed 0)"
+assert_contains "T12 passed greps keep VALIDATION: PASS" "VALIDATION: PASS" "$OUT_C"
+OUT_D="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "27/27 (node t.js)" passed 'grep -c alpha f => 1' mismatch 0)"
+assert_contains "T12 a mismatch still stamps FAIL" "VALIDATION: FAIL" "$OUT_D"
+OUT_E="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "27/27 (node t.js)" passed 'N/A (none executable)' all_dropped 3)"
+assert_contains "T12 all_dropped still stamps FAIL" "VALIDATION: FAIL" "$OUT_E"
 
 echo
 echo "stamp-manifest-evidence.sh: $PASS passed, $FAIL failed"
