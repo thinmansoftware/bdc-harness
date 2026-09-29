@@ -1321,6 +1321,49 @@ describe('dispatch db', () => {
     ).resolves.toEqual({ ok: false, reason: 'already_disposed' });
   });
 
+  test('T18 guarded machine disposition refuses a row with a human receipt', async () => {
+    const guarded = await createMessage({
+      correlation_id: 'corr-reader-guarded',
+      idempotency_key: 'idem-reader-guarded',
+      task_type: 'agent_message',
+      sender: 'taskmaster',
+      recipient: 'operator',
+      body: 'Taskmaster daily digest test',
+    });
+    expect((await acknowledgeMessage({ id: guarded.id, principal_id: 'operator' })).ok).toBe(true);
+    await expect(
+      disposeMessageByMachine({
+        id: guarded.id,
+        actor: 'system:inbox-reader',
+        disposition: 'expired',
+        requireNoReceipt: true,
+      })
+    ).resolves.toEqual({ ok: false, reason: 'receipt_present' });
+    expect(await getMessage(guarded.id)).toMatchObject({
+      route_disposition: null,
+      acknowledged_by: 'operator',
+    });
+
+    const legacy = await createMessage({
+      correlation_id: 'corr-reader-legacy',
+      idempotency_key: 'idem-reader-legacy',
+      task_type: 'agent_message',
+      sender: 'taskmaster',
+      recipient: 'operator',
+      body: 'Taskmaster daily digest legacy',
+    });
+    expect((await acknowledgeMessage({ id: legacy.id, principal_id: 'operator' })).ok).toBe(true);
+    expect(
+      (
+        await disposeMessageByMachine({
+          id: legacy.id,
+          actor: 'system:inbox-reader',
+          disposition: 'expired',
+        })
+      ).ok
+    ).toBe(true);
+  });
+
   test('addresses only acknowledged mail by its acknowledger and is idempotent', async () => {
     const message = await createMessage({
       correlation_id: 'corr-address',

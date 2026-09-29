@@ -32,7 +32,8 @@ export interface WorkerHeartbeatAlarmConfig {
   issue: string;
 }
 
-const DEFAULT_WATCHED_WORKERS = 'dispatch-worker-ASUS-ROG-DSK-2T,overseer-review-worker';
+const DEFAULT_WATCHED_WORKERS =
+  'dispatch-worker-ASUS-ROG-DSK-2T,overseer-review-worker,inbox-reader';
 const DEFAULT_ALARM_ISSUE = 'gh:thinmansoftware/bdc-xo#2489';
 
 export function readWorkerHeartbeatAlarmConfig(): WorkerHeartbeatAlarmConfig {

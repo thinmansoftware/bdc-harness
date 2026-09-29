@@ -39,3 +39,62 @@ curl -X POST "$ARCHON_URL/api/dispatch/messages/$MESSAGE_ID/ack" \
 The lease is checked again in the same transaction that writes the receipt. A stale lease returns
 `409 lease_fence_stale`. A bare operator token always binds the actor to `operator`; omitting the
 body on a non-`operator` mailbox therefore returns `409 wrong_recipient`.
+## Inbox reader
+
+The inbox reader classifies the `xo` mailbox every five minutes and can optionally take ownership
+of `operator`. It ships in dry-run mode with the existing operator consumer still enabled.
+
+| Variable | Default | Rule |
+|---|---:|---|
+| `INBOX_READER_INTERVAL_MS` | `300000` | Integer at least zero; zero disables the scheduler. |
+| `INBOX_READER_MODE` | `dry-run` | Only exact `enforce` enables dispositions. |
+| `INBOX_READER_MAX_PER_RUN` | `500` | Clamped to 1 through 500. |
+| `INBOX_READER_MIN_AGE_MS` | `600000` | May be raised but never lowered below ten minutes. |
+| `INBOX_READER_OPERATOR_OWNER` | `consumer` | Exact `reader` transfers the operator mailbox. |
+| `INBOX_READER_ACTIONABLE_ALERT_HOURS` | `24` | Positive number. |
+| `INBOX_READER_GAP_ALERT_HOURS` | `2` | Positive number. |
+| `INBOX_READER_ALERT_REPEAT_HOURS` | `6` | Positive number. |
+| `INBOX_READER_RETENTION_DAYS` | `14` | Positive integer. |
+
+Each run lists at most `INBOX_READER_MAX_PER_RUN` rows in total, split evenly across the owned
+mailboxes first (so a full `xo` page can never starve `operator`), with any unused share then
+offered to the others. Listing is a keyset walk over the database-assigned `seq`
+(`listMessagesBySeqCursor` with `openOnly`); each mailbox's position is saved as `cursors` in
+`state.json`, so retained ACTIONABLE mail no longer hides the rows behind it: the next run resumes
+after the last row read and wraps to the head once it reaches the tail. Delete `state.json` to
+restart every walk at the head.
+
+Read the current digest with:
+
+```sh
+ssh hetzner-prod "cat /opt/bdc/archon-data/inbox-reader/latest.md"
+```
+
+The companion files are `/opt/bdc/archon-data/inbox-reader/latest.json`,
+`/opt/bdc/archon-data/inbox-reader/alerts.jsonl`, and
+`/opt/bdc/archon-data/inbox-reader/runs/`.
+
+To enable expiry, set `INBOX_READER_MODE=enforce` in `/opt/bdc/archon/.env`. To transfer the
+operator mailbox too, separately set `INBOX_READER_OPERATOR_OWNER=reader`. Apply either change by
+recreating the app container with `docker compose up -d app`: recreate, not restart, because a
+restart does not reload the environment file.
+
+Rollback by setting `INBOX_READER_INTERVAL_MS=0`, restoring
+`INBOX_READER_OPERATOR_OWNER=consumer`, and recreating the container.
+
+The legacy operator surface can be classified read-only on the host with:
+
+```sh
+bun scripts/dispatch/inbox-reader-report.ts --surface /opt/bdc/archon-data/operator-inbox/surface.jsonl
+```
+
+Inside the container, `getArchonHome()` resolves to `/.archon`, so use:
+
+```sh
+docker exec archon-app-1 bun scripts/dispatch/inbox-reader-report.ts --surface /.archon/operator-inbox/surface.jsonl
+```
+
+The reader never acknowledges, addresses or cancels; it only machine-disposes INFO_DUPLICATE and NUDGE rows as expired, and only in enforce mode.
+
+Direct receipt operations and cancellation are prohibited. The legacy non-terminal surface
+disposition remains owned by the existing operator consumer and is not produced by this reader.

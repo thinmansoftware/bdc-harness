@@ -83,6 +83,7 @@ import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
 import { startTaskmaster, getTaskmasterRuntime, getTickHealth } from '../taskmaster/loop';
 import { startTaskmasterDeadmanChecker } from '@archon/overseer/taskmaster-deadman-check';
 import { startOperatorInboxConsumer } from '../dispatch/operator-inbox-consumer';
+import { startInboxReader, shouldStartOperatorInboxConsumer } from '../dispatch/inbox-reader';
 import {
   taskmasterStatusResponseSchema,
   taskmasterPauseBodySchema,
@@ -3579,7 +3580,10 @@ export function registerApiRoutes(
     // Same scheduler skeleton (singleton + inFlight + env interval 0=off);
     // human surface is durable JSONL under ARCHON_HOME/operator-inbox/ --
     // Telegram/SMS stay dark per #1456. OPERATOR_INBOX_INTERVAL_MS default 60000.
-    startOperatorInboxConsumer();
+    if (shouldStartOperatorInboxConsumer(process.env)) {
+      startOperatorInboxConsumer();
+    }
+    startInboxReader();
   }
 
   // GET /api/taskmaster/status - pause state, epoch, tick health
