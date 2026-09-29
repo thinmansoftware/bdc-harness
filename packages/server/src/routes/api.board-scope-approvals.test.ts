@@ -40,13 +40,14 @@ mock.module('@archon/core/db/board-scope-approvals', () => ({
   revokeScopeApproval: (input: Record<string, unknown>) =>
     input.database ? actualRevokeScopeApproval(input as never) : revoke(),
 }));
+const livePullHead = { sha: S };
 mock.module('@archon/overseer/adapters/github-real-deps', () => ({
   createRealOctokitClient: () => ({
     pulls: {
       get: mock(async () => ({
         data: {
           state: 'open',
-          head: { sha: S, ref: 'feature' },
+          head: { sha: livePullHead.sha, ref: 'feature' },
           base: { sha: B, ref: 'release/ce' },
         },
       })),
@@ -301,5 +302,64 @@ describe('scope approval routes', () => {
     expect((await response.json()).rerun).toBe('unavailable');
     expect(rerun).toHaveBeenCalledTimes(1);
     expect(rerun).toHaveBeenCalledWith(expect.objectContaining({ run_id: 10 }));
+  });
+  test('revoke_reruns_the_gate_for_the_live_pr_head_not_the_approved_head', async () => {
+    const S2 = '4'.repeat(40);
+    livePullHead.sha = S2;
+    try {
+      revoke.mockImplementation(async () => ({
+        ok: true,
+        approval: {
+          ...valid,
+          approval_id: 'approval-1',
+          base_sha: B,
+          target_branch: 'release/ce',
+        },
+      }));
+      listRuns.mockReset();
+      listRuns.mockImplementation(async (input: { head_sha?: string }) => ({
+        data: {
+          workflow_runs:
+            input.head_sha === S2
+              ? [
+                  {
+                    id: 42,
+                    path: '.github/workflows/ce-change-scope-gate.yml',
+                    head_sha: S2,
+                    head_branch: 'feature',
+                    run_started_at: '2026-01-03',
+                  },
+                ]
+              : [
+                  {
+                    id: 10,
+                    path: '.github/workflows/ce-change-scope-gate.yml',
+                    head_sha: S,
+                    head_branch: 'feature',
+                    run_started_at: '2026-01-01',
+                  },
+                ],
+        },
+      }));
+      rerun.mockReset();
+      rerun.mockImplementation(async () => ({}));
+      const response = await makeApp().request('/api/board/scope-approvals/approval-1/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          holder_id: 'h',
+          holder_token: 't',
+          fencing_token: 1,
+          reason: 'withdraw',
+        }),
+      });
+      expect(response.status).toBe(200);
+      expect((await response.json()).rerun).toBe('requested');
+      expect(listRuns).toHaveBeenCalledWith(expect.objectContaining({ head_sha: S2 }));
+      expect(rerun).toHaveBeenCalledTimes(1);
+      expect(rerun).toHaveBeenCalledWith(expect.objectContaining({ run_id: 42 }));
+    } finally {
+      livePullHead.sha = S;
+    }
   });
 });

@@ -4920,7 +4920,9 @@ export function registerApiRoutes(
             repo: repo,
             // PR HEAD, not base: pull_request_target run objects carry the PR head sha
             // (live-verified; packages/overseer/src/__tests__/fixtures/pull-request-target-run.live-2026-09-28.json).
-            head_sha: result.approval.head_sha,
+            // The LIVE PR head: a revoke must invalidate the gate that currently
+            // guards the PR, not a gate run for the (possibly older) approved head.
+            head_sha: pr.data.head.sha,
             event: 'pull_request_target',
             per_page: 100,
             page,
@@ -4932,7 +4934,7 @@ export function registerApiRoutes(
           .filter(
             run =>
               run.path === '.github/workflows/ce-change-scope-gate.yml' &&
-              run.head_sha === result.approval.head_sha &&
+              run.head_sha === pr.data.head.sha &&
               run.head_branch === pr.data.head.ref
           )
           .sort((a, b) => String(b.run_started_at).localeCompare(String(a.run_started_at)))[0];

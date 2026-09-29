@@ -131,15 +131,25 @@ async function authorize(
     principal_id: string;
     holder_id: string;
     holder_token_hash: string;
-    fencing_token: number;
-    expires_at: string;
-    released_at: string | null;
+    fencing_token: number | string;
+    expires_at: string | Date;
+    released_at: string | Date | null;
   }>(`SELECT * FROM board_xo_leases WHERE id = 1${db.dialect === 'postgres' ? ' FOR UPDATE' : ''}`);
-  const lease = result.rows[0];
+  const raw = result.rows[0];
+  // node-postgres returns TIMESTAMPTZ as Date and BIGINT as string; SQLite returns
+  // ISO text and numbers. Normalize before comparing so both dialects validate alike.
+  const lease = raw
+    ? {
+        ...raw,
+        fencing_token: Number(raw.fencing_token),
+        expires_at: new Date(raw.expires_at).toISOString(),
+        released_at: raw.released_at === null ? null : new Date(raw.released_at).toISOString(),
+      }
+    : undefined;
   const at = await now(query, db);
   const valid =
     lease?.released_at === null &&
-    lease.expires_at > at &&
+    Date.parse(lease.expires_at) > Date.parse(at) &&
     lease.holder_id === proof.holder_id &&
     lease.holder_token_hash === tokenHash(proof.holder_token) &&
     lease.fencing_token === proof.fencing_token &&
