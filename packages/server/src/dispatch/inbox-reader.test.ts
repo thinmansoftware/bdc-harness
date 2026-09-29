@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { readWorkerHeartbeatAlarmConfig } from './worker-heartbeat-alarm';
@@ -162,7 +162,7 @@ describe('inbox reader', () => {
     const { root, result, disposed } = await harness([F1, F3, F7, F8], 'dry-run');
     expect(disposed).toHaveLength(0);
     expect(result.digest?.disposal_plan).toHaveLength(3);
-    expect(JSON.parse(await readFile(join(root, 'latest.json'), 'utf8')).mode).toBe('dry-run');
+    expect(JSON.parse(await Bun.file(join(root, 'latest.json')).text()).mode).toBe('dry-run');
     expect(resolveInboxReaderConfig({ INBOX_READER_MODE: 'Enforce' }).mode).toBe('dry-run');
   });
 
@@ -184,7 +184,7 @@ describe('inbox reader', () => {
       },
       readText: async path => {
         events.push(`read:${path}`);
-        return readFile(path, 'utf8');
+        return Bun.file(path).text();
       },
       disposeMessageByMachine: async data => {
         events.push(`dispose:${data.id}`);
@@ -193,9 +193,9 @@ describe('inbox reader', () => {
       log: { info: () => {}, warn: () => {}, error: () => {} },
     };
     await runInboxReader(base, config);
-    expect(events.findIndex(event => event.includes('read:') && event.endsWith('latest.json'))).toBeLessThan(
-      events.findIndex(event => event.startsWith('dispose:'))
-    );
+    expect(
+      events.findIndex(event => event.includes('read:') && event.endsWith('latest.json'))
+    ).toBeLessThan(events.findIndex(event => event.startsWith('dispose:')));
 
     events.length = 0;
     currentTime = '2026-09-29T13:00:00Z';
@@ -204,13 +204,13 @@ describe('inbox reader', () => {
         ...base,
         readText: async path => {
           if (path.endsWith('latest.json')) throw new Error('injected read-back failure');
-          return readFile(path, 'utf8');
+          return Bun.file(path).text();
         },
       },
       config
     );
     expect(events.filter(event => event.startsWith('dispose:'))).toHaveLength(0);
-    expect(await readFile(join(root, 'state.json'), 'utf8')).toContain('2026-09-29T13:00:00.000Z');
+    expect(await Bun.file(join(root, 'state.json')).text()).toContain('2026-09-29T13:00:00.000Z');
 
     events.length = 0;
     currentTime = '2026-09-29T14:00:00Z';
@@ -226,7 +226,7 @@ describe('inbox reader', () => {
     );
     expect(events.filter(event => event.startsWith('dispose:'))).toHaveLength(0);
     expect(writeFailure.errors.join()).toContain('digest_write_failed');
-    expect(await readFile(join(root, 'state.json'), 'utf8')).toContain('2026-09-29T14:00:00.000Z');
+    expect(await Bun.file(join(root, 'state.json')).text()).toContain('2026-09-29T14:00:00.000Z');
   });
 
   test('T12 ACTIONABLE never reaches disposeMessageByMachine', async () => {
@@ -302,7 +302,7 @@ describe('inbox reader', () => {
 
   test('T17 surface.jsonl report classifies legacy lines read-only', async () => {
     const lines = (
-      await readFile(join(import.meta.dir, 'inbox-reader.surface-fixture.jsonl'), 'utf8')
+      await Bun.file(join(import.meta.dir, 'inbox-reader.surface-fixture.jsonl')).text()
     ).split(/\r?\n/);
     expect(buildReportFromSurfaceLines(lines)).toMatchObject({
       counts: { INFO_DUPLICATE: 2, ACTIONABLE: 2 },

@@ -1,4 +1,4 @@
-import { appendFile, mkdir, open, readFile, readdir, rename, unlink } from 'fs/promises';
+import { appendFile, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'crypto';
 import { join } from 'path';
 import {
@@ -294,7 +294,7 @@ export async function runInboxReader(
   const now = deps.now ?? ((): Date => new Date());
   const started = now();
   const root = deps.root ?? join(getArchonHome(), 'inbox-reader');
-  const read = deps.readText ?? ((path: string): Promise<string> => readFile(path, 'utf8'));
+  const read = deps.readText ?? ((path: string): Promise<string> => Bun.file(path).text());
   const writer = deps.atomicWrite ?? atomicWrite;
   const append =
     deps.appendText ??
@@ -535,10 +535,7 @@ export async function runInboxReader(
         } else {
           errors.push(`dispose_failed:${item.id}:${result.reason}`);
           if (result.reason === 'machine_actor_conflict') {
-            logger.error(
-              { id: item.id, reason: result.reason },
-              'machine_actor_conflict'
-            );
+            logger.error({ id: item.id, reason: result.reason }, 'machine_actor_conflict');
             break;
           }
         }
