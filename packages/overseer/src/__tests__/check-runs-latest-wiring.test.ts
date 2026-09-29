@@ -9,9 +9,31 @@
  * The octokit stub + inMemoryAttemptCounterStore pattern mirrors
  * github-real-deps-octokit-shape.test.ts and github-real-deps.test.ts.
  */
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, describe, expect, mock, test } from 'bun:test';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps.ts';
 import fixture from './fixtures/check-runs-latest.live-2026-09-29.json';
+
+// mock.module is process-global in bun and outlives this file, so a single-process
+// `bun test` would leak these stubs into later files (octokit-shape, durability,
+// createAppAuth mint tests). Snapshot the real modules first (absent in lane
+// worktrees, hence the guard) and put them back in afterAll.
+const MOCKED = [
+  '@octokit/rest',
+  '@octokit/auth-app',
+  '@archon/paths',
+  '../adapters/required-contexts-store',
+] as const;
+const realModules = new Map<string, Record<string, unknown>>();
+for (const name of MOCKED) {
+  try {
+    realModules.set(name, { ...(await import(name)) });
+  } catch {
+    // not installed: nothing to restore
+  }
+}
+afterAll(() => {
+  for (const [name, real] of realModules) mock.module(name, () => real);
+});
 
 mock.module('@octokit/rest', () => ({ Octokit: class {} }));
 mock.module('@octokit/auth-app', () => ({
@@ -28,8 +50,30 @@ mock.module('../adapters/required-contexts-store', () => ({
 }));
 
 const { createRealFetchExactHeadPullRequestEvidence, createRealFindPullRequest, summarizeChecks } =
-  await import('../adapters/github-real-deps.ts');
-const { inMemoryAttemptCounterStore } = await import('../adapters/required-contexts.ts');
+  await import('../adapters/github-real-deps.ts?check-runs-latest-wiring');
+// File-local counter store: the shared inMemoryAttemptCounterStore is a
+// process-global Map, so counts written here would leak into later files
+// (octokit-shape) that key on the same owner/repo/base in one `bun test`.
+const { resetRequiredContextsCache, resetRequiredContextsAttemptCounters } =
+  await import('../adapters/required-contexts.ts');
+// The resolver keeps a process-global contexts cache; clear what this file wrote.
+afterAll(() => {
+  resetRequiredContextsCache();
+  resetRequiredContextsAttemptCounters();
+});
+const localAttempts = new Map<string, number>();
+const inMemoryAttemptCounterStore = {
+  increment: (key: unknown) => {
+    const k = JSON.stringify(key);
+    const n = (localAttempts.get(k) ?? 0) + 1;
+    localAttempts.set(k, n);
+    return Promise.resolve(n);
+  },
+  clear: (key: unknown) => {
+    localAttempts.delete(JSON.stringify(key));
+    return Promise.resolve();
+  },
+};
 
 const HEAD = 'a'.repeat(40);
 
