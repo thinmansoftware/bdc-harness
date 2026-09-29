@@ -691,7 +691,10 @@ CREATE TABLE IF NOT EXISTS board_audit_events (
       'board_alias_resolved',
       'board_petition_delivered',
       'execution_claim_authority_rejected',
-      'manual_initiation_recorded'
+      'manual_initiation_recorded',
+      'ce_scope_approval_recorded',
+      'ce_scope_approval_revoked',
+      'ce_scope_approval_rejected'
     )
   ),
   actor_principal_id TEXT,
@@ -701,7 +704,8 @@ CREATE TABLE IF NOT EXISTS board_audit_events (
   motion_id TEXT,
   motion_revision_sha TEXT,
   details JSONB NOT NULL DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  subject_key TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_board_audit_events_created
@@ -710,6 +714,10 @@ CREATE INDEX IF NOT EXISTS idx_board_audit_events_created
 CREATE INDEX IF NOT EXISTS idx_board_audit_events_motion
   ON board_audit_events(motion_id, motion_revision_sha)
   WHERE motion_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_board_audit_events_subject
+  ON board_audit_events(event_type, subject_key)
+  WHERE subject_key IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION prevent_board_audit_event_mutation()
 RETURNS TRIGGER AS $$

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { rootLogger } from '@archon/paths';
 import {
+  buildCeScopeCompareAdapter,
   runMergeExecutionBridgeOnce,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
@@ -178,6 +179,62 @@ afterEach(() => {
 });
 
 describe('merge execution bridge', () => {
+  test('production CE compare adapter accepts 150 page-one files as complete', async () => {
+    const compareCommits = mock(async () => ({
+      data: {
+        files: Array.from({ length: 150 }, (_, index) => ({
+          filename: `src/components/ce/file-${index}.ts`,
+          status: 'modified',
+        })),
+      },
+    }));
+    const result = await buildCeScopeCompareAdapter({ repos: { compareCommits } })(
+      'thinmansoftware',
+      'lspro-react',
+      'base',
+      'head'
+    );
+
+    expect(compareCommits).toHaveBeenCalledTimes(1);
+    expect(compareCommits).toHaveBeenCalledWith(expect.objectContaining({ page: 1 }));
+    expect(result.files).toHaveLength(150);
+    expect(result.complete).toBe(true);
+  });
+
+  test('production CE compare adapter rejects the 300-file cap as truncated', async () => {
+    const compareCommits = mock(async () => ({
+      data: {
+        files: Array.from({ length: 300 }, (_, index) => ({
+          filename: `src/components/ce/file-${index}.ts`,
+          status: 'modified',
+        })),
+      },
+    }));
+    const result = await buildCeScopeCompareAdapter({ repos: { compareCommits } })(
+      'thinmansoftware',
+      'lspro-react',
+      'base',
+      'head'
+    );
+
+    expect(compareCommits).toHaveBeenCalledTimes(1);
+    expect(result.files).toHaveLength(300);
+    expect(result.complete).toBe(false);
+  });
+
+  test('production CE compare adapter rejects a missing files array as truncated', async () => {
+    const compareCommits = mock(async () => ({ data: {} }));
+    const result = await buildCeScopeCompareAdapter({ repos: { compareCommits } })(
+      'thinmansoftware',
+      'lspro-react',
+      'base',
+      'head'
+    );
+
+    expect(compareCommits).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ complete: false });
+  });
+
   test('docs-only PR into bdc-xo main merges when docs_only is merge', async () => {
     process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
       'thinmansoftware/bdc-xo': { main: { unattended: true, docs_only: 'merge' } },
