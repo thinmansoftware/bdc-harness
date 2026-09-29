@@ -201,6 +201,94 @@ re-establishes after a cold boot -- those require a live pass from the operator 
 ```bash
 bun run scripts/dispatch-worker/verify-reboot-recovery.ts
 ```
+
+## Worker death alarm + watchdog (WO-HARNESS-DISPATCH-WORKER-DEATH-ALARM-01)
+
+Issue #1041 recorded three silent worker deaths where the worker was gone but
+nothing paged John, and Task Scheduler still reported the task "Ready" (last
+result `0xFFFFFFFF`) with no live process. Two independent mechanisms close that
+gap. They are complementary: the alarm makes a death LOUD (pages + journals),
+the watchdog makes it SELF-HEALING (restarts).
+
+### 1. Page + journal (server side)
+
+The server runs a dedicated timer (default 60s, `DISPATCH_WORKER_ALARM_INTERVAL_MS`,
+minimum 5000) separate from the 15-minute Duty Officer tick, so a dead worker is
+paged within ~1 minute. A worker whose last heartbeat is older than the page
+threshold (default 5 minutes, `DISPATCH_WORKER_ALARM_PAGE_STALE_MINUTES`) pages
+John over Telegram. Every page attempt is journaled ROW-FIRST in `tm_journal`
+(`action_type=escalate_p0`, `thread_ref=dispatch-worker:<worker_id>`) before the
+send, then flipped to `sent`/`failed`, so a page survives a crash mid-send and is
+retried without duplicating a `sent` row. The page path runs even with no GitHub
+token -- it does not depend on the GitHub DOWN/UP comment path (which keeps its
+own 10-minute comment threshold, unchanged).
+
+A worker that is restarted by the watchdog BEFORE its heartbeat ages past five
+minutes would otherwise erase all evidence (the heartbeat clock restarts fresh).
+To prevent that, `acquireInstanceLock` appends one JSON line
+`{previous_pid, previous_started_at, reclaimed_at}` to an append-only death log at
+`~/.config/bdc/dispatch-worker-<worker_id>.deaths.jsonl` whenever it reclaims a
+dead-PID lock, BEFORE the lock is overwritten. Each registration carries the
+retained log (entries newer than 24h, at most 20) as
+`capabilities.restart_evidence`. The alarm journals and pages each death entry
+independent of heartbeat freshness, keyed by
+`dispatch-worker-death:<worker_id>:<previous_pid>:<previous_started_at>` (never the
+clock), so a watchdog-restarted worker still gets paged.
+
+### 2. Watchdog scheduled task (desktop side)
+
+`install-windows.ps1` registers a SECOND scheduled task,
+`BlueDevil-Dispatch-Worker-Watchdog`, with a repeating trigger every 5 minutes
+indefinitely (NOT logon-only), running `watchdog-windows.ps1` ->
+`watchdog.ts`. The watchdog reads the worker PID lockfile: a missing lock or a
+dead PID means "no live process", so it runs the worker task
+(`schtasks /Run /TN BlueDevil-Dispatch-Worker`). A start failure exits nonzero and
+logs `dispatch_worker_watchdog_start_failed`.
+
+### Operator verification (run on the desktop, post-merge)
+
+```powershell
+# Register both tasks (worker + watchdog)
+powershell -ExecutionPolicy Bypass -File scripts\dispatch-worker\install-windows.ps1
+
+# Confirm the watchdog task exists with a repeating trigger
+Get-ScheduledTask -TaskName 'BlueDevil-Dispatch-Worker-Watchdog'
+(Get-ScheduledTask -TaskName 'BlueDevil-Dispatch-Worker-Watchdog').Triggers
+
+# Induced-kill run 1 -- page while DOWN: disable the watchdog so the worker
+# stays dead, kill it, and confirm a Telegram page arrives within 6 minutes.
+Disable-ScheduledTask -TaskName 'BlueDevil-Dispatch-Worker-Watchdog'
+Stop-ScheduledTask   -TaskName 'BlueDevil-Dispatch-Worker'
+Get-Process | Where-Object { $_.Path -like '*bun*' }   # confirm gone
+
+# Induced-kill run 2 -- page even when the watchdog restarts it in under 5
+# minutes (heartbeat never goes stale; the death-evidence page still fires).
+Enable-ScheduledTask -TaskName 'BlueDevil-Dispatch-Worker-Watchdog'
+Stop-ScheduledTask   -TaskName 'BlueDevil-Dispatch-Worker'
+
+# Confirm the journaled page row on the host (action_type escalate_p0)
+sqlite3 "$env:USERPROFILE\.archon\archon.db" ^
+  "SELECT created_at, thread_ref, action_type, outcome, idempotency_key FROM tm_journal WHERE action_type='escalate_p0' AND thread_ref LIKE 'dispatch-worker:%' ORDER BY created_at DESC LIMIT 5;"
+```
+
+### Root-cause investigation for the 2026-09-28T21:38Z death (issue #1041 item 3)
+
+This is an operator investigation, not code. Pull the Windows event window around
+the death to find why the process exited:
+
+```powershell
+$start = [datetime]'2026-09-28T21:30:00Z'
+$end   = [datetime]'2026-09-28T21:45:00Z'
+# Task Scheduler operational log for the worker task
+Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-TaskScheduler/Operational'; StartTime=$start; EndTime=$end } |
+  Where-Object { $_.Message -like '*BlueDevil-Dispatch-Worker*' } | Format-List TimeCreated, Id, Message
+# System log for unexpected shutdown / sleep / power events in the same window
+Get-WinEvent -FilterHashtable @{ LogName='System'; StartTime=$start; EndTime=$end } |
+  Format-List TimeCreated, Id, ProviderName, Message
+# Worker's own rotating diagnostics log
+Get-Content "$env:USERPROFILE\.config\bdc\logs\dispatch-worker-$env:COMPUTERNAME.log" -Tail 200
+```
+
 # Phase 1 honest messaging
 
 Workers may place `DISPATCH_OUTCOME: blocked` or `DISPATCH_OUTCOME: failed` on
