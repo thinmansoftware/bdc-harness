@@ -20,7 +20,7 @@ import { createCancelController, runAcpAgent, type AcpRunResult } from './acp/se
 import { createMcpCancelController, runMcpAgent, type McpRunResult } from './mcp/session';
 import { resolveOperatorToken } from './credentials';
 import { realSeatPreflightDeps, runSeatPreflight, type SeatConfig } from './seat-preflight';
-import { acquireInstanceLock, type InstanceLockHandle } from './instance-lock';
+import { acquireInstanceLock, readRestartEvidence, type InstanceLockHandle } from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
 import { enumerateProcessTree, killProcessTree, waitForTreeDeath } from './acp/kill-tree';
 
@@ -177,6 +177,10 @@ function defaultLockFile(workerId: string): string {
   return join(homedir(), '.config', 'bdc', `dispatch-worker-${workerId}.lock`);
 }
 
+function defaultDeathLogFile(workerId: string): string {
+  return join(homedir(), '.config', 'bdc', `dispatch-worker-${workerId}.deaths.jsonl`);
+}
+
 function defaultLogFile(workerId: string): string {
   return join(homedir(), '.config', 'bdc', 'logs', `dispatch-worker-${workerId}.log`);
 }
@@ -256,12 +260,23 @@ async function requestJson<T>(
 }
 
 async function register(config: NormalizedWorkerConfig, token: string): Promise<void> {
+  // Carry any retained restart evidence (deaths reclaimed within the last 24h,
+  // at most 20) so the server-side heartbeat alarm can journal and page each
+  // death even when a watchdog restarted this worker before its heartbeat aged.
+  let capabilities = config.capabilities;
+  const evidence = await readRestartEvidence(
+    defaultDeathLogFile(config.worker_id),
+    new Date().toISOString()
+  );
+  if (evidence.length > 0) {
+    capabilities = { ...config.capabilities, restart_evidence: evidence };
+  }
   await requestJson(config, token, '/api/dispatch/workers/register', {
     method: 'POST',
     body: JSON.stringify({
       worker_id: config.worker_id,
       host: config.host,
-      capabilities: config.capabilities,
+      capabilities,
       max_concurrency: Object.values(config.max_concurrency).reduce(
         (max, value) => Math.max(max, value),
         1
@@ -907,9 +922,17 @@ async function main(): Promise<void> {
 
   let lock: InstanceLockHandle;
   try {
-    lock = await acquireInstanceLock({ lockFile: defaultLockFile(config.worker_id) });
+    lock = await acquireInstanceLock({
+      lockFile: defaultLockFile(config.worker_id),
+      deathLogFile: defaultDeathLogFile(config.worker_id),
+    });
   } catch (error) {
-    await log.error('startup refused: another instance appears to be running', error);
+    // Two distinct causes, both fatal: dispatch_worker_already_running (a live
+    // process holds the lock) or dispatch_worker_death_log_unwritable (a dead
+    // predecessor's death could not be journaled, so the lock was deliberately
+    // left unreclaimed rather than destroying that evidence). The thrown message
+    // names which one, so do not assert a cause here.
+    await log.error('startup refused: could not acquire the instance lock', error);
     console.error(String(error));
     process.exit(1);
     return;
