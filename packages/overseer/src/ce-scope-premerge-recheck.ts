@@ -86,8 +86,15 @@ export async function ceScopePremergeRecheck(input: {
       return { ok: false, reason: 'compare_truncated' };
     // A rename is judged on BOTH sides: moving a protected file out of its
     // directory removes it from there, and both names count toward breadth.
-    const isProtected = (path: string): boolean =>
-      path.startsWith('src/components/ce/') || path.startsWith('tests/ce-regression/');
+    // Each protected directory is its own zone: a move between the two zones removes
+    // the file from its source zone just like a move out of both.
+    const protectedZone = (path: string): string | null =>
+      path.startsWith('src/components/ce/')
+        ? 'src/components/ce/'
+        : path.startsWith('tests/ce-regression/')
+          ? 'tests/ce-regression/'
+          : null;
+    const isProtected = (path: string): boolean => protectedZone(path) !== null;
     const ceNames = new Set<string>();
     for (const file of comparison.files) {
       if (file.filename.startsWith('src/components/ce/')) ceNames.add(file.filename);
@@ -102,7 +109,7 @@ export async function ceScopePremergeRecheck(input: {
           (file.status === 'renamed' &&
             file.previous_filename !== undefined &&
             isProtected(file.previous_filename) &&
-            !isProtected(file.filename))
+            protectedZone(file.previous_filename) !== protectedZone(file.filename))
       );
     const identity = {
       repo: `${input.owner}/${input.repo}`,

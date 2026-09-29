@@ -378,4 +378,22 @@ describe('CE scope premerge recheck', () => {
       )
     ).toEqual({ ok: false, reason: 'revoked' });
   });
+  test('rename_between_protected_directories_counts_as_removal', async () => {
+    for (const [from, to] of [
+      ['src/components/ce/Grader.tsx', 'tests/ce-regression/Grader.tsx'],
+      ['tests/ce-regression/slab.spec.ts', 'src/components/ce/slab.spec.ts'],
+    ]) {
+      expect(
+        await check(
+          deps({
+            compare: async () => ({
+              complete: true,
+              files: [{ filename: to, previous_filename: from, status: 'renamed' }],
+            }),
+            getApproval: async () => ({ decision: 'deny', reason: 'no_record' }),
+          })
+        )
+      ).toEqual({ ok: false, reason: 'approval_missing' });
+    }
+  });
 });
