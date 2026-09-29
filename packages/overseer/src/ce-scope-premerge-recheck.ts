@@ -172,9 +172,12 @@ export async function ceScopePremergeRecheck(input: {
       )
     )
       return { ok: false, reason: 'gate_not_green' };
-    // Authoritative final read, AFTER every GitHub request above. The bridge merges
-    // with the exact head immediately after this returns; the only window left is
-    // between this read and GitHub's merge API call.
+    // Last GitHub request first (the release/ce tip), THEN the authoritative
+    // approval/revocation read, so nothing awaited after it can hide a revocation.
+    // The bridge merges with the exact head immediately after this returns; the only
+    // window left is between this read and GitHub's merge API call.
+    const finalBase = await input.deps.getBranchTip(input.owner, input.repo, 'release/ce');
+    if (finalBase !== base) return { ok: false, reason: 'base_moved' };
     const final = await checkAuthority();
     if (!final.ok) return final;
     if (final.newestRevokedAt) {
@@ -183,8 +186,6 @@ export async function ceScopePremergeRecheck(input: {
       if (Number.isNaN(green) || Number.isNaN(revokedAt) || green <= revokedAt)
         return { ok: false, reason: 'revoked_after_green' };
     }
-    const finalBase = await input.deps.getBranchTip(input.owner, input.repo, 'release/ce');
-    if (finalBase !== base) return { ok: false, reason: 'base_moved' };
     return { ok: true };
   } catch {
     return { ok: false, reason: 'approval_error' };

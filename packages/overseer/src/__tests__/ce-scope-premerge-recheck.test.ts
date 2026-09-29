@@ -332,4 +332,50 @@ describe('CE scope premerge recheck', () => {
       )
     ).toEqual({ ok: false, reason: 'base_moved' });
   });
+  test('revocation_during_final_base_lookup_is_seen', async () => {
+    // Nothing is awaited after the authoritative read: a revoke committed while the
+    // final release/ce tip is fetched (base unchanged) must still deny.
+    let tipCalls = 0;
+    let revokedAt: string | null = null;
+    expect(
+      await check(
+        deps({
+          getBranchTip: async () => {
+            tipCalls += 1;
+            if (tipCalls === 2) revokedAt = '2026-09-28T12:00:00Z';
+            return B;
+          },
+          getMetadata: async () => ({ hasOtherBase: false, newestRevokedAt: revokedAt }),
+        })
+      )
+    ).toEqual({ ok: false, reason: 'revoked_after_green' });
+    expect(tipCalls).toBe(2);
+    let revoked = false;
+    let wideTipCalls = 0;
+    expect(
+      await check(
+        deps({
+          compare: async () => ({ complete: true, files: wideFiles }),
+          getBranchTip: async () => {
+            wideTipCalls += 1;
+            if (wideTipCalls === 2) revoked = true;
+            return B;
+          },
+          getApproval: async () =>
+            revoked
+              ? { decision: 'deny', reason: 'revoked' }
+              : {
+                  decision: 'allow',
+                  approval: {
+                    repo: 'thinmansoftware/lspro-react',
+                    pr_number: 626,
+                    head_sha: S,
+                    base_sha: B,
+                    target_branch: 'release/ce',
+                  },
+                },
+        })
+      )
+    ).toEqual({ ok: false, reason: 'revoked' });
+  });
 });
