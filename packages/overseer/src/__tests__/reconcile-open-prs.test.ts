@@ -213,6 +213,34 @@ test('open_pr_that_only_mentions_the_stem_in_prose_does_not_hold', async () => {
   expectNormalClose(deps, result);
 });
 
+test('closes_line_for_a_longer_issue_number_does_not_hold_the_shorter_tracker', () => {
+  const longer = openPullRequest({
+    title: 'Unrelated stage',
+    body: 'Closes thinmansoftware/bdc-xo#10440',
+  });
+  const holders = openPullRequestsHoldingTracker({
+    stem,
+    mergedPr: mergedPullRequest(),
+    tracker: trackerIssue(),
+    openPullRequests: [longer],
+  });
+  expect(holders).toEqual([]);
+});
+
+test('closes_line_still_holds_when_the_exact_token_follows_punctuation', () => {
+  const holder = openPullRequest({
+    title: 'Stage B follow-up',
+    body: 'Closes thinmansoftware/bdc-xo#10440, thinmansoftware/bdc-xo#1044.',
+  });
+  const holders = openPullRequestsHoldingTracker({
+    stem,
+    mergedPr: mergedPullRequest(),
+    tracker: trackerIssue(),
+    openPullRequests: [holder],
+  });
+  expect(holders).toEqual([holder]);
+});
+
 test('open_pr_naming_the_tracker_in_a_closes_line_holds_even_without_the_stem', async () => {
   const holder = openPullRequest({
     title: 'Stage B follow-up',

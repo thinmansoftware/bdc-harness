@@ -531,8 +531,18 @@ function bodyClosesTracker(body: string, token: string): boolean {
 function lineClosesTracker(line: string, token: string): boolean {
   // Non-global so lastIndex cannot leak across lines.
   const match = /\b(?:closes|fixes|resolves)\b/i.exec(line);
-  if (!match) return false;
-  return line.slice(match.index + match[0].length).includes(token);
+  if (!match || token.length === 0) return false;
+  const rest = line.slice(match.index + match[0].length);
+  let from = 0;
+  while (from <= rest.length) {
+    const index = rest.indexOf(token, from);
+    if (index < 0) return false;
+    const next = rest.charAt(index + token.length);
+    // Trailing boundary so #1044 does not match the prefix of #10440.
+    if (next === '' || /[^A-Za-z0-9_]/.test(next)) return true;
+    from = index + 1;
+  }
+  return false;
 }
 
 export function buildEvidenceComment(input: {
