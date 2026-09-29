@@ -213,6 +213,20 @@ test('open_pr_that_only_mentions_the_stem_in_prose_does_not_hold', async () => {
   expectNormalClose(deps, result);
 });
 
+test('closes_line_with_a_prefixed_owner_does_not_hold_the_tracker', () => {
+  const prefixed = openPullRequest({
+    title: 'Unrelated stage',
+    body: 'Closes evilthinmansoftware/bdc-xo#1044',
+  });
+  const holders = openPullRequestsHoldingTracker({
+    stem,
+    mergedPr: mergedPullRequest(),
+    tracker: trackerIssue(),
+    openPullRequests: [prefixed],
+  });
+  expect(holders).toEqual([]);
+});
+
 test('closes_line_for_a_longer_issue_number_does_not_hold_the_shorter_tracker', () => {
   const longer = openPullRequest({
     title: 'Unrelated stage',

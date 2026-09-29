@@ -537,9 +537,15 @@ function lineClosesTracker(line: string, token: string): boolean {
   while (from <= rest.length) {
     const index = rest.indexOf(token, from);
     if (index < 0) return false;
-    const next = rest.charAt(index + token.length);
-    // Trailing boundary so #1044 does not match the prefix of #10440.
-    if (next === '' || /[^A-Za-z0-9_]/.test(next)) return true;
+    const at = match.index + match[0].length + index;
+    const prev = at === 0 ? '' : line.charAt(at - 1);
+    const next = line.charAt(at + token.length);
+    // Leading boundary so evilthinmansoftware/bdc-xo#1044 does not match
+    // thinmansoftware/bdc-xo#1044. Trailing boundary so #1044 does not match
+    // the prefix of #10440.
+    const leadingOk = prev === '' || /[^A-Za-z0-9_]/.test(prev);
+    const trailingOk = next === '' || /[^A-Za-z0-9_]/.test(next);
+    if (leadingOk && trailingOk) return true;
     from = index + 1;
   }
   return false;
