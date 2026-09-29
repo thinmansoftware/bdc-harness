@@ -924,7 +924,9 @@ export function createRealFindPullRequest(
         per_page: 100,
       });
       // Count each check NAME once, by its newest run at this head (#1048).
-      const checks = summarizeChecks(reduceToLatestCheckRuns(checkRunsResp.data.check_runs).current);
+      const checks = summarizeChecks(
+        reduceToLatestCheckRuns(checkRunsResp.data.check_runs).current
+      );
       let changedFilePaths: string[] | undefined;
       if (input.includeChangedFiles) {
         if (!octokit.pulls.listFiles) throw new Error('overseer_real_adapter_missing_list_files');
@@ -1379,9 +1381,7 @@ interface GraphQLReviewDecisionNode {
 
 /** Why GitHub's aggregate review decision was not usable for a sweep. */
 export type ReviewDecisionUnavailableReason =
-  | 'graphql_client_absent'
-  | 'graphql_error'
-  | 'graphql_empty_response';
+  'graphql_client_absent' | 'graphql_error' | 'graphql_empty_response';
 
 export interface ReviewDecisionLookup {
   /**
