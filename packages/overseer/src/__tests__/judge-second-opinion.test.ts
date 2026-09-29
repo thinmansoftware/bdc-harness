@@ -100,7 +100,8 @@ describe('grok second-opinion judge', () => {
     ).resolves.toMatchObject({ disposition: 'hold', reason: 'judge_error' });
     expect(recorded).toHaveLength(1);
     expect(recorded[0]).toEqual([
-      (process.env.OVERSEER_JUDGE_LADDER ?? 'grok').split(',')[0],
+      // WO-HARNESS-RETIRE-XAI-DIRECT-LANE-01: default first rung is now 'codex', not 'grok'.
+      (process.env.OVERSEER_JUDGE_LADDER ?? 'codex,cursor').split(',')[0],
       { exitCode: -1, timedOut: false },
       'judge-second-opinion',
     ]);
@@ -129,7 +130,8 @@ describe('grok second-opinion judge', () => {
     ).resolves.toMatchObject({ disposition: 'hold', reason: 'judge_exit_nonzero' });
     expect(recorded).toHaveLength(1);
     const call = recorded[0] as [string, { exitCode: number; timedOut: boolean }, string];
-    expect(call[0]).toBe((process.env.OVERSEER_JUDGE_LADDER ?? 'grok').split(',')[0]);
+    // WO-HARNESS-RETIRE-XAI-DIRECT-LANE-01: default first rung is now 'codex', not 'grok'.
+    expect(call[0]).toBe((process.env.OVERSEER_JUDGE_LADDER ?? 'codex,cursor').split(',')[0]);
     expect(call[1]).toMatchObject({ exitCode: 1, timedOut: false });
     expect(call[2]).toBe('judge-second-opinion');
   });

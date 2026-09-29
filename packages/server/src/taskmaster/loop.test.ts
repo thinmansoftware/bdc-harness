@@ -1205,7 +1205,7 @@ describe('fire_cauldron loop', () => {
           }) as NonNullable<TaskmasterDeps['runCascade']>,
         })
       );
-      expect(healthProviders.sort()).toEqual(['codex', 'xai']);
+      expect(healthProviders.sort()).toEqual(['codex']);
       expect(admissions).toBe(1);
       expect(
         world.journal.filter(row => row.action_type === 'fire_cauldron').map(row => row.thread_ref)
@@ -1247,7 +1247,9 @@ describe('fire_cauldron loop', () => {
       world.nowMs += 60_000;
     }
     expect(monitorTicks).toEqual([1, 97]);
-    expect(healthReads).toBe(97 * 2);
+    // WO-HARNESS-RETIRE-XAI-DIRECT-LANE-01: one health read per tick (codex only) now
+    // that the direct xAI lane is retired; previously two reads/tick (codex + xai).
+    expect(healthReads).toBe(97);
   });
 
   test('pause scope=effects parks an eligible fire without admitting a cascade', async () => {

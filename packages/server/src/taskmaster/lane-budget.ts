@@ -1,7 +1,11 @@
 import type { TmHealthSample, TmHealthState } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
 
-export type FireLane = 'claude' | 'codex' | 'xai';
+// WO-HARNESS-RETIRE-XAI-DIRECT-LANE-01: the direct xAI lane was removed by decision.
+// The xAI team account is credit-blocked (bdc-xo#2018); no transport change fixes a
+// blocked team. Grok stays fully reachable over the Cursor rail -- do NOT restore the
+// direct xAI lane here.
+export type FireLane = 'claude' | 'codex';
 export interface LaneBudgetDecision {
   lane: FireLane | null;
   holding: boolean;
@@ -22,9 +26,8 @@ export function decideFireLane(
   const states: Record<FireLane, TmHealthState> = {
     claude: health.claude?.state ?? claudeState(headroom),
     codex: health.codex?.state ?? 'unknown',
-    xai: health.xai?.state ?? 'unknown',
   };
-  for (const lane of ['claude', 'codex', 'xai'] as const) {
+  for (const lane of ['claude', 'codex'] as const) {
     const state = states[lane];
     const available = state === 'healthy' || (state === 'unknown' && lane === 'codex');
     if (available) return { lane, holding: false, reason: `${lane}:${state}` };

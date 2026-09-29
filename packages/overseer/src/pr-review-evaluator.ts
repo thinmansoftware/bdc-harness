@@ -673,9 +673,14 @@ export async function evaluatePullRequest(
   return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError);
 }
 
-/** The configured judge ladder, cheapest first. Exported for the breaker (#847). */
+/**
+ * The configured judge ladder, cheapest first. Exported for the breaker (#847).
+ * WO-HARNESS-RETIRE-XAI-DIRECT-LANE-01: default no longer includes the 'grok' rung --
+ * the xAI account is credit-blocked (bdc-xo#2018). Grok stays reachable over the Cursor
+ * rail and when explicitly named in OVERSEER_JUDGE_LADDER. Do NOT restore 'grok' default.
+ */
 export function defaultReviewLadder(): string[] {
-  return (process.env.OVERSEER_JUDGE_LADDER ?? 'grok')
+  return (process.env.OVERSEER_JUDGE_LADDER ?? 'codex,cursor')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
@@ -683,7 +688,7 @@ export function defaultReviewLadder(): string[] {
 
 /** Existing judge CLI convention, exposed for the real dependency composition. */
 export function configuredReviewIdentity(): ReviewAgentIdentity {
-  const model = defaultReviewLadder()[0] ?? 'grok';
+  const model = defaultReviewLadder()[0] ?? 'codex';
   return { provider: 'cli', model };
 }
 
