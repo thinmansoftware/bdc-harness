@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # stamp-manifest-evidence.sh -- unit tests for the stamp-manifest-evidence node core
 # (sme_*) in .archon/workflows/defaults/bdc-feature-development-codex.yaml and its
-# byte-identical mirrors in the other 10 bdc-feature-development lanes.
+# byte-identical mirrors in the other 12 bdc-feature-development lanes.
 #
 # bdc-xo #1940: the engine-side build-manifest renders placeholder "Tests: N/A
 # (required gates are reported separately)" and "Grep assertions: N/A (no declared
@@ -48,8 +48,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
+bdc-feature-development-astra.yaml
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
+bdc-feature-development-cursor.yaml
 bdc-feature-development-fable.yaml
 bdc-feature-development-fusion-cx-kimi.yaml
 bdc-feature-development-fusion-cx-qwen.yaml
@@ -78,7 +80,7 @@ for fn in sme_field sme_process; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: sme core byte-identical across all 11 lanes ---"
+echo "--- Parity: sme core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$SME_CORE" "$(extract_core "$DEFAULTS/$lane" sme)"
 done
@@ -141,10 +143,13 @@ OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c 
 assert_contains "VALIDATION: FAIL on grep mismatch" "VALIDATION: FAIL" "$OUT"
 assert_contains "audit line says greps=mismatch" "greps=mismatch" "$OUT"
 
-echo "--- Test 3b: incomplete greps flip VALIDATION to FAIL ---"
-OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c "a" b => 1; 1/2 declared grep assertions executed' incomplete)"
-assert_contains "VALIDATION: FAIL on incomplete greps" "VALIDATION: FAIL" "$OUT"
+echo "--- Test 3b: incomplete greps WITH a dropped one flip VALIDATION to FAIL ---"
+# WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01: incomplete flips to FAIL only when a
+# declared stop grep was DROPPED (grep_dropped>0). This test now passes dropped=1.
+OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c "a" b => 1; 1/2 declared grep assertions executed' incomplete 1)"
+assert_contains "VALIDATION: FAIL on incomplete+dropped greps" "VALIDATION: FAIL" "$OUT"
 assert_contains "audit line says greps=incomplete" "greps=incomplete" "$OUT"
+assert_contains "audit line records dropped=1" "dropped=1" "$OUT"
 
 echo "--- Test 4: short ALREADY_SATISFIED manifest passes through untouched ---"
 SHORT='WO: WO-X
@@ -170,6 +175,24 @@ echo "--- Test 7: manifest with Tests: but no Grep/VALIDATION lines gets both ap
 OUT="$(printf 'WO: WO-X\nTests: N/A\nPRs: x\n' | sme_process "3/3 (bun test)" passed "grep -c a b => 1" passed)"
 assert_contains "Tests stamped" "Tests: 3/3 (bun test)" "$OUT"
 assert_eq "Grep line appended at end, then audit line" "$(printf 'WO: WO-X\nTests: 3/3 (bun test)\nPRs: x\nGrep assertions: grep -c a b => 1\nStop conditions: tests=passed; greps=passed (observed by run-stop-tests / run-stop-greps in the run worktree)')" "$OUT"
+
+# =============================================================================
+# WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01: Test 12 -- incomplete flips on
+# dropped>0 (case A) but stays PASS for unparsed-only incomplete (case B, FP-4).
+# =============================================================================
+echo "--- Test 12A: incomplete + dropped=1 flips VALIDATION to FAIL ---"
+OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c a b => 1; UNVERIFIED (dropped): grep -c "x y" f' incomplete 1)"
+assert_contains "12A flips to FAIL" "VALIDATION: FAIL" "$OUT"
+assert_not_contains "12A PASS gone" "VALIDATION: PASS" "$OUT"
+assert_contains "12A audit says greps=incomplete" "greps=incomplete" "$OUT"
+assert_contains "12A audit records dropped=1" "dropped=1" "$OUT"
+
+echo "--- Test 12B: incomplete + dropped=0 (unparsed-only) keeps VALIDATION PASS (FP-4) ---"
+OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c a b => 1; UNVERIFIED (unparsed): prose condition one' incomplete 0)"
+assert_contains "12B keeps PASS" "VALIDATION: PASS" "$OUT"
+assert_not_contains "12B does not flip to FAIL" "VALIDATION: FAIL" "$OUT"
+assert_contains "12B audit says greps=incomplete" "greps=incomplete" "$OUT"
+assert_contains "12B audit records dropped=0" "dropped=0" "$OUT"
 
 echo
 echo "stamp-manifest-evidence.sh: $PASS passed, $FAIL failed"

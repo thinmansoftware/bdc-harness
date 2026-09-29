@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # manifest-evidence-check.sh -- unit tests for the manifest-evidence-check node core
 # (mec_*) in .archon/workflows/defaults/bdc-feature-development-codex.yaml and its
-# byte-identical mirrors in the other 11 bdc-feature-development lanes.
+# byte-identical mirrors in the other 12 bdc-feature-development lanes.
 #
 # bdc-xo #1940: manifest-evidence-check fails CLOSED when a CODE or MIXED WO would
 # publish "Tests: N/A ..." or when the spec declared grep stop conditions but the
@@ -46,6 +46,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
+bdc-feature-development-astra.yaml
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
 bdc-feature-development-cursor.yaml
@@ -87,17 +88,17 @@ for fn in mec_field mec_check sme_field sme_process; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: mec core byte-identical across all 12 lanes ---"
+echo "--- Parity: mec core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$MEC_CORE" "$(extract_core "$DEFAULTS/$lane" mec)"
 done
 
-echo "--- Parity: sme core byte-identical across all 12 lanes ---"
+echo "--- Parity: sme core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "sme parity $lane" "$SME_CORE" "$(extract_core "$DEFAULTS/$lane" sme)"
 done
 
-echo "--- Parity: evidence call sites byte-identical across all 12 lanes ---"
+echo "--- Parity: evidence call sites byte-identical across all 13 lanes ---"
 SME_CALL="$(extract_call "$CANONICAL_YAML" sme_process)"
 MEC_CALL="$(extract_call "$CANONICAL_YAML" mec_check)"
 for lane in $LANES; do
@@ -156,10 +157,11 @@ R="$(run_check "$NA_TESTS" PROCEED DOCUMENTATION not_required 0 none_declared)"
 assert_eq "DOCUMENTATION OK" "0|OK|" "$R"
 
 echo "--- Test 6: declared allowlist-dropped greps -> HARNESS_REFUSED (any class) ---"
-R="$(run_check "$NA_GREPS" PROCEED CODE passed 9 all_dropped 0 0 9 0 0 'DROPPED (not on read-only allowlist; not executed): grep -c x f')"
+R="$(run_check "$NA_GREPS" PROCEED CODE passed 9 all_dropped 0 0 9 0 0 'DROPPED (not on read-only allowlist; not executed): grep -c x f => expected eq 1')"
 assert_eq "rc 1" "1" "${R%%|*}"
 assert_contains "error names the declared count" "9 grep stop condition(s) were declared but none executed" "$R"
 assert_contains "all_dropped attributed to harness" "HARNESS_REFUSED:" "$R"
+assert_contains "all_dropped names the rejected command verbatim" "STOP_GREP_REJECTED: grep -c x f" "$R"
 R="$(run_check "$NA_GREPS" PROCEED INFRA not_required 2 all_dropped 0 0 2)"
 assert_eq "INFRA with declared greps and N/A also rc 1" "1" "${R%%|*}"
 
@@ -167,9 +169,15 @@ echo "--- Test 7: no greps declared, Grep assertions: N/A -> OK ---"
 R="$(run_check "$NA_GREPS" PROCEED CODE passed 0 none_declared)"
 assert_eq "rc 0 / OK" "0|OK|" "$R"
 
-echo "--- Test 7b: declared greps with incomplete execution -> admitted ---"
-R="$(run_check "$GOOD" PROCEED CODE passed 5 incomplete 0 2 2 1 0)"
-assert_eq "incomplete greps admitted" "0|OK|" "$R"
+echo "--- Test 7b: incomplete WITH dropped greps -> refused (WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01) ---"
+# Reversed from the prior WO: an incomplete run that dropped >=1 declared stop grep
+# no longer passes green -- it is refused and each rejected command is named.
+R="$(run_check "$GOOD" PROCEED CODE passed 5 incomplete 0 2 2 1 0 'DROPPED (not on read-only allowlist; not executed): grep -c "a b" f => expected eq 1
+DROPPED (not on read-only allowlist; not executed): grep -c "^x" g => expected eq 2')"
+assert_eq "incomplete+dropped refused rc 1" "1" "${R%%|*}"
+assert_contains "incomplete+dropped is HARNESS_REFUSED" "HARNESS_REFUSED:" "$R"
+assert_contains "incomplete+dropped names first rejected cmd" 'STOP_GREP_REJECTED: grep -c "a b" f' "$R"
+assert_contains "incomplete+dropped names second rejected cmd" 'STOP_GREP_REJECTED: grep -c "^x" g' "$R"
 
 echo "--- Test 7c: declared greps with a mismatch -> error ---"
 R="$(run_check "$GOOD" PROCEED CODE passed 5 mismatch 0 5 0 0 1)"
@@ -230,7 +238,7 @@ assert_contains "FP-6 mismatch evidence error" "EVIDENCE_ERROR:" "$R"
 if printf '%s\n' "$R" | grep -Fq 'SPEC_DEFECT'; then FAIL=$((FAIL + 1)); echo "FAIL: FP-6 must not be SPEC_DEFECT"; else PASS=$((PASS + 1)); echo "PASS: FP-6 must not be SPEC_DEFECT"; fi
 
 echo "--- Test FP-7: lane parity is deterministic ---"
-assert_eq "FP-7 lane count" "12" "$(printf '%s\n' $LANES | grep -c .)"
+assert_eq "FP-7 lane count" "13" "$(printf '%s\n' $LANES | grep -c .)"
 
 echo "--- Test 9: non-PROCEED paths are not gated ---"
 R="$(run_check "$NA_TESTS" ALREADY_SATISFIED CODE "" 0 "")"
@@ -248,6 +256,39 @@ echo "--- mec_field ---"
 assert_eq "TESTS_CLASS" "CODE" "$(mec_field TESTS_CLASS "$(printf 'TESTS_CLASS=CODE\nTESTS_STATUS=passed')")"
 assert_eq "GREP_DECLARED" "9" "$(mec_field GREP_DECLARED "$(printf 'GREP_DECLARED=9\nGREP_STATUS=passed')")"
 assert_eq "missing -> empty" "" "$(mec_field GREP_DECLARED "")"
+
+# =============================================================================
+# WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01
+# =============================================================================
+echo "--- Test SGR-10: dropped stop grep fails the gate, naming each command (run ea46da63) ---"
+EA_DETAIL="DROPPED (not on read-only allowlist; not executed): grep -c 'INSERT INTO stripe_webhook_events' shopops-api/routes/webhooks.js => expected eq 2
+DROPPED (not on read-only allowlist; not executed): grep -c 'paid_at) VALUES' shopops-api/routes/webhooks.js => expected eq 0
+DROPPED (not on read-only allowlist; not executed): grep -c 'ON CONFLICT (tenant_id, stripe_payment_id)' shopops-api/routes/webhooks.js => expected eq 2
+DROPPED (not on read-only allowlist; not executed): grep -c 'CREATE TABLE IF NOT EXISTS stripe_webhook_events' shopops-api/migrations/20260928_stripe_webhook_events_ledger.sql => expected eq 1"
+R="$(run_check "$GOOD" PROCEED CODE passed 5 incomplete 0 1 4 0 0 "$EA_DETAIL")"
+assert_eq "ea46da63 incomplete+dropped refused rc 1" "1" "${R%%|*}"
+assert_contains "ea46da63 is HARNESS_REFUSED" "HARNESS_REFUSED:" "$R"
+assert_contains "ea46da63 names paid_at VALUES cmd verbatim" "STOP_GREP_REJECTED: grep -c 'paid_at) VALUES' shopops-api/routes/webhooks.js" "$R"
+assert_contains "ea46da63 names INSERT cmd verbatim" "STOP_GREP_REJECTED: grep -c 'INSERT INTO stripe_webhook_events' shopops-api/routes/webhooks.js" "$R"
+assert_contains "ea46da63 names ON CONFLICT cmd verbatim" "STOP_GREP_REJECTED: grep -c 'ON CONFLICT (tenant_id, stripe_payment_id)' shopops-api/routes/webhooks.js" "$R"
+assert_contains "ea46da63 names CREATE TABLE cmd verbatim" "STOP_GREP_REJECTED: grep -c 'CREATE TABLE IF NOT EXISTS stripe_webhook_events' shopops-api/migrations/20260928_stripe_webhook_events_ledger.sql" "$R"
+assert_eq "ea46da63 emits exactly four STOP_GREP_REJECTED lines" "4" "$(printf '%s\n' "$R" | grep -c 'STOP_GREP_REJECTED:')"
+# all_dropped variant (declared 3, executed 0, dropped 3) also names each command
+AD_DETAIL="DROPPED (not on read-only allowlist; not executed): grep -c 'a b' one.js => expected eq 1
+DROPPED (not on read-only allowlist; not executed): grep -c 'c d' two.js => expected eq 1
+DROPPED (not on read-only allowlist; not executed): grep -c 'e f' three.js => expected eq 1"
+R="$(run_check "$NA_GREPS" PROCEED CODE passed 3 all_dropped 0 0 3 0 0 "$AD_DETAIL")"
+assert_eq "all_dropped 3 refused rc 1" "1" "${R%%|*}"
+assert_eq "all_dropped 3 emits three STOP_GREP_REJECTED lines" "3" "$(printf '%s\n' "$R" | grep -c 'STOP_GREP_REJECTED:')"
+
+echo "--- Test SGR-11: unparsed-only incomplete still admitted; mismatch/zero-executed still refuse ---"
+R="$(run_check "$GOOD" PROCEED CODE passed 3 incomplete 0 2 0 1 0)"
+assert_eq "unparsed-only incomplete (dropped=0) admitted" "0|OK|" "$R"
+assert_not_contains "unparsed-only admit emits no STOP_GREP_REJECTED" "STOP_GREP_REJECTED:" "$R"
+R="$(run_check "$GOOD" PROCEED CODE passed 3 mismatch 0 3 0 0 1)"
+assert_eq "mismatch still refused rc 1" "1" "${R%%|*}"
+R="$(run_check "$GOOD" PROCEED CODE passed 3 incomplete 0 0 3 0 0)"
+assert_eq "zero-executed incomplete still refused rc 1" "1" "${R%%|*}"
 
 echo
 echo "manifest-evidence-check.sh: $PASS passed, $FAIL failed"

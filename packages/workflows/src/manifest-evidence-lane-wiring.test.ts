@@ -136,7 +136,7 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         expect(n.bash).toContain('rsg_tokens_safe');
         expect(n.bash).toContain('rsg_exec_pipeline');
         expect(n.bash).toContain('-execdir');
-        expect(n.bash).toContain('^[A-Za-z0-9@%+=:,./_*?-]+$');
+        expect(n.bash).toContain('^[A-Za-z0-9@%+=:,./_*?~^-]+$');
         expect(n.bash).not.toContain('bash -c "$1"');
       });
 
