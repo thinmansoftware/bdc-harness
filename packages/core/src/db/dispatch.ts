@@ -13,21 +13,14 @@ import {
 const log = createLogger('db/dispatch');
 
 export type DispatchTaskType =
-  | 'agent_message'
-  | 'run_review'
-  | 'draft_spec'
-  | 'run_report'
-  | 'board_motion';
+  'agent_message' | 'run_review' | 'draft_spec' | 'run_report' | 'board_motion';
 export type DispatchMessageStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
 export type DispatchWorkerStatus = 'available' | 'unavailable';
 export type DispatchMessagePriority = 'blocker' | 'normal' | 'heartbeat';
 export type DispatchTaskOutcome = 'succeeded' | 'failed' | 'blocked';
 export type DispatchRouteDisposition = 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced';
 export type DispatchDeliveryMode =
-  | 'worker_poll'
-  | 'drain_on_start'
-  | 'alias_resolved'
-  | 'notify_only';
+  'worker_poll' | 'drain_on_start' | 'alias_resolved' | 'notify_only';
 
 export interface DispatchMessage {
   id: string;
@@ -141,6 +134,7 @@ export type DispatchMailboxResult =
         | 'machine_actor_required'
         | 'machine_actor_conflict'
         | 'already_disposed'
+        | 'receipt_present'
         | 'disposition_invalid'
         | 'disposition_terminal'
         | 'xo_bind_required'
@@ -1211,7 +1205,12 @@ async function validateMailboxActor(
 }
 
 export async function disposeMessageByMachine(
-  data: { id: string; actor: string; disposition: 'expired' | 'auto_surfaced' },
+  data: {
+    id: string;
+    actor: string;
+    disposition: 'expired' | 'auto_surfaced';
+    requireNoReceipt?: boolean;
+  },
   transactionQuery?: DispatchQueryExecutor
 ): Promise<DispatchMailboxResult> {
   if (!data.actor.startsWith('system:')) return { ok: false, reason: 'machine_actor_required' };
@@ -1228,13 +1227,24 @@ export async function disposeMessageByMachine(
 
     const now = nowIso();
     const update = await query(
-      `UPDATE agent_dispatch_messages
-       SET route_disposition = $2, route_disposed_at = $3
-       WHERE id = $1 AND route_disposition IS NULL`,
+      data.requireNoReceipt
+        ? `UPDATE agent_dispatch_messages
+           SET route_disposition = $2, route_disposed_at = $3
+           WHERE id = $1 AND route_disposition IS NULL
+             AND acknowledged_at IS NULL AND addressed_at IS NULL AND status = 'queued'`
+        : `UPDATE agent_dispatch_messages
+           SET route_disposition = $2, route_disposed_at = $3
+           WHERE id = $1 AND route_disposition IS NULL`,
       [data.id, data.disposition, now]
     );
     const finalMessage = await readMessageInTransaction(query, data.id);
     if (!finalMessage) return { ok: false, reason: 'not_found' };
+    if (update.rowCount === 0 && data.requireNoReceipt) {
+      if (finalMessage.route_disposition !== null) {
+        return { ok: false, reason: 'already_disposed' };
+      }
+      return { ok: false, reason: 'receipt_present' };
+    }
     if (update.rowCount === 0 || finalMessage.route_disposition !== data.disposition) {
       return { ok: false, reason: 'already_disposed' };
     }
