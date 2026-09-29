@@ -286,11 +286,91 @@ describe('reduceToLatestCheckRuns producer identity', () => {
       details_url: 'https://github.com/o/r/actions/runs/111/job/1',
     };
     const runs: LatestCheckRun[] = [
-      { ...base, id: 10, conclusion: 'failure' },
-      { ...base, id: 12, conclusion: 'success' },
+      {
+        ...base,
+        id: 10,
+        conclusion: 'failure',
+        started_at: '2026-09-29T08:00:00Z',
+        completed_at: '2026-09-29T08:02:00Z',
+      },
+      {
+        ...base,
+        id: 12,
+        conclusion: 'success',
+        started_at: '2026-09-29T08:03:00Z',
+        completed_at: '2026-09-29T08:05:00Z',
+      },
     ];
     const { current, superseded } = reduceToLatestCheckRuns(runs);
     expect(current.map(r => r.id)).toEqual([12]);
     expect(superseded.map(r => r.id)).toEqual([10]);
+  });
+
+  test('same-name jobs inside one workflow run: concurrent success cannot hide a failure', () => {
+    const base = { name: 'test', status: 'completed', app: { id: 15368 } };
+    const { current, superseded } = reduceToLatestCheckRuns([
+      {
+        ...base,
+        id: 10,
+        conclusion: 'failure',
+        details_url: 'https://github.com/o/r/actions/runs/111/job/1',
+        started_at: '2026-09-29T08:00:00Z',
+        completed_at: '2026-09-29T08:05:00Z',
+      },
+      {
+        ...base,
+        id: 11,
+        conclusion: 'success',
+        details_url: 'https://github.com/o/r/actions/runs/111/job/2',
+        started_at: '2026-09-29T08:00:00Z',
+        completed_at: '2026-09-29T08:04:00Z',
+      },
+    ]);
+    expect(current.map(r => r.conclusion).sort()).toEqual(['failure', 'success']);
+    expect(superseded).toEqual([]);
+  });
+
+  test('same-name jobs inside one workflow run without timestamps are preserved', () => {
+    const base = { name: 'test', status: 'completed', app: { id: 15368 } };
+    const { current, superseded } = reduceToLatestCheckRuns([
+      {
+        ...base,
+        id: 10,
+        conclusion: 'failure',
+        details_url: 'https://github.com/o/r/actions/runs/111/job/1',
+      },
+      {
+        ...base,
+        id: 11,
+        conclusion: 'success',
+        details_url: 'https://github.com/o/r/actions/runs/111/job/2',
+      },
+    ]);
+    expect(current).toHaveLength(2);
+    expect(superseded).toEqual([]);
+  });
+
+  test('same-name in-progress job inside one workflow run does not hide an older failure unless it started after it', () => {
+    const base = { name: 'test', app: { id: 15368 } };
+    const older = {
+      ...base,
+      id: 10,
+      status: 'completed',
+      conclusion: 'failure',
+      details_url: 'https://github.com/o/r/actions/runs/111/job/1',
+      started_at: '2026-09-29T08:00:00Z',
+      completed_at: '2026-09-29T08:05:00Z',
+    };
+    const concurrent = {
+      ...base,
+      id: 11,
+      status: 'in_progress',
+      conclusion: null,
+      details_url: 'https://github.com/o/r/actions/runs/111/job/2',
+      started_at: '2026-09-29T08:01:00Z',
+    };
+    expect(reduceToLatestCheckRuns([older, concurrent]).current).toHaveLength(2);
+    const rerun = { ...concurrent, started_at: '2026-09-29T08:06:00Z' };
+    expect(reduceToLatestCheckRuns([older, rerun]).current.map(r => r.id)).toEqual([11]);
   });
 });

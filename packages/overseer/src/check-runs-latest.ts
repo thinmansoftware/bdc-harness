@@ -15,6 +15,11 @@
  *   current state is that in-flight (pending) run, never the older completed
  *   conclusion.
  *
+ * Within a single Actions workflow run, same-name runs can be independent jobs
+ * rather than reruns, so a run is only superseded there when the newer run
+ * started after the older one completed (see isSuccessorOf); otherwise both
+ * are kept.
+ *
  * Fail closed on the legacy stub shape: if ANY run in a name group lacks a
  * numeric `id` we cannot order the group, so it is returned unreduced (every
  * run kept in `current`, nothing superseded). This preserves the exact
@@ -53,7 +58,7 @@ export interface ReducedCheckRuns {
  * Producer identity of a run: producing App plus, for Actions, the workflow run
  * id. Two same-name runs with different producers are independent checks, not
  * reruns of each other, so they must never supersede one another (a success
- * from workflow B cannot hide a failure from workflow A). Runs with no producer
+  const wf = workflowRunId(run);
  * metadata (legacy stub shape) all share the empty producer.
  */
 function producerKey(run: LatestCheckRun): string {
@@ -72,13 +77,29 @@ function isCompleted(run: LatestCheckRun): boolean {
   return run.status === 'completed';
 }
 
+/** Actions workflow run id embedded in a run's details URL, or '' if absent. */
+function workflowRunId(run: LatestCheckRun): string {
+  return /\/actions\/runs\/(\d+)/.exec(run.details_url ?? '')?.[1] ?? '';
+}
+
 /**
- * True when `run` is a newer COMPLETED run than `best`. Recency is the run's
- * creation identity (check-run id, ascending = newer), NOT completion time: an
- * older run that happens to finish after a newer one must not win.
+ * True when `newer` (higher id) provably replaces `older` as the current result.
+ *
+ * - Runs with no Actions job identity (legacy/stub shape, or non-Actions
+ *   checks) are ordered by run id alone: a higher id is a later attempt.
+ * - Runs inside ONE Actions workflow run may be either successive attempts of
+ *   the same job or independent same-name jobs (job ids differ in both cases),
+ *   so id order is not evidence. Require temporal succession: `older` is
+ *   completed and `newer` started at or after it completed. Missing or
+ *   overlapping timestamps are ambiguous and are NOT superseded (fail closed,
+ *   so a failure or pending state is never hidden by a concurrent sibling).
  */
-function isNewerCompleted(run: IdentifiedCheckRun, best: IdentifiedCheckRun): boolean {
-  return run.id > best.id;
+function isSuccessorOf(newer: IdentifiedCheckRun, older: IdentifiedCheckRun): boolean {
+  if (workflowRunId(newer) === '' && workflowRunId(older) === '') return true;
+  if (!isCompleted(older) || !older.completed_at || !newer.started_at) return false;
+  const doneAt = Date.parse(older.completed_at);
+  const startedAt = Date.parse(newer.started_at);
+  return !Number.isNaN(doneAt) && !Number.isNaN(startedAt) && startedAt >= doneAt;
 }
 
 /**
@@ -111,31 +132,25 @@ export function reduceToLatestCheckRuns(runs: LatestCheckRun[]): ReducedCheckRun
 
     const identified = group;
 
-    let newestCompleted: IdentifiedCheckRun | undefined;
-    let newestInflight: IdentifiedCheckRun | undefined;
+    // A run is superseded by a higher-id run only when the pair is provably
+    // successive attempts (see isSuccessorOf). Anything ambiguous is kept.
+    const supersededBy = new Map<IdentifiedCheckRun, IdentifiedCheckRun>();
     for (const run of identified) {
-      if (isCompleted(run)) {
-        if (newestCompleted === undefined || isNewerCompleted(run, newestCompleted)) {
-          newestCompleted = run;
+      for (const other of identified) {
+        if (other.id > run.id && isSuccessorOf(other, run)) {
+          const prev = supersededBy.get(run);
+          if (prev === undefined || other.id > prev.id) supersededBy.set(run, other);
         }
-      } else if (newestInflight === undefined || run.id > newestInflight.id) {
-        newestInflight = run;
       }
     }
 
-    // A newer in-flight run (higher id) means the check is running again, so
-    // its current state is pending -- never the older completed conclusion.
-    const winner =
-      newestCompleted !== undefined &&
-      (newestInflight === undefined || newestCompleted.id > newestInflight.id)
-        ? newestCompleted
-        : newestInflight;
-    if (winner === undefined) continue;
-
-    current.push(winner);
     for (const run of identified) {
-      if (run === winner) continue;
-      superseded.push({ ...run, superseded_by: winner.id });
+      const by = supersededBy.get(run);
+      if (by === undefined) {
+        current.push(run);
+      } else {
+        superseded.push({ ...run, superseded_by: by.id });
+      }
     }
   }
 
