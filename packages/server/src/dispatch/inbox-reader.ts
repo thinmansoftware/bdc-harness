@@ -81,6 +81,7 @@ interface ReaderState {
   run_file?: string | null;
   last_alert_at?: Record<string, string>;
   cursors?: Record<string, number>;
+  rotation?: number;
 }
 
 export interface InboxListFilters {
@@ -303,13 +304,15 @@ export async function writeDigest(
  * `cursor_seq` persisted in state.json between runs, so a page that cannot
  * shrink (retained ACTIONABLE rows, or dry-run) no longer hides the rows
  * behind it: the next run resumes after it, and a walk that reaches the tail
- * wraps to the head. An injected lister that returns no `cursor_seq` gets
+ * wraps to the head. The mailbox order rotates each run so a budget smaller
+ * than the mailbox count still serves every mailbox. An injected lister that returns no `cursor_seq` gets
  * head-only paging.
  */
 async function listAllRecipients(
   list: (filters: InboxListFilters) => Promise<ListedInboxMessage[]>,
   config: InboxReaderConfig,
   cursors: Record<string, number>,
+  rotation: number,
   errors: string[]
 ): Promise<{
   pages: Map<string, { rows: ListedInboxMessage[]; full: boolean }>;
@@ -379,12 +382,16 @@ async function listAllRecipients(
     }
   };
 
-  const base = Math.floor(config.maxPerRun / recipients.length);
-  const extra = config.maxPerRun % recipients.length;
-  for (const [index, recipient] of recipients.entries()) {
+  // Rotate which mailbox is served first (and so receives the extra slots) on
+  // every run, so a budget smaller than the mailbox count still reaches all.
+  const shift = ((rotation % recipients.length) + recipients.length) % recipients.length;
+  const ordered = [...recipients.slice(shift), ...recipients.slice(0, shift)];
+  const base = Math.floor(config.maxPerRun / ordered.length);
+  const extra = config.maxPerRun % ordered.length;
+  for (const [index, recipient] of ordered.entries()) {
     await fetchPage(recipient, Math.min(base + (index < extra ? 1 : 0), remaining));
   }
-  for (const recipient of recipients) {
+  for (const recipient of ordered) {
     while (remaining > 0 && !(walks.get(recipient)?.done ?? true)) {
       await fetchPage(recipient, remaining);
     }
@@ -434,7 +441,13 @@ export async function runInboxReader(
     const countsByRule: Record<string, number> = {};
     const classified: { message: InboxMessage; result: InboxClassification }[] = [];
     const pageInfo: { recipient: string; full: boolean }[] = [];
-    const listed = await listAllRecipients(list, config, state.cursors ?? {}, errors);
+    const listed = await listAllRecipients(
+      list,
+      config,
+      state.cursors ?? {},
+      state.rotation ?? 0,
+      errors
+    );
     const nextCursors = listed.cursors;
     for (const recipient of config.recipients) {
       counts[recipient] = emptyCounts();
@@ -678,7 +691,7 @@ export async function runInboxReader(
     for (const alert of alerts) lastAlertAt[alertKey(alert.kind, alert.recipient)] = alert.at;
     await writer(
       join(root, 'state.json'),
-      `${JSON.stringify({ last_run_at: started.toISOString(), content_hash: hash, run_file: digest.run_file, last_alert_at: lastAlertAt, cursors: nextCursors }, null, 2)}\n`
+      `${JSON.stringify({ last_run_at: started.toISOString(), content_hash: hash, run_file: digest.run_file, last_alert_at: lastAlertAt, cursors: nextCursors, rotation: (state.rotation ?? 0) + 1 }, null, 2)}\n`
     );
     const cutoff = started.getTime() - config.retentionDays * 86_400_000;
     for (const file of await readdir(join(root, 'runs'))) {

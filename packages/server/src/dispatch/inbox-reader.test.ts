@@ -468,6 +468,55 @@ describe('inbox reader', () => {
     expect(seen.has('operator-info-0')).toBe(true);
   });
 
+  test('T22 a budget of 1 rotates across mailboxes so operator is never starved', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'inbox-reader-'));
+    roots.push(root);
+    const store = [
+      {
+        ...F1,
+        id: 'xo-retained',
+        sender: 'codex',
+        task_type: 'agent_message',
+        recipient: 'xo',
+        body: 'escalation',
+        cursor_seq: 1,
+      },
+      { ...F1, id: 'operator-one', recipient: 'operator', cursor_seq: 2 },
+    ] as (typeof F1 & { cursor_seq: number })[];
+    const listed: string[] = [];
+    const run = () =>
+      runInboxReader(
+        {
+          root,
+          now: () => new Date('2026-09-29T12:00:00Z'),
+          listMessages: async ({ recipient, limit, afterSeq }) => {
+            const rows = store
+              .filter(row => row.recipient === recipient)
+              .filter(row => afterSeq === undefined || row.cursor_seq > afterSeq)
+              .slice(0, limit);
+            for (const row of rows) listed.push(row.id);
+            return rows;
+          },
+          disposeMessageByMachine: async data => ({ ok: true, message: { id: data.id } as never }),
+          registerWorker: async () => undefined,
+          heartbeatWorker: async () => undefined,
+          log: { info: () => {}, warn: () => {}, error: () => {} },
+        },
+        {
+          ...resolveInboxReaderConfig({
+            INBOX_READER_MODE: 'dry-run',
+            INBOX_READER_MAX_PER_RUN: '1',
+            INBOX_READER_OPERATOR_OWNER: 'reader',
+          }),
+          alertRepeatHours: 0,
+        }
+      );
+    await run();
+    await run();
+    expect(listed).toContain('operator-one');
+    expect(listed).toContain('xo-retained');
+  });
+
   test('retention deletes only expired timestamped run files', async () => {
     const root = await mkdtemp(join(tmpdir(), 'inbox-reader-'));
     roots.push(root);
