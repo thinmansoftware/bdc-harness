@@ -73,7 +73,7 @@ describe('reduceToLatestCheckRuns', () => {
     expect(superseded.map(r => r.id)).toEqual([20]);
   });
 
-  test('3 equal completed_at breaks ties by higher id, not order or conclusion', () => {
+  test('3 equal completed_at is decided by higher id, not order or conclusion', () => {
     const at = '2026-09-29T08:00:00Z';
     const failFirst = reduceToLatestCheckRuns([
       { id: 30, name: 'X', status: 'completed', conclusion: 'failure', completed_at: at },
@@ -88,6 +88,55 @@ describe('reduceToLatestCheckRuns', () => {
     ]);
     expect(swapped.current[0]?.id).toBe(31);
     expect(swapped.current[0]?.conclusion).toBe('failure');
+  });
+
+  test('3b out-of-order completion: newest run id wins regardless of completed_at', () => {
+    // Older success (id 32) completes AFTER newer failure (id 33): failure is current.
+    const olderSuccessLate = reduceToLatestCheckRuns([
+      {
+        id: 32,
+        name: 'X',
+        status: 'completed',
+        conclusion: 'success',
+        started_at: '2026-09-29T08:00:00Z',
+        completed_at: '2026-09-29T08:10:00Z',
+      },
+      {
+        id: 33,
+        name: 'X',
+        status: 'completed',
+        conclusion: 'failure',
+        started_at: '2026-09-29T08:01:00Z',
+        completed_at: '2026-09-29T08:05:00Z',
+      },
+    ]);
+    expect(olderSuccessLate.current).toHaveLength(1);
+    expect(olderSuccessLate.current[0]?.id).toBe(33);
+    expect(olderSuccessLate.current[0]?.conclusion).toBe('failure');
+    expect(olderSuccessLate.superseded[0]?.id).toBe(32);
+    expect(olderSuccessLate.superseded[0]?.superseded_by).toBe(33);
+
+    // Reverse: older failure (id 34) completes after newer success (id 35): success is current.
+    const olderFailureLate = reduceToLatestCheckRuns([
+      {
+        id: 35,
+        name: 'X',
+        status: 'completed',
+        conclusion: 'success',
+        completed_at: '2026-09-29T08:05:00Z',
+      },
+      {
+        id: 34,
+        name: 'X',
+        status: 'completed',
+        conclusion: 'failure',
+        completed_at: '2026-09-29T08:10:00Z',
+      },
+    ]);
+    expect(olderFailureLate.current).toHaveLength(1);
+    expect(olderFailureLate.current[0]?.id).toBe(35);
+    expect(olderFailureLate.current[0]?.conclusion).toBe('success');
+    expect(olderFailureLate.superseded[0]?.id).toBe(34);
   });
 
   test('4 a newer in-progress rerun makes the check pending, not the older result', () => {

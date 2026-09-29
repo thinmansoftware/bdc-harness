@@ -7,8 +7,9 @@
  * hide a real regression). This module groups the runs by trimmed name and, per
  * name, keeps only the current run:
  *
- * - the newest COMPLETED run, ordered by `completed_at` then by `id` (id breaks
- *   completed_at ties -- see #1048 live evidence where two runs share a head);
+ * - the newest COMPLETED run, ordered by run creation identity (`id`, higher =
+ *   newer). Completion time is deliberately NOT used: an older run that
+ *   completes after a newer run must not suppress the newer result (#1048);
  * - unless a same-name run that is NOT completed has a higher `id` than that
  *   newest completed run, in which case the check is running again and its
  *   current state is that in-flight (pending) run, never the older completed
@@ -55,21 +56,11 @@ function isCompleted(run: LatestCheckRun): boolean {
 }
 
 /**
- * Sortable rank for `completed_at`. A missing or unparseable timestamp ranks
- * lowest so a run that carries a real timestamp always wins over one that does
- * not; the `id` tie-break then orders equal timestamps deterministically.
+ * True when `run` is a newer COMPLETED run than `best`. Recency is the run's
+ * creation identity (check-run id, ascending = newer), NOT completion time: an
+ * older run that happens to finish after a newer one must not win.
  */
-function completedAtRank(run: LatestCheckRun): number {
-  if (!run.completed_at) return Number.NEGATIVE_INFINITY;
-  const parsed = Date.parse(run.completed_at);
-  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
-}
-
-/** True when `run` is a newer COMPLETED run than `best` (completed_at, then id). */
 function isNewerCompleted(run: IdentifiedCheckRun, best: IdentifiedCheckRun): boolean {
-  const runRank = completedAtRank(run);
-  const bestRank = completedAtRank(best);
-  if (runRank !== bestRank) return runRank > bestRank;
   return run.id > best.id;
 }
 
@@ -101,7 +92,7 @@ export function reduceToLatestCheckRuns(runs: LatestCheckRun[]): ReducedCheckRun
       continue;
     }
 
-    const identified = group as IdentifiedCheckRun[];
+    const identified = group;
 
     let newestCompleted: IdentifiedCheckRun | undefined;
     let newestInflight: IdentifiedCheckRun | undefined;
@@ -115,15 +106,14 @@ export function reduceToLatestCheckRuns(runs: LatestCheckRun[]): ReducedCheckRun
       }
     }
 
-    let winner: IdentifiedCheckRun;
-    if (newestCompleted !== undefined && newestInflight !== undefined) {
-      // A newer in-flight run (higher id) means the check is running again, so
-      // its current state is pending -- never the older completed conclusion.
-      winner = newestInflight.id > newestCompleted.id ? newestInflight : newestCompleted;
-    } else {
-      // The group is non-empty, so exactly one of the two is defined here.
-      winner = (newestCompleted ?? newestInflight) as IdentifiedCheckRun;
-    }
+    // A newer in-flight run (higher id) means the check is running again, so
+    // its current state is pending -- never the older completed conclusion.
+    const winner =
+      newestCompleted !== undefined &&
+      (newestInflight === undefined || newestCompleted.id > newestInflight.id)
+        ? newestCompleted
+        : newestInflight;
+    if (winner === undefined) continue;
 
     current.push(winner);
     for (const run of identified) {
