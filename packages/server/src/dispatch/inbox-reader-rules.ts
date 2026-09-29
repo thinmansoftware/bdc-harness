@@ -65,12 +65,16 @@ export function classifyInboxMessage(message: InboxMessage): InboxClassification
     (message.sender === 'overseer' || message.sender === 'overseer-review-route') &&
     message.task_type === 'run_report'
   ) {
-    let body: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      body = JSON.parse(message.body) as Record<string, unknown>;
+      parsed = JSON.parse(message.body);
     } catch {
       return result('ACTIONABLE', 'body_not_json', 'overseer report body is not JSON');
     }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return result('ACTIONABLE', 'body_not_json', 'overseer report body is not a JSON object');
+    }
+    const body = parsed as Record<string, unknown>;
     if (
       body.kind === 'pr_review_submit_receipt' &&
       ['approved', 'changes_requested'].includes(String(body.disposition)) &&

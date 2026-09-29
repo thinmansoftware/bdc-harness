@@ -95,6 +95,23 @@ describe('inbox reader', () => {
     );
   });
 
+  test('T6b overseer run_report with a null, scalar, array or non-JSON body is ACTIONABLE', () => {
+    for (const body of ['null', '42', '"text"', '[]', '[{"kind":"x"}]', 'not json', '']) {
+      const verdict = classifyInboxMessage({ ...F1, body });
+      expect(verdict.class).toBe('ACTIONABLE');
+      expect(verdict.rule_id).toBe('body_not_json');
+    }
+    expect(classifyInboxMessage({ ...F2, body: 'null' }).class).toBe('ACTIONABLE');
+  });
+
+  test('T6c a null-body overseer report does not abort the run and is never disposed', async () => {
+    const nullBody = { ...F1, id: 'null-body-row', body: 'null' };
+    const { result, disposed } = await harness([nullBody, F3]);
+    expect(result.errors).toEqual([]);
+    expect(disposed.map(item => item.id)).toEqual([F3.id]);
+    expect(result.digest?.actionable.map(item => item.id)).toContain('null-body-row');
+  });
+
   test('T6 unknown sender is ACTIONABLE', () => {
     expect(classifyInboxMessage(F11).rule_id).toBe('unknown_sender');
     expect(classifyInboxMessage({ ...F1, sender: 'overseer-v2' }).rule_id).toBe('unknown_sender');
