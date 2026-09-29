@@ -45,6 +45,19 @@ interactive operator session and ignores duplicate starts.
 
 `config.local.json` and `scripts/dispatch-worker/transcripts/` are intentionally gitignored.
 
+### Prompt delivery contract (no argv template)
+
+The dispatch body is delivered to an agent CLI on stdin by default, or written to
+a temp file substituted for the `__DISPATCH_PROMPT_FILE__` placeholder for
+`promptDelivery: 'prompt-file'` seats (grok). It is NEVER passed as an argv
+template. A `config.local.json` must NOT carry the literal `{{prompt}}` token in
+any `agents.*.args` -- the token is not substituted and an agent that receives it
+answers the literal template instead of the real task (issue #1042). As a
+safety net, `buildAgentInvocation` drops any argv element that is exactly the
+token and throws `dispatch_agent_args_prompt_template_embedded` when the token is
+embedded inside a larger argument, but the correct fix is to re-copy
+`config.local.json` from the current `config.example.json`.
+
 ## Per-agent working directory and environment (`cwd`, `env`)
 
 Every agent in `agents` accepts two optional fields:
