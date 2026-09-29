@@ -1,0 +1,80 @@
+{
+  "_source": "GitHub REST checks.listForRef filter=all, captured 2026-09-29 (WO-HARNESS-OVERSEER-LATEST-CHECK-RUN-01 section D). Frozen point-in-time capture, NOT current live state. Do not edit values to force a green: the 43f6e933 CE Change Scope Gate group intentionally reduces to a FAILURE because the newest run of that name at that head failed.",
+  "_ce_promotion_gate_note": "Section D recorded that lspro-react 43f6e933 CE Promotion Gate had five runs (a mix of skipped and success) but captured only the winning run's id (109340055172, success, 2026-09-29T09:19:03Z). Only captured values are stored here; the four other run ids were not captured in the WO and are not fabricated.",
+  "heads": [
+    {
+      "repo": "thinmansoftware/shopops",
+      "headSha": "ba023dca82a7f41274a68a98bb05967531eac1a8",
+      "checkRuns": [
+        {
+          "id": 109328882282,
+          "name": "manifest-validate / manifest-validate",
+          "status": "completed",
+          "conclusion": "failure",
+          "completed_at": "2026-09-29T08:47:18Z"
+        },
+        {
+          "id": 109329769985,
+          "name": "manifest-validate / manifest-validate",
+          "status": "completed",
+          "conclusion": "success",
+          "completed_at": "2026-09-29T08:49:52Z"
+        }
+      ]
+    },
+    {
+      "repo": "thinmansoftware/lspro-react",
+      "headSha": "33579a2f493b33b7fa2037aa58443da0518184b3",
+      "checkRuns": [
+        {
+          "id": 109151863524,
+          "name": "CE Change Scope Gate",
+          "status": "completed",
+          "conclusion": "failure",
+          "completed_at": "2026-09-28T21:50:34Z"
+        },
+        {
+          "id": 109292364884,
+          "name": "CE Change Scope Gate",
+          "status": "completed",
+          "conclusion": "success",
+          "completed_at": "2026-09-29T06:54:23Z"
+        }
+      ]
+    },
+    {
+      "repo": "thinmansoftware/lspro-react",
+      "headSha": "43f6e933efe51b59bdd38eac81ea00c328990fc7",
+      "checkRuns": [
+        {
+          "id": 109330480099,
+          "name": "CE Change Scope Gate",
+          "status": "completed",
+          "conclusion": "failure",
+          "completed_at": "2026-09-29T08:51:52Z"
+        },
+        {
+          "id": 109330645612,
+          "name": "CE Change Scope Gate",
+          "status": "completed",
+          "conclusion": "success",
+          "completed_at": "2026-09-29T08:52:20Z"
+        },
+        {
+          "id": 109340055390,
+          "name": "CE Change Scope Gate",
+          "status": "completed",
+          "conclusion": "failure",
+          "completed_at": "2026-09-29T09:18:49Z"
+        },
+        {
+          "id": 109340055172,
+          "name": "CE Promotion Gate",
+          "status": "completed",
+          "conclusion": "success",
+          "completed_at": "2026-09-29T09:19:03Z"
+        }
+      ]
+    }
+  ]
+}
