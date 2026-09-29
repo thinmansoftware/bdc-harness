@@ -80,7 +80,7 @@ export interface MergeExecutionBridgeOptions {
 export interface MinimalCompareClient {
   repos: {
     compareCommits(input: Record<string, unknown>): Promise<{
-      data: { files?: { filename: string; status: string }[] };
+      data: { files?: { filename: string; status: string; previous_filename?: string }[] };
     }>;
   };
 }
@@ -111,9 +111,9 @@ function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
     };
     repos: {
       getBranch(input: Record<string, unknown>): Promise<{ data: { commit: { sha: string } } }>;
-      compareCommits(
-        input: Record<string, unknown>
-      ): Promise<{ data: { files?: { filename: string; status: string }[] } }>;
+      compareCommits(input: Record<string, unknown>): Promise<{
+        data: { files?: { filename: string; status: string; previous_filename?: string }[] };
+      }>;
     };
     actions: {
       listWorkflowRunsForRepo(input: Record<string, unknown>): Promise<{

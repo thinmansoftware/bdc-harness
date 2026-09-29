@@ -32,7 +32,7 @@ export interface CeScopeRecheckDeps {
     base: string,
     head: string
   ): Promise<{
-    files?: readonly { filename: string; status: string }[];
+    files?: readonly { filename: string; status: string; previous_filename?: string }[];
     complete?: boolean;
   }>;
   listWorkflowRuns(owner: string, repo: string, head: string): Promise<readonly CeWorkflowRun[]>;
@@ -84,42 +84,62 @@ export async function ceScopePremergeRecheck(input: {
     }
     if (!comparison.complete || !comparison.files || comparison.files.length >= 300)
       return { ok: false, reason: 'compare_truncated' };
-    const ceFiles = comparison.files.filter(file => file.filename.startsWith('src/components/ce/'));
+    // A rename is judged on BOTH sides: moving a protected file out of its
+    // directory removes it from there, and both names count toward breadth.
+    const isProtected = (path: string): boolean =>
+      path.startsWith('src/components/ce/') || path.startsWith('tests/ce-regression/');
+    const ceNames = new Set<string>();
+    for (const file of comparison.files) {
+      if (file.filename.startsWith('src/components/ce/')) ceNames.add(file.filename);
+      if (file.previous_filename?.startsWith('src/components/ce/'))
+        ceNames.add(file.previous_filename);
+    }
     const wide =
-      ceFiles.length > 10 ||
+      ceNames.size > 10 ||
       comparison.files.some(
         file =>
-          file.status === 'removed' &&
-          (file.filename.startsWith('src/components/ce/') ||
-            file.filename.startsWith('tests/ce-regression/'))
+          (file.status === 'removed' && isProtected(file.filename)) ||
+          (file.status === 'renamed' &&
+            file.previous_filename !== undefined &&
+            isProtected(file.previous_filename) &&
+            !isProtected(file.filename))
       );
     const identity = {
       repo: `${input.owner}/${input.repo}`,
       pr_number: pr.number,
       head_sha: pr.head.sha,
     };
-    const metadata = await input.deps.getMetadata(identity);
-    if (wide) {
-      let decision;
-      try {
-        decision = await input.deps.getApproval({ ...identity, base_sha: base });
-      } catch {
-        return { ok: false, reason: 'approval_error' };
+    // Approval + revocation authority. Read once to fail fast, and read AGAIN after
+    // all GitHub inspection so a revocation committed during those requests is seen.
+    const checkAuthority = async (): Promise<
+      { ok: false; reason: string } | { ok: true; newestRevokedAt: string | null }
+    > => {
+      const metadata = await input.deps.getMetadata(identity);
+      if (wide) {
+        let decision;
+        try {
+          decision = await input.deps.getApproval({ ...identity, base_sha: base });
+        } catch {
+          return { ok: false, reason: 'approval_error' };
+        }
+        if (decision.decision === 'deny') {
+          if (decision.reason === 'revoked') return { ok: false, reason: 'revoked' };
+          return { ok: false, reason: metadata.hasOtherBase ? 'base_moved' : 'approval_missing' };
+        }
+        const approval = decision.approval;
+        if (
+          approval.repo !== identity.repo ||
+          approval.pr_number !== pr.number ||
+          approval.head_sha !== pr.head.sha ||
+          approval.base_sha !== base ||
+          approval.target_branch !== 'release/ce'
+        )
+          return { ok: false, reason: 'approval_malformed' };
       }
-      if (decision.decision === 'deny') {
-        if (decision.reason === 'revoked') return { ok: false, reason: 'revoked' };
-        return { ok: false, reason: metadata.hasOtherBase ? 'base_moved' : 'approval_missing' };
-      }
-      const approval = decision.approval;
-      if (
-        approval.repo !== identity.repo ||
-        approval.pr_number !== pr.number ||
-        approval.head_sha !== pr.head.sha ||
-        approval.base_sha !== base ||
-        approval.target_branch !== 'release/ce'
-      )
-        return { ok: false, reason: 'approval_malformed' };
-    }
+      return { ok: true, newestRevokedAt: metadata.newestRevokedAt };
+    };
+    const early = await checkAuthority();
+    if (!early.ok) return early;
     const runs = await input.deps.listWorkflowRuns(input.owner, input.repo, pr.head.sha);
     const pinned = runs.filter(run => run.path === CE_GATE_PATH && run.head_branch === pr.head.ref);
     const targetRuns = pinned
@@ -133,12 +153,6 @@ export async function ceScopePremergeRecheck(input: {
     if (selected?.conclusion !== 'success') return { ok: false, reason: 'gate_not_green' };
     // Compare epochs, never strings: timestamps may arrive in different formats.
     // An unparseable timestamp fails closed.
-    if (metadata.newestRevokedAt) {
-      const green = Date.parse(selected.run_started_at);
-      const revokedAt = Date.parse(metadata.newestRevokedAt);
-      if (Number.isNaN(green) || Number.isNaN(revokedAt) || green <= revokedAt)
-        return { ok: false, reason: 'revoked_after_green' };
-    }
     const trustedSuites = new Set(
       runs
         .filter(
@@ -158,6 +172,19 @@ export async function ceScopePremergeRecheck(input: {
       )
     )
       return { ok: false, reason: 'gate_not_green' };
+    // Authoritative final read, AFTER every GitHub request above. The bridge merges
+    // with the exact head immediately after this returns; the only window left is
+    // between this read and GitHub's merge API call.
+    const final = await checkAuthority();
+    if (!final.ok) return final;
+    if (final.newestRevokedAt) {
+      const green = Date.parse(selected.run_started_at);
+      const revokedAt = Date.parse(final.newestRevokedAt);
+      if (Number.isNaN(green) || Number.isNaN(revokedAt) || green <= revokedAt)
+        return { ok: false, reason: 'revoked_after_green' };
+    }
+    const finalBase = await input.deps.getBranchTip(input.owner, input.repo, 'release/ce');
+    if (finalBase !== base) return { ok: false, reason: 'base_moved' };
     return { ok: true };
   } catch {
     return { ok: false, reason: 'approval_error' };

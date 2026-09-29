@@ -236,4 +236,100 @@ describe('CE scope premerge recheck', () => {
     expect(queriedHead).toBe(headSha);
     expect(result).toEqual({ ok: true });
   });
+  test('rename_out_of_protected_directory_counts_as_removal', async () => {
+    const denied = deps({
+      compare: async () => ({
+        complete: true,
+        files: [
+          {
+            filename: 'src/components/other/Grader.tsx',
+            previous_filename: 'src/components/ce/Grader.tsx',
+            status: 'renamed',
+          },
+        ],
+      }),
+      getApproval: async () => ({ decision: 'deny', reason: 'no_record' }),
+    });
+    expect(await check(denied)).toEqual({ ok: false, reason: 'approval_missing' });
+    const regressionMove = deps({
+      compare: async () => ({
+        complete: true,
+        files: [
+          {
+            filename: 'tests/archive/slab.spec.ts',
+            previous_filename: 'tests/ce-regression/slab.spec.ts',
+            status: 'renamed',
+          },
+        ],
+      }),
+      getApproval: async () => ({ decision: 'deny', reason: 'no_record' }),
+    });
+    expect(await check(regressionMove)).toEqual({ ok: false, reason: 'approval_missing' });
+    // A rename that stays inside a protected directory is not a removal.
+    const within = deps({
+      compare: async () => ({
+        complete: true,
+        files: [
+          {
+            filename: 'src/components/ce/grading/Grader.tsx',
+            previous_filename: 'src/components/ce/Grader.tsx',
+            status: 'renamed',
+          },
+        ],
+      }),
+      getApproval: async () => ({ decision: 'deny', reason: 'no_record' }),
+    });
+    expect(await check(within)).toEqual({ ok: true });
+  });
+  test('revocation_during_final_check_run_request_is_seen', async () => {
+    // Narrow change: the revoke lands while GitHub check runs are being fetched.
+    let revokedAt: string | null = null;
+    const narrow = deps({
+      getMetadata: async () => ({ hasOtherBase: false, newestRevokedAt: revokedAt }),
+      listCheckRuns: async () => {
+        revokedAt = '2026-09-28T12:00:00Z';
+        return [{ name: 'CE Change Scope Gate', conclusion: 'success', check_suite: { id: 10 } }];
+      },
+    });
+    expect(await check(narrow)).toEqual({ ok: false, reason: 'revoked_after_green' });
+    // Wide change: the approval is revoked during the same request.
+    let revoked = false;
+    const wide = deps({
+      compare: async () => ({ complete: true, files: wideFiles }),
+      getApproval: async () =>
+        revoked
+          ? { decision: 'deny', reason: 'revoked' }
+          : {
+              decision: 'allow',
+              approval: {
+                repo: 'thinmansoftware/lspro-react',
+                pr_number: 626,
+                head_sha: S,
+                base_sha: B,
+                target_branch: 'release/ce',
+              },
+            },
+      listCheckRuns: async () => {
+        revoked = true;
+        return [{ name: 'CE Change Scope Gate', conclusion: 'success', check_suite: { id: 10 } }];
+      },
+    });
+    expect(await check(wide)).toEqual({ ok: false, reason: 'revoked' });
+  });
+  test('base_moving_during_inspection_is_refused', async () => {
+    let tip = B;
+    expect(
+      await check(
+        deps({
+          getBranchTip: async () => tip,
+          listCheckRuns: async () => {
+            tip = '9'.repeat(40);
+            return [
+              { name: 'CE Change Scope Gate', conclusion: 'success', check_suite: { id: 10 } },
+            ];
+          },
+        })
+      )
+    ).toEqual({ ok: false, reason: 'base_moved' });
+  });
 });
