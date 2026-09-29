@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run-stop-greps.sh -- unit tests for the run-stop-greps node core (rsg_*) in
 # .archon/workflows/defaults/bdc-feature-development-codex.yaml and its byte-identical
-# mirrors in the other 11 bdc-feature-development lanes.
+# mirrors in the other 12 bdc-feature-development lanes.
 #
 # bdc-xo #1940: the manifest "Grep assertions:" line was stamped "N/A (no declared
 # mechanical assertions)" for every WO, including specs that declared grep stop
@@ -9,7 +9,7 @@
 # it under the read-only allowlist, and emits OBSERVED counts.
 #
 # Cores are EXTRACTED from the canonical YAML (never re-typed). A parity test asserts
-# the core is byte-identical across all 12 lanes.
+# the core is byte-identical across all 13 lanes.
 #
 # Run: bash .archon/workflows/defaults/__tests__/run-stop-greps.sh
 # Exits 0 on all-pass, 1 on any failure. ASCII only.
@@ -41,6 +41,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
+bdc-feature-development-astra.yaml
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
 bdc-feature-development-cursor.yaml
@@ -72,7 +73,7 @@ for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: rsg core byte-identical across all 12 lanes (parity-all-12-lanes) ---"
+echo "--- Parity: rsg core byte-identical across all 13 lanes (parity-all-13-lanes) ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$RSG_CORE" "$(extract_core "$DEFAULTS/$lane" rsg)"
 done
@@ -161,7 +162,11 @@ c='grep -c "needle" fixture.txt'
 if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: double-quoted-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: double-quoted-still-dropped: $c"; fi
 
 echo "--- unsafe-quoted-content-still-dropped ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
+# Section 2A rows R4/R5/R9: unsafe INNER content and quoted forbidden flags stay
+# dropped. NOTE (WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01): the prior WO pinned
+# 'a b' and '^x' as dropped; those are now DATA and EXECUTE -- see the
+# quoted-space / quoted-caret executes groups below.
+for c in "grep -c '\$(id)' f" "grep -c 'x => y' f" "grep -c 'x f" "grep -c '' f" "grep -c a'b' f" "grep '--file=/etc/passwd' x" "grep -c '-f x' f" "find . '-exec' rm" "sort '-o' out"; do
   if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: unsafe-quoted-content-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: unsafe-quoted-content-still-dropped: $c"; fi
 done
 
@@ -241,7 +246,7 @@ assert_contains "double-quoted-still-dropped" "GREP_DROPPED=1" "$OUT"
 assert_contains "double-quoted-still-dropped not executed" "GREP_EXECUTED=0" "$OUT"
 
 echo "--- unsafe-quoted-content-still-dropped (run) ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f"; do
+for c in "grep -c '\$(id)' f" "grep -c 'x => y' f" "grep -c 'x f" "grep -c '' f"; do
   OUT="$(printf '%s\teq\t1\nUNPARSED\t0\nDECLARED\t1\n' "$c" | rsg_run)"
   assert_contains "unsafe-quoted-content-still-dropped: $c" "DROPPED (not on read-only allowlist; not executed): $c" "$OUT"
   assert_contains "unsafe-quoted-content-still-dropped not executed: $c" "GREP_EXECUTED=0" "$OUT"
@@ -327,6 +332,186 @@ assert_contains "ge 1 holds with observed 3" 'OK: grep -c gcd shopops-api/routes
 assert_contains "ASCII absence holds" 'OK: LC_ALL=C grep -n NonAscii shopops-api/routes/store.js => 0 (expected eq 0)' "$OUT"
 assert_contains "unparsed bullet assertions make evidence incomplete" "GREP_STATUS=incomplete" "$OUT"
 rm -rf "$TMP2"
+
+# =============================================================================
+# WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01: quote-aware tokenizer, read-only
+# git, and the fail-closed behavior. Section 2A is the authoritative rule table.
+# =============================================================================
+allow_yn() { if rsg_allow_cmd "$1"; then echo yes; else echo no; fi; }
+
+WT2="$(mktemp -d)"
+cd "$WT2"
+printf 'SET LOCAL app.tenant_id one\nSET LOCAL app.tenant_id two\nunrelated line\n' > store.sql
+printf 'foo bar\nfoo bar baz\nxfoo bar\n' > anchored.txt
+printf '<<<<<<< HEAD\nkept line\n' > markers.txt
+printf 'alpha|beta\na1\na.b\nend$\n(paren)\nx  y\n' > regexy.txt
+printf 'a.b\naZb\n' > dotf.txt
+
+echo "--- Test 1: quoted-space-pattern-executes (Section 2A R3) ---"
+assert_eq "quoted space pattern allowed" "yes" "$(allow_yn "grep -c 'SET LOCAL app.tenant_id' store.sql")"
+OUT="$(printf 'Stop 1 (grep assertion):\n  grep -c '\''SET LOCAL app.tenant_id'\'' store.sql\n  Expected: 2\n' | rsg_extract | rsg_run)"
+assert_contains "quoted space executes" "GREP_EXECUTED=1" "$OUT"
+assert_contains "quoted space not dropped" "GREP_DROPPED=0" "$OUT"
+assert_contains "quoted space observed 2" "OK: grep -c 'SET LOCAL app.tenant_id' store.sql => 2 (expected eq 2)" "$OUT"
+assert_contains "quoted space status passed" "GREP_STATUS=passed" "$OUT"
+
+echo "--- Test 2: quoted-caret-anchor-executes (Section 2A R1, R3) ---"
+assert_eq "quoted caret+space allowed" "yes" "$(allow_yn "grep -c '^foo bar' anchored.txt")"
+assert_eq "observe ^foo bar = 2" "2" "$(rsg_observe "grep -c '^foo bar' anchored.txt")"
+assert_eq "quoted caret conflict-marker allowed" "yes" "$(allow_yn "grep -c '^<<<<<<<' markers.txt")"
+assert_eq "observe ^<<<<<<< = 1" "1" "$(rsg_observe "grep -c '^<<<<<<<' markers.txt")"
+
+echo "--- Test 2b: reversed prior pins now EXECUTE ('a b' and '^x' are data) ---"
+printf 'a b\na b\nc\n' > ab.txt
+printf 'xy\nzx\n' > xx.txt
+assert_eq "'a b' now allowed" "yes" "$(allow_yn "grep -c 'a b' ab.txt")"
+assert_eq "observe 'a b' = 2" "2" "$(rsg_observe "grep -c 'a b' ab.txt")"
+assert_eq "'^x' now allowed" "yes" "$(allow_yn "grep -c '^x' xx.txt")"
+assert_eq "observe '^x' = 1" "1" "$(rsg_observe "grep -c '^x' xx.txt")"
+
+echo "--- Test 3: quoted-regex-characters-execute (Section 2A R3, R8) ---"
+for pat in 'alpha|beta' '[0-9]' 'end$' '(paren)' 'x  y'; do
+  assert_eq "quoted regex allowed: $pat" "yes" "$(allow_yn "grep -c '$pat' regexy.txt")"
+  assert_eq "quoted regex count matches direct: $pat" "$(grep -c "$pat" regexy.txt)" "$(rsg_observe "grep -c '$pat' regexy.txt")"
+done
+assert_eq "quoted backslash-dot literal allowed" "yes" "$(allow_yn "grep -c 'a\.b' dotf.txt")"
+assert_eq "quoted 'a\.b' matches direct (literal dot)" "$(grep -c 'a\.b' dotf.txt)" "$(rsg_observe "grep -c 'a\.b' dotf.txt")"
+assert_eq "quoted pipe is data, not a segment split" "yes" "$(allow_yn "grep -E 'a|b' regexy.txt | wc -l")"
+
+echo "--- Test 4: double-quoted-and-unquoted-metachar-still-dropped (R2, R6, R7) ---"
+for c in 'grep -c "needle" f' 'grep -c needle f > out' 'grep -c needle f; rm x' 'grep -c needle f && ls' 'cat $(ls)' 'grep -c need\le f' 'grep -c $FOO f' 'grep -c ${x} f'; do
+  assert_eq "unquoted/dquoted metachar dropped: $c" "no" "$(allow_yn "$c")"
+done
+assert_eq "no side-effect file 'out' created by Test 4" "0" "$([ -e out ] && echo 1 || echo 0)"
+
+echo "--- Test 6: git-readonly-executes (Section 2A R10) ---"
+GITFIX="$(mktemp -d)"
+(
+  cd "$GITFIX"
+  git init -q
+  git config user.email t@example.com
+  git config user.name tester
+  printf 'line one\nline two\n' > f
+  git add f && git commit -qm c1
+  printf 'line one\nline two\nline three\n' > f
+  git add f && git commit -qm c2
+)
+GS1="$(cd "$GITFIX" && git rev-parse HEAD~1)"
+GS2="$(cd "$GITFIX" && git rev-parse HEAD)"
+cd "$GITFIX"
+assert_eq "git diff --name-only allowed" "yes" "$(allow_yn "git diff --name-only $GS1 $GS2 -- f | wc -l")"
+assert_eq "git diff --name-only count matches direct" "$(git diff --name-only $GS1 $GS2 -- f | wc -l)" "$(rsg_observe "git diff --name-only $GS1 $GS2 -- f | wc -l")"
+assert_eq "git log --oneline -n 1 allowed" "yes" "$(allow_yn "git log --oneline -n 1 | wc -l")"
+assert_eq "git log --oneline -n 1 count 1" "1" "$(rsg_observe "git log --oneline -n 1 | wc -l")"
+assert_eq "git show SHA:f | grep allowed" "yes" "$(allow_yn "git show $GS2:f | grep -c line")"
+assert_eq "git show SHA:f grep count matches" "$(git show $GS2:f | grep -c line)" "$(rsg_observe "git show $GS2:f | grep -c line")"
+assert_eq "git diff SHA HEAD -- f | grep quoted allowed" "yes" "$(allow_yn "git diff $GS1 HEAD -- f | grep -c 'a b'")"
+
+echo "--- Test 7: git-mutating-forms-dropped (Section 2A R10) ---"
+for c in "git diff --output=out $GS1 $GS2" "git diff --out=out $GS1 $GS2" "git diff --ext-d $GS1" "git diff --textc $GS1" "git -c core.pager=x diff" "git push origin x" "git checkout HEAD~1" "git config user.name x" "git diff --ext-diff $GS1" "git diff -O x $GS1" "git diff -Ox $GS1" "git log --exec-path" "git commit -m x"; do
+  assert_eq "git mutating dropped: $c" "no" "$(allow_yn "$c")"
+done
+assert_eq "git mutating created no 'out' file" "0" "$([ -e out ] && echo 1 || echo 0)"
+assert_eq "git HEAD unchanged after mutating attempts" "$GS2" "$(git rev-parse HEAD)"
+
+echo "--- Test 8: git-textconv-and-external-diff-never-run ---"
+printf 'f diff=evil\n' > .gitattributes
+git config diff.evil.textconv "$GITFIX/evil.sh"
+git config diff.external "$GITFIX/evil.sh"
+printf '#!/bin/sh\ntouch %s/pwned-rsg\ncat "$1" 2>/dev/null || true\n' "$GITFIX" > evil.sh
+chmod +x evil.sh
+rsg_observe "git diff $GS1 $GS2 -- f | wc -l" >/dev/null
+rsg_observe "git show $GS2 -- f | wc -l" >/dev/null
+assert_eq "textconv/external-diff script never ran (no pwned-rsg)" "0" "$([ -e pwned-rsg ] && echo 1 || echo 0)"
+
+echo "--- Test 16: decode-bypass -- validated string equals executed argv (R6,R7,R10,R11) ---"
+: > -- 2>/dev/null || true
+printf 'x\n' > '--output=glob'
+BYPASS=(
+  "git diff --out\\put=out $GS1 $GS2"
+  "git diff --ext-dif\\f $GS1 $GS2"
+  "git diff --ou\"\"tput=out $GS1 $GS2"
+  "git diff --out\${x}put=out"
+  "git diff \$'--output=out' $GS1"
+  "find . -exe\\c rm '{}' +"
+  "find . -ex\"\"ec rm"
+  "find . '-exec' rm"
+  "git diff --output* $GS1"
+  "git diff -Oout $GS1"
+)
+for c in "${BYPASS[@]}"; do
+  assert_eq "decode-bypass dropped: $c" "no" "$(allow_yn "$c")"
+done
+assert_eq "bypass created no 'out' file" "0" "$([ -e out ] && echo 1 || echo 0)"
+assert_eq "bypass created no 'marker-exec' file" "0" "$([ -e marker-exec ] && echo 1 || echo 0)"
+assert_eq "glob-named worktree file unchanged" "x" "$(cat -- '--output=glob')"
+assert_eq "16k positive: quoted backslash-dot executes" "$(grep -c 'a\.b' "$WT2/dotf.txt")" "$(rsg_observe "grep -c 'a\.b' $WT2/dotf.txt")"
+assert_eq "16l positive: git diff --stat | wc -l executes" "$(git diff --stat $GS1 $GS2 -- f | wc -l)" "$(rsg_observe "git diff --stat $GS1 $GS2 -- f | wc -l")"
+
+echo "--- Test 9: prose-prefix-line-skipped, lowercase-command-kept ---"
+cd "$WT2"
+mkdir -p shopops-api
+printf 'scanToListRouter\nscanToListRouter\nscanToListRouter\nscanToListRouter\n' > shopops-api/index.js
+SPEC9="Stop 1 (grep assertion, guard):
+  Baselines below were MEASURED by the author at 395f224 on 2026-09-29 (git show 395f224:<file> | grep -c ...). Addition assertions fail on the untouched tree.
+  grep -c 'scanToListRouter' shopops-api/index.js
+  Expected: 4
+Stop 2 (grep assertion, lowercase non-runner):
+  awk '{print}' anchored.txt
+  Expected: 0"
+EX9="$(printf '%s\n' "$SPEC9" | rsg_extract)"
+assert_contains "prose prefix stripped: clean grep command extracted" "grep -c 'scanToListRouter' shopops-api/index.js${TAB}eq${TAB}4" "$EX9"
+assert_contains "lowercase awk line kept as a declared command" "awk '{print}' anchored.txt" "$EX9"
+RUN9="$(printf '%s\n' "$SPEC9" | rsg_extract | rsg_run)"
+assert_contains "prose-prefixed grep executes with observed 4" "OK: grep -c 'scanToListRouter' shopops-api/index.js => 4 (expected eq 4)" "$RUN9"
+assert_contains "awk line dropped visibly (not silently skipped)" "DROPPED (not on read-only allowlist; not executed): awk '{print}' anchored.txt" "$RUN9"
+
+echo "--- Test 13: replay-live-runs ea46da63 and 8ab3032a ---"
+R13="$(mktemp -d)"
+mkdir -p "$R13/shopops-api/routes" "$R13/shopops-api/migrations" "$R13/shopops-api/tests"
+printf 'INSERT INTO stripe_webhook_events (a) VALUES (1);\nINSERT INTO stripe_webhook_events (b) VALUES (2);\nON CONFLICT (tenant_id, stripe_payment_id) DO NOTHING;\nON CONFLICT (tenant_id, stripe_payment_id) DO UPDATE;\n' > "$R13/shopops-api/routes/webhooks.js"
+printf 'CREATE TABLE IF NOT EXISTS stripe_webhook_events (id int);\n' > "$R13/shopops-api/migrations/20260928_stripe_webhook_events_ledger.sql"
+printf 'test_stripe_webhook_ack_after_commit\n' > "$R13/shopops-api/tests/run_all.js"
+printf 'SET LOCAL app.tenant_id;\nother\n' > "$R13/shopops-api/migrations/20260706c_orderlines_exempt_inventory_ratio.sql"
+printf 'SET LOCAL app.tenant_id;\nother\n' > "$R13/shopops-api/migrations/20260619_clear_unresolved_cover_sources.sql"
+printf 'no conflict markers here\n' > "$R13/shopops-api/tests/test_ci_staging_migrations.js"
+SPEC_EA="Stop 1 (grep assertion):
+  grep -c 'INSERT INTO stripe_webhook_events' shopops-api/routes/webhooks.js
+  Expected: 2
+Stop 2 (grep assertion):
+  grep -c 'paid_at) VALUES' shopops-api/routes/webhooks.js
+  Expected: 0
+Stop 3 (grep assertion):
+  grep -c 'ON CONFLICT (tenant_id, stripe_payment_id)' shopops-api/routes/webhooks.js
+  Expected: 2
+Stop 4 (grep assertion):
+  grep -c 'CREATE TABLE IF NOT EXISTS stripe_webhook_events' shopops-api/migrations/20260928_stripe_webhook_events_ledger.sql
+  Expected: 1
+Stop 5 (grep assertion):
+  grep -c 'test_stripe_webhook_ack_after_commit' shopops-api/tests/run_all.js
+  Expected: 1"
+OUT_EA="$(cd "$R13" && printf '%s\n' "$SPEC_EA" | rsg_extract | rsg_run)"
+assert_contains "ea46da63 replay: DECLARED 5" "GREP_DECLARED=5" "$OUT_EA"
+assert_contains "ea46da63 replay: EXECUTED 5" "GREP_EXECUTED=5" "$OUT_EA"
+assert_contains "ea46da63 replay: DROPPED 0" "GREP_DROPPED=0" "$OUT_EA"
+assert_contains "ea46da63 replay: STATUS passed" "GREP_STATUS=passed" "$OUT_EA"
+SPEC_8AB="Stop 1 (grep assertion):
+  grep -c 'SET LOCAL app.tenant_id' shopops-api/migrations/20260706c_orderlines_exempt_inventory_ratio.sql
+  Expected: 1
+Stop 2 (grep assertion):
+  grep -c 'SET LOCAL app.tenant_id' shopops-api/migrations/20260619_clear_unresolved_cover_sources.sql
+  Expected: 1
+Stop 3 (grep assertion):
+  grep -c '^<<<<<<<' shopops-api/tests/test_ci_staging_migrations.js
+  Expected: 0"
+OUT_8AB="$(cd "$R13" && printf '%s\n' "$SPEC_8AB" | rsg_extract | rsg_run)"
+assert_contains "8ab3032a replay: DECLARED 3" "GREP_DECLARED=3" "$OUT_8AB"
+assert_contains "8ab3032a replay: EXECUTED 3" "GREP_EXECUTED=3" "$OUT_8AB"
+assert_contains "8ab3032a replay: DROPPED 0" "GREP_DROPPED=0" "$OUT_8AB"
+assert_contains "8ab3032a replay: STATUS passed" "GREP_STATUS=passed" "$OUT_8AB"
+
+cd "$HERE"
+rm -rf "$WT2" "$GITFIX" "$R13"
 
 echo
 echo "run-stop-greps.sh: $PASS passed, $FAIL failed"

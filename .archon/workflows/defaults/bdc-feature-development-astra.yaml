@@ -1753,6 +1753,10 @@ nodes:
       #   "or more", "or greater"), le ("at most", "<="). "no output" / "nothing" /
       #   "none" / "empty" mean eq 0. A declared assertion without a parseable
       #   expectation is counted in GREP_DECLARED but not executed.
+      #   While the command is still empty, a line that starts with an uppercase letter
+      #   followed by a lowercase letter is a prose sentence (e.g. a "Baselines ..."
+      #   note) and is skipped; a lowercase non-runner line (awk, ...) is NOT skipped --
+      #   it stays part of the command and is dropped visibly by the allowlist.
       rsg_extract() {
         awk '
           function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
@@ -1781,6 +1785,7 @@ nodes:
             }
             if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { note_unparsed(cmd != "" ? cmd : label); state = 0; cmd = "" }
             else {
+              if (cmd == "" && line ~ /^[A-Z][a-z]/) next
               cmd = (cmd == "" ? line : cmd " " line)
               sub(/[ \t]*\\$/, "", cmd)
               next
@@ -1809,46 +1814,99 @@ nodes:
           }
         '
       }
-      # rsg_strip_arg <token>   (prints inner text when the token is one
-      #   single-quoted argv-charset string; otherwise prints the token
-      #   unchanged. Qualifying: begins and ends with ', length >= 3, no
-      #   embedded ', inner matches ^[A-Za-z0-9@%+=:,./_*?-]+$. Callers strip
-      #   before flag checks and before exec so both see the same argv.)
-      rsg_strip_arg() {
+      # rsg_split_pipe <command>   (populates RSG_SEGMENTS with the |-separated segments
+      #   split OUTSIDE single-quoted spans; a pipe inside a '...' span is literal data.
+      #   rc 1 on an unbalanced single quote. An empty segment -- a leading, trailing or
+      #   doubled pipe ('||') -- is preserved as "" so the caller rejects it.)
+      rsg_split_pipe() {
+        local c="$1" i ch inq=0 cur="" n
+        RSG_SEGMENTS=()
+        n=${#c}
+        for ((i=0; i<n; i++)); do
+          ch="${c:i:1}"
+          if [ "$inq" -eq 1 ]; then
+            cur+="$ch"
+            [ "$ch" = "'" ] && inq=0
+            continue
+          fi
+          case "$ch" in
+            "'") inq=1; cur+="$ch" ;;
+            '|') RSG_SEGMENTS+=("$cur"); cur="" ;;
+            *) cur+="$ch" ;;
+          esac
+        done
+        RSG_SEGMENTS+=("$cur")
+        [ "$inq" -eq 0 ] || return 1
+        return 0
+      }
+      # rsg_tokenize <segment>   (populates RSG_TOKENS by splitting on whitespace OUTSIDE
+      #   single-quoted spans; whitespace inside a '...' span is literal data. A quote
+      #   opens/closes a span whose bytes -- quotes included -- stay attached to the
+      #   current token. rc 1 on an unbalanced single quote.)
+      rsg_tokenize() {
+        local s="$1" i ch inq=0 cur="" started=0 n
+        RSG_TOKENS=()
+        n=${#s}
+        for ((i=0; i<n; i++)); do
+          ch="${s:i:1}"
+          if [ "$inq" -eq 1 ]; then
+            cur+="$ch"; started=1
+            [ "$ch" = "'" ] && inq=0
+            continue
+          fi
+          case "$ch" in
+            "'") inq=1; cur+="$ch"; started=1 ;;
+            ' '|$'\t') if [ "$started" -eq 1 ]; then RSG_TOKENS+=("$cur"); cur=""; started=0; fi ;;
+            *) cur+="$ch"; started=1 ;;
+          esac
+        done
+        [ "$started" -eq 1 ] && RSG_TOKENS+=("$cur")
+        [ "$inq" -eq 0 ] || return 1
+        return 0
+      }
+      # rsg_quoted_inner_ok <inner>   (rc 0 when the inner text of a single-quoted span
+      #   is valid pattern DATA: non-empty printable ASCII 0x20-0x7E, and free of the
+      #   sequences that would collide with shell substitution or the manifest
+      #   delimiters -- a semicolon, a backtick, "$(" or "=>". A lone "$" not followed
+      #   by "(" is data. A single quote can never appear inside one span.)
+      rsg_quoted_inner_ok() {
+        local inner="$1"
+        [ -n "$inner" ] || return 1
+        LC_ALL=C printf '%s' "$inner" | LC_ALL=C grep -qE '[^ -~]' && return 1
+        case "$inner" in
+          *';'*|*'`'*|*'$('*|*'=>'*) return 1 ;;
+        esac
+        return 0
+      }
+      # rsg_token_argv <token>   (prints the token's argv VALUE and returns 0 when the
+      #   token is admissible: a standalone test-builtin bracket ('[' or ']'); a single
+      #   single-quoted span covering the whole token whose inner text is valid data
+      #   (prints the inner text); or a bare word of the argv charset
+      #   A-Za-z0-9 @ % + = : , . / _ * ? ~ ^ - (prints the word). rc 1 for anything
+      #   else: a double-quoted word, an unbalanced/empty/embedded span, a backslash or
+      #   any other metacharacter OUTSIDE a span.)
+      rsg_token_argv() {
         local t="$1" inner
         case "$t" in
-          "'"*"'") ;;
-          *) printf '%s' "$t"; return 0 ;;
+          '['|']') printf '%s' "$t"; return 0 ;;
         esac
-        if [ "${#t}" -lt 3 ]; then
+        case "$t" in
+          "'"*"'")
+            if [ "${#t}" -ge 2 ]; then
+              inner="${t:1:${#t}-2}"
+              case "$inner" in *"'"*) return 1 ;; esac
+              rsg_quoted_inner_ok "$inner" || return 1
+              printf '%s' "$inner"
+              return 0
+            fi
+            return 1
+            ;;
+        esac
+        if LC_ALL=C printf '%s' "$t" | LC_ALL=C grep -qE '^[A-Za-z0-9@%+=:,./_*?~^-]+$'; then
           printf '%s' "$t"
           return 0
         fi
-        inner="${t:1:${#t}-2}"
-        case "$inner" in
-          *"'"*) printf '%s' "$t"; return 0 ;;
-        esac
-        if printf '%s' "$inner" | grep -qE '^[A-Za-z0-9@%+=:,./_*?-]+$'; then
-          printf '%s' "$inner"
-        else
-          printf '%s' "$t"
-        fi
-      }
-      # rsg_tokens_safe <tokens...>   (rc 0 when every token is in the argv charset.
-      #   [ and ] are allowed so the test builtin can run. A single-quoted token
-      #   whose inner text matches the charset is accepted. * and ? are literal --
-      #   callers must set -f before splitting. Same shape as rst_tokens_safe.)
-      rsg_tokens_safe() {
-        local t stripped
-        for t in "$@"; do
-          case "$t" in '['|']') continue ;; esac
-          stripped="$(rsg_strip_arg "$t")"
-          if [ "$stripped" != "$t" ]; then
-            continue
-          fi
-          printf '%s' "$t" | grep -qE '^[A-Za-z0-9@%+=:,./_*?-]+$' || return 1
-        done
-        return 0
+        return 1
       }
       rsg_has_grep_flag() {
         local t
@@ -1877,31 +1935,69 @@ nodes:
         done
         return 1
       }
-      # rsg_argv_looks_readonly <segment>   (rc 0 when the segment tokenizes --
-      #   whitespace split, noglob -- to an allowlisted read-only runner with no
-      #   write/exec options. Leading LC_ALL=* / LANG=* tokens are skipped.
-      #   Qualifying single-quoted tokens are stripped before the charset check
-      #   and the flag checks, matching the argv rsg_exec_pipeline runs.)
+      # rsg_git_readonly <argv-after-git>   (rc 0 only for a read-only history query:
+      #   the first argument is exactly diff, log or show; after a standalone "--" token
+      #   every token is path data; otherwise every hyphen-leading token must be EXACTLY
+      #   one of a closed flag allowlist (option abbreviations, joined short options and
+      #   unknown flags all fail closed); a non-hyphen token is a revision/path. The
+      #   flag check runs on the STRIPPED argv the executor also runs.)
+      rsg_git_readonly() {
+        local sub="${1:-}" tok seen_ddash=0
+        case "$sub" in
+          diff|log|show) ;;
+          *) return 1 ;;
+        esac
+        shift
+        for tok in "$@"; do
+          if [ "$seen_ddash" -eq 1 ]; then continue; fi
+          if [ "$tok" = "--" ]; then seen_ddash=1; continue; fi
+          case "$tok" in
+            -*)
+              case "$tok" in
+                --stat|--numstat|--shortstat|--name-only|--name-status|--oneline|--no-merges|--cached|--staged|--summary) ;;
+                --unified=[0-9]*) ;;
+                -n|-n[0-9]*) ;;
+                -U[0-9]*) ;;
+                *) return 1 ;;
+              esac
+              ;;
+            *) : ;;
+          esac
+        done
+        return 0
+      }
+      # rsg_tokens_safe <tokens...>   (rc 0 when every token is admissible; populates
+      #   global RSG_ARGV with each token's stripped argv value in order. A standalone
+      #   '[' or ']' is allowed so the test builtin can run.)
+      rsg_tokens_safe() {
+        local t val
+        RSG_ARGV=()
+        for t in "$@"; do
+          val="$(rsg_token_argv "$t")" || return 1
+          RSG_ARGV+=("$val")
+        done
+        return 0
+      }
+      # rsg_argv_looks_readonly <segment>   (rc 0 when the segment tokenizes -- quote
+      #   aware -- to an allowlisted read-only runner with no write/exec options and,
+      #   for git, a read-only diff|log|show query. Leading LC_ALL=* / LANG=* tokens are
+      #   skipped. The flag checks run on the stripped argv rsg_exec_pipeline runs, so a
+      #   quoted token can never hide a flag.)
       rsg_argv_looks_readonly() {
-        local runner segment="$1" tok
-        local -a stripped=()
-        set -f
-        set -- $segment
-        set +f
-        while [ $# -ge 1 ]; do
-          case "$1" in
-            LC_ALL=*|LANG=*) shift ;;
+        local segment="$1" runner start=0
+        rsg_tokenize "$segment" || return 1
+        [ "${#RSG_TOKENS[@]}" -ge 1 ] || return 1
+        while [ "$start" -lt "${#RSG_TOKENS[@]}" ]; do
+          case "${RSG_TOKENS[$start]}" in
+            LC_ALL=*|LANG=*) start=$((start + 1)) ;;
             *) break ;;
           esac
         done
-        [ $# -ge 1 ] || return 1
-        for tok in "$@"; do
-          stripped+=("$(rsg_strip_arg "$tok")")
-        done
-        set -- "${stripped[@]}"
+        [ "$start" -lt "${#RSG_TOKENS[@]}" ] || return 1
+        rsg_tokens_safe "${RSG_TOKENS[@]:start}" || return 1
+        set -- "${RSG_ARGV[@]}"
         runner="$1"
         shift
-        rsg_tokens_safe "$runner" "$@" || return 1
         case "$runner" in
           grep|egrep|fgrep|rg)
             rsg_has_grep_flag "$@" && return 1
@@ -1918,78 +2014,74 @@ nodes:
           wc|head|tail|cut|tr|uniq|cat|ls|test|'[')
             return 0
             ;;
+          git)
+            rsg_git_readonly "$@"
+            return $?
+            ;;
         esac
         return 1
       }
-      # rsg_allow_cmd <command>   (fail-closed read-only allowlist: reject shell
-      #   operators except |, split on | only, whitespace-tokenize each segment,
-      #   reject write/exec options as whole tokens. awk/sed/xargs and anything
-      #   not listed are rejected. A single quote is not rejected here;
-      #   only a fully quoted charset token is accepted later. Double quote,
-      #   backslash, and every other metacharacter stay rejected.)
+      # rsg_allow_cmd <command>   (fail-closed read-only allowlist: split on | OUTSIDE
+      #   single quotes, then require every segment to be a read-only argv. An empty
+      #   segment -- leading/trailing/doubled pipe -- is rejected. A metacharacter is
+      #   admissible ONLY inside a single-quoted span (checked in rsg_token_argv); every
+      #   bare token must be the argv charset. awk/sed/xargs and anything not on the
+      #   runner allowlist are rejected.)
       rsg_allow_cmd() {
-        local c="$1" work segment
-        case "$c" in
-          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*|*'"'*|*'\\'*|*'||'*) return 1 ;;
-        esac
-        work="$c"
-        while :; do
-          case "$work" in
-            *'|'*) segment="${work%%|*}"; work="${work#*|}" ;;
-            *) segment="$work"; work='' ;;
-          esac
-          rsg_argv_looks_readonly "$segment" || return 1
-          [ -z "$work" ] && break
+        local c="$1" seg
+        rsg_split_pipe "$c" || return 1
+        for seg in "${RSG_SEGMENTS[@]}"; do
+          rsg_argv_looks_readonly "$seg" || return 1
         done
         return 0
       }
-      # rsg_exec_pipeline <command>   (prints stdout of the last | segment; rc of
-      #   the last segment. Intermediate segments are connected with temp files,
-      #   not a shell pipe. Tokenized argv; never a shell -c of the spec string.
-      #   Qualifying single-quoted tokens are stripped the same way as
-      #   rsg_argv_looks_readonly before the runner is invoked.
-      #   Intermediate nonzero exits do not abort -- matches bash -c without
-      #   pipefail, so grep-no-match | wc -l still yields a count.)
+      # rsg_exec_pipeline <command>   (prints stdout of the last | segment; rc of the
+      #   last segment. Intermediate segments are connected with temp files, not a shell
+      #   pipe. Tokenized argv -- the SAME tokens rsg_allow_cmd validated -- executed
+      #   directly; never a shell -c of the spec string, so a backslash inside a quoted
+      #   span is literal data no shell ever decodes. A git query runs as
+      #   git -c core.fsmonitor=false -c core.pager=cat --no-pager SUB --no-ext-diff
+      #   --no-textconv REST so a repository textconv/external-diff/fsmonitor config can
+      #   never execute a program. Intermediate nonzero exits do not abort.)
       rsg_exec_pipeline() {
-        local cmd="$1" work segment tmpdir_p="" tmp_in="/dev/null" tmp_out raw="" rc=0
-        local env_lc env_lang tok
-        local -a stripped=()
+        local cmd="$1" tmpdir_p="" tmp_in="/dev/null" tmp_out raw="" rc=0
+        local seg i j nseg start env_lc env_lang val sub
+        local -a raw_toks argv rest
         if ! rsg_allow_cmd "$cmd"; then
           return 127
         fi
-        work="$cmd"
-        while :; do
-          case "$work" in
-            *'|'*) segment="${work%%|*}"; work="${work#*|}" ;;
-            *) segment="$work"; work='' ;;
-          esac
-          set -f
-          set -- $segment
-          set +f
-          env_lc=""; env_lang=""
-          while [ $# -ge 1 ]; do
-            case "$1" in
-              LC_ALL=*) env_lc="${1#LC_ALL=}"; shift ;;
-              LANG=*) env_lang="${1#LANG=}"; shift ;;
+        rsg_split_pipe "$cmd" || return 127
+        nseg="${#RSG_SEGMENTS[@]}"
+        for ((i=0; i<nseg; i++)); do
+          seg="${RSG_SEGMENTS[$i]}"
+          rsg_tokenize "$seg" || { rc=127; break; }
+          raw_toks=("${RSG_TOKENS[@]}")
+          env_lc=""; env_lang=""; start=0
+          while [ "$start" -lt "${#raw_toks[@]}" ]; do
+            case "${raw_toks[$start]}" in
+              LC_ALL=*) env_lc="${raw_toks[$start]#LC_ALL=}"; start=$((start + 1)) ;;
+              LANG=*) env_lang="${raw_toks[$start]#LANG=}"; start=$((start + 1)) ;;
               *) break ;;
             esac
           done
-          if [ $# -eq 0 ]; then
-            rc=127
-            break
-          fi
-          stripped=()
-          for tok in "$@"; do
-            stripped+=("$(rsg_strip_arg "$tok")")
+          argv=()
+          for ((j=start; j<${#raw_toks[@]}; j++)); do
+            val="$(rsg_token_argv "${raw_toks[$j]}")" || { rc=127; break; }
+            argv+=("$val")
           done
-          set -- "${stripped[@]}"
-          if [ -n "$work" ]; then
+          [ "${#argv[@]}" -ge 1 ] || { rc=127; break; }
+          if [ "${argv[0]}" = "git" ]; then
+            sub="${argv[1]:-}"
+            rest=("${argv[@]:2}")
+            argv=(git -c core.fsmonitor=false -c core.pager=cat --no-pager "$sub" --no-ext-diff --no-textconv "${rest[@]}")
+          fi
+          if [ "$i" -lt "$((nseg - 1))" ]; then
             [ -n "$tmpdir_p" ] || tmpdir_p="$(mktemp -d)"
             tmp_out="$tmpdir_p/out"
             (
               [ -n "$env_lc" ] && export LC_ALL="$env_lc"
               [ -n "$env_lang" ] && export LANG="$env_lang"
-              "$@" < "$tmp_in" > "$tmp_out" 2>/dev/null
+              "${argv[@]}" < "$tmp_in" > "$tmp_out" 2>/dev/null
             )
             rc=$?
             tmp_in="$tmpdir_p/in"
@@ -1998,11 +2090,10 @@ nodes:
             raw="$(
               [ -n "$env_lc" ] && export LC_ALL="$env_lc"
               [ -n "$env_lang" ] && export LANG="$env_lang"
-              "$@" < "$tmp_in" 2>/dev/null
+              "${argv[@]}" < "$tmp_in" 2>/dev/null
             )"
             rc=$?
           fi
-          [ -z "$work" ] && break
         done
         [ -n "$tmpdir_p" ] && rm -rf "$tmpdir_p"
         printf '%s' "$raw"
@@ -3967,7 +4058,7 @@ nodes:
         [ -n "$grep_line" ] || grep_line="MISSING (run-stop-greps produced no output)"
         [ -n "$grep_status" ] || grep_status="missing"
         verdict="keep"
-        if [ "$tests_status" = "failed" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "missing" ] || [ "$grep_status" = "all_dropped" ]; then
+        if [ "$tests_status" = "failed" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "missing" ] || [ "$grep_status" = "all_dropped" ] || { [ "$grep_status" = "incomplete" ] && [ "${grep_dropped:-0}" -gt 0 ] 2>/dev/null; }; then
           verdict="fail"
         fi
         if [ "$grep_status" = "incomplete" ]; then
@@ -4027,6 +4118,22 @@ nodes:
       mec_field() {
         printf '%s\n' "$2" | grep -E "^${1}=" | head -1 | sed "s/^${1}=//" || true
       }
+      # mec_emit_rejected <grep_detail>   (emits one "STOP_GREP_REJECTED: <command>"
+      #   line on stderr per DROPPED assertion, naming the rejected stop grep verbatim
+      #   so the failing manifest-evidence gate points at the exact command the
+      #   read-only allowlist refused. Parses the "DROPPED (...): <command> => expected
+      #   <op> <n>" lines run-stop-greps already emits.)
+      mec_emit_rejected() {
+        printf '%s\n' "$1" | while IFS= read -r dl; do
+          case "$dl" in
+            DROPPED*)
+              dl="${dl#*): }"
+              dl="${dl% => expected *}"
+              [ -n "$dl" ] && echo "STOP_GREP_REJECTED: $dl" >&2
+              ;;
+          esac
+        done
+      }
       # mec_check <status> <class> <tests_status> <grep_declared> <grep_status> <tests_exit> <grep_executed> <grep_dropped> <grep_unparsed> <grep_mismatch> <grep_detail>
       #   (stamped manifest on stdin -> "OK" rc 0, or "EVIDENCE_ERROR: ..." rc 1)
       #   Only a PROCEED run (real build, real PR) is gated. CODE/MIXED: the Tests: line
@@ -4067,6 +4174,11 @@ nodes:
                 echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) reported incomplete with grep_executed=${grep_executed:-0} and grep_mismatch=${grep_mismatch:-0}. Incomplete evidence is admissible only after at least one grep executes with no mismatch (bdc-xo #1940)." >&2
                 return 1
               fi
+              if [ "${grep_dropped:-0}" -gt 0 ] 2>/dev/null; then
+                echo "HARNESS_REFUSED: ${grep_declared} grep stop condition(s) were declared but ${grep_dropped} were rejected by the read-only allowlist and NOT executed (grep_executed=${grep_executed:-0}, grep_dropped=${grep_dropped}, grep_mismatch=${grep_mismatch:-0}). A declared stop grep the harness cannot execute may not pass the run green; fix the command or the allowlist. Conditions: ${grep_line}${grep_detail:+; $grep_detail}" >&2
+                mec_emit_rejected "$grep_detail"
+                return 1
+              fi
               ;;
             mismatch)
               echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) were declared but grep_status=mismatch (grep_mismatch=${grep_mismatch:-0}). Every executed grep stop condition must return its declared count before manifest evidence can be published (bdc-xo #1940)." >&2
@@ -4078,6 +4190,7 @@ nodes:
               else
                 echo "HARNESS_REFUSED: ${grep_declared} grep stop condition(s) were declared but none executed (grep_executed=${grep_executed:-0}, grep_dropped=${grep_dropped:-0}, grep_unparsed=${grep_unparsed:-0}). Conditions: ${grep_line}${grep_detail:+; $grep_detail}" >&2
               fi
+              mec_emit_rejected "$grep_detail"
               return 1
               ;;
             *)
@@ -4139,37 +4252,245 @@ nodes:
       }
 
       # ---- BEGIN vma core (byte-identical across lanes; extracted by unit test) ----
-      # allow_cmd <command>
-      #   Fail-closed allowlist gate for the assertion command executed via the
-      #   bash -c below. build-manifest COMPOSES these commands, so they are
-      #   AI-authored, UNTRUSTED input executed inside the run worktree (WO
-      #   Section 7 item 2 -- accepted, now guarded). A command is allowed ONLY
-      #   when every pipe ('|') segment starts with a read-only inspection tool
-      #   (grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test). Any shell
-      #   chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>'
-      #   '<' newline) or a mutating find primary (-delete/-exec/-ok/-fprint*/
-      #   -fls) drops the assertion UNEXECUTED. This is also the fail-closed
-      #   backstop for a command that legitimately contained a ';': it is
-      #   fragmented by the ';'-split below and each fragment fails this gate
-      #   rather than executing.
-      allow_cmd() {
-        local c="$1" seg first
-        case "$c" in
-          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*) return 1 ;;
-          *' -delete'*|*' -exec'*|*' -ok'*|*' -fprint'*|*' -fls'*) return 1 ;;
+      # vma_split_pipe <command>   (populates VMA_SEGMENTS with the |-separated segments
+      #   split OUTSIDE single-quoted spans; a pipe inside a '...' span is literal data.
+      #   rc 1 on an unbalanced single quote. Empty segments -- leading/trailing/doubled
+      #   pipe -- are preserved as "" so allow_cmd rejects them.)
+      vma_split_pipe() {
+        local c="$1" i ch inq=0 cur="" n
+        VMA_SEGMENTS=()
+        n=${#c}
+        for ((i=0; i<n; i++)); do
+          ch="${c:i:1}"
+          if [ "$inq" -eq 1 ]; then
+            cur+="$ch"
+            [ "$ch" = "'" ] && inq=0
+            continue
+          fi
+          case "$ch" in
+            "'") inq=1; cur+="$ch" ;;
+            '|') VMA_SEGMENTS+=("$cur"); cur="" ;;
+            *) cur+="$ch" ;;
+          esac
+        done
+        VMA_SEGMENTS+=("$cur")
+        [ "$inq" -eq 0 ] || return 1
+        return 0
+      }
+      # vma_tokenize <segment>   (populates VMA_TOKENS by splitting on whitespace OUTSIDE
+      #   single-quoted spans; whitespace inside a '...' span is literal data. rc 1 on an
+      #   unbalanced single quote.)
+      vma_tokenize() {
+        local s="$1" i ch inq=0 cur="" started=0 n
+        VMA_TOKENS=()
+        n=${#s}
+        for ((i=0; i<n; i++)); do
+          ch="${s:i:1}"
+          if [ "$inq" -eq 1 ]; then
+            cur+="$ch"; started=1
+            [ "$ch" = "'" ] && inq=0
+            continue
+          fi
+          case "$ch" in
+            "'") inq=1; cur+="$ch"; started=1 ;;
+            ' '|$'\t') if [ "$started" -eq 1 ]; then VMA_TOKENS+=("$cur"); cur=""; started=0; fi ;;
+            *) cur+="$ch"; started=1 ;;
+          esac
+        done
+        [ "$started" -eq 1 ] && VMA_TOKENS+=("$cur")
+        [ "$inq" -eq 0 ] || return 1
+        return 0
+      }
+      # vma_quoted_inner_ok <inner>   (rc 0 when the inner text of a single-quoted span
+      #   is valid DATA: non-empty printable ASCII 0x20-0x7E, free of ';' '`' '$(' '=>'.)
+      vma_quoted_inner_ok() {
+        local inner="$1"
+        [ -n "$inner" ] || return 1
+        LC_ALL=C printf '%s' "$inner" | LC_ALL=C grep -qE '[^ -~]' && return 1
+        case "$inner" in
+          *';'*|*'`'*|*'$('*|*'=>'*) return 1 ;;
         esac
-        local IFS='|'
-        local -a segs
-        read -ra segs <<<"$c"
-        for seg in "${segs[@]}"; do
-          seg="$(printf '%s' "$seg" | sed 's/^[[:space:]]*//')"
-          first="${seg%%[[:space:]]*}"
-          case "$first" in
-            grep|egrep|fgrep|rg|wc|find|cat|head|tail|sort|uniq|test) ;;
-            *) return 1 ;;
+        return 0
+      }
+      # vma_token_argv <token>   (prints the token's argv VALUE, rc 0, when admissible:
+      #   a standalone '[' or ']'; one whole-token single-quoted span with valid inner
+      #   data (prints inner); or a bare argv-charset word. rc 1 otherwise -- a double
+      #   quote, backslash, bare '$', or any other metacharacter OUTSIDE a span, an
+      #   unbalanced/empty/embedded span. The SAME value vma_rebuild_cmd single-quotes,
+      #   so the validated text is the executed argv.)
+      vma_token_argv() {
+        local t="$1" inner
+        case "$t" in
+          '['|']') printf '%s' "$t"; return 0 ;;
+        esac
+        case "$t" in
+          "'"*"'")
+            if [ "${#t}" -ge 2 ]; then
+              inner="${t:1:${#t}-2}"
+              case "$inner" in *"'"*) return 1 ;; esac
+              vma_quoted_inner_ok "$inner" || return 1
+              printf '%s' "$inner"
+              return 0
+            fi
+            return 1
+            ;;
+        esac
+        if LC_ALL=C printf '%s' "$t" | LC_ALL=C grep -qE '^[A-Za-z0-9@%+=:,./_*?~^-]+$'; then
+          printf '%s' "$t"
+          return 0
+        fi
+        return 1
+      }
+      vma_has_grep_flag() {
+        local t
+        for t in "$@"; do
+          case "$t" in
+            --pre|--preprocessor|-f|--file|--pre=*|--preprocessor=*|-f=*|--file=*|-f*) return 0 ;;
+          esac
+        done
+        return 1
+      }
+      vma_has_find_flag() {
+        local t
+        for t in "$@"; do
+          case "$t" in
+            -exec|-execdir|-ok|-okdir|-delete|-fprint|-fprint0|-fprintf|-fls|-fprint*|-fls*) return 0 ;;
+          esac
+        done
+        return 1
+      }
+      vma_has_sort_flag() {
+        local t
+        for t in "$@"; do
+          case "$t" in
+            -o|--output|-o=*|--output=*|-o*|--compress-program|--compress-program=*) return 0 ;;
+          esac
+        done
+        return 1
+      }
+      # vma_git_readonly <argv-after-git>   (rc 0 only for a read-only diff|log|show
+      #   query under the closed flag allowlist; identical rule to the rsg core. The flag
+      #   check runs on the stripped argv the executor runs.)
+      vma_git_readonly() {
+        local sub="${1:-}" tok seen_ddash=0
+        case "$sub" in
+          diff|log|show) ;;
+          *) return 1 ;;
+        esac
+        shift
+        for tok in "$@"; do
+          if [ "$seen_ddash" -eq 1 ]; then continue; fi
+          if [ "$tok" = "--" ]; then seen_ddash=1; continue; fi
+          case "$tok" in
+            -*)
+              case "$tok" in
+                --stat|--numstat|--shortstat|--name-only|--name-status|--oneline|--no-merges|--cached|--staged|--summary) ;;
+                --unified=[0-9]*) ;;
+                -n|-n[0-9]*) ;;
+                -U[0-9]*) ;;
+                *) return 1 ;;
+              esac
+              ;;
+            *) : ;;
           esac
         done
         return 0
+      }
+      # vma_seg_readonly <segment>   (rc 0 when the segment tokenizes -- quote aware --
+      #   to an allowlisted read-only runner with no write/exec options; git is limited
+      #   to a read-only diff|log|show query. Populates VMA_ARGV with the stripped argv.
+      #   No LC_ALL/LANG env prefix is accepted (a leading assignment token is not a
+      #   runner and drops the assertion, as before).)
+      vma_seg_readonly() {
+        local segment="$1" runner tok val
+        vma_tokenize "$segment" || return 1
+        [ "${#VMA_TOKENS[@]}" -ge 1 ] || return 1
+        VMA_ARGV=()
+        for tok in "${VMA_TOKENS[@]}"; do
+          val="$(vma_token_argv "$tok")" || return 1
+          VMA_ARGV+=("$val")
+        done
+        set -- "${VMA_ARGV[@]}"
+        runner="$1"
+        shift
+        case "$runner" in
+          grep|egrep|fgrep|rg)
+            vma_has_grep_flag "$@" && return 1
+            return 0
+            ;;
+          find)
+            vma_has_find_flag "$@" && return 1
+            return 0
+            ;;
+          sort)
+            vma_has_sort_flag "$@" && return 1
+            return 0
+            ;;
+          wc|head|tail|cut|tr|uniq|cat|ls|test|'[')
+            return 0
+            ;;
+          git)
+            vma_git_readonly "$@"
+            return $?
+            ;;
+        esac
+        return 1
+      }
+      # allow_cmd <command>
+      #   Fail-closed allowlist gate for the assertion command executed via vma_exec_cmd
+      #   below. build-manifest COMPOSES these commands, so they are AI-authored,
+      #   UNTRUSTED input executed inside the run worktree. A command is allowed ONLY
+      #   when it splits (OUTSIDE single-quoted spans) into non-empty pipe segments that
+      #   each tokenize to a read-only inspection tool
+      #   (grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test) or a read-only git
+      #   diff|log|show query, with no write/exec option. A metacharacter (';' '&' '`'
+      #   '$' '>' '<' '"' '\' backslash, newline) is admissible ONLY inside a
+      #   single-quoted span; every bare token must be the argv charset, so a backslash
+      #   or double quote that bash would decode after validation is rejected. A mutating
+      #   find primary (-delete/-exec/-ok/-fprint*/-fls) drops the assertion UNEXECUTED,
+      #   whether bare or single-quoted (the flag check runs on the stripped token).
+      allow_cmd() {
+        local c="$1" seg
+        vma_split_pipe "$c" || return 1
+        for seg in "${VMA_SEGMENTS[@]}"; do
+          vma_seg_readonly "$seg" || return 1
+        done
+        return 0
+      }
+      # vma_rebuild_cmd <command>   (prints the command REBUILT from its validated,
+      #   stripped tokens -- every token re-emitted inside single quotes (a token can
+      #   never contain a single quote per vma_token_argv), pipe segments joined with
+      #   ' | '. rc 1 if any token is inadmissible. The rebuilt string, run under set -f
+      #   with a read-only git shell function, decodes to exactly the validated argv:
+      #   bash performs no backslash/quote/dollar/glob decoding on single-quoted text, so
+      #   the string handed to bash -c IS the argv, closing the decode bypass.)
+      vma_rebuild_cmd() {
+        local c="$1" seg tok val segout out="" first=1
+        vma_split_pipe "$c" || return 1
+        for seg in "${VMA_SEGMENTS[@]}"; do
+          vma_tokenize "$seg" || return 1
+          [ "${#VMA_TOKENS[@]}" -ge 1 ] || return 1
+          segout=""
+          for tok in "${VMA_TOKENS[@]}"; do
+            val="$(vma_token_argv "$tok")" || return 1
+            segout="${segout:+$segout }'${val}'"
+          done
+          if [ "$first" -eq 1 ]; then out="$segout"; first=0; else out="$out | $segout"; fi
+        done
+        printf '%s' "$out"
+      }
+      # vma_exec_cmd <command>   (executes an allow_cmd-validated command and prints its
+      #   stdout; rc of the pipeline. The command is REBUILT from validated tokens and
+      #   run via bash -c under set -f, with git wrapped so a query always runs as
+      #   git -c core.fsmonitor=false -c core.pager=cat --no-pager SUB --no-ext-diff
+      #   --no-textconv REST -- a repository textconv/external-diff/fsmonitor config can
+      #   never execute a program. The ORIGINAL untokenized string is never passed to
+      #   bash -c.)
+      vma_exec_cmd() {
+        local cmd="$1" rebuilt prelude
+        rebuilt="$(vma_rebuild_cmd "$cmd")" || return 127
+        prelude='git_ro(){ command git -c core.fsmonitor=false -c core.pager=cat --no-pager "$@"; }; git(){ local __s="${1:-}"; shift 2>/dev/null || true; git_ro "$__s" --no-ext-diff --no-textconv "$@"; }; set -f;'
+        bash -c "$prelude $rebuilt"
       }
       # vma_process_assertions <grep-value> <files-created-csv>
       #   Splits the Grep-assertions value on ';', executes each "<command> => <count>"
@@ -4238,7 +4559,7 @@ nodes:
             echo "verify-manifest-assertions: DROP (command not on read-only allowlist; not executed): $sub" >&2
             continue
           fi
-          raw="$(bash -c "$cmd" 2>/dev/null)"; rc=$?
+          raw="$(vma_exec_cmd "$cmd" 2>/dev/null)"; rc=$?
           rawtrim="$(printf '%s' "$raw" | tr -d '[:space:]')"
           if printf '%s' "$rawtrim" | grep -qE '^[0-9]+$'; then
             # Command printed a single integer (the "| wc -l" / "grep -c" form).

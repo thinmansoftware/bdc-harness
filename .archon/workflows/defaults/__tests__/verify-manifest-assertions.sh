@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # verify-manifest-assertions.sh -- unit tests for the verify-manifest-assertions
-# node logic in .archon/workflows/defaults/bdc-feature-development.yaml (and its
-# byte-identical mirror in bdc-feature-development-codex.yaml).
+# node logic (vma core) in .archon/workflows/defaults/bdc-feature-development.yaml
+# and its byte-identical mirrors in the 3 other lanes that carry the node
+# (bdc-feature-development-codex.yaml, -codex-only, -astra). The other 9
+# bdc-feature-development lanes have no verify-manifest-assertions node.
 #
 # WO-HARNESS-BUILD-MANIFEST-ASSERTION-EXECUTE-01.
 #
@@ -74,6 +76,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CANONICAL_YAML="$DEFAULTS_DIR/bdc-feature-development.yaml"
 MIRROR_YAML="$DEFAULTS_DIR/bdc-feature-development-codex.yaml"
+# The verify-manifest-assertions node (and therefore the vma core) exists in ONLY
+# these 4 lanes; the other 9 bdc-feature-development lanes have no such node
+# (WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01 Scope OUT: adding it to the 9 is
+# WO-HARNESS-VMA-NODE-REMAINING-LANES-01). The vma core is byte-identical across
+# these 4.
+VMA_LANES="
+bdc-feature-development.yaml
+bdc-feature-development-codex.yaml
+bdc-feature-development-codex-only.yaml
+bdc-feature-development-astra.yaml
+"
 
 # -----------------------------------------------------------------------------
 # Extract the vma core functions from the canonical YAML and load them.
@@ -214,25 +227,16 @@ assert_eq "N/A value kept verbatim" "N/A (no source-level greps; behavior covere
 # Test 9: parity -- the verify-manifest-assertions node bash block must be
 #         byte-identical between the two lanes (no shared include exists).
 # -----------------------------------------------------------------------------
-echo "--- Test 9: cross-lane node parity ---"
-extract_node_block() {
-  awk '
-    /^  - id: verify-manifest-assertions$/ { c=1 }
-    c && /^  - id: manifest-consistency-check$/ { exit }
-    c { print }
-  ' "$1"
-}
-BLOCK_A="$(extract_node_block "$CANONICAL_YAML")"
-BLOCK_B="$(extract_node_block "$MIRROR_YAML")"
-if [ "$BLOCK_A" = "$BLOCK_B" ]; then
-  PASS=$((PASS + 1))
-  echo "PASS: verify-manifest-assertions node identical across both lanes"
-else
-  FAIL=$((FAIL + 1))
-  echo "FAIL: verify-manifest-assertions node differs across lanes"
-  diff <(printf '%s\n' "$BLOCK_A") <(printf '%s\n' "$BLOCK_B") || true
-fi
-assert_contains "canonical node block is non-empty" "vma_process_assertions" "$BLOCK_A"
+echo "--- Test 9: cross-lane vma core parity (VMA_LANES = exactly 4 lanes) ---"
+assert_eq "VMA_LANES lists exactly 4 lanes" "4" "$(printf '%s\n' $VMA_LANES | grep -c .)"
+CANON_VMA="$(extract_vma_core "$CANONICAL_YAML")"
+for lane in $VMA_LANES; do
+  assert_eq "vma core byte-identical: $lane" "$CANON_VMA" "$(extract_vma_core "$DEFAULTS_DIR/$lane")"
+done
+# The vma helpers must live ONLY in these 4 lanes -- never in the other 9.
+assert_eq "vma_split_pipe present in exactly 4 lanes" "4" "$(grep -rl vma_split_pipe "$DEFAULTS_DIR" --include='bdc-feature-development*.yaml' | wc -l | tr -d ' ')"
+assert_eq "vma_rebuild_cmd present in exactly 4 lanes" "4" "$(grep -rl vma_rebuild_cmd "$DEFAULTS_DIR" --include='bdc-feature-development*.yaml' | wc -l | tr -d ' ')"
+assert_contains "canonical vma core is non-empty" "vma_process_assertions" "$CANON_VMA"
 
 # -----------------------------------------------------------------------------
 # Test 10: basename substring collision -- a created file whose basename is a
@@ -290,6 +294,127 @@ assert_eq "piped read-only command kept" "grep -c alpha $FIX/data.txt | wc -l =>
 
 # -----------------------------------------------------------------------------
 # Summary
+# =============================================================================
+# WO-HARNESS-STOP-GREP-QUOTED-FAIL-CLOSED-01
+# Test 14 + Test 16: the vma allow_cmd of EVERY lane that carries the node must
+# reach the SAME verdict as the rsg allow_cmd (Section 2A: no vma-only exceptions
+# after the security amendment). The rsg core is the cross-check oracle; the vma
+# core is re-evaluated per lane. Admitted git / quoted commands are also executed
+# through vma_process_assertions and must not run a repository textconv/external
+# diff.
+# =============================================================================
+extract_marker_core() {
+  awk -v m="$2" '
+    index($0, "# ---- BEGIN " m " core") { c = 1; next }
+    index($0, "# ---- END " m " core") { c = 0 }
+    c
+  ' "$1" | sed 's/^      //'
+}
+# Oracle: the rsg core (from the codex lane).
+RSG_ORACLE="$(extract_marker_core "$MIRROR_YAML" rsg)"
+eval "$RSG_ORACLE"
+if ! declare -F rsg_allow_cmd >/dev/null; then
+  echo "FATAL: rsg oracle not loaded"; exit 1
+fi
+
+# Fixture git repo (real SHAs) shared by the git rows.
+VG="$(mktemp -d)"
+(
+  cd "$VG"
+  git init -q
+  git config user.email t@example.com
+  git config user.name tester
+  printf 'line one\nline two\n' > f
+  git add f && git commit -qm c1
+  printf 'line one\nline two\nline three\n' > f
+  git add f && git commit -qm c2
+)
+V1="$(cd "$VG" && git rev-parse HEAD~1)"
+V2="$(cd "$VG" && git rev-parse HEAD)"
+printf 'a.b\naZb\n' > "$VG/dotf.txt"
+
+# Commands every lane's vma AND rsg must ACCEPT (Tests 1,2,3,6 + Test 16 k,l).
+ACCEPT=(
+  "grep -c 'SET LOCAL app.tenant_id' $VG/dotf.txt"
+  "grep -c '^foo bar' $VG/dotf.txt"
+  "grep -c 'alpha|beta' $VG/dotf.txt"
+  "grep -c '[0-9]' $VG/dotf.txt"
+  "grep -c 'a\\.b' $VG/dotf.txt"
+  "git diff --name-only $V1 $V2 -- f | wc -l"
+  "git log --oneline -n 1 | wc -l"
+  "git show $V2:f | grep -c line"
+  "git diff --stat $V1 $V2 -- f | wc -l"
+)
+# Commands every lane's vma AND rsg must REJECT (Tests 4,5,7 + Test 16 a-j).
+REJECT=(
+  'grep -c "needle" f'
+  'grep -c need\le f'
+  'grep -c $FOO f'
+  'cat $(ls)'
+  "grep -c 'a;b' f"
+  "grep -c '\$(id)' f"
+  "grep -c 'x => y' f"
+  "grep -c '-f x' f"
+  "find . '-exec' rm"
+  "git diff --output=out $V1 $V2"
+  "git diff --ext-diff $V1"
+  "git push origin x"
+  "git commit -m x"
+  "git diff --out\\put=out $V1 $V2"
+  "git diff --ext-dif\\f $V1 $V2"
+  "git diff --ou\"\"tput=out $V1 $V2"
+  "git diff --out\${x}put=out"
+  "git diff \$'--output=out' $V1"
+  "find . -exe\\c rm '{}' +"
+  "find . -ex\"\"ec rm"
+  "git diff --output* $V1"
+  "git diff -Oout $V1"
+)
+
+for lane in $VMA_LANES; do
+  echo "--- Test 14/16: rsg==vma verdict parity in $lane ---"
+  LANE_VMA="$(extract_marker_core "$DEFAULTS_DIR/$lane" vma)"
+  eval "$LANE_VMA"
+  for c in "${ACCEPT[@]}"; do
+    rv="no"; if rsg_allow_cmd "$c"; then rv="yes"; fi
+    vv="no"; if allow_cmd "$c"; then vv="yes"; fi
+    assert_eq "[$lane] ACCEPT rsg==vma==yes: $c" "yes|yes" "$rv|$vv"
+  done
+  for c in "${REJECT[@]}"; do
+    rv="no"; if rsg_allow_cmd "$c"; then rv="yes"; fi
+    vv="no"; if allow_cmd "$c"; then vv="yes"; fi
+    assert_eq "[$lane] REJECT rsg==vma==no: $c" "no|no" "$rv|$vv"
+  done
+done
+
+echo "--- Test 16: vma executes accepted git/quoted commands; textconv never runs ---"
+# Re-load the canonical vma core for the execution checks.
+eval "$(extract_marker_core "$CANONICAL_YAML" vma)"
+cd "$VG"
+# quoted-pipe git diff executes and its count is the direct-run count.
+DIRECT="$(git diff --stat $V1 $V2 -- f | wc -l | tr -d ' ')"
+OUT="$(vma_process_assertions "git diff --stat $V1 $V2 -- f | wc -l => $DIRECT" "" 2>/dev/null)"
+assert_eq "vma executes read-only git diff (count == direct run)" "git diff --stat $V1 $V2 -- f | wc -l => $DIRECT" "$OUT"
+# textconv / external-diff must be neutralized by the git wrapper.
+printf 'f diff=evil\n' > .gitattributes
+git config diff.evil.textconv "$VG/evil.sh"
+git config diff.external "$VG/evil.sh"
+printf '#!/bin/sh\ntouch %s/pwned-vma\ncat "$1" 2>/dev/null || true\n' "$VG" > evil.sh
+chmod +x evil.sh
+vma_process_assertions "git diff $V1 $V2 -- f | wc -l => 1" "" >/dev/null 2>&1
+vma_process_assertions "git show $V2 -- f | wc -l => 1" "" >/dev/null 2>&1
+if [ -e "$VG/pwned-vma" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL: vma ran repository textconv/external-diff (pwned-vma created)"
+else
+  PASS=$((PASS + 1)); echo "PASS: vma did not run repository textconv/external-diff"
+fi
+# R11: the string handed to bash -c is the rebuilt single-quoted argv (no unquoted
+# backslash / double quote / dollar).
+REB="$(vma_rebuild_cmd "grep -c 'a\\.b' $VG/dotf.txt")"
+assert_eq "rebuilt (k) is the single-quoted argv form" "'grep' '-c' 'a\\.b' '$VG/dotf.txt'" "$REB"
+cd "$SCRIPT_DIR"
+rm -rf "$VG"
+
 # -----------------------------------------------------------------------------
 echo ""
 echo "==== verify-manifest-assertions.sh tests ===="
