@@ -278,12 +278,11 @@ describe('reduceToLatestCheckRuns producer identity', () => {
     expect(superseded).toHaveLength(0);
   });
 
-  test('rerun by the same producer still supersedes the older run', () => {
+  test('rerun by the same non-Actions producer still supersedes the older run', () => {
     const base = {
       name: 'test',
       status: 'completed',
-      app: { id: 15368 },
-      details_url: 'https://github.com/o/r/actions/runs/111/job/1',
+      app: { id: 777 },
     };
     const runs: LatestCheckRun[] = [
       {
@@ -350,27 +349,27 @@ describe('reduceToLatestCheckRuns producer identity', () => {
     expect(superseded).toEqual([]);
   });
 
-  test('same-name in-progress job inside one workflow run does not hide an older failure unless it started after it', () => {
-    const base = { name: 'test', app: { id: 15368 } };
-    const older = {
-      ...base,
-      id: 10,
-      status: 'completed',
-      conclusion: 'failure',
-      details_url: 'https://github.com/o/r/actions/runs/111/job/1',
-      started_at: '2026-09-29T08:00:00Z',
-      completed_at: '2026-09-29T08:05:00Z',
-    };
-    const concurrent = {
-      ...base,
-      id: 11,
-      status: 'in_progress',
-      conclusion: null,
-      details_url: 'https://github.com/o/r/actions/runs/111/job/2',
-      started_at: '2026-09-29T08:01:00Z',
-    };
-    expect(reduceToLatestCheckRuns([older, concurrent]).current).toHaveLength(2);
-    const rerun = { ...concurrent, started_at: '2026-09-29T08:06:00Z' };
-    expect(reduceToLatestCheckRuns([older, rerun]).current.map(r => r.id)).toEqual([11]);
+  test('sequential independent same-name jobs inside one workflow run are both preserved', () => {
+    const base = { name: 'cleanup', status: 'completed', app: { id: 15368 } };
+    const { current, superseded } = reduceToLatestCheckRuns([
+      {
+        ...base,
+        id: 10,
+        conclusion: 'failure',
+        details_url: 'https://github.com/o/r/actions/runs/111/job/1',
+        started_at: '2026-09-29T08:00:00Z',
+        completed_at: '2026-09-29T08:05:00Z',
+      },
+      {
+        ...base,
+        id: 11,
+        conclusion: 'success',
+        details_url: 'https://github.com/o/r/actions/runs/111/job/2',
+        started_at: '2026-09-29T08:06:00Z',
+        completed_at: '2026-09-29T08:07:00Z',
+      },
+    ]);
+    expect(current.map(r => r.conclusion).sort()).toEqual(['failure', 'success']);
+    expect(superseded).toEqual([]);
   });
 });

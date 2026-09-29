@@ -15,10 +15,9 @@
  *   current state is that in-flight (pending) run, never the older completed
  *   conclusion.
  *
- * Within a single Actions workflow run, same-name runs can be independent jobs
- * rather than reruns, so a run is only superseded there when the newer run
- * started after the older one completed (see isSuccessorOf); otherwise both
- * are kept.
+ * Within a single Actions workflow run, same-name runs may be independent jobs
+ * or re-attempts and cannot be told apart, so none is superseded there (see
+ * isSuccessorOf).
  *
  * Fail closed on the legacy stub shape: if ANY run in a name group lacks a
  * numeric `id` we cannot order the group, so it is returned unreduced (every
@@ -57,13 +56,12 @@ export interface ReducedCheckRuns {
 /**
  * Producer identity of a run: producing App plus, for Actions, the workflow run
  * id. Two same-name runs with different producers are independent checks, not
- * reruns of each other, so they must never supersede one another (a success
-  const wf = workflowRunId(run);
- * metadata (legacy stub shape) all share the empty producer.
+ * reruns of each other, so they must never supersede one another. Runs with no
+ * producer metadata (legacy stub shape) all share the empty producer.
  */
 function producerKey(run: LatestCheckRun): string {
   const app = run.app?.id ?? run.app?.slug ?? '';
-  const wf = /\/actions\/runs\/(\d+)/.exec(run.details_url ?? '')?.[1] ?? '';
+  const wf = workflowRunId(run);
   return `${app}|${wf}`;
 }
 
@@ -71,10 +69,6 @@ type IdentifiedCheckRun = LatestCheckRun & { id: number };
 
 function hasNumericId(run: LatestCheckRun): run is IdentifiedCheckRun {
   return typeof run.id === 'number';
-}
-
-function isCompleted(run: LatestCheckRun): boolean {
-  return run.status === 'completed';
 }
 
 /** Actions workflow run id embedded in a run's details URL, or '' if absent. */
@@ -85,21 +79,14 @@ function workflowRunId(run: LatestCheckRun): string {
 /**
  * True when `newer` (higher id) provably replaces `older` as the current result.
  *
- * - Runs with no Actions job identity (legacy/stub shape, or non-Actions
- *   checks) are ordered by run id alone: a higher id is a later attempt.
- * - Runs inside ONE Actions workflow run may be either successive attempts of
- *   the same job or independent same-name jobs (job ids differ in both cases),
- *   so id order is not evidence. Require temporal succession: `older` is
- *   completed and `newer` started at or after it completed. Missing or
- *   overlapping timestamps are ambiguous and are NOT superseded (fail closed,
- *   so a failure or pending state is never hidden by a concurrent sibling).
+ * Only runs with no Actions workflow-run identity (non-Actions checks or the
+ * legacy stub shape) are ordered by id. Inside an Actions workflow run, the
+ * check-run payload cannot distinguish a re-attempt of a job from an
+ * independent same-name job (no attempt or job-definition id is exposed), so
+ * neither id order nor timestamps are evidence: keep both (fail closed).
  */
 function isSuccessorOf(newer: IdentifiedCheckRun, older: IdentifiedCheckRun): boolean {
-  if (workflowRunId(newer) === '' && workflowRunId(older) === '') return true;
-  if (!isCompleted(older) || !older.completed_at || !newer.started_at) return false;
-  const doneAt = Date.parse(older.completed_at);
-  const startedAt = Date.parse(newer.started_at);
-  return !Number.isNaN(doneAt) && !Number.isNaN(startedAt) && startedAt >= doneAt;
+  return workflowRunId(newer) === '' && workflowRunId(older) === '';
 }
 
 /**
