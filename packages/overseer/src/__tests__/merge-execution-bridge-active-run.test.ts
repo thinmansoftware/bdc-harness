@@ -294,6 +294,37 @@ describe('merge execution bridge active-run defer', () => {
     expect(h.merges).toBe(1);
   });
 
+  test('pr_discovery_verdict_carrying_a_real_wo_id_defers_when_a_run_is_active', async () => {
+    // A discovered PR (run-less, pr-discovery: run id) can still carry a real
+    // WO id. The gate is on the wo_id shape, not on run-backing, so this MUST
+    // defer while a repair run for the same WO is executing (bdc-harness #1046).
+    const h = harness(
+      [
+        verdict('disc-1', {
+          wo_id: 'WO-DISCOVERED-01',
+          run_id: 'pr-discovery:thinmansoftware/bdc-harness#7',
+        }),
+      ],
+      {
+        evidence: greenPr({ pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 7 } }),
+        hasActiveRunForWo: async woId => woId === 'WO-DISCOVERED-01',
+      }
+    );
+
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+
+    expect(h.activeRunCalls).toEqual(['WO-DISCOVERED-01']);
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.reserveSlotCalls).toHaveLength(0);
+    expect(h.outcomes).toHaveLength(0);
+    expect(h.claimReleases).toEqual([{ verdictId: 'disc-1', reason: 'active_run_deferred' }]);
+  });
+
   test('active_run_matching_is_exact_on_the_wo_id_and_ignores_prose', async () => {
     const messages = [
       'WO_ID=WO-A-01 --project x',

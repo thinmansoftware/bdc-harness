@@ -617,15 +617,17 @@ async function mergeClaimedVerdict(
 
   // Defer the merge while a Cauldron run for the SAME WO is still executing, so
   // the run is never failed by its own PR being merged underneath it
-  // (bdc-harness #1046). Only run-backed verdicts whose wo_id is a real WO id
-  // participate; run-less pull-ref verdicts (gh:owner/repo#N, run id
-  // pr-discovery:...) match no run and must never call the helper (Test 6). A
-  // deferral releases the claim and returns undefined -- NOT 'stop' -- so later
-  // verdicts in the same pass still process (only the rate ceiling stops the
-  // loop). The check fails safe: an error defers rather than merges.
+  // (bdc-harness #1046). The gate is purely on the wo_id SHAPE, not on whether
+  // the verdict is run-backed: a PR-discovery verdict (run-less, run id
+  // pr-discovery:...) can still carry a real WO id, and merging it mid-repair is
+  // exactly the failure #1046 prevents -- so it must be deferred too. Run-less
+  // pull-ref verdicts carry a gh:owner/repo#N wo_id that does not start with
+  // WO-, so they still never call the helper. A deferral releases the claim and
+  // returns undefined -- NOT 'stop' -- so later verdicts in the same pass still
+  // process (only the rate ceiling stops the loop). The check fails safe: an
+  // error defers rather than merges.
   if (
     options.store.hasActiveRunForWo &&
-    !isRunlessVerdict(verdict) &&
     typeof verdict.wo_id === 'string' &&
     verdict.wo_id.startsWith('WO-')
   ) {
