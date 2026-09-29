@@ -228,7 +228,13 @@ minutes would otherwise erase all evidence (the heartbeat clock restarts fresh).
 To prevent that, `acquireInstanceLock` appends one JSON line
 `{previous_pid, previous_started_at, reclaimed_at}` to an append-only death log at
 `~/.config/bdc/dispatch-worker-<worker_id>.deaths.jsonl` whenever it reclaims a
-dead-PID lock, BEFORE the lock is overwritten. Each registration carries the
+dead-PID lock, BEFORE the lock is overwritten. That append is load-bearing: if it
+fails (disk full, permissions), acquisition throws
+`dispatch_worker_death_log_unwritable` and the lock is left unreclaimed rather than
+overwriting the dead pid's record and losing the death. The worker refuses to start,
+which is itself loud -- no heartbeat means the stale-heartbeat page fires -- and the
+untouched lock still holds the dead pid, so a later start re-journals the same death.
+Each registration carries the
 retained log (entries newer than 24h, at most 20) as
 `capabilities.restart_evidence`. The alarm journals and pages each death entry
 independent of heartbeat freshness, keyed by

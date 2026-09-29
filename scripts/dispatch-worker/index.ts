@@ -927,7 +927,12 @@ async function main(): Promise<void> {
       deathLogFile: defaultDeathLogFile(config.worker_id),
     });
   } catch (error) {
-    await log.error('startup refused: another instance appears to be running', error);
+    // Two distinct causes, both fatal: dispatch_worker_already_running (a live
+    // process holds the lock) or dispatch_worker_death_log_unwritable (a dead
+    // predecessor's death could not be journaled, so the lock was deliberately
+    // left unreclaimed rather than destroying that evidence). The thrown message
+    // names which one, so do not assert a cause here.
+    await log.error('startup refused: could not acquire the instance lock', error);
     console.error(String(error));
     process.exit(1);
     return;

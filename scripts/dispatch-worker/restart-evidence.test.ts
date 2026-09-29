@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, readFile, rm, writeFile, appendFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile, appendFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { acquireInstanceLock, readRestartEvidence } from './instance-lock';
@@ -169,5 +169,55 @@ describe('instance-lock restart evidence', () => {
 
     // A missing file returns [].
     expect(await readRestartEvidence(join(dir, 'nope.jsonl'), nowIso)).toEqual([]);
+  });
+
+  test('Test 14: an_unwritable_death_log_fails_acquisition_and_preserves_the_dead_pid_lock', async () => {
+    const dir = await makeTempDir();
+    const lockFile = join(dir, 'worker.lock');
+    // A DIRECTORY at the death-log path makes appendFile fail (EISDIR on POSIX,
+    // EPERM/EACCES on Windows) -- the closest deterministic stand-in for the
+    // disk-full or permission-denied journal this contract has to survive.
+    const deathLogFile = join(dir, 'worker.deaths.jsonl');
+    await mkdir(deathLogFile, { recursive: true });
+
+    // A lock held by dead pid 4242 would normally be reclaimed.
+    await writeFile(
+      lockFile,
+      JSON.stringify({ pid: 4242, started_at: '2026-09-28T21:00:00.000Z' }),
+      'utf8'
+    );
+
+    // The death cannot be journaled, so acquisition fails instead of reclaiming.
+    await expect(
+      acquireInstanceLock({
+        lockFile,
+        deathLogFile,
+        pid: 5000,
+        isAlive: (pid: number) => pid !== 4242, // 4242 is dead
+      })
+    ).rejects.toThrow('dispatch_worker_death_log_unwritable');
+
+    // The evidence survives: the lock still names the dead pid and its start
+    // time, so a later start can re-journal that same death.
+    const lockAfter = JSON.parse(await readFile(lockFile, 'utf8')) as {
+      pid: number;
+      started_at: string;
+    };
+    expect(lockAfter.pid).toBe(4242);
+    expect(lockAfter.started_at).toBe('2026-09-28T21:00:00.000Z');
+
+    // Non-regression: when there is no death to journal, an unwritable death
+    // log must NOT block startup -- nothing is being destroyed.
+    await rm(lockFile, { force: true });
+    const handle = await acquireInstanceLock({
+      lockFile,
+      deathLogFile,
+      pid: 5001,
+      isAlive: () => false,
+    });
+    expect(handle.reclaimed).toBeNull();
+    const lockAfterClean = JSON.parse(await readFile(lockFile, 'utf8')) as { pid: number };
+    expect(lockAfterClean.pid).toBe(5001);
+    await handle.release();
   });
 });

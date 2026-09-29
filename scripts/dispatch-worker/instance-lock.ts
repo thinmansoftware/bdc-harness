@@ -20,7 +20,11 @@ import { dirname } from 'path';
  *   round trip and no dependency on server clock/expiry behavior. It also
  *   fails toward availability: if the lock is stale (process is dead), the
  *   new instance simply reclaims it and starts, instead of waiting on a
- *   server-side timeout it does not control.
+ *   server-side timeout it does not control. The ONE exception is the death
+ *   log (see deathLogFile): reclaiming a dead PID's lock destroys the only
+ *   record of that death, so if the death line cannot be written the
+ *   acquisition fails instead of reclaiming. Evidence beats availability at
+ *   exactly that one step, and only at that step.
  * - The existing token file convention (join(homedir(), '.config', 'bdc', ...))
  *   already establishes homedir()/.config/bdc as the correct place for this
  *   kind of local-machine state, so the lockfile follows the same pattern.
@@ -37,6 +41,11 @@ export interface InstanceLockOptions {
    * dead PID, it appends one JSON line describing that death here BEFORE the
    * lock is overwritten, so the evidence survives a watchdog restart that would
    * otherwise erase all trace of the death (the heartbeat clock restarts fresh).
+   *
+   * The append is load-bearing, not best-effort: if it fails, acquisition
+   * throws 'dispatch_worker_death_log_unwritable' and the lock file is left
+   * untouched. Writing the lock anyway would replace the dead PID's record
+   * with our own and lose that death permanently.
    */
   deathLogFile?: string;
 }
@@ -133,12 +142,28 @@ export async function acquireInstanceLock(
       reclaimed_at: new Date().toISOString(),
     };
     if (options.deathLogFile) {
+      // Fail closed. This append is the only durable record that the previous
+      // process died: a watchdog restart resets the heartbeat clock before the
+      // server's staleness alarm can fire, so if this line is lost the death is
+      // invisible forever. Continuing here would overwrite the lock -- the last
+      // place the dead pid and its start time still exist -- so a failed append
+      // must fail the acquisition instead.
+      //
+      // Refusing to start is not a silent failure, and not a lost death:
+      //  - the lock file is left untouched, so it still holds the dead pid and
+      //    started_at, and the next start re-attempts the same death line;
+      //  - with no worker running, the heartbeat ages past the page threshold
+      //    and the server-side alarm pages John on the ordinary stale path.
+      // The error is also distinct from dispatch_worker_already_running so an
+      // operator can tell "someone else holds the lock" from "I cannot journal".
       try {
         await mkdir(dirname(options.deathLogFile), { recursive: true });
         await appendFile(options.deathLogFile, `${JSON.stringify(reclaimed)}\n`, 'utf8');
-      } catch {
-        // Best-effort: a lost death line must never block the worker from
-        // starting. The heartbeat-age page path remains as a backstop.
+      } catch (error) {
+        throw new Error(
+          `dispatch_worker_death_log_unwritable: could not append restart evidence for dead pid ${existingPid} to ${options.deathLogFile}; refusing to reclaim ${options.lockFile} and lose the only record of that death`,
+          { cause: error }
+        );
       }
     }
   }
