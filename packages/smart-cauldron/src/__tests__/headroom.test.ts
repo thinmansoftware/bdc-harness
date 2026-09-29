@@ -204,19 +204,36 @@ describe('entry headroom', () => {
     const premiumTiers = loadPremiumTiers();
     const ruleset = loadRuleset();
     const codePick = pickEntryTier({ woClass: 'CODE' }, ruleset);
-    expect(codePick).toBe('codex');
+    expect(codePick).toBe('cursor');
+    const hotCursorCoolCodex: SeatUsageSnapshot = {
+      cursor: { limit_source: 'measured', windows: [{ name: 'primary', used_percent: 83 }] },
+      codex: { limit_source: 'measured', windows: [{ name: 'primary', used_percent: 11 }] },
+    };
     const codeEntry = chooseHeadroomEntry({
       picked: codePick,
       tiers,
       refusedTiers,
       premiumTiers,
-      usage: HOT_CODEX_COOL_CLAUDE,
+      usage: hotCursorCoolCodex,
       thresholdPercent: 80,
       pinned: false,
     });
-    expect(codeEntry.entry).toBe('claude');
+    expect(codeEntry.entry).toBe('codex');
     expect(codeEntry.changed).toBe(true);
-    expect(codeEntry.reason).toBe('seat_over_threshold:codex:83');
+    expect(codeEntry.reason).toBe('seat_over_threshold:cursor:83');
+    const coolCursor = chooseHeadroomEntry({
+      picked: codePick,
+      tiers,
+      refusedTiers,
+      premiumTiers,
+      usage: {
+        cursor: { limit_source: 'measured', windows: [{ name: 'primary', used_percent: 20 }] },
+      },
+      thresholdPercent: 80,
+      pinned: false,
+    });
+    expect(coolCursor.entry).toBe('cursor');
+    expect(coolCursor.changed).toBe(false);
 
     const billingPick = pickEntryTier({ woClass: 'CODE', tags: ['billing'] }, ruleset);
     expect(billingPick).toBe('claude');
