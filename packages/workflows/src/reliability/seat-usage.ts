@@ -20,6 +20,7 @@ import {
   createAuthenticatedMessage,
   type CreateAuthenticatedMessageData,
 } from '@archon/core/db/dispatch';
+import { getOperatorSetting } from '@archon/core/db/operator-settings';
 
 export const SEAT_IDS = ['claude', 'codex', 'cursor'] as const;
 export type SeatId = (typeof SEAT_IDS)[number];
@@ -31,6 +32,7 @@ export const MIN_SEAT_CUTOFF_PERCENT = 1;
 /** Highest accepted cutoff. Anything higher would switch the gate off in effect. */
 export const MAX_SEAT_CUTOFF_PERCENT = 95;
 export const SEAT_CUTOFF_OUT_OF_RANGE = 'seat_cutoff_out_of_range';
+export const FUELGLASS_SEAT_CUTOFF_SETTING_KEY = 'fuelglass.seat_cutoff_percent';
 
 const UNKNOWN_ALERT_WINDOW_MS = 60 * 60 * 1000;
 
@@ -658,6 +660,30 @@ export function setSeatCutoffOverride(percent: number | null): void {
     );
   }
   cutoffOverride = percent;
+}
+
+export async function loadPersistedSeatCutoff(): Promise<{ value: string; setAt: string } | null> {
+  const row = await getOperatorSetting(FUELGLASS_SEAT_CUTOFF_SETTING_KEY);
+  if (!row) return null;
+  return { value: row.setting_value, setAt: row.updated_at };
+}
+
+/**
+ * Load a persisted operator cutoff into memory. Does not catch: a loader
+ * failure rejects so startServer can log it and continue.
+ */
+export async function restoreSeatCutoffOverride(
+  loader: () => Promise<{ value: string; setAt: string } | null>
+): Promise<void> {
+  const loaded = await loader();
+  if (loaded === null) return;
+  const n = Number(loaded.value);
+  if (!isValidSeatCutoff(n)) {
+    warnLog({ raw: loaded.value }, 'fuelglass.seat_cutoff_persisted_invalid');
+    return;
+  }
+  warnLog({ percent: n, setAt: loaded.setAt }, 'fuelglass.seat_cutoff_override_restored');
+  setSeatCutoffOverride(n);
 }
 
 /** UTC hour bucket, e.g. 2026-09-24T10. */
