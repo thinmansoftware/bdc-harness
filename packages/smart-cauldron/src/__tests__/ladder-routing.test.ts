@@ -31,14 +31,17 @@ describe('live ladder SOR', () => {
     expect(refused).toContain('glm');
   });
 
-  // Entry floor: cursor is live and sits below codex, so it is now the first
-  // non-refused tier. glm/zero/qwen stay refused.
-  test('cursor is live, glm/zero/qwen stay refused, cursor is the entry floor', () => {
+  // M-20260929h: cursor and zero are live; qwen and glm stay refused. zero is
+  // first in the ladder, so it is the entry floor.
+  test('cursor and zero are live, glm/qwen stay refused, zero is the entry floor', () => {
     const refused = loadRefusedTiers();
     expect(refused).not.toContain('cursor');
-    expect([...refused].sort()).toEqual(['glm', 'qwen', 'zero']);
+    expect(refused).not.toContain('zero');
+    expect(refused).toContain('qwen');
+    expect(refused).toContain('glm');
+    expect([...refused].sort()).toEqual(['glm', 'qwen']);
     const firstLive = loadLadder().find(t => !refused.includes(t.name));
-    expect(firstLive?.name).toBe('cursor');
+    expect(firstLive?.name).toBe('zero');
   });
 });
 
