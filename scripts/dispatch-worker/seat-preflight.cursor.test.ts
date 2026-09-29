@@ -185,9 +185,10 @@ describe('cursor ladder tier is live', () => {
     expect(tier?.isFrontier).toBe(false);
   });
 
-  test('cursor tier is NOT refused (flipped live 2026-09-29); glm/zero/qwen still are', () => {
+  test('cursor and zero are NOT refused (M-20260929h); glm/qwen still are', () => {
     expect(ladderConfig.refusedTiers).not.toContain('cursor');
-    for (const t of ['glm', 'zero', 'qwen']) expect(ladderConfig.refusedTiers).toContain(t);
+    expect(ladderConfig.refusedTiers).not.toContain('zero');
+    for (const t of ['glm', 'qwen']) expect(ladderConfig.refusedTiers).toContain(t);
   });
 
   test('cursor sits below codex in the ladder order', () => {
@@ -195,9 +196,9 @@ describe('cursor ladder tier is live', () => {
     expect(names.indexOf('cursor')).toBeLessThan(names.indexOf('codex'));
   });
 
-  // With cursor live and below codex, cursor is the first non-refused tier.
-  test('entry floor is cursor now that it is live', () => {
+  // With zero live (first in the ladder), zero is the first non-refused tier.
+  test('entry floor is zero now that it is live', () => {
     const firstLive = ladderConfig.tiers.find(t => !ladderConfig.refusedTiers.includes(t.name));
-    expect(firstLive?.name).toBe('cursor');
+    expect(firstLive?.name).toBe('zero');
   });
 });
