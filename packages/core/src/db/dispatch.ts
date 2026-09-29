@@ -13,14 +13,21 @@ import {
 const log = createLogger('db/dispatch');
 
 export type DispatchTaskType =
-  'agent_message' | 'run_review' | 'draft_spec' | 'run_report' | 'board_motion';
+  | 'agent_message'
+  | 'run_review'
+  | 'draft_spec'
+  | 'run_report'
+  | 'board_motion';
 export type DispatchMessageStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
 export type DispatchWorkerStatus = 'available' | 'unavailable';
 export type DispatchMessagePriority = 'blocker' | 'normal' | 'heartbeat';
 export type DispatchTaskOutcome = 'succeeded' | 'failed' | 'blocked';
 export type DispatchRouteDisposition = 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced';
 export type DispatchDeliveryMode =
-  'worker_poll' | 'drain_on_start' | 'alias_resolved' | 'notify_only';
+  | 'worker_poll'
+  | 'drain_on_start'
+  | 'alias_resolved'
+  | 'notify_only';
 
 export interface DispatchMessage {
   id: string;
