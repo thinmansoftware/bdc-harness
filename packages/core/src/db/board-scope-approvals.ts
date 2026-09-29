@@ -347,13 +347,17 @@ export async function getScopeApprovalMetadata(input: {
       ) LIMIT 1`,
     ['ce_scope_approval_recorded', input.repo, input.pr_number, input.head_sha]
   );
-  const revoked = await db.query<{ created_at: string }>(
+  const revoked = await db.query<{ created_at: string | Date }>(
     `SELECT created_at FROM board_audit_events WHERE event_type=$1 AND ${jsonField(db, 'repo')}=$2
       AND ${jsonField(db, 'pr_number')}=$3 ORDER BY created_at DESC LIMIT 1`,
     ['ce_scope_approval_revoked', input.repo, input.pr_number]
   );
   return {
     hasOtherBase: approvals.rowCount > 0,
-    newestRevokedAt: revoked.rows[0]?.created_at ?? null,
+    // PostgreSQL returns TIMESTAMPTZ as Date; always hand back a UTC ISO string.
+    newestRevokedAt:
+      revoked.rows[0]?.created_at == null
+        ? null
+        : new Date(revoked.rows[0].created_at).toISOString(),
   };
 }

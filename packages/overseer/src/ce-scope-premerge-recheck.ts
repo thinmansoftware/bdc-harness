@@ -131,8 +131,14 @@ export async function ceScopePremergeRecheck(input: {
     if (!selected && pinned.some(run => run.event !== 'pull_request_target'))
       return { ok: false, reason: 'wrong_gate_event' };
     if (selected?.conclusion !== 'success') return { ok: false, reason: 'gate_not_green' };
-    if (metadata.newestRevokedAt && selected.run_started_at <= metadata.newestRevokedAt)
-      return { ok: false, reason: 'revoked_after_green' };
+    // Compare epochs, never strings: timestamps may arrive in different formats.
+    // An unparseable timestamp fails closed.
+    if (metadata.newestRevokedAt) {
+      const green = Date.parse(selected.run_started_at);
+      const revokedAt = Date.parse(metadata.newestRevokedAt);
+      if (Number.isNaN(green) || Number.isNaN(revokedAt) || green <= revokedAt)
+        return { ok: false, reason: 'revoked_after_green' };
+    }
     const trustedSuites = new Set(
       runs
         .filter(

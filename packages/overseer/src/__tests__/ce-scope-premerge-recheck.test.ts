@@ -99,6 +99,36 @@ describe('CE scope premerge recheck', () => {
         })
       )
     ).toEqual({ ok: false, reason: 'revoked_after_green' }));
+  test('revoked_after_green_compares_epochs_not_strings', async () => {
+    // PostgreSQL text form of a revoke AFTER the green run (started 10:00Z): blocks.
+    expect(
+      await check(
+        deps({
+          getMetadata: async () => ({
+            hasOtherBase: false,
+            newestRevokedAt: new Date('2026-09-28T11:00:00Z').toString(),
+          }),
+        })
+      )
+    ).toEqual({ ok: false, reason: 'revoked_after_green' });
+    // A revoke BEFORE the green run does not block.
+    expect(
+      await check(
+        deps({
+          getMetadata: async () => ({
+            hasOtherBase: false,
+            newestRevokedAt: '2026-09-28 09:00:00+00',
+          }),
+        })
+      )
+    ).toEqual({ ok: true });
+    // An unparseable revoke timestamp fails closed.
+    expect(
+      await check(
+        deps({ getMetadata: async () => ({ hasOtherBase: false, newestRevokedAt: 'garbage' }) })
+      )
+    ).toEqual({ ok: false, reason: 'revoked_after_green' });
+  });
   test('premerge_recheck_reverifies_record_not_just_check', async () =>
     expect(
       await check(

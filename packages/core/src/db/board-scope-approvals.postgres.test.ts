@@ -5,6 +5,7 @@ import { resolve } from 'path';
 import { PostgresAdapter } from './adapters/postgres';
 import {
   getScopeApprovalDecision,
+  getScopeApprovalMetadata,
   recordScopeApproval,
   revokeScopeApproval,
 } from './board-scope-approvals';
@@ -118,6 +119,16 @@ describe('scope approvals on PostgreSQL', () => {
       database: db,
     });
     expect(denied).toEqual({ decision: 'deny', reason: 'revoked' });
+    // created_at comes back from node-postgres as a Date; metadata must hand back an
+    // ISO string so the premerge recheck's revoked_after_green comparison works.
+    const metadata = await getScopeApprovalMetadata({
+      repo: 'thinmansoftware/lspro-react',
+      pr_number: 626,
+      head_sha: S,
+      database: db,
+    });
+    expect(typeof metadata.newestRevokedAt).toBe('string');
+    expect(metadata.newestRevokedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
   });
 
   test('postgres_stale_fencing_token_is_rejected', async () => {
