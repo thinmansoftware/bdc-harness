@@ -120,10 +120,12 @@ export interface ReconcileDeps {
   log?: ReconcileLogger;
 }
 
-interface OctokitLike {
+export interface OctokitLike {
   search: {
     issuesAndPullRequests(input: Record<string, unknown>): Promise<{
       data: {
+        total_count?: number;
+        incomplete_results?: boolean;
         items: {
           number: number;
           title: string;
@@ -761,7 +763,11 @@ async function searchMergedPullRequests(
   return [...results.values()];
 }
 
-async function searchOpenPullRequestsReferencingTracker(
+// GitHub search returns at most 1000 results per query.
+const OPEN_PR_SEARCH_PAGE_SIZE = 100;
+const OPEN_PR_SEARCH_MAX_PAGES = 10;
+
+export async function searchOpenPullRequestsReferencingTracker(
   octokit: OctokitLike,
   input: { issue: ReconcileTrackerIssue; stem: string }
 ): Promise<ReconcileOpenPullRequest[]> {
@@ -773,25 +779,47 @@ async function searchOpenPullRequestsReferencingTracker(
   const results = new Map<string, ReconcileOpenPullRequest>();
 
   for (const q of queries) {
-    const search = await octokit.search.issuesAndPullRequests({
-      q,
-      per_page: 100,
-    });
-    for (const item of search.data.items) {
-      if (!item.pull_request || item.state !== 'open') continue;
-      const repo = parseRepositoryFromUrl(item.repository_url);
-      if (!repo) continue;
-      const key = `${repo.owner}/${repo.repo}#${item.number}`;
-      if (results.has(key)) continue;
-      results.set(key, {
-        owner: repo.owner,
-        repo: repo.repo,
-        number: item.number,
-        title: item.title,
-        body: item.body,
-        htmlUrl:
-          item.html_url ?? `https://github.com/${repo.owner}/${repo.repo}/pull/${item.number}`,
+    // Paginate to exhaustion. If completeness cannot be established, throw so the
+    // caller leaves the tracker open (a missed holder would close it prematurely).
+    let retrieved = 0;
+    for (let page = 1; ; page++) {
+      if (page > OPEN_PR_SEARCH_MAX_PAGES) {
+        throw new Error(`open PR search exceeds retrievable results for query: ${q}`);
+      }
+      const search = await octokit.search.issuesAndPullRequests({
+        q,
+        per_page: OPEN_PR_SEARCH_PAGE_SIZE,
+        page,
       });
+      if (search.data.incomplete_results) {
+        throw new Error(`open PR search returned incomplete results for query: ${q}`);
+      }
+      const items = search.data.items;
+      retrieved += items.length;
+      for (const item of items) {
+        if (!item.pull_request || item.state !== 'open') continue;
+        const repo = parseRepositoryFromUrl(item.repository_url);
+        if (!repo) continue;
+        const key = `${repo.owner}/${repo.repo}#${item.number}`;
+        if (results.has(key)) continue;
+        results.set(key, {
+          owner: repo.owner,
+          repo: repo.repo,
+          number: item.number,
+          title: item.title,
+          body: item.body,
+          htmlUrl:
+            item.html_url ?? `https://github.com/${repo.owner}/${repo.repo}/pull/${item.number}`,
+        });
+      }
+      const total = search.data.total_count;
+      if (items.length < OPEN_PR_SEARCH_PAGE_SIZE) {
+        if (total !== undefined && retrieved < total) {
+          throw new Error(`open PR search short page before total_count for query: ${q}`);
+        }
+        break;
+      }
+      if (total !== undefined && retrieved >= total) break;
     }
   }
 

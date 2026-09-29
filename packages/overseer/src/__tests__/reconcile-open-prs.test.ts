@@ -11,6 +11,8 @@ import {
   RECONCILE_ACTION,
   RECONCILE_HOLD_OPEN_ACTION,
   runReconcileOnce,
+  searchOpenPullRequestsReferencingTracker,
+  type OctokitLike,
   type ReconcileActionRecord,
   type ReconcileDeps,
   type ReconcileMergedPullRequest,
@@ -323,4 +325,83 @@ test('the_merged_pr_itself_is_never_counted_as_a_holder', async () => {
   const result = await runReconcileOnce({ deps });
 
   expectNormalClose(deps, result);
+});
+
+function searchItem(number: number) {
+  return {
+    number,
+    title: `PR ${number}`,
+    body: null,
+    state: 'open',
+    pull_request: {},
+    repository_url: 'https://api.github.com/repos/thinmansoftware/bdc-harness',
+  };
+}
+
+function pagedOctokit(
+  pages: Record<
+    number,
+    { items: ReturnType<typeof searchItem>[]; total: number; incomplete?: boolean }
+  >
+): { octokit: OctokitLike; pagesRequested: number[] } {
+  const pagesRequested: number[] = [];
+  const octokit = {
+    search: {
+      issuesAndPullRequests: async (input: Record<string, unknown>) => {
+        const page = Number(input.page ?? 1);
+        pagesRequested.push(page);
+        const entry = pages[page] ?? { items: [], total: 0 };
+        return {
+          data: {
+            total_count: entry.total,
+            incomplete_results: entry.incomplete ?? false,
+            items: entry.items,
+          },
+        };
+      },
+    },
+  } as unknown as OctokitLike;
+  return { octokit, pagesRequested };
+}
+
+const pagedTracker: ReconcileTrackerIssue = {
+  owner: 'thinmansoftware',
+  repo: 'bdc-xo',
+  number: 1044,
+  title: stem,
+  state: 'open',
+};
+
+test('open_pr_search_reads_a_holder_that_appears_beyond_the_first_page', async () => {
+  const first = Array.from({ length: 100 }, (_, i) => searchItem(i + 1));
+  const { octokit, pagesRequested } = pagedOctokit({
+    1: { items: first, total: 101 },
+    2: { items: [searchItem(500)], total: 101 },
+  });
+
+  const found = await searchOpenPullRequestsReferencingTracker(octokit, {
+    issue: pagedTracker,
+    stem,
+  });
+
+  expect(found.map(p => p.number)).toContain(500);
+  expect(found).toHaveLength(101);
+  expect(pagesRequested).toContain(2);
+});
+
+test('open_pr_search_throws_when_results_are_incomplete', async () => {
+  const { octokit } = pagedOctokit({ 1: { items: [searchItem(1)], total: 1, incomplete: true } });
+  await expect(
+    searchOpenPullRequestsReferencingTracker(octokit, { issue: pagedTracker, stem })
+  ).rejects.toThrow('incomplete');
+});
+
+test('open_pr_search_throws_when_results_exceed_the_retrievable_limit', async () => {
+  const full = Array.from({ length: 100 }, (_, i) => searchItem(i + 1));
+  const pages: Record<number, { items: ReturnType<typeof searchItem>[]; total: number }> = {};
+  for (let page = 1; page <= 10; page++) pages[page] = { items: full, total: 1500 };
+  const { octokit } = pagedOctokit(pages);
+  await expect(
+    searchOpenPullRequestsReferencingTracker(octokit, { issue: pagedTracker, stem })
+  ).rejects.toThrow('exceeds retrievable');
 });
