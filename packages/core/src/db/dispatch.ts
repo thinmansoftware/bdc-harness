@@ -141,6 +141,7 @@ export type DispatchMailboxResult =
         | 'machine_actor_required'
         | 'machine_actor_conflict'
         | 'already_disposed'
+        | 'receipt_present'
         | 'disposition_invalid'
         | 'disposition_terminal'
         | 'xo_bind_required'
@@ -1211,7 +1212,21 @@ async function validateMailboxActor(
 }
 
 export async function disposeMessageByMachine(
-  data: { id: string; actor: string; disposition: 'expired' | 'auto_surfaced' },
+  data: {
+    id: string;
+    actor: string;
+    disposition: 'expired' | 'auto_surfaced';
+    /**
+     * Opt-in atomic no-receipt guard (WO-HARNESS-DISPATCH-INBOX-READER-01). When
+     * true, the UPDATE additionally requires the row to still carry no human
+     * receipt and remain queued (`acknowledged_at IS NULL AND addressed_at IS
+     * NULL AND status = 'queued'`) IN THE SAME STATEMENT. A concurrent human ack
+     * between the caller listing the row and this UPDATE makes the statement
+     * match zero rows and returns `receipt_present`, so an owned message is never
+     * expired. Default false: existing callers are unaffected.
+     */
+    requireNoReceipt?: boolean;
+  },
   transactionQuery?: DispatchQueryExecutor
 ): Promise<DispatchMailboxResult> {
   if (!data.actor.startsWith('system:')) return { ok: false, reason: 'machine_actor_required' };
@@ -1227,16 +1242,26 @@ export async function disposeMessageByMachine(
     if (message.route_disposition !== null) return { ok: false, reason: 'already_disposed' };
 
     const now = nowIso();
-    const update = await query(
-      `UPDATE agent_dispatch_messages
-       SET route_disposition = $2, route_disposed_at = $3
-       WHERE id = $1 AND route_disposition IS NULL`,
-      [data.id, data.disposition, now]
-    );
+    const update = data.requireNoReceipt
+      ? await query(
+          `UPDATE agent_dispatch_messages
+           SET route_disposition = $2, route_disposed_at = $3
+           WHERE id = $1 AND route_disposition IS NULL
+             AND acknowledged_at IS NULL AND addressed_at IS NULL AND status = 'queued'`,
+          [data.id, data.disposition, now]
+        )
+      : await query(
+          `UPDATE agent_dispatch_messages
+           SET route_disposition = $2, route_disposed_at = $3
+           WHERE id = $1 AND route_disposition IS NULL`,
+          [data.id, data.disposition, now]
+        );
     const finalMessage = await readMessageInTransaction(query, data.id);
     if (!finalMessage) return { ok: false, reason: 'not_found' };
     if (update.rowCount === 0 || finalMessage.route_disposition !== data.disposition) {
-      return { ok: false, reason: 'already_disposed' };
+      // With the no-receipt guard, a zero-row update means the row acquired a
+      // receipt (or left 'queued') between the snapshot read and this UPDATE.
+      return { ok: false, reason: data.requireNoReceipt ? 'receipt_present' : 'already_disposed' };
     }
     log.info(
       { messageId: data.id, actor: data.actor, disposition: data.disposition },

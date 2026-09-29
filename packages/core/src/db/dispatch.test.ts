@@ -1321,6 +1321,65 @@ describe('dispatch db', () => {
     ).resolves.toEqual({ ok: false, reason: 'already_disposed' });
   });
 
+  test('T18 requireNoReceipt refuses to expire a row acknowledged after it was listed', async () => {
+    // The reader lists the row (snapshot), then a human acks it before the
+    // machine expiry lands. The atomic guard must refuse with receipt_present,
+    // leaving route_disposition NULL and the receipt intact. The receipt is set
+    // via a fixture UPDATE (per WO Section 11 Test 18) to model the between-list
+    // -and-dispose ack without threading the xo lease bind through this test.
+    const raced = await createMessage({
+      correlation_id: 'corr-inbox-reader-race',
+      idempotency_key: 'idem-inbox-reader-race',
+      task_type: 'agent_message',
+      sender: 'taskmaster',
+      recipient: 'xo',
+      body: 'Taskmaster daily digest for 2026-08-30: escalate_p0:rejected=48.',
+    });
+    // Row was listed while unacked; a human ack now binds ownership.
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [raced.id, '2026-09-29T00:00:00.000Z', 'xo']
+    );
+    await expect(
+      disposeMessageByMachine({
+        id: raced.id,
+        actor: 'system:inbox-reader',
+        disposition: 'expired',
+        requireNoReceipt: true,
+      })
+    ).resolves.toEqual({ ok: false, reason: 'receipt_present' });
+    const afterGuarded = await getMessage(raced.id);
+    expect(afterGuarded).toMatchObject({
+      route_disposition: null,
+      acknowledged_by: 'xo',
+      acknowledged_at: '2026-09-29T00:00:00.000Z',
+    });
+
+    // Legacy behavior preserved: without requireNoReceipt an identical fresh
+    // acked row still disposes ok.
+    const legacy = await createMessage({
+      correlation_id: 'corr-inbox-reader-legacy',
+      idempotency_key: 'idem-inbox-reader-legacy',
+      task_type: 'agent_message',
+      sender: 'taskmaster',
+      recipient: 'xo',
+      body: 'Taskmaster daily digest for 2026-08-31: escalate_p0:rejected=1.',
+    });
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [legacy.id, '2026-09-29T00:00:00.000Z', 'xo']
+    );
+    expect(
+      (
+        await disposeMessageByMachine({
+          id: legacy.id,
+          actor: 'system:inbox-reader',
+          disposition: 'expired',
+        })
+      ).ok
+    ).toBe(true);
+  });
+
   test('addresses only acknowledged mail by its acknowledger and is idempotent', async () => {
     const message = await createMessage({
       correlation_id: 'corr-address',

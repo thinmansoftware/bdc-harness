@@ -83,6 +83,7 @@ import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
 import { startTaskmaster, getTaskmasterRuntime, getTickHealth } from '../taskmaster/loop';
 import { startTaskmasterDeadmanChecker } from '@archon/overseer/taskmaster-deadman-check';
 import { startOperatorInboxConsumer } from '../dispatch/operator-inbox-consumer';
+import { startInboxReader, shouldStartOperatorInboxConsumer } from '../dispatch/inbox-reader';
 import {
   taskmasterStatusResponseSchema,
   taskmasterPauseBodySchema,
@@ -3496,7 +3497,19 @@ export function registerApiRoutes(
     // Same scheduler skeleton (singleton + inFlight + env interval 0=off);
     // human surface is durable JSONL under ARCHON_HOME/operator-inbox/ --
     // Telegram/SMS stay dark per #1456. OPERATOR_INBOX_INTERVAL_MS default 60000.
-    startOperatorInboxConsumer();
+    // Gated on the inbox-reader owner flag: when INBOX_READER_OPERATOR_OWNER=reader
+    // the new reader owns the operator mailbox and the old consumer must NOT start
+    // (WO-HARNESS-DISPATCH-INBOX-READER-01). Default owner=consumer keeps the
+    // consumer as the operator-mailbox owner.
+    if (shouldStartOperatorInboxConsumer(process.env)) {
+      startOperatorInboxConsumer();
+    }
+    // Dispatch inbox reader (WO-HARNESS-DISPATCH-INBOX-READER-01). Classifies the
+    // xo mailbox (and operator when owner=reader), writes a persisted digest the
+    // XO reads at session start, and -- only in enforce mode -- machine-expires
+    // provably-informational/collapsed-reminder rows. Ships INERT (dry-run,
+    // owner=consumer). INBOX_READER_INTERVAL_MS default 300000, 0 = off.
+    startInboxReader();
   }
 
   // GET /api/taskmaster/status - pause state, epoch, tick health
