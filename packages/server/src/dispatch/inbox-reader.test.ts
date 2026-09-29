@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, readFile, rm } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { readWorkerHeartbeatAlarmConfig } from './worker-heartbeat-alarm';
@@ -118,8 +118,44 @@ describe('inbox reader', () => {
     expect(result.digest?.counts.operator).toMatchObject({ skipped: 3, acked_open: 1 });
   });
 
-  test('T9 per-run cap of 500 is respected', () => {
-    expect(resolveInboxReaderConfig({ INBOX_READER_MAX_PER_RUN: '620' }).maxPerRun).toBe(500);
+  test('T9 620 rows are capped, resumable, and idempotent across three runs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'inbox-reader-'));
+    roots.push(root);
+    const queued = Array.from({ length: 620 }, (_, index) => ({
+      ...F1,
+      id: `bulk-${index}`,
+    }));
+    const disposed: string[] = [];
+    const deps: InboxReaderDeps = {
+      root,
+      now: () => new Date('2026-09-29T12:00:00Z'),
+      listMessages: async ({ limit }) => queued.slice(0, limit),
+      disposeMessageByMachine: async ({ id }) => {
+        disposed.push(id);
+        queued.splice(
+          queued.findIndex(row => row.id === id),
+          1
+        );
+        return { ok: true, message: { id } as never };
+      },
+      registerWorker: async () => undefined,
+      heartbeatWorker: async () => undefined,
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+    };
+    const config = resolveInboxReaderConfig({
+      INBOX_READER_MODE: 'enforce',
+      INBOX_READER_MAX_PER_RUN: '620',
+    });
+
+    const first = await runInboxReader(deps, config);
+    const second = await runInboxReader(deps, config);
+    const third = await runInboxReader(deps, config);
+
+    expect(first.digest?.disposal_results).toHaveLength(500);
+    expect(second.digest?.disposal_results).toHaveLength(120);
+    expect(third.digest?.disposal_results).toHaveLength(0);
+    expect(disposed).toHaveLength(620);
+    expect(new Set(disposed).size).toBe(620);
   });
 
   test('T10 dry-run is the default and writes the digest without any disposition', async () => {
@@ -130,12 +166,67 @@ describe('inbox reader', () => {
     expect(resolveInboxReaderConfig({ INBOX_READER_MODE: 'Enforce' }).mode).toBe('dry-run');
   });
 
-  test('T11 digest is persisted and read back before the first disposition', async () => {
-    const { root, disposed } = await harness([F1]);
-    expect(disposed).toHaveLength(1);
-    expect(JSON.parse(await readFile(join(root, 'latest.json'), 'utf8')).disposal_plan[0].id).toBe(
-      F1.id
+  test('T11 read-back precedes disposal and persistence failures cause zero disposition', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'inbox-reader-'));
+    roots.push(root);
+    const events: string[] = [];
+    let currentTime = '2026-09-29T12:00:00Z';
+    const config = resolveInboxReaderConfig({ INBOX_READER_MODE: 'enforce' });
+    const base: InboxReaderDeps = {
+      root,
+      now: () => new Date(currentTime),
+      listMessages: async () => [F1],
+      registerWorker: async () => undefined,
+      heartbeatWorker: async () => undefined,
+      atomicWrite: async (path, contents) => {
+        events.push(`write:${path}`);
+        await writeFile(path, contents);
+      },
+      readText: async path => {
+        events.push(`read:${path}`);
+        return readFile(path, 'utf8');
+      },
+      disposeMessageByMachine: async data => {
+        events.push(`dispose:${data.id}`);
+        return { ok: true, message: F1 as never };
+      },
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+    };
+    await runInboxReader(base, config);
+    expect(events.findIndex(event => event.includes('read:') && event.endsWith('latest.json'))).toBeLessThan(
+      events.findIndex(event => event.startsWith('dispose:'))
     );
+
+    events.length = 0;
+    currentTime = '2026-09-29T13:00:00Z';
+    await runInboxReader(
+      {
+        ...base,
+        readText: async path => {
+          if (path.endsWith('latest.json')) throw new Error('injected read-back failure');
+          return readFile(path, 'utf8');
+        },
+      },
+      config
+    );
+    expect(events.filter(event => event.startsWith('dispose:'))).toHaveLength(0);
+    expect(await readFile(join(root, 'state.json'), 'utf8')).toContain('2026-09-29T13:00:00.000Z');
+
+    events.length = 0;
+    currentTime = '2026-09-29T14:00:00Z';
+    const writeFailure = await runInboxReader(
+      {
+        ...base,
+        atomicWrite: async (path, contents) => {
+          if (path.endsWith('latest.json')) throw new Error('injected write failure');
+          await writeFile(path, contents);
+        },
+      },
+      config
+    );
+    expect(events.filter(event => event.startsWith('dispose:'))).toHaveLength(0);
+    expect(writeFailure.errors.join()).toContain('digest_write_failed');
+    expect(await readFile(join(root, 'state.json'), 'utf8')).toContain('2026-09-29T14:00:00.000Z');
   });
 
   test('T12 ACTIONABLE never reaches disposeMessageByMachine', async () => {
@@ -145,9 +236,26 @@ describe('inbox reader', () => {
     );
   });
 
-  test('T13 stale alerts are repeat-keyed in state', async () => {
-    const { result } = await harness([{ ...F8, created_at: '2026-09-27T00:00:00.000Z' }]);
-    expect(result.digest?.alerts.map(row => row.kind)).toContain('actionable_stale');
+  test('T13 reader-gap alerts are detected and repeat-suppressed across runs', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'inbox-reader-'));
+    roots.push(root);
+    await mkdir(root, { recursive: true });
+    await writeFile(
+      join(root, 'state.json'),
+      JSON.stringify({ last_run_at: '2026-09-29T00:00:00.000Z' })
+    );
+    const deps: InboxReaderDeps = {
+      root,
+      now: () => new Date('2026-09-29T12:00:00Z'),
+      listMessages: async () => [],
+      registerWorker: async () => undefined,
+      heartbeatWorker: async () => undefined,
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+    };
+    const first = await runInboxReader(deps, resolveInboxReaderConfig({}));
+    const second = await runInboxReader(deps, resolveInboxReaderConfig({}));
+    expect(first.digest?.alerts.map(row => row.kind)).toContain('reader_gap');
+    expect(second.digest?.alerts.map(row => row.kind)).not.toContain('reader_gap');
   });
 
   test('T14 config resolver clamps and floors', () => {
@@ -226,22 +334,57 @@ describe('inbox reader', () => {
     expect(calls).toBe(2);
   });
 
-  test('T20 a full page that cannot advance raises page_not_advancing', async () => {
-    const rows = [F1, F3, F7, F8, F10];
+  test('T20 full-page alerting covers dry-run, all-race enforce, and successful progress', async () => {
+    const rows = [F1, F3, F7, F8, F10].map(row => ({ ...row, recipient: 'xo' as const }));
     const root = await mkdtemp(join(tmpdir(), 'inbox-reader-'));
     roots.push(root);
-    const config = { ...resolveInboxReaderConfig({}), maxPerRun: 5 };
-    const result = await runInboxReader(
+    const run = (mode: 'dry-run' | 'enforce', outcome: 'race' | 'success') =>
+      runInboxReader(
+        {
+          root,
+          now: () => new Date('2026-09-29T12:00:00Z'),
+          listMessages: async () => rows,
+          registerWorker: async () => undefined,
+          heartbeatWorker: async () => undefined,
+          disposeMessageByMachine: async data =>
+            outcome === 'race'
+              ? { ok: false, reason: 'receipt_present' }
+              : { ok: true, message: { id: data.id } as never },
+          log: { info: () => {}, warn: () => {}, error: () => {} },
+        },
+        {
+          ...resolveInboxReaderConfig({ INBOX_READER_MODE: mode }),
+          maxPerRun: 5,
+          alertRepeatHours: 0,
+        }
+      );
+    const dryRun = await run('dry-run', 'success');
+    const allRace = await run('enforce', 'race');
+    const progress = await run('enforce', 'success');
+    expect(dryRun.digest?.alerts.map(row => row.kind)).toContain('page_not_advancing');
+    expect(allRace.digest?.alerts.map(row => row.kind)).toContain('page_not_advancing');
+    expect(progress.digest?.alerts.map(row => row.kind)).not.toContain('page_not_advancing');
+  });
+
+  test('retention deletes only expired timestamped run files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'inbox-reader-'));
+    roots.push(root);
+    await mkdir(join(root, 'runs'), { recursive: true });
+    await writeFile(join(root, 'runs', '20260901T120000Z-old.json'), '{}');
+    await writeFile(join(root, 'runs', '20260929T110000Z-new.json'), '{}');
+    await runInboxReader(
       {
         root,
         now: () => new Date('2026-09-29T12:00:00Z'),
-        listMessages: async () => rows,
+        listMessages: async () => [],
         registerWorker: async () => undefined,
         heartbeatWorker: async () => undefined,
         log: { info: () => {}, warn: () => {}, error: () => {} },
       },
-      config
+      { ...resolveInboxReaderConfig({}), retentionDays: 14 }
     );
-    expect(result.digest?.alerts.map(row => row.kind)).toContain('page_not_advancing');
+    const runFiles = await readdir(join(root, 'runs'));
+    expect(runFiles).not.toContain('20260901T120000Z-old.json');
+    expect(runFiles).toContain('20260929T110000Z-new.json');
   });
 });

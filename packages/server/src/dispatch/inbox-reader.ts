@@ -498,6 +498,7 @@ export async function runInboxReader(
       last_run_at: started.toISOString(),
       run_file: runRequired ? runFile : null,
     };
+    let disposalAuthorized = true;
     try {
       await writeDigest(digest, root, writer, runRequired);
       const latest = JSON.parse(await read(join(root, 'latest.json'))) as Digest;
@@ -509,12 +510,12 @@ export async function runInboxReader(
           throw new Error('disposal_plan_readback_mismatch');
       }
     } catch (error) {
+      disposalAuthorized = false;
       errors.push(`digest_write_failed:${(error as Error).message}`);
       logger.error({ error }, 'digest_write_failed');
-      return { digest, errors, skipped_race: skippedRace };
     }
     const successes: Record<string, number> = {};
-    if (config.mode === 'enforce') {
+    if (config.mode === 'enforce' && disposalAuthorized) {
       for (const item of plan) {
         const result = await dispose({
           id: item.id,
@@ -533,7 +534,13 @@ export async function runInboxReader(
           skippedRace += 1;
         } else {
           errors.push(`dispose_failed:${item.id}:${result.reason}`);
-          if (result.reason === 'machine_actor_conflict') break;
+          if (result.reason === 'machine_actor_conflict') {
+            logger.error(
+              { id: item.id, reason: result.reason },
+              'machine_actor_conflict'
+            );
+            break;
+          }
         }
       }
     }
@@ -583,7 +590,10 @@ export async function runInboxReader(
     );
     const cutoff = started.getTime() - config.retentionDays * 86_400_000;
     for (const file of await readdir(join(root, 'runs'))) {
-      const parsed = Date.parse(file.slice(0, 15).replace(/(\d{8})T(\d{6})Z/, '$1T$2Z'));
+      const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-/.exec(file);
+      const parsed = match
+        ? Date.parse(`${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`)
+        : Number.NaN;
       if (Number.isFinite(parsed) && parsed < cutoff) await unlink(join(root, 'runs', file));
     }
   } catch (error) {
