@@ -1381,7 +1381,9 @@ interface GraphQLReviewDecisionNode {
 
 /** Why GitHub's aggregate review decision was not usable for a sweep. */
 export type ReviewDecisionUnavailableReason =
-  'graphql_client_absent' | 'graphql_error' | 'graphql_empty_response';
+  | 'graphql_client_absent'
+  | 'graphql_error'
+  | 'graphql_empty_response';
 
 export interface ReviewDecisionLookup {
   /**
