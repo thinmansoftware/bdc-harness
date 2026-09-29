@@ -20,7 +20,7 @@ import type {
   RequiredContextsFailureKind,
 } from './required-contexts.ts';
 import { createDurableAttemptCounterStore } from './required-contexts-store';
-import { reduceToLatestCheckRuns } from '../check-runs-latest.ts';
+import { reduceToLatestCheckRuns } from '../check-runs-latest';
 
 const log = createLogger('overseer/github-real-deps');
 
