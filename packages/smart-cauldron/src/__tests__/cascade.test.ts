@@ -87,7 +87,7 @@ afterAll(async () => {
   await rm(testOutRoot, { recursive: true, force: true });
 });
 
-/** Build base options pointing to the real config (entry defaults to codex).
+/** Build base options pointing to the real config (entry defaults to cursor).
  *
  * Claim lookup and WO locking default to in-memory stubs so tests cannot reach
  * GitHub or the filesystem by omission. Tests can override individual deps. */
@@ -959,8 +959,8 @@ describe('config file smoke tests', () => {
   test('loadRuleset returns ruleset with defaultEntry and rules', () => {
     const ruleset = loadRuleset();
     // v1.1 (2026-07-02): GLM demoted from defaultEntry after repetition-collapse
-    // + fabricated-build incidents; bare CODE now enters at codex.
-    expect(ruleset.defaultEntry).toBe('codex');
+    // + fabricated-build incidents; bare CODE entered at codex until 2026-09-29, when cursor became the default entry (M-20260929h extension).
+    expect(ruleset.defaultEntry).toBe('cursor');
     expect(Array.isArray(ruleset.rules)).toBe(true);
     expect(ruleset.rules.length).toBeGreaterThan(0);
   });

@@ -26,6 +26,20 @@ const HOT_CODEX_COOL_CLAUDE: SeatUsageSnapshot = {
   },
 };
 
+const HOT_CURSOR_COOL_CODEX: SeatUsageSnapshot = {
+  cursor: {
+    limit_source: 'measured',
+    windows: [{ name: 'primary', used_percent: 83 }],
+  },
+  codex: {
+    limit_source: 'measured',
+    windows: [
+      { name: 'primary', used_percent: 11 },
+      { name: 'secondary', used_percent: 40 },
+    ],
+  },
+};
+
 function recordPath(outDir: string, dispatchId: string): string {
   const slug = `dispatch-${createHash('sha256').update(dispatchId).digest('hex').slice(0, 24)}`;
   return join(outDir, slug, 'cascade-record.json');
@@ -76,18 +90,18 @@ describe('cascade headroom', () => {
           dispatchId: movedId,
           token: 'test-token',
           deps: {
-            seatUsage: async () => HOT_CODEX_COOL_CLAUDE,
+            seatUsage: async () => HOT_CURSOR_COOL_CODEX,
           },
         });
-        expect(moved.telemetry.entryTier).toBe('claude');
-        expect(moved.entrySelection?.reason).toBe('seat_over_threshold:codex:83');
-        expect(moved.entrySelection?.entry).toBe('claude');
-        expect(moved.entrySelection?.picked).toBe('codex');
+        expect(moved.telemetry.entryTier).toBe('codex');
+        expect(moved.entrySelection?.reason).toBe('seat_over_threshold:cursor:83');
+        expect(moved.entrySelection?.entry).toBe('codex');
+        expect(moved.entrySelection?.picked).toBe('cursor');
         const movedFile = JSON.parse(
           await readFile(recordPath(outDir, movedId), 'utf8')
         ) as CascadeRunRecord;
-        expect(movedFile.entrySelection?.reason).toBe('seat_over_threshold:codex:83');
-        expect(movedFile.telemetry.entryTier).toBe('claude');
+        expect(movedFile.entrySelection?.reason).toBe('seat_over_threshold:cursor:83');
+        expect(movedFile.telemetry.entryTier).toBe('codex');
 
         const pinnedId = 'headroom-dry-pinned';
         const pinned = await runCascade({
@@ -135,7 +149,7 @@ describe('cascade headroom', () => {
             },
           },
         });
-        expect(rejected.telemetry.entryTier).toBe('codex');
+        expect(rejected.telemetry.entryTier).toBe('cursor');
         expect(rejected.entrySelection?.reason).toBe('seat_usage_unavailable');
 
         const started = Date.now();
@@ -152,7 +166,7 @@ describe('cascade headroom', () => {
           },
         });
         expect(Date.now() - started).toBeLessThan(8000);
-        expect(timedOut.telemetry.entryTier).toBe('codex');
+        expect(timedOut.telemetry.entryTier).toBe('cursor');
         expect(timedOut.entrySelection?.reason).toBe('seat_usage_unavailable');
 
         const absent = await runCascade({
@@ -164,7 +178,7 @@ describe('cascade headroom', () => {
           dispatchId: 'headroom-absent',
           token: 'test-token',
         });
-        expect(absent.telemetry.entryTier).toBe('codex');
+        expect(absent.telemetry.entryTier).toBe('cursor');
         expect(absent.entrySelection).toBeUndefined();
       });
     } finally {
