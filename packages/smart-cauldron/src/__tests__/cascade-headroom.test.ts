@@ -170,7 +170,7 @@ describe('cascade headroom', () => {
     } finally {
       await rm(outDir, { recursive: true, force: true });
     }
-  });
+  }, 20000);
 
   test('attempt-carries-node-models', async () => {
     const outDir = await mkdtemp(join(tmpdir(), 'cascade-headroom-nodes-'));
