@@ -1,11 +1,11 @@
 /**
- * Reduce a head's raw check-runs to the newest run per check NAME.
+ * Reduce a head's raw check-runs to the newest run per check NAME + PRODUCER.
  *
  * GitHub's `checks.listForRef` returns EVERY run at a head, including older
  * runs of a check that has since been re-run. Counting them all lets a stale
  * failure block a PR whose check later passed (or vice versa: a stale success
- * hide a real regression). This module groups the runs by trimmed name and, per
- * name, keeps only the current run:
+ * hide a real regression). This module groups the runs by trimmed name and producer
+ * (App + workflow run) and, per group, keeps only the current run:
  *
  * - the newest COMPLETED run, ordered by run creation identity (`id`, higher =
  *   newer). Completion time is deliberately NOT used: an older run that
@@ -32,6 +32,10 @@ export interface LatestCheckRun {
   id?: number;
   started_at?: string | null;
   completed_at?: string | null;
+  /** Producing GitHub App (Actions is one app shared by every workflow). */
+  app?: { id?: number | null; slug?: string | null } | null;
+  /** For Actions runs the URL embeds the workflow run id (`/actions/runs/<id>`). */
+  details_url?: string | null;
 }
 
 /** A superseded (older) run, tagged with the id of the run that replaced it. */
@@ -43,6 +47,19 @@ export interface SupersededCheckRun extends LatestCheckRun {
 export interface ReducedCheckRuns {
   current: LatestCheckRun[];
   superseded: SupersededCheckRun[];
+}
+
+/**
+ * Producer identity of a run: producing App plus, for Actions, the workflow run
+ * id. Two same-name runs with different producers are independent checks, not
+ * reruns of each other, so they must never supersede one another (a success
+ * from workflow B cannot hide a failure from workflow A). Runs with no producer
+ * metadata (legacy stub shape) all share the empty producer.
+ */
+function producerKey(run: LatestCheckRun): string {
+  const app = run.app?.id ?? run.app?.slug ?? '';
+  const wf = /\/actions\/runs\/(\d+)/.exec(run.details_url ?? '')?.[1] ?? '';
+  return `${app}|${wf}`;
 }
 
 type IdentifiedCheckRun = LatestCheckRun & { id: number };
@@ -72,7 +89,7 @@ function isNewerCompleted(run: IdentifiedCheckRun, best: IdentifiedCheckRun): bo
 export function reduceToLatestCheckRuns(runs: LatestCheckRun[]): ReducedCheckRuns {
   const groups = new Map<string, LatestCheckRun[]>();
   for (const run of runs) {
-    const key = (run.name ?? '').trim();
+    const key = `${(run.name ?? '').trim()}#${producerKey(run)}`;
     const existing = groups.get(key);
     if (existing) {
       existing.push(run);

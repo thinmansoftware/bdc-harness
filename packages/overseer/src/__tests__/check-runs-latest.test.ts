@@ -242,3 +242,55 @@ describe('reduceToLatestCheckRuns', () => {
     expect(promoGate?.conclusion).toBe('success');
   });
 });
+
+describe('reduceToLatestCheckRuns producer identity', () => {
+  test('independent same-name success from another workflow cannot suppress a failure', () => {
+    const runs: LatestCheckRun[] = [
+      {
+        id: 10,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'failure',
+        app: { id: 15368 },
+        details_url: 'https://github.com/o/r/actions/runs/111/job/1',
+      },
+      {
+        id: 11,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'success',
+        app: { id: 15368 },
+        details_url: 'https://github.com/o/r/actions/runs/222/job/2',
+      },
+    ];
+    const { current, superseded } = reduceToLatestCheckRuns(runs);
+    expect(current.map(r => r.conclusion).sort()).toEqual(['failure', 'success']);
+    expect(superseded).toEqual([]);
+  });
+
+  test('same-name success from a different App cannot suppress a failure', () => {
+    const runs: LatestCheckRun[] = [
+      { id: 10, name: 'ci', status: 'completed', conclusion: 'failure', app: { id: 1 } },
+      { id: 11, name: 'ci', status: 'completed', conclusion: 'success', app: { id: 2 } },
+    ];
+    const { current, superseded } = reduceToLatestCheckRuns(runs);
+    expect(current).toHaveLength(2);
+    expect(superseded).toHaveLength(0);
+  });
+
+  test('rerun by the same producer still supersedes the older run', () => {
+    const base = {
+      name: 'test',
+      status: 'completed',
+      app: { id: 15368 },
+      details_url: 'https://github.com/o/r/actions/runs/111/job/1',
+    };
+    const runs: LatestCheckRun[] = [
+      { ...base, id: 10, conclusion: 'failure' },
+      { ...base, id: 12, conclusion: 'success' },
+    ];
+    const { current, superseded } = reduceToLatestCheckRuns(runs);
+    expect(current.map(r => r.id)).toEqual([12]);
+    expect(superseded.map(r => r.id)).toEqual([10]);
+  });
+});

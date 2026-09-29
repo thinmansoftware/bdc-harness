@@ -268,6 +268,8 @@ export interface RealGitHubOctokitLike {
           id?: number;
           started_at?: string | null;
           completed_at?: string | null;
+          app?: { id?: number | null; slug?: string | null } | null;
+          details_url?: string | null;
         }[];
       };
     }>;
