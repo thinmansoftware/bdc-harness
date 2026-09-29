@@ -60,9 +60,12 @@ $watchdogArguments = @(
 
 if ($PSCmdlet.ShouldProcess($WatchdogTaskName, 'Register repeating dispatch worker watchdog task')) {
     $watchdogAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $watchdogArguments
-    # -Once anchored to now, then repeating every 5 minutes for the maximum
-    # duration -- effectively an indefinite 5-minute heartbeat check.
-    $watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::MaxValue)
+    # -Once anchored to now, repeating every 5 minutes indefinitely. The cmdlet
+    # requires a duration alongside an interval, and the TimeSpan max duration is
+    # rejected by modern Task Scheduler. Build with a finite duration, then clear
+    # Repetition.Duration so the repetition pattern has no end (indefinite).
+    $watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 1)
+    $watchdogTrigger.Repetition.Duration = ''
     $watchdogSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
     $watchdogPrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $WatchdogTaskName -Action $watchdogAction -Trigger $watchdogTrigger -Settings $watchdogSettings -Principal $watchdogPrincipal -Force | Out-Null

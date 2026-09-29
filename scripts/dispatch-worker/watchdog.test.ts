@@ -87,6 +87,9 @@ describe('dispatch worker watchdog', () => {
     // A -Once trigger with a 5-minute repetition interval (not logon-gated).
     expect(ps1).toContain('New-ScheduledTaskTrigger -Once');
     expect(ps1).toContain('RepetitionInterval');
+    // MaxValue duration is rejected by modern Task Scheduler; repetition must be indefinite.
+    expect(ps1).not.toContain('MaxValue');
+    expect(ps1).toContain("Repetition.Duration = ''");
     expect(ps1).toMatch(/New-TimeSpan -Minutes 5/);
     // The original worker task's AtLogOn trigger is still present.
     expect(ps1).toContain('-AtLogOn');
