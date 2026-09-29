@@ -801,6 +801,15 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       });
       attempt.runId = fireResult.runId;
 
+      if (fireResult.drainRefused) {
+        attempt.outcome = 'drain-deferred';
+        attempt.infraErrorReason = fireResult.infraError;
+        attempt.completedAt = new Date().toISOString();
+        status = 'drain-deferred';
+        await checkpoint();
+        break;
+      }
+
       // Infra error: alert + stop (do NOT count as "too hard")
       if (!fireResult.ok) {
         const errorClass = classifyError({

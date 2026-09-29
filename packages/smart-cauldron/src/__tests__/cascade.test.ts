@@ -17,6 +17,7 @@ import { mkdtemp, readFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { runCascade } from '../cascade.js';
+import { statusToExitCode } from '../cli.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult, PollResult, GateVerdict, CascadeRunRecord } from '../types.js';
 import { loadLadder, loadRefusedTiers } from '../ladder.js';
@@ -1333,5 +1334,55 @@ describe('wo claim + single-flight (#1546)', () => {
     expect(record.attempts[0]?.outcome).toBe('refused');
     expect(record.refusalReason?.prNumber).toBe(77);
     expect(record.refusalReason?.checkedAtTier).not.toBeNull();
+  });
+});
+
+describe('drain refusal', () => {
+  test('smart_cauldron_drain_is_deferred_not_infra_alert', async () => {
+    let supervised = 0;
+    let escalated = 0;
+    const drained = await runCascade(
+      baseOpts({
+        deps: {
+          fire: async () => ({
+            ok: false,
+            runId: null,
+            conversationId: null,
+            infraError: 'HTTP 503: {"code":"cauldron_draining"}',
+            drainRefused: true,
+          }),
+          poll: async () => makePollResult(),
+          escalate: async () => {
+            escalated += 1;
+          },
+          superviseFailure: async () => {
+            supervised += 1;
+            return { handled: false, ownerId: null, fencingToken: null, evidenceRefs: [] };
+          },
+          writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+        },
+      })
+    );
+    expect(drained.status).toBe('drain-deferred');
+    expect(drained.attempts[0]?.outcome).toBe('drain-deferred');
+    expect(supervised).toBe(0);
+    expect(escalated).toBe(0);
+    expect(statusToExitCode('drain-deferred')).toBe(11);
+
+    let infraEscalated = 0;
+    const infra = await runCascade(
+      baseOpts({
+        deps: {
+          fire: async () => makeFireError('HTTP 503: service unavailable'),
+          poll: async () => makePollResult(),
+          escalate: async () => {
+            infraEscalated += 1;
+          },
+          writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+        },
+      })
+    );
+    expect(infra.status).toBe('infra-alert');
+    expect(infraEscalated).toBe(1);
   });
 });

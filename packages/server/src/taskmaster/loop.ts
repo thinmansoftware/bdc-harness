@@ -16,6 +16,7 @@
 import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
+import { getCauldronDrainState } from '@archon/core/db/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import {
   assessDispatchRecipient,
@@ -212,6 +213,7 @@ export interface TaskmasterDeps {
   ) => Promise<GithubIssueEvidence | null>;
   checkFireEligibility?: (issueTitle: string) => Promise<FireEligibilityResult>;
   runCascade?: typeof runCascade;
+  getCauldronDrainState?: typeof getCauldronDrainState;
   getFireRunEvidence?: (
     woId: string,
     cascadeId: string
@@ -1679,6 +1681,34 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       continue;
     }
 
+    if (proposal.type === 'fire_cauldron') {
+      const drain = await (deps.getCauldronDrainState ?? getCauldronDrainState)();
+      if (drain.mode === 'draining') {
+        result.deferred += 1;
+        const deferredJson = JSON.stringify({
+          ...proposal,
+          deferred: true,
+          deferred_reason: 'cauldron_draining',
+        });
+        if (!existingAction) {
+          existingAction = await dal.recordAction({
+            thread_ref: proposal.threadRef,
+            action_type: proposal.type,
+            proposal_json: deferredJson,
+            idempotency_key: proposal.idempotencyKey,
+            before_hash: sha256(proposal.body),
+            proof_predicate: proofPredicate(proposal),
+            proof_deadline_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+            outcome: 'deferred',
+          });
+          actionsByKey.set(proposal.idempotencyKey, existingAction);
+        } else {
+          await dal.updateActionOutcome(existingAction.id, 'deferred', deferredJson);
+        }
+        continue;
+      }
+    }
+
     // ROW FIRST, always -- then the effect.
     let journalRow: taskmasterDb.TmJournalEntry;
     if (existingAction && retrying) {
@@ -1825,6 +1855,21 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           );
         });
         const admitted = await admission;
+        if (admitted.status === 'drain-deferred') {
+          result.deferred += 1;
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'deferred',
+            JSON.stringify({
+              ...proposal,
+              deferred: true,
+              deferred_reason: 'cauldron_draining',
+              cascadeId: admitted.cascadeId,
+            })
+          );
+          journalRow.outcome = 'deferred';
+          continue;
+        }
         const registerExpectation =
           dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
         await registerExpectation?.({

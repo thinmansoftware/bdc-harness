@@ -100,9 +100,14 @@ mock.module('@archon/isolation', () => ({
   getIsolationProvider: mock(() => ({})),
 }));
 
+const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1', status: 'pending' }));
+const mockExecuteWorkflow = mock(() =>
+  Promise.resolve({ success: true, summary: '', workflowRunId: 'run-1' })
+);
+
 mock.module('../workflows/store-adapter', () => ({
   createWorkflowDeps: mock(() => ({
-    store: { createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })) },
+    store: { createWorkflowRun: mockCreateWorkflowRun },
     getAgentProvider: () => ({}),
     loadConfig: async () => ({}),
   })),
@@ -120,9 +125,7 @@ mock.module('../services/cleanup-service', () => ({
 }));
 
 mock.module('@archon/workflows/executor', () => ({
-  executeWorkflow: mock(() =>
-    Promise.resolve({ success: true, summary: '', workflowRunId: 'run-1' })
-  ),
+  executeWorkflow: mockExecuteWorkflow,
 }));
 
 // Dynamic imports inside dispatchBackgroundWorkflow (escalation linker).
@@ -134,7 +137,16 @@ mock.module('../escalation', () => ({
     })
   ),
 }));
+class CauldronDrainingError extends Error {
+  readonly code = 'cauldron_draining' as const;
+  constructor() {
+    super('cauldron_draining');
+    this.name = 'CauldronDrainingError';
+  }
+}
+
 mock.module('../db/workflows', () => ({
+  CauldronDrainingError,
   listWorkflowRuns: mock(() => Promise.resolve([])),
   updateWorkflowRun: mock(() => Promise.resolve()),
 }));
@@ -189,6 +201,14 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
       callOrder.push('freeze');
       return Promise.resolve({ frozen: true });
     });
+    mockCreateWorkflowRun.mockReset();
+    mockCreateWorkflowRun.mockImplementation(() =>
+      Promise.resolve({ id: 'run-1', status: 'pending' })
+    );
+    mockExecuteWorkflow.mockReset();
+    mockExecuteWorkflow.mockImplementation(() =>
+      Promise.resolve({ success: true, summary: '', workflowRunId: 'run-1' })
+    );
   });
 
   test('preserves task + fromBranch hints and assigns a unique worker workflowId', async () => {
@@ -353,5 +373,19 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
     expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(0);
     expect(mockUpdateConversation).toHaveBeenCalledTimes(0);
     expect(mockResolve).toHaveBeenCalledTimes(0);
+  });
+
+  test('orchestrator_precreate_does_not_swallow_drain', async () => {
+    mockCreateWorkflowRun.mockImplementation(() => Promise.reject(new CauldronDrainingError()));
+    const ctx = makeCtx();
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toBeInstanceOf(
+      CauldronDrainingError
+    );
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    const sent = (ctx.platform as MockPlatformAdapter).sendMessage.mock.calls
+      .map(call => String(call[1]))
+      .join('\n');
+    expect(sent).toContain('cauldron_draining');
+    expect(sent).toContain('not started');
   });
 });
