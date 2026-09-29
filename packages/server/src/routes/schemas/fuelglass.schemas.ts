@@ -2,7 +2,7 @@
  * Zod schemas for Fuelglass subscription seat usage.
  *
  * GET /api/fuelglass/seats reports measured usage. POST /api/fuelglass/cutoff
- * sets the in-memory entry-gate cutoff. Added by WO-HARNESS-FUELGLASS-SEAT-GATE-01.
+ * persists the operator cutoff until cleared. Added by WO-HARNESS-FUELGLASS-SEAT-GATE-01.
  */
 import { z } from '@hono/zod-openapi';
 
@@ -42,6 +42,8 @@ const seatReadingSchema = z.object({
 const cutoffSchema = z.object({
   percent: z.number(),
   source: z.enum(['operator', 'env', 'default']),
+  set_at: z.string().optional(),
+  set_by: z.string().optional(),
 });
 
 export const fuelglassSeatsResponseSchema = z
@@ -71,6 +73,7 @@ export const fuelglassCutoffBodySchema = z
       .min(1, { message: CUTOFF_RANGE_ERROR })
       .max(95, { message: CUTOFF_RANGE_ERROR })
       .nullable(),
+    reason: z.string().optional(),
   })
   .openapi('FuelglassCutoffBody');
 
