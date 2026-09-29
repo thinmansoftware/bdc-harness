@@ -174,6 +174,39 @@ describe('entry headroom', () => {
     expect(noLaterHeadroom.changed).toBe(false);
     expect(noLaterHeadroom.reason).toBe('no_known_headroom:codex:83');
     expect(noLaterHeadroom.entry).not.toBe('frontier');
+
+    // Audit record keeps every measured seat, including rungs below the pick.
+    const hotClaude = choose({
+      picked: 'claude',
+      usage: {
+        cursor: measured([{ name: 'primary', used_percent: 12 }]),
+        codex: measured([{ name: 'primary', used_percent: 10 }]),
+        claude: measured([{ name: 'seven_day', used_percent: 95 }]),
+      },
+    });
+    expect(hotClaude.entry).toBe('claude');
+    expect(hotClaude.changed).toBe(false);
+    expect(hotClaude.reason).toBe('no_known_headroom:claude:95');
+    expect(hotClaude.seats).toEqual({ cursor: 12, codex: 10, claude: 95 });
+
+    const claudeOnly = choose({
+      picked: 'claude',
+      usage: {
+        claude: measured([{ name: 'seven_day', used_percent: 45 }]),
+      },
+    });
+    expect(claudeOnly.seats).toEqual({ claude: 45 });
+
+    const omittedLater = choose({
+      picked: 'codex',
+      usage: {
+        cursor: measured([{ name: 'primary', used_percent: 12 }]),
+        codex: measured([{ name: 'primary', used_percent: 40 }]),
+      },
+    });
+    expect(omittedLater.entry).toBe('codex');
+    expect(omittedLater.reason).toBe('seat_ok:codex:40');
+    expect(omittedLater.seats).toEqual({ cursor: 12, codex: 40, claude: 'UNKNOWN' });
   });
 
   test('threshold-env-parsing', () => {
@@ -298,40 +331,6 @@ describe('entry headroom', () => {
       expect(triple.declared).not.toBe('');
       expect(triple.served).not.toBe('');
     }
-  });
-
-  test('audit-record-includes-measured-seats-below-the-pick', () => {
-    const hotClaude = choose({
-      picked: 'claude',
-      usage: {
-        cursor: measured([{ name: 'primary', used_percent: 12 }]),
-        codex: measured([{ name: 'primary', used_percent: 10 }]),
-        claude: measured([{ name: 'seven_day', used_percent: 95 }]),
-      },
-    });
-    expect(hotClaude.entry).toBe('claude');
-    expect(hotClaude.changed).toBe(false);
-    expect(hotClaude.reason).toBe('no_known_headroom:claude:95');
-    expect(hotClaude.seats).toEqual({ cursor: 12, codex: 10, claude: 95 });
-
-    const claudeOnly = choose({
-      picked: 'claude',
-      usage: {
-        claude: measured([{ name: 'seven_day', used_percent: 45 }]),
-      },
-    });
-    expect(claudeOnly.seats).toEqual({ claude: 45 });
-
-    const omittedLater = choose({
-      picked: 'codex',
-      usage: {
-        cursor: measured([{ name: 'primary', used_percent: 12 }]),
-        codex: measured([{ name: 'primary', used_percent: 40 }]),
-      },
-    });
-    expect(omittedLater.entry).toBe('codex');
-    expect(omittedLater.reason).toBe('seat_ok:codex:40');
-    expect(omittedLater.seats).toEqual({ cursor: 12, codex: 40, claude: 'UNKNOWN' });
   });
 
   test('unknown-destination-seat-is-never-a-promotion-target', () => {
