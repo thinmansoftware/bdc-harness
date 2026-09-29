@@ -2527,6 +2527,15 @@ export class SqliteAdapter implements IDatabase {
         lease_expires_at TEXT NOT NULL,
         posted_at TEXT
       );
+
+      -- operator settings (migration 059).
+      CREATE TABLE IF NOT EXISTS operator_settings (
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL,
+        reason TEXT
+      );
     `);
     getLog().info('db.sqlite_schema_initialized');
   }

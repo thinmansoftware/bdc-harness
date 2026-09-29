@@ -1,16 +1,25 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, readFile, writeFile } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { CreateAuthenticatedMessageData } from '@archon/core/db/dispatch';
+import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
+import {
+  clearOperatorSetting,
+  getOperatorSetting,
+  setOperatorSetting,
+} from '@archon/core/db/operator-settings';
 import {
   alertUnknownSeat,
   decideSeatGate,
   DEFAULT_SEAT_CUTOFF_PERCENT,
+  FUELGLASS_SEAT_CUTOFF_SETTING_KEY,
   getSeatCutoff,
+  loadPersistedSeatCutoff,
   readAllSeats,
   readSeat,
   resetSeatUsageCacheForTests,
+  restoreSeatCutoffOverride,
   seatsForBindings,
   setSeatAlertSendForTests,
   setSeatCutoffOverride,
@@ -648,6 +657,116 @@ describe('seat usage', () => {
     const decision = decideSeatGate([{ providerId: 'codex' }], { codex }, 100);
     expect(decision.refused).toBe(true);
     if (decision.refused) expect(decision.seat).toBe('codex');
+  });
+
+  test('restore-failure-does-not-block-boot', async () => {
+    try {
+      await restoreSeatCutoffOverride(async () => {
+        throw new Error('db down');
+      });
+      throw new Error('restore must reject when the loader throws');
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe('db down');
+      logs.push({ obj: { err: error }, msg: 'fuelglass.seat_cutoff_restore_failed' });
+    }
+    expect(logs.filter(entry => entry.msg === 'fuelglass.seat_cutoff_restore_failed')).toHaveLength(
+      1
+    );
+    expect(getSeatCutoff()).toEqual({ percent: 90, source: 'default' });
+  });
+});
+
+describe('persisted operator cutoff', () => {
+  let home = '';
+  const oldArchonHome = process.env.ARCHON_HOME;
+  const oldDatabaseUrl = process.env.DATABASE_URL;
+
+  function installLogSpy(): void {
+    logs = [];
+    setSeatUsageLogForTests((obj, msg) => {
+      logs.push({ obj, msg });
+    });
+  }
+
+  beforeEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    home = await mkdtemp(join(tmpdir(), 'seat-cutoff-'));
+    process.env.ARCHON_HOME = home;
+    delete process.env.DATABASE_URL;
+    delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
+    getDatabase();
+    installLogSpy();
+  });
+
+  afterEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    if (home) await rm(home, { recursive: true, force: true });
+    if (oldArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = oldArchonHome;
+    if (oldDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = oldDatabaseUrl;
+    delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
+  });
+
+  async function writeRawCutoff(value: string): Promise<void> {
+    await getDatabase().query(
+      `INSERT INTO operator_settings (setting_key, setting_value, updated_at, updated_by, reason)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (setting_key) DO UPDATE SET
+         setting_value = excluded.setting_value,
+         updated_at = excluded.updated_at,
+         updated_by = excluded.updated_by,
+         reason = excluded.reason`,
+      [FUELGLASS_SEAT_CUTOFF_SETTING_KEY, value, new Date().toISOString(), 'operator-token', null]
+    );
+  }
+
+  test('override-survives-restart', async () => {
+    await setOperatorSetting(
+      FUELGLASS_SEAT_CUTOFF_SETTING_KEY,
+      '95',
+      'operator-token',
+      'quota fix'
+    );
+    const stored = await getDatabase().query<{ setting_value: string }>(
+      'SELECT setting_value FROM operator_settings WHERE setting_key = $1',
+      [FUELGLASS_SEAT_CUTOFF_SETTING_KEY]
+    );
+    expect(stored.rows[0]?.setting_value).toBe('95');
+    resetSeatUsageCacheForTests();
+    installLogSpy();
+    await restoreSeatCutoffOverride(loadPersistedSeatCutoff);
+    expect(getSeatCutoff()).toEqual({ percent: 95, source: 'operator' });
+    const restored = logs.filter(entry => entry.msg === 'fuelglass.seat_cutoff_override_restored');
+    expect(restored).toHaveLength(1);
+    expect(restored[0]?.obj.percent).toBe(95);
+    expect(typeof restored[0]?.obj.setAt).toBe('string');
+  });
+
+  test('clear-is-durable', async () => {
+    await setOperatorSetting(FUELGLASS_SEAT_CUTOFF_SETTING_KEY, '95', 'operator-token', null);
+    await clearOperatorSetting(FUELGLASS_SEAT_CUTOFF_SETTING_KEY);
+    resetSeatUsageCacheForTests();
+    installLogSpy();
+    await restoreSeatCutoffOverride(loadPersistedSeatCutoff);
+    expect(await getOperatorSetting(FUELGLASS_SEAT_CUTOFF_SETTING_KEY)).toBeNull();
+    expect(getSeatCutoff().source).not.toBe('operator');
+    expect(getSeatCutoff()).toEqual({ percent: 90, source: 'default' });
+  });
+
+  test('invalid-persisted-value-is-ignored', async () => {
+    for (const raw of ['96', '0', 'abc']) {
+      await writeRawCutoff(raw);
+      resetSeatUsageCacheForTests();
+      installLogSpy();
+      await expect(restoreSeatCutoffOverride(loadPersistedSeatCutoff)).resolves.toBeUndefined();
+      expect(getSeatCutoff()).toEqual({ percent: 90, source: 'default' });
+      const invalid = logs.filter(entry => entry.msg === 'fuelglass.seat_cutoff_persisted_invalid');
+      expect(invalid).toHaveLength(1);
+    }
   });
 });
 

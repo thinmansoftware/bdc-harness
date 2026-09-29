@@ -30,6 +30,7 @@ import {
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
+import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import {
   readCascadeRecordById,
   claimFrontierResolution,
@@ -62,12 +63,18 @@ import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
 import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
 import {
+  FUELGLASS_SEAT_CUTOFF_SETTING_KEY,
   getSeatCutoff,
   isValidSeatCutoff,
   readAllSeats,
   SEAT_CUTOFF_OUT_OF_RANGE,
   setSeatCutoffOverride,
 } from '@archon/workflows/reliability/seat-usage';
+import {
+  clearOperatorSetting,
+  getOperatorSetting,
+  setOperatorSetting,
+} from '@archon/core/db/operator-settings';
 import { resolveWorkflowProbeBindings } from '@archon/workflows/reliability/resolve-binding';
 import type { ModelOverride } from '@archon/workflows/model-override';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
@@ -5928,7 +5935,10 @@ export function registerApiRoutes(
           token: c.req.header('x-archon-operator-token') ?? process.env.ARCHON_OPERATOR_TOKEN ?? '',
         };
         if (cascadeOptions.dryRun) {
-          const record = await runCascade(cascadeOptions);
+          const record = await runCascade({
+            ...cascadeOptions,
+            deps: { seatUsage: conductorSeatUsage },
+          });
           return c.json({
             accepted: true,
             status: record.status,
@@ -5955,6 +5965,7 @@ export function registerApiRoutes(
               );
               if (!check.valid) throw new Error(check.error);
             },
+            seatUsage: conductorSeatUsage,
           },
           onAdmission: record => resolveAdmission?.(record),
         });
@@ -6390,10 +6401,28 @@ export function registerApiRoutes(
   registerOpenApiRoute(getFuelglassSeatsRoute, async c => {
     try {
       const seats = await readAllSeats();
+      const cutoff = getSeatCutoff();
+      let cutoffResponse: {
+        percent: number;
+        source: 'operator' | 'env' | 'default';
+        set_at?: string;
+        set_by?: string;
+      } = cutoff;
+      if (cutoff.source === 'operator') {
+        const row = await getOperatorSetting(FUELGLASS_SEAT_CUTOFF_SETTING_KEY);
+        if (row) {
+          cutoffResponse = {
+            percent: cutoff.percent,
+            source: cutoff.source,
+            set_at: row.updated_at,
+            set_by: row.updated_by,
+          };
+        }
+      }
       return c.json({
         success: true,
         generated_at: new Date().toISOString(),
-        cutoff: getSeatCutoff(),
+        cutoff: cutoffResponse,
         // The gate has no off switch (John Ranson, 2026-09-24).
         gate_enabled: true,
         seats,
@@ -6409,6 +6438,16 @@ export function registerApiRoutes(
       const body = getValidatedBody(c, fuelglassCutoffBodySchema);
       if (body.percent !== null && !isValidSeatCutoff(body.percent)) {
         return apiError(c, 400, `${SEAT_CUTOFF_OUT_OF_RANGE}: percent must be between 1 and 95`);
+      }
+      if (body.percent === null) {
+        await clearOperatorSetting(FUELGLASS_SEAT_CUTOFF_SETTING_KEY);
+      } else {
+        await setOperatorSetting(
+          FUELGLASS_SEAT_CUTOFF_SETTING_KEY,
+          String(body.percent),
+          'operator-token',
+          body.reason ?? null
+        );
       }
       setSeatCutoffOverride(body.percent);
       return c.json({ success: true, cutoff: getSeatCutoff() });
