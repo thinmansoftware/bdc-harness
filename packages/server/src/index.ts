@@ -75,6 +75,10 @@ import {
   reconcilePendingRunsAtBoot,
   reconcileRunningRunsAtBoot,
 } from './startup-reconciliation';
+import {
+  loadPersistedSeatCutoff,
+  restoreSeatCutoffOverride,
+} from '@archon/workflows/reliability/seat-usage';
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import { createMergeManager } from '@archon/overseer/merge-manager';
 import { resolveDefaultDeps } from '@archon/overseer/service';
@@ -256,6 +260,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   } catch (error) {
     getLog().fatal({ err: error }, 'database_connection_failed');
     process.exit(1);
+  }
+
+  try {
+    await restoreSeatCutoffOverride(loadPersistedSeatCutoff);
+  } catch (error) {
+    getLog().warn({ err: error }, 'fuelglass.seat_cutoff_restore_failed');
   }
 
   const startupReconciliationAt = new Date().toISOString();
