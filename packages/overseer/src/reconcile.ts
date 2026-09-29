@@ -9,6 +9,7 @@ const log: ReconcileLogger = {
 
 export const RECONCILE_ACTION = 'reconcile_close';
 export const RECONCILE_SKIP_ACTION = 'reconcile_skip_noted';
+export const RECONCILE_HOLD_OPEN_ACTION = 'reconcile_hold_open_noted';
 export const WO_STEM_PATTERN = /\bWO-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]{2}\b/g;
 /**
  * `Reconcile-Skip: <WO-ID>[, <WO-ID> ...]` on a line of its own. The keyword
@@ -41,6 +42,11 @@ export interface ReconcileMergedPullRequest {
   mergeCommitSha?: string | null;
   mergedAt?: string | null;
 }
+
+export type ReconcileOpenPullRequest = Pick<
+  ReconcileMergedPullRequest,
+  'owner' | 'repo' | 'number' | 'title' | 'body' | 'htmlUrl'
+>;
 
 export interface ReconcileTrackerIssue {
   owner: string;
@@ -93,18 +99,38 @@ export interface ReconcileDeps {
    * predates this guard still works.
    */
   listPullRequestFiles?: (pr: ReconcileMergedPullRequest) => Promise<string[]>;
+  /**
+   * Open pull requests that may still reference this tracker. When one of them
+   * holds the WO, reconcile leaves the tracker open. Optional: when absent,
+   * reconcile falls back to prior behavior rather than blocking, so a deps
+   * object that predates this guard still works.
+   */
+  listOpenPullRequestsReferencingTracker?: (input: {
+    issue: ReconcileTrackerIssue;
+    stem: string;
+  }) => Promise<ReconcileOpenPullRequest[]>;
+  /**
+   * True when this merged PR has already posted the hold-open note for this WO
+   * (an action=reconcile_hold_open_noted row exists for prRef+woId). Optional
+   * for deps objects that predate the guard; the default reads
+   * overseer_reconcile_actions.
+   */
+  hasHoldBeenNoted?: (input: { prRef: string; woId: string }) => Promise<boolean>;
   now?: () => Date;
   log?: ReconcileLogger;
 }
 
-interface OctokitLike {
+export interface OctokitLike {
   search: {
     issuesAndPullRequests(input: Record<string, unknown>): Promise<{
       data: {
+        total_count?: number;
+        incomplete_results?: boolean;
         items: {
           number: number;
           title: string;
           body?: string | null;
+          html_url?: string;
           state: string;
           pull_request?: unknown;
           repository_url?: string;
@@ -285,6 +311,58 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
         }
       }
 
+      // OPEN-PR GUARD. A two-stage WO shares one stem across PRs. Closing the
+      // tracker when the first stage merges leaves later stages (still open,
+      // sometimes with changes requested) looking done. Anchor: bdc-harness
+      // #1051 -- shopops#760 merged and closed bdc-xo#2581 while #762 and #763
+      // were still open.
+      const listOpen = deps.listOpenPullRequestsReferencingTracker;
+      if (listOpen) {
+        let openPullRequests: ReconcileOpenPullRequest[];
+        try {
+          openPullRequests = await listOpen({ issue: tracker, stem });
+        } catch (error) {
+          // Fail OPEN on a lookup error: leave the tracker alone rather than
+          // closing on unverified evidence.
+          logger.warn(
+            { err: error as Error, prRef, stem },
+            'overseer.reconcile.open_pr_lookup_failed_leaving_tracker_open'
+          );
+          continue;
+        }
+        const holders = openPullRequestsHoldingTracker({
+          stem,
+          mergedPr: pr,
+          tracker,
+          openPullRequests,
+        });
+        if (holders.length > 0) {
+          const alreadyNoted = await (deps.hasHoldBeenNoted ?? hasDefaultHoldBeenNoted)({
+            prRef,
+            woId: stem,
+          });
+          if (alreadyNoted) {
+            logger.warn(
+              { prRef, stem, tracker: tracker.number },
+              'overseer.reconcile.open_prs_hold_tracker_open'
+            );
+            continue;
+          }
+          await deps.addTrackerEvidenceComment({
+            issue: tracker,
+            body: buildHoldOpenComment({ pr, stem, holders }),
+          });
+          await (deps.insertAction ?? insertDefaultOverseerAction)({
+            prRef,
+            woId: stem,
+            class: 'tracker_reconcile',
+            action: RECONCILE_HOLD_OPEN_ACTION,
+            result: `${pr.htmlUrl}:${pr.mergeCommitSha ?? 'merge_sha_unknown'}`,
+          });
+          continue;
+        }
+      }
+
       await deps.addTrackerEvidenceComment({
         issue: tracker,
         body: buildEvidenceComment({ pr, stem }),
@@ -410,6 +488,71 @@ export function classifyPullRequestStems(
   };
 }
 
+/**
+ * Open PRs that still count as unfinished work for this tracker.
+ * The just-merged PR is never a holder. A candidate holds the tracker when
+ * classifyPullRequestStems evidence contains the stem, or when a body line
+ * uses Closes/Fixes/Resolves and the exact owner/repo#number token.
+ */
+export function openPullRequestsHoldingTracker(input: {
+  stem: string;
+  mergedPr: Pick<ReconcileMergedPullRequest, 'owner' | 'repo' | 'number'>;
+  tracker: Pick<ReconcileTrackerIssue, 'owner' | 'repo' | 'number'>;
+  openPullRequests: readonly ReconcileOpenPullRequest[];
+}): ReconcileOpenPullRequest[] {
+  const token = `${input.tracker.owner}/${input.tracker.repo}#${input.tracker.number}`;
+  const holders: ReconcileOpenPullRequest[] = [];
+  for (const candidate of input.openPullRequests) {
+    if (
+      candidate.owner === input.mergedPr.owner &&
+      candidate.repo === input.mergedPr.repo &&
+      candidate.number === input.mergedPr.number
+    ) {
+      continue;
+    }
+    const evidence = classifyPullRequestStems({
+      title: candidate.title,
+      body: candidate.body,
+    }).evidence;
+    if (evidence.includes(input.stem) || bodyClosesTracker(candidate.body ?? '', token)) {
+      holders.push(candidate);
+    }
+  }
+  return holders;
+}
+
+function bodyClosesTracker(body: string, token: string): boolean {
+  for (const rawLine of body.split('\n')) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line.length > RECONCILE_LINE_MAX) continue;
+    if (lineClosesTracker(line, token)) return true;
+  }
+  return false;
+}
+
+function lineClosesTracker(line: string, token: string): boolean {
+  // Non-global so lastIndex cannot leak across lines.
+  const match = /\b(?:closes|fixes|resolves)\b/i.exec(line);
+  if (!match || token.length === 0) return false;
+  const rest = line.slice(match.index + match[0].length);
+  let from = 0;
+  while (from <= rest.length) {
+    const index = rest.indexOf(token, from);
+    if (index < 0) return false;
+    const at = match.index + match[0].length + index;
+    const prev = at === 0 ? '' : line.charAt(at - 1);
+    const next = line.charAt(at + token.length);
+    // Leading boundary so evilthinmansoftware/bdc-xo#1044 does not match
+    // thinmansoftware/bdc-xo#1044. Trailing boundary so #1044 does not match
+    // the prefix of #10440.
+    const leadingOk = prev === '' || /[^A-Za-z0-9_]/.test(prev);
+    const trailingOk = next === '' || /[^A-Za-z0-9_]/.test(next);
+    if (leadingOk && trailingOk) return true;
+    from = index + 1;
+  }
+  return false;
+}
+
 export function buildEvidenceComment(input: {
   pr: ReconcileMergedPullRequest;
   stem: string;
@@ -421,6 +564,22 @@ export function buildEvidenceComment(input: {
     `Repository: ${input.pr.owner}/${input.pr.repo}`,
     `Merge SHA: ${input.pr.mergeCommitSha ?? 'unknown'}`,
   ].join('\n');
+}
+
+export function buildHoldOpenComment(input: {
+  pr: ReconcileMergedPullRequest;
+  stem: string;
+  holders: readonly ReconcileOpenPullRequest[];
+}): string {
+  const lines = [
+    `Overseer reconcile: stage merged, ${input.holders.length} PRs still open for ${input.stem}.`,
+    '',
+    `Merged PR: ${input.pr.htmlUrl}`,
+    '',
+    'Still open:',
+    ...input.holders.map(h => `- ${h.owner}/${h.repo}#${h.number} ${h.htmlUrl}`),
+  ];
+  return lines.join('\n');
 }
 
 export async function readReconcileCursorFromActions(): Promise<string | null> {
@@ -459,6 +618,15 @@ async function hasDefaultCloseBeenRecorded(input: {
   });
 }
 
+async function hasDefaultHoldBeenNoted(input: { prRef: string; woId: string }): Promise<boolean> {
+  const { hasReconcileActionForPr } = await import('@archon/core/db/overseer');
+  return hasReconcileActionForPr({
+    prRef: input.prRef,
+    woId: input.woId,
+    action: RECONCILE_HOLD_OPEN_ACTION,
+  });
+}
+
 export function createDefaultReconcileDeps(): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   if (!token) {
@@ -490,6 +658,8 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     readCursor: readReconcileCursorFromActions,
     searchMergedPullRequests: async input => searchMergedPullRequests(await getOctokit(), input),
     findTrackerIssueByStem: async stem => findTrackerIssueByStem(await getOctokit(), stem),
+    listOpenPullRequestsReferencingTracker: async input =>
+      searchOpenPullRequestsReferencingTracker(await getOctokit(), input),
     listPullRequestFiles: async (pr): Promise<string[]> => {
       const client = await getOctokit();
       // per_page 100: a spec-only PR is 1-2 files, so the first page is always
@@ -533,6 +703,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     },
     hasSkipBeenNoted: hasDefaultSkipBeenNoted,
     hasCloseBeenRecorded: hasDefaultCloseBeenRecorded,
+    hasHoldBeenNoted: hasDefaultHoldBeenNoted,
     insertAction: insertDefaultOverseerAction,
     log,
   };
@@ -586,6 +757,69 @@ async function searchMergedPullRequests(
         mergeCommitSha: pr.data.merge_commit_sha,
         mergedAt: pr.data.merged_at,
       });
+    }
+  }
+
+  return [...results.values()];
+}
+
+// GitHub search returns at most 1000 results per query.
+const OPEN_PR_SEARCH_PAGE_SIZE = 100;
+const OPEN_PR_SEARCH_MAX_PAGES = 10;
+
+export async function searchOpenPullRequestsReferencingTracker(
+  octokit: OctokitLike,
+  input: { issue: ReconcileTrackerIssue; stem: string }
+): Promise<ReconcileOpenPullRequest[]> {
+  const issueRef = `${input.issue.owner}/${input.issue.repo}#${input.issue.number}`;
+  const queries = [
+    `org:${DEFAULT_ORG} is:pr is:open ${input.stem}`,
+    `org:${DEFAULT_ORG} is:pr is:open ${issueRef}`,
+  ];
+  const results = new Map<string, ReconcileOpenPullRequest>();
+
+  for (const q of queries) {
+    // Paginate to exhaustion. If completeness cannot be established, throw so the
+    // caller leaves the tracker open (a missed holder would close it prematurely).
+    let retrieved = 0;
+    for (let page = 1; ; page++) {
+      if (page > OPEN_PR_SEARCH_MAX_PAGES) {
+        throw new Error(`open PR search exceeds retrievable results for query: ${q}`);
+      }
+      const search = await octokit.search.issuesAndPullRequests({
+        q,
+        per_page: OPEN_PR_SEARCH_PAGE_SIZE,
+        page,
+      });
+      if (search.data.incomplete_results) {
+        throw new Error(`open PR search returned incomplete results for query: ${q}`);
+      }
+      const items = search.data.items;
+      retrieved += items.length;
+      for (const item of items) {
+        if (!item.pull_request || item.state !== 'open') continue;
+        const repo = parseRepositoryFromUrl(item.repository_url);
+        if (!repo) continue;
+        const key = `${repo.owner}/${repo.repo}#${item.number}`;
+        if (results.has(key)) continue;
+        results.set(key, {
+          owner: repo.owner,
+          repo: repo.repo,
+          number: item.number,
+          title: item.title,
+          body: item.body,
+          htmlUrl:
+            item.html_url ?? `https://github.com/${repo.owner}/${repo.repo}/pull/${item.number}`,
+        });
+      }
+      const total = search.data.total_count;
+      if (items.length < OPEN_PR_SEARCH_PAGE_SIZE) {
+        if (total !== undefined && retrieved < total) {
+          throw new Error(`open PR search short page before total_count for query: ${q}`);
+        }
+        break;
+      }
+      if (total !== undefined && retrieved >= total) break;
     }
   }
 
