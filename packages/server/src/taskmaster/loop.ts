@@ -17,6 +17,7 @@ import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
 import { runCascade } from '@archon/smart-cauldron/cascade';
+import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldron/headroom';
 import {
   assessDispatchRecipient,
   createAuthenticatedMessage,
@@ -52,6 +53,7 @@ import {
 import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
+import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import { fireBackoffDecision } from './backoff';
 import { checkExpectations } from './expectations';
 import {
@@ -1279,7 +1281,26 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.lane_health_read_failed');
   }
-  const laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+  let laneDecision: ReturnType<typeof decideFireLane>;
+  try {
+    const seatUsage = await conductorSeatUsage();
+    const thresholdPercent = resolveEntryThreshold(process.env);
+    const overThreshold: Partial<Record<'claude' | 'codex', boolean>> = {};
+    for (const lane of ['claude', 'codex'] as const) {
+      const used = bindingUsedPercent(seatUsage[lane]);
+      if (typeof used === 'number' && used >= thresholdPercent) overThreshold[lane] = true;
+    }
+    laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth }, overThreshold);
+    // The routing threshold only steers between lanes; it must never hold a fire that the
+    // unfiltered decision would dispatch (seats below the run-start cutoff stay usable).
+    if (laneDecision.holding) {
+      const unfiltered = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+      if (!unfiltered.holding) laneDecision = unfiltered;
+    }
+  } catch (error) {
+    log.warn({ err: error as Error }, 'taskmaster.seat_headroom_read_failed');
+    laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+  }
 
   // Grade previously sent actions against the external SOR.
   tickFailures += await gradeSentActions(
@@ -1815,6 +1836,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           project: proposal.fireEvidence.project,
           dispatchId: proposal.idempotencyKey,
           token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+          deps: { seatUsage: conductorSeatUsage },
           onAdmission: record => resolveAdmission?.(record),
         });
         void cascadePromise.catch((error: unknown) => {

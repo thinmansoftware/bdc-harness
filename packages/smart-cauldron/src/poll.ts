@@ -289,6 +289,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
         prUrl,
         prMergeable,
         servedModelId,
+        nodeModels: extractNodeModels(events),
         rawMetadata: detail.run.metadata ?? {},
       };
     }
@@ -612,6 +613,39 @@ export async function ghPrListForBranchDefault(
 function extractServedModelId(metadata: Record<string, unknown>): string | null {
   const id = metadata.served_model_id ?? metadata.model_id;
   return typeof id === 'string' ? id : null;
+}
+
+/**
+ * Last node_completed or node_failed model triple per step.
+ * A later event for the same step replaces the whole triple.
+ * Empty strings and non-strings are stored as null. Empty step names are skipped.
+ */
+export function extractNodeModels(
+  events: readonly {
+    event_type: string;
+    step_name: string | null;
+    data?: Record<string, unknown>;
+  }[]
+): Record<string, { provider: string | null; declared: string | null; served: string | null }> {
+  const nodeModels: Record<
+    string,
+    { provider: string | null; declared: string | null; served: string | null }
+  > = {};
+  for (const event of events) {
+    if (event.event_type !== 'node_completed' && event.event_type !== 'node_failed') continue;
+    if (typeof event.step_name !== 'string' || event.step_name.length === 0) continue;
+    const data = event.data ?? {};
+    nodeModels[event.step_name] = {
+      provider: nonEmptyModelField(data.provider),
+      declared: nonEmptyModelField(data.declared_model_id),
+      served: nonEmptyModelField(data.served_model_id),
+    };
+  }
+  return nodeModels;
+}
+
+function nonEmptyModelField(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
 /**
