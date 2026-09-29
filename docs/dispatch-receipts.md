@@ -56,6 +56,14 @@ of `operator`. It ships in dry-run mode with the existing operator consumer stil
 | `INBOX_READER_ALERT_REPEAT_HOURS` | `6` | Positive number. |
 | `INBOX_READER_RETENTION_DAYS` | `14` | Positive integer. |
 
+Each run lists at most `INBOX_READER_MAX_PER_RUN` rows in total, split evenly across the owned
+mailboxes first (so a full `xo` page can never starve `operator`), with any unused share then
+offered to the others. Listing is a keyset walk over the database-assigned `seq`
+(`listMessagesBySeqCursor` with `openOnly`); each mailbox's position is saved as `cursors` in
+`state.json`, so retained ACTIONABLE mail no longer hides the rows behind it: the next run resumes
+after the last row read and wraps to the head once it reaches the tail. Delete `state.json` to
+restart every walk at the head.
+
 Read the current digest with:
 
 ```sh

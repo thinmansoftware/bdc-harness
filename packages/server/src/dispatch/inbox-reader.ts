@@ -4,7 +4,7 @@ import { join } from 'path';
 import {
   disposeMessageByMachine,
   heartbeatWorker,
-  listMessages,
+  listMessagesBySeqCursor,
   registerWorker,
   type DispatchMailboxResult,
   type DispatchMessage,
@@ -80,16 +80,22 @@ interface ReaderState {
   content_hash?: string;
   run_file?: string | null;
   last_alert_at?: Record<string, string>;
+  cursors?: Record<string, number>;
 }
+
+export interface InboxListFilters {
+  recipient: string;
+  status: 'queued';
+  limit: number;
+  afterSeq?: number;
+}
+
+export type ListedInboxMessage = InboxMessage & { cursor_seq?: number };
 
 export interface InboxReaderDeps {
   now?: () => Date;
   root?: string;
-  listMessages?: (filters: {
-    recipient: string;
-    status: 'queued';
-    limit: number;
-  }) => Promise<InboxMessage[]>;
+  listMessages?: (filters: InboxListFilters) => Promise<ListedInboxMessage[]>;
   disposeMessageByMachine?: (data: {
     id: string;
     actor: string;
@@ -287,6 +293,105 @@ export async function writeDigest(
   await writer(join(root, 'latest.md'), markdown(digest));
 }
 
+/**
+ * Lists every configured recipient within one shared per-run budget.
+ *
+ * Fair share first: the budget is split across recipients so an earlier
+ * mailbox holding a full page of retained ACTIONABLE mail can never starve a
+ * later one. Budget a recipient leaves unused is then offered to the others,
+ * continuing each keyset walk. The walk position is a per-recipient
+ * `cursor_seq` persisted in state.json between runs, so a page that cannot
+ * shrink (retained ACTIONABLE rows, or dry-run) no longer hides the rows
+ * behind it: the next run resumes after it, and a walk that reaches the tail
+ * wraps to the head. An injected lister that returns no `cursor_seq` gets
+ * head-only paging.
+ */
+async function listAllRecipients(
+  list: (filters: InboxListFilters) => Promise<ListedInboxMessage[]>,
+  config: InboxReaderConfig,
+  cursors: Record<string, number>,
+  errors: string[]
+): Promise<{
+  pages: Map<string, { rows: ListedInboxMessage[]; full: boolean }>;
+  cursors: Record<string, number>;
+}> {
+  const recipients = config.recipients;
+  const pages = new Map<string, { rows: ListedInboxMessage[]; full: boolean }>();
+  const walks = new Map<
+    string,
+    { position: number | undefined; fromHead: boolean; done: boolean }
+  >();
+  const nextCursors = new Map<string, number>();
+  let remaining = config.maxPerRun;
+
+  const fetchPage = async (recipient: string, limit: number): Promise<void> => {
+    const start = cursors[recipient];
+    const walk = walks.get(recipient) ?? {
+      position: start,
+      fromHead: start === undefined,
+      done: false,
+    };
+    walks.set(recipient, walk);
+    const page = pages.get(recipient) ?? { rows: [], full: false };
+    pages.set(recipient, page);
+    if (walk.done) return;
+    if (limit <= 0) {
+      // No budget reached this mailbox; keep its walk position for next run.
+      if (walk.position !== undefined) nextCursors.set(recipient, walk.position);
+      return;
+    }
+    let rows: ListedInboxMessage[];
+    try {
+      rows = await list({
+        recipient,
+        status: 'queued',
+        limit,
+        ...(walk.position === undefined ? {} : { afterSeq: walk.position }),
+      });
+    } catch (error) {
+      errors.push(`list_failed:${recipient}:${(error as Error).message}`);
+      throw error;
+    }
+    const seen = new Set(page.rows.map(row => row.id));
+    const fresh = rows.filter(row => !seen.has(row.id));
+    page.rows.push(...fresh);
+    remaining -= fresh.length;
+    page.full = rows.length === limit;
+    const last = rows.at(-1)?.cursor_seq;
+    const pageable = typeof last === 'number' && Number.isFinite(last);
+    if (page.full && pageable) {
+      walk.position = last;
+      nextCursors.set(recipient, last);
+      if (fresh.length === 0) walk.done = true;
+    } else if (page.full) {
+      // A full page with no resume token cannot advance within this run.
+      walk.done = true;
+      nextCursors.delete(recipient);
+    } else {
+      // Reached the tail: the next run starts at the head again.
+      nextCursors.delete(recipient);
+      if (walk.fromHead) {
+        walk.done = true;
+      } else {
+        walk.position = undefined;
+        walk.fromHead = true;
+      }
+    }
+  };
+
+  const base = Math.floor(config.maxPerRun / recipients.length);
+  const extra = config.maxPerRun % recipients.length;
+  for (const [index, recipient] of recipients.entries()) {
+    await fetchPage(recipient, Math.min(base + (index < extra ? 1 : 0), remaining));
+  }
+  for (const recipient of recipients) {
+    while (remaining > 0 && !(walks.get(recipient)?.done ?? true)) {
+      await fetchPage(recipient, remaining);
+    }
+  }
+  return { pages, cursors: Object.fromEntries(nextCursors) };
+}
+
 export async function runInboxReader(
   deps: InboxReaderDeps = {},
   config = resolveInboxReaderConfig(process.env)
@@ -301,11 +406,8 @@ export async function runInboxReader(
     ((path: string, text: string): Promise<void> => appendFile(path, text, 'utf8'));
   const list =
     deps.listMessages ??
-    ((filters: {
-      recipient: string;
-      status: 'queued';
-      limit: number;
-    }): Promise<DispatchMessage[]> => listMessages(filters));
+    ((filters: InboxListFilters): Promise<ListedInboxMessage[]> =>
+      listMessagesBySeqCursor({ ...filters, openOnly: true }));
   const dispose = deps.disposeMessageByMachine ?? disposeMessageByMachine;
   const register = deps.registerWorker ?? registerWorker;
   const heartbeat = deps.heartbeatWorker ?? heartbeatWorker;
@@ -332,22 +434,15 @@ export async function runInboxReader(
     const countsByRule: Record<string, number> = {};
     const classified: { message: InboxMessage; result: InboxClassification }[] = [];
     const pageInfo: { recipient: string; full: boolean }[] = [];
-    let remaining = config.maxPerRun;
+    const listed = await listAllRecipients(list, config, state.cursors ?? {}, errors);
+    const nextCursors = listed.cursors;
     for (const recipient of config.recipients) {
       counts[recipient] = emptyCounts();
-      if (remaining === 0) break;
-      const limit = remaining;
-      let rows: InboxMessage[];
-      try {
-        rows = await list({ recipient, status: 'queued', limit });
-      } catch (error) {
-        errors.push(`list_failed:${recipient}:${(error as Error).message}`);
-        throw error;
-      }
-      remaining -= rows.length;
-      counts[recipient].listed = rows.length;
-      pageInfo.push({ recipient, full: rows.length === limit });
-      for (const message of rows) {
+      const page = listed.pages.get(recipient);
+      if (!page) continue;
+      counts[recipient].listed = page.rows.length;
+      pageInfo.push({ recipient, full: page.full });
+      for (const message of page.rows) {
         if (
           message.status !== 'queued' ||
           message.route_disposition !== null ||
@@ -561,7 +656,7 @@ export async function runInboxReader(
             'page_not_advancing',
             page.recipient,
             [],
-            `mode=${config.mode}; INFO_DUPLICATE=${count.INFO_DUPLICATE}, NUDGE=${count.NUDGE}, ACTIONABLE=${count.ACTIONABLE}`
+            `mode=${config.mode}; cursor=${nextCursors[page.recipient] ?? 'head'}; INFO_DUPLICATE=${count.INFO_DUPLICATE}, NUDGE=${count.NUDGE}, ACTIONABLE=${count.ACTIONABLE}`
           )
         );
       }
@@ -583,7 +678,7 @@ export async function runInboxReader(
     for (const alert of alerts) lastAlertAt[alertKey(alert.kind, alert.recipient)] = alert.at;
     await writer(
       join(root, 'state.json'),
-      `${JSON.stringify({ last_run_at: started.toISOString(), content_hash: hash, run_file: digest.run_file, last_alert_at: lastAlertAt }, null, 2)}\n`
+      `${JSON.stringify({ last_run_at: started.toISOString(), content_hash: hash, run_file: digest.run_file, last_alert_at: lastAlertAt, cursors: nextCursors }, null, 2)}\n`
     );
     const cutoff = started.getTime() - config.retentionDays * 86_400_000;
     for (const file of await readdir(join(root, 'runs'))) {

@@ -383,6 +383,91 @@ describe('inbox reader', () => {
     expect(progress.digest?.alerts.map(row => row.kind)).not.toContain('page_not_advancing');
   });
 
+  test('T21 a full page of retained ACTIONABLE xo mail neither starves operator nor hides later rows', async () => {
+    type Row = typeof F1 & { cursor_seq: number };
+    const store: Row[] = [];
+    let seq = 0;
+    for (let index = 0; index < 600; index += 1) {
+      seq += 1;
+      store.push({
+        ...F1,
+        id: `xo-actionable-${index}`,
+        sender: 'codex',
+        task_type: 'agent_message',
+        recipient: 'xo',
+        body: `escalation ${index}`,
+        cursor_seq: seq,
+      } as Row);
+    }
+    for (const [index, row] of [F1, F3, F4].entries()) {
+      seq += 1;
+      store.push({ ...row, id: `operator-info-${index}`, cursor_seq: seq } as Row);
+    }
+    const root = await mkdtemp(join(tmpdir(), 'inbox-reader-'));
+    roots.push(root);
+    const disposed = new Set<string>();
+    const seen = new Set<string>();
+    const listCalls: { recipient: string; limit: number; afterSeq?: number }[] = [];
+    const run = (mode: 'dry-run' | 'enforce') =>
+      runInboxReader(
+        {
+          root,
+          now: () => new Date('2026-09-29T12:00:00Z'),
+          listMessages: async ({ recipient, limit, afterSeq }) => {
+            listCalls.push({ recipient, limit, afterSeq });
+            const rows = store
+              .filter(row => row.recipient === recipient && !disposed.has(row.id))
+              .filter(row => afterSeq === undefined || row.cursor_seq > afterSeq)
+              .slice(0, limit);
+            for (const row of rows) seen.add(row.id);
+            return rows;
+          },
+          disposeMessageByMachine: async data => {
+            disposed.add(data.id);
+            return { ok: true, message: { id: data.id } as never };
+          },
+          registerWorker: async () => undefined,
+          heartbeatWorker: async () => undefined,
+          log: { info: () => {}, warn: () => {}, error: () => {} },
+        },
+        {
+          ...resolveInboxReaderConfig({
+            INBOX_READER_MODE: mode,
+            INBOX_READER_OPERATOR_OWNER: 'reader',
+          }),
+          alertRepeatHours: 0,
+        }
+      );
+
+    const first = await run('enforce');
+    expect(first.errors).toEqual([]);
+    // Fair share: operator is listed in the same run even though xo alone could fill 500.
+    expect(first.digest?.counts.operator.listed).toBe(3);
+    expect([...disposed].sort()).toEqual(['operator-info-0', 'operator-info-1', 'operator-info-2']);
+    expect(first.digest?.counts.xo.listed).toBe(497);
+    // The retained ACTIONABLE page does not stop the walk: run 2 resumes after it.
+    const second = await run('enforce');
+    expect(second.errors).toEqual([]);
+    expect(listCalls.some(call => call.recipient === 'xo' && call.afterSeq !== undefined)).toBe(
+      true
+    );
+    for (let index = 0; index < 600; index += 1)
+      expect(seen.has(`xo-actionable-${index}`)).toBe(true);
+    // No ACTIONABLE row is ever disposed.
+    expect([...disposed].every(id => id.startsWith('operator-info-'))).toBe(true);
+
+    // Dry-run walks the whole mailbox across runs too (nothing is ever disposed there).
+    disposed.clear();
+    seen.clear();
+    await rm(join(root, 'state.json'), { force: true });
+    await run('dry-run');
+    await run('dry-run');
+    expect(disposed.size).toBe(0);
+    for (let index = 0; index < 600; index += 1)
+      expect(seen.has(`xo-actionable-${index}`)).toBe(true);
+    expect(seen.has('operator-info-0')).toBe(true);
+  });
+
   test('retention deletes only expired timestamped run files', async () => {
     const root = await mkdtemp(join(tmpdir(), 'inbox-reader-'));
     roots.push(root);

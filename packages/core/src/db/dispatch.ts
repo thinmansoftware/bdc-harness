@@ -708,6 +708,13 @@ export async function listMessagesBySeqCursor(filters: {
   /** Exclusive lower bound: return rows whose ordering value is strictly above. */
   afterSeq?: number;
   limit?: number;
+  /**
+   * Only rows still open for a reader: not deferred (`not_before` passed or
+   * unset), not addressed, and with no route disposition. The same open-row
+   * filter `listMessages` applies to `status: 'queued'`, so a keyset walk of a
+   * mailbox is not diluted by rows another component already disposed.
+   */
+  openOnly?: boolean;
 }): Promise<SeqCursorMessage[]> {
   const limit = Math.max(1, Math.min(filters.limit ?? 100, 500));
   // Same effective ordering value the newest-first reads use, so a cursor taken
@@ -728,6 +735,12 @@ export async function listMessagesBySeqCursor(filters: {
   if (typeof filters.afterSeq === 'number') {
     params.push(filters.afterSeq);
     clauses.push(`${seqExpression} > $${params.length}`);
+  }
+  if (filters.openOnly) {
+    params.push(nowIso());
+    clauses.push(`(not_before IS NULL OR not_before <= $${params.length})`);
+    clauses.push('addressed_at IS NULL');
+    clauses.push('route_disposition IS NULL');
   }
   params.push(limit);
   const result = await getDatabase().query<DispatchMessageRow & { cursor_seq: unknown }>(
