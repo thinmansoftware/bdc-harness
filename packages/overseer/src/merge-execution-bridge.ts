@@ -146,16 +146,16 @@ function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
       const all: import('./ce-scope-premerge-recheck').CeWorkflowRun[] = [];
       for (let page = 1; ; page++) {
         const data = // head_sha = PR HEAD is correct for pull_request_target runs: verified on the
-        // live API (see __tests__/fixtures/pull-request-target-run.live-2026-09-28.json).
-        (
-          await client.actions.listWorkflowRunsForRepo({
-            owner,
-            repo,
-            head_sha: head,
-            per_page: 100,
-            page,
-          })
-        ).data;
+          // live API (see __tests__/fixtures/pull-request-target-run.live-2026-09-28.json).
+          (
+            await client.actions.listWorkflowRunsForRepo({
+              owner,
+              repo,
+              head_sha: head,
+              per_page: 100,
+              page,
+            })
+          ).data;
         all.push(...data.workflow_runs);
         if (all.length >= data.total_count || data.workflow_runs.length < 100) return all;
       }

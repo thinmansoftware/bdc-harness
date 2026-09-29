@@ -119,10 +119,13 @@ async function append(
 
 async function authorize(
   query: Tx,
+  db: IDatabase,
   principal: BoardPrincipal,
-  proof: LeaseProof,
-  at: string
-): Promise<LeaseAuthorization> {
+  proof: LeaseProof
+): Promise<LeaseAuthorization & { at: string }> {
+  // Lock the lease row BEFORE reading the clock or validating it, so a concurrent
+  // release or replacement cannot commit between this check and the audit insert
+  // (PostgreSQL). SQLite serializes writers, so no row lock is needed there.
   const result = await query<{
     lease_id: string;
     principal_id: string;
@@ -131,8 +134,9 @@ async function authorize(
     fencing_token: number;
     expires_at: string;
     released_at: string | null;
-  }>('SELECT * FROM board_xo_leases WHERE id = 1');
+  }>(`SELECT * FROM board_xo_leases WHERE id = 1${db.dialect === 'postgres' ? ' FOR UPDATE' : ''}`);
   const lease = result.rows[0];
+  const at = await now(query, db);
   const valid =
     lease?.released_at === null &&
     lease.expires_at > at &&
@@ -144,6 +148,7 @@ async function authorize(
     lease,
     valid,
     seatAllowed: principal.seat_id === 'xo' || principal.seat_id === 'john',
+    at,
   };
 }
 
@@ -174,8 +179,8 @@ export async function recordScopeApproval(input: {
   const db = input.database ?? getDatabase();
   const subject = `${input.repo}#${input.pr_number}@${input.head_sha}..${pr.base.sha}`;
   return db.withTransaction(async query => {
-    const at = await now(query, db);
-    const auth = await authorize(query, input.principal, input.proof, at);
+    const auth = await authorize(query, db, input.principal, input.proof);
+    const at = auth.at;
     const lease = auth.lease;
     if (!auth.seatAllowed || !auth.valid || !lease) {
       const reason = auth.seatAllowed ? 'stale_xo_lease_token' : 'seat_not_permitted';
@@ -240,8 +245,8 @@ export async function revokeScopeApproval(input: {
     return { ok: false, reason: 'invalid_request' };
   const db = input.database ?? getDatabase();
   return db.withTransaction(async query => {
-    const at = await now(query, db);
-    const auth = await authorize(query, input.principal, input.proof, at);
+    const auth = await authorize(query, db, input.principal, input.proof);
+    const at = auth.at;
     const lease = auth.lease;
     if (!auth.seatAllowed || !auth.valid || !lease) {
       const reason = auth.seatAllowed ? 'stale_xo_lease_token' : 'seat_not_permitted';

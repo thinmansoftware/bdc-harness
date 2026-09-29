@@ -210,4 +210,41 @@ describe('board scope approvals', () => {
     expect(two.created).toBe(true);
     expect(two.approval.approval_id).not.toBe(one.approval.approval_id);
   });
+  test('record_locks_lease_row_before_clock_and_rejects_concurrent_release', async () => {
+    // Postgres-dialect view over the real SQLite store. It records the statement
+    // order inside the transaction and simulates a concurrent release that commits
+    // first and so wins the row lock: the locked read must see it and reject.
+    const statements: string[] = [];
+    const translate = (sql: string): string =>
+      sql
+        .replace(' FOR UPDATE', '')
+        .replace(
+          /SELECT to_char\(clock_timestamp\(\)[^]*? AS value/,
+          "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS value"
+        );
+    const pg = {
+      dialect: 'postgres',
+      query: (sql: string, params?: unknown[]) => db.query(translate(sql), params),
+      withTransaction: <T>(fn: (q: never) => Promise<T>) =>
+        db.withTransaction(async q => {
+          const wrapped = async (sql: string, params?: unknown[]) => {
+            statements.push(sql);
+            if (sql.startsWith('SELECT * FROM board_xo_leases'))
+              await q(
+                "UPDATE board_xo_leases SET released_at = '2026-01-01T00:00:00.000Z' WHERE id = 1"
+              );
+            return q(translate(sql), params);
+          };
+          return fn(wrapped as never);
+        }),
+    };
+    const result = await record({ database: pg as never });
+    expect(result).toEqual({ ok: false, reason: 'stale_xo_lease_token' });
+    expect(statements[0]).toBe('SELECT * FROM board_xo_leases WHERE id = 1 FOR UPDATE');
+    expect(statements[1]).toContain('clock_timestamp');
+    const recorded = await db.query(
+      "SELECT 1 FROM board_audit_events WHERE event_type = 'ce_scope_approval_recorded'"
+    );
+    expect(recorded.rowCount).toBe(0);
+  });
 });
