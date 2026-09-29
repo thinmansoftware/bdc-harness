@@ -424,6 +424,59 @@ describe('manifest branch scope stamp', () => {
     expect(evidence.scopeValid).toBe(true);
   });
 
+  it('does not validate scope when the by-sha PR headRefOid differs from HEAD', async () => {
+    const authority = authorityRecord();
+    const driftedOid = '8'.repeat(40);
+    const collect = async (listSha: string, viewOid: string) => {
+      const run = runtimeRunner({
+        headSha: EXAMPLE_HEAD,
+        headBranch: 'fix/wo-example-01',
+        originRemote: authority.canonicalRemote,
+        baseSha: authority.baseSha,
+        diffPaths: EXAMPLE_FILES,
+        onGh: headShaLookupGh({
+          authorityBranch: authority.headBranch,
+          repository: 'bluedevilcollectibles/example',
+          headSha: EXAMPLE_HEAD,
+          list: [
+            {
+              number: 77,
+              sha: listSha,
+              ref: 'feat/wo-example-01-thread-7777777',
+              base: authority.baseBranch,
+            },
+          ],
+          viewByNumber: number =>
+            prViewJson({
+              url: EXAMPLE_PR_URL,
+              number,
+              baseRefName: authority.baseBranch,
+              headRefName: 'feat/wo-example-01-thread-7777777',
+              headRefOid: viewOid,
+              files: EXAMPLE_FILES,
+            }),
+        }),
+      });
+      return collectRuntimeEvidence(
+        evidenceStore(authority),
+        run,
+        runtimeRequest(authority, 'completed')
+      );
+    };
+
+    const listedDrift = await collect(driftedOid, EXAMPLE_HEAD);
+    const viewedDrift = await collect(EXAMPLE_HEAD, driftedOid);
+
+    expect(listedDrift.pullRequest).toBeNull();
+    expect(listedDrift.scopeValid).toBe(false);
+    expect(listedDrift.outcome.validationState).toBe('failed');
+    expect(listedDrift.outcome.primaryReason).toBe('gate_scope_mismatch');
+    expect(viewedDrift.pullRequest).toBeNull();
+    expect(viewedDrift.scopeValid).toBe(false);
+    expect(viewedDrift.outcome.validationState).toBe('failed');
+    expect(viewedDrift.outcome.primaryReason).toBe('gate_scope_mismatch');
+  });
+
   it('returns no PR when the HEAD sha lookup is ambiguous or fails', async () => {
     const authority = authorityRecord();
     const collect = async (list: readonly HeadPull[] | 'throw') => {

@@ -248,7 +248,9 @@ function parsePullRequest(json: string): PullRequestEvidence | null {
 
 // Authority-branch lookup misses when the lane pushes HEAD under a different
 // ref. Accept exactly one open PR at that sha on the authority base, then
-// re-fetch it with pr view. Zero, several, or any error yields null.
+// re-fetch it with pr view. The viewed headRefOid must still equal the run
+// sha; a PR that moved to another commit is not corroboration. Zero, several,
+// a drifted oid, or any error yields null.
 async function lookupPullRequestByHeadSha(
   run: EvidenceCommandRunner,
   cwd: string,
@@ -293,7 +295,10 @@ async function lookupPullRequestByHeadSha(
       ],
       cwd
     );
-    return parsePullRequest(view.stdout);
+    const viewed = parsePullRequest(view.stdout);
+    // headSha is the PR headRefOid. It must be the commit this lookup queried.
+    if (viewed === null || viewed.headSha !== headSha) return null;
+    return viewed;
   } catch {
     return null;
   }
@@ -396,6 +401,7 @@ export function collectMechanicalEvidence(
   const prCorroborates =
     pullRequest !== null &&
     pullRequest.baseRef === input.authority.baseBranch &&
+    // headSha is parsed from the PR headRefOid and must be this worktree HEAD.
     pullRequest.headSha === input.git.headSha &&
     pullRequestIdentityMatches(pullRequest, input.authority.canonicalRemote) &&
     pathsEqual(pullRequest.files, diffPaths);
