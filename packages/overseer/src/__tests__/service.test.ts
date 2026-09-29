@@ -10,6 +10,7 @@ import {
   resolveDefaultDeps,
   runOperatorCardDeliveryScheduler,
   runOverseerService,
+  runReconcileScheduler,
 } from '../service.ts';
 import type { M31ActionPermit, M31ActionProposal } from '../m31-substrate.ts';
 
@@ -914,6 +915,23 @@ serviceSuite('service', () => {
     ).resolves.toBeUndefined();
     expect(reconcileAttempts).toBe(2);
     expect(watcherPolls).toBeGreaterThan(0);
+  });
+
+  test('reconcile scheduler waits out a classified retryAfterMs before the next pass', async () => {
+    const controller = new AbortController();
+    const started = Date.now();
+    let calls = 0;
+    await runReconcileScheduler({
+      signal: controller.signal,
+      intervalMs: 1,
+      reconcile: async () => {
+        calls += 1;
+        if (calls === 2) controller.abort();
+        return { scanned: 0, closed: 0, skipped: true, retryAfterMs: 40 };
+      },
+    });
+    expect(calls).toBe(2);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(30);
   });
 
   test('watcher failure aborts and quiesces the delivery scheduler before rejecting', async () => {
