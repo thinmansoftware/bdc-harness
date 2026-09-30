@@ -1790,6 +1790,7 @@ nodes:
             }
             if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { note_unparsed(cmd != "" ? cmd : label); state = 0; cmd = "" }
             else {
+              if (cmd == "" && line ~ /^[A-Z][a-z]/) next
               cmd = (cmd == "" ? line : cmd " " line)
               sub(/[ \t]*\\$/, "", cmd)
               next
@@ -1818,11 +1819,175 @@ nodes:
           }
         '
       }
-      # rsg_strip_arg <token>   (prints inner text when the token is one
-      #   single-quoted argv-charset string; otherwise prints the token
-      #   unchanged. Qualifying: begins and ends with ', length >= 3, no
-      #   embedded ', inner matches ^[A-Za-z0-9@%+=:,./_*?-]+$. Callers strip
-      #   before flag checks and before exec so both see the same argv.)
+      # rsg_quoted_inner_ok <inner>   (rc 0 when the inner text of a single-quoted span
+      #   is admissible: non-empty printable ASCII (0x20-0x7E) containing no single
+      #   quote, no semicolon, no backtick, no dollar-paren and no equals-greater-than.
+      #   The last two collide with the manifest assertion delimiters that
+      #   stamp-manifest-evidence and verify-manifest-assertions re-split on, so they
+      #   must never reach a Grep-assertions value.)
+      rsg_quoted_inner_ok() {
+        local inner="$1"
+        [ -n "$inner" ] || return 1
+        case "$inner" in
+          *"'"*) return 1 ;;
+          *';'*) return 1 ;;
+          *'`'*) return 1 ;;
+          *'$('*) return 1 ;;
+          *'=>'*) return 1 ;;
+        esac
+        printf '%s' "$inner" | LC_ALL=C grep -qE '^[ -~]+$' || return 1
+        return 0
+      }
+      # rsg_tokenize <segment>   (prints one token per line, rc 1 when the segment is
+      #   malformed. Splits on whitespace OUTSIDE single quotes. A token is either
+      #   entirely bare -- charset [A-Za-z0-9@%+=:,./_*?~^-], or the bare word [ or ]
+      #   so the test builtin can run -- or exactly ONE single-quoted span whose inner
+      #   text passes rsg_quoted_inner_ok. Quoted tokens are emitted WITH their quotes
+      #   so a caller can still print the command verbatim; rsg_strip_arg removes them
+      #   for exec. Adjacent or embedded quotes (a'b', 'a'b, 'a''b'), an unbalanced
+      #   span and an empty span all return 1. Output is buffered and printed only on
+      #   success, so a rejected segment can never leak a partial argv to exec. A token
+      #   can never contain a newline, so one-token-per-line is unambiguous.)
+      rsg_tokenize() {
+        local s="$1" n i ch inner tok out=""
+        n=${#s}
+        i=0
+        while :; do
+          while [ "$i" -lt "$n" ]; do
+            ch="${s:i:1}"
+            case "$ch" in ' '|'	') i=$((i + 1)) ;; *) break ;; esac
+          done
+          [ "$i" -lt "$n" ] || break
+          ch="${s:i:1}"
+          if [ "$ch" = "'" ]; then
+            i=$((i + 1))
+            inner=""
+            while [ "$i" -lt "$n" ]; do
+              ch="${s:i:1}"
+              [ "$ch" = "'" ] && break
+              inner="$inner$ch"
+              i=$((i + 1))
+            done
+            [ "$i" -lt "$n" ] || return 1
+            i=$((i + 1))
+            if [ "$i" -lt "$n" ]; then
+              ch="${s:i:1}"
+              case "$ch" in ' '|'	') ;; *) return 1 ;; esac
+            fi
+            rsg_quoted_inner_ok "$inner" || return 1
+            out="${out}'${inner}'"$'\n'
+          else
+            tok=""
+            while [ "$i" -lt "$n" ]; do
+              ch="${s:i:1}"
+              case "$ch" in
+                ' '|'	') break ;;
+                "'") return 1 ;;
+                *) tok="$tok$ch"; i=$((i + 1)) ;;
+              esac
+            done
+            case "$tok" in
+              '['|']') out="${out}${tok}"$'\n'; continue ;;
+            esac
+            printf '%s' "$tok" | LC_ALL=C grep -qE '^[A-Za-z0-9@%+=:,./_*?~^-]+$' || return 1
+            out="${out}${tok}"$'\n'
+          fi
+        done
+        [ -n "$out" ] || return 1
+        printf '%s' "$out"
+        return 0
+      }
+      # rsg_split_pipe <command>   (prints one pipe segment per line, rc 1 when a double
+      #   pipe appears outside single quotes or a quoted span is unbalanced. A pipe
+      #   INSIDE a single-quoted span is data, not a separator, so a pattern such as
+      #   'alpha|beta' no longer fragments the command.)
+      rsg_split_pipe() {
+        local s="$1" n i ch seg="" out="" inq=0
+        n=${#s}
+        i=0
+        while [ "$i" -lt "$n" ]; do
+          ch="${s:i:1}"
+          if [ "$inq" -eq 1 ]; then
+            seg="$seg$ch"
+            [ "$ch" = "'" ] && inq=0
+            i=$((i + 1))
+            continue
+          fi
+          case "$ch" in
+            "'") inq=1; seg="$seg$ch"; i=$((i + 1)) ;;
+            '|')
+              if [ $((i + 1)) -lt "$n" ] && [ "${s:i+1:1}" = '|' ]; then return 1; fi
+              out="${out}${seg}"$'\n'
+              seg=""
+              i=$((i + 1))
+              ;;
+            *) seg="$seg$ch"; i=$((i + 1)) ;;
+          esac
+        done
+        [ "$inq" -eq 0 ] || return 1
+        out="${out}${seg}"$'\n'
+        printf '%s' "$out"
+        return 0
+      }
+      # rsg_meta_outside_ok <command>   (rc 0 when no shell metacharacter appears
+      #   OUTSIDE a single-quoted span. Rejects semicolon, ampersand, backtick,
+      #   greater-than, less-than, double quote, backslash, newline and the
+      #   two-character sequence dollar-paren. Inside a single-quoted span every one of
+      #   these is ordinary data, which is what lets a quoted regex execute. Kept as an
+      #   explicit guard even though rsg_tokenize's bare charset also excludes them.)
+      rsg_meta_outside_ok() {
+        local s="$1" n i ch inq=0
+        n=${#s}
+        i=0
+        while [ "$i" -lt "$n" ]; do
+          ch="${s:i:1}"
+          if [ "$inq" -eq 1 ]; then
+            [ "$ch" = "'" ] && inq=0
+            i=$((i + 1))
+            continue
+          fi
+          case "$ch" in
+            "'") inq=1 ;;
+            ';'|'&'|'`'|'>'|'<'|'"'|'\'|$'\n') return 1 ;;
+            '$') [ "${s:i+1:1}" = '(' ] && return 1 ;;
+          esac
+          i=$((i + 1))
+        done
+        [ "$inq" -eq 0 ] || return 1
+        return 0
+      }
+      # rsg_git_readonly <argv...>   (rc 0 when argv is a read-only git invocation: the
+      #   runner is git, the FIRST argument is exactly diff, log or show, and no token
+      #   equals or starts with a flag that can run a program, write a file or move the
+      #   repository root (-c, -C, -O, --output, --ext-diff, --textconv, --exec-path,
+      #   --git-dir, --work-tree, --namespace, --open-files-in-pager, --upload-pack,
+      #   --receive-pack). A -c/-C placed BEFORE the subcommand fails the subcommand
+      #   test itself, so "git -c core.pager=x diff" is rejected. Execution adds
+      #   --no-pager --no-ext-diff --no-textconv (see rsg_exec_pipeline) so a repository
+      #   textconv or diff.external setting can never run a program.)
+      rsg_git_readonly() {
+        local sub t
+        [ $# -ge 2 ] || return 1
+        [ "$1" = "git" ] || return 1
+        sub="$2"
+        case "$sub" in diff|log|show) ;; *) return 1 ;; esac
+        shift 2
+        for t in "$@"; do
+          case "$t" in
+            -c|-c*|-C|-C*|-O|-O*) return 1 ;;
+            --output|--output*|--ext-diff|--ext-diff*|--textconv|--textconv*) return 1 ;;
+            --exec-path|--exec-path*|--git-dir|--git-dir*) return 1 ;;
+            --work-tree|--work-tree*|--namespace|--namespace*) return 1 ;;
+            --open-files-in-pager|--open-files-in-pager*) return 1 ;;
+            --upload-pack|--upload-pack*|--receive-pack|--receive-pack*) return 1 ;;
+          esac
+        done
+        return 0
+      }
+      # rsg_strip_arg <token>   (prints the inner text when the token is exactly one
+      #   single-quoted span with admissible inner text; otherwise prints the token
+      #   unchanged. Callers strip before the flag checks and before exec so the
+      #   validated argv is the executed argv.)
       rsg_strip_arg() {
         local t="$1" inner
         case "$t" in
@@ -1834,28 +1999,29 @@ nodes:
           return 0
         fi
         inner="${t:1:${#t}-2}"
-        case "$inner" in
-          *"'"*) printf '%s' "$t"; return 0 ;;
-        esac
-        if printf '%s' "$inner" | grep -qE '^[A-Za-z0-9@%+=:,./_*?-]+$'; then
+        if rsg_quoted_inner_ok "$inner"; then
           printf '%s' "$inner"
         else
           printf '%s' "$t"
         fi
       }
-      # rsg_tokens_safe <tokens...>   (rc 0 when every token is in the argv charset.
-      #   [ and ] are allowed so the test builtin can run. A single-quoted token
-      #   whose inner text matches the charset is accepted. * and ? are literal --
-      #   callers must set -f before splitting. Same shape as rst_tokens_safe.)
+      # rsg_tokens_safe <tokens...>   (rc 0 when every token is an admissible bare token
+      #   or an admissible single-quoted span. [ and ] pass so the test builtin can run.
+      #   rsg_tokenize is the authority on token SHAPE; this stays the named predicate
+      #   for a token list that has already been split.)
       rsg_tokens_safe() {
-        local t stripped
+        local t inner
         for t in "$@"; do
           case "$t" in '['|']') continue ;; esac
-          stripped="$(rsg_strip_arg "$t")"
-          if [ "$stripped" != "$t" ]; then
-            continue
-          fi
-          printf '%s' "$t" | grep -qE '^[A-Za-z0-9@%+=:,./_*?-]+$' || return 1
+          case "$t" in
+            "'"*"'")
+              if [ "${#t}" -lt 3 ]; then return 1; fi
+              inner="${t:1:${#t}-2}"
+              rsg_quoted_inner_ok "$inner" || return 1
+              continue
+              ;;
+          esac
+          printf '%s' "$t" | LC_ALL=C grep -qE '^[A-Za-z0-9@%+=:,./_*?~^-]+$' || return 1
         done
         return 0
       }
@@ -1886,17 +2052,18 @@ nodes:
         done
         return 1
       }
-      # rsg_argv_looks_readonly <segment>   (rc 0 when the segment tokenizes --
-      #   whitespace split, noglob -- to an allowlisted read-only runner with no
-      #   write/exec options. Leading LC_ALL=* / LANG=* tokens are skipped.
-      #   Qualifying single-quoted tokens are stripped before the charset check
-      #   and the flag checks, matching the argv rsg_exec_pipeline runs.)
+      # rsg_argv_looks_readonly <segment>   (rc 0 when the segment tokenizes -- via the
+      #   quote-aware rsg_tokenize, so the validated argv is the executed argv -- to an
+      #   allowlisted read-only runner with no write/exec options. Leading LC_ALL=* /
+      #   LANG=* tokens are skipped. Qualifying single-quoted tokens are stripped before
+      #   the flag checks. git is admitted only through rsg_git_readonly.)
       rsg_argv_looks_readonly() {
-        local runner segment="$1" tok
-        local -a stripped=()
-        set -f
-        set -- $segment
-        set +f
+        local runner segment="$1" raw tok
+        local -a toks=() stripped=()
+        raw="$(rsg_tokenize "$segment")" || return 1
+        [ -n "$raw" ] || return 1
+        mapfile -t toks <<<"$raw"
+        set -- "${toks[@]}"
         while [ $# -ge 1 ]; do
           case "$1" in
             LC_ALL=*|LANG=*) shift ;;
@@ -1909,8 +2076,14 @@ nodes:
         done
         set -- "${stripped[@]}"
         runner="$1"
+        rsg_tokens_safe "${toks[@]}" || return 1
+        case "$runner" in
+          git)
+            rsg_git_readonly "$@" || return 1
+            return 0
+            ;;
+        esac
         shift
-        rsg_tokens_safe "$runner" "$@" || return 1
         case "$runner" in
           grep|egrep|fgrep|rg)
             rsg_has_grep_flag "$@" && return 1
@@ -1930,51 +2103,51 @@ nodes:
         esac
         return 1
       }
-      # rsg_allow_cmd <command>   (fail-closed read-only allowlist: reject shell
-      #   operators except |, split on | only, whitespace-tokenize each segment,
-      #   reject write/exec options as whole tokens. awk/sed/xargs and anything
-      #   not listed are rejected. A single quote is not rejected here;
-      #   only a fully quoted charset token is accepted later. Double quote,
-      #   backslash, and every other metacharacter stay rejected.)
+      # rsg_allow_cmd <command>   (fail-closed read-only allowlist. Rejects every shell
+      #   metacharacter OUTSIDE a single-quoted span (rsg_meta_outside_ok), splits on a
+      #   pipe that is itself outside quotes (rsg_split_pipe, which also rejects a
+      #   double pipe), then requires every segment to be an allowlisted read-only argv
+      #   (rsg_argv_looks_readonly). A single-quoted pattern containing a space, a
+      #   caret, or ordinary regex characters now passes; a double-quoted token, an
+      #   unbalanced or empty span, and awk/sed/xargs stay rejected.)
       rsg_allow_cmd() {
-        local c="$1" work segment
-        case "$c" in
-          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*|*'"'*|*'\\'*|*'||'*) return 1 ;;
-        esac
-        work="$c"
-        while :; do
-          case "$work" in
-            *'|'*) segment="${work%%|*}"; work="${work#*|}" ;;
-            *) segment="$work"; work='' ;;
-          esac
+        local c="$1" raw segment
+        local -a segs=()
+        rsg_meta_outside_ok "$c" || return 1
+        raw="$(rsg_split_pipe "$c")" || return 1
+        [ -n "$raw" ] || return 1
+        mapfile -t segs <<<"$raw"
+        [ "${#segs[@]}" -ge 1 ] || return 1
+        for segment in "${segs[@]}"; do
           rsg_argv_looks_readonly "$segment" || return 1
-          [ -z "$work" ] && break
         done
         return 0
       }
-      # rsg_exec_pipeline <command>   (prints stdout of the last | segment; rc of
-      #   the last segment. Intermediate segments are connected with temp files,
-      #   not a shell pipe. Tokenized argv; never a shell -c of the spec string.
-      #   Qualifying single-quoted tokens are stripped the same way as
-      #   rsg_argv_looks_readonly before the runner is invoked.
-      #   Intermediate nonzero exits do not abort -- matches bash -c without
-      #   pipefail, so grep-no-match | wc -l still yields a count.)
+      # rsg_exec_pipeline <command>   (prints stdout of the last pipe segment; rc of the
+      #   last segment. Segments are split with rsg_split_pipe and tokenized with
+      #   rsg_tokenize, so the argv that was VALIDATED is the argv that is executed --
+      #   never a shell -c of the spec string. Intermediate segments are connected with
+      #   temp files, not a shell pipe. Because tokenization is explicit there is no
+      #   unquoted word splitting, so a glob character is always literal. A git segment
+      #   is executed as "git --no-pager SUB --no-ext-diff --no-textconv REST" so a
+      #   repository textconv or diff.external configuration can never run a program.
+      #   Intermediate nonzero exits do not abort -- matches bash -c without pipefail,
+      #   so grep-no-match | wc -l still yields a count.)
       rsg_exec_pipeline() {
-        local cmd="$1" work segment tmpdir_p="" tmp_in="/dev/null" tmp_out raw="" rc=0
-        local env_lc env_lang tok
-        local -a stripped=()
+        local cmd="$1" raw segment seg_raw tmpdir_p="" tmp_in="/dev/null" tmp_out out_raw="" rc=0
+        local env_lc env_lang tok runner sub i last
+        local -a segs=() toks=() stripped=() argv=()
         if ! rsg_allow_cmd "$cmd"; then
           return 127
         fi
-        work="$cmd"
-        while :; do
-          case "$work" in
-            *'|'*) segment="${work%%|*}"; work="${work#*|}" ;;
-            *) segment="$work"; work='' ;;
-          esac
-          set -f
-          set -- $segment
-          set +f
+        raw="$(rsg_split_pipe "$cmd")" || return 127
+        mapfile -t segs <<<"$raw"
+        last=$(( ${#segs[@]} - 1 ))
+        i=0
+        for segment in "${segs[@]}"; do
+          seg_raw="$(rsg_tokenize "$segment")" || { rc=127; break; }
+          mapfile -t toks <<<"$seg_raw"
+          set -- "${toks[@]}"
           env_lc=""; env_lang=""
           while [ $# -ge 1 ]; do
             case "$1" in
@@ -1992,29 +2165,37 @@ nodes:
             stripped+=("$(rsg_strip_arg "$tok")")
           done
           set -- "${stripped[@]}"
-          if [ -n "$work" ]; then
+          runner="$1"
+          if [ "$runner" = "git" ]; then
+            sub="$2"
+            shift 2
+            argv=(git --no-pager "$sub" --no-ext-diff --no-textconv "$@")
+          else
+            argv=("$@")
+          fi
+          if [ "$i" -lt "$last" ]; then
             [ -n "$tmpdir_p" ] || tmpdir_p="$(mktemp -d)"
             tmp_out="$tmpdir_p/out"
             (
               [ -n "$env_lc" ] && export LC_ALL="$env_lc"
               [ -n "$env_lang" ] && export LANG="$env_lang"
-              "$@" < "$tmp_in" > "$tmp_out" 2>/dev/null
+              "${argv[@]}" < "$tmp_in" > "$tmp_out" 2>/dev/null
             )
             rc=$?
             tmp_in="$tmpdir_p/in"
             mv "$tmp_out" "$tmp_in"
           else
-            raw="$(
+            out_raw="$(
               [ -n "$env_lc" ] && export LC_ALL="$env_lc"
               [ -n "$env_lang" ] && export LANG="$env_lang"
-              "$@" < "$tmp_in" 2>/dev/null
+              "${argv[@]}" < "$tmp_in" 2>/dev/null
             )"
             rc=$?
           fi
-          [ -z "$work" ] && break
+          i=$((i + 1))
         done
         [ -n "$tmpdir_p" ] && rm -rf "$tmpdir_p"
-        printf '%s' "$raw"
+        printf '%s' "$out_raw"
         return "$rc"
       }
       # rsg_observe <command>   (-> observed count, or "ERR" on a hard command failure
@@ -3969,6 +4150,13 @@ nodes:
         if [ "$tests_status" = "failed" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "missing" ] || [ "$grep_status" = "all_dropped" ]; then
           verdict="fail"
         fi
+        # bdc-harness issue 1047: a declared stop grep the allowlist REJECTED is not
+        # evidence. Incomplete caused by dropped conditions flips the stamp to FAIL;
+        # incomplete caused ONLY by unparsed prose (dropped=0) keeps PASS (issue 857 /
+        # manifest-evidence-check Test FP-4).
+        if [ "$grep_status" = "incomplete" ] && [ "${grep_dropped:-0}" -gt 0 ] 2>/dev/null; then
+          verdict="fail"
+        fi
         if [ "$grep_status" = "incomplete" ]; then
           stop_detail="; unparsed=$(printf '%s\n' "$grep_line" | sed -n 's/.*UNVERIFIED (unparsed): //p'); dropped=${grep_dropped:-0}"
         fi
@@ -4026,6 +4214,24 @@ nodes:
       mec_field() {
         printf '%s\n' "$2" | grep -E "^${1}=" | head -1 | sed "s/^${1}=//" || true
       }
+      # mec_rejected_lines <grep_detail>   (prints one "STOP_GREP_REJECTED: <command>"
+      #   line per DROPPED detail line produced by run-stop-greps, naming the rejected
+      #   command verbatim. The "DROPPED (<reason>): " prefix and the trailing
+      #   " => expected <op> <n>" suffix are removed so the line carries exactly the
+      #   command a spec author must be able to find and fix.)
+      mec_rejected_lines() {
+        local detail="$1" line cmd
+        [ -n "$detail" ] || return 0
+        printf '%s\n' "$detail" | while IFS= read -r line; do
+          case "$line" in
+            DROPPED*) ;;
+            *) continue ;;
+          esac
+          cmd="$(printf '%s' "$line" | sed -E 's/^DROPPED \([^)]*\): //; s/ => expected (eq|ge|le) [0-9]+$//')"
+          [ -n "$cmd" ] || continue
+          printf 'STOP_GREP_REJECTED: %s\n' "$cmd"
+        done
+      }
       # mec_check <status> <class> <tests_status> <grep_declared> <grep_status> <tests_exit> <grep_executed> <grep_dropped> <grep_unparsed> <grep_mismatch> <grep_detail>
       #   (stamped manifest on stdin -> "OK" rc 0, or "EVIDENCE_ERROR: ..." rc 1)
       #   Only a PROCEED run (real build, real PR) is gated. CODE/MIXED: the Tests: line
@@ -4066,6 +4272,11 @@ nodes:
                 echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) reported incomplete with grep_executed=${grep_executed:-0} and grep_mismatch=${grep_mismatch:-0}. Incomplete evidence is admissible only after at least one grep executes with no mismatch (bdc-xo #1940)." >&2
                 return 1
               fi
+              if [ "${grep_dropped:-0}" -gt 0 ] 2>/dev/null; then
+                echo "HARNESS_REFUSED: ${grep_dropped} of ${grep_declared} declared grep stop condition(s) were REJECTED by the read-only allowlist and never executed (grep_executed=${grep_executed:-0}, grep_dropped=${grep_dropped}). A declared stop condition that cannot execute is not evidence, so the run may not publish manifest evidence with it silently skipped (bdc-harness issue 1047)." >&2
+                mec_rejected_lines "$grep_detail" >&2
+                return 1
+              fi
               ;;
             mismatch)
               echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) were declared but grep_status=mismatch (grep_mismatch=${grep_mismatch:-0}). Every executed grep stop condition must return its declared count before manifest evidence can be published (bdc-xo #1940)." >&2
@@ -4077,6 +4288,7 @@ nodes:
               else
                 echo "HARNESS_REFUSED: ${grep_declared} grep stop condition(s) were declared but none executed (grep_executed=${grep_executed:-0}, grep_dropped=${grep_dropped:-0}, grep_unparsed=${grep_unparsed:-0}). Conditions: ${grep_line}${grep_detail:+; $grep_detail}" >&2
               fi
+              mec_rejected_lines "$grep_detail" >&2
               return 1
               ;;
             *)
