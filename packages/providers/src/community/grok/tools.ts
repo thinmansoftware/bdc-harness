@@ -4,7 +4,15 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'node:fs';
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  existsSync,
+  realpathSync,
+} from 'node:fs';
 import { dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 
 const execFileAsync = promisify(execFile);
@@ -34,6 +42,20 @@ export const GROK_AGENT_TOOLS = [
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Relative path under cwd' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'read_artifact',
+      description: 'Read a UTF-8 workflow artifact relative to the run artifact directory.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Relative path under the run artifact directory' },
         },
         required: ['path'],
       },
@@ -110,7 +132,7 @@ export async function executeGrokTool(
   cwd: string,
   name: string,
   argsJson: string,
-  options?: { bashTimeoutMs?: number }
+  options?: { bashTimeoutMs?: number; artifactsDir?: string }
 ): Promise<string> {
   let args: Record<string, unknown> = {};
   try {
@@ -153,6 +175,20 @@ export async function executeGrokTool(
         const path = asString(args.path);
         const full = resolveInCwd(cwd, path);
         if (!existsSync(full)) return `ERROR: file not found: ${path}`;
+        const text = readFileSync(full, 'utf8');
+        return text.length > 200_000 ? text.slice(0, 200_000) + '\n...[truncated]' : text;
+      }
+      case 'read_artifact': {
+        if (!options?.artifactsDir) return 'ERROR: artifact directory unavailable';
+        const path = asString(args.path);
+        const full = resolveInCwd(options.artifactsDir, path);
+        if (!existsSync(full)) return `ERROR: artifact not found: ${path}`;
+        const realBase = realpathSync(options.artifactsDir);
+        const realFile = realpathSync(full);
+        const realRelative = relative(realBase, realFile);
+        if (realRelative.startsWith('..') || isAbsolute(realRelative)) {
+          return `ERROR: artifact escapes directory: ${path}`;
+        }
         const text = readFileSync(full, 'utf8');
         return text.length > 200_000 ? text.slice(0, 200_000) + '\n...[truncated]' : text;
       }

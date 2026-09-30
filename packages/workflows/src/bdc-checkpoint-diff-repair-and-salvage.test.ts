@@ -30,6 +30,8 @@ const EXPECTED_LANES = [
   'bdc-feature-development-fusion-cx-qwen.yaml',
   'bdc-feature-development-grok.yaml',
   'bdc-feature-development-kimi-k3.yaml',
+  'bdc-feature-development-open-a.yaml',
+  'bdc-feature-development-open-b.yaml',
   'bdc-feature-development-zero-claude.yaml',
   'bdc-feature-development-zero-open.yaml',
   'bdc-feature-development-zero.yaml',

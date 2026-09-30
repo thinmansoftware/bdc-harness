@@ -23,7 +23,7 @@ mock.module('openai', () => ({
   OpenAI: mockOpenAI,
 }));
 
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { GrokAgentProvider } from './provider';
@@ -65,6 +65,29 @@ describe('executeGrokTool', () => {
     const r = await executeGrokTool(cwd, 'read_file', JSON.stringify({ path: '../outside.txt' }));
     expect(r).toContain('ERROR');
     expect(r.toLowerCase()).toContain('escape');
+  });
+
+  test('reads only from the supplied run artifact directory', async () => {
+    const artifactsDir = mkdtempSync(join(tmpdir(), 'grok-artifact-'));
+    try {
+      writeFileSync(join(artifactsDir, 'diff.patch'), 'safe diff', 'utf8');
+      writeFileSync(join(cwd, 'private.txt'), 'outside artifact', 'utf8');
+      expect(
+        await executeGrokTool(cwd, 'read_artifact', JSON.stringify({ path: 'diff.patch' }), {
+          artifactsDir,
+        })
+      ).toBe('safe diff');
+      expect(
+        await executeGrokTool(cwd, 'read_artifact', JSON.stringify({ path: '../private.txt' }), {
+          artifactsDir,
+        })
+      ).toMatch(/^ERROR:/);
+      expect(
+        await executeGrokTool(cwd, 'read_artifact', JSON.stringify({ path: 'diff.patch' }))
+      ).toBe('ERROR: artifact directory unavailable');
+    } finally {
+      rmSync(artifactsDir, { recursive: true, force: true });
+    }
   });
 
   test('edit_file replaces string', async () => {
@@ -150,6 +173,7 @@ describe('GrokAgentProvider', () => {
       if (calls === 1) {
         return {
           model: 'deepseek/deepseek-v4.1-flash',
+          usage: { prompt_tokens: 20, completion_tokens: 5, cost: 0.001 },
           choices: [
             {
               message: {
@@ -171,6 +195,7 @@ describe('GrokAgentProvider', () => {
       }
       return {
         model: 'deepseek/deepseek-v4.1-flash',
+        usage: { prompt_tokens: 30, completion_tokens: 3, cost: 0.002 },
         choices: [{ message: { content: 'done', tool_calls: [] } }],
       };
     });
@@ -179,7 +204,8 @@ describe('GrokAgentProvider', () => {
     const signal = new AbortController().signal;
     try {
       const provider = new GrokAgentProvider();
-      const chunks: Array<{ type: string; toolName?: string; content?: string }> = [];
+      const chunks: Array<{ type: string; toolName?: string; content?: string; cost?: number }> =
+        [];
       for await (const chunk of provider.sendQuery('read a file', cwd, undefined, {
         abortSignal: signal,
         model: 'deepseek/deepseek-v4.1-flash',
@@ -198,6 +224,105 @@ describe('GrokAgentProvider', () => {
       ).toBe(false);
       const firstOptions = mockCreate.mock.calls[0]?.[1] as { signal?: AbortSignal } | undefined;
       expect(firstOptions?.signal).toBe(signal);
+      expect(chunks.find(chunk => chunk.type === 'result')?.cost).toBe(0.003);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('read-only tool list rejects a model-requested write before execution', async () => {
+    process.env.GLM_API_KEY = 'test-key';
+    mockCreate.mockReset();
+    mockCreate.mockImplementation(async () => ({
+      model: 'moonshotai/kimi-k3',
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: 'call_write',
+                type: 'function',
+                function: {
+                  name: 'write_file',
+                  arguments: JSON.stringify({ path: 'proof.txt', content: 'changed' }),
+                },
+              },
+            ],
+          },
+        },
+      ],
+    }));
+
+    const cwd = mkdtempSync(join(tmpdir(), 'openrouter-readonly-'));
+    try {
+      const provider = new GrokAgentProvider();
+      await expect(async () => {
+        for await (const _chunk of provider.sendQuery('review', cwd, undefined, {
+          model: 'moonshotai/kimi-k3',
+          nodeConfig: { allowed_tools: ['read_file', 'list_dir'] },
+        })) {
+          // Drain until the provider rejects the prohibited tool call.
+        }
+      }).toThrow(/openrouter_tool_refused: write_file/);
+      expect(mockCreate).toHaveBeenCalledTimes(1);
+      const request = mockCreate.mock.calls[0]?.[0] as {
+        tools?: Array<{ function: { name: string } }>;
+      };
+      expect(request.tools?.map(tool => tool.function.name)).toEqual(['read_file', 'list_dir']);
+      expect(existsSync(join(cwd, 'proof.txt'))).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('budgeted node stops before a returned tool call when reported cost reaches cap', async () => {
+    process.env.GLM_API_KEY = 'test-key';
+    mockCreate.mockReset();
+    mockCreate.mockImplementation(async () => ({
+      model: 'deepseek/deepseek-v4-pro-0813',
+      usage: { prompt_tokens: 100, completion_tokens: 100, cost: 0.15 },
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: 'call_write',
+                type: 'function',
+                function: {
+                  name: 'write_file',
+                  arguments: JSON.stringify({ path: 'proof.txt', content: 'changed' }),
+                },
+              },
+            ],
+          },
+        },
+      ],
+    }));
+    const cwd = mkdtempSync(join(tmpdir(), 'openrouter-budget-'));
+    try {
+      const provider = new GrokAgentProvider();
+      const chunks = [];
+      for await (const chunk of provider.sendQuery('build', cwd, undefined, {
+        model: 'deepseek/deepseek-v4-pro-0813',
+        maxBudgetUsd: 0.1,
+      })) {
+        chunks.push(chunk);
+      }
+      expect(chunks.at(-1)).toMatchObject({
+        type: 'result',
+        isError: true,
+        errorSubtype: 'error_max_budget_usd',
+        cost: 0.15,
+      });
+      expect(existsSync(join(cwd, 'proof.txt'))).toBe(false);
+      const request = mockCreate.mock.calls[0]?.[0] as {
+        max_tokens?: number;
+        usage?: { include?: boolean };
+      };
+      expect(request.max_tokens).toBe(2048);
+      expect(request.usage?.include).toBe(true);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

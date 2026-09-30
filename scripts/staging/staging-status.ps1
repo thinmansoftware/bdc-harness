@@ -39,7 +39,8 @@ try {
 if ($state -like "running*") {
   $js = 'const {Database}=require("bun:sqlite");const db=new Database("/.archon/archon.db",{readonly:true});try{const rows=db.query("SELECT id,workflow_name,status,started_at FROM remote_agent_workflow_runs ORDER BY started_at DESC LIMIT 5").all();console.log(JSON.stringify(rows,null,1));}catch(e){console.log("event store not initialized yet: "+e.message);}'
   Write-Host "[staging-status] last 5 runs (staging event store):"
-  & $Docker exec archon-staging bun -e $js
+  # PowerShell 5.1 strips nested quotes from native -e arguments. Stdin preserves JS.
+  $js | & $Docker exec -i archon-staging bun -
 } else {
   Write-Host "[staging-status] container not running -- event store persisted at staging-data/archon.db"
 }

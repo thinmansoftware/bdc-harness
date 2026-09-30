@@ -46,6 +46,13 @@ with a fresh random operator token, fills `GITHUB_TOKEN` from `gh auth token`
 laptop's `~/.claude` into `staging-user-home/.claude/` so canary read-spec
 nodes can run. All of those files are gitignored.
 
+The fixed OpenRouter lane canaries require a separate, spend-limited staging
+`OPENROUTER_API_KEY` in the laptop's existing `.env.staging`, followed by an
+exact-ref staging rebuild. The production key must remain in `archon-app-1`.
+The key is absent by default, so ordinary staging boots remain credential-free
+for OpenRouter. Node budgets stop additional requests after OpenRouter reports
+that a threshold was reached; the separate key's spend limit is the hard cap.
+
 ## The 5-step promote flow
 
 Harness changes reach production ONLY via this ladder:

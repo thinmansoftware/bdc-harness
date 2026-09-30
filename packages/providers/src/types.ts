@@ -267,6 +267,8 @@ export interface NodeConfig {
   >;
   allowed_tools?: string[];
   denied_tools?: string[];
+  /** Run-scoped artifact directory, provided by the workflow executor. */
+  artifacts_dir?: string;
   effort?: string;
   thinking?: unknown;
   sandbox?: unknown;

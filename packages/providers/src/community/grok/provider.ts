@@ -84,16 +84,30 @@ export class GrokAgentProvider implements IAgentProvider {
       baseURL: this.baseURL,
       defaultHeaders: {
         'HTTP-Referer': 'https://bluedevilcollectibles.com',
-        'X-Title': 'BDC Archon Grok Agent',
+        'X-Title': 'BDC Archon OpenRouter Agent',
       },
     });
 
+    const configuredTools = options?.nodeConfig?.allowed_tools;
+    const deniedTools = new Set(options?.nodeConfig?.denied_tools ?? []);
+    const tools = GROK_AGENT_TOOLS.filter(
+      tool =>
+        (tool.function.name !== 'read_artifact' || configuredTools?.includes('read_artifact')) &&
+        (configuredTools === undefined || configuredTools.includes(tool.function.name)) &&
+        !deniedTools.has(tool.function.name)
+    );
+    const allowedToolNames = new Set(tools.map(tool => tool.function.name));
+    const hasWriteTools = ['bash', 'write_file', 'edit_file'].some(name =>
+      allowedToolNames.has(name)
+    );
     const messages: ChatMessage[] = [];
     const systemParts: string[] = [
-      'You are a coding agent with tools (bash, read_file, write_file, edit_file, list_dir).',
-      'You MUST use tools to inspect and modify the worktree. Do not claim you lack shell access.',
+      hasWriteTools
+        ? 'You are a coding agent with the listed worktree tools.'
+        : 'You are a read-only reviewer. Do not modify files or run shell commands.',
+      `Available tools: ${tools.map(tool => tool.function.name).join(', ') || '(none)'}`,
       `Working directory: ${cwd}`,
-      'Prefer small surgical edits. Use ASCII only in source files.',
+      'Prefer small surgical changes when writing is allowed. Use ASCII only in source files.',
       'When the task is done, stop calling tools and print a short summary plus any required sentinels (e.g. COMPLETE).',
     ];
     if (options?.systemPrompt) {
@@ -112,6 +126,12 @@ export class GrokAgentProvider implements IAgentProvider {
 
     let totalIn = 0;
     let totalOut = 0;
+    let totalCost = 0;
+    let costReported = true;
+    const budgetUsd = options?.maxBudgetUsd;
+    if (budgetUsd !== undefined && (!Number.isFinite(budgetUsd) || budgetUsd <= 0)) {
+      throw new Error('openrouter_invalid_node_budget');
+    }
     let servedModelId: string | undefined;
     let finalText = '';
 
@@ -122,8 +142,10 @@ export class GrokAgentProvider implements IAgentProvider {
           {
             model: resolvedModel,
             messages,
-            tools: GROK_AGENT_TOOLS,
-            tool_choice: 'auto',
+            ...(budgetUsd !== undefined ? { max_tokens: 2048, usage: { include: true } } : {}),
+            ...(tools.length > 0
+              ? { tools, tool_choice: 'auto' as const }
+              : { tool_choice: 'none' as const }),
           },
           { signal: options?.abortSignal }
         );
@@ -138,6 +160,29 @@ export class GrokAgentProvider implements IAgentProvider {
       if (completion.usage) {
         totalIn += completion.usage.prompt_tokens ?? 0;
         totalOut += completion.usage.completion_tokens ?? 0;
+        const cost = (completion.usage as { cost?: unknown }).cost;
+        if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
+          totalCost += cost;
+        } else {
+          costReported = false;
+        }
+      } else {
+        costReported = false;
+      }
+      if (budgetUsd !== undefined) {
+        if (!costReported) throw new Error('openrouter_cost_missing_for_budgeted_node');
+        if (totalCost >= budgetUsd) {
+          yield {
+            type: 'result',
+            isError: true,
+            errorSubtype: 'error_max_budget_usd',
+            errors: [`openrouter_node_budget_reached: ${totalCost} >= ${budgetUsd}`],
+            cost: totalCost,
+            tokens: { input: totalIn, output: totalOut, total: totalIn + totalOut },
+            ...(servedModelId !== undefined ? { servedModelId } : {}),
+          };
+          return;
+        }
       }
 
       const choice = completion.choices[0];
@@ -167,6 +212,9 @@ export class GrokAgentProvider implements IAgentProvider {
       for (const call of toolCalls) {
         if (call.type !== 'function') continue;
         const name = call.function.name;
+        if (!allowedToolNames.has(name)) {
+          throw new Error(`openrouter_tool_refused: ${name}`);
+        }
         const args = call.function.arguments ?? '{}';
         let toolInput: Record<string, unknown>;
         try {
@@ -186,6 +234,7 @@ export class GrokAgentProvider implements IAgentProvider {
         };
         const result = await executeGrokTool(cwd, name, args, {
           bashTimeoutMs: this.bashTimeoutMs,
+          artifactsDir: options?.nodeConfig?.artifacts_dir,
         });
         messages.push({
           role: 'tool',
@@ -212,6 +261,7 @@ export class GrokAgentProvider implements IAgentProvider {
     yield {
       type: 'result',
       tokens,
+      ...(costReported ? { cost: totalCost } : {}),
       stopReason: 'stop',
       structuredOutput,
       ...(servedModelId !== undefined ? { servedModelId } : {}),

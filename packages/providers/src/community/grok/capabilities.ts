@@ -17,7 +17,7 @@ export const GROK_AGENT_CAPABILITIES: ProviderCapabilities = {
   hooks: false,
   skills: false,
   agents: false,
-  toolRestrictions: false,
+  toolRestrictions: true,
   structuredOutput: true,
   envInjection: true,
   costControl: false,
