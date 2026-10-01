@@ -19,7 +19,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { basename, join } from 'path';
+import { basename, delimiter, join } from 'path';
 import { parseWorkflow } from './loader';
 import {
   clearRegistry,
@@ -228,6 +228,7 @@ const REJECTED_REPAIR_BRANCHES = [
 ] as const;
 
 function extractCommitSelection(yaml: string, laneLabel: string): string {
+  yaml = yaml.replace(/\r\n/g, '\n');
   const startMarker = "DECIDE_OUTPUT_CLEAN=$(printf '%s\\n' \"$DECIDE_OUTPUT\" | tr -d '`')";
   const start = yaml.indexOf(startMarker);
   const end = start < 0 ? -1 : yaml.indexOf('\n      git status --short', start);
@@ -251,6 +252,7 @@ function extractCommitSelection(yaml: string, laneLabel: string): string {
 }
 
 function extractCheckoutRepair(yaml: string, laneLabel: string): string {
+  yaml = yaml.replace(/\r\n/g, '\n');
   const nodeStart = yaml.indexOf('  - id: checkout-repair-target\n');
   if (nodeStart < 0) {
     throw new Error(`checkout-repair-target missing in ${laneLabel}`);
@@ -284,17 +286,33 @@ function bash(
   cwd: string,
   env: Record<string, string> = {}
 ): { exitCode: number; stdout: string; stderr: string } {
-  const result = Bun.spawnSync(['bash', '-c', script], {
-    cwd,
-    env: { ...process.env, ...env },
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  return {
-    exitCode: result.exitCode ?? 1,
-    stdout: result.stdout.toString(),
-    stderr: result.stderr.toString(),
-  };
+  // Windows argument quoting can corrupt a multiline bash -c payload. Execute
+  // the same extracted bytes from a private file on both platforms instead.
+  const scriptDir = mkdtempSync(join(tmpdir(), 'bdc-shell-'));
+  const scriptPath = join(scriptDir, 'fixture.sh');
+  const childEnv = { ...process.env, ...env };
+  if (process.platform === 'win32' && env.PATH !== undefined) {
+    // Windows may inherit Path; a competing key can hide the fixture's PATH.
+    for (const key of Object.keys(childEnv)) {
+      if (key !== 'PATH' && key.toUpperCase() === 'PATH') delete childEnv[key];
+    }
+  }
+  try {
+    writeFileSync(scriptPath, script.replace(/\r\n/g, '\n'));
+    const result = Bun.spawnSync(['bash', scriptPath.replace(/\\/g, '/')], {
+      cwd,
+      env: childEnv,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    return {
+      exitCode: result.exitCode ?? 1,
+      stdout: result.stdout.toString(),
+      stderr: result.stderr.toString(),
+    };
+  } finally {
+    rmSync(scriptDir, { recursive: true, force: true });
+  }
 }
 
 function git(args: string[], cwd: string): void {
@@ -342,20 +360,22 @@ printf '{"state":"%s","headRefName":"%s","isCrossRepository":%s,"headRepositoryO
   process.env.FAKE_GH_OWNER = opts?.owner ?? 'thinmansoftware';
   process.env.FAKE_GH_REPO = opts?.repo ?? 'bdc-harness';
   process.env.FAKE_GH_HEAD_OID = opts?.headRefOid ?? '';
-  return `${binDir}:${process.env.PATH ?? ''}`;
+  return `${binDir}${delimiter}${process.env.PATH ?? ''}`;
 }
 
-function repairDecideOutput(branch: string): string {
+function repairDecideOutput(branch: string, pushTarget = 'feat/should-not-mint'): string {
   return [
-    'push_target: feature-branch: feat/should-not-mint',
+    `push_target: feature-branch: ${pushTarget}`,
     'repair_target_pr: #826',
     `repair_target_branch: ${branch}`,
     'repo: thinmansoftware/bdc-harness',
   ].join('\n');
 }
 
-function authorizedRepairDecideOutput(branch: string): string {
-  return [repairDecideOutput(branch), 'repair_target_authorized_by_spec: #826'].join('\n');
+function authorizedRepairDecideOutput(branch: string, pushTarget?: string): string {
+  return [repairDecideOutput(branch, pushTarget), 'repair_target_authorized_by_spec: #826'].join(
+    '\n'
+  );
 }
 
 function matchingRepairSpec(branch: string): string {
@@ -1164,6 +1184,7 @@ function publishHead(branch: string): string {
 }
 
 function rawCommitBlock(yaml: string, laneLabel: string): string {
+  yaml = yaml.replace(/\r\n/g, '\n');
   const startMarker = "DECIDE_OUTPUT_CLEAN=$(printf '%s\\n' \"$DECIDE_OUTPUT\" | tr -d '`')";
   const start = yaml.indexOf(startMarker);
   const end = start < 0 ? -1 : yaml.indexOf('\n      git status --short', start);
@@ -1229,276 +1250,309 @@ describe('Spec-authorized repair onto wo and Cauldron task branches', () => {
     }
   });
 
-  it('Test 1: accepts wo and archon task branches on checkout and commit selection', () => {
-    const published: Record<string, string> = {};
-    for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-      published[branch] = publishHead(branch);
-    }
-    configureOfflineCheckoutOrigin();
+  function itAcrossRepairLanes(name: string, run: (lane: string) => void, timeout = 120000) {
     for (const lane of REPAIR_COVERAGE_LANES) {
-      const { checkout, commit } = laneScripts(lane);
+      it(`${name} (${basename(lane)})`, () => run(lane), timeout);
+    }
+  }
+  itAcrossRepairLanes(
+    'Test 1: accepts wo and archon task branches on checkout and commit selection',
+    targetLane => {
+      const published: Record<string, string> = {};
       for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-        const oid = published[branch];
-        if (!oid) throw new Error(`missing oid for ${branch}`);
-        const label = `${basename(lane)} ${branch}`;
-        const pathEnv = fakeGhPath('OPEN', branch, { headRefOid: oid });
-        const checkoutResult = bash(checkout, worktreeDir, {
-          SPEC_TEXT: matchingRepairSpec(branch),
-          PATH: pathEnv,
-        });
-        if (checkoutResult.exitCode !== 0) throw new Error(showResult(checkoutResult, label));
-        expect(checkoutResult.stdout).toContain('REPAIR_TARGET=#826');
-        expect(checkoutResult.stdout).toContain(`REPAIR_TARGET_BRANCH=${branch}`);
-        expect(checkoutResult.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${oid}`);
-        const commitResult = bash(commit, worktreeDir, {
-          DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
-          SPEC_TEXT: matchingRepairSpec(branch),
-          CHECKOUT_OUTPUT: [
-            'REPAIR_TARGET=#826',
-            `REPAIR_TARGET_BRANCH=${branch}`,
-            `REPAIR_TARGET_LEASE_SHA=${oid}`,
-          ].join('\n'),
-          PATH: pathEnv,
-        });
-        if (commitResult.exitCode !== 0) throw new Error(showResult(commitResult, label));
-        expect(commitResult.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
-        expect(commitResult.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${oid}`);
-        expect(commitResult.stdout).not.toContain('-thread-');
-        expect(commitResult.stdout).not.toContain('UNIQUE_BRANCH=feat/should-not-mint');
+        published[branch] = publishHead(branch);
       }
-    }
-  }, 120000);
-
-  it('Test 2: rejects protected, promotion, and malformed repair branches', () => {
-    for (const lane of REPAIR_COVERAGE_LANES) {
-      const { checkout, commit } = laneScripts(lane);
-      for (const branch of REJECTED_REPAIR_BRANCHES) {
-        const label = `${basename(lane)} ${branch}`;
-        const checkoutResult = bash(checkout, worktreeDir, {
-          SPEC_TEXT: matchingRepairSpec(branch),
-        });
-        if (checkoutResult.exitCode === 0) throw new Error(showResult(checkoutResult, label));
-        expect(checkoutResult.stderr).toContain(`invalid repair_target_branch '${branch}'`);
-        expect(checkoutResult.stdout).not.toContain('REPAIR_TARGET=#826');
-        expect(bash('git rev-parse --abbrev-ref HEAD', worktreeDir).stdout.trim()).toBe('main');
-        const commitResult = bash(commit, worktreeDir, {
-          DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
-          SPEC_TEXT: matchingRepairSpec(branch),
-        });
-        if (commitResult.exitCode === 0)
-          throw new Error(showResult(commitResult, `commit ${label}`));
-        expect(commitResult.stderr).toContain(`invalid repair_target_branch '${branch}'`);
-        expect(commitResult.stdout).not.toContain('UNIQUE_BRANCH=');
-      }
-    }
-  }, 120000);
-
-  it('Test 3: rejects closed, forked, mismatched, and empty-head repair targets', () => {
-    configureOfflineCheckoutOrigin();
-    const cases: Array<{
-      name: string;
-      state: string;
-      liveBranch?: string;
-      opts?: { cross?: boolean; owner?: string; repo?: string; headRefOid?: string };
-      token: string;
-    }> = [
-      { name: 'closed', state: 'CLOSED', token: 'is CLOSED' },
-      {
-        name: 'fork',
-        state: 'OPEN',
-        opts: { cross: true, owner: 'someone-else', repo: 'bdc-harness' },
-        token: 'repair_target_rejected:fork',
-      },
-      {
-        name: 'branch-mismatch',
-        state: 'OPEN',
-        liveBranch: 'feat/a-different-branch',
-        token: 'head branch mismatch',
-      },
-      {
-        name: 'empty-sha',
-        state: 'OPEN',
-        opts: { headRefOid: '' },
-        token: 'repair_target_fetch_failed',
-      },
-    ];
-    for (const lane of REPAIR_COVERAGE_LANES) {
-      const { checkout, commit } = laneScripts(lane);
-      for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-        for (const specCase of cases) {
-          const label = `${basename(lane)} ${branch} ${specCase.name}`;
-          const liveBranch = specCase.liveBranch ?? branch;
-          const pathEnv = fakeGhPath(specCase.state, liveBranch, specCase.opts);
-          const env = {
+      configureOfflineCheckoutOrigin();
+      for (const lane of [targetLane]) {
+        const { checkout, commit } = laneScripts(lane);
+        for (const branch of ACCEPTED_REPAIR_BRANCHES) {
+          const oid = published[branch];
+          if (!oid) throw new Error(`missing oid for ${branch}`);
+          const label = `${basename(lane)} ${branch}`;
+          const pathEnv = fakeGhPath('OPEN', branch, { headRefOid: oid });
+          const checkoutResult = bash(checkout, worktreeDir, {
             SPEC_TEXT: matchingRepairSpec(branch),
             PATH: pathEnv,
-          };
-          const checkoutResult = bash(checkout, worktreeDir, env);
+          });
+          if (checkoutResult.exitCode !== 0) throw new Error(showResult(checkoutResult, label));
+          expect(checkoutResult.stdout).toContain('REPAIR_TARGET=#826');
+          expect(checkoutResult.stdout).toContain(`REPAIR_TARGET_BRANCH=${branch}`);
+          expect(checkoutResult.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${oid}`);
+          const commitResult = bash(commit, worktreeDir, {
+            DECIDE_OUTPUT: authorizedRepairDecideOutput(branch, branch),
+            SPEC_TEXT: matchingRepairSpec(branch),
+            CHECKOUT_OUTPUT: [
+              'REPAIR_TARGET=#826',
+              `REPAIR_TARGET_BRANCH=${branch}`,
+              `REPAIR_TARGET_LEASE_SHA=${oid}`,
+            ].join('\n'),
+            PATH: pathEnv,
+          });
+          if (commitResult.exitCode !== 0) throw new Error(showResult(commitResult, label));
+          expect(commitResult.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
+          expect(commitResult.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${oid}`);
+          expect(commitResult.stdout).not.toContain('-thread-');
+          expect(commitResult.stdout).not.toContain('UNIQUE_BRANCH=feat/should-not-mint');
+        }
+      }
+    },
+    120000
+  );
+
+  itAcrossRepairLanes(
+    'Test 2: rejects protected, promotion, and malformed repair branches',
+    targetLane => {
+      for (const lane of [targetLane]) {
+        const { checkout, commit } = laneScripts(lane);
+        for (const branch of REJECTED_REPAIR_BRANCHES) {
+          const label = `${basename(lane)} ${branch}`;
+          const checkoutResult = bash(checkout, worktreeDir, {
+            SPEC_TEXT: matchingRepairSpec(branch),
+          });
           if (checkoutResult.exitCode === 0) throw new Error(showResult(checkoutResult, label));
-          expect(`${checkoutResult.stdout}\n${checkoutResult.stderr}`).toContain(specCase.token);
+          expect(checkoutResult.stderr).toContain(`invalid repair_target_branch '${branch}'`);
           expect(checkoutResult.stdout).not.toContain('REPAIR_TARGET=#826');
           expect(bash('git rev-parse --abbrev-ref HEAD', worktreeDir).stdout.trim()).toBe('main');
           const commitResult = bash(commit, worktreeDir, {
-            ...env,
             DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
+            SPEC_TEXT: matchingRepairSpec(branch),
           });
           if (commitResult.exitCode === 0)
             throw new Error(showResult(commitResult, `commit ${label}`));
-          expect(`${commitResult.stdout}\n${commitResult.stderr}`).toContain(specCase.token);
+          expect(commitResult.stderr).toContain(`invalid repair_target_branch '${branch}'`);
           expect(commitResult.stdout).not.toContain('UNIQUE_BRANCH=');
         }
       }
-    }
-  }, 120000);
+    },
+    120000
+  );
 
-  it('Test 3: rejects fetched-head mismatch before checkout or selection', () => {
-    const published: Record<string, string> = {};
-    for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-      published[branch] = publishHead(branch);
-    }
-    configureOfflineCheckoutOrigin();
-    for (const lane of REPAIR_COVERAGE_LANES) {
-      const { checkout, commit } = laneScripts(lane);
-      for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-        const label = `${basename(lane)} ${branch} fetched-mismatch`;
-        const pathEnv = fakeGhPath('OPEN', branch, {
-          headRefOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-        });
-        const checkoutResult = bash(checkout, worktreeDir, {
-          SPEC_TEXT: matchingRepairSpec(branch),
-          PATH: pathEnv,
-        });
-        if (checkoutResult.exitCode === 0) throw new Error(showResult(checkoutResult, label));
-        expect(checkoutResult.stderr).toContain('repair_target_head_mismatch');
-        expect(bash('git rev-parse --abbrev-ref HEAD', worktreeDir).stdout.trim()).toBe('main');
-        const commitResult = bash(commit, worktreeDir, {
-          DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
-          SPEC_TEXT: matchingRepairSpec(branch),
-          PATH: pathEnv,
-        });
-        if (commitResult.exitCode === 0)
-          throw new Error(showResult(commitResult, `commit ${label}`));
-        expect(commitResult.stderr).toContain('repair_target_head_mismatch');
-        expect(commitResult.stdout).not.toContain('UNIQUE_BRANCH=');
-        expect(published[branch]).toBeTruthy();
-      }
-    }
-  }, 120000);
-
-  it('Test 3: rejects a moved checkout lease and a lease that is not an ancestor', () => {
-    const movedLease = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
-    for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-      const oid = publishHead(branch);
-      for (const lane of REPAIR_COVERAGE_LANES) {
-        const commit = extractCommitSelection(readFileSync(lane, 'utf8'), lane);
-        const label = `${basename(lane)} ${branch} head-moved`;
-        const moved = bash(commit, worktreeDir, {
-          DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
-          SPEC_TEXT: matchingRepairSpec(branch),
-          CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${movedLease}`,
-          PATH: fakeGhPath('OPEN', branch, { headRefOid: oid }),
-        });
-        if (moved.exitCode === 0) throw new Error(showResult(moved, label));
-        expect(moved.stderr).toContain('repair_target_head_moved');
-        expect(moved.stdout).not.toContain('UNIQUE_BRANCH=');
-      }
-    }
-
-    for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-      const initSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
-      const fileName = `pr-only-${branch.replace(/[^A-Za-z0-9]/g, '_')}.txt`;
-      writeFileSync(join(worktreeDir, fileName), 'on the PR\n');
-      git(['add', fileName], worktreeDir);
-      git(['commit', '-m', `pr-only ${branch}`], worktreeDir);
-      const leaseSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
-      git(['push', 'origin', `HEAD:${branch}`], worktreeDir);
-      git(['reset', '--hard', initSha], worktreeDir);
-      writeFileSync(join(worktreeDir, 'implement.txt'), `run ${branch}\n`);
-      git(['add', 'implement.txt'], worktreeDir);
-      git(['commit', '-m', `implement ${branch}`], worktreeDir);
-      for (const lane of REPAIR_COVERAGE_LANES) {
-        const commit = extractCommitSelection(readFileSync(lane, 'utf8'), lane);
-        const label = `${basename(lane)} ${branch} not-ancestor`;
-        const result = bash(commit, worktreeDir, {
-          DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
-          SPEC_TEXT: matchingRepairSpec(branch),
-          CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${leaseSha}`,
-          PATH: fakeGhPath('OPEN', branch, { headRefOid: leaseSha }),
-        });
-        if (result.exitCode === 0) throw new Error(showResult(result, label));
-        expect(result.stderr).toContain('repair_target_base_not_incorporated');
-        expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
-      }
-    }
-  }, 120000);
-
-  it('Test 4: ordinary push_target still rejects wo and archon task branches', () => {
-    for (const lane of REPAIR_COVERAGE_LANES) {
-      const yaml = readFileSync(lane, 'utf8');
-      const commit = extractCommitSelection(yaml, lane);
-      expect(yaml.split(ORDINARY_BRANCH_PATTERN).length - 1).toBe(1);
-      expect(F6A_VALIDATOR).toContain(ORDINARY_BRANCH_PATTERN);
-      for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-        const label = `${basename(lane)} ordinary ${branch}`;
-        const result = bash(commit, worktreeDir, {
-          DECIDE_OUTPUT: `push_target: feature-branch: ${branch}\nrepo: thinmansoftware/bdc-harness\n`,
-          SPEC_TEXT: 'WO: WO-TEST\nObjective: no repair target',
-        });
-        if (result.exitCode === 0) throw new Error(showResult(result, label));
-        expect(result.stderr).toContain('Malformed branch name');
-        expect(result.stderr).toContain('feat/|fix/|wip/|archon/thread-');
-        expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
-      }
-    }
-  }, 120000);
-
-  it('Test 6: repeated selection stays on the original branch and does not dirty the tree', () => {
-    const published: Record<string, string> = {};
-    for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-      published[branch] = publishHead(branch);
-    }
-    configureOfflineCheckoutOrigin();
-    for (const lane of REPAIR_COVERAGE_LANES) {
-      const { checkout, commit } = laneScripts(lane);
-      for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-        const oid = published[branch];
-        if (!oid) throw new Error(`missing oid for ${branch}`);
-        const label = `${basename(lane)} ${branch}`;
-        const pathEnv = fakeGhPath('OPEN', branch, { headRefOid: oid });
-        const checkoutEnv = {
-          SPEC_TEXT: matchingRepairSpec(branch),
-          PATH: pathEnv,
-        };
-        const firstCheckout = bash(checkout, worktreeDir, checkoutEnv);
-        const secondCheckout = bash(checkout, worktreeDir, checkoutEnv);
-        if (firstCheckout.exitCode !== 0 || secondCheckout.exitCode !== 0) {
-          throw new Error(
-            showResult(secondCheckout.exitCode === 0 ? firstCheckout : secondCheckout, label)
-          );
+  itAcrossRepairLanes(
+    'Test 3: rejects closed, forked, mismatched, and empty-head repair targets',
+    targetLane => {
+      configureOfflineCheckoutOrigin();
+      const cases: Array<{
+        name: string;
+        state: string;
+        liveBranch?: string;
+        opts?: { cross?: boolean; owner?: string; repo?: string; headRefOid?: string };
+        token: string;
+      }> = [
+        { name: 'closed', state: 'CLOSED', token: 'is CLOSED' },
+        {
+          name: 'fork',
+          state: 'OPEN',
+          opts: { cross: true, owner: 'someone-else', repo: 'bdc-harness' },
+          token: 'repair_target_rejected:fork',
+        },
+        {
+          name: 'branch-mismatch',
+          state: 'OPEN',
+          liveBranch: 'feat/a-different-branch',
+          token: 'head branch mismatch',
+        },
+        {
+          name: 'empty-sha',
+          state: 'OPEN',
+          opts: { headRefOid: '' },
+          token: 'repair_target_fetch_failed',
+        },
+      ];
+      for (const lane of [targetLane]) {
+        const { checkout, commit } = laneScripts(lane);
+        for (const branch of ACCEPTED_REPAIR_BRANCHES) {
+          for (const specCase of cases) {
+            const label = `${basename(lane)} ${branch} ${specCase.name}`;
+            const liveBranch = specCase.liveBranch ?? branch;
+            const pathEnv = fakeGhPath(specCase.state, liveBranch, specCase.opts);
+            const env = {
+              SPEC_TEXT: matchingRepairSpec(branch),
+              PATH: pathEnv,
+            };
+            const checkoutResult = bash(checkout, worktreeDir, env);
+            if (checkoutResult.exitCode === 0) throw new Error(showResult(checkoutResult, label));
+            expect(`${checkoutResult.stdout}\n${checkoutResult.stderr}`).toContain(specCase.token);
+            expect(checkoutResult.stdout).not.toContain('REPAIR_TARGET=#826');
+            expect(bash('git rev-parse --abbrev-ref HEAD', worktreeDir).stdout.trim()).toBe('main');
+            const commitResult = bash(commit, worktreeDir, {
+              ...env,
+              DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
+            });
+            if (commitResult.exitCode === 0)
+              throw new Error(showResult(commitResult, `commit ${label}`));
+            expect(`${commitResult.stdout}\n${commitResult.stderr}`).toContain(specCase.token);
+            expect(commitResult.stdout).not.toContain('UNIQUE_BRANCH=');
+          }
         }
-        expect(firstCheckout.stdout).toContain(`REPAIR_TARGET_BRANCH=${branch}`);
-        expect(secondCheckout.stdout).toContain(`REPAIR_TARGET_BRANCH=${branch}`);
-        expect(firstCheckout.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${oid}`);
-        expect(secondCheckout.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${oid}`);
-        const commitEnv = {
-          DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
-          SPEC_TEXT: matchingRepairSpec(branch),
-          CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${oid}`,
-          PATH: pathEnv,
-        };
-        const firstCommit = bash(commit, worktreeDir, commitEnv);
-        const secondCommit = bash(commit, worktreeDir, commitEnv);
-        if (firstCommit.exitCode !== 0 || secondCommit.exitCode !== 0) {
-          throw new Error(
-            showResult(secondCommit.exitCode === 0 ? firstCommit : secondCommit, label)
-          );
-        }
-        expect(firstCommit.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
-        expect(secondCommit.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
-        expect(firstCommit.stdout).not.toContain('-thread-');
-        expect(secondCommit.stdout).not.toContain('-thread-');
-        expect(bash('git status --porcelain', worktreeDir).stdout.trim()).toBe('');
       }
-    }
-  }, 120000);
+    },
+    120000
+  );
+
+  itAcrossRepairLanes(
+    'Test 3: rejects fetched-head mismatch before checkout or selection',
+    targetLane => {
+      const published: Record<string, string> = {};
+      for (const branch of ACCEPTED_REPAIR_BRANCHES) {
+        published[branch] = publishHead(branch);
+      }
+      configureOfflineCheckoutOrigin();
+      for (const lane of [targetLane]) {
+        const { checkout, commit } = laneScripts(lane);
+        for (const branch of ACCEPTED_REPAIR_BRANCHES) {
+          const label = `${basename(lane)} ${branch} fetched-mismatch`;
+          const pathEnv = fakeGhPath('OPEN', branch, {
+            headRefOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          });
+          const checkoutResult = bash(checkout, worktreeDir, {
+            SPEC_TEXT: matchingRepairSpec(branch),
+            PATH: pathEnv,
+          });
+          if (checkoutResult.exitCode === 0) throw new Error(showResult(checkoutResult, label));
+          expect(checkoutResult.stderr).toContain('repair_target_head_mismatch');
+          expect(bash('git rev-parse --abbrev-ref HEAD', worktreeDir).stdout.trim()).toBe('main');
+          const commitResult = bash(commit, worktreeDir, {
+            DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
+            SPEC_TEXT: matchingRepairSpec(branch),
+            PATH: pathEnv,
+          });
+          if (commitResult.exitCode === 0)
+            throw new Error(showResult(commitResult, `commit ${label}`));
+          expect(commitResult.stderr).toContain('repair_target_head_mismatch');
+          expect(commitResult.stdout).not.toContain('UNIQUE_BRANCH=');
+          expect(published[branch]).toBeTruthy();
+        }
+      }
+    },
+    120000
+  );
+
+  itAcrossRepairLanes(
+    'Test 3: rejects a moved checkout lease and a lease that is not an ancestor',
+    targetLane => {
+      const movedLease = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      for (const branch of ACCEPTED_REPAIR_BRANCHES) {
+        const oid = publishHead(branch);
+        for (const lane of [targetLane]) {
+          const commit = extractCommitSelection(readFileSync(lane, 'utf8'), lane);
+          const label = `${basename(lane)} ${branch} head-moved`;
+          const moved = bash(commit, worktreeDir, {
+            DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
+            SPEC_TEXT: matchingRepairSpec(branch),
+            CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${movedLease}`,
+            PATH: fakeGhPath('OPEN', branch, { headRefOid: oid }),
+          });
+          if (moved.exitCode === 0) throw new Error(showResult(moved, label));
+          expect(moved.stderr).toContain('repair_target_head_moved');
+          expect(moved.stdout).not.toContain('UNIQUE_BRANCH=');
+        }
+      }
+
+      for (const branch of ACCEPTED_REPAIR_BRANCHES) {
+        const initSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+        const fileName = `pr-only-${branch.replace(/[^A-Za-z0-9]/g, '_')}.txt`;
+        writeFileSync(join(worktreeDir, fileName), 'on the PR\n');
+        git(['add', fileName], worktreeDir);
+        git(['commit', '-m', `pr-only ${branch}`], worktreeDir);
+        const leaseSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+        git(['push', 'origin', `HEAD:${branch}`], worktreeDir);
+        git(['reset', '--hard', initSha], worktreeDir);
+        writeFileSync(join(worktreeDir, 'implement.txt'), `run ${branch}\n`);
+        git(['add', 'implement.txt'], worktreeDir);
+        git(['commit', '-m', `implement ${branch}`], worktreeDir);
+        for (const lane of [targetLane]) {
+          const commit = extractCommitSelection(readFileSync(lane, 'utf8'), lane);
+          const label = `${basename(lane)} ${branch} not-ancestor`;
+          const result = bash(commit, worktreeDir, {
+            DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
+            SPEC_TEXT: matchingRepairSpec(branch),
+            CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${leaseSha}`,
+            PATH: fakeGhPath('OPEN', branch, { headRefOid: leaseSha }),
+          });
+          if (result.exitCode === 0) throw new Error(showResult(result, label));
+          expect(result.stderr).toContain('repair_target_base_not_incorporated');
+          expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
+        }
+      }
+    },
+    120000
+  );
+
+  itAcrossRepairLanes(
+    'Test 4: ordinary push_target still rejects wo and archon task branches',
+    targetLane => {
+      for (const lane of [targetLane]) {
+        const yaml = readFileSync(lane, 'utf8');
+        const commit = extractCommitSelection(yaml, lane);
+        expect(yaml.split(ORDINARY_BRANCH_PATTERN).length - 1).toBe(1);
+        expect(F6A_VALIDATOR).toContain(ORDINARY_BRANCH_PATTERN);
+        for (const branch of ACCEPTED_REPAIR_BRANCHES) {
+          const label = `${basename(lane)} ordinary ${branch}`;
+          const result = bash(commit, worktreeDir, {
+            DECIDE_OUTPUT: `push_target: feature-branch: ${branch}\nrepo: thinmansoftware/bdc-harness\n`,
+            SPEC_TEXT: 'WO: WO-TEST\nObjective: no repair target',
+          });
+          if (result.exitCode === 0) throw new Error(showResult(result, label));
+          expect(result.stderr).toContain('Malformed branch name');
+          expect(result.stderr).toContain('feat/|fix/|wip/|archon/thread-');
+          expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
+        }
+      }
+    },
+    120000
+  );
+
+  itAcrossRepairLanes(
+    'Test 6: repeated selection stays on the original branch and does not dirty the tree',
+    targetLane => {
+      const published: Record<string, string> = {};
+      for (const branch of ACCEPTED_REPAIR_BRANCHES) {
+        published[branch] = publishHead(branch);
+      }
+      configureOfflineCheckoutOrigin();
+      for (const lane of [targetLane]) {
+        const { checkout, commit } = laneScripts(lane);
+        for (const branch of ACCEPTED_REPAIR_BRANCHES) {
+          const oid = published[branch];
+          if (!oid) throw new Error(`missing oid for ${branch}`);
+          const label = `${basename(lane)} ${branch}`;
+          const pathEnv = fakeGhPath('OPEN', branch, { headRefOid: oid });
+          const checkoutEnv = {
+            SPEC_TEXT: matchingRepairSpec(branch),
+            PATH: pathEnv,
+          };
+          const firstCheckout = bash(checkout, worktreeDir, checkoutEnv);
+          const secondCheckout = bash(checkout, worktreeDir, checkoutEnv);
+          if (firstCheckout.exitCode !== 0 || secondCheckout.exitCode !== 0) {
+            throw new Error(
+              showResult(secondCheckout.exitCode === 0 ? firstCheckout : secondCheckout, label)
+            );
+          }
+          expect(firstCheckout.stdout).toContain(`REPAIR_TARGET_BRANCH=${branch}`);
+          expect(secondCheckout.stdout).toContain(`REPAIR_TARGET_BRANCH=${branch}`);
+          expect(firstCheckout.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${oid}`);
+          expect(secondCheckout.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${oid}`);
+          const commitEnv = {
+            DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
+            SPEC_TEXT: matchingRepairSpec(branch),
+            CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${oid}`,
+            PATH: pathEnv,
+          };
+          const firstCommit = bash(commit, worktreeDir, commitEnv);
+          const secondCommit = bash(commit, worktreeDir, commitEnv);
+          if (firstCommit.exitCode !== 0 || secondCommit.exitCode !== 0) {
+            throw new Error(
+              showResult(secondCommit.exitCode === 0 ? firstCommit : secondCommit, label)
+            );
+          }
+          expect(firstCommit.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
+          expect(secondCommit.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
+          expect(firstCommit.stdout).not.toContain('-thread-');
+          expect(secondCommit.stdout).not.toContain('-thread-');
+          expect(bash('git status --porcelain', worktreeDir).stdout.trim()).toBe('');
+        }
+      }
+    },
+    120000
+  );
 });
