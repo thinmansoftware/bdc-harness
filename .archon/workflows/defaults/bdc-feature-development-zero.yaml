@@ -136,8 +136,8 @@ nodes:
         echo "REPAIR_TARGET=none"
         exit 0
       fi
-      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
-      if ! git check-ref-format --branch "$SPEC_REPAIR_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$SPEC_REPAIR_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+      REPAIR_BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+|wo/[A-Za-z0-9_-]+|archon/task-web-worker-[0-9]+-[A-Za-z0-9]+)$'
+      if ! git check-ref-format --branch "$SPEC_REPAIR_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$SPEC_REPAIR_BRANCH" | grep -Eq "$REPAIR_BRANCH_PATTERN"; then
         echo "ERROR: invalid repair_target_branch '${SPEC_REPAIR_BRANCH}'" >&2
         exit 1
       fi
@@ -3282,8 +3282,9 @@ nodes:
       # so trailing prose is tolerated. Failure now distinguishes "field absent"
       # from "field present but unparseable". Extraction is a pure read of the
       # decide output (no state mutation), so re-running the node is
-      # side-effect-free. BRANCH_PATTERN validation below is unchanged and still
-      # runs after extraction.
+      # side-effect-free. BRANCH_PATTERN runs only on the non-repair path
+      # immediately before ordinary UNIQUE_BRANCH construction. The repair arm
+      # uses REPAIR_BRANCH_PATTERN.
       DECIDE_OUTPUT_CLEAN=$(printf '%s\n' "$DECIDE_OUTPUT" | tr -d '`')
       BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*push_target:[[:space:]]*feature-branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       if [ -z "$BRANCH" ]; then
@@ -3307,17 +3308,6 @@ nodes:
         else
           echo "push_target field absent from decide-push-target output." >&2
         fi
-        exit 1
-      fi
-      # F-6A: Validate BRANCH against allowlist regex BEFORE constructing UNIQUE_BRANCH.
-      # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (anchor 2026-05-18: three WOs hit
-      # double-suffix branch names like archon/thread-9772643d-thread-9772643d).
-      # The engine appends -thread-<hash> at push time, so the agent must emit a
-      # clean feat/|fix/|wip/ prefix only. archon/thread- prefix is rejected here
-      # because it would produce a double-suffix UNIQUE_BRANCH.
-      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
-      if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
-        echo "Malformed branch name: $BRANCH does not match required pattern feat/|fix/|wip/|archon/thread-" >&2
         exit 1
       fi
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
@@ -3370,7 +3360,8 @@ nodes:
           echo "ERROR: repair_target_malformed: both repair_target_pr and repair_target_branch are required before branch selection" >&2
           exit 1
         fi
-        if ! git check-ref-format --branch "$REPAIR_TARGET_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        REPAIR_BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+|wo/[A-Za-z0-9_-]+|archon/task-web-worker-[0-9]+-[A-Za-z0-9]+)$'
+        if ! git check-ref-format --branch "$REPAIR_TARGET_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$REPAIR_BRANCH_PATTERN"; then
           echo "ERROR: invalid repair_target_branch '${REPAIR_TARGET_BRANCH}'" >&2
           exit 1
         fi
@@ -3443,6 +3434,17 @@ nodes:
         fi
         UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"
       else
+        # F-6A: Validate BRANCH against allowlist regex BEFORE constructing UNIQUE_BRANCH.
+        # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (anchor 2026-05-18: three WOs hit
+        # double-suffix branch names like archon/thread-9772643d-thread-9772643d).
+        # The engine appends -thread-<hash> at push time, so the agent must emit a
+        # clean feat/|fix/|wip/ prefix only. archon/thread- prefix is rejected here
+        # because it would produce a double-suffix UNIQUE_BRANCH.
+        BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+        if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+          echo "Malformed branch name: $BRANCH does not match required pattern feat/|fix/|wip/|archon/thread-" >&2
+          exit 1
+        fi
         UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       fi
       git status --short
