@@ -20,6 +20,7 @@ import type {
   RequiredContextsFailureKind,
 } from './required-contexts.ts';
 import { createDurableAttemptCounterStore } from './required-contexts-store';
+import { reduceToLatestCheckRuns } from '../check-runs-latest';
 
 const log = createLogger('overseer/github-real-deps');
 
@@ -260,7 +261,16 @@ export interface RealGitHubOctokitLike {
   checks: {
     listForRef(input: Record<string, unknown>): Promise<{
       data: {
-        check_runs: { name?: string; status: string; conclusion: string | null }[];
+        check_runs: {
+          name?: string;
+          status: string;
+          conclusion: string | null;
+          id?: number;
+          started_at?: string | null;
+          completed_at?: string | null;
+          app?: { id?: number | null; slug?: string | null } | null;
+          details_url?: string | null;
+        }[];
       };
     }>;
   };
@@ -367,7 +377,27 @@ export type BoundReposMethodName = (typeof BOUND_REPOS_METHODS)[number] &
 
 export interface ExactHeadPullRequestEvidence {
   diff: string;
-  checks: { name: string; status: string; conclusion: string | null }[];
+  checks: {
+    name: string;
+    status: string;
+    conclusion: string | null;
+    id?: number;
+    completed_at?: string | null;
+  }[];
+  /**
+   * Older runs of a check name that were superseded by a newer run at this head
+   * (#1048). Present only when the reduction dropped at least one run. Each
+   * entry carries `superseded_by`, the id of the current run that replaced it,
+   * so the audit trail records why an earlier failure/success was not counted.
+   */
+  supersededChecks?: {
+    name: string;
+    status: string;
+    conclusion: string | null;
+    id?: number;
+    completed_at?: string | null;
+    superseded_by: number;
+  }[];
   /**
    * Required status-check contexts enforced on the PR's base branch.
    *
@@ -514,6 +544,17 @@ export function createRealFetchExactHeadPullRequestEvidence(
     // prevent (#775).
     const requiredContexts: string[] | null =
       resolution.state === 'known' ? resolution.contexts : null;
+    // Judge each check NAME by its newest run at this head so an older failed
+    // run is never counted as current after a later run of the same name (#1048).
+    const reducedChecks = reduceToLatestCheckRuns(checkRuns.data.check_runs);
+    const supersededChecks = reducedChecks.superseded.map(run => ({
+      name: run.name?.trim() || 'check',
+      status: run.status,
+      conclusion: run.conclusion,
+      ...(typeof run.id === 'number' ? { id: run.id } : {}),
+      ...(run.completed_at != null ? { completed_at: run.completed_at } : {}),
+      superseded_by: run.superseded_by,
+    }));
     return {
       ...(resolution.state === 'exhausted'
         ? {
@@ -527,11 +568,14 @@ export function createRealFetchExactHeadPullRequestEvidence(
       diff: (comparison.data.files ?? [])
         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
         .join('\n'),
-      checks: checkRuns.data.check_runs.map((run, index) => ({
+      checks: reducedChecks.current.map((run, index) => ({
         name: run.name?.trim() || `check-${index + 1}`,
         status: run.status,
         conclusion: run.conclusion,
+        ...(typeof run.id === 'number' ? { id: run.id } : {}),
+        ...(run.completed_at != null ? { completed_at: run.completed_at } : {}),
       })),
+      ...(supersededChecks.length > 0 ? { supersededChecks } : {}),
       requiredContexts,
     };
   };
@@ -881,7 +925,10 @@ export function createRealFindPullRequest(
         ref: pr.data.head.sha,
         per_page: 100,
       });
-      const checks = summarizeChecks(checkRunsResp.data.check_runs);
+      // Count each check NAME once, by its newest run at this head (#1048).
+      const checks = summarizeChecks(
+        reduceToLatestCheckRuns(checkRunsResp.data.check_runs).current
+      );
       let changedFilePaths: string[] | undefined;
       if (input.includeChangedFiles) {
         if (!octokit.pulls.listFiles) throw new Error('overseer_real_adapter_missing_list_files');
