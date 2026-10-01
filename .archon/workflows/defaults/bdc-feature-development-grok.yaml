@@ -125,8 +125,8 @@ nodes:
         echo "REPAIR_TARGET=none"
         exit 0
       fi
-      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
-      if ! git check-ref-format --branch "$SPEC_REPAIR_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$SPEC_REPAIR_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+      REPAIR_BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+|wo/[A-Za-z0-9_-]+|archon/task-web-worker-[0-9]+-[A-Za-z0-9]+)$'
+      if ! git check-ref-format --branch "$SPEC_REPAIR_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$SPEC_REPAIR_BRANCH" | grep -Eq "$REPAIR_BRANCH_PATTERN"; then
         echo "ERROR: invalid repair_target_branch '${SPEC_REPAIR_BRANCH}'" >&2
         exit 1
       fi
@@ -3350,10 +3350,7 @@ nodes:
       # clean feat/|fix/|wip/ prefix only. archon/thread- prefix is rejected here
       # because it would produce a double-suffix UNIQUE_BRANCH.
       BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
-      if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
-        echo "Malformed branch name: $BRANCH does not match required pattern feat/|fix/|wip/|archon/thread-" >&2
-        exit 1
-      fi
+      REPAIR_BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+|wo/[A-Za-z0-9_-]+|archon/task-web-worker-[0-9]+-[A-Za-z0-9]+)$'
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
       # Engine already provides a unique archon/thread-<hash> branch per run.
       # Derive a unique remote push target from it instead of clobbering a shared name.
@@ -3404,7 +3401,7 @@ nodes:
           echo "ERROR: repair_target_malformed: both repair_target_pr and repair_target_branch are required before branch selection" >&2
           exit 1
         fi
-        if ! git check-ref-format --branch "$REPAIR_TARGET_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        if ! git check-ref-format --branch "$REPAIR_TARGET_BRANCH" >/dev/null 2>&1 || ! printf '%s\n' "$REPAIR_TARGET_BRANCH" | grep -Eq "$REPAIR_BRANCH_PATTERN"; then
           echo "ERROR: invalid repair_target_branch '${REPAIR_TARGET_BRANCH}'" >&2
           exit 1
         fi
@@ -3477,6 +3474,10 @@ nodes:
         fi
         UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"
       else
+        if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+          echo "Malformed branch name: $BRANCH does not match required pattern feat/|fix/|wip/|archon/thread-" >&2
+          exit 1
+        fi
         UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       fi
       git status --short
