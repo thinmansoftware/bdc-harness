@@ -130,6 +130,40 @@ describe('fireTier atomic conversation dispatch', () => {
     expect(fetchCalls).toHaveLength(2);
   });
 
+  test('keeps responseSummary infra errors and flags only cauldron_draining', async () => {
+    const body = '{"error":"nope","code":"cauldron_draining","extra":"x"}';
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith('/api/codebases')) return codebasesResponse();
+      return new Response(body, { status: 503 });
+    }) as typeof globalThis.fetch;
+
+    const drained = await fireTier({
+      workflowName: 'bdc-feature-development',
+      woId: 'WO-TEST-DRAIN',
+      project: 'bdc-harness',
+      message: buildFireMessage('WO-TEST-DRAIN', 'bdc-harness'),
+      apiBaseUrl: 'http://archon.test',
+    });
+    expect(drained.drainRefused).toBe(true);
+    expect(drained.infraError).toBe(`HTTP 503: ${body.slice(0, 200)}`);
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith('/api/codebases')) return codebasesResponse();
+      return new Response('gateway down', { status: 502 });
+    }) as typeof globalThis.fetch;
+    const ordinary = await fireTier({
+      workflowName: 'bdc-feature-development',
+      woId: 'WO-TEST-502',
+      project: 'bdc-harness',
+      message: buildFireMessage('WO-TEST-502', 'bdc-harness'),
+      apiBaseUrl: 'http://archon.test',
+    });
+    expect(ordinary.drainRefused).toBe(false);
+    expect(ordinary.infraError).toBe('HTTP 502: gateway down');
+  });
+
   test('fails closed when the requested project has no unique codebase binding', async () => {
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       fetchCalls.push({ url: String(input), init });
