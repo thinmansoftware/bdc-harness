@@ -35,3 +35,34 @@ tier (cascade hard-refuses before fire).
 
 Do not reconnect broken router entries "to try them." Keep the multi-tier vision;
 do not make dark lanes live entry points.
+# Bounded supervised Codex-only dispatch
+
+`--entry codex --codex-only` selects the existing
+`bdc-feature-development-codex-only` workflow for one supervised attempt. The
+PowerShell wrapper accepts `-Workflow codex -CodexOnly` (or the existing Codex
+workflow alias). The option does not rebind the global ladder. Omitted/false
+requests retain their existing request identity and escalation behavior.
+
+Before live admission, two authenticated reads resolve the unique target
+codebase and its absolute `default_cwd`, then read the registered workflow in
+that cwd. One 10000ms deadline covers headers and bodies. The root provider and
+effective node providers must be exactly Codex; declared availability/quota
+failover to another provider is rejected. Malformed, absent or unavailable
+registration throws a sanitized pre-admission classification (CLI exit 1),
+without a cascade record or provider fire. The wrapper requires the exact
+`codex-only-v1` capability before calling the deployed conductor.
+
+Admitted records persist `request.codexOnly: true` and the actual workflow name.
+Gate failure or progress timeout stops `blocked` (exit 2), with zero climbs and
+a provider boundary bound to the failed attempt's event identity. Timeout
+cancellation records acknowledgement or failure; acknowledgement does not
+prove the run stopped. No frontier approval packet or successor attempt is
+created. Existing success, infrastructure, external cancellation and
+already-satisfied outcomes keep their status/exit semantics. Dry-run/WhatIf
+reports the bounded variant and makes no remote call.
+
+Source tests and independent source review do not activate this route. An
+isolated supervised staging canary must prove deployed SHA, source authority,
+provider binding and an owned implementation iteration. Production activation
+requires its own board motion and John's current environment/commit-scoped
+authorization. Existing repair targets and ownership gates remain binding.

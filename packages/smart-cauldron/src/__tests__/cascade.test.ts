@@ -13,10 +13,11 @@
 
 import { describe, test, expect, afterAll } from 'bun:test';
 import { createHash, randomUUID } from 'crypto';
-import { mkdtemp, readFile, rm } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { runCascade } from '../cascade.js';
+import { pathToFileURL } from 'url';
+import { runCascade, CODEX_ONLY_DISPATCH_CAPABILITY } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult, PollResult, GateVerdict, CascadeRunRecord } from '../types.js';
 import { loadLadder, loadRefusedTiers } from '../ladder.js';
@@ -30,6 +31,7 @@ function loadLiveTiers() {
 }
 import { loadRuleset } from '../conductor.js';
 import { TimeoutError } from '../poll.js';
+import { resumeFrontierTier } from '../frontier-approval.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -120,6 +122,314 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     },
   };
 }
+
+describe('bounded supervised Codex-only dispatch', () => {
+  async function withRegistration(work: () => Promise<void>): Promise<void> {
+    const prior = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) =>
+      String(input).endsWith('/api/codebases')
+        ? Response.json([{ id: 'target', name: 'test-project', default_cwd: '/isolated/project' }])
+        : Response.json({
+            filename: 'bdc-feature-development-codex-only.yaml',
+            source: 'bundled',
+            workflow: {
+              name: 'bdc-feature-development-codex-only',
+              description: 'Harmless test workflow',
+              provider: 'codex',
+              nodes: [{ id: 'build', prompt: 'Build' }],
+            },
+          })) as typeof fetch;
+    try {
+      await work();
+    } finally {
+      globalThis.fetch = prior;
+    }
+  }
+
+  test('exports the exact capability and refuses invalid variants before admission', async () => {
+    expect(CODEX_ONLY_DISPATCH_CAPABILITY).toBe('codex-only-v1');
+    for (const entryOverride of [undefined, 'claude', 'frontier']) {
+      let admitted = 0;
+      await expect(
+        runCascade(
+          baseOpts({
+            codexOnly: true,
+            entryOverride,
+            deps: {
+              createRecord: async () => {
+                admitted++;
+                throw new Error('must not admit');
+              },
+            },
+          })
+        )
+      ).rejects.toThrow('codex_only_invalid_options');
+      expect(admitted).toBe(0);
+    }
+  });
+
+  test('failed provider preflight reaches neither ownership, admission nor fire', async () => {
+    const previous = globalThis.fetch;
+    let effects = 0;
+    globalThis.fetch = (async () => new Response('secret-body', { status: 503 })) as typeof fetch;
+    try {
+      await expect(
+        runCascade(
+          baseOpts({
+            codexOnly: true,
+            entryOverride: 'codex',
+            onAdmission: () => {
+              effects++;
+            },
+            deps: {
+              acquireWoLock: async () => {
+                effects++;
+                throw new Error('must not lock');
+              },
+              createRecord: async () => {
+                effects++;
+                throw new Error('must not admit');
+              },
+              fire: async () => {
+                effects++;
+                throw new Error('must not fire');
+              },
+            },
+          })
+        )
+      ).rejects.toThrow('codex_only_preflight_http');
+      expect(effects).toBe(0);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  test('dry-run, claim refusal and ownership denial preserve explicit variant', async () =>
+    withRegistration(async () => {
+      const dry = await runCascade(
+        baseOpts({ codexOnly: true, entryOverride: 'codex', dryRun: true })
+      );
+      expect(dry.request.codexOnly).toBe(true);
+      expect(dry.status).toBe('planned');
+      const refused = await runCascade(
+        baseOpts({
+          codexOnly: true,
+          entryOverride: 'codex',
+          deps: {
+            findWoClaim: async () => ({
+              number: 1,
+              state: 'MERGED',
+              url: 'https://github.com/org/repo/pull/1',
+            }),
+          },
+        })
+      );
+      expect(refused.request.codexOnly).toBe(true);
+      expect(refused.status).toBe('refused');
+      expect(refused.attempts).toHaveLength(0);
+      const blocked = await runCascade(
+        baseOpts({
+          codexOnly: true,
+          entryOverride: 'codex',
+          deps: {
+            acquireWoLock: async () => ({
+              acquired: false,
+              path: 'memory',
+              record: {
+                woId: 'WO-TEST-001',
+                project: 'test-project',
+                cascadeId: 'another-owner',
+                status: 'running',
+                createdAt: new Date(0).toISOString(),
+                updatedAt: new Date(0).toISOString(),
+              },
+            }),
+          },
+        })
+      );
+      expect(blocked.request.codexOnly).toBe(true);
+      expect(blocked.status).toBe('blocked');
+      expect(blocked.attempts).toHaveLength(0);
+    }));
+
+  test('durable replay cannot duplicate fire or change the variant identity', async () =>
+    withRegistration(async () => {
+      let fires = 0;
+      const opts = baseOpts({
+        dispatchId: randomUUID(),
+        codexOnly: true,
+        entryOverride: 'codex',
+        deps: {
+          fire: async () => {
+            fires++;
+            return makeFireOk('owned-run');
+          },
+          poll: async () => makePollResult(),
+          judge: () => makePassVerdict(),
+          fetchNodeTimeouts: async () => ({}),
+        },
+      });
+      const first = await runCascade(opts);
+      const replay = await runCascade(opts);
+      expect(replay).toEqual(first);
+      expect(fires).toBe(1);
+      await expect(runCascade({ ...opts, codexOnly: false })).rejects.toThrow();
+      expect(fires).toBe(1);
+    }));
+
+  test('legacy absent and false requests omit the variant field', async () => {
+    for (const codexOnly of [undefined, false]) {
+      const record = await runCascade(
+        baseOpts({ codexOnly, dryRun: true, entryOverride: 'codex' })
+      );
+      expect('codexOnly' in record.request).toBe(false);
+      expect(record.providerBoundary).toBeUndefined();
+    }
+  });
+
+  test('premium next tiers and refused-tier skipping cannot escape the boundary', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-only-tier-boundary-'));
+    const cascadeUrl = pathToFileURL(join(import.meta.dir, '../cascade.ts')).href;
+    const ladderUrl = pathToFileURL(join(import.meta.dir, '../ladder.ts')).href;
+    const pollUrl = pathToFileURL(join(import.meta.dir, '../poll.ts')).href;
+    try {
+      for (const [refused, premium, nextTier] of [
+        [[], ['claude'], 'claude'],
+        [['claude'], ['frontier'], 'frontier'],
+        [['claude', 'frontier'], ['frontier'], null],
+      ] as const) {
+        const script = join(directory, 'fixture.mjs');
+        await writeFile(
+          script,
+          `
+          import {mock} from 'bun:test';
+          const ladder = await import(${JSON.stringify(ladderUrl)});
+          const tiers = ladder.loadLadder();
+          const retired = ladder.loadRefusedTiers();
+          mock.module(${JSON.stringify(ladderUrl)}, () => ({
+            loadLadder: () => tiers, loadRefusedTiers: () => [...retired, ...${JSON.stringify(refused)}],
+            loadPremiumTiers: () => ${JSON.stringify(premium)}
+          }));
+          const {runCascade} = await import(${JSON.stringify(cascadeUrl)});
+          const {TimeoutError} = await import(${JSON.stringify(pollUrl)});
+          globalThis.fetch = async url => String(url).endsWith('/api/codebases')
+            ? Response.json([{id:'target',name:'test-project',default_cwd:'/isolated'}])
+            : Response.json({filename:'bdc-feature-development-codex-only.yaml',source:'bundled',workflow:{
+              name:'bdc-feature-development-codex-only',description:'Test',provider:'codex',nodes:[{id:'build',prompt:'Build'}]}});
+          let fires = 0, cancels = 0;
+          const record = await runCascade({woId:'TEST',project:'test-project',token:'test',entryOverride:'codex',codexOnly:true,
+            deps:{findWoClaim:async()=>null,acquireWoLock:async()=>({acquired:true}),releaseWoLock:async()=>{},
+              createRecord:async record=>({created:true,path:'memory',record}),writeRecord:async()=> 'memory',
+              fire:async()=>{fires++;return {ok:true,runId:'owned-run',conversationId:'test',infraError:null}},
+              fetchNodeTimeouts:async()=>({}),poll:async()=>{throw new TimeoutError('stalled')},
+              cancel:async()=>{cancels++;return {ok:true,error:null}}}});
+          console.log('EVIDENCE='+JSON.stringify({record,fires,cancels}));
+        `
+        );
+        const child = Bun.spawn([process.execPath, script], {
+          stdout: 'pipe',
+          stderr: 'pipe',
+          env: { ...process.env, SMART_CAULDRON_HERMETIC: '1' },
+        });
+        const [output, errors, exit] = await Promise.all([
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+          child.exited,
+        ]);
+        expect(exit, errors).toBe(0);
+        const evidence = JSON.parse(output.split('EVIDENCE=')[1]);
+        expect(evidence.fires).toBe(1);
+        expect(evidence.cancels).toBe(1);
+        expect(evidence.record.status).toBe('blocked');
+        expect(evidence.record.telemetry.climbCount).toBe(0);
+        expect(evidence.record.providerBoundary.nextTier).toBe(nextTier);
+        expect(evidence.record.frontierApproval).toBeUndefined();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  for (const mode of [
+    'won',
+    'gate',
+    'timeout-ack',
+    'timeout-reject',
+    'timeout-throw',
+    'infra',
+    'cancelled',
+  ] as const) {
+    test(`${mode} uses one Codex attempt and preserves truthful outcome`, async () =>
+      withRegistration(async () => {
+        const fired: string[] = [];
+        let admitted: CascadeRunRecord | undefined;
+        const record = await runCascade(
+          baseOpts({
+            codexOnly: true,
+            entryOverride: 'codex',
+            deps: {
+              createRecord: async value => {
+                admitted = structuredClone(value);
+                return { created: true, path: 'memory', record: value };
+              },
+              writeRecord: async () => 'memory',
+              fetchNodeTimeouts: async () => ({}),
+              fire: async opts => {
+                fired.push(opts.workflowName);
+                return mode === 'infra' ? makeFireError('unavailable') : makeFireOk('owned-run');
+              },
+              poll: async () => {
+                if (mode.startsWith('timeout')) throw new TimeoutError('stalled');
+                return makePollResult();
+              },
+              judge: () =>
+                mode === 'won'
+                  ? makePassVerdict()
+                  : { ...makeFailVerdict('revision needed'), cancelled: mode === 'cancelled' },
+              cancel: async () => {
+                if (mode === 'timeout-throw') throw new Error('secret error');
+                return { ok: mode === 'timeout-ack', error: 'secret error' };
+              },
+              escalate: async () => {},
+            },
+          })
+        );
+        expect(admitted?.request.codexOnly).toBe(true);
+        expect(fired).toEqual(['bdc-feature-development-codex-only']);
+        expect(record.attempts[0]?.workflowName).toBe(fired[0]);
+        expect(record.telemetry.climbCount).toBe(0);
+        expect(record.frontierApproval).toBeUndefined();
+        expect(record.status).toBe(
+          mode === 'won'
+            ? 'won'
+            : mode === 'infra'
+              ? 'infra-alert'
+              : mode === 'cancelled'
+                ? 'cancelled'
+                : 'blocked'
+        );
+        if (record.status === 'blocked') {
+          await expect(resumeFrontierTier(record)).rejects.toThrow('no frontierApproval packet');
+          expect(record.winningTier).toBeNull();
+          expect(record.providerBoundary).toMatchObject({
+            reason: 'codex-only-capacity',
+            nextTier: 'claude',
+            sourceEventId: record.attempts[0]?.sourceEventId,
+            sourceEventAt: record.attempts[0]?.sourceEventAt,
+          });
+        }
+        if (mode.startsWith('timeout')) {
+          expect(record.providerBoundary?.cancellation).toMatchObject({
+            runId: 'owned-run',
+            attempted: true,
+            result: mode === 'timeout-ack' ? 'acknowledged' : 'failed',
+            runStopVerified: false,
+          });
+          expect(JSON.stringify(record.providerBoundary)).not.toContain('secret error');
+        }
+      }));
+  }
+});
 
 test('cascade preserves the eligibility identity on every attempted lane', async () => {
   const expectedSpec = {

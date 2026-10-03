@@ -120,6 +120,8 @@ export interface CascadeRunRecord {
     tags: string[];
     entryOverride: TierName | null;
     dryRun: boolean;
+    /** Omitted on legacy requests to preserve replay identity. */
+    codexOnly?: true;
   };
   createdAt: string;
   status: CascadeStatus;
@@ -178,6 +180,19 @@ export interface CascadeRunRecord {
    * (terminate as needs-human) later. See FrontierApprovalPacket.
    */
   frontierApproval?: FrontierApprovalPacket;
+  providerBoundary?: {
+    reason: 'codex-only-capacity';
+    nextTier: TierName | null;
+    sourceEventId: string;
+    sourceEventAt: string;
+    cancellation?: {
+      runId: string;
+      attempted: true;
+      result: 'acknowledged' | 'failed';
+      errorClass: string | null;
+      runStopVerified: false;
+    };
+  };
 }
 
 export interface GateVerdict {
