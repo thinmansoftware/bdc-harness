@@ -769,14 +769,84 @@ function cleanupDb(path: string): void {
   }
 }
 
+type JournalObservationPhase = `${'before' | 'constructor' | 'after' | 'close' | 'cleanup'}-${
+  | 'start'
+  | 'end'
+  | 'throw'}`;
+let journalObservationSequence = 0;
+let currentJournalObservationId = 0;
+
+function journalObservationStart(): number {
+  try {
+    return performance.now();
+  } catch {
+    return 0;
+  }
+}
+
+function observeJournalPhase(phase: JournalObservationPhase, started: number): void {
+  try {
+    if (process.env.CI !== 'true') return;
+    const elapsedMs = performance.now() - started;
+    if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return;
+    console.log(
+      'WORKROOM_JOURNAL_HOOK_PHASE',
+      JSON.stringify({ phase, id: currentJournalObservationId, pid: process.pid, elapsedMs })
+    );
+  } catch {
+    // Diagnostic emission alone is best effort; operation failures remain unchanged.
+  }
+}
+
 beforeEach(() => {
-  currentDbPath = join(tmpdir(), `taskmaster-test-${Date.now()}-${Math.random()}.db`);
-  db = new SqliteAdapter(currentDbPath);
+  currentJournalObservationId = ++journalObservationSequence;
+  const hookStarted = journalObservationStart();
+  observeJournalPhase('before-start', hookStarted);
+  try {
+    currentDbPath = join(tmpdir(), `taskmaster-test-${Date.now()}-${Math.random()}.db`);
+    const constructorStarted = journalObservationStart();
+    observeJournalPhase('constructor-start', constructorStarted);
+    try {
+      db = new SqliteAdapter(currentDbPath);
+      observeJournalPhase('constructor-end', constructorStarted);
+    } catch (error) {
+      observeJournalPhase('constructor-throw', constructorStarted);
+      throw error;
+    }
+    observeJournalPhase('before-end', hookStarted);
+  } catch (error) {
+    observeJournalPhase('before-throw', hookStarted);
+    throw error;
+  }
 });
 
 afterEach(async () => {
-  await db.close();
-  cleanupDb(currentDbPath);
+  const hookStarted = journalObservationStart();
+  observeJournalPhase('after-start', hookStarted);
+  try {
+    const closeStarted = journalObservationStart();
+    observeJournalPhase('close-start', closeStarted);
+    try {
+      await db.close();
+      observeJournalPhase('close-end', closeStarted);
+    } catch (error) {
+      observeJournalPhase('close-throw', closeStarted);
+      throw error;
+    }
+    const cleanupStarted = journalObservationStart();
+    observeJournalPhase('cleanup-start', cleanupStarted);
+    try {
+      cleanupDb(currentDbPath);
+      observeJournalPhase('cleanup-end', cleanupStarted);
+    } catch (error) {
+      observeJournalPhase('cleanup-throw', cleanupStarted);
+      throw error;
+    }
+    observeJournalPhase('after-end', hookStarted);
+  } catch (error) {
+    observeJournalPhase('after-throw', hookStarted);
+    throw error;
+  }
 });
 
 describe('tm_journal DAL', () => {
