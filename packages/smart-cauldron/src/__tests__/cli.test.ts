@@ -8,6 +8,52 @@ import { join } from 'path';
 let originalToken: string | undefined;
 
 describe('explicit Codex-only CLI option', () => {
+  test('actual CLI dry-run preserves legacy project and forwards explicit variant project', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-cli-dry-run-'));
+    try {
+      const source = await readFile(new URL('../cli.ts', import.meta.url), 'utf8');
+      const candidate = join(directory, 'cli.ts');
+      await writeFile(candidate, source);
+      await writeFile(
+        join(directory, 'cascade.js'),
+        `export async function runCascade(opts) {
+        const explicit = process.env.TEST_CASE === 'explicit';
+        if (opts.dryRun !== true || opts.token !== undefined || opts.codexOnly !== (explicit ? true : undefined) || opts.project !== (explicit ? 'test-project' : undefined)) throw new Error('dry-run forwarding failed');
+        return {status:'planned',winningTier:null,attempts:[],telemetry:{climbed:false,climbCount:0,wonCheap:false},totalCostUsd:null};
+      }`
+      );
+      for (const mode of ['legacy', 'explicit'] as const) {
+        const child = Bun.spawn(
+          [
+            process.execPath,
+            candidate,
+            'fire',
+            'WO-TEST',
+            '--dry-run',
+            '--project',
+            'test-project',
+            ...(mode === 'explicit' ? ['--entry', 'codex', '--codex-only'] : []),
+          ],
+          {
+            env: { ...process.env, ARCHON_OPERATOR_TOKEN: '', TEST_CASE: mode },
+            stdout: 'pipe',
+            stderr: 'pipe',
+          }
+        );
+        const [stdout, stderr, status] = await Promise.all([
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+          child.exited,
+        ]);
+        expect(status).toBe(0);
+        expect(stdout).toContain('status:      planned');
+        expect(stderr).not.toContain('[smart-cauldron] Fatal error:');
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test('requires an explicitly selected Codex entry', () => {
     for (const entry of [[], ['--entry', 'claude'], ['--entry', 'frontier']]) {
       expect(() => parseArgs(['bun', 'cli.ts', 'fire', 'WO-1', '--codex-only', ...entry])).toThrow(

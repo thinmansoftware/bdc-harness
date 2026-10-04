@@ -312,7 +312,7 @@ async function main(): Promise<void> {
     dryRun: args.dryRun,
     apiBaseUrl: args.apiUrl,
     token: fireAuth?.token,
-    project: fireAuth?.project ?? args.project,
+    project: fireAuth?.project ?? (args.codexOnly === true ? args.project : undefined),
     codexOnly: args.codexOnly,
     pollTimeoutMs: args.pollTimeoutMs,
     allowClaimed: allowSatisfied.enabled,
