@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { execFile } from 'child_process';
 import { existsSync, realpathSync } from 'fs';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'fs/promises';
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'path';
 import { promisify } from 'util';
@@ -111,13 +111,24 @@ function assertOwnedPath(root: string, target: string, canonicalRepo?: string): 
 }
 
 function selectOwnedWorktrees(root: string, canonicalRepo: string, porcelain: string): string[] {
+  if (typeof realpathSync.native !== 'function') {
+    throw new Error('Restart fixture cleanup requires native filesystem resolution');
+  }
+  const resolvedRoot = realpathSync.native(root);
+  const resolvedCanonical = realpathSync.native(canonicalRepo);
+  assertOwnedPath(resolvedRoot, resolvedCanonical);
   const worktrees = porcelain
     .split(/\r?\n/)
     .filter(line => line.startsWith('worktree '))
-    .map(line => resolve(line.slice('worktree '.length)))
-    .filter(path => normalizedPath(path) !== normalizedPath(canonicalRepo));
-  for (const worktree of worktrees) assertOwnedPath(root, worktree, canonicalRepo);
-  return worktrees;
+    .map(line => resolve(line.slice('worktree '.length)));
+  const selected: string[] = [];
+  for (const worktree of worktrees) {
+    const resolvedWorktree = realpathSync.native(worktree);
+    if (normalizedPath(resolvedWorktree) === normalizedPath(resolvedCanonical)) continue;
+    assertOwnedPath(resolvedRoot, resolvedWorktree, resolvedCanonical);
+    selected.push(worktree);
+  }
+  return selected;
 }
 
 afterEach(async () => {
@@ -151,10 +162,19 @@ afterEach(async () => {
 });
 
 describe('WorktreeProvider restart persistence', () => {
-  test('cleanup excludes primary separator variants and retains owned linked worktrees', () => {
-    const root = join(tmpdir(), 'archon-worktree-restart-selection');
+  async function selectionFixture() {
+    const outer = await mkdtemp(join(tmpdir(), 'archon-worktree-restart-'));
+    temporaryRoots.push(outer);
+    const root = join(outer, 'selection');
     const canonicalRepo = join(root, 'canonical');
+    await mkdir(canonicalRepo, { recursive: true });
+    return { outer, root, canonicalRepo };
+  }
+
+  test('cleanup excludes primary separator variants and retains owned linked worktrees', async () => {
+    const { root, canonicalRepo } = await selectionFixture();
     const linked = join(canonicalRepo, '.worktrees', 'linked');
+    await mkdir(linked, { recursive: true });
     const primary = canonicalRepo.replaceAll('\\', '/');
     expect(
       selectOwnedWorktrees(root, canonicalRepo, `worktree ${primary}\nworktree ${linked}\n`)
@@ -166,14 +186,62 @@ describe('WorktreeProvider restart persistence', () => {
     }
   });
 
-  test('cleanup rejects sibling-prefix, root and outside targets before removal', () => {
-    const root = join(tmpdir(), 'archon-worktree-restart-selection');
-    const canonicalRepo = join(root, 'canonical');
-    for (const target of [root, `${root}-sibling`, join(root, '..', 'outside')]) {
+  test('cleanup rejects sibling-prefix, root and outside targets before removal', async () => {
+    const { outer, root, canonicalRepo } = await selectionFixture();
+    const sibling = `${root}-sibling`;
+    const outside = join(outer, 'outside');
+    await mkdir(sibling);
+    await mkdir(outside);
+    for (const target of [root, sibling, outside]) {
       expect(() => selectOwnedWorktrees(root, canonicalRepo, `worktree ${target}\n`)).toThrow(
         'outside its recorded root'
       );
+      expect(existsSync(target)).toBe(true);
     }
+  });
+
+  test('cleanup excludes a native primary alias and retains an owned linked alias', async () => {
+    const { root, canonicalRepo } = await selectionFixture();
+    const linked = join(canonicalRepo, '.worktrees', 'linked');
+    await mkdir(linked, { recursive: true });
+    const alias = join(root, 'primary-alias');
+    await symlink(canonicalRepo, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const linkedAlias = join(alias, '.worktrees', 'linked');
+    expect(
+      selectOwnedWorktrees(root, canonicalRepo, `worktree ${alias}\nworktree ${linkedAlias}\n`)
+    ).toEqual([resolve(linkedAlias)]);
+    expect(existsSync(canonicalRepo)).toBe(true);
+    expect(existsSync(linked)).toBe(true);
+  });
+
+  test('cleanup rejects resolved target and canonical escapes without removal', async () => {
+    const { outer, root, canonicalRepo } = await selectionFixture();
+    const outside = join(outer, 'outside');
+    await mkdir(outside);
+    const alias = join(root, 'outside-alias');
+    await symlink(outside, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    expect(() => selectOwnedWorktrees(root, canonicalRepo, `worktree ${alias}\n`)).toThrow(
+      'outside its recorded root'
+    );
+    expect(() => selectOwnedWorktrees(root, alias, `worktree ${alias}\n`)).toThrow(
+      'outside its recorded root'
+    );
+    expect(existsSync(outside)).toBe(true);
+    expect(existsSync(canonicalRepo)).toBe(true);
+  });
+
+  test('cleanup aborts selection when a later target cannot resolve', async () => {
+    const { root, canonicalRepo } = await selectionFixture();
+    const linked = join(canonicalRepo, '.worktrees', 'linked');
+    await mkdir(linked, { recursive: true });
+    const sentinel = join(linked, 'retained.txt');
+    await writeFile(sentinel, 'still owned\n', 'utf8');
+    const missing = join(root, 'missing');
+    expect(() =>
+      selectOwnedWorktrees(root, canonicalRepo, `worktree ${linked}\nworktree ${missing}\n`)
+    ).toThrow();
+    expect(await readFile(sentinel, 'utf8')).toBe('still owned\n');
+    expect(existsSync(canonicalRepo)).toBe(true);
   });
 
   test('a new provider process adopts the same identity without losing uncommitted changes', async () => {
