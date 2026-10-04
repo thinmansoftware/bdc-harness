@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { execFile } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'path';
@@ -51,6 +51,59 @@ function assertOwnedPath(root: string, target: string, canonicalRepo?: string): 
         }
       } catch {
         /* Observation must never replace the original cleanup rejection. */
+      }
+      try {
+        const strings = [root, target, ...(canonicalRepo ? [canonicalRepo] : [])];
+        if (strings.every(value => value.length <= 2048)) {
+          const nativeAvailable = typeof realpathSync.native === 'function';
+          const observe = (path: string) => {
+            if (!nativeAvailable) return { status: 'native-unavailable' };
+            try {
+              const value = realpathSync.native(path);
+              if (typeof value !== 'string' || value.length > 2048) {
+                return { status: 'value-omitted' };
+              }
+              return { status: 'resolved', value };
+            } catch {
+              return { status: 'lookup-unavailable' };
+            }
+          };
+          const rootResolution = observe(root);
+          const targetResolution = observe(target);
+          const canonicalResolution = canonicalRepo ? observe(canonicalRepo) : undefined;
+          const realRelativeChild =
+            rootResolution.value !== undefined && targetResolution.value !== undefined
+              ? relative(
+                  normalizedPath(rootResolution.value),
+                  normalizedPath(targetResolution.value)
+                )
+              : undefined;
+          const record = {
+            phase: 'filesystem-observation',
+            pid: process.pid,
+            root,
+            target,
+            ...(canonicalRepo ? { canonicalRepo } : {}),
+            nativeAvailable,
+            rootResolution,
+            targetResolution,
+            ...(canonicalResolution ? { canonicalResolution } : {}),
+            ...(realRelativeChild !== undefined && realRelativeChild.length <= 2048
+              ? { realRelativeChild }
+              : {}),
+            ...(canonicalResolution?.value !== undefined && targetResolution.value !== undefined
+              ? {
+                  realPrimaryEqual:
+                    normalizedPath(targetResolution.value) ===
+                    normalizedPath(canonicalResolution.value),
+                }
+              : {}),
+          };
+          const marker = 'WORKROOM_RESTART_FILESYSTEM_OBSERVATION ' + JSON.stringify(record);
+          if (marker.length <= 8192) process.stderr.write(marker + '\n');
+        }
+      } catch {
+        /* Filesystem resolution is observation only, never cleanup permission. */
       }
     }
     throw new Error('Restart fixture cleanup target is outside its recorded root');
