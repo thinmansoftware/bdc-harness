@@ -21,9 +21,38 @@ function normalizedPath(path: string): string {
   return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
 }
 
-function assertOwnedPath(root: string, target: string): void {
+function assertOwnedPath(root: string, target: string, canonicalRepo?: string): void {
   const child = relative(normalizedPath(root), normalizedPath(target));
   if (!child || child === '..' || child.startsWith(`..${sep}`) || isAbsolute(child)) {
+    if (process.env.CI === 'true') {
+      try {
+        const strings = [root, target, child, ...(canonicalRepo ? [canonicalRepo] : [])];
+        if (strings.every(value => value.length <= 2048)) {
+          const record = {
+            phase: 'ownership-rejection',
+            pid: process.pid,
+            root,
+            target,
+            relativeChild: child,
+            rejectEmpty: !child,
+            rejectParent: child === '..',
+            rejectPrefix: child.startsWith(`..${sep}`),
+            rejectAbsolute: isAbsolute(child),
+            rootExists: existsSync(root),
+            ...(canonicalRepo
+              ? {
+                  canonicalRepo,
+                  primaryEqual: normalizedPath(target) === normalizedPath(canonicalRepo),
+                }
+              : {}),
+          };
+          const marker = 'WORKROOM_RESTART_OWNERSHIP_REJECTION ' + JSON.stringify(record);
+          if (marker.length <= 8192) process.stderr.write(marker + '\n');
+        }
+      } catch {
+        /* Observation must never replace the original cleanup rejection. */
+      }
+    }
     throw new Error('Restart fixture cleanup target is outside its recorded root');
   }
 }
@@ -34,7 +63,7 @@ function selectOwnedWorktrees(root: string, canonicalRepo: string, porcelain: st
     .filter(line => line.startsWith('worktree '))
     .map(line => resolve(line.slice('worktree '.length)))
     .filter(path => normalizedPath(path) !== normalizedPath(canonicalRepo));
-  for (const worktree of worktrees) assertOwnedPath(root, worktree);
+  for (const worktree of worktrees) assertOwnedPath(root, worktree, canonicalRepo);
   return worktrees;
 }
 
