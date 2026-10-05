@@ -957,4 +957,78 @@ describe('SqliteAdapter', () => {
       expect(tableSql.rows[0]?.sql ?? '').not.toMatch(/idempotency_key TEXT NOT NULL UNIQUE/i);
     });
   });
+
+  test('blocker_report: old-shape SQLite journal upgrades and accepts the new verb', async () => {
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const legacy = new Database(currentDbPath);
+    legacy.run(`
+      CREATE TABLE tm_journal (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        thread_ref TEXT NOT NULL,
+        action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+        proposal_json TEXT NOT NULL,
+        idempotency_key TEXT,
+        before_hash TEXT,
+        proof_predicate TEXT,
+        proof_deadline_at TEXT,
+        outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+        graded_at TEXT,
+        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+      )
+    `);
+    legacy.run(`
+      INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+      VALUES
+        ('legacy-060-1', '2026-10-01T00:00:00.000Z', 'gh:o/r#1', 'nudge', '{}', 'sent'),
+        ('legacy-060-2', '2026-10-01T00:00:01.000Z', 'gh:o/r#2', 'digest', '{}', 'parked')
+    `);
+    legacy.close();
+
+    db = new SqliteAdapter(currentDbPath);
+    const preserved = await db.query<{ id: string }>(
+      `SELECT id FROM tm_journal WHERE id IN ('legacy-060-1', 'legacy-060-2') ORDER BY id`
+    );
+    expect(preserved.rows.map(row => row.id)).toEqual(['legacy-060-1', 'legacy-060-2']);
+    const schema = await db.query<{ sql: string }>(
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+    );
+    expect(schema.rows[0]?.sql).toContain('blocker_report');
+    expect(schema.rows[0]?.sql).toContain('delivered_to_issue');
+    await db.query(
+      `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      ['legacy-060-3', '2026-10-02T00:00:00.000Z', 'gh:o/r#3', 'blocker_report', '{}', 'sent']
+    );
+    await expect(
+      db.query(
+        `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        ['legacy-060-bogus', '2026-10-02T00:00:01.000Z', 'gh:o/r#4', 'bogus', '{}', 'sent']
+      )
+    ).rejects.toThrow(/CHECK/i);
+    const root = await db.query<{ rootpage: number }>(
+      `SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+    );
+    const rootpage = root.rows[0]?.rootpage;
+    expect(rootpage).toBeGreaterThan(0);
+
+    await db.close();
+    db = new SqliteAdapter(currentDbPath);
+    const secondRoot = await db.query<{ rootpage: number }>(
+      `SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+    );
+    expect(secondRoot.rows[0]?.rootpage).toBe(rootpage);
+    const rows = await db.query<{ id: string; action_type: string }>(
+      `SELECT id, action_type FROM tm_journal ORDER BY id`
+    );
+    expect(rows.rows).toEqual([
+      { id: 'legacy-060-1', action_type: 'nudge' },
+      { id: 'legacy-060-2', action_type: 'digest' },
+      { id: 'legacy-060-3', action_type: 'blocker_report' },
+    ]);
+  });
 });

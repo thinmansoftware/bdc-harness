@@ -123,6 +123,13 @@ export function isTaskmasterMailbox(message: DispatchMessage): boolean {
   return message.sender === 'taskmaster';
 }
 
+export function isTaskmasterBlockerReport(message: DispatchMessage): boolean {
+  return (
+    message.sender === 'taskmaster' &&
+    (message.idempotency_key ?? '').startsWith('tm:blocker_report:')
+  );
+}
+
 function namedNextStep(body: string): string | null {
   try {
     const parsed = JSON.parse(body) as { next_step?: unknown; nextStep?: unknown };
@@ -389,7 +396,8 @@ async function escalateToXo(
   claimed: DispatchMessage,
   verdict: DutyOfficerJudgeVerdict
 ): Promise<void> {
-  const excerpt = (verdict.body || claimed.body).slice(0, 500);
+  const excerptCap = verdict.reason === 'taskmaster_blocker_report' ? 2000 : 500;
+  const excerpt = (verdict.body || claimed.body).slice(0, excerptCap);
   const subjectKey = escalationSubjectKey(claimed.subject_key);
   await deps.createAuthenticatedMessage(DUTY_OFFICER_SENDER, {
     correlation_id: claimed.correlation_id || `do-clock:${claimed.id}`,
@@ -402,6 +410,7 @@ async function escalateToXo(
       source_id: claimed.id,
       task_type: claimed.task_type,
       subject_key: claimed.subject_key,
+      thread_ref: claimed.subject_key,
       transport: verdict.transport ?? null,
       reason: verdict.reason,
       excerpt,
@@ -426,6 +435,26 @@ async function holdItem(deps: DutyOfficerClockDeps, claimed: DispatchMessage): P
 }
 
 async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
+  if (isTaskmasterBlockerReport(claimed)) {
+    try {
+      await escalateToXo(deps, claimed, {
+        status: 'unconfigured',
+        action: 'escalate_xo',
+        reason: 'taskmaster_blocker_report',
+        body: claimed.body,
+        failures: [],
+      });
+    } catch (error) {
+      log.error({ err: error, messageId: claimed.id }, 'duty_officer_blocker_report_relay_failed');
+      await holdItem(deps, claimed);
+      return;
+    }
+    await finishItem(deps, claimed, 'done', 'succeeded', {
+      disposition: 'taskmaster_blocker_report_relayed',
+      transport: null,
+    });
+    return;
+  }
   let verdict = await deps.judge(claimed);
   if (verdict.status === 'unconfigured') {
     verdict = mechanicalVerdict(claimed);

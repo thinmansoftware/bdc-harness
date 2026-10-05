@@ -23,6 +23,7 @@ export const TM_ALLOWED_ACTION_TYPES = [
   'escalate_p0',
   'digest',
   'fire_cauldron',
+  'blocker_report',
 ] as const;
 export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
 
@@ -31,7 +32,13 @@ export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
  * drain used for escalations and the daily digest (the 'john' dispatch
  * principal is seeded inactive). No broadcast, no 'board', no customers.
  */
-export const TM_ALLOWED_RECIPIENTS = ['xo', 'major-build', 'captain-ci', 'operator'] as const;
+export const TM_ALLOWED_RECIPIENTS = [
+  'xo',
+  'major-build',
+  'captain-ci',
+  'operator',
+  'duty-officer',
+] as const;
 export type TmAllowedRecipient = (typeof TM_ALLOWED_RECIPIENTS)[number];
 
 /**
@@ -58,6 +65,26 @@ const NUDGE_WHY_RE = /\b(?:Blocked|Next action):\s*\S+/i;
 
 export function isContentCompleteNudgeBody(body: string): boolean {
   return NUDGE_TITLE_RE.test(body) && NUDGE_OWNER_RE.test(body) && NUDGE_WHY_RE.test(body);
+}
+
+/**
+ * Structural content contract for blocker reports. composeBlockerReportBody
+ * always carries a quoted title, an owner slot, a Blocked clause, a GitHub
+ * issue URL, and a duration (`for 3h` / `for 2 days`).
+ */
+const BLOCKER_REPORT_TITLE_RE = /"[^"]+"/;
+const BLOCKER_REPORT_OWNER_RE = /\bowner:\s*\S+/i;
+const BLOCKER_REPORT_BLOCKED_RE = /\bBlocked:\s*\S+/i;
+const BLOCKER_REPORT_DURATION_RE = /\bfor\s+\d+h\b|\bfor\s+\d+\s+days\b/;
+
+export function isContentCompleteBlockerReportBody(body: string): boolean {
+  return (
+    BLOCKER_REPORT_TITLE_RE.test(body) &&
+    BLOCKER_REPORT_OWNER_RE.test(body) &&
+    BLOCKER_REPORT_BLOCKED_RE.test(body) &&
+    body.includes('https://github.com/') &&
+    BLOCKER_REPORT_DURATION_RE.test(body)
+  );
 }
 
 export interface GuardResult {
@@ -98,6 +125,26 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       allowed: false,
       forbiddenEffect: true,
       reason: `recipient_not_allowlisted: '${proposal.recipient}' is not a named seat the Taskmaster may address (allowed: ${TM_ALLOWED_RECIPIENTS.join(', ')}).`,
+    };
+  }
+
+  // blocker_report may address only duty-officer, and duty-officer may receive
+  // only blocker_report. Digest proposals stay addressed to operator here; the
+  // send path rewrites that recipient after this guard.
+  const actionType = proposal.type.trim().toLowerCase();
+  const recipient = proposal.recipient.trim().toLowerCase();
+  if (actionType === 'blocker_report' && recipient !== 'duty-officer') {
+    return {
+      allowed: false,
+      forbiddenEffect: true,
+      reason: 'recipient_not_allowlisted: blocker_report may be addressed only to duty-officer.',
+    };
+  }
+  if (actionType !== 'blocker_report' && recipient === 'duty-officer') {
+    return {
+      allowed: false,
+      forbiddenEffect: true,
+      reason: 'recipient_not_allowlisted: only blocker_report may be addressed to duty-officer.',
     };
   }
 
@@ -168,6 +215,18 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       reason:
         'content_incomplete: the nudge body lacks the required item content ' +
         '(quoted title, owner, and blocker or next action); the item stays on the register.',
+    };
+  }
+
+  if (
+    proposal.type.trim().toLowerCase() === 'blocker_report' &&
+    !isContentCompleteBlockerReportBody(normalized)
+  ) {
+    return {
+      allowed: false,
+      reason:
+        'content_incomplete: the blocker report body lacks the required item content ' +
+        '(quoted title, owner, blocker, GitHub URL, and duration); the item stays on the register.',
     };
   }
 

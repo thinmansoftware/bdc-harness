@@ -2,7 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import {
   adoptionContentHash,
   classifyThread,
+  BLOCKER_REPORT_COOLDOWN_MS,
+  composeBlockerReportBody,
   composeNudgeBody,
+  computeBlockerReport,
   computeNextAction,
   isSuppressedByNoise,
   nudgeClockMs,
@@ -16,7 +19,7 @@ import {
   USEFUL_RATE_MIN_GRADED,
 } from './rules';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
-import { validateProposal } from './guard';
+import { isContentCompleteBlockerReportBody, validateProposal } from './guard';
 
 const EXPECTED_SPEC = {
   specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
@@ -660,5 +663,213 @@ describe('M-155 exception push (rules)', () => {
     expect(proposal?.type).toBe('deliver_ruling');
     expect(proposal?.body).toContain('ruling-155');
     expect(proposal?.body).toContain(proposal?.threadRef ?? '');
+  });
+});
+
+describe('blocker_report rules', () => {
+  const HOUR_MS = 3_600_000;
+  const idle3h = new Date(NOW_MS - 3 * HOUR_MS).toISOString();
+  const ref = 'gh:thinmansoftware/bdc-harness#1';
+
+  function blockedAdoption(overrides: Partial<TmAdoptionRow> = {}): TmAdoptionRow {
+    return makeAdoption({
+      title: 'WO-X-01 fix',
+      owner_login: null,
+      blocked_reason: null,
+      last_movement_at: idle3h,
+      ...overrides,
+    });
+  }
+
+  test('blocker_report: label-blocked thread past the P1 clock reports to duty-officer', () => {
+    const item = thread({ isBlocked: true, priority: 'P1', lastActivityAt: idle3h });
+    const adoption = blockedAdoption();
+    const context = { interventionsLast24h: 0, nowMs: NOW_MS, adoption };
+    const proposal = computeBlockerReport(item, 'blocked', context);
+    const bucket = Math.floor(NOW_MS / BLOCKER_REPORT_COOLDOWN_MS);
+    expect(proposal?.type).toBe('blocker_report');
+    expect(proposal?.recipient).toBe('duty-officer');
+    expect(proposal?.actsImmediately).toBe(false);
+    expect(proposal?.idempotencyKey).toBe(`tm:blocker_report:${ref}:${bucket}`);
+    expect(computeNextAction(item, 'blocked', context)).toBeNull();
+  });
+
+  test('blocker_report: unclaimed P0 that is not fire-eligible reports; fire-eligible or held does not', () => {
+    const adoption = blockedAdoption({ priority: 'P0' });
+    const base = { interventionsLast24h: 0, nowMs: NOW_MS, adoption };
+    const unclaimed = thread({
+      priority: 'P0',
+      isUnclaimedP0: true,
+      isBlocked: false,
+      lastActivityAt: idle3h,
+    });
+    const reported = computeBlockerReport(unclaimed, 'ready', { ...base, fireEligible: false });
+    expect(reported?.type).toBe('blocker_report');
+    expect(reported?.body).toContain('unclaimed P0, not fire-eligible');
+
+    const fireEvidence = {
+      woId: 'WO-HARNESS-EXAMPLE-01',
+      targetRepo: 'thinmansoftware/bdc-harness',
+      project: 'bdc-harness',
+      specVerifiedAt: new Date(NOW_MS).toISOString(),
+      noOpenOrMergedPr: true as const,
+      expectedSpec: EXPECTED_SPEC,
+    };
+    expect(
+      computeBlockerReport(unclaimed, 'ready', {
+        ...base,
+        fireEligible: true,
+        fireEvidence,
+      })
+    ).toBeNull();
+    expect(
+      computeBlockerReport(thread({ ...unclaimed, isHeld: true }), 'ready', {
+        ...base,
+        fireEligible: false,
+      })
+    ).toBeNull();
+    expect(
+      computeBlockerReport(unclaimed, 'ready', {
+        ...base,
+        fireEligible: false,
+        fireHolding: true,
+      })
+    ).toBeNull();
+
+    const markerText = 'waiting on the vendor queue';
+    const markerThread = thread({
+      isBlocked: false,
+      lastActivityAt: new Date(NOW_MS - 10 * 60_000).toISOString(),
+    });
+    const markerAdoption = blockedAdoption({
+      latest_marker_kind: 'BLOCKED',
+      latest_marker_at: idle3h,
+      blocked_reason: markerText,
+      last_movement_at: new Date(NOW_MS - 30 * 60_000).toISOString(),
+    });
+    const markerReport = computeBlockerReport(markerThread, 'healthy', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      adoption: markerAdoption,
+    });
+    expect(markerReport?.type).toBe('blocker_report');
+    expect(markerReport?.body).toContain(`Blocked: ${markerText}`);
+    expect(markerReport?.body).toContain('[BLOCKED] marker');
+    expect(markerReport?.body).toContain('for 3h');
+    expect(
+      computeBlockerReport(markerThread, 'healthy', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        adoption: blockedAdoption({
+          latest_marker_kind: 'BLOCKED',
+          latest_marker_at: null,
+          last_movement_at: idle3h,
+        }),
+      })
+    ).toBeNull();
+    expect(
+      computeBlockerReport(
+        thread({ ref: 'dispatch:abc', isBlocked: true, lastActivityAt: idle3h }),
+        'blocked',
+        base
+      )
+    ).toBeNull();
+  });
+
+  test('blocker_report: clock, cooldown and intervention cap gate the report', () => {
+    const item = thread({ isBlocked: true, lastActivityAt: idle3h });
+    const adoption = blockedAdoption();
+    const young = thread({
+      isBlocked: true,
+      lastActivityAt: new Date(NOW_MS - 90 * 60_000).toISOString(),
+    });
+    expect(
+      computeBlockerReport(young, 'blocked', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        adoption: blockedAdoption({
+          last_movement_at: new Date(NOW_MS - 90 * 60_000).toISOString(),
+        }),
+      })
+    ).toBeNull();
+    expect(
+      computeBlockerReport(item, 'blocked', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        adoption,
+        lastBlockerReportSentAtMs: NOW_MS - 71 * HOUR_MS,
+      })
+    ).toBeNull();
+    expect(
+      computeBlockerReport(item, 'blocked', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        adoption,
+        lastBlockerReportSentAtMs: NOW_MS - 73 * HOUR_MS,
+      })?.type
+    ).toBe('blocker_report');
+    expect(
+      computeBlockerReport(item, 'blocked', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        adoption,
+        lastBlockerReportSentAtMs: NOW_MS - BLOCKER_REPORT_COOLDOWN_MS,
+      })?.type
+    ).toBe('blocker_report');
+    expect(
+      computeBlockerReport(item, 'blocked', {
+        interventionsLast24h: MAX_INTERVENTIONS_PER_ITEM_24H,
+        nowMs: NOW_MS,
+        adoption,
+      })
+    ).toBeNull();
+  });
+
+  test('blocker_report: body is content-complete and bounded', () => {
+    const idleMs = 3 * HOUR_MS;
+    const withOwner = composeBlockerReportBody(
+      thread({ isBlocked: true }),
+      blockedAdoption({
+        owner_login: 'jdoe',
+        blocked_reason: 'waiting on PRH credit',
+      }),
+      idleMs
+    );
+    const withNeither = composeBlockerReportBody(
+      thread({ isBlocked: true }),
+      blockedAdoption(),
+      idleMs
+    );
+    const longTitle = 'T'.repeat(400);
+    const longBlocked = 'B'.repeat(800);
+    const bounded = composeBlockerReportBody(
+      thread({ isBlocked: true }),
+      blockedAdoption({ title: longTitle, blocked_reason: longBlocked }),
+      idleMs
+    );
+    for (const body of [withOwner, withNeither, bounded]) {
+      expect(body).not.toBeNull();
+      expect(body!.length).toBeLessThanOrEqual(500);
+      expect(body).toContain('for 3h');
+      expect(body).toContain('https://github.com/thinmansoftware/bdc-harness/issues/1');
+      expect(isContentCompleteBlockerReportBody(body!)).toBe(true);
+    }
+    expect(withOwner).toContain('"WO-X-01 fix"');
+    expect(withOwner).toContain('owner: jdoe');
+    expect(withOwner).toContain('Blocked: waiting on PRH credit');
+    expect(withNeither).toContain('owner: UNASSIGNED');
+    expect(withNeither).toContain('Blocked: no named blocker');
+    const quoted = bounded!.match(/"([^"]+)"/)?.[1] ?? '';
+    expect(quoted.length).toBeLessThanOrEqual(200);
+    expect(quoted.length).toBeGreaterThan(0);
+    expect(bounded!.length).toBeLessThan(longTitle.length + longBlocked.length);
+    expect(composeBlockerReportBody(thread({ isBlocked: true }), undefined, idleMs)).toBeNull();
+    expect(
+      composeBlockerReportBody(
+        thread({ isBlocked: true }),
+        blockedAdoption({ title: '   ' }),
+        idleMs
+      )
+    ).toBeNull();
   });
 });
