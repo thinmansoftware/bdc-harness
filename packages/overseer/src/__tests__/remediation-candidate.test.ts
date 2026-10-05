@@ -353,6 +353,75 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
     });
   }
 
+  /**
+   * REGRESSION -- PR #740 round 6 [major] (2026-10-05). Classes were matched
+   * against `scope + summary`, so a FILE PATH could authorize automation: scope
+   * 'src/black.ts' with a data-disclosure summary matched lint_or_format
+   * through the filename and bypassed the non-auto override entirely.
+   *
+   * Two changes: classes are matched against the SUMMARY alone (the scope is a
+   * path, not a description of the defect), and a tool NAME now has to come
+   * with observed failure evidence -- 'black' and 'ruff' are ordinary English
+   * words and real filenames.
+   *
+   * The non-auto override still reads scope AND summary: widening what can
+   * REFUSE is safe, widening what can APPROVE is not.
+   */
+  const filenameBypassCases: readonly {
+    readonly label: string;
+    readonly finding: IndependentReviewFinding;
+  }[] = [
+    {
+      label: "the gate's example -- disclosure finding in src/black.ts",
+      finding: {
+        scope: 'src/black.ts',
+        severity: 'blocker',
+        summary: "Endpoint returns every customer's invoices to any caller",
+      },
+    },
+    {
+      label: 'a path named after ruff',
+      finding: {
+        scope: 'src/ruff.ts',
+        severity: 'blocker',
+        summary: 'Endpoint leaks other tenants rows',
+      },
+    },
+    {
+      label: 'a directory named lint',
+      finding: {
+        scope: 'packages/linter-config/src/a.ts',
+        severity: 'blocker',
+        summary: 'Returns all users to an unauthenticated caller',
+      },
+    },
+    {
+      // Proves the SCOPE/SUMMARY SPLIT specifically: the path carries the
+      // failure evidence, so a concatenated match would classify this as a
+      // genuine lint failure even with the narrowed pattern.
+      label: 'failure words in the PATH, judgment call in the summary',
+      finding: {
+        scope: 'ci/eslint-failures/report.ts',
+        severity: 'blocker',
+        summary: 'Returns every tenant invoice to any caller',
+      },
+    },
+    {
+      label: 'a tool named in passing, with no failure',
+      finding: {
+        scope: 'src/a.ts',
+        severity: 'blocker',
+        summary: 'We should make the output prettier for operators',
+      },
+    },
+  ];
+
+  for (const { label, finding } of filenameBypassCases) {
+    test(`NON-AUTO: ${label}`, () => {
+      expect(classifyFinding(finding).autoFixable).toBe(false);
+    });
+  }
+
   test('the real tool-reported versions of those classes DO auto-route', () => {
     const mechanical: readonly [string, string, string][] = [
       ['named linter', 'eslint reports 3 errors: prefer-const', 'lint_or_format'],
@@ -569,6 +638,30 @@ describe('submit path hands a rejected verdict back to Taskmaster', () => {
     expect(outcome.remediation?.attempt).toBe(1);
     expect(emitted).toHaveLength(1);
     expect(receipts[0]?.remediation).toEqual({ emitted: true, attempt: 1 });
+  });
+
+  /**
+   * REGRESSION -- PR #740 round 6 [minor] (2026-10-05). Splitting the approved
+   * branch out of the shared terminal return dropped `...summaryField(verdict)`
+   * from it, silently removing the reviewer's text from every successful
+   * approval outcome. #782 added that field precisely so the same-head recheck
+   * path can tell a CHECK-caused verdict from a CODE finding, and the worker
+   * persists the outcome as result_body -- so losing it is a contract change,
+   * not a cosmetic one.
+   */
+  test('an APPROVED outcome still carries the reviewer summary', async () => {
+    const { deps: d } = deps({
+      runReviewer: async () => ({
+        approved: true,
+        summary: 'No blocking findings. Checks green at this head.',
+        reviewedHeadSha: 'f868542e0000000000000000000000000000abcd',
+        findings: [],
+      }),
+    });
+    const outcome = await runAndSubmitReview(work(), d);
+
+    expect(outcome.disposition).toBe('approved');
+    expect(outcome.summary).toBe('No blocking findings. Checks green at this head.');
   });
 
   test('an APPROVED verdict emits nothing', async () => {

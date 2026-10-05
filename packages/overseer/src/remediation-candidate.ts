@@ -134,16 +134,19 @@ export const AUTO_FIXABLE_CLASSES: readonly AutoFixableClass[] = [
   {
     id: 'lint_or_format',
     description:
-      'Lint/formatter violations a NAMED TOOL reported. Bare "format" or "style" is excluded -- those words describe data shape and behavior far more often than tooling.',
-    // Requires a named tool (eslint/prettier/lint/rustfmt/gofmt/ruff/black/
-    // clippy/stylelint/tsfmt), OR the literal phrase "style violation"/"lint
-    // error". "format" and "style" ALONE are deliberately not enough: PR #740
-    // round 3 (2026-09-04) showed "The API response format exposes internal
-    // identifiers" -- a security judgment -- classifying as lint_or_format,
-    // and "The date format shown to customers is wrong" is a behavioral bug,
-    // not a formatter complaint. Both now fall through to a human.
+      'Lint/formatter violations a NAMED TOOL reported. A bare tool name, or a bare "format"/"style", is excluded.',
+    // THREE things this pattern deliberately refuses, each a real false
+    // positive the review gate caught on this PR:
+    //  - bare "format"/"style" (round 3): "The API response format exposes
+    //    internal identifiers" is a security judgment; "The date format shown
+    //    to customers is wrong" is a behavioral bug.
+    //  - a bare TOOL NAME (round 6): 'black' and 'ruff' are ordinary English
+    //    words and real filenames, so a mention alone is not evidence. A tool
+    //    name must appear WITH an observed failure.
+    // Combined with classifyFinding matching the SUMMARY only, a path like
+    // src/black.ts or ci/eslint-failures/ can no longer authorize automation.
     pattern:
-      /\b(?:es-?lint|prettier|stylelint|rustfmt|gofmt|ruff|black|clippy|biome|tsfmt|lint(?:er|ing)?)\b|\b(?:style|lint|formatting)\s+(?:violation|error|failure)s?\b|\bformat(?:ting)?\s+check\s+(?:fail\w*|error\w*)\b/i,
+      /\b(?:es-?lint|prettier|stylelint|rustfmt|gofmt|ruff|black|clippy|biome|tsfmt|lint(?:er|ing)?)\b[\s\S]{0,60}?\b(?:fails?|failing|failed|failure|errors?|erroring|violations?|reports?|reported|complains?|flags?|flagged)\b|\b(?:fails?|failing|failed|reports?|reported|violations?|errors?)\b[\s\S]{0,60}?\b(?:es-?lint|prettier|stylelint|rustfmt|gofmt|ruff|black|clippy|biome|tsfmt|lint(?:er|ing)?)\b|\b(?:style|lint|formatting)\s+(?:violation|error|failure)s?\b|\bformat(?:ting)?\s+check\s+(?:fail\w*|error\w*)\b/i,
   },
   {
     id: 'migration_ordering',
@@ -214,14 +217,28 @@ export interface FindingClassification {
  *   3. Matching nothing means NON-AUTO -- never auto.
  */
 export function classifyFinding(finding: IndependentReviewFinding): FindingClassification {
-  const text = `${finding.scope} ${finding.summary}`;
+  // THE SCOPE IS A FILE PATH, NOT A DESCRIPTION OF THE DEFECT.
+  //
+  // Classes are matched against the SUMMARY ALONE. Matching the concatenation
+  // let a path contaminate the decision: PR #740 round 6 (2026-10-05) showed
+  // scope 'src/black.ts' with summary "Endpoint returns every customer's
+  // invoices to any caller" matching lint_or_format through the FILENAME -- a
+  // data-disclosure finding routed for unattended remediation. It also meant
+  // failure words living in a path (ci/eslint-failures/...) could supply the
+  // "mechanical evidence" for a judgment call described in the summary.
+  //
+  // The non-auto override still reads BOTH, because a judgment-call signal
+  // anywhere in the finding must be able to veto. Widening what can REFUSE is
+  // safe; widening what can APPROVE is not.
+  const vetoText = `${finding.scope} ${finding.summary}`;
+  const classifyText = finding.summary;
 
   // 1. Judgment-call signal overrides any mechanical-looking match.
-  if (NON_AUTO_PATTERN.test(text)) return { autoFixable: false, classId: null };
+  if (NON_AUTO_PATTERN.test(vetoText)) return { autoFixable: false, classId: null };
 
-  // 2. Known mechanical class.
+  // 2. Known mechanical class, judged on the reviewer's description only.
   for (const candidate of AUTO_FIXABLE_CLASSES) {
-    if (candidate.pattern.test(text)) return { autoFixable: true, classId: candidate.id };
+    if (candidate.pattern.test(classifyText)) return { autoFixable: true, classId: candidate.id };
   }
 
   // 3. Unrecognized -> non-auto. This is the fail-closed default.

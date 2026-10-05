@@ -537,7 +537,16 @@ export async function runAndSubmitReview(
   }
 
   if (verdict.approved) {
-    return finish(deps, work, work.headSha, { disposition: 'approved', event });
+    // summaryField is REQUIRED here, not optional polish. Splitting the
+    // approved branch out of the shared terminal return dropped it (PR #740
+    // round 6 [minor]), which silently removed the reviewer's text from every
+    // successful approval outcome -- the same text #782 added so the same-head
+    // recheck path can tell a CHECK-caused verdict from a CODE finding.
+    return finish(deps, work, work.headSha, {
+      disposition: 'approved',
+      event,
+      ...summaryField(verdict),
+    });
   }
 
   // THE MISSING ARROW. The review has landed as REQUEST_CHANGES; without this
