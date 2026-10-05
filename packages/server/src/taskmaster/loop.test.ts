@@ -24,6 +24,8 @@ import {
   isPauseEffectsExempt,
   TM_REPEAT_REASON_BY_TYPE,
   isPostCutoverReceipt,
+  resolveBlockerReportEnabled,
+  MAX_BLOCKER_REPORTS_PER_TICK,
   type TaskmasterDeps,
   type ListedThread,
   type GithubIssueEvidence,
@@ -3966,7 +3968,7 @@ describe('M-155 exception push (loop)', () => {
     expect(nudges[0]?.body).toContain('Chronic but titled');
   });
 
-  test('push: the five-verb allowlist and the budgets are explicit (regression)', () => {
+  test('push: the six-verb allowlist and the budgets are explicit (regression)', () => {
     expect(MAX_INTERVENTIONS_PER_ITEM_24H).toBe(3);
     expect(MAX_EFFECTS_PER_TICK).toBe(10);
     expect([...TM_ALLOWED_ACTION_TYPES]).toEqual([
@@ -3975,8 +3977,38 @@ describe('M-155 exception push (loop)', () => {
       'escalate_p0',
       'digest',
       'fire_cauldron',
+      'blocker_report',
     ]);
-    expect([...TM_ALLOWED_RECIPIENTS]).toEqual(['xo', 'major-build', 'captain-ci', 'operator']);
+    expect([...TM_ALLOWED_RECIPIENTS]).toEqual([
+      'xo',
+      'major-build',
+      'captain-ci',
+      'operator',
+      'duty-officer',
+    ]);
+  });
+
+  test('blocker_report: per-tick cap and repeat reason are explicit', () => {
+    expect(MAX_BLOCKER_REPORTS_PER_TICK).toBe(3);
+    expect(TM_REPEAT_REASON_BY_TYPE.blocker_report).toBe('tm:blocker_report:repeated');
+  });
+
+  test('blocker_report: flag follows the Duty Officer clock and explicit false', () => {
+    expect(resolveBlockerReportEnabled('false', true)).toBe(false);
+    expect(resolveBlockerReportEnabled('0', true)).toBe(false);
+    expect(resolveBlockerReportEnabled(undefined, false)).toBe(false);
+    expect(resolveBlockerReportEnabled(undefined, true)).toBe(true);
+  });
+
+  test('blocker_report: pause parks reports under every scope', () => {
+    expect(isPauseEffectsExempt('blocker_report', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('blocker_report', null)).toBe(false);
+  });
+
+  test('blocker_report: existing verb ranks and behavior remain represented', () => {
+    expect(TM_REPEAT_REASON_BY_TYPE.fire_cauldron).toBe('tm:fire_cauldron:repeated');
+    expect(TM_REPEAT_REASON_BY_TYPE.escalate_p0).toBe('tm:escalate_p0:repeated');
+    expect(TM_REPEAT_REASON_BY_TYPE.nudge).toBe('tm:nudge:follow-up');
   });
 
   test('fire verb environment defaults OFF without a calendar budget', () => {

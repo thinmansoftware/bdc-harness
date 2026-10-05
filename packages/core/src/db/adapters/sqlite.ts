@@ -657,6 +657,29 @@ export class SqliteAdapter implements IDatabase {
             graded_at TEXT,
             grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
           )
+      `);
+    }
+    // Migration 060: widen the current action_type CHECK for blocker_report.
+    // Re-read after every earlier rebuild so this decision is idempotent.
+    const journalSchema4 = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
+      .get() as { sql?: string } | undefined;
+    if (journalSchema4?.sql && !journalSchema4.sql.includes('blocker_report')) {
+      this.rebuildTmJournal(`
+          CREATE TABLE tm_journal_new (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            thread_ref TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')),
+            proposal_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            before_hash TEXT,
+            proof_predicate TEXT,
+            proof_deadline_at TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+            graded_at TEXT,
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+          )
         `);
     }
     // Migration 046: older on-disk databases used a composite primary key for
@@ -2371,7 +2394,7 @@ export class SqliteAdapter implements IDatabase {
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         thread_ref TEXT NOT NULL,
         action_type TEXT NOT NULL CHECK (
-          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')
+          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')
         ),
         proposal_json TEXT NOT NULL,
         idempotency_key TEXT,

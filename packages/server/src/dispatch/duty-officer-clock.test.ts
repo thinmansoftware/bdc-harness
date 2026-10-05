@@ -12,8 +12,60 @@ import {
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
+  isTaskmasterBlockerReport,
   type DutyOfficerClockDeps,
 } from './duty-officer-clock';
+
+test('blocker_report: recognizer requires taskmaster sender and blocker key', () => {
+  expect(
+    isTaskmasterBlockerReport(
+      message({
+        id: 'br-rec',
+        sender: 'taskmaster',
+        idempotency_key: 'tm:blocker_report:gh:a/b#1:7',
+      })
+    )
+  ).toBe(true);
+  expect(
+    isTaskmasterBlockerReport(
+      message({
+        id: 'br-wrong',
+        sender: 'overseer',
+        idempotency_key: 'tm:blocker_report:gh:a/b#1:7',
+      })
+    )
+  ).toBe(false);
+});
+
+test('blocker_report: clock relays once without the judge and includes thread_ref', async () => {
+  const body =
+    'Blocker report (P1): "Fix" -- owner: UNASSIGNED. Blocked: waiting. State: labelled blocked for 3h. https://github.com/a/b/issues/1';
+  const source = message({
+    id: 'br-relay',
+    sender: 'taskmaster',
+    task_type: 'agent_message',
+    idempotency_key: 'tm:blocker_report:gh:a/b#1:7',
+    subject_key: 'gh:a/b#1',
+    body,
+  });
+  const deps = fakeDeps([source]);
+  deps.judge = mock(async () => {
+    throw new Error('judge_must_not_run');
+  });
+  await tickDutyOfficerClock(deps);
+  await tickDutyOfficerClock(deps);
+  expect(deps.judge).not.toHaveBeenCalled();
+  expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+  const data = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }).mock
+    .calls[0]?.[1] as { body: string; idempotency_key: string; priority: string };
+  expect(data.idempotency_key).toBe('do-clock-escalation:br-relay');
+  expect(data.priority).toBe('normal');
+  expect(JSON.parse(data.body)).toMatchObject({
+    reason: 'taskmaster_blocker_report',
+    thread_ref: 'gh:a/b#1',
+    excerpt: body,
+  });
+});
 
 function message(overrides: Partial<DispatchMessage> & { id: string }): DispatchMessage {
   return {
