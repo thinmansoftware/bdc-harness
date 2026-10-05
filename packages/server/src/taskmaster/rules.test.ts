@@ -3,6 +3,8 @@ import {
   adoptionContentHash,
   classifyThread,
   composeNudgeBody,
+  composeBlockerReportBody,
+  computeBlockerReport,
   computeNextAction,
   isSuppressedByNoise,
   nudgeClockMs,
@@ -46,6 +48,117 @@ describe('nudgeClockMs', () => {
 
   test('customer-facing threads use the 30min clock regardless of priority', () => {
     expect(nudgeClockMs({ priority: 'P3', isCustomerFacing: true })).toBe(CUSTOMER_CLOCK_MS);
+  });
+});
+
+describe('blocker reports', () => {
+  const old = new Date(NOW_MS - 3 * 3_600_000).toISOString();
+
+  test('blocker_report: label-blocked thread past the P1 clock reports to duty-officer', () => {
+    const item = thread({ isBlocked: true, lastActivityAt: old });
+    const adoption = makeAdoption({ title: 'WO-X-01 fix', last_movement_at: old });
+    const report = computeBlockerReport(item, 'blocked', {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      adoption,
+    });
+    expect(report).toMatchObject({ type: 'blocker_report', recipient: 'duty-officer' });
+    expect(
+      computeNextAction(item, 'blocked', { interventionsLast24h: 0, nowMs: NOW_MS, adoption })
+    ).toBeNull();
+  });
+
+  test('blocker_report: unclaimed non-fire P0 and marker report while fire-eligible and held do not', () => {
+    const adoption = makeAdoption({ title: 'P0 work', last_movement_at: old });
+    const item = thread({ priority: 'P0', isUnclaimedP0: true, lastActivityAt: old });
+    expect(
+      computeBlockerReport(item, 'ready', { interventionsLast24h: 0, nowMs: NOW_MS, adoption })
+        ?.type
+    ).toBe('blocker_report');
+    expect(
+      computeBlockerReport(item, 'ready', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        adoption,
+        fireEligible: true,
+        fireEvidence: {
+          woId: 'WO-X-01',
+          targetRepo: 'a/b',
+          project: 'x',
+          specVerifiedAt: old,
+          noOpenOrMergedPr: true,
+          expectedSpec: EXPECTED_SPEC,
+        },
+      })
+    ).toBeNull();
+    expect(
+      computeBlockerReport({ ...item, isHeld: true }, 'ready', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        adoption,
+      })
+    ).toBeNull();
+    const marker = makeAdoption({
+      title: 'Marked',
+      latest_marker_kind: 'BLOCKED',
+      latest_marker_at: old,
+      blocked_reason: 'waiting on review',
+    });
+    expect(
+      computeBlockerReport(thread(), 'healthy', {
+        interventionsLast24h: 0,
+        nowMs: NOW_MS,
+        adoption: marker,
+      })?.body
+    ).toContain('waiting on review');
+  });
+
+  test('blocker_report: clock cooldown invalid time and intervention cap gate it', () => {
+    const item = thread({ isBlocked: true });
+    const adoption = makeAdoption({ title: 'Blocked', last_movement_at: old });
+    const base = { interventionsLast24h: 0, nowMs: NOW_MS, adoption };
+    expect(
+      computeBlockerReport(item, 'blocked', {
+        ...base,
+        lastBlockerReportSentAtMs: NOW_MS - 71 * 3_600_000,
+      })
+    ).toBeNull();
+    expect(
+      computeBlockerReport(item, 'blocked', {
+        ...base,
+        lastBlockerReportSentAtMs: NOW_MS - 73 * 3_600_000,
+      })
+    ).not.toBeNull();
+    expect(computeBlockerReport(item, 'blocked', { ...base, interventionsLast24h: 3 })).toBeNull();
+    expect(
+      computeBlockerReport(item, 'blocked', {
+        ...base,
+        adoption: makeAdoption({ title: 'Bad time', last_movement_at: 'bad' }),
+      })
+    ).toBeNull();
+  });
+
+  test('blocker_report: body is content-complete and bounded', () => {
+    const adoption = makeAdoption({
+      title: 'x'.repeat(400),
+      owner_login: 'jdoe',
+      blocked_reason: 'waiting on PRH credit',
+      last_movement_at: old,
+    });
+    const body = composeBlockerReportBody(thread({ isBlocked: true }), adoption, NOW_MS);
+    expect(body?.length).toBeLessThanOrEqual(500);
+    expect(body).toContain('owner: jdoe');
+    expect(body).toContain('for 3h');
+    expect(
+      validateProposal({
+        ...computeBlockerReport(thread({ isBlocked: true }), 'blocked', {
+          interventionsLast24h: 0,
+          nowMs: NOW_MS,
+          adoption,
+        })!,
+      }).allowed
+    ).toBe(true);
+    expect(composeBlockerReportBody(thread(), makeAdoption({ title: null }), NOW_MS)).toBeNull();
   });
 });
 

@@ -57,9 +57,10 @@ describe('validateProposal', () => {
   });
 
   test('every Slice 1 verb passes the action-type allowlist', () => {
-    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(5);
+    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(6);
     for (const type of TM_ALLOWED_ACTION_TYPES) {
-      if (type !== 'fire_cauldron') expect(validateProposal(proposal({ type })).allowed).toBe(true);
+      if (type !== 'fire_cauldron' && type !== 'blocker_report')
+        expect(validateProposal(proposal({ type })).allowed).toBe(true);
     }
   });
 
@@ -105,8 +106,29 @@ describe('validateProposal', () => {
 
   test('all allowlisted recipients pass', () => {
     for (const recipient of TM_ALLOWED_RECIPIENTS) {
-      expect(validateProposal(proposal({ recipient })).allowed).toBe(true);
+      if (recipient !== 'duty-officer')
+        expect(validateProposal(proposal({ recipient })).allowed).toBe(true);
     }
+  });
+
+  test('blocker_report: guard admits duty-officer only for blocker_report', () => {
+    const valid = proposal({
+      type: 'blocker_report',
+      recipient: 'duty-officer',
+      body: 'Blocker report (P1): "Fix it" -- owner: jdoe. Blocked: waiting. State: labelled blocked for 3h. https://github.com/a/b/issues/1',
+    });
+    expect(validateProposal(valid).allowed).toBe(true);
+    expect(validateProposal({ ...valid, recipient: 'xo' }).forbiddenEffect).toBe(true);
+    expect(validateProposal(proposal({ recipient: 'duty-officer' })).forbiddenEffect).toBe(true);
+    const incomplete = validateProposal({
+      ...valid,
+      body: 'Blocker report "Fix it" Blocked: waiting for 3h https://github.com/a/b/issues/1',
+    });
+    expect(incomplete).toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('content_incomplete'),
+    });
+    expect(incomplete.forbiddenEffect).not.toBe(true);
   });
 
   test('missing idempotency key is rejected', () => {

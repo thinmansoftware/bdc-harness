@@ -12,8 +12,134 @@ import {
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
+  isTaskmasterBlockerReport,
   type DutyOfficerClockDeps,
 } from './duty-officer-clock';
+
+test('blocker_report: recognizer requires taskmaster sender and blocker key', () => {
+  expect(
+    isTaskmasterBlockerReport(
+      message({
+        id: 'br-rec',
+        sender: 'taskmaster',
+        idempotency_key: 'tm:blocker_report:gh:a/b#1:7',
+      })
+    )
+  ).toBe(true);
+  expect(
+    isTaskmasterBlockerReport(
+      message({
+        id: 'br-wrong',
+        sender: 'overseer',
+        idempotency_key: 'tm:blocker_report:gh:a/b#1:7',
+      })
+    )
+  ).toBe(false);
+});
+
+test('blocker_report: clock relays once without the judge and includes thread_ref', async () => {
+  const body =
+    'Blocker report (P1): "Fix" -- owner: UNASSIGNED. Blocked: waiting. State: labelled blocked for 3h. https://github.com/a/b/issues/1';
+  const source = message({
+    id: 'br-relay',
+    sender: 'taskmaster',
+    task_type: 'agent_message',
+    idempotency_key: 'tm:blocker_report:gh:a/b#1:7',
+    subject_key: 'gh:a/b#1',
+    body,
+  });
+  const deps = fakeDeps([source]);
+  deps.judge = mock(async () => {
+    throw new Error('judge_must_not_run');
+  });
+  await tickDutyOfficerClock(deps);
+  await tickDutyOfficerClock(deps);
+  expect(deps.judge).not.toHaveBeenCalled();
+  expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+  const data = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }).mock
+    .calls[0]?.[1] as {
+    body: string;
+    idempotency_key: string;
+    priority: string;
+    recipient: string;
+    subject_key: string;
+  };
+  expect(data.idempotency_key).toBe('do-clock-escalation:br-relay');
+  expect(data.recipient).toBe('xo');
+  expect(data.subject_key).toBe('gh:a/b#1');
+  expect(data.priority).toBe('normal');
+  expect(JSON.parse(data.body)).toMatchObject({
+    reason: 'taskmaster_blocker_report',
+    thread_ref: 'gh:a/b#1',
+    excerpt: body,
+  });
+  const finish = (
+    deps.postResult as unknown as { mock: { calls: unknown[][] } }
+  ).mock.calls[0]?.[0] as {
+    status: string;
+    task_outcome: string;
+    result_body: string;
+  };
+  expect(finish).toMatchObject({ status: 'done', task_outcome: 'succeeded' });
+  expect(JSON.parse(finish.result_body)).toMatchObject({
+    disposition: 'taskmaster_blocker_report_relayed',
+  });
+});
+
+test('blocker_report: failed relay holds then retries the same key; digests stay unrelayed', async () => {
+  const blocker = message({
+    id: 'br-retry',
+    sender: 'taskmaster',
+    task_type: 'agent_message',
+    idempotency_key: 'tm:blocker_report:gh:a/b#2:7',
+    subject_key: 'gh:a/b#2',
+    body: 'Blocker report retry',
+  });
+  const digest = message({
+    id: 'digest-no-relay',
+    sender: 'taskmaster',
+    task_type: 'agent_message',
+    idempotency_key: 'tm:digest:2026-10-05',
+    subject_key: 'digest:2026-10-05',
+    body: 'Taskmaster daily digest',
+  });
+  const deps = fakeDeps([blocker, digest]);
+  let relayAttempts = 0;
+  deps.createAuthenticatedMessage = mock(async (_context, data) => {
+    if (data.idempotency_key === 'do-clock-escalation:br-retry' && relayAttempts++ === 0) {
+      throw new Error('relay unavailable');
+    }
+    return { id: 'xo-msg' };
+  }) as DutyOfficerClockDeps['createAuthenticatedMessage'];
+  deps.judge = mock(async () => ({
+    status: 'ok' as const,
+    transport: 'test',
+    action: 'hold' as const,
+    reason: 'ordinary taskmaster digest',
+    body: digest.body,
+    failures: [],
+  }));
+
+  await tickDutyOfficerClock(deps);
+  await tickDutyOfficerClock(deps);
+
+  const relayCalls = (
+    deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
+  ).mock.calls.map(call => call[1] as { idempotency_key: string });
+  expect(relayCalls.map(call => call.idempotency_key)).toEqual([
+    'do-clock-escalation:br-retry',
+    'do-clock-escalation:br-retry',
+  ]);
+  expect(deps.releaseMessage).toHaveBeenCalledTimes(1);
+  const finishedIds = (
+    deps.postResult as unknown as { mock: { calls: Array<[{ id: string }]> } }
+  ).mock.calls.map(call => call[0].id);
+  expect(finishedIds.filter(id => id === 'br-retry')).toHaveLength(1);
+  const digestFinish = (
+    deps.postResult as unknown as { mock: { calls: Array<[{ id: string; result_body: string }]> } }
+  ).mock.calls.map(call => call[0]).find(call => call.id === 'digest-no-relay');
+  expect(JSON.parse(digestFinish!.result_body)).toMatchObject({ disposition: 'taskmaster_mailbox' });
+});
 
 function message(overrides: Partial<DispatchMessage> & { id: string }): DispatchMessage {
   return {

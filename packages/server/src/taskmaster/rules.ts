@@ -29,7 +29,13 @@ import { WO_ID_RE } from './guard';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
 export type ThreadClass = 'ready' | 'stale' | 'blocked' | 'healthy';
-export type TmActionType = 'deliver_ruling' | 'nudge' | 'escalate_p0' | 'digest' | 'fire_cauldron';
+export type TmActionType =
+  | 'deliver_ruling'
+  | 'nudge'
+  | 'escalate_p0'
+  | 'digest'
+  | 'fire_cauldron'
+  | 'blocker_report';
 
 export type FireEvidence = FireEligibilityEvidence;
 
@@ -185,6 +191,7 @@ export interface NextActionContext {
   fireEscalate?: boolean;
   customerP0Exempt?: boolean;
   fireEvidence?: FireEvidence;
+  lastBlockerReportSentAtMs?: number;
 }
 
 /**
@@ -262,6 +269,92 @@ function describeMovement(lastMovementAt: string | null, nowMs: number): string 
 /** Canonical GitHub URL for an adoption row. */
 function adoptionIssueUrl(adoption: TmAdoptionRow): string {
   return `https://github.com/${adoption.repo}/issues/${adoption.issue_number}`;
+}
+
+const BLOCKER_REPORT_COOLDOWN_MS = 72 * HOUR_MS;
+
+function canonicalBlockerRef(ref: string): string | null {
+  const match = /^gh:([^/]+)\/([^#]+)#([1-9][0-9]*)$/i.exec(ref);
+  if (!match) return null;
+  const owner = match[1].toLowerCase() === 'bluedevilcollectibles' ? 'thinmansoftware' : match[1];
+  return `gh:${owner}/${match[2]}#${match[3]}`;
+}
+
+function blockerDuration(sinceMs: number, nowMs: number): string {
+  const hours = Math.floor(Math.max(0, nowMs - sinceMs) / HOUR_MS);
+  return hours < 48 ? `${hours}h` : `${Math.floor(hours / 24)} days`;
+}
+
+/** Compose the bounded, structurally complete Duty Officer blocker report. */
+export function composeBlockerReportBody(
+  thread: ThreadSnapshot,
+  adoption: TmAdoptionRow | undefined,
+  nowMs: number
+): string | null {
+  const canonicalRef = canonicalBlockerRef(thread.ref);
+  const title = adoption?.title?.trim();
+  if (!canonicalRef || !title || !adoption) return null;
+  const markerBlocked = adoption.latest_marker_kind === 'BLOCKED';
+  const sinceRaw = markerBlocked
+    ? adoption.latest_marker_at
+    : (adoption.last_movement_at ?? thread.lastActivityAt);
+  const sinceMs = sinceRaw ? Date.parse(sinceRaw) : NaN;
+  if (!Number.isFinite(sinceMs)) return null;
+  const state = markerBlocked
+    ? '[BLOCKED] marker'
+    : thread.isBlocked
+      ? 'labelled blocked'
+      : 'unclaimed P0, not fire-eligible';
+  const owner = adoption.owner_login?.trim() || 'UNASSIGNED';
+  const url = `https://github.com/${canonicalRef.slice(3).replace('#', '/issues/')}`;
+  let fittedTitle = title.slice(0, 200);
+  let reason = adoption.blocked_reason?.trim() || 'no named blocker';
+  const render = (): string =>
+    `Blocker report (${thread.priority}): "${fittedTitle}" -- owner: ${owner}. ` +
+    `Blocked: ${reason}. State: ${state} for ${blockerDuration(sinceMs, nowMs)}. ${url}`;
+  while (render().length > 500 && reason.length > 1) reason = reason.slice(0, -1);
+  while (render().length > 500 && fittedTitle.length > 1) fittedTitle = fittedTitle.slice(0, -1);
+  return render().length <= 500 ? render() : null;
+}
+
+/** Independently propose a report; this never replaces computeNextAction. */
+export function computeBlockerReport(
+  thread: ThreadSnapshot,
+  _classification: ThreadClass,
+  context: NextActionContext
+): ActionProposal | null {
+  const canonicalRef = canonicalBlockerRef(thread.ref);
+  if (!canonicalRef || thread.isHeld) return null;
+  const adoption = context.adoption;
+  const markerBlocked = adoption?.latest_marker_kind === 'BLOCKED';
+  const unclaimedP0 = thread.isUnclaimedP0 === true;
+  const blocked = thread.isBlocked === true || markerBlocked;
+  if (!blocked && !unclaimedP0) return null;
+  if (!blocked) {
+    if (context.fireHolding) return null;
+    if (context.fireEligible && context.fireEvidence?.expectedSpec) return null;
+  }
+  if (context.interventionsLast24h >= MAX_INTERVENTIONS_PER_ITEM_24H) return null;
+  const sinceRaw = markerBlocked
+    ? adoption?.latest_marker_at
+    : (adoption?.last_movement_at ?? thread.lastActivityAt);
+  const sinceMs = sinceRaw ? Date.parse(sinceRaw) : NaN;
+  if (!Number.isFinite(sinceMs) || context.nowMs - sinceMs < NUDGE_CLOCK_MS.P1) return null;
+  if (
+    context.lastBlockerReportSentAtMs !== undefined &&
+    context.nowMs - context.lastBlockerReportSentAtMs < BLOCKER_REPORT_COOLDOWN_MS
+  )
+    return null;
+  const body = composeBlockerReportBody(thread, adoption, context.nowMs);
+  if (!body) return null;
+  return {
+    type: 'blocker_report',
+    threadRef: canonicalRef,
+    recipient: 'duty-officer',
+    body,
+    idempotencyKey: `tm:blocker_report:${canonicalRef}:${Math.floor(context.nowMs / BLOCKER_REPORT_COOLDOWN_MS)}`,
+    actsImmediately: false,
+  };
 }
 
 /**

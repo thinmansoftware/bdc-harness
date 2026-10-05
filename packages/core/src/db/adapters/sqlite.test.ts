@@ -52,6 +52,51 @@ describe('SqliteAdapter', () => {
     }
   });
 
+  test('blocker_report: old SQLite journal upgrades idempotently and preserves rows', async () => {
+    currentDbPath = join(import.meta.dir, `.test-blocker-upgrade-${Date.now()}.db`);
+    const raw = new Database(currentDbPath);
+    raw.exec(`CREATE TABLE tm_journal (
+      id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      thread_ref TEXT NOT NULL,
+      action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+      proposal_json TEXT NOT NULL, idempotency_key TEXT, before_hash TEXT, proof_predicate TEXT,
+      proof_deadline_at TEXT,
+      outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+      graded_at TEXT,
+      grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+    );
+    INSERT INTO tm_journal (id, thread_ref, action_type, proposal_json, outcome)
+      VALUES ('old-1', 'gh:a/b#1', 'nudge', '{}', 'sent'),
+             ('old-2', 'gh:a/b#2', 'digest', '{}', 'sent');`);
+    raw.close();
+    db = new SqliteAdapter(currentDbPath);
+    await db.query(`INSERT INTO tm_journal (id, thread_ref, action_type, proposal_json, outcome)
+      VALUES ('br-1', 'gh:a/b#1', 'blocker_report', '{}', 'sent')`);
+    const rows = await db.query<{ action_type: string }>(
+      'SELECT action_type FROM tm_journal ORDER BY id'
+    );
+    expect(rows.rows.map(row => row.action_type)).toEqual(['blocker_report', 'nudge', 'digest']);
+    await expect(
+      db.query(`INSERT INTO tm_journal (id, thread_ref, action_type, proposal_json, outcome)
+      VALUES ('br-2', 'gh:a/b#2', 'bogus', '{}', 'sent')`)
+    ).rejects.toThrow();
+    await db.close();
+    db = new SqliteAdapter(currentDbPath);
+    const schema = await db.query<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'"
+    );
+    expect(schema.rows[0]?.sql).toContain('blocker_report');
+    expect(schema.rows[0]?.sql).toContain('delivered_to_issue');
+    await db.query(`CREATE TRIGGER blocker_upgrade_reopen_sentinel
+      AFTER INSERT ON tm_journal BEGIN SELECT 1; END`);
+    await db.close();
+    db = new SqliteAdapter(currentDbPath);
+    const sentinel = await db.query<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'blocker_upgrade_reopen_sentinel'"
+    );
+    expect(sentinel.rows).toEqual([{ name: 'blocker_upgrade_reopen_sentinel' }]);
+  });
+
   describe('Smart Cauldron reliability schema', () => {
     test('creates all additive reliability tables and indexes', async () => {
       db = createTestDb();
