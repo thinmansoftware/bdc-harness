@@ -101,7 +101,13 @@ beforeAll(async () => {
       ('claude', 'Claude', 'worker_poll', TRUE),
       ('codex', 'Codex', 'worker_poll', TRUE),
       ('fusion', 'Fusion', 'worker_poll', TRUE),
-      ('xo', 'XO', 'drain_on_start', TRUE)
+      ('xo', 'XO', 'drain_on_start', TRUE),
+      -- WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01: recipient of
+      -- the capped-subject fence tests below. This harness builds its own
+      -- isolated schema rather than running the migrations, so a principal
+      -- seeded by migration 046 still has to be declared here.
+      ('taskmaster', 'Taskmaster', 'worker_poll', TRUE),
+      ('overseer', 'Overseer', 'notify_only', TRUE)
   `);
   await db.query(`
     CREATE TABLE agent_dispatch_messages (
