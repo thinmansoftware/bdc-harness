@@ -171,41 +171,51 @@ credential" is non-auto).
    wildcard and no default-auto branch.
 3. **Mixed verdicts go to the human.** One blocking judgment-call finding among
    otherwise fixable ones refuses the whole verdict.
-4. **Two properties, enforced in two places.** They cannot share one key.
+4. **Two invariants, one DATABASE TRANSACTION.** They cannot share one key.
+   - **(A) BOUNDED:** at most `MAX_REMEDIATION_ATTEMPTS` candidates per PR,
+     however concurrent deliveries interleave.
+   - **(B) IDEMPOTENT:** a redelivered verdict (same reviewed head) must not add
+     a second candidate.
 
-   The only atomic primitive is the UNIQUE index on
-   `(sender_principal_id, idempotency_key)`, so one key buys one guarantee:
-   key it on the attempt slot and the cap is atomic but redelivery duplicates;
-   key it on the head and redelivery is a no-op but concurrent heads blow the
-   cap. This was learned the hard way THREE times on this PR:
+   The only atomic primitive in the dispatch table is the UNIQUE index on
+   `(sender_principal_id, idempotency_key)`, so one key buys one guarantee. This
+   PR proved that the hard way **five** times:
 
-   | Round | Key                                   | Fixed      | Broke                                 |
-   | ----- | ------------------------------------- | ---------- | ------------------------------------- |
-   | 1     | (PR, head, attempt)                   | --         | concurrent heads exceed the cap       |
-   | 2     | (PR, attempt)                         | the race   | redelivery duplicates                 |
-   | 3     | (PR, head)                            | redelivery | concurrent heads exceed the cap again |
-   | 4     | (PR, attempt) + pre-insert head check | both       | --                                    |
+   | Round | Mechanism                                  | Fixed          | Broke                                                                       |
+   | ----- | ------------------------------------------ | -------------- | --------------------------------------------------------------------------- |
+   | 1     | key = (PR, head, attempt)                  | --             | (A): concurrent heads exceed the cap                                        |
+   | 2     | key = (PR, attempt)                        | (A)            | (B): redelivery duplicates                                                  |
+   | 3     | key = (PR, head)                           | (B)            | (A) again                                                                   |
+   | 4     | key = (PR, attempt) + pre-insert head read | sequential (B) | (B) under CONCURRENCY -- the read is not atomic against a concurrent insert |
+   | 5     | **`createCappedSubjectMessage` fence**     | both           | --                                                                          |
 
-   So `emitRemediationCandidate` does it in two steps against the same rows:
-   - **Redelivery** is settled FIRST, by identity: if any existing candidate for
-     this PR already names this head, return `claimed: false` without inserting.
-   - **The cap** is then enforced by the DATABASE: claim the next free attempt
-     slot, whose key is `overseer-remediation:owner/repo#N:attempt-K`. That
-     insert is atomic, so concurrent racers on different heads contend for one
-     row and exactly one wins. A loser tries the next slot; when all slots are
-     held the cap has genuinely been reached. The loop is bounded by
-     `MAX_REMEDIATION_ATTEMPTS` and cannot spin.
+   The fence (`packages/core/src/db/dispatch.ts`) does the dedupe read AND the
+   slot insert **inside one transaction** -- `BEGIN IMMEDIATE` on sqlite (plus
+   the in-process promise chain the control plane already uses), `FOR UPDATE`
+   row locks on postgres. The head is the dedupe token, giving (B); the attempt
+   slot is the idempotency key, giving (A).
 
-   **Do not fold the head back into the key.** That is rounds 1 and 3, and it
-   silently unbounds the reviewer-fix-reviewer loop. A real-DB test fires four
-   concurrent racers on four distinct heads and asserts exactly two rows; it
-   fails with `Received: 4` against the round-3 design.
+   It is deliberately NARROW, modelled on the taskmaster notice fence beside it:
+   it validates its own preconditions (`subject_key` present, `1 <= maxRows <=
+16`, non-empty dedupe token) and throws `capped_subject_fence_invalid`
+   rather than degrading to a racy path. Adding it does not widen what any other
+   dispatch caller may do.
 
-   A losing racer gets `claimed: false` and the receipt records
-   `attempt_slot_already_claimed` -- never reported as a queued fix. That is
-   decided by a per-call UUID nonce in `correlation_id` (caller-controlled,
-   stored verbatim, not part of the key): body comparison could not tell a fresh
-   insert from a byte-identical replay.
+   **Do not replace this with an application-level read-then-insert.** That is
+   round 4, and it silently duplicates under concurrency.
+
+   The fence returns the slot it **actually** claimed, which may differ from the
+   attempt a delivery predicted when a racer took an earlier slot. The receipt
+   records that value -- otherwise an audit trail can say attempt 1 while the
+   durable row says attempt 2.
+
+   **Where the guarantee is tested:** `packages/core/src/db/dispatch.test.ts`,
+   `createCappedSubjectMessage (capped-subject fence)` -- against a real
+   database, with the transaction as the thing under test. Removing the
+   transaction makes the distinct-token case exceed `maxRows` and the suite
+   fail. The overseer-level tests cover the wiring only; Bun's sqlite driver is
+   synchronous, so they cannot distinguish a fence from a lucky schedule, and
+   they say so.
 
 5. **Taskmaster still decides.** Budget, pause, backoff, and eligibility all
    still apply.

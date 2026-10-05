@@ -307,6 +307,22 @@ export interface RemediationCandidateBody {
   readonly owningLane: string | null;
 }
 
+/**
+ * What the emitter reports back.
+ *
+ * `attempt` is the slot ACTUALLY claimed, which may differ from the attempt the
+ * caller predicted when a concurrent racer took an earlier slot. The receipt
+ * must record this one, not the prediction, or an audit trail can say attempt 1
+ * while the durable row says attempt 2 (PR #740 round 5 [minor]).
+ */
+export interface RemediationEmitResult {
+  readonly claimed: boolean;
+  /** The slot actually claimed; absent when nothing was inserted. */
+  readonly attempt?: number;
+  /** Why nothing was inserted, when claimed === false. */
+  readonly reason?: 'duplicate_unit_of_work' | 'cap_exhausted';
+}
+
 export interface RemediationCandidateInput {
   readonly owner: string;
   readonly repo: string;

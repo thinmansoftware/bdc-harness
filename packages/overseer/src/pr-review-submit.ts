@@ -28,6 +28,7 @@ import type { IndependentReviewFinding } from './independent-review-evidence.ts'
 import {
   decideRemediation,
   type RemediationCandidateBody,
+  type RemediationEmitResult,
   type RemediationRefusalReason,
 } from './remediation-candidate';
 
@@ -264,7 +265,7 @@ export interface SubmitDeps {
    * it must be REPORTED rather than reported as success, or an operator would
    * be told a fix was queued when this verdict queued nothing.
    */
-  emitRemediationCandidate?(body: RemediationCandidateBody): Promise<{ claimed: boolean }>;
+  emitRemediationCandidate?(body: RemediationCandidateBody): Promise<RemediationEmitResult>;
 }
 
 /** What the remediation hand-back did, recorded on the receipt. */
@@ -602,7 +603,7 @@ async function handBackToTaskmaster(
 
   if (!decision.emit) return { emitted: false, reason: decision.reason };
 
-  let result: { claimed: boolean };
+  let result: RemediationEmitResult;
   try {
     result = await deps.emitRemediationCandidate(decision.body);
   } catch {
@@ -614,7 +615,11 @@ async function handBackToTaskmaster(
   if (!result.claimed) {
     return { emitted: false, reason: 'attempt_slot_already_claimed' };
   }
-  return { emitted: true, attempt: decision.body.attempt };
+  // Report the slot the fence ACTUALLY claimed, not the attempt this delivery
+  // predicted: a concurrent racer may have taken an earlier slot, and a receipt
+  // that disagrees with the durable row is a false audit trail (PR #740 round 5
+  // [minor]). Falling back to the prediction only if the emitter omitted it.
+  return { emitted: true, attempt: result.attempt ?? decision.body.attempt };
 }
 
 /**

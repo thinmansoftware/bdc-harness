@@ -1379,6 +1379,119 @@ describe('remediation hand-back against a real SqliteAdapter', () => {
    * sequential test cannot produce. The attempt SLOT is the scarce resource, so
    * however the reads interleave, at most MAX_REMEDIATION_ATTEMPTS rows exist.
    */
+  /**
+   * REGRESSION -- PR #740 round 5 [major] (2026-09-23).
+   *
+   * The round-4 emitter deduped with a READ before inserting, which is not
+   * atomic: two deliveries of the SAME reviewed head both completed the
+   * precheck before either inserted, then one took slot 1 and the other took
+   * slot 2. One verdict produced two candidates and consumed the whole cap.
+   *
+   * The existing tests could not catch it -- they covered sequential same-head
+   * delivery (the precheck does work when the first insert has landed) and
+   * CONCURRENT DISTINCT heads (a different invariant). This covers the gap:
+   * concurrent SAME head.
+   *
+   * The fix moves the dedupe read inside the insert transaction, so exactly one
+   * row can exist for one head no matter how the deliveries interleave.
+   */
+  test('CONCURRENT deliveries of the SAME head yield exactly ONE row', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    const count = deps.countPriorRemediationAttempts;
+    if (!emit || !count) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 653 };
+    const headSha = '9'.repeat(40);
+    const candidate = {
+      kind: 'overseer_remediation_candidate' as const,
+      ...pr,
+      headSha,
+      attempt: 1,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['migration_ordering'],
+      verdictBody: 'one verdict, delivered twice at once',
+      woId: null,
+      owningLane: 'cauldron-lane-a',
+    };
+
+    // Dispatch both without awaiting between them. The fence serializes them
+    // (BEGIN IMMEDIATE on sqlite), so whichever runs second sees the first
+    // insert and dedupes on the head rather than taking the next slot.
+    const [first, second] = await Promise.all([emit(candidate), emit(candidate)]);
+
+    const claims = [first, second].filter(r => r.claimed);
+    expect(claims).toHaveLength(1);
+    const loser = [first, second].find(r => !r.claimed);
+    expect(loser?.reason).toBe('duplicate_unit_of_work');
+
+    // ONE verdict, ONE row, ONE attempt spent -- not two.
+    expect(await count(pr)).toBe(1);
+    const rows = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE recipient = $1',
+      [REMEDIATION_RECIPIENT]
+    );
+    expect(Number(rows.rows[0]?.n ?? 0)).toBe(1);
+  });
+
+  /**
+   * NOTE ON WHERE ATOMICITY IS PROVED.
+   *
+   * These overseer-level tests exercise the WIRING -- that the emitter asks the
+   * fence for the right thing and reports what it is told. They deliberately do
+   * NOT claim to prove atomicity: Bun's sqlite driver runs queries
+   * synchronously, so two awaited emits run back-to-back and a racy
+   * read-then-insert emitter passes them just as happily (verified by reverting
+   * the emitter: 23 pass either way). A test that cannot fail proves nothing.
+   *
+   * The atomicity guarantee is proved where it is implemented, against a real
+   * database and with the transaction as the thing under test, in
+   * packages/core/src/db/dispatch.test.ts -> "createCappedSubjectMessage
+   * (capped-subject fence)". Removing the transaction from the fence makes the
+   * distinct-token case exceed maxRows and that suite fail.
+   */
+
+  /**
+   * PR #740 round 5 [minor]: the receipt reported the attempt the caller
+   * PREDICTED, but the emitter may claim a different slot when a racer took an
+   * earlier one. The emitter now returns the slot it actually claimed.
+   */
+  test('the emitter reports the slot it ACTUALLY claimed', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    if (!emit) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 654 };
+    const make = (headSha: string) => ({
+      kind: 'overseer_remediation_candidate' as const,
+      ...pr,
+      headSha,
+      // Both deliveries PREDICT slot 1; the second must be told it got slot 2.
+      attempt: 1,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['migration_ordering'],
+      verdictBody: `verdict at ${headSha}`,
+      woId: null,
+      owningLane: 'cauldron-lane-a',
+    });
+
+    const first = await emit(make('a'.repeat(40)));
+    const second = await emit(make('b'.repeat(40)));
+
+    expect(first.claimed).toBe(true);
+    expect(first.attempt).toBe(1);
+    expect(second.claimed).toBe(true);
+    expect(second.attempt).toBe(2);
+
+    // And the durable row agrees with what was reported.
+    const rows = await db.query<{ body: string }>(
+      'SELECT body FROM agent_dispatch_messages WHERE recipient = $1 ORDER BY created_at ASC',
+      [REMEDIATION_RECIPIENT]
+    );
+    const attempts = rows.rows.map(r => (JSON.parse(r.body) as { attempt: number }).attempt);
+    expect(attempts).toEqual([1, 2]);
+  });
+
   test('CONCURRENT racers on distinct heads cannot exceed the cap', async () => {
     const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
     const emit = deps.emitRemediationCandidate;
