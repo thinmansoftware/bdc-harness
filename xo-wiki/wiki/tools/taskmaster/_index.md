@@ -89,14 +89,39 @@ This preserves the existing governance-delivery behavior.
 
 ## Environment
 
-| Variable                       | Meaning                                                                                                             |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| `TASKMASTER_INTERVAL_MS`       | Tick interval. `60000` in production compose. `0` = KILLED (loop off, zero effects) -- this is the rollback switch. |
-| `TASKMASTER_GH_REPOS`          | Comma-separated GitHub repos read as the work SOR (default `bluedevilcollectibles/bdc-xo`).                         |
-| `TASKMASTER_USAGE_ARTIFACT`    | Optional path to a local usage-anchor JSON (`{"tokensRemaining": N, "observedAt": ISO}`).                           |
-| `TASKMASTER_CLI_ANCHOR_CMD`    | Optional shell probe printing tokens-remaining; failure reads as UNKNOWN, never 0.                                  |
-| `TASKMASTER_FIRE_VERB_ENABLED` | Enables mechanically-qualified unclaimed-P0 Cauldron fires. Default `false`; leave off through deploy.              |
-| `TASKMASTER_FIRE_MAX_PER_DAY`  | Maximum successful automatic fires per UTC day. Default `2`.                                                        |
+| Variable                       | Meaning                                                                                                                                                                                             |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASKMASTER_INTERVAL_MS`       | Tick interval. `60000` in production compose. `0` = KILLED (loop off, zero effects) -- this is the rollback switch.                                                                                 |
+| `TASKMASTER_GH_REPOS`          | Comma-separated GitHub repos read as the work SOR (default `bluedevilcollectibles/bdc-xo`).                                                                                                         |
+| `TASKMASTER_USAGE_ARTIFACT`    | Optional path to a local usage-anchor JSON (`{"tokensRemaining": N, "observedAt": ISO}`).                                                                                                           |
+| `TASKMASTER_CLI_ANCHOR_CMD`    | Optional shell probe printing tokens-remaining; failure reads as UNKNOWN, never 0.                                                                                                                  |
+| `TASKMASTER_FIRE_VERB_ENABLED` | Enables mechanically-qualified unclaimed-P0 Cauldron fires. Default `false`; leave off through deploy.                                                                                              |
+| `TASKMASTER_FIRE_MAX_PER_DAY`  | Maximum successful automatic fires per UTC day. Default `2`.                                                                                                                                        |
+| `TASKMASTER_ESCALATE_TO_ISSUE` | Route `escalate_p0` for `gh:owner/repo#N` threads to a GitHub issue comment instead of the operator mailbox. Default `true`; only the literal `false` (any case) restores the pre-WO dispatch path. |
+
+### Escalate a stuck P0 to its GitHub issue (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01)
+
+When Taskmaster escalates a stuck P0 whose thread carries a `gh:owner/repo#N`
+reference, the escalation is delivered as a comment ON THE GITHUB ISSUE it is
+about -- where the owner and the Duty Officer look -- rather than the operator
+dispatch mailbox (`drain_on_start`, no human reader). The comment carries a
+hidden marker `<!-- taskmaster-escalation -->` and a short plain-English line:
+what is stuck, since when, the next step if the tracker names one, at most one
+`@owner` mention (only from an `owner:<login>` label), and an
+"Escalated by Taskmaster (M-155)." attribution.
+
+**Dedupe (documented choice).** The spec left the "last non-Taskmaster activity
+vs. a fixed cooldown" decision to the builder, requiring only determinism. This
+build uses a **72h cooldown** keyed to the escalation's OWN most-recent marker
+comment `created_at`: a fresh escalation is suppressed until 72h have elapsed
+since the last marker comment on that issue. This is one cheap comments-list
+call (no extra events fetch competing with the per-tick GitHub rate-limit
+budget) and is fully deterministic -- three ticks with no new activity leave
+exactly one marker comment. Threads without a `gh:` ref keep the prior
+operator-mailbox path unchanged, and `fire_cauldron` is unaffected.
+
+Kill switch: set `TASKMASTER_ESCALATE_TO_ISSUE=false` and force-recreate the
+container to restore the operator-mailbox escalation path.
 
 ### Enable the fire verb
 
@@ -166,16 +191,17 @@ than replaying them and writes its own audit (response includes
 `expired_proposals` and `audit_id`). An already-RUNNING reset preserves the
 epoch-start timestamp, so accumulated useful/noise grades remain in scope.
 
-## Grading (useful / noise / unheard)
+## Grading (useful / noise / unheard / delivered_to_issue)
 
 `gradeSentActions` (`packages/server/src/taskmaster/loop.ts`) grades each sent
 action against action-specific external SOR evidence recorded after the send:
 
-| Grade     | Meaning                                                                                                     | Counts toward useful-rate floor? |
-| --------- | ----------------------------------------------------------------------------------------------------------- | -------------------------------- |
-| `useful`  | External SOR shows downstream movement caused by the send (ruling addressed, issue closed/assigned/marked). | Yes (numerator)                  |
-| `noise`   | Heard channel, proof deadline passed, no downstream movement.                                               | Yes (denominator)                |
-| `unheard` | The dispatch row was never acknowledged by a non-draining principal -- nobody could have read it.           | No (excluded from denominator)   |
+| Grade                | Meaning                                                                                                                                                                                       | Counts toward useful-rate floor? |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `useful`             | External SOR shows downstream movement caused by the send (ruling addressed, issue closed/assigned/marked).                                                                                   | Yes (numerator)                  |
+| `noise`              | Heard channel, proof deadline passed, no downstream movement.                                                                                                                                 | Yes (denominator)                |
+| `unheard`            | The dispatch row was never acknowledged by a non-draining principal -- nobody could have read it.                                                                                             | No (excluded from denominator)   |
+| `delivered_to_issue` | A `gh:owner/repo#N` `escalate_p0` delivered as a GitHub issue comment (marker `<!-- taskmaster-escalation -->`) instead of the operator mailbox. Set at SEND time, not by `gradeSentActions`. | No (excluded from denominator)   |
 
 **M-155 Amendment 03 (John's ruling 2026-09-21).** An action is `unheard`
 unless its dispatch row carries an `acknowledged_at` from a recipient whose
@@ -198,6 +224,13 @@ the heard gate -- it is a direct cascade trigger with no human-mailbox hop, so
 channel deafness cannot apply, and it is graded useful/noise like before. The
 40% floor value, `USEFUL_RATE_MIN_GRADED`, the auto-pause mechanism, and
 "resume is an operator decision" are all unchanged.
+
+`delivered_to_issue` (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01) is excluded
+from the floor denominator by the same construction as `unheard`: it is neither
+`useful` nor `noise`, so it never feeds `usefulRateFloorBreached`. Unlike the
+`gradeSentActions` grades above, it is written at SEND time when a `gh:` P0
+escalation is delivered as a GitHub issue comment rather than the operator
+mailbox (see the escalate-to-issue section above).
 
 Grade-split query:
 

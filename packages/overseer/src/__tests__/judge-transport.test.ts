@@ -140,7 +140,7 @@ describe('#852 -- buildJudgeTransport knows the cursor rung', () => {
   test('spawns cursor-agent in read-only ask mode with the prompt on stdin', async () => {
     delete process.env.OVERSEER_CURSOR_JUDGE_MODEL;
     const transport = await buildJudgeTransport('cursor', 'private envelope');
-    expect(DEFAULT_CURSOR_JUDGE_MODEL).toBe('claude-fable-5-1-thinking-high');
+    expect(DEFAULT_CURSOR_JUDGE_MODEL).toBe('grok-4.7-high');
     expect(transport.argv).toEqual([
       'cursor-agent',
       '--print',

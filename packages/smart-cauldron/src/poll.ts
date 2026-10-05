@@ -18,6 +18,15 @@ const execFileAsync = promisify(execFile);
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'escalated', 'cancelled']);
 
 /**
+ * Default OPEN-NODE silence budget (ms): 60 minutes.
+ *
+ * Exported so the production caller (cascade.ts) and the per-node timeout
+ * resolver agree on the same floor instead of duplicating a literal. See the
+ * `openNodeBudgetMs` option doc below for why the fallback is this generous.
+ */
+export const DEFAULT_OPEN_NODE_BUDGET_MS = 3_600_000;
+
+/**
  * Thrown by pollForTerminal when a run does not reach a terminal state within
  * the poll budget. Distinguishable from network/API errors so callers (the
  * cascade) can treat a progress-timeout as a quality-fail-and-climb signal
@@ -84,9 +93,50 @@ interface PollOptions {
    * is directly observable. If no new event arrives within this window, the run
    * is treated as stalled and the cascade climbs.
    *
+   * TWO CARVE-OUTS (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01) -- silence only
+   * counts as a stall once the run is actually WORKING:
+   *   1. Queue time is not stall time. A run still `pending` with no
+   *      `node_started` event has not begun; its silence is queue latency, not a
+   *      stuck build. Only the hard `timeoutMs` ceiling can end such a run.
+   *   2. An open node is alive. When a node has started but not yet
+   *      completed/failed, the run is granted that node's own configured
+   *      `timeout` when available (see `nodeTimeoutsMs`), else a generous default
+   *      (`openNodeBudgetMs`, 60 min), of silence before it counts as stalled --
+   *      a single long node (e.g. a 25-minute test run) legitimately emits
+   *      nothing while it works and must not be cut at 20 min.
+   *
    * Set to 0 to disable stall detection and fall back to duration-only.
    */
   stallTimeoutMs?: number;
+  /**
+   * OPEN-NODE SILENCE BUDGET (ms). Default: 3600000 (60 minutes).
+   *
+   * FALLBACK budget for an open node whose configured `timeout` is not available
+   * (see `nodeTimeoutsMs`). While a node has started but not yet
+   * completed/failed, the run is allowed this much silence before it is judged
+   * stalled, instead of the tighter `stallTimeoutMs`. The poll event feed itself
+   * carries no per-node `timeout` (node_started events are nodeId/nodeName only),
+   * so this generous default applies to every open node the caller did not
+   * supply a configured timeout for. Ignored when no node is open.
+   */
+  openNodeBudgetMs?: number;
+  /**
+   * PER-NODE CONFIGURED TIMEOUTS (ms), keyed by node name (step_name), sourced
+   * from the workflow definition by the caller. When an open node's name is
+   * present here, its own configured `timeout` becomes the open-node silence
+   * budget instead of the generic `openNodeBudgetMs` default -- honoring Scope IN
+   * item 2 of WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 ("the node's own
+   * configured timeout from the workflow definition, when available"). This is
+   * the ONLY channel by which a configured timeout becomes available: the poll
+   * event feed does not carry it. Production supplies it from cascade.ts via
+   * `fetchNodeTimeoutsMs` (node-timeouts.ts), which reads the fired tier's
+   * workflow definition. Nodes absent from this map fall back to
+   * `openNodeBudgetMs`. When several nodes are open at once (a concurrent DAG
+   * layer), the largest applicable budget is used so a healthy long node is
+   * never cut short by a shorter sibling. Default: {} (every open node uses
+   * `openNodeBudgetMs`).
+   */
+  nodeTimeoutsMs?: Record<string, number>;
   /** Poll interval (ms). Default: 30000 (30 seconds). */
   intervalMs?: number;
   /**
@@ -118,11 +168,17 @@ interface PollOptions {
   /** Delay between findExistingPrForBranch `gh pr list` retries (ms). Default: 10000. */
   prBranchLookupDelayMs?: number;
   /**
+   * GitHub "owner/repo" for the branch fallback's `gh pr list --repo` call.
+   * When unknown, the fallback is skipped because the conductor's cwd is not
+   * a git checkout and gh cannot safely infer the repository.
+   */
+  repo?: string | null;
+  /**
    * Injectable seam for the `gh pr list --head <branch>` lookup. Test-only:
    * production always uses the real gh CLI (ghPrListForBranchDefault). Returns
    * the PR URL for the branch, or null when gh is unavailable / no PR is found.
    */
-  ghPrListForBranch?: (branch: string) => Promise<string | null>;
+  ghPrListForBranch?: (branch: string, repo: string | null) => Promise<string | null>;
   /**
    * Injectable seam for `gh pr view --json mergeable`. Test-only:
    * production always uses the real gh CLI (checkPrMergeableDefault).
@@ -143,11 +199,14 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     token: tokenOverride,
     timeoutMs = 14_400_000,
     stallTimeoutMs = 1_200_000,
+    openNodeBudgetMs = DEFAULT_OPEN_NODE_BUDGET_MS,
+    nodeTimeoutsMs = {},
     intervalMs = 30_000,
     prRetryAttempts = 3,
     prRetryDelayMs = 10_000,
     prBranchLookupAttempts = 3,
     prBranchLookupDelayMs = 10_000,
+    repo = null,
     ghPrListForBranch = ghPrListForBranchDefault,
     checkPrMergeable: checkPrMergeableFn = checkPrMergeableDefault,
   } = opts;
@@ -209,7 +268,8 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
             events,
             ghPrListForBranch,
             prBranchLookupAttempts,
-            prBranchLookupDelayMs
+            prBranchLookupDelayMs,
+            repo
           );
           if (prUrl !== null) {
             console.log(
@@ -229,17 +289,39 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
         prUrl,
         prMergeable,
         servedModelId,
+        nodeModels: extractNodeModels(events),
         rawMetadata: detail.run.metadata ?? {},
       };
     }
 
-    // Stall check: silence, not duration, is what indicates a stuck run.
-    if (stallTimeoutMs > 0) {
+    // Stall check: silence, not duration, is what indicates a stuck run -- but
+    // only once the run is actually WORKING. Two carve-outs (WO-HARNESS-
+    // CONDUCTOR-STALL-DETECTOR-FIX-01):
+    //   1. Queue time is not stall time. A run still `pending` with no
+    //      `node_started` event has not begun; skip the silence check entirely
+    //      (only the hard `timeoutMs` ceiling can end it). We do NOT advance
+    //      lastActivityAt while queued -- we simply do not judge it stalled.
+    //   2. An open node is alive. When a node has started and not yet
+    //      completed/failed, grant the generous open-node budget of silence
+    //      before judging the run stalled, instead of the tighter stall budget.
+    const events = detail.events ?? [];
+    if (stallTimeoutMs > 0 && hasRunStarted(detail.run.status, events)) {
+      const openNodes = openNodeNames(events);
+      const openNode = openNodes.length > 0;
+      // For an open node, use its own configured timeout from the workflow
+      // definition when the caller supplied one (nodeTimeoutsMs); otherwise the
+      // generous openNodeBudgetMs default. Across a concurrent DAG layer take the
+      // largest so a long healthy node is not cut short by a shorter sibling
+      // (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN item 2).
+      const openBudget = openNode
+        ? Math.max(...openNodes.map(name => nodeTimeoutsMs[name] ?? openNodeBudgetMs))
+        : 0;
+      const budget = openNode ? Math.max(stallTimeoutMs, openBudget) : stallTimeoutMs;
       const silentFor = Date.now() - lastActivityAt;
-      if (silentFor >= stallTimeoutMs) {
+      if (silentFor >= budget) {
         throw new TimeoutError(
           `[smart-cauldron/poll] Run ${runId} stalled: no new events for ${String(silentFor)}ms ` +
-            `(stall budget ${String(stallTimeoutMs)}ms). Last activity was at ` +
+            `(stall budget ${String(budget)}ms${openNode ? ', open-node budget' : ''}). Last activity was at ` +
             `${newestEventSeen === null ? 'no events observed' : new Date(newestEventSeen).toISOString()}.`
         );
       }
@@ -268,18 +350,75 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
 function newestEventTimestamp(events: { created_at?: string | null }[]): number | null {
   let newest: number | null = null;
   for (const ev of events) {
-    if (!ev.created_at) continue;
-    // SQLite emits "YYYY-MM-DD HH:MM:SS" (space-separated, UTC, no zone marker).
-    // Date.parse treats that as LOCAL time on some runtimes, which would skew
-    // every comparison. Normalize to ISO-8601 UTC before parsing.
-    const raw = ev.created_at.trim();
-    const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)
-      ? `${raw.replace(' ', 'T')}Z`
-      : raw;
-    const parsed = Date.parse(iso);
-    if (!Number.isNaN(parsed) && (newest === null || parsed > newest)) newest = parsed;
+    const parsed = parseEventTimestamp(ev.created_at);
+    if (parsed !== null && (newest === null || parsed > newest)) newest = parsed;
   }
   return newest;
+}
+
+/**
+ * Parse an event's `created_at` into epoch ms, or null when absent/unparseable.
+ *
+ * SQLite emits "YYYY-MM-DD HH:MM:SS" (space-separated, UTC, no zone marker).
+ * Date.parse treats that as LOCAL time on some runtimes, which would skew every
+ * comparison. Normalize to ISO-8601 UTC before parsing.
+ */
+function parseEventTimestamp(createdAt?: string | null): number | null {
+  if (!createdAt) return null;
+  const raw = createdAt.trim();
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw) ? `${raw.replace(' ', 'T')}Z` : raw;
+  const parsed = Date.parse(iso);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Has this run actually begun executing?
+ *
+ * A run that is still `pending` and has emitted no `node_started` event has not
+ * started -- its silence is queue latency, not a stuck build, so it must never be
+ * judged stalled by the silence budget (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01
+ * Scope IN item 1). Any non-pending status, or the presence of a node_started
+ * event, means work has begun and the silence budget applies.
+ */
+function hasRunStarted(status: string, events: { event_type: string }[]): boolean {
+  if (status !== 'pending') return true;
+  return events.some(ev => ev.event_type === 'node_started');
+}
+
+/**
+ * Names of nodes currently OPEN -- started but not yet completed or failed.
+ *
+ * Processes node lifecycle events (node_started / node_completed / node_failed)
+ * in chronological order, tracking the latest start per step and clearing it on
+ * completion/failure. A run with any open node is granted the generous open-node
+ * silence budget instead of the tighter stall budget, because a single long node
+ * (e.g. a 25-minute test run) legitimately emits nothing while it works
+ * (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN item 2). The feed itself
+ * carries no per-node `timeout`, so the caller maps these names to configured
+ * timeouts (poll's `nodeTimeoutsMs`) when available, falling back to a fixed
+ * budget otherwise. Returns the open node names so the caller can look each up.
+ */
+function openNodeNames(
+  events: { event_type: string; step_name: string | null; created_at?: string | null }[]
+): string[] {
+  const openStarts = new Set<string>();
+  const lifecycle = events
+    .filter(
+      ev =>
+        ev.event_type === 'node_started' ||
+        ev.event_type === 'node_completed' ||
+        ev.event_type === 'node_failed'
+    )
+    .map(ev => ({ ev, ts: parseEventTimestamp(ev.created_at) }))
+    .filter((x): x is { ev: (typeof x)['ev']; ts: number } => x.ts !== null)
+    .sort((a, b) => a.ts - b.ts);
+
+  for (const { ev } of lifecycle) {
+    const step = ev.step_name ?? '';
+    if (ev.event_type === 'node_started') openStarts.add(step);
+    else openStarts.delete(step);
+  }
+  return [...openStarts];
 }
 
 async function fetchRunDetail(
@@ -326,28 +465,37 @@ function extractValidatorVerdict(
   return 'unknown';
 }
 
+/** Read current node text while retaining compatibility with legacy events. */
+function extractEventText(data: Record<string, unknown>): string {
+  if (typeof data.node_output === 'string') return data.node_output;
+  if (typeof data.output === 'string') return data.output;
+  return '';
+}
+
 /**
  * Extract PR URL from node_completed events.
  *
  * Looks for node with step_name matching "open-pr" or containing "pr".
- * Parses PR_URL=https://... pattern from data.output.
+ * Parses an explicit PR_URL= value first, then a bare trailing GitHub pull URL.
  */
 function extractPrUrl(
   events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
 ): string | null {
-  const prUrlPattern = /PR_URL=(https?:\/\/\S+)/i;
+  const prUrlPattern = /PR_URL=(https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+)/i;
 
   for (const ev of events) {
     if (ev.event_type !== 'node_completed') continue;
     const stepName = ev.step_name ?? '';
     if (stepName !== 'open-pr' && !stepName.toLowerCase().includes('pr')) continue;
 
-    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+    const output = extractEventText(ev.data);
     const match = prUrlPattern.exec(output);
     if (match?.[1]) return match[1];
 
     // Also check for raw GitHub PR URL in output
-    const rawMatch = /(https:\/\/github\.com\/[^\s]+\/pull\/\d+)/.exec(output);
+    const rawMatch = /(?:^|\n)\s*(https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+)\s*$/.exec(
+      output
+    );
     if (rawMatch?.[1]) return rawMatch[1];
   }
 
@@ -388,14 +536,15 @@ function extractPrUrl(
  */
 async function findExistingPrForBranch(
   events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[],
-  lookup: (branch: string) => Promise<string | null>,
+  lookup: (branch: string, repo: string | null) => Promise<string | null>,
   attempts: number,
-  delayMs: number
+  delayMs: number,
+  repo: string | null
 ): Promise<string | null> {
   // The commit-and-push node reports its final target as unique_branch=<name>.
   let branch: string | null = null;
   for (const ev of events) {
-    const output = typeof ev.data.output === 'string' ? ev.data.output : '';
+    const output = extractEventText(ev.data);
     const m = /unique_branch=(\S+)/.exec(output);
     if (m?.[1]) branch = m[1];
   }
@@ -407,22 +556,37 @@ async function findExistingPrForBranch(
     if (attempt > 0) {
       await new Promise<void>(resolve => setTimeout(resolve, delayMs));
     }
-    const url = await lookup(branch);
+    const url = await lookup(branch, repo);
     if (url !== null) return url;
   }
   return null;
 }
 
 /**
- * Default `gh pr list --head <branch>` lookup used in production. Returns the
- * open PR URL for the branch, or null when gh is unavailable or nothing matches.
- * Callers must treat null as "unknown", never as "confirmed absent".
+ * Injectable exec seam for testing the exact gh invocation without replacing
+ * child_process globally.
  */
-async function ghPrListForBranchDefault(branch: string): Promise<string | null> {
+type ExecFileFn = (command: string, args: string[]) => Promise<{ stdout: string; stderr: string }>;
+
+/** Default `gh pr list --head <branch> --repo <repo>` production lookup. */
+export async function ghPrListForBranchDefault(
+  branch: string,
+  repo: string | null,
+  execFn: ExecFileFn = execFileAsync
+): Promise<string | null> {
+  if (!repo) {
+    console.log(
+      '[smart-cauldron/poll] skipping gh pr list --head branch lookup: repo is unknown -- ' +
+        'gh cannot infer a repository from /app (not a git checkout) without --repo'
+    );
+    return null;
+  }
   try {
-    const { stdout } = await execFileAsync('gh', [
+    const { stdout } = await execFn('gh', [
       'pr',
       'list',
+      '--repo',
+      repo,
       '--head',
       branch,
       '--state',
@@ -434,7 +598,10 @@ async function ghPrListForBranchDefault(branch: string): Promise<string | null> 
     ]);
     const url = stdout.trim();
     return url.length > 0 ? url : null;
-  } catch {
+  } catch (err) {
+    const stderr = (err as { stderr?: string }).stderr;
+    const firstLine = (stderr ?? (err as Error).message ?? '').split('\n')[0];
+    console.log(`[smart-cauldron/poll] gh pr list --head failed: ${firstLine}`);
     return null;
   }
 }
@@ -446,6 +613,39 @@ async function ghPrListForBranchDefault(branch: string): Promise<string | null> 
 function extractServedModelId(metadata: Record<string, unknown>): string | null {
   const id = metadata.served_model_id ?? metadata.model_id;
   return typeof id === 'string' ? id : null;
+}
+
+/**
+ * Last node_completed or node_failed model triple per step.
+ * A later event for the same step replaces the whole triple.
+ * Empty strings and non-strings are stored as null. Empty step names are skipped.
+ */
+export function extractNodeModels(
+  events: readonly {
+    event_type: string;
+    step_name: string | null;
+    data?: Record<string, unknown>;
+  }[]
+): Record<string, { provider: string | null; declared: string | null; served: string | null }> {
+  const nodeModels: Record<
+    string,
+    { provider: string | null; declared: string | null; served: string | null }
+  > = {};
+  for (const event of events) {
+    if (event.event_type !== 'node_completed' && event.event_type !== 'node_failed') continue;
+    if (typeof event.step_name !== 'string' || event.step_name.length === 0) continue;
+    const data = event.data ?? {};
+    nodeModels[event.step_name] = {
+      provider: nonEmptyModelField(data.provider),
+      declared: nonEmptyModelField(data.declared_model_id),
+      served: nonEmptyModelField(data.served_model_id),
+    };
+  }
+  return nodeModels;
+}
+
+function nonEmptyModelField(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
 /**
@@ -467,7 +667,10 @@ async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
     if (val === 'MERGEABLE') return true;
     if (val === 'CONFLICTING' || val === 'BLOCKED') return false;
     return null;
-  } catch {
+  } catch (err) {
+    const stderr = (err as { stderr?: string }).stderr;
+    const firstLine = (stderr ?? (err as Error).message ?? '').split('\n')[0];
+    console.log(`[smart-cauldron/poll] gh pr view --json mergeable failed: ${firstLine}`);
     return null;
   }
 }

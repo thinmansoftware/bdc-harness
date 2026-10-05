@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run-stop-greps.sh -- unit tests for the run-stop-greps node core (rsg_*) in
 # .archon/workflows/defaults/bdc-feature-development-codex.yaml and its byte-identical
-# mirrors in the other 10 bdc-feature-development lanes.
+# mirrors in the other 11 bdc-feature-development lanes.
 #
 # bdc-xo #1940: the manifest "Grep assertions:" line was stamped "N/A (no declared
 # mechanical assertions)" for every WO, including specs that declared grep stop
@@ -9,7 +9,7 @@
 # it under the read-only allowlist, and emits OBSERVED counts.
 #
 # Cores are EXTRACTED from the canonical YAML (never re-typed). A parity test asserts
-# the core is byte-identical across all 11 lanes.
+# the core is byte-identical across all 12 lanes.
 #
 # Run: bash .archon/workflows/defaults/__tests__/run-stop-greps.sh
 # Exits 0 on all-pass, 1 on any failure. ASCII only.
@@ -43,6 +43,7 @@ CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
+bdc-feature-development-cursor.yaml
 bdc-feature-development-fable.yaml
 bdc-feature-development-fusion-cx-kimi.yaml
 bdc-feature-development-fusion-cx-qwen.yaml
@@ -71,7 +72,7 @@ for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: rsg core byte-identical across all 11 lanes ---"
+echo "--- Parity: rsg core byte-identical across all 12 lanes (parity-all-12-lanes) ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$RSG_CORE" "$(extract_core "$DEFAULTS/$lane" rsg)"
 done
@@ -125,7 +126,7 @@ assert_contains "awk assertion still extracted (dropped later, not here)" "| awk
 assert_contains "DECLARED counts every grep header including the one without Expected" "DECLARED${TAB}5" "$EXTRACTED"
 assert_eq "test-suite and ASCII stops are not grep assertions" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c 'bun test\|LC_ALL' || true)"
 assert_eq "header without Expected: emits no executable assertion line" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c "gamma.*${TAB}eq${TAB}" || true)"
-assert_contains "header without Expected is named as unparsed" 'UNPARSED	1	grep -c gamma fixture.txt' "$EXTRACTED"
+assert_contains "header without Expected is named as unparsed" "UNPARSED${TAB}1${TAB}grep -c gamma fixture.txt" "$EXTRACTED"
 assert_eq "no grep stops -> zero unparsed and declared" "UNPARSED${TAB}0
 DECLARED${TAB}0" "$(printf 'Stop 2 (test suite):\n  bun test\n  Expected: ok\n' | rsg_extract)"
 assert_contains "'at most' becomes le" "${TAB}le${TAB}3" "$(printf 'Stop 1 (grep assertion):\n  grep -c a b\n  Expected: at most 3\n' | rsg_extract)"
@@ -140,6 +141,28 @@ for c in 'grep -c a b; rm -rf /' 'grep a b | awk "{print}"' 'grep a b > out' 'ca
   'find . -okdir sh x.sh' 'sort --output=out in' 'grep --file /etc/passwd x' 'find . -fprintf out %p' 'xargs grep x' \
   'grep -c "alpha" fixture.txt' 'LC_ALL=C grep -n "[^ -~]" src/a.ts'; do
   if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: forbidden expected: $c"; else PASS=$((PASS+1)); echo "PASS: forbidden: $c"; fi
+done
+
+echo "--- unquoted-still-executes ---"
+c='grep -c needle fixture.txt'
+if rsg_allow_cmd "$c"; then PASS=$((PASS+1)); echo "PASS: unquoted-still-executes: $c"; else FAIL=$((FAIL+1)); echo "FAIL: unquoted-still-executes: $c"; fi
+
+echo "--- quoted-pattern-executes (allowlist) ---"
+c="grep -c 'needle' fixture.txt"
+if rsg_allow_cmd "$c"; then PASS=$((PASS+1)); echo "PASS: quoted-pattern-executes allow: $c"; else FAIL=$((FAIL+1)); echo "FAIL: quoted-pattern-executes allow: $c"; fi
+
+echo "--- quoted-colon-and-equals-execute (allowlist) ---"
+for c in "grep -c 'SPEC_DEFECT:' fixture.txt" "grep -c 'unparsed=' fixture.txt"; do
+  if rsg_allow_cmd "$c"; then PASS=$((PASS+1)); echo "PASS: quoted-colon-and-equals-execute allow: $c"; else FAIL=$((FAIL+1)); echo "FAIL: quoted-colon-and-equals-execute allow: $c"; fi
+done
+
+echo "--- double-quoted-still-dropped ---"
+c='grep -c "needle" fixture.txt'
+if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: double-quoted-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: double-quoted-still-dropped: $c"; fi
+
+echo "--- unsafe-quoted-content-still-dropped ---"
+for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
+  if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: unsafe-quoted-content-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: unsafe-quoted-content-still-dropped: $c"; fi
 done
 
 echo "--- rsg_observe / rsg_compare ---"
@@ -191,6 +214,38 @@ assert_contains "all dropped -> N/A line names the count" "GREP_LINE=N/A (1 decl
 OUT="$(printf 'Stop 1 (grep assertion):\n  LC_ALL=C grep -c alpha fixture.txt\n  Expected: 1\n' | rsg_extract | rsg_run)"
 assert_contains "LC_ALL prefix passes the gate and executes" "GREP_EXECUTED=1" "$OUT"
 assert_contains "LC_ALL prefixed command kept verbatim in GREP_LINE" 'GREP_LINE=LC_ALL=C grep -c alpha fixture.txt => 1' "$OUT"
+
+echo "--- quoted-pattern-executes ---"
+printf 'needle\nneedle\n' > "$TMP/needle.txt"
+OUT="$(printf 'Stop 1 (grep assertion):\n  grep -c '\''needle'\'' needle.txt\n  Expected: 2\n' | rsg_extract | rsg_run)"
+assert_contains "quoted-pattern-executes is executed" "GREP_EXECUTED=1" "$OUT"
+assert_contains "quoted-pattern-executes reports OK with observed 2" "OK: grep -c 'needle' needle.txt => 2 (expected eq 2)" "$OUT"
+assert_contains "quoted-pattern-executes is not dropped" "GREP_DROPPED=0" "$OUT"
+
+echo "--- quoted-colon-and-equals-execute ---"
+printf 'SPEC_DEFECT:\nunparsed=\nSPEC_DEFECT:\n' > "$TMP/marks.txt"
+OUT="$(printf 'Stop 1 (grep assertion):\n  grep -c '\''SPEC_DEFECT:'\'' marks.txt\n  Expected: 2\nStop 2 (grep assertion):\n  grep -c '\''unparsed='\'' marks.txt\n  Expected: 1\n' | rsg_extract | rsg_run)"
+assert_contains "quoted-colon-and-equals-execute SPEC_DEFECT" "OK: grep -c 'SPEC_DEFECT:' marks.txt => 2 (expected eq 2)" "$OUT"
+assert_contains "quoted-colon-and-equals-execute unparsed" "OK: grep -c 'unparsed=' marks.txt => 1 (expected eq 1)" "$OUT"
+assert_contains "quoted-colon-and-equals-execute both executed" "GREP_EXECUTED=2" "$OUT"
+assert_contains "quoted-colon-and-equals-execute none dropped" "GREP_DROPPED=0" "$OUT"
+
+echo "--- unquoted-still-executes (run) ---"
+OUT="$(printf 'Stop 1 (grep assertion):\n  grep -c alpha fixture.txt\n  Expected: 1\n' | rsg_extract | rsg_run)"
+assert_contains "unquoted-still-executes reports OK" "OK: grep -c alpha fixture.txt => 1 (expected eq 1)" "$OUT"
+assert_contains "unquoted-still-executes is executed" "GREP_EXECUTED=1" "$OUT"
+
+echo "--- double-quoted-still-dropped (run) ---"
+OUT="$(printf 'grep -c "needle" needle.txt\teq\t2\nUNPARSED\t0\nDECLARED\t1\n' | rsg_run)"
+assert_contains "double-quoted-still-dropped" "GREP_DROPPED=1" "$OUT"
+assert_contains "double-quoted-still-dropped not executed" "GREP_EXECUTED=0" "$OUT"
+
+echo "--- unsafe-quoted-content-still-dropped (run) ---"
+for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f"; do
+  OUT="$(printf '%s\teq\t1\nUNPARSED\t0\nDECLARED\t1\n' "$c" | rsg_run)"
+  assert_contains "unsafe-quoted-content-still-dropped: $c" "DROPPED (not on read-only allowlist; not executed): $c" "$OUT"
+  assert_contains "unsafe-quoted-content-still-dropped not executed: $c" "GREP_EXECUTED=0" "$OUT"
+done
 
 echo "--- rsg_run: find -execdir is dropped and never executed ---"
 printf 'touch pwned-rsg-execdir.txt\n' > "$TMP/evil.sh"

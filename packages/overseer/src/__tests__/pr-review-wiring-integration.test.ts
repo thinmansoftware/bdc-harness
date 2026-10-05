@@ -171,6 +171,7 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
   test('a real review submission receipt binds the code-fixed Overseer system principal', async () => {
     const deps = createRealSubmitDeps('thinman-overseer[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
     });
 
     await deps.recordReceipt({
@@ -284,18 +285,19 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
        WHERE id = $1`,
       [first.messageId]
     );
-    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
-      {
-        correlationId: first.correlationId ?? '',
-        messageId: first.messageId ?? '',
-        owner: 'thinmansoftware',
-        repo: 'bdc-harness',
-        prNumber: 148,
-        headSha: '1'.repeat(40),
-        disposition: 'changes_requested',
-        event: 'REQUEST_CHANGES',
-      }
-    );
+    await createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
+    }).recordReceipt({
+      correlationId: first.correlationId ?? '',
+      messageId: first.messageId ?? '',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 148,
+      headSha: '1'.repeat(40),
+      disposition: 'changes_requested',
+      event: 'REQUEST_CHANGES',
+    });
 
     const secondHeadSha = '2'.repeat(40);
     const secondPayload = payloadFor('synchronize', secondHeadSha);
@@ -364,7 +366,10 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
        WHERE id = $1`,
       [first.messageId]
     );
-    const submitDeps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() });
+    const submitDeps = createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
+    });
     await submitDeps.recordReceipt({
       correlationId: first.correlationId ?? '',
       messageId: first.messageId ?? '',
@@ -622,18 +627,19 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
        WHERE id = $1`,
       [first.messageId]
     );
-    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
-      {
-        correlationId: first.correlationId ?? '',
-        messageId: first.messageId ?? '',
-        owner: 'thinmansoftware',
-        repo: 'shopops',
-        prNumber,
-        headSha: firstHeadSha,
-        disposition: 'changes_requested',
-        event: 'REQUEST_CHANGES',
-      }
-    );
+    await createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
+    }).recordReceipt({
+      correlationId: first.correlationId ?? '',
+      messageId: first.messageId ?? '',
+      owner: 'thinmansoftware',
+      repo: 'shopops',
+      prNumber,
+      headSha: firstHeadSha,
+      disposition: 'changes_requested',
+      event: 'REQUEST_CHANGES',
+    });
 
     const secondHeadSha = '9'.repeat(40);
     const secondPayload = payloadFor('synchronize', secondHeadSha);
@@ -784,18 +790,19 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
        WHERE id = $1`,
       [first.messageId]
     );
-    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
-      {
-        correlationId: first.correlationId ?? '',
-        messageId: first.messageId ?? '',
-        owner: 'thinmansoftware',
-        repo: 'bdc-harness',
-        prNumber,
-        headSha: firstHeadSha,
-        disposition: 'changes_requested',
-        event: 'REQUEST_CHANGES',
-      }
-    );
+    await createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
+    }).recordReceipt({
+      correlationId: first.correlationId ?? '',
+      messageId: first.messageId ?? '',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber,
+      headSha: firstHeadSha,
+      disposition: 'changes_requested',
+      event: 'REQUEST_CHANGES',
+    });
 
     // Rewrite the receipt into the PRE-DEPLOYMENT shape: no subject_key, which
     // is precisely what every receipt on disk today looks like. correlation_id
@@ -885,18 +892,19 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       deps
     );
     expect(neighbour.disposition).toBe('queued');
-    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
-      {
-        correlationId: neighbour.correlationId ?? '',
-        messageId: neighbour.messageId ?? '',
-        owner: 'thinmansoftware',
-        repo: 'bdc-harness',
-        prNumber: 900,
-        headSha: neighbourHeadSha,
-        disposition: 'changes_requested',
-        event: 'REQUEST_CHANGES',
-      }
-    );
+    await createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
+    }).recordReceipt({
+      correlationId: neighbour.correlationId ?? '',
+      messageId: neighbour.messageId ?? '',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 900,
+      headSha: neighbourHeadSha,
+      disposition: 'changes_requested',
+      event: 'REQUEST_CHANGES',
+    });
     await db.query(
       `UPDATE agent_dispatch_messages
        SET subject_key = NULL
@@ -998,18 +1006,19 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
        WHERE id = $1`,
       [first.messageId]
     );
-    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
-      {
-        correlationId: first.correlationId ?? '',
-        messageId: first.messageId ?? '',
-        owner: 'thinmansoftware',
-        repo: 'bdc-harness',
-        prNumber,
-        headSha: firstHeadSha,
-        disposition: 'changes_requested',
-        event: 'REQUEST_CHANGES',
-      }
-    );
+    await createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
+    }).recordReceipt({
+      correlationId: first.correlationId ?? '',
+      messageId: first.messageId ?? '',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber,
+      headSha: firstHeadSha,
+      disposition: 'changes_requested',
+      event: 'REQUEST_CHANGES',
+    });
 
     // Legacy shape: no subject_key, correlation_id intact. Pinned to a
     // timestamp strictly NEWER than every backlog row below. An unfiltered

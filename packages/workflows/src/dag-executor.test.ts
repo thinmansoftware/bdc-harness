@@ -11267,10 +11267,65 @@ describe('agent persona dispatch', () => {
     }
   });
 
-  async function writeAgentFile(name: string, model: string, tools?: string[]): Promise<void> {
+  async function writeAgentFile(name: string, model?: string, tools?: string[]): Promise<void> {
     const toolsLine = tools ? `tools: [${tools.join(', ')}]` : '';
-    const content = `---\nname: ${name}\nmodel: ${model}\n${toolsLine}\n---\n\nYou are the ${name} agent.\n`;
+    const modelLine = model ? `model: ${model}` : '';
+    const content = `---\nname: ${name}\n${modelLine}\n${toolsLine}\n---\n\nYou are the ${name} agent.\n`;
     await writeFile(join(testDir, '.archon', 'agents', `${name}.md`), content, 'utf-8');
+  }
+
+  for (const provider of ['codex-native-strict', 'claude']) {
+    for (const loop of [false, true]) {
+      it(`Astra lane binds ${provider} ${loop ? 'loop' : 'prompt'} with a separate persona`, async () => {
+        const model = provider === 'claude' ? 'claude-fable-5' : 'gpt-6-astra';
+        await writeAgentFile('lane-probe', provider === 'claude' ? model : undefined, ['Read']);
+        const store = createMockStore();
+        const deps = createMockDeps(store);
+        const captured = mock(async function* () {
+          yield { type: 'assistant' as const, content: '<promise>COMPLETE</promise>' };
+          yield { type: 'result' as const, sessionId: 'isolated-probe-session' };
+        });
+        const originalProvider = deps.getAgentProvider;
+        deps.getAgentProvider = mock((id: string) => ({
+          ...originalProvider(id),
+          sendQuery: captured,
+        }));
+        const node = {
+          id: 'lane-probe',
+          provider,
+          model: provider === 'claude' ? 'sonnet' : model,
+          persona: 'lane-probe',
+          context: 'fresh',
+          ...(loop
+            ? { loop: { prompt: 'Probe only.', until: 'COMPLETE', max_iterations: 1 } }
+            : { prompt: 'Probe only.' }),
+        } as DagNode;
+        await executeDagWorkflow(
+          deps,
+          createMockPlatform(),
+          'probe-conversation',
+          testDir,
+          { name: 'isolated-model-probe', nodes: [node] },
+          makeWorkflowRun(),
+          provider,
+          model,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          {
+            ...minimalConfig,
+            assistants: { ...minimalConfig.assistants, [provider]: { model: 'gpt-5.6-sol' } },
+          }
+        );
+        expect(deps.getAgentProvider).toHaveBeenCalledWith(provider);
+        expect(captured).toHaveBeenCalledTimes(1);
+        const options = (captured.mock.calls as unknown[][])[0][3] as Record<string, unknown>;
+        expect(options.model).toBe(model);
+        expect(options.systemPrompt).toContain('lane-probe agent');
+        expect(store.completeWorkflowRun).toHaveBeenCalled();
+      });
+    }
   }
 
   it('prompt node with agent: applies persona allowed_tools to nodeConfig', async () => {
@@ -11345,6 +11400,140 @@ describe('agent persona dispatch', () => {
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     // Persona model (sonnet) wins over node model (opus)
     expect(optionsArg.model).toBe('sonnet');
+  });
+
+  it('Claude node override supplies the model for a persona without one', async () => {
+    await writeAgentFile('provider-agnostic-test-agent');
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-claude-override');
+    const nodes: DagNode[] = [
+      {
+        id: 'plan',
+        agent: 'provider-agnostic-test-agent',
+        prompt: 'Plan.',
+      } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'claude-override-test', nodes },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      { nodes: { plan: { provider: 'claude', model: 'sonnet' } } }
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalled();
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    expect(optionsArg.model).toBe('sonnet');
+  });
+
+  it('Claude node override replaces a persona model pin and records the effective binding', async () => {
+    await writeAgentFile('opus-test-agent', 'opus');
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-claude-pin-override');
+    const nodes: DagNode[] = [
+      {
+        id: 'plan',
+        agent: 'opus-test-agent',
+        prompt: 'Plan.',
+      } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'claude-pin-override-test', nodes },
+      workflowRun,
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      { nodes: { plan: { provider: 'claude', model: 'sonnet' } } }
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    expect(optionsArg.model).toBe('sonnet');
+    expect(mockStore.createProviderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'claude',
+        model: 'sonnet',
+        declaredProvider: 'claude',
+        declaredModel: 'sonnet',
+      })
+    );
+  });
+
+  it('non-Claude node override ignores a persona model pin', async () => {
+    await writeAgentFile('claude-pinned-test-agent', 'opus');
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-codex-override');
+    const nodes: DagNode[] = [
+      {
+        id: 'plan',
+        agent: 'claude-pinned-test-agent',
+        prompt: 'Plan.',
+      } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'codex-persona-override-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      { nodes: { plan: { provider: 'codex', model: 'gpt-5.5' } } }
+    );
+
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    expect(optionsArg.model).toBe('gpt-5.5');
+    expect(mockStore.createProviderAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'codex',
+        model: 'gpt-5.5',
+        declaredProvider: 'codex',
+        declaredModel: 'gpt-5.5',
+      })
+    );
   });
 
   it('backward compat: node without agent: does not inject persona allowed_tools', async () => {
@@ -12071,10 +12260,10 @@ describe('executeDagWorkflow -- tier/entry_rung + frontier_cost_usd', () => {
   });
 
   it('T2: frontier_cost_usd == tokens.input * INPUT_RATE + tokens.output * OUTPUT_RATE', async () => {
-    // Known token counts; published frontier rates (claude-opus-4-7):
-    //   INPUT_RATE  = 0.000015 USD/token
-    //   OUTPUT_RATE = 0.000075 USD/token
-    // 1000 * 0.000015 + 200 * 0.000075 = 0.015 + 0.015 = 0.030
+    // Known token counts; published frontier rates (claude-opus-5-5):
+    //   INPUT_RATE  = 0.000004 USD/token
+    //   OUTPUT_RATE = 0.00002 USD/token
+    // 1000 * 0.000004 + 200 * 0.00002 = 0.004 + 0.004 = 0.008
     mockSendQueryDag.mockImplementation(function* () {
       yield { type: 'assistant', content: 'done' };
       yield {
@@ -12107,7 +12296,7 @@ describe('executeDagWorkflow -- tier/entry_rung + frontier_cost_usd', () => {
 
     const data = getNodeCompletedData(store);
     expect(typeof data.frontier_cost_usd).toBe('number');
-    expect(data.frontier_cost_usd as number).toBeCloseTo(0.03, 10);
+    expect(data.frontier_cost_usd as number).toBeCloseTo(0.008, 10);
   });
 
   it('T3: run metadata carries both total_cost_usd and total_frontier_cost_usd', async () => {
@@ -14354,5 +14543,301 @@ describe('executeDagWorkflow -- node output file handoff (ARCHON_NODE_OUT)', () 
 
     expect(firstWrite).toBe('stable output');
     expect(secondWrite).toBe('stable output');
+  });
+});
+
+describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-silent-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  function eventsOf(store: IWorkflowStore): Array<{
+    event_type: string;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  }> {
+    return (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+    );
+  }
+
+  async function runPromptNode(
+    store: IWorkflowStore,
+    nodeId: string,
+    idleTimeout: number,
+    runId: string
+  ): Promise<void> {
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun(runId);
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-silent',
+      testDir,
+      {
+        name: 'silent-node',
+        nodes: [{ id: nodeId, prompt: 'work', idle_timeout: idleTimeout }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts-' + runId),
+      join(testDir, 'logs-' + runId),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+  }
+
+  it('provider_never_started fails the node with the named reason', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      await new Promise<void>(() => {});
+      yield { type: 'assistant', content: 'never' };
+    });
+
+    const store = createMockStore();
+    let runStatus = 'running';
+    (store.failWorkflowRun as ReturnType<typeof mock>).mockImplementation(() => {
+      runStatus = 'failed';
+      return Promise.resolve();
+    });
+
+    const run = runPromptNode(store, 'silent-node', 200, 'silent-never-started');
+    const timeout = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error('silent node did not finish within 5000ms')), 5000);
+    });
+    await Promise.race([run, timeout]);
+
+    expect(runStatus).not.toBe('running');
+    const failed = eventsOf(store).filter(
+      e => e.event_type === 'node_failed' && e.step_name === 'silent-node'
+    );
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.data?.reason).toBe('provider_never_started');
+    expect(failed[0]?.data?.reason_code).toBe('progress_timeout');
+  });
+
+  it('provider_silent after a first chunk', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'working' };
+      await new Promise<void>(() => {});
+    });
+
+    const store = createMockStore();
+    const run = runPromptNode(store, 'silent-after-chunk', 200, 'silent-after-chunk');
+    const timeout = new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(new Error('silent node did not finish within 5000ms')), 5000);
+    });
+    await Promise.race([run, timeout]);
+
+    const events = eventsOf(store);
+    const failed = events.filter(
+      e => e.event_type === 'node_failed' && e.step_name === 'silent-after-chunk'
+    );
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.data?.reason).toBe('provider_silent');
+    const progressIdx = events.findIndex(
+      e => e.event_type === 'node_progress' && e.step_name === 'silent-after-chunk'
+    );
+    const failedIdx = events.findIndex(
+      e => e.event_type === 'node_failed' && e.step_name === 'silent-after-chunk'
+    );
+    expect(progressIdx).toBeGreaterThanOrEqual(0);
+    expect(progressIdx).toBeLessThan(failedIdx);
+    const progress = events[progressIdx];
+    expect(progress?.data?.provider).toBe('claude');
+    expect(progress?.data?.last_chunk_type).toBe('assistant');
+    expect(progress?.data?.chunks_seen).toBe(1);
+  });
+
+  it('a chatty healthy node is not killed and its progress is throttled', async () => {
+    const prev = process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
+    process.env.ARCHON_NODE_PROGRESS_EVENT_MS = '50';
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        const started = Date.now();
+        while (Date.now() - started < 400) {
+          yield { type: 'assistant', content: 'working' };
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        yield { type: 'result', sessionId: 'chatty-session' };
+      });
+
+      const store = createMockStore();
+      await runPromptNode(store, 'chatty-node', 200, 'silent-chatty');
+
+      const events = eventsOf(store);
+      const progress = events.filter(
+        e => e.event_type === 'node_progress' && e.step_name === 'chatty-node'
+      );
+      const failed = events.filter(
+        e => e.event_type === 'node_failed' && e.step_name === 'chatty-node'
+      );
+      const completed = events.filter(
+        e => e.event_type === 'node_completed' && e.step_name === 'chatty-node'
+      );
+      expect(failed).toHaveLength(0);
+      expect(completed).toHaveLength(1);
+      expect(progress.length).toBeGreaterThanOrEqual(2);
+      expect(progress.length).toBeLessThanOrEqual(10);
+      expect(progress[0]?.data?.provider).toBe('claude');
+      expect(progress[0]?.data?.last_chunk_type).toBe('assistant');
+      expect(progress[0]?.data?.chunks_seen).toBe(1);
+      for (const event of progress) {
+        expect(event.data?.provider).toBe('claude');
+        expect(typeof event.data?.last_chunk_type).toBe('string');
+        expect(event.data?.last_chunk_type).not.toBe('');
+      }
+    } finally {
+      if (prev === undefined) delete process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
+      else process.env.ARCHON_NODE_PROGRESS_EVENT_MS = prev;
+    }
+  });
+
+  it('cancel lands while the provider is silent', async () => {
+    const prev = process.env.ARCHON_NODE_CANCEL_POLL_MS;
+    process.env.ARCHON_NODE_CANCEL_POLL_MS = '50';
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        await new Promise<void>(() => {});
+        yield { type: 'assistant', content: 'never' };
+      });
+
+      const store = createMockStore();
+      let statusCalls = 0;
+      (store.getWorkflowRunStatus as ReturnType<typeof mock>).mockImplementation(() => {
+        statusCalls += 1;
+        return Promise.resolve(statusCalls === 1 ? ('running' as const) : ('cancelled' as const));
+      });
+
+      const run = runPromptNode(store, 'cancel-silent', 60000, 'silent-cancel');
+      const timeout = new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error('cancel did not land within 3000ms')), 3000);
+      });
+      await Promise.race([run, timeout]);
+
+      const failed = eventsOf(store).filter(
+        e => e.event_type === 'node_failed' && e.step_name === 'cancel-silent'
+      );
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.data?.error).toBe('Cancelled by user');
+      expect(failed[0]?.data?.reason).not.toBe('provider_never_started');
+    } finally {
+      if (prev === undefined) delete process.env.ARCHON_NODE_CANCEL_POLL_MS;
+      else process.env.ARCHON_NODE_CANCEL_POLL_MS = prev;
+    }
+  });
+});
+
+// Kept outside the 'silent node detection' block so that block's Stop 2 count
+// (4 passing / 4 total) stays exactly as the WO spec declares.
+describe('cancel-poll interval cleanup (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-cancelpoll-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  it('a rejecting beginProviderAttempt leaves no live cancel-poll interval', async () => {
+    // An unusual poll period lets the spies pick out the cancel-poll interval
+    // from every other timer the executor starts.
+    const pollMs = 37;
+    const prev = process.env.ARCHON_NODE_CANCEL_POLL_MS;
+    process.env.ARCHON_NODE_CANCEL_POLL_MS = String(pollMs);
+    const created = new Set<unknown>();
+    const cleared = new Set<unknown>();
+    const realSetInterval = globalThis.setInterval;
+    const realClearInterval = globalThis.clearInterval;
+    const setSpy = spyOn(globalThis, 'setInterval').mockImplementation(((
+      handler: () => void,
+      ms?: number
+    ) => {
+      const handle = realSetInterval(handler, ms);
+      if (ms === pollMs) created.add(handle);
+      return handle;
+    }) as typeof setInterval);
+    const clearSpy = spyOn(globalThis, 'clearInterval').mockImplementation(((
+      handle?: Parameters<typeof clearInterval>[0]
+    ) => {
+      cleared.add(handle);
+      realClearInterval(handle);
+    }) as typeof clearInterval);
+    try {
+      mockSendQueryDag.mockClear();
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield { type: 'assistant', content: 'unreachable' };
+      });
+
+      const store = createMockStore();
+      // provider_attempt_persist_failed: beginProviderAttempt throws before
+      // the node stream starts.
+      (store.createProviderAttempt as Mock<() => Promise<boolean>>).mockResolvedValue(false);
+
+      await executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-cancelpoll',
+        testDir,
+        {
+          name: 'cancel-poll-cleanup',
+          nodes: [{ id: 'attempt-rejects', prompt: 'work', idle_timeout: 60000 }],
+        },
+        makeWorkflowRun('cancelpoll-attempt-rejects'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag).not.toHaveBeenCalled();
+      const failed = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls
+        .map(
+          call => call[0] as { event_type: string; step_name?: string; data?: { error?: unknown } }
+        )
+        .filter(e => e.event_type === 'node_failed' && e.step_name === 'attempt-rejects');
+      expect(failed).toHaveLength(1);
+      expect(String(failed[0]?.data?.error)).toContain('provider_attempt_persist_failed');
+
+      // Every cancel-poll interval that was started must have been cleared.
+      const live = [...created].filter(handle => !cleared.has(handle));
+      expect(live).toHaveLength(0);
+
+      // Behavioral check: nothing keeps polling run status after the node exits.
+      const statusMock = store.getWorkflowRunStatus as ReturnType<typeof mock>;
+      const pollsAtExit = statusMock.mock.calls.length;
+      await new Promise(resolve => setTimeout(resolve, pollMs * 5));
+      expect(statusMock.mock.calls.length).toBe(pollsAtExit);
+    } finally {
+      for (const handle of created)
+        realClearInterval(handle as Parameters<typeof clearInterval>[0]);
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+      if (prev === undefined) delete process.env.ARCHON_NODE_CANCEL_POLL_MS;
+      else process.env.ARCHON_NODE_CANCEL_POLL_MS = prev;
+    }
   });
 });

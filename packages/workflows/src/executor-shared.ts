@@ -383,6 +383,27 @@ export const CONTEXT_VAR_PATTERN_STR =
   '\\$(?:CONTEXT|EXTERNAL_CONTEXT|ISSUE_CONTEXT)(?![A-Za-z0-9_])';
 
 /**
+ * Character-class fragment asserting a workflow variable is a WHOLE identifier
+ * (not the prefix of a longer name like $BASE_BRANCH_OVERRIDE). Matches the
+ * boundary logic already used by CONTEXT_VAR_PATTERN_STR.
+ */
+const VAR_BOUNDARY = '(?![A-Za-z0-9_])';
+
+/**
+ * Replace every whole-identifier occurrence of `$<name>` in `str` with `value`.
+ * Bounds the match so a longer shell variable that begins with `<name>`
+ * (e.g. `$BASE_BRANCH_OVERRIDE` when name is `BASE_BRANCH`) is left untouched.
+ */
+function boundedReplace(str: string, name: string, value: string): string {
+  return str.replace(new RegExp('\\$' + name + VAR_BOUNDARY, 'g'), value);
+}
+
+/** True if `prompt` references `$<name>` as a whole identifier. */
+function referencesVariable(prompt: string, name: string): boolean {
+  return new RegExp('\\$' + name + VAR_BOUNDARY).test(prompt);
+}
+
+/**
  * Substitute workflow variables in a prompt.
  *
  * Supported variables:
@@ -414,8 +435,9 @@ export function substituteWorkflowVariables(
   rejectionReason?: string,
   loopPrevOutput?: string
 ): { prompt: string; contextSubstituted: boolean } {
-  // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
-  if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
+  // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved.
+  // Bounded so $BASE_BRANCH_OVERRIDE (a shell variable, not a workflow variable) does not trip it.
+  if (!baseBranch && referencesVariable(prompt, 'BASE_BRANCH')) {
     throw new Error(
       'No base branch could be resolved. Auto-detection failed and `worktree.baseBranch` is not set in .archon/config.yaml. ' +
         'Set the config value or use the --from flag to select a branch (e.g., --from dev).'
@@ -425,18 +447,25 @@ export function substituteWorkflowVariables(
   // Defensive: ensure docsDir always has a value (callers should resolve, but guard here)
   const resolvedDocsDir = docsDir || 'docs/';
 
-  // Substitute basic variables
-  let result = prompt
-    .replace(/\$WORKFLOW_ID/g, workflowId)
-    .replace(/\$\{run\.id\}/g, workflowId)
-    .replace(/\$USER_MESSAGE/g, userMessage)
-    .replace(/\$ARGUMENTS/g, userMessage)
-    .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
-    .replace(/\$BASE_BRANCH/g, baseBranch)
-    .replace(/\$DOCS_DIR/g, resolvedDocsDir)
-    .replace(/\$LOOP_USER_INPUT/g, loopUserInput ?? '')
-    .replace(/\$REJECTION_REASON/g, rejectionReason ?? '')
-    .replace(/\$LOOP_PREV_OUTPUT/g, loopPrevOutput ?? '');
+  // Substitute basic variables. Each $NAME is bound to a whole identifier so a
+  // longer shell variable that begins with a workflow variable name (e.g.
+  // $BASE_BRANCH_OVERRIDE, $BASE_BRANCH_PR) is left verbatim. ${run.id} is
+  // brace-delimited and already exact, so it is replaced directly.
+  //
+  // Order is load-bearing: $WORKFLOW_ID is substituted BEFORE ${run.id} to
+  // preserve the pre-refactor cascading behavior. Both bind to `workflowId`,
+  // so the order only matters when `workflowId` itself contains one of these
+  // tokens; keeping $WORKFLOW_ID first matches the original replacement chain.
+  let result = boundedReplace(prompt, 'WORKFLOW_ID', workflowId);
+  result = result.replace(/\$\{run\.id\}/g, workflowId);
+  result = boundedReplace(result, 'USER_MESSAGE', userMessage);
+  result = boundedReplace(result, 'ARGUMENTS', userMessage);
+  result = boundedReplace(result, 'ARTIFACTS_DIR', artifactsDir);
+  result = boundedReplace(result, 'BASE_BRANCH', baseBranch);
+  result = boundedReplace(result, 'DOCS_DIR', resolvedDocsDir);
+  result = boundedReplace(result, 'LOOP_USER_INPUT', loopUserInput ?? '');
+  result = boundedReplace(result, 'REJECTION_REASON', rejectionReason ?? '');
+  result = boundedReplace(result, 'LOOP_PREV_OUTPUT', loopPrevOutput ?? '');
 
   // Check if context variables exist (use fresh regex to avoid lastIndex issues)
   const hasContextVariables = new RegExp(CONTEXT_VAR_PATTERN_STR).test(result);
@@ -803,6 +832,8 @@ export class InfrastructureClassBlock extends Error {
  *   InfrastructureClassBlock (a codex persona declaring an Anthropic model is a
  *   config bug). If absent, resolution.model is undefined and the codex provider
  *   uses assistants.codex.model or the account default.
+ * - provider === 'codex-native-strict': reject persona.model too, but preserve
+ *   currentModel so this explicitly selected model cannot revert to a default.
  * - provider === 'claude' (default): persona.model is REQUIRED. If absent, throw
  *   InfrastructureClassBlock. If present, the persona model wins over the node
  *   model (today's behavior), and a mismatch is logged.
@@ -814,7 +845,7 @@ export function resolveAgentPersona(
   currentModel: string | undefined,
   provider: string
 ): AgentPersonaResolution {
-  if (provider === 'codex') {
+  if (provider === 'codex' || provider === 'codex-native-strict') {
     if (persona.model !== undefined) {
       throw new InfrastructureClassBlock(
         `Codex persona '${persona.name}' must not declare 'model:'. A 'provider: codex' ` +
@@ -844,9 +875,14 @@ export function resolveAgentPersona(
   // currentModel when the persona omits `model:`.  Providers such as pi
   // require a model; without this fallback they throw "requires a model".
   // For claude: persona.model was validated non-undefined above.
-  // For codex: persona.model is undefined (the codex branch throws if set).
+  // For Codex providers: persona.model is undefined (the branch throws if set).
+  // Strict routing preserves the explicit selection; ordinary Codex is unchanged.
   const resolvedModel =
-    provider !== 'codex' && provider !== 'claude' ? (persona.model ?? currentModel) : persona.model;
+    provider === 'codex-native-strict'
+      ? currentModel
+      : provider !== 'codex' && provider !== 'claude'
+        ? (persona.model ?? currentModel)
+        : persona.model;
 
   const resolution: AgentPersonaResolution = {
     model: resolvedModel,

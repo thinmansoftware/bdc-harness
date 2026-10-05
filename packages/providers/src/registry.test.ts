@@ -8,6 +8,8 @@ import {
   getRegisteredProviders,
   getProviderInfoList,
   isRegisteredProvider,
+  registerProviderAlias,
+  resolveProviderId,
   registerBuiltinProviders,
   registerCommunityProviders,
   clearRegistry,
@@ -82,6 +84,17 @@ describe('registry', () => {
       expect(provider).toBeDefined();
       expect(provider.getType()).toBe('codex');
       expect(typeof provider.sendQuery).toBe('function');
+    });
+
+    test('strict native Codex disables failback while the ordinary provider retains it', () => {
+      const strict = getRegistration('codex-native-strict').factory();
+      const ordinary = getRegistration('codex').factory();
+      expect(strict.getType()).toBe('codex');
+      expect(strict.getCapabilities()).toEqual(ordinary.getCapabilities());
+      expect(Object.getOwnPropertyDescriptor(strict, 'failbackProviderFactory')?.value).toBeNull();
+      expect(
+        typeof Object.getOwnPropertyDescriptor(ordinary, 'failbackProviderFactory')?.value
+      ).toBe('function');
     });
 
     test('throws UnknownProviderError for unknown type', () => {
@@ -187,9 +200,9 @@ describe('registry', () => {
       }
     });
 
-    test('declares Pi and Grok as repository execution providers', () => {
+    test('declares Pi and OpenRouter as repository execution providers', () => {
       registerCommunityProviders();
-      for (const id of ['pi', 'grok']) {
+      for (const id of ['pi', 'openrouter']) {
         expect(getProviderCapabilities(id).execution).toEqual({
           text: true,
           repositoryRead: true,
@@ -197,6 +210,20 @@ describe('registry', () => {
           shell: true,
         });
       }
+    });
+
+    test('grok alias resolves to openrouter', () => {
+      registerBuiltinProviders();
+      registerCommunityProviders();
+      expect(isRegisteredProvider('grok')).toBe(true);
+      expect(resolveProviderId('grok')).toBe('openrouter');
+      expect(getAgentProvider('grok').getType()).toBe('openrouter');
+      expect(getRegistration('grok').id).toBe('openrouter');
+      const ids = getProviderInfoList().map(info => info.id);
+      expect(ids.filter(id => id === 'openrouter')).toHaveLength(1);
+      expect(ids).not.toContain('grok');
+      expect(() => registerProviderAlias('grok', 'openrouter')).toThrow();
+      expect(() => registerProvider(makeMockRegistration('grok'))).toThrow();
     });
 
     test('reports missing execution capabilities mechanically', () => {
@@ -244,7 +271,7 @@ describe('registry', () => {
   describe('getRegisteredProviders', () => {
     test('returns all registered providers', () => {
       const all = getRegisteredProviders();
-      expect(all.length).toBe(3);
+      expect(all.length).toBe(4);
       const ids = all.map(r => r.id);
       expect(ids).toContain('claude');
       expect(ids).toContain('codex');
@@ -254,14 +281,14 @@ describe('registry', () => {
     test('includes community providers after registration', () => {
       registerProvider(makeMockRegistration('my-llm'));
       const all = getRegisteredProviders();
-      expect(all.length).toBe(4);
+      expect(all.length).toBe(5);
     });
   });
 
   describe('getProviderInfoList', () => {
     test('returns API-safe projection without factory', () => {
       const infos = getProviderInfoList();
-      expect(infos.length).toBe(3);
+      expect(infos.length).toBe(4);
       for (const info of infos) {
         expect(info).toHaveProperty('id');
         expect(info).toHaveProperty('displayName');
@@ -290,7 +317,7 @@ describe('registry', () => {
       registerBuiltinProviders();
       registerBuiltinProviders();
       const all = getRegisteredProviders();
-      expect(all.length).toBe(3);
+      expect(all.length).toBe(4);
     });
   });
 
@@ -376,7 +403,7 @@ describe('registry', () => {
       const ids = getRegisteredProviders()
         .map(p => p.id)
         .sort();
-      expect(ids).toEqual(['claude', 'codex', 'codex-opr', 'pi']);
+      expect(ids).toEqual(['claude', 'codex', 'codex-native-strict', 'codex-opr', 'pi']);
     });
   });
 
@@ -434,7 +461,7 @@ describe('registry', () => {
       const ids = getRegisteredProviders()
         .map(p => p.id)
         .sort();
-      expect(ids).toEqual(['claude', 'codex', 'codex-opr', 'glm', 'opr']);
+      expect(ids).toEqual(['claude', 'codex', 'codex-native-strict', 'codex-opr', 'glm', 'opr']);
     });
   });
 

@@ -123,7 +123,10 @@ describe('collectMechanicalEvidence', () => {
   it('fails closed when the worktree branch or origin remote drifts', () => {
     const original = input();
     const wrongBranch = collectMechanicalEvidence(
-      input({ git: { ...original.git, headBranch: 'archon/other-run' } })
+      input({
+        git: { ...original.git, headBranch: 'archon/other-run' },
+        pullRequest: null,
+      })
     );
     const wrongRemote = collectMechanicalEvidence(
       input({ git: { ...original.git, originRemote: 'https://github.com/other/repo.git' } })

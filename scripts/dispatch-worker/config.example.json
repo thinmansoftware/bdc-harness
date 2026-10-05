@@ -29,7 +29,7 @@
   "agents": {
     "claude": {
       "command": "claude",
-      "args": ["--permission-mode", "plan", "-p", "{{prompt}}"]
+      "args": ["--permission-mode", "plan", "-p"]
     },
     "codex": {
       "command": "codex",
@@ -41,19 +41,25 @@
         "--ephemeral",
         "--ignore-user-config",
         "-c",
-        "windows.sandbox=\"unelevated\"",
-        "{{prompt}}"
+        "windows.sandbox=\"unelevated\""
       ],
       "cwd": "C:/Users/pcmed/projects/BDC_XO/.worktrees/xo-main",
       "env": {}
     },
     "grok": {
       "command": "grok",
-      "args": ["--permission-mode", "plan", "--no-subagents", "-p", "{{prompt}}"]
+      "args": [
+        "--permission-mode",
+        "plan",
+        "--no-subagents",
+        "--prompt-file",
+        "__DISPATCH_PROMPT_FILE__"
+      ],
+      "promptDelivery": "prompt-file"
     },
     "cursor": {
       "command": "cursor-agent",
-      "args": ["--print", "--mode", "ask", "--trust", "{{prompt}}"]
+      "args": ["--print", "--mode", "ask", "--trust"]
     },
     "fusion": {
       "kind": "fusion",

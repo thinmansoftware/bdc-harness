@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { existsSync, mkdtempSync, unlinkSync } from 'fs';
 import { removeTempDirWithRetry } from '../test/temp-dir';
 import { tmpdir } from 'os';
@@ -45,6 +45,7 @@ import {
   reconcileDispatchOutcomeNotices,
   registerWorker,
   deferMessage,
+  disposeMessageByMachine,
   listMessagesByCorrelationId,
   releaseDispatchEscalationClaim,
   releaseMessage,
@@ -52,9 +53,12 @@ import {
   resolveDispatchRecipient,
   assessDispatchRecipient,
   normalizeDispatchSubjectKey,
+  mailboxDepthByPrincipal,
   supersedeMessage,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
+  type XoLeaseBind,
+  type DispatchQueryExecutor,
 } from './dispatch';
 
 /** Test-local fixture constructor -- production path is createAuthenticatedMessage. */
@@ -462,6 +466,60 @@ describe('dispatch db', () => {
     expect(
       await claimMessage({ id: mailboxMessage.id, worker_id: 'worker-mode-guard' })
     ).toBeNull();
+  });
+
+  // WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01: astra is a drain_on_start mailbox
+  // principal. It must be a valid recipient, must never be claimed by any
+  // worker, must ack/address as 'astra', and must refuse a 'codex' actor.
+  test('astra is an unclaimable mailbox principal that only its own actor may address', async () => {
+    await expect(assessDispatchRecipient(' Astra ')).resolves.toEqual({
+      ok: true,
+      canonical_principal: 'astra',
+      delivery_mode: 'drain_on_start',
+      reason: null,
+    });
+
+    await registerWorker({
+      worker_id: 'worker-astra-guard',
+      host: 'host',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const astraMessage = await createMessage({
+      correlation_id: 'corr-astra-mailbox',
+      idempotency_key: 'idem-astra-mailbox',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'astra',
+      body: 'Arc D ruling for Astra.',
+    });
+
+    // (b) no worker ever claims an astra row -- it stays queued, unleased.
+    expect(await claimMessage({ id: astraMessage.id, worker_id: 'worker-astra-guard' })).toBeNull();
+    const afterClaim = await getMessage(astraMessage.id);
+    expect(afterClaim?.status).toBe('queued');
+    expect(afterClaim?.lease_owner).toBeNull();
+
+    // (d) a wrong-recipient actor (codex) is refused for ack and address.
+    await expect(
+      acknowledgeMessage({ id: astraMessage.id, principal_id: 'codex' })
+    ).resolves.toEqual({ ok: false, reason: 'wrong_recipient' });
+    await expect(addressMessage({ id: astraMessage.id, principal_id: 'codex' })).resolves.toEqual({
+      ok: false,
+      reason: 'wrong_recipient',
+    });
+
+    // (c) astra acks its own mail, then addresses it, both idempotent.
+    expect((await acknowledgeMessage({ id: astraMessage.id, principal_id: 'astra' })).ok).toBe(
+      true
+    );
+    expect((await addressMessage({ id: astraMessage.id, principal_id: ' Astra ' })).ok).toBe(true);
+    const stored = await getMessage(astraMessage.id);
+    expect(stored).toMatchObject({
+      status: 'queued',
+      acknowledged_by: 'astra',
+      addressed_by: 'astra',
+    });
   });
 
   test('rejects missing and inactive concrete principals before claim', async () => {
@@ -895,13 +953,542 @@ describe('dispatch db', () => {
       ok: false,
       reason: 'not_queued',
     });
-    expect((await acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).ok).toBe(true);
+    await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'xo_bind_required',
+    });
     await expect(acknowledgeMessage({ id: mailbox.id, principal_id: 'xo-fable' })).resolves.toEqual(
       {
         ok: false,
         reason: 'wrong_recipient',
       }
     );
+  });
+
+  for (const action of ['acknowledge', 'address'] as const) {
+    for (const turnover of ['replace', 'release'] as const) {
+      test(`${action} rejects XO lease ${turnover} between validation and UPDATE`, async () => {
+        const message = await createMessage({
+          correlation_id: 'corr-xo-turnover',
+          idempotency_key: 'idem-xo-turnover',
+          task_type: 'agent_message',
+          sender: 'operator',
+          recipient: 'xo',
+          body: 'XO lease turnover.',
+        });
+        const bind: XoLeaseBind = {
+          kind: 'xo_lease',
+          lease_id: '11111111-1111-4111-8111-111111111111',
+          fencing_token: 9,
+          holder_token_hash: createHash('sha256').update('test-holder').digest('hex'),
+          holder_principal_id: 'xo',
+        };
+        await db.query(
+          `INSERT INTO board_xo_leases
+           (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+            acquired_at, expires_at)
+           VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, $5)`,
+          [
+            bind.lease_id,
+            bind.holder_token_hash,
+            bind.fencing_token,
+            new Date().toISOString(),
+            new Date(Date.now() + 60_000).toISOString(),
+          ]
+        );
+        const data = { id: message.id, principal_id: 'xo', bind };
+        if (action === 'address') expect((await acknowledgeMessage(data)).ok).toBe(true);
+        const before = await getMessage(message.id);
+        const withTransaction = db.withTransaction.bind(db);
+        let leaseValidated = false;
+        let turnoverInjected = false;
+        const transactionSpy = spyOn(db, 'withTransaction').mockImplementation(fn =>
+          withTransaction(query => {
+            const wrappedQuery: DispatchQueryExecutor = async <T>(
+              sql: string,
+              params?: unknown[]
+            ) => {
+              if (sql.startsWith('UPDATE agent_dispatch_messages') && !turnoverInjected) {
+                expect(leaseValidated).toBe(true);
+                // Inject turnover only after the pre-check has read the valid lease.
+                await query(
+                  turnover === 'replace'
+                    ? "UPDATE board_xo_leases SET lease_id = '22222222-2222-4222-8222-222222222222', fencing_token = fencing_token + 1 WHERE id = 1"
+                    : 'UPDATE board_xo_leases SET released_at = $1 WHERE id = 1',
+                  turnover === 'release' ? [new Date().toISOString()] : []
+                );
+                turnoverInjected = true;
+              }
+              const result = await query<T>(sql, params);
+              if (sql.startsWith('SELECT lease_id, fencing_token, holder_token_hash')) {
+                expect(result.rowCount).toBe(turnoverInjected && turnover === 'release' ? 0 : 1);
+                leaseValidated = true;
+              }
+              return result;
+            };
+            return fn(wrappedQuery);
+          })
+        );
+        try {
+          const mutate = action === 'acknowledge' ? acknowledgeMessage : addressMessage;
+          await expect(mutate(data)).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+          expect(turnoverInjected).toBe(true);
+          const stored = await getMessage(message.id);
+          expect(stored?.acknowledged_at).toBe(before?.acknowledged_at ?? null);
+          expect(stored?.acknowledged_by).toBe(before?.acknowledged_by ?? null);
+          expect(stored?.addressed_at).toBeNull();
+          expect(stored?.addressed_by).toBeNull();
+        } finally {
+          transactionSpy.mockRestore();
+        }
+      });
+    }
+  }
+
+  test('requires and transactionally fences the XO mailbox lease binding', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-xo-bind',
+      idempotency_key: 'idem-xo-bind',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'XO binding test.',
+    });
+    await expect(acknowledgeMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
+      ok: false,
+      reason: 'xo_bind_required',
+    });
+    const holderToken = 'holder-secret';
+    const bind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-current',
+      fencing_token: 9,
+      holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
+      holder_principal_id: 'xo',
+    };
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, NULL, $5, NULL)`,
+      [
+        bind.lease_id,
+        bind.holder_token_hash,
+        bind.fencing_token,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    await expect(
+      acknowledgeMessage({
+        id: message.id,
+        principal_id: 'xo',
+        bind: { ...bind, fencing_token: 8 },
+      })
+    ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind })).ok).toBe(true);
+  });
+
+  for (const holder of ['xo-claude-board-work', 'xo-codex-board-work'] as const) {
+    test(`dispatch DAL: a bind whose holder_principal_id matches the live lease row succeeds (${holder})`, async () => {
+      const message = await createMessage({
+        correlation_id: `corr-holder-${holder}`,
+        idempotency_key: `idem-holder-${holder}`,
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'Holder bind ack.',
+      });
+      const bind: XoLeaseBind = {
+        kind: 'xo_lease',
+        lease_id: `lease-${holder}`,
+        fencing_token: 11,
+        holder_token_hash: createHash('sha256').update(`holder-secret-${holder}`).digest('hex'),
+        holder_principal_id: holder,
+      };
+      await db.query(
+        `INSERT INTO board_xo_leases
+         (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+          acquired_at, renewed_at, expires_at, released_at)
+         VALUES (1, $1, $2, 'xo', $2, $3, $4, $5, NULL, $6, NULL)`,
+        [
+          bind.lease_id,
+          holder,
+          bind.holder_token_hash,
+          bind.fencing_token,
+          new Date().toISOString(),
+          new Date(Date.now() + 60_000).toISOString(),
+        ]
+      );
+      const result = await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind });
+      expect(result.ok).toBe(true);
+      const stored = await getMessage(message.id);
+      expect(stored?.acknowledged_by).toBe('xo');
+      expect(stored?.acknowledged_at).not.toBeNull();
+    });
+  }
+
+  test('dispatch DAL: a bind whose holder_principal_id differs from the live lease row is lease_fence_stale on acknowledge', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-holder-mismatch-ack',
+      idempotency_key: 'idem-holder-mismatch-ack',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'Mismatched holder ack.',
+    });
+    const holderTokenHash = createHash('sha256').update('holder-secret-mismatch').digest('hex');
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo-claude-board-work', 'xo', 'xo-claude-board-work', $2, 12, $3, NULL, $4, NULL)`,
+      [
+        'lease-mismatch',
+        holderTokenHash,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    const bind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-mismatch',
+      fencing_token: 12,
+      holder_token_hash: holderTokenHash,
+      holder_principal_id: 'xo-codex-board-work',
+    };
+    await expect(acknowledgeMessage({ id: message.id, principal_id: 'xo', bind })).resolves.toEqual(
+      { ok: false, reason: 'lease_fence_stale' }
+    );
+    const stored = await getMessage(message.id);
+    expect(stored?.acknowledged_at).toBeNull();
+    expect(stored?.acknowledged_by).toBeNull();
+  });
+
+  test('dispatch DAL: a bind whose holder_principal_id differs from the live lease row is lease_fence_stale on address', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-holder-mismatch-address',
+      idempotency_key: 'idem-holder-mismatch-address',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'Mismatched holder address.',
+    });
+    const holderTokenHash = createHash('sha256')
+      .update('holder-secret-mismatch-address')
+      .digest('hex');
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo-claude-board-work', 'xo', 'xo-claude-board-work', $2, 13, $3, NULL, $4, NULL)`,
+      [
+        'lease-mismatch-address',
+        holderTokenHash,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    const goodBind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-mismatch-address',
+      fencing_token: 13,
+      holder_token_hash: holderTokenHash,
+      holder_principal_id: 'xo-claude-board-work',
+    };
+    expect(
+      (await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind: goodBind })).ok
+    ).toBe(true);
+    const before = await getMessage(message.id);
+    const badBind: XoLeaseBind = {
+      ...goodBind,
+      holder_principal_id: 'xo-codex-board-work',
+    };
+    await expect(
+      addressMessage({ id: message.id, principal_id: 'xo', bind: badBind })
+    ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+    const stored = await getMessage(message.id);
+    expect(stored?.acknowledged_at).toBe(before?.acknowledged_at ?? null);
+    expect(stored?.acknowledged_by).toBe('xo');
+    expect(stored?.addressed_at).toBeNull();
+    expect(stored?.addressed_by).toBeNull();
+  });
+
+  test('mailbox depth treats all stamped rows as legacy_unverified without a cutover', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-legacy-depth',
+      idempotency_key: 'idem-legacy-depth',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Legacy depth test.',
+    });
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [message.id, new Date().toISOString(), 'operator']
+    );
+    await db.query('DELETE FROM dispatch_receipt_cutover');
+    const depth = await mailboxDepthByPrincipal();
+    expect(depth.cutover_at).toBeNull();
+    const operator = depth.operator as import('./dispatch').MailboxDepth;
+    expect(operator.legacy_unverified).toBe(1);
+    expect(operator.acked_open).toBe(0);
+  });
+
+  test('mailbox depth assigns an eight-row fixture to exclusive exact buckets', async () => {
+    const cutover = new Date(Date.now() - 60_000).toISOString();
+    const before = new Date(Date.now() - 120_000).toISOString();
+    const after = new Date(Date.now() - 30_000).toISOString();
+    await db.query('DELETE FROM dispatch_receipt_cutover');
+    await db.query('INSERT INTO dispatch_receipt_cutover (id, applied_at) VALUES (1, $1)', [
+      cutover,
+    ]);
+    const rows = await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        createMessage({
+          correlation_id: `depth-corr-${index}`,
+          idempotency_key: `depth-idem-${index}`,
+          task_type: 'agent_message',
+          sender: 'xo',
+          recipient: 'operator',
+          body: `depth ${index}`,
+        })
+      )
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [rows[2]!.id, before, 'operator']
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3 WHERE id = $1',
+      [rows[3]!.id, after, 'operator']
+    );
+    await db.query(
+      'UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3, addressed_at = $2, addressed_by = $3 WHERE id = $1',
+      [rows[4]!.id, after, 'operator']
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'expired', route_disposed_at = $2 WHERE id = $1",
+      [rows[5]!.id, after]
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [rows[6]!.id, after]
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET acknowledged_at = $2, acknowledged_by = $3, route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [rows[7]!.id, after, 'operator']
+    );
+
+    const depth = (await mailboxDepthByPrincipal()).operator as import('./dispatch').MailboxDepth;
+    expect(depth).toEqual({
+      unread: 2,
+      legacy_unverified: 1,
+      acked_open: 1,
+      addressed_by_mind: 1,
+      disposed_by_machine: 1,
+      surfaced_unacked: 1,
+      surfaced_acked: 1,
+    });
+    expect(Object.values(depth).reduce((sum, count) => sum + count, 0)).toBe(8);
+  });
+
+  test('mailbox depth rejects a principal that collides with the cutover_at metadata key', async () => {
+    await db.query(
+      "INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active) VALUES ('cutover_at', 'Reserved', 'notify_only', 1)"
+    );
+    await expect(mailboxDepthByPrincipal()).rejects.toThrow(
+      'dispatch_principal_reserved:cutover_at'
+    );
+  });
+
+  test('machine disposition writes only routing evidence and auto_surfaced stays ackable', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-machine-surface',
+      idempotency_key: 'idem-machine-surface',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'Surface me.',
+    });
+    const disposed = await disposeMessageByMachine({
+      id: message.id,
+      actor: 'system:operator-inbox-consumer',
+      disposition: 'auto_surfaced',
+    });
+    expect(disposed).toMatchObject({
+      ok: true,
+      message: {
+        status: 'queued',
+        route_disposition: 'auto_surfaced',
+        acknowledged_at: null,
+        acknowledged_by: null,
+        addressed_at: null,
+        addressed_by: null,
+      },
+    });
+    if (disposed.ok) expect(disposed.message.route_disposed_at).not.toBeNull();
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+    expect(await getMessage(message.id)).toMatchObject({
+      acknowledged_by: 'operator',
+      addressed_at: null,
+      route_disposition: 'auto_surfaced',
+    });
+  });
+
+  test('terminal dispositions refuse acknowledgement with disposition_terminal', async () => {
+    // expired -> disposition_terminal; unroutable -> disposition_terminal;
+    // superseded is covered by the same terminal-receipt contract.
+    for (const disposition of ['expired', 'unroutable', 'superseded'] as const) {
+      const message = await createMessage({
+        correlation_id: `corr-terminal-${disposition}`,
+        idempotency_key: `idem-terminal-${disposition}`,
+        task_type: 'agent_message',
+        sender: 'xo',
+        recipient: 'operator',
+        body: disposition,
+      });
+      if (disposition === 'expired') {
+        expect(
+          (
+            await disposeMessageByMachine({
+              id: message.id,
+              actor: 'system:test-expirer',
+              disposition,
+            })
+          ).ok
+        ).toBe(true);
+      } else {
+        await db.query(
+          'UPDATE agent_dispatch_messages SET route_disposition = $2, route_disposed_at = $3 WHERE id = $1',
+          [message.id, disposition, '2026-09-23T00:00:00.000Z']
+        );
+      }
+      await expect(
+        acknowledgeMessage({ id: message.id, principal_id: 'operator' })
+      ).resolves.toEqual({ ok: false, reason: 'disposition_terminal' });
+    }
+  });
+
+  test('queued listing excludes disposed rows and route_disposition retrieves surfaced rows', async () => {
+    const surfaced = await createMessage({
+      correlation_id: 'corr-list-surfaced',
+      idempotency_key: 'idem-list-surfaced',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'surface',
+    });
+    const expired = await createMessage({
+      correlation_id: 'corr-list-expired',
+      idempotency_key: 'idem-list-expired',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'expire',
+    });
+    await disposeMessageByMachine({
+      id: surfaced.id,
+      actor: 'system:test',
+      disposition: 'auto_surfaced',
+    });
+    await disposeMessageByMachine({ id: expired.id, actor: 'system:test', disposition: 'expired' });
+    expect(
+      (await listMessages({ recipient: 'operator', status: 'queued' })).map(row => row.id)
+    ).not.toContain(surfaced.id);
+    expect(
+      (await listMessages({ recipient: 'operator', status: 'queued' })).map(row => row.id)
+    ).not.toContain(expired.id);
+    expect(
+      (await listMessages({ recipient: 'operator', route_disposition: 'auto_surfaced' })).map(
+        row => row.id
+      )
+    ).toContain(surfaced.id);
+    expect(
+      (
+        await listMessages({
+          recipient: 'operator',
+          status: 'queued',
+          route_disposition: 'auto_surfaced',
+        })
+      ).map(row => row.id)
+    ).toContain(surfaced.id);
+  });
+
+  test('machine disposition validates actor, value, and one-shot behavior', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-machine-errors',
+      idempotency_key: 'idem-machine-errors',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'errors',
+    });
+    await expect(
+      disposeMessageByMachine({ id: message.id, actor: 'operator', disposition: 'expired' })
+    ).resolves.toEqual({ ok: false, reason: 'machine_actor_required' });
+    await expect(
+      disposeMessageByMachine({
+        id: message.id,
+        actor: 'system:test',
+        disposition: 'addressed' as 'expired',
+      })
+    ).resolves.toEqual({ ok: false, reason: 'disposition_invalid' });
+    expect(
+      (
+        await disposeMessageByMachine({
+          id: message.id,
+          actor: 'system:test',
+          disposition: 'expired',
+        })
+      ).ok
+    ).toBe(true);
+    await expect(
+      disposeMessageByMachine({ id: message.id, actor: 'system:test', disposition: 'expired' })
+    ).resolves.toEqual({ ok: false, reason: 'already_disposed' });
+  });
+
+  test('T18 guarded machine disposition refuses a row with a human receipt', async () => {
+    const guarded = await createMessage({
+      correlation_id: 'corr-reader-guarded',
+      idempotency_key: 'idem-reader-guarded',
+      task_type: 'agent_message',
+      sender: 'taskmaster',
+      recipient: 'operator',
+      body: 'Taskmaster daily digest test',
+    });
+    expect((await acknowledgeMessage({ id: guarded.id, principal_id: 'operator' })).ok).toBe(true);
+    await expect(
+      disposeMessageByMachine({
+        id: guarded.id,
+        actor: 'system:inbox-reader',
+        disposition: 'expired',
+        requireNoReceipt: true,
+      })
+    ).resolves.toEqual({ ok: false, reason: 'receipt_present' });
+    expect(await getMessage(guarded.id)).toMatchObject({
+      route_disposition: null,
+      acknowledged_by: 'operator',
+    });
+
+    const legacy = await createMessage({
+      correlation_id: 'corr-reader-legacy',
+      idempotency_key: 'idem-reader-legacy',
+      task_type: 'agent_message',
+      sender: 'taskmaster',
+      recipient: 'operator',
+      body: 'Taskmaster daily digest legacy',
+    });
+    expect((await acknowledgeMessage({ id: legacy.id, principal_id: 'operator' })).ok).toBe(true);
+    expect(
+      (
+        await disposeMessageByMachine({
+          id: legacy.id,
+          actor: 'system:inbox-reader',
+          disposition: 'expired',
+        })
+      ).ok
+    ).toBe(true);
   });
 
   test('addresses only acknowledged mail by its acknowledger and is idempotent', async () => {
@@ -920,7 +1507,7 @@ describe('dispatch db', () => {
     expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
     await expect(addressMessage({ id: message.id, principal_id: 'xo' })).resolves.toEqual({
       ok: false,
-      reason: 'wrong_recipient',
+      reason: 'xo_bind_required',
     });
     await expect(
       addressMessage({ id: message.id, principal_id: 'operator' })
@@ -1084,7 +1671,7 @@ describe('dispatch db', () => {
     });
     await expect(addressMessage({ id: mailbox.id, principal_id: 'xo' })).resolves.toEqual({
       ok: false,
-      reason: 'wrong_recipient',
+      reason: 'xo_bind_required',
     });
     await db.query("UPDATE agent_dispatch_messages SET acknowledged_by = 'xo' WHERE id = $1", [
       mailbox.id,

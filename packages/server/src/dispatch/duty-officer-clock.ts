@@ -1,6 +1,7 @@
 import {
   claimMessage,
   createAuthenticatedMessage,
+  getWorker,
   heartbeatWorker,
   listMessages,
   postResult,
@@ -10,10 +11,22 @@ import {
   type DispatchMessage,
   type DispatchSenderContext,
   type DispatchTaskOutcome,
+  type DispatchWorker,
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
+import {
+  mintAppInstallationToken,
+  runSecurityDetector,
+  type SecurityDetectorResult,
+} from './duty-officer-security-detector';
+import {
+  listWorkerAlarmIssueComments,
+  postWorkerAlarmComment,
+  runWorkerHeartbeatAlarm,
+  type WorkerAlarmIssueComment,
+} from './worker-heartbeat-alarm';
 
 const log = createLogger('dispatch/duty-officer-clock');
 
@@ -26,6 +39,30 @@ const GH_SUBJECT =
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
+let detectorInFlight: Promise<SecurityDetectorResult | null> | null = null;
+let detectorStatus: {
+  last_run_at: string | null;
+  verdict: SecurityDetectorResult['verdict'] | null;
+  reasons: string[];
+  error_count: number;
+  last_error: string | null;
+  build_sha: string | null;
+  last_tick_detector_outcome?:
+    | 'skipped_throttled'
+    | 'skipped_in_flight'
+    | 'timed_out'
+    | 'error'
+    | 'completed';
+  last_tick_at?: string;
+} = {
+  last_run_at: null,
+  verdict: null,
+  reasons: [],
+  error_count: 0,
+  last_error: null,
+  build_sha: null,
+};
+const startedAt = new Date().toISOString();
 
 export interface DutyOfficerStaleIssue {
   owner: string;
@@ -48,15 +85,27 @@ export interface DutyOfficerClockDeps {
   listStaleIssues: () => Promise<DutyOfficerStaleIssue[]>;
   postIssueComment: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
   judge: (message: DispatchMessage) => Promise<DutyOfficerJudgeVerdict>;
+  securityDetector: (signal: AbortSignal) => Promise<SecurityDetectorResult | null>;
+  // Worker heartbeat alarm deps (independent of DUTY_OFFICER_GH_NUDGE). Optional
+  // so legacy fixtures need not provide them; createRealDutyOfficerClockDeps
+  // always wires them and the tick only runs the alarm when all three exist.
+  getWorker?: (workerId: string) => Promise<DispatchWorker | null>;
+  postAlarmComment?: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
+  listAlarmIssueComments?: (issue: DutyOfficerStaleIssue) => Promise<WorkerAlarmIssueComment[]>;
+  now?: () => Date;
 }
 
-function githubToken(): string | null {
+export function githubToken(): string | null {
   const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
   return token ? token : null;
 }
 
 export function githubNudgeEnabled(): boolean {
   return process.env.DUTY_OFFICER_GH_NUDGE === 'true' && Boolean(githubToken());
+}
+
+function githubTimeoutMs(): number {
+  return Math.max(1_000, Number(process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS) || 15_000);
 }
 
 export function isTaskmasterSelfPause(message: DispatchMessage): boolean {
@@ -91,7 +140,7 @@ function shouldEscalate(message: DispatchMessage): boolean {
   return namedNextStep(message.body) === null;
 }
 
-function parseGithubSubject(subjectKey: string | null): DutyOfficerStaleIssue | null {
+export function parseGithubSubject(subjectKey: string | null): DutyOfficerStaleIssue | null {
   if (!subjectKey) return null;
   const match = GH_SUBJECT.exec(subjectKey);
   if (!match) return null;
@@ -123,6 +172,7 @@ async function githubJson<T>(
     method: options?.method,
     headers,
     body: options?.body,
+    signal: AbortSignal.timeout(githubTimeoutMs()),
   });
   if (!response.ok) {
     throw new Error(`duty_officer_github_http_${response.status}`);
@@ -206,8 +256,60 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
     getCurrentXoLease,
     listStaleIssues: listStaleGithubIssues,
     postIssueComment: postGithubIssueComment,
+    getWorker,
+    postAlarmComment: postWorkerAlarmComment,
+    listAlarmIssueComments: listWorkerAlarmIssueComments,
     judge: judgeDutyOfficerItem,
+    securityDetector: signal =>
+      runSecurityDetector(
+        {
+          fetchImpl: fetch,
+          readToken: githubToken,
+          writeTokenProvider: mintAppInstallationToken,
+          now: () => new Date(),
+          buildSha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
+        },
+        signal
+      ),
   };
+}
+
+function detectorTimeoutMs(): number {
+  return Math.max(1, Number(process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS) || 30_000);
+}
+
+async function detectorDeadline(
+  deps: DutyOfficerClockDeps
+): Promise<SecurityDetectorResult | null | undefined> {
+  if (detectorInFlight) {
+    log.info('duty_officer_security_detector_skipped_in_flight');
+    return undefined;
+  }
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      const error = new Error('duty_officer_security_detector_timeout');
+      controller.abort(error);
+      reject(error);
+    }, detectorTimeoutMs());
+  });
+  // Only settlement of the underlying run releases the guard, even after timeout.
+  detectorInFlight = Promise.resolve().then(() => deps.securityDetector(controller.signal));
+  const run = detectorInFlight;
+  void run.then(
+    () => {
+      detectorInFlight = null;
+    },
+    () => {
+      detectorInFlight = null;
+    }
+  );
+  try {
+    return await Promise.race([run, deadline]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function finishItem(
@@ -379,10 +481,32 @@ export async function tickDutyOfficerClock(
     await deps.registerWorker({
       worker_id: DUTY_OFFICER_WORKER_ID,
       host: process.env.HOSTNAME ?? 'in-process',
-      capabilities: { task_types: ['run_report', 'agent_message'], principal: 'duty-officer' },
+      capabilities: {
+        task_types: ['run_report', 'agent_message'],
+        principal: 'duty-officer',
+        security_detector: detectorStatus,
+      },
       max_concurrency: 1,
     });
     await deps.heartbeatWorker({ worker_id: DUTY_OFFICER_WORKER_ID, status: 'available' });
+
+    // Watch registered Dispatch workers for heartbeat staleness. This runs on its
+    // own switch (DISPATCH_WORKER_ALARM_ENABLED, default ON), independent of the
+    // production-disabled DUTY_OFFICER_GH_NUDGE. Failures are caught here so a
+    // GitHub/DB hiccup can never break the rest of the tick (queued-message loop,
+    // security detector, existing nudge block still run below).
+    if (deps.getWorker && deps.postAlarmComment && deps.listAlarmIssueComments) {
+      try {
+        await runWorkerHeartbeatAlarm({
+          getWorker: deps.getWorker,
+          postAlarmComment: deps.postAlarmComment,
+          listIssueComments: deps.listAlarmIssueComments,
+          now: deps.now,
+        });
+      } catch (error) {
+        log.error({ err: error }, 'worker_heartbeat_alarm_failed');
+      }
+    }
 
     const lease = await deps.getCurrentXoLease();
     if (!lease) {
@@ -408,6 +532,44 @@ export async function tickDutyOfficerClock(
       }
     }
 
+    try {
+      const detectorResult = await detectorDeadline(deps);
+      detectorStatus = {
+        ...detectorStatus,
+        ...(detectorResult
+          ? {
+              last_run_at: detectorResult.evaluated_at,
+              verdict: detectorResult.verdict,
+              reasons: detectorResult.reasons.map(reason => reason.code),
+              error_count: detectorResult.last_error ? 1 : 0,
+              last_error: detectorResult.last_error ?? null,
+              build_sha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
+            }
+          : {}),
+        last_tick_detector_outcome: detectorResult
+          ? 'completed'
+          : detectorResult === null
+            ? 'skipped_throttled'
+            : 'skipped_in_flight',
+        last_tick_at: (deps.now?.() ?? new Date()).toISOString(),
+      };
+    } catch (error) {
+      const lastError = error instanceof Error ? error.message : String(error);
+      detectorStatus = {
+        ...detectorStatus,
+        error_count: detectorStatus.error_count + 1,
+        last_error: lastError,
+        last_tick_detector_outcome:
+          lastError === 'duty_officer_security_detector_timeout' ? 'timed_out' : 'error',
+        last_tick_at: (deps.now?.() ?? new Date()).toISOString(),
+      };
+      if (lastError === 'duty_officer_security_detector_timeout') {
+        log.error('duty_officer_security_detector_timeout');
+      } else {
+        log.error({ err: error }, 'duty_officer_security_detector_failed');
+      }
+    }
+
     if (!githubNudgeEnabled()) {
       log.info('duty_officer_github_nudge_skipped');
       return;
@@ -423,6 +585,24 @@ export async function tickDutyOfficerClock(
   } catch (error) {
     log.error({ err: error }, 'duty_officer_clock_tick_failed');
   } finally {
+    try {
+      const now = deps.now?.() ?? new Date();
+      await deps.registerWorker({
+        worker_id: DUTY_OFFICER_WORKER_ID,
+        host: process.env.HOSTNAME ?? 'in-process',
+        capabilities: {
+          task_types: ['run_report', 'agent_message'],
+          principal: 'duty-officer',
+          started_at: startedAt,
+          build_sha: process.env.ARCHON_BUILD_SHA ?? 'unknown',
+          last_tick_completed_at: now.toISOString(),
+          security_detector: detectorStatus,
+        },
+        max_concurrency: 1,
+      });
+    } catch (error) {
+      log.error({ err: error }, 'duty_officer_clock_completion_write_failed');
+    }
     inFlight = false;
   }
 }

@@ -34,9 +34,9 @@
  *              (fail-closed; the fix must NOT fail-open).
  */
 
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 
-import { pollForTerminal } from '../poll.js';
+import { ghPrListForBranchDefault, pollForTerminal } from '../poll.js';
 import { judgeGate } from '../judge.js';
 import { runCascade } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
@@ -62,6 +62,18 @@ const openPrEvent = {
   data: { output: 'PR_URL=https://github.com/thinmansoftware/lspro-react/pull/513' },
 };
 
+const liveOpenPrEvent = {
+  event_type: 'node_completed',
+  step_name: 'open-pr-if-needed',
+  data: {
+    duration_ms: 3132,
+    type: 'bash',
+    node_output:
+      'ORIGIN_PREC... == db05798e... (attempt 1)\nhttps://github.com/thinmansoftware/bdc-harness/pull/898',
+    gate_result: { pass: true },
+  },
+};
+
 // The commit-and-push node event. Carries the pushed branch as unique_branch=,
 // which is the value findExistingPrForBranch attributes the PR by. NOTE the
 // branch is a feat/wo-...-thread-... UNIQUE_BRANCH, never archon/thread-*.
@@ -69,6 +81,12 @@ const commitPushEvent = (branch: string) => ({
   event_type: 'node_completed',
   step_name: 'commit-and-push',
   data: { output: `VERIFIED: origin/${branch} == local HEAD\nunique_branch=${branch}` },
+});
+
+const liveCommitPushEvent = (branch: string) => ({
+  event_type: 'node_completed',
+  step_name: 'commit-and-push',
+  data: { node_output: `VERIFIED: origin/${branch} == local HEAD\nunique_branch=${branch}` },
 });
 
 const UNIQUE_BRANCH = 'feat/wo-lspro-ce-cover-picker-scroll-01-thread-abcd1234';
@@ -100,6 +118,69 @@ function simulateEventualConsistency(emptyResponses: number, url: string) {
 // ---------------------------------------------------------------------------
 
 describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
+  test('reads an explicit PR_URL from node_output', async () => {
+    const url = 'https://github.com/thinmansoftware/bdc-harness/pull/900';
+    globalThis.fetch = (async () =>
+      completedRun([
+        {
+          event_type: 'node_completed',
+          step_name: 'open-pr-if-needed',
+          data: { node_output: `PR_URL=${url}` },
+        },
+      ])) as unknown as typeof fetch;
+
+    const result = await pollForTerminal({
+      runId: 'run-node-output-explicit',
+      apiBaseUrl: 'http://archon.test',
+      checkPrMergeable: async () => true,
+    });
+
+    expect(result.prUrl).toBe(url);
+  });
+
+  test('reads the live bare GitHub pull URL shape from node_output', async () => {
+    globalThis.fetch = (async () => completedRun([liveOpenPrEvent])) as unknown as typeof fetch;
+
+    const result = await pollForTerminal({
+      runId: 'run-node-output-bare',
+      apiBaseUrl: 'http://archon.test',
+      checkPrMergeable: async () => true,
+    });
+
+    expect(result.prUrl).toBe('https://github.com/thinmansoftware/bdc-harness/pull/898');
+  });
+
+  test('ignores non-GitHub URLs and GitHub pull URLs from non-PR nodes', async () => {
+    globalThis.fetch = (async () =>
+      completedRun([
+        {
+          event_type: 'node_completed',
+          step_name: 'open-pr-if-needed',
+          data: { node_output: 'https://example.com/thinmansoftware/bdc-harness/pull/898' },
+        },
+        {
+          event_type: 'node_completed',
+          step_name: 'publish-result',
+          data: { node_output: 'https://github.com/thinmansoftware/bdc-harness/pull/898' },
+        },
+      ])) as unknown as typeof fetch;
+
+    let ghCalls = 0;
+    const result = await pollForTerminal({
+      runId: 'run-decoys',
+      apiBaseUrl: 'http://archon.test',
+      prRetryAttempts: 0,
+      ghPrListForBranch: async () => {
+        ghCalls++;
+        return null;
+      },
+    });
+
+    expect(result.prUrl).toBeNull();
+    expect(ghCalls).toBe(0);
+    expect(judgeGate(result).pass).toBe(false);
+  });
+
   test('Scenario 2: PR list empty on first lookup, found on retry -> PR-found (eventual consistency)', async () => {
     // Run completed, pushed its branch, but opened no open-pr NODE event and the
     // gh pr list REST path is briefly empty. The event-feed retries find nothing;
@@ -187,6 +268,45 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
   });
 });
 
+describe('default gh branch lookup', () => {
+  test('passes the explicit repository to gh pr list', async () => {
+    let invocation: { command: string; args: string[] } | null = null;
+    const url = 'https://github.com/thinmansoftware/bdc-harness/pull/898';
+
+    const result = await ghPrListForBranchDefault(
+      'feat/example',
+      'thinmansoftware/bdc-harness',
+      async (command, args) => {
+        invocation = { command, args };
+        return { stdout: `${url}\n`, stderr: '' };
+      }
+    );
+
+    expect(result).toBe(url);
+    expect(invocation?.command).toBe('gh');
+    const repoIndex = invocation?.args.indexOf('--repo') ?? -1;
+    expect(repoIndex).toBeGreaterThan(-1);
+    expect(invocation?.args[repoIndex + 1]).toBe('thinmansoftware/bdc-harness');
+  });
+
+  test('skips gh and logs when the repository is unknown', async () => {
+    let execCalls = 0;
+    const log = spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const result = await ghPrListForBranchDefault('feat/example', null, async () => {
+        execCalls++;
+        throw new Error('must not execute');
+      });
+
+      expect(result).toBeNull();
+      expect(execCalls).toBe(0);
+      expect(log.mock.calls.some(call => String(call[0]).includes('repo is unknown'))).toBe(true);
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Cascade-level: proves the LADDER does not climb (attempts.length === 1)
 // ---------------------------------------------------------------------------
@@ -237,6 +357,32 @@ function realPollDep(ghLookup: (branch: string) => Promise<string | null>): Casc
 describe('cascade does not climb when the completed run landed a PR (issue #1502)', () => {
   test('Scenario 1: PR present on the run event feed -> wins on entry tier, no climb', async () => {
     globalThis.fetch = (async () => completedRun([openPrEvent])) as unknown as typeof fetch;
+
+    let fireCalls = 0;
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fireCalls++;
+        return makeFireOk(`run-${fireCalls}`);
+      },
+      poll: realPollDep(async () => null),
+      specRepair: noopSpecRepair,
+      escalate: async () => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const result = await runCascade(baseOpts(deps));
+
+    expect(result.status).toBe('won');
+    expect(result.attempts).toHaveLength(1);
+    expect(fireCalls).toBe(1);
+  });
+
+  test('live node_output event shape wins on entry tier without climbing', async () => {
+    globalThis.fetch = (async () =>
+      completedRun([
+        liveCommitPushEvent(UNIQUE_BRANCH),
+        liveOpenPrEvent,
+      ])) as unknown as typeof fetch;
 
     let fireCalls = 0;
     const deps: CascadeDeps = {

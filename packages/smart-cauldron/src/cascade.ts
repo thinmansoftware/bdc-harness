@@ -23,13 +23,16 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
+import { chooseHeadroomEntry, resolveEntryThreshold } from './headroom.js';
+import type { EntrySelection, SeatUsageSnapshot } from './headroom.js';
 import { fireTier, buildFireMessage } from './fire.js';
-import { pollForTerminal, TimeoutError } from './poll.js';
+import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './poll.js';
+import { fetchNodeTimeoutsMs } from './node-timeouts.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { createRecord, writeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
-import { findWoClaim, type WoClaim } from './already-satisfied.js';
+import { findWoClaim, resolveGithubRepo, type WoClaim } from './already-satisfied.js';
 import { acquireWoLock, releaseWoLock } from './wo-lock.js';
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
 import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
@@ -58,6 +61,12 @@ export interface CascadeDeps {
   preflight?: (tier: LadderTier) => Promise<void>;
   fire?: typeof fireTier;
   poll?: typeof pollForTerminal;
+  /**
+   * Resolves the fired workflow's per-node configured timeouts for poll's
+   * `nodeTimeoutsMs`. Best-effort: returns {} on any failure, which restores
+   * the generic open-node default. Injectable so tests do not need the API.
+   */
+  fetchNodeTimeouts?: typeof fetchNodeTimeoutsMs;
   judge?: typeof judgeGate;
   escalate?: (context: EscalationCallContext) => Promise<void>;
   writeRecord?: typeof writeRecord;
@@ -90,6 +99,51 @@ export interface CascadeDeps {
    * entryOverride is set (that already skips the conductor).
    */
   ruleset?: ConductorRuleset;
+  /**
+   * Live subscription-seat snapshot. Absent means headroom routing is skipped.
+   * A rejection or timeout fails open (usage null) and never holds the fire.
+   */
+  seatUsage?: () => Promise<SeatUsageSnapshot>;
+}
+
+const SEAT_USAGE_READ_TIMEOUT_MS = 5000;
+
+/**
+ * Read seat usage with a fixed timeout. A rejection or timeout becomes null
+ * and logs exactly one failure line. A late reader result after timeout is ignored.
+ */
+async function readSeatUsageOrNull(
+  read: () => Promise<SeatUsageSnapshot>
+): Promise<SeatUsageSnapshot | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  try {
+    return await new Promise<SeatUsageSnapshot | null>(resolve => {
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        console.log('[smart-cauldron] seat usage unavailable: timeout');
+        resolve(null);
+      }, SEAT_USAGE_READ_TIMEOUT_MS);
+      Promise.resolve()
+        .then(() => read())
+        .then(
+          value => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+          },
+          () => {
+            if (settled) return;
+            settled = true;
+            console.log('[smart-cauldron] seat usage unavailable: rejected');
+            resolve(null);
+          }
+        );
+    });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 export interface SupervisorFailureContext {
@@ -229,6 +283,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const fireImpl = opts.deps?.fire ?? fireTier;
   const preflightImpl = opts.deps?.preflight;
   const pollImpl = opts.deps?.poll ?? pollForTerminal;
+  const fetchNodeTimeoutsImpl = opts.deps?.fetchNodeTimeouts ?? fetchNodeTimeoutsMs;
   const judgeImpl = opts.deps?.judge ?? judgeGate;
   const escalateImpl = opts.deps?.escalate ?? defaultEscalate;
   const writeRecordImpl = opts.deps?.writeRecord ?? writeRecord;
@@ -297,6 +352,25 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     entryTierName = promoted.name;
   }
 
+  let entrySelection: EntrySelection | undefined;
+  if (opts.deps?.seatUsage) {
+    const usage = await readSeatUsageOrNull(opts.deps.seatUsage);
+    entrySelection = chooseHeadroomEntry({
+      picked: entryTierName,
+      tiers,
+      refusedTiers,
+      premiumTiers,
+      usage,
+      thresholdPercent: resolveEntryThreshold(process.env),
+      pinned: entryOverride !== undefined,
+    });
+    entryTierName = entrySelection.entry;
+    console.log(
+      `[smart-cauldron] entry selection: ${entrySelection.reason} ` +
+        `picked=${entrySelection.picked} entry=${entrySelection.entry}`
+    );
+  }
+
   let currentIndex = tiers.findIndex(t => t.name === entryTierName);
   if (currentIndex === -1) {
     throw new Error(
@@ -338,6 +412,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         climbCount: 0,
         wonCheap: false,
       },
+      ...(entrySelection ? { entrySelection } : {}),
     };
     const admission = await createRecordImpl(record, outDir);
     onAdmission?.(admission.record, admission.created);
@@ -486,6 +561,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
         ...(refusalReason ? { refusalReason } : {}),
+        ...(entrySelection ? { entrySelection } : {}),
       };
     }
 
@@ -622,67 +698,93 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       return false;
     }
 
+    /**
+     * Pause the cascade at a premium-tier boundary instead of firing that tier.
+     *
+     * Shared by the loop-top approval gate and the progress-timeout pre-cancel
+     * check. An AUTOMATIC climb into a premium tier (default ['frontier']) must
+     * NEVER auto-fire ("then dont waste my usage if it will fail" -- John,
+     * 2026-08-18), and must NEVER cancel the current run only to wait on a tier
+     * that is not approved (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN
+     * item 3, anchor: run 1388511a). Records the full escalation packet, emits
+     * ONE operator notice, sets status = 'pending-frontier-approval', and
+     * checkpoints. The pause persists even if the notice delivery fails.
+     */
+    async function pauseForFrontierApproval(
+      premiumTier: LadderTier,
+      runId: string | null
+    ): Promise<void> {
+      const pausedAt = new Date().toISOString();
+      let notifiedAt: string | null = null;
+      try {
+        await emitEscalation({
+          errorClass: 'validator_rejected',
+          woId,
+          reason:
+            'PENDING FRONTIER APPROVAL -- auto-climb reached premium tier ' +
+            `"${premiumTier.name}" (workflow ${premiumTier.workflowName}) for ${woId}. Not fired. ` +
+            'Approve to resume, or reject to send to needs-human. ' +
+            `Approve: POST /api/cascades/${cascadeId}/approve-frontier ; ` +
+            `Reject: POST /api/cascades/${cascadeId}/reject-frontier`,
+          remediation: buildFrontierApprovalRemediation(cascadeId, premiumTier, attempts),
+          runId: runId ?? attempts.at(-1)?.runId ?? null,
+          overseerPermit: opts.overseerPermit,
+        });
+        notifiedAt = new Date().toISOString();
+      } catch (notifyErr) {
+        console.log(
+          `[smart-cauldron] Frontier-approval notice failed for woId=${woId}: ` +
+            `${(notifyErr as Error).message} (pause persisted regardless)`
+        );
+      }
+
+      frontierApprovalRecord = {
+        ...(opts.expectedSpec ? { expectedSpec: opts.expectedSpec } : {}),
+        tierName: premiumTier.name,
+        workflowName: premiumTier.workflowName,
+        priorContext,
+        project: project ?? null,
+        woId,
+        woClass: woClass ?? null,
+        tags: [...(tags ?? [])].sort(),
+        apiBaseUrl,
+        pausedAt,
+        notifiedAt,
+        resolution: null,
+        resolvedAt: null,
+        resumeCascadeId: null,
+        rejectReason: null,
+      };
+      status = 'pending-frontier-approval';
+      console.log(
+        '[smart-cauldron] PENDING FRONTIER APPROVAL: auto-climb reached premium ' +
+          `tier=${premiumTier.name} for woId=${woId} -- NOT firing (cascadeId=${cascadeId})`
+      );
+      await checkpoint();
+    }
+
+    /**
+     * The next tier an AUTOMATIC climb from `fromIndex` would fire, skipping
+     * refused (dark/retired) rungs -- mirrors the currentIndex++/refused-skip
+     * logic in climbOrStop, but as a pure peek that does not mutate state.
+     * Returns null when the ladder is exhausted above `fromIndex`.
+     */
+    function peekNextClimbTier(fromIndex: number): LadderTier | null {
+      let idx = fromIndex + 1;
+      while (idx < tiers.length && refusedTiers.includes(tiers[idx].name)) idx++;
+      return idx < tiers.length ? (tiers[idx] ?? null) : null;
+    }
+
     while (currentIndex < tiers.length) {
       const tier = tiers[currentIndex];
       if (!tier) break;
 
       // ==== Premium-tier approval gate (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01) ====
       // An AUTOMATIC climb into a premium tier (default ['frontier']) must NEVER
-      // auto-fire: "then dont waste my usage if it will fail" (John, 2026-08-18).
-      // Pause with the preserved escalation packet and emit ONE operator notice.
-      // An explicit --entry override onto this tier is human-typed and bypasses
-      // the gate (the operator already chose to spend on it).
+      // auto-fire. An explicit --entry override onto this tier is human-typed and
+      // bypasses the gate (the operator already chose to spend on it).
       if (premiumTiers.includes(tier.name) && tier.name !== entryOverride) {
-        const pausedAt = new Date().toISOString();
-        let notifiedAt: string | null = null;
-        try {
-          await emitEscalation({
-            errorClass: 'validator_rejected',
-            woId,
-            reason:
-              'PENDING FRONTIER APPROVAL -- auto-climb reached premium tier ' +
-              `"${tier.name}" (workflow ${tier.workflowName}) for ${woId}. Not fired. ` +
-              'Approve to resume, or reject to send to needs-human. ' +
-              `Approve: POST /api/cascades/${cascadeId}/approve-frontier ; ` +
-              `Reject: POST /api/cascades/${cascadeId}/reject-frontier`,
-            remediation: buildFrontierApprovalRemediation(cascadeId, tier, attempts),
-            runId: attempts.at(-1)?.runId ?? null,
-            overseerPermit: opts.overseerPermit,
-          });
-          notifiedAt = new Date().toISOString();
-        } catch (notifyErr) {
-          // The pause itself must persist even if the notice delivery fails --
-          // an operator can still find the paused record and resolve it. Log
-          // the failure and fall through to persist the paused state.
-          console.log(
-            `[smart-cauldron] Frontier-approval notice failed for woId=${woId}: ` +
-              `${(notifyErr as Error).message} (pause persisted regardless)`
-          );
-        }
-
-        frontierApprovalRecord = {
-          ...(opts.expectedSpec ? { expectedSpec: opts.expectedSpec } : {}),
-          tierName: tier.name,
-          workflowName: tier.workflowName,
-          priorContext,
-          project: project ?? null,
-          woId,
-          woClass: woClass ?? null,
-          tags: [...(tags ?? [])].sort(),
-          apiBaseUrl,
-          pausedAt,
-          notifiedAt,
-          resolution: null,
-          resolvedAt: null,
-          resumeCascadeId: null,
-          rejectReason: null,
-        };
-        status = 'pending-frontier-approval';
-        console.log(
-          '[smart-cauldron] PENDING FRONTIER APPROVAL: auto-climb reached premium ' +
-            `tier=${tier.name} for woId=${woId} -- NOT firing (cascadeId=${cascadeId})`
-        );
-        await checkpoint();
+        await pauseForFrontierApproval(tier, attempts.at(-1)?.runId ?? null);
         break;
       }
 
@@ -817,6 +919,35 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       // Poll for terminal state (runId is guaranteed non-null since fireResult.ok is true)
       const resolvedRunId = fireResult.runId ?? '';
+
+      // Per-node configured timeouts for the watchdog. The run event feed carries
+      // no per-node `timeout`, so the workflow definition is the only source and
+      // this is the only production path that supplies it -- without this call
+      // poll's `nodeTimeoutsMs` is inert and a node configured ABOVE the 60-minute
+      // open-node default is still cut at 60 (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-
+      // FIX-01 Scope IN item 2). Resolved per attempt because each tier binds its
+      // own workflow. Best-effort: never throws, {} restores the prior default.
+      //
+      // Guarded: the run is ALREADY FIRED and live by this point. The real
+      // resolver never throws, but letting any future/injected resolver throw
+      // here would abandon a live run over a watchdog-tuning lookup. Degrade to
+      // the generic default instead.
+      let nodeTimeoutsMs: Record<string, number> = {};
+      try {
+        nodeTimeoutsMs = await fetchNodeTimeoutsImpl({
+          workflowName: tier.workflowName,
+          apiBaseUrl,
+          token,
+          floorMs: DEFAULT_OPEN_NODE_BUDGET_MS,
+        });
+      } catch (err) {
+        console.log(
+          `[smart-cauldron] node-timeout resolution failed for workflow ${tier.workflowName} ` +
+            `(${(err as Error).message}); open nodes use the ` +
+            `${String(DEFAULT_OPEN_NODE_BUDGET_MS)}ms default`
+        );
+      }
+
       let pollResult: PollResult;
       try {
         pollResult = await pollImpl({
@@ -826,28 +957,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           timeoutMs: pollTimeoutMs,
           stallTimeoutMs: pollStallTimeoutMs,
           intervalMs: pollIntervalMs,
+          nodeTimeoutsMs,
+          repo: resolveGithubRepo(project),
         });
       } catch (pollErr) {
         if (pollErr instanceof TimeoutError) {
-          // Progress-timeout: the model responded and burned tokens but never
-          // reached a terminal state within budget. Per the three-failure-class
-          // design (v1.1 amendment 2), this is a QUALITY failure, not an infra
-          // failure -- cancel the hung run (best-effort; must not block the
-          // climb) and climb via the same logic used for gate-fail.
-          const cancelResult = await cancelImpl({ runId: resolvedRunId, apiBaseUrl, token }).catch(
-            (cancelErr: unknown) => ({
-              ok: false,
-              error: `cancel threw: ${(cancelErr as Error).message}`,
-            })
-          );
-          if (!cancelResult.ok) {
-            console.log(
-              `[smart-cauldron] Warning: cancel failed for run ${resolvedRunId} on tier ` +
-                `${tier.name}: ${cancelResult.error ?? 'unknown'} (continuing climb -- ` +
-                'cancellation is best-effort)'
-            );
-          }
-
           // Carry the poll's own message through: it distinguishes a STALL (run went
           // silent) from the hard-ceiling backstop (run was still emitting but ran
           // past the runaway limit). Those are different diagnoses and the operator
@@ -856,6 +970,62 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
             pollErr instanceof TimeoutError
               ? pollErr.message
               : `progress-timeout: no terminal state within ${pollTimeoutMs}ms`;
+
+          // No cancel-to-nowhere (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope
+          // IN item 3): if the automatic climb from this tier would land on a
+          // premium tier that requires operator approval, do NOT cancel the
+          // current run. Cancelling here kills live work only to wait on a tier we
+          // are not allowed to fire (anchor: run 1388511a was cancelled with an
+          // empty reason and then immediately paused for frontier approval).
+          // Pause for approval and leave the run RUNNING.
+          if (!tier.isFrontier) {
+            const nextTier = peekNextClimbTier(currentIndex);
+            if (
+              nextTier &&
+              premiumTiers.includes(nextTier.name) &&
+              nextTier.name !== entryOverride
+            ) {
+              attempt.outcome = 'progress-timeout';
+              attempt.gateFailReason = timeoutReason;
+              attempt.completedAt = new Date().toISOString();
+              priorContext = buildTimeoutPriorContext(tier.name, pollStallTimeoutMs);
+              console.log(
+                `[smart-cauldron] Progress-timeout on tier=${tier.name}: ${timeoutReason}`
+              );
+              console.log(
+                `[smart-cauldron] NOT cancelling run ${resolvedRunId}: next tier=` +
+                  `${nextTier.name} requires approval -- pausing for frontier approval and ` +
+                  'leaving the run running (no cancel-to-nowhere)'
+              );
+              await pauseForFrontierApproval(nextTier, fireResult.runId);
+              break;
+            }
+          }
+
+          // Progress-timeout: the model responded and burned tokens but never
+          // reached a terminal state within budget. Per the three-failure-class
+          // design (v1.1 amendment 2), this is a QUALITY failure, not an infra
+          // failure -- cancel the hung run (best-effort; must not block the
+          // climb) and climb via the same logic used for gate-fail. Every
+          // conductor cancel carries a non-empty reason (Scope IN item 4) so
+          // run_cancelled.data.reason is never "".
+          const cancelResult = await cancelImpl({
+            runId: resolvedRunId,
+            apiBaseUrl,
+            token,
+            reason: `smart-cauldron stall: ${timeoutReason}; cascade ${cascadeId}`,
+          }).catch((cancelErr: unknown) => ({
+            ok: false,
+            error: `cancel threw: ${(cancelErr as Error).message}`,
+          }));
+          if (!cancelResult.ok) {
+            console.log(
+              `[smart-cauldron] Warning: cancel failed for run ${resolvedRunId} on tier ` +
+                `${tier.name}: ${cancelResult.error ?? 'unknown'} (continuing climb -- ` +
+                'cancellation is best-effort)'
+            );
+          }
+
           attempt.outcome = 'progress-timeout';
           attempt.gateFailReason = timeoutReason;
           attempt.completedAt = new Date().toISOString();
@@ -896,6 +1066,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       attempt.outcome = outcome;
       attempt.gateFailReason = verdict.pass ? null : verdict.reason;
       attempt.servedModelId = pollResult.servedModelId;
+      attempt.nodeModels = pollResult.nodeModels;
       attempt.completedAt = new Date().toISOString();
 
       if (verdict.pass) {

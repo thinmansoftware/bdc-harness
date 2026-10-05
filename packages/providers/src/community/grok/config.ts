@@ -1,6 +1,6 @@
 export interface GrokAgentProviderDefaults {
   [key: string]: unknown;
-  /** OpenRouter model id, e.g. x-ai/grok-4.5 */
+  /** OpenRouter model id, e.g. deepseek/deepseek-v4.1-flash */
   model?: string;
   /** Override OpenRouter base URL (tests / proxies) */
   baseURL?: string;

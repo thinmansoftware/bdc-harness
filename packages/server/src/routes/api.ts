@@ -9,7 +9,7 @@ import type { WebAdapter } from '../adapters/web';
 import { rm, readFile, writeFile, unlink, mkdir } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import type { Context } from 'hono';
 import type {
   ConversationLockManager,
@@ -30,6 +30,7 @@ import {
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
+import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import {
   readCascadeRecordById,
   claimFrontierResolution,
@@ -61,7 +62,21 @@ import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { checkCodexDispatchGate } from '@archon/providers/auth-refresh/dispatch-gate';
 import { processDueProviderWaits } from '@archon/workflows/reliability/wait-scheduler';
+import {
+  FUELGLASS_SEAT_CUTOFF_SETTING_KEY,
+  getSeatCutoff,
+  isValidSeatCutoff,
+  readAllSeats,
+  SEAT_CUTOFF_OUT_OF_RANGE,
+  setSeatCutoffOverride,
+} from '@archon/workflows/reliability/seat-usage';
+import {
+  clearOperatorSetting,
+  getOperatorSetting,
+  setOperatorSetting,
+} from '@archon/core/db/operator-settings';
 import { resolveWorkflowProbeBindings } from '@archon/workflows/reliability/resolve-binding';
+import type { ModelOverride } from '@archon/workflows/model-override';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
@@ -75,6 +90,7 @@ import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
 import { startTaskmaster, getTaskmasterRuntime, getTickHealth } from '../taskmaster/loop';
 import { startTaskmasterDeadmanChecker } from '@archon/overseer/taskmaster-deadman-check';
 import { startOperatorInboxConsumer } from '../dispatch/operator-inbox-consumer';
+import { startInboxReader, shouldStartOperatorInboxConsumer } from '../dispatch/inbox-reader';
 import {
   taskmasterStatusResponseSchema,
   taskmasterPauseBodySchema,
@@ -181,6 +197,8 @@ import * as messageDb from '@archon/core/db/messages';
 import * as dispatchDb from '@archon/core/db/dispatch';
 import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
 import * as boardAuthorityDb from '@archon/core/db/board-authority';
+import * as boardScopeApprovalDb from '@archon/core/db/board-scope-approvals';
+import { createRealOctokitClient } from '@archon/overseer/adapters/github-real-deps';
 import * as executionClaimsDb from '@archon/core/db/execution-claims';
 import * as mergeStewardDb from '@archon/core/db/merge-steward';
 import * as overseerBriefingDb from '@archon/core/db/overseer-briefing';
@@ -199,6 +217,7 @@ import { authenticateDispatchWorkerCredential } from '../auth/dispatch-worker-cr
 import {
   DispatchNonSystemCapability,
   DispatchPrincipalAuthError,
+  authenticateDispatchPrincipal,
   type DispatchSenderAuthMode,
 } from '../auth/dispatch-principal';
 import { createLogger as createDispatchRouteLogger } from '@archon/paths';
@@ -288,6 +307,11 @@ import {
   throttleResponseSchema,
 } from './schemas/admin.schemas';
 import {
+  fuelglassCutoffBodySchema,
+  fuelglassCutoffResponseSchema,
+  fuelglassSeatsResponseSchema,
+} from './schemas/fuelglass.schemas';
+import {
   claimDispatchMessageBodySchema,
   createDispatchMessageBodySchema,
   supersedeDispatchMessageBodySchema,
@@ -312,6 +336,11 @@ import {
   xoLeaseReleaseBodySchema,
   xoLeaseRenewBodySchema,
   xoLeaseSchema,
+  scopeApprovalRecordBodySchema,
+  scopeApprovalRevokeBodySchema,
+  scopeApprovalResponseSchema,
+  scopeApprovalPublicReadQuerySchema,
+  scopeApprovalPublicReadResponseSchema,
 } from './schemas/board-authority.schemas';
 import {
   acquireExecutionClaimBodySchema,
@@ -353,7 +382,12 @@ import {
   providerAttemptsQuerySchema,
   providerAttemptsResponseSchema,
 } from './schemas/provider-attempts.schemas';
-import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
+import {
+  getOpenRouterXaiRefusal,
+  getProviderInfoList,
+  isRegisteredProvider,
+  OPENROUTER_XAI_REFUSED_REASON,
+} from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 import { buildProductionCanarySnapshot } from '../services/canary-snapshot';
 
@@ -1035,6 +1069,82 @@ const boardRecipientRoute = createRoute({
       description: 'Board recipient resolution',
     },
     500: jsonError('Server error'),
+  },
+});
+
+const recordScopeApprovalRoute = createRoute({
+  method: 'post',
+  path: '/api/board/scope-approvals',
+  tags: ['Board Authority'],
+  summary: 'Record an exact-commit CE scope approval',
+  request: {
+    body: {
+      content: { 'application/json': { schema: scopeApprovalRecordBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: scopeApprovalResponseSchema } },
+      description: 'Existing approval',
+    },
+    201: {
+      content: { 'application/json': { schema: scopeApprovalResponseSchema } },
+      description: 'Approval recorded',
+    },
+    400: jsonError('Invalid request'),
+    401: jsonError('Principal rejected'),
+    403: jsonError('Seat not permitted'),
+    409: jsonError('Conflict'),
+    500: jsonError('Server error'),
+  },
+});
+
+const revokeScopeApprovalRoute = createRoute({
+  method: 'post',
+  path: '/api/board/scope-approvals/{approval_id}/revoke',
+  tags: ['Board Authority'],
+  summary: 'Revoke a CE scope approval',
+  request: {
+    params: z.object({ approval_id: z.string().min(1) }),
+    body: {
+      content: { 'application/json': { schema: scopeApprovalRevokeBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: scopeApprovalResponseSchema } },
+      description: 'Approval revoked',
+    },
+    400: jsonError('Invalid request'),
+    401: jsonError('Principal rejected'),
+    403: jsonError('Seat not permitted'),
+    404: jsonError('Approval not found'),
+    409: jsonError('Conflict'),
+    500: jsonError('Server error'),
+  },
+});
+
+const readScopeApprovalRoute = createRoute({
+  method: 'get',
+  path: '/api/public/board/scope-approvals',
+  tags: ['Board Authority'],
+  summary: 'Read an exact-commit CE scope approval decision',
+  request: { query: scopeApprovalPublicReadQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: scopeApprovalPublicReadResponseSchema } },
+      description: 'Decision',
+    },
+    400: {
+      content: { 'application/json': { schema: scopeApprovalPublicReadResponseSchema } },
+      description: 'Invalid query',
+    },
+    500: {
+      content: { 'application/json': { schema: scopeApprovalPublicReadResponseSchema } },
+      description: 'Store error',
+    },
   },
 });
 
@@ -1793,6 +1903,38 @@ const getAdminThrottleRoute = createRoute({
   },
 });
 
+const getFuelglassSeatsRoute = createRoute({
+  method: 'get',
+  path: '/api/fuelglass/seats',
+  tags: ['Admin'],
+  summary: 'Read measured subscription seat usage',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: fuelglassSeatsResponseSchema } },
+      description: 'Current seat readings and cutoff',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const postFuelglassCutoffRoute = createRoute({
+  method: 'post',
+  path: '/api/fuelglass/cutoff',
+  tags: ['Admin'],
+  summary: 'Set or clear the subscription seat cutoff override',
+  request: {
+    body: { content: { 'application/json': { schema: fuelglassCutoffBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: fuelglassCutoffResponseSchema } },
+      description: 'Cutoff updated',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
 const adminDrainRoute = createRoute({
   method: 'post',
   path: '/api/admin/drain',
@@ -2421,7 +2563,8 @@ export function registerApiRoutes(
   webAdapter: WebAdapter,
   lockManager: ConversationLockManager,
   activePlatforms?: readonly string[],
-  canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot
+  canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
+  dispatchMailboxActorResolvedHook?: () => Promise<void>
 ): void {
   function apiError(
     c: Context,
@@ -2482,6 +2625,79 @@ export function registerApiRoutes(
 
   function boardPrincipalProofFromHeaders(c: Context): boardAuthorityDb.BoardPrincipalProof {
     return { principal_token: c.req.header('x-board-principal-token')?.trim() };
+  }
+
+  class DispatchActorUnboundError extends Error {
+    constructor() {
+      super('dispatch_actor_unbound');
+    }
+  }
+
+  async function resolveDispatchMailboxActor(
+    c: Context
+  ): Promise<{ actor: string; bind?: dispatchDb.XoLeaseBind }> {
+    const identityHeaders = [
+      'x-dispatch-principal-id',
+      'x-dispatch-principal-token',
+      'x-board-principal-token',
+      'x-xo-holder-token',
+      'x-xo-lease-id',
+      'x-xo-fencing-token',
+    ];
+    const identityRequest = identityHeaders.some(name => c.req.header(name) !== undefined);
+    if (!identityRequest) return { actor: 'operator' };
+
+    const boardToken = c.req.header('x-board-principal-token')?.trim();
+    const holderToken = c.req.header('x-xo-holder-token')?.trim();
+    const leaseId = c.req.header('x-xo-lease-id')?.trim();
+    const fencingText = c.req.header('x-xo-fencing-token')?.trim();
+    if (boardToken || holderToken || leaseId || fencingText) {
+      if (!boardToken || !holderToken || !leaseId || !fencingText)
+        throw new DispatchActorUnboundError();
+      const fencingToken = Number(fencingText);
+      if (!Number.isSafeInteger(fencingToken) || fencingToken <= 0)
+        throw new DispatchActorUnboundError();
+      try {
+        const principal = await boardAuthorityDb.authenticateBoardPrincipal(
+          boardPrincipalProofFromHeaders(c)
+        );
+        const lease = await boardAuthorityDb.getCurrentXoLease();
+        if (
+          !lease ||
+          principal.seat_id !== 'xo' ||
+          lease.seat_id !== 'xo' ||
+          lease.principal_id !== principal.principal_id ||
+          lease.lease_id !== leaseId ||
+          lease.fencing_token !== fencingToken
+        )
+          throw new DispatchActorUnboundError();
+        await dispatchMailboxActorResolvedHook?.();
+        return {
+          actor: 'xo',
+          bind: {
+            kind: 'xo_lease',
+            lease_id: leaseId,
+            fencing_token: fencingToken,
+            holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
+            holder_principal_id: principal.principal_id,
+          },
+        };
+      } catch {
+        throw new DispatchActorUnboundError();
+      }
+    }
+
+    try {
+      const credential = authenticateDispatchPrincipal({
+        principal_id: c.req.header('x-dispatch-principal-id'),
+        token: c.req.header('x-dispatch-principal-token'),
+        require_send_role: false,
+      });
+      if (credential.principal_id === 'xo') throw new DispatchActorUnboundError();
+      return { actor: credential.principal_id };
+    } catch {
+      throw new DispatchActorUnboundError();
+    }
   }
 
   function parseDispatchJsonBody(body: string): unknown {
@@ -2843,11 +3059,15 @@ export function registerApiRoutes(
   const DEFAULT_BUILDER_MONITOR_URL =
     'https://n8n.bluedevilcollectibles.com/webhook/builder-status';
 
-  function workflowHasCodexNode(workflow: WorkflowDefinition): boolean {
-    return (
-      workflow.provider === 'codex' ||
-      (workflow.nodes ?? []).some(node => 'provider' in node && node.provider === 'codex')
-    );
+  function workflowHasCodexNode(
+    workflow: WorkflowDefinition,
+    modelOverride?: ModelOverride
+  ): boolean {
+    const workflowProvider = modelOverride?.workflow?.provider ?? workflow.provider;
+    return (workflow.nodes ?? []).some(node => {
+      const nodeOverride = modelOverride?.nodes?.[node.id];
+      return (nodeOverride?.provider ?? node.provider ?? workflowProvider) === 'codex';
+    });
   }
 
   async function postBuilderStatusAlert(
@@ -2878,11 +3098,62 @@ export function registerApiRoutes(
     }
   }
 
+  function openRouterXaiRefusalForRun(
+    workflow: WorkflowDefinition,
+    modelOverride?: ModelOverride
+  ): string | null {
+    const checks: { nodeId: string; provider?: string; model?: string }[] = [];
+    checks.push({
+      nodeId: 'workflow',
+      provider: modelOverride?.workflow?.provider ?? workflow.provider,
+      model: modelOverride?.workflow?.model ?? workflow.model,
+    });
+    if (workflow.failover_provider && workflow.failover_model) {
+      checks.push({
+        nodeId: 'workflow',
+        provider: workflow.failover_provider,
+        model: workflow.failover_model,
+      });
+    }
+    for (const node of workflow.nodes ?? []) {
+      const nodeOverride = modelOverride?.nodes?.[node.id];
+      const failover = node as { failover_provider?: string; failover_model?: string };
+      checks.push({
+        nodeId: node.id,
+        provider:
+          nodeOverride?.provider ??
+          node.provider ??
+          modelOverride?.workflow?.provider ??
+          workflow.provider,
+        model:
+          nodeOverride?.model ?? node.model ?? modelOverride?.workflow?.model ?? workflow.model,
+      });
+      if (failover.failover_provider && failover.failover_model) {
+        checks.push({
+          nodeId: node.id,
+          provider: failover.failover_provider,
+          model: failover.failover_model,
+        });
+      }
+    }
+    for (const check of checks) {
+      if (getOpenRouterXaiRefusal(check.provider, check.model)) {
+        return `openrouter_xai_refused:${check.nodeId}: ${OPENROUTER_XAI_REFUSED_REASON}`;
+      }
+    }
+    return null;
+  }
+
   async function validateWorkflowRunTarget(
     message: string,
-    codebaseId?: string | null
+    codebaseId?: string | null,
+    modelOverride?: ModelOverride
   ): Promise<
-    | { valid: true; isolationHints?: HandleMessageContext['isolationHints'] }
+    | {
+        valid: true;
+        isolationHints?: HandleMessageContext['isolationHints'];
+        workflow?: WorkflowDefinition;
+      }
     | { valid: false; error: string; httpStatus?: number }
   > {
     const match = WORKFLOW_RUN_COMMAND.exec(message.trim());
@@ -2946,6 +3217,10 @@ export function registerApiRoutes(
         error: `Workflow "${workflowName}" not found. Use GET /api/workflows to list available workflows.`,
       };
     }
+    const xaiRefusal = openRouterXaiRefusalForRun(workflow, modelOverride);
+    if (xaiRefusal) {
+      return { valid: false, error: xaiRefusal };
+    }
     // A branch override requests task-worktree isolation. A workflow that pins
     // `worktree.enabled: false` would run in the live checkout, so honoring the
     // override is impossible -- reject before anything is created.
@@ -2959,18 +3234,18 @@ export function registerApiRoutes(
         error: `Workflow "${workflowName}" runs in the live checkout (worktree.enabled: false); --from/--from-branch cannot be applied.`,
       };
     }
-    if (workflowHasCodexNode(workflow)) {
+    if (workflowHasCodexNode(workflow, modelOverride)) {
       getLog().info({ workflowName }, 'codex_dispatch_gate_consult');
       try {
         const gate = await checkCodexDispatchGate();
-        if (gate.fresh) return { valid: true, isolationHints };
+        if (gate.fresh) return { valid: true, isolationHints, workflow };
         getLog().warn({ workflowName, reason: gate.reason }, 'codex_dispatch_gate_refused');
       } catch (error) {
         getLog().warn({ err: error, workflowName }, 'codex_dispatch_gate_failed');
       }
       return { valid: false, error: 'codex_auth_stale', httpStatus: 503 };
     }
-    return { valid: true, isolationHints };
+    return { valid: true, isolationHints, workflow };
   }
 
   async function dispatchToOrchestrator(
@@ -3313,7 +3588,10 @@ export function registerApiRoutes(
     // Same scheduler skeleton (singleton + inFlight + env interval 0=off);
     // human surface is durable JSONL under ARCHON_HOME/operator-inbox/ --
     // Telegram/SMS stay dark per #1456. OPERATOR_INBOX_INTERVAL_MS default 60000.
-    startOperatorInboxConsumer();
+    if (shouldStartOperatorInboxConsumer(process.env)) {
+      startOperatorInboxConsumer();
+    }
+    startInboxReader();
   }
 
   // GET /api/taskmaster/status - pause state, epoch, tick health
@@ -4143,6 +4421,9 @@ export function registerApiRoutes(
         recipient: c.req.query('recipient') ?? undefined,
         status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
         subject_key: c.req.query('subject_key') ?? undefined,
+        route_disposition: c.req.query('route_disposition') as
+          | dispatchDb.DispatchRouteDisposition
+          | undefined,
         limit: Number.isFinite(rawLimit) ? rawLimit : 100,
         allowBoardAlias:
           c.req.query('recipient') !== undefined &&
@@ -4162,6 +4443,9 @@ export function registerApiRoutes(
           recipient: c.req.query('recipient') ?? undefined,
           status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
           subject_key: c.req.query('subject_key') ?? undefined,
+          route_disposition: c.req.query('route_disposition') as
+            | dispatchDb.DispatchRouteDisposition
+            | undefined,
           limit: Number.isFinite(rawLimit) ? rawLimit : 100,
           allowBoardAlias: false,
         });
@@ -4203,15 +4487,25 @@ export function registerApiRoutes(
   registerOpenApiRoute(acknowledgeDispatchMessageRoute, async c => {
     try {
       const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const { actor, bind } = await resolveDispatchMailboxActor(c);
+      if (
+        body.principal_id !== undefined &&
+        body.principal_id !== actor &&
+        body.principal_id !== bind?.holder_principal_id
+      )
+        return apiError(c, 409, 'actor_mismatch');
       const result = await dispatchDb.acknowledgeMessage({
         id: c.req.param('id') ?? '',
-        principal_id: body.principal_id,
+        principal_id: actor,
+        bind,
       });
       if (!result.ok) {
         return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
       }
       return c.json(result.message);
     } catch (error) {
+      if (error instanceof DispatchActorUnboundError)
+        return apiError(c, 401, 'dispatch_actor_unbound');
       getLog().error({ err: error }, 'dispatch_acknowledge_message_failed');
       return apiError(c, 500, 'Failed to acknowledge dispatch message');
     }
@@ -4220,15 +4514,25 @@ export function registerApiRoutes(
   registerOpenApiRoute(addressDispatchMessageRoute, async c => {
     try {
       const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const { actor, bind } = await resolveDispatchMailboxActor(c);
+      if (
+        body.principal_id !== undefined &&
+        body.principal_id !== actor &&
+        body.principal_id !== bind?.holder_principal_id
+      )
+        return apiError(c, 409, 'actor_mismatch');
       const result = await dispatchDb.addressMessage({
         id: c.req.param('id') ?? '',
-        principal_id: body.principal_id,
+        principal_id: actor,
+        bind,
       });
       if (!result.ok) {
         return apiError(c, result.reason === 'not_found' ? 404 : 409, result.reason);
       }
       return c.json(result.message);
     } catch (error) {
+      if (error instanceof DispatchActorUnboundError)
+        return apiError(c, 401, 'dispatch_actor_unbound');
       getLog().error({ err: error }, 'dispatch_address_message_failed');
       return apiError(c, 500, 'Failed to address dispatch message');
     }
@@ -4352,9 +4656,12 @@ export function registerApiRoutes(
       const staleAfterMs = Number.isFinite(rawStaleAfterMs)
         ? Math.max(1, Math.min(rawStaleAfterMs, 86_400_000))
         : dispatchDb.DEFAULT_WORKER_STALE_AFTER_MS;
-      const [workers, messages] = await Promise.all([
+      // mailboxDepthByPrincipal supplies the exclusive cutover buckets, including
+      // surfaced_unacked and surfaced_acked, over the full table rather than this page.
+      const [workers, messages, mailbox] = await Promise.all([
         dispatchDb.listWorkers(staleAfterMs),
         dispatchDb.listMessages({ limit: 500 }),
+        dispatchDb.mailboxDepthByPrincipal(),
       ]);
       const queue: Record<dispatchDb.DispatchMessageStatus, number> = {
         queued: 0,
@@ -4398,6 +4705,8 @@ export function registerApiRoutes(
         worker_stale_after_ms: staleAfterMs,
         workers,
         queue,
+        worker_lifecycle: queue,
+        mailbox,
         operator_reports: messages
           .filter(message => message.task_type === 'run_report' && !isExecutionHandoff(message))
           .map(item),
@@ -4523,6 +4832,191 @@ export function registerApiRoutes(
       return apiError(c, 500, 'Failed to resolve board recipient');
     }
   });
+
+  registerOpenApiRoute(recordScopeApprovalRoute, async c => {
+    try {
+      const body = getValidatedBody(c, scopeApprovalRecordBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
+      const octokit = createRealOctokitClient();
+      const result = await boardScopeApprovalDb.recordScopeApproval({
+        principal,
+        proof: body,
+        repo: body.repo,
+        pr_number: body.pr_number,
+        head_sha: body.head_sha,
+        conditions: body.conditions,
+        evidence_url: body.evidence_url,
+        github: {
+          getPullRequest: async (repo, prNumber) => {
+            const [owner, name] = repo.split('/');
+            const response = await octokit.pulls.get({
+              owner: owner,
+              repo: name,
+              pull_number: prNumber,
+            });
+            if (!response.data.head.ref || !response.data.base?.sha || !response.data.base.ref)
+              throw new Error('github_pr_facts_incomplete');
+            return {
+              state: response.data.state,
+              head: { sha: response.data.head.sha, ref: response.data.head.ref },
+              base: { sha: response.data.base.sha, ref: response.data.base.ref },
+            };
+          },
+        },
+      });
+      if (!result.ok) {
+        const status =
+          result.reason === 'seat_not_permitted'
+            ? 403
+            : result.reason === 'repo_not_allowed' || result.reason === 'invalid_request'
+              ? 400
+              : 409;
+        return apiError(c, status, result.reason);
+      }
+      return c.json({ approval: result.approval }, result.created ? 201 : 200);
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'board_scope_approval_record_failed');
+      return apiError(c, 500, 'Failed to record scope approval');
+    }
+  });
+
+  registerOpenApiRoute(revokeScopeApprovalRoute, async c => {
+    try {
+      const body = getValidatedBody(c, scopeApprovalRevokeBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
+      const approvalId = c.req.param('approval_id');
+      if (!approvalId) return apiError(c, 400, 'invalid_approval_id');
+      const result = await boardScopeApprovalDb.revokeScopeApproval({
+        principal,
+        proof: body,
+        approval_id: approvalId,
+        reason: body.reason,
+      });
+      if (!result.ok) {
+        if (result.reason === 'invalid_request') return apiError(c, 400, result.reason);
+        if (result.reason === 'seat_not_permitted') return apiError(c, 403, result.reason);
+        if (result.reason === 'approval_not_found') return apiError(c, 404, result.reason);
+        return apiError(c, 409, result.reason);
+      }
+      let rerun: 'requested' | 'unavailable' | 'failed' = 'unavailable';
+      try {
+        const octokit = createRealOctokitClient();
+        const [owner, repo] = result.approval.repo.split('/');
+        const pr = await octokit.pulls.get({
+          owner: owner,
+          repo: repo,
+          pull_number: result.approval.pr_number,
+        });
+        if (!pr.data.head.ref) throw new Error('github_pr_head_ref_missing');
+        const actions = (
+          octokit as unknown as {
+            actions: {
+              listWorkflowRunsForRepo(input: Record<string, unknown>): Promise<{
+                data: {
+                  workflow_runs: {
+                    id: number;
+                    path?: string;
+                    head_sha?: string | null;
+                    head_branch?: string | null;
+                    run_started_at?: string | null;
+                  }[];
+                };
+              }>;
+              reRunWorkflow(input: Record<string, unknown>): Promise<unknown>;
+            };
+          }
+        ).actions;
+        const workflowRuns: {
+          id: number;
+          path?: string;
+          head_sha?: string | null;
+          head_branch?: string | null;
+          run_started_at?: string | null;
+        }[] = [];
+        for (let page = 1; ; page++) {
+          const runs = await actions.listWorkflowRunsForRepo({
+            owner: owner,
+            repo: repo,
+            // PR HEAD, not base: pull_request_target run objects carry the PR head sha
+            // (live-verified; packages/overseer/src/__tests__/fixtures/pull-request-target-run.live-2026-09-28.json).
+            // The LIVE PR head: a revoke must invalidate the gate that currently
+            // guards the PR, not a gate run for the (possibly older) approved head.
+            head_sha: pr.data.head.sha,
+            event: 'pull_request_target',
+            per_page: 100,
+            page,
+          });
+          workflowRuns.push(...runs.data.workflow_runs);
+          if (runs.data.workflow_runs.length < 100) break;
+        }
+        const trusted = workflowRuns
+          .filter(
+            run =>
+              run.path === '.github/workflows/ce-change-scope-gate.yml' &&
+              run.head_sha === pr.data.head.sha &&
+              run.head_branch === pr.data.head.ref
+          )
+          .sort((a, b) => String(b.run_started_at).localeCompare(String(a.run_started_at)))[0];
+        if (trusted) {
+          await actions.reRunWorkflow({ owner: owner, repo: repo, run_id: trusted.id });
+          rerun = 'requested';
+        }
+      } catch (error) {
+        rerun =
+          typeof error === 'object' && error !== null && 'status' in error && error.status === 403
+            ? 'unavailable'
+            : 'failed';
+      }
+      const credentialClass = 'existing_github_credential';
+      // Secret-free audit trail: record the credential class used for the
+      // gate rerun and the rerun outcome. No tokens or secrets are logged --
+      // only the credential class label, the rerun status, and non-sensitive
+      // approval identifiers.
+      getLog().info(
+        {
+          approvalId: result.approval.approval_id,
+          repo: result.approval.repo,
+          prNumber: result.approval.pr_number,
+          credentialClass,
+          rerun,
+        },
+        'board_scope_approval_revoke_completed'
+      );
+      return c.json({
+        approval: result.approval,
+        rerun,
+        credential_class: credentialClass,
+      });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'board_scope_approval_revoke_failed');
+      return apiError(c, 500, 'Failed to revoke scope approval');
+    }
+  });
+
+  app.openapi(
+    readScopeApprovalRoute,
+    async c => {
+      try {
+        const url = new URL(c.req.url);
+        const query = scopeApprovalPublicReadQuerySchema.parse(
+          Object.fromEntries(url.searchParams)
+        );
+        return c.json(await boardScopeApprovalDb.getScopeApprovalDecision(query));
+      } catch (error) {
+        if (error instanceof z.ZodError)
+          return c.json({ decision: 'deny' as const, reason: 'invalid_query' as const }, 400);
+        getLog().error({ err: error }, 'board_scope_approval_read_failed');
+        return c.json({ decision: 'deny' as const, reason: 'server_error' as const }, 500);
+      }
+    },
+    (result, c) => {
+      if (!result.success)
+        return c.json({ decision: 'deny' as const, reason: 'invalid_query' as const }, 400);
+      return undefined;
+    }
+  );
 
   // =======================================================================
   // Execution claim handlers (M-27B)
@@ -5384,7 +5878,25 @@ export function registerApiRoutes(
     try {
       const drainRejection = await rejectNewDispatchIfDraining(c);
       if (drainRejection) return drainRejection;
-      const { conversationId, message, conductor } = getValidatedBody(c, runWorkflowBodySchema);
+      const { conversationId, message, conductor, modelOverride } = getValidatedBody(
+        c,
+        runWorkflowBodySchema
+      );
+      if (modelOverride && conductor) {
+        return c.json({ accepted: false, error: 'model_override_conductor_conflict' }, 400);
+      }
+      const overrideBindings = modelOverride
+        ? [
+            ...(modelOverride.workflow ? [modelOverride.workflow] : []),
+            ...Object.values(modelOverride.nodes ?? {}),
+          ]
+        : [];
+      if (overrideBindings.some(binding => binding.model.length === 0)) {
+        return c.json({ accepted: false, error: 'model_override_empty_model' }, 400);
+      }
+      if (overrideBindings.some(binding => binding.provider === '')) {
+        return c.json({ accepted: false, error: 'model_override_empty_provider' }, 400);
+      }
       // Persist user message and register DB ID (same as message endpoint).
       // /run callers may provide a fresh platform conversation id; create that
       // row up front so workflow dispatch can attach a run and web persistence
@@ -5432,7 +5944,10 @@ export function registerApiRoutes(
           token: c.req.header('x-archon-operator-token') ?? process.env.ARCHON_OPERATOR_TOKEN ?? '',
         };
         if (cascadeOptions.dryRun) {
-          const record = await runCascade(cascadeOptions);
+          const record = await runCascade({
+            ...cascadeOptions,
+            deps: { seatUsage: conductorSeatUsage },
+          });
           return c.json({
             accepted: true,
             status: record.status,
@@ -5459,6 +5974,7 @@ export function registerApiRoutes(
               );
               if (!check.valid) throw new Error(check.error);
             },
+            seatUsage: conductorSeatUsage,
           },
           onAdmission: record => resolveAdmission?.(record),
         });
@@ -5479,7 +5995,7 @@ export function registerApiRoutes(
       }
 
       const fullMessage = `/workflow run ${workflowName} ${message}`;
-      const check = await validateWorkflowRunTarget(fullMessage, conv?.codebase_id);
+      const check = await validateWorkflowRunTarget(fullMessage, conv?.codebase_id, modelOverride);
       if (!check.valid) {
         if (check.httpStatus === 503 && check.error === 'codex_auth_stale') {
           void postBuilderStatusAlert(
@@ -5490,6 +6006,31 @@ export function registerApiRoutes(
           return c.json({ error: 'codex_auth_stale' }, 503);
         }
         return c.json({ accepted: false, error: check.error }, 400);
+      }
+      if (modelOverride) {
+        if (!check.workflow) {
+          return c.json({ accepted: false, error: 'model_override_workflow_unavailable' }, 400);
+        }
+        const unknownProvider = overrideBindings.find(
+          binding => binding.provider && !isRegisteredProvider(binding.provider)
+        )?.provider;
+        if (unknownProvider) {
+          return c.json(
+            {
+              accepted: false,
+              error: `model_override_unknown_provider:${unknownProvider}`,
+            },
+            400
+          );
+        }
+        const nodeIds = new Set(check.workflow.nodes.map(node => node.id));
+        const unknownNode = Object.keys(modelOverride.nodes ?? {}).find(id => !nodeIds.has(id));
+        if (unknownNode) {
+          return c.json(
+            { accepted: false, error: `model_override_unknown_node:${unknownNode}` },
+            400
+          );
+        }
       }
 
       // Duplicate-fire guard (bdc-xo#1546): refuse a NEW independent fire while
@@ -5521,7 +6062,7 @@ export function registerApiRoutes(
         }
       }
 
-      const result = await dispatchToOrchestrator(conversationId, fullMessage);
+      const result = await dispatchToOrchestrator(conversationId, fullMessage, { modelOverride });
       return c.json(result);
     } catch (error) {
       getLog().error({ err: error }, 'run_workflow_failed');
@@ -5863,6 +6404,65 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'admin_throttle_api_failed');
       return apiError(c, 500, 'Failed to update throttle state');
+    }
+  });
+
+  registerOpenApiRoute(getFuelglassSeatsRoute, async c => {
+    try {
+      const seats = await readAllSeats();
+      const cutoff = getSeatCutoff();
+      let cutoffResponse: {
+        percent: number;
+        source: 'operator' | 'env' | 'default';
+        set_at?: string;
+        set_by?: string;
+      } = cutoff;
+      if (cutoff.source === 'operator') {
+        const row = await getOperatorSetting(FUELGLASS_SEAT_CUTOFF_SETTING_KEY);
+        if (row) {
+          cutoffResponse = {
+            percent: cutoff.percent,
+            source: cutoff.source,
+            set_at: row.updated_at,
+            set_by: row.updated_by,
+          };
+        }
+      }
+      return c.json({
+        success: true,
+        generated_at: new Date().toISOString(),
+        cutoff: cutoffResponse,
+        // The gate has no off switch (John Ranson, 2026-09-24).
+        gate_enabled: true,
+        seats,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'get_fuelglass_seats_api_failed');
+      return apiError(c, 500, 'Failed to read seat usage');
+    }
+  });
+
+  registerOpenApiRoute(postFuelglassCutoffRoute, async c => {
+    try {
+      const body = getValidatedBody(c, fuelglassCutoffBodySchema);
+      if (body.percent !== null && !isValidSeatCutoff(body.percent)) {
+        return apiError(c, 400, `${SEAT_CUTOFF_OUT_OF_RANGE}: percent must be between 1 and 95`);
+      }
+      if (body.percent === null) {
+        await clearOperatorSetting(FUELGLASS_SEAT_CUTOFF_SETTING_KEY);
+      } else {
+        await setOperatorSetting(
+          FUELGLASS_SEAT_CUTOFF_SETTING_KEY,
+          String(body.percent),
+          'operator-token',
+          body.reason ?? null
+        );
+      }
+      setSeatCutoffOverride(body.percent);
+      return c.json({ success: true, cutoff: getSeatCutoff() });
+    } catch (error) {
+      getLog().error({ err: error }, 'fuelglass_cutoff_api_failed');
+      return apiError(c, 500, 'Failed to update seat cutoff');
     }
   });
 

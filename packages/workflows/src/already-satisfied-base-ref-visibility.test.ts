@@ -23,7 +23,7 @@ registerCommunityProviders();
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 
-// The 12 lanes that carry the check-already-satisfied precheck node (spec Section 5).
+// The 15 lanes that carry the check-already-satisfied precheck node (spec Section 5).
 // Hardcoded on purpose: this is the tripwire that forces a NEW lane to be given the
 // base-ref precheck rather than silently inheriting the old worktree-only prompt.
 // Kimi canary lanes added here 2026-07-25 -- they were cloned from fusion-cx-qwen
@@ -31,6 +31,7 @@ const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 // "Do NOT consult origin/main" instruction and no BASE_CHECK. This test caught that
 // before merge; the fix was ported into both.
 const EXPECTED_PRECHECK_LANES = [
+  'bdc-feature-development-astra.yaml',
   'bdc-feature-development-codex-only.yaml',
   'bdc-feature-development-codex.yaml',
   'bdc-feature-development-cursor.yaml',
@@ -244,6 +245,7 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
     // old broken gate and were correctly excluded by the filter above. Their
     // presence in this list is the evidence that both ports took.
     expect(JSON_GATE_FEATURE_LANES).toEqual([
+      'bdc-feature-development-astra.yaml',
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-cursor.yaml',

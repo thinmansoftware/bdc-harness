@@ -18,9 +18,8 @@ import { runCascade } from '../cascade.js';
 import type { CascadeDeps } from '../cascade.js';
 
 describe('live ladder SOR', () => {
-  // 'cursor' inserted below codex by WO-HARNESS-CURSOR-BUILD-SEAT-01. It ships
-  // in refusedTiers (see below), so it is present in the ladder but dark --
-  // live cascade behavior is unchanged.
+  // 'cursor' inserted below codex by WO-HARNESS-CURSOR-BUILD-SEAT-01; flipped
+  // LIVE 2026-09-29 (removed from refusedTiers).
   test('canonical ladder name order is zero -> qwen -> cursor -> codex -> claude -> frontier', () => {
     const names = loadLadder().map(t => t.name);
     expect(names).toEqual(['zero', 'qwen', 'cursor', 'codex', 'claude', 'frontier']);
@@ -32,13 +31,17 @@ describe('live ladder SOR', () => {
     expect(refused).toContain('glm');
   });
 
-  // The entry floor is what actually governs live routing, and it must NOT
-  // move because a dark tier was inserted ahead of codex in the ordering.
-  test('cursor ships dark, so the first non-refused tier is still codex', () => {
+  // M-20260929h: cursor and zero are live; qwen and glm stay refused. zero is
+  // first in the ladder, so it is the entry floor.
+  test('cursor and zero are live, glm/qwen stay refused, zero is the entry floor', () => {
     const refused = loadRefusedTiers();
-    expect(refused).toContain('cursor');
+    expect(refused).not.toContain('cursor');
+    expect(refused).not.toContain('zero');
+    expect(refused).toContain('qwen');
+    expect(refused).toContain('glm');
+    expect([...refused].sort()).toEqual(['glm', 'qwen']);
     const firstLive = loadLadder().find(t => !refused.includes(t.name));
-    expect(firstLive?.name).toBe('codex');
+    expect(firstLive?.name).toBe('zero');
   });
 });
 
@@ -47,6 +50,18 @@ describe('live ruleset routing', () => {
     const ruleset = loadRuleset();
     const entry = pickEntryTier({ woClass: 'CODE', tags: ['mechanical'] }, ruleset);
     expect(entry).toBe('zero');
+  });
+
+  test('plain CODE and no-match default enter cursor (2026-09-29 default lane)', () => {
+    const ruleset = loadRuleset();
+    expect(pickEntryTier({ woClass: 'CODE' }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['docs'] }, ruleset)).toBe('cursor');
+    expect(ruleset.defaultEntry).toBe('cursor');
+  });
+
+  test('feature-tagged CODE still enters codex', () => {
+    const ruleset = loadRuleset();
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['feature'] }, ruleset)).toBe('codex');
   });
 
   test('INFRA routes stronger (claude)', () => {

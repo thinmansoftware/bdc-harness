@@ -10,10 +10,11 @@ import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/p
 import { execFileAsync, getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
 import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
+import { resolveModelForNode, type ModelOverride } from './model-override';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
-import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
+import { isRegisteredProvider, getRegisteredProviders, resolveProviderId } from '@archon/providers';
 import { classifyError } from './executor-shared';
 import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
 import { resolveEntryLane, DEFAULT_ENGINE_TO_LANE } from './router-dispatcher';
@@ -27,6 +28,16 @@ import {
 import { captureRuntimeRevisions } from './reliability/runtime-revisions';
 import { formatProbeBlock, runFireTimeProbe } from './reliability/fire-time-probe';
 import {
+  alertUnknownSeat,
+  decideSeatGate,
+  getSeatCutoff,
+  getSeatUsageReader,
+  seatsForBindings,
+  unknownSeatReading,
+  type SeatId,
+  type SeatReading,
+} from './reliability/seat-usage';
+import {
   renderCanaryProbeRed,
   renderCanaryProbeWarn,
   sendCanaryTelegramAlert,
@@ -37,6 +48,32 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.executor');
   return cachedLog;
+}
+
+async function readBoundSeats(
+  seatIds: readonly SeatId[]
+): Promise<Partial<Record<SeatId, SeatReading>>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>(resolve => {
+    timer = setTimeout(() => {
+      resolve(null);
+    }, 12_000);
+  });
+  let note = 'seat read timed out';
+  try {
+    const result = await Promise.race([getSeatUsageReader()(seatIds), timeout]);
+    if (result) return result;
+  } catch (err) {
+    getLog().warn({ err: err as Error }, 'workflow.seat_usage_unknown');
+    note = err instanceof Error ? err.message : 'seat read failed';
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  const unknown: Partial<Record<SeatId, SeatReading>> = {};
+  for (const seat of seatIds) {
+    unknown[seat] = unknownSeatReading(seat, note);
+  }
+  return unknown;
 }
 
 async function pageCanaryTelegram(text: string, context: Record<string, unknown>): Promise<void> {
@@ -507,7 +544,8 @@ export async function executeWorkflow(
   },
   parentConversationId?: string,
   preCreatedRun?: WorkflowRun,
-  authoritySource?: RunAuthorityDispatch
+  authoritySource?: RunAuthorityDispatch,
+  modelOverride?: ModelOverride
 ): Promise<WorkflowExecutionResult> {
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
@@ -538,33 +576,6 @@ export async function executeWorkflow(
   }
 
   const docsDir = config.docsPath ?? 'docs/';
-
-  // Resolve provider and model once (used by all nodes).
-  // Provider is explicit: node.provider ?? workflow.provider ?? config.assistant.
-  // Model strings pass through to the SDK as-is -- the SDK validates at request time.
-  const resolvedProvider: string = workflow.provider ?? config.assistant;
-  const providerSource = workflow.provider ? 'workflow definition' : 'config';
-  if (!isRegisteredProvider(resolvedProvider)) {
-    throw new Error(
-      `Workflow '${workflow.name}': unknown provider '${resolvedProvider}'. ` +
-        `Registered: ${getRegisteredProviders()
-          .map(p => p.id)
-          .join(', ')}`
-    );
-  }
-  const assistantDefaults = config.assistants[resolvedProvider];
-  const resolvedModel =
-    workflow.model ?? (assistantDefaults?.model as string | undefined) ?? 'claude-sonnet-4-5';
-
-  getLog().info(
-    {
-      workflowName: workflow.name,
-      provider: resolvedProvider,
-      providerSource,
-      model: resolvedModel,
-    },
-    'workflow_provider_resolved'
-  );
 
   if (configuredCommandFolder) {
     getLog().debug({ configuredCommandFolder }, 'command_folder_configured');
@@ -729,7 +740,10 @@ export async function executeWorkflow(
         codebase_id: codebaseId,
         user_message: userMessage,
         working_path: cwd,
-        metadata: issueContext ? { github_context: issueContext } : {},
+        metadata: {
+          ...(issueContext ? { github_context: issueContext } : {}),
+          ...(modelOverride ? { model_override: modelOverride } : {}),
+        },
         parent_conversation_id: parentConversationId,
       });
     } catch (error) {
@@ -746,6 +760,49 @@ export async function executeWorkflow(
       return { success: false, error: 'Database error creating workflow run' };
     }
   }
+
+  // A resumed run always keeps the binding selected when it was first fired.
+  const persistedModelOverride = workflowRun.metadata?.model_override;
+  if (persistedModelOverride && typeof persistedModelOverride === 'object') {
+    modelOverride = persistedModelOverride as ModelOverride;
+  }
+
+  const assistantModels = Object.fromEntries(
+    Object.entries(config.assistants).map(([provider, assistant]) => [
+      provider,
+      assistant?.model as string | undefined,
+    ])
+  );
+  const workflowBinding = resolveModelForNode({
+    nodeId: '__workflow__',
+    workflowProvider: workflow.provider ?? config.assistant,
+    workflowModel: workflow.model,
+    assistantModels,
+    modelOverride,
+    fallbackModel: 'claude-sonnet-4-5',
+  });
+  // Model resolution above used the id as written (assistants.grok still applies).
+  // Recorded provider ids use the canonical id.
+  const writtenProvider = workflowBinding.provider;
+  const resolvedProvider = resolveProviderId(writtenProvider);
+  const resolvedModel = workflowBinding.model;
+  if (!isRegisteredProvider(writtenProvider)) {
+    throw new Error(
+      `Workflow '${workflow.name}': unknown provider '${writtenProvider}'. ` +
+        `Registered: ${getRegisteredProviders()
+          .map(p => p.id)
+          .join(', ')}`
+    );
+  }
+  getLog().info(
+    {
+      workflowName: workflow.name,
+      provider: resolvedProvider,
+      providerSource: modelOverride?.workflow ? 'run override' : 'workflow definition or config',
+      model: resolvedModel,
+    },
+    'workflow_provider_resolved'
+  );
 
   // Path-lock guard: ensure no other workflow run holds this working_path.
   //
@@ -996,12 +1053,13 @@ export async function executeWorkflow(
 
     const probeDecision = await runFireTimeProbe(deps, {
       workflow: executableWorkflow,
-      workflowProvider: resolvedProvider,
+      workflowProvider: writtenProvider,
       workflowModel: resolvedModel,
       config,
       cwd,
       source: 'fire_probe',
       allowFireReprobeClear: true,
+      modelOverride,
     });
     for (const warning of probeDecision.warnings) {
       if (!warning.ok) {
@@ -1067,6 +1125,70 @@ export async function executeWorkflow(
       await deps.store.failWorkflowRun(workflowRun.id, reason);
       await sendCriticalMessage(platform, conversationId, `[ ] **Workflow blocked**: ${reason}`);
       return { success: false, workflowRunId: workflowRun.id, error: reason };
+    }
+
+    // Seat gate: always on (John Ranson, 2026-09-24). There is no off switch.
+    const seatIds = seatsForBindings(probeDecision.bindings);
+    if (seatIds.length > 0) {
+      const readings = await readBoundSeats(seatIds);
+      const cutoff = getSeatCutoff();
+      const seatDecision = decideSeatGate(probeDecision.bindings, readings, cutoff.percent);
+      // UNKNOWN never refuses on its own (a broken probe must not stop all
+      // work), and it is never silent either: log + alert for every bound
+      // seat that could not be measured, regardless of whether ANOTHER seat
+      // in this same run causes a refusal below.
+      for (const seat of seatDecision.unknownSeats) {
+        const note = readings[seat]?.note ?? 'UNKNOWN';
+        getLog().warn(
+          {
+            workflowName: executableWorkflow.name,
+            workflowRunId: workflowRun.id,
+            seat,
+            note,
+          },
+          'workflow.seat_usage_unknown'
+        );
+        await alertUnknownSeat(seat, note, {
+          workflowName: executableWorkflow.name,
+          workflowRunId: workflowRun.id,
+        });
+      }
+      if (seatDecision.refused) {
+        const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}`;
+        getLog().warn(
+          {
+            workflowName: executableWorkflow.name,
+            workflowRunId: workflowRun.id,
+            seat: seatDecision.seat,
+            window: seatDecision.window,
+            usedPercent: seatDecision.usedPercent,
+            cutoffPercent: seatDecision.cutoffPercent,
+          },
+          'workflow.seat_usage_refused'
+        );
+        await deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'dag_workflow_failed',
+            data: {
+              reason: 'seat_usage_refused',
+              detail,
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
+              'workflow_event_persist_failed'
+            );
+          });
+        await deps.store.failWorkflowRun(workflowRun.id, detail);
+        await sendCriticalMessage(
+          platform,
+          conversationId,
+          `Workflow refused: seat ${seatDecision.seat} at ${String(seatDecision.usedPercent)}% of ${seatDecision.window} (cutoff ${String(seatDecision.cutoffPercent)}%)`
+        );
+        return { success: false, workflowRunId: workflowRun.id, error: detail };
+      }
     }
 
     getLog().info(
@@ -1210,7 +1332,7 @@ export async function executeWorkflow(
       cwd,
       executableWorkflow,
       workflowRun,
-      resolvedProvider,
+      writtenProvider,
       resolvedModel,
       artifactsDir,
       logDir,
@@ -1219,7 +1341,8 @@ export async function executeWorkflow(
       config,
       configuredCommandFolder,
       issueContext,
-      dagPriorCompletedNodes
+      dagPriorCompletedNodes,
+      modelOverride
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

@@ -10,6 +10,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   createRealSubmitDeps,
   isExactHeadCiGreen,
+  maybeRecordReviewApprovalVerdict,
+  recordReviewApprovalVerdict,
   REVIEW_REVIEWER_IDENTITY_ENV,
   REVIEW_WEBHOOK_SECRET_ENV,
   parseReviewWorkBody,
@@ -79,7 +81,176 @@ const work = {
   author: 'contributor',
 };
 
+describe('PR review approval verdict recording', () => {
+  test('records one merge-ready runless verdict with the reviewed head and PR URL', async () => {
+    const claims: unknown[] = [];
+    const finalizations: unknown[] = [];
+    await recordReviewApprovalVerdict(
+      {
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 42,
+        headSha: HEAD,
+        model: 'review-model',
+      },
+      {
+        claimVerdict: async input => {
+          claims.push(input);
+          return { claimed: true, verdictId: 'verdict-1', retryCount: 0 };
+        },
+        finalizeVerdict: async input => {
+          finalizations.push(input);
+          return {} as never;
+        },
+      }
+    );
+
+    expect(claims).toEqual([
+      {
+        runId: 'pr-discovery:thinmansoftware/bdc-harness#42',
+        woId: 'pr-discovery:thinmansoftware/bdc-harness#42',
+        headSha: HEAD,
+      },
+    ]);
+    expect(finalizations).toEqual([
+      {
+        verdictId: 'verdict-1',
+        status: 'verdict',
+        verdict: 'merge_candidate',
+        proposedAction: 'flag_merge_ready',
+        model: 'review-model',
+        prUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/42',
+      },
+    ]);
+  });
+
+  test('a repeated approval at the same head is a no-op after the claim loses', async () => {
+    let finalized = 0;
+    await recordReviewApprovalVerdict(
+      { owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
+      {
+        claimVerdict: async () => ({ claimed: false }),
+        finalizeVerdict: async () => {
+          finalized += 1;
+          return {} as never;
+        },
+      }
+    );
+    expect(finalized).toBe(0);
+  });
+
+  test.each([
+    ['REQUEST_CHANGES', { disposition: 'changes_requested' }],
+    [
+      'INDETERMINATE',
+      { disposition: 'changes_requested', reason: 'indeterminate:usage_limit_until' },
+    ],
+  ] as const)('%s does not record a verdict', async (_verdict, outcome) => {
+    let recorded = 0;
+    await maybeRecordReviewApprovalVerdict(
+      { ...outcome, owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
+      {
+        record: async () => {
+          recorded += 1;
+        },
+      }
+    );
+    expect(recorded).toBe(0);
+  });
+
+  test('kill switch false suppresses an approved verdict', async () => {
+    let recorded = 0;
+    await maybeRecordReviewApprovalVerdict(
+      { disposition: 'approved', owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
+      {
+        env: { OVERSEER_REVIEW_RECORDS_VERDICT: ' false ' },
+        record: async () => {
+          recorded += 1;
+        },
+      }
+    );
+    expect(recorded).toBe(0);
+  });
+
+  test('store errors are reported and swallowed', async () => {
+    const errors: unknown[] = [];
+    await expect(
+      maybeRecordReviewApprovalVerdict(
+        { disposition: 'approved', owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
+        {
+          record: async () => {
+            throw new Error('db unavailable');
+          },
+          onError: error => errors.push(error),
+        }
+      )
+    ).resolves.toBeUndefined();
+    expect(errors).toHaveLength(1);
+    expect(String(errors[0])).toContain('db unavailable');
+  });
+});
+
 describe('createRealSubmitDeps -- evaluator binding', () => {
+  test('records an approved receipt with the resolved review model', async () => {
+    const recorded: Parameters<typeof recordReviewApprovalVerdict>[0][] = [];
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      reviewerModel: 'resolved-review-model',
+      createReceiptMessage: async () => ({}) as never,
+      recordApprovalVerdict: async input => {
+        recorded.push(input);
+      },
+    });
+
+    await deps.recordReceipt({
+      correlationId: 'correlation-1',
+      messageId: 'message-1',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 42,
+      headSha: HEAD,
+      disposition: 'approved',
+    });
+
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toMatchObject({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 42,
+      headSha: HEAD,
+      model: 'resolved-review-model',
+    });
+  });
+
+  test('records an approved receipt and resolves when the verdict store throws or rejects', async () => {
+    for (const asyncFailure of [false, true]) {
+      const receipts: unknown[] = [];
+      let verdictAttempts = 0;
+      const deps = createRealSubmitDeps('review-app[bot]', {
+        octokit: submitOctokit(),
+        recordApprovalVerdict: () => {
+          verdictAttempts += 1;
+          const error = new Error('verdict store unavailable');
+          if (asyncFailure) return Promise.reject(error);
+          throw error;
+        },
+        createReceiptMessage: async (_authority, input) => {
+          receipts.push(JSON.parse(input.body));
+          return {} as never;
+        },
+      });
+      const receipt = {
+        ...work,
+        disposition: 'approved' as const,
+        event: 'APPROVE' as const,
+      };
+
+      await expect(deps.recordReceipt(receipt)).resolves.toBeUndefined();
+      expect(verdictAttempts).toBe(1);
+      expect(receipts).toEqual([{ kind: 'pr_review_submit_receipt', ...receipt }]);
+    }
+  });
+
   test.each([
     ['APPROVE', true],
     ['REQUEST_CHANGES', false],
@@ -87,6 +258,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
   ] as const)('maps %s to approved=%s', async (verdict, approved) => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       evaluate: async () =>
         reviewResult({
           verdict,
@@ -103,6 +275,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
   test('maps CHECKS_PENDING to a distinct checksPending signal, not approved=false', async () => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       evaluate: async () => reviewResult({ verdict: 'CHECKS_PENDING', error: 'checks_pending' }),
     });
 
@@ -118,6 +291,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
   test('maps CHECKS_UNAVAILABLE to a terminal, non-approving blocked signal (#775)', async () => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       patOctokit: null,
       evaluate: async () =>
         reviewResult({
@@ -142,6 +316,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
   test('the blocked summary names the transient cause when that is what failed', async () => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       patOctokit: null,
       evaluate: async () =>
         reviewResult({
@@ -161,6 +336,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     const secretError = 'model_error:token=super-secret-provider-detail';
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       evaluate: async () => reviewResult({ verdict: 'INDETERMINATE', error: secretError }),
     });
 
@@ -175,6 +351,7 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     let observedReviewer: unknown;
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
       reviewerModel: 'review-model',
       evaluate: async (_input, evaluatorDeps) => {
         observedReviewer = evaluatorDeps.reviewer;

@@ -33,10 +33,22 @@ import {
 } from './merge-repo-policy';
 import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
+import { createRealOctokitClient } from './adapters/github-real-deps';
+import {
+  getScopeApprovalDecision,
+  getScopeApprovalMetadata,
+} from '@archon/core/db/board-scope-approvals';
+import {
+  ceScopePremergeRecheck,
+  CE_GATE_NAME,
+  type CeScopeRecheckDeps,
+} from './ce-scope-premerge-recheck';
 
 const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
 const FLAG_MERGE_READY = 'flag_merge_ready';
+const RECEIPT_MARKER = '<!-- merge-manager-receipt -->';
+const RECEIPT_KEY_PREFIX = '<!-- merge-manager-receipt-key';
 export type MergeExecutionRepoConfig = Readonly<Record<string, { readonly baseBranch: string }>>;
 
 export interface MergeExecutionBridgeStore {
@@ -44,6 +56,9 @@ export interface MergeExecutionBridgeStore {
   claimVerdict(verdictId: string): Promise<boolean>;
   releaseVerdictClaim(verdictId: string, reason: string): Promise<boolean>;
   getRunById(runId: string): Promise<OverseerWatchRun | null>;
+  // Optional so older/test stores that predate the active-run guard keep prior
+  // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
+  hasActiveRunForWo?(woId: string): Promise<boolean>;
   reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
   releaseMergeSlot(verdictId: string): Promise<void>;
   recordOutcome(input: {
@@ -62,6 +77,117 @@ export interface MergeExecutionBridgeOptions {
   now?: () => Date;
   maxMergesPerHour?: number;
   repoConfig?: MergeExecutionRepoConfig;
+  ceScopeRecheckDeps?: CeScopeRecheckDeps;
+}
+
+export interface MinimalCompareClient {
+  repos: {
+    compareCommits(input: Record<string, unknown>): Promise<{
+      data: { files?: { filename: string; status: string; previous_filename?: string }[] };
+    }>;
+  };
+}
+
+export function buildCeScopeCompareAdapter(
+  client: MinimalCompareClient
+): CeScopeRecheckDeps['compare'] {
+  return async (owner, repo, base, head) => {
+    const data = (
+      await client.repos.compareCommits({ owner, repo, base, head, per_page: 100, page: 1 })
+    ).data;
+    if (!data.files) return { complete: false };
+    return { files: data.files, complete: data.files.length < 300 };
+  };
+}
+
+function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
+  const client = createRealOctokitClient() as unknown as {
+    pulls: {
+      get(input: Record<string, unknown>): Promise<{
+        data: {
+          number: number;
+          state: string;
+          head: { sha: string; ref: string };
+          base: { ref: string };
+        };
+      }>;
+    };
+    repos: {
+      getBranch(input: Record<string, unknown>): Promise<{ data: { commit: { sha: string } } }>;
+      compareCommits(input: Record<string, unknown>): Promise<{
+        data: { files?: { filename: string; status: string; previous_filename?: string }[] };
+      }>;
+    };
+    actions: {
+      listWorkflowRunsForRepo(input: Record<string, unknown>): Promise<{
+        data: {
+          total_count: number;
+          workflow_runs: import('./ce-scope-premerge-recheck').CeWorkflowRun[];
+        };
+      }>;
+    };
+    checks: {
+      listForRef(input: Record<string, unknown>): Promise<{
+        data: {
+          total_count: number;
+          check_runs: import('./ce-scope-premerge-recheck').CeCheckRun[];
+        };
+      }>;
+    };
+  };
+  return {
+    getPullRequest: async (owner, repo, number) =>
+      (await client.pulls.get({ owner, repo, pull_number: number })).data,
+    getBranchTip: async (owner, repo, branch) =>
+      (await client.repos.getBranch({ owner, repo, branch })).data.commit.sha,
+    compare: buildCeScopeCompareAdapter(client),
+    listWorkflowRuns: async (
+      owner,
+      repo,
+      head
+    ): Promise<readonly import('./ce-scope-premerge-recheck').CeWorkflowRun[]> => {
+      const all: import('./ce-scope-premerge-recheck').CeWorkflowRun[] = [];
+      for (let page = 1; ; page++) {
+        const data = // head_sha = PR HEAD is correct for pull_request_target runs: verified on the
+          // live API (see __tests__/fixtures/pull-request-target-run.live-2026-09-28.json).
+          (
+            await client.actions.listWorkflowRunsForRepo({
+              owner,
+              repo,
+              head_sha: head,
+              per_page: 100,
+              page,
+            })
+          ).data;
+        all.push(...data.workflow_runs);
+        if (all.length >= data.total_count || data.workflow_runs.length < 100) return all;
+      }
+    },
+    listCheckRuns: async (
+      owner,
+      repo,
+      head
+    ): Promise<readonly import('./ce-scope-premerge-recheck').CeCheckRun[]> => {
+      const all: import('./ce-scope-premerge-recheck').CeCheckRun[] = [];
+      for (let page = 1; ; page++) {
+        const data = (
+          await client.checks.listForRef({
+            owner,
+            repo,
+            ref: head,
+            check_name: CE_GATE_NAME,
+            filter: 'all',
+            per_page: 100,
+            page,
+          })
+        ).data;
+        all.push(...data.check_runs);
+        if (all.length >= data.total_count || data.check_runs.length < 100) return all;
+      }
+    },
+    getApproval: getScopeApprovalDecision,
+    getMetadata: getScopeApprovalMetadata,
+  };
 }
 
 function configuredLimit(override?: number): number {
@@ -332,6 +458,85 @@ async function resolveMergeTarget(
   };
 }
 
+/**
+ * The receipt body is a documented ASCII/no-at-sign artifact (see the test
+ * `receipt body is ASCII and contains no at-sign`): it must never let a
+ * dynamic field trigger a GitHub @mention or inject non-ASCII bytes. Branch
+ * names and repo identities are attacker-influenced (a PR author picks their
+ * own branch name), so every dynamic field is sanitized before interpolation:
+ * '@' is replaced (GitHub mentions trigger on a bare '@handle', including
+ * inside inline code spans -- backticks alone are not a safe boundary), and
+ * any byte outside printable ASCII (0x20-0x7E) is stripped.
+ */
+function sanitizeReceiptField(value: string): string {
+  return value
+    .replace(/@/g, '(at)')
+    .split('')
+    .filter(ch => {
+      const code = ch.codePointAt(0) ?? 0;
+      return code >= 0x20 && code <= 0x7e;
+    })
+    .join('');
+}
+
+function receiptKey(verdict: OverseerVerdictRow): string {
+  const keyField = (value: string): string =>
+    sanitizeReceiptField(value).replace(/[^A-Za-z0-9._:-]/g, '_');
+  return `${RECEIPT_KEY_PREFIX} verdict=${keyField(verdict.id)} head=${keyField(
+    verdict.head_sha
+  )} -->`;
+}
+
+async function postMergeReceiptComment(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  pr: PullRequestEvidence,
+  input: { mergeSha?: string; baseBranch?: string; policyLabel?: string }
+): Promise<void> {
+  if (!options.github.commentOnPullRequest) {
+    log.warn(
+      { verdictId: verdict.id, prUrl: pr.htmlUrl },
+      'merge-coordinator.receipt_comment_unavailable'
+    );
+    return;
+  }
+  if (!pr.pr) return;
+  try {
+    const expectedReceiptKey = receiptKey(verdict);
+    const commentAuthorLogin = options.github.commentAuthorLogin?.trim().toLowerCase();
+    if (options.github.listPullRequestComments && commentAuthorLogin) {
+      const existing = await options.github.listPullRequestComments(pr.pr);
+      if (
+        existing.some(
+          comment =>
+            comment.authorLogin.trim().toLowerCase() === commentAuthorLogin &&
+            comment.body.split(/\r?\n/).some(line => line.trim() === expectedReceiptKey)
+        )
+      ) {
+        return;
+      }
+    }
+    const mergeShort = sanitizeReceiptField((input.mergeSha ?? 'unknown').slice(0, 8));
+    const baseBranch = sanitizeReceiptField(
+      input.baseBranch && input.baseBranch.length > 0 ? input.baseBranch : 'unknown'
+    );
+    const policyLabel = sanitizeReceiptField(
+      input.policyLabel && input.policyLabel.length > 0 ? input.policyLabel : 'unknown'
+    );
+    const body = [
+      RECEIPT_MARKER,
+      expectedReceiptKey,
+      `Merged by the merge manager (unattended): Overseer verdict ${verdict.id.slice(0, 8)} APPROVED at head ${verdict.head_sha.slice(0, 8)}, checks green, base ${baseBranch}, policy ${policyLabel}. Merge commit ${mergeShort}.`,
+    ].join('\n');
+    await options.github.commentOnPullRequest({ ...pr.pr, body });
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+      'merge-coordinator.receipt_comment_failed'
+    );
+  }
+}
+
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
@@ -410,6 +615,71 @@ async function mergeClaimedVerdict(
     return undefined;
   }
 
+  // Defer the merge while a Cauldron run for the SAME WO is still executing, so
+  // the run is never failed by its own PR being merged underneath it
+  // (bdc-harness #1046). The gate is purely on the wo_id SHAPE, not on whether
+  // the verdict is run-backed: a PR-discovery verdict (run-less, run id
+  // pr-discovery:...) can still carry a real WO id, and merging it mid-repair is
+  // exactly the failure #1046 prevents -- so it must be deferred too. Run-less
+  // pull-ref verdicts carry a gh:owner/repo#N wo_id that does not start with
+  // WO-, so they still never call the helper. A deferral releases the claim and
+  // returns undefined -- NOT 'stop' -- so later verdicts in the same pass still
+  // process (only the rate ceiling stops the loop). The check fails safe: an
+  // error defers rather than merges.
+  if (
+    options.store.hasActiveRunForWo &&
+    typeof verdict.wo_id === 'string' &&
+    verdict.wo_id.startsWith('WO-')
+  ) {
+    let activeRun: boolean;
+    try {
+      activeRun = await options.store.hasActiveRunForWo(verdict.wo_id);
+    } catch (error) {
+      await options.store.releaseVerdictClaim(verdict.id, 'active_run_check_failed');
+      log.warn(
+        {
+          err: error as Error,
+          verdictId: verdict.id,
+          runId: verdict.run_id,
+          woId: verdict.wo_id,
+          prUrl: pr.htmlUrl,
+        },
+        'merge-coordinator.active_run_check_failed'
+      );
+      return undefined;
+    }
+    if (activeRun) {
+      await options.store.releaseVerdictClaim(verdict.id, 'active_run_deferred');
+      log.info(
+        {
+          verdictId: verdict.id,
+          runId: verdict.run_id,
+          woId: verdict.wo_id,
+          prUrl: pr.htmlUrl,
+        },
+        'merge-coordinator.active_run_deferred'
+      );
+      return undefined;
+    }
+  }
+
+  const isCeReleasePr =
+    `${pr.pr.owner}/${pr.pr.repo}`.toLowerCase() === 'thinmansoftware/lspro-react' &&
+    pr.baseBranch === 'release/ce';
+
+  if (isCeReleasePr) {
+    const recheck = await ceScopePremergeRecheck({
+      owner: pr.pr.owner,
+      repo: pr.pr.repo,
+      prNumber: pr.pr.number,
+      deps: options.ceScopeRecheckDeps ?? productionCeScopeRecheckDeps(),
+    });
+    if (!recheck.ok) {
+      await skip(recheck.reason, pr.htmlUrl);
+      return undefined;
+    }
+  }
+
   const now = (options.now ?? ((): Date => new Date()))();
   const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
   if (
@@ -443,6 +713,24 @@ async function mergeClaimedVerdict(
         { err: error as Error, verdictId: verdict.id },
         'merge-coordinator.approval_failed_nonfatal'
       );
+    }
+  }
+  // Fail-closed re-verify of the CE approval/gate immediately before merge.
+  // The earlier recheck runs before merge-slot reservation and the async
+  // approvePullRequest call; an operator could revoke approval in that window.
+  // Re-running the recheck here closes that revocation race so a revoked
+  // approval cannot slip through between the first recheck and the merge.
+  if (isCeReleasePr) {
+    const premergeRecheck = await ceScopePremergeRecheck({
+      owner: pr.pr.owner,
+      repo: pr.pr.repo,
+      prNumber: pr.pr.number,
+      deps: options.ceScopeRecheckDeps ?? productionCeScopeRecheckDeps(),
+    });
+    if (!premergeRecheck.ok) {
+      await options.store.releaseMergeSlot(verdict.id);
+      await skip(premergeRecheck.reason, pr.htmlUrl);
+      return undefined;
     }
   }
   let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
@@ -491,6 +779,12 @@ async function mergeClaimedVerdict(
     },
     'merge-coordinator.merge_executed'
   );
+  const ownerRepo = pr.pr !== undefined ? `${pr.pr.owner}/${pr.pr.repo}` : 'unknown';
+  await postMergeReceiptComment(options, verdict, pr, {
+    mergeSha: merged.mergeSha ?? merged.sha,
+    baseBranch: pr.baseBranch,
+    policyLabel: `${ownerRepo}:${pr.baseBranch ?? 'unknown'}`,
+  });
   return undefined;
 }
 

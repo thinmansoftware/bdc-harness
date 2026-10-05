@@ -86,12 +86,12 @@ export interface FusionReviewRequest {
 }
 
 /**
- * Grok model id as exposed by Cursor. Verified live 2026-08-26 against
- * `cursor-agent --list-models` on the target host. Overridable by env because
+ * Grok model id as exposed by Cursor. Verified live 2026-09-22/2026-09-23
+ * via `cursor-agent --list-models` on archon-app-1. Overridable by env because
  * Cursor's roster moves (Grok 4.3 -> 4.5 -> 4.6 inside two months); a moved id
  * must be a config change, not a code change.
  */
-export const CURSOR_GROK_MODEL = process.env.CURSOR_GROK_MODEL ?? 'cursor-grok-4.6-high-fast';
+export const CURSOR_GROK_MODEL = process.env.CURSOR_GROK_MODEL ?? 'grok-4.7-high';
 
 export const defaultAgentConfigs: Record<string, AgentConfig> = {
   claude: {
@@ -187,11 +187,9 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
    * admitted under the grok family, so a separately-installed Grok builder
    * slots in alongside these without changing this entry.
    *
-   * Model id verified live 2026-08-26 via `cursor-agent --list-models` on the
-   * target host, then proven end-to-end in a scratch container:
-   *   cursor-agent -f -p --model cursor-grok-4.6-high-fast "..." -> rc 0,
-   *   non-empty response. The 2026-07-22 feasibility doc had listed the exact
-   *   Grok model-id string as UNCONFIRMED; this resolves it.
+   * Model id verified live 2026-09-22/2026-09-23 via `cursor-agent --list-models`
+   * on archon-app-1. The 2026-08-26 scratch-container run proved
+   * cursor-grok-4.6-high-fast, not this id.
    *
    * Same three CLI traps as cursor-build apply (no --mode: both choices are
    * read-only; --force to run commands; --trust or the CLI exits 0 with EMPTY
@@ -252,14 +250,47 @@ export function restrictAgentsToAllowlist(
   return Object.fromEntries(Object.entries(agents).filter(([name]) => allowlist.includes(name)));
 }
 
+/**
+ * The legacy prompt template token. Older config.local.json files (copied from
+ * a pre-fix config.example.json) still carry `{{prompt}}` as an argv element.
+ * The prompt is delivered on stdin (or via the prompt file), never as an argv
+ * template, so any such element is inert noise that must not reach the CLI --
+ * issue #1042 (a codex seat replied "Your message contains {{prompt}} instead
+ * of the main task"). Matches optional inner whitespace and any case, e.g.
+ * `{{ Prompt }}`.
+ */
+const PROMPT_TEMPLATE_TOKEN = /\{\{\s*prompt\s*\}\}/i;
+const PROMPT_TEMPLATE_TOKEN_EXACT = /^\{\{\s*prompt\s*\}\}$/i;
+
 export function buildAgentInvocation(
   config: AgentConfig,
   // Retained for call-site/test compatibility; no longer used for argv substitution.
   _prompt: string
 ): { command: string; args: string[] } {
+  const args: string[] = [];
+  for (const arg of config.args) {
+    // The prompt-file placeholder is worker-owned scratch that runAgent
+    // substitutes per spawn; it carries no braces and must pass through
+    // untouched.
+    if (arg === PROMPT_FILE_PLACEHOLDER) {
+      args.push(arg);
+      continue;
+    }
+    // An argv element that is EXACTLY the token is inert noise -- drop it.
+    if (PROMPT_TEMPLATE_TOKEN_EXACT.test(arg)) {
+      continue;
+    }
+    // The token embedded inside a larger argument (e.g. `--prompt={{prompt}}`)
+    // cannot be silently stripped without corrupting the flag. Fail loud rather
+    // than leak the literal token to the CLI.
+    if (PROMPT_TEMPLATE_TOKEN.test(arg)) {
+      throw new Error('dispatch_agent_args_prompt_template_embedded');
+    }
+    args.push(arg);
+  }
   return {
     command: config.command,
-    args: [...config.args],
+    args,
   };
 }
 

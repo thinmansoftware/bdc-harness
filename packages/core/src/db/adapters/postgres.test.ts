@@ -191,7 +191,6 @@ describe('PostgresAdapter', () => {
         'escalated_sms_at TIMESTAMPTZ',
         'subject_key TEXT',
         'route_disposition TEXT',
-        "CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))",
         'supersedes_id UUID REFERENCES agent_dispatch_messages(id)',
       ];
       const principalDefinitions = [
@@ -235,8 +234,19 @@ describe('PostgresAdapter', () => {
         ['overseer-review-route', 'Overseer Review Route', 'notify_only', 'TRUE'],
         ['duty-officer', 'Duty Officer', 'worker_poll', 'TRUE'],
         ['do', 'Duty Officer alias', 'worker_poll', 'TRUE'],
+        // WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01 (migration 056): Astra Codex
+        // desktop Board/XO seat, added after Phase 0, so combined carries it.
+        ['astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 'TRUE'],
         ['taskmaster', 'Taskmaster', 'worker_poll', 'TRUE'],
       ] as const;
+
+      expect(migration).toContain(
+        "CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))"
+      );
+      expect(combined).toContain(
+        "CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded', 'expired', 'auto_surfaced'))"
+      );
+      expect(combined).toContain('route_disposed_at TEXT');
 
       for (const schema of [migration, combined]) {
         const normalizedSchema = schema.replace(/\s+/g, ' ');

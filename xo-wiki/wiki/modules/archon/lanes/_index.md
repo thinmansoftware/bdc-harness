@@ -46,3 +46,27 @@ For non-interactive runs that remain blocked, `noninteractive-salvage` also pres
 any remaining working-tree changes in a `salvage(uncommitted): <n> files` commit and
 pushes the salvage branch for human review. This preservation does not authorize the
 normal `commit-and-push` node or bypass its blocked-run approval rules.
+
+## manifest-evidence-check admission policy (counts_unparsed, SPEC_DEFECT, HARNESS_REFUSED)
+
+For CODE and MIXED work orders, `manifest-evidence-check` admits an executed test
+command that reports `tests_status=counts_unparsed` only when `tests_exit=0`. The
+manifest keeps the existing N/A-style explanation because the command produced no
+parseable counts. A nonzero exit, `failed`, `no_command_declared`, or missing test
+evidence still fails closed with `EVIDENCE_ERROR`.
+
+Declared grep stop conditions are handled by their observed status. `passed` is
+admitted. `incomplete` is admitted only when at least one grep executed and no grep
+mismatched; its Stop conditions line publishes `unparsed=<names>; dropped=<n>`.
+`mismatch` remains an `EVIDENCE_ERROR`. `all_dropped`, meaning zero conditions
+executed, fails with `SPEC_DEFECT:` when one or more conditions were unparsed and
+includes their names and any `DROPPED:` reasons, attributing the failure to the
+stop-condition specification. When every parsed condition was instead removed by
+the allowlist, it fails with `HARNESS_REFUSED:` and includes the `DROPPED:` reasons,
+attributing the refusal to harness policy rather than to a malformed specification.
+
+The `mec core` block and the `sme_process` / `mec_check` call sites in
+`.archon/workflows/defaults/bdc-feature-development.yaml` are the source of truth;
+their mirrored lane copies must remain byte-identical. The unit test checks both the
+function bodies and these separate argument-passing surfaces so new evidence fields
+cannot silently fall back to defaults in a subset of lanes.

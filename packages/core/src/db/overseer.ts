@@ -4,6 +4,22 @@ import { getDatabase } from './connection';
 
 const log = createLogger('db/overseer');
 
+/**
+ * Run-id prefix for discovery-sourced PR verdicts (hand-opened spec/diary PRs).
+ *
+ * This MUST stay byte-for-byte in sync with PR_DISCOVERY_RUN_ID_PREFIX in
+ * packages/overseer/src/merge-candidate-discovery.ts, which is the canonical
+ * owner that mints these run ids and the value the merge-execution bridge parses
+ * PR identity back out of. It is re-declared here rather than imported because
+ * @archon/overseer depends on @archon/core (overseer/src/service.ts imports
+ * claimOverseerVerdict from this module); importing the constant back would be a
+ * circular workspace dependency and a layering inversion (core is the
+ * foundational layer). The value is a fixed contract
+ * (WO-HARNESS-DISCOVERY-VERDICT-RECORD-01 "keep the prefix"); any divergence
+ * would break the discovery -> verdict -> bridge round-trip and be caught there.
+ */
+const DISCOVERY_RUN_ID_PREFIX = 'pr-discovery:';
+
 export interface OverseerWatchRun {
   id: string;
   woId: string;
@@ -211,6 +227,10 @@ export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
      FROM remote_agent_workflow_runs r
      LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
      WHERE r.status IN ('completed', 'failed', 'escalated', 'cancelled')
+       -- Synthetic discovery-PR parent rows (workflow_name = 'pr-discovery') are
+       -- not real work: excluding them keeps the watch loop from re-judging a
+       -- hand-opened PR that already has its own verdict recorded directly.
+       AND r.workflow_name != 'pr-discovery'
        AND NOT EXISTS (
          SELECT 1 FROM overseer_actions oa
          WHERE oa.run_id = r.id
@@ -236,6 +256,26 @@ export async function getOverseerWatchRunById(runId: string): Promise<OverseerWa
     [runId]
   );
   return result.rows[0] ? normalizeRun(result.rows[0]) : null;
+}
+
+/**
+ * The user_message of every currently ACTIVE workflow run, so the merge bridge
+ * can defer merging a PR while a run for the same WO is still executing
+ * (bdc-harness #1046). Active statuses match the in-flight set used elsewhere
+ * (packages/core/src/db/workflows.ts): pending, running, waiting_provider,
+ * paused. Synthetic discovery-PR parent rows (workflow_name = 'pr-discovery')
+ * are excluded -- they are not real work and never carry a WO_ID marker.
+ */
+export async function listActiveRunUserMessages(): Promise<string[]> {
+  const result = await getDatabase().query<{ user_message: string | null }>(
+    `SELECT user_message
+     FROM remote_agent_workflow_runs
+     WHERE status IN ('pending', 'running', 'waiting_provider', 'paused')
+       AND workflow_name != 'pr-discovery'`
+  );
+  return result.rows
+    .map(row => (typeof row.user_message === 'string' ? row.user_message : ''))
+    .filter(message => message.length > 0);
 }
 
 interface OverseerEffectTimestampRow {
@@ -265,6 +305,9 @@ export async function countRunsPendingOverseerJudgment(): Promise<number> {
     `SELECT COUNT(*) AS pending_count
      FROM remote_agent_workflow_runs
      WHERE status IN ('completed', 'failed', 'escalated', 'cancelled')
+       -- Exclude synthetic discovery-PR parent rows so backlog metrics are not
+       -- inflated forever (they never receive an overseer_actions row this path).
+       AND workflow_name != 'pr-discovery'
        AND NOT EXISTS (
          SELECT 1 FROM overseer_actions oa WHERE oa.run_id = remote_agent_workflow_runs.id
        )`
@@ -492,6 +535,45 @@ export interface OverseerVerdictClaim {
  * health-alarm state may be re-claimed until maxRetries is exhausted. A slot
  * holding a semantic verdict (or an in-flight claim) is never re-claimed.
  */
+/**
+ * Idempotently ensure the synthetic parent rows a discovery-PR verdict FKs to.
+ *
+ * `overseer_verdicts.run_id` has a NOT NULL FK to remote_agent_workflow_runs, but
+ * discovery-sourced PRs (runId `pr-discovery:<owner>/<repo>#<n>`) are hand-opened
+ * PRs with no workflow run -- so every claimOverseerVerdict for one previously
+ * threw SQLITE_CONSTRAINT_FOREIGNKEY and no discovery verdict was ever recorded
+ * (bdc-xo#2208: 0 rows table-wide, 500 FK errors in 3h).
+ *
+ * On SQLite (the production dialect) remote_agent_workflow_runs.conversation_id
+ * is itself NOT NULL with an FK to remote_agent_conversations, so we ensure a
+ * synthetic conversation first, then the run. Both inserts are deterministic from
+ * runId and idempotent (ON CONFLICT (id) DO NOTHING), so a replay at the same head
+ * leaves exactly one conversation and one run row.
+ *
+ * The run is TERMINAL ('completed') so the rebuild inflight guard
+ * (status IN ('pending','running')), dashboards and backlog counts never treat it
+ * as live work. It carries workflow_name = 'pr-discovery' so the watch loop and
+ * pending-judgment count exclude it by name (see listRunsForOverseerWatch and
+ * countRunsPendingOverseerJudgment); user_message is the runId, never a WO token,
+ * so WO-substring run scans do not collide with it.
+ */
+export async function ensureDiscoveryRunRow(runId: string): Promise<void> {
+  const db = getDatabase();
+  await db.query(
+    `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
+     VALUES ($1, 'pr-discovery', $1, 'PR discovery')
+     ON CONFLICT (id) DO NOTHING`,
+    [runId]
+  );
+  await db.query(
+    `INSERT INTO remote_agent_workflow_runs
+       (id, conversation_id, workflow_name, user_message, status, completed_at)
+     VALUES ($1, $1, 'pr-discovery', $1, 'completed', $2)
+     ON CONFLICT (id) DO NOTHING`,
+    [runId, new Date().toISOString()]
+  );
+}
+
 export async function claimOverseerVerdict(input: {
   runId: string;
   woId: string;
@@ -503,6 +585,11 @@ export async function claimOverseerVerdict(input: {
   const db = getDatabase();
   const id = randomUUID();
   const headSha = input.headSha ?? '';
+  // Discovery-sourced PRs have no workflow run; mint the synthetic terminal
+  // parent row before the FK'd verdict insert so it does not throw.
+  if (input.runId.startsWith(DISCOVERY_RUN_ID_PREFIX)) {
+    await ensureDiscoveryRunRow(input.runId);
+  }
   const inserted = await db.query<{ id: string }>(
     `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, status, hint_action, hint_error_class)
      VALUES ($1, $2, $3, $4, 'claimed', $5, $6)
@@ -555,6 +642,7 @@ export async function finalizeOverseerVerdict(input: {
   reason?: string;
   evidenceDigest?: string;
   evidence?: string;
+  prUrl?: string;
 }): Promise<OverseerVerdictRow> {
   const db = getDatabase();
   // No RETURNING: the SQLite adapter rejects it on UPDATE, and this throw took
@@ -566,7 +654,7 @@ export async function finalizeOverseerVerdict(input: {
      SET status = $2, verdict = $3, confidence = $4, model = $5, model_rung = $6,
          proposed_action = $7, proposed_tier = $8, required_tier = $9, effective_tier = $10,
          reason = $11, evidence_digest = COALESCE($12, evidence_digest),
-         evidence = $13, updated_at = $14
+         evidence = $13, pr_url = COALESCE($14, pr_url), updated_at = $15
      WHERE id = $1`,
     [
       input.verdictId,
@@ -582,6 +670,7 @@ export async function finalizeOverseerVerdict(input: {
       input.reason ?? null,
       input.evidenceDigest ?? null,
       input.evidence ?? null,
+      input.prUrl ?? null,
       new Date().toISOString(),
     ]
   );

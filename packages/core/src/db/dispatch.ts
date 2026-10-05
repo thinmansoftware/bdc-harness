@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { randomUUID, timingSafeEqual } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 import { appendBoardAuditEvent, resolveBoardRecipient } from './board-authority';
@@ -22,7 +22,7 @@ export type DispatchMessageStatus = 'queued' | 'claimed' | 'done' | 'failed' | '
 export type DispatchWorkerStatus = 'available' | 'unavailable';
 export type DispatchMessagePriority = 'blocker' | 'normal' | 'heartbeat';
 export type DispatchTaskOutcome = 'succeeded' | 'failed' | 'blocked';
-export type DispatchRouteDisposition = 'unroutable' | 'superseded';
+export type DispatchRouteDisposition = 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced';
 export type DispatchDeliveryMode =
   | 'worker_poll'
   | 'drain_on_start'
@@ -64,6 +64,7 @@ export interface DispatchMessage {
   escalated_sms_at: string | null;
   subject_key: string | null;
   route_disposition: DispatchRouteDisposition | null;
+  route_disposed_at: string | null;
   supersedes_id: string | null;
   repeat_reason: string | null;
 }
@@ -136,8 +137,39 @@ export type DispatchMailboxResult =
         | 'wrong_recipient'
         | 'not_queued'
         | 'address_before_ack'
-        | 'actor_mismatch';
+        | 'actor_mismatch'
+        | 'machine_actor_required'
+        | 'machine_actor_conflict'
+        | 'already_disposed'
+        | 'receipt_present'
+        | 'disposition_invalid'
+        | 'disposition_terminal'
+        | 'xo_bind_required'
+        | 'lease_fence_stale';
     };
+
+export interface XoLeaseBind {
+  kind: 'xo_lease';
+  lease_id: string;
+  fencing_token: number;
+  holder_token_hash: string;
+  holder_principal_id: string;
+}
+
+export interface MailboxDepth {
+  unread: number;
+  legacy_unverified: number;
+  acked_open: number;
+  addressed_by_mind: number;
+  disposed_by_machine: number;
+  surfaced_unacked: number;
+  surfaced_acked: number;
+}
+
+export type MailboxDepthResult = { cutover_at: string | null } & Record<
+  string,
+  string | null | MailboxDepth
+>;
 
 export interface UnroutableQueuedDispatchMessage {
   id: string;
@@ -203,6 +235,7 @@ function normalizeMessage(row: DispatchMessageRow): DispatchMessage {
     addressed_at: normalizeNullableTimestamp(row.addressed_at),
     escalated_tg_at: normalizeNullableTimestamp(row.escalated_tg_at),
     escalated_sms_at: normalizeNullableTimestamp(row.escalated_sms_at),
+    route_disposed_at: normalizeNullableTimestamp(row.route_disposed_at),
   };
 }
 
@@ -676,6 +709,13 @@ export async function listMessagesBySeqCursor(filters: {
   /** Exclusive lower bound: return rows whose ordering value is strictly above. */
   afterSeq?: number;
   limit?: number;
+  /**
+   * Only rows still open for a reader: not deferred (`not_before` passed or
+   * unset), not addressed, and with no route disposition. The same open-row
+   * filter `listMessages` applies to `status: 'queued'`, so a keyset walk of a
+   * mailbox is not diluted by rows another component already disposed.
+   */
+  openOnly?: boolean;
 }): Promise<SeqCursorMessage[]> {
   const limit = Math.max(1, Math.min(filters.limit ?? 100, 500));
   // Same effective ordering value the newest-first reads use, so a cursor taken
@@ -696,6 +736,12 @@ export async function listMessagesBySeqCursor(filters: {
   if (typeof filters.afterSeq === 'number') {
     params.push(filters.afterSeq);
     clauses.push(`${seqExpression} > $${params.length}`);
+  }
+  if (filters.openOnly) {
+    params.push(nowIso());
+    clauses.push(`(not_before IS NULL OR not_before <= $${params.length})`);
+    clauses.push('addressed_at IS NULL');
+    clauses.push('route_disposition IS NULL');
   }
   params.push(limit);
   const result = await getDatabase().query<DispatchMessageRow & { cursor_seq: unknown }>(
@@ -721,6 +767,7 @@ export async function listMessages(filters: {
   limit?: number;
   allowBoardAlias?: boolean;
   subject_key?: string;
+  route_disposition?: DispatchRouteDisposition;
 }): Promise<DispatchMessage[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -752,10 +799,17 @@ export async function listMessages(filters: {
     params.push(normalizeDispatchSubjectKey(filters.subject_key));
     clauses.push(`subject_key = $${params.length}`);
   }
+  if (filters.route_disposition !== undefined) {
+    params.push(filters.route_disposition);
+    clauses.push(`route_disposition = $${params.length}`);
+  }
   if (filters.status === 'queued') {
     params.push(nowIso());
     clauses.push(`(not_before IS NULL OR not_before <= $${params.length})`);
     clauses.push('addressed_at IS NULL');
+    if (filters.route_disposition === undefined) {
+      clauses.push('route_disposition IS NULL');
+    }
   }
   params.push(Math.max(1, Math.min(filters.limit ?? 100, 500)));
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1150,6 +1204,13 @@ async function validateMailboxActor(
   message: DispatchMessage,
   principalId: string
 ): Promise<Exclude<DispatchMailboxResult, { ok: true }> | null> {
+  if (
+    message.route_disposition === 'expired' ||
+    message.route_disposition === 'unroutable' ||
+    message.route_disposition === 'superseded'
+  ) {
+    return { ok: false, reason: 'disposition_terminal' };
+  }
   const resolvedRecipient = canonicalizePrincipal(message.resolved_recipient ?? message.recipient);
   if (resolvedRecipient !== principalId) return { ok: false, reason: 'wrong_recipient' };
   const recipientPrincipal = await getDispatchPrincipal(query, resolvedRecipient);
@@ -1162,6 +1223,61 @@ async function validateMailboxActor(
   }
   if (message.status !== 'queued') return { ok: false, reason: 'not_queued' };
   return null;
+}
+
+export async function disposeMessageByMachine(
+  data: {
+    id: string;
+    actor: string;
+    disposition: 'expired' | 'auto_surfaced';
+    requireNoReceipt?: boolean;
+  },
+  transactionQuery?: DispatchQueryExecutor
+): Promise<DispatchMailboxResult> {
+  if (!data.actor.startsWith('system:')) return { ok: false, reason: 'machine_actor_required' };
+  if (data.disposition !== 'expired' && data.disposition !== 'auto_surfaced') {
+    return { ok: false, reason: 'disposition_invalid' };
+  }
+
+  const execute = async (query: DispatchQueryExecutor): Promise<DispatchMailboxResult> => {
+    const principal = await getDispatchPrincipal(query, canonicalizePrincipal(data.actor));
+    if (principal) return { ok: false, reason: 'machine_actor_conflict' };
+    const message = await readMessageInTransaction(query, data.id);
+    if (!message) return { ok: false, reason: 'not_found' };
+    if (message.route_disposition !== null) return { ok: false, reason: 'already_disposed' };
+
+    const now = nowIso();
+    const update = await query(
+      data.requireNoReceipt
+        ? `UPDATE agent_dispatch_messages
+           SET route_disposition = $2, route_disposed_at = $3
+           WHERE id = $1 AND route_disposition IS NULL
+             AND acknowledged_at IS NULL AND addressed_at IS NULL AND status = 'queued'`
+        : `UPDATE agent_dispatch_messages
+           SET route_disposition = $2, route_disposed_at = $3
+           WHERE id = $1 AND route_disposition IS NULL`,
+      [data.id, data.disposition, now]
+    );
+    const finalMessage = await readMessageInTransaction(query, data.id);
+    if (!finalMessage) return { ok: false, reason: 'not_found' };
+    if (update.rowCount === 0 && data.requireNoReceipt) {
+      if (finalMessage.route_disposition !== null) {
+        return { ok: false, reason: 'already_disposed' };
+      }
+      return { ok: false, reason: 'receipt_present' };
+    }
+    if (update.rowCount === 0 || finalMessage.route_disposition !== data.disposition) {
+      return { ok: false, reason: 'already_disposed' };
+    }
+    log.info(
+      { messageId: data.id, actor: data.actor, disposition: data.disposition },
+      'dispatch.message_disposed_by_machine'
+    );
+    return { ok: true, message: finalMessage };
+  };
+
+  if (transactionQuery) return execute(transactionQuery);
+  return withRetriedMailboxTransaction(() => getDatabase().withTransaction(execute));
 }
 
 function isRetriableMailboxTransactionError(error: unknown): boolean {
@@ -1186,9 +1302,124 @@ async function withRetriedMailboxTransaction<T>(fn: () => Promise<T>): Promise<T
   throw new Error('mailbox_transaction_retry_exhausted');
 }
 
+function equalHexDigest(left: string, right: string): boolean {
+  const a = Buffer.from(left, 'hex');
+  const b = Buffer.from(right, 'hex');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+async function validateXoLeaseBind(
+  query: DispatchQueryExecutor,
+  principalId: string,
+  bind?: XoLeaseBind
+): Promise<Extract<DispatchMailboxResult, { ok: false }> | null> {
+  if (principalId !== 'xo') return bind ? { ok: false, reason: 'lease_fence_stale' } : null;
+  if (bind?.kind !== 'xo_lease') return { ok: false, reason: 'xo_bind_required' };
+  // PostgreSQL holds this row lock through the receipt transaction's commit, blocking turnover.
+  // SQLite serializes writers; the receipt UPDATE's EXISTS runs under its write lock.
+  const leaseLock = getDatabase().dialect === 'postgres' ? ' FOR UPDATE' : '';
+  const result = await query<{
+    lease_id: string;
+    fencing_token: number | string;
+    holder_token_hash: string;
+  }>(
+    `SELECT lease_id, fencing_token, holder_token_hash
+     FROM board_xo_leases
+     WHERE id = 1 AND principal_id = $2 AND seat_id = 'xo'
+       AND released_at IS NULL AND expires_at > $1${leaseLock}`,
+    [nowIso(), bind.holder_principal_id]
+  );
+  const lease = result.rows[0];
+  if (
+    lease?.lease_id !== bind.lease_id ||
+    Number(lease?.fencing_token) !== bind.fencing_token ||
+    !equalHexDigest(lease?.holder_token_hash ?? '', bind.holder_token_hash)
+  ) {
+    return { ok: false, reason: 'lease_fence_stale' };
+  }
+  return null;
+}
+
+function xoLeaseBindPredicate(
+  principalId: string,
+  bind?: XoLeaseBind
+): { sql: string; params: unknown[] } {
+  if (principalId !== 'xo') return { sql: '', params: [] };
+  if (!bind) throw new Error('xo_bind_required');
+  // Receipt UPDATEs reserve $1-$3. Check the live lease in the write itself.
+  // $8 is bind.holder_principal_id.
+  return {
+    sql: ` AND EXISTS (SELECT 1 FROM board_xo_leases
+      WHERE id = 1 AND principal_id = $8 AND seat_id = 'xo'
+        AND lease_id = $4 AND fencing_token = $5 AND holder_token_hash = $6
+        AND released_at IS NULL AND expires_at > $7)`,
+    params: [
+      bind.lease_id,
+      bind.fencing_token,
+      bind.holder_token_hash,
+      nowIso(),
+      bind.holder_principal_id,
+    ],
+  };
+}
+
+export async function mailboxDepthByPrincipal(): Promise<MailboxDepthResult> {
+  const result = await getDatabase().query<{
+    principal_id: string;
+    cutover_at: string | null;
+    unread: number | string;
+    legacy_unverified: number | string;
+    acked_open: number | string;
+    addressed_by_mind: number | string;
+    disposed_by_machine: number | string;
+    surfaced_unacked: number | string;
+    surfaced_acked: number | string;
+  }>(`WITH cutover AS (
+      SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1
+    ), mailbox_rows AS (
+      SELECT p.principal_id, c.applied_at AS cutover_at, m.*,
+        CASE WHEN (m.acknowledged_at IS NOT NULL AND (c.applied_at IS NULL OR m.acknowledged_at < c.applied_at))
+               OR (m.addressed_at IS NOT NULL AND (c.applied_at IS NULL OR m.addressed_at < c.applied_at))
+               OR (m.route_disposed_at IS NOT NULL AND (c.applied_at IS NULL OR m.route_disposed_at < c.applied_at))
+             THEN 1 ELSE 0 END AS is_legacy
+      FROM dispatch_principals p
+      LEFT JOIN agent_dispatch_messages m ON LOWER(TRIM(COALESCE(m.resolved_recipient, m.recipient))) = p.principal_id
+      LEFT JOIN cutover c ON TRUE
+      WHERE CAST(p.active AS TEXT) IN ('1', 'true') AND p.delivery_mode IN ('drain_on_start', 'notify_only')
+    )
+    SELECT principal_id, cutover_at,
+      SUM(CASE WHEN id IS NOT NULL AND acknowledged_at IS NULL AND addressed_at IS NULL AND route_disposition IS NULL THEN 1 ELSE 0 END) AS unread,
+      SUM(is_legacy) AS legacy_unverified,
+      SUM(CASE WHEN is_legacy = 0 AND cutover_at IS NOT NULL AND acknowledged_at >= cutover_at AND addressed_at IS NULL AND route_disposition IS NULL THEN 1 ELSE 0 END) AS acked_open,
+      SUM(CASE WHEN is_legacy = 0 AND cutover_at IS NOT NULL AND addressed_at >= cutover_at AND acknowledged_at >= cutover_at AND addressed_by NOT LIKE 'system:%' AND route_disposition IS NULL THEN 1 ELSE 0 END) AS addressed_by_mind,
+      SUM(CASE WHEN is_legacy = 0 AND cutover_at IS NOT NULL AND route_disposition = 'expired' AND acknowledged_at IS NULL AND addressed_at IS NULL AND route_disposed_at >= cutover_at THEN 1 ELSE 0 END) AS disposed_by_machine,
+      SUM(CASE WHEN is_legacy = 0 AND route_disposition = 'auto_surfaced' AND acknowledged_at IS NULL THEN 1 ELSE 0 END) AS surfaced_unacked,
+      SUM(CASE WHEN is_legacy = 0 AND cutover_at IS NOT NULL AND route_disposition = 'auto_surfaced' AND acknowledged_at >= cutover_at THEN 1 ELSE 0 END) AS surfaced_acked
+    FROM mailbox_rows GROUP BY principal_id, cutover_at`);
+  const principals: Record<string, MailboxDepth> = {};
+  let cutoverAt: string | null = null;
+  for (const row of result.rows) {
+    cutoverAt = row.cutover_at ?? cutoverAt;
+    if (row.principal_id === 'cutover_at') {
+      throw new Error('dispatch_principal_reserved:cutover_at');
+    }
+    principals[row.principal_id] = {
+      unread: Number(row.unread),
+      legacy_unverified: Number(row.legacy_unverified),
+      acked_open: Number(row.acked_open),
+      addressed_by_mind: Number(row.addressed_by_mind),
+      disposed_by_machine: Number(row.disposed_by_machine),
+      surfaced_unacked: Number(row.surfaced_unacked),
+      surfaced_acked: Number(row.surfaced_acked),
+    };
+  }
+  return { cutover_at: cutoverAt, ...principals };
+}
+
 export async function acknowledgeMessage(data: {
   id: string;
   principal_id: string;
+  bind?: XoLeaseBind;
 }): Promise<DispatchMailboxResult> {
   const db = getDatabase();
   const principalId = canonicalizePrincipal(data.principal_id);
@@ -1197,6 +1428,8 @@ export async function acknowledgeMessage(data: {
     db.withTransaction(async txQuery => {
       const message = await readMessageInTransaction(txQuery, data.id);
       if (!message) return { ok: false, reason: 'not_found' };
+      const staleBind = await validateXoLeaseBind(txQuery, principalId, data.bind);
+      if (staleBind) return staleBind;
       const invalid = await validateMailboxActor(txQuery, message, principalId);
       if (invalid) return invalid;
       if (message.acknowledged_by !== null) {
@@ -1205,6 +1438,7 @@ export async function acknowledgeMessage(data: {
           : { ok: false, reason: 'actor_mismatch' };
       }
 
+      const leasePredicate = xoLeaseBindPredicate(principalId, data.bind);
       const update = await txQuery(
         `UPDATE agent_dispatch_messages
        SET acknowledged_at = $2,
@@ -1220,9 +1454,13 @@ export async function acknowledgeMessage(data: {
            WHERE recipient_principal.principal_id = LOWER(TRIM(COALESCE(resolved_recipient, recipient)))
              AND CAST(recipient_principal.active AS TEXT) IN ('1', 'true')
              AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
-         )`,
-        [data.id, now, principalId]
+         )${leasePredicate.sql}`,
+        [data.id, now, principalId, ...leasePredicate.params]
       );
+      if (update.rowCount === 0 && principalId === 'xo') {
+        const staleBind = await validateXoLeaseBind(txQuery, principalId, data.bind);
+        if (staleBind) return staleBind;
+      }
       const finalMessage = await readMessageInTransaction(txQuery, data.id);
       if (!finalMessage) return { ok: false, reason: 'not_found' };
       const finalInvalid = await validateMailboxActor(txQuery, finalMessage, principalId);
@@ -1239,6 +1477,7 @@ export async function acknowledgeMessage(data: {
 export async function addressMessage(data: {
   id: string;
   principal_id: string;
+  bind?: XoLeaseBind;
 }): Promise<DispatchMailboxResult> {
   const db = getDatabase();
   const principalId = canonicalizePrincipal(data.principal_id);
@@ -1247,6 +1486,8 @@ export async function addressMessage(data: {
     db.withTransaction(async txQuery => {
       const message = await readMessageInTransaction(txQuery, data.id);
       if (!message) return { ok: false, reason: 'not_found' };
+      const staleBind = await validateXoLeaseBind(txQuery, principalId, data.bind);
+      if (staleBind) return staleBind;
       const invalid = await validateMailboxActor(txQuery, message, principalId);
       if (invalid) return invalid;
       if (message.acknowledged_by === null) return { ok: false, reason: 'address_before_ack' };
@@ -1257,6 +1498,7 @@ export async function addressMessage(data: {
           : { ok: false, reason: 'actor_mismatch' };
       }
 
+      const leasePredicate = xoLeaseBindPredicate(principalId, data.bind);
       const update = await txQuery(
         `UPDATE agent_dispatch_messages
        SET addressed_at = $2,
@@ -1273,9 +1515,13 @@ export async function addressMessage(data: {
            WHERE recipient_principal.principal_id = LOWER(TRIM(COALESCE(resolved_recipient, recipient)))
              AND CAST(recipient_principal.active AS TEXT) IN ('1', 'true')
              AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
-         )`,
-        [data.id, now, principalId]
+         )${leasePredicate.sql}`,
+        [data.id, now, principalId, ...leasePredicate.params]
       );
+      if (update.rowCount === 0 && principalId === 'xo') {
+        const staleBind = await validateXoLeaseBind(txQuery, principalId, data.bind);
+        if (staleBind) return staleBind;
+      }
       const finalMessage = await readMessageInTransaction(txQuery, data.id);
       if (!finalMessage) return { ok: false, reason: 'not_found' };
       const finalInvalid = await validateMailboxActor(txQuery, finalMessage, principalId);

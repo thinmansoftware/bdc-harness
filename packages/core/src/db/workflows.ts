@@ -26,6 +26,16 @@ import type {
 } from '@archon/workflows/reliability/types';
 import { createLogger } from '@archon/paths';
 
+/**
+ * workflow_name of the synthetic terminal parent rows minted for discovery-sourced
+ * PR verdicts (runId `pr-discovery:<owner>/<repo>#<n>`) in
+ * packages/core/src/db/overseer.ts::ensureDiscoveryRunRow. These rows exist only to
+ * satisfy the overseer_verdicts FK; they are not real workflow runs, so every run-list
+ * surface (dashboard list/count and listWorkflowRuns / /api/workflow-runs) excludes
+ * them by name. Kept in sync with the literal written in overseer.ts.
+ */
+const DISCOVERY_WORKFLOW_NAME = 'pr-discovery';
+
 /** Best-effort ROLLBACK -- log but swallow errors since we're already in an error path. */
 function rollback(): Promise<void> {
   return pool.query('ROLLBACK', []).then(
@@ -2440,6 +2450,11 @@ function buildDashboardWhereClauses(
   if (!options?.includeArchived) {
     whereClauses.push('r.archived_at IS NULL');
   }
+  // Synthetic discovery-PR parent rows are not real work: exclude them from both the
+  // dashboard run list and the per-status counts so they never appear as rows or inflate
+  // the completed/all totals (see DISCOVERY_WORKFLOW_NAME).
+  values.push(DISCOVERY_WORKFLOW_NAME);
+  whereClauses.push(`r.workflow_name != $${String(values.length)}`);
 
   return whereClauses;
 }
@@ -2603,6 +2618,10 @@ export async function listWorkflowRuns(options?: {
   if (!options?.includeArchived) {
     whereClauses.push('archived_at IS NULL');
   }
+  // Never surface synthetic discovery-PR parent rows through this list (it backs
+  // /api/workflow-runs); they exist only to satisfy the overseer_verdicts FK.
+  values.push(DISCOVERY_WORKFLOW_NAME);
+  whereClauses.push(`workflow_name != $${String(values.length)}`);
 
   const limit = options?.limit ?? 50;
   values.push(limit);

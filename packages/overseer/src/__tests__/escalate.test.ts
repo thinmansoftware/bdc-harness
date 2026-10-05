@@ -52,7 +52,7 @@ describe.serial('durable escalation card', () => {
     );
   });
 
-  test('deduplicates the same stable source event into one card and three jobs', async () => {
+  test('deduplicates the same stable source event into one card and two jobs', async () => {
     const args = [
       'run-dedupe',
       { decision: 'escalate' as const, reason: 'unknown failure' },
@@ -72,7 +72,7 @@ describe.serial('durable escalation card', () => {
     const second = await runEscalation(...args);
     const view = await getOperatorCard(first.card_id);
     expect(second.card_id).toBe(first.card_id);
-    expect(view?.jobs).toHaveLength(3);
+    expect(view?.jobs).toHaveLength(2);
   });
 
   test('rejects an escalation without stable source event identity', async () => {

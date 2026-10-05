@@ -5,6 +5,8 @@
  * WO: WO-HARNESS-SMART-CAULDRON-V1-PER-RUN-CASCADE-01
  */
 
+import type { EntrySelection } from './headroom.js';
+
 export type TierName = string; // e.g. "zero", "qwen", "codex", "claude", "frontier"
 
 export type TierOutcome =
@@ -41,6 +43,11 @@ export interface CascadeAttempt {
   gateFailReason: string | null; // which condition failed (terminal/validator/pr)
   infraErrorReason: string | null; // HTTP status + message on infra-error
   servedModelId: string | null; // from run metadata when available
+  /** Last node_completed / node_failed model triple per step, when the poll supplied one. */
+  nodeModels?: Record<
+    string,
+    { provider: string | null; declared: string | null; served: string | null }
+  >;
   costUsd: number | null;
   startedAt: string;
   completedAt: string | null;
@@ -126,6 +133,11 @@ export interface CascadeRunRecord {
     wonCheap: boolean; // true if entry tier won without climbing
   };
   /**
+   * Seat-headroom entry decision. Present only when the cascade was given a
+   * seatUsage reader. Absent when that dependency was not supplied.
+   */
+  entrySelection?: EntrySelection;
+  /**
    * Populated ONLY when the frontier (fable) tier gate-failed and the cascade
    * emitted a SPEC-REPAIR escalation (status === 'spec-repair'). Doctrine
    * 2026-07-02 (John): Fable is the last escalation before failure -- a WO must
@@ -198,5 +210,10 @@ export interface PollResult {
   prUrl: string | null;
   prMergeable: boolean | null;
   servedModelId: string | null;
+  /** Last node_completed / node_failed model triple per step. */
+  nodeModels?: Record<
+    string,
+    { provider: string | null; declared: string | null; served: string | null }
+  >;
   rawMetadata: Record<string, unknown>;
 }

@@ -28,6 +28,7 @@ const PHASE_0_NULLABLE_COLUMNS = [
   'escalated_sms_at',
   'subject_key',
   'route_disposition',
+  'route_disposed_at',
   'supersedes_id',
 ] as const;
 const REQUIRED_DISPATCH_INDEXES = [
@@ -36,6 +37,7 @@ const REQUIRED_DISPATCH_INDEXES = [
   'idx_dispatch_board_pending',
 ] as const;
 const KNOWN_PRINCIPALS = [
+  ['astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1],
   ['board', 'Board', 'alias_resolved', 1],
   ['cauldron', 'Cauldron', 'notify_only', 1],
   ['claude', 'Claude', 'worker_poll', 1],
@@ -683,7 +685,7 @@ function validateMessageSchema(table: TableSnapshot): void {
   assertSqlContains(tableSql, [
     "check (priority in ('blocker', 'normal', 'heartbeat'))",
     "check (task_outcome is null or task_outcome in ('succeeded', 'failed', 'blocked'))",
-    "check (route_disposition is null or route_disposition in ('unroutable', 'superseded'))",
+    "check (route_disposition is null or route_disposition in ('unroutable', 'superseded', 'expired', 'auto_surfaced'))",
     'supersedes_id text references agent_dispatch_messages(id)',
     'sender_principal_id',
   ]);

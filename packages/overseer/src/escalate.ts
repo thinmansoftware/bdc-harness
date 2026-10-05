@@ -26,7 +26,6 @@
  * mechanism that ensures no Cauldron failure ever exits silently again.
  */
 
-import { createLogger } from '@archon/paths';
 import { appendOperatorCard, type OperatorCardRecord } from '@archon/core/db/overseer-briefing';
 import {
   buildOperatorCard,
@@ -36,8 +35,6 @@ import {
 } from './operator-card';
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
-
-const log = createLogger('overseer/escalate');
 
 /**
  * Structured payload accepted by runEscalation. Mirrors the loose shape of
@@ -60,16 +57,6 @@ export interface EscalationSourceEvent {
   stepName: string;
   eventCreatedAt: string;
 }
-
-/**
- * Default Notion database ID for BDC's main Cauldron / WO board.
- * Used as fallback when NOTION_DB_ID env var is not set. Hardcoding this single
- * BDC-specific identifier is acceptable: it is a public discovery ID (not a secret)
- * and the alternative is failing the escalation silently when the env var drifts.
- * Override via NOTION_DB_ID for non-prod environments.
- */
-const NOTION_VERSION = '2022-06-28';
-const NOTION_API_BASE = 'https://api.notion.com/v1';
 
 /**
  * Run an escalation for a non-recoverable workflow failure.
@@ -176,83 +163,6 @@ export function buildDispatchRunReportBody(
     remediation: context.remediation ?? [],
     timestamp,
   });
-}
-
-/**
- * Find a Notion page UUID by querying the database with a filter on the WO ID
- * column. Returns null if no match or if Notion returns an error.
- *
- * BDC's WO database surfaces the WO ID under different property names depending
- * on the row -- we try the common ones in order. This is intentionally tolerant:
- * the goal is best-effort discovery, not exact-schema enforcement.
- */
-export interface NotionPageLookupResult {
-  page_id: string | null;
-  failure_outcome: 'transient_failure' | 'permanent_failure' | null;
-}
-
-function isRetrySafeHttpStatus(status: number): boolean {
-  return status === 429 || (status >= 500 && status <= 599);
-}
-
-export async function lookupNotionPage(
-  apiKey: string,
-  databaseId: string,
-  woId: string,
-  fetchImpl: typeof fetch = globalThis.fetch
-): Promise<NotionPageLookupResult> {
-  const url = `${NOTION_API_BASE}/databases/${databaseId}/query`;
-  const candidateProps = ['Task', 'WO ID', 'Name', 'Title', 'WO_ID'];
-  let sawSuccessfulQuery = false;
-  let sawRetrySafeFailure = false;
-  for (const property of candidateProps) {
-    try {
-      const res = await fetchImpl(url, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'Notion-Version': NOTION_VERSION,
-        },
-        body: JSON.stringify({
-          filter: { property, title: { equals: woId } },
-          page_size: 1,
-        }),
-      });
-      if (!res.ok) {
-        if (isRetrySafeHttpStatus(res.status)) sawRetrySafeFailure = true;
-        continue;
-      }
-      sawSuccessfulQuery = true;
-      const data = (await res.json()) as { results?: { id?: string }[] };
-      const first = data.results?.[0];
-      if (first?.id) {
-        log.info({ property, databaseId, woId }, 'overseer.notion_lookup_matched');
-        return { page_id: first.id, failure_outcome: null };
-      }
-    } catch {
-      sawRetrySafeFailure = true;
-    }
-  }
-  const failureOutcome =
-    sawSuccessfulQuery || sawRetrySafeFailure ? 'transient_failure' : 'permanent_failure';
-  log.info(
-    { candidateProps, databaseId, woId, failureOutcome },
-    'overseer.notion_lookup_exhausted'
-  );
-  return {
-    page_id: null,
-    failure_outcome: failureOutcome,
-  };
-}
-
-export async function lookupNotionPageId(
-  apiKey: string,
-  databaseId: string,
-  woId: string,
-  fetchImpl: typeof fetch = globalThis.fetch
-): Promise<string | null> {
-  return (await lookupNotionPage(apiKey, databaseId, woId, fetchImpl)).page_id;
 }
 
 function isOperatorCardRecord(

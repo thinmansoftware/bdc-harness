@@ -32,8 +32,12 @@ afterAll(() => {
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
 const requiredContextsDb = await import('@archon/core/db/overseer-required-contexts');
 const { createDurableAttemptCounterStore } = await import('../adapters/required-contexts-store.ts');
-const { NO_BASE_REF_SENTINEL, REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV, resolveRequiredContexts } =
-  await import('../adapters/required-contexts.ts');
+const {
+  NO_BASE_REF_SENTINEL,
+  REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
+  resetRequiredContextsCache,
+  resolveRequiredContexts,
+} = await import('../adapters/required-contexts.ts');
 
 const OWNER = 'thinmansoftware';
 const REPO = 'bdc-harness';
@@ -81,6 +85,7 @@ function failingInput(overrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
+  resetRequiredContextsCache();
   currentDbPath = join(
     import.meta.dir,
     `.test-required-contexts-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
@@ -200,7 +205,9 @@ describe('durable attempt counters -- the count outlives the process', () => {
     );
     expect(await requiredContextsDb.readRequiredContextsAttempts(key)).toBe(0);
 
-    // And the next failure starts the bound over rather than blocking at once.
+    // The success is cached for this base. Drop it so the next failure is a
+    // real lookup and the cleared counter starts over instead of blocking.
+    resetRequiredContextsCache();
     expect((await resolveRequiredContexts(failingInput(), env)).state).toBe('unknown');
   });
 

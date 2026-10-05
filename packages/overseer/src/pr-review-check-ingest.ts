@@ -275,7 +275,7 @@ export function conclusionIsPassing(conclusion: string | null | undefined): bool
   return (PASSING_CONCLUSIONS as readonly string[]).includes(conclusion.toLowerCase());
 }
 
-const FINDING_LINE_RE = /^\[(blocker|major|minor|note)\]\s+(.+)$/i;
+const FINDING_LINE_RE = /^\[(blocker|major|minor|note)\]\s/i;
 const CHECKS_SCOPE_PREFIX = 'checks/';
 
 /**
@@ -294,7 +294,8 @@ function parseReviewFindingLines(
     const line = raw.trim();
     const match = FINDING_LINE_RE.exec(line);
     if (!match) continue;
-    const rest = match[2] ?? '';
+    const rest = line.slice(match[0].length).trim();
+    if (rest.length === 0) continue;
     const colon = rest.indexOf(':');
     const scope = (colon === -1 ? rest : rest.slice(0, colon)).trim();
     if (scope.length === 0) continue;
@@ -318,11 +319,10 @@ export function blockingCheckNamesFromVerdict(summary: string | null | undefined
   for (const finding of parseReviewFindingLines(summary)) {
     const scope = finding.scope;
     if (!scope.toLowerCase().startsWith(CHECKS_SCOPE_PREFIX)) continue;
-    const name = scope
-      .slice(CHECKS_SCOPE_PREFIX.length)
-      .trim()
-      .replace(/\s+failed\b.*$/i, '')
-      .trim();
+    let name = scope.slice(CHECKS_SCOPE_PREFIX.length).trim();
+    const failedAt = name.search(/\sfailed\b/i);
+    if (failedAt !== -1) name = name.slice(0, failedAt);
+    name = name.trim();
     const key = name.toLowerCase();
     if (name.length === 0 || seen.has(key)) continue;
     seen.add(key);
@@ -336,6 +336,21 @@ function isSuiteLevelCheckId(checkId: string): boolean {
 }
 
 /**
+ * Drop a trailing matrix cell `(label)` from a check name. Same contract as
+ * `/\s*\([^)]*\)\s*$/`: the final group's interior may contain `(`, but a `)`
+ * inside it means the suffix is not a matrix cell and the name is unchanged.
+ * Linear in the length of `s`.
+ */
+export function stripMatrixSuffix(s: string): string {
+  const t = s.trimEnd();
+  if (!t.endsWith(')')) return t;
+  const prevClose = t.lastIndexOf(')', t.length - 2);
+  const open = t.indexOf('(', prevClose + 1);
+  if (open === -1) return t;
+  return t.slice(0, open).trimEnd();
+}
+
+/**
  * Sweep-style matcher: exact, or bare context vs matrix job. Two different
  * matrix cells (windows vs ubuntu) do not match each other.
  */
@@ -344,8 +359,8 @@ function checkNameMatchesBlockingName(checkName: string, named: string): boolean
   const want = named.trim().toLowerCase();
   if (runName.length === 0 || want.length === 0) return false;
   if (runName === want) return true;
-  const runBare = runName.replace(/\s*\([^)]*\)\s*$/, '').trim();
-  const wantBare = want.replace(/\s*\([^)]*\)\s*$/, '').trim();
+  const runBare = stripMatrixSuffix(runName);
+  const wantBare = stripMatrixSuffix(want);
   if (runBare.length >= 3 && runBare === want) return true;
   if (wantBare.length >= 3 && wantBare === runName) return true;
   return false;
@@ -499,6 +514,9 @@ export function completionIsRelevantToVerdict(
     return false;
   }
 
+  // A fork can set check_run.name. Refuse oversized names before any match.
+  if (completion.checkName.length > 512) return false;
+
   // A SUITE-LEVEL completion (`workflow_run` / `check_suite`) that concluded
   // passing means EVERY job inside it passed, including whichever one the
   // verdict named. That is strictly stronger evidence than a single job going
@@ -524,7 +542,7 @@ export function completionIsRelevantToVerdict(
   // CONTEXT is sometimes just `test`. Compare the bare job name too, so the
   // matrix suffix does not defeat an otherwise exact match. Bounded to a
   // non-trivial stem so a one-letter fragment cannot match everything.
-  const bare = name.replace(/\s*\([^)]*\)\s*$/, '').trim();
+  const bare = stripMatrixSuffix(name).trim();
   return bare.length >= 3 && bare !== name && summary.includes(bare);
 }
 

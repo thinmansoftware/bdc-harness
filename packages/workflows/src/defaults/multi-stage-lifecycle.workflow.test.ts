@@ -15,6 +15,19 @@ const workflowPath = join(
 );
 
 describe('multi-stage workflow lifecycle guards', () => {
+  test('allows CI-green gate waits beyond the default idle timeout', () => {
+    const workflow = readFileSync(workflowPath, 'utf8');
+    const nodeStart = workflow.indexOf('  - id: implement-pipeline');
+    expect(nodeStart).toBeGreaterThanOrEqual(0);
+
+    const nextNodeStart = workflow.indexOf('\n  - id:', nodeStart + 1);
+    const nodeText = workflow.slice(nodeStart, nextNodeStart === -1 ? undefined : nextNodeStart);
+    const idleTimeout = nodeText.match(/^    idle_timeout: (\d+)\s*$/m);
+
+    expect(idleTimeout).not.toBeNull();
+    expect(Number(idleTimeout?.[1])).toBeGreaterThanOrEqual(900000);
+  });
+
   test('uses the mechanical lifecycle reducer before status mutation', () => {
     const workflow = readFileSync(workflowPath, 'utf8');
     const reducerIndex = workflow.indexOf('multi-stage-lifecycle.ts');

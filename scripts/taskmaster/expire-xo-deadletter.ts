@@ -1,8 +1,8 @@
 /**
  * One-shot M-155 dead-letter expiry (WO-HARNESS-TASKMASTER-EXCEPTION-PUSH-01).
  *
- * Marks the ~920 queued, never-addressed recipient='xo' taskmaster messages
- * as addressed, with a tm_journal note citing M-155. The Taskmaster sent them
+ * Marks queued, unread recipient='xo' taskmaster messages expired via their
+ * route disposition, with a tm_journal note citing M-155. The Taskmaster sent them
  * into a mailbox faster than it was drained; M-155 ruled the backlog
  * dead-letter (DoD D-4: messages must reach a surface someone reads).
  *
@@ -20,16 +20,18 @@
  */
 import { randomUUID } from 'node:crypto';
 import { closeDatabase, getDatabase } from '../../packages/core/src/db/connection';
+import { disposeMessageByMachine } from '../../packages/core/src/db/dispatch';
 
 const MATCH_WHERE = `
   sender = 'taskmaster'
   AND LOWER(TRIM(recipient)) = 'xo'
   AND status = 'queued'
+  AND acknowledged_at IS NULL
   AND addressed_at IS NULL
+  AND route_disposition IS NULL
 `;
 
 const JOURNAL_IDEMPOTENCY_KEY = 'tm:m155:deadletter-expiry';
-const ADDRESSED_BY = 'xo:m155-deadletter-expiry';
 
 async function countMatching(): Promise<number> {
   const result = await getDatabase().query<{ cnt: number | string }>(
@@ -46,7 +48,7 @@ async function main(): Promise<void> {
   if (!confirm) {
     console.log(
       `[dry-run] ${matching} queued, never-addressed recipient='xo' taskmaster ` +
-        'messages match. Re-run with --confirm to mark them addressed (M-155).'
+        'messages match. Re-run with --confirm to expire them (M-155).'
     );
     return;
   }
@@ -62,12 +64,20 @@ async function main(): Promise<void> {
   // committed update would leave the expiry permanently unjournaled -- a
   // rerun sees 0 matching rows and exits before ever reaching the insert.
   await db.withTransaction(async query => {
-    await query(
-      `UPDATE agent_dispatch_messages
-          SET addressed_at = $1, addressed_by = $2
-        WHERE ${MATCH_WHERE}`,
-      [nowIso, ADDRESSED_BY]
+    const rows = await query<{ id: string }>(
+      `SELECT id FROM agent_dispatch_messages WHERE ${MATCH_WHERE}`
     );
+    for (const row of rows.rows) {
+      const disposed = await disposeMessageByMachine(
+        {
+          id: row.id,
+          actor: 'system:m155-deadletter-expiry',
+          disposition: 'expired',
+        },
+        query
+      );
+      if (!disposed.ok) throw new Error(`deadletter_dispose_failed:${row.id}:${disposed.reason}`);
+    }
 
     // Journal note citing M-155 (idempotent: skipped when the note already
     // exists from a prior completed run). action_type/outcome use existing
@@ -88,11 +98,11 @@ async function main(): Promise<void> {
           JSON.stringify({
             note:
               `M-155 dead-letter expiry: marked ${matching} queued, never-addressed ` +
-              "recipient='xo' taskmaster messages as addressed. Authority: " +
+              "recipient='xo' taskmaster messages as expired. Authority: " +
               'M-20260817-155 (docs/board/motions/M-20260817-155-taskmaster-course-correction.md), ' +
               'DoD D-4. One-shot operator action at Deploy 2; never run by the loop.',
             expired_count: matching,
-            addressed_by: ADDRESSED_BY,
+            disposition: 'expired',
           }),
           JOURNAL_IDEMPOTENCY_KEY,
         ]
@@ -101,8 +111,7 @@ async function main(): Promise<void> {
   });
 
   console.log(
-    `Marked ${matching} taskmaster dead-letter messages addressed (addressed_by=${ADDRESSED_BY}) ` +
-      'and journaled the M-155 citation.'
+    `Marked ${matching} taskmaster dead-letter messages expired and journaled the M-155 citation.`
   );
 }
 

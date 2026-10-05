@@ -125,13 +125,17 @@ interface GhPrRow {
   body?: string;
 }
 
-export async function ghPrSearchDefault(repo: string, woId: string): Promise<WoClaim[]> {
+export async function ghPrSearchDefault(
+  repo: string,
+  woId: string,
+  execFn: typeof execFileAsync = execFileAsync
+): Promise<WoClaim[]> {
   if (process.env.SMART_CAULDRON_HERMETIC === '1') {
     console.log('[smart-cauldron/already-satisfied] skipping GitHub search in hermetic mode');
     return [];
   }
   try {
-    const { stdout } = await execFileAsync(
+    const { stdout } = await execFn(
       'gh',
       [
         'pr',

@@ -17,6 +17,7 @@ import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
 import { runCascade } from '@archon/smart-cauldron/cascade';
+import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldron/headroom';
 import {
   assessDispatchRecipient,
   createAuthenticatedMessage,
@@ -38,10 +39,21 @@ import {
   type TmActionType,
   usefulRateFloorBreached,
 } from './rules';
-import { validateProposal, type TmAllowedRecipient } from './guard';
+import { validateProposal, WO_ID_RE, type TmAllowedRecipient } from './guard';
+import {
+  buildEscalationCommentBody,
+  createDbEscalationDeliveryClaim,
+  createRealEscalationDeliveryDeps,
+  deliverEscalationToIssue,
+  parseGithubThreadRef,
+  parseOwnerLabel,
+  resolveEscalateToIssueEnabled,
+  type EscalationDeliveryDeps,
+} from './escalation-delivery';
 import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
+import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import { fireBackoffDecision } from './backoff';
 import { checkExpectations } from './expectations';
 import {
@@ -54,6 +66,17 @@ import {
 } from './deadman';
 
 const log = createLogger('taskmaster/loop');
+
+/**
+ * One process-wide real escalation-delivery deps object, so its cached
+ * poster-login lookup (GET /user, used to trust only Taskmaster's own marker
+ * comments) runs once per token rather than once per escalation.
+ */
+let realEscalationDelivery: EscalationDeliveryDeps | null = null;
+function defaultEscalationDelivery(): EscalationDeliveryDeps {
+  realEscalationDelivery ??= createRealEscalationDeliveryDeps();
+  return realEscalationDelivery;
+}
 
 /** Ratified Q1 budgets. */
 export const MAX_EFFECTS_PER_TICK = 10;
@@ -184,6 +207,7 @@ export interface TaskmasterDeps {
    * human-read) from human-facing channels when grading an action 'unheard'.
    */
   assessDispatchRecipient?: (recipient: string) => Promise<DispatchRecipientAssessment>;
+  getDispatchReceiptCutoverAt?: () => Promise<string | null>;
   getGithubIssueEvidence?: (
     threadRef: string,
     sinceIso: string
@@ -198,6 +222,15 @@ export interface TaskmasterDeps {
   /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
   onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
   checkExpectations?: (now: Date) => Promise<void>;
+  /**
+   * GitHub-issue escalation delivery seam
+   * (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). Tests inject fake
+   * listIssueComments/postIssueComment; production defaults to
+   * createRealEscalationDeliveryDeps(). The per-issue delivery claim comes
+   * from escalationDelivery.claim when provided, else the database-backed
+   * claim when the real DAL is in use (no deps.db), else none.
+   */
+  escalationDelivery?: EscalationDeliveryDeps;
 }
 
 export interface TickResult {
@@ -288,7 +321,10 @@ interface GithubIssue {
  * issue number -- OR semantics, never requiring both simultaneously.
  */
 const WORK_LABELS = ['wo', 'project', 'arc'] as const;
+const MAX_PAGES_PER_LABEL = 10;
 const GITHUB_RATE_LIMIT_FLOOR = 5;
+/** Max GitHub search requests for open-PR claims inside one defaultListThreads call. */
+const PR_CLAIM_LOOKUP_CAP = 10;
 
 /**
  * Default max evidence enrichments per adoption refresh tick.
@@ -375,6 +411,7 @@ export interface ListedThread extends ThreadSnapshot {
   title?: string | null;
   ownerLogin?: string | null;
   labels?: string[];
+  beyondFirstPage?: boolean;
 }
 
 export type ListedThreadResult = ListedThread[] & { unlabelledPriorityTriage: string[] };
@@ -400,7 +437,7 @@ function assertGithubRateLimit(response: Response, context: string): void {
 
 /**
  * Work-SOR read: open GitHub issues labeled wo, project, or arc across the configured
- * repos (one request per label -- see WORK_LABELS). Rate-limit-aware (Claude
+ * repos (bounded pagination per label -- see WORK_LABELS). Rate-limit-aware (Claude
  * seat amendment): honors x-ratelimit-remaining and backs off rather than
  * spinning. An incomplete or failed read throws so the tick cannot advance its
  * success heartbeat on a partial source snapshot. Exported for tests;
@@ -417,12 +454,18 @@ export async function defaultListThreads(
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const threads: ListedThread[] = [];
   const unlabelledPriorityTriage: string[] = [];
+  let prClaimLookups = 0;
   for (const repo of repos) {
     const seen = new Set<number>();
-    for (const label of WORK_LABELS) {
+    const firstPages = new Map<(typeof WORK_LABELS)[number], GithubIssue[]>();
+
+    const fetchPage = async (
+      label: (typeof WORK_LABELS)[number],
+      page: number
+    ): Promise<GithubIssue[]> => {
       try {
         const response = await fetchImpl(
-          `https://api.github.com/repos/${repo}/issues?state=open&labels=${label}&per_page=100`,
+          `https://api.github.com/repos/${repo}/issues?state=open&labels=${label}&per_page=100&page=${page}`,
           {
             headers: {
               accept: 'application/vnd.github+json',
@@ -430,50 +473,79 @@ export async function defaultListThreads(
             },
           }
         );
-        assertGithubRateLimit(response, `work-sor:${repo}:${label}`);
+        assertGithubRateLimit(response, `work-sor:${repo}:${label}:${page}`);
         if (!response.ok) {
-          log.warn({ repo, label, status: response.status }, 'taskmaster.github_read_failed');
+          log.warn({ repo, label, page, status: response.status }, 'taskmaster.github_read_failed');
           throw new Error(`taskmaster_github_work_sor_read_failed:${response.status}`);
         }
-        const issues = (await response.json()) as GithubIssue[];
-        for (const issue of issues) {
-          if (issue.pull_request) continue;
-          if (seen.has(issue.number)) continue; // carried both labels
-          seen.add(issue.number);
-          const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
-          const priority = priorityFromLabels(labels);
-          if (priority === null) {
-            const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
-            unlabelledPriorityTriage.push(ref);
-            log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
-            continue;
-          }
-          const normalizedLabels = labels.map(label => label.trim().toLowerCase());
-          const hasClaimStatus = normalizedLabels.some(label =>
-            ['status:building', 'status:review'].includes(label)
-          );
-          const ownerLogin = issue.assignees?.[0]?.login ?? null;
-          const isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
-          threads.push({
-            ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
-            priority,
-            isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
-            lastActivityAt: issue.updated_at,
-            isBlocked: normalizedLabels.some(label =>
-              ['blocked', 'status:blocked'].includes(label)
-            ),
-            isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
-            isUnclaimed,
-            isUnclaimedP0: priority === 'P0' && isUnclaimed,
-            recipient: resolveRecipient(ownerLogin),
-            title: issue.title ?? null,
-            ownerLogin,
-            labels,
-          });
-        }
+        return (await response.json()) as GithubIssue[];
       } catch (error) {
-        log.warn({ err: error as Error, repo, label }, 'taskmaster.github_read_error');
+        log.warn({ err: error as Error, repo, label, page }, 'taskmaster.github_read_error');
         throw error;
+      }
+    };
+
+    const addIssues = async (issues: GithubIssue[], beyondFirstPage: boolean): Promise<void> => {
+      for (const issue of issues) {
+        if (issue.pull_request) continue;
+        if (seen.has(issue.number)) continue; // carried both labels
+        seen.add(issue.number);
+        const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
+        const priority = priorityFromLabels(labels);
+        if (priority === null) {
+          const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
+          unlabelledPriorityTriage.push(ref);
+          log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
+          continue;
+        }
+        const normalizedLabels = labels.map(label => label.trim().toLowerCase());
+        const hasClaimStatus = normalizedLabels.some(label =>
+          ['status:building', 'status:review'].includes(label)
+        );
+        const ownerLogin = issue.assignees?.[0]?.login ?? null;
+        let isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
+        const woId = issue.title?.match(WO_ID_RE)?.[0];
+        if (isUnclaimed && woId !== undefined && prClaimLookups < PR_CLAIM_LOOKUP_CAP) {
+          prClaimLookups += 1;
+          const claimed = await lookupOpenPrClaim(fetchImpl, repo, woId);
+          if (claimed) isUnclaimed = false;
+        }
+        threads.push({
+          ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
+          priority,
+          isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
+          lastActivityAt: issue.updated_at,
+          isBlocked: normalizedLabels.some(label =>
+            ['blocked', 'status:blocked', 'wo:blocked'].includes(label)
+          ),
+          isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
+          isUnclaimed,
+          isUnclaimedP0: priority === 'P0' && isUnclaimed,
+          recipient: resolveRecipient(ownerLogin),
+          title: issue.title ?? null,
+          ownerLogin,
+          labels,
+          beyondFirstPage,
+        });
+      }
+    };
+
+    // Process every label's first page before later pages so cross-label
+    // duplicates retain first-page status regardless of label order.
+    for (const label of WORK_LABELS) {
+      const issues = await fetchPage(label, 1);
+      firstPages.set(label, issues);
+      await addIssues(issues, false);
+    }
+    for (const label of WORK_LABELS) {
+      if (firstPages.get(label)?.length !== 100) continue;
+      for (let page = 2; page <= MAX_PAGES_PER_LABEL; page += 1) {
+        const issues = await fetchPage(label, page);
+        await addIssues(issues, true);
+        if (issues.length < 100) break;
+        if (page === MAX_PAGES_PER_LABEL) {
+          log.warn({ repo, label, page }, 'taskmaster.github_page_limit_reached');
+        }
       }
     }
   }
@@ -503,6 +575,46 @@ function githubHeaders(): Record<string, string> {
     accept: 'application/vnd.github+json',
     ...(token ? { authorization: `Bearer ${token}` } : {}),
   };
+}
+
+/** HTTP failure from the open-PR claim search. Carries the response status for the warning. */
+class PrClaimLookupError extends Error {
+  readonly status: number;
+
+  constructor(status: number) {
+    super(`taskmaster_pr_claim_lookup_failed:${status}`);
+    this.name = 'PrClaimLookupError';
+    this.status = status;
+  }
+}
+
+/**
+ * True when GitHub search returns at least one open pull request whose title
+ * or body contains the work-order id, scoped to the repository owner.
+ * Failures are logged and returned as false so the work-SOR read stays up.
+ */
+async function lookupOpenPrClaim(
+  fetchImpl: typeof fetch,
+  repo: string,
+  woId: string
+): Promise<boolean> {
+  const slash = repo.indexOf('/');
+  const owner = slash === -1 ? repo : repo.slice(0, slash);
+  const query = `is:pr is:open in:title,body ${woId} org:${owner}`;
+  const url = `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=1`;
+  try {
+    const response = await fetchImpl(url, { headers: githubHeaders() });
+    if (!response.ok) {
+      throw new PrClaimLookupError(response.status);
+    }
+    const body = (await response.json()) as { items?: unknown[] } | null;
+    return Array.isArray(body?.items) && body.items.length > 0;
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    const status = error instanceof PrClaimLookupError ? error.status : undefined;
+    log.warn({ err, repo, woId, status }, 'taskmaster.pr_claim_lookup_failed');
+    return false;
+  }
 }
 
 /**
@@ -791,6 +903,10 @@ async function reconcilePendingActions(
  * channel-deafness cannot apply. It is inherently heard and graded
  * 'useful'/'noise' purely on cascade-run and issue-movement evidence.
  */
+export function isPostCutoverReceipt(stamp: string | null, cutoverAt: string | null): boolean {
+  return stamp !== null && cutoverAt !== null && stamp >= cutoverAt;
+}
+
 async function gradeSentActions(
   actions: taskmasterDb.TmJournalEntry[],
   dal: TaskmasterDal,
@@ -799,7 +915,8 @@ async function gradeSentActions(
   getIssueEvidence: NonNullable<TaskmasterDeps['getGithubIssueEvidence']>,
   nowMs: number,
   getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>,
-  assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>
+  assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>,
+  cutoverAt: string | null
 ): Promise<number> {
   let failures = 0;
   for (const action of actions) {
@@ -853,7 +970,7 @@ async function gradeSentActions(
       const heardRecipient = dispatchRow?.resolved_recipient ?? dispatchRow?.recipient ?? null;
       const recipientAssessment = heardRecipient ? await assessRecipient(heardRecipient) : null;
       const heard =
-        dispatchRow?.acknowledged_at != null &&
+        isPostCutoverReceipt(dispatchRow?.acknowledged_at ?? null, cutoverAt) &&
         recipientAssessment?.delivery_mode != null &&
         recipientAssessment.delivery_mode !== 'drain_on_start';
 
@@ -896,7 +1013,9 @@ async function gradeSentActions(
           ? action.thread_ref.slice('dispatch:'.length)
           : '';
         const ruling = rulingId ? await getDispatchById(rulingId) : null;
-        const addressedAtMs = ruling?.addressed_at ? Date.parse(ruling.addressed_at) : NaN;
+        const addressedAtMs = isPostCutoverReceipt(ruling?.addressed_at ?? null, cutoverAt)
+          ? Date.parse(ruling?.addressed_at ?? '')
+          : NaN;
         const expectedRecipient = ruling?.resolved_recipient ?? ruling?.recipient;
         if (
           ruling &&
@@ -995,11 +1114,11 @@ export async function refreshAdoption(
   try {
     snapshotId = await dal.beginAdoptionSnapshot();
 
-    // Prior committed evidence ages for staleness ordering (NULL first).
+    // Prior committed rows provide evidence ages and carry-forward values.
     const priorRows = (await dal.getAdoption()) ?? [];
-    const priorEvidenceAt = new Map<string, string | null>();
+    const priorByRef = new Map<string, taskmasterDb.TmAdoptionRow>();
     for (const row of priorRows) {
-      priorEvidenceAt.set(row.thread_ref, row.evidence_observed_at);
+      priorByRef.set(canonicalizeThreadRef(row.thread_ref), row);
     }
 
     // Attempt counts: read journal without threadRef filter, group by canonical ref.
@@ -1021,8 +1140,8 @@ export async function refreshAdoption(
     const ordered = [...threads].sort((a, b) => {
       const aRef = canonicalizeThreadRef(a.ref);
       const bRef = canonicalizeThreadRef(b.ref);
-      const aAt = priorEvidenceAt.get(aRef) ?? null;
-      const bAt = priorEvidenceAt.get(bRef) ?? null;
+      const aAt = priorByRef.get(aRef)?.evidence_observed_at ?? null;
+      const bAt = priorByRef.get(bRef)?.evidence_observed_at ?? null;
       if (aAt === null && bAt === null) return 0;
       if (aAt === null) return -1;
       if (bAt === null) return 1;
@@ -1092,6 +1211,26 @@ export async function refreshAdoption(
           // Prefer list title; evidence path does not re-fetch title separately.
           enrichedCount += 1;
         }
+      } else {
+        const prior = priorByRef.get(ref);
+        if (prior) {
+          base.owner_login = prior.owner_login;
+          base.state = prior.state;
+          base.labels_json = prior.labels_json;
+          base.last_movement_at = prior.last_movement_at;
+          base.last_movement_kind = prior.last_movement_kind;
+          base.latest_marker_kind = prior.latest_marker_kind;
+          base.latest_marker_at = prior.latest_marker_at;
+          base.blocked_reason = prior.blocked_reason;
+          base.next_action = prior.next_action;
+          base.evidence_observed_at = prior.evidence_observed_at;
+          if (
+            prior.source_updated_at !== null &&
+            Date.parse(thread.lastActivityAt) <= Date.parse(prior.source_updated_at)
+          ) {
+            base.source_updated_at = prior.source_updated_at;
+          }
+        }
       }
 
       await dal.upsertAdoptionRow(snapshotId, base);
@@ -1157,6 +1296,15 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       return { status: row.status, prOpened };
     });
   const nowMs = now().getTime();
+  const cutoverAt = await (
+    deps.getDispatchReceiptCutoverAt ??
+    (async (): Promise<string | null> => {
+      const result = await getDatabase().query<{ applied_at: string }>(
+        'SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1'
+      );
+      return result.rows[0]?.applied_at ?? null;
+    })
+  )();
 
   state.tickIndex += 1;
   recordTickAttempt(state.deadman, nowMs);
@@ -1232,7 +1380,26 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.lane_health_read_failed');
   }
-  const laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+  let laneDecision: ReturnType<typeof decideFireLane>;
+  try {
+    const seatUsage = await conductorSeatUsage();
+    const thresholdPercent = resolveEntryThreshold(process.env);
+    const overThreshold: Partial<Record<'claude' | 'codex', boolean>> = {};
+    for (const lane of ['claude', 'codex'] as const) {
+      const used = bindingUsedPercent(seatUsage[lane]);
+      if (typeof used === 'number' && used >= thresholdPercent) overThreshold[lane] = true;
+    }
+    laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth }, overThreshold);
+    // The routing threshold only steers between lanes; it must never hold a fire that the
+    // unfiltered decision would dispatch (seats below the run-start cutoff stay usable).
+    if (laneDecision.holding) {
+      const unfiltered = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+      if (!unfiltered.holding) laneDecision = unfiltered;
+    }
+  } catch (error) {
+    log.warn({ err: error as Error }, 'taskmaster.seat_headroom_read_failed');
+    laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+  }
 
   // Grade previously sent actions against the external SOR.
   tickFailures += await gradeSentActions(
@@ -1243,7 +1410,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     getIssueEvidence,
     nowMs,
     getFireRunEvidence,
-    assessRecipient
+    assessRecipient,
+    cutoverAt
   );
 
   // M-155 Q3: useful-rate floor with auto-PAUSE. Counted AFTER
@@ -1403,6 +1571,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   }
 
   const proposals: ActionProposal[] = [];
+  const fireBeyondFirstPageAllowed = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE === 'true';
   for (const item of [...rulings, ...threads]) {
     const canonRef = canonicalizeThreadRef(item.ref);
     const adoptionRow = adoptionByRef.get(canonRef);
@@ -1443,7 +1612,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       adoption: adoptionRow?.title ? adoptionRow : undefined,
       grades: gradesByRef.get(canonRef),
       suppression: suppressionByRef.get(canonRef),
-      fireEligible: fireResult.eligible && Boolean(fireResult.evidence?.expectedSpec),
+      fireEligible:
+        fireResult.eligible &&
+        Boolean(fireResult.evidence?.expectedSpec) &&
+        (!(item as ListedThread).beyondFirstPage || fireBeyondFirstPageAllowed),
       fireLane: laneDecision.lane,
       fireHolding: laneDecision.holding,
       fireEscalate: backoff.kind === 'escalate',
@@ -1682,7 +1854,78 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
 
     try {
-      if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
+      const escalationIssue =
+        proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
+          ? parseGithubThreadRef(proposal.threadRef)
+          : null;
+      if (escalationIssue) {
+        // WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01: deliver the escalation as
+        // a GitHub issue comment (where the owner and Duty Officer look), not to
+        // the operator dispatch mailbox (a drain_on_start principal with no
+        // reader). The body is built from adoption content, NOT proposal.body,
+        // which is written for the operator-mailbox audience. No dispatch row
+        // exists for a GitHub-comment effect, so no expectation is registered.
+        //
+        // The two delivery results are journaled differently:
+        //   - posted:true  -> the row is 'sent' + graded 'delivered_to_issue'
+        //     (excluded from the M-155 useful-rate floor, like 'unheard') and
+        //     counts as a tick effect.
+        //   - posted:false -> NOTHING was delivered: either another attempt holds
+        //     the issue's delivery claim (suppressedBy 'claim_held') or a marker
+        //     comment inside the 72h cooldown already covers the issue
+        //     ('cooldown_marker'). The row is closed as 'expired' (the existing
+        //     "journaled, never performed, terminal for this key" outcome) with
+        //     proposal_json.suppressed=<reason>, and is NOT graded. It is not a
+        //     tick effect, does not mark the thread touched, and -- because the
+        //     per-item 24h intervention cap (interventions24hByThread), the
+        //     adoption attempt counts, and gradeSentActions all read only
+        //     outcome='sent' -- it consumes no intervention budget and never
+        //     enters the useful-rate floor.
+        //
+        // The per-issue claim (tm_escalation_claims, migration 057) is taken
+        // BEFORE the GitHub list+post, so two ticks or processes sharing the
+        // database cannot both pass the marker check and both post.
+        const adoptionRow = adoptionByRef.get(canonicalizeThreadRef(proposal.threadRef));
+        const body = buildEscalationCommentBody({
+          title: adoptionRow?.title ?? null,
+          threadRef: proposal.threadRef,
+          sinceIso: adoptionRow?.last_movement_at ?? adoptionRow?.source_updated_at ?? null,
+          nextAction: adoptionRow?.next_action ?? null,
+          ownerLabelLogin: parseOwnerLabel(adoptionRow?.labels_json),
+          nowMs,
+        });
+        const baseDelivery = deps.escalationDelivery ?? defaultEscalationDelivery();
+        const delivery: EscalationDeliveryDeps =
+          baseDelivery.claim || deps.db
+            ? baseDelivery
+            : { ...baseDelivery, claim: createDbEscalationDeliveryClaim() };
+        const delivered = await deliverEscalationToIssue(
+          { issue: escalationIssue, threadRef: proposal.threadRef, body },
+          delivery
+        );
+        if (!delivered.posted) {
+          const suppressed = delivered.suppressedBy ?? 'cooldown_marker';
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'expired',
+            JSON.stringify({ ...proposal, suppressed })
+          );
+          journalRow.outcome = 'expired';
+          result.expired += 1;
+          log.info(
+            {
+              actionType: proposal.type,
+              threadRef: proposal.threadRef,
+              idempotencyKey: proposal.idempotencyKey,
+              suppressed,
+            },
+            'taskmaster.escalation_suppressed'
+          );
+          continue;
+        }
+        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.gradeAction(journalRow.id, 'delivered_to_issue');
+      } else if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
         let resolveAdmission: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
           null;
         let rejectAdmission: ((error: unknown) => void) | null = null;
@@ -1696,6 +1939,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           project: proposal.fireEvidence.project,
           dispatchId: proposal.idempotencyKey,
           token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+          deps: { seatUsage: conductorSeatUsage },
           onAdmission: record => resolveAdmission?.(record),
         });
         void cascadePromise.catch((error: unknown) => {
