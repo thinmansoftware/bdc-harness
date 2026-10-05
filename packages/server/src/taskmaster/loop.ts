@@ -31,6 +31,7 @@ import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
   adoptionContentHash,
   classifyThread,
+  computeBlockerReport,
   computeNextAction,
   isSuppressedByNoise,
   type ActionProposal,
@@ -39,6 +40,7 @@ import {
   type TmActionType,
   usefulRateFloorBreached,
 } from './rules';
+import { dutyOfficerClockEnabled } from '../dispatch/duty-officer-clock';
 import { validateProposal, WO_ID_RE, type TmAllowedRecipient } from './guard';
 import {
   buildEscalationCommentBody,
@@ -82,6 +84,15 @@ function defaultEscalationDelivery(): EscalationDeliveryDeps {
 export const MAX_EFFECTS_PER_TICK = 10;
 /** Conservative faucet bound for newly eligible work, within the shared cap. */
 export const MAX_FIRES_PER_TICK = 3;
+
+/**
+ * Per-tick cap on blocker_report sends (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01).
+ * With 27 label-blocked threads and up to 63 unclaimed P0s in tm_adoption, the
+ * first cycle would otherwise flood the single xo mailbox; capping at 3 per
+ * 15-minute tick drains the backlog over several ticks instead. Overflow is
+ * journaled 'deferred' (not dropped), exactly like other budget overflow.
+ */
+export const MAX_BLOCKER_REPORTS_PER_TICK = 3;
 
 /**
  * Pause effect-delivery gate (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01).
@@ -404,6 +415,7 @@ export const TM_REPEAT_REASON_BY_TYPE: Record<TmActionType, string> = {
   deliver_ruling: 'tm:deliver_ruling:repeated',
   digest: 'tm:digest:repeated',
   fire_cauldron: 'tm:fire_cauldron:repeated',
+  blocker_report: 'tm:blocker_report:repeated',
 };
 
 /** Listed work-SOR thread with optional adoption fields carried from the issue payload. */
@@ -989,6 +1001,10 @@ async function gradeSentActions(
         }
       }
       if (action.action_type === 'digest') continue;
+      // blocker_report is a DO-relay handoff, not an SC7 useful action: like
+      // digest it is never graded useful/noise and never enters the 40%
+      // useful-rate floor denominator in either direction.
+      if (action.action_type === 'blocker_report') continue;
 
       const sentAtMs = Date.parse(effect.createdAt);
       if (!Number.isFinite(sentAtMs)) {
@@ -1084,6 +1100,9 @@ function proofPredicate(proposal: ActionProposal): string {
   }
   if (proposal.type === 'fire_cauldron') {
     return 'created Cauldron run completes or opens a PR, or the source issue gains status:building before the proof deadline';
+  }
+  if (proposal.type === 'blocker_report') {
+    return 'blocker report delivery only; relayed to xo by the Duty Officer clock; never qualifies as an SC7 useful action';
   }
   return 'digest delivery only; never qualifies as an SC7 useful action';
 }
@@ -1360,6 +1379,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   const lookback = await dal.getActionsSince(new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString());
   const actionsByKey = new Map<string, taskmasterDb.TmJournalEntry>();
   const interventions24hByThread = new Map<string, number>();
+  // Most recent 'sent' blocker_report per canonical ref (72h cooldown input).
+  const lastBlockerReportSentByThread = new Map<string, number>();
   const since24h = nowMs - DAY_MS;
   for (const action of lookback) {
     if (action.idempotency_key && !actionsByKey.has(action.idempotency_key))
@@ -1369,6 +1390,14 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         action.thread_ref,
         (interventions24hByThread.get(action.thread_ref) ?? 0) + 1
       );
+    }
+    if (action.action_type === 'blocker_report' && action.outcome === 'sent') {
+      const key = canonicalizeThreadRef(action.thread_ref);
+      const atMs = Date.parse(action.created_at);
+      if (Number.isFinite(atMs)) {
+        const prev = lastBlockerReportSentByThread.get(key);
+        if (prev === undefined || atMs > prev) lastBlockerReportSentByThread.set(key, atMs);
+      }
     }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
@@ -1572,6 +1601,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   const proposals: ActionProposal[] = [];
   const fireBeyondFirstPageAllowed = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE === 'true';
+  const blockerReportEnabled = resolveBlockerReportEnabled();
   for (const item of [...rulings, ...threads]) {
     const canonRef = canonicalizeThreadRef(item.ref);
     const adoptionRow = adoptionByRef.get(canonRef);
@@ -1602,6 +1632,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         );
       }
     }
+    const fireEligibleResolved =
+      fireResult.eligible &&
+      Boolean(fireResult.evidence?.expectedSpec) &&
+      (!(item as ListedThread).beyondFirstPage || fireBeyondFirstPageAllowed);
     const proposal = computeNextAction(item, classification, {
       interventionsLast24h: interventions24hByThread.get(item.ref) ?? 0,
       nowMs,
@@ -1612,10 +1646,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       adoption: adoptionRow?.title ? adoptionRow : undefined,
       grades: gradesByRef.get(canonRef),
       suppression: suppressionByRef.get(canonRef),
-      fireEligible:
-        fireResult.eligible &&
-        Boolean(fireResult.evidence?.expectedSpec) &&
-        (!(item as ListedThread).beyondFirstPage || fireBeyondFirstPageAllowed),
+      fireEligible: fireEligibleResolved,
       fireLane: laneDecision.lane,
       fireHolding: laneDecision.holding,
       fireEscalate: backoff.kind === 'escalate',
@@ -1636,6 +1667,23 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     });
     if (proposal) {
       proposals.push(proposal);
+    }
+
+    // blocker_report is computed IN ADDITION to computeNextAction (it never
+    // replaces a ruling/fire/escalate/nudge). Off by flag -> not called.
+    if (blockerReportEnabled) {
+      const blockerProposal = computeBlockerReport(item, classification, {
+        interventionsLast24h: interventions24hByThread.get(item.ref) ?? 0,
+        nowMs,
+        adoption: adoptionRow,
+        fireEligible: fireEligibleResolved,
+        fireHolding: laneDecision.holding,
+        fireEvidence: fireResult.evidence,
+        lastBlockerReportSentAtMs: lastBlockerReportSentByThread.get(canonRef) ?? null,
+      });
+      if (blockerProposal) {
+        proposals.push(blockerProposal);
+      }
     }
   }
 
@@ -1681,7 +1729,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       return 2 + priorityRank[priorityByRef.get(proposal.threadRef) ?? 'P3'];
     }
     if (proposal.type === 'nudge') return 6;
-    return 7;
+    if (proposal.type === 'blocker_report') return 7;
+    return 8;
   };
   proposals.sort((a, b) => {
     const immediate = Number(b.actsImmediately) - Number(a.actsImmediately);
@@ -1692,6 +1741,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   const touchedThisTick = new Set<string>();
   let firesThisTick = 0;
+  let blockerReportsThisTick = 0;
 
   for (const proposal of proposals) {
     let existingAction =
@@ -1784,6 +1834,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     if (
       result.effects >= MAX_EFFECTS_PER_TICK ||
       (proposal.type === 'fire_cauldron' && firesThisTick >= MAX_FIRES_PER_TICK) ||
+      (proposal.type === 'blocker_report' &&
+        blockerReportsThisTick >= MAX_BLOCKER_REPORTS_PER_TICK) ||
       touchedThisTick.has(proposal.threadRef)
     ) {
       result.deferred += 1;
@@ -2007,8 +2059,16 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             classification: 'succeeded',
           }),
           due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
-          on_absence: proposal.type === 'digest' ? 'escalate' : 'redispatch',
-          max_retries: 2,
+          // blocker_report uses give_up / 0 retries: a redispatch would make a
+          // second duty-officer row and a second XO relay; the next 72h report
+          // is its retry. digest escalates; everything else redispatches.
+          on_absence:
+            proposal.type === 'digest'
+              ? 'escalate'
+              : proposal.type === 'blocker_report'
+                ? 'give_up'
+                : 'redispatch',
+          max_retries: proposal.type === 'blocker_report' ? 0 : 2,
         });
         await dal.updateActionOutcome(journalRow.id, 'sent');
       }
@@ -2016,6 +2076,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
       if (proposal.type === 'fire_cauldron') firesThisTick += 1;
+      if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
       log.info(
         {
           actionType: proposal.type,
@@ -2095,6 +2156,23 @@ export function resolveFireVerbEnabled(
   raw: string | undefined = process.env.TASKMASTER_FIRE_VERB_ENABLED
 ): boolean {
   return raw?.trim().toLowerCase() === 'true' || raw?.trim() === '1';
+}
+
+/**
+ * Resolve whether blocker_report is enabled this tick
+ * (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01). Explicit 'false'/'0' off,
+ * 'true'/'1' on; unset follows the Duty Officer clock, which in this process is
+ * the only consumer of recipient 'duty-officer' -- a report with no consumer is
+ * a dead letter, so if the clock is off the verb is off by default.
+ */
+export function resolveBlockerReportEnabled(
+  raw: string | undefined = process.env.TASKMASTER_BLOCKER_REPORT,
+  clockEnabled: boolean = dutyOfficerClockEnabled()
+): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  if (normalized === 'false' || normalized === '0') return false;
+  if (normalized === 'true' || normalized === '1') return true;
+  return clockEnabled;
 }
 
 /**

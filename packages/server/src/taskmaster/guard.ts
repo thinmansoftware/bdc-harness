@@ -23,6 +23,7 @@ export const TM_ALLOWED_ACTION_TYPES = [
   'escalate_p0',
   'digest',
   'fire_cauldron',
+  'blocker_report',
 ] as const;
 export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
 
@@ -30,8 +31,20 @@ export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
  * Named seats the Taskmaster may address. 'operator' is the John-facing
  * drain used for escalations and the daily digest (the 'john' dispatch
  * principal is seeded inactive). No broadcast, no 'board', no customers.
+ *
+ * 'duty-officer' (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01) is admitted
+ * ONLY for the blocker_report verb -- the Duty Officer clock is its sole
+ * consumer, relaying to the XO. The pairing is enforced in validateProposal:
+ * a blocker_report to any other seat, or any other verb to 'duty-officer', is
+ * a forbidden EFFECT (not fixable content).
  */
-export const TM_ALLOWED_RECIPIENTS = ['xo', 'major-build', 'captain-ci', 'operator'] as const;
+export const TM_ALLOWED_RECIPIENTS = [
+  'xo',
+  'major-build',
+  'captain-ci',
+  'operator',
+  'duty-officer',
+] as const;
 export type TmAllowedRecipient = (typeof TM_ALLOWED_RECIPIENTS)[number];
 
 /**
@@ -58,6 +71,34 @@ const NUDGE_WHY_RE = /\b(?:Blocked|Next action):\s*\S+/i;
 
 export function isContentCompleteNudgeBody(body: string): boolean {
   return NUDGE_TITLE_RE.test(body) && NUDGE_OWNER_RE.test(body) && NUDGE_WHY_RE.test(body);
+}
+
+/**
+ * Structural content contract for blocker reports
+ * (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01). A content-complete body
+ * (composeBlockerReportBody) always carries:
+ *   - a quoted item title,
+ *   - an explicit owner slot ("owner: <login-or-UNASSIGNED>"),
+ *   - a "Blocked: ..." clause,
+ *   - a GitHub issue URL (https://github.com/...),
+ *   - a "for <duration>" clause ("for 3h" / "for 5 days").
+ * A body missing any part is an ORDINARY content_incomplete rejection (not a
+ * forbidden effect), exactly like an incomplete nudge.
+ */
+const BLOCKER_REPORT_TITLE_RE = /"[^"]+"/;
+const BLOCKER_REPORT_OWNER_RE = /\bowner:\s*\S+/i;
+const BLOCKER_REPORT_BLOCKED_RE = /\bBlocked:\s*\S/i;
+const BLOCKER_REPORT_URL_RE = /https:\/\/github\.com\/\S+/i;
+const BLOCKER_REPORT_DURATION_RE = /\bfor\s+\d+\s*(?:h|days?)\b/i;
+
+export function isContentCompleteBlockerReportBody(body: string): boolean {
+  return (
+    BLOCKER_REPORT_TITLE_RE.test(body) &&
+    BLOCKER_REPORT_OWNER_RE.test(body) &&
+    BLOCKER_REPORT_BLOCKED_RE.test(body) &&
+    BLOCKER_REPORT_URL_RE.test(body) &&
+    BLOCKER_REPORT_DURATION_RE.test(body)
+  );
 }
 
 export interface GuardResult {
@@ -98,6 +139,28 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       allowed: false,
       forbiddenEffect: true,
       reason: `recipient_not_allowlisted: '${proposal.recipient}' is not a named seat the Taskmaster may address (allowed: ${TM_ALLOWED_RECIPIENTS.join(', ')}).`,
+    };
+  }
+
+  // blocker_report <-> duty-officer is an exclusive pairing (M-blocker-report):
+  // blocker_report may ONLY address 'duty-officer', and 'duty-officer' may ONLY
+  // receive a blocker_report. Any other pairing is a forbidden EFFECT (the DO
+  // clock is the sole consumer of that mailbox for this verb), so it trips the
+  // auto HARD_PAUSE circuit rather than being a fixable content skip.
+  const isBlockerReport = proposal.type.trim().toLowerCase() === 'blocker_report';
+  const toDutyOfficer = proposal.recipient.trim().toLowerCase() === 'duty-officer';
+  if (isBlockerReport && !toDutyOfficer) {
+    return {
+      allowed: false,
+      forbiddenEffect: true,
+      reason: `blocker_report_recipient_invalid: blocker_report must address 'duty-officer', not '${proposal.recipient}'.`,
+    };
+  }
+  if (toDutyOfficer && !isBlockerReport) {
+    return {
+      allowed: false,
+      forbiddenEffect: true,
+      reason: `duty_officer_recipient_restricted: only blocker_report may address 'duty-officer', not '${proposal.type}'.`,
     };
   }
 
@@ -168,6 +231,19 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       reason:
         'content_incomplete: the nudge body lacks the required item content ' +
         '(quoted title, owner, and blocker or next action); the item stays on the register.',
+    };
+  }
+
+  // blocker_report bodies are content-gated the same way (ORDINARY reject, not
+  // a HARD_PAUSE circuit): a body missing the quoted title, owner, Blocked
+  // clause, GitHub URL or "for <duration>" clause is a journal-only skip.
+  if (isBlockerReport && !isContentCompleteBlockerReportBody(normalized)) {
+    return {
+      allowed: false,
+      reason:
+        'content_incomplete: the blocker_report body lacks the required item content ' +
+        '(quoted title, owner, Blocked clause, GitHub URL, and a "for <duration>" clause); ' +
+        'the item stays on the register.',
     };
   }
 

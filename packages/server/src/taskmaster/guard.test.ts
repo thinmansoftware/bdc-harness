@@ -57,9 +57,13 @@ describe('validateProposal', () => {
   });
 
   test('every Slice 1 verb passes the action-type allowlist', () => {
-    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(5);
+    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(6);
     for (const type of TM_ALLOWED_ACTION_TYPES) {
-      if (type !== 'fire_cauldron') expect(validateProposal(proposal({ type })).allowed).toBe(true);
+      // fire_cauldron needs mechanical evidence and blocker_report needs the
+      // duty-officer recipient + its own body shape; both are asserted in their
+      // own tests below. Every other verb passes with the default nudge body.
+      if (type !== 'fire_cauldron' && type !== 'blocker_report')
+        expect(validateProposal(proposal({ type })).allowed).toBe(true);
     }
   });
 
@@ -105,6 +109,9 @@ describe('validateProposal', () => {
 
   test('all allowlisted recipients pass', () => {
     for (const recipient of TM_ALLOWED_RECIPIENTS) {
+      // 'duty-officer' is admitted ONLY for blocker_report (asserted in its own
+      // blocker_report: test); an ordinary nudge to it is a forbidden effect.
+      if (recipient === 'duty-officer') continue;
       expect(validateProposal(proposal({ recipient })).allowed).toBe(true);
     }
   });
@@ -299,5 +306,55 @@ describe('validateProposal', () => {
 
     expect(result.allowed).toBe(false);
     expect(result.reason?.toLowerCase()).toContain("'send the invoice'");
+  });
+});
+
+describe('blocker_report guard (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', () => {
+  function blockerProposal(overrides: Partial<ActionProposal> = {}): ActionProposal {
+    return {
+      type: 'blocker_report',
+      threadRef: 'gh:thinmansoftware/bdc-harness#7',
+      recipient: 'duty-officer',
+      body:
+        'Blocker report (P1): "Fix the export mapper" -- owner: major-build. ' +
+        'Blocked: waiting on PRH credit. State: labelled blocked for 3h. ' +
+        'https://github.com/thinmansoftware/bdc-harness/issues/7',
+      idempotencyKey: 'tm:blocker_report:gh:thinmansoftware/bdc-harness#7:100',
+      actsImmediately: false,
+      ...overrides,
+    };
+  }
+
+  test('blocker_report: guard admits duty-officer only for blocker_report', () => {
+    // (1) valid blocker_report to duty-officer -> allowed
+    expect(validateProposal(blockerProposal()).allowed).toBe(true);
+
+    // (2) blocker_report to xo -> forbidden effect
+    const toXo = validateProposal(blockerProposal({ recipient: 'xo' }));
+    expect(toXo.allowed).toBe(false);
+    expect(toXo.forbiddenEffect).toBe(true);
+
+    // (3) a nudge to duty-officer -> forbidden effect
+    const nudgeToDo = validateProposal(
+      proposal({
+        type: 'nudge',
+        recipient: 'duty-officer',
+      })
+    );
+    expect(nudgeToDo.allowed).toBe(false);
+    expect(nudgeToDo.forbiddenEffect).toBe(true);
+
+    // (4) blocker_report whose body lacks `owner:` -> ordinary content_incomplete
+    const missingOwner = validateProposal(
+      blockerProposal({
+        body:
+          'Blocker report (P1): "Fix the export mapper" -- Blocked: waiting on PRH credit. ' +
+          'State: labelled blocked for 3h. ' +
+          'https://github.com/thinmansoftware/bdc-harness/issues/7',
+      })
+    );
+    expect(missingOwner.allowed).toBe(false);
+    expect(missingOwner.forbiddenEffect).not.toBe(true);
+    expect(missingOwner.reason).toContain('content_incomplete');
   });
 });
