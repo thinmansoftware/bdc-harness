@@ -1627,6 +1627,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         );
       }
     }
+    const effectiveFireEligible =
+      fireResult.eligible &&
+      Boolean(fireResult.evidence?.expectedSpec) &&
+      (!(item as ListedThread).beyondFirstPage || fireBeyondFirstPageAllowed);
     const proposal = computeNextAction(item, classification, {
       interventionsLast24h: interventions24hByThread.get(item.ref) ?? 0,
       nowMs,
@@ -1637,10 +1641,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       adoption: adoptionRow?.title ? adoptionRow : undefined,
       grades: gradesByRef.get(canonRef),
       suppression: suppressionByRef.get(canonRef),
-      fireEligible:
-        fireResult.eligible &&
-        Boolean(fireResult.evidence?.expectedSpec) &&
-        (!(item as ListedThread).beyondFirstPage || fireBeyondFirstPageAllowed),
+      fireEligible: effectiveFireEligible,
       fireLane: laneDecision.lane,
       fireHolding: laneDecision.holding,
       fireEscalate: backoff.kind === 'escalate',
@@ -1667,7 +1668,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         interventionsLast24h: interventions24hByThread.get(item.ref) ?? 0,
         nowMs,
         adoption: adoptionRow?.title ? adoptionRow : undefined,
-        fireEligible: fireResult.eligible,
+        fireEligible: effectiveFireEligible,
         fireHolding: laneDecision.holding,
         fireEvidence: fireResult.evidence,
         lastBlockerReportSentAtMs: lastBlockerReportSentByThread.get(canonRef),

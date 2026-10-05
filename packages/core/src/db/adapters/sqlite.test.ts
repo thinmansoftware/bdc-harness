@@ -87,6 +87,14 @@ describe('SqliteAdapter', () => {
     );
     expect(schema.rows[0]?.sql).toContain('blocker_report');
     expect(schema.rows[0]?.sql).toContain('delivered_to_issue');
+    await db.query(`CREATE TRIGGER blocker_upgrade_reopen_sentinel
+      AFTER INSERT ON tm_journal BEGIN SELECT 1; END`);
+    await db.close();
+    db = new SqliteAdapter(currentDbPath);
+    const sentinel = await db.query<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'blocker_upgrade_reopen_sentinel'"
+    );
+    expect(sentinel.rows).toEqual([{ name: 'blocker_upgrade_reopen_sentinel' }]);
   });
 
   describe('Smart Cauldron reliability schema', () => {
