@@ -167,7 +167,7 @@ export const AUTO_FIXABLE_CLASSES: readonly AutoFixableClass[] = [
     // for customers" is a display bug needing human judgment, and it used to
     // classify as auto-fixable.
     pattern:
-      /\b(?:non[-\s]?ascii|ascii[-\s]?only|em[-\s]?dash|smart\s+quote|curly\s+quote|non[-\s]?breaking\s+space|unicode)\b[\s\S]{0,100}?\b(?:break\w*|fail\w*|pars\w*|corrupt\w*|reject\w*|violat\w*|gate)\b|\b(?:break\w*|fail\w*|pars\w*|corrupt\w*|reject\w*|violat\w*|gate)\b[\s\S]{0,100}?\b(?:non[-\s]?ascii|ascii[-\s]?only|em[-\s]?dash|smart\s+quote|curly\s+quote|non[-\s]?breaking\s+space|unicode)\b/i,
+      /\b(?:ascii[-\s]?only|non[-\s]?ascii\s+(?:rule|gate|check|policy)|ascii\s+(?:rule|gate|check|policy)|encoding\s+(?:rule|gate|check))\b[\s\S]{0,80}?\b(?:fails\s+the\s+(?:gate|check|lint|build)|violat\w*|rejected\s+by|refuses\s+to\s+pars\w*|pars\w*\s+(?:error|failure)|breaks\s+(?:parsing|the\s+parser|powershell|the\s+build)|corrupts\s+the\s+file)\b|\b(?:fails\s+the\s+(?:gate|check|lint|build)|violat\w*|rejected\s+by|refuses\s+to\s+pars\w*|pars\w*\s+(?:error|failure)|breaks\s+(?:parsing|the\s+parser|powershell|the\s+build)|corrupts\s+the\s+file)\b[\s\S]{0,80}?\b(?:ascii[-\s]?only|non[-\s]?ascii\s+(?:rule|gate|check|policy)|ascii\s+(?:rule|gate|check|policy)|encoding\s+(?:rule|gate|check))\b|\b(?:em[-\s]?dash|en[-\s]?dash|smart\s+quote|curly\s+quote|non[-\s]?breaking\s+space|unicode\s+minus|ellipsis\s+character)\b[\s\S]{0,80}?\b(?:fails\s+the\s+(?:gate|check|lint|build)|violat\w*|rejected\s+by|refuses\s+to\s+pars\w*|pars\w*\s+(?:error|failure)|breaks\s+(?:parsing|the\s+parser|powershell|the\s+build)|corrupts\s+the\s+file)\b|\b(?:fails\s+the\s+(?:gate|check|lint|build)|violat\w*|rejected\s+by|refuses\s+to\s+pars\w*|pars\w*\s+(?:error|failure)|breaks\s+(?:parsing|the\s+parser|powershell|the\s+build)|corrupts\s+the\s+file)\b[\s\S]{0,80}?\b(?:em[-\s]?dash|en[-\s]?dash|smart\s+quote|curly\s+quote|non[-\s]?breaking\s+space|unicode\s+minus|ellipsis\s+character)\b/i,
   },
 ];
 
@@ -195,6 +195,58 @@ export const AUTO_FIXABLE_CLASSES: readonly AutoFixableClass[] = [
  */
 const NON_AUTO_PATTERN =
   /\b(?:securit\w*|vulnerab\w*|auth\w*|credential\w*|secret\w*|injection|inject(?:s|ed|ing)?|escap\w*|sanitiz\w*|sanitis\w*|xss|csrf|ssrf|rce|traversal|untrusted|user[-\s]input|request\s+param\w*|design|architect\w*|scope|governance|policy|approv\w*|judgment|judgement|intent|breaking\s+change|data\s+loss|privacy|pii)\b/i;
+
+/**
+ * SECOND VETO: a described CONSEQUENCE, not a vocabulary match.
+ *
+ * WHY A SECOND ONE EXISTS. NON_AUTO_PATTERN is a keyword list, and a keyword
+ * list cannot enumerate every way to describe a security defect. The review
+ * gate demonstrated that five rounds running on this PR, each time with a
+ * finding that used a MECHANICAL topic word plus a MECHANICAL evidence word
+ * while describing a data-disclosure defect:
+ *
+ *   "Unicode normalization breaks tenant isolation, allowing one customer to
+ *    read another customer's invoices"        -> matched ascii_violation
+ *   "The tenant-id type check fails to stop one customer reading another
+ *    customer invoices"                       -> matched build_failure
+ *   "The tenant isolation test fails to cover cross-customer invoice reads"
+ *                                             -> matched test_failure
+ *   "The migration foreign key constraint fails to isolate tenants, exposing
+ *    invoices"                                -> matched migration_ordering
+ *
+ * None of those contain a NON_AUTO_PATTERN word. Narrowing the class patterns
+ * one at a time was losing a race against phrasing.
+ *
+ * THE STRUCTURAL DISTINCTION. A genuinely mechanical defect's consequence is a
+ * RED TOOL: the build fails, the suite fails, the linter objects, the migration
+ * is rejected by a constraint. A finding that instead describes a consequence
+ * TO DATA OR TO ANOTHER PARTY -- somebody can read something, something is
+ * exposed or leaked, a boundary between tenants or customers fails -- is
+ * reasoning about impact, and impact is exactly what a human must weigh.
+ *
+ * So this vetoes on CONSEQUENCE SHAPE rather than on topic vocabulary, which is
+ * why it catches phrasings no keyword list anticipated. It can only ever
+ * REFUSE, never approve, so a false positive costs one unnecessary human
+ * review while a false negative hands a disclosure defect to an unattended
+ * builder. That asymmetry is the whole reason it is deliberately broad.
+ */
+const NON_AUTO_IMPACT_PATTERN = new RegExp(
+  [
+    // Cross-party access: "one customer ... another customer", "other tenants".
+    String.raw`\b(?:another|other|different|cross)[-\s](?:customer|tenant|user|account|org|organisation|organization|company)`,
+    String.raw`\b(?:customer|tenant|user|account|org)s?\b[\s\S]{0,60}?\b(?:read|access|see|view|retrieve|download|modify)\b[\s\S]{0,60}?\b(?:another|other|each\s+other)`,
+    // Isolation or boundary failure.
+    String.raw`\b(?:tenant|customer|account|data|privilege|trust|security)[-\s](?:isolation|boundary|separation|segregation)`,
+    String.raw`\b(?:isolation|boundary|separation|segregation)\b[\s\S]{0,40}?\b(?:break\w*|fail\w*|bypass\w*|violat\w*|lost|broken)`,
+    // Exposure or leakage of data.
+    String.raw`\b(?:expos\w*|leak\w*|disclos\w*|reveal\w*)\b[\s\S]{0,60}?\b(?:invoice|customer|tenant|user|account|record|row|data|secret|token|password|identifier|hostname|path)`,
+    String.raw`\b(?:invoice|customer|tenant|record|row|datum|data)s?\b[\s\S]{0,40}?\b(?:expos\w*|leak\w*|disclos\w*|reveal\w*)`,
+    // Unauthenticated or arbitrary access.
+    String.raw`\b(?:any|every|unauthenticated|anonymous|arbitrary)\s+(?:caller|user|client|requester|visitor)`,
+    String.raw`\b(?:all|every)\s+(?:customer|tenant|user|account|invoice|record)s?\b[\s\S]{0,40}?\b(?:read|returned?|accessible|exposed|listed)`,
+  ].join('|'),
+  'i'
+);
 
 /** Severities that block a merge and therefore justify remediation work. */
 const BLOCKING_SEVERITIES: ReadonlySet<IndependentReviewFinding['severity']> = new Set([
@@ -233,8 +285,14 @@ export function classifyFinding(finding: IndependentReviewFinding): FindingClass
   const vetoText = `${finding.scope} ${finding.summary}`;
   const classifyText = finding.summary;
 
-  // 1. Judgment-call signal overrides any mechanical-looking match.
+  // 1a. Judgment-call VOCABULARY overrides any mechanical-looking match.
   if (NON_AUTO_PATTERN.test(vetoText)) return { autoFixable: false, classId: null };
+
+  // 1b. Judgment-call CONSEQUENCE, independent of vocabulary. A mechanical
+  // defect's consequence is a red tool; a consequence to data or to another
+  // party is impact, and impact is what a human must weigh. This catches the
+  // phrasings five rounds of keyword narrowing kept missing.
+  if (NON_AUTO_IMPACT_PATTERN.test(vetoText)) return { autoFixable: false, classId: null };
 
   // 2. Known mechanical class, judged on the reviewer's description only.
   for (const candidate of AUTO_FIXABLE_CLASSES) {

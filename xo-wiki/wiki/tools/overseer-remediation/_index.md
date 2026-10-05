@@ -153,6 +153,49 @@ added a bare `sql` token, which matched the `.sql` extension of the migration
 filename and sent the live shopops#650 anchor -- the case this whole WO exists
 for -- to a human.
 
+### Two vetoes, and why the second one exists
+
+A finding is handed back only if it matches a class below AND survives **both**
+vetoes. Both can only ever REFUSE, never approve.
+
+1. **`NON_AUTO_PATTERN` -- judgment-call VOCABULARY.** security, auth, design,
+   scope, governance, privacy, injection, and so on. Checked against scope AND
+   summary.
+2. **`NON_AUTO_IMPACT_PATTERN` -- judgment-call CONSEQUENCE.** Cross-party
+   access, isolation/boundary failure, exposure or leakage of data,
+   unauthenticated or arbitrary access.
+
+The second exists because a keyword list cannot enumerate every way to describe
+a security defect, and the review gate proved that **five rounds running** on
+PR #740. Each time, a finding used a class's own topic word AND its own evidence
+word while describing a data-disclosure defect, with no vocabulary keyword
+anywhere:
+
+| Phrasing                                                                                                   | Matched              |
+| ---------------------------------------------------------------------------------------------------------- | -------------------- |
+| "Unicode normalization breaks tenant isolation, allowing one customer to read another customer's invoices" | `ascii_violation`    |
+| "The tenant-id type check fails to stop one customer reading another customer invoices"                    | `build_failure`      |
+| "The tenant isolation test fails to cover cross-customer invoice reads"                                    | `test_failure`       |
+| "The migration foreign key constraint fails to isolate tenants, exposing invoices"                         | `migration_ordering` |
+| "eslint reports the rule is disabled where we leak invoices to any caller"                                 | `lint_or_format`     |
+
+Narrowing class patterns one at a time was losing a race against phrasing.
+
+**The structural distinction:** a genuinely mechanical defect's consequence is a
+RED TOOL -- the build fails, the suite fails, the linter objects, a constraint
+rejects the migration. A finding that instead describes a consequence TO DATA OR
+TO ANOTHER PARTY is reasoning about impact, and impact is exactly what a human
+must weigh. So the second veto matches on consequence SHAPE rather than topic
+vocabulary, which is why it catches phrasings no keyword list anticipated.
+
+The asymmetry is deliberate: a false positive costs one unnecessary human
+review; a false negative hands a disclosure defect to an unattended builder.
+When in doubt it refuses.
+
+**If you add a class, run the audit** -- attach a security/behavioral payload to
+that class's own topic and evidence words and confirm it still routes to a
+human. Do not assume the vetoes cover a phrasing you have not tested.
+
 ### What must NEVER be added
 
 Design disagreements, scope questions, governance objections, security

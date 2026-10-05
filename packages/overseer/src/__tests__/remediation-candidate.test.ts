@@ -473,6 +473,62 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
     }
   });
 
+  /**
+   * REGRESSION -- PR #740 round 8 [major] (2026-10-05), and the STRUCTURAL fix
+   * for a defect class the gate found five rounds running.
+   *
+   * Each of these uses a class's own topic word AND its own evidence word while
+   * describing a data-disclosure defect, and none contains a NON_AUTO_PATTERN
+   * keyword. Narrowing class patterns one at a time was losing a race against
+   * phrasing, so NON_AUTO_IMPACT_PATTERN now vetoes on the CONSEQUENCE shape:
+   * a mechanical defect's consequence is a red tool, while a consequence to
+   * data or to another party is impact, which a human must weigh.
+   *
+   * The first case is the one the gate reported; the other four I found by
+   * auditing every class for the same shape rather than waiting to be told.
+   */
+  const impactConsequenceCases: readonly { readonly label: string; readonly summary: string }[] = [
+    {
+      label: "the gate's example -- unicode normalization breaks tenant isolation",
+      summary:
+        "Unicode normalization breaks tenant isolation, allowing one customer to read another customer's invoices",
+    },
+    {
+      label: 'build_failure shape with a disclosure consequence',
+      summary:
+        'The tenant-id type check fails to stop one customer reading another customer invoices',
+    },
+    {
+      label: 'test_failure shape with a disclosure consequence',
+      summary: 'The tenant isolation test fails to cover cross-customer invoice reads',
+    },
+    {
+      label: 'lint_or_format shape with a disclosure consequence',
+      summary: 'eslint reports the rule is disabled where we leak invoices to any caller',
+    },
+    {
+      label: 'migration_ordering shape with a disclosure consequence',
+      summary: 'The migration foreign key constraint fails to isolate tenants, exposing invoices',
+    },
+  ];
+
+  for (const { label, summary } of impactConsequenceCases) {
+    test(`NON-AUTO: ${label}`, () => {
+      expect(
+        classifyFinding({ scope: 'src/tenants.ts', severity: 'blocker', summary }).autoFixable
+      ).toBe(false);
+    });
+
+    test(`emits NO candidate: ${label}`, () => {
+      const decision = decideRemediation(
+        baseInput({
+          findings: [{ scope: 'src/tenants.ts', severity: 'blocker', summary }],
+        })
+      );
+      expect(decision.emit).toBe(false);
+    });
+  }
+
   test('the real tool-reported versions of those classes DO auto-route', () => {
     const mechanical: readonly [string, string, string][] = [
       ['named linter', 'eslint reports 3 errors: prefer-const', 'lint_or_format'],
