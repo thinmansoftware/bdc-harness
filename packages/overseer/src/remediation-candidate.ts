@@ -167,7 +167,7 @@ export const AUTO_FIXABLE_CLASSES: readonly AutoFixableClass[] = [
     // for customers" is a display bug needing human judgment, and it used to
     // classify as auto-fixable.
     pattern:
-      /\b(?:non[-\s]?ascii|ascii[-\s]?only)\b|\b(?:em[-\s]?dash|smart\s+quote|curly\s+quote|non[-\s]?breaking\s+space|unicode)\b[\s\S]{0,100}?\b(?:break\w*|fail\w*|pars\w*|corrupt\w*|reject\w*|violat\w*)\b/i,
+      /\b(?:non[-\s]?ascii|ascii[-\s]?only|em[-\s]?dash|smart\s+quote|curly\s+quote|non[-\s]?breaking\s+space|unicode)\b[\s\S]{0,100}?\b(?:break\w*|fail\w*|pars\w*|corrupt\w*|reject\w*|violat\w*|gate)\b|\b(?:break\w*|fail\w*|pars\w*|corrupt\w*|reject\w*|violat\w*|gate)\b[\s\S]{0,100}?\b(?:non[-\s]?ascii|ascii[-\s]?only|em[-\s]?dash|smart\s+quote|curly\s+quote|non[-\s]?breaking\s+space|unicode)\b/i,
   },
 ];
 

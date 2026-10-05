@@ -422,6 +422,57 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
     });
   }
 
+  /**
+   * REGRESSION -- PR #740 round 7 [major] (2026-10-05). ascii_violation kept a
+   * BARE first alternative -- /(?:non-ascii|ascii-only)/ with no failure
+   * requirement -- so any finding that merely said "Non-ASCII" classified as
+   * auto-fixable. The gate's example is a data-disclosure defect:
+   * "Non-ASCII tenant names collide, allowing one customer to read another
+   * customer's invoices".
+   *
+   * I had applied the mechanical-evidence rule to the second half of that
+   * pattern and left the first half open. Every alternative in every class must
+   * carry evidence; a topic mention is not a defect report.
+   *
+   * After fixing it I audited all five classes with security/behavioral
+   * payloads attached to each class's own topic words. None bypasses now -- see
+   * the structural audit in the commit message.
+   */
+  const bareMentionCases: readonly { readonly label: string; readonly summary: string }[] = [
+    {
+      label: "the gate's example -- non-ASCII collision causing disclosure",
+      summary:
+        "Non-ASCII tenant names collide, allowing one customer to read another customer's invoices",
+    },
+    {
+      label: 'non-ASCII as a BEHAVIORAL bug, not an encoding-rule violation',
+      summary: 'Non-ASCII customer names sort incorrectly in the picker',
+    },
+    {
+      label: 'the ascii-only rule merely MENTIONED, with no failure',
+      summary: 'The ascii-only convention should be documented for contributors',
+    },
+  ];
+
+  for (const { label, summary } of bareMentionCases) {
+    test(`NON-AUTO: ${label}`, () => {
+      expect(
+        classifyFinding({ scope: 'src/tenants.ts', severity: 'blocker', summary }).autoFixable
+      ).toBe(false);
+    });
+  }
+
+  test('a REAL encoding-rule violation still auto-routes', () => {
+    for (const summary of [
+      'Non-ASCII em-dash breaks PowerShell parsing',
+      'The file violates the ascii-only rule and fails the gate',
+    ]) {
+      const result = classifyFinding({ scope: 'scripts/x.ps1', severity: 'blocker', summary });
+      expect(result.autoFixable, summary).toBe(true);
+      expect(result.classId, summary).toBe('ascii_violation');
+    }
+  });
+
   test('the real tool-reported versions of those classes DO auto-route', () => {
     const mechanical: readonly [string, string, string][] = [
       ['named linter', 'eslint reports 3 errors: prefer-const', 'lint_or_format'],
