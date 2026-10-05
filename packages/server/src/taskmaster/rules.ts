@@ -29,7 +29,13 @@ import { WO_ID_RE } from './guard';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
 export type ThreadClass = 'ready' | 'stale' | 'blocked' | 'healthy';
-export type TmActionType = 'deliver_ruling' | 'nudge' | 'escalate_p0' | 'digest' | 'fire_cauldron';
+export type TmActionType =
+  | 'deliver_ruling'
+  | 'nudge'
+  | 'escalate_p0'
+  | 'digest'
+  | 'fire_cauldron'
+  | 'blocker_report';
 
 export type FireEvidence = FireEligibilityEvidence;
 
@@ -90,6 +96,9 @@ export const NUDGE_CLOCK_MS: Record<ThreadPriority, number> = {
   P2: 24 * HOUR_MS,
   P3: 24 * HOUR_MS,
 };
+
+/** One blocker report per canonical ref per 72 hours. */
+export const BLOCKER_REPORT_COOLDOWN_MS = 72 * HOUR_MS;
 
 export const CUSTOMER_CLOCK_MS = 30 * MINUTE_MS;
 
@@ -185,6 +194,12 @@ export interface NextActionContext {
   fireEscalate?: boolean;
   customerP0Exempt?: boolean;
   fireEvidence?: FireEvidence;
+  /**
+   * Latest `sent` blocker_report created_at for this canonical ref, epoch ms.
+   * Null or omitted means none in the lookback. Read only by computeBlockerReport;
+   * computeNextAction ignores it.
+   */
+  lastBlockerReportSentAtMs?: number | null;
 }
 
 /**
@@ -426,4 +441,130 @@ export function computeNextAction(
   }
 
   return null;
+}
+
+const GH_THREAD_REF_RE = /^gh:[^/]+\/[^#]+#\d+$/;
+
+type BlockerReportState =
+  | '[BLOCKED] marker'
+  | 'labelled blocked'
+  | 'unclaimed P0, not fire-eligible';
+
+function blockerReportState(
+  thread: ThreadSnapshot,
+  adoption: TmAdoptionRow | undefined
+): BlockerReportState {
+  if (adoption?.latest_marker_kind === 'BLOCKED') return '[BLOCKED] marker';
+  if (thread.isBlocked) return 'labelled blocked';
+  return 'unclaimed P0, not fire-eligible';
+}
+
+function formatBlockerAge(idleMs: number): string {
+  const hours = Math.floor(idleMs / HOUR_MS);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.floor(hours / 24)} days`;
+}
+
+/**
+ * Compose a content-complete blocker-report body, or null when the thread
+ * has no title or the mandatory fields cannot fit in 500 characters.
+ * Age is the caller's already-chosen idle duration, not a second clock.
+ */
+export function composeBlockerReportBody(
+  thread: ThreadSnapshot,
+  adoption: TmAdoptionRow | undefined,
+  idleMs: number
+): string | null {
+  const rawTitle = adoption?.title?.trim();
+  if (!rawTitle) return null;
+  let title = rawTitle.replace(/"/g, "'").slice(0, 200);
+  let blocked = adoption?.blocked_reason?.trim() || 'no named blocker';
+  const owner = adoption?.owner_login?.trim() || 'UNASSIGNED';
+  const state = blockerReportState(thread, adoption);
+  const age = formatBlockerAge(idleMs);
+  const url = adoption ? adoptionIssueUrl(adoption) : '';
+  if (!url.startsWith('https://github.com/')) return null;
+
+  const assemble = (nextTitle: string, nextBlocked: string): string =>
+    `Blocker report (${thread.priority}): "${nextTitle}" -- owner: ${owner}. ` +
+    `Blocked: ${nextBlocked}. State: ${state} for ${age}. ${url}`;
+
+  let body = assemble(title, blocked);
+  if (body.length > 500 && title.length > 1) {
+    const overflow = body.length - 500;
+    const titleCut = Math.min(overflow, title.length - 1);
+    title = title.slice(0, title.length - titleCut);
+    body = assemble(title, blocked);
+  }
+  if (body.length > 500 && blocked.length > 1) {
+    const overflow = body.length - 500;
+    const blockedCut = Math.min(overflow, blocked.length - 1);
+    blocked = blocked.slice(0, blocked.length - blockedCut);
+    body = assemble(title, blocked);
+  }
+  if (body.length > 500 || title.length < 1 || blocked.length < 1) return null;
+  return body;
+}
+
+function blockerReportAnchorMs(
+  thread: ThreadSnapshot,
+  adoption: TmAdoptionRow | undefined
+): number | null {
+  if (adoption?.latest_marker_kind === 'BLOCKED') {
+    const markerMs = Date.parse(adoption.latest_marker_at ?? '');
+    return Number.isFinite(markerMs) ? markerMs : null;
+  }
+  const movementMs = adoption?.last_movement_at ? Date.parse(adoption.last_movement_at) : NaN;
+  if (Number.isFinite(movementMs)) return movementMs;
+  const activityMs = Date.parse(thread.lastActivityAt);
+  return Number.isFinite(activityMs) ? activityMs : null;
+}
+
+/**
+ * Additional proposal for a stuck blocked thread or an unclaimed P0 that
+ * Taskmaster cannot fire. Never replaces computeNextAction. Returns null
+ * unless every gate holds.
+ */
+export function computeBlockerReport(
+  thread: ThreadSnapshot,
+  classification: ThreadClass,
+  context: NextActionContext
+): ActionProposal | null {
+  if (!GH_THREAD_REF_RE.test(thread.ref)) return null;
+  if (thread.isHeld === true) return null;
+
+  const adoption = context.adoption;
+  const markerBlocked = adoption?.latest_marker_kind === 'BLOCKED';
+  const labelBlocked = thread.isBlocked === true || classification === 'blocked';
+  const fireReady = Boolean(context.fireEligible && context.fireEvidence?.expectedSpec);
+  const unclaimedUnfireableP0 =
+    thread.isUnclaimedP0 === true && !fireReady && context.fireHolding !== true;
+  if (!labelBlocked && !markerBlocked && !unclaimedUnfireableP0) return null;
+
+  const anchorMs = blockerReportAnchorMs(thread, adoption);
+  if (anchorMs === null) return null;
+  const idleMs = context.nowMs - anchorMs;
+  if (idleMs < NUDGE_CLOCK_MS.P1) return null;
+  if (context.interventionsLast24h >= MAX_INTERVENTIONS_PER_ITEM_24H) return null;
+
+  const lastSent = context.lastBlockerReportSentAtMs;
+  if (
+    typeof lastSent === 'number' &&
+    Number.isFinite(lastSent) &&
+    context.nowMs - lastSent < BLOCKER_REPORT_COOLDOWN_MS
+  ) {
+    return null;
+  }
+
+  const body = composeBlockerReportBody(thread, adoption, idleMs);
+  if (body === null) return null;
+  const bucket = Math.floor(context.nowMs / BLOCKER_REPORT_COOLDOWN_MS);
+  return {
+    type: 'blocker_report',
+    threadRef: thread.ref,
+    recipient: 'duty-officer',
+    body,
+    idempotencyKey: `tm:blocker_report:${thread.ref}:${bucket}`,
+    actsImmediately: false,
+  };
 }

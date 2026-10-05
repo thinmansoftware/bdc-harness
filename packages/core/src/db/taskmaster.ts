@@ -20,7 +20,13 @@ import {
 
 const log = createLogger('db/taskmaster');
 
-export type TmActionType = 'deliver_ruling' | 'nudge' | 'escalate_p0' | 'digest' | 'fire_cauldron';
+export type TmActionType =
+  | 'deliver_ruling'
+  | 'nudge'
+  | 'escalate_p0'
+  | 'digest'
+  | 'fire_cauldron'
+  | 'blocker_report';
 export type TmActionOutcome =
   | 'pending'
   | 'sent'

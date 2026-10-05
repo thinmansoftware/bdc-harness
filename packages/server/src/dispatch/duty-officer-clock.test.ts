@@ -654,4 +654,132 @@ describe('duty officer clock', () => {
       })
     );
   });
+
+  test('blocker_report: clock relays a Taskmaster blocker report to xo once, without the judge', async () => {
+    const sourceBody =
+      'Blocker report (P0): "WO-X-01 fix" -- owner: UNASSIGNED. ' +
+      'Blocked: no named blocker. State: labelled blocked for 3h. ' +
+      'https://github.com/thinmansoftware/bdc-xo/issues/2274';
+    const queued = [
+      message({
+        id: 'blocker-2274',
+        correlation_id: 'tm-journal-blocker-2274',
+        idempotency_key: 'tm:blocker_report:gh:thinmansoftware/bdc-xo#2274:7',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        recipient: 'duty-officer',
+        subject_key: 'gh:thinmansoftware/bdc-xo#2274',
+        priority: 'normal',
+        body: sourceBody,
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    deps.judge = mock(async () => {
+      throw new Error('judge_must_not_run');
+    });
+
+    await tickDutyOfficerClock(deps);
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.judge).not.toHaveBeenCalled();
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+    const createCall = (
+      deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls[0]?.[1] as {
+      recipient: string;
+      idempotency_key: string;
+      priority: string;
+      subject_key: string;
+      body: string;
+    };
+    expect(createCall.recipient).toBe('xo');
+    expect(createCall.idempotency_key).toBe('do-clock-escalation:blocker-2274');
+    expect(createCall.priority).toBe('normal');
+    expect(createCall.subject_key).toBe('gh:thinmansoftware/bdc-xo#2274');
+    const relay = JSON.parse(createCall.body) as {
+      reason: string;
+      thread_ref: string;
+      excerpt: string;
+    };
+    expect(relay.reason).toBe('taskmaster_blocker_report');
+    expect(relay.thread_ref).toBe('gh:thinmansoftware/bdc-xo#2274');
+    expect(relay.excerpt).toBe(sourceBody);
+    const finished = (
+      deps.postResult as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }
+    ).mock.calls.find(call => call[0]?.id === 'blocker-2274');
+    expect(finished?.[0]).toEqual(
+      expect.objectContaining({ id: 'blocker-2274', status: 'done', task_outcome: 'succeeded' })
+    );
+    const disposition = JSON.parse(String(finished?.[0]?.result_body)) as { disposition: string };
+    expect(disposition.disposition).toBe('taskmaster_blocker_report_relayed');
+  });
+
+  test('blocker_report: failed relay is held and retried without a double send', async () => {
+    const sourceBody = 'Blocker report (P1): "WO-X-02 fix" -- owner: UNASSIGNED.';
+    const queued = [
+      message({
+        id: 'blocker-hold',
+        correlation_id: 'tm-journal-blocker-hold',
+        idempotency_key: 'tm:blocker_report:gh:thinmansoftware/bdc-xo#2275:7',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        recipient: 'duty-officer',
+        subject_key: 'gh:thinmansoftware/bdc-xo#2275',
+        body: sourceBody,
+      }),
+      message({
+        id: 'digest-hold',
+        correlation_id: 'tm-journal-digest-hold',
+        idempotency_key: 'tm:digest:2026-10-05',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        recipient: 'duty-officer',
+        subject_key: 'digest:2026-10-05',
+        body: 'sent=1, parked=0',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    let attempts = 0;
+    const relayPayloads: Array<Record<string, unknown>> = [];
+    deps.createAuthenticatedMessage = mock(async (_context, data) => {
+      attempts += 1;
+      relayPayloads.push(data as Record<string, unknown>);
+      if (attempts === 1) throw new Error('dispatch_unavailable');
+      return { id: 'xo-msg' };
+    });
+
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'blocker-hold', worker_id: 'duty-officer-clock' })
+    );
+    expect(deps.postResult).not.toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'blocker-hold' })
+    );
+    const digestFinish = (
+      deps.postResult as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }
+    ).mock.calls.find(call => call[0]?.id === 'digest-hold');
+    expect(digestFinish?.[0]).toEqual(
+      expect.objectContaining({ id: 'digest-hold', status: 'done', task_outcome: 'succeeded' })
+    );
+    expect(JSON.parse(String(digestFinish?.[0]?.result_body)).disposition).toBe(
+      'taskmaster_mailbox'
+    );
+    expect(relayPayloads).toHaveLength(1);
+
+    await tickDutyOfficerClock(deps);
+
+    expect(relayPayloads).toHaveLength(2);
+    expect(relayPayloads[0]?.idempotency_key).toBe('do-clock-escalation:blocker-hold');
+    expect(relayPayloads[1]?.idempotency_key).toBe('do-clock-escalation:blocker-hold');
+    const blockerFinish = (
+      deps.postResult as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }
+    ).mock.calls.find(call => call[0]?.id === 'blocker-hold');
+    expect(JSON.parse(String(blockerFinish?.[0]?.result_body)).disposition).toBe(
+      'taskmaster_blocker_report_relayed'
+    );
+    expect(
+      relayPayloads.filter(payload => String(payload.idempotency_key).includes('digest'))
+    ).toHaveLength(0);
+  });
 });

@@ -31,6 +31,7 @@ import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
   adoptionContentHash,
   classifyThread,
+  computeBlockerReport,
   computeNextAction,
   isSuppressedByNoise,
   type ActionProposal,
@@ -39,6 +40,7 @@ import {
   type TmActionType,
   usefulRateFloorBreached,
 } from './rules';
+import { dutyOfficerClockEnabled } from '../dispatch/duty-officer-clock';
 import { validateProposal, WO_ID_RE, type TmAllowedRecipient } from './guard';
 import {
   buildEscalationCommentBody,
@@ -82,6 +84,8 @@ function defaultEscalationDelivery(): EscalationDeliveryDeps {
 export const MAX_EFFECTS_PER_TICK = 10;
 /** Conservative faucet bound for newly eligible work, within the shared cap. */
 export const MAX_FIRES_PER_TICK = 3;
+/** Blocker reports relayed onward by the Duty Officer; keep the first cycle from flooding xo. */
+export const MAX_BLOCKER_REPORTS_PER_TICK = 3;
 
 /**
  * Pause effect-delivery gate (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01).
@@ -404,6 +408,7 @@ export const TM_REPEAT_REASON_BY_TYPE: Record<TmActionType, string> = {
   deliver_ruling: 'tm:deliver_ruling:repeated',
   digest: 'tm:digest:repeated',
   fire_cauldron: 'tm:fire_cauldron:repeated',
+  blocker_report: 'tm:blocker_report:repeated',
 };
 
 /** Listed work-SOR thread with optional adoption fields carried from the issue payload. */
@@ -988,7 +993,7 @@ async function gradeSentActions(
           continue;
         }
       }
-      if (action.action_type === 'digest') continue;
+      if (action.action_type === 'digest' || action.action_type === 'blocker_report') continue;
 
       const sentAtMs = Date.parse(effect.createdAt);
       if (!Number.isFinite(sentAtMs)) {
@@ -1084,6 +1089,9 @@ function proofPredicate(proposal: ActionProposal): string {
   }
   if (proposal.type === 'fire_cauldron') {
     return 'created Cauldron run completes or opens a PR, or the source issue gains status:building before the proof deadline';
+  }
+  if (proposal.type === 'blocker_report') {
+    return 'blocker report delivery only; relayed to xo by the Duty Officer clock; never qualifies as an SC7 useful action';
   }
   return 'digest delivery only; never qualifies as an SC7 useful action';
 }
@@ -1360,6 +1368,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   const lookback = await dal.getActionsSince(new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString());
   const actionsByKey = new Map<string, taskmasterDb.TmJournalEntry>();
   const interventions24hByThread = new Map<string, number>();
+  const lastBlockerReportSentAtMsByRef = new Map<string, number>();
   const since24h = nowMs - DAY_MS;
   for (const action of lookback) {
     if (action.idempotency_key && !actionsByKey.has(action.idempotency_key))
@@ -1369,6 +1378,16 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         action.thread_ref,
         (interventions24hByThread.get(action.thread_ref) ?? 0) + 1
       );
+    }
+    if (action.action_type === 'blocker_report' && action.outcome === 'sent') {
+      const sentAtMs = Date.parse(action.created_at);
+      if (Number.isFinite(sentAtMs)) {
+        const refKey = canonicalizeThreadRef(action.thread_ref);
+        const previous = lastBlockerReportSentAtMsByRef.get(refKey);
+        if (previous === undefined || sentAtMs > previous) {
+          lastBlockerReportSentAtMsByRef.set(refKey, sentAtMs);
+        }
+      }
     }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
@@ -1571,6 +1590,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   }
 
   const proposals: ActionProposal[] = [];
+  const blockerReportsEnabled = resolveBlockerReportEnabled();
   const fireBeyondFirstPageAllowed = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE === 'true';
   for (const item of [...rulings, ...threads]) {
     const canonRef = canonicalizeThreadRef(item.ref);
@@ -1602,7 +1622,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         );
       }
     }
-    const proposal = computeNextAction(item, classification, {
+    const actionContext = {
       interventionsLast24h: interventions24hByThread.get(item.ref) ?? 0,
       nowMs,
       // Content policy gates on what the projection KNOWS. A titleless row is
@@ -1633,9 +1653,17 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             ].includes(label.toLowerCase())
           )),
       fireEvidence: fireResult.evidence,
-    });
+    };
+    const proposal = computeNextAction(item, classification, actionContext);
     if (proposal) {
       proposals.push(proposal);
+    }
+    if (blockerReportsEnabled) {
+      const blockerReport = computeBlockerReport(item, classification, {
+        ...actionContext,
+        lastBlockerReportSentAtMs: lastBlockerReportSentAtMsByRef.get(canonRef) ?? null,
+      });
+      if (blockerReport) proposals.push(blockerReport);
     }
   }
 
@@ -1681,7 +1709,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       return 2 + priorityRank[priorityByRef.get(proposal.threadRef) ?? 'P3'];
     }
     if (proposal.type === 'nudge') return 6;
-    return 7;
+    if (proposal.type === 'blocker_report') return 7;
+    return 8;
   };
   proposals.sort((a, b) => {
     const immediate = Number(b.actsImmediately) - Number(a.actsImmediately);
@@ -1692,6 +1721,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   const touchedThisTick = new Set<string>();
   let firesThisTick = 0;
+  let blockerReportsThisTick = 0;
 
   for (const proposal of proposals) {
     let existingAction =
@@ -1784,6 +1814,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     if (
       result.effects >= MAX_EFFECTS_PER_TICK ||
       (proposal.type === 'fire_cauldron' && firesThisTick >= MAX_FIRES_PER_TICK) ||
+      (proposal.type === 'blocker_report' &&
+        blockerReportsThisTick >= MAX_BLOCKER_REPORTS_PER_TICK) ||
       touchedThisTick.has(proposal.threadRef)
     ) {
       result.deferred += 1;
@@ -2007,8 +2039,13 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             classification: 'succeeded',
           }),
           due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
-          on_absence: proposal.type === 'digest' ? 'escalate' : 'redispatch',
-          max_retries: 2,
+          on_absence:
+            proposal.type === 'blocker_report'
+              ? 'give_up'
+              : proposal.type === 'digest'
+                ? 'escalate'
+                : 'redispatch',
+          max_retries: proposal.type === 'blocker_report' ? 0 : 2,
         });
         await dal.updateActionOutcome(journalRow.id, 'sent');
       }
@@ -2016,6 +2053,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
       if (proposal.type === 'fire_cauldron') firesThisTick += 1;
+      if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
       log.info(
         {
           actionType: proposal.type,
@@ -2095,6 +2133,20 @@ export function resolveFireVerbEnabled(
   raw: string | undefined = process.env.TASKMASTER_FIRE_VERB_ENABLED
 ): boolean {
   return raw?.trim().toLowerCase() === 'true' || raw?.trim() === '1';
+}
+
+/**
+ * TASKMASTER_BLOCKER_REPORT: true/1 on, false/0 off, otherwise follow the
+ * in-process Duty Officer clock. A report with no clock consumer is a dead letter.
+ */
+export function resolveBlockerReportEnabled(
+  raw: string | undefined = process.env.TASKMASTER_BLOCKER_REPORT,
+  clockEnabled: boolean = dutyOfficerClockEnabled()
+): boolean {
+  const trimmed = raw?.trim().toLowerCase();
+  if (trimmed === 'true' || trimmed === '1') return true;
+  if (trimmed === 'false' || trimmed === '0') return false;
+  return clockEnabled;
 }
 
 /**
