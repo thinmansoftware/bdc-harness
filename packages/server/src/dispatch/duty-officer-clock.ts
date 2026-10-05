@@ -123,6 +123,18 @@ export function isTaskmasterMailbox(message: DispatchMessage): boolean {
   return message.sender === 'taskmaster';
 }
 
+/**
+ * A Taskmaster blocker_report (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01):
+ * sender 'taskmaster' AND an idempotency key in the blocker_report namespace.
+ * These skip the judge entirely and are relayed to the XO once, then finished.
+ */
+export function isTaskmasterBlockerReport(message: DispatchMessage): boolean {
+  return (
+    message.sender === 'taskmaster' &&
+    (message.idempotency_key ?? '').startsWith('tm:blocker_report:')
+  );
+}
+
 function namedNextStep(body: string): string | null {
   try {
     const parsed = JSON.parse(body) as { next_step?: unknown; nextStep?: unknown };
@@ -387,9 +399,10 @@ function mechanicalVerdict(claimed: DispatchMessage): DutyOfficerJudgeVerdict {
 async function escalateToXo(
   deps: DutyOfficerClockDeps,
   claimed: DispatchMessage,
-  verdict: DutyOfficerJudgeVerdict
+  verdict: DutyOfficerJudgeVerdict,
+  excerptLimit = 500
 ): Promise<void> {
-  const excerpt = (verdict.body || claimed.body).slice(0, 500);
+  const excerpt = (verdict.body || claimed.body).slice(0, excerptLimit);
   const subjectKey = escalationSubjectKey(claimed.subject_key);
   await deps.createAuthenticatedMessage(DUTY_OFFICER_SENDER, {
     correlation_id: claimed.correlation_id || `do-clock:${claimed.id}`,
@@ -402,6 +415,7 @@ async function escalateToXo(
       source_id: claimed.id,
       task_type: claimed.task_type,
       subject_key: claimed.subject_key,
+      thread_ref: claimed.subject_key,
       transport: verdict.transport ?? null,
       reason: verdict.reason,
       excerpt,
@@ -426,6 +440,33 @@ async function holdItem(deps: DutyOfficerClockDeps, claimed: DispatchMessage): P
 }
 
 async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
+  // A Taskmaster blocker_report is relayed to the XO once, WITHOUT the judge
+  // (zero LLM): the report is already content-complete and its whole purpose is
+  // to reach the XO via this clock. A failed relay holds the item and retries
+  // with the same escalation key, so the XO gets exactly one copy.
+  if (isTaskmasterBlockerReport(claimed)) {
+    const verdict: DutyOfficerJudgeVerdict = {
+      status: 'unconfigured',
+      action: 'escalate_xo',
+      reason: 'taskmaster_blocker_report',
+      // Full source body (<=500 chars by construction; capped at 2000 in
+      // escalateToXo defensively).
+      body: claimed.body,
+      failures: [],
+    };
+    try {
+      await escalateToXo(deps, claimed, verdict, 2000);
+    } catch (error) {
+      log.error({ err: error, messageId: claimed.id }, 'duty_officer_blocker_report_relay_failed');
+      await holdItem(deps, claimed);
+      return;
+    }
+    await finishItem(deps, claimed, 'done', 'succeeded', {
+      disposition: 'taskmaster_blocker_report_relayed',
+      transport: verdict.transport ?? null,
+    });
+    return;
+  }
   let verdict = await deps.judge(claimed);
   if (verdict.status === 'unconfigured') {
     verdict = mechanicalVerdict(claimed);

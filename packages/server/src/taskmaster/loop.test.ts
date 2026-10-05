@@ -16,6 +16,8 @@ import {
   tick,
   resolveTaskmasterIntervalMs,
   resolveFireVerbEnabled,
+  resolveBlockerReportEnabled,
+  MAX_BLOCKER_REPORTS_PER_TICK,
   refreshAdoption,
   canonicalizeThreadRef,
   resolveRecipient,
@@ -3966,7 +3968,7 @@ describe('M-155 exception push (loop)', () => {
     expect(nudges[0]?.body).toContain('Chronic but titled');
   });
 
-  test('push: the five-verb allowlist and the budgets are explicit (regression)', () => {
+  test('push: the six-verb allowlist and the budgets are explicit (regression)', () => {
     expect(MAX_INTERVENTIONS_PER_ITEM_24H).toBe(3);
     expect(MAX_EFFECTS_PER_TICK).toBe(10);
     expect([...TM_ALLOWED_ACTION_TYPES]).toEqual([
@@ -3975,8 +3977,15 @@ describe('M-155 exception push (loop)', () => {
       'escalate_p0',
       'digest',
       'fire_cauldron',
+      'blocker_report',
     ]);
-    expect([...TM_ALLOWED_RECIPIENTS]).toEqual(['xo', 'major-build', 'captain-ci', 'operator']);
+    expect([...TM_ALLOWED_RECIPIENTS]).toEqual([
+      'xo',
+      'major-build',
+      'captain-ci',
+      'operator',
+      'duty-officer',
+    ]);
   });
 
   test('fire verb environment defaults OFF without a calendar budget', () => {
@@ -4270,6 +4279,361 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_ESCALATE_TO_ISSUE;
       else process.env.TASKMASTER_ESCALATE_TO_ISSUE = prior;
+    }
+  });
+});
+
+describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', () => {
+  const HOUR = 3_600_000;
+
+  function withBlockerFlag(value: string | undefined): () => void {
+    const prior = process.env.TASKMASTER_BLOCKER_REPORT;
+    if (value === undefined) delete process.env.TASKMASTER_BLOCKER_REPORT;
+    else process.env.TASKMASTER_BLOCKER_REPORT = value;
+    return () => {
+      if (prior === undefined) delete process.env.TASKMASTER_BLOCKER_REPORT;
+      else process.env.TASKMASTER_BLOCKER_REPORT = prior;
+    };
+  }
+
+  function blockedThread(n: number): ListedThread {
+    return makeListedThread({
+      ref: `gh:thinmansoftware/bdc-xo#${n}`,
+      priority: 'P1',
+      title: `WO-BLOCK-${n} stuck`,
+      isBlocked: true,
+      labels: ['wo', 'prio:P1', 'blocked'],
+      lastActivityAt: new Date(T0 - 3 * HOUR).toISOString(),
+    });
+  }
+
+  test('blocker_report: tick sends to duty-officer with subject and repeat reason, capped per tick', async () => {
+    const restore = withBlockerFlag('true');
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const threads = [1, 2, 3, 4, 5].map(blockedThread);
+      const createCalls: Array<{
+        idempotency_key: string;
+        recipient: string;
+        subject_key?: string;
+        repeat_reason?: string;
+        priority?: string;
+        body: string;
+      }> = [];
+      const deps = makeDeps(world, {
+        listThreads: async () =>
+          Object.assign([...threads], { unlabelledPriorityTriage: [] as string[] }),
+        createTask: (async (
+          _ctx: unknown,
+          data: {
+            idempotency_key: string;
+            recipient: string;
+            subject_key?: string;
+            repeat_reason?: string;
+            priority?: string;
+            body: string;
+          }
+        ) => {
+          createCalls.push(data);
+          world.sentMessages.push({
+            idempotency_key: data.idempotency_key,
+            recipient: data.recipient,
+            body: data.body,
+            createdAt: new Date(world.nowMs).toISOString(),
+          });
+          return { id: `msg-${world.sentMessages.length}`, status: 'queued' };
+        }) as unknown as TaskmasterDeps['createTask'],
+      });
+      const registered: Array<{ recipient: string; on_absence: string; max_retries: number }> = [];
+      deps.db = {
+        ...deps.db!,
+        registerExpectation: async (d: {
+          recipient: string;
+          on_absence: string;
+          max_retries: number;
+        }) => {
+          registered.push(d);
+          return `exp-${registered.length}`;
+        },
+      };
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps); // confirm tick
+      world.nowMs += 60_000;
+      await tick(state, deps); // send tick
+
+      const reportCalls = createCalls.filter(c =>
+        c.idempotency_key.startsWith('tm:blocker_report:')
+      );
+      expect(reportCalls).toHaveLength(MAX_BLOCKER_REPORTS_PER_TICK);
+      for (const c of reportCalls) {
+        expect(c.recipient).toBe('duty-officer');
+        expect(c.subject_key).toMatch(/^gh:thinmansoftware\/bdc-xo#\d+$/);
+        expect(c.repeat_reason).toBe('tm:blocker_report:repeated');
+        expect(c.priority).toBeUndefined();
+      }
+      // The other 2 are journaled deferred.
+      const deferred = world.journal.filter(
+        j => j.action_type === 'blocker_report' && j.outcome === 'deferred'
+      );
+      expect(deferred).toHaveLength(2);
+      // No createTask addressed to xo or an owner seat.
+      expect(
+        createCalls.some(c => ['xo', 'major-build', 'captain-ci', 'operator'].includes(c.recipient))
+      ).toBe(false);
+      // Each blocker_report expectation: give_up / 0 retries (no redispatch).
+      const blockerExps = registered.filter(e => e.recipient === 'duty-officer');
+      expect(blockerExps).toHaveLength(MAX_BLOCKER_REPORTS_PER_TICK);
+      for (const e of blockerExps) {
+        expect(e.on_absence).toBe('give_up');
+        expect(e.max_retries).toBe(0);
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test('blocker_report: pause parks it and the flag turns it off', async () => {
+    // (a) PAUSED scope effects -> parked, no send.
+    {
+      const restore = withBlockerFlag('true');
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        world.control.pause_state = 'PAUSED';
+        world.control.pause_scope = 'effects';
+        const deps = makeDeps(world, { listThreads: async () => [blockedThread(11)] });
+        const state = createTaskmasterState(60_000);
+        await tick(state, deps);
+        world.nowMs += 60_000;
+        await tick(state, deps);
+        const row = world.journal.find(j => j.action_type === 'blocker_report');
+        expect(row?.outcome).toBe('parked');
+        expect(JSON.parse(row?.proposal_json ?? '{}').reason).toBe('paused');
+        expect(
+          world.sentMessages.some(m => m.idempotency_key.startsWith('tm:blocker_report:'))
+        ).toBe(false);
+      } finally {
+        restore();
+      }
+    }
+    // (b) PAUSED scope null -> still parked (blocker_report is never pause-exempt).
+    {
+      const restore = withBlockerFlag('true');
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        world.control.pause_state = 'PAUSED';
+        world.control.pause_scope = null;
+        const deps = makeDeps(world, { listThreads: async () => [blockedThread(12)] });
+        const state = createTaskmasterState(60_000);
+        await tick(state, deps);
+        world.nowMs += 60_000;
+        await tick(state, deps);
+        const row = world.journal.find(j => j.action_type === 'blocker_report');
+        expect(row?.outcome).toBe('parked');
+        expect(JSON.parse(row?.proposal_json ?? '{}').reason).toBe('paused');
+      } finally {
+        restore();
+      }
+    }
+    // (c) RUNNING with flag 'false' -> no proposal at all.
+    {
+      const restore = withBlockerFlag('false');
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const deps = makeDeps(world, { listThreads: async () => [blockedThread(13)] });
+        const state = createTaskmasterState(60_000);
+        await tick(state, deps);
+        world.nowMs += 60_000;
+        await tick(state, deps);
+        expect(world.journal.some(j => j.action_type === 'blocker_report')).toBe(false);
+        expect(
+          world.sentMessages.some(m => m.idempotency_key.startsWith('tm:blocker_report:'))
+        ).toBe(false);
+      } finally {
+        restore();
+      }
+    }
+    // (d) unset follows the clock-enabled signal.
+    expect(resolveBlockerReportEnabled(undefined, false)).toBe(false);
+    expect(resolveBlockerReportEnabled(undefined, true)).toBe(true);
+    expect(resolveBlockerReportEnabled('false', true)).toBe(false);
+    expect(resolveBlockerReportEnabled('1', false)).toBe(true);
+  });
+
+  test('blocker_report: never graded useful or noise and never moves the floor', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const nudgeRef = 'gh:thinmansoftware/bdc-xo#700';
+    const blockerRef = 'gh:thinmansoftware/bdc-xo#701';
+    const nudgeKey = `tm:nudge:${nudgeRef}:1`;
+    const blockerKey = `tm:blocker_report:${blockerRef}:1`;
+    const createdAt = new Date(T0 - 23 * HOUR).toISOString();
+    const deadline = new Date(T0 - 1 * HOUR).toISOString();
+
+    for (const [key, ref, type, recipient] of [
+      [nudgeKey, nudgeRef, 'nudge', 'major-build'],
+      [blockerKey, blockerRef, 'blocker_report', 'duty-officer'],
+    ] as const) {
+      world.journal.push({
+        id: `seed-${type}`,
+        created_at: createdAt,
+        thread_ref: ref,
+        action_type: type,
+        proposal_json: '{}',
+        idempotency_key: key,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: deadline,
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+      world.sentMessages.push({
+        idempotency_key: key,
+        recipient,
+        body: 'seeded',
+        createdAt,
+        acknowledged_at: new Date(T0 - 2 * HOUR).toISOString(),
+      });
+    }
+
+    const deps = makeDeps(world, {
+      // Both the nudge and the blocker_report rows refer to a now-closed issue.
+      getGithubIssueEvidence: async () =>
+        makeEvidence({ state: 'closed', closedAt: new Date(T0 - 2 * HOUR).toISOString() }),
+      // Live principals: duty-officer is worker_poll (non-draining), so the
+      // blocker_report's dispatch row counts as heard -- yet it must still never
+      // be graded useful/noise.
+      assessDispatchRecipient: (async (recipient: string) => ({
+        ok: true,
+        canonical_principal: recipient.trim().toLowerCase(),
+        delivery_mode: 'worker_poll' as DispatchDeliveryMode,
+        reason: null,
+      })) as unknown as TaskmasterDeps['assessDispatchRecipient'],
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    const nudgeRow = world.journal.find(j => j.id === 'seed-nudge');
+    const blockerRow = world.journal.find(j => j.id === 'seed-blocker_report');
+    // The ordinary nudge is graded exactly as before (a closed issue -> useful).
+    expect(nudgeRow?.grade).toBe('useful');
+    // The blocker_report is NEVER graded useful or noise -> absent from the floor.
+    expect(blockerRow?.grade).toBeNull();
+  });
+
+  test('blocker_report: other verbs are unchanged when the flag is on', async () => {
+    const restoreFlag = withBlockerFlag('true');
+    const priorFire = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const A = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#801',
+        priority: 'P0',
+        isUnclaimed: true,
+        isUnclaimedP0: true,
+        title: 'WO-FIRE-ELIGIBLE-801 outage',
+        lastActivityAt: new Date(T0 - 3 * HOUR).toISOString(),
+      });
+      const B = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#802',
+        priority: 'P0',
+        isUnclaimed: true,
+        isUnclaimedP0: true,
+        title: 'WO-NONFIRE-802 stuck',
+        lastActivityAt: new Date(T0 - 3 * HOUR).toISOString(),
+      });
+      const C = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#803',
+        priority: 'P1',
+        isUnclaimed: false,
+        ownerLogin: 'major-build',
+        title: 'WO-NUDGE-803 investigate',
+        lastActivityAt: new Date(T0 - 3 * HOUR).toISOString(),
+      });
+      const gh = makeIssueCommentSink(world);
+      const record = { cascadeId: 'cascade-801', status: 'running' } as unknown as Awaited<
+        ReturnType<NonNullable<TaskmasterDeps['runCascade']>>
+      >;
+      const deps = makeDeps(world, {
+        listThreads: async () =>
+          Object.assign([A, B, C], { unlabelledPriorityTriage: [] as string[] }),
+        escalationDelivery: gh.delivery,
+        checkFireEligibility: async (title: string) =>
+          title.includes('WO-FIRE-ELIGIBLE-801')
+            ? {
+                eligible: true,
+                evidence: {
+                  woId: 'WO-FIRE-ELIGIBLE-801',
+                  targetRepo: 'thinmansoftware/bdc-harness',
+                  project: 'bdc-harness',
+                  specVerifiedAt: new Date(T0).toISOString(),
+                  noOpenOrMergedPr: true,
+                  expectedSpec: EXPECTED_SPEC,
+                },
+              }
+            : { eligible: false, reason: 'not_eligible' },
+        runCascade: (async options => {
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+        getGithubIssueEvidence: async (ref: string) =>
+          ref.includes('#803')
+            ? makeEvidence({
+                ownerLogin: 'major-build',
+                latestMarkerKind: 'PROGRESS',
+                latestMarkerText: 'rerun the failing export suite',
+                updatedAt: new Date(T0 - 3 * HOUR).toISOString(),
+                lastMovementAt: new Date(T0 - 3 * HOUR).toISOString(),
+              })
+            : null,
+      });
+      deps.db = {
+        ...deps.db!,
+        registerExpectation: async () => 'exp',
+      };
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      world.nowMs += 60_000;
+      await tick(state, deps);
+
+      // fire_cauldron produced for A (and A gets NO blocker_report).
+      expect(
+        world.journal.some(j => j.action_type === 'fire_cauldron' && j.outcome === 'sent')
+      ).toBe(true);
+      expect(
+        world.journal.some(j => j.action_type === 'blocker_report' && j.thread_ref === A.ref)
+      ).toBe(false);
+
+      // escalate_p0 for B delivered via the issue-comment path (not displaced).
+      const escalateB = world.journal.find(
+        j => j.action_type === 'escalate_p0' && j.thread_ref === B.ref
+      );
+      expect(escalateB?.outcome).toBe('sent');
+      expect(escalateB?.grade).toBe('delivered_to_issue');
+      expect(gh.posts()).toBeGreaterThanOrEqual(1);
+
+      // nudge for C sent exactly as before.
+      expect(world.sentMessages.some(m => m.idempotency_key.startsWith(`tm:nudge:${C.ref}:`))).toBe(
+        true
+      );
+
+      // B additionally gets ONE blocker_report (deferred to a later tick by the
+      // 1-effect-per-item rule), never in place of escalate_p0.
+      const blockerB = world.sentMessages.filter(
+        m => m.idempotency_key === `tm:blocker_report:${B.ref}:${Math.floor(T0 / (72 * HOUR))}`
+      );
+      expect(blockerB).toHaveLength(1);
+      expect(blockerB[0]?.recipient).toBe('duty-officer');
+    } finally {
+      restoreFlag();
+      if (priorFire === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFire;
     }
   });
 });

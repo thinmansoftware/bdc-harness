@@ -690,6 +690,124 @@ describe('SqliteAdapter', () => {
     });
   });
 
+  describe('tm_journal blocker_report verb migration (migration 060 / WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', () => {
+    test('blocker_report: old-shape SQLite journal upgrades and accepts the new verb', async () => {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      // Pre-060 shape: the FIVE-verb action_type CHECK and the post-056
+      // delivered_to_issue grade CHECK -- the exact on-disk shape migration 060
+      // must widen (action_type only; the grade CHECK is carried forward).
+      legacy.run(`
+        CREATE TABLE tm_journal (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          thread_ref TEXT NOT NULL,
+          action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+          proposal_json TEXT NOT NULL,
+          idempotency_key TEXT,
+          before_hash TEXT,
+          proof_predicate TEXT,
+          proof_deadline_at TEXT,
+          outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+          graded_at TEXT,
+          grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+        )
+      `);
+      legacy.run(`
+        INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome, grade)
+        VALUES ('legacy-060-1', '2026-10-01T00:00:00.000Z', 'thread-1', 'nudge', '{}', 'sent', 'useful')
+      `);
+      legacy.run(`
+        INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome, grade)
+        VALUES ('legacy-060-2', '2026-10-01T01:00:00.000Z', 'thread-2', 'escalate_p0', '{}', 'sent', 'delivered_to_issue')
+      `);
+      legacy.close();
+
+      // First initialization runs the migration and rebuilds the table.
+      db = new SqliteAdapter(currentDbPath);
+      const schemaAfterFirst = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+      );
+      expect(schemaAfterFirst.rows[0]?.sql).toContain('blocker_report');
+
+      // Both pre-existing rows survive the rebuild.
+      const preserved = await db.query<{ id: string }>(`SELECT id FROM tm_journal ORDER BY id`);
+      expect(preserved.rows.map(r => r.id)).toEqual(['legacy-060-1', 'legacy-060-2']);
+
+      // A blocker_report insert now succeeds against the migrated database.
+      await db.query(
+        `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          'legacy-060-3',
+          '2026-10-05T00:00:00.000Z',
+          'gh:thinmansoftware/bdc-xo#2274',
+          'blocker_report',
+          '{}',
+          'sent',
+        ]
+      );
+      const inserted = await db.query<{ action_type: string }>(
+        `SELECT action_type FROM tm_journal WHERE id = 'legacy-060-3'`
+      );
+      expect(inserted.rows).toEqual([{ action_type: 'blocker_report' }]);
+
+      // The CHECK is NOT loosened: a bogus verb still fails.
+      let bogusError: unknown;
+      try {
+        await db.query(
+          `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          ['legacy-060-bogus', '2026-10-05T00:00:00.000Z', 'thread-x', 'bogus', '{}', 'sent']
+        );
+      } catch (error: unknown) {
+        bogusError = error;
+      }
+      expect(bogusError).toBeDefined();
+
+      // The grade CHECK is unchanged (not loosened): a bogus grade still fails.
+      let badGradeError: unknown;
+      try {
+        await db.query(
+          `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome, grade)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            'legacy-060-badgrade',
+            '2026-10-05T00:00:00.000Z',
+            'thread-y',
+            'nudge',
+            '{}',
+            'sent',
+            'bogus',
+          ]
+        );
+      } catch (error: unknown) {
+        badGradeError = error;
+      }
+      expect(badGradeError).toBeDefined();
+
+      // Second initialization does NOT rebuild again: the schema already lists
+      // blocker_report, so the idempotent block is a no-op and the table is
+      // stable (same schema SQL, rows and new verb preserved).
+      const second = new SqliteAdapter(currentDbPath);
+      const schemaAfterSecond = await second.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+      );
+      expect(schemaAfterSecond.rows[0]?.sql).toBe(schemaAfterFirst.rows[0]?.sql);
+      const afterSecond = await second.query<{ id: string }>(
+        `SELECT id FROM tm_journal ORDER BY id`
+      );
+      expect(afterSecond.rows.map(r => r.id)).toEqual([
+        'legacy-060-1',
+        'legacy-060-2',
+        'legacy-060-3',
+      ]);
+    });
+  });
+
   describe('INSERT with RETURNING', () => {
     test('returns inserted row via native RETURNING', async () => {
       db = createTestDb();
