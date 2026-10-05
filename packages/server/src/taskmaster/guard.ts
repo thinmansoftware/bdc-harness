@@ -23,6 +23,7 @@ export const TM_ALLOWED_ACTION_TYPES = [
   'escalate_p0',
   'digest',
   'fire_cauldron',
+  'blocker_report',
 ] as const;
 export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
 
@@ -31,7 +32,13 @@ export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
  * drain used for escalations and the daily digest (the 'john' dispatch
  * principal is seeded inactive). No broadcast, no 'board', no customers.
  */
-export const TM_ALLOWED_RECIPIENTS = ['xo', 'major-build', 'captain-ci', 'operator'] as const;
+export const TM_ALLOWED_RECIPIENTS = [
+  'xo',
+  'major-build',
+  'captain-ci',
+  'operator',
+  'duty-officer',
+] as const;
 export type TmAllowedRecipient = (typeof TM_ALLOWED_RECIPIENTS)[number];
 
 /**
@@ -58,6 +65,16 @@ const NUDGE_WHY_RE = /\b(?:Blocked|Next action):\s*\S+/i;
 
 export function isContentCompleteNudgeBody(body: string): boolean {
   return NUDGE_TITLE_RE.test(body) && NUDGE_OWNER_RE.test(body) && NUDGE_WHY_RE.test(body);
+}
+
+export function isContentCompleteBlockerReportBody(body: string): boolean {
+  return (
+    NUDGE_TITLE_RE.test(body) &&
+    NUDGE_OWNER_RE.test(body) &&
+    /\bBlocked:\s*\S+/i.test(body) &&
+    /https:\/\/github\.com\//i.test(body) &&
+    /\bfor\s+(?:\d+h|\d+ days)\b/i.test(body)
+  );
 }
 
 export interface GuardResult {
@@ -98,6 +115,19 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       allowed: false,
       forbiddenEffect: true,
       reason: `recipient_not_allowlisted: '${proposal.recipient}' is not a named seat the Taskmaster may address (allowed: ${TM_ALLOWED_RECIPIENTS.join(', ')}).`,
+    };
+  }
+
+  const actionType = proposal.type.trim().toLowerCase();
+  const recipient = proposal.recipient.trim().toLowerCase();
+  if (
+    (actionType === 'blocker_report' && recipient !== 'duty-officer') ||
+    (actionType !== 'blocker_report' && recipient === 'duty-officer')
+  ) {
+    return {
+      allowed: false,
+      forbiddenEffect: true,
+      reason: 'recipient_action_mismatch: duty-officer is reserved for blocker_report.',
     };
   }
 
@@ -168,6 +198,13 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       reason:
         'content_incomplete: the nudge body lacks the required item content ' +
         '(quoted title, owner, and blocker or next action); the item stays on the register.',
+    };
+  }
+
+  if (actionType === 'blocker_report' && !isContentCompleteBlockerReportBody(normalized)) {
+    return {
+      allowed: false,
+      reason: 'content_incomplete: the blocker report lacks its required item content.',
     };
   }
 
