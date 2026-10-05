@@ -39,7 +39,7 @@ import {
   type TmActionType,
   usefulRateFloorBreached,
 } from './rules';
-import { validateProposal, type TmAllowedRecipient } from './guard';
+import { validateProposal, WO_ID_RE, type TmAllowedRecipient } from './guard';
 import {
   buildEscalationCommentBody,
   createDbEscalationDeliveryClaim,
@@ -322,6 +322,8 @@ interface GithubIssue {
  */
 const WORK_LABELS = ['wo', 'project', 'arc'] as const;
 const GITHUB_RATE_LIMIT_FLOOR = 5;
+/** Max GitHub search requests for open-PR claims inside one defaultListThreads call. */
+const PR_CLAIM_LOOKUP_CAP = 10;
 
 /**
  * Default max evidence enrichments per adoption refresh tick.
@@ -450,6 +452,7 @@ export async function defaultListThreads(
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const threads: ListedThread[] = [];
   const unlabelledPriorityTriage: string[] = [];
+  let prClaimLookups = 0;
   for (const repo of repos) {
     const seen = new Set<number>();
     for (const label of WORK_LABELS) {
@@ -486,14 +489,20 @@ export async function defaultListThreads(
             ['status:building', 'status:review'].includes(label)
           );
           const ownerLogin = issue.assignees?.[0]?.login ?? null;
-          const isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
+          let isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
+          const woId = issue.title?.match(WO_ID_RE)?.[0];
+          if (isUnclaimed && woId !== undefined && prClaimLookups < PR_CLAIM_LOOKUP_CAP) {
+            prClaimLookups += 1;
+            const claimed = await lookupOpenPrClaim(fetchImpl, repo, woId);
+            if (claimed) isUnclaimed = false;
+          }
           threads.push({
             ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
             priority,
             isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
             lastActivityAt: issue.updated_at,
             isBlocked: normalizedLabels.some(label =>
-              ['blocked', 'status:blocked'].includes(label)
+              ['blocked', 'status:blocked', 'wo:blocked'].includes(label)
             ),
             isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
             isUnclaimed,
@@ -536,6 +545,46 @@ function githubHeaders(): Record<string, string> {
     accept: 'application/vnd.github+json',
     ...(token ? { authorization: `Bearer ${token}` } : {}),
   };
+}
+
+/** HTTP failure from the open-PR claim search. Carries the response status for the warning. */
+class PrClaimLookupError extends Error {
+  readonly status: number;
+
+  constructor(status: number) {
+    super(`taskmaster_pr_claim_lookup_failed:${status}`);
+    this.name = 'PrClaimLookupError';
+    this.status = status;
+  }
+}
+
+/**
+ * True when GitHub search returns at least one open pull request whose title
+ * or body contains the work-order id, scoped to the repository owner.
+ * Failures are logged and returned as false so the work-SOR read stays up.
+ */
+async function lookupOpenPrClaim(
+  fetchImpl: typeof fetch,
+  repo: string,
+  woId: string
+): Promise<boolean> {
+  const slash = repo.indexOf('/');
+  const owner = slash === -1 ? repo : repo.slice(0, slash);
+  const query = `is:pr is:open in:title,body ${woId} org:${owner}`;
+  const url = `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=1`;
+  try {
+    const response = await fetchImpl(url, { headers: githubHeaders() });
+    if (!response.ok) {
+      throw new PrClaimLookupError(response.status);
+    }
+    const body = (await response.json()) as { items?: unknown[] } | null;
+    return Array.isArray(body?.items) && body.items.length > 0;
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    const status = error instanceof PrClaimLookupError ? error.status : undefined;
+    log.warn({ err, repo, woId, status }, 'taskmaster.pr_claim_lookup_failed');
+    return false;
+  }
 }
 
 /**

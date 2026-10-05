@@ -6,6 +6,7 @@
 import { afterAll, describe, expect, test } from 'bun:test';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
+import { rootLogger } from '@archon/paths';
 import {
   createTaskmasterState,
   defaultFindEffectByIdempotencyKey,
@@ -37,7 +38,13 @@ import {
 } from './escalation-delivery';
 import type { DispatchDeliveryMode } from '@archon/core/db/dispatch';
 import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
-import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal, NUDGE_CLOCK_MS } from './rules';
+import {
+  classifyThread,
+  computeNextAction,
+  MAX_INTERVENTIONS_PER_ITEM_24H,
+  NUDGE_CLOCK_MS,
+  type ActionProposal,
+} from './rules';
 import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
 import type { ThreadSnapshot } from './rules';
 import type {
@@ -3026,6 +3033,112 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     expect(urls[1]).toContain('/issues/1453/comments');
     expect(urls.some(url => url.includes('/events'))).toBe(false);
     expect(urls.some(url => url.includes('/issues/1454'))).toBe(false);
+  });
+
+  test('wo_blocked_label_is_blocked', async () => {
+    const { fetchImpl } = fakeGithubFetch({
+      wo: [ghIssue(21, ['wo', 'prio:P0', 'wo:blocked'])],
+    });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(1);
+    const thread = threads[0];
+    if (thread === undefined) throw new Error('missing blocked thread');
+    expect(thread.isBlocked).toBe(true);
+    expect(
+      computeNextAction(thread, classifyThread(thread, T0), {
+        interventionsLast24h: 0,
+        nowMs: T0,
+      })
+    ).toBeNull();
+  });
+
+  test('open_pr_counts_as_claim', async () => {
+    const searchUrls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/search/issues')) {
+        searchUrls.push(url);
+        return new Response(JSON.stringify({ items: [{ title: 'WO-EXAMPLE-FOO-01' }] }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '100',
+          },
+        });
+      }
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      const issues =
+        label === 'wo' ? [ghIssue(31, ['wo', 'prio:P0'], { title: 'WO-EXAMPLE-FOO-01' })] : [];
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    const threads = await defaultListThreads(fetchImpl);
+    expect(searchUrls).toHaveLength(1);
+    const searchUrl = searchUrls[0];
+    expect(searchUrl).toBeDefined();
+    const q = new URL(searchUrl ?? '').searchParams.get('q') ?? '';
+    expect(q).toContain('is:pr');
+    expect(q).toContain('is:open');
+    expect(q).toContain('in:title,body');
+    expect(q).toContain('WO-EXAMPLE-FOO-01');
+    expect(q).toContain('org:thinmansoftware');
+    expect(threads).toHaveLength(1);
+    expect(threads[0]?.isUnclaimed).toBe(false);
+    expect(threads[0]?.isUnclaimedP0).toBe(false);
+  });
+
+  test('pr_lookup_fails_open', async () => {
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/search/issues')) {
+        return new Response('rate limited', {
+          status: 403,
+          headers: { 'x-ratelimit-remaining': '0' },
+        });
+      }
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      const issues =
+        label === 'wo' ? [ghIssue(32, ['wo', 'prio:P0'], { title: 'WO-EXAMPLE-FOO-01' })] : [];
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    // Pino keeps the destination on a local Symbol(pino.stream), not Symbol.for.
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    if (streamSymbol === undefined) {
+      throw new Error('pino.stream symbol missing on rootLogger');
+    }
+    const stream = (rootLogger as unknown as Record<symbol, { write: (chunk: string) => boolean }>)[
+      streamSymbol
+    ];
+    const chunks: string[] = [];
+    const originalWrite = stream.write;
+    stream.write = (chunk: string) => {
+      chunks.push(String(chunk));
+      return true;
+    };
+    try {
+      const threads = await defaultListThreads(fetchImpl);
+      expect(threads).toHaveLength(1);
+      expect(threads[0]?.isUnclaimed).toBe(true);
+      expect(threads[0]?.isUnclaimedP0).toBe(true);
+      expect(chunks.join('')).toContain('taskmaster.pr_claim_lookup_failed');
+    } finally {
+      stream.write = originalWrite;
+    }
   });
 });
 
