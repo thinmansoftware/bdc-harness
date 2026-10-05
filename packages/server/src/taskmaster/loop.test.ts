@@ -3083,11 +3083,7 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     const searchUrl = searchUrls[0];
     expect(searchUrl).toBeDefined();
     const q = new URL(searchUrl ?? '').searchParams.get('q') ?? '';
-    expect(q).toContain('is:pr');
-    expect(q).toContain('is:open');
-    expect(q).toContain('in:title,body');
-    expect(q).toContain('WO-EXAMPLE-FOO-01');
-    expect(q).toContain('org:thinmansoftware');
+    expect(q).toBe('is:pr is:open in:title,body "WO-EXAMPLE-FOO-01" org:thinmansoftware');
     expect(threads).toHaveLength(1);
     expect(threads[0]?.isUnclaimed).toBe(false);
     expect(threads[0]?.isUnclaimedP0).toBe(false);

@@ -570,7 +570,9 @@ async function lookupOpenPrClaim(
 ): Promise<boolean> {
   const slash = repo.indexOf('/');
   const owner = slash === -1 ? repo : repo.slice(0, slash);
-  const query = `is:pr is:open in:title,body ${woId} org:${owner}`;
+  // Quote the id so search matches the full WO token. Unquoted hyphens are
+  // exclusion operators and split WO-... into separate terms.
+  const query = `is:pr is:open in:title,body "${woId}" org:${owner}`;
   const url = `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=1`;
   try {
     const response = await fetchImpl(url, { headers: githubHeaders() });
