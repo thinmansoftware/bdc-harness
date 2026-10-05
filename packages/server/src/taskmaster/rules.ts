@@ -26,6 +26,7 @@ import { createHash } from 'crypto';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
 import type { FireEligibilityEvidence } from './fire-eligibility';
 import { WO_ID_RE } from './guard';
+import { canonicalizeThreadRef } from './thread-ref';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
 export type ThreadClass = 'ready' | 'stale' | 'blocked' | 'healthy';
@@ -501,7 +502,9 @@ export function composeBlockerReportBody(
 ): string | null {
   const title = adoption?.title?.trim();
   if (!title) return null;
-  const parsed = parseGhIssueRef(thread.ref);
+  // Canonicalize first so a pre-rename alias ref (gh:bluedevilcollectibles/...)
+  // yields the current, non-obsolete issue URL.
+  const parsed = parseGhIssueRef(canonicalizeThreadRef(thread.ref));
   if (!parsed) return null;
   const boundedTitle = title.length > 200 ? title.slice(0, 200) : title;
   const owner = adoption?.owner_login?.trim() || 'UNASSIGNED';
@@ -512,14 +515,20 @@ export function composeBlockerReportBody(
   const prefix = `Blocker report (${thread.priority}): "${boundedTitle}" -- owner: ${owner}. Blocked: `;
   const suffix = `. State: ${descriptor} for ${duration}. ${url}`;
   const room = 500 - prefix.length - suffix.length;
-  // room is ample for realistic inputs (title is capped at 200, owner is a
-  // short login, descriptor/duration/url are short). Keep at least one
-  // non-space blocked char so the content check still passes; if there is no
-  // room at all, fall back to the short literal.
+  // The 500-char budget must hold even for a pathological owner login or repo
+  // slug: if the fixed prefix/suffix alone leave no room for a blocked-reason
+  // character, we cannot emit a bounded, content-complete body. Reject (the
+  // caller treats null as "no report") rather than return an oversized string.
+  if (room < 1) return null;
+  // Trim the variable blocked clause to fit, preserving the trailing URL. Keep
+  // at least one non-space char so the content check still passes; if a
+  // length-capped slice is all whitespace, fall back to the raw capped slice
+  // (still within `room`) rather than the untrimmed full reason.
   let blockedFinal = blocked;
-  if (room <= 0) blockedFinal = 'no named blocker';
-  else if (blockedFinal.length > room)
-    blockedFinal = blockedFinal.slice(0, room).trimEnd() || blocked;
+  if (blockedFinal.length > room) {
+    const trimmed = blockedFinal.slice(0, room).trimEnd();
+    blockedFinal = trimmed.length > 0 ? trimmed : blockedFinal.slice(0, room);
+  }
   return `${prefix}${blockedFinal}${suffix}`;
 }
 
@@ -542,7 +551,11 @@ export function computeBlockerReport(
   _classification: ThreadClass,
   context: NextActionContext
 ): ActionProposal | null {
-  const parsed = parseGhIssueRef(thread.ref);
+  // Canonicalize once: pre-rename alias refs (gh:bluedevilcollectibles/...)
+  // must collapse to the current org so the idempotency key and issue URL match
+  // the journal grouping loop.ts performs via canonicalizeThreadRef.
+  const canonicalRef = canonicalizeThreadRef(thread.ref);
+  const parsed = parseGhIssueRef(canonicalRef);
   if (!parsed) return null;
   if (thread.isHeld) return null;
 
@@ -590,7 +603,7 @@ export function computeBlockerReport(
     threadRef: thread.ref,
     recipient: 'duty-officer',
     body,
-    idempotencyKey: `tm:blocker_report:${thread.ref}:${bucket}`,
+    idempotencyKey: `tm:blocker_report:${canonicalRef}:${bucket}`,
     actsImmediately: false,
   };
 }

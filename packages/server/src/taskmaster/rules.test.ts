@@ -871,6 +871,19 @@ describe('blocker_report (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', () =>
     expect(longTitle!.length).toBeLessThanOrEqual(500);
     expect(isContentCompleteBlockerReportBody(longTitle!)).toBe(true);
 
+    // An oversized blocked reason is trimmed to keep the body within 500 chars
+    // while preserving the trailing URL and a non-space blocked char.
+    const longReason = composeBlockerReportBody(
+      item,
+      makeAdoption({ title: 'WO-B-03 fix', blocked_reason: 'R'.repeat(600) }),
+      'labelled_blocked',
+      since,
+      NOW_MS
+    );
+    expect(longReason!.length).toBeLessThanOrEqual(500);
+    expect(longReason).toContain('https://github.com/thinmansoftware/bdc-harness/issues/1');
+    expect(isContentCompleteBlockerReportBody(longReason!)).toBe(true);
+
     // No title -> null
     expect(
       composeBlockerReportBody(
@@ -881,5 +894,47 @@ describe('blocker_report (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', () =>
         NOW_MS
       )
     ).toBeNull();
+  });
+
+  test('blocker_report: oversized owner/ref is rejected, not returned over 500 chars', () => {
+    const item = thread({ priority: 'P1' });
+    const since = NOW_MS - THREE_HOURS_MS;
+    // A pathological owner login pushes the fixed prefix past the 500-char
+    // budget: there is no room for even one blocked-reason char, so the body
+    // composer rejects (null) rather than emitting an oversized string.
+    const rejected = composeBlockerReportBody(
+      item,
+      makeAdoption({ title: 'WO-BIG-01', owner_login: 'o'.repeat(600), blocked_reason: 'x' }),
+      'labelled_blocked',
+      since,
+      NOW_MS
+    );
+    expect(rejected).toBeNull();
+  });
+
+  test('blocker_report: pre-rename aliased ref yields canonical key and URL', () => {
+    // Historical gh:bluedevilcollectibles/... ref must collapse to the current
+    // org before the idempotency key and issue URL are built (M-141 alias).
+    const aliasedItem = thread({ ref: 'gh:bluedevilcollectibles/bdc-harness#1', isBlocked: true });
+    const adoption = makeAdoption({
+      title: 'WO-ALIAS-01 fix',
+      is_blocked: 1,
+      blocked_reason: 'waiting on PRH credit',
+      last_movement_at: new Date(NOW_MS - THREE_HOURS_MS).toISOString(),
+    });
+    const proposal = computeBlockerReport(
+      aliasedItem,
+      classifyThread(aliasedItem, NOW_MS),
+      ctx({ adoption })
+    );
+    expect(proposal).not.toBeNull();
+    // Canonical org in the key, NOT the historical alias -- matches the journal
+    // grouping loop.ts performs via canonicalizeThreadRef.
+    expect(proposal?.idempotencyKey).toBe(
+      `tm:blocker_report:gh:thinmansoftware/bdc-harness#1:${BUCKET}`
+    );
+    // Canonical (non-obsolete) issue URL in the body.
+    expect(proposal?.body).toContain('https://github.com/thinmansoftware/bdc-harness/issues/1');
+    expect(proposal?.body).not.toContain('bluedevilcollectibles');
   });
 });
