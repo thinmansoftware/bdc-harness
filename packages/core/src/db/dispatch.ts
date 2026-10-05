@@ -153,6 +153,7 @@ export interface XoLeaseBind {
   lease_id: string;
   fencing_token: number;
   holder_token_hash: string;
+  holder_principal_id: string;
 }
 
 export interface MailboxDepth {
@@ -1324,9 +1325,9 @@ async function validateXoLeaseBind(
   }>(
     `SELECT lease_id, fencing_token, holder_token_hash
      FROM board_xo_leases
-     WHERE id = 1 AND principal_id = 'xo' AND seat_id = 'xo'
+     WHERE id = 1 AND principal_id = $2 AND seat_id = 'xo'
        AND released_at IS NULL AND expires_at > $1${leaseLock}`,
-    [nowIso()]
+    [nowIso(), bind.holder_principal_id]
   );
   const lease = result.rows[0];
   if (
@@ -1346,12 +1347,19 @@ function xoLeaseBindPredicate(
   if (principalId !== 'xo') return { sql: '', params: [] };
   if (!bind) throw new Error('xo_bind_required');
   // Receipt UPDATEs reserve $1-$3. Check the live lease in the write itself.
+  // $8 is bind.holder_principal_id.
   return {
     sql: ` AND EXISTS (SELECT 1 FROM board_xo_leases
-      WHERE id = 1 AND principal_id = 'xo' AND seat_id = 'xo'
+      WHERE id = 1 AND principal_id = $8 AND seat_id = 'xo'
         AND lease_id = $4 AND fencing_token = $5 AND holder_token_hash = $6
         AND released_at IS NULL AND expires_at > $7)`,
-    params: [bind.lease_id, bind.fencing_token, bind.holder_token_hash, nowIso()],
+    params: [
+      bind.lease_id,
+      bind.fencing_token,
+      bind.holder_token_hash,
+      nowIso(),
+      bind.holder_principal_id,
+    ],
   };
 }
 

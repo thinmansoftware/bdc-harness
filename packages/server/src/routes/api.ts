@@ -2663,27 +2663,28 @@ export function registerApiRoutes(
         );
         const lease = await boardAuthorityDb.getCurrentXoLease();
         if (
+          !lease ||
           principal.seat_id !== 'xo' ||
-          principal.principal_id !== 'xo' ||
-          lease?.principal_id !== 'xo' ||
           lease.seat_id !== 'xo' ||
+          lease.principal_id !== principal.principal_id ||
           lease.lease_id !== leaseId ||
           lease.fencing_token !== fencingToken
         )
           throw new DispatchActorUnboundError();
         await dispatchMailboxActorResolvedHook?.();
+        return {
+          actor: 'xo',
+          bind: {
+            kind: 'xo_lease',
+            lease_id: leaseId,
+            fencing_token: fencingToken,
+            holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
+            holder_principal_id: principal.principal_id,
+          },
+        };
       } catch {
         throw new DispatchActorUnboundError();
       }
-      return {
-        actor: 'xo',
-        bind: {
-          kind: 'xo_lease',
-          lease_id: leaseId,
-          fencing_token: fencingToken,
-          holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
-        },
-      };
     }
 
     try {
@@ -4487,7 +4488,11 @@ export function registerApiRoutes(
     try {
       const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
       const { actor, bind } = await resolveDispatchMailboxActor(c);
-      if (body.principal_id !== undefined && body.principal_id !== actor)
+      if (
+        body.principal_id !== undefined &&
+        body.principal_id !== actor &&
+        body.principal_id !== bind?.holder_principal_id
+      )
         return apiError(c, 409, 'actor_mismatch');
       const result = await dispatchDb.acknowledgeMessage({
         id: c.req.param('id') ?? '',
@@ -4510,7 +4515,11 @@ export function registerApiRoutes(
     try {
       const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
       const { actor, bind } = await resolveDispatchMailboxActor(c);
-      if (body.principal_id !== undefined && body.principal_id !== actor)
+      if (
+        body.principal_id !== undefined &&
+        body.principal_id !== actor &&
+        body.principal_id !== bind?.holder_principal_id
+      )
         return apiError(c, 409, 'actor_mismatch');
       const result = await dispatchDb.addressMessage({
         id: c.req.param('id') ?? '',

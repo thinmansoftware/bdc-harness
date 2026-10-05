@@ -208,6 +208,7 @@ describe('dispatch Phase 1.5 PostgreSQL integration', () => {
             lease_id: '11111111-1111-4111-8111-111111111111',
             fencing_token: 9,
             holder_token_hash: createHash('sha256').update('test-holder').digest('hex'),
+            holder_principal_id: 'xo',
           };
           await db.query(
             `INSERT INTO board_xo_leases

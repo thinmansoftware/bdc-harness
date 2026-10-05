@@ -981,6 +981,7 @@ describe('dispatch db', () => {
           lease_id: '11111111-1111-4111-8111-111111111111',
           fencing_token: 9,
           holder_token_hash: createHash('sha256').update('test-holder').digest('hex'),
+          holder_principal_id: 'xo',
         };
         await db.query(
           `INSERT INTO board_xo_leases
@@ -1063,6 +1064,7 @@ describe('dispatch db', () => {
       lease_id: 'lease-current',
       fencing_token: 9,
       holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
+      holder_principal_id: 'xo',
     };
     await db.query(
       `INSERT INTO board_xo_leases
@@ -1085,6 +1087,131 @@ describe('dispatch db', () => {
       })
     ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
     expect((await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind })).ok).toBe(true);
+  });
+
+  for (const holder of ['xo-claude-board-work', 'xo-codex-board-work'] as const) {
+    test(`dispatch DAL: a bind whose holder_principal_id matches the live lease row succeeds (${holder})`, async () => {
+      const message = await createMessage({
+        correlation_id: `corr-holder-${holder}`,
+        idempotency_key: `idem-holder-${holder}`,
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'Holder bind ack.',
+      });
+      const bind: XoLeaseBind = {
+        kind: 'xo_lease',
+        lease_id: `lease-${holder}`,
+        fencing_token: 11,
+        holder_token_hash: createHash('sha256').update(`holder-secret-${holder}`).digest('hex'),
+        holder_principal_id: holder,
+      };
+      await db.query(
+        `INSERT INTO board_xo_leases
+         (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+          acquired_at, renewed_at, expires_at, released_at)
+         VALUES (1, $1, $2, 'xo', $2, $3, $4, $5, NULL, $6, NULL)`,
+        [
+          bind.lease_id,
+          holder,
+          bind.holder_token_hash,
+          bind.fencing_token,
+          new Date().toISOString(),
+          new Date(Date.now() + 60_000).toISOString(),
+        ]
+      );
+      const result = await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind });
+      expect(result.ok).toBe(true);
+      const stored = await getMessage(message.id);
+      expect(stored?.acknowledged_by).toBe('xo');
+      expect(stored?.acknowledged_at).not.toBeNull();
+    });
+  }
+
+  test('dispatch DAL: a bind whose holder_principal_id differs from the live lease row is lease_fence_stale on acknowledge', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-holder-mismatch-ack',
+      idempotency_key: 'idem-holder-mismatch-ack',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'Mismatched holder ack.',
+    });
+    const holderTokenHash = createHash('sha256').update('holder-secret-mismatch').digest('hex');
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo-claude-board-work', 'xo', 'xo-claude-board-work', $2, 12, $3, NULL, $4, NULL)`,
+      [
+        'lease-mismatch',
+        holderTokenHash,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    const bind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-mismatch',
+      fencing_token: 12,
+      holder_token_hash: holderTokenHash,
+      holder_principal_id: 'xo-codex-board-work',
+    };
+    await expect(acknowledgeMessage({ id: message.id, principal_id: 'xo', bind })).resolves.toEqual(
+      { ok: false, reason: 'lease_fence_stale' }
+    );
+    const stored = await getMessage(message.id);
+    expect(stored?.acknowledged_at).toBeNull();
+    expect(stored?.acknowledged_by).toBeNull();
+  });
+
+  test('dispatch DAL: a bind whose holder_principal_id differs from the live lease row is lease_fence_stale on address', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-holder-mismatch-address',
+      idempotency_key: 'idem-holder-mismatch-address',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'Mismatched holder address.',
+    });
+    const holderTokenHash = createHash('sha256')
+      .update('holder-secret-mismatch-address')
+      .digest('hex');
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo-claude-board-work', 'xo', 'xo-claude-board-work', $2, 13, $3, NULL, $4, NULL)`,
+      [
+        'lease-mismatch-address',
+        holderTokenHash,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    const goodBind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-mismatch-address',
+      fencing_token: 13,
+      holder_token_hash: holderTokenHash,
+      holder_principal_id: 'xo-claude-board-work',
+    };
+    expect(
+      (await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind: goodBind })).ok
+    ).toBe(true);
+    const before = await getMessage(message.id);
+    const badBind: XoLeaseBind = {
+      ...goodBind,
+      holder_principal_id: 'xo-codex-board-work',
+    };
+    await expect(
+      addressMessage({ id: message.id, principal_id: 'xo', bind: badBind })
+    ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+    const stored = await getMessage(message.id);
+    expect(stored?.acknowledged_at).toBe(before?.acknowledged_at ?? null);
+    expect(stored?.acknowledged_by).toBe('xo');
+    expect(stored?.addressed_at).toBeNull();
+    expect(stored?.addressed_by).toBeNull();
   });
 
   test('mailbox depth treats all stamped rows as legacy_unverified without a cutover', async () => {
