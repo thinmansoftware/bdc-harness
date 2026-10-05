@@ -1294,7 +1294,10 @@ describe('dispatch API', () => {
       { method: 'POST', headers: xoSeatHeaders(proof), body: '{}' }
     );
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { acknowledged_by: string; acknowledged_at: string | null };
+    const body = (await response.json()) as {
+      acknowledged_by: string;
+      acknowledged_at: string | null;
+    };
     expect(body.acknowledged_by).toBe('xo');
     expect(body.acknowledged_at).not.toBeNull();
     const stored = await storedReceipt(message.id);

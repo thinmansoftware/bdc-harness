@@ -1174,7 +1174,9 @@ describe('dispatch db', () => {
       recipient: 'xo',
       body: 'Mismatched holder address.',
     });
-    const holderTokenHash = createHash('sha256').update('holder-secret-mismatch-address').digest('hex');
+    const holderTokenHash = createHash('sha256')
+      .update('holder-secret-mismatch-address')
+      .digest('hex');
     await db.query(
       `INSERT INTO board_xo_leases
        (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
@@ -1194,9 +1196,9 @@ describe('dispatch db', () => {
       holder_token_hash: holderTokenHash,
       holder_principal_id: 'xo-claude-board-work',
     };
-    expect((await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind: goodBind })).ok).toBe(
-      true
-    );
+    expect(
+      (await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind: goodBind })).ok
+    ).toBe(true);
     const before = await getMessage(message.id);
     const badBind: XoLeaseBind = {
       ...goodBind,
