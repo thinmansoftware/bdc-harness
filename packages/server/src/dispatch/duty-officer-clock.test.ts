@@ -135,6 +135,10 @@ test('blocker_report: failed relay holds then retries the same key; digests stay
     deps.postResult as unknown as { mock: { calls: Array<[{ id: string }]> } }
   ).mock.calls.map(call => call[0].id);
   expect(finishedIds.filter(id => id === 'br-retry')).toHaveLength(1);
+  const digestFinish = (
+    deps.postResult as unknown as { mock: { calls: Array<[{ id: string; result_body: string }]> } }
+  ).mock.calls.map(call => call[0]).find(call => call.id === 'digest-no-relay');
+  expect(JSON.parse(digestFinish!.result_body)).toMatchObject({ disposition: 'taskmaster_mailbox' });
 });
 
 function message(overrides: Partial<DispatchMessage> & { id: string }): DispatchMessage {
