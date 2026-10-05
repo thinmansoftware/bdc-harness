@@ -727,6 +727,62 @@ const EXPECTED_SPEC = {
   specHash: `sha256:${'b'.repeat(64)}`,
 };
 describe('fire_cauldron loop', () => {
+  test('beyond_first_page_cannot_fire_by_default', async () => {
+    const priorFireVerb = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    const priorBeyondPage = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    const run = async (allowBeyondPage: boolean) => {
+      if (allowBeyondPage) process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE = 'true';
+      else delete process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE;
+      const world = makeWorld();
+      seedDigestSent(world);
+      const item = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#499',
+        title: 'WO-HARNESS-EXAMPLE-01',
+        priority: 'P0',
+        isUnclaimed: true,
+        isUnclaimedP0: true,
+        beyondFirstPage: true,
+      });
+      const deps = makeDeps(world, {
+        listThreads: async () => [item],
+        checkFireEligibility: async () => ({
+          eligible: true,
+          evidence: {
+            woId: 'WO-HARNESS-EXAMPLE-01',
+            targetRepo: 'thinmansoftware/bdc-harness',
+            project: 'bdc-harness',
+            specVerifiedAt: new Date(T0).toISOString(),
+            noOpenOrMergedPr: true,
+            expectedSpec: EXPECTED_SPEC,
+          },
+        }),
+        runCascade: async options => {
+          const record = { cascadeId: 'cascade-499', status: 'running' } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        },
+      });
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      await tick(state, deps);
+      return world.journal.map(row => row.action_type);
+    };
+
+    try {
+      const gatedActions = await run(false);
+      expect(gatedActions).not.toContain('fire_cauldron');
+      expect(gatedActions).toContain('escalate_p0');
+      const allowedActions = await run(true);
+      expect(allowedActions).toContain('fire_cauldron');
+    } finally {
+      if (priorFireVerb === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFireVerb;
+      if (priorBeyondPage === undefined) delete process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE;
+      else process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE = priorBeyondPage;
+    }
+  });
+
   test('legacy eligibility without immutable identity never dispatches a cascade', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
@@ -2805,6 +2861,86 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     return { urls, fetchImpl };
   }
 
+  test('paginates_all_pages', async () => {
+    const urls: string[] = [];
+    const pageIssues = (start: number, count: number) =>
+      Array.from({ length: count }, (_, index) => ghIssue(start + index, ['wo', 'prio:P1']));
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      urls.push(url);
+      const parsed = new URL(url);
+      const label = parsed.searchParams.get('labels');
+      const page = Number(parsed.searchParams.get('page'));
+      let issues: Record<string, unknown>[] = [];
+      if (label === 'wo' && page === 1) issues = pageIssues(1, 100);
+      if (label === 'wo' && page === 2) issues = pageIssues(101, 100);
+      if (label === 'wo' && page === 3) issues = pageIssues(201, 30);
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'x-ratelimit-remaining': '100' },
+      });
+    }) as typeof fetch;
+
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(230);
+    const woPages = urls
+      .filter(url => new URL(url).searchParams.get('labels') === 'wo')
+      .map(url => Number(new URL(url).searchParams.get('page')));
+    expect(woPages).toEqual([1, 2, 3]);
+    expect(urls.some(url => new URL(url).searchParams.get('labels') === 'project')).toBe(true);
+    expect(urls.some(url => new URL(url).searchParams.get('labels') === 'arc')).toBe(true);
+    expect(threads.slice(0, 100).every(thread => thread.beyondFirstPage === false)).toBe(true);
+    expect(threads.slice(100).every(thread => thread.beyondFirstPage === true)).toBe(true);
+  });
+
+  test('caps_pages_per_label', async () => {
+    const urls: string[] = [];
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    if (streamSymbol === undefined) throw new Error('pino.stream symbol missing on rootLogger');
+    const stream = (rootLogger as unknown as Record<symbol, { write: (chunk: string) => boolean }>)[
+      streamSymbol
+    ];
+    const chunks: string[] = [];
+    const originalWrite = stream.write;
+    stream.write = (chunk: string) => {
+      chunks.push(String(chunk));
+      return true;
+    };
+    try {
+      const fetchImpl = (async (input: string | URL | Request) => {
+        const url = String(input);
+        urls.push(url);
+        const parsed = new URL(url);
+        const label = parsed.searchParams.get('labels');
+        const page = Number(parsed.searchParams.get('page'));
+        const issues =
+          label === 'wo'
+            ? Array.from({ length: 100 }, (_, index) =>
+                ghIssue((page - 1) * 100 + index + 1, ['wo', 'prio:P1'])
+              )
+            : [];
+        return new Response(JSON.stringify(issues), {
+          status: 200,
+          headers: { 'content-type': 'application/json', 'x-ratelimit-remaining': '100' },
+        });
+      }) as typeof fetch;
+
+      const threads = await defaultListThreads(fetchImpl);
+      const woPages = urls
+        .filter(url => new URL(url).searchParams.get('labels') === 'wo')
+        .map(url => Number(new URL(url).searchParams.get('page')));
+      expect(woPages).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+      expect(threads).toHaveLength(1000);
+      expect(
+        chunks.filter(chunk => chunk.includes('taskmaster.github_page_limit_reached'))
+      ).toHaveLength(1);
+    } finally {
+      stream.write = originalWrite;
+    }
+  });
+
   test('queries wo, project, and arc separately while preserving an explicit repo override', async () => {
     const { urls, fetchImpl } = fakeGithubFetch({
       wo: [ghIssue(1, ['wo', 'P1']), ghIssue(3, ['wo', 'arc', 'P0'])],
@@ -3180,6 +3316,81 @@ function makeEvidence(overrides: Partial<GithubIssueEvidence> = {}): GithubIssue
 }
 
 describe('adoption projection', () => {
+  test('evidence_survives_snapshot', async () => {
+    const priorBudget = process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+    process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = '1';
+    try {
+      const world = makeWorld();
+      const refs = [4101, 4102, 4103].map(number => `gh:thinmansoftware/bdc-xo#${number}`);
+      let threads = refs.map((ref, index) =>
+        makeListedThread({
+          ref,
+          title: `Tick 1 title ${index}`,
+          priority: 'P1',
+          labels: ['wo', 'prio:P1'],
+          lastActivityAt: new Date(T0 - 10_000).toISOString(),
+        })
+      );
+      const enriched: string[] = [];
+      const deps = makeDeps(world, {
+        getGithubIssueEvidence: async ref => {
+          enriched.push(ref);
+          return makeEvidence({
+            ownerLogin: `owner-${ref.slice(-1)}`,
+            state: 'open',
+            labels: ['wo', 'prio:P1', 'evidence'],
+            updatedAt: new Date(T0).toISOString(),
+            latestMarkerKind: 'PROGRESS',
+            latestMarkerText: `next-${ref.slice(-1)}`,
+            latestMarkerAt: new Date(T0 - 2_000).toISOString(),
+            lastMovementAt: new Date(T0 - 3_000).toISOString(),
+            lastMovementKind: 'progress_comment',
+          });
+        },
+      });
+
+      await refreshAdoption(threads, deps);
+      const firstA = (await deps.db!.getAdoption!()).find(row => row.thread_ref === refs[0]);
+      expect(firstA?.owner_login).toBe('owner-1');
+
+      threads = threads.map((thread, index) => ({
+        ...thread,
+        title: `Tick 2 title ${index}`,
+        priority: 'P2',
+        labels: ['wo', 'prio:P2'],
+        isBlocked: true,
+        lastActivityAt: new Date(T0 - 20_000).toISOString(),
+      }));
+      await refreshAdoption(threads, deps);
+      const secondRows = await deps.db!.getAdoption!();
+      const secondA = secondRows.find(row => row.thread_ref === refs[0]);
+      expect(secondA?.owner_login).toBe('owner-1');
+      expect(secondA?.last_movement_at).toBe(new Date(T0 - 3_000).toISOString());
+      expect(secondA?.latest_marker_kind).toBe('PROGRESS');
+      expect(secondA?.next_action).toBe('next-1');
+      expect(secondA?.evidence_observed_at).not.toBeNull();
+      expect(secondA?.title).toBe('Tick 2 title 0');
+      expect(secondA?.priority).toBe('P2');
+      expect(secondA?.is_blocked).toBe(1);
+      expect(secondA?.source_updated_at).toBe(new Date(T0).toISOString());
+      expect(
+        secondRows.find(row => row.thread_ref === refs[1])?.evidence_observed_at
+      ).not.toBeNull();
+      expect(secondRows.find(row => row.thread_ref === refs[2])?.evidence_observed_at).toBeNull();
+
+      threads = threads.map((thread, index) =>
+        index === 0 ? { ...thread, lastActivityAt: new Date(T0 + 10_000).toISOString() } : thread
+      );
+      await refreshAdoption(threads, deps);
+      const thirdA = (await deps.db!.getAdoption!()).find(row => row.thread_ref === refs[0]);
+      expect(thirdA?.source_updated_at).toBe(new Date(T0 + 10_000).toISOString());
+      expect(enriched).toEqual(refs);
+    } finally {
+      if (priorBudget === undefined) delete process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+      else process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = priorBudget;
+    }
+  });
+
   test('adoption: captures charter-minimum state (title owner blocker movement)', async () => {
     const world = makeWorld();
     const thread = makeListedThread({

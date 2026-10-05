@@ -321,6 +321,7 @@ interface GithubIssue {
  * issue number -- OR semantics, never requiring both simultaneously.
  */
 const WORK_LABELS = ['wo', 'project', 'arc'] as const;
+const MAX_PAGES_PER_LABEL = 10;
 const GITHUB_RATE_LIMIT_FLOOR = 5;
 /** Max GitHub search requests for open-PR claims inside one defaultListThreads call. */
 const PR_CLAIM_LOOKUP_CAP = 10;
@@ -410,6 +411,7 @@ export interface ListedThread extends ThreadSnapshot {
   title?: string | null;
   ownerLogin?: string | null;
   labels?: string[];
+  beyondFirstPage?: boolean;
 }
 
 export type ListedThreadResult = ListedThread[] & { unlabelledPriorityTriage: string[] };
@@ -435,7 +437,7 @@ function assertGithubRateLimit(response: Response, context: string): void {
 
 /**
  * Work-SOR read: open GitHub issues labeled wo, project, or arc across the configured
- * repos (one request per label -- see WORK_LABELS). Rate-limit-aware (Claude
+ * repos (bounded pagination per label -- see WORK_LABELS). Rate-limit-aware (Claude
  * seat amendment): honors x-ratelimit-remaining and backs off rather than
  * spinning. An incomplete or failed read throws so the tick cannot advance its
  * success heartbeat on a partial source snapshot. Exported for tests;
@@ -455,10 +457,15 @@ export async function defaultListThreads(
   let prClaimLookups = 0;
   for (const repo of repos) {
     const seen = new Set<number>();
-    for (const label of WORK_LABELS) {
+    const firstPages = new Map<(typeof WORK_LABELS)[number], GithubIssue[]>();
+
+    const fetchPage = async (
+      label: (typeof WORK_LABELS)[number],
+      page: number
+    ): Promise<GithubIssue[]> => {
       try {
         const response = await fetchImpl(
-          `https://api.github.com/repos/${repo}/issues?state=open&labels=${label}&per_page=100`,
+          `https://api.github.com/repos/${repo}/issues?state=open&labels=${label}&per_page=100&page=${page}`,
           {
             headers: {
               accept: 'application/vnd.github+json',
@@ -466,56 +473,79 @@ export async function defaultListThreads(
             },
           }
         );
-        assertGithubRateLimit(response, `work-sor:${repo}:${label}`);
+        assertGithubRateLimit(response, `work-sor:${repo}:${label}:${page}`);
         if (!response.ok) {
-          log.warn({ repo, label, status: response.status }, 'taskmaster.github_read_failed');
+          log.warn({ repo, label, page, status: response.status }, 'taskmaster.github_read_failed');
           throw new Error(`taskmaster_github_work_sor_read_failed:${response.status}`);
         }
-        const issues = (await response.json()) as GithubIssue[];
-        for (const issue of issues) {
-          if (issue.pull_request) continue;
-          if (seen.has(issue.number)) continue; // carried both labels
-          seen.add(issue.number);
-          const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
-          const priority = priorityFromLabels(labels);
-          if (priority === null) {
-            const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
-            unlabelledPriorityTriage.push(ref);
-            log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
-            continue;
-          }
-          const normalizedLabels = labels.map(label => label.trim().toLowerCase());
-          const hasClaimStatus = normalizedLabels.some(label =>
-            ['status:building', 'status:review'].includes(label)
-          );
-          const ownerLogin = issue.assignees?.[0]?.login ?? null;
-          let isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
-          const woId = issue.title?.match(WO_ID_RE)?.[0];
-          if (isUnclaimed && woId !== undefined && prClaimLookups < PR_CLAIM_LOOKUP_CAP) {
-            prClaimLookups += 1;
-            const claimed = await lookupOpenPrClaim(fetchImpl, repo, woId);
-            if (claimed) isUnclaimed = false;
-          }
-          threads.push({
-            ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
-            priority,
-            isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
-            lastActivityAt: issue.updated_at,
-            isBlocked: normalizedLabels.some(label =>
-              ['blocked', 'status:blocked', 'wo:blocked'].includes(label)
-            ),
-            isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
-            isUnclaimed,
-            isUnclaimedP0: priority === 'P0' && isUnclaimed,
-            recipient: resolveRecipient(ownerLogin),
-            title: issue.title ?? null,
-            ownerLogin,
-            labels,
-          });
-        }
+        return (await response.json()) as GithubIssue[];
       } catch (error) {
-        log.warn({ err: error as Error, repo, label }, 'taskmaster.github_read_error');
+        log.warn({ err: error as Error, repo, label, page }, 'taskmaster.github_read_error');
         throw error;
+      }
+    };
+
+    const addIssues = async (issues: GithubIssue[], beyondFirstPage: boolean): Promise<void> => {
+      for (const issue of issues) {
+        if (issue.pull_request) continue;
+        if (seen.has(issue.number)) continue; // carried both labels
+        seen.add(issue.number);
+        const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
+        const priority = priorityFromLabels(labels);
+        if (priority === null) {
+          const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
+          unlabelledPriorityTriage.push(ref);
+          log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
+          continue;
+        }
+        const normalizedLabels = labels.map(label => label.trim().toLowerCase());
+        const hasClaimStatus = normalizedLabels.some(label =>
+          ['status:building', 'status:review'].includes(label)
+        );
+        const ownerLogin = issue.assignees?.[0]?.login ?? null;
+        let isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
+        const woId = issue.title?.match(WO_ID_RE)?.[0];
+        if (isUnclaimed && woId !== undefined && prClaimLookups < PR_CLAIM_LOOKUP_CAP) {
+          prClaimLookups += 1;
+          const claimed = await lookupOpenPrClaim(fetchImpl, repo, woId);
+          if (claimed) isUnclaimed = false;
+        }
+        threads.push({
+          ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
+          priority,
+          isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
+          lastActivityAt: issue.updated_at,
+          isBlocked: normalizedLabels.some(label =>
+            ['blocked', 'status:blocked', 'wo:blocked'].includes(label)
+          ),
+          isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
+          isUnclaimed,
+          isUnclaimedP0: priority === 'P0' && isUnclaimed,
+          recipient: resolveRecipient(ownerLogin),
+          title: issue.title ?? null,
+          ownerLogin,
+          labels,
+          beyondFirstPage,
+        });
+      }
+    };
+
+    // Process every label's first page before later pages so cross-label
+    // duplicates retain first-page status regardless of label order.
+    for (const label of WORK_LABELS) {
+      const issues = await fetchPage(label, 1);
+      firstPages.set(label, issues);
+      await addIssues(issues, false);
+    }
+    for (const label of WORK_LABELS) {
+      if (firstPages.get(label)?.length !== 100) continue;
+      for (let page = 2; page <= MAX_PAGES_PER_LABEL; page += 1) {
+        const issues = await fetchPage(label, page);
+        await addIssues(issues, true);
+        if (issues.length < 100) break;
+        if (page === MAX_PAGES_PER_LABEL) {
+          log.warn({ repo, label, page }, 'taskmaster.github_page_limit_reached');
+        }
       }
     }
   }
@@ -1084,11 +1114,11 @@ export async function refreshAdoption(
   try {
     snapshotId = await dal.beginAdoptionSnapshot();
 
-    // Prior committed evidence ages for staleness ordering (NULL first).
+    // Prior committed rows provide evidence ages and carry-forward values.
     const priorRows = (await dal.getAdoption()) ?? [];
-    const priorEvidenceAt = new Map<string, string | null>();
+    const priorByRef = new Map<string, taskmasterDb.TmAdoptionRow>();
     for (const row of priorRows) {
-      priorEvidenceAt.set(row.thread_ref, row.evidence_observed_at);
+      priorByRef.set(canonicalizeThreadRef(row.thread_ref), row);
     }
 
     // Attempt counts: read journal without threadRef filter, group by canonical ref.
@@ -1110,8 +1140,8 @@ export async function refreshAdoption(
     const ordered = [...threads].sort((a, b) => {
       const aRef = canonicalizeThreadRef(a.ref);
       const bRef = canonicalizeThreadRef(b.ref);
-      const aAt = priorEvidenceAt.get(aRef) ?? null;
-      const bAt = priorEvidenceAt.get(bRef) ?? null;
+      const aAt = priorByRef.get(aRef)?.evidence_observed_at ?? null;
+      const bAt = priorByRef.get(bRef)?.evidence_observed_at ?? null;
       if (aAt === null && bAt === null) return 0;
       if (aAt === null) return -1;
       if (bAt === null) return 1;
@@ -1180,6 +1210,26 @@ export async function refreshAdoption(
           }
           // Prefer list title; evidence path does not re-fetch title separately.
           enrichedCount += 1;
+        }
+      } else {
+        const prior = priorByRef.get(ref);
+        if (prior) {
+          base.owner_login = prior.owner_login;
+          base.state = prior.state;
+          base.labels_json = prior.labels_json;
+          base.last_movement_at = prior.last_movement_at;
+          base.last_movement_kind = prior.last_movement_kind;
+          base.latest_marker_kind = prior.latest_marker_kind;
+          base.latest_marker_at = prior.latest_marker_at;
+          base.blocked_reason = prior.blocked_reason;
+          base.next_action = prior.next_action;
+          base.evidence_observed_at = prior.evidence_observed_at;
+          if (
+            prior.source_updated_at !== null &&
+            Date.parse(thread.lastActivityAt) <= Date.parse(prior.source_updated_at)
+          ) {
+            base.source_updated_at = prior.source_updated_at;
+          }
         }
       }
 
@@ -1521,6 +1571,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   }
 
   const proposals: ActionProposal[] = [];
+  const fireBeyondFirstPageAllowed = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE === 'true';
   for (const item of [...rulings, ...threads]) {
     const canonRef = canonicalizeThreadRef(item.ref);
     const adoptionRow = adoptionByRef.get(canonRef);
@@ -1561,7 +1612,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       adoption: adoptionRow?.title ? adoptionRow : undefined,
       grades: gradesByRef.get(canonRef),
       suppression: suppressionByRef.get(canonRef),
-      fireEligible: fireResult.eligible && Boolean(fireResult.evidence?.expectedSpec),
+      fireEligible:
+        fireResult.eligible &&
+        Boolean(fireResult.evidence?.expectedSpec) &&
+        (!(item as ListedThread).beyondFirstPage || fireBeyondFirstPageAllowed),
       fireLane: laneDecision.lane,
       fireHolding: laneDecision.holding,
       fireEscalate: backoff.kind === 'escalate',
