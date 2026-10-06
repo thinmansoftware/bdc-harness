@@ -1,18 +1,29 @@
 /**
  * WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01, Section 11.
  *
- * Scenarios 1-7 and 9 are covered here. Scenario 8 (Taskmaster refusal) is
- * still skipped, but the REASON changed on 2026-08-30: bdc-harness PR #669
- * (M-129) has MERGED, so packages/server/src/taskmaster/* is no longer frozen.
- * What blocks scenario 8 now is simply that the Taskmaster-side consumer for
- * `overseer_remediation_candidate` has not been built yet -- verified by grep
- * against packages/server/src/taskmaster/. There is no refusal to assert
- * against until it exists, and building it is follow-on work, not this WO.
+ * Scenarios 1-9 are all live; nothing in this file is skipped.
+ *
+ * Scenario 8 (Taskmaster refusal) is split across two packages by necessity.
+ * The refusal is a property of the CONSUMER -- a candidate arriving while
+ * Taskmaster is paused or over the per-item budget must not fire -- and it is
+ * asserted against the REAL consumer (`tick` from
+ * packages/server/src/taskmaster/loop.ts) in
+ * packages/server/src/taskmaster/remediation-consumer.test.ts, Tests 3 and 4.
+ *
+ * It cannot be asserted here: the workspace dependency edge runs
+ * server -> overseer only, so `@archon/server` does not resolve from
+ * `@archon/overseer` (MODULE_NOT_FOUND) and this file cannot drive a tick.
+ * Scenario 8 therefore proves the producer half from inside the overseer
+ * boundary and ANCHORS the consumer-side coverage mechanically, so the
+ * cross-package claim above fails loudly instead of rotting into a stale
+ * comment.
  *
  * No mock.module anywhere: every dependency is injected, so these tests cannot
  * pollute the process-wide module cache for other files in the package.
  */
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { IndependentReviewFinding } from '../independent-review-evidence.ts';
 import {
   AUTO_FIXABLE_CLASSES,
@@ -658,21 +669,22 @@ describe('scenario 8: Taskmaster refusal (consumer present)', () => {
   // UNSKIPPED by WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01: the Taskmaster
   // consumer now exists and reads `overseer_remediation_candidate` rows.
   //
-  // The tick-level refusal itself -- a candidate arriving while Taskmaster is
-  // paused or over the per-item budget is NOT fired, the refusal is recorded,
-  // and the candidate is left for a later tick -- is exercised against the REAL
-  // consumer in packages/server/src/taskmaster/remediation-consumer.test.ts
-  // (Section 7 Tests 3 and 4). That assertion lives in @archon/server because
-  // @archon/overseer must not depend on @archon/server: the dependency edge runs
-  // server -> overseer only (importing the consumer here does not even resolve),
-  // so this file cannot drive a tick.
+  // Scenario 8 has two halves, in the only two places each can live:
   //
-  // What scenario 8 proves from inside the overseer boundary is the producer
-  // half of "Overseer did not bypass the gates": a CHANGES_REQUESTED verdict is
-  // handed back as an INERT candidate (a row Taskmaster reads and gates), never
-  // an action Overseer fires itself, and the candidate is exactly what the
-  // consumer's own parser accepts. Whatever Taskmaster's pause/budget gates then
-  // decide governs the outcome.
+  //   1. PRODUCER half (here): a CHANGES_REQUESTED verdict is handed back as an
+  //      INERT candidate -- a row Taskmaster reads and gates, never an action
+  //      Overseer fires itself -- and that row is exactly what the consumer's
+  //      own parser accepts.
+  //   2. CONSUMER half (packages/server): the tick-level refusal itself, driven
+  //      against the real `tick`. @archon/overseer cannot assert it, because
+  //      the workspace dependency edge runs server -> overseer only and
+  //      `@archon/server` does not resolve from here.
+  //
+  // The second test below ANCHORS half 2. Without it, half 2 would be a prose
+  // claim in a comment: if those consumer tests were deleted, renamed, or
+  // quietly re-pointed at a fake tick, this file would keep asserting the
+  // producer half and nothing would notice the refusal had stopped being
+  // covered. The anchor makes that failure loud and local.
   test('a CHANGES_REQUESTED verdict is handed back as an inert, consumer-readable candidate', () => {
     const decision = decideRemediation(baseInput(), LEGACY_PATTERN_CLASSES);
 
@@ -694,6 +706,46 @@ describe('scenario 8: Taskmaster refusal (consumer present)', () => {
     expect(parsed?.headSha).toBe(decision.body.headSha);
     expect(parsed?.attempt).toBe(decision.body.attempt);
     expect(parsed?.verdictBody).toBe(decision.body.verdictBody);
+  });
+
+  // Anchors half 2. This READS the consumer test rather than importing it:
+  // importing @archon/server from @archon/overseer would invert the workspace
+  // dependency edge and does not resolve (MODULE_NOT_FOUND).
+  test('the consumer-side paused/over-budget refusal exists and drives the real tick', () => {
+    const consumerTestPath = resolve(
+      import.meta.dir,
+      '../../../server/src/taskmaster/remediation-consumer.test.ts'
+    );
+
+    let source: string;
+    try {
+      source = readFileSync(consumerTestPath, 'utf8');
+    } catch {
+      throw new Error(
+        "Scenario 8's consumer half is missing: expected the Taskmaster paused/" +
+          `over-budget refusal tests at ${consumerTestPath}. If that file moved, ` +
+          'repoint this anchor; if the coverage was dropped, restore it -- the ' +
+          'refusal is only assertable from @archon/server.'
+      );
+    }
+
+    // It must exercise the REAL consumer: a bare `tick` specifier imported from
+    // './loop'. Checked by specifier, not substring, so an aliased stand-in
+    // (`tick as fakeTick`) or a local reimplementation does not satisfy it.
+    const loopImport = source.match(/import\s*\{([^}]*)\}\s*from\s*'\.\/loop'/);
+    expect(loopImport).not.toBeNull();
+    const specifiers = (loopImport?.[1] ?? '').split(',').map(entry => entry.trim());
+    expect(specifiers).toContain('tick');
+
+    // Test 3 drives the paused refusal through the real control state.
+    expect(source).toContain("pause_state = 'PAUSED'");
+
+    // Test 4 drives the over-budget refusal through the real per-item cap.
+    expect(source).toContain('MAX_INTERVENTIONS_PER_ITEM_24H');
+
+    // Both refusals must leave the candidate unconsumed for a later tick,
+    // which is what makes the refusal a deferral rather than a silent drop.
+    expect(source).toContain('consumeCalls).toEqual([])');
   });
 });
 
