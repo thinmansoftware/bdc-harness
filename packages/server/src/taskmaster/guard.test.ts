@@ -57,7 +57,7 @@ describe('validateProposal', () => {
   });
 
   test('every Slice 1 verb passes the action-type allowlist', () => {
-    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(6);
+    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(7);
     for (const type of TM_ALLOWED_ACTION_TYPES) {
       // fire_cauldron needs mechanical evidence and blocker_report needs the
       // duty-officer recipient + its own body shape; both are asserted in their

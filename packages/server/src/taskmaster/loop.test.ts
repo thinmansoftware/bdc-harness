@@ -3968,7 +3968,7 @@ describe('M-155 exception push (loop)', () => {
     expect(nudges[0]?.body).toContain('Chronic but titled');
   });
 
-  test('push: the six-verb allowlist and the budgets are explicit (regression)', () => {
+  test('push: the seven-verb allowlist and the budgets are explicit (regression)', () => {
     expect(MAX_INTERVENTIONS_PER_ITEM_24H).toBe(3);
     expect(MAX_EFFECTS_PER_TICK).toBe(10);
     expect([...TM_ALLOWED_ACTION_TYPES]).toEqual([
@@ -3978,6 +3978,9 @@ describe('M-155 exception push (loop)', () => {
       'digest',
       'fire_cauldron',
       'blocker_report',
+      // WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01: the remediation owner
+      // nudge. TM_ALLOWED_RECIPIENTS below is deliberately UNCHANGED.
+      'remediation_nudge',
     ]);
     expect([...TM_ALLOWED_RECIPIENTS]).toEqual([
       'xo',
