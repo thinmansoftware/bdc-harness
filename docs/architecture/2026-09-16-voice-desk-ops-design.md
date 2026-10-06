@@ -145,19 +145,70 @@ Registered providers:
 
 | id | Stack | Role | builtIn |
 |---|---|---|---|
-| `local-cascade` | Parakeet TDT 0.6B v3 (or the faster-whisper already running on :9000) + Kokoro TTS + local grammar | **The floor.** Offline, free, Lane A only. Mandatory fallback so the desk never hard-fails. | yes |
+| `local-cascade` | Parakeet TDT 0.6B v3 (or the faster-whisper already running on :9000) + Kokoro-82M TTS + local grammar | **The floor.** Offline, free, Lane A only. Mandatory fallback so the desk never hard-fails. | yes |
 | `openai-realtime` | `gpt-realtime-2` | Best full-duplex available. Admissible only under the S3 mouth/brain reconciliation. | yes |
 | `gemini-live` | Existing `voice-bridge` Gemini Live code | Already written; keep as an option rather than delete. | yes |
-| `elevenlabs-agents` | Canonical DA pick, Claude-native dropdown | Claude-brained option; shares the Gary voice asset. | yes |
+| `elevenlabs-agents` | Canonical DA pick, Claude-native dropdown | Claude-brained option; shares the Gary voice asset. Now **cost-optional** -- see S5.1. | yes |
 
-Two notes on the local stack, both changes from the 2026-06-26 record:
+Three notes on the local stack, all changes from the 2026-06-26 record:
 
 - **Piper is archived** (read-only on GitHub since 2025-10-06). It still runs, but it is not a
-  forward choice. `local-cascade` should use **Kokoro** for TTS. The 2026-06-26 line "local
+  forward choice. `local-cascade` should use **Kokoro-82M** for TTS. The 2026-06-26 line "local
   Piper is the free floor" needs this correction.
 - **Parakeet TDT 0.6B v3** now beats Whisper large-v3 on accuracy at a quarter the size and is
   dramatically faster on CPU. For a fixed-grammar reflex lane it is the better pick than
   Whisper. Keep the existing Whisper endpoint as the fallback so nothing has to be ripped out.
+- **`dots.tts` makes the premium talk-back voice free.** See S5.1 -- this is the change that
+  retires the ElevenLabs line item, and it is the reason the 2026-06-26 "paid within reason"
+  decision no longer has a cost to justify.
+
+### S5.1 Talk-back voice: the ElevenLabs line item is now optional
+
+`dots.tts` (RedNote HiLab, **Apache 2.0**) changes the economics of the talk-back layer. It is
+a 2B fully-continuous end-to-end autoregressive TTS; the **MF** checkpoint is MeanFlow-distilled
+for few-step inference at 48 kHz, and it does **voice cloning**.
+
+Measured figures from its technical report (arXiv 2606.07080):
+
+| Metric | `dots.tts` MF | Kokoro-82M |
+|---|---|---|
+| First packet / first audio | 85 ms output-streaming, 54 ms dual-streaming | 45 ms (RTX 5090) to 85 ms (RTX 3050) |
+| RTF | 0.15 - 0.21 | 0.03 |
+| Params / VRAM | 2B, multi-GB | 82M, under 1 GB weights (2-3 GB in practice) |
+| Voice cloning | yes | no |
+| Cloning first-chunk p50/p90 | 204 / 381 ms | n/a |
+| Cloning steady-state p50/p90 | 0.88 / 1.73 s | n/a |
+| Quality | best average on Seed-TTS-Eval (EN WER 1.30%); highest speaker similarity (83.9) on the 24-language MiniMax benchmark | good, not cloning-grade |
+| License | Apache 2.0 | Apache 2.0 |
+
+**Recommendation: use both, split by lane. Do not swap one for the other.**
+
+- **Lane A keeps Kokoro-82M.** Reflex confirmations are six-word canned strings
+  ("Batman 150, three, confirmed"). Kokoro has a 5-7x better RTF, is 25x smaller, and fits the
+  sub-500ms budget with room to spare. Voice cloning adds nothing to a confirmation beep, and a
+  2B model at RTF 0.16 with a 0.88s steady-state p50 would eat most of the Lane A budget for no
+  operator benefit. Putting `dots.tts` in the reflex path would reintroduce the exact latency
+  problem S2 is about.
+- **Lane B and the persona voice get `dots.tts`.** Longer spoken answers, where prosody and a
+  consistent voice matter, and where cloning can carry the Gary / "Bill" voice without a
+  subscription.
+
+**Effect on the 2026-06-26 ruling.** That design chose ElevenLabs TTS for talk-back, explicitly
+on a paid-is-acceptable basis ("even if paid within reason"), with local Piper as the free
+floor. The premise has moved: the free option is no longer a downgrade. `dots.tts` beats what
+Piper could do and is competitive with premium cloud TTS on both latency and speaker
+similarity, at Apache 2.0. So the ElevenLabs line item becomes **optional rather than the
+pick** -- roughly $25-30/mo recovered, per the DA voice estimate.
+
+This supersedes the 2026-06-26 S1 TTS choice **on cost grounds only**. It does not touch the
+`da-grizzly-brain-and-voice` ruling about the *brain*, and it does not remove
+`elevenlabs-agents` from the registry: Gary (System 2, customer-facing) may still want a
+managed cloud voice with an SLA, and that is a separate decision from John's operator interface.
+Keeping both providers registered is precisely what the S5 interface is for.
+
+**Open risk.** The latency figures above are the published report, not measured on m129. Phase 2
+must bench both on the actual hardware before the Lane A/Lane B split is locked, because the
+S10 kill criterion is stated in measured milliseconds.
 
 ### Windows / m129 reality check
 
@@ -271,6 +322,10 @@ any front end can act, and it is the half a harness workflow can reach today.
 plus registry, the `local-cascade` provider, the S6 Lane A grammar, the M-129 rail client, the
 poller heartbeat, and the native-Windows audio host. Needs its own WO and its own session:
 that repo is under a different owner and could not be attached to the 2026-09-16 session.
+
+Phase 2 must also **bench Kokoro-82M and `dots.tts` MF on m129** and record the measured
+first-audio and RTF numbers before the S5.1 lane split is locked. The S10 kill criterion is
+stated in measured milliseconds, so it cannot be evaluated against a published report.
 
 **Phase 3 -- remaining providers and phone.** `openai-realtime`, `elevenlabs-agents`, SIP.
 Phase 3 is also where the S3 mouth/brain reconciliation should be put to the board if anyone
