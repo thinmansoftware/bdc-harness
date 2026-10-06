@@ -26,7 +26,13 @@ export type TmActionType =
   | 'escalate_p0'
   | 'digest'
   | 'fire_cauldron'
-  | 'blocker_report';
+  | 'blocker_report'
+  // WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01: the seventh Taskmaster verb,
+  // an owner nudge built from an Overseer remediation candidate. ActionProposal
+  // .type and this journal action_type are the same enum by construction, so a
+  // new verb must be admitted here and in the SQLite tm_journal action_type
+  // CHECK, exactly as the sixth verb 'blocker_report' was.
+  | 'remediation_nudge';
 export type TmActionOutcome =
   | 'pending'
   | 'sent'
