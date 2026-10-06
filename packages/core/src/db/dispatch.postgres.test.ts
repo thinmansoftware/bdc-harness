@@ -39,8 +39,13 @@ mock.module('./connection', () => ({
   getDatabase: () => db,
 }));
 
-const { createAuthenticatedMessage, acknowledgeMessage, addressMessage, getMessage } =
-  await import('./dispatch');
+const {
+  createAuthenticatedMessage,
+  createCappedSubjectMessage,
+  acknowledgeMessage,
+  addressMessage,
+  getMessage,
+} = await import('./dispatch');
 import type { DispatchQueryExecutor, XoLeaseBind } from './dispatch';
 
 function setSenderAuthMode(mode: 'enforce'): void {
@@ -96,7 +101,13 @@ beforeAll(async () => {
       ('claude', 'Claude', 'worker_poll', TRUE),
       ('codex', 'Codex', 'worker_poll', TRUE),
       ('fusion', 'Fusion', 'worker_poll', TRUE),
-      ('xo', 'XO', 'drain_on_start', TRUE)
+      ('xo', 'XO', 'drain_on_start', TRUE),
+      -- WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01: recipient of
+      -- the capped-subject fence tests below. This harness builds its own
+      -- isolated schema rather than running the migrations, so a principal
+      -- seeded by migration 046 still has to be declared here.
+      ('taskmaster', 'Taskmaster', 'worker_poll', TRUE),
+      ('overseer', 'Overseer', 'notify_only', TRUE)
   `);
   await db.query(`
     CREATE TABLE agent_dispatch_messages (
@@ -568,5 +579,132 @@ describe('dispatch Phase 1.5 PostgreSQL integration', () => {
       [key]
     );
     expect(count.rows[0]?.count).toBe('2');
+  });
+});
+
+describe('createCappedSubjectMessage on PostgreSQL', () => {
+  /**
+   * PR #740 round 6 [major]: on postgres the fence originally relied on
+   * SELECT ... FOR UPDATE, which locks only the rows a SELECT returns. It
+   * therefore could not lock an EMPTY subject, so two first deliveries under
+   * READ COMMITTED both read zero rows and both allocated slot 1. The UNIQUE
+   * index stopped the duplicate row, but nothing serialized the ALLOCATION and
+   * the second caller was still told claimed:true.
+   *
+   * The fix takes a transaction-scoped advisory lock on the subject key -- a
+   * lock that exists whether or not any row does -- plus SERIALIZABLE and a
+   * 40001 retry, matching overseer-control-plane.ts. These tests exercise that
+   * on real postgres, which is where the defect lived; the sqlite suite cannot
+   * reach it because BEGIN IMMEDIATE already serializes.
+   */
+  function fenceFor(subject: string, token: string, maxRows = 2) {
+    return {
+      maxRows,
+      dedupeToken: token,
+      readDedupeToken: (body: string) => {
+        try {
+          const parsed = JSON.parse(body) as { token?: string };
+          return typeof parsed.token === 'string' ? parsed.token : null;
+        } catch {
+          return null;
+        }
+      },
+      slotKey: (slot: number) => `pg-capped:${subject}:slot-${slot}`,
+      slotBody: (slot: number) => JSON.stringify({ token, slot }),
+    };
+  }
+
+  function dataFor(subject: string) {
+    return {
+      correlation_id: randomUUID(),
+      idempotency_key: randomUUID(),
+      task_type: 'run_review' as const,
+      recipient: 'taskmaster',
+      body: 'replaced-by-the-fence',
+      subject_key: subject,
+      repeat_reason: 'pg capped fence test',
+    };
+  }
+
+  async function rowsFor(subject: string): Promise<number> {
+    const result = await db.query<{ n: string }>(
+      'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE subject_key = $1',
+      [subject]
+    );
+    return Number(result.rows[0]?.n ?? 0);
+  }
+
+  test('CONCURRENT first deliveries of the SAME head yield exactly ONE row', async () => {
+    const subject = 'gh:thinmansoftware/shopops#9001';
+    const results = await Promise.all(
+      [0, 1, 2].map(() =>
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          dataFor(subject),
+          fenceFor(subject, 'head-same')
+        )
+      )
+    );
+
+    // Exactly one insert; the others must report the duplicate, not claim it.
+    expect(results.filter(r => r.claimed)).toHaveLength(1);
+    expect(results.filter(r => r.reason === 'duplicate_unit_of_work')).toHaveLength(2);
+    expect(await rowsFor(subject)).toBe(1);
+  });
+
+  test('CONCURRENT first deliveries of DISTINCT heads cannot exceed maxRows', async () => {
+    const subject = 'gh:thinmansoftware/shopops#9002';
+    const results = await Promise.all(
+      ['h1', 'h2', 'h3', 'h4'].map(token =>
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          dataFor(subject),
+          fenceFor(subject, token)
+        )
+      )
+    );
+
+    // This is the assertion that failed with FOR UPDATE: every racer read an
+    // empty subject and allocated slot 1.
+    expect(results.filter(r => r.claimed)).toHaveLength(2);
+    expect(results.filter(r => r.reason === 'cap_exhausted')).toHaveLength(2);
+    expect(
+      results
+        .filter(r => r.claimed)
+        .map(r => r.slot)
+        .sort()
+    ).toEqual([1, 2]);
+    expect(await rowsFor(subject)).toBe(2);
+  });
+
+  test('claimed reflects OUR insert, and the row records the slot claimed', async () => {
+    const subject = 'gh:thinmansoftware/shopops#9003';
+    const first = await createCappedSubjectMessage(
+      { kind: 'system', sender: 'overseer' },
+      dataFor(subject),
+      fenceFor(subject, 'head-one')
+    );
+    const replay = await createCappedSubjectMessage(
+      { kind: 'system', sender: 'overseer' },
+      dataFor(subject),
+      fenceFor(subject, 'head-one')
+    );
+    const second = await createCappedSubjectMessage(
+      { kind: 'system', sender: 'overseer' },
+      dataFor(subject),
+      fenceFor(subject, 'head-two')
+    );
+
+    expect(first.claimed).toBe(true);
+    expect(first.slot).toBe(1);
+    expect(replay.claimed).toBe(false);
+    expect(replay.reason).toBe('duplicate_unit_of_work');
+    expect(replay.message.id).toBe(first.message.id);
+    expect(second.claimed).toBe(true);
+    expect(second.slot).toBe(2);
+
+    expect((JSON.parse(first.message.body) as { slot: number }).slot).toBe(1);
+    expect((JSON.parse(second.message.body) as { slot: number }).slot).toBe(2);
+    expect(await rowsFor(subject)).toBe(2);
   });
 });

@@ -61,6 +61,18 @@ const {
   buildSupersedeReason,
   ingestPullRequestEvent,
 } = await import('../pr-review-ingest.ts');
+// LEGACY_PATTERN_CLASSES: the shipped AUTO_FIXABLE_CLASSES is empty (disarmed
+// pending a structured eligibility signal), so these FENCE tests inject the
+// former pattern table to get an eligible candidate. The fence, cap and
+// idempotency are what they exercise -- not the classification decision.
+const {
+  REMEDIATION_RECIPIENT,
+  REMEDIATION_SENDER,
+  MAX_REMEDIATION_ATTEMPTS,
+  decideRemediation,
+  LEGACY_PATTERN_CLASSES,
+} = await import('../remediation-candidate.ts');
+const { createRealOctokitClient } = await import('../adapters/github-real-deps.ts');
 const { createHmac } = await import('crypto');
 // Imported dynamically, after mock.module above, so it binds the mocked
 // connection and therefore the per-test SqliteAdapter.
@@ -1137,5 +1149,463 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       correlationPrefix: 'pr-review:thinmansoftware/a_c#1@',
     });
     expect(found).toHaveLength(0);
+  });
+});
+
+/**
+ * Remediation hand-back against the REAL dispatch DAL
+ * (WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01).
+ *
+ * Same lesson as this file's header, one layer up. A fake emitter proves
+ * nothing about whether `createMessage` will actually ACCEPT the row, and two
+ * real rejection rules sit on that path:
+ *
+ *   1. `assessDispatchRecipientWithQuery` rejects any recipient absent from
+ *      `dispatch_principals` -- so `taskmaster` must be seeded.
+ *   2. `repeat_reason_required` -- once ANY earlier message under this PR's
+ *      subject key is terminal, a further message is refused unless it carries
+ *      a `repeat_reason`. Attempt 2 is exactly that case.
+ *
+ * Rule 2 was a live defect found on this WO's own PR #740 (2026-08-28): the
+ * review route hit `enqueue_failed:repeat_reason_required` on its second push,
+ * which is the same disease in the sibling code path. Without the test below,
+ * the cap of 2 would silently have been a cap of 1.
+ */
+/**
+ * The remediation emitter never touches GitHub -- it writes to dispatch. But
+ * createRealSubmitDeps builds an Octokit eagerly, which throws without a token.
+ * Injecting a stub keeps these tests on the REAL dispatch DAL (the thing under
+ * test) without requiring credentials in CI.
+ */
+function stubOctokit() {
+  return {
+    pulls: { get: async () => ({ data: { head: { sha: '0'.repeat(40) } } }) },
+  } as unknown as ReturnType<typeof createRealOctokitClient>;
+}
+
+describe('remediation hand-back against a real SqliteAdapter', () => {
+  beforeEach(() => {
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-remediation-wiring-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(currentDbPath);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    cleanupDb(currentDbPath);
+  });
+
+  test('taskmaster is a seeded dispatch principal', async () => {
+    const rows = await db.query<{ principal_id: string; active: number }>(
+      'SELECT principal_id, active FROM dispatch_principals WHERE principal_id IN ($1, $2)',
+      [REMEDIATION_RECIPIENT, REMEDIATION_SENDER]
+    );
+    const found = new Set(rows.rows.map(row => row.principal_id));
+    expect(found.has(REMEDIATION_RECIPIENT)).toBe(true);
+    expect(found.has(REMEDIATION_SENDER)).toBe(true);
+  });
+
+  /**
+   * REGRESSION -- PR #740 [minor] (2026-09-04): the declared REMEDIATION_SENDER
+   * was 'overseer-review-route' while the emitter authenticated as 'overseer',
+   * so the exported wire contract and this suite's principal assertion were
+   * both describing a sender that never sent anything.
+   *
+   * Asserting against the STORED row is what makes the contract honest -- a
+   * constant can be edited to agree with itself, but the database records who
+   * actually authenticated.
+   */
+  test('the stored sender equals the declared REMEDIATION_SENDER', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    if (!emit) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 660 };
+    await emit({
+      kind: 'overseer_remediation_candidate' as const,
+      ...pr,
+      headSha: 'e'.repeat(40),
+      attempt: 1,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['migration_ordering'],
+      verdictBody: 'verdict',
+      woId: null,
+      owningLane: 'cauldron-lane-a',
+    });
+
+    const row = await db.query<{ sender: string; recipient: string }>(
+      'SELECT sender, recipient FROM agent_dispatch_messages WHERE recipient = $1',
+      [REMEDIATION_RECIPIENT]
+    );
+    expect(row.rows[0]?.sender).toBe(REMEDIATION_SENDER);
+    expect(row.rows[0]?.recipient).toBe(REMEDIATION_RECIPIENT);
+  });
+
+  /**
+   * REGRESSION -- PR #740 [minor] (2026-09-04): `claimed` compared the returned
+   * body to the submitted one, so an idempotent replay whose stored body was
+   * byte-identical also reported claimed:true. A duplicate submission was then
+   * recorded as a newly emitted attempt, contradicting the documented
+   * claimed:false / attempt_slot_already_claimed contract.
+   *
+   * This is the case the earlier race test could NOT catch: there the two
+   * bodies differed by headSha, so body comparison happened to work. Here the
+   * SAME candidate is submitted twice and the bodies are equal.
+   */
+  /**
+   * REGRESSION -- PR #740 round 3 [major] (2026-09-04).
+   *
+   * The previous version of this test called `emit` twice with a HAND-BUILT
+   * candidate carrying a hardcoded `attempt: 1`, so it never exercised
+   * countPriorRemediationAttempts -> decideRemediation. The gate caught that
+   * the production path behaved differently: after attempt 1 lands the count
+   * returns 1, so replaying the SAME verdict computed attempt 2, a DIFFERENT
+   * idempotency key, and a second durable row -- duplicate remediation work
+   * that also consumed half the cap. Spec safety rule 3 forbids exactly this.
+   *
+   * This version drives the REAL sequence a redelivered webhook drives:
+   * count -> decide -> emit, twice, with the attempt number derived rather
+   * than asserted. The fix is keying idempotency on the HEAD SHA, which is
+   * what identifies a verdict; the attempt number is audit metadata and no
+   * longer part of the uniqueness decision.
+   */
+  test('REDELIVERY through the real count/decide path enqueues exactly one row', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    const count = deps.countPriorRemediationAttempts;
+    if (!emit || !count) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 661 };
+    const headSha = 'f'.repeat(40);
+    const findings = [
+      {
+        scope: 'migrations/041.sql',
+        severity: 'blocker' as const,
+        summary:
+          'The migration updates the parent before the child rows; the composite foreign key rejects that ordering.',
+      },
+    ];
+
+    // One delivery of the verdict, exactly as production does it.
+    const deliver = async () => {
+      const priorAttempts = await count(pr);
+      const decision = decideRemediation(
+        {
+          ...pr,
+          headSha,
+          verdict: 'CHANGES_REQUESTED',
+          findings,
+          verdictBody: 'byte-identical verdict body',
+          priorAttempts,
+        },
+        LEGACY_PATTERN_CLASSES
+      );
+      if (!decision.emit) return { emitted: false as const, reason: decision.reason };
+      const result = await emit(decision.body);
+      return { emitted: true as const, claimed: result.claimed, attempt: decision.body.attempt };
+    };
+
+    const first = await deliver();
+    const replay = await deliver();
+
+    expect(first.emitted).toBe(true);
+    expect(first.emitted && first.claimed).toBe(true);
+
+    // The replay is allowed to BUILD a candidate (the count legitimately moved),
+    // but it must not create a second durable row.
+    if (replay.emitted) expect(replay.claimed).toBe(false);
+
+    // The load-bearing assertion: one reviewed head, one row, one attempt spent.
+    expect(await count(pr)).toBe(1);
+    const rows = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE recipient = $1',
+      [REMEDIATION_RECIPIENT]
+    );
+    expect(Number(rows.rows[0]?.n ?? 0)).toBe(1);
+  });
+
+  test('attempt 1 and attempt 2 BOTH enqueue for the same PR (repeat_reason honored)', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    const count = deps.countPriorRemediationAttempts;
+    if (!emit || !count) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 650 };
+    const candidate = (attempt: number, headSha: string) => ({
+      kind: 'overseer_remediation_candidate' as const,
+      ...pr,
+      headSha,
+      attempt,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['migration_ordering'],
+      verdictBody: `verdict at ${headSha}`,
+      woId: null,
+      owningLane: 'cauldron-lane-a',
+    });
+
+    expect(await count(pr)).toBe(0);
+
+    const first = await emit(candidate(1, 'a'.repeat(40)));
+    expect(first.claimed).toBe(true);
+    expect(await count(pr)).toBe(1);
+
+    // Drive the first row terminal -- this is what arms the repeat_reason rule
+    // and is exactly the real-world state after Taskmaster consumes attempt 1.
+    await db.query("UPDATE agent_dispatch_messages SET status = 'done' WHERE recipient = $1", [
+      REMEDIATION_RECIPIENT,
+    ]);
+
+    // Attempt 2 after a fix push. Before repeat_reason was supplied this threw
+    // `repeat_reason_required` and the second remediation was impossible.
+    const second = await emit(candidate(2, 'b'.repeat(40)));
+    expect(second.claimed).toBe(true);
+    expect(await count(pr)).toBe(2);
+  });
+
+  /**
+   * The round-1 guarantee, re-proved under the round-3 key.
+   *
+   * Round 1's race test asserted that two DIFFERENT heads collide on one key.
+   * That was true when the key was (PR, attempt) and is deliberately NOT true
+   * now: keying on the head gives each reviewed head its own slot, which is
+   * what makes redelivery idempotent. Two distinct heads are two distinct
+   * verdicts and each may legitimately produce a candidate.
+   *
+   * So the bounded-loop property is no longer enforced by key collision -- it
+   * is enforced by decideRemediation refusing once the count reaches the cap.
+   * That is the thing worth testing, and this replaces the now-obsolete
+   * collision assertion rather than deleting the coverage.
+   */
+  /**
+   * REGRESSION -- PR #740 round 4 [major] (2026-09-04).
+   *
+   * The cap must hold when the count is read CONCURRENTLY, not just when
+   * deliveries are sequential. Under head-keyed idempotency three racers on
+   * three distinct heads each read prior count 0, each built a candidate, and
+   * each inserted under its own key -- three rows against a cap of two.
+   *
+   * This drives them with NO awaits in between (all decided from the same
+   * below-cap count, then emitted together), which is the interleaving the
+   * sequential test cannot produce. The attempt SLOT is the scarce resource, so
+   * however the reads interleave, at most MAX_REMEDIATION_ATTEMPTS rows exist.
+   */
+  /**
+   * REGRESSION -- PR #740 round 5 [major] (2026-09-23).
+   *
+   * The round-4 emitter deduped with a READ before inserting, which is not
+   * atomic: two deliveries of the SAME reviewed head both completed the
+   * precheck before either inserted, then one took slot 1 and the other took
+   * slot 2. One verdict produced two candidates and consumed the whole cap.
+   *
+   * The existing tests could not catch it -- they covered sequential same-head
+   * delivery (the precheck does work when the first insert has landed) and
+   * CONCURRENT DISTINCT heads (a different invariant). This covers the gap:
+   * concurrent SAME head.
+   *
+   * The fix moves the dedupe read inside the insert transaction, so exactly one
+   * row can exist for one head no matter how the deliveries interleave.
+   */
+  test('CONCURRENT deliveries of the SAME head yield exactly ONE row', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    const count = deps.countPriorRemediationAttempts;
+    if (!emit || !count) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 653 };
+    const headSha = '9'.repeat(40);
+    const candidate = {
+      kind: 'overseer_remediation_candidate' as const,
+      ...pr,
+      headSha,
+      attempt: 1,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['migration_ordering'],
+      verdictBody: 'one verdict, delivered twice at once',
+      woId: null,
+      owningLane: 'cauldron-lane-a',
+    };
+
+    // Dispatch both without awaiting between them. The fence serializes them
+    // (BEGIN IMMEDIATE on sqlite), so whichever runs second sees the first
+    // insert and dedupes on the head rather than taking the next slot.
+    const [first, second] = await Promise.all([emit(candidate), emit(candidate)]);
+
+    const claims = [first, second].filter(r => r.claimed);
+    expect(claims).toHaveLength(1);
+    const loser = [first, second].find(r => !r.claimed);
+    expect(loser?.reason).toBe('duplicate_unit_of_work');
+
+    // ONE verdict, ONE row, ONE attempt spent -- not two.
+    expect(await count(pr)).toBe(1);
+    const rows = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE recipient = $1',
+      [REMEDIATION_RECIPIENT]
+    );
+    expect(Number(rows.rows[0]?.n ?? 0)).toBe(1);
+  });
+
+  /**
+   * NOTE ON WHERE ATOMICITY IS PROVED.
+   *
+   * These overseer-level tests exercise the WIRING -- that the emitter asks the
+   * fence for the right thing and reports what it is told. They deliberately do
+   * NOT claim to prove atomicity: Bun's sqlite driver runs queries
+   * synchronously, so two awaited emits run back-to-back and a racy
+   * read-then-insert emitter passes them just as happily (verified by reverting
+   * the emitter: 23 pass either way). A test that cannot fail proves nothing.
+   *
+   * The atomicity guarantee is proved where it is implemented, against a real
+   * database and with the transaction as the thing under test, in
+   * packages/core/src/db/dispatch.test.ts -> "createCappedSubjectMessage
+   * (capped-subject fence)". Removing the transaction from the fence makes the
+   * distinct-token case exceed maxRows and that suite fail.
+   */
+
+  /**
+   * PR #740 round 5 [minor]: the receipt reported the attempt the caller
+   * PREDICTED, but the emitter may claim a different slot when a racer took an
+   * earlier one. The emitter now returns the slot it actually claimed.
+   */
+  test('the emitter reports the slot it ACTUALLY claimed', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    if (!emit) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 654 };
+    const make = (headSha: string) => ({
+      kind: 'overseer_remediation_candidate' as const,
+      ...pr,
+      headSha,
+      // Both deliveries PREDICT slot 1; the second must be told it got slot 2.
+      attempt: 1,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['migration_ordering'],
+      verdictBody: `verdict at ${headSha}`,
+      woId: null,
+      owningLane: 'cauldron-lane-a',
+    });
+
+    const first = await emit(make('a'.repeat(40)));
+    const second = await emit(make('b'.repeat(40)));
+
+    expect(first.claimed).toBe(true);
+    expect(first.attempt).toBe(1);
+    expect(second.claimed).toBe(true);
+    expect(second.attempt).toBe(2);
+
+    // And the durable row agrees with what was reported.
+    const rows = await db.query<{ body: string }>(
+      'SELECT body FROM agent_dispatch_messages WHERE recipient = $1 ORDER BY created_at ASC',
+      [REMEDIATION_RECIPIENT]
+    );
+    const attempts = rows.rows.map(r => (JSON.parse(r.body) as { attempt: number }).attempt);
+    expect(attempts).toEqual([1, 2]);
+  });
+
+  test('CONCURRENT racers on distinct heads cannot exceed the cap', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    const count = deps.countPriorRemediationAttempts;
+    if (!emit || !count) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 652 };
+    const findings = [
+      {
+        scope: 'migrations/041.sql',
+        severity: 'blocker' as const,
+        summary:
+          'The migration updates the parent before the child rows; the composite foreign key rejects that ordering.',
+      },
+    ];
+
+    // Every racer decides from the SAME below-cap count -- the stale read.
+    const priorAttempts = await count(pr);
+    expect(priorAttempts).toBe(0);
+
+    const heads = ['1'.repeat(40), '2'.repeat(40), '3'.repeat(40), '4'.repeat(40)];
+    const bodies = heads.map(headSha => {
+      const decision = decideRemediation(
+        {
+          ...pr,
+          headSha,
+          verdict: 'CHANGES_REQUESTED',
+          findings,
+          verdictBody: `verdict at ${headSha}`,
+          priorAttempts,
+        },
+        LEGACY_PATTERN_CLASSES
+      );
+      if (!decision.emit) throw new Error('expected every racer to build a candidate');
+      return decision.body;
+    });
+
+    const results = await Promise.all(bodies.map(b => emit(b)));
+    const won = results.filter(r => r.claimed).length;
+
+    // At most the cap may win, and the durable rows must agree.
+    expect(won).toBe(MAX_REMEDIATION_ATTEMPTS);
+    expect(await count(pr)).toBe(MAX_REMEDIATION_ATTEMPTS);
+    const rows = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE recipient = $1',
+      [REMEDIATION_RECIPIENT]
+    );
+    expect(Number(rows.rows[0]?.n ?? 0)).toBe(MAX_REMEDIATION_ATTEMPTS);
+  });
+
+  test('distinct heads each get a slot, but the CAP still bounds the loop', async () => {
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: stubOctokit() });
+    const emit = deps.emitRemediationCandidate;
+    const count = deps.countPriorRemediationAttempts;
+    if (!emit || !count) throw new Error('remediation deps must be wired');
+
+    const pr = { owner: 'thinmansoftware', repo: 'shopops', prNumber: 651 };
+    const findings = [
+      {
+        scope: 'migrations/041.sql',
+        severity: 'blocker' as const,
+        summary:
+          'The migration updates the parent before the child rows; the composite foreign key rejects that ordering.',
+      },
+    ];
+
+    // Each call is a full delivery for a NEW head, through the real path.
+    const deliverHead = async (headSha: string) => {
+      const priorAttempts = await count(pr);
+      const decision = decideRemediation(
+        {
+          ...pr,
+          headSha,
+          verdict: 'CHANGES_REQUESTED',
+          findings,
+          verdictBody: `verdict at ${headSha}`,
+          priorAttempts,
+        },
+        LEGACY_PATTERN_CLASSES
+      );
+      if (!decision.emit) return { emitted: false as const, reason: decision.reason };
+      const result = await emit(decision.body);
+      return { emitted: true as const, claimed: result.claimed };
+    };
+
+    const one = await deliverHead('c'.repeat(40));
+    const two = await deliverHead('d'.repeat(40));
+    const three = await deliverHead('e'.repeat(40));
+
+    expect(one.emitted && one.claimed).toBe(true);
+    expect(two.emitted && two.claimed).toBe(true);
+
+    // The third is over the cap of 2 and must be REFUSED -- this is the
+    // unattended reviewer-fix-reviewer loop the WO must not create.
+    expect(three.emitted).toBe(false);
+    expect(three.emitted === false && three.reason).toBe('remediation_attempts_exhausted');
+
+    expect(await count(pr)).toBe(MAX_REMEDIATION_ATTEMPTS);
+    const rows = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE recipient = $1',
+      [REMEDIATION_RECIPIENT]
+    );
+    expect(Number(rows.rows[0]?.n ?? 0)).toBe(MAX_REMEDIATION_ATTEMPTS);
   });
 });

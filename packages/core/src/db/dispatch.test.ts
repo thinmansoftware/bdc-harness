@@ -32,6 +32,7 @@ import {
   claimDispatchEscalation,
   claimMessage,
   createAuthenticatedMessage,
+  createCappedSubjectMessage,
   evaluateWorkerStaleness,
   ensureXoEscalationHandoffs,
   getMessage,
@@ -3185,6 +3186,144 @@ describe('dispatch db', () => {
         correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#900@',
       });
       expect(found).toHaveLength(0);
+    });
+  });
+  describe('createCappedSubjectMessage (capped-subject fence)', () => {
+    const SUBJECT = 'gh:thinmansoftware/shopops#900';
+
+    function fenceFor(token: string, maxRows = 2) {
+      return {
+        maxRows,
+        dedupeToken: token,
+        readDedupeToken: (body: string) => {
+          try {
+            const parsed = JSON.parse(body) as { token?: string };
+            return typeof parsed.token === 'string' ? parsed.token : null;
+          } catch {
+            return null;
+          }
+        },
+        slotKey: (slot: number) => `capped-fence:${SUBJECT}:slot-${slot}`,
+        slotBody: (slot: number) => JSON.stringify({ token, slot }),
+      };
+    }
+
+    function dataFor(correlation: string) {
+      return {
+        correlation_id: correlation,
+        idempotency_key: 'replaced-by-the-fence',
+        task_type: 'run_review' as const,
+        recipient: 'taskmaster',
+        body: 'replaced-by-the-fence',
+        subject_key: SUBJECT,
+        repeat_reason: 'capped fence test',
+      };
+    }
+
+    test('CONCURRENT calls for the SAME token yield exactly ONE row', async () => {
+      // Both calls are started before either is awaited. The fence serializes
+      // them through BEGIN IMMEDIATE, so the second one's dedupe read happens
+      // AFTER the first one's insert has committed -- which is precisely what an
+      // application-level read-then-insert cannot guarantee.
+      const [a, b] = await Promise.all([
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          dataFor('fence-same-a'),
+          fenceFor('head-aaa')
+        ),
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          dataFor('fence-same-b'),
+          fenceFor('head-aaa')
+        ),
+      ]);
+
+      const claimed = [a, b].filter(r => r.claimed);
+      expect(claimed).toHaveLength(1);
+      expect([a, b].find(r => !r.claimed)?.reason).toBe('duplicate_unit_of_work');
+      // Both callers are handed the SAME surviving row.
+      expect(a.message.id).toBe(b.message.id);
+
+      const rows = await db.query<{ n: number }>(
+        'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE subject_key = $1',
+        [SUBJECT]
+      );
+      expect(Number(rows.rows[0]?.n ?? 0)).toBe(1);
+    });
+
+    test('CONCURRENT calls for DISTINCT tokens cannot exceed maxRows', async () => {
+      const results = await Promise.all(
+        ['h1', 'h2', 'h3', 'h4'].map((token, i) =>
+          createCappedSubjectMessage(
+            { kind: 'system', sender: 'overseer' },
+            dataFor(`fence-distinct-${i}`),
+            fenceFor(token)
+          )
+        )
+      );
+
+      expect(results.filter(r => r.claimed)).toHaveLength(2);
+      expect(results.filter(r => r.reason === 'cap_exhausted')).toHaveLength(2);
+      // Slots are handed out in order, never duplicated.
+      expect(
+        results
+          .filter(r => r.claimed)
+          .map(r => r.slot)
+          .sort()
+      ).toEqual([1, 2]);
+
+      const rows = await db.query<{ n: number }>(
+        'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE subject_key = $1',
+        [SUBJECT]
+      );
+      expect(Number(rows.rows[0]?.n ?? 0)).toBe(2);
+    });
+
+    test('reports the slot ACTUALLY claimed, and the row agrees', async () => {
+      const first = await createCappedSubjectMessage(
+        { kind: 'system', sender: 'overseer' },
+        dataFor('fence-slot-1'),
+        fenceFor('head-one')
+      );
+      const second = await createCappedSubjectMessage(
+        { kind: 'system', sender: 'overseer' },
+        dataFor('fence-slot-2'),
+        fenceFor('head-two')
+      );
+
+      expect(first.slot).toBe(1);
+      expect(second.slot).toBe(2);
+      expect((JSON.parse(first.message.body) as { slot: number }).slot).toBe(1);
+      expect((JSON.parse(second.message.body) as { slot: number }).slot).toBe(2);
+    });
+
+    test('refuses a fence it cannot honor instead of degrading to a racy path', async () => {
+      // No subject_key -> neither invariant is expressible.
+      await expect(
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          { ...dataFor('fence-bad-1'), subject_key: undefined },
+          fenceFor('head-x')
+        )
+      ).rejects.toThrow('capped_subject_fence_invalid');
+
+      // Nonsense cap.
+      await expect(
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          dataFor('fence-bad-2'),
+          fenceFor('head-x', 0)
+        )
+      ).rejects.toThrow('capped_subject_fence_invalid');
+
+      // Empty dedupe token.
+      await expect(
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          dataFor('fence-bad-3'),
+          fenceFor('')
+        )
+      ).rejects.toThrow('capped_subject_fence_invalid');
     });
   });
 });

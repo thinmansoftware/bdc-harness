@@ -412,6 +412,212 @@ export interface TaskmasterNoticeFence {
   taskmasterPausedScope: string | null;
 }
 
+/**
+ * Fence for a capped, per-subject enqueue
+ * (WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01).
+ *
+ * WHY THIS EXISTS. Some producers must satisfy two invariants that a single
+ * UNIQUE index cannot carry at once:
+ *
+ *   (A) BOUNDED: at most `maxRows` rows may ever exist for one subject_key,
+ *       however concurrent writers interleave.
+ *   (B) IDEMPOTENT: a redelivery of the SAME logical unit of work (identified
+ *       by `dedupeToken`, not by the key) must not add a second row.
+ *
+ * Keying on the slot gives (A) but not (B); keying on the token gives (B) but
+ * not (A). Doing a read-then-insert in application code gives neither, because
+ * the read is not atomic against a concurrent insert -- two callers both pass
+ * the dedupe check, then claim different slots.
+ *
+ * The fence closes that by performing the dedupe read AND the insert inside one
+ * transaction: sqlite takes a write lock via BEGIN IMMEDIATE (and serializes
+ * in-process through the same promise chain the control plane uses), postgres
+ * takes row locks with FOR UPDATE on the existing subject rows.
+ *
+ * DELIBERATELY NARROW. This is not a general transaction escape hatch. It
+ * validates its own preconditions and refuses anything outside them, exactly as
+ * the taskmaster notice fence above does, so adding it cannot widen what any
+ * other caller may do.
+ */
+export interface CappedSubjectFence {
+  /** Hard ceiling on rows per subject_key. Small positive integer. */
+  maxRows: number;
+  /**
+   * Identifies the logical unit of work. If an existing row for this subject
+   * carries the same token, the enqueue is a no-op and the existing row is
+   * returned. Extracted from a candidate row body by `readDedupeToken`.
+   */
+  dedupeToken: string;
+  /** Pulls the dedupe token out of a stored row body; null when absent. */
+  readDedupeToken: (body: string) => string | null;
+  /** Builds the idempotency key for attempt slot N (1-based). */
+  slotKey: (slot: number) => string;
+  /** Builds the row body for the slot actually claimed (1-based). */
+  slotBody: (slot: number) => string;
+}
+
+export interface CappedSubjectEnqueueResult {
+  /** The row this subject now holds for the caller's unit of work. */
+  message: DispatchMessage;
+  /** True when THIS call inserted it; false for a dedupe hit or a full cap. */
+  claimed: boolean;
+  /** The slot actually claimed (1-based), or null when nothing was inserted. */
+  slot: number | null;
+  /** Set when claimed === false, so the caller can report honestly. */
+  reason?: 'duplicate_unit_of_work' | 'cap_exhausted';
+}
+
+/**
+ * Atomically dedupe-then-claim one capped slot under a subject key.
+ *
+ * Returns `claimed: false` with `reason: 'duplicate_unit_of_work'` when this
+ * unit of work already has a row, and `reason: 'cap_exhausted'` when every slot
+ * is taken. Neither is an error -- both are correct refusals the caller reports.
+ */
+export async function createCappedSubjectMessage(
+  context: DispatchSenderContext,
+  data: CreateAuthenticatedMessageData,
+  fence: CappedSubjectFence
+): Promise<CappedSubjectEnqueueResult> {
+  if ('supersedes_id' in data) throw new Error('dispatch_supersedes_guarded_path_required');
+  const bound = bindSenderContext(context);
+  // Preconditions. Fail closed rather than silently degrading to a racy path:
+  // a caller that cannot state a subject_key and a sane cap does not get the
+  // fence, because without them neither invariant is even expressible.
+  if (
+    !Number.isSafeInteger(fence.maxRows) ||
+    fence.maxRows < 1 ||
+    fence.maxRows > 16 ||
+    !data.subject_key ||
+    fence.dedupeToken.length === 0
+  ) {
+    throw new Error('capped_subject_fence_invalid');
+  }
+  const db = getDatabase();
+  const subjectKey = normalizeDispatchSubjectKey(data.subject_key);
+  // The INSERT path stores the CANONICAL recipient (trimmed + lowercased), so
+  // the dedupe read must filter on the same value. Matching on the raw string
+  // would silently miss existing rows whenever a caller passed a differently
+  // cased recipient, defeating invariant (B) without any visible error.
+  const canonicalRecipient = canonicalizePrincipal(data.recipient);
+
+  const claim = async (query: DispatchQueryExecutor): Promise<CappedSubjectEnqueueResult> => {
+    // Read the subject's existing rows under the transaction's lock. FOR UPDATE
+    // on postgres makes concurrent claimers queue behind this read instead of
+    // observing the same pre-insert state; sqlite already holds a write lock.
+    const existing = await query<DispatchMessageRow>(
+      // No FOR UPDATE: it cannot lock an empty subject, which is the case that
+      // matters. Serialization comes from BEGIN IMMEDIATE (sqlite) or the
+      // advisory lock + SERIALIZABLE (postgres) established before this read.
+      `SELECT * FROM agent_dispatch_messages
+       WHERE subject_key = $1 AND recipient = $2
+       ORDER BY created_at ASC`,
+      [subjectKey, canonicalRecipient]
+    );
+
+    // (B) IDEMPOTENT -- settled by identity, inside the lock, so a concurrent
+    // redelivery of the same unit of work cannot slip past this check.
+    const taken = new Set<string>();
+    for (const row of existing.rows) {
+      const message = normalizeMessage(row);
+      if (fence.readDedupeToken(message.body) === fence.dedupeToken) {
+        return { message, claimed: false, slot: null, reason: 'duplicate_unit_of_work' };
+      }
+      taken.add(message.idempotency_key);
+    }
+
+    // (A) BOUNDED -- the slot space is the ceiling, so the cap cannot be
+    // exceeded no matter how many callers arrive.
+    for (let slot = 1; slot <= fence.maxRows; slot += 1) {
+      const key = fence.slotKey(slot);
+      if (taken.has(key)) continue;
+      const slotBody = fence.slotBody(slot);
+      const message = await createAuthenticatedMessageWithQuery(query, {
+        bound,
+        data: { ...data, idempotency_key: key, body: slotBody },
+      });
+      // createAuthenticatedMessageWithQuery returns the EXISTING row on an
+      // idempotency conflict rather than throwing, so a bare `true` would
+      // report a replay as a fresh insert (PR #740 round 6). Inside the lock a
+      // conflict should be impossible; assert it rather than trust it, because
+      // a silent false positive here is what the whole fence exists to prevent.
+      return { message, claimed: message.body === slotBody, slot };
+    }
+
+    const last = existing.rows[existing.rows.length - 1];
+    if (!last) throw new Error('capped_subject_fence_cap_without_rows');
+    return { message: normalizeMessage(last), claimed: false, slot: null, reason: 'cap_exhausted' };
+  };
+
+  if (db.dialect === 'sqlite') {
+    // BEGIN IMMEDIATE takes the write lock up front, and the control plane's
+    // promise chain serializes callers inside this process.
+    return withOverseerControlPlaneImmediateTransaction(db, claim);
+  }
+
+  // POSTGRES NEEDS AN EXPLICIT LOCK, not FOR UPDATE.
+  //
+  // FOR UPDATE locks the rows a SELECT actually returns, so it cannot lock an
+  // EMPTY subject and cannot stop a concurrent insert from appearing. Two first
+  // deliveries under READ COMMITTED both saw no rows and both picked slot 1
+  // (PR #740 round 6). The UNIQUE index stopped the duplicate row, but the
+  // allocation itself was never serialized.
+  //
+  // A transaction-scoped advisory lock on the subject key exists whether or not
+  // any row does, which is exactly the missing primitive. SERIALIZABLE plus a
+  // 40001 retry matches the pattern already proven in
+  // overseer-control-plane.ts (withSerializedTransaction), including the
+  // in-process queue, because two pooled connections in one process would
+  // otherwise contend on the advisory lock and deadlock-retry needlessly.
+  const lockKey = `dispatch:capped-subject:${subjectKey}:${canonicalRecipient}`;
+  return withCappedSubjectProcessSerialization(lockKey, async () => {
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      try {
+        return await db.withTransaction(async query => {
+          await query('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+          await query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [lockKey]);
+          return claim(query);
+        });
+      } catch (error) {
+        // 40001 = serialization failure. Anything else is a real error.
+        if ((error as { readonly code?: unknown }).code !== '40001') throw error;
+        if (attempt === 5) {
+          throw new Error('capped_subject_fence_serialization_retry_exhausted', { cause: error });
+        }
+        await new Promise(resolve => setTimeout(resolve, attempt * attempt * 10));
+      }
+    }
+    throw new Error('capped_subject_fence_serialization_retry_unreachable');
+  });
+}
+
+/**
+ * Serializes same-subject fence calls within this process before they reach
+ * postgres, so pooled connections queue instead of fighting over the advisory
+ * lock. Keyed per subject: unrelated subjects never block each other.
+ */
+const cappedSubjectTails = new Map<string, Promise<void>>();
+
+async function withCappedSubjectProcessSerialization<T>(
+  lockKey: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const prior = cappedSubjectTails.get(lockKey) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const tail = prior.then(() => current);
+  cappedSubjectTails.set(lockKey, tail);
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (cappedSubjectTails.get(lockKey) === tail) cappedSubjectTails.delete(lockKey);
+  }
+}
+
 export function createAuthenticatedMessage(
   context: DispatchSenderContext,
   data: CreateAuthenticatedMessageData
