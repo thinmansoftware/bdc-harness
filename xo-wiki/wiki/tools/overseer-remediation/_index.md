@@ -156,52 +156,64 @@ happily while production fails on first use, which is why that file exists.
    settled subject. The emitter supplies one naming the attempt and head.
    Without it the cap of 2 would silently have been a cap of 1.
 
-## The auto-fixable class list
+## The auto-fixable class list (EMPTY — historical record only)
 
-A finding is handed back only if its class is on this list. **Adding a class is
-routine work: edit `AUTO_FIXABLE_CLASSES` in `remediation-candidate.ts` and add
-a test.** Nothing else changes.
+> **This section is HISTORY, not instructions.** `AUTO_FIXABLE_CLASSES` is empty
+> and must stay empty until a structured eligibility signal exists. **Do not add
+> a regex class.** See "How to re-arm" above. The table below records what was
+> tried and why it was removed, so nobody rebuilds it.
 
-| Class id             | Covers                                                                                  |
-| -------------------- | --------------------------------------------------------------------------------------- |
-| `build_failure`      | Build / compile / type errors the toolchain ALREADY REPORTED.                           |
-| `test_failure`       | Tests OBSERVED FAILING. Missing coverage is excluded -- see below.                      |
-| `lint_or_format`     | Violations a NAMED TOOL reported (eslint/prettier/...). Bare "format"/"style" excluded. |
-| `migration_ordering` | Ordering the SCHEMA rejects (FK/constraint violation). Excludes redesign judgments.     |
-| `ascii_violation`    | Non-ASCII where the ENCODING RULE is the defect. Excludes Unicode rendering bugs.       |
+Remediation eligibility _was_ decided by matching patterns against the
+reviewer's prose. Five classes existed:
 
-### The rule when adding a class: demand MECHANICAL EVIDENCE
+| Class id (removed)   | What it tried to match                                   |
+| -------------------- | -------------------------------------------------------- |
+| `build_failure`      | Build / compile / type errors the toolchain had reported |
+| `test_failure`       | Tests observed failing (missing coverage excluded)       |
+| `lint_or_format`     | Violations a named tool reported (eslint/prettier/...)   |
+| `migration_ordering` | Ordering the schema rejects (FK/constraint violation)    |
+| `ascii_violation`    | Non-ASCII where the encoding rule itself was the defect  |
 
-A pattern must require evidence of an ALREADY-OBSERVED failure (a runner said
-which assertion broke, a compiler named a line), not merely mention a mechanical
-noun. **This is the actual security boundary** -- not the keyword blocklist
-below it.
+They survive as `LEGACY_PATTERN_CLASSES`, a **test fixture only**, so the fence
+and attempt cap stay exercised. Nothing in production imports it.
 
-PR #740's `[major]` finding (2026-09-04) is the anchor. `test_failure` used to
-mean "the word _test_ followed by a failure word", which matched
-_"Test missing for unescaped user content rendered into the page"_ -- an XSS
-defect wearing a coverage-gap costume -- and routed it for unattended
-remediation.
+### Why the approach was abandoned
 
-The distinction that fixed it: a **missing** test is a judgment call, because
-deciding what it should assert requires knowing what the code ought to do. A
-**failing** test is mechanical, because the runner already said what broke. So
-coverage-gap phrasings ("missing", "absent", "no test for") now fall through to
-the fail-closed default and reach a human regardless of how they are worded.
+Each round of review narrowed the patterns; each narrowing was defeated by a
+rephrasing. The belief being tested — _"require evidence of an already-observed
+failure and the boundary holds"_ — is **false**, and this pair is why:
 
-All five classes were audited against this rule after PR #740 round 3
-(2026-09-04) found `lint_or_format` still matching any mention of "format" or
-"style" -- it routed "The API response format exposes internal identifiers", a
-security judgment, for unattended remediation. The audit found two more of the
-same shape: a Unicode RENDERING bug reading as `ascii_violation`, and "this
-migration should be redesigned" reading as `migration_ordering`. Both fixed in
-the same pass. If you add a class, assume this flaw is present until you have
-written the counterexample that proves it is not.
+```
+"The permission test fails: expected 403 but received 200."
+    -> mechanical. A builder can fix this.
+"The permission test fails: a read-only member can delete projects."
+    -> a privilege-escalation report. A human must decide.
+```
 
-Watch precision when editing the blocklist too: an earlier attempt at this fix
-added a bare `sql` token, which matched the `.sql` extension of the migration
-filename and sent the live shopops#650 anchor -- the case this whole WO exists
-for -- to a human.
+Same topic word, same evidence word, same grammatical shape. **Any pattern that
+admits the first admits the second.** Mechanical evidence was never the security
+boundary; it only looked like one until someone wrote a security finding in
+mechanical language.
+
+Ten phrasings defeated it across rounds 3-10 of PR #740. A sample:
+
+| Phrasing                                                                                                   | Wrongly matched      |
+| ---------------------------------------------------------------------------------------------------------- | -------------------- |
+| "Test missing for unescaped user content rendered into the page"                                           | `test_failure`       |
+| "The API response format exposes internal identifiers"                                                     | `lint_or_format`     |
+| "Non-ASCII tenant names collide, allowing one customer to read another customer's invoices"                | `ascii_violation`    |
+| "Unicode normalization breaks tenant isolation, allowing one customer to read another customer's invoices" | `ascii_violation`    |
+| "The tenant-id type check fails to stop one customer reading another customer invoices"                    | `build_failure`      |
+| "The migration foreign key constraint fails to isolate tenants, exposing invoices"                         | `migration_ordering` |
+| "The permission test fails: a read-only member can delete projects."                                       | `test_failure`       |
+
+Narrowing also began producing **false negatives** —
+`"The auth test fails after the column rename."` was refused — so continued
+tightening degraded the feature in both directions at once. Round 9 audited all
+five classes and closed seven bypasses in a single pass; round 10 arrived anyway.
+
+The full regression set lives in `remediation-candidate.test.ts` and carries over
+to the re-arm WO (bdc-xo#2974) as its acceptance suite.
 
 ### Two vetoes, and why the second one exists
 
@@ -242,9 +254,11 @@ The asymmetry is deliberate: a false positive costs one unnecessary human
 review; a false negative hands a disclosure defect to an unattended builder.
 When in doubt it refuses.
 
-**If you add a class, run the audit** -- attach a security/behavioral payload to
-that class's own topic and evidence words and confirm it still routes to a
-human. Do not assume the vetoes cover a phrasing you have not tested.
+**Both vetoes remain live, and both stay** when eligibility is re-armed from a
+structured signal (bdc-xo#2974). They are defence in depth, not the primary
+gate: the ten phrasings above prove a prose-based gate cannot be the primary
+one. Do not treat either veto as licence to re-add regex classes -- they were
+in place for the last several bypasses and did not stop them.
 
 ### What must NEVER be added
 
