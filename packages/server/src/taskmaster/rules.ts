@@ -26,10 +26,17 @@ import { createHash } from 'crypto';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
 import type { FireEligibilityEvidence } from './fire-eligibility';
 import { WO_ID_RE } from './guard';
+import { canonicalizeThreadRef } from './thread-ref';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
 export type ThreadClass = 'ready' | 'stale' | 'blocked' | 'healthy';
-export type TmActionType = 'deliver_ruling' | 'nudge' | 'escalate_p0' | 'digest' | 'fire_cauldron';
+export type TmActionType =
+  | 'deliver_ruling'
+  | 'nudge'
+  | 'escalate_p0'
+  | 'digest'
+  | 'fire_cauldron'
+  | 'blocker_report';
 
 export type FireEvidence = FireEligibilityEvidence;
 
@@ -185,6 +192,13 @@ export interface NextActionContext {
   fireEscalate?: boolean;
   customerP0Exempt?: boolean;
   fireEvidence?: FireEvidence;
+  /**
+   * Epoch millis of the most recent `sent` blocker_report for this thread's
+   * canonical ref, computed by the loop from the 7-day journal lookback.
+   * Null/undefined when none exists. Gates the 72h blocker-report cooldown
+   * (computeBlockerReport only); never consulted by computeNextAction.
+   */
+  lastBlockerReportSentAtMs?: number | null;
 }
 
 /**
@@ -426,4 +440,170 @@ export function computeNextAction(
   }
 
   return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * blocker_report (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)
+ *
+ * A sixth verb that reports a long-blocked item (or an unclaimed P0 the
+ * Taskmaster cannot fire) to the Duty Officer, who relays it to the XO. It
+ * never addresses an owner or the XO directly and never comments on GitHub;
+ * it is a pure handoff into the duty-officer mailbox. The report is throttled
+ * to at most once per 72h per item.
+ * ------------------------------------------------------------------ */
+
+/** 72h cooldown between blocker reports for the same canonical ref. */
+export const BLOCKER_REPORT_COOLDOWN_MS = 72 * HOUR_MS;
+
+/** Which qualifying state produced the report (drives the body descriptor). */
+export type BlockerReportState =
+  | 'labelled_blocked'
+  | 'marker_blocked'
+  | 'unclaimed_p0_not_fire_eligible';
+
+const BLOCKER_REPORT_STATE_DESCRIPTION: Record<BlockerReportState, string> = {
+  labelled_blocked: 'labelled blocked',
+  marker_blocked: '[BLOCKED] marker',
+  unclaimed_p0_not_fire_eligible: 'unclaimed P0, not fire-eligible',
+};
+
+/** Parse a canonical gh ref into its repo slug and issue number. */
+function parseGhIssueRef(ref: string): { repo: string; issueNumber: number } | null {
+  const match = /^gh:([^#]+)#(\d+)$/.exec(ref);
+  if (!match) return null;
+  return { repo: match[1], issueNumber: Number(match[2]) };
+}
+
+/** Compact "for Nh" / "for N days" duration from a state-start time. */
+function describeStateDuration(stateSinceMs: number, nowMs: number): string {
+  const idleMs = Math.max(0, nowMs - stateSinceMs);
+  const hours = Math.floor(idleMs / HOUR_MS);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.floor(hours / 24)} days`;
+}
+
+/**
+ * Compose a content-complete blocker_report body, or null when the row cannot
+ * support one (no title, or a non-gh ref with no issue URL). The body is
+ * bounded to 500 characters with the issue URL preserved: the variable
+ * blocked-reason clause is trimmed to fit rather than the trailing URL being
+ * lost. Shape:
+ *
+ *   Blocker report (<priority>): "<title (<=200)>" -- owner: <login|UNASSIGNED>.
+ *   Blocked: <reason|no named blocker>. State: <descriptor> for <Nh|N days>.
+ *   <https url>
+ */
+export function composeBlockerReportBody(
+  thread: ThreadSnapshot,
+  adoption: TmAdoptionRow | undefined,
+  state: BlockerReportState,
+  stateSinceMs: number,
+  nowMs: number
+): string | null {
+  const title = adoption?.title?.trim();
+  if (!title) return null;
+  // Canonicalize first so a pre-rename alias ref (gh:bluedevilcollectibles/...)
+  // yields the current, non-obsolete issue URL.
+  const parsed = parseGhIssueRef(canonicalizeThreadRef(thread.ref));
+  if (!parsed) return null;
+  const boundedTitle = title.length > 200 ? title.slice(0, 200) : title;
+  const owner = adoption?.owner_login?.trim() || 'UNASSIGNED';
+  const blocked = adoption?.blocked_reason?.trim() || 'no named blocker';
+  const descriptor = BLOCKER_REPORT_STATE_DESCRIPTION[state];
+  const duration = describeStateDuration(stateSinceMs, nowMs);
+  const url = `https://github.com/${parsed.repo}/issues/${parsed.issueNumber}`;
+  const prefix = `Blocker report (${thread.priority}): "${boundedTitle}" -- owner: ${owner}. Blocked: `;
+  const suffix = `. State: ${descriptor} for ${duration}. ${url}`;
+  const room = 500 - prefix.length - suffix.length;
+  // The 500-char budget must hold even for a pathological owner login or repo
+  // slug: if the fixed prefix/suffix alone leave no room for a blocked-reason
+  // character, we cannot emit a bounded, content-complete body. Reject (the
+  // caller treats null as "no report") rather than return an oversized string.
+  if (room < 1) return null;
+  // Trim the variable blocked clause to fit, preserving the trailing URL. Keep
+  // at least one non-space char so the content check still passes; if a
+  // length-capped slice is all whitespace, fall back to the raw capped slice
+  // (still within `room`) rather than the untrimmed full reason.
+  let blockedFinal = blocked;
+  if (blockedFinal.length > room) {
+    const trimmed = blockedFinal.slice(0, room).trimEnd();
+    blockedFinal = trimmed.length > 0 ? trimmed : blockedFinal.slice(0, room);
+  }
+  return `${prefix}${blockedFinal}${suffix}`;
+}
+
+/**
+ * Compute a blocker_report proposal for a thread, or null for no-op. Called by
+ * the tick IN ADDITION to computeNextAction -- it never replaces a ruling,
+ * fire, escalate_p0 or nudge. Returns a proposal only when ALL hold:
+ *   - the ref is a gh: ref;
+ *   - the thread is not held;
+ *   - the thread is BLOCKED (label or latest [BLOCKED] marker) OR is an
+ *     unclaimed P0 that is not fire-eligible and not lane-budget holding;
+ *   - the state has lasted at least NUDGE_CLOCK_MS.P1 (measured from the marker
+ *     time for a marker-blocked thread, else last_movement_at, else
+ *     lastActivityAt; an unparseable time means no report);
+ *   - interventionsLast24h < MAX_INTERVENTIONS_PER_ITEM_24H;
+ *   - no blocker_report for the same ref was sent in the last 72h.
+ */
+export function computeBlockerReport(
+  thread: ThreadSnapshot,
+  _classification: ThreadClass,
+  context: NextActionContext
+): ActionProposal | null {
+  // Canonicalize once: pre-rename alias refs (gh:bluedevilcollectibles/...)
+  // must collapse to the current org so the idempotency key and issue URL match
+  // the journal grouping loop.ts performs via canonicalizeThreadRef.
+  const canonicalRef = canonicalizeThreadRef(thread.ref);
+  const parsed = parseGhIssueRef(canonicalRef);
+  if (!parsed) return null;
+  if (thread.isHeld) return null;
+
+  const adoption = context.adoption;
+  const markerBlocked = adoption?.latest_marker_kind === 'BLOCKED';
+  const labelBlocked = thread.isBlocked === true;
+  const fireEligible = Boolean(context.fireEligible && context.fireEvidence?.expectedSpec);
+  const unclaimedP0NotFireEligible =
+    thread.isUnclaimedP0 === true && !fireEligible && context.fireHolding !== true;
+
+  let state: BlockerReportState | null = null;
+  if (markerBlocked) state = 'marker_blocked';
+  else if (labelBlocked) state = 'labelled_blocked';
+  else if (unclaimedP0NotFireEligible) state = 'unclaimed_p0_not_fire_eligible';
+  if (state === null) return null;
+
+  // State-start time: marker time for a marker-blocked thread, otherwise
+  // adoption movement, falling back to list-level activity. An unparseable
+  // time means no report (label application time is not recorded).
+  const stateSinceRaw =
+    state === 'marker_blocked'
+      ? (adoption?.latest_marker_at ?? null)
+      : (adoption?.last_movement_at ?? thread.lastActivityAt);
+  const stateSinceMs = stateSinceRaw ? Date.parse(stateSinceRaw) : NaN;
+  if (!Number.isFinite(stateSinceMs)) return null;
+  if (context.nowMs - stateSinceMs < NUDGE_CLOCK_MS.P1) return null;
+
+  if (context.interventionsLast24h >= MAX_INTERVENTIONS_PER_ITEM_24H) return null;
+
+  const lastSent = context.lastBlockerReportSentAtMs;
+  if (
+    lastSent !== null &&
+    lastSent !== undefined &&
+    context.nowMs - lastSent < BLOCKER_REPORT_COOLDOWN_MS
+  ) {
+    return null;
+  }
+
+  const body = composeBlockerReportBody(thread, adoption, state, stateSinceMs, context.nowMs);
+  if (body === null) return null;
+
+  const bucket = Math.floor(context.nowMs / BLOCKER_REPORT_COOLDOWN_MS);
+  return {
+    type: 'blocker_report',
+    threadRef: thread.ref,
+    recipient: 'duty-officer',
+    body,
+    idempotencyKey: `tm:blocker_report:${canonicalRef}:${bucket}`,
+    actsImmediately: false,
+  };
 }
