@@ -23,6 +23,56 @@ Now a CHANGES_REQUESTED verdict whose blocking findings are all mechanically
 fixable becomes a **remediation candidate** on the existing
 `agent_dispatch_messages` seam that Taskmaster already reads.
 
+## STATUS: the hand-back is BUILT and DISARMED
+
+**Remediation does not fire today.** `AUTO_FIXABLE_CLASSES` ships **empty**, so
+every finding falls through the fail-closed default and reaches a human. The
+transport, the fence, the attempt cap, the idempotency and the dispatch contract
+are all complete, tested, and verified in CI -- only the eligibility DECISION is
+switched off.
+
+### Why
+
+Deciding _which_ findings are mechanically fixable was done by pattern-matching
+the reviewer's prose. The Overseer gate found that unsafe **ten times** on
+PR #740. The decisive pair:
+
+```
+"The permission test fails: expected 403 but received 200."
+    -> mechanical. A builder can fix this.
+"The permission test fails: a read-only member can delete projects."
+    -> a privilege-escalation report. A human must decide.
+```
+
+Same topic word, same evidence word, same grammatical shape. **Any pattern that
+admits the first admits the second.** Narrowing had also begun producing FALSE
+NEGATIVES (`"The auth test fails after the column rename."` was being refused),
+so continued tightening degraded the feature in both directions at once. Rounds
+3-9 were all this one defect class; round 9 closed seven bypasses in a single
+audited pass and round 10 arrived anyway.
+
+The gate's own wording is the finding:
+
+> _"Observed test failure does not establish that remediation is mechanical.
+> Require explicit, validated remediation eligibility rather than treating a
+> regex match plus absence of listed risk phrases as authorization."_
+
+That cannot be satisfied from `IndependentReviewFinding`, which carries only
+`{scope, severity, summary}`.
+
+### How to re-arm
+
+**Do not repopulate the table with regexes.** That is the mistake the emptiness
+records. The reviewer must emit a **machine-readable eligibility class**, with
+**absence meaning NON-AUTO**, and the table must key off that signal instead of
+prose. That changes the evaluator's model contract, which the original WO placed
+out of scope (_"Changing what the reviewer reviews or how it judges"_), so it is
+tracked as its own WO.
+
+`LEGACY_PATTERN_CLASSES` retains the former table as a **test fixture only** --
+it keeps the fence and cap exercised end to end. It is not imported by
+production code and should be deleted once a structured signal exists.
+
 ## Division of labor (do not redesign this)
 
 **Overseer judges and hands back. Taskmaster decides what actually fires.**

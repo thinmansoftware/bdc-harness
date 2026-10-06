@@ -87,36 +87,62 @@ export interface AutoFixableClass {
 }
 
 /**
- * The auto-fixable class list.
+ * DISARMED PENDING A STRUCTURED ELIGIBILITY SIGNAL. Deliberately EMPTY.
  *
- * Every entry describes a defect whose CORRECTION IS MECHANICAL: the reviewer
- * has already named what is wrong and the fix does not require a judgment call
- * about intent, scope, or risk. Migration ordering is here because it is the
- * live anchor: shopops#650's parent-before-child update order is wrong in a way
- * the diff itself proves, and reordering it settles the finding.
+ * The hand-back mechanism in this module -- the fence, the attempt cap, the
+ * idempotency, the dispatch contract -- is complete and tested. What is NOT
+ * safe is deciding WHICH findings are mechanically fixable by pattern-matching
+ * the reviewer's prose, so that decision is switched off rather than shipped
+ * wrong. With no classes, every finding falls through classifyFinding's
+ * fail-closed default and reaches a human. Remediation never fires.
  *
- * Explicitly NOT here, and never to be added: design disagreements, scope
- * questions, governance objections, and security judgments. Those are the cases
- * where a human must decide, and routing them to a builder would launder a
- * judgment call into a code change.
+ * WHY, IN ONE EXAMPLE. The Overseer gate found this class of defect on PR #740
+ * ten times. The decisive pair:
  *
- * EACH PATTERN MUST DEMAND MECHANICAL EVIDENCE -- a failure a tool already
- * reported -- not merely a mechanical noun. This is the actual security
- * boundary, and it is where PR #740's [major] finding landed (2026-09-04).
+ *   "The permission test fails: expected 403 but received 200."
+ *       -> mechanical. A builder can fix this.
+ *   "The permission test fails: a read-only member can delete projects."
+ *       -> a privilege-escalation report. A human must decide.
  *
- * The old `test_failure` pattern was "the word test ... then a failure word
- * anywhere after it", which matched "Test missing for unescaped user content
- * rendered into the page" -- an XSS defect dressed as a coverage gap, routed
- * for unattended remediation. A MISSING test is a judgment call: deciding what
- * a test should assert requires knowing what the code ought to do, which is
- * exactly the reasoning a human must own. A FAILING test is mechanical: the
- * runner already said which assertion broke.
+ * Same topic word, same evidence word, same grammatical shape. Any pattern that
+ * admits the first admits the second. Narrowing was also starting to produce
+ * FALSE NEGATIVES ("The auth test fails after the column rename." was being
+ * refused), so continued tightening degraded the feature in both directions at
+ * once. Rounds 3-9 of that PR were all this one defect class; round 9 closed
+ * seven bypasses in a single audited pass and round 10 arrived anyway.
  *
- * So these patterns now require an observed failure (failing/erroring/red), and
- * coverage-gap phrasings ("missing", "absent", "no test for") are deliberately
- * excluded -- they fall through to the fail-closed default and reach a human.
+ * The gate's own words: "Observed test failure does not establish that
+ * remediation is mechanical. Require explicit, validated remediation
+ * eligibility rather than treating a regex match plus absence of listed risk
+ * phrases as authorization." That is correct, and it cannot be satisfied from
+ * `IndependentReviewFinding`, which carries only {scope, severity, summary}.
+ *
+ * HOW TO RE-ARM. Do NOT repopulate this table with regexes -- that is the
+ * mistake this emptiness records. The reviewer must emit a machine-readable
+ * eligibility class, with ABSENCE meaning NON-AUTO, and this table must key off
+ * that signal instead of prose. That requires changing the evaluator's model
+ * contract, which WO-...-REMEDIATION-01 placed out of scope ("Changing what the
+ * reviewer reviews or how it judges"), so it is tracked as its own WO.
+ *
+ * Everything else here stays live and covered by tests so the follow-up only
+ * has to supply the signal.
  */
-export const AUTO_FIXABLE_CLASSES: readonly AutoFixableClass[] = [
+export const AUTO_FIXABLE_CLASSES: readonly AutoFixableClass[] = [];
+
+/**
+ * The pattern-based class table as it stood before AUTO_FIXABLE_CLASSES was
+ * disarmed, kept HERE so the hand-back mechanism stays exercised end to end.
+ *
+ * These patterns are NOT safe to ship as an eligibility decision -- that is why
+ * the production table is empty. They are retained as a TEST FIXTURE because
+ * the fence, the attempt cap, the idempotency and the dispatch contract all
+ * need a non-empty table to be exercised at all, and those parts ARE correct.
+ *
+ * Do not import this into production code. When the reviewer gains a structured
+ * eligibility signal, the real table keys off that signal and this fixture can
+ * go away.
+ */
+export const LEGACY_PATTERN_CLASSES: readonly AutoFixableClass[] = [
   {
     id: 'build_failure',
     description:
@@ -268,7 +294,13 @@ export interface FindingClassification {
  *   2. Otherwise, the finding must match a known auto-fixable class.
  *   3. Matching nothing means NON-AUTO -- never auto.
  */
-export function classifyFinding(finding: IndependentReviewFinding): FindingClassification {
+export function classifyFinding(
+  finding: IndependentReviewFinding,
+  // Injectable so the mechanism stays exercised by tests while the SHIPPED
+  // table is empty. Production always takes the default, so passing a table is
+  // a test-only affordance and cannot re-arm remediation by accident.
+  classes: readonly AutoFixableClass[] = AUTO_FIXABLE_CLASSES
+): FindingClassification {
   // THE SCOPE IS A FILE PATH, NOT A DESCRIPTION OF THE DEFECT.
   //
   // Classes are matched against the SUMMARY ALONE. Matching the concatenation
@@ -295,7 +327,7 @@ export function classifyFinding(finding: IndependentReviewFinding): FindingClass
   if (NON_AUTO_IMPACT_PATTERN.test(vetoText)) return { autoFixable: false, classId: null };
 
   // 2. Known mechanical class, judged on the reviewer's description only.
-  for (const candidate of AUTO_FIXABLE_CLASSES) {
+  for (const candidate of classes) {
     if (candidate.pattern.test(classifyText)) return { autoFixable: true, classId: candidate.id };
   }
 
@@ -324,7 +356,8 @@ export interface FindingsClassification {
  * one the spec singles out, and it resolves toward the human.
  */
 export function classifyFindings(
-  findings: readonly IndependentReviewFinding[]
+  findings: readonly IndependentReviewFinding[],
+  classes: readonly AutoFixableClass[] = AUTO_FIXABLE_CLASSES
 ): FindingsClassification {
   const blocking = findings.filter(finding => BLOCKING_SEVERITIES.has(finding.severity));
   if (blocking.length === 0) {
@@ -334,7 +367,7 @@ export function classifyFindings(
   const classIds: string[] = [];
   const nonAutoSummaries: string[] = [];
   for (const finding of blocking) {
-    const classification = classifyFinding(finding);
+    const classification = classifyFinding(finding, classes);
     if (classification.autoFixable && classification.classId) {
       classIds.push(classification.classId);
     } else {
@@ -429,12 +462,15 @@ export type RemediationDecision =
  * `priorAttempts` rather than read here, which keeps the counting concern with
  * the durable store that owns it (see countPriorRemediationAttempts).
  */
-export function decideRemediation(input: RemediationCandidateInput): RemediationDecision {
+export function decideRemediation(
+  input: RemediationCandidateInput,
+  classes: readonly AutoFixableClass[] = AUTO_FIXABLE_CLASSES
+): RemediationDecision {
   if (input.verdict !== 'CHANGES_REQUESTED') {
     return { emit: false, reason: 'verdict_not_changes_requested', nonAutoSummaries: [] };
   }
 
-  const classification = classifyFindings(input.findings);
+  const classification = classifyFindings(input.findings, classes);
 
   if (classification.classIds.length === 0 && classification.nonAutoSummaries.length === 0) {
     // A CHANGES_REQUESTED verdict with no blocking finding is not something a
