@@ -24,6 +24,13 @@ export const TM_ALLOWED_ACTION_TYPES = [
   'digest',
   'fire_cauldron',
   'blocker_report',
+  // WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01: an Overseer CHANGES_REQUESTED
+  // verdict handed back to Taskmaster becomes one gated owner nudge. Without this
+  // entry validateProposal would reject every remediation_nudge as a forbidden
+  // effect and auto-HARD_PAUSE the loop. Recipient allowlist is NOT widened: a
+  // remediation_nudge addresses the matched thread's already-resolved recipient
+  // (an existing allowlisted seat), never a new one.
+  'remediation_nudge',
 ] as const;
 export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
 
