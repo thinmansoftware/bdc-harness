@@ -544,11 +544,63 @@ nodes:
       printf '%s\n' "$RUN_SCOPE_SHA" > "$ARTIFACTS_DIR/run-scope-sha.txt"
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
+  - id: prep-dependencies
+    persona: major-build
+    depends_on: [capture-run-scope]
+    trigger_rule: all_done
+    timeout: 900000
+    bash: |
+      set -uo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
+      # Prepare bun-lockfile JavaScript worktrees without making dependency setup
+      # load-bearing. The persistent appuser bun cache supplies reusable artifacts.
+      dprep_ensure_js_deps() {
+        if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
+          echo "dprep: no package.json with a bun lockfile, skipping"
+          return 0
+        fi
+        if [ -d node_modules ]; then
+          echo "dprep: node_modules present, skipping"
+          return 0
+        fi
+        if ! command -v bun >/dev/null 2>&1; then
+          echo "dprep: bun not found, skipping"
+          return 0
+        fi
+        local started elapsed rc name
+        echo "dprep: installing JS dependencies (bun install --frozen-lockfile) in $(pwd)"
+        started=$(date +%s)
+        (
+          for name in $(env | sed -n 's/=.*//p'); do
+            case "$name" in
+              *_TEST_*) continue ;;
+              OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL)
+                unset "$name"
+                ;;
+            esac
+          done
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+        )
+        rc=$?
+        elapsed=$(($(date +%s) - started))
+        if [ "$rc" -eq 0 ]; then
+          echo "dprep: install ok (${elapsed}s)"
+        else
+          echo "dprep: install failed rc=$rc (continuing; run-stop-tests reports the real result)"
+        fi
+        return 0
+      }
+      # ---- END dprep core ----
+      dprep_ensure_js_deps
+      exit 0
+
   - id: implement
     idle_timeout: 600000
     provider: codex
     model: gpt-5.6-sol
-    depends_on: [capture-run-scope]
+    depends_on: [prep-dependencies]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
@@ -1240,6 +1292,50 @@ nodes:
     bash: |
       set -uo pipefail
 
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+
+      # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
+      # Prepare bun-lockfile JavaScript worktrees without making dependency setup
+      # load-bearing. The persistent appuser bun cache supplies reusable artifacts.
+      dprep_ensure_js_deps() {
+        if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
+          echo "dprep: no package.json with a bun lockfile, skipping"
+          return 0
+        fi
+        if [ -d node_modules ]; then
+          echo "dprep: node_modules present, skipping"
+          return 0
+        fi
+        if ! command -v bun >/dev/null 2>&1; then
+          echo "dprep: bun not found, skipping"
+          return 0
+        fi
+        local started elapsed rc name
+        echo "dprep: installing JS dependencies (bun install --frozen-lockfile) in $(pwd)"
+        started=$(date +%s)
+        (
+          for name in $(env | sed -n 's/=.*//p'); do
+            case "$name" in
+              *_TEST_*) continue ;;
+              OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL)
+                unset "$name"
+                ;;
+            esac
+          done
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+        )
+        rc=$?
+        elapsed=$(($(date +%s) - started))
+        if [ "$rc" -eq 0 ]; then
+          echo "dprep: install ok (${elapsed}s)"
+        else
+          echo "dprep: install failed rc=$rc (continuing; run-stop-tests reports the real result)"
+        fi
+        return 0
+      }
+      # ---- END dprep core ----
+
       capture_node_output() {
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
       }
@@ -1575,6 +1671,31 @@ nodes:
                 set -- $segment
                 set +f
                 if [ $# -eq 0 ]; then rc=1; break; fi
+                if [ "$1" = "npx" ] && ! command -v "${RST_NPX_BIN:-npx}" >/dev/null 2>&1; then
+                  shift
+                  if command -v bunx >/dev/null 2>&1; then
+                    set -- bunx "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  elif command -v bun >/dev/null 2>&1; then
+                    set -- bun x "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  else
+                    set -- npx "$@"
+                  fi
+                elif [ "$1" = "npm" ] && ! command -v "${RST_NPM_BIN:-npm}" >/dev/null 2>&1 && command -v bun >/dev/null 2>&1; then
+                  shift
+                  if [ "${1:-}" = "test" ]; then
+                    shift
+                    set -- bun run test "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  elif [ "${1:-}" = "run" ] && [ -n "${2:-}" ]; then
+                    shift
+                    set -- bun run "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  else
+                    set -- npm "$@"
+                  fi
+                fi
                 timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
                 rc=$?
                 [ "$rc" -ne 0 ] && break
@@ -1629,6 +1750,8 @@ nodes:
         printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\n' "$status" "$line"
       }
       # ---- END rst core ----
+
+      dprep_ensure_js_deps >&2
 
       SPEC=$read-spec.output
       CLASS="$(printf '%s\n' "$SPEC" | rst_class)"
