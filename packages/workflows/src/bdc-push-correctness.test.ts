@@ -291,6 +291,15 @@ function bash(
   const scriptDir = mkdtempSync(join(tmpdir(), 'bdc-shell-'));
   const scriptPath = join(scriptDir, 'fixture.sh');
   const childEnv = { ...process.env, ...env };
+  // Existing success paths authorize in the decide output only. The lane now
+  // also requires a standalone field in the raw approved-plan fence.
+  if (
+    env.PLAN_REVIEW_RAW === undefined &&
+    typeof env.DECIDE_OUTPUT === 'string' &&
+    /repair_target_authorized_by_spec:\s*#[0-9]+/.test(env.DECIDE_OUTPUT)
+  ) {
+    childEnv.PLAN_REVIEW_RAW = authorizedPlanReviewRaw();
+  }
   if (process.platform === 'win32' && env.PATH !== undefined) {
     // Windows may inherit Path; a competing key can hide the fixture's PATH.
     for (const key of Object.keys(childEnv)) {
@@ -380,6 +389,20 @@ function authorizedRepairDecideOutput(branch: string, pushTarget?: string): stri
 
 function matchingRepairSpec(branch: string): string {
   return ['WO: WO-TEST', `Repair target: PR #826 (branch ${branch})`].join('\n');
+}
+
+function fencedPlanReview(bodyLines: readonly string[]): string {
+  return [
+    'Reviewer critique before the fence.',
+    '=== APPROVED_PLAN_BEGIN ===',
+    ...bodyLines,
+    '=== APPROVED_PLAN_END ===',
+    'Reviewer critique after the fence.',
+  ].join('\n');
+}
+
+function authorizedPlanReviewRaw(pr = '826'): string {
+  return fencedPlanReview(['Commit message: fix: x', `repair_target_authorized_by_spec: #${pr}`]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,6 +1134,45 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('repair_target_malformed');
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
+  });
+
+  it('Test 3: model-only authorization is refused', () => {
+    const branch = 'feat/x';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
+      PLAN_REVIEW_RAW: fencedPlanReview(['Commit message: fix: x']),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('repair_target_unauthorized');
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
+  });
+
+  it('Test 4: plan + decider + spec in agreement passes the guard', () => {
+    const branch = 'feat/x';
+    git(['push', 'origin', `HEAD:${branch}`], worktreeDir);
+    const headOid = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: authorizedDecideOutput(branch, branch),
+      SPEC_TEXT: matchingSpec(branch),
+      PLAN_REVIEW_RAW: authorizedPlanReviewRaw(),
+      PATH: fakeGhPath('OPEN', branch, { headRefOid: headOid }),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain('repair_target_unauthorized');
+    expect(result.stdout).toContain('UNIQUE_BRANCH=feat/x');
+  });
+
+  it('Test 20: decider-only authorization is refused end to end', () => {
+    const branch = 'feat/x';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
+      PLAN_REVIEW_RAW: fencedPlanReview(['Do not emit repair_target_authorized_by_spec: #826']),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('repair_target_unauthorized');
     expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
   });
 });
