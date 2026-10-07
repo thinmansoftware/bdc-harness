@@ -515,11 +515,65 @@ nodes:
       printf '%s\n' "$RUN_SCOPE_SHA" > "$ARTIFACTS_DIR/run-scope-sha.txt"
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
+  - id: prep-dependencies
+    depends_on: [capture-run-scope]
+    trigger_rule: all_done
+    timeout: 900000
+    bash: |
+      set -uo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
+      # dprep_ensure_js_deps installs bun-lockfile JavaScript dependencies when
+      # node_modules is absent. prep-dependencies calls it before implement, and
+      # run-stop-tests calls it before the first rst_try. Always returns 0. The
+      # install subshell unsets the same credential families as rst_scrub_env and
+      # keeps *_TEST_* names. node_modules is never symlinked or copied.
+      dprep_ensure_js_deps() {
+        if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
+          printf 'dprep: no package.json with a bun lockfile, skipping\n'
+          return 0
+        fi
+        if [ -d node_modules ]; then
+          printf 'dprep: node_modules present, skipping\n'
+          return 0
+        fi
+        if ! command -v bun >/dev/null 2>&1; then
+          printf 'dprep: bun not found, skipping\n'
+          return 0
+        fi
+        local start now elapsed rc=0
+        start="$(date +%s)"
+        printf 'dprep: installing JS dependencies (bun install --frozen-lockfile) in %s\n' "$(pwd)"
+        (
+          for name in $(env | sed -n 's/=.*//p'); do
+            case "$name" in
+              *_TEST_*) continue ;;
+              OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL)
+                unset "$name"
+                ;;
+            esac
+          done
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+        ) || rc=$?
+        now="$(date +%s)"
+        elapsed=$((now - start))
+        if [ "$rc" -eq 0 ]; then
+          printf 'dprep: install ok (%ss)\n' "$elapsed"
+        else
+          printf 'dprep: install failed rc=%s (continuing; run-stop-tests reports the real result)\n' "$rc"
+        fi
+        return 0
+      }
+      # ---- END dprep core ----
+      dprep_ensure_js_deps
+      exit 0
+
   - id: implement
     provider: openrouter
     model: moonshotai/kimi-k2.7-code
     persona: major-build-opr
-    depends_on: [capture-run-scope]
+    depends_on: [prep-dependencies]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
@@ -1521,6 +1575,29 @@ nodes:
                 set -- $segment
                 set +f
                 if [ $# -eq 0 ]; then rc=1; break; fi
+                # Rewrite npx/npm to bun only after the original argv passed the allowlist.
+                # When the real binary is on PATH, leave the command unchanged.
+                if [ "$1" = "npx" ] && ! command -v "${RST_NPX_BIN:-npx}" >/dev/null 2>&1; then
+                  if command -v bunx >/dev/null 2>&1; then
+                    shift
+                    set -- bunx "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  elif command -v bun >/dev/null 2>&1; then
+                    shift
+                    set -- bun x "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  fi
+                elif [ "$1" = "npm" ] && ! command -v "${RST_NPM_BIN:-npm}" >/dev/null 2>&1 && command -v bun >/dev/null 2>&1; then
+                  if [ "${2:-}" = "test" ]; then
+                    shift 2
+                    set -- bun run test "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  elif [ "${2:-}" = "run" ] && [ -n "${3:-}" ]; then
+                    shift 2
+                    set -- bun run "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  fi
+                fi
                 timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
                 rc=$?
                 [ "$rc" -ne 0 ] && break
@@ -1576,6 +1653,50 @@ nodes:
       }
       # ---- END rst core ----
 
+      # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
+      # dprep_ensure_js_deps installs bun-lockfile JavaScript dependencies when
+      # node_modules is absent. prep-dependencies calls it before implement, and
+      # run-stop-tests calls it before the first rst_try. Always returns 0. The
+      # install subshell unsets the same credential families as rst_scrub_env and
+      # keeps *_TEST_* names. node_modules is never symlinked or copied.
+      dprep_ensure_js_deps() {
+        if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
+          printf 'dprep: no package.json with a bun lockfile, skipping\n'
+          return 0
+        fi
+        if [ -d node_modules ]; then
+          printf 'dprep: node_modules present, skipping\n'
+          return 0
+        fi
+        if ! command -v bun >/dev/null 2>&1; then
+          printf 'dprep: bun not found, skipping\n'
+          return 0
+        fi
+        local start now elapsed rc=0
+        start="$(date +%s)"
+        printf 'dprep: installing JS dependencies (bun install --frozen-lockfile) in %s\n' "$(pwd)"
+        (
+          for name in $(env | sed -n 's/=.*//p'); do
+            case "$name" in
+              *_TEST_*) continue ;;
+              OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL)
+                unset "$name"
+                ;;
+            esac
+          done
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+        ) || rc=$?
+        now="$(date +%s)"
+        elapsed=$((now - start))
+        if [ "$rc" -eq 0 ]; then
+          printf 'dprep: install ok (%ss)\n' "$elapsed"
+        else
+          printf 'dprep: install failed rc=%s (continuing; run-stop-tests reports the real result)\n' "$rc"
+        fi
+        return 0
+      }
+      # ---- END dprep core ----
+
       SPEC=$read-spec.output
       CLASS="$(printf '%s\n' "$SPEC" | rst_class)"
       EVIDENCE_DIR="${ARTIFACTS_DIR:-.}/evidence"
@@ -1616,6 +1737,9 @@ nodes:
         # that exited 0 with no parseable counts (or no command at all) falls through;
         # the earlier attempt stays in the log and in TESTS_SOURCE.
         TRIED=""
+        (
+          cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && dprep_ensure_js_deps
+        ) >&2
         if ! rst_try "spec_declared"; then
           if [ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]; then
             TRIED="spec_declared command(s) exited $EXIT_CODE with no parseable counts: $CMD_JOINED"
