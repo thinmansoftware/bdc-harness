@@ -438,8 +438,8 @@ chmod +x "$TMP/bin/bun"
 printf '{"name":"x"}\n' > "$TMP/proj/package.json"
 printf '{}\n' > "$TMP/proj/bun.lock"
 OUT1="$(cd "$TMP/proj" && export PATH="$TMP/bin:$PATH" && dprep_ensure_js_deps 2>&1)"; RC1=$?
-assert_contains "Test1: installing log line" "dprep: installing JS dependencies (bun install --frozen-lockfile --ignore-scripts)" "$OUT1"
-assert_eq "Test1: stub recorded exact argv (--ignore-scripts blocks lifecycle writes)" "install --frozen-lockfile --ignore-scripts" "$(cat "$TMP/argv")"
+assert_contains "Test1: installing log line" "dprep: installing JS dependencies (bun install --frozen-lockfile)" "$OUT1"
+assert_eq "Test1: stub recorded exact argv" "install --frozen-lockfile" "$(cat "$TMP/argv")"
 assert_eq "Test1: node_modules created" "yes" "$([ -d "$TMP/proj/node_modules" ] && echo yes || echo no)"
 assert_eq "Test1: return 0" "0" "$RC1"
 
@@ -483,6 +483,36 @@ OUT="$(cd "$TMP" && export PATH="$TMP/bin:$PATH" && dprep_ensure_js_deps 2>&1)";
 assert_contains "Test4: install failed message" "dprep: install failed rc=1 (continuing" "$OUT"
 assert_eq "Test4: return 0 on failed install" "0" "$RC"
 assert_eq "Test4: tracked files untouched" "" "$(cd "$TMP" && git status --porcelain --untracked-files=no)"
+rm -rf "$TMP"
+
+# Test 4b: lifecycle hooks DO run (the spec mandates the exact `bun install
+# --frozen-lockfile` argv, so they are not suppressed), therefore dprep must RESTORE
+# any tracked file the install mutated -- while leaving pre-existing uncommitted work
+# alone. Stub bun simulates a postinstall hook rewriting a committed tracked file.
+TMP="$(mktemp -d)"
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/bun" <<EOF
+#!/usr/bin/env bash
+echo "\$*" > "$TMP/argv4b"
+echo mutated-by-lifecycle > tracked.txt
+mkdir -p node_modules
+EOF
+chmod +x "$TMP/bin/bun"
+(
+  cd "$TMP" && git init -q . && git config user.email t@t && git config user.name t
+  printf '{"name":"x"}\n' > package.json && printf '{}\n' > bun.lock
+  printf 'original\n' > tracked.txt && printf 'committed\n' > inflight.txt
+  git add -A && git commit -qm base
+  printf 'dirty-before-install\n' > inflight.txt
+)
+OUT4B="$(cd "$TMP" && export PATH="$TMP/bin:$PATH" && dprep_ensure_js_deps 2>&1)"; RC4B=$?
+assert_eq "Test4b: return 0" "0" "$RC4B"
+assert_eq "Test4b: exact argv kept (no --ignore-scripts)" "install --frozen-lockfile" "$(cat "$TMP/argv4b")"
+assert_eq "Test4b: lifecycle-mutated tracked file restored" "original" "$(cat "$TMP/tracked.txt")"
+assert_contains "Test4b: restore logged" "dprep: restored tracked file mutated by install: tracked.txt" "$OUT4B"
+assert_eq "Test4b: pre-existing uncommitted work NOT clobbered" "dirty-before-install" "$(cat "$TMP/inflight.txt")"
+assert_eq "Test4b: only the pre-existing dirt remains" " M inflight.txt" "$(cd "$TMP" && git status --porcelain --untracked-files=no)"
+assert_eq "Test4b: node_modules created" "yes" "$([ -d "$TMP/node_modules" ] && echo yes || echo no)"
 rm -rf "$TMP"
 
 echo "--- rst_run_commands: npx->bunx / npm->bun translation + allowlist (Tests 5-7) ---"

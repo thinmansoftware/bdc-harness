@@ -567,17 +567,20 @@ nodes:
       #   command can import them). Builder worktrees are created by `git worktree add`,
       #   so gitignored node_modules is absent even though the source clone has it. When
       #   the CWD has package.json AND a bun lockfile (bun.lock or bun.lockb) AND no
-      #   node_modules AND bun is on PATH, run `bun install --frozen-lockfile --ignore-scripts` using the
+      #   node_modules AND bun is on PATH, run `bun install --frozen-lockfile` using the
       #   persistent bun cache; node_modules is never symlinked or copied from the source
       #   clone. The install runs with the same production credential families unset that
       #   rst_scrub_env removes (dprep is self-contained and does not depend on the rst
-      #   core). --ignore-scripts prevents package lifecycle hooks (preinstall/postinstall/
-      #   prepare) from running, so the install can never mutate tracked files. It ALWAYS
-      #   returns 0 and never mutates tracked files -- a failed or skipped install just
-      #   means run-stop-tests reports the real test result later.
+      #   core). Package lifecycle hooks (preinstall/postinstall/prepare) DO run -- some
+      #   packages are unusable without them -- so instead of suppressing them dprep
+      #   snapshots the dirty tracked-file set before the install and afterwards restores
+      #   ONLY the paths the install newly dirtied. Paths already dirty beforehand are
+      #   in-flight work and are left untouched, so tracked files are unchanged by dprep
+      #   either way. It ALWAYS returns 0 -- a failed or skipped install just means
+      #   run-stop-tests reports the real test result later.
       #   All log lines go to stderr so a caller stdout contract is unchanged.
       dprep_ensure_js_deps() {
-        local dir rc start end name
+        local dir rc start end name before after path
         dir="$(pwd)"
         if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
           echo "dprep: no package.json with a bun lockfile, skipping" >&2
@@ -591,7 +594,8 @@ nodes:
           echo "dprep: bun not found, skipping" >&2
           return 0
         fi
-        echo "dprep: installing JS dependencies (bun install --frozen-lockfile --ignore-scripts) in $dir" >&2
+        echo "dprep: installing JS dependencies (bun install --frozen-lockfile) in $dir" >&2
+        before="$(git status --porcelain --untracked-files=no 2>/dev/null | sed 's/^...//')"
         start="$(date +%s 2>/dev/null || echo 0)"
         (
           for name in $(env | sed -n 's/=.*//p'); do
@@ -602,10 +606,20 @@ nodes:
                 ;;
             esac
           done
-          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile --ignore-scripts < /dev/null
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
         ) >&2
         rc=$?
         end="$(date +%s 2>/dev/null || echo 0)"
+        after="$(git status --porcelain --untracked-files=no 2>/dev/null | sed 's/^...//')"
+        if [ "$after" != "$before" ]; then
+          printf '%s\n' "$after" | while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            printf '%s\n' "$before" | grep -Fqx -- "$path" && continue
+            if git checkout -- "$path" 2>/dev/null; then
+              echo "dprep: restored tracked file mutated by install: $path" >&2
+            fi
+          done
+        fi
         if [ "$rc" -eq 0 ]; then
           echo "dprep: install ok ($((end - start))s)" >&2
         else
@@ -1747,17 +1761,20 @@ nodes:
       #   command can import them). Builder worktrees are created by `git worktree add`,
       #   so gitignored node_modules is absent even though the source clone has it. When
       #   the CWD has package.json AND a bun lockfile (bun.lock or bun.lockb) AND no
-      #   node_modules AND bun is on PATH, run `bun install --frozen-lockfile --ignore-scripts` using the
+      #   node_modules AND bun is on PATH, run `bun install --frozen-lockfile` using the
       #   persistent bun cache; node_modules is never symlinked or copied from the source
       #   clone. The install runs with the same production credential families unset that
       #   rst_scrub_env removes (dprep is self-contained and does not depend on the rst
-      #   core). --ignore-scripts prevents package lifecycle hooks (preinstall/postinstall/
-      #   prepare) from running, so the install can never mutate tracked files. It ALWAYS
-      #   returns 0 and never mutates tracked files -- a failed or skipped install just
-      #   means run-stop-tests reports the real test result later.
+      #   core). Package lifecycle hooks (preinstall/postinstall/prepare) DO run -- some
+      #   packages are unusable without them -- so instead of suppressing them dprep
+      #   snapshots the dirty tracked-file set before the install and afterwards restores
+      #   ONLY the paths the install newly dirtied. Paths already dirty beforehand are
+      #   in-flight work and are left untouched, so tracked files are unchanged by dprep
+      #   either way. It ALWAYS returns 0 -- a failed or skipped install just means
+      #   run-stop-tests reports the real test result later.
       #   All log lines go to stderr so a caller stdout contract is unchanged.
       dprep_ensure_js_deps() {
-        local dir rc start end name
+        local dir rc start end name before after path
         dir="$(pwd)"
         if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
           echo "dprep: no package.json with a bun lockfile, skipping" >&2
@@ -1771,7 +1788,8 @@ nodes:
           echo "dprep: bun not found, skipping" >&2
           return 0
         fi
-        echo "dprep: installing JS dependencies (bun install --frozen-lockfile --ignore-scripts) in $dir" >&2
+        echo "dprep: installing JS dependencies (bun install --frozen-lockfile) in $dir" >&2
+        before="$(git status --porcelain --untracked-files=no 2>/dev/null | sed 's/^...//')"
         start="$(date +%s 2>/dev/null || echo 0)"
         (
           for name in $(env | sed -n 's/=.*//p'); do
@@ -1782,10 +1800,20 @@ nodes:
                 ;;
             esac
           done
-          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile --ignore-scripts < /dev/null
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
         ) >&2
         rc=$?
         end="$(date +%s 2>/dev/null || echo 0)"
+        after="$(git status --porcelain --untracked-files=no 2>/dev/null | sed 's/^...//')"
+        if [ "$after" != "$before" ]; then
+          printf '%s\n' "$after" | while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            printf '%s\n' "$before" | grep -Fqx -- "$path" && continue
+            if git checkout -- "$path" 2>/dev/null; then
+              echo "dprep: restored tracked file mutated by install: $path" >&2
+            fi
+          done
+        fi
         if [ "$rc" -eq 0 ]; then
           echo "dprep: install ok ($((end - start))s)" >&2
         else
