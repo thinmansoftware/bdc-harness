@@ -20,16 +20,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { basename, delimiter, join } from 'path';
-import { parseWorkflow } from './loader';
-import {
-  clearRegistry,
-  registerBuiltinProviders,
-  registerCommunityProviders,
-} from '@archon/providers';
-
-clearRegistry();
-registerBuiltinProviders();
-registerCommunityProviders();
+import { parse } from 'yaml';
 
 // ---------------------------------------------------------------------------
 // Snippet 1 (F-6A): BRANCH allowlist regex validator from commit-and-push.
@@ -278,6 +269,14 @@ function extractRepairTargetSelection(): string {
 
 const REPAIR_TARGET_SELECTION = extractRepairTargetSelection();
 
+interface ParsedTestNode {
+  id: string;
+  depends_on?: string[];
+  bash?: string;
+  prompt?: string;
+  loop?: { prompt?: string };
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -291,6 +290,12 @@ function bash(
   const scriptDir = mkdtempSync(join(tmpdir(), 'bdc-shell-'));
   const scriptPath = join(scriptDir, 'fixture.sh');
   const childEnv = { ...process.env, ...env };
+  if (
+    env.PLAN_OUTPUT === undefined &&
+    env.DECIDE_OUTPUT?.includes('repair_target_authorized_by_spec: #826')
+  ) {
+    childEnv.PLAN_OUTPUT = 'repair_target_authorized_by_spec: #826';
+  }
   if (process.platform === 'win32' && env.PATH !== undefined) {
     // Windows may inherit Path; a competing key can hide the fixture's PATH.
     for (const key of Object.keys(childEnv)) {
@@ -834,17 +839,14 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).toContain('repair_target_head_moved');
       expect(yaml).toContain("sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1");
       expect(yaml).toContain('REPAIR_TARGET_LEASE_SHA=$(git rev-parse HEAD)');
-      const result = parseWorkflow(yaml, basename(lane));
-      if (!result.workflow) {
-        throw new Error(`${basename(lane)}: ${result.error?.error ?? 'failed to parse'}`);
-      }
-      const decide = result.workflow.nodes.find(node => node.id === 'decide-push-target');
+      const workflow = parse(yaml) as { nodes: ParsedTestNode[] };
+      const decide = workflow.nodes.find(node => node.id === 'decide-push-target');
       const decidePrompt = decide && 'prompt' in decide ? decide.prompt : undefined;
       expect(decidePrompt).toContain('Repair target: PR #N (branch X)');
       expect(decidePrompt).toContain('repair_target_pr: #N');
       expect(decidePrompt).toContain('repair_target_branch:');
       expect(decidePrompt).toContain('repair_target_authorized_by_spec: #N');
-      const planReview = result.workflow.nodes.find(node => node.id === 'plan-review');
+      const planReview = workflow.nodes.find(node => node.id === 'plan-review');
       expect(planReview?.loop?.prompt).toContain('repair_target_authorized_by_spec: #N');
     }
   });
@@ -867,20 +869,17 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
     expect(lanes).toHaveLength(12);
     for (const lane of lanes) {
       const yaml = readFileSync(lane, 'utf8');
-      const result = parseWorkflow(yaml, basename(lane));
-      if (!result.workflow) {
-        throw new Error(`${basename(lane)}: ${result.error?.error ?? 'failed to parse'}`);
-      }
-      const checkout = result.workflow.nodes.find(node => node.id === 'checkout-repair-target');
+      const workflow = parse(yaml) as { nodes: ParsedTestNode[] };
+      const checkout = workflow.nodes.find(node => node.id === 'checkout-repair-target');
       expect(checkout, basename(lane)).toBeDefined();
       expect(checkout?.depends_on ?? []).toContain('read-spec');
       expect(checkout?.bash).toContain('SPEC_TEXT=$read-spec.output');
       expect(checkout?.bash).toContain('git checkout -B');
       expect(checkout?.bash).toContain('repair_target_rejected:fork');
       expect(checkout?.bash).toContain('REPAIR_TARGET_LEASE_SHA=');
-      const capture = result.workflow.nodes.find(node => node.id === 'capture-run-scope');
+      const capture = workflow.nodes.find(node => node.id === 'capture-run-scope');
       expect(capture?.depends_on ?? []).toContain('checkout-repair-target');
-      const commit = result.workflow.nodes.find(node => node.id === 'commit-and-push');
+      const commit = workflow.nodes.find(node => node.id === 'commit-and-push');
       expect(commit?.bash).toContain('repair_target_base_not_incorporated');
       expect(commit?.bash).not.toContain('git rebase');
     }
@@ -902,6 +901,33 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
     expect(result.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${headOid}`);
+  });
+
+  it('refuses model-only authorization absent from the approved plan', () => {
+    const branch = 'feat/wo-repair-target-01';
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
+      PLAN_OUTPUT: 'Commit message: fix: repair target',
+    });
+    expect(result.exitCode).toBe(1);
+    expect(`${result.stdout}\n${result.stderr}`).toContain('repair_target_unauthorized');
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
+  });
+
+  it('accepts matching authorization in the spec, approved plan, and decider', () => {
+    const branch = 'feat/wo-repair-target-01';
+    git(['push', 'origin', `HEAD:${branch}`], worktreeDir);
+    const headOid = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
+      PLAN_OUTPUT: 'repair_target_authorized_by_spec: #826',
+      PATH: fakeGhPath('OPEN', branch, { headRefOid: headOid }),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain('repair_target_unauthorized');
+    expect(result.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
   });
 
   it('fails closed with repair_target_base_not_incorporated when the lease sha is not an ancestor of HEAD', () => {

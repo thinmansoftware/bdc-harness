@@ -176,7 +176,165 @@ nodes:
         echo "ERROR: repair_target_head_mismatch: fetched ${FETCHED_SHA} != live ${REPAIR_TARGET_LIVE_OID}" >&2
         exit 1
       fi
-      git checkout -B "$SPEC_REPAIR_BRANCH" FETCH_HEAD
+      # ---- BEGIN rtw core (byte-identical across lanes; extracted by unit test) ----
+      # Reclaim only a registered, clean worktree held solely by old terminal runs.
+      # Overrides: RTW_RUNS_DB, RTW_MIN_AGE_SECONDS, and RTW_PROC_ROOT.
+      rtw_checkout_repair_branch() {
+        local branch=$1 error_file git_rc collision holder holder_real current_real
+        local matches registered worktree_list db_result row_id row_status row_completed proc_root cwd_link cwd_real
+        local current_top holder_tip sha7 stamp backup_ref remote_tip retry_error status_file
+        error_file=$(mktemp) || return 1
+        if git checkout -B "$branch" FETCH_HEAD 2>"$error_file"; then
+          rm -f "$error_file"
+          return 0
+        else
+          git_rc=$?
+        fi
+        collision=$(cat "$error_file")
+        if ! printf '%s\n' "$collision" | grep -Eq "is already (used by worktree|checked out) at '.*'"; then
+          cat "$error_file" >&2
+          rm -f "$error_file"
+          return "$git_rc"
+        fi
+        matches=$(printf '%s\n' "$collision" | sed -n "s/.*is already \(used by worktree\|checked out\) at '\(.*\)'$/\2/p")
+        rm -f "$error_file"
+        if [ "$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')" != 1 ]; then
+          holder='<unparsed>'
+          echo "repair_target_branch_held: $branch is checked out by $holder; not reclaimed: ambiguous holder path" >&2
+          return 1
+        fi
+        holder=$(printf '%s\n' "$matches" | sed -n '1p')
+        if [ -z "$holder" ] || [ ! -d "$holder" ]; then
+          echo "repair_target_branch_held: $branch is checked out by ${holder:-<unparsed>}; not reclaimed: holder path is missing" >&2
+          return 1
+        fi
+        holder_real=$(cd "$holder" 2>/dev/null && pwd -P) || {
+          echo "repair_target_branch_held: $branch is checked out by $holder; not reclaimed: holder path cannot be resolved" >&2
+          return 1
+        }
+        current_top=$(git rev-parse --show-toplevel 2>/dev/null) || current_top=''
+        current_real=$(cd "$current_top" 2>/dev/null && pwd -P) || current_real=''
+        if [ -z "$current_real" ] || [ "$holder_real" = "$current_real" ]; then
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: holder is the current worktree" >&2
+          return 1
+        fi
+        registered=false
+        if ! worktree_list=$(git worktree list --porcelain 2>/dev/null); then
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: registered worktrees could not be read" >&2
+          return 1
+        fi
+        while IFS= read -r row; do
+          case "$row" in
+            'worktree '*)
+              row=${row#worktree }
+              if [ -d "$row" ] && [ "$(cd "$row" 2>/dev/null && pwd -P)" = "$holder_real" ]; then registered=true; fi
+              ;;
+          esac
+        done <<<"$worktree_list"
+        if [ "$registered" != true ]; then
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: holder is not a registered worktree" >&2
+          return 1
+        fi
+        case "${RTW_MIN_AGE_SECONDS:-600}" in ''|*[!0-9]*)
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: invalid minimum age" >&2
+          return 1;;
+        esac
+        if [ "${RTW_MIN_AGE_SECONDS:-600}" -lt 0 ]; then
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: invalid minimum age" >&2
+          return 1
+        fi
+        if ! db_result=$(RTW_DB_PATH="${RTW_RUNS_DB:-/.archon/archon.db}" RTW_HOLDER_PATH="$holder_real" RTW_MIN_AGE="${RTW_MIN_AGE_SECONDS:-600}" bun -e '
+          import { Database } from "bun:sqlite";
+          const db = new Database(process.env.RTW_DB_PATH!, { readonly: true });
+          const rows = db.query("SELECT id, status, working_path, completed_at FROM remote_agent_workflow_runs WHERE working_path = ?").all(process.env.RTW_HOLDER_PATH!) as any[];
+          if (!rows.length) throw new Error("no matching run rows");
+          const terminal = new Set(["completed", "failed", "escalated", "cancelled"]);
+          const minAge = Number(process.env.RTW_MIN_AGE);
+          const parsed = rows.map(row => {
+            if (!terminal.has(row.status)) throw new Error(`non-terminal run ${row.id}`);
+            if (typeof row.completed_at !== "string" || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(row.completed_at)) throw new Error(`invalid completed_at for ${row.id}`);
+            const time = Date.parse(row.completed_at.replace(" ", "T") + "Z");
+            if (!Number.isFinite(time)) throw new Error(`invalid completed_at for ${row.id}`);
+            const age = (Date.now() - time) / 1000;
+            if (age < minAge) throw new Error(`recent run ${row.id}`);
+            return { ...row, time };
+          });
+          parsed.sort((a, b) => b.time - a.time || String(a.id).localeCompare(String(b.id)));
+          const chosen = parsed[0];
+          process.stdout.write(`${chosen.id}\t${chosen.status}\t${chosen.completed_at}`);
+        ' 2>/dev/null); then
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: run database did not prove an old terminal holder" >&2
+          return 1
+        fi
+        IFS=$'\t' read -r row_id row_status row_completed <<<"$db_result"
+        if [ -z "$row_id" ] || [ -z "$row_status" ] || [ -z "$row_completed" ]; then
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: invalid run database result" >&2
+          return 1
+        fi
+        proc_root=${RTW_PROC_ROOT:-/proc}
+        if [ ! -d "$proc_root" ] || [ ! -r "$proc_root" ]; then
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: process root is unavailable" >&2
+          return 1
+        fi
+        for cwd_link in "$proc_root"/[0-9]*/cwd; do
+          [ -e "$cwd_link" ] || [ -L "$cwd_link" ] || continue
+          if ! cwd_real=$(readlink -f "$cwd_link" 2>/dev/null); then
+            echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: process cwd scan was indeterminate" >&2
+            return 1
+          fi
+          case "$cwd_real" in "$holder_real"|"$holder_real"/*)
+            echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: a process cwd is inside the holder" >&2
+            return 1;;
+          esac
+        done
+        status_file=$(mktemp) || return 1
+        if ! git -C "$holder_real" status --porcelain >"$status_file" 2>/dev/null; then
+          rm -f "$status_file"
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: holder status could not be read" >&2
+          return 1
+        fi
+        if [ -s "$status_file" ]; then
+          rm -f "$status_file"
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: holder is dirty" >&2
+          return 1
+        fi
+        rm -f "$status_file"
+        if ! holder_tip=$(git -C "$holder_real" rev-parse HEAD 2>/dev/null); then
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: holder tip could not be resolved" >&2
+          return 1
+        fi
+        backup_ref=''
+        if ! git merge-base --is-ancestor "$holder_tip" FETCH_HEAD >/dev/null 2>&1; then
+          sha7=$(printf '%.7s' "$holder_tip")
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          backup_ref="refs/heads/backup/${branch}-${sha7}-${stamp}"
+          if ! git push origin "${holder_tip}:${backup_ref}" >/dev/null 2>&1; then
+            echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: backup push failed" >&2
+            return 1
+          fi
+          remote_tip=$(git ls-remote origin "$backup_ref" 2>/dev/null | awk 'NR == 1 {print $1}')
+          if [ "$remote_tip" != "$holder_tip" ]; then
+            echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: backup verification failed" >&2
+            return 1
+          fi
+        fi
+        if ! git worktree remove "$holder_real" >/dev/null 2>&1; then
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: worktree removal failed" >&2
+          return 1
+        fi
+        echo "repair_target_worktree_reclaimed: $holder_real (run ${row_id:0:8} status $row_status completed_at $row_completed) held $branch"
+        if [ -n "$backup_ref" ]; then echo "backup_branch: $backup_ref"; fi
+        retry_error=$(mktemp) || return 1
+        if ! git checkout -B "$branch" FETCH_HEAD 2>"$retry_error"; then
+          cat "$retry_error" >&2
+          rm -f "$retry_error"
+          echo "repair_target_branch_held: $branch is checked out by $holder_real; not reclaimed: checkout retry failed" >&2
+          return 1
+        fi
+        rm -f "$retry_error"
+      }
+      # ---- END rtw core ----
+      rtw_checkout_repair_branch "$SPEC_REPAIR_BRANCH"
       echo "REPAIR_TARGET=#${SPEC_REPAIR_PR}"
       echo "REPAIR_TARGET_BRANCH=${SPEC_REPAIR_BRANCH}"
       echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LIVE_OID}"
@@ -365,7 +523,7 @@ nodes:
     # Cross-model boundary: Grok authors the plan; DeepSeek reviews it through
     # the repository-capable codex-opr provider. Grok never grades its own work.
     model: deepseek/deepseek-v4-pro-0813
-    depends_on: [plan]
+    depends_on: [plan, checkout-repair-target]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
@@ -399,6 +557,8 @@ nodes:
         worktree. Ensure the approved plan remains a minimal plan that VERIFIES the
         existing state rather than re-creating it.
         Spec: $read-spec.output
+        Lane-verified repair-target record (verified by the lane with the GitHub CLI before plan-review ran):
+        $checkout-repair-target.output
 
         ## Attack the plan on these dimensions
         1. Scope creep -- any file not justified by the spec.
@@ -409,13 +569,16 @@ nodes:
            and shopops-storefront have NO staging branch (verified 2026-07-07;
            their PRs target the repo default branch).
         4b. Repair target -- when the spec declares `Repair target: PR #N (branch X)`,
-           use WebFetch to verify that PR #N is open on the target repo and its head
-           branch is X. An open matching PR is self-authorizing: preserve it in the
-           approved plan as `repair_target_authorized_by_spec: #N`; never ask whether
-           it is canonical or whether to close it and rebuild fresh. If it is closed,
-           fail this plan iteration with the literal reason `declared repair target #N
-           is closed`. If it is not on the target repo, its branch does not match X, or
-           it cannot be verified, fail with `declared repair target #N is not on <repo>`.
+           parse REPAIR_TARGET and REPAIR_TARGET_BRANCH from the lane-verified
+           repair-target record supplied above. When both the PR number and the branch
+           match, that match is self-authorizing: preserve it in the approved plan as
+           `repair_target_authorized_by_spec: #N`; never ask whether it is canonical or
+           whether to close it and rebuild fresh. When REPAIR_TARGET=none despite a
+           declared target, fail this plan iteration with the literal reason
+           `declared repair target #N was not verified by the lane`. When either the PR
+           number or the branch differs, fail this plan iteration with the literal
+           reason `declared repair target #N does not match the lane-verified record`.
+           Decide only from that record. Do not access the network in this step.
         5. Out-of-scope list present and correct.
 
         ## Self-repair (the point -- do not just report)
@@ -3211,13 +3374,18 @@ nodes:
       Validator:
       $war-council-validator.output
 
+      Approved plan (plan-review node output; use ONLY the text between === APPROVED_PLAN_BEGIN === and === APPROVED_PLAN_END ===):
+      $plan-review.output
+
       ## Branch Name Derivation Rules (F-6A prevention)
       First check for `Repair target: PR #N (branch X)` in the spec. Verify it with
       `gh pr view N --repo <target-repo> --json state,headRefName`: state must be OPEN
       and headRefName must equal X. On success, emit the normal fields below plus
       `repair_target_pr: #N` and `repair_target_branch: <verified-headRefName-from-gh>`;
-      emit `repair_target_authorized_by_spec: #N` ONLY when the approved plan carried
-      that authorization. Use that verified head as the feature branch and stop
+      emit `repair_target_authorized_by_spec: #N` ONLY when the fenced approved-plan
+      block contains that authorization for the same N as the spec's `Repair target:`
+      line. Never derive it from reviewer critique outside the fence and never invent
+      it. Use that verified head as the feature branch and stop
       without deriving a fresh branch. On a closed PR or repo/branch mismatch, fail
       closed with the exact declared-repair-target reason from the approved plan.
       Never mint a replacement.
@@ -3526,7 +3694,7 @@ nodes:
         REPAIR_TARGET_AUTHORIZED=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_authorized_by_spec:[[:space:]]*\(#[0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
         SPEC_REPAIR_PR=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #\([0-9][0-9]*\)[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
         SPEC_REPAIR_BRANCH=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #[0-9][0-9]*[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
-        if [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" != true ] || [ "$REPAIR_TARGET_AUTHORIZED" != "#${REPAIR_TARGET_PR}" ] || [ "$SPEC_REPAIR_PR" != "$REPAIR_TARGET_PR" ] || [ "$SPEC_REPAIR_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
+        if [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" != true ] || [ "$REPAIR_TARGET_AUTHORIZED" != "#${REPAIR_TARGET_PR}" ] || [ "$SPEC_REPAIR_PR" != "$REPAIR_TARGET_PR" ] || [ "$SPEC_REPAIR_BRANCH" != "$REPAIR_TARGET_BRANCH" ] || ! grep -Eq "repair_target_authorized_by_spec:[[:space:]]*#${REPAIR_TARGET_PR}([^0-9]|$)" <<<"${PLAN_OUTPUT:-}"; then
           echo "repair_target_unauthorized"
           echo "ERROR: repair_target_unauthorized: refusing to select an existing branch without a spec-bound authorization matching PR #${REPAIR_TARGET_PR} branch ${REPAIR_TARGET_BRANCH}" >&2
           exit 1
