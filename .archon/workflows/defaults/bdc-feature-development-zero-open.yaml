@@ -1729,7 +1729,7 @@ nodes:
                     printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
                   elif [ "${1:-}" = "run" ] && [ -n "${2:-}" ]; then
                     shift
-                    set -- bun "$@"
+                    set -- bun run "$@"
                     printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
                   else
                     set -- npm "$@"

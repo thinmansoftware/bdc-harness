@@ -497,6 +497,11 @@ RESULT="$(cd "$TMP" && PATH="$TMP/bin:$PATH" rst_run_commands ./cmds ./npm.log)"
 assert_eq "missing npm uses bun with real counts" "0 2 2" "$RESULT"
 assert_eq "npm test becomes bun run test" "run test" "$(cat "$TMP/bun.argv")"
 assert_contains "npm fallback is logged" "rst_run_commands: npm not found, running as: bun run test" "$(cat "$TMP/npm.log")"
+printf 'npm run test:unit -- --watch=false\n' > "$TMP/cmds"
+RESULT="$(cd "$TMP" && PATH="$TMP/bin:$PATH" rst_run_commands ./cmds ./npm-run.log)"
+assert_eq "missing npm run uses bun with real counts" "0 2 2" "$RESULT"
+assert_eq "npm run preserves run, script, and arguments" "run test:unit -- --watch=false" "$(cat "$TMP/bun.argv")"
+assert_contains "npm run fallback is logged" "rst_run_commands: npm not found, running as: bun run test:unit -- --watch=false" "$(cat "$TMP/npm-run.log")"
 cat > "$TMP/bin/npx" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" > "$RST_RECORD"
