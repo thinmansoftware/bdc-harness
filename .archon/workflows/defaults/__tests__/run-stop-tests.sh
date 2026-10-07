@@ -438,8 +438,8 @@ chmod +x "$TMP/bin/bun"
 printf '{"name":"x"}\n' > "$TMP/proj/package.json"
 printf '{}\n' > "$TMP/proj/bun.lock"
 OUT1="$(cd "$TMP/proj" && export PATH="$TMP/bin:$PATH" && dprep_ensure_js_deps 2>&1)"; RC1=$?
-assert_contains "Test1: installing log line" "dprep: installing JS dependencies (bun install --frozen-lockfile)" "$OUT1"
-assert_eq "Test1: stub recorded exact argv" "install --frozen-lockfile" "$(cat "$TMP/argv")"
+assert_contains "Test1: installing log line" "dprep: installing JS dependencies (bun install --frozen-lockfile --ignore-scripts)" "$OUT1"
+assert_eq "Test1: stub recorded exact argv (--ignore-scripts blocks lifecycle writes)" "install --frozen-lockfile --ignore-scripts" "$(cat "$TMP/argv")"
 assert_eq "Test1: node_modules created" "yes" "$([ -d "$TMP/proj/node_modules" ] && echo yes || echo no)"
 assert_eq "Test1: return 0" "0" "$RC1"
 
@@ -505,6 +505,31 @@ assert_eq "Test5: report passed, declared command text kept" \
   "$(SOURCE=spec_declared rst_report CODE 'npx vitest run x.test.ts' 0 '3 3')"
 rm -rf "$TMP"
 
+# Test 5b: npx falls back to `bun x` when BOTH npx and bunx are absent (bun-only
+# containers may ship bun without the bunx shim). Build a PATH that keeps coreutils
+# but provides neither npx nor bunx -- only our bun stub -- so the elif branch runs.
+TMP="$(mktemp -d)"
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/bun" <<EOF
+#!/usr/bin/env bash
+echo "\$*" > "$TMP/bun-x-argv"
+echo "      Tests  3 passed (3)"
+EOF
+chmod +x "$TMP/bin/bun"
+NOBUNX=""
+OLDIFS="$IFS"; IFS=:
+for d in $PATH; do
+  [ -x "$d/bunx" ] && continue
+  NOBUNX="${NOBUNX:+$NOBUNX:}$d"
+done
+IFS="$OLDIFS"
+printf 'npx vitest run x.test.ts\n' > "$TMP/cmds"
+RESULT="$(cd "$TMP" && export PATH="$TMP/bin:$NOBUNX" RST_NPX_BIN=npx-absent-xyz && rst_run_commands ./cmds ./log)"
+assert_eq "Test5b: rst_run_commands prints 0 3 3" "0 3 3" "$RESULT"
+assert_eq "Test5b: bun stub recorded 'x' + rest of argv (bun x fallback)" "x vitest run x.test.ts" "$(cat "$TMP/bun-x-argv")"
+assert_contains "Test5b: bun x translation line logged" "rst_run_commands: npx not found, running as: bun x vitest run x.test.ts" "$(cat "$TMP/log")"
+rm -rf "$TMP"
+
 # Test 6: npm test -> bun run test when npm absent; real npx is left alone
 TMP="$(mktemp -d)"
 mkdir -p "$TMP/bin"
@@ -518,6 +543,14 @@ printf 'npm test\n' > "$TMP/cmds"
 RESULT="$(cd "$TMP" && export PATH="$TMP/bin:$PATH" RST_NPM_BIN=npm-absent-xyz && rst_run_commands ./cmds ./log)"
 assert_eq "Test6: npm counts 0 2 2" "0 2 2" "$RESULT"
 assert_eq "Test6: bun stub recorded 'run test'" "run test" "$(cat "$TMP/bun-argv")"
+# npm run <script> <args> -> bun run <script> <args> (the elif "run" branch, which
+# Test 6's `npm test` case never exercises). Script name + trailing positional args
+# must survive the argv[0] swap verbatim.
+printf 'npm run lint:fix src\n' > "$TMP/cmds-run"
+RESULT_RUN="$(cd "$TMP" && export PATH="$TMP/bin:$PATH" RST_NPM_BIN=npm-absent-xyz && rst_run_commands ./cmds-run ./log-run)"
+assert_eq "Test6: npm run counts 0 2 2" "0 2 2" "$RESULT_RUN"
+assert_eq "Test6: bun stub recorded 'run lint:fix src'" "run lint:fix src" "$(cat "$TMP/bun-argv")"
+assert_contains "Test6: npm run translation line logged" "rst_run_commands: npm not found, running as: bun run lint:fix src" "$(cat "$TMP/log-run")"
 cat > "$TMP/bin/npx" <<EOF
 #!/usr/bin/env bash
 echo "\$*" > "$TMP/npx-argv"

@@ -509,12 +509,14 @@ nodes:
       #   command can import them). Builder worktrees are created by `git worktree add`,
       #   so gitignored node_modules is absent even though the source clone has it. When
       #   the CWD has package.json AND a bun lockfile (bun.lock or bun.lockb) AND no
-      #   node_modules AND bun is on PATH, run `bun install --frozen-lockfile` using the
+      #   node_modules AND bun is on PATH, run `bun install --frozen-lockfile --ignore-scripts` using the
       #   persistent bun cache; node_modules is never symlinked or copied from the source
       #   clone. The install runs with the same production credential families unset that
       #   rst_scrub_env removes (dprep is self-contained and does not depend on the rst
-      #   core). It ALWAYS returns 0 and never mutates tracked files -- a failed or
-      #   skipped install just means run-stop-tests reports the real test result later.
+      #   core). --ignore-scripts prevents package lifecycle hooks (preinstall/postinstall/
+      #   prepare) from running, so the install can never mutate tracked files. It ALWAYS
+      #   returns 0 and never mutates tracked files -- a failed or skipped install just
+      #   means run-stop-tests reports the real test result later.
       #   All log lines go to stderr so a caller stdout contract is unchanged.
       dprep_ensure_js_deps() {
         local dir rc start end name
@@ -531,7 +533,7 @@ nodes:
           echo "dprep: bun not found, skipping" >&2
           return 0
         fi
-        echo "dprep: installing JS dependencies (bun install --frozen-lockfile) in $dir" >&2
+        echo "dprep: installing JS dependencies (bun install --frozen-lockfile --ignore-scripts) in $dir" >&2
         start="$(date +%s 2>/dev/null || echo 0)"
         (
           for name in $(env | sed -n 's/=.*//p'); do
@@ -542,7 +544,7 @@ nodes:
                 ;;
             esac
           done
-          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile --ignore-scripts < /dev/null
         ) >&2
         rc=$?
         end="$(date +%s 2>/dev/null || echo 0)"
@@ -1721,12 +1723,14 @@ nodes:
       #   command can import them). Builder worktrees are created by `git worktree add`,
       #   so gitignored node_modules is absent even though the source clone has it. When
       #   the CWD has package.json AND a bun lockfile (bun.lock or bun.lockb) AND no
-      #   node_modules AND bun is on PATH, run `bun install --frozen-lockfile` using the
+      #   node_modules AND bun is on PATH, run `bun install --frozen-lockfile --ignore-scripts` using the
       #   persistent bun cache; node_modules is never symlinked or copied from the source
       #   clone. The install runs with the same production credential families unset that
       #   rst_scrub_env removes (dprep is self-contained and does not depend on the rst
-      #   core). It ALWAYS returns 0 and never mutates tracked files -- a failed or
-      #   skipped install just means run-stop-tests reports the real test result later.
+      #   core). --ignore-scripts prevents package lifecycle hooks (preinstall/postinstall/
+      #   prepare) from running, so the install can never mutate tracked files. It ALWAYS
+      #   returns 0 and never mutates tracked files -- a failed or skipped install just
+      #   means run-stop-tests reports the real test result later.
       #   All log lines go to stderr so a caller stdout contract is unchanged.
       dprep_ensure_js_deps() {
         local dir rc start end name
@@ -1743,7 +1747,7 @@ nodes:
           echo "dprep: bun not found, skipping" >&2
           return 0
         fi
-        echo "dprep: installing JS dependencies (bun install --frozen-lockfile) in $dir" >&2
+        echo "dprep: installing JS dependencies (bun install --frozen-lockfile --ignore-scripts) in $dir" >&2
         start="$(date +%s 2>/dev/null || echo 0)"
         (
           for name in $(env | sed -n 's/=.*//p'); do
@@ -1754,7 +1758,7 @@ nodes:
                 ;;
             esac
           done
-          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile --ignore-scripts < /dev/null
         ) >&2
         rc=$?
         end="$(date +%s 2>/dev/null || echo 0)"
