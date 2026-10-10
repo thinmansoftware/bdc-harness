@@ -36,6 +36,77 @@ if [ "$(id -u)" = "0" ]; then
       echo "[archon] WARN: failed to copy /run/secrets/cursor-config into /home/appuser/.cursor -- cursor judge rung / provider will report Authentication required unless CURSOR_API_KEY is set" >&2
     fi
   fi
+  # WO-HARNESS-CAULDRON-CREDS-BIND-MOUNT-01: seed the Claude OAuth credential from
+  # the read-only host mount at /run/secrets/claude-creds.
+  #
+  # Why this exists: the Claude SDK reads os.homedir()/.claude/.credentials.json.
+  # This container runs the server as appuser BUT the SDK resolves HOME=/root for
+  # the spawned Claude process (CLAUDE_USE_GLOBAL_AUTH=true), so the credential the
+  # lanes actually use is /root/.claude/.credentials.json. That path lives in the
+  # image layer with no volume behind it, so EVERY `docker compose build app` or
+  # --force-recreate wipes it and every build lane dies with "Not logged in".
+  #
+  # Anchor: 2026-09-16 -- two routine config recreates (a judge-ladder change and a
+  # judge-model change) silently killed the build lanes for 18 hours. Every health
+  # signal stayed green; a human reported it, not the machine. The fix was filed as
+  # this WO on 2026-05-28 and sat unbuilt for ~9 months while operators hand-copied
+  # credentials after each rebuild (doctrine/cauldron-creds-target-root-not-appuser).
+  #
+  # Same shape as the cursor seed above: a read-only mount is COPIED in rather than
+  # mounted over the live path, because the SDK rewrites .credentials.json in place
+  # when it refreshes the token. Mounting read-only would break that refresh; a
+  # writable mount would let the container's refreshed token flow back to the host,
+  # which is desirable but is a separate decision (see the WO's follow-up section).
+  # The /dev/null default is a char device, not a directory, so it is skipped.
+  # A log WARN is not detection -- an unread warning is exactly how 18 hours passed
+  # on 2026-09-16. Mirror the GitHub auth pre-flight below and write a machine-readable
+  # status to /tmp so healthcheck/monitoring wiring can assert on it rather than on
+  # process liveness. Values: ok | seed-failed | unmounted | missing.
+  # TWO consumers, TWO paths, and ownership matters as much as location:
+  #   - the SDK binary spawned for a lane resolves HOME=/root, so it reads
+  #     /root/.claude/.credentials.json (CLAUDE_USE_GLOBAL_AUTH=true)
+  #   - the server's own auth-refresh (packages/providers/src/auth-refresh/claude.ts)
+  #     calls os.homedir(), and the server runs as APPUSER, so it reads
+  #     /home/appuser/.claude/.credentials.json
+  # Seed both. The appuser copy MUST be chowned appuser: a 0600 file owned by root is
+  # unreadable to it, readCreds() treats unreadable as absent, and every lane fails
+  # with "Cauldron auth for claude is dead (reason: no_refresh_token)" while
+  # `claude auth status` still reports loggedIn:true. Verified live 2026-09-16 --
+  # a hand `docker cp` left both copies root-owned and produced exactly that.
+  # The .claude DIRECTORY must be appuser-owned too: refreshClaude() writes
+  # .refresh.lock beside the credential.
+  if [ -d /run/secrets/claude-creds ] && [ -f /run/secrets/claude-creds/.credentials.json ]; then
+    mkdir -p /root/.claude /home/appuser/.claude
+    _seed_ok=1
+    if cp -a /run/secrets/claude-creds/.credentials.json /root/.claude/.credentials.json 2>/dev/null; then
+      chown root:root /root/.claude/.credentials.json
+      chmod 600 /root/.claude/.credentials.json
+    else
+      _seed_ok=0
+    fi
+    if cp -a /run/secrets/claude-creds/.credentials.json /home/appuser/.claude/.credentials.json 2>/dev/null; then
+      chown appuser:appuser /home/appuser/.claude /home/appuser/.claude/.credentials.json
+      chmod 600 /home/appuser/.claude/.credentials.json
+    else
+      _seed_ok=0
+    fi
+    if [ "$_seed_ok" = "1" ]; then
+      echo "[archon] Claude credential seeded from /run/secrets/claude-creds to /root/.claude (SDK) and /home/appuser/.claude (auth-refresh)" >&2
+      echo "ok" > /tmp/claude-creds.status
+    else
+      echo "[archon] ERROR: failed to seed /run/secrets/claude-creds/.credentials.json to both /root/.claude and /home/appuser/.claude -- Claude build lanes will fail until it is installed by hand" >&2
+      echo "seed-failed" > /tmp/claude-creds.status
+    fi
+    unset _seed_ok
+  elif [ -f /root/.claude/.credentials.json ] || [ -f /home/appuser/.claude/.credentials.json ]; then
+    # Works today, but dies on the next rebuild -- that is the whole defect this
+    # mount exists to close, so it is not an "ok" state.
+    echo "[archon] WARN: Claude credential present at /root/.claude but NO host mount configured -- it will be WIPED by the next rebuild or --force-recreate. Set CLAUDE_CREDS_HOST_PATH in .env." >&2
+    echo "unmounted" > /tmp/claude-creds.status
+  else
+    echo "[archon] ERROR: no Claude credential at /root/.claude and no /run/secrets/claude-creds mount -- ALL Claude build lanes will fail with 'Not logged in' while every health check stays green. Set CLAUDE_CREDS_HOST_PATH in .env. See doctrine/cauldron-creds-target-root-not-appuser." >&2
+    echo "missing" > /tmp/claude-creds.status
+  fi
   # WO-168 Tier 1: /host-artifacts is a host bind mount for load-bearing
   # workflow output (git bundles, raw artifacts). Workflow nodes run as
   # appuser, so we must own it. Best-effort: if the mount is missing
