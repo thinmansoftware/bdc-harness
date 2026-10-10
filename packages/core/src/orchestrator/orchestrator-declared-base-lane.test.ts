@@ -134,7 +134,16 @@ mock.module('../escalation', () => ({
     })
   ),
 }));
+class CauldronDrainingError extends Error {
+  readonly code = 'cauldron_draining' as const;
+  constructor() {
+    super('cauldron_draining');
+    this.name = 'CauldronDrainingError';
+  }
+}
+
 mock.module('../db/workflows', () => ({
+  CauldronDrainingError,
   listWorkflowRuns: mock(() => Promise.resolve([])),
   updateWorkflowRun: mock(() => Promise.resolve()),
 }));

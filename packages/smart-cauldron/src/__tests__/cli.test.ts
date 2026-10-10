@@ -57,6 +57,10 @@ describe('statusToExitCode', () => {
     expect(statusToExitCode('infra-alert')).toBe(3);
   });
 
+  test('drain-deferred maps to 11', () => {
+    expect(statusToExitCode('drain-deferred')).toBe(11);
+  });
+
   test('spec-repair maps to distinct non-zero code 4', () => {
     expect(statusToExitCode('spec-repair')).toBe(4);
     expect(statusToExitCode('spec-repair')).not.toBe(statusToExitCode('won'));
