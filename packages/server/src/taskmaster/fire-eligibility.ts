@@ -1,5 +1,6 @@
 import { listCodebases } from '@archon/core/db/codebases';
 import { createHash } from 'crypto';
+import { serviceGitHubToken } from '../github-service-request';
 import {
   freezeWorkOrderSource,
   type ExpectedSpecIdentity,
@@ -32,10 +33,6 @@ export interface FireEligibilityDeps {
 }
 
 const WO_ID_RE = /\b(WO-[A-Z][A-Z0-9-]*-\d+)\b/;
-
-function githubToken(): string | undefined {
-  return process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-}
 
 function headers(token: string): Record<string, string> {
   return {
@@ -72,7 +69,7 @@ export async function checkFireEligibility(
   // resolveWorkOrderSource, so the token is resolved and asserted here instead.
   // Unauthenticated canonical reads would break private-repo access and burn
   // the 60/hr anonymous rate limit.
-  const token = deps.githubToken ?? githubToken();
+  const token = deps.githubToken ?? (await serviceGitHubToken('taskmaster'));
   if (!token) return { eligible: false, reason: 'github_auth_missing' };
   let frozen;
   try {

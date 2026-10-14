@@ -23,10 +23,9 @@
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {
+    "@archon/core": "workspace:*",
     "@archon/overseer": "workspace:*",
     "@archon/paths": "workspace:*"
   },
-  "devDependencies": {
-    "@archon/core": "workspace:*"
-  }
+  "devDependencies": {}
 }

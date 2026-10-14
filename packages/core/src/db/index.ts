@@ -42,3 +42,4 @@ export * from './overseer-capabilities';
 export * from './overseer-briefing';
 export * from './overseer-required-contexts';
 export * from './taskmaster';
+export * from './github-api';

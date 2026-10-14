@@ -9,6 +9,8 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import type { PollResult } from './types.js';
+import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
+import { mintServiceGitHubToken } from '@archon/core/github/token-minter';
 
 const execFileAsync = promisify(execFile);
 
@@ -566,7 +568,19 @@ async function findExistingPrForBranch(
  * Injectable exec seam for testing the exact gh invocation without replacing
  * child_process globally.
  */
-type ExecFileFn = (command: string, args: string[]) => Promise<{ stdout: string; stderr: string }>;
+type ExecFileFn = (
+  command: string,
+  args: string[],
+  options?: { env?: NodeJS.ProcessEnv }
+) => Promise<{ stdout: string; stderr: string }>;
+
+export async function smartCauldronGhEnv(
+  env: NodeJS.ProcessEnv = process.env
+): Promise<NodeJS.ProcessEnv> {
+  const auth = resolveServiceGitHubAuth('smart_cauldron', { env });
+  if (auth.kind === 'none') return { ...env };
+  return { ...env, GH_TOKEN: (await mintServiceGitHubToken(auth)).token };
+}
 
 /** Default `gh pr list --head <branch> --repo <repo>` production lookup. */
 export async function ghPrListForBranchDefault(
@@ -582,20 +596,24 @@ export async function ghPrListForBranchDefault(
     return null;
   }
   try {
-    const { stdout } = await execFn('gh', [
-      'pr',
-      'list',
-      '--repo',
-      repo,
-      '--head',
-      branch,
-      '--state',
-      'open',
-      '--json',
-      'url',
-      '--jq',
-      '.[0].url // empty',
-    ]);
+    const { stdout } = await execFn(
+      'gh',
+      [
+        'pr',
+        'list',
+        '--repo',
+        repo,
+        '--head',
+        branch,
+        '--state',
+        'open',
+        '--json',
+        'url',
+        '--jq',
+        '.[0].url // empty',
+      ],
+      { env: await smartCauldronGhEnv() }
+    );
     const url = stdout.trim();
     return url.length > 0 ? url : null;
   } catch (err) {
@@ -654,15 +672,11 @@ function nonEmptyModelField(value: unknown): string | null {
  */
 async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
   try {
-    const { stdout } = await execFileAsync('gh', [
-      'pr',
-      'view',
-      prUrl,
-      '--json',
-      'mergeable',
-      '--jq',
-      '.mergeable',
-    ]);
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['pr', 'view', prUrl, '--json', 'mergeable', '--jq', '.mergeable'],
+      { env: await smartCauldronGhEnv() }
+    );
     const val = stdout.trim().toUpperCase();
     if (val === 'MERGEABLE') return true;
     if (val === 'CONFLICTING' || val === 'BLOCKED') return false;

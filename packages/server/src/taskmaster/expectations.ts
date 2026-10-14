@@ -145,8 +145,9 @@ export function nextPageUrl(linkHeader: string | null | undefined): string | nul
   return null;
 }
 
-function githubHeaders(): Record<string, string> {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+async function githubHeaders(): Promise<Record<string, string>> {
+  const { serviceGitHubToken } = await import('../github-service-request');
+  const token = await serviceGitHubToken('taskmaster');
   return {
     accept: 'application/vnd.github+json',
     ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -172,7 +173,7 @@ export async function checkEvidence(
     let url: string | null =
       `https://api.github.com/repos/${spec.repo}/issues/${spec.number}/comments?per_page=100`;
     for (let page = 1; url && page <= MAX_COMMENT_PAGES; page += 1) {
-      const response = await fetchImpl(url, { headers: githubHeaders() });
+      const response = await fetchImpl(url, { headers: await githubHeaders() });
       if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
       const comments = (await response.json()) as {
         html_url?: string;
@@ -213,7 +214,7 @@ export async function checkEvidence(
   if (spec.kind === 'label_present') {
     const response = await fetchImpl(
       `https://api.github.com/repos/${spec.repo}/issues/${spec.number}`,
-      { headers: githubHeaders() }
+      { headers: await githubHeaders() }
     );
     if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
     const issue = (await response.json()) as {
@@ -232,7 +233,7 @@ export async function checkEvidence(
       : `in:title ${spec.title_prefix ?? ''}`;
     const response = await fetchImpl(
       `https://api.github.com/search/issues?q=${encodeURIComponent(`repo:${spec.repo} is:pr is:open ${qualifier}`)}`,
-      { headers: githubHeaders() }
+      { headers: await githubHeaders() }
     );
     if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
     const result = (await response.json()) as {

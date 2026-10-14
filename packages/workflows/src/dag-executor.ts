@@ -17,7 +17,19 @@ import {
   win32 as win32Path,
 } from 'path';
 import { execFileAsync } from '@archon/git';
+import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
+import { mintServiceGitHubToken } from '@archon/core/github/token-minter';
 import { discoverScriptsForCwd } from './script-discovery';
+
+export async function buildRunNodeEnv(
+  envVars?: Record<string, string>
+): Promise<Record<string, string> | undefined> {
+  const combined = { ...process.env, ...(envVars ?? {}) };
+  const auth = resolveServiceGitHubAuth('run_nodes', { env: combined });
+  if (auth.kind === 'none') return envVars;
+  const token = await mintServiceGitHubToken(auth);
+  return { ...(envVars ?? {}), GH_TOKEN: token.token };
+}
 import { resolveModelForNode, type ModelOverride } from './model-override';
 import type {
   IWorkflowPlatform,
@@ -5824,7 +5836,7 @@ async function executeDagWorkflowInternal(
               docsDir,
               nodeOutputs,
               issueContext,
-              config.envVars,
+              await buildRunNodeEnv(config.envVars),
               resolvedInputs
             );
             return { nodeId: node.id, output };
@@ -6053,7 +6065,7 @@ async function executeDagWorkflowInternal(
               docsDir,
               nodeOutputs,
               issueContext,
-              config.envVars
+              await buildRunNodeEnv(config.envVars)
             );
             return { nodeId: node.id, output };
           }

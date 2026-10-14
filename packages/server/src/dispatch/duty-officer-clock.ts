@@ -15,6 +15,8 @@ import {
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
+import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
+import { serviceGitHubFetch } from '../github-service-request';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
 import {
   mintAppInstallationToken,
@@ -96,8 +98,7 @@ export interface DutyOfficerClockDeps {
 }
 
 export function githubToken(): string | null {
-  const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
-  return token ? token : null;
+  return resolveServiceGitHubAuth('duty_officer').kind === 'none' ? null : 'configured';
 }
 
 export function githubNudgeEnabled(): boolean {
@@ -167,11 +168,9 @@ async function githubJson<T>(
   path: string,
   options?: { method?: string; extraHeaders?: Record<string, string>; body?: string }
 ): Promise<T> {
-  const token = githubToken();
-  if (!token) throw new Error('duty_officer_github_token_missing');
+  if (!githubToken()) throw new Error('duty_officer_github_token_missing');
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
     'User-Agent': 'bdc-harness-duty-officer-clock',
     'X-GitHub-Api-Version': '2022-11-28',
   };
@@ -180,7 +179,7 @@ async function githubJson<T>(
       headers[key] = options.extraHeaders[key];
     }
   }
-  const response = await fetch(`https://api.github.com${path}`, {
+  const response = await serviceGitHubFetch('duty_officer', `https://api.github.com${path}`, {
     method: options?.method,
     headers,
     body: options?.body,

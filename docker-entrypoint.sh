@@ -83,6 +83,10 @@ done
 # in this fork -- see WO-HARNESS-CONTAINER-GITHUB-AUTH-BOUNDARY-01 / #171).
 # Uses a helper function so the token stays in the environment, not in ~/.gitconfig.
 _GH_AUTH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+# Run-node App tokens are intentionally minted per child by the workflow
+# executor. Keep this process-level token as the PAT fallback; exporting an App
+# installation token here would leak the run_nodes identity to unrelated human
+# and interactive sessions.
 if [ -n "$_GH_AUTH_TOKEN" ]; then
   # Export both names so child processes (gh CLI, bun workflow nodes spawning git)
   # find whichever they look for. The credential helper reads GH_AUTH_TOKEN_INTERNAL

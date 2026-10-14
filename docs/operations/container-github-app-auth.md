@@ -181,3 +181,35 @@ Not part of this WO, but the outcome to confirm later (WO section 8): an APPROVE
 review exists on a real PR, authored by `thinman-overseer[bot]`, on a PR that
 `bluedevilcollectibles` opened. Until that row exists somewhere observable, the
 capability is built but dark.
+
+## Per-service identities and quota pools
+
+`packages/core/src/github/service-identity.ts` is the source of truth. The first complete match wins; a partially configured App entry throws and names every missing variable.
+
+| Service | Precedence |
+|---|---|
+| overseer | `GITHUB_APP_OVERSEER_*`, shared `GITHUB_APP_*`, PAT |
+| pr_discovery | `GITHUB_APP_PR_DISCOVERY_*`, shared `GITHUB_APP_*`, PAT |
+| merge_manager | `GITHUB_APP_MERGE_MANAGER_*`, `MERGE_MANAGER_GH_TOKEN`, no merge identity (HOLD) |
+| taskmaster | `GITHUB_APP_TASKMASTER_*`, PAT |
+| duty_officer | `GITHUB_APP_DUTY_OFFICER_*`, `GITHUB_APP_TASKMASTER_*`, PAT |
+| smart_cauldron | `GITHUB_APP_SMART_CAULDRON_*`, `GITHUB_APP_TASKMASTER_*`, PAT |
+| run_nodes | `GITHUB_APP_RUN_NODES_*`, `GITHUB_APP_TASKMASTER_*`, PAT |
+
+Each `*` trio is `ID`, `INSTALLATION_ID`, and `PRIVATE_KEY_PATH` (or the supported inline `PRIVATE_KEY`). The Taskmaster trio is an explicit alias for Duty Officer, Smart Cauldron, and run nodes. Merge Manager and the Taskmaster family never select the shared Overseer App. With no new service variables set, behavior is unchanged. Pool labels contain only App and installation IDs (for example `app-4572556-153246775`) or `user-pat`. Services sharing an installation share rate-limit backoff by pool and resource (`core`, `search`, or `graphql`). A 403 `Resource not accessible by integration` retries only that call with the PAT and increments the visible permission-fallback counter.
+
+```dotenv
+GITHUB_APP_MERGE_MANAGER_ID=
+GITHUB_APP_MERGE_MANAGER_INSTALLATION_ID=
+GITHUB_APP_MERGE_MANAGER_PRIVATE_KEY_PATH=
+GITHUB_APP_TASKMASTER_ID=
+GITHUB_APP_TASKMASTER_INSTALLATION_ID=
+GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH=
+```
+
+### HUMAN-STEPS
+
+1. Confirm that XO/the host already holds a private key for thinmangithub (App 4572556). The only key file found in the reference directory is the thinman-overseer one. If none exists: GitHub org Settings, Developer settings, GitHub Apps, thinmangithub, "Generate a private key", and save the .pem straight to the Hetzner host at /opt/bdc/archon/secrets/thinmangithub-app.private-key.pem with mode 0600. Never paste key contents into chat, an issue, or git.
+2. Check thinmangithub's permissions include Contents RW, Pull requests RW and Issues RW (it lists them today, access level unverified) and that it is allowed to merge into protected bases (allowed merge actor or bypass actor, John's call, because merge must stay a different actor than the reviewing Overseer App per M-153). Optional: if John prefers Overseer also to read issues, add Issues Read to thinman-overseer (App settings, Permissions); not required.
+3. Set these env var NAMES in the archon .env on the host (values are the ids and the in-container key path, none are secret except the key file itself): GITHUB_APP_MERGE_MANAGER_ID=4572556, GITHUB_APP_MERGE_MANAGER_INSTALLATION_ID=153246775, GITHUB_APP_MERGE_MANAGER_PRIVATE_KEY_PATH, GITHUB_APP_TASKMASTER_ID=4572556, GITHUB_APP_TASKMASTER_INSTALLATION_ID=153246775, GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH (this one trio is the documented alias also used by duty_officer, smart_cauldron and run_nodes; a GITHUB_APP_<SERVICE>_* trio overrides it for that service). Overseer and pr_discovery keep the existing GITHUB_APP_ID trio unchanged.
+4. XO rebuilds archon-app-1 after the harness merge (M-181 plan) and notifies John; nothing activates until the env names are set, so merging the code first is safe.

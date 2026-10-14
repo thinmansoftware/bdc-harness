@@ -16,6 +16,7 @@
 import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
+import { getGitHubApiDigest } from '@archon/core/db/github-api';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldron/headroom';
 import {
@@ -41,6 +42,7 @@ import {
   usefulRateFloorBreached,
 } from './rules';
 import { dutyOfficerClockEnabled } from '../dispatch/duty-officer-clock';
+import { serviceGitHubToken } from '../github-service-request';
 import { validateProposal, WO_ID_RE, type TmAllowedRecipient } from './guard';
 import {
   buildEscalationCommentBody,
@@ -452,7 +454,7 @@ export async function defaultListThreads(
     .split(',')
     .map(r => r.trim())
     .filter(Boolean);
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  const token = await serviceGitHubToken('taskmaster');
   const threads: ListedThread[] = [];
   const unlabelledPriorityTriage: string[] = [];
   let prClaimLookups = 0;
@@ -574,8 +576,8 @@ interface GithubIssueEvent {
   label?: { name?: string } | null;
 }
 
-function githubHeaders(): Record<string, string> {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+async function githubHeaders(): Promise<Record<string, string>> {
+  const token = await serviceGitHubToken('taskmaster');
   return {
     accept: 'application/vnd.github+json',
     ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -608,7 +610,7 @@ async function lookupOpenPrClaim(
   const query = `is:pr is:open in:title,body ${woId} org:${owner}`;
   const url = `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=1`;
   try {
-    const response = await fetchImpl(url, { headers: githubHeaders() });
+    const response = await fetchImpl(url, { headers: await githubHeaders() });
     if (!response.ok) {
       throw new PrClaimLookupError(response.status);
     }
@@ -687,7 +689,7 @@ export async function defaultGetGithubIssueEvidence(
   const issueNumber = match[2];
   const issueResponse = await fetchImpl(
     `https://api.github.com/repos/${repo}/issues/${issueNumber}`,
-    { headers: githubHeaders() }
+    { headers: await githubHeaders() }
   );
   assertGithubRateLimit(issueResponse, `evidence:issue:${repo}#${issueNumber}`);
   if (!issueResponse.ok) {
@@ -698,7 +700,7 @@ export async function defaultGetGithubIssueEvidence(
   // memory; adoption needs the latest marker regardless of age.
   const commentsResponse = await fetchImpl(
     `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?per_page=100`,
-    { headers: githubHeaders() }
+    { headers: await githubHeaders() }
   );
   assertGithubRateLimit(commentsResponse, `evidence:comments:${repo}#${issueNumber}`);
   if (!commentsResponse.ok) {
@@ -709,7 +711,7 @@ export async function defaultGetGithubIssueEvidence(
   const comments = (await commentsResponse.json()) as GithubIssueComment[];
   const eventsResponse = await fetchImpl(
     `https://api.github.com/repos/${repo}/issues/${issueNumber}/events?per_page=100`,
-    { headers: githubHeaders() }
+    { headers: await githubHeaders() }
   );
   assertGithubRateLimit(eventsResponse, `evidence:events:${repo}#${issueNumber}`);
   if (!eventsResponse.ok) {
@@ -796,13 +798,13 @@ export function buildSelfPauseNotice(
  * one `outcome='sent'` row per day and zero self-pause events in that window. Retirement is
  * a board decision, not an automatic expiry -- the code MUST NOT self-disable.
  */
-function digestProposal(
+async function digestProposal(
   actions24h: taskmasterDb.TmJournalEntry[],
   control: taskmasterDb.TmControlState,
   nowMs: number,
   expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>,
   unlabelledPriorityTriage: string[] = []
-): ActionProposal {
+): Promise<ActionProposal> {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
   const digestActions = actions24h.filter(action => action.thread_ref !== 'taskmaster:reset');
   const outcomeCount = (outcome: taskmasterDb.TmActionOutcome): number =>
@@ -827,6 +829,29 @@ function digestProposal(
   const triageSummary = unlabelledPriorityTriage.length
     ? ` Needs priority triage: ${unlabelledPriorityTriage.join(', ')}.`
     : '';
+  let githubSummary = '';
+  try {
+    const github = await getGitHubApiDigest();
+    const usage = github.usage
+      .map(
+        row =>
+          `${row.service} (pool ${row.poolId}) ${row.averageCallsPerHour.toFixed(1)} avg calls/h, ${row.peakCallsPerHour} peak calls/h`
+      )
+      .join('; ');
+    const pools = github.pools
+      .map(row => `${row.poolId}/${row.resource} ${row.remaining}/${row.limit}`)
+      .join('; ');
+    const warnings = github.pools
+      .filter(row => row.limit > 0 && row.remaining / row.limit < 0.2)
+      .map(
+        row =>
+          `GITHUB-QUOTA-LOW ${row.poolId}/${row.resource} (${(github.memberships.get(`${row.poolId}/${row.resource}`) ?? []).join(', ')})`
+      )
+      .join(' ');
+    githubSummary = ` GitHub API last 24h by service: ${usage || 'none'}. GitHub API pools: ${pools || 'none'}.${warnings ? ` ${warnings}` : ''}`;
+  } catch {
+    githubSummary = ' GitHub API metering unavailable.';
+  }
   return {
     type: 'digest',
     threadRef: `digest:${dateKey}`,
@@ -837,7 +862,7 @@ function digestProposal(
       `Taskmaster daily canary for ${dateKey}: state=${control.pause_state}, ` +
       `scope=${control.pause_scope ?? 'none'}, actor=${control.pause_actor ?? 'none'}, ` +
       `updated_at=${control.updated_at}; ${summary}; ${pauseDetail}.` +
-      `${expectationSummary}${triageSummary} ` +
+      `${expectationSummary}${triageSummary}${githubSummary} ` +
       'Pause/resume/status runbook: xo-wiki/wiki/tools/taskmaster/_index.md.',
     idempotencyKey: `tm:digest:${dateKey}`,
     actsImmediately: true,
@@ -1712,7 +1737,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.expectation_counts_failed');
   }
-  const digest = digestProposal(
+  const digest = await digestProposal(
     actions24h,
     control,
     nowMs,
