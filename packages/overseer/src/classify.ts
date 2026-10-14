@@ -263,6 +263,27 @@ export function classifyError(input: ClassifyInput): ErrorClass {
     return 'commit_hook_lint_failure';
   }
 
+  // SECOND (final) commit-hook failure. The attempt-2 rejection does NOT surface
+  // from commit-and-push: that node exits 0 with a COMMIT_HOOK_FAILED=true marker
+  // to hand the run to the one bounded repair pass, so the dead end is reported by
+  // the load_bearing commit-hook-gate (or by commit-hook-retry when it hard-fails
+  // its push/verify). Without this rule the unrepaired hook failure classified as
+  // `unknown`, losing both the class and the attempt-2 blocker semantics that
+  // decide() keys on.
+  //
+  // Gated on POSITIVE evidence, not on the node id alone: the lane emits the
+  // literal `commit_hook_lint_failure` token ONLY on the path where
+  // commit-and-push actually reported a pre-commit hook rejection. Any other
+  // failure of these nodes (a missing branch, a push failure, a non-hook commit
+  // error) carries no such token and is left to the generic classes, where the
+  // load-bearing dead-end rule still escalates it to XO.
+  if (
+    (input.nodeId === 'commit-hook-gate' || input.nodeId === 'commit-hook-retry') &&
+    /commit_hook_lint_failure/i.test(rawMessage)
+  ) {
+    return 'commit_hook_lint_failure';
+  }
+
   // --- Provider/network classes (ported from router.py) ---
 
   if (

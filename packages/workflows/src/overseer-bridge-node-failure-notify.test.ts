@@ -442,6 +442,69 @@ describe('handleNodeFailure node-failure Dispatch notification', () => {
     );
   });
 
+  test('18 the gate dead end is classified commit_hook_lint_failure at attempt 2', async () => {
+    // The attempt-2 rejection is reported by the load_bearing commit-hook-gate, whose
+    // bash failure site carries no retry counter (ctx.attempt defaults to 1). The lane
+    // stamps the real attempt from the commit-core's own counter as
+    // commit_hook_attempt=2; without honouring it, decide() would answer this dead end
+    // with "feed the hook output back for one bounded repair pass" -- the pass that
+    // already ran -- and would not mark it a blocker.
+    const run = makeRun({ id: 'run-18' });
+    const gateError = [
+      'COMMIT_HOOK_GATE=failed',
+      'commit_hook_lint_failure: the husky pre-commit lint/format hook rejected the commit and the one bounded repair pass did not clear it (commit_hook_attempt=2); operator triage required.',
+    ].join('\n');
+    const result = await handleNodeFailure(
+      {
+        store: makeStore(),
+        emitter: { emit: () => undefined },
+        log: makeLog({ errors: [] }),
+        logNodeError: () => Promise.resolve(),
+      },
+      run,
+      loadBearingNode('commit-hook-gate'),
+      { ...baseCtx, errorMsg: gateError }
+    );
+    // Classified as the hook class (not `unknown`) and escalated.
+    expect(result.errorClass).toBe('commit_hook_lint_failure');
+    expect(result.decision).toBe('escalate');
+
+    // Attempt 2 semantics: the duty-officer message reports attempt 2 and blocker,
+    // and XO is messaged at priority blocker.
+    const duty = await dispatchRows('overseer-node-failure:run-18:commit-hook-gate');
+    expect(duty).toHaveLength(1);
+    expect(duty[0]!.body).toContain('commit_hook_lint_failure');
+    expect(duty[0]!.body).toContain('attempt: 2');
+    expect(duty[0]!.body).toContain('blocker: yes');
+    const xo = await dispatchRows('overseer-node-failure-blocker:run-18:commit-hook-gate');
+    expect(xo).toHaveLength(1);
+    expect(xo[0]!.recipient).toBe('xo');
+    expect(xo[0]!.priority).toBe('blocker');
+  });
+
+  test('18 a first-attempt hook failure is still attempt 1 (token never downgrades)', async () => {
+    // No attempt token in the message -> the caller's attempt stands, so the FIRST
+    // commit-and-push rejection keeps its repairable-once, non-blocker semantics.
+    const run = makeRun({ id: 'run-18b' });
+    await handleNodeFailure(
+      {
+        store: makeStore(),
+        emitter: { emit: () => undefined },
+        log: makeLog({ errors: [] }),
+        logNodeError: () => Promise.resolve(),
+      },
+      run,
+      node('commit-and-push'),
+      { ...baseCtx, errorMsg: HOOK_ERROR, attempt: 1 }
+    );
+    const duty = await dispatchRows('overseer-node-failure:run-18b:commit-and-push');
+    expect(duty).toHaveLength(1);
+    expect(duty[0]!.body).toContain('attempt: 1');
+    expect(
+      await dispatchRows('overseer-node-failure-blocker:run-18b:commit-and-push')
+    ).toHaveLength(0);
+  });
+
   test('15 a skip decision creates no node-failure Dispatch message', async () => {
     const run = makeRun({ id: 'run-15' });
     const result = await handleNodeFailure(

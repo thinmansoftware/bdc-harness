@@ -201,22 +201,65 @@ export async function recordUnverifiedApprovalVerdict(
   // row can NEVER be inserted alongside the merge-ready one. If we returned here the
   // stale merge-ready verdict would stay actionable and the merge bridge would merge
   // an approval the reviewer could not verify. Instead, DOWNGRADE the existing row in
-  // place to the held, non-mergeable state. An already-actioned row (actioned_at set)
-  // is left untouched -- that merge has happened and must not be rewritten.
+  // place to the held, non-mergeable state.
   const getVerdicts = deps.getVerdictsForRun ?? getOverseerVerdictsForRun;
-  const existing = (await getVerdicts(runId)).find(
-    row => row.head_sha === input.headSha && row.actioned_at === null
-  );
-  if (!existing) return;
-  if (existing.verdict === 'approved_unverified' && existing.proposed_action === 'none') return;
-  await deps.finalizeVerdict({
-    verdictId: existing.id,
-    status: 'verdict',
-    verdict: 'approved_unverified',
-    proposedAction: 'none',
-    model: input.model,
-    prUrl,
-  });
+  const rowsForRun = await getVerdicts(runId);
+  const forHead = rowsForRun.filter(row => row.head_sha === input.headSha);
+  const unclaimed = forHead.find(row => row.actioned_at === null);
+  if (unclaimed) {
+    if (unclaimed.verdict === 'approved_unverified' && unclaimed.proposed_action === 'none') return;
+    await deps.finalizeVerdict({
+      verdictId: unclaimed.id,
+      status: 'verdict',
+      verdict: 'approved_unverified',
+      proposedAction: 'none',
+      model: input.model,
+      prUrl,
+    });
+    return;
+  }
+
+  // No unclaimed row for this head. `actioned_at` being set means two very different
+  // things, and conflating them is what let an unverified approval merge:
+  //
+  //   action_reason === 'processing'  -> the merge bridge has CLAIMED this row and is
+  //        mid-flight RIGHT NOW. Rewriting it would not stop that merge (the bridge
+  //        already holds the row in memory) and would corrupt the bridge's state
+  //        machine, whose recordOutcome UPDATE is itself predicated on
+  //        action_reason = 'processing'. The hold cannot be applied by a row rewrite
+  //        here, so do NOT pretend it was: say so loudly and let the caller escalate.
+  //        The bridge's own post-claim re-read is what catches the ordering where the
+  //        downgrade lands first; this branch is the residual window where it does not.
+  //
+  //   anything else                   -> the merge already resolved (merged or skipped).
+  //        That outcome is history and must not be rewritten.
+  const claimedInFlight = forHead.find(row => row.action_reason === 'processing');
+  if (claimedInFlight) {
+    log.error(
+      {
+        owner: input.owner,
+        repo: input.repo,
+        prNumber: input.prNumber,
+        headSha: input.headSha,
+        verdictId: claimedInFlight.id,
+      },
+      'overseer.review.unverified_hold_lost_race_to_merge_claim'
+    );
+    return;
+  }
+  if (forHead.length > 0) {
+    log.warn(
+      {
+        owner: input.owner,
+        repo: input.repo,
+        prNumber: input.prNumber,
+        headSha: input.headSha,
+        verdictId: forHead[0]?.id,
+        actionReason: forHead[0]?.action_reason,
+      },
+      'overseer.review.unverified_hold_skipped_already_actioned'
+    );
+  }
 }
 
 /** Idempotency key for the single bounded re-review of an unverified approval. */

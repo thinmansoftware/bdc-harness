@@ -255,6 +255,39 @@ describe('unverified approval end-to-end (WO node-failure-repair)', () => {
     expect(rows.filter(r => r.proposed_action === 'flag_merge_ready')).toHaveLength(0);
   });
 
+  test('23b a merge-claimed row is NOT rewritten, and the hold is reported as lost', async () => {
+    // A verified approval records the merge-ready verdict...
+    await runAndSubmitReview(work('msg-23b1'), deps([], 'APPROVE'));
+    let rows = await db.query<{ id: string; action_reason: string | null }>(
+      'SELECT id, action_reason FROM overseer_verdicts WHERE head_sha = $1',
+      [HEAD]
+    );
+    expect(rows.rows).toHaveLength(1);
+    const verdictId = rows.rows[0]!.id;
+
+    // ...and the merge bridge CLAIMS it (actioned_at set, action_reason
+    // 'processing') before the later review comes back unverified. The bridge now
+    // holds that row in memory, so rewriting the database row here cannot stop the
+    // in-flight merge and would corrupt the bridge's state machine, whose
+    // recordOutcome UPDATE is predicated on action_reason = 'processing'.
+    const { claimVerdictForMergeExecution } = await import('@archon/core/db/overseer');
+    expect(await claimVerdictForMergeExecution(verdictId)).toBe(true);
+
+    await runAndSubmitReview(work('msg-23b2'), deps([], 'APPROVE_UNVERIFIED', 'sandbox failed'));
+
+    // The claimed row is left intact for the bridge to resolve -- NOT downgraded
+    // underneath it, and NOT silently treated as if the hold had been applied.
+    rows = await db.query<{ id: string; action_reason: string | null }>(
+      'SELECT id, action_reason FROM overseer_verdicts WHERE head_sha = $1',
+      [HEAD]
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]!.action_reason).toBe('processing');
+
+    // The unverified outcome still escalates: the bounded re-review is enqueued.
+    expect(await reviewWorkItems()).toHaveLength(1);
+  });
+
   test('22 the verified path writes no duty-officer unverified escalation', async () => {
     const prefix = `overseer-review-unverified:${OWNER}/${REPO}#${PR}:${HEAD}`;
     await runAndSubmitReview(work('msg-22v'), deps([], 'APPROVE'));

@@ -119,13 +119,42 @@ export interface HandleNodeFailureResult {
  * Returns a NodeOutput the caller returns directly. The caller remains responsible for
  * site-specific housekeeping (throttle-map cleanup, etc).
  */
+/**
+ * Attempt number the lane reports for a commit-hook failure, as the literal
+ * `commit_hook_attempt=<n>` token.
+ */
+const COMMIT_HOOK_ATTEMPT_PATTERN = /commit_hook_attempt=(\d{1,3})\b/i;
+
+/**
+ * Effective attempt for a commit-hook lint failure.
+ *
+ * Bash node-failure sites do not carry a retry counter, so `ctx.attempt` is 1 at
+ * every one of them. For `commit_hook_lint_failure` that default is WRONG on the
+ * second failure: decide() keys the blocker on `attempt >= 2`, so a dead-ended
+ * hook failure reported with attempt 1 would be answered with "feed the hook
+ * output back for one bounded repair pass" even though that pass already ran.
+ *
+ * The lane therefore stamps the real attempt count -- taken from the commit-core's
+ * own attempt file, i.e. the number of times `git commit` actually ran -- into the
+ * failure text as `commit_hook_attempt=<n>`. Honour it only for this class, and
+ * only when it is HIGHER than the caller's value, so the token can escalate the
+ * attempt but never silently downgrade a real retry counter.
+ */
+function effectiveCommitHookAttempt(errorClass: string, errorMsg: string, attempt: number): number {
+  if (errorClass !== 'commit_hook_lint_failure') return attempt;
+  const match = COMMIT_HOOK_ATTEMPT_PATTERN.exec(errorMsg);
+  const raw = match?.[1];
+  if (raw === undefined) return attempt;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > attempt ? parsed : attempt;
+}
+
 export async function handleNodeFailure(
   deps: HandleNodeFailureDeps,
   workflowRun: WorkflowRun,
   node: DagNode,
   ctx: HandleNodeFailureContext
 ): Promise<HandleNodeFailureResult> {
-  const attempt = ctx.attempt ?? 1;
   const hasOutput = ctx.hasOutput ?? false;
 
   const errorClass = classifyError({
@@ -138,6 +167,8 @@ export async function handleNodeFailure(
     threadCommitsAhead: ctx.threadCommitsAhead,
     hasOriginBranch: ctx.hasOriginBranch,
   });
+
+  const attempt = effectiveCommitHookAttempt(errorClass, ctx.errorMsg, ctx.attempt ?? 1);
 
   const result = decide({
     errorClass,

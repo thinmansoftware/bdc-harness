@@ -58,6 +58,13 @@ export type MergeExecutionRepoConfig = Readonly<Record<string, { readonly baseBr
 export interface MergeExecutionBridgeStore {
   listUnactionedVerdicts(): Promise<OverseerVerdictRow[]>;
   claimVerdict(verdictId: string): Promise<boolean>;
+  /**
+   * Fresh read of every verdict row for a run, used for the post-claim re-check of
+   * the unverified-approval hold. Optional so older/test stores that predate the
+   * re-check keep prior behavior; when absent only the pre-claim snapshot is
+   * consulted (bdc-harness: unverified-approval downgrade race).
+   */
+  getVerdictsForRun?(runId: string): Promise<OverseerVerdictRow[]>;
   releaseVerdictClaim(verdictId: string, reason: string): Promise<boolean>;
   deferVerdictClaim?(verdictId: string, reason: string, notBefore: string): Promise<boolean>;
   getRunById(runId: string): Promise<OverseerWatchRun | null>;
@@ -565,9 +572,15 @@ async function postMergeReceiptComment(
  * to suppress a merge on the SAME pull request and the SAME head. run_id encodes
  * owner/repo#number for a PR verdict, so (run_id, head_sha) pins the defense to
  * one PR -- a commit SHA shared by another PR or repo cannot cross-contaminate.
+ *
+ * The separator is written as the ESCAPE SEQUENCE `\u0000`, never as a literal NUL
+ * byte: a raw 0x00 in the source makes this file binary to grep/diff/review tooling
+ * and fails the ASCII-only source gate (policy Rule 13). The escape keeps the source
+ * pure ASCII while the runtime separator stays a NUL, which cannot occur inside a
+ * run_id or a hex head_sha and so can never make two distinct pairs collide.
  */
 function unverifiedApprovalKey(runId: string, headSha: string): string {
-  return `${runId} ${headSha}`;
+  return `${runId}\u0000${headSha}`;
 }
 
 async function mergeClaimedVerdict(
@@ -645,6 +658,67 @@ async function mergeClaimedVerdict(
   ) {
     await skip('approval_unverified');
     return undefined;
+  }
+
+  // POST-CLAIM RE-CHECK of the same hold, against FRESH database state.
+  //
+  // `verdict` and `unverifiedApprovalKeys` both come from the pre-claim
+  // listUnactionedVerdicts() snapshot, so on their own they are stale by exactly the
+  // window that matters: recordUnverifiedApprovalVerdict can downgrade an existing
+  // flag_merge_ready row to approved_unverified/none AFTER we listed it. The in-memory
+  // copy still says flag_merge_ready and would merge an approval the reviewer could
+  // not verify while that downgrade rewrites the row underneath us.
+  //
+  // claimVerdict is the serialization point (it flips actioned_at from NULL under a
+  // conditional UPDATE), so re-reading AFTER a successful claim observes every
+  // downgrade that committed before the claim and closes that window. A downgrade that
+  // arrives after the claim is handled on the writer side, which refuses to treat a
+  // claimed-and-processing row as held and escalates instead.
+  //
+  // This re-read is also the only thing that sees a SIBLING unverified row at all:
+  // listUnactionedVerdicts filters to proposed_action = 'flag_merge_ready', so an
+  // approved_unverified row (proposed_action 'none') never appears in the snapshot and
+  // the pre-claim key set above is empty in production.
+  if (options.store.getVerdictsForRun) {
+    let freshRows: OverseerVerdictRow[] | null = null;
+    try {
+      freshRows = await options.store.getVerdictsForRun(verdict.run_id);
+    } catch (error) {
+      // Fail CLOSED: if we cannot confirm the hold is absent, do not merge.
+      log.error(
+        { err: error as Error, verdictId: verdict.id, runId: verdict.run_id },
+        'merge-coordinator.unverified_recheck_failed'
+      );
+      await skip('approval_unverified_recheck_unavailable');
+      return undefined;
+    }
+    const self = freshRows.find(row => row.id === verdict.id);
+    const downgraded =
+      self !== undefined &&
+      (self.verdict === 'approved_unverified' || self.proposed_action !== FLAG_MERGE_READY);
+    const siblingHold =
+      typeof verdict.head_sha === 'string' &&
+      verdict.head_sha.length > 0 &&
+      freshRows.some(
+        row =>
+          row.id !== verdict.id &&
+          row.verdict === 'approved_unverified' &&
+          row.head_sha === verdict.head_sha
+      );
+    if (downgraded || siblingHold) {
+      log.warn(
+        {
+          verdictId: verdict.id,
+          runId: verdict.run_id,
+          headSha: verdict.head_sha,
+          downgraded,
+          siblingHold,
+        },
+        'merge-coordinator.unverified_hold_detected_post_claim'
+      );
+      await skip('approval_unverified');
+      return undefined;
+    }
   }
 
   const policy = (options.readPolicy ?? readOverseerActionPolicyFromEnv)();

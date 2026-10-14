@@ -367,3 +367,155 @@ describe('Test 7: unpushed_repair_makes_open_pr_draft', () => {
     expect(commentLine).toContain('NOT pushed');
   }, 60000);
 });
+
+/**
+ * Positive-evidence hook attribution. The commit-core previously decided "hook
+ * failure" by elimination: every nonzero `git commit` that did not match a short
+ * list of known git errors was labelled a repairable lint rejection. A commit-msg
+ * hook rejection (a DIFFERENT hook phase, not a staged lint/format problem) was
+ * therefore fed to the bounded lint-repair pass and burned the run's one attempt.
+ * The core now requires positive attribution to the PRE-COMMIT phase.
+ */
+describe('Test 5c: commit_msg_hook_rejection_is_not_pre_commit_lint', () => {
+  test('a commit-msg hook rejection does NOT write the hook-output file', () => {
+    const ctx = makeRealHookRepo();
+    // A commit-msg hook that always rejects. The staged file is NOT TypeScript, so
+    // the real pre-commit hook passes -- the ONLY reason the commit fails is the
+    // commit-msg phase, which the bounded lint repair cannot fix.
+    const commitMsgHook = join(ctx.repo, '.git', 'hooks', 'commit-msg');
+    writeFileSync(
+      commitMsgHook,
+      `#!/usr/bin/env bash\necho "commit message rejected by policy" >&2\nexit 1\n`
+    );
+    chmodSync(commitMsgHook, 0o755);
+    writeFileSync(join(ctx.repo, 'notes.txt'), 'plain text, no lint rule applies\n');
+
+    const r = runCore(ctx, 'all');
+
+    expect(r.status).not.toBe(0);
+    // Not attributed to the pre-commit phase -> no hook-output file, so
+    // commit-and-push takes the hard-fail path instead of the lint repair.
+    expect(existsSync(ctx.hookOut)).toBe(false);
+    expect(r.stdout).toContain('COMMIT_CORE=commit_failed_non_hook');
+    // And no commit was created.
+    expect(
+      execFileSync('git', ['rev-list', '--count', '--all'], {
+        cwd: ctx.repo,
+        encoding: 'utf8',
+      }).trim()
+    ).toBe('0');
+  }, 60000);
+
+  test('a real pre-commit rejection is still positively attributed and repairable', () => {
+    // The counterpart: the fixture hook is a plain .git/hooks/pre-commit that just
+    // execs eslint -- it prints NO husky/lint-staged marker. Attribution therefore
+    // comes from directly observing that the pre-commit hook is what rejects the
+    // staged delta, and the evidence kind is reported.
+    const ctx = makeRealHookRepo();
+    writeFileSync(join(ctx.repo, 'bad.ts'), VIOLATING);
+
+    const r = runCore(ctx, 'all');
+
+    expect(r.status).not.toBe(0);
+    expect(existsSync(ctx.hookOut)).toBe(true);
+    expect(readFileSync(ctx.hookOut, 'utf8')).toContain('explicit-function-return-type');
+    expect(r.stdout).toContain('COMMIT_CORE=hook_failed');
+    expect(r.stdout).toContain('evidence=pre_commit_rerun');
+    // Hooks were never bypassed to reach that conclusion.
+    expect(readFileSync(ctx.gitArgvLog, 'utf8')).not.toContain(NO_VERIFY);
+    expect(readFileSync(ctx.gitEnvLog, 'utf8')).not.toContain(HUSKY_OFF);
+  }, 60000);
+
+  test('the lane requires positive evidence and never labels by elimination', () => {
+    const core = extractCommitCore();
+    // The repairable path is gated on an explicit evidence variable...
+    expect(core).toContain('CORE_HOOK_EVIDENCE=none');
+    expect(core).toContain('if [ "$CORE_HOOK_EVIDENCE" = "none" ]; then');
+    // ...and a commit-msg rejection is explicitly excluded.
+    expect(core).toContain('husky - commit-msg script failed');
+    // The hook-output file is only written after the evidence check.
+    const evidenceGate = core.indexOf('if [ "$CORE_HOOK_EVIDENCE" = "none" ]; then');
+    const writeHookOut = core.indexOf('> "$CORE_HOOK_OUTPUT_FILE"');
+    expect(evidenceGate).toBeGreaterThan(-1);
+    expect(writeHookOut).toBeGreaterThan(evidenceGate);
+  });
+});
+
+/**
+ * The gate must REPORT the dead end, not just fail. commit-and-push exits 0 on the
+ * first hook rejection (it hands off to the one bounded repair pass), so the
+ * load_bearing commit-hook-gate is the only node that can surface the attempt-2
+ * rejection. It therefore emits the class token plus the real attempt count -- and
+ * ONLY on positive evidence that commit-and-push reported a hook rejection.
+ */
+describe('Test 7b: gate_reports_class_and_attempt', () => {
+  function runGate(
+    commitAndPushOut: string,
+    attemptFileContents?: string
+  ): { status: number | null; stdout: string } {
+    const nodeOut = mkdtempSync(join(tmpdir(), 'gate2-nodeout-'));
+    const artifacts = mkdtempSync(join(tmpdir(), 'gate2-artifacts-'));
+    const binDir = mkdtempSync(join(tmpdir(), 'gate2-bin-'));
+    writeFileSync(join(nodeOut, 'commit-and-push.out'), commitAndPushOut);
+    writeFileSync(join(nodeOut, 'commit-hook-retry.out'), 'COMMIT_HOOK_RETRY=hook_failed_again\n');
+    writeFileSync(join(nodeOut, 'decide-push-target.out'), 'repo: thinmansoftware/bdc-harness\n');
+    writeFileSync(
+      join(artifacts, 'commit-hook-env.sh'),
+      'UNIQUE_BRANCH=feat/x-thread-abc123\nCOMMIT_MESSAGE=feat: x\n'
+    );
+    if (attemptFileContents !== undefined) {
+      writeFileSync(join(artifacts, 'commit-hook-attempt.txt'), attemptFileContents);
+    }
+    // gh stub: no open PR, so the drafting branch is a no-op.
+    const gh = join(binDir, 'gh');
+    writeFileSync(gh, `#!/usr/bin/env bash\nexit 0\n`);
+    chmodSync(gh, 0o755);
+
+    const gateBash = laneNode('commit-hook-gate')?.bash;
+    if (!gateBash) throw new Error('commit-hook-gate node/bash missing');
+    const gateScript = join(binDir, 'gate.sh');
+    writeFileSync(gateScript, gateBash);
+    const r = spawnSync('bash', [gateScript], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ''}`,
+        ARCHON_NODE_OUT: nodeOut,
+        ARTIFACTS_DIR: artifacts,
+      },
+    });
+    return { status: r.status, stdout: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+  }
+
+  test('an unrepaired hook failure emits the class token and the real attempt count', () => {
+    const r = runGate('COMMIT_HOOK_FAILED=true\n', '2\n');
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).toContain('commit_hook_lint_failure');
+    expect(r.stdout).toContain('commit_hook_attempt=2');
+  }, 60000);
+
+  test('the attempt count is floored at 2 when the counter file is missing', () => {
+    // This branch is only reachable once the single bounded repair opportunity is
+    // spent, so the budget is exhausted by construction even without the counter.
+    const r = runGate('COMMIT_HOOK_FAILED=true\n');
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).toContain('commit_hook_attempt=2');
+  }, 60000);
+
+  test('a gate failure with NO hook rejection does NOT claim the hook class', () => {
+    // commit-and-push failed for some other reason (no COMMIT_HOOK_FAILED marker,
+    // no pushed branch). Mislabelling this a lint failure would send it down the
+    // repair path; it must fail closed as its own thing instead.
+    const r = runGate('ERROR: something else went wrong\n');
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain('commit_hook_lint_failure');
+    expect(r.stdout).toContain('reported no pre-commit hook rejection');
+  }, 60000);
+
+  test('a first-attempt success path still passes the gate', () => {
+    const r = runGate('unique_branch=feat/x-thread-abc123\n');
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('COMMIT_HOOK_GATE=passed_first_attempt');
+    expect(r.stdout).not.toContain('commit_hook_lint_failure');
+  }, 60000);
+});
