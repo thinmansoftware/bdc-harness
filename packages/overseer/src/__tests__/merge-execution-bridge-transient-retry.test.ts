@@ -196,7 +196,7 @@ describe('merge execution bridge transient retry', () => {
     expect(h.outcomes).toHaveLength(0);
   });
 
-  test('rate-limit run-less PR lookup failure defers the verdict and ends the pass', async () => {
+  test('repair regressions use strict retry integers and stop after lookup rate limits', async () => {
     const runless = (id: string) =>
       verdict(id, {
         run_id: `pr-discovery:thinmansoftware/bdc-harness#${id === 'first' ? 1 : 2}`,
@@ -213,26 +213,23 @@ describe('merge execution bridge transient retry', () => {
     expect(h.claims).toEqual(['first']);
     expect(lookups).toBe(1);
     expect(h.outcomes).toHaveLength(0);
-  });
 
-  test.each(['10.5', '10junk'])(
-    'malformed retry integer %s falls back to the default',
-    async malformed => {
+    for (const malformed of ['10.5', '10junk']) {
       const previous = process.env.OVERSEER_MERGE_RETRY_BASE_MINUTES;
       process.env.OVERSEER_MERGE_RETRY_BASE_MINUTES = malformed;
       try {
-        const h = makeHarness([verdict(`malformed-${malformed}`)], () =>
+        const malformedHarness = makeHarness([verdict(`malformed-${malformed}`)], () =>
           green({ mergeable: null, mergeableState: 'unknown' })
         );
-        h.options.retryBaseMinutes = undefined;
-        await runMergeExecutionBridgeOnce(h.options);
-        expect(h.deferrals[0]?.notBefore).toBe('2026-10-14T00:10:00.000Z');
+        malformedHarness.options.retryBaseMinutes = undefined;
+        await runMergeExecutionBridgeOnce(malformedHarness.options);
+        expect(malformedHarness.deferrals[0]?.notBefore).toBe('2026-10-14T00:10:00.000Z');
       } finally {
         if (previous === undefined) delete process.env.OVERSEER_MERGE_RETRY_BASE_MINUTES;
         else process.env.OVERSEER_MERGE_RETRY_BASE_MINUTES = previous;
       }
     }
-  );
+  });
 
   test('production-base and stale-head skips stay terminal', async () => {
     const cases: [string, PullRequestEvidence, Partial<OverseerVerdictRow>][] = [
