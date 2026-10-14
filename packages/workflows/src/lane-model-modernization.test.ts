@@ -144,27 +144,33 @@ describe('WO-HARNESS-LANES-MODERNIZE-AND-HAIKU-01', () => {
     }
   });
 
-  it('Test 3: Grok tiers -- check-already-satisfied is grok-4.7-medium, other cursor nodes grok-4.7-high', () => {
+  it('Test 3: Grok tiers -- every cursor-provider model-bearing node pins the right grok-4.7 tier', () => {
     for (const file of [
       'bdc-feature-development-cursor.yaml',
       'bdc-feature-development-grok.yaml',
     ]) {
       const wf = parse(file);
-      // Only nodes that actually resolve to a Grok model are in scope; bash/clerical
-      // nodes that merely inherit the cursor root provider carry no model.
-      const grokNodes = wf.nodes.filter(
-        n => typeof n.model === 'string' && n.model.startsWith('grok-4.7-')
+      // Enumerate EVERY model-bearing node whose effective provider is cursor
+      // (explicit node.provider, else the lane root provider). We must NOT
+      // prefilter on the grok-4.7 prefix: an obsolete or wrong Grok id on a
+      // cursor seat (e.g. grok-4-high, grok-5-high, grok-4.6-high) must FAIL
+      // the tier assertion, not be silently excluded from scope.
+      const cursorNodes = wf.nodes.filter(
+        n => (n.provider ?? wf.provider) === 'cursor' && typeof n.model === 'string'
       );
-      expect(grokNodes.length, `${file}:has-grok-nodes`).toBeGreaterThan(0);
-      for (const node of grokNodes) {
-        if (node.id === 'check-already-satisfied') {
-          expect(node.model, `${file}:${node.id}`).toBe('grok-4.7-medium');
-        } else {
-          expect(node.model, `${file}:${node.id}`).toBe('grok-4.7-high');
-        }
+      expect(cursorNodes.length, `${file}:has-cursor-model-nodes`).toBeGreaterThan(0);
+      for (const node of cursorNodes) {
+        const expected =
+          node.id === 'check-already-satisfied' ? 'grok-4.7-medium' : 'grok-4.7-high';
+        expect(node.model, `${file}:${node.id}`).toBe(expected);
       }
+      // check-already-satisfied must exist as a cursor seat on the medium tier.
       const cas = wf.nodes.find(n => n.id === 'check-already-satisfied');
       expect(cas?.model, `${file}:check-already-satisfied`).toBe('grok-4.7-medium');
+      expect(
+        cas ? (cas.provider ?? wf.provider) : undefined,
+        `${file}:check-already-satisfied:provider`
+      ).toBe('cursor');
     }
   });
 
@@ -201,6 +207,7 @@ describe('WO-HARNESS-LANES-MODERNIZE-AND-HAIKU-01', () => {
       'diff-review-final',
       'opus-rereview',
       'findings-consolidate',
+      'apply-diff-review-final',
     ];
     for (const id of buildSeats) {
       expect(byId.get(id)?.model, `haiku:${id}`).toBe('claude-haiku-5-5');
@@ -243,14 +250,31 @@ describe('WO-HARNESS-LANES-MODERNIZE-AND-HAIKU-01', () => {
     expect(bundled).toContain('claude-haiku-5-5');
   });
 
-  it('Test 8: runbook lists every lane with a model and a cost class', () => {
+  it('Test 8: runbook gives each lane its own roster row with model info and a valid cost class', () => {
     const runbook = readFileSync(RUNBOOK, 'utf-8');
-    const lower = runbook.toLowerCase();
-    const COST_CLASSES = ['cheap', 'standard', 'premium', 'open-model'];
-    expect(COST_CLASSES.some(c => lower.includes(c))).toBe(true);
+    const COST_CLASSES = new Set(['cheap', 'standard', 'premium', 'open-model']);
+    // Markers that count as "model information" in a roster row.
+    const MODEL_MARKER = /claude-|gpt-[0-9]|grok-[0-9]|deepseek|kimi|qwen/i;
+    // Candidate roster rows are the markdown table rows (leading pipe).
+    const rows = runbook.split('\n').filter(line => line.trimStart().startsWith('|'));
+
     for (const file of LANE_FILES) {
       const laneName = file.replace(/\.yaml$/, '');
-      expect(runbook, `runbook missing lane ${laneName}`).toContain(laneName);
+      // Exact first-cell match so a prefix lane (bdc-feature-development) does
+      // NOT borrow a longer lane's row (e.g. bdc-feature-development-astra).
+      const row = rows.find(line => line.split('|')[1]?.trim() === laneName);
+      expect(row, `runbook missing roster row for lane ${laneName}`).toBeDefined();
+      // Columns: '' | Lane | Builder | Reviewer | Cost class | When to use | ''
+      const cells = (row as string).split('|').map(c => c.trim());
+      const costCell = cells[4] ?? '';
+      expect(
+        COST_CLASSES.has(costCell),
+        `runbook row for ${laneName}: cost column '${costCell}' is not a valid cost class`
+      ).toBe(true);
+      expect(
+        MODEL_MARKER.test(row as string),
+        `runbook row for ${laneName}: no model id present in the row`
+      ).toBe(true);
     }
   });
 });
