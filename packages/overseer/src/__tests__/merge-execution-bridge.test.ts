@@ -1164,28 +1164,42 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
 });
 
 describe('merge execution bridge -- unverified approval defense in depth (WO node-failure-repair)', () => {
-  const flagReadyVerdict = (id: string, head = 'judged-sha'): OverseerVerdictRow =>
+  const flagReadyVerdict = (
+    id: string,
+    head = 'judged-sha',
+    runId = `run-${id}`
+  ): OverseerVerdictRow =>
     ({
       id,
-      run_id: `run-${id}`,
+      run_id: runId,
       wo_id: 'WO-TEST',
       head_sha: head,
       proposed_action: 'flag_merge_ready',
       verdict: 'merge_candidate',
     }) as OverseerVerdictRow;
 
-  const unverifiedVerdict = (id: string, head = 'judged-sha'): OverseerVerdictRow =>
+  const unverifiedVerdict = (
+    id: string,
+    head = 'judged-sha',
+    runId = `run-${id}`
+  ): OverseerVerdictRow =>
     ({
       id,
-      run_id: `run-${id}`,
+      run_id: runId,
       wo_id: 'WO-TEST',
       head_sha: head,
       proposed_action: 'none',
       verdict: 'approved_unverified',
     }) as OverseerVerdictRow;
 
-  test('19 a flag_merge_ready verdict whose head has an approved_unverified record is skipped', async () => {
-    const h = harness([flagReadyVerdict('fmr'), unverifiedVerdict('unv')]);
+  test('19 a flag_merge_ready verdict whose SAME-PR head has an approved_unverified record is skipped', async () => {
+    // Both verdicts belong to the SAME pull request (same run_id) and head: the
+    // unverified approval must suppress the merge-ready verdict.
+    const sharedRun = 'pr-discovery:thinmansoftware/bdc-harness#19';
+    const h = harness([
+      flagReadyVerdict('fmr', 'judged-sha', sharedRun),
+      unverifiedVerdict('unv', 'judged-sha', sharedRun),
+    ]);
     await runMergeExecutionBridgeOnce({
       store: h.store,
       github: h.github,
@@ -1198,6 +1212,25 @@ describe('merge execution bridge -- unverified approval defense in depth (WO nod
     }
     // Both rows were processed and skipped.
     expect(h.outcomes.map(o => o.verdictId).sort()).toEqual(['fmr', 'unv']);
+  });
+
+  test('19 a DIFFERENT PR sharing the same commit SHA is NOT suppressed (merges)', async () => {
+    // Regression for the head-only defense: an unverified approval on one PR (run
+    // 'run-unv') must not suppress a verified merge-ready verdict on a DIFFERENT PR
+    // ('run-fmr') that happens to share the same head SHA. Keyed on
+    // (run_id, head_sha), these do not collide, so the verified verdict still merges.
+    const h = harness([flagReadyVerdict('fmr'), unverifiedVerdict('unv')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    // The verified verdict merges exactly once; only the bare unverified row is skipped.
+    expect(h.merges).toBe(1);
+    expect(h.outcomes.some(o => o.verdictId === 'fmr' && o.reason === 'merge_executed')).toBe(true);
+    expect(h.outcomes.some(o => o.verdictId === 'unv' && o.reason === 'approval_unverified')).toBe(
+      true
+    );
   });
 
   test('19 a bare approved_unverified verdict is skipped with approval_unverified, no merge', async () => {

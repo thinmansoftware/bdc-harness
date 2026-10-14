@@ -132,6 +132,10 @@ function node(id: string): DagNode {
   return { id, command: id } as DagNode;
 }
 
+function loadBearingNode(id: string): DagNode {
+  return { id, command: id, load_bearing: true } as DagNode;
+}
+
 // Real lint-staged ordering: eslint prints the finding first, husky prints the
 // summary line last. The notify body carries the FIRST non-empty error line, so
 // the finding (with "Missing return type") is what reaches the digest.
@@ -388,6 +392,54 @@ describe('handleNodeFailure node-failure Dispatch notification', () => {
     expect(notifyFailures).toHaveLength(1);
     // Re-open so afterEach close() does not throw on an already-closed db.
     db = new SqliteAdapter(currentDbPath);
+  });
+
+  test('16 a load_bearing node escalating with an unrepairable failure messages xo as a blocker', async () => {
+    // commit-hook-gate's unrepaired-hook failure arrives here classified `unknown`
+    // (nodeId is not commit-and-push). It is NOT in BLOCKER_ERROR_CLASSES and decide
+    // sets no blocker flag, so only the load_bearing + no-retry-path rule makes it a
+    // blocker -- which is what surfaces the second hook failure to XO.
+    const run = makeRun({ id: 'run-16' });
+    await handleNodeFailure(
+      {
+        store: makeStore(),
+        emitter: { emit: () => undefined },
+        log: makeLog({ errors: [] }),
+        logNodeError: () => Promise.resolve(),
+      },
+      run,
+      loadBearingNode('commit-hook-gate'),
+      { ...baseCtx, errorMsg: 'COMMIT_HOOK_GATE=failed: the commit never landed' }
+    );
+    const duty = await dispatchRows('overseer-node-failure:run-16:commit-hook-gate');
+    expect(duty).toHaveLength(1);
+    expect(duty[0]!.body).toContain('unknown');
+    expect(duty[0]!.body).toContain('blocker: yes');
+    const xo = await dispatchRows('overseer-node-failure-blocker:run-16:commit-hook-gate');
+    expect(xo).toHaveLength(1);
+    expect(xo[0]!.recipient).toBe('xo');
+    expect(xo[0]!.priority).toBe('blocker');
+  });
+
+  test('17 a load_bearing node whose failure is repairable-once is NOT a blocker', async () => {
+    // First-attempt commit_hook_lint_failure on a load_bearing node still carries a
+    // recovery path (the one bounded repair pass), so it must NOT message xo.
+    const run = makeRun({ id: 'run-17' });
+    await handleNodeFailure(
+      {
+        store: makeStore(),
+        emitter: { emit: () => undefined },
+        log: makeLog({ errors: [] }),
+        logNodeError: () => Promise.resolve(),
+      },
+      run,
+      loadBearingNode('commit-and-push'),
+      { ...baseCtx, errorMsg: HOOK_ERROR, attempt: 1 }
+    );
+    expect(await dispatchRows('overseer-node-failure:run-17:commit-and-push')).toHaveLength(1);
+    expect(await dispatchRows('overseer-node-failure-blocker:run-17:commit-and-push')).toHaveLength(
+      0
+    );
   });
 
   test('15 a skip decision creates no node-failure Dispatch message', async () => {

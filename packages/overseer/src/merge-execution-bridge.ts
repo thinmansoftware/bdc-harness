@@ -560,11 +560,21 @@ async function postMergeReceiptComment(
   }
 }
 
+/**
+ * Composite key for the unverified-approval defense: an approval is only allowed
+ * to suppress a merge on the SAME pull request and the SAME head. run_id encodes
+ * owner/repo#number for a PR verdict, so (run_id, head_sha) pins the defense to
+ * one PR -- a commit SHA shared by another PR or repo cannot cross-contaminate.
+ */
+function unverifiedApprovalKey(runId: string, headSha: string): string {
+  return `${runId} ${headSha}`;
+}
+
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
   repoPolicy: MergeRepoPolicy,
-  unverifiedApprovalHeads: ReadonlySet<string>
+  unverifiedApprovalKeys: ReadonlySet<string>
 ): Promise<'stop' | undefined> {
   let rateLimitDeferred = false;
   const skip = async (reason: string, prUrl?: string, rateLimited = false): Promise<void> => {
@@ -629,7 +639,9 @@ async function mergeClaimedVerdict(
   // unverified approval unattended.
   if (
     verdict.verdict === 'approved_unverified' ||
-    (typeof verdict.head_sha === 'string' && unverifiedApprovalHeads.has(verdict.head_sha))
+    (typeof verdict.head_sha === 'string' &&
+      verdict.head_sha.length > 0 &&
+      unverifiedApprovalKeys.has(unverifiedApprovalKey(verdict.run_id, verdict.head_sha)))
   ) {
     await skip('approval_unverified');
     return undefined;
@@ -873,9 +885,14 @@ export async function runMergeExecutionBridgeOnce(
 ): Promise<void> {
   const repoPolicy = configuredPolicy(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
-  // Heads with an unresolved unverified approval (WO node-failure-repair): a
-  // flag_merge_ready verdict on any of these heads must be skipped, not merged.
-  const unverifiedApprovalHeads = new Set(
+  // (run_id, head_sha) pairs with an unresolved unverified approval (WO
+  // node-failure-repair): a flag_merge_ready verdict for the SAME PR AND head must
+  // be skipped, not merged. Keying on head_sha ALONE is unsafe -- a commit SHA can
+  // be shared across PRs (and across repos), so a head-only match would let one
+  // PR's unverified approval wrongly suppress an unrelated verified merge. run_id
+  // for a PR verdict encodes owner/repo#number, so the composite pins the defense
+  // to the exact pull request.
+  const unverifiedApprovalKeys = new Set(
     verdicts
       .filter(
         v =>
@@ -883,7 +900,7 @@ export async function runMergeExecutionBridgeOnce(
           typeof v.head_sha === 'string' &&
           v.head_sha.length > 0
       )
-      .map(v => v.head_sha)
+      .map(v => unverifiedApprovalKey(v.run_id, v.head_sha))
   );
   for (const verdict of verdicts) {
     const isUnverifiedApproval = verdict.verdict === 'approved_unverified';
@@ -894,8 +911,7 @@ export async function runMergeExecutionBridgeOnce(
     if (!(await options.store.claimVerdict(verdict.id))) continue;
     try {
       if (
-        (await mergeClaimedVerdict(options, verdict, repoPolicy, unverifiedApprovalHeads)) ===
-        'stop'
+        (await mergeClaimedVerdict(options, verdict, repoPolicy, unverifiedApprovalKeys)) === 'stop'
       )
         break;
     } catch (error) {

@@ -235,6 +235,31 @@ describe('Test 5: second_failure_does_not_loop', () => {
   }, 60000);
 });
 
+describe('Test 5b: non_hook_commit_failure_is_not_repairable', () => {
+  test('a nonzero git commit that is NOT a pre-commit hook rejection (signing failure) does not write the hook-output file', () => {
+    const ctx = makeRealHookRepo();
+    // Force a commit-signing failure that is unrelated to the pre-commit hook:
+    // gpg signing on, pointed at a binary that does not exist. The staged file is
+    // NOT TypeScript, so the real pre-commit hook passes -- the ONLY reason the
+    // commit fails is the signing error, exactly the non-hook class finding 2 is about.
+    execFileSync('git', ['config', 'commit.gpgsign', 'true'], { cwd: ctx.repo });
+    execFileSync('git', ['config', 'gpg.program', join(ctx.meta, 'nonexistent-gpg')], {
+      cwd: ctx.repo,
+    });
+    writeFileSync(join(ctx.repo, 'notes.txt'), 'plain text, no lint rule applies\n');
+
+    const r = runCore(ctx, 'all');
+
+    // The commit failed...
+    expect(r.status).not.toBe(0);
+    // ...but it was NOT classified as a repairable hook rejection: no hook-output
+    // file was persisted, so commit-and-push takes the hard-fail path instead of
+    // handing off to the bounded lint repair.
+    expect(existsSync(ctx.hookOut)).toBe(false);
+    expect(r.stdout).toContain('COMMIT_CORE=commit_failed_non_hook');
+  }, 60000);
+});
+
 describe('Test 6: lane_yaml_structure_has_one_bounded_repair', () => {
   test('exactly one hook-repair node, depends on commit-and-push, OPUS_REPAIR idiom, one commit-core invoked by two nodes', () => {
     const repairNodes = LANE_DOC.nodes.filter(n => n.id === 'commit-hook-repair');

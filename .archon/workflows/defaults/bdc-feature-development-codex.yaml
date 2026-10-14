@@ -3644,7 +3644,18 @@ nodes:
         echo "COMMIT_CORE=committed"
         exit 0
       fi
-      # husky/lint-staged rejected the staged delta. Persist the hook output so the
+      # A nonzero `git commit` is a REPAIRABLE lint/format hook rejection ONLY when the
+      # failure actually came from the pre-commit hook. Other causes -- a missing Git
+      # identity, an index/ref lock, or a commit-signing failure -- are NOT fixable by
+      # the bounded lint-repair pass. They must NOT persist the hook-output file (the
+      # caller treats that file's existence as proof of a hook rejection) and must fail
+      # hard instead. Exclude those known non-hook git failures first; everything else
+      # that reaches here is a pre-commit hook rejection.
+      if printf '%s\n' "$CORE_COMMIT_LOG" | grep -Eqi 'please tell me who you are|unable to auto-detect email address|author identity unknown|empty ident (name|email)|unable to create [^\n]*\.lock|gpg failed to sign|failed to write commit object|cannot (run|spawn) gpg|unable to start gpg'; then
+        echo "COMMIT_CORE=commit_failed_non_hook" >&2
+        exit "$CORE_RC"
+      fi
+      # Pre-commit hook rejected the staged delta. Persist the hook output so the
       # bounded commit-hook-repair pass can read exactly what to fix, then exit non-zero.
       printf '%s\n' "$CORE_COMMIT_LOG" > "$CORE_HOOK_OUTPUT_FILE"
       echo "COMMIT_CORE=hook_failed"

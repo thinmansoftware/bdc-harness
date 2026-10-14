@@ -226,10 +226,33 @@ describe('unverified approval end-to-end (WO node-failure-repair)', () => {
     expect(rows[0]!.correlation_id).toBe(HEAD);
     expect(rows[0]!.body).toContain(String(PR));
     expect(rows[0]!.body).toContain(HEAD);
+    // BOTH reasons appear: the first (persisted on the retry row) and the latest.
+    expect(rows[0]!.body).toContain('sandbox failed');
     expect(rows[0]!.body).toContain('still could not verify');
+    expect(rows[0]!.body).toContain('first reason:');
+    expect(rows[0]!.body).toContain('latest reason:');
     // A third unverified pass creates no second row.
     await runAndSubmitReview(work('msg-22c'), deps([], 'APPROVE_UNVERIFIED', 'again'));
     expect(await dispatchRows(prefix)).toHaveLength(1);
+  });
+
+  test('23 an unverified approval neutralizes an already-recorded flag_merge_ready verdict', async () => {
+    // A verified approval records a merge-ready verdict for this head...
+    await runAndSubmitReview(work('msg-23a'), deps([], 'APPROVE'));
+    let rows = await verdictRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.proposed_action).toBe('flag_merge_ready');
+
+    // ...then a LATER review of the SAME head comes back unverified. The
+    // (run_id, head_sha) slot is already taken, so the held verdict cannot be
+    // inserted alongside -- the existing merge-ready row must be downgraded in
+    // place so the merge bridge can no longer act on it.
+    await runAndSubmitReview(work('msg-23b'), deps([], 'APPROVE_UNVERIFIED', 'sandbox failed'));
+    rows = await verdictRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.verdict).toBe('approved_unverified');
+    expect(rows[0]!.proposed_action).toBe('none');
+    expect(rows.filter(r => r.proposed_action === 'flag_merge_ready')).toHaveLength(0);
   });
 
   test('22 the verified path writes no duty-officer unverified escalation', async () => {

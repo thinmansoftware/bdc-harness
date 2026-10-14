@@ -288,7 +288,19 @@ export async function handleNodeFailure(
   // call never throws and never re-enters this handler (no-loop guarantee lives
   // in notifyNodeFailureEscalation).
   if (result.decision === 'escalate') {
-    const blocker = isAlwaysBlockerClass(errorClass) || result.blocker === true;
+    // A load-bearing node (commit-and-push, commit-hook-gate, ascii-gate, open-pr,
+    // etc.) whose failure has NO remaining recovery path is a blocker in its own
+    // right: its output is critical to the run, the decision is escalate (never a
+    // retry), and nothing downstream will repair it. XO must be told at priority
+    // blocker, not just the Duty Officer digest. `repairableOnce` is the one
+    // recovery path a load-bearing escalate can still carry (the first
+    // commit_hook_lint_failure), so it is excluded. This is what surfaces the
+    // UNREPAIRED commit-hook-gate failure (the second hook failure, which arrives
+    // as a load_bearing gate failure classified `unknown`) to XO -- previously it
+    // escalated with no blocker signal at all.
+    const loadBearingDeadEnd = node.load_bearing === true && result.repairableOnce !== true;
+    const blocker =
+      isAlwaysBlockerClass(errorClass) || result.blocker === true || loadBearingDeadEnd;
     await notifyNodeFailureEscalation(
       { log: deps.log },
       {

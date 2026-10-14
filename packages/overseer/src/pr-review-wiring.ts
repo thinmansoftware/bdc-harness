@@ -17,7 +17,11 @@
  */
 import { randomUUID } from 'node:crypto';
 import * as dispatch from '@archon/core/db/dispatch';
-import { claimOverseerVerdict, finalizeOverseerVerdict } from '@archon/core/db/overseer';
+import {
+  claimOverseerVerdict,
+  finalizeOverseerVerdict,
+  getOverseerVerdictsForRun,
+} from '@archon/core/db/overseer';
 import { createLogger } from '@archon/paths';
 import {
   createRealFetchExactHeadPullRequestEvidence,
@@ -82,6 +86,15 @@ interface ReviewApprovalVerdictDeps {
   finalizeVerdict: typeof finalizeOverseerVerdict;
 }
 
+interface UnverifiedApprovalVerdictDeps extends ReviewApprovalVerdictDeps {
+  /**
+   * Reads every verdict row for a PR run. Used to NEUTRALIZE an already-recorded
+   * merge-ready verdict when a later unverified approval cannot claim a fresh slot
+   * for the same (run_id, head_sha). Seam for tests; defaults to the real DAL.
+   */
+  getVerdictsForRun?: typeof getOverseerVerdictsForRun;
+}
+
 export async function recordReviewApprovalVerdict(
   input: { owner: string; repo: string; prNumber: number; headSha: string; model?: string },
   deps: ReviewApprovalVerdictDeps = {
@@ -129,6 +142,24 @@ export async function maybeRecordReviewApprovalVerdict(
 export const UNVERIFIED_APPROVAL_RETRY_REASON = 'unverified_approval_retry';
 
 /**
+ * JSON body field that carries the FIRST unverified-approval reason on the bounded
+ * re-review row, so a repeated-unverified escalation can report both reasons.
+ */
+const FIRST_UNVERIFIED_REASON_KEY = 'firstUnverifiedReason';
+
+/** Read the persisted first unverified reason off a stored retry-row body. */
+function firstUnverifiedReasonFromBody(body: string | null): string {
+  if (!body) return '';
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const value = parsed[FIRST_UNVERIFIED_REASON_KEY];
+    return typeof value === 'string' ? value : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Record an unverified approval as a NON-MERGEABLE verdict
  * (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01). Writes an
  * overseer_verdicts row with verdict 'approved_unverified' and proposed_action
@@ -145,21 +176,46 @@ export async function recordUnverifiedApprovalVerdict(
     model?: string;
     verificationReason?: string;
   },
-  deps: ReviewApprovalVerdictDeps = {
+  deps: UnverifiedApprovalVerdictDeps = {
     claimVerdict: claimOverseerVerdict,
     finalizeVerdict: finalizeOverseerVerdict,
   }
 ): Promise<void> {
   const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
+  const prUrl = `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`;
   const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
-  if (!claim.claimed || !claim.verdictId) return;
+  if (claim.claimed && claim.verdictId) {
+    await deps.finalizeVerdict({
+      verdictId: claim.verdictId,
+      status: 'verdict',
+      verdict: 'approved_unverified',
+      proposedAction: 'none',
+      model: input.model,
+      prUrl,
+    });
+    return;
+  }
+  // The (run_id, head_sha) slot is already taken -- typically by an EARLIER verified
+  // flag_merge_ready verdict for this exact PR head. claimOverseerVerdict is UNIQUE
+  // on (run_id, head_sha) and only re-claims retryable health-alarm rows, so a held
+  // row can NEVER be inserted alongside the merge-ready one. If we returned here the
+  // stale merge-ready verdict would stay actionable and the merge bridge would merge
+  // an approval the reviewer could not verify. Instead, DOWNGRADE the existing row in
+  // place to the held, non-mergeable state. An already-actioned row (actioned_at set)
+  // is left untouched -- that merge has happened and must not be rewritten.
+  const getVerdicts = deps.getVerdictsForRun ?? getOverseerVerdictsForRun;
+  const existing = (await getVerdicts(runId)).find(
+    row => row.head_sha === input.headSha && row.actioned_at === null
+  );
+  if (!existing) return;
+  if (existing.verdict === 'approved_unverified' && existing.proposed_action === 'none') return;
   await deps.finalizeVerdict({
-    verdictId: claim.verdictId,
+    verdictId: existing.id,
     status: 'verdict',
     verdict: 'approved_unverified',
     proposedAction: 'none',
     model: input.model,
-    prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+    prUrl,
   });
 }
 
@@ -239,13 +295,14 @@ export async function handleUnverifiedApprovalOutcome(
   // 2. First unverified approval -> enqueue one bounded re-review. Repeat (the
   //    retry also came back unverified) -> escalate to the Duty Officer.
   const retryKey = unverifiedRereviewIdempotencyKey(input);
-  let retryAlreadyEnqueued = false;
+  const safeReason = redactSecretsFromErrorLine(reason).slice(0, 300);
+  let retryMessageBody: string | null = null;
   try {
     const prior = await dispatch.listMessages({
       recipient: REVIEW_RECIPIENT,
       subject_key: subjectKey,
     });
-    retryAlreadyEnqueued = prior.some(message => message.idempotency_key === retryKey);
+    retryMessageBody = prior.find(message => message.idempotency_key === retryKey)?.body ?? null;
   } catch (error) {
     log.error(
       { error, owner: input.owner, repo: input.repo, prNumber: input.prNumber },
@@ -254,7 +311,7 @@ export async function handleUnverifiedApprovalOutcome(
     return;
   }
 
-  if (!retryAlreadyEnqueued) {
+  if (retryMessageBody === null) {
     try {
       const body: ReviewWorkBody = {
         owner: input.owner,
@@ -274,7 +331,11 @@ export async function handleUnverifiedApprovalOutcome(
           recipient: REVIEW_RECIPIENT,
           subject_key: subjectKey,
           repeat_reason: UNVERIFIED_APPROVAL_RETRY_REASON,
-          body: JSON.stringify(body),
+          // Persist the FIRST unverified reason (already redacted + truncated) on
+          // the retry row. If this re-review ALSO comes back unverified, the
+          // escalation below reads it back so the Duty Officer sees BOTH reasons,
+          // not just the latest one. parseReviewWorkBody ignores the extra field.
+          body: JSON.stringify({ ...body, [FIRST_UNVERIFIED_REASON_KEY]: safeReason }),
         }
       );
     } catch (error) {
@@ -292,13 +353,16 @@ export async function handleUnverifiedApprovalOutcome(
     return;
   }
 
-  // Repeated unverified approval: tell the Duty Officer.
+  // Repeated unverified approval: tell the Duty Officer. Surface BOTH reasons --
+  // the first (persisted on the retry row) and the latest -- each already redacted
+  // and truncated, so the operator can see whether the cause changed between passes.
   try {
-    const safeReason = redactSecretsFromErrorLine(reason).slice(0, 300);
+    const firstReason = firstUnverifiedReasonFromBody(retryMessageBody);
     const body = [
       `Repeated UNVERIFIED approval on ${input.owner}/${input.repo}#${input.prNumber} at head ${input.headSha}.`,
       'The one bounded re-review also could not verify; this PR must not be merged unattended.',
-      `reason: ${safeReason}`,
+      `first reason: ${firstReason || '(not recorded)'}`,
+      `latest reason: ${safeReason}`,
     ].join('\n');
     await dispatch.createAuthenticatedMessage(
       { kind: 'system', sender: REVIEW_SENDER },
