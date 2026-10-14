@@ -42,6 +42,8 @@ describe('merge skip classification', () => {
       'merge_failed',
       'merge_failed:Head branch was modified',
       'transient_exhausted:mergeable_state_not_clean',
+      // WO node-failure-repair: an unverified approval must NOT retry in a loop.
+      'approval_unverified',
     ];
     for (const reason of transient) expect(classifyMergeSkip(reason), reason).toBe('transient');
     for (const reason of terminal) expect(classifyMergeSkip(reason), reason).toBe('terminal');

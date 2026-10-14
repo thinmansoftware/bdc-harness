@@ -563,7 +563,8 @@ async function postMergeReceiptComment(
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
-  repoPolicy: MergeRepoPolicy
+  repoPolicy: MergeRepoPolicy,
+  unverifiedApprovalHeads: ReadonlySet<string>
 ): Promise<'stop' | undefined> {
   let rateLimitDeferred = false;
   const skip = async (reason: string, prUrl?: string, rateLimited = false): Promise<void> => {
@@ -619,6 +620,20 @@ async function mergeClaimedVerdict(
       'merge-coordinator.merge_skipped'
     );
   };
+
+  // DEFENSE IN DEPTH (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01).
+  // Never merge an approval the reviewer could not verify, and never merge any
+  // verdict whose PR head carries an unresolved approved_unverified record. Both
+  // skip with the same terminal reason BEFORE any GitHub call, so no merge
+  // mutation is ever attempted. Anchor: PR #1118 (2026-10-14) merged an
+  // unverified approval unattended.
+  if (
+    verdict.verdict === 'approved_unverified' ||
+    (typeof verdict.head_sha === 'string' && unverifiedApprovalHeads.has(verdict.head_sha))
+  ) {
+    await skip('approval_unverified');
+    return undefined;
+  }
 
   const policy = (options.readPolicy ?? readOverseerActionPolicyFromEnv)();
   if (!policy.service_enabled) {
@@ -858,11 +873,31 @@ export async function runMergeExecutionBridgeOnce(
 ): Promise<void> {
   const repoPolicy = configuredPolicy(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
+  // Heads with an unresolved unverified approval (WO node-failure-repair): a
+  // flag_merge_ready verdict on any of these heads must be skipped, not merged.
+  const unverifiedApprovalHeads = new Set(
+    verdicts
+      .filter(
+        v =>
+          v.verdict === 'approved_unverified' &&
+          typeof v.head_sha === 'string' &&
+          v.head_sha.length > 0
+      )
+      .map(v => v.head_sha)
+  );
   for (const verdict of verdicts) {
-    if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
+    const isUnverifiedApproval = verdict.verdict === 'approved_unverified';
+    // Process flag_merge_ready verdicts as before, PLUS approved_unverified
+    // verdicts so the bridge actively records a skip for them instead of
+    // silently ignoring a non-mergeable row.
+    if (verdict.proposed_action !== FLAG_MERGE_READY && !isUnverifiedApproval) continue;
     if (!(await options.store.claimVerdict(verdict.id))) continue;
     try {
-      if ((await mergeClaimedVerdict(options, verdict, repoPolicy)) === 'stop') break;
+      if (
+        (await mergeClaimedVerdict(options, verdict, repoPolicy, unverifiedApprovalHeads)) ===
+        'stop'
+      )
+        break;
     } catch (error) {
       await options.store.releaseMergeSlot(verdict.id);
       await options.store.releaseVerdictClaim(

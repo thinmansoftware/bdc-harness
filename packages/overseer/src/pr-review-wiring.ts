@@ -44,6 +44,7 @@ import {
   reviewErrorCode,
 } from './pr-review-evaluator';
 import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-health';
+import { redactSecretsFromErrorLine } from './node-failure-notify';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
@@ -121,6 +122,210 @@ export async function maybeRecordReviewApprovalVerdict(
     await (options.record ?? recordReviewApprovalVerdict)(input);
   } catch (error) {
     options.onError?.(error);
+  }
+}
+
+/** repeat_reason stamped on the single bounded re-review of an unverified approval. */
+export const UNVERIFIED_APPROVAL_RETRY_REASON = 'unverified_approval_retry';
+
+/**
+ * Record an unverified approval as a NON-MERGEABLE verdict
+ * (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01). Writes an
+ * overseer_verdicts row with verdict 'approved_unverified' and proposed_action
+ * 'none' (never 'flag_merge_ready'), so the merge manager never treats it as
+ * merge-ready. Mirrors recordReviewApprovalVerdict's claim/finalize shape but
+ * for the held verdict.
+ */
+export async function recordUnverifiedApprovalVerdict(
+  input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    model?: string;
+    verificationReason?: string;
+  },
+  deps: ReviewApprovalVerdictDeps = {
+    claimVerdict: claimOverseerVerdict,
+    finalizeVerdict: finalizeOverseerVerdict,
+  }
+): Promise<void> {
+  const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
+  const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
+  if (!claim.claimed || !claim.verdictId) return;
+  await deps.finalizeVerdict({
+    verdictId: claim.verdictId,
+    status: 'verdict',
+    verdict: 'approved_unverified',
+    proposedAction: 'none',
+    model: input.model,
+    prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+  });
+}
+
+/** Idempotency key for the single bounded re-review of an unverified approval. */
+export function unverifiedRereviewIdempotencyKey(input: {
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+}): string {
+  return `overseer-unverified-rereview:${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`;
+}
+
+/** Idempotency key for the duty-officer escalation on a repeated unverified approval. */
+export function unverifiedApprovalEscalationKey(input: {
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+}): string {
+  return `overseer-review-unverified:${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`;
+}
+
+/**
+ * Handle one `approved_unverified` submit outcome: record the held verdict, then
+ * EITHER enqueue exactly one bounded re-review of the same head (first time) OR
+ * -- if that re-review was already enqueued, i.e. the retry ALSO came back
+ * unverified -- escalate to the Duty Officer. A per-PR-and-head idempotency key
+ * guarantees at most one retry and at most one escalation. Every dispatch write
+ * is wrapped so a failure logs and never throws.
+ */
+export async function handleUnverifiedApprovalOutcome(
+  input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    model?: string;
+    verificationReason?: string;
+  },
+  options: {
+    env?: Record<string, string | undefined>;
+    recordVerdict?: typeof recordUnverifiedApprovalVerdict;
+  } = {}
+): Promise<void> {
+  const subjectKey = reviewSubjectKey(input.owner, input.repo, input.prNumber);
+  const reason = (input.verificationReason ?? 'unverified').trim() || 'unverified';
+
+  // 1. Record the held, non-mergeable verdict.
+  if (reviewRecordsVerdictEnabled(options.env)) {
+    try {
+      await (options.recordVerdict ?? recordUnverifiedApprovalVerdict)(input);
+      log.info(
+        {
+          owner: input.owner,
+          repo: input.repo,
+          prNumber: input.prNumber,
+          headSha: input.headSha,
+          reason: reason.slice(0, 300),
+        },
+        'overseer.review.approved_unverified'
+      );
+    } catch (error) {
+      log.error(
+        {
+          error,
+          owner: input.owner,
+          repo: input.repo,
+          prNumber: input.prNumber,
+          headSha: input.headSha,
+        },
+        'overseer.review.approved_unverified_record_failed'
+      );
+    }
+  }
+
+  // 2. First unverified approval -> enqueue one bounded re-review. Repeat (the
+  //    retry also came back unverified) -> escalate to the Duty Officer.
+  const retryKey = unverifiedRereviewIdempotencyKey(input);
+  let retryAlreadyEnqueued = false;
+  try {
+    const prior = await dispatch.listMessages({
+      recipient: REVIEW_RECIPIENT,
+      subject_key: subjectKey,
+    });
+    retryAlreadyEnqueued = prior.some(message => message.idempotency_key === retryKey);
+  } catch (error) {
+    log.error(
+      { error, owner: input.owner, repo: input.repo, prNumber: input.prNumber },
+      'overseer.review.unverified_retry_lookup_failed'
+    );
+    return;
+  }
+
+  if (!retryAlreadyEnqueued) {
+    try {
+      const body: ReviewWorkBody = {
+        owner: input.owner,
+        repo: input.repo,
+        prNumber: input.prNumber,
+        headSha: input.headSha,
+        baseRef: '',
+        author: '',
+        headCiGreen: false,
+      };
+      await dispatch.createAuthenticatedMessage(
+        { kind: 'system', sender: REVIEW_SENDER },
+        {
+          correlation_id: `${reviewCorrelationPrefix(input.owner, input.repo, input.prNumber)}${input.headSha}`,
+          idempotency_key: retryKey,
+          task_type: 'run_review',
+          recipient: REVIEW_RECIPIENT,
+          subject_key: subjectKey,
+          repeat_reason: UNVERIFIED_APPROVAL_RETRY_REASON,
+          body: JSON.stringify(body),
+        }
+      );
+    } catch (error) {
+      log.error(
+        {
+          error,
+          owner: input.owner,
+          repo: input.repo,
+          prNumber: input.prNumber,
+          headSha: input.headSha,
+        },
+        'overseer.review.unverified_rereview_enqueue_failed'
+      );
+    }
+    return;
+  }
+
+  // Repeated unverified approval: tell the Duty Officer.
+  try {
+    const safeReason = redactSecretsFromErrorLine(reason).slice(0, 300);
+    const body = [
+      `Repeated UNVERIFIED approval on ${input.owner}/${input.repo}#${input.prNumber} at head ${input.headSha}.`,
+      'The one bounded re-review also could not verify; this PR must not be merged unattended.',
+      `reason: ${safeReason}`,
+    ].join('\n');
+    await dispatch.createAuthenticatedMessage(
+      { kind: 'system', sender: REVIEW_SENDER },
+      {
+        correlation_id: input.headSha,
+        idempotency_key: unverifiedApprovalEscalationKey(input),
+        task_type: 'agent_message',
+        recipient: 'duty-officer',
+        priority: 'normal',
+        subject_key: `gh:${input.owner}/${input.repo}#${input.prNumber}`,
+        // Required when the subject key already holds a terminal message; the
+        // unique idempotency_key is what actually bounds this to one row.
+        repeat_reason: `unverified approval escalation for head ${input.headSha}`,
+        body,
+      }
+    );
+  } catch (error) {
+    log.error(
+      {
+        error,
+        owner: input.owner,
+        repo: input.repo,
+        prNumber: input.prNumber,
+        headSha: input.headSha,
+      },
+      'overseer.review.unverified_escalation_failed'
+    );
   }
 }
 
@@ -1009,11 +1214,33 @@ export function createRealSubmitDeps(
             : {}),
         };
       }
-      const summary =
+      const findingsSummary =
         result.findings.length > 0
           ? result.findings
               .map(finding => `[${finding.severity}] ${finding.scope}: ${finding.summary}`)
               .join('\n')
+          : 'No blocking findings.';
+      // APPROVE_UNVERIFIED (WO node-failure-repair): an APPROVE the judge could
+      // not stand behind. NEVER collapse into `approved: true` -- it posts a
+      // COMMENT and records a non-mergeable verdict. The verification reason
+      // travels so the COMMENT, the recorded verdict and the duty-officer
+      // escalation can all state why.
+      if (result.verdict === 'APPROVE_UNVERIFIED') {
+        return {
+          approved: false,
+          approvedUnverified: true,
+          summary: findingsSummary,
+          reviewedHeadSha: result.reviewed_head_sha,
+          findings: result.findings,
+          ...(typeof result.verification_reason === 'string' &&
+          result.verification_reason.trim().length > 0
+            ? { verificationReason: result.verification_reason }
+            : {}),
+        };
+      }
+      const summary =
+        result.findings.length > 0
+          ? findingsSummary
           : result.verdict === 'INDETERMINATE'
             ? buildIndeterminateSummary(result.error)
             : 'No blocking findings.';
@@ -1066,6 +1293,18 @@ export function createRealSubmitDeps(
           },
         }
       );
+      // Unverified approval (WO node-failure-repair): record the held verdict,
+      // enqueue one bounded re-review, and escalate on repeat. Never throws.
+      if (input.disposition === 'approved_unverified') {
+        await handleUnverifiedApprovalOutcome({
+          owner: input.owner,
+          repo: input.repo,
+          prNumber: input.prNumber,
+          headSha: input.headSha,
+          model: modelReviewer.model,
+          verificationReason: input.verificationReason,
+        });
+      }
       if (blocked) {
         log.error(
           {

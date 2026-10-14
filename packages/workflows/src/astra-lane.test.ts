@@ -64,13 +64,31 @@ const attributionChanges = [
 ];
 
 describe('Astra build / Fable review lane', () => {
+  // WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01 adds a bounded
+  // commit-hook repair+retry chain to the CODEX lane only (5 new nodes) and
+  // adapts commit-and-push + open-pr-if-needed to it. That divergence is codex-only
+  // by WO scope; a follow-up WO fans the same change to astra and the other 11
+  // lanes. Until then astra mirrors codex for every SHARED, UNCHANGED node, and the
+  // ONLY codex/astra DAG difference is exactly those WO-scoped nodes.
+  const CODEX_ONLY_NODES = new Set([
+    'classify-commit-hook',
+    'commit-hook-repair',
+    'classify-commit-hook-repair',
+    'commit-hook-retry',
+    'commit-hook-gate',
+  ]);
+  const WO_DIVERGED_NODES = new Set(['commit-and-push', 'open-pr-if-needed']);
+
   it('loads the real workflow without changing any DAG behavior or gates', () => {
     registerBuiltinProviders();
     const parsed = parseWorkflow(astraText, 'bdc-feature-development-astra.yaml');
     expect(parsed.error).toBeNull();
     expect(parsed.workflow).toBeDefined();
+    const baselineShared = baseline.nodes.filter(
+      node => !CODEX_ONLY_NODES.has(node.id) && !WO_DIVERGED_NODES.has(node.id)
+    );
     const expected = JSON.parse(
-      JSON.stringify(baseline.nodes.map(withoutBindings)),
+      JSON.stringify(baselineShared.map(withoutBindings)),
       (_key, value: unknown) =>
         typeof value === 'string'
           ? attributionChanges.reduce(
@@ -79,7 +97,20 @@ describe('Astra build / Fable review lane', () => {
             )
           : value
     );
-    expect(astra.nodes.map(withoutBindings)).toEqual(expected);
+    const astraShared = astra.nodes.filter(node => !WO_DIVERGED_NODES.has(node.id));
+    expect(astraShared.map(withoutBindings)).toEqual(expected);
+
+    // The codex-only commit-hook nodes exist in codex but NOT in astra -- the
+    // divergence is exactly the WO's scoped additions and nothing else.
+    for (const id of CODEX_ONLY_NODES) {
+      expect(baseline.nodes.some(node => node.id === id)).toBe(true);
+      expect(astra.nodes.some(node => node.id === id)).toBe(false);
+    }
+    // Both lanes still carry the adapted nodes (shapes differ until the follow-up).
+    for (const id of WO_DIVERGED_NODES) {
+      expect(baseline.nodes.some(node => node.id === id)).toBe(true);
+      expect(astra.nodes.some(node => node.id === id)).toBe(true);
+    }
   });
 
   it('binds every prompt and loop seat, preserving different-family review', () => {

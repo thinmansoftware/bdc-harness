@@ -94,7 +94,13 @@ function mapSubmitOutcome(
     // enqueues a fresh item bound to the exact new head, so this item retiring
     // leaves no head unreviewed. TERMINAL, and `succeeded` rather than
     // `blocked` because supersession is the system working, not a failure.
+    // `approved_unverified` (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01):
+    // the review ran and produced a judgment the reviewer could not stand behind.
+    // The submit path already posted a COMMENT (not an APPROVE), recorded a
+    // non-mergeable verdict, and enqueued the one bounded re-review / escalation.
+    // So this work item is TERMINAL and succeeded -- the clock must not re-run it.
     case 'approved':
+    case 'approved_unverified':
     case 'changes_requested':
     case 'stale_head':
     case 'superseded_head':

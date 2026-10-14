@@ -18,12 +18,28 @@
  *   - createWorkflowEvent persistence for Mission Control "Workflow Decisions" tab
  *   - Per-WO-class override rules
  *   - LLM provider failover
+ *
+ * Node-failure Dispatch notification (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01):
+ *   handleNodeFailure now calls notifyNodeFailureEscalation on EVERY `escalate`
+ *   decision -- any node (bash or AI), any error class including `unknown`, with
+ *   or without an escalationContext. It writes one Dispatch message to recipient
+ *   'duty-officer' (so the Duty Officer digest carries the run id + failing node)
+ *   and, when the failure is a blocker (out_of_credits / auth_failed, or
+ *   commit_hook_lint_failure on attempt >= 2), ALSO one message to recipient 'xo'
+ *   at priority 'blocker'. This replaces the prior silent-exit behaviour where a
+ *   context-less escalate produced no operator-visible signal (anchor run
+ *   3993fe05, 2026-10-14). The write never throws and never re-enters this
+ *   handler; it does NOT replace the runEscalation operator-card path, it runs
+ *   alongside it.
  */
 
 import type { Logger } from '@archon/paths';
 import {
+  bdcXoSubjectKeyForRun,
   classifyError,
   decide,
+  isAlwaysBlockerClass,
+  notifyNodeFailureEscalation,
   permitFromMetadata,
   runAuthorizedEscalation,
   runEscalation,
@@ -260,6 +276,36 @@ export async function handleNodeFailure(
         }
       );
     }
+  }
+
+  // Node-failure Dispatch notification (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01).
+  //
+  // Gated on `result.decision === 'escalate'` ALONE -- NOT nested inside the
+  // escalationContext branch above -- so EVERY escalate writes a duty-officer
+  // message, including the `unknown` class and the older classes that carry no
+  // escalationContext (which previously returned failed with no operator-visible
+  // signal). A blocker ALSO messages recipient 'xo' at priority blocker. The
+  // call never throws and never re-enters this handler (no-loop guarantee lives
+  // in notifyNodeFailureEscalation).
+  if (result.decision === 'escalate') {
+    const blocker = isAlwaysBlockerClass(errorClass) || result.blocker === true;
+    await notifyNodeFailureEscalation(
+      { log: deps.log },
+      {
+        runId: workflowRun.id,
+        workflowName: workflowRun.workflow_name,
+        nodeId: node.id,
+        errorClass,
+        decision: result.decision,
+        attempt,
+        errorMsg: ctx.errorMsg,
+        blocker,
+        subjectKey: bdcXoSubjectKeyForRun({
+          metadata: workflowRun.metadata,
+          user_message: workflowRun.user_message,
+        }),
+      }
+    );
   }
 
   // Translate decision to NodeOutput state.

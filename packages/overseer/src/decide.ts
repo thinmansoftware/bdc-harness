@@ -40,6 +40,21 @@ export interface DecisionResult {
   /** Suggested backoff in ms if decision is retry */
   backoffMs?: number;
   /**
+   * Set for `commit_hook_lint_failure` on its FIRST occurrence: the lane may feed
+   * the hook output back to the builder for exactly one bounded repair pass and
+   * re-run commit-and-push. Absent/false on every other class and on the second
+   * occurrence (which is a blocker, see below).
+   */
+  repairableOnce?: boolean;
+  /**
+   * True when the failure has no remaining recovery path and a person must be
+   * told at priority blocker (out_of_credits, auth_failed, or
+   * commit_hook_lint_failure on attempt >= 2). The notification layer
+   * (overseer-bridge node-failure notify) reads this to decide whether to ALSO
+   * message recipient 'xo'. Absent/false otherwise.
+   */
+  blocker?: boolean;
+  /**
    * Optional structured payload for the escalation handler. Populated for the
    * silent-dead-end classes (implement_loop_no_output, validator_feedback_not_applied,
    * validator_rejected, implement_loop_skipped). When present AND decision==='escalate',
@@ -197,6 +212,30 @@ export function decide(input: DecideInput): DecisionResult {
         decision: 'escalate',
         reason:
           'spec lookup failed on retry -- WO_ID may not exist on bdc-xo main, operator must check',
+      };
+
+    case 'commit_hook_lint_failure':
+      // commit-and-push rejected by the husky pre-commit lint/format hook.
+      // FIRST occurrence (attempt 1): escalate but mark repairable-once, so the
+      // lane feeds the hook output back to the builder for exactly ONE bounded
+      // repair pass and re-runs commit-and-push (hooks intact, never bypassed).
+      // SECOND occurrence (attempt >= 2): the one repair pass did not fix it, so
+      // this is a blocker a person must triage.
+      if (attempt >= 2) {
+        return {
+          decision: 'escalate',
+          reason:
+            'commit-and-push failed the husky pre-commit lint/format hook a second time -- the one bounded repair pass did not clear it; operator triage required',
+          repairableOnce: false,
+          blocker: true,
+        };
+      }
+      return {
+        decision: 'escalate',
+        reason:
+          'commit-and-push failed the husky pre-commit lint/format hook -- feed the hook output back to the builder for one bounded repair pass, then re-run with hooks intact',
+        repairableOnce: true,
+        blocker: false,
       };
 
     // --- Silent-dead-end classes (BDC-specific 2026-05-18 Wave A anchor incidents) ---

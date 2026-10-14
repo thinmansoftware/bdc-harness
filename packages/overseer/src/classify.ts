@@ -47,6 +47,11 @@ export type ErrorClass =
   | 'validator_rejected' // war-council-validator stdout begins with REJECT/BLOCK/FAIL
   | 'implement_loop_skipped' // commit-and-push: thread branch HEAD-only, agent never wrote to disk
   | 'validator_sdk_contradiction' // non-loop node (e.g. war-council-validator): Anthropic SDK returned isError=true + errorSubtype='success' (bdc-harness#344), previously fell through to unknown with no escalation
+  // Commit-time hook failure (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01):
+  // commit-and-push failed because the husky pre-commit lint/format hook (lint-staged
+  // + eslint) rejected the staged delta. Repairable with exactly one bounded pass; NEVER
+  // bypassed with a commit hook-skip flag.
+  | 'commit_hook_lint_failure'
   // Fallback
   | 'unknown';
 
@@ -238,6 +243,24 @@ export function classifyError(input: ClassifyInput): ErrorClass {
     !msg.includes('not found') // not npm-not-found (already handled above)
   ) {
     return 'verify_pre_existing';
+  }
+
+  // Commit-time hook lint/format failure (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01).
+  //
+  // Only the commit-and-push node can produce this class: husky runs lint-staged
+  // (eslint --fix --max-warnings 0 ...) as a pre-commit hook, and a lint/format
+  // violation in the staged delta makes `git commit` exit non-zero. Gated on
+  // nodeId so the same hook text surfacing from an unrelated node (Test 2:
+  // build-manifest) is NOT captured, and gated on the hook markers so a plain
+  // commit-and-push failure such as a push rejection is NOT captured either.
+  // Checked BEFORE the unknown fallthrough; a lint error message never matches
+  // the provider/network patterns below, so position relative to them is moot.
+  if (
+    input.nodeId === 'commit-and-push' &&
+    (/husky - pre-commit script failed/i.test(rawMessage) ||
+      (/lint-staged/i.test(rawMessage) && rawMessage.includes('[FAILED]')))
+  ) {
+    return 'commit_hook_lint_failure';
   }
 
   // --- Provider/network classes (ported from router.py) ---

@@ -1162,3 +1162,65 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(body).toContain('policy thinmansoftware/bdc-harness:dev');
   });
 });
+
+describe('merge execution bridge -- unverified approval defense in depth (WO node-failure-repair)', () => {
+  const flagReadyVerdict = (id: string, head = 'judged-sha'): OverseerVerdictRow =>
+    ({
+      id,
+      run_id: `run-${id}`,
+      wo_id: 'WO-TEST',
+      head_sha: head,
+      proposed_action: 'flag_merge_ready',
+      verdict: 'merge_candidate',
+    }) as OverseerVerdictRow;
+
+  const unverifiedVerdict = (id: string, head = 'judged-sha'): OverseerVerdictRow =>
+    ({
+      id,
+      run_id: `run-${id}`,
+      wo_id: 'WO-TEST',
+      head_sha: head,
+      proposed_action: 'none',
+      verdict: 'approved_unverified',
+    }) as OverseerVerdictRow;
+
+  test('19 a flag_merge_ready verdict whose head has an approved_unverified record is skipped', async () => {
+    const h = harness([flagReadyVerdict('fmr'), unverifiedVerdict('unv')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    for (const o of h.outcomes) {
+      expect(o.reason).toBe('approval_unverified');
+      expect(o.mutationSent).toBe(false);
+    }
+    // Both rows were processed and skipped.
+    expect(h.outcomes.map(o => o.verdictId).sort()).toEqual(['fmr', 'unv']);
+  });
+
+  test('19 a bare approved_unverified verdict is skipped with approval_unverified, no merge', async () => {
+    const h = harness([unverifiedVerdict('unv-only')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.outcomes).toHaveLength(1);
+    expect(h.outcomes[0]?.reason).toBe('approval_unverified');
+  });
+
+  test('20 a verified flag_merge_ready verdict still merges exactly once', async () => {
+    const h = harness([flagReadyVerdict('verified')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(h.outcomes.some(o => o.reason === 'approval_unverified')).toBe(false);
+    expect(h.outcomes.some(o => o.reason === 'merge_executed')).toBe(true);
+  });
+});
