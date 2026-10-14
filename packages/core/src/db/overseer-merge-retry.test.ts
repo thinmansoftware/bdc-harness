@@ -90,9 +90,12 @@ describe('overseer merge retry store', () => {
       merge_last_transient_reason: string | null;
     }>(`SELECT id, actioned_at, action_reason, merge_attempts, merge_not_before,
               merge_last_transient_reason FROM overseer_verdicts ORDER BY id`);
-    expect(rows.rows.filter(row => row.actioned_at === null).map(row => row.id)).toEqual(['a', 'b']);
+    expect(rows.rows.filter(row => row.actioned_at === null).map(row => row.id)).toEqual([
+      'a',
+      'b',
+    ]);
     expect(rows.rows[0]?.merge_last_transient_reason).toBe('mergeable_state_not_clean');
-    expect((await requeueTransientMergeSkips({ dryRun: false, classify }))).toEqual({
+    expect(await requeueTransientMergeSkips({ dryRun: false, classify })).toEqual({
       matched: 0,
       requeued: 0,
       rows: [],
@@ -105,9 +108,15 @@ describe('overseer merge retry store', () => {
       `UPDATE overseer_verdicts SET action_reason = 'processing' WHERE id = 'deferred'`
     );
     const future = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-    expect(await deferVerdictClaimForMergeExecution('deferred', 'mergeable_state_not_clean', future)).toBe(true);
-    expect((await listUnactionedFlagMergeReadyVerdicts()).map(row => row.id)).not.toContain('deferred');
-    await db.query(`UPDATE overseer_verdicts SET merge_not_before = '2000-01-01T00:00:00.000Z' WHERE id = 'deferred'`);
+    expect(
+      await deferVerdictClaimForMergeExecution('deferred', 'mergeable_state_not_clean', future)
+    ).toBe(true);
+    expect((await listUnactionedFlagMergeReadyVerdicts()).map(row => row.id)).not.toContain(
+      'deferred'
+    );
+    await db.query(
+      `UPDATE overseer_verdicts SET merge_not_before = '2000-01-01T00:00:00.000Z' WHERE id = 'deferred'`
+    );
     const listed = await listUnactionedFlagMergeReadyVerdicts();
     expect(listed.find(row => row.id === 'deferred')?.merge_attempts).toBe(1);
     expect(await deferVerdictClaimForMergeExecution('deferred', 'again', future)).toBe(false);
@@ -134,7 +143,13 @@ describe('overseer merge retry store', () => {
     expect(names).toContain('merge_attempts');
     expect(names).toContain('merge_not_before');
     expect(names).toContain('merge_last_transient_reason');
-    expect((await db.query<{ merge_attempts: number }>(`SELECT merge_attempts FROM overseer_verdicts WHERE id = 'old'`)).rows[0]?.merge_attempts).toBe(0);
+    expect(
+      (
+        await db.query<{ merge_attempts: number }>(
+          `SELECT merge_attempts FROM overseer_verdicts WHERE id = 'old'`
+        )
+      ).rows[0]?.merge_attempts
+    ).toBe(0);
     await db.close();
     db = new SqliteAdapter(path);
   });

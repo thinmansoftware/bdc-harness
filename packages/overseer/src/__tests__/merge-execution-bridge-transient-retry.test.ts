@@ -45,7 +45,10 @@ function makeHarness(rows: OverseerVerdictRow[], evidence: () => PullRequestEvid
   let merges = 0;
   const store: MergeExecutionBridgeStore = {
     listUnactionedVerdicts: async () =>
-      rows.filter(row => !row.actioned_at && (!row.merge_not_before || row.merge_not_before <= clock.toISOString())),
+      rows.filter(
+        row =>
+          !row.actioned_at && (!row.merge_not_before || row.merge_not_before <= clock.toISOString())
+      ),
     claimVerdict: async id => {
       const row = rows.find(item => item.id === id);
       if (!row || row.actioned_at) return false;
@@ -107,7 +110,13 @@ function makeHarness(rows: OverseerVerdictRow[], evidence: () => PullRequestEvid
       service_enabled: true,
       emergency_stop: false,
       legacy_dry_run: false,
-      capability_flags: { escalation: false, repair: false, branch: false, lifecycle: false, merge: true },
+      capability_flags: {
+        escalation: false,
+        repair: false,
+        branch: false,
+        lifecycle: false,
+        merge: true,
+      },
     }),
     repoConfig: { 'thinmansoftware/bdc-harness': { baseBranch: 'dev' } },
   };
@@ -187,13 +196,65 @@ describe('merge execution bridge transient retry', () => {
     expect(h.outcomes).toHaveLength(0);
   });
 
+  test('rate-limit run-less PR lookup failure defers the verdict and ends the pass', async () => {
+    const runless = (id: string) =>
+      verdict(id, {
+        run_id: `pr-discovery:thinmansoftware/bdc-harness#${id === 'first' ? 1 : 2}`,
+        wo_id: `gh:thinmansoftware/bdc-harness#${id === 'first' ? 1 : 2}`,
+      });
+    const h = makeHarness([runless('first'), runless('second')], () => green());
+    let lookups = 0;
+    h.github.findPullRequest = async () => {
+      lookups += 1;
+      throw new Error('API rate limit exceeded for user ID 255238497.');
+    };
+    await runMergeExecutionBridgeOnce(h.options);
+    expect(h.deferrals[0]?.reason).toBe('pr_context_fetch_failed');
+    expect(h.claims).toEqual(['first']);
+    expect(lookups).toBe(1);
+    expect(h.outcomes).toHaveLength(0);
+  });
+
+  test.each(['10.5', '10junk'])(
+    'malformed retry integer %s falls back to the default',
+    async malformed => {
+      const previous = process.env.OVERSEER_MERGE_RETRY_BASE_MINUTES;
+      process.env.OVERSEER_MERGE_RETRY_BASE_MINUTES = malformed;
+      try {
+        const h = makeHarness([verdict(`malformed-${malformed}`)], () =>
+          green({ mergeable: null, mergeableState: 'unknown' })
+        );
+        h.options.retryBaseMinutes = undefined;
+        await runMergeExecutionBridgeOnce(h.options);
+        expect(h.deferrals[0]?.notBefore).toBe('2026-10-14T00:10:00.000Z');
+      } finally {
+        if (previous === undefined) delete process.env.OVERSEER_MERGE_RETRY_BASE_MINUTES;
+        else process.env.OVERSEER_MERGE_RETRY_BASE_MINUTES = previous;
+      }
+    }
+  );
+
   test('production-base and stale-head skips stay terminal', async () => {
     const cases: [string, PullRequestEvidence, Partial<OverseerVerdictRow>][] = [
       ['integration_base_mismatch', green({ baseBranch: 'other' }), {}],
       ['verdict_stale_head', green({ headSha: 'moved' }), {}],
       ['not_mergeable_dirty', green({ mergeable: false, mergeableState: 'dirty' }), {}],
-      ['head_moved', green({ headSha: 'moved' }), { run_id: 'pr-discovery:thinmansoftware/bdc-harness#1', wo_id: 'gh:thinmansoftware/bdc-harness#1' }],
-      ['base_not_allowlisted', green({ baseBranch: 'release/x' }), { run_id: 'pr-discovery:thinmansoftware/bdc-harness#1', wo_id: 'gh:thinmansoftware/bdc-harness#1' }],
+      [
+        'head_moved',
+        green({ headSha: 'moved' }),
+        {
+          run_id: 'pr-discovery:thinmansoftware/bdc-harness#1',
+          wo_id: 'gh:thinmansoftware/bdc-harness#1',
+        },
+      ],
+      [
+        'base_not_allowlisted',
+        green({ baseBranch: 'release/x' }),
+        {
+          run_id: 'pr-discovery:thinmansoftware/bdc-harness#1',
+          wo_id: 'gh:thinmansoftware/bdc-harness#1',
+        },
+      ],
     ];
     for (const [reason, pr, overrides] of cases) {
       const h = makeHarness([verdict(reason, overrides)], () => pr);
@@ -205,7 +266,10 @@ describe('merge execution bridge transient retry', () => {
   });
 
   test('fetch failure defers as pr_context_fetch_failed and old stores keep terminal behavior', async () => {
-    const row = verdict('fetch', { run_id: 'pr-discovery:thinmansoftware/bdc-harness#1', wo_id: 'gh:thinmansoftware/bdc-harness#1' });
+    const row = verdict('fetch', {
+      run_id: 'pr-discovery:thinmansoftware/bdc-harness#1',
+      wo_id: 'gh:thinmansoftware/bdc-harness#1',
+    });
     const modern = makeHarness([row], () => green());
     modern.github.findPullRequest = async () => {
       throw new Error('lookup failed');
@@ -213,7 +277,9 @@ describe('merge execution bridge transient retry', () => {
     await runMergeExecutionBridgeOnce(modern.options);
     expect(modern.deferrals[0]?.reason).toBe('pr_context_fetch_failed');
     expect(modern.outcomes).toHaveLength(0);
-    const legacy = makeHarness([verdict('legacy', { run_id: row.run_id, wo_id: row.wo_id })], () => green());
+    const legacy = makeHarness([verdict('legacy', { run_id: row.run_id, wo_id: row.wo_id })], () =>
+      green()
+    );
     delete legacy.store.deferVerdictClaim;
     legacy.github.findPullRequest = modern.github.findPullRequest;
     await runMergeExecutionBridgeOnce(legacy.options);

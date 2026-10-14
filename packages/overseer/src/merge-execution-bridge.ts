@@ -200,7 +200,8 @@ function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
 
 function configuredLimit(override?: number): number {
   if (override !== undefined) return override;
-  const parsed = Number.parseInt(process.env.OVERSEER_MAX_MERGES_PER_HOUR ?? '', 10);
+  const raw = process.env.OVERSEER_MAX_MERGES_PER_HOUR ?? '';
+  const parsed = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_MERGES_PER_HOUR;
 }
 
@@ -209,7 +210,8 @@ function configuredNonNegativeInteger(
   envName: string,
   fallback: number
 ): number {
-  const value = override ?? Number.parseInt(process.env[envName] ?? '', 10);
+  const raw = process.env[envName] ?? '';
+  const value = override ?? (/^\d+$/.test(raw) ? Number(raw) : Number.NaN);
   return Number.isInteger(value) && value >= 0 ? value : fallback;
 }
 
@@ -306,7 +308,7 @@ async function recordPostMutationOutcome(
   }
 }
 
-type SkipVerdict = (reason: string, prUrl?: string) => Promise<void>;
+type SkipVerdict = (reason: string, prUrl?: string, rateLimited?: boolean) => Promise<void>;
 
 interface MergeTarget {
   pr: PullRequestEvidence;
@@ -399,7 +401,11 @@ async function resolveRunlessTarget(
       },
       'merge-coordinator.pr_context_fetch_failed'
     );
-    await skip('pr_context_fetch_failed');
+    await skip(
+      'pr_context_fetch_failed',
+      undefined,
+      isRateLimitSkip(error instanceof Error ? error.message : '')
+    );
     return null;
   }
   if (!pr.exists || pr.pr?.number !== ref.prNumber) {
@@ -560,7 +566,7 @@ async function mergeClaimedVerdict(
   repoPolicy: MergeRepoPolicy
 ): Promise<'stop' | undefined> {
   let rateLimitDeferred = false;
-  const skip = async (reason: string, prUrl?: string): Promise<void> => {
+  const skip = async (reason: string, prUrl?: string, rateLimited = false): Promise<void> => {
     if (classifyMergeSkip(reason) === 'transient' && options.store.deferVerdictClaim) {
       const retryMaxAttempts = configuredNonNegativeInteger(
         options.retryMaxAttempts,
@@ -584,7 +590,7 @@ async function mergeClaimedVerdict(
         const notBefore = new Date(now.getTime() + delayMinutes * 60 * 1000).toISOString();
         const deferred = await options.store.deferVerdictClaim(verdict.id, reason, notBefore);
         if (deferred) {
-          rateLimitDeferred = isRateLimitSkip(reason);
+          rateLimitDeferred = rateLimited || isRateLimitSkip(reason);
           log.info(
             {
               verdictId: verdict.id,
@@ -633,7 +639,7 @@ async function mergeClaimedVerdict(
   }
 
   const target = await resolveMergeTarget(options, verdict, repoPolicy, skip);
-  if (!target) return undefined;
+  if (!target) return rateLimitDeferred ? 'stop' : undefined;
   const { pr, basePolicy } = target;
   if (!pr.exists || !pr.pr) {
     await skip(pr.lookupFailed ? 'pr_lookup_failed' : 'open_pr_not_found', pr.htmlUrl);
