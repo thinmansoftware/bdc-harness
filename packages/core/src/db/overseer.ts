@@ -393,15 +393,78 @@ export interface OverseerVerdictRow {
   action_reason: string | null;
   merge_sha: string | null;
   pr_url: string | null;
+  merge_attempts: number;
+  merge_not_before: string | null;
+  merge_last_transient_reason: string | null;
 }
 
 export async function listUnactionedFlagMergeReadyVerdicts(): Promise<OverseerVerdictRow[]> {
+  const now = new Date().toISOString();
   const result = await getDatabase().query<OverseerVerdictRow>(
     `SELECT * FROM overseer_verdicts
      WHERE proposed_action = 'flag_merge_ready' AND actioned_at IS NULL
-     ORDER BY created_at ASC`
+       AND (merge_not_before IS NULL OR merge_not_before <= $1)
+     ORDER BY created_at ASC`,
+    [now]
   );
   return [...result.rows];
+}
+
+export async function deferVerdictClaimForMergeExecution(
+  verdictId: string,
+  reason: string,
+  notBefore: string
+): Promise<boolean> {
+  const result = await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET actioned_at = NULL, mutation_sent = NULL, action_reason = NULL,
+         merge_attempts = merge_attempts + 1, merge_not_before = $3,
+         merge_last_transient_reason = $2, updated_at = $4
+     WHERE id = $1 AND actioned_at IS NOT NULL AND action_reason = 'processing'`,
+    [verdictId, reason, notBefore, new Date().toISOString()]
+  );
+  return result.rowCount === 1;
+}
+
+export interface RequeueTransientMergeSkipRow {
+  id: string;
+  pr_url: string | null;
+  head_sha: string;
+  action_reason: string;
+}
+
+export async function requeueTransientMergeSkips(input: {
+  dryRun: boolean;
+  classify: (reason: string) => 'transient' | 'terminal';
+}): Promise<{ matched: number; requeued: number; rows: RequeueTransientMergeSkipRow[] }> {
+  const db = getDatabase();
+  const candidates = await db.query<RequeueTransientMergeSkipRow>(
+    `SELECT id, pr_url, head_sha, action_reason FROM overseer_verdicts
+     WHERE proposed_action = 'flag_merge_ready'
+       AND actioned_at IS NOT NULL
+       AND mutation_sent = false
+       AND action_reason <> 'processing'
+       AND action_reason NOT LIKE 'transient_exhausted:%'`
+  );
+  const rows = candidates.rows.filter(row => input.classify(row.action_reason) === 'transient');
+  if (input.dryRun) return { matched: rows.length, requeued: 0, rows: [...rows] };
+
+  let requeued = 0;
+  for (const row of rows) {
+    const result = await db.query(
+      `UPDATE overseer_verdicts
+       SET actioned_at = NULL, mutation_sent = NULL, action_reason = NULL,
+           merge_not_before = NULL, merge_attempts = 0,
+           merge_last_transient_reason = $2, updated_at = $3
+       WHERE id = $1 AND proposed_action = 'flag_merge_ready'
+         AND actioned_at IS NOT NULL AND mutation_sent = false
+         AND action_reason = $2 AND action_reason <> 'processing'
+         AND action_reason NOT LIKE 'transient_exhausted:%'`,
+      [row.id, row.action_reason, new Date().toISOString()]
+    );
+    requeued += result.rowCount === 1 ? 1 : 0;
+  }
+  return { matched: rows.length, requeued, rows: [...rows] };
 }
 
 export async function countRecentOverseerVerdictMerges(since: string): Promise<number> {

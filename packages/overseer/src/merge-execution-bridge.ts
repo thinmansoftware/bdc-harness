@@ -34,6 +34,7 @@ import {
 import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
+import { classifyMergeSkip, isRateLimitSkip } from './merge-skip-classification';
 import {
   getScopeApprovalDecision,
   getScopeApprovalMetadata,
@@ -46,6 +47,9 @@ import {
 
 const log = createLogger('overseer/merge-coordinator');
 const DEFAULT_MAX_MERGES_PER_HOUR = 4;
+const DEFAULT_MERGE_RETRY_BASE_MINUTES = 10;
+const DEFAULT_MERGE_RETRY_MAX_DELAY_MINUTES = 240;
+const DEFAULT_MERGE_RETRY_MAX_ATTEMPTS = 8;
 const FLAG_MERGE_READY = 'flag_merge_ready';
 const RECEIPT_MARKER = '<!-- merge-manager-receipt -->';
 const RECEIPT_KEY_PREFIX = '<!-- merge-manager-receipt-key';
@@ -55,6 +59,7 @@ export interface MergeExecutionBridgeStore {
   listUnactionedVerdicts(): Promise<OverseerVerdictRow[]>;
   claimVerdict(verdictId: string): Promise<boolean>;
   releaseVerdictClaim(verdictId: string, reason: string): Promise<boolean>;
+  deferVerdictClaim?(verdictId: string, reason: string, notBefore: string): Promise<boolean>;
   getRunById(runId: string): Promise<OverseerWatchRun | null>;
   // Optional so older/test stores that predate the active-run guard keep prior
   // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
@@ -76,6 +81,9 @@ export interface MergeExecutionBridgeOptions {
   readPolicy?: () => OverseerActionPolicy;
   now?: () => Date;
   maxMergesPerHour?: number;
+  retryBaseMinutes?: number;
+  retryMaxDelayMinutes?: number;
+  retryMaxAttempts?: number;
   repoConfig?: MergeExecutionRepoConfig;
   ceScopeRecheckDeps?: CeScopeRecheckDeps;
 }
@@ -194,6 +202,15 @@ function configuredLimit(override?: number): number {
   if (override !== undefined) return override;
   const parsed = Number.parseInt(process.env.OVERSEER_MAX_MERGES_PER_HOUR ?? '', 10);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_MERGES_PER_HOUR;
+}
+
+function configuredNonNegativeInteger(
+  override: number | undefined,
+  envName: string,
+  fallback: number
+): number {
+  const value = override ?? Number.parseInt(process.env[envName] ?? '', 10);
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
 }
 
 function isOwnerRepoIdentity(key: string): boolean {
@@ -382,7 +399,7 @@ async function resolveRunlessTarget(
       },
       'merge-coordinator.pr_context_fetch_failed'
     );
-    await skip('pr_context_unresolvable');
+    await skip('pr_context_fetch_failed');
     return null;
   }
   if (!pr.exists || pr.pr?.number !== ref.prNumber) {
@@ -542,7 +559,49 @@ async function mergeClaimedVerdict(
   verdict: OverseerVerdictRow,
   repoPolicy: MergeRepoPolicy
 ): Promise<'stop' | undefined> {
+  let rateLimitDeferred = false;
   const skip = async (reason: string, prUrl?: string): Promise<void> => {
+    if (classifyMergeSkip(reason) === 'transient' && options.store.deferVerdictClaim) {
+      const retryMaxAttempts = configuredNonNegativeInteger(
+        options.retryMaxAttempts,
+        'OVERSEER_MERGE_RETRY_MAX_ATTEMPTS',
+        DEFAULT_MERGE_RETRY_MAX_ATTEMPTS
+      );
+      const attempts = verdict.merge_attempts ?? 0;
+      if (attempts + 1 < retryMaxAttempts) {
+        const baseMinutes = configuredNonNegativeInteger(
+          options.retryBaseMinutes,
+          'OVERSEER_MERGE_RETRY_BASE_MINUTES',
+          DEFAULT_MERGE_RETRY_BASE_MINUTES
+        );
+        const maxDelayMinutes = configuredNonNegativeInteger(
+          options.retryMaxDelayMinutes,
+          'OVERSEER_MERGE_RETRY_MAX_DELAY_MINUTES',
+          DEFAULT_MERGE_RETRY_MAX_DELAY_MINUTES
+        );
+        const delayMinutes = Math.min(baseMinutes * 2 ** attempts, maxDelayMinutes);
+        const now = (options.now ?? ((): Date => new Date()))();
+        const notBefore = new Date(now.getTime() + delayMinutes * 60 * 1000).toISOString();
+        const deferred = await options.store.deferVerdictClaim(verdict.id, reason, notBefore);
+        if (deferred) {
+          rateLimitDeferred = isRateLimitSkip(reason);
+          log.info(
+            {
+              verdictId: verdict.id,
+              runId: verdict.run_id,
+              woId: verdict.wo_id,
+              reason,
+              prUrl,
+              notBefore,
+              mergeAttempts: attempts + 1,
+            },
+            'merge-coordinator.merge_deferred'
+          );
+        }
+        return;
+      }
+      reason = `transient_exhausted:${reason}`;
+    }
     await options.store.recordOutcome({
       verdictId: verdict.id,
       mutationSent: false,
@@ -746,7 +805,7 @@ async function mergeClaimedVerdict(
       error instanceof Error && error.message ? `merge_failed:${error.message}` : 'merge_failed',
       pr.htmlUrl
     );
-    return undefined;
+    return rateLimitDeferred ? 'stop' : undefined;
   }
   if (!merged.merged) {
     if (merged.message === 'github_merge_transport_ambiguous') {
@@ -759,7 +818,7 @@ async function mergeClaimedVerdict(
     }
     await options.store.releaseMergeSlot(verdict.id);
     await skip(merged.message ?? 'merge_failed', pr.htmlUrl);
-    return undefined;
+    return rateLimitDeferred ? 'stop' : undefined;
   }
   const persisted = await recordPostMutationOutcome(options, verdict, {
     reason: 'merge_executed',
