@@ -100,7 +100,7 @@ export function classifyError(input: ClassifyInput): ErrorClass {
   // builder or validation node is ordinary command output and must not trigger
   // the bounded commit repair path.
   if (
-    input.nodeId === 'commit-and-push' &&
+    (input.nodeId === 'commit-and-push' || input.nodeId === 'commit-and-push-retry') &&
     (/husky - pre-commit script failed/i.test(rawMessage) ||
       (/lint-staged/i.test(rawMessage) && /\[FAILED\]/i.test(rawMessage)))
   ) {

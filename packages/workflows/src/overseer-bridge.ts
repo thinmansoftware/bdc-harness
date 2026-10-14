@@ -112,7 +112,8 @@ export async function handleNodeFailure(
   node: DagNode,
   ctx: HandleNodeFailureContext
 ): Promise<HandleNodeFailureResult> {
-  const attempt = ctx.attempt ?? 1;
+  const attempt =
+    node.id === 'commit-and-push-retry' ? Math.max(ctx.attempt ?? 1, 2) : (ctx.attempt ?? 1);
   const hasOutput = ctx.hasOutput ?? false;
 
   const errorClass = classifyError({
@@ -147,7 +148,8 @@ export async function handleNodeFailure(
       metadata: workflowRun.metadata,
       userMessage: workflowRun.user_message,
       loadBearing: node.load_bearing === true,
-      retryPathRemaining: result.decision === 'retry',
+      retryPathRemaining:
+        result.decision === 'retry' || (errorClass === 'commit_hook_lint_failure' && attempt < 2),
     },
     deps.log
   );

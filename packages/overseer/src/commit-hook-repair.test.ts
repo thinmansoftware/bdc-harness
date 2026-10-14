@@ -26,6 +26,9 @@ describe('commit hook repair contract', () => {
     expect(classifyError({ nodeId: 'commit-and-push', message: 'git push rejected' })).not.toBe(
       'commit_hook_lint_failure'
     );
+    expect(classifyError({ nodeId: 'commit-and-push-retry', message: hookFailure })).toBe(
+      'commit_hook_lint_failure'
+    );
   });
 
   test('real_hook_repair_roundtrip', () => {
@@ -39,7 +42,7 @@ describe('commit hook repair contract', () => {
       '.archon/workflows/defaults/bdc-feature-development-codex.yaml',
       'utf8'
     );
-    expect(lane).toContain('.archon/scripts/commit-and-push.sh 1');
+    expect(lane).not.toContain('.archon/scripts/commit-and-push.sh 1');
     expect(lane).toContain('.archon/scripts/commit-and-push.sh 2');
     expect(lane).not.toContain('.archon/scripts/commit-and-push.sh 3');
   });
@@ -51,6 +54,7 @@ describe('commit hook repair contract', () => {
     );
     expect(lane.match(/id: commit-hook-repair/g)?.length).toBe(1);
     expect(lane).toContain('OPUS_REPAIR=fixed');
+    expect(lane).toContain('id: qualify-commit-hook-repair');
   });
 
   test('unpushed_repair_makes_open_pr_draft', () => {

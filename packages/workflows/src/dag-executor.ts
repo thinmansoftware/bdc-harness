@@ -999,9 +999,24 @@ function hasPositiveUsage(tokens: TokenUsage | undefined, cost: number | undefin
 export const SDK_CONTRADICTION_BACKOFF_MAX_TOTAL_MS = 240_000;
 const SDK_CONTRADICTION_BACKOFFS_MS = [30_000, 120_000] as const;
 
-function sdkContradictionWaitMs(baseMs: number, random: () => number): number {
+export function sdkContradictionWaitMs(baseMs: number, random: () => number): number {
   const factor = Math.min(1.2, Math.max(0.8, 0.8 + random() * 0.4));
   return Math.round(baseMs * factor);
+}
+
+export async function waitForSdkContradictionBackoff(
+  waitMs: number,
+  sleep: (ms: number) => Promise<void>,
+  isRunLeaseValid: (() => boolean) | undefined
+): Promise<boolean> {
+  let remaining = waitMs;
+  while (remaining > 0) {
+    if (isRunLeaseValid?.() === false) return false;
+    const sliceMs = Math.min(remaining, 250);
+    await sleep(sliceMs);
+    remaining -= sliceMs;
+  }
+  return isRunLeaseValid?.() !== false;
 }
 
 function stringifySdkFields(msg: {
@@ -6222,14 +6237,16 @@ async function executeDagWorkflowInternal(
                   },
                   'dag.sdk_contradiction_backoff'
                 );
-                await (
+                const completedBackoff = await waitForSdkContradictionBackoff(
+                  waitMs,
                   deps.sleep ??
-                  ((ms: number): Promise<void> =>
-                    new Promise(resolve => {
-                      setTimeout(resolve, ms);
-                    }))
-                )(waitMs);
-                if (deps.isRunLeaseValid?.() === false) break;
+                    ((ms: number): Promise<void> =>
+                      new Promise(resolve => {
+                        setTimeout(resolve, ms);
+                      })),
+                  deps.isRunLeaseValid
+                );
+                if (!completedBackoff) break;
               } else {
                 // Preserve the historical one immediate retry only when the first
                 // execution itself had the zero-token engine-dark signature.

@@ -410,6 +410,16 @@ export async function listUnactionedFlagMergeReadyVerdicts(): Promise<OverseerVe
   return [...result.rows];
 }
 
+export async function hasUnverifiedApprovalForHead(verdict: OverseerVerdictRow): Promise<boolean> {
+  const result = await getDatabase().query<{ present: number }>(
+    `SELECT 1 AS present FROM overseer_verdicts
+     WHERE head_sha = $1 AND verdict = 'approved_unverified'
+     LIMIT 1`,
+    [verdict.head_sha]
+  );
+  return result.rows.length > 0;
+}
+
 export async function deferVerdictClaimForMergeExecution(
   verdictId: string,
   reason: string,

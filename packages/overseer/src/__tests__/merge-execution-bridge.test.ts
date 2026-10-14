@@ -76,6 +76,7 @@ function harness(
   let occupied = recentMerges;
   const slots = new Map<string, { released: boolean }>();
   const store: MergeExecutionBridgeStore = {
+    hasUnverifiedApprovalForHead: async () => false,
     listUnactionedVerdicts: async () => [...pending],
     claimVerdict: async verdictId => {
       if (!pending.some(row => row.id === verdictId)) return false;
@@ -455,6 +456,7 @@ describe('merge execution bridge', () => {
       occupied -= 1;
     };
     const storeFor = (id: string): MergeExecutionBridgeStore => ({
+      hasUnverifiedApprovalForHead: async () => false,
       listUnactionedVerdicts: async () => [verdict(id)],
       claimVerdict: async () => true,
       releaseVerdictClaim: async (verdictId, reason) => {

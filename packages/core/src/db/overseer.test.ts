@@ -21,6 +21,7 @@ import {
   getOverseerLastVerdictAt,
   getOverseerVerdictsForRun,
   getOverseerWatchRunById,
+  hasUnverifiedApprovalForHead,
   hasReconcileActionForPr,
   insertOverseerAction,
   insertReconcileAction,
@@ -665,6 +666,20 @@ describe('overseer db', () => {
     expect(listed[0]?.actioned_at).toBeNull();
     expect(listed[0]?.action_reason).toBeNull();
     expect(await claimVerdictForMergeExecution('verdict-release')).toBe(true);
+  });
+
+  test('detects an unverified approval shadowing a merge-ready head', async () => {
+    await seedRun('run-ready');
+    await seedRun('run-unverified');
+    await db.query(
+      `INSERT INTO overseer_verdicts (id, run_id, wo_id, head_sha, verdict, proposed_action)
+       VALUES
+         ('verdict-ready', 'run-ready', 'WO-READY', 'shared-head', 'merge_candidate', 'flag_merge_ready'),
+         ('verdict-unverified', 'run-unverified', 'WO-UNVERIFIED', 'shared-head', 'approved_unverified', 'none')`
+    );
+    const ready = (await listUnactionedFlagMergeReadyVerdicts())[0];
+    expect(ready).toBeDefined();
+    expect(await hasUnverifiedApprovalForHead(ready!)).toBe(true);
   });
 
   test('releaseVerdictClaimForMergeExecution never un-finalizes a recorded outcome', async () => {

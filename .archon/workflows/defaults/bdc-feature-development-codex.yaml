@@ -3612,8 +3612,6 @@ nodes:
       printf 'UNIQUE_BRANCH=%q\nCOMMIT_MESSAGE=%q\nREPAIR_TARGET_LEASE_SHA=%q\n' \
         "$UNIQUE_BRANCH" "$COMMIT_MESSAGE" "${REPAIR_TARGET_LEASE_SHA:-}" \
         > "$ARTIFACTS_DIR/commit-and-push.env"
-      .archon/scripts/commit-and-push.sh 1
-      exit 0
       DIRTY=$(git status --porcelain)
       if [ -z "$DIRTY" ]; then
         # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: do NOT exit 0 here on the
@@ -3709,7 +3707,11 @@ nodes:
           WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
           COMMIT_MESSAGE="feat: ${WO_ID} implementation"
         fi
-        git commit -m "$COMMIT_MESSAGE"
+        git diff --cached --name-only > "$ARTIFACTS_DIR/commit-hook-staged-paths.txt"
+        if ! git commit -m "$COMMIT_MESSAGE" > "$ARTIFACTS_DIR/commit-hook-output.txt" 2>&1; then
+          cat "$ARTIFACTS_DIR/commit-hook-output.txt" >&2
+          exit 1
+        fi
       fi
 
       # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
@@ -3765,10 +3767,28 @@ nodes:
       echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
       echo "unique_branch=${UNIQUE_BRANCH}"
 
-  - id: commit-hook-repair
-    agent: major-build
+  - id: qualify-commit-hook-repair
     depends_on: [commit-and-push]
     trigger_rule: all_done
+    output_format:
+      type: object
+      properties:
+        qualified:
+          type: boolean
+      required: [qualified]
+    bash: |
+      set -euo pipefail
+      HOOK_OUTPUT="$ARTIFACTS_DIR/commit-hook-output.txt"
+      if [ -s "$HOOK_OUTPUT" ] && grep -Eqi 'husky - pre-commit script failed|lint-staged.*\[FAILED\]' "$HOOK_OUTPUT"; then
+        printf '{"qualified":true}\n'
+      else
+        printf '{"qualified":false}\n'
+      fi
+
+  - id: commit-hook-repair
+    agent: major-build
+    depends_on: [qualify-commit-hook-repair]
+    when: "$qualify-commit-hook-repair.output.qualified == 'true'"
     task_class: medium_work
     prompt: |
       The commit-and-push node may have failed a pre-commit lint or format hook.
@@ -3816,10 +3836,17 @@ nodes:
         exit 1
       fi
 
+  - id: commit-and-push-complete
+    depends_on: [commit-and-push, commit-and-push-retry]
+    trigger_rule: one_success
+    bash: |
+      set -euo pipefail
+      echo "commit-and-push complete"
+
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
     persona: major-build
-    depends_on: [commit-and-push-retry]
+    depends_on: [commit-and-push-complete]
     task_class: clerical
     load_bearing: true
     bash: |

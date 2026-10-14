@@ -8,7 +8,14 @@ message="${COMMIT_MESSAGE:-feat: ${WO_ID:-work order} implementation}"
 mkdir -p "$artifacts_dir"
 printf '%s\n' "$attempt" > "$artifacts_dir/commit-hook-attempt.txt"
 
-git add -A
+staged_paths_file="$artifacts_dir/commit-hook-staged-paths.txt"
+if [ ! -s "$staged_paths_file" ]; then
+  echo "ERROR: guarded staged-path record is missing; refusing to stage the worktree" >&2
+  exit 1
+fi
+while IFS= read -r path; do
+  [ -n "$path" ] && git add -- "$path"
+done < "$staged_paths_file"
 if ! git diff --cached --quiet; then
   hook_output="$artifacts_dir/commit-hook-output.txt"
   if ! git commit -m "$message" >"$hook_output" 2>&1; then

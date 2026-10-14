@@ -65,7 +65,7 @@ export interface MergeExecutionBridgeStore {
   // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
   hasActiveRunForWo?(woId: string): Promise<boolean>;
   /** Defense in depth for a merge-ready row shadowed by an unverified approval. */
-  hasUnverifiedApprovalForHead?(verdict: OverseerVerdictRow): Promise<boolean>;
+  hasUnverifiedApprovalForHead(verdict: OverseerVerdictRow): Promise<boolean>;
   reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
   releaseMergeSlot(verdictId: string): Promise<void>;
   recordOutcome(input: {
@@ -869,7 +869,7 @@ export async function runMergeExecutionBridgeOnce(
     }
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
     if (!(await options.store.claimVerdict(verdict.id))) continue;
-    if (await options.store.hasUnverifiedApprovalForHead?.(verdict)) {
+    if (await options.store.hasUnverifiedApprovalForHead(verdict)) {
       await options.store.releaseVerdictClaim(verdict.id, 'approval_unverified');
       log.info({ verdictId: verdict.id, reason: 'approval_unverified' }, 'merge-coordinator.skip');
       continue;
