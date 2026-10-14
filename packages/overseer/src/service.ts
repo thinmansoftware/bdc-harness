@@ -2,6 +2,7 @@ import { createLogger } from '@archon/paths';
 import {
   claimOverseerVerdict,
   claimVerdictForMergeExecution,
+  deferVerdictClaimForMergeExecution,
   finalizeOverseerVerdict,
   getOverseerWatchRunById,
   insertOverseerAction,
@@ -432,6 +433,7 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
             listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
             claimVerdict: claimVerdictForMergeExecution,
             releaseVerdictClaim: releaseVerdictClaimForMergeExecution,
+            deferVerdictClaim: deferVerdictClaimForMergeExecution,
             getRunById: getOverseerWatchRunById,
             hasActiveRunForWo: (woId: string) => hasActiveRunForWo(woId, listActiveRunUserMessages),
             reserveMergeSlot: reserveOverseerMergeSlot,

@@ -815,8 +815,13 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(h.outcomes[0]).toEqual(expect.objectContaining({ mutationSent: false, reason }));
   });
 
-  test('(e) records pr_context_unresolvable and sends no mutation when the fetch throws', async () => {
+  test('(e) defers pr_context_fetch_failed and sends no mutation when the fetch throws', async () => {
     const { h } = runlessHarness([runlessVerdict('runless-throws')]);
+    const deferrals: { verdictId: string; reason: string; notBefore: string }[] = [];
+    h.store.deferVerdictClaim = async (verdictId, reason, notBefore) => {
+      deferrals.push({ verdictId, reason, notBefore });
+      return true;
+    };
     h.github.findPullRequest = async () => {
       throw new Error('github unavailable');
     };
@@ -825,14 +830,10 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(h.approvals).toBe(0);
     expect(h.occupied).toBe(0);
     expect(h.claimReleases).toEqual([]);
-    expect(h.outcomes).toEqual([
-      expect.objectContaining({
-        verdictId: 'runless-throws',
-        mutationSent: false,
-        reason: 'pr_context_unresolvable',
-      }),
+    expect(h.outcomes).toEqual([]);
+    expect(deferrals).toEqual([
+      expect.objectContaining({ verdictId: 'runless-throws', reason: 'pr_context_fetch_failed' }),
     ]);
-    expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
   });
 
   test('(f) a verdict WITH a run id whose run row is missing still records run_context_unresolvable', async () => {
