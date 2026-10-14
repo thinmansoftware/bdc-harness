@@ -755,6 +755,9 @@ export class SqliteAdapter implements IDatabase {
         ['action_reason', 'TEXT'],
         ['merge_sha', 'TEXT'],
         ['pr_url', 'TEXT'],
+        ['merge_attempts', 'INTEGER NOT NULL DEFAULT 0'],
+        ['merge_not_before', 'TEXT'],
+        ['merge_last_transient_reason', 'TEXT'],
       ];
       for (const [name, definition] of additions) {
         if (!verdictColNames.has(name)) {
@@ -2280,6 +2283,9 @@ export class SqliteAdapter implements IDatabase {
         action_reason TEXT,
         merge_sha TEXT,
         pr_url TEXT,
+        merge_attempts INTEGER NOT NULL DEFAULT 0,
+        merge_not_before TEXT,
+        merge_last_transient_reason TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
