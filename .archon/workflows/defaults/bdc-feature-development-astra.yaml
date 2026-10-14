@@ -2295,7 +2295,7 @@ nodes:
   # executor-honest: Codex is read-only and CANNOT write files; until_bash CANNOT prove a
   # semantic Codex objection was fixed. So: codex reviews (stdout only) -> major-build repairs
   # (reads codex stdout in-prompt, until_bash checks MECHANICAL invariants only) -> codex
-  # RE-REVIEWS for real and decides. Cross-model: Terra (gpt-5.6-terra) reviews Sol-authored code.
+  # RE-REVIEWS for real and decides. Cross-model: cross-family reviewer evaluates builder-authored code.
   # capture-diff: the Codex reviewer persona is read-only [Read,Grep,Glob] with NO Bash,
   # so it cannot run `git diff` itself (F5 fix). This bash node captures the full feature
   # diff (merge-base..HEAD plus any unstaged working-tree changes) to an artifact the

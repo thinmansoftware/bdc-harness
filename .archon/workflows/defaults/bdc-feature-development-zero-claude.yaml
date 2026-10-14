@@ -3009,8 +3009,8 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: codex-opr
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     # Codex quota exhaustion routes sideways through the OpenRouter tool-loop provider via node-failover.ts.
     failover_provider: openrouter
     failover_model: deepseek/deepseek-v4-pro-0813

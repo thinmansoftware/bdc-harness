@@ -84,6 +84,7 @@ describe('lane registration and war-council-validator pin', () => {
       'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-haiku.yaml',
       'bdc-feature-development-kimi-k3.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
@@ -149,10 +150,10 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-cursor.yaml') {
-        // Grok 4.7 builds on the Cursor rail; the judge is Codex gpt-5.6-sol
+        // Grok 4.7 builds on the Cursor rail; the judge is Codex gpt-6-astra
         // so the lane never grades its own work.
-        expect(wcv.provider).toBe('codex');
-        expect(wcv.model).toBe('gpt-5.6-sol');
+        expect(wcv.provider).toBe('codex-native-strict');
+        expect(wcv.model).toBe('gpt-6-astra');
         expect(wcv.persona).toBe('captain-ci-validator-codex');
         return;
       }
@@ -170,14 +171,20 @@ describe('lane registration and war-council-validator pin', () => {
         return;
       }
 
+      if (file === 'bdc-feature-development-haiku.yaml') {
+        expect(wcv.provider).toBe('codex-native-strict');
+        expect(wcv.model).toBe('gpt-6-astra');
+        return;
+      }
+
       if (file === 'bdc-feature-development-codex-only.yaml') {
         // Claude-out / Codex-in: validator on codex with model-free persona.
-        expect(wcv.provider).toBe('codex');
+        expect(wcv.provider).toBe('codex-native-strict');
         return;
       }
 
       if (file === 'bdc-feature-development-codex.yaml') {
-        // This lane builds with gpt-5.6-sol. The judge is gpt-5.6-terra so
+        // This lane builds with gpt-6-astra. The judge is gpt-5.6-terra so
         // the builder never grades its own work.
         expect(wcv.provider).toBe('codex');
         expect(wcv.model).toBe('gpt-5.6-terra');
@@ -191,7 +198,7 @@ describe('lane registration and war-council-validator pin', () => {
       // and stays on the CLOSER rung (see the codex-lane branch above, which
       // is correct and unchanged).
       const expectedModel =
-        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'sonnet';
+        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'claude-sonnet-5-5';
       expect(wcv.provider).toBe('claude');
       expect(wcv.model).toBe(expectedModel);
     });
@@ -298,7 +305,7 @@ describe('lane registration and war-council-validator pin', () => {
     return node?.persona ?? node?.agent;
   }
 
-  it('S4l: the Cursor lane builds on grok-4.7 and reviews on Codex gpt-5.6-sol', () => {
+  it('S4l: the Cursor lane builds on grok-4.7 and reviews on Codex gpt-6-astra', () => {
     const file = 'bdc-feature-development-cursor.yaml';
     const lane = loadLane(file);
     const grok = loadLane('bdc-feature-development-grok.yaml');
@@ -325,9 +332,8 @@ describe('lane registration and war-council-validator pin', () => {
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = node(id);
       const source = codexNode(id);
-      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex');
-      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe(source?.provider);
-      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-5.6-sol');
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
+      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-6-astra');
       expect(source?.model, `codex:${id}:model`).toBe('gpt-5.6-terra');
       expect(reviewNode?.persona, `${file}:${id}:persona`).toBe(source?.persona);
       expect(reviewNode?.agent, `${file}:${id}:agent`).toBe(source?.agent);
@@ -344,20 +350,22 @@ describe('lane registration and war-council-validator pin', () => {
     ]) {
       const buildNode = node(id);
       expect(buildNode?.provider, `${file}:${id}:provider`).toBe('cursor');
-      expect(buildNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
+      expect(buildNode?.model, `${file}:${id}:model`).toBe(
+        id === 'check-already-satisfied' ? 'grok-4.7-medium' : 'grok-4.7-high'
+      );
     }
     const content = readFileSync(join(LANES_DIR, file), 'utf-8');
     expect(content).not.toMatch(/^\s*provider:\s*claude\b/m);
     expect(content).not.toMatch(/^\s*provider:\s*(grok|codex-opr)\b/m);
   });
 
-  it('Test 1: cursor-lane review seats are Codex gpt-5.6-sol with model-free personas', () => {
+  it('Test 1: cursor-lane review seats are Codex gpt-6-astra with model-free personas', () => {
     const lane = loadLane('bdc-feature-development-cursor.yaml');
     const nodes = lane.nodes ?? [];
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = nodes.find(candidate => candidate.id === id);
-      expect(reviewNode?.provider, id).toBe('codex');
-      expect(reviewNode?.model, id).toBe('gpt-5.6-sol');
+      expect(reviewNode?.provider, id).toBe('codex-native-strict');
+      expect(reviewNode?.model, id).toBe('gpt-6-astra');
       expect(reviewNode?.provider, id).not.toBe('claude');
       expect(reviewNode?.provider, id).not.toBe('cursor');
       expect(reviewNode?.model ?? '', id).not.toMatch(/grok/i);
@@ -376,7 +384,7 @@ describe('lane registration and war-council-validator pin', () => {
       const reviewNode = nodes.find(candidate => candidate.id === id);
       expect(reviewNode?.provider, id).toBe('codex');
       expect(reviewNode?.model, id).toBe('gpt-5.6-terra');
-      expect(reviewNode?.model, id).not.toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, id).not.toBe('gpt-6-astra');
       expect(reviewNode?.provider, id).not.toBe('claude');
       const persona = reviewPersona(reviewNode);
       expect(REVIEW_PERSONA_ALLOWLIST.has(persona ?? ''), id).toBe(true);
@@ -394,19 +402,19 @@ describe('lane registration and war-council-validator pin', () => {
     }
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = (cursor.nodes ?? []).find(candidate => candidate.id === id);
-      expect(reviewNode?.model, `cursor:${id}`).toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, `cursor:${id}`).toBe('gpt-6-astra');
       expect(reviewNode?.model, `cursor:${id}`).not.toBe(cursor.model);
     }
 
     for (const id of buildIds) {
       const buildNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
       const model = buildNode?.model ?? codex.model;
-      expect(model, `codex:${id}`).toBe('gpt-5.6-sol');
+      expect(model, `codex:${id}`).toBe('gpt-6-astra');
     }
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
       expect(reviewNode?.model, `codex:${id}`).toBe('gpt-5.6-terra');
-      expect(reviewNode?.model, `codex:${id}`).not.toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, `codex:${id}`).not.toBe('gpt-6-astra');
       expect(reviewNode?.model, `codex:${id}`).not.toBe(codex.model);
     }
   });
@@ -434,7 +442,9 @@ describe('lane registration and war-council-validator pin', () => {
     ]) {
       const executionNode = node(id);
       expect(executionNode?.provider, `${file}:${id}:provider`).toBe('cursor');
-      expect(executionNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
+      expect(executionNode?.model, `${file}:${id}:model`).toBe(
+        id === 'check-already-satisfied' ? 'grok-4.7-medium' : 'grok-4.7-high'
+      );
       expect(executionNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }
 
@@ -448,7 +458,7 @@ describe('lane registration and war-council-validator pin', () => {
       'apply-diff-review-final',
     ]) {
       const reviewNode = node(id);
-      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-opr');
+      expect(['codex-opr', 'codex-native-strict']).toContain(reviewNode?.provider);
       expect(reviewNode?.model, `${file}:${id}:model`).not.toBe('grok-4.7-high');
       expect(reviewNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }
