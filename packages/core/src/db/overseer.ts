@@ -425,6 +425,19 @@ export async function hasUnresolvedUnverifiedApproval(
   return result.rows.length > 0;
 }
 
+/** Resolve every outstanding unverified approval for an exact PR head after verification succeeds. */
+export async function resolveUnverifiedApprovals(prUrl: string, headSha: string): Promise<number> {
+  const now = new Date().toISOString();
+  const result = await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET actioned_at = $3, mutation_sent = false, action_reason = 'approval_verified', updated_at = $3
+     WHERE verdict = 'approved_unverified' AND pr_url = $1 AND head_sha = $2
+       AND actioned_at IS NULL`,
+    [prUrl, headSha, now]
+  );
+  return result.rowCount;
+}
+
 export async function deferVerdictClaimForMergeExecution(
   verdictId: string,
   reason: string,

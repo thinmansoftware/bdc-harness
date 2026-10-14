@@ -125,7 +125,10 @@ export async function handleNodeFailure(
   node: DagNode,
   ctx: HandleNodeFailureContext
 ): Promise<HandleNodeFailureResult> {
-  const attempt = ctx.attempt ?? 1;
+  // The bounded commit-hook repair is represented by a second DAG node rather
+  // than an executor-level retry counter. Preserve that logical run attempt so
+  // a second hook failure reaches blocker/XO escalation.
+  const attempt = ctx.attempt ?? (node.id === 'commit-and-push-retry' ? 2 : 1);
   const hasOutput = ctx.hasOutput ?? false;
 
   const errorClass = classifyError({

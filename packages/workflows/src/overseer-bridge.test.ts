@@ -318,4 +318,24 @@ describe('handleNodeFailure -- side effects', () => {
     });
     expect(result.output.output).toBe('partial response so far');
   });
+
+  it('treats commit-and-push-retry as logical attempt 2', async () => {
+    const deps = makeDeps();
+    const result = await handleNodeFailure(
+      deps,
+      makeWorkflowRun(),
+      makeNode('commit-and-push-retry'),
+      {
+        ...baseCtx,
+        errorMsg: 'husky - pre-commit script failed',
+      }
+    );
+    expect(result.errorClass).toBe('commit_hook_lint_failure');
+    expect(result.decision).toBe('escalate');
+    const info = deps.log.info as unknown as { mock: { calls: unknown[][] } };
+    expect(info.mock.calls).toContainEqual([
+      expect.objectContaining({ attempt: 2, reason: expect.stringContaining('after its repair') }),
+      'overseer.decision',
+    ]);
+  });
 });

@@ -17,7 +17,11 @@
  */
 import { randomUUID } from 'node:crypto';
 import * as dispatch from '@archon/core/db/dispatch';
-import { claimOverseerVerdict, finalizeOverseerVerdict } from '@archon/core/db/overseer';
+import {
+  claimOverseerVerdict,
+  finalizeOverseerVerdict,
+  resolveUnverifiedApprovals,
+} from '@archon/core/db/overseer';
 import { createLogger } from '@archon/paths';
 import {
   createRealFetchExactHeadPullRequestEvidence,
@@ -55,6 +59,7 @@ import {
   REMEDIATION_SENDER,
 } from './remediation-candidate';
 import type { RemediationEmitResult } from './remediation-candidate';
+import { sanitizeFailureLine } from './node-failure-notify';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -81,6 +86,7 @@ interface ReviewApprovalVerdictDeps {
   finalizeVerdict: typeof finalizeOverseerVerdict;
   listMessages?: typeof dispatch.listMessages;
   createMessage?: typeof dispatch.createAuthenticatedMessage;
+  resolveUnverified?: typeof resolveUnverifiedApprovals;
 }
 
 export async function recordReviewApprovalVerdict(
@@ -88,8 +94,11 @@ export async function recordReviewApprovalVerdict(
   deps: ReviewApprovalVerdictDeps = {
     claimVerdict: claimOverseerVerdict,
     finalizeVerdict: finalizeOverseerVerdict,
+    resolveUnverified: resolveUnverifiedApprovals,
   }
 ): Promise<void> {
+  const prUrl = `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`;
+  await deps.resolveUnverified?.(prUrl, input.headSha);
   const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
   const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
   if (!claim.claimed || !claim.verdictId) return;
@@ -99,12 +108,19 @@ export async function recordReviewApprovalVerdict(
     verdict: 'merge_candidate',
     proposedAction: 'flag_merge_ready',
     model: input.model,
-    prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+    prUrl,
   });
 }
 
 export async function recordUnverifiedReviewVerdict(
-  input: { owner: string; repo: string; prNumber: number; headSha: string; model?: string },
+  input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    model?: string;
+    reason?: string;
+  },
   deps: ReviewApprovalVerdictDeps = {
     claimVerdict: claimOverseerVerdict,
     finalizeVerdict: finalizeOverseerVerdict,
@@ -127,7 +143,7 @@ export async function recordUnverifiedReviewVerdict(
   const createMessage = deps.createMessage ?? dispatch.createAuthenticatedMessage;
   const priorRetry = (
     await listMessages({ recipient: REVIEW_RECIPIENT, subject_key: subjectKey })
-  ).some(
+  ).find(
     message =>
       message.repeat_reason === 'unverified_approval_retry' &&
       parseReviewWorkBody(message.body)?.headSha === input.headSha
@@ -150,6 +166,7 @@ export async function recordUnverifiedReviewVerdict(
           baseRef: '',
           author: '',
           headCiGreen: false,
+          verificationReason: sanitizeFailureLine(input.reason ?? 'verification unavailable'),
         } satisfies ReviewWorkBody),
       }
     );
@@ -158,12 +175,18 @@ export async function recordUnverifiedReviewVerdict(
       { kind: 'system', sender: REVIEW_SENDER },
       {
         correlation_id: `pr-review:${input.owner}/${input.repo}#${input.prNumber}@${input.headSha}:unverified-escalation`,
-        idempotency_key: `pr-review-unverified-escalation:${input.owner}/${input.repo}#${input.prNumber}@${input.headSha}`,
+        idempotency_key: `overseer-unverified-approval:${input.owner}/${input.repo}#${input.prNumber}@${input.headSha}`,
         task_type: 'agent_message',
         recipient: 'duty-officer',
-        priority: 'blocker',
+        priority: 'normal',
         subject_key: subjectKey,
-        body: `A second approval could not be verified for ${input.owner}/${input.repo}#${input.prNumber} at ${input.headSha}. Merge remains held pending Duty Officer resolution.`,
+        body: [
+          `PR: ${input.owner}/${input.repo}#${input.prNumber}`,
+          `Head: ${input.headSha}`,
+          `First unverified reason: ${sanitizeFailureLine(parseReviewWorkBody(priorRetry.body)?.verificationReason ?? 'verification unavailable')}`,
+          `Second unverified reason: ${sanitizeFailureLine(input.reason ?? 'verification unavailable')}`,
+          'Action: Merge remains held pending Duty Officer resolution.',
+        ].join('\n'),
       }
     );
   }
@@ -181,6 +204,7 @@ export async function maybeRecordReviewApprovalVerdict(
     prNumber: number;
     headSha: string;
     model?: string;
+    reason?: string;
   },
   options: {
     env?: Record<string, string | undefined>;
@@ -248,6 +272,7 @@ export interface ReviewWorkBody {
   baseRef: string;
   author: string;
   headCiGreen: boolean;
+  verificationReason?: string;
 }
 
 export function parseReviewWorkBody(body: string): ReviewWorkBody | null {
@@ -269,6 +294,9 @@ export function parseReviewWorkBody(body: string): ReviewWorkBody | null {
       baseRef: typeof value.baseRef === 'string' ? value.baseRef : '',
       author: typeof value.author === 'string' ? value.author : '',
       headCiGreen: value.headCiGreen === true,
+      ...(typeof value.verificationReason === 'string'
+        ? { verificationReason: value.verificationReason }
+        : {}),
     };
   } catch {
     return null;

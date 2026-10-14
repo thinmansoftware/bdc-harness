@@ -194,7 +194,10 @@ describe('merge execution bridge', () => {
 
     expect(h.merges).toBe(0);
     expect(h.approvals).toBe(0);
-    expect(await h.store.listUnactionedVerdicts()).toHaveLength(1);
+    expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
+    expect(h.outcomes).toContainEqual(
+      expect.objectContaining({ verdictId: 'held', reason: 'approval_unverified' })
+    );
   });
   test('production CE compare adapter accepts 150 page-one files as complete', async () => {
     const compareCommits = mock(async () => ({

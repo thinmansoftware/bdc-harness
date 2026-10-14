@@ -881,10 +881,20 @@ export async function runMergeExecutionBridgeOnce(
       verdict.pr_url &&
       (await options.store.hasUnresolvedUnverifiedApproval?.(verdict.pr_url, verdict.head_sha))
     ) {
-      // Leave merge authority unclaimed. The exact-head re-review or Duty
-      // Officer resolution must clear the unverified verdict first.
+      if (!(await options.store.claimVerdict(verdict.id))) continue;
+      await options.store.recordOutcome({
+        verdictId: verdict.id,
+        mutationSent: false,
+        reason: 'approval_unverified',
+        prUrl: verdict.pr_url,
+      });
       log.info(
-        { verdictId: verdict.id, prUrl: verdict.pr_url, headSha: verdict.head_sha },
+        {
+          verdictId: verdict.id,
+          prUrl: verdict.pr_url,
+          headSha: verdict.head_sha,
+          reason: 'approval_unverified',
+        },
         'merge-coordinator.unverified_approval_hold'
       );
       continue;
