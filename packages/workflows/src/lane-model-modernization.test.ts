@@ -17,6 +17,10 @@ type Node = {
   persona?: string;
   prompt?: string;
   loop?: unknown;
+  depends_on?: string[];
+  trigger_rule?: string;
+  when?: string;
+  task_class?: string;
 };
 type Lane = {
   name: string;
@@ -52,6 +56,12 @@ describe('feature-development lane model modernization', () => {
         expect(exceptionIds.has(entry.id)).toBe(true);
       }
     }
+    const codex = load('bdc-feature-development-codex.yaml');
+    const observedExceptionIds = (codex.nodes ?? [])
+      .filter(entry => entry.model === 'gpt-5.6-terra')
+      .map(entry => entry.id)
+      .sort();
+    expect(observedExceptionIds).toEqual([...exceptionIds].sort());
   });
 
   it('Test 2: rejects Claude aliases and confines approved Claude ids', () => {
@@ -133,14 +143,29 @@ describe('feature-development lane model modernization', () => {
     const astra = load('bdc-feature-development-astra.yaml');
     expect(haiku.run_authority).toEqual(astra.run_authority);
     expect(haiku.nodes?.map(entry => entry.id)).toEqual(astra.nodes?.map(entry => entry.id));
-    for (const entry of haiku.nodes ?? []) {
-      if (
-        entry.persona &&
-        (entry.prompt || entry.loop) &&
-        entry.provider &&
-        entry.provider !== 'claude'
-      ) {
-        expect(entry.model, entry.id).toBeTruthy();
+    for (const [index, entry] of (haiku.nodes ?? []).entries()) {
+      const astraEntry = astra.nodes?.[index];
+      expect(
+        {
+          depends_on: entry.depends_on,
+          trigger_rule: entry.trigger_rule,
+          when: entry.when,
+          task_class: entry.task_class,
+          hasPrompt: Boolean(entry.prompt),
+          hasLoop: Boolean(entry.loop),
+        },
+        entry.id
+      ).toEqual({
+        depends_on: astraEntry?.depends_on,
+        trigger_rule: astraEntry?.trigger_rule,
+        when: astraEntry?.when,
+        task_class: astraEntry?.task_class,
+        hasPrompt: Boolean(astraEntry?.prompt),
+        hasLoop: Boolean(astraEntry?.loop),
+      });
+      if (entry.persona && (entry.prompt || entry.loop)) {
+        expect(entry.provider, `${entry.id}:provider`).toBeTruthy();
+        expect(entry.model, `${entry.id}:model`).toBeTruthy();
       }
     }
     expect(readFileSync(join(LANES, 'bdc-feature-development-haiku.yaml'), 'utf8')).not.toContain(
@@ -150,6 +175,12 @@ describe('feature-development lane model modernization', () => {
 
   it('Test 7: registers and bundles the Haiku lane', () => {
     expect(files).toContain('bdc-feature-development-haiku.yaml');
+    const registrationTest = readFileSync(
+      join(import.meta.dir, 'lane-registration.test.ts'),
+      'utf8'
+    );
+    const roster = registrationTest.match(/expect\(LANE_FILES\)\.toEqual\(\[([\s\S]*?)\]\);/)?.[1];
+    expect(roster).toContain("'bdc-feature-development-haiku.yaml'");
     const bundled = readFileSync(
       join(import.meta.dir, 'defaults/bundled-defaults.generated.ts'),
       'utf8'
