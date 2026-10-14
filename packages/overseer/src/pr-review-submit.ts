@@ -93,6 +93,16 @@ export interface ReviewerVerdict {
   reasonCode?: string;
   /** Milliseconds to wait before the item becomes claimable again. */
   retryAfterMs?: number;
+  /**
+   * True when the reviewer APPROVED but could not verify -- it could not run or
+   * inspect the checkout, execute tests, or confirm the exact head
+   * (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01). TERMINAL and
+   * NEVER MERGEABLE: the submit path posts a COMMENT (never an APPROVE event) and
+   * records a non-mergeable verdict. MUST NOT be collapsed into `approved: true`.
+   */
+  approvedUnverified?: boolean;
+  /** Present on approvedUnverified: why the judge could not verify. */
+  verificationReason?: string;
 }
 
 export interface ReviewWorkItem {
@@ -108,6 +118,15 @@ export interface ReviewWorkItem {
 
 export type SubmitDisposition =
   | 'approved'
+  /**
+   * TERMINAL, NEVER MERGEABLE (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01).
+   * The reviewer approved but could not verify (no run/inspect/tests, or the
+   * exact head could not be confirmed). A COMMENT is posted (not an APPROVE
+   * event) and the recorded verdict is `approved_unverified` with
+   * proposed_action `none`, so the merge manager never treats it as merge-ready.
+   * Anchor: PR #1118 (2026-10-14) merged an unverified approval unattended.
+   */
+  | 'approved_unverified'
   | 'changes_requested'
   | 'custody_conflict'
   | 'merge_custody_conflict'
@@ -196,6 +215,11 @@ export interface SubmitOutcome {
    * recheck on its disposition alone.
    */
   summary?: string;
+  /**
+   * Present only on `approved_unverified` (WO node-failure-repair): why the
+   * judge could not verify, forwarded to the recording path.
+   */
+  verificationReason?: string;
   /** Set only on `rate_limited`: when the item should become claimable again. */
   retryAfter?: string;
   /**
@@ -232,6 +256,12 @@ export interface SubmitDeps {
      * blocking finding needs your judgment".
      */
     remediation?: RemediationOutcome;
+    /**
+     * Present only on `approved_unverified` (WO node-failure-repair): why the
+     * judge could not verify. The recording path carries it onto the held
+     * verdict and the Duty Officer escalation.
+     */
+    verificationReason?: string;
   }): Promise<void>;
 
   /**
@@ -494,6 +524,43 @@ export async function runAndSubmitReview(
     });
   }
 
+  // UNVERIFIED APPROVAL (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01).
+  // Both head gates have passed, so this binds to a head the reviewer actually
+  // evaluated and that is still live. It is an APPROVE the judge could not stand
+  // behind, so NEVER post an APPROVE event: post a COMMENT whose body states it
+  // is not mergeable, and finish with the terminal `approved_unverified`
+  // disposition. The recording path (recordReceipt -> maybeRecordReviewApprovalVerdict)
+  // writes a non-mergeable verdict and runs the bounded re-review / escalation.
+  if (verdict.approvedUnverified) {
+    const reason = verdict.verificationReason?.trim() || verdict.reasonCode || 'unverified';
+    const commentBody = `UNVERIFIED approval -- not mergeable: ${reason}\n\n${buildReviewBody(work, verdict)}`;
+    let submitMessage: string | undefined;
+    try {
+      await deps.submitReview({
+        owner: work.owner,
+        repo: work.repo,
+        number: work.prNumber,
+        event: 'COMMENT',
+        body:
+          commentBody.length > MAX_EVIDENCE_BODY
+            ? commentBody.slice(0, MAX_EVIDENCE_BODY)
+            : commentBody,
+        commitId: work.headSha,
+      });
+    } catch (error) {
+      submitMessage = errorCode(error);
+    }
+    return finish(deps, work, work.headSha, {
+      disposition: 'approved_unverified',
+      reason: submitMessage
+        ? `approved_unverified:comment_failed:${submitMessage}`
+        : 'approved_unverified',
+      event: 'COMMENT',
+      ...summaryField(verdict),
+      ...(reason ? { verificationReason: reason } : {}),
+    });
+  }
+
   const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
   const body = buildReviewBody(work, verdict);
 
@@ -667,6 +734,7 @@ async function finish(
       ...(outcome.event ? { event: outcome.event } : {}),
       ...(outcome.reason ? { reason: outcome.reason } : {}),
       ...(outcome.remediation ? { remediation: outcome.remediation } : {}),
+      ...(outcome.verificationReason ? { verificationReason: outcome.verificationReason } : {}),
     });
   } catch {
     // Receipt failure never converts a classified outcome into a throw.

@@ -4,6 +4,7 @@ import {
   claimVerdictForMergeExecution,
   deferVerdictClaimForMergeExecution,
   finalizeOverseerVerdict,
+  getOverseerVerdictsForRun,
   getOverseerWatchRunById,
   insertOverseerAction,
   listActiveRunUserMessages,
@@ -432,6 +433,10 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
           store: {
             listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
             claimVerdict: claimVerdictForMergeExecution,
+            // Fresh post-claim read for the unverified-approval hold re-check. The
+            // listUnactionedVerdicts snapshot above cannot see it: it filters to
+            // proposed_action = 'flag_merge_ready', and a held row is 'none'.
+            getVerdictsForRun: getOverseerVerdictsForRun,
             releaseVerdictClaim: releaseVerdictClaimForMergeExecution,
             deferVerdictClaim: deferVerdictClaimForMergeExecution,
             getRunById: getOverseerWatchRunById,

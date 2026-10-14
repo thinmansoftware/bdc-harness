@@ -69,8 +69,22 @@ function getLog(): ReturnType<typeof createLogger> {
  * A rate limit is "come back at T", so it carries a retry instant and the work
  * item re-enters the queue then.
  */
+/**
+ * APPROVE_UNVERIFIED (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01)
+ * is an APPROVE the judge could not stand behind: it could not run or inspect
+ * the checkout, could not execute tests, could not confirm the exact head SHA,
+ * or its sandbox/tools failed. It is NEVER mergeable -- the submit path posts a
+ * COMMENT (not an APPROVE) and records a non-mergeable verdict. Anchor: PR #1118
+ * (2026-10-14) approved and MERGED at head 6ad3de68 despite a note reading
+ * "Local inspection and test execution were unavailable because the execution
+ * sandbox failed to start; the exact checkout SHA could not be independently
+ * verified". A deterministic backstop also forces this verdict when the judge
+ * claims verified but a finding's text matches a sandbox/checkout/execution
+ * failure.
+ */
 export type PrReviewVerdict =
   | 'APPROVE'
+  | 'APPROVE_UNVERIFIED'
   | 'REQUEST_CHANGES'
   | 'INDETERMINATE'
   | 'CHECKS_PENDING'
@@ -115,6 +129,13 @@ export interface PrReviewResult {
    * callers that prefer a duration to an instant.
    */
   retry_after_ms?: number;
+  /**
+   * Set only on APPROVE_UNVERIFIED: why the judge could not verify (its stated
+   * verification_reason, or the deterministic backstop's description of the
+   * sandbox/checkout/execution failure it detected). Carried to the PR COMMENT
+   * body, the recorded verdict, and the duty-officer escalation.
+   */
+  verification_reason?: string;
 }
 
 export interface PrReviewModelResult {
@@ -174,12 +195,32 @@ interface ParsedReviewVerdict {
   verdict: Exclude<PrReviewVerdict, 'INDETERMINATE' | 'CHECKS_PENDING' | 'CHECKS_UNAVAILABLE'>;
   findings: IndependentReviewFinding[];
   reviewed_head_sha: string;
+  /** Present only on APPROVE_UNVERIFIED: why the judge could not verify. */
+  verification_reason?: string;
 }
 
 const FINDING_SEVERITIES = new Set(['blocker', 'major', 'minor', 'note']);
 
+/**
+ * Finding text that proves the judge did NOT actually run/inspect/verify, even
+ * when it claimed `verification: verified`. The verbatim PR #1118 note matches
+ * every disjunct it should: `sandbox`, `unavailable because`,
+ * `could not be independently verified`. Kept narrow so an ordinary style note
+ * ("could be simplified", "consider renaming") never trips it (Test 17).
+ */
+const UNVERIFIED_FINDING_PATTERN =
+  /\bsandbox\b|could not be independently verified|unavailable because|unable to (?:run|inspect|verify)/i;
+
 function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+/** True when a finding's scope or summary proves the review could not verify. */
+function findingProvesUnverified(finding: IndependentReviewFinding): boolean {
+  return (
+    UNVERIFIED_FINDING_PATTERN.test(finding.scope) ||
+    UNVERIFIED_FINDING_PATTERN.test(finding.summary)
+  );
 }
 
 /** Strictly parse the model's complete JSON response. Invalid output fails closed. */
@@ -194,6 +235,17 @@ export function parseReviewVerdict(stdout: string): ParsedReviewVerdict | null {
       !nonEmpty(value.reviewed_head_sha) ||
       !Array.isArray(value.findings)
     ) {
+      return null;
+    }
+    // Verification self-report is REQUIRED (WO node-failure-repair). A missing or
+    // invalid value is invalid output -> null, the existing fail-closed
+    // model_output_invalid path that advances to the next rung.
+    if (value.verification !== 'verified' && value.verification !== 'unverified') {
+      return null;
+    }
+    const unverified = value.verification === 'unverified';
+    // An unverified self-report MUST state why, or it is invalid output.
+    if (unverified && !nonEmpty(value.verification_reason)) {
       return null;
     }
     const findings: IndependentReviewFinding[] = [];
@@ -219,11 +271,37 @@ export function parseReviewVerdict(stdout: string): ParsedReviewVerdict | null {
     ) {
       return null;
     }
-    return {
-      verdict: value.verdict,
-      findings,
-      reviewed_head_sha: value.reviewed_head_sha.trim(),
-    };
+    // REQUEST_CHANGES is unaffected by verification: a code rejection stands
+    // whether or not the judge could run tests.
+    if (value.verdict === 'REQUEST_CHANGES') {
+      return {
+        verdict: 'REQUEST_CHANGES',
+        findings,
+        reviewed_head_sha: value.reviewed_head_sha.trim(),
+      };
+    }
+    // APPROVE. Two independent ways it becomes NON-MERGEABLE APPROVE_UNVERIFIED:
+    //   (1) the judge self-reported unverified, or
+    //   (2) the deterministic backstop: the judge claimed verified but a finding
+    //       proves it could not have (sandbox/checkout/execution failure).
+    if (unverified) {
+      return {
+        verdict: 'APPROVE_UNVERIFIED',
+        findings,
+        reviewed_head_sha: value.reviewed_head_sha.trim(),
+        verification_reason: String(value.verification_reason).trim(),
+      };
+    }
+    const blocker = findings.find(findingProvesUnverified);
+    if (blocker) {
+      return {
+        verdict: 'APPROVE_UNVERIFIED',
+        findings,
+        reviewed_head_sha: value.reviewed_head_sha.trim(),
+        verification_reason: `judge claimed verified but a finding proves it could not: ${blocker.scope}: ${blocker.summary}`,
+      };
+    }
+    return { verdict: 'APPROVE', findings, reviewed_head_sha: value.reviewed_head_sha.trim() };
   } catch {
     return null;
   }
@@ -240,8 +318,9 @@ export function buildReviewPrompt(input: {
     'Evaluate the exact-head code diff, check/test results, security implications, authorized scope, and stated acceptance criteria.',
     'Report blocking issues as severity blocker or major. Advisory issues use minor or note.',
     'Return only one JSON object with this exact shape:',
-    '{"verdict":"APPROVE|REQUEST_CHANGES","findings":[{"scope":"non-empty","severity":"blocker|major|minor|note","summary":"non-empty"}],"reviewed_head_sha":"exact input SHA"}',
+    '{"verdict":"APPROVE|REQUEST_CHANGES","findings":[{"scope":"non-empty","severity":"blocker|major|minor|note","summary":"non-empty"}],"reviewed_head_sha":"exact input SHA","verification":"verified|unverified","verification_reason":"non-empty when unverified"}',
     'Use REQUEST_CHANGES only with at least one blocker or major finding. Never approve when checks fail or a stated acceptance criterion is unmet.',
+    'Set "verification":"unverified" (with a non-empty "verification_reason") whenever you could NOT run or inspect the checkout, could NOT execute tests, could NOT confirm the exact head SHA, or your sandbox or tools failed. Set "verified" only when you actually inspected the code at the exact head and ran what you needed to.',
     '',
     `Repository: ${input.request.owner}/${input.request.repo}`,
     `Pull request: ${input.request.pr_number}`,

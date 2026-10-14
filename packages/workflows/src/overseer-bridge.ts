@@ -18,12 +18,28 @@
  *   - createWorkflowEvent persistence for Mission Control "Workflow Decisions" tab
  *   - Per-WO-class override rules
  *   - LLM provider failover
+ *
+ * Node-failure Dispatch notification (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01):
+ *   handleNodeFailure now calls notifyNodeFailureEscalation on EVERY `escalate`
+ *   decision -- any node (bash or AI), any error class including `unknown`, with
+ *   or without an escalationContext. It writes one Dispatch message to recipient
+ *   'duty-officer' (so the Duty Officer digest carries the run id + failing node)
+ *   and, when the failure is a blocker (out_of_credits / auth_failed, or
+ *   commit_hook_lint_failure on attempt >= 2), ALSO one message to recipient 'xo'
+ *   at priority 'blocker'. This replaces the prior silent-exit behaviour where a
+ *   context-less escalate produced no operator-visible signal (anchor run
+ *   3993fe05, 2026-10-14). The write never throws and never re-enters this
+ *   handler; it does NOT replace the runEscalation operator-card path, it runs
+ *   alongside it.
  */
 
 import type { Logger } from '@archon/paths';
 import {
+  bdcXoSubjectKeyForRun,
   classifyError,
   decide,
+  isAlwaysBlockerClass,
+  notifyNodeFailureEscalation,
   permitFromMetadata,
   runAuthorizedEscalation,
   runEscalation,
@@ -103,13 +119,42 @@ export interface HandleNodeFailureResult {
  * Returns a NodeOutput the caller returns directly. The caller remains responsible for
  * site-specific housekeeping (throttle-map cleanup, etc).
  */
+/**
+ * Attempt number the lane reports for a commit-hook failure, as the literal
+ * `commit_hook_attempt=<n>` token.
+ */
+const COMMIT_HOOK_ATTEMPT_PATTERN = /commit_hook_attempt=(\d{1,3})\b/i;
+
+/**
+ * Effective attempt for a commit-hook lint failure.
+ *
+ * Bash node-failure sites do not carry a retry counter, so `ctx.attempt` is 1 at
+ * every one of them. For `commit_hook_lint_failure` that default is WRONG on the
+ * second failure: decide() keys the blocker on `attempt >= 2`, so a dead-ended
+ * hook failure reported with attempt 1 would be answered with "feed the hook
+ * output back for one bounded repair pass" even though that pass already ran.
+ *
+ * The lane therefore stamps the real attempt count -- taken from the commit-core's
+ * own attempt file, i.e. the number of times `git commit` actually ran -- into the
+ * failure text as `commit_hook_attempt=<n>`. Honour it only for this class, and
+ * only when it is HIGHER than the caller's value, so the token can escalate the
+ * attempt but never silently downgrade a real retry counter.
+ */
+function effectiveCommitHookAttempt(errorClass: string, errorMsg: string, attempt: number): number {
+  if (errorClass !== 'commit_hook_lint_failure') return attempt;
+  const match = COMMIT_HOOK_ATTEMPT_PATTERN.exec(errorMsg);
+  const raw = match?.[1];
+  if (raw === undefined) return attempt;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > attempt ? parsed : attempt;
+}
+
 export async function handleNodeFailure(
   deps: HandleNodeFailureDeps,
   workflowRun: WorkflowRun,
   node: DagNode,
   ctx: HandleNodeFailureContext
 ): Promise<HandleNodeFailureResult> {
-  const attempt = ctx.attempt ?? 1;
   const hasOutput = ctx.hasOutput ?? false;
 
   const errorClass = classifyError({
@@ -122,6 +167,8 @@ export async function handleNodeFailure(
     threadCommitsAhead: ctx.threadCommitsAhead,
     hasOriginBranch: ctx.hasOriginBranch,
   });
+
+  const attempt = effectiveCommitHookAttempt(errorClass, ctx.errorMsg, ctx.attempt ?? 1);
 
   const result = decide({
     errorClass,
@@ -260,6 +307,48 @@ export async function handleNodeFailure(
         }
       );
     }
+  }
+
+  // Node-failure Dispatch notification (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01).
+  //
+  // Gated on `result.decision === 'escalate'` ALONE -- NOT nested inside the
+  // escalationContext branch above -- so EVERY escalate writes a duty-officer
+  // message, including the `unknown` class and the older classes that carry no
+  // escalationContext (which previously returned failed with no operator-visible
+  // signal). A blocker ALSO messages recipient 'xo' at priority blocker. The
+  // call never throws and never re-enters this handler (no-loop guarantee lives
+  // in notifyNodeFailureEscalation).
+  if (result.decision === 'escalate') {
+    // A load-bearing node (commit-and-push, commit-hook-gate, ascii-gate, open-pr,
+    // etc.) whose failure has NO remaining recovery path is a blocker in its own
+    // right: its output is critical to the run, the decision is escalate (never a
+    // retry), and nothing downstream will repair it. XO must be told at priority
+    // blocker, not just the Duty Officer digest. `repairableOnce` is the one
+    // recovery path a load-bearing escalate can still carry (the first
+    // commit_hook_lint_failure), so it is excluded. This is what surfaces the
+    // UNREPAIRED commit-hook-gate failure (the second hook failure, which arrives
+    // as a load_bearing gate failure classified `unknown`) to XO -- previously it
+    // escalated with no blocker signal at all.
+    const loadBearingDeadEnd = node.load_bearing === true && result.repairableOnce !== true;
+    const blocker =
+      isAlwaysBlockerClass(errorClass) || result.blocker === true || loadBearingDeadEnd;
+    await notifyNodeFailureEscalation(
+      { log: deps.log },
+      {
+        runId: workflowRun.id,
+        workflowName: workflowRun.workflow_name,
+        nodeId: node.id,
+        errorClass,
+        decision: result.decision,
+        attempt,
+        errorMsg: ctx.errorMsg,
+        blocker,
+        subjectKey: bdcXoSubjectKeyForRun({
+          metadata: workflowRun.metadata,
+          user_message: workflowRun.user_message,
+        }),
+      }
+    );
   }
 
   // Translate decision to NodeOutput state.
