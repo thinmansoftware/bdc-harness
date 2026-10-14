@@ -1,8 +1,8 @@
-import { readFileSync } from 'node:fs';
-import { createPrivateKey } from 'node:crypto';
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
+import { resolveServiceGitHubAuth, type GitHubService } from '@archon/core/github/service-identity';
+import { observationFromResponse, recordGitHubApiCall } from '@archon/core/github/metering';
 import type {
   DiscoveredPullRequest,
   GitHubClientDeps,
@@ -573,6 +573,27 @@ export interface GitHubAppAuthConfig {
  * win when both are set.
  */
 export function resolveGitHubAppAuth(): GitHubAppAuthConfig | null {
+  let resolved;
+  try {
+    resolved = resolveServiceGitHubAuth('overseer');
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.includes('GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH')
+    ) {
+      throw new Error(
+        'overseer_github_app_auth_private_key_missing: set GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH'
+      );
+    }
+    throw error;
+  }
+  if (resolved.kind !== 'app') return null;
+  return {
+    appId: resolved.appId,
+    installationId: resolved.installationId,
+    privateKey: resolved.privateKey,
+  };
+  /* Legacy validation body retained below for source compatibility documentation.
   const appId = (process.env.GITHUB_APP_ID ?? '').trim();
   const installationId = (process.env.GITHUB_APP_INSTALLATION_ID ?? '').trim();
   const privateKeyInline = process.env.GITHUB_APP_PRIVATE_KEY ?? '';
@@ -634,7 +655,7 @@ export function resolveGitHubAppAuth(): GitHubAppAuthConfig | null {
     );
   }
 
-  return { appId, installationId, privateKey };
+  return { appId, installationId, privateKey }; */
 }
 
 /**
@@ -670,8 +691,36 @@ export function resolveRealOctokitAuthOptions(): RealOctokitAuthOptions {
  * App env vars are complete (attributing API calls to thinman-overseer[bot]),
  * otherwise falls back to the GH_TOKEN/GITHUB_TOKEN PAT path unchanged.
  */
-export function createRealOctokitClient(): RealGitHubOctokitLike {
-  return new Octokit(resolveRealOctokitAuthOptions()) as unknown as RealGitHubOctokitLike;
+export function createRealOctokitClient(
+  service: Extract<GitHubService, 'overseer' | 'pr_discovery'> = 'overseer'
+): RealGitHubOctokitLike {
+  const identity = resolveServiceGitHubAuth(service);
+  const options: RealOctokitAuthOptions =
+    identity.kind === 'app'
+      ? {
+          authStrategy: createAppAuth,
+          auth: {
+            appId: identity.appId,
+            privateKey: identity.privateKey,
+            installationId: identity.installationId,
+          },
+        }
+      : { auth: identity.kind === 'pat' ? identity.token : resolveGitHubToken() };
+  const client = new Octokit(options);
+  client.hook.after('request', response => {
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(response.headers)) {
+      if (value !== undefined) headers.set(name, String(value));
+    }
+    recordGitHubApiCall(
+      observationFromResponse(
+        service,
+        identity.poolId,
+        new Response(null, { status: response.status, headers })
+      )
+    );
+  });
+  return client as unknown as RealGitHubOctokitLike;
 }
 
 /**
@@ -699,15 +748,37 @@ export function createRealReadOnlyPatOctokitClient(): RealGitHubOctokitLike | nu
 export const MERGE_MANAGER_GH_TOKEN_ENV = 'MERGE_MANAGER_GH_TOKEN' as const;
 
 export function hasDistinctMergeIdentity(): boolean {
-  return Boolean(process.env[MERGE_MANAGER_GH_TOKEN_ENV]);
+  return resolveServiceGitHubAuth('merge_manager').distinct;
 }
 
 export function createRealMergeOctokitClient(): RealGitHubOctokitLike {
-  const mergeToken = process.env[MERGE_MANAGER_GH_TOKEN_ENV];
-  if (mergeToken) {
-    return new Octokit({ auth: mergeToken }) as unknown as RealGitHubOctokitLike;
-  }
-  return createRealOctokitClient();
+  const identity = resolveServiceGitHubAuth('merge_manager');
+  if (identity.kind === 'none') throw new Error('merge_manager_identity_not_distinct');
+  const options: RealOctokitAuthOptions =
+    identity.kind === 'app'
+      ? {
+          authStrategy: createAppAuth,
+          auth: {
+            appId: identity.appId,
+            privateKey: identity.privateKey,
+            installationId: identity.installationId,
+          },
+        }
+      : { auth: identity.token };
+  const client = new Octokit(options);
+  client.hook.after('request', response => {
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(response.headers))
+      if (value !== undefined) headers.set(name, String(value));
+    recordGitHubApiCall(
+      observationFromResponse(
+        'merge_manager',
+        identity.poolId,
+        new Response(null, { status: response.status, headers })
+      )
+    );
+  });
+  return client as unknown as RealGitHubOctokitLike;
 }
 
 export function summarizeChecks(
@@ -1778,7 +1849,11 @@ export function createRealGitHubClientDeps(
     findPullRequest: createRealFindPullRequest(octokit),
     // Merge mutations go through the distinct merge identity when configured
     // (M-153: the merger is never the reviewer).
-    mergePullRequest: createRealMergePullRequest(createRealMergeOctokitClient()),
+    mergePullRequest: hasDistinctMergeIdentity()
+      ? createRealMergePullRequest(createRealMergeOctokitClient())
+      : async (): Promise<never> => {
+          throw new Error('merge_manager_identity_not_distinct');
+        },
     listPullRequestReviews: async (
       input
     ): Promise<{ login: string; state: string; commitId: string }[]> => {

@@ -83,6 +83,9 @@ done
 # in this fork -- see WO-HARNESS-CONTAINER-GITHUB-AUTH-BOUNDARY-01 / #171).
 # Uses a helper function so the token stays in the environment, not in ~/.gitconfig.
 _GH_AUTH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+if [ -n "${GITHUB_APP_RUN_NODES_ID:-}${GITHUB_APP_RUN_NODES_INSTALLATION_ID:-}${GITHUB_APP_RUN_NODES_PRIVATE_KEY:-}${GITHUB_APP_RUN_NODES_PRIVATE_KEY_PATH:-}${GITHUB_APP_TASKMASTER_ID:-}${GITHUB_APP_TASKMASTER_INSTALLATION_ID:-}${GITHUB_APP_TASKMASTER_PRIVATE_KEY:-}${GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH:-}" ]; then
+  _GH_AUTH_TOKEN="$(bun run /app/scripts/github-service-token.ts run_nodes)"
+fi
 if [ -n "$_GH_AUTH_TOKEN" ]; then
   # Export both names so child processes (gh CLI, bun workflow nodes spawning git)
   # find whichever they look for. The credential helper reads GH_AUTH_TOKEN_INTERNAL

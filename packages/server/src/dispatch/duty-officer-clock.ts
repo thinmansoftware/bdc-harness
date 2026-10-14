@@ -15,6 +15,8 @@ import {
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
+import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
+import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
 import {
   mintAppInstallationToken,
@@ -96,12 +98,22 @@ export interface DutyOfficerClockDeps {
 }
 
 export function githubToken(): string | null {
-  const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
-  return token ? token : null;
+  try {
+    const identity = resolveServiceGitHubAuth('duty_officer');
+    return identity.kind === 'pat' ? identity.token : null;
+  } catch {
+    return null;
+  }
 }
 
 export function githubNudgeEnabled(): boolean {
-  return process.env.DUTY_OFFICER_GH_NUDGE === 'true' && Boolean(githubToken());
+  if (process.env.DUTY_OFFICER_GH_NUDGE !== 'true') return false;
+  try {
+    resolveServiceGitHubAuth('duty_officer');
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function githubTimeoutMs(): number {
@@ -167,11 +179,8 @@ async function githubJson<T>(
   path: string,
   options?: { method?: string; extraHeaders?: Record<string, string>; body?: string }
 ): Promise<T> {
-  const token = githubToken();
-  if (!token) throw new Error('duty_officer_github_token_missing');
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
     'User-Agent': 'bdc-harness-duty-officer-clock',
     'X-GitHub-Api-Version': '2022-11-28',
   };
@@ -180,11 +189,15 @@ async function githubJson<T>(
       headers[key] = options.extraHeaders[key];
     }
   }
-  const response = await fetch(`https://api.github.com${path}`, {
-    method: options?.method,
-    headers,
-    body: options?.body,
-    signal: AbortSignal.timeout(githubTimeoutMs()),
+  const response = await serviceGitHubFetchWithPermissionFallback({
+    service: 'duty_officer',
+    url: `https://api.github.com${path}`,
+    init: {
+      method: options?.method,
+      headers,
+      body: options?.body,
+      signal: AbortSignal.timeout(githubTimeoutMs()),
+    },
   });
   if (!response.ok) {
     throw new Error(`duty_officer_github_http_${response.status}`);
