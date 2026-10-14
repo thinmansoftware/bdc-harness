@@ -8150,6 +8150,8 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
 
     const store = createMockStore();
     const deps = createMockDeps(store);
+    deps.sleep = async (): Promise<void> => undefined;
+    deps.random = (): number => 0.5;
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('validator-failure-run');
 

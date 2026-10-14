@@ -64,6 +64,8 @@ export interface MergeExecutionBridgeStore {
   // Optional so older/test stores that predate the active-run guard keep prior
   // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
   hasActiveRunForWo?(woId: string): Promise<boolean>;
+  /** Defense in depth for a merge-ready row shadowed by an unverified approval. */
+  hasUnverifiedApprovalForHead?(verdict: OverseerVerdictRow): Promise<boolean>;
   reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
   releaseMergeSlot(verdictId: string): Promise<void>;
   recordOutcome(input: {
@@ -859,8 +861,19 @@ export async function runMergeExecutionBridgeOnce(
   const repoPolicy = configuredPolicy(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
   for (const verdict of verdicts) {
+    if (verdict.verdict === 'approved_unverified') {
+      if (!(await options.store.claimVerdict(verdict.id))) continue;
+      await options.store.releaseVerdictClaim(verdict.id, 'approval_unverified');
+      log.info({ verdictId: verdict.id, reason: 'approval_unverified' }, 'merge-coordinator.skip');
+      continue;
+    }
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
     if (!(await options.store.claimVerdict(verdict.id))) continue;
+    if (await options.store.hasUnverifiedApprovalForHead?.(verdict)) {
+      await options.store.releaseVerdictClaim(verdict.id, 'approval_unverified');
+      log.info({ verdictId: verdict.id, reason: 'approval_unverified' }, 'merge-coordinator.skip');
+      continue;
+    }
     try {
       if ((await mergeClaimedVerdict(options, verdict, repoPolicy)) === 'stop') break;
     } catch (error) {

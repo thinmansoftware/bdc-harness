@@ -5,7 +5,9 @@
  * dag-executor.ts further. Each of the executor's node-failure sites calls
  * `handleNodeFailure` instead of inlining the log + persist + emit + return pattern.
  *
- * v1 scope (WO-HARNESS-OVERSEER-WIRE-V1-01 / bdc-xo#151):
+ * Node failures are classified, persisted, and every escalate decision is sent
+ * to Dispatch for Duty Officer visibility. Operator cards remain the richer
+ * path for classes carrying escalationContext.
  *   - AI-node failure sites only (4 sites in dag-executor.ts: command-load,
  *     cancelled-during-streaming, credit-exhaustion, empty-output)
  *   - Bash-node failures are out of scope; sibling WO to follow
@@ -27,6 +29,7 @@ import {
   permitFromMetadata,
   runAuthorizedEscalation,
   runEscalation,
+  notifyNodeFailure,
   type Decision,
 } from '@archon/overseer';
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
@@ -131,6 +134,23 @@ export async function handleNodeFailure(
     validatorOutput: ctx.validatorOutput,
     woId: ctx.woId,
   });
+
+  await notifyNodeFailure(
+    {
+      runId: workflowRun.id,
+      workflowName: workflowRun.workflow_name,
+      nodeId: node.id,
+      errorClass,
+      decision: result.decision,
+      attempt,
+      error: ctx.errorMsg,
+      metadata: workflowRun.metadata,
+      userMessage: workflowRun.user_message,
+      loadBearing: node.load_bearing === true,
+      retryPathRemaining: result.decision === 'retry',
+    },
+    deps.log
+  );
 
   // Observability -- Mission Control "Workflow Decisions" tab will consume this when
   // persistence lands in v2. For v1 we only emit a structured log line.

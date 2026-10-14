@@ -996,6 +996,14 @@ function hasPositiveUsage(tokens: TokenUsage | undefined, cost: number | undefin
   return (tokenTotal !== undefined && tokenTotal > 0) || (cost !== undefined && cost > 0);
 }
 
+export const SDK_CONTRADICTION_BACKOFF_MAX_TOTAL_MS = 240_000;
+const SDK_CONTRADICTION_BACKOFFS_MS = [30_000, 120_000] as const;
+
+function sdkContradictionWaitMs(baseMs: number, random: () => number): number {
+  const factor = Math.min(1.2, Math.max(0.8, 0.8 + random() * 0.4));
+  return Math.round(baseMs * factor);
+}
+
 function stringifySdkFields(msg: {
   errorSubtype?: string;
   errors?: string[];
@@ -6102,7 +6110,9 @@ async function executeDagWorkflowInternal(
           // a FATAL pattern (auth/permission/credit-balance) is NOT re-run: the
           // FATAL guard on the outer check below preserves the "FATAL is never
           // retried" invariant.
-          let sdkContradictionRetryUsed = false;
+          let sdkContradictionExecutions = 1;
+          let sdkContradictionBackoffRetries = 0;
+          let sdkContradictionBackoffTotalMs = 0;
           sdkContradictionRetry: for (;;) {
             for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
               output = await executeNodeInternal(
@@ -6184,19 +6194,56 @@ async function executeDagWorkflowInternal(
 
             if (
               output.state === 'failed' &&
-              !sdkContradictionRetryUsed &&
               output.error !== undefined &&
               isSdkSuccessContradiction(output.error) &&
               // FATAL errors (auth/permission/credit-balance) are never retried,
               // even when they arrive dressed as a success-contradiction.
               classifyError(new Error(output.error)) !== 'FATAL'
             ) {
-              sdkContradictionRetryUsed = true;
-              getLog().warn({ nodeId: node.id }, 'dag.sdk_contradiction_retry');
+              const tokens = output.tokens;
+              const positiveTokens = (tokens?.input ?? 0) + (tokens?.output ?? 0) > 0;
+              if (positiveTokens) {
+                if (sdkContradictionBackoffRetries >= SDK_CONTRADICTION_BACKOFFS_MS.length) break;
+                const baseMs = SDK_CONTRADICTION_BACKOFFS_MS[sdkContradictionBackoffRetries];
+                const jittered = sdkContradictionWaitMs(baseMs, deps.random ?? Math.random);
+                const remaining =
+                  SDK_CONTRADICTION_BACKOFF_MAX_TOTAL_MS - sdkContradictionBackoffTotalMs;
+                if (remaining <= 0) break;
+                const waitMs = Math.min(jittered, remaining);
+                sdkContradictionBackoffRetries += 1;
+                sdkContradictionBackoffTotalMs += waitMs;
+                getLog().warn(
+                  {
+                    nodeId: node.id,
+                    class: 'truncated_nonzero',
+                    tokens: { input: tokens?.input ?? 0, output: tokens?.output ?? 0 },
+                    waitMs,
+                    retryIndex: sdkContradictionBackoffRetries,
+                  },
+                  'dag.sdk_contradiction_backoff'
+                );
+                await (
+                  deps.sleep ??
+                  ((ms: number): Promise<void> =>
+                    new Promise(resolve => {
+                      setTimeout(resolve, ms);
+                    }))
+                )(waitMs);
+                if (deps.isRunLeaseValid?.() === false) break;
+              } else {
+                // Preserve the historical one immediate retry only when the first
+                // execution itself had the zero-token engine-dark signature.
+                if (sdkContradictionExecutions !== 1) break;
+                getLog().warn(
+                  { nodeId: node.id, class: 'zero_token' },
+                  'dag.sdk_contradiction_retry'
+                );
+              }
+              sdkContradictionExecutions += 1;
               await safeSendMessage(
                 platform,
                 conversationId,
-                `! Node \`${node.id}\` hit an SDK success-contradiction (isError + subtype 'success'); retrying once.`,
+                `! Node \`${node.id}\` hit an SDK success-contradiction (isError + subtype 'success'); retrying within the bounded policy.`,
                 { workflowId: workflowRun.id, nodeName: node.id }
               );
               continue sdkContradictionRetry;

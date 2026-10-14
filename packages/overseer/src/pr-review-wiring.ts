@@ -46,6 +46,7 @@ import {
 import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-health';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
+import { redactFailureText } from './node-failure-notify';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
 import {
   countPriorRemediationAttempts,
@@ -82,7 +83,14 @@ interface ReviewApprovalVerdictDeps {
 }
 
 export async function recordReviewApprovalVerdict(
-  input: { owner: string; repo: string; prNumber: number; headSha: string; model?: string },
+  input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    model?: string;
+    disposition?: string;
+  },
   deps: ReviewApprovalVerdictDeps = {
     claimVerdict: claimOverseerVerdict,
     finalizeVerdict: finalizeOverseerVerdict,
@@ -94,8 +102,9 @@ export async function recordReviewApprovalVerdict(
   await deps.finalizeVerdict({
     verdictId: claim.verdictId,
     status: 'verdict',
-    verdict: 'merge_candidate',
-    proposedAction: 'flag_merge_ready',
+    verdict:
+      input.disposition === 'approved_unverified' ? 'approved_unverified' : 'merge_candidate',
+    proposedAction: input.disposition === 'approved_unverified' ? 'none' : 'flag_merge_ready',
     model: input.model,
     prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
   });
@@ -116,7 +125,11 @@ export async function maybeRecordReviewApprovalVerdict(
     onError?: (error: unknown) => void;
   } = {}
 ): Promise<void> {
-  if (input.disposition !== 'approved' || !reviewRecordsVerdictEnabled(options.env)) return;
+  if (
+    (input.disposition !== 'approved' && input.disposition !== 'approved_unverified') ||
+    !reviewRecordsVerdictEnabled(options.env)
+  )
+    return;
   try {
     await (options.record ?? recordReviewApprovalVerdict)(input);
   } catch (error) {
@@ -1024,6 +1037,8 @@ export function createRealSubmitDeps(
         result.verdict === 'INDETERMINATE' ? reviewErrorCode(result.error) : null;
       return {
         approved: result.verdict === 'APPROVE',
+        approvedUnverified: result.verdict === 'APPROVE_UNVERIFIED',
+        ...(result.verification_reason ? { verificationReason: result.verification_reason } : {}),
         summary,
         reviewedHeadSha: result.reviewed_head_sha,
         // Structured findings ride alongside the flattened summary so
@@ -1048,6 +1063,84 @@ export function createRealSubmitDeps(
       // additionally logs at error level and marks the body `needsOperator` so
       // a blocked-for-permissions PR is not just one more receipt in the list.
       const blocked = input.disposition === 'blocked_required_contexts_unavailable';
+      if (input.disposition === 'approved_unverified') {
+        log.warn(
+          {
+            owner: input.owner,
+            repo: input.repo,
+            pr: input.prNumber,
+            headSha: input.headSha,
+            reason: input.reason,
+          },
+          'overseer.review.approved_unverified'
+        );
+        const subjectKey = reviewSubjectKey(input.owner, input.repo, input.prNumber);
+        const prior = await dispatch.listMessages({
+          recipient: 'operator',
+          subject_key: subjectKey,
+        });
+        const priorUnverified = prior.filter(message => {
+          try {
+            const body = JSON.parse(message.body) as { disposition?: unknown; headSha?: unknown };
+            return body.disposition === 'approved_unverified' && body.headSha === input.headSha;
+          } catch {
+            return false;
+          }
+        });
+        const safeReason = redactFailureText(input.reason ?? 'verification unavailable').slice(
+          0,
+          300
+        );
+        if (priorUnverified.length === 0) {
+          await dispatch.createAuthenticatedMessage(
+            { kind: 'system', sender: REVIEW_SENDER },
+            {
+              correlation_id: input.headSha,
+              idempotency_key: `overseer-review-unverified-retry:${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`,
+              task_type: 'run_review',
+              recipient: 'operator',
+              subject_key: subjectKey,
+              repeat_reason: 'unverified_approval_retry',
+              body: JSON.stringify({
+                owner: input.owner,
+                repo: input.repo,
+                prNumber: input.prNumber,
+                headSha: input.headSha,
+                baseRef: '',
+                author: '',
+                headCiGreen: true,
+              }),
+            }
+          );
+        } else {
+          let firstReason = 'verification unavailable';
+          try {
+            const body = JSON.parse(priorUnverified[0].body) as { reason?: unknown };
+            if (typeof body.reason === 'string') firstReason = body.reason;
+          } catch {
+            // Keep the safe fallback; malformed historical receipts cannot block escalation.
+          }
+          try {
+            await dispatch.createAuthenticatedMessage(
+              { kind: 'system', sender: REVIEW_SENDER },
+              {
+                correlation_id: input.headSha,
+                idempotency_key: `overseer-review-unverified:${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`,
+                task_type: 'agent_message',
+                recipient: 'duty-officer',
+                priority: 'normal',
+                subject_key: subjectKey,
+                body: `Repeated unverified approval for ${input.owner}/${input.repo} PR #${input.prNumber} at ${input.headSha}. First: ${redactFailureText(firstReason).slice(0, 300)}. Retry: ${safeReason}.`,
+              }
+            );
+          } catch (error) {
+            log.error(
+              { error, pr: input.prNumber, headSha: input.headSha },
+              'overseer.review.unverified_notify_failed'
+            );
+          }
+        }
+      }
       await maybeRecordReviewApprovalVerdict(
         { ...input, model: modelReviewer.model },
         {

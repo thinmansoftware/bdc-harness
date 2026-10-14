@@ -126,4 +126,8 @@ export interface WorkflowDeps {
   ) => Promise<FrozenSpecSource>;
   /** Internal execution guard installed by the run-lease wrapper. */
   isRunLeaseValid?: () => boolean;
+  /** Test seam for bounded SDK-contradiction backoff. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Test seam for SDK-contradiction jitter; production defaults to Math.random. */
+  random?: () => number;
 }

@@ -36,6 +36,9 @@ import {
 export interface ReviewerVerdict {
   /** true -> APPROVE; false -> REQUEST_CHANGES. */
   approved: boolean;
+  /** Approval judgment that could not verify the exact head; never mergeable. */
+  approvedUnverified?: boolean;
+  verificationReason?: string;
   /** Evidence. REQUIRED (non-empty) when approved === false. */
   summary: string;
   /** The head the reviewer actually examined. Must match the work item. */
@@ -108,6 +111,7 @@ export interface ReviewWorkItem {
 
 export type SubmitDisposition =
   | 'approved'
+  | 'approved_unverified'
   | 'changes_requested'
   | 'custody_conflict'
   | 'merge_custody_conflict'
@@ -489,6 +493,41 @@ export async function runAndSubmitReview(
       reason: submitted
         ? 'required_contexts_unavailable_blocked'
         : `required_contexts_unavailable_blocked:comment_failed:${submitMessage ?? 'unknown'}`,
+      event: 'COMMENT',
+      ...summaryField(verdict),
+    });
+  }
+
+  if (verdict.approvedUnverified) {
+    const reason =
+      verdict.verificationReason?.trim() || verdict.summary.trim() || 'verification unavailable';
+    let submission: SubmitPullRequestReviewResult;
+    try {
+      submission = await deps.submitReview({
+        owner: work.owner,
+        repo: work.repo,
+        number: work.prNumber,
+        event: 'COMMENT',
+        body: `UNVERIFIED approval -- not mergeable: ${reason}`,
+        commitId: work.headSha,
+      });
+    } catch (error) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'submission_failed',
+        reason: `submit_threw:${errorCode(error)}`,
+        event: 'COMMENT',
+      });
+    }
+    if (!submission.submitted) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'submission_failed',
+        reason: submission.message ?? 'submit_rejected',
+        event: 'COMMENT',
+      });
+    }
+    return finish(deps, work, work.headSha, {
+      disposition: 'approved_unverified',
+      reason,
       event: 'COMMENT',
       ...summaryField(verdict),
     });

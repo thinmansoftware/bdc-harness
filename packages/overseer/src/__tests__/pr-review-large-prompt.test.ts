@@ -41,7 +41,13 @@ const input: PrReviewInput = {
 };
 
 function verdictJson(): string {
-  return JSON.stringify({ verdict: 'APPROVE', findings: [], reviewed_head_sha: HEAD });
+  return JSON.stringify({
+    verdict: 'APPROVE',
+    verification: 'verified',
+    verification_reason: '',
+    findings: [],
+    reviewed_head_sha: HEAD,
+  });
 }
 
 function deps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {
