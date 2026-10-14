@@ -275,6 +275,68 @@ describe('lane-pr-registry', () => {
     expect(result).toHaveLength(0);
   });
 
+  test('a null head-repo (unprovable same-repo) is not lane-created', async () => {
+    const { db, sqlite } = makeDb();
+    seedRun(sqlite, {
+      id: 'run-nullhead',
+      workflow: 'bdc-feature-development-codex',
+      woId: WO_DIGEST,
+      startedAt: '2026-10-14T01:41:00Z',
+      completedAt: '2026-10-14T01:59:08Z',
+    });
+    seedEvent(
+      sqlite,
+      'run-nullhead',
+      'implement',
+      'https://github.com/thinmansoftware/bdc-xo/pull/5100'
+    );
+    const fetchPr = makeFetcher({
+      'thinmansoftware/bdc-xo#5100': bdcXoPr(
+        5100,
+        'feat/wo-xo-ce-health-digest-01-nullhead',
+        '2026-10-14T01:50:00Z',
+        { headRepoFullName: null }
+      ),
+    });
+    const result = await listLanePrsForWo(WO_DIGEST, {
+      db,
+      fetchPr,
+      now: () => Date.parse('2026-10-14T12:00:00Z'),
+    });
+    expect(result).toHaveLength(0);
+  });
+
+  test('a case-variant same-repo head is still lane-created', async () => {
+    const { db, sqlite } = makeDb();
+    seedRun(sqlite, {
+      id: 'run-casehead',
+      workflow: 'bdc-feature-development-codex',
+      woId: WO_DIGEST,
+      startedAt: '2026-10-14T01:41:00Z',
+      completedAt: '2026-10-14T01:59:08Z',
+    });
+    seedEvent(
+      sqlite,
+      'run-casehead',
+      'implement',
+      'https://github.com/thinmansoftware/bdc-xo/pull/5200'
+    );
+    const fetchPr = makeFetcher({
+      'thinmansoftware/bdc-xo#5200': bdcXoPr(
+        5200,
+        'feat/wo-xo-ce-health-digest-01-case',
+        '2026-10-14T01:50:00Z',
+        { headRepoFullName: 'ThinmanSoftware/BDC-XO' }
+      ),
+    });
+    const result = await listLanePrsForWo(WO_DIGEST, {
+      db,
+      fetchPr,
+      now: () => Date.parse('2026-10-14T12:00:00Z'),
+    });
+    expect(result).toHaveLength(1);
+  });
+
   test('a wo/ spec-branch head is never lane-created', async () => {
     const { db, sqlite } = makeDb();
     seedRun(sqlite, {

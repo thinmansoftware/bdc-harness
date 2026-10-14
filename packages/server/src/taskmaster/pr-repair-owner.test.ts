@@ -348,6 +348,83 @@ describe('runPrRepairOwner', () => {
     expect(rec.addressed).toEqual([{ id: 'row-old', note: 'refused:superseded_by_#3172' }]);
   });
 
+  test('resolves the candidate by full repo slug, not PR number alone (cross-repo)', async () => {
+    const woId = 'WO-XO-CE-HEALTH-DIGEST-01';
+    // Two lane PRs share PR number 3171 across different repos. The candidate
+    // targets the shopops one; matching prNumber alone would pick bdc-xo and
+    // repair the wrong PR.
+    const wrongRepoPr = lanePr({
+      owner: 'thinmansoftware',
+      repo: 'bdc-xo',
+      prNumber: 3171,
+      headSha: 'head-xo-3171',
+    });
+    const targetPr = lanePr({
+      owner: 'thinmansoftware',
+      repo: 'shopops',
+      prNumber: 3171,
+      headRef: 'feat/wo-xo-ce-health-digest-01-shopops',
+      headSha: 'head-shopops-3171',
+    });
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: [wrongRepoPr, targetPr] },
+      queued: [
+        {
+          id: 'row-xrepo',
+          body: candidateBody({
+            owner: 'thinmansoftware',
+            repo: 'shopops',
+            prNumber: 3171,
+            headSha: 'head-shopops-3171',
+            woId,
+            headRef: targetPr.headRef,
+          }),
+        },
+      ],
+    });
+
+    const result = await runPrRepairOwner(deps);
+
+    expect(result.repairsFired).toBe(1);
+    expect(rec.fired).toHaveLength(1);
+    const fire = rec.fired[0];
+    expect(fire.project).toBe('shopops');
+    expect(fire.repair.headRef).toBe(targetPr.headRef);
+  });
+
+  test('refuses a candidate whose PR number matches only a different repo', async () => {
+    const woId = 'WO-XO-CE-HEALTH-DIGEST-01';
+    // The only lane PR with number 3171 lives in bdc-xo; the candidate claims
+    // shopops. No same-repo match exists -> refused as not lane-created.
+    const otherRepoPr = lanePr({
+      owner: 'thinmansoftware',
+      repo: 'bdc-xo',
+      prNumber: 3171,
+      headSha: 'head-xo-3171',
+    });
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: [otherRepoPr] },
+      queued: [
+        {
+          id: 'row-xrepo-miss',
+          body: candidateBody({
+            owner: 'thinmansoftware',
+            repo: 'shopops',
+            prNumber: 3171,
+            headSha: 'head-shopops-3171',
+            woId,
+            headRef: 'feat/wo-xo-ce-health-digest-01-shopops',
+          }),
+        },
+      ],
+    });
+
+    await runPrRepairOwner(deps);
+
+    expect(rec.fired).toHaveLength(0);
+    expect(rec.addressed).toEqual([{ id: 'row-xrepo-miss', note: 'refused:not_lane_created' }]);
+  });
+
   test('skips a repair while a run for the WO is still running (row stays queued)', async () => {
     const woId = 'WO-XO-CE-HEALTH-DIGEST-01';
     const pr = lanePr({ prNumber: 3171, headSha: 'head-3171' });

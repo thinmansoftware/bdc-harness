@@ -270,8 +270,12 @@ function applyRuleBcd(
   const windowEnd = (citation.completedAtMs ?? nowMs) + WINDOW_SLACK_MS;
   if (createdMs < windowStart || createdMs > windowEnd) return null;
 
-  // (c) same-repo head (not a fork) + lane head-ref shape (wo/ excluded).
-  if (info.headRepoFullName !== null && info.headRepoFullName !== info.baseRepoFullName) {
+  // (c) same-repo head (not a fork) + lane head-ref shape (wo/ excluded). The
+  // LANE PR RULE requires POSITIVE proof the head lives in the base repository:
+  // a null headRepoFullName (fork deleted, head repo unavailable) is not proof
+  // and must be rejected, just like an explicit cross-repo mismatch. Compare
+  // case-insensitively since GitHub repo slugs are case-insensitive.
+  if (info.headRepoFullName?.toLowerCase() !== info.baseRepoFullName.toLowerCase()) {
     return null;
   }
   if (!LANE_HEAD_RE.test(info.headRefName)) return null;

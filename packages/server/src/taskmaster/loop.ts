@@ -1891,6 +1891,12 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   const touchedThisTick = new Set<string>();
   let firesThisTick = 0;
   let blockerReportsThisTick = 0;
+  // Did THIS tick's digest actually land as a sent effect? The PR-repair
+  // exhausted rows ride this tick's digest; we must only mark them delivered
+  // once the digest itself was successfully sent (not deduped/skipped,
+  // deferred, parked, rejected, or failed). See the commitPrRepairExhausted
+  // gate after the proposal loop.
+  let digestSentThisTick = false;
 
   for (const proposal of proposals) {
     let existingAction =
@@ -2226,6 +2232,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       result.effects += 1;
       if (proposal.type === 'fire_cauldron') firesThisTick += 1;
       if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
+      if (proposal.type === 'digest') digestSentThisTick = true;
       log.info(
         {
           actionType: proposal.type,
@@ -2244,9 +2251,11 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   // PR repair owner (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): the
   // exhausted/judgment lines rode this tick's daily digest above; address their
-  // queued rows ONLY now that the digest has been processed, so a failed digest
-  // leaves the row queued for the next tick instead of dropping the line.
-  if (commitPrRepairExhausted) {
+  // queued rows ONLY now that the digest effect was successfully SENT this tick.
+  // If the digest was deduped/skipped, deferred, parked, rejected, or failed,
+  // the exhausted line never reached a person -- leave the row queued for the
+  // next tick instead of marking it delivered and dropping the line.
+  if (commitPrRepairExhausted && digestSentThisTick) {
     try {
       await commitPrRepairExhausted();
     } catch (error) {

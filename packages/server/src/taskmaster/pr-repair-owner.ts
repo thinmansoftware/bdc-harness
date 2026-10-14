@@ -342,15 +342,33 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       fetchPr: deps.fetchPr,
       now,
     });
-    const target = lanePrs.find(pr => pr.prNumber === candidate.prNumber);
+    // Match the full repository slug (case-insensitive) AND the PR number:
+    // identical PR numbers for the same WO can exist across repositories, so
+    // matching prNumber alone could select and repair the wrong PR.
+    const candidateSlug = slug(candidate.owner, candidate.repo, candidate.prNumber).toLowerCase();
+    const target = lanePrs.find(
+      pr => slug(pr.owner, pr.repo, pr.prNumber).toLowerCase() === candidateSlug
+    );
     if (!target) {
       await addressRefusal(deps, id, 'refused:not_lane_created', log);
       continue;
     }
 
-    // Collapse-first: a non-survivor is never repaired.
-    const plan = planDedupe(lanePrs);
-    if (plan.survivor && plan.survivor.prNumber !== candidate.prNumber) {
+    // Collapse-first: a non-survivor is never repaired. Scope the dedupe to the
+    // candidate's OWN repository -- a WO's lane PRs can span repositories, and a
+    // same-number PR in a different repo must not be able to supersede (or be
+    // superseded by) this one. Compare the survivor by full repo slug, not
+    // prNumber alone.
+    const candidateRepoSlug = `${candidate.owner}/${candidate.repo}`.toLowerCase();
+    const sameRepoLanePrs = lanePrs.filter(
+      pr => `${pr.owner}/${pr.repo}`.toLowerCase() === candidateRepoSlug
+    );
+    const plan = planDedupe(sameRepoLanePrs);
+    if (
+      plan.survivor &&
+      slug(plan.survivor.owner, plan.survivor.repo, plan.survivor.prNumber).toLowerCase() !==
+        candidateSlug
+    ) {
       await addressRefusal(deps, id, `refused:superseded_by_#${plan.survivor.prNumber}`, log);
       continue;
     }
