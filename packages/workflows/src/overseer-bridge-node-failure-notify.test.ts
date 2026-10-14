@@ -6,6 +6,7 @@ import {
   notifyNodeFailure,
 } from '@archon/overseer';
 import { listMessages } from '@archon/core/db/dispatch';
+import { getDatabase } from '@archon/core/db/connection';
 
 const base = {
   runId: 'run-1',
@@ -39,14 +40,12 @@ describe('node failure dispatch notification', () => {
     expect(sent).toHaveLength(1);
   });
   test('notification_is_idempotent', async () => {
-    const persisted = new Map<string, unknown>();
-    const send = async (_context: unknown, data: { idempotency_key: string }) => {
-      persisted.set(data.idempotency_key, data);
-      return {} as never;
-    };
-    await notifyNodeFailure(base, { error: () => undefined }, send as never);
-    await notifyNodeFailure(base, { error: () => undefined }, send as never);
-    expect([...persisted.keys()]).toEqual(['overseer-node-failure:run-1:commit-and-push']);
+    const runId = `idempotent-${crypto.randomUUID()}`;
+    await notifyNodeFailure({ ...base, runId }, { error: () => undefined });
+    await notifyNodeFailure({ ...base, runId }, { error: () => undefined });
+    const persisted = await listMessages({ correlation_id: runId });
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]?.idempotency_key).toBe(`overseer-node-failure:${runId}:commit-and-push`);
   });
   test('notification_is_persisted_in_dispatch', async () => {
     const runId = `persisted-${crypto.randomUUID()}`;
@@ -61,15 +60,12 @@ describe('node failure dispatch notification', () => {
     );
   });
   test('blocker_also_goes_to_xo', async () => {
-    const sent: Array<{ recipient: string; priority: string }> = [];
+    const runId = `blocker-${crypto.randomUUID()}`;
     await notifyNodeFailure(
-      { ...base, attempt: 2, retryPathRemaining: false },
-      { error: () => undefined },
-      (async (_context, data) => {
-        sent.push(data as never);
-        return {} as never;
-      }) as never
+      { ...base, runId, attempt: 2, retryPathRemaining: false },
+      { error: () => undefined }
     );
+    const sent = await listMessages({ correlation_id: runId });
     expect(isNodeFailureBlocker({ ...base, attempt: 2 })).toBe(true);
     expect(sent).toContainEqual(expect.objectContaining({ recipient: 'xo', priority: 'blocker' }));
   });
@@ -85,13 +81,19 @@ describe('node failure dispatch notification', () => {
   });
   test('failed_notify_does_not_recurse_or_throw', async () => {
     const failures: unknown[] = [];
-    await expect(
-      notifyNodeFailure(base, { error: fields => failures.push(fields) }, (async () => {
-        throw new Error('closed');
-      }) as never)
-    ).resolves.toBeUndefined();
-    expect(failures).toHaveLength(1);
-    expect(failures[0]).toMatchObject({ runId: 'run-1', recipient: 'duty-officer' });
+    const db = getDatabase();
+    await db.query("UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'duty-officer'");
+    try {
+      await expect(
+        notifyNodeFailure(base, { error: fields => failures.push(fields) })
+      ).resolves.toBeUndefined();
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({ runId: 'run-1', recipient: 'duty-officer' });
+    } finally {
+      await db.query(
+        "UPDATE dispatch_principals SET active = 1 WHERE principal_id = 'duty-officer'"
+      );
+    }
   });
   test('clean_run_creates_no_message', async () => {
     let count = 0;

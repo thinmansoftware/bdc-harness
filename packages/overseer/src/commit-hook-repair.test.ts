@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { classifyError } from './classify';
 import { decide } from './decide';
 
@@ -26,15 +29,56 @@ describe('commit hook repair contract', () => {
     expect(classifyError({ nodeId: 'commit-and-push', message: 'git push rejected' })).not.toBe(
       'commit_hook_lint_failure'
     );
-    expect(classifyError({ nodeId: 'commit-and-push-retry', message: hookFailure })).toBe(
+    expect(classifyError({ nodeId: 'commit-and-push-retry', message: hookFailure })).not.toBe(
       'commit_hook_lint_failure'
     );
   });
 
   test('real_hook_repair_roundtrip', () => {
-    const script = readFileSync('.archon/scripts/commit-and-push.sh', 'utf8');
-    expect(script).toContain('git commit -m');
-    expect(script).toContain('commit-hook-output.txt');
+    const fixture = mkdtempSync(join(tmpdir(), 'commit-hook-roundtrip-'));
+    const remote = join(fixture, 'remote.git');
+    const repo = join(fixture, 'repo');
+    execFileSync('git', ['init', '--bare', remote]);
+    execFileSync('git', ['init', repo]);
+    execFileSync('git', ['-C', repo, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', repo, 'config', 'user.name', 'Test']);
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', remote]);
+    writeFileSync(join(repo, 'checked.js'), 'bad\n');
+    const hooks = join(repo, '.hooks');
+    execFileSync('mkdir', ['-p', hooks]);
+    writeFileSync(
+      join(hooks, 'eslint'),
+      '#!/bin/sh\nif grep -q bad "$1"; then echo "lint-staged [FAILED] eslint"; exit 1; fi\n'
+    );
+    writeFileSync(join(hooks, 'pre-commit'), '#!/bin/sh\n.hooks/eslint checked.js\n');
+    chmodSync(join(hooks, 'eslint'), 0o755);
+    chmodSync(join(hooks, 'pre-commit'), 0o755);
+    execFileSync('git', ['-C', repo, 'config', 'core.hooksPath', '.hooks']);
+    const env = {
+      ...process.env,
+      UNIQUE_BRANCH: 'repair',
+      ARTIFACTS_DIR: join(fixture, 'artifacts'),
+      COMMIT_MESSAGE: 'test',
+    };
+    const first = spawnSync(process.cwd() + '/.archon/scripts/commit-and-push.sh', ['1'], {
+      cwd: repo,
+      env,
+    });
+    expect(first.status).not.toBe(0);
+    expect(readFileSync(join(fixture, 'artifacts', 'commit-hook-output.txt'), 'utf8')).toContain(
+      '[FAILED]'
+    );
+    writeFileSync(join(repo, 'checked.js'), 'good\n');
+    const second = spawnSync(process.cwd() + '/.archon/scripts/commit-and-push.sh', ['2'], {
+      cwd: repo,
+      env,
+    });
+    expect(second.status).toBe(0);
+    expect(
+      execFileSync('git', ['--git-dir', remote, 'rev-parse', 'refs/heads/repair'], {
+        encoding: 'utf8',
+      }).trim()
+    ).toBe(execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
   });
 
   test('second_failure_does_not_loop', () => {
@@ -42,7 +86,7 @@ describe('commit hook repair contract', () => {
       '.archon/workflows/defaults/bdc-feature-development-codex.yaml',
       'utf8'
     );
-    expect(lane).not.toContain('.archon/scripts/commit-and-push.sh 1');
+    expect(lane).toContain('.archon/scripts/commit-and-push.sh 1');
     expect(lane).toContain('.archon/scripts/commit-and-push.sh 2');
     expect(lane).not.toContain('.archon/scripts/commit-and-push.sh 3');
   });

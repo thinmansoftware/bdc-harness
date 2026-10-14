@@ -9,8 +9,11 @@ mkdir -p "$artifacts_dir"
 printf '%s\n' "$attempt" > "$artifacts_dir/commit-hook-attempt.txt"
 
 staged_paths_file="$artifacts_dir/commit-hook-staged-paths.txt"
-if [ ! -s "$staged_paths_file" ]; then
-  echo "ERROR: guarded staged-path record is missing; refusing to stage the worktree" >&2
+if [ "$attempt" = 1 ]; then
+  : > "$staged_paths_file"
+  git status --porcelain | awk '{print substr($0,4)}' > "$staged_paths_file"
+elif [ ! -s "$staged_paths_file" ]; then
+  echo "ERROR: guarded staged-path record is missing; refusing to stage the worktree on retry" >&2
   exit 1
 fi
 while IFS= read -r path; do
