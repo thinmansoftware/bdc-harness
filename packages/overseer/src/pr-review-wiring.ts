@@ -55,6 +55,7 @@ import {
   REMEDIATION_SENDER,
 } from './remediation-candidate';
 import type { RemediationEmitResult } from './remediation-candidate';
+import { attributeLanePr, type LanePrGithubInfo } from '@archon/core/db/lane-pr-registry';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -1189,6 +1190,101 @@ export function createRealSubmitDeps(
         ...(result.slot !== null ? { attempt: result.slot } : {}),
         ...(result.reason ? { reason: result.reason } : {}),
       };
+    },
+
+    /**
+     * Structural lane-repair proof: one targeted event-store read
+     * (attributeLanePr) plus one GitHub PR read. Returns {woId, headRef,
+     * workflowName} only when the LANE PR RULE proves this PR was built by the
+     * lane for that WO; null otherwise (a human PR, a fork, or the spec branch).
+     */
+    async resolveLaneRepairContext(input): Promise<{
+      woId: string;
+      headRef: string;
+      workflowName: string;
+    } | null> {
+      const fetchPr = async (
+        prOwner: string,
+        prRepo: string,
+        prNumber: number
+      ): Promise<LanePrGithubInfo | null> => {
+        try {
+          const pr = await octokit.pulls.get({
+            owner: prOwner,
+            repo: prRepo,
+            pull_number: prNumber,
+          });
+          const d = pr.data as typeof pr.data & {
+            body?: string | null;
+            head: { sha: string; ref?: string; repo?: { full_name?: string } };
+            base?: { sha: string; ref?: string; repo?: { full_name?: string } };
+          };
+          const stateRaw = d.merged
+            ? 'MERGED'
+            : (d.state ?? '').toUpperCase() === 'CLOSED'
+              ? 'CLOSED'
+              : 'OPEN';
+          return {
+            number: d.number,
+            state: stateRaw,
+            reviewDecision: null,
+            createdAt: d.created_at ?? '',
+            headRefName: d.head?.ref ?? '',
+            headSha: d.head?.sha ?? '',
+            headRepoFullName: d.head?.repo?.full_name ?? null,
+            baseRepoFullName: d.base?.repo?.full_name ?? `${prOwner}/${prRepo}`,
+            title: d.title ?? '',
+            body: d.body ?? '',
+          };
+        } catch {
+          return null;
+        }
+      };
+      try {
+        const attribution = await attributeLanePr(
+          { owner: input.owner, repo: input.repo, prNumber: input.prNumber },
+          { fetchPr }
+        );
+        if (!attribution) return null;
+        return {
+          woId: attribution.woId,
+          headRef: attribution.lane.headRef,
+          workflowName: attribution.lane.workflowName,
+        };
+      } catch {
+        return null;
+      }
+    },
+
+    /**
+     * One-per-PR exhausted/judgment hand-off to Taskmaster. Keyed
+     * overseer-remediation-exhausted:<owner>/<repo>#<N> (no head) so ON CONFLICT
+     * DO NOTHING makes it idempotent -- sent at most once per PR ever -- and it
+     * carries kind `overseer_remediation_exhausted` that Taskmaster's PR repair
+     * owner turns into a single Duty Officer digest line.
+     */
+    async emitRemediationExhausted(input): Promise<void> {
+      const slug = `${input.owner.toLowerCase()}/${input.repo.toLowerCase()}#${input.prNumber}`;
+      await (overrides.createReceiptMessage ?? dispatch.createAuthenticatedMessage)(
+        { kind: 'system', sender: REMEDIATION_SENDER },
+        {
+          correlation_id: `overseer-remediation-exhausted:${slug}`,
+          idempotency_key: `overseer-remediation-exhausted:${slug}`,
+          task_type: 'run_report',
+          recipient: REMEDIATION_RECIPIENT,
+          subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+          repeat_reason: `lane-repair exhausted (${input.reason}) for ${slug}`,
+          body: JSON.stringify({
+            kind: 'overseer_remediation_exhausted',
+            owner: input.owner,
+            repo: input.repo,
+            prNumber: input.prNumber,
+            headSha: input.headSha,
+            woId: input.woId,
+            reason: input.reason,
+          }),
+        }
+      );
     },
   };
 }

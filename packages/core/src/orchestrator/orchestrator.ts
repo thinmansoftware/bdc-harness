@@ -56,6 +56,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { freezeWorkOrderSource } from '../workflows/work-order-source';
+import { createRepairAttemptLookup } from '../workflows/store-adapter';
 import {
   cleanupToMakeRoom,
   getWorktreeStatusBreakdown,
@@ -290,7 +291,12 @@ export async function dispatchBackgroundWorkflow(
   }
 ): Promise<void> {
   const frozenSpecSource = workflow.run_authority?.required
-    ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
+    ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage, {
+        // Repair-attempt authority (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01):
+        // a trusted taskmaster-acknowledged dispatch row is required before any
+        // "Repair target: PR #N" line can enter the frozen spec.
+        lookupRepairAttempt: createRepairAttemptLookup(),
+      })
     : undefined;
 
   // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): resolve the WO's

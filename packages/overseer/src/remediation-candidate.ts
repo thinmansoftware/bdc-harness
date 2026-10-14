@@ -407,6 +407,14 @@ export interface RemediationCandidateBody {
   /** Work order id when the review route knew one; null otherwise. */
   readonly woId: string | null;
   /**
+   * The lane PR head ref to repair in place, set ONLY on a lane_repair
+   * candidate (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01); null otherwise. The
+   * PR repair owner reads this to target the exact branch, and run authority
+   * validates it against this trusted row before any repair target enters the
+   * frozen spec.
+   */
+  readonly headRef?: string | null;
+  /**
    * The lane that built the PR. KNOWN SCOPE LIMIT (deliberate): owner
    * selection defaults to the building lane. The general problem -- the
    * machine ASSIGNING an owner to ownerless work -- is a board design question
@@ -443,6 +451,20 @@ export interface RemediationCandidateInput {
   readonly priorAttempts: number;
   readonly woId?: string | null;
   readonly owningLane?: string | null;
+  /**
+   * Lane-repair eligibility signal (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01).
+   *
+   * STRUCTURAL, NOT PROSE. When present it means the caller has PROVEN, from the
+   * event store (lane-pr-registry), that this PR was created by the lane that
+   * built WO `woId` -- a fact a regex over the reviewer's text could never
+   * establish. That is the structured eligibility signal AUTO_FIXABLE_CLASSES
+   * was deliberately left empty waiting for. With it, a CHANGES_REQUESTED
+   * verdict whose blocking findings carry no veto is handed back as a
+   * findingClasses:['lane_repair'] candidate WITHOUT any positive class match --
+   * AUTO_FIXABLE_CLASSES stays empty. Absent -> behavior is byte-for-byte
+   * unchanged.
+   */
+  readonly laneRepair?: { woId: string; headRef: string; workflowName: string };
 }
 
 export type RemediationDecision =
@@ -471,6 +493,16 @@ export function decideRemediation(
   }
 
   const classification = classifyFindings(input.findings, classes);
+
+  // LANE-REPAIR PATH (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01). Reachable ONLY
+  // when the PR is proven lane-created AND the class table yielded nothing
+  // (which is always, in production, because AUTO_FIXABLE_CLASSES is empty).
+  // The structural lane proof -- not a prose match -- is what authorizes the
+  // hand-back. Everything else (the cap, the veto, the blocking requirement)
+  // still gates, and the cap is still checked before any body is built.
+  if (input.laneRepair && classification.classIds.length === 0) {
+    return decideLaneRepair(input, input.laneRepair, classification);
+  }
 
   if (classification.classIds.length === 0 && classification.nonAutoSummaries.length === 0) {
     // A CHANGES_REQUESTED verdict with no blocking finding is not something a
@@ -507,6 +539,63 @@ export function decideRemediation(
       verdictBody: input.verdictBody,
       woId: input.woId ?? null,
       owningLane: input.owningLane ?? null,
+      headRef: null,
+    },
+  };
+}
+
+/**
+ * The lane-repair decision. Independent of any positive class match: a
+ * lane-created PR earns an in-place repair when the verdict is
+ * CHANGES_REQUESTED (checked by the caller), at least one blocking finding
+ * exists, and NO blocking finding trips a veto (NON_AUTO_PATTERN or
+ * NON_AUTO_IMPACT_PATTERN on `${scope} ${summary}`). The cap is checked before
+ * the body is built, so an exhausted PR reports exhaustion and no over-cap body
+ * can exist.
+ */
+function decideLaneRepair(
+  input: RemediationCandidateInput,
+  laneRepair: NonNullable<RemediationCandidateInput['laneRepair']>,
+  classification: FindingsClassification
+): RemediationDecision {
+  const blocking = input.findings.filter(finding => BLOCKING_SEVERITIES.has(finding.severity));
+  if (blocking.length === 0) {
+    return { emit: false, reason: 'no_blocking_findings', nonAutoSummaries: [] };
+  }
+  const anyVetoed = blocking.some(finding => {
+    const vetoText = `${finding.scope} ${finding.summary}`;
+    return NON_AUTO_PATTERN.test(vetoText) || NON_AUTO_IMPACT_PATTERN.test(vetoText);
+  });
+  if (anyVetoed) {
+    // A judgment-call finding on a lane PR is still a human's to weigh. The
+    // submit path turns this refusal into the one-per-PR exhausted hand-off.
+    return {
+      emit: false,
+      reason: 'non_auto_finding_present',
+      nonAutoSummaries:
+        classification.nonAutoSummaries.length > 0
+          ? classification.nonAutoSummaries
+          : blocking.map(finding => finding.summary),
+    };
+  }
+  if (input.priorAttempts >= MAX_REMEDIATION_ATTEMPTS) {
+    return { emit: false, reason: 'remediation_attempts_exhausted', nonAutoSummaries: [] };
+  }
+  return {
+    emit: true,
+    body: {
+      kind: REMEDIATION_CANDIDATE_KIND,
+      owner: input.owner,
+      repo: input.repo,
+      prNumber: input.prNumber,
+      headSha: input.headSha,
+      attempt: input.priorAttempts + 1,
+      maxAttempts: MAX_REMEDIATION_ATTEMPTS,
+      findingClasses: ['lane_repair'],
+      verdictBody: input.verdictBody,
+      woId: laneRepair.woId ?? input.woId ?? null,
+      owningLane: laneRepair.workflowName ?? input.owningLane ?? null,
+      headRef: laneRepair.headRef,
     },
   };
 }
@@ -594,6 +683,7 @@ export function parseRemediationCandidateBody(body: string): RemediationCandidat
       verdictBody: value.verdictBody,
       woId: typeof value.woId === 'string' ? value.woId : null,
       owningLane: typeof value.owningLane === 'string' ? value.owningLane : null,
+      headRef: typeof value.headRef === 'string' ? value.headRef : null,
     };
   } catch {
     return null;

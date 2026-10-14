@@ -19,6 +19,8 @@ import { getDatabase } from '@archon/core';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldron/headroom';
 import {
+  acknowledgeMessage,
+  addressMessage,
   assessDispatchRecipient,
   createAuthenticatedMessage,
   getMessage,
@@ -27,6 +29,16 @@ import {
   type DispatchMessage,
   type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
+import {
+  listLanePrsForWo,
+  listWosWithMultipleLanePrs,
+  type LanePrFetcher,
+  type LanePrGithubInfo,
+  type LanePrState,
+} from '@archon/core/db/lane-pr-registry';
+import { execFileAsync } from '@archon/git';
+import { loadLadder } from '@archon/smart-cauldron/ladder';
+import { runPrRepairOwner, type PrRepairOwnerDeps } from './pr-repair-owner';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
   adoptionContentHash,
@@ -785,6 +797,130 @@ export function buildSelfPauseNotice(
   };
 }
 
+/**
+ * A lane-pr-registry GitHub fetcher backed by `gh pr view`. Reads only the
+ * fields the LANE PR RULE needs; returns null when the PR cannot be read. Fork
+ * detection uses isCrossRepository so rule (c) can drop a fork head.
+ */
+function createGhLaneFetcher(): LanePrFetcher {
+  return async (owner, repo, prNumber): Promise<LanePrGithubInfo | null> => {
+    let stdout: string;
+    try {
+      ({ stdout } = await execFileAsync(
+        'gh',
+        [
+          'pr',
+          'view',
+          String(prNumber),
+          '--repo',
+          `${owner}/${repo}`,
+          '--json',
+          'number,state,reviewDecision,createdAt,headRefName,headRefOid,isCrossRepository,title,body',
+        ],
+        { timeout: 30000 }
+      ));
+    } catch {
+      return null;
+    }
+    const row = JSON.parse(stdout || '{}') as {
+      number?: number;
+      state?: string;
+      reviewDecision?: string | null;
+      createdAt?: string;
+      headRefName?: string;
+      headRefOid?: string;
+      isCrossRepository?: boolean;
+      title?: string;
+      body?: string;
+    };
+    if (typeof row.number !== 'number') return null;
+    const stateRaw = (row.state ?? '').toUpperCase();
+    const state: LanePrState =
+      stateRaw === 'MERGED' ? 'MERGED' : stateRaw === 'CLOSED' ? 'CLOSED' : 'OPEN';
+    const baseRepoFullName = `${owner}/${repo}`;
+    return {
+      number: row.number,
+      state,
+      reviewDecision: row.reviewDecision ?? null,
+      createdAt: row.createdAt ?? '',
+      headRefName: row.headRefName ?? '',
+      headSha: row.headRefOid ?? '',
+      headRepoFullName: row.isCrossRepository ? `fork:${baseRepoFullName}` : baseRepoFullName,
+      baseRepoFullName,
+      title: row.title ?? '',
+      body: row.body ?? '',
+    };
+  };
+}
+
+/**
+ * Bind the PR repair owner to live infrastructure: the event store
+ * (lane-pr-registry), the dispatch mailbox (taskmaster rows), gh (PR close +
+ * read), the ladder (workflow_name -> entry tier) and runCascade. Pure in tests
+ * -- this factory is NEVER called when a fake DAL is injected.
+ */
+function createRealPrRepairOwnerDeps(nowMs: number): PrRepairOwnerDeps {
+  const fetchPr = createGhLaneFetcher();
+  let tierByWorkflow: Map<string, string> | null = null;
+  const resolveEntryTier = (workflowName: string | null): string | undefined => {
+    if (!workflowName) return undefined;
+    if (!tierByWorkflow) {
+      tierByWorkflow = new Map();
+      try {
+        for (const tier of loadLadder()) tierByWorkflow.set(tier.workflowName, tier.name);
+      } catch {
+        tierByWorkflow = new Map();
+      }
+    }
+    return tierByWorkflow.get(workflowName);
+  };
+  return {
+    now: () => nowMs,
+    fetchPr,
+    listWosWithMultipleLanePrs: opts => listWosWithMultipleLanePrs(opts),
+    listLanePrsForWo: (woId, opts) => listLanePrsForWo(woId, opts),
+    async listQueuedTaskmasterMessages(): Promise<{ id: string; body: string }[]> {
+      const rows = await listMessages({ recipient: 'taskmaster', status: 'queued' });
+      return rows.map(row => ({ id: row.id, body: row.body }));
+    },
+    async acknowledgeRow(id): Promise<void> {
+      await acknowledgeMessage({ id, principal_id: 'taskmaster' });
+    },
+    async addressRow(id, note): Promise<void> {
+      await addressMessage({ id, principal_id: 'taskmaster' });
+      log.info({ id, note }, 'taskmaster.pr_repair_row_addressed');
+    },
+    async closePr(input): Promise<void> {
+      // `gh pr close` with --comment; NO --delete-branch (the branch is kept so
+      // the dedupe is reversible and the survivor can cherry-pick if needed).
+      await execFileAsync(
+        'gh',
+        [
+          'pr',
+          'close',
+          String(input.prNumber),
+          '--repo',
+          `${input.owner}/${input.repo}`,
+          '--comment',
+          input.comment,
+        ],
+        { timeout: 30000 }
+      );
+    },
+    async hasRunningRunForWo(woId): Promise<boolean> {
+      const result = await getDatabase().query<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM remote_agent_workflow_runs
+         WHERE user_message LIKE $1 AND status = 'running'`,
+        [`%${woId}%`]
+      );
+      return (result.rows[0]?.n ?? 0) > 0;
+    },
+    fireRepairCascade: opts => runCascade({ ...opts, deps: { seatUsage: conductorSeatUsage } }),
+    resolveEntryTier,
+    token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+  };
+}
+
 /*
  * RETIREMENT: The daily canary retires when the Taskmaster has run 30 consecutive days with at least
  * one `outcome='sent'` row per day and zero self-pause events in that window. Retirement is
@@ -795,7 +931,8 @@ function digestProposal(
   control: taskmasterDb.TmControlState,
   nowMs: number,
   expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>,
-  unlabelledPriorityTriage: string[] = []
+  unlabelledPriorityTriage: string[] = [],
+  prRepairItems: string[] = []
 ): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
   const digestActions = actions24h.filter(action => action.thread_ref !== 'taskmaster:reset');
@@ -821,6 +958,12 @@ function digestProposal(
   const triageSummary = unlabelledPriorityTriage.length
     ? ` Needs priority triage: ${unlabelledPriorityTriage.join(', ')}.`
     : '';
+  // PR repair owner ride-along (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): the
+  // exhausted/judgment and approved-non-survivor cases a human must look at,
+  // on the same single daily message. Nothing here writes to xo or operator.
+  const prRepairSummary = prRepairItems.length
+    ? ` PR repair needs a person: ${prRepairItems.join('; ')}.`
+    : '';
   return {
     type: 'digest',
     threadRef: `digest:${dateKey}`,
@@ -831,7 +974,7 @@ function digestProposal(
       `Taskmaster daily canary for ${dateKey}: state=${control.pause_state}, ` +
       `scope=${control.pause_scope ?? 'none'}, actor=${control.pause_actor ?? 'none'}, ` +
       `updated_at=${control.updated_at}; ${summary}; ${pauseDetail}.` +
-      `${expectationSummary}${triageSummary} ` +
+      `${expectationSummary}${triageSummary}${prRepairSummary} ` +
       'Pause/resume/status runbook: xo-wiki/wiki/tools/taskmaster/_index.md.',
     idempotencyKey: `tm:digest:${dateKey}`,
     actsImmediately: true,
@@ -1697,12 +1840,31 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.expectation_counts_failed');
   }
+  // PR repair owner (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): collapse
+  // duplicate lane PRs, fire at most one bounded in-place repair, and gather the
+  // exhausted/judgment lines for THIS tick's digest. Runs only while RUNNING and
+  // only against live infrastructure (skipped when a fake DAL is injected, where
+  // the owner is exercised directly in pr-repair-owner.test.ts). It must never
+  // break the tick: any failure degrades to "no items this tick".
+  let prRepairItems: string[] = [];
+  let commitPrRepairExhausted: (() => Promise<void>) | null = null;
+  if (control.pause_state === 'RUNNING' && !deps.db) {
+    try {
+      const owner = await runPrRepairOwner(createRealPrRepairOwnerDeps(nowMs));
+      prRepairItems = owner.digestItems;
+      commitPrRepairExhausted = owner.commitExhausted;
+    } catch (error) {
+      log.warn({ err: error as Error }, 'taskmaster.pr_repair_owner_failed');
+    }
+  }
+
   const digest = digestProposal(
     actions24h,
     control,
     nowMs,
     expectationCounts,
-    unlabelledPriorityTriage
+    unlabelledPriorityTriage,
+    prRepairItems
   );
   proposals.push(digest);
 
@@ -2077,6 +2239,18 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       journalRow.outcome = 'failed';
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
+    }
+  }
+
+  // PR repair owner (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): the
+  // exhausted/judgment lines rode this tick's daily digest above; address their
+  // queued rows ONLY now that the digest has been processed, so a failed digest
+  // leaves the row queued for the next tick instead of dropping the line.
+  if (commitPrRepairExhausted) {
+    try {
+      await commitPrRepairExhausted();
+    } catch (error) {
+      log.warn({ err: error as Error }, 'taskmaster.pr_repair_commit_failed');
     }
   }
 
