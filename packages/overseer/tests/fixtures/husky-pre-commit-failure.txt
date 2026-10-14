@@ -1,0 +1,4 @@
+[STARTED] Running tasks for staged files...
+[FAILED] packages/server/src/taskmaster/loop.ts
+1419:19 error Missing return type on function @typescript-eslint/explicit-function-return-type
+husky - pre-commit script failed (code 1)

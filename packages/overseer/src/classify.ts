@@ -96,10 +96,11 @@ export function classifyError(input: ClassifyInput): ErrorClass {
   const exit = input.exitCode;
   const validatorText = input.validatorOutput ?? '';
 
-  // This recovery is deliberately restricted to commit-and-push. Identical text
-  // elsewhere may be quoted evidence and must not enter the bounded repair path.
+  // This recovery is deliberately restricted to the initial commit node and its
+  // single bounded retry. Identical text elsewhere may be quoted evidence and
+  // must not enter the repair path.
   if (
-    input.nodeId === 'commit-and-push' &&
+    (input.nodeId === 'commit-and-push' || input.nodeId === 'commit-and-push-retry') &&
     (/husky\s+-\s+pre-commit script failed/i.test(rawMessage) ||
       (/lint-staged/i.test(rawMessage) && /\[FAILED\]/i.test(rawMessage)))
   ) {

@@ -64,6 +64,7 @@ export interface MergeExecutionBridgeStore {
   // Optional so older/test stores that predate the active-run guard keep prior
   // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
   hasActiveRunForWo?(woId: string): Promise<boolean>;
+  hasUnresolvedUnverifiedApproval?(prUrl: string, headSha: string): Promise<boolean>;
   reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
   releaseMergeSlot(verdictId: string): Promise<void>;
   recordOutcome(input: {
@@ -876,6 +877,18 @@ export async function runMergeExecutionBridgeOnce(
       continue;
     }
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
+    if (
+      verdict.pr_url &&
+      (await options.store.hasUnresolvedUnverifiedApproval?.(verdict.pr_url, verdict.head_sha))
+    ) {
+      // Leave merge authority unclaimed. The exact-head re-review or Duty
+      // Officer resolution must clear the unverified verdict first.
+      log.info(
+        { verdictId: verdict.id, prUrl: verdict.pr_url, headSha: verdict.head_sha },
+        'merge-coordinator.unverified_approval_hold'
+      );
+      continue;
+    }
     if (!(await options.store.claimVerdict(verdict.id))) continue;
     try {
       if ((await mergeClaimedVerdict(options, verdict, repoPolicy)) === 'stop') break;

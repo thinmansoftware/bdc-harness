@@ -79,6 +79,8 @@ export function reviewRecordsVerdictEnabled(
 interface ReviewApprovalVerdictDeps {
   claimVerdict: typeof claimOverseerVerdict;
   finalizeVerdict: typeof finalizeOverseerVerdict;
+  listMessages?: typeof dispatch.listMessages;
+  createMessage?: typeof dispatch.createAuthenticatedMessage;
 }
 
 export async function recordReviewApprovalVerdict(
@@ -110,15 +112,61 @@ export async function recordUnverifiedReviewVerdict(
 ): Promise<void> {
   const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}:unverified`;
   const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
-  if (!claim.claimed || !claim.verdictId) return;
-  await deps.finalizeVerdict({
-    verdictId: claim.verdictId,
-    status: 'verdict',
-    verdict: 'approved_unverified',
-    proposedAction: 'none',
-    model: input.model,
-    prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
-  });
+  if (claim.claimed && claim.verdictId) {
+    await deps.finalizeVerdict({
+      verdictId: claim.verdictId,
+      status: 'verdict',
+      verdict: 'approved_unverified',
+      proposedAction: 'none',
+      model: input.model,
+      prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+    });
+  }
+  const subjectKey = reviewSubjectKey(input.owner, input.repo, input.prNumber);
+  const listMessages = deps.listMessages ?? dispatch.listMessages;
+  const createMessage = deps.createMessage ?? dispatch.createAuthenticatedMessage;
+  const priorRetry = (
+    await listMessages({ recipient: REVIEW_RECIPIENT, subject_key: subjectKey })
+  ).some(
+    message =>
+      message.repeat_reason === 'unverified_approval_retry' &&
+      parseReviewWorkBody(message.body)?.headSha === input.headSha
+  );
+  if (!priorRetry) {
+    await createMessage(
+      { kind: 'system', sender: REVIEW_SENDER },
+      {
+        correlation_id: `pr-review:${input.owner}/${input.repo}#${input.prNumber}@${input.headSha}:unverified-retry`,
+        idempotency_key: `pr-review-unverified-retry:${input.owner}/${input.repo}#${input.prNumber}@${input.headSha}`,
+        task_type: 'run_review',
+        recipient: REVIEW_RECIPIENT,
+        subject_key: subjectKey,
+        repeat_reason: 'unverified_approval_retry',
+        body: JSON.stringify({
+          owner: input.owner,
+          repo: input.repo,
+          prNumber: input.prNumber,
+          headSha: input.headSha,
+          baseRef: '',
+          author: '',
+          headCiGreen: false,
+        } satisfies ReviewWorkBody),
+      }
+    );
+  } else {
+    await createMessage(
+      { kind: 'system', sender: REVIEW_SENDER },
+      {
+        correlation_id: `pr-review:${input.owner}/${input.repo}#${input.prNumber}@${input.headSha}:unverified-escalation`,
+        idempotency_key: `pr-review-unverified-escalation:${input.owner}/${input.repo}#${input.prNumber}@${input.headSha}`,
+        task_type: 'agent_message',
+        recipient: 'duty-officer',
+        priority: 'blocker',
+        subject_key: subjectKey,
+        body: `A second approval could not be verified for ${input.owner}/${input.repo}#${input.prNumber} at ${input.headSha}. Merge remains held pending Duty Officer resolution.`,
+      }
+    );
+  }
   log.warn(
     { owner: input.owner, repo: input.repo, prNumber: input.prNumber, headSha: input.headSha },
     'overseer.review.approved_unverified'

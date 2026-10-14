@@ -410,6 +410,21 @@ export async function listUnactionedFlagMergeReadyVerdicts(): Promise<OverseerVe
   return [...result.rows];
 }
 
+/** True while an exact PR head has an unverified approval that has not been resolved. */
+export async function hasUnresolvedUnverifiedApproval(
+  prUrl: string,
+  headSha: string
+): Promise<boolean> {
+  const result = await getDatabase().query<{ present: number }>(
+    `SELECT 1 AS present FROM overseer_verdicts
+     WHERE verdict = 'approved_unverified' AND pr_url = $1 AND head_sha = $2
+       AND actioned_at IS NULL
+     LIMIT 1`,
+    [prUrl, headSha]
+  );
+  return result.rows.length > 0;
+}
+
 export async function deferVerdictClaimForMergeExecution(
   verdictId: string,
   reason: string,

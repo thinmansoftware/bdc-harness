@@ -31,14 +31,20 @@ import { mkdtemp } from 'node:fs/promises';
 import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { classifyError, decide } from '../src/index.ts';
 
 const COMMIT_HOOK_FIXTURE = `[FAILED] packages/server/src/taskmaster/loop.ts
 1419:19 error Missing return type on function @typescript-eslint/explicit-function-return-type
 husky - pre-commit script failed (code 1)`;
 
+const REAL_HUSKY_FIXTURE = readFileSync(
+  new URL('./fixtures/husky-pre-commit-failure.txt', import.meta.url),
+  'utf8'
+);
+
 test('lint_hook_failure_classified_and_decided', () => {
-  const errorClass = classifyError({ nodeId: 'commit-and-push', message: COMMIT_HOOK_FIXTURE });
+  const errorClass = classifyError({ nodeId: 'commit-and-push', message: REAL_HUSKY_FIXTURE });
   expect(errorClass).toBe('commit_hook_lint_failure');
   expect(decide({ errorClass, attempt: 1 })).toMatchObject({
     decision: 'escalate',
@@ -59,6 +65,18 @@ test('hook_failure_text_on_other_node_not_captured', () => {
   expect(
     classifyError({ nodeId: 'commit-and-push', message: 'remote rejected git push' })
   ).not.toBe('commit_hook_lint_failure');
+});
+
+test('second hook failure on bounded retry reaches attempt-2 blocker classification', () => {
+  const errorClass = classifyError({
+    nodeId: 'commit-and-push-retry',
+    message: COMMIT_HOOK_FIXTURE,
+  });
+  expect(errorClass).toBe('commit_hook_lint_failure');
+  expect(decide({ errorClass, attempt: 2 })).toMatchObject({
+    blocker: true,
+    repairableOnce: false,
+  });
 });
 
 test('unknown_class_still_escalates_and_is_unchanged', () => {

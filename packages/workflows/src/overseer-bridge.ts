@@ -97,6 +97,21 @@ export interface HandleNodeFailureResult {
   errorClass: string;
 }
 
+export function deriveFailureIssueNumber(
+  metadata: Record<string, unknown>,
+  userMessage: string
+): number | undefined {
+  const candidate = metadata.wo_issue_number ?? metadata.issue_number;
+  if (typeof candidate === 'number' && Number.isInteger(candidate) && candidate > 0)
+    return candidate;
+  if (typeof candidate === 'string' && /^\d+$/.test(candidate)) return Number(candidate);
+  const conventionalReference =
+    /(?:https?:\/\/github\.com\/thinmansoftware\/bdc-xo\/issues\/|thinmansoftware\/bdc-xo#|(?:review[ _-]?issue|issue(?:_number)?)\s*[:=#]\s*)(\d+)\b/i.exec(
+      userMessage
+    );
+  return conventionalReference ? Number(conventionalReference[1]) : undefined;
+}
+
 /**
  * Shared node-failure handler. Replaces the 5-step log + logNodeError + createWorkflowEvent +
  * emitter.emit + return-failed pattern at each AI-node failure site in dag-executor.ts.
@@ -135,13 +150,7 @@ export async function handleNodeFailure(
 
   if (result.decision === 'escalate') {
     const metadata = workflowRun.metadata ?? {};
-    const issueCandidate = metadata.wo_issue_number ?? metadata.issue_number;
-    const issueNumber =
-      typeof issueCandidate === 'number'
-        ? issueCandidate
-        : typeof issueCandidate === 'string' && /^\d+$/.test(issueCandidate)
-          ? Number(issueCandidate)
-          : undefined;
+    const issueNumber = deriveFailureIssueNumber(metadata, workflowRun.user_message);
     await notifyNodeFailure({
       runId: workflowRun.id,
       workflowName: workflowRun.workflow_name,

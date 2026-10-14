@@ -8,11 +8,12 @@
  */
 
 import { describe, it, expect, mock } from 'bun:test';
-import { handleNodeFailure } from './overseer-bridge.ts';
+import { deriveFailureIssueNumber, handleNodeFailure } from './overseer-bridge.ts';
 import type { WorkflowRun } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
 import type { IWorkflowStore } from './store.ts';
 import type { Logger } from '@archon/paths';
+import { listMessages } from '@archon/core/db/dispatch';
 
 // --- Minimal mocks ------------------------------------------------------------
 
@@ -84,6 +85,16 @@ function makeDeps() {
 }
 
 const baseCtx = { errorMsg: '', logDir: '/tmp/test-logs', outputSoFar: '' };
+
+describe('failure issue derivation', () => {
+  it('prefers metadata and falls back to workflow message review conventions', () => {
+    expect(deriveFailureIssueNumber({ wo_issue_number: '41' }, 'review issue: 99')).toBe(41);
+    expect(deriveFailureIssueNumber({}, 'Review issue: thinmansoftware/bdc-xo#812')).toBe(812);
+    expect(
+      deriveFailureIssueNumber({}, 'See https://github.com/thinmansoftware/bdc-xo/issues/913')
+    ).toBe(913);
+  });
+});
 
 // --- Tests --------------------------------------------------------------------
 
@@ -179,6 +190,22 @@ describe('handleNodeFailure -- decision routing', () => {
 });
 
 describe('handleNodeFailure -- side effects', () => {
+  it('persists one idempotent overseer-node-failure Duty Officer message through Dispatch DAL', async () => {
+    const deps = makeDeps();
+    const workflowRun = { ...makeWorkflowRun(), id: 'dispatch-idempotency-run' };
+    const context = { ...baseCtx, errorMsg: 'unrecognised failure' };
+
+    await handleNodeFailure(deps, workflowRun, makeNode('dispatch-node'), context);
+    await handleNodeFailure(deps, workflowRun, makeNode('dispatch-node'), context);
+
+    const messages = await listMessages({ recipient: 'duty-officer' });
+    expect(
+      messages.filter(
+        message =>
+          message.idempotency_key === 'overseer-node-failure:dispatch-idempotency-run:dispatch-node'
+      )
+    ).toHaveLength(1);
+  });
   it('emits overseer.decision log line with structured fields', async () => {
     const deps = makeDeps();
     await handleNodeFailure(deps, makeWorkflowRun(), makeNode('node-x'), {

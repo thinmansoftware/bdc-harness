@@ -3760,12 +3760,26 @@ nodes:
       echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
       echo "unique_branch=${UNIQUE_BRANCH}"
 
-  # Exactly one bounded repair pass for a pre-commit lint/format hook failure.
+  - id: classify-commit-hook-failure
+    persona: overseer
+    depends_on: [commit-and-push]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+      HOOK_OUTPUT="${ARCHON_RUN_ARTIFACTS_DIR:-${ARCHON_HOME:-.archon}/artifacts}/commit-hook-output.txt"
+      if [ -s "$HOOK_OUTPUT" ] && grep -Eqi 'husky - pre-commit script failed|lint-staged.*\[FAILED\]' "$HOOK_OUTPUT"; then
+        printf '{"error_class":"commit_hook_lint_failure"}\n'
+      else
+        printf '{"error_class":"other"}\n'
+      fi
+
+  # Exactly one bounded repair pass for a classified pre-commit lint/format hook failure.
   - id: commit-hook-repair
     persona: major-build
     agent: major-build
-    depends_on: [commit-and-push]
-    trigger_rule: all_done
+    depends_on: [classify-commit-hook-failure]
+    when: "$classify-commit-hook-failure.output.error_class == 'commit_hook_lint_failure'"
     task_class: medium_work
     prompt: |
       The commit-and-push node may have failed in a real pre-commit hook. Read

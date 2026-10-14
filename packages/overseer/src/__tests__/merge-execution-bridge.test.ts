@@ -179,6 +179,23 @@ afterEach(() => {
 });
 
 describe('merge execution bridge', () => {
+  test('holds exact-head merge authority while an unverified approval is unresolved', async () => {
+    const row = verdict('held');
+    row.pr_url = 'https://github.com/thinmansoftware/bdc-harness/pull/42';
+    const h = harness([row]);
+    h.store.hasUnresolvedUnverifiedApproval = async (prUrl, headSha) =>
+      prUrl === row.pr_url && headSha === row.head_sha;
+
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(await h.store.listUnactionedVerdicts()).toHaveLength(1);
+  });
   test('production CE compare adapter accepts 150 page-one files as complete', async () => {
     const compareCommits = mock(async () => ({
       data: {
