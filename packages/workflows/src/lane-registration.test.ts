@@ -69,9 +69,11 @@ function loadLane(filename: string): LaneDef {
 }
 
 describe('lane registration and war-council-validator pin', () => {
-  it('S4: enumerates exactly the twelve governed feature lanes', () => {
+  it('S4: enumerates exactly the fourteen governed feature lanes', () => {
     // Kimi canary lanes added 2026-07-20 (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01).
     // Cursor lane added 2026-09-15 (PR #848): grok clone on the Cursor rail.
+    // Haiku canary lane added 2026-10-14 (WO-HARNESS-LANES-MODERNIZE-AND-HAIKU-01):
+    //   Claude-haiku-5-5 build, gpt-6-astra cross-family review.
     // This enumeration is deliberately hardcoded: it is the tripwire that forces a
     // new lane to be acknowledged here AND given an explicit validator-pin branch
     // in S4b below, rather than silently inheriting a default.
@@ -84,6 +86,7 @@ describe('lane registration and war-council-validator pin', () => {
       'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-haiku.yaml',
       'bdc-feature-development-kimi-k3.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
@@ -149,10 +152,21 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-cursor.yaml') {
-        // Grok 4.7 builds on the Cursor rail; the judge is Codex gpt-5.6-sol
-        // so the lane never grades its own work.
-        expect(wcv.provider).toBe('codex');
-        expect(wcv.model).toBe('gpt-5.6-sol');
+        // Grok 4.7 builds on the Cursor rail; the judge is Codex gpt-6-astra via
+        // codex-native-strict (modernized 2026-10-14) so the lane never grades
+        // its own work.
+        expect(wcv.provider).toBe('codex-native-strict');
+        expect(wcv.model).toBe('gpt-6-astra');
+        expect(wcv.persona).toBe('captain-ci-validator-codex');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-haiku.yaml') {
+        // Claude-haiku-5-5 builds; a strong cross-family judge (gpt-6-astra via
+        // codex-native-strict) validates. Owner ruling 2026-10-14 mandates a
+        // strong-model review seat on this lane -- never Haiku judging Haiku.
+        expect(wcv.provider).toBe('codex-native-strict');
+        expect(wcv.model).toBe('gpt-6-astra');
         expect(wcv.persona).toBe('captain-ci-validator-codex');
         return;
       }
@@ -171,14 +185,16 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-codex-only.yaml') {
-        // Claude-out / Codex-in: validator on codex with model-free persona.
-        expect(wcv.provider).toBe('codex');
+        // Claude-out / Codex-in: validator on codex-native-strict (modernized to
+        // gpt-6-astra, 2026-10-14) with model-free persona.
+        expect(wcv.provider).toBe('codex-native-strict');
         return;
       }
 
       if (file === 'bdc-feature-development-codex.yaml') {
-        // This lane builds with gpt-5.6-sol. The judge is gpt-5.6-terra so
-        // the builder never grades its own work.
+        // This lane builds with gpt-6-astra (modernized 2026-10-14). The judge is
+        // the documented gpt-5.6-terra exception (no cheaper verified GPT-6 id on
+        // the runtime) so the builder never grades its own work.
         expect(wcv.provider).toBe('codex');
         expect(wcv.model).toBe('gpt-5.6-terra');
         expect(wcv.persona).toBe('captain-ci-validator-codex');
@@ -191,7 +207,7 @@ describe('lane registration and war-council-validator pin', () => {
       // and stays on the CLOSER rung (see the codex-lane branch above, which
       // is correct and unchanged).
       const expectedModel =
-        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'sonnet';
+        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'claude-sonnet-5-5';
       expect(wcv.provider).toBe('claude');
       expect(wcv.model).toBe(expectedModel);
     });
@@ -298,7 +314,7 @@ describe('lane registration and war-council-validator pin', () => {
     return node?.persona ?? node?.agent;
   }
 
-  it('S4l: the Cursor lane builds on grok-4.7 and reviews on Codex gpt-5.6-sol', () => {
+  it('S4l: the Cursor lane builds on grok-4.7 and reviews on Codex gpt-6-astra', () => {
     const file = 'bdc-feature-development-cursor.yaml';
     const lane = loadLane(file);
     const grok = loadLane('bdc-feature-development-grok.yaml');
@@ -325,23 +341,28 @@ describe('lane registration and war-council-validator pin', () => {
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = node(id);
       const source = codexNode(id);
-      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex');
-      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe(source?.provider);
-      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-5.6-sol');
+      // Modernized 2026-10-14: cursor review seats run gpt-6-astra via
+      // codex-native-strict; the codex lane keeps its gpt-5.6-terra exception.
+      // Personas/agents still mirror the codex lane the cursor lane was cloned from.
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
+      expect(source?.provider, `codex:${id}:provider`).toBe('codex');
+      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-6-astra');
       expect(source?.model, `codex:${id}:model`).toBe('gpt-5.6-terra');
       expect(reviewNode?.persona, `${file}:${id}:persona`).toBe(source?.persona);
       expect(reviewNode?.agent, `${file}:${id}:agent`).toBe(source?.agent);
       expect(REVIEW_PERSONA_ALLOWLIST.has(reviewPersona(reviewNode) ?? '')).toBe(true);
     }
     expect(nodes.filter(n => n.provider === 'claude').map(n => n.id)).toEqual([]);
-    for (const id of [
-      'check-already-satisfied',
-      'plan',
-      'implement',
-      'diff-repair',
-      'opus-repair',
-      'apply-suggested-fix',
-    ]) {
+    // check-already-satisfied retiered to grok-4.7-medium (2026-10-14); the rest
+    // of the Grok build/repair seats stay grok-4.7-high.
+    expect(
+      node('check-already-satisfied')?.provider,
+      `${file}:check-already-satisfied:provider`
+    ).toBe('cursor');
+    expect(node('check-already-satisfied')?.model, `${file}:check-already-satisfied:model`).toBe(
+      'grok-4.7-medium'
+    );
+    for (const id of ['plan', 'implement', 'diff-repair', 'opus-repair', 'apply-suggested-fix']) {
       const buildNode = node(id);
       expect(buildNode?.provider, `${file}:${id}:provider`).toBe('cursor');
       expect(buildNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
@@ -351,13 +372,13 @@ describe('lane registration and war-council-validator pin', () => {
     expect(content).not.toMatch(/^\s*provider:\s*(grok|codex-opr)\b/m);
   });
 
-  it('Test 1: cursor-lane review seats are Codex gpt-5.6-sol with model-free personas', () => {
+  it('Test 1: cursor-lane review seats are Codex gpt-6-astra with model-free personas', () => {
     const lane = loadLane('bdc-feature-development-cursor.yaml');
     const nodes = lane.nodes ?? [];
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = nodes.find(candidate => candidate.id === id);
-      expect(reviewNode?.provider, id).toBe('codex');
-      expect(reviewNode?.model, id).toBe('gpt-5.6-sol');
+      expect(reviewNode?.provider, id).toBe('codex-native-strict');
+      expect(reviewNode?.model, id).toBe('gpt-6-astra');
       expect(reviewNode?.provider, id).not.toBe('claude');
       expect(reviewNode?.provider, id).not.toBe('cursor');
       expect(reviewNode?.model ?? '', id).not.toMatch(/grok/i);
@@ -394,19 +415,19 @@ describe('lane registration and war-council-validator pin', () => {
     }
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = (cursor.nodes ?? []).find(candidate => candidate.id === id);
-      expect(reviewNode?.model, `cursor:${id}`).toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, `cursor:${id}`).toBe('gpt-6-astra');
       expect(reviewNode?.model, `cursor:${id}`).not.toBe(cursor.model);
     }
 
     for (const id of buildIds) {
       const buildNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
       const model = buildNode?.model ?? codex.model;
-      expect(model, `codex:${id}`).toBe('gpt-5.6-sol');
+      expect(model, `codex:${id}`).toBe('gpt-6-astra');
     }
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
       expect(reviewNode?.model, `codex:${id}`).toBe('gpt-5.6-terra');
-      expect(reviewNode?.model, `codex:${id}`).not.toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, `codex:${id}`).not.toBe('gpt-6-astra');
       expect(reviewNode?.model, `codex:${id}`).not.toBe(codex.model);
     }
   });
@@ -424,14 +445,20 @@ describe('lane registration and war-council-validator pin', () => {
     expect(content).not.toContain('model: claude');
     expect(content).not.toContain('agent: overseer-opus');
 
-    for (const id of [
-      'check-already-satisfied',
-      'plan',
-      'implement',
-      'diff-repair',
-      'opus-repair',
-      'apply-suggested-fix',
-    ]) {
+    // check-already-satisfied retiered to grok-4.7-medium (2026-10-14); the rest
+    // of the Grok execution seats stay grok-4.7-high.
+    expect(
+      node('check-already-satisfied')?.provider,
+      `${file}:check-already-satisfied:provider`
+    ).toBe('cursor');
+    expect(node('check-already-satisfied')?.model, `${file}:check-already-satisfied:model`).toBe(
+      'grok-4.7-medium'
+    );
+    expect(
+      node('check-already-satisfied')?.fallbackModel,
+      `${file}:check-already-satisfied:fallbackModel`
+    ).toBeUndefined();
+    for (const id of ['plan', 'implement', 'diff-repair', 'opus-repair', 'apply-suggested-fix']) {
       const executionNode = node(id);
       expect(executionNode?.provider, `${file}:${id}:provider`).toBe('cursor');
       expect(executionNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
