@@ -332,6 +332,8 @@ interface GithubIssue {
  * labels), so each label is queried separately and results are deduped by
  * issue number -- OR semantics, never requiring both simultaneously.
  */
+// Project-labelled issues without an explicit priority default to P1 during
+// adoption; priority-less wo and arc issues remain in the triage list.
 const WORK_LABELS = ['wo', 'project', 'arc'] as const;
 const MAX_PAGES_PER_LABEL = 10;
 const GITHUB_RATE_LIMIT_FLOOR = 5;
@@ -490,14 +492,18 @@ export async function defaultListThreads(
         if (seen.has(issue.number)) continue; // carried both labels
         seen.add(issue.number);
         const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
-        const priority = priorityFromLabels(labels);
-        if (priority === null) {
-          const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
-          unlabelledPriorityTriage.push(ref);
-          log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
-          continue;
-        }
         const normalizedLabels = labels.map(label => label.trim().toLowerCase());
+        let priority = priorityFromLabels(labels);
+        if (priority === null) {
+          if (normalizedLabels.includes('project')) {
+            priority = 'P1';
+          } else {
+            const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
+            unlabelledPriorityTriage.push(ref);
+            log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
+            continue;
+          }
+        }
         const hasClaimStatus = normalizedLabels.some(label =>
           ['status:building', 'status:review'].includes(label)
         );
@@ -1388,6 +1394,15 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
+  const recentEscalateP0ByThread = new Set(
+    actions24h
+      .filter(
+        action =>
+          action.action_type === 'escalate_p0' &&
+          (action.outcome === 'sent' || action.outcome === 'expired')
+      )
+      .map(action => canonicalizeThreadRef(action.thread_ref))
+  );
   const readHealth = deps.getHealthSample ?? taskmasterDb.getHealthSample;
   let codexHealth: taskmasterDb.TmHealthSample | null = null;
   let xaiHealth: taskmasterDb.TmHealthSample | null = null;
@@ -1731,6 +1746,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   let blockerReportsThisTick = 0;
 
   for (const proposal of proposals) {
+    const canonicalProposalRef = canonicalizeThreadRef(proposal.threadRef);
+    if (proposal.type === 'escalate_p0' && recentEscalateP0ByThread.has(canonicalProposalRef)) {
+      continue;
+    }
     let existingAction =
       actionsByKey.get(proposal.idempotencyKey) ??
       (await dal.getActionByIdempotencyKey(proposal.idempotencyKey));
@@ -1950,6 +1969,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             JSON.stringify({ ...proposal, suppressed })
           );
           journalRow.outcome = 'expired';
+          recentEscalateP0ByThread.add(canonicalProposalRef);
           result.expired += 1;
           log.info(
             {
@@ -2060,6 +2080,9 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         await dal.updateActionOutcome(journalRow.id, 'sent');
       }
       journalRow.outcome = 'sent';
+      if (proposal.type === 'escalate_p0') {
+        recentEscalateP0ByThread.add(canonicalProposalRef);
+      }
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
       if (proposal.type === 'fire_cauldron') firesThisTick += 1;
