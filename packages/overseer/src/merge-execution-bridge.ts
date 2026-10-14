@@ -859,6 +859,22 @@ export async function runMergeExecutionBridgeOnce(
   const repoPolicy = configuredPolicy(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
   for (const verdict of verdicts) {
+    // Defense in depth: an unverified approval is never merge authority even if
+    // malformed persistence assigned it a merge-ready action.
+    if (verdict.verdict === 'approved_unverified') {
+      if (!(await options.store.claimVerdict(verdict.id))) continue;
+      await options.store.recordOutcome({
+        verdictId: verdict.id,
+        mutationSent: false,
+        reason: 'approval_unverified',
+        prUrl: verdict.pr_url ?? undefined,
+      });
+      log.info(
+        { verdictId: verdict.id, runId: verdict.run_id, reason: 'approval_unverified' },
+        'merge-coordinator.merge_skipped'
+      );
+      continue;
+    }
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
     if (!(await options.store.claimVerdict(verdict.id))) continue;
     try {

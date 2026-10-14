@@ -101,6 +101,30 @@ export async function recordReviewApprovalVerdict(
   });
 }
 
+export async function recordUnverifiedReviewVerdict(
+  input: { owner: string; repo: string; prNumber: number; headSha: string; model?: string },
+  deps: ReviewApprovalVerdictDeps = {
+    claimVerdict: claimOverseerVerdict,
+    finalizeVerdict: finalizeOverseerVerdict,
+  }
+): Promise<void> {
+  const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}:unverified`;
+  const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
+  if (!claim.claimed || !claim.verdictId) return;
+  await deps.finalizeVerdict({
+    verdictId: claim.verdictId,
+    status: 'verdict',
+    verdict: 'approved_unverified',
+    proposedAction: 'none',
+    model: input.model,
+    prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+  });
+  log.warn(
+    { owner: input.owner, repo: input.repo, prNumber: input.prNumber, headSha: input.headSha },
+    'overseer.review.approved_unverified'
+  );
+}
+
 export async function maybeRecordReviewApprovalVerdict(
   input: {
     disposition: string;
@@ -116,9 +140,17 @@ export async function maybeRecordReviewApprovalVerdict(
     onError?: (error: unknown) => void;
   } = {}
 ): Promise<void> {
-  if (input.disposition !== 'approved' || !reviewRecordsVerdictEnabled(options.env)) return;
+  if (
+    !['approved', 'approved_unverified'].includes(input.disposition) ||
+    !reviewRecordsVerdictEnabled(options.env)
+  )
+    return;
   try {
-    await (options.record ?? recordReviewApprovalVerdict)(input);
+    if (input.disposition === 'approved_unverified' && !options.record) {
+      await recordUnverifiedReviewVerdict(input);
+    } else {
+      await (options.record ?? recordReviewApprovalVerdict)(input);
+    }
   } catch (error) {
     options.onError?.(error);
   }
@@ -1024,6 +1056,8 @@ export function createRealSubmitDeps(
         result.verdict === 'INDETERMINATE' ? reviewErrorCode(result.error) : null;
       return {
         approved: result.verdict === 'APPROVE',
+        approvedUnverified: result.verdict === 'APPROVE_UNVERIFIED',
+        ...(result.verification_reason ? { verificationReason: result.verification_reason } : {}),
         summary,
         reviewedHeadSha: result.reviewed_head_sha,
         // Structured findings ride alongside the flattened summary so

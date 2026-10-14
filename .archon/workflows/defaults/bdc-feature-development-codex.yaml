@@ -3323,8 +3323,12 @@ nodes:
     trigger_rule: all_done
     when: "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied' || $classify-opus-rereview.output.verdict == 'satisfied'"
     load_bearing: true
-    bash: |
+    bash: &commit_and_push_command |
       set -euo pipefail
+      # Preserve hook diagnostics for the one bounded repair pass. Hooks remain enabled.
+      COMMIT_HOOK_OUTPUT="${ARCHON_RUN_ARTIFACTS_DIR:-${ARCHON_HOME:-.archon}/artifacts}/commit-hook-output.txt"
+      mkdir -p "$(dirname "$COMMIT_HOOK_OUTPUT")"
+      exec > >(tee "$COMMIT_HOOK_OUTPUT") 2>&1
       # 2026-05-16 quote-fix: substituteNodeOutputRefs with escapedForBash=true wraps
       # the output in single quotes. Wrapping the substitution in double quotes here
       # creates `"'multiline\nagent\noutput'"` which bash mis-tokenizes - line 2+ of
@@ -3756,10 +3760,76 @@ nodes:
       echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
       echo "unique_branch=${UNIQUE_BRANCH}"
 
+  # Exactly one bounded repair pass for a pre-commit lint/format hook failure.
+  - id: commit-hook-repair
+    persona: major-build
+    agent: major-build
+    depends_on: [commit-and-push]
+    trigger_rule: all_done
+    task_class: medium_work
+    prompt: |
+      The commit-and-push node may have failed in a real pre-commit hook. Read
+      ${ARCHON_RUN_ARTIFACTS_DIR:-${ARCHON_HOME:-.archon}/artifacts}/commit-hook-output.txt.
+      If it contains "husky - pre-commit script failed", or both "lint-staged" and
+      "[FAILED]", fix only the reported lint or format errors in the current worktree.
+      Do not touch unrelated files, weaken rules, disable hooks, or bypass verification.
+      Emit exactly OPUS_REPAIR=fixed when repaired. Otherwise emit exactly
+      OPUS_REPAIR=needs-human. This is the only automatic commit-hook repair pass.
+
+  - id: classify-commit-hook-repair
+    persona: major-build
+    depends_on: [commit-hook-repair]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+      REPAIR_OUTPUT=$(cat <<'BDC_COMMIT_HOOK_REPAIR_OUTPUT'
+      $commit-hook-repair.output
+      BDC_COMMIT_HOOK_REPAIR_OUTPUT
+      )
+      if printf '%s\n' "$REPAIR_OUTPUT" | grep -q 'OPUS_REPAIR=fixed'; then
+        printf '{"fixed":"true"}\n'
+      else
+        printf '{"fixed":"false"}\n'
+      fi
+
+  - id: commit-and-push-retry
+    persona: overseer
+    depends_on: [classify-commit-hook-repair]
+    when: "$classify-commit-hook-repair.output.fixed == 'true'"
+    load_bearing: true
+    bash: *commit_and_push_command
+
+  - id: contain-unpushed-repair
+    persona: major-build
+    depends_on: [commit-and-push-retry]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+      HOOK_OUTPUT="${ARCHON_RUN_ARTIFACTS_DIR:-${ARCHON_HOME:-.archon}/artifacts}/commit-hook-output.txt"
+      if grep -q '^unique_branch=' "$ARCHON_NODE_OUT/commit-and-push-retry.out" 2>/dev/null; then
+        exit 0
+      fi
+      if [ ! -s "$HOOK_OUTPUT" ] || ! grep -Eqi 'husky - pre-commit script failed|lint-staged.*\[FAILED\]' "$HOOK_OUTPUT"; then
+        exit 0
+      fi
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      PR_NUMBER=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+      [ -n "$PR_NUMBER" ] || exit 0
+      gh pr ready "$PR_NUMBER" --undo
+      COMMENT_FILE=$(mktemp)
+      {
+        echo 'The run repair delta was NOT pushed; in-run review findings remain unresolved.'
+        grep 'UNRESOLVED' "$ARCHON_NODE_OUT/diff-review-final.out" 2>/dev/null || true
+      } > "$COMMENT_FILE"
+      gh pr comment "$PR_NUMBER" --body-file "$COMMENT_FILE"
+
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
     persona: major-build
-    depends_on: [commit-and-push]
+    depends_on: [commit-and-push, commit-and-push-retry, contain-unpushed-repair]
+    trigger_rule: all_done
     task_class: clerical
     load_bearing: true
     bash: |

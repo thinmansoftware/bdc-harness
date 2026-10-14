@@ -32,6 +32,40 @@ import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyError, decide } from '../src/index.ts';
+
+const COMMIT_HOOK_FIXTURE = `[FAILED] packages/server/src/taskmaster/loop.ts
+1419:19 error Missing return type on function @typescript-eslint/explicit-function-return-type
+husky - pre-commit script failed (code 1)`;
+
+test('lint_hook_failure_classified_and_decided', () => {
+  const errorClass = classifyError({ nodeId: 'commit-and-push', message: COMMIT_HOOK_FIXTURE });
+  expect(errorClass).toBe('commit_hook_lint_failure');
+  expect(decide({ errorClass, attempt: 1 })).toMatchObject({
+    decision: 'escalate',
+    repairableOnce: true,
+    blocker: false,
+  });
+  expect(decide({ errorClass, attempt: 2 })).toMatchObject({
+    decision: 'escalate',
+    repairableOnce: false,
+    blocker: true,
+  });
+});
+
+test('hook_failure_text_on_other_node_not_captured', () => {
+  expect(classifyError({ nodeId: 'build-manifest', message: COMMIT_HOOK_FIXTURE })).not.toBe(
+    'commit_hook_lint_failure'
+  );
+  expect(
+    classifyError({ nodeId: 'commit-and-push', message: 'remote rejected git push' })
+  ).not.toBe('commit_hook_lint_failure');
+});
+
+test('unknown_class_still_escalates_and_is_unchanged', () => {
+  const errorClass = classifyError({ nodeId: 'patch-pr-body', message: 'unrecognised failure' });
+  expect(errorClass).toBe('unknown');
+  expect(decide({ errorClass, attempt: 1 }).decision).toBe('escalate');
+});
 import { runEscalation } from '../src/escalate.ts';
 import { closeDatabase, getOperatorCard, resetDatabase } from '@archon/core/db';
 import type { EscalationContext } from '../src/escalate.ts';

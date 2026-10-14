@@ -46,7 +46,13 @@ function output(
   findings: unknown[] = [],
   head = HEAD_A
 ): string {
-  return JSON.stringify({ verdict, findings, reviewed_head_sha: head });
+  return JSON.stringify({
+    verdict,
+    verification: 'verified',
+    verification_reason: '',
+    findings,
+    reviewed_head_sha: head,
+  });
 }
 
 function deps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {
@@ -62,6 +68,68 @@ function deps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {
     ...overrides,
   };
 }
+
+test('judge_verification_field_parsed_and_required', () => {
+  expect(
+    parseReviewVerdict(
+      JSON.stringify({
+        verdict: 'APPROVE',
+        verification: 'verified',
+        verification_reason: '',
+        findings: [],
+        reviewed_head_sha: HEAD_A,
+      })
+    )?.verdict
+  ).toBe('APPROVE');
+  const unverified = parseReviewVerdict(
+    JSON.stringify({
+      verdict: 'APPROVE',
+      verification: 'unverified',
+      verification_reason: 'tests unavailable',
+      findings: [],
+      reviewed_head_sha: HEAD_A,
+    })
+  );
+  expect(unverified).toMatchObject({
+    verdict: 'APPROVE_UNVERIFIED',
+    verification_reason: 'tests unavailable',
+  });
+  expect(
+    parseReviewVerdict(
+      JSON.stringify({ verdict: 'APPROVE', findings: [], reviewed_head_sha: HEAD_A })
+    )
+  ).toBeNull();
+});
+
+test('sandbox_failure_note_forces_unverified_even_if_judge_says_verified', () => {
+  const parsed = parseReviewVerdict(
+    JSON.stringify({
+      verdict: 'APPROVE',
+      verification: 'verified',
+      verification_reason: '',
+      findings: [
+        {
+          severity: 'note',
+          scope: 'Validation',
+          summary:
+            'Local inspection and test execution were unavailable because the execution sandbox failed to start',
+        },
+      ],
+      reviewed_head_sha: HEAD_A,
+    })
+  );
+  expect(parsed?.verdict).toBe('APPROVE_UNVERIFIED');
+  const style = parseReviewVerdict(
+    JSON.stringify({
+      verdict: 'APPROVE',
+      verification: 'verified',
+      verification_reason: '',
+      findings: [{ severity: 'note', scope: 'Style', summary: 'Consider a shorter name' }],
+      reviewed_head_sha: HEAD_A,
+    })
+  );
+  expect(style?.verdict).toBe('APPROVE');
+});
 
 describe('governed PR-code reviewer', () => {
   test('1 clean diff yields APPROVE with exact head and reviewer identity', async () => {

@@ -23,6 +23,14 @@
 
 export { classifyError } from './classify';
 export type { ErrorClass, ClassifyInput } from './classify';
+export {
+  NODE_FAILURE_BLOCKER_CLASSES,
+  buildNodeFailureDispatchBody,
+  isNodeFailureBlocker,
+  notifyNodeFailure,
+  sanitizeFailureLine,
+} from './node-failure-notify';
+export type { NodeFailureNotificationInput } from './node-failure-notify';
 
 export { decide } from './decide';
 export type { Decision, DecideInput, DecisionResult } from './decide';

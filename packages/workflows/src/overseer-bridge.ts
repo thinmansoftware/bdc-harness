@@ -27,6 +27,7 @@ import {
   permitFromMetadata,
   runAuthorizedEscalation,
   runEscalation,
+  notifyNodeFailure,
   type Decision,
 } from '@archon/overseer';
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
@@ -131,6 +132,30 @@ export async function handleNodeFailure(
     validatorOutput: ctx.validatorOutput,
     woId: ctx.woId,
   });
+
+  if (result.decision === 'escalate') {
+    const metadata = workflowRun.metadata ?? {};
+    const issueCandidate = metadata.wo_issue_number ?? metadata.issue_number;
+    const issueNumber =
+      typeof issueCandidate === 'number'
+        ? issueCandidate
+        : typeof issueCandidate === 'string' && /^\d+$/.test(issueCandidate)
+          ? Number(issueCandidate)
+          : undefined;
+    await notifyNodeFailure({
+      runId: workflowRun.id,
+      workflowName: workflowRun.workflow_name,
+      nodeId: node.id,
+      errorClass,
+      decision: result.decision,
+      attempt,
+      error: ctx.errorMsg,
+      ...(issueNumber ? { issueNumber } : {}),
+      loadBearing: node.load_bearing === true,
+      retryPathRemaining: result.repairableOnce === true,
+      log: deps.log,
+    });
+  }
 
   // Observability -- Mission Control "Workflow Decisions" tab will consume this when
   // persistence lands in v2. For v1 we only emit a structured log line.

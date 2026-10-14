@@ -36,6 +36,9 @@ import {
 export interface ReviewerVerdict {
   /** true -> APPROVE; false -> REQUEST_CHANGES. */
   approved: boolean;
+  /** Approval was proposed without verified inspection; it is comment-only and non-mergeable. */
+  approvedUnverified?: boolean;
+  verificationReason?: string;
   /** Evidence. REQUIRED (non-empty) when approved === false. */
   summary: string;
   /** The head the reviewer actually examined. Must match the work item. */
@@ -108,6 +111,7 @@ export interface ReviewWorkItem {
 
 export type SubmitDisposition =
   | 'approved'
+  | 'approved_unverified'
   | 'changes_requested'
   | 'custody_conflict'
   | 'merge_custody_conflict'
@@ -494,8 +498,14 @@ export async function runAndSubmitReview(
     });
   }
 
-  const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
-  const body = buildReviewBody(work, verdict);
+  const event: OverseerReviewEvent = verdict.approvedUnverified
+    ? 'COMMENT'
+    : verdict.approved
+      ? 'APPROVE'
+      : 'REQUEST_CHANGES';
+  const body = verdict.approvedUnverified
+    ? `UNVERIFIED approval -- not mergeable: ${verdict.verificationReason ?? verdict.summary}`
+    : buildReviewBody(work, verdict);
 
   // A rejection with no evidence is not actionable; refuse before the call.
   if (!verdict.approved && verdict.summary.trim().length === 0) {
@@ -533,6 +543,15 @@ export async function runAndSubmitReview(
       disposition: 'submission_failed',
       reason: submission.message ?? 'submit_rejected',
       event,
+    });
+  }
+
+  if (verdict.approvedUnverified) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'approved_unverified',
+      event,
+      reason: verdict.verificationReason ?? 'verification unavailable',
+      ...summaryField(verdict),
     });
   }
 
