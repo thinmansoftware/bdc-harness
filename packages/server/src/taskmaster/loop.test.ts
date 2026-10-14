@@ -4044,6 +4044,27 @@ describe('M-155 exception push (loop)', () => {
 describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01)', () => {
   const P0_REF = 'gh:thinmansoftware/bdc-harness#194';
 
+  function seedEscalation(
+    world: FakeWorld,
+    outcome: TmActionOutcome,
+    proposal: Record<string, unknown>
+  ): void {
+    world.journal.push({
+      id: `journal-escalate-seed-${world.journal.length}`,
+      created_at: new Date(world.nowMs - 31 * 60_000).toISOString(),
+      thread_ref: P0_REF,
+      action_type: 'escalate_p0',
+      proposal_json: JSON.stringify(proposal),
+      idempotency_key: 'tm:escalate_p0:seed',
+      before_hash: null,
+      proof_predicate: null,
+      proof_deadline_at: null,
+      outcome,
+      graded_at: null,
+      grade: null,
+    });
+  }
+
   function unclaimedP0(ref = P0_REF): ListedThread {
     return makeListedThread({
       ref,
@@ -4054,6 +4075,109 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
       title: 'WO-HARNESS-EXAMPLE-194 stuck P0',
     });
   }
+
+  test('adopt_fixup_stale_epoch_expired_does_not_suppress', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedEscalation(world, 'expired', { type: 'escalate_p0' });
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    const result = await tick(createTaskmasterState(60_000), deps);
+
+    expect(result.effects).toBe(1);
+    expect(gh.posts()).toBe(1);
+    expect(
+      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
+    ).toHaveLength(2);
+  });
+
+  test('adopt_fixup_pending_and_suppressed_dedupe_boundaries', async () => {
+    const pendingWorld = makeWorld();
+    seedDigestSent(pendingWorld);
+    seedEscalation(pendingWorld, 'pending', { type: 'escalate_p0' });
+    const pendingGh = makeIssueCommentSink(pendingWorld);
+    const pendingDeps = makeDeps(pendingWorld, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: pendingGh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), pendingDeps);
+
+    expect(pendingGh.posts()).toBe(1);
+    expect(
+      pendingWorld.journal.filter(
+        row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+      )
+    ).toHaveLength(2);
+
+    const suppressedWorld = makeWorld();
+    seedDigestSent(suppressedWorld);
+    seedEscalation(suppressedWorld, 'expired', {
+      type: 'escalate_p0',
+      suppressed: 'claim_held',
+    });
+    const suppressedGh = makeIssueCommentSink(suppressedWorld);
+    const suppressedDeps = makeDeps(suppressedWorld, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: suppressedGh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), suppressedDeps);
+
+    expect(suppressedGh.posts()).toBe(0);
+    expect(
+      suppressedWorld.journal.filter(
+        row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+      )
+    ).toHaveLength(1);
+  });
+
+  test('adopt_fixup_concurrent_ticks_journal_one_escalation', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+    const getActionsSince = deps.db!.getActionsSince.bind(deps.db);
+    let releaseLookback: (() => void) | undefined;
+    const lookbackBarrier = new Promise<void>(resolve => {
+      releaseLookback = resolve;
+    });
+    let lookbackCalls = 0;
+    deps.db = {
+      ...deps.db!,
+      getActionsSince: async sinceIso => {
+        lookbackCalls += 1;
+        if (lookbackCalls === 1) setTimeout(() => releaseLookback?.(), 0);
+        if (lookbackCalls <= 2) await lookbackBarrier;
+        return getActionsSince(sinceIso);
+      },
+    };
+
+    try {
+      await Promise.all([
+        tick(createTaskmasterState(60_000), deps),
+        tick(createTaskmasterState(60_000), deps),
+      ]);
+    } finally {
+      releaseLookback?.();
+    }
+
+    expect(
+      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
+    ).toHaveLength(1);
+    expect(gh.posts()).toBe(1);
+  });
 
   test('gh-ref escalation posts exactly one marked comment and sends NO dispatch message', async () => {
     const world = makeWorld();

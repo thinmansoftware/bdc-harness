@@ -1278,7 +1278,33 @@ export async function refreshAdoption(
   }
 }
 
-export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
+function isDeliverySuppressedExpiry(action: taskmasterDb.TmJournalEntry): boolean {
+  if (action.outcome !== 'expired') return false;
+  try {
+    const proposal: unknown = JSON.parse(action.proposal_json);
+    return (
+      typeof proposal === 'object' &&
+      proposal !== null &&
+      !Array.isArray(proposal) &&
+      Boolean((proposal as Record<string, unknown>).suppressed)
+    );
+  } catch {
+    return false;
+  }
+}
+
+let tickQueue: Promise<void> = Promise.resolve();
+
+export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
+  const result = tickQueue.then(() => runTick(state, deps));
+  tickQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
+async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<TickResult> {
   const now = deps.now ?? ((): Date => new Date());
   const dal = deps.db ?? taskmasterDb;
   const createTask = deps.createTask ?? createAuthenticatedMessage;
@@ -1399,7 +1425,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       .filter(
         action =>
           action.action_type === 'escalate_p0' &&
-          (action.outcome === 'sent' || action.outcome === 'expired')
+          (action.outcome === 'sent' || isDeliverySuppressedExpiry(action))
       )
       .map(action => canonicalizeThreadRef(action.thread_ref))
   );
