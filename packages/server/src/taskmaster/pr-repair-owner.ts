@@ -338,6 +338,14 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
   };
 
   // (1) DEDUPE SWEEP -----------------------------------------------------------
+  const hasClosableDuplicates = (entry: { prs: LanePr[] }): boolean => {
+    const groups = new Map<string, LanePr[]>();
+    for (const pr of entry.prs) {
+      const key = `${pr.owner}/${pr.repo}`.toLowerCase();
+      groups.set(key, [...(groups.get(key) ?? []), pr]);
+    }
+    return [...groups.values()].some(prs => planDedupe(prs).toClose.length > 0);
+  };
   const dupeWos = (
     await deps.listWosWithMultipleLanePrs({ fetchPr: deps.fetchPr, withinHours, now })
   )
@@ -352,6 +360,9 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       }
       return false;
     })
+    // Approved-only groups need a human; they cannot consume every bounded
+    // slot while an actionable duplicate sits later in the same result set.
+    .sort((a, b) => Number(hasClosableDuplicates(b)) - Number(hasClosableDuplicates(a)))
     .slice(0, MAX_DEDUPE_WOS_PER_TICK);
   for (const entry of dupeWos) {
     const repositories = new Map<string, LanePr[]>();
@@ -407,6 +418,12 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     );
     if (!target) {
       await addressRefusal(deps, id, 'refused:not_lane_created', log);
+      continue;
+    }
+    // freezeWorkOrderSource reads this immutable dispatch body's branch.
+    // It must equal the validated live branch, even when the SHA is unchanged.
+    if (target.headRef !== candidate.headRef) {
+      await addressRefusal(deps, id, 'refused:stale_branch', log);
       continue;
     }
 

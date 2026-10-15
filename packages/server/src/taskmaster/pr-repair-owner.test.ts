@@ -161,6 +161,46 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
 }
 
 describe('review repair regressions', () => {
+  test('same SHA on a renamed live branch cannot authorize the stale dispatch branch', async () => {
+    const woId = 'WO-RENAMED-BRANCH';
+    const pr = lanePr({ prNumber: 99, headRef: 'feat/live-renamed-branch' });
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: [pr] },
+      queued: [
+        {
+          id: 'stale-branch',
+          body: candidateBody({
+            prNumber: 99,
+            headSha: pr.headSha,
+            woId,
+            headRef: 'feat/stale-reviewed-branch',
+          }),
+        },
+      ],
+    });
+    const result = await runPrRepairOwner(deps);
+    expect(result.repairsFired).toBe(0);
+    expect(rec.fired).toHaveLength(0);
+    expect(rec.addressed).toEqual([{ id: 'stale-branch', note: 'refused:stale_branch' }]);
+  });
+
+  test('approved-only duplicates cannot monopolize the five bounded sweep slots', async () => {
+    const human = Array.from({ length: 5 }, (_, i) => ({
+      woId: `WO-APPROVED-${i}`,
+      prs: [
+        lanePr({ prNumber: 100 + i, reviewDecision: 'APPROVED' }),
+        lanePr({ prNumber: 200 + i, reviewDecision: 'APPROVED' }),
+      ],
+    }));
+    const { deps, rec } = makeDeps({
+      dupeWos: [
+        ...human,
+        { woId: 'WO-CLOSABLE', prs: [lanePr({ prNumber: 301 }), lanePr({ prNumber: 302 })] },
+      ],
+    });
+    await runPrRepairOwner(deps);
+    expect(rec.closed.map(row => row.prNumber)).toEqual([301]);
+  });
   test('failed admission remains queued and bounds attempts to one per tick', async () => {
     const woId = 'WO-ADMISSION-FAIL';
     const pr = lanePr({ prNumber: 99 });
