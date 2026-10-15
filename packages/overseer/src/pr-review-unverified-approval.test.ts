@@ -196,11 +196,14 @@ describe('unverified approval persistence and execution', () => {
     const deps = realSubmit();
     await deps.recordReceipt(receipt);
     await deps.recordReceipt(receipt);
-    const rows = await db.query<{ repeat_reason: string }>(
-      "SELECT repeat_reason FROM agent_dispatch_messages WHERE task_type='run_review'"
+    const rows = await db.query<{ repeat_reason: string; recipient: string }>(
+      "SELECT repeat_reason, recipient FROM agent_dispatch_messages WHERE task_type='run_review'"
     );
     expect(rows.rows).toEqual([
-      expect.objectContaining({ repeat_reason: 'unverified_approval_retry' }),
+      expect.objectContaining({
+        repeat_reason: 'unverified_approval_retry',
+        recipient: 'overseer-reviewer',
+      }),
     ]);
   });
 

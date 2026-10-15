@@ -1111,7 +1111,7 @@ export function createRealSubmitDeps(
               correlation_id: input.headSha,
               idempotency_key: `overseer-review-unverified-retry:${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`,
               task_type: 'run_review',
-              recipient: 'operator',
+              recipient: 'overseer-reviewer',
               subject_key: subjectKey,
               repeat_reason: 'unverified_approval_retry',
               body: JSON.stringify({

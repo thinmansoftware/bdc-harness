@@ -1,14 +1,78 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { parse } from 'yaml';
 import { classifyError } from './classify';
 import { decide } from './decide';
 
 const root = join(import.meta.dir, '../../..');
 const read = (path: string): string => readFileSync(join(root, path), 'utf8');
+
+function hookFixture(): {
+  directory: string;
+  repo: string;
+  artifacts: string;
+  run: (attempt: number) => ReturnType<typeof spawnSync>;
+} {
+  const directory = mkdtempSync(join(tmpdir(), 'real-hook-repair-'));
+  const repo = join(directory, 'repo');
+  const artifacts = join(directory, 'artifacts');
+  mkdirSync(repo);
+  mkdirSync(artifacts);
+  const env = { ...process.env, HUSKY: undefined };
+  const command = (program: string, args: string[]): void => {
+    const result = spawnSync(program, args, {
+      cwd: repo,
+      env,
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 15000,
+    });
+    if (result.status !== 0)
+      throw new Error(`fixture command failed: ${program}: ${result.stderr}`);
+  };
+  command('git', ['init']);
+  command('git', ['config', 'user.name', 'Harness fixture']);
+  command('git', ['config', 'user.email', 'fixture@example.invalid']);
+  command('node', [join(root, 'node_modules/husky/bin.js')]);
+  const unix = (path: string): string => path.replaceAll('\\', '/');
+  writeFileSync(
+    join(repo, '.husky/pre-commit'),
+    `node '${unix(join(root, 'node_modules/eslint/bin/eslint.js'))}' fixture.ts --config eslint.config.mjs\n`
+  );
+  writeFileSync(
+    join(repo, 'eslint.config.mjs'),
+    `import tseslint from ${JSON.stringify(pathToFileURL(join(root, 'node_modules/typescript-eslint/dist/index.js')).href)};
+     export default [{files:['**/*.ts'],languageOptions:{parser:tseslint.parser},
+       plugins:{'@typescript-eslint':tseslint.plugin},rules:{'@typescript-eslint/explicit-function-return-type':'error'}}];\n`
+  );
+  writeFileSync(join(repo, 'fixture.ts'), 'export function value() { return 1; }\n');
+  const script = join(directory, 'invoke.sh');
+  writeFileSync(
+    script,
+    `set -euo pipefail\nexport UNIQUE_BRANCH=fixture ARTIFACTS_DIR='${unix(artifacts)}'\n` +
+      `git() { printf '%s\\n' "$*" >> '${unix(artifacts)}/git-argv'; ` +
+      `printf '%s\\n' "\x24{HUSKY-unset}" >> '${unix(artifacts)}/hook-env'; ` +
+      `case "$1" in push) return 0;; ls-remote) printf '%s\\trefs/heads/fixture\\n' "$(command git rev-parse HEAD)";; *) command git "$@";; esac; }\n` +
+      `source '${unix(join(root, '.archon/scripts/commit-and-push.sh'))}' "$1"\n`
+  );
+  return {
+    directory,
+    repo,
+    artifacts,
+    run: attempt =>
+      spawnSync('bash', [script, String(attempt)], {
+        cwd: repo,
+        env,
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 20000,
+      }),
+  };
+}
 
 const hookFailure = `lint-staged\n[FAILED] eslint\npackages/server/src/taskmaster/loop.ts 1419:19 error Missing return type on function @typescript-eslint/explicit-function-return-type\nhusky - pre-commit script failed`;
 
@@ -36,9 +100,56 @@ describe('commit hook repair contract', () => {
   });
 
   test('real_hook_repair_roundtrip', () => {
-    const script = read('.archon/scripts/commit-and-push.sh');
-    expect(script).toContain('git commit -m');
-    expect(script).toContain('commit-hook-output.txt');
+    const fixture = hookFixture();
+    try {
+      expect(fixture.run(1).status).toBe(1);
+      expect(readFileSync(join(fixture.artifacts, 'commit-hook-output.txt'), 'utf8')).toContain(
+        'explicit-function-return-type'
+      );
+      writeFileSync(
+        join(fixture.repo, 'fixture.ts'),
+        'export function value(): number { return 1; }\n'
+      );
+      expect(fixture.run(2).status).toBe(0);
+      const commit = spawnSync('git', ['log', '-1', '--format=%s'], {
+        cwd: fixture.repo,
+        encoding: 'utf8',
+        windowsHide: true,
+      });
+      expect(commit.stdout.trim()).toBe('feat: work order implementation');
+      expect(readFileSync(join(fixture.artifacts, 'git-argv'), 'utf8')).not.toMatch(
+        /--no-verify|--no-hooks/
+      );
+      expect(
+        readFileSync(join(fixture.artifacts, 'hook-env'), 'utf8').split('\n').filter(Boolean)
+      ).toEqual(
+        Array(
+          readFileSync(join(fixture.artifacts, 'hook-env'), 'utf8').split('\n').filter(Boolean)
+            .length
+        ).fill('unset')
+      );
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  test('a second real hook failure remains failed with the attempt counter at two', () => {
+    const fixture = hookFixture();
+    try {
+      expect(fixture.run(1).status).toBe(1);
+      expect(fixture.run(2).status).toBe(1);
+      expect(readFileSync(join(fixture.artifacts, 'commit-hook-attempt.txt'), 'utf8').trim()).toBe(
+        '2'
+      );
+      const head = spawnSync('git', ['rev-parse', '--verify', 'HEAD'], {
+        cwd: fixture.repo,
+        encoding: 'utf8',
+        windowsHide: true,
+      });
+      expect(head.status).not.toBe(0);
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
   });
 
   test('second_failure_does_not_loop', () => {
