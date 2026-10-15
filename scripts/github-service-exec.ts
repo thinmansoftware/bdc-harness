@@ -41,7 +41,7 @@ export async function runGitHubServiceCommand(input: {
     GITHUB_TOKEN: token,
   });
   const stderr = new TextDecoder().decode(result.stderr);
-  const fallback = env.GH_TOKEN || env.GITHUB_TOKEN;
+  const fallback = env.ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN || env.GH_TOKEN || env.GITHUB_TOKEN;
   if (
     identity.kind === 'app' &&
     result.exitCode !== 0 &&

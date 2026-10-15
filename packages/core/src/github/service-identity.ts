@@ -109,6 +109,14 @@ export function resolveServiceGitHubAuth(
   env: Env = process.env
 ): ServiceGitHubAuth {
   const own = resolveApp(servicePrefix(service), service, env);
+  if (own && service === 'merge_manager') {
+    const reviewer =
+      resolveApp('GITHUB_APP_OVERSEER_', 'overseer', env) ??
+      resolveApp('GITHUB_APP_', 'overseer', env);
+    if (reviewer?.appId === own.appId) {
+      return { kind: 'none', service: 'merge_manager', poolId: 'none', distinct: false };
+    }
+  }
   if (own) return own;
 
   if (service === 'overseer' || service === 'pr_discovery') {
@@ -188,4 +196,25 @@ export async function getServiceGitHubToken(
 
 export function clearServiceGitHubTokenCache(): void {
   tokenCache.clear();
+}
+
+/** Preserve service selection and original permission fallback across a CLI shim. */
+export async function serviceGitHubCommandEnvironment(
+  service: GitHubService,
+  env: Env = process.env,
+  token: typeof getServiceGitHubToken = getServiceGitHubToken
+): Promise<{ env: Env; poolId: string }> {
+  const identity = resolveServiceGitHubAuth(service, env);
+  const selectedToken = await token(identity);
+  return {
+    poolId: identity.poolId,
+    env: {
+      ...env,
+      GH_TOKEN: selectedToken,
+      GITHUB_TOKEN: selectedToken,
+      ARCHON_GITHUB_SERVICE: service,
+      ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN:
+        env.ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN ?? env.GH_TOKEN ?? env.GITHUB_TOKEN ?? '',
+    },
+  };
 }

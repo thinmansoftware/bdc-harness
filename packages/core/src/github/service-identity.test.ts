@@ -48,4 +48,32 @@ describe('Test 2: service GitHub identity precedence', () => {
       distinct: false,
     });
   });
+  it('holds a merge App matching the effective reviewer, including another installation', () => {
+    const shared = {
+      GITHUB_APP_ID: '1',
+      GITHUB_APP_INSTALLATION_ID: '2',
+      GITHUB_APP_PRIVATE_KEY: privateKey,
+    };
+    for (const installation of ['2', '99']) {
+      expect(
+        resolveServiceGitHubAuth('merge_manager', {
+          ...shared,
+          GITHUB_APP_MERGE_MANAGER_ID: '1',
+          GITHUB_APP_MERGE_MANAGER_INSTALLATION_ID: installation,
+          GITHUB_APP_MERGE_MANAGER_PRIVATE_KEY: privateKey,
+        }).distinct
+      ).toBe(false);
+    }
+    expect(
+      resolveServiceGitHubAuth('merge_manager', {
+        ...shared,
+        GITHUB_APP_OVERSEER_ID: '3',
+        GITHUB_APP_OVERSEER_INSTALLATION_ID: '4',
+        GITHUB_APP_OVERSEER_PRIVATE_KEY: privateKey,
+        GITHUB_APP_MERGE_MANAGER_ID: '1',
+        GITHUB_APP_MERGE_MANAGER_INSTALLATION_ID: '2',
+        GITHUB_APP_MERGE_MANAGER_PRIVATE_KEY: privateKey,
+      }).distinct
+    ).toBe(true);
+  });
 });

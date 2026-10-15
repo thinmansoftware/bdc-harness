@@ -8,10 +8,7 @@
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import {
-  getServiceGitHubToken,
-  resolveServiceGitHubAuth,
-} from '@archon/core/github/service-identity';
+import { serviceGitHubCommandEnvironment } from '@archon/core/github/service-identity';
 import { assertGitHubPoolAvailable, recordGitHubApiCall } from '@archon/core/github/metering';
 import type { PollResult } from './types.js';
 
@@ -578,9 +575,7 @@ type ExecFileFn = (
 ) => Promise<{ stdout: string; stderr: string }>;
 
 export async function smartCauldronGhEnv(): Promise<{ env: NodeJS.ProcessEnv; poolId: string }> {
-  const identity = resolveServiceGitHubAuth('smart_cauldron');
-  const token = await getServiceGitHubToken(identity);
-  return { env: { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token }, poolId: identity.poolId };
+  return serviceGitHubCommandEnvironment('smart_cauldron');
 }
 
 /** Default `gh pr list --head <branch> --repo <repo>` production lookup. */
