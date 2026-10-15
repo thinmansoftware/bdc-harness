@@ -3867,12 +3867,10 @@ nodes:
       )
       # The first hook failure has no branch output; the successful bounded
       # retry owns the final branch and refreshed remote lease.
-      COMMIT_PUSH_OUTPUT=$(
-        cat "$ARCHON_NODE_OUT/commit-and-push.out"
-        if [ -f "$ARCHON_NODE_OUT/commit-and-push-retry.out" ]; then
-          cat "$ARCHON_NODE_OUT/commit-and-push-retry.out"
-        fi
-      )
+      COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")
+      if [ -f "$ARCHON_NODE_OUT/commit-and-push-retry.out" ]; then
+        COMMIT_PUSH_OUTPUT=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT"; cat "$ARCHON_NODE_OUT/commit-and-push-retry.out")
+      fi
       if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0
