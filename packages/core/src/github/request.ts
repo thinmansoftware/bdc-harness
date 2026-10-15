@@ -5,7 +5,8 @@ import {
   type ServiceGitHubAuth,
 } from './service-identity';
 import {
-  assertGitHubPoolAvailable,
+  assertPersistedGitHubPoolAvailable,
+  flushGitHubApiMeter,
   observationFromResponse,
   recordGitHubApiCall,
 } from './metering';
@@ -31,17 +32,18 @@ export async function serviceGitHubFetch(options: ServiceGitHubRequestOptions): 
   const resource =
     options.resource ??
     (path === '/graphql' ? 'graphql' : path.startsWith('/search/') ? 'search' : 'core');
-  assertGitHubPoolAvailable(identity.poolId, resource);
+  await assertPersistedGitHubPoolAvailable(identity.poolId, [resource]);
   const token = await getServiceGitHubToken(identity, { fetch: options.fetch });
   const headers = new Headers(options.init?.headers);
   if (token) headers.set('authorization', `Bearer ${token}`);
   if (!headers.has('accept')) headers.set('accept', 'application/vnd.github+json');
   const response = await (options.fetch ?? fetch)(options.url, { ...options.init, headers });
-  recordGitHubApiCall(
-    observationFromResponse(options.service, identity.poolId, response, {
-      permissionFallback: options.permissionFallback,
-    })
-  );
+  const observation = observationFromResponse(options.service, identity.poolId, response, {
+    permissionFallback: options.permissionFallback,
+  });
+  if (!response.headers.has('x-ratelimit-resource')) observation.resource = resource;
+  recordGitHubApiCall(observation);
+  if (observation.rateLimited) await flushGitHubApiMeter();
   return response;
 }
 

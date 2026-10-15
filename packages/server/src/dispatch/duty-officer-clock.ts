@@ -109,8 +109,8 @@ export function githubToken(): string | null {
 export function githubNudgeEnabled(): boolean {
   if (process.env.DUTY_OFFICER_GH_NUDGE !== 'true') return false;
   try {
-    resolveServiceGitHubAuth('duty_officer');
-    return true;
+    const identity = resolveServiceGitHubAuth('duty_officer');
+    return identity.kind === 'app' || (identity.kind === 'pat' && Boolean(identity.token.trim()));
   } catch {
     return false;
   }

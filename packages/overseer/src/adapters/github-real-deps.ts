@@ -3,7 +3,8 @@ import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
 import { resolveServiceGitHubAuth, type GitHubService } from '@archon/core/github/service-identity';
 import {
-  assertGitHubPoolAvailable,
+  assertPersistedGitHubPoolAvailable,
+  flushGitHubApiMeter,
   observationFromResponse,
   recordGitHubApiCall,
 } from '@archon/core/github/metering';
@@ -701,38 +702,39 @@ export function attachGitHubQuotaHooks(
   service: GitHubService,
   poolId: string
 ): void {
-  const record = (response: {
-    status: number;
-    headers: Record<string, string | number | undefined>;
-  }): void => {
+  const resourceFor = (url: string): string =>
+    url.includes('/graphql') ? 'graphql' : url.includes('/search/') ? 'search' : 'core';
+  const record = async (
+    response: {
+      status: number;
+      headers: Record<string, string | number | undefined>;
+    },
+    url: string
+  ): Promise<void> => {
     const headers = new Headers();
     for (const [name, value] of Object.entries(response.headers)) {
       if (value !== undefined) headers.set(name, String(value));
     }
-    recordGitHubApiCall(
-      observationFromResponse(
-        service,
-        poolId,
-        new Response(null, { status: response.status, headers })
-      )
+    const observation = observationFromResponse(
+      service,
+      poolId,
+      new Response(null, { status: response.status, headers })
     );
+    if (!headers.has('x-ratelimit-resource')) observation.resource = resourceFor(url);
+    recordGitHubApiCall(observation);
+    if (observation.rateLimited) await flushGitHubApiMeter();
   };
-  client.hook.before('request', options => {
-    const resource = options.url.includes('/graphql')
-      ? 'graphql'
-      : options.url.includes('/search/')
-        ? 'search'
-        : 'core';
-    assertGitHubPoolAvailable(poolId, resource);
+  client.hook.before('request', async options => {
+    await assertPersistedGitHubPoolAvailable(poolId, [resourceFor(options.url)]);
   });
-  client.hook.after('request', response => {
-    record(response);
+  client.hook.after('request', async (response, options) => {
+    await record(response, options.url);
   });
-  client.hook.error('request', error => {
+  client.hook.error('request', async (error, options) => {
     const failure = error as Error & {
       response?: { status: number; headers: Record<string, string | number | undefined> };
     };
-    if (failure.response) record(failure.response);
+    if (failure.response) await record(failure.response, options.url);
     throw error;
   });
 }
