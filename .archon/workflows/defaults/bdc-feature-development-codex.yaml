@@ -3805,7 +3805,21 @@ nodes:
       set -euo pipefail
       source "$ARTIFACTS_DIR/commit-and-push.env"
       export UNIQUE_BRANCH COMMIT_MESSAGE REPAIR_TARGET_LEASE_SHA
-      if ! .archon/scripts/commit-and-push.sh 2; then
+      .archon/scripts/commit-and-push.sh 2
+
+  - id: commit-hook-terminal
+    persona: overseer
+    depends_on: [commit-and-push-retry]
+    trigger_rule: all_done
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if [ ! -f "$ARTIFACTS_DIR/commit-and-push.env" ]; then
+        exit 0
+      fi
+      source "$ARTIFACTS_DIR/commit-and-push.env"
+      REMOTE_HEAD=$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" | awk '{print $1}')
+      if [ "$REMOTE_HEAD" != "$(git rev-parse HEAD)" ] || ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
         REPO=$(git remote get-url origin | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##')
         PR=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
         if [ -n "$PR" ]; then
@@ -3819,7 +3833,7 @@ nodes:
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
     persona: major-build
-    depends_on: [commit-and-push-retry]
+    depends_on: [commit-hook-terminal]
     task_class: clerical
     load_bearing: true
     bash: |

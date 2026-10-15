@@ -17,7 +17,11 @@
  */
 import { randomUUID } from 'node:crypto';
 import * as dispatch from '@archon/core/db/dispatch';
-import { claimOverseerVerdict, finalizeOverseerVerdict } from '@archon/core/db/overseer';
+import {
+  claimOverseerVerdict,
+  finalizeOverseerVerdict,
+  reviseOverseerReviewVerdict,
+} from '@archon/core/db/overseer';
 import { createLogger } from '@archon/paths';
 import {
   createRealFetchExactHeadPullRequestEvidence,
@@ -80,6 +84,7 @@ export function reviewRecordsVerdictEnabled(
 interface ReviewApprovalVerdictDeps {
   claimVerdict: typeof claimOverseerVerdict;
   finalizeVerdict: typeof finalizeOverseerVerdict;
+  reviseVerdict?: typeof reviseOverseerReviewVerdict;
 }
 
 export async function recordReviewApprovalVerdict(
@@ -94,11 +99,19 @@ export async function recordReviewApprovalVerdict(
   deps: ReviewApprovalVerdictDeps = {
     claimVerdict: claimOverseerVerdict,
     finalizeVerdict: finalizeOverseerVerdict,
+    reviseVerdict: reviseOverseerReviewVerdict,
   }
 ): Promise<void> {
   const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
   const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
-  if (!claim.claimed || !claim.verdictId) return;
+  if (!claim.claimed || !claim.verdictId) {
+    await deps.reviseVerdict?.({
+      runId,
+      headSha: input.headSha,
+      unverified: input.disposition === 'approved_unverified',
+    });
+    return;
+  }
   await deps.finalizeVerdict({
     verdictId: claim.verdictId,
     status: 'verdict',

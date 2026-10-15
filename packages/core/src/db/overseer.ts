@@ -410,6 +410,41 @@ export async function listUnactionedFlagMergeReadyVerdicts(): Promise<OverseerVe
   return [...result.rows];
 }
 
+export async function hasUnverifiedApprovalForHead(verdict: OverseerVerdictRow): Promise<boolean> {
+  const result = await getDatabase().query<{ id: string }>(
+    `SELECT id FROM overseer_verdicts
+     WHERE head_sha = $1 AND verdict = 'approved_unverified'
+       AND (run_id = $2 OR (pr_url IS NOT NULL AND pr_url = $3))
+     LIMIT 1`,
+    [verdict.head_sha, verdict.run_id, verdict.pr_url]
+  );
+  return result.rows.length > 0;
+}
+
+export async function reviseOverseerReviewVerdict(input: {
+  runId: string;
+  headSha: string;
+  unverified: boolean;
+}): Promise<void> {
+  await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET verdict = $3, proposed_action = $4, actioned_at = NULL,
+         action_reason = NULL, mutation_sent = NULL, updated_at = $5
+     WHERE run_id = $1 AND head_sha = $2 AND status = 'verdict'
+       AND verdict IN ('approved_unverified', 'merge_candidate')
+       AND verdict <> $3
+       AND (mutation_sent IS NULL OR mutation_sent = false)
+       AND (action_reason IS NULL OR action_reason <> 'processing')`,
+    [
+      input.runId,
+      input.headSha,
+      input.unverified ? 'approved_unverified' : 'merge_candidate',
+      input.unverified ? 'none' : 'flag_merge_ready',
+      new Date().toISOString(),
+    ]
+  );
+}
+
 export async function deferVerdictClaimForMergeExecution(
   verdictId: string,
   reason: string,

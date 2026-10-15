@@ -6222,14 +6222,27 @@ async function executeDagWorkflowInternal(
                   },
                   'dag.sdk_contradiction_backoff'
                 );
-                await (
-                  deps.sleep ??
-                  ((ms: number): Promise<void> =>
-                    new Promise(resolve => {
-                      setTimeout(resolve, ms);
-                    }))
-                )(waitMs);
-                if (deps.isRunLeaseValid?.() === false) break;
+                let waitRemaining = waitMs;
+                let cancelled = false;
+                while (waitRemaining > 0) {
+                  const slice = Math.min(waitRemaining, 1000);
+                  await (
+                    deps.sleep ??
+                    ((ms: number): Promise<void> =>
+                      new Promise(resolve => {
+                        setTimeout(resolve, ms);
+                      }))
+                  )(slice);
+                  waitRemaining -= slice;
+                  if (
+                    deps.isRunLeaseValid?.() === false ||
+                    (await deps.store.getWorkflowRunStatus(workflowRun.id)) === 'cancelled'
+                  ) {
+                    cancelled = true;
+                    break;
+                  }
+                }
+                if (cancelled) break;
               } else {
                 // Preserve the historical one immediate retry only when the first
                 // execution itself had the zero-token engine-dark signature.

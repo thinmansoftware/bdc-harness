@@ -65,7 +65,7 @@ export interface MergeExecutionBridgeStore {
   // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
   hasActiveRunForWo?(woId: string): Promise<boolean>;
   /** Defense in depth for a merge-ready row shadowed by an unverified approval. */
-  hasUnverifiedApprovalForHead?(verdict: OverseerVerdictRow): Promise<boolean>;
+  hasUnverifiedApprovalForHead(verdict: OverseerVerdictRow): Promise<boolean>;
   reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
   releaseMergeSlot(verdictId: string): Promise<void>;
   recordOutcome(input: {
@@ -643,6 +643,16 @@ async function mergeClaimedVerdict(
   const target = await resolveMergeTarget(options, verdict, repoPolicy, skip);
   if (!target) return rateLimitDeferred ? 'stop' : undefined;
   const { pr, basePolicy } = target;
+  if (
+    await options.store.hasUnverifiedApprovalForHead({
+      ...verdict,
+      pr_url: pr.htmlUrl ?? verdict.pr_url,
+    })
+  ) {
+    await options.store.releaseVerdictClaim(verdict.id, 'approval_unverified');
+    log.info({ verdictId: verdict.id, reason: 'approval_unverified' }, 'merge-coordinator.skip');
+    return undefined;
+  }
   if (!pr.exists || !pr.pr) {
     await skip(pr.lookupFailed ? 'pr_lookup_failed' : 'open_pr_not_found', pr.htmlUrl);
     return undefined;
@@ -869,12 +879,15 @@ export async function runMergeExecutionBridgeOnce(
     }
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
     if (!(await options.store.claimVerdict(verdict.id))) continue;
-    if (await options.store.hasUnverifiedApprovalForHead?.(verdict)) {
-      await options.store.releaseVerdictClaim(verdict.id, 'approval_unverified');
-      log.info({ verdictId: verdict.id, reason: 'approval_unverified' }, 'merge-coordinator.skip');
-      continue;
-    }
     try {
+      if (await options.store.hasUnverifiedApprovalForHead(verdict)) {
+        await options.store.releaseVerdictClaim(verdict.id, 'approval_unverified');
+        log.info(
+          { verdictId: verdict.id, reason: 'approval_unverified' },
+          'merge-coordinator.skip'
+        );
+        continue;
+      }
       if ((await mergeClaimedVerdict(options, verdict, repoPolicy)) === 'stop') break;
     } catch (error) {
       await options.store.releaseMergeSlot(verdict.id);

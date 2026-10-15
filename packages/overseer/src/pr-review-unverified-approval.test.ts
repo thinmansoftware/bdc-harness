@@ -1,5 +1,15 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { parseReviewVerdict } from './pr-review-evaluator';
+import * as connection from '@archon/core/db/connection';
+import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import * as verdictStore from '@archon/core/db/overseer';
+import { createRealSubmitDeps, recordReviewApprovalVerdict } from './pr-review-wiring';
+import { runAndSubmitReview, type SubmitDeps } from './pr-review-submit';
+import {
+  runMergeExecutionBridgeOnce,
+  type MergeExecutionBridgeStore,
+} from './merge-execution-bridge';
+import type { GitHubClientDeps } from './types';
 
 const output = (extra: Record<string, unknown>): string =>
   JSON.stringify({
@@ -35,10 +45,175 @@ describe('unverified approvals', () => {
     ];
     expect(parseReviewVerdict(output({ findings }))?.verdict).toBe('APPROVE_UNVERIFIED');
   });
-  test('unverified_approval_posts_no_approve_and_records_nonmergeable_verdict', () =>
-    expect(true).toBe(true));
-  test('merge_bridge_skips_unverified_and_logs_reason', () => expect(true).toBe(true));
-  test('verified_approval_still_merges_as_before', () => expect(true).toBe(true));
-  test('first_unverified_triggers_exactly_one_re_review', () => expect(true).toBe(true));
-  test('repeated_unverified_writes_duty_officer_message', () => expect(true).toBe(true));
+});
+
+describe('unverified approval persistence and execution', () => {
+  let db: SqliteAdapter;
+  const head = 'a'.repeat(40);
+  const prUrl = 'https://github.com/thinmansoftware/bdc-harness/pull/55';
+  const work = {
+    owner: 'thinmansoftware',
+    repo: 'bdc-harness',
+    prNumber: 55,
+    headSha: head,
+    author: 'builder',
+    messageId: 'review-1',
+    correlationId: 'correlation-1',
+  };
+  const receipt = {
+    ...work,
+    disposition: 'approved_unverified' as const,
+    reason: 'sandbox unavailable',
+  };
+
+  beforeEach(() => {
+    db = new SqliteAdapter(':memory:');
+    spyOn(connection, 'getDatabase').mockReturnValue(db);
+  });
+  afterEach(async () => {
+    mock.restore();
+    await db.close();
+  });
+
+  const realSubmit = (): SubmitDeps =>
+    createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: {} as never,
+      patOctokit: null,
+    });
+
+  async function bridge(): Promise<{ merges: number; reasons: string[] }> {
+    const observed = { merges: 0, reasons: [] as string[] };
+    const store: MergeExecutionBridgeStore = {
+      listUnactionedVerdicts: verdictStore.listUnactionedFlagMergeReadyVerdicts,
+      claimVerdict: verdictStore.claimVerdictForMergeExecution,
+      releaseVerdictClaim: async (id, reason) => {
+        observed.reasons.push(reason);
+        return verdictStore.releaseVerdictClaimForMergeExecution(id, reason);
+      },
+      getRunById: async () => null,
+      hasUnverifiedApprovalForHead: verdictStore.hasUnverifiedApprovalForHead,
+      reserveMergeSlot: async () => true,
+      releaseMergeSlot: async () => {},
+      recordOutcome: verdictStore.recordVerdictMergeOutcome,
+    };
+    const github = {
+      findPullRequest: async () => ({
+        exists: true,
+        state: 'open',
+        headSha: head,
+        htmlUrl: prUrl,
+        baseBranch: 'dev',
+        mergeable: true,
+        mergeableState: 'clean',
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        changedFilePaths: ['packages/overseer/src/code.ts'],
+        pr: { owner: work.owner, repo: work.repo, number: 55 },
+      }),
+      approvePullRequest: async () => ({ approved: true }),
+      mergePullRequest: async () => {
+        observed.merges += 1;
+        return { merged: true, mergeSha: 'merged' };
+      },
+    } as unknown as GitHubClientDeps;
+    await runMergeExecutionBridgeOnce({
+      store,
+      github,
+      repoConfig: { 'thinmansoftware/bdc-harness': { baseBranch: 'dev' } },
+      readPolicy: () => ({
+        service_enabled: true,
+        emergency_stop: false,
+        legacy_dry_run: false,
+        capability_flags: {
+          merge: true,
+          repair: false,
+          branch: false,
+          lifecycle: false,
+          escalation: false,
+        },
+      }),
+    });
+    return observed;
+  }
+
+  test('unverified_approval_posts_no_approve_and_records_nonmergeable_verdict', async () => {
+    const submitted: string[] = [];
+    const deps = realSubmit();
+    deps.currentHeadSha = async () => head;
+    deps.runReviewer = async () => ({
+      approved: false,
+      approvedUnverified: true,
+      summary: 'sandbox unavailable',
+      reviewedHeadSha: head,
+    });
+    deps.submitReview = async input => {
+      submitted.push(input.event);
+      return { submitted: true };
+    };
+    const result = await runAndSubmitReview(work, deps);
+    expect(result.disposition).toBe('approved_unverified');
+    expect(submitted).toEqual(['COMMENT']);
+    const rows = await db.query<{ verdict: string; proposed_action: string }>(
+      'SELECT verdict, proposed_action FROM overseer_verdicts'
+    );
+    expect(rows.rows).toEqual([
+      expect.objectContaining({ verdict: 'approved_unverified', proposed_action: 'none' }),
+    ]);
+  });
+
+  test('merge_bridge_skips_unverified_and_logs_reason', async () => {
+    await recordReviewApprovalVerdict({ ...work, disposition: 'approved_unverified' });
+    const runId = 'pr-discovery:thinmansoftware/bdc-harness#55:older-run';
+    await verdictStore.ensureDiscoveryRunRow(runId);
+    await db.query(
+      `INSERT INTO overseer_verdicts (id,run_id,wo_id,head_sha,status,verdict,proposed_action,pr_url)
+      VALUES ('old-ready',$1,'WO-3239',$2,'verdict','merge_candidate','flag_merge_ready',$3)`,
+      [runId, head, prUrl]
+    );
+    const result = await bridge();
+    expect(result.merges).toBe(0);
+    expect(result.reasons).toEqual(['approval_unverified']);
+    expect(
+      await verdictStore.hasUnverifiedApprovalForHead({
+        run_id: runId,
+        head_sha: 'b'.repeat(40),
+        pr_url: prUrl,
+      } as verdictStore.OverseerVerdictRow)
+    ).toBe(false);
+  });
+
+  test('verified_approval_still_merges_as_before', async () => {
+    await recordReviewApprovalVerdict({ ...work, disposition: 'approved_unverified' });
+    await recordReviewApprovalVerdict({ ...work, disposition: 'approved' });
+    const result = await bridge();
+    expect(result.merges).toBe(1);
+    const rows = await db.query<{ mutation_sent: number }>(
+      'SELECT mutation_sent FROM overseer_verdicts'
+    );
+    expect(rows.rows[0].mutation_sent).toBe(1);
+  });
+
+  test('first_unverified_triggers_exactly_one_re_review', async () => {
+    const deps = realSubmit();
+    await deps.recordReceipt(receipt);
+    await deps.recordReceipt(receipt);
+    const rows = await db.query<{ repeat_reason: string }>(
+      "SELECT repeat_reason FROM agent_dispatch_messages WHERE task_type='run_review'"
+    );
+    expect(rows.rows).toEqual([
+      expect.objectContaining({ repeat_reason: 'unverified_approval_retry' }),
+    ]);
+  });
+
+  test('repeated_unverified_writes_duty_officer_message', async () => {
+    const deps = realSubmit();
+    await deps.recordReceipt(receipt);
+    await deps.recordReceipt({ ...receipt, messageId: 'review-retry' });
+    await deps.recordReceipt({ ...receipt, messageId: 'review-retry' });
+    const rows = await db.query<{ body: string }>(
+      "SELECT body FROM agent_dispatch_messages WHERE recipient='duty-officer'"
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0].body).toContain(head);
+    expect(rows.rows[0].body).toContain('#55');
+  });
 });

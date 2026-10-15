@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { parse } from 'yaml';
 import { classifyError } from './classify';
 import { decide } from './decide';
 
@@ -61,4 +65,53 @@ describe('commit hook repair contract', () => {
     expect(lane).toContain('gh pr ready "$PR"');
     expect(lane).toContain('NOT pushed');
   });
+
+  for (const repairState of ['needs_human', 'classification_failed', 'retry_failed', 'pushed']) {
+    test(`terminal_hook_handling_${repairState}`, () => {
+      const lane = parse(
+        readFileSync('.archon/workflows/defaults/bdc-feature-development-codex.yaml', 'utf8')
+      ) as {
+        nodes: {
+          id: string;
+          bash?: string;
+          depends_on?: string[];
+          trigger_rule?: string;
+          when?: string;
+        }[];
+      };
+      const terminal = lane.nodes.find(node => node.id === 'commit-hook-terminal');
+      expect(terminal?.trigger_rule).toBe('all_done');
+      expect(terminal?.when).toBeUndefined();
+      expect(lane.nodes.find(node => node.id === 'open-pr-if-needed')?.depends_on).toEqual([
+        'commit-hook-terminal',
+      ]);
+      const directory = mkdtempSync(join(tmpdir(), 'hook-terminal-'));
+      const unixDirectory = directory.replaceAll('\\', '/');
+      const pushed = repairState === 'pushed';
+      writeFileSync(join(directory, 'commit-and-push.env'), 'UNIQUE_BRANCH=repair-branch\n');
+      writeFileSync(join(directory, 'diff-review-final.out'), 'UNRESOLVED missing return type\n');
+      const script =
+        `export ARTIFACTS_DIR='${unixDirectory}' ARCHON_NODE_OUT='${unixDirectory}'\n` +
+        `git() { case "$1" in ls-remote) printf '${pushed ? 'local-head' : 'old-head'}\\trefs/heads/repair-branch\\n';; rev-parse) echo local-head;; diff) return ${pushed ? '0' : '1'};; ls-files) return 0;; remote) echo https://github.com/thinmansoftware/bdc-harness.git;; esac; }\n` +
+        `gh() { if [ "$2" = list ]; then echo 55; else printf '%s\\n' "$*" >> '${unixDirectory}/gh-calls'; fi; }\n` +
+        terminal?.bash;
+      writeFileSync(join(directory, 'terminal.sh'), script);
+      try {
+        const result = spawnSync('bash', [join(directory, 'terminal.sh')], {
+          encoding: 'utf8',
+          timeout: 10000,
+          windowsHide: true,
+        });
+        expect(result.status).toBe(pushed ? 0 : 1);
+        if (!pushed) {
+          const calls = readFileSync(join(directory, 'gh-calls'), 'utf8');
+          expect(calls).toContain('pr ready 55 --repo thinmansoftware/bdc-harness --undo');
+          expect(calls).toContain('NOT pushed');
+          expect(calls).toContain('UNRESOLVED missing return type');
+        }
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
 });
