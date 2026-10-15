@@ -8,7 +8,20 @@ message="${COMMIT_MESSAGE:-feat: ${WO_ID:-work order} implementation}"
 mkdir -p "$artifacts_dir"
 printf '%s\n' "$attempt" > "$artifacts_dir/commit-hook-attempt.txt"
 
-git add -A
+staged_paths_file="$artifacts_dir/commit-hook-staged-paths.nul"
+if [ "$attempt" = 1 ]; then
+  {
+    git diff --name-only -z
+    git diff --cached --name-only -z
+    git ls-files --others --exclude-standard -z
+  } | sort -zu > "$staged_paths_file"
+elif [ ! -s "$staged_paths_file" ]; then
+  echo "ERROR: initial path record missing; refusing to stage unrelated retry files" >&2
+  exit 1
+fi
+if [ -s "$staged_paths_file" ]; then
+  git add --pathspec-from-file="$staged_paths_file" --pathspec-file-nul
+fi
 if ! git diff --cached --quiet; then
   hook_output="$artifacts_dir/commit-hook-output.txt"
   if ! git commit -m "$message" >"$hook_output" 2>&1; then

@@ -102,6 +102,7 @@ describe('commit hook repair contract', () => {
   test('real_hook_repair_roundtrip', () => {
     const fixture = hookFixture();
     try {
+      writeFileSync(join(fixture.repo, 'space file.ts'), 'export const kept = true;\n');
       expect(fixture.run(1).status).toBe(1);
       expect(readFileSync(join(fixture.artifacts, 'commit-hook-output.txt'), 'utf8')).toContain(
         'explicit-function-return-type'
@@ -110,6 +111,7 @@ describe('commit hook repair contract', () => {
         join(fixture.repo, 'fixture.ts'),
         'export function value(): number { return 1; }\n'
       );
+      writeFileSync(join(fixture.repo, 'unrelated.ts'), 'export const unrelated = true;\n');
       expect(fixture.run(2).status).toBe(0);
       const commit = spawnSync('git', ['log', '-1', '--format=%s'], {
         cwd: fixture.repo,
@@ -117,6 +119,13 @@ describe('commit hook repair contract', () => {
         windowsHide: true,
       });
       expect(commit.stdout.trim()).toBe('feat: work order implementation');
+      const files = spawnSync('git', ['show', '--format=', '--name-only', 'HEAD'], {
+        cwd: fixture.repo,
+        encoding: 'utf8',
+        windowsHide: true,
+      });
+      expect(files.stdout).toContain('space file.ts');
+      expect(files.stdout).not.toContain('unrelated.ts');
       expect(readFileSync(join(fixture.artifacts, 'git-argv'), 'utf8')).not.toMatch(
         /--no-verify|--no-hooks/
       );
