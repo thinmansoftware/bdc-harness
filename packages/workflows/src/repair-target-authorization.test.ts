@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -46,8 +46,12 @@ function bash(
   }
 }
 
-function runRta(raw: string, pr = '826'): { exitCode: number; stdout: string; stderr: string } {
-  const script = `set -euo pipefail\n${RTA_CORE}\nrta_plan_authorizes "$PLAN_REVIEW_RAW" "$PR_NUMBER"\n`;
+function runRta(
+  raw: string,
+  pr = '826',
+  core = RTA_CORE
+): { exitCode: number; stdout: string; stderr: string } {
+  const script = `set -euo pipefail\n${core}\nrta_plan_authorizes "$PLAN_REVIEW_RAW" "$PR_NUMBER"\n`;
   return bash(script, { PLAN_REVIEW_RAW: raw, PR_NUMBER: pr });
 }
 
@@ -70,6 +74,34 @@ function expectRefuse(raw: string, reason: string): void {
 }
 
 describe('repair-target plan authorization', () => {
+  const laneDirectory = join(REPO_ROOT, '.archon/workflows/defaults');
+  for (const file of readdirSync(laneDirectory).filter(name =>
+    /^bdc-feature-development.*\.yaml$/.test(name)
+  )) {
+    const text = readFileSync(join(laneDirectory, file), 'utf8');
+    if (!text.includes('# ---- BEGIN rta core')) continue;
+    const core = extractRtaCore(text);
+    for (const indent of ['    ', '\t']) {
+      it(`${file} refuses Markdown code indentation ${JSON.stringify(indent)}`, () => {
+        const result = runRta(
+          wrap('\n' + indent + 'repair_target_authorized_by_spec: #826'),
+          '826',
+          core
+        );
+        expect(result.exitCode).toBe(1);
+        expect(result.stdout).toContain('no_standalone_field');
+      });
+    }
+  }
+  it('mixed tabs and deeper indentation cannot authorize a repair', () => {
+    for (const indent of [' \t', '   \t', '        ']) {
+      expectRefuse(
+        wrap('\n' + indent + 'repair_target_authorized_by_spec: #826'),
+        'no_standalone_field'
+      );
+    }
+  });
+
   it('Test 11: standalone field is accepted', () => {
     for (const line of [
       'repair_target_authorized_by_spec: #826',
