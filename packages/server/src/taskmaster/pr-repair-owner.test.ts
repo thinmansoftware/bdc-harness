@@ -158,6 +158,47 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
 }
 
 describe('review repair regressions', () => {
+  test('historical closed duplicates do not consume the five actionable WO slots', async () => {
+    const historical = Array.from({ length: 5 }, (_, i) => ({
+      woId: `WO-CLOSED-${i}`,
+      prs: [lanePr({ prNumber: 100 + i, state: 'CLOSED' }), lanePr({ prNumber: 200 + i })],
+    }));
+    const { deps, rec } = makeDeps({
+      dupeWos: [
+        ...historical,
+        {
+          woId: 'WO-ACTIVE',
+          prs: [lanePr({ prNumber: 301 }), lanePr({ prNumber: 302 })],
+        },
+      ],
+    });
+    await runPrRepairOwner(deps);
+    expect(rec.closed.map(row => row.prNumber)).toEqual([301]);
+  });
+
+  test('non-object JSON never poisons subsequent repair and exhausted messages', async () => {
+    const woId = 'WO-GOOD';
+    const pr = lanePr({ prNumber: 401 });
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: [pr] },
+      queued: [
+        ...['null', 'true', '1', '[]', '"text"'].map((body, i) => ({ id: `bad-${i}`, body })),
+        {
+          id: 'valid',
+          body: candidateBody({ prNumber: 401, headSha: pr.headSha, headRef: pr.headRef, woId }),
+        },
+        {
+          id: 'exhausted',
+          body: exhaustedBody({ repo: 'bdc-xo', prNumber: 402, woId, reason: 'cap' }),
+        },
+      ],
+    });
+    const result = await runPrRepairOwner(deps);
+    expect(rec.fired).toHaveLength(1);
+    expect(result.exhaustedRowIds).toEqual(['exhausted']);
+    expect(result.digestItems).toHaveLength(1);
+  });
+
   test('sweep groups a shared WO by repository before closing duplicates', async () => {
     const woId = 'WO-MULTI-REPO';
     const { deps, rec } = makeDeps({

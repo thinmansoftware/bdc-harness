@@ -9,6 +9,7 @@ import { join } from 'path';
 import { rootLogger } from '@archon/paths';
 import {
   createTaskmasterState,
+  createGhLaneFetcher,
   defaultFindEffectByIdempotencyKey,
   defaultGetGithubIssueEvidence,
   defaultListThreads,
@@ -4635,5 +4636,20 @@ describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', 
       if (priorFire === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFire;
     }
+  });
+});
+
+describe('production repair-owner GitHub fetcher', () => {
+  test('propagates read failures rather than hiding an unresolved PR', async () => {
+    const fetcher = createGhLaneFetcher((async () => {
+      throw new Error('github_transient_failure');
+    }) as Parameters<typeof createGhLaneFetcher>[0]);
+    let caught: unknown;
+    try {
+      await fetcher('thinmansoftware', 'bdc-harness', 1120);
+    } catch (error) {
+      caught = error;
+    }
+    expect((caught as Error)?.message).toBe('github_transient_failure');
   });
 });

@@ -16,6 +16,7 @@
 import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
+import { createGhLanePrFetcher } from '@archon/smart-cauldron/open-pr-guard';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldron/headroom';
 import {
@@ -29,13 +30,7 @@ import {
   type DispatchMessage,
   type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
-import {
-  listLanePrsForWo,
-  listWosWithMultipleLanePrs,
-  type LanePrFetcher,
-  type LanePrGithubInfo,
-  type LanePrState,
-} from '@archon/core/db/lane-pr-registry';
+import { listLanePrsForWo, listWosWithMultipleLanePrs } from '@archon/core/db/lane-pr-registry';
 import { execFileAsync } from '@archon/git';
 import { loadLadder } from '@archon/smart-cauldron/ladder';
 import { runPrRepairOwner, type PrRepairOwnerDeps } from './pr-repair-owner';
@@ -797,61 +792,8 @@ export function buildSelfPauseNotice(
   };
 }
 
-/**
- * A lane-pr-registry GitHub fetcher backed by `gh pr view`. Reads only the
- * fields the LANE PR RULE needs; returns null when the PR cannot be read. Fork
- * detection uses isCrossRepository so rule (c) can drop a fork head.
- */
-function createGhLaneFetcher(): LanePrFetcher {
-  return async (owner, repo, prNumber): Promise<LanePrGithubInfo | null> => {
-    let stdout: string;
-    try {
-      ({ stdout } = await execFileAsync(
-        'gh',
-        [
-          'pr',
-          'view',
-          String(prNumber),
-          '--repo',
-          `${owner}/${repo}`,
-          '--json',
-          'number,state,reviewDecision,createdAt,headRefName,headRefOid,isCrossRepository,title,body',
-        ],
-        { timeout: 30000 }
-      ));
-    } catch {
-      return null;
-    }
-    const row = JSON.parse(stdout || '{}') as {
-      number?: number;
-      state?: string;
-      reviewDecision?: string | null;
-      createdAt?: string;
-      headRefName?: string;
-      headRefOid?: string;
-      isCrossRepository?: boolean;
-      title?: string;
-      body?: string;
-    };
-    if (typeof row.number !== 'number') return null;
-    const stateRaw = (row.state ?? '').toUpperCase();
-    const state: LanePrState =
-      stateRaw === 'MERGED' ? 'MERGED' : stateRaw === 'CLOSED' ? 'CLOSED' : 'OPEN';
-    const baseRepoFullName = `${owner}/${repo}`;
-    return {
-      number: row.number,
-      state,
-      reviewDecision: row.reviewDecision ?? null,
-      createdAt: row.createdAt ?? '',
-      headRefName: row.headRefName ?? '',
-      headSha: row.headRefOid ?? '',
-      headRepoFullName: row.isCrossRepository ? `fork:${baseRepoFullName}` : baseRepoFullName,
-      baseRepoFullName,
-      title: row.title ?? '',
-      body: row.body ?? '',
-    };
-  };
-}
+/** Reuse the conductor's fail-closed numbered PR lookup for repair ownership. */
+export const createGhLaneFetcher = createGhLanePrFetcher;
 
 /**
  * Bind the PR repair owner to live infrastructure: the event store

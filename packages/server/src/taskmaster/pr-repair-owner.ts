@@ -213,6 +213,7 @@ function parseLaneRepairCandidate(body: string): LaneRepairCandidate | null {
   } catch {
     return null;
   }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   if (value.kind !== 'overseer_remediation_candidate') return null;
   const classes = Array.isArray(value.findingClasses) ? value.findingClasses : [];
   if (!classes.includes('lane_repair')) return null;
@@ -245,6 +246,7 @@ function parseExhaustedRow(body: string): ExhaustedRow | null {
   } catch {
     return null;
   }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   if (value.kind !== 'overseer_remediation_exhausted') return null;
   if (
     typeof value.owner !== 'string' ||
@@ -284,7 +286,19 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
   // (1) DEDUPE SWEEP -----------------------------------------------------------
   const dupeWos = (
     await deps.listWosWithMultipleLanePrs({ fetchPr: deps.fetchPr, withinHours, now })
-  ).slice(0, MAX_DEDUPE_WOS_PER_TICK);
+  )
+    .filter(entry => {
+      const openByRepository = new Map<string, number>();
+      for (const pr of entry.prs) {
+        if (pr.state !== 'OPEN') continue;
+        const key = `${pr.owner}/${pr.repo}`.toLowerCase();
+        const count = (openByRepository.get(key) ?? 0) + 1;
+        if (count >= 2) return true;
+        openByRepository.set(key, count);
+      }
+      return false;
+    })
+    .slice(0, MAX_DEDUPE_WOS_PER_TICK);
   for (const entry of dupeWos) {
     const repositories = new Map<string, LanePr[]>();
     for (const pr of entry.prs) {
