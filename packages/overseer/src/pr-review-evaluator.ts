@@ -71,6 +71,7 @@ function getLog(): ReturnType<typeof createLogger> {
  */
 export type PrReviewVerdict =
   | 'APPROVE'
+  | 'APPROVE_UNVERIFIED'
   | 'REQUEST_CHANGES'
   | 'INDETERMINATE'
   | 'CHECKS_PENDING'
@@ -99,6 +100,7 @@ export interface PrReviewResult {
   reviewer: ReviewAgentIdentity;
   acceptance_criteria_available: boolean;
   error?: string;
+  verification_reason?: string;
   /**
    * Set only on RATE_LIMITED. Absolute instant (ISO-8601) the GitHub budget is
    * expected to have refilled, taken from the response's `retry-after` or
@@ -174,9 +176,13 @@ interface ParsedReviewVerdict {
   verdict: Exclude<PrReviewVerdict, 'INDETERMINATE' | 'CHECKS_PENDING' | 'CHECKS_UNAVAILABLE'>;
   findings: IndependentReviewFinding[];
   reviewed_head_sha: string;
+  verification: 'verified' | 'unverified';
+  verification_reason?: string;
 }
 
 const FINDING_SEVERITIES = new Set(['blocker', 'major', 'minor', 'note']);
+const UNVERIFIED_EVIDENCE =
+  /sandbox|could not be independently verified|unavailable because|unable to (?:run|inspect|verify)|checkout (?:failed|unavailable)|execution (?:failed|unavailable)|exact head .*(?:not|unable|failed)|tools? (?:failed|unavailable)/i;
 
 function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
@@ -191,6 +197,8 @@ export function parseReviewVerdict(stdout: string): ParsedReviewVerdict | null {
       typeof value !== 'object' ||
       Array.isArray(value) ||
       (value.verdict !== 'APPROVE' && value.verdict !== 'REQUEST_CHANGES') ||
+      (value.verification !== 'verified' && value.verification !== 'unverified') ||
+      (value.verification === 'unverified' && !nonEmpty(value.verification_reason)) ||
       !nonEmpty(value.reviewed_head_sha) ||
       !Array.isArray(value.findings)
     ) {
@@ -219,10 +227,22 @@ export function parseReviewVerdict(stdout: string): ParsedReviewVerdict | null {
     ) {
       return null;
     }
+    const backstop = findings.find(finding =>
+      UNVERIFIED_EVIDENCE.test(`${finding.scope} ${finding.summary}`)
+    );
+    const unverified = value.verification === 'unverified' || backstop !== undefined;
+    const verificationReason =
+      value.verification === 'unverified'
+        ? String(value.verification_reason).trim()
+        : backstop
+          ? `${backstop.scope}: ${backstop.summary}`
+          : undefined;
     return {
-      verdict: value.verdict,
+      verdict: value.verdict === 'APPROVE' && unverified ? 'APPROVE_UNVERIFIED' : value.verdict,
       findings,
       reviewed_head_sha: value.reviewed_head_sha.trim(),
+      verification: unverified ? 'unverified' : 'verified',
+      ...(verificationReason ? { verification_reason: verificationReason } : {}),
     };
   } catch {
     return null;
@@ -240,8 +260,9 @@ export function buildReviewPrompt(input: {
     'Evaluate the exact-head code diff, check/test results, security implications, authorized scope, and stated acceptance criteria.',
     'Report blocking issues as severity blocker or major. Advisory issues use minor or note.',
     'Return only one JSON object with this exact shape:',
-    '{"verdict":"APPROVE|REQUEST_CHANGES","findings":[{"scope":"non-empty","severity":"blocker|major|minor|note","summary":"non-empty"}],"reviewed_head_sha":"exact input SHA"}',
+    '{"verdict":"APPROVE|REQUEST_CHANGES","verification":"verified|unverified","verification_reason":"required and non-empty when unverified","findings":[{"scope":"non-empty","severity":"blocker|major|minor|note","summary":"non-empty"}],"reviewed_head_sha":"exact input SHA"}',
     'Use REQUEST_CHANGES only with at least one blocker or major finding. Never approve when checks fail or a stated acceptance criterion is unmet.',
+    'Set verification to unverified whenever you could not inspect the checkout, run tests, confirm the exact head SHA, or use the sandbox or required tools. Explain why in verification_reason.',
     '',
     `Repository: ${input.request.owner}/${input.request.repo}`,
     `Pull request: ${input.request.pr_number}`,

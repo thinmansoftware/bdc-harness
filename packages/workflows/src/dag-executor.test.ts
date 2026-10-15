@@ -8150,6 +8150,8 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
 
     const store = createMockStore();
     const deps = createMockDeps(store);
+    deps.sleep = async (): Promise<void> => undefined;
+    deps.random = (): number => 0.5;
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('validator-failure-run');
 
@@ -13939,6 +13941,131 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
 
     expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  async function runBackoffScenario(
+    options: {
+      random?: number;
+      zeroTokens?: boolean;
+      cancelDuringSleep?: boolean;
+      deferSleep?: (milliseconds: number) => Promise<void>;
+    } = {}
+  ): Promise<{ starts: number[]; waits: number[]; failed: number; completed: number }> {
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    let clock = 0;
+    let cancelled = false;
+    const starts: number[] = [];
+    const waits: number[] = [];
+    deps.random = () => options.random ?? 0.5;
+    (store.getWorkflowRunStatus as ReturnType<typeof mock>).mockImplementation(async () =>
+      cancelled ? 'cancelled' : 'running'
+    );
+    deps.sleep = async milliseconds => {
+      const attempt = starts.length - 1;
+      if (waits[attempt] === undefined) {
+        waits[attempt] = 0;
+        await options.deferSleep?.(milliseconds);
+      }
+      waits[attempt] += milliseconds;
+      clock += milliseconds;
+      if (options.cancelDuringSleep) cancelled = true;
+    };
+    mockSendQueryDag.mockImplementation(function* () {
+      starts.push(clock);
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'success',
+        tokens: { input: options.zeroTokens ? 0 : 105, output: options.zeroTokens ? 0 : 700 },
+      };
+    });
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'backoff-test',
+      testDir,
+      { name: 'backoff-test', nodes: [{ id: 'work', prompt: 'work' }] },
+      makeWorkflowRun(),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    return {
+      starts,
+      waits,
+      failed: (store.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length,
+      completed: (store.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length,
+    };
+  }
+
+  it('truncated_nonzero_contradiction_waits_backoff_with_fake_clock', async () => {
+    const release: (() => void)[] = [];
+    const pending = runBackoffScenario({
+      deferSleep: () =>
+        new Promise<void>(resolve => {
+          release.push(resolve);
+        }),
+    });
+    for (let ticks = 0; release.length < 1 && ticks < 1000; ticks += 1) await Bun.sleep(1);
+    expect(mockSendQueryDag.mock.calls).toHaveLength(1);
+    expect(release).toHaveLength(1);
+    release[0]();
+    for (let ticks = 0; release.length < 2 && ticks < 1000; ticks += 1) await Bun.sleep(1);
+    expect(mockSendQueryDag.mock.calls).toHaveLength(2);
+    expect(release).toHaveLength(2);
+    release[1]();
+    const result = await pending;
+    expect(result.starts).toEqual([0, 30000, 150000]);
+    expect(result.waits).toEqual([30000, 120000]);
+    expect(result.failed).toBe(1);
+  });
+
+  it('zero_token_contradiction_keeps_existing_path', async () => {
+    const result = await runBackoffScenario({ zeroTokens: true });
+    expect(result.starts).toEqual([0, 0]);
+    expect(result.waits).toEqual([]);
+    expect(result.failed).toBe(1);
+  });
+
+  it('backoff_is_jittered_bounded_and_cancellable', async () => {
+    expect((await runBackoffScenario({ random: 0 })).waits).toEqual([24000, 96000]);
+    expect((await runBackoffScenario({ random: 1 })).waits).toEqual([36000, 144000]);
+    const result = await runBackoffScenario({ cancelDuringSleep: true });
+    expect(result.starts).toEqual([0]);
+    expect(result.waits).toEqual([1000]);
+    expect(result.completed).toBe(0);
+  });
+
+  it('backoff_log_line_records_class_tokens_and_wait', async () => {
+    mockLogFn.mockClear();
+    await runBackoffScenario();
+    const entries = mockLogFn.mock.calls as unknown as [Record<string, unknown>, string][];
+    expect(entries.filter(([, message]) => message === 'dag.sdk_contradiction_backoff')).toEqual([
+      [
+        expect.objectContaining({
+          nodeId: 'work',
+          class: 'truncated_nonzero',
+          tokens: { input: 105, output: 700 },
+          waitMs: 30000,
+          retryIndex: 1,
+        }),
+        'dag.sdk_contradiction_backoff',
+      ],
+      [
+        expect.objectContaining({
+          nodeId: 'work',
+          class: 'truncated_nonzero',
+          waitMs: 120000,
+          retryIndex: 2,
+        }),
+        'dag.sdk_contradiction_backoff',
+      ],
+    ]);
   });
 
   it('contradiction retry: retries once and completes; one sdk-contradiction-dump event exists', async () => {

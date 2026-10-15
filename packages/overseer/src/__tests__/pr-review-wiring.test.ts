@@ -94,6 +94,8 @@ describe('PR review approval verdict recording', () => {
         model: 'review-model',
       },
       {
+        persistUnverifiedEvidence: async () => true,
+        resolveUnverifiedEvidence: async () => {},
         claimVerdict: async input => {
           claims.push(input);
           return { claimed: true, verdictId: 'verdict-1', retryCount: 0 };
@@ -129,6 +131,8 @@ describe('PR review approval verdict recording', () => {
     await recordReviewApprovalVerdict(
       { owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
       {
+        persistUnverifiedEvidence: async () => true,
+        resolveUnverifiedEvidence: async () => {},
         claimVerdict: async () => ({ claimed: false }),
         finalizeVerdict: async () => {
           finalized += 1;

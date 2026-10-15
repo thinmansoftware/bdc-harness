@@ -1,0 +1,163 @@
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import {
+  buildNodeFailureNoticeBody,
+  isNodeFailureBlocker,
+  NODE_FAILURE_BLOCKER_CLASSES,
+  notifyNodeFailure,
+} from '@archon/overseer';
+
+import * as connection from '@archon/core/db/connection';
+import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import { handleNodeFailure } from './overseer-bridge';
+
+let db: SqliteAdapter;
+beforeEach(() => {
+  db = new SqliteAdapter(':memory:');
+  spyOn(connection, 'getDatabase').mockReturnValue(db);
+});
+afterEach(async () => {
+  mock.restore();
+  await db.close();
+});
+
+async function caller(nodeId: string, errorMsg: string): Promise<void> {
+  const noop = (): void => {};
+  const log = { info: noop, error: noop, warn: noop, debug: noop };
+  await handleNodeFailure(
+    {
+      store: { createWorkflowEvent: async () => {} },
+      emitter: { emit: noop },
+      log,
+      logNodeError: async () => {},
+    } as unknown as Parameters<typeof handleNodeFailure>[0],
+    {
+      id: 'caller-run',
+      workflow_name: 'bdc-feature-development-codex',
+      metadata: { wo_issue_number: 3239 },
+      user_message: '',
+    } as Parameters<typeof handleNodeFailure>[1],
+    {
+      id: nodeId,
+      bash: 'exit 1',
+      load_bearing: true,
+    } as Parameters<typeof handleNodeFailure>[2],
+    {
+      errorMsg,
+      logDir: 'unused',
+      nodeType: 'bash',
+    }
+  );
+}
+
+const base = {
+  runId: 'run-1',
+  workflowName: 'bdc-feature-development-codex',
+  nodeId: 'commit-and-push',
+  errorClass: 'commit_hook_lint_failure' as const,
+  decision: 'escalate' as const,
+  attempt: 1,
+  error: 'Missing return type',
+};
+
+describe('node failure dispatch notification', () => {
+  test('escalate_writes_duty_officer_message', async () => {
+    const sent: unknown[] = [];
+    await notifyNodeFailure(base, { error: () => undefined }, (async (_context, data) => {
+      sent.push(data);
+      return {} as never;
+    }) as never);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ recipient: 'duty-officer', priority: 'normal' });
+  });
+  test('unknown_class_without_escalation_context_still_notifies', async () => {
+    const sent: unknown[] = [];
+    await notifyNodeFailure({ ...base, errorClass: 'unknown' }, { error: () => undefined }, (async (
+      _c,
+      d
+    ) => {
+      sent.push(d);
+      return {} as never;
+    }) as never);
+    expect(sent).toHaveLength(1);
+  });
+  test('notification_is_idempotent', async () => {
+    await notifyNodeFailure(base, { error: () => {} });
+    await notifyNodeFailure(base, { error: () => {} });
+    const rows = await db.query<{ idempotency_key: string }>(
+      "SELECT idempotency_key FROM agent_dispatch_messages WHERE correlation_id='run-1'"
+    );
+    expect(rows.rows).toEqual([{ idempotency_key: 'overseer-node-failure:run-1:commit-and-push' }]);
+  });
+  for (const [id, expectedAttempt, expectedRecipients] of [
+    ['commit-and-push', 1, ['duty-officer']],
+    ['commit-and-push-retry', 2, ['duty-officer', 'xo']],
+  ] as const) {
+    test(`real bridge reports hook attempt ${expectedAttempt} with bounded escalation`, async () => {
+      await caller(id, 'lint-staged [FAILED] eslint\nhusky - pre-commit script failed');
+      const rows = await db.query<{ recipient: string; body: string; subject_key: string }>(
+        'SELECT recipient,body,subject_key FROM agent_dispatch_messages ORDER BY recipient'
+      );
+      expect(rows.rows.map(row => row.recipient)).toEqual([...expectedRecipients]);
+      for (const row of rows.rows) {
+        expect(row.body).toContain(`Attempt: ${expectedAttempt}`);
+        expect(row.body).toContain('Class: commit_hook_lint_failure');
+        expect(row.subject_key).toBe('gh:thinmansoftware/bdc-xo#3239');
+      }
+    });
+  }
+  test('real bridge notifies unknown failures even without escalation context', async () => {
+    await caller('patch-pr-body', 'novel failure');
+    const rows = await db.query<{ body: string }>(
+      "SELECT body FROM agent_dispatch_messages WHERE recipient='duty-officer'"
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0].body).toContain('Class: unknown');
+  });
+  test('blocker_also_goes_to_xo', () =>
+    expect(isNodeFailureBlocker({ ...base, attempt: 2 })).toBe(true));
+  test('blocker_table_is_exported_and_complete', async () => {
+    expect(NODE_FAILURE_BLOCKER_CLASSES).toEqual(['out_of_credits', 'auth_failed']);
+    for (const errorClass of NODE_FAILURE_BLOCKER_CLASSES) {
+      const sent: { recipient: string; priority: string }[] = [];
+      await notifyNodeFailure({ ...base, errorClass }, { error: () => {} }, (async (
+        _context,
+        data
+      ) => {
+        sent.push(data);
+        return {} as never;
+      }) as never);
+      expect(sent).toEqual([
+        expect.objectContaining({ recipient: 'duty-officer', priority: 'normal' }),
+        expect.objectContaining({ recipient: 'xo', priority: 'blocker' }),
+      ]);
+    }
+    expect(isNodeFailureBlocker({ ...base, errorClass: 'unknown' })).toBe(false);
+  });
+  test('error_line_is_redacted_and_truncated', () => {
+    const body = buildNodeFailureNoticeBody({
+      ...base,
+      error: `Authorization: Bearer secret${'x'.repeat(600)}`,
+    });
+    expect(body).not.toContain('secret');
+    expect(body.split('Error: ')[1].length).toBeLessThanOrEqual(300);
+  });
+  test('failed_notify_does_not_recurse_or_throw', async () => {
+    await expect(
+      notifyNodeFailure(base, { error: () => undefined }, (async () => {
+        throw new Error('closed');
+      }) as never)
+    ).resolves.toBeUndefined();
+  });
+  test('clean_run_creates_no_message', async () => {
+    let count = 0;
+    await notifyNodeFailure(
+      { ...base, decision: 'skip' },
+      { error: () => undefined },
+      (async () => {
+        count += 1;
+        return {} as never;
+      }) as never
+    );
+    expect(count).toBe(0);
+  });
+});

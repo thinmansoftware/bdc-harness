@@ -85,6 +85,7 @@ function harness(rows: OverseerVerdictRow[], opts: HarnessOptions = {}) {
   let occupied = 0;
 
   const store: MergeExecutionBridgeStore = {
+    hasUnverifiedApprovalForHead: async () => false,
     listUnactionedVerdicts: async () => [...pending],
     claimVerdict: async verdictId => {
       if (!pending.some(row => row.id === verdictId)) return false;

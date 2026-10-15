@@ -3605,6 +3605,15 @@ nodes:
         UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       fi
       git status --short
+      WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+      COMMIT_MESSAGE="feat: ${WO_ID} implementation"
+      export UNIQUE_BRANCH COMMIT_MESSAGE REPAIR_TARGET_LEASE_SHA
+      mkdir -p "$ARTIFACTS_DIR"
+      printf 'UNIQUE_BRANCH=%q\nCOMMIT_MESSAGE=%q\nREPAIR_TARGET_LEASE_SHA=%q\n' \
+        "$UNIQUE_BRANCH" "$COMMIT_MESSAGE" "${REPAIR_TARGET_LEASE_SHA:-}" \
+        > "$ARTIFACTS_DIR/commit-and-push.env"
+      .archon/scripts/commit-and-push.sh 1
+      exit 0
       DIRTY=$(git status --porcelain)
       if [ -z "$DIRTY" ]; then
         # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: do NOT exit 0 here on the
@@ -3756,10 +3765,79 @@ nodes:
       echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
       echo "unique_branch=${UNIQUE_BRANCH}"
 
+  - id: commit-hook-repair
+    agent: major-build
+    depends_on: [commit-and-push]
+    trigger_rule: all_done
+    task_class: medium_work
+    prompt: |
+      The commit-and-push node may have failed a pre-commit lint or format hook.
+      Read $ARTIFACTS_DIR/commit-hook-output.txt. If it does not contain a Husky
+      pre-commit failure or a lint-staged [FAILED] marker, make no changes and emit
+      OPUS_REPAIR=already-satisfied. Otherwise fix only the files and exact lint or
+      format errors reported there; do not touch unrelated files. Run the narrow
+      checks needed to confirm the correction. Emit exactly one final sentinel:
+      OPUS_REPAIR=fixed, OPUS_REPAIR=already-satisfied, or OPUS_REPAIR=needs-human.
+
+  - id: classify-commit-hook-repair
+    depends_on: [commit-hook-repair]
+    trigger_rule: all_done
+    output_format:
+      type: object
+      properties:
+        verdict:
+          type: string
+          enum: [fixed, already_satisfied, needs_human]
+      required: [verdict]
+    prompt: |
+      Classify the repair output. OPUS_REPAIR=fixed is fixed,
+      OPUS_REPAIR=already-satisfied is already_satisfied, and every other result
+      is needs_human. Return only the requested object.
+      $commit-hook-repair.output
+
+  - id: commit-and-push-retry
+    persona: overseer
+    depends_on: [classify-commit-hook-repair]
+    trigger_rule: all_done
+    when: "$classify-commit-hook-repair.output.verdict == 'fixed' || $classify-commit-hook-repair.output.verdict == 'already_satisfied'"
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if [ -f "$ARTIFACTS_DIR/commit-and-push.succeeded" ]; then
+        exit 0
+      fi
+      source "$ARTIFACTS_DIR/commit-and-push.env"
+      export UNIQUE_BRANCH COMMIT_MESSAGE REPAIR_TARGET_LEASE_SHA
+      .archon/scripts/commit-and-push.sh 2
+
+  - id: commit-hook-terminal
+    persona: overseer
+    depends_on: [commit-and-push-retry]
+    trigger_rule: all_done
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if [ ! -f "$ARTIFACTS_DIR/commit-and-push.env" ]; then
+        echo "ERROR: commit state missing; push has not been verified." >&2
+        exit 1
+      fi
+      source "$ARTIFACTS_DIR/commit-and-push.env"
+      REMOTE_HEAD=$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" | awk '{print $1}')
+      if [ "$REMOTE_HEAD" != "$(git rev-parse HEAD)" ] || ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+        REPO=$(git remote get-url origin | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##')
+        PR=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        if [ -n "$PR" ]; then
+          gh pr ready "$PR" --repo "$REPO" --undo || true
+          UNRESOLVED=$(grep '^UNRESOLVED' "$ARCHON_NODE_OUT/diff-review-final.out" 2>/dev/null || true)
+          gh pr comment "$PR" --repo "$REPO" --body "Run repair delta was NOT pushed; in-run review findings remain unresolved.\n${UNRESOLVED}" || true
+        fi
+        exit 1
+      fi
+
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
     persona: major-build
-    depends_on: [commit-and-push]
+    depends_on: [commit-hook-terminal]
     task_class: clerical
     load_bearing: true
     bash: |
@@ -3787,7 +3865,12 @@ nodes:
       $war-council-validator.output
       BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023
       )
+      # The first hook failure has no branch output; the successful bounded
+      # retry owns the final branch and refreshed remote lease.
       COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")
+      if [ -f "$ARCHON_NODE_OUT/commit-and-push-retry.out" ]; then
+        COMMIT_PUSH_OUTPUT=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT"; cat "$ARCHON_NODE_OUT/commit-and-push-retry.out")
+      fi
       if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0
@@ -3795,7 +3878,7 @@ nodes:
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: read the unique
       # remote branch the commit-and-push node pushed to; gh pr create must use
       # --head to target that branch rather than the (local) archon/thread-<hash>.
-      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | tail -n 1)
       if [ -z "$UNIQUE_BRANCH" ]; then
         echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
         exit 1
