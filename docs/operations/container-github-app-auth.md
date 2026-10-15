@@ -231,3 +231,19 @@ GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH=
 2. The app currently lacks Issues:write. Issue comments/labels remain on the original user credential via permission fallback unless John separately grants that app permission. Do not change permissions or copy credentials as part of a source repair.
 3. Preserve M-153: review and merge must use distinct identities. The existing dedicated merge PAT remains the merge route, or merge holds if it is absent. Reusing the reviewing App for merge does not satisfy that guard. An optional second BDC App would require John to create it; none is assumed.
 4. XO owns the rebuild and action-time configuration/custody verification after the source merge. The shared App fallback changes effective service routing on that rebuild even without new service-specific environment names. Production authorization, active-work and rollback checks remain separate; this runbook is not execution authority.
+
+### Short-lived CLI command metering
+
+The existing command driver captures gh HTTP diagnostics in memory, consumes
+only response status and quota headers, and discards trace headers/URLs/bodies
+before returning stderr. It persists each observed HTTP response to the existing
+usage tables before exit or the single permission fallback. A command without
+an HTTP response is counted separately as resource `cli` with status0, not as
+a successful API request. Before starting each child it rereads the shared
+pool state for core/graphql/search/cli, so another CLI process cannot ignore a
+recorded exhaustion. This conservative preflight may hold a mixed CLI command
+when any resource in its pool is exhausted. Secondary retry deadlines use
+`backoff:<resource>` state rows without overwriting measured quota remaining.
+Explicit GraphQL integration-permission errors can use the preserved PAT once;
+rate limits and transport failures cannot. No trace or credential values are
+stored by metering. These source changes do not activate credentials or a pool.

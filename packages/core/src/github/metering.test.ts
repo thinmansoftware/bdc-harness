@@ -2,10 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import type { IDatabase, QueryResult } from '../db/adapters/types';
 import {
   assertGitHubPoolAvailable,
+  assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
   recordGitHubApiCall,
   resetGitHubApiMeterForTests,
+  observationFromResponse,
 } from './metering';
+import { SqliteAdapter } from '../db/adapters/sqlite';
 
 afterEach(resetGitHubApiMeterForTests);
 
@@ -89,7 +92,51 @@ describe('Test 3 and Test 6: pool isolation and batched metering', () => {
       });
     await flushGitHubApiMeter(db);
     expect(writes.filter(write => write.sql.includes('github_api_usage'))).toHaveLength(3);
-    expect(writes.filter(write => write.sql.includes('github_api_pool_state'))).toHaveLength(3);
+    expect(writes.filter(write => write.sql.includes('github_api_pool_state'))).toHaveLength(4);
     expect(JSON.stringify(writes)).not.toContain('token');
   });
+});
+
+it('a fresh process sees secondary backoff without corrupting measured quota or blocking other pools', async () => {
+  const db = new SqliteAdapter(':memory:');
+  try {
+    const observation = observationFromResponse(
+      'run_nodes',
+      'shared-app',
+      new Response(null, {
+        status: 429,
+        headers: {
+          'retry-after': '60',
+          'x-ratelimit-resource': 'graphql',
+          'x-ratelimit-remaining': '99',
+          'x-ratelimit-reset': String(Math.floor(Date.now() / 1000) + 3600),
+        },
+      })
+    );
+    recordGitHubApiCall(observation);
+    await flushGitHubApiMeter(db);
+    resetGitHubApiMeterForTests();
+    const measured = await db.query<{ remaining: number }>(
+      'SELECT remaining FROM github_api_pool_state WHERE pool_id = $1 AND resource = $2',
+      ['shared-app', 'graphql']
+    );
+    expect(measured.rows[0]?.remaining).toBe(99);
+    let refused: unknown;
+    try {
+      await assertPersistedGitHubPoolAvailable('shared-app', ['graphql'], db);
+    } catch (error) {
+      refused = error;
+    }
+    expect(String(refused)).toContain('github_pool_backoff');
+    await assertPersistedGitHubPoolAvailable('different-app', ['graphql'], db);
+    await assertPersistedGitHubPoolAvailable('shared-app', ['core'], db);
+    await assertPersistedGitHubPoolAvailable(
+      'shared-app',
+      ['graphql'],
+      db,
+      observation.backoffUntil! + 1
+    );
+  } finally {
+    await db.close();
+  }
 });

@@ -1,12 +1,56 @@
-import { describe, expect, test } from 'bun:test';
-import { runGitHubServiceCommand } from './github-service-exec';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { runGitHubServiceCommand as runCommand } from './github-service-exec';
 import { serviceGitHubCommandEnvironment } from '../packages/core/src/github/service-identity';
 import { generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { resetGitHubApiMeterForTests } from '../packages/core/src/github/metering';
+import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
+
+let db: SqliteAdapter;
+beforeEach(() => {
+  db = new SqliteAdapter(':memory:');
+});
+afterEach(async () => {
+  resetGitHubApiMeterForTests();
+  await db.close();
+});
+const runGitHubServiceCommand = (
+  input: Parameters<typeof runCommand>[0]
+): ReturnType<typeof runCommand> => runCommand({ ...input, db });
 
 describe('operation-scoped GitHub CLI authentication', () => {
+  test('command launch failures are persisted as CLI attempts without a permission retry', async () => {
+    let launches = 0;
+    let caught: unknown;
+    try {
+      await runGitHubServiceCommand({
+        service: 'run_nodes',
+        command: 'synthetic-missing-command',
+        args: [],
+        identity: {
+          kind: 'pat',
+          service: 'run_nodes',
+          token: 'synthetic-pat',
+          poolId: 'user-pat',
+          distinct: false,
+        },
+        execute: () => {
+          launches += 1;
+          throw new Error('synthetic launch failure');
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(String(caught)).toContain('synthetic launch failure');
+    expect(launches).toBe(1);
+    const usage = await db.query<{ calls: number }>(
+      "SELECT calls FROM github_api_usage WHERE resource = 'cli'"
+    );
+    expect(usage.rows[0]?.calls).toBe(1);
+  });
   test('Smart Cauldron override survives the actual container wrapper and keeps PAT fallback', async () => {
     const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 })
       .privateKey.export({ type: 'pkcs8', format: 'pem' })
@@ -97,6 +141,9 @@ describe('operation-scoped GitHub CLI authentication', () => {
       env: {
         PATH: process.env.PATH,
         SystemRoot: process.env.SystemRoot,
+        ARCHON_HOME: process.env.ARCHON_HOME,
+        DATABASE_URL: '',
+        LOG_LEVEL: 'error',
         GH_TOKEN: 'synthetic-pat',
         GITHUB_TOKEN: 'synthetic-pat',
       },
@@ -125,6 +172,9 @@ describe('operation-scoped GitHub CLI authentication', () => {
       env: {
         PATH: process.env.PATH,
         SystemRoot: process.env.SystemRoot,
+        ARCHON_HOME: process.env.ARCHON_HOME,
+        DATABASE_URL: '',
+        LOG_LEVEL: 'error',
         GH_TOKEN: 'synthetic-pat',
         GITHUB_TOKEN: 'synthetic-pat',
       },
@@ -135,7 +185,7 @@ describe('operation-scoped GitHub CLI authentication', () => {
     expect(result.exitCode).toBe(0);
     expect(new TextDecoder().decode(result.stdout)).toBe(payload);
   });
-  for (const reason of ['permission', 'rate_limit', 'transport']) {
+  for (const reason of ['permission', 'graphql_permission', 'rate_limit', 'transport']) {
     test(`preserves parent credentials and retries only permission denial (${reason})`, async () => {
       const parent = { GH_TOKEN: 'original-pat', GITHUB_TOKEN: 'original-pat' };
       const used: string[] = [];
@@ -159,11 +209,13 @@ describe('operation-scoped GitHub CLI authentication', () => {
           used.push(env.GH_TOKEN ?? '');
           const denied = env.GH_TOKEN !== 'original-pat';
           const error =
-            reason === 'permission'
-              ? 'Resource not accessible by integration (HTTP 403)'
-              : reason === 'rate_limit'
-                ? 'API rate limit exceeded (HTTP 403)'
-                : 'connection reset';
+            reason === 'graphql_permission'
+              ? 'GraphQL: Resource not accessible by integration (addComment)'
+              : reason === 'permission'
+                ? 'Resource not accessible by integration (HTTP 403)'
+                : reason === 'rate_limit'
+                  ? 'API rate limit exceeded (HTTP 403)'
+                  : 'connection reset';
           return {
             exitCode: denied ? 1 : 0,
             stdout: new Uint8Array(),
@@ -172,11 +224,22 @@ describe('operation-scoped GitHub CLI authentication', () => {
         },
       };
       await runGitHubServiceCommand(input);
-      expect(used).toEqual(reason === 'permission' ? ['app-1', 'original-pat'] : ['app-1']);
+      expect(used).toEqual(reason.includes('permission') ? ['app-1', 'original-pat'] : ['app-1']);
       expect(parent).toEqual({ GH_TOKEN: 'original-pat', GITHUB_TOKEN: 'original-pat' });
-      await runGitHubServiceCommand(input);
-      expect(mints).toBe(2);
-      expect(used).toContain('app-2');
+      if (reason === 'rate_limit') {
+        let refused: unknown;
+        try {
+          await runGitHubServiceCommand(input);
+        } catch (error) {
+          refused = error;
+        }
+        expect(String(refused)).toContain('github_pool_backoff');
+        expect(mints).toBe(1);
+      } else {
+        await runGitHubServiceCommand(input);
+        expect(mints).toBe(2);
+        expect(used).toContain('app-2');
+      }
     });
   }
 });

@@ -13,6 +13,8 @@ export interface GitHubApiObservation {
   rateLimited?: boolean;
   permissionFallback?: boolean;
   observedAt?: number;
+  /** Secondary-limit retry deadline, distinct from the quota reset header. */
+  backoffUntil?: number;
 }
 
 interface UsageAggregate {
@@ -46,6 +48,12 @@ export function observationFromResponse(
 ): GitHubApiObservation {
   const remaining = finiteHeader(response.headers.get('x-ratelimit-remaining'));
   const reset = finiteHeader(response.headers.get('x-ratelimit-reset'));
+  const retryAfter = response.headers.get('retry-after');
+  const retrySeconds = finiteHeader(retryAfter);
+  const retryDate = retryAfter ? Date.parse(retryAfter) : NaN;
+  const rateLimited =
+    response.status === 429 ||
+    (response.status === 403 && (remaining === 0 || response.headers.has('retry-after')));
   return {
     service,
     poolId,
@@ -54,9 +62,19 @@ export function observationFromResponse(
     limit: finiteHeader(response.headers.get('x-ratelimit-limit')),
     remaining,
     reset,
-    rateLimited:
-      response.status === 429 ||
-      (response.status === 403 && (remaining === 0 || response.headers.has('retry-after'))),
+    rateLimited,
+    ...(rateLimited
+      ? {
+          backoffUntil:
+            retrySeconds !== undefined && retrySeconds >= 0
+              ? Date.now() + retrySeconds * 1000
+              : Number.isFinite(retryDate)
+                ? retryDate
+                : reset
+                  ? reset * 1000
+                  : Date.now() + 60_000,
+        }
+      : {}),
     permissionFallback: extra.permissionFallback,
   };
 }
@@ -88,9 +106,21 @@ export function recordGitHubApiCall(observation: GitHubApiObservation): void {
       observedAt,
     });
   }
-  if (observation.rateLimited && observation.reset) {
-    const until = observation.reset * 1000;
+  if (observation.rateLimited) {
+    const until =
+      observation.backoffUntil ??
+      (observation.reset ? observation.reset * 1000 : observedAt + 60_000);
     backoff.set(`${observation.poolId}|${observation.resource}`, until);
+    // Durable gate in the existing resource-keyed table. Keep measured quota
+    // remaining/reset untouched, including secondary limits with quota left.
+    poolState.set(`${observation.poolId}|backoff:${observation.resource}`, {
+      ...observation,
+      resource: `backoff:${observation.resource}`,
+      limit: undefined,
+      remaining: 0,
+      reset: until / 1000,
+      observedAt,
+    });
   }
   scheduleFlush();
 }
@@ -102,6 +132,28 @@ export function assertGitHubPoolAvailable(
 ): void {
   const until = backoff.get(`${poolId}|${resource}`) ?? 0;
   if (until > now) throw new Error(`github_pool_backoff:${poolId}/${resource}:${until}`);
+}
+
+/** Read shared state afresh: command drivers do not share the server's Map. */
+export async function assertPersistedGitHubPoolAvailable(
+  poolId: string,
+  resources: readonly string[],
+  db: IDatabase = getDatabase(),
+  now = Date.now()
+): Promise<void> {
+  for (const resource of resources) {
+    assertGitHubPoolAvailable(poolId, resource, now);
+    const result = await db.query<{ remaining: number | null; reset_at: string | null }>(
+      'SELECT remaining, reset_at FROM github_api_pool_state WHERE pool_id = $1 AND (resource = $2 OR resource = $3)',
+      [poolId, resource, `backoff:${resource}`]
+    );
+    for (const state of result.rows) {
+      const until = state.reset_at ? Date.parse(state.reset_at) : 0;
+      if (state.remaining === 0 && until > now) {
+        throw new Error(`github_pool_backoff:${poolId}/${resource}:${until}`);
+      }
+    }
+  }
 }
 
 function scheduleFlush(): void {
