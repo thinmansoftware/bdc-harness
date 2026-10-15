@@ -85,6 +85,7 @@ describe('already-satisfied lane wiring', () => {
       'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-haiku.yaml',
       'bdc-feature-development-kimi-k3.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',

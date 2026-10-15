@@ -197,6 +197,7 @@ const REPAIR_COVERAGE_LANES = [
   'bdc-feature-development-fusion-cx-kimi.yaml',
   'bdc-feature-development-fusion-cx-qwen.yaml',
   'bdc-feature-development-grok.yaml',
+  'bdc-feature-development-haiku.yaml',
   'bdc-feature-development-kimi-k3.yaml',
   'bdc-feature-development-zero-claude.yaml',
   'bdc-feature-development-zero-open.yaml',
@@ -811,12 +812,13 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-haiku.yaml',
       'bdc-feature-development-kimi-k3.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
     ].map(file => join(DEFAULTS_DIR, file));
-    expect(lanes).toHaveLength(12);
+    expect(lanes).toHaveLength(13);
     for (const lane of lanes) {
       const yaml = readFileSync(lane, 'utf8');
       expect(yaml).toContain(
@@ -859,12 +861,13 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-haiku.yaml',
       'bdc-feature-development-kimi-k3.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
     ].map(file => join(DEFAULTS_DIR, file));
-    expect(lanes).toHaveLength(12);
+    expect(lanes).toHaveLength(13);
     for (const lane of lanes) {
       const yaml = readFileSync(lane, 'utf8');
       const result = parseWorkflow(yaml, basename(lane));
@@ -1207,8 +1210,8 @@ describe('Spec-authorized repair onto wo and Cauldron task branches', () => {
     };
   }
 
-  it('keeps ordinary and repair guards in source order on all 13 lanes', () => {
-    expect(REPAIR_COVERAGE_LANES).toHaveLength(13);
+  it('keeps ordinary and repair guards in source order on all 14 lanes', () => {
+    expect(REPAIR_COVERAGE_LANES).toHaveLength(14);
     expect(F6A_VALIDATOR).toContain(ORDINARY_BRANCH_PATTERN);
     expect(F6A_VALIDATOR).not.toContain('wo/');
     expect(F6A_VALIDATOR).not.toContain('archon/task-web-worker');
