@@ -33,7 +33,11 @@ import {
 import { listLanePrsForWo, listWosWithMultipleLanePrs } from '@archon/core/db/lane-pr-registry';
 import { execFileAsync } from '@archon/git';
 import { loadLadder } from '@archon/smart-cauldron/ladder';
-import { runPrRepairOwner, type PrRepairOwnerDeps } from './pr-repair-owner';
+import {
+  runPrRepairOwner,
+  resolvePrRepairDedupeWindowHours,
+  type PrRepairOwnerDeps,
+} from './pr-repair-owner';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
   adoptionContentHash,
@@ -801,7 +805,11 @@ export const createGhLaneFetcher = createGhLanePrFetcher;
  * read), the ladder (workflow_name -> entry tier) and runCascade. Pure in tests
  * -- this factory is NEVER called when a fake DAL is injected.
  */
-function createRealPrRepairOwnerDeps(nowMs: number): PrRepairOwnerDeps {
+export function createRealPrRepairOwnerDeps(
+  nowMs: number,
+  expectedEpoch: number,
+  getControl: typeof taskmasterDb.getPauseState = taskmasterDb.getPauseState
+): PrRepairOwnerDeps {
   const fetchPr = createGhLaneFetcher();
   let tierByWorkflow: Map<string, string> | null = null;
   const resolveEntryTier = (workflowName: string | null): string | undefined => {
@@ -819,6 +827,11 @@ function createRealPrRepairOwnerDeps(nowMs: number): PrRepairOwnerDeps {
   return {
     now: () => nowMs,
     fetchPr,
+    dedupeWindowHours: resolvePrRepairDedupeWindowHours(process.env.PR_REPAIR_DEDUPE_WINDOW_HOURS),
+    canApplyEffect: async (): Promise<boolean> => {
+      const fresh = await getControl();
+      return fresh.pause_state === 'RUNNING' && fresh.epoch === expectedEpoch;
+    },
     listWosWithMultipleLanePrs: opts => listWosWithMultipleLanePrs(opts),
     listLanePrsForWo: (woId, opts) => listLanePrsForWo(woId, opts),
     async listQueuedTaskmasterMessages(): Promise<{ id: string; body: string }[]> {
@@ -1792,7 +1805,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   let commitPrRepairExhausted: (() => Promise<void>) | null = null;
   if (control.pause_state === 'RUNNING' && !deps.db) {
     try {
-      const owner = await runPrRepairOwner(createRealPrRepairOwnerDeps(nowMs));
+      const owner = await runPrRepairOwner(createRealPrRepairOwnerDeps(nowMs, epoch));
       prRepairItems = owner.digestItems;
       commitPrRepairExhausted = owner.commitExhausted;
     } catch (error) {

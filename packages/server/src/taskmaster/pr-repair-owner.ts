@@ -38,6 +38,10 @@ import type {
 
 /** Default dedupe lookback window (hours). Overridable via env. */
 export const PR_REPAIR_DEDUPE_WINDOW_HOURS_DEFAULT = 168;
+export function resolvePrRepairDedupeWindowHours(raw: string | undefined): number {
+  const hours = Number(raw);
+  return Number.isFinite(hours) && hours > 0 ? hours : PR_REPAIR_DEDUPE_WINDOW_HOURS_DEFAULT;
+}
 /** At most one repair cascade is fired per tick -- the bounded-fire contract. */
 export const MAX_REPAIR_FIRES_PER_TICK = 1;
 /** At most this many duplicate-PR work orders are swept per tick. */
@@ -92,6 +96,8 @@ export interface PrRepairOwnerDeps {
   dedupeWindowHours?: number;
   /** GitHub PR fetcher (injected; no implicit network). */
   fetchPr: LanePrFetcher;
+  /** Fresh RUNNING state and the captured epoch, immediately before each effect. */
+  canApplyEffect: () => Promise<boolean>;
   /** WOs with 2+ lane-created PRs within the window. */
   listWosWithMultipleLanePrs: (opts: {
     fetchPr: LanePrFetcher;
@@ -310,6 +316,25 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       if (!plan.survivor) continue;
       for (const victim of plan.toClose) {
         try {
+          const survivor = await deps.fetchPr(
+            plan.survivor.owner,
+            plan.survivor.repo,
+            plan.survivor.prNumber
+          );
+          const current = await deps.fetchPr(victim.owner, victim.repo, victim.prNumber);
+          const unchanged = (live: typeof current, prior: LanePr): boolean =>
+            live?.number === prior.prNumber &&
+            live.state === 'OPEN' &&
+            live.headSha === prior.headSha &&
+            live.headRefName === prior.headRef &&
+            live.reviewDecision === prior.reviewDecision;
+          if (
+            !unchanged(survivor, plan.survivor) ||
+            !unchanged(current, victim) ||
+            (current?.reviewDecision ?? '').toUpperCase() === 'APPROVED'
+          )
+            continue;
+          if (!(await deps.canApplyEffect())) break;
           await deps.closePr({
             owner: victim.owner,
             repo: victim.repo,
@@ -357,6 +382,7 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
   let repairsFired = 0;
   for (const { id, candidate } of candidates) {
     if (repairsFired >= MAX_REPAIR_FIRES_PER_TICK) break;
+    if (!(await deps.canApplyEffect())) break;
 
     // Re-prove the LANE PR RULE: the PR must still be lane-created for this WO.
     const lanePrs = await deps.listLanePrsForWo(candidate.woId, {
@@ -428,7 +454,9 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       await addressRefusal(deps, id, 'refused:review_eligibility_changed', log);
       continue;
     }
+    if (!(await deps.canApplyEffect())) break;
     await deps.acknowledgeRow(id);
+    if (!(await deps.canApplyEffect())) break;
     let admitted: ((cascadeId: string) => void) | null = null;
     let rejected: ((error: unknown) => void) | null = null;
     const admission = new Promise<string>((resolve, reject) => {

@@ -10,6 +10,7 @@ import { rootLogger } from '@archon/paths';
 import {
   createTaskmasterState,
   createGhLaneFetcher,
+  createRealPrRepairOwnerDeps,
   defaultFindEffectByIdempotencyKey,
   defaultGetGithubIssueEvidence,
   defaultListThreads,
@@ -4652,4 +4653,21 @@ describe('production repair-owner GitHub fetcher', () => {
     }
     expect((caught as Error)?.message).toBe('github_transient_failure');
   });
+});
+
+test('production repair-owner effect gate reads fresh pause and captured epoch', async () => {
+  let epoch = 5;
+  let pause_state: 'RUNNING' | 'PAUSED' = 'RUNNING';
+  let reads = 0;
+  const deps = createRealPrRepairOwnerDeps(T0, 5, async () => {
+    reads++;
+    return { epoch, pause_state } as never;
+  });
+  expect(await deps.canApplyEffect()).toBe(true);
+  pause_state = 'PAUSED';
+  expect(await deps.canApplyEffect()).toBe(false);
+  pause_state = 'RUNNING';
+  epoch = 6;
+  expect(await deps.canApplyEffect()).toBe(false);
+  expect(reads).toBe(3);
 });

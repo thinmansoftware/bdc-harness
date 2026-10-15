@@ -12,6 +12,7 @@ import { describe, expect, test } from 'bun:test';
 import type { LanePr, WoWithMultipleLanePrs } from '@archon/core/db/lane-pr-registry';
 import {
   buildSupersededComment,
+  resolvePrRepairDedupeWindowHours,
   planDedupe,
   runPrRepairOwner,
   type PrRepairOwnerDeps,
@@ -103,10 +104,12 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
 
   const deps: PrRepairOwnerDeps = {
     now: () => NOW,
+    canApplyEffect: async () => true,
     fetchPr: async (owner, repo, number) => {
-      const pr = Object.values(laneByWo)
-        .flat()
-        .find(value => value.owner === owner && value.repo === repo && value.prNumber === number);
+      const pr = [
+        ...Object.values(laneByWo).flat(),
+        ...(config.dupeWos ?? []).flatMap(entry => entry.prs),
+      ].find(value => value.owner === owner && value.repo === repo && value.prNumber === number);
       return pr
         ? {
             number: pr.prNumber,
@@ -158,6 +161,58 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
 }
 
 describe('review repair regressions', () => {
+  for (const changed of ['victim_approved', 'survivor_closed', 'paused_during_reads']) {
+    test(`close revalidates current eligibility: ${changed}`, async () => {
+      const prs = [lanePr({ prNumber: 1 }), lanePr({ prNumber: 2 })];
+      const { deps, rec } = makeDeps({
+        dupeWos: [{ woId: 'WO-RACE', prs }],
+        laneByWo: { 'WO-RACE': prs },
+      });
+      const fetcher = deps.fetchPr;
+      let running = true;
+      Object.assign(deps, { canApplyEffect: async () => running });
+      deps.fetchPr = async (owner, repo, number) => {
+        const current = await fetcher(owner, repo, number);
+        if (!current) return current;
+        if (changed === 'paused_during_reads') running = false;
+        if (changed === 'victim_approved' && number === 1)
+          return { ...current, reviewDecision: 'APPROVED' };
+        if (changed === 'survivor_closed' && number === 2) return { ...current, state: 'CLOSED' };
+        return current;
+      };
+      await runPrRepairOwner(deps);
+      expect(rec.closed).toHaveLength(0);
+    });
+  }
+  test('pause after acknowledgement prevents cascade admission', async () => {
+    const woId = 'WO-PAUSE';
+    const pr = lanePr({ prNumber: 99 });
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: [pr] },
+      queued: [
+        {
+          id: 'row-pause',
+          body: candidateBody({
+            woId,
+            prNumber: 99,
+            headSha: pr.headSha,
+            headRef: pr.headRef,
+          }),
+        },
+      ],
+    });
+    let running = true;
+    Object.assign(deps, { canApplyEffect: async () => running });
+    const acknowledge = deps.acknowledgeRow;
+    deps.acknowledgeRow = async id => {
+      await acknowledge(id);
+      running = false;
+    };
+    await runPrRepairOwner(deps);
+    expect(rec.fired).toHaveLength(0);
+    expect(rec.addressed).toHaveLength(0);
+  });
+
   test('historical closed duplicates do not consume the five actionable WO slots', async () => {
     const historical = Array.from({ length: 5 }, (_, i) => ({
       woId: `WO-CLOSED-${i}`,
@@ -611,4 +666,12 @@ describe('buildSupersededComment', () => {
         'Runbook: docs/operations/pr-repair-owner.md'
     );
   });
+});
+
+test('dedupe window accepts positive hours and rejects invalid configuration', () => {
+  for (const raw of [undefined, '', '0', '-1', 'bad', 'Infinity']) {
+    expect(resolvePrRepairDedupeWindowHours(raw)).toBe(168);
+  }
+  expect(resolvePrRepairDedupeWindowHours('24')).toBe(24);
+  expect(resolvePrRepairDedupeWindowHours('12.5')).toBe(12.5);
 });
