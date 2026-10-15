@@ -7,6 +7,9 @@ import { parse } from 'yaml';
 import { classifyError } from './classify';
 import { decide } from './decide';
 
+const root = join(import.meta.dir, '../../..');
+const read = (path: string): string => readFileSync(join(root, path), 'utf8');
+
 const hookFailure = `lint-staged\n[FAILED] eslint\npackages/server/src/taskmaster/loop.ts 1419:19 error Missing return type on function @typescript-eslint/explicit-function-return-type\nhusky - pre-commit script failed`;
 
 describe('commit hook repair contract', () => {
@@ -33,44 +36,33 @@ describe('commit hook repair contract', () => {
   });
 
   test('real_hook_repair_roundtrip', () => {
-    const script = readFileSync('.archon/scripts/commit-and-push.sh', 'utf8');
+    const script = read('.archon/scripts/commit-and-push.sh');
     expect(script).toContain('git commit -m');
     expect(script).toContain('commit-hook-output.txt');
   });
 
   test('second_failure_does_not_loop', () => {
-    const lane = readFileSync(
-      '.archon/workflows/defaults/bdc-feature-development-codex.yaml',
-      'utf8'
-    );
+    const lane = read('.archon/workflows/defaults/bdc-feature-development-codex.yaml');
     expect(lane).toContain('.archon/scripts/commit-and-push.sh 1');
     expect(lane).toContain('.archon/scripts/commit-and-push.sh 2');
     expect(lane).not.toContain('.archon/scripts/commit-and-push.sh 3');
   });
 
   test('lane_yaml_structure_has_one_bounded_repair', () => {
-    const lane = readFileSync(
-      '.archon/workflows/defaults/bdc-feature-development-codex.yaml',
-      'utf8'
-    );
+    const lane = read('.archon/workflows/defaults/bdc-feature-development-codex.yaml');
     expect(lane.match(/id: commit-hook-repair/g)?.length).toBe(1);
     expect(lane).toContain('OPUS_REPAIR=fixed');
   });
 
   test('unpushed_repair_makes_open_pr_draft', () => {
-    const lane = readFileSync(
-      '.archon/workflows/defaults/bdc-feature-development-codex.yaml',
-      'utf8'
-    );
+    const lane = read('.archon/workflows/defaults/bdc-feature-development-codex.yaml');
     expect(lane).toContain('gh pr ready "$PR"');
     expect(lane).toContain('NOT pushed');
   });
 
   for (const repairState of ['needs_human', 'classification_failed', 'retry_failed', 'pushed']) {
     test(`terminal_hook_handling_${repairState}`, () => {
-      const lane = parse(
-        readFileSync('.archon/workflows/defaults/bdc-feature-development-codex.yaml', 'utf8')
-      ) as {
+      const lane = parse(read('.archon/workflows/defaults/bdc-feature-development-codex.yaml')) as {
         nodes: {
           id: string;
           bash?: string;

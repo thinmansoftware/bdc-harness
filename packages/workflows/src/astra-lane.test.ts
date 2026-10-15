@@ -44,6 +44,7 @@ const codexOnlyRecoveryIds = new Set([
   'commit-hook-repair',
   'classify-commit-hook-repair',
   'commit-and-push-retry',
+  'commit-hook-terminal',
 ]);
 const baselineNodesForAstra = baseline.nodes
   .filter(node => !codexOnlyRecoveryIds.has(node.id))
