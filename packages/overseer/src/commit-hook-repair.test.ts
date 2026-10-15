@@ -160,6 +160,50 @@ describe('commit hook repair contract', () => {
       rmSync(fixture.directory, { recursive: true, force: true });
     }
   });
+  test('a successful clean initial push skips the real retry node and an empty path record is valid', () => {
+    const fixture = hookFixture();
+    try {
+      writeFileSync(
+        join(fixture.repo, 'fixture.ts'),
+        'export function value(): number { return 1; }\n'
+      );
+      for (const args of [
+        ['add', '.'],
+        ['commit', '-m', 'bootstrap'],
+      ]) {
+        const result = spawnSync('git', args, {
+          cwd: fixture.repo,
+          encoding: 'utf8',
+          windowsHide: true,
+          timeout: 15000,
+        });
+        expect(result.status).toBe(0);
+      }
+      expect(fixture.run(1).status).toBe(0);
+      const paths = join(fixture.artifacts, 'commit-hook-staged-paths.nul');
+      expect(readFileSync(paths).length).toBe(0);
+      const lane = parse(read('.archon/workflows/defaults/bdc-feature-development-codex.yaml')) as {
+        nodes: { id: string; bash?: string }[];
+      };
+      const retry = lane.nodes.find(node => node.id === 'commit-and-push-retry')?.bash;
+      expect(retry).toBeDefined();
+      const result = spawnSync(
+        'bash',
+        ['-c', `export ARTIFACTS_DIR='${fixture.artifacts.replaceAll('\\', '/')}';\n${retry}`],
+        { encoding: 'utf8', windowsHide: true, timeout: 10000 }
+      );
+      expect(result.status).toBe(0);
+      expect(readFileSync(join(fixture.artifacts, 'commit-hook-attempt.txt'), 'utf8').trim()).toBe(
+        '1'
+      );
+      // A deliberate replay with no paths is a valid no-op; an absent record is not.
+      expect(fixture.run(2).status).toBe(0);
+      rmSync(paths);
+      expect(fixture.run(2).status).toBe(1);
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
 
   test('second_failure_does_not_loop', () => {
     const lane = read('.archon/workflows/defaults/bdc-feature-development-codex.yaml');

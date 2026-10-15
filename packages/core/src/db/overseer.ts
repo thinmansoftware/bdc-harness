@@ -445,6 +445,59 @@ export async function reviseOverseerReviewVerdict(input: {
   );
 }
 
+/** Keep negative review evidence outside a merge claim's mutable verdict row. */
+export async function recordUnverifiedApprovalEvidence(input: {
+  runId: string;
+  headSha: string;
+  prUrl: string;
+  reviewId: string;
+}): Promise<boolean> {
+  const evidenceRun = `${input.runId}:unverified:${input.reviewId}`;
+  await ensureDiscoveryRunRow(evidenceRun);
+  const db = getDatabase();
+  await db.query(
+    `INSERT INTO overseer_verdicts
+      (id,run_id,wo_id,head_sha,status,verdict,proposed_action,pr_url,evidence)
+     VALUES ($1,$2,$3,$4,'verdict','approved_unverified','none',$5,$6)
+     ON CONFLICT (run_id,head_sha) DO NOTHING`,
+    [
+      randomUUID(),
+      evidenceRun,
+      input.runId,
+      input.headSha,
+      input.prUrl,
+      JSON.stringify({
+        disposition: 'approved_unverified',
+        reviewId: input.reviewId,
+        headSha: input.headSha,
+        prUrl: input.prUrl,
+      }),
+    ]
+  );
+  const existing = await db.query<{ verdict: string }>(
+    'SELECT verdict FROM overseer_verdicts WHERE run_id=$1 AND head_sha=$2',
+    [evidenceRun, input.headSha]
+  );
+  // A redelivery of an observation already resolved by a verified retry cannot
+  // turn that old observation back into a fresh negative.
+  return existing.rows[0]?.verdict === 'approved_unverified';
+}
+
+export async function resolveUnverifiedApprovalEvidence(input: {
+  runId: string;
+  headSha: string;
+  prUrl: string;
+}): Promise<void> {
+  const prefix = `${input.runId}:unverified:`;
+  await getDatabase().query(
+    `UPDATE overseer_verdicts SET verdict='approval_verified', updated_at=$4
+     WHERE substr(run_id,1,length($1))=$1 AND head_sha=$2 AND pr_url=$3
+       AND status='verdict' AND verdict='approved_unverified'
+       AND proposed_action='none'`,
+    [prefix, input.headSha, input.prUrl, new Date().toISOString()]
+  );
+}
+
 export async function deferVerdictClaimForMergeExecution(
   verdictId: string,
   reason: string,

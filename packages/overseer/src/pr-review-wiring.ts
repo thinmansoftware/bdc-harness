@@ -21,6 +21,8 @@ import {
   claimOverseerVerdict,
   finalizeOverseerVerdict,
   reviseOverseerReviewVerdict,
+  recordUnverifiedApprovalEvidence,
+  resolveUnverifiedApprovalEvidence,
 } from '@archon/core/db/overseer';
 import { createLogger } from '@archon/paths';
 import {
@@ -85,6 +87,8 @@ interface ReviewApprovalVerdictDeps {
   claimVerdict: typeof claimOverseerVerdict;
   finalizeVerdict: typeof finalizeOverseerVerdict;
   reviseVerdict?: typeof reviseOverseerReviewVerdict;
+  persistUnverifiedEvidence: typeof recordUnverifiedApprovalEvidence;
+  resolveUnverifiedEvidence: typeof resolveUnverifiedApprovalEvidence;
 }
 
 export async function recordReviewApprovalVerdict(
@@ -93,6 +97,7 @@ export async function recordReviewApprovalVerdict(
     repo: string;
     prNumber: number;
     headSha: string;
+    messageId?: string;
     model?: string;
     disposition?: string;
   },
@@ -100,9 +105,22 @@ export async function recordReviewApprovalVerdict(
     claimVerdict: claimOverseerVerdict,
     finalizeVerdict: finalizeOverseerVerdict,
     reviseVerdict: reviseOverseerReviewVerdict,
+    persistUnverifiedEvidence: recordUnverifiedApprovalEvidence,
+    resolveUnverifiedEvidence: resolveUnverifiedApprovalEvidence,
   }
 ): Promise<void> {
   const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
+  const prUrl = `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`;
+  const evidence = { runId, headSha: input.headSha, prUrl };
+  const unverified = input.disposition === 'approved_unverified';
+  if (
+    unverified &&
+    !(await deps.persistUnverifiedEvidence({
+      ...evidence,
+      reviewId: input.messageId ?? 'legacy',
+    }))
+  )
+    return;
   const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
   if (!claim.claimed || !claim.verdictId) {
     await deps.reviseVerdict?.({
@@ -110,6 +128,7 @@ export async function recordReviewApprovalVerdict(
       headSha: input.headSha,
       unverified: input.disposition === 'approved_unverified',
     });
+    if (!unverified) await deps.resolveUnverifiedEvidence(evidence);
     return;
   }
   await deps.finalizeVerdict({
@@ -119,8 +138,9 @@ export async function recordReviewApprovalVerdict(
       input.disposition === 'approved_unverified' ? 'approved_unverified' : 'merge_candidate',
     proposedAction: input.disposition === 'approved_unverified' ? 'none' : 'flag_merge_ready',
     model: input.model,
-    prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+    prUrl,
   });
+  if (!unverified) await deps.resolveUnverifiedEvidence(evidence);
 }
 
 export async function maybeRecordReviewApprovalVerdict(
@@ -130,6 +150,7 @@ export async function maybeRecordReviewApprovalVerdict(
     repo: string;
     prNumber: number;
     headSha: string;
+    messageId?: string;
     model?: string;
   },
   options: {

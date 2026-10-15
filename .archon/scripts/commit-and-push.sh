@@ -7,6 +7,9 @@ artifacts_dir="${ARTIFACTS_DIR:?ARTIFACTS_DIR required}"
 message="${COMMIT_MESSAGE:-feat: ${WO_ID:-work order} implementation}"
 mkdir -p "$artifacts_dir"
 printf '%s\n' "$attempt" > "$artifacts_dir/commit-hook-attempt.txt"
+if [ "$attempt" = 1 ]; then
+  rm -f "$artifacts_dir/commit-and-push.succeeded"
+fi
 
 staged_paths_file="$artifacts_dir/commit-hook-staged-paths.nul"
 if [ "$attempt" = 1 ]; then
@@ -15,7 +18,7 @@ if [ "$attempt" = 1 ]; then
     git diff --cached --name-only -z
     git ls-files --others --exclude-standard -z
   } | sort -zu > "$staged_paths_file"
-elif [ ! -s "$staged_paths_file" ]; then
+elif [ ! -f "$staged_paths_file" ]; then
   echo "ERROR: initial path record missing; refusing to stage unrelated retry files" >&2
   exit 1
 fi
@@ -52,4 +55,5 @@ local_head="$(git rev-parse HEAD)"
   exit 1
 }
 echo "VERIFIED: origin/${unique_branch} == local HEAD (${local_head})"
+printf '%s\n' "$local_head" > "$artifacts_dir/commit-and-push.succeeded"
 echo "unique_branch=${unique_branch}"

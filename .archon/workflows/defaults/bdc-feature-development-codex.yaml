@@ -3803,6 +3803,9 @@ nodes:
     load_bearing: true
     bash: |
       set -euo pipefail
+      if [ -f "$ARTIFACTS_DIR/commit-and-push.succeeded" ]; then
+        exit 0
+      fi
       source "$ARTIFACTS_DIR/commit-and-push.env"
       export UNIQUE_BRANCH COMMIT_MESSAGE REPAIR_TARGET_LEASE_SHA
       .archon/scripts/commit-and-push.sh 2

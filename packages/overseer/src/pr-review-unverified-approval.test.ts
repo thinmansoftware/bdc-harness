@@ -157,6 +157,7 @@ describe('unverified approval persistence and execution', () => {
     );
     expect(rows.rows).toEqual([
       expect.objectContaining({ verdict: 'approved_unverified', proposed_action: 'none' }),
+      expect.objectContaining({ verdict: 'approved_unverified', proposed_action: 'none' }),
     ]);
   });
 
@@ -187,9 +188,47 @@ describe('unverified approval persistence and execution', () => {
     const result = await bridge();
     expect(result.merges).toBe(1);
     const rows = await db.query<{ mutation_sent: number }>(
-      'SELECT mutation_sent FROM overseer_verdicts'
+      "SELECT mutation_sent FROM overseer_verdicts WHERE proposed_action='flag_merge_ready'"
     );
     expect(rows.rows[0].mutation_sent).toBe(1);
+  });
+  test('unverified evidence survives a processing merge claim and a verified retry resolves it', async () => {
+    await recordReviewApprovalVerdict({ ...work, disposition: 'approved' });
+    const candidate = await db.query<{ id: string }>(
+      "SELECT id FROM overseer_verdicts WHERE proposed_action='flag_merge_ready'"
+    );
+    expect(await verdictStore.claimVerdictForMergeExecution(candidate.rows[0].id)).toBe(true);
+    await recordReviewApprovalVerdict({
+      ...work,
+      messageId: 'negative-review',
+      disposition: 'approved_unverified',
+    });
+    const claimed = await db.query<{ action_reason: string }>(
+      'SELECT action_reason FROM overseer_verdicts WHERE id=$1',
+      [candidate.rows[0].id]
+    );
+    expect(claimed.rows[0].action_reason).toBe('processing');
+    const original = {
+      run_id: `pr-discovery:thinmansoftware/bdc-harness#55`,
+      head_sha: head,
+      pr_url: prUrl,
+    } as verdictStore.OverseerVerdictRow;
+    expect(await verdictStore.hasUnverifiedApprovalForHead(original)).toBe(true);
+    await verdictStore.releaseVerdictClaimForMergeExecution(candidate.rows[0].id, 'test_release');
+    expect((await bridge()).merges).toBe(0);
+    await recordReviewApprovalVerdict({
+      ...work,
+      messageId: 'verified-retry',
+      disposition: 'approved',
+    });
+    expect(await verdictStore.hasUnverifiedApprovalForHead(original)).toBe(false);
+    await recordReviewApprovalVerdict({
+      ...work,
+      messageId: 'negative-review',
+      disposition: 'approved_unverified',
+    });
+    expect(await verdictStore.hasUnverifiedApprovalForHead(original)).toBe(false);
+    expect((await bridge()).merges).toBe(1);
   });
 
   test('first_unverified_triggers_exactly_one_re_review', async () => {
