@@ -1,7 +1,58 @@
-import { describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
 import { serviceGitHubFetchWithPermissionFallback } from './request';
-import { flushGitHubApiMeter, resetGitHubApiMeterForTests } from './metering';
+import {
+  assertGitHubPoolAvailable,
+  recordGitHubApiCall,
+  flushGitHubApiMeter,
+  resetGitHubApiMeterForTests,
+} from './metering';
+
+afterEach(resetGitHubApiMeterForTests);
+
+it('consults the fallback PAT search pool before sending a permission retry', async () => {
+  resetGitHubApiMeterForTests();
+  recordGitHubApiCall({
+    service: 'overseer',
+    poolId: 'user-pat',
+    resource: 'search',
+    status: 403,
+    rateLimited: true,
+    reset: Math.floor(Date.now() / 1000) + 60,
+  });
+  const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+    .privateKey.export({ type: 'pkcs8', format: 'pem' })
+    .toString();
+  let requests = 0;
+  let failure: unknown;
+  try {
+    await serviceGitHubFetchWithPermissionFallback({
+      service: 'duty_officer',
+      url: 'https://api.github.com/search/issues',
+      identity: {
+        kind: 'app',
+        service: 'duty_officer',
+        appId: '3',
+        installationId: '4',
+        privateKey: key,
+        poolId: 'app-3-4',
+        distinct: true,
+      },
+      fallbackToken: 'synthetic',
+      fetch: (async (url: string | URL | Request) => {
+        if (String(url).includes('/access_tokens'))
+          return Response.json({ token: 'synthetic-app' });
+        requests += 1;
+        return new Response('Resource not accessible by integration', { status: 403 });
+      }) as typeof fetch,
+    });
+  } catch (error) {
+    failure = error;
+  }
+  expect((failure as Error)?.message).toContain('user-pat/search');
+  expect(requests).toBe(1);
+  expect(() => assertGitHubPoolAvailable('app-3-4', 'search')).not.toThrow();
+});
 
 describe('Test 5: App permission fallback', () => {
   it('retries one call through PAT and records the fallback', async () => {

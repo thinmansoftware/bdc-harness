@@ -20,7 +20,9 @@ describe('Test 2: service GitHub identity precedence', () => {
     expect(resolveServiceGitHubAuth('overseer', env).poolId).toBe('app-1-2');
     expect(resolveServiceGitHubAuth('pr_discovery', env).poolId).toBe('app-1-2');
     expect(resolveServiceGitHubAuth('merge_manager', env).poolId).toBe('merge-manager-pat');
-    expect(resolveServiceGitHubAuth('taskmaster', env).poolId).toBe('user-pat');
+    for (const service of ['taskmaster', 'duty_officer', 'smart_cauldron', 'run_nodes'] as const) {
+      expect(resolveServiceGitHubAuth(service, env).poolId).toBe('app-1-2');
+    }
   });
 
   it('uses the taskmaster alias family, an own override, and throws on partial trios', () => {

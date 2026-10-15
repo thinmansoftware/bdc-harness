@@ -14,10 +14,10 @@ export const SERVICE_GITHUB_AUTH_PRECEDENCE = {
   overseer: ['service_app', 'shared_overseer_app', 'pat'],
   pr_discovery: ['service_app', 'shared_overseer_app', 'pat'],
   merge_manager: ['service_app', 'merge_manager_pat', 'hold'],
-  taskmaster: ['service_app', 'taskmaster_app_alias', 'pat'],
-  duty_officer: ['service_app', 'taskmaster_app_alias', 'pat'],
-  smart_cauldron: ['service_app', 'taskmaster_app_alias', 'pat'],
-  run_nodes: ['service_app', 'taskmaster_app_alias', 'pat'],
+  taskmaster: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
+  duty_officer: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
+  smart_cauldron: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
+  run_nodes: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
 } as const satisfies Record<GitHubService, readonly string[]>;
 
 export interface GitHubAppIdentity {
@@ -127,6 +127,8 @@ export function resolveServiceGitHubAuth(
 
   const alias = resolveApp('GITHUB_APP_TASKMASTER_', service, env);
   if (alias) return alias;
+  const shared = resolveApp('GITHUB_APP_', service, env);
+  if (shared) return shared;
   const token =
     service === 'duty_officer'
       ? (env.GH_TOKEN ?? env.GITHUB_TOKEN ?? '')

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import type { IDatabase, QueryResult } from '../db/adapters/types';
 import {
   assertGitHubPoolAvailable,
@@ -6,6 +6,45 @@ import {
   recordGitHubApiCall,
   resetGitHubApiMeterForTests,
 } from './metering';
+
+afterEach(resetGitHubApiMeterForTests);
+
+it('concurrent flushes retain calls arriving during a transaction exactly once', async () => {
+  resetGitHubApiMeterForTests();
+  const persisted: number[] = [];
+  let release: (() => void) | undefined;
+  const blocked = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  let transactions = 0;
+  const query = async <T>(sql: string, params?: unknown[]): Promise<QueryResult<T>> => {
+    if (sql.includes('github_api_usage')) persisted.push(Number(params?.[4]));
+    return { rows: [], rowCount: 1 };
+  };
+  const db = {
+    query,
+    withTransaction: async (fn: Parameters<IDatabase['withTransaction']>[0]) => {
+      transactions += 1;
+      if (transactions === 1) await blocked;
+      return fn(query);
+    },
+  } as IDatabase;
+  const observation = {
+    service: 'overseer' as const,
+    poolId: 'app',
+    resource: 'core',
+    status: 200,
+  };
+  recordGitHubApiCall(observation);
+  const first = flushGitHubApiMeter(db);
+  recordGitHubApiCall(observation);
+  const second = flushGitHubApiMeter(db);
+  expect(transactions).toBe(1);
+  release?.();
+  await Promise.all([first, second]);
+  expect(persisted).toEqual([1, 1]);
+  expect(transactions).toBe(2);
+});
 
 describe('Test 3 and Test 6: pool isolation and batched metering', () => {
   beforeEach(resetGitHubApiMeterForTests);

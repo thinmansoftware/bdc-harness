@@ -30,6 +30,7 @@ const poolState = new Map<string, GitHubApiObservation>();
 const backoff = new Map<string, number>();
 let lastFlushAt = 0;
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let flushInFlight: Promise<void> | null = null;
 
 function finiteHeader(value: string | null): number | undefined {
   if (value === null || value.trim() === '') return undefined;
@@ -114,6 +115,18 @@ function scheduleFlush(): void {
 }
 
 export async function flushGitHubApiMeter(db: IDatabase = getDatabase()): Promise<void> {
+  while (flushInFlight) await flushInFlight.catch(() => undefined);
+  if (usage.size === 0 && poolState.size === 0) return;
+  const operation = flushBatch(db);
+  flushInFlight = operation;
+  try {
+    await operation;
+  } finally {
+    if (flushInFlight === operation) flushInFlight = null;
+  }
+}
+
+async function flushBatch(db: IDatabase): Promise<void> {
   if (flushTimer) clearTimeout(flushTimer);
   flushTimer = null;
   const usageRows = [...usage.values()];
@@ -171,7 +184,10 @@ export async function flushGitHubApiMeter(db: IDatabase = getDatabase()): Promis
         current.permissionFallbacks += row.permissionFallbacks;
       } else usage.set(key, row);
     }
-    for (const row of stateRows) poolState.set(`${row.poolId}|${row.resource}`, row);
+    for (const row of stateRows) {
+      const key = `${row.poolId}|${row.resource}`;
+      if ((poolState.get(key)?.observedAt ?? 0) <= (row.observedAt ?? 0)) poolState.set(key, row);
+    }
     throw error;
   }
 }

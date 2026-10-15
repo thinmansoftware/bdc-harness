@@ -27,7 +27,11 @@ export function isAppPermissionDenied(response: Response, body: string): boolean
 
 export async function serviceGitHubFetch(options: ServiceGitHubRequestOptions): Promise<Response> {
   const identity = options.identity ?? resolveServiceGitHubAuth(options.service);
-  assertGitHubPoolAvailable(identity.poolId, options.resource ?? 'core');
+  const path = new URL(String(options.url), 'https://api.github.com').pathname;
+  const resource =
+    options.resource ??
+    (path === '/graphql' ? 'graphql' : path.startsWith('/search/') ? 'search' : 'core');
+  assertGitHubPoolAvailable(identity.poolId, resource);
   const token = await getServiceGitHubToken(identity, { fetch: options.fetch });
   const headers = new Headers(options.init?.headers);
   if (token) headers.set('authorization', `Bearer ${token}`);

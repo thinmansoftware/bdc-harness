@@ -192,16 +192,22 @@ partially configured App step throws and names the missing variables.
 |---|---|
 | overseer, pr_discovery | service App; shared `GITHUB_APP_*`; existing PAT |
 | merge_manager | `GITHUB_APP_MERGE_MANAGER_*`; `MERGE_MANAGER_GH_TOKEN`; hold |
-| taskmaster | service App; `GITHUB_APP_TASKMASTER_*`; existing PAT |
-| duty_officer, smart_cauldron, run_nodes | service App; `GITHUB_APP_TASKMASTER_*` alias; existing PAT |
+| taskmaster | service App; `GITHUB_APP_TASKMASTER_*`; shared `GITHUB_APP_*`; existing PAT |
+| duty_officer, smart_cauldron, run_nodes | service App; `GITHUB_APP_TASKMASTER_*` alias; shared `GITHUB_APP_*`; existing PAT |
 
 The supported override is
 `GITHUB_APP_<SERVICE>_{ID,INSTALLATION_ID,PRIVATE_KEY_PATH}` (or
 `PRIVATE_KEY`). The Taskmaster trio is an explicit alias for Duty Officer,
-Smart Cauldron, and run nodes. Those services never use the Overseer App.
+Smart Cauldron, and run nodes. The default BDC deployment uses the ONE shared
+thinman-overseer App (4574893, installation153295654) for these services too.
 Merge Manager never uses the reviewing Overseer App or shared user PAT.
 
-With none of the new names set, identities are unchanged. Quota backoff is
+Existing shared App configuration becomes eligible for those services after
+the reviewed rebuild; activation must therefore verify this routing change.
+CLI commands resolve credentials per operation through the existing merge guard;
+git's credential helper also resolves at operation time. Parent PAT environment
+values are preserved, and only an explicitly permission-denied CLI call retries
+on the original PAT. Quota backoff is
 shared by `(pool_id, resource)`, so services on one installation share fate
 while `core`, `search`, and `graphql` remain independent. Calls and latest quota
 state are metered by service. An App 403 containing "Resource not accessible by
@@ -221,7 +227,7 @@ GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH=
 
 ### HUMAN-STEPS
 
-1. Confirm that XO/the host already holds a private key for thinmangithub (App 4572556). The only key file found in the reference directory is the thinman-overseer one. If none exists: GitHub org Settings, Developer settings, GitHub Apps, thinmangithub, "Generate a private key", and save the .pem straight to the Hetzner host at /opt/bdc/archon/secrets/thinmangithub-app.private-key.pem with mode 0600. Never paste key contents into chat, an issue, or git.
-2. Check thinmangithub's permissions include Contents RW, Pull requests RW and Issues RW (it lists them today, access level unverified) and that it is allowed to merge into protected bases (allowed merge actor or bypass actor, John's call, because merge must stay a different actor than the reviewing Overseer App per M-153). Optional: if John prefers Overseer also to read issues, add Issues Read to thinman-overseer (App settings, Permissions); not required.
-3. Set these env var NAMES in the archon .env on the host (values are the ids and the in-container key path, none are secret except the key file itself): GITHUB_APP_MERGE_MANAGER_ID=4572556, GITHUB_APP_MERGE_MANAGER_INSTALLATION_ID=153246775, GITHUB_APP_MERGE_MANAGER_PRIVATE_KEY_PATH, GITHUB_APP_TASKMASTER_ID=4572556, GITHUB_APP_TASKMASTER_INSTALLATION_ID=153246775, GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH (this one trio is the documented alias also used by duty_officer, smart_cauldron and run_nodes; a GITHUB_APP_<SERVICE>_* trio overrides it for that service). Overseer and pr_discovery keep the existing GITHUB_APP_ID trio unchanged.
-4. XO rebuilds archon-app-1 after the harness merge (M-181 plan) and notifies John; nothing activates until the env names are set, so merging the code first is safe.
+1. Do not use thinmangithub (4572556): it belongs to Vercel, not BDC. No BDC key-generation step exists for it. XO reports the existing thinman-overseer installation pool measured15000/hour after the enterprise upgrade; it is one shared pool, not15000 per service. Recheck capacity with a real authenticated call before activation.
+2. The app currently lacks Issues:write. Issue comments/labels remain on the original user credential via permission fallback unless John separately grants that app permission. Do not change permissions or copy credentials as part of a source repair.
+3. Preserve M-153: review and merge must use distinct identities. The existing dedicated merge PAT remains the merge route, or merge holds if it is absent. Reusing the reviewing App for merge does not satisfy that guard. An optional second BDC App would require John to create it; none is assumed.
+4. XO owns the rebuild and action-time configuration/custody verification after the source merge. The shared App fallback changes effective service routing on that rebuild even without new service-specific environment names. Production authorization, active-work and rollback checks remain separate; this runbook is not execution authority.

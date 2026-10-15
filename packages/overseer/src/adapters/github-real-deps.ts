@@ -2,7 +2,11 @@ import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
 import { resolveServiceGitHubAuth, type GitHubService } from '@archon/core/github/service-identity';
-import { observationFromResponse, recordGitHubApiCall } from '@archon/core/github/metering';
+import {
+  assertGitHubPoolAvailable,
+  observationFromResponse,
+  recordGitHubApiCall,
+} from '@archon/core/github/metering';
 import type {
   DiscoveredPullRequest,
   GitHubClientDeps,
@@ -579,6 +583,7 @@ export function resolveGitHubAppAuth(): GitHubAppAuthConfig | null {
   } catch (error) {
     if (
       error instanceof Error &&
+      error.message.startsWith('github_app_auth_incomplete:') &&
       error.message.includes('GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_PATH')
     ) {
       throw new Error(
@@ -691,6 +696,47 @@ export function resolveRealOctokitAuthOptions(): RealOctokitAuthOptions {
  * App env vars are complete (attributing API calls to thinman-overseer[bot]),
  * otherwise falls back to the GH_TOKEN/GITHUB_TOKEN PAT path unchanged.
  */
+export function attachGitHubQuotaHooks(
+  client: Octokit,
+  service: GitHubService,
+  poolId: string
+): void {
+  const record = (response: {
+    status: number;
+    headers: Record<string, string | number | undefined>;
+  }): void => {
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(response.headers)) {
+      if (value !== undefined) headers.set(name, String(value));
+    }
+    recordGitHubApiCall(
+      observationFromResponse(
+        service,
+        poolId,
+        new Response(null, { status: response.status, headers })
+      )
+    );
+  };
+  client.hook.before('request', options => {
+    const resource = options.url.includes('/graphql')
+      ? 'graphql'
+      : options.url.includes('/search/')
+        ? 'search'
+        : 'core';
+    assertGitHubPoolAvailable(poolId, resource);
+  });
+  client.hook.after('request', response => {
+    record(response);
+  });
+  client.hook.error('request', error => {
+    const failure = error as Error & {
+      response?: { status: number; headers: Record<string, string | number | undefined> };
+    };
+    if (failure.response) record(failure.response);
+    throw error;
+  });
+}
+
 export function createRealOctokitClient(
   service: Extract<GitHubService, 'overseer' | 'pr_discovery'> = 'overseer'
 ): RealGitHubOctokitLike {
@@ -707,19 +753,7 @@ export function createRealOctokitClient(
         }
       : { auth: identity.kind === 'pat' ? identity.token : resolveGitHubToken() };
   const client = new Octokit(options);
-  client.hook.after('request', response => {
-    const headers = new Headers();
-    for (const [name, value] of Object.entries(response.headers)) {
-      if (value !== undefined) headers.set(name, String(value));
-    }
-    recordGitHubApiCall(
-      observationFromResponse(
-        service,
-        identity.poolId,
-        new Response(null, { status: response.status, headers })
-      )
-    );
-  });
+  attachGitHubQuotaHooks(client, service, identity.poolId);
   return client as unknown as RealGitHubOctokitLike;
 }
 
@@ -734,7 +768,9 @@ export function createRealOctokitClient(
 export function createRealReadOnlyPatOctokitClient(): RealGitHubOctokitLike | null {
   const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
   if (!token) return null;
-  return new Octokit({ auth: token }) as unknown as RealGitHubOctokitLike;
+  const client = new Octokit({ auth: token });
+  attachGitHubQuotaHooks(client, 'overseer', 'user-pat');
+  return client as unknown as RealGitHubOctokitLike;
 }
 
 /**
@@ -766,18 +802,7 @@ export function createRealMergeOctokitClient(): RealGitHubOctokitLike {
         }
       : { auth: identity.token };
   const client = new Octokit(options);
-  client.hook.after('request', response => {
-    const headers = new Headers();
-    for (const [name, value] of Object.entries(response.headers))
-      if (value !== undefined) headers.set(name, String(value));
-    recordGitHubApiCall(
-      observationFromResponse(
-        'merge_manager',
-        identity.poolId,
-        new Response(null, { status: response.status, headers })
-      )
-    );
-  });
+  attachGitHubQuotaHooks(client, 'merge_manager', identity.poolId);
   return client as unknown as RealGitHubOctokitLike;
 }
 
