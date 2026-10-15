@@ -467,3 +467,17 @@ Recipients that are mailboxes:
   then acts in its own thread and acks/addresses the row as `astra`. Because
   `astra` is `drain_on_start`, the desktop dispatch worker's generic `codex`
   leg can never claim it -- the message reaches only the Astra seat.
+
+## Codex CLI minimum for GPT-6 (WO-HARNESS-CODEX-CLI-GPT6-BUMP-01)
+
+The executable selected by the existing worker Codex command must report
+`codex-cli 0.155.0` or newer. Check that exact executable with `--version`
+before enabling a GPT-6 lane. The container SDK is pinned to `0.155.1`; for
+the worker, the operator can install the same stable pin with
+`npm i -g @openai/codex@0.155.1`. Do not point the worker at a Desktop
+hash-named installation directory, which changes across Desktop updates.
+This source repair does not update the machine-local config, install a
+global CLI, restart a worker, or establish runtime/model acceptance. XO
+records the existing WO runtime stops after the separately governed rebuild
+and operator update. The newer Desktop CLI result is not proof about the
+container or the worker executable.
