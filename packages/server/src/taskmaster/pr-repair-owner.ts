@@ -286,35 +286,42 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     await deps.listWosWithMultipleLanePrs({ fetchPr: deps.fetchPr, withinHours, now })
   ).slice(0, MAX_DEDUPE_WOS_PER_TICK);
   for (const entry of dupeWos) {
-    const plan = planDedupe(entry.prs);
-    if (!plan.survivor) continue;
-    for (const victim of plan.toClose) {
-      try {
-        await deps.closePr({
-          owner: victim.owner,
-          repo: victim.repo,
-          prNumber: victim.prNumber,
-          comment: buildSupersededComment(plan.survivor.prNumber, entry.woId),
-        });
-        closedPrs += 1;
-        log('pr_repair.dedupe_closed', {
-          woId: entry.woId,
-          closed: victim.prNumber,
-          survivor: plan.survivor.prNumber,
-        });
-      } catch (error) {
-        log('pr_repair.dedupe_close_failed', {
-          woId: entry.woId,
-          prNumber: victim.prNumber,
-          error: (error as Error).message,
-        });
-      }
+    const repositories = new Map<string, LanePr[]>();
+    for (const pr of entry.prs) {
+      const key = `${pr.owner}/${pr.repo}`.toLowerCase();
+      repositories.set(key, [...(repositories.get(key) ?? []), pr]);
     }
-    for (const approved of plan.approvedNonSurvivors) {
-      digestItems.push(
-        `${slug(approved.owner, approved.repo, approved.prNumber)} ${entry.woId} ` +
-          `dedupe_needs_human (survivor #${plan.survivor.prNumber})`
-      );
+    for (const prs of repositories.values()) {
+      const plan = planDedupe(prs);
+      if (!plan.survivor) continue;
+      for (const victim of plan.toClose) {
+        try {
+          await deps.closePr({
+            owner: victim.owner,
+            repo: victim.repo,
+            prNumber: victim.prNumber,
+            comment: buildSupersededComment(plan.survivor.prNumber, entry.woId),
+          });
+          closedPrs += 1;
+          log('pr_repair.dedupe_closed', {
+            woId: entry.woId,
+            closed: victim.prNumber,
+            survivor: plan.survivor.prNumber,
+          });
+        } catch (error) {
+          log('pr_repair.dedupe_close_failed', {
+            woId: entry.woId,
+            prNumber: victim.prNumber,
+            error: (error as Error).message,
+          });
+        }
+      }
+      for (const approved of plan.approvedNonSurvivors) {
+        digestItems.push(
+          `${slug(approved.owner, approved.repo, approved.prNumber)} ${entry.woId} ` +
+            `dedupe_needs_human (survivor #${plan.survivor.prNumber})`
+        );
+      }
     }
   }
 
@@ -378,6 +385,10 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       await addressRefusal(deps, id, 'refused:stale_head', log);
       continue;
     }
+    if (isApproved(target)) {
+      await addressRefusal(deps, id, 'refused:already_approved', log);
+      continue;
+    }
 
     // Never race a run that is still building this WO; leave the row queued.
     if (await deps.hasRunningRunForWo(candidate.woId)) {
@@ -393,6 +404,16 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       'claude';
 
     // Acknowledge BEFORE firing, address with the cascade id on admission.
+    const current = await deps.fetchPr(candidate.owner, candidate.repo, candidate.prNumber);
+    if (
+      current?.state !== 'OPEN' ||
+      current.headSha !== candidate.headSha ||
+      current.headRefName !== target.headRef ||
+      (current.reviewDecision ?? '').toUpperCase() === 'APPROVED'
+    ) {
+      await addressRefusal(deps, id, 'refused:review_eligibility_changed', log);
+      continue;
+    }
     await deps.acknowledgeRow(id);
     let admitted: ((cascadeId: string) => void) | null = null;
     let rejected: ((error: unknown) => void) | null = null;

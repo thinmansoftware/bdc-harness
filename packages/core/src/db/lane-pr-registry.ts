@@ -322,13 +322,7 @@ async function resolveLanePrs(
   const resolved: LanePr[] = [];
   for (const group of byPr.values()) {
     const first = group[0];
-    let info: LanePrGithubInfo | null;
-    try {
-      info = await fetchPr(first.owner, first.repo, first.prNumber);
-    } catch {
-      // A PR that cannot be read is not provably lane-created; skip it.
-      info = null;
-    }
+    const info = await fetchPr(first.owner, first.repo, first.prNumber);
     if (!info) continue;
     for (const citation of group) {
       const lane = applyRuleBcd(citation, info, woId, nowMs);

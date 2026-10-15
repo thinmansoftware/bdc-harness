@@ -19,6 +19,28 @@ import {
 const WO_DIGEST = 'WO-XO-CE-HEALTH-DIGEST-01';
 const WO_TRIAL = 'WO-SHOPOPS-OWNER-ALERT-TRIAL-STATE-01';
 
+test('registry propagates an attributed PR lookup failure', async () => {
+  const { db, sqlite } = makeDb();
+  seedE1E2(sqlite);
+  try {
+    let failure: unknown;
+    try {
+      await listLanePrsForWo(WO_DIGEST, {
+        db,
+        fetchPr: async () => {
+          throw new Error('github_unavailable');
+        },
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe('github_unavailable');
+  } finally {
+    sqlite.close();
+  }
+});
+
 /** Wrap an in-memory bun:sqlite as the read-only LanePrRegistryDb surface. */
 function makeDb(): { db: LanePrRegistryDb; sqlite: Database } {
   const sqlite = new Database(':memory:');

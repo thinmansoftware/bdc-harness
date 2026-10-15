@@ -103,7 +103,25 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
 
   const deps: PrRepairOwnerDeps = {
     now: () => NOW,
-    fetchPr: async () => null,
+    fetchPr: async (owner, repo, number) => {
+      const pr = Object.values(laneByWo)
+        .flat()
+        .find(value => value.owner === owner && value.repo === repo && value.prNumber === number);
+      return pr
+        ? {
+            number: pr.prNumber,
+            state: pr.state,
+            reviewDecision: pr.reviewDecision,
+            createdAt: pr.createdAt,
+            headRefName: pr.headRef,
+            headSha: pr.headSha,
+            headRepoFullName: `${owner}/${repo}`,
+            baseRepoFullName: `${owner}/${repo}`,
+            title: '',
+            body: '',
+          }
+        : null;
+    },
     listWosWithMultipleLanePrs: async () => config.dupeWos ?? [],
     listLanePrsForWo: async woId => laneByWo[woId] ?? [],
     listQueuedTaskmasterMessages: async () =>
@@ -138,6 +156,59 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
   };
   return { deps, rec };
 }
+
+describe('review repair regressions', () => {
+  test('sweep groups a shared WO by repository before closing duplicates', async () => {
+    const woId = 'WO-MULTI-REPO';
+    const { deps, rec } = makeDeps({
+      dupeWos: [
+        {
+          woId,
+          prs: [
+            lanePr({ prNumber: 1, repo: 'first' }),
+            lanePr({ prNumber: 2, repo: 'second' }),
+            lanePr({ prNumber: 3, repo: 'first' }),
+          ],
+        },
+      ],
+    });
+    await runPrRepairOwner(deps);
+    expect(rec.closed.map(row => row.prNumber)).toEqual([1]);
+  });
+
+  for (const approvedDuringRead of [false, true]) {
+    test(`obsolete rejection never repairs an approved head (late=${approvedDuringRead})`, async () => {
+      const woId = 'WO-APPROVED';
+      const pr = lanePr({
+        prNumber: 5,
+        reviewDecision: approvedDuringRead ? 'CHANGES_REQUESTED' : 'APPROVED',
+      });
+      const { deps, rec } = makeDeps({
+        laneByWo: { [woId]: [pr] },
+        queued: [
+          {
+            id: 'obsolete',
+            body: candidateBody({
+              woId,
+              prNumber: 5,
+              headRef: pr.headRef,
+              headSha: pr.headSha,
+            }),
+          },
+        ],
+      });
+      const fetch = deps.fetchPr;
+      deps.fetchPr = async (...args) => {
+        const current = await fetch(...args);
+        return current ? { ...current, reviewDecision: 'APPROVED' } : null;
+      };
+      await runPrRepairOwner(deps);
+      expect(rec.fired).toHaveLength(0);
+      expect(rec.acknowledged).toEqual(['obsolete']);
+      expect(rec.addressed[0]?.note).toContain('refused:');
+    });
+  }
+});
 
 describe('planDedupe', () => {
   test('survivor is newest OPEN when none approved', () => {

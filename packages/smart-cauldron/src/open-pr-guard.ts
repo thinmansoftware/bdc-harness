@@ -290,27 +290,23 @@ interface GhPrViewRow {
  */
 export function createGhLanePrFetcher(execFn: typeof execFileAsync = execFileAsync): LanePrFetcher {
   return async (owner, repo, prNumber): Promise<LanePrGithubInfo | null> => {
-    let stdout: string;
-    try {
-      ({ stdout } = await execFn(
-        'gh',
-        [
-          'pr',
-          'view',
-          String(prNumber),
-          '--repo',
-          `${owner}/${repo}`,
-          '--json',
-          'number,state,reviewDecision,createdAt,headRefName,headRefOid,isCrossRepository,title,body',
-        ],
-        { timeout: 30000 }
-      ));
-    } catch {
-      return null;
-    }
+    const { stdout } = await execFn(
+      'gh',
+      [
+        'pr',
+        'view',
+        String(prNumber),
+        '--repo',
+        `${owner}/${repo}`,
+        '--json',
+        'number,state,reviewDecision,createdAt,headRefName,headRefOid,isCrossRepository,title,body',
+      ],
+      { timeout: 30000 }
+    );
     const row = JSON.parse(stdout || '{}') as GhPrViewRow;
-    if (typeof row.number !== 'number') return null;
+    if (row.number !== prNumber) throw new Error('lane_pr_lookup_invalid');
     const stateRaw = (row.state ?? '').toUpperCase();
+    if (!['OPEN', 'CLOSED', 'MERGED'].includes(stateRaw)) throw new Error('lane_pr_lookup_invalid');
     const state: LanePrState =
       stateRaw === 'MERGED' ? 'MERGED' : stateRaw === 'CLOSED' ? 'CLOSED' : 'OPEN';
     const baseRepoFullName = `${owner}/${repo}`;

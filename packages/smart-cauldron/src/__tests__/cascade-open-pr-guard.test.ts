@@ -10,7 +10,8 @@
  *
  * All injected: no network, no real GitHub, no DB.
  */
-import { describe, test, expect, afterAll } from 'bun:test';
+import { describe, test, expect, afterAll, spyOn } from 'bun:test';
+import * as registry from '@archon/core/db/lane-pr-registry';
 import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -20,6 +21,8 @@ import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult, PollResult, GateVerdict } from '../types.js';
 import {
   findBlockingOpenPrs,
+  createDefaultOpenPrGuardLookup,
+  createGhLanePrFetcher,
   type OpenPrGuardLookup,
   type BlockingOpenPr,
 } from '../open-pr-guard.js';
@@ -27,6 +30,38 @@ import { findWoClaim as realFindWoClaim, type WoClaim } from '../already-satisfi
 
 const WO = 'WO-XO-CE-HEALTH-DIGEST-01';
 const SPEC_HEAD = 'wo/wo-xo-ce-health-digest-01';
+
+test('production registry fetch errors retry once and refuse the climb', async () => {
+  let directReads = 0;
+  const execute = (async (_command: string, args: string[]) => {
+    if (args[0] === 'pr' && args[1] === 'list') return { stdout: '[]', stderr: '' };
+    directReads += 1;
+    throw new Error('github_unavailable');
+  }) as typeof import('@archon/git').execFileAsync;
+  const spy = spyOn(registry, 'listLanePrsForWo').mockImplementation(async (_woId, options) => {
+    await options.fetchPr('thinmansoftware', 'bdc-xo', 55);
+    return [];
+  });
+  try {
+    let failure: unknown;
+    try {
+      await findBlockingOpenPrs({
+        woId: WO,
+        project: 'bdc-xo',
+        attemptRunIds: ['run'],
+        lookup: createDefaultOpenPrGuardLookup(createGhLanePrFetcher(execute), execute),
+        retryDelayMs: 0,
+        sleep: async () => {},
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect((failure as Error)?.message).toBe('github_unavailable');
+    expect(directReads).toBe(2);
+  } finally {
+    spy.mockRestore();
+  }
+});
 
 const testOutRoot = join(tmpdir(), `oguard-${randomUUID()}`);
 afterAll(async () => {
