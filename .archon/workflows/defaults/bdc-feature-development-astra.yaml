@@ -3716,8 +3716,8 @@ nodes:
           local in_code=0 field_count=0 i=0
           local fence_char="" fence_size=0 marker="" tail=""
           local -a lines=()
-          local begin_re='===[[:space:]]*APPROVED_PLAN_BEGIN[[:space:]]*==='
-          local end_re='===[[:space:]]*APPROVED_PLAN_END[[:space:]]*==='
+          local begin_re='^ {0,3}===[[:blank:]]*APPROVED_PLAN_BEGIN[[:blank:]]*===[[:blank:]]*$'
+          local end_re='^ {0,3}===[[:blank:]]*APPROVED_PLAN_END[[:blank:]]*===[[:blank:]]*$'
           local field_re=$'^ {0,3}repair_target_authorized_by_spec:[ \t]*#([0-9]+)[ \t]*$'
           local fence_re=$'^[ \t]*(`{3,}|~{3,})'
           while IFS= read -r line || [ -n "$line" ]; do

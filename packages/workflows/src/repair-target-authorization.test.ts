@@ -74,6 +74,33 @@ function expectRefuse(raw: string, reason: string): void {
 }
 
 describe('repair-target plan authorization', () => {
+  it('prose-embedded or decorated markers are not approved-plan boundaries', () => {
+    for (const raw of [
+      [
+        'Example: === APPROVED_PLAN_BEGIN ===',
+        'repair_target_authorized_by_spec: #826',
+        'Example: === APPROVED_PLAN_END ===',
+      ].join('\n'),
+      [
+        '=== APPROVED_PLAN_BEGIN === example',
+        'repair_target_authorized_by_spec: #826',
+        '=== APPROVED_PLAN_END === example',
+      ].join('\n'),
+      [
+        '`=== APPROVED_PLAN_BEGIN ===`',
+        'repair_target_authorized_by_spec: #826',
+        '`=== APPROVED_PLAN_END ===`',
+      ].join('\n'),
+    ])
+      expectRefuse(raw, 'fence_count');
+    const actual = runRta(
+      'Example: === APPROVED_PLAN_BEGIN ===\n' +
+        wrap('repair_target_authorized_by_spec: #826') +
+        '\nExample: === APPROVED_PLAN_END ==='
+    );
+    expect(actual.exitCode).toBe(0);
+  });
+
   const laneDirectory = join(REPO_ROOT, '.archon/workflows/defaults');
   for (const file of readdirSync(laneDirectory).filter(name =>
     /^bdc-feature-development.*\.yaml$/.test(name)

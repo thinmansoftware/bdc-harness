@@ -20,7 +20,7 @@ import { join } from 'path';
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 
-// The main Claude lane is EXEMPT: its top-level model: sonnet is intentional.
+// The main Claude lane is EXEMPT: its explicit modern Sonnet default is intentional (WO3197).
 const EXEMPT_LANE = 'bdc-feature-development.yaml';
 
 // Only test lanes (the bdc-feature-development family)
@@ -49,9 +49,9 @@ describe('lane cheap defaults (no Claude usage leak)', () => {
     }
   });
 
-  it('S3b: exempt main Claude lane retains top-level `model: sonnet`', () => {
+  it('S3b: exempt main Claude lane uses the WO3197 explicit Sonnet5.5 default', () => {
     const content = readFileSync(join(LANES_DIR, EXEMPT_LANE), 'utf-8');
-    expect(/^model:\s*sonnet\s*$/m.test(content)).toBe(true);
+    expect(/^model:\s*claude-sonnet-5-5\s*$/m.test(content)).toBe(true);
   });
 
   it('S3c: exempt main Claude lane has the exemption comment', () => {
