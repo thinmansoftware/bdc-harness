@@ -30,6 +30,7 @@
  * Every external effect is an INJECTED seam, so the owner's whole decision tree
  * runs in tests with no network and no real GitHub writes.
  */
+import type { CascadeRunRecord } from '@archon/smart-cauldron/types';
 import type {
   LanePr,
   LanePrFetcher,
@@ -77,6 +78,8 @@ interface ExhaustedRow {
   reason: string;
 }
 
+type PrRepairAdmissionRecord = Pick<CascadeRunRecord, 'cascadeId' | 'status'>;
+
 /** Fire one bounded repair cascade. Structurally compatible with runCascade. */
 export type PrRepairFireCascade = (opts: {
   woId: string;
@@ -86,8 +89,8 @@ export type PrRepairFireCascade = (opts: {
   repair: { prNumber: number; headRef: string; attemptId: string };
   dispatchId?: string;
   token?: string;
-  onAdmission?: (record: { cascadeId: string }) => void;
-}) => Promise<{ cascadeId: string }>;
+  onAdmission?: (record: PrRepairAdmissionRecord) => void;
+}) => Promise<PrRepairAdmissionRecord>;
 
 export interface PrRepairOwnerDeps {
   /** Clock seam (ms). Defaults to Date.now. */
@@ -289,6 +292,51 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
   const digestItems: string[] = [];
   let closedPrs = 0;
 
+  const closePlan = async (woId: string, plan: DedupePlan): Promise<void> => {
+    if (!plan.survivor) return;
+    for (const victim of plan.toClose) {
+      try {
+        const survivor = await deps.fetchPr(
+          plan.survivor.owner,
+          plan.survivor.repo,
+          plan.survivor.prNumber
+        );
+        const current = await deps.fetchPr(victim.owner, victim.repo, victim.prNumber);
+        const unchanged = (live: typeof current, prior: LanePr): boolean =>
+          live?.number === prior.prNumber &&
+          live.state === 'OPEN' &&
+          live.headSha === prior.headSha &&
+          live.headRefName === prior.headRef &&
+          live.reviewDecision === prior.reviewDecision;
+        if (
+          !unchanged(survivor, plan.survivor) ||
+          !unchanged(current, victim) ||
+          (current?.reviewDecision ?? '').toUpperCase() === 'APPROVED'
+        )
+          continue;
+        if (!(await deps.canApplyEffect())) break;
+        await deps.closePr({
+          owner: victim.owner,
+          repo: victim.repo,
+          prNumber: victim.prNumber,
+          comment: buildSupersededComment(plan.survivor.prNumber, woId),
+        });
+        closedPrs += 1;
+        log('pr_repair.dedupe_closed', {
+          woId: woId,
+          closed: victim.prNumber,
+          survivor: plan.survivor.prNumber,
+        });
+      } catch (error) {
+        log('pr_repair.dedupe_close_failed', {
+          woId: woId,
+          prNumber: victim.prNumber,
+          error: (error as Error).message,
+        });
+      }
+    }
+  };
+
   // (1) DEDUPE SWEEP -----------------------------------------------------------
   const dupeWos = (
     await deps.listWosWithMultipleLanePrs({ fetchPr: deps.fetchPr, withinHours, now })
@@ -314,47 +362,7 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     for (const prs of repositories.values()) {
       const plan = planDedupe(prs);
       if (!plan.survivor) continue;
-      for (const victim of plan.toClose) {
-        try {
-          const survivor = await deps.fetchPr(
-            plan.survivor.owner,
-            plan.survivor.repo,
-            plan.survivor.prNumber
-          );
-          const current = await deps.fetchPr(victim.owner, victim.repo, victim.prNumber);
-          const unchanged = (live: typeof current, prior: LanePr): boolean =>
-            live?.number === prior.prNumber &&
-            live.state === 'OPEN' &&
-            live.headSha === prior.headSha &&
-            live.headRefName === prior.headRef &&
-            live.reviewDecision === prior.reviewDecision;
-          if (
-            !unchanged(survivor, plan.survivor) ||
-            !unchanged(current, victim) ||
-            (current?.reviewDecision ?? '').toUpperCase() === 'APPROVED'
-          )
-            continue;
-          if (!(await deps.canApplyEffect())) break;
-          await deps.closePr({
-            owner: victim.owner,
-            repo: victim.repo,
-            prNumber: victim.prNumber,
-            comment: buildSupersededComment(plan.survivor.prNumber, entry.woId),
-          });
-          closedPrs += 1;
-          log('pr_repair.dedupe_closed', {
-            woId: entry.woId,
-            closed: victim.prNumber,
-            survivor: plan.survivor.prNumber,
-          });
-        } catch (error) {
-          log('pr_repair.dedupe_close_failed', {
-            woId: entry.woId,
-            prNumber: victim.prNumber,
-            error: (error as Error).message,
-          });
-        }
-      }
+      await closePlan(entry.woId, plan);
       for (const approved of plan.approvedNonSurvivors) {
         digestItems.push(
           `${slug(approved.owner, approved.repo, approved.prNumber)} ${entry.woId} ` +
@@ -380,8 +388,9 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
 
   // (2) REPAIR -- at most MAX_REPAIR_FIRES_PER_TICK fires this tick -------------
   let repairsFired = 0;
+  let admissionAttempts = 0;
   for (const { id, candidate } of candidates) {
-    if (repairsFired >= MAX_REPAIR_FIRES_PER_TICK) break;
+    if (admissionAttempts >= MAX_REPAIR_FIRES_PER_TICK) break;
     if (!(await deps.canApplyEffect())) break;
 
     // Re-prove the LANE PR RULE: the PR must still be lane-created for this WO.
@@ -439,6 +448,23 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       continue;
     }
 
+    // A candidate outside the bounded/windowed sweep must still satisfy the
+    // same collapse-first rule. Re-read after closes: failed or unsafe closes
+    // never authorize a repair over another OPEN claimant.
+    await closePlan(candidate.woId, plan);
+    const afterDedupe = await deps.listLanePrsForWo(candidate.woId, { fetchPr: deps.fetchPr, now });
+    const otherOpen = afterDedupe.some(
+      pr =>
+        pr.state === 'OPEN' &&
+        `${pr.owner}/${pr.repo}`.toLowerCase() === candidateRepoSlug &&
+        pr.prNumber !== candidate.prNumber
+    );
+    if (otherOpen) {
+      const line = `${candidateSlug} ${candidate.woId} repair_waiting_for_dedupe`;
+      if (!digestItems.includes(line)) digestItems.push(line);
+      continue;
+    }
+
     const entryOverride =
       (deps.resolveEntryTier ?? ((): string | undefined => undefined))(target.workflowName) ??
       'claude';
@@ -457,12 +483,13 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     if (!(await deps.canApplyEffect())) break;
     await deps.acknowledgeRow(id);
     if (!(await deps.canApplyEffect())) break;
-    let admitted: ((cascadeId: string) => void) | null = null;
+    let admitted: ((record: PrRepairAdmissionRecord) => void) | null = null;
     let rejected: ((error: unknown) => void) | null = null;
-    const admission = new Promise<string>((resolve, reject) => {
+    const admission = new Promise<PrRepairAdmissionRecord>((resolve, reject) => {
       admitted = resolve;
       rejected = reject;
     });
+    admissionAttempts += 1;
     const firePromise = deps.fireRepairCascade({
       woId: candidate.woId,
       project: target.repo,
@@ -471,21 +498,46 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       repair: { prNumber: candidate.prNumber, headRef: target.headRef, attemptId: id },
       dispatchId: id,
       ...(deps.token ? { token: deps.token } : {}),
-      onAdmission: record => admitted?.(record.cascadeId),
+      onAdmission: record => admitted?.(record),
     });
-    void firePromise.then(record => admitted?.(record.cascadeId)).catch(error => rejected?.(error));
-    let cascadeId: string;
+    void firePromise.then(record => admitted?.(record)).catch(error => rejected?.(error));
+    let admissionRecord: PrRepairAdmissionRecord;
     try {
-      cascadeId = await admission;
+      admissionRecord = await admission;
     } catch (error) {
       log('pr_repair.repair_fire_failed', {
         woId: candidate.woId,
         prNumber: candidate.prNumber,
         error: (error as Error).message,
       });
-      await addressRefusal(deps, id, 'refused:fire_failed', log);
+      digestItems.push(
+        `${candidateSlug} ${candidate.woId} repair_admission_failed; candidate retained`
+      );
       continue;
     }
+    const admittedStatuses = new Set([
+      'running',
+      'won',
+      'spec-repair',
+      'recovery-delegated',
+      'infra-alert',
+      'pending-frontier-approval',
+      'frontier-rejected',
+      'frontier-approved',
+      'cancelled',
+    ]);
+    if (!admittedStatuses.has(admissionRecord.status)) {
+      log('pr_repair.repair_not_admitted', {
+        id,
+        cascadeId: admissionRecord.cascadeId,
+        status: admissionRecord.status,
+      });
+      digestItems.push(
+        `${candidateSlug} ${candidate.woId} repair_not_admitted:${admissionRecord.status ?? 'missing_status'}; candidate retained`
+      );
+      continue;
+    }
+    const cascadeId = admissionRecord.cascadeId;
     await deps.addressRow(id, `fired:${cascadeId}`);
     repairsFired += 1;
     log('pr_repair.repair_fired', {

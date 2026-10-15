@@ -152,8 +152,8 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
       cascadeSeq += 1;
       const cascadeId = config.cascadeId ?? `casc-${cascadeSeq}`;
       rec.fired.push(opts);
-      opts.onAdmission?.({ cascadeId });
-      return { cascadeId };
+      opts.onAdmission?.({ cascadeId, status: 'running' });
+      return { cascadeId, status: 'won' as const };
     },
     resolveEntryTier: () => undefined,
   };
@@ -161,6 +161,109 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
 }
 
 describe('review repair regressions', () => {
+  test('failed admission remains queued and bounds attempts to one per tick', async () => {
+    const woId = 'WO-ADMISSION-FAIL';
+    const pr = lanePr({ prNumber: 99 });
+    const body = candidateBody({ woId, prNumber: 99, headSha: pr.headSha, headRef: pr.headRef });
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: [pr] },
+      queued: [
+        { id: 'one', body },
+        { id: 'two', body },
+      ],
+    });
+    let calls = 0;
+    deps.fireRepairCascade = async () => {
+      calls++;
+      throw new Error('temporary_admission_failure');
+    };
+    const result = await runPrRepairOwner(deps);
+    expect(calls).toBe(1);
+    expect(result.repairsFired).toBe(0);
+    expect(rec.addressed).toHaveLength(0);
+    expect(result.digestItems.join(' ')).toContain('repair_admission_failed');
+  });
+  test('a failed candidate-specific close cannot admit a repair over another open PR', async () => {
+    const woId = 'WO-CLOSE-FAIL';
+    const prs = [lanePr({ prNumber: 1 }), lanePr({ prNumber: 2 })];
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: prs },
+      queued: [
+        {
+          id: 'held',
+          body: candidateBody({
+            woId,
+            prNumber: 2,
+            headSha: prs[1].headSha,
+            headRef: prs[1].headRef,
+          }),
+        },
+      ],
+    });
+    deps.closePr = async () => {
+      throw new Error('close_failed');
+    };
+    const result = await runPrRepairOwner(deps);
+    expect(rec.fired).toHaveLength(0);
+    expect(rec.addressed).toHaveLength(0);
+    expect(result.digestItems.join(' ')).toContain('repair_waiting_for_dedupe');
+  });
+
+  test('candidate-specific dedupe runs even when the WO was absent from the bounded sweep', async () => {
+    const woId = 'WO-OUTSIDE-SWEEP';
+    const prs = [lanePr({ prNumber: 1 }), lanePr({ prNumber: 2 })];
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: prs },
+      queued: [
+        {
+          id: 'repair-survivor',
+          body: candidateBody({
+            woId,
+            prNumber: 2,
+            headSha: prs[1].headSha,
+            headRef: prs[1].headRef,
+          }),
+        },
+      ],
+    });
+    await runPrRepairOwner(deps);
+    expect(rec.closed.map(row => row.prNumber)).toEqual([1]);
+    expect(rec.fired).toHaveLength(1);
+    expect(prs.filter(pr => pr.state === 'OPEN').map(pr => pr.prNumber)).toEqual([2]);
+  });
+  for (const status of ['refused', 'blocked', 'planned'] as const) {
+    test(`unstarted ${status} cascade never consumes the repair candidate`, async () => {
+      const woId = 'WO-UNSTARTED';
+      const pr = lanePr({ prNumber: 99 });
+      const { deps, rec } = makeDeps({
+        laneByWo: { [woId]: [pr] },
+        queued: [
+          {
+            id: 'recoverable',
+            body: candidateBody({
+              woId,
+              prNumber: 99,
+              headSha: pr.headSha,
+              headRef: pr.headRef,
+            }),
+          },
+        ],
+      });
+      let attempts = 0;
+      deps.fireRepairCascade = async opts => {
+        attempts++;
+        const result = { cascadeId: 'unstarted', status };
+        if (status === 'blocked') opts.onAdmission?.(result);
+        return result;
+      };
+      const first = await runPrRepairOwner(deps);
+      const second = await runPrRepairOwner(deps);
+      expect(first.repairsFired + second.repairsFired).toBe(0);
+      expect(rec.addressed).toHaveLength(0);
+      expect(attempts).toBe(2);
+    });
+  }
+
   for (const changed of ['victim_approved', 'survivor_closed', 'paused_during_reads']) {
     test(`close revalidates current eligibility: ${changed}`, async () => {
       const prs = [lanePr({ prNumber: 1 }), lanePr({ prNumber: 2 })];
