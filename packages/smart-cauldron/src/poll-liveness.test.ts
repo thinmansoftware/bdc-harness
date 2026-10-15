@@ -68,6 +68,21 @@ function stepEvent(msSinceEpoch: number, type: string, step: string): FakeEvent 
   return { ...eventAt(msSinceEpoch, type), step_name: step };
 }
 
+/**
+ * Epoch ms poll reads from an event. Mirrors parseEventTimestamp in poll.ts so
+ * an expected open-span age is the parsed time of a specific event, not a
+ * parallel clock.
+ */
+function eventTimestampMs(event: FakeEvent): number {
+  const raw = event.created_at.trim();
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw) ? `${raw.replace(' ', 'T')}Z` : raw;
+  const parsed = Date.parse(iso);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`unparseable event time: ${raw}`);
+  }
+  return parsed;
+}
+
 /** Serve a run that never terminates, with an event stream the test controls. */
 function serveRun(getEvents: () => FakeEvent[], status = 'running'): void {
   globalThis.fetch = (async () =>
@@ -441,7 +456,8 @@ describe('pollForTerminal liveness', () => {
   test('stalled-loop-is-cut-at-open-budget-and-named', async () => {
     installFakeTimers();
     const t0 = Date.now();
-    serveRun(() => [stepEvent(t0, 'loop_iteration_started', 'implement')]);
+    const opened = stepEvent(t0, 'loop_iteration_started', 'implement');
+    serveRun(() => [opened]);
 
     let caught: unknown;
     try {
@@ -464,15 +480,54 @@ describe('pollForTerminal liveness', () => {
     expect(Date.now() - t0).toBeLessThan(7_200_000);
     const message = (caught as Error).message;
     expect(message).toContain('open-node budget');
-    expect(message).toMatch(/open nodes: implement \(open \d+ms\)/);
+    const ageFromOpen = Date.now() - eventTimestampMs(opened);
+    expect(message).toContain(`open nodes: implement (open ${String(ageFromOpen)}ms)`);
   });
 
   test('loop-between-iterations-stays-open-until-node-completed', async () => {
     installFakeTimers();
     const t0 = Date.now();
+    // Later iteration activity must not move the open-span start.
+    const laterIteration = t0 + 600_000;
+    const started = stepEvent(t0, 'loop_iteration_started', 'implement');
+    const completed = stepEvent(laterIteration, 'loop_iteration_completed', 'implement');
+    expect(eventTimestampMs(completed)).toBeGreaterThan(eventTimestampMs(started));
+
+    serveRun(() => [started, completed]);
+
+    let caught: unknown;
+    try {
+      await pollForTerminal({
+        runId: 'r1',
+        apiBaseUrl: 'http://x',
+        token: 't',
+        stallTimeoutMs: 1_200_000,
+        openNodeBudgetMs: 3_600_000,
+        intervalMs: 30_000,
+        timeoutMs: 7_200_000,
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(TimeoutError);
+    // The between-iteration gap stayed open through the tight stall budget.
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(3_600_000);
+    expect(Date.now() - t0).toBeLessThan(7_200_000);
+    const ageFromOpen = Date.now() - eventTimestampMs(started);
+    const ageFromLater = Date.now() - eventTimestampMs(completed);
+    expect(ageFromOpen).toBeGreaterThan(ageFromLater);
+    const message = (caught as Error).message;
+    expect(message).toContain(`open nodes: implement (open ${String(ageFromOpen)}ms)`);
+
+    // node_completed still closes the gap and lets the run finish. Fresh clock:
+    // the stall above already burned the open-node budget.
+    installFakeTimers();
+    const t1 = Date.now();
+    const later = t1 + 600_000;
     const frozen: FakeEvent[] = [
-      stepEvent(t0, 'loop_iteration_started', 'implement'),
-      stepEvent(t0, 'loop_iteration_completed', 'implement'),
+      stepEvent(t1, 'loop_iteration_started', 'implement'),
+      stepEvent(later, 'loop_iteration_completed', 'implement'),
     ];
     let ticks = 0;
     globalThis.fetch = (async () => {
@@ -500,7 +555,7 @@ describe('pollForTerminal liveness', () => {
     });
 
     expect(result.terminalStatus).toBe('completed');
-    expect(Date.now() - t0).toBeGreaterThan(1_200_000);
+    expect(Date.now() - t1).toBeGreaterThan(1_200_000);
   });
 
   test('closed-loop-then-silence-uses-tight-budget-and-says-none', async () => {
