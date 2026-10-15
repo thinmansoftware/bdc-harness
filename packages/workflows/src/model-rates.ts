@@ -25,6 +25,28 @@ export const FRONTIER_MODEL_ID: string =
 export const FRONTIER_INPUT_RATE_PER_TOKEN = 0.000004; // USD
 export const FRONTIER_OUTPUT_RATE_PER_TOKEN = 0.00002; // USD
 
+export interface ModelRates {
+  input: number;
+  output: number;
+}
+
+/**
+ * Explicit rates used for attribution of modernized lane models.
+ *
+ * Zero is intentional until an operator verifies billable list rates for these
+ * subscription-backed runtime ids. Presence in this table distinguishes that
+ * documented zero from an unknown model.
+ */
+export const MODEL_RATES: Readonly<Record<string, ModelRates>> = {
+  'claude-haiku-5-5': { input: 0, output: 0 },
+  'claude-sonnet-5-5': { input: 0, output: 0 },
+  'gpt-6-astra': { input: 0, output: 0 },
+};
+
+export function getModelRates(model: string): ModelRates | undefined {
+  return MODEL_RATES[model];
+}
+
 /**
  * Derive the entry-rung label for a node.
  * Returns "<provider>:<effective-model>" as a colon-joined string.
