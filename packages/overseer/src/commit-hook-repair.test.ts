@@ -60,7 +60,13 @@ describe('commit hook repair contract', () => {
     expect(lane).toContain('NOT pushed');
   });
 
-  for (const repairState of ['needs_human', 'classification_failed', 'retry_failed', 'pushed']) {
+  for (const repairState of [
+    'needs_human',
+    'classification_failed',
+    'retry_failed',
+    'missing_env',
+    'pushed',
+  ]) {
     test(`terminal_hook_handling_${repairState}`, () => {
       const lane = parse(read('.archon/workflows/defaults/bdc-feature-development-codex.yaml')) as {
         nodes: {
@@ -80,7 +86,9 @@ describe('commit hook repair contract', () => {
       const directory = mkdtempSync(join(tmpdir(), 'hook-terminal-'));
       const unixDirectory = directory.replaceAll('\\', '/');
       const pushed = repairState === 'pushed';
-      writeFileSync(join(directory, 'commit-and-push.env'), 'UNIQUE_BRANCH=repair-branch\n');
+      if (repairState !== 'missing_env') {
+        writeFileSync(join(directory, 'commit-and-push.env'), 'UNIQUE_BRANCH=repair-branch\n');
+      }
       writeFileSync(join(directory, 'diff-review-final.out'), 'UNRESOLVED missing return type\n');
       const script =
         `export ARTIFACTS_DIR='${unixDirectory}' ARCHON_NODE_OUT='${unixDirectory}'\n` +
@@ -95,7 +103,7 @@ describe('commit hook repair contract', () => {
           windowsHide: true,
         });
         expect(result.status).toBe(pushed ? 0 : 1);
-        if (!pushed) {
+        if (!pushed && repairState !== 'missing_env') {
           const calls = readFileSync(join(directory, 'gh-calls'), 'utf8');
           expect(calls).toContain('pr ready 55 --repo thinmansoftware/bdc-harness --undo');
           expect(calls).toContain('NOT pushed');

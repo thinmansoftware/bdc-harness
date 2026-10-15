@@ -3815,7 +3815,8 @@ nodes:
     bash: |
       set -euo pipefail
       if [ ! -f "$ARTIFACTS_DIR/commit-and-push.env" ]; then
-        exit 0
+        echo "ERROR: commit state missing; push has not been verified." >&2
+        exit 1
       fi
       source "$ARTIFACTS_DIR/commit-and-push.env"
       REMOTE_HEAD=$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" | awk '{print $1}')
