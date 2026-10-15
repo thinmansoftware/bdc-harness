@@ -74,7 +74,7 @@ const baselineNodesForAstra = baseline.nodes
       return {
         ...node,
         bash: node.bash.replace(
-          /git status --short\nWO_ID=.*?\.archon\/scripts\/commit-and-push\.sh 1\nexit 0\nDIRTY=/s,
+          /git status --short\nWO_ID=.*?bash "\$ARTIFACTS_DIR\/commit-and-push\.sh" 1\nexit 0\nDIRTY=/s,
           'git status --short\nDIRTY='
         ),
       };

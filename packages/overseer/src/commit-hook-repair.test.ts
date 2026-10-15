@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -16,6 +16,8 @@ function hookFixture(): {
   repo: string;
   artifacts: string;
   run: (attempt: number) => ReturnType<typeof spawnSync>;
+  runInitialNode: () => ReturnType<typeof spawnSync>;
+  runRetryNode: () => ReturnType<typeof spawnSync>;
 } {
   const directory = mkdtempSync(join(tmpdir(), 'real-hook-repair-'));
   const repo = join(directory, 'repo');
@@ -63,6 +65,44 @@ function hookFixture(): {
     directory,
     repo,
     artifacts,
+    runRetryNode: () => {
+      const lane = parse(read('.archon/workflows/defaults/bdc-feature-development-codex.yaml')) as {
+        nodes: { id: string; bash?: string }[];
+      };
+      const bash = lane.nodes.find(node => node.id === 'commit-and-push-retry')?.bash;
+      if (!bash) throw new Error('retry caller missing');
+      const original = readFileSync(script, 'utf8');
+      const prefix = original.slice(0, original.indexOf("source '"));
+      const retry = join(directory, 'retry-node.sh');
+      writeFileSync(retry, prefix + 'export -f git\n' + bash + '\n');
+      return spawnSync('bash', [retry], {
+        cwd: repo,
+        env,
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 20000,
+      });
+    },
+    runInitialNode: () => {
+      const lane = parse(read('.archon/workflows/defaults/bdc-feature-development-codex.yaml')) as {
+        nodes: { id: string; bash?: string }[];
+      };
+      const bash = lane.nodes.find(node => node.id === 'commit-and-push')?.bash ?? '';
+      const start = bash.indexOf('git status --short\nWO_ID=');
+      const end = bash.indexOf('\nDIRTY=', start);
+      if (start < 0 || end < 0) throw new Error('initial hook caller markers missing');
+      const original = readFileSync(script, 'utf8');
+      const prefix = original.slice(0, original.indexOf("source '"));
+      const initial = join(directory, 'initial.sh');
+      writeFileSync(initial, prefix + 'export -f git\n' + bash.slice(start, end) + '\n');
+      return spawnSync('bash', [initial], {
+        cwd: repo,
+        env,
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 20000,
+      });
+    },
     run: attempt =>
       spawnSync('bash', [script, String(attempt)], {
         cwd: repo,
@@ -77,6 +117,29 @@ function hookFixture(): {
 const hookFailure = `lint-staged\n[FAILED] eslint\npackages/server/src/taskmaster/loop.ts 1419:19 error Missing return type on function @typescript-eslint/explicit-function-return-type\nhusky - pre-commit script failed`;
 
 describe('commit hook repair contract', () => {
+  test('actual initial caller carries its helper into a target repo without Harness files', () => {
+    const fixture = hookFixture();
+    try {
+      const first = fixture.runInitialNode();
+      expect(first.status, first.stderr).toBe(1);
+      expect(readFileSync(join(fixture.artifacts, 'commit-hook-output.txt'), 'utf8')).toContain(
+        'explicit-function-return-type'
+      );
+      expect(existsSync(join(fixture.repo, '.archon'))).toBe(false);
+      expect(readFileSync(join(fixture.artifacts, 'commit-and-push.sh'), 'utf8')).toBe(
+        read('.archon/scripts/commit-and-push.sh').replace(/\r\n/g, '\n')
+      );
+      writeFileSync(
+        join(fixture.repo, 'fixture.ts'),
+        'export function value(): number { return 1; }\n'
+      );
+      const retry = fixture.runRetryNode();
+      expect(retry.status, retry.stderr).toBe(0);
+      expect(existsSync(join(fixture.artifacts, 'commit-and-push.succeeded'))).toBe(true);
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
   test('open PR consumes the successful retry branch and refreshed lease', () => {
     const lane = parse(read('.archon/workflows/defaults/bdc-feature-development-codex.yaml')) as {
       nodes: { id: string; bash?: string }[];
@@ -238,9 +301,9 @@ describe('commit hook repair contract', () => {
 
   test('second_failure_does_not_loop', () => {
     const lane = read('.archon/workflows/defaults/bdc-feature-development-codex.yaml');
-    expect(lane).toContain('.archon/scripts/commit-and-push.sh 1');
-    expect(lane).toContain('.archon/scripts/commit-and-push.sh 2');
-    expect(lane).not.toContain('.archon/scripts/commit-and-push.sh 3');
+    expect(lane).toContain('bash "$ARTIFACTS_DIR/commit-and-push.sh" 1');
+    expect(lane).toContain('bash "$ARTIFACTS_DIR/commit-and-push.sh" 2');
+    expect(lane).not.toContain('bash "$ARTIFACTS_DIR/commit-and-push.sh" 3');
   });
 
   test('lane_yaml_structure_has_one_bounded_repair', () => {
