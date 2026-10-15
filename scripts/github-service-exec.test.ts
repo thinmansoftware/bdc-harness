@@ -2,6 +2,58 @@ import { describe, expect, test } from 'bun:test';
 import { runGitHubServiceCommand } from './github-service-exec';
 
 describe('operation-scoped GitHub CLI authentication', () => {
+  test('the real command driver forwards piped request input without a provider call', () => {
+    const payload = '{"body":"synthetic stdin regression"}';
+    const result = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        `${import.meta.dir}/github-service-exec.ts`,
+        'run_nodes',
+        process.execPath,
+        '-e',
+        'process.stdout.write(await Bun.stdin.text())',
+      ],
+      env: {
+        PATH: process.env.PATH,
+        SystemRoot: process.env.SystemRoot,
+        GH_TOKEN: 'synthetic-pat',
+        GITHUB_TOKEN: 'synthetic-pat',
+      },
+      stdin: new TextEncoder().encode(payload),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(result.exitCode).toBe(0);
+    expect(new TextDecoder().decode(result.stdout)).toBe(payload);
+  });
+  test('the real permission retry replays the same stdin bytes', () => {
+    const payload = '{"body":"permission retry input"}';
+    const child = `const input = await Bun.stdin.text();
+      if (process.env.GH_TOKEN === 'synthetic-app') {
+        console.error('Resource not accessible by integration (HTTP 403)'); process.exit(1);
+      }
+      process.stdout.write(input);`;
+    const driver = `import { runGitHubServiceCommand } from ${JSON.stringify(`${import.meta.dir}/github-service-exec.ts`)};
+      const result = await runGitHubServiceCommand({service:'run_nodes', command:process.execPath,
+        args:['-e',${JSON.stringify(child)}], stdin:await Bun.stdin.bytes(),
+        identity:{kind:'app',service:'run_nodes',appId:'1',installationId:'2',privateKey:'unused',poolId:'synthetic',distinct:true},
+        token:async()=> 'synthetic-app'});
+      await Bun.write(Bun.stdout,result.stdout); process.exitCode=result.exitCode;`;
+    const result = Bun.spawnSync({
+      cmd: [process.execPath, '-e', driver],
+      env: {
+        PATH: process.env.PATH,
+        SystemRoot: process.env.SystemRoot,
+        GH_TOKEN: 'synthetic-pat',
+        GITHUB_TOKEN: 'synthetic-pat',
+      },
+      stdin: new TextEncoder().encode(payload),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(result.exitCode).toBe(0);
+    expect(new TextDecoder().decode(result.stdout)).toBe(payload);
+  });
   for (const reason of ['permission', 'rate_limit', 'transport']) {
     test(`preserves parent credentials and retries only permission denial (${reason})`, async () => {
       const parent = { GH_TOKEN: 'original-pat', GITHUB_TOKEN: 'original-pat' };

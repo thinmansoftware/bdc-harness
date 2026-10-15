@@ -15,6 +15,8 @@ export async function runGitHubServiceCommand(input: {
   service: GitHubService;
   command: string;
   args: string[];
+  /** Replay piped request bodies unchanged for the one permission-only retry. */
+  stdin?: Uint8Array;
   env?: Record<string, string | undefined>;
   identity?: ServiceGitHubAuth;
   token?: (identity: ServiceGitHubAuth) => Promise<string>;
@@ -26,7 +28,13 @@ export async function runGitHubServiceCommand(input: {
   const execute =
     input.execute ??
     ((command, childEnv): CommandResult =>
-      Bun.spawnSync({ cmd: command, env: childEnv, stdout: 'pipe', stderr: 'pipe' }));
+      Bun.spawnSync({
+        cmd: command,
+        env: childEnv,
+        stdin: input.stdin ?? 'inherit',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }));
   const result = execute([input.command, ...input.args], {
     ...env,
     GH_TOKEN: token,
@@ -58,6 +66,7 @@ if (import.meta.main) {
       service: service as GitHubService,
       command,
       args,
+      ...(process.stdin.isTTY ? {} : { stdin: await Bun.stdin.bytes() }),
     });
     await Bun.write(Bun.stdout, result.stdout);
     await Bun.write(Bun.stderr, result.stderr);
