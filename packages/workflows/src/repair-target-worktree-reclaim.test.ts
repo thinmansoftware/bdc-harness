@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -168,9 +169,13 @@ function show(result: RunResult): string {
 const roots: string[] = [];
 
 afterEach(() => {
+  Bun.gc(true);
   while (roots.length > 0) {
     const root = roots.pop();
-    if (root) rmSync(root, { recursive: true, force: true });
+    if (root) {
+      expect(root.startsWith(join(tmpdir(), 'rtw-repo-'))).toBe(true);
+      removeTempDirWithRetry(root);
+    }
   }
 });
 

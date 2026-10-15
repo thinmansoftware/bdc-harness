@@ -109,6 +109,44 @@ describe('repair-target plan authorization', () => {
     expectRefuse(wrap(body), 'no_standalone_field');
   });
 
+  for (const fence of ['~~~', '~~~~', '````', '`````']) {
+    it(`refuses authorization inside ${fence} fences and enclosing code blocks`, () => {
+      expectRefuse(
+        wrap([fence, 'repair_target_authorized_by_spec: #826', fence].join('\n')),
+        'no_standalone_field'
+      );
+      expectRefuse(
+        [fence, wrap('repair_target_authorized_by_spec: #826'), fence].join('\n'),
+        'no_standalone_field'
+      );
+    });
+  }
+
+  it('shorter or mismatched fences cannot close an existing code block', () => {
+    expectRefuse(
+      wrap(['````', '```', 'repair_target_authorized_by_spec: #826', '````'].join('\n')),
+      'no_standalone_field'
+    );
+    expectRefuse(
+      wrap(['~~~', '```', 'repair_target_authorized_by_spec: #826', '~~~'].join('\n')),
+      'no_standalone_field'
+    );
+  });
+
+  it('a plan boundary inside code cannot authorize a later field', () => {
+    expectRefuse(
+      [
+        '~~~',
+        '=== APPROVED_PLAN_BEGIN ===',
+        '~~~',
+        'repair_target_authorized_by_spec: #826',
+        '=== APPROVED_PLAN_END ===',
+      ].join('\n'),
+      'no_standalone_field'
+    );
+    expectRefuse(wrap('repair_target_authorized_by_spec: #826\n~~~'), 'no_standalone_field');
+  });
+
   it('Test 15: the field outside the fence is refused', () => {
     const before = [
       'repair_target_authorized_by_spec: #826',

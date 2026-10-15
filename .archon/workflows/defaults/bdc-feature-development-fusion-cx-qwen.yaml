@@ -256,7 +256,9 @@ nodes:
         process.stdout.write(id + "\t" + status + "\t" + completed + "\n");
       }
       RTW_BUN
-        if ! bun "$rtw_query" "$rtw_db" "$holder" >"$rtw_db_out" 2>"$rtw_db_err"; then
+        if bun "$rtw_query" "$rtw_db" "$holder" >"$rtw_db_out" 2>"$rtw_db_err"; then
+          rtw_db_code=0
+        else
           rtw_db_code=$?
         fi
         if [ "$rtw_db_code" -ne 0 ]; then
@@ -303,6 +305,9 @@ nodes:
           esac
           [ -L "$cwdlink" ] || [ -e "$cwdlink" ] || continue
           resolved=$(readlink -f "$cwdlink" 2>/dev/null || true)
+          if command -v cygpath >/dev/null 2>&1; then
+            resolved=$(cygpath -m "$resolved")
+          fi
           [ -n "$resolved" ] || continue
           if [ "$resolved" = "$holder" ] || [ "${resolved#"$holder"/}" != "$resolved" ]; then
             rtw_refuse "live process cwd under holder" || return
@@ -3667,11 +3672,12 @@ nodes:
           local line="" stripped="" captured=""
           local begin_count=0 end_count=0 begin_idx=-1 end_idx=-1
           local in_code=0 field_count=0 i=0
+          local fence_char="" fence_size=0 marker="" tail=""
           local -a lines=()
           local begin_re='===[[:space:]]*APPROVED_PLAN_BEGIN[[:space:]]*==='
           local end_re='===[[:space:]]*APPROVED_PLAN_END[[:space:]]*==='
           local field_re=$'^[ \t]*repair_target_authorized_by_spec:[ \t]*#([0-9]+)[ \t]*$'
-          local fence_re=$'^[ \t]*```[ \t]*[A-Za-z0-9_+-]*[ \t]*$'
+          local fence_re=$'^[ \t]*(`{3,}|~{3,})'
           while IFS= read -r line || [ -n "$line" ]; do
             line="${line%$'\r'}"
             lines+=("$line")
@@ -3695,17 +3701,25 @@ nodes:
             printf 'repair_target_plan_authorization_refused: fence_count\n'
             return 1
           fi
-          for ((i=begin_idx+1; i<end_idx; i++)); do
+          for ((i=0; i<end_idx; i++)); do
             line="${lines[$i]}"
+            if [ "$i" -eq "$begin_idx" ] && [ "$in_code" -eq 1 ]; then
+              printf 'repair_target_plan_authorization_refused: no_standalone_field\n'
+              return 1
+            fi
             if [[ "$line" =~ $fence_re ]]; then
+              marker="${BASH_REMATCH[1]}"
+              tail="${line#*"$marker"}"
               if [ "$in_code" -eq 0 ]; then
                 in_code=1
-              else
+                fence_char="${marker:0:1}"
+                fence_size=${#marker}
+              elif [ "${marker:0:1}" = "$fence_char" ] && [ "${#marker}" -ge "$fence_size" ] && [[ "$tail" =~ ^[[:space:]]*$ ]]; then
                 in_code=0
               fi
               continue
             fi
-            if [ "$in_code" -eq 1 ]; then
+            if [ "$in_code" -eq 1 ] || [ "$i" -le "$begin_idx" ]; then
               continue
             fi
             if [[ "$line" =~ $field_re ]]; then
@@ -3713,7 +3727,7 @@ nodes:
               captured="${BASH_REMATCH[1]}"
             fi
           done
-          if [ "$field_count" -eq 0 ]; then
+          if [ "$field_count" -eq 0 ] || [ "$in_code" -eq 1 ]; then
             printf 'repair_target_plan_authorization_refused: no_standalone_field\n'
             return 1
           fi
