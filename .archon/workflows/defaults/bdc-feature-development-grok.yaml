@@ -190,7 +190,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     provider: cursor
-    model: grok-4.7-high
+    model: grok-4.7-medium
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     depends_on: [checkout-repair-target]
@@ -2365,8 +2365,8 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: codex-opr
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -2633,8 +2633,8 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: codex-opr
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -2799,8 +2799,8 @@ nodes:
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: codex-opr
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3017,8 +3017,8 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
-    provider: codex-opr
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     persona: xo-opr
     depends_on: [block-reclassify]
     trigger_rule: all_done
@@ -3147,8 +3147,8 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: codex-opr
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
