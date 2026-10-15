@@ -77,6 +77,37 @@ function hookFixture(): {
 const hookFailure = `lint-staged\n[FAILED] eslint\npackages/server/src/taskmaster/loop.ts 1419:19 error Missing return type on function @typescript-eslint/explicit-function-return-type\nhusky - pre-commit script failed`;
 
 describe('commit hook repair contract', () => {
+  test('open PR consumes the successful retry branch and refreshed lease', () => {
+    const lane = parse(read('.archon/workflows/defaults/bdc-feature-development-codex.yaml')) as {
+      nodes: { id: string; bash?: string }[];
+    };
+    const opener = lane.nodes.find(node => node.id === 'open-pr-if-needed')?.bash ?? '';
+    const start = opener.indexOf('COMMIT_PUSH_OUTPUT=');
+    const end = opener.indexOf('# WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01', start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const directory = mkdtempSync(join(tmpdir(), 'hook-open-pr-'));
+    try {
+      writeFileSync(join(directory, 'commit-and-push.out'), 'pre-commit hook failed\n');
+      writeFileSync(
+        join(directory, 'commit-and-push-retry.out'),
+        'unique_branch=repair-existing\nREPAIR_TARGET_LEASE_SHA=fresh-head\n'
+      );
+      const script =
+        `set -euo pipefail\nexport ARCHON_NODE_OUT='${directory.replaceAll('\\', '/')}'\nDECIDE_OUTPUT='pr_required: true'\n` +
+        opener.slice(start, end) +
+        '\nprintf "%s:%s\\n" "$UNIQUE_BRANCH" "$REPAIR_TARGET_LEASE_SHA"\n';
+      const result = spawnSync('bash', ['-c', script], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 10000,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim()).toBe('repair-existing:fresh-head');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
   test('lint_hook_failure_classified_and_decided', () => {
     const errorClass = classifyError({ nodeId: 'commit-and-push', message: hookFailure });
     expect(errorClass).toBe('commit_hook_lint_failure');

@@ -3865,7 +3865,14 @@ nodes:
       $war-council-validator.output
       BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023
       )
-      COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")
+      # The first hook failure has no branch output; the successful bounded
+      # retry owns the final branch and refreshed remote lease.
+      COMMIT_PUSH_OUTPUT=$(
+        cat "$ARCHON_NODE_OUT/commit-and-push.out"
+        if [ -f "$ARCHON_NODE_OUT/commit-and-push-retry.out" ]; then
+          cat "$ARCHON_NODE_OUT/commit-and-push-retry.out"
+        fi
+      )
       if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0
@@ -3873,7 +3880,7 @@ nodes:
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: read the unique
       # remote branch the commit-and-push node pushed to; gh pr create must use
       # --head to target that branch rather than the (local) archon/thread-<hash>.
-      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | tail -n 1)
       if [ -z "$UNIQUE_BRANCH" ]; then
         echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
         exit 1

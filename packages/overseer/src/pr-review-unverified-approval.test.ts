@@ -182,6 +182,64 @@ describe('unverified approval persistence and execution', () => {
     ).toBe(false);
   });
 
+  for (const failure of ['throws', 'rejects']) {
+    test(`unverified evidence precedes a comment that ${failure} and still blocks merging`, async () => {
+      const deps = realSubmit();
+      deps.currentHeadSha = async () => head;
+      deps.runReviewer = async () => ({
+        approved: false,
+        approvedUnverified: true,
+        summary: 'sandbox unavailable',
+        reviewedHeadSha: head,
+      });
+      const runId = `pr-discovery:thinmansoftware/bdc-harness#55:${failure}`;
+      await verdictStore.ensureDiscoveryRunRow(runId);
+      await db.query(
+        `INSERT INTO overseer_verdicts
+        (id,run_id,wo_id,head_sha,status,verdict,proposed_action,pr_url)
+        VALUES ('old-ready',$1,'WO-3239',$2,'verdict','merge_candidate','flag_merge_ready',$3)`,
+        [runId, head, prUrl]
+      );
+      const candidate = (await verdictStore.listUnactionedFlagMergeReadyVerdicts())[0];
+      expect(candidate).toBeDefined();
+      let persistedBeforeComment = false;
+      deps.submitReview = async () => {
+        persistedBeforeComment = await verdictStore.hasUnverifiedApprovalForHead(candidate);
+        if (failure === 'throws') throw new Error('synthetic comment failure');
+        return { submitted: false, message: 'synthetic rejected comment' };
+      };
+      const result = await runAndSubmitReview(work, deps);
+      expect(result.disposition).toBe('submission_failed');
+      expect(persistedBeforeComment).toBe(true);
+      expect(await verdictStore.hasUnverifiedApprovalForHead(candidate)).toBe(true);
+      const execution = await bridge();
+      expect(execution.merges).toBe(0);
+      expect(execution.reasons).toContain('approval_unverified');
+    });
+  }
+
+  test('unverified persistence failure prevents GitHub submission', async () => {
+    const deps = realSubmit();
+    deps.currentHeadSha = async () => head;
+    deps.runReviewer = async () => ({
+      approved: false,
+      approvedUnverified: true,
+      summary: 'sandbox unavailable',
+      reviewedHeadSha: head,
+    });
+    deps.recordUnverifiedApproval = async () => {
+      throw new Error('synthetic storage failure');
+    };
+    let submissions = 0;
+    deps.submitReview = async () => {
+      submissions += 1;
+      return { submitted: true };
+    };
+    const result = await runAndSubmitReview(work, deps);
+    expect(result.reason).toBe('unverified_approval_persistence_failed');
+    expect(submissions).toBe(0);
+  });
+
   test('verified_approval_still_merges_as_before', async () => {
     await recordReviewApprovalVerdict({ ...work, disposition: 'approved_unverified' });
     await recordReviewApprovalVerdict({ ...work, disposition: 'approved' });

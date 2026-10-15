@@ -1082,6 +1082,13 @@ export function createRealSubmitDeps(
         ...(indeterminateCode ? { reasonCode: indeterminateCode } : {}),
       };
     },
+    async recordUnverifiedApproval(work): Promise<void> {
+      await (overrides.recordApprovalVerdict ?? recordReviewApprovalVerdict)({
+        ...work,
+        disposition: 'approved_unverified',
+        model: modelReviewer.model,
+      });
+    },
     submitReview: createRealSubmitPullRequestReview(octokit),
     async currentHeadSha(input): Promise<string> {
       const pr = await octokit.pulls.get({

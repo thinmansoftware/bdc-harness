@@ -213,6 +213,8 @@ export interface SubmitDeps {
   reviewerIdentity: string;
   /** Runs the governed reviewer against an exact head. */
   runReviewer(work: ReviewWorkItem): Promise<ReviewerVerdict>;
+  /** Mandatory nonmergeable evidence, persisted before any GitHub delivery. */
+  recordUnverifiedApproval(work: ReviewWorkItem): Promise<void>;
   /** The existing Overseer App adapter's general review submission. */
   submitReview(input: SubmitPullRequestReviewInput): Promise<SubmitPullRequestReviewResult>;
   /**
@@ -501,6 +503,15 @@ export async function runAndSubmitReview(
   if (verdict.approvedUnverified) {
     const reason =
       verdict.verificationReason?.trim() || verdict.summary.trim() || 'verification unavailable';
+    try {
+      await deps.recordUnverifiedApproval(work);
+    } catch {
+      return finish(deps, work, work.headSha, {
+        disposition: 'submission_failed',
+        reason: 'unverified_approval_persistence_failed',
+        event: 'COMMENT',
+      });
+    }
     let submission: SubmitPullRequestReviewResult;
     try {
       submission = await deps.submitReview({

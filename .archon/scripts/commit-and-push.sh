@@ -57,3 +57,9 @@ local_head="$(git rev-parse HEAD)"
 echo "VERIFIED: origin/${unique_branch} == local HEAD (${local_head})"
 printf '%s\n' "$local_head" > "$artifacts_dir/commit-and-push.succeeded"
 echo "unique_branch=${unique_branch}"
+
+# A leased repair push advanced the remote. Downstream retry consumers must
+# use its new head for any bounded visibility re-push.
+if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+  echo "REPAIR_TARGET_LEASE_SHA=${local_head}"
+fi
