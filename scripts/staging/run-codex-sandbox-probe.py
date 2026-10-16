@@ -65,6 +65,11 @@ def main():
         result = docker("start", "-ai", name, input=source.decode("utf-8"))
         # Never print arbitrary container output or inherited image environment.
         if result.returncode:
+            print(json.dumps({"probeFailureBoundary": {
+                "imageId": data["Image"], "apparmor": data.get("AppArmorProfile"),
+                "network": host["NetworkMode"], "readOnlyRoot": host["ReadonlyRootfs"],
+                "user": config["User"], "capDrop": host["CapDrop"],
+                "profileSha256": hashlib.sha256(profile.read_bytes()).hexdigest()}}), flush=True)
             # Synthetic probe only: emit its bounded assertion header, not raw output.
             diagnostic = next((line[:500] for line in result.stderr.splitlines()
                                if line.startswith("error: ")), "no probe assertion header")

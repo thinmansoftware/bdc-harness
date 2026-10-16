@@ -62,8 +62,19 @@ jobs:
           done
           exit 1
       - name: Verify non-model Codex tool sandbox
+        id: codex_sandbox
         run: |
+          echo "SANDBOX_STARTED_AT=$(date --utc '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
+          uname -r
+          docker version --format '{{.Server.Version}}'
+          docker info --format '{{json .SecurityOptions}}'
+          echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
           python3 scripts/staging/run-codex-sandbox-probe.py --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+      - name: Read sandbox kernel denial diagnostics
+        if: failure() && steps.codex_sandbox.outcome == 'failure'
+        run: |
+          # Read-only, time-bounded, filtered to the synthetic sandbox process.
+          sudo journalctl -k --since "$SANDBOX_STARTED_AT" --no-pager | grep 'apparmor="DENIED"' | grep -E 'comm="(codex|bwrap|linux-sandbox)"' | tail -30 || echo "No matching kernel denial evidence available"
       - name: Verify runtime and isolation
         run: |
           python3 scripts/staging/inspect-offline-qualification.py "$QUALIFICATION_CONTAINER" "$(git rev-parse HEAD)" "$COMPOSE_PROJECT_NAME"
