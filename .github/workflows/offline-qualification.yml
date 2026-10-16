@@ -58,6 +58,7 @@ jobs:
           echo "Testing checkout $(git rev-parse HEAD) (PR runs use merge candidate)"
           docker build --build-arg ARCHON_BUILD_SHA="$(git rev-parse HEAD)" -t "$QUALIFICATION_IMAGE" .
       - name: Launch isolated staging
+        id: launch_staging
         run: |
           token=$(openssl rand -hex 32)
           echo "::add-mask::$token"
@@ -80,7 +81,11 @@ jobs:
           docker info --format '{{json .SecurityOptions}}'
           echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
           python3 scripts/staging/run-codex-sandbox-probe.py --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+      - name: Verify empty and hostile project configuration isolation
+        if: ${{ !cancelled() && steps.launch_staging.outcome == 'success' }}
+        run: |
           python3 scripts/staging/run-codex-sandbox-probe.py --kind configuration --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+          python3 scripts/staging/run-codex-sandbox-probe.py --kind configuration --hostile-project --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
       - name: Read sandbox kernel denial diagnostics
         if: failure() && steps.codex_sandbox.outcome == 'failure'
         run: |

@@ -52,3 +52,33 @@ BDC laptop, Docker29.8.2, image source71625bfbe6b8b72590340e6c9059475184e90704,
 image sha256:a12e527c95bf6299722ad346e9df70a81d6cf37ce34030ab0fbe2e6402694295:
 18 runtime probes passed with zero model invocations. Source typecheck and lint
 passed. CI uses the PR's own built image; laptop proof is not substituted for CI.
+
+## Configuration and hostile-project qualification
+
+Run both checks after building the candidate image:
+
+```
+python scripts/staging/run-codex-sandbox-probe.py --kind configuration --image IMAGE --expected-sha SHA
+python scripts/staging/run-codex-sandbox-probe.py --kind configuration --hostile-project --image IMAGE --expected-sha SHA
+```
+
+Configuration checks import the policy helper from the image, then start the pinned
+app-server twice without a model call. They require the exact effective policy,
+disabled extensions, empty MCP/plugin/skill catalogs and immutable empty project
+configuration masks. The null glob_scan_max_depth serializer field is allowed;
+extra access entries or non-null metadata are rejected.
+
+The hostile variant creates one labeled, uniquely named workspace volume. A fixed
+filesystem-only seeder writes synthetic permissive config, a harmless hook marker
+command and a named skill. It runs as UID0 solely to initialize this fresh volume,
+with no capabilities, network or writable root. Readers run as UID1001 with a
+read-only volume. No Codex process ever runs with the hostile files unmasked.
+The configuration probe uses UID1001 and the owned workspace volume under empty
+read-only .codex and .agents tmpfs masks. Before and after hashes must match and
+marker files must be absent. Cleanup removes only the generated containers/volume.
+
+This proves that seeded files remain hidden/inactive during the tested starts,
+not that the fixtures execute unmasked or that authenticated runtime is admitted.
+The runner reports its own hash separately from image/source/probe hashes.
+Laptop image97cf976b passed both configuration starts and this hostile variant;
+the scripts were supplied over stdin, not claimed to be embedded in that image.
