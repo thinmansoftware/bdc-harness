@@ -43,7 +43,17 @@ jobs:
           bun --filter @archon/server test
           bun --filter @archon/server type-check
           bun x tsc --noEmit -p scripts/tsconfig.json
-      - name: Build exact checkout candidate
+      - name: Test restricted provider source candidate
+        # Restricted-provider tests are isolated processes because SDK mocks are global.
+        # The synthetic executable uses the real SDK but never contacts a model.
+        # Runtime admission remains separate from these source checks.
+        run: |
+          cd packages/providers
+          bun test src/codex/restricted-provider.test.ts
+          bun test src/codex/restricted-sdk.test.ts
+          bun test src/codex/provider.test.ts
+          bun x tsc --noEmit
+      - name: Build exact checkout candidate image
         run: |
           echo "Testing checkout $(git rev-parse HEAD) (PR runs use merge candidate)"
           docker build --build-arg ARCHON_BUILD_SHA="$(git rev-parse HEAD)" -t "$QUALIFICATION_IMAGE" .
