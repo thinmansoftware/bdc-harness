@@ -214,11 +214,29 @@ const minimalConfig: WorkflowConfig = {
 it('direct DAG resume rejects an unbound tee-time request before provider or prior-output reuse', async () => {
   const deps = createMockDeps();
   const callsBefore = mockGetAgentProviderDag.mock.calls.length;
-  await expect(executeDagWorkflow(deps, createMockPlatform(), 'conv', '/test',
-    { name: 'bdc-teetime-foundation', nodes: [] },
-    makeWorkflowRun('restricted-resume', { user_message: 'WO-TEETIME-FOUNDATION-01', codebase_id: null }),
-    'claude', 'opus', '/test/artifacts', '/test/logs', 'staging', 'docs', minimalConfig,
-    undefined, undefined, new Map([['prior-node', 'untrusted prior output']]))).rejects.toThrow('stored codebase identity');
+  await expect(
+    executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'conv',
+      '/test',
+      { name: 'bdc-teetime-foundation', nodes: [] },
+      makeWorkflowRun('restricted-resume', {
+        user_message: 'WO-TEETIME-FOUNDATION-01',
+        codebase_id: null,
+      }),
+      'claude',
+      'opus',
+      '/test/artifacts',
+      '/test/logs',
+      'staging',
+      'docs',
+      minimalConfig,
+      undefined,
+      undefined,
+      new Map([['prior-node', 'untrusted prior output']])
+    )
+  ).rejects.toThrow('stored codebase identity');
   expect(mockGetAgentProviderDag.mock.calls.length).toBe(callsBefore);
 });
 
