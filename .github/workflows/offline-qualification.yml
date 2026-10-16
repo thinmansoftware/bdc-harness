@@ -80,6 +80,7 @@ jobs:
           docker info --format '{{json .SecurityOptions}}'
           echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
           python3 scripts/staging/run-codex-sandbox-probe.py --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+          python3 scripts/staging/run-codex-sandbox-probe.py --kind configuration --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
       - name: Read sandbox kernel denial diagnostics
         if: failure() && steps.codex_sandbox.outcome == 'failure'
         run: |

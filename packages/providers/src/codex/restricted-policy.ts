@@ -50,6 +50,7 @@ export function restrictedClientOptions(): CodexOptions {
       model_provider: 'openai',
       notify: [],
       agents: { enabled: false },
+      skills: { bundled: { enabled: false }, include_instructions: false },
       features: {
         hooks: false,
         apps: false,

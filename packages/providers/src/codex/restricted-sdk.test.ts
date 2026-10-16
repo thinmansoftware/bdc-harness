@@ -59,6 +59,8 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:0,output_t
       }
       expect(call.args).toContain('features.skip_host_skill_discovery=true');
       expect(call.args).toContain('agents.enabled=false');
+      expect(call.args).toContain('skills.bundled.enabled=false');
+      expect(call.args).toContain('skills.include_instructions=false');
       expect(call.args).toContain('notify=[]');
       expect(call.args).toContain('model_provider="openai"');
       expect(call.args).toContain(restrictedClientOptions().configOverrides![0]);

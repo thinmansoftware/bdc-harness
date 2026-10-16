@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--docker", default="docker")
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-sha", required=True)
+    parser.add_argument("--kind", choices=["sandbox", "configuration"], default="sandbox")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     profile = root / "codex-probe-seccomp.json"
@@ -23,7 +24,7 @@ def main():
     assert len(inventory) == 12 and all(item["removed"] is False for item in inventory)
     assert candidate == {**baseline, "syscalls": baseline["syscalls"] +
                          [item["rule"] for item in inventory]}, "unreviewed seccomp delta"
-    source = (root / "probe-codex-sandbox.ts").read_bytes()
+    source = (root / ("probe-codex-" + args.kind + ".ts")).read_bytes()
     name = "teetime-sandbox-probe-" + uuid.uuid4().hex[:12]
     temporary = {"/tmp", "/home/appuser", "/workspace", "/protected"}
 
@@ -38,6 +39,10 @@ def main():
                "--env", "TEE_TIME_SANDBOX_PROBE=1", "--entrypoint", "bun"]
     for path in sorted(temporary):
         options.extend(["--tmpfs", path + ":uid=1001,gid=1001"])
+    if args.kind == "configuration":
+        for path in ["/workspace/.codex", "/workspace/.agents"]:
+            temporary.add(path)
+            options.extend(["--tmpfs", path + ":ro,uid=1001,gid=1001"])
     options.extend([args.image, "run", "-"])
     try:
         created = docker(*options)
@@ -57,6 +62,9 @@ def main():
         assert not host.get("PidMode") and not host.get("Binds")
         assert not data["Mounts"], "unexpected persistent mount"
         assert set(host["Tmpfs"]) == temporary
+        if args.kind == "configuration":
+            for path in ["/workspace/.codex", "/workspace/.agents"]:
+                assert "ro" in host["Tmpfs"][path].split(","), "writable config mask"
         assert config["User"] == "1001:1001" and config["WorkingDir"] == "/workspace"
         assert config["Entrypoint"] == ["bun"] and config["Cmd"] == ["run", "-"]
         environment = dict(item.split("=", 1) for item in config["Env"] if "=" in item)
