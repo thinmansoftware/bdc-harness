@@ -233,6 +233,7 @@ COPY --from=web-build /app/packages/web/dist/ ./packages/web/dist/
 COPY config/ ./config/
 COPY .archon/ ./.archon/
 COPY migrations/ ./migrations/
+COPY scripts/staging/verify-offline-qualification.ts ./scripts/staging/verify-offline-qualification.ts
 COPY tsconfig*.json ./
 
 # Fix permissions for appuser

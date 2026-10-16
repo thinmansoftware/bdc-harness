@@ -1,0 +1,40 @@
+# Offline candidate qualification only. No model run or product demo.
+# Explicit image tag is required; launch with a fresh operator token.
+name: archon-teetime-qualification
+services:
+  app:
+    image: ${QUALIFICATION_IMAGE:?Set exact candidate image tag}
+    container_name: ${QUALIFICATION_CONTAINER:-archon-teetime-qualification}
+    user: "1001:1001"
+    entrypoint: ["bun", "packages/server/src/index.ts"]
+    working_dir: /app
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    environment:
+      ARCHON_OFFLINE_QUALIFICATION: "1"
+      ARCHON_OPERATOR_TOKEN: ${QUALIFICATION_OPERATOR_TOKEN:?Fresh operator token required}
+      ARCHON_DOCKER: "true"
+      DEFAULT_AI_ASSISTANT: codex-native-strict
+      HOME: /home/appuser
+      PORT: "3092"
+      OVERSEER_ENABLED: "false"
+      OVERSEER_EMERGENCY_STOP: "true"
+      TASKMASTER_INTERVAL_MS: "0"
+      TASKMASTER_DEADMAN_INTERVAL_MS: "0"
+      OPERATOR_INBOX_INTERVAL_MS: "0"
+    tmpfs:
+      - /tmp:uid=1001,gid=1001,mode=1777
+      - /home/appuser:uid=1001,gid=1001,mode=0755
+      - /host-artifacts:uid=1001,gid=1001,mode=0755
+    volumes:
+      - qualification-data:/.archon
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:3092/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+volumes:
+  qualification-data:

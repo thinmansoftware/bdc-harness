@@ -10,6 +10,7 @@ import { rm, readFile, writeFile, unlink, mkdir } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
 import { createHash, randomUUID } from 'crypto';
+import { OFFLINE_QUALIFICATION } from '@archon/paths/offline-qualification';
 import type { Context } from 'hono';
 import type {
   ConversationLockManager,
@@ -2958,6 +2959,13 @@ export function registerApiRoutes(
     return next();
   });
 
+  app.use('/api/*', async (c, next) => {
+    if (OFFLINE_QUALIFICATION && !['GET', 'HEAD', 'OPTIONS'].includes(c.req.method)) {
+      return apiError(c, 403, 'offline_qualification_execution_disabled');
+    }
+    return next();
+  });
+
   // Shared lock/dispatch/error handling for message and workflow endpoints
   /** Maximum allowed upload size per file (10 MB) */
   const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -3529,7 +3537,11 @@ export function registerApiRoutes(
     }
   }
 
-  if (process.env.NODE_ENV !== 'test' && providerWaitSchedulerTimer === undefined) {
+  if (
+    !OFFLINE_QUALIFICATION &&
+    process.env.NODE_ENV !== 'test' &&
+    providerWaitSchedulerTimer === undefined
+  ) {
     const schedulerStore = createWorkflowDeps().store;
     const schedulerOwnerId = `provider-wait:${randomUUID()}`;
     const configuredInterval = Number.parseInt(
@@ -3571,7 +3583,7 @@ export function registerApiRoutes(
   // Skeleton cloned from the provider-wait scheduler above; the timer
   // singleton, inFlight guard, and TASKMASTER_INTERVAL_MS handling
   // (default 60000, 0 = off) live in ../taskmaster/loop.ts.
-  if (process.env.NODE_ENV !== 'test') {
+  if (!OFFLINE_QUALIFICATION && process.env.NODE_ENV !== 'test') {
     startTaskmaster(randomUUID());
     // External dead-man checker (binding condition 5 / Q4): lives in the
     // Overseer package and observes the taskmaster ONLY via
