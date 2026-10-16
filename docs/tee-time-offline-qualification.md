@@ -44,3 +44,29 @@ issue. HTTP 200 alone does not satisfy this gate.
 
 Normal-mode regressions and live model transport remain separate gates. Do not
 use this mode as evidence that Cursor or Codex builder tools are sandboxed.
+
+## CI qualification
+
+`.github/workflows/offline-qualification.yml` runs on relevant pull requests and
+manual dispatch. It uses a fresh hosted runner, read-only repository permission,
+pinned checkout/Bun actions, no provider secrets, and a random masked operator
+token. It runs the canonical server test command (which isolates mock-bearing
+suites in separate Bun processes), builds the exact checkout SHA, starts this
+profile, and runs both runtime and host-side isolation checks.
+
+The PR run tests GitHub's merge candidate, not necessarily the PR head SHA.
+Evidence identifies the checkout SHA and Docker image ID explicitly. The CI
+project and container are unique to run ID and attempt. Cleanup removes only
+that disposable CI project's volume; laptop qualification data remains retained.
+No promotion or live model execution follows a successful qualification.
+
+Host-side inspection (Python and Docker required):
+
+```text
+python scripts/staging/inspect-offline-qualification.py CONTAINER FULL_SHA PROJECT
+```
+
+The inspector asserts the image source SHA, UID, root filesystem, network,
+capabilities, privilege settings, entrypoint, exact isolated mounts, health, and
+absence of published ports/devices. It emits an allowlisted summary rather than
+raw Docker inspection data, which would expose the operator token.

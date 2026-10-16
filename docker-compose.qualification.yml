@@ -4,7 +4,7 @@ name: archon-teetime-qualification
 services:
   app:
     image: ${QUALIFICATION_IMAGE:?Set exact candidate image tag}
-    container_name: archon-teetime-qualification
+    container_name: ${QUALIFICATION_CONTAINER:-archon-teetime-qualification}
     user: "1001:1001"
     entrypoint: ["bun", "packages/server/src/index.ts"]
     working_dir: /app
