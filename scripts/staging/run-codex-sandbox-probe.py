@@ -65,8 +65,10 @@ def main():
         result = docker("start", "-ai", name, input=source.decode("utf-8"))
         # Never print arbitrary container output or inherited image environment.
         if result.returncode:
+            stopped = json.loads(docker("inspect", name, check=True).stdout)[0]
             print(json.dumps({"probeFailureBoundary": {
-                "imageId": data["Image"], "apparmor": data.get("AppArmorProfile"),
+                "imageId": data["Image"], "apparmor": stopped.get("AppArmorProfile"),
+                "pid": stopped["State"]["Pid"], "containerId": stopped["Id"],
                 "network": host["NetworkMode"], "readOnlyRoot": host["ReadonlyRootfs"],
                 "user": config["User"], "capDrop": host["CapDrop"],
                 "profileSha256": hashlib.sha256(profile.read_bytes()).hexdigest()}}), flush=True)
