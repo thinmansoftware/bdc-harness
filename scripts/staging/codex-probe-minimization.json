@@ -1,0 +1,176 @@
+[
+  {
+    "rule": {
+      "names": ["clone"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 268566528,
+          "valueTwo": 268566528,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces. On e.g. debian this can be enabled with 'sysctl kernel.unprivileged_userns_clone=1'."
+  },
+  {
+    "rule": {
+      "names": ["mount"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 3,
+          "value": 573440,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: Failed to make / slave: Operation not permitted"
+  },
+  {
+    "rule": {
+      "names": ["mount"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 3,
+          "value": 6,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: Failed to mount tmpfs: Operation not permitted"
+  },
+  {
+    "rule": {
+      "names": ["mount"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 3,
+          "value": 3236810752,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: setting up newroot bind: Operation not permitted"
+  },
+  {
+    "rule": {
+      "names": ["pivot_root"],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: pivot_root: Operation not permitted"
+  },
+  {
+    "rule": {
+      "names": ["mount"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 3,
+          "value": 53248,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: Can't bind mount /oldroot/dev/null on /newroot/dev/null: Unable to mount source on destination: Operation not permitted"
+  },
+  {
+    "rule": {
+      "names": ["mount"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 3,
+          "value": 2134055,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: Can't bind mount /oldroot/app on /newroot/app: Unable to remount destination \"/newroot/app\" with correct flags: Operation not permitted"
+  },
+  {
+    "rule": {
+      "args": [
+        {
+          "value": 10,
+          "op": "SCMP_CMP_EQ",
+          "index": 3
+        }
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "names": ["mount"]
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: Can't mount devpts on /newroot/dev/pts: Operation not permitted"
+  },
+  {
+    "rule": {
+      "names": ["mount"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "value": 2134063,
+          "index": 3,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: Can't bind mount /oldroot/workspace on /newroot/workspace: Unable to remount destination \"/newroot/workspace\" with correct flags: Operation not permitted"
+  },
+  {
+    "rule": {
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "value": 311296,
+          "index": 3,
+          "op": "SCMP_CMP_EQ"
+        }
+      ],
+      "names": ["mount"]
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: Failed to make old root rprivate: Operation not permitted"
+  },
+  {
+    "rule": {
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "op": "SCMP_CMP_EQ",
+          "value": 2,
+          "index": 1
+        }
+      ],
+      "names": ["umount2"]
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: unmount old root: Operation not permitted"
+  },
+  {
+    "rule": {
+      "names": ["unshare"],
+      "args": [
+        {
+          "op": "SCMP_CMP_EQ",
+          "value": 268435456,
+          "index": 0
+        }
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    "removed": false,
+    "diagnostic": "error: workspace-write: sandbox did not start the probe command: bwrap: unshare user ns: Operation not permitted"
+  }
+]
