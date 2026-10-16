@@ -85,7 +85,9 @@ jobs:
         if: failure() && steps.codex_sandbox.outcome == 'failure'
         run: |
           # Read-only, time-bounded, filtered to the synthetic sandbox process.
-          sudo journalctl -k --since "$SANDBOX_STARTED_AT" --no-pager | grep 'apparmor="DENIED"' | grep -E 'comm="(codex|bwrap|linux-sandbox)"' | tail -30 || echo "No matching kernel denial evidence available"
+          set -o pipefail
+          sudo journalctl -k --since "$SANDBOX_STARTED_AT" --no-pager | grep 'apparmor="DENIED"' | grep -E 'comm="(codex[^"]*|bwrap|linux-sandbox)"|profile="docker-default"' | tail -30 || echo "No matching journal denial evidence available"
+          sudo dmesg --since "$SANDBOX_STARTED_AT" | grep 'apparmor="DENIED"' | grep -E 'comm="(codex[^"]*|bwrap|linux-sandbox)"|profile="docker-default"' | tail -30 || echo "No matching dmesg denial evidence available"
       - name: Verify runtime and isolation
         run: |
           python3 scripts/staging/inspect-offline-qualification.py "$QUALIFICATION_CONTAINER" "$(git rev-parse HEAD)" "$COMPOSE_PROJECT_NAME"
