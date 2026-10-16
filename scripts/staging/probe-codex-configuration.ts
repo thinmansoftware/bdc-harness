@@ -125,7 +125,8 @@ async function inspectCatalogs(): Promise<void> {
             requireCondition(permissions.filesystem[path] === access, 'filesystem policy mismatch');
           }
           requireCondition(
-            Object.keys(permissions.filesystem).length === 5,
+            Object.keys(permissions.filesystem).length === 6 &&
+              permissions.filesystem.glob_scan_max_depth === null,
             'additional filesystem permission'
           );
           requireCondition(config.model_provider === 'openai', 'provider mismatch');
