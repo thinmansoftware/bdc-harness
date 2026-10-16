@@ -82,3 +82,22 @@ not that the fixtures execute unmasked or that authenticated runtime is admitted
 The runner reports its own hash separately from image/source/probe hashes.
 Laptop image97cf976b passed both configuration starts and this hostile variant;
 the scripts were supplied over stdin, not claimed to be embedded in that image.
+
+## Reachable peer network qualification
+
+```
+python scripts/staging/run-codex-sandbox-probe.py --isolated-network --image IMAGE --expected-sha SHA
+```
+
+The runner resolves the image to an immutable ID, creates one owned internal Docker
+bridge and a fixed synthetic HTTP peer, and inspects both containers before starting.
+No public ports, internet route, host mounts or provider credentials are introduced.
+The parent must reach the peer and read its exact response before and after the
+direct/nested sandbox attempts, which must fail with connection-denial diagnostics.
+All22 assertions passed on laptop image97cf976b. The wrapper requires the four peer
+results explicitly; skipped peer tests cannot count as success. The inspected peer
+address is passed through an exact checked env value, with proxy use disabled.
+Container cleanup precedes removal of the uniquely labeled network.
+
+This proves tool denial to a reachable bridge peer. It does not establish permitted
+OpenAI transport, internet/DNS policy or real authenticated runtime readiness.

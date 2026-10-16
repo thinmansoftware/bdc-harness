@@ -16,9 +16,12 @@ def main():
     parser.add_argument("--expected-sha", required=True)
     parser.add_argument("--kind", choices=["sandbox", "configuration"], default="sandbox")
     parser.add_argument("--hostile-project", action="store_true")
+    parser.add_argument("--isolated-network", action="store_true")
     args = parser.parse_args()
     if args.hostile_project and args.kind != "configuration":
         parser.error("--hostile-project requires --kind configuration")
+    if args.isolated_network and args.kind != "sandbox":
+        parser.error("--isolated-network requires --kind sandbox")
     root = Path(__file__).resolve().parent
     profile = root / "codex-probe-seccomp.json"
     baseline = json.loads((root / "moby-default-seccomp.json").read_text())
@@ -30,11 +33,52 @@ def main():
     source = (root / ("probe-codex-" + args.kind + ".ts")).read_bytes()
     name = "teetime-sandbox-probe-" + uuid.uuid4().hex[:12]
     volume = name + "-workspace" if args.hostile_project else None
+    network = name + "-network" if args.isolated_network else None
+    peer = name + "-peer"
     temporary = {"/tmp", "/home/appuser", "/workspace", "/protected"}
 
     def docker(*parts, **kwargs):
         return subprocess.run([args.docker, *parts], capture_output=True,
                               text=True, timeout=120, **kwargs)
+
+    image_id = docker("image", "inspect", args.image, "--format", "{{.Id}}", check=True).stdout.strip()
+    assert image_id.startswith("sha256:") and len(image_id) == 71
+    peer_url = None
+
+    def inspect_network():
+        state = json.loads(docker("network", "inspect", network, check=True).stdout)[0]
+        assert state["Name"] == network and state["Internal"] is True
+        assert state["Driver"] == "bridge" and state["Labels"].get("teetime.probe") == name
+
+    def start_peer():
+        docker("network", "create", "--internal", "--driver", "bridge",
+               "--label", "teetime.probe=" + name, network, check=True)
+        inspect_network()
+        command = 'Bun.serve({hostname:"0.0.0.0",port:3999,fetch(){return new Response("teetime-peer")}})'
+        docker("create", "--name", peer, "--network", network, "--read-only",
+               "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+               "--user", "1001:1001", "--entrypoint", "bun", image_id,
+               "-e", command, check=True)
+        data = json.loads(docker("inspect", peer, check=True).stdout)[0]
+        host, config = data["HostConfig"], data["Config"]
+        assert data["Name"] == "/" + peer and host["NetworkMode"] == network
+        assert host["ReadonlyRootfs"] and not host.get("Privileged")
+        assert host["CapDrop"] == ["ALL"] and not host.get("CapAdd")
+        assert host["SecurityOpt"] == ["no-new-privileges:true"]
+        assert not host.get("Binds") and not host.get("Devices") and not data["Mounts"]
+        assert not host.get("PortBindings") and not host.get("PidMode")
+        assert config["User"] == "1001:1001" and config["Entrypoint"] == ["bun"]
+        assert config["Cmd"] == ["-e", command]
+        assert set(data["NetworkSettings"]["Networks"]) == {network}
+        environment = dict(item.split("=", 1) for item in config["Env"] if "=" in item)
+        assert environment.get("ARCHON_BUILD_SHA") == args.expected_sha
+        docker("start", peer, check=True)
+        data = json.loads(docker("inspect", peer, check=True).stdout)[0]
+        assert data["State"]["Running"] and set(data["NetworkSettings"]["Networks"]) == {network}
+        import ipaddress
+        address = ipaddress.IPv4Address(data["NetworkSettings"]["Networks"][network]["IPAddress"])
+        assert address.is_private and not address.is_loopback
+        return "http://" + str(address) + ":3999"
 
     def inspect_fixture_mount(data, writable=True):
         mounts = data["Mounts"]
@@ -88,7 +132,7 @@ console.log(JSON.stringify(hashes));
                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                    "--user", uid, "--mount", "type=volume,src=" + volume + ",dst=/workspace" +
                    ("" if seed else ",readonly"),
-                   "--workdir", "/workspace", "--entrypoint", "bun", args.image,
+                   "--workdir", "/workspace", "--entrypoint", "bun", image_id,
                    "run", "-", check=True)
             data = json.loads(docker("inspect", step_name, check=True).stdout)[0]
             host, config = data["HostConfig"], data["Config"]
@@ -117,7 +161,7 @@ console.log(JSON.stringify(hashes));
             if remaining.returncode or (remaining.stdout.strip() and docker("rm", "-f", step_name).returncode):
                 raise RuntimeError("fixture container cleanup failed: " + step_name)
 
-    options = ["create", "-i", "--name", name, "--network", "none", "--read-only",
+    options = ["create", "-i", "--name", name, "--network", network or "none", "--read-only",
                "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                "--security-opt", "seccomp=" + str(profile), "--user", "1001:1001",
                "--workdir", "/workspace", "--env", "HOME=/home/appuser",
@@ -131,8 +175,11 @@ console.log(JSON.stringify(hashes));
         for path in ["/workspace/.codex", "/workspace/.agents"]:
             temporary.add(path)
             options.extend(["--tmpfs", path + ":ro,uid=1001,gid=1001"])
-    options.extend([args.image, "run", "-"])
     try:
+        if network:
+            peer_url = start_peer()
+            options.extend(["--env", "TEE_TIME_PROBE_PEER=" + peer_url])
+        options.extend([image_id, "run", "-"])
         if volume:
             docker("volume", "create", "--label", "teetime.probe=" + name, volume, check=True)
             owned = json.loads(docker("volume", "inspect", volume, check=True).stdout)[0]
@@ -146,7 +193,10 @@ console.log(JSON.stringify(hashes));
         data = json.loads(inspected.stdout)[0]
         host, config = data["HostConfig"], data["Config"]
         assert data["Name"] == "/" + name
-        assert host["NetworkMode"] == "none" and host["ReadonlyRootfs"]
+        assert host["NetworkMode"] == (network or "none") and host["ReadonlyRootfs"]
+        if network:
+            inspect_network()
+            assert set(data["NetworkSettings"]["Networks"]) == {network}
         assert not host.get("Privileged") and not host.get("CapAdd")
         assert "ALL" in host["CapDrop"]
         assert "no-new-privileges:true" in host["SecurityOpt"]
@@ -167,6 +217,8 @@ console.log(JSON.stringify(hashes));
         environment = dict(item.split("=", 1) for item in config["Env"] if "=" in item)
         assert environment.get("ARCHON_BUILD_SHA") == args.expected_sha
         assert environment.get("TEE_TIME_SANDBOX_PROBE") == "1"
+        if network:
+            assert environment.get("TEE_TIME_PROBE_PEER") == peer_url
         result = docker("start", "-ai", name, input=source.decode("utf-8"))
         # Never print arbitrary container output or inherited image environment.
         if result.returncode:
@@ -188,6 +240,11 @@ console.log(JSON.stringify(hashes));
             assert fixture_step(False) == fixture_before
             evidence["hostileProjectHidden"] = True
             evidence["fixtureHashes"] = fixture_before
+        if network:
+            results = evidence["results"]
+            assert results["baseline-peer-network"] == results["baseline-peer-network-after"] == 0
+            assert results["tool-peer-network"] == results["nested-peer-network"] == 7
+            evidence["internalBridgePeer"] = True
         print(json.dumps({"passed": True, "imageId": data["Image"],
                           "sourceSha": args.expected_sha,
                           "profileSha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
@@ -200,6 +257,16 @@ console.log(JSON.stringify(hashes));
             raise RuntimeError("could not verify probe cleanup for " + name)
         if remaining.stdout.strip() and docker("rm", "-f", name).returncode:
             raise RuntimeError("probe cleanup failed for " + name)
+        if network:
+            remaining = docker("container", "ls", "-aq", "--filter", "name=^/" + peer + "$")
+            if remaining.returncode or (remaining.stdout.strip() and docker("rm", "-f", peer).returncode):
+                raise RuntimeError("peer cleanup failed: " + peer)
+            existing = docker("network", "ls", "-q", "--filter", "name=^" + network + "$")
+            if existing.returncode:
+                raise RuntimeError("could not verify network cleanup: " + network)
+            if existing.stdout.strip():
+                inspect_network()
+                docker("network", "rm", network, check=True)
         if volume:
             existing = docker("volume", "ls", "-q", "--filter", "name=^" + volume + "$")
             if existing.returncode:
