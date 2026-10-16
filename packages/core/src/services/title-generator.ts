@@ -5,6 +5,8 @@
  * Optionally uses TITLE_GENERATION_MODEL env var for a cheaper/faster model.
  * Designed to be fire-and-forget -- never throws, all errors logged internally.
  */
+import { resolveTeeTimePolicy } from '@archon/paths/tee-time-policy';
+import * as codebaseDb from '../db/codebases';
 import { getAgentProvider } from '@archon/providers';
 import * as conversationDb from '../db/conversations';
 import { createLogger } from '@archon/paths';
@@ -38,6 +40,15 @@ export async function generateAndSetTitle(
   workflowName?: string
 ): Promise<void> {
   try {
+    const conversation = await conversationDb.getConversationById(conversationDbId);
+    if (!conversation) throw new Error('Title identity unavailable');
+    const codebase = conversation.codebase_id
+      ? await codebaseDb.getCodebase(conversation.codebase_id)
+      : null;
+    if (resolveTeeTimePolicy(codebase, userMessage)) {
+      await conversationDb.updateConversationTitle(conversationDbId, truncateMessage(userMessage));
+      return;
+    }
     getLog().debug({ conversationDbId, assistantType }, 'title.generate_started');
 
     // Model: use TITLE_GENERATION_MODEL env var if set, otherwise let SDK use its default

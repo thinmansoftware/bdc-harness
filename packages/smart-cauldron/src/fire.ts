@@ -9,6 +9,11 @@
  * Secret boundary: apiBaseUrl and token come from the caller or environment.
  */
 
+import {
+  resolveTeeTimePolicy,
+  TEE_TIME_WORKFLOW,
+  policyBlocked,
+} from '@archon/paths/tee-time-policy';
 import type { FireResult } from './types.js';
 import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
 
@@ -32,6 +37,7 @@ interface FireTierOptions {
 interface CodebaseSummary {
   id: string;
   name: string;
+  repository_url: string | null;
 }
 
 interface AtomicConversationResponse {
@@ -117,7 +123,9 @@ async function resolveCodebaseId(
     };
   }
 
-  return { codebaseId: matches[0]?.id ?? null, error: null };
+  const selected = matches[0];
+  resolveTeeTimePolicy(selected ?? null, project);
+  return { codebaseId: selected?.id ?? null, error: null };
 }
 
 /** Fire a WO and return only after its workflow run row is discoverable. */
@@ -134,6 +142,8 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
   } = opts;
 
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
+  if (/whats-that-tee-time/i.test(project) && workflowName !== TEE_TIME_WORKFLOW)
+    policyBlocked('workflow is forbidden');
   const binding = await resolveCodebaseId(project, apiBaseUrl, token);
   if (binding.codebaseId === null) {
     return { ok: false, runId: null, conversationId: null, infraError: binding.error };

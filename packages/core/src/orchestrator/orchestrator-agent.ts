@@ -6,6 +6,11 @@
  * - Can answer directly or invoke workflows
  * - Does NOT require a project to be selected before starting a conversation
  */
+import {
+  resolveTeeTimePolicy,
+  policyBlocked,
+  TEE_TIME_WORKFLOW,
+} from '@archon/paths/tee-time-policy';
 import { existsSync } from 'fs';
 import { createLogger } from '@archon/paths';
 import type {
@@ -622,6 +627,13 @@ export async function handleMessage(
       conversationId
     );
 
+    const boundCodebase = conversation.codebase_id
+      ? await codebaseDb.getCodebase(conversation.codebase_id)
+      : null;
+    const restricted = resolveTeeTimePolicy(boundCodebase, message);
+    if (restricted && !message.startsWith(`/workflow run ${TEE_TIME_WORKFLOW} `)) {
+      policyBlocked('restricted project accepts only its explicit foundation workflow command');
+    }
     // 1c. Auto-generate title for untitled conversations (fire-and-forget)
     if (!conversation.title && !message.startsWith('/')) {
       void generateAndSetTitle(

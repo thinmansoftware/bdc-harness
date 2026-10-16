@@ -102,7 +102,10 @@ mock.module('@archon/isolation', () => ({
 
 mock.module('../workflows/store-adapter', () => ({
   createWorkflowDeps: mock(() => ({
-    store: { createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })) },
+    store: {
+      getCodebase: mockGetCodebase,
+      createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })),
+    },
     getAgentProvider: () => ({}),
     loadConfig: async () => ({}),
   })),
@@ -210,6 +213,19 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
     // The worker gets its OWN unique id, not the parent's conversation id.
     expect(resolveArg.hints?.workflowId).not.toBe('parent-platform-conv');
     expect(String(resolveArg.hints?.workflowId)).toMatch(/^web-worker-/);
+  });
+
+  test('restricted request with mismatched stored identity rejects before worker or isolation', async () => {
+    await expect(
+      dispatchBackgroundWorkflow(
+        makeCtx({ originalMessage: 'WO-TEETIME-FOUNDATION-01' }),
+        makeWorkflow()
+      )
+    ).rejects.toThrow('stored codebase identity');
+    expect(mockGetOrCreateConversation).not.toHaveBeenCalled();
+    expect(mockResolve).not.toHaveBeenCalled();
+    expect(mockFreeze).not.toHaveBeenCalled();
+    expect(callOrder).toEqual([]);
   });
 
   test('no isolation hints -> preserves thread default with worker workflowId', async () => {

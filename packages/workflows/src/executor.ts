@@ -1,6 +1,12 @@
 /**
  * Workflow Executor - runs DAG-based workflows
  */
+import {
+  resolveRestrictedRun,
+  guardTeeTimeProviders,
+  assertRestrictedResume,
+} from './tee-time-policy';
+import { policyBlocked, assertTeeTimeAuthority } from '@archon/paths/tee-time-policy';
 import { mkdir, readFile } from 'fs/promises';
 import { join, resolve } from 'path';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
@@ -547,6 +553,12 @@ export async function executeWorkflow(
   authoritySource?: RunAuthorityDispatch,
   modelOverride?: ModelOverride
 ): Promise<WorkflowExecutionResult> {
+  const executionPolicy = await resolveRestrictedRun(deps, codebaseId, userMessage, workflow);
+  if (executionPolicy) {
+    if (modelOverride) policyBlocked('run model overrides are disabled for restricted foundation');
+    deps = guardTeeTimeProviders(deps);
+  }
+  if (preCreatedRun) assertRestrictedResume(preCreatedRun, executionPolicy);
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
   const dbEnvVars = codebaseId ? await deps.store.getCodebaseEnvVars(codebaseId) : {};
@@ -624,6 +636,7 @@ export async function executeWorkflow(
 
     // Step 2: Activate the resume -- propagate as error if this fails
     if (resumableRun) {
+      assertRestrictedResume(resumableRun, executionPolicy);
       // Load completed node outputs from the prior run's events.
       let priorNodes: Map<string, string>;
       try {
@@ -741,6 +754,7 @@ export async function executeWorkflow(
         user_message: userMessage,
         working_path: cwd,
         metadata: {
+          ...(executionPolicy ? { execution_policy: executionPolicy } : {}),
           ...(issueContext ? { github_context: issueContext } : {}),
           ...(modelOverride ? { model_override: modelOverride } : {}),
         },
@@ -989,6 +1003,7 @@ export async function executeWorkflow(
         const frozen = await deps.freezeWorkOrderSource(workflow.run_authority, userMessage);
         effectiveAuthoritySource = { ...frozen, dispatchId: conversationId };
       }
+      assertTeeTimeAuthority(executionPolicy, effectiveAuthoritySource ?? existingAuthority);
       if (effectiveAuthoritySource) {
         // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): the WO's
         // declared "Base branch:" overrides the auto-detected repo default so the

@@ -17,6 +17,13 @@
  * No hardcoded model names or workflow names in this file -- all in config.
  */
 
+import {
+  isTeeTimeProject,
+  isTeeTimeRequest,
+  policyBlocked,
+  TEE_TIME_WORKFLOW,
+  TEE_TIME_POLICY_HASH,
+} from '@archon/paths/tee-time-policy';
 import { randomUUID } from 'crypto';
 import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
 import { execFile } from 'child_process';
@@ -314,13 +321,27 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       process.env.SMART_CAULDRON_ALLOW_CLAIMED === 'true');
 
   // Load config from files (never from inline constants)
-  const tiers = loadLadder();
+  const restricted = isTeeTimeProject(project);
+  if (isTeeTimeRequest(woId) && !restricted) policyBlocked('WO/project mismatch');
+  if (restricted && !/^WO-TEETIME-FOUNDATION-[0-9]+$/.test(woId))
+    policyBlocked('only foundation work is admitted');
+  if (restricted && entryOverride && entryOverride !== 'cursor')
+    policyBlocked('entry tier is forbidden');
+  const loadedTiers = loadLadder();
+  const restrictedTier = loadedTiers.find(tier => tier.name === 'cursor');
+  if (restricted && !restrictedTier) policyBlocked('restricted tier is missing');
+  const tiers =
+    restricted && restrictedTier
+      ? [{ ...restrictedTier, workflowName: TEE_TIME_WORKFLOW }]
+      : loadedTiers;
   const ruleset = opts.deps?.ruleset ?? loadRuleset();
   const refusedTiers = loadRefusedTiers();
   const premiumTiers = loadPremiumTiers();
 
   // Conductor: pick entry tier (ruleset), or honor explicit --entry override
-  let entryTierName = entryOverride ?? pickEntryTier({ woClass, tags }, ruleset);
+  let entryTierName = restricted
+    ? ('cursor' as TierName)
+    : (entryOverride ?? pickEntryTier({ woClass, tags }, ruleset));
 
   // Dark/retired lanes are never live entry points. An explicit --entry onto a
   // refused tier is an operator error and throws; a RULESET pick that lands on a
@@ -353,7 +374,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   }
 
   let entrySelection: EntrySelection | undefined;
-  if (opts.deps?.seatUsage) {
+  if (!restricted && opts.deps?.seatUsage) {
     const usage = await readSeatUsageOrNull(opts.deps.seatUsage);
     entrySelection = chooseHeadroomEntry({
       picked: entryTierName,
@@ -392,6 +413,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       );
     }
     const record: CascadeRunRecord = {
+      ...(restricted ? { executionPolicy: TEE_TIME_POLICY_HASH } : {}),
       cascadeId,
       woId,
       project: project ?? null,
@@ -434,6 +456,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         `active cascadeId=${woLock.record.cascadeId}`
     );
     const blocked: CascadeRunRecord = {
+      ...(restricted ? { executionPolicy: TEE_TIME_POLICY_HASH } : {}),
       cascadeId,
       woId,
       project,
@@ -468,6 +491,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           `[${existingClaim.state}] ${existingClaim.url} -- skipping cascade`
       );
       const refused: CascadeRunRecord = {
+        ...(restricted ? { executionPolicy: TEE_TIME_POLICY_HASH } : {}),
         cascadeId,
         woId,
         project,
@@ -509,6 +533,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     const emitEscalation = async (
       context: Omit<EscalationCallContext, 'sourceEventId' | 'sourceEventCreatedAt' | 'repository'>
     ): Promise<void> => {
+      if (restricted) return; // Durable local record only; no model-backed escalation.
       // The last recorded attempt is the natural source event for an escalation.
       // The frontier-approval gate (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01)
       // can pause with zero prior attempts when the conductor resolves entry
@@ -537,6 +562,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
       const climbed = climbCount > 0;
       return {
+        ...(restricted ? { executionPolicy: TEE_TIME_POLICY_HASH } : {}),
         cascadeId,
         woId,
         project: project ?? null,
@@ -594,8 +620,13 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       failReason: string,
       runId: string | null
     ): Promise<boolean> {
+      if (restricted) {
+        status = 'blocked';
+        await checkpoint();
+        return true;
+      }
       if (currentTier.isFrontier) {
-        if (superviseFailureImpl) {
+        if (!restricted && superviseFailureImpl) {
           const recovery = await superviseFailureImpl({
             woId,
             cascadeId,
@@ -880,7 +911,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         attempt.infraErrorReason = fireResult.infraError;
         attempt.completedAt = new Date().toISOString();
 
-        if (superviseFailureImpl) {
+        if (!restricted && superviseFailureImpl) {
           const recovery = await superviseFailureImpl({
             woId,
             cascadeId,
@@ -961,6 +992,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           repo: resolveGithubRepo(project),
         });
       } catch (pollErr) {
+        if (restricted) {
+          attempt.outcome = 'progress-timeout';
+          attempt.gateFailReason = `tee_time_policy_blocked: supervision needs operator attention: ${String(pollErr)}`;
+          attempt.completedAt = new Date().toISOString();
+          status = 'blocked';
+          await checkpoint();
+          break; // Never cancel a potentially healthy child to start another lane.
+        }
         if (pollErr instanceof TimeoutError) {
           // Carry the poll's own message through: it distinguishes a STALL (run went
           // silent) from the hard-ceiling backstop (run was still emitting but ran

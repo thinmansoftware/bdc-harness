@@ -1,0 +1,71 @@
+name: bdc-teetime-foundation
+description: Restricted preparation-only foundation lane; no demo features or live integrations.
+provider: cursor
+model: grok-4.7-high
+run_authority:
+  required: true
+  spec_repository: thinmansoftware/bdc-xo
+  spec_revision: main
+  spec_paths:
+    - docs/work-orders/{WO_ID}.md
+  allow_issue_fallback: false
+nodes:
+  - id: read-spec
+    bash: |
+      set -euo pipefail
+      test -s "$ARTIFACTS_DIR/authority/work-order.md"
+      test -s "$ARTIFACTS_DIR/authority/run-authority.json"
+      cat "$ARTIFACTS_DIR/authority/work-order.md"
+  - id: plan
+    depends_on: [read-spec]
+    prompt: |
+      Prepare the foundation-only work defined in this frozen spec:
+      $read-spec.output
+      Demo features are held. No product screens, simulator, searches, alerts, booking
+      adapters, purchases, external applications, payments or real bookings.
+      Do not call any other AI service, model CLI, agent, or provider yourself.
+      Plan only repository foundation, meaningful CI and staging preview plumbing.
+      Do not merge, deploy production, change credentials or start background agents.
+  - id: plan-review
+    depends_on: [plan]
+    provider: codex-native-strict
+    model: gpt-5.6-sol
+    prompt: |
+      Independently review this foundation-only plan against the frozen scope:
+      $read-spec.output
+      $plan.output
+      Reject any demo feature work, paid service, real booking, provider application,
+      production action or unapproved AI call. Do not call other models or agents.
+      End with exactly FOUNDATION_PLAN_APPROVED or FOUNDATION_PLAN_REJECTED.
+  - id: plan-gate
+    depends_on: [plan-review]
+    bash: |
+      set -euo pipefail
+      test "$(tail -n 1 "$ARTIFACTS_DIR/node-out/plan-review.out")" = FOUNDATION_PLAN_APPROVED
+  - id: implement
+    depends_on: [plan-gate]
+    prompt: |
+      Implement only the reviewed foundation plan in the frozen spec:
+      $read-spec.output
+      $plan.output
+      No demo features, purchases, provider applications, real bookings or payments.
+      No other model CLI/service, subagents, credentials changes, production deployment
+      or merge. Use a source branch and draft PR; preserve existing work. Run meaningful
+      checks and record exact evidence. CI failure must block staging deployment. Stop
+      if required existing hosting/account access is unavailable. No fake passing tests.
+  - id: review
+    depends_on: [implement]
+    provider: codex-native-strict
+    model: gpt-5.6-sol
+    prompt: |
+      Independently inspect the actual foundation diff and tests against the frozen spec:
+      $read-spec.output
+      $implement.output
+      No other AI calls, subagents, merge or production action. Reject demo features,
+      missing meaningful tests, unproved checks and missing rollback/preview evidence.
+      End with exactly FOUNDATION_REVIEW_APPROVED or FOUNDATION_REVIEW_REJECTED.
+  - id: review-gate
+    depends_on: [review]
+    bash: |
+      set -euo pipefail
+      test "$(tail -n 1 "$ARTIFACTS_DIR/node-out/review.out")" = FOUNDATION_REVIEW_APPROVED

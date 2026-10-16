@@ -16,6 +16,7 @@ const mockUpdateConversationTitle = mock(() => Promise.resolve()) as Mock<
 
 mock.module('../db/conversations', () => ({
   updateConversationTitle: mockUpdateConversationTitle,
+  getConversationById: mock(async () => ({ id: 'test', codebase_id: null })),
 }));
 
 // AI client mock -- sendQuery returns an AsyncGenerator<MessageChunk>

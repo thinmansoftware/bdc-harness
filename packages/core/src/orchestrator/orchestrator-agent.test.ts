@@ -1087,7 +1087,7 @@ describe('discoverAllWorkflows -- remote sync', () => {
     const conversation = makeConversation({ codebase_id: 'codebase-1' });
     const codebase = makeCodebaseForSync();
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockGetCodebase.mockReturnValue(Promise.resolve(codebase));
 
     const platform = makePlatform();
     await handleMessage(platform, 'conv-1', 'What is the latest commit?');
@@ -1108,7 +1108,7 @@ describe('discoverAllWorkflows -- remote sync', () => {
       default_cwd: '/home/test/.archon/workspaces/owner/repo/source',
     };
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockGetCodebase.mockReturnValue(Promise.resolve(codebase));
 
     const platform = makePlatform();
     await handleMessage(platform, 'conv-1', 'What is the latest commit?');
@@ -1124,7 +1124,7 @@ describe('discoverAllWorkflows -- remote sync', () => {
     const conversation = makeConversation({ codebase_id: 'codebase-1' });
     const codebase = makeCodebaseForSync();
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockGetCodebase.mockReturnValue(Promise.resolve(codebase));
     mockSyncWorkspace.mockRejectedValueOnce(new Error('Network timeout'));
 
     const platform = makePlatform();
@@ -1151,7 +1151,7 @@ describe('discoverAllWorkflows -- remote sync', () => {
     const conversation = makeConversation({ codebase_id: 'codebase-1' });
     const codebase = makeCodebaseForSync();
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockGetCodebase.mockReturnValue(Promise.resolve(codebase));
     mockSyncWorkspace.mockRejectedValueOnce(new Error('Network timeout'));
 
     const platform = makePlatform();
@@ -1167,7 +1167,7 @@ describe('discoverAllWorkflows -- remote sync', () => {
     const conversation = makeConversation({ codebase_id: 'codebase-1' });
     const codebase = makeCodebaseForSync();
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockGetCodebase.mockReturnValue(Promise.resolve(codebase));
     mockGetCodebaseEnvVars.mockResolvedValueOnce({ DB_SECRET: 'db-value' });
     mockLoadConfig.mockResolvedValueOnce({
       assistants: { claude: {}, codex: {} },
@@ -1198,7 +1198,7 @@ describe('discoverAllWorkflows -- remote sync', () => {
     const conversation = makeConversation({ codebase_id: 'codebase-1' });
     const codebase = makeCodebaseForSync();
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockGetCodebase.mockReturnValue(Promise.resolve(codebase));
     mockGetCodebaseEnvVars.mockRejectedValueOnce(new Error('db unavailable'));
     mockLoadConfig.mockResolvedValueOnce({
       assistants: { claude: {}, codex: {} },
@@ -1263,7 +1263,7 @@ describe('workflow dispatch routing -- interactive flag', () => {
 
   test('calls executeWorkflow (not dispatchBackground) for interactive workflow on web', async () => {
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockGetCodebase.mockReturnValue(Promise.resolve(makeDispatchCodebase()));
     mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
 
     const platform = makePlatform(); // getPlatformType returns 'web'
@@ -1286,7 +1286,7 @@ describe('workflow dispatch routing -- interactive flag', () => {
     // must still carry parentConversationId forward so the API helpers can
     // keep dispatching resume on subsequent approvals.
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockGetCodebase.mockReturnValue(Promise.resolve(makeDispatchCodebase()));
     mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
     mockFindResumableRunByParentConversation.mockReturnValueOnce(
       Promise.resolve({
@@ -1311,7 +1311,7 @@ describe('workflow dispatch routing -- interactive flag', () => {
 
   test('calls dispatchBackgroundWorkflow for non-interactive workflow on web', async () => {
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockGetCodebase.mockReturnValue(Promise.resolve(makeDispatchCodebase()));
     mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(undefined)));
 
     const platform = makePlatform(); // getPlatformType returns 'web'
@@ -1323,7 +1323,7 @@ describe('workflow dispatch routing -- interactive flag', () => {
 
   test('calls executeWorkflow for interactive workflow on non-web platform', async () => {
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeDispatchCodebase()));
+    mockGetCodebase.mockReturnValue(Promise.resolve(makeDispatchCodebase()));
     mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
 
     const platform = {
@@ -1836,7 +1836,7 @@ describe('discoverAllWorkflows -- merge repo workflows over global', () => {
     const conversation = makeConversation({ codebase_id: 'codebase-1' });
     const codebase = makeCodebaseForSync();
     mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
-    mockGetCodebase.mockReturnValueOnce(Promise.resolve(codebase));
+    mockGetCodebase.mockReturnValue(Promise.resolve(codebase));
 
     // First call: global discovery returns 'assist' workflow
     mockDiscoverWorkflowsWithConfig.mockResolvedValueOnce({

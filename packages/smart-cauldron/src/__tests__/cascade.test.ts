@@ -121,6 +121,78 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
   };
 }
 
+describe('tee-time restricted supervised lane', () => {
+  for (const failure of ['gate', 'infra', 'timeout', 'pass']) {
+    test(`restricted ${failure} stays in one lane without repair or escalation`, async () => {
+      const fired: string[] = [];
+      let escapes = 0;
+      const records: CascadeRunRecord[] = [];
+      const result = await runCascade(
+        baseOpts({
+          project: 'whats-that-tee-time',
+          woId: 'WO-TEETIME-FOUNDATION-01',
+          woClass: 'INFRA',
+          deps: {
+            fire: async options => {
+              fired.push(options.workflowName);
+              return failure === 'infra' ? makeFireError('quota') : makeFireOk('restricted');
+            },
+            poll: async () => {
+              if (failure === 'timeout') throw new Error('timeout');
+              return makePollResult();
+            },
+            fetchNodeTimeouts: async () => ({}),
+            judge: () => (failure === 'pass' ? makePassVerdict() : makeFailVerdict('rejected')),
+            cancel: async () => {
+              escapes++;
+            },
+            escalate: async () => {
+              escapes++;
+            },
+            superviseFailure: async () => {
+              escapes++;
+              throw new Error('must not recover');
+            },
+            specRepair: async () => {
+              escapes++;
+              throw new Error('must not repair');
+            },
+            writeRecord: async record => {
+              records.push(record);
+              return 'memory';
+            },
+          },
+        })
+      );
+      expect(fired).toEqual(['bdc-teetime-foundation']);
+      expect(escapes).toBe(0);
+      expect(result.executionPolicy).toStartWith('sha256:');
+      expect(result.telemetry.climbed).toBe(false);
+      expect(result.status).toBe(
+        failure === 'pass' ? 'won' : failure === 'infra' ? 'infra-alert' : 'blocked'
+      );
+      expect(records.length).toBeGreaterThan(0);
+    });
+  }
+  test('forbidden entry, demo work and mismatched project fail before dispatch', async () => {
+    await expect(
+      runCascade(
+        baseOpts({
+          project: 'whats-that-tee-time',
+          woId: 'WO-TEETIME-FOUNDATION-01',
+          entryOverride: 'claude',
+        })
+      )
+    ).rejects.toThrow('entry tier');
+    await expect(
+      runCascade(baseOpts({ project: 'whats-that-tee-time', woId: 'WO-TEETIME-DEMO-01' }))
+    ).rejects.toThrow('foundation');
+    await expect(
+      runCascade(baseOpts({ project: 'shopops', woId: 'WO-TEETIME-FOUNDATION-01' }))
+    ).rejects.toThrow('mismatch');
+  });
+});
+
 test('cascade preserves the eligibility identity on every attempted lane', async () => {
   const expectedSpec = {
     specSource: 'github:org/repo:docs/WO-TEST-001.md',
