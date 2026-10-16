@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 import subprocess
 import uuid
@@ -17,11 +18,14 @@ def main():
     parser.add_argument("--kind", choices=["sandbox", "configuration"], default="sandbox")
     parser.add_argument("--hostile-project", action="store_true")
     parser.add_argument("--isolated-network", action="store_true")
+    parser.add_argument("--apparmor-profile")
     args = parser.parse_args()
     if args.hostile_project and args.kind != "configuration":
         parser.error("--hostile-project requires --kind configuration")
     if args.isolated_network and args.kind != "sandbox":
         parser.error("--isolated-network requires --kind sandbox")
+    if args.apparmor_profile and not re.fullmatch(r"teetime-probe-audit-[0-9]+-[0-9]+", args.apparmor_profile):
+        parser.error("only an owned diagnosis profile is supported")
     root = Path(__file__).resolve().parent
     profile = root / "codex-probe-seccomp.json"
     baseline = json.loads((root / "moby-default-seccomp.json").read_text())
@@ -166,6 +170,9 @@ console.log(JSON.stringify(hashes));
                "--security-opt", "seccomp=" + str(profile), "--user", "1001:1001",
                "--workdir", "/workspace", "--env", "HOME=/home/appuser",
                "--env", "TEE_TIME_SANDBOX_PROBE=1", "--entrypoint", "bun"]
+    if args.apparmor_profile:
+        options.extend(["--security-opt", "apparmor=" + args.apparmor_profile])
+        options.extend(["--label", "teetime.audit-profile=" + args.apparmor_profile])
     if volume:
         temporary.remove("/workspace")
         options.extend(["--mount", "type=volume,src=" + volume + ",dst=/workspace"])
@@ -200,6 +207,8 @@ console.log(JSON.stringify(hashes));
         assert not host.get("Privileged") and not host.get("CapAdd")
         assert "ALL" in host["CapDrop"]
         assert "no-new-privileges:true" in host["SecurityOpt"]
+        if args.apparmor_profile:
+            assert "apparmor=" + args.apparmor_profile in host["SecurityOpt"]
         seccomp = [item for item in host["SecurityOpt"] if item.startswith("seccomp=")]
         assert len(seccomp) == 1 and json.loads(seccomp[0][8:]) == candidate
         assert not host.get("PortBindings") and not host.get("Devices")
@@ -219,7 +228,22 @@ console.log(JSON.stringify(hashes));
         assert environment.get("TEE_TIME_SANDBOX_PROBE") == "1"
         if network:
             assert environment.get("TEE_TIME_PROBE_PEER") == peer_url
-        result = docker("start", "-ai", name, input=source.decode("utf-8"))
+        if args.apparmor_profile:
+            # Start only the stdin-waiting interpreter, then verify the applied
+            # profile before attaching and supplying any probe/CLI instructions.
+            docker("start", name, check=True)
+            running = json.loads(docker("inspect", name, check=True).stdout)[0]
+            assert running["State"]["Running"] and running["AppArmorProfile"] == args.apparmor_profile
+            result = docker("attach", "--sig-proxy=false", name, input=source.decode("utf-8"))
+            stopped = json.loads(docker("inspect", name, check=True).stdout)[0]
+            assert not stopped["State"]["Running"]
+            print(json.dumps({"auditProbeExit": {"attach": result.returncode,
+                                                "container": stopped["State"]["ExitCode"]}}), flush=True)
+            if result.returncode not in (0, stopped["State"]["ExitCode"]):
+                raise RuntimeError("audit probe attach transport failed")
+            result.returncode = stopped["State"]["ExitCode"]
+        else:
+            result = docker("start", "-ai", name, input=source.decode("utf-8"))
         # Never print arbitrary container output or inherited image environment.
         if result.returncode:
             stopped = json.loads(docker("inspect", name, check=True).stdout)[0]

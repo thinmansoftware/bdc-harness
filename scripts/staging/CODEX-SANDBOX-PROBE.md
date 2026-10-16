@@ -101,3 +101,23 @@ Container cleanup precedes removal of the uniquely labeled network.
 
 This proves tool denial to a reachable bridge peer. It does not establish permitted
 OpenAI transport, internet/DNS policy or real authenticated runtime readiness.
+
+## Hosted-runner mount diagnosis
+
+On sandbox failure only, CI renders a uniquely named AppArmor profile from pinned
+Moby template commit4b8214fc4971e06172938a1f1554ccff6647ee80. Source SHA256 is
+7da15d81aa5c507f5002b844fdc49a969904681447a2cc29222bd6cbe797163b. Existing Moby
+license applies. The sole permission-rule delta is `deny mount` to `audit deny mount`:
+mounts stay denied. ABI/includes and parser success are mandatory. No fallback profile.
+
+The runner's --apparmor-profile accepts only generated diagnostic names. It starts
+the stdin-waiting interpreter, verifies the applied profile, then supplies synthetic
+probe code. Attach and container exit statuses are retained. Expected probe failure
+is not evidence without the matching audit record. CI records bounded named-profile
+kernel denials; absent records remain inconclusive.
+
+The EXIT cleanup identifies exact-profile users, removes only labeled owned probe
+containers and verifies none remain before unloading. A cleanup failure retains the
+profile. The docker-default profile, host sysctls and shared services are untouched.
+Cleanup ownership/failure behavior has three deterministic tests. This is diagnosis,
+not a mount allowance or permission to start a model.

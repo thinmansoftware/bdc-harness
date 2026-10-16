@@ -39,6 +39,7 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Test offline boundary and normal server behavior
         run: |
+          python3 scripts/staging/test_cleanup_apparmor_audit.py
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test
           bun --filter @archon/server type-check
@@ -94,6 +95,28 @@ jobs:
           set -o pipefail
           sudo journalctl -k --since "$SANDBOX_STARTED_AT" --no-pager | grep 'apparmor="DENIED"' | grep -E 'comm="(codex[^"]*|bwrap|linux-sandbox)"|profile="docker-default"' | tail -30 || echo "No matching journal denial evidence available"
           sudo dmesg --since "$SANDBOX_STARTED_AT" | grep 'apparmor="DENIED"' | grep -E 'comm="(codex[^"]*|bwrap|linux-sandbox)"|profile="docker-default"' | tail -30 || echo "No matching dmesg denial evidence available"
+      - name: Audit denied mounts without granting mount access
+        if: failure() && steps.codex_sandbox.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          profile="teetime-probe-audit-${{ github.run_id }}-${{ github.run_attempt }}"
+          profile_file="$RUNNER_TEMP/$profile"
+          test -r /etc/apparmor.d/abi/3.0
+          test -r /etc/apparmor.d/tunables/global
+          test -r /etc/apparmor.d/abstractions/base
+          if sudo grep -Fq "$profile " /sys/kernel/security/apparmor/profiles; then exit 1; fi
+          python3 scripts/staging/render-apparmor-audit.py "$profile" > "$profile_file"
+          sha256sum "$profile_file"
+          sudo apparmor_parser -a "$profile_file"
+          trap 'python3 scripts/staging/cleanup-apparmor-audit.py "$profile" "$profile_file"' EXIT
+          audit_start=$(date --utc '+%Y-%m-%d %H:%M:%S')
+          set +e
+          python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+          probe_status=$?
+          set -e
+          if [ "$probe_status" -eq 0 ]; then echo "Unexpected audit-only sandbox success"; exit 1; fi
+          sudo journalctl -k --since "$audit_start" --no-pager | grep 'apparmor="DENIED"' | grep -F "profile=\"$profile\"" | tail -30 || echo "No named-profile journal denial evidence available"
+          sudo dmesg --since "$audit_start" | grep 'apparmor="DENIED"' | grep -F "profile=\"$profile\"" | tail -30 || echo "No named-profile dmesg denial evidence available"
       - name: Verify runtime and isolation
         run: |
           python3 scripts/staging/inspect-offline-qualification.py "$QUALIFICATION_CONTAINER" "$(git rev-parse HEAD)" "$COMPOSE_PROJECT_NAME"
