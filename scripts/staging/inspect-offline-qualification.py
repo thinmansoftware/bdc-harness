@@ -27,7 +27,12 @@ environment = dict(item.split("=", 1) for item in config["Env"] if "=" in item)
 assert environment.get("ARCHON_BUILD_SHA") == expected_sha, "image source SHA mismatch"
 assert environment.get("ARCHON_OFFLINE_QUALIFICATION") == "1", "offline mode missing"
 mounts = data["Mounts"]
-assert {mount["Destination"] for mount in mounts} == {"/.archon", "/tmp", "/home/appuser", "/host-artifacts"}, "unexpected mount set"
+temporary = {"/tmp", "/home/appuser", "/host-artifacts"}
+tmpfs = host.get("Tmpfs") or {}
+assert set(tmpfs) == temporary, "unexpected tmpfs set"
+for options in tmpfs.values():
+    assert {"uid=1001", "gid=1001"} <= set(options.split(",")), "tmpfs owner mismatch"
+assert {mount["Destination"] for mount in mounts} | set(tmpfs) == {"/.archon"} | temporary, "unexpected mount set"
 for mount in mounts:
     if mount["Destination"] == "/.archon":
         assert mount["Type"] == "volume", "database is not isolated volume"
@@ -38,4 +43,5 @@ assert data["State"]["Health"]["Status"] == "healthy", "container unhealthy"
 print(json.dumps({"passed": True, "container": container, "project": project,
     "sourceSha": expected_sha, "imageId": data["Image"], "network": "none",
     "readOnlyRoot": True, "user": config["User"], "ports": [],
-    "mounts": [{"type": m["Type"], "destination": m["Destination"]} for m in mounts]}))
+    "mounts": [{"type": m["Type"], "destination": m["Destination"]} for m in mounts],
+    "tmpfs": sorted(tmpfs)}))
