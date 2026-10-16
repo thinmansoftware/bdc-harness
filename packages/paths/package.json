@@ -9,6 +9,7 @@
     "./strip-cwd-env": "./src/strip-cwd-env.ts",
     "./strip-cwd-env-boot": "./src/strip-cwd-env-boot.ts",
     "./tee-time-policy": "./src/tee-time-policy.ts",
+    "./offline-qualification": "./src/offline-qualification.ts",
     "./env-loader": "./src/env-loader.ts"
   },
   "scripts": {

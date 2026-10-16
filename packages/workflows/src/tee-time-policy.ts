@@ -4,6 +4,7 @@ import type { WorkflowDefinition, WorkflowRun } from './schemas';
 import { readFile } from 'fs/promises';
 import { join, resolve } from 'path';
 import { buildRunAuthority } from './reliability/run-authority';
+import { assertExecutionEnabled } from '@archon/paths/offline-qualification';
 import {
   assertTeeTimeProvider,
   assertTeeTimeAuthority,
@@ -57,6 +58,7 @@ export async function resolveRestrictedRun(
   message: string,
   workflow: Pick<WorkflowDefinition, 'name'>
 ): Promise<Record<string, unknown> | null> {
+  assertExecutionEnabled();
   const codebase = codebaseId ? await deps.store.getCodebase(codebaseId) : null;
   if (!resolveTeeTimePolicy(codebase, message)) return null;
   if (!codebase) policyBlocked('stored codebase is missing');

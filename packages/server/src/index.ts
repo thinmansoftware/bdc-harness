@@ -34,12 +34,18 @@ if (envPath) {
 // (#1302 / #1303).
 import { loadArchonEnv } from '@archon/paths/env-loader';
 loadArchonEnv(process.cwd());
+import {
+  OFFLINE_QUALIFICATION,
+  validateOfflineQualification,
+} from '@archon/paths/offline-qualification';
+validateOfflineQualification();
 
 // CLAUDECODE=1 warning is emitted inside stripCwdEnv() (boot import above)
 // BEFORE the marker is deleted from process.env. No duplicate warning here.
 
 // Smart default: use Claude Code's built-in OAuth if no explicit credentials
 if (
+  !OFFLINE_QUALIFICATION &&
   !process.env.CLAUDE_API_KEY &&
   !process.env.CLAUDE_CODE_OAUTH_TOKEN &&
   process.env.CLAUDE_USE_GLOBAL_AUTH === undefined
@@ -224,7 +230,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   );
   const hasCodexCredentials = process.env.CODEX_ID_TOKEN && process.env.CODEX_ACCESS_TOKEN;
 
-  if (!hasClaudeCredentials && !hasCodexCredentials) {
+  if (!OFFLINE_QUALIFICATION && !hasClaudeCredentials && !hasCodexCredentials) {
     getLog().fatal(
       {
         checked: {
@@ -272,38 +278,40 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().warn({ err: error }, 'fuelglass.seat_cutoff_restore_failed');
   }
 
-  const startupReconciliationAt = new Date().toISOString();
+  if (!OFFLINE_QUALIFICATION) {
+    const startupReconciliationAt = new Date().toISOString();
 
-  // Observe expired leases before the HTTP listener can accept new dispatch.
-  // This pass is deliberately non-mutating; explicit recovery uses lease CAS.
-  try {
-    const recovery = await observeStartupRecovery(undefined, startupReconciliationAt);
-    getLog().info(recovery, 'startup_recovery_observed');
-    if (recovery.blocked > 0) {
-      getLog().warn(recovery, 'startup_recovery_blocked_candidates');
+    // Observe expired leases before the HTTP listener can accept new dispatch.
+    // This pass is deliberately non-mutating; explicit recovery uses lease CAS.
+    try {
+      const recovery = await observeStartupRecovery(undefined, startupReconciliationAt);
+      getLog().info(recovery, 'startup_recovery_observed');
+      if (recovery.blocked > 0) {
+        getLog().warn(recovery, 'startup_recovery_blocked_candidates');
+      }
+    } catch (error) {
+      getLog().fatal({ err: error }, 'startup_recovery_observation_failed');
+      process.exit(1);
     }
-  } catch (error) {
-    getLog().fatal({ err: error }, 'startup_recovery_observation_failed');
-    process.exit(1);
-  }
 
-  try {
-    const pendingReconcile = await reconcilePendingRunsAtBoot(undefined, startupReconciliationAt);
-    getLog().info(pendingReconcile, 'startup_pending_reconciliation_completed');
-  } catch (error) {
-    getLog().fatal({ err: error }, 'startup_pending_reconciliation_failed');
-    process.exit(1);
-  }
+    try {
+      const pendingReconcile = await reconcilePendingRunsAtBoot(undefined, startupReconciliationAt);
+      getLog().info(pendingReconcile, 'startup_pending_reconciliation_completed');
+    } catch (error) {
+      getLog().fatal({ err: error }, 'startup_pending_reconciliation_failed');
+      process.exit(1);
+    }
 
-  try {
-    const runningReconcile = await reconcileRunningRunsAtBoot(undefined, startupReconciliationAt);
-    getLog().info(runningReconcile, 'startup_running_reconciliation_completed');
-  } catch (error) {
-    getLog().fatal({ err: error }, 'startup_running_reconciliation_failed');
-    process.exit(1);
-  }
+    try {
+      const runningReconcile = await reconcileRunningRunsAtBoot(undefined, startupReconciliationAt);
+      getLog().info(runningReconcile, 'startup_running_reconciliation_completed');
+    } catch (error) {
+      getLog().fatal({ err: error }, 'startup_running_reconciliation_failed');
+      process.exit(1);
+    }
 
-  startOverseerRuntimeWithRealMergeManager();
+    startOverseerRuntimeWithRealMergeManager();
+  }
 
   const config = await loadConfig();
   logConfig(config);
@@ -319,7 +327,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   }
 
   // Start cleanup scheduler
-  startCleanupScheduler();
+  if (!OFFLINE_QUALIFICATION) startCleanupScheduler();
 
   // Startup recovery remains observe-only. It never flips another worker's row,
   // resumes a run, or touches a worktree without an explicit lease-CAS recovery.
@@ -368,7 +376,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   let discord: DiscordAdapter | null = null;
   let slack: SlackAdapter | null = null;
 
-  if (!opts.skipPlatformAdapters) {
+  if (!OFFLINE_QUALIFICATION && !opts.skipPlatformAdapters) {
     // Check that at least one platform is configured
     const hasTelegram = Boolean(process.env.TELEGRAM_BOT_TOKEN);
     const hasDiscord = Boolean(process.env.DISCORD_BOT_TOKEN);
@@ -625,7 +633,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // the reviewer identity are configured. An unconfigured deployment has no
   // endpoint at all rather than an endpoint that accepts unverified input.
   const reviewRouteConfig = resolveReviewRouteConfig();
-  if (reviewRouteConfig) {
+  if (!OFFLINE_QUALIFICATION && reviewRouteConfig) {
     const ingestDeps = createRealIngestDeps(reviewRouteConfig);
     const recheckDeps = createRealRecheckIngestDeps(reviewRouteConfig);
     app.post('/webhooks/github/review', async c => {
@@ -693,10 +701,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       'overseer_review_route_not_configured: set OVERSEER_REVIEW_WEBHOOK_SECRET and OVERSEER_REVIEW_IDENTITY to enable'
     );
   }
-  startDutyOfficerClock();
+  if (!OFFLINE_QUALIFICATION) startDutyOfficerClock();
   // Dedicated fast timer (default 60s) that pages John for a dead/restarted
   // Dispatch worker, independent of the 15-minute Duty Officer tick.
-  startWorkerHeartbeatAlarmTimer();
+  if (!OFFLINE_QUALIFICATION) startWorkerHeartbeatAlarmTimer();
 
   // Gitea webhook endpoint
   if (gitea) {
@@ -813,11 +821,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     idleTimeout: 255, // Max value (seconds) - prevents SSE connections from being killed
   });
   getLog().info({ port: server.port, hostname }, 'server_listening');
-  startDispatchEscalationClock();
+  if (!OFFLINE_QUALIFICATION) startDispatchEscalationClock();
 
   // Initialize Telegram adapter (conditional, skipped in CLI serve mode)
   let telegram: TelegramAdapter | null = null;
-  if (!opts.skipPlatformAdapters && process.env.TELEGRAM_BOT_TOKEN) {
+  if (!OFFLINE_QUALIFICATION && !opts.skipPlatformAdapters && process.env.TELEGRAM_BOT_TOKEN) {
     const streamingMode = (process.env.TELEGRAM_STREAMING_MODE ?? 'stream') as 'stream' | 'batch';
     telegram = new TelegramAdapter(process.env.TELEGRAM_BOT_TOKEN, streamingMode);
     const telegramAdapter = telegram; // Capture for use in callback

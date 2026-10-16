@@ -32,6 +32,7 @@ import { registerCursorAgentProvider } from './community/cursor/registration';
 import { GlmProvider } from './community/glm/provider';
 import { UnknownProviderError } from './errors';
 import { createLogger } from '@archon/paths';
+import { assertExecutionEnabled } from '@archon/paths/offline-qualification';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -81,6 +82,7 @@ export function registerProvider(entry: ProviderRegistration): void {
  * @throws UnknownProviderError if not registered
  */
 export function getAgentProvider(id: string): IAgentProvider {
+  assertExecutionEnabled();
   const resolved = resolveProviderId(id);
   const entry = registry.get(resolved);
   if (!entry) {
