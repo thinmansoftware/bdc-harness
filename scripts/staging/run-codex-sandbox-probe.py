@@ -65,7 +65,11 @@ def main():
         result = docker("start", "-ai", name, input=source.decode("utf-8"))
         # Never print arbitrary container output or inherited image environment.
         if result.returncode:
-            raise RuntimeError("sandbox assertions failed; exit=" + str(result.returncode))
+            # Synthetic probe only: emit its bounded assertion header, not raw output.
+            diagnostic = next((line[:500] for line in result.stderr.splitlines()
+                               if line.startswith("error: ")), "no probe assertion header")
+            raise RuntimeError("sandbox assertions failed; exit=" + str(result.returncode)
+                               + "; " + diagnostic)
         evidence = json.loads(result.stdout.strip())
         assert evidence["passed"] is True and evidence["modelInvocations"] == 0
         print(json.dumps({"passed": True, "imageId": data["Image"],
