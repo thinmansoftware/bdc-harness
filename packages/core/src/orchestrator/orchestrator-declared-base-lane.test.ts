@@ -103,7 +103,10 @@ mock.module('@archon/isolation', () => ({
 
 mock.module('../workflows/store-adapter', () => ({
   createWorkflowDeps: mock(() => ({
-    store: { createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })) },
+    store: {
+      getCodebase: async (id: string) => (await import('../db/codebases')).getCodebase(id),
+      createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })),
+    },
     getAgentProvider: () => ({}),
     loadConfig: async () => ({}),
   })),

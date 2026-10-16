@@ -5,6 +5,13 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
+import {
+  resolveRestrictedRun,
+  guardTeeTimeProviders,
+  assertRestrictedResume,
+  assertRestrictedAuthority,
+} from './tee-time-policy';
+import { policyBlocked } from '@archon/paths/tee-time-policy';
 import { existsSync } from 'fs';
 import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
@@ -5520,6 +5527,25 @@ async function executeDagWorkflowInternal(
   priorCompletedNodes?: Map<string, string>,
   modelOverride?: ModelOverride
 ): Promise<string | undefined> {
+  const executionPolicy = await resolveRestrictedRun(
+    deps,
+    workflowRun.codebase_id ?? undefined,
+    workflowRun.user_message,
+    workflow
+  );
+  assertRestrictedResume(workflowRun, executionPolicy);
+  if (executionPolicy) {
+    await assertRestrictedAuthority(
+      deps,
+      workflowRun,
+      executionPolicy,
+      workflow.name,
+      cwd,
+      artifactsDir
+    );
+    if (modelOverride) policyBlocked('run model overrides are disabled for restricted foundation');
+    deps = guardTeeTimeProviders(deps);
+  }
   const dagStartTime = Date.now();
 
   // Resolve workflow inputs: extract defaults from the `inputs:` section.

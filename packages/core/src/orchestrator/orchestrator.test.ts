@@ -96,7 +96,7 @@ const mockFindWorkflow = mock((name: string, workflows: readonly WorkflowDefinit
 
 mock.module('../workflows/store-adapter', () => ({
   createWorkflowDeps: mock(() => ({
-    store: {},
+    store: { getCodebase: mockGetCodebase },
     getAgentProvider: () => ({}),
     loadConfig: async () => ({}),
   })),

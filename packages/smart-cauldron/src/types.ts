@@ -112,6 +112,7 @@ export interface FrontierApprovalPacket {
 }
 
 export interface CascadeRunRecord {
+  executionPolicy?: string;
   cascadeId: string; // randomUUID
   woId: string;
   project: string | null; // frozen codebase authority; null only for dry-run plans

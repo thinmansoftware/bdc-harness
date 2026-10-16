@@ -70,6 +70,7 @@ registerBuiltinProviders();
 // --- Import after mocks ---
 import { executeWorkflow, resolveExecutorLane, LaneAvailabilityRefusedError } from './executor';
 import { markEngineDarkIfZeroUsage, resetEngineAvailabilityForTests } from './engine-availability';
+import { setSeatUsageReaderForTests } from './reliability/seat-usage';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun } from './schemas';
@@ -150,6 +151,28 @@ function getExecutedWorkflow(): WorkflowDefinition {
   return mockExecuteDagWorkflow.mock.calls[0]?.[4] as WorkflowDefinition;
 }
 
+beforeEach(() => {
+  // Unit tests must not read live subscription usage or send operator alerts.
+  setSeatUsageReaderForTests(async seats =>
+    Object.fromEntries(
+      seats.map(seat => [
+        seat,
+        {
+          seat,
+          limit_source: 'measured',
+          windows: [],
+          seven_day: 'NOT_APPLICABLE',
+          gate_windows: [],
+          note: 'unit fixture',
+          probed_at: new Date(0).toISOString(),
+          endpoint: 'fixture',
+        },
+      ])
+    )
+  );
+});
+afterEach(() => setSeatUsageReaderForTests(null));
+
 describe('executeWorkflow', () => {
   beforeEach(() => {
     mockLogFn.mockClear();
@@ -158,6 +181,33 @@ describe('executeWorkflow', () => {
     mockEmitter.unregisterRun.mockClear();
     mockEmitter.emit.mockClear();
     mockExecuteDagWorkflow.mockImplementation(async (): Promise<string | undefined> => undefined);
+  });
+
+  it('rejects tee-time requests without stored identity before config or resume side effects', async () => {
+    for (const status of ['failed', 'paused', 'waiting_provider'] as const) {
+      const store = makeStore();
+      const deps = makeDeps(store);
+      await expect(
+        executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv',
+          '/test',
+          makeWorkflow(),
+          'WO-TEETIME-FOUNDATION-01',
+          'db-conv',
+          'missing-codebase',
+          undefined,
+          undefined,
+          undefined,
+          makeRun({ status })
+        )
+      ).rejects.toThrow('stored codebase identity');
+      expect(deps.loadConfig).not.toHaveBeenCalled();
+      expect(deps.getAgentProvider).not.toHaveBeenCalled();
+      expect(store.getCompletedDagNodeOutputs).not.toHaveBeenCalled();
+      expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+    }
   });
 
   // -------------------------------------------------------------------------

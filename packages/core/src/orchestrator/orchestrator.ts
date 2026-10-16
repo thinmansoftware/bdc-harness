@@ -289,9 +289,20 @@ export async function dispatchBackgroundWorkflow(
     prBranch?: string;
   }
 ): Promise<void> {
+  const workflowDeps = createWorkflowDeps();
+  const { resolveRestrictedRun } = await import('@archon/workflows/tee-time-policy');
+  const executionPolicy = await resolveRestrictedRun(
+    workflowDeps,
+    ctx.codebaseId,
+    ctx.originalMessage,
+    workflow
+  );
   const frozenSpecSource = workflow.run_authority?.required
     ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
     : undefined;
+
+  const { assertTeeTimeAuthority } = await import('@archon/paths/tee-time-policy');
+  assertTeeTimeAuthority(executionPolicy, frozenSpecSource);
 
   // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): resolve the WO's
   // declared "Base branch:" from the frozen spec BEFORE isolation is allocated so the
@@ -420,7 +431,7 @@ export async function dispatchBackgroundWorkflow(
   // inject an escalation packet into this successor's user_message so the
   // higher tier sees the rejection context. Best-effort -- never blocks
   // dispatch.
-  const workflowDeps = createWorkflowDeps();
+
   let effectiveUserMessage = ctx.originalMessage;
   try {
     const { prepareDispatchWithEscalation } = await import('../escalation');
@@ -431,7 +442,9 @@ export async function dispatchBackgroundWorkflow(
       listWorkflowEvents: workflowEventDb.listWorkflowEvents,
       updateWorkflowRun: workflowDb.updateWorkflowRun,
     };
-    const prepared = await prepareDispatchWithEscalation(ctx.originalMessage, linkerStore);
+    const prepared = executionPolicy
+      ? { userMessage: ctx.originalMessage, link: { escalatedRunIds: [], woId: '', packet: '' } }
+      : await prepareDispatchWithEscalation(ctx.originalMessage, linkerStore);
     effectiveUserMessage = prepared.userMessage;
     if (prepared.link.escalatedRunIds.length > 0) {
       getLog().info(
@@ -464,6 +477,7 @@ export async function dispatchBackgroundWorkflow(
       user_message: effectiveUserMessage,
       working_path: workerCwd,
       metadata: {
+        ...(executionPolicy ? { execution_policy: executionPolicy } : {}),
         ...(ctx.issueContext ? { github_context: ctx.issueContext } : {}),
         ...(ctx.modelOverride ? { model_override: ctx.modelOverride } : {}),
       },

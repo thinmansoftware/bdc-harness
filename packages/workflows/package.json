@@ -3,6 +3,7 @@
   "version": "0.3.10",
   "type": "module",
   "exports": {
+    "./tee-time-policy": "./src/tee-time-policy.ts",
     "./schemas/*": "./src/schemas/*.ts",
     "./reliability/*": "./src/reliability/*.ts",
     "./executor": "./src/executor.ts",
