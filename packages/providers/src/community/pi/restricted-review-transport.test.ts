@@ -7,6 +7,7 @@ const payload = {
   model: REVIEW_MODEL,
   messages: [{ role: 'user' as const, content: 'synthetic fixture' }],
   stream: true as const,
+  max_tokens: 1024,
 };
 function response() {
   return new Response('data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
@@ -160,4 +161,76 @@ it('routes the installed Pi SDK through the guard with bounded output and no too
     globalThis.fetch = originalFetch;
     server.stop(true);
   }
+});
+
+it('rejects a real HTTP redirect without reaching its target', async () => {
+  let sourceCalls = 0;
+  let targetCalls = 0;
+  const target = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch() {
+      targetCalls++;
+      return response();
+    },
+  });
+  const source = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    fetch() {
+      sourceCalls++;
+      return new Response(null, { status: 302, headers: { location: target.url.toString() } });
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  try {
+    const upstream = (async (input: Request | string | URL, init?: RequestInit) => {
+      const req = input as Request;
+      return originalFetch(source.url, {
+        method: req.method,
+        body: await req.text(),
+        headers: req.headers,
+        redirect: init?.redirect,
+        signal: req.signal,
+      });
+    }) as typeof fetch;
+    const client = new OpenAI({
+      apiKey: 'local-no-auth',
+      baseURL: REVIEW_ENDPOINT + '/v1',
+      fetch: createRestrictedReviewFetch(upstream),
+      maxRetries: 1,
+    });
+    await expect((async () => await client.chat.completions.create(payload))()).rejects.toThrow();
+    expect(sourceCalls).toBe(1);
+    expect(targetCalls).toBe(0);
+  } finally {
+    source.stop(true);
+    target.stop(true);
+  }
+});
+
+it('rejects tool payloads, oversized input, oversized responses and extra inventory calls', async () => {
+  let calls = 0;
+  const upstream = (async () => {
+    calls++;
+    return new Response('x'.repeat(131073));
+  }) as unknown as typeof fetch;
+  const guard = createRestrictedReviewFetch(upstream);
+  for (const body of [
+    { ...payload, tools: [{ type: 'function' }] },
+    { ...payload, messages: [{ role: 'user', content: 'x'.repeat(16001) }] },
+  ]) {
+    await expect(
+      createRestrictedReviewFetch(upstream)(REVIEW_ENDPOINT + '/v1/chat/completions', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+    ).rejects.toThrow();
+  }
+  expect(calls).toBe(0);
+  const oversized = await guard(REVIEW_ENDPOINT + '/api/tags');
+  await expect(oversized.text()).rejects.toThrow('response exceeds');
+  await guard(REVIEW_ENDPOINT + '/api/tags');
+  await expect(guard(REVIEW_ENDPOINT + '/api/tags')).rejects.toThrow('budget');
+  expect(calls).toBe(2);
 });

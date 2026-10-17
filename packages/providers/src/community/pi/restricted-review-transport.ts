@@ -39,8 +39,10 @@ export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetc
       if (
         data.model !== REVIEW_MODEL ||
         data.stream !== true ||
-        data.tools?.length ||
-        data.functions?.length
+        'tools' in data ||
+        'functions' in data ||
+        'tool_choice' in data ||
+        (data.max_tokens ?? data.max_completion_tokens) !== 1024
       )
         throw new Error('unexpected review inference payload');
       // This bound is not proof of server context capacity. Admission remains closed.
