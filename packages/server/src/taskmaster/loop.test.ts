@@ -3,10 +3,15 @@
  * auto-circuit. Everything is dependency-injected (fake clock, fake DAL,
  * fake dispatch); no mock.module.
  */
-import { afterAll, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { rootLogger } from '@archon/paths';
+import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
+
+// A synthetic exhausted response belongs to its test, never the next caller.
+beforeEach(resetGitHubApiMeterForTests);
+afterEach(resetGitHubApiMeterForTests);
 import {
   createTaskmasterState,
   defaultFindEffectByIdempotencyKey,
