@@ -1,0 +1,37 @@
+{
+  "_source": "Captured verbatim 2026-09-28 from the live GitHub REST API: GET repos/thinmansoftware/lspro-react/actions/runs/36449329616 (fields trimmed), GET repos/thinmansoftware/lspro-react/pulls/630, GET repos/thinmansoftware/lspro-react/commits/e60dc8921dae0c6fc7a0614b8433f10b79d5c3df/check-runs?filter=all. It shows that for a pull_request_target run the run object's head_sha is the PR HEAD (not the base), its check run is attached to that head commit with the same check_suite id, and pull_requests[] is empty. pull_request.state is the state at run time (the PR was closed later that day).",
+  "workflow_run": {
+    "id": 36449329616,
+    "name": "CE Backport Check",
+    "path": ".github/workflows/ce-backport-check.yml",
+    "event": "pull_request_target",
+    "head_sha": "e60dc8921dae0c6fc7a0614b8433f10b79d5c3df",
+    "head_branch": "promotion/ce/scope-gate-policy-20260928",
+    "run_attempt": 1,
+    "run_started_at": "2026-09-28T16:12:19Z",
+    "status": "completed",
+    "conclusion": "skipped",
+    "check_suite_id": 98695118208,
+    "pull_requests": [],
+    "head_repository": { "full_name": "thinmansoftware/lspro-react" },
+    "repository": { "full_name": "thinmansoftware/lspro-react" }
+  },
+  "pull_request": {
+    "number": 630,
+    "state": "open",
+    "head": {
+      "sha": "e60dc8921dae0c6fc7a0614b8433f10b79d5c3df",
+      "ref": "promotion/ce/scope-gate-policy-20260928"
+    },
+    "base": { "sha": "ccbd3283cbd70720c4516eaa3703f7fd611b7e35", "ref": "release/ce" }
+  },
+  "check_runs_on_pr_head": [
+    {
+      "name": "backport-check",
+      "conclusion": "skipped",
+      "app_id": 15368,
+      "head_sha": "e60dc8921dae0c6fc7a0614b8433f10b79d5c3df",
+      "check_suite": { "id": 98695118208 }
+    }
+  ]
+}

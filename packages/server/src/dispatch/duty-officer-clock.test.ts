@@ -654,4 +654,114 @@ describe('duty officer clock', () => {
       })
     );
   });
+
+  test('blocker_report: clock relays a Taskmaster blocker report to xo once, without the judge', async () => {
+    const blockerMsg = message({
+      id: 'br-1',
+      sender: 'taskmaster',
+      task_type: 'agent_message',
+      idempotency_key: 'tm:blocker_report:gh:thinmansoftware/bdc-xo#2274:7',
+      subject_key: 'gh:thinmansoftware/bdc-xo#2274',
+      correlation_id: 'tm-journal-br-1',
+      body:
+        'Blocker report (P1): "WO-X-01 fix" -- owner: UNASSIGNED. Blocked: no named blocker. ' +
+        'State: labelled blocked for 3h. https://github.com/thinmansoftware/bdc-xo/issues/2274',
+    });
+    const deps = fakeDeps([blockerMsg]);
+    deps.judge = mock(async () => {
+      throw new Error('judge_must_not_run');
+    });
+
+    await tickDutyOfficerClock(deps);
+    await tickDutyOfficerClock(deps);
+
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+    const call = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls[0];
+    const data = call[1] as {
+      recipient: string;
+      idempotency_key: string;
+      priority: string;
+      subject_key?: string;
+      body: string;
+    };
+    expect(data.recipient).toBe('xo');
+    expect(data.idempotency_key).toBe('do-clock-escalation:br-1');
+    expect(data.priority).toBe('normal');
+    expect(data.subject_key).toBe('gh:thinmansoftware/bdc-xo#2274');
+    const parsed = JSON.parse(data.body) as {
+      reason: string;
+      thread_ref: string;
+      excerpt: string;
+    };
+    expect(parsed.reason).toBe('taskmaster_blocker_report');
+    expect(parsed.thread_ref).toBe('gh:thinmansoftware/bdc-xo#2274');
+    expect(parsed.excerpt).toBe(blockerMsg.body);
+
+    const resultCall = (deps.postResult as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0][0] as { id: string; status: string; task_outcome: string; result_body: string };
+    expect(resultCall.id).toBe('br-1');
+    expect(resultCall.status).toBe('done');
+    expect(resultCall.task_outcome).toBe('succeeded');
+    expect(JSON.parse(resultCall.result_body).disposition).toBe(
+      'taskmaster_blocker_report_relayed'
+    );
+    expect(deps.judge).not.toHaveBeenCalled();
+  });
+
+  test('blocker_report: failed relay is held and retried without a double send', async () => {
+    const blockerMsg = message({
+      id: 'br-2',
+      sender: 'taskmaster',
+      task_type: 'agent_message',
+      idempotency_key: 'tm:blocker_report:gh:thinmansoftware/bdc-xo#2275:7',
+      subject_key: 'gh:thinmansoftware/bdc-xo#2275',
+      body:
+        'Blocker report (P1): "WO-Y-02 fix" -- owner: UNASSIGNED. Blocked: no named blocker. ' +
+        'State: labelled blocked for 4h. https://github.com/thinmansoftware/bdc-xo/issues/2275',
+    });
+    const digestMsg = message({
+      id: 'dg-1',
+      sender: 'taskmaster',
+      task_type: 'agent_message',
+      idempotency_key: 'tm:digest:2026-10-05',
+      subject_key: 'digest:2026-10-05',
+      body: 'sent=0, parked=0',
+    });
+    const deps = fakeDeps([blockerMsg, digestMsg]);
+    let relayCalls = 0;
+    deps.createAuthenticatedMessage = mock(async (_context, data) => {
+      relayCalls += 1;
+      if (relayCalls === 1 && data.idempotency_key === 'do-clock-escalation:br-2') {
+        throw new Error('relay_failed_once');
+      }
+      return { id: 'xo-msg' };
+    });
+
+    // Tick 1: relay throws -> item held (releaseMessage), not finished.
+    await tickDutyOfficerClock(deps);
+    expect(deps.releaseMessage).toHaveBeenCalledWith(expect.objectContaining({ id: 'br-2' }));
+    const postedAfter1 = (
+      deps.postResult as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map(c => (c[0] as { id: string }).id);
+    expect(postedAfter1).not.toContain('br-2');
+    // The digest in the same fixture is finished as a plain mailbox item, NOT relayed.
+    const dgCall = (deps.postResult as unknown as { mock: { calls: unknown[][] } }).mock.calls.find(
+      c => (c[0] as { id: string }).id === 'dg-1'
+    )![0] as { result_body: string };
+    expect(JSON.parse(dgCall.result_body).disposition).toBe('taskmaster_mailbox');
+
+    // Tick 2: the message becomes claimable again and relays once with the SAME key.
+    await tickDutyOfficerClock(deps);
+    const brRelays = (
+      deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.filter(
+      c => (c[1] as { idempotency_key: string }).idempotency_key === 'do-clock-escalation:br-2'
+    );
+    expect(brRelays).toHaveLength(2); // one throw + one success, same key -> XO gets exactly one copy
+    const br2Finish = (
+      deps.postResult as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.find(c => (c[0] as { id: string }).id === 'br-2')![0] as { result_body: string };
+    expect(JSON.parse(br2Finish.result_body).disposition).toBe('taskmaster_blocker_report_relayed');
+  });
 });
