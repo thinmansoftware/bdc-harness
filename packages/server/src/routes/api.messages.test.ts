@@ -43,6 +43,14 @@ const mockAddMessage = mock(
 );
 const mockListMessages = mock(async (_conversationId: string, _limit?: number) => []);
 const mockHandleMessage = mock(async () => {});
+class CauldronDrainingError extends Error {
+  readonly code = 'cauldron_draining' as const;
+  constructor() {
+    super('cauldron_draining');
+    this.name = 'CauldronDrainingError';
+  }
+}
+
 const mockGetCauldronDrainState = mock(async () => ({
   mode: 'normal' as 'normal' | 'draining',
   activeLeaseCount: 0,
@@ -153,6 +161,7 @@ mock.module('@archon/core/db/workflows', () => ({
   cancelWorkflowRun: mock(async () => {}),
   getWorkflowRunByWorkerPlatformId: mock(async () => null),
   getCauldronDrainState: mockGetCauldronDrainState,
+  CauldronDrainingError,
 }));
 
 mock.module('@archon/core/db/workflow-events', () => ({
@@ -287,6 +296,41 @@ describe('POST /api/conversations/:id/message', () => {
     expect(response.status).toBe(503);
     expect(mockAddMessage).not.toHaveBeenCalled();
     expect(mockHandleMessage).not.toHaveBeenCalled();
+  });
+
+  test('maps a post-check drain race to 503', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockHandleMessage.mockImplementationOnce(async () => {
+      throw new CauldronDrainingError();
+    });
+    mockGetCauldronDrainState.mockReset();
+    mockGetCauldronDrainState
+      .mockResolvedValueOnce({
+        mode: 'normal',
+        activeLeaseCount: 0,
+        activeRunCount: 0,
+        activeRunIds: [],
+        drained: false,
+        updatedAt: null,
+      })
+      .mockResolvedValueOnce({
+        mode: 'draining',
+        activeLeaseCount: 1,
+        activeRunCount: 1,
+        activeRunIds: ['run-race'],
+        drained: false,
+        updatedAt: new Date().toISOString(),
+      });
+    const { app } = makeApp();
+    const response = await app.request('/api/conversations/web-test-abc/message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'Start more work' }),
+    });
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { code: string };
+    expect(body.code).toBe('cauldron_draining');
+    expect(mockHandleMessage).toHaveBeenCalled();
   });
 
   test('persists user message to DB when conversation is found', async () => {
