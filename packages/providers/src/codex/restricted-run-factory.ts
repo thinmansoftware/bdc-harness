@@ -13,6 +13,20 @@ export interface RestrictedWorkerBinding {
 // The caller owns process/handle custody; this interface cannot authenticate a
 // different run that obtains the handle. Never put it in the global registry.
 export function createRestrictedWorkerProvider(input: RestrictedWorkerBinding): IAgentProvider {
+  return createWorker(input);
+}
+
+// Separate unregistered entrypoint; never infer transport from caller environment.
+export function createRestrictedCanaryWorkerProvider(
+  input: RestrictedWorkerBinding
+): IAgentProvider {
+  return createWorker(input, 'teetime-connect-v1');
+}
+
+function createWorker(
+  input: RestrictedWorkerBinding,
+  transport?: 'teetime-connect-v1'
+): IAgentProvider {
   const binding = Object.freeze({ ...input });
   if (
     typeof binding.runId !== 'string' ||
@@ -23,7 +37,10 @@ export function createRestrictedWorkerProvider(input: RestrictedWorkerBinding): 
     process.cwd() !== RESTRICTED_WORKSPACE
   )
     throw new Error('invalid restricted worker binding');
-  const provider = new CodexProvider({ restricted: true });
+  const provider = new CodexProvider({
+    restricted: true,
+    ...(transport ? { restrictedTransport: transport } : {}),
+  });
   let active = false;
   return Object.freeze({
     getType: () => provider.getType(),

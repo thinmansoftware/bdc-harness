@@ -4,8 +4,12 @@ const instances: object[] = [];
 let queries = 0;
 let fail = false;
 let expectedSignal: AbortSignal | undefined;
+let canary = false;
 const constructor = mock(function (options: unknown) {
-  expect(options).toEqual({ restricted: true });
+  expect(options).toEqual({
+    restricted: true,
+    ...(canary ? { restrictedTransport: 'teetime-connect-v1' } : {}),
+  });
   const instance = {
     getType: () => 'codex-teetime-restricted',
     getCapabilities: () => ({ sessionResume: true }),
@@ -23,7 +27,8 @@ const constructor = mock(function (options: unknown) {
   return instance;
 });
 mock.module('./provider', () => ({ CodexProvider: constructor }));
-const { createRestrictedWorkerProvider } = await import('./restricted-run-factory');
+const { createRestrictedWorkerProvider, createRestrictedCanaryWorkerProvider } =
+  await import('./restricted-run-factory');
 const valid = () => ({
   runId: 'fixture-run',
   policyDigest: 'sha256:' + 'a'.repeat(64),
@@ -33,12 +38,28 @@ let cwd: ReturnType<typeof spyOn>;
 beforeEach(() => {
   cwd = spyOn(process, 'cwd').mockReturnValue('/workspace');
   queries = 0;
+  canary = false;
   fail = false;
   expectedSignal = undefined;
   instances.length = 0;
   constructor.mockClear();
 });
 afterEach(() => cwd.mockRestore());
+
+test('dedicated canary entrypoint fixes transport but keeps option restrictions', async () => {
+  canary = true;
+  const provider = createRestrictedCanaryWorkerProvider(valid());
+  await expect(
+    provider
+      .sendQuery('fixture', '/workspace', undefined, { env: { HTTPS_PROXY: 'http://other' } })
+      .next()
+  ).rejects.toThrow('override');
+  expect(queries).toBe(0);
+  for await (const _ of provider.sendQuery('fixture', '/workspace')) {
+    /* fixture */
+  }
+  expect(queries).toBe(1);
+});
 
 test('rejects invalid binding before constructing provider', () => {
   for (const input of [

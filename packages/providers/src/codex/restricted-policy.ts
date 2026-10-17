@@ -37,13 +37,20 @@ export function validateRestrictedRequest(
   }
 }
 
-export function restrictedClientOptions(): CodexOptions {
+export type RestrictedTransport = 'teetime-connect-v1';
+
+export function restrictedClientOptions(transport?: RestrictedTransport): CodexOptions {
+  if (transport !== undefined && transport !== 'teetime-connect-v1')
+    throw new Error('Restricted Codex transport rejected');
   return {
     codexPathOverride: RESTRICTED_BINARY,
     env: {
       HOME: '/home/appuser',
       CODEX_HOME: '/home/appuser/.codex',
       PATH: '/usr/local/bin:/usr/bin:/bin',
+      ...(transport === 'teetime-connect-v1'
+        ? { HTTPS_PROXY: 'http://teetime-proxy:3128', HTTP_PROXY: 'http://teetime-proxy:3128' }
+        : {}),
     },
     config: {
       default_permissions: 'tee-time',
