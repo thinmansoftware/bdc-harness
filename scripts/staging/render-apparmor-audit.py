@@ -19,8 +19,12 @@ template = template.replace('{{.PeerName}}', '"' + name + '"')
 template = template.replace('{{.DaemonProfile}}', 'unconfined')
 if '{{' in template or template.count('  deny mount,') != 1:
     raise SystemExit("unexpected pinned template structure")
-rule = (Path(__file__).with_name('codex-apparmor-mount-rules.txt').read_text().rstrip()
+mount_rules = Path(__file__).with_name('codex-apparmor-mount-rules.txt').read_bytes()
+if hashlib.sha256(mount_rules).hexdigest() != '9494ebe0c2ef00b55d283b75af9777358dba83a363434debfe288474b2fa93b7':
+    raise SystemExit('reviewed mount rules mismatch')
+rule = (mount_rules.decode().rstrip()
         if name.startswith('teetime-probe-mount-') else '  audit deny mount,')
+
 audited = template.replace('  deny mount,', rule)
 assert audited.replace(rule, '  deny mount,') == template
 sys.stdout.write(audited)

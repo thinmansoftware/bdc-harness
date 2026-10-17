@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   qualify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
       COMPOSE_PROJECT_NAME: teetime-qual-${{ github.run_id }}-${{ github.run_attempt }}
@@ -40,6 +40,7 @@ jobs:
       - name: Test offline boundary and normal server behavior
         run: |
           python3 scripts/staging/test_cleanup_apparmor_audit.py
+          python3 scripts/staging/test_apparmor_negatives.py
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test
           bun --filter @archon/server type-check
@@ -73,32 +74,13 @@ jobs:
             sleep 5
           done
           exit 1
-      - name: Verify non-model Codex tool sandbox
-        id: codex_sandbox
-        run: |
-          echo "SANDBOX_STARTED_AT=$(date --utc '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
-          uname -r
-          docker version --format '{{.Server.Version}}'
-          docker info --format '{{json .SecurityOptions}}'
-          echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
-          python3 scripts/staging/run-codex-sandbox-probe.py --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
-          python3 scripts/staging/run-codex-sandbox-probe.py --isolated-network --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
-      - name: Verify empty and hostile project configuration isolation
-        if: ${{ !cancelled() && steps.launch_staging.outcome == 'success' }}
-        run: |
-          python3 scripts/staging/run-codex-sandbox-probe.py --kind configuration --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
-          python3 scripts/staging/run-codex-sandbox-probe.py --kind configuration --hostile-project --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
-      - name: Read sandbox kernel denial diagnostics
-        if: failure() && steps.codex_sandbox.outcome == 'failure'
-        run: |
-          # Read-only, time-bounded, filtered to the synthetic sandbox process.
-          set -o pipefail
-          sudo journalctl -k --since "$SANDBOX_STARTED_AT" --no-pager | grep 'apparmor="DENIED"' | grep -E 'comm="(codex[^"]*|bwrap|linux-sandbox)"|profile="docker-default"' | tail -30 || echo "No matching journal denial evidence available"
-          sudo dmesg --since "$SANDBOX_STARTED_AT" | grep 'apparmor="DENIED"' | grep -E 'comm="(codex[^"]*|bwrap|linux-sandbox)"|profile="docker-default"' | tail -30 || echo "No matching dmesg denial evidence available"
-      - name: Diagnose reviewed mount-path batch
-        if: failure() && steps.codex_sandbox.outcome == 'failure'
+      - name: Require named sandbox and configuration isolation
         run: |
           set -euo pipefail
+          uname -r
+          docker version --format '{{.Server.Version}}'
+          sudo apparmor_parser --version
+          echo "Runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
           profile="teetime-probe-mount-${{ github.run_id }}-${{ github.run_attempt }}"
           profile_file="$RUNNER_TEMP/$profile"
           test -r /etc/apparmor.d/abi/3.0
@@ -108,36 +90,36 @@ jobs:
           python3 scripts/staging/render-apparmor-audit.py "$profile" > "$profile_file"
           sha256sum "$profile_file"
           sudo apparmor_parser -a "$profile_file"
-          trap 'python3 scripts/staging/cleanup-apparmor-audit.py "$profile" "$profile_file"' EXIT
+          cleanup_profile() {
+            status=$?
+            set +e
+            python3 scripts/staging/cleanup-apparmor-audit.py "$profile" "$profile_file"
+            cleanup_status=$?
+            if [ "$cleanup_status" -ne 0 ]; then exit "$cleanup_status"; fi
+            exit "$status"
+          }
+          trap cleanup_profile EXIT
           audit_start=$(date --utc '+%Y-%m-%d %H:%M:%S')
-          set +e
           python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
-          probe_status=$?
-          if [ "$probe_status" -eq 0 ]; then
-            python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --isolated-network --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
-            probe_status=$?
-          fi
-          set -e
-          if [ "$probe_status" -eq 0 ]; then
-            negative_dir="$RUNNER_TEMP/teetime-negative-${{ github.run_id }}-${{ github.run_attempt }}"
-            mkdir "$negative_dir"
-            gcc -static -O2 -Wall -Wextra -Werror scripts/staging/probe-apparmor-negative.c -o "$negative_dir/teetime-mount-negative"
-            sha256sum scripts/staging/probe-apparmor-negative.c "$negative_dir/teetime-mount-negative"
-            base_id=$(docker image inspect "$QUALIFICATION_IMAGE" --format '{{.Id}}')
-            negative_image="teetime-negative:${{ github.run_id }}-${{ github.run_attempt }}"
-            printf 'FROM %s\nCOPY teetime-mount-negative /app/teetime-mount-negative\n' "$QUALIFICATION_IMAGE" > "$negative_dir/Dockerfile"
-            docker build --pull=false -t "$negative_image" "$negative_dir"
-            test "$(docker image inspect "$QUALIFICATION_IMAGE" --format '{{.Id}}')" = "$base_id"
-            docker image inspect "$negative_image" --format '{{.Id}}'
-            negative_start=$(date --utc '+%Y-%m-%d %H:%M:%S')
-            python3 scripts/staging/run-codex-sandbox-probe.py --kind negative --apparmor-profile "$profile" --image "$negative_image" --expected-sha "$(git rev-parse HEAD)"
-            sudo journalctl -k --since "$negative_start" --no-pager > "$negative_dir/audit.log"
-            python3 scripts/staging/verify-apparmor-negatives.py "$profile" "$negative_dir/audit.log"
-            docker image rm "$negative_image"
-            echo "Candidate diagnostic passed; separate admission review still required"
-          fi
-          sudo journalctl -k --since "$audit_start" --no-pager | grep 'apparmor="DENIED"' | grep -F "profile=\"$profile\"" | tail -30 || echo "No named-profile journal denial evidence available"
-          sudo dmesg --since "$audit_start" | grep 'apparmor="DENIED"' | grep -F "profile=\"$profile\"" | tail -30 || echo "No named-profile dmesg denial evidence available"
+          python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --isolated-network --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+          python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --kind configuration --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+          python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --kind configuration --hostile-project --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+          negative_dir="$RUNNER_TEMP/teetime-negative-${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir "$negative_dir"
+          gcc -static -O2 -Wall -Wextra -Werror scripts/staging/probe-apparmor-negative.c -o "$negative_dir/teetime-mount-negative"
+          sha256sum scripts/staging/probe-apparmor-negative.c "$negative_dir/teetime-mount-negative"
+          base_id=$(docker image inspect "$QUALIFICATION_IMAGE" --format '{{.Id}}')
+          negative_image="teetime-negative:${{ github.run_id }}-${{ github.run_attempt }}"
+          printf 'FROM %s\nCOPY teetime-mount-negative /app/teetime-mount-negative\n' "$QUALIFICATION_IMAGE" > "$negative_dir/Dockerfile"
+          docker build --pull=false -t "$negative_image" "$negative_dir"
+          test "$(docker image inspect "$QUALIFICATION_IMAGE" --format '{{.Id}}')" = "$base_id"
+          docker image inspect "$negative_image" --format '{{.Id}}'
+          negative_start=$(date --utc '+%Y-%m-%d %H:%M:%S')
+          python3 scripts/staging/run-codex-sandbox-probe.py --kind negative --apparmor-profile "$profile" --image "$negative_image" --expected-sha "$(git rev-parse HEAD)"
+          sudo journalctl -k --since "$negative_start" --no-pager > "$negative_dir/audit.log"
+          python3 scripts/staging/verify-apparmor-negatives.py "$profile" "$negative_dir/audit.log"
+          docker image rm "$negative_image"
+          echo "Required non-model qualification passed; model admission remains separate"
       - name: Verify runtime and isolation
         run: |
           python3 scripts/staging/inspect-offline-qualification.py "$QUALIFICATION_CONTAINER" "$(git rev-parse HEAD)" "$COMPOSE_PROJECT_NAME"
