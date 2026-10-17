@@ -150,7 +150,30 @@ export async function* runRestrictedReview(
     verifySession();
     if (!terminal) throw new Error('missing terminal review result');
     await verifyModelIdentity(signal);
-    const verdict = parseReviewVerdict(text);
+    let verdict;
+    try {
+      verdict = parseReviewVerdict(text);
+    } catch (error) {
+      // Opt-in diagnostic for isolated synthetic qualification only. Never enabled
+      // by the shared server or ordinary review path; not an accepted result.
+      if (
+        process.platform === 'linux' &&
+        process.cwd() === '/workspace' &&
+        process.env.TEE_TIME_REVIEW_WORKER === '1' &&
+        process.env.TEE_TIME_SYNTHETIC_REVIEW_DIAGNOSTICS === '1'
+      ) {
+        console.error(
+          JSON.stringify({
+            type: 'synthetic_review_diagnostic',
+            category: error instanceof SyntaxError ? 'invalid_json' : 'invalid_schema',
+            rawResponse: text.slice(0, 6000),
+            stopReason: terminal.stopReason,
+            tokens: terminal.tokens,
+          })
+        );
+      }
+      throw error;
+    }
     yield { type: 'assistant', content: JSON.stringify(verdict) };
     yield {
       ...terminal,

@@ -13,7 +13,11 @@ Claude/Fable calls, purchases, provider applications, real bookings or credentia
 are permitted. Require meaningful tests and exact evidence. Missing, contradictory or
 incomplete evidence means REJECTED. You have no tools. Return ONLY JSON with exactly
 these keys: verdict (APPROVED or REJECTED), reasons (nonempty array of concise strings),
-evidenceIds (nonempty array containing only spec, diff or tests).`;
+evidenceIds (nonempty array containing only spec, diff or tests).
+For APPROVED, evidenceIds must contain all three distinct IDs: spec, diff, tests.
+For REJECTED, cite at least one relevant ID. Never duplicate evidence IDs.
+Provide 1 to 12 nonblank reasons, each at most 500 characters. No additional keys,
+markdown fences, heading, preamble or text outside the JSON object.`;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);

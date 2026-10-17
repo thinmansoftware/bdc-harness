@@ -299,3 +299,38 @@ describe('restricted text-only reviewer candidate', () => {
     ).toThrow();
   });
 });
+
+it('enforces every declared verdict rule without repairing malformed responses', () => {
+  const valid = {
+    verdict: 'APPROVED',
+    reasons: ['verified'],
+    evidenceIds: ['spec', 'diff', 'tests'],
+  };
+  expect(parseReviewVerdict(JSON.stringify(valid))).toEqual(valid);
+  for (const value of [
+    null,
+    [],
+    { ...valid, extra: true },
+    { ...valid, verdict: 'MAYBE' },
+    { ...valid, reasons: [] },
+    { ...valid, reasons: Array(13).fill('reason') },
+    { ...valid, reasons: [' '] },
+    { ...valid, reasons: ['x'.repeat(501)] },
+    { ...valid, reasons: [1] },
+    { ...valid, evidenceIds: [] },
+    { ...valid, evidenceIds: ['spec'] },
+    { ...valid, evidenceIds: ['spec', 'diff', 'unknown'] },
+    { ...valid, evidenceIds: ['spec', 'diff', 'diff'] },
+  ])
+    expect(() => parseReviewVerdict(JSON.stringify(value))).toThrow();
+  for (const text of [
+    'Verdict: ' + JSON.stringify(valid),
+    '```json\n' + JSON.stringify(valid) + '\n```',
+    'x'.repeat(6001),
+  ])
+    expect(() => parseReviewVerdict(text)).toThrow();
+  expect(
+    parseReviewVerdict(JSON.stringify({ ...valid, verdict: 'REJECTED', evidenceIds: ['tests'] }))
+      .verdict
+  ).toBe('REJECTED');
+});
