@@ -1349,7 +1349,7 @@ branch refs/heads/feature/auth
 
       expect(execSpy).toHaveBeenCalledWith(
         'git',
-        ['-C', '/workspace/repo', 'fetch', 'origin', 'main'],
+        ['-C', '/workspace/repo', 'fetch', '--', 'origin', 'main'],
         expect.any(Object)
       );
     });
@@ -1601,6 +1601,30 @@ branch refs/heads/feature/auth
         'Clean untracked files in main workspace failed'
       );
     });
+
+    test('fetch argv places -- before origin and the branch', async () => {
+      execSpy.mockClear();
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      await git.syncWorkspace('/workspace/repo', 'dev');
+
+      const fetchCall = execSpy.mock.calls.find((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('fetch');
+      });
+      const args = fetchCall?.[1] as string[];
+      const fetchIdx = args.indexOf('fetch');
+      expect(args.slice(fetchIdx, fetchIdx + 4)).toEqual(['fetch', '--', 'origin', 'dev']);
+    });
+
+    test('rejects a branch that starts with - before any exec', async () => {
+      execSpy.mockClear();
+
+      await expect(git.syncWorkspace('/workspace/repo', '--upload-pack=x')).rejects.toThrow(
+        'unsupported branch'
+      );
+      expect(execSpy).not.toHaveBeenCalled();
+    });
   });
 
   describe('cloneRepository', () => {
@@ -1622,7 +1646,7 @@ branch refs/heads/feature/auth
       expect(result).toEqual({ ok: true, value: undefined });
       expect(execSpy).toHaveBeenCalledWith(
         'git',
-        ['clone', 'https://github.com/owner/repo.git', '/tmp/target'],
+        ['clone', '--', 'https://github.com/owner/repo.git', '/tmp/target'],
         { timeout: 120000 }
       );
     });
@@ -1636,7 +1660,7 @@ branch refs/heads/feature/auth
 
       expect(result).toEqual({ ok: true, value: undefined });
       // Verify the token is in the URL
-      const cloneUrl = execSpy.mock.calls[0]![1][1] as string;
+      const cloneUrl = execSpy.mock.calls[0]![1][2] as string;
       expect(cloneUrl).toContain('ghp_abc123');
       expect(cloneUrl).toContain('github.com');
     });
@@ -1689,6 +1713,17 @@ branch refs/heads/feature/auth
       if (!result.ok) {
         expect(result.error.code).toBe('unknown');
       }
+    });
+
+    test('clone argv is clone, --, url, path', async () => {
+      execSpy.mockClear();
+      execSpy.mockResolvedValue({ stdout: '', stderr: '' });
+
+      const url = 'https://github.com/o/r.git';
+      const path = '/tmp/clone-target';
+      await git.cloneRepository(url, path);
+
+      expect(execSpy).toHaveBeenCalledWith('git', ['clone', '--', url, path], { timeout: 120000 });
     });
   });
 
