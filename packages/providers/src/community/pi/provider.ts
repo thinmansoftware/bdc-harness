@@ -14,6 +14,7 @@ import type {
 import { PI_CAPABILITIES } from './capabilities';
 import { parsePiConfig } from './config';
 import { parsePiModelRef } from './model-ref';
+import { validateRestrictedReview } from './restricted-review-policy';
 
 // IMPORTANT: Do NOT add static `import { ... } from '@mariozechner/*'` here,
 // and do NOT statically import sibling modules that themselves import runtime
@@ -163,12 +164,21 @@ ${JSON.stringify(schema, null, 2)}`;
  * (no reuse) so concurrent calls don't collide.
  */
 export class PiProvider implements IAgentProvider {
+  constructor(private readonly restrictedReview = false) {}
+
   async *sendQuery(
     prompt: string,
     cwd: string,
     resumeSessionId?: string,
     requestOptions?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
+    if (this.restrictedReview) {
+      validateRestrictedReview(prompt, cwd, resumeSessionId, requestOptions);
+      ensurePiPackageDirShim();
+      const { runRestrictedReview } = await import('./restricted-review');
+      yield* runRestrictedReview(prompt, requestOptions?.abortSignal);
+      return;
+    }
     // Install the PI_PACKAGE_DIR shim BEFORE the dynamic imports below: Pi's
     // config.js runs `readFileSync(getPackageJsonPath())` at its own module
     // init, and getPackageJsonPath() checks process.env.PI_PACKAGE_DIR first.
@@ -581,7 +591,7 @@ export class PiProvider implements IAgentProvider {
   }
 
   getType(): string {
-    return 'pi';
+    return this.restrictedReview ? 'pi-teetime-review' : 'pi';
   }
 
   getCapabilities(): ProviderCapabilities {
