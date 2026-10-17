@@ -33,6 +33,18 @@ attempts stopped at the curl control and do not count as isolation passes.
 This proves CLI sandbox confinement for these probes, not CLI application HTTP
 compatibility or the forthcoming credentialed worker lifecycle.
 
+Add `--metadata` together with `--sandbox` for the pinned CLI's negative remote
+metadata check. Keep probe-teetime-cli-metadata.py beside the launcher. It creates
+an unmistakably invalid synthetic login in owned tmpfs, initializes app-server,
+and calls only account/rateLimits/read. A terminal 401/unauthorized response is
+required; no thread, turn, execution or inference request is sent. The child
+process group is killed on exit and the synthetic auth file is removed. This
+mode must never be adapted to accept real credentials or retain account output.
+
+Laptop run teetime-transport-0522566710b0 passed this check together with the
+sandbox controls. It used the prior e9d8d071 image and reported no cleanup errors.
+This verifies CLI metadata transport, not successful authentication or inference.
+
 The worker has only the internal network. The gateway accepts only CONNECT to
 chatgpt.com:443 and connects to a validated public IPv4 address without a second
 hostname lookup. It neither decrypts TLS nor logs payloads. The first-byte check

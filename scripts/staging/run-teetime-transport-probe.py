@@ -13,7 +13,10 @@ parser.add_argument('--docker',default='docker')
 parser.add_argument('--image',required=True)
 parser.add_argument('--expected-sha',required=True)
 parser.add_argument('--sandbox',action='store_true')
+parser.add_argument('--metadata',action='store_true')
 args=parser.parse_args()
+if args.metadata and not args.sandbox:
+    parser.error('--metadata requires --sandbox isolation')
 profile=Path(__file__).with_name('codex-probe-seccomp.json')
 if args.sandbox:
     baseline=json.loads(profile.with_name('moby-default-seccomp.json').read_text())
@@ -114,6 +117,8 @@ result={'proxyTlsVerified':True,'forbiddenDestinationsRejected':4,'workerDirectP
 '''
     if args.sandbox:
         code+='\n'+Path(__file__).with_name('probe-teetime-proxy-sandbox.py').read_text()
+    if args.metadata:
+        code+='\n'+Path(__file__).with_name('probe-teetime-cli-metadata.py').read_text()
     code+='\nprint(json.dumps(result))\n'
     compile(code,'credential-free-probe','exec')
     d('start',worker);assert check(worker,[internal])['State']['Running']
@@ -128,7 +133,7 @@ result={'proxyTlsVerified':True,'forbiddenDestinationsRejected':4,'workerDirectP
     result={'result':result,'imageId':image,'sourceSha':args.expected_sha,
         'proxySourceSha256':hashlib.sha256(source).hexdigest(),'internalNetwork':internal,
         'networks':network_receipts,'workerProbeSha256':hashlib.sha256(code.encode()).hexdigest(),
-        'note':'Credential-free probe only; CLI application transport and authenticated checks remain separate'}
+        'note':'Synthetic checks only; successful authentication, inference and lane admission remain unverified'}
     (receipt/'result.json').write_text(json.dumps(result,indent=2))
     print(json.dumps(result))
 finally:
