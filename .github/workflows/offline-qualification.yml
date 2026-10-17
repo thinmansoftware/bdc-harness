@@ -95,7 +95,7 @@ jobs:
           set -o pipefail
           sudo journalctl -k --since "$SANDBOX_STARTED_AT" --no-pager | grep 'apparmor="DENIED"' | grep -E 'comm="(codex[^"]*|bwrap|linux-sandbox)"|profile="docker-default"' | tail -30 || echo "No matching journal denial evidence available"
           sudo dmesg --since "$SANDBOX_STARTED_AT" | grep 'apparmor="DENIED"' | grep -E 'comm="(codex[^"]*|bwrap|linux-sandbox)"|profile="docker-default"' | tail -30 || echo "No matching dmesg denial evidence available"
-      - name: Diagnose remaining mounts with reviewed root propagation rule
+      - name: Diagnose reviewed mount-path batch
         if: failure() && steps.codex_sandbox.outcome == 'failure'
         run: |
           set -euo pipefail
@@ -113,6 +113,10 @@ jobs:
           set +e
           python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
           probe_status=$?
+          if [ "$probe_status" -eq 0 ]; then
+            python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --isolated-network --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+            probe_status=$?
+          fi
           set -e
           if [ "$probe_status" -eq 0 ]; then echo "Candidate passed; separate admission review still required"; fi
           sudo journalctl -k --since "$audit_start" --no-pager | grep 'apparmor="DENIED"' | grep -F "profile=\"$profile\"" | tail -30 || echo "No named-profile journal denial evidence available"

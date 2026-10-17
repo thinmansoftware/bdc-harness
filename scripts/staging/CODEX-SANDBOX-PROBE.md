@@ -129,3 +129,14 @@ replaces the blanket mount denial with exactly
 unmatched mounts remain denied. This single independently reviewed allowance is only
 for the disposable CI diagnostic. It does not change the default sandbox test or
 admit a credentialed worker. Parser success and new audit evidence are still required.
+
+### AppArmor path diagnosis
+
+The named diagnostic profile now carries architect-reviewed explicit mount rules
+from a synthetic strace run. No proc mount is allowed; that attempt failed in the
+successful reference trace. Base image was a2cc56ab4068e4126d9ade9dcc74d134b1d0f70761d73a3a4615ec575a95f733;
+strace-only derivative was b85a19b86b8dc74482233aa9cdc4d23170c742a16f7b9ce9609eacdbf0df0f77.
+The derivative's 18 non-model probes passed with no added caps/seccomp changes.
+This is supporting path evidence, not exact-image admission. The runner parses
+the named profile before use; unmatched mounts remain denied. Negative destination
+and option tests require matching AppArmor audit evidence before admission.
