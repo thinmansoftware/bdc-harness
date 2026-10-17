@@ -247,3 +247,16 @@ when any resource in its pool is exhausted. Secondary retry deadlines use
 Explicit GraphQL integration-permission errors can use the preserved PAT once;
 rate limits and transport failures cannot. No trace or credential values are
 stored by metering. These source changes do not activate credentials or a pool.
+
+The CLI driver leaves stdin inherited for ordinary commands such as `gh pr
+list` and `gh pr view`. It must not read an unused pipe: Smart Cauldron's
+`execFile` callers leave that pipe open. Input is buffered for permission-retry
+replay only when the command declares a stdin source (`--input -`,
+`--body-file -` / `-F -`, API `--field name=@-` / `-F name=@-`,
+`auth login --with-token`, `workflow run --json`, or `gist create -`).
+The focused regression uses the real `execFile` launch with an open stdin pipe;
+it also checks payload forwarding and identical-byte permission retry:
+
+```bash
+bun test ./scripts/github-service-exec.test.ts
+```

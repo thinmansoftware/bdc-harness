@@ -21,6 +21,23 @@ interface CommandResult {
   stderr: Uint8Array;
 }
 
+/** Only buffer input when gh explicitly requests it, so permission retries can replay it. */
+export function githubCommandReadsStdin(args: string[]): boolean {
+  if (args[0] === 'workflow' && args[1] === 'run' && args.includes('--json')) return true;
+  if (args[0] === 'gist' && args[1] === 'create' && args.includes('-')) return true;
+  return args.some((arg, index) => {
+    if (arg === '--with-token') return true;
+    if (arg === '--input=-' || arg === '--body-file=-') return true;
+    if (arg === '-' && ['--input', '--body-file', '-F'].includes(args[index - 1] ?? '')) {
+      return true;
+    }
+    return (
+      ((arg === '--field' || arg === '-F') && (args[index + 1] ?? '').endsWith('=@-')) ||
+      /^(?:--field=|-F).+=@-$/.test(arg)
+    );
+  });
+}
+
 /** Consume gh's captured HTTP trace; never forward headers, URLs or bodies. */
 export function consumeGitHubTrace(
   raw: string,
@@ -181,7 +198,9 @@ if (import.meta.main) {
       service: service as GitHubService,
       command,
       args,
-      ...(process.stdin.isTTY ? {} : { stdin: await Bun.stdin.bytes() }),
+      ...(!process.stdin.isTTY && githubCommandReadsStdin(args)
+        ? { stdin: await Bun.stdin.bytes() }
+        : {}),
     });
     if (result.stdout.byteLength) await Bun.write(Bun.stdout, result.stdout);
     if (result.stderr.byteLength) await Bun.write(Bun.stderr, result.stderr);

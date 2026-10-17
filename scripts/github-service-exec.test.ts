@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { runGitHubServiceCommand as runCommand } from './github-service-exec';
+import {
+  githubCommandReadsStdin,
+  runGitHubServiceCommand as runCommand,
+} from './github-service-exec';
 import { serviceGitHubCommandEnvironment } from '../packages/core/src/github/service-identity';
 import { generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -7,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetGitHubApiMeterForTests } from '../packages/core/src/github/metering';
 import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
+import { execFile } from 'node:child_process';
 
 let db: SqliteAdapter;
 beforeEach(() => {
@@ -21,6 +25,66 @@ const runGitHubServiceCommand = (
 ): ReturnType<typeof runCommand> => runCommand({ ...input, db });
 
 describe('operation-scoped GitHub CLI authentication', () => {
+  test('buffers declared gh stdin sources and leaves ordinary query arguments alone', () => {
+    for (const args of [
+      ['api', 'repos/synthetic/test', '--input', '-'],
+      ['api', 'repos/synthetic/test', '--input=-'],
+      ['issue', 'comment', '1', '--body-file', '-'],
+      ['issue', 'comment', '1', '--body-file=-'],
+      ['api', 'graphql', '-F', 'query=@-'],
+      ['api', 'graphql', '--field', 'query=@-'],
+      ['api', 'graphql', '--field=query=@-'],
+      ['api', 'graphql', '-Fquery=@-'],
+      ['auth', 'login', '--with-token'],
+      ['workflow', 'run', 'synthetic.yml', '--json'],
+      ['gist', 'create', '-'],
+    ]) {
+      expect(githubCommandReadsStdin(args)).toBe(true);
+    }
+    for (const args of [
+      ['pr', 'list', '--json', 'url'],
+      ['pr', 'view', '1', '--json', 'mergeable'],
+      ['issue', 'comment', '1', '--body', '-'],
+      ['api', 'repos/synthetic/test', '--input', 'body.json'],
+    ]) {
+      expect(githubCommandReadsStdin(args)).toBe(false);
+    }
+  });
+  test('execFile commands finish while their unused stdin pipe remains open', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'github-service-open-stdin-'));
+    try {
+      const result = await new Promise<{ error: Error | null; stdout: string }>(resolve => {
+        // Match Smart Cauldron: execFile creates a pipe, and the caller never
+        // writes to or closes child.stdin. No real GitHub request is made.
+        execFile(
+          process.execPath,
+          [
+            `${import.meta.dir}/github-service-exec.ts`,
+            'smart_cauldron',
+            process.execPath,
+            '-e',
+            'process.stdout.write("synthetic-pr-result")',
+          ],
+          {
+            timeout: 5000,
+            env: {
+              PATH: process.env.PATH,
+              SystemRoot: process.env.SystemRoot,
+              ARCHON_HOME: directory,
+              DATABASE_URL: '',
+              GH_TOKEN: 'synthetic-pat',
+              LOG_LEVEL: 'error',
+            },
+          },
+          (error, stdout) => resolve({ error, stdout })
+        );
+      });
+      expect(result.error).toBeNull();
+      expect(result.stdout).toBe('synthetic-pr-result');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 10000);
   test('command launch failures are persisted as CLI attempts without a permission retry', async () => {
     let launches = 0;
     let caught: unknown;
@@ -137,6 +201,9 @@ describe('operation-scoped GitHub CLI authentication', () => {
         process.execPath,
         '-e',
         'process.stdout.write(await Bun.stdin.text())',
+        '--',
+        '--input',
+        '-',
       ],
       env: {
         PATH: process.env.PATH,
