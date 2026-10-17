@@ -85,6 +85,14 @@ const normalDrainState = {
   drained: false,
   updatedAt: null as string | null,
 };
+class CauldronDrainingError extends Error {
+  readonly code = 'cauldron_draining' as const;
+  constructor() {
+    super('cauldron_draining');
+    this.name = 'CauldronDrainingError';
+  }
+}
+
 const mockGetCauldronDrainState = mock(async () => normalDrainState);
 const mockSetCauldronDrainMode = mock(async (data: { mode: 'normal' | 'draining' }) => ({
   changed: true,
@@ -278,6 +286,7 @@ mock.module('@archon/core/db/workflows', () => ({
   sumWorkflowTokensInWindow: mockSumWorkflowTokensInWindow,
   getCauldronDrainState: mockGetCauldronDrainState,
   setCauldronDrainMode: mockSetCauldronDrainMode,
+  CauldronDrainingError,
   getRunOutcome: mockGetRunOutcome,
 }));
 
@@ -775,6 +784,55 @@ describe('POST /api/workflows/:name/run', () => {
     expect(mockRunCascade).not.toHaveBeenCalled();
     expect(mockHandleMessage).not.toHaveBeenCalled();
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  test('named_reason_in_http_body', async () => {
+    mockGetCauldronDrainState.mockResolvedValueOnce({
+      ...normalDrainState,
+      mode: 'draining',
+      activeLeaseCount: 2,
+      activeRunCount: 2,
+      activeRunIds: ['run-a', 'run-b'],
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'WO-TEST-001' }),
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('60');
+    expect(await response.json()).toEqual({
+      error: 'Cauldron is draining; new dispatch is disabled',
+      code: 'cauldron_draining',
+      detail: 'active_leases=2 active_runs=2',
+    });
+  });
+
+  test('maps a post-check drain race to 503', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockHandleMessage.mockImplementationOnce(async () => {
+      throw new CauldronDrainingError();
+    });
+    mockGetCauldronDrainState.mockReset();
+    mockGetCauldronDrainState.mockResolvedValueOnce(normalDrainState).mockResolvedValueOnce({
+      ...normalDrainState,
+      mode: 'draining',
+      activeLeaseCount: 1,
+      activeRunCount: 1,
+      activeRunIds: ['run-race'],
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'WO-TEST-001' }),
+    });
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { code: string; detail: string };
+    expect(body.code).toBe('cauldron_draining');
+    expect(body.detail).toBe('active_leases=1 active_runs=1');
+    expect(mockHandleMessage).toHaveBeenCalled();
   });
 
   test('sends /workflow run <name> <message> to orchestrator', async () => {

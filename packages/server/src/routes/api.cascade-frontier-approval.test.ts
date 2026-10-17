@@ -50,11 +50,16 @@ const mockClaimFrontierResolution = mock(
     path: '/tmp/claim.json',
   })
 );
+const mockReleaseFrontierClaim = mock(async () => {});
 const mockResumeFrontierTier = mock(
   async (
     _record: MockCascadeRecord,
-    opts?: { onAdmission?: (r: MockCascadeRecord, created: boolean) => void }
+    opts?: {
+      onAdmission?: (r: MockCascadeRecord, created: boolean) => void;
+      assertDispatchAllowed?: () => Promise<void>;
+    }
   ) => {
+    await opts?.assertDispatchAllowed?.();
     const resumed: MockCascadeRecord = {
       cascadeId: 'resumed-cascade-1',
       woId: _record.woId,
@@ -81,6 +86,7 @@ const mockRejectFrontierTier = mock(
 mock.module('@archon/smart-cauldron/frontier-approval', () => ({
   readCascadeRecordById: mockReadCascadeRecordById,
   claimFrontierResolution: mockClaimFrontierResolution,
+  releaseFrontierClaim: mockReleaseFrontierClaim,
   resumeFrontierTier: mockResumeFrontierTier,
   rejectFrontierTier: mockRejectFrontierTier,
 }));
@@ -166,6 +172,23 @@ mock.module('@archon/core/db/isolation-environments', () => ({
   updateStatus: mock(async () => {}),
 }));
 
+class CauldronDrainingError extends Error {
+  readonly code = 'cauldron_draining' as const;
+  constructor() {
+    super('cauldron_draining');
+    this.name = 'CauldronDrainingError';
+  }
+}
+
+const mockGetCauldronDrainState = mock(async () => ({
+  mode: 'normal' as const,
+  activeLeaseCount: 0,
+  activeRunCount: 0,
+  activeRunIds: [] as string[],
+  drained: false,
+  updatedAt: null as string | null,
+}));
+
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mock(async () => []),
   listDashboardRuns: mock(async () => ({
@@ -179,6 +202,8 @@ mock.module('@archon/core/db/workflows', () => ({
   deleteWorkflowRun: mock(async () => {}),
   updateWorkflowRun: mock(async () => {}),
   getWorkflowRunByWorkerPlatformId: mock(async () => null),
+  getCauldronDrainState: mockGetCauldronDrainState,
+  CauldronDrainingError,
 }));
 
 mock.module('@archon/core/db/workflow-events', () => ({
@@ -279,6 +304,7 @@ describe('POST /api/cascades/:id/approve-frontier', () => {
       path: '/tmp/claim.json',
     }));
     mockResumeFrontierTier.mockImplementation(async (_record, opts) => {
+      await opts?.assertDispatchAllowed?.();
       const resumed: MockCascadeRecord = {
         cascadeId: 'resumed-cascade-1',
         woId: _record.woId,
@@ -427,5 +453,70 @@ describe('operator-token gate on cascade endpoints', () => {
     } finally {
       delete process.env.ARCHON_OPERATOR_TOKEN;
     }
+  });
+});
+
+describe('drain refuses frontier approval before claim', () => {
+  test('fire_refused_while_draining_every_path', async () => {
+    mockClaimFrontierResolution.mockClear();
+    mockGetCauldronDrainState.mockResolvedValueOnce({
+      mode: 'draining',
+      activeLeaseCount: 1,
+      activeRunCount: 1,
+      activeRunIds: ['run-1'],
+      drained: false,
+      updatedAt: '2026-09-24T00:00:00.000Z',
+    });
+    mockReadCascadeRecordById.mockResolvedValueOnce({
+      cascadeId: 'cascade-1',
+      woId: 'WO-TEST',
+      status: 'pending-frontier-approval',
+      frontierApproval: { tierName: 'frontier' },
+    });
+    const res = await makeApp().request('/api/cascades/cascade-1/approve-frontier', {
+      method: 'POST',
+    });
+    expect(res.status).toBe(503);
+    expect(res.headers.get('Retry-After')).toBe('60');
+    const body = (await res.json()) as { code: string };
+    expect(body.code).toBe('cauldron_draining');
+    expect(mockClaimFrontierResolution).not.toHaveBeenCalled();
+  });
+
+  test('post-claim drain race returns 503 and releases the claim', async () => {
+    const draining = {
+      mode: 'draining' as const,
+      activeLeaseCount: 1,
+      activeRunCount: 1,
+      activeRunIds: ['run-1'],
+      drained: false,
+      updatedAt: '2026-09-24T00:00:00.000Z',
+    };
+    mockGetCauldronDrainState
+      .mockResolvedValueOnce({
+        mode: 'normal',
+        activeLeaseCount: 0,
+        activeRunCount: 0,
+        activeRunIds: [],
+        drained: false,
+        updatedAt: null,
+      })
+      .mockResolvedValueOnce(draining)
+      .mockResolvedValueOnce(draining);
+    mockReadCascadeRecordById.mockResolvedValueOnce({
+      cascadeId: 'cascade-1',
+      woId: 'WO-TEST',
+      status: 'pending-frontier-approval',
+      frontierApproval: { tierName: 'frontier' },
+    });
+    mockReleaseFrontierClaim.mockClear();
+    const res = await makeApp().request('/api/cascades/cascade-1/approve-frontier', {
+      method: 'POST',
+    });
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { code: string };
+    expect(body.code).toBe('cauldron_draining');
+    expect(mockClaimFrontierResolution).toHaveBeenCalled();
+    expect(mockReleaseFrontierClaim).toHaveBeenCalledWith('cascade-1');
   });
 });

@@ -2,6 +2,7 @@ import { mock, describe, test, expect, beforeEach } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
+import { rootLogger } from '@archon/paths';
 import { SqliteAdapter } from './adapters/sqlite';
 import type { IDatabase } from './adapters/types';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
@@ -93,6 +94,8 @@ import {
   reconcileTerminalWorkflowRuns,
   getCauldronDrainState,
   setCauldronDrainMode,
+  applyCauldronDrainClearOnBoot,
+  CauldronDrainingError,
 } from './workflows';
 
 describe('workflows database', () => {
@@ -122,7 +125,9 @@ describe('workflows database', () => {
 
   describe('createWorkflowRun', () => {
     test('creates a new workflow run', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([mockWorkflowRun]));
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ mode: 'normal' }]))
+        .mockResolvedValueOnce(createQueryResult([mockWorkflowRun]));
 
       const result = await createWorkflowRun({
         workflow_name: 'feature-development',
@@ -132,7 +137,8 @@ describe('workflows database', () => {
       });
 
       expect(result).toEqual(mockWorkflowRun);
-      expect(mockQuery).toHaveBeenCalledWith(
+      expect(mockTransactionQuery).toHaveBeenNthCalledWith(
+        2,
         expect.stringContaining('INSERT INTO remote_agent_workflow_runs'),
         [
           'feature-development',
@@ -151,7 +157,9 @@ describe('workflows database', () => {
         ...mockWorkflowRun,
         metadata: { github_context: 'Issue #42 context' },
       };
-      mockQuery.mockResolvedValueOnce(createQueryResult([runWithMetadata]));
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ mode: 'normal' }]))
+        .mockResolvedValueOnce(createQueryResult([runWithMetadata]));
 
       const result = await createWorkflowRun({
         workflow_name: 'feature-development',
@@ -162,7 +170,8 @@ describe('workflows database', () => {
       });
 
       expect(result.metadata).toEqual({ github_context: 'Issue #42 context' });
-      expect(mockQuery).toHaveBeenCalledWith(
+      expect(mockTransactionQuery).toHaveBeenNthCalledWith(
+        2,
         expect.stringContaining('INSERT INTO remote_agent_workflow_runs'),
         [
           'feature-development',
@@ -178,7 +187,9 @@ describe('workflows database', () => {
 
     test('creates workflow run without codebase_id', async () => {
       const runWithoutCodebase = { ...mockWorkflowRun, codebase_id: null };
-      mockQuery.mockResolvedValueOnce(createQueryResult([runWithoutCodebase]));
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ mode: 'normal' }]))
+        .mockResolvedValueOnce(createQueryResult([runWithoutCodebase]));
 
       const result = await createWorkflowRun({
         workflow_name: 'feature-development',
@@ -187,7 +198,8 @@ describe('workflows database', () => {
       });
 
       expect(result.codebase_id).toBeNull();
-      expect(mockQuery).toHaveBeenCalledWith(
+      expect(mockTransactionQuery).toHaveBeenNthCalledWith(
+        2,
         expect.stringContaining('INSERT INTO remote_agent_workflow_runs'),
         ['feature-development', 'conv-456', null, 'Add dark mode support', '{}', null, null]
       );
@@ -626,7 +638,9 @@ describe('workflows database', () => {
 
   describe('error handling', () => {
     test('createWorkflowRun throws on database error', async () => {
-      mockQuery.mockRejectedValueOnce(new Error('Connection refused'));
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ mode: 'normal' }]))
+        .mockRejectedValueOnce(new Error('Connection refused'));
 
       await expect(
         createWorkflowRun({
@@ -699,7 +713,9 @@ describe('workflows database', () => {
       const circularObj: Record<string, unknown> = { someKey: 'value' };
       circularObj.self = circularObj;
 
-      mockQuery.mockResolvedValueOnce(createQueryResult([{ ...mockWorkflowRun, metadata: {} }]));
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ mode: 'normal' }]))
+        .mockResolvedValueOnce(createQueryResult([{ ...mockWorkflowRun, metadata: {} }]));
 
       const result = await createWorkflowRun({
         workflow_name: 'test',
@@ -710,7 +726,7 @@ describe('workflows database', () => {
 
       // Should succeed with empty metadata fallback
       expect(result.metadata).toEqual({});
-      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      const [, params] = mockTransactionQuery.mock.calls[1] as [string, unknown[]];
       expect(params[4]).toBe('{}');
     });
 
@@ -719,7 +735,9 @@ describe('workflows database', () => {
         ...mockWorkflowRun,
         metadata: { github_context: 'Issue #99: Fix bug' },
       };
-      mockQuery.mockResolvedValueOnce(createQueryResult([runWithContext]));
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ mode: 'normal' }]))
+        .mockResolvedValueOnce(createQueryResult([runWithContext]));
 
       const result = await createWorkflowRun({
         workflow_name: 'test',
@@ -2455,14 +2473,22 @@ describe('Cauldron drain mode', () => {
       .mockResolvedValueOnce(createQueryResult([{ mode: 'draining', updated_at: 'now' }]))
       .mockResolvedValueOnce(createQueryResult([{ active_lease_count: 0 }]))
       .mockResolvedValueOnce(createQueryResult([{ active_run_count: 1 }]))
+      .mockResolvedValueOnce(
+        createQueryResult([{ pending_run_count: 0, running_run_count: 1, surviving_run_count: 0 }])
+      )
       .mockResolvedValueOnce(createQueryResult([{ id: 'run-legacy' }]));
 
     await expect(getCauldronDrainState('2026-07-09T20:00:00.000Z')).resolves.toEqual({
       mode: 'draining',
       activeLeaseCount: 0,
       activeRunCount: 1,
+      pendingRunCount: 0,
+      runningRunCount: 1,
+      survivingRunCount: 0,
       activeRunIds: ['run-legacy'],
       drained: false,
+      recreateSafe: false,
+      clearOnBoot: false,
       updatedAt: 'now',
     });
   });
@@ -2587,6 +2613,462 @@ describe('Cauldron drain mode', () => {
           unlinkSync(dbPath + suffix);
         } catch {
           // File may not exist depending on SQLite checkpoint timing.
+        }
+      }
+    }
+  });
+});
+
+describe('WO-HARNESS-REBUILD-DRAIN-MODE-01 drain create and recreateSafe', () => {
+  beforeEach(() => {
+    mockQuery.mockReset();
+    mockQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    mockTransactionQuery.mockReset();
+    mockTransactionQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    mockWithTransaction.mockClear();
+    activeDatabase = defaultMockDatabase;
+  });
+
+  test('create_run_is_atomic_with_drain', async () => {
+    mockTransactionQuery.mockResolvedValueOnce(createQueryResult([{ mode: 'draining' }]));
+    await expect(
+      createWorkflowRun({
+        workflow_name: 'feature',
+        conversation_id: 'conv',
+        user_message: 'test',
+      })
+    ).rejects.toBeInstanceOf(CauldronDrainingError);
+    const sql = mockTransactionQuery.mock.calls.map(call => String(call[0]));
+    expect(sql.some(statement => statement.includes('FOR UPDATE'))).toBe(true);
+    expect(
+      sql.some(statement => statement.includes('INSERT INTO remote_agent_workflow_runs'))
+    ).toBe(false);
+
+    const dbPath = join(
+      import.meta.dir,
+      `.test-drain-atomic-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sqlText: string, params?: unknown[]) =>
+      sqlite.query(sqlText, params)
+    );
+    try {
+      await setCauldronDrainMode({
+        mode: 'draining',
+        actor: 'operator',
+        reason: 'test',
+        updatedAt: '2026-09-24T00:00:00.000Z',
+      });
+      const before = await sqlite.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM remote_agent_workflow_runs'
+      );
+      await expect(
+        createWorkflowRun({
+          workflow_name: 'feature',
+          conversation_id: 'conv-missing',
+          user_message: 'test',
+        })
+      ).rejects.toMatchObject({ code: 'cauldron_draining' });
+      const after = await sqlite.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM remote_agent_workflow_runs'
+      );
+      expect(after.rows[0]?.count).toBe(before.rows[0]?.count);
+    } finally {
+      await sqlite.close();
+      for (const suffix of ['', '-wal', '-shm']) {
+        try {
+          unlinkSync(dbPath + suffix);
+        } catch {
+          // ignore missing sidecar
+        }
+      }
+    }
+  });
+
+  test('recreate_safe_false_when_not_draining', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-drain-normal-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sqlText: string, params?: unknown[]) =>
+      sqlite.query(sqlText, params)
+    );
+    try {
+      await expect(getCauldronDrainState()).resolves.toMatchObject({
+        mode: 'normal',
+        recreateSafe: false,
+        pendingRunCount: 0,
+        runningRunCount: 0,
+      });
+    } finally {
+      await sqlite.close();
+      try {
+        unlinkSync(dbPath);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  test('recreate_safe_true_at_zero', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-drain-safe-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sqlText: string, params?: unknown[]) =>
+      sqlite.query(sqlText, params)
+    );
+    try {
+      await setCauldronDrainMode({
+        mode: 'draining',
+        actor: 'operator',
+        reason: 'rebuild',
+        updatedAt: '2026-09-24T00:00:00.000Z',
+      });
+      const codebaseId = '99999999-9999-4999-8999-999999999991';
+      const conversationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab';
+      const runningId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc';
+      const pausedId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbd';
+      await sqlite.query(
+        'INSERT INTO remote_agent_codebases (id, name, default_cwd) VALUES ($1, $2, $3)',
+        [codebaseId, 'drain-safe', '/tmp/drain-safe']
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_conversations
+         (id, platform_type, platform_conversation_id, codebase_id)
+         VALUES ($1, 'test', 'drain-safe', $2)`,
+        [conversationId, codebaseId]
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_workflow_runs
+         (id, conversation_id, codebase_id, workflow_name, user_message, status)
+         VALUES ($1, $2, $3, 'feature', 'run', 'running')`,
+        [runningId, conversationId, codebaseId]
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_workflow_runs
+         (id, conversation_id, codebase_id, workflow_name, user_message, status)
+         VALUES ($1, $2, $3, 'feature', 'pause', 'paused')`,
+        [pausedId, conversationId, codebaseId]
+      );
+      await sqlite.query(
+        `INSERT INTO remote_agent_run_leases
+         (run_id, owner_id, lease_token, acquired_at, last_heartbeat_at, expires_at)
+         VALUES ($1, 'worker', 'cccccccc-cccc-4ccc-8ccc-cccccccccccd',
+                 '2026-07-09T20:00:00.000Z', '2026-07-09T20:00:00.000Z',
+                 '2999-07-09T20:00:00.000Z')`,
+        [runningId]
+      );
+      await expect(getCauldronDrainState()).resolves.toMatchObject({
+        recreateSafe: false,
+        runningRunCount: 1,
+      });
+      await sqlite.query(
+        "UPDATE remote_agent_workflow_runs SET status = 'completed' WHERE id = $1",
+        [runningId]
+      );
+      await sqlite.query('UPDATE remote_agent_run_leases SET released_at = $2 WHERE run_id = $1', [
+        runningId,
+        '2026-07-09T20:01:00.000Z',
+      ]);
+      await expect(getCauldronDrainState()).resolves.toMatchObject({
+        recreateSafe: true,
+        survivingRunCount: 1,
+        drained: false,
+        runningRunCount: 0,
+        pendingRunCount: 0,
+      });
+    } finally {
+      await sqlite.close();
+      try {
+        unlinkSync(dbPath);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  test('clear_on_boot_clears_rebuild_drain', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-drain-boot-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sqlText: string, params?: unknown[]) =>
+      sqlite.query(sqlText, params)
+    );
+    try {
+      await setCauldronDrainMode({
+        mode: 'draining',
+        actor: 'operator',
+        reason: 'rebuild',
+        updatedAt: '2026-09-24T00:00:00.000Z',
+        clearOnBoot: true,
+      });
+      await expect(applyCauldronDrainClearOnBoot('2026-09-24T01:00:00.000Z')).resolves.toBe(
+        'cleared'
+      );
+      await expect(getCauldronDrainState()).resolves.toMatchObject({ mode: 'normal' });
+      const events = await sqlite.query<{ actor: string; reason: string }>(
+        'SELECT actor, reason FROM remote_agent_cauldron_control_events ORDER BY created_at'
+      );
+      const boot = events.rows.filter(row => row.actor === 'boot');
+      expect(boot).toHaveLength(1);
+      expect(boot[0]?.reason).toBe('clear_on_boot after restart');
+    } finally {
+      await sqlite.close();
+      try {
+        unlinkSync(dbPath);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  test('boot clear leaves a foreign drain that replaces the rebuild drain after the read', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-drain-boot-race-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sqlText: string, params?: unknown[]) =>
+      sqlite.query(sqlText, params)
+    );
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    const stream = rootLogger[streamSymbol as keyof typeof rootLogger] as {
+      write: (chunk: string | Uint8Array) => boolean;
+    };
+    const logged: string[] = [];
+    const originalWrite = stream.write.bind(stream);
+    stream.write = (chunk: string | Uint8Array): boolean => {
+      logged.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return originalWrite(chunk);
+    };
+    const originalQuery = sqlite.query.bind(sqlite);
+    let interleaved = false;
+    try {
+      await setCauldronDrainMode({
+        mode: 'draining',
+        actor: 'rebuild-script',
+        reason: 'rebuild',
+        updatedAt: '2026-09-24T00:00:00.000Z',
+        clearOnBoot: true,
+      });
+      sqlite.query = (async (sql: string, params?: unknown[]) => {
+        const result = await originalQuery(sql, params);
+        const trimmed = sql.trim().toUpperCase();
+        if (
+          !interleaved &&
+          trimmed.startsWith('SELECT') &&
+          sql.includes('remote_agent_cauldron_control') &&
+          !sql.includes('remote_agent_cauldron_control_events')
+        ) {
+          interleaved = true;
+          await originalQuery(
+            `UPDATE remote_agent_cauldron_control
+             SET mode = 'normal', updated_at = $1, updated_by = $2, clear_on_boot = 0
+             WHERE id = 1`,
+            ['2026-09-24T00:30:00.000Z', 'clearing-operator']
+          );
+          await originalQuery(
+            `UPDATE remote_agent_cauldron_control
+             SET mode = 'draining', updated_at = $1, updated_by = $2, clear_on_boot = 0
+             WHERE id = 1`,
+            ['2026-09-24T00:45:00.000Z', 'incident-operator']
+          );
+          await originalQuery(
+            `INSERT INTO remote_agent_cauldron_control_events
+             (from_mode, to_mode, actor, reason, created_at)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+              'normal',
+              'draining',
+              'incident-operator',
+              'incident freeze',
+              '2026-09-24T00:45:00.000Z',
+            ]
+          );
+        }
+        return result;
+      }) as typeof sqlite.query;
+      await expect(applyCauldronDrainClearOnBoot('2026-09-24T01:00:00.000Z')).resolves.toBe(
+        'persisted'
+      );
+      const row = await originalQuery<{
+        mode: string;
+        clear_on_boot: number;
+        updated_by: string;
+        updated_at: string;
+      }>(
+        'SELECT mode, clear_on_boot, updated_by, updated_at FROM remote_agent_cauldron_control WHERE id = 1'
+      );
+      expect(row.rows[0]?.mode).toBe('draining');
+      expect(row.rows[0]?.updated_by).toBe('incident-operator');
+      expect(Number(row.rows[0]?.clear_on_boot)).toBe(0);
+      expect(row.rows[0]?.updated_at).toBe('2026-09-24T00:45:00.000Z');
+      const events = await originalQuery<{ actor: string; to_mode: string; reason: string | null }>(
+        'SELECT actor, to_mode, reason FROM remote_agent_cauldron_control_events'
+      );
+      expect(events.rows.some(event => event.reason === 'clear_on_boot after restart')).toBe(false);
+      expect(events.rows.some(event => event.actor === 'boot')).toBe(false);
+      expect(events.rows.some(event => event.to_mode === 'normal' && event.actor === 'boot')).toBe(
+        false
+      );
+      const freeze = events.rows.find(event => event.actor === 'incident-operator');
+      expect(freeze?.reason).toBe('incident freeze');
+      expect(freeze?.to_mode).toBe('draining');
+      expect(logged.join('')).toContain('drain_clear_skipped_foreign_drain');
+      expect(interleaved).toBe(true);
+    } finally {
+      stream.write = originalWrite;
+      sqlite.query = originalQuery;
+      await sqlite.close();
+      try {
+        unlinkSync(dbPath);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  test('refuses clear_on_boot takeover of an existing drain', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-drain-foreign-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sqlText: string, params?: unknown[]) =>
+      sqlite.query(sqlText, params)
+    );
+    try {
+      await setCauldronDrainMode({
+        mode: 'draining',
+        actor: 'incident-operator',
+        reason: 'incident freeze',
+        updatedAt: '2026-09-24T00:00:00.000Z',
+        clearOnBoot: false,
+      });
+      await expect(
+        setCauldronDrainMode({
+          mode: 'draining',
+          actor: 'rebuild-script',
+          reason: 'rebuild takeover',
+          updatedAt: '2026-09-24T02:00:00.000Z',
+          clearOnBoot: true,
+        })
+      ).resolves.toEqual({ changed: false, mode: 'draining' });
+      const row = await sqlite.query<{
+        mode: string;
+        clear_on_boot: number;
+        updated_by: string;
+      }>('SELECT mode, clear_on_boot, updated_by FROM remote_agent_cauldron_control WHERE id = 1');
+      expect(row.rows[0]?.mode).toBe('draining');
+      expect(Number(row.rows[0]?.clear_on_boot)).toBe(0);
+      expect(row.rows[0]?.updated_by).toBe('incident-operator');
+      const events = await sqlite.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM remote_agent_cauldron_control_events'
+      );
+      expect(events.rows[0]?.count).toBe(1);
+    } finally {
+      await sqlite.close();
+      try {
+        unlinkSync(dbPath);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  test('incident_drain_persists_and_old_shape_upgrades', async () => {
+    const dbPath = join(
+      import.meta.dir,
+      `.test-drain-incident-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const sqlite = new SqliteAdapter(dbPath);
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sqlText: string, params?: unknown[]) =>
+      sqlite.query(sqlText, params)
+    );
+    try {
+      await setCauldronDrainMode({
+        mode: 'draining',
+        actor: 'operator',
+        reason: 'incident',
+        updatedAt: '2026-09-24T00:00:00.000Z',
+        clearOnBoot: false,
+      });
+      await expect(applyCauldronDrainClearOnBoot('2026-09-24T01:00:00.000Z')).resolves.toBe(
+        'persisted'
+      );
+      await expect(getCauldronDrainState()).resolves.toMatchObject({
+        mode: 'draining',
+        clearOnBoot: false,
+      });
+      await expect(
+        setCauldronDrainMode({
+          mode: 'draining',
+          actor: 'rebuild-script',
+          reason: 'upgrade incident freeze to rebuild scope',
+          updatedAt: '2026-09-24T02:00:00.000Z',
+          clearOnBoot: true,
+        })
+      ).resolves.toEqual({ changed: false, mode: 'draining' });
+      await expect(getCauldronDrainState()).resolves.toMatchObject({
+        mode: 'draining',
+        clearOnBoot: false,
+      });
+      const events = await sqlite.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM remote_agent_cauldron_control_events'
+      );
+      expect(events.rows[0]?.count).toBe(1);
+    } finally {
+      await sqlite.close();
+    }
+
+    const { Database } = await import('bun:sqlite');
+    const oldPath = join(
+      import.meta.dir,
+      `.test-drain-old-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const raw = new Database(oldPath);
+    raw.run(`CREATE TABLE remote_agent_cauldron_control (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      mode TEXT NOT NULL CHECK (mode IN ('normal', 'draining')),
+      updated_at TEXT,
+      updated_by TEXT
+    )`);
+    raw.run(
+      "INSERT INTO remote_agent_cauldron_control (id, mode, updated_by) VALUES (1, 'draining', 'operator')"
+    );
+    raw.close();
+    const upgraded = new SqliteAdapter(oldPath);
+    try {
+      const cols = await upgraded.query<{ name: string }>(
+        "PRAGMA table_info('remote_agent_cauldron_control')"
+      );
+      expect(cols.rows.map(row => row.name)).toContain('clear_on_boot');
+      const mode = await upgraded.query<{ mode: string; clear_on_boot: number }>(
+        'SELECT mode, clear_on_boot FROM remote_agent_cauldron_control WHERE id = 1'
+      );
+      expect(mode.rows[0]?.mode).toBe('draining');
+      expect(Number(mode.rows[0]?.clear_on_boot)).toBe(0);
+    } finally {
+      await upgraded.close();
+      for (const path of [dbPath, oldPath]) {
+        try {
+          unlinkSync(path);
+        } catch {
+          // ignore
         }
       }
     }

@@ -443,7 +443,8 @@ CREATE TABLE IF NOT EXISTS remote_agent_cauldron_control (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   mode TEXT NOT NULL CHECK (mode IN ('normal', 'draining')),
   updated_at TIMESTAMP WITH TIME ZONE,
-  updated_by TEXT
+  updated_by TEXT,
+  clear_on_boot INTEGER NOT NULL DEFAULT 0
 );
 
 INSERT INTO remote_agent_cauldron_control (id, mode)
