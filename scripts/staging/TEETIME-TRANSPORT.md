@@ -59,6 +59,7 @@ the real-SDK synthetic executable test if combined into one invocation.
 
 ```text
 python -m unittest discover -s scripts/staging -p test_teetime_connect_proxy.py
+python -m unittest discover -s scripts/staging -p test_teetime_auth_receiver.py
 bun test packages/providers/src/codex/restricted-canary-transport.test.ts
 bun test packages/providers/src/codex/restricted-provider.test.ts
 bun test packages/providers/src/codex/restricted-run-factory.test.ts
@@ -68,6 +69,32 @@ bun --filter @archon/providers type-check
 ```
 
 ## Provider entrypoint
+
+## Credential receiver candidate (not integrated)
+
+teetime_auth_receiver.py is a receiver candidate for a future inspected worker.
+It is not an operator-host command and must never run on the desktop. It accepts
+only stdin, requires Linux uid1001 and the exact home tmpfs mount, creates a fresh
+0700 directory and exclusive0600 file, rejects alternate credentials, duplicate
+JSON keys and nonfinite/near-expiry access-token claims, and prints only a boolean
+receipt. An expiry claim is a precondition, not JWT signature verification.
+The ten-second alarm raises a controlled exception so failure cleanup executes.
+
+The actual receiver subprocess can be tested with synthetic data only:
+
+```text
+python scripts/staging/test-teetime-auth-receiver-linux.py --docker path/to/docker --image sha256:EXACT_IMAGE
+```
+
+The test creates an owned no-network container and destroys it afterward. Seven
+Linux cases passed on the prior pinned e9d8d071 image: installation/modes/owner,
+malformed, oversized, expired, existing directory, symlink, and alarm cleanup.
+Four payload unit tests pass. This does not qualify the complete credential
+delivery lifecycle. A reviewed launcher must stop all model processes until
+receipt, preserve the original login, detect auth-copy changes in memory without
+logging hashes, and destroy the credential-bearing container on every exit.
+
+## Provider entrypoint contract
 
 createRestrictedCanaryWorkerProvider is a dedicated, unregistered entrypoint.
 Its constructor-owned teetime-connect-v1 transport fixes HTTP_PROXY and HTTPS_PROXY
