@@ -26,6 +26,7 @@ const selected = { id: REVIEW_MODEL, provider: REVIEW_PROVIDER, baseUrl: `${REVI
 let fallback: string | undefined;
 let sessionModel = { ...selected };
 let digest = REVIEW_DIGEST;
+let contextLength = 8192;
 let output = JSON.stringify({
   verdict: 'REJECTED',
   reasons: ['missing evidence'],
@@ -95,6 +96,7 @@ beforeEach(() => {
   fallback = undefined;
   sessionModel = { ...selected };
   digest = REVIEW_DIGEST;
+  contextLength = 8192;
   prompted = 0;
   disposed = 0;
   postDigest = undefined;
@@ -107,8 +109,10 @@ beforeEach(() => {
     evidenceIds: ['tests'],
   });
   globalThis.fetch = mock(async (url: string | URL | Request) => {
-    expect(String(url)).toBe(`${REVIEW_ENDPOINT}/api/tags`);
-    return Response.json({ models: [{ name: REVIEW_MODEL, digest }] });
+    expect([`${REVIEW_ENDPOINT}/api/tags`, `${REVIEW_ENDPOINT}/api/ps`]).toContain(String(url));
+    return Response.json({
+      models: [{ name: REVIEW_MODEL, digest, context_length: contextLength }],
+    });
   }) as typeof fetch;
 });
 afterEach(() => {
@@ -194,6 +198,12 @@ describe('restricted text-only reviewer candidate', () => {
   it('rejects model digest drift before session construction', async () => {
     digest = 'different';
     await expect(collect()).rejects.toThrow('digest');
+    expect(construction).toBeUndefined();
+    expect(prompted).toBe(0);
+  });
+  it('rejects unqualified effective context before session creation', async () => {
+    contextLength = 4096;
+    await expect(collect()).rejects.toThrow('capacity');
     expect(construction).toBeUndefined();
     expect(prompted).toBe(0);
   });

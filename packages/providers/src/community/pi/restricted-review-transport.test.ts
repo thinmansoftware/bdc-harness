@@ -100,6 +100,7 @@ it('routes the installed Pi SDK through the guard with bounded output and no too
       expect(body.model).toBe(REVIEW_MODEL);
       expect(body.tools).toBeUndefined();
       expect(body.max_tokens ?? body.max_completion_tokens).toBe(1024);
+      expect(body.store).toBe(false);
       expect(
         body.messages.some(
           (message: { content: string }) => message.content === 'synthetic fixture'
@@ -216,16 +217,23 @@ it('rejects tool payloads, oversized input, oversized responses and extra invent
     return new Response('x'.repeat(131073));
   }) as unknown as typeof fetch;
   const guard = createRestrictedReviewFetch(upstream);
-  for (const body of [
-    { ...payload, tools: [{ type: 'function' }] },
-    { ...payload, messages: [{ role: 'user', content: 'x'.repeat(16001) }] },
-  ]) {
+  for (const [body, reason] of [
+    [{ ...payload, tools: [{ type: 'function' }] }, 'unsupported review payload override'],
+    [{ ...payload, max_completion_tokens: 999 }, 'unsupported review payload override'],
+    [{ ...payload, options: { num_ctx: 1 } }, 'unsupported review payload override'],
+    [{ ...payload, store: true }, 'unsupported review payload override'],
+    [
+      { ...payload, messages: [{ role: 'user', content: 'x'.repeat(16001) }] },
+      'serialized review request exceeds',
+    ],
+  ] as const) {
     await expect(
       createRestrictedReviewFetch(upstream)(REVIEW_ENDPOINT + '/v1/chat/completions', {
         method: 'POST',
         body: JSON.stringify(body),
       })
-    ).rejects.toThrow();
+    ).rejects.toThrow(reason);
+    expect(calls).toBe(0);
   }
   expect(calls).toBe(0);
   const oversized = await guard(REVIEW_ENDPOINT + '/api/tags');

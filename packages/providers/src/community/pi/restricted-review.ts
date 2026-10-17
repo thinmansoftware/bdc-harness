@@ -18,6 +18,18 @@ async function verifyModelIdentity(signal: AbortSignal): Promise<void> {
   const matches = inventory.models?.filter(model => model.name === REVIEW_MODEL) ?? [];
   if (matches.length !== 1 || matches[0].digest !== REVIEW_DIGEST)
     throw new Error('local review model digest mismatch');
+  const loadedResponse = await fetch(`${REVIEW_ENDPOINT}/api/ps`, { redirect: 'error', signal });
+  if (!loadedResponse.ok) throw new Error('review capacity inventory unavailable');
+  const loaded = (await loadedResponse.json()) as {
+    models?: { name?: string; digest?: string; context_length?: number }[];
+  };
+  const running = loaded.models?.filter(model => model.name === REVIEW_MODEL) ?? [];
+  if (
+    running.length !== 1 ||
+    running[0].digest !== REVIEW_DIGEST ||
+    running[0].context_length !== 8192
+  )
+    throw new Error('review model capacity not qualified');
 }
 
 export async function* runRestrictedReview(

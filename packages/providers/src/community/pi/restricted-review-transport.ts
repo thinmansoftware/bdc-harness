@@ -3,15 +3,17 @@ import { REVIEW_ENDPOINT, REVIEW_MODEL } from './restricted-review-policy';
 
 export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetch {
   let inferenceRequests = 0;
-  let inventoryRequests = 0;
+  const inventoryRequests = new Map<string, number>();
   return (async (input: Request | string | URL, init?: RequestInit) => {
     const request =
       input instanceof Request ? new Request(input, init) : new Request(String(input), init);
     const url = new URL(request.url);
     if (url.origin !== REVIEW_ENDPOINT || url.username || url.password || url.search || url.hash)
       throw new Error('restricted review transport destination rejected');
-    if (url.pathname === '/api/tags' && request.method === 'GET') {
-      if (++inventoryRequests > 2) throw new Error('review inventory request budget exhausted');
+    if (['/api/tags', '/api/ps'].includes(url.pathname) && request.method === 'GET') {
+      const count = (inventoryRequests.get(url.pathname) ?? 0) + 1;
+      inventoryRequests.set(url.pathname, count);
+      if (count > 2) throw new Error('review inventory request budget exhausted');
       if ([...request.headers.keys()].length) throw new Error('inventory headers rejected');
     } else if (url.pathname === '/v1/chat/completions' && request.method === 'POST') {
       if (++inferenceRequests > 1) throw new Error('review inference request budget exhausted');
@@ -33,9 +35,25 @@ export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetc
         }
       }
       const body = await request.clone().text();
-      if (new TextEncoder().encode(body).length > 16000)
+      if (new TextEncoder().encode(body).length > 6000)
         throw new Error('serialized review request exceeds diagnostic bound');
       const data = JSON.parse(body);
+      const allowed = new Set([
+        'model',
+        'messages',
+        'stream',
+        'stream_options',
+        'max_tokens',
+        'max_completion_tokens',
+        'temperature',
+        'store',
+      ]);
+      if (
+        Object.keys(data).some(key => !allowed.has(key)) ||
+        ('store' in data && data.store !== false) ||
+        ('max_tokens' in data && 'max_completion_tokens' in data)
+      )
+        throw new Error('unsupported review payload override');
       if (
         data.model !== REVIEW_MODEL ||
         data.stream !== true ||
