@@ -53,6 +53,7 @@ jobs:
           cd packages/providers
           bun test src/codex/restricted-provider.test.ts
           bun test src/codex/restricted-sdk.test.ts
+          bun test src/codex/restricted-run-factory.test.ts
           bun test src/codex/provider.test.ts
           bun x tsc --noEmit
       - name: Build exact checkout candidate image
