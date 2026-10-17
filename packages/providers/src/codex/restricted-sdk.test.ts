@@ -35,6 +35,11 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:0,output_t
     const client = new Codex({ ...restrictedClientOptions(), codexPathOverride: executable });
     await client.startThread(restrictedThreadOptions()).run('synthetic');
     await client.resumeThread('synthetic-thread', restrictedThreadOptions()).run('synthetic');
+    const canary = new Codex({
+      ...restrictedClientOptions('teetime-connect-v1'),
+      codexPathOverride: executable,
+    });
+    await canary.startThread(restrictedThreadOptions()).run('synthetic');
     const calls = readFileSync(capture, 'utf8')
       .trim()
       .split('\n')
@@ -45,8 +50,8 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:0,output_t
             env: Record<string, string>;
           }
       );
-    expect(calls).toHaveLength(2);
-    for (const call of calls) {
+    expect(calls).toHaveLength(3);
+    for (const [index, call] of calls.entries()) {
       expect(call.args).not.toContain('--sandbox');
       expect(call.args).not.toContain('--add-dir');
       expect(call.args.some(arg => arg.startsWith('sandbox_workspace_write.'))).toBe(false);
@@ -70,6 +75,14 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:0,output_t
       expect(call.env.TEE_TIME_SYNTHETIC_SECRET).toBeUndefined();
       expect(call.env.CODEX_HOME).toBe('/home/appuser/.codex');
       const allowedKeys = ['HOME', 'CODEX_HOME', 'PATH', 'CODEX_INTERNAL_ORIGINATOR_OVERRIDE'];
+      if (index === 2) {
+        allowedKeys.push('HTTPS_PROXY', 'HTTP_PROXY');
+        expect(call.env.HTTPS_PROXY).toBe('http://teetime-proxy:3128');
+        expect(call.env.HTTP_PROXY).toBe('http://teetime-proxy:3128');
+      } else {
+        expect(call.env.HTTPS_PROXY).toBeUndefined();
+        expect(call.env.HTTP_PROXY).toBeUndefined();
+      }
       // Windows adds these process bootstrap keys. The admitted worker is Linux;
       // its CI assertion retains the strict four-key set above.
       if (process.platform === 'win32')

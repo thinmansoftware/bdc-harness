@@ -41,6 +41,7 @@ jobs:
         run: |
           python3 scripts/staging/test_cleanup_apparmor_audit.py
           python3 scripts/staging/test_apparmor_negatives.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_connect_proxy.py
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test
           bun --filter @archon/server type-check
@@ -52,6 +53,7 @@ jobs:
         run: |
           cd packages/providers
           bun test src/codex/restricted-provider.test.ts
+          bun test src/codex/restricted-canary-transport.test.ts
           bun test src/codex/restricted-sdk.test.ts
           bun test src/community/pi/restricted-review.test.ts
           bun test src/community/pi/restricted-review-transport.test.ts

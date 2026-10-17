@@ -64,6 +64,35 @@ test('restricted startup and owned resume use fixed options without global auth'
   expect(reactive).not.toHaveBeenCalled();
 });
 
+test('canary uses only constructor-owned transport and does not refresh failed auth', async () => {
+  const provider = new CodexProvider({
+    restricted: true,
+    restrictedTransport: 'teetime-connect-v1',
+  });
+  failures = ['401 unauthorized'];
+  await expect(consume(provider)).rejects.toThrow();
+  expect(sdk.mock.calls[0][0]).toEqual(restrictedClientOptions('teetime-connect-v1'));
+  expect(runStreamed).toHaveBeenCalledTimes(1);
+  expect(proactive).not.toHaveBeenCalled();
+  expect(reactive).not.toHaveBeenCalled();
+  expect(() => new CodexProvider({ restrictedTransport: 'teetime-connect-v1' })).toThrow(
+    'transport'
+  );
+  expect(
+    () => new CodexProvider({ restricted: true, restrictedTransport: 'other' as never })
+  ).toThrow('transport');
+});
+
+test('canary stops on subprocess crash without a second model attempt', async () => {
+  failures = ['Codex process exited with code 1'];
+  await expect(
+    consume(new CodexProvider({ restricted: true, restrictedTransport: 'teetime-connect-v1' }))
+  ).rejects.toThrow();
+  expect(runStreamed).toHaveBeenCalledTimes(1);
+  expect(proactive).not.toHaveBeenCalled();
+  expect(reactive).not.toHaveBeenCalled();
+});
+
 test('foreign or restarted-instance sessions fail before auth and SDK', async () => {
   await consume(new CodexProvider({ restricted: true }));
   sdk.mockClear();
@@ -72,6 +101,22 @@ test('foreign or restarted-instance sessions fail before auth and SDK', async ()
   ).rejects.toThrow('unowned');
   expect(sdk).not.toHaveBeenCalled();
   expect(proactive).not.toHaveBeenCalled();
+});
+
+test('canary rejects even owned resume before constructing another SDK client', async () => {
+  const provider = new CodexProvider({
+    restricted: true,
+    restrictedTransport: 'teetime-connect-v1',
+  });
+  await consume(provider);
+  for (const fn of [sdk, start, resume, runStreamed]) fn.mockClear();
+  await expect(consume(provider, undefined, 'owned-thread')).rejects.toThrow('resume');
+  expect(sdk).not.toHaveBeenCalled();
+  expect(start).not.toHaveBeenCalled();
+  expect(resume).not.toHaveBeenCalled();
+  expect(runStreamed).not.toHaveBeenCalled();
+  expect(proactive).not.toHaveBeenCalled();
+  expect(reactive).not.toHaveBeenCalled();
 });
 
 test('configuration overrides and wrong worker cwd fail before auth and SDK', async () => {

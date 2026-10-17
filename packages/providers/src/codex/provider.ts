@@ -727,6 +727,7 @@ function toCodexAuthPathError(error: unknown): Error {
  */
 export class CodexProvider implements IAgentProvider {
   private readonly restricted: boolean;
+  private readonly restrictedTransport?: 'teetime-connect-v1';
   private readonly ownedRestrictedSessions = new Set<string>();
   private readonly retryBaseDelayMs: number;
   private readonly failbackProviderFactory: (() => IAgentProvider) | null;
@@ -736,6 +737,8 @@ export class CodexProvider implements IAgentProvider {
   constructor(options?: {
     /** Unregistered candidate; requires separately qualified dedicated worker. */
     restricted?: boolean;
+    /** Unregistered canary only; requires independently qualified proxy/worker. */
+    restrictedTransport?: 'teetime-connect-v1';
     retryBaseDelayMs?: number;
     /**
      * Optional factory that produces a fallback IAgentProvider for the
@@ -748,6 +751,12 @@ export class CodexProvider implements IAgentProvider {
     failbackEventName?: string;
   }) {
     this.restricted = options?.restricted === true;
+    if (
+      options?.restrictedTransport !== undefined &&
+      (!this.restricted || options.restrictedTransport !== 'teetime-connect-v1')
+    )
+      throw new Error('Restricted Codex transport rejected');
+    this.restrictedTransport = options?.restrictedTransport;
     if (this.restricted && options?.failbackProviderFactory) {
       throw new Error('Restricted Codex cannot have a fallback provider');
     }
@@ -796,6 +805,9 @@ export class CodexProvider implements IAgentProvider {
     // direct refresh-endpoint POST if that path doesn't advance auth.json.
     // Behavior spec v2 invariant I-1; research doc section Design recommendation L2 + L4.
     if (this.restricted) {
+      if (this.restrictedTransport !== undefined && resumeSessionId !== undefined) {
+        throw new Error('Canary resume rejected');
+      }
       validateRestrictedRequest(cwd, resumeSessionId, this.ownedRestrictedSessions, requestOptions);
     } else {
       await ensureFreshAuth('codex');
@@ -806,7 +818,7 @@ export class CodexProvider implements IAgentProvider {
 
     // 1. Initialize SDK and build thread options
     const codex = this.restricted
-      ? new Codex(restrictedClientOptions())
+      ? new Codex(restrictedClientOptions(this.restrictedTransport))
       : await this.createCodexClient(codexConfig.codexBinaryPath, requestOptions?.env);
     const threadOptions = this.restricted
       ? restrictedThreadOptions()
@@ -1029,7 +1041,11 @@ export class CodexProvider implements IAgentProvider {
           }
         }
 
-        if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) {
+        if (
+          !shouldRetry ||
+          attempt >= MAX_SUBPROCESS_RETRIES ||
+          this.restrictedTransport !== undefined
+        ) {
           // WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01: Claude failback.
           // When Codex is terminally unavailable AND a failback provider is
           // wired, delegate the query to it rather than throwing. The
