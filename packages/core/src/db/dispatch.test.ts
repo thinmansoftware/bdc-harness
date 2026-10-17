@@ -146,6 +146,104 @@ interface MailboxProcessResult {
   stderr: string;
 }
 
+function forwardMailboxObservations(stderr: string): void {
+  if (process.env.CI !== 'true') return;
+  try {
+    const prefix = 'WORKROOM_DISPATCH_CHILD_PHASE ';
+    const phases = new Set([
+      'initialize-start',
+      'initialize-end',
+      'initialize-throw',
+      'wait-start',
+      'wait-end',
+      'operation-start',
+      'operation-end',
+      'operation-throw',
+      'close-start',
+      'close-end',
+      'close-throw',
+    ]);
+    const files = new Set([
+      'packages/core/src/db/dispatch.ts',
+      'packages/core/src/db/connection.ts',
+      'packages/core/src/db/adapters/sqlite.ts',
+      'packages/core/src/db/dispatch.test.ts',
+    ]);
+    const bytes = Buffer.from(stderr);
+    const bounded = bytes.subarray(0, 65536).toString('utf8');
+    const lines = bounded.split('\n');
+    // A trailing record without its newline may have been truncated.
+    for (const line of lines.slice(0, Math.min(64, lines.length - 1))) {
+      if (!line.startsWith(prefix) || line.length > 2048) continue;
+      try {
+        const row: unknown = JSON.parse(line.slice(prefix.length));
+        if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+        const r = row as Record<string, unknown>;
+        if (typeof r.phase !== 'string' || !phases.has(r.phase)) continue;
+        const throwing = r.phase.endsWith('-throw');
+        const required = ['phase', 'child', 'action', 'pid', 'elapsedMs'];
+        const allowed = throwing ? [...required, 'errorKind', 'locations'] : required;
+        if (required.some(k => !(k in r)) || Object.keys(r).some(k => !allowed.includes(k)))
+          continue;
+        if (r.child !== 0 && r.child !== 1) continue;
+        if (r.action !== 'acknowledge' && r.action !== 'address') continue;
+        if (typeof r.pid !== 'number' || !Number.isInteger(r.pid) || r.pid <= 0) continue;
+        if (typeof r.elapsedMs !== 'number' || !Number.isFinite(r.elapsedMs) || r.elapsedMs < 0)
+          continue;
+        if (
+          throwing &&
+          (typeof r.errorKind !== 'string' ||
+            !['sqlite_busy', 'sqlite_locked', 'other'].includes(r.errorKind))
+        )
+          continue;
+        const locations: Array<{ file: string; line: number; column: number }> = [];
+        if ('locations' in r) {
+          if (!Array.isArray(r.locations) || r.locations.length > 6) continue;
+          let valid = true;
+          for (const location of r.locations) {
+            if (!location || typeof location !== 'object' || Array.isArray(location)) {
+              valid = false;
+              break;
+            }
+            const l = location as Record<string, unknown>;
+            if (
+              Object.keys(l).length !== 3 ||
+              Object.keys(l).some(k => !['file', 'line', 'column'].includes(k)) ||
+              typeof l.file !== 'string' ||
+              !files.has(l.file) ||
+              typeof l.line !== 'number' ||
+              !Number.isInteger(l.line) ||
+              l.line <= 0 ||
+              typeof l.column !== 'number' ||
+              !Number.isInteger(l.column) ||
+              l.column <= 0
+            ) {
+              valid = false;
+              break;
+            }
+            locations.push({ file: l.file, line: l.line, column: l.column });
+          }
+          if (!valid) continue;
+        }
+        const output = {
+          phase: r.phase,
+          child: r.child,
+          action: r.action,
+          pid: r.pid,
+          elapsedMs: r.elapsedMs,
+          ...(throwing ? { errorKind: r.errorKind } : {}),
+          ...('locations' in r ? { locations } : {}),
+        };
+        process.stderr.write(prefix + JSON.stringify(output) + '\n');
+      } catch {
+        /* Supplemental output must never change test results. */
+      }
+    }
+  } catch {
+    /* Preserve original captured stderr and test control flow. */
+  }
+}
+
 async function runMailboxRace(
   archonHome: string,
   action: 'acknowledge' | 'address',
@@ -154,22 +252,76 @@ async function runMailboxRace(
   const dispatchUrl = pathToFileURL(resolve(import.meta.dir, 'dispatch.ts')).href;
   const connectionUrl = pathToFileURL(resolve(import.meta.dir, 'connection.ts')).href;
   const startFile = join(archonHome, `${action}.start`);
-  const childScript = `
+  const childScript = String.raw`
     const { acknowledgeMessage, addressMessage } = await import(${JSON.stringify(dispatchUrl)});
     const { closeDatabase, getDatabase } = await import(${JSON.stringify(connectionUrl)});
-    getDatabase();
+    const observationEnabled = process.env.CI === 'true';
+    const observationChild = Number(process.env.MAILBOX_CHILD);
+    const observationAction = process.env.MAILBOX_ACTION;
+    const observationPid = process.pid;
+    function observationNow() {
+      if (!observationEnabled) return NaN;
+      try { const n = performance.now(); return Number.isFinite(n) && n >= 0 ? n : NaN; } catch { return NaN; }
+    }
+    function observe(phase, start, error) {
+      if (!observationEnabled) return;
+      try {
+        const elapsedMs = observationNow() - start;
+        if (!Number.isFinite(start) || !Number.isFinite(elapsedMs) || elapsedMs < 0) return;
+        if (![0, 1].includes(observationChild) || !['acknowledge', 'address'].includes(observationAction) || !Number.isInteger(observationPid) || observationPid <= 0) return;
+        const row = { phase, child: observationChild, action: observationAction, pid: observationPid, elapsedMs };
+        if (phase.endsWith('-throw')) {
+          row.errorKind = 'other';
+          try {
+            const code = error?.code;
+            const errno = error?.errno;
+            if (code === 'SQLITE_BUSY' || errno === 5) row.errorKind = 'sqlite_busy';
+            else if (code === 'SQLITE_LOCKED' || errno === 6) row.errorKind = 'sqlite_locked';
+          } catch { /* Unsupported error metadata remains other. */ }
+          try {
+            const stack = error?.stack;
+            if (typeof stack === 'string') {
+              const locations = [];
+              for (const frame of stack.slice(0, 2048).split('\n').slice(1, 7)) {
+                const match = frame.replaceAll('\\', '/').match(/(?:^|\/)packages\/core\/src\/db\/(dispatch\.ts|connection\.ts|adapters\/sqlite\.ts|dispatch\.test\.ts):(\d+):(\d+)(?:\)|$)/);
+                if (!match) continue;
+                const line = Number(match[2]), column = Number(match[3]);
+                if (Number.isInteger(line) && line > 0 && Number.isInteger(column) && column > 0) locations.push({ file: 'packages/core/src/db/' + match[1], line, column });
+              }
+              if (locations.length) row.locations = locations;
+            }
+          } catch { /* Never copy arbitrary stack/error text. */ }
+        }
+        const marker = 'WORKROOM_DISPATCH_CHILD_PHASE ' + JSON.stringify(row);
+        if (marker.length <= 2048) process.stderr.write('\n' + marker + '\n');
+      } catch { /* Diagnostics are best-effort only. */ }
+    }
+    const initializeStart = observationNow();
+    observe('initialize-start', initializeStart);
+    try { getDatabase(); observe('initialize-end', initializeStart); }
+    catch (error) { observe('initialize-throw', initializeStart, error); throw error; }
     await Bun.write(process.env.READY_FILE, 'ready');
+    const waitStart = observationNow();
+    observe('wait-start', waitStart);
     while (!(await Bun.file(process.env.START_FILE).exists())) await Bun.sleep(2);
+    observe('wait-end', waitStart);
+    const operationStart = observationNow();
+    observe('operation-start', operationStart);
     try {
       const result = process.env.MAILBOX_ACTION === 'acknowledge'
         ? await acknowledgeMessage({ id: process.env.MESSAGE_ID, principal_id: 'operator' })
         : await addressMessage({ id: process.env.MESSAGE_ID, principal_id: 'operator' });
       process.stdout.write(JSON.stringify(result));
+      observe('operation-end', operationStart);
     } catch (error) {
+      observe('operation-throw', operationStart, error);
       process.stderr.write(error instanceof Error ? error.message : 'mailbox_process_failed');
       process.exitCode = 1;
     } finally {
-      await closeDatabase();
+      const closeStart = observationNow();
+      observe('close-start', closeStart);
+      try { await closeDatabase(); observe('close-end', closeStart); }
+      catch (error) { observe('close-throw', closeStart, error); throw error; }
     }
   `;
   const children: Array<{
@@ -188,6 +340,7 @@ async function runMailboxRace(
         ARCHON_HOME: archonHome,
         LOG_LEVEL: 'fatal',
         MAILBOX_ACTION: action,
+        MAILBOX_CHILD: String(index),
         MESSAGE_ID: messageId,
         READY_FILE: readyFile,
         START_FILE: startFile,
@@ -209,6 +362,7 @@ async function runMailboxRace(
         new Response(child.stdout).text(),
         new Response(child.stderr).text(),
       ]);
+      forwardMailboxObservations(stderr);
       return { exitCode, stdout, stderr };
     })
   );

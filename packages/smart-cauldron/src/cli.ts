@@ -91,6 +91,7 @@ interface CliArgs {
   woClass?: string;
   tags?: string[];
   entry?: string;
+  codexOnly?: boolean;
   outDir: string;
   dryRun: boolean;
   apiUrl?: string;
@@ -115,6 +116,7 @@ Options:
   --class <CLASS>    WO class for conductor ruleset (CODE, INFRA, MIXED)
   --tags <tags>      Comma-separated tags (e.g. mechanical,auth)
   --entry <tier>     Override entry tier (zero, qwen, codex, claude, frontier)
+  --codex-only       Bound one supervised Codex attempt (requires --entry codex)
   --out-dir <path>   Output directory for cascade records (default: ./cascade-runs)
   --dry-run          Print entry tier selection only; do not fire
   --api-url <url>    Archon API base URL (default: ARCHON_API_BASE_URL env or http://localhost:3090)
@@ -171,6 +173,9 @@ export function parseArgs(argv: string[]): CliArgs {
     } else if (arg === '--dry-run') {
       result.dryRun = true;
       i++;
+    } else if (arg === '--codex-only') {
+      result.codexOnly = true;
+      i++;
     } else if (arg === '--allow-satisfied') {
       result.allowSatisfied = true;
       i++;
@@ -208,6 +213,7 @@ export function parseArgs(argv: string[]): CliArgs {
     result.woId = positional[0];
   }
 
+  if (result.codexOnly && result.entry !== 'codex') throw new Error('codex_only_invalid_options');
   return result;
 }
 
@@ -306,7 +312,8 @@ async function main(): Promise<void> {
     dryRun: args.dryRun,
     apiBaseUrl: args.apiUrl,
     token: fireAuth?.token,
-    project: fireAuth?.project,
+    project: fireAuth?.project ?? (args.codexOnly === true ? args.project : undefined),
+    codexOnly: args.codexOnly,
     pollTimeoutMs: args.pollTimeoutMs,
     allowClaimed: allowSatisfied.enabled,
   });

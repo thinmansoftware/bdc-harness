@@ -25,7 +25,7 @@ import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
 import { chooseHeadroomEntry, resolveEntryThreshold } from './headroom.js';
 import type { EntrySelection, SeatUsageSnapshot } from './headroom.js';
-import { fireTier, buildFireMessage } from './fire.js';
+import { fireTier, buildFireMessage, preflightCodexOnly } from './fire.js';
 import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './poll.js';
 import { fetchNodeTimeoutsMs } from './node-timeouts.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
@@ -51,6 +51,7 @@ import type {
 } from './types.js';
 
 const execFileAsync = promisify(execFile);
+export const CODEX_ONLY_DISPATCH_CAPABILITY = 'codex-only-v1';
 
 // ---------------------------------------------------------------------------
 // Dependency injection interface (for testability)
@@ -208,6 +209,8 @@ export interface RunCascadeOptions {
   tags?: string[];
   /** Override the entry tier (skips conductor ruleset). */
   entryOverride?: TierName;
+  /** Explicit, bounded supervised dispatch; requires entryOverride codex. */
+  codexOnly?: boolean;
   /**
    * Seed the informed-climb context of the FIRST attempt. Used only when
    * resuming an approved frontier-approval pause (WO-HARNESS-FRONTIER-CLIMB-
@@ -261,6 +264,13 @@ export interface RunCascadeOptions {
  * Writes a cascade-runs/ JSON record and returns the complete CascadeRunRecord.
  */
 export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRecord> {
+  if (
+    (opts.codexOnly !== undefined && typeof opts.codexOnly !== 'boolean') ||
+    (opts.codexOnly === true && (opts.entryOverride !== 'codex' || !opts.project))
+  ) {
+    throw new Error('codex_only_invalid_options');
+  }
+  const codexOnly = opts.codexOnly === true;
   const {
     woId,
     dispatchId,
@@ -315,6 +325,18 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
   // Load config from files (never from inline constants)
   const tiers = loadLadder();
+  if (codexOnly) {
+    const selected = tiers.find(tier => tier.name === 'codex');
+    if (!selected) throw new Error('codex_only_invalid_options');
+    selected.workflowName = 'bdc-feature-development-codex-only';
+    // No dependency override can bypass provider proof. Dry-run makes no remote reads.
+    if (!dryRun)
+      await preflightCodexOnly(
+        project ?? '',
+        apiBaseUrl,
+        token ?? process.env.ARCHON_OPERATOR_TOKEN ?? ''
+      );
+  }
   const ruleset = opts.deps?.ruleset ?? loadRuleset();
   const refusedTiers = loadRefusedTiers();
   const premiumTiers = loadPremiumTiers();
@@ -399,6 +421,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         woClass: woClass ?? null,
         tags: [...(tags ?? [])].sort(),
         entryOverride: entryOverride ?? null,
+        ...(codexOnly ? { codexOnly: true as const } : {}),
         dryRun: true,
       },
       createdAt,
@@ -441,6 +464,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         woClass: woClass ?? null,
         tags: [...(tags ?? [])].sort(),
         entryOverride: entryOverride ?? null,
+        ...(codexOnly ? { codexOnly: true as const } : {}),
         dryRun: false,
       },
       createdAt,
@@ -475,6 +499,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           woClass: woClass ?? null,
           tags: [...(tags ?? [])].sort(),
           entryOverride: entryOverride ?? null,
+          ...(codexOnly ? { codexOnly: true as const } : {}),
           dryRun: false,
         },
         createdAt,
@@ -532,6 +557,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
     let refusalReason: CascadeRunRecord['refusalReason'];
+    let providerBoundary: CascadeRunRecord['providerBoundary'];
 
     function buildCurrentRecord(): CascadeRunRecord {
       const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
@@ -544,6 +570,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           woClass: woClass ?? null,
           tags: [...(tags ?? [])].sort(),
           entryOverride: entryOverride ?? null,
+          ...(codexOnly ? { codexOnly: true as const } : {}),
           dryRun: false,
         },
         createdAt,
@@ -561,6 +588,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
         ...(refusalReason ? { refusalReason } : {}),
+        ...(providerBoundary ? { providerBoundary } : {}),
         ...(entrySelection ? { entrySelection } : {}),
       };
     }
@@ -775,6 +803,17 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       return idx < tiers.length ? (tiers[idx] ?? null) : null;
     }
 
+    function stopAtProviderBoundary(attempt: CascadeAttempt): void {
+      status = 'blocked';
+      winningTier = null;
+      providerBoundary = {
+        reason: 'codex-only-capacity',
+        nextTier: peekNextClimbTier(currentIndex)?.name ?? null,
+        sourceEventId: attempt.sourceEventId,
+        sourceEventAt: attempt.sourceEventAt,
+      };
+    }
+
     while (currentIndex < tiers.length) {
       const tier = tiers[currentIndex];
       if (!tier) break;
@@ -971,6 +1010,39 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
               ? pollErr.message
               : `progress-timeout: no terminal state within ${pollTimeoutMs}ms`;
 
+          if (codexOnly) {
+            attempt.outcome = 'progress-timeout';
+            attempt.gateFailReason = timeoutReason;
+            attempt.completedAt = new Date().toISOString();
+            stopAtProviderBoundary(attempt);
+            let result: 'acknowledged' | 'failed' = 'failed';
+            let errorClass: string | null = 'cancel_rejected';
+            try {
+              const cancelled = await cancelImpl({
+                runId: resolvedRunId,
+                apiBaseUrl,
+                token,
+                reason: `smart-cauldron codex-only stall; cascade ${cascadeId}`,
+              });
+              if (cancelled.ok) {
+                result = 'acknowledged';
+                errorClass = null;
+              }
+            } catch {
+              errorClass = 'cancel_threw';
+            }
+            if (!providerBoundary) throw new Error('codex_only_invalid_options');
+            providerBoundary.cancellation = {
+              runId: resolvedRunId,
+              attempted: true,
+              result,
+              errorClass,
+              runStopVerified: false,
+            };
+            await checkpoint();
+            break;
+          }
+
           // No cancel-to-nowhere (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope
           // IN item 3): if the automatic climb from this tier would land on a
           // premium tier that requires operator approval, do NOT cancel the
@@ -1092,6 +1164,12 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       // Gate failed
       console.log(`[smart-cauldron] Gate failed on tier=${tier.name}: ${verdict.reason}`);
+
+      if (codexOnly) {
+        stopAtProviderBoundary(attempt);
+        await checkpoint();
+        break;
+      }
 
       // Before climbing, re-check whether the work already landed under another
       // branch/PR the per-run event feed missed (the classic 5-tier burn).
