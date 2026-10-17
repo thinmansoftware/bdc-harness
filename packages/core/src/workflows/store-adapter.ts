@@ -28,8 +28,13 @@ export function createRepairAttemptLookup(): (id: string) => Promise<RepairAttem
     if (!row) return null;
     return {
       sender: row.sender,
+      sender_principal_id: row.sender_principal_id,
       recipient: row.recipient,
       body: row.body,
+      status: row.status,
+      addressed_at: row.addressed_at,
+      addressed_by: row.addressed_by,
+      route_disposition: row.route_disposition,
       acknowledged_by: row.acknowledged_by,
       acknowledged_at: row.acknowledged_at,
     };
@@ -128,7 +133,7 @@ export function createWorkflowDeps(): WorkflowDeps {
     store: createWorkflowStore(),
     getAgentProvider,
     loadConfig: loadMergedConfig,
-    freezeWorkOrderSource: (policy, userMessage) =>
-      freezeWorkOrderSource(policy, userMessage, { lookupRepairAttempt }),
+    freezeWorkOrderSource: (policy, userMessage, targetRepository) =>
+      freezeWorkOrderSource(policy, userMessage, { lookupRepairAttempt, targetRepository }),
   };
 }

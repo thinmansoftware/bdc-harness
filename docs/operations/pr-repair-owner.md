@@ -39,10 +39,24 @@ three bounded steps:
      (`refused:superseded_by_#<S>`);
    - requires the PR OPEN with its live head SHA equal to the reviewed head
      (else `refused:stale_head`);
-   - skips (leaves the row queued) while any run for the WO is still `running`;
+   - skips (leaves the row queued) while any run for the WO is `pending` or `running`;
    - otherwise acknowledges the row as `taskmaster`, fires EXACTLY ONE bounded
-     repair cascade on the PR's branch (the cascade never climbs), and addresses
-     the row with the cascade id on admission.
+     repair cascade on the PR's branch (the cascade never climbs). Admission does
+     not address or consume the row: the first run-authority transaction does.
+
+   Freezing requires the candidate's owner/repository to match the resolved
+   execution repository, not the separate spec repository. It rejects addressed,
+   cancelled, rerouted, stale-acknowledged or future-acknowledged rows and requires
+   the authenticated Overseer sender plus Taskmaster acknowledgment. The full
+   candidate ID travels as `repairAttemptId` and selects the immutable authority's
+   `dispatch_id=repair:<candidate id>` in both background and direct execution.
+
+   First authority persistence atomically revalidates the candidate against the
+   actual Git remote, compare-and-set addresses it, and inserts the authority.
+   The existing unique dispatch index permits only one run per candidate. A
+   failed insert rolls back addressing; an identical retry by the same run is
+   idempotent. A second run or an addressed/refused candidate is rejected. No new
+   table, migration, mailbox status, or alternate controller is introduced.
 
    The attempt cap is two repairs per PR, enforced upstream by the Overseer
    remediation candidate's attempt-slot key; a third CHANGES_REQUESTED verdict

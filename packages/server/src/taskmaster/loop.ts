@@ -839,10 +839,12 @@ export function createRealPrRepairOwnerDeps(
       return rows.map(row => ({ id: row.id, body: row.body }));
     },
     async acknowledgeRow(id): Promise<void> {
-      await acknowledgeMessage({ id, principal_id: 'taskmaster' });
+      const result = await acknowledgeMessage({ id, principal_id: 'taskmaster' });
+      if (!result.ok) throw new Error(`pr_repair_acknowledgement_refused:${result.reason}`);
     },
     async addressRow(id, note): Promise<void> {
-      await addressMessage({ id, principal_id: 'taskmaster' });
+      const result = await addressMessage({ id, principal_id: 'taskmaster' });
+      if (!result.ok) throw new Error(`pr_repair_address_refused:${result.reason}`);
       log.info({ id, note }, 'taskmaster.pr_repair_row_addressed');
     },
     async closePr(input): Promise<void> {
@@ -865,7 +867,7 @@ export function createRealPrRepairOwnerDeps(
     async hasRunningRunForWo(woId): Promise<boolean> {
       const result = await getDatabase().query<{ n: number }>(
         `SELECT COUNT(*) AS n FROM remote_agent_workflow_runs
-         WHERE user_message LIKE $1 AND status = 'running'`,
+         WHERE user_message LIKE $1 AND status IN ('pending', 'running')`,
         [`%${woId}%`]
       );
       return (result.rows[0]?.n ?? 0) > 0;

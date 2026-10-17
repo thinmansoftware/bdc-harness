@@ -486,7 +486,8 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       (deps.resolveEntryTier ?? ((): string | undefined => undefined))(target.workflowName) ??
       'claude';
 
-    // Acknowledge BEFORE firing, address with the cascade id on admission.
+    // Acknowledge before firing. The first immutable run authority consumes and
+    // addresses this candidate atomically; cascade admission alone grants no run.
     const current = await deps.fetchPr(candidate.owner, candidate.repo, candidate.prNumber);
     if (
       current?.state !== 'OPEN' ||
@@ -555,7 +556,6 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       continue;
     }
     const cascadeId = admissionRecord.cascadeId;
-    await deps.addressRow(id, `fired:${cascadeId}`);
     repairsFired += 1;
     log('pr_repair.repair_fired', {
       woId: candidate.woId,

@@ -100,6 +100,7 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
   // as listMessages(status:'queued') would once addressed_by is set.
   const messages = (config.queued ?? []).map(m => ({ ...m, addressed: false }));
   const laneByWo = config.laneByWo ?? {};
+  const activeWos = config.running ?? new Set<string>();
   let cascadeSeq = 0;
 
   const deps: PrRepairOwnerDeps = {
@@ -147,11 +148,12 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
         for (const pr of entry.prs) if (pr.prNumber === input.prNumber) pr.state = 'CLOSED';
       }
     },
-    hasRunningRunForWo: async woId => (config.running ?? new Set()).has(woId),
+    hasRunningRunForWo: async woId => activeWos.has(woId),
     fireRepairCascade: async opts => {
       cascadeSeq += 1;
       const cascadeId = config.cascadeId ?? `casc-${cascadeSeq}`;
       rec.fired.push(opts);
+      activeWos.add(opts.woId);
       opts.onAdmission?.({ cascadeId, status: 'running' });
       return { cascadeId, status: 'won' as const };
     },
@@ -509,7 +511,8 @@ describe('runPrRepairOwner', () => {
     expect(fire.project).toBe('bdc-xo');
     expect(fire.woId).toBe(woId);
     expect(rec.acknowledged).toContain('row-1');
-    expect(rec.addressed).toEqual([{ id: 'row-1', note: 'fired:casc-1' }]);
+    // Admission is not authority consumption; only the authority transaction addresses it.
+    expect(rec.addressed).toHaveLength(0);
   });
 
   test('Test 4: duplicate_prs_collapse_to_one_survivor', async () => {
@@ -793,8 +796,8 @@ describe('runPrRepairOwner', () => {
     expect(rec.fired).toHaveLength(1);
     expect(rec.closed).toHaveLength(2);
 
-    // Second tick: the repaired row is addressed (excluded) and the swept PRs
-    // are CLOSED, so no further effects.
+    // Second tick: the admitted run is pending/running and the swept PRs are
+    // CLOSED. The owner cannot refire while authority binding is in flight.
     await runPrRepairOwner(deps);
     expect(rec.fired).toHaveLength(1);
     expect(rec.closed).toHaveLength(2);
