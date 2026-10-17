@@ -52,7 +52,15 @@ const fakeSession = {
 };
 mock.module('@mariozechner/pi-coding-agent', () => ({
   AuthStorage: { inMemory: () => ({ setRuntimeApiKey: () => {} }) },
-  ModelRegistry: { inMemory: () => ({ registerProvider: () => {}, find: () => selected }) },
+  ModelRegistry: {
+    inMemory: () => ({
+      registerProvider: (_name: string, config: { apiKey?: string }) => {
+        if (config.apiKey !== 'local-no-auth')
+          throw new Error('explicit local placeholder required');
+      },
+      find: () => selected,
+    }),
+  },
   SettingsManager: { inMemory: () => ({}) },
   SessionManager: { inMemory: () => ({}) },
   DefaultResourceLoader: class {

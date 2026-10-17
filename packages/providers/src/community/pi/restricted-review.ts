@@ -56,6 +56,7 @@ export async function* runRestrictedReview(
   authStorage.setRuntimeApiKey(REVIEW_PROVIDER, 'local-no-auth');
   const modelRegistry = pi.ModelRegistry.inMemory(authStorage);
   modelRegistry.registerProvider(REVIEW_PROVIDER, {
+    apiKey: 'local-no-auth',
     baseUrl: `${REVIEW_ENDPOINT}/v1`,
     api: 'openai-completions',
     authHeader: false,
