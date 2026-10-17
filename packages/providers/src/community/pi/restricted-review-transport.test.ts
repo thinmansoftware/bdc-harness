@@ -98,9 +98,9 @@ it('routes the installed Pi SDK through the guard with bounded output and no too
       calls++;
       const body = await request.json();
       expect(body.model).toBe(REVIEW_MODEL);
-      expect(body.tools).toBeUndefined();
       expect(body.max_tokens ?? body.max_completion_tokens).toBe(1024);
       expect(body.store).toBe(false);
+      expect(body.tools).toEqual([]);
       expect(
         body.messages.some(
           (message: { content: string }) => message.content === 'synthetic fixture'
@@ -151,6 +151,7 @@ it('routes the installed Pi SDK through the guard with bounded output and no too
       model,
       {
         systemPrompt: 'fixture',
+        tools: [],
         messages: [{ role: 'user', content: 'synthetic fixture', timestamp: 0 }],
       },
       { apiKey: 'local-no-auth', maxTokens: 1024 }
@@ -218,7 +219,9 @@ it('rejects tool payloads, oversized input, oversized responses and extra invent
   }) as unknown as typeof fetch;
   const guard = createRestrictedReviewFetch(upstream);
   for (const [body, reason] of [
-    [{ ...payload, tools: [{ type: 'function' }] }, 'unsupported review payload override'],
+    [{ ...payload, tools: [{ type: 'function' }] }, 'unexpected review inference payload'],
+    [{ ...payload, tools: null }, 'unexpected review inference payload'],
+    [{ ...payload, tools: {} }, 'unexpected review inference payload'],
     [{ ...payload, max_completion_tokens: 999 }, 'unsupported review payload override'],
     [{ ...payload, options: { num_ctx: 1 } }, 'unsupported review payload override'],
     [{ ...payload, store: true }, 'unsupported review payload override'],

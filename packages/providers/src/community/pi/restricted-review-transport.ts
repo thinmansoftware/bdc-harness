@@ -47,6 +47,7 @@ export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetc
         'max_completion_tokens',
         'temperature',
         'store',
+        'tools',
       ]);
       if (
         Object.keys(data).some(key => !allowed.has(key)) ||
@@ -57,7 +58,7 @@ export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetc
       if (
         data.model !== REVIEW_MODEL ||
         data.stream !== true ||
-        'tools' in data ||
+        ('tools' in data && (!Array.isArray(data.tools) || data.tools.length !== 0)) ||
         'functions' in data ||
         'tool_choice' in data ||
         (data.max_tokens ?? data.max_completion_tokens) !== 1024
