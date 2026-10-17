@@ -68,13 +68,21 @@ export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetc
         (data.max_tokens ?? data.max_completion_tokens) !== 1024
       )
         throw new Error('unexpected review inference payload');
+      const userContent = data.messages?.[1]?.content;
+      const textOnly =
+        typeof userContent === 'string' ||
+        (Array.isArray(userContent) &&
+          userContent.length === 1 &&
+          userContent[0]?.type === 'text' &&
+          typeof userContent[0]?.text === 'string' &&
+          Object.keys(userContent[0]).every(key => key === 'type' || key === 'text'));
       if (
         !Array.isArray(data.messages) ||
         data.messages.length !== 2 ||
         data.messages[0]?.role !== 'system' ||
         !isRestrictedReviewSystem(data.messages[0]?.content) ||
         data.messages[1]?.role !== 'user' ||
-        typeof data.messages[1]?.content !== 'string'
+        !textOnly
       )
         throw new Error('restricted review system policy missing or changed');
       // This bound is not proof of server context capacity. Admission remains closed.
