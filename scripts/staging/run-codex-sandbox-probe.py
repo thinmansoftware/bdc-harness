@@ -15,11 +15,13 @@ def main():
     parser.add_argument("--docker", default="docker")
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-sha", required=True)
-    parser.add_argument("--kind", choices=["sandbox", "configuration"], default="sandbox")
+    parser.add_argument("--kind", choices=["sandbox", "configuration", "negative"], default="sandbox")
     parser.add_argument("--hostile-project", action="store_true")
     parser.add_argument("--isolated-network", action="store_true")
     parser.add_argument("--apparmor-profile")
     args = parser.parse_args()
+    if args.kind == "negative" and not args.apparmor_profile:
+        parser.error("negative checks require an owned AppArmor profile")
     if args.hostile_project and args.kind != "configuration":
         parser.error("--hostile-project requires --kind configuration")
     if args.isolated_network and args.kind != "sandbox":

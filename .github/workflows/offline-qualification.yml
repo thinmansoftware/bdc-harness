@@ -118,7 +118,24 @@ jobs:
             probe_status=$?
           fi
           set -e
-          if [ "$probe_status" -eq 0 ]; then echo "Candidate passed; separate admission review still required"; fi
+          if [ "$probe_status" -eq 0 ]; then
+            negative_dir="$RUNNER_TEMP/teetime-negative-${{ github.run_id }}-${{ github.run_attempt }}"
+            mkdir "$negative_dir"
+            gcc -static -O2 -Wall -Wextra -Werror scripts/staging/probe-apparmor-negative.c -o "$negative_dir/teetime-mount-negative"
+            sha256sum scripts/staging/probe-apparmor-negative.c "$negative_dir/teetime-mount-negative"
+            base_id=$(docker image inspect "$QUALIFICATION_IMAGE" --format '{{.Id}}')
+            negative_image="teetime-negative:${{ github.run_id }}-${{ github.run_attempt }}"
+            printf 'FROM %s\nCOPY teetime-mount-negative /app/teetime-mount-negative\n' "$QUALIFICATION_IMAGE" > "$negative_dir/Dockerfile"
+            docker build --pull=false -t "$negative_image" "$negative_dir"
+            test "$(docker image inspect "$QUALIFICATION_IMAGE" --format '{{.Id}}')" = "$base_id"
+            docker image inspect "$negative_image" --format '{{.Id}}'
+            negative_start=$(date --utc '+%Y-%m-%d %H:%M:%S')
+            python3 scripts/staging/run-codex-sandbox-probe.py --kind negative --apparmor-profile "$profile" --image "$negative_image" --expected-sha "$(git rev-parse HEAD)"
+            sudo journalctl -k --since "$negative_start" --no-pager > "$negative_dir/audit.log"
+            python3 scripts/staging/verify-apparmor-negatives.py "$profile" "$negative_dir/audit.log"
+            docker image rm "$negative_image"
+            echo "Candidate diagnostic passed; separate admission review still required"
+          fi
           sudo journalctl -k --since "$audit_start" --no-pager | grep 'apparmor="DENIED"' | grep -F "profile=\"$profile\"" | tail -30 || echo "No named-profile journal denial evidence available"
           sudo dmesg --since "$audit_start" | grep 'apparmor="DENIED"' | grep -F "profile=\"$profile\"" | tail -30 || echo "No named-profile dmesg denial evidence available"
       - name: Verify runtime and isolation
