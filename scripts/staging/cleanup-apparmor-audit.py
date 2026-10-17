@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 name, source = sys.argv[1:]
-if not re.fullmatch(r"teetime-probe-audit-[0-9]+-[0-9]+", name):
+if not re.fullmatch(r"teetime-probe-(audit|mount)-[0-9]+-[0-9]+", name):
     raise SystemExit("invalid diagnostic profile identity")
 path = Path(source).resolve()
 if path.name != name or path.parent != Path(os.environ["RUNNER_TEMP"]).resolve():
