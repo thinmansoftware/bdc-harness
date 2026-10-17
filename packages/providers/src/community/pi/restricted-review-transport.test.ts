@@ -107,6 +107,32 @@ it('routes the installed Pi SDK through the guard with bounded output and no too
       expect(body.messages[0]).toEqual({ role: 'system', content: systemPrompt });
       expect(body.store).toBe(false);
       expect(body.tools).toEqual([]);
+      expect(body.temperature).toBe(0);
+      expect(body.response_format.type).toBe('json_schema');
+      expect(body.response_format.json_schema).toMatchObject({
+        name: 'tee_time_review',
+        strict: true,
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['verdict', 'reasons', 'evidenceIds'],
+          properties: {
+            verdict: { type: 'string', enum: ['APPROVED', 'REJECTED'] },
+            reasons: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 12,
+              items: { type: 'string', minLength: 1, maxLength: 500 },
+            },
+            evidenceIds: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 3,
+              items: { type: 'string', enum: ['spec', 'diff', 'tests'] },
+            },
+          },
+        },
+      });
       expect(
         body.messages.some(
           (message: { content: unknown }) =>
@@ -318,7 +344,9 @@ it('loads the custom policy with the installed SDK before creating a session', a
   expect(loader.getSkills().skills).toEqual([]);
   expect(loader.getPrompts().prompts).toEqual([]);
   expect(loader.getAgentsFiles().agentsFiles).toEqual([]);
-});
+
+  // Cold SDK import on the Windows operator host can exceed the shared 30s default.
+}, 60000);
 
 it('runs the real installed session and bridge through the guarded wire path', async () => {
   const { REVIEW_DIGEST, isRestrictedReviewSystem } = await import('./restricted-review-policy');
@@ -361,6 +389,32 @@ it('runs the real installed session and bridge through the guarded wire path', a
       const user = body.messages[1].content;
       expect(typeof user === 'string' ? user : user[0].text).toBe(frozen);
       expect(body.tools).toEqual([]);
+      expect(body.temperature).toBe(0);
+      expect(body.response_format.type).toBe('json_schema');
+      expect(body.response_format.json_schema).toMatchObject({
+        name: 'tee_time_review',
+        strict: true,
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['verdict', 'reasons', 'evidenceIds'],
+          properties: {
+            verdict: { type: 'string', enum: ['APPROVED', 'REJECTED'] },
+            reasons: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 12,
+              items: { type: 'string', minLength: 1, maxLength: 500 },
+            },
+            evidenceIds: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 3,
+              items: { type: 'string', enum: ['spec', 'diff', 'tests'] },
+            },
+          },
+        },
+      });
       const verdict = JSON.stringify({
         verdict: 'REJECTED',
         reasons: ['synthetic evidence'],
@@ -392,4 +446,52 @@ it('runs the real installed session and bridge through the guarded wire path', a
       else process.env[key] = saved[index];
     });
   }
+});
+
+it('rejects caller format/temperature and final oversized payload before upstream', async () => {
+  const upstream = mock(async () => response()) as unknown as typeof fetch;
+  for (const override of [
+    { response_format: { type: 'json_object' } },
+    { temperature: 0 },
+    { temperature: 1 },
+  ]) {
+    await expect(
+      createRestrictedReviewFetch(upstream)(REVIEW_ENDPOINT + '/v1/chat/completions', {
+        method: 'POST',
+        body: JSON.stringify({ ...payload, ...override }),
+      })
+    ).rejects.toThrow('override');
+  }
+  const large = { ...payload, messages: [payload.messages[0], { role: 'user', content: '' }] };
+  large.messages[1].content = 'x'.repeat(5900 - JSON.stringify(large).length);
+  expect(JSON.stringify(large).length).toBe(5900);
+  await expect(
+    createRestrictedReviewFetch(upstream)(REVIEW_ENDPOINT + '/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify(large),
+    })
+  ).rejects.toThrow('final review wire');
+  expect(upstream).not.toHaveBeenCalled();
+});
+
+it('rebuilds content length and preserves caller cancellation', async () => {
+  const controller = new AbortController();
+  const upstream = mock(async (input: Request | string | URL, init?: RequestInit) => {
+    const request = input as Request;
+    expect(request.headers.has('content-length')).toBe(false);
+    const body = await request.clone().json();
+    expect(body.messages).toEqual(payload.messages);
+    expect(body.temperature).toBe(0);
+    controller.abort();
+    expect(request.signal.aborted).toBe(true);
+    expect(init?.signal?.aborted).toBe(true);
+    return response();
+  }) as unknown as typeof fetch;
+  await createRestrictedReviewFetch(upstream)(REVIEW_ENDPOINT + '/v1/chat/completions', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    headers: { 'content-length': '1' },
+    signal: controller.signal,
+  });
+  expect(upstream).toHaveBeenCalledTimes(1);
 });

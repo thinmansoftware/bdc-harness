@@ -5,11 +5,15 @@ import {
   isRestrictedReviewSystem,
 } from './restricted-review-policy';
 
+// Private immutable wire contract. Callers cannot supply a replacement.
+const REVIEW_RESPONSE_FORMAT_JSON =
+  '{"type":"json_schema","json_schema":{"name":"tee_time_review","strict":true,"schema":{"type":"object","additionalProperties":false,"required":["verdict","reasons","evidenceIds"],"properties":{"verdict":{"type":"string","enum":["APPROVED","REJECTED"]},"reasons":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"string","minLength":1,"maxLength":500}},"evidenceIds":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"string","enum":["spec","diff","tests"]}}}}}}';
+
 export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetch {
   let inferenceRequests = 0;
   const inventoryRequests = new Map<string, number>();
   return (async (input: Request | string | URL, init?: RequestInit) => {
-    const request =
+    let request =
       input instanceof Request ? new Request(input, init) : new Request(String(input), init);
     const url = new URL(request.url);
     if (url.origin !== REVIEW_ENDPOINT || url.username || url.password || url.search || url.hash)
@@ -49,7 +53,6 @@ export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetc
         'stream_options',
         'max_tokens',
         'max_completion_tokens',
-        'temperature',
         'store',
         'tools',
       ]);
@@ -85,6 +88,22 @@ export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetc
         !textOnly
       )
         throw new Error('restricted review system policy missing or changed');
+      const wireBody = JSON.stringify({
+        ...data,
+        response_format: JSON.parse(REVIEW_RESPONSE_FORMAT_JSON),
+        temperature: 0,
+      });
+      if (new TextEncoder().encode(wireBody).length > 6000)
+        throw new Error('final review wire payload exceeds diagnostic bound');
+      const headers = new Headers(request.headers);
+      headers.delete('content-length');
+      request = new Request(request.url, {
+        method: 'POST',
+        headers,
+        body: wireBody,
+        signal: request.signal,
+        redirect: 'error',
+      });
       // This bound is not proof of server context capacity. Admission remains closed.
     } else throw new Error('restricted review request path or method rejected');
     const response = await upstream(request, { redirect: 'error', signal: request.signal });
