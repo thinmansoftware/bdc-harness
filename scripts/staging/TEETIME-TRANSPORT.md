@@ -20,6 +20,19 @@ configuration, runs a TLS and destination-denial probe, then removes its resourc
 Receipt files contain network identities, source hash, sanitized outcomes and
 cleanup results. Nonzero exit or nonempty cleanup errors fail this qualification.
 
+Add `--sandbox` to verify pinned CLI 0.153.3 sandbox child and nested-child denial
+against the actual proxy. Keep probe-teetime-proxy-sandbox.py and the three
+codex-probe/moby seccomp policy files beside the launcher. The worker uses owned
+tmpfs and read-only project config masks. A successful unsandboxed curl control
+is required before denial can pass. Curl's CONNECT User-Agent is suppressed to
+match the strict header allowlist; the proxy itself is not weakened.
+
+Laptop run teetime-transport-cc92f0d50f5a passed both child denial checks and the
+control on the prior pinned e9d8d071 image, with cleanup errors empty. Earlier
+attempts stopped at the curl control and do not count as isolation passes.
+This proves CLI sandbox confinement for these probes, not CLI application HTTP
+compatibility or the forthcoming credentialed worker lifecycle.
+
 The worker has only the internal network. The gateway accepts only CONNECT to
 chatgpt.com:443 and connects to a validated public IPv4 address without a second
 hostname lookup. It neither decrypts TLS nor logs payloads. The first-byte check
