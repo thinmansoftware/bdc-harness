@@ -1,4 +1,4 @@
-import { mkdir, readdir, rename, rm, stat } from 'fs/promises';
+import { cp, mkdir, mkdtemp, readdir, rename, rm, stat } from 'fs/promises';
 import { basename, dirname, join, relative, resolve } from 'path';
 import {
   execFileAsync,
@@ -366,6 +366,110 @@ async function defaultPruneWorktree(repoPath: string): Promise<void> {
   await execFileAsync('git', ['-C', repoPath, 'worktree', 'prune'], { timeout: 30000 });
 }
 
+/** Options passed to fs.cp when rename(2) fails with EXDEV (cross-mount move). */
+const MOVE_DIR_CP_OPTIONS = {
+  recursive: true,
+  preserveTimestamps: true,
+  verbatimSymlinks: true,
+  errorOnExist: true,
+  force: false,
+} as const;
+
+export interface MoveDirAcrossDevicesDeps {
+  rename: (from: string, to: string) => Promise<void>;
+  cp: (
+    from: string,
+    to: string,
+    options: {
+      recursive: true;
+      preserveTimestamps: true;
+      verbatimSymlinks: true;
+      errorOnExist: true;
+      force: false;
+    }
+  ) => Promise<void>;
+  rm: (path: string, options: { recursive: true; force: true }) => Promise<void>;
+}
+
+/**
+ * Thrown by moveDirAcrossDevices when its atomic publish finds that `to`
+ * already exists. The completed copy stays private in an invocation-owned
+ * staging directory until publish, so collision cleanup never touches `to`.
+ */
+export class MoveDirDestinationExistsError extends Error {
+  constructor(public readonly path: string) {
+    super(`worktree_sweep_move_dir_destination_exists: ${path}`);
+    this.name = 'MoveDirDestinationExistsError';
+  }
+}
+
+/**
+ * Move a directory. rename(2) is used first. Between two mount points rename
+ * returns EXDEV even when both mounts are the same filesystem type, so that
+ * case copies then deletes the source. Any other rename error is rethrown.
+ *
+ * The EXDEV fallback copies into an atomically created, unique staging
+ * directory beside `to`, then publishes the complete copy with a same-mount
+ * rename. Until that publish succeeds, cleanup removes only the staging path
+ * this invocation owns. If another actor creates `to` meanwhile, publish
+ * fails without modifying that destination and the source stays in place.
+ *
+ * Default deps read the fs/promises bindings at call time so tests can spy on
+ * rename without injecting moveDir into the sweep.
+ */
+export async function moveDirAcrossDevices(
+  from: string,
+  to: string,
+  deps: MoveDirAcrossDevicesDeps = { rename, cp, rm }
+): Promise<void> {
+  try {
+    await deps.rename(from, to);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EXDEV') {
+      throw error;
+    }
+  }
+
+  const stagingPath = await mkdtemp(`${to}.partial-`);
+
+  try {
+    await deps.cp(from, stagingPath, MOVE_DIR_CP_OPTIONS);
+    // POSIX rename(2) silently replaces an EMPTY existing directory instead
+    // of throwing -- on Linux, `deps.rename(stagingPath, to)` alone would
+    // clobber a `to` that already exists but happens to be empty, with no
+    // error at all. Checking existence immediately before the publish
+    // closes that hole: the rename is only attempted once we have just
+    // observed `to` does not exist. A publish error after that check still
+    // falls back to a pathExists probe, so a genuine race (something else
+    // creates `to` in the gap) is still reported as a collision rather than
+    // a generic rename failure.
+    if (await pathExists(to)) {
+      throw new MoveDirDestinationExistsError(to);
+    }
+    try {
+      await deps.rename(stagingPath, to);
+    } catch (publishError) {
+      if (await pathExists(to)) {
+        throw new MoveDirDestinationExistsError(to);
+      }
+      throw publishError;
+    }
+  } catch (copyOrPublishError) {
+    try {
+      await deps.rm(stagingPath, { recursive: true, force: true });
+    } catch (rmError) {
+      getLog().warn(
+        { err: rmError, path: stagingPath },
+        'worktree_sweep_partial_copy_cleanup_failed'
+      );
+    }
+    throw copyOrPublishError;
+  }
+
+  await deps.rm(from, { recursive: true, force: true });
+}
+
 export async function sweepTerminalWorkflowWorktrees(
   opts: WorktreeSweepOptions = {}
 ): Promise<WorktreeSweepReport> {
@@ -387,7 +491,7 @@ export async function sweepTerminalWorkflowWorktrees(
   const getCanonicalRepoPathFn =
     opts.getCanonicalRepoPathFn ??
     ((path: string): Promise<string> => getCanonicalRepoPath(toWorktreePath(path)));
-  const moveDir = opts.moveDir ?? rename;
+  const moveDir = opts.moveDir ?? moveDirAcrossDevices;
   const pruneWorktree = opts.pruneWorktree ?? defaultPruneWorktree;
   const removeQuarantineDir =
     opts.removeQuarantineDir ??
