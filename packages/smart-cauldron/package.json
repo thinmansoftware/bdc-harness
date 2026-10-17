@@ -13,7 +13,8 @@
     "./types": "./src/types.ts",
     "./already-satisfied": "./src/already-satisfied.ts",
     "./wo-lock": "./src/wo-lock.ts",
-    "./frontier-approval": "./src/frontier-approval.ts"
+    "./frontier-approval": "./src/frontier-approval.ts",
+    "./open-pr-guard": "./src/open-pr-guard.ts"
   },
   "bin": {
     "smart-cauldron": "./src/cli.ts"

@@ -52,6 +52,7 @@ const mockGetCodebase = mock(() =>
     id: 'cb-1',
     name: 'test-repo',
     default_cwd: '/workspace/test-repo',
+    repository_url: 'https://github.com/owner/test-repo.git',
     commands: {},
     created_at: new Date(),
     updated_at: new Date(),
@@ -101,6 +102,7 @@ mock.module('@archon/isolation', () => ({
 }));
 
 mock.module('../workflows/store-adapter', () => ({
+  createRepairAttemptLookup: () => async () => null,
   createWorkflowDeps: mock(() => ({
     store: { createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })) },
     getAgentProvider: () => ({}),
@@ -119,10 +121,11 @@ mock.module('../services/cleanup-service', () => ({
   STALE_THRESHOLD_DAYS: 7,
 }));
 
+const mockExecuteWorkflow = mock((..._args: unknown[]) =>
+  Promise.resolve({ success: true, summary: '', workflowRunId: 'run-1' })
+);
 mock.module('@archon/workflows/executor', () => ({
-  executeWorkflow: mock(() =>
-    Promise.resolve({ success: true, summary: '', workflowRunId: 'run-1' })
-  ),
+  executeWorkflow: mockExecuteWorkflow,
 }));
 
 // Dynamic imports inside dispatchBackgroundWorkflow (escalation linker).
@@ -179,6 +182,7 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
     mockGetOrCreateConversation.mockClear();
     mockUpdateConversation.mockClear();
     mockFreeze.mockClear();
+    mockExecuteWorkflow.mockClear();
     mockGetCodebase.mockClear();
     mockResolve.mockImplementation((_input: unknown) => {
       callOrder.push('resolve');
@@ -189,6 +193,36 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
       callOrder.push('freeze');
       return Promise.resolve({ frozen: true });
     });
+  });
+
+  test('binds a frozen repair candidate to execution identity and the resolved repository', async () => {
+    mockFreeze.mockImplementation(() =>
+      Promise.resolve({
+        frozen: true,
+        woId: 'WO-REPAIR-01',
+        specBytes: Buffer.from('# Repair\n'),
+        repairAttemptId: 'repair-dispatch-abcdef12',
+      })
+    );
+    await dispatchBackgroundWorkflow(
+      makeCtx() as never,
+      makeWorkflow({
+        run_authority: {
+          required: true,
+          spec_repository: 'thinmansoftware/bdc-xo',
+          spec_revision: 'main',
+          spec_paths: ['docs/work-orders/{WO_ID}.md'],
+        },
+      })
+    );
+    const freezeArgs = mockFreeze.mock.calls[0] as unknown as [
+      unknown,
+      unknown,
+      { targetRepository: string },
+    ];
+    expect(freezeArgs[2].targetRepository).toBe('https://github.com/owner/test-repo.git');
+    const source = mockExecuteWorkflow.mock.calls[0]?.[12] as { dispatchId: string };
+    expect(source.dispatchId).toBe('repair:repair-dispatch-abcdef12');
   });
 
   test('preserves task + fromBranch hints and assigns a unique worker workflowId', async () => {

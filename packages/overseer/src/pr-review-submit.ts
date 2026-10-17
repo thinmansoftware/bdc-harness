@@ -266,6 +266,37 @@ export interface SubmitDeps {
    * be told a fix was queued when this verdict queued nothing.
    */
   emitRemediationCandidate?(body: RemediationCandidateBody): Promise<RemediationEmitResult>;
+
+  /**
+   * Resolve the structural lane-repair context for this PR
+   * (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01). Returns {woId, headRef,
+   * workflowName} when the event store proves the PR was lane-created for a WO,
+   * else null. This is the structured eligibility signal decideRemediation
+   * needs to hand a lane PR back WITHOUT a prose class match. OPTIONAL: when
+   * absent, no PR is treated as lane-created and the hand-back behaves exactly
+   * as before (fail-closed -- a non-lane PR is never auto-repaired).
+   */
+  resolveLaneRepairContext?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+  }): Promise<{ woId: string; headRef: string; workflowName: string } | null>;
+
+  /**
+   * Emit the one-per-PR exhausted/judgment hand-off to Taskmaster's digest when
+   * a LANE PR's repair is refused with attempt_cap or non_auto_finding. Keyed
+   * `overseer-remediation-exhausted:<owner>/<repo>#<N>` (no head) so it is sent
+   * at most once per PR ever and is NOT counted as a remediation attempt.
+   */
+  emitRemediationExhausted?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    woId: string;
+    reason: 'attempt_cap' | 'non_auto_finding';
+  }): Promise<void>;
 }
 
 /** What the remediation hand-back did, recorded on the receipt. */
@@ -585,6 +616,24 @@ async function handBackToTaskmaster(
     return { emitted: false, reason: 'remediation_not_configured' };
   }
 
+  // Structural lane-repair proof (never prose): is this PR lane-created, and for
+  // which WO/branch? A failure to resolve degrades to "not lane-created", which
+  // routes to a human -- the fail-closed direction.
+  let laneRepair: { woId: string; headRef: string; workflowName: string } | undefined;
+  if (deps.resolveLaneRepairContext) {
+    try {
+      laneRepair =
+        (await deps.resolveLaneRepairContext({
+          owner: work.owner,
+          repo: work.repo,
+          prNumber: work.prNumber,
+          headSha: work.headSha,
+        })) ?? undefined;
+    } catch {
+      laneRepair = undefined;
+    }
+  }
+
   let priorAttempts: number;
   try {
     priorAttempts = await deps.countPriorRemediationAttempts({
@@ -608,9 +657,38 @@ async function handBackToTaskmaster(
     verdictBody: buildReviewBody(work, verdict),
     priorAttempts,
     owningLane: work.author || null,
+    ...(laneRepair ? { woId: laneRepair.woId, laneRepair } : {}),
   });
 
-  if (!decision.emit) return { emitted: false, reason: decision.reason };
+  if (!decision.emit) {
+    // A lane PR whose repair is exhausted or needs human judgment surfaces ONCE
+    // in the Duty Officer digest, not silently. Keyed per-PR (no head), so a
+    // replayed verdict adds nothing; never counted as an attempt. Never throws.
+    if (
+      laneRepair &&
+      deps.emitRemediationExhausted &&
+      (decision.reason === 'remediation_attempts_exhausted' ||
+        decision.reason === 'non_auto_finding_present')
+    ) {
+      try {
+        await deps.emitRemediationExhausted({
+          owner: work.owner,
+          repo: work.repo,
+          prNumber: work.prNumber,
+          headSha: work.headSha,
+          woId: laneRepair.woId,
+          reason:
+            decision.reason === 'remediation_attempts_exhausted'
+              ? 'attempt_cap'
+              : 'non_auto_finding',
+        });
+      } catch {
+        // The exhausted hand-off is best-effort: a failure here must never
+        // convert a submitted review into a failed submission.
+      }
+    }
+    return { emitted: false, reason: decision.reason };
+  }
 
   let result: RemediationEmitResult;
   try {

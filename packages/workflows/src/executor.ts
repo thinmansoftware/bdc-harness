@@ -20,6 +20,7 @@ import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
 import { resolveEntryLane, DEFAULT_ENGINE_TO_LANE } from './router-dispatcher';
 import { isLaneFullyDark, listDarkEngines } from './engine-availability';
 import {
+  frozenSourceDispatchId,
   parseDeclaredBaseBranch,
   persistRunAuthority,
   type RunAuthorityDispatch,
@@ -150,9 +151,14 @@ async function captureRunAuthorityInput(
   const headBranch = branchOutput.trim();
   if (!headBranch) throw new Error('scope_authority_missing: headBranch');
   const revisions = await captureRuntimeRevisions(workflow);
+  // Candidate identity has already selected dispatchId; it is not a new column
+  // in the immutable authority manifest or database record.
+  const authoritySource = { ...source };
+  delete authoritySource.repairAttemptId;
 
   return {
-    ...source,
+    ...authoritySource,
+    dispatchId: frozenSourceDispatchId(source, source.dispatchId),
     runId: workflowRun.id,
     workflowName: workflow.name,
     codebaseId,
@@ -986,8 +992,17 @@ export async function executeWorkflow(
         if (!deps.freezeWorkOrderSource) {
           throw new Error('scope_authority_missing: frozen dispatch source');
         }
-        const frozen = await deps.freezeWorkOrderSource(workflow.run_authority, userMessage);
-        effectiveAuthoritySource = { ...frozen, dispatchId: conversationId };
+        const frozen = await deps.freezeWorkOrderSource(
+          workflow.run_authority,
+          userMessage,
+          /^repair_attempt=[A-Za-z0-9-]{8,64}$/m.test(userMessage)
+            ? await getRemoteUrl(toRepoPath(cwd))
+            : undefined
+        );
+        effectiveAuthoritySource = {
+          ...frozen,
+          dispatchId: frozenSourceDispatchId(frozen, conversationId),
+        };
       }
       if (effectiveAuthoritySource) {
         // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): the WO's

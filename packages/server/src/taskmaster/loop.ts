@@ -16,9 +16,12 @@
 import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
+import { createGhLanePrFetcher } from '@archon/smart-cauldron/open-pr-guard';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldron/headroom';
 import {
+  acknowledgeMessage,
+  addressMessage,
   assessDispatchRecipient,
   createAuthenticatedMessage,
   getMessage,
@@ -27,6 +30,14 @@ import {
   type DispatchMessage,
   type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
+import { listLanePrsForWo, listWosWithMultipleLanePrs } from '@archon/core/db/lane-pr-registry';
+import { execFileAsync } from '@archon/git';
+import { loadLadder } from '@archon/smart-cauldron/ladder';
+import {
+  runPrRepairOwner,
+  resolvePrRepairDedupeWindowHours,
+  type PrRepairOwnerDeps,
+} from './pr-repair-owner';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
   adoptionContentHash,
@@ -791,6 +802,88 @@ export function buildSelfPauseNotice(
   };
 }
 
+/** Reuse the conductor's fail-closed numbered PR lookup for repair ownership. */
+export const createGhLaneFetcher = createGhLanePrFetcher;
+
+/**
+ * Bind the PR repair owner to live infrastructure: the event store
+ * (lane-pr-registry), the dispatch mailbox (taskmaster rows), gh (PR close +
+ * read), the ladder (workflow_name -> entry tier) and runCascade. Pure in tests
+ * -- this factory is NEVER called when a fake DAL is injected.
+ */
+export function createRealPrRepairOwnerDeps(
+  nowMs: number,
+  expectedEpoch: number,
+  getControl: typeof taskmasterDb.getPauseState = taskmasterDb.getPauseState
+): PrRepairOwnerDeps {
+  const fetchPr = createGhLaneFetcher();
+  let tierByWorkflow: Map<string, string> | null = null;
+  const resolveEntryTier = (workflowName: string | null): string | undefined => {
+    if (!workflowName) return undefined;
+    if (!tierByWorkflow) {
+      tierByWorkflow = new Map();
+      try {
+        for (const tier of loadLadder()) tierByWorkflow.set(tier.workflowName, tier.name);
+      } catch {
+        tierByWorkflow = new Map();
+      }
+    }
+    return tierByWorkflow.get(workflowName);
+  };
+  return {
+    now: () => nowMs,
+    fetchPr,
+    dedupeWindowHours: resolvePrRepairDedupeWindowHours(process.env.PR_REPAIR_DEDUPE_WINDOW_HOURS),
+    canApplyEffect: async (): Promise<boolean> => {
+      const fresh = await getControl();
+      return fresh.pause_state === 'RUNNING' && fresh.epoch === expectedEpoch;
+    },
+    listWosWithMultipleLanePrs: opts => listWosWithMultipleLanePrs(opts),
+    listLanePrsForWo: (woId, opts) => listLanePrsForWo(woId, opts),
+    async listQueuedTaskmasterMessages(): Promise<{ id: string; body: string }[]> {
+      const rows = await listMessages({ recipient: 'taskmaster', status: 'queued' });
+      return rows.map(row => ({ id: row.id, body: row.body }));
+    },
+    async acknowledgeRow(id): Promise<void> {
+      const result = await acknowledgeMessage({ id, principal_id: 'taskmaster' });
+      if (!result.ok) throw new Error(`pr_repair_acknowledgement_refused:${result.reason}`);
+    },
+    async addressRow(id, note): Promise<void> {
+      const result = await addressMessage({ id, principal_id: 'taskmaster' });
+      if (!result.ok) throw new Error(`pr_repair_address_refused:${result.reason}`);
+      log.info({ id, note }, 'taskmaster.pr_repair_row_addressed');
+    },
+    async closePr(input): Promise<void> {
+      // `gh pr close` with --comment; NO --delete-branch (the branch is kept so
+      // the dedupe is reversible and the survivor can cherry-pick if needed).
+      await execFileAsync(
+        'gh',
+        [
+          'pr',
+          'close',
+          String(input.prNumber),
+          '--repo',
+          `${input.owner}/${input.repo}`,
+          '--comment',
+          input.comment,
+        ],
+        { timeout: 30000 }
+      );
+    },
+    async hasRunningRunForWo(woId): Promise<boolean> {
+      const result = await getDatabase().query<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM remote_agent_workflow_runs
+         WHERE user_message LIKE $1 AND status IN ('pending', 'running')`,
+        [`%${woId}%`]
+      );
+      return (result.rows[0]?.n ?? 0) > 0;
+    },
+    fireRepairCascade: opts => runCascade({ ...opts, deps: { seatUsage: conductorSeatUsage } }),
+    resolveEntryTier,
+    token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+  };
+}
+
 /*
  * RETIREMENT: The daily canary retires when the Taskmaster has run 30 consecutive days with at least
  * one `outcome='sent'` row per day and zero self-pause events in that window. Retirement is
@@ -801,7 +894,8 @@ function digestProposal(
   control: taskmasterDb.TmControlState,
   nowMs: number,
   expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>,
-  unlabelledPriorityTriage: string[] = []
+  unlabelledPriorityTriage: string[] = [],
+  prRepairItems: string[] = []
 ): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
   const digestActions = actions24h.filter(action => action.thread_ref !== 'taskmaster:reset');
@@ -827,6 +921,12 @@ function digestProposal(
   const triageSummary = unlabelledPriorityTriage.length
     ? ` Needs priority triage: ${unlabelledPriorityTriage.join(', ')}.`
     : '';
+  // PR repair owner ride-along (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): the
+  // exhausted/judgment and approved-non-survivor cases a human must look at,
+  // on the same single daily message. Nothing here writes to xo or operator.
+  const prRepairSummary = prRepairItems.length
+    ? ` PR repair needs a person: ${prRepairItems.join('; ')}.`
+    : '';
   return {
     type: 'digest',
     threadRef: `digest:${dateKey}`,
@@ -837,7 +937,7 @@ function digestProposal(
       `Taskmaster daily canary for ${dateKey}: state=${control.pause_state}, ` +
       `scope=${control.pause_scope ?? 'none'}, actor=${control.pause_actor ?? 'none'}, ` +
       `updated_at=${control.updated_at}; ${summary}; ${pauseDetail}.` +
-      `${expectationSummary}${triageSummary} ` +
+      `${expectationSummary}${triageSummary}${prRepairSummary} ` +
       'Pause/resume/status runbook: xo-wiki/wiki/tools/taskmaster/_index.md.',
     idempotencyKey: `tm:digest:${dateKey}`,
     actsImmediately: true,
@@ -1738,12 +1838,31 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.expectation_counts_failed');
   }
+  // PR repair owner (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): collapse
+  // duplicate lane PRs, fire at most one bounded in-place repair, and gather the
+  // exhausted/judgment lines for THIS tick's digest. Runs only while RUNNING and
+  // only against live infrastructure (skipped when a fake DAL is injected, where
+  // the owner is exercised directly in pr-repair-owner.test.ts). It must never
+  // break the tick: any failure degrades to "no items this tick".
+  let prRepairItems: string[] = [];
+  let commitPrRepairExhausted: (() => Promise<void>) | null = null;
+  if (control.pause_state === 'RUNNING' && !deps.db) {
+    try {
+      const owner = await runPrRepairOwner(createRealPrRepairOwnerDeps(nowMs, epoch));
+      prRepairItems = owner.digestItems;
+      commitPrRepairExhausted = owner.commitExhausted;
+    } catch (error) {
+      log.warn({ err: error as Error }, 'taskmaster.pr_repair_owner_failed');
+    }
+  }
+
   const digest = digestProposal(
     actions24h,
     control,
     nowMs,
     expectationCounts,
-    unlabelledPriorityTriage
+    unlabelledPriorityTriage,
+    prRepairItems
   );
   proposals.push(digest);
 
@@ -1770,6 +1889,12 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   const touchedThisTick = new Set<string>();
   let firesThisTick = 0;
   let blockerReportsThisTick = 0;
+  // Did THIS tick's digest actually land as a sent effect? The PR-repair
+  // exhausted rows ride this tick's digest; we must only mark them delivered
+  // once the digest itself was successfully sent (not deduped/skipped,
+  // deferred, parked, rejected, or failed). See the commitPrRepairExhausted
+  // gate after the proposal loop.
+  let digestSentThisTick = false;
 
   for (const proposal of proposals) {
     const canonicalProposalRef = canonicalizeThreadRef(proposal.threadRef);
@@ -2113,6 +2238,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       result.effects += 1;
       if (proposal.type === 'fire_cauldron') firesThisTick += 1;
       if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
+      if (proposal.type === 'digest') digestSentThisTick = true;
       log.info(
         {
           actionType: proposal.type,
@@ -2126,6 +2252,20 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       journalRow.outcome = 'failed';
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
+    }
+  }
+
+  // PR repair owner (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): the
+  // exhausted/judgment lines rode this tick's daily digest above; address their
+  // queued rows ONLY now that the digest effect was successfully SENT this tick.
+  // If the digest was deduped/skipped, deferred, parked, rejected, or failed,
+  // the exhausted line never reached a person -- leave the row queued for the
+  // next tick instead of marking it delivered and dropping the line.
+  if (commitPrRepairExhausted && digestSentThisTick) {
+    try {
+      await commitPrRepairExhausted();
+    } catch (error) {
+      log.warn({ err: error as Error }, 'taskmaster.pr_repair_commit_failed');
     }
   }
 

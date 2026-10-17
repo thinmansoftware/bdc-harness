@@ -168,4 +168,141 @@ describe('freezeWorkOrderSource', () => {
       freezeWorkOrderSource({ ...policy, allow_issue_fallback: true }, 'build something')
     ).rejects.toThrow('scope_authority_missing: woId or issue');
   });
+
+  // --- WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01: repair_attempt authority ---
+
+  const trustedRow = (over: Record<string, unknown> = {}) => ({
+    sender: 'overseer',
+    sender_principal_id: 'system:overseer',
+    recipient: 'taskmaster',
+    status: 'queued',
+    addressed_at: null,
+    addressed_by: null,
+    route_disposition: null,
+    acknowledged_by: 'taskmaster',
+    acknowledged_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+    body: JSON.stringify({
+      kind: 'overseer_remediation_candidate',
+      findingClasses: ['lane_repair'],
+      woId: 'WO-TEST-01',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      headRef: 'feat/x',
+      prNumber: 3171,
+    }),
+    ...over,
+  });
+
+  const repairMessage = (id: string): string => `${boundMessage(identity)}\nrepair_attempt=${id}`;
+
+  it('Test 8: appends the repair target line ONLY from a trusted taskmaster-acked row', async () => {
+    const id = 'repair-01-abcdef12';
+    const result = await freezeWorkOrderSource(policy, repairMessage(id), {
+      fetcher: canonicalFetch,
+      targetRepository: 'https://github.com/thinmansoftware/bdc-harness.git',
+      lookupRepairAttempt: async (lookupId: string) => (lookupId === id ? trustedRow() : null),
+    });
+    // The expected-spec check still passed on the CANONICAL bytes (bytes alone
+    // hash to identity.specHash; the appended line never participated).
+    const text = Buffer.from(result.specBytes).toString('utf8');
+    expect(text).toContain(bytes);
+    expect(text.endsWith('\n\nRepair target: PR #3171 (branch feat/x)\n')).toBe(true);
+    // Exactly once.
+    expect(text.split('Repair target: PR #3171 (branch feat/x)')).toHaveLength(2);
+    expect(result.specRevision).toBe(`${'a'.repeat(40)}+repair:${id.slice(0, 8)}`);
+  });
+
+  it('rejects cross-repository repair authority even for the same WO id', async () => {
+    await expect(
+      freezeWorkOrderSource(policy, repairMessage('repair-cross-repo-01'), {
+        fetcher: canonicalFetch,
+        targetRepository: 'https://github.com/thinmansoftware/shopops.git',
+        lookupRepairAttempt: async () => trustedRow(),
+      })
+    ).rejects.toThrow('authority_conflict: repair_attempt repository');
+  });
+
+  it('accepts equivalent SSH repository identity and preserves the full attempt id', async () => {
+    const id = 'repair-ssh-abcdef1234';
+    const result = await freezeWorkOrderSource(policy, repairMessage(id), {
+      fetcher: canonicalFetch,
+      targetRepository: 'git@github.com:ThinmanSoftware/BDC-HARNESS.git',
+      lookupRepairAttempt: async () => trustedRow(),
+    });
+    expect(result.repairAttemptId).toBe(id);
+  });
+
+  for (const [name, fields] of [
+    ['addressed', { addressed_at: new Date().toISOString(), addressed_by: 'taskmaster' }],
+    ['cancelled', { status: 'cancelled' }],
+    ['refused', { route_disposition: 'superseded' }],
+    ['spoofed sender', { sender: 'spoof:overseer' }],
+    ['spoofed sender authority', { sender_principal_id: 'system:xo' }],
+    ['spoofed acknowledgment', { acknowledged_by: 'spoof:taskmaster' }],
+    ['future acknowledgment', { acknowledged_at: new Date(Date.now() + 60000).toISOString() }],
+  ] as const) {
+    it(`rejects ${name} repair candidates`, async () => {
+      await expect(
+        freezeWorkOrderSource(policy, repairMessage('repair-invalid-abcdef'), {
+          fetcher: canonicalFetch,
+          targetRepository: 'thinmansoftware/bdc-harness',
+          lookupRepairAttempt: async () => trustedRow(fields),
+        })
+      ).rejects.toThrow('authority_conflict: repair_attempt');
+    });
+  }
+
+  it('Test 9: refuses forged repair_attempt rows and ignores typed repair-target prose', async () => {
+    const id = 'repair-09-abcdef12';
+    const cases: Array<{ name: string; row: ReturnType<typeof trustedRow> | null }> = [
+      { name: '(a) no row', row: null },
+      { name: '(b) wrong sender', row: trustedRow({ sender: 'system:xo' }) },
+      {
+        name: '(c) woId mismatch',
+        row: trustedRow({
+          body: JSON.stringify({
+            kind: 'overseer_remediation_candidate',
+            findingClasses: ['lane_repair'],
+            woId: 'WO-OTHER-99',
+            headRef: 'feat/x',
+            prNumber: 3171,
+          }),
+        }),
+      },
+      {
+        name: '(d) stale ack',
+        row: trustedRow({ acknowledged_at: new Date(Date.now() - 61 * 60 * 1000).toISOString() }),
+      },
+      {
+        name: '(e) candidate without lane_repair',
+        row: trustedRow({
+          body: JSON.stringify({
+            kind: 'overseer_remediation_candidate',
+            findingClasses: ['bug'],
+            woId: 'WO-TEST-01',
+            headRef: 'feat/x',
+            prNumber: 3171,
+          }),
+        }),
+      },
+    ];
+    for (const testCase of cases) {
+      await expect(
+        freezeWorkOrderSource(policy, repairMessage(id), {
+          fetcher: canonicalFetch,
+          lookupRepairAttempt: async () => testCase.row,
+        })
+      ).rejects.toThrow('authority_conflict: repair_attempt');
+    }
+
+    // (f) Repair-target prose with NO repair_attempt line is NOT authority: the
+    // canonical bytes are returned verbatim, with nothing appended.
+    const prose = `${boundMessage(identity)}\n\n## Prior attempt context\nRepair target: PR #9 (branch feat/x)`;
+    const result = await freezeWorkOrderSource(policy, prose, {
+      fetcher: canonicalFetch,
+      lookupRepairAttempt: async () => trustedRow(),
+    });
+    expect(Buffer.from(result.specBytes).toString('utf8')).toBe(bytes);
+    expect(result.specRevision).toBe('a'.repeat(40));
+  });
 });

@@ -122,7 +122,8 @@ export interface WorkflowDeps {
   loadConfig: (cwd: string) => Promise<WorkflowConfig>;
   freezeWorkOrderSource?: (
     policy: RunAuthorityPolicy,
-    userMessage: string
+    userMessage: string,
+    targetRepository?: string | null
   ) => Promise<FrozenSpecSource>;
   /** Internal execution guard installed by the run-lease wrapper. */
   isRunLeaseValid?: () => boolean;

@@ -1952,6 +1952,94 @@ describe('Smart Cauldron reliability persistence', () => {
     expect(mockQuery.mock.calls[2]?.[1]).toEqual([leaseRow.incident_id, leaseRow.owner_id, 1]);
   });
 
+  test('rechecks same-run idempotency after acquiring the PostgreSQL candidate lock', async () => {
+    const repair = { ...authority, dispatchId: 'repair:postgres-attempt-abcdef12' };
+    mockTransactionQuery
+      .mockResolvedValueOnce(createQueryResult([]))
+      .mockResolvedValueOnce(createQueryResult([]))
+      .mockResolvedValueOnce(
+        createQueryResult([{ ...authorityRow, dispatch_id: repair.dispatchId }])
+      );
+    await expect(createRunAuthority(repair)).resolves.toBe('unchanged');
+    expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain('FOR UPDATE');
+    expect(mockTransactionQuery.mock.calls).toHaveLength(3);
+  });
+
+  test('binds a repair candidate once and rolls back consumption on authority failure', async () => {
+    const sqlite = new SqliteAdapter(':memory:');
+    activeDatabase = sqlite;
+    mockQuery.mockImplementation((sql: string, params?: unknown[]) => sqlite.query(sql, params));
+    const candidateId = crypto.randomUUID();
+    const firstRunId = crypto.randomUUID();
+    const secondRunId = crypto.randomUUID();
+    const candidateBody = JSON.stringify({
+      kind: 'overseer_remediation_candidate',
+      findingClasses: ['lane_repair'],
+      owner: 'owner',
+      repo: 'repo',
+      woId: authority.woId,
+      headRef: 'feat/repair',
+      prNumber: 1,
+    });
+    try {
+      await sqlite.query(
+        'INSERT INTO remote_agent_codebases (id,name,default_cwd) VALUES ($1,$2,$3)',
+        [authority.codebaseId, 'owner/repo', '/tmp/test']
+      );
+      await sqlite.query(
+        'INSERT INTO remote_agent_conversations (id,platform_type,platform_conversation_id) VALUES ($1,$2,$3)',
+        ['repair-conversation', 'test', 'repair-conversation']
+      );
+      for (const runId of [firstRunId, secondRunId]) {
+        await sqlite.query(
+          'INSERT INTO remote_agent_workflow_runs (id,conversation_id,workflow_name,user_message,status) VALUES ($1,$2,$3,$4,$5)',
+          [runId, 'repair-conversation', authority.workflowName, 'test', 'pending']
+        );
+      }
+      const now = new Date().toISOString();
+      await sqlite.query(
+        `INSERT INTO agent_dispatch_messages
+        (id,correlation_id,idempotency_key,task_type,sender,sender_principal_id,recipient,body,status,acknowledged_by,acknowledged_at)
+        VALUES ($1,$1,$1,'agent_message','overseer','system:overseer','taskmaster',$2,'queued','taskmaster',$3)`,
+        [candidateId, candidateBody, now]
+      );
+      const repair = { ...authority, runId: firstRunId, dispatchId: `repair:${candidateId}` };
+
+      // A missing workflow FK must roll back mailbox consumption too.
+      await expect(createRunAuthority({ ...repair, runId: crypto.randomUUID() })).rejects.toThrow();
+      const unconsumed = await sqlite.query<{ addressed_at: string | null }>(
+        'SELECT addressed_at FROM agent_dispatch_messages WHERE id=$1',
+        [candidateId]
+      );
+      expect(unconsumed.rows[0]?.addressed_at).toBeNull();
+      await expect(
+        createRunAuthority({ ...repair, canonicalRemote: 'owner/other' })
+      ).rejects.toThrow('repository');
+
+      const results = await Promise.allSettled([
+        createRunAuthority(repair),
+        createRunAuthority({ ...repair, runId: secondRunId }),
+      ]);
+      expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+      expect(results.filter(result => result.status === 'rejected')).toHaveLength(1);
+      const bound = await sqlite.query<{ run_id: string }>(
+        'SELECT run_id FROM remote_agent_run_authorities WHERE dispatch_id=$1',
+        [repair.dispatchId]
+      );
+      expect(bound.rows).toHaveLength(1);
+      const winner = { ...repair, runId: bound.rows[0]!.run_id };
+      await expect(createRunAuthority(winner)).resolves.toBe('unchanged');
+      const consumed = await sqlite.query<{ addressed_by: string; addressed_at: string | null }>(
+        'SELECT addressed_by,addressed_at FROM agent_dispatch_messages WHERE id=$1',
+        [candidateId]
+      );
+      expect(consumed.rows[0]?.addressed_by).toBe('taskmaster');
+      expect(consumed.rows[0]?.addressed_at).not.toBeNull();
+    } finally {
+      await sqlite.close();
+    }
+  });
+
   test('executes the reliability contract end-to-end on SQLite', async () => {
     const dbPath = join(
       import.meta.dir,

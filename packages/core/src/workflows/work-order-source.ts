@@ -5,6 +5,147 @@ import type { FrozenSpecSource } from '@archon/workflows/reliability/run-authori
 export interface WorkOrderSourceDependencies {
   readonly fetcher?: typeof fetch;
   readonly githubToken?: string;
+  /** Resolved execution repository, never the repository containing the spec. */
+  readonly targetRepository?: string | null;
+  /**
+   * Resolve a repair-attempt dispatch row by id
+   * (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01). Wired to dispatch.getMessage.
+   * When the frozen message carries a `repair_attempt=<id>` line, this is the
+   * ONLY authority that can admit a "Repair target: PR #N (branch X)" line into
+   * the frozen spec -- message text alone is never authority.
+   */
+  readonly lookupRepairAttempt?: (id: string) => Promise<RepairAttemptRow | null>;
+}
+
+/** The dispatch-row fields the repair-attempt authority check reads. */
+export interface RepairAttemptRow {
+  readonly sender: string;
+  readonly sender_principal_id: string | null;
+  readonly recipient: string;
+  readonly body: string;
+  readonly status: string;
+  readonly addressed_at: string | null;
+  readonly addressed_by: string | null;
+  readonly route_disposition: string | null;
+  readonly acknowledged_by: string | null;
+  readonly acknowledged_at: string | Date | null;
+}
+
+const REPAIR_ATTEMPT_LINE_RE = /^repair_attempt=([A-Za-z0-9-]{8,64})$/;
+const REPAIR_ACK_MAX_AGE_MS = 60 * 60 * 1000;
+
+/** GitHub remote and owner/repo forms share the same case-insensitive identity. */
+function repairRepository(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const match =
+    /^(?:(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/))?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(
+      value.trim()
+    );
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+/** Shared by freezing and the atomic first-run authority transaction. */
+export function validateRepairAttemptRow(
+  row: RepairAttemptRow,
+  frozenWoId: string,
+  targetRepository: string | null | undefined
+): { prNumber: number; headRef: string } {
+  if (row.sender !== 'overseer' || row.sender_principal_id !== 'system:overseer') {
+    throw new Error('authority_conflict: repair_attempt sender');
+  }
+  if (row.recipient !== 'taskmaster') {
+    throw new Error('authority_conflict: repair_attempt recipient');
+  }
+  if (
+    row.status !== 'queued' ||
+    row.addressed_at !== null ||
+    row.addressed_by !== null ||
+    row.route_disposition !== null
+  )
+    throw new Error('authority_conflict: repair_attempt consumed or refused');
+  let body: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(row.body);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error();
+    body = parsed as Record<string, unknown>;
+  } catch {
+    throw new Error('authority_conflict: repair_attempt body');
+  }
+  if (body.kind !== 'overseer_remediation_candidate') {
+    throw new Error('authority_conflict: repair_attempt kind');
+  }
+  if (!Array.isArray(body.findingClasses) || !body.findingClasses.includes('lane_repair')) {
+    throw new Error('authority_conflict: repair_attempt findingClasses');
+  }
+  if (body.woId !== frozenWoId) throw new Error('authority_conflict: repair_attempt woId');
+  const actualRepository = repairRepository(targetRepository);
+  if (
+    typeof body.owner !== 'string' ||
+    typeof body.repo !== 'string' ||
+    !actualRepository ||
+    `${body.owner}/${body.repo}`.toLowerCase() !== actualRepository
+  )
+    throw new Error('authority_conflict: repair_attempt repository');
+  if (typeof body.headRef !== 'string' || !body.headRef) {
+    throw new Error('authority_conflict: repair_attempt headRef');
+  }
+  if (
+    typeof body.prNumber !== 'number' ||
+    !Number.isSafeInteger(body.prNumber) ||
+    body.prNumber < 1
+  ) {
+    throw new Error('authority_conflict: repair_attempt prNumber');
+  }
+  if (row.acknowledged_by !== 'taskmaster') {
+    throw new Error('authority_conflict: repair_attempt not acknowledged by taskmaster');
+  }
+  const ackMs =
+    row.acknowledged_at instanceof Date
+      ? row.acknowledged_at.getTime()
+      : row.acknowledged_at
+        ? Date.parse(row.acknowledged_at)
+        : NaN;
+  const age = Date.now() - ackMs;
+  if (!Number.isFinite(ackMs) || age < 0 || age > REPAIR_ACK_MAX_AGE_MS) {
+    throw new Error('authority_conflict: repair_attempt acknowledgement stale');
+  }
+  return { prNumber: body.prNumber, headRef: body.headRef };
+}
+
+/**
+ * Resolve the repair target from a trusted dispatch row, or null when the
+ * message carries no repair_attempt line. Throws authority_conflict on any
+ * failed requirement -- a repair target can NEVER come from message text alone.
+ *
+ * Runs strictly AFTER the expected-spec comparison on the canonical bytes, so
+ * the appended "Repair target" line never participates in that hash check.
+ */
+async function resolveRepairTarget(
+  userMessage: string,
+  frozenWoId: string,
+  dependencies: WorkOrderSourceDependencies
+): Promise<{ prNumber: number; headRef: string; id: string } | null> {
+  const lines = userMessage.split(/\r?\n/);
+  let attemptId: string | null = null;
+  // Line 1 is the policy header; a repair_attempt line is only honored after it.
+  for (let i = 1; i < lines.length; i += 1) {
+    const match = REPAIR_ATTEMPT_LINE_RE.exec(lines[i]);
+    if (match) {
+      attemptId = match[1];
+      break;
+    }
+  }
+  if (!attemptId) return null;
+
+  if (!dependencies.lookupRepairAttempt) {
+    throw new Error('authority_conflict: repair_attempt lookup unavailable');
+  }
+  const row = await dependencies.lookupRepairAttempt(attemptId);
+  if (!row) throw new Error('authority_conflict: repair_attempt row not found');
+  return {
+    ...validateRepairAttemptRow(row, frozenWoId, dependencies.targetRepository),
+    id: attemptId,
+  };
 }
 
 /** A constraint on policy-resolved authority, never an alternate authority source. */
@@ -114,6 +255,23 @@ export async function freezeWorkOrderSource(
       `sha256:${createHash('sha256').update(source.specBytes).digest('hex')}` !== expected.specHash)
   )
     throw new Error('authority_conflict: canonical spec changed since eligibility');
+
+  // AFTER the expected-spec comparison (the appended line must never alter that
+  // hash): if a trusted repair-attempt row authorizes it, append the repair
+  // target line to the canonical bytes and mark the revision.
+  const repair = await resolveRepairTarget(userMessage, source.woId, dependencies);
+  if (repair) {
+    const specBytes = Buffer.concat([
+      Buffer.from(source.specBytes),
+      Buffer.from(`\n\nRepair target: PR #${repair.prNumber} (branch ${repair.headRef})\n`, 'utf8'),
+    ]);
+    return {
+      ...source,
+      repairAttemptId: repair.id,
+      specBytes,
+      specRevision: `${source.specRevision}+repair:${repair.id.slice(0, 8)}`,
+    };
+  }
   return source;
 }
 

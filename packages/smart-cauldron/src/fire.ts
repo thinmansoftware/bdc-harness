@@ -269,12 +269,22 @@ export function buildFireMessage(
   woId: string,
   project: string,
   priorAttemptContext?: string,
-  expectedSpec?: ExpectedSpecIdentity
+  expectedSpec?: ExpectedSpecIdentity,
+  /**
+   * Repair-attempt authorization id (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01).
+   * When supplied it is inserted as the SECOND line `repair_attempt=<id>`; the
+   * FIRST line stays byte-for-byte as today so readExpectedSpecIdentity (which
+   * parses only line 1) is unaffected. freezeWorkOrderSource validates the id
+   * against a trusted dispatch row before any repair target can enter the
+   * frozen spec -- the message text alone is never authority.
+   */
+  repairAttemptId?: string
 ): string {
   const binding = expectedSpec
     ? ` --expected-spec=${Buffer.from(JSON.stringify(expectedSpec)).toString('base64url')}`
     : '';
   const base = `WO_ID=${woId} --project ${project}${binding}`;
-  if (!priorAttemptContext) return base;
-  return `${base}\n\n## Prior attempt context\n${priorAttemptContext}`;
+  const header = repairAttemptId ? `${base}\nrepair_attempt=${repairAttemptId}` : base;
+  if (!priorAttemptContext) return header;
+  return `${header}\n\n## Prior attempt context\n${priorAttemptContext}`;
 }

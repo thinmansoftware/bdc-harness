@@ -9,6 +9,8 @@ import { join } from 'path';
 import { rootLogger } from '@archon/paths';
 import {
   createTaskmasterState,
+  createGhLaneFetcher,
+  createRealPrRepairOwnerDeps,
   defaultFindEffectByIdempotencyKey,
   defaultGetGithubIssueEvidence,
   defaultListThreads,
@@ -4877,4 +4879,36 @@ describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', 
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFire;
     }
   });
+});
+
+describe('production repair-owner GitHub fetcher', () => {
+  test('propagates read failures rather than hiding an unresolved PR', async () => {
+    const fetcher = createGhLaneFetcher((async () => {
+      throw new Error('github_transient_failure');
+    }) as Parameters<typeof createGhLaneFetcher>[0]);
+    let caught: unknown;
+    try {
+      await fetcher('thinmansoftware', 'bdc-harness', 1120);
+    } catch (error) {
+      caught = error;
+    }
+    expect((caught as Error)?.message).toBe('github_transient_failure');
+  });
+});
+
+test('production repair-owner effect gate reads fresh pause and captured epoch', async () => {
+  let epoch = 5;
+  let pause_state: 'RUNNING' | 'PAUSED' = 'RUNNING';
+  let reads = 0;
+  const deps = createRealPrRepairOwnerDeps(T0, 5, async () => {
+    reads++;
+    return { epoch, pause_state } as never;
+  });
+  expect(await deps.canApplyEffect()).toBe(true);
+  pause_state = 'PAUSED';
+  expect(await deps.canApplyEffect()).toBe(false);
+  pause_state = 'RUNNING';
+  epoch = 6;
+  expect(await deps.canApplyEffect()).toBe(false);
+  expect(reads).toBe(3);
 });

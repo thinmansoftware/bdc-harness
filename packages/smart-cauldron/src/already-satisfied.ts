@@ -22,6 +22,15 @@ export interface WoClaim {
   readonly title: string;
   readonly url: string;
   readonly repo: string;
+  /**
+   * The PR's head branch name. Already fetched by ghPrSearchDefault (gh pr list
+   * --json includes headRefName); surfaced on the claim so the repair-target
+   * admission exemption can recognise the author-wo.sh spec branch (wo/<id>)
+   * without a second lookup. Optional: a lookup that predates this field (or a
+   * test fixture) may omit it, in which case the spec-PR exemption simply does
+   * not match it.
+   */
+  readonly headRefName?: string;
 }
 
 export interface FindWoClaimOptions {
@@ -29,6 +38,14 @@ export interface FindWoClaimOptions {
   readonly project: string;
   /** Override gh lookup (tests). */
   readonly lookup?: (repo: string, woId: string) => Promise<WoClaim[]>;
+  /**
+   * Repair-target admission exemption (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01).
+   * When supplied, every claim for which this returns true is dropped BEFORE the
+   * MERGED-first selection, so it cannot refuse the caller. Used ONLY in repair
+   * mode to drop (i) the repair target's own OPEN PR and (ii) the author-wo.sh
+   * spec PR (head wo/<woId>). Every other OPEN or MERGED claim still refuses.
+   */
+  readonly ignore?: (claim: WoClaim) => boolean;
 }
 
 /**
@@ -178,6 +195,7 @@ export async function ghPrSearchDefault(
         title,
         url,
         repo,
+        headRefName: head,
       });
     }
     return out;
@@ -196,8 +214,12 @@ export async function findWoClaim(opts: FindWoClaimOptions): Promise<WoClaim | n
   const repo = resolveGithubRepo(opts.project);
   const lookup = opts.lookup ?? ghPrSearchDefault;
   const claims = await lookup(repo, opts.woId);
-  if (claims.length === 0) return null;
-  const merged = claims.find(c => c.state === 'MERGED');
+  // Drop exempted claims (repair target + spec PR) BEFORE the MERGED-first
+  // selection so an exempted claim can never be the one that refuses.
+  const ignore = opts.ignore;
+  const considered = ignore ? claims.filter(c => !ignore(c)) : claims;
+  if (considered.length === 0) return null;
+  const merged = considered.find(c => c.state === 'MERGED');
   if (merged) return merged;
-  return claims[0] ?? null;
+  return considered[0] ?? null;
 }

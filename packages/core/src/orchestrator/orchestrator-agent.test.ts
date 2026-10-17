@@ -132,6 +132,7 @@ mock.module('../utils/error', () => ({
 }));
 
 mock.module('../workflows/store-adapter', () => ({
+  createRepairAttemptLookup: () => async () => null,
   createWorkflowDeps: mock(() => ({})),
 }));
 
