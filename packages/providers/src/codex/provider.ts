@@ -27,6 +27,11 @@ import { parseCodexConfig } from './config';
 import { CODEX_CAPABILITIES } from './capabilities';
 import { resolveCodexBinaryPath } from './binary-resolver';
 import {
+  restrictedClientOptions,
+  restrictedThreadOptions,
+  validateRestrictedRequest,
+} from './restricted-policy';
+import {
   AUTH_PATTERNS,
   buildReauthMessage,
   ensureFreshAuth,
@@ -721,12 +726,16 @@ function toCodexAuthPathError(error: unknown): Error {
  *   reduced cross-model adversarial value.
  */
 export class CodexProvider implements IAgentProvider {
+  private readonly restricted: boolean;
+  private readonly ownedRestrictedSessions = new Set<string>();
   private readonly retryBaseDelayMs: number;
   private readonly failbackProviderFactory: (() => IAgentProvider) | null;
   private readonly failbackLabel: string;
   private readonly failbackEventName: string;
 
   constructor(options?: {
+    /** Unregistered candidate; requires separately qualified dedicated worker. */
+    restricted?: boolean;
     retryBaseDelayMs?: number;
     /**
      * Optional factory that produces a fallback IAgentProvider for the
@@ -738,6 +747,10 @@ export class CodexProvider implements IAgentProvider {
     failbackLabel?: string;
     failbackEventName?: string;
   }) {
+    this.restricted = options?.restricted === true;
+    if (this.restricted && options?.failbackProviderFactory) {
+      throw new Error('Restricted Codex cannot have a fallback provider');
+    }
     this.retryBaseDelayMs = options?.retryBaseDelayMs ?? RETRY_BASE_DELAY_MS;
     this.failbackProviderFactory = options?.failbackProviderFactory ?? null;
     this.failbackLabel = options?.failbackLabel ?? 'Claude';
@@ -782,14 +795,22 @@ export class CodexProvider implements IAgentProvider {
     // developers.openai.com/codex/auth/ci-cd-auth) and only falls back to a
     // direct refresh-endpoint POST if that path doesn't advance auth.json.
     // Behavior spec v2 invariant I-1; research doc section Design recommendation L2 + L4.
-    await ensureFreshAuth('codex');
+    if (this.restricted) {
+      validateRestrictedRequest(cwd, resumeSessionId, this.ownedRestrictedSessions, requestOptions);
+    } else {
+      await ensureFreshAuth('codex');
+    }
 
     const assistantConfig = requestOptions?.assistantConfig ?? {};
     const codexConfig = parseCodexConfig(assistantConfig);
 
     // 1. Initialize SDK and build thread options
-    const codex = await this.createCodexClient(codexConfig.codexBinaryPath, requestOptions?.env);
-    const threadOptions = buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
+    const codex = this.restricted
+      ? new Codex(restrictedClientOptions())
+      : await this.createCodexClient(codexConfig.codexBinaryPath, requestOptions?.env);
+    const threadOptions = this.restricted
+      ? restrictedThreadOptions()
+      : buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
 
     if (requestOptions?.abortSignal?.aborted) {
       throw new Error('Query aborted');
@@ -888,7 +909,7 @@ export class CodexProvider implements IAgentProvider {
 
         // 5. Stream normalized events (fresh state per attempt to avoid dedup leaks)
         yield* streamCodexEvents(
-          result.events as AsyncIterable<Record<string, unknown>>,
+          this.trackRestrictedSessions(result.events as AsyncIterable<Record<string, unknown>>),
           hasOutputFormat,
           thread.id,
           requestOptions?.abortSignal
@@ -984,7 +1005,7 @@ export class CodexProvider implements IAgentProvider {
         );
 
         // BDC fork: subscription auth must self-heal; API-key fallback is forbidden.
-        if (errorClass === 'auth' && attempt === 0) {
+        if (errorClass === 'auth' && attempt === 0 && !this.restricted) {
           try {
             const result = await refreshIfAuthFailed('codex');
             if (result.refreshed) {
@@ -1091,7 +1112,23 @@ export class CodexProvider implements IAgentProvider {
     throw lastError ?? new Error('Codex query failed after retries');
   }
 
+  private async *trackRestrictedSessions(
+    events: AsyncIterable<Record<string, unknown>>
+  ): AsyncGenerator<Record<string, unknown>> {
+    for await (const event of events) {
+      if (
+        this.restricted &&
+        event.type === 'thread.started' &&
+        typeof event.thread_id === 'string' &&
+        event.thread_id
+      ) {
+        this.ownedRestrictedSessions.add(event.thread_id);
+      }
+      yield event;
+    }
+  }
+
   getType(): string {
-    return 'codex';
+    return this.restricted ? 'codex-teetime-restricted' : 'codex';
   }
 }

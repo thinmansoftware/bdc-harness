@@ -39,6 +39,9 @@ const server = Bun.spawn(
   { env, stdout: 'ignore', stderr: 'ignore' }
 );
 const results: Record<string, number> = {};
+const peer = process.env.TEE_TIME_PROBE_PEER;
+if (peer && !/^http:\/\/\d{1,3}(\.\d{1,3}){3}:3999$/.test(peer))
+  throw new Error('invalid inspected peer address');
 function run(name: string, args: string[], expected: 'success' | 'denied'): void {
   const result = Bun.spawnSync(args, { env, cwd, stdout: 'pipe', stderr: 'pipe', timeout: 5000 });
   if (result.signalCode) throw new Error(`${name}: process did not exit normally`);
@@ -55,6 +58,8 @@ function run(name: string, args: string[], expected: 'success' | 'denied'): void
   if ((expected === 'success') !== (result.exitCode === 0)) {
     throw new Error(`${name} failed: ${result.exitCode}: ${result.stderr.toString()}`);
   }
+  if (name.startsWith('baseline-peer') && result.stdout.toString() !== 'teetime-peer')
+    throw new Error('unexpected synthetic peer response');
   if (expected === 'denied' && name !== 'invalid-profile') {
     const expectedCode = name.includes('network') ? 7 : name.includes('write') ? 2 : 1;
     if (result.exitCode !== expectedCode)
@@ -80,12 +85,32 @@ const sandbox = [
 ];
 try {
   await Bun.sleep(300);
+  if (peer) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const ready = Bun.spawnSync(['curl', '--noproxy', '*', '-fsS', '--max-time', '1', peer], {
+        env,
+        cwd,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 2000,
+      });
+      if (ready.exitCode === 0 && ready.stdout.toString() === 'teetime-peer') break;
+      if (attempt === 4) throw new Error('synthetic peer readiness failed');
+      await Bun.sleep(200);
+    }
+  }
   run('baseline-write', ['sh', '-c', 'echo baseline > /protected/write-probe'], 'success');
   run('baseline-read', ['cat', '/protected/synthetic-secret.txt'], 'success');
   run('baseline-auth-read', ['cat', `${home}/.codex/auth.json`], 'success');
   symlinkSync(`${home}/.codex/auth.json`, `${cwd}/auth-link`);
   symlinkSync('/protected/write-probe', `${cwd}/write-link`);
   run('baseline-network', ['curl', '-fsS', '--max-time', '2', 'http://127.0.0.1:3999'], 'success');
+  if (peer)
+    run(
+      'baseline-peer-network',
+      ['curl', '--noproxy', '*', '-fsS', '--max-time', '2', peer],
+      'success'
+    );
   run('workspace-write', [...sandbox, 'sh', '-c', 'echo allowed > allowed.txt'], 'success');
   run('outside-write', [...sandbox, 'sh', '-c', 'echo denied > /protected/write-probe'], 'denied');
   run('credential-read', [...sandbox, 'cat', '/protected/synthetic-secret.txt'], 'denied');
@@ -114,6 +139,36 @@ try {
     [...sandbox, 'sh', '-c', 'curl -fsS --max-time 2 http://127.0.0.1:3999'],
     'denied'
   );
+  if (peer) {
+    run(
+      'tool-peer-network',
+      [...sandbox, 'curl', '--noproxy', '*', '-fsS', '--max-time', '2', peer],
+      'denied'
+    );
+    run(
+      'nested-peer-network',
+      [
+        ...sandbox,
+        'sh',
+        '-c',
+        'exec "$@"',
+        'peer',
+        'curl',
+        '--noproxy',
+        '*',
+        '-fsS',
+        '--max-time',
+        '2',
+        peer,
+      ],
+      'denied'
+    );
+    run(
+      'baseline-peer-network-after',
+      ['curl', '--noproxy', '*', '-fsS', '--max-time', '2', peer],
+      'success'
+    );
+  }
   run(
     'invalid-profile',
     [binary, 'sandbox', '-P', 'missing-profile', '-C', cwd, 'touch', 'unsafe.txt'],
