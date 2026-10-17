@@ -33,6 +33,8 @@ bun run validate
 
 **Important:** Use `bun run test` (not `bun test` from the repo root) to avoid mock pollution across packages.
 
+Windows CI (`test (windows-latest)`) runs on pushes to `dev` and `main`, normally after a merge. Pull requests skip that job; there is no on-demand Windows trigger unless one is added separately.
+
 ### Commit Messages
 
 - Use present tense ("Add feature" not "Added feature")
