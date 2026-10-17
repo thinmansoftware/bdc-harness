@@ -6,6 +6,7 @@ import {
   REVIEW_MODEL,
   REVIEW_PROVIDER,
   REVIEW_REF,
+  REVIEW_SYSTEM,
   validateRestrictedReview,
   parseReviewVerdict,
 } from './restricted-review-policy';
@@ -23,6 +24,8 @@ function packageText(): string {
   });
 }
 const selected = { id: REVIEW_MODEL, provider: REVIEW_PROVIDER, baseUrl: `${REVIEW_ENDPOINT}/v1` };
+let loaded = false;
+let systemPrompt = '';
 let fallback: string | undefined;
 let sessionModel = { ...selected };
 let digest = REVIEW_DIGEST;
@@ -39,6 +42,9 @@ let postDigest: string | undefined;
 let unexpectedAction = false;
 let construction: Record<string, unknown> | undefined;
 const fakeSession = {
+  get systemPrompt() {
+    return systemPrompt;
+  },
   get model() {
     return sessionModel;
   },
@@ -65,6 +71,27 @@ mock.module('@mariozechner/pi-coding-agent', () => ({
   SessionManager: { inMemory: () => ({}) },
   DefaultResourceLoader: class {
     constructor(public options: unknown) {}
+    async reload() {
+      loaded = true;
+    }
+    getSystemPrompt() {
+      return loaded ? REVIEW_SYSTEM : undefined;
+    }
+    getAppendSystemPrompt() {
+      return [];
+    }
+    getExtensions() {
+      return { extensions: [], errors: [] };
+    }
+    getSkills() {
+      return { skills: [] };
+    }
+    getPrompts() {
+      return { prompts: [] };
+    }
+    getAgentsFiles() {
+      return { agentsFiles: [] };
+    }
   },
   createAgentSession: async (options: Record<string, unknown>) => {
     construction = options;
@@ -101,6 +128,9 @@ const proxyKeys = [
 const savedProxy = Object.fromEntries(proxyKeys.map(key => [key, process.env[key]]));
 beforeEach(() => {
   for (const key of proxyKeys) delete process.env[key];
+  loaded = false;
+  systemPrompt =
+    REVIEW_SYSTEM + '\nCurrent date: 2026-10-17\nCurrent working directory: /workspace';
   fallback = undefined;
   sessionModel = { ...selected };
   digest = REVIEW_DIGEST;
@@ -180,6 +210,7 @@ describe('restricted text-only reviewer candidate', () => {
   });
   it('constructs a tool-free fresh session and emits only a parsed verdict after identity checks', async () => {
     const chunks = await collect();
+    expect(loaded).toBe(true);
     expect(construction?.tools).toEqual([]);
     expect(construction?.customTools).toEqual([]);
     expect(construction?.scopedModels).toEqual([]);
@@ -191,6 +222,12 @@ describe('restricted text-only reviewer candidate', () => {
     });
     expect(prompted).toBe(1);
     expect(disposed).toBeGreaterThan(0);
+  });
+  it('rejects altered effective instructions before prompting and disposes', async () => {
+    systemPrompt = 'default prompt';
+    await expect(collect()).rejects.toThrow('mismatch');
+    expect(prompted).toBe(0);
+    expect(disposed).toBe(1);
   });
   it('rejects fallback and disposes before any prompt', async () => {
     fallback = 'different model selected';

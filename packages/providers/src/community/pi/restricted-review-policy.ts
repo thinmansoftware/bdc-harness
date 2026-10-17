@@ -96,3 +96,11 @@ export function parseReviewVerdict(text: string): {
     evidenceIds: value.evidenceIds as string[],
   };
 }
+
+// The installed Pi SDK appends only date and cwd to this custom policy.
+export function isRestrictedReviewSystem(value: unknown): boolean {
+  if (typeof value !== 'string' || !value.startsWith(REVIEW_SYSTEM)) return false;
+  return /^\nCurrent date: \d{4}-\d{2}-\d{2}\nCurrent working directory: \/workspace$/.test(
+    value.slice(REVIEW_SYSTEM.length)
+  );
+}

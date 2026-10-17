@@ -8,6 +8,7 @@ import {
   REVIEW_DIGEST,
   REVIEW_ENDPOINT,
   REVIEW_SYSTEM,
+  isRestrictedReviewSystem,
   parseReviewVerdict,
 } from './restricted-review-policy';
 
@@ -89,7 +90,19 @@ export async function* runRestrictedReview(
     noThemes: true,
     noContextFiles: true,
     systemPrompt: REVIEW_SYSTEM,
+    appendSystemPrompt: [],
   });
+  await resourceLoader.reload();
+  if (
+    resourceLoader.getSystemPrompt() !== REVIEW_SYSTEM ||
+    resourceLoader.getAppendSystemPrompt().length !== 0 ||
+    resourceLoader.getExtensions().extensions.length !== 0 ||
+    resourceLoader.getExtensions().errors.length !== 0 ||
+    resourceLoader.getSkills().skills.length !== 0 ||
+    resourceLoader.getPrompts().prompts.length !== 0 ||
+    resourceLoader.getAgentsFiles().agentsFiles.length !== 0
+  )
+    throw new Error('restricted review resources mismatch');
   const { session, modelFallbackMessage, extensionsResult } = await pi.createAgentSession({
     cwd: '/workspace',
     agentDir: '/home/appuser/.pi/teetime-review',
@@ -106,6 +119,7 @@ export async function* runRestrictedReview(
   function verifySession(): void {
     if (
       modelFallbackMessage ||
+      !isRestrictedReviewSystem(session.systemPrompt) ||
       session.model?.id !== REVIEW_MODEL ||
       session.model.provider !== REVIEW_PROVIDER ||
       session.model.baseUrl !== `${REVIEW_ENDPOINT}/v1` ||

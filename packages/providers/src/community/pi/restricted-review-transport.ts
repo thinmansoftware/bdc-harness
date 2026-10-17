@@ -1,5 +1,9 @@
 // Dedicated-process candidate only. Never install this in the shared harness.
-import { REVIEW_ENDPOINT, REVIEW_MODEL } from './restricted-review-policy';
+import {
+  REVIEW_ENDPOINT,
+  REVIEW_MODEL,
+  isRestrictedReviewSystem,
+} from './restricted-review-policy';
 
 export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetch {
   let inferenceRequests = 0;
@@ -64,6 +68,15 @@ export function createRestrictedReviewFetch(upstream: typeof fetch): typeof fetc
         (data.max_tokens ?? data.max_completion_tokens) !== 1024
       )
         throw new Error('unexpected review inference payload');
+      if (
+        !Array.isArray(data.messages) ||
+        data.messages.length !== 2 ||
+        data.messages[0]?.role !== 'system' ||
+        !isRestrictedReviewSystem(data.messages[0]?.content) ||
+        data.messages[1]?.role !== 'user' ||
+        typeof data.messages[1]?.content !== 'string'
+      )
+        throw new Error('restricted review system policy missing or changed');
       // This bound is not proof of server context capacity. Admission remains closed.
     } else throw new Error('restricted review request path or method rejected');
     const response = await upstream(request, { redirect: 'error', signal: request.signal });
