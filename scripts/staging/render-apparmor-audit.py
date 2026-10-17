@@ -5,7 +5,7 @@ import re
 import sys
 
 name = sys.argv[1]
-if not re.fullmatch(r"teetime-probe-audit-[0-9]+-[0-9]+", name):
+if not re.fullmatch(r"teetime-probe-(audit|mount)-[0-9]+-[0-9]+", name):
     raise SystemExit("invalid owned audit profile name")
 source = Path(__file__).with_name("moby-apparmor-template.go").read_bytes()
 if hashlib.sha256(source).hexdigest() != "7da15d81aa5c507f5002b844fdc49a969904681447a2cc29222bd6cbe797163b":
@@ -19,6 +19,8 @@ template = template.replace('{{.PeerName}}', '"' + name + '"')
 template = template.replace('{{.DaemonProfile}}', 'unconfined')
 if '{{' in template or template.count('  deny mount,') != 1:
     raise SystemExit("unexpected pinned template structure")
-audited = template.replace('  deny mount,', '  audit deny mount,')
-assert audited.replace('  audit deny mount,', '  deny mount,') == template
+rule = ('  audit mount options=(rw,silent,rslave) -> /,'
+        if name.startswith('teetime-probe-mount-') else '  audit deny mount,')
+audited = template.replace('  deny mount,', rule)
+assert audited.replace(rule, '  deny mount,') == template
 sys.stdout.write(audited)

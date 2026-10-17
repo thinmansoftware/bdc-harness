@@ -24,7 +24,7 @@ def main():
         parser.error("--hostile-project requires --kind configuration")
     if args.isolated_network and args.kind != "sandbox":
         parser.error("--isolated-network requires --kind sandbox")
-    if args.apparmor_profile and not re.fullmatch(r"teetime-probe-audit-[0-9]+-[0-9]+", args.apparmor_profile):
+    if args.apparmor_profile and not re.fullmatch(r"teetime-probe-(audit|mount)-[0-9]+-[0-9]+", args.apparmor_profile):
         parser.error("only an owned diagnosis profile is supported")
     root = Path(__file__).resolve().parent
     profile = root / "codex-probe-seccomp.json"

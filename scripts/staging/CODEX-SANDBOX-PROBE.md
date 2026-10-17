@@ -121,3 +121,11 @@ containers and verifies none remain before unloading. A cleanup failure retains 
 profile. The docker-default profile, host sysctls and shared services are untouched.
 Cleanup ownership/failure behavior has three deterministic tests. This is diagnosis,
 not a mount allowance or permission to start a model.
+
+The audit-only run38984030965 captured an actual denied mount at `/` with
+`rw, silent, rslave`. The separately named `teetime-probe-mount-*` diagnostic candidate
+replaces the blanket mount denial with exactly
+`audit mount options=(rw,silent,rslave) -> /,`. All other baseline rules remain;
+unmatched mounts remain denied. This single independently reviewed allowance is only
+for the disposable CI diagnostic. It does not change the default sandbox test or
+admit a credentialed worker. Parser success and new audit evidence are still required.
