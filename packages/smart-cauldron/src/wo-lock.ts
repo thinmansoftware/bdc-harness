@@ -23,7 +23,12 @@ async function withMutationGuard<T>(filePath: string, mutate: () => Promise<T>):
       await writeFile(guardPath, '', { encoding: 'utf8', flag: 'wx' });
       break;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const code = (error as NodeJS.ErrnoException).code;
+      // Windows may briefly refuse exclusive creation while another handle closes.
+      // A retry grants no ownership: only a successful wx permits mutation/cleanup.
+      const retryablePermission =
+        process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES');
+      if (code !== 'EEXIST' && !retryablePermission) throw error;
       if (performance.now() >= deadline) throw new Error('smart_cauldron_wo_lock_busy');
       await new Promise<void>(resolve => setTimeout(resolve, 10));
     }

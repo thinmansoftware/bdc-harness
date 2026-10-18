@@ -22,6 +22,99 @@ async function makeOutDir(): Promise<string> {
 }
 
 describe('wo-lock', () => {
+  test.each([
+    ['win32', 'EPERM', 'transient', true],
+    ['win32', 'EACCES', 'transient', true],
+    ['win32', 'EPERM', 'persistent', false],
+    ['win32', 'EACCES', 'persistent', false],
+    ['win32', 'EPERM', 'foreign', false],
+    ['win32', 'EIO', 'transient', false],
+    ['linux', 'EPERM', 'transient', false],
+    ['linux', 'EACCES', 'transient', false],
+  ] as const)(
+    '%s %s guard creation %s preserves exclusive ownership',
+    async (platform, code, mode, succeeds) => {
+      const outDir = await makeOutDir();
+      const first = await acquireWoLock('WO-LOCK-01', 'shopops', 'prior', outDir);
+      await releaseWoLock('WO-LOCK-01', 'shopops', 'prior', outDir, first.executionToken!);
+      const original = await readFile(first.path, 'utf8');
+      const guardPath = `${first.path}.mutation-guard`;
+      if (mode === 'foreign') await writeFile(guardPath, 'foreign-owner', { flag: 'wx' });
+      const url = pathToFileURL(join(import.meta.dir, '../wo-lock.ts')).href;
+      const child = Bun.spawn(
+        [
+          process.execPath,
+          '-e',
+          `
+          import { mock } from 'bun:test';
+          const fs = await import('fs/promises');
+          const write = fs.writeFile;
+          const unlink = fs.unlink;
+          let attempts = 0, metadataWrites = 0, guardUnlinks = 0;
+          Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} });
+          mock.module('fs/promises', () => ({ ...fs,
+            writeFile: async (...args) => {
+              if (String(args[0]).endsWith('.mutation-guard')) {
+                attempts++;
+                if (args[2]?.flag !== 'wx') throw new Error('not-exclusive');
+                if (${JSON.stringify(mode)} === 'persistent' || attempts <= 2 && ${JSON.stringify(mode)} !== 'foreign' || attempts === 1 && ${JSON.stringify(mode)} === 'foreign')
+                  throw Object.assign(new Error('injected-guard-error'), { code: ${JSON.stringify(code)} });
+              } else metadataWrites++;
+              return write(...args);
+            },
+            unlink: async (...args) => { guardUnlinks++; return unlink(...args); },
+          }));
+          const { acquireWoLock } = await import(${JSON.stringify(url)});
+          const start = performance.now();
+          let acquired = false, error = null;
+          try { acquired = (await acquireWoLock('WO-LOCK-01', 'shopops', 'next', ${JSON.stringify(outDir)})).acquired; }
+          catch (e) { error = e.code ?? e.message; }
+          console.log(JSON.stringify({ acquired, error, attempts, metadataWrites, guardUnlinks, elapsed: performance.now() - start }));
+        `,
+        ],
+        { stdout: 'pipe', stderr: 'pipe' }
+      );
+      let completionTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const [exit, stdout, stderr] = await Promise.race([
+          Promise.all([
+            child.exited,
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+          ]),
+          new Promise<never>((_, reject) => {
+            completionTimer = setTimeout(() => reject(new Error('guard child timed out')), 10000);
+          }),
+        ]);
+        expect(exit, stderr).toBe(0);
+        const result = JSON.parse(stdout.trim());
+        expect(result.acquired).toBe(succeeds);
+        if (succeeds) {
+          expect(result.attempts).toBe(3);
+          expect(result.error).toBeNull();
+          expect(result.guardUnlinks).toBe(1);
+          expect(JSON.parse(await readFile(first.path, 'utf8')).cascadeId).toBe('next');
+        } else {
+          expect(result.metadataWrites).toBe(0);
+          expect(result.guardUnlinks).toBe(0);
+          expect(await readFile(first.path, 'utf8')).toBe(original);
+          const waits = platform === 'win32' && code !== 'EIO';
+          expect(result.error).toBe(waits ? 'smart_cauldron_wo_lock_busy' : code);
+          if (waits) {
+            expect(result.attempts).toBeGreaterThan(1);
+            expect(result.elapsed).toBeGreaterThanOrEqual(2000);
+          } else expect(result.attempts).toBe(1);
+        }
+        if (mode === 'foreign') expect(await readFile(guardPath, 'utf8')).toBe('foreign-owner');
+      } finally {
+        clearTimeout(completionTimer);
+        if (child.exitCode === null) child.kill();
+        await child.exited;
+      }
+    },
+    15000
+  );
+
   test('settlement observation requires exact released generation and never repairs evidence', async () => {
     const outDir = await makeOutDir();
     expect(await isWoExecutionSettled('WO-LOCK-01', 'shopops', 'prior', outDir)).toBe(false);
