@@ -88,15 +88,37 @@ export function isContentCompleteNudgeBody(body: string): boolean {
 const BLOCKER_REPORT_TITLE_RE = /"[^"]+"/;
 const BLOCKER_REPORT_OWNER_RE = /\bowner:\s*\S+/i;
 const BLOCKER_REPORT_BLOCKED_RE = /\bBlocked:\s*\S/i;
-const BLOCKER_REPORT_URL_RE = /https:\/\/github\.com\/\S+/i;
+// Match the same owner/repo/positive-number shape as the GitHub thread-ref parser.
+const BLOCKER_REPORT_ISSUE_PATH_RE =
+  /^\/[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\/[A-Za-z0-9_.-]+\/issues\/[1-9][0-9]*$/;
 const BLOCKER_REPORT_DURATION_RE = /\bfor\s+\d+\s*(?:h|days?)\b/i;
+
+function hasGitHubIssueUrl(body: string): boolean {
+  // The composer emits a complete whitespace-delimited URL. Do not count GitHub
+  // text embedded in another URL's host, path, query or fragment as that URL.
+  return body.split(/\s+/).some(token => {
+    try {
+      const url = new URL(token);
+      return (
+        url.protocol === 'https:' &&
+        url.hostname === 'github.com' &&
+        url.username === '' &&
+        url.password === '' &&
+        url.port === '' &&
+        BLOCKER_REPORT_ISSUE_PATH_RE.test(url.pathname)
+      );
+    } catch {
+      return false;
+    }
+  });
+}
 
 export function isContentCompleteBlockerReportBody(body: string): boolean {
   return (
     BLOCKER_REPORT_TITLE_RE.test(body) &&
     BLOCKER_REPORT_OWNER_RE.test(body) &&
     BLOCKER_REPORT_BLOCKED_RE.test(body) &&
-    BLOCKER_REPORT_URL_RE.test(body) &&
+    hasGitHubIssueUrl(body) &&
     BLOCKER_REPORT_DURATION_RE.test(body)
   );
 }
