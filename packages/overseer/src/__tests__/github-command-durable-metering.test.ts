@@ -22,19 +22,16 @@ test('real CLI processes persist request counts and refuse an exhausted shared p
   };
   const driver = join(import.meta.dir, '../../../../scripts/github-service-exec.ts');
   const run = (code: string): ReturnType<typeof Bun.spawnSync> =>
-    Bun.spawnSync(
-      {
-        cmd: [process.execPath, driver, 'run_nodes', process.execPath, '-e', code],
-        env,
-        stdin: new Uint8Array(),
-        stdout: 'pipe',
-        stderr: 'pipe',
-        // Each real CLI initializes an owned SQLite database before its command.
-        // Bound both children explicitly within the integration-test budget.
-        timeout: 20_000,
-      },
-      45_000
-    );
+    Bun.spawnSync({
+      cmd: [process.execPath, driver, 'run_nodes', process.execPath, '-e', code],
+      env,
+      stdin: new Uint8Array(),
+      stdout: 'pipe',
+      stderr: 'pipe',
+      // Each real CLI initializes an owned SQLite database before its command.
+      // Bound both children explicitly within the integration-test budget.
+      timeout: 20_000,
+    });
   let db: SqliteAdapter | undefined;
   let databaseSpy: ReturnType<typeof spyOn> | undefined;
   try {
@@ -122,6 +119,6 @@ test('real CLI processes persist request counts and refuse an exhausted shared p
     Bun.gc(true);
     rmSync(home, { recursive: true, force: true });
   }
-  // Two real CLI subprocesses initialize independent databases. Match the
-  // package's 30-second integration-test budget on slower Windows runners.
-}, 30_000);
+  // Two bounded real CLI subprocesses initialize independent databases.
+  // Leave room for both child limits and the parent's database assertions.
+}, 45_000);
