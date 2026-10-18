@@ -1,7 +1,7 @@
 #!/bin/sh
 # This extensionless executable must remain LF-only; see the repository attributes.
 # Refuse pull-request mutations from builder nodes: pr create, pr merge,
-# pr ready, and gh api POST/PATCH/PUT to a path containing /pulls.
+# pr ready, and gh api explicit or implicit POST/PATCH/PUT to /pulls paths.
 # Every other gh invocation execs the next gh on PATH. The shim directory is
 # removed from PATH first so this script cannot recurse. ASCII only. Exit 3
 # on a refusal. No external commands before that exec: a builder PATH may
@@ -37,7 +37,7 @@ refuse() {
 
 is_mutating_method() {
   case "$1" in
-    POST|PATCH|PUT|post|patch|put|Post|Patch|Put) return 0 ;;
+    [Pp][Oo][Ss][Tt]|[Pp][Aa][Tt][Cc][Hh]|[Pp][Uu][Tt]) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -50,21 +50,69 @@ fi
 
 if [ "${1:-}" = "api" ]; then
   method=""
-  prev=""
-  path_has_pulls=0
+  payload=0
+  endpoint=""
+  value_for=""
+  end_options=0
+  first=1
   for arg in "$@"; do
-    case "$prev" in
-      -X|--method) method=$arg ;;
-    esac
+    if [ "$first" = 1 ]; then
+      first=0
+      continue
+    fi
+    if [ -n "$value_for" ]; then
+      if [ "$value_for" = method ]; then method=$arg; fi
+      value_for=""
+      continue
+    fi
+    if [ "$end_options" = 1 ]; then
+      if [ -z "$endpoint" ]; then endpoint=$arg; fi
+      continue
+    fi
     case "$arg" in
+      --) end_options=1 ;;
+      --method) value_for=method ;;
       --method=*) method=${arg#--method=} ;;
-      */pulls*) path_has_pulls=1 ;;
+      --field|--raw-field|--input) payload=1; value_for=skip ;;
+      --field=*|--raw-field=*|--input=*) payload=1 ;;
+      --header|--jq|--template|--preview|--hostname|--cache) value_for=skip ;;
+      --*) ;; # Other long options do not consume endpoint arguments.
+      -?*)
+        # pflag accepts short clusters and attached values, e.g. -iXPOST.
+        short=${arg#-}
+        while [ -n "$short" ]; do
+          flag=${short%"${short#?}"}
+          short=${short#?}
+          case "$flag" in
+            i|h)
+              # An explicit boolean value is not another short-option cluster.
+              case "$short" in =*) short="" ;; esac
+              ;;
+            X|f|F|H|q|t|p)
+              if [ "$flag" = f ] || [ "$flag" = F ]; then payload=1; fi
+              if [ -n "$short" ]; then
+                value=${short#=}
+                if [ "$flag" = X ]; then method=$value; fi
+                short=""
+              elif [ "$flag" = X ]; then
+                value_for=method
+              else
+                value_for=skip
+              fi
+              ;;
+          esac
+        done
+        ;;
+      *) if [ -z "$endpoint" ]; then endpoint=$arg; fi ;;
     esac
-    prev=$arg
   done
-  if [ "$path_has_pulls" = 1 ] && is_mutating_method "$method"; then
-    refuse
+  # Explicit --method wins regardless of where payload options occurred.
+  if [ -z "$method" ]; then
+    if [ "$payload" = 1 ]; then method=POST; else method=GET; fi
   fi
+  case "$endpoint" in
+    */pulls*) if is_mutating_method "$method"; then refuse; fi ;;
+  esac
 fi
 
 next_gh=$(command -v gh 2>/dev/null || true)

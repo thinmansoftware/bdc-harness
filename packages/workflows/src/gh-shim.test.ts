@@ -5,15 +5,39 @@ import { delimiter, dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 
 const SHIM = join(import.meta.dir, 'shims', 'gh');
+// Optional local Windows proof executes the unchanged POSIX shim through Git Bash.
+const POSIX_SHELL =
+  process.platform === 'win32' ? process.env.ARCHON_GH_SHIM_TEST_SHELL : undefined;
+const CAN_EXECUTE = process.platform !== 'win32' || Boolean(POSIX_SHELL);
+function shellPath(path: string): string {
+  return POSIX_SHELL
+    ? path
+        .replace(/\\/g, '/')
+        .replace(/^([A-Za-z]):/, (_, drive: string) => `/${drive.toLowerCase()}`)
+    : path;
+}
 
 function runShim(
   args: string[],
   pathEnv: string
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(SHIM, args, {
-      env: { ...process.env, PATH: pathEnv },
-    });
+    const child = POSIX_SHELL
+      ? spawn(
+          POSIX_SHELL,
+          [
+            '--noprofile',
+            '--norc',
+            '-c',
+            'PATH=$1; export PATH; shift; exec /bin/sh "$@"',
+            'gh-shim-test',
+            pathEnv,
+            shellPath(SHIM),
+            ...args,
+          ],
+          { env: process.env }
+        )
+      : spawn(SHIM, args, { env: { ...process.env, PATH: pathEnv } });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -37,7 +61,7 @@ describe('gh shim denies pull request mutations', () => {
     expect(source.startsWith('#!/bin/sh\n')).toBe(true);
   });
 
-  test.skipIf(process.platform === 'win32')(
+  test.skipIf(!CAN_EXECUTE)(
     'blocks pr create, merge, ready, and mutating api pulls calls',
     async () => {
       const fakeDir = await mkdtemp(join(tmpdir(), 'gh-shim-'));
@@ -45,19 +69,57 @@ describe('gh shim denies pull request mutations', () => {
       await writeFile(fakeGh, '#!/bin/sh\necho "FAKE $*"\nexit 0\n');
       await chmod(fakeGh, 0o755);
       await chmod(SHIM, 0o755);
-      const pathEnv = `${dirname(SHIM)}${delimiter}${fakeDir}`;
+      const pathEnv = [dirname(SHIM), fakeDir].map(shellPath).join(POSIX_SHELL ? ':' : delimiter);
 
       const blocked = [
         ['pr', 'create', '--title', 'x'],
         ['pr', 'merge', '1'],
         ['pr', 'ready', '1'],
         ['api', '-X', 'POST', 'repos/o/r/pulls'],
+        ['api', 'repos/o/r/pulls', '-f', 'title=x'],
+        ['api', 'repos/o/r/pulls', '--raw-field', 'title=x'],
+        ['api', 'repos/o/r/pulls', '--raw-field=title=x'],
+        ['api', 'repos/o/r/pulls', '-ftitle=x'],
+        ['api', '-F', 'draft=true', 'repos/o/r/pulls'],
+        ['api', '--field=draft=true', 'repos/o/r/pulls'],
+        ['api', '-Fdraft=true', 'repos/o/r/pulls'],
+        ['api', 'repos/o/r/pulls', '--input', 'body.json'],
+        ['api', 'repos/o/r/pulls', '--input=body.json'],
+        ['api', 'repos/o/r/pulls', '--input', '-'],
+        ['api', '-XPOST', 'repos/o/r/pulls'],
+        ['api', '-X=POST', 'repos/o/r/pulls'],
+        ['api', '-iXPOST', 'repos/o/r/pulls'],
+        ['api', '-iftitle=x', 'repos/o/r/pulls'],
+        ['api', '-iFdraft=true', 'repos/o/r/pulls'],
+        ['api', '-X', 'GET', '--method', 'POST', 'repos/o/r/pulls'],
+        ['api', '-f', 'title=x', '--', 'repos/o/r/pulls'],
+        ['api', '--method=PATCH', 'repos/o/r/pulls/1'],
       ];
       for (const args of blocked) {
         const result = await runShim(args, pathEnv);
         expect(result.code).toBe(3);
         expect(result.stderr).toContain('denied');
         expect(result.stdout).not.toContain('FAKE');
+      }
+
+      for (const args of [
+        ['api', 'repos/o/r/pulls'],
+        ['api', '-i=false', 'repos/o/r/pulls'],
+        ['api', '-i=true', 'repos/o/r/pulls'],
+        ['api', '-i=false', '-fstate=open', '-XGET', 'repos/o/r/pulls'],
+        ['api', '-X', 'GET', 'repos/o/r/pulls', '-f', 'state=open'],
+        ['api', 'repos/o/r/pulls', '--input=body.json', '--method=GET'],
+        ['api', 'repos/o/r/issues', '-f', 'title=x'],
+        ['api', '--method=POST', '-XGET', 'repos/o/r/pulls', '-Fstate=open'],
+        ['api', '-iXGET', 'repos/o/r/pulls', '-fstate=open'],
+        ['api', 'repos/o/r/issues', '-f', 'body=/pulls'],
+        ['api', '-H', 'X-Fixture: /pulls', '-X', 'POST', 'repos/o/r/issues'],
+        ['api', '--jq=/pulls', '-XPOST', 'repos/o/r/issues'],
+        ['api', '-t', '/pulls', '-XPOST', 'repos/o/r/issues'],
+      ]) {
+        const result = await runShim(args, pathEnv);
+        expect(result.code).toBe(0);
+        expect(result.stdout.trim()).toBe(`FAKE ${args.join(' ')}`);
       }
 
       const view = await runShim(['pr', 'view', '1'], pathEnv);
