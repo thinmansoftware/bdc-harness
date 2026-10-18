@@ -3975,7 +3975,8 @@ nodes:
         else
           COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
         fi
-        if [ "$COMMITS_AHEAD" = "0" ]; then
+        # An authorized repair destination must never be retargeted by SHA matching.
+        if [ "$COMMITS_AHEAD" = "0" ] && [ -z "${REPAIR_TARGET_PR:-}" ]; then
           # F-7C: origin/${UNIQUE_BRANCH} may be missing because the implement
           # loop already pushed to a different remote branch (e.g. the engine's
           # archon/thread-<hash> ref). Search git ls-remote origin for any ref
@@ -4007,6 +4008,8 @@ nodes:
             echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
             exit 1
           fi
+        elif [ "$COMMITS_AHEAD" = "0" ]; then
+          echo "Repair target ${UNIQUE_BRANCH} already contains HEAD; preserving authorized destination."
         else
           echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
         fi
