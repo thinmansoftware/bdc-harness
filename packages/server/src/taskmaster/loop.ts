@@ -176,6 +176,9 @@ type TaskmasterDal = Pick<
       | 'getExpectationByRegistrationKey'
       | 'listPendingFireActions'
       | 'transitionPendingFireAction'
+      | 'claimFireLaunch'
+      | 'releaseFireLaunch'
+      | 'listFireLaunchClaims'
       | 'getExpectationCounts'
     >
   >;
@@ -1581,6 +1584,39 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     log.warn('taskmaster.pending_fire_read_failed');
   }
 
+  // Sent proves run identity, not that the cascade has stopped owning work.
+  try {
+    if (!dal.listFireLaunchClaims) throw new Error('launch claim reader unavailable');
+    for (const action of await dal.listFireLaunchClaims()) {
+      try {
+        const metadata = taskmasterDb.fireLaunchMetadata(action);
+        const launch = metadata.launch;
+        if (launch?.state !== 'active') throw new Error('launch identity unknown');
+        let released = false;
+        try {
+          const bound = await readFireEvidence({
+            cascadeId: launch.cascadeId,
+            woId: metadata.woId,
+            project: metadata.project,
+          });
+          if (bound.settled === true)
+            released =
+              (await dal.releaseFireLaunch?.(action, launch.token, 'settled-cascade')) === true;
+        } catch {
+          /* UNKNOWN retains ownership, regardless of elapsed time. */
+        }
+        if (!released) pendingFireScopes.add(fireScopeKey(metadata.woId, metadata.project));
+      } catch {
+        unknownFireScope = true;
+        log.warn({ journalId: action.id }, 'taskmaster.fire_launch_scope_unknown');
+      }
+    }
+  } catch {
+    unknownFireScope = true;
+    tickFailures += 1;
+    log.warn('taskmaster.fire_launch_read_failed');
+  }
+
   // 3. Dispatch restart reconciliation (fire actions use exact cascade custody).
   if (!state.reconciled) {
     state.reconciled = true;
@@ -2118,7 +2154,26 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
     // ROW FIRST, always -- then the effect.
     let journalRow: taskmasterDb.TmJournalEntry;
-    if (existingAction && retrying) {
+    let fireLaunchToken: string | undefined;
+    if (proposal.type === 'fire_cauldron') {
+      const claimed = await dal.claimFireLaunch?.({
+        thread_ref: proposal.threadRef,
+        proposal_json: JSON.stringify({ ...proposal, cascadeId: proposal.idempotencyKey }),
+        idempotency_key: proposal.idempotencyKey,
+        before_hash: sha256(proposal.body),
+        proof_predicate: proofPredicate(proposal),
+        proof_deadline_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+        expectedEpoch: epoch,
+      });
+      if (claimed?.status !== 'claimed') {
+        if (claimed?.status === 'paused') result.parked += 1;
+        else if (claimed?.status === 'stale') result.expired += 1;
+        else result.deferred += 1;
+        continue;
+      }
+      journalRow = claimed.row;
+      fireLaunchToken = claimed.token;
+    } else if (existingAction && retrying) {
       const reused = await dal.updateActionOutcome(existingAction.id, 'pending');
       if (!reused) throw new Error(`taskmaster_retry_row_missing:${existingAction.id}`);
       journalRow = reused;
@@ -2126,11 +2181,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       journalRow = await dal.recordAction({
         thread_ref: proposal.threadRef,
         action_type: proposal.type,
-        proposal_json: JSON.stringify(
-          proposal.type === 'fire_cauldron'
-            ? { ...proposal, cascadeId: proposal.idempotencyKey }
-            : proposal
-        ),
+        proposal_json: JSON.stringify(proposal),
         idempotency_key: proposal.idempotencyKey,
         before_hash: sha256(proposal.body),
         proof_predicate: proofPredicate(proposal),
@@ -2151,6 +2202,14 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         fresh.pause_scope
       );
     if (fresh.epoch !== epoch || freshPauseWithhold) {
+      if (proposal.type === 'fire_cauldron') {
+        if (
+          fireLaunchToken &&
+          (await dal.releaseFireLaunch?.(journalRow, fireLaunchToken, 'aborted-before-invoke'))
+        )
+          result.expired += 1;
+        continue;
+      }
       // A pause that landed mid-tick (fresh scope withholds this effect) is a
       // pause-park, not an ordinary stale-epoch/resume expiry: re-tag the
       // ROW-FIRST row as parked with reason='paused' so it is indistinguishable
@@ -2297,21 +2356,10 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             admitted.attempts.length === 0 &&
             (admitted.status === 'refused' || admitted.status === 'blocked')
           ) {
-            const expired = JSON.stringify({
-              ...custody.proposal,
-              cascadeId: custody.identity.cascadeId,
-              noFireReason: admitted.status,
-            });
             if (
-              await dal.transitionPendingFireAction?.(
-                journalRow.id,
-                journalRow.proposal_json,
-                'expired',
-                expired
-              )
+              fireLaunchToken &&
+              (await dal.releaseFireLaunch?.(journalRow, fireLaunchToken, 'verified-no-fire'))
             ) {
-              journalRow.outcome = 'expired';
-              journalRow.proposal_json = expired;
               result.expired += 1;
             }
             continue;
@@ -2380,8 +2428,12 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         'taskmaster.effect_sent'
       );
     } catch (error) {
-      await dal.updateActionOutcome(journalRow.id, 'failed');
-      journalRow.outcome = 'failed';
+      if (proposal.type === 'fire_cauldron') {
+        await retainFireHold(journalRow, dal, 'admission-uncertain');
+      } else {
+        await dal.updateActionOutcome(journalRow.id, 'failed');
+        journalRow.outcome = 'failed';
+      }
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
     }

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { pathToFileURL } from 'url';
 import { SqliteAdapter } from './adapters/sqlite';
 import { Database } from 'bun:sqlite';
 
@@ -46,6 +47,9 @@ import {
   expectationKeyExists,
   listDueExpectations,
   listPendingFireActions,
+  claimFireLaunch,
+  releaseFireLaunch,
+  listFireLaunchClaims,
   transitionPendingFireAction,
   getExpectationByRegistrationKey,
   expectationRegistrationKey,
@@ -63,6 +67,218 @@ import {
   upsertHealthSample,
   type TmAdoptionRow,
 } from './taskmaster';
+
+describe('durable fire launch grants', () => {
+  function input(key: string, project = 'bdc-harness') {
+    return {
+      thread_ref: 'gh:thinmansoftware/bdc-harness#700',
+      proposal_json: JSON.stringify({
+        type: 'fire_cauldron',
+        idempotencyKey: key,
+        recipient: 'operator',
+        fireEvidence: { woId: 'WO-HARNESS-CUSTODY-01', project },
+      }),
+      idempotency_key: key,
+      before_hash: 'before',
+      proof_predicate: 'actual run',
+      proof_deadline_at: new Date(Date.now() + 86400000).toISOString(),
+      expectedEpoch: 0,
+    };
+  }
+
+  test.each(['same-key', 'different-buckets'])('%s has exactly one grant', async mode => {
+    const results = await Promise.all(
+      Array.from({ length: 6 }, (_, i) =>
+        claimFireLaunch(input(mode === 'same-key' ? 'one-key' : `bucket-${i}`))
+      )
+    );
+    expect(results.filter(result => result.status === 'claimed')).toHaveLength(1);
+    expect(results.filter(result => result.status === 'held')).toHaveLength(5);
+    expect(await listFireLaunchClaims()).toHaveLength(1);
+  });
+
+  test.each(['same-key', 'different-buckets'])(
+    'separate SQLite processes: %s grants once',
+    async mode => {
+      await getPauseState(); // Finish schema installation before independent children attach.
+      const moduleUrl = (name: string) => pathToFileURL(join(import.meta.dir, name)).href;
+      const children = [0, 1].map(i => {
+        const script = `
+        import { mock } from 'bun:test';
+        const { SqliteAdapter } = await import(${JSON.stringify(moduleUrl('adapters/sqlite.ts'))});
+        const db = new SqliteAdapter(${JSON.stringify(currentDbPath)});
+        mock.module(${JSON.stringify(moduleUrl('connection.ts'))}, () => ({ getDatabase: () => db }));
+        const { claimFireLaunch } = await import(${JSON.stringify(moduleUrl('taskmaster.ts'))});
+        try {
+          await db.query('SELECT 1');
+          console.log('READY');
+          for await (const chunk of Bun.stdin.stream()) { break; }
+          console.log('RESULT:' + (await claimFireLaunch(${JSON.stringify(input(mode === 'same-key' ? 'child-key' : `child-key-${i}`))})).status);
+        } finally { await db.close(); }
+      `;
+        return Bun.spawn([process.execPath, '-e', script], {
+          cwd: import.meta.dir,
+          stdin: 'pipe',
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+      });
+      try {
+        const readers = children.map(child => child.stdout.getReader());
+        const prefixes = await Promise.all(
+          readers.map(async reader => {
+            let output = '';
+            while (!output.includes('READY\n')) {
+              const next = await reader.read();
+              if (next.done) throw new Error(`launch child exited before READY: ${output}`);
+              output += new TextDecoder().decode(next.value);
+            }
+            return output;
+          })
+        );
+        for (const child of children) {
+          child.stdin.write('go\n');
+          child.stdin.end();
+        }
+        const outputs = await Promise.all(
+          readers.map(async (reader, i) => {
+            let output = prefixes[i]!;
+            for (;;) {
+              const next = await reader.read();
+              if (next.done) return output;
+              output += new TextDecoder().decode(next.value);
+            }
+          })
+        );
+        const exits = await Promise.all(children.map(child => child.exited));
+        const errors = await Promise.all(children.map(child => new Response(child.stderr).text()));
+        expect(exits, errors.join('\n')).toEqual([0, 0]);
+        expect(outputs.map(output => /RESULT:(\w+)/.exec(output)?.[1]).sort()).toEqual([
+          'claimed',
+          'held',
+        ]);
+        expect(await listFireLaunchClaims()).toHaveLength(1);
+      } finally {
+        for (const child of children) if (child.exitCode === null) child.kill();
+        await Promise.all(children.map(child => child.exited));
+      }
+    },
+    30000
+  );
+
+  test('different projects remain independent; sent retains ownership across old time and reset', async () => {
+    const first = await claimFireLaunch(input('first'));
+    expect(first.status).toBe('claimed');
+    if (first.status !== 'claimed') throw new Error('missing first grant');
+    await updateActionOutcome(first.row.id, 'sent');
+    await db.query('UPDATE tm_journal SET created_at = $1 WHERE id = $2', [
+      '2000-01-01T00:00:00.000Z',
+      first.row.id,
+    ]);
+    await resetTaskmaster({ actor: 'test', reason: 'test' });
+    expect((await claimFireLaunch(input('later'))).status).toBe('held');
+    expect((await claimFireLaunch(input('another-project', 'other-project'))).status).toBe(
+      'claimed'
+    );
+    expect(await listFireLaunchClaims()).toHaveLength(2);
+  });
+
+  test('positive no-fire release permits new key, stale token and stale metadata cannot release', async () => {
+    const first = await claimFireLaunch(input('first'));
+    if (first.status !== 'claimed') throw new Error('missing first grant');
+    expect(await releaseFireLaunch(first.row, 'stale-token', 'verified-no-fire')).toBe(false);
+    const stale = { ...first.row };
+    await updateActionOutcome(
+      first.row.id,
+      'pending',
+      JSON.stringify({ ...JSON.parse(first.row.proposal_json), fireHoldReason: 'unknown' })
+    );
+    expect(await releaseFireLaunch(stale, first.token, 'verified-no-fire')).toBe(false);
+    const current = (await getActionByIdempotencyKey('first'))!;
+    expect(await releaseFireLaunch(current, first.token, 'verified-no-fire')).toBe(true);
+    expect((await claimFireLaunch(input('first'))).status).toBe('held');
+    expect((await claimFireLaunch(input('second'))).status).toBe('claimed');
+  });
+
+  test('pause and epoch fencing create no launch row', async () => {
+    await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects', pause_actor: 'test' });
+    expect((await claimFireLaunch(input('paused'))).status).toBe('paused');
+    expect((await claimFireLaunch({ ...input('stale'), expectedEpoch: 99 })).status).toBe('stale');
+    expect(
+      (await getActionsSince(new Date(0).toISOString())).filter(
+        row => row.action_type === 'fire_cauldron'
+      )
+    ).toHaveLength(0);
+  });
+
+  test('failed transaction grants nothing and rolls back journal metadata', async () => {
+    await db.query(`CREATE TRIGGER reject_fire_launch BEFORE INSERT ON tm_journal
+      WHEN NEW.action_type = 'fire_cauldron' BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END`);
+    await expect(claimFireLaunch(input('rejected'))).rejects.toThrow('fixture rejection');
+    expect(await listFireLaunchClaims()).toHaveLength(0);
+    await db.query('DROP TRIGGER reject_fire_launch');
+    expect((await claimFireLaunch(input('after-rollback'))).status).toBe('claimed');
+  });
+
+  test('malformed deferred deadline never grants launch ownership', async () => {
+    const original = input('deferred');
+    await recordAction({
+      ...original,
+      action_type: 'fire_cauldron',
+      outcome: 'deferred',
+      proof_deadline_at: 'invalid',
+    });
+    expect((await claimFireLaunch(original)).status).toBe('stale');
+    expect(await listFireLaunchClaims()).toHaveLength(0);
+  });
+
+  test('legacy sent without a launch marker cannot prove its scope is free', async () => {
+    await recordAction({ ...input('legacy'), action_type: 'fire_cauldron', outcome: 'sent' });
+    expect((await claimFireLaunch(input('later-same-scope'))).status).toBe('held');
+    expect((await claimFireLaunch(input('independent', 'other-project'))).status).toBe('claimed');
+  });
+
+  test('malformed unresolved scope globally holds; never creates another journal row', async () => {
+    await recordAction({
+      thread_ref: 'unknown',
+      action_type: 'fire_cauldron',
+      proposal_json: '{',
+      outcome: 'pending',
+    });
+    expect((await claimFireLaunch(input('next'))).status).toBe('held');
+    expect(await listFireLaunchClaims()).toHaveLength(1);
+  });
+
+  test.each(['project', 'woId', 'recipient', 'spec'])(
+    'deferred immutable %s drift never grants or corrupts custody',
+    async field => {
+      const original = input('deferred');
+      const deferred = await recordAction({
+        ...original,
+        action_type: 'fire_cauldron',
+        outcome: 'deferred',
+      });
+      const candidate = input('deferred');
+      const proposal = JSON.parse(candidate.proposal_json);
+      if (field === 'recipient') proposal.recipient = 'xo';
+      else if (field === 'spec')
+        proposal.fireEvidence.expectedSpec = {
+          specSource: 'new',
+          specRevision: 'new',
+          specHash: 'new',
+        };
+      else
+        proposal.fireEvidence[field] =
+          field === 'project' ? 'other-project' : 'WO-HARNESS-OTHER-01';
+      candidate.proposal_json = JSON.stringify(proposal);
+      expect((await claimFireLaunch(candidate)).status).toBe('held');
+      expect((await getActionByIdempotencyKey('deferred'))?.proposal_json).toBe(
+        deferred.proposal_json
+      );
+      expect(await listFireLaunchClaims()).toHaveLength(0);
+    }
+  );
+});
 
 describe('tm_expectations DAL', () => {
   test('a fresh database creates tm_expectations with the unique index and escalating', async () => {

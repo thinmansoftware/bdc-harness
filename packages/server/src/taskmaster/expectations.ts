@@ -63,6 +63,7 @@ export async function readCascadeWorkflowEvidence(
   completedRunId: string | null;
   status: string;
   prOpened: boolean;
+  settled?: boolean;
 }> {
   try {
     if (
@@ -80,6 +81,7 @@ export async function readCascadeWorkflowEvidence(
         getDatabase().query<T>(sql, params));
     const visited = new Set<string>();
     const runs = new Map<string, string>();
+    let settled = true;
     let cascadeId: string | null = identity.cascadeId;
     while (cascadeId !== null) {
       // Follow explicit approval links only; bounded even for corrupted records.
@@ -95,10 +97,24 @@ export async function readCascadeWorkflowEvidence(
         !Array.isArray(record.attempts)
       )
         throw new Error('invalid cascade scope');
+      if (
+        ![
+          'won',
+          'blocked',
+          'refused',
+          'cancelled',
+          'frontier-rejected',
+          'frontier-approved',
+        ].includes(record.status)
+      )
+        settled = false;
       for (const attempt of record.attempts) {
         if (!attempt || typeof attempt.workflowName !== 'string' || !attempt.workflowName)
           throw new Error('invalid attempt');
-        if (attempt.runId === null) continue;
+        if (attempt.runId === null) {
+          settled = false; // A timed-out discovery may still own provider work.
+          continue;
+        }
         if (typeof attempt.runId !== 'string' || !attempt.runId.trim())
           throw new Error('invalid run id');
         const prior = runs.get(attempt.runId);
@@ -116,6 +132,22 @@ export async function readCascadeWorkflowEvidence(
       const resume: unknown = record.frontierApproval?.resumeCascadeId;
       if (resume !== undefined && resume !== null && (typeof resume !== 'string' || !resume.trim()))
         throw new Error('invalid resume');
+      if (
+        record.status === 'frontier-approved' &&
+        (record.frontierApproval?.resolution !== 'approved' || typeof resume !== 'string')
+      )
+        settled = false;
+      if (
+        record.frontierApproval &&
+        !(
+          (record.frontierApproval.resolution === 'approved' && typeof resume === 'string') ||
+          (record.frontierApproval.resolution === 'rejected' &&
+            record.status === 'frontier-rejected' &&
+            resume === null)
+        )
+      )
+        settled = false;
+      if (record.supervisorRecovery) settled = false;
       cascadeId = resume ?? null;
     }
     // A valid admission without an actual workflow ID is still not ready.
@@ -147,6 +179,7 @@ export async function readCascadeWorkflowEvidence(
       firstRunId ??= runId;
       status = row.status;
       completed ||= row.status === 'completed';
+      if (!['completed', 'failed', 'escalated', 'cancelled'].includes(row.status)) settled = false;
       if (row.status === 'completed') completedRunId ??= runId;
       try {
         // Preserve existing PR metadata semantics; this phase changes ownership
@@ -163,6 +196,7 @@ export async function readCascadeWorkflowEvidence(
       completedRunId,
       status: completed ? 'completed' : status,
       prOpened,
+      settled,
     };
   } catch {
     // UNKNOWN must throw so the existing grading catch skips noise grading too.

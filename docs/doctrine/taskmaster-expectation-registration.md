@@ -244,3 +244,39 @@ row with the wrong predicate remains visibly held: registration does not replace
 it, and this proposal provides no automatic legacy conversion. This section is a
 source proposal for review. It authorizes no merge, deployment, runtime repair or
 new absence action and supplies no evidence of improved production success.
+
+## Proposed source repair for review: durable launch ownership (2026-10-18)
+
+The next source proposal replaces a returned journal row as the right to launch
+with an explicit one-time execution grant. In the existing Taskmaster DAL, a
+short transaction locks the control singleton, validates pause and epoch, reads
+existing fire custody across all ages, and creates or claims the proposal with a
+versioned random token. SQLite uses the existing immediate-transaction helper;
+PostgreSQL locks `tm_control` with `FOR UPDATE` on its transaction connection.
+The transaction commits before any provider invocation. No table or migration is
+added. Deferred retries must retain exact WO/project, recipient, target repository
+and expected-spec authority, with a valid original deadline.
+
+All Taskmaster fire invocations require the winning grant. A loser never parks,
+expires or rewrites the winner's row. A fresh pause/epoch check may abort only
+the owned token before invocation. A pause arriving after that check cannot be
+made atomic with external execution by this database transaction.
+
+The active token survives `pending -> sent`, reset and elapsed time. Another
+bucket for the same WO/project remains held while that token owns work. Release
+compares the exact row, active token, metadata and outcome. It requires a
+positive pre-invocation abort, a directly observed identity-bound zero-attempt
+refusal, or exact durable evidence that the entire cascade chain has settled
+and every actual workflow is terminal. One completed workflow is insufficient.
+Null-run attempts, running cascades, unresolved frontier approval and recovery
+or spec-repair handoffs retain ownership; missing evidence never grants takeover.
+
+The conservative implementation scans fire journal history, including claims
+whose journal outcome changed. Malformed historical terminal metadata can hold
+all new fires as well as malformed pending custody. Such records require explicit
+legacy reconciliation before deployment; this proposal does not silently repair
+or discard them. An unmarked historical sent fire also holds its exact scope:
+its outcome alone does not prove its provider work stopped. No marker is silently
+backfilled. The scan cost grows with history and has no unsafe age cutoff.
+This closes Taskmaster launch overlap only; it does not repair Cauldron's own
+released-file-lock takeover protocol or grant any merge/deployment authority.
