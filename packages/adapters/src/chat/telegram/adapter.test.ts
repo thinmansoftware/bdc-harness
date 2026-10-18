@@ -286,6 +286,8 @@ describe('TelegramAdapter', () => {
 
     test('should retry twice on 409 and succeed on third attempt', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
+      // Admission warnings belong to construction, not start() retry events.
+      mockLogger.warn.mockClear();
       const conflictError = new Error('409: Conflict: terminated by other getUpdates request');
       const mockStart = mock<
         (opts?: { drop_pending_updates?: boolean; onStart?: () => void }) => Promise<void>
