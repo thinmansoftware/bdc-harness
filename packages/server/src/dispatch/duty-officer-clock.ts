@@ -121,6 +121,7 @@ function githubTimeoutMs(): number {
 }
 
 export function isTaskmasterSelfPause(message: DispatchMessage): boolean {
+  if (!isTaskmasterMailbox(message)) return false;
   const subject = message.subject_key ?? '';
   const key = message.idempotency_key ?? '';
   const correlation = message.correlation_id ?? '';
@@ -132,18 +133,17 @@ export function isTaskmasterSelfPause(message: DispatchMessage): boolean {
 }
 
 export function isTaskmasterMailbox(message: DispatchMessage): boolean {
-  return message.sender === 'taskmaster';
+  return message.sender === 'taskmaster' && message.sender_principal_id === 'system:taskmaster';
 }
 
 /**
  * A Taskmaster blocker_report (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01):
- * sender 'taskmaster' AND an idempotency key in the blocker_report namespace.
+ * Internal Taskmaster provenance AND a key in the blocker_report namespace.
  * These skip the judge entirely and are relayed to the XO once, then finished.
  */
 export function isTaskmasterBlockerReport(message: DispatchMessage): boolean {
   return (
-    message.sender === 'taskmaster' &&
-    (message.idempotency_key ?? '').startsWith('tm:blocker_report:')
+    isTaskmasterMailbox(message) && (message.idempotency_key ?? '').startsWith('tm:blocker_report:')
   );
 }
 
