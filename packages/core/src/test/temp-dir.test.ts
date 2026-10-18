@@ -22,7 +22,7 @@ test('preload scrub preserves test fixtures and removes inherited production cre
   );
 
   try {
-    const child = Bun.spawnSync(['bun', 'test', childTest], {
+    const child = Bun.spawnSync([process.execPath, 'test', childTest], {
       cwd: process.cwd(),
       env: {
         ...process.env,
@@ -150,5 +150,54 @@ describe('removeTempDirWithRetry', () => {
       });
       expect(calls).toBe(2);
     }
+  });
+});
+
+describe('strict temporary directory cleanup', () => {
+  for (const code of ['EBUSY', 'EACCES']) {
+    test(`throws the original ${code} failure with bounded attempts`, () => {
+      const failure = Object.assign(new Error('synthetic cleanup failure'), { code });
+      let calls = 0;
+      let caught: unknown;
+      const sleeps: number[] = [];
+      const logs: string[] = [];
+      try {
+        removeTempDirWithRetry('C:/tmp/archon-strict-fixture', {
+          throwOnFailure: true,
+          attempts: 3,
+          delayMs: 10,
+          rm: () => {
+            calls += 1;
+            throw failure;
+          },
+          sleep: ms => sleeps.push(ms),
+          log: message => logs.push(message),
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBe(failure);
+      expect(calls).toBe(code === 'EBUSY' ? 3 : 1);
+      expect(sleeps).toEqual(code === 'EBUSY' ? [10, 20] : []);
+      expect(logs).toEqual([]);
+    });
+  }
+
+  test('strict mode returns after a transient failure clears', () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const logs: string[] = [];
+    removeTempDirWithRetry('C:/tmp/archon-strict-success', {
+      throwOnFailure: true,
+      rm: () => {
+        calls += 1;
+        if (calls === 1) throw ebusy();
+      },
+      sleep: ms => sleeps.push(ms),
+      log: message => logs.push(message),
+    });
+    expect(calls).toBe(2);
+    expect(sleeps).toEqual([250]);
+    expect(logs).toEqual([]);
   });
 });

@@ -13,6 +13,7 @@
  * Retrying with a short backoff clears it. On final failure we log one line and
  * return without throwing: the runner's temp directory is reaped by the OS, so a
  * leaked fixture directory is not worth failing an otherwise-green test over.
+ * Callers that require successful cleanup can opt into throwing the original error.
  */
 import { rmSync } from 'fs';
 
@@ -21,6 +22,8 @@ export interface RemoveTempDirOptions {
   attempts?: number;
   /** Base delay between attempts in ms; grows linearly. Defaults to 250. */
   delayMs?: number;
+  /** Throw the original removal error on failure instead of warning. Default false. */
+  throwOnFailure?: boolean;
   /** Injection seam for tests. Defaults to `fs.rmSync`. */
   rm?: (path: string) => void;
   /** Injection seam for tests. Defaults to `Bun.sleepSync`. */
@@ -56,7 +59,8 @@ function defaultSleep(ms: number): void {
 /**
  * Remove a temp directory, retrying on Windows file-lock errors.
  *
- * Never throws. Synchronous, so it drops into an existing `afterEach` without
+ * Warns on final failure by default; throwOnFailure preserves strict teardown.
+ * Synchronous, so it drops into an existing `afterEach` without
  * changing whether the hook is async.
  */
 export function removeTempDirWithRetry(path: string, options: RemoveTempDirOptions = {}): void {
@@ -83,6 +87,7 @@ export function removeTempDirWithRetry(path: string, options: RemoveTempDirOptio
     }
   }
 
+  if (options.throwOnFailure) throw lastError;
   const code = errorCode(lastError) ?? 'unknown';
   log(
     `[test-cleanup] gave up removing temp dir after ${attempts} attempts (${code}): ${path} -- ` +
