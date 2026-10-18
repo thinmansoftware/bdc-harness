@@ -10,19 +10,17 @@ set -uo pipefail
 
 FAIL=0
 PASS=0
-TMPS=()
+WDI_TEST_TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/archon-wdi-tests.XXXXXX")"
 
 cleanup() {
-  local d
-  for d in "${TMPS[@]}"; do rm -rf "$d"; done
+  case "$WDI_TEST_TMP_ROOT" in
+    "${TMPDIR:-/tmp}"/archon-wdi-tests.*) rm -rf -- "$WDI_TEST_TMP_ROOT" ;;
+  esac
 }
 trap cleanup EXIT
 
 newtmp() {
-  local d
-  d="$(mktemp -d)"
-  TMPS+=("$d")
-  printf '%s' "$d"
+  mktemp -d "$WDI_TEST_TMP_ROOT/case.XXXXXX"
 }
 
 assert_eq() {
@@ -130,7 +128,12 @@ minimal_path() {
     date stat cmp tr head tail find sort env sleep timeout dirname basename \
     comm uname ls touch bun node; do
     src="$(command -v "$cmd" 2>/dev/null || true)"
-    [ -n "$src" ] && ln -sfn "$src" "$dest/$cmd"
+    if [ -n "$src" ]; then
+      # Git Bash may copy an executable for ln -s, losing its adjacent DLLs.
+      # Delegate to its original location while keeping npm absent from PATH.
+      printf '#!/bin/bash\nexec %q "$@"\n' "$src" > "$dest/$cmd"
+      chmod +x "$dest/$cmd"
+    fi
   done
 }
 
@@ -171,6 +174,7 @@ for fn in wdi_class wdi_candidate_dirs wdi_pick_manager wdi_install_dir wdi_scru
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined"; exit 1; fi
 done
 
+if [ "${WDI_INDEX_ONLY:-0}" != "1" ]; then
 echo "--- Test 1: bun repo installs and a targeted test loads ---"
 reset_wdi_env
 T1="$(newtmp)"
@@ -432,7 +436,7 @@ lane_scan() {
 SCAN1="$(lane_scan)"
 SCAN2="$(lane_scan)"
 assert_eq "Test 11 scan deterministic" "$SCAN1" "$SCAN2"
-assert_eq "Test 11 lane count" "LANE_COUNT 12" "$(printf '%s\n' "$SCAN1" | grep '^LANE_COUNT')"
+assert_eq "Test 11 lane count" "LANE_COUNT 13" "$(printf '%s\n' "$SCAN1" | grep '^LANE_COUNT')"
 if printf '%s\n' "$SCAN1" | grep -Eq 'MISSING_|BAD_DEP|HAS_WHEN|CORE_DIFF'; then
   FAIL=$((FAIL+1)); echo "FAIL: Test 11 wiring"; printf '%s\n' "$SCAN1"
 else
@@ -561,6 +565,86 @@ assert_contains "Test 15 dirty_reverted" ".:dirty_reverted" "$OUT15"
 assert_eq "Test 15 source restored" "committed-content" "$(cat "$T15/repo/rename-source.txt")"
 [ ! -e "$T15/repo/$RENAME15" ] && echo "PASS: Test 15 destination removed" && PASS=$((PASS+1)) || { echo "FAIL: Test 15 destination removed"; FAIL=$((FAIL+1)); }
 assert_eq "Test 15 repository clean" "" "$(cd "$T15/repo" && git status --porcelain=v1 --untracked-files=all)"
+
+fi
+
+for INDEX_CASE in stage reset mode; do
+  echo "--- Index regression: $INDEX_CASE pre-existing dirty work ---"
+  reset_wdi_env
+  INDEX_TMP="$(newtmp)"
+  export ARTIFACTS_DIR="$INDEX_TMP/artifacts"
+  mkdir -p "$INDEX_TMP/repo" "$ARTIFACTS_DIR"
+  printf '%s\n' '{"name":"wdi-fixture","private":true}' > "$INDEX_TMP/repo/package.json"
+  printf '%s\n' lock-v1 > "$INDEX_TMP/repo/bun.lock"
+  printf '%s\n' node_modules > "$INDEX_TMP/repo/.gitignore"
+  printf '%s\n' committed > "$INDEX_TMP/repo/dirty.txt"
+  init_repo "$INDEX_TMP/repo"
+  printf '%s\n' builder-work > "$INDEX_TMP/repo/dirty.txt"
+  if [ "$INDEX_CASE" = reset ]; then git -C "$INDEX_TMP/repo" add dirty.txt; fi
+  INDEX_BIN="$(make_stub_bin)"
+  arm_stub_logs "$INDEX_BIN"
+  case "$INDEX_CASE" in
+    stage) write_stub "$INDEX_BIN" bun 'git add -- dirty.txt' ;;
+    reset) write_stub "$INDEX_BIN" bun 'git reset -q HEAD -- dirty.txt' ;;
+    mode) write_stub "$INDEX_BIN" bun 'git update-index --chmod=+x -- dirty.txt' ;;
+  esac
+  export PATH="$INDEX_BIN:$ORIG_PATH"
+  INDEX_OUT="$(cd "$INDEX_TMP/repo" && wdi_main </dev/null)"
+  assert_contains "Index $INDEX_CASE reports failure" 'DEPS_STATUS=failed' "$INDEX_OUT"
+  assert_contains "Index $INDEX_CASE failed_mutation" '.:failed_mutation' "$INDEX_OUT"
+  assert_eq "Index $INDEX_CASE preserves working bytes" builder-work "$(cat "$INDEX_TMP/repo/dirty.txt")"
+  [ ! -e "$INDEX_TMP/repo/node_modules/.archon-wdi-stamp" ] && PASS=$((PASS+1)) || { echo "FAIL: Index $INDEX_CASE wrote stamp"; FAIL=$((FAIL+1)); }
+done
+
+echo "--- Literal cleanup preserves unrelated dirty work ---"
+reset_wdi_env
+LITERAL_TMP="$(newtmp)"
+export ARTIFACTS_DIR="$LITERAL_TMP/artifacts"
+mkdir -p "$LITERAL_TMP/repo" "$ARTIFACTS_DIR"
+printf '%s\n' '{"name":"fixture"}' > "$LITERAL_TMP/repo/package.json"
+printf '%s\n' lock-v1 > "$LITERAL_TMP/repo/bun.lock"
+printf '%s\n' node_modules > "$LITERAL_TMP/repo/.gitignore"
+printf '%s\n' committed > "$LITERAL_TMP/repo/file1.txt"
+printf '%s\n' committed > "$LITERAL_TMP/repo/file[1].txt"
+init_repo "$LITERAL_TMP/repo"
+printf '%s\n' builder-work > "$LITERAL_TMP/repo/file1.txt"
+LITERAL_BIN="$(make_stub_bin)"
+arm_stub_logs "$LITERAL_BIN"
+write_stub "$LITERAL_BIN" bun 'printf "%s\n" installer-change > "file[1].txt"'
+export PATH="$LITERAL_BIN:$ORIG_PATH"
+LITERAL_OUT="$(cd "$LITERAL_TMP/repo" && wdi_main </dev/null)"
+assert_contains "Literal cleanup reports dirty_reverted" '.:dirty_reverted' "$LITERAL_OUT"
+assert_eq "Literal cleanup preserves unrelated work" builder-work "$(cat "$LITERAL_TMP/repo/file1.txt")"
+assert_eq "Literal cleanup restores only actual target" committed "$(cat "$LITERAL_TMP/repo/file[1].txt")"
+
+for SNAPSHOT_COMMAND in status ls-files; do
+  for SNAPSHOT_PHASE in before after; do
+    reset_wdi_env
+    SNAPSHOT_TMP="$(newtmp)"
+    export ARTIFACTS_DIR="$SNAPSHOT_TMP/artifacts"
+    mkdir -p "$SNAPSHOT_TMP/repo" "$ARTIFACTS_DIR"
+    printf '%s\n' '{"name":"fixture"}' > "$SNAPSHOT_TMP/repo/package.json"
+    printf '%s\n' lock-v1 > "$SNAPSHOT_TMP/repo/bun.lock"
+    printf '%s\n' node_modules > "$SNAPSHOT_TMP/repo/.gitignore"
+    printf '%s\n' committed > "$SNAPSHOT_TMP/repo/dirty.txt"
+    init_repo "$SNAPSHOT_TMP/repo"
+    printf '%s\n' builder-work > "$SNAPSHOT_TMP/repo/dirty.txt"
+    SNAPSHOT_BIN="$(make_stub_bin)"
+    arm_stub_logs "$SNAPSHOT_BIN"
+    export WDI_TEST_REAL_GIT="$(command -v git)"
+    export WDI_TEST_FAIL_COMMAND="$SNAPSHOT_COMMAND" WDI_TEST_FAIL_PHASE="$SNAPSHOT_PHASE"
+    write_stub "$SNAPSHOT_BIN" bun 'touch "$ARTIFACTS_DIR/installer-was-run"'
+    write_stub "$SNAPSHOT_BIN" git 'case " $* " in *" $WDI_TEST_FAIL_COMMAND "*) if [ "$WDI_TEST_FAIL_PHASE" = before ] || [ -e "$ARTIFACTS_DIR/installer-was-run" ]; then exit 42; fi ;; esac; exec "$WDI_TEST_REAL_GIT" "$@"'
+    export PATH="$SNAPSHOT_BIN:$ORIG_PATH"
+    SNAPSHOT_OUT="$(cd "$SNAPSHOT_TMP/repo" && wdi_main </dev/null)"
+    assert_contains "Snapshot $SNAPSHOT_COMMAND $SNAPSHOT_PHASE fails closed" '.:failed_snapshot' "$SNAPSHOT_OUT"
+    assert_eq "Snapshot failure preserves dirty bytes" builder-work "$(cat "$SNAPSHOT_TMP/repo/dirty.txt")"
+    [ ! -e "$SNAPSHOT_TMP/repo/node_modules/.archon-wdi-stamp" ] && PASS=$((PASS+1)) || { echo "FAIL: snapshot failure wrote stamp"; FAIL=$((FAIL+1)); }
+    if [ "$SNAPSHOT_PHASE" = before ]; then
+      [ ! -e "$ARTIFACTS_DIR/installer-was-run" ] && PASS=$((PASS+1)) || { echo 'FAIL: snapshot failure ran installer'; FAIL=$((FAIL+1)); }
+    fi
+  done
+done
 
 echo
 echo "install-worktree-deps.sh: $PASS passed, $FAIL failed"

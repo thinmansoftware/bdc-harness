@@ -70,6 +70,12 @@ registerBuiltinProviders();
 // --- Import after mocks ---
 import { executeWorkflow, resolveExecutorLane, LaneAvailabilityRefusedError } from './executor';
 import { markEngineDarkIfZeroUsage, resetEngineAvailabilityForTests } from './engine-availability';
+import {
+  resetSeatUsageCacheForTests,
+  setSeatUsageReaderForTests,
+  type SeatId,
+  type SeatReading,
+} from './reliability/seat-usage';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun } from './schemas';
@@ -150,6 +156,37 @@ function getExecutedWorkflow(): WorkflowDefinition {
   return mockExecuteDagWorkflow.mock.calls[0]?.[4] as WorkflowDefinition;
 }
 
+// These orchestration tests mock the DAG/provider. Seat capacity must be a
+// fixture too, so host credentials and live subscription usage cannot decide
+// whether an unrelated policy/resume test reaches that mocked DAG.
+beforeEach(() => {
+  resetSeatUsageCacheForTests();
+  setSeatUsageReaderForTests(async seats => {
+    const readings: Partial<Record<SeatId, SeatReading>> = {};
+    for (const seat of seats) {
+      const gateWindows =
+        seat === 'claude'
+          ? ['five_hour', 'seven_day']
+          : seat === 'codex'
+            ? ['primary', 'secondary']
+            : ['monthly'];
+      const week = { used_percent: 0, remaining_percent: 100, resets_at: '2030-01-01T00:00:00Z' };
+      readings[seat] = {
+        seat,
+        limit_source: 'measured',
+        windows: gateWindows.map(name => ({ name, ...week })),
+        seven_day: seat === 'cursor' ? 'NOT_APPLICABLE' : week,
+        gate_windows: gateWindows,
+        note: 'synthetic orchestration fixture',
+        probed_at: '2026-10-17T00:00:00Z',
+        endpoint: 'https://fixture.invalid',
+      };
+    }
+    return readings;
+  });
+});
+afterEach(resetSeatUsageCacheForTests);
+
 describe('executeWorkflow', () => {
   beforeEach(() => {
     mockLogFn.mockClear();
@@ -158,6 +195,47 @@ describe('executeWorkflow', () => {
     mockEmitter.unregisterRun.mockClear();
     mockEmitter.emit.mockClear();
     mockExecuteDagWorkflow.mockImplementation(async (): Promise<string | undefined> => undefined);
+  });
+
+  it('uses synthetic seat usage without probing credentials from the host', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'executor-seat-fixture-'));
+    const credentialsFile = join(cwd, 'credentials.json');
+    await writeFile(
+      credentialsFile,
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: 'synthetic-seat-marker',
+          expiresAt: Date.now() + 60_000,
+        },
+      })
+    );
+    const previousPath = process.env.FUELGLASS_CLAUDE_CREDENTIALS_FILE;
+    const previousFetch = globalThis.fetch;
+    let networkCalls = 0;
+    process.env.FUELGLASS_CLAUDE_CREDENTIALS_FILE = credentialsFile;
+    globalThis.fetch = (async () => {
+      networkCalls += 1;
+      return Response.json({ seven_day: { utilization: 99, resets_at: '2030-01-01T00:00:00Z' } });
+    }) as typeof fetch;
+    try {
+      const result = await executeWorkflow(
+        makeDeps(),
+        makePlatform(),
+        'conv-1',
+        cwd,
+        makeWorkflow(),
+        'fixture',
+        'db-conv-1'
+      );
+      expect(networkCalls).toBe(0);
+      expect(result.success).toBe(true);
+      expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousPath === undefined) delete process.env.FUELGLASS_CLAUDE_CREDENTIALS_FILE;
+      else process.env.FUELGLASS_CLAUDE_CREDENTIALS_FILE = previousPath;
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   // -------------------------------------------------------------------------

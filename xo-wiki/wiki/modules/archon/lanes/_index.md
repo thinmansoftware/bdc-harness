@@ -104,7 +104,12 @@ Stdout keys:
 Per-directory status is one of: `installed`, `cached`, `skipped_no_package_json`,
 `skipped_no_lockfile`, `skipped_no_tool`, `skipped_not_ignored`,
 `skipped_low_disk`, `skipped_budget`, `failed_exit_<n>`, `failed_timeout`,
-`dirty_reverted`.
+`dirty_reverted`, `failed_mutation`, or `failed_snapshot`.
+
+Preexisting dirty content and index state are fingerprinted. An installer mutation
+of either reports `failed_mutation`, writes no success stamp, and leaves the
+installer-modified state for reconciliation; it does not restore the original
+index. Snapshot read failure reports `failed_snapshot` and avoids unsafe cleanup.
 
 Overall status is `failed` if any directory failed, `installed` if any
 directory is `installed` or `cached` and none failed, and `skipped` otherwise.

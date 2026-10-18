@@ -71,10 +71,18 @@ import {
 import { startReviewWorkerClock, stopReviewWorkerClock } from './dispatch/review-worker-clock';
 import { startDutyOfficerClock, stopDutyOfficerClock } from './dispatch/duty-officer-clock';
 import {
+  startWorkerHeartbeatAlarmTimer,
+  stopWorkerHeartbeatAlarmTimer,
+} from './dispatch/worker-heartbeat-alarm';
+import {
   observeStartupRecovery,
   reconcilePendingRunsAtBoot,
   reconcileRunningRunsAtBoot,
 } from './startup-reconciliation';
+import {
+  loadPersistedSeatCutoff,
+  restoreSeatCutoffOverride,
+} from '@archon/workflows/reliability/seat-usage';
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import { createMergeManager } from '@archon/overseer/merge-manager';
 import { resolveDefaultDeps } from '@archon/overseer/service';
@@ -256,6 +264,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   } catch (error) {
     getLog().fatal({ err: error }, 'database_connection_failed');
     process.exit(1);
+  }
+
+  try {
+    await restoreSeatCutoffOverride(loadPersistedSeatCutoff);
+  } catch (error) {
+    getLog().warn({ err: error }, 'fuelglass.seat_cutoff_restore_failed');
   }
 
   const startupReconciliationAt = new Date().toISOString();
@@ -680,6 +694,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     );
   }
   startDutyOfficerClock();
+  // Dedicated fast timer (default 60s) that pages John for a dead/restarted
+  // Dispatch worker, independent of the 15-minute Duty Officer tick.
+  startWorkerHeartbeatAlarmTimer();
 
   // Gitea webhook endpoint
   if (gitea) {
@@ -837,6 +854,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopDispatchEscalationClock();
     stopReviewWorkerClock();
     stopDutyOfficerClock();
+    stopWorkerHeartbeatAlarmTimer();
     persistence.stopPeriodicFlush();
 
     // Await overseer watcher abort before flushing; bounded by the watcher's own

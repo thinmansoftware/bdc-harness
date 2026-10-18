@@ -10,6 +10,7 @@
   "include": [
     "*.ts",
     "db/**/*.ts",
+    "dispatch/**/*.ts",
     "dispatch-worker/**/*.ts",
     "staging/**/*.ts",
     "taskmaster/**/*.ts",

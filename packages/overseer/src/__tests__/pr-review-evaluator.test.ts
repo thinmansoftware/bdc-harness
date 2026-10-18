@@ -6,6 +6,7 @@ import {
 import {
   inMemoryAttemptCounterStore,
   resetRequiredContextsAttemptCounters,
+  resetRequiredContextsCache,
 } from '../adapters/required-contexts.ts';
 import {
   buildReviewModelTransport,
@@ -27,6 +28,7 @@ import {
 // from an earlier test in this file and degrading by accident.
 beforeEach(() => {
   resetRequiredContextsAttemptCounters();
+  resetRequiredContextsCache();
 });
 
 const HEAD_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';

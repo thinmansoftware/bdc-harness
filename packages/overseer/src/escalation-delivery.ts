@@ -1,4 +1,5 @@
 import {
+  ACTIVE_OPERATOR_CARD_CHANNELS,
   appendDeliveryReceipt,
   claimDueDeliveryJob,
   completeDeliveryJob,
@@ -10,7 +11,7 @@ import {
 } from '@archon/core/db/overseer-briefing';
 import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
-import { buildDispatchRunReportBody, lookupNotionPage } from './escalate';
+import { buildDispatchRunReportBody } from './escalate';
 import { resolveWoBoardSeatOwner } from './owner-resolution';
 
 export interface ChannelDeliveryResult {
@@ -48,8 +49,8 @@ const defaultStore: DeliveryStore = {
   completeDeliveryJob,
 };
 
-const DEFAULT_NOTION_DATABASE_ID = 'a6df831c-0b52-449f-8ca4-d77be6b70d0a';
 const DEFAULT_BUILDER_MONITOR_URL = 'https://n8n.bluedevilcollectibles.com/webhook/builder-status';
+const ACTIVE_OPERATOR_CARD_CHANNEL_SET = new Set<string>(ACTIVE_OPERATOR_CARD_CHANNELS);
 
 function classifyHttpFailure(status: number, channel: string): ChannelDeliveryResult {
   if (status >= 500 && status <= 599) {
@@ -70,11 +71,8 @@ function classifyHttpFailure(status: number, channel: string): ChannelDeliveryRe
 export function createDefaultOperatorCardChannels(
   overrides: Partial<OperatorCardChannelDeps> = {}
 ): OperatorCardChannel[] {
-  const deps: OperatorCardChannelDeps = {
+  const deps = {
     fetch: overrides.fetch ?? globalThis.fetch,
-    notion_api_key: overrides.notion_api_key ?? process.env.NOTION_API_KEY,
-    notion_database_id:
-      overrides.notion_database_id ?? process.env.NOTION_DB_ID ?? DEFAULT_NOTION_DATABASE_ID,
     builder_monitor_url:
       overrides.builder_monitor_url ??
       process.env.BUILDER_MONITOR_WEBHOOK_URL ??
@@ -137,58 +135,7 @@ export function createDefaultOperatorCardChannels(
     }),
   };
 
-  const notion: OperatorCardChannel = {
-    channel: 'notion',
-    deliver: async card => {
-      if (!deps.notion_api_key) {
-        return {
-          outcome: 'permanent_failure',
-          sanitized_status: 'notion_not_configured',
-          error_class: 'configuration',
-        };
-      }
-      const lookup = await lookupNotionPage(
-        deps.notion_api_key,
-        deps.notion_database_id,
-        card.card.wo_id,
-        deps.fetch
-      );
-      if (!lookup.page_id) {
-        return {
-          outcome: lookup.failure_outcome ?? 'permanent_failure',
-          sanitized_status: 'notion_page_not_found',
-          error_class: 'notion_lookup_failed',
-        };
-      }
-      const response = await deps.fetch('https://api.notion.com/v1/comments', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${deps.notion_api_key}`,
-          'Content-Type': 'application/json',
-          'Notion-Version': '2022-06-28',
-        },
-        body: JSON.stringify({
-          parent: { page_id: lookup.page_id },
-          rich_text: [
-            {
-              type: 'text',
-              text: {
-                content: `Overseer operator card ${card.card.card_id}: ${card.card.blocker}`,
-              },
-            },
-          ],
-        }),
-      });
-      return response.ok
-        ? { outcome: 'succeeded', sanitized_status: 'notion_comment_created' }
-        : classifyHttpFailure(response.status, 'notion_comment');
-    },
-    reconcile: async () => ({
-      outcome: 'indeterminate',
-      sanitized_status: 'notion_provider_state_unknown',
-    }),
-  };
-  return [dispatch, builderMonitor, notion];
+  return [dispatch, builderMonitor];
 }
 
 function normalizeResult(result: ChannelDeliveryResult): ChannelDeliveryResult {
@@ -312,6 +259,34 @@ export async function deliverOperatorCard(input: {
   });
 }
 
+async function retireInactiveOperatorCardChannel(input: {
+  job: DeliveryJobRecord;
+  owner: string;
+  now: string;
+  store: DeliveryStore;
+}): Promise<DeliveryJobRecord> {
+  await input.store.appendDeliveryReceipt({
+    card_id: input.job.card_id,
+    channel: input.job.channel,
+    attempt_number: input.job.attempts_started,
+    phase: 'terminal',
+    started_at: input.now,
+    completed_at: input.now,
+    outcome: 'permanent_failure',
+    sanitized_status: 'channel_retired',
+    fencing_token: input.job.fencing_token,
+    lease_owner: input.owner,
+  });
+  return input.store.completeDeliveryJob({
+    card_id: input.job.card_id,
+    channel: input.job.channel,
+    owner: input.owner,
+    fencing_token: input.job.fencing_token,
+    outcome: 'permanent_failure',
+    now: input.now,
+  });
+}
+
 export async function runDueOperatorCardDeliveries(input: {
   channels: OperatorCardChannel[];
   owner: string;
@@ -326,6 +301,12 @@ export async function runDueOperatorCardDeliveries(input: {
   for (let count = 0; count < (input.max_jobs ?? 100); count += 1) {
     const job = await store.claimDueDeliveryJob({ owner: input.owner, now });
     if (!job) break;
+    if (!ACTIVE_OPERATOR_CARD_CHANNEL_SET.has(job.channel)) {
+      completed.push(
+        await retireInactiveOperatorCardChannel({ job, owner: input.owner, now, store })
+      );
+      continue;
+    }
     const channel = channels.get(job.channel);
     if (!channel) throw new Error(`operator_card_channel_missing:${job.channel}`);
     completed.push(await deliverOperatorCard({ job, channel, owner: input.owner, now, store }));
