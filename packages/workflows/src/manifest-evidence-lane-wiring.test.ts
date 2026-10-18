@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { parseWorkflow } from './loader';
 import { substituteNodeOutputRefs } from './dag-executor';
 import {
@@ -249,6 +249,7 @@ function runStopTestsNode(opts: {
     writeFileSync(join(cwd, 'bun.lock'), '{}\n');
     writeFileSync(join(cwd, 'repo-pass.sh'), 'echo "Tests: 1/1"\nexit 0\n');
     for (const [rel, body] of Object.entries(opts.files ?? {})) {
+      mkdirSync(dirname(join(cwd, rel)), { recursive: true });
       writeFileSync(join(cwd, rel), body);
     }
     const bash = node(
@@ -577,4 +578,56 @@ describe.skipIf(process.platform === 'win32')('run-stop-greps allowlist (behavio
     expect(stdout).toContain('find . -execdir sh evil.sh');
     expect(pwned).toBe(false);
   });
+});
+
+describe('Bun workspace test evidence', () => {
+  for (const failing of [false, true]) {
+    it(`counts two real workspace tests and preserves ${failing ? 'failure' : 'success'}`, () => {
+      const files: Record<string, string> = {
+        'package.json': JSON.stringify({
+          name: 'fixture',
+          private: true,
+          workspaces: ['packages/*'],
+          scripts: { test: "bun --filter '*' --parallel test" },
+        }),
+      };
+      for (const name of ['a', 'b']) {
+        files[`packages/${name}/package.json`] = JSON.stringify({
+          name: `@archon/fixture-${name}`,
+          scripts: { test: 'bun test' },
+        });
+        files[`packages/${name}/fixture.test.ts`] =
+          `import { test, expect } from 'bun:test';\ntest('fixture', () => expect(1).toBe(${failing && name === 'b' ? 2 : 1}));\n`;
+      }
+      const { stdout, log } = runStopTestsNode({
+        spec: rstSpec('bash ./repo-pass.sh'),
+        resolution: `TEST_COMMAND_SOURCE=project-map\nTEST_COMMAND_B64=${Buffer.from('bun run test').toString('base64')}`,
+        files,
+      });
+      expect(rstField(stdout, 'TESTS_STATUS')).toBe(failing ? 'failed' : 'passed');
+      expect(rstField(stdout, 'TESTS_LINE')).toContain(
+        failing ? '1/2 (bun run test)' : '2/2 (bun run test)'
+      );
+      expect(rstField(stdout, 'TESTS_SOURCE')).toBe('project-map');
+      expect(log).toContain('@archon/fixture-a:test |');
+      expect(log).not.toContain('### run-stop-tests: bash ./repo-pass.sh');
+      if (failing) expect(log).toMatch(/### exit [1-9]/);
+    }, 30_000);
+  }
+  for (const prefix of [
+    'fixture:build |',
+    'fixture:lint |',
+    'arbitrary |',
+    '../fixture:test |',
+    '@scope/fixture:test|',
+  ]) {
+    it(`does not normalize unrelated prefix ${prefix}`, () => {
+      const { stdout } = runStopTestsNode({
+        spec: rstSpec('bash ./repo-pass.sh'),
+        resolution: `TEST_COMMAND_SOURCE=project-map\nTEST_COMMAND_B64=${Buffer.from('bash ./prefixed.sh').toString('base64')}`,
+        files: { 'prefixed.sh': `printf '%s\\n' '${prefix} 2 pass' '${prefix} 0 fail'\n` },
+      });
+      expect(rstField(stdout, 'TESTS_STATUS')).toBe('counts_unparsed');
+    }, 30_000);
+  }
 });

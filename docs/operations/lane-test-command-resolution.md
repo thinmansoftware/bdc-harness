@@ -23,6 +23,11 @@ maps also report an explicit reason and fall back.
 Once a valid mapped command is selected, its result is controlling. Nonzero
 exit remains failed, and output without parseable counts remains unparsed.
 Neither result is replaced by a passing spec or repository fallback.
+Bun workspace `package:test |` and `@scope/package:test |` prefixes are
+removed only from the count parser input, after ANSI stripping. Raw logs
+retain their prefixes. Other task names and arbitrary pipe prefixes are not
+normalized. Existing count arithmetic and exit-status rules are unchanged.
+
 The manifest Tests line records the actual source and, for mapped commands,
 the fetched blob SHA. Evidence gates remain unchanged.
 

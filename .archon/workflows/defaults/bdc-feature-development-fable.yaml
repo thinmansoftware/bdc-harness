@@ -1805,7 +1805,8 @@ nodes:
       rst_parse_counts() {
         local esc raw counts
         esc="$(printf '\033')"
-        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g")"
+        # Bun --filter prefixes each workspace test line; normalize parser input only.
+        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g" | sed -E 's/^(@[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)?[A-Za-z0-9_-][A-Za-z0-9_.-]*:test[[:blank:]]+\|[[:blank:]]*//')"
         counts="$(printf '%s\n' "$raw" | awk '
           /^[ \t]*Passed: [0-9]+[ \t]+Failed: [0-9]+[ \t]+Total: [0-9]+/ { p += $2; t += $6; hit = 1; next }
           /^[ \t]*Tests: [0-9]+\/[0-9]+[ \t]*$/ { split($2, a, "/"); p += a[1]; t += a[2]; hit = 1; next }
