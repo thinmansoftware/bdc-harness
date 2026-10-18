@@ -249,5 +249,110 @@ def main():
     return 0 if result['passed'] else 1
 
 
+def artifact_workspace_snapshot():
+    root = Path('/workspace')
+    entries = sorted(root.iterdir(), key=lambda path: path.name)
+    if [path.name for path in entries] != ['.agents', '.codex']:
+        raise ValueError('artifact workspace inventory rejected')
+    records = []
+    for path in entries:
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or list(path.iterdir()):
+            raise ValueError('artifact workspace mask rejected')
+        records.append((path.name, info.st_mode, info.st_uid, info.st_gid, info.st_dev, info.st_ino))
+    return tuple(records)
+
+
+def artifact_main(nonce, source):
+    import hashlib
+    import sys
+    # Python -I excludes the script directory. Only the immutable image source is added.
+    sys.path.insert(0, str(ROOT))
+    from teetime_auth_artifact_protocol import empty_worker_result, validate_selector, validate_worker_result
+    from teetime_fixed_artifact import validate_task_result, validate_wrapper_evidence
+    validate_selector('artifact', source, nonce)
+    if os.environ.get('TEETIME_AUTH_ARTIFACT_SOURCE_SHA') != source:
+        raise ValueError('artifact image source rejected')
+    result = empty_worker_result()
+    original = before_workspace = candidate = task = None
+    policy_hash = None
+    before_oom = oom_kills()
+    started = None
+    try:
+        assert __debug__ and os.getuid() == 1001 and Path.cwd() == Path('/workspace')
+        info = AUTH.lstat()
+        assert stat.S_ISREG(info.st_mode) and info.st_uid == 1001 and info.st_mode & 0o777 == 0o600
+        assert 1 <= info.st_size <= 65536
+        original = AUTH.read_bytes()
+        before_workspace = artifact_workspace_snapshot()
+        for path in ['/etc/codex', '/.codex', '/.agents']:
+            assert not Path(path).exists()
+        preflight()
+        assert AUTH.read_bytes() == original
+        assert artifact_workspace_snapshot() == before_workspace
+        result['preflightPassed'] = True
+        policy_hash = hashlib.sha256(Path('/app/packages/providers/src/codex/restricted-policy.ts').read_bytes()).hexdigest()
+        result['taskStarted'] = True
+        result['modelInvocations'] = None  # Unknown until a valid task receipt arrives.
+        started = time.monotonic()
+        raw = bounded_process(['bun', str(ROOT/'teetime-fixed-artifact-task.ts'), nonce], 100)
+        candidate = validate_task_result(0, raw, nonce=nonce, policy_hash=policy_hash)
+        task = json.loads(raw)  # Strict duplicate/schema validation already succeeded.
+        result['taskDiagnosticsPresent'] = True
+        for key in ['modelInvocations', 'assistantCount', 'resultCount', 'thinkingCount',
+                    'normalProviderEnd', 'providerIteratorClosed', 'aborted']:
+            result[key] = task[key]
+    except BaseException:
+        result['failureCategory'] = 'rejected'
+    finally:
+        if started is not None:
+            result['elapsedMs'] = max(0, int((time.monotonic()-started)*1000))
+        after_oom = oom_kills()
+        if before_oom is not None and after_oom is not None and after_oom >= before_oom:
+            result['oomKillDelta'] = after_oom-before_oom
+        try:
+            info = AUTH.lstat()
+            result['authUnchanged'] = (original is not None and stat.S_ISREG(info.st_mode)
+                and info.st_uid == 1001 and info.st_mode & 0o777 == 0o600 and AUTH.read_bytes() == original)
+            result['workspaceUnchanged'] = (before_workspace is not None
+                and artifact_workspace_snapshot() == before_workspace)
+        except Exception:
+            pass
+        result['preflightChecks'] = PREFLIGHT_CHECKS
+        result['authenticationRejected'] = AUTH_REJECTED
+        try:
+            if candidate is None or task is None or result['oomKillDelta'] != 0:
+                raise ValueError('artifact task not verified')
+            validate_wrapper_evidence(auth_before=original, auth_after=AUTH.read_bytes(),
+                workspace_unchanged=result['workspaceUnchanged'], preflight_checks=PREFLIGHT_CHECKS)
+            if not result['authUnchanged']:
+                raise ValueError('artifact auth observation rejected')
+            result.update({'passed': True, 'artifactVerified': True, 'failureCategory': 'none',
+                'artifactBase64': task['artifactBase64'], 'artifactHash': candidate.artifact_hash,
+                'bindingHash': candidate.binding_hash, 'manifestHash': candidate.manifest_hash,
+                'sourceTree': candidate.source_tree})
+            validate_worker_result(result, nonce=nonce, policy_hash=policy_hash)
+        except Exception:
+            result.update({'passed': False, 'artifactVerified': False, 'artifactBase64': None,
+                'artifactHash': None, 'bindingHash': None, 'manifestHash': None, 'sourceTree': None,
+                'failureCategory': 'rejected'})
+        print(json.dumps(result), flush=True)
+    return 0 if result['passed'] else 1
+
+
 if __name__ == '__main__':
-    raise SystemExit(main())
+    import argparse
+    import re
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--task', choices=['filesystem', 'artifact'], default='filesystem')
+    parser.add_argument('--nonce')
+    parser.add_argument('--artifact-source')
+    args = parser.parse_args()
+    if args.task == 'filesystem':
+        if args.nonce is not None or args.artifact_source is not None:
+            parser.error('artifact-only arguments rejected in filesystem mode')
+        raise SystemExit(main())
+    if (re.fullmatch('[a-f0-9]{32}', args.nonce or '') is None
+            or re.fullmatch('[a-f0-9]{40}', args.artifact_source or '') is None):
+        parser.error('artifact mode requires exact nonce and source')
+    raise SystemExit(artifact_main(args.nonce, args.artifact_source))

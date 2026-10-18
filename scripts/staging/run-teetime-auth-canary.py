@@ -26,6 +26,8 @@ def main():
     parser.add_argument('--image', required=True)
     parser.add_argument('--expected-sha', required=True)
     parser.add_argument('--nonce', required=True)
+    parser.add_argument('--task', choices=['filesystem', 'artifact'], default='filesystem')
+    parser.add_argument('--artifact-source')
     args = parser.parse_args()
     if os.name != 'nt' or not __debug__:
         raise ValueError('Windows assertion-enabled controller required')
@@ -33,6 +35,16 @@ def main():
     assert re.fullmatch('[a-f0-9]{40}', args.expected_sha)
     assert re.fullmatch('[a-f0-9]{32}', args.nonce)
     root = Path(__file__).parent
+    artifact_mode = args.task == 'artifact'
+    if artifact_mode:
+        from teetime_auth_artifact_protocol import (artifact_hashes, artifact_identity, IMAGE_PATHS,
+            POLICY_PATH, empty_worker_result, validate_selector, validate_worker_result)
+        from teetime_joined_fixture import strict_json
+        validate_selector(args.task, args.artifact_source, args.nonce)
+        frozen_hashes = artifact_hashes(root, args.artifact_source, args.expected_sha)
+        contract_hash = artifact_identity(args.nonce, frozen_hashes[POLICY_PATH])
+    elif args.artifact_source is not None:
+        parser.error('artifact-only source rejected in filesystem mode')
     proxy_source = (root/'teetime_connect_proxy.py').read_bytes()
     owner = 'teetime-auth-' + uuid.uuid4().hex[:12]
     receipt = Path.home()/owner
@@ -46,6 +58,9 @@ def main():
                'artifactExists': False, 'artifactRegular': False, 'artifactExactContent': False, 'workspaceEntriesExact': False,
                'exceptionCategory': 'none', 'aborted': False, 'elapsedMs': 0, 'oomKillDelta': None,
                'proxyMetricsVerified': False, 'taskDiagnosticsPresent': False}
+    if artifact_mode:
+        outcome = {'passed': False, 'cleanupVerified': False, 'credentialReceived': False,
+                   'proxyMetricsVerified': False, 'artifactResult': empty_worker_result()}
     proxy_thread = None
     proxy_results = queue.Queue(maxsize=1)
     proxy_ready = threading.Event()
@@ -59,6 +74,8 @@ def main():
         state = json.loads(d('image', 'inspect', args.image))[0]
         assert state['Id'] == args.image
         assert 'ARCHON_BUILD_SHA='+args.expected_sha in state['Config']['Env']
+        if artifact_mode:
+            assert 'TEETIME_AUTH_ARTIFACT_SOURCE_SHA='+args.artifact_source in state['Config']['Env']
         profile = root/'codex-probe-seccomp.json'
         candidate = json.loads(profile.read_text())
         baseline = json.loads((root/'moby-default-seccomp.json').read_text())
@@ -126,15 +143,22 @@ def main():
             assert actual_nets == ({internal} if role == 'worker' else {internal, egress})
         # Verify runtime bytes against reviewed operator files before credential delivery.
         hashes = {}
-        for filename in ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts', 'teetime-canary-result.ts',
-                         'teetime_connect_proxy.py']:
-            expected = hashlib.sha256(proxy_source if filename == 'teetime_connect_proxy.py' else (root/filename).read_bytes()).hexdigest()
-            actual = d('exec', ids['worker'], 'sha256sum', '/app/scripts/staging/'+filename).decode().split()[0]
-            assert actual == expected
-            hashes[filename] = expected
-        for filename in ['run-teetime-auth-canary.py', 'teetime_canary_protocol.py', 'teetime_watchdog.py',
-                         'codex-probe-seccomp.json', 'teetime_bounded_process.py', 'teetime_proxy_receipt.py']:
-            hashes[filename] = hashlib.sha256((root/filename).read_bytes()).hexdigest()
+        if artifact_mode:
+            image_paths = (*IMAGE_PATHS, 'scripts/staging/teetime_connect_proxy.py')
+            measured = d('exec', ids['worker'], 'sha256sum', *['/app/'+path for path in image_paths]).decode()
+            actual = {line.split()[1].removeprefix('/app/'): line.split()[0] for line in measured.splitlines()}
+            assert actual == {path: frozen_hashes[path] for path in image_paths}
+            hashes = frozen_hashes
+        else:
+            for filename in ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts', 'teetime-canary-result.ts',
+                             'teetime_connect_proxy.py']:
+                expected = hashlib.sha256(proxy_source if filename == 'teetime_connect_proxy.py' else (root/filename).read_bytes()).hexdigest()
+                actual = d('exec', ids['worker'], 'sha256sum', '/app/scripts/staging/'+filename).decode().split()[0]
+                assert actual == expected
+                hashes[filename] = expected
+            for filename in ['run-teetime-auth-canary.py', 'teetime_canary_protocol.py', 'teetime_watchdog.py',
+                             'codex-probe-seccomp.json', 'teetime_bounded_process.py', 'teetime_proxy_receipt.py']:
+                hashes[filename] = hashlib.sha256((root/filename).read_bytes()).hexdigest()
         startup = bytearray()
         def proxy_output(chunk):
             if not proxy_ready.is_set():
@@ -180,9 +204,13 @@ def main():
             assert kernel.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value == 259
         finally:
             kernel.CloseHandle(handle)
-        print(json.dumps({'type': 'READY', 'nonce': args.nonce, 'image': args.image,
+        ready = {'type': 'READY', 'nonce': args.nonce, 'image': args.image,
             'sourceSha': args.expected_sha, 'owner': owner, 'manifestSha256': manifest_hash,
-            'workerId': ids['worker'], 'gatewayId': ids['gateway'], 'hashes': hashes}), flush=True)
+            'workerId': ids['worker'], 'gatewayId': ids['gateway'], 'hashes': hashes}
+        if artifact_mode:
+            ready.update({'task': 'artifact', 'artifactSourceSha': args.artifact_source,
+                          'artifactContractHash': contract_hash})
+        print(json.dumps(ready), flush=True)
         inbox = queue.Queue(maxsize=1)
         def receive():
             try:
@@ -199,23 +227,32 @@ def main():
         assert installed == {'installed': True}
         outcome['credentialReceived'] = True
         assert manifest['deadline']-time.time() > 145
+        worker_args = (['--task', 'artifact', '--nonce', args.nonce, '--artifact-source', args.artifact_source]
+                       if artifact_mode else [])
         returncode, output = capture([args.docker, 'exec', '-w', '/workspace', ids['worker'],
-            'python3', '-I', '/app/scripts/staging/teetime_canary_worker.py'], timeout=140)
-        result = json.loads(output)
-        keys = {'passed', 'preflightPassed', 'authUnchanged', 'artifactVerified', 'modelInvocations', 'servedModelVerified', 'preflightChecks', 'authenticationRejected', 'taskFailureCode','terminalCount','systemCategory','diagnosticHint','artifactExists','artifactRegular','artifactExactContent','workspaceEntriesExact','exceptionCategory','aborted','elapsedMs','oomKillDelta','taskDiagnosticsPresent'}
-        assert set(result) == keys
-        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode','terminalCount','systemCategory','diagnosticHint','exceptionCategory','elapsedMs','oomKillDelta'})
-        assert result['exceptionCategory'] in ['none','aborted','auth_hint','quota_hint','model_access_hint','transport_hint','process_hint','other']
-        assert type(result['elapsedMs']) is int and 0 <= result['elapsedMs'] <= 120000
-        assert result['oomKillDelta'] is None or type(result['oomKillDelta']) is int and 0 <= result['oomKillDelta'] <= 1024
-        assert type(result['terminalCount']) is int and result['terminalCount'] in [0,1]
-        assert result['systemCategory'] in ['none','task_list','file_change_failed','file_change_unexpected','format_warning','resume_warning','failback','other']
-        assert result['diagnosticHint'] in ['none','permission_hint','sandbox_hint','other']
-        assert result['taskFailureCode'] in ['not_started','worker_error','none','unexpected_system','terminal_rejected','provider_failed']
-        assert type(result['preflightChecks']) is int and 0 <= result['preflightChecks'] <= 6
-        assert type(result['modelInvocations']) is int and result['modelInvocations'] in [0, 1]
-        outcome.update(result)
-        assert returncode == 0 and result['passed']
+            'python3', '-I', '/app/scripts/staging/teetime_canary_worker.py', *worker_args], timeout=140)
+        if artifact_mode:
+            result = strict_json(output)
+            validate_worker_result(result, nonce=args.nonce, policy_hash=frozen_hashes[POLICY_PATH])
+            assert type(returncode) is int and returncode == (0 if result['passed'] else 1)
+            outcome['artifactResult'] = result
+            outcome['passed'] = result['passed']
+        else:
+            result = json.loads(output)
+            keys = {'passed', 'preflightPassed', 'authUnchanged', 'artifactVerified', 'modelInvocations', 'servedModelVerified', 'preflightChecks', 'authenticationRejected', 'taskFailureCode','terminalCount','systemCategory','diagnosticHint','artifactExists','artifactRegular','artifactExactContent','workspaceEntriesExact','exceptionCategory','aborted','elapsedMs','oomKillDelta','taskDiagnosticsPresent'}
+            assert set(result) == keys
+            assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode','terminalCount','systemCategory','diagnosticHint','exceptionCategory','elapsedMs','oomKillDelta'})
+            assert result['exceptionCategory'] in ['none','aborted','auth_hint','quota_hint','model_access_hint','transport_hint','process_hint','other']
+            assert type(result['elapsedMs']) is int and 0 <= result['elapsedMs'] <= 120000
+            assert result['oomKillDelta'] is None or type(result['oomKillDelta']) is int and 0 <= result['oomKillDelta'] <= 1024
+            assert type(result['terminalCount']) is int and result['terminalCount'] in [0,1]
+            assert result['systemCategory'] in ['none','task_list','file_change_failed','file_change_unexpected','format_warning','resume_warning','failback','other']
+            assert result['diagnosticHint'] in ['none','permission_hint','sandbox_hint','other']
+            assert result['taskFailureCode'] in ['not_started','worker_error','none','unexpected_system','terminal_rejected','provider_failed']
+            assert type(result['preflightChecks']) is int and 0 <= result['preflightChecks'] <= 6
+            assert type(result['modelInvocations']) is int and result['modelInvocations'] in [0, 1]
+            outcome.update(result)
+            assert returncode == 0 and result['passed']
     except BaseException:
         outcome['passed'] = False
     finally:
@@ -239,8 +276,15 @@ def main():
                 errors.append({'kind':'capture','id':ids['gateway'],'failure':'ThreadAlive'})
         outcome['cleanupVerified'] = not errors
         outcome['passed'] = outcome['passed'] and not errors
+        if artifact_mode and not outcome['passed']:
+            outcome['artifactResult'].update({'passed': False, 'artifactVerified': False,
+                'artifactBase64': None, 'artifactHash': None, 'bindingHash': None,
+                'manifestHash': None, 'sourceTree': None, 'failureCategory': 'rejected'})
         report = {'type': 'RESULT', 'nonce': args.nonce, 'owner': owner,
                   'result': outcome, 'cleanupErrors': errors, 'receiptDirectory': str(receipt), 'proxyMetrics': proxy_metrics}
+        if artifact_mode:
+            report.update({'task': 'artifact', 'artifactSourceSha': args.artifact_source,
+                           'artifactContractHash': contract_hash})
         (receipt/'result.json').write_text(json.dumps(report, indent=2))
         print(json.dumps(report), flush=True)
     return 0 if outcome['passed'] else 1

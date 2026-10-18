@@ -593,3 +593,78 @@ and exact-source CI are required before any later integration/rehearsal review.
 Independent architect final review approved source publication/CI with no blocking
 correction. servedModelVerified remains false and wrapper evidence remains a
 runtime obligation until the separately reviewed launcher selector is implemented.
+
+## Artifact selector source integration (not runtime-qualified)
+
+The existing invoke/run/worker lifecycle now accepts the closed --task selector:
+filesystem is the unchanged default; artifact additionally requires --artifact-source
+with an exact40-hex source. Artifact-only arguments in filesystem mode reject.
+The artifact operator derives the remote archive directory as
+teetime-auth-artifact-<source>/scripts/staging, with no arbitrary path input.
+Both operator and controller require a frozen source-manifest.json and exact
+local helper hashes before transport/resource creation. Source/base/image and
+consumed host/image helpers bind the complete reviewed archive. The image also
+requires TEETIME_AUTH_ARTIFACT_SOURCE_SHA=<source> alongside ARCHON_BUILD_SHA.
+
+Artifact READY has a separate exact schema: the original identities plus task,
+artifactSourceSha and artifactContractHash. The latter hashes the independent
+nonce/policy-bound expected artifact. Every expected helper hash derives from the
+operator archive; READY cannot supply its own expected values. Runtime image
+helpers are measured before credential delivery. Selector/source/contract/hash
+disagreement rejects before the host login is read. Strict duplicate-key JSON and
+a distinct protocol-error sentinel reject malformed data even after RESULT.
+
+The selected worker reuses the actual six-check preflight, bounded process, OOM
+reads and restricted task helpers. It snapshots auth bytes and empty workspace
+mask metadata before preflight, rechecks before task start and compares actual
+reads after the task. Preflight/workspace/auth/process/OOM failures cannot emit
+artifact bytes. A started task with no valid receipt has unknown modelInvocations
+(null), not a fabricated zero. Synthetic auth rejection has five checks and zero
+task/query attempts. Successful fixed tasks require six checks and OOM delta0.
+Legacy filesystem worker/result requirements remain in their separate branch.
+
+Controller artifact results use a separate exact schema with nested artifactResult.
+Task result, proxy receipt, cleanup and actual controller exit must agree. Failed
+cleanup scrubs artifact bytes/identities before RESULT emission. Host checks original
+login equality and cleanup before independently reparsing actual artifact bytes;
+uncertain outcomes emit no artifact. This slice performs no materialization.
+
+Plan/preflight: extend the proven lifecycle with one selector and separate schemas,
+not a duplicate launcher. Missing protocol and unsupported operator/worker arguments
+were observed RED. Additional tests observed contradictory cleanup and preflight
+workspace changes fail RED, then pass after guards were added.14 new protocol/operator/
+worker tests and3 unchanged legacy protocol tests initially passed locally. Fake SSH forbids
+real login reads; wrapper tests use temporary files and simulated UID/preflight/
+model behavior, not real credentials or Docker. Source syntax/ASCII checks apply.
+
+```text
+python -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_protocol.py
+python -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_operator.py
+python -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_worker.py
+```
+
+After separate source/CI/image and no-credential rehearsal review, the fixed form is:
+
+```text
+python -I scripts/staging/invoke-teetime-auth-canary.py --task artifact --artifact-source <40-hex-reviewed-source> --image sha256:<exact-image> --expected-sha <40-hex-base-source> --synthetic
+```
+
+STOP POINT: no new credential transfer or authenticated request has occurred.
+The existing watchdog starts after resource setup and is deadline-based; it does
+not prove parent-pinned setup/immediate-loss cleanup. New selector disconnect/
+cancellation transitions need exact-image no-credential rehearsals. This source
+does not start materialization, prove served-model identity, load real RunAuthority,
+publish a candidate ref, call a reviewer, revise active policy or admit the lane.
+
+Final source review found missing isolated-mode sibling imports and one omitted
+transitive Python dependency. Both reproduced RED in new regressions. Artifact
+mode now adds only source-owned /app/scripts/staging before helper imports, and
+the image/frozen inventory includes teetime_fixture_diagnostics.py. A required
+AST-based local Python import-closure test catches static dependency omissions;
+an actual python -I subprocess proves import resolution before source rejection,
+without auth/provider access.16 new selector tests plus3 unchanged legacy tests
+pass after these corrections. The import test maps only its trusted test source
+directory as an image-path surrogate; it does not qualify a Docker runtime.
+Independent architect source recheck approved publication/CI after both fixes.
+No selector rehearsal, credential transfer or authenticated attempt is approved by
+that source verdict; exact frozen source/image/manifest and runtime review remain.
