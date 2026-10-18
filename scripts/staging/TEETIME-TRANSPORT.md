@@ -68,8 +68,6 @@ bun test packages/providers/src/codex/provider.test.ts
 bun --filter @archon/providers type-check
 ```
 
-## Provider entrypoint
-
 ## Credential receiver candidate (not integrated)
 
 teetime_auth_receiver.py is a receiver candidate for a future inspected worker.
@@ -93,6 +91,36 @@ Four payload unit tests pass. This does not qualify the complete credential
 delivery lifecycle. A reviewed launcher must stop all model processes until
 receipt, preserve the original login, detect auth-copy changes in memory without
 logging hashes, and destroy the credential-bearing container on every exit.
+
+## Independent watchdog candidate
+
+The Windows SSH service can terminate ordinary detached descendants when the
+session exits. The first no-auth crash test demonstrated this, leaving the owned
+test worker behind; ownership-checked cleanup then removed that worker/network.
+The probe now requires CREATE_BREAKAWAY_FROM_JOB as well as detached/new-process
+group flags. It must fail before credentials if process creation is rejected.
+
+```text
+python -m unittest discover -s scripts/staging -p test_teetime_watchdog.py
+python scripts/staging/probe-teetime-watchdog.py --docker path/to/docker --image sha256:EXACT_IMAGE
+```
+
+This no-auth probe deliberately exits23 after establishing an independent
+watchdog. With --disconnect it instead waits so the operator can terminate the
+SSH client. The watchdog accepts exact full resource IDs and an owner label,
+binds READY to the manifest hash, publishes READY atomically, converts its fixed
+deadline to monotonic time, and records verified cleanup or explicit failures.
+The launcher checks watchdog liveness and remaining time before trusting READY.
+
+Laptop crash receipt teetime-auth-c1b98684e369 and separate killed-SSH receipt
+teetime-auth-1afd56fe0496 both reported cleanupVerified true with no errors.
+Fresh Docker listings confirmed each worker absent. Both used a sleeping worker
+on the prior e9d8d071 image and no credentials or Codex model. Six unit tests pass.
+
+The watchdog deadline is when cleanup begins, not proof of deletion at that
+instant. The credentialed launcher must reserve cleanup time within its total
+five-minute budget. Docker unavailability is a containment failure, never green.
+This standalone watchdog is not yet integrated into an authenticated launcher.
 
 ## Provider entrypoint contract
 
