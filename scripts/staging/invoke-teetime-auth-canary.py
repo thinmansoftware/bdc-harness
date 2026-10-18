@@ -95,9 +95,13 @@ def main():
         # Only known status fields leave this operator; no raw remote diagnostics.
         result = report['result']
         keys = {'passed','cleanupVerified','credentialReceived','preflightPassed','authUnchanged',
-                'artifactVerified','modelInvocations','servedModelVerified','preflightChecks','authenticationRejected','taskFailureCode'}
+                'artifactVerified','modelInvocations','servedModelVerified','preflightChecks','authenticationRejected','taskFailureCode',
+                'terminalCount','systemCategory','diagnosticHint','artifactExists','artifactRegular','artifactExactContent','workspaceEntriesExact'}
         assert set(result) == keys
-        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode'})
+        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode','terminalCount','systemCategory','diagnosticHint'})
+        assert type(result['terminalCount']) is int and result['terminalCount'] in [0,1]
+        assert result['systemCategory'] in ['none','task_list','file_change_failed','file_change_unexpected','format_warning','resume_warning','failback','other']
+        assert result['diagnosticHint'] in ['none','permission_hint','sandbox_hint','other']
         assert result['taskFailureCode'] in ['not_started','worker_error','none','unexpected_system','terminal_rejected','provider_failed']
         assert type(result['preflightChecks']) is int and 0 <= result['preflightChecks'] <= 6
         assert type(result['modelInvocations']) is int and result['modelInvocations'] in [0,1]

@@ -18,12 +18,14 @@ mock.module('../auth-refresh/index.js', () => ({
   isAuthErrorMessage: (message: string) => /401|unauthorized|refresh token/i.test(message),
 }));
 let failures: string[] = [];
+let injectedEvents: Record<string, unknown>[] = [];
 const runStreamed = mock(async () => {
   const failure = failures.shift();
   if (failure) throw new Error(failure);
   return {
     events: (async function* () {
       yield { type: 'thread.started', thread_id: 'owned-thread' };
+      yield* injectedEvents;
       yield {
         type: 'turn.completed',
         usage: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 },
@@ -39,6 +41,7 @@ const { CodexProvider } = await import('./provider');
 let cwdSpy: ReturnType<typeof spyOn>;
 beforeEach(() => {
   failures = [];
+  injectedEvents = [];
   for (const fn of [proactive, reactive, start, resume, sdk, runStreamed]) fn.mockClear();
   cwdSpy = spyOn(process, 'cwd').mockReturnValue('/workspace');
 });
@@ -60,6 +63,45 @@ test('restricted startup and owned resume use fixed options without global auth'
   for (const call of sdk.mock.calls) expect(call[0]).toEqual(restrictedClientOptions());
   expect(start).toHaveBeenCalledWith(restrictedThreadOptions());
   expect(resume).toHaveBeenCalledWith('owned-thread', restrictedThreadOptions());
+  expect(proactive).not.toHaveBeenCalled();
+  expect(reactive).not.toHaveBeenCalled();
+});
+
+test('actual provider normalization keeps task lists as discardable progress', async () => {
+  injectedEvents = [
+    {
+      type: 'item.completed',
+      item: {
+        type: 'todo_list',
+        items: [{ text: 'Synthetic untrusted progress', completed: false }],
+      },
+    },
+    {
+      type: 'item.completed',
+      item: {
+        type: 'file_change',
+        status: 'completed',
+        changes: [{ kind: 'add', path: '/workspace/canary.txt' }],
+      },
+    },
+  ];
+  const { acceptCanaryChunk } = await import('../../../../scripts/staging/teetime-canary-result');
+  const state = { results: 0, failureCode: 'none' as const };
+  const system: string[] = [];
+  const provider = new CodexProvider({
+    restricted: true,
+    restrictedTransport: 'teetime-connect-v1',
+  });
+  for await (const chunk of provider.sendQuery('synthetic', '/workspace')) {
+    if (chunk.type === 'system') system.push(chunk.content);
+    acceptCanaryChunk(state, chunk);
+  }
+  expect(system).toEqual([
+    '[TASKS] Tasks:\n[ ] Synthetic untrusted progress',
+    '[OK] File changes:\n[+] /workspace/canary.txt',
+  ]);
+  expect(state.results).toBe(1);
+  expect(state.failureCode).toBe('none');
   expect(proactive).not.toHaveBeenCalled();
   expect(reactive).not.toHaveBeenCalled();
 });

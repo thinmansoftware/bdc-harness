@@ -52,6 +52,9 @@ emit(
     modelInvocations: 1,
     servedModelVerified: false,
     failureCode: state.failureCode,
+    terminalCount: state.results,
+    systemCategory: state.systemCategory ?? 'none',
+    diagnosticHint: state.diagnosticHint ?? 'none',
   }) + '\n'
 );
 // The trusted wrapper receives the sanitized failure category and determines exit.

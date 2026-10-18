@@ -171,7 +171,9 @@ def preflight():
 def main():
     result = {'passed': False, 'preflightPassed': False, 'authUnchanged': False,
               'artifactVerified': False, 'modelInvocations': 0, 'servedModelVerified': False,
-              'taskFailureCode': 'not_started'}
+              'taskFailureCode': 'not_started', 'terminalCount': 0, 'systemCategory': 'none',
+              'diagnosticHint': 'none', 'artifactExists': False, 'artifactRegular': False,
+              'artifactExactContent': False, 'workspaceEntriesExact': False}
     original = None
     try:
         assert __debug__ and os.getuid() == 1001 and Path.cwd() == Path('/workspace')
@@ -188,10 +190,15 @@ def main():
         result['taskFailureCode'] = 'worker_error'
         raw = bounded_process(['bun', str(ROOT/'teetime-canary-task.ts')], 100)
         task = json.loads(raw)
-        assert set(task) == {'passed','modelInvocations','servedModelVerified','failureCode'}
+        assert set(task) == {'passed','modelInvocations','servedModelVerified','failureCode','terminalCount','systemCategory','diagnosticHint'}
         assert type(task['passed']) is bool and task['modelInvocations'] == 1 and task['servedModelVerified'] is False
         assert task['failureCode'] in ['none','unexpected_system','terminal_rejected','provider_failed']
+        assert type(task['terminalCount']) is int and task['terminalCount'] in [0,1]
+        assert task['systemCategory'] in ['none','task_list','file_change_failed','file_change_unexpected','format_warning','resume_warning','failback','other']
+        assert task['diagnosticHint'] in ['none','permission_hint','sandbox_hint','other']
         result['taskFailureCode'] = task['failureCode']
+        for key in ['terminalCount','systemCategory','diagnosticHint']:
+            result[key] = task[key]
         result['passed'] = task['passed'] and task['failureCode'] == 'none'
     except BaseException:
         result['passed'] = False
@@ -199,10 +206,12 @@ def main():
         # Trusted verification runs on failures too; a file alone never grants success.
         try:
             artifact = Path('/workspace/canary.txt')
+            result['artifactExists'] = artifact.exists()
+            result['artifactRegular'] = stat.S_ISREG(artifact.lstat().st_mode)
+            result['artifactExactContent'] = result['artifactRegular'] and artifact.stat().st_size == 22 and artifact.read_bytes() == b'tee-time-canary-ready\n'
+            result['workspaceEntriesExact'] = set(p.name for p in Path('/workspace').iterdir()) == {'.codex','.agents','canary.txt'}
             result['artifactVerified'] = (
-                set(p.name for p in Path('/workspace').iterdir()) == {'.codex','.agents','canary.txt'}
-                and stat.S_ISREG(artifact.lstat().st_mode) and artifact.stat().st_size == 22
-                and artifact.read_bytes() == b'tee-time-canary-ready\n')
+                result['artifactRegular'] and result['artifactExactContent'] and result['workspaceEntriesExact'])
         except Exception:
             result['artifactVerified'] = False
         try:

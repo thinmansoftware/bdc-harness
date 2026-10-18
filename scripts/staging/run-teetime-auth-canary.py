@@ -39,7 +39,9 @@ def main():
     outcome = {'passed': False, 'cleanupVerified': False, 'credentialReceived': False,
                'preflightPassed': False, 'authUnchanged': False, 'artifactVerified': False,
                'modelInvocations': 0, 'servedModelVerified': False, 'preflightChecks': 0,
-               'authenticationRejected': False, 'taskFailureCode': 'not_started'}
+               'authenticationRejected': False, 'taskFailureCode': 'not_started',
+               'terminalCount': 0, 'systemCategory': 'none', 'diagnosticHint': 'none',
+               'artifactExists': False, 'artifactRegular': False, 'artifactExactContent': False, 'workspaceEntriesExact': False}
     def d(*parts, **kwargs):
         return subprocess.run([args.docker, *parts], capture_output=True, check=True,
                               timeout=kwargs.pop('timeout', 15), **kwargs).stdout
@@ -170,9 +172,12 @@ def main():
         returncode, output = capture([args.docker, 'exec', '-w', '/workspace', ids['worker'],
             'python3', '-I', '/app/scripts/staging/teetime_canary_worker.py'], timeout=140)
         result = json.loads(output)
-        keys = {'passed', 'preflightPassed', 'authUnchanged', 'artifactVerified', 'modelInvocations', 'servedModelVerified', 'preflightChecks', 'authenticationRejected', 'taskFailureCode'}
+        keys = {'passed', 'preflightPassed', 'authUnchanged', 'artifactVerified', 'modelInvocations', 'servedModelVerified', 'preflightChecks', 'authenticationRejected', 'taskFailureCode','terminalCount','systemCategory','diagnosticHint','artifactExists','artifactRegular','artifactExactContent','workspaceEntriesExact'}
         assert set(result) == keys
-        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode'})
+        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode','terminalCount','systemCategory','diagnosticHint'})
+        assert type(result['terminalCount']) is int and result['terminalCount'] in [0,1]
+        assert result['systemCategory'] in ['none','task_list','file_change_failed','file_change_unexpected','format_warning','resume_warning','failback','other']
+        assert result['diagnosticHint'] in ['none','permission_hint','sandbox_hint','other']
         assert result['taskFailureCode'] in ['not_started','worker_error','none','unexpected_system','terminal_rejected','provider_failed']
         assert type(result['preflightChecks']) is int and 0 <= result['preflightChecks'] <= 6
         assert type(result['modelInvocations']) is int and result['modelInvocations'] in [0, 1]

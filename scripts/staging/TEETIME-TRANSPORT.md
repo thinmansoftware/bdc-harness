@@ -225,3 +225,24 @@ actual silent level before creating provider child loggers. It reports only fixe
 failure categories. The wrapper checks the artifact independently on failures;
 overall success still requires every preflight, task, artifact and auth check.
 These source defects do not prove the first attempt's sole failure cause.
+
+The second attempt, teetime-auth-05fc79cd2196 on source332a08c0/image3042606f,
+also passed preflight/auth preservation and cleanup but failed on an unexpected
+system notification, before a verified artifact. Its receipt does not distinguish
+task progress from failed file changes. It remains FAILED, not an approval.
+
+The next candidate classifies rejected system events using fixed categories and
+independently reports artifact existence/type/content, workspace entries and
+accepted terminal count. Known task-list progress is discarded as data after a
+test through the actual provider normalizer. Warnings, failbacks, extra file
+changes and invalid terminals still fail. No raw diagnostics leave the worker.
+
+No-auth apply-patch receipt teetime-patch-c5064e868c60 resolves a misleading
+success report: the helper created an outside-looking path in a private sandbox
+filesystem (device145), not the original HOME (device155). The original file was
+absent, synthetic auth unchanged/invisible, shell HOME/tmp writes denied, and the
+workspace contained only the exact canary file. This used constructor-generated
+policy overrides on image3042606f. An earlier exit-code-only interpretation as an
+original-HOME write was incorrect; no filesystem-policy expansion was applied.
+The operator probe is scripts/staging/probe-teetime-apply-patch.py and uses no auth
+or model. It is a diagnostic, not an admission gate based on helper exit alone.
