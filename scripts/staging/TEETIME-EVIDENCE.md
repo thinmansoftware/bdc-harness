@@ -278,3 +278,24 @@ STOP POINT: a separately reviewed lifecycle must remove the normally exited
 sole writable container and verify all volume references before readonly testing.
 The fixed test-worker command/output, actual EROFS write denial, independent
 before/after complete identities and bounded receipts are not implemented here.
+
+The separate image-owned teetime_materialization_check.py source now implements
+complete inventory/content/mode verification and fixed fixture assertions without
+importing or executing candidate code. It checks before/after manifest/tree IDs
+and requires an actual EROFS response to an attempted source write. Its six Linux
+unit tests include extra/missing files, links, metadata directories, byte/mode
+drift, actual writable-root rejection and mocked error categories. Mocked EROFS
+does not prove a real readonly mount. Descriptor traversal assumes the controller
+has already removed every writer and inspected that mount; it grants no custody.
+
+Source invocation for the future fixed fixture test worker:
+
+```text
+python3 -I /app/scripts/staging/teetime_materialization_check.py --manifest-hash <trusted-sha256> --source-tree <trusted-git-tree> < complete-candidate-frame.json
+```
+
+The future operator must reject frames above65536 bytes before resource creation,
+because its existing bounded subprocess transport has that smaller input limit.
+This fixed small fixture does not qualify12 MiB operator transport. Writer removal,
+exclusive volume lifecycle, real readonly mount, process-status receipts, watchdog
+failure cases and actual Linux runtime remain separate qualification gates.

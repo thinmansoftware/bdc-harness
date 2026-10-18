@@ -52,6 +52,7 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_artifact_contract.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_materialization_frame.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_materializer.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_materialization_check.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_proxy_receipt.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_canary_diagnostics.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_operator_protocol.py
