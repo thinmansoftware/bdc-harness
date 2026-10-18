@@ -12,7 +12,7 @@ def record(value):
 def final(phase='complete'):
     return {'kind': 'result', 'accepted': False, 'bytesBase64': None, 'intercepted': 0, 'threads': 0,
         'optionsVerified': False, 'threadOptionsVerified': False, 'importIntercepted': False,
-        'normalProviderEnd': False, 'counts': {}, 'abortedBeforeCleanup': True, 'phase': phase,
+        'normalProviderEnd': False, 'providerIteratorClosed': False, 'counts': {}, 'abortedBeforeCleanup': True, 'phase': phase,
         'errorName': 'Error', 'errorCode': None}
 
 
@@ -86,9 +86,10 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_accepted_result_rejects_contradictory_completion_fields(self):
         success = {**final(), 'accepted': True, 'bytesBase64': 'AA==',
-                   'normalProviderEnd': True, 'abortedBeforeCleanup': False, 'errorName': None}
+                   'normalProviderEnd': True, 'providerIteratorClosed': True, 'abortedBeforeCleanup': False, 'errorName': None}
         for key, value in [('errorName', 'Error'), ('errorCode', 'MODULE_NOT_FOUND'),
                            ('normalProviderEnd', False), ('abortedBeforeCleanup', True),
+                           ('providerIteratorClosed', False),
                            ('phase', 'collect')]:
             protocol = DiagnosticProtocol()
             phases = PHASES[:-1] if key == 'phase' else PHASES

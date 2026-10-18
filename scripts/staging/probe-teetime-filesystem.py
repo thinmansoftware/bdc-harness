@@ -97,7 +97,7 @@ try:
     if artifact_mode:
         paths = ['scripts/staging/'+name for name in [worker_name, 'teetime-artifact-stream.ts',
             'teetime_artifact_contract.py', 'teetime_snapshot.py', 'teetime_git_objects.py',
-            'teetime_fixture_diagnostics.py']]
+            'teetime_fixture_diagnostics.py', 'teetime-sdk-lifecycle.ts']]
         paths += ['packages/providers/src/codex/'+name for name in [
             'provider.ts', 'restricted-policy.ts', 'restricted-run-factory.ts']]
         paths += ['packages/providers/src/types.ts', 'packages/paths/src/logger.ts']

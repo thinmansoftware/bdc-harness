@@ -382,3 +382,29 @@ cases require phase evidence, expected controller exit, independent watchdog
 cleanup and fresh absence; generic controller failure is never a passing test.
 No daemon case has run at this source-preparation point. Publication/review-package,
 replay protection, policy revision, registry admission and app CI/CD remain open.
+
+Exact controller source16a75285bca5873490956c00216fdcbf0cfc58df passed hosted
+CI39132506256, including the eight lifecycle/resource tests. No daemon case is
+qualified by that CI result alone.
+
+The next bounded full SDK case at3f6bc3f7 reached phase complete and emitted a
+final record, but Bun exited1. It remains FAILED: teetime-fs-122854c05cc3/
+execution-failure.json. One loopback request used the expected model, with no
+server errors; no real credentials/provider requests occurred. Cleanup passed.
+Neither finalObserved nor phase complete can override the failed process exit.
+
+Installed SDK0.153.3 removes child error listeners and kills the child when its
+iterator unwinds. The fixture then called abort unconditionally after closure.
+A credential-free Windows/Bun reproduction of this exact process sequence exits1
+with AbortError after printing its marker; omitting the late abort exits0. Linux
+CI must independently establish the reproduction; Windows alone is insufficient.
+
+teetime-sdk-lifecycle.ts tracks iterator closure in finally only after underlying
+unwinding and clears the active-query timer there. Normal completion remains
+separate from closure due to rejection/error. Catch/final cleanup aborts only an
+active iterator. Existing outer capture/container deadlines, normal process exit,
+unchanged synthetic auth/workspace and actual cleanup remain required. The SDK,
+production provider, acceptance criteria and budgets are unchanged. No global
+AbortError handler is installed. Six lifecycle/process tests pass locally, as do
+the full scripts typecheck and strict diagnostic tests. Another runtime fixture
+requires new source review, exact CI and frozen image/hash qualification.

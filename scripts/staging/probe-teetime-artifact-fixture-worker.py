@@ -108,12 +108,12 @@ url = 'http://127.0.0.1:'+str(server.server_address[1])+'/v1'
 code = r'''
 const emit=process.stdout.write.bind(process.stdout);
 let intercepted=0,threads=0,optionsVerified=false,threadOptionsVerified=false,importIntercepted=false;
-let accepted=false,normalProviderEnd=false,bytesBase64=null;
+let accepted=false,bytesBase64=null,lifecycle=null;
 let phase='logger',errorName=null,errorCode=null;
 function mark(next){phase=next;emit(JSON.stringify({kind:'phase',phase})+'\n');}
 const counts={};
 const controller=new AbortController();
-const timer=setTimeout(()=>controller.abort(),25000);
+const timer=setTimeout(()=>{if(!lifecycle||!lifecycle.closed)controller.abort();},25000);
 try {
  mark('logger');
  const {rootLogger}=await import('/app/packages/paths/src/logger.ts');
@@ -155,15 +155,16 @@ try {
  mark('factory-import');
  const {createRestrictedCanaryWorkerProvider}=await import('/app/packages/providers/src/codex/restricted-run-factory.ts');
  const {collectArtifactStream}=await import('/app/scripts/staging/teetime-artifact-stream.ts');
+ const {ArtifactProviderLifecycle}=await import('/app/scripts/staging/teetime-sdk-lifecycle.ts');
  mark('factory-construct');
  const provider=createRestrictedCanaryWorkerProvider({runId:'artifact-fixture-run',policyDigest:FIXTURE_POLICY,workspace:'/workspace'});
+ lifecycle=new ArtifactProviderLifecycle(controller,()=>clearTimeout(timer));
  async function* observed() {
-  for await(const chunk of provider.sendQuery('Synthetic infrastructure fixture. Return one JSON artifact message only. Do not use tools or modify any files.','/workspace',undefined,{abortSignal:controller.signal})) {
+  for await(const chunk of lifecycle.observe(provider.sendQuery('Synthetic infrastructure fixture. Return one JSON artifact message only. Do not use tools or modify any files.','/workspace',undefined,{abortSignal:controller.signal}))) {
    counts[chunk.type]=(counts[chunk.type]??0)+1;
    if(Object.keys(counts).length>8) throw new Error('event type bound');
    yield chunk;
   }
-  normalProviderEnd=true;
  }
  mark('collect');
  const bytes=await collectArtifactStream(observed(),controller.signal);
@@ -173,12 +174,15 @@ try {
 } catch(error) {
  errorName=['Error','TypeError','SyntaxError','ResolveMessage'].includes(error?.name)?error.name:'other';
  errorCode=['MODULE_NOT_FOUND','ERR_MODULE_NOT_FOUND','ERR_PACKAGE_PATH_NOT_EXPORTED'].includes(error?.code)?error.code:null;
- controller.abort();
-} finally {clearTimeout(timer);}
+ if(lifecycle)lifecycle.abortIfActive();else controller.abort();
+} finally {
+ if(lifecycle)lifecycle.abortIfActive();else controller.abort();
+ clearTimeout(timer);
+}
 const abortedBeforeCleanup=controller.signal.aborted;
-controller.abort();
+const normalProviderEnd=lifecycle?.normalEnd??false,providerIteratorClosed=lifecycle?.closed??false;
 emit(JSON.stringify({kind:'result',accepted,bytesBase64,intercepted,threads,optionsVerified,threadOptionsVerified,
- importIntercepted,normalProviderEnd,counts,abortedBeforeCleanup,phase,errorName,errorCode})+'\n');
+ importIntercepted,normalProviderEnd,providerIteratorClosed,counts,abortedBeforeCleanup,phase,errorName,errorCode})+'\n');
 '''
 bootstrap = 'const FIXTURE_URL='+json.dumps(url)+';\nconst FIXTURE_POLICY='+json.dumps(binding['policyHash'])+';\n'+code
 protocol = DiagnosticProtocol()
@@ -223,6 +227,7 @@ workspace_unchanged = (set(path.name for path in Path('/workspace').iterdir()) =
 common = (state['requests'] == 1 and not state['errors'] and state['modelVerified']
           and sdk['intercepted'] == 1 and sdk['threads'] == 1 and sdk['optionsVerified']
           and sdk['threadOptionsVerified'] and sdk['importIntercepted']
+          and sdk['providerIteratorClosed']
           and auth.read_bytes() == original and workspace_unchanged)
 outcome = (candidate_verified and sdk['counts'] == {'assistant': 1, 'result': 1}
            and sdk['normalProviderEnd'] and not sdk['abortedBeforeCleanup']) if case == 'success' else (

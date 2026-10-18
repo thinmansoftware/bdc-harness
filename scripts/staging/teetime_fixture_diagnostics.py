@@ -8,9 +8,9 @@ PHASES = ('logger', 'resolve', 'real-import', 'policy-options', 'mock-install',
           'import-verify', 'factory-import', 'factory-construct', 'collect', 'complete')
 FINAL_KEYS = {'kind', 'accepted', 'bytesBase64', 'intercepted', 'threads', 'optionsVerified',
     'threadOptionsVerified', 'importIntercepted', 'normalProviderEnd', 'counts',
-    'abortedBeforeCleanup', 'phase', 'errorName', 'errorCode'}
+    'abortedBeforeCleanup', 'providerIteratorClosed', 'phase', 'errorName', 'errorCode'}
 BOOLEAN_KEYS = ('accepted', 'optionsVerified', 'threadOptionsVerified', 'importIntercepted',
-                'normalProviderEnd', 'abortedBeforeCleanup')
+                'normalProviderEnd', 'providerIteratorClosed', 'abortedBeforeCleanup')
 CHUNK_TYPES = {'assistant', 'result', 'thinking', 'error', 'system', 'tool_use', 'tool_result',
                'rate_limit', 'routing', 'warning'}
 
@@ -73,7 +73,7 @@ class DiagnosticProtocol:
         encoded = value['bytesBase64']
         if value['accepted']:
             if (value['phase'] != 'complete' or value['errorName'] is not None or value['errorCode'] is not None
-                    or not value['normalProviderEnd'] or value['abortedBeforeCleanup']):
+                    or not value['normalProviderEnd'] or not value['providerIteratorClosed'] or value['abortedBeforeCleanup']):
                 raise ValueError('contradictory accepted diagnostic result')
             if type(encoded) is not str or len(encoded) > 32768:
                 raise ValueError('diagnostic artifact encoding')
