@@ -1,0 +1,39 @@
+# Credential-free acquisition only. No application source, account or model call.
+# Linux amd64 manifests were read from the official registries on 2026-10-18.
+FROM oven/bun:1.3.11-slim@sha256:49a1dfafe49d774e0b75a17bd596d5a8e49231c1fab76d9a30b6fc690c30f30e AS bun
+FROM mcr.microsoft.com/playwright:v1.64.1-noble@sha256:bdfda2a8fdf48707c5e50a49bd3e06d8d0c759153dc8ee057d8a81c3450bb3e9
+
+USER root
+COPY --from=bun /usr/local/bin/bun /opt/teetime/bun/bun
+# Official Node SHASUMS256.txt, retained separately with its retrieval identity.
+RUN env -i PATH=/usr/bin:/bin curl --fail --location --silent --show-error \
+      --max-time 120 --output /tmp/teetime-node.tar.xz \
+      https://nodejs.org/dist/v24.22.0/node-v24.22.0-linux-x64.tar.xz \
+    && echo 'cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008  /tmp/teetime-node.tar.xz' | sha256sum --check --strict \
+    && mkdir -p /opt/teetime/node \
+    && tar --extract --xz --file /tmp/teetime-node.tar.xz --strip-components=1 --no-same-owner --directory /opt/teetime/node \
+    && rm /tmp/teetime-node.tar.xz \
+    && test "$(/opt/teetime/node/bin/node --version)" = v24.22.0 \
+    && test "$(/opt/teetime/bun/bun --version)" = 1.3.11 \
+    && mkdir -p /home/teetime /opt/teetime/dependencies /workspace \
+    && chown 1001:1001 /home/teetime /opt/teetime/dependencies /workspace
+
+COPY --chown=1001:1001 teetime-demo-package.json /opt/teetime/dependencies/package.json
+USER 1001:1001
+WORKDIR /opt/teetime/dependencies
+# This is the one lock GENERATION stage, not an acceptance install. Lifecycle
+# scripts are disabled. The resulting complete bun.lock must be frozen/reviewed.
+RUN env -i PATH=/opt/teetime/bun:/opt/teetime/node/bin:/usr/bin:/bin \
+      HOME=/home/teetime BUN_INSTALL_CACHE_DIR=/tmp/teetime-bun-cache \
+      /opt/teetime/bun/bun install --ignore-scripts --linker=hoisted --no-progress
+
+# Source/version/native-load checks only; no app compilation or browser launch.
+RUN --network=none env -i PATH=/opt/teetime/node/bin:/usr/bin:/bin HOME=/home/teetime \
+      /opt/teetime/node/bin/node --input-type=module -e \
+      'import {createRequire} from "node:module"; const require=createRequire(import.meta.url); for(const [name,version] of Object.entries({next:"16.4.2",react:"19.3.1","react-dom":"19.3.1",typescript:"5.9.3","@playwright/test":"1.64.1"})){if(require(name+"/package.json").version!==version)throw Error("dependency version mismatch")} require("@next/swc-linux-x64-gnu");'
+
+ENV PATH="/opt/teetime/node/bin:/opt/teetime/bun:/usr/bin:/bin"
+ENV HOME="/home/teetime"
+ENV PLAYWRIGHT_BROWSERS_PATH="/ms-playwright"
+WORKDIR /workspace
+ENTRYPOINT ["/opt/teetime/node/bin/node"]
