@@ -34,6 +34,16 @@ export type EvidenceSpec =
 
 type EvidenceScalar = string | number | boolean;
 
+/** Loop-owned evidence only; the public registration schema retains six kinds. */
+export type InternalEvidenceSpec =
+  | EvidenceSpec
+  | {
+      kind: 'cascade_workflow_completed';
+      cascadeId: string;
+      woId: string;
+      project: string;
+    };
+
 export interface EvidenceResult {
   ok: boolean;
   pointer: string | null;
@@ -44,11 +54,16 @@ export interface CascadeEvidenceDeps {
   query?: ExpectationDeps['query'];
 }
 
-/** Exact internal run evidence for usefulness grading; no new registration kind. */
+/** Exact bound run evidence shared by grading and the loop-owned completion check. */
 export async function readCascadeWorkflowEvidence(
   identity: { cascadeId: string; woId: string; project: string | undefined },
   deps: CascadeEvidenceDeps = {}
-): Promise<{ earliestRunId: string; status: string; prOpened: boolean }> {
+): Promise<{
+  earliestRunId: string;
+  completedRunId: string | null;
+  status: string;
+  prOpened: boolean;
+}> {
   try {
     if (
       [identity.cascadeId, identity.woId, identity.project].some(
@@ -108,6 +123,7 @@ export async function readCascadeWorkflowEvidence(
     let firstRunId: string | undefined;
     let status: string | undefined;
     let completed = false;
+    let completedRunId: string | null = null;
     let prOpened = false;
     for (const [runId, workflowName] of runs) {
       const result = await query<{
@@ -131,6 +147,7 @@ export async function readCascadeWorkflowEvidence(
       firstRunId ??= runId;
       status = row.status;
       completed ||= row.status === 'completed';
+      if (row.status === 'completed') completedRunId ??= runId;
       try {
         // Preserve existing PR metadata semantics; this phase changes ownership
         // binding, not the metadata producer's evidence contract.
@@ -141,7 +158,12 @@ export async function readCascadeWorkflowEvidence(
       }
     }
     if (!firstRunId || !status) throw new Error('no proven workflow');
-    return { earliestRunId: firstRunId, status: completed ? 'completed' : status, prOpened };
+    return {
+      earliestRunId: firstRunId,
+      completedRunId,
+      status: completed ? 'completed' : status,
+      prOpened,
+    };
   } catch {
     // UNKNOWN must throw so the existing grading catch skips noise grading too.
     throw new Error('taskmaster_cascade_evidence_unknown');
@@ -149,6 +171,7 @@ export async function readCascadeWorkflowEvidence(
 }
 
 export interface ExpectationDeps {
+  readCascade?: typeof readCascadeRecordById;
   fetch?: typeof fetch;
   // Generic result typing keeps evidence implementations free of unsafe casts.
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters
@@ -495,7 +518,7 @@ async function sendRedispatch(
 export function renderEscalationBody(expectation: taskmasterDb.TmExpectation): string {
   let evidence: string;
   try {
-    const spec = JSON.parse(expectation.evidence_json) as EvidenceSpec;
+    const spec = JSON.parse(expectation.evidence_json) as InternalEvidenceSpec;
     evidence = describeEvidence(spec);
   } catch {
     // Never let an unparseable spec swallow the escalation itself.
@@ -522,8 +545,10 @@ export function renderEscalationBody(expectation: taskmasterDb.TmExpectation): s
 }
 
 /** One evidence spec as a phrase, for the escalation body. */
-function describeEvidence(spec: EvidenceSpec): string {
+function describeEvidence(spec: InternalEvidenceSpec): string {
   switch (spec.kind) {
+    case 'cascade_workflow_completed':
+      return `a completed workflow in cascade ${spec.cascadeId} for ${spec.woId} on ${spec.project}`;
     case 'issue_comment_exists':
       return `a comment on ${spec.repo}#${String(spec.number)}${
         spec.author ? ` by ${spec.author}` : ''
@@ -551,10 +576,18 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
   for (const expectation of active) {
     let evidence: EvidenceResult;
     try {
-      evidence = await (
-        deps.checkEvidence ??
-        ((spec: EvidenceSpec): Promise<EvidenceResult> => checkEvidence(spec, deps))
-      )(JSON.parse(expectation.evidence_json) as EvidenceSpec);
+      const spec = JSON.parse(expectation.evidence_json) as InternalEvidenceSpec;
+      if (spec.kind === 'cascade_workflow_completed') {
+        const bound = await readCascadeWorkflowEvidence(spec, deps);
+        evidence = bound.completedRunId
+          ? { ok: true, pointer: `workflow:${bound.completedRunId}` }
+          : { ok: false, pointer: null };
+      } else {
+        evidence = await (
+          deps.checkEvidence ??
+          ((publicSpec: EvidenceSpec): Promise<EvidenceResult> => checkEvidence(publicSpec, deps))
+        )(spec);
+      }
     } catch (error) {
       log.warn(
         { err: error as Error, expectationId: expectation.id },
