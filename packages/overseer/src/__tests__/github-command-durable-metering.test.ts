@@ -22,13 +22,19 @@ test('real CLI processes persist request counts and refuse an exhausted shared p
   };
   const driver = join(import.meta.dir, '../../../../scripts/github-service-exec.ts');
   const run = (code: string): ReturnType<typeof Bun.spawnSync> =>
-    Bun.spawnSync({
-      cmd: [process.execPath, driver, 'run_nodes', process.execPath, '-e', code],
-      env,
-      stdin: new Uint8Array(),
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    Bun.spawnSync(
+      {
+        cmd: [process.execPath, driver, 'run_nodes', process.execPath, '-e', code],
+        env,
+        stdin: new Uint8Array(),
+        stdout: 'pipe',
+        stderr: 'pipe',
+        // Each real CLI initializes an owned SQLite database before its command.
+        // Bound both children explicitly within the integration-test budget.
+        timeout: 20_000,
+      },
+      45_000
+    );
   let db: SqliteAdapter | undefined;
   let databaseSpy: ReturnType<typeof spyOn> | undefined;
   try {
