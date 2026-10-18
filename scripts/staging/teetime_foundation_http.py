@@ -125,6 +125,16 @@ def header_map(pairs):
     return result,total
 
 
+def validate_case_headers(case_id,headers):
+    if case_id in ('root-get','missing-get'): media_type(headers,'text/html')
+    if case_id=='health-get': media_type(headers,'application/json')
+    if case_id in ('health-get','health-head'): no_store(headers.get('cache-control',''))
+    if case_id=='health-options':
+        allowed=http_list(headers.get('allow',''))
+        if len(allowed)!=3 or set(allowed)!={'GET','HEAD','OPTIONS'}:
+            raise ValueError('foundation Allow method set rejected')
+
+
 def validate_foundation_http(records):
     if type(records) is not tuple or len(records)!=len(HTTP_CASES):
         raise ValueError('foundation complete HTTP cases required')
@@ -140,6 +150,7 @@ def validate_foundation_http(records):
                 or type(record.body) is not bytes or len(record.body)>limit):
             raise ValueError('foundation HTTP case observation rejected')
         headers,header_bytes=header_map(record.headers)
+        validate_case_headers(case_id,headers)
         total+=header_bytes+len(record.body)
         if total>1048576: raise ValueError('foundation aggregate HTTP bytes exceeded')
         if 'content-length' in headers:
@@ -151,24 +162,17 @@ def validate_foundation_http(records):
             raise ValueError('foundation empty observed body required')
         try: text=record.body.decode('utf-8')
         except UnicodeError: raise ValueError('foundation HTTP UTF-8 required') from None
-        if case_id in ('root-get','missing-get'): media_type(headers,'text/html')
         if case_id=='root-get':
             unescaped=html.unescape(text)
             if any(expected not in unescaped for expected in ["What's That Tee Time Again?",'Simulated prototype. No live availability or bookings.']):
                 raise ValueError('foundation root text presence required')
         if case_id=='health-get':
-            media_type(headers,'application/json')
             try:
                 validate_depth(text)
                 value=json.loads(text,object_pairs_hook=unique_object,parse_constant=reject_constant)
             except (ValueError,RecursionError): raise ValueError('foundation health JSON rejected') from None
             if type(value) is not dict or value!={'status':'ok','mode':'simulated'}:
                 raise ValueError('foundation exact simulated health required')
-        if case_id in ('health-get','health-head'): no_store(headers.get('cache-control',''))
-        if case_id=='health-options':
-            allowed=http_list(headers.get('allow',''))
-            if len(allowed)!=3 or set(allowed)!={'GET','HEAD','OPTIONS'}:
-                raise ValueError('foundation Allow method set rejected')
         observed.append(HTTPObservation(case_id,method,path,status,len(record.body),
                         hashlib.sha256(record.body).hexdigest(),
                         hashlib.sha256(canonical(record.headers).encode('ascii')).hexdigest()))
