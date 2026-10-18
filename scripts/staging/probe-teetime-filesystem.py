@@ -17,6 +17,7 @@ parser.add_argument('--expected-sha',required=True)
 selector = parser.add_mutually_exclusive_group()
 selector.add_argument('--patch-fixture',action='store_true')
 selector.add_argument('--artifact-fixture',action='store_true')
+selector.add_argument('--artifact-import-only',action='store_true')
 parser.add_argument('--artifact-case',choices=['success','duplicate'],default='success')
 parser.add_argument('--artifact-source')
 parser.add_argument('--pids-budget',type=int,choices=[64,128],default=64)
@@ -26,11 +27,15 @@ if not __debug__:
 assert re.fullmatch('sha256:[a-f0-9]{64}',args.image)
 assert re.fullmatch('[a-f0-9]{40}',args.expected_sha)
 root = Path(__file__).parent
-if args.artifact_fixture:
+artifact_mode = args.artifact_fixture or args.artifact_import_only
+if artifact_mode:
     assert re.fullmatch('[a-f0-9]{40}',args.artifact_source or '') and args.pids_budget == 128
+    if args.artifact_import_only:
+        assert args.artifact_case == 'success'
 else:
     assert args.artifact_source is None and args.artifact_case == 'success'
-worker_name = ('probe-teetime-artifact-fixture-worker.py' if args.artifact_fixture else
+worker_name = ('probe-teetime-sdk-import-worker.py' if args.artifact_import_only else
+               'probe-teetime-artifact-fixture-worker.py' if args.artifact_fixture else
                'probe-teetime-patch-fixture-worker.py' if args.patch_fixture else
                'probe-teetime-filesystem-worker.py')
 source = (root/worker_name).read_bytes()
@@ -48,7 +53,7 @@ def d(*parts):
 try:
     image = json.loads(d('image','inspect',args.image))[0]
     assert image['Id'] == args.image and 'ARCHON_BUILD_SHA='+args.expected_sha in image['Config']['Env']
-    if args.artifact_fixture:
+    if artifact_mode:
         assert 'TEETIME_ARTIFACT_SOURCE_SHA='+args.artifact_source in image['Config']['Env']
     profile = root/'codex-probe-seccomp.json'
     baseline = json.loads((root/'moby-default-seccomp.json').read_bytes())
@@ -89,9 +94,10 @@ try:
     d('start',identifier)
     assert json.loads(d('inspect',identifier))[0]['State']['Running'] is True
     artifact_hashes = {}
-    if args.artifact_fixture:
+    if artifact_mode:
         paths = ['scripts/staging/'+name for name in [worker_name, 'teetime-artifact-stream.ts',
-            'teetime_artifact_contract.py', 'teetime_snapshot.py', 'teetime_git_objects.py']]
+            'teetime_artifact_contract.py', 'teetime_snapshot.py', 'teetime_git_objects.py',
+            'teetime_fixture_diagnostics.py']]
         paths += ['packages/providers/src/codex/'+name for name in [
             'provider.ts', 'restricted-policy.ts', 'restricted-run-factory.ts']]
         paths += ['packages/providers/src/types.ts', 'packages/paths/src/logger.ts']
@@ -117,7 +123,7 @@ try:
     diagnostic_passed = result['diagnosticPassed'] is True
     report = {'imageId':args.image,'sourceSha':args.expected_sha,
               'probeSha256':hashlib.sha256(source).hexdigest(),'pidsLimit':args.pids_budget,'result':result}
-    if args.artifact_fixture:
+    if artifact_mode:
         report.update({'artifactSourceSha':args.artifact_source,'artifactFileHashes':artifact_hashes})
     (receipt/'result.json').write_text(json.dumps(report,indent=2))
     print(json.dumps(report))

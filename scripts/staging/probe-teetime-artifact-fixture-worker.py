@@ -5,6 +5,7 @@ import http.server
 import io
 import json
 import os
+import queue
 from pathlib import Path
 import sys
 import threading
@@ -12,6 +13,7 @@ import threading
 sys.path.insert(0, '/app/scripts/staging')
 from teetime_artifact_contract import parse_artifact
 from teetime_bounded_process import capture
+from teetime_fixture_diagnostics import DiagnosticProtocol
 from teetime_snapshot import SnapshotFile, snapshot_manifest
 
 if not __debug__ or os.getuid() != 1001 or sys.argv[1:] not in [['success'], ['duplicate']]:
@@ -105,23 +107,27 @@ server_thread.start()
 url = 'http://127.0.0.1:'+str(server.server_address[1])+'/v1'
 code = r'''
 const emit=process.stdout.write.bind(process.stdout);
-const {rootLogger}=await import('/app/packages/paths/src/logger.ts');
-rootLogger.level='silent';
-console.log=console.info=console.warn=console.error=console.debug=()=>{};
 let intercepted=0,threads=0,optionsVerified=false,threadOptionsVerified=false,importIntercepted=false;
 let accepted=false,normalProviderEnd=false,bytesBase64=null;
-let phase='resolve',errorName=null,errorCode=null;
+let phase='logger',errorName=null,errorCode=null;
+function mark(next){phase=next;emit(JSON.stringify({kind:'phase',phase})+'\n');}
 const counts={};
 const controller=new AbortController();
 const timer=setTimeout(()=>controller.abort(),25000);
 try {
+ mark('logger');
+ const {rootLogger}=await import('/app/packages/paths/src/logger.ts');
+ rootLogger.level='silent';
+ console.log=console.info=console.warn=console.error=console.debug=()=>{};
+ mark('resolve');
  const {isDeepStrictEqual}=await import('node:util');
  const {mock}=await import('bun:test');
  const sdkPath=import.meta.resolve('@openai/codex-sdk','file:///app/packages/providers/src/codex/provider.ts');
- phase='real-import';
+ mark('real-import');
  const real=await import(sdkPath);
  const RealCodex=real.Codex;
- phase='policy-options';
+ const RealThread=real.Thread;
+ mark('policy-options');
  const {restrictedClientOptions,restrictedThreadOptions}=await import('/app/packages/providers/src/codex/restricted-policy.ts');
  const expected=restrictedClientOptions('teetime-connect-v1');
  class FixtureCodex extends RealCodex {
@@ -141,15 +147,15 @@ try {
    return super.startThread(options);
   }
  }
- phase='mock-install';
- mock.module(sdkPath,()=>({...real,Codex:FixtureCodex}));
- phase='import-verify';
+ mark('mock-install');
+ mock.module(sdkPath,()=>({Codex:FixtureCodex,Thread:RealThread}));
+ mark('import-verify');
  importIntercepted=(await import(sdkPath)).Codex===FixtureCodex;
  if(!importIntercepted) throw new Error('SDK import was not intercepted');
- phase='factory-import';
+ mark('factory-import');
  const {createRestrictedCanaryWorkerProvider}=await import('/app/packages/providers/src/codex/restricted-run-factory.ts');
  const {collectArtifactStream}=await import('/app/scripts/staging/teetime-artifact-stream.ts');
- phase='factory-construct';
+ mark('factory-construct');
  const provider=createRestrictedCanaryWorkerProvider({runId:'artifact-fixture-run',policyDigest:FIXTURE_POLICY,workspace:'/workspace'});
  async function* observed() {
   for await(const chunk of provider.sendQuery('Synthetic infrastructure fixture. Return one JSON artifact message only. Do not use tools or modify any files.','/workspace',undefined,{abortSignal:controller.signal})) {
@@ -159,11 +165,11 @@ try {
   }
   normalProviderEnd=true;
  }
- phase='collect';
+ mark('collect');
  const bytes=await collectArtifactStream(observed(),controller.signal);
  bytesBase64=Buffer.from(bytes).toString('base64');
  accepted=true;
- phase='complete';
+ mark('complete');
 } catch(error) {
  errorName=['Error','TypeError','SyntaxError','ResolveMessage'].includes(error?.name)?error.name:'other';
  errorCode=['MODULE_NOT_FOUND','ERR_MODULE_NOT_FOUND','ERR_PACKAGE_PATH_NOT_EXPORTED'].includes(error?.code)?error.code:null;
@@ -171,21 +177,39 @@ try {
 } finally {clearTimeout(timer);}
 const abortedBeforeCleanup=controller.signal.aborted;
 controller.abort();
-emit(JSON.stringify({accepted,bytesBase64,intercepted,threads,optionsVerified,threadOptionsVerified,
+emit(JSON.stringify({kind:'result',accepted,bytesBase64,intercepted,threads,optionsVerified,threadOptionsVerified,
  importIntercepted,normalProviderEnd,counts,abortedBeforeCleanup,phase,errorName,errorCode})+'\n');
 '''
 bootstrap = 'const FIXTURE_URL='+json.dumps(url)+';\nconst FIXTURE_POLICY='+json.dumps(binding['policyHash'])+';\n'+code
+protocol = DiagnosticProtocol()
+exit_code = None
+failure = None
 try:
-    exit_code, output = capture(['bun', '-e', bootstrap], 35, limit=32768)
+    exit_code, _ = capture(['bun', '-e', bootstrap], 35, limit=32768, on_stdout=protocol.feed)
     if exit_code != 0:
-        raise ValueError('fixture SDK process failed')
-    sdk = json.loads(output)
+        failure = 'sdk-nonzero-exit'
+    else:
+        sdk = protocol.finish(exit_code)
+except (TimeoutError, queue.Empty):
+    failure = 'sdk-capture-deadline'
+except ValueError:
+    failure = 'sdk-capture-or-protocol-bound'
+except Exception:
+    failure = 'sdk-capture-failure'
 finally:
     server.shutdown()
     server.server_close()
     server_thread.join(timeout=3)
 if server_thread.is_alive():
-    raise ValueError('fixture server did not stop')
+    failure = 'server-stop-failure'
+if failure:
+    # Markers and even a final result cannot salvage a process or capture failure.
+    print(json.dumps({'diagnosticPassed': False, 'case': case, 'failureCategory': failure,
+        'sdkExitCode': exit_code, 'lastValidatedPhase': protocol.last_phase,
+        'finalObserved': protocol.final is not None, 'operations': state,
+        'syntheticAuthUnchanged': auth.read_bytes() == original,
+        'credentialsUsed': False, 'realProviderRequests': 0}), flush=True)
+    raise SystemExit(1)
 candidate_verified = False
 if sdk['accepted']:
     import base64

@@ -299,3 +299,38 @@ because its existing bounded subprocess transport has that smaller input limit.
 This fixed small fixture does not qualify12 MiB operator transport. Writer removal,
 exclusive volume lifecycle, real readonly mount, process-status receipts, watchdog
 failure cases and actual Linux runtime remain separate qualification gates.
+
+The808e1579 diagnostics-only runtime case also failed. The container stopped with
+exit1 and no stdout; cleanup passed. Receipt: teetime-fs-4ec83cce2a2e/
+execution-failure.json. Exact-source CI39130869507 passed separately, including
+the required Linux writer tests. No duplicate, authenticated or successful SDK
+qualification result is inferred. Both failed runs remain in the audit record.
+
+The next diagnostics source moves logger import inside the protected block and
+snapshots both SDK exports before installing the mock, avoiding a live-namespace
+spread. That mock interaction is a hypothesis, not a proven cause of the failure.
+teetime_fixture_diagnostics.py consumes bounded ASCII newline-delimited records,
+strict ordered phases and one exact final result. It rejects duplicate keys,
+unknown fields/phases/error categories, incomplete/oversized records and results
+after termination. Nonzero/unknown process exit cannot accept a valid final.
+Timeout, queue deadline, process failure and malformed protocol emit one fixed
+failure receipt with the last validated phase; raw stderr/errors are discarded.
+Budgets and acceptance criteria are unchanged. Eleven pure synthetic protocol
+tests pass. Preparing this source does not authorize another runtime attempt.
+
+The fixed --artifact-import-only selector prepares an initialization diagnostic
+with no HTTP server, auth file, provider construction, thread or query. It loads
+the real logger, policy, SDK, explicit saved-export mock and actual factory module.
+Ordered phase records end in a separate import-only-result schema. That marker
+never grants artifact acceptance. The same frozen source/image/helper checks,
+networknone, metadata masks, nonroot/readonly worker, bounds and cleanup apply.
+The worker checks HOME/workspace remain unchanged. Invocation after separate
+source/runtime review and exact CI/image qualification:
+
+```text
+python -I probe-teetime-filesystem.py --docker <operator-docker-path> --image sha256:<exact-image-id> --expected-sha <base-ARCHON_BUILD_SHA> --artifact-import-only --artifact-source <exact-artifact-commit> --pids-budget 128
+```
+
+Source1d28e81d0d3ffcb2c299b663974d24cd6bcd6d88 passed exact hosted CI39131304783,
+including the six Linux checker tests. This is distinct from actual Docker
+readonly mount or complete materialization qualification, which remain pending.
