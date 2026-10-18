@@ -8,6 +8,14 @@ import subprocess
 import uuid
 from teetime_bounded_process import capture
 from teetime_reviewer_probe import reviewer_settings, verify_reviewer_limits, remove_owned_reviewer, reviewer_failure_diagnostic
+from teetime_startup_packet import startup_metadata, write_private_packet
+from teetime_startup_control import startup_settings, require_private_context, verify_startup_identity, BINARY_HASH
+
+
+def completed_capture(code,output,kind):
+    # Preserve private bytes until the strict packet validator can reject invalid
+    # encoding with a fixed error. UnicodeDecodeError must never print raw bytes.
+    return subprocess.CompletedProcess([],code,output if kind=='startup' else output.decode('utf-8'),'')
 
 
 def main():
@@ -17,13 +25,26 @@ def main():
     parser.add_argument("--docker", default="docker")
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-sha", required=True)
-    parser.add_argument("--kind", choices=["sandbox", "configuration", "negative", "reviewer"], default="sandbox")
+    parser.add_argument("--kind", choices=["sandbox", "configuration", "negative", "reviewer", "startup"], default="sandbox")
     parser.add_argument("--reviewer-case")
     parser.add_argument("--reviewer-owner")
+    parser.add_argument('--startup-owner')
+    parser.add_argument('--startup-root')
     parser.add_argument("--hostile-project", action="store_true")
     parser.add_argument("--isolated-network", action="store_true")
     parser.add_argument("--apparmor-profile")
     args = parser.parse_args()
+    if args.kind == 'startup':
+        if not args.startup_root or not args.startup_owner:
+            parser.error('startup requires a private root and exact owner')
+        if args.reviewer_case is not None or args.reviewer_owner is not None:
+            parser.error('startup cannot accept reviewer options')
+        reviewer_extra=startup_settings(args.startup_owner)
+        if not args.apparmor_profile or re.fullmatch('[a-f0-9]{40}',args.expected_sha) is None:
+            parser.error('startup requires owned confinement and exact source SHA')
+        require_private_context(args.startup_root,args.startup_owner)
+    elif args.startup_owner is not None or args.startup_root is not None:
+        parser.error('startup options require startup kind')
     if args.kind == 'reviewer':
         reviewer_extra = reviewer_settings(args.reviewer_case, args.reviewer_owner)
         if not args.apparmor_profile:
@@ -47,6 +68,8 @@ def main():
     assert candidate == {**baseline, "syscalls": baseline["syscalls"] +
                          [item["rule"] for item in inventory]}, "unreviewed seccomp delta"
     source = (root / ("probe-codex-" + args.kind + ".ts")).read_bytes()
+    startup_raw=None
+    startup_receipt=None
     name = "teetime-sandbox-probe-" + uuid.uuid4().hex[:12]
     volume = name + "-workspace" if args.hostile_project else None
     network = name + "-network" if args.isolated_network else None
@@ -185,15 +208,15 @@ console.log(JSON.stringify(hashes));
     if args.apparmor_profile:
         options.extend(["--security-opt", "apparmor=" + args.apparmor_profile])
         options.extend(["--label", "teetime.audit-profile=" + args.apparmor_profile])
-    if args.kind == 'reviewer':
+    if args.kind in ('reviewer','startup'):
         options.extend(reviewer_extra)
     if volume:
         temporary.remove("/workspace")
         options.extend(["--mount", "type=volume,src=" + volume + ",dst=/workspace"])
     for path in sorted(temporary):
-        size = (",size=64m" if path == '/home/appuser' else ",size=16m") if args.kind == 'reviewer' else ''
+        size = (",size=64m" if path == '/home/appuser' else ",size=16m") if args.kind in ('reviewer','startup') else ''
         options.extend(["--tmpfs", path + ":uid=1001,gid=1001" + size])
-    if args.kind in ("configuration", "reviewer"):
+    if args.kind in ("configuration", "reviewer", "startup"):
         for path in ["/workspace/.codex", "/workspace/.agents"]:
             temporary.add(path)
             options.extend(["--tmpfs", path + ":ro,uid=1001,gid=1001"])
@@ -222,10 +245,13 @@ console.log(JSON.stringify(hashes));
         assert not host.get("Privileged") and not host.get("CapAdd")
         assert "ALL" in host["CapDrop"]
         assert "no-new-privileges:true" in host["SecurityOpt"]
-        if args.kind == 'reviewer':
+        if args.kind in ('reviewer','startup'):
             verify_reviewer_limits(host)
+        if args.kind == 'reviewer':
             assert config['Labels'].get('teetime.reviewer-fixture') == args.reviewer_owner
             assert config['Labels'].get('teetime.reviewer-case') == args.reviewer_case
+        if args.kind == 'startup':
+            assert config['Labels'].get('teetime.startup-fixture') == args.startup_owner
         if args.apparmor_profile:
             assert "apparmor=" + args.apparmor_profile in host["SecurityOpt"]
         seccomp = [item for item in host["SecurityOpt"] if item.startswith("seccomp=")]
@@ -237,7 +263,7 @@ console.log(JSON.stringify(hashes));
         else:
             assert not data["Mounts"], "unexpected persistent mount"
         assert set(host["Tmpfs"]) == temporary
-        if args.kind in ("configuration", "reviewer"):
+        if args.kind in ("configuration", "reviewer", "startup"):
             for path in ["/workspace/.codex", "/workspace/.agents"]:
                 assert "ro" in host["Tmpfs"][path].split(","), "writable config mask"
         assert config["User"] == "1001:1001" and config["WorkingDir"] == "/workspace"
@@ -245,6 +271,8 @@ console.log(JSON.stringify(hashes));
         environment = dict(item.split("=", 1) for item in config["Env"] if "=" in item)
         assert environment.get("ARCHON_BUILD_SHA") == args.expected_sha
         assert environment.get("TEE_TIME_SANDBOX_PROBE") == "1"
+        if args.kind == 'startup':
+            assert environment.get('TEE_TIME_STARTUP_BINARY_HASH') == BINARY_HASH
         if network:
             assert environment.get("TEE_TIME_PROBE_PEER") == peer_url
         if args.apparmor_profile:
@@ -253,10 +281,10 @@ console.log(JSON.stringify(hashes));
             docker("start", name, check=True)
             running = json.loads(docker("inspect", name, check=True).stdout)[0]
             assert running["State"]["Running"] and running["AppArmorProfile"] == args.apparmor_profile
-            if args.kind == 'reviewer':
+            if args.kind in ('reviewer','startup'):
                 code, output = capture([args.docker, 'attach', '--sig-proxy=false', name],
                                        90, limit=65536, input_bytes=source)
-                result = subprocess.CompletedProcess([], code, output.decode('utf-8'), '')
+                result = completed_capture(code,output,args.kind)
             else:
                 result = docker("attach", "--sig-proxy=false", name, input=source.decode("utf-8"))
             stopped = json.loads(docker("inspect", name, check=True).stdout)[0]
@@ -285,8 +313,19 @@ console.log(JSON.stringify(hashes));
                                if line.startswith("error: ")), "no probe assertion header")
             raise RuntimeError("sandbox assertions failed; exit=" + str(result.returncode)
                                + "; " + diagnostic)
-        evidence = json.loads(result.stdout.strip())
-        assert evidence["passed"] is True and evidence["modelInvocations"] == 0
+        if args.kind == 'startup':
+            startup_raw=result.stdout
+            metadata=startup_metadata(startup_raw)
+            verify_startup_identity(metadata)
+            assert stopped['State']['OOMKilled'] is False
+            startup_receipt={'kind':'teetime-thread-start-receipt-v1','metadata':metadata,
+                             'imageId':data['Image'],'sourceSha':args.expected_sha,
+                             'runnerSha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                             'probeSha256':hashlib.sha256(source).hexdigest()}
+            evidence=None
+        else:
+            evidence = json.loads(result.stdout.strip())
+            assert evidence["passed"] is True and evidence["modelInvocations"] == 0
         if volume:
             assert fixture_step(False) == fixture_before
             evidence["hostileProjectHidden"] = True
@@ -296,15 +335,16 @@ console.log(JSON.stringify(hashes));
             assert results["baseline-peer-network"] == results["baseline-peer-network-after"] == 0
             assert results["tool-peer-network"] == results["nested-peer-network"] == 7
             evidence["internalBridgePeer"] = True
-        print(json.dumps({"passed": True, "imageId": data["Image"],
+        if args.kind != 'startup': print(json.dumps({"passed": True, "imageId": data["Image"],
                           "sourceSha": args.expected_sha,
                           "profileSha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
                           "runnerSha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                           "probeSha256": hashlib.sha256(source).hexdigest(),
                           "probe": evidence}))
     finally:
-        if args.kind == 'reviewer':
-            remove_owned_reviewer(docker, name, args.reviewer_owner)
+        if args.kind in ('reviewer','startup'):
+            remove_owned_reviewer(docker, name,args.startup_owner if args.kind=='startup' else args.reviewer_owner,
+                                  startup=args.kind=='startup')
         remaining = docker("container", "ls", "-aq", "--filter", "name=^/" + name + "$")
         if remaining.returncode:
             raise RuntimeError("could not verify probe cleanup for " + name)
@@ -328,6 +368,12 @@ console.log(JSON.stringify(hashes));
                 owned = json.loads(docker("volume", "inspect", volume, check=True).stdout)[0]
                 assert owned["Name"] == volume and owned["Labels"].get("teetime.probe") == name
                 docker("volume", "rm", volume, check=True)
+    if args.kind=='startup':
+        assert startup_raw is not None and startup_receipt is not None
+        require_private_context(args.startup_root,args.startup_owner)
+        write_private_packet(args.startup_root,args.startup_owner,startup_raw)
+        startup_receipt['ownedContainerAbsent']=True
+        print(json.dumps(startup_receipt))
 
 
 if __name__ == "__main__":

@@ -55,6 +55,8 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_canary_protocol.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_bounded_process.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_reviewer_probe.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_startup_packet.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_startup_control.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_snapshot.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_git_objects.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_git_commit.py
@@ -79,6 +81,7 @@ jobs:
           bun test ./scripts/staging/teetime-artifact-stream.test.ts
           bun test ./scripts/staging/teetime-sdk-lifecycle.test.ts
           bun test ./scripts/staging/teetime-reviewer-fixture.test.ts
+          bun test ./scripts/staging/teetime-startup-protocol.test.ts
           bun test ./scripts/staging/teetime-fixed-artifact.test.ts
           bun test packages/workflows/src/reliability/tee-time-review-package.test.ts
           bun test packages/workflows/src/reliability/tee-time-controller-input.test.ts

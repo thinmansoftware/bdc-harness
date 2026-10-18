@@ -105,8 +105,15 @@ def verify_reviewer_limits(host):
         raise ValueError('reviewer resource limits mismatch')
 
 
-def remove_owned_reviewer(docker, name, owner):
-    reviewer_settings('positive', owner)
+def remove_owned_reviewer(docker, name, owner, *, startup=False):
+    if type(startup) is not bool: raise ValueError('probe cleanup scope rejected')
+    if startup:
+        from teetime_startup_control import startup_settings
+        startup_settings(owner)
+        label='teetime.startup-fixture'
+    else:
+        reviewer_settings('positive', owner)
+        label='teetime.reviewer-fixture'
     if re.fullmatch(r'teetime-sandbox-probe-[a-f0-9]{12}', name or '') is None:
         raise ValueError('reviewer cleanup name rejected')
     query = ('container', 'ls', '-aq', '--no-trunc', '--filter', 'name=^/'+name+'$')
@@ -124,7 +131,7 @@ def remove_owned_reviewer(docker, name, owner):
     data = entries[0]
     identifier = data.get('Id', '')
     if (re.fullmatch('[a-f0-9]{64}', identifier) is None or data.get('Name') != '/'+name
-            or data.get('Config',{}).get('Labels',{}).get('teetime.reviewer-fixture') != owner
+            or data.get('Config',{}).get('Labels',{}).get(label) != owner
             or result.stdout.strip() != identifier):
         raise ValueError('reviewer cleanup ownership mismatch')
     if docker('rm', '-f', identifier).returncode:
