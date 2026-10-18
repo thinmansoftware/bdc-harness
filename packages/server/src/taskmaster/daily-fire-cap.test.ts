@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { lstatSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -69,6 +69,145 @@ function fakeCascade(outDir: string): RunCascadeOptions {
     },
   };
 }
+
+function legacyCleanupMetadata(directory: string) {
+  if (!directory.startsWith(join(tmpdir(), 'tm-cap-legacy-')))
+    throw new Error('invalid diagnostic root');
+  if (lstatSync(directory).isSymbolicLink()) throw new Error('diagnostic root is a link');
+  const classify = (name: string) =>
+    name === 'isolated.db'
+      ? 'db'
+      : name === 'isolated.db-wal'
+        ? 'wal'
+        : name === 'isolated.db-shm'
+          ? 'shm'
+          : /^dispatch-[a-f0-9]{24}$/.test(name)
+            ? 'recorder'
+            : 'other';
+  const all = readdirSync(directory, { withFileTypes: true });
+  const entries = all.slice(0, 8).map(entry => {
+    const info = lstatSync(join(directory, entry.name));
+    return {
+      classification: classify(entry.name),
+      kind: info.isSymbolicLink() ? 'link' : info.isDirectory() ? 'directory' : 'file',
+      bytes: info.size,
+    };
+  });
+  return { status: 'available', entryCount: all.length, truncated: all.length > 8, entries };
+}
+
+async function removeLegacyFixture(
+  directory: string,
+  diagnostic: {
+    remove?: typeof rm;
+    inspect?: typeof legacyCleanupMetadata;
+    report?: (metadata: object) => void;
+    synthetic?: boolean;
+  } = {}
+) {
+  try {
+    await (diagnostic.remove ?? rm)(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 50,
+    });
+  } catch (original) {
+    let metadata: object = { status: 'diagnostic-unavailable' };
+    try {
+      metadata = (diagnostic.inspect ?? legacyCleanupMetadata)(directory);
+    } catch {
+      // Inspection cannot replace the original cleanup failure.
+    }
+    const code = (original as NodeJS.ErrnoException | null)?.code;
+    const errorClass =
+      original instanceof Error &&
+      ['Error', 'TypeError', 'RangeError', 'SystemError'].includes(original.name)
+        ? original.name
+        : 'unknown';
+    const report = {
+      synthetic: diagnostic.synthetic ?? false,
+      stage: diagnostic.synthetic ? 'synthetic-cleanup-control' : 'after-close-clear-yield-gc',
+      runtime: Bun.version,
+      platform: process.platform,
+      errorClass,
+      code: typeof code === 'string' && /^[A-Z0-9_]{1,24}$/.test(code) ? code : 'unknown',
+      metadata,
+    };
+    try {
+      (diagnostic.report ?? (value => console.error('[tm-cap-cleanup]', JSON.stringify(value))))(
+        report
+      );
+    } catch {
+      try {
+        console.error('[tm-cap-cleanup]', '{"status":"diagnostic-unavailable"}');
+      } catch {
+        // Even a broken reporter must not replace the original failure.
+      }
+    }
+    throw original;
+  }
+}
+
+test('synthetic cleanup diagnostics preserve the original error and bound owned metadata', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'tm-cap-legacy-diagnostic-'));
+  const original = Object.assign(new Error('synthetic cleanup control'), { code: 'EBUSY' });
+  const reports: object[] = [];
+  try {
+    for (let index = 0; index < 20; index++)
+      writeFileSync(join(directory, `synthetic-${index}`), 'x');
+    const metadata = legacyCleanupMetadata(directory);
+    expect(metadata.entryCount).toBe(20);
+    expect(metadata.entries).toHaveLength(8);
+    expect(metadata.truncated).toBe(true);
+    expect(metadata.entries.every(entry => entry.classification === 'other')).toBe(true);
+    expect(JSON.stringify(metadata)).not.toContain(directory);
+    expect(JSON.stringify(metadata)).not.toContain('synthetic-');
+    expect(JSON.stringify(metadata).length).toBeLessThan(2048);
+    await expect(
+      removeLegacyFixture(directory, {
+        remove: async () => {
+          throw original;
+        },
+        report: value => reports.push(value),
+        synthetic: true,
+      })
+    ).rejects.toBe(original);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      synthetic: true,
+      code: 'EBUSY',
+      metadata: { status: 'available', entryCount: 20, truncated: true },
+    });
+    expect(JSON.stringify(reports)).not.toContain(original.message);
+    expect(JSON.stringify(reports).length).toBeLessThan(2048);
+    reports.length = 0;
+    await expect(
+      removeLegacyFixture(directory, {
+        remove: async () => {
+          throw original;
+        },
+        inspect: () => {
+          throw new Error('synthetic inspection failure');
+        },
+        report: value => reports.push(value),
+        synthetic: true,
+      })
+    ).rejects.toBe(original);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      synthetic: true,
+      stage: 'synthetic-cleanup-control',
+      errorClass: 'Error',
+      code: 'EBUSY',
+      metadata: { status: 'diagnostic-unavailable' },
+    });
+  } finally {
+    if (!directory.startsWith(join(tmpdir(), 'tm-cap-legacy-diagnostic-')))
+      throw new Error('invalid synthetic diagnostic root');
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 test('production cascade awaits preflight then rebooks actual UTC admission day before a fake effect', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'tm-cap-cascade-'));
   const db = new SqliteAdapter(join(directory, 'isolated.db'));
@@ -344,6 +483,6 @@ test.each([
     // Yield for Bun's closed SQLite handle finalizer on Windows before cleanup.
     if (!directory.startsWith(join(tmpdir(), 'tm-cap-legacy-')))
       throw new Error('invalid test root');
-    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    await removeLegacyFixture(directory);
   }
 });

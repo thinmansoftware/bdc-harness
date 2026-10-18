@@ -74,6 +74,29 @@ old pending history and genuine lost post-permission provenance. All external
 cascade effects in this suite are injected fakes. Temporary SQLite references
 are dropped before final collection/cleanup on Windows.
 
+### Windows cleanup diagnostic boundary
+
+At source7572a409, hosted Windows job117780463435 failed with EBUSY while
+removing the proved legacy case's owned temporary directory. Its Taskmaster
+group reported357pass/1fail/1416assertions. The same unmodified grouped command
+passed locally358/0/1416 before A4 changes; local Bun1.3.13 differs from hosted
+1.3.11. Neither that difference nor a missing yield is a proven root cause.
+The subsequent A4 four-file cap run reproduced the real EBUSY locally:
+158pass/1fail/810assertions. Its non-synthetic diagnostic found only the SQLite
+db/wal/shm files remaining, after recorder artifacts had been removed. The
+retaining adapter/native handle is still unknown; the version difference alone
+cannot explain a failure now observed under local1.3.13 as well.
+
+A4 adds failure-only metadata collection, not a cleanup repair. It preserves
+the existing close/reference/yield/GC ordering and rm retry/time bounds. Upon
+the original removal error it reports at most eight root-entry classifications
+(db/wal/shm/recorder/other), kinds and byte lengths, runtime and fixed stage/error
+metadata. It reads no contents, follows no symlinks and reports no raw paths or
+stacks. Inspection/reporting failure cannot replace the original cleanup error;
+the test still fails. A synthetic diagnostic control validates bounds and exact
+error preservation; it is not a reproduction of the hosted lock. A later hosted
+pass alone must not be described as a root-cause repair.
+
 ## Publication and rollout
 
 Migration `063_tm_fire_admissions.sql` is additive PostgreSQL DDL; SQLite has an
