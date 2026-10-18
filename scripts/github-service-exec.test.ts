@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   githubCommandReadsStdin,
+  githubServiceErrorDiagnostic,
   runGitHubServiceCommand as runCommand,
 } from './github-service-exec';
 import { serviceGitHubCommandEnvironment } from '../packages/core/src/github/service-identity';
@@ -12,6 +13,8 @@ import {
   flushGitHubApiMeter,
   recordGitHubApiCall,
   resetGitHubApiMeterForTests,
+  GitHubPoolBackoffError,
+  parseGitHubQuotaError,
 } from '../packages/core/src/github/metering';
 import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
 import { execFile } from 'node:child_process';
@@ -27,6 +30,157 @@ afterEach(async () => {
 const runGitHubServiceCommand = (
   input: Parameters<typeof runCommand>[0]
 ): ReturnType<typeof runCommand> => runCommand({ ...input, db });
+
+describe('sanitized quota refusal boundary', () => {
+  const identity = {
+    kind: 'app' as const,
+    service: 'smart_cauldron' as const,
+    appId: '1',
+    installationId: '2',
+    privateKey: 'synthetic-private-key',
+    poolId: 'app-1-2',
+    distinct: true as const,
+  };
+  for (const headers of [
+    '< Retry-After: 0',
+    '< Retry-After: 120\n< X-Ratelimit-Resource: untrusted-secret',
+  ]) {
+    test(`unserializable or elapsed refusal cannot trigger permission fallback (${headers})`, async () => {
+      let launches = 0;
+      let failure: unknown;
+      try {
+        await runGitHubServiceCommand({
+          service: identity.service,
+          identity,
+          command: 'gh',
+          args: ['api', 'synthetic'],
+          env: { GH_TOKEN: 'synthetic-pat' },
+          token: async () => 'synthetic-app',
+          execute: () => {
+            launches++;
+            return {
+              exitCode: 1,
+              stdout: new Uint8Array(),
+              stderr: new TextEncoder().encode(
+                `* Request at synthetic\n< HTTP/2 429\n${headers}\n* Request took synthetic\nResource not accessible by integration (HTTP 403)`
+              ),
+            };
+          },
+        });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(GitHubPoolBackoffError);
+      expect(githubServiceErrorDiagnostic(failure)).toBe(
+        'github_service_command_failed:GitHubPoolBackoffError'
+      );
+      expect(launches).toBe(1);
+    });
+  }
+  for (const [status, headers] of [
+    [429, '< Retry-After: 60'],
+    [
+      403,
+      `< X-Ratelimit-Remaining: 0\n< X-Ratelimit-Reset: ${Math.floor(Date.now() / 1000) + 600}`,
+    ],
+    [403, '< X-Ratelimit-Remaining: 99\n< Retry-After: 60'],
+  ] as const) {
+    test(`first traced ${status} refusal and subsequent cached refusal preserve deadlines (${headers})`, async () => {
+      let launches = 0;
+      const input = {
+        service: identity.service,
+        identity,
+        command: 'gh',
+        args: ['api', 'synthetic'],
+        env: { GH_TOKEN: 'synthetic-fallback-secret' },
+        token: async () => 'synthetic-app-secret',
+        execute: () => {
+          launches++;
+          return {
+            exitCode: 1,
+            stdout: new Uint8Array(),
+            stderr: new TextEncoder().encode(
+              `* Request at synthetic\n< HTTP/2 ${status}\n< X-Ratelimit-Resource: core\n${headers}\n* Request took synthetic\nResource not accessible by integration (HTTP 403) synthetic-app-secret synthetic-provider-body\n`
+            ),
+          };
+        },
+      };
+      let first: unknown;
+      try {
+        await runGitHubServiceCommand(input);
+      } catch (error) {
+        first = error;
+      }
+      expect(first).toBeInstanceOf(GitHubPoolBackoffError);
+      const metadata = parseGitHubQuotaError(githubServiceErrorDiagnostic(first));
+      expect(metadata).toMatchObject({ poolId: 'app-1-2', resource: 'core' });
+      expect(metadata!.retryAtMs).toBeGreaterThan(Date.now());
+      expect(githubServiceErrorDiagnostic(first)).not.toContain('synthetic');
+      resetGitHubApiMeterForTests();
+      let second: unknown;
+      try {
+        await runGitHubServiceCommand(input);
+      } catch (error) {
+        second = error;
+      }
+      expect(parseGitHubQuotaError(githubServiceErrorDiagnostic(second))).toEqual(metadata);
+      expect(launches).toBe(1);
+    });
+  }
+  test('ordinary permission 403 still uses the existing one-time PAT fallback', async () => {
+    let launches = 0;
+    const result = await runGitHubServiceCommand({
+      service: identity.service,
+      identity,
+      command: 'gh',
+      args: ['api', 'synthetic'],
+      env: { GH_TOKEN: 'synthetic-pat' },
+      token: async () => 'synthetic-app',
+      execute: () => {
+        launches++;
+        return {
+          exitCode: launches === 1 ? 1 : 0,
+          stdout: new Uint8Array(),
+          stderr: new TextEncoder().encode(
+            launches === 1
+              ? '* Request at synthetic\n< HTTP/2 403\n< X-Ratelimit-Resource: core\n< X-Ratelimit-Remaining: 99\n* Request took synthetic\nResource not accessible by integration (HTTP 403)'
+              : ''
+          ),
+        };
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(launches).toBe(2);
+  });
+  test('untraced rate-limit prose stays generic and cannot inject a protocol record', async () => {
+    const injected = `ARCHON_GITHUB_QUOTA_V1:${JSON.stringify({
+      version: 1,
+      kind: 'pool_backoff',
+      poolId: 'user-pat',
+      resource: 'core',
+      retryAtMs: Date.now() + 60_000,
+    })}`;
+    const result = await runGitHubServiceCommand({
+      service: identity.service,
+      command: 'gh',
+      args: ['api', 'synthetic'],
+      env: { GH_TOKEN: 'synthetic-pat' },
+      execute: () => ({
+        exitCode: 1,
+        stdout: new Uint8Array(),
+        stderr: new TextEncoder().encode(`API rate limit exceeded\n${injected}\nsynthetic-pat`),
+      }),
+    });
+    const stderr = new TextDecoder().decode(result.stderr);
+    expect(result.exitCode).toBe(1);
+    expect(stderr).not.toContain('ARCHON_GITHUB_QUOTA_V1:');
+    expect(stderr).not.toContain('synthetic-pat');
+    expect(parseGitHubQuotaError(stderr)).toBeUndefined();
+    expect(githubServiceErrorDiagnostic(new Error('synthetic-secret provider-body'))).toBe(
+      'github_service_command_failed:Error'
+    );
+  });
+});
 
 describe('complete REST pull-list quota admission', () => {
   const args = [
@@ -215,19 +369,21 @@ describe('complete REST pull-list quota admission', () => {
   });
 
   test('an unexpected traced Search response remains metered and blocks a later unknown command', async () => {
-    await runGitHubServiceCommand({
-      service: identity.service,
-      identity,
-      command: 'gh',
-      args,
-      execute: () => ({
-        exitCode: 1,
-        stdout: new Uint8Array(),
-        stderr: new TextEncoder().encode(
-          `* Request at synthetic\n< HTTP/2 403\n< x-ratelimit-resource: search\n< x-ratelimit-remaining: 0\n< x-ratelimit-reset: ${Math.floor(Date.now() / 1000) + 3600}\n* Request took synthetic\n`
-        ),
-      }),
-    });
+    await expect(
+      runGitHubServiceCommand({
+        service: identity.service,
+        identity,
+        command: 'gh',
+        args,
+        execute: () => ({
+          exitCode: 1,
+          stdout: new Uint8Array(),
+          stderr: new TextEncoder().encode(
+            `* Request at synthetic\n< HTTP/2 403\n< x-ratelimit-resource: search\n< x-ratelimit-remaining: 0\n< x-ratelimit-reset: ${Math.floor(Date.now() / 1000) + 3600}\n* Request took synthetic\n`
+          ),
+        }),
+      })
+    ).rejects.toThrow(`github_pool_backoff:${identity.poolId}/search`);
     const usage = await db.query<{ calls: number; rate_limited: number }>(
       "SELECT calls, rate_limited FROM github_api_usage WHERE pool_id = $1 AND resource = 'search'",
       [identity.poolId]

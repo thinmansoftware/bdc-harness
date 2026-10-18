@@ -2,6 +2,86 @@ import { getDatabase } from '../db/connection';
 import type { IDatabase } from '../db/adapters/types';
 import type { GitHubService } from './service-identity';
 
+/** A local gate deadline, not proof of a GitHub reset or permission to retry. */
+export class GitHubPoolBackoffError extends Error {
+  constructor(
+    readonly poolId: string,
+    readonly resource: string,
+    readonly retryAtMs: number
+  ) {
+    super(`github_pool_backoff:${poolId}/${resource}:${retryAtMs}`);
+    this.name = 'GitHubPoolBackoffError';
+  }
+}
+
+export const GITHUB_QUOTA_RECORD_PREFIX = 'ARCHON_GITHUB_QUOTA_V1:';
+export interface GitHubQuotaMetadata {
+  readonly version: 1;
+  readonly kind: 'pool_backoff';
+  readonly poolId: string;
+  readonly resource: 'core' | 'graphql' | 'search' | 'cli';
+  readonly retryAtMs: number;
+}
+
+function quotaMetadata(value: unknown, now: number): GitHubQuotaMetadata | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  if (
+    Object.keys(row).sort().join(',') !== 'kind,poolId,resource,retryAtMs,version' ||
+    row.version !== 1 ||
+    row.kind !== 'pool_backoff' ||
+    typeof row.poolId !== 'string' ||
+    !/^(?:user-pat|merge-manager-pat|app-[1-9][0-9]*-[1-9][0-9]*)$/.test(row.poolId) ||
+    !['core', 'graphql', 'search', 'cli'].includes(row.resource as string) ||
+    typeof row.retryAtMs !== 'number' ||
+    !Number.isSafeInteger(row.retryAtMs) ||
+    row.retryAtMs <= now
+  )
+    return undefined;
+  return Object.freeze({
+    version: 1,
+    kind: 'pool_backoff',
+    poolId: row.poolId,
+    resource: row.resource as GitHubQuotaMetadata['resource'],
+    retryAtMs: row.retryAtMs,
+  });
+}
+
+/** Serialize allowlisted fields only; never an error object or provider diagnostics. */
+export function serializeGitHubQuotaError(error: unknown, now = Date.now()): string | undefined {
+  if (!(error instanceof GitHubPoolBackoffError)) return undefined;
+  const metadata = quotaMetadata(
+    {
+      version: 1,
+      kind: 'pool_backoff',
+      poolId: error.poolId,
+      resource: error.resource,
+      retryAtMs: error.retryAtMs,
+    },
+    now
+  );
+  return metadata ? GITHUB_QUOTA_RECORD_PREFIX + JSON.stringify(metadata) : undefined;
+}
+
+/** Accept one canonical record amid runtime warnings; discard every diagnostic. */
+export function parseGitHubQuotaError(
+  stderr: unknown,
+  now = Date.now()
+): GitHubQuotaMetadata | undefined {
+  if (typeof stderr !== 'string') return undefined;
+  if (stderr.split(GITHUB_QUOTA_RECORD_PREFIX).length !== 2) return undefined;
+  const line = stderr.split(/\r?\n/).find(value => value.includes(GITHUB_QUOTA_RECORD_PREFIX));
+  if (!line?.startsWith(GITHUB_QUOTA_RECORD_PREFIX)) return undefined;
+  const payload = line.slice(GITHUB_QUOTA_RECORD_PREFIX.length);
+  try {
+    const metadata = quotaMetadata(JSON.parse(payload), now);
+    // Canonical encoding also rejects duplicate JSON keys and extra physical lines.
+    return metadata && JSON.stringify(metadata) === payload ? metadata : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface GitHubApiObservation {
   service: GitHubService;
   poolId: string;
@@ -131,7 +211,7 @@ export function assertGitHubPoolAvailable(
   now = Date.now()
 ): void {
   const until = backoff.get(`${poolId}|${resource}`) ?? 0;
-  if (until > now) throw new Error(`github_pool_backoff:${poolId}/${resource}:${until}`);
+  if (until > now) throw new GitHubPoolBackoffError(poolId, resource, until);
 }
 
 /** Read shared state afresh: command drivers do not share the server's Map. */
@@ -150,7 +230,7 @@ export async function assertPersistedGitHubPoolAvailable(
     for (const state of result.rows) {
       const until = state.reset_at ? Date.parse(state.reset_at) : 0;
       if (state.remaining === 0 && until > now) {
-        throw new Error(`github_pool_backoff:${poolId}/${resource}:${until}`);
+        throw new GitHubPoolBackoffError(poolId, resource, until);
       }
     }
   }

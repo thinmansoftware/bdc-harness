@@ -11,6 +11,7 @@
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { parseGitHubQuotaError, type GitHubQuotaMetadata } from '@archon/core/github/metering';
 
 const execFileAsync = promisify(execFile);
 
@@ -117,7 +118,10 @@ export function textClaimsWoId(text: string, woId: string): boolean {
 }
 
 export class ClaimDiscoveryError extends Error {
-  constructor(readonly code: 'request_failed' | 'invalid_response' | 'invalid_repository') {
+  constructor(
+    readonly code: 'request_failed' | 'invalid_response' | 'invalid_repository',
+    readonly quota?: GitHubQuotaMetadata
+  ) {
     super(`claim_discovery_${code}`);
     this.name = 'ClaimDiscoveryError';
   }
@@ -152,9 +156,11 @@ export async function ghPrSearchDefault(
       // default execFile buffer truncating ordinary multi-page repositories.
       { timeout: 30000, maxBuffer: 16 * 1024 * 1024 }
     ));
-  } catch {
+  } catch (error) {
     // Do not expose provider diagnostics or interpret failed pagination as absence.
-    throw new ClaimDiscoveryError('request_failed');
+    const stderr =
+      error && typeof error === 'object' && 'stderr' in error ? error.stderr : undefined;
+    throw new ClaimDiscoveryError('request_failed', parseGitHubQuotaError(stderr));
   }
   try {
     const pages: unknown = JSON.parse(stdout);

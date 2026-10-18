@@ -7,8 +7,12 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve, relative, isAbsolute } from 'node:path';
 
 import { ghPrSearchDefault } from '../already-satisfied.js';
+import { parseGitHubQuotaError } from '@archon/core/github/metering';
 
 const execFileFake = mock(async () => ({ stdout: '[[]]', stderr: '' }));
 
@@ -71,6 +75,129 @@ const restRow = (number: number, overrides: Record<string, unknown> = {}) => ({
 describe('complete REST claim discovery', () => {
   beforeEach(() => {
     delete process.env.SMART_CAULDRON_HERMETIC;
+  });
+
+  test('retains only the strict wrapper quota record on request failure', async () => {
+    const quota = {
+      version: 1,
+      kind: 'pool_backoff',
+      poolId: 'app-1-2',
+      resource: 'core',
+      retryAtMs: Date.now() + 120_000,
+    };
+    let failure: unknown;
+    try {
+      await ghPrSearchDefault('thinmansoftware/bdc-harness', 'WO-TEST-001', async () => {
+        throw Object.assign(new Error('synthetic credential must disappear'), {
+          stderr: `ARCHON_GITHUB_QUOTA_V1:${JSON.stringify(quota)}\n`,
+        });
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      code: 'request_failed',
+      message: 'claim_discovery_request_failed',
+      quota,
+    });
+    expect(JSON.stringify(failure)).not.toContain('credential');
+  });
+
+  test('malformed, duplicate and expired records remain sanitized request failures', async () => {
+    const record = {
+      version: 1,
+      kind: 'pool_backoff',
+      poolId: 'user-pat',
+      resource: 'core',
+      retryAtMs: Date.now() + 120_000,
+    };
+    const line = `ARCHON_GITHUB_QUOTA_V1:${JSON.stringify(record)}`;
+    for (const stderr of [
+      line + '\n' + line,
+      'embedded ' + line,
+      'synthetic-secret',
+      `ARCHON_GITHUB_QUOTA_V1:${JSON.stringify({ ...record, version: 2 })}`,
+      `ARCHON_GITHUB_QUOTA_V1:${JSON.stringify({ ...record, retryAtMs: 1 })}`,
+      'ARCHON_GITHUB_QUOTA_V1:{',
+    ]) {
+      let failure: unknown;
+      try {
+        await ghPrSearchDefault('thinmansoftware/bdc-harness', 'WO-TEST-001', async () => {
+          throw Object.assign(new Error('synthetic-secret'), { stderr });
+        });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({ code: 'request_failed', quota: undefined });
+      expect(JSON.stringify(failure)).not.toContain('synthetic-secret');
+    }
+  });
+
+  test('real wrapper stderr survives execFile rejection into discovery without provider diagnostics', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'quota-wrapper-discovery-'));
+    const wrapper = resolve(import.meta.dir, '../../../../scripts/github-service-exec.ts');
+    const exec = promisify(execFile);
+    const env = {
+      PATH: process.env.PATH,
+      SystemRoot: process.env.SystemRoot,
+      ARCHON_HOME: directory,
+      DATABASE_URL: '',
+      LOG_LEVEL: 'error',
+      GH_TOKEN: 'synthetic-credential',
+      GITHUB_TOKEN: 'synthetic-credential',
+    };
+    const child = `console.error('* Request at synthetic\\n< HTTP/2 429\\n< X-Ratelimit-Resource: core\\n< Retry-After: 120\\n* Request took synthetic\\nsynthetic-credential synthetic-provider-body'); process.exit(1);`;
+    try {
+      let failure: unknown;
+      let captured = '';
+      try {
+        await ghPrSearchDefault(
+          'thinmansoftware/bdc-harness',
+          'WO-TEST-001',
+          async (_command, _args, options) => {
+            try {
+              return await exec(
+                process.execPath,
+                [wrapper, 'smart_cauldron', process.execPath, '-e', child],
+                { ...options, env }
+              );
+            } catch (error) {
+              captured = (error as { stderr: string }).stderr;
+              throw error;
+            }
+          }
+        );
+      } catch (error) {
+        failure = error;
+      }
+      expect(captured).toContain('ARCHON_GITHUB_QUOTA_V1:');
+      expect(failure).toMatchObject({
+        code: 'request_failed',
+        quota: { version: 1, kind: 'pool_backoff', poolId: 'user-pat', resource: 'core' },
+      });
+      expect(captured.split('ARCHON_GITHUB_QUOTA_V1:')).toHaveLength(2);
+      expect(captured).not.toContain('synthetic');
+      expect(JSON.stringify(failure)).not.toContain('synthetic');
+      // A new wrapper process must refuse from persisted quota before launching.
+      const cached = await exec(
+        process.execPath,
+        [wrapper, 'smart_cauldron', process.execPath, '-e', "throw new Error('MUST_NOT_LAUNCH')"],
+        { env }
+      ).then(
+        () => 'unexpected success',
+        error => error.stderr as string
+      );
+      expect(parseGitHubQuotaError(cached)).toEqual(parseGitHubQuotaError(captured));
+    } finally {
+      const withinTemp = relative(realpathSync(tmpdir()), realpathSync(directory));
+      if (
+        !withinTemp.startsWith('..') &&
+        !isAbsolute(withinTemp) &&
+        withinTemp.startsWith('quota-wrapper-discovery-')
+      ) {
+        rmSync(directory, { recursive: true, force: true });
+      } else throw new Error('unsafe quota fixture cleanup');
+    }
   });
 
   test('actual exec captures a complete response larger than the default buffer', async () => {

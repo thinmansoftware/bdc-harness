@@ -12,6 +12,9 @@ import {
   flushGitHubApiMeter,
   observationFromResponse,
   recordGitHubApiCall,
+  GitHubPoolBackoffError,
+  GITHUB_QUOTA_RECORD_PREFIX,
+  serializeGitHubQuotaError,
   type GitHubApiObservation,
 } from '../packages/core/src/github/metering';
 
@@ -184,10 +187,25 @@ export async function runGitHubServiceCommand(input: {
     }
     // Persist before exit/retry so the next CLI process sees the same pool.
     await flushGitHubApiMeter(db);
+    // Only captured HTTP observations establish a first-response quota refusal.
+    // No-trace prose keeps its existing conservative local backoff, without
+    // promoting arbitrary provider diagnostics into structured response truth.
+    if (result.exitCode !== 0) {
+      const limited = trace.observations.filter(observation => observation.rateLimited);
+      limited.sort((a, b) => (b.backoffUntil ?? 0) - (a.backoffUntil ?? 0));
+      if (limited[0])
+        throw new GitHubPoolBackoffError(
+          selected.poolId,
+          limited[0].resource,
+          limited[0].backoffUntil ?? Date.now()
+        );
+    }
     let stderr = trace.stderr;
     for (const secret of [token, fallback]) {
       if (secret) stderr = stderr.split(secret).join('[redacted]');
     }
+    // The provider cannot inject the wrapper's reserved error protocol.
+    stderr = stderr.split(GITHUB_QUOTA_RECORD_PREFIX).join('[untrusted-quota-record]:');
     return { ...result, stderr: new TextEncoder().encode(stderr) };
   };
   const result = await invoke(identity);
@@ -208,6 +226,13 @@ export async function runGitHubServiceCommand(input: {
   return result;
 }
 
+export function githubServiceErrorDiagnostic(error: unknown): string {
+  return (
+    serializeGitHubQuotaError(error) ??
+    `github_service_command_failed:${error instanceof Error ? error.name : 'unknown'}`
+  );
+}
+
 if (import.meta.main) {
   // stdout is gh's machine-readable response, never database startup logs.
   rootLogger.level = 'silent';
@@ -226,9 +251,7 @@ if (import.meta.main) {
     if (result.stderr.byteLength) await Bun.write(Bun.stderr, result.stderr);
     process.exitCode = result.exitCode;
   } catch (error) {
-    console.error(
-      `github_service_command_failed:${error instanceof Error ? error.name : 'unknown'}`
-    );
+    console.error(githubServiceErrorDiagnostic(error));
     process.exitCode = 1;
   } finally {
     await closeDatabase();
