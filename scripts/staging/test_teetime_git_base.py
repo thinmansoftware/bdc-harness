@@ -72,6 +72,66 @@ class BaseReaderTests(unittest.TestCase):
         self.assertEqual(result['sourceTree'],self.run_git('rev-parse',self.commit+'^{tree}').decode().strip())
         self.assertEqual(json.loads(encode_result(result)),result)
 
+    def linked_worktree(self):
+        path=self.root/'linked-fixture'
+        self.run_git('remote','add','origin','https://github.com/'+ 'thinmansoftware/whats-that-tee-time.git')
+        self.run_git('worktree','add','-b','demo-fixture',str(path),self.commit)
+        self.addCleanup(lambda:self.run_git('worktree','remove',str(path)))
+        self.run_git('update-ref','refs/remotes/origin/staging',self.commit)
+        return path
+
+    def test_registered_worktree_requires_canonical_origin(self):
+        path=self.linked_worktree()
+        self.run_git('remote','remove','origin')
+        with self.assertRaises(ValueError):self.observe(path)
+
+    def observe(self,path,**kwargs):
+        return read_git_base(self.git,str(self.root),self.commit,worktree=str(path),
+            run_scope=kwargs.get('run_scope',self.commit),branch='demo-fixture')
+
+    def test_registered_named_head_and_both_staging_refs_observed(self):
+        result=self.observe(self.linked_worktree())
+        self.assertEqual(result['worktreeObservation'],{
+            'state':'registered-head-and-both-bases-observed-stable',
+            'headCommit':self.commit,'headBranch':'demo-fixture',
+            'localStagingCommit':self.commit,'remoteStagingCommit':self.commit})
+
+    def test_wrong_head_detached_head_and_missing_remote_rejected(self):
+        path=self.linked_worktree()
+        with self.assertRaises(ValueError):self.observe(path,run_scope='0'*40)
+        self.run_git('update-ref','-d','refs/remotes/origin/staging')
+        with self.assertRaises(ValueError):self.observe(path)
+        self.run_git('update-ref','refs/remotes/origin/staging',self.commit)
+        admin=Path((path/'.git').read_text().strip()[8:])
+        (admin/'HEAD').write_text(self.commit+'\n',encoding='ascii')
+        with self.assertRaises(ValueError):self.observe(path)
+
+    def test_worktree_backlink_and_common_directory_required(self):
+        path=self.linked_worktree()
+        admin=Path((path/'.git').read_text().strip()[8:])
+        for name,changed in [('gitdir',str(self.root/'.git')+'\n'),('commondir','../../../outside\n')]:
+            file=admin/name;original=file.read_bytes()
+            try:
+                file.write_bytes(changed.encode())
+                with self.assertRaises(ValueError):self.observe(path)
+            finally:file.write_bytes(original)
+
+    def test_ref_movement_during_committed_capture_rejected(self):
+        path=self.linked_worktree()
+        other=self.run_git('commit-tree',self.run_git('rev-parse',self.commit+'^{tree}').decode().strip(),
+            '-p',self.commit,input=b'Synthetic advanced staging\n').decode().strip()
+        from teetime_git_base import capture as actual_capture
+        moved=False
+        def capture_and_move(args,*rest,**kwargs):
+            nonlocal moved
+            result=actual_capture(args,*rest,**kwargs)
+            if not moved and 'cat-file' in args:
+                self.run_git('update-ref','refs/remotes/origin/staging',other);moved=True
+            return result
+        with patch('teetime_git_base.capture',side_effect=capture_and_move),self.assertRaises(ValueError):
+            self.observe(path)
+        self.assertTrue(moved)
+
     def test_missing_or_noncommit_or_malformed_identity_rejected(self):
         blob=self.run_git('hash-object','--stdin',input=b'blob').decode().strip()
         for oid in ['0'*40,blob,self.commit.upper(),'HEAD']:
