@@ -41,6 +41,15 @@ jobs:
         run: |
           python3 scripts/staging/test_cleanup_apparmor_audit.py
           python3 scripts/staging/test_apparmor_negatives.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_connect_proxy.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_auth_receiver.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_watchdog.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_canary_protocol.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_bounded_process.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_proxy_receipt.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_canary_diagnostics.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_operator_protocol.py
+          bun test ./scripts/staging/teetime-canary-result.test.ts
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test
           bun --filter @archon/server type-check
@@ -52,6 +61,7 @@ jobs:
         run: |
           cd packages/providers
           bun test src/codex/restricted-provider.test.ts
+          bun test src/codex/restricted-canary-transport.test.ts
           bun test src/codex/restricted-sdk.test.ts
           bun test src/community/pi/restricted-review.test.ts
           bun test src/community/pi/restricted-review-transport.test.ts
