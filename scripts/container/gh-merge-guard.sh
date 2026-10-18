@@ -57,4 +57,7 @@ if [ "$BLOCK" = "1" ]; then
   exit 86
 fi
 
+if [ -n "${GITHUB_APP_ID:-}${GITHUB_APP_RUN_NODES_ID:-}${GITHUB_APP_TASKMASTER_ID:-}" ]; then
+  exec bun /app/scripts/github-service-exec.ts "${ARCHON_GITHUB_SERVICE:-run_nodes}" "$REAL_GH" "$@"
+fi
 exec "$REAL_GH" "$@"
