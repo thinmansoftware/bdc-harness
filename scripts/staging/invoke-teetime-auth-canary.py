@@ -1,0 +1,120 @@
+"""Operator SSH transport. Real login is read only after verified remote READY."""
+import argparse
+import base64
+import hashlib
+import io
+import json
+from pathlib import Path
+import queue
+import re
+import subprocess
+import threading
+import time
+import uuid
+from teetime_auth_receiver import validate_payload
+from teetime_canary_protocol import encode_frame
+
+
+def main():
+    if not __debug__:
+        raise ValueError('assertions required')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--image', required=True)
+    parser.add_argument('--expected-sha', required=True)
+    parser.add_argument('--synthetic', action='store_true')
+    parser.add_argument('--disconnect-before-auth', action='store_true')
+    args = parser.parse_args()
+    assert re.fullmatch('sha256:[a-f0-9]{64}', args.image)
+    assert re.fullmatch('[a-f0-9]{40}', args.expected_sha)
+    nonce = uuid.uuid4().hex
+    command = r'''$ErrorActionPreference='Stop'; python "$env:USERPROFILE\teetime-config-diagnostic\run-teetime-auth-canary.py" --docker 'C:\Program Files\Docker\Docker\resources\bin\docker.exe' --image ''' + "'"+args.image+"' --expected-sha '"+args.expected_sha+"' --nonce '"+nonce+"'"
+    encoded = base64.b64encode(command.encode('utf-16le')).decode()
+    child = subprocess.Popen(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+        'bdc-server', 'powershell', '-NoProfile', '-EncodedCommand', encoded], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    inbox = queue.Queue()
+    def read_output():
+        try:
+            total = 0
+            while True:
+                line = child.stdout.readline(16385)
+                if not line:
+                    break
+                total += len(line)
+                if len(line) > 16384 or total > 32768:
+                    raise ValueError('protocol output bound')
+                inbox.put(json.loads(line))
+        except BaseException:
+            inbox.put(None)
+        finally:
+            inbox.put(None)
+    threading.Thread(target=read_output, daemon=True).start()
+    original = None
+    auth_path = Path.home()/'.codex'/'auth.json'
+    original_unchanged = True
+    try:
+        ready = inbox.get(timeout=75)
+        assert isinstance(ready, dict) and ready['type'] == 'READY'
+        assert set(ready) == {'type','nonce','image','sourceSha','owner','manifestSha256','workerId','gatewayId','hashes'}
+        assert ready['nonce'] == nonce and ready['image'] == args.image and ready['sourceSha'] == args.expected_sha
+        assert re.fullmatch('teetime-auth-[a-f0-9]{12}', ready['owner'])
+        for key in ['manifestSha256', 'workerId', 'gatewayId']:
+            assert re.fullmatch('[a-f0-9]{64}', ready[key])
+        root = Path(__file__).parent
+        filenames = ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts',
+            'teetime_connect_proxy.py', 'run-teetime-auth-canary.py', 'teetime_canary_protocol.py',
+            'teetime_watchdog.py', 'codex-probe-seccomp.json', 'teetime_bounded_process.py']
+        assert ready['hashes'] == {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in filenames}
+        if args.disconnect_before_auth:
+            child.kill(); child.wait(timeout=5)
+            print(json.dumps({'disconnectInjected': True, 'owner': ready['owner'], 'credentialsUsed': False}))
+            return 0
+        if args.synthetic:
+            def token(value):
+                return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b'=').decode()
+            jwt = token({'alg':'RS256'})+'.'+token({'exp':time.time()+7200,
+                'email':'synthetic@example.invalid','https://api.openai.com/auth':{
+                'chatgpt_account_id':'synthetic-invalid-account','chatgpt_plan_type':'plus'}})+'.aW52YWxpZA'
+            payload = json.dumps({'auth_mode':'chatgpt','tokens':{'access_token':jwt,'id_token':jwt,
+                'refresh_token':'synthetic-invalid','account_id':'synthetic-invalid-account'}}).encode()
+        else:
+            assert auth_path.stat().st_size <= 65536 and not auth_path.is_symlink()
+            original = auth_path.read_bytes()
+            payload = validate_payload(io.BytesIO(original), time.time())
+        child.stdin.write(encode_frame(payload)); child.stdin.close()
+        del payload
+        report = inbox.get(timeout=180)
+        assert isinstance(report, dict) and report['type'] == 'RESULT'
+        assert set(report) == {'type','nonce','owner','result','cleanupErrors','receiptDirectory'}
+        assert report['nonce'] == nonce and report['owner'] == ready['owner']
+        assert child.wait(timeout=10) in [0, 1]
+        assert inbox.get(timeout=5) is None
+        # Only known status fields leave this operator; no raw remote diagnostics.
+        result = report['result']
+        keys = {'passed','cleanupVerified','credentialReceived','preflightPassed','authUnchanged',
+                'artifactVerified','modelInvocations','servedModelVerified'}
+        assert set(result) == keys
+        assert all(type(result[k]) is bool for k in keys-{'modelInvocations'})
+        assert type(result['modelInvocations']) is int and result['modelInvocations'] in [0,1]
+        if original is not None:
+            original_unchanged = auth_path.read_bytes() == original
+        print(json.dumps({'owner':ready['owner'],'result':result,'synthetic':args.synthetic,
+                          'originalAuthUnchanged':original_unchanged}))
+        assert original_unchanged and result['cleanupVerified']
+        if args.synthetic:
+            assert result['credentialReceived'] and not result['passed'] and result['modelInvocations'] == 0
+        else:
+            assert result['passed']
+        return 0
+    finally:
+        if child.poll() is None:
+            child.kill(); child.wait(timeout=5)
+        if original is not None and auth_path.read_bytes() != original:
+            raise ValueError('original login changed during canary')
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except Exception:
+        raise SystemExit('Canary not verified; inspect sanitized owned-resource receipt. No credential data logged.') from None

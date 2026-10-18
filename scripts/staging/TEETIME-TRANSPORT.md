@@ -174,5 +174,40 @@ sync back or change the desktop login, and compare disposable auth in memory.
 
 Separate outstanding gates include immutable evidence capture, approval validation,
 plan review, policy/workflow registration, trusted publication, end-to-end canary,
-app CI/CD and preview/rollback proof. Demo implementation remains on hold pending
-Sean's feedback and John's scope confirmation.
+app CI/CD and preview/rollback proof. On October 18 John instructed this session
+to continue until the demo is ready for verification. This supersedes the prior
+demo implementation hold; all admission gates and simulation-only bounds remain.
+
+## Authenticated launcher candidate
+
+The complete launcher is a source candidate until the exact-image rehearsal and
+independent review pass. It is not a registered general-purpose builder.
+
+```text
+python scripts/staging/invoke-teetime-auth-canary.py --image sha256:EXACT_IMAGE --expected-sha EXACT_COMMIT --synthetic
+python scripts/staging/invoke-teetime-auth-canary.py --image sha256:EXACT_IMAGE --expected-sha EXACT_COMMIT --disconnect-before-auth
+python scripts/staging/invoke-teetime-auth-canary.py --image sha256:EXACT_IMAGE --expected-sha EXACT_COMMIT
+```
+
+Operator files must be installed at the existing BDC laptop's
+teetime-config-diagnostic directory, with the same reviewed helper bytes as the
+image. The SSH host is fixed to bdc-server and known-host checking is mandatory.
+The real invocation reads only the existing desktop .codex/auth.json after READY
+validates exact image/source, nonce, resource IDs and helper hashes. It neither
+copies that file to a host path nor updates it. Binary framing rejects partial,
+oversized, trailing or duplicate data. The receiver installs into worker tmpfs.
+
+The remote controller inspects isolation and arms the breakaway watchdog before
+READY. Docker logging is disabled. The watchdog starts cleanup at 210 seconds;
+the model call has its own 90-second abort and 100-second process cutoff. Raw
+authenticated subprocess responses stay in bounded memory; only allowlisted
+booleans and invocation counts are reported. Both source and disposable auth
+bytes must remain unchanged. Any cleanup failure fails the canary.
+
+Preflight checks the pinned CLI, effective restricted profile, empty extension
+catalogs, account/read with refreshToken false and authenticated rate-limit
+metadata. One factory invocation may create only canary.txt with fixed content.
+The trusted wrapper checks file type, exact content and directory membership.
+Served-model identity is explicitly unverified because this SDK does not expose
+it. Synthetic invalid auth must fail before any model invocation and still clean
+up. This task does not implement the app or publish any artifact.
