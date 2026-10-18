@@ -12,3 +12,4 @@ scripts/staging/moby-apparmor-template.go text eol=lf
 packages/overseer/src/__tests__/fixtures/reconcile/*.md -text
 
 scripts/staging/codex-apparmor-mount-rules.txt text eol=lf
+packages/providers/src/codex/restricted-review-model-base.json text eol=lf
