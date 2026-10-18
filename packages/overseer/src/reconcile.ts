@@ -629,7 +629,12 @@ async function hasDefaultHoldBeenNoted(input: { prRef: string; woId: string }): 
 
 export function createDefaultReconcileDeps(): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  if (!token) {
+  const appConfigured = ['GITHUB_APP_', 'GITHUB_APP_OVERSEER_'].some(prefix =>
+    ['ID', 'INSTALLATION_ID', 'PRIVATE_KEY', 'PRIVATE_KEY_PATH'].some(suffix =>
+      Boolean(process.env[`${prefix}${suffix}`]?.trim())
+    )
+  );
+  if (!token && !appConfigured) {
     return {
       readCursor: async () => null,
       searchMergedPullRequests: async (): Promise<ReconcileMergedPullRequest[]> => {
@@ -649,8 +654,28 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
 
   let octokit: Promise<OctokitLike> | null = null;
   const getOctokit = async (): Promise<OctokitLike> => {
-    octokit ??= import('@octokit/rest').then(
-      module => new module.Octokit({ auth: token }) as unknown as OctokitLike
+    octokit ??= Promise.all([import('@octokit/rest'), import('@archon/core/github/request')]).then(
+      ([module, transport]) => {
+        // Octokit supplies URL + RequestInit; the existing service transport owns
+        // authentication and quota state, including fail-closed App validation.
+        const requestFetch = async (
+          input: string | URL | Request,
+          init?: RequestInit
+        ): Promise<Response> => {
+          const url = input instanceof Request ? input.url : input;
+          const path = new URL(String(url)).pathname;
+          const method = (init?.method ?? 'GET').toUpperCase();
+          const trackerWrite =
+            (method === 'POST' &&
+              /^\/repos\/[^/]+\/[^/]+\/issues\/\d+\/(comments|labels)$/.test(path)) ||
+            (method === 'PATCH' && /^\/repos\/[^/]+\/[^/]+\/issues\/\d+$/.test(path));
+          const request = trackerWrite
+            ? transport.serviceGitHubFetchWithPermissionFallback
+            : transport.serviceGitHubFetch;
+          return request({ service: 'overseer', url, init });
+        };
+        return new module.Octokit({ request: { fetch: requestFetch } }) as unknown as OctokitLike;
+      }
     );
     return octokit;
   };
@@ -858,6 +883,7 @@ function isRateLimitError(error: unknown): boolean {
     message?: string;
     response?: { headers?: unknown };
   };
+  if (candidate.message?.includes('github_pool_backoff:')) return true;
   if (candidate.status === 403 || candidate.status === 429) {
     const message = candidate.message ?? '';
     if (/rate.limit|rateLimit|rate limit|secondary rate/i.test(message)) return true;

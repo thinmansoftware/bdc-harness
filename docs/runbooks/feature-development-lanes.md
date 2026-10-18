@@ -5,8 +5,12 @@ Last modernized: 2026-10-14 (GPT-6 on Codex, Claude 5.5 on Claude, Grok 4.7 on C
 
 This runbook lists every `bdc-feature-development*.yaml` lane under
 `.archon/workflows/defaults/`, its builder and reviewer models, a cost class,
-and when to use it. The build agent ("builder") and the independent review/judge
-seats are always different model families -- a lane never grades its own work.
+and when to use it. The roster below records each build and review seat. The
+Haiku canary requires cross-family Codex review. This is not universal across
+lanes: codex-only intentionally uses gpt-6-astra for every seat; Codex builds
+and gpt-5.6-terra reviews share the GPT family; default Claude and Fable lanes
+have same-family validator seats alongside Codex diff review. Separate seats
+do not establish independent reviewer qualification or runtime acceptance.
 
 Cost classes: `cheap`, `standard`, `premium`, `open-model`.
 
