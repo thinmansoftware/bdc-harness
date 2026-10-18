@@ -171,6 +171,62 @@ test('fresh pause or epoch drift refuses permission before the effect', async ()
   await db.query("UPDATE tm_control SET pause_state='PAUSED', epoch=2 WHERE id=1");
   expect((await tm.authorizeAutomaticFire(input, db)).allowed).toBe(false);
 });
+
+test('reconciliation settlement cannot refund committed permission', async () => {
+  const input = await request('settlement-refund');
+  await tm.reserveAutomaticFire({ ...input, limit: 1 }, db);
+  await tm.settleAutomaticFire(
+    { actionKey: input.actionKey, cascadeId: input.cascadeId, state: 'released' },
+    other
+  );
+  expect((await tm.listAutomaticFireAdmissions(db))[0]?.state).toBe('reserved');
+  expect(await tm.releaseAutomaticFire({ ...input, ownerToken: 'foreign' }, other)).toBe(false);
+  await tm.authorizeAutomaticFire({ ...input, limit: 1 }, db);
+  const before = (await tm.listAutomaticFireAdmissions(db))[0]!;
+  await tm.settleAutomaticFire(
+    { actionKey: input.actionKey, cascadeId: input.cascadeId, state: 'released' },
+    other
+  );
+  expect((await tm.listAutomaticFireAdmissions(db))[0]).toEqual(before);
+  await tm.settleAutomaticFire(
+    {
+      actionKey: input.actionKey,
+      cascadeId: input.cascadeId,
+      state: 'admitted',
+      admittedAt: '2026-10-17T12:00:00.000Z',
+    },
+    other
+  );
+  expect((await tm.listAutomaticFireAdmissions(db))[0]).toEqual(before);
+  expect(
+    (await tm.reserveAutomaticFire({ ...(await request('not-refunded')), limit: 1 }, other)).allowed
+  ).toBe(false);
+});
+
+test.each([true, false])(
+  'owned release and authorization serialize across SQLite connections: releaseFirst=%s',
+  async releaseFirst => {
+    const input = { ...(await request('release-race')), limit: 1 };
+    await tm.reserveAutomaticFire(input, db);
+    const release = () => tm.releaseAutomaticFire(input, other);
+    const authorize = () => tm.authorizeAutomaticFire(input, db);
+    const [released, decision] = releaseFirst
+      ? await Promise.all([release(), authorize()])
+      : await Promise.all([authorize(), release()]).then(([a, r]) => [r, a] as const);
+    expect(Number(released) + Number(decision.allowed)).toBe(1);
+    const row = (
+      await db.query<tm.AutomaticFireAdmission>(
+        'SELECT * FROM tm_fire_admissions WHERE action_key=$1',
+        [input.actionKey]
+      )
+    ).rows[0]!;
+    expect(row.state).toBe(released ? 'released' : 'unknown');
+    expect(row.admitted_at).toBe(released ? null : now);
+    expect(
+      (await tm.reserveAutomaticFire({ ...(await request('after-race')), limit: 1 }, other)).allowed
+    ).toBe(released);
+  }
+);
 test('unreconciled legacy fire journal blocks fresh budget', async () => {
   await request('legacy');
   await db.query("UPDATE tm_journal SET outcome='sent' WHERE id='legacy'");

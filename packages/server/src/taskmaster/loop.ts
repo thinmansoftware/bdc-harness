@@ -994,17 +994,10 @@ async function reconcileAutomaticFires(
     const record = await read(row.cascade_id);
     if (!record) continue; // Absence is never proof that a permission was unused.
     const runIds = record.attempts.flatMap(attempt => (attempt.runId ? [attempt.runId] : []));
-    if (
-      (record.status === 'refused' || record.status === 'planned') &&
-      record.attempts.length === 0
-    ) {
-      await budget.settleAutomaticFire({
-        actionKey: row.action_key,
-        cascadeId: row.cascade_id,
-        state: 'released',
-      });
-      continue;
-    }
+    // A zero-attempt file can predate this permission (manual/dry-run collision).
+    // It is not an owned non-admission witness. Check provenance even for such
+    // records; absent/conflicting evidence stays held. The active owner releases
+    // definitive pre-permission refusals through releaseAutomaticFire below.
     const source = record.automaticFireAdmission;
     if (!source) {
       // A terminal journal label alone is not admission proof. Only an exact,
@@ -1066,13 +1059,21 @@ async function reconcileAutomaticFires(
       // Keep the legacy owner marker and original journal/record provenance.
       continue;
     }
+    const recordDryRun: unknown = record.request?.dryRun;
     if (
       source.source !== 'taskmaster' ||
       source.actionKey !== row.action_key ||
       source.journalId !== row.journal_id ||
       source.sourceThreadRef !== row.source_thread_ref ||
       source.cascadeId !== row.cascade_id ||
-      source.utcDay !== source.admittedAt.slice(0, 10)
+      record.cascadeId !== row.cascade_id ||
+      recordDryRun !== false ||
+      !Number.isFinite(Date.parse(source.admittedAt)) ||
+      Date.parse(source.admittedAt) > now.getTime() ||
+      source.utcDay !== source.admittedAt.slice(0, 10) ||
+      (row.admitted_at !== null &&
+        (Date.parse(source.admittedAt) !== Date.parse(row.admitted_at) ||
+          source.utcDay !== row.utc_day))
     )
       throw new Error('automatic_fire_provenance_conflict');
     await budget.settleAutomaticFire({

@@ -195,12 +195,16 @@ export async function releaseAutomaticFire(
   input: Pick<AutomaticFireRequest, 'actionKey' | 'ownerToken' | 'now'>,
   db: IDatabase = getDatabase()
 ): Promise<boolean> {
-  const result = await db.query(
-    `UPDATE tm_fire_admissions SET state='released',updated_at=$1
-     WHERE action_key=$2 AND owner_token=$3 AND state='reserved' AND admitted_at IS NULL`,
-    [input.now, input.actionKey, input.ownerToken]
-  );
-  return result.rowCount === 1;
+  // Serialize with authorization's control-row lock on BOTH dialects. A CAS
+  // outside that lock could release after authorization read its reservation.
+  return fireBudgetTransaction(db, async query => {
+    const result = await query(
+      `UPDATE tm_fire_admissions SET state='released',updated_at=$1
+       WHERE action_key=$2 AND owner_token=$3 AND state='reserved' AND admitted_at IS NULL`,
+      [input.now, input.actionKey, input.ownerToken]
+    );
+    return result.rowCount === 1;
+  });
 }
 export async function settleAutomaticFire(
   input: {
@@ -212,11 +216,14 @@ export async function settleAutomaticFire(
   },
   db: IDatabase = getDatabase()
 ): Promise<void> {
+  // Settlement has no owner/non-admission witness. Only the owned, serialized
+  // releaseAutomaticFire path can release an uncommitted reservation.
   await db.query(
     `UPDATE tm_fire_admissions SET state=$1,admitted_at=COALESCE($2,admitted_at),
      utc_day=COALESCE($3,utc_day),run_ids_json=$4,updated_at=$5
      WHERE action_key=$6 AND cascade_id=$7
-       AND (state <> 'admitted' OR $1='admitted')`,
+       AND $1 <> 'released' AND (state <> 'admitted' OR $1='admitted')
+       AND (admitted_at IS NULL OR $2 IS NULL OR admitted_at=$2)`,
     [
       input.state,
       input.admittedAt ?? null,

@@ -9,6 +9,7 @@ import {
   settleAutomaticFire,
   releaseAutomaticFire,
   type AutomaticFireRequest,
+  listAutomaticFireAdmissions,
 } from './taskmaster';
 
 const schema = `tm_fire_cap_${randomUUID().replace(/-/g, '')}`;
@@ -135,3 +136,59 @@ test('PostgreSQL epoch fence and definitive no-permission release preserve unkno
   expect((await authorizeAutomaticFire(input, second)).allowed).toBe(false);
   expect(await releaseAutomaticFire(input, first)).toBe(true);
 });
+
+test('PostgreSQL unowned settlement never releases reserved or committed permission', async () => {
+  const input = { ...(await request('settlement-refund')), limit: 1 };
+  await reserveAutomaticFire(input, first);
+  await settleAutomaticFire(
+    { actionKey: input.actionKey, cascadeId: input.cascadeId, state: 'released' },
+    second
+  );
+  expect((await listAutomaticFireAdmissions(first))[0]?.state).toBe('reserved');
+  expect(await releaseAutomaticFire({ ...input, ownerToken: 'foreign' }, second)).toBe(false);
+  expect((await authorizeAutomaticFire(input, first)).allowed).toBe(true);
+  const row = (await listAutomaticFireAdmissions(first))[0]!;
+  await settleAutomaticFire(
+    { actionKey: input.actionKey, cascadeId: input.cascadeId, state: 'released' },
+    second
+  );
+  expect((await listAutomaticFireAdmissions(first))[0]).toEqual(row);
+  await settleAutomaticFire(
+    {
+      actionKey: input.actionKey,
+      cascadeId: input.cascadeId,
+      state: 'admitted',
+      admittedAt: '2026-10-17T12:00:00.000Z',
+    },
+    second
+  );
+  expect((await listAutomaticFireAdmissions(first))[0]).toEqual(row);
+  expect(
+    (await reserveAutomaticFire({ ...(await request('replacement')), limit: 1 }, second)).allowed
+  ).toBe(false);
+});
+
+test.each([true, false])(
+  'PostgreSQL owned release and authorization serialize: releaseFirst=%s',
+  async releaseFirst => {
+    const input = { ...(await request('release-race')), limit: 1 };
+    await reserveAutomaticFire(input, first);
+    const release = () => releaseAutomaticFire(input, second);
+    const authorize = () => authorizeAutomaticFire(input, first);
+    const [released, decision] = releaseFirst
+      ? await Promise.all([release(), authorize()])
+      : await Promise.all([authorize(), release()]).then(([a, r]) => [r, a] as const);
+    expect(Number(released) + Number(decision.allowed)).toBe(1);
+    const row = (
+      await first!.query<{ state: string; admitted_at: string | null }>(
+        'SELECT state,admitted_at FROM tm_fire_admissions WHERE action_key=$1',
+        [input.actionKey]
+      )
+    ).rows[0]!;
+    expect(row.state).toBe(released ? 'released' : 'unknown');
+    expect(row.admitted_at === null).toBe(released);
+    expect(
+      (await reserveAutomaticFire({ ...(await request('after-race')), limit: 1 }, second)).allowed
+    ).toBe(released);
+  }
+);

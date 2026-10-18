@@ -804,6 +804,65 @@ const EXPECTED_SPEC = {
   specHash: `sha256:${'b'.repeat(64)}`,
 };
 describe('fire_cauldron loop', () => {
+  test.each(['refused', 'planned'] as const)(
+    'definitive pre-permission %s releases only the owned reservation',
+    async status => {
+      const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const deps = makeDeps(world, {
+          listThreads: async () => [
+            makeListedThread({
+              ref: 'gh:thinmansoftware/bdc-harness#709',
+              title: 'WO-HARNESS-EXAMPLE-709',
+              priority: 'P0',
+              isUnclaimed: true,
+              isUnclaimedP0: true,
+            }),
+          ],
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-709',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+            },
+          }),
+        });
+        let calls = 0;
+        // Bypass the fixture's automatic gate wrapper: a real pre-admission
+        // refusal/dry-run returns WITHOUT asking for permission.
+        deps.runCascade = async options => {
+          calls++;
+          return { cascadeId: options.dispatchId, status, attempts: [] } as never;
+        };
+        const result = await tick(createTaskmasterState(60_000), deps);
+        expect(calls).toBe(1);
+        expect(result.failed).toBe(0);
+        expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe(
+          'expired'
+        );
+        const rows = (
+          await budgetStores.get(world)!.query<{
+            state: string;
+            admitted_at: string | null;
+          }>('SELECT state,admitted_at FROM tm_fire_admissions')
+        ).rows;
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.state).toBe('released');
+        expect(rows[0]?.admitted_at).toBeNull();
+      } finally {
+        if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+        else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+      }
+    }
+  );
+
   test('beyond_first_page_cannot_fire_by_default', async () => {
     const priorFireVerb = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     const priorBeyondPage = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE;

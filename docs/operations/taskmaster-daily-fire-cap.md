@@ -18,8 +18,10 @@ after acquiring the DB lock, rechecks UTC day and current pause/epoch, and
 commits conservative permission before a durable cascade admission or effect.
 
 A lost result remains unknown and consumes capacity. There is no timeout refund.
-Only a reservation that never committed permission, or a durable zero-attempt
-refusal/dry-run, can release capacity. Later build failure does not refund an
+Only the active owner's reservation that never committed permission can release
+capacity. A definitive refusal/dry-run observed before the awaited permission
+guard uses that owned release path. A pre-existing zero-attempt record alone is
+not proof that a later permission was unused. Later build failure does not refund an
 accepted fire. Restart reconciliation covers all unresolved ledger identities,
 including those older than the message journal lookback. Missing or conflicting
 history withholds new fires; legacy unknowns are not relabelled as verified.
@@ -41,6 +43,43 @@ The cascade record carries source, journal/action/thread, UTC admission day and
 permission timestamp. Actual workflow identities come from `attempts[].runId`.
 The ledger and pending expectation follow those child IDs; a cascade ID is never
 used as a workflow row ID, and WO text matching is not admission evidence.
+
+### A7 provenance and release correction candidate
+
+Independent review of published5f7f (#2002/6255868999) found that reconciliation
+could refund a committed unknown permission from an older planned/refused file
+before matching its admission provenance. Three real temporary-recorder collision
+cases and a direct DAL case reproduced that transition:0pass/4fail/31assertions,
+then4pass/0fail/47assertions after the correction. A second RED0/2/14 exposed
+rewriting a committed permission's accounting timestamp to an earlier day.
+
+The candidate removes the unowned zero-attempt reconciliation refund. Matching
+action/journal/thread/cascade, non-dry-run and committed time/day evidence is
+checked before settlement. Missing or conflicting evidence remains held. Generic
+settlement cannot release capacity or replace a committed admission timestamp;
+the existing owner-bound reserved/null release now uses the same control-row
+transaction lock as authorization in both dialects. No schema, provider,
+recorder, cascade or SQLite adapter implementation changes accompany A7.
+Normal loop refused/planned returns before permission still release the owner's
+reservation. Separate SQLite connections exercise release versus authorization
+in both invocation orders; PostgreSQL counterparts await fresh isolated proof.
+
+A7's four-file Stop1 passed175/0/1006assertions, no skip/filter. Its exact14-file
+Taskmaster group FAILED371/1/1603: the existing old-pending fixture hit EPERM in
+the normal recorder's rename. Core taskmaster passed103/0/350. The EPERM cause
+is UNRESOLVED; it is distinct from the earlier SQLite cleanup EBUSY.
+
+Separate diagnostic-only D1 observed one group372/0/1614 and one named isolated
+old-pending control1/0/11 (32 other cases filtered for that diagnostic only).
+Both traces show two normal exclusive creates and eight normal writes, sequential
+awaited calls, peak one test-owned writer per record and none active at stop.
+Both normal recorder methods were explicitly injected to preserve exclusive
+create behavior. Observation does not prove native-handle closure or external
+ownership. These passes neither erase A7's failure nor establish an EPERM fix.
+No retry, forced deletion, sleep, teardown change or OS/config workaround was
+added. The local checkpoint remains BLOCKED pending fresh exact-head CI/PG,
+independent/App review, post-build validation and the unresolved failure's
+disposition. It authorizes no publication, runtime release or registry effect.
 
 ## Verification
 

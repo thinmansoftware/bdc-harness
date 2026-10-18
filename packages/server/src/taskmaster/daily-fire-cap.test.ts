@@ -10,6 +10,7 @@ import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import { reserveAutomaticFire, authorizeAutomaticFire } from '@archon/core/db/taskmaster';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import * as loop from './loop';
+import { createRecord, writeRecord } from '../../../smart-cauldron/src/recorder';
 
 test('daily cap defaults to two and invalid configuration fails closed', () => {
   expect(loop.resolveTaskmasterFireDailyLimit(undefined)).toBe(2);
@@ -404,6 +405,182 @@ test('denied admission gate creates no provider effect; dry-run never requests p
 });
 
 test.each([
+  'manual-refused',
+  'manual-planned',
+  'dry-run',
+  'matching-permission',
+  'foreign-action',
+  'foreign-journal',
+  'foreign-thread',
+  'foreign-cascade',
+  'foreign-time',
+])('pre-existing zero-attempt record cannot refund later permission: %s', async scenario => {
+  const directory = mkdtempSync(join(tmpdir(), 'tm-cap-legacy-collision-'));
+  let db = new SqliteAdapter(join(directory, 'test.db'));
+  const previousFlag = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+  process.env.TASKMASTER_FIRE_VERB_ENABLED = '1';
+  try {
+    await db.query("UPDATE tm_control SET pause_state='RUNNING',epoch=1 WHERE id=1");
+    const day = new Date().toISOString();
+    let effects = 0;
+    const options = fakeCascade(directory);
+    options.deps!.fire = async () => {
+      effects++;
+      throw new Error('collision must not start a provider');
+    };
+    if (scenario === 'dry-run') options.dryRun = true;
+    else
+      options.deps!.findWoClaim = async () => ({
+        number: 1,
+        state: 'OPEN',
+        title: 'existing manual claim',
+        url: 'https://example.test/pr/1',
+        repo: 'fixture/repo',
+      });
+    const prior = await runCascade(options);
+    if (scenario === 'manual-planned') {
+      prior.status = 'planned';
+      await writeRecord(prior, directory);
+    }
+    expect(prior.attempts).toHaveLength(0);
+    expect(prior.automaticFireAdmission).toBeUndefined();
+    await db.query(
+      `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at)
+         VALUES ('collision','test:collision','fire_cauldron',$1,'cap-test','pending',$2)`,
+      [
+        JSON.stringify({
+          cascadeId: 'cap-test',
+          fireEvidence: { woId: options.woId, project: options.project },
+        }),
+        day,
+      ]
+    );
+    const input = {
+      actionKey: 'cap-test',
+      journalId: 'collision',
+      sourceThreadRef: 'test:collision',
+      ownerToken: 'actual-owner',
+      cascadeId: 'cap-test',
+      epoch: 1,
+      limit: 1,
+      now: day,
+    };
+    expect((await reserveAutomaticFire(input, db)).allowed).toBe(true);
+    const automatic = fakeCascade(directory);
+    automatic.deps!.fire = options.deps!.fire;
+    let permission: taskmasterDb.AutomaticFireProvenance | undefined;
+    automatic.beforeAdmission = async () => {
+      const decision = await authorizeAutomaticFire(input, db);
+      expect(decision.allowed).toBe(true);
+      permission = decision.admission;
+      return decision.admission!;
+    };
+    if (scenario === 'dry-run')
+      await expect(runCascade(automatic)).rejects.toThrow('dispatch identity conflict');
+    else expect((await runCascade(automatic)).status).toBe(prior.status);
+    expect(await taskmasterDb.releaseAutomaticFire(input, db)).toBe(false);
+    await db.query("UPDATE tm_journal SET outcome='failed' WHERE id='collision'");
+    const before = (await taskmasterDb.listAutomaticFireAdmissions(db))[0]!;
+    expect(before.state).toBe('unknown');
+    expect(before.admitted_at).toBe(day);
+    if (scenario === 'matching-permission' || scenario.startsWith('foreign-')) {
+      // Persist actual returned permission, then isolate one provenance conflict.
+      prior.automaticFireAdmission = { ...permission! };
+      if (scenario === 'foreign-action') prior.automaticFireAdmission.actionKey = 'foreign';
+      if (scenario === 'foreign-journal') prior.automaticFireAdmission.journalId = 'foreign';
+      if (scenario === 'foreign-thread') prior.automaticFireAdmission.sourceThreadRef = 'foreign';
+      if (scenario === 'foreign-cascade') prior.automaticFireAdmission.cascadeId = 'foreign';
+      if (scenario === 'foreign-time') {
+        prior.automaticFireAdmission.admittedAt = new Date(
+          Date.parse(day) - 86_400_000
+        ).toISOString();
+        prior.automaticFireAdmission.utcDay = prior.automaticFireAdmission.admittedAt.slice(0, 10);
+      }
+      await writeRecord(prior, directory);
+    }
+    const reconcile = async (at: string) => {
+      await expect(
+        loop.tick(loop.createTaskmasterState(60_000), {
+          now: () => new Date(at),
+          db: {
+            ...taskmasterDb,
+            getActionsSince: async () =>
+              (await db.query<taskmasterDb.TmJournalEntry>('SELECT * FROM tm_journal')).rows,
+            getPauseState: async () => {
+              throw new Error('collision-reconciliation-stop');
+            },
+            updateActionOutcome: async (id, outcome, proposal) => {
+              await db.query('UPDATE tm_journal SET outcome=$1,proposal_json=$2 WHERE id=$3', [
+                outcome,
+                proposal ?? '{}',
+                id,
+              ]);
+              return null;
+            },
+            registerExpectation: undefined,
+          },
+          fireBudget: {
+            reserveAutomaticFire: value => taskmasterDb.reserveAutomaticFire(value, db),
+            authorizeAutomaticFire: value => taskmasterDb.authorizeAutomaticFire(value, db),
+            releaseAutomaticFire: value => taskmasterDb.releaseAutomaticFire(value, db),
+            settleAutomaticFire: value => taskmasterDb.settleAutomaticFire(value, db),
+            seedAutomaticFireHistory: value => taskmasterDb.seedAutomaticFireHistory(value, db),
+            listAutomaticFireAdmissions: () => taskmasterDb.listAutomaticFireAdmissions(db),
+            updateAutomaticFireExpectation: value =>
+              taskmasterDb.updateAutomaticFireExpectation(value, db),
+          },
+          readFireCascade: id => readCascadeRecord(id, directory),
+          getDispatchReceiptCutoverAt: async () => null,
+          checkExpectations: async () => {},
+        })
+      ).rejects.toThrow('collision-reconciliation-stop');
+      const after = (await taskmasterDb.listAutomaticFireAdmissions(db))[0]!;
+      if (scenario === 'matching-permission') {
+        expect(after.state).toBe('admitted');
+        expect(after.admitted_at).toBe(before.admitted_at);
+        expect(after.owner_token).toBe(before.owner_token);
+        expect(after.utc_day).toBe(before.utc_day);
+      } else expect(after).toEqual(before);
+    };
+    await reconcile(day);
+    await db.close();
+    db = new SqliteAdapter(join(directory, 'test.db'));
+    const nextDay = new Date(Date.parse(day) + 86_400_000).toISOString();
+    await reconcile(nextDay);
+    await db.query(
+      `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,outcome,created_at)
+        VALUES ('replacement','replacement','fire_cauldron','{}','pending',$1)`,
+      [nextDay]
+    );
+    expect(
+      (
+        await reserveAutomaticFire(
+          {
+            ...input,
+            actionKey: 'replacement',
+            journalId: 'replacement',
+            sourceThreadRef: 'replacement',
+            cascadeId: 'replacement',
+            now: nextDay,
+          },
+          db
+        )
+      ).allowed
+    ).toBe(scenario === 'matching-permission');
+    expect(effects).toBe(0);
+    expect(await readCascadeRecord('cap-test', directory)).toEqual(prior);
+  } finally {
+    if (previousFlag === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    else process.env.TASKMASTER_FIRE_VERB_ENABLED = previousFlag;
+    await db.close();
+    db = undefined as unknown as SqliteAdapter;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    Bun.gc(true);
+    await removeLegacyFixture(directory);
+  }
+});
+
+test.each([
   'proved',
   'proved-failed',
   'proved-expired',
@@ -425,6 +602,55 @@ test.each([
 ])('legacy reconciliation across restart and UTC day: %s', async scenario => {
   const directory = mkdtempSync(join(tmpdir(), 'tm-cap-legacy-'));
   let db = new SqliteAdapter(join(directory, 'isolated.db'));
+  // D1 observes only the original failing synthetic case. This measures awaited
+  // test-owned calls, not native handles or unrelated OS readers/writers.
+  const lifecycle: Array<{
+    sequence: number;
+    phase: string;
+    stage: string;
+    active: number;
+    elapsedMs: number;
+    code?: string;
+  }> = [];
+  const activeWriters = new Map<string, number>();
+  const started = performance.now();
+  let sequence = 0;
+  let peakOwnedWriters = 0;
+  const observe = async <T>(
+    phase: string,
+    key: string,
+    operation: () => Promise<T>
+  ): Promise<T> => {
+    const record = (stage: string, code?: string) => {
+      if (lifecycle.length < 32)
+        lifecycle.push({
+          sequence: sequence++,
+          phase,
+          stage,
+          active: activeWriters.get(key) ?? 0,
+          elapsedMs: Math.round(performance.now() - started),
+          ...(code ? { code } : {}),
+        });
+    };
+    activeWriters.set(key, (activeWriters.get(key) ?? 0) + 1);
+    peakOwnedWriters = Math.max(peakOwnedWriters, activeWriters.get(key)!);
+    record('begin');
+    try {
+      const result = await operation();
+      record('fulfilled');
+      return result;
+    } catch (error) {
+      const code: unknown = (error as NodeJS.ErrnoException).code;
+      record(
+        'rejected',
+        typeof code === 'string' && /^[A-Z0-9_]{1,24}$/.test(code) ? code : 'unknown'
+      );
+      throw error;
+    } finally {
+      activeWriters.set(key, activeWriters.get(key)! - 1);
+      record('end');
+    }
+  };
   const priorFlag = process.env.TASKMASTER_FIRE_VERB_ENABLED;
   process.env.TASKMASTER_FIRE_VERB_ENABLED = '1';
   try {
@@ -433,6 +659,14 @@ test.each([
     const day = '2026-10-18T12:00:00.000Z';
     for (const key of ['legacy-a', 'legacy-b']) {
       const options = fakeCascade(directory);
+      if (scenario === 'old-pending') {
+        // Specify BOTH normal methods: supplying writeRecord alone would select
+        // runCascade's legacy create shim instead of its real exclusive create.
+        options.deps!.createRecord = (record, outDir) =>
+          observe('create', key, () => createRecord(record, outDir));
+        options.deps!.writeRecord = (record, outDir) =>
+          observe('write', key, () => writeRecord(record, outDir));
+      }
       options.dispatchId = key;
       const record = await runCascade(options);
       record.createdAt = day;
@@ -601,6 +835,23 @@ test.each([
           .rows[0]?.proof_deadline_at
       ).toBeNull();
   } finally {
+    if (scenario === 'old-pending') {
+      try {
+        console.error(
+          'D1_OWNED_RECORDER_LIFECYCLE',
+          JSON.stringify({
+            synthetic: true,
+            peakOwnedWriters,
+            activeAtStop: [...activeWriters.values()],
+            lifecycle,
+            nativeHandleClosure: 'unobserved',
+            externalOwners: 'unobserved',
+          })
+        );
+      } catch {
+        /* Diagnostic reporting cannot replace the original test error. */
+      }
+    }
     if (priorFlag === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
     else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFlag;
     await db.close();
