@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { readdirSync, readFileSync } from 'node:fs';
+import { constants } from 'node:fs';
+import { lstat, open, opendir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
   CreateAuthenticatedMessageData,
@@ -48,7 +49,7 @@ export interface DeployDriftDeps {
   readBuildSha: () => string;
   fetchImpl: typeof fetch;
   readToken: () => string | null;
-  readLaneFiles: () => LaneFileMaps;
+  readLaneFiles: (signal?: AbortSignal) => LaneFileMaps | Promise<LaneFileMaps>;
   createMessage: (
     context: DispatchSenderContext,
     data: CreateAuthenticatedMessageData
@@ -106,29 +107,84 @@ function recipient(): string {
   return process.env.DUTY_OFFICER_DEPLOY_DRIFT_RECIPIENT?.trim() || 'xo';
 }
 
-function hashWorkflowDir(dir: string): Record<string, string> {
-  let names: string[];
+// Current defaults total about 5 MiB with a largest file below 300 KiB.
+const MAX_WORKFLOW_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_WORKFLOW_TOTAL_BYTES = 32 * 1024 * 1024;
+const MAX_WORKFLOW_ENTRIES = 2048;
+
+async function hashWorkflowDir(
+  dir: string,
+  budget: { entries: number; bytes: number },
+  signal?: AbortSignal
+): Promise<Record<string, string>> {
+  signal?.throwIfAborted();
   try {
-    names = readdirSync(dir);
-  } catch {
-    return {};
+    const root = await stat(dir);
+    signal?.throwIfAborted();
+    if (!root.isDirectory()) throw new Error('workflow_root_not_directory');
+  } catch (error) {
+    signal?.throwIfAborted();
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    throw error;
   }
+  const directory = await opendir(dir);
   const out: Record<string, string> = {};
-  for (const name of names) {
+  for await (const entry of directory) {
+    signal?.throwIfAborted();
+    if (++budget.entries > MAX_WORKFLOW_ENTRIES) throw new Error('workflow_entry_limit');
+    // Do not open directories, links, FIFOs, sockets or device entries.
+    if (!entry.isFile()) continue;
+    const path = join(dir, entry.name);
+    const before = await lstat(path);
+    signal?.throwIfAborted();
+    if (!before.isFile()) throw new Error('workflow_file_changed');
+    // Nonblocking/no-follow flags also protect the interval between lstat/open.
+    const handle = await open(
+      path,
+      constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0)
+    );
     try {
-      const data = readFileSync(join(dir, name));
-      out[name] = createHash('sha256').update(data).digest('hex');
-    } catch {
-      // Directories and unreadable entries are not lane files.
+      signal?.throwIfAborted();
+      const opened = await handle.stat();
+      signal?.throwIfAborted();
+      if (!opened.isFile() || before.dev !== opened.dev || before.ino !== opened.ino) {
+        throw new Error('workflow_file_changed');
+      }
+      if (opened.size > MAX_WORKFLOW_FILE_BYTES) throw new Error('workflow_file_byte_limit');
+      const hash = createHash('sha256');
+      const buffer = Buffer.alloc(64 * 1024);
+      let bytes = 0;
+      for (;;) {
+        signal?.throwIfAborted();
+        const read = await handle.read(buffer, 0, buffer.length, bytes);
+        signal?.throwIfAborted();
+        if (read.bytesRead === 0) break;
+        bytes += read.bytesRead;
+        budget.bytes += read.bytesRead;
+        if (bytes > MAX_WORKFLOW_FILE_BYTES || budget.bytes > MAX_WORKFLOW_TOTAL_BYTES) {
+          throw new Error('workflow_file_byte_limit');
+        }
+        hash.update(buffer.subarray(0, read.bytesRead));
+      }
+      const after = await handle.stat();
+      signal?.throwIfAborted();
+      if (after.size !== bytes || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs) {
+        throw new Error('workflow_file_changed');
+      }
+      out[entry.name] = hash.digest('hex');
+    } finally {
+      await handle.close();
     }
   }
+  signal?.throwIfAborted();
   return out;
 }
 
-export function readLaneFiles(): LaneFileMaps {
+export async function readLaneFiles(signal?: AbortSignal): Promise<LaneFileMaps> {
+  const budget = { entries: 0, bytes: 0 };
   return {
-    baked: hashWorkflowDir(getDefaultWorkflowsPath()),
-    served: hashWorkflowDir(getHomeWorkflowsPath()),
+    baked: await hashWorkflowDir(getDefaultWorkflowsPath(), budget, signal),
+    served: await hashWorkflowDir(getHomeWorkflowsPath(), budget, signal),
   };
 }
 
@@ -262,7 +318,8 @@ export async function runDeployDriftDetector(
   try {
     signal.throwIfAborted();
     runningSha = deps.readBuildSha();
-    const lanes = deps.readLaneFiles();
+    const lanes = await deps.readLaneFiles(signal);
+    signal.throwIfAborted();
     const repo = deployRepo();
     const branch = deployBranch();
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {

@@ -489,4 +489,28 @@ describe('deploy drift detector', () => {
     expect(readLaneFiles).toHaveBeenCalledTimes(0);
     expect(createMessage).toHaveBeenCalledTimes(0);
   });
+  test('aborted asynchronous lane read makes no HTTP or notification call', async () => {
+    const controller = new AbortController();
+    readLaneFiles.mockImplementation(async () => {
+      await Promise.resolve();
+      controller.abort(new Error('fixture lane cancellation'));
+      return sameLanes();
+    });
+    const result = await runDeployDriftDetector(deps(), controller.signal);
+    expect(result?.verdict).toBe('observation_error');
+    expect(result?.last_error).toBe('fixture lane cancellation');
+    expect(fetchImpl).toHaveBeenCalledTimes(0);
+    expect(createMessage).toHaveBeenCalledTimes(0);
+  });
+
+  test('failed asynchronous lane read makes no HTTP or notification call', async () => {
+    readLaneFiles.mockImplementation(async () => {
+      throw new Error('fixture filesystem failure');
+    });
+    const result = await run();
+    expect(result?.verdict).toBe('observation_error');
+    expect(result?.last_error).toBe('fixture filesystem failure');
+    expect(fetchImpl).toHaveBeenCalledTimes(0);
+    expect(createMessage).toHaveBeenCalledTimes(0);
+  });
 });

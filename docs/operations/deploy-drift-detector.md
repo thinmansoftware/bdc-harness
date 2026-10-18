@@ -88,3 +88,25 @@ a dirty tree (exit 3, the word `DIRTY`) and exports `ARCHON_BUILD_SHA` from
 `git rev-parse HEAD` before `docker compose build`. A compose build that does not
 go through `build-app-image.sh` leaves `ARCHON_BUILD_SHA=unknown`, and this detector
 will alert once the process has been up longer than the grace period.
+
+
+## Workflow file observation bounds
+
+The reader asynchronously hashes regular files only. It skips directory entries
+that are links, directories, FIFOs, sockets or devices, and verifies the opened
+file descriptor against the regular file identity observed before opening.
+Nonblocking/no-follow open flags are used where supported. Missing workflow
+root directories remain empty maps; other read failures are observation errors.
+
+Both directories share a 2048-entry and 32 MiB read budget; each file is limited
+to 2 MiB. The current baked defaults contain 104 files totaling about 4.95 MB,
+with a largest file below 300 KB. Limits, replacement/modification observations
+and cancellation produce an observation error without a drift alert. Reads use
+64 KiB chunks and check cancellation between filesystem operations. The clock's
+deadline remains active while these asynchronous reads run.
+
+AbortSignal cannot preempt every operating-system filesystem call, and file
+identity depends on the filesystem's device/inode support. This removes the
+identified synchronous special-file read; it is not a universal filesystem hang
+guarantee. Skipped entries retain the existing shared-regular-filename comparison
+scope and do not establish whether an ignored file is a valid runnable workflow.
