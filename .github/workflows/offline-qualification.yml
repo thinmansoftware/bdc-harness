@@ -69,6 +69,7 @@ jobs:
           bun test ./scripts/staging/teetime-artifact-stream.test.ts
           bun test ./scripts/staging/teetime-sdk-lifecycle.test.ts
           bun test ./scripts/staging/teetime-fixed-artifact.test.ts
+          bun test packages/workflows/src/reliability/tee-time-review-package.test.ts
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test
           bun --filter @archon/server type-check

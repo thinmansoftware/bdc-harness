@@ -74,7 +74,7 @@ export function evidenceHash(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
-function requireBinding(actual: ReviewBinding, expected: ReviewBinding): void {
+export function requireBinding(actual: ReviewBinding, expected: ReviewBinding): void {
   for (const value of [actual, expected]) {
     if (Object.keys(value).sort().join(',') !== [...bindingKeys].sort().join(','))
       throw new Error('binding fields mismatch');
@@ -102,6 +102,38 @@ function requireBinding(actual: ReviewBinding, expected: ReviewBinding): void {
     throw new Error('stale or foreign binding');
 }
 
+export function validateTrustedReviewChecks(
+  binding: ReviewBinding,
+  requiredChecks: readonly { id: string; commandHash: string }[],
+  checks: readonly TrustedCheck[]
+): void {
+  const required = new Map(requiredChecks.map(check => [check.id, check.commandHash]));
+  if (!required.size || required.size !== requiredChecks.length || checks.length !== required.size)
+    throw new Error('required checks missing or duplicated');
+  const seen = new Set<string>();
+  for (const check of checks) {
+    if (
+      !required.has(check.id) ||
+      seen.has(check.id) ||
+      !/^[a-f0-9]{64}$/.test(check.commandHash) ||
+      required.get(check.id) !== check.commandHash ||
+      check.sourceTree !== binding.sourceTree ||
+      check.image !== binding.testImage ||
+      check.exitCode !== 0 ||
+      check.termination !== 'completed' ||
+      typeof check.truncated !== 'boolean' ||
+      check.truncated ||
+      check.skipped !== 0 ||
+      !Number.isSafeInteger(check.assertions) ||
+      check.assertions < 1 ||
+      !check.output.trim() ||
+      evidenceHash(check.output) !== check.outputHash
+    )
+      throw new Error('trusted test receipt rejected');
+    seen.add(check.id);
+  }
+}
+
 export function validateReviewEvidence(input: {
   binding: ReviewBinding;
   expectedBinding: ReviewBinding;
@@ -122,35 +154,7 @@ export function validateReviewEvidence(input: {
     throw new Error('reviewer schema or model identity mismatch');
   const packageHash = evidenceHash(input.packageText);
   if (input.envelope.packageHash !== packageHash) throw new Error('review package hash mismatch');
-  const required = new Map(input.requiredChecks.map(check => [check.id, check.commandHash]));
-  if (
-    !required.size ||
-    required.size !== input.requiredChecks.length ||
-    input.checks.length !== required.size
-  )
-    throw new Error('required checks missing or duplicated');
-  const seen = new Set<string>();
-  for (const check of input.checks) {
-    if (
-      !required.has(check.id) ||
-      seen.has(check.id) ||
-      !/^[a-f0-9]{64}$/.test(check.commandHash) ||
-      required.get(check.id) !== check.commandHash ||
-      check.sourceTree !== input.binding.sourceTree ||
-      check.image !== input.binding.testImage ||
-      check.exitCode !== 0 ||
-      check.termination !== 'completed' ||
-      typeof check.truncated !== 'boolean' ||
-      check.truncated ||
-      check.skipped !== 0 ||
-      !Number.isSafeInteger(check.assertions) ||
-      check.assertions < 1 ||
-      !check.output.trim() ||
-      evidenceHash(check.output) !== check.outputHash
-    )
-      throw new Error('trusted test receipt rejected');
-    seen.add(check.id);
-  }
+  validateTrustedReviewChecks(input.binding, input.requiredChecks, input.checks);
   const artifacts = JSON.parse(input.packageText).artifacts as {
     id: string;
     content: string;

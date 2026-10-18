@@ -668,3 +668,38 @@ directory as an image-path surrogate; it does not qualify a Docker runtime.
 Independent architect source recheck approved publication/CI after both fixes.
 No selector rehearsal, credential transfer or authenticated attempt is approved by
 that source verdict; exact frozen source/image/manifest and runtime review remain.
+
+## Pure implementation-review package candidate
+
+Invocation: assembleTeeTimeReviewPackage(input) in
+packages/workflows/src/reliability/tee-time-review-package.ts. Tests:
+
+```text
+bun test packages/workflows/src/reliability/tee-time-review-package.test.ts packages/providers/src/community/pi/restricted-review-evidence.test.ts
+```
+
+This source-only helper consumes controller-loaded RunAuthority, run/persisted
+policy, reviewed workflow, exact spec bytes, ReviewBinding, controller Git
+observations and required actual test receipts. It reuses buildRunAuthority,
+policy digest/equality, binding validation and extracted required-check validation.
+No record loading, filesystem, Git command, provider or network call occurs.
+
+Binding and run/policy/workflow/spec/base/parent/head/tree/manifest/image identities
+must agree. baseSha is not replaced by runScopeSha. Required checks must match
+reviewed command identities and source/image; failed, missing, skipped, truncated
+or altered output rejects. Malformed UTF-8 or surrogate text rejects instead of
+replacement. The three payloads are exact spec, complete controller diff text and
+JSON.stringify(checks), each hashed as UTF-8. No verdict is manufactured to reuse
+the validator. Existing final review validation behavior is preserved.
+
+The synchronous serializer callback supplies bytes; its installed-SDK provenance
+is NOT established by this helper. buildRestrictedReviewWire verifies the exact
+package and unchanged6000-byte final limit. Oversize blocks, without summaries or
+retries. Returned binding is a frozen copy; remaining outputs are immutable strings
+and numbers, with no approval/permission/ref/publication output.
+
+Controller complete/binary flags are assertions, not proof of complete diff
+generation, trusted Git custody, parent/tree relation or an established head.
+The future adapter must prove those facts and actual test/record/SDK custody.
+Separately approved plan, reviewer execution, atomic replay-safe consumption and
+coordinated policy/workflow adoption remain required before admission.
