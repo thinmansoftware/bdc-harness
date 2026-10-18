@@ -211,3 +211,36 @@ reconciliation, pending custody across reset, and legacy expectation conversion
 remain separate open work. The governing FIRE-VERB and EXPECTATION-REGISTRY WOs
 require those distinctions to remain visible. No new internal evidence kind is
 introduced by this phase.
+
+## Proposed source repair for review: pending fire custody (2026-10-18)
+
+This follow-on proposal keeps a fire journal row pending until the exact cascade
+reader proves an actual workflow run and the deterministic expectation is read
+back with the requested identity, original deadline and escalation policy.
+Admission alone is not a confirmed send. The journal stores the actual earliest
+workflow run ID; completion may be proved by a later bound attempt or an explicit
+frontier resume. An internal `cascade_workflow_completed` checker records the
+actual completed workflow ID as its evidence pointer. The public registration
+schema continues to accept exactly its existing six evidence kinds.
+
+Pending fires reconcile every tick, including rows older than the ordinary
+journal lookback. Reconciliation never invokes Cauldron. Missing or corrupt
+evidence leaves the row pending and holds another fire for that exact WO/project;
+an unparseable scope holds all new fires. Reset and parked-proposal expiry retain
+pending fires because they may already own provider work. Reconciliation updates
+compare the previous journal metadata and pending outcome so a stale reconciler
+cannot replace a newer custody transition. This is not a cross-process launch
+fence: the existing pre-effect pause/epoch writers and concurrent journal-row
+reuse still require a separate durable launch-ownership repair.
+
+Each attempted launch reserves a fire slot, an effect slot and its thread before
+invocation, even while admission remains uncertain. The existing three-fire and
+ten-effect per-tick limits remain unchanged, with no daily fire ceiling. A direct,
+identity-bound blocked/refused response with zero attempts is recorded as an
+expired no-fire; absence of a durable record after a crash cannot establish that.
+
+Registration retries read back the existing deterministic expectation. A legacy
+row with the wrong predicate remains visibly held: registration does not replace
+it, and this proposal provides no automatic legacy conversion. This section is a
+source proposal for review. It authorizes no merge, deployment, runtime repair or
+new absence action and supplies no evidence of improved production success.

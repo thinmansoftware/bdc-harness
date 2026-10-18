@@ -45,6 +45,10 @@ import {
   countExternalExpectationsSince,
   expectationKeyExists,
   listDueExpectations,
+  listPendingFireActions,
+  transitionPendingFireAction,
+  getExpectationByRegistrationKey,
+  expectationRegistrationKey,
   markMet,
   markFailed,
   claimRedispatchAttempt,
@@ -1384,6 +1388,117 @@ describe('tm_journal DAL', () => {
 });
 
 describe('tm_control DAL', () => {
+  test('pending fire enumeration keeps old custody beyond journal lookback', async () => {
+    const old = await recordAction({
+      thread_ref: 'old-fire',
+      action_type: 'fire_cauldron',
+      proposal_json: '{}',
+      outcome: 'pending',
+    });
+    await db.query('UPDATE tm_journal SET created_at = $1 WHERE id = $2', [
+      '2000-01-01T00:00:00Z',
+      old.id,
+    ]);
+    await recordAction({
+      thread_ref: 'sent-fire',
+      action_type: 'fire_cauldron',
+      proposal_json: '{}',
+      outcome: 'sent',
+    });
+    await recordAction({
+      thread_ref: 'nudge',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      outcome: 'pending',
+    });
+    expect((await listPendingFireActions()).map(row => row.id)).toEqual([old.id]);
+  });
+
+  test('pending fire transition fences outcome and metadata against stale reconcilers', async () => {
+    const fire = await recordAction({
+      thread_ref: 'fire',
+      action_type: 'fire_cauldron',
+      proposal_json: '{"version":1}',
+      outcome: 'pending',
+    });
+    expect(
+      await transitionPendingFireAction(fire.id, fire.proposal_json, 'pending', '{"version":2}')
+    ).toBe(true);
+    expect(
+      await transitionPendingFireAction(fire.id, fire.proposal_json, 'sent', '{"stale":true}')
+    ).toBe(false);
+    expect(
+      await transitionPendingFireAction(fire.id, '{"version":2}', 'sent', '{"runId":"actual"}')
+    ).toBe(true);
+    expect(await transitionPendingFireAction(fire.id, '{"runId":"actual"}', 'expired', '{}')).toBe(
+      false
+    );
+    expect(
+      (await getActionsSince(new Date(0).toISOString())).find(row => row.id === fire.id)
+    ).toMatchObject({ outcome: 'sent', proposal_json: '{"runId":"actual"}' });
+    const nudge = await recordAction({
+      thread_ref: 'nudge',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      outcome: 'pending',
+    });
+    expect(await transitionPendingFireAction(nudge.id, '{}', 'sent', '{}')).toBe(false);
+  });
+
+  test('expectation readback exposes a legacy mismatch without replacing it', async () => {
+    const first = {
+      action_ref: 'fire-action',
+      dispatch_ref: 'cascade',
+      recipient: 'operator',
+      evidence_json: '{"kind":"db_row_exists"}',
+      due_at: '2026-10-18T00:00:00Z',
+      on_absence: 'escalate' as const,
+      max_retries: 0,
+    };
+    const id = await registerExpectation(first);
+    const replacement = { ...first, evidence_json: '{"kind":"cascade_workflow_completed"}' };
+    expect(await registerExpectation(replacement)).toBe(id);
+    const stored = await getExpectationByRegistrationKey(
+      expectationRegistrationKey(first.action_ref, first.dispatch_ref)
+    );
+    expect(stored?.id).toBe(id);
+    expect(stored?.evidence_json).toBe(first.evidence_json);
+    expect(expectationSemanticMismatches(stored!, replacement)).toEqual(['evidence']);
+    expect(await getExpectationByRegistrationKey('missing')).toBeNull();
+  });
+
+  for (const reset of ['resume', 'reset'] as const) {
+    test(`${reset} preserves pending fire custody while expiring unsent proposals`, async () => {
+      const pendingFire = await recordAction({
+        thread_ref: 'fire',
+        action_type: 'fire_cauldron',
+        proposal_json: '{}',
+        outcome: 'pending',
+      });
+      await recordAction({
+        thread_ref: 'nudge',
+        action_type: 'nudge',
+        proposal_json: '{}',
+        outcome: 'pending',
+      });
+      await recordAction({
+        thread_ref: 'parked-fire',
+        action_type: 'fire_cauldron',
+        proposal_json: '{}',
+        outcome: 'parked',
+      });
+      const expired =
+        reset === 'resume'
+          ? await expireParkedActions()
+          : (await resetTaskmaster({ actor: 'test', reason: 'custody regression' }))
+              .expiredProposals;
+      expect(expired).toBe(2);
+      const rows = await getActionsSince(new Date(0).toISOString());
+      expect(rows.find(row => row.id === pendingFire.id)?.outcome).toBe('pending');
+      expect(rows.filter(row => row.outcome === 'expired')).toHaveLength(2);
+    });
+  }
+
   test('getPauseState returns the seeded RUNNING singleton', async () => {
     const control = await getPauseState();
     expect(control.pause_state).toBe('RUNNING');
