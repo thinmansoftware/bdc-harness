@@ -1,6 +1,7 @@
 export type DispatchTaskType =
   | 'agent_message'
   | 'run_review'
+  | 'run_rework'
   | 'draft_spec'
   | 'run_report'
   | 'board_motion';

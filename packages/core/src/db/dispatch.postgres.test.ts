@@ -506,6 +506,92 @@ describe('dispatch Phase 1.5 PostgreSQL integration', () => {
     );
   });
 
+  test('migration 064 seeds the rework principal idempotently', async () => {
+    const migration = readFileSync(
+      resolve(import.meta.dir, '../../../../migrations/064_overseer_rework_principal.sql'),
+      'utf8'
+    );
+    await db.query(migration);
+    await db.query(migration);
+    const rows = await db.query<{ delivery_mode: string; active: boolean }>(
+      "SELECT delivery_mode, active FROM dispatch_principals WHERE principal_id = 'overseer-rework'"
+    );
+    expect(rows.rows).toEqual([{ delivery_mode: 'worker_poll', active: true }]);
+  });
+
+  test('migration 065 widens an old-shape task_type CHECK to admit run_rework', async () => {
+    // Reproduce a pre-rework Postgres database: a task_type CHECK that predates
+    // this WO and does not list 'run_rework' (WO-HARNESS-OVERSEER-REWORK-LOOP-01,
+    // Overseer CHANGES_REQUESTED on PR #936: "Existing PostgreSQL databases
+    // retain the agent_dispatch_messages task_type CHECK constraint without
+    // 'run_rework' ... production enqueue attempts will therefore violate the
+    // existing constraint"). Migration 064 only seeds the dispatch_principals
+    // row; it does not touch this CHECK, so an old-shape database stays broken
+    // until 065 runs.
+    await db.query(`
+      ALTER TABLE agent_dispatch_messages
+        ADD CONSTRAINT task_type_stale_pre_rework
+          CHECK (task_type IN ('agent_message', 'run_review', 'draft_spec', 'run_report', 'board_motion'))
+    `);
+
+    const rejected = await db
+      .query(
+        `INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, recipient, body)
+         VALUES ($1, $2, $3, 'run_rework', 'overseer', 'codex', 'pre-rework rework attempt')`,
+        [randomUUID(), randomUUID(), `migration-065-pre-${randomUUID()}`]
+      )
+      .then(() => null)
+      .catch((error: unknown) => error);
+    expect(rejected).not.toBeNull();
+    expect(String((rejected as Error)?.message ?? rejected)).toMatch(
+      /task_type_stale_pre_rework|check constraint/i
+    );
+
+    const migration = readFileSync(
+      resolve(import.meta.dir, '../../../../migrations/065_dispatch_run_rework_task_type.sql'),
+      'utf8'
+    );
+    await db.query(migration);
+
+    const checks = await db.query<{ conname: string; definition: string }>(
+      `SELECT c.conname, pg_get_constraintdef(c.oid) AS definition
+         FROM pg_constraint c
+        WHERE c.conrelid = to_regclass('agent_dispatch_messages')
+          AND c.contype = 'c'
+          AND pg_get_constraintdef(c.oid) LIKE '%task_type%'`
+    );
+    expect(checks.rows).toHaveLength(1);
+    expect(checks.rows[0]?.conname).not.toBe('task_type_stale_pre_rework');
+    expect(checks.rows[0]?.definition).toContain('run_rework');
+
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+       (id, correlation_id, idempotency_key, task_type, sender, recipient, body)
+       VALUES ($1, $2, $3, 'run_rework', 'overseer', 'codex', 'migration 065')`,
+      [randomUUID(), randomUUID(), `migration-065-post-${randomUUID()}`]
+    );
+
+    // Re-running the migration must stay idempotent (production applies
+    // migrations in order exactly once, but a rebuild-then-reapply path must
+    // not fail if 065 is ever re-run against an already-migrated database).
+    await db.query(migration);
+    for (const taskType of [
+      'agent_message',
+      'run_review',
+      'draft_spec',
+      'run_report',
+      'board_motion',
+    ]) {
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, recipient, body)
+         VALUES ($1, $2, $3, $4, 'overseer', 'codex', 'prior type still accepted')`,
+        [randomUUID(), randomUUID(), `migration-065-prior-${randomUUID()}`, taskType]
+      );
+    }
+  });
+
   test('same-principal concurrent retries return one row; different principals share keys', async () => {
     const key = `race-${randomUUID()}`;
     const mk = (principal: string, sender: string, body: string) =>

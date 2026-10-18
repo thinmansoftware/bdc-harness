@@ -28,6 +28,7 @@ import {
   REVIEW_RECIPIENT,
   type ReviewRouteConfig,
 } from '@archon/overseer/pr-review-wiring';
+import { assessAndEnqueueRework, createRealReworkDeps } from '@archon/overseer/pr-rework';
 import {
   runAndSubmitReview,
   type ReviewWorkItem,
@@ -74,6 +75,12 @@ export interface ReviewWorkerDeps {
    * parked heads wait for an operator `ladder_restored` row.
    */
   judgeLadderRecovery?: (config: ReviewRouteConfig) => Promise<unknown>;
+  /**
+   * Enqueue a builder rework after a terminal changes_requested verdict.
+   * Optional so a test double can omit it. A hook failure is logged and never
+   * changes the review result already posted.
+   */
+  reworkOnChangesRequested?: (work: ReviewWorkItem, outcome: SubmitOutcome) => Promise<unknown>;
 }
 
 interface ResultMapping {
@@ -145,6 +152,8 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
       ingestDeps ??= createRealIngestDeps(config);
       return recoverParkedJudgeHeads(ingestDeps, defaultReviewLadder());
     },
+    reworkOnChangesRequested: (work, outcome) =>
+      assessAndEnqueueRework({ work, outcome }, createRealReworkDeps()),
   };
 }
 
@@ -259,13 +268,30 @@ export async function tickReviewWorkerClock(
           continue;
         }
         const result = mapSubmitOutcome(outcome.disposition);
-        await deps.postResult({
+        const completed = await deps.postResult({
           id: claimed.id,
           worker_id: REVIEW_WORKER_ID,
           fencing_token: claimed.fencing_token,
           ...result,
           result_body: JSON.stringify(outcome),
         });
+        // A rejected fence returns null. Follow-up work requires the same
+        // worker generation to have committed the expected terminal result.
+        if (
+          completed?.id === claimed.id &&
+          completed.fencing_token === claimed.fencing_token &&
+          completed.lease_owner === REVIEW_WORKER_ID &&
+          completed.status === result.status &&
+          completed.task_outcome === result.task_outcome &&
+          outcome.disposition === 'changes_requested' &&
+          deps.reworkOnChangesRequested
+        ) {
+          try {
+            await deps.reworkOnChangesRequested(work, outcome);
+          } catch (error) {
+            log.error({ err: error, messageId: claimed.id }, 'overseer_rework_enqueue_failed');
+          }
+        }
       } catch (error) {
         log.error({ err: error, messageId: message.id }, 'overseer_review_work_item_failed');
       }

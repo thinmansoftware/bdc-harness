@@ -168,4 +168,139 @@ describe('freezeWorkOrderSource', () => {
       freezeWorkOrderSource({ ...policy, allow_issue_fallback: true }, 'build something')
     ).rejects.toThrow('scope_authority_missing: woId or issue');
   });
+
+  describe('rework directive (WO-HARNESS-OVERSEER-REWORK-LOOP-01)', () => {
+    const reworkRef = {
+      prNumber: 936,
+      branch: 'feat/wo-harness-overseer-rework-loop-01-thread-abc123',
+      headSha: 'c'.repeat(40),
+      reviewMessageId: 'review-msg-1',
+    };
+    const reworkToken = Buffer.from(JSON.stringify(reworkRef)).toString('base64url');
+    const reworkMessage = (): string =>
+      `WO_ID=WO-TEST-01 --project bdc-harness --rework=${reworkToken}`;
+    const verifiedReviewRow = {
+      id: 'review-msg-1',
+      task_type: 'run_review' as const,
+      recipient: 'overseer-reviewer',
+      subject_key: 'gh:thinmansoftware/bdc-harness#936',
+      body: JSON.stringify({ headSha: reworkRef.headSha }),
+      result_body: JSON.stringify({
+        disposition: 'changes_requested',
+        summary: '[major] pr-rework.ts: missing coverage.',
+      }),
+      correlation_id: 'corr-1',
+      idempotency_key: 'idem-1',
+      sender: 'overseer',
+      sender_principal_id: null,
+      status: 'done' as const,
+      created_at: '2026-09-24T00:00:00.000Z',
+      claimed_at: null,
+      completed_at: null,
+      not_before: null,
+      lease_owner: null,
+      lease_expires_at: null,
+      fencing_token: 0,
+      recipient_alias: null,
+      motion_id: null,
+      motion_revision_sha: null,
+      resolved_recipient: null,
+      resolved_xo_lease_id: null,
+      resolved_xo_fencing_token: null,
+      resolved_at: null,
+      priority: 'normal' as const,
+      task_outcome: null,
+      acknowledged_at: null,
+      acknowledged_by: null,
+      addressed_at: null,
+      addressed_by: null,
+      escalated_tg_at: null,
+      escalated_sms_at: null,
+      route_disposition: null,
+      supersedes_id: null,
+      repeat_reason: null,
+    };
+
+    // Test 13: a verified rework directive appends a deterministic block to
+    // the canonical spec bytes, forcing the lane's gate-already-satisfied node
+    // (Stop 5) to see REWORK_DIRECTIVE and reads back the Overseer's findings.
+    it('appends the rework directive to the canonical spec bytes when the review message verifies', async () => {
+      const frozen = await freezeWorkOrderSource(policy, reworkMessage(), {
+        fetcher: canonicalFetch,
+        loadReviewMessage: async id => {
+          expect(id).toBe('review-msg-1');
+          return verifiedReviewRow;
+        },
+      });
+      const text = Buffer.from(frozen.specBytes).toString('utf8');
+      expect(text.startsWith(bytes)).toBe(true);
+      expect(text).toContain('REWORK_DIRECTIVE: overseer-changes-requested');
+      expect(text).toContain(`Repair target: PR #936 (branch ${reworkRef.branch})`);
+      expect(text).toContain(`Rework head: ${reworkRef.headSha}`);
+      expect(text).toContain('Review message: review-msg-1');
+      expect(text).toContain('[major] pr-rework.ts: missing coverage.');
+    });
+
+    // Test 14: a mismatched review row (wrong head, wrong disposition, wrong
+    // subject, wrong task_type/recipient, or missing) is rejected rather than
+    // silently trusted -- the directive's authority comes from the verified
+    // review row, not from the caller-supplied ref alone.
+    it('rejects a rework directive whose review message does not verify', async () => {
+      const cases: Array<[string, unknown]> = [
+        ['missing review row', null],
+        [
+          'wrong head sha',
+          { ...verifiedReviewRow, body: JSON.stringify({ headSha: 'd'.repeat(40) }) },
+        ],
+        [
+          'non-changes_requested disposition',
+          {
+            ...verifiedReviewRow,
+            result_body: JSON.stringify({ disposition: 'approved', summary: 'ok' }),
+          },
+        ],
+        [
+          'wrong subject key (different PR)',
+          { ...verifiedReviewRow, subject_key: 'gh:thinmansoftware/bdc-harness#914' },
+        ],
+        ['wrong task_type', { ...verifiedReviewRow, task_type: 'agent_message' }],
+        ['wrong recipient', { ...verifiedReviewRow, recipient: 'operator' }],
+        ['unparseable result_body', { ...verifiedReviewRow, result_body: 'not json' }],
+      ];
+      for (const [, row] of cases) {
+        await expect(
+          freezeWorkOrderSource(policy, reworkMessage(), {
+            fetcher: canonicalFetch,
+            loadReviewMessage: async () => row as never,
+          })
+        ).rejects.toThrow('authority_conflict');
+      }
+    });
+
+    it('rejects a malformed --rework token instead of silently dispatching unbound', async () => {
+      await expect(
+        freezeWorkOrderSource(
+          policy,
+          'WO_ID=WO-TEST-01 --project bdc-harness --rework=not-a-real-token',
+          { fetcher: canonicalFetch }
+        )
+      ).rejects.toThrow('authority_conflict');
+    });
+
+    // Test 15: with no --rework flag present, behavior is byte-identical to
+    // every pre-existing test above -- the directive path must never fire on
+    // an ordinary fire, and freezeWorkOrderSource's existing contract (Tests
+    // 1-12 in this file) must not regress.
+    it('leaves the frozen spec byte-identical to the no-directive case when no --rework flag is present', async () => {
+      const withoutDirective = await freezeWorkOrderSource(
+        policy,
+        'WO_ID=WO-TEST-01 --project bdc-harness',
+        {
+          fetcher: canonicalFetch,
+        }
+      );
+      expect(Buffer.from(withoutDirective.specBytes).toString('utf8')).toBe(bytes);
+      expect(withoutDirective.specSource).toBe(identity.specSource);
+    });
+  });
 });
