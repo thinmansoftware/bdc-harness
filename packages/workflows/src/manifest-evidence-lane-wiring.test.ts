@@ -107,6 +107,16 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
     describe(file, () => {
       const nodes = laneNodes(file);
 
+      it('preserves canonical project-map resolver and runner mechanics', () => {
+        const canonical = laneNodes('bdc-feature-development-codex.yaml');
+        const resolver = node(nodes, 'resolve-test-command', file);
+        expect(resolver.bash).toBe(node(canonical, 'resolve-test-command', 'canonical').bash);
+        expect(resolver.depends_on).toEqual(['format-autofix']);
+        expect(node(nodes, 'run-stop-tests', file).bash).toBe(
+          node(canonical, 'run-stop-tests', 'canonical').bash
+        );
+      });
+
       it('carries the four mechanical evidence nodes as bash nodes', () => {
         for (const id of EVIDENCE_NODES) {
           const n = node(nodes, id, file);
@@ -117,11 +127,7 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
 
       it('run-stop-tests runs after format-autofix with a 30-minute budget', () => {
         const n = node(nodes, 'run-stop-tests', file);
-        expect(n.depends_on).toEqual(
-          ['bdc-feature-development-codex.yaml', 'bdc-feature-development.yaml'].includes(file)
-            ? ['format-autofix', 'resolve-test-command']
-            : ['format-autofix']
-        );
+        expect(n.depends_on).toEqual(['format-autofix', 'resolve-test-command']);
         expect(n.timeout).toBe(1800000);
         expect(n.bash).toContain(
           "case \"$cmd\" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1"

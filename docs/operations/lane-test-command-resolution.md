@@ -2,8 +2,9 @@
 
 Tracking: bdc-xo #2045, WO-HARNESS-LANE-TOOLCHAIN-AND-TEST-COMMAND-01.
 
-The Codex and base feature-development lanes resolve a command before
-`run-stop-tests`. Other lanes retain their existing selection behavior.
+All 13 active feature-development lanes resolve a command before
+`run-stop-tests`. Resolver and runner mechanics remain identical across
+model variants, preserving the existing Astra/Codex DAG parity contract.
 The resolver reads the fixed `scripts/cauldron/cauldron-projects.json` path
 from bdc-xo main through the existing GitHub CLI authentication route.
 
@@ -46,4 +47,4 @@ At the 2026-10-18 source read, the bdc-harness map entry declares `bun test`,
 while its note describes executing the package test script. Those operations
 are different: `bun run test` invokes the package script. This resolver
 preserves the declared command. Correcting that map is separate work in
-bdc-xo; no command rewrite is hidden in the resolver.
+bdc-xo (PR #3385, merged externally on 2026-10-18); no command rewrite is hidden in the resolver.
