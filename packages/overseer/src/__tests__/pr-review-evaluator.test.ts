@@ -743,4 +743,63 @@ describe('WO node-failure-repair: judge verification field', () => {
     };
     expect(parseReviewVerdict(approve('verified', undefined, [note]))?.verdict).toBe('APPROVE');
   });
+
+  test.each([
+    ['Validation', 'Consider documenting the sandbox configuration.'],
+    ['Validation', 'Consider documenting sandbox cleanup after the review.'],
+    ['sandbox.ts', 'Consider renaming this helper for clarity.'],
+    ['sandbox.ts', 'Failed to start.'],
+    ['checkout.ts', 'Could not be independently verified.'],
+    ['Validation', 'The sandbox initialized successfully and tests passed.'],
+    ['Validation', 'Independent checkout inspection and test execution succeeded.'],
+    ['Availability', 'The service is unavailable because scheduled maintenance is active.'],
+    ['Shipping', 'The customer address could not be independently verified.'],
+  ])('verified ordinary finding stays APPROVE: %s / %s', async (scope, summary) => {
+    const stdout = approve('verified', undefined, [{ scope, summary, severity: 'note' }]);
+    expect(parseReviewVerdict(stdout)?.verdict).toBe('APPROVE');
+    const result = await evaluatePullRequest(
+      input,
+      deps({ invokeModel: async () => ({ exitCode: 0, timedOut: false, stdout }) })
+    );
+    expect(result.verdict).toBe('APPROVE');
+    expect(result.reviewed_head_sha).toBe(HEAD_A);
+  });
+
+  test.each([
+    ['Exact checkout SHA', 'Could not be independently verified.'],
+    ['Sandbox', 'Failed to start.'],
+  ])('split review execution failure stays held: %s / %s', async (scope, summary) => {
+    const stdout = approve('verified', undefined, [{ scope, summary, severity: 'note' }]);
+    expect(parseReviewVerdict(stdout)?.verdict).toBe('APPROVE_UNVERIFIED');
+    const result = await evaluatePullRequest(
+      input,
+      deps({ invokeModel: async () => ({ exitCode: 0, timedOut: false, stdout }) })
+    );
+    expect(result.verdict).toBe('APPROVE_UNVERIFIED');
+    expect(result.reviewed_head_sha).toBe(HEAD_A);
+  });
+
+  test.each([
+    'The execution sandbox failed to start.',
+    'Independent local inspection and test execution were unavailable because the sandbox could not initialize.',
+    'Sandbox initialization failed.',
+    'The execution sandbox was unavailable.',
+    'Unable to inspect the checkout.',
+    'Unable to verify the exact head SHA.',
+    'Unable to execute tests.',
+    'Test execution was unavailable.',
+    'Tests could not be executed.',
+    'The exact checkout SHA could not be independently verified.',
+  ])('explicit review execution failure stays held: %s', async summary => {
+    const stdout = approve('verified', undefined, [
+      { scope: 'Validation', summary, severity: 'note' },
+    ]);
+    expect(parseReviewVerdict(stdout)?.verdict).toBe('APPROVE_UNVERIFIED');
+    const result = await evaluatePullRequest(
+      input,
+      deps({ invokeModel: async () => ({ exitCode: 0, timedOut: false, stdout }) })
+    );
+    expect(result.verdict).toBe('APPROVE_UNVERIFIED');
+    expect(result.reviewed_head_sha).toBe(HEAD_A);
+  });
 });

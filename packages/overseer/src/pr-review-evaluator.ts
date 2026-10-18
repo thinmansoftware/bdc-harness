@@ -202,14 +202,21 @@ interface ParsedReviewVerdict {
 const FINDING_SEVERITIES = new Set(['blocker', 'major', 'minor', 'note']);
 
 /**
- * Finding text that proves the judge did NOT actually run/inspect/verify, even
- * when it claimed `verification: verified`. The verbatim PR #1118 note matches
- * every disjunct it should: `sandbox`, `unavailable because`,
- * `could not be independently verified`. Kept narrow so an ordinary style note
- * ("could be simplified", "consider renaming") never trips it (Test 17).
+ * Explicit review-execution failure overrides a claimed `verification: verified`.
+ * A sandbox mention or unrelated unavailable/unverified product fact is not
+ * execution-failure evidence. This conservative text backstop preserves the
+ * PR #1118 failure note; it cannot prove that successful verification occurred.
  */
-const UNVERIFIED_FINDING_PATTERN =
-  /\bsandbox\b|could not be independently verified|unavailable because|unable to (?:run|inspect|verify)/i;
+const UNVERIFIED_FINDING_PATTERN = new RegExp(
+  [
+    String.raw`\bsandbox\s+(?:failed to|could not|did not|cannot)\s+(?:start|initialize)\b`,
+    String.raw`\bsandbox\s+(?:startup|initialization)\s+failed\b`,
+    String.raw`\bsandbox\s+(?:(?:was|is)\s+)?unavailable\b`,
+    String.raw`\b(?:unable to|could not|cannot)\s+(?:run|execute|inspect|verify|confirm)\s+(?:(?:the|this|local|independent|exact)\s+){0,3}(?:tests?|test suite|checkout|repository|repo|head(?: sha)?|checkout sha)\b`,
+    String.raw`\b(?:local inspection|test execution|tests?|(?:exact )?(?:checkout|head)(?: sha)?|review (?:execution|verification))\s+(?:(?:was|were|is)\s+)?(?:unavailable|not (?:run|executed|verified)|could not be (?:independently )?(?:verified|executed|performed))\b`,
+  ].join('|'),
+  'i'
+);
 
 function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
@@ -219,7 +226,10 @@ function nonEmpty(value: unknown): value is string {
 function findingProvesUnverified(finding: IndependentReviewFinding): boolean {
   return (
     UNVERIFIED_FINDING_PATTERN.test(finding.scope) ||
-    UNVERIFIED_FINDING_PATTERN.test(finding.summary)
+    UNVERIFIED_FINDING_PATTERN.test(finding.summary) ||
+    // A subject-only scope can supply the context for the summary's failure.
+    // Keep the field boundary; file scopes such as sandbox.ts are not subjects.
+    UNVERIFIED_FINDING_PATTERN.test(`${finding.scope}\n${finding.summary}`)
   );
 }
 
