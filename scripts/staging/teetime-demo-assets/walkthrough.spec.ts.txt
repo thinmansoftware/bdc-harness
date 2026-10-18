@@ -1,0 +1,212 @@
+import { test, expect, type Page } from '@playwright/test';
+const externalRequests = new WeakMap<Page, string[]>();
+
+// Trusted acceptance input. The artifact builder cannot edit this file or config.
+async function search(page: Page, scenario = 'success') {
+  await page.goto('/');
+  await expect(page.getByTestId('simulation-notice')).toContainText('No live availability or bookings');
+  await page.getByLabel('Demo scenario', { exact: true }).selectOption(scenario);
+  await page.getByLabel('Cedar Lantern (fictional)', { exact: true }).check();
+  await page.getByLabel('From date', { exact: true }).fill('2026-10-24');
+  await page.getByLabel('Through date', { exact: true }).fill('2026-10-25');
+  await page.getByLabel('Earliest tee time', { exact: true }).fill('08:00');
+  await page.getByLabel('Latest tee time', { exact: true }).fill('10:00');
+  await page.getByLabel('Players', { exact: true }).fill('4');
+  await page.getByLabel('Budget per player', { exact: true }).fill('100');
+  await page.getByLabel('Radius (miles)', { exact: true }).fill('30');
+  await page.getByRole('button', { name: 'Save search', exact: true }).click();
+  await expect(page.getByTestId('search-status')).toContainText('Saved');
+}
+async function offer(page: Page, scenario = 'success') {
+  await search(page, scenario);
+  await page.getByRole('button', { name: 'Run simulated check', exact: true }).click();
+  await expect(page.getByTestId('offer-details')).toContainText('Cedar Lantern');
+  await expect(page.getByTestId('offer-details')).toContainText('8:40');
+  await expect(page.getByTestId('offer-details')).toContainText('Oct 24');
+  await expect(page.getByTestId('offer-details')).toContainText('4 players');
+  await expect(page.getByTestId('offer-total')).toHaveText('$360.00');
+  await expect(page.getByTestId('cancellation-terms')).toContainText('24 hours');
+  await expect(page.getByTestId('booking-card')).toHaveCount(0);
+}
+test.beforeEach(async ({ page }) => {
+  // A match outside this origin is a failure even though Docker also has no network.
+  const external: string[] = [];
+  externalRequests.set(page, external);
+  const origin = new URL(String(test.info().project.use.baseURL)).origin;
+  expect(['http://127.0.0.1:3187', 'http://192.168.50.226:3187']).toContain(origin);
+  page.on('request', request => {
+    if (!request.url().startsWith(origin + '/')) external.push(request.url());
+  });
+  await page.route('**/*', route => route.request().url().startsWith(origin + '/') ? route.continue() : route.abort());
+});
+test.afterEach(async ({ page }) => { expect(externalRequests.get(page)).toEqual([]); });
+
+for (const width of [390, 1440]) {
+  test('approved success, persistence and local invitation at ' + width, async ({ page }) => {
+    await page.setViewportSize({ width, height: 844 });
+    await offer(page);
+    await page.getByRole('button', { name: 'Favorite Cedar Lantern', exact: true }).click();
+    await page.getByRole('button', { name: 'Yes, reserve', exact: true }).click();
+    await expect(page.getByTestId('reservation-status')).toContainText('Rechecking');
+    await expect(page.getByTestId('booking-card')).toHaveCount(0);
+    await expect(page.getByTestId('reservation-status')).toContainText('Confirmed');
+    await expect(page.getByTestId('booking-card')).toHaveCount(1);
+    await expect(page.getByTestId('booking-card')).toContainText('$360.00');
+    await expect(page.getByTestId('delivery-outbox')).toContainText('Simulated email');
+    await expect(page.getByTestId('delivery-outbox')).toContainText('Simulated reminder');
+    await expect(page.getByTestId('delivery-outbox')).toContainText('.invalid');
+    await page.reload();
+    await expect(page.getByTestId('booking-card')).toHaveCount(1);
+    await expect(page.getByRole('button', { name: 'Favorite Cedar Lantern', exact: true })).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.getByLabel('Players', { exact: true })).toHaveValue('4');
+    await expect(page.getByLabel('From date', { exact: true })).toHaveValue('2026-10-24');
+    const downloaded = page.waitForEvent('download');
+    await page.getByRole('button', { name: 'Download calendar', exact: true }).click();
+    const download = await downloaded;
+    expect(download.suggestedFilename()).toMatch(/\.ics$/);
+    const stream = await download.createReadStream();
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream!) chunks.push(Buffer.from(chunk));
+    const calendar = Buffer.concat(chunks).toString('utf8');
+    expect(calendar).toContain('BEGIN:VCALENDAR');
+    expect(calendar).toContain('DTSTART:20261024T124000Z');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await expect(page.getByTestId('simulation-notice')).toBeVisible();
+    await page.screenshot({ path: '/results/walkthrough-' + width + '.png', fullPage: true });
+  });
+}
+test('price increase requires a second explicit approval', async ({ page }) => {
+  await offer(page, 'price-increase');
+  await page.getByRole('button', { name: 'Yes, reserve', exact: true }).click();
+  await expect(page.getByTestId('reservation-status')).toContainText('Approval required');
+  await expect(page.getByTestId('offer-total')).toHaveText('$400.00');
+  await expect(page.getByTestId('booking-card')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Approve new total', exact: true }).click();
+  await expect(page.getByTestId('reservation-status')).toContainText('Rechecking');
+  await expect(page.getByTestId('booking-card')).toHaveCount(1);
+  await expect(page.getByTestId('booking-card')).toContainText('$400.00');
+});
+test('unavailable resumes monitoring without a confirmation', async ({ page }) => {
+  await offer(page, 'unavailable');
+  await page.getByRole('button', { name: 'Yes, reserve', exact: true }).click();
+  await expect(page.getByTestId('reservation-status')).toContainText('Monitoring');
+  await expect(page.getByTestId('booking-card')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Yes, reserve', exact: true })).toHaveCount(0);
+});
+for (const result of ['confirmed', 'absent']) {
+  test('uncertain response survives refresh and reconciles as ' + result, async ({ page }) => {
+    await offer(page, 'uncertain');
+    await page.getByRole('button', { name: 'Yes, reserve', exact: true }).click();
+    await expect(page.getByTestId('reservation-status')).toContainText('Pending reconciliation');
+    await expect(page.getByTestId('booking-card')).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByTestId('reservation-status')).toContainText('Pending reconciliation');
+    await page.getByLabel('Reconciliation result', { exact: true }).selectOption(result);
+    await page.getByRole('button', { name: 'Reconcile', exact: true }).click();
+    await expect(page.getByTestId('reservation-status')).toContainText(result === 'confirmed' ? 'Confirmed' : 'Monitoring');
+    await expect(page.getByTestId('booking-card')).toHaveCount(result === 'confirmed' ? 1 : 0);
+    await page.reload();
+    await expect(page.getByTestId('booking-card')).toHaveCount(result === 'confirmed' ? 1 : 0);
+  });
+}
+test('double approval creates one booking; cancellation persists', async ({ page }) => {
+  await offer(page);
+  await page.getByRole('button', { name: 'Yes, reserve', exact: true }).evaluate(button => {
+    (button as HTMLButtonElement).click();
+    (button as HTMLButtonElement).click();
+  });
+  await expect(page.getByTestId('booking-card')).toHaveCount(1);
+  await page.reload();
+  await expect(page.getByTestId('booking-card')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Cancel booking', exact: true }).click();
+  await expect(page.getByTestId('booking-card')).toContainText('Cancelled');
+  await page.reload();
+  await expect(page.getByTestId('booking-card')).toHaveCount(1);
+  await expect(page.getByTestId('booking-card')).toContainText('Cancelled');
+});
+test('no match is fabricated outside saved dates or budget', async ({ page }) => {
+  await search(page);
+  await page.getByLabel('Budget per player', { exact: true }).fill('20');
+  await page.getByRole('button', { name: 'Save search', exact: true }).click();
+  await page.getByRole('button', { name: 'Run simulated check', exact: true }).click();
+  await expect(page.getByTestId('reservation-status')).toContainText('Monitoring');
+  await expect(page.getByTestId('offer-details')).toHaveCount(0);
+  await page.getByLabel('Budget per player', { exact: true }).fill('100');
+  await page.getByLabel('From date', { exact: true }).fill('2026-10-26');
+  await page.getByLabel('Through date', { exact: true }).fill('2026-10-27');
+  await page.getByRole('button', { name: 'Save search', exact: true }).click();
+  await page.getByRole('button', { name: 'Run simulated check', exact: true }).click();
+  await expect(page.getByTestId('offer-details')).toHaveCount(0);
+});
+test('saving changed preferences invalidates the previous offer', async ({ page }) => {
+  await offer(page);
+  await page.getByLabel('Players', { exact: true }).fill('2');
+  await page.getByRole('button', { name: 'Save search', exact: true }).click();
+  await expect(page.getByTestId('offer-details')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Yes, reserve', exact: true })).toHaveCount(0);
+  await expect(page.getByTestId('booking-card')).toHaveCount(0);
+});
+test('reset during pending rejects a stale simulated response', async ({ page }) => {
+  await offer(page);
+  await page.getByRole('button', { name: 'Yes, reserve', exact: true }).click();
+  await expect(page.getByTestId('reservation-status')).toContainText('Rechecking');
+  await page.getByRole('button', { name: 'Reset demo', exact: true }).click();
+  await page.waitForTimeout(1200);
+  await expect(page.getByTestId('booking-card')).toHaveCount(0);
+  await expect(page.getByTestId('offer-details')).toHaveCount(0);
+});
+test('invalid saved search does not start monitoring', async ({ page }) => {
+  await search(page);
+  await page.getByLabel('Through date', { exact: true }).fill('2026-10-23');
+  await page.getByRole('button', { name: 'Save search', exact: true }).click();
+  await expect(page.getByTestId('search-error')).toContainText('date');
+  await expect(page.getByTestId('booking-card')).toHaveCount(0);
+});
+test('refresh during rechecking reconciles instead of reserving again', async ({ page }) => {
+  await offer(page);
+  await page.getByRole('button', { name: 'Yes, reserve', exact: true }).click();
+  await expect(page.getByTestId('reservation-status')).toContainText('Rechecking');
+  await page.reload();
+  await expect(page.getByTestId('reservation-status')).toContainText('Pending reconciliation');
+  await expect(page.getByTestId('booking-card')).toHaveCount(0);
+  await page.getByLabel('Reconciliation result', { exact: true }).selectOption('confirmed');
+  await page.getByRole('button', { name: 'Reconcile', exact: true }).click();
+  await expect(page.getByTestId('booking-card')).toHaveCount(1);
+  await page.reload();
+  await expect(page.getByTestId('booking-card')).toHaveCount(1);
+});
+for (const filter of ['radius', 'time', 'course', 'players']) {
+  test('matching respects ' + filter, async ({ page }) => {
+    await search(page);
+    if (filter === 'radius') await page.getByLabel('Radius (miles)', { exact: true }).fill('10');
+    if (filter === 'time') {
+      await page.getByLabel('Earliest tee time', { exact: true }).fill('11:00');
+      await page.getByLabel('Latest tee time', { exact: true }).fill('12:00');
+    }
+    if (filter === 'course') await page.getByLabel('Cedar Lantern (fictional)', { exact: true }).uncheck();
+    if (filter === 'players') await page.getByLabel('Players', { exact: true }).fill('5');
+    await page.getByRole('button', { name: 'Save search', exact: true }).click();
+    if (filter === 'course' || filter === 'players') {
+      await expect(page.getByTestId('search-error')).toContainText(filter === 'course' ? 'course' : '1-4');
+    } else {
+      await page.getByRole('button', { name: 'Run simulated check', exact: true }).click();
+      await expect(page.getByTestId('reservation-status')).toContainText('Monitoring');
+      await expect(page.getByTestId('offer-details')).toHaveCount(0);
+    }
+    await expect(page.getByTestId('booking-card')).toHaveCount(0);
+  });
+}
+test('complete prices scale with validated party size', async ({ page }) => {
+  await search(page, 'price-increase');
+  await page.getByLabel('Players', { exact: true }).fill('2');
+  await page.getByRole('button', { name: 'Save search', exact: true }).click();
+  await page.getByRole('button', { name: 'Run simulated check', exact: true }).click();
+  await expect(page.getByTestId('offer-details')).toContainText('2 players');
+  await expect(page.getByTestId('offer-total')).toHaveText('$180.00');
+  await page.getByRole('button', { name: 'Yes, reserve', exact: true }).click();
+  await expect(page.getByTestId('offer-total')).toHaveText('$200.00');
+  await expect(page.getByTestId('booking-card')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Approve new total', exact: true }).click();
+  await expect(page.getByTestId('booking-card')).toHaveCount(1);
+  await expect(page.getByTestId('booking-card')).toContainText('$200.00');
+});

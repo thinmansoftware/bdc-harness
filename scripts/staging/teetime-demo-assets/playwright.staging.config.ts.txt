@@ -1,0 +1,8 @@
+import config from './playwright.config';
+
+// A separate trusted served-preview target; never starts a replacement app server.
+export default {
+  ...config,
+  webServer: undefined,
+  use: { ...config.use, baseURL: 'http://192.168.50.226:3187' },
+};

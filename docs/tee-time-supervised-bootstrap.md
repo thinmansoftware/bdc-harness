@@ -174,3 +174,29 @@ and then passing. Only next-env.d.ts and tsconfig.json may be generated changes;
 their complete bytes are retained for inspection/freeze. All other fixture bytes
 must remain identical. The300-second outer deadline intentionally overrides the
 sum of the individual120-second command limits. Timeout remains failure.
+
+The one frozen framework case at acdbbd0236bf9eff12be3bc2114e838dd9d5afe6 passed
+on the actual BDC Docker laptop. Helper SHA256
+22108e6eb04104b302f6ad91d72b994cd6cc1251166ff0ddaff817bf9f436368;
+payload28342 bytes, SHA256
+9ed29a047e9805bc4d440ab4bd7b9ed84b74c80bbd21c0c5379dfa8c587a2f7a.
+Cached frozen install/typegen, Bun unit tests, Next webpack production build,
+TypeScript noEmit and both390/1440px browser checks returned0. All ten accepted
+source hashes matched before/after; generatedChanges was empty. Both containers
+exited normally with no OOM, attach clients reaped, exact container and volume
+absence verified. No account/model/product feature/host port was involved.
+Source CI39170996165 also passed for that source lineage. This is framework
+qualification only; the complete app case/WO and operational entry remain gates.
+
+The full app source-case draft now separates seven model-editable source paths
+from nine immutable prepared dependency/configuration/acceptance assets. The model
+may write its product unit tests; the trusted walkthrough and CI gates are excluded.
+Preparation retains original and prepared manifest/tree identities, rejects base
+drift/collisions and preserves every immutable asset. Six pure regressions include
+an exact65536-byte artifact and rejection at65537 bytes. The new demo-only complete
+frame bound is147456 bytes; original global/fixed canary limits are unchanged.
+Ruling: required matching-filter and in-flight-refresh acceptance expanded the
+trusted test source beyond the earlier131072-byte conservative full-frame bound.
+The new finite bound covers the derived closed inventory without reducing coverage
+or expanding model output. Actual launcher support/packet bounds are still pending;
+this pure helper does not prove transport readiness or grant an account attempt.
