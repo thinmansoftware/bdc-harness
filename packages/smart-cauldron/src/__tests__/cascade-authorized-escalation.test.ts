@@ -21,7 +21,7 @@ const ENV_KEYS = [
 const oldEnv = new Map(ENV_KEYS.map(key => [key, process.env[key]]));
 
 async function withPersistentPermit(
-  work: (permit: M31ActionPermit) => Promise<void>
+  work: (permit: M31ActionPermit, home: string) => Promise<void>
 ): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'archon-cascade-escalation-'));
   await closeDatabase();
@@ -92,7 +92,7 @@ async function withPersistentPermit(
       issued_at: new Date(now - 1_000).toISOString(),
       valid_until: new Date(now + 60_000).toISOString(),
     };
-    await work(permit);
+    await work(permit, home);
   } finally {
     await closeDatabase();
     resetDatabase();
@@ -112,10 +112,11 @@ describe('cascade default escalation boundary', () => {
   });
 
   test('valid permit records one inert attempt through the real persistent boundary', async () => {
-    await withPersistentPermit(async permit => {
+    await withPersistentPermit(async (permit, home) => {
       const result = await runCascade({
         woId: 'WO-CASCADE-BOUNDARY-01',
         project: 'bdc-harness',
+        outDir: join(home, 'cascade-records'),
         entryOverride: 'codex',
         overseerPermit: permit,
         deps: {

@@ -519,6 +519,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
   // Cascade loop
   const attempts: CascadeAttempt[] = [];
+  // Each invocation needs its own terminal proof. A later climb cannot discharge
+  // an earlier ambiguous dispatch, timeout or failed cancellation observation.
+  const unresolvedInvocations = new Set<symbol>();
+  let legacyFrontierInvocation: symbol | null = null;
+  let finishedNormally = false;
   try {
     const emitEscalation = async (
       context: Omit<EscalationCallContext, 'sourceEventId' | 'sourceEventCreatedAt' | 'repository'>
@@ -765,7 +770,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     async function pauseForFrontierApproval(
       premiumTier: LadderTier,
       runId: string | null
-    ): Promise<void> {
+    ): Promise<boolean> {
       const pausedAt = new Date().toISOString();
       let notifiedAt: string | null = null;
       try {
@@ -813,6 +818,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           `tier=${premiumTier.name} for woId=${woId} -- NOT firing (cascadeId=${cascadeId})`
       );
       await checkpoint();
+      return notifiedAt !== null;
     }
 
     /**
@@ -918,14 +924,17 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       }
 
       // Fire the WO on this tier
-      const fireResult: FireResult = await fireImpl({
+      const fireOptions = {
         workflowName: tier.workflowName,
         woId,
         project,
         message: buildFireMessage(woId, project, priorContext ?? undefined, opts.expectedSpec),
         apiBaseUrl,
         token,
-      });
+      };
+      const invocation = Symbol('provider-invocation');
+      unresolvedInvocations.add(invocation);
+      const fireResult: FireResult = await fireImpl(fireOptions);
       attempt.runId = fireResult.runId;
 
       // Infra error: alert + stop (do NOT count as "too hard")
@@ -1056,7 +1065,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
                   `${nextTier.name} requires approval -- pausing for frontier approval and ` +
                   'leaving the run running (no cancel-to-nowhere)'
               );
-              await pauseForFrontierApproval(nextTier, fireResult.runId);
+              const notified = await pauseForFrontierApproval(nextTier, fireResult.runId);
+              if (notified && typeof fireResult.runId === 'string' && fireResult.runId.trim())
+                legacyFrontierInvocation = invocation;
               break;
             }
           }
@@ -1118,7 +1129,15 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         break;
       }
 
-      // Judge the gate
+      if (
+        typeof fireResult.runId === 'string' &&
+        fireResult.runId.trim() &&
+        pollResult.runId === fireResult.runId &&
+        ['completed', 'failed', 'escalated', 'cancelled'].includes(pollResult.terminalStatus)
+      )
+        unresolvedInvocations.delete(invocation);
+
+      // Judge the gate. Terminal proof precedes judge/checkpoint failures.
       const verdict: GateVerdict = judgeImpl(pollResult);
       const outcome = classifyAttemptOutcome(fireResult, verdict);
 
@@ -1194,9 +1213,21 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     const recordPath = await writeRecordImpl(record, outDir);
     console.log(`[smart-cauldron] Cascade record written: ${recordPath}`);
 
+    finishedNormally = true;
     return record;
   } finally {
-    await releaseWoLockImpl(woId, project, cascadeId, outDir, executionToken);
+    // Preserve only the successful legacy no-cancel frontier approval flow.
+    // This is a contract exception, not proof that its provider terminated.
+    const legacyFrontierRelease =
+      finishedNormally &&
+      legacyFrontierInvocation !== null &&
+      unresolvedInvocations.size === 1 &&
+      unresolvedInvocations.has(legacyFrontierInvocation);
+    if (unresolvedInvocations.size === 0 || legacyFrontierRelease) {
+      if (legacyFrontierRelease)
+        console.warn('[smart-cauldron] legacy_frontier_release; provider terminal state unproven');
+      await releaseWoLockImpl(woId, project, cascadeId, outDir, executionToken);
+    } else console.warn('[smart-cauldron] provider_lifetime_unresolved; retaining WO lock');
   }
 }
 

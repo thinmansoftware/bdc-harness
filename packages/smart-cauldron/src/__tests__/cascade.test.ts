@@ -30,7 +30,11 @@ function loadLiveTiers() {
 }
 import { loadRuleset } from '../conductor.js';
 import { TimeoutError } from '../poll.js';
-import { readCascadeRecordById } from '../frontier-approval.js';
+import {
+  readCascadeRecordById,
+  claimFrontierResolution,
+  resumeFrontierTier,
+} from '../frontier-approval.js';
 import { acquireWoLock, releaseWoLock } from '../wo-lock.js';
 import { createRecord, writeRecord } from '../recorder.js';
 
@@ -124,6 +128,243 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     },
   };
 }
+
+describe('provider lifetime release fencing', () => {
+  function options(overrides: CascadeDeps = {}): RunCascadeOptions {
+    return baseOpts({
+      entryOverride: 'frontier',
+      deps: {
+        acquireWoLock,
+        releaseWoLock,
+        createRecord,
+        writeRecord,
+        fetchNodeTimeouts: async () => ({}),
+        fire: async () => makeFireOk('owned-run'),
+        poll: async () => makePollResult({ runId: 'owned-run' }),
+        judge: result =>
+          result.terminalStatus === 'completed'
+            ? makePassVerdict()
+            : { ...makeFailVerdict('terminal non-success'), terminalStatus: result.terminalStatus },
+        specRepair: async () => ({ posted: false, issueRepo: null, issueNumber: null }),
+        escalate: async () => {},
+        ...overrides,
+      },
+    });
+  }
+  async function isFree(opts: RunCascadeOptions): Promise<boolean> {
+    return (await acquireWoLock(opts.woId, opts.project!, 'later-dispatch', opts.outDir)).acquired;
+  }
+
+  test('checkpoint failure before invocation releases without starting provider work', async () => {
+    let fires = 0;
+    const opts = options({
+      fire: async () => {
+        fires++;
+        return makeFireOk('unexpected');
+      },
+      writeRecord: async () => {
+        throw new Error('prefire checkpoint failure');
+      },
+    });
+    await expect(runCascade(opts)).rejects.toThrow('prefire checkpoint failure');
+    expect(fires).toBe(0);
+    expect(await isFree(opts)).toBe(true);
+  });
+
+  test.each(['throw', 'ambiguous-return'])('fire %s retains the lifetime lock', async mode => {
+    const opts = options({
+      fire: async () => {
+        if (mode === 'throw') throw new Error('uncertain invocation');
+        return makeFireError('HTTP 503 uncertain response');
+      },
+    });
+    if (mode === 'throw') await expect(runCascade(opts)).rejects.toThrow('uncertain invocation');
+    else expect((await runCascade(opts)).status).toBe('infra-alert');
+    expect(await isFree(opts)).toBe(false);
+  });
+
+  test('checkpoint failure after an actual run ID retains ownership before polling', async () => {
+    let polls = 0;
+    const opts = options({
+      poll: async () => {
+        polls++;
+        return makePollResult({ runId: 'owned-run' });
+      },
+      writeRecord: async (record, outDir) => {
+        if (record.attempts.some(attempt => attempt.runId === 'owned-run'))
+          throw new Error('postfire checkpoint failure');
+        return writeRecord(record, outDir);
+      },
+    });
+    await expect(runCascade(opts)).rejects.toThrow('postfire checkpoint failure');
+    expect(polls).toBe(0);
+    expect(await isFree(opts)).toBe(false);
+  });
+
+  test.each(['transport-error', 'timeout-cancel-ack', 'wrong-run', 'unknown-terminal'])(
+    '%s cannot establish provider termination',
+    async mode => {
+      const opts = options({
+        poll: async () => {
+          if (mode === 'transport-error') throw new Error('poll transport failure');
+          if (mode === 'timeout-cancel-ack') throw new TimeoutError('still unresolved');
+          return makePollResult({
+            runId: mode === 'wrong-run' ? 'other-run' : 'owned-run',
+            terminalStatus:
+              mode === 'unknown-terminal' ? ('invented-status' as 'completed') : 'completed',
+          });
+        },
+        judge: () => makePassVerdict(),
+        cancel: async () => ({ ok: true, error: null }),
+      });
+      await runCascade(opts);
+      expect(await isFree(opts)).toBe(false);
+    }
+  );
+
+  test.each(['completed', 'failed', 'escalated', 'cancelled'] as const)(
+    'matching %s poll positively releases provider lifetime',
+    async status => {
+      const opts = options({
+        poll: async () => makePollResult({ runId: 'owned-run', terminalStatus: status }),
+      });
+      await runCascade(opts);
+      expect(await isFree(opts)).toBe(true);
+    }
+  );
+
+  test.each(['judge', 'checkpoint'])(
+    'verified terminal poll permits release after later %s failure',
+    async mode => {
+      const opts = options({
+        judge: () => {
+          if (mode === 'judge') throw new Error('postterminal judge failure');
+          return makePassVerdict();
+        },
+        writeRecord: async (record, outDir) => {
+          if (record.status === 'won') throw new Error('postterminal checkpoint failure');
+          return writeRecord(record, outDir);
+        },
+      });
+      await expect(runCascade(opts)).rejects.toThrow(
+        `postterminal ${mode === 'judge' ? 'judge' : 'checkpoint'} failure`
+      );
+      expect(await isFree(opts)).toBe(true);
+    }
+  );
+
+  test('later completed climb cannot clear an earlier unresolved invocation after cancel acknowledgment', async () => {
+    let fires = 0;
+    const opts = options({
+      fire: async () => makeFireOk(`owned-run-${++fires}`),
+      poll: async requested => {
+        if (fires === 1) throw new TimeoutError('first invocation unresolved');
+        return makePollResult({ runId: requested.runId });
+      },
+      cancel: async () => ({ ok: true, error: null }),
+    });
+    opts.entryOverride = 'cursor';
+    expect((await runCascade(opts)).status).toBe('won');
+    expect(fires).toBe(2);
+    expect(await isFree(opts)).toBe(false);
+  });
+
+  test('successful intentional frontier pause preserves the existing approved resume path', async () => {
+    const opts = options({
+      poll: async () => {
+        throw new TimeoutError('waiting for approval');
+      },
+    });
+    opts.entryOverride = 'claude';
+    const paused = await runCascade(opts);
+    expect(paused.status).toBe('pending-frontier-approval');
+    expect(paused.frontierApproval?.notifiedAt).not.toBeNull();
+    expect((await claimFrontierResolution(paused.cascadeId, 'approved', opts.outDir)).claimed).toBe(
+      true
+    );
+    let premiumFires = 0;
+    const resumed = await resumeFrontierTier(paused, {
+      outDir: opts.outDir,
+      token: 'test-token',
+      deps: {
+        ...opts.deps,
+        fire: async () => {
+          premiumFires++;
+          return makeFireOk('approved-run');
+        },
+        poll: async () => makePollResult({ runId: 'approved-run' }),
+      },
+    });
+    expect(resumed.status).toBe('won');
+    expect(premiumFires).toBe(1);
+  });
+
+  test.each([null, '', '   '])(
+    'frontier notice with unknown provider run ID %s retains ownership',
+    async runId => {
+      const opts = options({
+        fire: async () => ({ ...makeFireOk('unused'), runId }),
+        poll: async () => {
+          throw new TimeoutError('waiting for approval');
+        },
+      });
+      opts.entryOverride = 'claude';
+      const paused = await runCascade(opts);
+      expect(paused.status).toBe('pending-frontier-approval');
+      expect(paused.frontierApproval?.notifiedAt).not.toBeNull();
+      expect(await isFree(opts)).toBe(false);
+    }
+  );
+
+  test.each(['notice', 'pause-checkpoint', 'final-write'])(
+    'interrupted %s does not acquire frontier release exception',
+    async failure => {
+      let pendingWrites = 0;
+      const opts = options({
+        poll: async () => {
+          throw new TimeoutError('waiting for approval');
+        },
+        escalate: async () => {
+          if (failure === 'notice') throw new Error('notice failed');
+        },
+        writeRecord: async (record, outDir) => {
+          if (record.status === 'pending-frontier-approval') {
+            pendingWrites++;
+            if (
+              (failure === 'pause-checkpoint' && pendingWrites === 1) ||
+              (failure === 'final-write' && pendingWrites === 2)
+            )
+              throw new Error('pause persistence failed');
+          }
+          return writeRecord(record, outDir);
+        },
+      });
+      opts.entryOverride = 'claude';
+      if (failure === 'notice') {
+        const paused = await runCascade(opts);
+        expect(paused.frontierApproval?.notifiedAt).toBeNull();
+      } else await expect(runCascade(opts)).rejects.toThrow('pause persistence failed');
+      expect(await isFree(opts)).toBe(false);
+    }
+  );
+
+  test('successful later frontier pause cannot release an earlier unresolved invocation', async () => {
+    let fires = 0;
+    const opts = options({
+      fire: async () => makeFireOk(`unresolved-${++fires}`),
+      poll: async () => {
+        throw new TimeoutError('unresolved');
+      },
+      cancel: async () => ({ ok: true, error: null }),
+    });
+    opts.entryOverride = 'cursor';
+    const paused = await runCascade(opts);
+    expect(paused.status).toBe('pending-frontier-approval');
+    expect(fires).toBeGreaterThan(1);
+    expect(paused.frontierApproval?.notifiedAt).not.toBeNull();
+    expect(await isFree(opts)).toBe(false);
+  });
+});
 
 describe('claim discovery uncertainty', () => {
   test('same-dispatch replay cannot release the original running owner', async () => {
@@ -295,7 +536,7 @@ describe('claim discovery uncertainty', () => {
             fires += 1;
             return makeFireOk('run-before-block');
           },
-          poll: async () => makePollResult(),
+          poll: async requested => makePollResult({ runId: requested.runId }),
           judge: () => makeFailVerdict('needs revision'),
           escalate: async () => undefined,
           releaseWoLock: async () => {

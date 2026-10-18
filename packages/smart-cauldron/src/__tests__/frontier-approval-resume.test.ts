@@ -99,7 +99,7 @@ async function producePausedRecord(
 ): Promise<CascadeRunRecord> {
   const deps: CascadeDeps = {
     fire: async opts => makeFireOk(`run-${opts.workflowName}`),
-    poll: async () => makeFailPoll(),
+    poll: async requested => ({ ...makeFailPoll(), runId: requested.runId }),
     judge: () => makeFailVerdict('validator: needs_revision'),
     escalate: async () => undefined,
     findWoClaim: async () => null,
@@ -135,7 +135,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
             fires++;
             return makeFireOk('must-not-fire');
           },
-          poll: async () => makePassPoll(),
+          poll: async requested => ({ ...makePassPoll(), runId: requested.runId }),
           judge: () => makePassVerdict(),
           findWoClaim: async () => null,
         },
@@ -164,7 +164,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
           messages.push(options.message);
           return makeFireOk('bound-resume');
         },
-        poll: async () => makePassPoll(),
+        poll: async requested => ({ ...makePassPoll(), runId: requested.runId }),
         judge: () => makePassVerdict(),
         findWoClaim: async () => null,
       },
@@ -191,7 +191,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
         fireMessages.push(opts.message);
         return makeFireOk(`resume-run-${firedWorkflows.length}`);
       },
-      poll: async () => makePassPoll(),
+      poll: async requested => ({ ...makePassPoll(), runId: requested.runId }),
       judge: () => makePassVerdict(),
       escalate: async () => undefined,
       findWoClaim: async () => null,
@@ -269,7 +269,7 @@ describe('frontier-approval reject + direct-entry bypass (Test 3)', () => {
         firedWorkflows.push(opts.workflowName);
         return makeFireOk(`direct-run-${firedWorkflows.length}`);
       },
-      poll: async () => makePassPoll(),
+      poll: async requested => ({ ...makePassPoll(), runId: requested.runId }),
       judge: () => makePassVerdict(),
       escalate: async () => undefined,
       findWoClaim: async () => null,
@@ -339,7 +339,7 @@ describe('frontier-approval resume dead-end guard (Test 2 failure mode: zero fir
         firedWorkflows.push(opts.workflowName);
         return makeFireOk(`should-not-fire-${firedWorkflows.length}`);
       },
-      poll: async () => makePassPoll(),
+      poll: async requested => ({ ...makePassPoll(), runId: requested.runId }),
       judge: () => makePassVerdict(),
       escalate: async () => undefined,
       findWoClaim: async () => null,

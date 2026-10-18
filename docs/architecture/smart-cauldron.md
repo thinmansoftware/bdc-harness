@@ -83,6 +83,38 @@ Persistence exhaustion remains a separate lifetime risk: the existing cascade
 finally can release its token even when provider ownership is unresolved. This
 bounded persistence repair does not establish safe release on that error path.
 
+## Proposed source repair for review: unexpected provider-lifetime failure paths (2026-10-18)
+
+The follow-on proposal tracks each provider invocation separately before it is
+called. Only a recognized terminal poll status with that invocation's exact,
+nonempty actual run ID discharges it. This proof is recorded before judging or
+later persistence. Fire throw/ambiguous return, transport error, timeout,
+cancellation HTTP acknowledgment, recovery acceptance, attempt timestamps and a
+later invocation's completion do not discharge earlier work.
+
+Unexpected exits retain the generation-owned WO lock while any invocation is
+unresolved and emit a fixed warning. Failures before invocation and failures
+after matching terminal proof can release normally. No cancellation, retry,
+climb, authority, TTL or takeover policy is added.
+
+There is a narrow legacy exception to preserve the successful existing frontier
+approval contract. The no-cancel-to-nowhere branch can nominate only its own
+invocation with a nonempty actual provider run ID after the notification routine
+returns successfully and the pause checkpoint completes. Release then requires that it is the only unresolved
+invocation and that the final record write and normal return succeeded. This
+exception is not provider terminal proof; its warning says so explicitly.
+Top-of-loop pauses and earlier unknown invocations cannot inherit the exception.
+
+The governing WOs are pinned at bdc-xo commit
+`8303e2fa898faa5aedbce48cffc1360943d96a94`: STALL-DETECTOR-FIX requires leaving
+the current run running before approval; FRONTIER-CLIMB-APPROVAL-GATE requires
+successful approval to fire the preserved premium packet. This proposal preserves
+that successful legacy path, not complete approval behavior on unexpected errors.
+Failed notification or incomplete persistence can leave a held approval packet
+that blocks resume; explicit reconciliation is required. A complete reviewed
+provider-lifetime transfer/cancellation design for approval remains open. There
+is no universal lifetime-fence or full bdc-xo#1546 acceptance claim.
+
 ---
 
 # PART 1 -- The system in plain words
