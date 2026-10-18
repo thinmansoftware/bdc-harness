@@ -2,6 +2,7 @@
  * SQLite adapter using bun:sqlite
  */
 import { Database, type SQLQueryBindings } from 'bun:sqlite';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import type { IDatabase, QueryResult, SqlDialect } from './types';
@@ -85,8 +86,8 @@ export class SqliteAdapter implements IDatabase {
   readonly sql: SqlDialect = sqliteDialect;
   /** M-42 Slice 8: registration of reviewed isolated Wave 2 schema installers. */
   private wave2SchemaPromise: Promise<void> | null = null;
-  /** Re-entrancy guard while installers call this.query(). */
-  private wave2Installing = false;
+  /** Only installer-owned queries may bypass the shared readiness promise. */
+  private readonly wave2InstallerContext = new AsyncLocalStorage<true>();
 
   constructor(dbPath: string) {
     // Ensure directory exists
@@ -122,23 +123,19 @@ export class SqliteAdapter implements IDatabase {
    */
   async ensureWave2Schemas(): Promise<void> {
     if (!this.wave2SchemaPromise) {
-      this.wave2SchemaPromise = (async (): Promise<void> => {
-        this.wave2Installing = true;
-        try {
-          await installM31TargetV2Sqlite(this);
-          await installOverseerControlPlaneSqlite(this);
-        } finally {
-          this.wave2Installing = false;
-        }
-      })();
+      this.wave2SchemaPromise = this.wave2InstallerContext.run(true, async (): Promise<void> => {
+        await installM31TargetV2Sqlite(this);
+        await installOverseerControlPlaneSqlite(this);
+      });
     }
     await this.wave2SchemaPromise;
   }
 
   async query<T>(sql: string, params?: unknown[]): Promise<QueryResult<T>> {
     // Register Wave 2 isolated schemas before any application query.
-    // Skip while installers themselves are issuing CREATE statements.
-    if (!this.wave2Installing) {
+    // Only the installer async context can recurse without awaiting itself.
+    // Unrelated concurrent callers must await the same initialization result.
+    if (!this.wave2InstallerContext.getStore()) {
       await this.ensureWave2Schemas();
     }
 
