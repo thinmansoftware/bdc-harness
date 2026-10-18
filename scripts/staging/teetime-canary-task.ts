@@ -1,9 +1,11 @@
 // Fixed synthetic task only. This entrypoint cannot accept a product prompt.
-import { createRestrictedCanaryWorkerProvider } from '../../packages/providers/src/codex/restricted-run-factory';
+import { rootLogger } from '../../packages/paths/src/logger';
+import { acceptCanaryChunk, type CanaryCompletion } from './teetime-canary-result';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
 const emit = process.stdout.write.bind(process.stdout);
+rootLogger.level = 'silent';
 // Provider diagnostics must never be emitted from this authenticated process.
 console.log =
   console.info =
@@ -18,40 +20,38 @@ const timer = setTimeout(() => {
   controller.abort();
 }, 90000);
 let passed = false;
+const state: CanaryCompletion = { results: 0, failureCode: 'none' };
 try {
+  // Initialize provider children only after the actual Pino root is silent.
+  const { createRestrictedCanaryWorkerProvider } =
+    await import('../../packages/providers/src/codex/restricted-run-factory');
   const policy = readFileSync('/app/packages/providers/src/codex/restricted-policy.ts');
   const provider = createRestrictedCanaryWorkerProvider({
     runId: 'teetime-authenticated-synthetic-canary',
     policyDigest: 'sha256:' + createHash('sha256').update(policy).digest('hex'),
     workspace: '/workspace',
   });
-  let results = 0;
   for await (const chunk of provider.sendQuery(
     'Create only /workspace/canary.txt containing exactly tee-time-canary-ready followed by one newline. Do not read other files, run network commands, install tools, or modify any other path. This is a synthetic infrastructure check, not application work.',
     '/workspace',
     undefined,
     { abortSignal: controller.signal }
   )) {
-    if (chunk.type === 'system') throw new Error('unexpected system diagnostic');
-    if (chunk.type === 'result') {
-      // This provider emits this shape only for the SDK turn.completed event.
-      if (
-        chunk.isError ||
-        chunk.errors?.length ||
-        chunk.errorSubtype ||
-        !chunk.sessionId ||
-        chunk.servedModelId !== null ||
-        chunk.servedModelMissingReason !== 'codex_sdk_does_not_expose_served_model'
-      )
-        throw new Error('canary rejected');
-      results += 1;
-    }
+    acceptCanaryChunk(state, chunk);
   }
-  passed = results === 1;
+  passed = state.results === 1;
 } catch {
+  if (state.failureCode === 'none') state.failureCode = 'provider_failed';
   passed = false;
 } finally {
   clearTimeout(timer);
 }
-emit(JSON.stringify({ passed, modelInvocations: 1, servedModelVerified: false }) + '\n');
-process.exitCode = passed ? 0 : 1;
+emit(
+  JSON.stringify({
+    passed,
+    modelInvocations: 1,
+    servedModelVerified: false,
+    failureCode: state.failureCode,
+  }) + '\n'
+);
+// The trusted wrapper receives the sanitized failure category and determines exit.

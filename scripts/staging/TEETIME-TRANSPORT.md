@@ -211,3 +211,17 @@ The trusted wrapper checks file type, exact content and directory membership.
 Served-model identity is explicitly unverified because this SDK does not expose
 it. Synthetic invalid auth must fail before any model invocation and still clean
 up. This task does not implement the app or publish any artifact.
+
+The first real-login attempt, teetime-auth-3e7f2a65698d on source76c8bc40,
+passed all six authenticated preflight checks but failed the task stage. Its
+disposable and original authentication remained unchanged and cleanup verified.
+This remains a FAILED canary. No raw authenticated diagnostic was retained.
+
+Source inspection then found the task rejecting the provider's normal successful
+file-change message and requiring a sessionId captured before fresh-stream
+initialization. The corrected task accepts only the exact single canary-path
+success notification, preserves normal terminal/error checks, and uses Pino's
+actual silent level before creating provider child loggers. It reports only fixed
+failure categories. The wrapper checks the artifact independently on failures;
+overall success still requires every preflight, task, artifact and auth check.
+These source defects do not prove the first attempt's sole failure cause.

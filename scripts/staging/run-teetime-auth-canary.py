@@ -39,7 +39,7 @@ def main():
     outcome = {'passed': False, 'cleanupVerified': False, 'credentialReceived': False,
                'preflightPassed': False, 'authUnchanged': False, 'artifactVerified': False,
                'modelInvocations': 0, 'servedModelVerified': False, 'preflightChecks': 0,
-               'authenticationRejected': False}
+               'authenticationRejected': False, 'taskFailureCode': 'not_started'}
     def d(*parts, **kwargs):
         return subprocess.run([args.docker, *parts], capture_output=True, check=True,
                               timeout=kwargs.pop('timeout', 15), **kwargs).stdout
@@ -112,7 +112,7 @@ def main():
             assert actual_nets == ({internal} if role == 'worker' else {internal, egress})
         # Verify runtime bytes against reviewed operator files before credential delivery.
         hashes = {}
-        for filename in ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts',
+        for filename in ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts', 'teetime-canary-result.ts',
                          'teetime_connect_proxy.py']:
             expected = hashlib.sha256((root/filename).read_bytes()).hexdigest()
             actual = d('exec', ids['worker'], 'sha256sum', '/app/scripts/staging/'+filename).decode().split()[0]
@@ -170,9 +170,10 @@ def main():
         returncode, output = capture([args.docker, 'exec', '-w', '/workspace', ids['worker'],
             'python3', '-I', '/app/scripts/staging/teetime_canary_worker.py'], timeout=140)
         result = json.loads(output)
-        keys = {'passed', 'preflightPassed', 'authUnchanged', 'artifactVerified', 'modelInvocations', 'servedModelVerified', 'preflightChecks', 'authenticationRejected'}
+        keys = {'passed', 'preflightPassed', 'authUnchanged', 'artifactVerified', 'modelInvocations', 'servedModelVerified', 'preflightChecks', 'authenticationRejected', 'taskFailureCode'}
         assert set(result) == keys
-        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks'})
+        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode'})
+        assert result['taskFailureCode'] in ['not_started','worker_error','none','unexpected_system','terminal_rejected','provider_failed']
         assert type(result['preflightChecks']) is int and 0 <= result['preflightChecks'] <= 6
         assert type(result['modelInvocations']) is int and result['modelInvocations'] in [0, 1]
         outcome.update(result)

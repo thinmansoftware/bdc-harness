@@ -62,7 +62,7 @@ def main():
         for key in ['manifestSha256', 'workerId', 'gatewayId']:
             assert re.fullmatch('[a-f0-9]{64}', ready[key])
         root = Path(__file__).parent
-        filenames = ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts',
+        filenames = ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts', 'teetime-canary-result.ts',
             'teetime_connect_proxy.py', 'run-teetime-auth-canary.py', 'teetime_canary_protocol.py',
             'teetime_watchdog.py', 'codex-probe-seccomp.json', 'teetime_bounded_process.py']
         assert ready['hashes'] == {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in filenames}
@@ -95,9 +95,10 @@ def main():
         # Only known status fields leave this operator; no raw remote diagnostics.
         result = report['result']
         keys = {'passed','cleanupVerified','credentialReceived','preflightPassed','authUnchanged',
-                'artifactVerified','modelInvocations','servedModelVerified','preflightChecks','authenticationRejected'}
+                'artifactVerified','modelInvocations','servedModelVerified','preflightChecks','authenticationRejected','taskFailureCode'}
         assert set(result) == keys
-        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks'})
+        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode'})
+        assert result['taskFailureCode'] in ['not_started','worker_error','none','unexpected_system','terminal_rejected','provider_failed']
         assert type(result['preflightChecks']) is int and 0 <= result['preflightChecks'] <= 6
         assert type(result['modelInvocations']) is int and result['modelInvocations'] in [0,1]
         if original is not None:
