@@ -10,6 +10,7 @@ import {
 import {
   githubIssueInAllowList,
   githubNudgeEnabled,
+  postGithubIssueComment,
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
@@ -180,6 +181,252 @@ async function seedDetector(): Promise<DutyOfficerClockDeps> {
   await tickDutyOfficerClock(deps);
   return deps;
 }
+
+describe('duty officer nudge delivery evidence', () => {
+  test.each([
+    'missing-subject',
+    'malformed-subject',
+    'disabled',
+    'missing-identity',
+    'foreign-repository',
+    'adapter-refused',
+    'adapter-unconfirmed',
+  ])('generic nudge %s is held without a success receipt', async scenario => {
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    delete process.env.GITHUB_TOKEN;
+    const item = message({
+      id: 'nudge-refusal',
+      task_type: 'agent_message',
+      subject_key: 'gh:thinmansoftware/bdc-xo#2274',
+      body: JSON.stringify({ next_step: 'continue existing work' }),
+    });
+    const deps = fakeDeps([item]);
+    deps.judge = mock(async () => ({
+      status: 'ok' as const,
+      action: 'nudge' as const,
+      reason: 'next_step_known',
+      body: '',
+      failures: [],
+    }));
+    deps.listStaleIssues = mock(async () => []);
+    deps.postIssueComment = mock(async () => true);
+    if (scenario === 'missing-subject') item.subject_key = null;
+    if (scenario === 'malformed-subject') item.subject_key = 'gh:invalid';
+    if (scenario === 'disabled') process.env.DUTY_OFFICER_GH_NUDGE = 'false';
+    if (scenario === 'missing-identity') delete process.env.GH_TOKEN;
+    if (scenario === 'foreign-repository') item.subject_key = 'gh:foreign/repository#1';
+    if (scenario === 'adapter-refused') deps.postIssueComment = mock(async () => false);
+    if (scenario === 'adapter-unconfirmed') {
+      // Deliberately inject a legacy void adapter to verify fail-closed handling.
+      deps.postIssueComment = mock(
+        async () => undefined
+      ) as unknown as DutyOfficerClockDeps['postIssueComment'];
+    }
+
+    await tickDutyOfficerClock(deps);
+    expect(deps.postResult).not.toHaveBeenCalled();
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: item.id,
+        worker_id: 'duty-officer-clock',
+        fencing_token: 1,
+        not_before: expect.any(String),
+      })
+    );
+    expect(deps.postIssueComment).toHaveBeenCalledTimes(scenario.startsWith('adapter-') ? 1 : 0);
+  });
+
+  test('generic nudge records success only after an explicitly confirmed cue', async () => {
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    const deps = fakeDeps([
+      message({
+        id: 'confirmed-nudge',
+        task_type: 'agent_message',
+        subject_key: 'gh:thinmansoftware/bdc-xo#2274',
+      }),
+    ]);
+    deps.judge = mock(async () => ({
+      status: 'ok' as const,
+      action: 'nudge' as const,
+      reason: 'next_step_known',
+      body: '',
+      failures: [],
+    }));
+    deps.listStaleIssues = mock(async () => []);
+    let confirmed = false;
+    deps.postIssueComment = mock(async () => {
+      expect(deps.postResult).not.toHaveBeenCalled();
+      confirmed = true;
+      return true;
+    });
+    await tickDutyOfficerClock(deps);
+    expect(confirmed).toBe(true);
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'done',
+        task_outcome: 'succeeded',
+        result_body: JSON.stringify({ disposition: 'cued', transport: null }),
+      })
+    );
+  });
+
+  test('refused generic nudge cannot release a newer claim', async () => {
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    const item = message({ id: 'moved-nudge', subject_key: 'gh:thinmansoftware/bdc-xo#2274' });
+    const deps = fakeDeps([item]);
+    deps.judge = mock(async () => ({
+      status: 'ok' as const,
+      action: 'nudge' as const,
+      reason: 'next_step_known',
+      body: '',
+      failures: [],
+    }));
+    deps.listStaleIssues = mock(async () => []);
+    deps.postIssueComment = mock(async () => {
+      item.status = 'claimed';
+      item.fencing_token = 2;
+      item.lease_owner = 'new-worker';
+      return false;
+    });
+    deps.releaseMessage = mock(async input => {
+      if (input.fencing_token !== item.fencing_token || input.worker_id !== item.lease_owner)
+        return null;
+      item.status = 'queued';
+      return { ...item };
+    });
+    await tickDutyOfficerClock(deps);
+    expect(deps.releaseMessage).toHaveBeenCalledWith(expect.objectContaining({ fencing_token: 1 }));
+    expect(item.status).toBe('claimed');
+    expect(item.lease_owner).toBe('new-worker');
+    expect(item.fencing_token).toBe(2);
+    expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  test('ambiguous GitHub nudge failure produces neither success nor automatic retry', async () => {
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    const item = message({ id: 'ambiguous-nudge', subject_key: 'gh:thinmansoftware/bdc-xo#2274' });
+    const deps = fakeDeps([item]);
+    deps.listMessages = mock(async ({ recipient }) =>
+      recipient === 'duty-officer' && item.status === 'queued' ? [{ ...item }] : []
+    );
+    deps.claimMessage = mock(async ({ worker_id }) => {
+      item.status = 'claimed';
+      item.lease_owner = worker_id;
+      item.fencing_token = 1;
+      return { ...item };
+    });
+    deps.judge = mock(async () => ({
+      status: 'ok' as const,
+      action: 'nudge' as const,
+      reason: 'next_step_known',
+      body: '',
+      failures: [],
+    }));
+    deps.listStaleIssues = mock(async () => []);
+    deps.postIssueComment = mock(async () => {
+      throw new Error('GitHub response lost after possible write');
+    });
+    await tickDutyOfficerClock(deps);
+    await tickDutyOfficerClock(deps);
+    expect(item.status).toBe('claimed');
+    expect(deps.postIssueComment).toHaveBeenCalledTimes(1);
+    expect(deps.postResult).not.toHaveBeenCalled();
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  test.each([false, true])(
+    'real nudge adapter confirms delivery or an existing marker: %s',
+    async existing => {
+      process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+      process.env.GH_TOKEN = 'synthetic-pat';
+      const methods: string[] = [];
+      const fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+        const method = options?.method ?? 'GET';
+        methods.push(method);
+        return new Response(
+          JSON.stringify(
+            method === 'POST'
+              ? { id: 1 }
+              : existing
+                ? [{ body: '<!-- duty-officer-nudge -->' }]
+                : []
+          ),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          }
+        );
+      });
+      try {
+        expect(
+          await postGithubIssueComment(
+            { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2274 },
+            'cue'
+          )
+        ).toBe(true);
+        expect(methods).toEqual(existing ? ['GET'] : ['GET', 'POST']);
+      } finally {
+        fetchStub.mockRestore();
+      }
+    }
+  );
+
+  test('real nudge adapter refuses disabled and foreign repository requests before fetch', async () => {
+    process.env.GH_TOKEN = 'synthetic-pat';
+    const fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new Error('network_must_not_run');
+    });
+    try {
+      expect(
+        await postGithubIssueComment(
+          { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2274 },
+          'cue'
+        )
+      ).toBe(false);
+      process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+      expect(
+        await postGithubIssueComment({ owner: 'foreign', repo: 'repository', number: 1 }, 'cue')
+      ).toBe(false);
+      expect(fetchStub).not.toHaveBeenCalled();
+    } finally {
+      fetchStub.mockRestore();
+    }
+  });
+
+  test.each(['disabled', 'identity-revoked', 'repository-changed'])(
+    'real nudge adapter rechecks authorization before POST: %s',
+    async revoked => {
+      process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+      process.env.GH_TOKEN = 'synthetic-pat';
+      delete process.env.GITHUB_TOKEN;
+      const methods: string[] = [];
+      const fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+        methods.push(options?.method ?? 'GET');
+        if (revoked === 'disabled') process.env.DUTY_OFFICER_GH_NUDGE = 'false';
+        if (revoked === 'identity-revoked') delete process.env.GH_TOKEN;
+        if (revoked === 'repository-changed')
+          process.env.DUTY_OFFICER_GH_REPO = 'foreign/repository';
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      });
+      try {
+        expect(
+          await postGithubIssueComment(
+            { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2274 },
+            'cue'
+          )
+        ).toBe(false);
+        expect(methods).toEqual(['GET']);
+      } finally {
+        fetchStub.mockRestore();
+      }
+    }
+  );
+});
 
 describe('duty officer clock', () => {
   test('fresh deps each tick preserve detector throttle and verdict until the interval expires', async () => {
@@ -522,7 +769,7 @@ describe('duty officer clock', () => {
     deps.listStaleIssues = mock(async () => [
       { owner: 'thinmansoftware', repo: 'bdc-xo', number: 12 },
     ]);
-    deps.postIssueComment = mock(async () => {});
+    deps.postIssueComment = mock(async () => true);
     process.env.DUTY_OFFICER_GH_NUDGE = 'true';
     process.env.GITHUB_TOKEN = 'ghs_test';
 
