@@ -3503,6 +3503,176 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
       }));
   }
 
+  function budgetClaimFetch(
+    count: number,
+    searched: string[],
+    failAt = -1,
+    claimed = false
+  ): typeof fetch {
+    return (async input => {
+      const url = new URL(String(input));
+      if (url.pathname === '/search/issues') {
+        searched.push(url.searchParams.get('q') ?? '');
+        if (searched.length === failAt) return new Response('unavailable', { status: 503 });
+        return Response.json(
+          {
+            total_count: claimed ? 1 : 0,
+            incomplete_results: false,
+            items: claimed
+              ? [
+                  {
+                    number: 9000,
+                    state: 'open',
+                    title: 'claimed work',
+                    body: null,
+                    pull_request: {},
+                  },
+                ]
+              : [],
+          },
+          {
+            headers: { 'x-ratelimit-remaining': '100' },
+          }
+        );
+      }
+      return Response.json(
+        url.searchParams.get('labels') === 'wo'
+          ? Array.from({ length: count }, (_, i) =>
+              ghIssue(1000 + i, ['wo', 'prio:P0'], {
+                title: `WO-BUDGET-${String(i).padStart(3, '0')}-01`,
+              })
+            )
+          : [],
+        { headers: { 'x-ratelimit-remaining': '100' } }
+      );
+    }) as typeof fetch;
+  }
+
+  test('claim budget keeps all 63 issues visible and rotates fresh verification', async () =>
+    withIsolatedClaimMeter(async () => {
+      const cursor = { lastVerifiedRef: null as string | null };
+      const searched: string[] = [];
+      const covered = new Set<string>();
+      for (let tickIndex = 0; tickIndex < 7; tickIndex++) {
+        const before = searched.length;
+        const rows = await defaultListThreads(budgetClaimFetch(63, searched), cursor);
+        expect(rows).toHaveLength(63);
+        expect(searched.length - before).toBe(10);
+        const deferred = rows.filter(row => row.prClaimVerification === 'deferred_budget');
+        expect(deferred).toHaveLength(53);
+        expect(
+          deferred.every(row => row.isUnclaimed === undefined && row.isUnclaimedP0 === undefined)
+        ).toBe(true);
+        for (const row of rows.filter(row => row.prClaimVerification === undefined)) {
+          expect(row.isUnclaimedP0).toBe(true);
+          covered.add(row.ref);
+        }
+      }
+      expect(covered.size).toBe(63);
+    }));
+
+  test('claim budget deferral suppresses interventions while adoption and heartbeat continue', async () =>
+    withIsolatedClaimMeter(async () => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const cursor = { lastVerifiedRef: null as string | null };
+      const searched: string[] = [];
+      const eligibleTitles: string[] = [];
+      let deferredRef = '';
+      const deps = makeDeps(world, {
+        listThreads: async () => {
+          const rows = await defaultListThreads(budgetClaimFetch(11, searched, -1, true), cursor);
+          const deferred = rows.find(row => row.prClaimVerification === 'deferred_budget');
+          expect(deferred).toBeDefined();
+          deferredRef = deferred?.ref ?? '';
+          return rows;
+        },
+        getGithubIssueEvidence: async () => makeEvidence(),
+        checkFireEligibility: async title => {
+          eligibleTitles.push(title);
+          return { eligible: false, reason: 'fixture' };
+        },
+      });
+      const state = createTaskmasterState(60_000);
+      const priorFire = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+      const result = await (async () => {
+        try {
+          return await tick(state, deps);
+        } finally {
+          if (priorFire === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+          else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFire;
+        }
+      })();
+      expect(result.successful).toBe(true);
+      expect(world.adoptionMeta.row_count).toBe(11);
+      expect(state.deadman.lastTickAtMs).toBe(T0);
+      expect(world.journal.some(row => row.thread_ref === deferredRef)).toBe(false);
+      expect(eligibleTitles).toEqual([]);
+      expect(result.deferred).toBeGreaterThanOrEqual(1);
+    }));
+
+  test('failed claim selection does not advance the verification cursor', async () =>
+    withIsolatedClaimMeter(async () => {
+      const cursor = { lastVerifiedRef: 'gh:thinmansoftware/bdc-harness#1003' };
+      const searched: string[] = [];
+      await expect(defaultListThreads(budgetClaimFetch(11, searched, 2), cursor)).rejects.toThrow();
+      expect(cursor.lastVerifiedRef).toBe('gh:thinmansoftware/bdc-harness#1003');
+      const retry: string[] = [];
+      await defaultListThreads(budgetClaimFetch(11, retry), cursor);
+      expect(retry[0]).toBe(searched[0]);
+    }));
+
+  test('claim budget preserves independent ruling delivery', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const deferred: ListedThread = {
+      ...ruling(),
+      title: 'WO-RULING-01',
+      prClaimVerification: 'deferred_budget',
+    };
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        listUndeliveredRulings: async () => [deferred],
+        listThreads: async () => [],
+      })
+    );
+    expect(world.journal.filter(row => row.outcome === 'sent').map(row => row.action_type)).toEqual(
+      ['digest', 'deliver_ruling']
+    );
+  });
+
+  test('claim budget excludes assigned and active-status work and preserves non-WO facts', async () =>
+    withIsolatedClaimMeter(async () => {
+      let searches = 0;
+      const fetchImpl = (async input => {
+        const url = new URL(String(input));
+        if (url.pathname === '/search/issues') {
+          searches++;
+          return Response.json({ total_count: 0, incomplete_results: false, items: [] });
+        }
+        return Response.json(
+          url.searchParams.get('labels') === 'wo'
+            ? [
+                ghIssue(11, ['wo', 'prio:P0'], {
+                  title: 'WO-ASSIGNED-01',
+                  assignees: [{ login: 'owner' }],
+                }),
+                ghIssue(12, ['wo', 'prio:P0', 'status:building'], { title: 'WO-BUILDING-01' }),
+                ghIssue(13, ['wo', 'prio:P0', 'status:review'], { title: 'WO-REVIEW-01' }),
+                ghIssue(14, ['wo', 'prio:P0'], { title: 'ordinary issue' }),
+                ghIssue(15, ['wo', 'prio:P0'], { title: 'WO-VERIFY-01' }),
+              ]
+            : []
+        );
+      }) as typeof fetch;
+      const rows = await defaultListThreads(fetchImpl, { lastVerifiedRef: null });
+      expect(searches).toBe(1);
+      expect(rows.every(row => row.prClaimVerification === undefined)).toBe(true);
+      expect(rows.map(row => row.isUnclaimedP0)).toEqual([false, false, false, true, true]);
+    }));
+
   test('complete empty PR claim permits the existing unclaimed classification', async () =>
     withIsolatedClaimMeter(async () => {
       const fetchImpl = (async input => {

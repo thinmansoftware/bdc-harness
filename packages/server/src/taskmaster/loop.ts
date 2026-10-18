@@ -338,7 +338,7 @@ interface GithubIssue {
 const WORK_LABELS = ['wo', 'project', 'arc'] as const;
 const MAX_PAGES_PER_LABEL = 10;
 const GITHUB_RATE_LIMIT_FLOOR = 5;
-/** Max GitHub search requests for open-PR claims inside one defaultListThreads call. */
+/** Max logical open-PR claim lookups per read; permission fallback may retry HTTP. */
 const PR_CLAIM_LOOKUP_CAP = 10;
 
 /**
@@ -414,7 +414,15 @@ export interface ListedThread extends ThreadSnapshot {
   ownerLogin?: string | null;
   labels?: string[];
   beyondFirstPage?: boolean;
+  /** No PR absence evidence this tick; observe only, never intervene. */
+  prClaimVerification?: 'deferred_budget';
 }
+
+/** Fair scheduling position only. Never caches claim or absence evidence. */
+export interface PrClaimVerificationCursor {
+  lastVerifiedRef: string | null;
+}
+const defaultPrClaimCursor: PrClaimVerificationCursor = { lastVerifiedRef: null };
 
 export type ListedThreadResult = ListedThread[] & { unlabelledPriorityTriage: string[] };
 
@@ -447,7 +455,8 @@ function assertGithubRateLimit(response: Response, context: string): void {
  * tests only.
  */
 export async function defaultListThreads(
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch = fetch,
+  claimCursor: PrClaimVerificationCursor = defaultPrClaimCursor
 ): Promise<ListedThreadResult> {
   const repos = (process.env.TASKMASTER_GH_REPOS ?? 'thinmansoftware/bdc-xo')
     .split(',')
@@ -455,7 +464,7 @@ export async function defaultListThreads(
     .filter(Boolean);
   const threads: ListedThread[] = [];
   const unlabelledPriorityTriage: string[] = [];
-  let prClaimLookups = 0;
+  const candidates: { thread: ListedThread; repo: string; woId: string }[] = [];
   for (const repo of repos) {
     const seen = new Set<number>();
     const firstPages = new Map<(typeof WORK_LABELS)[number], GithubIssue[]>();
@@ -505,14 +514,9 @@ export async function defaultListThreads(
           ['status:building', 'status:review'].includes(label)
         );
         const ownerLogin = issue.assignees?.[0]?.login ?? null;
-        let isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
+        const isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
         const woId = issue.title?.match(WO_ID_RE)?.[0];
-        if (isUnclaimed && woId !== undefined && prClaimLookups < PR_CLAIM_LOOKUP_CAP) {
-          prClaimLookups += 1;
-          const claimed = await lookupOpenPrClaim(fetchImpl, repo, woId);
-          if (claimed) isUnclaimed = false;
-        }
-        threads.push({
+        const thread: ListedThread = {
           ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
           priority,
           isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
@@ -528,7 +532,9 @@ export async function defaultListThreads(
           ownerLogin,
           labels,
           beyondFirstPage,
-        });
+        };
+        threads.push(thread);
+        if (isUnclaimed && woId !== undefined) candidates.push({ thread, repo, woId });
       }
     };
 
@@ -552,6 +558,33 @@ export async function defaultListThreads(
       }
     }
   }
+  // Only the complete issue snapshot defines the rotation. Unselected claims
+  // remain explicitly unknown, not absence inferred from the request budget.
+  candidates.sort((a, b) =>
+    a.thread.ref < b.thread.ref ? -1 : a.thread.ref > b.thread.ref ? 1 : 0
+  );
+  for (const { thread } of candidates) {
+    delete thread.isUnclaimed;
+    delete thread.isUnclaimedP0;
+    thread.prClaimVerification = 'deferred_budget';
+  }
+  const afterCursor = candidates.findIndex(
+    candidate =>
+      claimCursor.lastVerifiedRef === null || candidate.thread.ref > claimCursor.lastVerifiedRef
+  );
+  const start = afterCursor < 0 ? 0 : afterCursor;
+  let lastVerifiedRef = claimCursor.lastVerifiedRef;
+  for (let offset = 0; offset < Math.min(PR_CLAIM_LOOKUP_CAP, candidates.length); offset++) {
+    const candidate = candidates[(start + offset) % candidates.length];
+    if (!candidate) continue;
+    const claimed = await lookupOpenPrClaim(fetchImpl, candidate.repo, candidate.woId);
+    candidate.thread.isUnclaimed = !claimed;
+    candidate.thread.isUnclaimedP0 = candidate.thread.priority === 'P0' && !claimed;
+    delete candidate.thread.prClaimVerification;
+    lastVerifiedRef = candidate.thread.ref;
+  }
+  // Failed reads publish neither a partial source nor a new scheduling position.
+  claimCursor.lastVerifiedRef = lastVerifiedRef;
   return Object.assign(threads, { unlabelledPriorityTriage });
 }
 
@@ -588,7 +621,7 @@ class PrClaimLookupError extends Error {
  * or body contains the work-order id, scoped to the repository owner.
  * Only a valid complete empty response proves absence. Unknown claim evidence
  * rejects this work-SOR read so the prior adoption snapshot remains authoritative.
- * The separate lookup cap still leaves skipped claims unverified; it is unchanged.
+ * Budget-deferred candidates stay explicitly unknown until a later fresh lookup.
  */
 async function lookupOpenPrClaim(
   fetchImpl: typeof fetch,
@@ -1731,6 +1764,13 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   const fireBeyondFirstPageAllowed = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE === 'true';
   const blockerReportEnabled = resolveBlockerReportEnabled();
   for (const item of [...rulings, ...threads]) {
+    if (
+      !item.undeliveredRulingId &&
+      (item as ListedThread).prClaimVerification === 'deferred_budget'
+    ) {
+      result.deferred += 1;
+      continue;
+    }
     const canonRef = canonicalizeThreadRef(item.ref);
     const adoptionRow = adoptionByRef.get(canonRef);
     const classification = classifyThread(item, nowMs);
