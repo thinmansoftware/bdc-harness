@@ -122,6 +122,25 @@ instant. The credentialed launcher must reserve cleanup time within its total
 five-minute budget. Docker unavailability is a containment failure, never green.
 This standalone watchdog is not yet integrated into an authenticated launcher.
 
+## Local staging image derivative
+
+```text
+python scripts/staging/build-teetime-derivative.py --docker path/to/docker --repo path/to/checkout --base-image sha256:EXACT_BASE_IMAGE --base-sha EXACT_BASE_COMMIT --target-sha EXACT_TARGET_COMMIT
+```
+
+The target commit must already be present in the checkout object database. The
+helper accepts only regular-file additions/modifications under the canary paths,
+copies exact Git blobs, checks the base image's source identity, and verifies each
+changed file's hash in the result. The local base tag is unique, checked against
+the immutable image ID before/after build and removed afterward. No registry
+login, base pull, dependency change or checkout switch is performed.
+
+Target824479580affab678310ef066b98f538a6373a6c produced local derivative image
+sha256:d13e1c6075b547f9dc638ef647d98d9124727dba4c8129ad461a324ea281b55c.
+Receipt: teetime-derivative-824479580aff-9a0316. The helper itself was supplied as
+an operator-side candidate for this build. This is a local derivative, not the
+full hosted CI image, and has not performed an authenticated canary.
+
 ## Provider entrypoint contract
 
 createRestrictedCanaryWorkerProvider is a dedicated, unregistered entrypoint.
