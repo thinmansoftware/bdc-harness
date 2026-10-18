@@ -119,6 +119,10 @@ jobs:
           sleep 5
           curl --fail --retry 10 --retry-delay 3 --retry-all-errors http://localhost:3000/api/health
 
+      - name: Smoke test -- lane toolchain as application user
+        run: |
+          docker exec --user appuser archon-smoke sh -ec 'node --version && npm --version && npx --version && pytest --version'
+
       - name: Dump container logs on failure
         if: failure()
         run: docker logs archon-smoke 2>&1 || true
