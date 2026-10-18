@@ -43,6 +43,7 @@ interface NodeDef {
   fallbackModel?: string;
   bash?: string;
   prompt?: string;
+  depends_on?: string[];
   loop?: {
     prompt?: string;
   };
@@ -75,6 +76,7 @@ describe('lane registration and war-council-validator pin', () => {
     // new lane to be acknowledged here AND given an explicit validator-pin branch
     // in S4b below, rather than silently inheriting a default.
     expect(LANE_FILES).toEqual([
+      'bdc-feature-development-astra.yaml',
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-cursor.yaml',
@@ -162,6 +164,12 @@ describe('lane registration and war-council-validator pin', () => {
         return;
       }
 
+      if (file === 'bdc-feature-development-astra.yaml') {
+        expect(wcv.provider).toBe('claude');
+        expect(wcv.model).toBe('claude-fable-5');
+        return;
+      }
+
       if (file === 'bdc-feature-development-codex-only.yaml') {
         // Claude-out / Codex-in: validator on codex with model-free persona.
         expect(wcv.provider).toBe('codex');
@@ -207,13 +215,13 @@ describe('lane registration and war-council-validator pin', () => {
       expect(lane.model?.startsWith('qwen/')).toBe(true);
 
       const planReview = node('plan-review');
-      expect(planReview?.provider, `${file}:plan-review:provider`).toBe('grok');
-      expect(planReview?.model, `${file}:plan-review:model`).toBe('x-ai/grok-4.6');
+      expect(planReview?.provider, `${file}:plan-review:provider`).toBe('cursor');
+      expect(planReview?.model, `${file}:plan-review:model`).toBe('grok-4.7-high');
 
       for (const id of ['implement', 'diff-repair', 'opus-repair', 'apply-suggested-fix']) {
         const executionNode = node(id);
-        expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
-        expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.6');
+        expect(executionNode?.provider, `${file}:${id}:provider`).toBe('cursor');
+        expect(executionNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
       }
 
       expect(node('apply-suggested-fix')?.agent, `${file}:apply-suggested-fix:agent`).toBe(
@@ -410,8 +418,8 @@ describe('lane registration and war-council-validator pin', () => {
     const nodes = lane.nodes ?? [];
     const node = (id: string) => nodes.find(candidate => candidate.id === id);
 
-    expect(lane.provider).toBe('grok');
-    expect(lane.model).toBe('x-ai/grok-4.6');
+    expect(lane.provider).toBe('cursor');
+    expect(lane.model).toBe('grok-4.7-high');
     expect(content).not.toContain('provider: claude');
     expect(content).not.toContain('model: claude');
     expect(content).not.toContain('agent: overseer-opus');
@@ -425,8 +433,8 @@ describe('lane registration and war-council-validator pin', () => {
       'apply-suggested-fix',
     ]) {
       const executionNode = node(id);
-      expect(executionNode?.provider, `${file}:${id}:provider`).toBe('grok');
-      expect(executionNode?.model, `${file}:${id}:model`).toBe('x-ai/grok-4.6');
+      expect(executionNode?.provider, `${file}:${id}:provider`).toBe('cursor');
+      expect(executionNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
       expect(executionNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }
 
@@ -441,7 +449,7 @@ describe('lane registration and war-council-validator pin', () => {
     ]) {
       const reviewNode = node(id);
       expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-opr');
-      expect(reviewNode?.model, `${file}:${id}:model`).not.toBe('x-ai/grok-4.6');
+      expect(reviewNode?.model, `${file}:${id}:model`).not.toBe('grok-4.7-high');
       expect(reviewNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
     }
   });
@@ -529,4 +537,53 @@ describe('lane registration and war-council-validator pin', () => {
       expect(manifestNode && 'prompt' in manifestNode).toBe(false);
     });
   }
+});
+
+const REPAIR_TARGET_LANES = [
+  'bdc-feature-development-codex.yaml',
+  'bdc-feature-development-cursor.yaml',
+] as const;
+
+const MISMATCH_REASON = 'declared repair target #N does not match the lane-verified record';
+const UNVERIFIED_REASON = 'declared repair target #N was not verified by the lane';
+
+function extractStep4b(prompt: string): string {
+  const start = prompt.indexOf('4b. Repair target');
+  if (start < 0) {
+    throw new Error('step 4b start boundary missing');
+  }
+  const end = prompt.indexOf('\n5. Out-of-scope', start);
+  if (end < 0) {
+    throw new Error('step 4b end boundary missing');
+  }
+  return prompt.slice(start, end);
+}
+
+describe('plan-review repair-target record', () => {
+  for (const file of REPAIR_TARGET_LANES) {
+    it(`${file}: plan-review depends on the lane-verified checkout record`, () => {
+      const lane = loadLane(file);
+      const planReview = lane.nodes?.find(node => node.id === 'plan-review');
+      const prompt = planReview?.loop?.prompt ?? '';
+      const step4b = extractStep4b(prompt);
+
+      expect(planReview?.depends_on).toEqual(['plan', 'checkout-repair-target']);
+      expect(prompt).toContain('$checkout-repair-target.output');
+      expect(step4b).toContain('REPAIR_TARGET');
+      expect(step4b).toContain('REPAIR_TARGET_BRANCH');
+      expect(step4b).not.toContain('WebFetch');
+      expect(step4b).not.toContain('gh pr');
+      expect(step4b).toContain(MISMATCH_REASON);
+      expect(step4b).toContain(UNVERIFIED_REASON);
+    });
+  }
+
+  it('step 4b is byte-identical in the codex and cursor lanes', () => {
+    const blocks = REPAIR_TARGET_LANES.map(file => {
+      const lane = loadLane(file);
+      const prompt = lane.nodes?.find(node => node.id === 'plan-review')?.loop?.prompt ?? '';
+      return extractStep4b(prompt);
+    });
+    expect(blocks[0]).toBe(blocks[1]);
+  });
 });
