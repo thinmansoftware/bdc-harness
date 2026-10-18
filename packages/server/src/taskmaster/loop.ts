@@ -58,7 +58,11 @@ import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
 import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import { fireBackoffDecision } from './backoff';
-import { checkExpectations } from './expectations';
+import {
+  checkExpectations,
+  readCascadeWorkflowEvidence,
+  type CascadeEvidenceDeps,
+} from './expectations';
 import { canonicalizeThreadRef } from './thread-ref';
 import {
   createDeadmanState,
@@ -229,7 +233,8 @@ export interface TaskmasterDeps {
   runCascade?: typeof runCascade;
   getFireRunEvidence?: (
     woId: string,
-    cascadeId: string
+    cascadeId: string,
+    project?: string
   ) => Promise<{ status: string; prOpened?: boolean } | null>;
   getHealthSample?: typeof taskmasterDb.getHealthSample;
   /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
@@ -289,6 +294,16 @@ export async function defaultFindEffectByIdempotencyKey(
   );
   const row = result.rows[0];
   return row ? { id: row.id, status: row.status, createdAt: row.created_at } : null;
+}
+
+/** Default fire evidence probe, kept injectable for source-backed regressions. */
+export async function defaultGetFireRunEvidence(
+  woId: string,
+  cascadeId: string,
+  project: string | undefined,
+  deps: CascadeEvidenceDeps = {}
+): Promise<{ status: string; prOpened?: boolean } | null> {
+  return readCascadeWorkflowEvidence({ woId, cascadeId, project }, deps);
 }
 
 /** Undelivered ratified rulings: queued board-motion mailbox rows not yet acknowledged. */
@@ -999,7 +1014,7 @@ async function gradeSentActions(
         const woId = proposal.fireEvidence?.woId;
         const cascadeId = proposal.cascadeId;
         if (!woId || !cascadeId) continue;
-        const run = await getFireRunEvidence(woId, cascadeId);
+        const run = await getFireRunEvidence(woId, cascadeId, proposal.fireEvidence?.project);
         const issue = await getIssueEvidence(action.thread_ref, action.created_at);
         const buildingAtMs = issue?.activeStatusAt ? Date.parse(issue.activeStatusAt) : NaN;
         const deadlineMs = action.proof_deadline_at ? Date.parse(action.proof_deadline_at) : NaN;
@@ -1373,25 +1388,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
   const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
   const executeCascade = deps.runCascade ?? runCascade;
-  const getFireRunEvidence =
-    deps.getFireRunEvidence ??
-    (async (woId: string): Promise<{ status: string; prOpened?: boolean } | null> => {
-      const result = await getDatabase().query<{ status: string; metadata: string | null }>(
-        `SELECT status, metadata FROM remote_agent_workflow_runs
-         WHERE user_message LIKE $1 ORDER BY started_at DESC LIMIT 1`,
-        [`%${woId}%`]
-      );
-      const row = result.rows[0];
-      if (!row) return null;
-      let prOpened = false;
-      try {
-        const metadata = JSON.parse(row.metadata ?? '{}') as Record<string, unknown>;
-        prOpened = Boolean(metadata.prUrl ?? metadata.pr_url ?? metadata.pullRequestUrl);
-      } catch {
-        // Malformed metadata is no proof; status and issue evidence remain usable.
-      }
-      return { status: row.status, prOpened };
-    });
+  const getFireRunEvidence = deps.getFireRunEvidence ?? defaultGetFireRunEvidence;
   const nowMs = now().getTime();
   const cutoverAt = await (
     deps.getDispatchReceiptCutoverAt ??

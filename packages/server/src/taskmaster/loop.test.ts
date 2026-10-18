@@ -1366,10 +1366,11 @@ describe('fire_cauldron loop', () => {
     }
   });
 
-  test('grades completed fire useful and overdue running fire noise', async () => {
+  test('grades proven fire evidence and leaves overdue UNKNOWN ungraded', async () => {
     for (const testCase of [
       { id: 'completed-fire', status: 'completed', deadline: T0 + 60_000, grade: 'useful' },
       { id: 'overdue-running-fire', status: 'running', deadline: T0 - 1, grade: 'noise' },
+      { id: 'overdue-unknown-fire', status: null, deadline: T0 - 1, grade: null },
     ] as const) {
       const world = makeWorld();
       seedDigestSent(world);
@@ -1381,7 +1382,7 @@ describe('fire_cauldron loop', () => {
         proposal_json: JSON.stringify({
           type: 'fire_cauldron',
           cascadeId: `cascade-${testCase.id}`,
-          fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01' },
+          fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01', project: 'bdc-harness' },
         }),
         idempotency_key: `tm:fire:${testCase.id}`,
         before_hash: null,
@@ -1395,8 +1396,14 @@ describe('fire_cauldron loop', () => {
       await tick(
         createTaskmasterState(60_000),
         makeDeps(world, {
-          getFireRunEvidence: async () => {
+          getFireRunEvidence: async (woId, cascadeId, project) => {
             evidenceCalls += 1;
+            expect([woId, cascadeId, project]).toEqual([
+              'WO-HARNESS-EXAMPLE-01',
+              `cascade-${testCase.id}`,
+              'bdc-harness',
+            ]);
+            if (testCase.status === null) throw new Error('taskmaster_cascade_evidence_unknown');
             return { status: testCase.status, prOpened: false };
           },
         })
