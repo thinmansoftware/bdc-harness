@@ -124,12 +124,13 @@ describe('PR review approval verdict recording', () => {
     ]);
   });
 
-  test('a repeated approval at the same head is a no-op after the claim loses', async () => {
+  test('a repeated approval without an eligible held row is a no-op', async () => {
     let finalized = 0;
     await recordReviewApprovalVerdict(
       { owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
       {
         claimVerdict: async () => ({ claimed: false }),
+        transitionVerification: async () => false,
         finalizeVerdict: async () => {
           finalized += 1;
           return {} as never;

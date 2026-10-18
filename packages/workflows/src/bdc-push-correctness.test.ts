@@ -753,7 +753,16 @@ describe('Lane consistency: all feature-development lanes share review-base wiri
       const yaml = readFileSync(lane, 'utf8').replace(/\r\n/g, '\n');
       const openPr = yaml.split('  - id: open-pr-if-needed\n')[1]?.split('\n  - id: ')[0] ?? '';
       expect(openPr).toContain('DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")');
-      expect(openPr).toContain('COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")');
+      // WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01 intentionally
+      // diverges ONLY the codex lane: its open-pr reads the commit ground truth
+      // from commit-hook-gate, which consolidates commit-and-push (attempt 1) and
+      // commit-hook-retry (post-repair attempt 2) and passes through unique_branch.
+      // Every OTHER lane still reads commit-and-push.out directly (the follow-up
+      // WO fans this out to the remaining lanes).
+      const commitSource = lane.endsWith('bdc-feature-development-codex.yaml')
+        ? 'COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-hook-gate.out")'
+        : 'COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")';
+      expect(openPr).toContain(commitSource);
       expect(openPr).not.toMatch(
         /DECIDE_OUTPUT=\$\(cat <<'[^']+'\n\s*\$decide-push-target\.output\n/
       );

@@ -3952,6 +3952,107 @@ nodes:
         fi
         UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       fi
+      # Shared commit-core (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01):
+      # the SINGLE definition of the commit action, written once here and invoked by BOTH
+      # this node (attempt 1) and the commit-hook-retry node (attempt 2). It is written to
+      # the run artifacts dir (shared across nodes in the run) so there is no duplicated
+      # commit logic. Hooks ALWAYS run -- the core NEVER passes a commit hook-skip flag,
+      # a hook-disabling env var, or a hooks-path override. On a husky/lint-staged rejection it persists the hook
+      # output for one bounded repair pass and exits non-zero; it never bypasses the hook.
+      # ARTIFACTS_DIR is always set by the executor at run time; default it to a
+      # temp dir so the shared-core write is also safe when this node's bash is
+      # exercised in isolation by a unit test harness (no run context).
+      : "${ARTIFACTS_DIR:=$(mktemp -d 2>/dev/null || echo /tmp)}"
+      mkdir -p "$ARTIFACTS_DIR" 2>/dev/null || true
+      CORE_SCRIPT="$ARTIFACTS_DIR/commit-and-push-core.sh"
+      cat > "$CORE_SCRIPT" <<'COMMIT_AND_PUSH_CORE_EOF'
+      #!/usr/bin/env bash
+      # commit-and-push-core: the single shared commit action. Hooks intact, no bypass.
+      set -uo pipefail
+      : "${CORE_COMMIT_MESSAGE:?commit-core: CORE_COMMIT_MESSAGE required}"
+      : "${CORE_HOOK_OUTPUT_FILE:?commit-core: CORE_HOOK_OUTPUT_FILE required}"
+      if [ -n "${CORE_ATTEMPT_FILE:-}" ]; then
+        CORE_PREV_ATTEMPT=$(cat "$CORE_ATTEMPT_FILE" 2>/dev/null || echo 0)
+        case "$CORE_PREV_ATTEMPT" in ''|*[!0-9]*) CORE_PREV_ATTEMPT=0;; esac
+        printf '%s\n' "$((CORE_PREV_ATTEMPT + 1))" > "$CORE_ATTEMPT_FILE"
+      fi
+      if [ "${CORE_STAGE_MODE:-prestaged}" = "all" ]; then
+        git add -A
+      fi
+      if git diff --cached --quiet; then
+        echo "COMMIT_CORE=nothing_staged" >&2
+        exit 3
+      fi
+      set +e
+      CORE_COMMIT_LOG=$(git commit -m "$CORE_COMMIT_MESSAGE" 2>&1)
+      CORE_RC=$?
+      set -e
+      printf '%s\n' "$CORE_COMMIT_LOG"
+      if [ "$CORE_RC" -eq 0 ]; then
+        echo "COMMIT_CORE=committed"
+        exit 0
+      fi
+      # A nonzero `git commit` is a REPAIRABLE pre-commit lint/format rejection ONLY on
+      # POSITIVE evidence that the pre-commit hook is what rejected it. This must never
+      # be decided by elimination: git fails nonzero for many reasons the bounded lint
+      # repair cannot fix -- a commit-msg hook rejection, a missing identity, an
+      # index/ref lock, a signing failure, ENOSPC, a read-only or unwritable .git --
+      # and labelling any unrecognized failure a "hook failure" would feed the repair
+      # pass garbage and burn the run's one bounded attempt. The caller treats the
+      # existence of CORE_HOOK_OUTPUT_FILE as proof of a hook rejection, so that file is
+      # written ONLY on positive evidence; every other failure exits hard (fail closed).
+      #
+      # Step 1 -- hard exclusions. Known git-level failure phrasings (including a
+      # commit-msg hook rejection, which is a DIFFERENT hook phase and is not a staged
+      # lint/format problem) can never be a pre-commit lint rejection.
+      if printf '%s\n' "$CORE_COMMIT_LOG" | grep -Eqi 'please tell me who you are|unable to auto-detect email address|author identity unknown|empty ident (name|email)|unable to create [^\n]*\.lock|cannot lock ref|gpg failed to sign|failed to write commit object|cannot (run|spawn) gpg|unable to start gpg|husky - commit-msg script failed|no space left on device|disk quota exceeded|read-only file system|permission denied|index file (smaller|corrupt)'; then
+        echo "COMMIT_CORE=commit_failed_non_hook" >&2
+        exit "$CORE_RC"
+      fi
+      # Step 2 -- require positive attribution to the pre-commit phase.
+      CORE_HOOK_EVIDENCE=none
+      # 2a. Fast path: husky / lint-staged print an explicit, phase-attributed marker.
+      #     'husky - pre-commit script failed' names the phase outright; a lint-staged
+      #     run that reports [FAILED] is a staged lint/format rejection by definition.
+      if printf '%s\n' "$CORE_COMMIT_LOG" | grep -Eqi 'husky - pre-commit script failed'; then
+        CORE_HOOK_EVIDENCE=husky_marker
+      elif printf '%s\n' "$CORE_COMMIT_LOG" | grep -qi 'lint-staged' \
+        && printf '%s\n' "$CORE_COMMIT_LOG" | grep -q '\[FAILED\]'; then
+        CORE_HOOK_EVIDENCE=lint_staged_marker
+      else
+        # 2b. No marker (a plain .git/hooks/pre-commit that just execs a linter emits
+        #     only the linter's own output). Attribute the phase by DIRECT OBSERVATION:
+        #     re-run ONLY the pre-commit hook, in isolation, and see whether it is the
+        #     thing that rejects the staged delta. A nonzero exit here is positive proof
+        #     of a pre-commit rejection; a zero exit proves the commit failed for some
+        #     other reason, so we fail hard. This is not a bypass -- the commit itself
+        #     always runs with hooks intact; this only re-runs the hook to read its
+        #     verdict, and it only happens when the commit has ALREADY failed.
+        CORE_HOOK_SCRIPT="$(git rev-parse --git-path hooks/pre-commit 2>/dev/null || true)"
+        if [ -n "$CORE_HOOK_SCRIPT" ] && [ -x "$CORE_HOOK_SCRIPT" ]; then
+          set +e
+          CORE_HOOK_RERUN=$("$CORE_HOOK_SCRIPT" 2>&1)
+          CORE_HOOK_RERUN_RC=$?
+          set -e
+          if [ "$CORE_HOOK_RERUN_RC" -ne 0 ]; then
+            CORE_HOOK_EVIDENCE=pre_commit_rerun
+            CORE_COMMIT_LOG=$(printf '%s\n%s\n' "$CORE_COMMIT_LOG" "$CORE_HOOK_RERUN")
+          fi
+        fi
+      fi
+      if [ "$CORE_HOOK_EVIDENCE" = "none" ]; then
+        # No positive evidence of a pre-commit rejection -- NOT repairable by the lint
+        # pass. Do not write the hook-output file; fail hard so the caller escalates.
+        echo "COMMIT_CORE=commit_failed_non_hook" >&2
+        exit "$CORE_RC"
+      fi
+      # Positively attributed pre-commit hook rejection. Persist the hook output so the
+      # bounded commit-hook-repair pass can read exactly what to fix, then exit non-zero.
+      printf '%s\n' "$CORE_COMMIT_LOG" > "$CORE_HOOK_OUTPUT_FILE"
+      echo "COMMIT_CORE=hook_failed evidence=${CORE_HOOK_EVIDENCE}"
+      exit "$CORE_RC"
+      COMMIT_AND_PUSH_CORE_EOF
+      chmod +x "$CORE_SCRIPT" 2>/dev/null || true
       git status --short
       DIRTY=$(git status --porcelain)
       if [ -z "$DIRTY" ]; then
@@ -4048,7 +4149,38 @@ nodes:
           WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
           COMMIT_MESSAGE="feat: ${WO_ID} implementation"
         fi
-        git commit -m "$COMMIT_MESSAGE"
+        # Attempt 1 via the shared commit-core (hooks intact). On a pre-commit
+        # lint/format hook rejection, hand off to the bounded commit-hook-repair
+        # node instead of bypassing the hook or hard-failing the run here.
+        CORE_HOOK_OUTPUT_FILE="$ARTIFACTS_DIR/commit-hook-output.txt"
+        rm -f "$CORE_HOOK_OUTPUT_FILE" 2>/dev/null || true
+        set +e
+        CORE_COMMIT_MESSAGE="$COMMIT_MESSAGE" \
+        CORE_HOOK_OUTPUT_FILE="$CORE_HOOK_OUTPUT_FILE" \
+        CORE_STAGE_MODE=prestaged \
+        CORE_ATTEMPT_FILE="$ARTIFACTS_DIR/commit-hook-attempt.txt" \
+          bash "$CORE_SCRIPT"
+        CORE_RC=$?
+        set -e
+        if [ "$CORE_RC" -ne 0 ]; then
+          if [ -f "$CORE_HOOK_OUTPUT_FILE" ]; then
+            # Pre-commit lint/format hook rejected the staged delta. Persist the
+            # retry env and emit a machine-readable marker, then exit 0 so the DAG
+            # proceeds to commit-hook-repair + commit-hook-retry. commit-hook-gate
+            # fails the run closed if the one bounded repair pass does not clear it.
+            # NEVER bypass the hook.
+            {
+              printf 'UNIQUE_BRANCH=%s\n' "$UNIQUE_BRANCH"
+              printf 'COMMIT_MESSAGE=%s\n' "$COMMIT_MESSAGE"
+              printf 'REPAIR_TARGET_LEASE_SHA=%s\n' "${REPAIR_TARGET_LEASE_SHA:-}"
+            } > "$ARTIFACTS_DIR/commit-hook-env.sh"
+            echo "COMMIT_HOOK_FAILED=true"
+            echo "commit_hook_lint_failure: husky pre-commit lint/format hook rejected the staged delta (hook output at ${CORE_HOOK_OUTPUT_FILE}); bounded repair pass pending." >&2
+            exit 0
+          fi
+          echo "ERROR: commit-core failed (rc=${CORE_RC}) without a hook-output file -- not a lint/format hook rejection." >&2
+          exit "$CORE_RC"
+        fi
       fi
 
       # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
@@ -4104,10 +4236,224 @@ nodes:
       echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
       echo "unique_branch=${UNIQUE_BRANCH}"
 
+  # Commit-hook bounded repair + retry (WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01).
+  # When commit-and-push fails on the husky pre-commit lint/format hook it exits 0 with a
+  # COMMIT_HOOK_FAILED=true marker (not a hard fail), handing the run to exactly ONE bounded
+  # repair pass that fixes only the reported lint/format errors and re-runs the SAME shared
+  # commit-core once. A second failure dead-ends at commit-hook-gate, which fails the run
+  # closed (load_bearing). Hooks are NEVER bypassed. This reuses the opus-repair OPUS_REPAIR
+  # sentinel + classify idiom; it does not invent a parallel mechanism.
+  - id: classify-commit-hook
+    depends_on: [commit-and-push]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      CP=$(cat "$ARCHON_NODE_OUT/commit-and-push.out" 2>/dev/null || true)
+      if printf '%s\n' "$CP" | grep -q '^COMMIT_HOOK_FAILED=true'; then
+        printf '{"hook_failed":"true"}\n'
+      else
+        printf '{"hook_failed":"false"}\n'
+      fi
+
+  - id: commit-hook-repair
+    provider: codex
+    model: gpt-5.6-sol
+    depends_on: [classify-commit-hook]
+    trigger_rule: all_done
+    when: "$classify-commit-hook.output.hook_failed == 'true'"
+    prompt: |
+      commit-and-push failed because the husky pre-commit hook (lint-staged running
+      eslint/prettier) rejected the staged change. You get ONE bounded repair pass.
+      Fix ONLY the specific lint/format errors the hook reported, in the files it
+      named, in THIS worktree. Do NOT touch unrelated files, do NOT weaken, relax, or
+      disable any lint/format rule, and NEVER bypass the pre-commit hook in any way
+      (no commit hook-skip flag, no hook-disabling env var, no hooks-path override).
+
+      ## Hook output (the exact errors to fix)
+      Read the captured hook output from the run artifacts directory:
+        cat "$ARTIFACTS_DIR/commit-hook-output.txt"
+
+      ## What was being committed (context)
+      $block-reclassify.output
+
+      ## Output (last lines, STDOUT only)
+      - If you fixed the reported lint/format errors in this worktree:
+          OPUS_REPAIR=fixed
+      - If you could NOT fix them and a human must decide:
+          OPUS_REPAIR=needs-human
+          REASON=<one sentence>
+
+  - id: classify-commit-hook-repair
+    depends_on: [commit-hook-repair]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      OPUS=$(cat <<'BDC_FEATURE_DEV_COMMIT_HOOK_REPAIR_SENTINEL_20261014'
+      $commit-hook-repair.output
+      BDC_FEATURE_DEV_COMMIT_HOOK_REPAIR_SENTINEL_20261014
+      )
+      if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed'; then
+        printf '{"fixed":"true"}\n'
+      else
+        printf '{"fixed":"false"}\n'
+      fi
+
+  - id: commit-hook-retry
+    persona: overseer
+    depends_on: [classify-commit-hook-repair]
+    trigger_rule: all_done
+    when: "$classify-commit-hook-repair.output.fixed == 'true'"
+    bash: |
+      set -uo pipefail
+      CORE_SCRIPT="$ARTIFACTS_DIR/commit-and-push-core.sh"
+      ENV_FILE="$ARTIFACTS_DIR/commit-hook-env.sh"
+      HOOK_OUT="$ARTIFACTS_DIR/commit-hook-output.txt"
+      if [ ! -f "$CORE_SCRIPT" ] || [ ! -f "$ENV_FILE" ]; then
+        echo "ERROR: commit-hook-retry: missing shared core script or env (no attempt-1 hook failure)." >&2
+        exit 1
+      fi
+      UNIQUE_BRANCH=$(sed -n 's/^UNIQUE_BRANCH=//p' "$ENV_FILE" | head -n 1)
+      COMMIT_MESSAGE=$(sed -n 's/^COMMIT_MESSAGE=//p' "$ENV_FILE" | head -n 1)
+      REPAIR_TARGET_LEASE_SHA=$(sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' "$ENV_FILE" | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ] || [ -z "$COMMIT_MESSAGE" ]; then
+        echo "ERROR: commit-hook-retry: UNIQUE_BRANCH or COMMIT_MESSAGE missing from env." >&2
+        exit 1
+      fi
+      # Attempt 2: re-run the SAME shared commit-core (hooks intact). The one repair
+      # pass edited only in-scope files already reviewed upstream, so stage all + commit.
+      set +e
+      CORE_COMMIT_MESSAGE="$COMMIT_MESSAGE" \
+      CORE_HOOK_OUTPUT_FILE="$HOOK_OUT" \
+      CORE_STAGE_MODE=all \
+      CORE_ATTEMPT_FILE="$ARTIFACTS_DIR/commit-hook-attempt.txt" \
+        bash "$CORE_SCRIPT"
+      CORE_RC=$?
+      set -e
+      if [ "$CORE_RC" -ne 0 ]; then
+        RETRY_ATTEMPT=$(tr -dc '0-9' < "$ARTIFACTS_DIR/commit-hook-attempt.txt" 2>/dev/null | head -c 3)
+        case "$RETRY_ATTEMPT" in ''|*[!0-9]*) RETRY_ATTEMPT=2;; esac
+        if [ "$RETRY_ATTEMPT" -lt 2 ]; then RETRY_ATTEMPT=2; fi
+        echo "COMMIT_HOOK_RETRY=hook_failed_again"
+        # Exit 0 on purpose: commit-hook-gate is the single load_bearing consolidation
+        # point for BOTH commit paths and fails the run closed. Stamp the class + real
+        # attempt count here too so the attempt-2 rejection is attributable in this
+        # node's own log, not only in the gate's.
+        echo "commit_hook_lint_failure: the one bounded repair pass did not clear the pre-commit hook (commit_hook_attempt=${RETRY_ATTEMPT}); commit-hook-gate will fail the run closed." >&2
+        echo "ERROR: commit-hook-retry: the one bounded repair pass did not clear the hook; commit-hook-gate will escalate." >&2
+        exit 0
+      fi
+      # Committed with hooks passing. Push + verify durability.
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+          if git push --force-with-lease="refs/heads/${UNIQUE_BRANCH}:${REPAIR_TARGET_LEASE_SHA}" origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then PUSH_OK=true; break; fi
+        else
+          if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then PUSH_OK=true; break; fi
+        fi
+        echo "WARN: commit-hook-retry push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: commit-hook-retry: git push failed after 3 attempts." >&2
+        exit 1
+      fi
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      LOCAL_HEAD="$(git rev-parse HEAD)"
+      if [ "$REMOTE_HEAD" != "$LOCAL_HEAD" ]; then
+        echo "FATAL: commit-hook-retry: ${UNIQUE_BRANCH} not durably pushed (origin=${REMOTE_HEAD:-<absent>} local=${LOCAL_HEAD})" >&2
+        exit 1
+      fi
+      echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
+      echo "COMMIT_HOOK_RETRY=committed"
+      echo "unique_branch=${UNIQUE_BRANCH}"
+      if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+        echo "REPAIR_TARGET_LEASE_SHA=$(git rev-parse HEAD)"
+      fi
+
+  # commit-hook-gate: consolidates the two commit paths and is the load_bearing
+  # success invariant for the commit. Passes through unique_branch from whichever
+  # attempt committed+pushed. If NEITHER landed (hook unrepaired after one bounded
+  # pass, or repair said needs-human), it fails the run closed AND -- when the
+  # builder already opened a PR for this run branch -- converts that PR to draft and
+  # comments that the repair delta was NOT pushed and in-run findings are unresolved,
+  # so an unrepaired head is never merged as if the run passed.
+  - id: commit-hook-gate
+    persona: overseer
+    depends_on: [commit-and-push, classify-commit-hook, commit-hook-retry]
+    trigger_rule: all_done
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      CP=$(cat "$ARCHON_NODE_OUT/commit-and-push.out" 2>/dev/null || true)
+      RETRY=$(cat "$ARCHON_NODE_OUT/commit-hook-retry.out" 2>/dev/null || true)
+      # Path 1: commit-and-push committed + pushed on the first attempt (no hook failure).
+      CP_BRANCH=$(printf '%s\n' "$CP" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -n "$CP_BRANCH" ]; then
+        printf '%s\n' "$CP" | grep -E '^(unique_branch=|REPAIR_TARGET_LEASE_SHA=)' || true
+        echo "COMMIT_HOOK_GATE=passed_first_attempt"
+        exit 0
+      fi
+      # Path 2: the one bounded repair pass fixed it and the retry committed + pushed.
+      RETRY_BRANCH=$(printf '%s\n' "$RETRY" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if printf '%s\n' "$RETRY" | grep -q '^COMMIT_HOOK_RETRY=committed' && [ -n "$RETRY_BRANCH" ]; then
+        printf '%s\n' "$RETRY" | grep -E '^(unique_branch=|REPAIR_TARGET_LEASE_SHA=)' || true
+        echo "COMMIT_HOOK_GATE=passed_after_repair"
+        exit 0
+      fi
+      # Failure: the commit never landed. Draft the PR (if any) so it cannot be merged.
+      echo "COMMIT_HOOK_GATE=failed" >&2
+      # Classify THIS dead end for the overseer before failing. The attempt-2 hook
+      # rejection never surfaces from commit-and-push (that node exits 0 with the
+      # COMMIT_HOOK_FAILED=true handoff marker), so this gate is the only place that
+      # can report it. Emit the class token + the real attempt count, and emit them
+      # ONLY on positive evidence that commit-and-push actually reported a pre-commit
+      # hook rejection -- a gate failure from any other cause must NOT be labelled a
+      # lint failure (it is still escalated: the gate is load_bearing with no retry
+      # path, which the overseer treats as a blocker on its own).
+      HOOK_PATH_FAILURE=false
+      if printf '%s\n' "$CP" | grep -q '^COMMIT_HOOK_FAILED=true'; then
+        HOOK_PATH_FAILURE=true
+      fi
+      # Real attempt count = how many times commit-core actually ran `git commit`,
+      # recorded by the core itself. Floor it at 2: this branch is only reachable
+      # after the one bounded repair opportunity is spent (the retry failed, or the
+      # repair said needs-human and the retry was skipped), so the bounded budget is
+      # exhausted by construction even when the counter file is unreadable.
+      HOOK_ATTEMPT=$(tr -dc '0-9' < "$ARTIFACTS_DIR/commit-hook-attempt.txt" 2>/dev/null | head -c 3)
+      case "$HOOK_ATTEMPT" in ''|*[!0-9]*) HOOK_ATTEMPT=2;; esac
+      if [ "$HOOK_ATTEMPT" -lt 2 ]; then HOOK_ATTEMPT=2; fi
+      ENV_FILE="$ARTIFACTS_DIR/commit-hook-env.sh"
+      BRANCH=$(sed -n 's/^UNIQUE_BRANCH=//p' "$ENV_FILE" 2>/dev/null | head -n 1)
+      DECIDE=$(cat "$ARCHON_NODE_OUT/decide-push-target.out" 2>/dev/null || true)
+      REPO=$(printf '%s\n' "$DECIDE" | tr -d '`' | sed -n 's/^[[:space:]]*repo:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
+      DIFF_FINAL=$(cat <<'BDC_FEATURE_DEV_GATE_DIFF_FINAL_20261014'
+      $diff-review-final.output
+      BDC_FEATURE_DEV_GATE_DIFF_FINAL_20261014
+      )
+      UNRESOLVED=$(printf '%s\n' "$DIFF_FINAL" | sed -n '/UNRESOLVED/,$p' | head -n 20)
+      if [ -n "$BRANCH" ] && printf '%s\n' "$REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+        PR_NUM=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        if printf '%s\n' "$PR_NUM" | grep -Eq '^[0-9]+$'; then
+          gh pr ready "$PR_NUM" --undo --repo "$REPO" 2>&1 || true
+          COMMENT="This run's commit-hook repair delta was NOT pushed: the husky pre-commit lint/format hook rejected the commit and the one bounded repair pass did not clear it. In-run review findings are unresolved, so this head must not be merged as if the run passed."
+          if [ -n "$UNRESOLVED" ]; then
+            COMMENT="$(printf '%s\n\nUnresolved from diff-review-final:\n%s\n' "$COMMENT" "$UNRESOLVED")"
+          fi
+          gh pr comment "$PR_NUM" --repo "$REPO" --body "$COMMENT" 2>&1 || true
+        fi
+      fi
+      if [ "$HOOK_PATH_FAILURE" = "true" ]; then
+        echo "commit_hook_lint_failure: the husky pre-commit lint/format hook rejected the commit and the one bounded repair pass did not clear it (commit_hook_attempt=${HOOK_ATTEMPT}); operator triage required." >&2
+        echo "ERROR: commit-and-push failed on the pre-commit lint/format hook and the one bounded repair pass did not clear it; failing the run (load_bearing)." >&2
+      else
+        echo "ERROR: commit-hook-gate: neither commit-and-push nor commit-hook-retry produced a pushed branch, and commit-and-push reported no pre-commit hook rejection; failing the run (load_bearing)." >&2
+      fi
+      exit 1
+
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
     persona: major-build
-    depends_on: [commit-and-push]
+    depends_on: [commit-hook-gate]
     task_class: clerical
     load_bearing: true
     bash: |
@@ -4135,7 +4481,10 @@ nodes:
       $war-council-validator.output
       BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023
       )
-      COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")
+      # WO-HARNESS-OVERSEER-NODE-FAILURE-REPAIR-AND-ESCALATION-01: read the commit
+      # ground truth from commit-hook-gate, which passes through unique_branch +
+      # REPAIR_TARGET_LEASE_SHA from whichever attempt (first or post-repair) landed.
+      COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-hook-gate.out")
       if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0

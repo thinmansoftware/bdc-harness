@@ -32,6 +32,17 @@ export { parseM31ActionPermit, permitFromMetadata } from './permit';
 export { buildDispatchRunReportBody, runEscalation } from './escalate';
 export type { EscalationContext, EscalationSourceEvent } from './escalate';
 export {
+  BLOCKER_ERROR_CLASSES,
+  bdcXoSubjectKeyForRun,
+  buildNodeFailureNotifyBody,
+  deriveBdcXoIssueNumber,
+  firstRedactedErrorLine,
+  isAlwaysBlockerClass,
+  notifyNodeFailureEscalation,
+  redactSecretsFromErrorLine,
+} from './node-failure-notify';
+export type { NodeFailureNotifyDeps, NodeFailureNotifyInput } from './node-failure-notify';
+export {
   buildOperatorCard,
   canonicalizeActionableEvent,
   deriveOperatorCardId,

@@ -46,7 +46,10 @@ function output(
   findings: unknown[] = [],
   head = HEAD_A
 ): string {
-  return JSON.stringify({ verdict, findings, reviewed_head_sha: head });
+  // `verification` is now a REQUIRED judge field (WO node-failure-repair). These
+  // baseline cases are all genuine, verified verdicts; the unverified paths are
+  // exercised explicitly below.
+  return JSON.stringify({ verdict, findings, reviewed_head_sha: head, verification: 'verified' });
 }
 
 function deps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {
@@ -686,5 +689,117 @@ describe('cursor judge rung', () => {
         output('REQUEST_CHANGES', [{ scope: 'a.ts', severity: 'major', summary: 'x' }])
       )?.verdict
     ).toBe('REQUEST_CHANGES');
+  });
+});
+
+describe('WO node-failure-repair: judge verification field', () => {
+  const approve = (verification: unknown, reason?: string, findings: unknown[] = []): string =>
+    JSON.stringify({
+      verdict: 'APPROVE',
+      findings,
+      reviewed_head_sha: HEAD_A,
+      ...(verification === undefined ? {} : { verification }),
+      ...(reason === undefined ? {} : { verification_reason: reason }),
+    });
+
+  test('16 verified APPROVE parses as APPROVE', () => {
+    expect(parseReviewVerdict(approve('verified'))?.verdict).toBe('APPROVE');
+  });
+
+  test('16 unverified APPROVE parses as APPROVE_UNVERIFIED carrying the reason', () => {
+    const parsed = parseReviewVerdict(approve('unverified', 'sandbox did not start'));
+    expect(parsed?.verdict).toBe('APPROVE_UNVERIFIED');
+    expect(parsed?.verification_reason).toBe('sandbox did not start');
+  });
+
+  test('16 an absent verification key yields null (invalid output, next rung)', () => {
+    expect(parseReviewVerdict(approve(undefined))).toBeNull();
+  });
+
+  test('16 an invalid verification value yields null', () => {
+    expect(parseReviewVerdict(approve('maybe'))).toBeNull();
+  });
+
+  test('16 unverified APPROVE with no reason yields null', () => {
+    expect(parseReviewVerdict(approve('unverified'))).toBeNull();
+  });
+
+  test('17 a sandbox-failure note forces APPROVE_UNVERIFIED even when judge says verified', () => {
+    const note = {
+      scope: 'Validation',
+      severity: 'note',
+      summary:
+        'Local inspection and test execution were unavailable because the execution sandbox failed to start; the exact checkout SHA could not be independently verified',
+    };
+    const parsed = parseReviewVerdict(approve('verified', undefined, [note]));
+    expect(parsed?.verdict).toBe('APPROVE_UNVERIFIED');
+  });
+
+  test('17 an ordinary style note on a verified APPROVE stays APPROVE', () => {
+    const note = {
+      scope: 'format.ts',
+      severity: 'note',
+      summary: 'Consider renaming this helper for clarity; purely stylistic.',
+    };
+    expect(parseReviewVerdict(approve('verified', undefined, [note]))?.verdict).toBe('APPROVE');
+  });
+
+  test.each([
+    ['Validation', 'Consider documenting the sandbox configuration.'],
+    ['Validation', 'Consider documenting sandbox cleanup after the review.'],
+    ['sandbox.ts', 'Consider renaming this helper for clarity.'],
+    ['sandbox.ts', 'Failed to start.'],
+    ['checkout.ts', 'Could not be independently verified.'],
+    ['Validation', 'The sandbox initialized successfully and tests passed.'],
+    ['Validation', 'Independent checkout inspection and test execution succeeded.'],
+    ['Availability', 'The service is unavailable because scheduled maintenance is active.'],
+    ['Shipping', 'The customer address could not be independently verified.'],
+  ])('verified ordinary finding stays APPROVE: %s / %s', async (scope, summary) => {
+    const stdout = approve('verified', undefined, [{ scope, summary, severity: 'note' }]);
+    expect(parseReviewVerdict(stdout)?.verdict).toBe('APPROVE');
+    const result = await evaluatePullRequest(
+      input,
+      deps({ invokeModel: async () => ({ exitCode: 0, timedOut: false, stdout }) })
+    );
+    expect(result.verdict).toBe('APPROVE');
+    expect(result.reviewed_head_sha).toBe(HEAD_A);
+  });
+
+  test.each([
+    ['Exact checkout SHA', 'Could not be independently verified.'],
+    ['Sandbox', 'Failed to start.'],
+  ])('split review execution failure stays held: %s / %s', async (scope, summary) => {
+    const stdout = approve('verified', undefined, [{ scope, summary, severity: 'note' }]);
+    expect(parseReviewVerdict(stdout)?.verdict).toBe('APPROVE_UNVERIFIED');
+    const result = await evaluatePullRequest(
+      input,
+      deps({ invokeModel: async () => ({ exitCode: 0, timedOut: false, stdout }) })
+    );
+    expect(result.verdict).toBe('APPROVE_UNVERIFIED');
+    expect(result.reviewed_head_sha).toBe(HEAD_A);
+  });
+
+  test.each([
+    'The execution sandbox failed to start.',
+    'Independent local inspection and test execution were unavailable because the sandbox could not initialize.',
+    'Sandbox initialization failed.',
+    'The execution sandbox was unavailable.',
+    'Unable to inspect the checkout.',
+    'Unable to verify the exact head SHA.',
+    'Unable to execute tests.',
+    'Test execution was unavailable.',
+    'Tests could not be executed.',
+    'The exact checkout SHA could not be independently verified.',
+  ])('explicit review execution failure stays held: %s', async summary => {
+    const stdout = approve('verified', undefined, [
+      { scope: 'Validation', summary, severity: 'note' },
+    ]);
+    expect(parseReviewVerdict(stdout)?.verdict).toBe('APPROVE_UNVERIFIED');
+    const result = await evaluatePullRequest(
+      input,
+      deps({ invokeModel: async () => ({ exitCode: 0, timedOut: false, stdout }) })
+    );
+    expect(result.verdict).toBe('APPROVE_UNVERIFIED');
+    expect(result.reviewed_head_sha).toBe(HEAD_A);
   });
 });

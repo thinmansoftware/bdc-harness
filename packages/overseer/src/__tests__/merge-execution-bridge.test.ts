@@ -1162,3 +1162,243 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(body).toContain('policy thinmansoftware/bdc-harness:dev');
   });
 });
+
+describe('merge execution bridge -- unverified approval defense in depth (WO node-failure-repair)', () => {
+  const flagReadyVerdict = (
+    id: string,
+    head = 'judged-sha',
+    runId = `run-${id}`
+  ): OverseerVerdictRow =>
+    ({
+      id,
+      run_id: runId,
+      wo_id: 'WO-TEST',
+      head_sha: head,
+      proposed_action: 'flag_merge_ready',
+      verdict: 'merge_candidate',
+    }) as OverseerVerdictRow;
+
+  const unverifiedVerdict = (
+    id: string,
+    head = 'judged-sha',
+    runId = `run-${id}`
+  ): OverseerVerdictRow =>
+    ({
+      id,
+      run_id: runId,
+      wo_id: 'WO-TEST',
+      head_sha: head,
+      proposed_action: 'none',
+      verdict: 'approved_unverified',
+    }) as OverseerVerdictRow;
+
+  test('19 a flag_merge_ready verdict whose SAME-PR head has an approved_unverified record is skipped', async () => {
+    // Both verdicts belong to the SAME pull request (same run_id) and head: the
+    // unverified approval must suppress the merge-ready verdict.
+    const sharedRun = 'pr-discovery:thinmansoftware/bdc-harness#19';
+    const h = harness([
+      flagReadyVerdict('fmr', 'judged-sha', sharedRun),
+      unverifiedVerdict('unv', 'judged-sha', sharedRun),
+    ]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    for (const o of h.outcomes) {
+      expect(o.reason).toBe('approval_unverified');
+      expect(o.mutationSent).toBe(false);
+    }
+    // Both rows were processed and skipped.
+    expect(h.outcomes.map(o => o.verdictId).sort()).toEqual(['fmr', 'unv']);
+  });
+
+  test('19 a DIFFERENT PR sharing the same commit SHA is NOT suppressed (merges)', async () => {
+    // Regression for the head-only defense: an unverified approval on one PR (run
+    // 'run-unv') must not suppress a verified merge-ready verdict on a DIFFERENT PR
+    // ('run-fmr') that happens to share the same head SHA. Keyed on
+    // (run_id, head_sha), these do not collide, so the verified verdict still merges.
+    const h = harness([flagReadyVerdict('fmr'), unverifiedVerdict('unv')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    // The verified verdict merges exactly once; only the bare unverified row is skipped.
+    expect(h.merges).toBe(1);
+    expect(h.outcomes.some(o => o.verdictId === 'fmr' && o.reason === 'merge_executed')).toBe(true);
+    expect(h.outcomes.some(o => o.verdictId === 'unv' && o.reason === 'approval_unverified')).toBe(
+      true
+    );
+  });
+
+  test('19 a bare approved_unverified verdict is skipped with approval_unverified, no merge', async () => {
+    const h = harness([unverifiedVerdict('unv-only')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.outcomes).toHaveLength(1);
+    expect(h.outcomes[0]?.reason).toBe('approval_unverified');
+  });
+
+  test('20 a verified flag_merge_ready verdict still merges exactly once', async () => {
+    const h = harness([flagReadyVerdict('verified')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(h.outcomes.some(o => o.reason === 'approval_unverified')).toBe(false);
+    expect(h.outcomes.some(o => o.reason === 'merge_executed')).toBe(true);
+  });
+});
+
+/**
+ * Post-claim re-check of the unverified-approval hold.
+ *
+ * The bridge builds its verdict list (and its unverified-approval key set) BEFORE
+ * claiming. recordUnverifiedApprovalVerdict can downgrade an existing
+ * flag_merge_ready row to approved_unverified/none inside that window, which left
+ * the bridge holding a stale in-memory flag_merge_ready verdict it would merge
+ * while the row was rewritten underneath it. The bridge therefore re-reads the run's
+ * rows AFTER the claim (the claim is the serialization point) and fails closed.
+ */
+describe('merge execution bridge -- unverified hold re-checked after claim', () => {
+  const SHARED_RUN = 'pr-discovery:thinmansoftware/bdc-harness#31';
+
+  const readyRow = (id: string, head = 'judged-sha', runId = SHARED_RUN): OverseerVerdictRow =>
+    ({
+      id,
+      run_id: runId,
+      wo_id: 'WO-TEST',
+      head_sha: head,
+      proposed_action: 'flag_merge_ready',
+      verdict: 'merge_candidate',
+    }) as OverseerVerdictRow;
+
+  const downgradedRow = (id: string, head = 'judged-sha', runId = SHARED_RUN): OverseerVerdictRow =>
+    ({
+      id,
+      run_id: runId,
+      wo_id: 'WO-TEST',
+      head_sha: head,
+      proposed_action: 'none',
+      verdict: 'approved_unverified',
+    }) as OverseerVerdictRow;
+
+  /** Harness whose fresh per-run read can differ from the pre-claim snapshot. */
+  function raceHarness(
+    snapshot: OverseerVerdictRow[],
+    freshAfterClaim: () => OverseerVerdictRow[] | Error
+  ) {
+    const base = harness(snapshot);
+    let claimed = false;
+    const store: MergeExecutionBridgeStore = {
+      ...base.store,
+      claimVerdict: async (verdictId: string) => {
+        const ok = await base.store.claimVerdict(verdictId);
+        if (ok) claimed = true;
+        return ok;
+      },
+      getVerdictsForRun: async () => {
+        // Before the claim the DB still matches the snapshot; the downgrade is only
+        // visible once the claim has serialized us behind it.
+        const rows = claimed ? freshAfterClaim() : snapshot;
+        if (rows instanceof Error) throw rows;
+        return rows;
+      },
+    };
+    // NOTE: do not spread `base` -- its `merges`/`approvals` are getters and a
+    // spread would snapshot them to 0. Delegate instead.
+    return {
+      store,
+      github: base.github,
+      outcomes: base.outcomes,
+      claimReleases: base.claimReleases,
+      get merges() {
+        return base.merges;
+      },
+      get approvals() {
+        return base.approvals;
+      },
+    };
+  }
+
+  test('31 a row downgraded to approved_unverified after the snapshot is NOT merged', async () => {
+    // The snapshot says flag_merge_ready (what the old code would have merged);
+    // the fresh post-claim read shows the row was downgraded to the held state.
+    const h = raceHarness([readyRow('raced')], () => [downgradedRow('raced')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.outcomes).toHaveLength(1);
+    expect(h.outcomes[0]?.verdictId).toBe('raced');
+    expect(h.outcomes[0]?.reason).toBe('approval_unverified');
+    expect(h.outcomes[0]?.mutationSent).toBe(false);
+  });
+
+  test('31 a sibling approved_unverified row inserted after the snapshot suppresses the merge', async () => {
+    // The held row has proposed_action 'none', so listUnactionedVerdicts (which
+    // filters to flag_merge_ready) can never surface it -- only the fresh per-run
+    // read sees it. Same PR (same run_id) and same head.
+    const h = raceHarness([readyRow('fmr')], () => [readyRow('fmr'), downgradedRow('held')]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('approval_unverified');
+  });
+
+  test('31 a sibling held row on a DIFFERENT head does not suppress the merge', async () => {
+    // run-<id> run ids here: the harness resolves the watch run by stripping that
+    // prefix, and the merge path needs a resolvable run.
+    const h = raceHarness([readyRow('fmr', 'judged-sha', 'run-fmr')], () => [
+      readyRow('fmr', 'judged-sha', 'run-fmr'),
+      downgradedRow('held', 'other-sha', 'run-fmr'),
+    ]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(h.outcomes.some(o => o.reason === 'merge_executed')).toBe(true);
+  });
+
+  test('31 an unchanged row still merges exactly once (re-check is not a blanket block)', async () => {
+    const h = raceHarness([readyRow('clean', 'judged-sha', 'run-clean')], () => [
+      readyRow('clean', 'judged-sha', 'run-clean'),
+    ]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(h.outcomes.some(o => o.reason === 'merge_executed')).toBe(true);
+    expect(h.outcomes.some(o => o.reason === 'approval_unverified')).toBe(false);
+  });
+
+  test('31 a failing re-check fails CLOSED (no merge) rather than trusting the snapshot', async () => {
+    const h = raceHarness([readyRow('unreadable')], () => new Error('db unavailable'));
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.outcomes).toHaveLength(1);
+    expect(h.outcomes[0]?.reason).toBe('approval_unverified_recheck_unavailable');
+    expect(h.outcomes[0]?.mutationSent).toBe(false);
+  });
+});
