@@ -110,19 +110,21 @@ rootLogger.level='silent';
 console.log=console.info=console.warn=console.error=console.debug=()=>{};
 let intercepted=0,threads=0,optionsVerified=false,threadOptionsVerified=false,importIntercepted=false;
 let accepted=false,normalProviderEnd=false,bytesBase64=null;
+let phase='resolve',errorName=null,errorCode=null;
 const counts={};
 const controller=new AbortController();
 const timer=setTimeout(()=>controller.abort(),25000);
 try {
- const {createRequire}=await import('node:module');
  const {isDeepStrictEqual}=await import('node:util');
  const {mock}=await import('bun:test');
- const require=createRequire('/app/packages/providers/package.json');
- const sdkPath=require.resolve('@openai/codex-sdk');
+ const sdkPath=import.meta.resolve('@openai/codex-sdk','file:///app/packages/providers/src/codex/provider.ts');
+ phase='real-import';
  const real=await import(sdkPath);
+ const RealCodex=real.Codex;
+ phase='policy-options';
  const {restrictedClientOptions,restrictedThreadOptions}=await import('/app/packages/providers/src/codex/restricted-policy.ts');
  const expected=restrictedClientOptions('teetime-connect-v1');
- class FixtureCodex extends real.Codex {
+ class FixtureCodex extends RealCodex {
   constructor(options) {
    if(!isDeepStrictEqual(options,expected)) throw new Error('unexpected original options');
    const {HTTP_PROXY,HTTPS_PROXY,...env}=options.env;
@@ -139,11 +141,15 @@ try {
    return super.startThread(options);
   }
  }
+ phase='mock-install';
  mock.module(sdkPath,()=>({...real,Codex:FixtureCodex}));
+ phase='import-verify';
  importIntercepted=(await import(sdkPath)).Codex===FixtureCodex;
  if(!importIntercepted) throw new Error('SDK import was not intercepted');
+ phase='factory-import';
  const {createRestrictedCanaryWorkerProvider}=await import('/app/packages/providers/src/codex/restricted-run-factory.ts');
  const {collectArtifactStream}=await import('/app/scripts/staging/teetime-artifact-stream.ts');
+ phase='factory-construct';
  const provider=createRestrictedCanaryWorkerProvider({runId:'artifact-fixture-run',policyDigest:FIXTURE_POLICY,workspace:'/workspace'});
  async function* observed() {
   for await(const chunk of provider.sendQuery('Synthetic infrastructure fixture. Return one JSON artifact message only. Do not use tools or modify any files.','/workspace',undefined,{abortSignal:controller.signal})) {
@@ -153,16 +159,20 @@ try {
   }
   normalProviderEnd=true;
  }
+ phase='collect';
  const bytes=await collectArtifactStream(observed(),controller.signal);
  bytesBase64=Buffer.from(bytes).toString('base64');
  accepted=true;
-} catch {
+ phase='complete';
+} catch(error) {
+ errorName=['Error','TypeError','SyntaxError','ResolveMessage'].includes(error?.name)?error.name:'other';
+ errorCode=['MODULE_NOT_FOUND','ERR_MODULE_NOT_FOUND','ERR_PACKAGE_PATH_NOT_EXPORTED'].includes(error?.code)?error.code:null;
  controller.abort();
 } finally {clearTimeout(timer);}
 const abortedBeforeCleanup=controller.signal.aborted;
 controller.abort();
 emit(JSON.stringify({accepted,bytesBase64,intercepted,threads,optionsVerified,threadOptionsVerified,
- importIntercepted,normalProviderEnd,counts,abortedBeforeCleanup})+'\n');
+ importIntercepted,normalProviderEnd,counts,abortedBeforeCleanup,phase,errorName,errorCode})+'\n');
 '''
 bootstrap = 'const FIXTURE_URL='+json.dumps(url)+';\nconst FIXTURE_POLICY='+json.dumps(binding['policyHash'])+';\n'+code
 try:

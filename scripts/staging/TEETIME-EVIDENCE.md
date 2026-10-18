@@ -234,3 +234,47 @@ it must not be inferred from unit tests or the prior filesystem canary. No
 authenticated request, materializer, registration or workflow activation is
 performed by these helpers. The source-data contract remains unqualified until
 its exact reviewed runtime evidence is accepted separately.
+
+The first Linux success case at b1978e69 failed before SDK construction or any
+HTTP request. Evidence: teetime-fs-6c00314aad99/result.json, image
+sha256:f1c3f260bc750e68b69a8439e1b80e59cd1a92e195392811e43e320cdfa9c2fe.
+Cleanup passed; auth/workspace remained unchanged. No duplicate case was run.
+Exact-source hosted CI39130185734 passed separately. An import-only local check
+reproduced MODULE_NOT_FOUND from CommonJS resolution of the import-only SDK;
+ES-module resolution loaded the actual Codex constructor. The fixture now uses
+that resolution and fixed initialization phases/allowlisted error categories.
+No raw errors, stacks or environment values are emitted. Another runtime run
+requires separately reviewed source and exact CI; the failed case is retained.
+
+## Trusted complete-candidate transfer candidate
+
+The next source-only slice is teetime_materialization_frame.py and
+teetime_materializer.py. It is not connected to dispatch or publication.
+encode_frame/decode_frame use a canonical ASCII JSON frame, at most12 MiB,
+with strict duplicate/field/type/base64 validation. Complete candidate files
+remain bounded to128 files,1 MiB/file and8 MiB total. Encoder and decoder
+independently recompute manifest SHA-256 and Git tree identity, comparing both
+against trusted controller inputs. Binary files and executable modes survive.
+
+The Linux UID1001 writer reads bounded stdin, validates all records first, then
+requires a new empty owned root. It creates descriptor-relative nofollow/exclusive
+files, handles short writes, sets modes explicitly and fsyncs files/directories.
+It never reads model workspace files. Any failure invalidates the entire volume;
+the caller must discard it, never resume partial materialization. No cleanup or
+exclusive writer custody is established by this helper itself.
+
+Fixed future worker invocation (not a runtime admission command):
+
+```text
+python3 -I /app/scripts/staging/teetime_materializer.py --manifest-hash <trusted-sha256> --source-tree <trusted-git-tree> < complete-candidate-frame.json
+```
+
+The source root is fixed to /candidate. There is no arbitrary root, executable,
+test command, dependency installation, model call or repository publication.
+Required tests are test_teetime_materialization_frame.py (pure) and
+test_teetime_materializer.py (Linux UID1001; skips do not qualify it).
+
+STOP POINT: a separately reviewed lifecycle must remove the normally exited
+sole writable container and verify all volume references before readonly testing.
+The fixed test-worker command/output, actual EROFS write denial, independent
+before/after complete identities and bounded receipts are not implemented here.
