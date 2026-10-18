@@ -537,3 +537,59 @@ repository head. Parent existence/type/membership and relationship to frozen
 RunAuthority.baseSha are unverified trusted-controller obligations. Input custody,
 authority, reviewer wire, ReviewBinding.headCommit adoption, publication/ref update,
 atomic approval consumption, policy and workflow admission remain unchanged.
+
+## Fixed authenticated-artifact helper preparation (no auth run)
+
+First source slice only: teetime-fixed-artifact.ts constructs the fixed canary
+contract from one32-hex controller nonce and64-hex reviewed policy hash, then
+reuses the existing collector/lifecycle. Its single prompt includes the entire
+expected JSON byte string. Only exactly equal UTF-8 bytes may enter the sanitized
+result's artifactBase64. Rejected raw text, thinking and exception strings are
+discarded. No trimming, extraction, fencing or serialization repair is allowed.
+All canonical bytes are ASCII; the artifact has no trailing newline. Keys are:
+version,binding,operations; binding uses runId,nodeId,attempt,authorityHash,
+policyHash,baseManifestHash; its write uses action,path,baseHash,mode,content.
+The standard JSON string escape for the fixed content's LF is part of the bytes.
+
+The fixed fixture has the same trusted data.bin/executable src/run.sh base and
+one index.html write as the joined test. RunId is teetime-artifact-<nonce>;
+authorityHash is synthetic. This exact-byte restriction qualifies only a fixed
+compliance canary, not the general artifact parser or application generation.
+
+teetime-fixed-artifact-task.ts accepts only the nonce, reads the actual trusted
+policy file, silences diagnostics before dynamic provider initialization, creates
+one restricted canary factory and runs the fixed helper with the existing90-second
+task deadline. Iterator closure clears the deadline; closed iterators are never
+aborted afterward. Invalid invocation fails before policy/provider access. Results
+exit0 only when the task passes. This entrypoint is not yet selected by a launcher.
+
+Python teetime_fixed_artifact.py independently derives the canonical artifact.
+validate_task_result requires actual exit0, bounded strict result JSON, canonical
+base64, exactly one query/assistant/result, natural completion, closed iterator,
+no abort and exact expected bytes. It then uses the existing strict artifact parser
+against independent base/binding/capabilities and checks all expected files.
+Separate validate_wrapper_evidence accepts only actual wrapper observations:
+unchanged nonempty auth bytes, unchanged workspace and six preflight checks.
+Those observations are NOT taken from task booleans. Actual filesystem custody,
+preflight and launcher enforcement remain unimplemented by these pure helpers.
+
+Plan/preflight: preserve the old filesystem task and authenticated lifecycle;
+build/test helpers first, integrate one closed launcher selector separately later.
+Both missing-helper RED tests and missing-entrypoint RED were observed. GREEN7
+TS tests/72 assertions and5 Python tests include independent cross-language byte
+comparison, exact/altered/reformatted/duplicate/missing/exception/abort outcomes,
+invalid entrypoint and separate auth/workspace/preflight rejection. Full scripts
+typecheck, helper/entry lint and source formatting passed locally.
+
+```text
+bun test ./scripts/staging/teetime-fixed-artifact.test.ts
+python -m unittest discover -s scripts/staging -p test_teetime_fixed_artifact.py
+```
+
+STOP POINT: no credential copying, new authentication, launcher selection,
+materialization after auth, live model compliance, reviewer call, policy or workflow
+admission is implemented or qualified by this helper slice. Both source review
+and exact-source CI are required before any later integration/rehearsal review.
+Independent architect final review approved source publication/CI with no blocking
+correction. servedModelVerified remains false and wrapper evidence remains a
+runtime obligation until the separately reviewed launcher selector is implemented.
