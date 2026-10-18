@@ -408,3 +408,40 @@ production provider, acceptance criteria and budgets are unchanged. No global
 AbortError handler is installed. Six lifecycle/process tests pass locally, as do
 the full scripts typecheck and strict diagnostic tests. Another runtime fixture
 requires new source review, exact CI and frozen image/hash qualification.
+
+At exact66470825, the corrected normal/duplicate SDK cases and all four standalone
+materialization cases subsequently passed on the two frozen prototype images.
+Aggregate receipts: provenance-build-664708256f1c-03d864/qualification-receipts.json.
+The original failed fixtures remain retained. These independent cases do not yet
+join one actual artifact to materialization and testing or confer lane admission.
+
+## Pure artifact-to-materialization join
+
+teetime_artifact_materialization.py exposes prepare_materialization(raw_artifact,
+base_files=..., expected_binding=..., allowed_paths=...). It calls the qualified
+strict parser and passes exactly that complete candidate into the existing frame
+encoder, using its recomputed manifest/tree identities. The immutable result has
+raw_artifact_hash, binding_hash, manifest_hash, source_tree and frame bytes.
+The encoded frame must fit the independent65536-byte controller input limit.
+There are no replacement-file/identity inputs after parsing and no filesystem,
+process, Docker, commit, approval or dispatch actions.
+
+The trusted joined fixture base contains data.bin and executable src/run.sh;
+the artifact adds index.html. Thus binary data stays in trusted base content,
+and the complete result matches the qualified checker's fixed three-file fixture.
+Six pure tests cover exact files/modes/hashes, foreign bindings, scope, malformed
+artifacts, transport overflow and frame/content substitution. Invocation:
+
+```text
+python -m unittest discover -s scripts/staging -p test_teetime_artifact_materialization.py
+```
+
+STOP POINT: these hashes establish content identity, not authenticated provenance,
+SDK success or approval. The helper has no SDK outcome input and cannot determine
+whether identical raw bytes came from a failed/duplicate stream. A separately
+reviewed controller must prove actual successful stream/process custody before
+calling it, parse outside the worker against frozen controller-owned inputs, and
+reject failed/duplicate outcomes before any materialization resource is created.
+The joined controller/fixture, actual output receipt binding and runtime path are
+not implemented or qualified by this pure slice. Existing headCommit,6000-byte
+review wire, frozen authority and v1 policy/workflow contracts remain unchanged.
