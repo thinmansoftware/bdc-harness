@@ -9,11 +9,23 @@ import {
 } from './duty-officer-security-detector';
 import {
   githubIssueInAllowList,
+  githubNudgeEnabled,
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
   type DutyOfficerClockDeps,
 } from './duty-officer-clock';
+
+test('explicit GitHub nudge switch still requires a usable authenticated identity', () => {
+  process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  expect(githubNudgeEnabled()).toBe(false);
+  process.env.GH_TOKEN = '   ';
+  expect(githubNudgeEnabled()).toBe(false);
+  process.env.GH_TOKEN = 'synthetic-pat';
+  expect(githubNudgeEnabled()).toBe(true);
+});
 
 function message(overrides: Partial<DispatchMessage> & { id: string }): DispatchMessage {
   return {

@@ -39,6 +39,10 @@ const T0 = Date.parse('2026-09-23T12:00:00.000Z');
 const POSTER = 'taskmaster-bot';
 const posterLogin = async (): Promise<string> => POSTER;
 
+test('escalation_comment_cooldown_constant_unchanged', () => {
+  expect(TASKMASTER_ESCALATION_COOLDOWN_MS).toBe(72 * 60 * 60 * 1000);
+});
+
 // Non-ASCII test inputs built from char codes so this source file stays
 // ASCII-only (the formatter rewrites \u escapes into literal characters).
 const E_ACUTE = String.fromCharCode(0xe9);
