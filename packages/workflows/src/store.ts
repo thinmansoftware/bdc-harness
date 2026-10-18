@@ -40,6 +40,9 @@ export const WORKFLOW_EVENT_TYPES = [
   'resource_exhausted_retry',
   'tool_called',
   'tool_completed',
+  // Throttled liveness signal for a prompt/command node (WO-HARNESS-SILENT-NODE-DETECTION-01).
+  // Persisted by executeNodeInternal only; not an emitter event.
+  'node_progress',
   'ralph_story_started',
   'ralph_story_completed',
   'approval_requested',

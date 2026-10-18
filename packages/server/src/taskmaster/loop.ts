@@ -15,8 +15,10 @@
  */
 import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
+import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { getDatabase } from '@archon/core';
 import { runCascade } from '@archon/smart-cauldron/cascade';
+import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldron/headroom';
 import {
   assessDispatchRecipient,
   createAuthenticatedMessage,
@@ -30,6 +32,7 @@ import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
   adoptionContentHash,
   classifyThread,
+  computeBlockerReport,
   computeNextAction,
   isSuppressedByNoise,
   type ActionProposal,
@@ -38,12 +41,25 @@ import {
   type TmActionType,
   usefulRateFloorBreached,
 } from './rules';
-import { validateProposal, type TmAllowedRecipient } from './guard';
+import { dutyOfficerClockEnabled } from '../dispatch/duty-officer-clock';
+import { validateProposal, WO_ID_RE, type TmAllowedRecipient } from './guard';
+import {
+  buildEscalationCommentBody,
+  createDbEscalationDeliveryClaim,
+  createRealEscalationDeliveryDeps,
+  deliverEscalationToIssue,
+  parseGithubThreadRef,
+  parseOwnerLabel,
+  resolveEscalateToIssueEnabled,
+  type EscalationDeliveryDeps,
+} from './escalation-delivery';
 import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
+import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import { fireBackoffDecision } from './backoff';
 import { checkExpectations } from './expectations';
+import { canonicalizeThreadRef } from './thread-ref';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -55,10 +71,30 @@ import {
 
 const log = createLogger('taskmaster/loop');
 
+/**
+ * One process-wide real escalation-delivery deps object, so its cached
+ * poster-login lookup (GET /user, used to trust only Taskmaster's own marker
+ * comments) runs once per token rather than once per escalation.
+ */
+let realEscalationDelivery: EscalationDeliveryDeps | null = null;
+function defaultEscalationDelivery(): EscalationDeliveryDeps {
+  realEscalationDelivery ??= createRealEscalationDeliveryDeps();
+  return realEscalationDelivery;
+}
+
 /** Ratified Q1 budgets. */
 export const MAX_EFFECTS_PER_TICK = 10;
 /** Conservative faucet bound for newly eligible work, within the shared cap. */
 export const MAX_FIRES_PER_TICK = 3;
+
+/**
+ * Per-tick cap on blocker_report sends (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01).
+ * With 27 label-blocked threads and up to 63 unclaimed P0s in tm_adoption, the
+ * first cycle would otherwise flood the single xo mailbox; capping at 3 per
+ * 15-minute tick drains the backlog over several ticks instead. Overflow is
+ * journaled 'deferred' (not dropped), exactly like other budget overflow.
+ */
+export const MAX_BLOCKER_REPORTS_PER_TICK = 3;
 
 /**
  * Pause effect-delivery gate (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01).
@@ -199,6 +235,15 @@ export interface TaskmasterDeps {
   /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
   onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
   checkExpectations?: (now: Date) => Promise<void>;
+  /**
+   * GitHub-issue escalation delivery seam
+   * (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). Tests inject fake
+   * listIssueComments/postIssueComment; production defaults to
+   * createRealEscalationDeliveryDeps(). The per-issue delivery claim comes
+   * from escalationDelivery.claim when provided, else the database-backed
+   * claim when the real DAL is in use (no deps.db), else none.
+   */
+  escalationDelivery?: EscalationDeliveryDeps;
 }
 
 export interface TickResult {
@@ -288,8 +333,13 @@ interface GithubIssue {
  * labels), so each label is queried separately and results are deduped by
  * issue number -- OR semantics, never requiring both simultaneously.
  */
+// Project-labelled issues without an explicit priority default to P1 during
+// adoption; priority-less wo and arc issues remain in the triage list.
 const WORK_LABELS = ['wo', 'project', 'arc'] as const;
+const MAX_PAGES_PER_LABEL = 10;
 const GITHUB_RATE_LIMIT_FLOOR = 5;
+/** Max GitHub search requests for open-PR claims inside one defaultListThreads call. */
+const PR_CLAIM_LOOKUP_CAP = 10;
 
 /**
  * Default max evidence enrichments per adoption refresh tick.
@@ -310,24 +360,10 @@ export function resolveAdoptionEvidenceBudgetPerTick(
   return ADOPTION_EVIDENCE_BUDGET_PER_TICK;
 }
 
-/** Historical org rename (M-141, 2026-08-14): pre-rename journal rows still exist. */
-const THREAD_REF_ORG_ALIASES: Record<string, string> = {
-  bluedevilcollectibles: 'thinmansoftware',
-};
-
-/**
- * Canonicalize a thread ref so pre- and post-rename org eras collapse.
- * Non-gh refs (digest:, dispatch:) return byte-identical.
- */
-export function canonicalizeThreadRef(ref: string): string {
-  const match = /^gh:([^/]+)\/([^#]+)#(\d+)$/.exec(ref);
-  if (!match) return ref;
-  const org = match[1];
-  const repo = match[2];
-  const num = match[3];
-  const canonicalOrg = THREAD_REF_ORG_ALIASES[org] ?? org;
-  return `gh:${canonicalOrg}/${repo}#${num}`;
-}
+// Thread-ref canonicalization now lives in ./thread-ref so rules.ts can share
+// it without a circular import (imported at the top of this file). Re-exported
+// here to preserve existing importers (loop.test.ts imports it from here).
+export { canonicalizeThreadRef };
 
 /**
  * Owner-login -> dispatch mailbox routing (M-155 WO 3). Named and testable,
@@ -369,6 +405,7 @@ export const TM_REPEAT_REASON_BY_TYPE: Record<TmActionType, string> = {
   deliver_ruling: 'tm:deliver_ruling:repeated',
   digest: 'tm:digest:repeated',
   fire_cauldron: 'tm:fire_cauldron:repeated',
+  blocker_report: 'tm:blocker_report:repeated',
 };
 
 /** Listed work-SOR thread with optional adoption fields carried from the issue payload. */
@@ -376,6 +413,7 @@ export interface ListedThread extends ThreadSnapshot {
   title?: string | null;
   ownerLogin?: string | null;
   labels?: string[];
+  beyondFirstPage?: boolean;
 }
 
 export type ListedThreadResult = ListedThread[] & { unlabelledPriorityTriage: string[] };
@@ -401,7 +439,7 @@ function assertGithubRateLimit(response: Response, context: string): void {
 
 /**
  * Work-SOR read: open GitHub issues labeled wo, project, or arc across the configured
- * repos (one request per label -- see WORK_LABELS). Rate-limit-aware (Claude
+ * repos (bounded pagination per label -- see WORK_LABELS). Rate-limit-aware (Claude
  * seat amendment): honors x-ratelimit-remaining and backs off rather than
  * spinning. An incomplete or failed read throws so the tick cannot advance its
  * success heartbeat on a partial source snapshot. Exported for tests;
@@ -415,66 +453,101 @@ export async function defaultListThreads(
     .split(',')
     .map(r => r.trim())
     .filter(Boolean);
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const threads: ListedThread[] = [];
   const unlabelledPriorityTriage: string[] = [];
+  let prClaimLookups = 0;
   for (const repo of repos) {
     const seen = new Set<number>();
-    for (const label of WORK_LABELS) {
+    const firstPages = new Map<(typeof WORK_LABELS)[number], GithubIssue[]>();
+
+    const fetchPage = async (
+      label: (typeof WORK_LABELS)[number],
+      page: number
+    ): Promise<GithubIssue[]> => {
       try {
-        const response = await fetchImpl(
-          `https://api.github.com/repos/${repo}/issues?state=open&labels=${label}&per_page=100`,
-          {
-            headers: {
-              accept: 'application/vnd.github+json',
-              ...(token ? { authorization: `Bearer ${token}` } : {}),
-            },
-          }
-        );
-        assertGithubRateLimit(response, `work-sor:${repo}:${label}`);
+        const response = await serviceGitHubFetchWithPermissionFallback({
+          service: 'taskmaster',
+          fetch: fetchImpl,
+          url: `https://api.github.com/repos/${repo}/issues?state=open&labels=${label}&per_page=100&page=${page}`,
+          init: { headers: { accept: 'application/vnd.github+json' } },
+        });
+        assertGithubRateLimit(response, `work-sor:${repo}:${label}:${page}`);
         if (!response.ok) {
-          log.warn({ repo, label, status: response.status }, 'taskmaster.github_read_failed');
+          log.warn({ repo, label, page, status: response.status }, 'taskmaster.github_read_failed');
           throw new Error(`taskmaster_github_work_sor_read_failed:${response.status}`);
         }
-        const issues = (await response.json()) as GithubIssue[];
-        for (const issue of issues) {
-          if (issue.pull_request) continue;
-          if (seen.has(issue.number)) continue; // carried both labels
-          seen.add(issue.number);
-          const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
-          const priority = priorityFromLabels(labels);
-          if (priority === null) {
+        return (await response.json()) as GithubIssue[];
+      } catch (error) {
+        log.warn({ err: error as Error, repo, label, page }, 'taskmaster.github_read_error');
+        throw error;
+      }
+    };
+
+    const addIssues = async (issues: GithubIssue[], beyondFirstPage: boolean): Promise<void> => {
+      for (const issue of issues) {
+        if (issue.pull_request) continue;
+        if (seen.has(issue.number)) continue; // carried both labels
+        seen.add(issue.number);
+        const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
+        const normalizedLabels = labels.map(label => label.trim().toLowerCase());
+        let priority = priorityFromLabels(labels);
+        if (priority === null) {
+          if (normalizedLabels.includes('project')) {
+            priority = 'P1';
+          } else {
             const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
             unlabelledPriorityTriage.push(ref);
             log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
             continue;
           }
-          const normalizedLabels = labels.map(label => label.trim().toLowerCase());
-          const hasClaimStatus = normalizedLabels.some(label =>
-            ['status:building', 'status:review'].includes(label)
-          );
-          const ownerLogin = issue.assignees?.[0]?.login ?? null;
-          const isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
-          threads.push({
-            ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
-            priority,
-            isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
-            lastActivityAt: issue.updated_at,
-            isBlocked: normalizedLabels.some(label =>
-              ['blocked', 'status:blocked'].includes(label)
-            ),
-            isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
-            isUnclaimed,
-            isUnclaimedP0: priority === 'P0' && isUnclaimed,
-            recipient: resolveRecipient(ownerLogin),
-            title: issue.title ?? null,
-            ownerLogin,
-            labels,
-          });
         }
-      } catch (error) {
-        log.warn({ err: error as Error, repo, label }, 'taskmaster.github_read_error');
-        throw error;
+        const hasClaimStatus = normalizedLabels.some(label =>
+          ['status:building', 'status:review'].includes(label)
+        );
+        const ownerLogin = issue.assignees?.[0]?.login ?? null;
+        let isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
+        const woId = issue.title?.match(WO_ID_RE)?.[0];
+        if (isUnclaimed && woId !== undefined && prClaimLookups < PR_CLAIM_LOOKUP_CAP) {
+          prClaimLookups += 1;
+          const claimed = await lookupOpenPrClaim(fetchImpl, repo, woId);
+          if (claimed) isUnclaimed = false;
+        }
+        threads.push({
+          ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
+          priority,
+          isCustomerFacing: labels.some(l => l.toLowerCase() === 'customer'),
+          lastActivityAt: issue.updated_at,
+          isBlocked: normalizedLabels.some(label =>
+            ['blocked', 'status:blocked', 'wo:blocked'].includes(label)
+          ),
+          isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
+          isUnclaimed,
+          isUnclaimedP0: priority === 'P0' && isUnclaimed,
+          recipient: resolveRecipient(ownerLogin),
+          title: issue.title ?? null,
+          ownerLogin,
+          labels,
+          beyondFirstPage,
+        });
+      }
+    };
+
+    // Process every label's first page before later pages so cross-label
+    // duplicates retain first-page status regardless of label order.
+    for (const label of WORK_LABELS) {
+      const issues = await fetchPage(label, 1);
+      firstPages.set(label, issues);
+      await addIssues(issues, false);
+    }
+    for (const label of WORK_LABELS) {
+      if (firstPages.get(label)?.length !== 100) continue;
+      for (let page = 2; page <= MAX_PAGES_PER_LABEL; page += 1) {
+        const issues = await fetchPage(label, page);
+        await addIssues(issues, true);
+        if (issues.length < 100) break;
+        if (page === MAX_PAGES_PER_LABEL) {
+          log.warn({ repo, label, page }, 'taskmaster.github_page_limit_reached');
+        }
       }
     }
   }
@@ -498,12 +571,48 @@ interface GithubIssueEvent {
   label?: { name?: string } | null;
 }
 
-function githubHeaders(): Record<string, string> {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  return {
-    accept: 'application/vnd.github+json',
-    ...(token ? { authorization: `Bearer ${token}` } : {}),
-  };
+/** HTTP failure from the open-PR claim search. Carries the response status for the warning. */
+class PrClaimLookupError extends Error {
+  readonly status: number;
+
+  constructor(status: number) {
+    super(`taskmaster_pr_claim_lookup_failed:${status}`);
+    this.name = 'PrClaimLookupError';
+    this.status = status;
+  }
+}
+
+/**
+ * True when GitHub search returns at least one open pull request whose title
+ * or body contains the work-order id, scoped to the repository owner.
+ * Failures are logged and returned as false so the work-SOR read stays up.
+ */
+async function lookupOpenPrClaim(
+  fetchImpl: typeof fetch,
+  repo: string,
+  woId: string
+): Promise<boolean> {
+  const slash = repo.indexOf('/');
+  const owner = slash === -1 ? repo : repo.slice(0, slash);
+  const query = `is:pr is:open in:title,body ${woId} org:${owner}`;
+  const url = `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=1`;
+  try {
+    const response = await serviceGitHubFetchWithPermissionFallback({
+      service: 'taskmaster',
+      fetch: fetchImpl,
+      url,
+    });
+    if (!response.ok) {
+      throw new PrClaimLookupError(response.status);
+    }
+    const body = (await response.json()) as { items?: unknown[] } | null;
+    return Array.isArray(body?.items) && body.items.length > 0;
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    const status = error instanceof PrClaimLookupError ? error.status : undefined;
+    log.warn({ err, repo, woId, status }, 'taskmaster.pr_claim_lookup_failed');
+    return false;
+  }
 }
 
 /**
@@ -569,10 +678,11 @@ export async function defaultGetGithubIssueEvidence(
   if (!match) return null;
   const repo = match[1];
   const issueNumber = match[2];
-  const issueResponse = await fetchImpl(
-    `https://api.github.com/repos/${repo}/issues/${issueNumber}`,
-    { headers: githubHeaders() }
-  );
+  const issueResponse = await serviceGitHubFetchWithPermissionFallback({
+    service: 'taskmaster',
+    fetch: fetchImpl,
+    url: `https://api.github.com/repos/${repo}/issues/${issueNumber}`,
+  });
   assertGithubRateLimit(issueResponse, `evidence:issue:${repo}#${issueNumber}`);
   if (!issueResponse.ok) {
     throw new Error(`taskmaster_github_issue_evidence_read_failed:${issueResponse.status}`);
@@ -580,10 +690,11 @@ export async function defaultGetGithubIssueEvidence(
   const issue = (await issueResponse.json()) as GithubIssueDetail;
   // Fetch full comment list (no since=). Grading still filters post-since in
   // memory; adoption needs the latest marker regardless of age.
-  const commentsResponse = await fetchImpl(
-    `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?per_page=100`,
-    { headers: githubHeaders() }
-  );
+  const commentsResponse = await serviceGitHubFetchWithPermissionFallback({
+    service: 'taskmaster',
+    fetch: fetchImpl,
+    url: `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?per_page=100`,
+  });
   assertGithubRateLimit(commentsResponse, `evidence:comments:${repo}#${issueNumber}`);
   if (!commentsResponse.ok) {
     throw new Error(
@@ -591,10 +702,11 @@ export async function defaultGetGithubIssueEvidence(
     );
   }
   const comments = (await commentsResponse.json()) as GithubIssueComment[];
-  const eventsResponse = await fetchImpl(
-    `https://api.github.com/repos/${repo}/issues/${issueNumber}/events?per_page=100`,
-    { headers: githubHeaders() }
-  );
+  const eventsResponse = await serviceGitHubFetchWithPermissionFallback({
+    service: 'taskmaster',
+    fetch: fetchImpl,
+    url: `https://api.github.com/repos/${repo}/issues/${issueNumber}/events?per_page=100`,
+  });
   assertGithubRateLimit(eventsResponse, `evidence:events:${repo}#${issueNumber}`);
   if (!eventsResponse.ok) {
     throw new Error(`taskmaster_github_issue_evidence_read_failed:events:${eventsResponse.status}`);
@@ -680,12 +792,58 @@ export function buildSelfPauseNotice(
  * one `outcome='sent'` row per day and zero self-pause events in that window. Retirement is
  * a board decision, not an automatic expiry -- the code MUST NOT self-disable.
  */
-function digestProposal(
+export interface GitHubDigestData {
+  usage: { service: string; pool_id: string; calls: number; peak: number }[];
+  pools: { pool_id: string; resource: string; remaining: number; limit: number }[];
+  servicesByPool: Map<string, string[]>;
+}
+
+export async function loadGitHubDigestData(nowMs: number): Promise<GitHubDigestData> {
+  const since = new Date(nowMs - 24 * 60 * 60 * 1000).toISOString();
+  const db = getDatabase();
+  const usage = await db.query<{
+    service: string;
+    pool_id: string;
+    calls: number | string;
+    peak: number | string;
+  }>(
+    `SELECT service, pool_id, SUM(calls) AS calls, MAX(calls) AS peak FROM github_api_usage
+     WHERE hour_bucket >= $1 GROUP BY service, pool_id ORDER BY service, pool_id`,
+    [since]
+  );
+  const pools = await db.query<{
+    pool_id: string;
+    resource: string;
+    remaining: number | string;
+    limit: number | string;
+  }>(
+    `SELECT pool_id, resource, remaining, "limit" AS limit FROM github_api_pool_state
+     WHERE resource IN ('core', 'search', 'graphql') ORDER BY pool_id, resource`
+  );
+  const servicesByPool = new Map<string, string[]>();
+  for (const row of usage.rows) {
+    const services = servicesByPool.get(row.pool_id) ?? [];
+    if (!services.includes(row.service)) services.push(row.service);
+    servicesByPool.set(row.pool_id, services);
+  }
+  return {
+    usage: usage.rows.map(row => ({ ...row, calls: Number(row.calls), peak: Number(row.peak) })),
+    pools: pools.rows.map(row => ({
+      ...row,
+      remaining: Number(row.remaining),
+      limit: Number(row.limit),
+    })),
+    servicesByPool,
+  };
+}
+
+export function digestProposal(
   actions24h: taskmasterDb.TmJournalEntry[],
   control: taskmasterDb.TmControlState,
   nowMs: number,
   expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>,
-  unlabelledPriorityTriage: string[] = []
+  unlabelledPriorityTriage: string[] = [],
+  github?: GitHubDigestData
 ): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
   const digestActions = actions24h.filter(action => action.thread_ref !== 'taskmaster:reset');
@@ -711,6 +869,23 @@ function digestProposal(
   const triageSummary = unlabelledPriorityTriage.length
     ? ` Needs priority triage: ${unlabelledPriorityTriage.join(', ')}.`
     : '';
+  const githubUsage =
+    github?.usage
+      .map(
+        row =>
+          `GitHub API last 24h by service: ${row.service} (pool ${row.pool_id}) ${(row.calls / 24).toFixed(2)} avg calls/h, ${row.peak} peak calls/h.`
+      )
+      .join(' ') ?? '';
+  const githubPools =
+    github?.pools
+      .map(row => {
+        const state = `${row.pool_id}/${row.resource} ${row.remaining}/${row.limit}.`;
+        if (row.limit > 0 && row.remaining < row.limit * 0.2) {
+          return `${state} GITHUB-QUOTA-LOW ${row.pool_id}/${row.resource} (${(github.servicesByPool.get(row.pool_id) ?? []).join(', ')}).`;
+        }
+        return state;
+      })
+      .join(' ') ?? '';
   return {
     type: 'digest',
     threadRef: `digest:${dateKey}`,
@@ -721,7 +896,7 @@ function digestProposal(
       `Taskmaster daily canary for ${dateKey}: state=${control.pause_state}, ` +
       `scope=${control.pause_scope ?? 'none'}, actor=${control.pause_actor ?? 'none'}, ` +
       `updated_at=${control.updated_at}; ${summary}; ${pauseDetail}.` +
-      `${expectationSummary}${triageSummary} ` +
+      `${expectationSummary}${triageSummary} ${githubUsage} ${githubPools} ` +
       'Pause/resume/status runbook: xo-wiki/wiki/tools/taskmaster/_index.md.',
     idempotencyKey: `tm:digest:${dateKey}`,
     actsImmediately: true,
@@ -878,6 +1053,10 @@ async function gradeSentActions(
         }
       }
       if (action.action_type === 'digest') continue;
+      // blocker_report is a DO-relay handoff, not an SC7 useful action: like
+      // digest it is never graded useful/noise and never enters the 40%
+      // useful-rate floor denominator in either direction.
+      if (action.action_type === 'blocker_report') continue;
 
       const sentAtMs = Date.parse(effect.createdAt);
       if (!Number.isFinite(sentAtMs)) {
@@ -974,6 +1153,9 @@ function proofPredicate(proposal: ActionProposal): string {
   if (proposal.type === 'fire_cauldron') {
     return 'created Cauldron run completes or opens a PR, or the source issue gains status:building before the proof deadline';
   }
+  if (proposal.type === 'blocker_report') {
+    return 'blocker report delivery only; relayed to xo by the Duty Officer clock; never qualifies as an SC7 useful action';
+  }
   return 'digest delivery only; never qualifies as an SC7 useful action';
 }
 
@@ -1003,11 +1185,11 @@ export async function refreshAdoption(
   try {
     snapshotId = await dal.beginAdoptionSnapshot();
 
-    // Prior committed evidence ages for staleness ordering (NULL first).
+    // Prior committed rows provide evidence ages and carry-forward values.
     const priorRows = (await dal.getAdoption()) ?? [];
-    const priorEvidenceAt = new Map<string, string | null>();
+    const priorByRef = new Map<string, taskmasterDb.TmAdoptionRow>();
     for (const row of priorRows) {
-      priorEvidenceAt.set(row.thread_ref, row.evidence_observed_at);
+      priorByRef.set(canonicalizeThreadRef(row.thread_ref), row);
     }
 
     // Attempt counts: read journal without threadRef filter, group by canonical ref.
@@ -1029,8 +1211,8 @@ export async function refreshAdoption(
     const ordered = [...threads].sort((a, b) => {
       const aRef = canonicalizeThreadRef(a.ref);
       const bRef = canonicalizeThreadRef(b.ref);
-      const aAt = priorEvidenceAt.get(aRef) ?? null;
-      const bAt = priorEvidenceAt.get(bRef) ?? null;
+      const aAt = priorByRef.get(aRef)?.evidence_observed_at ?? null;
+      const bAt = priorByRef.get(bRef)?.evidence_observed_at ?? null;
       if (aAt === null && bAt === null) return 0;
       if (aAt === null) return -1;
       if (bAt === null) return 1;
@@ -1100,6 +1282,26 @@ export async function refreshAdoption(
           // Prefer list title; evidence path does not re-fetch title separately.
           enrichedCount += 1;
         }
+      } else {
+        const prior = priorByRef.get(ref);
+        if (prior) {
+          base.owner_login = prior.owner_login;
+          base.state = prior.state;
+          base.labels_json = prior.labels_json;
+          base.last_movement_at = prior.last_movement_at;
+          base.last_movement_kind = prior.last_movement_kind;
+          base.latest_marker_kind = prior.latest_marker_kind;
+          base.latest_marker_at = prior.latest_marker_at;
+          base.blocked_reason = prior.blocked_reason;
+          base.next_action = prior.next_action;
+          base.evidence_observed_at = prior.evidence_observed_at;
+          if (
+            prior.source_updated_at !== null &&
+            Date.parse(thread.lastActivityAt) <= Date.parse(prior.source_updated_at)
+          ) {
+            base.source_updated_at = prior.source_updated_at;
+          }
+        }
       }
 
       await dal.upsertAdoptionRow(snapshotId, base);
@@ -1135,7 +1337,33 @@ export async function refreshAdoption(
   }
 }
 
-export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
+function isDeliverySuppressedExpiry(action: taskmasterDb.TmJournalEntry): boolean {
+  if (action.outcome !== 'expired') return false;
+  try {
+    const proposal: unknown = JSON.parse(action.proposal_json);
+    return (
+      typeof proposal === 'object' &&
+      proposal !== null &&
+      !Array.isArray(proposal) &&
+      Boolean((proposal as Record<string, unknown>).suppressed)
+    );
+  } catch {
+    return false;
+  }
+}
+
+let tickQueue: Promise<void> = Promise.resolve();
+
+export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
+  const result = tickQueue.then(() => runTick(state, deps));
+  tickQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
+async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<TickResult> {
   const now = deps.now ?? ((): Date => new Date());
   const dal = deps.db ?? taskmasterDb;
   const createTask = deps.createTask ?? createAuthenticatedMessage;
@@ -1229,6 +1457,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   const lookback = await dal.getActionsSince(new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString());
   const actionsByKey = new Map<string, taskmasterDb.TmJournalEntry>();
   const interventions24hByThread = new Map<string, number>();
+  // Most recent 'sent' blocker_report per canonical ref (72h cooldown input).
+  const lastBlockerReportSentByThread = new Map<string, number>();
   const since24h = nowMs - DAY_MS;
   for (const action of lookback) {
     if (action.idempotency_key && !actionsByKey.has(action.idempotency_key))
@@ -1239,8 +1469,25 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         (interventions24hByThread.get(action.thread_ref) ?? 0) + 1
       );
     }
+    if (action.action_type === 'blocker_report' && action.outcome === 'sent') {
+      const key = canonicalizeThreadRef(action.thread_ref);
+      const atMs = Date.parse(action.created_at);
+      if (Number.isFinite(atMs)) {
+        const prev = lastBlockerReportSentByThread.get(key);
+        if (prev === undefined || atMs > prev) lastBlockerReportSentByThread.set(key, atMs);
+      }
+    }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
+  const recentEscalateP0ByThread = new Set(
+    actions24h
+      .filter(
+        action =>
+          action.action_type === 'escalate_p0' &&
+          (action.outcome === 'sent' || isDeliverySuppressedExpiry(action))
+      )
+      .map(action => canonicalizeThreadRef(action.thread_ref))
+  );
   const readHealth = deps.getHealthSample ?? taskmasterDb.getHealthSample;
   let codexHealth: taskmasterDb.TmHealthSample | null = null;
   let xaiHealth: taskmasterDb.TmHealthSample | null = null;
@@ -1249,7 +1496,26 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.lane_health_read_failed');
   }
-  const laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+  let laneDecision: ReturnType<typeof decideFireLane>;
+  try {
+    const seatUsage = await conductorSeatUsage();
+    const thresholdPercent = resolveEntryThreshold(process.env);
+    const overThreshold: Partial<Record<'claude' | 'codex', boolean>> = {};
+    for (const lane of ['claude', 'codex'] as const) {
+      const used = bindingUsedPercent(seatUsage[lane]);
+      if (typeof used === 'number' && used >= thresholdPercent) overThreshold[lane] = true;
+    }
+    laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth }, overThreshold);
+    // The routing threshold only steers between lanes; it must never hold a fire that the
+    // unfiltered decision would dispatch (seats below the run-start cutoff stay usable).
+    if (laneDecision.holding) {
+      const unfiltered = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+      if (!unfiltered.holding) laneDecision = unfiltered;
+    }
+  } catch (error) {
+    log.warn({ err: error as Error }, 'taskmaster.seat_headroom_read_failed');
+    laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+  }
 
   // Grade previously sent actions against the external SOR.
   tickFailures += await gradeSentActions(
@@ -1421,6 +1687,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   }
 
   const proposals: ActionProposal[] = [];
+  const fireBeyondFirstPageAllowed = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE === 'true';
+  const blockerReportEnabled = resolveBlockerReportEnabled();
   for (const item of [...rulings, ...threads]) {
     const canonRef = canonicalizeThreadRef(item.ref);
     const adoptionRow = adoptionByRef.get(canonRef);
@@ -1451,6 +1719,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         );
       }
     }
+    const fireEligibleResolved =
+      fireResult.eligible &&
+      Boolean(fireResult.evidence?.expectedSpec) &&
+      (!(item as ListedThread).beyondFirstPage || fireBeyondFirstPageAllowed);
     const proposal = computeNextAction(item, classification, {
       interventionsLast24h: interventions24hByThread.get(item.ref) ?? 0,
       nowMs,
@@ -1461,7 +1733,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       adoption: adoptionRow?.title ? adoptionRow : undefined,
       grades: gradesByRef.get(canonRef),
       suppression: suppressionByRef.get(canonRef),
-      fireEligible: fireResult.eligible && Boolean(fireResult.evidence?.expectedSpec),
+      fireEligible: fireEligibleResolved,
       fireLane: laneDecision.lane,
       fireHolding: laneDecision.holding,
       fireEscalate: backoff.kind === 'escalate',
@@ -1483,6 +1755,23 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     if (proposal) {
       proposals.push(proposal);
     }
+
+    // blocker_report is computed IN ADDITION to computeNextAction (it never
+    // replaces a ruling/fire/escalate/nudge). Off by flag -> not called.
+    if (blockerReportEnabled) {
+      const blockerProposal = computeBlockerReport(item, classification, {
+        interventionsLast24h: interventions24hByThread.get(item.ref) ?? 0,
+        nowMs,
+        adoption: adoptionRow,
+        fireEligible: fireEligibleResolved,
+        fireHolding: laneDecision.holding,
+        fireEvidence: fireResult.evidence,
+        lastBlockerReportSentAtMs: lastBlockerReportSentByThread.get(canonRef) ?? null,
+      });
+      if (blockerProposal) {
+        proposals.push(blockerProposal);
+      }
+    }
   }
 
   if (
@@ -1499,6 +1788,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   // Daily digest: one summary message per UTC day through the same path.
   let expectationCounts: Record<taskmasterDb.TmExpectationStatus, number> | undefined;
+  let githubDigest: GitHubDigestData | undefined;
   try {
     expectationCounts = dal.getExpectationCounts
       ? await dal.getExpectationCounts()
@@ -1508,12 +1798,20 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.expectation_counts_failed');
   }
+  if (!deps.db) {
+    try {
+      githubDigest = await loadGitHubDigestData(nowMs);
+    } catch (error) {
+      log.warn({ err: error as Error }, 'taskmaster.github_digest_failed');
+    }
+  }
   const digest = digestProposal(
     actions24h,
     control,
     nowMs,
     expectationCounts,
-    unlabelledPriorityTriage
+    unlabelledPriorityTriage,
+    githubDigest
   );
   proposals.push(digest);
 
@@ -1527,7 +1825,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       return 2 + priorityRank[priorityByRef.get(proposal.threadRef) ?? 'P3'];
     }
     if (proposal.type === 'nudge') return 6;
-    return 7;
+    if (proposal.type === 'blocker_report') return 7;
+    return 8;
   };
   proposals.sort((a, b) => {
     const immediate = Number(b.actsImmediately) - Number(a.actsImmediately);
@@ -1538,8 +1837,13 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   const touchedThisTick = new Set<string>();
   let firesThisTick = 0;
+  let blockerReportsThisTick = 0;
 
   for (const proposal of proposals) {
+    const canonicalProposalRef = canonicalizeThreadRef(proposal.threadRef);
+    if (proposal.type === 'escalate_p0' && recentEscalateP0ByThread.has(canonicalProposalRef)) {
+      continue;
+    }
     let existingAction =
       actionsByKey.get(proposal.idempotencyKey) ??
       (await dal.getActionByIdempotencyKey(proposal.idempotencyKey));
@@ -1630,6 +1934,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     if (
       result.effects >= MAX_EFFECTS_PER_TICK ||
       (proposal.type === 'fire_cauldron' && firesThisTick >= MAX_FIRES_PER_TICK) ||
+      (proposal.type === 'blocker_report' &&
+        blockerReportsThisTick >= MAX_BLOCKER_REPORTS_PER_TICK) ||
       touchedThisTick.has(proposal.threadRef)
     ) {
       result.deferred += 1;
@@ -1700,7 +2006,79 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
 
     try {
-      if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
+      const escalationIssue =
+        proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
+          ? parseGithubThreadRef(proposal.threadRef)
+          : null;
+      if (escalationIssue) {
+        // WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01: deliver the escalation as
+        // a GitHub issue comment (where the owner and Duty Officer look), not to
+        // the operator dispatch mailbox (a drain_on_start principal with no
+        // reader). The body is built from adoption content, NOT proposal.body,
+        // which is written for the operator-mailbox audience. No dispatch row
+        // exists for a GitHub-comment effect, so no expectation is registered.
+        //
+        // The two delivery results are journaled differently:
+        //   - posted:true  -> the row is 'sent' + graded 'delivered_to_issue'
+        //     (excluded from the M-155 useful-rate floor, like 'unheard') and
+        //     counts as a tick effect.
+        //   - posted:false -> NOTHING was delivered: either another attempt holds
+        //     the issue's delivery claim (suppressedBy 'claim_held') or a marker
+        //     comment inside the 72h cooldown already covers the issue
+        //     ('cooldown_marker'). The row is closed as 'expired' (the existing
+        //     "journaled, never performed, terminal for this key" outcome) with
+        //     proposal_json.suppressed=<reason>, and is NOT graded. It is not a
+        //     tick effect, does not mark the thread touched, and -- because the
+        //     per-item 24h intervention cap (interventions24hByThread), the
+        //     adoption attempt counts, and gradeSentActions all read only
+        //     outcome='sent' -- it consumes no intervention budget and never
+        //     enters the useful-rate floor.
+        //
+        // The per-issue claim (tm_escalation_claims, migration 057) is taken
+        // BEFORE the GitHub list+post, so two ticks or processes sharing the
+        // database cannot both pass the marker check and both post.
+        const adoptionRow = adoptionByRef.get(canonicalizeThreadRef(proposal.threadRef));
+        const body = buildEscalationCommentBody({
+          title: adoptionRow?.title ?? null,
+          threadRef: proposal.threadRef,
+          sinceIso: adoptionRow?.last_movement_at ?? adoptionRow?.source_updated_at ?? null,
+          nextAction: adoptionRow?.next_action ?? null,
+          ownerLabelLogin: parseOwnerLabel(adoptionRow?.labels_json),
+          nowMs,
+        });
+        const baseDelivery = deps.escalationDelivery ?? defaultEscalationDelivery();
+        const delivery: EscalationDeliveryDeps =
+          baseDelivery.claim || deps.db
+            ? baseDelivery
+            : { ...baseDelivery, claim: createDbEscalationDeliveryClaim() };
+        const delivered = await deliverEscalationToIssue(
+          { issue: escalationIssue, threadRef: proposal.threadRef, body },
+          delivery
+        );
+        if (!delivered.posted) {
+          const suppressed = delivered.suppressedBy ?? 'cooldown_marker';
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'expired',
+            JSON.stringify({ ...proposal, suppressed })
+          );
+          journalRow.outcome = 'expired';
+          recentEscalateP0ByThread.add(canonicalProposalRef);
+          result.expired += 1;
+          log.info(
+            {
+              actionType: proposal.type,
+              threadRef: proposal.threadRef,
+              idempotencyKey: proposal.idempotencyKey,
+              suppressed,
+            },
+            'taskmaster.escalation_suppressed'
+          );
+          continue;
+        }
+        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.gradeAction(journalRow.id, 'delivered_to_issue');
+      } else if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
         let resolveAdmission: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
           null;
         let rejectAdmission: ((error: unknown) => void) | null = null;
@@ -1714,6 +2092,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           project: proposal.fireEvidence.project,
           dispatchId: proposal.idempotencyKey,
           token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+          deps: { seatUsage: conductorSeatUsage },
           onAdmission: record => resolveAdmission?.(record),
         });
         void cascadePromise.catch((error: unknown) => {
@@ -1781,15 +2160,27 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             classification: 'succeeded',
           }),
           due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
-          on_absence: proposal.type === 'digest' ? 'escalate' : 'redispatch',
-          max_retries: 2,
+          // blocker_report uses give_up / 0 retries: a redispatch would make a
+          // second duty-officer row and a second XO relay; the next 72h report
+          // is its retry. digest escalates; everything else redispatches.
+          on_absence:
+            proposal.type === 'digest'
+              ? 'escalate'
+              : proposal.type === 'blocker_report'
+                ? 'give_up'
+                : 'redispatch',
+          max_retries: proposal.type === 'blocker_report' ? 0 : 2,
         });
         await dal.updateActionOutcome(journalRow.id, 'sent');
       }
       journalRow.outcome = 'sent';
+      if (proposal.type === 'escalate_p0') {
+        recentEscalateP0ByThread.add(canonicalProposalRef);
+      }
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
       if (proposal.type === 'fire_cauldron') firesThisTick += 1;
+      if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
       log.info(
         {
           actionType: proposal.type,
@@ -1869,6 +2260,23 @@ export function resolveFireVerbEnabled(
   raw: string | undefined = process.env.TASKMASTER_FIRE_VERB_ENABLED
 ): boolean {
   return raw?.trim().toLowerCase() === 'true' || raw?.trim() === '1';
+}
+
+/**
+ * Resolve whether blocker_report is enabled this tick
+ * (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01). Explicit 'false'/'0' off,
+ * 'true'/'1' on; unset follows the Duty Officer clock, which in this process is
+ * the only consumer of recipient 'duty-officer' -- a report with no consumer is
+ * a dead letter, so if the clock is off the verb is off by default.
+ */
+export function resolveBlockerReportEnabled(
+  raw: string | undefined = process.env.TASKMASTER_BLOCKER_REPORT,
+  clockEnabled: boolean = dutyOfficerClockEnabled()
+): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  if (normalized === 'false' || normalized === '0') return false;
+  if (normalized === 'true' || normalized === '1') return true;
+  return clockEnabled;
 }
 
 /**

@@ -66,8 +66,24 @@ export function resolveLoopIterationWallTimeoutMs(nodeOverride?: number): number
   return LOOP_ITERATION_WALL_TIMEOUT_MS;
 }
 
+/**
+ * Resolve the step-level idle timeout at call time.
+ * Precedence: positive finite node override, then ARCHON_STEP_IDLE_MS, then
+ * STEP_IDLE_TIMEOUT_MS (30 minutes).
+ */
+export function resolveStepIdleTimeoutMs(nodeOverride?: number): number {
+  if (nodeOverride != null && Number.isFinite(nodeOverride) && nodeOverride > 0) {
+    return nodeOverride;
+  }
+  const fromEnv = Number.parseInt(process.env.ARCHON_STEP_IDLE_MS ?? '', 10);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return STEP_IDLE_TIMEOUT_MS;
+}
+
 /** Sentinel value to distinguish idle timeout from normal generator completion */
 const IDLE_TIMEOUT_SENTINEL = Symbol('IDLE_TIMEOUT');
+/** Sentinel: caller aborted while generator.next() was still pending */
+const ABORT_SENTINEL = Symbol('ABORT');
 
 /**
  * Wraps an async generator with an idle timeout. If no value is yielded within
@@ -88,18 +104,26 @@ const IDLE_TIMEOUT_SENTINEL = Symbol('IDLE_TIMEOUT');
  * @param timeoutMs - Maximum idle time in milliseconds before terminating
  * @param onTimeout - Optional callback invoked when idle timeout fires (before return)
  * @param shouldResetTimer - Optional predicate; return false to NOT reset the timer for a value
+ * @param abortSignal - Optional signal. When it aborts while generator.next() is pending,
+ *   the wrapper returns promptly without calling onTimeout and skips generator.return().
  */
 export async function* withIdleTimeout<T>(
   generator: AsyncGenerator<T>,
   timeoutMs: number,
   onTimeout?: () => void,
-  shouldResetTimer?: (value: T) => boolean
+  shouldResetTimer?: (value: T) => boolean,
+  abortSignal?: AbortSignal
 ): AsyncGenerator<T> {
   let timedOut = false;
   let timerStartedAt = Date.now();
 
   try {
     while (true) {
+      if (abortSignal?.aborted) {
+        timedOut = true;
+        return;
+      }
+
       const elapsed = Date.now() - timerStartedAt;
       const remaining = Math.max(0, timeoutMs - elapsed);
 
@@ -113,8 +137,39 @@ export async function* withIdleTimeout<T>(
       // Start waiting for the next value from the generator
       const nextPromise = generator.next();
 
-      const result = await Promise.race([nextPromise, timeoutPromise]);
+      let removeAbortListener: (() => void) | undefined;
+      const abortPromise: Promise<typeof ABORT_SENTINEL> | undefined = abortSignal
+        ? new Promise(resolve => {
+            const onAbort = (): void => {
+              resolve(ABORT_SENTINEL);
+            };
+            abortSignal.addEventListener('abort', onAbort);
+            removeAbortListener = (): void => {
+              abortSignal.removeEventListener('abort', onAbort);
+            };
+            if (abortSignal.aborted) resolve(ABORT_SENTINEL);
+          })
+        : undefined;
+
+      const result = await Promise.race<
+        IteratorResult<T> | typeof IDLE_TIMEOUT_SENTINEL | typeof ABORT_SENTINEL
+      >(
+        abortPromise !== undefined
+          ? [nextPromise, timeoutPromise, abortPromise]
+          : [nextPromise, timeoutPromise]
+      );
       clearTimeout(timer);
+      removeAbortListener?.();
+
+      if (result === ABORT_SENTINEL) {
+        timedOut = true;
+        // Same as the timeout path: do not call generator.return() (it would
+        // block on the pending next()), and do not invoke onTimeout.
+        nextPromise.catch((_err: unknown) => {
+          // Intentional: swallow rejection from the aborted generator
+        });
+        return;
+      }
 
       if (result === IDLE_TIMEOUT_SENTINEL) {
         timedOut = true;

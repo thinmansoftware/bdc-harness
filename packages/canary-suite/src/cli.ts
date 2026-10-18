@@ -7,6 +7,7 @@ import {
   type TaskmasterCanaryDeps,
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
+import { runProbeBindingCommand, type ProbeBindingCommandDeps } from './probe-binding';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
@@ -17,6 +18,7 @@ interface CanaryCliDeps {
     outputRoot: string,
     report: TaskmasterCanaryResult
   ) => Promise<readonly string[]>;
+  readonly probeBinding?: ProbeBindingCommandDeps;
 }
 
 function flag(args: readonly string[], name: string): string | undefined {
@@ -47,6 +49,13 @@ export async function runCanaryCli(
   }
 ): Promise<number> {
   const command = args[0];
+  if (command === 'probe-binding') {
+    const probeDeps = deps.probeBinding ?? (await defaultProbeBindingDeps());
+    const result = await runProbeBindingCommand(args, probeDeps);
+    if (result.exitCode === 0) deps.stdout(result.output);
+    else deps.stderr(result.output);
+    return result.exitCode;
+  }
   if (command === 'taskmaster') {
     const dbPath = flag(args, '--db-path');
     const statusUrl = flag(args, '--status-url');
@@ -82,7 +91,7 @@ export async function runCanaryCli(
   }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster> [options]');
+    deps.stderr('Usage: archon-canary <check|plan|taskmaster|probe-binding> [options]');
     return 3;
   }
   const manifestPath = flag(args, '--manifest');
@@ -115,6 +124,12 @@ export async function runCanaryCli(
     deps.stderr((error as Error).message.replaceAll(token, '[REDACTED]'));
     return 4;
   }
+}
+
+async function defaultProbeBindingDeps(): Promise<ProbeBindingCommandDeps> {
+  const { registerBuiltinProviders, getAgentProvider } = await import('@archon/providers');
+  registerBuiltinProviders();
+  return { getAgentProvider, cwd: process.cwd() };
 }
 
 if (import.meta.main) process.exitCode = await runCanaryCli(Bun.argv.slice(2));

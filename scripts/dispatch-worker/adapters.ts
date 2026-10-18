@@ -250,14 +250,47 @@ export function restrictAgentsToAllowlist(
   return Object.fromEntries(Object.entries(agents).filter(([name]) => allowlist.includes(name)));
 }
 
+/**
+ * The legacy prompt template token. Older config.local.json files (copied from
+ * a pre-fix config.example.json) still carry `{{prompt}}` as an argv element.
+ * The prompt is delivered on stdin (or via the prompt file), never as an argv
+ * template, so any such element is inert noise that must not reach the CLI --
+ * issue #1042 (a codex seat replied "Your message contains {{prompt}} instead
+ * of the main task"). Matches optional inner whitespace and any case, e.g.
+ * `{{ Prompt }}`.
+ */
+const PROMPT_TEMPLATE_TOKEN = /\{\{\s*prompt\s*\}\}/i;
+const PROMPT_TEMPLATE_TOKEN_EXACT = /^\{\{\s*prompt\s*\}\}$/i;
+
 export function buildAgentInvocation(
   config: AgentConfig,
   // Retained for call-site/test compatibility; no longer used for argv substitution.
   _prompt: string
 ): { command: string; args: string[] } {
+  const args: string[] = [];
+  for (const arg of config.args) {
+    // The prompt-file placeholder is worker-owned scratch that runAgent
+    // substitutes per spawn; it carries no braces and must pass through
+    // untouched.
+    if (arg === PROMPT_FILE_PLACEHOLDER) {
+      args.push(arg);
+      continue;
+    }
+    // An argv element that is EXACTLY the token is inert noise -- drop it.
+    if (PROMPT_TEMPLATE_TOKEN_EXACT.test(arg)) {
+      continue;
+    }
+    // The token embedded inside a larger argument (e.g. `--prompt={{prompt}}`)
+    // cannot be silently stripped without corrupting the flag. Fail loud rather
+    // than leak the literal token to the CLI.
+    if (PROMPT_TEMPLATE_TOKEN.test(arg)) {
+      throw new Error('dispatch_agent_args_prompt_template_embedded');
+    }
+    args.push(arg);
+  }
   return {
     command: config.command,
-    args: [...config.args],
+    args,
   };
 }
 

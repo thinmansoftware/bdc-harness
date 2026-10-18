@@ -6,6 +6,7 @@ import {
   LOOP_ITERATION_WALL_TIMEOUT_MS,
   resolveLoopIterationIdleTimeoutMs,
   resolveLoopIterationWallTimeoutMs,
+  resolveStepIdleTimeoutMs,
 } from './idle-timeout';
 
 /** Helper: create an async generator from an array of values with optional delays */
@@ -47,6 +48,22 @@ describe('loop iteration timeout defaults', () => {
     expect(resolveLoopIterationIdleTimeoutMs()).toBe(90_000);
     delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
     expect(resolveLoopIterationIdleTimeoutMs()).toBe(LOOP_ITERATION_IDLE_TIMEOUT_MS);
+  });
+
+  test('resolveStepIdleTimeoutMs prefers node override then env then default', () => {
+    const prev = process.env.ARCHON_STEP_IDLE_MS;
+    try {
+      process.env.ARCHON_STEP_IDLE_MS = '999';
+      expect(resolveStepIdleTimeoutMs(1234)).toBe(1234);
+      expect(resolveStepIdleTimeoutMs(undefined)).toBe(999);
+      delete process.env.ARCHON_STEP_IDLE_MS;
+      expect(resolveStepIdleTimeoutMs(undefined)).toBe(STEP_IDLE_TIMEOUT_MS);
+      process.env.ARCHON_STEP_IDLE_MS = 'abc';
+      expect(resolveStepIdleTimeoutMs(undefined)).toBe(STEP_IDLE_TIMEOUT_MS);
+    } finally {
+      if (prev === undefined) delete process.env.ARCHON_STEP_IDLE_MS;
+      else process.env.ARCHON_STEP_IDLE_MS = prev;
+    }
   });
 
   test('resolveLoopIterationWallTimeoutMs prefers node override then env then default', () => {
@@ -227,6 +244,28 @@ describe('withIdleTimeout', () => {
 
     expect(result).toEqual([{ type: 'assistant' }, { type: 'tool' }, { type: 'assistant' }]);
     expect(onTimeout).toHaveBeenCalledTimes(1);
+  });
+
+  test('returns promptly on abort without calling onTimeout', async () => {
+    const onTimeout = mock(() => {});
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 30);
+    const started = Date.now();
+    const result: string[] = [];
+
+    for await (const v of withIdleTimeout(
+      hangAfter<string>([]),
+      60_000,
+      onTimeout,
+      undefined,
+      controller.signal
+    )) {
+      result.push(v);
+    }
+
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(onTimeout).not.toHaveBeenCalled();
+    expect(result).toEqual([]);
   });
 
   test('without shouldResetTimer, tool events reset timer (original behavior)', async () => {

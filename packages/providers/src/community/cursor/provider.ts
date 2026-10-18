@@ -15,6 +15,9 @@
  *  - `--trust`  suppress the Workspace Trust prompt; without it the CLI exits 0
  *               with EMPTY output, so empty output is treated as failure below.
  *  - `--workspace <cwd>` pin the workspace to the worktree.
+ *  - `--output-format stream-json` one JSON event per line while the agent
+ *    works. Text mode prints only the final answer, which lets a long build
+ *    trip the DAG idle timeout (bdc-harness #920).
  *
  * The prompt is delivered on stdin, never as an argv element (Linux
  * MAX_ARG_STRLEN 131,072 bytes per argument; bdc-harness #789).
@@ -64,7 +67,18 @@ const defaultCursorAgentSpawn: CursorAgentSpawn = (argv, options) =>
 
 /** Exported for tests: the exact argv, with the prompt deliberately absent. */
 export function buildCursorAgentArgv(binary: string, model: string, cwd: string): string[] {
-  return [binary, '--print', '--force', '--trust', '--workspace', cwd, '--model', model];
+  return [
+    binary,
+    '--print',
+    '--output-format',
+    'stream-json',
+    '--force',
+    '--trust',
+    '--workspace',
+    cwd,
+    '--model',
+    model,
+  ];
 }
 
 export class CursorAgentProvider implements IAgentProvider {
@@ -110,23 +124,33 @@ export class CursorAgentProvider implements IAgentProvider {
     // reads stdin to EOF before answering, so writing and reading must overlap.
     const delivery = deliverPrompt(child.stdin, buildCursorPrompt(prompt, options));
 
-    let finalText = '';
+    const stream = createCursorStreamState();
     try {
       if (child.stdout) {
         const decoder = new TextDecoder();
         const reader = child.stdout.getReader();
+        let buffer = '';
+        const take = (text: string): MessageChunk[] => {
+          buffer += text;
+          const chunks: MessageChunk[] = [];
+          for (;;) {
+            const nl = buffer.indexOf('\n');
+            if (nl < 0) break;
+            const line = buffer.slice(0, nl);
+            buffer = buffer.slice(nl + 1);
+            chunks.push(...chunksForStreamLine(line, stream));
+          }
+          return chunks;
+        };
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
           const text = decoder.decode(value, { stream: true });
-          if (text.length === 0) continue;
-          finalText += text;
-          yield { type: 'assistant', content: text };
+          for (const chunk of take(text)) yield chunk;
         }
-        const tail = decoder.decode();
-        if (tail.length > 0) {
-          finalText += tail;
-          yield { type: 'assistant', content: tail };
+        for (const chunk of take(decoder.decode())) yield chunk;
+        if (buffer.length > 0) {
+          for (const chunk of chunksForStreamLine(buffer, stream)) yield chunk;
         }
       }
       const [exitCode, stderr] = await Promise.all([child.exited, stderrText]);
@@ -135,7 +159,19 @@ export class CursorAgentProvider implements IAgentProvider {
         const detail = stderr.trim().slice(-400) || 'no stderr';
         throw new Error(`cursor-agent exited ${exitCode} (model ${model}): ${detail}`);
       }
-      if (finalText.trim().length === 0) {
+      if (stream.resultError !== null) {
+        const detail = stream.resultError || 'cursor-agent result error';
+        const skipped =
+          stream.diagnostics.length > 0
+            ? ` [${stream.diagnostics.length} non-json line(s) skipped]`
+            : '';
+        throw new Error(`${detail}${skipped}`);
+      }
+      if (stream.finalText.trim().length === 0 && stream.successResultText.trim().length > 0) {
+        stream.finalText = stream.successResultText;
+        yield { type: 'assistant', content: stream.successResultText };
+      }
+      if (stream.finalText.trim().length === 0) {
         // rc 0 with no output is the Workspace Trust / auth no-op
         // (scripts/dispatch-worker/seat-preflight.ts cursorBuildResultIsEmpty).
         // Never report it as success.
@@ -149,17 +185,107 @@ export class CursorAgentProvider implements IAgentProvider {
 
     let structuredOutput: unknown;
     if (options?.outputFormat?.type === 'json_schema') {
-      structuredOutput = parseJsonBestEffort(finalText);
+      structuredOutput = parseJsonBestEffort(stream.finalText);
     }
 
     yield {
       type: 'result',
       stopReason: 'stop',
       structuredOutput,
-      servedModelId: null,
-      servedModelMissingReason: 'cursor-agent --print text output carries no served-model field',
+      servedModelId: stream.servedModel ?? null,
+      ...(stream.servedModel
+        ? {}
+        : {
+            servedModelMissingReason:
+              'cursor-agent stream-json output had no system/init model field',
+          }),
     };
   }
+}
+
+interface CursorStreamState {
+  finalText: string;
+  servedModel?: string;
+  resultError: string | null;
+  successResultText: string;
+  diagnostics: string[];
+}
+
+function createCursorStreamState(): CursorStreamState {
+  return {
+    finalText: '',
+    resultError: null,
+    successResultText: '',
+    diagnostics: [],
+  };
+}
+
+/**
+ * One stream-json line. Bad JSON is recorded and skipped.
+ * thinking yields its `text` delta (idle-timer reset plus live progress).
+ * tool_call yields an empty thinking chunk: MessageChunk's tool variant
+ * requires toolName, which cursor-agent nests differently per tool.
+ * Neither event's text is appended to the node output (assistant texts only).
+ */
+function chunksForStreamLine(line: string, state: CursorStreamState): MessageChunk[] {
+  const raw = line.endsWith('\r') ? line.slice(0, -1) : line;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    state.diagnostics.push(raw);
+    return [];
+  }
+  const event = asRecord(parsed);
+  if (!event || typeof event.type !== 'string') {
+    state.diagnostics.push(raw);
+    return [];
+  }
+  if (event.type === 'assistant') {
+    const text = assistantEventText(event);
+    state.finalText += text;
+    return [{ type: 'assistant', content: text }];
+  }
+  if (event.type === 'thinking') {
+    const text = typeof event.text === 'string' ? event.text : '';
+    return [{ type: 'thinking', content: text }];
+  }
+  if (event.type === 'tool_call') {
+    return [{ type: 'thinking', content: '' }];
+  }
+  if (event.type === 'system' && event.subtype === 'init') {
+    if (typeof event.model === 'string' && event.model.length > 0) {
+      state.servedModel = event.model;
+    }
+    return [];
+  }
+  if (event.type === 'result') {
+    const resultText = typeof event.result === 'string' ? event.result : '';
+    const failed = event.is_error === true || event.subtype !== 'success';
+    if (failed) {
+      state.resultError = resultText.slice(-400);
+    } else {
+      state.successResultText = resultText;
+    }
+    return [];
+  }
+  return [];
+}
+
+function assistantEventText(event: Record<string, unknown>): string {
+  const message = asRecord(event.message);
+  if (!message || !Array.isArray(message.content)) return '';
+  let text = '';
+  for (const part of message.content) {
+    const record = asRecord(part);
+    if (record && typeof record.text === 'string') text += record.text;
+  }
+  return text;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
 }
 
 function buildCursorPrompt(prompt: string, options?: SendQueryOptions): string {

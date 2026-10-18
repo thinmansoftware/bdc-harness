@@ -36,6 +36,7 @@ import {
   getProviderCapabilities,
   getRegisteredProviders,
   isRegisteredProvider,
+  resolveProviderId,
 } from '@archon/providers';
 import type {
   DagNode,
@@ -84,9 +85,9 @@ import {
 } from './logger';
 import {
   withIdleTimeout,
-  STEP_IDLE_TIMEOUT_MS,
   resolveLoopIterationIdleTimeoutMs,
   resolveLoopIterationWallTimeoutMs,
+  resolveStepIdleTimeoutMs,
 } from './utils/idle-timeout';
 import {
   classifyError,
@@ -908,14 +909,15 @@ async function beginProviderAttempt(
     null
   );
   const requestedModel = model ?? declaredModel ?? 'provider-default';
+  const canonicalProvider = resolveProviderId(provider);
   const attempt: ProviderAttemptRecord = {
     attemptId: randomUUID(),
     runId: workflowRun.id,
     nodeId: node.id,
     attemptNumber: (latest?.attemptNumber ?? 0) + 1,
-    provider,
+    provider: canonicalProvider,
     model: requestedModel,
-    declaredProvider: provider,
+    declaredProvider: canonicalProvider,
     declaredModel: declaredModel ?? requestedModel,
     requiredCapabilities: deriveNodeExecutionRequirements(node).map(
       capability => EXECUTION_CAPABILITY_LEDGER_MAP[capability]
@@ -1940,8 +1942,9 @@ async function resolveNodeProviderAndModel(
     fallbackModel: fb,
   };
 
-  // Pass assistantConfig from config -- provider parses internally
+  // Assistant config stays keyed by the id as written (assistants.grok still applies).
   const assistantConfig = config.assistants[provider] ?? {};
+  const canonicalProvider = resolveProviderId(provider);
 
   const options: SendQueryOptions = {
     ...baseOptions,
@@ -1950,7 +1953,7 @@ async function resolveNodeProviderAndModel(
   };
 
   return {
-    provider,
+    provider: canonicalProvider,
     model: effectiveModel,
     options,
     declaredModelId: modelOverride?.nodes?.[node.id]?.model ?? model,
@@ -2208,7 +2211,19 @@ async function executeNodeInternal(
     ...(shouldForkSession ? { forkSession: true } : {}),
   };
   let nodeIdleTimedOut = false;
-  const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
+  const effectiveIdleTimeout = resolveStepIdleTimeoutMs(node.idle_timeout);
+  let nodeChunksSeen = 0;
+  let lastNodeProgressEventAt = 0;
+  const nodeProgressEventMs = ((): number => {
+    const fromEnv = Number.parseInt(process.env.ARCHON_NODE_PROGRESS_EVENT_MS ?? '', 10);
+    if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+    return 60_000;
+  })();
+  const cancelPollMs = ((): number => {
+    const fromEnv = Number.parseInt(process.env.ARCHON_NODE_CANCEL_POLL_MS ?? '', 10);
+    if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+    return CANCEL_CHECK_INTERVAL_MS;
+  })();
   let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
   let providerAttempt = await beginProviderAttempt(
     deps,
@@ -2219,8 +2234,31 @@ async function executeNodeInternal(
     declaredModelId
   );
   let providerAttemptCompleted = false;
+  // Started only after the attempt is reserved. beginProviderAttempt throws on
+  // ceiling, persist failure, and a rejecting listProviderAttempts; those paths
+  // must not leave this interval alive for the process lifetime.
+  let cancelPoll: ReturnType<typeof setInterval> | undefined;
 
   try {
+    cancelPoll = setInterval(() => {
+      void deps.store
+        .getWorkflowRunStatus(workflowRun.id)
+        .then(status => {
+          if (!shouldContinueStreamingForStatus(status)) {
+            getLog().info(
+              { workflowRunId: workflowRun.id, nodeId: node.id, status: status ?? 'deleted' },
+              'dag.stop_detected_during_streaming'
+            );
+            nodeAbortController.abort();
+          }
+        })
+        .catch((cancelCheckErr: unknown) => {
+          getLog().warn(
+            { err: cancelCheckErr as Error, workflowRunId: workflowRun.id, nodeId: node.id },
+            'dag.status_check_failed'
+          );
+        });
+    }, cancelPollMs);
     for await (const msg of withIdleTimeout(
       aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, nodeOptionsWithAbort),
       effectiveIdleTimeout,
@@ -2231,10 +2269,34 @@ async function executeNodeInternal(
           'dag_node_idle_timeout_reached'
         );
         nodeAbortController.abort();
-      }
+      },
+      undefined,
+      nodeAbortController.signal
     )) {
       const tickNow = Date.now();
       const nodeKey = `${workflowRun.id}:${node.id}`;
+      nodeChunksSeen += 1;
+      if (nodeChunksSeen === 1 || tickNow - lastNodeProgressEventAt >= nodeProgressEventMs) {
+        lastNodeProgressEventAt = tickNow;
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'node_progress',
+            step_name: node.id,
+            data: {
+              provider,
+              chunks_seen: nodeChunksSeen,
+              last_chunk_type: msg.type,
+              since_node_start_ms: tickNow - nodeStartTime,
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'node_progress' },
+              'workflow_event_persist_failed'
+            );
+          });
+      }
 
       // Cancel/pause check -- read-only, no write contention in WAL mode (every 10s).
       //
@@ -2653,7 +2715,9 @@ async function executeNodeInternal(
         });
         providerAttemptCompleted = true;
       }
-      const progressError = `Node '${node.id}' exceeded idle timeout (${String(effectiveIdleTimeout)}ms) without meaningful progress`;
+      const silenceReason: 'provider_never_started' | 'provider_silent' =
+        nodeChunksSeen === 0 ? 'provider_never_started' : 'provider_silent';
+      const progressError = `Node '${node.id}' ${silenceReason}: no provider output for ${String(effectiveIdleTimeout)}ms`;
       await safeSendMessage(
         platform,
         conversationId,
@@ -2673,6 +2737,7 @@ async function executeNodeInternal(
           extraEventData: {
             reason_code: 'progress_timeout',
             idle_timeout_ms: effectiveIdleTimeout,
+            reason: silenceReason,
           },
         }
       );
@@ -3104,6 +3169,8 @@ async function executeNodeInternal(
         ? { modelMismatch: !isDeclaredServedMatch(declaredModelId, nodeServedModelId) }
         : {}),
     };
+  } finally {
+    if (cancelPoll !== undefined) clearInterval(cancelPoll);
   }
 }
 
@@ -4510,7 +4577,7 @@ async function executeLoopNode(
               attemptId: iterationAttempt.attemptId,
               attemptNumber: iterationAttempt.attemptNumber,
               attemptStartedAt: iterationAttempt.startedAt,
-              provider: workflowProvider,
+              provider: resolveProviderId(workflowProvider),
               info: error.info,
               iteration: i,
             },
@@ -5837,7 +5904,7 @@ async function executeDagWorkflowInternal(
               output.state === 'failed' &&
               output.error !== undefined &&
               loopFailoverTarget !== null &&
-              loopFailoverTarget.provider !== loopProvider &&
+              resolveProviderId(loopFailoverTarget.provider) !== resolveProviderId(loopProvider) &&
               isRegisteredProvider(loopFailoverTarget.provider) &&
               (loopQuotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
             ) {
@@ -5854,8 +5921,11 @@ async function executeDagWorkflowInternal(
                   deps,
                   workflowRun.id,
                   node.id,
-                  { provider: loopProvider, model: loopModel },
-                  { provider: loopFailoverTarget.provider, model: loopFailoverModel },
+                  { provider: resolveProviderId(loopProvider), model: loopModel },
+                  {
+                    provider: resolveProviderId(loopFailoverTarget.provider),
+                    model: loopFailoverModel,
+                  },
                   loopFailoverErrorClass
                 );
                 await safeSendMessage(
@@ -6156,7 +6226,7 @@ async function executeDagWorkflowInternal(
             output.state === 'failed' &&
             output.error !== undefined &&
             failoverTarget !== null &&
-            failoverTarget.provider !== provider && // never "failover" to the same provider
+            resolveProviderId(failoverTarget.provider) !== provider && // never "failover" to the same provider
             (quotaRoute?.kind === 'failover' || isAvailabilityError(output.error))
           ) {
             try {

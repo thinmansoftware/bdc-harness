@@ -3,9 +3,15 @@
  * auto-circuit. Everything is dependency-injected (fake clock, fake DAL,
  * fake dispatch); no mock.module.
  */
-import { afterAll, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
+import { rootLogger } from '@archon/paths';
+import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
+
+// A synthetic exhausted response belongs to its test, never the next caller.
+beforeEach(resetGitHubApiMeterForTests);
+afterEach(resetGitHubApiMeterForTests);
 import {
   createTaskmasterState,
   defaultFindEffectByIdempotencyKey,
@@ -15,6 +21,8 @@ import {
   tick,
   resolveTaskmasterIntervalMs,
   resolveFireVerbEnabled,
+  resolveBlockerReportEnabled,
+  MAX_BLOCKER_REPORTS_PER_TICK,
   refreshAdoption,
   canonicalizeThreadRef,
   resolveRecipient,
@@ -29,9 +37,21 @@ import {
   type AdoptionRefreshResult,
 } from './loop';
 import { checkEvidence } from './expectations';
+import {
+  TASKMASTER_ESCALATION_MARKER,
+  TASKMASTER_ESCALATION_COOLDOWN_MS,
+  type EscalationDeliveryDeps,
+  type EscalationIssueComment,
+} from './escalation-delivery';
 import type { DispatchDeliveryMode } from '@archon/core/db/dispatch';
 import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
-import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal, NUDGE_CLOCK_MS } from './rules';
+import {
+  classifyThread,
+  computeNextAction,
+  MAX_INTERVENTIONS_PER_ITEM_24H,
+  NUDGE_CLOCK_MS,
+  type ActionProposal,
+} from './rules';
 import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
 import type { ThreadSnapshot } from './rules';
 import type {
@@ -460,6 +480,47 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
   };
 }
 
+/**
+ * Fake GitHub-issue escalation delivery seam
+ * (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). Records posted comments; its
+ * clock tracks world.nowMs so the module's 72h cooldown is evaluated against the
+ * same virtual time the tick uses. `onPost` lets ordering tests observe the post.
+ */
+function makeIssueCommentSink(
+  world: FakeWorld,
+  onPost?: (body: string) => void
+): { delivery: EscalationDeliveryDeps; posts: () => number; comments: EscalationIssueComment[] } {
+  // Comments are keyed per issue (owner/repo#number) so distinct issues do not
+  // share a dedupe window; `comments` is the flat aggregate for assertions.
+  const byIssue = new Map<string, EscalationIssueComment[]>();
+  const all: EscalationIssueComment[] = [];
+  let posts = 0;
+  const keyOf = (issue: { owner: string; repo: string; number: number }): string =>
+    `${issue.owner}/${issue.repo}#${issue.number}`;
+  return {
+    comments: all,
+    posts: () => posts,
+    delivery: {
+      listIssueComments: async issue => byIssue.get(keyOf(issue)) ?? [],
+      postIssueComment: async (issue, body) => {
+        posts += 1;
+        const comment = {
+          body,
+          created_at: new Date(world.nowMs).toISOString(),
+          authorLogin: 'taskmaster-bot',
+        };
+        const list = byIssue.get(keyOf(issue)) ?? [];
+        list.push(comment);
+        byIssue.set(keyOf(issue), list);
+        all.push(comment);
+        onPost?.(body);
+      },
+      posterLogin: async () => 'taskmaster-bot',
+      now: () => new Date(world.nowMs),
+    },
+  };
+}
+
 /** Seed today's digest as already sent so tests can assert exact send counts. */
 function seedDigestSent(world: FakeWorld): void {
   world.journal.push({
@@ -673,6 +734,62 @@ const EXPECTED_SPEC = {
   specHash: `sha256:${'b'.repeat(64)}`,
 };
 describe('fire_cauldron loop', () => {
+  test('beyond_first_page_cannot_fire_by_default', async () => {
+    const priorFireVerb = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    const priorBeyondPage = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    const run = async (allowBeyondPage: boolean) => {
+      if (allowBeyondPage) process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE = 'true';
+      else delete process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE;
+      const world = makeWorld();
+      seedDigestSent(world);
+      const item = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#499',
+        title: 'WO-HARNESS-EXAMPLE-01',
+        priority: 'P0',
+        isUnclaimed: true,
+        isUnclaimedP0: true,
+        beyondFirstPage: true,
+      });
+      const deps = makeDeps(world, {
+        listThreads: async () => [item],
+        checkFireEligibility: async () => ({
+          eligible: true,
+          evidence: {
+            woId: 'WO-HARNESS-EXAMPLE-01',
+            targetRepo: 'thinmansoftware/bdc-harness',
+            project: 'bdc-harness',
+            specVerifiedAt: new Date(T0).toISOString(),
+            noOpenOrMergedPr: true,
+            expectedSpec: EXPECTED_SPEC,
+          },
+        }),
+        runCascade: async options => {
+          const record = { cascadeId: 'cascade-499', status: 'running' } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        },
+      });
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      await tick(state, deps);
+      return world.journal.map(row => row.action_type);
+    };
+
+    try {
+      const gatedActions = await run(false);
+      expect(gatedActions).not.toContain('fire_cauldron');
+      expect(gatedActions).toContain('escalate_p0');
+      const allowedActions = await run(true);
+      expect(allowedActions).toContain('fire_cauldron');
+    } finally {
+      if (priorFireVerb === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFireVerb;
+      if (priorBeyondPage === undefined) delete process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE;
+      else process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE = priorBeyondPage;
+    }
+  });
+
   test('legacy eligibility without immutable identity never dispatches a cascade', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
@@ -935,6 +1052,10 @@ describe('fire_cauldron loop', () => {
           events.push(data.body.includes('Ratified ruling') ? 'deliver_ruling' : 'escalate_p0');
           return { id: `msg-${events.length}`, status: 'queued' } as never;
         }) as TaskmasterDeps['createTask'],
+        // The unclaimed-P0 escalation (#520) now delivers as a GitHub issue
+        // comment, not a dispatch message; record it in the same ordering trace
+        // (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01).
+        escalationDelivery: makeIssueCommentSink(world, () => events.push('escalate_p0')).delivery,
         runCascade: (async options => {
           events.push(`fire:${options.woId}`);
           const record = { cascadeId: `cascade-${options.woId}`, status: 'running' } as never;
@@ -1355,18 +1476,23 @@ describe('WO pause-gate enforcement (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01
     // pause_state defaults to RUNNING, pause_scope null.
 
     const { rulings, threads, refs } = threeDeliverables();
+    const sink = makeIssueCommentSink(world);
     const deps = makeDeps(world, {
       listUndeliveredRulings: async () => rulings,
       listThreads: async () => threads,
+      escalationDelivery: sink.delivery,
     });
     const state = createTaskmasterState(60_000);
 
     const result = await tick(state, deps);
 
-    // All 3 deliver exactly as before the gate WO.
+    // All 3 deliver exactly as before the gate WO -- but the two gh-ref P0
+    // escalations now land on their GitHub issues, not the operator mailbox
+    // (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). The ruling still dispatches.
     expect(result.effects).toBe(3);
     expect(result.parked).toBe(0);
-    expect(world.sentMessages.length).toBe(3);
+    expect(world.sentMessages.length).toBe(1);
+    expect(sink.posts()).toBe(2);
     const sent = world.journal.filter(j => j.outcome === 'sent' && refs.includes(j.thread_ref));
     expect(sent.length).toBe(3);
   });
@@ -2742,6 +2868,86 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     return { urls, fetchImpl };
   }
 
+  test('paginates_all_pages', async () => {
+    const urls: string[] = [];
+    const pageIssues = (start: number, count: number) =>
+      Array.from({ length: count }, (_, index) => ghIssue(start + index, ['wo', 'prio:P1']));
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      urls.push(url);
+      const parsed = new URL(url);
+      const label = parsed.searchParams.get('labels');
+      const page = Number(parsed.searchParams.get('page'));
+      let issues: Record<string, unknown>[] = [];
+      if (label === 'wo' && page === 1) issues = pageIssues(1, 100);
+      if (label === 'wo' && page === 2) issues = pageIssues(101, 100);
+      if (label === 'wo' && page === 3) issues = pageIssues(201, 30);
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'x-ratelimit-remaining': '100' },
+      });
+    }) as typeof fetch;
+
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(230);
+    const woPages = urls
+      .filter(url => new URL(url).searchParams.get('labels') === 'wo')
+      .map(url => Number(new URL(url).searchParams.get('page')));
+    expect(woPages).toEqual([1, 2, 3]);
+    expect(urls.some(url => new URL(url).searchParams.get('labels') === 'project')).toBe(true);
+    expect(urls.some(url => new URL(url).searchParams.get('labels') === 'arc')).toBe(true);
+    expect(threads.slice(0, 100).every(thread => thread.beyondFirstPage === false)).toBe(true);
+    expect(threads.slice(100).every(thread => thread.beyondFirstPage === true)).toBe(true);
+  });
+
+  test('caps_pages_per_label', async () => {
+    const urls: string[] = [];
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    if (streamSymbol === undefined) throw new Error('pino.stream symbol missing on rootLogger');
+    const stream = (rootLogger as unknown as Record<symbol, { write: (chunk: string) => boolean }>)[
+      streamSymbol
+    ];
+    const chunks: string[] = [];
+    const originalWrite = stream.write;
+    stream.write = (chunk: string) => {
+      chunks.push(String(chunk));
+      return true;
+    };
+    try {
+      const fetchImpl = (async (input: string | URL | Request) => {
+        const url = String(input);
+        urls.push(url);
+        const parsed = new URL(url);
+        const label = parsed.searchParams.get('labels');
+        const page = Number(parsed.searchParams.get('page'));
+        const issues =
+          label === 'wo'
+            ? Array.from({ length: 100 }, (_, index) =>
+                ghIssue((page - 1) * 100 + index + 1, ['wo', 'prio:P1'])
+              )
+            : [];
+        return new Response(JSON.stringify(issues), {
+          status: 200,
+          headers: { 'content-type': 'application/json', 'x-ratelimit-remaining': '100' },
+        });
+      }) as typeof fetch;
+
+      const threads = await defaultListThreads(fetchImpl);
+      const woPages = urls
+        .filter(url => new URL(url).searchParams.get('labels') === 'wo')
+        .map(url => Number(new URL(url).searchParams.get('page')));
+      expect(woPages).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+      expect(threads).toHaveLength(1000);
+      expect(
+        chunks.filter(chunk => chunk.includes('taskmaster.github_page_limit_reached'))
+      ).toHaveLength(1);
+    } finally {
+      stream.write = originalWrite;
+    }
+  });
+
   test('queries wo, project, and arc separately while preserving an explicit repo override', async () => {
     const { urls, fetchImpl } = fakeGithubFetch({
       wo: [ghIssue(1, ['wo', 'P1']), ghIssue(3, ['wo', 'arc', 'P0'])],
@@ -2806,6 +3012,38 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     expect(threads).toHaveLength(0);
     expect(threads.unlabelledPriorityTriage).toEqual(['gh:thinmansoftware/bdc-harness#44']);
     expect(priorityFromLabels(['wo'])).toBeNull();
+  });
+
+  test('project_issue_without_prio_defaults_to_p1', async () => {
+    const { fetchImpl } = fakeGithubFetch({ project: [ghIssue(9001, ['project'])] });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads.find(thread => thread.ref.endsWith('#9001'))?.priority).toBe('P1');
+    expect(threads.unlabelledPriorityTriage).not.toContain('gh:thinmansoftware/bdc-harness#9001');
+  });
+
+  test('wo_issue_without_prio_still_goes_to_triage', async () => {
+    const { fetchImpl } = fakeGithubFetch({ wo: [ghIssue(9002, ['wo'])] });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads.some(thread => thread.ref.endsWith('#9002'))).toBe(false);
+    expect(threads.unlabelledPriorityTriage).toContain('gh:thinmansoftware/bdc-harness#9002');
+  });
+
+  test('project_issue_with_explicit_prio_keeps_it', async () => {
+    const { fetchImpl } = fakeGithubFetch({
+      project: [ghIssue(9003, ['project', 'prio:P2'])],
+    });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads.find(thread => thread.ref.endsWith('#9003'))?.priority).toBe('P2');
+  });
+
+  test('project_label_match_is_exact_and_case_insensitive', async () => {
+    const { fetchImpl } = fakeGithubFetch({
+      project: [ghIssue(9004, ['Project']), ghIssue(9005, ['project-x'])],
+    });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads.find(thread => thread.ref.endsWith('#9004'))?.priority).toBe('P1');
+    expect(threads.some(thread => thread.ref.endsWith('#9005'))).toBe(false);
+    expect(threads.unlabelledPriorityTriage).toContain('gh:thinmansoftware/bdc-harness#9005');
   });
 
   test('defaults to bdc-xo when TASKMASTER_GH_REPOS is unset', async () => {
@@ -2971,6 +3209,112 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     expect(urls.some(url => url.includes('/events'))).toBe(false);
     expect(urls.some(url => url.includes('/issues/1454'))).toBe(false);
   });
+
+  test('wo_blocked_label_is_blocked', async () => {
+    const { fetchImpl } = fakeGithubFetch({
+      wo: [ghIssue(21, ['wo', 'prio:P0', 'wo:blocked'])],
+    });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(1);
+    const thread = threads[0];
+    if (thread === undefined) throw new Error('missing blocked thread');
+    expect(thread.isBlocked).toBe(true);
+    expect(
+      computeNextAction(thread, classifyThread(thread, T0), {
+        interventionsLast24h: 0,
+        nowMs: T0,
+      })
+    ).toBeNull();
+  });
+
+  test('open_pr_counts_as_claim', async () => {
+    const searchUrls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/search/issues')) {
+        searchUrls.push(url);
+        return new Response(JSON.stringify({ items: [{ title: 'WO-EXAMPLE-FOO-01' }] }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '100',
+          },
+        });
+      }
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      const issues =
+        label === 'wo' ? [ghIssue(31, ['wo', 'prio:P0'], { title: 'WO-EXAMPLE-FOO-01' })] : [];
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    const threads = await defaultListThreads(fetchImpl);
+    expect(searchUrls).toHaveLength(1);
+    const searchUrl = searchUrls[0];
+    expect(searchUrl).toBeDefined();
+    const q = new URL(searchUrl ?? '').searchParams.get('q') ?? '';
+    expect(q).toContain('is:pr');
+    expect(q).toContain('is:open');
+    expect(q).toContain('in:title,body');
+    expect(q).toContain('WO-EXAMPLE-FOO-01');
+    expect(q).toContain('org:thinmansoftware');
+    expect(threads).toHaveLength(1);
+    expect(threads[0]?.isUnclaimed).toBe(false);
+    expect(threads[0]?.isUnclaimedP0).toBe(false);
+  });
+
+  test('pr_lookup_fails_open', async () => {
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/search/issues')) {
+        return new Response('rate limited', {
+          status: 403,
+          headers: { 'x-ratelimit-remaining': '0' },
+        });
+      }
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      const issues =
+        label === 'wo' ? [ghIssue(32, ['wo', 'prio:P0'], { title: 'WO-EXAMPLE-FOO-01' })] : [];
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    // Pino keeps the destination on a local Symbol(pino.stream), not Symbol.for.
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    if (streamSymbol === undefined) {
+      throw new Error('pino.stream symbol missing on rootLogger');
+    }
+    const stream = (rootLogger as unknown as Record<symbol, { write: (chunk: string) => boolean }>)[
+      streamSymbol
+    ];
+    const chunks: string[] = [];
+    const originalWrite = stream.write;
+    stream.write = (chunk: string) => {
+      chunks.push(String(chunk));
+      return true;
+    };
+    try {
+      const threads = await defaultListThreads(fetchImpl);
+      expect(threads).toHaveLength(1);
+      expect(threads[0]?.isUnclaimed).toBe(true);
+      expect(threads[0]?.isUnclaimedP0).toBe(true);
+      expect(chunks.join('')).toContain('taskmaster.pr_claim_lookup_failed');
+    } finally {
+      stream.write = originalWrite;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3011,6 +3355,81 @@ function makeEvidence(overrides: Partial<GithubIssueEvidence> = {}): GithubIssue
 }
 
 describe('adoption projection', () => {
+  test('evidence_survives_snapshot', async () => {
+    const priorBudget = process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+    process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = '1';
+    try {
+      const world = makeWorld();
+      const refs = [4101, 4102, 4103].map(number => `gh:thinmansoftware/bdc-xo#${number}`);
+      let threads = refs.map((ref, index) =>
+        makeListedThread({
+          ref,
+          title: `Tick 1 title ${index}`,
+          priority: 'P1',
+          labels: ['wo', 'prio:P1'],
+          lastActivityAt: new Date(T0 - 10_000).toISOString(),
+        })
+      );
+      const enriched: string[] = [];
+      const deps = makeDeps(world, {
+        getGithubIssueEvidence: async ref => {
+          enriched.push(ref);
+          return makeEvidence({
+            ownerLogin: `owner-${ref.slice(-1)}`,
+            state: 'open',
+            labels: ['wo', 'prio:P1', 'evidence'],
+            updatedAt: new Date(T0).toISOString(),
+            latestMarkerKind: 'PROGRESS',
+            latestMarkerText: `next-${ref.slice(-1)}`,
+            latestMarkerAt: new Date(T0 - 2_000).toISOString(),
+            lastMovementAt: new Date(T0 - 3_000).toISOString(),
+            lastMovementKind: 'progress_comment',
+          });
+        },
+      });
+
+      await refreshAdoption(threads, deps);
+      const firstA = (await deps.db!.getAdoption!()).find(row => row.thread_ref === refs[0]);
+      expect(firstA?.owner_login).toBe('owner-1');
+
+      threads = threads.map((thread, index) => ({
+        ...thread,
+        title: `Tick 2 title ${index}`,
+        priority: 'P2',
+        labels: ['wo', 'prio:P2'],
+        isBlocked: true,
+        lastActivityAt: new Date(T0 - 20_000).toISOString(),
+      }));
+      await refreshAdoption(threads, deps);
+      const secondRows = await deps.db!.getAdoption!();
+      const secondA = secondRows.find(row => row.thread_ref === refs[0]);
+      expect(secondA?.owner_login).toBe('owner-1');
+      expect(secondA?.last_movement_at).toBe(new Date(T0 - 3_000).toISOString());
+      expect(secondA?.latest_marker_kind).toBe('PROGRESS');
+      expect(secondA?.next_action).toBe('next-1');
+      expect(secondA?.evidence_observed_at).not.toBeNull();
+      expect(secondA?.title).toBe('Tick 2 title 0');
+      expect(secondA?.priority).toBe('P2');
+      expect(secondA?.is_blocked).toBe(1);
+      expect(secondA?.source_updated_at).toBe(new Date(T0).toISOString());
+      expect(
+        secondRows.find(row => row.thread_ref === refs[1])?.evidence_observed_at
+      ).not.toBeNull();
+      expect(secondRows.find(row => row.thread_ref === refs[2])?.evidence_observed_at).toBeNull();
+
+      threads = threads.map((thread, index) =>
+        index === 0 ? { ...thread, lastActivityAt: new Date(T0 + 10_000).toISOString() } : thread
+      );
+      await refreshAdoption(threads, deps);
+      const thirdA = (await deps.db!.getAdoption!()).find(row => row.thread_ref === refs[0]);
+      expect(thirdA?.source_updated_at).toBe(new Date(T0 + 10_000).toISOString());
+      expect(enriched).toEqual(refs);
+    } finally {
+      if (priorBudget === undefined) delete process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET;
+      else process.env.TASKMASTER_ADOPTION_EVIDENCE_BUDGET = priorBudget;
+    }
+  });
+
   test('adoption: captures charter-minimum state (title owner blocker movement)', async () => {
     const world = makeWorld();
     const thread = makeListedThread({
@@ -3586,7 +4005,7 @@ describe('M-155 exception push (loop)', () => {
     expect(nudges[0]?.body).toContain('Chronic but titled');
   });
 
-  test('push: the five-verb allowlist and the budgets are explicit (regression)', () => {
+  test('push: the six-verb allowlist and the budgets are explicit (regression)', () => {
     expect(MAX_INTERVENTIONS_PER_ITEM_24H).toBe(3);
     expect(MAX_EFFECTS_PER_TICK).toBe(10);
     expect([...TM_ALLOWED_ACTION_TYPES]).toEqual([
@@ -3595,8 +4014,15 @@ describe('M-155 exception push (loop)', () => {
       'escalate_p0',
       'digest',
       'fire_cauldron',
+      'blocker_report',
     ]);
-    expect([...TM_ALLOWED_RECIPIENTS]).toEqual(['xo', 'major-build', 'captain-ci', 'operator']);
+    expect([...TM_ALLOWED_RECIPIENTS]).toEqual([
+      'xo',
+      'major-build',
+      'captain-ci',
+      'operator',
+      'duty-officer',
+    ]);
   });
 
   test('fire verb environment defaults OFF without a calendar budget', () => {
@@ -3616,6 +4042,844 @@ describe('M-155 exception push (loop)', () => {
         expect(site.slice(0, 300)).not.toContain("'RUNNING'");
       }
       expect(/pause_state:\s*'RUNNING'/.test(source)).toBe(false);
+    }
+  });
+});
+
+describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01)', () => {
+  const P0_REF = 'gh:thinmansoftware/bdc-harness#194';
+
+  function seedEscalation(
+    world: FakeWorld,
+    outcome: TmActionOutcome,
+    proposal: Record<string, unknown>
+  ): void {
+    world.journal.push({
+      id: `journal-escalate-seed-${world.journal.length}`,
+      created_at: new Date(world.nowMs - 31 * 60_000).toISOString(),
+      thread_ref: P0_REF,
+      action_type: 'escalate_p0',
+      proposal_json: JSON.stringify(proposal),
+      idempotency_key: 'tm:escalate_p0:seed',
+      before_hash: null,
+      proof_predicate: null,
+      proof_deadline_at: null,
+      outcome,
+      graded_at: null,
+      grade: null,
+    });
+  }
+
+  function unclaimedP0(ref = P0_REF): ListedThread {
+    return makeListedThread({
+      ref,
+      priority: 'P0',
+      isUnclaimed: true,
+      isUnclaimedP0: true,
+      lastActivityAt: new Date(T0 - 6 * 3_600_000).toISOString(),
+      title: 'WO-HARNESS-EXAMPLE-194 stuck P0',
+    });
+  }
+
+  test('adopt_fixup_stale_epoch_expired_does_not_suppress', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedEscalation(world, 'expired', { type: 'escalate_p0' });
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    const result = await tick(createTaskmasterState(60_000), deps);
+
+    expect(result.effects).toBe(1);
+    expect(gh.posts()).toBe(1);
+    expect(
+      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
+    ).toHaveLength(2);
+  });
+
+  test('adopt_fixup_pending_and_suppressed_dedupe_boundaries', async () => {
+    const pendingWorld = makeWorld();
+    seedDigestSent(pendingWorld);
+    seedEscalation(pendingWorld, 'pending', { type: 'escalate_p0' });
+    const pendingGh = makeIssueCommentSink(pendingWorld);
+    const pendingDeps = makeDeps(pendingWorld, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: pendingGh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), pendingDeps);
+
+    expect(pendingGh.posts()).toBe(1);
+    expect(
+      pendingWorld.journal.filter(
+        row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+      )
+    ).toHaveLength(2);
+
+    const suppressedWorld = makeWorld();
+    seedDigestSent(suppressedWorld);
+    seedEscalation(suppressedWorld, 'expired', {
+      type: 'escalate_p0',
+      suppressed: 'claim_held',
+    });
+    const suppressedGh = makeIssueCommentSink(suppressedWorld);
+    const suppressedDeps = makeDeps(suppressedWorld, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: suppressedGh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), suppressedDeps);
+
+    expect(suppressedGh.posts()).toBe(0);
+    expect(
+      suppressedWorld.journal.filter(
+        row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+      )
+    ).toHaveLength(1);
+  });
+
+  test('adopt_fixup_concurrent_ticks_journal_one_escalation', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+    const getActionsSince = deps.db!.getActionsSince.bind(deps.db);
+    let releaseLookback: (() => void) | undefined;
+    const lookbackBarrier = new Promise<void>(resolve => {
+      releaseLookback = resolve;
+    });
+    let lookbackCalls = 0;
+    deps.db = {
+      ...deps.db!,
+      getActionsSince: async sinceIso => {
+        lookbackCalls += 1;
+        if (lookbackCalls === 1) setTimeout(() => releaseLookback?.(), 0);
+        if (lookbackCalls <= 2) await lookbackBarrier;
+        return getActionsSince(sinceIso);
+      },
+    };
+
+    try {
+      await Promise.all([
+        tick(createTaskmasterState(60_000), deps),
+        tick(createTaskmasterState(60_000), deps),
+      ]);
+    } finally {
+      releaseLookback?.();
+    }
+
+    expect(
+      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
+    ).toHaveLength(1);
+    expect(gh.posts()).toBe(1);
+  });
+
+  test('gh-ref escalation posts exactly one marked comment and sends NO dispatch message', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      // Ambient TASKMASTER_FIRE_VERB_ENABLED must not turn these into fire cascades.
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    // One marked issue comment; zero operator-mailbox dispatch messages.
+    expect(gh.posts()).toBe(1);
+    expect(gh.comments).toHaveLength(1);
+    expect(gh.comments[0]?.body).toContain(TASKMASTER_ESCALATION_MARKER);
+    expect(gh.comments[0]?.body).toContain('Escalated by Taskmaster (M-155).');
+    expect(world.sentMessages).toHaveLength(0);
+
+    // Journal: the escalate_p0 row is sent + graded delivered_to_issue.
+    const row = world.journal.find(j => j.thread_ref === P0_REF && j.action_type === 'escalate_p0');
+    expect(row?.outcome).toBe('sent');
+    expect(row?.grade).toBe('delivered_to_issue');
+  });
+
+  test('a later tick with no new activity (within cooldown) posts nothing more', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      // Ambient TASKMASTER_FIRE_VERB_ENABLED must not turn these into fire cascades.
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    // Tick 1 posts.
+    await tick(createTaskmasterState(60_000), deps);
+    expect(gh.posts()).toBe(1);
+
+    // Advance past the P0 bucket (30m) so a fresh escalate_p0 proposal is made,
+    // but stay well inside the 72h cooldown. The module suppresses the repeat.
+    world.nowMs += 45 * 60_000;
+    await tick(createTaskmasterState(60_000), deps);
+    expect(gh.posts()).toBe(1);
+    expect(gh.comments).toHaveLength(1);
+    expect(world.sentMessages).toHaveLength(0);
+  });
+
+  test('posted:true -> row sent + delivered_to_issue and counted as one tick effect', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    const result = await tick(createTaskmasterState(60_000), deps);
+
+    expect(gh.posts()).toBe(1);
+    expect(result.effects).toBe(1);
+    expect(result.expired).toBe(0);
+    const rows = world.journal.filter(
+      j => j.thread_ref === P0_REF && j.action_type === 'escalate_p0'
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.outcome).toBe('sent');
+    expect(rows[0]?.grade).toBe('delivered_to_issue');
+    expect(JSON.parse(rows[0]?.proposal_json ?? '{}').suppressed).toBeUndefined();
+  });
+
+  test('posted:false (cooldown marker) -> expired + suppressed detail, ungraded, not an effect', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: {
+        ...gh.delivery,
+        listIssueComments: async () => [
+          {
+            body: TASKMASTER_ESCALATION_MARKER,
+            created_at: new Date(world.nowMs).toISOString(),
+            authorLogin: 'taskmaster-bot',
+          },
+        ],
+      },
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    const first = await tick(createTaskmasterState(60_000), deps);
+    expect(first.expired).toBe(1);
+    expect(gh.posts()).toBe(0);
+
+    // New P0 bucket (30m), same 24h journal window: proposal-level dedupe
+    // prevents a second delivery attempt and journal row.
+    world.nowMs += 45 * 60_000;
+    const result = await tick(createTaskmasterState(60_000), deps);
+
+    expect(gh.posts()).toBe(0);
+    expect(result.effects).toBe(0);
+    expect(result.expired).toBe(0);
+    const rows = world.journal.filter(
+      j => j.thread_ref === P0_REF && j.action_type === 'escalate_p0'
+    );
+    expect(rows).toHaveLength(1);
+    const suppressed = rows[0];
+    expect(suppressed?.outcome).toBe('expired');
+    expect(suppressed?.grade).toBeNull();
+    expect(JSON.parse(suppressed?.proposal_json ?? '{}').suppressed).toBe('cooldown_marker');
+  });
+
+  test('claim held by another attempt -> expired with suppressed=claim_held, nothing posted', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    let lists = 0;
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: {
+        ...gh.delivery,
+        listIssueComments: async (...args) => {
+          lists += 1;
+          return gh.delivery.listIssueComments(...args);
+        },
+        claim: {
+          claim: async () => null,
+          complete: async () => {},
+          release: async () => {},
+        },
+      },
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    const result = await tick(createTaskmasterState(60_000), deps);
+
+    // The claim is taken BEFORE the GitHub list+post: neither happens.
+    expect(lists).toBe(0);
+    expect(gh.posts()).toBe(0);
+    expect(result.effects).toBe(0);
+    expect(result.expired).toBe(1);
+    const row = world.journal.find(j => j.thread_ref === P0_REF && j.action_type === 'escalate_p0');
+    expect(row?.outcome).toBe('expired');
+    expect(row?.grade).toBeNull();
+    expect(JSON.parse(row?.proposal_json ?? '{}').suppressed).toBe('claim_held');
+  });
+
+  test('escalate_p0_journaled_once_per_issue_per_24h', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: {
+        ...gh.delivery,
+        claim: { claim: async () => null, complete: async () => {}, release: async () => {} },
+      },
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    for (let index = 0; index < 3; index += 1) {
+      const result = await tick(createTaskmasterState(60_000), deps);
+      expect(result.expired).toBe(index === 0 ? 1 : 0);
+      world.nowMs += 31 * 60_000;
+    }
+
+    expect(
+      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
+    ).toHaveLength(1);
+  });
+
+  test('escalate_p0_reproposed_after_24h', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: {
+        ...gh.delivery,
+        claim: { claim: async () => null, complete: async () => {}, release: async () => {} },
+      },
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+    world.nowMs += 25 * 60 * 60_000;
+    const result = await tick(createTaskmasterState(60_000), deps);
+
+    expect(result.expired).toBe(1);
+    expect(
+      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
+    ).toHaveLength(2);
+  });
+
+  test('escalate_p0_dedupe_is_per_thread', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const refs = ['gh:thinmansoftware/bdc-harness#9101', 'gh:thinmansoftware/bdc-harness#9102'];
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => refs.map(ref => unclaimedP0(ref)),
+      escalationDelivery: {
+        ...gh.delivery,
+        claim: { claim: async () => null, complete: async () => {}, release: async () => {} },
+      },
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    for (let index = 0; index < 3; index += 1) {
+      await tick(createTaskmasterState(60_000), deps);
+      world.nowMs += 31 * 60_000;
+    }
+
+    for (const ref of refs) {
+      expect(
+        world.journal.filter(row => row.thread_ref === ref && row.action_type === 'escalate_p0')
+      ).toHaveLength(1);
+    }
+  });
+
+  test('suppressed escalations do not consume the per-item 24h intervention cap or the floor', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: {
+        ...gh.delivery,
+        claim: {
+          claim: async () => null,
+          complete: async () => {},
+          release: async () => {},
+        },
+      },
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    // Tick 1 reaches delivery and is suppressed. Later buckets are dropped by
+    // proposal-level dedupe before delivery and do not affect intervention
+    // accounting or the useful-rate floor.
+    const first = await tick(createTaskmasterState(60_000), deps);
+    expect(first.expired).toBe(1);
+    const suppressedTicks = MAX_INTERVENTIONS_PER_ITEM_24H + 2;
+    for (let i = 0; i < suppressedTicks; i += 1) {
+      world.nowMs += 31 * 60_000;
+      const result = await tick(createTaskmasterState(60_000), deps);
+      expect(result.effects).toBe(0);
+      expect(result.expired).toBe(0);
+    }
+
+    expect(gh.posts()).toBe(0);
+    const rows = world.journal.filter(
+      j => j.thread_ref === P0_REF && j.action_type === 'escalate_p0'
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows.filter(r => r.outcome === 'sent')).toHaveLength(0);
+    expect(rows.filter(r => r.outcome === 'expired')).toHaveLength(1);
+    // Never graded: not in the useful-rate floor (only 'useful'/'noise' count)
+    // and never 'delivered_to_issue'.
+    for (const row of rows.filter(r => r.outcome === 'expired')) {
+      expect(row.grade).toBeNull();
+    }
+  });
+
+  test('after the 72h cooldown, the next tick escalates again', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0()],
+      escalationDelivery: gh.delivery,
+      // Ambient TASKMASTER_FIRE_VERB_ENABLED must not turn these into fire cascades.
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+    expect(gh.posts()).toBe(1);
+
+    // Advance beyond the cooldown (new bucket, new idempotency key): re-escalate.
+    // Crossing >72h lands on a new UTC day, so a fresh digest legitimately
+    // dispatches; assert only that NO escalate_p0 went to the operator mailbox.
+    world.nowMs += TASKMASTER_ESCALATION_COOLDOWN_MS + 60 * 60_000;
+    await tick(createTaskmasterState(60_000), deps);
+    expect(gh.posts()).toBe(2);
+    expect(gh.comments).toHaveLength(2);
+    expect(
+      world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:escalate_p0:'))
+    ).toHaveLength(0);
+  });
+
+  test('a non-gh escalate_p0 thread keeps the operator-mailbox dispatch path', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0('dispatch:orphan-p0-1')],
+      escalationDelivery: gh.delivery,
+      // Ambient TASKMASTER_FIRE_VERB_ENABLED must not turn these into fire cascades.
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    // No issue comment; the escalation goes out as a dispatch message as before.
+    expect(gh.posts()).toBe(0);
+    const escalations = world.sentMessages.filter(m =>
+      m.idempotency_key.startsWith('tm:escalate_p0:')
+    );
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]?.recipient).toBe('operator');
+    expect(escalations[0]?.body).toContain('Unclaimed P0');
+  });
+
+  test('kill switch TASKMASTER_ESCALATE_TO_ISSUE=false restores the dispatch path for a gh-ref', async () => {
+    const prior = process.env.TASKMASTER_ESCALATE_TO_ISSUE;
+    process.env.TASKMASTER_ESCALATE_TO_ISSUE = 'false';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const gh = makeIssueCommentSink(world);
+      const deps = makeDeps(world, {
+        listThreads: async () => [unclaimedP0()],
+        escalationDelivery: gh.delivery,
+        checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+      });
+
+      await tick(createTaskmasterState(60_000), deps);
+
+      // Kill switch off => no issue comment; old dispatch-mailbox path used.
+      expect(gh.posts()).toBe(0);
+      const escalations = world.sentMessages.filter(m =>
+        m.idempotency_key.startsWith('tm:escalate_p0:')
+      );
+      expect(escalations).toHaveLength(1);
+      expect(escalations[0]?.recipient).toBe('operator');
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_ESCALATE_TO_ISSUE;
+      else process.env.TASKMASTER_ESCALATE_TO_ISSUE = prior;
+    }
+  });
+});
+
+describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', () => {
+  const HOUR = 3_600_000;
+
+  function withBlockerFlag(value: string | undefined): () => void {
+    const prior = process.env.TASKMASTER_BLOCKER_REPORT;
+    if (value === undefined) delete process.env.TASKMASTER_BLOCKER_REPORT;
+    else process.env.TASKMASTER_BLOCKER_REPORT = value;
+    return () => {
+      if (prior === undefined) delete process.env.TASKMASTER_BLOCKER_REPORT;
+      else process.env.TASKMASTER_BLOCKER_REPORT = prior;
+    };
+  }
+
+  function blockedThread(n: number): ListedThread {
+    return makeListedThread({
+      ref: `gh:thinmansoftware/bdc-xo#${n}`,
+      priority: 'P1',
+      title: `WO-BLOCK-${n} stuck`,
+      isBlocked: true,
+      labels: ['wo', 'prio:P1', 'blocked'],
+      lastActivityAt: new Date(T0 - 3 * HOUR).toISOString(),
+    });
+  }
+
+  test('blocker_report: tick sends to duty-officer with subject and repeat reason, capped per tick', async () => {
+    const restore = withBlockerFlag('true');
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const threads = [1, 2, 3, 4, 5].map(blockedThread);
+      const createCalls: Array<{
+        idempotency_key: string;
+        recipient: string;
+        subject_key?: string;
+        repeat_reason?: string;
+        priority?: string;
+        body: string;
+      }> = [];
+      const deps = makeDeps(world, {
+        listThreads: async () =>
+          Object.assign([...threads], { unlabelledPriorityTriage: [] as string[] }),
+        createTask: (async (
+          _ctx: unknown,
+          data: {
+            idempotency_key: string;
+            recipient: string;
+            subject_key?: string;
+            repeat_reason?: string;
+            priority?: string;
+            body: string;
+          }
+        ) => {
+          createCalls.push(data);
+          world.sentMessages.push({
+            idempotency_key: data.idempotency_key,
+            recipient: data.recipient,
+            body: data.body,
+            createdAt: new Date(world.nowMs).toISOString(),
+          });
+          return { id: `msg-${world.sentMessages.length}`, status: 'queued' };
+        }) as unknown as TaskmasterDeps['createTask'],
+      });
+      const registered: Array<{ recipient: string; on_absence: string; max_retries: number }> = [];
+      deps.db = {
+        ...deps.db!,
+        registerExpectation: async (d: {
+          recipient: string;
+          on_absence: string;
+          max_retries: number;
+        }) => {
+          registered.push(d);
+          return `exp-${registered.length}`;
+        },
+      };
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps); // confirm tick
+      world.nowMs += 60_000;
+      await tick(state, deps); // send tick
+
+      const reportCalls = createCalls.filter(c =>
+        c.idempotency_key.startsWith('tm:blocker_report:')
+      );
+      expect(reportCalls).toHaveLength(MAX_BLOCKER_REPORTS_PER_TICK);
+      for (const c of reportCalls) {
+        expect(c.recipient).toBe('duty-officer');
+        expect(c.subject_key).toMatch(/^gh:thinmansoftware\/bdc-xo#\d+$/);
+        expect(c.repeat_reason).toBe('tm:blocker_report:repeated');
+        expect(c.priority).toBeUndefined();
+      }
+      // The other 2 are journaled deferred.
+      const deferred = world.journal.filter(
+        j => j.action_type === 'blocker_report' && j.outcome === 'deferred'
+      );
+      expect(deferred).toHaveLength(2);
+      // No createTask addressed to xo or an owner seat.
+      expect(
+        createCalls.some(c => ['xo', 'major-build', 'captain-ci', 'operator'].includes(c.recipient))
+      ).toBe(false);
+      // Each blocker_report expectation: give_up / 0 retries (no redispatch).
+      const blockerExps = registered.filter(e => e.recipient === 'duty-officer');
+      expect(blockerExps).toHaveLength(MAX_BLOCKER_REPORTS_PER_TICK);
+      for (const e of blockerExps) {
+        expect(e.on_absence).toBe('give_up');
+        expect(e.max_retries).toBe(0);
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  test('blocker_report: pause parks it and the flag turns it off', async () => {
+    // (a) PAUSED scope effects -> parked, no send.
+    {
+      const restore = withBlockerFlag('true');
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        world.control.pause_state = 'PAUSED';
+        world.control.pause_scope = 'effects';
+        const deps = makeDeps(world, { listThreads: async () => [blockedThread(11)] });
+        const state = createTaskmasterState(60_000);
+        await tick(state, deps);
+        world.nowMs += 60_000;
+        await tick(state, deps);
+        const row = world.journal.find(j => j.action_type === 'blocker_report');
+        expect(row?.outcome).toBe('parked');
+        expect(JSON.parse(row?.proposal_json ?? '{}').reason).toBe('paused');
+        expect(
+          world.sentMessages.some(m => m.idempotency_key.startsWith('tm:blocker_report:'))
+        ).toBe(false);
+      } finally {
+        restore();
+      }
+    }
+    // (b) PAUSED scope null -> still parked (blocker_report is never pause-exempt).
+    {
+      const restore = withBlockerFlag('true');
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        world.control.pause_state = 'PAUSED';
+        world.control.pause_scope = null;
+        const deps = makeDeps(world, { listThreads: async () => [blockedThread(12)] });
+        const state = createTaskmasterState(60_000);
+        await tick(state, deps);
+        world.nowMs += 60_000;
+        await tick(state, deps);
+        const row = world.journal.find(j => j.action_type === 'blocker_report');
+        expect(row?.outcome).toBe('parked');
+        expect(JSON.parse(row?.proposal_json ?? '{}').reason).toBe('paused');
+      } finally {
+        restore();
+      }
+    }
+    // (c) RUNNING with flag 'false' -> no proposal at all.
+    {
+      const restore = withBlockerFlag('false');
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const deps = makeDeps(world, { listThreads: async () => [blockedThread(13)] });
+        const state = createTaskmasterState(60_000);
+        await tick(state, deps);
+        world.nowMs += 60_000;
+        await tick(state, deps);
+        expect(world.journal.some(j => j.action_type === 'blocker_report')).toBe(false);
+        expect(
+          world.sentMessages.some(m => m.idempotency_key.startsWith('tm:blocker_report:'))
+        ).toBe(false);
+      } finally {
+        restore();
+      }
+    }
+    // (d) unset follows the clock-enabled signal.
+    expect(resolveBlockerReportEnabled(undefined, false)).toBe(false);
+    expect(resolveBlockerReportEnabled(undefined, true)).toBe(true);
+    expect(resolveBlockerReportEnabled('false', true)).toBe(false);
+    expect(resolveBlockerReportEnabled('1', false)).toBe(true);
+  });
+
+  test('blocker_report: never graded useful or noise and never moves the floor', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const nudgeRef = 'gh:thinmansoftware/bdc-xo#700';
+    const blockerRef = 'gh:thinmansoftware/bdc-xo#701';
+    const nudgeKey = `tm:nudge:${nudgeRef}:1`;
+    const blockerKey = `tm:blocker_report:${blockerRef}:1`;
+    const createdAt = new Date(T0 - 23 * HOUR).toISOString();
+    const deadline = new Date(T0 - 1 * HOUR).toISOString();
+
+    for (const [key, ref, type, recipient] of [
+      [nudgeKey, nudgeRef, 'nudge', 'major-build'],
+      [blockerKey, blockerRef, 'blocker_report', 'duty-officer'],
+    ] as const) {
+      world.journal.push({
+        id: `seed-${type}`,
+        created_at: createdAt,
+        thread_ref: ref,
+        action_type: type,
+        proposal_json: '{}',
+        idempotency_key: key,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: deadline,
+        outcome: 'sent',
+        graded_at: null,
+        grade: null,
+      });
+      world.sentMessages.push({
+        idempotency_key: key,
+        recipient,
+        body: 'seeded',
+        createdAt,
+        acknowledged_at: new Date(T0 - 2 * HOUR).toISOString(),
+      });
+    }
+
+    const deps = makeDeps(world, {
+      // Both the nudge and the blocker_report rows refer to a now-closed issue.
+      getGithubIssueEvidence: async () =>
+        makeEvidence({ state: 'closed', closedAt: new Date(T0 - 2 * HOUR).toISOString() }),
+      // Live principals: duty-officer is worker_poll (non-draining), so the
+      // blocker_report's dispatch row counts as heard -- yet it must still never
+      // be graded useful/noise.
+      assessDispatchRecipient: (async (recipient: string) => ({
+        ok: true,
+        canonical_principal: recipient.trim().toLowerCase(),
+        delivery_mode: 'worker_poll' as DispatchDeliveryMode,
+        reason: null,
+      })) as unknown as TaskmasterDeps['assessDispatchRecipient'],
+    });
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    const nudgeRow = world.journal.find(j => j.id === 'seed-nudge');
+    const blockerRow = world.journal.find(j => j.id === 'seed-blocker_report');
+    // The ordinary nudge is graded exactly as before (a closed issue -> useful).
+    expect(nudgeRow?.grade).toBe('useful');
+    // The blocker_report is NEVER graded useful or noise -> absent from the floor.
+    expect(blockerRow?.grade).toBeNull();
+  });
+
+  test('blocker_report: other verbs are unchanged when the flag is on', async () => {
+    const restoreFlag = withBlockerFlag('true');
+    const priorFire = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const A = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#801',
+        priority: 'P0',
+        isUnclaimed: true,
+        isUnclaimedP0: true,
+        title: 'WO-FIRE-ELIGIBLE-801 outage',
+        lastActivityAt: new Date(T0 - 3 * HOUR).toISOString(),
+      });
+      const B = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#802',
+        priority: 'P0',
+        isUnclaimed: true,
+        isUnclaimedP0: true,
+        title: 'WO-NONFIRE-802 stuck',
+        lastActivityAt: new Date(T0 - 3 * HOUR).toISOString(),
+      });
+      const C = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#803',
+        priority: 'P1',
+        isUnclaimed: false,
+        ownerLogin: 'major-build',
+        title: 'WO-NUDGE-803 investigate',
+        lastActivityAt: new Date(T0 - 3 * HOUR).toISOString(),
+      });
+      const gh = makeIssueCommentSink(world);
+      const record = { cascadeId: 'cascade-801', status: 'running' } as unknown as Awaited<
+        ReturnType<NonNullable<TaskmasterDeps['runCascade']>>
+      >;
+      const deps = makeDeps(world, {
+        listThreads: async () =>
+          Object.assign([A, B, C], { unlabelledPriorityTriage: [] as string[] }),
+        escalationDelivery: gh.delivery,
+        checkFireEligibility: async (title: string) =>
+          title.includes('WO-FIRE-ELIGIBLE-801')
+            ? {
+                eligible: true,
+                evidence: {
+                  woId: 'WO-FIRE-ELIGIBLE-801',
+                  targetRepo: 'thinmansoftware/bdc-harness',
+                  project: 'bdc-harness',
+                  specVerifiedAt: new Date(T0).toISOString(),
+                  noOpenOrMergedPr: true,
+                  expectedSpec: EXPECTED_SPEC,
+                },
+              }
+            : { eligible: false, reason: 'not_eligible' },
+        runCascade: (async options => {
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+        getGithubIssueEvidence: async (ref: string) =>
+          ref.includes('#803')
+            ? makeEvidence({
+                ownerLogin: 'major-build',
+                latestMarkerKind: 'PROGRESS',
+                latestMarkerText: 'rerun the failing export suite',
+                updatedAt: new Date(T0 - 3 * HOUR).toISOString(),
+                lastMovementAt: new Date(T0 - 3 * HOUR).toISOString(),
+              })
+            : null,
+      });
+      deps.db = {
+        ...deps.db!,
+        registerExpectation: async () => 'exp',
+      };
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      world.nowMs += 60_000;
+      await tick(state, deps);
+
+      // fire_cauldron produced for A (and A gets NO blocker_report).
+      expect(
+        world.journal.some(j => j.action_type === 'fire_cauldron' && j.outcome === 'sent')
+      ).toBe(true);
+      expect(
+        world.journal.some(j => j.action_type === 'blocker_report' && j.thread_ref === A.ref)
+      ).toBe(false);
+
+      // escalate_p0 for B delivered via the issue-comment path (not displaced).
+      const escalateB = world.journal.find(
+        j => j.action_type === 'escalate_p0' && j.thread_ref === B.ref
+      );
+      expect(escalateB?.outcome).toBe('sent');
+      expect(escalateB?.grade).toBe('delivered_to_issue');
+      expect(gh.posts()).toBeGreaterThanOrEqual(1);
+
+      // nudge for C sent exactly as before.
+      expect(world.sentMessages.some(m => m.idempotency_key.startsWith(`tm:nudge:${C.ref}:`))).toBe(
+        true
+      );
+
+      // B additionally gets ONE blocker_report (deferred to a later tick by the
+      // 1-effect-per-item rule), never in place of escalate_p0.
+      const blockerB = world.sentMessages.filter(
+        m => m.idempotency_key === `tm:blocker_report:${B.ref}:${Math.floor(T0 / (72 * HOUR))}`
+      );
+      expect(blockerB).toHaveLength(1);
+      expect(blockerB[0]?.recipient).toBe('duty-officer');
+    } finally {
+      restoreFlag();
+      if (priorFire === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFire;
     }
   });
 });

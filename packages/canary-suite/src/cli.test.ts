@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'bun:test';
+import type { IAgentProvider, MessageChunk } from '@archon/providers/types';
 import { runCanaryCli } from './cli';
 import type { CanaryReport, RunCanaryResult } from './types';
 import type { TaskmasterCanaryResult } from './taskmaster-canary';
@@ -159,4 +160,91 @@ test('taskmaster maps a failed report to exit 2 after writing its artifact', asy
 
   expect(await runCanaryCli([...taskmasterArgs, '--interval-ms', '60000'], {}, deps)).toBe(2);
   expect(deps.taskmasterArtifactWriter).toHaveBeenCalledWith('artifacts', failedReport);
+});
+
+const probeBindingArgs = [
+  'probe-binding',
+  '--provider',
+  'fixture-provider',
+  '--model',
+  'fixture-model',
+];
+
+function probeCliDeps(behavior: MessageChunk[] | Error) {
+  const seen: { providerId?: string; cwd?: string; model?: unknown } = {};
+  const getAgentProvider = mock((providerId: string): IAgentProvider => {
+    seen.providerId = providerId;
+    return {
+      getType: () => 'claude',
+      getCapabilities: () => ({}) as ReturnType<IAgentProvider['getCapabilities']>,
+      async *sendQuery(
+        _prompt: string,
+        cwd: string,
+        _resume?: string,
+        options?: { model?: string }
+      ) {
+        seen.cwd = cwd;
+        seen.model = options?.model;
+        if (behavior instanceof Error) throw behavior;
+        for (const chunk of behavior) yield chunk;
+      },
+    };
+  });
+  return {
+    seen,
+    runner: mock(async () => ({}) as RunCanaryResult),
+    stdout: mock(() => {}),
+    stderr: mock(() => {}),
+    probeBinding: {
+      getAgentProvider,
+      sleep: async () => {},
+      cwd: '/tmp/probe-binding-cli',
+    },
+  };
+}
+
+test('probe-binding dispatches injected deps to stdout and exit 0', async () => {
+  const deps = probeCliDeps([{ type: 'assistant', content: 'OK' }]);
+  const exit = await runCanaryCli(probeBindingArgs, {}, deps);
+
+  expect(exit).toBe(0);
+  expect(deps.runner).not.toHaveBeenCalled();
+  expect(deps.seen.providerId).toBe('fixture-provider');
+  expect(deps.seen.model).toBe('fixture-model');
+  expect(deps.seen.cwd).toBe('/tmp/probe-binding-cli');
+  expect(deps.stdout).toHaveBeenCalledWith('ok');
+  expect(deps.stderr).not.toHaveBeenCalled();
+});
+
+test('probe-binding routes a failed probe to stderr and exit 2', async () => {
+  const deps = probeCliDeps(Object.assign(new Error('authentication failed'), { httpStatus: 401 }));
+  const exit = await runCanaryCli(probeBindingArgs, {}, deps);
+
+  expect(exit).toBe(2);
+  expect(deps.runner).not.toHaveBeenCalled();
+  expect(deps.stdout).not.toHaveBeenCalled();
+  expect(deps.stderr).toHaveBeenCalledTimes(1);
+  expect(String(deps.stderr.mock.calls[0]?.[0])).toContain('unknown_400');
+});
+
+test('probe-binding rejects missing arguments on stderr before calling the provider', async () => {
+  const deps = probeCliDeps([{ type: 'assistant', content: 'OK' }]);
+  const exit = await runCanaryCli(['probe-binding', '--provider', 'fixture-provider'], {}, deps);
+
+  expect(exit).toBe(2);
+  expect(deps.probeBinding.getAgentProvider).not.toHaveBeenCalled();
+  expect(deps.stdout).not.toHaveBeenCalled();
+  expect(deps.stderr).toHaveBeenCalledWith('probe_binding_missing_required_argument');
+});
+
+test('probe-binding uses default deps when probeBinding is omitted', async () => {
+  const runner = mock(async () => ({}) as RunCanaryResult);
+  const stdout = mock(() => {});
+  const stderr = mock(() => {});
+  const exit = await runCanaryCli(['probe-binding'], {}, { runner, stdout, stderr });
+
+  expect(exit).toBe(2);
+  expect(runner).not.toHaveBeenCalled();
+  expect(stdout).not.toHaveBeenCalled();
+  expect(stderr).toHaveBeenCalledWith('probe_binding_missing_required_argument');
 });

@@ -142,7 +142,10 @@ describe('real GitHub deps', () => {
       state: 'all',
       per_page: 5,
     });
-    expect(search).not.toHaveBeenCalled();
+    expect(search).toHaveBeenCalledWith({
+      q: 'repo:thinmansoftware/bdc-harness is:pr is:open "WO-42"',
+      per_page: 5,
+    });
     expect(result).toMatchObject({
       exists: true,
       state: 'open',
@@ -179,7 +182,7 @@ describe('real GitHub deps', () => {
     });
 
     expect(search).toHaveBeenCalledWith({
-      q: 'repo:thinmansoftware/bdc-harness is:pr "WO-FALLBACK-77"',
+      q: 'repo:thinmansoftware/bdc-harness is:pr is:open "WO-FALLBACK-77"',
       per_page: 5,
     });
     expect(get).toHaveBeenCalledWith({

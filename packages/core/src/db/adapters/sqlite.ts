@@ -66,6 +66,19 @@ const TM_EXPECTATIONS_DUE_INDEX =
 const TM_EXPECTATIONS_DISPATCH_REF_INDEX =
   'CREATE INDEX IF NOT EXISTS idx_tm_expectations_dispatch_ref ON tm_expectations(dispatch_ref)';
 
+/**
+ * Canonical tm_journal indexes (migration 041). Shared by initSchema and the
+ * CHECK-widening table rebuilds in migrateColumns, so a rebuild recreates them
+ * in its own transaction instead of leaving the table unindexed until the
+ * initSchema tail runs. idx_tm_journal_idem backs the Taskmaster idempotency
+ * lookup (`WHERE idempotency_key = ?`) that migration 057 relies on.
+ */
+const TM_JOURNAL_INDEXES: readonly string[] = [
+  'CREATE INDEX IF NOT EXISTS idx_tm_journal_thread ON tm_journal(thread_ref, created_at)',
+  'CREATE INDEX IF NOT EXISTS idx_tm_journal_idem ON tm_journal(idempotency_key)',
+  'CREATE INDEX IF NOT EXISTS idx_tm_journal_created ON tm_journal(created_at)',
+];
+
 export class SqliteAdapter implements IDatabase {
   private db: Database;
   readonly dialect = 'sqlite' as const;
@@ -442,11 +455,7 @@ export class SqliteAdapter implements IDatabase {
     }
     // Taskmaster Slice 1 indexes (migration 041) -- after migrateColumns()
     // per the established pattern.
-    this.db.run(
-      'CREATE INDEX IF NOT EXISTS idx_tm_journal_thread ON tm_journal(thread_ref, created_at)'
-    );
-    this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_journal_idem ON tm_journal(idempotency_key)');
-    this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_journal_created ON tm_journal(created_at)');
+    for (const indexSql of TM_JOURNAL_INDEXES) this.db.run(indexSql);
     this.db.run(
       'CREATE INDEX IF NOT EXISTS idx_tm_usage_provider ON tm_usage_sample(provider, observed_at)'
     );
@@ -457,21 +466,129 @@ export class SqliteAdapter implements IDatabase {
   }
 
   /**
+   * Rebuild tm_journal from `createNewTableSql` (a CREATE TABLE tm_journal_new
+   * statement) because SQLite cannot ALTER a CHECK constraint.
+   *
+   * DROP TABLE silently drops every index and trigger attached to the table.
+   * So, inside one IMMEDIATE transaction: capture the DDL of every index and
+   * trigger on tm_journal from sqlite_master, copy the rows, swap the tables,
+   * replay the captured DDL, then ensure the canonical migration-041 indexes.
+   * The upgraded table never becomes visible without its indexes and triggers
+   * (no unbounded idempotency lookups in the window before initSchema's tail),
+   * and objects created outside createSchema() are preserved rather than lost.
+   * Indexes with NULL sql are SQLite autoindexes (PRIMARY KEY / UNIQUE); the new
+   * CREATE TABLE recreates those itself. Rows are copied BEFORE the triggers are
+   * replayed, so an INSERT trigger never fires on the copy.
+   */
+  private rebuildTmJournal(createNewTableSql: string): void {
+    this.db.run('BEGIN IMMEDIATE');
+    try {
+      const dependents = this.db
+        .prepare(
+          `SELECT type, name, sql FROM sqlite_master
+           WHERE tbl_name = 'tm_journal' AND type IN ('index', 'trigger') AND sql IS NOT NULL
+           ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name`
+        )
+        .all() as { type: string; name: string; sql: string }[];
+      this.db.run(createNewTableSql);
+      this.db.run('INSERT INTO tm_journal_new SELECT * FROM tm_journal');
+      this.db.run('DROP TABLE tm_journal');
+      this.db.run('ALTER TABLE tm_journal_new RENAME TO tm_journal');
+      for (const dependent of dependents) this.db.run(dependent.sql);
+      for (const indexSql of TM_JOURNAL_INDEXES) this.db.run(indexSql);
+      this.db.run('COMMIT');
+    } catch (error: unknown) {
+      this.db.run('ROLLBACK');
+      throw error;
+    }
+  }
+
+  private upgradeBoardAuditEvents(): void {
+    const row = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'board_audit_events'")
+      .get() as { sql?: string } | undefined;
+    if (!row?.sql) return;
+    const columns = this.db.prepare("PRAGMA table_info('board_audit_events')").all() as {
+      name: string;
+    }[];
+    const hasSubjectKey = columns.some(column => column.name === 'subject_key');
+    const requiredTypes = [
+      'execution_claim_authority_rejected',
+      'manual_initiation_recorded',
+      'ce_scope_approval_recorded',
+      'ce_scope_approval_revoked',
+      'ce_scope_approval_rejected',
+    ];
+    const tableSql = row.sql;
+    if (!hasSubjectKey || requiredTypes.some(type => !tableSql.includes(type))) {
+      this.db.run('BEGIN IMMEDIATE');
+      try {
+        const dependents = this.db
+          .prepare(
+            `SELECT name, sql FROM sqlite_master
+             WHERE tbl_name = 'board_audit_events' AND type IN ('index', 'trigger')
+               AND sql IS NOT NULL AND name != 'uq_board_audit_events_subject'
+             ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name`
+          )
+          .all() as { name: string; sql: string }[];
+        this.db.run(`CREATE TABLE board_audit_events_new (
+          id TEXT PRIMARY KEY,
+          event_type TEXT NOT NULL CHECK (event_type IN (
+            'xo_lease_acquired','xo_lease_acquire_rejected','xo_lease_renewed',
+            'xo_lease_renew_rejected','xo_lease_released','xo_lease_release_rejected',
+            'board_recipient_resolved','board_recipient_deferred','canonical_motion_frozen',
+            'canonical_approval_accepted','canonical_approval_rejected',
+            'motion_notification_enqueued','motion_notification_deduplicated',
+            'board_alias_resolved','board_petition_delivered',
+            'execution_claim_authority_rejected','manual_initiation_recorded',
+            'ce_scope_approval_recorded','ce_scope_approval_revoked','ce_scope_approval_rejected'
+          )),
+          actor_principal_id TEXT,
+          actor_seat_id TEXT CHECK (actor_seat_id IS NULL OR actor_seat_id IN ('john','general','xo')),
+          xo_lease_id TEXT,
+          xo_fencing_token INTEGER CHECK (xo_fencing_token IS NULL OR xo_fencing_token > 0),
+          motion_id TEXT, motion_revision_sha TEXT, details TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          subject_key TEXT
+        )`);
+        const subjectExpression = hasSubjectKey ? 'subject_key' : 'NULL';
+        this.db.run(`INSERT INTO board_audit_events_new
+          (id,event_type,actor_principal_id,actor_seat_id,xo_lease_id,xo_fencing_token,
+           motion_id,motion_revision_sha,details,created_at,subject_key)
+          SELECT id,event_type,actor_principal_id,actor_seat_id,xo_lease_id,xo_fencing_token,
+           motion_id,motion_revision_sha,details,created_at,${subjectExpression}
+          FROM board_audit_events`);
+        this.db.run('DROP TABLE board_audit_events');
+        this.db.run('ALTER TABLE board_audit_events_new RENAME TO board_audit_events');
+        for (const dependent of dependents) this.db.run(dependent.sql);
+        this.db.run(`CREATE UNIQUE INDEX uq_board_audit_events_subject
+          ON board_audit_events(event_type, subject_key) WHERE subject_key IS NOT NULL`);
+        this.db.run('COMMIT');
+      } catch (error) {
+        this.db.run('ROLLBACK');
+        throw error;
+      }
+    } else {
+      this.db.run(`CREATE UNIQUE INDEX IF NOT EXISTS uq_board_audit_events_subject
+        ON board_audit_events(event_type, subject_key) WHERE subject_key IS NOT NULL`);
+    }
+  }
+
+  /**
    * Add columns to existing tables that predate newer schema additions.
    * SQLite's CREATE TABLE IF NOT EXISTS skips entirely for existing tables,
    * so new columns must be added via ALTER TABLE for databases created before
    * the columns were added to createSchema().
    */
   private migrateColumns(): void {
+    this.upgradeBoardAuditEvents();
     // Migration 045: SQLite cannot alter CHECK constraints. Rebuild existing
     // four-verb journals transactionally before any fire_cauldron insert.
     const journalSchema = this.db
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
       .get() as { sql?: string } | undefined;
     if (journalSchema?.sql && !journalSchema.sql.includes('fire_cauldron')) {
-      this.db.run('BEGIN');
-      try {
-        this.db.run(`
+      this.rebuildTmJournal(`
           CREATE TABLE tm_journal_new (
             id TEXT PRIMARY KEY,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -485,16 +602,8 @@ export class SqliteAdapter implements IDatabase {
             outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
             graded_at TEXT,
             grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
-          );
-          INSERT INTO tm_journal_new SELECT * FROM tm_journal;
-          DROP TABLE tm_journal;
-          ALTER TABLE tm_journal_new RENAME TO tm_journal;
+          )
         `);
-        this.db.run('COMMIT');
-      } catch (error: unknown) {
-        this.db.run('ROLLBACK');
-        throw error;
-      }
     }
     // Migration 055 (M-155 Amendment 03, WO-HARNESS-TASKMASTER-UNHEARD-GRADE-01):
     // widen tm_journal.grade CHECK to accept 'unheard'. SQLite cannot ALTER a
@@ -506,9 +615,7 @@ export class SqliteAdapter implements IDatabase {
       .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
       .get() as { sql?: string } | undefined;
     if (journalSchema2?.sql && !journalSchema2.sql.includes('unheard')) {
-      this.db.run('BEGIN');
-      try {
-        this.db.run(`
+      this.rebuildTmJournal(`
           CREATE TABLE tm_journal_new (
             id TEXT PRIMARY KEY,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -522,16 +629,65 @@ export class SqliteAdapter implements IDatabase {
             outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
             graded_at TEXT,
             grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
-          );
-          INSERT INTO tm_journal_new SELECT * FROM tm_journal;
-          DROP TABLE tm_journal;
-          ALTER TABLE tm_journal_new RENAME TO tm_journal;
+          )
         `);
-        this.db.run('COMMIT');
-      } catch (error: unknown) {
-        this.db.run('ROLLBACK');
-        throw error;
-      }
+    }
+    // Migration 056 (WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01): widen
+    // tm_journal.grade CHECK to accept 'delivered_to_issue'. Re-read the schema
+    // fresh -- the migration-055 rebuild above may have just recreated the table
+    // with a CHECK that still lacks 'delivered_to_issue', so the stale schema
+    // string from that block cannot be reused here. Separate block (do not edit
+    // the 045/055 CHECK literals) so each widen is independently idempotent.
+    const journalSchema3 = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
+      .get() as { sql?: string } | undefined;
+    if (journalSchema3?.sql && !journalSchema3.sql.includes('delivered_to_issue')) {
+      this.rebuildTmJournal(`
+          CREATE TABLE tm_journal_new (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            thread_ref TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')),
+            proposal_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            before_hash TEXT,
+            proof_predicate TEXT,
+            proof_deadline_at TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+            graded_at TEXT,
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+          )
+        `);
+    }
+    // Migration 060 (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01): widen
+    // tm_journal.action_type CHECK to accept the sixth verb 'blocker_report'.
+    // SQLite cannot ALTER a CHECK, so rebuild transactionally. Re-read the
+    // schema fresh -- the migration-056 rebuild above may have just recreated
+    // the table with a CHECK that still lacks 'blocker_report', so the stale
+    // schema string from that block cannot be reused here. Separate block (do
+    // not edit the 045/055/056 CHECK literals) so each widen is independently
+    // idempotent. Only action_type widens; the grade CHECK is carried forward
+    // exactly as migration 056 left it.
+    const journalSchema4 = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
+      .get() as { sql?: string } | undefined;
+    if (journalSchema4?.sql && !journalSchema4.sql.includes('blocker_report')) {
+      this.rebuildTmJournal(`
+          CREATE TABLE tm_journal_new (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            thread_ref TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')),
+            proposal_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            before_hash TEXT,
+            proof_predicate TEXT,
+            proof_deadline_at TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+            graded_at TEXT,
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+          )
+        `);
     }
     // Migration 046: older on-disk databases used a composite primary key for
     // tm_health. Add a provider-only UNIQUE index (allowed by the WO) instead
@@ -599,6 +755,9 @@ export class SqliteAdapter implements IDatabase {
         ['action_reason', 'TEXT'],
         ['merge_sha', 'TEXT'],
         ['pr_url', 'TEXT'],
+        ['merge_attempts', 'INTEGER NOT NULL DEFAULT 0'],
+        ['merge_not_before', 'TEXT'],
+        ['merge_last_transient_reason', 'TEXT'],
       ];
       for (const [name, definition] of additions) {
         if (!verdictColNames.has(name)) {
@@ -1114,7 +1273,13 @@ export class SqliteAdapter implements IDatabase {
         ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1),
         ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1),
         ('duty-officer', 'Duty Officer', 'worker_poll', 1),
-        ('do', 'Duty Officer alias', 'worker_poll', 1)
+        ('do', 'Duty Officer alias', 'worker_poll', 1),
+        -- WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
+        -- (migration 046 parity): Overseer hands CHANGES_REQUESTED verdicts
+        -- back as remediation candidates addressed to 'taskmaster'. Without
+        -- this row createAuthenticatedMessage rejects every one with
+        -- missing_principal.
+        ('taskmaster', 'Taskmaster', 'worker_poll', 1)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`
@@ -1555,7 +1720,10 @@ export class SqliteAdapter implements IDatabase {
             'board_alias_resolved',
             'board_petition_delivered',
             'execution_claim_authority_rejected',
-            'manual_initiation_recorded'
+            'manual_initiation_recorded',
+            'ce_scope_approval_recorded',
+            'ce_scope_approval_revoked',
+            'ce_scope_approval_rejected'
           )
         ),
         actor_principal_id TEXT,
@@ -1565,7 +1733,8 @@ export class SqliteAdapter implements IDatabase {
         motion_id TEXT,
         motion_revision_sha TEXT,
         details TEXT NOT NULL DEFAULT '{}',
-        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        subject_key TEXT
       );
 
       CREATE TRIGGER IF NOT EXISTS trg_board_audit_events_no_update
@@ -2114,6 +2283,9 @@ export class SqliteAdapter implements IDatabase {
         action_reason TEXT,
         merge_sha TEXT,
         pr_url TEXT,
+        merge_attempts INTEGER NOT NULL DEFAULT 0,
+        merge_not_before TEXT,
+        merge_last_transient_reason TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
@@ -2241,7 +2413,7 @@ export class SqliteAdapter implements IDatabase {
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         thread_ref TEXT NOT NULL,
         action_type TEXT NOT NULL CHECK (
-          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')
+          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')
         ),
         proposal_json TEXT NOT NULL,
         idempotency_key TEXT,
@@ -2252,7 +2424,7 @@ export class SqliteAdapter implements IDatabase {
           outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')
         ),
         graded_at TEXT,
-        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard'))
+        grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
       );
 
       CREATE TABLE IF NOT EXISTS tm_control (
@@ -2384,6 +2556,49 @@ export class SqliteAdapter implements IDatabase {
         suppressed_until_hash TEXT NOT NULL,
         suppressed_at TEXT NOT NULL,
         noise_grade_count INTEGER NOT NULL DEFAULT 2
+      );
+
+      -- Taskmaster escalation delivery claims (migration 057,
+      -- WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01). One row per GitHub issue;
+      -- serializes the list-then-post escalation comment. Additive: existing
+      -- databases gain the table here because createSchema runs on every open.
+      CREATE TABLE IF NOT EXISTS tm_escalation_claims (
+        issue_key TEXT PRIMARY KEY,
+        claim_id TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL,
+        posted_at TEXT
+      );
+
+      -- Per-service GitHub API usage and latest quota state (migration 062).
+      CREATE TABLE IF NOT EXISTS github_api_usage (
+        hour_bucket TEXT NOT NULL,
+        service TEXT NOT NULL,
+        pool_id TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        calls INTEGER NOT NULL DEFAULT 0,
+        rate_limited INTEGER NOT NULL DEFAULT 0,
+        permission_fallbacks INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (hour_bucket, service, pool_id, resource)
+      );
+
+      CREATE TABLE IF NOT EXISTS github_api_pool_state (
+        pool_id TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        "limit" INTEGER,
+        remaining INTEGER,
+        reset_at TEXT,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY (pool_id, resource)
+      );
+
+      -- operator settings (migration 059).
+      CREATE TABLE IF NOT EXISTS operator_settings (
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL,
+        reason TEXT
       );
     `);
     getLog().info('db.sqlite_schema_initialized');

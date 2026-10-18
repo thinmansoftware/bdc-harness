@@ -832,6 +832,8 @@ export class InfrastructureClassBlock extends Error {
  *   InfrastructureClassBlock (a codex persona declaring an Anthropic model is a
  *   config bug). If absent, resolution.model is undefined and the codex provider
  *   uses assistants.codex.model or the account default.
+ * - provider === 'codex-native-strict': reject persona.model too, but preserve
+ *   currentModel so this explicitly selected model cannot revert to a default.
  * - provider === 'claude' (default): persona.model is REQUIRED. If absent, throw
  *   InfrastructureClassBlock. If present, the persona model wins over the node
  *   model (today's behavior), and a mismatch is logged.
@@ -843,7 +845,7 @@ export function resolveAgentPersona(
   currentModel: string | undefined,
   provider: string
 ): AgentPersonaResolution {
-  if (provider === 'codex') {
+  if (provider === 'codex' || provider === 'codex-native-strict') {
     if (persona.model !== undefined) {
       throw new InfrastructureClassBlock(
         `Codex persona '${persona.name}' must not declare 'model:'. A 'provider: codex' ` +
@@ -873,9 +875,14 @@ export function resolveAgentPersona(
   // currentModel when the persona omits `model:`.  Providers such as pi
   // require a model; without this fallback they throw "requires a model".
   // For claude: persona.model was validated non-undefined above.
-  // For codex: persona.model is undefined (the codex branch throws if set).
+  // For Codex providers: persona.model is undefined (the branch throws if set).
+  // Strict routing preserves the explicit selection; ordinary Codex is unchanged.
   const resolvedModel =
-    provider !== 'codex' && provider !== 'claude' ? (persona.model ?? currentModel) : persona.model;
+    provider === 'codex-native-strict'
+      ? currentModel
+      : provider !== 'codex' && provider !== 'claude'
+        ? (persona.model ?? currentModel)
+        : persona.model;
 
   const resolution: AgentPersonaResolution = {
     model: resolvedModel,

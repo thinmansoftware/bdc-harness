@@ -2,21 +2,25 @@ import { describe, expect, test } from 'bun:test';
 import {
   adoptionContentHash,
   classifyThread,
+  composeBlockerReportBody,
   composeNudgeBody,
+  computeBlockerReport,
   computeNextAction,
   isSuppressedByNoise,
   nudgeClockMs,
+  BLOCKER_REPORT_COOLDOWN_MS,
   CUSTOMER_CLOCK_MS,
   MAX_INTERVENTIONS_PER_ITEM_24H,
   NUDGE_CLOCK_MS,
   type GradedActionLike,
+  type NextActionContext,
   type ThreadSnapshot,
   usefulRateFloorBreached,
   USEFUL_RATE_FLOOR,
   USEFUL_RATE_MIN_GRADED,
 } from './rules';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
-import { validateProposal } from './guard';
+import { isContentCompleteBlockerReportBody, validateProposal } from './guard';
 
 const EXPECTED_SPEC = {
   specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
@@ -660,5 +664,277 @@ describe('M-155 exception push (rules)', () => {
     expect(proposal?.type).toBe('deliver_ruling');
     expect(proposal?.body).toContain('ruling-155');
     expect(proposal?.body).toContain(proposal?.threadRef ?? '');
+  });
+});
+
+describe('blocker_report (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', () => {
+  const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+  const REF = 'gh:thinmansoftware/bdc-harness#1';
+  const BUCKET = Math.floor(NOW_MS / BLOCKER_REPORT_COOLDOWN_MS);
+
+  function ctx(overrides: Partial<NextActionContext> = {}): NextActionContext {
+    return {
+      interventionsLast24h: 0,
+      nowMs: NOW_MS,
+      lastBlockerReportSentAtMs: null,
+      ...overrides,
+    };
+  }
+
+  test('blocker_report: label-blocked thread past the P1 clock reports to duty-officer', () => {
+    const item = thread({ isBlocked: true });
+    const adoption = makeAdoption({
+      title: 'WO-X-01 fix',
+      blocked_reason: null,
+      owner_login: null,
+      is_blocked: 1,
+      last_movement_at: new Date(NOW_MS - THREE_HOURS_MS).toISOString(),
+    });
+    const proposal = computeBlockerReport(item, classifyThread(item, NOW_MS), ctx({ adoption }));
+    expect(proposal).not.toBeNull();
+    expect(proposal?.type).toBe('blocker_report');
+    expect(proposal?.recipient).toBe('duty-officer');
+    expect(proposal?.idempotencyKey).toBe(`tm:blocker_report:${REF}:${BUCKET}`);
+    expect(proposal?.actsImmediately).toBe(false);
+    // computeNextAction must still return null for the blocked thread -- no nudge
+    // to an owner is ever produced alongside the report.
+    expect(computeNextAction(item, classifyThread(item, NOW_MS), ctx({ adoption }))).toBeNull();
+  });
+
+  test('blocker_report: unclaimed P0 that is not fire-eligible reports; fire-eligible or held does not', () => {
+    const p0 = thread({
+      priority: 'P0',
+      isBlocked: false,
+      isUnclaimed: true,
+      isUnclaimedP0: true,
+    });
+    const adoption = makeAdoption({
+      title: 'WO-P0-01 outage',
+      priority: 'P0',
+      last_movement_at: new Date(NOW_MS - THREE_HOURS_MS).toISOString(),
+    });
+
+    // (a) not fire-eligible -> reports
+    const notEligible = computeBlockerReport(
+      p0,
+      classifyThread(p0, NOW_MS),
+      ctx({ adoption, fireEligible: false, fireHolding: false })
+    );
+    expect(notEligible?.type).toBe('blocker_report');
+    expect(notEligible?.body).toContain('unclaimed P0, not fire-eligible');
+
+    // (b) fire-eligible with a spec -> null
+    expect(
+      computeBlockerReport(
+        p0,
+        classifyThread(p0, NOW_MS),
+        ctx({
+          adoption,
+          fireEligible: true,
+          fireEvidence: {
+            woId: 'WO-P0-01',
+            targetRepo: 'thinmansoftware/bdc-harness',
+            project: 'bdc-harness',
+            specVerifiedAt: new Date(NOW_MS).toISOString(),
+            noOpenOrMergedPr: true,
+            expectedSpec: {
+              specSource: 'issue-body',
+              specRevision: 'a'.repeat(40),
+              specHash: `sha256:${'b'.repeat(64)}`,
+            },
+          },
+        })
+      )
+    ).toBeNull();
+
+    // (c) held -> null
+    expect(
+      computeBlockerReport(
+        thread({ ...p0, isHeld: true }),
+        'ready',
+        ctx({ adoption, fireEligible: false })
+      )
+    ).toBeNull();
+
+    // (d) blocked only by a latest [BLOCKED] marker 3h old -> reports with marker text
+    const markerThread = thread({ isBlocked: false });
+    const markerAdoption = makeAdoption({
+      title: 'WO-MARK-01 stuck',
+      latest_marker_kind: 'BLOCKED',
+      latest_marker_at: new Date(NOW_MS - THREE_HOURS_MS).toISOString(),
+      blocked_reason: 'waiting on PRH credit',
+    });
+    const markerProposal = computeBlockerReport(
+      markerThread,
+      classifyThread(markerThread, NOW_MS),
+      ctx({ adoption: markerAdoption })
+    );
+    expect(markerProposal?.type).toBe('blocker_report');
+    expect(markerProposal?.body).toContain('Blocked: waiting on PRH credit');
+    expect(markerProposal?.body).toContain('[BLOCKED] marker');
+  });
+
+  test('blocker_report: clock, cooldown and intervention cap gate the report', () => {
+    const item = thread({ isBlocked: true });
+    const blockedAdoption = (movementOffsetMs: number): TmAdoptionRow =>
+      makeAdoption({
+        title: 'WO-GATE-01 blocked',
+        is_blocked: 1,
+        last_movement_at: new Date(NOW_MS - movementOffsetMs).toISOString(),
+      });
+
+    // 90 minutes < 2h P1 clock -> null
+    expect(
+      computeBlockerReport(item, 'blocked', ctx({ adoption: blockedAdoption(90 * 60_000) }))
+    ).toBeNull();
+
+    // 3h idle but a report sent 71h ago (inside the 72h cooldown) -> null
+    expect(
+      computeBlockerReport(
+        item,
+        'blocked',
+        ctx({
+          adoption: blockedAdoption(THREE_HOURS_MS),
+          lastBlockerReportSentAtMs: NOW_MS - 71 * 60 * 60 * 1000,
+        })
+      )
+    ).toBeNull();
+
+    // 3h idle, last report 73h ago (outside cooldown) -> proposal
+    expect(
+      computeBlockerReport(
+        item,
+        'blocked',
+        ctx({
+          adoption: blockedAdoption(THREE_HOURS_MS),
+          lastBlockerReportSentAtMs: NOW_MS - 73 * 60 * 60 * 1000,
+        })
+      )?.type
+    ).toBe('blocker_report');
+
+    // intervention cap reached -> null
+    expect(
+      computeBlockerReport(
+        item,
+        'blocked',
+        ctx({
+          adoption: blockedAdoption(THREE_HOURS_MS),
+          interventionsLast24h: MAX_INTERVENTIONS_PER_ITEM_24H,
+        })
+      )
+    ).toBeNull();
+  });
+
+  test('blocker_report: body is content-complete and bounded', () => {
+    const item = thread({ priority: 'P1' });
+    const since = NOW_MS - THREE_HOURS_MS;
+
+    const withOwner = composeBlockerReportBody(
+      item,
+      makeAdoption({
+        title: 'WO-B-01 fix',
+        owner_login: 'jdoe',
+        blocked_reason: 'waiting on PRH credit',
+      }),
+      'labelled_blocked',
+      since,
+      NOW_MS
+    );
+    expect(withOwner).not.toBeNull();
+    expect(withOwner).toContain('"WO-B-01 fix"');
+    expect(withOwner).toContain('owner: jdoe');
+    expect(withOwner).toContain('Blocked: waiting on PRH credit');
+    expect(withOwner).toContain('https://github.com/thinmansoftware/bdc-harness/issues/1');
+    expect(withOwner).toContain('for 3h');
+    expect(withOwner!.length).toBeLessThanOrEqual(500);
+    expect(isContentCompleteBlockerReportBody(withOwner!)).toBe(true);
+
+    const neither = composeBlockerReportBody(
+      item,
+      makeAdoption({ title: 'WO-B-02 fix', owner_login: null, blocked_reason: null }),
+      'labelled_blocked',
+      since,
+      NOW_MS
+    );
+    expect(neither).toContain('owner: UNASSIGNED');
+    expect(neither).toContain('Blocked: no named blocker');
+    expect(neither!.length).toBeLessThanOrEqual(500);
+    expect(isContentCompleteBlockerReportBody(neither!)).toBe(true);
+
+    const longTitle = composeBlockerReportBody(
+      item,
+      makeAdoption({ title: 'T'.repeat(400) }),
+      'labelled_blocked',
+      since,
+      NOW_MS
+    );
+    expect(longTitle!.length).toBeLessThanOrEqual(500);
+    expect(isContentCompleteBlockerReportBody(longTitle!)).toBe(true);
+
+    // An oversized blocked reason is trimmed to keep the body within 500 chars
+    // while preserving the trailing URL and a non-space blocked char.
+    const longReason = composeBlockerReportBody(
+      item,
+      makeAdoption({ title: 'WO-B-03 fix', blocked_reason: 'R'.repeat(600) }),
+      'labelled_blocked',
+      since,
+      NOW_MS
+    );
+    expect(longReason!.length).toBeLessThanOrEqual(500);
+    expect(longReason).toContain('https://github.com/thinmansoftware/bdc-harness/issues/1');
+    expect(isContentCompleteBlockerReportBody(longReason!)).toBe(true);
+
+    // No title -> null
+    expect(
+      composeBlockerReportBody(
+        item,
+        makeAdoption({ title: null }),
+        'labelled_blocked',
+        since,
+        NOW_MS
+      )
+    ).toBeNull();
+  });
+
+  test('blocker_report: oversized owner/ref is rejected, not returned over 500 chars', () => {
+    const item = thread({ priority: 'P1' });
+    const since = NOW_MS - THREE_HOURS_MS;
+    // A pathological owner login pushes the fixed prefix past the 500-char
+    // budget: there is no room for even one blocked-reason char, so the body
+    // composer rejects (null) rather than emitting an oversized string.
+    const rejected = composeBlockerReportBody(
+      item,
+      makeAdoption({ title: 'WO-BIG-01', owner_login: 'o'.repeat(600), blocked_reason: 'x' }),
+      'labelled_blocked',
+      since,
+      NOW_MS
+    );
+    expect(rejected).toBeNull();
+  });
+
+  test('blocker_report: pre-rename aliased ref yields canonical key and URL', () => {
+    // Historical gh:bluedevilcollectibles/... ref must collapse to the current
+    // org before the idempotency key and issue URL are built (M-141 alias).
+    const aliasedItem = thread({ ref: 'gh:bluedevilcollectibles/bdc-harness#1', isBlocked: true });
+    const adoption = makeAdoption({
+      title: 'WO-ALIAS-01 fix',
+      is_blocked: 1,
+      blocked_reason: 'waiting on PRH credit',
+      last_movement_at: new Date(NOW_MS - THREE_HOURS_MS).toISOString(),
+    });
+    const proposal = computeBlockerReport(
+      aliasedItem,
+      classifyThread(aliasedItem, NOW_MS),
+      ctx({ adoption })
+    );
+    expect(proposal).not.toBeNull();
+    // Canonical org in the key, NOT the historical alias -- matches the journal
+    // grouping loop.ts performs via canonicalizeThreadRef.
+    expect(proposal?.idempotencyKey).toBe(
+      `tm:blocker_report:gh:thinmansoftware/bdc-harness#1:${BUCKET}`
+    );
+    // Canonical (non-obsolete) issue URL in the body.
+    expect(proposal?.body).toContain('https://github.com/thinmansoftware/bdc-harness/issues/1');
+    expect(proposal?.body).not.toContain('bluedevilcollectibles');
   });
 });

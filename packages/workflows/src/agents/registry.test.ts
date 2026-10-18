@@ -192,6 +192,19 @@ Prompt.
     expect(persona.model).toBeUndefined();
   });
 
+  test('claude-opus-5-5 is a known model and does not raise agent_invalid_model', async () => {
+    const content = `---
+name: opus-55
+model: claude-opus-5-5
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('opus-55.md', content);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.model).toBe('claude-opus-5-5');
+  });
+
   test('agent_invalid_model: model alias not in known set', async () => {
     const content = `---
 name: bad-model
