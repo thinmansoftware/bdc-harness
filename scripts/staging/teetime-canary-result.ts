@@ -17,6 +17,20 @@ export function classifyCanarySystem(content: string): string {
   return 'other';
 }
 
+export function classifyCanaryException(error: unknown, aborted: boolean): string {
+  if (aborted) return 'aborted';
+  // Error text stays in memory. These are diagnostic hints, never server assertions.
+  const text = error instanceof Error ? error.message : '';
+  if (/401|unauthorized|authentication|refresh.token/i.test(text)) return 'auth_hint';
+  if (/429|rate.limit|quota|usage.limit/i.test(text)) return 'quota_hint';
+  if (/model.*(?:access|support|available|not.found)|access.*model/i.test(text))
+    return 'model_access_hint';
+  if (/connection|network|websocket|stream.*disconnect|timed.out|fetch.failed|TLS|SSL/i.test(text))
+    return 'transport_hint';
+  if (/process.*exit|subprocess/i.test(text)) return 'process_hint';
+  return 'other';
+}
+
 export function acceptCanaryChunk(state: CanaryCompletion, chunk: MessageChunk): void {
   if (chunk.type === 'system') {
     const category = classifyCanarySystem(chunk.content);

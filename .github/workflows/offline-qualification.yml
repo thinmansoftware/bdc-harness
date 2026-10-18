@@ -46,6 +46,9 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_watchdog.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_canary_protocol.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_bounded_process.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_proxy_receipt.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_canary_diagnostics.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_operator_protocol.py
           bun test ./scripts/staging/teetime-canary-result.test.ts
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test

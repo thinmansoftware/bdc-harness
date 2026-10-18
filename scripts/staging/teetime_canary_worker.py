@@ -16,6 +16,18 @@ PREFLIGHT_CHECKS = 0
 AUTH_REJECTED = False
 
 
+def oom_kills():
+    try:
+        raw = Path('/sys/fs/cgroup/memory.events').read_bytes()
+        if len(raw) > 4096:
+            return None
+        values = dict(line.split() for line in raw.decode('ascii').splitlines())
+        value = int(values['oom_kill'])
+        return value if value >= 0 else None
+    except Exception:
+        return None
+
+
 def bounded_process(argv, timeout, env=ENV):
     child = subprocess.Popen(argv, cwd='/workspace', env=env, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, start_new_session=True)
@@ -173,8 +185,11 @@ def main():
               'artifactVerified': False, 'modelInvocations': 0, 'servedModelVerified': False,
               'taskFailureCode': 'not_started', 'terminalCount': 0, 'systemCategory': 'none',
               'diagnosticHint': 'none', 'artifactExists': False, 'artifactRegular': False,
-              'artifactExactContent': False, 'workspaceEntriesExact': False}
+              'artifactExactContent': False, 'workspaceEntriesExact': False,
+              'exceptionCategory': 'none', 'aborted': False, 'elapsedMs': 0, 'oomKillDelta': None,
+              'taskDiagnosticsPresent': False}
     original = None
+    before_oom = oom_kills()
     try:
         assert __debug__ and os.getuid() == 1001 and Path.cwd() == Path('/workspace')
         assert not AUTH.is_symlink() and stat.S_ISREG(AUTH.lstat().st_mode)
@@ -190,19 +205,28 @@ def main():
         result['taskFailureCode'] = 'worker_error'
         raw = bounded_process(['bun', str(ROOT/'teetime-canary-task.ts')], 100)
         task = json.loads(raw)
-        assert set(task) == {'passed','modelInvocations','servedModelVerified','failureCode','terminalCount','systemCategory','diagnosticHint'}
+        assert set(task) == {'passed','modelInvocations','servedModelVerified','failureCode','terminalCount','systemCategory','diagnosticHint','exceptionCategory','aborted','elapsedMs'}
         assert type(task['passed']) is bool and task['modelInvocations'] == 1 and task['servedModelVerified'] is False
         assert task['failureCode'] in ['none','unexpected_system','terminal_rejected','provider_failed']
         assert type(task['terminalCount']) is int and task['terminalCount'] in [0,1]
         assert task['systemCategory'] in ['none','task_list','file_change_failed','file_change_unexpected','format_warning','resume_warning','failback','other']
         assert task['diagnosticHint'] in ['none','permission_hint','sandbox_hint','other']
+        assert task['exceptionCategory'] in ['none','aborted','auth_hint','quota_hint','model_access_hint','transport_hint','process_hint','other']
+        assert type(task['aborted']) is bool
+        assert type(task['elapsedMs']) is int and 0 <= task['elapsedMs'] <= 120000
+        result['taskDiagnosticsPresent'] = True
         result['taskFailureCode'] = task['failureCode']
-        for key in ['terminalCount','systemCategory','diagnosticHint']:
+        for key in ['terminalCount','systemCategory','diagnosticHint','exceptionCategory','aborted','elapsedMs']:
             result[key] = task[key]
-        result['passed'] = task['passed'] and task['failureCode'] == 'none'
+        result['passed'] = task['passed'] and task['failureCode'] == 'none' and not task['aborted'] and task['exceptionCategory'] == 'none'
     except BaseException:
         result['passed'] = False
     finally:
+        after_oom = oom_kills()
+        if before_oom is not None and after_oom is not None and after_oom >= before_oom:
+            result['oomKillDelta'] = after_oom-before_oom
+            if result['oomKillDelta']:
+                result['passed'] = False
         # Trusted verification runs on failures too; a file alone never grants success.
         try:
             artifact = Path('/workspace/canary.txt')

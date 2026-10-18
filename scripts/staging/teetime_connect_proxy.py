@@ -147,6 +147,7 @@ async def handle_client(reader, writer):
 
 async def main():
     server = await asyncio.start_server(handle_client, '0.0.0.0', 3128, limit=HEADER_LIMIT)
+    print('{"proxyReady":true}', flush=True)
     async with server:
         try:
             await asyncio.wait_for(server.serve_forever(), TOTAL_SECONDS)

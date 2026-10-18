@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import {
   acceptCanaryChunk,
   classifyCanarySystem,
+  classifyCanaryException,
   type CanaryCompletion,
 } from './teetime-canary-result';
 import type { MessageChunk } from '../../packages/providers/src/types';
@@ -64,6 +65,21 @@ test('silences actual Pino diagnostics before child logger construction', () => 
   expect(probe.stdout.toString().trim()).toBe('sanitized-marker');
   // The runtime may report an existing package.json warning; no diagnostic payload may escape.
   expect(probe.stderr.toString()).not.toContain('RAW_DIAGNOSTIC_SENTINEL');
+});
+
+test('classifies actual abort state before error wording without exposing messages', () => {
+  expect(classifyCanaryException(new Error('401 synthetic sentinel'), true)).toBe('aborted');
+  for (const [message, category] of [
+    ['401 unauthorized sentinel', 'auth_hint'],
+    ['429 rate limit sentinel', 'quota_hint'],
+    ['model is not supported for this account sentinel', 'model_access_hint'],
+    ['stream disconnected sentinel', 'transport_hint'],
+    ['Codex process exited with code 137 sentinel', 'process_hint'],
+    ['opaque sentinel', 'other'],
+  ]) {
+    expect(classifyCanaryException(new Error(message), false)).toBe(category);
+    expect(classifyCanaryException(new Error(message), false)).not.toContain('sentinel');
+  }
 });
 
 test('discards task-list progress without accepting a terminal or obeying its body', () => {

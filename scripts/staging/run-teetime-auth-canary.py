@@ -17,6 +17,7 @@ from teetime_auth_receiver import validate_payload
 from teetime_canary_protocol import read_frame
 from teetime_watchdog import cleanup
 from teetime_bounded_process import capture
+from teetime_proxy_receipt import parse_proxy_receipt
 
 
 def main():
@@ -32,6 +33,7 @@ def main():
     assert re.fullmatch('[a-f0-9]{40}', args.expected_sha)
     assert re.fullmatch('[a-f0-9]{32}', args.nonce)
     root = Path(__file__).parent
+    proxy_source = (root/'teetime_connect_proxy.py').read_bytes()
     owner = 'teetime-auth-' + uuid.uuid4().hex[:12]
     receipt = Path.home()/owner
     receipt.mkdir(exist_ok=False)
@@ -41,7 +43,13 @@ def main():
                'modelInvocations': 0, 'servedModelVerified': False, 'preflightChecks': 0,
                'authenticationRejected': False, 'taskFailureCode': 'not_started',
                'terminalCount': 0, 'systemCategory': 'none', 'diagnosticHint': 'none',
-               'artifactExists': False, 'artifactRegular': False, 'artifactExactContent': False, 'workspaceEntriesExact': False}
+               'artifactExists': False, 'artifactRegular': False, 'artifactExactContent': False, 'workspaceEntriesExact': False,
+               'exceptionCategory': 'none', 'aborted': False, 'elapsedMs': 0, 'oomKillDelta': None,
+               'proxyMetricsVerified': False, 'taskDiagnosticsPresent': False}
+    proxy_thread = None
+    proxy_results = queue.Queue(maxsize=1)
+    proxy_ready = threading.Event()
+    proxy_metrics = None
     def d(*parts, **kwargs):
         return subprocess.run([args.docker, *parts], capture_output=True, check=True,
                               timeout=kwargs.pop('timeout', 15), **kwargs).stdout
@@ -69,7 +77,9 @@ def main():
         ids = {}
         for role, network in [('gateway', egress), ('worker', internal)]:
             extra = []
-            command = ['-I', '/app/scripts/staging/teetime_connect_proxy.py']
+            command = ['-I', '-']
+            if role == 'gateway':
+                extra = ['-i']
             if role == 'worker':
                 extra = ['--security-opt', 'seccomp='+str(profile)]
                 for path in ['/home/appuser', '/workspace', '/tmp']:
@@ -105,7 +115,7 @@ def main():
                 for path in ['/workspace/.codex', '/workspace/.agents']:
                     assert 'ro' in host['Tmpfs'][path].split(',')
             else:
-                assert config['Cmd'] == ['-I', '/app/scripts/staging/teetime_connect_proxy.py']
+                assert config['Cmd'] == ['-I', '-'] and config['OpenStdin'] is True
                 assert host['SecurityOpt'] == ['no-new-privileges:true'] and not host.get('Tmpfs')
             d('start', identifier)
             started = inspect(identifier)
@@ -116,13 +126,31 @@ def main():
         hashes = {}
         for filename in ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts', 'teetime-canary-result.ts',
                          'teetime_connect_proxy.py']:
-            expected = hashlib.sha256((root/filename).read_bytes()).hexdigest()
+            expected = hashlib.sha256(proxy_source if filename == 'teetime_connect_proxy.py' else (root/filename).read_bytes()).hexdigest()
             actual = d('exec', ids['worker'], 'sha256sum', '/app/scripts/staging/'+filename).decode().split()[0]
             assert actual == expected
             hashes[filename] = expected
         for filename in ['run-teetime-auth-canary.py', 'teetime_canary_protocol.py', 'teetime_watchdog.py',
-                         'codex-probe-seccomp.json', 'teetime_bounded_process.py']:
+                         'codex-probe-seccomp.json', 'teetime_bounded_process.py', 'teetime_proxy_receipt.py']:
             hashes[filename] = hashlib.sha256((root/filename).read_bytes()).hexdigest()
+        startup = bytearray()
+        def proxy_output(chunk):
+            if not proxy_ready.is_set():
+                startup.extend(chunk)
+                if b'\n' in startup:
+                    first = bytes(startup).split(b'\n', 1)[0]
+                    if json.loads(first) != {'proxyReady': True}:
+                        raise ValueError('invalid proxy startup')
+                    proxy_ready.set()
+        def collect_proxy():
+            try:
+                proxy_results.put(capture([args.docker,'attach','--sig-proxy=false',ids['gateway']],
+                    timeout=205,limit=4096,input_bytes=proxy_source,on_stdout=proxy_output))
+            except BaseException:
+                proxy_results.put(None)
+        proxy_thread = threading.Thread(target=collect_proxy, daemon=True)
+        proxy_thread.start()
+        assert proxy_ready.wait(6) and inspect(ids['gateway'])['State']['Running']
         # Actual-image masks must deny mutation before any credential exists.
         mask_check = "from pathlib import Path; import subprocess; p=['/workspace/.codex','/workspace/.agents']; assert all(not list(Path(x).iterdir()) for x in p); assert all(subprocess.run(['sh','-c','touch '+x+'/blocked'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode != 0 for x in p)"
         d('exec', ids['worker'], 'python3', '-I', '-c', mask_check)
@@ -172,9 +200,12 @@ def main():
         returncode, output = capture([args.docker, 'exec', '-w', '/workspace', ids['worker'],
             'python3', '-I', '/app/scripts/staging/teetime_canary_worker.py'], timeout=140)
         result = json.loads(output)
-        keys = {'passed', 'preflightPassed', 'authUnchanged', 'artifactVerified', 'modelInvocations', 'servedModelVerified', 'preflightChecks', 'authenticationRejected', 'taskFailureCode','terminalCount','systemCategory','diagnosticHint','artifactExists','artifactRegular','artifactExactContent','workspaceEntriesExact'}
+        keys = {'passed', 'preflightPassed', 'authUnchanged', 'artifactVerified', 'modelInvocations', 'servedModelVerified', 'preflightChecks', 'authenticationRejected', 'taskFailureCode','terminalCount','systemCategory','diagnosticHint','artifactExists','artifactRegular','artifactExactContent','workspaceEntriesExact','exceptionCategory','aborted','elapsedMs','oomKillDelta','taskDiagnosticsPresent'}
         assert set(result) == keys
-        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode','terminalCount','systemCategory','diagnosticHint'})
+        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode','terminalCount','systemCategory','diagnosticHint','exceptionCategory','elapsedMs','oomKillDelta'})
+        assert result['exceptionCategory'] in ['none','aborted','auth_hint','quota_hint','model_access_hint','transport_hint','process_hint','other']
+        assert type(result['elapsedMs']) is int and 0 <= result['elapsedMs'] <= 120000
+        assert result['oomKillDelta'] is None or type(result['oomKillDelta']) is int and 0 <= result['oomKillDelta'] <= 1024
         assert type(result['terminalCount']) is int and result['terminalCount'] in [0,1]
         assert result['systemCategory'] in ['none','task_list','file_change_failed','file_change_unexpected','format_warning','resume_warning','failback','other']
         assert result['diagnosticHint'] in ['none','permission_hint','sandbox_hint','other']
@@ -186,11 +217,28 @@ def main():
     except BaseException:
         outcome['passed'] = False
     finally:
+        if proxy_thread is not None:
+            try:
+                info = inspect(ids['gateway'])
+                assert info['Config']['Labels']['teetime.owner'] == owner
+                if info['State']['Running']:
+                    d('kill','--signal','SIGINT',ids['gateway'])
+                captured = proxy_results.get(timeout=8)
+                assert captured is not None and captured[0] == 0
+                proxy_metrics = parse_proxy_receipt(captured[1])
+                outcome['proxyMetricsVerified'] = True
+            except BaseException:
+                outcome['passed'] = False
+        outcome['passed'] = outcome['passed'] and outcome['proxyMetricsVerified']
         errors = cleanup(args.docker, manifest)
+        if proxy_thread is not None:
+            proxy_thread.join(timeout=3)
+            if proxy_thread.is_alive():
+                errors.append({'kind':'capture','id':ids['gateway'],'failure':'ThreadAlive'})
         outcome['cleanupVerified'] = not errors
         outcome['passed'] = outcome['passed'] and not errors
         report = {'type': 'RESULT', 'nonce': args.nonce, 'owner': owner,
-                  'result': outcome, 'cleanupErrors': errors, 'receiptDirectory': str(receipt)}
+                  'result': outcome, 'cleanupErrors': errors, 'receiptDirectory': str(receipt), 'proxyMetrics': proxy_metrics}
         (receipt/'result.json').write_text(json.dumps(report, indent=2))
         print(json.dumps(report), flush=True)
     return 0 if outcome['passed'] else 1

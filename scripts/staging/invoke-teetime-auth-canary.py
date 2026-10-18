@@ -49,7 +49,8 @@ def main():
             inbox.put(None)
         finally:
             inbox.put(None)
-    threading.Thread(target=read_output, daemon=True).start()
+    reader_thread = threading.Thread(target=read_output, daemon=True)
+    reader_thread.start()
     original = None
     auth_path = Path.home()/'.codex'/'auth.json'
     original_unchanged = True
@@ -64,7 +65,7 @@ def main():
         root = Path(__file__).parent
         filenames = ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts', 'teetime-canary-result.ts',
             'teetime_connect_proxy.py', 'run-teetime-auth-canary.py', 'teetime_canary_protocol.py',
-            'teetime_watchdog.py', 'codex-probe-seccomp.json', 'teetime_bounded_process.py']
+            'teetime_watchdog.py', 'codex-probe-seccomp.json', 'teetime_bounded_process.py', 'teetime_proxy_receipt.py']
         assert ready['hashes'] == {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in filenames}
         if args.disconnect_before_auth:
             child.kill(); child.wait(timeout=5)
@@ -88,7 +89,7 @@ def main():
         del payload
         report = inbox.get(timeout=180)
         assert isinstance(report, dict) and report['type'] == 'RESULT'
-        assert set(report) == {'type','nonce','owner','result','cleanupErrors','receiptDirectory'}
+        assert set(report) == {'type','nonce','owner','result','cleanupErrors','receiptDirectory','proxyMetrics'}
         assert report['nonce'] == nonce and report['owner'] == ready['owner']
         assert child.wait(timeout=10) in [0, 1]
         assert inbox.get(timeout=5) is None
@@ -96,9 +97,19 @@ def main():
         result = report['result']
         keys = {'passed','cleanupVerified','credentialReceived','preflightPassed','authUnchanged',
                 'artifactVerified','modelInvocations','servedModelVerified','preflightChecks','authenticationRejected','taskFailureCode',
-                'terminalCount','systemCategory','diagnosticHint','artifactExists','artifactRegular','artifactExactContent','workspaceEntriesExact'}
+                'terminalCount','systemCategory','diagnosticHint','artifactExists','artifactRegular','artifactExactContent','workspaceEntriesExact',
+                'exceptionCategory','aborted','elapsedMs','oomKillDelta','proxyMetricsVerified','taskDiagnosticsPresent'}
         assert set(result) == keys
-        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode','terminalCount','systemCategory','diagnosticHint'})
+        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks','taskFailureCode','terminalCount','systemCategory','diagnosticHint','exceptionCategory','elapsedMs','oomKillDelta'})
+        assert result['exceptionCategory'] in ['none','aborted','auth_hint','quota_hint','model_access_hint','transport_hint','process_hint','other']
+        assert type(result['elapsedMs']) is int and 0 <= result['elapsedMs'] <= 120000
+        assert result['oomKillDelta'] is None or type(result['oomKillDelta']) is int and 0 <= result['oomKillDelta'] <= 1024
+        if result['proxyMetricsVerified']:
+            metrics = report['proxyMetrics']
+            assert set(metrics) == {'bytes','header_or_destination_denied','dns_denied','byte_limit','timeout','rejected_or_closed','closed'}
+            assert all(type(value) is int and 0 <= value <= 10**9 for value in metrics.values())
+        else:
+            assert report['proxyMetrics'] is None
         assert type(result['terminalCount']) is int and result['terminalCount'] in [0,1]
         assert result['systemCategory'] in ['none','task_list','file_change_failed','file_change_unexpected','format_warning','resume_warning','failback','other']
         assert result['diagnosticHint'] in ['none','permission_hint','sandbox_hint','other']
@@ -107,9 +118,9 @@ def main():
         assert type(result['modelInvocations']) is int and result['modelInvocations'] in [0,1]
         if original is not None:
             original_unchanged = auth_path.read_bytes() == original
-        print(json.dumps({'owner':ready['owner'],'result':result,'synthetic':args.synthetic,
+        print(json.dumps({'owner':ready['owner'],'result':result,'proxyMetrics':report['proxyMetrics'],'synthetic':args.synthetic,
                           'originalAuthUnchanged':original_unchanged}))
-        assert original_unchanged and result['cleanupVerified']
+        assert original_unchanged and result['cleanupVerified'] and result['proxyMetricsVerified']
         if args.frame_test:
             assert not result['credentialReceived'] and not result['passed'] and result['modelInvocations'] == 0
         elif args.synthetic:
@@ -121,6 +132,15 @@ def main():
     finally:
         if child.poll() is None:
             child.kill(); child.wait(timeout=5)
+        if child.stdin is not None and not child.stdin.closed:
+            try:
+                child.stdin.close()
+            except OSError:
+                pass
+        reader_thread.join(timeout=3)
+        if reader_thread.is_alive():
+            raise ValueError('operator protocol reader did not stop')
+        child.stdout.close()
         if original is not None and auth_path.read_bytes() != original:
             raise ValueError('original login changed during canary')
 

@@ -237,6 +237,23 @@ accepted terminal count. Known task-list progress is discarded as data after a
 test through the actual provider normalizer. Warnings, failbacks, extra file
 changes and invalid terminals still fail. No raw diagnostics leave the worker.
 
+The third attempt, teetime-auth-1f4d051e7e44 on sourced9c31e4e/image42e48cf2,
+passed all six preflight checks and preserved authentication and cleanup, but
+reported provider_failed with no accepted terminal or verified artifact. The
+receipt did not identify an abort, proxy failure or resource cause. Duration
+alone does not establish which limit was reached. This remains FAILED.
+
+The diagnostic candidate reports the actual abort signal, bounded task elapsed
+time, fixed exception hints and cgroup OOM-kill delta (null when unavailable).
+taskDiagnosticsPresent distinguishes missing task output from an actual receipt.
+The gateway emits fixed readiness and final traffic counters through bounded
+capture; no payloads, request headers or raw errors are retained. Its immutable
+source bytes are checked before credential READY. SIGINT shutdown must produce a
+quiescent counter receipt, and the capture thread must stop after owned cleanup.
+Traffic rules, model settings, budgets and canary acceptance remain unchanged.
+Independent review authorizes commit and synthetic rehearsal only at this point;
+another model request requires review of those exact-image rehearsal results.
+
 No-auth apply-patch receipt teetime-patch-c5064e868c60 resolves a misleading
 success report: the helper created an outside-looking path in a private sandbox
 filesystem (device145), not the original HOME (device155). The original file was
