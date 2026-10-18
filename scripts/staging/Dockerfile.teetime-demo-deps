@@ -6,13 +6,14 @@ FROM mcr.microsoft.com/playwright:v1.64.1-noble@sha256:bdfda2a8fdf48707c5e50a49b
 USER root
 COPY --from=bun /usr/local/bin/bun /opt/teetime/bun/bun
 # Official Node SHASUMS256.txt, retained separately with its retrieval identity.
-RUN env -i PATH=/usr/bin:/bin curl --fail --location --silent --show-error \
-      --max-time 120 --output /tmp/teetime-node.tar.xz \
-      https://nodejs.org/dist/v24.22.0/node-v24.22.0-linux-x64.tar.xz \
-    && echo 'cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008  /tmp/teetime-node.tar.xz' | sha256sum --check --strict \
+RUN command -v gzip \
+    && env -i PATH=/usr/bin:/bin curl --fail --location --silent --show-error \
+      --max-time 120 --output /tmp/teetime-node.tar.gz \
+      https://nodejs.org/dist/v24.22.0/node-v24.22.0-linux-x64.tar.gz \
+    && echo '28ea0a438de9a13bd7891fd758eee6c7819ee8af5442dfd8d45bd65e56d4228c  /tmp/teetime-node.tar.gz' | sha256sum --check --strict \
     && mkdir -p /opt/teetime/node \
-    && tar --extract --xz --file /tmp/teetime-node.tar.xz --strip-components=1 --no-same-owner --directory /opt/teetime/node \
-    && rm /tmp/teetime-node.tar.xz \
+    && tar --extract --gzip --file /tmp/teetime-node.tar.gz --strip-components=1 --no-same-owner --directory /opt/teetime/node \
+    && rm /tmp/teetime-node.tar.gz \
     && test "$(/opt/teetime/node/bin/node --version)" = v24.22.0 \
     && test "$(/opt/teetime/bun/bun --version)" = 1.3.11 \
     && mkdir -p /home/teetime /opt/teetime/dependencies /workspace \

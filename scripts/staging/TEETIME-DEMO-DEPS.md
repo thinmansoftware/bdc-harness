@@ -45,3 +45,18 @@ Rollback is removal of only the newly created owned acquisition resources. Prese
 existing qualified images, shared Docker services and previous failed evidence.
 Never run broad image/container/volume pruning. Source publication alone does not
 authorize an account-bearing or application run.
+
+## Preserved first acquisition failure
+
+Source464452bba8b540e62646b1e5d867fe5b2c380a48 had one actual acquisition build.
+It failed after the official Node checksum passed: the browser base lacks xz,
+so tar could not extract the .tar.xz. No dependency install, final image, app build,
+account or model call occurred. The owned result remains passed:false; the source
+context was unchanged. This is not a timeout or unknown daemon completion.
+
+The repair uses the official same-version Node .tar.gz, its distinct verified
+SHASUMS256 identity, and an explicit gzip preflight; it adds no apt installation.
+It requires a new committed context and independently reviewed ONE repair build.
+Do not reuse the first owner/launch marker or call this an automatic retry.
+The operator launcher uses an exclusive empty Docker config and the verified local
+named-pipe endpoint; no host registry auth, helper config or proxy config is copied.
