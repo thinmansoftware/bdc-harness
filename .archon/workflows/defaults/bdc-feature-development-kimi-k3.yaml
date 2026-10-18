@@ -958,10 +958,43 @@ nodes:
 
       git add -A 2>/dev/null || true
 
+      CHECKPOINT_SOURCE=HEAD
       if git diff --cached --quiet 2>/dev/null; then
-        echo "checkpoint-push: nothing staged -- no commit needed"
-        exit 0
-      fi
+        # Implement may already have committed but failed to push. Bind clean
+        # history to this run's immutable start, then preserve the pinned HEAD.
+        CHECKPOINT_SOURCE=$(git rev-parse HEAD 2>/dev/null || true)
+        RUN_BASE=''
+        if [ -n "${ARTIFACTS_DIR:-}" ]; then
+          # Sentinel preserves trailing newlines so extra lines fail validation.
+          RUN_BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null && printf '.') || RUN_BASE=''
+          RUN_BASE=${RUN_BASE%.}
+          RUN_BASE=${RUN_BASE%$'\n'}
+          RUN_BASE=${RUN_BASE%$'\r'}
+        fi
+        OBJECT_FORMAT=$(git rev-parse --show-object-format 2>/dev/null || true)
+        case "$OBJECT_FORMAT" in
+          sha1) SHA_LENGTH=40 ;;
+          sha256) SHA_LENGTH=64 ;;
+          *) SHA_LENGTH=0 ;;
+        esac
+        BASE_VALID=true
+        case "$RUN_BASE" in ''|*[!0-9a-fA-F]*) BASE_VALID=false ;; esac
+        if [ "${#RUN_BASE}" -ne "$SHA_LENGTH" ]; then BASE_VALID=false; fi
+        if [ "$BASE_VALID" != true ] ||
+           [ "$(git cat-file -t "$RUN_BASE" 2>/dev/null || true)" != commit ] ||
+           [ -z "$CHECKPOINT_SOURCE" ] ||
+           ! git merge-base --is-ancestor "$RUN_BASE" "$CHECKPOINT_SOURCE" 2>/dev/null; then
+          echo "WARN: clean checkpoint has no verified run-start baseline; work is local only" >&2
+          echo "CHECKPOINT_STATUS=local_only_unverified_baseline"
+          exit 0
+        fi
+        RUN_BASE=$(printf '%s' "$RUN_BASE" | tr 'A-F' 'a-f')
+        if [ "$RUN_BASE" = "$CHECKPOINT_SOURCE" ]; then
+          echo "checkpoint-push: no commits or staged changes since run start"
+          exit 0
+        fi
+        echo "checkpoint-push: preserving existing implementation commit"
+      else
 
       git commit -m "wip: checkpoint after implement loop -- ${WO_ID}
 
@@ -970,11 +1003,13 @@ nodes:
 
       Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>" \
         2>/dev/null || { echo "WARN: checkpoint commit failed -- continuing" >&2; exit 0; }
+      fi
+      CHECKPOINT_SHA=$(git rev-parse "$CHECKPOINT_SOURCE" 2>/dev/null || true)
 
-      if git push -u origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
+      if git push -u origin "${CHECKPOINT_SOURCE}:refs/heads/${WIP_BRANCH}" 2>/dev/null; then
         echo "checkpoint-push: WIP branch pushed -- ${WIP_BRANCH}"
         echo "CHECKPOINT_BRANCH=${WIP_BRANCH}"
-        echo "CHECKPOINT_SHA=$(git rev-parse HEAD)"
+        echo "CHECKPOINT_SHA=${CHECKPOINT_SHA}"
       else
         echo "WARN: checkpoint push failed -- work is local only; backstop will retry" >&2
       fi

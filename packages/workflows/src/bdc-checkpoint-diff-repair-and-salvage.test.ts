@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'f
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { parse } from 'yaml';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 
 interface WorkflowNode {
   id: string;
@@ -37,7 +38,7 @@ const EXPECTED_LANES = [
 ];
 const tempDirs: string[] = [];
 
-function run(args: string[], cwd: string) {
+function run(args: string[], cwd: string, env: Record<string, string> = {}) {
   return Bun.spawnSync(args, {
     cwd,
     env: {
@@ -46,6 +47,7 @@ function run(args: string[], cwd: string) {
       GIT_AUTHOR_EMAIL: 'test@example.com',
       GIT_COMMITTER_NAME: 'Test',
       GIT_COMMITTER_EMAIL: 'test@example.com',
+      ...env,
     },
     stdout: 'pipe',
     stderr: 'pipe',
@@ -65,15 +67,167 @@ function makeRepo(): string {
   git(['commit', '-m', 'initial'], dir);
   return dir;
 }
-function nodeBash(id: string): string {
-  const file = join(LANES_DIR, 'bdc-feature-development-codex.yaml');
+function nodeBash(id: string, lane = 'bdc-feature-development-codex.yaml'): string {
+  const file = join(LANES_DIR, lane);
   const workflow = parse(readFileSync(file, 'utf8')) as WorkflowDocument;
   const bash = workflow.nodes.find(node => node.id === id)?.bash;
   if (!bash) throw new Error(`missing bash node ${id}`);
   return bash;
 }
 afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  for (const dir of tempDirs.splice(0)) removeTempDirWithRetry(dir);
+});
+
+function checkpointFixture() {
+  const dir = makeRepo();
+  const remote = mkdtempSync(join(tmpdir(), 'checkpoint-remote-'));
+  const artifacts = mkdtempSync(join(tmpdir(), 'checkpoint-artifacts-'));
+  tempDirs.push(remote, artifacts);
+  git(['init', '--bare', remote], dir);
+  git(['remote', 'add', 'origin', remote], dir);
+  git(['push', '-u', 'origin', 'main'], dir);
+  const baseline = git(['rev-parse', 'HEAD'], dir);
+  writeFileSync(join(artifacts, 'run-start-sha.txt'), baseline + '\n');
+  return { dir, remote, artifacts, baseline };
+}
+
+function runCheckpoint(
+  fixture: ReturnType<typeof checkpointFixture>,
+  lane = 'bdc-feature-development-codex.yaml',
+  prefix = ''
+) {
+  const script = nodeBash('checkpoint-push', lane).replace(
+    '$read-spec.output',
+    "'WO_ID=WO-CHECKPOINT-PRESERVATION-01'"
+  );
+  return run(['bash', '-c', prefix + script], fixture.dir, {
+    ARTIFACTS_DIR: fixture.artifacts.replaceAll('\\', '/'),
+    WO_ID: 'WO-CHECKPOINT-PRESERVATION-01',
+  });
+}
+
+function wipRefs(fixture: ReturnType<typeof checkpointFixture>): string {
+  return git(
+    ['--git-dir', fixture.remote, 'for-each-ref', '--format=%(objectname)', 'refs/heads/wip/'],
+    fixture.dir
+  );
+}
+
+describe('implement checkpoint preserves committed work', () => {
+  for (const lane of EXPECTED_LANES) {
+    it(`${lane} pushes a clean unpushed implementation commit`, () => {
+      const fixture = checkpointFixture();
+      writeFileSync(join(fixture.dir, 'README.md'), 'implementation committed locally\n');
+      git(['commit', '-am', 'implement'], fixture.dir);
+      const implementation = git(['rev-parse', 'HEAD'], fixture.dir);
+      expect(git(['status', '--porcelain'], fixture.dir)).toBe('');
+
+      const result = runCheckpoint(fixture, lane);
+      expect(result.exitCode).toBe(0);
+      expect(wipRefs(fixture), result.stdout.toString() + result.stderr.toString()).toBe(
+        implementation
+      );
+      expect(result.stdout.toString()).toContain(`CHECKPOINT_SHA=${implementation}`);
+      expect(git(['rev-parse', 'HEAD'], fixture.dir)).toBe(implementation);
+    }, 30_000);
+  }
+
+  it('does not create a checkpoint ref when implement produced no work', () => {
+    const fixture = checkpointFixture();
+    const result = runCheckpoint(fixture);
+    expect(result.exitCode).toBe(0);
+    expect(wipRefs(fixture)).toBe('');
+    expect(result.stdout.toString()).not.toContain('CHECKPOINT_SHA=');
+  });
+
+  it('pushes the verified commit even if HEAD advances immediately before push', () => {
+    const fixture = checkpointFixture();
+    writeFileSync(join(fixture.dir, 'README.md'), 'implementation committed locally\n');
+    git(['commit', '-am', 'implement'], fixture.dir);
+    const verified = git(['rev-parse', 'HEAD'], fixture.dir);
+    const prefix = [
+      'git() {',
+      '  if [ "$1" = push ]; then',
+      '    printf "late writer\\n" > README.md',
+      '    command git commit -am "late writer" >/dev/null || return 1',
+      '  fi',
+      '  command git "$@"',
+      '}',
+      '',
+    ].join('\n');
+    const result = runCheckpoint(fixture, 'bdc-feature-development-codex.yaml', prefix);
+    expect(result.exitCode).toBe(0);
+    expect(git(['rev-parse', 'HEAD'], fixture.dir)).not.toBe(verified);
+    expect(wipRefs(fixture)).toBe(verified);
+    expect(result.stdout.toString()).toContain(`CHECKPOINT_SHA=${verified}`);
+  }, 30_000);
+
+  for (const baseline of ['missing', 'HEAD', 'short', 'multiline', 'nonancestor', 'blob']) {
+    it(`does not export clean committed work with ${baseline} run-start identity`, () => {
+      const fixture = checkpointFixture();
+      writeFileSync(join(fixture.dir, 'README.md'), 'implementation committed locally\n');
+      git(['commit', '-am', 'implement'], fixture.dir);
+      const file = join(fixture.artifacts, 'run-start-sha.txt');
+      if (baseline === 'missing') rmSync(file);
+      else if (baseline === 'HEAD') writeFileSync(file, 'HEAD\n');
+      else if (baseline === 'short') writeFileSync(file, fixture.baseline.slice(0, 8) + '\n');
+      else if (baseline === 'multiline') writeFileSync(file, fixture.baseline + '\n\n');
+      else if (baseline === 'blob')
+        writeFileSync(file, git(['rev-parse', 'HEAD:README.md'], fixture.dir) + '\n');
+      else
+        writeFileSync(
+          file,
+          git(['commit-tree', 'HEAD^{tree}', '-m', 'unrelated root'], fixture.dir) + '\n'
+        );
+
+      const result = runCheckpoint(fixture);
+      expect(result.exitCode).toBe(0);
+      expect(wipRefs(fixture)).toBe('');
+      expect(result.stdout.toString()).toContain(
+        'CHECKPOINT_STATUS=local_only_unverified_baseline'
+      );
+      expect(result.stdout.toString()).not.toContain('CHECKPOINT_SHA=');
+    }, 30_000);
+  }
+
+  it('still commits and pushes dirty implementation work', () => {
+    const fixture = checkpointFixture();
+    rmSync(join(fixture.artifacts, 'run-start-sha.txt'));
+    writeFileSync(join(fixture.dir, 'feature.ts'), 'export const feature = true;\n');
+    const result = runCheckpoint(fixture);
+    expect(result.exitCode).toBe(0);
+    const checkpoint = git(['rev-parse', 'HEAD'], fixture.dir);
+    expect(checkpoint).not.toBe(fixture.baseline);
+    expect(wipRefs(fixture)).toBe(checkpoint);
+    expect(git(['status', '--porcelain'], fixture.dir)).toBe('');
+  }, 30_000);
+
+  it('does not export when the baseline read emits bytes but reports failure', () => {
+    const fixture = checkpointFixture();
+    writeFileSync(join(fixture.dir, 'README.md'), 'implementation committed locally\n');
+    git(['commit', '-am', 'implement'], fixture.dir);
+    const result = runCheckpoint(
+      fixture,
+      'bdc-feature-development-codex.yaml',
+      'cat() { command cat "$@"; return 1; }\n'
+    );
+    expect(result.exitCode).toBe(0);
+    expect(wipRefs(fixture)).toBe('');
+    expect(result.stdout.toString()).toContain('CHECKPOINT_STATUS=local_only_unverified_baseline');
+    expect(result.stdout.toString()).not.toContain('CHECKPOINT_SHA=');
+  }, 30_000);
+
+  it('does not claim preservation when the remote push fails', () => {
+    const fixture = checkpointFixture();
+    writeFileSync(join(fixture.dir, 'README.md'), 'implementation committed locally\n');
+    git(['commit', '-am', 'implement'], fixture.dir);
+    git(['remote', 'set-url', '--push', 'origin', join(fixture.remote, 'missing')], fixture.dir);
+    const result = runCheckpoint(fixture);
+    expect(result.exitCode).toBe(0);
+    expect(wipRefs(fixture)).toBe('');
+    expect(result.stdout.toString()).not.toContain('CHECKPOINT_SHA=');
+    expect(result.stderr.toString()).toContain('work is local only');
+  }, 30_000);
 });
 
 describe('diff-repair checkpoint and salvage', () => {
