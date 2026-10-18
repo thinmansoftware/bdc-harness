@@ -70,3 +70,26 @@ The inspector asserts the image source SHA, UID, root filesystem, network,
 capabilities, privilege settings, entrypoint, exact isolated mounts, health, and
 absence of published ports/devices. It emits an allowlisted summary rather than
 raw Docker inspection data, which would expose the operator token.
+
+## Read-only persisted controller inputs
+
+`loadTeeTimeControllerInput` reads existing workflow-run, codebase and frozen
+authority records from the store. It requires the registered tee-time repository,
+project-scoped authority artifacts, current bundled policy/workflow revisions,
+worktree ownership, exact helper closure and Python/Git executable hashes. It
+rechecks records and frozen files after reading the complete committed base.
+The Git reader rejects metadata indirection, replacement/promisor/shallow objects,
+unsupported entries and incomplete or oversized evidence. It reads binary object
+bytes with a closed environment and recomputes the complete root tree.
+
+The returned `worktreeState` is `ownership-only-head-unverified`: frozen
+`runScopeSha`/`headBranch` are records, not fresh proof of the checkout's HEAD.
+`baseSha` remains the frozen committed base; it is never replaced with HEAD.
+The returned `helperExecution` is `frozen-files-no-image-attestation`; configured
+file and executable hashes do not prove a pinned-image invocation. A current v1
+policy match does not admit a future v2 worker or enable demo features.
+
+These source tests use only disposable Git repositories and synthetic store
+records. They create no real run, approval, model/provider client or app feature.
+Actual persisted-run capture, candidate adoption, meaningful reviewed tests,
+complete reviewer evidence and atomic approval consumption remain separate gates.

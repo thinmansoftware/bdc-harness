@@ -1,10 +1,26 @@
 import sys
+import os
 import threading
 import unittest
+from unittest.mock import patch
 from teetime_bounded_process import capture
 
 
 class CaptureTests(unittest.TestCase):
+    def test_explicit_environment_excludes_parent_git_sentinel(self):
+        with patch.dict(os.environ, {'GIT_TEST_PARENT_SENTINEL':'parent'}):
+            code,output=capture([sys.executable,'-c',
+                'import os; print(os.getenv("GIT_TEST_PARENT_SENTINEL","absent")); print(os.getenv("TEETIME_PERMITTED"))'],
+                5,env={'TEETIME_PERMITTED':'allowed'})
+        self.assertEqual(code,0)
+        self.assertEqual(output.splitlines(),[b'absent',b'allowed'])
+
+    def test_omitted_environment_preserves_inheritance(self):
+        with patch.dict(os.environ, {'GIT_TEST_PARENT_SENTINEL':'parent'}):
+            code,output=capture([sys.executable,'-c','import os; print(os.getenv("GIT_TEST_PARENT_SENTINEL"))'],5)
+        self.assertEqual(code,0)
+        self.assertEqual(output.strip(),b'parent')
+
     def test_stream_callback_arrives_before_process_exit(self):
         ready = threading.Event()
         result = []
