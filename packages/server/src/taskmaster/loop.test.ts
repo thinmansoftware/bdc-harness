@@ -1912,6 +1912,39 @@ describe('failed effect reuse and successful-tick health', () => {
     expect(state.deadman.lastTickAtMs).toBe(T0);
   });
 
+  test.each(['rejected', 'empty'])(
+    'adoption snapshot after %s work-SOR read retains the correct custody',
+    async mode => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const deps = makeDeps(world, {
+        listThreads: async () => {
+          if (mode === 'rejected') throw new Error('synthetic rejected work-SOR read');
+          return [];
+        },
+        getGithubIssueEvidence: async () => makeEvidence(),
+      });
+      await refreshAdoption(
+        [makeListedThread({ ref: 'gh:thinmansoftware/bdc-xo#123', title: 'known work' })],
+        deps
+      );
+      const beforeMeta = structuredClone(world.adoptionMeta);
+      const beforeRows = structuredClone(world.adoptionRows);
+      const state = createTaskmasterState(60_000);
+      const result = await tick(state, deps);
+      if (mode === 'rejected') {
+        expect(world.adoptionMeta).toEqual(beforeMeta);
+        expect(world.adoptionRows).toEqual(beforeRows);
+        expect(result.successful).toBe(false);
+        expect(state.deadman.lastTickAtMs).toBeNull();
+      } else {
+        expect(world.adoptionMeta.row_count).toBe(0);
+        expect(world.adoptionRows).toEqual([]);
+        expect(result.successful).toBe(true);
+      }
+    }
+  );
+
   test('a failed source read does not advance the successful heartbeat', async () => {
     const world = makeWorld();
     seedDigestSent(world);
