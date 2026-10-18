@@ -117,7 +117,11 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
 
       it('run-stop-tests runs after format-autofix with a 30-minute budget', () => {
         const n = node(nodes, 'run-stop-tests', file);
-        expect(n.depends_on).toEqual(['format-autofix']);
+        expect(n.depends_on).toEqual(
+          ['bdc-feature-development-codex.yaml', 'bdc-feature-development.yaml'].includes(file)
+            ? ['format-autofix', 'resolve-test-command']
+            : ['format-autofix']
+        );
         expect(n.timeout).toBe(1800000);
         expect(n.bash).toContain(
           "case \"$cmd\" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1"
@@ -210,7 +214,7 @@ function rstField(stdout: string, key: string): string {
   if (!line) {
     throw new Error(`missing ${key} in:\n${stdout}`);
   }
-  return line.slice(key.length + 1);
+  return line.slice(key.length + 1).replace(/\r$/, '');
 }
 
 function rstSpec(command: string): string {
@@ -225,6 +229,7 @@ function rstSpec(command: string): string {
 
 function runStopTestsNode(opts: {
   readonly spec: string;
+  readonly resolution?: string;
   readonly files?: Readonly<Record<string, string>>;
 }): { readonly stdout: string; readonly log: string } {
   const cwd = mkdtempSync(join(tmpdir(), 'rst-ladder-'));
@@ -248,10 +253,14 @@ function runStopTestsNode(opts: {
     if (!bash) throw new Error('run-stop-tests has no bash');
     const rendered = substituteNodeOutputRefs(
       bash,
-      new Map([['read-spec', { state: 'completed' as const, output: opts.spec }]]),
+      new Map([
+        ['read-spec', { state: 'completed' as const, output: opts.spec }],
+        ['resolve-test-command', { state: 'completed' as const, output: opts.resolution ?? '' }],
+      ]),
       true
     );
-    const proc = Bun.spawnSync(['bash', '-c', rendered], {
+    writeFileSync(join(cwd, 'run-stop-tests.sh'), rendered);
+    const proc = Bun.spawnSync(['bash', './run-stop-tests.sh'], {
       cwd,
       env: { ...process.env, ARTIFACTS_DIR: artifacts },
       stdout: 'pipe',
@@ -264,7 +273,7 @@ function runStopTestsNode(opts: {
     } catch {
       log = '';
     }
-    if (proc.exitCode !== 0) {
+    if (proc.exitCode !== 0 || !stdout.includes('TESTS_STATUS=')) {
       throw new Error(
         `run-stop-tests exited ${proc.exitCode}: ${stdout}\n${proc.stderr.toString()}`
       );
@@ -286,7 +295,7 @@ describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral
     expect(rstField(stdout, 'TESTS_STATUS')).toBe('failed');
     expect(rstField(stdout, 'TESTS_SOURCE')).toBe('spec_declared');
     expect(rstField(stdout, 'TESTS_LINE')).toBe(
-      'N/A (spec-declared test command exited 3 with no parseable counts: bash ./exit3.sh) -- FAILED'
+      'N/A (spec-declared test command exited 3 with no parseable counts: bash ./exit3.sh) -- FAILED [source: wo-spec]'
     );
     expect(log).toContain('### run-stop-tests: bash ./exit3.sh');
     expect(log).toContain('### exit 3');
@@ -304,7 +313,7 @@ describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral
     expect(rstField(stdout, 'TESTS_SOURCE')).toContain('after: spec_declared');
     expect(log).toContain('### run-stop-tests: bash ./noop.sh');
     expect(log).toContain('### run-stop-tests: bun run test');
-    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/1 (bun run test)');
+    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/1 (bun run test) [source: repo_test_script]');
   });
 
   it('parsed passing counts from a spec-declared command still report passed', () => {
@@ -314,7 +323,7 @@ describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral
     });
     expect(rstField(stdout, 'TESTS_STATUS')).toBe('passed');
     expect(rstField(stdout, 'TESTS_SOURCE')).toBe('spec_declared');
-    expect(rstField(stdout, 'TESTS_LINE')).toBe('3/3 (bash ./green.sh)');
+    expect(rstField(stdout, 'TESTS_LINE')).toBe('3/3 (bash ./green.sh) [source: wo-spec]');
     expect(log).not.toContain('### run-stop-tests: bun run test');
   });
 
@@ -325,7 +334,9 @@ describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral
     });
     expect(rstField(stdout, 'TESTS_STATUS')).toBe('failed');
     expect(rstField(stdout, 'TESTS_SOURCE')).toBe('spec_declared');
-    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/2 (bash ./red.sh) -- FAILED, exit 1');
+    expect(rstField(stdout, 'TESTS_LINE')).toBe(
+      '1/2 (bash ./red.sh) -- FAILED, exit 1 [source: wo-spec]'
+    );
     expect(log).not.toContain('### run-stop-tests: bun run test');
   });
 
@@ -335,12 +346,164 @@ describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral
     });
     expect(rstField(stdout, 'TESTS_STATUS')).toBe('passed');
     expect(rstField(stdout, 'TESTS_SOURCE')).toContain('repo_test_script');
-    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/1 (bun run test)');
+    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/1 (bun run test) [source: repo_test_script]');
     expect(stdout).not.toContain('python -c');
     expect(log).not.toContain('python -c');
     expect(log).not.toContain('### run-stop-tests: python');
     expect(log).toContain('### run-stop-tests: bun run test');
   });
+});
+
+function resolveProjectCommand(
+  map: unknown,
+  remote = 'git@github.com:ThinmanSoftware/shopops.git',
+  unavailable = false
+): string {
+  const cwd = mkdtempSync(join(tmpdir(), 'project-command-'));
+  try {
+    writeFileSync(join(cwd, 'map.json'), JSON.stringify(map));
+    const bash = node(
+      laneNodes('bdc-feature-development-codex.yaml'),
+      'resolve-test-command',
+      'canonical'
+    ).bash;
+    if (!bash) throw new Error('resolver has no bash');
+    const proc = Bun.spawnSync(
+      [
+        'bash',
+        '-c',
+        `timeout() { shift; "$@"; }; gh() { if [ "$TEST_MAP_UNAVAILABLE" = "1" ]; then return 1; fi; cat map.json; }; git() { printf '%s' "$TEST_REMOTE"; };\n${bash}`,
+      ],
+      {
+        cwd,
+        env: { ...process.env, TEST_REMOTE: remote, TEST_MAP_UNAVAILABLE: unavailable ? '1' : '0' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }
+    );
+    if (proc.exitCode !== 0) throw new Error(proc.stderr.toString());
+    return proc.stdout.toString();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+describe('project-map command resolver (real bash)', () => {
+  const response = (map: unknown) => ({
+    sha: 'a'.repeat(40),
+    content: Buffer.from(JSON.stringify(map)).toString('base64'),
+  });
+  it('matches the exact repository and preserves the existing ShopOps directory prefix', () => {
+    const command = 'cd shopops-api && node tests/run_all.js';
+    const out = resolveProjectCommand(
+      response({
+        shopops: {
+          repo: 'thinmansoftware/shopops',
+          working_subdir: 'shopops-api',
+          test_command: command,
+        },
+      })
+    );
+    expect(rstField(out, 'TEST_COMMAND_SOURCE')).toBe('project-map');
+    expect(Buffer.from(rstField(out, 'TEST_COMMAND_B64'), 'base64').toString()).toBe(command);
+    expect(rstField(out, 'TEST_COMMAND_MAP_SHA')).toBe('a'.repeat(40));
+  });
+  it('falls back when the authenticated GitHub read is unavailable', () => {
+    const out = resolveProjectCommand({}, 'https://github.com/thinmansoftware/shopops.git', true);
+    expect(rstField(out, 'TEST_COMMAND_SOURCE')).toBe('wo-spec');
+    expect(rstField(out, 'TEST_COMMAND_FALLBACK')).toBe('unavailable');
+  });
+  it('requires an actual GitHub origin and the exact owner/repository', () => {
+    const map = response({
+      shopops: { repo: 'thinmansoftware/shopops', test_command: 'npm test' },
+    });
+    for (const remote of [
+      'thinmansoftware/shopops',
+      '/tmp/thinmansoftware/shopops',
+      'file:///tmp/shopops',
+      'https://github.com.attacker.test/thinmansoftware/shopops.git',
+    ]) {
+      expect(rstField(resolveProjectCommand(map, remote), 'TEST_COMMAND_FALLBACK')).toBe(
+        'invalid-origin'
+      );
+    }
+    expect(
+      rstField(
+        resolveProjectCommand(map, 'https://github.com/other/shopops.git'),
+        'TEST_COMMAND_FALLBACK'
+      )
+    ).toBe('missing');
+    expect(
+      rstField(
+        resolveProjectCommand(map, 'https://github.com/thinmansoftware/shopops.git'),
+        'TEST_COMMAND_SOURCE'
+      )
+    ).toBe('project-map');
+  });
+  for (const [reason, value] of [
+    ['missing', response({ other: { repo: 'thinmansoftware/other', test_command: 'npm test' } })],
+    [
+      'ambiguous',
+      response({
+        one: { repo: 'thinmansoftware/shopops', test_command: 'npm test' },
+        two: { repo: 'thinmansoftware/shopops', test_command: 'bun test' },
+      }),
+    ],
+    ['malformed', { sha: 'a'.repeat(40), content: 'invalid base64?!' }],
+    [
+      'invalid-command',
+      response({
+        shopops: { repo: 'thinmansoftware/shopops', test_command: 'npm test\necho injected' },
+      }),
+    ],
+  ] as const) {
+    it(`falls back explicitly for ${reason}`, () => {
+      const out = resolveProjectCommand(value);
+      expect(rstField(out, 'TEST_COMMAND_SOURCE')).toBe('wo-spec');
+      expect(rstField(out, 'TEST_COMMAND_FALLBACK')).toBe(reason);
+      expect(rstField(out, 'TEST_COMMAND_B64')).toBe('');
+    });
+  }
+});
+
+describe('project-map runner failure preservation', () => {
+  it('rejects an unsafe map command and executes the declared safe command', () => {
+    const { stdout, log } = runStopTestsNode({
+      spec: rstSpec('bash ./safe.sh'),
+      resolution: `TEST_COMMAND_SOURCE=project-map\nTEST_COMMAND_B64=${Buffer.from('node -e process.exit(0)').toString('base64')}`,
+      files: { 'safe.sh': 'echo "Tests: 1/1"\n' },
+    });
+    expect(rstField(stdout, 'TESTS_MAP_FALLBACK')).toBe('unsafe-command');
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('passed');
+    expect(rstField(stdout, 'TESTS_LINE')).toContain('source: wo-spec');
+    expect(log).not.toContain('### run-stop-tests: node -e');
+  }, 30_000);
+  it('unparseable successful map output cannot be replaced with passing fallback evidence', () => {
+    const { stdout, log } = runStopTestsNode({
+      spec: rstSpec('bash ./repo-pass.sh'),
+      resolution: `TEST_COMMAND_SOURCE=project-map\nTEST_COMMAND_B64=${Buffer.from('bash ./map-empty.sh').toString('base64')}`,
+      files: { 'map-empty.sh': 'echo "No test counts"\n' },
+    });
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('counts_unparsed');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toBe('project-map');
+    expect(log).not.toContain('### run-stop-tests: bash ./repo-pass.sh');
+    expect(log).not.toContain('### run-stop-tests: bun run test');
+  }, 30_000);
+
+  it('never replaces a failing selected map command with a passing spec or repository script', () => {
+    const { stdout, log } = runStopTestsNode({
+      spec: rstSpec('bash ./repo-pass.sh'),
+      resolution: `TEST_COMMAND_SOURCE=project-map\nTEST_COMMAND_MAP_SHA=${'a'.repeat(40)}\nTEST_COMMAND_B64=${Buffer.from('bash ./map-fail.sh').toString('base64')}`,
+      files: { 'map-fail.sh': 'exit 3\n' },
+    });
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('failed');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toBe('project-map');
+    expect(rstField(stdout, 'TESTS_LINE')).toContain('FAILED');
+    expect(rstField(stdout, 'TESTS_LINE')).toContain('source: project-map');
+    expect(log).toContain('### run-stop-tests: bash ./map-fail.sh');
+    expect(log).not.toContain('### run-stop-tests: bash ./repo-pass.sh');
+    expect(log).not.toContain('### run-stop-tests: bun run test');
+  }, 30_000);
 });
 
 function rsgField(stdout: string, key: string): string {
