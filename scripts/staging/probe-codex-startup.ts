@@ -1,9 +1,9 @@
 // Private, non-query native thread/start diagnostic. Never register as a provider.
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { RESTRICTED_BINARY } from '../../packages/providers/src/codex/restricted-policy';
-import { compareBundledCatalog, fixtureClientOptions } from './teetime-reviewer-fixture';
-import { exchangeStartup, startupArguments } from './teetime-startup-protocol';
+import type * as Policy from '../../packages/providers/src/codex/restricted-policy';
+import type * as Fixture from './teetime-reviewer-fixture';
+import type * as Startup from './teetime-startup-protocol';
 
 function requireValue(condition: unknown): asserts condition {
   if (!condition) throw new Error('startup input rejected');
@@ -11,6 +11,15 @@ function requireValue(condition: unknown): asserts condition {
 const hash = (raw: Uint8Array | string): string => createHash('sha256').update(raw).digest('hex');
 async function main(): Promise<void> {
   requireValue(process.env.TEE_TIME_SANDBOX_PROBE === '1' && process.getuid?.() === 1001);
+  // This entry is supplied on stdin from /workspace, not loaded at its source path.
+  const policyPath = '/app/packages/providers/src/codex/restricted-policy.ts';
+  const fixturePath = '/app/scripts/staging/teetime-reviewer-fixture.ts';
+  const protocolPath = '/app/scripts/staging/teetime-startup-protocol.ts';
+  const { RESTRICTED_BINARY } = (await import(policyPath)) as typeof Policy;
+  const { compareBundledCatalog, fixtureClientOptions } = (await import(
+    fixturePath
+  )) as typeof Fixture;
+  const { exchangeStartup, startupArguments } = (await import(protocolPath)) as typeof Startup;
   const expectedBinary = process.env.TEE_TIME_STARTUP_BINARY_HASH;
   requireValue(typeof expectedBinary === 'string' && /^[a-f0-9]{64}$/.test(expectedBinary));
   const binaryHash = hash(readFileSync(RESTRICTED_BINARY));

@@ -85,6 +85,7 @@ jobs:
           bun test ./scripts/staging/teetime-sdk-lifecycle.test.ts
           bun test ./scripts/staging/teetime-reviewer-fixture.test.ts
           bun test ./scripts/staging/teetime-startup-protocol.test.ts
+          bun test ./scripts/staging/teetime-startup-entry.test.ts
           bun test ./scripts/staging/teetime-fixed-artifact.test.ts
           bun test packages/workflows/src/reliability/tee-time-review-package.test.ts
           bun test packages/workflows/src/reliability/tee-time-controller-input.test.ts
