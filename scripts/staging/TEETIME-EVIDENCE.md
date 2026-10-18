@@ -188,3 +188,49 @@ and separate readonly/noauth/nonetwork testing. The qualified reviewer's6000-byt
 wire bound, replay-safe approval consumption, policy/workflow revision and exact
 CI/staging gates remain binding. Do not activate this amendment by aliasing the
 old filesystem canary or ordinary provider identities.
+
+## Unregistered artifact stream qualification candidate
+
+teetime-artifact-stream.ts collects exact bytes from one assistant message, then
+one successful provider result and normal iterator completion. It bounds the whole
+stream to64 chunks, reasoning to16384 UTF-8 bytes and artifact text to65536 bytes.
+It rejects lone UTF-16 surrogates before encoding. Reasoning is untrusted discarded
+data and may only precede the artifact. Tools, system/warnings, rate limits,
+routing, unknown/malformed fields, extra messages/results, abort and iterator
+exceptions fail. The collector neither parses JSON nor grants source authority.
+It returns the exact bytes for the separate strict parser.
+
+Its observable boundary is the provider iterator: Codex's normalizer returns at
+the first turn.completed, so raw SDK events not exposed by it are not attested.
+Direct collector tests cover post-terminal provider chunks. The caller must impose
+a deadline and abort/reap the owned process when an iterator stalls or is rejected.
+
+The fixed no-auth selector is:
+
+```text
+python probe-teetime-filesystem.py --docker <operator-docker-path> --image sha256:<exact-image-id> --expected-sha <base-ARCHON_BUILD_SHA> --artifact-fixture --artifact-source <exact-artifact-commit> --artifact-case success --pids-budget 128
+```
+
+Use duplicate as the separately executed negative case. The composite image keeps
+base ARCHON_BUILD_SHA and adds TEETIME_ARTIFACT_SOURCE_SHA. The controller verifies
+both, plus immutable hashes of the fixture, collector, parser, snapshot/Git helpers,
+actual restricted factory/provider/policy/types and logger. It retains all existing
+no-network, nonroot, readonly root, metadata masks, seccomp, memory/CPU/PID and
+bounded output/cleanup checks. Existing filesystem/patch selectors remain unchanged.
+
+The loopback worker loads the real SDK before a test-only module wrapper. Original
+constructor and thread options must exactly match unchanged restricted helpers.
+Only loopback base URL, dummy API credential and proxy removal may differ; the
+real factory/provider, SDK and pinned CLI run unchanged. Module interception and
+exact option deltas are verified. Pino is silenced before provider import.
+SSE messages use the inspected pinned responses.rs::ev_assistant_message helper.
+Success requires one assistant, one result, normal provider end, exact raw bytes,
+strict parser/candidate checks and unchanged synthetic auth/model workspace.
+Duplicate assistant messages must reject without any candidate.
+
+Nine collector tests/43 assertions and the full local scripts typecheck pass.
+Linux SDK fixture execution is still pending at this source-preparation point;
+it must not be inferred from unit tests or the prior filesystem canary. No
+authenticated request, materializer, registration or workflow activation is
+performed by these helpers. The source-data contract remains unqualified until
+its exact reviewed runtime evidence is accepted separately.
