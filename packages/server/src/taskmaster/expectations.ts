@@ -225,23 +225,97 @@ export async function checkEvidence(
     return { ok, pointer: ok ? (issue.html_url ?? null) : null };
   }
   if (spec.kind === 'pr_opened') {
-    const qualifier = spec.head_branch
-      ? `head:${spec.head_branch}`
-      : `in:title ${spec.title_prefix ?? ''}`;
-    const response = await serviceGitHubFetchWithPermissionFallback({
-      service: 'taskmaster',
-      fetch: fetchImpl,
-      resource: 'search',
-      url: `https://api.github.com/search/issues?q=${encodeURIComponent(`repo:${spec.repo} is:pr is:open ${qualifier}`)}`,
-    });
-    if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
-    const result = (await response.json()) as {
-      items?: { html_url?: string; title?: string }[];
-    };
-    const match = result.items?.find(
-      item => !spec.title_prefix || item.title?.startsWith(spec.title_prefix)
-    );
-    return { ok: Boolean(match), pointer: match?.html_url ?? null };
+    if (!/^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/.test(spec.repo) || spec.head_branch?.includes(':'))
+      throw new Error('expectation_pr_scope_unknown');
+    const endpoint = `/repos/${spec.repo}/pulls`;
+    let url: string | null =
+      `https://api.github.com${endpoint}?state=open&per_page=100&sort=created&direction=asc&page=1`;
+    const identities = new Map<number, string>();
+    let pointer: string | null = null;
+    for (let page = 1; url && page <= 100; page++) {
+      const parsed = new URL(url);
+      if (
+        parsed.origin !== 'https://api.github.com' ||
+        parsed.pathname !== endpoint ||
+        parsed.username ||
+        parsed.password ||
+        parsed.hash ||
+        parsed.searchParams.get('state') !== 'open' ||
+        parsed.searchParams.get('per_page') !== '100' ||
+        parsed.searchParams.get('sort') !== 'created' ||
+        parsed.searchParams.get('direction') !== 'asc' ||
+        parsed.searchParams.get('page') !== String(page) ||
+        [...parsed.searchParams.keys()].length !== 5 ||
+        ['state', 'per_page', 'sort', 'direction', 'page'].some(
+          key => parsed.searchParams.getAll(key).length !== 1
+        )
+      )
+        throw new Error('expectation_pr_pagination_invalid');
+      const response = await serviceGitHubFetchWithPermissionFallback({
+        service: 'taskmaster',
+        fetch: fetchImpl,
+        resource: 'core',
+        url,
+      });
+      if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
+      const rows: unknown = await response.json();
+      if (!Array.isArray(rows) || rows.length > 100) throw new Error('expectation_pr_page_invalid');
+      for (const value of rows) {
+        if (!value || typeof value !== 'object') throw new Error('expectation_pr_row_invalid');
+        const row = value as Record<string, unknown>;
+        const headRef =
+          typeof row.head === 'object' && row.head !== null
+            ? (row.head as Record<string, unknown>).ref
+            : undefined;
+        if (
+          typeof row.number !== 'number' ||
+          !Number.isSafeInteger(row.number) ||
+          row.number <= 0 ||
+          row.state !== 'open' ||
+          typeof row.title !== 'string' ||
+          typeof row.html_url !== 'string' ||
+          (spec.head_branch && (typeof headRef !== 'string' || !headRef.trim()))
+        )
+          throw new Error('expectation_pr_row_invalid');
+        const evidenceUrl = new URL(row.html_url);
+        if (
+          evidenceUrl.origin !== 'https://github.com' ||
+          evidenceUrl.username ||
+          evidenceUrl.password ||
+          evidenceUrl.pathname.toLowerCase() !== `/${spec.repo}/pull/${row.number}`.toLowerCase() ||
+          evidenceUrl.search ||
+          evidenceUrl.hash
+        )
+          throw new Error('expectation_pr_pointer_invalid');
+        const identity = JSON.stringify([row.state, row.title, row.html_url, headRef ?? null]);
+        if (identities.has(row.number) && identities.get(row.number) !== identity)
+          throw new Error('expectation_pr_identity_conflict');
+        identities.set(row.number, identity);
+        if (
+          !pointer &&
+          (!spec.head_branch || headRef === spec.head_branch) &&
+          (!spec.title_prefix || row.title.startsWith(spec.title_prefix))
+        )
+          pointer = row.html_url;
+      }
+      const link = response.headers.get('link');
+      if (
+        link
+          ?.split(',')
+          .some(
+            part =>
+              !/^\s*<[^>]+>\s*;\s*rel=(?:"(?:next|prev|first|last)"|next|prev|first|last)\s*$/.test(
+                part
+              )
+          )
+      )
+        throw new Error('expectation_pr_pagination_invalid');
+      if ((link?.split(',').filter(part => /\brel=(?:"next"|next)\s*$/.test(part)).length ?? 0) > 1)
+        throw new Error('expectation_pr_pagination_invalid');
+      url = nextPageUrl(link);
+      if (!url) return { ok: pointer !== null, pointer };
+    }
+    throw new Error('expectation_pr_probe_capped');
   }
   if (spec.kind === 'lease_holder_is') {
     const result = await query<{ lease_id: string }>(
