@@ -176,6 +176,47 @@ test('unreconciled legacy fire journal blocks fresh budget', async () => {
   await db.query("UPDATE tm_journal SET outcome='sent' WHERE id='legacy'");
   expect((await tm.reserveAutomaticFire(await request('new'), db)).allowed).toBe(false);
 });
+
+test('proved legacy settlement preserves journal supervision and legacy attribution', async () => {
+  const input = await request('proved-legacy');
+  const deadline = '2026-10-18T23:00:00.000Z';
+  await db.query("UPDATE tm_journal SET outcome='sent',proof_deadline_at=$1 WHERE id=$2", [
+    deadline,
+    input.journalId,
+  ]);
+  await tm.seedAutomaticFireHistory({ ...input, ownerToken: 'legacy-reconciliation' }, db);
+  await tm.settleAutomaticFire(
+    {
+      actionKey: input.actionKey,
+      cascadeId: input.cascadeId,
+      state: 'admitted',
+      admittedAt: now,
+      runIds: ['legacy-child'],
+    },
+    other
+  );
+  const row = (await tm.listAutomaticFireAdmissions(db))[0]!;
+  expect(row.owner_token).toBe('legacy-reconciliation');
+  expect(row.utc_day).toBe('2026-10-18');
+  expect(row.state).toBe('admitted');
+  expect(JSON.parse(row.run_ids_json)).toEqual(['legacy-child']);
+  expect(
+    (
+      await db.query<{ proof_deadline_at: string }>(
+        'SELECT proof_deadline_at FROM tm_journal WHERE id=$1',
+        [input.journalId]
+      )
+    ).rows[0]?.proof_deadline_at
+  ).toBe(deadline);
+  expect(
+    (
+      await tm.reserveAutomaticFire(
+        { ...(await request('next-legacy-day')), now: '2026-10-19T12:00:00.000Z' },
+        other
+      )
+    ).allowed
+  ).toBe(true);
+});
 test('zero or invalid limit cannot reserve; schema preserves prior journal rows', async () => {
   const input = await request('disabled');
   for (const limit of [0, -1, 1.5, Number.NaN]) {

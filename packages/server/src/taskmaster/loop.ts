@@ -1006,7 +1006,66 @@ async function reconcileAutomaticFires(
       continue;
     }
     const source = record.automaticFireAdmission;
-    if (!source) continue; // Legacy unknowns are not relabelled as verified automatic admissions.
+    if (!source) {
+      // A terminal journal label alone is not admission proof. Only an exact,
+      // completed legacy cascade can establish the historical accounting day;
+      // missing evidence and real post-permission unknowns remain held.
+      const action = history.find(action => action.id === row.journal_id);
+      const proposal = action
+        ? (JSON.parse(action.proposal_json) as ActionProposal & {
+            cascadeId?: string;
+          })
+        : null;
+      const admittedAt = Date.parse(record.createdAt);
+      const legacyDryRun: unknown = record.request?.dryRun;
+      if (
+        row.owner_token !== 'legacy-reconciliation' ||
+        action?.action_type !== 'fire_cauldron' ||
+        action.idempotency_key !== row.action_key ||
+        action.thread_ref !== row.source_thread_ref ||
+        proposal?.cascadeId !== row.cascade_id ||
+        record.cascadeId !== row.cascade_id ||
+        typeof proposal.fireEvidence?.woId !== 'string' ||
+        !proposal.fireEvidence.woId.trim() ||
+        typeof proposal.fireEvidence.project !== 'string' ||
+        !proposal.fireEvidence.project.trim() ||
+        proposal.fireEvidence?.woId !== record.woId ||
+        proposal.fireEvidence?.project !== record.project ||
+        legacyDryRun !== false ||
+        !['won', 'blocked', 'spec-repair', 'cancelled', 'frontier-rejected'].includes(
+          record.status
+        ) ||
+        !runIds.length ||
+        !runIds.every(id => typeof id === 'string' && id.trim().length > 0) ||
+        !Number.isFinite(admittedAt) ||
+        !Number.isFinite(Date.parse(action.created_at)) ||
+        admittedAt < Date.parse(action.created_at) ||
+        admittedAt > now.getTime() ||
+        !record.attempts.every(
+          attempt =>
+            Number.isFinite(Date.parse(attempt.startedAt)) &&
+            Date.parse(attempt.startedAt) >= admittedAt &&
+            attempt.completedAt !== null &&
+            Number.isFinite(Date.parse(attempt.completedAt)) &&
+            Date.parse(attempt.completedAt) >= Date.parse(attempt.startedAt) &&
+            Date.parse(attempt.completedAt) <= now.getTime()
+        ) ||
+        // Record creation precedes admission. Crossing midnight before the first
+        // attempt leaves the historical admission day ambiguous, so keep it held.
+        new Date(Date.parse(record.attempts[0].startedAt)).toISOString().slice(0, 10) !==
+          new Date(admittedAt).toISOString().slice(0, 10)
+      )
+        continue;
+      await budget.settleAutomaticFire({
+        actionKey: row.action_key,
+        cascadeId: row.cascade_id,
+        state: 'admitted',
+        admittedAt: new Date(admittedAt).toISOString(),
+        runIds,
+      });
+      // Keep the legacy owner marker and original journal/record provenance.
+      continue;
+    }
     if (
       source.source !== 'taskmaster' ||
       source.actionKey !== row.action_key ||

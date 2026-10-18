@@ -24,6 +24,19 @@ accepted fire. Restart reconciliation covers all unresolved ledger identities,
 including those older than the message journal lookback. Missing or conflicting
 history withholds new fires; legacy unknowns are not relabelled as verified.
 
+Legacy reconciliation may establish a historical accounting day only from an
+exact journal/action/thread/cascade/WO/project match, a non-dry-run terminal
+cascade, real child identifiers and complete, valid attempt timestamps. Record
+creation and the first attempt must bound admission within the same UTC day;
+otherwise its day remains ambiguous and held. The legacy record creation time
+is the historical accounting anchor, not a newly verified permission instant.
+The ledger then counts the proven admission on that bounded day and
+keeps its `legacy-reconciliation` owner; no automatic permission provenance is
+invented, the original cascade is not rewritten, and legacy journal supervision
+deadlines are preserved. A terminal journal outcome alone is insufficient.
+Missing records, running/incomplete attempts, identity/time conflicts and genuine
+post-permission unknowns remain held across UTC days; there is no blanket expiry.
+
 The cascade record carries source, journal/action/thread, UTC admission day and
 permission timestamp. Actual workflow identities come from `attempts[].runId`.
 The ledger and pending expectation follow those child IDs; a cascade ID is never
@@ -52,6 +65,14 @@ The SQLite suite also invokes `taskmaster-fire-cap-race.fixture.ts` with Bun to
 race two real OS processes against one remaining slot. The fixture accepts only
 the suite's `tm-cap-*` temporary-directory `test.db` and synthetic request JSON;
 it is not a builder, provider runner or operational database command.
+
+The server cap suite includes the migration regression: seed two proven legacy
+admissions, reconcile, reopen the real temporary SQLite database, advance one UTC
+day and admit exactly two new reservations. Negative controls cover missing or
+conflicting identity, malformed/future times, absent child/completion evidence,
+old pending history and genuine lost post-permission provenance. All external
+cascade effects in this suite are injected fakes. Temporary SQLite references
+are dropped before final collection/cleanup on Windows.
 
 ## Publication and rollout
 

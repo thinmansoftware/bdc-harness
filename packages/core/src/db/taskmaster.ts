@@ -233,7 +233,8 @@ export async function settleAutomaticFire(
     await db.query(
       `UPDATE tm_journal SET proof_deadline_at=$1 WHERE id IN (
          SELECT journal_id FROM tm_fire_admissions WHERE action_key=$2
-         AND cascade_id=$3 AND state='admitted' AND admitted_at=$4)`,
+         AND cascade_id=$3 AND state='admitted' AND admitted_at=$4
+         AND owner_token <> 'legacy-reconciliation')`,
       [
         new Date(Date.parse(input.admittedAt) + 86_400_000).toISOString(),
         input.actionKey,
