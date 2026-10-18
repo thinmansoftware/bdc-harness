@@ -13,7 +13,7 @@
 
 import { describe, test, expect, afterAll } from 'bun:test';
 import { createHash, randomUUID } from 'crypto';
-import { mkdtemp, readFile, rm } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { runCascade } from '../cascade.js';
@@ -31,6 +31,8 @@ function loadLiveTiers() {
 import { loadRuleset } from '../conductor.js';
 import { TimeoutError } from '../poll.js';
 import { readCascadeRecordById } from '../frontier-approval.js';
+import { acquireWoLock, releaseWoLock } from '../wo-lock.js';
+import { createRecord, writeRecord } from '../recorder.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -106,6 +108,7 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
       findWoClaim: async () => null,
       acquireWoLock: async (woId, project, cascadeId) => ({
         acquired: true,
+        executionToken: 'test-execution-owner',
         path: 'in-memory-test-lock',
         record: {
           woId,
@@ -123,6 +126,152 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
 }
 
 describe('claim discovery uncertainty', () => {
+  test('same-dispatch replay cannot release the original running owner', async () => {
+    let signalStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      signalStarted = resolve;
+    });
+    let finish!: () => void;
+    const heldFire = new Promise<void>(resolve => {
+      finish = resolve;
+    });
+    let fires = 0;
+    const admissions: boolean[] = [];
+    const options = baseOpts({
+      dispatchId: 'same-dispatch-running',
+      onAdmission: (_record, created) => {
+        admissions.push(created);
+      },
+      deps: {
+        acquireWoLock,
+        releaseWoLock,
+        createRecord,
+        writeRecord,
+        fetchNodeTimeouts: async () => ({}),
+        fire: async () => {
+          fires++;
+          signalStarted();
+          await heldFire;
+          return makeFireOk('owned-run');
+        },
+        poll: async () => makePollResult({ runId: 'owned-run' }),
+        judge: () => makePassVerdict(),
+        escalate: async () => {},
+      },
+    });
+    const owner = runCascade(options);
+    try {
+      await started;
+      const replay = await runCascade(options);
+      expect(replay.cascadeId).toBe(options.dispatchId!);
+      expect(replay.status).toBe('running');
+      expect(fires).toBe(1);
+      expect(admissions).toEqual([true, false]);
+      await expect(runCascade({ ...options, tags: ['different-request'] })).rejects.toThrow(
+        'smart_cauldron_admission_unknown'
+      );
+      const path = join(
+        options.outDir!,
+        `dispatch-${createHash('sha256').update(options.dispatchId!).digest('hex').slice(0, 24)}`,
+        'cascade-record.json'
+      );
+      const original = await readFile(path, 'utf8');
+      for (const corrupt of [{ status: 'invented-status' }, { attempts: null }]) {
+        await writeFile(path, JSON.stringify({ ...JSON.parse(original), ...corrupt }), 'utf8');
+        await expect(runCascade(options)).rejects.toThrow('smart_cauldron_admission_unknown');
+      }
+      await writeFile(path, original, 'utf8');
+      const competitor = await acquireWoLock(
+        options.woId,
+        options.project!,
+        'competing-dispatch',
+        options.outDir
+      );
+      expect(competitor.acquired).toBe(false);
+    } finally {
+      finish();
+      await owner;
+    }
+  });
+
+  test('same-dispatch replay before original admission cannot steal its write or execution grant', async () => {
+    let signalBlocked!: () => void;
+    const blocked = new Promise<void>(resolve => {
+      signalBlocked = resolve;
+    });
+    let resume!: () => void;
+    const resumeWrite = new Promise<void>(resolve => {
+      resume = resolve;
+    });
+    let writes = 0;
+    let fires = 0;
+    const options = baseOpts({
+      dispatchId: 'same-dispatch-pre-admission',
+      deps: {
+        acquireWoLock,
+        releaseWoLock,
+        writeRecord,
+        createRecord: async (record, outDir) => {
+          writes++;
+          if (writes === 1) {
+            signalBlocked();
+            await resumeWrite;
+          }
+          return createRecord(record, outDir);
+        },
+        fetchNodeTimeouts: async () => ({}),
+        fire: async () => {
+          fires++;
+          return makeFireOk('only-owner-run');
+        },
+        poll: async () => makePollResult({ runId: 'only-owner-run' }),
+        judge: () => makePassVerdict(),
+        escalate: async () => {},
+      },
+    });
+    const owner = runCascade(options);
+    try {
+      await blocked;
+      await expect(runCascade(options)).rejects.toThrow('smart_cauldron_admission_unknown');
+      expect(writes).toBe(1);
+      expect(fires).toBe(0);
+    } finally {
+      resume();
+      await owner;
+    }
+    expect(fires).toBe(1);
+  });
+
+  test('old acquired-only injected dependency cannot grant execution or cleanup authority', async () => {
+    let effects = 0;
+    const ownerFixture = baseOpts().deps!.acquireWoLock!;
+    const options = baseOpts({
+      deps: {
+        acquireWoLock: async (...args) => {
+          const result = await ownerFixture(...args);
+          const { executionToken: ignored, ...legacy } = result;
+          return legacy;
+        },
+        findWoClaim: async () => {
+          effects++;
+          return null;
+        },
+        createRecord: async () => {
+          effects++;
+          throw new Error('unexpected write');
+        },
+        fire: async () => {
+          effects++;
+          return makeFireOk('unexpected');
+        },
+        releaseWoLock: async () => {
+          effects++;
+        },
+      },
+    });
+    await expect(runCascade(options)).rejects.toThrow('smart_cauldron_lock_owner_unknown');
+    expect(effects).toBe(0);
+  });
   for (const [phase, lookupNumber] of [
     ['admission', 1],
     ['before-fire', 2],
@@ -1352,6 +1501,7 @@ describe('wo claim + single-flight (#1546)', () => {
           heldBy = cascadeId;
           return {
             acquired: true,
+            executionToken: 'test-execution-owner',
             path,
             record: {
               woId,

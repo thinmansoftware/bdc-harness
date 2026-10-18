@@ -30,6 +30,35 @@ ownership is follow-on work. This proposal is not full acceptance of bdc-xo#1546
 a live two-lane canary, or merge/deployment authority. A mixed-version writer that
 does not obey this guard is outside its serialization guarantee.
 
+## Proposed source repair for review: same-dispatch execution ownership (2026-10-18)
+
+The follow-on proposal gives a fresh or explicitly released-lock acquirer a
+random execution-generation token, persisted in the WO lock. Same-ID running
+reacquisition remains recognizable but returns an explicit null token: it is a
+read-only replay, never a second execution grant. Missing ownership metadata from
+an injected acquisition dependency is UNKNOWN, not implicit permission.
+
+A replay branches before discovery, admission creation and the owner's finally
+block. It reads the durable record through the existing recorder module,
+validates exact cascade/WO/project, the existing request identity comparison,
+a known status and an attempts array, then reports admission with `created=false`.
+Missing or unparseable records, conflicting identity/request and invalid
+status/attempts envelopes are UNKNOWN and perform no write, fire or release.
+This is not complete field-by-field record-schema validation. It also prevents
+a replay arriving before admission from becoming its writer. The frontier
+module retains its existing reader export by forwarding the shared reader.
+
+Only the execution-token owner enters provider execution and cleanup. Release
+compares exact cascade identity and token under the metadata guard, including
+when a later generation reuses the same cascade ID. Stale or missing tokens
+leave evidence untouched. Genuine-owner fixtures now state ownership explicitly.
+
+Legacy running lock records without a generation token remain conservatively
+held; they require explicit reconciliation or a coordinated drain before any
+future version transition. No token is silently backfilled, and mixed-version
+writers remain outside the guarantee. This is source validation for review,
+not a deployment, live canary or full closure of bdc-xo#1546.
+
 ---
 
 # PART 1 -- The system in plain words

@@ -25,7 +25,7 @@ describe('wo-lock', () => {
   test('concurrent takeover of a released lock grants exactly one cascade', async () => {
     const outDir = await makeOutDir();
     const prior = await acquireWoLock('WO-LOCK-01', 'shopops', 'prior', outDir);
-    await releaseWoLock('WO-LOCK-01', 'shopops', 'prior', outDir);
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'prior', outDir, prior.executionToken!);
     const claims = await Promise.all(
       Array.from({ length: 12 }, (_, i) =>
         acquireWoLock('WO-LOCK-01', 'shopops', `candidate-${i}`, outDir)
@@ -38,8 +38,8 @@ describe('wo-lock', () => {
 
   test('independent processes grant one released-lock takeover', async () => {
     const outDir = await makeOutDir();
-    await acquireWoLock('WO-LOCK-01', 'shopops', 'prior', outDir);
-    await releaseWoLock('WO-LOCK-01', 'shopops', 'prior', outDir);
+    const prior = await acquireWoLock('WO-LOCK-01', 'shopops', 'prior', outDir);
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'prior', outDir, prior.executionToken!);
     const url = pathToFileURL(join(import.meta.dir, '../wo-lock.ts')).href;
     const children = [0, 1, 2].map(i =>
       Bun.spawn(
@@ -121,7 +121,7 @@ describe('wo-lock', () => {
         },
       }));
       const { releaseWoLock } = await import(${JSON.stringify(url)});
-      await releaseWoLock('WO-LOCK-01', 'shopops', 'cascade-a', ${JSON.stringify(outDir)});
+      await releaseWoLock('WO-LOCK-01', 'shopops', 'cascade-a', ${JSON.stringify(outDir)}, ${JSON.stringify(first.executionToken)});
     `,
         ],
         { stdout: 'pipe', stderr: 'pipe' }
@@ -153,9 +153,9 @@ describe('wo-lock', () => {
   test('an old owner release preserves the newer running owner', async () => {
     const outDir = await makeOutDir();
     const first = await acquireWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir);
-    await releaseWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir);
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir, first.executionToken!);
     await acquireWoLock('WO-LOCK-01', 'shopops', 'cascade-b', outDir);
-    await releaseWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir);
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir, first.executionToken!);
     expect(JSON.parse(await readFile(first.path, 'utf8'))).toMatchObject({
       cascadeId: 'cascade-b',
       status: 'running',
@@ -166,7 +166,7 @@ describe('wo-lock', () => {
     const outDir = await makeOutDir();
     const first = await acquireWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir);
     await writeFile(first.path, '{corrupt', 'utf8');
-    await releaseWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir);
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir, first.executionToken!);
     expect(await readFile(first.path, 'utf8')).toBe('{corrupt');
     await expect(acquireWoLock('WO-LOCK-01', 'shopops', 'cascade-b', outDir)).rejects.toThrow();
   });
@@ -197,12 +197,30 @@ describe('wo-lock', () => {
     await acquireWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir);
     const again = await acquireWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir);
     expect(again.acquired).toBe(true);
+    expect(again.executionToken).toBeNull();
+  });
+
+  test('same-ID stale generation and missing token cannot release a new owner', async () => {
+    const outDir = await makeOutDir();
+    const first = await acquireWoLock('WO-LOCK-01', 'shopops', 'same-id', outDir);
+    expect(typeof first.executionToken).toBe('string');
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'same-id', outDir, first.executionToken!);
+    const next = await acquireWoLock('WO-LOCK-01', 'shopops', 'same-id', outDir);
+    expect(next.executionToken).not.toBe(first.executionToken);
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'same-id', outDir, first.executionToken!);
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'same-id', outDir);
+    expect(JSON.parse(await readFile(first.path, 'utf8'))).toMatchObject({
+      status: 'running',
+      executionToken: next.executionToken,
+    });
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'same-id', outDir, next.executionToken!);
+    expect(JSON.parse(await readFile(first.path, 'utf8')).status).toBe('released');
   });
 
   test('release allows a new cascade', async () => {
     const outDir = await makeOutDir();
-    await acquireWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir);
-    await releaseWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir);
+    const first = await acquireWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir);
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'cascade-a', outDir, first.executionToken!);
     const next = await acquireWoLock('WO-LOCK-01', 'shopops', 'cascade-b', outDir);
     expect(next.acquired).toBe(true);
     expect(next.record.cascadeId).toBe('cascade-b');

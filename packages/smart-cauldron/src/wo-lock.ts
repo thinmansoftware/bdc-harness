@@ -54,7 +54,9 @@ async function readValidatedLock(
     typeof record.createdAt !== 'string' ||
     !Number.isFinite(Date.parse(record.createdAt)) ||
     typeof record.updatedAt !== 'string' ||
-    !Number.isFinite(Date.parse(record.updatedAt))
+    !Number.isFinite(Date.parse(record.updatedAt)) ||
+    (record.executionToken !== undefined &&
+      (typeof record.executionToken !== 'string' || !record.executionToken.trim()))
   )
     throw new Error('smart_cauldron_wo_lock_unknown');
   return record;
@@ -69,12 +71,15 @@ export interface WoLockRecord {
   readonly status: WoLockStatus;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly executionToken?: string;
 }
 
 export interface AcquireWoLockResult {
   readonly acquired: boolean;
   readonly path: string;
   readonly record: WoLockRecord;
+  /** Nonempty only for the fresh execution owner; null is a read-only same-ID replay. */
+  readonly executionToken?: string | null;
 }
 
 function lockPath(outDir: string, woId: string, project: string): string {
@@ -91,6 +96,7 @@ export async function acquireWoLock(
   const filePath = lockPath(outDir, woId, project);
   await mkdir(join(outDir, 'wo-locks'), { recursive: true });
   const now = new Date().toISOString();
+  const executionToken = randomUUID();
   const record: WoLockRecord = {
     woId,
     project,
@@ -98,6 +104,7 @@ export async function acquireWoLock(
     status: 'running',
     createdAt: now,
     updatedAt: now,
+    executionToken,
   };
 
   return withMutationGuard(filePath, async () => {
@@ -106,7 +113,7 @@ export async function acquireWoLock(
         encoding: 'utf8',
         flag: 'wx',
       });
-      return { acquired: true, path: filePath, record };
+      return { acquired: true, path: filePath, record, executionToken };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       const existing = await readValidatedLock(filePath, woId, project);
@@ -118,12 +125,12 @@ export async function acquireWoLock(
           flag: 'wx',
         });
         await rename(tempPath, filePath);
-        return { acquired: true, path: filePath, record };
+        return { acquired: true, path: filePath, record, executionToken };
       }
       if (existing.cascadeId === cascadeId) {
-        return { acquired: true, path: filePath, record: existing };
+        return { acquired: true, path: filePath, record: existing, executionToken: null };
       }
-      return { acquired: false, path: filePath, record: existing };
+      return { acquired: false, path: filePath, record: existing, executionToken: null };
     }
   });
 }
@@ -132,14 +139,24 @@ export async function releaseWoLock(
   woId: string,
   project: string,
   cascadeId: string,
-  outDir = './cascade-runs'
+  outDir = './cascade-runs',
+  executionToken?: string
 ): Promise<void> {
+  if (typeof executionToken !== 'string' || !executionToken.trim()) {
+    log.warn('smart_cauldron.wo_lock_release_owner_unknown');
+    return;
+  }
   const filePath = lockPath(outDir, woId, project);
   try {
     await mkdir(join(outDir, 'wo-locks'), { recursive: true });
     await withMutationGuard(filePath, async () => {
       const existing = await readValidatedLock(filePath, woId, project);
-      if (existing.cascadeId !== cascadeId || existing.status === 'released') return;
+      if (
+        existing.cascadeId !== cascadeId ||
+        existing.executionToken !== executionToken ||
+        existing.status === 'released'
+      )
+        return;
       const released: WoLockRecord = {
         ...existing,
         status: 'released',

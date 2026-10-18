@@ -29,7 +29,12 @@ import { fireTier, buildFireMessage } from './fire.js';
 import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './poll.js';
 import { fetchNodeTimeoutsMs } from './node-timeouts.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
-import { createRecord, writeRecord } from './recorder.js';
+import {
+  createRecord,
+  writeRecord,
+  readCascadeRecordById,
+  assertCascadeRecordIdentity,
+} from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
 import {
@@ -464,6 +469,53 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     onAdmission?.(blocked, false);
     return blocked;
   }
+
+  if (woLock.executionToken === null) {
+    // Reentrant callers can only read admission. They must not win its create,
+    // enter provider execution, or release the original caller's lifetime lock.
+    let existing: CascadeRunRecord;
+    try {
+      const record = await readCascadeRecordById(cascadeId, outDir);
+      if (
+        !record ||
+        !Array.isArray(record.attempts) ||
+        ![
+          'planned',
+          'running',
+          'won',
+          'blocked',
+          'spec-repair',
+          'recovery-delegated',
+          'infra-alert',
+          'pending-frontier-approval',
+          'frontier-rejected',
+          'frontier-approved',
+          'cancelled',
+          'refused',
+        ].includes(record.status)
+      )
+        throw new Error('admission unknown');
+      assertCascadeRecordIdentity(record, {
+        cascadeId,
+        woId,
+        project,
+        request: {
+          woClass: woClass ?? null,
+          tags: [...(tags ?? [])].sort(),
+          entryOverride: entryOverride ?? null,
+          dryRun: false,
+        },
+      });
+      existing = record;
+    } catch {
+      throw new Error('smart_cauldron_admission_unknown');
+    }
+    onAdmission?.(existing, false);
+    return existing;
+  }
+  const executionToken = woLock.executionToken;
+  if (typeof executionToken !== 'string' || !executionToken.trim())
+    throw new Error('smart_cauldron_lock_owner_unknown');
 
   // Cascade loop
   const attempts: CascadeAttempt[] = [];
@@ -1144,7 +1196,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
     return record;
   } finally {
-    await releaseWoLockImpl(woId, project, cascadeId, outDir);
+    await releaseWoLockImpl(woId, project, cascadeId, outDir, executionToken);
   }
 }
 
