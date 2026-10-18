@@ -30,6 +30,7 @@ import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './po
 import { fetchNodeTimeoutsMs } from './node-timeouts.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { createRecord, writeRecord } from './recorder.js';
+export { readCascadeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
 import { findWoClaim, resolveGithubRepo, type WoClaim } from './already-satisfied.js';
@@ -204,6 +205,8 @@ export interface RunCascadeOptions {
   dispatchId?: string;
   /** Resolves only after the initial record is durable; used by async API dispatch. */
   onAdmission?: (record: CascadeRunRecord, created: boolean) => void;
+  /** Await durable automatic-fire permission after preflight, before admission/effects. */
+  beforeAdmission?: () => Promise<import('@archon/core/db/taskmaster').AutomaticFireProvenance>;
   woClass?: string;
   tags?: string[];
   /** Override the entry tier (skips conductor ruleset). */
@@ -532,12 +535,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
     let refusalReason: CascadeRunRecord['refusalReason'];
+    let automaticPreflightTier: string | null = null;
 
     function buildCurrentRecord(): CascadeRunRecord {
       const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
       const climbed = climbCount > 0;
       return {
         cascadeId,
+        ...(automaticFireAdmission ? { automaticFireAdmission } : {}),
         woId,
         project: project ?? null,
         request: {
@@ -571,6 +576,13 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
     // Persist admission before any provider lane can be fired. A duplicate dispatch
     // returns the existing record and cannot create a second provider attempt.
+    if (opts.beforeAdmission && preflightImpl) {
+      const firstTier = tiers[currentIndex];
+      if (!firstTier) throw new Error('automatic_fire_entry_tier_missing');
+      await preflightImpl(firstTier);
+      automaticPreflightTier = firstTier.name;
+    }
+    const automaticFireAdmission = await opts.beforeAdmission?.();
     const admission = await createRecordImpl(buildCurrentRecord(), outDir);
     onAdmission?.(admission.record, admission.created);
     if (!admission.created) return admission.record;
@@ -806,7 +818,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       attempts.push(attempt);
       await checkpoint();
 
-      if (preflightImpl) {
+      if (preflightImpl && !(attempts.length === 1 && automaticPreflightTier === tier.name)) {
         try {
           await preflightImpl(tier);
         } catch (error) {

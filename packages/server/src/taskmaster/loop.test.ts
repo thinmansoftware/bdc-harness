@@ -63,6 +63,7 @@ import type {
 } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import * as fireBudgetDb from '@archon/core/db/taskmaster';
 
 describe('Taskmaster reset visibility and canary', () => {
   test('legacy_unverified receipts are never post-cutover evidence', () => {
@@ -271,6 +272,53 @@ function makeWorld(): FakeWorld {
   };
 }
 
+const budgetStores = new WeakMap<FakeWorld, SqliteAdapter>();
+const openedBudgetStores: SqliteAdapter[] = [];
+afterAll(async () => {
+  for (const db of openedBudgetStores) await db.close();
+});
+function fixtureFireBudget(world: FakeWorld): NonNullable<TaskmasterDeps['fireBudget']> {
+  const database = async (): Promise<SqliteAdapter> => {
+    let db = budgetStores.get(world);
+    if (!db) {
+      db = new SqliteAdapter(':memory:');
+      budgetStores.set(world, db);
+      openedBudgetStores.push(db);
+    }
+    await db.query('UPDATE tm_control SET pause_state=$1,epoch=$2 WHERE id=1', [
+      world.control.pause_state,
+      world.control.epoch,
+    ]);
+    for (const row of world.journal)
+      await db.query(
+        `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET outcome=$6,proposal_json=$4`,
+        [
+          row.id,
+          row.thread_ref,
+          row.action_type,
+          row.proposal_json,
+          row.idempotency_key,
+          row.outcome,
+          row.created_at,
+        ]
+      );
+    return db;
+  };
+  return {
+    reserveAutomaticFire: async input => fireBudgetDb.reserveAutomaticFire(input, await database()),
+    authorizeAutomaticFire: async input =>
+      fireBudgetDb.authorizeAutomaticFire(input, await database()),
+    releaseAutomaticFire: async input => fireBudgetDb.releaseAutomaticFire(input, await database()),
+    settleAutomaticFire: async input => fireBudgetDb.settleAutomaticFire(input, await database()),
+    seedAutomaticFireHistory: async input =>
+      fireBudgetDb.seedAutomaticFireHistory(input, await database()),
+    listAutomaticFireAdmissions: async () =>
+      fireBudgetDb.listAutomaticFireAdmissions(await database()),
+    updateAutomaticFireExpectation: async input =>
+      fireBudgetDb.updateAutomaticFireExpectation(input, await database()),
+  };
+}
 function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): TaskmasterDeps {
   let journalSeq = world.journal.length;
   const dal = {
@@ -477,6 +525,28 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     // Default no-op evidence so adoption refresh never hits the network in unit tests.
     getGithubIssueEvidence: async () => null,
     ...overrides,
+    fireBudget: overrides.fireBudget ?? fixtureFireBudget(world),
+    readFireCascade: overrides.readFireCascade ?? (async () => null),
+    ...(overrides.runCascade
+      ? {
+          runCascade: (async options => {
+            const provenance = await options.beforeAdmission?.();
+            const normalize = (
+              record: Awaited<ReturnType<NonNullable<TaskmasterDeps['runCascade']>>>
+            ) => ({
+              ...record,
+              cascadeId: options.dispatchId!,
+              automaticFireAdmission: provenance,
+              attempts: record.attempts ?? [{ runId: record.cascadeId }],
+            });
+            const record = await overrides.runCascade!({
+              ...options,
+              onAdmission: (record, created) => options.onAdmission?.(normalize(record), created),
+            });
+            return normalize(record);
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        }
+      : {}),
   };
 }
 
@@ -913,7 +983,7 @@ describe('fire_cauldron loop', () => {
       expect(fires[0]?.outcome).toBe('sent');
       expect(fires[0]?.proposal_json).toContain('cascade-501');
       expect(registered).toHaveLength(1);
-      expect(registered[0]?.dispatch_ref).toBe('cascade-501');
+      expect(registered[0]?.dispatch_ref).toBe(fires[0]?.idempotency_key);
       expect(registered[0]?.evidence_json).toContain('remote_agent_workflow_runs');
       // Deterministic identity: the journal action id is passed so a replayed
       // fire reuses this expectation instead of registering a second one.
@@ -1076,7 +1146,7 @@ describe('fire_cauldron loop', () => {
     }
   });
 
-  test('fire cap dispatches P0 through P2 first and defers overflow for the next tick', async () => {
+  test('daily cap dispatches P0 and P1 first and preserves overflow across ticks and restart', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -1125,26 +1195,22 @@ describe('fire_cauldron loop', () => {
       });
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
-      expect(admitted).toEqual([
-        'WO-HARNESS-EXAMPLE-510',
-        'WO-HARNESS-EXAMPLE-511',
-        'WO-HARNESS-EXAMPLE-512',
-      ]);
-      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(2);
+      expect(admitted).toEqual(['WO-HARNESS-EXAMPLE-510', 'WO-HARNESS-EXAMPLE-511']);
+      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(3);
 
       world.nowMs += 60_000;
       await tick(state, deps);
-      expect(admitted.slice(3).sort()).toEqual([
-        'WO-HARNESS-EXAMPLE-513',
-        'WO-HARNESS-EXAMPLE-514',
-      ]);
+      expect(admitted).toHaveLength(2);
+      world.nowMs += 60_000;
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted).toHaveLength(2);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
   });
 
-  test('prior same-day sent fires do not impose a daily fire ceiling', async () => {
+  test('prior same-day unresolved automatic fires close the daily faucet', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -1201,7 +1267,7 @@ describe('fire_cauldron loop', () => {
           }) as NonNullable<TaskmasterDeps['runCascade']>,
         })
       );
-      expect(admissions).toBe(1);
+      expect(admissions).toBe(0);
       expect(world.journal.filter(row => row.action_type === 'fire_cauldron')).toHaveLength(3);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
