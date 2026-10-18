@@ -287,6 +287,134 @@ function fixtureRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+export const REVIEWER_EVENT_TYPES = Object.freeze([
+  'thread.started',
+  'turn.started',
+  'item.started',
+  'item.updated',
+  'item.completed',
+  'turn.completed',
+  'turn.failed',
+  'error',
+  'other',
+]);
+export const REVIEWER_REJECTION_STAGES = Object.freeze([
+  'none',
+  'endpoint',
+  'upgrade-limit',
+  'wire-bound',
+  'decoding',
+  'tool-inventory',
+  'request-shape',
+  'denial-mismatch',
+]);
+
+export function reviewerDiagnosticCategory(
+  category: string,
+  phase: string,
+  sdkKind: string
+): string {
+  if (category === 'cleanup-failed') return category;
+  if (phase === 'sdk-run' && sdkKind === 'cli-exit') return 'sdk-process';
+  if (phase === 'sdk-run' && sdkKind === 'sdk-parse') return 'sdk-parse';
+  return category;
+}
+
+/** Pure diagnostics only. No raw errors, request data, paths or arbitrary keys escape. */
+export function reviewerFailureEvidence(
+  error: unknown,
+  observation: unknown
+): {
+  requests: number;
+  websocketAttempts: number;
+  validatedRequests: number;
+  firstRejection: string;
+  eventCounts: Record<string, number>;
+  sdkFailure: {
+    kind: string;
+    exitCode: number | null;
+    signal: string | null;
+    stderrCategory: string;
+  };
+} {
+  const value = fixtureRecord(observation);
+  if (
+    Object.keys(value).sort().join(',') !==
+    'eventCounts,firstRejection,requests,validatedRequests,websocketAttempts'
+  )
+    throw new Error('fixture diagnostic fields');
+  for (const key of ['requests', 'websocketAttempts', 'validatedRequests'])
+    if (
+      !Number.isSafeInteger(value[key]) ||
+      (value[key] as number) < 0 ||
+      (value[key] as number) > 255
+    )
+      throw new Error('fixture diagnostic count bound');
+  if (
+    (value.validatedRequests as number) > Math.min(2, value.requests as number) ||
+    typeof value.firstRejection !== 'string' ||
+    !REVIEWER_REJECTION_STAGES.includes(value.firstRejection)
+  )
+    throw new Error('fixture diagnostic rejection inventory');
+  const counts = fixtureRecord(value.eventCounts);
+  const eventCounts: Record<string, number> = {};
+  let total = 0;
+  for (const [key, count] of Object.entries(counts)) {
+    if (
+      !REVIEWER_EVENT_TYPES.includes(key) ||
+      !Number.isSafeInteger(count) ||
+      (count as number) < 0 ||
+      (count as number) > 65
+    )
+      throw new Error('fixture diagnostic event inventory');
+    total += count as number;
+    eventCounts[key] = count as number;
+  }
+  if (total > 65) throw new Error('fixture diagnostic event bound');
+  const sdkFailure: {
+    kind: string;
+    exitCode: number | null;
+    signal: string | null;
+    stderrCategory: string;
+  } = { kind: 'other', exitCode: null, signal: null, stderrCategory: 'other' };
+  const message = (error as { message?: unknown } | null)?.message;
+  if (typeof message === 'string' && message.length <= 65536) {
+    const exit =
+      /^Codex Exec exited with (?:code ([0-9]{1,3})|signal (SIGTERM|SIGKILL|SIGABRT|SIGSEGV|SIGINT|SIGPIPE|SIGBUS|SIGILL)): /.exec(
+        message
+      );
+    if (exit && (exit[1] === undefined || Number(exit[1]) <= 255)) {
+      sdkFailure.kind = 'cli-exit';
+      sdkFailure.exitCode = exit[1] === undefined ? null : Number(exit[1]);
+      sdkFailure.signal = exit[2] ?? null;
+      // Fixed prefixes verified at pinned b1a547b1 exec/src/lib.rs. Only codes escape.
+      const prefixes: Record<string, string> = {
+        'Error parsing -c overrides:': 'config-overrides',
+        'Error finding codex home:': 'codex-home',
+        'Error loading rules:': 'exec-policy',
+        'Error loading config.toml:': 'config-load',
+        'failed to initialize in-process app-server client:': 'app-server-start',
+      };
+      for (const line of message.slice(exit[0].length).split(/\r?\n/)) {
+        const prefix = Object.keys(prefixes).find(prefix => line.startsWith(prefix));
+        if (prefix !== undefined) {
+          sdkFailure.stderrCategory = prefixes[prefix];
+          break;
+        }
+      }
+    } else if (message.startsWith('Failed to parse item: ')) sdkFailure.kind = 'sdk-parse';
+  }
+  if ((error as { name?: unknown } | null)?.name === 'AbortError') sdkFailure.kind = 'aborted';
+  return {
+    requests: value.requests as number,
+    websocketAttempts: value.websocketAttempts as number,
+    validatedRequests: value.validatedRequests as number,
+    firstRejection: value.firstRejection,
+    eventCounts,
+    sdkFailure,
+  };
+}
+
 /** ApiConfig.ToolsV2 omits native utility fields; require resolved CLI provenance. */
 export function verifyReviewerUtilityControls(response: unknown): void {
   const result = fixtureRecord(response);

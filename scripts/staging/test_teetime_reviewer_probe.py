@@ -10,6 +10,22 @@ ID = 'b'*64
 
 
 class ReviewerProbeTests(unittest.TestCase):
+    def test_v2_closed_failure_evidence_retains_counts_without_raw_errors(self):
+        evidence = {'requests':0, 'websocketAttempts':0, 'validatedRequests':0,
+                    'firstRejection':'none', 'eventCounts':{},
+                    'sdkFailure':{'kind':'cli-exit','exitCode':1,'signal':None,'stderrCategory':'config-load'}}
+        frame = {'kind':'teetime-reviewer-failure-v2','phase':'sdk-run','category':'sdk-process','evidence':evidence}
+        self.assertEqual(reviewer_failure_diagnostic(json.dumps(frame).encode(),1),frame)
+        for patch in [{'requests':256}, {'validatedRequests':1}, {'firstRejection':'private'},
+                      {'eventCounts':{'private':1}}, {'eventCounts':{'error':66}},
+                      {'sdkFailure':{'kind':'cli-exit','exitCode':1,'signal':'SIGKILL','stderrCategory':'other'}},
+                      {'sdkFailure':{'kind':'cli-exit','exitCode':999,'signal':None,'stderrCategory':'other'}},
+                      {'sdkFailure':{'kind':'other','exitCode':None,'signal':None,'stderrCategory':'private'}},
+                      {'extra':'private'}]:
+            with self.assertRaises(ValueError):
+                reviewer_failure_diagnostic(json.dumps({**frame,'evidence':{**evidence,**patch}}).encode(),1)
+        with self.assertRaises(ValueError): reviewer_failure_diagnostic(json.dumps(frame).encode(),0)
+
     def test_failure_diagnostic_never_satisfies_success_or_zero_exit(self):
         frame={'kind':'teetime-reviewer-failure-v1','phase':'catalog-compare','category':'catalog-identity'}
         raw=json.dumps(frame).encode()+b'\n'
@@ -27,6 +43,7 @@ class ReviewerProbeTests(unittest.TestCase):
                 reviewer_failure_diagnostic(json.dumps(changed).encode(),1)
         raw=json.dumps(frame).encode()+b'\n'
         for changed in [raw+raw,b'not json',raw+b'\nextra',b'x'*2049,
+                        b'{"kind":"teetime-reviewer-failure-v2"}',
                         raw.replace(b'"phase":',b'"phase":"sdk-run","phase":')]:
             with self.assertRaises(ValueError): reviewer_failure_diagnostic(changed,1)
 

@@ -10,6 +10,10 @@ function requireValue(condition: unknown, label: string): asserts condition {
 }
 let phase = 'bootstrap';
 let failureCleanup: (() => void) | undefined;
+let diagnosticCategory: typeof Fixture.reviewerDiagnosticCategory | undefined;
+let failureEvidence:
+  | ((error: unknown) => ReturnType<typeof Fixture.reviewerFailureEvidence>)
+  | undefined;
 async function main(): Promise<void> {
   const { createHash } = await import('node:crypto');
   const { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } =
@@ -28,6 +32,7 @@ async function main(): Promise<void> {
   const policyPath = '/app/packages/providers/src/codex/restricted-policy.ts';
   phase = 'options-import';
   const fixture = (await import(fixturePath)) as typeof Fixture;
+  diagnosticCategory = fixture.reviewerDiagnosticCategory;
   const policy = (await import(policyPath)) as typeof Policy;
   const options = fixture.fixtureClientOptions();
   const binary = policy.RESTRICTED_BINARY;
@@ -250,6 +255,17 @@ async function main(): Promise<void> {
 
   let requests = 0;
   let websocketAttempts = 0;
+  let validatedRequests = 0;
+  let firstRejection = 'none';
+  const counts: Record<string, number> = {};
+  failureEvidence = (error: unknown): ReturnType<typeof Fixture.reviewerFailureEvidence> =>
+    fixture.reviewerFailureEvidence(error, {
+      requests,
+      websocketAttempts,
+      validatedRequests,
+      firstRejection,
+      eventCounts: counts,
+    });
   let protocolFailure = false;
   let hostileEmitted = false;
   let denialObserved = false;
@@ -283,9 +299,11 @@ async function main(): Promise<void> {
     port: 0,
     idleTimeout: 10,
     async fetch(request) {
+      let rejectionStage = 'endpoint';
       try {
         if (request.headers.get('upgrade') !== null) {
           websocketAttempts++;
+          rejectionStage = 'upgrade-limit';
           requireValue(
             request.method === 'GET' &&
               new URL(request.url).pathname === '/v1/responses' &&
@@ -300,6 +318,7 @@ async function main(): Promise<void> {
           'endpoint'
         );
         requests++;
+        rejectionStage = 'wire-bound';
         requireValue(requests <= (caseName === 'positive' ? 1 : 2), 'request count');
         const size = Number(request.headers.get('content-length'));
         requireValue(
@@ -312,13 +331,33 @@ async function main(): Promise<void> {
         const wire = new Uint8Array(await request.arrayBuffer());
         requireValue(wire.length === size, 'request length');
         const encoding = request.headers.get('content-encoding');
+        rejectionStage = 'decoding';
         const body = encoding === 'gzip' ? gunzipSync(wire, { maxOutputLength: 1048576 }) : wire;
         requireValue(
           (encoding === null || encoding === 'identity' || encoding === 'gzip') &&
             body.length <= 1048576,
           'decoded request bound'
         );
-        const observed = fixture.inspectReviewerRequest(body, requests, caseName);
+        rejectionStage = 'request-shape';
+        let observed: ReturnType<typeof fixture.inspectReviewerRequest>;
+        try {
+          observed = fixture.inspectReviewerRequest(body, requests, caseName);
+        } catch (error) {
+          const message = (error as { message?: unknown })?.message;
+          if (
+            typeof message === 'string' &&
+            [
+              'fixture executable definitions',
+              'fixture additional tools',
+              'fixture alternative definitions',
+            ].includes(message)
+          )
+            rejectionStage = 'tool-inventory';
+          else if (message === 'fixture explicit denial required')
+            rejectionStage = 'denial-mismatch';
+          throw error;
+        }
+        validatedRequests++;
         if (requests === 1) {
           firstBodyHash = observed.bodyHash;
           instructionHash = observed.instructionHash;
@@ -383,6 +422,7 @@ async function main(): Promise<void> {
           }
         );
       } catch {
+        if (firstRejection === 'none') firstRejection = rejectionStage;
         protocolFailure = true;
         return new Response('fixture request rejected', { status: 400 });
       }
@@ -419,7 +459,6 @@ async function main(): Promise<void> {
     clearTimeout(timer);
     server.stop(true);
   };
-  const counts: Record<string, number> = {};
   let finalMessages = 0;
   let turnCompleted = 0;
   let rawToolEvent = false;
@@ -440,7 +479,8 @@ async function main(): Promise<void> {
         ++eventCount <= 64 && eventBytes <= 65536 && !controller.signal.aborted,
         'raw SDK event bound'
       );
-      counts[event.type] = (counts[event.type] ?? 0) + 1;
+      const eventType = fixture.REVIEWER_EVENT_TYPES.includes(event.type) ? event.type : 'other';
+      counts[eventType] = (counts[eventType] ?? 0) + 1;
       requireValue(!['error', 'turn.failed'].includes(event.type), 'SDK failure');
       if ('item' in event) {
         if (event.item.type === 'agent_message') {
@@ -556,8 +596,15 @@ void main().catch((error: unknown) => {
   } catch {
     category = 'cleanup-failed';
   }
+  const evidence = failureEvidence?.(error);
+  category =
+    diagnosticCategory?.(category, phase, evidence?.sdkFailure.kind ?? 'other') ?? category;
   process.stdout.write(
-    JSON.stringify({ kind: 'teetime-reviewer-failure-v1', phase, category }) + '\n'
+    JSON.stringify(
+      evidence
+        ? { kind: 'teetime-reviewer-failure-v2', phase, category, evidence }
+        : { kind: 'teetime-reviewer-failure-v1', phase, category }
+    ) + '\n'
   );
   process.exitCode = 1;
 });

@@ -7,7 +7,41 @@ CASES = ('positive', 'shell', 'patch', 'code-mode')
 FAILURE_PHASES = ('bootstrap','options-import','home','cli-version','catalog-read','catalog-compare',
                   'catalog-write','configuration','server','sdk-import','sdk-run','final-check')
 FAILURE_CATEGORIES = ('module-resolution','fixture-input','native-process','catalog-identity',
-                      'configuration','request-protocol','sdk-stream','case-acceptance','cleanup-failed','other')
+                      'configuration','request-protocol','sdk-stream','sdk-process','sdk-parse',
+                      'case-acceptance','cleanup-failed','other')
+EVENT_TYPES = ('thread.started','turn.started','item.started','item.updated','item.completed',
+               'turn.completed','turn.failed','error','other')
+REJECTIONS = ('none','endpoint','upgrade-limit','wire-bound','decoding','tool-inventory',
+              'request-shape','denial-mismatch')
+SIGNALS = ('SIGTERM','SIGKILL','SIGABRT','SIGSEGV','SIGINT','SIGPIPE','SIGBUS','SIGILL')
+STDERR_CATEGORIES = ('other','config-overrides','codex-home','exec-policy','config-load','app-server-start')
+
+
+def validate_failure_evidence(value):
+    if (type(value) is not dict or set(value) != {'requests','websocketAttempts','validatedRequests',
+                                                'firstRejection','eventCounts','sdkFailure'}):
+        raise ValueError('reviewer diagnostic evidence fields')
+    for key in ('requests','websocketAttempts','validatedRequests'):
+        if type(value[key]) is not int or not 0 <= value[key] <= 255:
+            raise ValueError('reviewer diagnostic count bound')
+    if value['validatedRequests'] > min(2,value['requests']) or value['firstRejection'] not in REJECTIONS:
+        raise ValueError('reviewer diagnostic rejection inventory')
+    counts = value['eventCounts']
+    if (type(counts) is not dict or any(key not in EVENT_TYPES or type(count) is not int
+            or not 0 <= count <= 65 for key,count in counts.items()) or sum(counts.values()) > 65):
+        raise ValueError('reviewer diagnostic event inventory')
+    failure = value['sdkFailure']
+    if (type(failure) is not dict or set(failure) != {'kind','exitCode','signal','stderrCategory'}
+            or failure['kind'] not in ('cli-exit','sdk-parse','aborted','other')
+            or failure['stderrCategory'] not in STDERR_CATEGORIES):
+        raise ValueError('reviewer diagnostic SDK inventory')
+    if failure['kind'] == 'cli-exit':
+        numeric = type(failure['exitCode']) is int and 0 <= failure['exitCode'] <= 255
+        signaled = failure['signal'] in SIGNALS
+        if not ((numeric and failure['signal'] is None) or (signaled and failure['exitCode'] is None)):
+            raise ValueError('reviewer diagnostic SDK termination')
+    elif failure['exitCode'] is not None or failure['signal'] is not None or failure['stderrCategory'] != 'other':
+        raise ValueError('reviewer diagnostic SDK classification')
 
 
 def reviewer_failure_diagnostic(raw, exit_code):
@@ -18,10 +52,13 @@ def reviewer_failure_diagnostic(raw, exit_code):
         frame = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
     except (ValueError, RecursionError):
         raise ValueError('reviewer failure diagnostic JSON') from None
-    if (type(frame) is not dict or set(frame) != {'kind','phase','category'}
-            or frame['kind'] != 'teetime-reviewer-failure-v1'
-            or frame['phase'] not in FAILURE_PHASES or frame['category'] not in FAILURE_CATEGORIES):
+    if (type(frame) is not dict or frame.get('kind') not in ('teetime-reviewer-failure-v1','teetime-reviewer-failure-v2')
+            or frame.get('phase') not in FAILURE_PHASES or frame.get('category') not in FAILURE_CATEGORIES):
         raise ValueError('reviewer failure diagnostic fields')
+    fields = {'kind','phase','category'}
+    if frame['kind'] == 'teetime-reviewer-failure-v2': fields.add('evidence')
+    if set(frame) != fields: raise ValueError('reviewer failure diagnostic fields')
+    if 'evidence' in frame: validate_failure_evidence(frame['evidence'])
     return frame
 
 

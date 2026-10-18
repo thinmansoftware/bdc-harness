@@ -10,6 +10,8 @@ import {
   fixtureCaseAccepted,
   validateFixtureFinalText,
   verifyReviewerUtilityControls,
+  reviewerFailureEvidence,
+  reviewerDiagnosticCategory,
 } from './teetime-reviewer-fixture';
 
 const raw = readFileSync(
@@ -17,6 +19,105 @@ const raw = readFileSync(
 );
 const original = JSON.parse(raw.toString());
 const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
+
+test('cleanup failure stays primary when an SDK process or parsing failure also occurred', () => {
+  for (const kind of ['cli-exit', 'sdk-parse', 'other'])
+    expect(reviewerDiagnosticCategory('cleanup-failed', 'sdk-run', kind)).toBe('cleanup-failed');
+  expect(reviewerDiagnosticCategory('other', 'sdk-run', 'cli-exit')).toBe('sdk-process');
+  expect(reviewerDiagnosticCategory('other', 'sdk-run', 'sdk-parse')).toBe('sdk-parse');
+  expect(reviewerDiagnosticCategory('other', 'configuration', 'cli-exit')).toBe('other');
+});
+
+test('failure evidence distinguishes SDK process exits without retaining stderr or arbitrary fields', () => {
+  const observation = {
+    requests: 0,
+    websocketAttempts: 0,
+    validatedRequests: 0,
+    firstRejection: 'none',
+    eventCounts: { 'thread.started': 1 },
+  } as const;
+  const evidence = reviewerFailureEvidence(
+    new Error('Codex Exec exited with code 2: synthetic-private-error'),
+    observation
+  );
+  expect(evidence.sdkFailure).toEqual({
+    kind: 'cli-exit',
+    exitCode: 2,
+    signal: null,
+    stderrCategory: 'other',
+  });
+  expect(evidence.eventCounts).toEqual({ 'thread.started': 1 });
+  expect(JSON.stringify(evidence)).not.toContain('synthetic-private-error');
+  expect(
+    reviewerFailureEvidence(
+      new Error('Codex Exec exited with signal SIGKILL: private'),
+      observation
+    ).sdkFailure
+  ).toEqual({ kind: 'cli-exit', exitCode: null, signal: 'SIGKILL', stderrCategory: 'other' });
+  expect(
+    reviewerFailureEvidence(new Error('Failed to parse item: private'), observation).sdkFailure.kind
+  ).toBe('sdk-parse');
+  expect(
+    reviewerFailureEvidence({ name: 'AbortError', message: 'private' }, observation).sdkFailure.kind
+  ).toBe('aborted');
+  for (const message of ['other private', 'Codex Exec exited with code 999: private'])
+    expect(reviewerFailureEvidence(new Error(message), observation).sdkFailure.kind).toBe('other');
+  for (const [prefix, category] of [
+    ['Error parsing -c overrides:', 'config-overrides'],
+    ['Error finding codex home:', 'codex-home'],
+    ['Error loading rules:', 'exec-policy'],
+    ['Error loading config.toml:', 'config-load'],
+    ['failed to initialize in-process app-server client:', 'app-server-start'],
+  ]) {
+    const result = reviewerFailureEvidence(
+      new Error('Codex Exec exited with code 1: warning\n' + prefix + ' private'),
+      observation
+    );
+    expect(result.sdkFailure.stderrCategory).toBe(category);
+    expect(JSON.stringify(result)).not.toContain('private');
+  }
+  expect(
+    reviewerFailureEvidence(
+      new Error('Codex Exec exited with code 1: ' + 'x'.repeat(65537)),
+      observation
+    ).sdkFailure.kind
+  ).toBe('other');
+});
+
+test('failure observations reject unbounded, inconsistent or arbitrary event and rejection fields', () => {
+  const base = {
+    requests: 1,
+    websocketAttempts: 0,
+    validatedRequests: 0,
+    firstRejection: 'request-shape',
+    eventCounts: {},
+  };
+  for (const patch of [
+    { requests: -1 },
+    { requests: 256 },
+    { websocketAttempts: 1.5 },
+    { validatedRequests: 2 },
+    { firstRejection: 'raw private text' },
+    { eventCounts: { private: 1 } },
+    { eventCounts: { error: 66 } },
+    { eventCounts: { error: true } },
+    { extra: 'private' },
+  ])
+    expect(() => reviewerFailureEvidence(new Error(), { ...base, ...patch })).toThrow();
+  for (const firstRejection of [
+    'none',
+    'endpoint',
+    'upgrade-limit',
+    'wire-bound',
+    'decoding',
+    'tool-inventory',
+    'request-shape',
+    'denial-mismatch',
+  ])
+    expect(reviewerFailureEvidence(new Error(), { ...base, firstRejection }).firstRejection).toBe(
+      firstRejection
+    );
+});
 
 test('fixture options preserve restricted controls and expose no caller override argument', () => {
   const base = restrictedClientOptions();
