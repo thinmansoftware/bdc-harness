@@ -190,6 +190,76 @@ afterEach(() => {
 });
 
 describe('merge execution bridge', () => {
+  test('execution event reader retains the store receiver', async () => {
+    const h = harness([verdict('receiver')]);
+    let reads = 0;
+    h.store.listRunEvents = async function (this: MergeExecutionBridgeStore, runId) {
+      expect(this).toBe(h.store);
+      reads++;
+      return [
+        {
+          id: 'event',
+          workflow_run_id: runId,
+          event_type: 'node_completed',
+          step_name: 'implement',
+          data: {},
+        },
+      ];
+    };
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(reads).toBe(1);
+    expect(h.merges).toBe(1);
+  });
+
+  test('explicit execution event override takes precedence over the store reader', async () => {
+    const h = harness([verdict('override')]);
+    const storeReader = mock(async () => {
+      throw new Error('store reader must not execute');
+    });
+    h.store.listRunEvents = storeReader;
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      listRunEvents: async runId => [
+        {
+          id: 'event',
+          workflow_run_id: runId,
+          event_type: 'node_completed',
+          step_name: 'implement',
+          data: {},
+        },
+      ],
+    });
+    expect(storeReader).not.toHaveBeenCalled();
+    expect(h.merges).toBe(1);
+  });
+
+  test.each(['missing', 'throwing'] as const)(
+    'execution reader %s refuses before any reservation or mutation',
+    async mode => {
+      const h = harness([verdict('reader-unavailable')]);
+      if (mode === 'missing') delete h.store.listRunEvents;
+      else
+        h.store.listRunEvents = async () => {
+          throw new Error('unavailable');
+        };
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+      });
+      expect(h.outcomes[0]?.reason).toBe('execution_evidence_unavailable');
+      expect(h.occupied).toBe(0);
+      expect(h.approvals).toBe(0);
+      expect(h.merges).toBe(0);
+    }
+  );
+
   test('docs-only PR into bdc-xo main merges when docs_only is merge', async () => {
     process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
       'thinmansoftware/bdc-xo': { main: { unattended: true, docs_only: 'merge' } },

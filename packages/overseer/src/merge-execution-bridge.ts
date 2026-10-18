@@ -513,7 +513,13 @@ async function mergeClaimedVerdict(
     return undefined;
   }
   if (!isRunlessVerdict(verdict)) {
-    const listRunEvents = options.listRunEvents ?? options.store.listRunEvents;
+    const listRunEvents =
+      options.listRunEvents ??
+      (options.store.listRunEvents
+        ? (runId: string): Promise<OverseerWorkflowEvent[]> =>
+            options.store.listRunEvents?.(runId) ??
+            Promise.reject(new Error('execution_event_reader_unavailable'))
+        : undefined);
     if (!listRunEvents) {
       await skip('execution_evidence_unavailable', pr.htmlUrl);
       return undefined;
