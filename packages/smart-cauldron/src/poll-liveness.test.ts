@@ -25,10 +25,12 @@ interface FakeEvent {
 
 const originalFetch = globalThis.fetch;
 const originalSetTimeout = globalThis.setTimeout;
+const originalDateNow = Date.now;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
   globalThis.setTimeout = originalSetTimeout;
+  Date.now = originalDateNow;
 });
 
 /**

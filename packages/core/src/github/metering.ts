@@ -23,7 +23,11 @@ export interface GitHubQuotaMetadata {
   readonly retryAtMs: number;
 }
 
-function quotaMetadata(value: unknown, now: number): GitHubQuotaMetadata | undefined {
+/** Validate and copy evidence only; a backoff deadline never grants retry authority. */
+export function validateGitHubQuotaMetadata(
+  value: unknown,
+  now = Date.now()
+): GitHubQuotaMetadata | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const row = value as Record<string, unknown>;
   if (
@@ -50,7 +54,7 @@ function quotaMetadata(value: unknown, now: number): GitHubQuotaMetadata | undef
 /** Serialize allowlisted fields only; never an error object or provider diagnostics. */
 export function serializeGitHubQuotaError(error: unknown, now = Date.now()): string | undefined {
   if (!(error instanceof GitHubPoolBackoffError)) return undefined;
-  const metadata = quotaMetadata(
+  const metadata = validateGitHubQuotaMetadata(
     {
       version: 1,
       kind: 'pool_backoff',
@@ -74,7 +78,7 @@ export function parseGitHubQuotaError(
   if (!line?.startsWith(GITHUB_QUOTA_RECORD_PREFIX)) return undefined;
   const payload = line.slice(GITHUB_QUOTA_RECORD_PREFIX.length);
   try {
-    const metadata = quotaMetadata(JSON.parse(payload), now);
+    const metadata = validateGitHubQuotaMetadata(JSON.parse(payload), now);
     // Canonical encoding also rejects duplicate JSON keys and extra physical lines.
     return metadata && JSON.stringify(metadata) === payload ? metadata : undefined;
   } catch {

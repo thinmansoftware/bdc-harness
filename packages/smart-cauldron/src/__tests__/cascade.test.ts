@@ -31,6 +31,12 @@ function loadLiveTiers() {
 import { loadRuleset } from '../conductor.js';
 import { TimeoutError } from '../poll.js';
 import { readCascadeRecordById } from '../frontier-approval.js';
+import { ClaimDiscoveryError, ghPrSearchDefault } from '../already-satisfied.js';
+import {
+  GitHubPoolBackoffError,
+  serializeGitHubQuotaError,
+  type GitHubQuotaMetadata,
+} from '@archon/core/github/metering';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -123,6 +129,120 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
 }
 
 describe('claim discovery uncertainty', () => {
+  for (const [phase, lookupNumber] of [
+    ['admission', 1],
+    ['before-fire', 2],
+    ['before-climb', 3],
+  ] as const) {
+    test(`${phase} retains actual discovery quota in its durable blocked receipt`, async () => {
+      const retryAtMs = Date.now() + 120_000;
+      const wire = serializeGitHubQuotaError(
+        new GitHubPoolBackoffError('app-123-456', 'search', retryAtMs)
+      )!;
+      let lookups = 0,
+        fires = 0,
+        executions = 0;
+      const hermetic = process.env.SMART_CAULDRON_HERMETIC;
+      delete process.env.SMART_CAULDRON_HERMETIC;
+      try {
+        const options = baseOpts({
+          dispatchId: `quota-receipt-${randomUUID()}`,
+          deps: {
+            findWoClaim: async () => {
+              if (++lookups !== lookupNumber) return null;
+              await ghPrSearchDefault('thinmansoftware/test-project', 'WO-TEST-001', async () => {
+                executions++;
+                throw Object.assign(new Error('synthetic-private-error'), {
+                  stderr: 'synthetic-private-diagnostic\n' + wire + '\n',
+                });
+              });
+              throw new Error('discovery unexpectedly succeeded');
+            },
+            fire: async () => {
+              fires++;
+              return makeFireOk('prior-run');
+            },
+            poll: async () => makePollResult(),
+            judge: () => makeFailVerdict('needs revision'),
+            escalate: async () => undefined,
+          },
+        });
+        const result = await runCascade(options);
+        expect(result.status).toBe('blocked');
+        expect(result.claimDiscoveryBlock).toMatchObject({
+          phase,
+          reason: 'request_failed',
+          quota: {
+            version: 1,
+            kind: 'pool_backoff',
+            poolId: 'app-123-456',
+            resource: 'search',
+            retryAtMs,
+          },
+        });
+        expect(executions).toBe(1);
+        expect(lookups).toBe(lookupNumber);
+        expect(fires).toBe(phase === 'before-climb' ? 1 : 0);
+        expect(JSON.stringify(result)).not.toContain('synthetic-private');
+        expect(await readCascadeRecordById(result.cascadeId, options.outDir)).toEqual(result);
+        const replay = await runCascade({
+          ...options,
+          deps: {
+            ...options.deps,
+            findWoClaim: async () => null,
+          },
+        });
+        expect(replay).toEqual(result);
+        expect(fires).toBe(phase === 'before-climb' ? 1 : 0);
+      } finally {
+        if (hermetic === undefined) delete process.env.SMART_CAULDRON_HERMETIC;
+        else process.env.SMART_CAULDRON_HERMETIC = hermetic;
+      }
+    });
+  }
+
+  test('only valid request-failed quota is retained and copied', async () => {
+    const valid: GitHubQuotaMetadata = {
+      version: 1,
+      kind: 'pool_backoff',
+      poolId: 'user-pat',
+      resource: 'core',
+      retryAtMs: Date.now() + 120_000,
+    };
+    for (const [error, expected] of [
+      [new ClaimDiscoveryError('request_failed', valid), valid],
+      [new ClaimDiscoveryError('invalid_response', valid), undefined],
+      [new ClaimDiscoveryError('invalid_repository', valid), undefined],
+      [Object.assign(new Error('private'), { quota: valid }), undefined],
+      ...[
+        { ...valid, retryAtMs: 0 },
+        { ...valid, retryAtMs: '123' },
+        { ...valid, retryAtMs: Infinity },
+        { ...valid, resource: 'private' },
+        { ...valid, poolId: 'private' },
+        { ...valid, private: 'synthetic-private' },
+      ].map(value => [
+        new ClaimDiscoveryError('request_failed', value as GitHubQuotaMetadata),
+        undefined,
+      ]),
+    ] as const) {
+      const options = baseOpts({
+        deps: {
+          findWoClaim: async () => {
+            throw error;
+          },
+        },
+      });
+      const result = await runCascade(options);
+      expect(result.status).toBe('blocked');
+      expect(result.claimDiscoveryBlock?.quota).toEqual(expected);
+      if (expected) expect(result.claimDiscoveryBlock?.quota).not.toBe(expected);
+      expect(result.attempts).toHaveLength(0);
+      expect(JSON.stringify(result)).not.toContain('private');
+      expect(await readCascadeRecordById(result.cascadeId, options.outDir)).toEqual(result);
+    }
+  });
+
   for (const [phase, lookupNumber] of [
     ['admission', 1],
     ['before-fire', 2],

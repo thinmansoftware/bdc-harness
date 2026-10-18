@@ -19,6 +19,7 @@
 
 import { randomUUID } from 'crypto';
 import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
+import { validateGitHubQuotaMetadata } from '@archon/core/github/metering';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
@@ -504,10 +505,15 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       } catch (error) {
         status = 'blocked';
         winningTier = null;
+        const quota =
+          error instanceof ClaimDiscoveryError && error.code === 'request_failed'
+            ? validateGitHubQuotaMetadata(error.quota)
+            : undefined;
         claimDiscoveryBlock = {
           phase,
           reason: error instanceof ClaimDiscoveryError ? error.code : 'request_failed',
           checkedAt: new Date().toISOString(),
+          ...(quota ? { quota } : {}),
         };
         return null;
       }
