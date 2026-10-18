@@ -547,6 +547,7 @@ export async function defaultListThreads(
         if (issues.length < 100) break;
         if (page === MAX_PAGES_PER_LABEL) {
           log.warn({ repo, label, page }, 'taskmaster.github_page_limit_reached');
+          throw new Error('taskmaster_github_work_sor_incomplete');
         }
       }
     }
