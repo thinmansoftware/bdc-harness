@@ -10,9 +10,10 @@
  *
  * Anchor: PR #1118 (2026-10-14) merged an unverified approval unattended.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
+import { rootLogger } from '@archon/paths';
 import type { RealGitHubOctokitLike } from './adapters/github-real-deps.ts';
 import type { PrReviewResult } from './pr-review-evaluator.ts';
 
@@ -150,6 +151,148 @@ async function reviewWorkItems(): Promise<{ repeat_reason: string | null }[]> {
 }
 
 describe('unverified approval end-to-end (WO node-failure-repair)', () => {
+  test('confirmed-hold logging redacts the verification reason', async () => {
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => String(symbol) === 'Symbol(pino.stream)'
+    )!;
+    const stream = (rootLogger as unknown as Record<symbol, { write(chunk: string): unknown }>)[
+      streamSymbol
+    ];
+    const write = stream.write;
+    const captured: string[] = [];
+    stream.write = chunk => {
+      captured.push(chunk);
+      return true;
+    };
+    try {
+      const { handleUnverifiedApprovalOutcome } = await import('./pr-review-wiring');
+      await handleUnverifiedApprovalOutcome({
+        owner: OWNER,
+        repo: REPO,
+        prNumber: PR,
+        headSha: HEAD,
+        verificationReason: 'sandbox unavailable token="synthetic-private-log"',
+      });
+    } finally {
+      stream.write = write;
+    }
+    expect(captured.join('')).toContain('overseer.review.approved_unverified');
+    expect(captured.join('')).toContain('[redacted]');
+    expect(captured.join('')).not.toContain('synthetic-private-log');
+  });
+
+  test.each(['processing', 'merged'])(
+    'a failed hold on %s custody persists two bounded notices without rewriting history',
+    async state => {
+      await runAndSubmitReview(work('verified-before-custody'), deps([], 'APPROVE'));
+      await db.query(
+        `UPDATE overseer_verdicts SET actioned_at = '2026-01-01',
+        mutation_sent = 0, action_reason = $1`,
+        [state]
+      );
+      const before = await db.query('SELECT * FROM overseer_verdicts');
+      const { handleUnverifiedApprovalOutcome } = await import('./pr-review-wiring');
+      const input = {
+        owner: OWNER,
+        repo: REPO,
+        prNumber: PR,
+        headSha: HEAD,
+        verificationReason: 'sandbox unavailable token=synthetic-private',
+      };
+      await handleUnverifiedApprovalOutcome(input);
+      await handleUnverifiedApprovalOutcome(input);
+      expect((await db.query('SELECT * FROM overseer_verdicts')).rows).toEqual(before.rows);
+      const notices = await dispatchRows('overseer-review-unverified-hold-failed:');
+      expect(notices.map(row => row.recipient).sort()).toEqual(['duty-officer', 'xo']);
+      for (const notice of notices) {
+        expect(notice.body).toContain(
+          state === 'processing' ? 'merge_in_flight' : 'already_resolved'
+        );
+        expect(notice.body).toContain('Hold was not confirmed');
+        expect(notice.body).not.toContain('synthetic-private');
+        expect(notice.body).not.toContain('merge was prevented');
+      }
+      const priorities = await db.query<{ priority: string }>(
+        "SELECT priority FROM agent_dispatch_messages WHERE idempotency_key LIKE 'overseer-review-unverified-hold-failed:%'"
+      );
+      expect(priorities.rows.map(row => row.priority)).toEqual(['blocker', 'blocker']);
+    }
+  );
+
+  test.each(['status', 'pr', 'mutation', 'reason', 'merge'])(
+    'an apparent held verdict with invalid %s does not confirm the hold',
+    async field => {
+      await runAndSubmitReview(work('held-before-invalid'), deps([], 'APPROVE_UNVERIFIED'));
+      const edits: Record<string, string> = {
+        status: "status = 'claimed'",
+        pr: "pr_url = 'https://github.com/other/repo/pull/1'",
+        mutation: 'mutation_sent = 0',
+        reason: "action_reason = 'other'",
+        merge: "merge_sha = 'old'",
+      };
+      await db.query(`UPDATE overseer_verdicts SET ${edits[field]}`);
+      const before = await db.query('SELECT * FROM overseer_verdicts');
+      const { recordUnverifiedApprovalVerdict } = await import('./pr-review-wiring');
+      await expect(
+        recordUnverifiedApprovalVerdict({
+          owner: OWNER,
+          repo: REPO,
+          prNumber: PR,
+          headSha: HEAD,
+        })
+      ).rejects.toThrow('unverified_approval_hold_not_confirmed');
+      expect((await db.query('SELECT * FROM overseer_verdicts')).rows).toEqual(before.rows);
+    }
+  );
+
+  test('failed-hold notices precede retry lookup and attempt recipients independently', async () => {
+    const dispatch = await import('@archon/core/db/dispatch');
+    const originalCreate = dispatch.createAuthenticatedMessage;
+    const attempts: string[] = [];
+    const create = spyOn(dispatch, 'createAuthenticatedMessage').mockImplementation(
+      async (sender, data) => {
+        attempts.push(data.recipient);
+        if (data.recipient === 'duty-officer') throw new Error('fixture notice unavailable');
+        return originalCreate(sender, data);
+      }
+    );
+    const lookup = spyOn(dispatch, 'listMessages').mockImplementation(async () => {
+      throw new Error('fixture retry lookup unavailable');
+    });
+    try {
+      const { handleUnverifiedApprovalOutcome } = await import('./pr-review-wiring');
+      await handleUnverifiedApprovalOutcome(
+        { owner: OWNER, repo: REPO, prNumber: PR, headSha: HEAD },
+        {
+          recordVerdict: async () => {
+            throw new Error('private provider detail');
+          },
+        }
+      );
+      expect(attempts).toEqual(['duty-officer', 'xo']);
+      const notices = await dispatchRows('overseer-review-unverified-hold-failed:');
+      expect(notices.map(row => row.recipient)).toEqual(['xo']);
+      expect(notices[0]?.body).toContain('record_failed');
+      expect(notices[0]?.body).not.toContain('private provider detail');
+    } finally {
+      lookup.mockRestore();
+      create.mockRestore();
+    }
+  });
+
+  test('confirmed holds and the disabled recording switch do not emit failed-hold notices', async () => {
+    const { handleUnverifiedApprovalOutcome } = await import('./pr-review-wiring');
+    const input = { owner: OWNER, repo: REPO, prNumber: PR, headSha: HEAD };
+    await handleUnverifiedApprovalOutcome(input);
+    await handleUnverifiedApprovalOutcome(input, {
+      env: { OVERSEER_REVIEW_RECORDS_VERDICT: 'false' },
+      recordVerdict: async () => {
+        throw new Error('must not execute');
+      },
+    });
+    expect(await dispatchRows('overseer-review-unverified-hold-failed:')).toHaveLength(0);
+  });
+
   test('unverified observation holds a fresh verified claim before its finalization', async () => {
     const { recordReviewApprovalVerdict, recordUnverifiedApprovalVerdict } =
       await import('./pr-review-wiring');
@@ -525,17 +668,19 @@ describe('unverified approval end-to-end (WO node-failure-repair)', () => {
     } = await import('@archon/core/db/overseer');
     const { recordUnverifiedApprovalVerdict } = await import('./pr-review-wiring');
     const row = (await db.query<{ id: string }>('SELECT id FROM overseer_verdicts')).rows[0]!;
-    await recordUnverifiedApprovalVerdict(
-      { owner: OWNER, repo: REPO, prNumber: PR, headSha: HEAD },
-      {
-        claimVerdict: claimOverseerVerdict,
-        finalizeVerdict: finalizeOverseerVerdict,
-        transitionVerification: async input => {
-          expect(await claimVerdictForMergeExecution(row.id)).toBe(true);
-          return transitionReviewApprovalVerification(input);
-        },
-      }
-    );
+    await expect(
+      recordUnverifiedApprovalVerdict(
+        { owner: OWNER, repo: REPO, prNumber: PR, headSha: HEAD },
+        {
+          claimVerdict: claimOverseerVerdict,
+          finalizeVerdict: finalizeOverseerVerdict,
+          transitionVerification: async input => {
+            expect(await claimVerdictForMergeExecution(row.id)).toBe(true);
+            return transitionReviewApprovalVerification(input);
+          },
+        }
+      )
+    ).rejects.toThrow('unverified_approval_hold_not_confirmed:merge_in_flight');
     const after = (
       await db.query<{ verdict: string; action_reason: string; proposed_action: string }>(
         'SELECT verdict, action_reason, proposed_action FROM overseer_verdicts'

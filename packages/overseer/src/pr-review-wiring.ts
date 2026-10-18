@@ -22,6 +22,7 @@ import {
   finalizeOverseerVerdict,
   getOverseerVerdictsForRun,
   transitionReviewApprovalVerification,
+  type OverseerVerdictRow,
 } from '@archon/core/db/overseer';
 import { createLogger } from '@archon/paths';
 import {
@@ -159,6 +160,13 @@ export const UNVERIFIED_APPROVAL_RETRY_REASON = 'unverified_approval_retry';
  */
 const FIRST_UNVERIFIED_REASON_KEY = 'firstUnverifiedReason';
 
+export class UnverifiedApprovalHoldError extends Error {
+  constructor(readonly state: 'merge_in_flight' | 'already_resolved' | 'unknown_state') {
+    super(`unverified_approval_hold_not_confirmed:${state}`);
+    this.name = 'UnverifiedApprovalHoldError';
+  }
+}
+
 /** Read the persisted first unverified reason off a stored retry-row body. */
 function firstUnverifiedReasonFromBody(body: string | null): string {
   if (!body) return '';
@@ -195,9 +203,20 @@ export async function recordUnverifiedApprovalVerdict(
 ): Promise<void> {
   const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
   const prUrl = `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`;
+  const confirmsHold = (row: OverseerVerdictRow): boolean =>
+    row.run_id === runId &&
+    row.head_sha === input.headSha &&
+    row.pr_url === prUrl &&
+    row.status === 'verdict' &&
+    row.verdict === 'approved_unverified' &&
+    row.proposed_action === 'none' &&
+    row.actioned_at === null &&
+    row.mutation_sent === null &&
+    row.action_reason === null &&
+    row.merge_sha === null;
   const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
   if (claim.claimed && claim.verdictId) {
-    await deps.finalizeVerdict({
+    const finalized = await deps.finalizeVerdict({
       verdictId: claim.verdictId,
       status: 'verdict',
       verdict: 'approved_unverified',
@@ -205,6 +224,7 @@ export async function recordUnverifiedApprovalVerdict(
       model: input.model,
       prUrl,
     });
+    if (!confirmsHold(finalized)) throw new UnverifiedApprovalHoldError('unknown_state');
     return;
   }
   // The (run_id, head_sha) slot is already taken -- typically by an EARLIER verified
@@ -226,16 +246,8 @@ export async function recordUnverifiedApprovalVerdict(
   // This read is diagnostic only. Ownership predicates live in the UPDATE,
   // never in a read followed by the unconditional finalizer.
   const rowsForRun = await getVerdicts(runId);
-  const forHead = rowsForRun.filter(row => row.head_sha === input.headSha);
-  if (
-    forHead.some(
-      row =>
-        row.actioned_at === null &&
-        row.verdict === 'approved_unverified' &&
-        row.proposed_action === 'none'
-    )
-  )
-    return;
+  const forHead = rowsForRun.filter(row => row.run_id === runId && row.head_sha === input.headSha);
+  if (forHead.some(confirmsHold)) return;
 
   // No unclaimed row for this head. `actioned_at` being set means two very different
   // things, and conflating them is what let an unverified approval merge:
@@ -263,7 +275,7 @@ export async function recordUnverifiedApprovalVerdict(
       },
       'overseer.review.unverified_hold_lost_race_to_merge_claim'
     );
-    return;
+    throw new UnverifiedApprovalHoldError('merge_in_flight');
   }
   if (forHead.length > 0) {
     log.warn(
@@ -278,6 +290,9 @@ export async function recordUnverifiedApprovalVerdict(
       'overseer.review.unverified_hold_skipped_already_actioned'
     );
   }
+  if (forHead.some(row => row.run_id === runId && row.actioned_at !== null))
+    throw new UnverifiedApprovalHoldError('already_resolved');
+  throw new UnverifiedApprovalHoldError('unknown_state');
 }
 
 /** Idempotency key for the single bounded re-review of an unverified approval. */
@@ -324,6 +339,7 @@ export async function handleUnverifiedApprovalOutcome(
 ): Promise<void> {
   const subjectKey = reviewSubjectKey(input.owner, input.repo, input.prNumber);
   const reason = (input.verificationReason ?? 'unverified').trim() || 'unverified';
+  const safeReason = redactSecretsFromErrorLine(reason).slice(0, 300);
 
   // 1. Record the held, non-mergeable verdict.
   if (reviewRecordsVerdictEnabled(options.env)) {
@@ -335,7 +351,7 @@ export async function handleUnverifiedApprovalOutcome(
           repo: input.repo,
           prNumber: input.prNumber,
           headSha: input.headSha,
-          reason: reason.slice(0, 300),
+          reason: safeReason,
         },
         'overseer.review.approved_unverified'
       );
@@ -350,13 +366,58 @@ export async function handleUnverifiedApprovalOutcome(
         },
         'overseer.review.approved_unverified_record_failed'
       );
+      const state = error instanceof UnverifiedApprovalHoldError ? error.state : 'record_failed';
+      const explanation = {
+        merge_in_flight:
+          'Merge execution owns this verdict; submission or its outcome may be uncertain.',
+        already_resolved:
+          'Verdict execution already resolved. Inspect its recorded outcome; a completed action cannot be stopped by this notice.',
+        unknown_state:
+          'No exact valid held verdict was confirmed. Inspect the verdict and review evidence.',
+        record_failed: 'Verdict persistence failed. No held-state confirmation is available.',
+      }[state];
+      // Persist before retry discovery, and attempt each recipient independently.
+      // A dispatch receipt is not acknowledgment or proof a merge was prevented.
+      for (const recipient of ['duty-officer', 'xo'] as const) {
+        try {
+          await dispatch.createAuthenticatedMessage(
+            { kind: 'system', sender: REVIEW_SENDER },
+            {
+              correlation_id: input.headSha,
+              idempotency_key: `overseer-review-unverified-hold-failed:${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}:${recipient}`,
+              task_type: 'agent_message',
+              recipient,
+              priority: 'blocker',
+              subject_key: `gh:${input.owner}/${input.repo}#${input.prNumber}`,
+              repeat_reason: `unverified hold not confirmed for head ${input.headSha}`,
+              body: [
+                `Hold was not confirmed for ${input.owner}/${input.repo}#${input.prNumber} at head ${input.headSha}.`,
+                `state: ${state}`,
+                explanation,
+                `verification reason: ${safeReason}`,
+              ].join('\n'),
+            }
+          );
+        } catch (noticeError) {
+          log.error(
+            {
+              error: noticeError,
+              recipient,
+              owner: input.owner,
+              repo: input.repo,
+              prNumber: input.prNumber,
+              headSha: input.headSha,
+            },
+            'overseer.review.unverified_hold_notice_failed'
+          );
+        }
+      }
     }
   }
 
   // 2. First unverified approval -> enqueue one bounded re-review. Repeat (the
   //    retry also came back unverified) -> escalate to the Duty Officer.
   const retryKey = unverifiedRereviewIdempotencyKey(input);
-  const safeReason = redactSecretsFromErrorLine(reason).slice(0, 300);
   let retryMessageBody: string | null = null;
   try {
     const prior = await dispatch.listMessages({
