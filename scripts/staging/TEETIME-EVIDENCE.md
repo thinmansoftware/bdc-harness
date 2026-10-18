@@ -9,6 +9,7 @@ validation cannot authenticate its caller or prevent concurrent replay.
 
 ```text
 python -m unittest discover -s scripts/staging -p test_teetime_snapshot.py
+python -m unittest discover -s scripts/staging -p test_teetime_git_objects.py
 bun test packages/providers/src/community/pi/restricted-review-evidence.test.ts
 bun test packages/providers/src/community/pi/restricted-review-transport.test.ts
 bun test packages/providers/src/community/pi/restricted-review.test.ts
@@ -60,6 +61,28 @@ snapshot_manifest accepts only unchanged validated parser output. Its canonical
 manifest includes every regular file, including additions, with mode, size and
 content hash. It is not a validator for arbitrary constructed records. Compare
 against a trusted frozen base to represent deletions explicitly; that comparison,
-trusted Git tree/commit construction, runtime export, readonly test mounts,
+trusted Git commit construction, runtime export, readonly test mounts,
 before/after source checks and replay-safe approval consumption remain separate
 work. Never let a model-written .gitignore choose what evidence to omit.
+Pure Git tree construction is implemented in the next section; its existence
+does not establish runtime capture custody.
+
+## Pure Git tree identity
+
+scripts/staging/teetime_git_objects.py exports build_git_objects(files,
+expected_format='sha1'). The keyword is required; other object formats fail.
+Supply the complete unchanged tuple from read_snapshot, never a partial diff.
+The helper preserves exact binary bytes and executable modes, applies Git's
+directory ordering, deduplicates identical blobs and returns immutable bounded
+blob/tree records plus the root tree ID. It creates no commits, refs or repository
+state and invokes no subprocess. Git SHA-1 object IDs are distinct from the
+canonical SHA-256 snapshot manifest. Additional structural checks do not prove
+runtime provenance or authenticate the caller.
+
+The tests independently compare every object and complete root tree against
+trusted Git hash-object/update-index/write-tree in fresh bare repositories with
+isolated configuration, empty hooks/templates, disabled attributes and no remote
+protocols. They cover empty, nested, executable, binary, ordering, additions,
+deletions and deterministic deduplication. Trusted Git is required; no skipped
+check may stand in for this comparison. The source-only constructor does not
+resolve the runtime execution barrier, inventory custody or test-worker gates.
