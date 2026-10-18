@@ -34,7 +34,7 @@ Response shape:
 
 ## Set or clear the cutoff
 
-Percent must be a number from 1 to 95. `null` clears the in-memory operator override, which returns the cutoff to the env value or the default 90.
+Percent must be a number from 1 to 95. `null` clears the operator override and returns the cutoff to the env value or the default 90. The override persists until cleared. It is stored in the `operator_settings` table (`setting_key` `fuelglass.seat_cutoff_percent`).
 
 ```bash
 curl -s -X POST localhost:3090/api/fuelglass/cutoff \
@@ -48,7 +48,7 @@ curl -s -X POST localhost:3090/api/fuelglass/cutoff \
   -d '{"percent": null}'
 ```
 
-A percent below 1 or above 95 (for example 96 or 100) returns HTTP 400 with an error naming `seat_cutoff_out_of_range`. A non-number returns HTTP 400. The override is process-local and is lost on restart.
+A percent below 1 or above 95 (for example 96 or 100) returns HTTP 400 with an error naming `seat_cutoff_out_of_range`. A non-number returns HTTP 400. When `cutoff.source` is `operator`, GET `/api/fuelglass/seats` adds `set_at` (ISO timestamp) and `set_by` (the string `operator-token`). Those fields are absent when the source is `env` or `default`.
 
 ## Environment
 

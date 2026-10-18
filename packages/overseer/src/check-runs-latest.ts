@@ -1,10 +1,9 @@
 /**
  * Reduce a head's raw check-runs to the newest run per check NAME + PRODUCER.
  *
- * GitHub's `checks.listForRef` returns EVERY run at a head, including older
- * runs of a check that has since been re-run. Counting them all lets a stale
- * failure block a PR whose check later passed (or vice versa: a stale success
- * hide a real regression). This module groups the runs by trimmed name and producer
+ * Evidence may contain multiple runs under the same check name. Counting stale
+ * results can block a later passing check, while choosing an unrelated success
+ * can hide a real failure. This module groups runs by trimmed name and producer
  * (App + workflow run) and, per group, keeps only the current run:
  *
  * - the newest COMPLETED run, ordered by run creation identity (`id`, higher =
@@ -20,7 +19,7 @@
  * isSuccessorOf).
  *
  * Fail closed on the legacy stub shape: if ANY run in a name group lacks a
- * numeric `id` we cannot order the group, so it is returned unreduced (every
+ * positive safe-integer `id` we cannot order the group, so it is returned unreduced (every
  * run kept in `current`, nothing superseded). This preserves the exact
  * behaviour existing `{ name, status, conclusion }` callers/tests rely on.
  *
@@ -67,8 +66,8 @@ function producerKey(run: LatestCheckRun): string {
 
 type IdentifiedCheckRun = LatestCheckRun & { id: number };
 
-function hasNumericId(run: LatestCheckRun): run is IdentifiedCheckRun {
-  return typeof run.id === 'number';
+function hasValidId(run: LatestCheckRun): run is IdentifiedCheckRun {
+  return typeof run.id === 'number' && Number.isSafeInteger(run.id) && run.id > 0;
 }
 
 /** Actions workflow run id embedded in a run's details URL, or '' if absent. */
@@ -112,7 +111,7 @@ export function reduceToLatestCheckRuns(runs: LatestCheckRun[]): ReducedCheckRun
   for (const group of groups.values()) {
     // Fail closed on the legacy stub shape: without a numeric id on every run
     // we cannot order the group, so keep every run and supersede nothing.
-    if (!group.every(hasNumericId)) {
+    if (!group.every(hasValidId)) {
       current.push(...group);
       continue;
     }

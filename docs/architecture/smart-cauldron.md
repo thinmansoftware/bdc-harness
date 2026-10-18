@@ -93,6 +93,32 @@ already wrong; served == requested while both silently differed from the YAML. T
 declared-model comparison catches parse-layer drops; the requested-model comparison
 cannot. A run where served != declared is flagged RED on the deck.
 
+## Entry seat headroom (WO-HARNESS-CONDUCTOR-SEAT-HEADROOM-01)
+
+Before a cascade fires, the conductor may move the entry tier up the ladder when
+the picked subscription seat is already hot. Set
+`SMART_CAULDRON_HEADROOM_THRESHOLD_PERCENT` to an integer from 1 through 99.
+Unset, empty, padded, signed, decimal, zero, 100 or more, and any other
+non-matching value use the default 80.
+
+Promotion happens only when the picked seat's maximum window `used_percent` is
+at or above that threshold. A pinned entry override never moves. A failed read,
+a timeout, or an UNKNOWN seat fails open and keeps the ruleset pick. Routing
+never holds the fire, never picks a premium tier, and never moves to a lower
+rung. The run-start seat gate (cutoff 90) remains the only wall.
+
+Read `cascade-runs/<slug>/cascade-record.json`:
+
+- `entrySelection.reason` says why the entry was kept or moved (`pinned`,
+  `seat_ok:<seat>:<percent>`, `seat_over_threshold:<seat>:<percent>`,
+  `no_known_headroom:<seat>:<percent>`, `seat_unknown:<seat>`,
+  `seat_usage_unavailable`, or `no_seat`).
+- `entrySelection.picked` is the ruleset or override tier.
+  `entrySelection.entry` is the tier that fired.
+- `entrySelection.seats` lists each seen seat as a used percent or `UNKNOWN`.
+- `attempts[].nodeModels` maps each node id to `{ provider, declared, served }`
+  from the last `node_completed` or `node_failed` event for that step.
+
 ## Honest gates are the foundation (unchanged, one addition)
 
 The cascade's whole decision engine is gate verdicts. A lying gate poisons routing:

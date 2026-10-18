@@ -373,3 +373,38 @@ describe('reduceToLatestCheckRuns producer identity', () => {
     expect(superseded).toEqual([]);
   });
 });
+
+describe('invalid check-run ordering identities fail closed', () => {
+  test.each([
+    0,
+    -1,
+    1.5,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    Number.NaN,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])('preserves the entire producer group with invalid id %s in either input order', invalidId => {
+    const runs: LatestCheckRun[] = [
+      { name: 'ci', app: { id: 777 }, id: 10, status: 'completed', conclusion: 'failure' },
+      { name: 'ci', app: { id: 777 }, id: 11, status: 'completed', conclusion: 'success' },
+      { name: 'ci', app: { id: 777 }, id: invalidId, status: 'completed', conclusion: 'success' },
+    ];
+    for (const order of [runs, [...runs].reverse()]) {
+      const result = reduceToLatestCheckRuns(order);
+      expect(result.current).toEqual(order);
+      expect(result.superseded).toEqual([]);
+    }
+  });
+
+  test('still orders positive safe identities at the supported upper boundary', () => {
+    const runs: LatestCheckRun[] = [
+      { name: 'ci', id: Number.MAX_SAFE_INTEGER - 1, status: 'completed', conclusion: 'failure' },
+      { name: 'ci', id: Number.MAX_SAFE_INTEGER, status: 'completed', conclusion: 'success' },
+    ];
+    for (const order of [runs, [...runs].reverse()]) {
+      const result = reduceToLatestCheckRuns(order);
+      expect(result.current).toEqual([runs[1]!]);
+      expect(result.superseded).toEqual([{ ...runs[0]!, superseded_by: Number.MAX_SAFE_INTEGER }]);
+    }
+  });
+});

@@ -52,6 +52,18 @@ describe('live ruleset routing', () => {
     expect(entry).toBe('zero');
   });
 
+  test('plain CODE and no-match default enter cursor (2026-09-29 default lane)', () => {
+    const ruleset = loadRuleset();
+    expect(pickEntryTier({ woClass: 'CODE' }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['docs'] }, ruleset)).toBe('cursor');
+    expect(ruleset.defaultEntry).toBe('cursor');
+  });
+
+  test('feature-tagged CODE still enters codex', () => {
+    const ruleset = loadRuleset();
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['feature'] }, ruleset)).toBe('codex');
+  });
+
   test('INFRA routes stronger (claude)', () => {
     const ruleset = loadRuleset();
     expect(pickEntryTier({ woClass: 'INFRA' }, ruleset)).toBe('claude');

@@ -659,6 +659,36 @@ export class SqliteAdapter implements IDatabase {
           )
         `);
     }
+    // Migration 060 (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01): widen
+    // tm_journal.action_type CHECK to accept the sixth verb 'blocker_report'.
+    // SQLite cannot ALTER a CHECK, so rebuild transactionally. Re-read the
+    // schema fresh -- the migration-056 rebuild above may have just recreated
+    // the table with a CHECK that still lacks 'blocker_report', so the stale
+    // schema string from that block cannot be reused here. Separate block (do
+    // not edit the 045/055/056 CHECK literals) so each widen is independently
+    // idempotent. Only action_type widens; the grade CHECK is carried forward
+    // exactly as migration 056 left it.
+    const journalSchema4 = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
+      .get() as { sql?: string } | undefined;
+    if (journalSchema4?.sql && !journalSchema4.sql.includes('blocker_report')) {
+      this.rebuildTmJournal(`
+          CREATE TABLE tm_journal_new (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            thread_ref TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')),
+            proposal_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            before_hash TEXT,
+            proof_predicate TEXT,
+            proof_deadline_at TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+            graded_at TEXT,
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+          )
+        `);
+    }
     // Migration 046: older on-disk databases used a composite primary key for
     // tm_health. Add a provider-only UNIQUE index (allowed by the WO) instead
     // of rebuilding: table constraints, columns, indexes and triggers survive.
@@ -725,6 +755,9 @@ export class SqliteAdapter implements IDatabase {
         ['action_reason', 'TEXT'],
         ['merge_sha', 'TEXT'],
         ['pr_url', 'TEXT'],
+        ['merge_attempts', 'INTEGER NOT NULL DEFAULT 0'],
+        ['merge_not_before', 'TEXT'],
+        ['merge_last_transient_reason', 'TEXT'],
       ];
       for (const [name, definition] of additions) {
         if (!verdictColNames.has(name)) {
@@ -1240,7 +1273,13 @@ export class SqliteAdapter implements IDatabase {
         ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1),
         ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1),
         ('duty-officer', 'Duty Officer', 'worker_poll', 1),
-        ('do', 'Duty Officer alias', 'worker_poll', 1)
+        ('do', 'Duty Officer alias', 'worker_poll', 1),
+        -- WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
+        -- (migration 046 parity): Overseer hands CHANGES_REQUESTED verdicts
+        -- back as remediation candidates addressed to 'taskmaster'. Without
+        -- this row createAuthenticatedMessage rejects every one with
+        -- missing_principal.
+        ('taskmaster', 'Taskmaster', 'worker_poll', 1)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`
@@ -2244,6 +2283,9 @@ export class SqliteAdapter implements IDatabase {
         action_reason TEXT,
         merge_sha TEXT,
         pr_url TEXT,
+        merge_attempts INTEGER NOT NULL DEFAULT 0,
+        merge_not_before TEXT,
+        merge_last_transient_reason TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
@@ -2371,7 +2413,7 @@ export class SqliteAdapter implements IDatabase {
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         thread_ref TEXT NOT NULL,
         action_type TEXT NOT NULL CHECK (
-          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')
+          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')
         ),
         proposal_json TEXT NOT NULL,
         idempotency_key TEXT,
@@ -2526,6 +2568,37 @@ export class SqliteAdapter implements IDatabase {
         claimed_at TEXT NOT NULL,
         lease_expires_at TEXT NOT NULL,
         posted_at TEXT
+      );
+
+      -- Per-service GitHub API usage and latest quota state (migration 062).
+      CREATE TABLE IF NOT EXISTS github_api_usage (
+        hour_bucket TEXT NOT NULL,
+        service TEXT NOT NULL,
+        pool_id TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        calls INTEGER NOT NULL DEFAULT 0,
+        rate_limited INTEGER NOT NULL DEFAULT 0,
+        permission_fallbacks INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (hour_bucket, service, pool_id, resource)
+      );
+
+      CREATE TABLE IF NOT EXISTS github_api_pool_state (
+        pool_id TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        "limit" INTEGER,
+        remaining INTEGER,
+        reset_at TEXT,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY (pool_id, resource)
+      );
+
+      -- operator settings (migration 059).
+      CREATE TABLE IF NOT EXISTS operator_settings (
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL,
+        reason TEXT
       );
     `);
     getLog().info('db.sqlite_schema_initialized');

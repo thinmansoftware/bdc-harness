@@ -83,6 +83,8 @@ interface StubRun {
   status: string;
   conclusion: string | null;
   completed_at?: string;
+  app?: { id: number };
+  details_url?: string;
 }
 
 /** Octokit stub for createRealFetchExactHeadPullRequestEvidence. */
@@ -236,3 +238,66 @@ describe('check-run reduction wiring in github-real-deps', () => {
     expect(evidence.checks.passed).toBe(1);
   });
 });
+
+test('invalid ordering identity cannot hide failure in either evidence consumer', async () => {
+  const runs: StubRun[] = [
+    { id: 0, name: 'ci', status: 'completed', conclusion: 'failure' },
+    { id: 11, name: 'ci', status: 'completed', conclusion: 'success' },
+  ];
+  for (const order of [runs, [...runs].reverse()]) {
+    const evidence = await fetchEvidence(order);
+    expect(summarizeChecks(evidence.checks).failed).toBe(1);
+    expect(evidence.checks).toHaveLength(2);
+    expect(evidence.supersededChecks ?? []).toEqual([]);
+    const found = await createRealFindPullRequest(findOctokit(order))({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 42,
+      woId: 'WO-TEST',
+    });
+    expect(found.checks).toEqual({ total: 2, passed: 1, failed: 1, pending: 0 });
+  }
+});
+
+test.each(['same-workflow', 'other-workflow', 'other-app'])(
+  'both consumers preserve independent or ambiguous %s check evidence',
+  async producer => {
+    const runs: StubRun[] = [
+      {
+        id: 10,
+        name: 'ci',
+        status: 'completed',
+        conclusion: 'failure',
+        app: { id: producer === 'other-app' ? 1 : 15368 },
+        ...(producer === 'other-app'
+          ? {}
+          : { details_url: 'https://github.com/o/r/actions/runs/111/job/1' }),
+      },
+      {
+        id: 11,
+        name: 'ci',
+        status: 'completed',
+        conclusion: 'success',
+        app: { id: producer === 'other-app' ? 2 : 15368 },
+        ...(producer === 'other-app'
+          ? {}
+          : {
+              details_url: `https://github.com/o/r/actions/runs/${producer === 'other-workflow' ? '222' : '111'}/job/2`,
+            }),
+      },
+    ];
+    for (const order of [runs, [...runs].reverse()]) {
+      const evidence = await fetchEvidence(order);
+      expect(summarizeChecks(evidence.checks).failed).toBe(1);
+      expect(evidence.checks).toHaveLength(2);
+      expect(evidence.supersededChecks ?? []).toEqual([]);
+      const found = await createRealFindPullRequest(findOctokit(order))({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 42,
+        woId: 'WO-TEST',
+      });
+      expect(found.checks).toEqual({ total: 2, passed: 1, failed: 1, pending: 0 });
+    }
+  }
+);

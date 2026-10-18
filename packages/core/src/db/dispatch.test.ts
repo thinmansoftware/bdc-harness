@@ -32,6 +32,7 @@ import {
   claimDispatchEscalation,
   claimMessage,
   createAuthenticatedMessage,
+  createCappedSubjectMessage,
   evaluateWorkerStaleness,
   ensureXoEscalationHandoffs,
   getMessage,
@@ -981,6 +982,7 @@ describe('dispatch db', () => {
           lease_id: '11111111-1111-4111-8111-111111111111',
           fencing_token: 9,
           holder_token_hash: createHash('sha256').update('test-holder').digest('hex'),
+          holder_principal_id: 'xo',
         };
         await db.query(
           `INSERT INTO board_xo_leases
@@ -1063,6 +1065,7 @@ describe('dispatch db', () => {
       lease_id: 'lease-current',
       fencing_token: 9,
       holder_token_hash: createHash('sha256').update(holderToken).digest('hex'),
+      holder_principal_id: 'xo',
     };
     await db.query(
       `INSERT INTO board_xo_leases
@@ -1085,6 +1088,131 @@ describe('dispatch db', () => {
       })
     ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
     expect((await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind })).ok).toBe(true);
+  });
+
+  for (const holder of ['xo-claude-board-work', 'xo-codex-board-work'] as const) {
+    test(`dispatch DAL: a bind whose holder_principal_id matches the live lease row succeeds (${holder})`, async () => {
+      const message = await createMessage({
+        correlation_id: `corr-holder-${holder}`,
+        idempotency_key: `idem-holder-${holder}`,
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'Holder bind ack.',
+      });
+      const bind: XoLeaseBind = {
+        kind: 'xo_lease',
+        lease_id: `lease-${holder}`,
+        fencing_token: 11,
+        holder_token_hash: createHash('sha256').update(`holder-secret-${holder}`).digest('hex'),
+        holder_principal_id: holder,
+      };
+      await db.query(
+        `INSERT INTO board_xo_leases
+         (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+          acquired_at, renewed_at, expires_at, released_at)
+         VALUES (1, $1, $2, 'xo', $2, $3, $4, $5, NULL, $6, NULL)`,
+        [
+          bind.lease_id,
+          holder,
+          bind.holder_token_hash,
+          bind.fencing_token,
+          new Date().toISOString(),
+          new Date(Date.now() + 60_000).toISOString(),
+        ]
+      );
+      const result = await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind });
+      expect(result.ok).toBe(true);
+      const stored = await getMessage(message.id);
+      expect(stored?.acknowledged_by).toBe('xo');
+      expect(stored?.acknowledged_at).not.toBeNull();
+    });
+  }
+
+  test('dispatch DAL: a bind whose holder_principal_id differs from the live lease row is lease_fence_stale on acknowledge', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-holder-mismatch-ack',
+      idempotency_key: 'idem-holder-mismatch-ack',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'Mismatched holder ack.',
+    });
+    const holderTokenHash = createHash('sha256').update('holder-secret-mismatch').digest('hex');
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo-claude-board-work', 'xo', 'xo-claude-board-work', $2, 12, $3, NULL, $4, NULL)`,
+      [
+        'lease-mismatch',
+        holderTokenHash,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    const bind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-mismatch',
+      fencing_token: 12,
+      holder_token_hash: holderTokenHash,
+      holder_principal_id: 'xo-codex-board-work',
+    };
+    await expect(acknowledgeMessage({ id: message.id, principal_id: 'xo', bind })).resolves.toEqual(
+      { ok: false, reason: 'lease_fence_stale' }
+    );
+    const stored = await getMessage(message.id);
+    expect(stored?.acknowledged_at).toBeNull();
+    expect(stored?.acknowledged_by).toBeNull();
+  });
+
+  test('dispatch DAL: a bind whose holder_principal_id differs from the live lease row is lease_fence_stale on address', async () => {
+    const message = await createMessage({
+      correlation_id: 'corr-holder-mismatch-address',
+      idempotency_key: 'idem-holder-mismatch-address',
+      task_type: 'agent_message',
+      sender: 'operator',
+      recipient: 'xo',
+      body: 'Mismatched holder address.',
+    });
+    const holderTokenHash = createHash('sha256')
+      .update('holder-secret-mismatch-address')
+      .digest('hex');
+    await db.query(
+      `INSERT INTO board_xo_leases
+       (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+        acquired_at, renewed_at, expires_at, released_at)
+       VALUES (1, $1, 'xo-claude-board-work', 'xo', 'xo-claude-board-work', $2, 13, $3, NULL, $4, NULL)`,
+      [
+        'lease-mismatch-address',
+        holderTokenHash,
+        new Date().toISOString(),
+        new Date(Date.now() + 60_000).toISOString(),
+      ]
+    );
+    const goodBind: XoLeaseBind = {
+      kind: 'xo_lease',
+      lease_id: 'lease-mismatch-address',
+      fencing_token: 13,
+      holder_token_hash: holderTokenHash,
+      holder_principal_id: 'xo-claude-board-work',
+    };
+    expect(
+      (await acknowledgeMessage({ id: message.id, principal_id: 'xo', bind: goodBind })).ok
+    ).toBe(true);
+    const before = await getMessage(message.id);
+    const badBind: XoLeaseBind = {
+      ...goodBind,
+      holder_principal_id: 'xo-codex-board-work',
+    };
+    await expect(
+      addressMessage({ id: message.id, principal_id: 'xo', bind: badBind })
+    ).resolves.toEqual({ ok: false, reason: 'lease_fence_stale' });
+    const stored = await getMessage(message.id);
+    expect(stored?.acknowledged_at).toBe(before?.acknowledged_at ?? null);
+    expect(stored?.acknowledged_by).toBe('xo');
+    expect(stored?.addressed_at).toBeNull();
+    expect(stored?.addressed_by).toBeNull();
   });
 
   test('mailbox depth treats all stamped rows as legacy_unverified without a cutover', async () => {
@@ -3058,6 +3186,144 @@ describe('dispatch db', () => {
         correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#900@',
       });
       expect(found).toHaveLength(0);
+    });
+  });
+  describe('createCappedSubjectMessage (capped-subject fence)', () => {
+    const SUBJECT = 'gh:thinmansoftware/shopops#900';
+
+    function fenceFor(token: string, maxRows = 2) {
+      return {
+        maxRows,
+        dedupeToken: token,
+        readDedupeToken: (body: string) => {
+          try {
+            const parsed = JSON.parse(body) as { token?: string };
+            return typeof parsed.token === 'string' ? parsed.token : null;
+          } catch {
+            return null;
+          }
+        },
+        slotKey: (slot: number) => `capped-fence:${SUBJECT}:slot-${slot}`,
+        slotBody: (slot: number) => JSON.stringify({ token, slot }),
+      };
+    }
+
+    function dataFor(correlation: string) {
+      return {
+        correlation_id: correlation,
+        idempotency_key: 'replaced-by-the-fence',
+        task_type: 'run_review' as const,
+        recipient: 'taskmaster',
+        body: 'replaced-by-the-fence',
+        subject_key: SUBJECT,
+        repeat_reason: 'capped fence test',
+      };
+    }
+
+    test('CONCURRENT calls for the SAME token yield exactly ONE row', async () => {
+      // Both calls are started before either is awaited. The fence serializes
+      // them through BEGIN IMMEDIATE, so the second one's dedupe read happens
+      // AFTER the first one's insert has committed -- which is precisely what an
+      // application-level read-then-insert cannot guarantee.
+      const [a, b] = await Promise.all([
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          dataFor('fence-same-a'),
+          fenceFor('head-aaa')
+        ),
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          dataFor('fence-same-b'),
+          fenceFor('head-aaa')
+        ),
+      ]);
+
+      const claimed = [a, b].filter(r => r.claimed);
+      expect(claimed).toHaveLength(1);
+      expect([a, b].find(r => !r.claimed)?.reason).toBe('duplicate_unit_of_work');
+      // Both callers are handed the SAME surviving row.
+      expect(a.message.id).toBe(b.message.id);
+
+      const rows = await db.query<{ n: number }>(
+        'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE subject_key = $1',
+        [SUBJECT]
+      );
+      expect(Number(rows.rows[0]?.n ?? 0)).toBe(1);
+    });
+
+    test('CONCURRENT calls for DISTINCT tokens cannot exceed maxRows', async () => {
+      const results = await Promise.all(
+        ['h1', 'h2', 'h3', 'h4'].map((token, i) =>
+          createCappedSubjectMessage(
+            { kind: 'system', sender: 'overseer' },
+            dataFor(`fence-distinct-${i}`),
+            fenceFor(token)
+          )
+        )
+      );
+
+      expect(results.filter(r => r.claimed)).toHaveLength(2);
+      expect(results.filter(r => r.reason === 'cap_exhausted')).toHaveLength(2);
+      // Slots are handed out in order, never duplicated.
+      expect(
+        results
+          .filter(r => r.claimed)
+          .map(r => r.slot)
+          .sort()
+      ).toEqual([1, 2]);
+
+      const rows = await db.query<{ n: number }>(
+        'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE subject_key = $1',
+        [SUBJECT]
+      );
+      expect(Number(rows.rows[0]?.n ?? 0)).toBe(2);
+    });
+
+    test('reports the slot ACTUALLY claimed, and the row agrees', async () => {
+      const first = await createCappedSubjectMessage(
+        { kind: 'system', sender: 'overseer' },
+        dataFor('fence-slot-1'),
+        fenceFor('head-one')
+      );
+      const second = await createCappedSubjectMessage(
+        { kind: 'system', sender: 'overseer' },
+        dataFor('fence-slot-2'),
+        fenceFor('head-two')
+      );
+
+      expect(first.slot).toBe(1);
+      expect(second.slot).toBe(2);
+      expect((JSON.parse(first.message.body) as { slot: number }).slot).toBe(1);
+      expect((JSON.parse(second.message.body) as { slot: number }).slot).toBe(2);
+    });
+
+    test('refuses a fence it cannot honor instead of degrading to a racy path', async () => {
+      // No subject_key -> neither invariant is expressible.
+      await expect(
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          { ...dataFor('fence-bad-1'), subject_key: undefined },
+          fenceFor('head-x')
+        )
+      ).rejects.toThrow('capped_subject_fence_invalid');
+
+      // Nonsense cap.
+      await expect(
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          dataFor('fence-bad-2'),
+          fenceFor('head-x', 0)
+        )
+      ).rejects.toThrow('capped_subject_fence_invalid');
+
+      // Empty dedupe token.
+      await expect(
+        createCappedSubjectMessage(
+          { kind: 'system', sender: 'overseer' },
+          dataFor('fence-bad-3'),
+          fenceFor('')
+        )
+      ).rejects.toThrow('capped_subject_fence_invalid');
     });
   });
 });

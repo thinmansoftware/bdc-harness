@@ -23,8 +23,13 @@ run `bun scripts/taskmaster/expire-xo-deadletter.ts --confirm` once against the 
 
 ## Acknowledging as xo
 
-An XO session must use all four identity proofs supplied by its own live lease hook. Never copy
-lease or token values into documentation or scripts:
+The live lease holder is `xo-claude-board-work` or `xo-codex-board-work`. Both profiles have
+seat `xo`. All four headers come from the XO's own lease hook. The board principal token and
+the holder token are the same secret in the XO credential store. The lease id and fencing
+token come from `GET /api/board/xo-lease/current`. The receipt actor stays `xo`.
+
+Send body `{}`, or a body that names the holder principal id. The body is never proof. Do not
+copy token, lease id, or fence values into docs or scripts.
 
 ```sh
 curl -X POST "$ARCHON_URL/api/dispatch/messages/$MESSAGE_ID/ack" \
@@ -36,9 +41,20 @@ curl -X POST "$ARCHON_URL/api/dispatch/messages/$MESSAGE_ID/ack" \
   --data '{}'
 ```
 
-The lease is checked again in the same transaction that writes the receipt. A stale lease returns
-`409 lease_fence_stale`. A bare operator token always binds the actor to `operator`; omitting the
-body on a non-`operator` mailbox therefore returns `409 wrong_recipient`.
+| HTTP | Error | When |
+|---|---|---|
+| 200 |  | The receipt is written. `acknowledged_by` or `addressed_by` is `xo`. |
+| 401 | `dispatch_actor_unbound` | A proof is missing, the seat is not `xo`, or the caller is not the live holder. |
+| 409 | `lease_fence_stale` | The lease id, fence, holder, release, or expiry no longer matches inside the write. |
+| 409 | `wrong_recipient` | The row recipient is not the resolved actor. |
+| 409 | `actor_mismatch` | The body names a principal other than `xo` or the bound holder. |
+| 409 | `address_before_ack` | Address ran before a successful acknowledgement. |
+
+`status` stays `queued`. `acked_open` is derived from `acknowledged_at` through
+`mailboxDepthByPrincipal`.
+
+The lease is checked again in the same transaction that writes the receipt. A bare operator
+token always binds the actor to `operator`.
 ## Inbox reader
 
 The inbox reader classifies the `xo` mailbox every five minutes and can optionally take ownership

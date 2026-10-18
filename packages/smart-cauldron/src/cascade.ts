@@ -23,6 +23,8 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
+import { chooseHeadroomEntry, resolveEntryThreshold } from './headroom.js';
+import type { EntrySelection, SeatUsageSnapshot } from './headroom.js';
 import { fireTier, buildFireMessage } from './fire.js';
 import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './poll.js';
 import { fetchNodeTimeoutsMs } from './node-timeouts.js';
@@ -97,6 +99,51 @@ export interface CascadeDeps {
    * entryOverride is set (that already skips the conductor).
    */
   ruleset?: ConductorRuleset;
+  /**
+   * Live subscription-seat snapshot. Absent means headroom routing is skipped.
+   * A rejection or timeout fails open (usage null) and never holds the fire.
+   */
+  seatUsage?: () => Promise<SeatUsageSnapshot>;
+}
+
+const SEAT_USAGE_READ_TIMEOUT_MS = 5000;
+
+/**
+ * Read seat usage with a fixed timeout. A rejection or timeout becomes null
+ * and logs exactly one failure line. A late reader result after timeout is ignored.
+ */
+async function readSeatUsageOrNull(
+  read: () => Promise<SeatUsageSnapshot>
+): Promise<SeatUsageSnapshot | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let settled = false;
+  try {
+    return await new Promise<SeatUsageSnapshot | null>(resolve => {
+      timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        console.log('[smart-cauldron] seat usage unavailable: timeout');
+        resolve(null);
+      }, SEAT_USAGE_READ_TIMEOUT_MS);
+      Promise.resolve()
+        .then(() => read())
+        .then(
+          value => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+          },
+          () => {
+            if (settled) return;
+            settled = true;
+            console.log('[smart-cauldron] seat usage unavailable: rejected');
+            resolve(null);
+          }
+        );
+    });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 export interface SupervisorFailureContext {
@@ -305,6 +352,25 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     entryTierName = promoted.name;
   }
 
+  let entrySelection: EntrySelection | undefined;
+  if (opts.deps?.seatUsage) {
+    const usage = await readSeatUsageOrNull(opts.deps.seatUsage);
+    entrySelection = chooseHeadroomEntry({
+      picked: entryTierName,
+      tiers,
+      refusedTiers,
+      premiumTiers,
+      usage,
+      thresholdPercent: resolveEntryThreshold(process.env),
+      pinned: entryOverride !== undefined,
+    });
+    entryTierName = entrySelection.entry;
+    console.log(
+      `[smart-cauldron] entry selection: ${entrySelection.reason} ` +
+        `picked=${entrySelection.picked} entry=${entrySelection.entry}`
+    );
+  }
+
   let currentIndex = tiers.findIndex(t => t.name === entryTierName);
   if (currentIndex === -1) {
     throw new Error(
@@ -346,6 +412,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         climbCount: 0,
         wonCheap: false,
       },
+      ...(entrySelection ? { entrySelection } : {}),
     };
     const admission = await createRecordImpl(record, outDir);
     onAdmission?.(admission.record, admission.created);
@@ -494,6 +561,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
         ...(refusalReason ? { refusalReason } : {}),
+        ...(entrySelection ? { entrySelection } : {}),
       };
     }
 
@@ -998,6 +1066,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       attempt.outcome = outcome;
       attempt.gateFailReason = verdict.pass ? null : verdict.reason;
       attempt.servedModelId = pollResult.servedModelId;
+      attempt.nodeModels = pollResult.nodeModels;
       attempt.completedAt = new Date().toISOString();
 
       if (verdict.pass) {
