@@ -474,11 +474,11 @@ assert_eq "test1 scrubbed GH_TOKEN" "GH_TOKEN=unset" "$(head -1 "$ENVREC")"
 assert_eq "test1 kept TEST_URL" "TEST_URL=postgresql://localhost/phase15" "$(sed -n '2p' "$ENVREC")"
 if [ -d "$TMP/node_modules" ]; then PASS=$((PASS + 1)); echo "PASS: test1 node_modules exists"; else FAIL=$((FAIL + 1)); echo "FAIL: test1 node_modules exists"; fi
 
-echo "--- test 2: prep is idempotent and skips when not applicable ---"
+echo "--- test 2: repeated prep revalidates existing dependencies and skips only inapplicable roots ---"
 out="$(cd "$TMP" && dprep_ensure_js_deps)"
 rc=$?
 assert_eq "test2 present rc" "0" "$rc"
-assert_contains "test2 node_modules present" "dprep: node_modules present, skipping" "$out"
+assert_contains "test2 existing directory reinstalled" "dprep: install ok (" "$out"
 TMP2="$(mktemp -d)"
 printf '{}\n' > "$TMP2/package.json"
 out="$(cd "$TMP2" && dprep_ensure_js_deps)"
@@ -490,7 +490,7 @@ out="$(cd "$TMP3" && dprep_ensure_js_deps)"
 rc=$?
 assert_eq "test2 empty rc" "0" "$rc"
 assert_contains "test2 empty dir" "dprep: no package.json with a bun lockfile, skipping" "$out"
-assert_eq "test2 bun call count stays 1" "1" "$(wc -l < "$REC" | tr -d ' ')"
+assert_eq "test2 repeated frozen install count" "2" "$(wc -l < "$REC" | tr -d ' ')"
 
 echo "--- test 3: missing bun skips cleanly ---"
 TMP4="$(mktemp -d)"
@@ -501,9 +501,12 @@ rc=$?
 assert_eq "test3 rc" "0" "$rc"
 assert_contains "test3 bun missing" "dprep: bun not found, skipping" "$out"
 
-echo "--- test 4: a failed install never fails the run ---"
-cat > "$BIN/bun" <<'EOF'
+echo "--- test 4: a partial failed install never fails the run and retries ---"
+: > "$REC"
+cat > "$BIN/bun" <<EOF
 #!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$REC"
+mkdir -p node_modules
 exit 1
 EOF
 chmod +x "$BIN/bun"
@@ -524,6 +527,58 @@ TMP5="$(mktemp -d)"
 assert_eq "test4 rc" "0" "$(tr -d '[:space:]' < "$TMP5/rc")"
 assert_contains "test4 failed install continues" "dprep: install failed rc=1 (continuing" "$(cat "$TMP5/out")"
 assert_eq "test4 tracked files untouched" "" "$(cat "$TMP5/porcelain")"
+
+# Only the install is stubbed: retry executes the production helper and scrub.
+cat > "$BIN/bun" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$REC"
+printf 'GH_TOKEN=%s\\n' "\${GH_TOKEN-unset}" >> "$ENVREC"
+mkdir -p node_modules
+printf 'ready\\n' > node_modules/test-ready
+EOF
+chmod +x "$BIN/bun"
+out="$(cd "$TMP5" && dprep_ensure_js_deps)"
+assert_contains "test4 partial install retries successfully" "dprep: install ok (" "$out"
+assert_eq "test4 both installs executed" "2" "$(wc -l < "$REC" | tr -d ' ')"
+assert_eq "test4 frozen arguments retained" "install --frozen-lockfile" "$(tail -1 "$REC")"
+assert_eq "test4 repeated credentials scrubbed" "GH_TOKEN=unset" "$(tail -1 "$ENVREC")"
+assert_eq "test4 retry tracked tree untouched" "" "$(git -C "$TMP5" status --porcelain --untracked-files=no)"
+
+cat > "$BIN/bun" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$REC"
+mkdir -p node_modules
+sleep 4
+EOF
+chmod +x "$BIN/bun"
+out="$(cd "$TMP5" && DPREP_TIMEOUT_SECONDS=1 dprep_ensure_js_deps)"
+assert_contains "test4 timeout remains nonblocking" "dprep: install failed rc=124 (continuing" "$out"
+cat > "$BIN/bun" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$REC"
+mkdir -p node_modules
+EOF
+chmod +x "$BIN/bun"
+out="$(cd "$TMP5" && dprep_ensure_js_deps)"
+assert_contains "test4 timed-out partial install retries" "dprep: install ok (" "$out"
+assert_eq "test4 timeout and recovery executed" "4" "$(wc -l < "$REC" | tr -d ' ')"
+assert_eq "test4 timeout recovery tracked tree untouched" "" "$(git -C "$TMP5" status --porcelain --untracked-files=no)"
+
+TMP8="$(mktemp -d)"
+printf '{}\n' > "$TMP8/package.json"
+: > "$TMP8/bun.lock"
+ln -s "$TMP5/node_modules" "$TMP8/node_modules" 2>/dev/null || true
+if [ -L "$TMP8/node_modules" ]; then
+  before_calls="$(wc -l < "$REC" | tr -d ' ')"
+  out="$(cd "$TMP8" && dprep_ensure_js_deps)"
+  assert_contains "test4 symlink refusal" "dprep: node_modules is a symlink, skipping" "$out"
+  assert_eq "test4 shared dependencies never installed into" "$before_calls" "$(wc -l < "$REC" | tr -d ' ')"
+else
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) echo "SKIP: actual POSIX symlink unavailable; Linux CI must exercise this control" ;;
+    *) FAIL=$((FAIL + 1)); echo "FAIL: actual POSIX symlink fixture unavailable" ;;
+  esac
+fi
 
 echo "--- test 5: npx becomes bunx when npx is absent ---"
 : > "$REC"
@@ -639,7 +694,7 @@ fi
 
 unset RST_NPX_BIN RST_NPM_BIN GH_TOKEN
 export PATH="$ORIG_PATH"
-rm -rf "$BIN" "$TMP" "$TMP2" "$TMP3" "$TMP4" "$TMP5" "$TMP6" "$TMP7"
+rm -rf "$BIN" "$TMP" "$TMP2" "$TMP3" "$TMP4" "$TMP5" "$TMP6" "$TMP7" "$TMP8"
 
 echo
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"

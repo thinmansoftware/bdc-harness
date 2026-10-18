@@ -70,3 +70,32 @@ The `mec core` block and the `sme_process` / `mec_check` call sites in
 their mirrored lane copies must remain byte-identical. The unit test checks both the
 function bodies and these separate argument-passing surfaces so new evidence fields
 cannot silently fall back to defaults in a subset of lanes.
+
+## Pre-implement Bun dependency prep
+
+The `dprep_ensure_js_deps` core runs in `prep-dependencies` before implement and
+again before `run-stop-tests` executes the declared tests. A root `package.json`
+and Bun lockfile are required; other package managers and nested roots remain
+outside this helper's scope. Both copies are kept identical in all 13 feature
+lanes.
+
+Each applicable invocation repeats `bun install --frozen-lockfile` under the
+existing credential scrub, closed stdin, and `DPREP_TIMEOUT_SECONDS` limit
+(default 600 seconds). An existing `node_modules` directory may be partial after
+a failed or timed-out install, so its presence no longer skips installation.
+Symlinked `node_modules` is refused rather than following a shared directory.
+There is no success stamp or dependency deletion. Bun's own artifact cache remains
+available; repeated bounded installation may add latency and reruns root lifecycle
+scripts. A disposable Bun 1.3.11 fixture observed `postinstall` run on each frozen
+installation. Product-specific lifecycle behavior remains subject to review and
+runtime acceptance.
+
+The helper still returns zero and records the install result. Installation success
+does not prove tests pass; downstream observed test and manifest gates remain
+required. Existing node limits are 900 seconds for prep and 1800 seconds for stop
+tests, leaving time beyond the default installer limit. The broader WDI installer
+in PR #946 remains separate.
+
+Verify with `bash .archon/workflows/defaults/__tests__/run-stop-tests.sh`; installs
+are stubbed while the tests extract and execute the actual core. Windows may lack
+actual POSIX symlink support; the Linux CI control is required for that behavior.

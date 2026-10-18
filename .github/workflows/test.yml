@@ -45,6 +45,11 @@ jobs:
       - name: GitHub service command and credential routing regressions
         run: bun test ./scripts/github-service-exec.test.ts packages/overseer/src/__tests__/github-command-durable-metering.test.ts ./scripts/github-service-token.test.ts ./scripts/container/gh-merge-guard.test.ts
 
+      - name: Lane stop-test and dependency-prep regressions
+        shell: bash
+        timeout-minutes: 5
+        run: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh
+
       - name: Run tests
         if: runner.os != 'Windows'
         run: bun run test

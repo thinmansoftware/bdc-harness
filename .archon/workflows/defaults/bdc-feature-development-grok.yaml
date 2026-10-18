@@ -703,9 +703,9 @@ nodes:
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       cd "$WT"
       # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
-      # dprep_ensure_js_deps installs bun-lockfile JavaScript dependencies when
-      # node_modules is absent. prep-dependencies calls it before implement, and
-      # run-stop-tests calls it before the first rst_try. Always returns 0. The
+      # dprep_ensure_js_deps repeats the bounded frozen install on each applicable
+      # call: an existing directory does not prove a prior install succeeded.
+      # prep-dependencies and run-stop-tests both call it. Always returns 0. The
       # install subshell unsets the same credential families as rst_scrub_env and
       # keeps *_TEST_* names. node_modules is never symlinked or copied.
       dprep_ensure_js_deps() {
@@ -713,8 +713,8 @@ nodes:
           printf 'dprep: no package.json with a bun lockfile, skipping\n'
           return 0
         fi
-        if [ -d node_modules ]; then
-          printf 'dprep: node_modules present, skipping\n'
+        if [ -L node_modules ]; then
+          printf 'dprep: node_modules is a symlink, skipping\n'
           return 0
         fi
         if ! command -v bun >/dev/null 2>&1; then
@@ -1904,9 +1904,9 @@ nodes:
       # ---- END rst core ----
 
       # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
-      # dprep_ensure_js_deps installs bun-lockfile JavaScript dependencies when
-      # node_modules is absent. prep-dependencies calls it before implement, and
-      # run-stop-tests calls it before the first rst_try. Always returns 0. The
+      # dprep_ensure_js_deps repeats the bounded frozen install on each applicable
+      # call: an existing directory does not prove a prior install succeeded.
+      # prep-dependencies and run-stop-tests both call it. Always returns 0. The
       # install subshell unsets the same credential families as rst_scrub_env and
       # keeps *_TEST_* names. node_modules is never symlinked or copied.
       dprep_ensure_js_deps() {
@@ -1914,8 +1914,8 @@ nodes:
           printf 'dprep: no package.json with a bun lockfile, skipping\n'
           return 0
         fi
-        if [ -d node_modules ]; then
-          printf 'dprep: node_modules present, skipping\n'
+        if [ -L node_modules ]; then
+          printf 'dprep: node_modules is a symlink, skipping\n'
           return 0
         fi
         if ! command -v bun >/dev/null 2>&1; then
