@@ -46,6 +46,7 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_watchdog.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_canary_protocol.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_bounded_process.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_snapshot.py
           bun test ./scripts/staging/teetime-canary-result.test.ts
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test
@@ -62,6 +63,7 @@ jobs:
           bun test src/codex/restricted-sdk.test.ts
           bun test src/community/pi/restricted-review.test.ts
           bun test src/community/pi/restricted-review-transport.test.ts
+          bun test src/community/pi/restricted-review-evidence.test.ts
           bun test src/codex/restricted-run-factory.test.ts
           bun test src/codex/provider.test.ts
           bun x tsc --noEmit
