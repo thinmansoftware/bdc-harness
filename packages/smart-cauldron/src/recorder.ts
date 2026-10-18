@@ -19,6 +19,37 @@ export interface CreateCascadeRecordResult {
   readonly record: CascadeRunRecord;
 }
 
+function recordPath(cascadeId: string, outDir: string): string {
+  const digest = createHash('sha256').update(cascadeId).digest('hex').slice(0, 24);
+  return join(outDir, `dispatch-${digest}`, 'cascade-record.json');
+}
+
+/** Read-only lookup: absence never creates admission or grants execution. */
+export async function readCascadeRecordById(
+  cascadeId: string,
+  outDir = './cascade-runs'
+): Promise<CascadeRunRecord | null> {
+  try {
+    return JSON.parse(await readFile(recordPath(cascadeId, outDir), 'utf8')) as CascadeRunRecord;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+export function assertCascadeRecordIdentity(
+  existing: CascadeRunRecord,
+  requested: Pick<CascadeRunRecord, 'cascadeId' | 'woId' | 'project' | 'request'>
+): void {
+  if (
+    existing?.cascadeId !== requested.cascadeId ||
+    existing.woId !== requested.woId ||
+    existing.project !== requested.project ||
+    JSON.stringify(existing.request) !== JSON.stringify(requested.request)
+  )
+    throw new Error('[smart-cauldron/recorder] dispatch identity conflict');
+}
+
 /** Create the admission record exactly once. Existing dispatch IDs are returned, not overwritten. */
 export async function createRecord(
   record: CascadeRunRecord,
@@ -34,17 +65,7 @@ export async function createRecord(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     const existing = JSON.parse(await readFile(filePath, 'utf8')) as CascadeRunRecord;
-    if (
-      existing.woId !== record.woId ||
-      existing.project !== record.project ||
-      JSON.stringify(existing.request) !== JSON.stringify(record.request)
-    ) {
-      throw new Error(
-        `[smart-cauldron/recorder] dispatch identity conflict for ${record.cascadeId}: ` +
-          `existing scope is ${existing.woId}/${existing.project ?? 'none'}, ` +
-          `requested scope is ${record.woId}/${record.project ?? 'none'}, or request parameters differ`
-      );
-    }
+    assertCascadeRecordIdentity(existing, record);
     return { created: false, path: filePath, record: existing };
   }
 }
@@ -66,7 +87,24 @@ export async function writeRecord(
     encoding: 'utf8',
     flag: 'wx',
   });
-  await rename(tempPath, filePath);
+  // Persist one immutable payload. Windows can transiently refuse replacement;
+  // retry only this rename, never the provider work or a destructive fallback.
+  const delays = [10, 20, 40, 80] as const;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(tempPath, filePath);
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (
+        process.platform !== 'win32' ||
+        (code !== 'EPERM' && code !== 'EBUSY') ||
+        attempt >= delays.length
+      )
+        throw error;
+      await new Promise<void>(resolve => setTimeout(resolve, delays[attempt]));
+    }
+  }
   return filePath;
 }
 

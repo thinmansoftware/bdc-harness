@@ -28,6 +28,7 @@ import { dirname, join } from 'path';
 import { runCascade } from './cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from './cascade.js';
 import { writeRecord } from './recorder.js';
+export { readCascadeRecordById } from './recorder.js';
 import type { CascadeRunRecord } from './types.js';
 
 const DEFAULT_OUT_DIR = './cascade-runs';
@@ -48,37 +49,10 @@ interface FrontierClaimFile {
   readonly claimedAt: string;
 }
 
-/**
- * Reconstruct the cascade record path for a cascadeId. Mirrors the private
- * buildRunSlug in recorder.ts (dispatch-<sha256(cascadeId)[:24]>) so a record
- * written by runCascade can be located from an operator API call. Kept as a
- * local re-derivation to avoid widening recorder.ts's exported surface.
- */
-function cascadeRecordPath(cascadeId: string, outDir: string): string {
-  const digest = createHash('sha256').update(cascadeId).digest('hex').slice(0, 24);
-  return join(outDir, `dispatch-${digest}`, 'cascade-record.json');
-}
-
+/** The approval claim remains separate from the shared read-only admission lookup. */
 function claimPath(cascadeId: string, outDir: string): string {
   const digest = createHash('sha256').update(cascadeId).digest('hex').slice(0, 24);
   return join(outDir, 'frontier-approval-claims', `claim-${digest}.json`);
-}
-
-/**
- * Read a persisted cascade record by cascadeId. Returns null when no record
- * exists (unknown id). Rethrows any non-ENOENT read/parse error.
- */
-export async function readCascadeRecordById(
-  cascadeId: string,
-  outDir: string = DEFAULT_OUT_DIR
-): Promise<CascadeRunRecord | null> {
-  const filePath = cascadeRecordPath(cascadeId, outDir);
-  try {
-    return JSON.parse(await readFile(filePath, 'utf8')) as CascadeRunRecord;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw error;
-  }
 }
 
 /**
@@ -221,9 +195,8 @@ export async function resumeFrontierTier(
   });
 
   // Only record the approval on the original paused record once the premium tier
-  // actually fired. A 'blocked' result means nothing fired (WO lock held by a
-  // live duplicate) -- leaving the record pending lets a retry succeed once the
-  // duplicate clears, instead of stranding it 'approved' with no fire.
+  // actually fired. A blocked result can reflect a live WO owner or incomplete
+  // claim discovery. A named drain refusal leaves approval pending as well.
   if (result.status === 'drain-deferred') {
     await releaseFrontierClaim(record.cascadeId, outDir);
   } else if (result.status !== 'blocked') {

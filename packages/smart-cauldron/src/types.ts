@@ -167,6 +167,12 @@ export interface CascadeRunRecord {
     prUrl: string;
     checkedAtTier: TierName | null;
   };
+  /** Discovery uncertainty blocks provider spend; contains no provider diagnostics. */
+  claimDiscoveryBlock?: {
+    phase: 'admission' | 'before-fire' | 'before-climb';
+    reason: 'request_failed' | 'invalid_response' | 'invalid_repository';
+    checkedAt: string;
+  };
   supervisorRecovery?: {
     ownerId: string;
     fencingToken: number;

@@ -34,7 +34,10 @@
  *              (fail-closed; the fix must NOT fail-open).
  */
 
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { ghPrListForBranchDefault, pollForTerminal } from '../poll.js';
 import { judgeGate } from '../judge.js';
@@ -43,6 +46,8 @@ import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult } from '../types.js';
 
 const originalFetch = globalThis.fetch;
+const testOutRoot = mkdtempSync(join(tmpdir(), 'smart-cauldron-pr-detection-'));
+afterAll(() => rmSync(testOutRoot, { recursive: true, force: true }));
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -324,10 +329,11 @@ function baseOpts(deps: CascadeDeps): RunCascadeOptions {
     woId: 'WO-TEST-1502-PR-DETECTION-REGRESSION',
     woClass: 'CODE',
     tags: ['mechanical'],
-    outDir: '/tmp/smart-cauldron-1502-test-runs',
+    outDir: mkdtempSync(join(testOutRoot, 'cascade-')),
     token: 'test-token',
     project: 'lspro-react',
-    deps,
+    // Run-specific PR attribution is under test; WO discovery must stay offline.
+    deps: { findWoClaim: async () => null, ...deps },
   };
 }
 
