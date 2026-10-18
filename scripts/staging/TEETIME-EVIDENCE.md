@@ -334,3 +334,51 @@ python -I probe-teetime-filesystem.py --docker <operator-docker-path> --image sh
 Source1d28e81d0d3ffcb2c299b663974d24cd6bcd6d88 passed exact hosted CI39131304783,
 including the six Linux checker tests. This is distinct from actual Docker
 readonly mount or complete materialization qualification, which remain pending.
+
+The3f6bc3f7 import-only run passed on exact source/image/helper hashes and hosted
+CI39131876511. Receipt teetime-fs-e6da265c62a4/result.json records normal exit,
+actual SDK exports/mock interception/factory import and unchanged HOME/workspace.
+Image sha256:8a61be5ae2b78859c0ad84503ac10f5d59b6bff0a1487f97ba579fb9e102fb28.
+No server, credentials, provider constructor, thread or query was used. Cleanup
+passed. This proves initialization only; artifactQualified is explicitly false.
+
+## Standalone complete-candidate lifecycle source
+
+probe_teetime_materialization.py is a separate fixed provenance prototype, not
+application QA or lane admission. Eight pure resource/lifecycle tests pass.
+It validates the complete fixed frame and identities before resources exist,
+retaining the smaller65536-byte operator input limit. Its immutable image must
+have TEETIME_MATERIALIZATION_SOURCE_SHA and an empty ordinary /candidate owned
+by UID1001; the verifier checks that root and every helper hash before copy-up.
+The operator recipe must create that image-owned directory explicitly.
+
+The writer uses the first mount/copy-up into a new exclusive labeled local
+volume. Actual root emptiness/ownership and resolved volume backing path are
+verified before stdin delivery. Normal writer exit, exact receipt, no OOM/error,
+removal and zero volume references precede test-container creation. The test
+mount is readonly with volume-nocopy. Every stage checks created/running/exited
+state explicitly. The fixed test checks complete bytes/modes/identities and an
+actual EROFS attempt, and its actual process status/command/helper hash are bound
+to the retained receipt. No candidate code or dependencies execute.
+
+The independent watchdog reuses the proven process-creation identity/handle
+mechanism; its new cleanup recognizes only verify/writer/test roles under the
+fixed teetime-materialize owner prefix. Controller cutoff is25 seconds, watchdog
+deadline45 seconds; parent exit precedes two absence reconciliations. Old capture
+cleanup is unchanged. Only owned exact-image containers and local labeled volumes
+may be removed. Failed/partial volumes are disposed, never resumed or repaired.
+
+Invocation after separate exact-source/image/runtime review:
+
+```text
+python -I probe_teetime_materialization.py --docker <operator-docker-path> --image sha256:<exact-image-id> --source <exact-materialization-commit> --case clean
+```
+
+Additional separately executed cases: writer-failure injects a synchronous partial
+write and requires exit17/exact marker with no test start. forced-writing verifies
+two partial bytes while the trusted writer is blocked, then exits the controller73.
+forced-after-writer exits73 only after writer removal/zero references. These forced
+cases require phase evidence, expected controller exit, independent watchdog
+cleanup and fresh absence; generic controller failure is never a passing test.
+No daemon case has run at this source-preparation point. Publication/review-package,
+replay protection, policy revision, registry admission and app CI/CD remain open.
