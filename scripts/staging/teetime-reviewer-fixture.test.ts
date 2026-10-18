@@ -9,6 +9,7 @@ import {
   inspectReviewerRequest,
   fixtureCaseAccepted,
   validateFixtureFinalText,
+  verifyReviewerUtilityControls,
 } from './teetime-reviewer-fixture';
 
 const raw = readFileSync(
@@ -176,4 +177,71 @@ test('fixture acceptance fails closed on excess requests, final text and incompl
     { rawToolEvent: true },
   ])
     expect(() => fixtureCaseAccepted('shell', { ...negative, ...patch })).toThrow();
+});
+
+const utilityResponse = () => ({
+  // Pinned API ToolsV2 deliberately omits the two native ToolsToml flags.
+  config: { tools: { web_search: null } },
+  layers: [
+    {
+      name: { type: 'sessionFlags' },
+      version: 'fixture-v1',
+      config: {
+        tools: {
+          update_plan: { enabled: false },
+          experimental_request_user_input: { enabled: false },
+        },
+      },
+    },
+  ],
+  origins: {
+    'tools.update_plan.enabled': { name: { type: 'sessionFlags' }, version: 'fixture-v1' },
+    'tools.experimental_request_user_input.enabled': {
+      name: { type: 'sessionFlags' },
+      version: 'fixture-v1',
+    },
+  },
+});
+
+test('validates native utility controls via exact resolved layer origins despite lossy API projection', () => {
+  verifyReviewerUtilityControls(utilityResponse());
+  const response = utilityResponse();
+  Object.assign(response.layers[0], { disabledReason: null });
+  verifyReviewerUtilityControls(response);
+});
+
+test('missing, duplicate, disabled or foreign utility layer evidence rejects instead of falling back', () => {
+  const missing = utilityResponse();
+  missing.layers = [];
+  const duplicate = utilityResponse();
+  duplicate.layers.push(structuredClone(duplicate.layers[0]));
+  const foreign = utilityResponse();
+  foreign.layers[0].name.type = 'user';
+  const disabled = utilityResponse();
+  Object.assign(disabled.layers[0], { disabledReason: 'disabled' });
+  const emptyVersion = utilityResponse();
+  emptyVersion.layers[0].version = '';
+  for (const value of [null, {}, missing, duplicate, foreign, disabled, emptyVersion])
+    expect(() => verifyReviewerUtilityControls(value)).toThrow();
+  for (const path of [
+    'tools.update_plan.enabled',
+    'tools.experimental_request_user_input.enabled',
+  ] as const) {
+    const absent = utilityResponse();
+    delete (absent.origins as Record<string, unknown>)[path];
+    const changed = utilityResponse();
+    changed.origins[path].version = 'different';
+    const other = utilityResponse();
+    other.origins[path].name.type = 'project';
+    for (const value of [absent, changed, other])
+      expect(() => verifyReviewerUtilityControls(value)).toThrow();
+  }
+  for (const key of ['update_plan', 'experimental_request_user_input'] as const) {
+    const enabled = utilityResponse();
+    enabled.layers[0].config.tools[key].enabled = true;
+    const absent = utilityResponse();
+    delete (absent.layers[0].config.tools as Record<string, unknown>)[key];
+    for (const value of [enabled, absent])
+      expect(() => verifyReviewerUtilityControls(value)).toThrow();
+  }
 });

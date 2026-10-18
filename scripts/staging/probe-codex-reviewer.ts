@@ -158,7 +158,7 @@ async function main(): Promise<void> {
           requireValue(!response.error, 'effective configuration RPC rejected');
           if (response.id === 1) {
             child.stdin.write('{"method":"initialized"}\n');
-            send(2, 'config/read', { cwd: '/workspace', includeLayers: false });
+            send(2, 'config/read', { cwd: '/workspace', includeLayers: true });
           } else if (response.id === 2) {
             const config = response.result.config;
             for (const key of [
@@ -179,11 +179,7 @@ async function main(): Promise<void> {
               'effective agent or skills configuration'
             );
             requireValue(config.model_catalog_json === catalogPath, 'effective catalog path');
-            requireValue(
-              config.tools.update_plan.enabled === false &&
-                config.tools.experimental_request_user_input.enabled === false,
-              'effective utility tools'
-            );
+            fixture.verifyReviewerUtilityControls(response.result);
             requireValue(
               config.default_permissions === 'tee-time' && config.model_provider === 'openai',
               'effective restricted provider'
@@ -501,6 +497,7 @@ async function main(): Promise<void> {
       framingKeys,
       executableDefinitions: 0,
       effectiveConfigurationVerified: true,
+      utilityControlEvidence: 'source-decoder-and-resolved-layer-origins-plus-request-inventory',
       hostileEmitted,
       denialObserved,
       rawSdkEventCounts: counts,
@@ -544,6 +541,8 @@ void main().catch((error: unknown) => {
           'final-check': 'case-acceptance',
         } as Record<string, string>
       )[phase] ?? 'other';
+  } else if (typeof message === 'string' && message.startsWith('fixture utility ')) {
+    category = 'configuration';
   } else if (
     typeof message === 'string' &&
     (message.startsWith('installed model entry ') ||

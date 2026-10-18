@@ -280,3 +280,44 @@ export function fixtureCaseAccepted(
     throw new Error('fixture hostile acceptance rejected');
   return false;
 }
+
+function fixtureRecord(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value))
+    throw new Error('fixture utility evidence object');
+  return value as Record<string, unknown>;
+}
+
+/** ApiConfig.ToolsV2 omits native utility fields; require resolved CLI provenance. */
+export function verifyReviewerUtilityControls(response: unknown): void {
+  const result = fixtureRecord(response);
+  if (!Array.isArray(result.layers) || result.layers.length > 16)
+    throw new Error('fixture utility layer inventory');
+  const layers = result.layers.map(fixtureRecord);
+  const cliLayers = layers.filter(layer => fixtureRecord(layer.name).type === 'sessionFlags');
+  if (cliLayers.length !== 1) throw new Error('fixture utility session layer count');
+  const cli = cliLayers[0];
+  const name = fixtureRecord(cli.name);
+  if (
+    Object.keys(name).length !== 1 ||
+    (cli.disabledReason !== undefined && cli.disabledReason !== null) ||
+    typeof cli.version !== 'string' ||
+    cli.version.length === 0 ||
+    cli.version.length > 256
+  )
+    throw new Error('fixture utility layer disabled or unversioned');
+  const tools = fixtureRecord(fixtureRecord(cli.config).tools);
+  const origins = fixtureRecord(result.origins);
+  for (const key of ['update_plan', 'experimental_request_user_input']) {
+    if (fixtureRecord(tools[key]).enabled !== false)
+      throw new Error('fixture utility enabled or missing');
+    const origin = fixtureRecord(origins['tools.' + key + '.enabled']);
+    const originName = fixtureRecord(origin.name);
+    if (
+      originName.type !== 'sessionFlags' ||
+      Object.keys(originName).length !== 1 ||
+      origin.version !== cli.version ||
+      Object.keys(origin).some(key => !['name', 'version'].includes(key))
+    )
+      throw new Error('fixture utility origin overridden or missing');
+  }
+}

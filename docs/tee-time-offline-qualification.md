@@ -193,3 +193,25 @@ validates its shape but cannot accept it as success. No raw error, stack, reques
 environment, path or model text is emitted. Dispatch now defaults to `none` and
 offers only `positive-only`; another full case set requires a reviewed source
 change. Publication does not itself authorize the next diagnostic attempt.
+
+The one positive-only diagnostic run39149336869 at
+`1dd6a94cabab117d1ed8074897f56b6a1838ee0f` also failed, with the validated
+frame phase=`configuration`, category=`other`. Image:
+`sha256:d7fa51f1436ca8ab56b604b4cd2a266043f3db85788b5d7d1ca98fff04672ed9`.
+Owned reviewer-container absence and compose-volume removal passed. Separate PR
+run39149341731 passed baseline checks and executed no reviewer cases.
+
+Pinned upstream `app-server-protocol/src/protocol/v2/config.rs` defines
+`ToolsV2` with only `web_search`. Native `config/src/config_toml.rs` defines
+both utility flags, but `app-server/src/config_manager_service.rs:133-145`
+projects native ConfigToml through JSON into ApiConfig, dropping those fields.
+The probe incorrectly dereferenced missing API-projection fields. That assertion
+cannot validate the native controls and may throw despite valid configuration.
+
+The correction requests complete layers, requires exactly one active
+`sessionFlags` layer with literal false values, and requires both exact leaf-path
+origins to name that layer/version. Missing/foreign/overridden origins reject.
+The native service removes origins covered by exact requirements; their absence
+is never a reason to accept a raw layer. Complete actual request-tool inventory
+remains required. No full layer, raw request, instruction or sensitive value is
+logged. This source correction grants no new runtime or reviewer admission.
