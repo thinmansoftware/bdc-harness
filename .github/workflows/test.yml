@@ -45,6 +45,10 @@ jobs:
       - name: GitHub service command and credential routing regressions
         run: bun test ./scripts/github-service-exec.test.ts packages/overseer/src/__tests__/github-command-durable-metering.test.ts ./scripts/github-service-token.test.ts ./scripts/container/gh-merge-guard.test.ts
 
+      - name: Verify worktree dependency hygiene
+        if: runner.os == 'Linux'
+        run: bash .archon/workflows/defaults/__tests__/install-worktree-deps.sh
+
       - name: Run tests
         if: runner.os != 'Windows'
         run: bun run test
