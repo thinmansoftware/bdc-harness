@@ -52,6 +52,63 @@ describe('SqliteAdapter', () => {
     }
   });
 
+  describe('Wave 2 query readiness', () => {
+    test('concurrent first queries await both schema families', async () => {
+      db = createTestDb();
+      const results = await Promise.allSettled([
+        db.query<{ ready: number }>('SELECT 1 AS ready'),
+        db.query<{ count: number }>('SELECT COUNT(*) AS count FROM overseer_parent_commitments'),
+        db.query<{ count: number }>(
+          'SELECT COUNT(*) AS count FROM overseer_m31_execution_receipts_v2'
+        ),
+        db.query<{ count: number }>('SELECT COUNT(*) AS count FROM overseer_control_events'),
+      ]);
+      expect(results).toEqual([
+        { status: 'fulfilled', value: { rows: [{ ready: 1 }], rowCount: 1 } },
+        ...Array.from({ length: 3 }, () => ({
+          status: 'fulfilled',
+          value: { rows: [{ count: 0 }], rowCount: 1 },
+        })),
+      ]);
+    });
+
+    test('installation failure rejects concurrent and later queries without bypass', async () => {
+      db = createTestDb();
+      const malformed = new Database(currentDbPath);
+      try {
+        malformed.run('CREATE TABLE overseer_m31_snapshots_v2 (wrong_column TEXT)');
+      } finally {
+        malformed.close();
+      }
+      const results = await Promise.allSettled([db.query('SELECT 1'), db.query('SELECT 2')]);
+      expect(results[0]?.status).toBe('rejected');
+      expect(results[1]).toEqual(results[0]);
+      const first = results[0];
+      if (first?.status !== 'rejected') throw new Error('expected_schema_installation_failure');
+      expect(first.reason).toBeInstanceOf(Error);
+      expect(String(first.reason)).toContain('no such column');
+      await expect(db.query('SELECT 3')).rejects.toBe(first.reason);
+    });
+
+    test('a concurrent first transaction awaits schema installation', async () => {
+      db = createTestDb();
+      const results = await Promise.allSettled([
+        db.query('SELECT 1'),
+        db.withTransaction(async query => {
+          const control = await query<{ count: number }>(
+            'SELECT COUNT(*) AS count FROM overseer_parent_commitments'
+          );
+          const m31 = await query<{ count: number }>(
+            'SELECT COUNT(*) AS count FROM overseer_m31_execution_receipts_v2'
+          );
+          return [control.rows[0]?.count, m31.rows[0]?.count];
+        }),
+      ]);
+      expect(results[0]?.status).toBe('fulfilled');
+      expect(results[1]).toEqual({ status: 'fulfilled', value: [0, 0] });
+    });
+  });
+
   describe('Smart Cauldron reliability schema', () => {
     test('creates all additive reliability tables and indexes', async () => {
       db = createTestDb();
