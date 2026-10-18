@@ -175,7 +175,7 @@ describe('cursor empty-output guard', () => {
   });
 });
 
-describe('cursor ladder tier ships dark', () => {
+describe('cursor ladder tier is live', () => {
   // Scenario 4 (edge -- ladder dark): asserted against the REAL config file,
   // not a fixture, so the shipped artifact is what is under test.
   test('cursor tier exists and is bound to its own workflow', () => {
@@ -185,8 +185,10 @@ describe('cursor ladder tier ships dark', () => {
     expect(tier?.isFrontier).toBe(false);
   });
 
-  test('cursor tier is REFUSED so live cascade behavior is unchanged', () => {
-    expect(ladderConfig.refusedTiers).toContain('cursor');
+  test('cursor and zero are NOT refused (M-20260929h); glm/qwen still are', () => {
+    expect(ladderConfig.refusedTiers).not.toContain('cursor');
+    expect(ladderConfig.refusedTiers).not.toContain('zero');
+    for (const t of ['glm', 'qwen']) expect(ladderConfig.refusedTiers).toContain(t);
   });
 
   test('cursor sits below codex in the ladder order', () => {
@@ -194,10 +196,9 @@ describe('cursor ladder tier ships dark', () => {
     expect(names.indexOf('cursor')).toBeLessThan(names.indexOf('codex'));
   });
 
-  // The pre-existing entry floor must not regress: codex remains the first
-  // non-refused tier while cursor is dark.
-  test('entry floor remains codex while cursor is refused', () => {
+  // With zero live (first in the ladder), zero is the first non-refused tier.
+  test('entry floor is zero now that it is live', () => {
     const firstLive = ladderConfig.tiers.find(t => !ladderConfig.refusedTiers.includes(t.name));
-    expect(firstLive?.name).toBe('codex');
+    expect(firstLive?.name).toBe('zero');
   });
 });

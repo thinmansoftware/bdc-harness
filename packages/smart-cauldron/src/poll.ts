@@ -8,6 +8,8 @@
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { serviceGitHubCommandEnvironment } from '@archon/core/github/service-identity';
+import { assertGitHubPoolAvailable, recordGitHubApiCall } from '@archon/core/github/metering';
 import type { PollResult } from './types.js';
 
 const execFileAsync = promisify(execFile);
@@ -289,6 +291,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
         prUrl,
         prMergeable,
         servedModelId,
+        nodeModels: extractNodeModels(events),
         rawMetadata: detail.run.metadata ?? {},
       };
     }
@@ -300,9 +303,11 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     //      `node_started` event has not begun; skip the silence check entirely
     //      (only the hard `timeoutMs` ceiling can end it). We do NOT advance
     //      lastActivityAt while queued -- we simply do not judge it stalled.
-    //   2. An open node is alive. When a node has started and not yet
-    //      completed/failed, grant the generous open-node budget of silence
-    //      before judging the run stalled, instead of the tighter stall budget.
+    //   2. An open node is alive. A plain node opened by node_started, or a
+    //      loop node kept open by loop_iteration_started / loop_iteration_completed
+    //      until node_completed / node_failed, is granted the generous open-node
+    //      budget of silence before the run is judged stalled, instead of the
+    //      tighter stall budget.
     const events = detail.events ?? [];
     if (stallTimeoutMs > 0 && hasRunStarted(detail.run.status, events)) {
       const openNodes = openNodeNames(events);
@@ -313,14 +318,23 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
       // largest so a long healthy node is not cut short by a shorter sibling
       // (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN item 2).
       const openBudget = openNode
-        ? Math.max(...openNodes.map(name => nodeTimeoutsMs[name] ?? openNodeBudgetMs))
+        ? Math.max(...openNodes.map(({ name }) => nodeTimeoutsMs[name] ?? openNodeBudgetMs))
         : 0;
       const budget = openNode ? Math.max(stallTimeoutMs, openBudget) : stallTimeoutMs;
       const silentFor = Date.now() - lastActivityAt;
       if (silentFor >= budget) {
+        const openNodesLabel =
+          openNodes.length === 0
+            ? 'none'
+            : openNodes
+                .map(
+                  ({ name, openSinceMs }) => `${name} (open ${String(Date.now() - openSinceMs)}ms)`
+                )
+                .join(', ');
         throw new TimeoutError(
           `[smart-cauldron/poll] Run ${runId} stalled: no new events for ${String(silentFor)}ms ` +
-            `(stall budget ${String(budget)}ms${openNode ? ', open-node budget' : ''}). Last activity was at ` +
+            `(stall budget ${String(budget)}ms${openNode ? ', open-node budget' : ''}). ` +
+            `open nodes: ${openNodesLabel}. Last activity was at ` +
             `${newestEventSeen === null ? 'no events observed' : new Date(newestEventSeen).toISOString()}.`
         );
       }
@@ -385,26 +399,37 @@ function hasRunStarted(status: string, events: { event_type: string }[]): boolea
 }
 
 /**
- * Names of nodes currently OPEN -- started but not yet completed or failed.
+ * Nodes currently OPEN, each with the epoch ms its current open span began.
  *
- * Processes node lifecycle events (node_started / node_completed / node_failed)
- * in chronological order, tracking the latest start per step and clearing it on
- * completion/failure. A run with any open node is granted the generous open-node
- * silence budget instead of the tighter stall budget, because a single long node
- * (e.g. a 25-minute test run) legitimately emits nothing while it works
- * (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN item 2). The feed itself
- * carries no per-node `timeout`, so the caller maps these names to configured
- * timeouts (poll's `nodeTimeoutsMs`) when available, falling back to a fixed
- * budget otherwise. Returns the open node names so the caller can look each up.
+ * Opening or keeping events (node_started, loop_iteration_started,
+ * loop_iteration_completed) open a step that is not already open and record
+ * that event's timestamp as openSinceMs. A later opening event in the same
+ * span keeps the original openSinceMs, so a later loop iteration does not
+ * reset the age. loop_iteration_completed does not close the node, including
+ * the gap before the next iteration or before node_completed. node_completed
+ * and node_failed remove the step. A close followed by a later opening event
+ * starts a new span.
+ *
+ * Loop nodes persist loop_iteration_started / loop_iteration_completed per
+ * iteration and only a closing node_completed, so a running loop counts as
+ * open (WO-HARNESS-STALL-DETECTOR-OPEN-NODE-BUDGET-01). A run with any open
+ * node is granted the generous open-node silence budget instead of the tighter
+ * stall budget, because a single long node legitimately emits nothing while it
+ * works (WO-HARNESS-CONDUCTOR-STALL-DETECTOR-FIX-01 Scope IN item 2). Open-node
+ * age is display-only. The feed carries no per-node timeout, so the caller maps
+ * these names to configured timeouts (poll's nodeTimeoutsMs) when available.
+ * Entries are in Map insertion order: the first opening of each current span.
  */
 function openNodeNames(
   events: { event_type: string; step_name: string | null; created_at?: string | null }[]
-): string[] {
-  const openStarts = new Set<string>();
+): { name: string; openSinceMs: number }[] {
+  const openSince = new Map<string, number>();
   const lifecycle = events
     .filter(
       ev =>
         ev.event_type === 'node_started' ||
+        ev.event_type === 'loop_iteration_started' ||
+        ev.event_type === 'loop_iteration_completed' ||
         ev.event_type === 'node_completed' ||
         ev.event_type === 'node_failed'
     )
@@ -412,12 +437,19 @@ function openNodeNames(
     .filter((x): x is { ev: (typeof x)['ev']; ts: number } => x.ts !== null)
     .sort((a, b) => a.ts - b.ts);
 
-  for (const { ev } of lifecycle) {
+  for (const { ev, ts } of lifecycle) {
     const step = ev.step_name ?? '';
-    if (ev.event_type === 'node_started') openStarts.add(step);
-    else openStarts.delete(step);
+    if (
+      ev.event_type === 'node_started' ||
+      ev.event_type === 'loop_iteration_started' ||
+      ev.event_type === 'loop_iteration_completed'
+    ) {
+      if (!openSince.has(step)) openSince.set(step, ts);
+    } else {
+      openSince.delete(step);
+    }
   }
-  return [...openStarts];
+  return [...openSince.entries()].map(([name, openSinceMs]) => ({ name, openSinceMs }));
 }
 
 async function fetchRunDetail(
@@ -565,13 +597,22 @@ async function findExistingPrForBranch(
  * Injectable exec seam for testing the exact gh invocation without replacing
  * child_process globally.
  */
-type ExecFileFn = (command: string, args: string[]) => Promise<{ stdout: string; stderr: string }>;
+type ExecFileFn = (
+  command: string,
+  args: string[],
+  options?: { env?: NodeJS.ProcessEnv }
+) => Promise<{ stdout: string; stderr: string }>;
+
+export async function smartCauldronGhEnv(): Promise<{ env: NodeJS.ProcessEnv; poolId: string }> {
+  return serviceGitHubCommandEnvironment('smart_cauldron');
+}
 
 /** Default `gh pr list --head <branch> --repo <repo>` production lookup. */
 export async function ghPrListForBranchDefault(
   branch: string,
   repo: string | null,
-  execFn: ExecFileFn = execFileAsync
+  execFn: ExecFileFn = execFileAsync,
+  resolveAuth: typeof smartCauldronGhEnv = smartCauldronGhEnv
 ): Promise<string | null> {
   if (!repo) {
     console.log(
@@ -581,20 +622,32 @@ export async function ghPrListForBranchDefault(
     return null;
   }
   try {
-    const { stdout } = await execFn('gh', [
-      'pr',
-      'list',
-      '--repo',
-      repo,
-      '--head',
-      branch,
-      '--state',
-      'open',
-      '--json',
-      'url',
-      '--jq',
-      '.[0].url // empty',
-    ]);
+    const auth = await resolveAuth();
+    assertGitHubPoolAvailable(auth.poolId, 'core');
+    const { stdout } = await execFn(
+      'gh',
+      [
+        'pr',
+        'list',
+        '--repo',
+        repo,
+        '--head',
+        branch,
+        '--state',
+        'open',
+        '--json',
+        'url',
+        '--jq',
+        '.[0].url // empty',
+      ],
+      { env: auth.env }
+    );
+    recordGitHubApiCall({
+      service: 'smart_cauldron',
+      poolId: auth.poolId,
+      resource: 'core',
+      status: 0,
+    });
     const url = stdout.trim();
     return url.length > 0 ? url : null;
   } catch (err) {
@@ -615,20 +668,57 @@ function extractServedModelId(metadata: Record<string, unknown>): string | null 
 }
 
 /**
+ * Last node_completed or node_failed model triple per step.
+ * A later event for the same step replaces the whole triple.
+ * Empty strings and non-strings are stored as null. Empty step names are skipped.
+ */
+export function extractNodeModels(
+  events: readonly {
+    event_type: string;
+    step_name: string | null;
+    data?: Record<string, unknown>;
+  }[]
+): Record<string, { provider: string | null; declared: string | null; served: string | null }> {
+  const nodeModels: Record<
+    string,
+    { provider: string | null; declared: string | null; served: string | null }
+  > = {};
+  for (const event of events) {
+    if (event.event_type !== 'node_completed' && event.event_type !== 'node_failed') continue;
+    if (typeof event.step_name !== 'string' || event.step_name.length === 0) continue;
+    const data = event.data ?? {};
+    nodeModels[event.step_name] = {
+      provider: nonEmptyModelField(data.provider),
+      declared: nonEmptyModelField(data.declared_model_id),
+      served: nonEmptyModelField(data.served_model_id),
+    };
+  }
+  return nodeModels;
+}
+
+function nonEmptyModelField(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/**
  * Check if a PR is mergeable via the gh CLI.
  * Returns null if gh is unavailable or returns non-zero.
  */
 async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
   try {
-    const { stdout } = await execFileAsync('gh', [
-      'pr',
-      'view',
-      prUrl,
-      '--json',
-      'mergeable',
-      '--jq',
-      '.mergeable',
-    ]);
+    const auth = await smartCauldronGhEnv();
+    assertGitHubPoolAvailable(auth.poolId, 'core');
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['pr', 'view', prUrl, '--json', 'mergeable', '--jq', '.mergeable'],
+      { env: auth.env }
+    );
+    recordGitHubApiCall({
+      service: 'smart_cauldron',
+      poolId: auth.poolId,
+      resource: 'core',
+      status: 0,
+    });
     const val = stdout.trim().toUpperCase();
     if (val === 'MERGEABLE') return true;
     if (val === 'CONFLICTING' || val === 'BLOCKED') return false;

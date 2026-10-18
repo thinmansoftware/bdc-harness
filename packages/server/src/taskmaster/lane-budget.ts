@@ -17,7 +17,8 @@ function claudeState(reading: HeadroomReading): TmHealthState {
 /** Cheapest-first lane choice. UNKNOWN is deliberately lane-specific. */
 export function decideFireLane(
   headroom: HeadroomReading,
-  health: Partial<Record<FireLane, TmHealthSample | null>>
+  health: Partial<Record<FireLane, TmHealthSample | null>>,
+  overThreshold?: Partial<Record<FireLane, boolean>>
 ): LaneBudgetDecision {
   const states: Record<FireLane, TmHealthState> = {
     claude: health.claude?.state ?? claudeState(headroom),
@@ -26,7 +27,9 @@ export function decideFireLane(
   };
   for (const lane of ['claude', 'codex', 'xai'] as const) {
     const state = states[lane];
-    const available = state === 'healthy' || (state === 'unknown' && lane === 'codex');
+    const available =
+      overThreshold?.[lane] !== true &&
+      (state === 'healthy' || (state === 'unknown' && lane === 'codex'));
     if (available) return { lane, holding: false, reason: `${lane}:${state}` };
   }
   return { lane: null, holding: true, reason: 'all_lanes_degraded_or_unavailable' };

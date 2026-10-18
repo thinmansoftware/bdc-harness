@@ -42,6 +42,9 @@ jobs:
       - name: Check formatting
         run: bun run format:check
 
+      - name: GitHub service command and credential routing regressions
+        run: bun test ./scripts/github-service-exec.test.ts packages/overseer/src/__tests__/github-command-durable-metering.test.ts ./scripts/github-service-token.test.ts ./scripts/container/gh-merge-guard.test.ts
+
       - name: Run tests
         if: runner.os != 'Windows'
         run: bun run test
@@ -81,6 +84,8 @@ jobs:
         run: bun test packages/core/src/db/dispatch.postgres.test.ts
       - name: Taskmaster health migration and atomic reset PostgreSQL integration
         run: bun test packages/core/src/db/taskmaster.postgres.test.ts
+      - name: CE scope approvals PostgreSQL integration
+        run: bun test packages/core/src/db/board-scope-approvals.postgres.test.ts
 
       - name: Rebuild script drain tests
         run: bun test ./deploy/rebuild-archon.test.ts

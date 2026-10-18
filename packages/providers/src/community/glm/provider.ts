@@ -8,6 +8,7 @@ import type {
   TokenUsage,
 } from '../../types';
 
+import { getOpenRouterXaiRefusal } from '../../openrouter-guard';
 import { GLM_CAPABILITIES } from './capabilities';
 import { parseGlmConfig } from './config';
 
@@ -97,6 +98,14 @@ export class GlmProvider implements IAgentProvider {
     _resumeSessionId?: string,
     options?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
+    const model = options?.model ?? this.model;
+    // xAI refusal is permanent and must not reach the client or the availability failback.
+    // Check the raw id so a bare grok-* is refused before the z-ai/ prefix.
+    const refusal = getOpenRouterXaiRefusal(this.getType(), model);
+    if (refusal) {
+      throw new Error(refusal);
+    }
+
     const apiKey = process.env.GLM_API_KEY;
     if (!apiKey) {
       throw new Error(
@@ -109,7 +118,6 @@ export class GlmProvider implements IAgentProvider {
       baseURL: this.baseURL,
     });
 
-    const model = options?.model ?? this.model;
     // Normalize bare model ids to OpenRouter's z-ai/ namespace.
     // YAML workflows request "glm-5.2"; OpenRouter requires "z-ai/glm-5.2".
     // Already-prefixed ids (e.g. "z-ai/glm-4.6") pass through unchanged.

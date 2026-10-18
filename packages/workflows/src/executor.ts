@@ -14,7 +14,7 @@ import { resolveModelForNode, type ModelOverride } from './model-override';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
-import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
+import { isRegisteredProvider, getRegisteredProviders, resolveProviderId } from '@archon/providers';
 import { classifyError } from './executor-shared';
 import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
 import { resolveEntryLane, DEFAULT_ENGINE_TO_LANE } from './router-dispatcher';
@@ -28,6 +28,16 @@ import {
 import { captureRuntimeRevisions } from './reliability/runtime-revisions';
 import { formatProbeBlock, runFireTimeProbe } from './reliability/fire-time-probe';
 import {
+  alertUnknownSeat,
+  decideSeatGate,
+  getSeatCutoff,
+  getSeatUsageReader,
+  seatsForBindings,
+  unknownSeatReading,
+  type SeatId,
+  type SeatReading,
+} from './reliability/seat-usage';
+import {
   renderCanaryProbeRed,
   renderCanaryProbeWarn,
   sendCanaryTelegramAlert,
@@ -38,6 +48,32 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.executor');
   return cachedLog;
+}
+
+async function readBoundSeats(
+  seatIds: readonly SeatId[]
+): Promise<Partial<Record<SeatId, SeatReading>>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>(resolve => {
+    timer = setTimeout(() => {
+      resolve(null);
+    }, 12_000);
+  });
+  let note = 'seat read timed out';
+  try {
+    const result = await Promise.race([getSeatUsageReader()(seatIds), timeout]);
+    if (result) return result;
+  } catch (err) {
+    getLog().warn({ err: err as Error }, 'workflow.seat_usage_unknown');
+    note = err instanceof Error ? err.message : 'seat read failed';
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  const unknown: Partial<Record<SeatId, SeatReading>> = {};
+  for (const seat of seatIds) {
+    unknown[seat] = unknownSeatReading(seat, note);
+  }
+  return unknown;
 }
 
 async function pageCanaryTelegram(text: string, context: Record<string, unknown>): Promise<void> {
@@ -757,11 +793,14 @@ export async function executeWorkflow(
     modelOverride,
     fallbackModel: 'claude-sonnet-4-5',
   });
-  const resolvedProvider = workflowBinding.provider;
+  // Model resolution above used the id as written (assistants.grok still applies).
+  // Recorded provider ids use the canonical id.
+  const writtenProvider = workflowBinding.provider;
+  const resolvedProvider = resolveProviderId(writtenProvider);
   const resolvedModel = workflowBinding.model;
-  if (!isRegisteredProvider(resolvedProvider)) {
+  if (!isRegisteredProvider(writtenProvider)) {
     throw new Error(
-      `Workflow '${workflow.name}': unknown provider '${resolvedProvider}'. ` +
+      `Workflow '${workflow.name}': unknown provider '${writtenProvider}'. ` +
         `Registered: ${getRegisteredProviders()
           .map(p => p.id)
           .join(', ')}`
@@ -1026,7 +1065,7 @@ export async function executeWorkflow(
 
     const probeDecision = await runFireTimeProbe(deps, {
       workflow: executableWorkflow,
-      workflowProvider: resolvedProvider,
+      workflowProvider: writtenProvider,
       workflowModel: resolvedModel,
       config,
       cwd,
@@ -1098,6 +1137,70 @@ export async function executeWorkflow(
       await deps.store.failWorkflowRun(workflowRun.id, reason);
       await sendCriticalMessage(platform, conversationId, `[ ] **Workflow blocked**: ${reason}`);
       return { success: false, workflowRunId: workflowRun.id, error: reason };
+    }
+
+    // Seat gate: always on (John Ranson, 2026-09-24). There is no off switch.
+    const seatIds = seatsForBindings(probeDecision.bindings);
+    if (seatIds.length > 0) {
+      const readings = await readBoundSeats(seatIds);
+      const cutoff = getSeatCutoff();
+      const seatDecision = decideSeatGate(probeDecision.bindings, readings, cutoff.percent);
+      // UNKNOWN never refuses on its own (a broken probe must not stop all
+      // work), and it is never silent either: log + alert for every bound
+      // seat that could not be measured, regardless of whether ANOTHER seat
+      // in this same run causes a refusal below.
+      for (const seat of seatDecision.unknownSeats) {
+        const note = readings[seat]?.note ?? 'UNKNOWN';
+        getLog().warn(
+          {
+            workflowName: executableWorkflow.name,
+            workflowRunId: workflowRun.id,
+            seat,
+            note,
+          },
+          'workflow.seat_usage_unknown'
+        );
+        await alertUnknownSeat(seat, note, {
+          workflowName: executableWorkflow.name,
+          workflowRunId: workflowRun.id,
+        });
+      }
+      if (seatDecision.refused) {
+        const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}`;
+        getLog().warn(
+          {
+            workflowName: executableWorkflow.name,
+            workflowRunId: workflowRun.id,
+            seat: seatDecision.seat,
+            window: seatDecision.window,
+            usedPercent: seatDecision.usedPercent,
+            cutoffPercent: seatDecision.cutoffPercent,
+          },
+          'workflow.seat_usage_refused'
+        );
+        await deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'dag_workflow_failed',
+            data: {
+              reason: 'seat_usage_refused',
+              detail,
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
+              'workflow_event_persist_failed'
+            );
+          });
+        await deps.store.failWorkflowRun(workflowRun.id, detail);
+        await sendCriticalMessage(
+          platform,
+          conversationId,
+          `Workflow refused: seat ${seatDecision.seat} at ${String(seatDecision.usedPercent)}% of ${seatDecision.window} (cutoff ${String(seatDecision.cutoffPercent)}%)`
+        );
+        return { success: false, workflowRunId: workflowRun.id, error: detail };
+      }
     }
 
     getLog().info(
@@ -1241,7 +1344,7 @@ export async function executeWorkflow(
       cwd,
       executableWorkflow,
       workflowRun,
-      resolvedProvider,
+      writtenProvider,
       resolvedModel,
       artifactsDir,
       logDir,

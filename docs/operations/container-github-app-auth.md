@@ -181,3 +181,82 @@ Not part of this WO, but the outcome to confirm later (WO section 8): an APPROVE
 review exists on a real PR, authored by `thinman-overseer[bot]`, on a PR that
 `bluedevilcollectibles` opened. Until that row exists somewhere observable, the
 capability is built but dark.
+
+## Per-service identities, quota pools, and metering
+
+The source of truth is `SERVICE_GITHUB_AUTH_PRECEDENCE` in
+`packages/core/src/github/service-identity.ts`. First complete match wins; any
+partially configured App step throws and names the missing variables.
+
+| Service | Precedence |
+|---|---|
+| overseer, pr_discovery | service App; shared `GITHUB_APP_*`; existing PAT |
+| merge_manager | `GITHUB_APP_MERGE_MANAGER_*`; `MERGE_MANAGER_GH_TOKEN`; hold |
+| taskmaster | service App; `GITHUB_APP_TASKMASTER_*`; shared `GITHUB_APP_*`; existing PAT |
+| duty_officer, smart_cauldron, run_nodes | service App; `GITHUB_APP_TASKMASTER_*` alias; shared `GITHUB_APP_*`; existing PAT |
+
+The supported override is
+`GITHUB_APP_<SERVICE>_{ID,INSTALLATION_ID,PRIVATE_KEY_PATH}` (or
+`PRIVATE_KEY`). The Taskmaster trio is an explicit alias for Duty Officer,
+Smart Cauldron, and run nodes. The default BDC deployment uses the ONE shared
+thinman-overseer App (4574893, installation153295654) for these services too.
+Merge Manager never uses the reviewing Overseer App or shared user PAT.
+
+Existing shared App configuration becomes eligible for those services after
+the reviewed rebuild; activation must therefore verify this routing change.
+CLI commands resolve credentials per operation through the existing merge guard;
+git's credential helper also resolves at operation time. Parent PAT environment
+values are preserved, and only an explicitly permission-denied CLI call retries
+on the original PAT. Quota backoff is
+shared by `(pool_id, resource)`, so services on one installation share fate
+while `core`, `search`, and `graphql` remain independent. Calls and latest quota
+state are metered by service. An App 403 containing "Resource not accessible by
+integration" retries only that call with the PAT and increments
+`github_app_permission_fallbacks`.
+
+All deployment defaults are empty:
+
+```dotenv
+GITHUB_APP_MERGE_MANAGER_ID=
+GITHUB_APP_MERGE_MANAGER_INSTALLATION_ID=
+GITHUB_APP_MERGE_MANAGER_PRIVATE_KEY_PATH=
+GITHUB_APP_TASKMASTER_ID=
+GITHUB_APP_TASKMASTER_INSTALLATION_ID=
+GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH=
+```
+
+### HUMAN-STEPS
+
+1. Do not use thinmangithub (4572556): it belongs to Vercel, not BDC. No BDC key-generation step exists for it. XO reports the existing thinman-overseer installation pool measured15000/hour after the enterprise upgrade; it is one shared pool, not15000 per service. Recheck capacity with a real authenticated call before activation.
+2. The app currently lacks Issues:write. Issue comments/labels remain on the original user credential via permission fallback unless John separately grants that app permission. Do not change permissions or copy credentials as part of a source repair.
+3. Preserve M-153: review and merge must use distinct identities. The existing dedicated merge PAT remains the merge route, or merge holds if it is absent. Reusing the reviewing App for merge does not satisfy that guard. An optional second BDC App would require John to create it; none is assumed.
+4. XO owns the rebuild and action-time configuration/custody verification after the source merge. The shared App fallback changes effective service routing on that rebuild even without new service-specific environment names. Production authorization, active-work and rollback checks remain separate; this runbook is not execution authority.
+
+### Short-lived CLI command metering
+
+The existing command driver captures gh HTTP diagnostics in memory, consumes
+only response status and quota headers, and discards trace headers/URLs/bodies
+before returning stderr. It persists each observed HTTP response to the existing
+usage tables before exit or the single permission fallback. A command without
+an HTTP response is counted separately as resource `cli` with status0, not as
+a successful API request. Before starting each child it rereads the shared
+pool state for core/graphql/search/cli, so another CLI process cannot ignore a
+recorded exhaustion. This conservative preflight may hold a mixed CLI command
+when any resource in its pool is exhausted. Secondary retry deadlines use
+`backoff:<resource>` state rows without overwriting measured quota remaining.
+Explicit GraphQL integration-permission errors can use the preserved PAT once;
+rate limits and transport failures cannot. No trace or credential values are
+stored by metering. These source changes do not activate credentials or a pool.
+
+The CLI driver leaves stdin inherited for ordinary commands such as `gh pr
+list` and `gh pr view`. It must not read an unused pipe: Smart Cauldron's
+`execFile` callers leave that pipe open. Input is buffered for permission-retry
+replay only when the command declares a stdin source (`--input -`,
+`--body-file -` / `-F -`, API `--field name=@-` / `-F name=@-`,
+`auth login --with-token`, `workflow run --json`, or `gist create -`).
+The focused regression uses the real `execFile` launch with an open stdin pipe;
+it also checks payload forwarding and identical-byte permission retry:
+
+```bash
+bun test ./scripts/github-service-exec.test.ts
+```
