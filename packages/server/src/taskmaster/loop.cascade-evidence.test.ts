@@ -237,4 +237,24 @@ describe('exact cascade-bound fire usefulness evidence', () => {
       })
     ).rejects.toThrow(/^taskmaster_cascade_evidence_unknown$/);
   });
+
+  for (const field of ['cascadeId', 'woId', 'project'] as const) {
+    test(`serialized non-string ${field} is UNKNOWN even if corrupt record agrees`, async () => {
+      seed('actual-run', 'completed');
+      const malformed = { ...identity, [field]: 123 };
+      await expect(
+        defaultGetFireRunEvidence(
+          malformed.woId as string,
+          malformed.cascadeId as string,
+          malformed.project as string,
+          {
+            readCascade: async () => record(malformed as Partial<CascadeRunRecord>),
+            query: async <T>(sql: string, params: unknown[] = []) => ({
+              rows: db.query(sql).all(...(params as string[])) as T[],
+            }),
+          }
+        )
+      ).rejects.toThrow('taskmaster_cascade_evidence_unknown');
+    });
+  }
 });

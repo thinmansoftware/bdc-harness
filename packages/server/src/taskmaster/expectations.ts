@@ -50,7 +50,11 @@ export async function readCascadeWorkflowEvidence(
   deps: CascadeEvidenceDeps = {}
 ): Promise<{ earliestRunId: string; status: string; prOpened: boolean }> {
   try {
-    if (!identity.cascadeId || !identity.woId || !identity.project)
+    if (
+      [identity.cascadeId, identity.woId, identity.project].some(
+        value => typeof value !== 'string' || !value.trim()
+      )
+    )
       throw new Error('missing identity');
     const read = deps.readCascade ?? readCascadeRecordById;
     const query =
