@@ -97,6 +97,26 @@ the test still fails. A synthetic diagnostic control validates bounds and exact
 error preservation; it is not a reproduction of the hosted lock. A later hosted
 pass alone must not be described as a root-cause repair.
 
+A6 eliminated the memory/file confound with a separate raw file/WAL control:
+both finalized old and reopened connections closed strictly without error. The
+adapter control then failed strict close with its own control statement already
+finalized and no open transaction. Routing twenty unfinalized metadata SELECT/
+PRAGMA reads through the existing `pragmaAll` finalization helper made the same
+adapter control pass; deliberately pending caller-owned statements still report
+in-use and remain usable. This supports the metadata-statement lifetime cause
+collectively, not attribution to one uniquely identified statement.
+
+Only resource finalization changed. Former single-row reads retain the first
+row or native null-on-absence result. All351 literal values/order and all93
+write/cached-query calls/order are identical; `query`, `pragmaAll` and `close`
+implementations are byte-identical. Ordinary close/reopen/cleanup retains its
+ordering, method, retry/time bounds and assertions, without strict-close calls.
+Local cap Stop1 passed161/0/840assertions and the Taskmaster group361/0/1461.
+Seven existing SQLite/schema/dispatch suites passed251 applicable tests with
+1106assertions; one unchanged Windows skip covers dangling symlink aliases.
+Fresh hosted Windows/PG/CI, independent review and runtime approval remain
+required; no deployed behavior or registry correction follows from local proof.
+
 ## Publication and rollout
 
 Migration `063_tm_fire_admissions.sql` is additive PostgreSQL DDL; SQLite has an

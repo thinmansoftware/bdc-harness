@@ -3,6 +3,7 @@ import { lstatSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Database } from 'bun:sqlite';
 import { runCascade, readCascadeRecord } from '@archon/smart-cauldron/cascade';
 import type { RunCascadeOptions } from '@archon/smart-cauldron/cascade';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
@@ -207,6 +208,132 @@ test('synthetic cleanup diagnostics preserve the original error and bound owned 
       throw new Error('invalid synthetic diagnostic root');
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('synthetic raw file WAL control closes finalized old and reopened connections', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'tm-cap-legacy-raw-wal-'));
+  try {
+    for (const role of ['old', 'reopened']) {
+      const native = new Database(join(directory, 'isolated.db'));
+      let statement: ReturnType<Database['prepare']> | undefined;
+      try {
+        native.run('PRAGMA journal_mode = WAL');
+        native.run('PRAGMA busy_timeout = 5000');
+        native.run('PRAGMA foreign_keys = ON');
+        statement = native.prepare('SELECT 1 AS value');
+        expect((statement.get() as { value: number }).value).toBe(1);
+        statement.finalize();
+        expect(native.inTransaction).toBe(false);
+        native.close(true);
+        console.info(
+          '[tm-cap-native-close]',
+          JSON.stringify({
+            synthetic: true,
+            role,
+            control: 'raw-file-wal-finalized',
+            outcome: 'returned',
+          })
+        );
+      } finally {
+        statement?.finalize();
+        native.close();
+      }
+    }
+  } finally {
+    if (!directory.startsWith(join(tmpdir(), 'tm-cap-legacy-raw-wal-')))
+      throw new Error('invalid raw WAL diagnostic root');
+    await removeLegacyFixture(directory, { synthetic: true });
+  }
+});
+
+test('synthetic native-close controls distinguish owned statement and connection lifetimes', async () => {
+  const samples: object[] = [];
+  const finalizedControl = new Database(':memory:');
+  const finalizedStatement = finalizedControl.prepare('SELECT 1 AS value');
+  try {
+    expect((finalizedStatement.get() as { value: number }).value).toBe(1);
+    finalizedStatement.finalize();
+    finalizedControl.close(true);
+    console.info(
+      '[tm-cap-native-close]',
+      JSON.stringify({ synthetic: true, role: 'finalized-native-control', outcome: 'returned' })
+    );
+  } finally {
+    finalizedStatement.finalize();
+    finalizedControl.close();
+  }
+  for (const closeMode of ['adapter-default', 'native-strict']) {
+    for (const statementMode of ['pending', 'finalized']) {
+      const directory = mkdtempSync(join(tmpdir(), 'tm-cap-legacy-native-'));
+      try {
+        for (const role of ['old', 'reopened']) {
+          const adapter = new SqliteAdapter(join(directory, 'isolated.db'));
+          // Explicit A5 diagnostic permission: OWN disposable connection only.
+          const native = (adapter as unknown as { db: Database }).db;
+          const statement = native.prepare('SELECT 1 AS value');
+          try {
+            expect(
+              (await adapter.query<{ value: number }>('SELECT 1 AS value')).rows[0]?.value
+            ).toBe(1);
+            expect((statement.get() as { value: number }).value).toBe(1);
+            if (statementMode === 'finalized') statement.finalize();
+            const inTransactionBeforeClose = native.inTransaction;
+            let outcome = 'returned';
+            try {
+              if (closeMode === 'native-strict') native.close(true);
+              else await adapter.close();
+            } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code;
+              const message = error instanceof Error ? error.message : '';
+              if (code === 'SQLITE_BUSY') outcome = 'reported-in-use-code';
+              else if (message === 'database is locked') outcome = 'reported-in-use-message';
+              else throw error;
+            }
+            let statementAfterClose = 'usable';
+            try {
+              statement.get();
+            } catch (error) {
+              const message = error instanceof Error ? error.message : '';
+              statementAfterClose = /finalized/i.test(message)
+                ? 'finalized'
+                : /closed/i.test(message)
+                  ? 'closed'
+                  : 'other-error';
+            }
+            const sample = {
+              synthetic: true,
+              closeMode,
+              statementMode,
+              role,
+              outcome,
+              inTransactionBeforeClose,
+              statementAfterClose,
+            };
+            samples.push(sample);
+            console.info('[tm-cap-native-close]', JSON.stringify(sample));
+            if (closeMode === 'native-strict') {
+              if (statementMode === 'pending') {
+                expect(outcome).toMatch(/^reported-in-use/);
+                expect(statementAfterClose).toBe('usable');
+              } else {
+                expect(outcome).toBe('returned');
+                expect(statementAfterClose).toBe('finalized');
+              }
+            }
+          } finally {
+            // Only the deliberately created control statement is finalized here.
+            statement.finalize();
+            await adapter.close();
+          }
+        }
+      } finally {
+        if (!directory.startsWith(join(tmpdir(), 'tm-cap-legacy-native-')))
+          throw new Error('invalid native diagnostic root');
+        await removeLegacyFixture(directory, { synthetic: true });
+      }
+    }
+  }
+  expect(samples).toHaveLength(8);
 });
 test('production cascade awaits preflight then rebooks actual UTC admission day before a fake effect', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'tm-cap-cascade-'));
