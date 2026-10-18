@@ -68,7 +68,7 @@ async function runGateScript(
 }
 
 describe('already-satisfied lane wiring', () => {
-  it('discovers the 12 affected feature-development lanes', () => {
+  it('discovers the 14 affected feature-development lanes', () => {
     // This list is the ONLY hardcoded part of this file -- LANE_FILES itself is
     // glob-derived, so the per-lane assertions below automatically cover any new
     // lane. Adding a lane therefore fails HERE and nowhere else, which is the
@@ -85,6 +85,7 @@ describe('already-satisfied lane wiring', () => {
       'bdc-feature-development-fusion-cx-kimi.yaml',
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-haiku.yaml',
       'bdc-feature-development-kimi-k3.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',

@@ -185,7 +185,7 @@ const FEATURE_DEV_LANES = [
   join(DEFAULTS_DIR, 'bdc-feature-development-zero.yaml'),
 ];
 
-// All 13 feature-development lanes that carry checkout-repair-target.
+// All 14 feature-development lanes that carry checkout-repair-target.
 // FEATURE_DEV_LANES above stays the existing 9-file subset.
 const REPAIR_COVERAGE_LANES = [
   'bdc-feature-development.yaml',
@@ -197,6 +197,7 @@ const REPAIR_COVERAGE_LANES = [
   'bdc-feature-development-fusion-cx-kimi.yaml',
   'bdc-feature-development-fusion-cx-qwen.yaml',
   'bdc-feature-development-grok.yaml',
+  'bdc-feature-development-haiku.yaml',
   'bdc-feature-development-kimi-k3.yaml',
   'bdc-feature-development-zero-claude.yaml',
   'bdc-feature-development-zero-open.yaml',
@@ -1269,8 +1270,8 @@ describe('Spec-authorized repair onto wo and Cauldron task branches', () => {
     };
   }
 
-  it('keeps ordinary and repair guards in source order on all 13 lanes', () => {
-    expect(REPAIR_COVERAGE_LANES).toHaveLength(13);
+  it('keeps ordinary and repair guards in source order on all 14 lanes', () => {
+    expect(REPAIR_COVERAGE_LANES).toHaveLength(14);
     expect(F6A_VALIDATOR).toContain(ORDINARY_BRANCH_PATTERN);
     expect(F6A_VALIDATOR).not.toContain('wo/');
     expect(F6A_VALIDATOR).not.toContain('archon/task-web-worker');

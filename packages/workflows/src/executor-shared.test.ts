@@ -1125,10 +1125,10 @@ describe('fable apex lane -- build-critical nodes serve claude-fable-5 (M-121 ap
     expect(byId('war-council-validator')?.provider).toBe('claude');
   });
 
-  it('non-build-critical nodes keep their bindings unchanged', () => {
+  it('preserves the commit persona and modernizes the Codex diff-review binding', () => {
     expect(byId('commit-and-push')?.persona).toBe('overseer');
     const diffReview = byId('diff-review');
-    expect(diffReview?.provider).toBe('codex');
-    expect(diffReview?.model).toBe('gpt-5.6-sol');
+    expect(diffReview?.provider).toBe('codex-native-strict');
+    expect(diffReview?.model).toBe('gpt-6-astra');
   });
 });

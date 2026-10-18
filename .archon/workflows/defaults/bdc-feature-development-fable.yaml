@@ -29,7 +29,7 @@ run_authority:
 # All OTHER nodes keep their persona bindings unchanged.
 #
 # APEX COMPOSITION -- M-121 (John, 2026-08-04): this lane is the ladder's TOP. It
-# holds BOTH apex models: gpt-5.6-sol (codex seats below) and real claude-fable-5
+# holds BOTH apex models: gpt-6-astra (codex seats below) and real claude-fable-5
 # (this root + war-council-validator). Sol attempts first at the seats it holds;
 # Fable is the genuine last resort, which keeps Fable usage rare BY CONSTRUCTION
 # rather than by policy. "If these two models cant do it it cant be done" (John).
@@ -2562,8 +2562,8 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -2814,8 +2814,8 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -2977,8 +2977,8 @@ nodes:
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3320,8 +3320,8 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done

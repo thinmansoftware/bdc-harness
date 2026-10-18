@@ -1,6 +1,6 @@
 name: bdc-feature-development-codex-only
 description: |
-  ZERO-CLAUDE Codex lane. All prompt seats on Codex (gpt-5.6-sol). Use when Claude
+  ZERO-CLAUDE Codex lane. All prompt seats on Codex (gpt-6-astra). Use when Claude
   usage is exhausted but OpenAI/Codex quota remains. Model-free *-opr / *-codex
   personas only (F1 invariant). Not dual-cap (still needs Codex).
 
@@ -14,10 +14,10 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Codex build lane: Codex/gpt-5.6-sol is the build default. war-council-validator is
+# Codex build lane: Codex/gpt-6-astra is the build default. war-council-validator is
 # pinned to claude/sonnet on the node. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
-provider: codex
-model: gpt-5.6-sol
+provider: codex-native-strict
+model: gpt-6-astra
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -404,7 +404,7 @@ nodes:
   - id: check-already-satisfied
     persona: war-council-architect-opr
     agent: war-council-architect-opr
-    provider: codex
+    provider: codex-native-strict
     depends_on: [checkout-repair-target]
     task_class: clerical
     prompt: |
@@ -529,7 +529,7 @@ nodes:
     # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
     # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
     # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
-    provider: codex
+    provider: codex-native-strict
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     agent: war-council-architect-opr
@@ -581,7 +581,7 @@ nodes:
     # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
     # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
     # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
-    provider: codex
+    provider: codex-native-strict
     agent: war-council-architect-opr
     depends_on: [plan, checkout-repair-target]
     trigger_rule: all_done
@@ -786,8 +786,8 @@ nodes:
 
   - id: implement
     idle_timeout: 600000
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     depends_on: [prep-dependencies]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -2407,7 +2407,7 @@ nodes:
     # required because persona model WINS over node model on provider claude
     # (persona pin law, wiki doctrine/archon-yaml-authoring 2026-07-02).
     # Superseded by the apex-rung WO (bdc-xo issue #575) when it lands.
-    provider: codex
+    provider: codex-native-strict
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
@@ -2545,7 +2545,7 @@ nodes:
 
   - id: diff-review
     persona: codex-adversarial-reviewer
-    provider: codex
+    provider: codex-native-strict
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -2600,8 +2600,8 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: diff-repair
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -2797,7 +2797,7 @@ nodes:
 
   - id: diff-review-final
     persona: codex-adversarial-reviewer
-    provider: codex
+    provider: codex-native-strict
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -2901,8 +2901,8 @@ nodes:
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
+    model: gpt-6-astra
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
@@ -2962,7 +2962,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     persona: codex-adversarial-reviewer
-    provider: codex
+    provider: codex-native-strict
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3180,7 +3180,7 @@ nodes:
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
     persona: xo-opr
-    provider: codex
+    provider: codex-native-strict
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -3272,7 +3272,7 @@ nodes:
   - id: apply-suggested-fix
     persona: major-build-opr
     agent: major-build-opr
-    provider: codex
+    provider: codex-native-strict
     effort: xhigh
     context: fresh
     depends_on: [pause-gate]
@@ -3308,7 +3308,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     persona: codex-adversarial-reviewer
-    provider: codex
+    provider: codex-native-strict
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
@@ -3356,7 +3356,7 @@ nodes:
 
   - id: decide-push-target
     persona: major-build-opr
-    provider: codex
+    provider: codex-native-strict
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -4221,7 +4221,7 @@ nodes:
 
   - id: build-manifest
     persona: major-build-opr
-    provider: codex
+    provider: codex-native-strict
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical

@@ -370,7 +370,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     provider: cursor
-    model: grok-4.7-high
+    model: grok-4.7-medium
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     depends_on: [checkout-repair-target]
@@ -2552,7 +2552,7 @@ nodes:
 
   - id: diff-review
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -2820,7 +2820,7 @@ nodes:
 
   - id: diff-review-final
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -2986,7 +2986,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3204,7 +3204,7 @@ nodes:
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     persona: xo-opr
     depends_on: [block-reclassify]
     trigger_rule: all_done
@@ -3334,7 +3334,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
