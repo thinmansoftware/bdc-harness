@@ -86,3 +86,52 @@ protocols. They cover empty, nested, executable, binary, ordering, additions,
 deletions and deterministic deduplication. Trusted Git is required; no skipped
 check may stand in for this comparison. The source-only constructor does not
 resolve the runtime execution barrier, inventory custody or test-worker gates.
+
+## Standalone capture prototype
+
+The source-only capture prototype uses a fixed synchronous writer, not a model.
+It is not connected to authenticated workers, registry, workflows or admission.
+Previously submitted asynchronous I/O and Docker API operations that complete
+after a timed-out client remain separate admission questions. Pausing tasks and
+matching exports are not a claim of a general immutable filesystem snapshot.
+
+teetime_snapshot_exporter.py traverses a readonly volume with bounded Linux
+descriptor-relative no-follow operations. Underlying .codex/.agents directories
+must be ordinary and empty; links, special entries, multiple hard links and
+out-of-scope files fail. A canonical framed inventory precedes bounded USTAR data.
+The controller independently checks scope and exact inventory through the existing
+parser, then computes the pure Git tree identity. Ignore rules are never loaded.
+
+probe_teetime_snapshot_capture.py accepts --docker, --image (exact immutable ID),
+--source (exact prototype commit) and one fixed --case. It requires an image with
+TEETIME_CAPTURE_SOURCE_SHA and matching immutable helper hashes. This is a
+prototype-specific derivative, not a full-source image or an authenticated image
+promotion. Before volume copy-up, its image /workspace must be empty and owned by
+UID1001. Runtime containers use no network, credentials, host binds or Docker socket.
+The worker owns one unique local volume; the separate exporter mounts it readonly.
+Exact configurations and exclusive volume references are checked before workloads
+start, then before/after each paused export. Exporter code lives outside the volume.
+
+An independently pinned-controller watchdog arms before resources are created.
+The controller stops Docker operations after25 seconds; cleanup starts no later
+than45 seconds, verifies controller exit (terminating only that pinned process if
+necessary), and reconciles owned resources until absence is observed twice.
+There is no unpause path. Result receipts are retained in the unique owner folder.
+These bounds are prototype budgets, not changes to the authenticated launcher.
+
+Cases: clean captures twice with an advancing-then-paused counter; shadow,
+symlink and hardlink require the exact expected rejection; unpaused must fail
+before export; delayed-create must reject creation after its execution cutoff.
+forced-exit and controller-stall intentionally terminate the operator process;
+their result is the independent watchdog receipt plus fresh owned-resource absence,
+not an exit0 controller result. Never treat generic process failure as a successful
+negative test. Run each once after source review, not as an automatic retry loop.
+
+Required Linux unit command (no skipping on Windows):
+
+```text
+python3 -m unittest discover -s /app/scripts/staging -p test_teetime_snapshot_exporter.py
+```
+
+The initial tests failed before implementation. Local controller tests pass;
+Linux filesystem tests and actual-daemon cases are not yet claimed as passed.
