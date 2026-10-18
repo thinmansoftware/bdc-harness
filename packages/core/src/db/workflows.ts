@@ -25,6 +25,11 @@ import type {
   TerminalWorkflowPersistence,
 } from '@archon/workflows/reliability/types';
 import { createLogger } from '@archon/paths';
+import { randomUUID } from 'node:crypto';
+import {
+  withOverseerControlPlaneImmediateTransaction,
+  type OverseerControlPlaneQuery,
+} from './overseer-control-plane-sqlite';
 
 /**
  * workflow_name of the synthetic terminal parent rows minted for discovery-sourced
@@ -923,6 +928,14 @@ export class CauldronDrainingError extends Error {
   }
 }
 
+export class CauldronDrainOwnershipConflict extends Error {
+  readonly code = 'cauldron_drain_ownership_conflict' as const;
+  constructor() {
+    super('cauldron_drain_ownership_conflict');
+    this.name = 'CauldronDrainOwnershipConflict';
+  }
+}
+
 export interface CauldronDrainState {
   mode: CauldronDrainMode;
   activeLeaseCount: number;
@@ -935,6 +948,7 @@ export interface CauldronDrainState {
   /** True only while draining with zero pending, zero running, and zero live leases. */
   recreateSafe: boolean;
   clearOnBoot: boolean;
+  drainToken: string | null;
   updatedAt: string | null;
 }
 
@@ -951,7 +965,10 @@ export async function getCauldronDrainState(
       mode: CauldronDrainMode;
       updated_at: string | Date | null;
       clear_on_boot: number | boolean | null;
-    }>('SELECT mode, updated_at, clear_on_boot FROM remote_agent_cauldron_control WHERE id = 1');
+      drain_token: string | null;
+    }>(
+      'SELECT mode, updated_at, clear_on_boot, drain_token FROM remote_agent_cauldron_control WHERE id = 1'
+    );
     const leases = await query<{ active_lease_count: number | string }>(
       `SELECT COUNT(*) AS active_lease_count
        FROM remote_agent_run_leases l
@@ -1007,6 +1024,7 @@ export async function getCauldronDrainState(
         runningRunCount === 0 &&
         activeLeaseCount === 0,
       clearOnBoot,
+      drainToken: controlRow?.drain_token ?? null,
       updatedAt:
         controlRow?.updated_at instanceof Date
           ? controlRow.updated_at.toISOString()
@@ -1022,15 +1040,18 @@ export async function applyCauldronDrainClearOnBoot(
   // Read and conditional clear share one transaction. A foreign actor can
   // replace the rebuild drain between two transactions; matching the values
   // just read refuses to clear that newer drain.
-  return db.withTransaction(async query => {
+  const clear = async (
+    query: OverseerControlPlaneQuery
+  ): Promise<'cleared' | 'persisted' | 'normal'> => {
     const lockSuffix = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
     const current = await query<{
       mode: CauldronDrainMode;
       clear_on_boot: number | boolean | null;
       updated_at: string | Date | null;
       updated_by: string | null;
+      drain_token: string | null;
     }>(
-      `SELECT mode, clear_on_boot, updated_at, updated_by
+      `SELECT mode, clear_on_boot, updated_at, updated_by, drain_token
        FROM remote_agent_cauldron_control
        WHERE id = 1${lockSuffix}`
     );
@@ -1044,13 +1065,21 @@ export async function applyCauldronDrainClearOnBoot(
        SET mode = 'normal',
            updated_at = $1,
            updated_by = $2,
-           clear_on_boot = 0
+           clear_on_boot = 0,
+           drain_token = NULL
        WHERE id = 1
          AND mode = 'draining'
          AND clear_on_boot = 1
          AND updated_at = $3
-         AND updated_by = $4`,
-      [updatedAt, 'boot', row?.updated_at ?? null, row?.updated_by ?? null]
+         AND updated_by = $4
+         AND (drain_token = $5 OR (drain_token IS NULL AND $5 IS NULL))`,
+      [
+        updatedAt,
+        'boot',
+        row?.updated_at ?? null,
+        row?.updated_by ?? null,
+        row?.drain_token ?? null,
+      ]
     );
     if (update.rowCount !== 1) {
       getLog().warn({}, 'drain_clear_skipped_foreign_drain');
@@ -1063,7 +1092,10 @@ export async function applyCauldronDrainClearOnBoot(
       ['draining', 'normal', 'boot', 'clear_on_boot after restart', updatedAt]
     );
     return 'cleared';
-  });
+  };
+  return db.dialect === 'sqlite'
+    ? withOverseerControlPlaneImmediateTransaction(db, clear)
+    : db.withTransaction(clear);
 }
 
 export async function setCauldronDrainMode(data: {
@@ -1072,37 +1104,61 @@ export async function setCauldronDrainMode(data: {
   reason: string | null;
   updatedAt: string;
   clearOnBoot?: boolean;
-}): Promise<{ changed: boolean; mode: CauldronDrainMode }> {
+  expectedDrainToken?: string;
+}): Promise<{ changed: boolean; mode: CauldronDrainMode; acquiredDrainToken: string | null }> {
   const db = getDatabase();
   const clearOnBoot = data.mode === 'normal' ? 0 : data.clearOnBoot ? 1 : 0;
-  return db.withTransaction(async query => {
+  const transition = async (
+    query: OverseerControlPlaneQuery
+  ): Promise<{ changed: boolean; mode: CauldronDrainMode; acquiredDrainToken: string | null }> => {
     const lockSuffix = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
     const current = await query<{
       mode: CauldronDrainMode;
       clear_on_boot: number | boolean | null;
-    }>(`SELECT mode, clear_on_boot FROM remote_agent_cauldron_control WHERE id = 1${lockSuffix}`);
+      drain_token: string | null;
+    }>(
+      `SELECT mode, clear_on_boot, drain_token FROM remote_agent_cauldron_control WHERE id = 1${lockSuffix}`
+    );
+    if (!current.rows[0]) throw new CauldronDrainOwnershipConflict();
     const currentMode = current.rows[0]?.mode ?? 'normal';
+    const currentToken = current.rows[0]?.drain_token ?? null;
+    if (
+      data.expectedDrainToken !== undefined &&
+      (data.mode !== 'normal' ||
+        currentMode !== 'draining' ||
+        currentToken !== data.expectedDrainToken)
+    ) {
+      throw new CauldronDrainOwnershipConflict();
+    }
     const currentClearOnBoot = numericCount(current.rows[0]?.clear_on_boot) === 1 ? 1 : 0;
     // An existing drain is not ours to retarget. A second draining request,
     // including clearOnBoot:true from a rebuild script, must not adopt the
     // row, rewrite clear_on_boot, or append a transition event.
     if (currentMode === 'draining' && data.mode === 'draining') {
-      return { changed: false, mode: data.mode };
+      return { changed: false, mode: data.mode, acquiredDrainToken: null };
     }
     if (currentMode === data.mode && currentClearOnBoot === clearOnBoot) {
-      return { changed: false, mode: data.mode };
+      return { changed: false, mode: data.mode, acquiredDrainToken: null };
     }
     const modeChanged = currentMode !== data.mode;
-    await query(
-      `INSERT INTO remote_agent_cauldron_control (id, mode, updated_at, updated_by, clear_on_boot)
-       VALUES (1, $1, $2, $3, $4)
-       ON CONFLICT (id) DO UPDATE SET
-         mode = EXCLUDED.mode,
-         updated_at = EXCLUDED.updated_at,
-         updated_by = EXCLUDED.updated_by,
-         clear_on_boot = EXCLUDED.clear_on_boot`,
-      [data.mode, data.updatedAt, data.actor, clearOnBoot]
+    const acquiredDrainToken =
+      currentMode === 'normal' && data.mode === 'draining' ? randomUUID() : null;
+    const updated = await query(
+      `UPDATE remote_agent_cauldron_control
+       SET mode = $1, updated_at = $2, updated_by = $3, clear_on_boot = $4, drain_token = $5
+       WHERE id = 1 AND mode = $6
+         AND (drain_token = $7 OR (drain_token IS NULL AND $7 IS NULL))`,
+      [
+        data.mode,
+        data.updatedAt,
+        data.actor,
+        clearOnBoot,
+        acquiredDrainToken,
+        currentMode,
+        currentToken,
+      ]
     );
+    if (updated.rowCount !== 1) throw new CauldronDrainOwnershipConflict();
     if (modeChanged) {
       await query(
         `INSERT INTO remote_agent_cauldron_control_events
@@ -1111,8 +1167,11 @@ export async function setCauldronDrainMode(data: {
         [currentMode, data.mode, data.actor, data.reason, data.updatedAt]
       );
     }
-    return { changed: true, mode: data.mode };
-  });
+    return { changed: true, mode: data.mode, acquiredDrainToken };
+  };
+  return db.dialect === 'sqlite'
+    ? withOverseerControlPlaneImmediateTransaction(db, transition)
+    : db.withTransaction(transition);
 }
 
 interface ExpiredRunLeaseRow {

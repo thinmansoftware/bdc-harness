@@ -3,9 +3,9 @@
  * docker, curl, git, sqlite3, df, and flock record every invocation.
  */
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
-import { chmod, mkdtemp, rm, writeFile, readFile, mkdir } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative, isAbsolute } from 'node:path';
 
 const SCRIPT = join(import.meta.dir, 'rebuild-archon.sh');
 
@@ -13,10 +13,25 @@ let root: string;
 let bin: string;
 let log: string;
 let curlCount: string;
+const acquiredToken = '11111111-1111-4111-8111-111111111111';
+const replacementToken = '22222222-2222-4222-8222-222222222222';
+const bashPath = (path: string): string =>
+  path
+    .replaceAll('\\', '/')
+    .replace(/^([A-Za-z]):/, (_match, drive: string) => `/${drive.toLowerCase()}`);
+
+async function cleanupRoot(): Promise<void> {
+  if (!root) return;
+  const owned = relative(await realpath(tmpdir()), await realpath(root));
+  if (owned.startsWith('..') || isAbsolute(owned) || !owned.startsWith('rebuild-archon-'))
+    throw new Error('unsafe rebuild fixture cleanup');
+  await rm(root, { recursive: true, force: true });
+  root = '';
+}
 
 async function writeStub(name: string, body: string): Promise<void> {
   const path = join(bin, name);
-  await writeFile(path, body, { mode: 0o755 });
+  await writeFile(path, body.replaceAll(root, bashPath(root)), { mode: 0o755 });
   await chmod(path, 0o755);
 }
 
@@ -31,7 +46,21 @@ async function setup(opts: {
   initialMode?: 'normal' | 'draining';
   drainStatus?: number;
   healthOk?: boolean;
+  replacementDrain?: boolean;
+  drainTransportFail?: boolean;
+  invalidGrant?:
+    | 'missing'
+    | 'malformed'
+    | 'invalid_json'
+    | 'duplicate'
+    | 'trailing'
+    | 'nonfinite'
+    | 'array'
+    | 'unsuccessful'
+    | 'changed_number'
+    | 'unowned_grant';
 }): Promise<void> {
+  await cleanupRoot();
   root = await mkdtemp(join(tmpdir(), 'rebuild-archon-'));
   bin = join(root, 'bin');
   log = join(root, 'calls.log');
@@ -50,6 +79,35 @@ async function setup(opts: {
   const initialMode = opts.initialMode ?? 'normal';
   const drainStatus = opts.drainStatus ?? 200;
   const healthCode = opts.healthOk === false ? '503' : '200';
+  const replacement = opts.replacementDrain ? '1' : '0';
+  const transportFail = opts.drainTransportFail ? '1' : '0';
+  const replacementFlag = join(root, 'replacement-drain');
+  const grant =
+    opts.changed === false
+      ? 'null'
+      : JSON.stringify(opts.invalidGrant === 'malformed' ? 'invalid' : acquiredToken);
+  let grantResponse =
+    opts.invalidGrant === 'invalid_json'
+      ? 'not-json'
+      : JSON.stringify({
+          success: true,
+          changed: opts.changed !== false,
+          mode: 'draining',
+          drainToken: opts.replacementDrain ? replacementToken : acquiredToken,
+          ...(opts.invalidGrant === 'missing' ? {} : { acquiredDrainToken: JSON.parse(grant) }),
+        });
+  if (opts.invalidGrant === 'duplicate')
+    grantResponse = grantResponse.replace('"changed":true', '"changed":true,"changed":true');
+  if (opts.invalidGrant === 'trailing') grantResponse += '{}';
+  if (opts.invalidGrant === 'nonfinite')
+    grantResponse = grantResponse.replace('"success":true', '"extra":NaN,"success":true');
+  if (opts.invalidGrant === 'array') grantResponse = '[]';
+  if (opts.invalidGrant === 'unsuccessful')
+    grantResponse = grantResponse.replace('"success":true', '"success":false');
+  if (opts.invalidGrant === 'changed_number')
+    grantResponse = grantResponse.replace('"changed":true', '"changed":1');
+  if (opts.invalidGrant === 'unowned_grant')
+    grantResponse = grantResponse.replace('"changed":true', '"changed":false');
 
   await writeStub(
     'flock',
@@ -94,9 +152,19 @@ if [ -n "$data" ]; then
   status=200
   if [[ "$data" == *'clearOnBoot":true'* || "$data" == *'clearOnBoot:true'* ]]; then
     status=${drainStatus}
-    resp='{"changed":${changed},"mode":"draining"}'
+    resp='${grantResponse}'
+    if [ "${transportFail}" = "1" ]; then exit 56; fi
   elif [[ "$data" == *'draining":false'* || "$data" == *'draining": false'* ]]; then
     resp='{"changed":true,"mode":"normal"}'
+    if [ -f "${replacementFlag}" ]; then
+      if [[ "$data" == *'"expectedDrainToken":"${acquiredToken}"'* ]]; then
+        status=409
+        resp='{"error":"cauldron_drain_ownership_conflict"}'
+      else
+        printf '%s\\n' INCIDENT_CLEARED >> "${log}"
+        rm -f "${replacementFlag}"
+      fi
+    fi
   else
     resp='{"changed":${changed},"mode":"draining"}'
   fi
@@ -111,6 +179,7 @@ if [ "$seen" = "0" ]; then
   exit 0
 fi
 printf '%s\\n' POLL_LOOP >> "${log}"
+if [ "${replacement}" = "1" ]; then touch "${replacementFlag}"; fi
 n=$(cat "${curlCount}")
 n=$((n + 1))
 printf '%s' "$n" > "${curlCount}"
@@ -152,24 +221,45 @@ exit 0
   await chmod(prune, 0o755);
 }
 
+function spawnScript(
+  args: string[],
+  extraEnv: Record<string, string> = {}
+): Bun.Subprocess<'ignore', 'pipe', 'pipe'> {
+  return Bun.spawn(
+    [
+      'bash',
+      '-c',
+      `export PATH="$REBUILD_STUB_BIN:$PATH"; for tool in docker curl git sqlite3 df flock; do [ "$(command -v "$tool")" = "$REBUILD_STUB_BIN/$tool" ] || exit 97; done; printf '%s' "$$" > "$REBUILD_TEST_PID"; exec bash "$REBUILD_TEST_SCRIPT" "$@"`,
+      'rebuild-fixture',
+      ...args,
+    ],
+    {
+      env: {
+        ...process.env,
+        REBUILD_STUB_BIN: bashPath(bin),
+        REBUILD_TEST_SCRIPT: bashPath(SCRIPT),
+        REBUILD_TEST_PID: bashPath(join(root, 'script.pid')),
+        REBUILD_LOCK_FILE: bashPath(join(root, 'rebuild.lock')),
+        REBUILD_REPO_DIR: bashPath(root),
+        REBUILD_DB: bashPath(join(root, 'archon.db')),
+        REBUILD_PRUNE_SCRIPT: bashPath(join(root, 'prune.sh')),
+        REBUILD_PYTHON:
+          process.env.REBUILD_PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3'),
+        REBUILD_API_BASE: 'http://127.0.0.1:3090',
+        ...extraEnv,
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+      stdin: 'ignore',
+    }
+  );
+}
+
 async function runScript(
   args: string[],
   extraEnv: Record<string, string> = {}
 ): Promise<{ exitCode: number; stdout: string; stderr: string; calls: string }> {
-  const proc = Bun.spawn(['bash', SCRIPT, ...args], {
-    env: {
-      ...process.env,
-      PATH: `${bin}:${process.env.PATH ?? ''}`,
-      REBUILD_LOCK_FILE: join(root, 'rebuild.lock'),
-      REBUILD_REPO_DIR: root,
-      REBUILD_DB: join(root, 'archon.db'),
-      REBUILD_PRUNE_SCRIPT: join(root, 'prune.sh'),
-      REBUILD_API_BASE: 'http://127.0.0.1:3090',
-      ...extraEnv,
-    },
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
+  const proc = spawnScript(args, extraEnv);
   const exitCode = await proc.exited;
   const stdout = await new Response(proc.stdout).text();
   const stderr = await new Response(proc.stderr).text();
@@ -182,10 +272,67 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (root) await rm(root, { recursive: true, force: true });
+  await cleanupRoot();
 });
 
 describe('rebuild-archon.sh', () => {
+  test('missing Python refuses before Docker or drain and lost acquisition response never guesses cleanup', async () => {
+    const missing = await runScript([], { REBUILD_PYTHON: 'missing-fixture-python-executable' });
+    expect(missing.exitCode).toBe(1);
+    expect(missing.stdout).toContain('ABORT_PYTHON3_REQUIRED');
+    expect(missing.calls).toBe('');
+    await setup({ drainTransportFail: true });
+    const lost = await runScript([]);
+    expect(lost.exitCode).toBe(1);
+    expect(lost.stdout).toContain('ABORT_DRAIN_OWNERSHIP_UNKNOWN');
+    expect(lost.calls).not.toContain('draining":false');
+    expect(lost.calls).not.toContain('compose build');
+  });
+  for (const options of [
+    { readyOn: 99 },
+    { dirty: true },
+    { upFails: true },
+    { healthOk: false },
+    {},
+  ]) {
+    test(`replacement incident drain survives automatic cleanup ${JSON.stringify(options)}`, async () => {
+      await setup({ ...options, replacementDrain: true });
+      const result = await runScript(
+        ['--poll-sec', '0', '--drain-timeout-min', 'readyOn' in options ? '0' : '5'],
+        { REBUILD_HEALTH_TIMEOUT_SEC: '1' }
+      );
+      expect(result.exitCode).not.toBe(97);
+      expect(result.calls).not.toContain('INCIDENT_CLEARED');
+      const clears = result.calls
+        .split('\n')
+        .filter(line => line.startsWith('curl ') && line.includes('draining":false'));
+      expect(clears.length).toBeGreaterThan(0);
+      for (const clear of clears)
+        expect(clear).toContain(`"expectedDrainToken":"${acquiredToken}"`);
+      expect(result.stdout).not.toContain('DRAIN_CLEARED_BY_SCRIPT');
+    });
+  }
+  for (const invalidGrant of [
+    'missing',
+    'malformed',
+    'invalid_json',
+    'duplicate',
+    'trailing',
+    'nonfinite',
+    'array',
+    'unsuccessful',
+    'changed_number',
+    'unowned_grant',
+  ] as const) {
+    test(`invalid acquisition proof refuses build and unconditional cleanup (${invalidGrant})`, async () => {
+      await setup({ invalidGrant });
+      const result = await runScript(['--poll-sec', '0']);
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain('ABORT_DRAIN_OWNERSHIP_UNKNOWN');
+      expect(result.calls).not.toContain('compose build');
+      expect(result.calls).not.toContain('draining":false');
+    });
+  }
   test('rebuild_script_drains_before_build', async () => {
     const { exitCode, stdout, calls } = await runScript([
       '--poll-sec',
@@ -326,38 +473,50 @@ describe('rebuild-archon.sh', () => {
       ['SIGTERM', 143],
     ] as const) {
       await setup({ readyOn: 99 });
-      const proc = Bun.spawn(['bash', SCRIPT, '--poll-sec', '30', '--drain-timeout-min', '10'], {
-        env: {
-          ...process.env,
-          PATH: `${bin}:${process.env.PATH ?? ''}`,
-          REBUILD_LOCK_FILE: join(root, 'rebuild.lock'),
-          REBUILD_REPO_DIR: root,
-          REBUILD_DB: join(root, 'archon.db'),
-          REBUILD_PRUNE_SCRIPT: join(root, 'prune.sh'),
-          REBUILD_API_BASE: 'http://127.0.0.1:3090',
-        },
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      const started = Date.now();
-      let sawPoll = false;
-      while (Date.now() - started < 10000) {
-        const calls = await readFile(log, 'utf8').catch(() => '');
-        if (calls.includes('POLL_LOOP')) {
-          sawPoll = true;
-          break;
+      // Short, real sleeps bound Bash's deferred trap handling without changing
+      // the production polling interval or simulating the signal itself.
+      await writeStub(
+        'sleep',
+        '#!/usr/bin/env bash\n"$REBUILD_PYTHON" -c "import time; time.sleep(0.1)"\n'
+      );
+      const proc = spawnScript(['--poll-sec', '30', '--drain-timeout-min', '10']);
+      const output = [new Response(proc.stdout).text(), new Response(proc.stderr).text()];
+      let exited = false;
+      try {
+        const started = Date.now();
+        let sawPoll = false;
+        while (Date.now() - started < 10000) {
+          const calls = await readFile(log, 'utf8').catch(() => '');
+          if (calls.includes('POLL_LOOP')) {
+            sawPoll = true;
+            break;
+          }
+          await Bun.sleep(50);
         }
-        await Bun.sleep(50);
+        expect(sawPoll).toBe(true);
+        const pid = await readFile(join(root, 'script.pid'), 'utf8');
+        if (!/^[1-9][0-9]*$/.test(pid)) throw new Error('invalid owned fixture process id');
+        const sent = Bun.spawnSync(
+          ['bash', '-c', 'kill -s "$1" "$2"', 'signal-fixture', signal.slice(3), pid],
+          { stdout: 'pipe', stderr: 'pipe' }
+        );
+        expect(sent.exitCode).toBe(0);
+        const exitCode = await proc.exited;
+        exited = true;
+        const calls = await readFile(log, 'utf8');
+        expect(exitCode).toBe(code);
+        const undrains = calls.split('\n').filter(line => line.includes('draining":false'));
+        expect(undrains).toHaveLength(1);
+        expect(undrains[0]).toContain(`"expectedDrainToken":"${acquiredToken}"`);
+        expect(calls).not.toContain('compose build app');
+        expect(calls).not.toContain('compose up -d app');
+      } finally {
+        if (!exited) {
+          proc.kill('SIGKILL');
+          await proc.exited;
+        }
+        await Promise.all(output);
       }
-      expect(sawPoll).toBe(true);
-      proc.kill(signal);
-      const exitCode = await proc.exited;
-      const calls = await readFile(log, 'utf8');
-      expect(exitCode).toBe(code);
-      const undrains = calls.split('\n').filter(line => line.includes('draining":false'));
-      expect(undrains).toHaveLength(1);
-      expect(calls).not.toContain('compose build app');
-      expect(calls).not.toContain('compose up -d app');
     }
   });
 

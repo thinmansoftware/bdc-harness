@@ -62,6 +62,26 @@ bash deploy/rebuild-archon.sh --help
 The script takes an exclusive flock on `/opt/bdc/archon-data/.rebuild.lock`.
 A second invocation prints `LOCKED` and exits 75.
 
+Python 3 is a new host prerequisite for strict acquisition-response parsing.
+The default executable is `python3`; `REBUILD_PYTHON` may name one executable
+path. Missing Python refuses before Docker or drain calls. Host availability has
+not been verified by the source tests.
+
+Each new drain generation receives a server UUID. The POST response's
+`acquiredDrainToken` is the acquisition grant; the separately observed
+`drainToken` may already describe a replacement and must never grant ownership.
+An already-draining request returns no grant and cannot adopt the drain.
+Every automatic script clear sends its captured `expectedDrainToken`; the
+database compares it atomically. HTTP 409 means ownership was lost or the drain
+already cleared. Cleanup never retries unconditionally. Explicit authenticated
+operator clearing without a condition remains available.
+
+Malformed, missing, duplicate-key, or uncertain acquisition proof prints
+`ABORT_DRAIN_OWNERSHIP_UNKNOWN` and refuses build. The request may have taken
+effect: inspect the authenticated drain state and reconcile ownership manually.
+The script cannot safely guess an automatic clear. A failed cleanup prints
+`DRAIN_CLEAR_UNCONFIRMED`; a lost generation prints `DRAIN_OWNERSHIP_LOST`.
+
 Exit codes:
 
   0  rebuild completed
@@ -74,7 +94,15 @@ rebuild log, and pin retention stay with bdc-xo#2306.
 
 ## PR #949 rollout
 
-PR #949's own rollout needs a manual M-181 rebuild. The running pre-#949
-container reports no `recreateSafe` field, so this script would poll for 120
-minutes, undrain, and exit 3. Draining before that manual rebuild leaves a
-drain the old container's boot cannot clear.
+An older API cannot grant generation-fenced ownership. This script fails closed
+when that contract is absent; its first activation needs a separately reviewed
+bootstrap path. Migration 066 adds nullable generation ownership without
+backfilling legacy drains. Boot clears only a matching rebuild generation;
+incident drains remain in force. Older scripts that clear unconditionally remain
+outside this guarantee.
+
+This document grants no deployment authority. Any production rebuild requires
+the current environment- and commit-scoped approval and deployment evidence.
+Historical M-181 entries do not authorize a new rebuild. Host installation,
+rebuild logging, pin retention, automatic run recovery, and a recreate reservation
+remain separate work; `recreateSafe` is an observation, not a reservation.

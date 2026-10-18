@@ -30,6 +30,11 @@ export const drainBodySchema = z
     draining: z.boolean(),
     reason: z.string().trim().max(500).optional(),
     clearOnBoot: z.boolean().default(false),
+    expectedDrainToken: z.string().uuid().optional(),
+  })
+  .refine(body => !body.draining || body.expectedDrainToken === undefined, {
+    message: 'expectedDrainToken is only valid when clearing drain',
+    path: ['expectedDrainToken'],
   })
   .openapi('AdminDrainBody');
 
@@ -47,6 +52,8 @@ export const drainResponseSchema = z
     survivingRunCount: z.number().int().nonnegative(),
     activeRunIds: z.array(z.string()),
     clearOnBoot: z.boolean(),
+    drainToken: z.string().uuid().nullable(),
+    acquiredDrainToken: z.string().uuid().nullable().optional(),
     updatedAt: z.string().nullable(),
   })
   .openapi('AdminDrainResponse');

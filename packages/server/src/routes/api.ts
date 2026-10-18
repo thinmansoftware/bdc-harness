@@ -1961,6 +1961,7 @@ const adminDrainRoute = createRoute({
       description: 'Drain state updated',
     },
     400: jsonError('Bad request'),
+    409: jsonError('Drain ownership changed or is no longer active'),
     500: jsonError('Server error'),
   },
 });
@@ -6555,10 +6556,19 @@ export function registerApiRoutes(
         reason: body.reason ?? null,
         updatedAt,
         clearOnBoot: body.clearOnBoot,
+        expectedDrainToken: body.expectedDrainToken,
       });
       const state = await workflowDb.getCauldronDrainState(updatedAt);
-      return c.json({ success: true, changed: transition.changed, ...state });
+      return c.json({
+        success: true,
+        changed: transition.changed,
+        ...state,
+        acquiredDrainToken: transition.acquiredDrainToken,
+      });
     } catch (error) {
+      if (error instanceof workflowDb.CauldronDrainOwnershipConflict) {
+        return apiError(c, 409, 'cauldron_drain_ownership_conflict');
+      }
       getLog().error({ err: error }, 'admin_drain_api_failed');
       return apiError(c, 500, 'Failed to update drain state');
     }

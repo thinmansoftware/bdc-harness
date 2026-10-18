@@ -2468,6 +2468,82 @@ describe('Cauldron drain mode', () => {
     activeDatabase = defaultMockDatabase;
   });
 
+  test('concurrent rebuild acquisitions grant exactly one generation without adopting it', async () => {
+    const sqlite = new SqliteAdapter(':memory:');
+    activeDatabase = sqlite;
+    try {
+      const request = {
+        mode: 'draining' as const,
+        actor: 'rebuild',
+        reason: 'fixture',
+        updatedAt: new Date().toISOString(),
+        clearOnBoot: true,
+      };
+      const results = await Promise.all([
+        setCauldronDrainMode(request),
+        setCauldronDrainMode(request),
+      ]);
+      const grants = results.filter(result => result.acquiredDrainToken);
+      expect(grants).toHaveLength(1);
+      expect(grants[0]?.acquiredDrainToken).toMatch(/^[0-9a-f-]{36}$/);
+      expect(results.filter(result => !result.changed)).toEqual([
+        { changed: false, mode: 'draining', acquiredDrainToken: null },
+      ]);
+      expect(await getCauldronDrainState()).toMatchObject({
+        drainToken: grants[0]?.acquiredDrainToken,
+      });
+    } finally {
+      await sqlite.close();
+    }
+  });
+
+  test('stale generation cannot clear a replacement incident drain or append an event', async () => {
+    const sqlite = new SqliteAdapter(':memory:');
+    activeDatabase = sqlite;
+    try {
+      const request = { actor: 'operator', reason: 'fixture', updatedAt: new Date().toISOString() };
+      const first = await setCauldronDrainMode({ ...request, mode: 'draining', clearOnBoot: true });
+      await setCauldronDrainMode({ ...request, mode: 'normal' });
+      const incident = await setCauldronDrainMode({ ...request, mode: 'draining' });
+      expect(first.acquiredDrainToken).not.toBe(incident.acquiredDrainToken);
+      const before = await sqlite.query('SELECT * FROM remote_agent_cauldron_control_events');
+      await expect(
+        setCauldronDrainMode({
+          ...request,
+          mode: 'normal',
+          expectedDrainToken: first.acquiredDrainToken ?? undefined,
+        })
+      ).rejects.toMatchObject({
+        code: 'cauldron_drain_ownership_conflict',
+      });
+      expect(await getCauldronDrainState()).toMatchObject({
+        mode: 'draining',
+        clearOnBoot: false,
+        drainToken: incident.acquiredDrainToken,
+      });
+      expect(
+        (await sqlite.query('SELECT * FROM remote_agent_cauldron_control_events')).rows
+      ).toEqual(before.rows);
+      await expect(
+        setCauldronDrainMode({
+          ...request,
+          mode: 'normal',
+          expectedDrainToken: incident.acquiredDrainToken ?? undefined,
+        })
+      ).resolves.toMatchObject({ changed: true, acquiredDrainToken: null });
+      await expect(
+        setCauldronDrainMode({
+          ...request,
+          mode: 'normal',
+          expectedDrainToken: incident.acquiredDrainToken ?? undefined,
+        })
+      ).rejects.toMatchObject({ code: 'cauldron_drain_ownership_conflict' });
+      expect(await getCauldronDrainState()).toMatchObject({ mode: 'normal', drainToken: null });
+    } finally {
+      await sqlite.close();
+    }
+  });
+
   test('reports durable mode, active leases and runs, and conservative drained state', async () => {
     mockTransactionQuery
       .mockResolvedValueOnce(createQueryResult([{ mode: 'draining', updated_at: 'now' }]))
@@ -2490,6 +2566,7 @@ describe('Cauldron drain mode', () => {
       recreateSafe: false,
       clearOnBoot: false,
       updatedAt: 'now',
+      drainToken: null,
     });
   });
 
@@ -2506,7 +2583,7 @@ describe('Cauldron drain mode', () => {
         reason: 'maintenance',
         updatedAt: '2026-07-09T20:00:00.000Z',
       })
-    ).resolves.toEqual({ changed: true, mode: 'draining' });
+    ).resolves.toEqual({ changed: true, mode: 'draining', acquiredDrainToken: expect.any(String) });
     expect(mockTransactionQuery.mock.calls[1]?.[0]).toContain('remote_agent_cauldron_control');
     expect(mockTransactionQuery.mock.calls[2]?.[0]).toContain(
       'remote_agent_cauldron_control_events'
@@ -2523,7 +2600,7 @@ describe('Cauldron drain mode', () => {
         reason: null,
         updatedAt: '2026-07-09T20:00:00.000Z',
       })
-    ).resolves.toEqual({ changed: false, mode: 'draining' });
+    ).resolves.toEqual({ changed: false, mode: 'draining', acquiredDrainToken: null });
     expect(mockTransactionQuery).toHaveBeenCalledTimes(1);
   });
 
@@ -2549,6 +2626,7 @@ describe('Cauldron drain mode', () => {
       await expect(setCauldronDrainMode(change)).resolves.toEqual({
         changed: true,
         mode: 'draining',
+        acquiredDrainToken: expect.any(String),
       });
       const codebaseId = '99999999-9999-4999-8999-999999999999';
       const conversationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -2587,6 +2665,7 @@ describe('Cauldron drain mode', () => {
       await expect(setCauldronDrainMode(change)).resolves.toEqual({
         changed: false,
         mode: 'draining',
+        acquiredDrainToken: null,
       });
       await sqlite.query(
         "UPDATE remote_agent_workflow_runs SET status = 'completed' WHERE id = $1",
@@ -2966,7 +3045,7 @@ describe('WO-HARNESS-REBUILD-DRAIN-MODE-01 drain create and recreateSafe', () =>
           updatedAt: '2026-09-24T02:00:00.000Z',
           clearOnBoot: true,
         })
-      ).resolves.toEqual({ changed: false, mode: 'draining' });
+      ).resolves.toEqual({ changed: false, mode: 'draining', acquiredDrainToken: null });
       const row = await sqlite.query<{
         mode: string;
         clear_on_boot: number;
@@ -3022,7 +3101,7 @@ describe('WO-HARNESS-REBUILD-DRAIN-MODE-01 drain create and recreateSafe', () =>
           updatedAt: '2026-09-24T02:00:00.000Z',
           clearOnBoot: true,
         })
-      ).resolves.toEqual({ changed: false, mode: 'draining' });
+      ).resolves.toEqual({ changed: false, mode: 'draining', acquiredDrainToken: null });
       await expect(getCauldronDrainState()).resolves.toMatchObject({
         mode: 'draining',
         clearOnBoot: false,
@@ -3057,6 +3136,10 @@ describe('WO-HARNESS-REBUILD-DRAIN-MODE-01 drain create and recreateSafe', () =>
         "PRAGMA table_info('remote_agent_cauldron_control')"
       );
       expect(cols.rows.map(row => row.name)).toContain('clear_on_boot');
+      expect(cols.rows.map(row => row.name)).toContain('drain_token');
+      expect(
+        (await upgraded.query('SELECT drain_token FROM remote_agent_cauldron_control')).rows
+      ).toEqual([{ drain_token: null }]);
       const mode = await upgraded.query<{ mode: string; clear_on_boot: number }>(
         'SELECT mode, clear_on_boot FROM remote_agent_cauldron_control WHERE id = 1'
       );

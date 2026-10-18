@@ -24,6 +24,9 @@ CLEANED=0
 TOKEN=""
 ACTIVE_IDS=""
 CURL_MAX_TIME=30
+PYTHON="${REBUILD_PYTHON:-python3}"
+OWNED_DRAIN_TOKEN=""
+ACQUISITION_PENDING=0
 
 usage() {
   cat <<'EOF'
@@ -61,6 +64,43 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Strict acquisition parsing needs Python 3 on the host. Never guess ownership
+# with sed or execute Docker/drain operations when this prerequisite is absent.
+if ! command -v "$PYTHON" >/dev/null 2>&1 || ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info.major != 3)' >/dev/null 2>&1; then
+  printf '%s\n' ABORT_PYTHON3_REQUIRED
+  exit 1
+fi
+
+parse_drain_grant() {
+  "$PYTHON" -c '
+import json, sys, uuid
+def strict(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+def reject_constant(value):
+    raise ValueError("non-finite constant")
+try:
+    row = json.load(sys.stdin, object_pairs_hook=strict, parse_constant=reject_constant)
+    if not isinstance(row, dict) or row.get("success") is not True or type(row.get("changed")) is not bool or "acquiredDrainToken" not in row:
+        raise ValueError("missing acquisition proof")
+    token = row["acquiredDrainToken"]
+    if row["changed"]:
+        if not isinstance(token, str) or str(uuid.UUID(token)) != token:
+            raise ValueError("invalid grant")
+        print(token)
+    else:
+        if token is not None:
+            raise ValueError("unowned grant")
+        print("unowned")
+except Exception:
+    sys.exit(1)
+'
+}
+
 json_escape() {
   # Escapes a string for safe use inside a JSON double-quoted value: backslash
   # and double-quote first (order matters -- escaping the backslash first
@@ -81,16 +121,30 @@ json_escape() {
   printf '%s' "$s"
 }
 
+clear_owned_drain() {
+  [ "$DRAIN_SET_BY_ME" = "1" ] && [ -n "$OWNED_DRAIN_TOKEN" ] || return 1
+  local body http reason
+  reason="$(json_escape "$1")"
+  body="$(printf '{"draining":false,"expectedDrainToken":"%s","reason":"%s"}' "$OWNED_DRAIN_TOKEN" "$reason")"
+  http="$(curl -sS --max-time "$CURL_MAX_TIME" -o /dev/null -w '%{http_code}' \
+    -X POST "$API_BASE/api/admin/drain" -H "Content-Type: application/json" \
+    -H "x-archon-operator-token: $TOKEN" -d "$body")" || {
+    printf '%s\n' DRAIN_CLEAR_UNCONFIRMED
+    return 1
+  }
+  case "$http" in
+    200) DRAIN_SET_BY_ME=0; OWNED_DRAIN_TOKEN=""; return 0 ;;
+    409) DRAIN_SET_BY_ME=0; OWNED_DRAIN_TOKEN=""; printf '%s\n' DRAIN_OWNERSHIP_LOST; return 1 ;;
+    *) printf '%s\n' DRAIN_CLEAR_UNCONFIRMED; return 1 ;;
+  esac
+}
+
 undrain_if_mine() {
   # Gate on confirmed boot, not RECREATED. RECREATED flips as soon as
   # `up -d` returns, which is before clear-on-boot can run. A foreign drain
   # (DRAIN_SET_BY_ME=0) is never cleared.
   if [ "$DRAIN_SET_BY_ME" = "1" ] && [ "$CONFIRMED_BOOT" = "0" ] && [ -n "$TOKEN" ]; then
-    curl -sS --max-time "$CURL_MAX_TIME" -X POST "$API_BASE/api/admin/drain" \
-      -H "Content-Type: application/json" \
-      -H "x-archon-operator-token: $TOKEN" \
-      -d '{"draining":false,"reason":"rebuild aborted"}' >/dev/null || true
-    DRAIN_SET_BY_ME=0
+    clear_owned_drain 'rebuild aborted' || true
   fi
 }
 
@@ -99,6 +153,9 @@ on_abort() {
     return 0
   fi
   CLEANED=1
+  if [ "$ACQUISITION_PENDING" = "1" ]; then
+    printf '%s\n' ABORT_DRAIN_OWNERSHIP_UNKNOWN
+  fi
   undrain_if_mine
 }
 trap 'status=$?; on_abort; exit "$status"' ERR
@@ -129,6 +186,7 @@ case "$INITIAL_STATE" in
     REASON_JSON="$(json_escape "$REASON")"
     DRAIN_BODY="$(printf '{"draining":true,"clearOnBoot":true,"reason":"%s"}' "$REASON_JSON")"
     DRAIN_RESP_FILE="$(mktemp)"
+    ACQUISITION_PENDING=1
     DRAIN_HTTP="$(curl -sS --max-time "$CURL_MAX_TIME" -o "$DRAIN_RESP_FILE" -w '%{http_code}' \
       -X POST "$API_BASE/api/admin/drain" \
       -H "Content-Type: application/json" \
@@ -136,20 +194,28 @@ case "$INITIAL_STATE" in
       -d "$DRAIN_BODY")" || {
       rm -f "$DRAIN_RESP_FILE"
       printf '%s\n' ABORT_DRAIN_REQUEST_FAILED
+      printf '%s\n' ABORT_DRAIN_OWNERSHIP_UNKNOWN
       exit 1
     }
     DRAIN_RESP="$(cat "$DRAIN_RESP_FILE")"
     rm -f "$DRAIN_RESP_FILE"
     case "$DRAIN_HTTP" in
-      4*|5*)
+      200) ;;
+      *)
         printf '%s\n' ABORT_DRAIN_REQUEST_FAILED
+        printf '%s\n' ABORT_DRAIN_OWNERSHIP_UNKNOWN
         exit 1
         ;;
     esac
-    case "$DRAIN_RESP" in
-      *'"changed":true'*|*'\"changed\":true'*) DRAIN_SET_BY_ME=1 ;;
-      *) DRAIN_SET_BY_ME=0 ;;
-    esac
+    GRANT="$(printf '%s' "$DRAIN_RESP" | parse_drain_grant)" || {
+      printf '%s\n' ABORT_DRAIN_OWNERSHIP_UNKNOWN
+      exit 1
+    }
+    if [ "$GRANT" != 'unowned' ]; then
+      OWNED_DRAIN_TOKEN="$GRANT"
+      DRAIN_SET_BY_ME=1
+    fi
+    ACQUISITION_PENDING=0
     ;;
 esac
 
@@ -189,11 +255,7 @@ done
 
 if [ "$ready" != "1" ]; then
   if [ "$DRAIN_SET_BY_ME" = "1" ]; then
-    curl -sS --max-time "$CURL_MAX_TIME" -X POST "$API_BASE/api/admin/drain" \
-      -H "Content-Type: application/json" \
-      -H "x-archon-operator-token: $TOKEN" \
-      -d '{"draining":false,"reason":"ABORT_DRAIN_TIMEOUT"}' >/dev/null || true
-    DRAIN_SET_BY_ME=0
+    clear_owned_drain 'ABORT_DRAIN_TIMEOUT' || true
   fi
   printf 'activeRunIds=%s\n' "${ACTIVE_IDS:-[]}"
   printf '%s\n' ABORT_DRAIN_TIMEOUT
@@ -256,11 +318,9 @@ POST_STATE="$(curl -sS --max-time "$CURL_MAX_TIME" "$API_BASE/api/admin/drain" \
 if [ "$DRAIN_SET_BY_ME" = "1" ]; then
   case "$POST_STATE" in
     *'"mode":"draining"'*)
-      curl -sS --max-time "$CURL_MAX_TIME" -X POST "$API_BASE/api/admin/drain" \
-        -H "Content-Type: application/json" \
-        -H "x-archon-operator-token: $TOKEN" \
-        -d '{"draining":false,"reason":"cleared after recreate"}' >/dev/null || true
-      printf '%s\n' DRAIN_CLEARED_BY_SCRIPT
+      if clear_owned_drain 'cleared after recreate'; then
+        printf '%s\n' DRAIN_CLEARED_BY_SCRIPT
+      fi
       ;;
   esac
 fi

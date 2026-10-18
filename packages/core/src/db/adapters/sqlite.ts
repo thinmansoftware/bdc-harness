@@ -1315,6 +1315,9 @@ export class SqliteAdapter implements IDatabase {
           'ALTER TABLE remote_agent_cauldron_control ADD COLUMN clear_on_boot INTEGER NOT NULL DEFAULT 0'
         );
       }
+      if (controlCols.length > 0 && !controlColNames.has('drain_token')) {
+        this.db.run('ALTER TABLE remote_agent_cauldron_control ADD COLUMN drain_token TEXT');
+      }
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_cauldron_clear_on_boot_failed');
     }
@@ -1596,7 +1599,8 @@ export class SqliteAdapter implements IDatabase {
         mode TEXT NOT NULL CHECK (mode IN ('normal', 'draining')),
         updated_at TEXT,
         updated_by TEXT,
-        clear_on_boot INTEGER NOT NULL DEFAULT 0
+        clear_on_boot INTEGER NOT NULL DEFAULT 0,
+        drain_token TEXT
       );
       INSERT INTO remote_agent_cauldron_control (id, mode)
       VALUES (1, 'normal')
