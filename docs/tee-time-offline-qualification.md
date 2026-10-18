@@ -70,3 +70,148 @@ The inspector asserts the image source SHA, UID, root filesystem, network,
 capabilities, privilege settings, entrypoint, exact isolated mounts, health, and
 absence of published ports/devices. It emits an allowlisted summary rather than
 raw Docker inspection data, which would expose the operator token.
+
+## Read-only persisted controller inputs
+
+`loadTeeTimeControllerInput` reads existing workflow-run, codebase and frozen
+authority records from the store. It requires the registered tee-time repository,
+project-scoped authority artifacts, current bundled policy/workflow revisions,
+worktree ownership, exact helper closure and Python/Git executable hashes. It
+rechecks records and frozen files after reading the complete committed base.
+The Git reader rejects metadata indirection, replacement/promisor/shallow objects,
+unsupported entries and incomplete or oversized evidence. It reads binary object
+bytes with a closed environment and recomputes the complete root tree.
+
+The returned `worktreeState` is `ownership-only-head-unverified`: frozen
+`runScopeSha`/`headBranch` are records, not fresh proof of the checkout's HEAD.
+`baseSha` remains the frozen committed base; it is never replaced with HEAD.
+The returned `helperExecution` is `frozen-files-no-image-attestation`; configured
+file and executable hashes do not prove a pinned-image invocation. A current v1
+policy match does not admit a future v2 worker or enable demo features.
+
+These source tests use only disposable Git repositories and synthetic store
+records. They create no real run, approval, model/provider client or app feature.
+Actual persisted-run capture, candidate adoption, meaningful reviewed tests,
+complete reviewer evidence and atomic approval consumption remain separate gates.
+
+## Source-only reviewer catalog reduction
+
+`deriveRestrictedReviewCatalog` accepts only the complete frozen Windows CLI
+0.153.3 bundled `gpt-5.6-sol` entry. The ASCII fixture is 42451 bytes, SHA-256
+`59f2bbc19bce43c67d6f1cdd99886953a256d948788d85810c774b17375c1fb6`.
+Its extraction source was installed binary SHA-256
+`e5ef3c4b81d2fb861f3731c91a773d45a1973c6a0b480d6449f80bc8fd749e96`,
+complete bundled output SHA-256
+`5cd9470c75971da5a479b69101f078558d9c7fc47cdc6706db76fe2ea582009a`.
+Only the selected full entry is retained in source; no account data is involved.
+Git pins LF and the formatter excludes this exact-byte data file.
+
+Comparison source: official `openai/codex` tag `rust-v0.153.3`, commit
+`b1a547b1f73ce86205d9222ac19cff334b3b7a2e`, `codex-rs/models-manager/models.json`
+SHA-256 `b31a636f8e1dc23f59770aadc4fb4c23f1cd8828aed8f32bbc6c67de0e72fdac`.
+The installed entry includes explicit `false` values for
+`model_messages.token_budget.enabled` and `use_history_notes_extension` that
+the source catalog omits. Both have `serde(default)` in the pinned protocol
+struct; the observed presence difference is consistent with deserialization and
+serialization defaults. All other shared fields match. Installed-only and
+source-only fields are preserved as observed; this is not binary equivalence.
+
+The pure transformer changes only `shell_type` to `disabled`,
+`apply_patch_tool_type` to `null`, `tool_mode` to `direct`,
+`experimental_supported_tools` to `[]` (already empty), and
+`supports_search_tool` to `false`. It preserves instructions, model identity,
+context and transport metadata. Wrong bytes, reserialization, duplicate-key
+serialization, extra entries and oversized input fail closed. Returned text and
+hashes are immutable. No provider, process, filesystem write or runtime binding
+is created by the helper.
+
+This is not tool-free reviewer qualification. A separately reviewed effective
+client configuration must also disable shell, code modes, view image, token
+budget, clock/sleep, deferred executor, permission requests, image generation,
+tool suggestion and deferred world state. Multi-agent must be disabled; MCP,
+dynamic tools and extensions must be empty; plan and user-input controls must be
+explicit. Apps, hooks, plugins and web search must remain disabled. Removed
+feature flags are not accepted as evidence that a tool is absent.
+
+The next no-auth SDK loopback fixture must capture actual complete instructions,
+tool definitions and framing for the exact Linux binary. It must find no
+executable tools, namespaces or extensions and show that hostile unadvertised
+shell/patch/code-mode calls cannot execute or produce accepted approval. Empty
+tool metadata may be omitted by legitimate serialization. Context compaction,
+output/reasoning capacity, finite review quality, authenticated invocation and
+atomic approval consumption remain separate unresolved gates. The existing
+6000-byte reviewer limit is unchanged. No foundation/demo admission follows.
+
+## Credential-free installed reviewer fixture
+
+`probe-codex-reviewer.ts` is a finite local endpoint fixture, not a registered
+reviewer. `teetime-reviewer-fixture.ts` has a closed no-argument option builder;
+the SDK invocation adds only a synthetic API key and its owned loopback URL.
+The Linux CLI's complete parsed bundled entry must match the frozen entry before
+derivation. A bounded unique-key parser rejects duplicate catalog keys; all
+observed original bytes and derived data have separate receipt hashes.
+
+The probe reads actual app-server configuration and empty MCP/plugin/skill
+inventories, then observes bounded complete SDK requests and raw SDK events.
+Every executable tool/namespace definition, alternate request field or nonempty
+additional-tools inventory fails. The positive case returns one fixed synthetic
+JSON message. Three hostile cases inject one unadvertised shell, patch or code
+mode call. Each requires an explicit unsupported-call result, unchanged sentinel,
+normal finite protocol completion and rejected synthetic-response acceptance.
+A failed process, timeout or missing denial is failure, never a successful denial.
+The endpoint's hostile-call record is fixture evidence; it is not a production
+adapter's authenticated detection mechanism.
+
+The existing inspected Docker runner owns one container per case, with no host
+mount, real auth, remote model, published port or external network. Reviewer-only
+limits are 128 PIDs, 768 MiB memory/swap ceiling, one CPU and bounded tmpfs.
+Attach output is bounded to 65536 bytes with a 90-second external deadline. The
+direct attached client is killed/reaped on failure; finally cleanup inspects the
+exact owner label and ID, removes only that ID and verifies name/ID absence.
+CI also has an always step scoped to the exact run/attempt owner. This does not
+claim cleanup after host loss. Existing sandbox/configuration behavior is retained.
+The four installed-SDK cases run only on explicit workflow dispatch; PR CI retains
+their pure tests and existing isolation checks, avoiding duplicate case runs.
+
+Source copy into the candidate Docker image makes the fixture helper available;
+it is not an entrypoint, factory registration, merge or production deployment.
+No real approval, served-model attestation, context/output capacity, compaction
+absence, review quality, authenticated behavior or BDC laptop readiness is proven.
+
+The first dispatched set at source
+`5a323917b7a1b86ec27e95869e47124d1c16fd64` failed its first positive case in
+run39148458683. It produced no valid capability receipt; the remaining three
+cases did not run. The bounded attach helper discarded stderr, so no failure
+phase was established. Its exact container and the isolated compose resources
+were removed; the scoped always step verified reviewer-container absence.
+Separate PR run39148465031 passed existing checks while skipping these cases.
+Neither result qualifies a reviewer.
+
+The diagnostic revision wraps initialization/imports in a guarded main and emits
+one closed phase/category frame on failure, preserving nonzero status. The runner
+validates its shape but cannot accept it as success. No raw error, stack, request,
+environment, path or model text is emitted. Dispatch now defaults to `none` and
+offers only `positive-only`; another full case set requires a reviewed source
+change. Publication does not itself authorize the next diagnostic attempt.
+
+The one positive-only diagnostic run39149336869 at
+`1dd6a94cabab117d1ed8074897f56b6a1838ee0f` also failed, with the validated
+frame phase=`configuration`, category=`other`. Image:
+`sha256:d7fa51f1436ca8ab56b604b4cd2a266043f3db85788b5d7d1ca98fff04672ed9`.
+Owned reviewer-container absence and compose-volume removal passed. Separate PR
+run39149341731 passed baseline checks and executed no reviewer cases.
+
+Pinned upstream `app-server-protocol/src/protocol/v2/config.rs` defines
+`ToolsV2` with only `web_search`. Native `config/src/config_toml.rs` defines
+both utility flags, but `app-server/src/config_manager_service.rs:133-145`
+projects native ConfigToml through JSON into ApiConfig, dropping those fields.
+The probe incorrectly dereferenced missing API-projection fields. That assertion
+cannot validate the native controls and may throw despite valid configuration.
+
+The correction requests complete layers, requires exactly one active
+`sessionFlags` layer with literal false values, and requires both exact leaf-path
+origins to name that layer/version. Missing/foreign/overridden origins reject.
+The native service removes origins covered by exact requirements; their absence
+is never a reason to accept a raw layer. Complete actual request-tool inventory
+remains required. No full layer, raw request, instruction or sensitive value is
+logged. This source correction grants no new runtime or reviewer admission.

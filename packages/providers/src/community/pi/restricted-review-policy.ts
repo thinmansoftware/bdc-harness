@@ -39,6 +39,10 @@ export function validateRestrictedReview(
   }
   if (options?.model !== undefined && options.model !== REVIEW_REF)
     throw new Error('review model override rejected');
+  validateRestrictedReviewArtifacts(prompt);
+}
+
+export function validateRestrictedReviewArtifacts(prompt: string): void {
   if (prompt.length > 12000) throw new Error('review input exceeds bound; do not truncate');
   const input: unknown = JSON.parse(prompt);
   if (

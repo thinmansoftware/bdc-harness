@@ -24,16 +24,34 @@ def main():
     parser.add_argument('--synthetic', action='store_true')
     parser.add_argument('--disconnect-before-auth', action='store_true')
     parser.add_argument('--frame-test', choices=['partial', 'oversized'])
+    parser.add_argument('--task', choices=['filesystem', 'artifact'], default='filesystem')
+    parser.add_argument('--artifact-source')
     args = parser.parse_args()
     assert re.fullmatch('sha256:[a-f0-9]{64}', args.image)
     assert re.fullmatch('[a-f0-9]{40}', args.expected_sha)
     nonce = uuid.uuid4().hex
-    command = r'''$ErrorActionPreference='Stop'; python "$env:USERPROFILE\teetime-config-diagnostic\run-teetime-auth-canary.py" --docker 'C:\Program Files\Docker\Docker\resources\bin\docker.exe' --image ''' + "'"+args.image+"' --expected-sha '"+args.expected_sha+"' --nonce '"+nonce+"'"
+    root = Path(__file__).parent
+    artifact_mode = args.task == 'artifact'
+    if artifact_mode:
+        from teetime_auth_artifact_protocol import artifact_hashes, validate_selector, validate_ready, validate_report, POLICY_PATH
+        from teetime_joined_fixture import strict_json
+        validate_selector(args.task, args.artifact_source, nonce)
+        frozen_hashes = artifact_hashes(root, args.artifact_source, args.expected_sha)
+        context = 'teetime-auth-artifact-'+args.artifact_source+'\\scripts\\staging'
+    else:
+        if args.artifact_source is not None:
+            parser.error('artifact-only source rejected in filesystem mode')
+        context = 'teetime-config-diagnostic'
+    command = r'''$ErrorActionPreference='Stop'; python "$env:USERPROFILE\CANARY_CONTEXT\run-teetime-auth-canary.py" --docker 'C:\Program Files\Docker\Docker\resources\bin\docker.exe' --image ''' + "'"+args.image+"' --expected-sha '"+args.expected_sha+"' --nonce '"+nonce+"'"
+    command = command.replace('CANARY_CONTEXT', context)
+    if artifact_mode:
+        command += " --task artifact --artifact-source '"+args.artifact_source+"'"
     encoded = base64.b64encode(command.encode('utf-16le')).decode()
     child = subprocess.Popen(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
         'bdc-server', 'powershell', '-NoProfile', '-EncodedCommand', encoded], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     inbox = queue.Queue()
+    protocol_error = object()
     def read_output():
         try:
             total = 0
@@ -44,9 +62,9 @@ def main():
                 total += len(line)
                 if len(line) > 16384 or total > 32768:
                     raise ValueError('protocol output bound')
-                inbox.put(json.loads(line))
+                inbox.put(strict_json(line) if artifact_mode else json.loads(line))
         except BaseException:
-            inbox.put(None)
+            inbox.put(protocol_error if artifact_mode else None)
         finally:
             inbox.put(None)
     reader_thread = threading.Thread(target=read_output, daemon=True)
@@ -56,17 +74,20 @@ def main():
     original_unchanged = True
     try:
         ready = inbox.get(timeout=75)
-        assert isinstance(ready, dict) and ready['type'] == 'READY'
-        assert set(ready) == {'type','nonce','image','sourceSha','owner','manifestSha256','workerId','gatewayId','hashes'}
-        assert ready['nonce'] == nonce and ready['image'] == args.image and ready['sourceSha'] == args.expected_sha
-        assert re.fullmatch('teetime-auth-[a-f0-9]{12}', ready['owner'])
-        for key in ['manifestSha256', 'workerId', 'gatewayId']:
-            assert re.fullmatch('[a-f0-9]{64}', ready[key])
-        root = Path(__file__).parent
-        filenames = ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts', 'teetime-canary-result.ts',
-            'teetime_connect_proxy.py', 'run-teetime-auth-canary.py', 'teetime_canary_protocol.py',
-            'teetime_watchdog.py', 'codex-probe-seccomp.json', 'teetime_bounded_process.py', 'teetime_proxy_receipt.py']
-        assert ready['hashes'] == {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in filenames}
+        if artifact_mode:
+            validate_ready(ready, nonce=nonce, image=args.image, base_source=args.expected_sha,
+                           source=args.artifact_source, hashes=frozen_hashes)
+        else:
+            assert isinstance(ready, dict) and ready['type'] == 'READY'
+            assert set(ready) == {'type','nonce','image','sourceSha','owner','manifestSha256','workerId','gatewayId','hashes'}
+            assert ready['nonce'] == nonce and ready['image'] == args.image and ready['sourceSha'] == args.expected_sha
+            assert re.fullmatch('teetime-auth-[a-f0-9]{12}', ready['owner'])
+            for key in ['manifestSha256', 'workerId', 'gatewayId']:
+                assert re.fullmatch('[a-f0-9]{64}', ready[key])
+            filenames = ['teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime-canary-task.ts', 'teetime-canary-result.ts',
+                'teetime_connect_proxy.py', 'run-teetime-auth-canary.py', 'teetime_canary_protocol.py',
+                'teetime_watchdog.py', 'codex-probe-seccomp.json', 'teetime_bounded_process.py', 'teetime_proxy_receipt.py']
+            assert ready['hashes'] == {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in filenames}
         if args.disconnect_before_auth:
             child.kill(); child.wait(timeout=5)
             print(json.dumps({'disconnectInjected': True, 'owner': ready['owner'], 'credentialsUsed': False}))
@@ -88,6 +109,28 @@ def main():
         child.stdin.write(payload if args.frame_test else encode_frame(payload)); child.stdin.close()
         del payload
         report = inbox.get(timeout=180)
+        if artifact_mode:
+            child_exit = child.wait(timeout=10)
+            assert inbox.get(timeout=5) is None
+            if original is not None:
+                original_unchanged = auth_path.read_bytes() == original
+            assert original_unchanged
+            # The validator checks cleanup before independently reparsing artifact bytes.
+            validate_report(report, child_exit, ready=ready, policy_hash=frozen_hashes[POLICY_PATH])
+            outcome = report['result']
+            result = outcome['artifactResult']
+            assert outcome['cleanupVerified'] and outcome['proxyMetricsVerified']
+            if args.frame_test:
+                assert not outcome['credentialReceived'] and not outcome['passed'] and result['modelInvocations'] == 0
+            elif args.synthetic:
+                assert outcome['credentialReceived'] and not outcome['passed'] and result['modelInvocations'] == 0
+                assert result['preflightChecks'] == 5 and result['authenticationRejected'] and not result['taskStarted']
+            else:
+                assert outcome['passed']
+            print(json.dumps({'owner': ready['owner'], 'task': 'artifact', 'artifactSourceSha': args.artifact_source,
+                'result': outcome, 'proxyMetrics': report['proxyMetrics'], 'synthetic': args.synthetic,
+                'originalAuthUnchanged': original_unchanged}))
+            return 0
         assert isinstance(report, dict) and report['type'] == 'RESULT'
         assert set(report) == {'type','nonce','owner','result','cleanupErrors','receiptDirectory','proxyMetrics'}
         assert report['nonce'] == nonce and report['owner'] == ready['owner']

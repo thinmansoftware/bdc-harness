@@ -12,6 +12,14 @@ on:
       - '.dockerignore'
       - '.github/workflows/offline-qualification.yml'
   workflow_dispatch:
+    inputs:
+      reviewer_fixture_scope:
+        description: Reviewed credential-free case scope; select only an independently approved scope
+        type: choice
+        default: none
+        options:
+          - none
+          - positive-only
 
 permissions:
   contents: read
@@ -46,10 +54,41 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_watchdog.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_canary_protocol.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_bounded_process.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_reviewer_probe.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_startup_packet.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_startup_control.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_foundation_case.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_foundation_http.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_foundation_http_collect.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_snapshot.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_git_objects.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_git_commit.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_git_base.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_snapshot_exporter.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_artifact_contract.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_materialization_frame.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_materializer.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_materialization_check.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_fixture_diagnostics.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_materialization_probe.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_artifact_materialization.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_joined_fixture.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_fixed_artifact.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_protocol.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_operator.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_worker.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_proxy_receipt.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_canary_diagnostics.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_operator_protocol.py
           bun test ./scripts/staging/teetime-canary-result.test.ts
+          bun test ./scripts/staging/teetime-artifact-stream.test.ts
+          bun test ./scripts/staging/teetime-sdk-lifecycle.test.ts
+          bun test ./scripts/staging/teetime-reviewer-fixture.test.ts
+          bun test ./scripts/staging/teetime-startup-protocol.test.ts
+          bun test ./scripts/staging/teetime-startup-entry.test.ts
+          bun test ./scripts/staging/teetime-fixed-artifact.test.ts
+          bun test packages/workflows/src/reliability/tee-time-review-package.test.ts
+          bun test packages/workflows/src/reliability/tee-time-controller-input.test.ts
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test
           bun --filter @archon/server type-check
@@ -65,7 +104,9 @@ jobs:
           bun test src/codex/restricted-sdk.test.ts
           bun test src/community/pi/restricted-review.test.ts
           bun test src/community/pi/restricted-review-transport.test.ts
+          bun test src/community/pi/restricted-review-evidence.test.ts
           bun test src/codex/restricted-run-factory.test.ts
+          bun test src/codex/restricted-review-catalog.test.ts
           bun test src/codex/provider.test.ts
           bun x tsc --noEmit
       - name: Build exact checkout candidate image
@@ -117,6 +158,16 @@ jobs:
           python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --isolated-network --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
           python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --kind configuration --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
           python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --kind configuration --hostile-project --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            case "${{ inputs.reviewer_fixture_scope }}" in
+              none) reviewer_cases='' ;;
+              positive-only) reviewer_cases='positive' ;;
+              *) echo 'Unrecognized reviewer case scope'; exit 1 ;;
+            esac
+            for reviewer_case in $reviewer_cases; do
+              python3 scripts/staging/run-codex-sandbox-probe.py --kind reviewer --reviewer-case "$reviewer_case" --reviewer-owner "teetime-reviewer-${{ github.run_id }}-${{ github.run_attempt }}" --apparmor-profile "$profile" --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+            done
+          fi
           negative_dir="$RUNNER_TEMP/teetime-negative-${{ github.run_id }}-${{ github.run_attempt }}"
           mkdir "$negative_dir"
           gcc -static -O2 -Wall -Wextra -Werror scripts/staging/probe-apparmor-negative.c -o "$negative_dir/teetime-mount-negative"
@@ -137,6 +188,10 @@ jobs:
         run: |
           python3 scripts/staging/inspect-offline-qualification.py "$QUALIFICATION_CONTAINER" "$(git rev-parse HEAD)" "$COMPOSE_PROJECT_NAME"
           docker exec "$QUALIFICATION_CONTAINER" bun scripts/staging/verify-offline-qualification.ts
+      - name: Remove only this job's reviewer fixture containers
+        if: always()
+        run: |
+          python3 scripts/staging/cleanup-teetime-reviewer-fixtures.py --owner "teetime-reviewer-${{ github.run_id }}-${{ github.run_attempt }}"
       - name: Collect bounded state and remove this job's resources
         if: always()
         run: |

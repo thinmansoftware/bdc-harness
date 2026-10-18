@@ -54,3 +54,6 @@ harness/policies/
 # reconcile test fixtures (bdc-xo #1889 false close, 2026-09-02). Bytes must
 # stay exactly as GitHub returned them, CRLF included.
 packages/overseer/src/__tests__/fixtures/reconcile/
+
+# Exact-byte pinned bundled model entry; changing serialization invalidates identity.
+packages/providers/src/codex/restricted-review-model-base.json
