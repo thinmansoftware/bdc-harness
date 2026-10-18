@@ -46,6 +46,7 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_watchdog.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_canary_protocol.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_bounded_process.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_reviewer_probe.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_snapshot.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_git_objects.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_git_commit.py
@@ -69,6 +70,7 @@ jobs:
           bun test ./scripts/staging/teetime-canary-result.test.ts
           bun test ./scripts/staging/teetime-artifact-stream.test.ts
           bun test ./scripts/staging/teetime-sdk-lifecycle.test.ts
+          bun test ./scripts/staging/teetime-reviewer-fixture.test.ts
           bun test ./scripts/staging/teetime-fixed-artifact.test.ts
           bun test packages/workflows/src/reliability/tee-time-review-package.test.ts
           bun test packages/workflows/src/reliability/tee-time-controller-input.test.ts
@@ -141,6 +143,11 @@ jobs:
           python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --isolated-network --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
           python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --kind configuration --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
           python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --kind configuration --hostile-project --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            for reviewer_case in positive shell patch code-mode; do
+              python3 scripts/staging/run-codex-sandbox-probe.py --kind reviewer --reviewer-case "$reviewer_case" --reviewer-owner "teetime-reviewer-${{ github.run_id }}-${{ github.run_attempt }}" --apparmor-profile "$profile" --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
+            done
+          fi
           negative_dir="$RUNNER_TEMP/teetime-negative-${{ github.run_id }}-${{ github.run_attempt }}"
           mkdir "$negative_dir"
           gcc -static -O2 -Wall -Wextra -Werror scripts/staging/probe-apparmor-negative.c -o "$negative_dir/teetime-mount-negative"
@@ -161,6 +168,10 @@ jobs:
         run: |
           python3 scripts/staging/inspect-offline-qualification.py "$QUALIFICATION_CONTAINER" "$(git rev-parse HEAD)" "$COMPOSE_PROJECT_NAME"
           docker exec "$QUALIFICATION_CONTAINER" bun scripts/staging/verify-offline-qualification.ts
+      - name: Remove only this job's reviewer fixture containers
+        if: always()
+        run: |
+          python3 scripts/staging/cleanup-teetime-reviewer-fixtures.py --owner "teetime-reviewer-${{ github.run_id }}-${{ github.run_attempt }}"
       - name: Collect bounded state and remove this job's resources
         if: always()
         run: |

@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 import subprocess
 import uuid
+from teetime_bounded_process import capture
+from teetime_reviewer_probe import reviewer_settings, verify_reviewer_limits, remove_owned_reviewer
 
 
 def main():
@@ -15,11 +17,19 @@ def main():
     parser.add_argument("--docker", default="docker")
     parser.add_argument("--image", required=True)
     parser.add_argument("--expected-sha", required=True)
-    parser.add_argument("--kind", choices=["sandbox", "configuration", "negative"], default="sandbox")
+    parser.add_argument("--kind", choices=["sandbox", "configuration", "negative", "reviewer"], default="sandbox")
+    parser.add_argument("--reviewer-case")
+    parser.add_argument("--reviewer-owner")
     parser.add_argument("--hostile-project", action="store_true")
     parser.add_argument("--isolated-network", action="store_true")
     parser.add_argument("--apparmor-profile")
     args = parser.parse_args()
+    if args.kind == 'reviewer':
+        reviewer_extra = reviewer_settings(args.reviewer_case, args.reviewer_owner)
+        if not args.apparmor_profile:
+            parser.error('reviewer requires an owned AppArmor profile')
+    elif args.reviewer_case is not None or args.reviewer_owner is not None:
+        parser.error('reviewer options require reviewer kind')
     if args.kind == "negative" and not args.apparmor_profile:
         parser.error("negative checks require an owned AppArmor profile")
     if args.hostile_project and args.kind != "configuration":
@@ -175,12 +185,15 @@ console.log(JSON.stringify(hashes));
     if args.apparmor_profile:
         options.extend(["--security-opt", "apparmor=" + args.apparmor_profile])
         options.extend(["--label", "teetime.audit-profile=" + args.apparmor_profile])
+    if args.kind == 'reviewer':
+        options.extend(reviewer_extra)
     if volume:
         temporary.remove("/workspace")
         options.extend(["--mount", "type=volume,src=" + volume + ",dst=/workspace"])
     for path in sorted(temporary):
-        options.extend(["--tmpfs", path + ":uid=1001,gid=1001"])
-    if args.kind == "configuration":
+        size = (",size=64m" if path == '/home/appuser' else ",size=16m") if args.kind == 'reviewer' else ''
+        options.extend(["--tmpfs", path + ":uid=1001,gid=1001" + size])
+    if args.kind in ("configuration", "reviewer"):
         for path in ["/workspace/.codex", "/workspace/.agents"]:
             temporary.add(path)
             options.extend(["--tmpfs", path + ":ro,uid=1001,gid=1001"])
@@ -209,6 +222,10 @@ console.log(JSON.stringify(hashes));
         assert not host.get("Privileged") and not host.get("CapAdd")
         assert "ALL" in host["CapDrop"]
         assert "no-new-privileges:true" in host["SecurityOpt"]
+        if args.kind == 'reviewer':
+            verify_reviewer_limits(host)
+            assert config['Labels'].get('teetime.reviewer-fixture') == args.reviewer_owner
+            assert config['Labels'].get('teetime.reviewer-case') == args.reviewer_case
         if args.apparmor_profile:
             assert "apparmor=" + args.apparmor_profile in host["SecurityOpt"]
         seccomp = [item for item in host["SecurityOpt"] if item.startswith("seccomp=")]
@@ -220,7 +237,7 @@ console.log(JSON.stringify(hashes));
         else:
             assert not data["Mounts"], "unexpected persistent mount"
         assert set(host["Tmpfs"]) == temporary
-        if args.kind == "configuration":
+        if args.kind in ("configuration", "reviewer"):
             for path in ["/workspace/.codex", "/workspace/.agents"]:
                 assert "ro" in host["Tmpfs"][path].split(","), "writable config mask"
         assert config["User"] == "1001:1001" and config["WorkingDir"] == "/workspace"
@@ -236,7 +253,12 @@ console.log(JSON.stringify(hashes));
             docker("start", name, check=True)
             running = json.loads(docker("inspect", name, check=True).stdout)[0]
             assert running["State"]["Running"] and running["AppArmorProfile"] == args.apparmor_profile
-            result = docker("attach", "--sig-proxy=false", name, input=source.decode("utf-8"))
+            if args.kind == 'reviewer':
+                code, output = capture([args.docker, 'attach', '--sig-proxy=false', name],
+                                       90, limit=65536, input_bytes=source)
+                result = subprocess.CompletedProcess([], code, output.decode('utf-8'), '')
+            else:
+                result = docker("attach", "--sig-proxy=false", name, input=source.decode("utf-8"))
             stopped = json.loads(docker("inspect", name, check=True).stdout)[0]
             assert not stopped["State"]["Running"]
             print(json.dumps({"auditProbeExit": {"attach": result.returncode,
@@ -278,6 +300,8 @@ console.log(JSON.stringify(hashes));
                           "probeSha256": hashlib.sha256(source).hexdigest(),
                           "probe": evidence}))
     finally:
+        if args.kind == 'reviewer':
+            remove_owned_reviewer(docker, name, args.reviewer_owner)
         remaining = docker("container", "ls", "-aq", "--filter", "name=^/" + name + "$")
         if remaining.returncode:
             raise RuntimeError("could not verify probe cleanup for " + name)

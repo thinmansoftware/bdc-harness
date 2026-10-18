@@ -141,3 +141,39 @@ tool metadata may be omitted by legitimate serialization. Context compaction,
 output/reasoning capacity, finite review quality, authenticated invocation and
 atomic approval consumption remain separate unresolved gates. The existing
 6000-byte reviewer limit is unchanged. No foundation/demo admission follows.
+
+## Credential-free installed reviewer fixture
+
+`probe-codex-reviewer.ts` is a finite local endpoint fixture, not a registered
+reviewer. `teetime-reviewer-fixture.ts` has a closed no-argument option builder;
+the SDK invocation adds only a synthetic API key and its owned loopback URL.
+The Linux CLI's complete parsed bundled entry must match the frozen entry before
+derivation. A bounded unique-key parser rejects duplicate catalog keys; all
+observed original bytes and derived data have separate receipt hashes.
+
+The probe reads actual app-server configuration and empty MCP/plugin/skill
+inventories, then observes bounded complete SDK requests and raw SDK events.
+Every executable tool/namespace definition, alternate request field or nonempty
+additional-tools inventory fails. The positive case returns one fixed synthetic
+JSON message. Three hostile cases inject one unadvertised shell, patch or code
+mode call. Each requires an explicit unsupported-call result, unchanged sentinel,
+normal finite protocol completion and rejected synthetic-response acceptance.
+A failed process, timeout or missing denial is failure, never a successful denial.
+The endpoint's hostile-call record is fixture evidence; it is not a production
+adapter's authenticated detection mechanism.
+
+The existing inspected Docker runner owns one container per case, with no host
+mount, real auth, remote model, published port or external network. Reviewer-only
+limits are 128 PIDs, 768 MiB memory/swap ceiling, one CPU and bounded tmpfs.
+Attach output is bounded to 65536 bytes with a 90-second external deadline. The
+direct attached client is killed/reaped on failure; finally cleanup inspects the
+exact owner label and ID, removes only that ID and verifies name/ID absence.
+CI also has an always step scoped to the exact run/attempt owner. This does not
+claim cleanup after host loss. Existing sandbox/configuration behavior is retained.
+The four installed-SDK cases run only on explicit workflow dispatch; PR CI retains
+their pure tests and existing isolation checks, avoiding duplicate case runs.
+
+Source copy into the candidate Docker image makes the fixture helper available;
+it is not an entrypoint, factory registration, merge or production deployment.
+No real approval, served-model attestation, context/output capacity, compaction
+absence, review quality, authenticated behavior or BDC laptop readiness is proven.
