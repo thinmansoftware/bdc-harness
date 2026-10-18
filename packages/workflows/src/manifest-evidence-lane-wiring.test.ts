@@ -588,7 +588,9 @@ describe('Bun workspace test evidence', () => {
           name: 'fixture',
           private: true,
           workspaces: ['packages/*'],
-          scripts: { test: "bun --filter '*' --parallel test" },
+          // This fixture counts both summaries; fail-fast may cancel the passing sibling.
+          // Keep the real aggregate failure while allowing both workspace tests to finish.
+          scripts: { test: "bun --filter '*' --parallel --no-exit-on-error test" },
         }),
       };
       for (const name of ['a', 'b']) {
