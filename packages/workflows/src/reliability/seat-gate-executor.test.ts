@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { mkdtemp } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -317,11 +317,41 @@ describe('executor seat gate', () => {
   test('a hanging seat read falls back to UNKNOWN at the 12s ceiling', async () => {
     setSeatUsageReaderForTests(() => new Promise(() => {}));
     setSeatCutoffOverride(90);
-    const started = Date.now();
-    const { result, store } = await runWorkflow();
-    const elapsed = Date.now() - started;
-    expect(elapsed).toBeGreaterThanOrEqual(12_000);
-    expect(elapsed).toBeLessThan(16_000);
+    let expire: (() => void) | undefined;
+    let entered: (() => void) | undefined;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const timerRegistered = new Promise<void>(resolve => {
+      entered = resolve;
+    });
+    const realSetTimeout = globalThis.setTimeout;
+    const observedDelays: number[] = [];
+    const clock = spyOn(globalThis, 'setTimeout').mockImplementation(((
+      ...args: Parameters<typeof setTimeout>
+    ) => {
+      const [callback, delay] = args;
+      if (delay === 12_000 && typeof callback === 'function') {
+        observedDelays.push(delay);
+        expire = () => callback();
+        deadlineTimer = realSetTimeout(() => {}, 120_000);
+        entered?.();
+        return deadlineTimer;
+      }
+      return realSetTimeout(...args);
+    }) as typeof setTimeout);
+    let completed: Awaited<ReturnType<typeof runWorkflow>>;
+    try {
+      const pending = runWorkflow();
+      await timerRegistered;
+      expect(observedDelays).toEqual([12_000]);
+      expect(prompts.filter(prompt => prompt !== 'Reply with exactly: OK')).toHaveLength(0);
+      if (!expire) throw new Error('seat deadline was not registered');
+      expire();
+      completed = await pending;
+    } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      clock.mockRestore();
+    }
+    const { result, store } = completed;
     expect(result.error ?? '').not.toContain('seat_usage_refused');
     const events = store.createWorkflowEvent.mock.calls.map(
       call =>

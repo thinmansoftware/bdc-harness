@@ -64,7 +64,22 @@ export interface JudgeEvidenceEnvelope {
     lookupFailed: boolean;
     checks: PullRequestEvidence['checks'];
     url: string | null;
+    number: number | null;
+    headRef: string | null;
+    author: string | null;
+    createdAt: string | null;
   };
+  otherOpenPrsForWo: { number: number; headRef: string; createdAt: string }[] | null;
+  /**
+   * True when the best-effort sibling search failed. otherOpenPrsForWo is
+   * then null and must not be read as an authoritative empty list.
+   */
+  otherOpenPrsForWoLookupFailed: boolean;
+  /**
+   * Inclusive bounds of this run, taken from event timestamps. The judge
+   * compares PR createdAt against this window. Null when no event has a timestamp.
+   */
+  runWindow: { startedAt: string | null; endedAt: string | null };
   /** Classifier output, demoted to advisory hint fields (binding term: no gate). */
   hint: { action: string; errorClass: string | null; reason: string };
   eventTail: { type: string; step: string | null; at: string; message: string }[];
@@ -117,8 +132,31 @@ function truncate(value: string, cap: number): string {
   return value.length > cap ? `${value.slice(0, cap)}...` : value;
 }
 
+/** Earliest and latest event timestamps. Two strings, never the event list. */
+function runWindowFromEvents(events: OverseerWorkflowEvent[]): {
+  startedAt: string | null;
+  endedAt: string | null;
+} {
+  let startedAt: string | null = null;
+  let endedAt: string | null = null;
+  for (const event of events) {
+    const at = event.created_at;
+    if (typeof at !== 'string' || at === '') continue;
+    if (startedAt === null || at < startedAt) startedAt = at;
+    if (endedAt === null || at > endedAt) endedAt = at;
+  }
+  return { startedAt, endedAt };
+}
+
 function eventMessage(data: Record<string, unknown>): string {
-  const candidates = [data.error, data.message, data.stderr, data.output, data.reason];
+  const candidates = [
+    data.error,
+    data.message,
+    data.stderr,
+    data.node_output,
+    data.output,
+    data.reason,
+  ];
   const found = candidates.find(value => typeof value === 'string' && value.trim());
   if (typeof found === 'string') return found;
   try {
@@ -142,6 +180,7 @@ export function buildEvidenceEnvelope(
     at: event.created_at ?? '',
     message: truncate(eventMessage(event.data), EVENT_MESSAGE_CAP),
   }));
+  const siblingLookupFailed = record.prEvidence.otherOpenPrsForWoLookupFailed === true;
   return {
     runId: record.runId,
     woId: record.woId,
@@ -156,7 +195,16 @@ export function buildEvidenceEnvelope(
       lookupFailed: record.prEvidence.lookupFailed ?? false,
       checks: record.prEvidence.checks,
       url: record.prEvidence.htmlUrl ?? null,
+      number: record.prEvidence.pr?.number ?? null,
+      headRef: record.prEvidence.pr?.headRef ?? null,
+      author: record.prEvidence.pr?.author ?? null,
+      createdAt: record.prEvidence.pr?.createdAt ?? null,
     },
+    otherOpenPrsForWo: siblingLookupFailed
+      ? null
+      : (record.prEvidence.otherOpenPrsForWo ?? []).slice(0, 5),
+    otherOpenPrsForWoLookupFailed: siblingLookupFailed,
+    runWindow: runWindowFromEvents(events),
     hint: {
       action: record.action,
       errorClass: record.errorClass ?? null,
@@ -189,6 +237,15 @@ export function buildJudgePrompt(envelope: JudgeEvidenceEnvelope): string {
     'run; failed_genuine when the run failed and no salvageable work exists;',
     'duplicate_work when the evidence shows this WO already has an equivalent open PR;',
     'needs_human when evidence conflicts or the failure shape is unrecognized;',
+    'A PR whose headRef starts with "archon/task-" and whose createdAt falls inside',
+    "runWindow (startedAt through endedAt, inclusive) is that run's builder-created",
+    'pre-review byproduct, never duplicate_work. If either runWindow bound is null,',
+    'do not treat createdAt as during the run.',
+    'A completed run whose own PR exists and whose event tail contains no failed node',
+    'must be classified as healthy or observe, never needs_human.',
+    'otherOpenPrsForWoLookupFailed: true together with otherOpenPrsForWo: null means',
+    'the sibling list is unavailable. A null sibling list is not evidence that no',
+    'duplicate or sibling PR exists and must not be treated as proof of exclusivity.',
     'observe/healthy for uneventful terminal runs. The deterministic classifier hint',
     'below is ADVISORY ONLY -- you may contradict it, and say so in reason when you do.',
     '',

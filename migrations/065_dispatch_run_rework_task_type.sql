@@ -1,10 +1,10 @@
--- Migration 060 (WO-HARNESS-OVERSEER-REWORK-LOOP-01): widens the
+-- Migration 065 (WO-HARNESS-OVERSEER-REWORK-LOOP-01): widens the
 -- agent_dispatch_messages.task_type CHECK to accept 'run_rework'.
 --
--- Migration 059 seeds the 'overseer-rework' dispatch_principals row but does
+-- Migration 064 seeds the 'overseer-rework' dispatch_principals row but does
 -- NOT touch the task_type CHECK constraint on agent_dispatch_messages, so an
--- existing (pre-057) Postgres database still rejects any run_rework insert
--- with a check-constraint violation even after 057 runs. 000_combined.sql
+-- existing (pre-rework) Postgres database still rejects any run_rework insert
+-- with a check-constraint violation even after 064 runs. 000_combined.sql
 -- already carries 'run_rework' in its CHECK because it is the fresh-schema
 -- definition, not a migration -- it never runs against an existing database.
 --
@@ -19,7 +19,7 @@ DECLARE
   constraint_name text;
 BEGIN
   IF target_oid IS NULL THEN
-    RAISE EXCEPTION 'migration 060: agent_dispatch_messages not found via to_regclass on current search_path';
+    RAISE EXCEPTION 'migration 065: agent_dispatch_messages not found via to_regclass on current search_path';
   END IF;
 
   SELECT c.conname INTO constraint_name

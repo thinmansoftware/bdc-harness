@@ -96,6 +96,8 @@ function fakeDeps(
       return found
         ? {
             ...found,
+            fencing_token: input.fencing_token,
+            lease_owner: input.worker_id,
             status: input.status ?? 'done',
             result_body: input.result_body,
             task_outcome: input.task_outcome ?? null,
@@ -412,6 +414,37 @@ describe('review worker clock', () => {
       expect.objectContaining({ headSha: 'exact-head', messageId: 'one' }),
       expect.objectContaining({ disposition: 'changes_requested' })
     );
+  });
+
+  test.each([
+    'refused',
+    'wrong-message',
+    'wrong-fence',
+    'wrong-owner',
+    'not-terminal',
+    'wrong-outcome',
+    'thrown',
+  ])('does not enqueue rework after %s completion', async failure => {
+    const deps = fakeDeps([message('one')], () => ({ disposition: 'changes_requested' }));
+    const rework = mock(async () => undefined);
+    deps.reworkOnChangesRequested = rework;
+    deps.postResult = mock(async input => {
+      if (failure === 'thrown') throw new Error('completion failed');
+      if (failure === 'refused') return null;
+      return {
+        ...message('one'),
+        id: failure === 'wrong-message' ? 'other' : input.id,
+        fencing_token: failure === 'wrong-fence' ? input.fencing_token + 1 : input.fencing_token,
+        lease_owner: failure === 'wrong-owner' ? 'other-worker' : input.worker_id,
+        status: failure === 'not-terminal' ? 'claimed' : 'done',
+        task_outcome: failure === 'wrong-outcome' ? 'failed' : 'succeeded',
+        result_body: input.result_body,
+      };
+    });
+
+    await expect(tickReviewWorkerClock(CONFIG, deps)).resolves.toBeUndefined();
+    expect(deps.postResult).toHaveBeenCalledTimes(1);
+    expect(rework).not.toHaveBeenCalled();
   });
 
   test('never calls reworkOnChangesRequested for a non-changes_requested terminal disposition', async () => {

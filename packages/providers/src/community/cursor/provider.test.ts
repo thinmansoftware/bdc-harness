@@ -345,5 +345,6 @@ describe('registerCursorAgentProvider', () => {
     registerCommunityProviders();
     expect(isRegisteredProvider('cursor')).toBe(true);
     expect(isRegisteredProvider('grok')).toBe(true);
+    expect(isRegisteredProvider('openrouter')).toBe(true);
   });
 });

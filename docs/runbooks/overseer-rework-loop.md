@@ -11,7 +11,9 @@ bounded retry cap and an escalation when the cap is reached. There is no
 manual command to fire a rework: the review worker clock
 (`packages/server/src/dispatch/review-worker-clock.ts`,
 `tickReviewWorkerClock`) triggers it automatically after every
-`changes_requested` verdict, via the optional
+`changes_requested` verdict whose Dispatch completion confirms the same message,
+worker owner, fencing token, and expected terminal outcome. A refused or failed
+completion cannot enqueue follow-up work. The optional
 `reworkOnChangesRequested` hook, which calls
 `assessAndEnqueueRework` (`packages/overseer/src/pr-rework.ts`).
 
@@ -61,7 +63,7 @@ order by `assessAndEnqueueRework`:
 | `OVERSEER_REWORK_ENABLED` | unset (treated as enabled) | Kill switch. Set to the literal string `false` to disable the whole loop; any other value (including unset) leaves it enabled. |
 | `OVERSEER_REWORK_REPOS` | `thinmansoftware/bdc-harness` | Comma-separated `owner/repo` allowlist (case-insensitive, trimmed). Only listed repos are ever reworked. |
 | `OVERSEER_REWORK_MAX_ATTEMPTS` | `2` | Max automatic reworks per PR. The EFFECTIVE cap is `min(this value, resolveMaxRereviewAttempts())` -- it can never exceed the re-review budget (default 3, env `OVERSEER_MAX_REREVIEW_ATTEMPTS`), because every rework push triggers one automatic re-review. |
-| `OVERSEER_REWORK_WORKFLOW` | `bdc-feature-development-codex` | The lane the rework worker fires. Must be one of `REWORK_CAPABLE_WORKFLOWS` (currently only `bdc-feature-development-codex` -- the only lane carrying the `REWORK_DIRECTIVE` gate line). Any other value logs `overseer_rework_workflow_not_capable` and fires nothing. |
+| `OVERSEER_REWORK_WORKFLOW` | `bdc-feature-development-codex` | The lane the rework worker fires. Must be one of `REWORK_CAPABLE_WORKFLOWS` (currently only `bdc-feature-development-codex`; Astra mirrors the gate for mechanics parity but is not enabled in this allowlist). Any other value logs `overseer_rework_workflow_not_capable` and fires nothing. |
 | `OVERSEER_REWORK_MODEL_OVERRIDE` | `{"nodes":{"implement":{"provider":"cursor","model":"grok-4.7-high"},"diff-repair":{"provider":"cursor","model":"grok-4.7-high"},"opus-repair":{"provider":"cursor","model":"grok-4.7-high"}}}` | JSON `modelOverride` body sent with the direct fire. |
 | `ARCHON_API_BASE_URL` | `http://localhost:3090` | Base URL the rework worker clock POSTs the fire request to (`/api/workflows/<workflow>/run`). |
 | `ARCHON_OPERATOR_TOKEN` | (required at fire time, no default) | Sent as the `x-archon-operator-token` header on the fire request. Read from the environment only -- **never logged**, and never appears in any dispatch message body or PR comment. |
@@ -106,9 +108,9 @@ repos).
 
 `run_rework` is a Dispatch `task_type` on `agent_dispatch_messages`, recipient
 `overseer-rework` (principal `Overseer Rework Dispatcher`, delivery mode
-`worker_poll`, seeded by migration `059_overseer_rework_principal.sql` and,
+`worker_poll`, seeded by migration `064_overseer_rework_principal.sql` and,
 for the Postgres CHECK constraint on pre-existing databases, migration
-`060_dispatch_run_rework_task_type.sql`). To list every rework attempt for
+`065_dispatch_run_rework_task_type.sql`). To list every rework attempt for
 one PR:
 
 ```sql

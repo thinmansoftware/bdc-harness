@@ -268,14 +268,24 @@ export async function tickReviewWorkerClock(
           continue;
         }
         const result = mapSubmitOutcome(outcome.disposition);
-        await deps.postResult({
+        const completed = await deps.postResult({
           id: claimed.id,
           worker_id: REVIEW_WORKER_ID,
           fencing_token: claimed.fencing_token,
           ...result,
           result_body: JSON.stringify(outcome),
         });
-        if (outcome.disposition === 'changes_requested' && deps.reworkOnChangesRequested) {
+        // A rejected fence returns null. Follow-up work requires the same
+        // worker generation to have committed the expected terminal result.
+        if (
+          completed?.id === claimed.id &&
+          completed.fencing_token === claimed.fencing_token &&
+          completed.lease_owner === REVIEW_WORKER_ID &&
+          completed.status === result.status &&
+          completed.task_outcome === result.task_outcome &&
+          outcome.disposition === 'changes_requested' &&
+          deps.reworkOnChangesRequested
+        ) {
           try {
             await deps.reworkOnChangesRequested(work, outcome);
           } catch (error) {
