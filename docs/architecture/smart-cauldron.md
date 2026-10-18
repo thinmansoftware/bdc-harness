@@ -59,6 +59,30 @@ future version transition. No token is silently backfilled, and mixed-version
 writers remain outside the guarantee. This is source validation for review,
 not a deployment, live canary or full closure of bdc-xo#1546.
 
+## Proposed source repair for review: Windows checkpoint replacement (2026-10-18)
+
+The composed Taskmaster/cascade fixture repeatedly failed at atomic record rename
+with Windows `EPERM` while supervision read the same record. The evidence
+establishes the rename failure, not its underlying handle-sharing cause.
+
+The recorder writes its unique temporary payload once, then retries only that
+same rename on Windows `EPERM` or `EBUSY`: at most five attempts with waits of
+10, 20, 40 and 80 milliseconds (150 milliseconds total scheduled backoff, plus
+filesystem I/O). Other errors and non-Windows behavior remain immediate failures.
+Exhaustion throws the filesystem error and retains both the old destination and
+temporary evidence. It never unlinks, copies over, truncates or recreates the
+payload and never retries provider execution.
+
+The real composed fixture failed three repeated runs before the repair and
+passed three after it. It exercises pending admission, an actual workflow SQL
+projection, sent custody, read-only replay preserving the live lock, exact
+completion proof and settled release. Provider calls and Taskmaster storage are
+deterministic test dependencies; this is not a live provider or production test.
+
+Persistence exhaustion remains a separate lifetime risk: the existing cascade
+finally can release its token even when provider ownership is unresolved. This
+bounded persistence repair does not establish safe release on that error path.
+
 ---
 
 # PART 1 -- The system in plain words

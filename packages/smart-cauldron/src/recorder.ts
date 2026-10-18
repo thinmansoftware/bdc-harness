@@ -87,7 +87,24 @@ export async function writeRecord(
     encoding: 'utf8',
     flag: 'wx',
   });
-  await rename(tempPath, filePath);
+  // Persist one immutable payload. Windows can transiently refuse replacement;
+  // retry only this rename, never the provider work or a destructive fallback.
+  const delays = [10, 20, 40, 80] as const;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(tempPath, filePath);
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (
+        process.platform !== 'win32' ||
+        (code !== 'EPERM' && code !== 'EBUSY') ||
+        attempt >= delays.length
+      )
+        throw error;
+      await new Promise<void>(resolve => setTimeout(resolve, delays[attempt]));
+    }
+  }
   return filePath;
 }
 

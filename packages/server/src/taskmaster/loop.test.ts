@@ -6,6 +6,12 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
+import { mkdtemp, rm } from 'fs/promises';
+import { tmpdir } from 'os';
+import { Database } from 'bun:sqlite';
+import { runCascade as realRunCascade } from '@archon/smart-cauldron/cascade';
+import { acquireWoLock as realAcquireWoLock } from '@archon/smart-cauldron/wo-lock';
+import { readCascadeRecordById } from '@archon/smart-cauldron/frontier-approval';
 import { rootLogger } from '@archon/paths';
 import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
 
@@ -36,7 +42,7 @@ import {
   type GithubIssueEvidence,
   type AdoptionRefreshResult,
 } from './loop';
-import { checkEvidence, checkExpectations } from './expectations';
+import { checkEvidence, checkExpectations, readCascadeWorkflowEvidence } from './expectations';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
@@ -1624,6 +1630,141 @@ describe('pending fire custody', () => {
     });
     return { deps, fires: () => fires };
   }
+
+  test('joint real cascade custody follows actual workflow through replay and settled release', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'tm-cascade-joint-'));
+    const sql = new Database(':memory:');
+    sql.exec(
+      'CREATE TABLE remote_agent_workflow_runs (id TEXT PRIMARY KEY, workflow_name TEXT, status TEXT, metadata TEXT)'
+    );
+    const world = makeWorld();
+    seedDigestSent(world);
+    let releaseFire!: () => void;
+    const fireGate = new Promise<void>(resolve => {
+      releaseFire = resolve;
+    });
+    let signalPoll!: () => void;
+    const pollStarted = new Promise<void>(resolve => {
+      signalPoll = resolve;
+    });
+    let releasePoll!: () => void;
+    const pollGate = new Promise<void>(resolve => {
+      releasePoll = resolve;
+    });
+    let flight: ReturnType<typeof realRunCascade> | undefined;
+    let options: Parameters<typeof realRunCascade>[0] | undefined;
+    let providerFires = 0;
+    const query = async <T>(statement: string, params: unknown[] = []) => ({
+      rows: sql.query(statement).all(...(params as string[])) as T[],
+    });
+    const read = (identity: { cascadeId: string; woId: string; project: string | undefined }) =>
+      readCascadeWorkflowEvidence(identity, {
+        readCascade: id => readCascadeRecordById(id, outDir),
+        query,
+      });
+    const fixture = setup(world, {
+      readFireCascadeEvidence: read,
+      getFireRunEvidence: (woId, cascadeId, project) => read({ woId, cascadeId, project }),
+      runCascade: requested => {
+        options = {
+          ...requested,
+          outDir,
+          deps: {
+            findWoClaim: async () => null,
+            fetchNodeTimeouts: async () => ({}),
+            fire: async tier => {
+              providerFires++;
+              await fireGate;
+              sql
+                .query('INSERT INTO remote_agent_workflow_runs VALUES (?, ?, ?, ?)')
+                .run('joint-actual-run', tier.workflowName, 'running', '{}');
+              return {
+                ok: true,
+                runId: 'joint-actual-run',
+                conversationId: 'local-test',
+                infraError: null,
+              };
+            },
+            poll: async () => {
+              signalPoll();
+              await pollGate;
+              sql.query("UPDATE remote_agent_workflow_runs SET status='completed'").run();
+              return {
+                runId: 'joint-actual-run',
+                terminalStatus: 'completed',
+                validatorVerdict: 'satisfied',
+                prUrl: 'https://github.com/synthetic/local/pull/1',
+                prMergeable: true,
+                servedModelId: null,
+                rawMetadata: {},
+              };
+            },
+            judge: () => ({
+              pass: true,
+              reason: 'local test',
+              cancelled: false,
+              validatorVerdict: 'satisfied',
+              prOpened: true,
+              prMergeable: true,
+              terminalStatus: 'completed',
+            }),
+            escalate: async () => {},
+          },
+        };
+        flight = realRunCascade(options);
+        return flight;
+      },
+    });
+    try {
+      const first = await tick(createTaskmasterState(60000), fixture.deps);
+      const fire = world.journal.find(row => row.action_type === 'fire_cauldron')!;
+      expect(first.effects).toBe(0);
+      expect(fire.outcome).toBe('pending');
+      releaseFire();
+      await Promise.race([
+        pollStarted,
+        flight!.then(() => {
+          throw new Error('joint cascade ended before polling');
+        }),
+      ]);
+      await tick(createTaskmasterState(60000), fixture.deps);
+      expect(fire.outcome).toBe('sent');
+      expect(JSON.parse(fire.proposal_json).runId).toBe('joint-actual-run');
+      expect(JSON.parse(fire.proposal_json).fireLaunch.state).toBe('active');
+      const replay = await realRunCascade(options!);
+      expect(replay.status).toBe('running');
+      expect(
+        (await realAcquireWoLock(options!.woId, options!.project!, 'competing-joint', outDir))
+          .acquired
+      ).toBe(false);
+      expect(providerFires).toBe(1);
+      releasePoll();
+      await flight;
+      await checkExpectations(new Date(world.nowMs), {
+        readCascade: id => readCascadeRecordById(id, outDir),
+        query,
+        listDueExpectations: async () => [...world.expectations.values()],
+        markMet: async (id, pointer) => {
+          const row = [...world.expectations.values()].find(row => row.id === id)!;
+          row.status = 'met';
+          row.evidence_pointer = pointer;
+          return true;
+        },
+      });
+      expect([...world.expectations.values()][0]?.evidence_pointer).toBe(
+        'workflow:joint-actual-run'
+      );
+      await tick(createTaskmasterState(60000), fixture.deps);
+      expect(JSON.parse(fire.proposal_json).fireLaunch.state).toBe('released');
+      expect(providerFires).toBe(1);
+    } finally {
+      releaseFire();
+      releasePoll();
+      await flight?.catch(() => {});
+      sql.close();
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
 
   test('admission without a proven workflow stays pending across later ticks and buckets', async () => {
     const world = makeWorld();
