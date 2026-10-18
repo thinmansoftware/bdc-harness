@@ -134,4 +134,57 @@ python3 -m unittest discover -s /app/scripts/staging -p test_teetime_snapshot_ex
 ```
 
 The initial tests failed before implementation. Local controller tests pass;
-Linux filesystem tests and actual-daemon cases are not yet claimed as passed.
+the exact5d9d16f317d6934b73db62b6f08f304c4a3c6a2d prototype subsequently passed
+13 Linux tests and all eight cases on image
+sha256:ad9cca8535c33c98650eeda6f56a395842656d3600fb3210c05b7e4a29f8c156.
+Hosted isolation CI39128002700 passed separately. See the owning bdc-xo record
+docs/tee-time/tee-time-capture-prototype-20261018.md for receipts and limits.
+
+## Proposed source-data contract amendment
+
+This is a reviewed source-only alternative to capturing an untrusted model
+workspace. It does not modify the active version1 policy or register a provider.
+The builder's workspace, Git metadata, ignore rules and claimed test results
+never supply candidate source. Instead, a future stream collector must accept
+exactly one bounded assistant artifact message, then one successful result and
+normal iterator completion. Extra assistant messages, warnings, fallback, errors,
+abort, missing completion and iterator exceptions fail. Actual CodexProvider
+assistant chunks contain item.completed agent_message text; its result chunk
+does not contain that text. Do not use structuredOutput or concatenate messages.
+The stream collector/installed-SDK fixture is a separate unqualified next slice.
+
+teetime_artifact_contract.py exports parse_artifact(raw, base_files=...,
+expected_binding=..., allowed_paths=...). raw must be immutable strict UTF-8 JSON
+bytes, at most65536 bytes, nesting at most8 and one to32 explicit operations.
+Duplicate keys at every object level, BOM, fences and trailing payload fail.
+Only version1, binding and operations fields are accepted.
+
+Binding fields: runId, nodeId, attempt, authorityHash, policyHash, baseManifestHash.
+The controller supplies their expected values from frozen authority and the
+complete trusted base; echoed values grant no authority. Manifest SHA-256 is
+distinct from the Git SHA-1 tree ID. allowed_paths maps fixed canonical paths to
+tuples of permitted100644/100755 modes, without wildcards.
+
+Each write has action, path, baseHash, mode and ASCII content. baseHash is the
+existing content's SHA-256 or null for explicit absence. Each delete has action,
+path and the existing baseHash. Only one operation per canonical path is allowed;
+absent deletes, stale hashes, out-of-scope paths/modes, NUL content and ineffective
+changes fail. Unmentioned base files are preserved byte-for-byte, including binary
+files. Existing file/count/total bounds and final candidate collision checks apply.
+
+The returned frozen candidate contains complete file records, canonical manifest,
+manifest hash, tree ID and raw artifact/binding hashes. It performs no filesystem,
+subprocess, repository, approval or publication action and cannot authenticate its
+caller. Pure tests are invoked with:
+
+```text
+python -m unittest discover -s scripts/staging -p test_teetime_artifact_contract.py
+```
+
+STOP POINT: parser success does not qualify the SDK message contract or admit a
+builder. Next separately review and qualify the real installed-SDK loopback
+fixture, trusted synchronous materialization into a new controller-owned volume,
+and separate readonly/noauth/nonetwork testing. The qualified reviewer's6000-byte
+wire bound, replay-safe approval consumption, policy/workflow revision and exact
+CI/staging gates remain binding. Do not activate this amendment by aliasing the
+old filesystem canary or ordinary provider identities.
