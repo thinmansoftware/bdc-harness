@@ -21,6 +21,7 @@ import { rootLogger } from '@archon/paths';
 import {
   createTaskmasterState,
   defaultListRemediationCandidates,
+  defaultConsumeRemediationCandidate,
   tick,
   type ListedThread,
   type RemediationCandidate,
@@ -400,6 +401,120 @@ describe('Test 3: paused Taskmaster refuses and records it', () => {
   });
 });
 
+describe('remediation custody across pause and epoch fences', () => {
+  test.each([
+    ['effects', null],
+    ['effects', 'WO-UNMATCHED-99'],
+    ['all', null],
+    ['all', 'WO-UNMATCHED-99'],
+    [null, null],
+    [null, 'WO-UNMATCHED-99'],
+  ] as const)(
+    'unmatched candidate stays retryable across pause scope %s / WO %s and restart',
+    async (scope, woId) => {
+      const world = makeWorld();
+      world.control = { ...world.control, pause_state: 'PAUSED', pause_scope: scope };
+      world.candidates.push({
+        id: 'unmatched-paused',
+        consumed: false,
+        body: candidateBody({ woId }),
+      });
+      const deps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+      await tick(createTaskmasterState(60000), deps);
+      const row = world.journal.find(
+        item => JSON.parse(item.proposal_json).remediationCandidateId === 'unmatched-paused'
+      )!;
+      expect(row.action_type).toBe('escalate_p0');
+      expect(row.outcome).toBe('deferred');
+      expect(world.consumeCalls).toEqual([]);
+      const deadline = row.proof_deadline_at;
+      world.control = { ...world.control, pause_state: 'RUNNING', pause_scope: null };
+      world.nowMs += 60000;
+      await tick(createTaskmasterState(60000), deps);
+      const sends = world.sentMessages.filter(item =>
+        item.idempotency_key.startsWith('tm:remediation_nudge:')
+      );
+      expect(sends).toHaveLength(1);
+      expect(sends[0]?.recipient).toBe('operator');
+      expect(row.outcome).toBe('sent');
+      expect(row.proof_deadline_at).toBe(deadline);
+    }
+  );
+
+  test('a pause beyond the original deadline does not acquire fresh delivery authority', async () => {
+    const world = makeWorld();
+    world.control = { ...world.control, pause_state: 'PAUSED', pause_scope: 'effects' };
+    world.candidates.push({
+      id: 'expired-paused',
+      consumed: false,
+      body: candidateBody({ woId: null }),
+    });
+    const deps = makeDeps(world);
+    await tick(createTaskmasterState(60000), deps);
+    const row = world.journal.find(
+      item => JSON.parse(item.proposal_json).remediationCandidateId === 'expired-paused'
+    )!;
+    const deadline = row.proof_deadline_at;
+    world.nowMs += 25 * 60 * 60 * 1000;
+    world.control = { ...world.control, pause_state: 'RUNNING', pause_scope: null };
+    await tick(createTaskmasterState(60000), deps);
+    expect(row.outcome).toBe('expired');
+    expect(row.proof_deadline_at).toBe(deadline);
+    expect(world.consumeCalls).toEqual([]);
+    expect(
+      world.sentMessages.filter(item => item.idempotency_key.startsWith('tm:remediation_nudge:'))
+    ).toHaveLength(0);
+  });
+
+  test.each(['pause-owner', 'pause-unmatched', 'epoch-owner', 'epoch-unmatched'])(
+    'pre-effect fence remains retryable without consuming candidate (%s)',
+    async mode => {
+      const world = makeWorld();
+      world.candidates.push({
+        id: 'mid-fence',
+        consumed: false,
+        body: candidateBody({ woId: mode.endsWith('unmatched') ? null : 'WO-X-01' }),
+      });
+      const deps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+      const record = deps.db!.recordAction;
+      let changed = false;
+      deps.db = {
+        ...deps.db!,
+        recordAction: async data => {
+          const row = await record(data);
+          if (
+            !changed &&
+            data.outcome === 'pending' &&
+            JSON.parse(data.proposal_json).remediationCandidateId === 'mid-fence'
+          ) {
+            changed = true;
+            world.control = mode.startsWith('pause')
+              ? { ...world.control, pause_state: 'PAUSED', pause_scope: 'effects' }
+              : { ...world.control, epoch: world.control.epoch + 1 };
+          }
+          return row;
+        },
+      };
+      await tick(createTaskmasterState(60000), deps);
+      const row = world.journal.find(
+        item => JSON.parse(item.proposal_json).remediationCandidateId === 'mid-fence'
+      )!;
+      expect(changed).toBe(true);
+      expect(row.outcome).toBe('deferred');
+      expect(world.consumeCalls).toEqual([]);
+      const deadline = row.proof_deadline_at;
+      world.control = { ...world.control, pause_state: 'RUNNING', pause_scope: null };
+      world.nowMs += 60000;
+      await tick(createTaskmasterState(60000), deps);
+      expect(
+        world.sentMessages.filter(item => item.idempotency_key.startsWith('tm:remediation_nudge:'))
+      ).toHaveLength(1);
+      expect(row.outcome).toBe('sent');
+      expect(row.proof_deadline_at).toBe(deadline);
+    }
+  );
+});
+
 describe('Test 4: the per-item intervention cap refuses', () => {
   test('owner thread at the 24h cap: nothing sent and the refusal is recorded', async () => {
     const world = makeWorld();
@@ -579,6 +694,174 @@ describe('Test 8: attempt 2 on a new head nudges again', () => {
     expect(second.idempotency_key).toBe('tm:remediation_nudge:owner/repo#5:2:bbbbbbb');
     expect(second.body).toContain('attempt 2');
     expect(world.consumeCalls.sort()).toEqual(['cand-1', 'cand-2'].sort());
+  });
+});
+
+describe('production candidate lifecycle composition', () => {
+  function dispatchStore(rows: DispatchMessage[], failFirst = false) {
+    const disposals: string[] = [];
+    const deps = {
+      getMessage: async (id: string) => rows.find(row => row.id === id) ?? null,
+      listMessages: (async () =>
+        rows.filter(row => row.status === 'queued' && row.route_disposition === null)) as never,
+      disposeMessageByMachine: (async (data: {
+        id: string;
+        actor: string;
+        disposition: string;
+        requireNoReceipt?: boolean;
+      }) => {
+        expect(data.actor).toBe('system:taskmaster-remediation');
+        expect(data.requireNoReceipt).toBe(true);
+        disposals.push(data.id);
+        if (failFirst && disposals.length === 1)
+          return { ok: false, reason: 'machine_actor_conflict' };
+        const row = rows.find(item => item.id === data.id)!;
+        if (row.route_disposition !== null) return { ok: false, reason: 'already_disposed' };
+        row.route_disposition = 'expired';
+        return { ok: true };
+      }) as never,
+    };
+    return { deps, disposals };
+  }
+
+  test.each(['owner', 'unmatched'])(
+    '%s retains a sent first attempt, reconciles it, and disposes only at supersession/cap',
+    async mode => {
+      const world = makeWorld();
+      const body = candidateBody({ woId: mode === 'owner' ? 'WO-X-01' : null });
+      const rows = [
+        fakeDispatchRow({
+          id: 'first',
+          recipient: 'taskmaster',
+          task_type: 'run_review',
+          body: JSON.stringify(body),
+        }),
+      ];
+      const store = dispatchStore(rows);
+      const deps = makeDeps(world, {
+        listThreads: async () => [ownerThread()],
+        listRemediationCandidates: () => defaultListRemediationCandidates(store.deps.listMessages),
+        consumeRemediationCandidate: async id => {
+          world.consumeCalls.push(id);
+          await defaultConsumeRemediationCandidate(id, store.deps);
+        },
+      });
+      await tick(createTaskmasterState(60000), deps);
+      expect(rows[0]?.route_disposition).toBeNull();
+      expect(store.disposals).toEqual([]);
+      world.nowMs += 60000;
+      await tick(createTaskmasterState(60000), deps);
+      expect(world.consumeCalls).toEqual(['first', 'first']);
+      expect(
+        world.sentMessages.filter(row => row.idempotency_key.startsWith('tm:remediation_nudge:'))
+      ).toHaveLength(1);
+      rows.push(
+        fakeDispatchRow({
+          id: 'second',
+          recipient: 'taskmaster',
+          task_type: 'run_review',
+          body: JSON.stringify({ ...body, attempt: 2, headSha: 'bbbbbbb2222' }),
+        })
+      );
+      world.nowMs += 60000;
+      await tick(createTaskmasterState(60000), deps);
+      if (mode === 'unmatched') {
+        expect(rows.map(row => row.route_disposition)).toEqual(['expired', null]);
+        expect(
+          world.sentMessages.filter(row => row.idempotency_key.startsWith('tm:remediation_nudge:'))
+        ).toHaveLength(1);
+        world.nowMs += 25 * 60 * 60 * 1000;
+        await tick(createTaskmasterState(60000), deps);
+      }
+      expect(rows.map(row => row.route_disposition)).toEqual(['expired', 'expired']);
+      expect(store.disposals.sort()).toEqual(['first', 'second']);
+      expect(
+        world.sentMessages.filter(row => row.idempotency_key.startsWith('tm:remediation_nudge:'))
+      ).toHaveLength(2);
+    }
+  );
+
+  test.each(['owner', 'unmatched'])(
+    '%s retries failed terminal disposal without sending twice',
+    async mode => {
+      const world = makeWorld();
+      const rows = [
+        fakeDispatchRow({
+          id: 'capped',
+          recipient: 'taskmaster',
+          task_type: 'run_review',
+          body: JSON.stringify(
+            candidateBody({ attempt: 2, woId: mode === 'owner' ? 'WO-X-01' : null })
+          ),
+        }),
+      ];
+      const store = dispatchStore(rows, true);
+      const deps = makeDeps(world, {
+        listThreads: async () => [ownerThread()],
+        listRemediationCandidates: () => defaultListRemediationCandidates(store.deps.listMessages),
+        consumeRemediationCandidate: id => defaultConsumeRemediationCandidate(id, store.deps),
+      });
+      await tick(createTaskmasterState(60000), deps);
+      expect(rows[0]?.route_disposition).toBeNull();
+      const sent = world.journal.find(
+        row => JSON.parse(row.proposal_json).remediationCandidateId === 'capped'
+      )!;
+      expect(sent.outcome).toBe('sent');
+      world.nowMs += 60000;
+      await tick(createTaskmasterState(60000), deps);
+      expect(rows[0]?.route_disposition).toBe('expired');
+      expect(sent.outcome).toBe('sent');
+      expect(store.disposals).toEqual(['capped', 'capped']);
+      expect(
+        world.sentMessages.filter(row => row.idempotency_key.startsWith('tm:remediation_nudge:'))
+      ).toHaveLength(1);
+    }
+  );
+
+  test.each(['agent-message', 'acknowledged', 'addressed', 'wrong-recipient', 'disposed'])(
+    'candidate-shaped %s sibling cannot authorize disposal',
+    async mode => {
+      const first = fakeDispatchRow({
+        id: 'first',
+        recipient: 'taskmaster',
+        task_type: 'run_review',
+        body: JSON.stringify(candidateBody()),
+      });
+      const sibling = fakeDispatchRow({
+        id: 'not-eligible',
+        recipient: mode === 'wrong-recipient' ? 'captain-ci' : 'taskmaster',
+        task_type: mode === 'agent-message' ? 'agent_message' : 'run_review',
+        body: JSON.stringify(candidateBody({ attempt: 2 })),
+      });
+      if (mode === 'acknowledged') sibling.acknowledged_at = new Date(T0).toISOString();
+      if (mode === 'addressed') sibling.addressed_at = new Date(T0).toISOString();
+      if (mode === 'disposed') sibling.route_disposition = 'expired';
+      const store = dispatchStore([first, sibling]);
+      await defaultConsumeRemediationCandidate('first', store.deps);
+      expect(first.route_disposition).toBeNull();
+      expect(store.disposals).toEqual([]);
+    }
+  );
+
+  test('target acknowledgment during observation prevents machine disposal', async () => {
+    const target = fakeDispatchRow({
+      id: 'capped',
+      recipient: 'taskmaster',
+      task_type: 'run_review',
+      body: JSON.stringify(candidateBody({ attempt: 2 })),
+    });
+    const store = dispatchStore([target]);
+    let reads = 0;
+    await defaultConsumeRemediationCandidate('capped', {
+      ...store.deps,
+      getMessage: async () => {
+        reads++;
+        return reads === 1 ? target : { ...target, acknowledged_at: new Date(T0).toISOString() };
+      },
+    });
+    expect(reads).toBe(2);
+    expect(store.disposals).toEqual([]);
+    expect(target.route_disposition).toBeNull();
   });
 });
 
