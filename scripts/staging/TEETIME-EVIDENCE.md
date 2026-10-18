@@ -497,3 +497,43 @@ The fixed synthetic authorityHash (sha256 followed by64 a characters) is not a
 loaded RunAuthority and cannot qualify authority admission. Independent architect
 review approved source publication/CI only; runtime needs the new exact frozen
 source, complete helper manifest, composite image IDs and exact-source CI first.
+
+## Pure commit-object candidate (source-only)
+
+The reviewer contract still requires headCommit; a tree ID or invented40-hex value
+cannot satisfy it. teetime_git_commit.py exposes build_candidate_commit(files,
+expected_format=..., parent_commit=..., identity=CommitIdentity(name,email),
+timestamp=..., message=...). It recomputes the complete GitSnapshot using the
+existing constructor and returns that immutable snapshot plus an immutable
+GitObject(kind='commit'). Both author/committer use the separate trusted identity
+fields, explicit timestamp and fixed UTC offset. The canonical commit header and
+payload produce the actual SHA-1 object ID.
+
+expected_format is required; only sha1 is supported. Exactly one lowercase40-hex
+parent is required. Name/email are nonempty bounded ASCII without controls/header
+delimiters/edge whitespace; email has no whitespace. Timestamp is a nonboolean
+integer from0 through9999999999. Message is exact immutable ASCII bytes,1..4096,
+ending in LF; only printable bytes, tab and LF are allowed. There is no trimming,
+newline normalization, clock lookup, directory scan, Git subprocess, object write
+or ref update. Commit header/payload count toward existing aggregate object-count
+and byte limits; identity collisions with different objects are rejected.
+
+Plan/preflight: the reviewed pure source slice preserves the existing GitSnapshot
+and GitObject contracts, with separate metadata inputs and no workflow adoption.
+RED observed missing teetime_git_commit module before implementation. GREEN8 tests
+cover exact immutable payload/hash, repeatability, content/parent/metadata changes,
+injection, type/message/aggregate bounds and collision, plus isolated trusted Git
+commit-tree/hash-object/cat-file comparison with explicit dates, no signing/hooks/
+system/global config/remotes and no refs. Existing8 Git-object tests also pass.
+Independent architect final source review approved publication/CI within this
+four-file slice. No runtime or workflow adoption is approved by that source review.
+
+```text
+python -m unittest discover -s scripts/staging -p test_teetime_git_commit.py
+```
+
+STOP POINT: this creates an authentic commit-object candidate, not an established
+repository head. Parent existence/type/membership and relationship to frozen
+RunAuthority.baseSha are unverified trusted-controller obligations. Input custody,
+authority, reviewer wire, ReviewBinding.headCommit adoption, publication/ref update,
+atomic approval consumption, policy and workflow admission remain unchanged.
