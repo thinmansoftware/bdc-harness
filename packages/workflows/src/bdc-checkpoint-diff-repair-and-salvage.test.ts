@@ -75,7 +75,7 @@ function nodeBash(id: string, lane = 'bdc-feature-development-codex.yaml'): stri
   return bash;
 }
 afterEach(() => {
-  for (const dir of tempDirs.splice(0)) removeTempDirWithRetry(dir);
+  for (const dir of tempDirs.splice(0)) removeTempDirWithRetry(dir, { throwOnFailure: true });
 });
 
 function checkpointFixture() {
