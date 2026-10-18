@@ -32,7 +32,12 @@ import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { createRecord, writeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
-import { findWoClaim, resolveGithubRepo, type WoClaim } from './already-satisfied.js';
+import {
+  ClaimDiscoveryError,
+  findWoClaim,
+  resolveGithubRepo,
+  type WoClaim,
+} from './already-satisfied.js';
 import { acquireWoLock, releaseWoLock } from './wo-lock.js';
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
 import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
@@ -425,6 +430,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     );
   }
 
+  const claimProject = project;
   // WO-level exclusive lock (bdc-xo#1546): cascadeId admission alone does not
   // stop two different cascades from racing the same WO.
   const woLock = await acquireWoLockImpl(woId, project, cascadeId, outDir);
@@ -459,50 +465,6 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     return blocked;
   }
 
-  // Already-satisfied / claim check before any provider spend (M-123 Q5 / #1546).
-  if (!allowClaimed) {
-    const existingClaim = await findWoClaimImpl(woId, project);
-    if (existingClaim) {
-      console.log(
-        `[smart-cauldron] ALREADY SATISFIED woId=${woId}: PR #${existingClaim.number} ` +
-          `[${existingClaim.state}] ${existingClaim.url} -- skipping cascade`
-      );
-      const refused: CascadeRunRecord = {
-        cascadeId,
-        woId,
-        project,
-        request: {
-          woClass: woClass ?? null,
-          tags: [...(tags ?? [])].sort(),
-          entryOverride: entryOverride ?? null,
-          dryRun: false,
-        },
-        createdAt,
-        status: 'refused',
-        winningTier: null,
-        attempts: [],
-        totalCostUsd: null,
-        telemetry: {
-          entryTier: entryTierName,
-          climbed: false,
-          climbCount: 0,
-          wonCheap: false,
-        },
-        refusalReason: {
-          reason: 'already-satisfied',
-          prNumber: existingClaim.number,
-          prState: existingClaim.state,
-          prUrl: existingClaim.url,
-          checkedAtTier: null,
-        },
-      };
-      const admissionEarly = await createRecordImpl(refused, outDir);
-      onAdmission?.(admissionEarly.record, admissionEarly.created);
-      await releaseWoLockImpl(woId, project, cascadeId, outDir);
-      return admissionEarly.record;
-    }
-  }
-
   // Cascade loop
   const attempts: CascadeAttempt[] = [];
   try {
@@ -532,6 +494,24 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
     let refusalReason: CascadeRunRecord['refusalReason'];
+    let claimDiscoveryBlock: CascadeRunRecord['claimDiscoveryBlock'];
+
+    async function discoverClaim(
+      phase: NonNullable<CascadeRunRecord['claimDiscoveryBlock']>['phase']
+    ): Promise<WoClaim | null> {
+      try {
+        return await findWoClaimImpl(woId, claimProject);
+      } catch (error) {
+        status = 'blocked';
+        winningTier = null;
+        claimDiscoveryBlock = {
+          phase,
+          reason: error instanceof ClaimDiscoveryError ? error.code : 'request_failed',
+          checkedAt: new Date().toISOString(),
+        };
+        return null;
+      }
+    }
 
     function buildCurrentRecord(): CascadeRunRecord {
       const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
@@ -561,6 +541,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
         ...(refusalReason ? { refusalReason } : {}),
+        ...(claimDiscoveryBlock ? { claimDiscoveryBlock } : {}),
         ...(entrySelection ? { entrySelection } : {}),
       };
     }
@@ -569,11 +550,30 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       return writeRecordImpl(buildCurrentRecord(), outDir);
     }
 
+    // Discovery and persistence are inside the WO-lock finally, including refusals.
+    if (!allowClaimed) {
+      const existingClaim = await discoverClaim('admission');
+      if (existingClaim) {
+        console.log(
+          `[smart-cauldron] ALREADY SATISFIED woId=${woId}: PR #${existingClaim.number} ` +
+            `[${existingClaim.state}] ${existingClaim.url} -- skipping cascade`
+        );
+        status = 'refused';
+        refusalReason = {
+          reason: 'already-satisfied',
+          prNumber: existingClaim.number,
+          prState: existingClaim.state,
+          prUrl: existingClaim.url,
+          checkedAtTier: null,
+        };
+      }
+    }
+
     // Persist admission before any provider lane can be fired. A duplicate dispatch
     // returns the existing record and cannot create a second provider attempt.
     const admission = await createRecordImpl(buildCurrentRecord(), outDir);
     onAdmission?.(admission.record, admission.created);
-    if (!admission.created) return admission.record;
+    if (!admission.created || claimDiscoveryBlock || refusalReason) return admission.record;
 
     /**
      * Shared climb/frontier logic for both the gate-fail path and the
@@ -835,7 +835,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       // Re-check claim before each provider fire (another cascade or human may
       // have landed a PR while we were climbing).
       if (!allowClaimed) {
-        const claimBeforeFire = await findWoClaimImpl(woId, project);
+        const claimBeforeFire = await discoverClaim('before-fire');
+        if (claimDiscoveryBlock) {
+          attempt.outcome = 'infra-error';
+          attempt.infraErrorReason = 'Claim discovery unavailable before provider fire';
+          attempt.completedAt = new Date().toISOString();
+          await checkpoint();
+          break;
+        }
         if (claimBeforeFire) {
           console.log(
             `[smart-cauldron] ALREADY SATISFIED before tier=${tier.name}: PR #${claimBeforeFire.number} ` +
@@ -1096,7 +1103,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       // Before climbing, re-check whether the work already landed under another
       // branch/PR the per-run event feed missed (the classic 5-tier burn).
       if (!allowClaimed) {
-        const claimBeforeClimb = await findWoClaimImpl(woId, project);
+        const claimBeforeClimb = await discoverClaim('before-climb');
+        if (claimDiscoveryBlock) {
+          await checkpoint();
+          break;
+        }
         if (claimBeforeClimb) {
           console.log(
             `[smart-cauldron] ALREADY SATISFIED after gate-fail on tier=${tier.name}: ` +

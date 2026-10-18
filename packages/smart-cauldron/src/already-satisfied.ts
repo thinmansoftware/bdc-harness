@@ -116,75 +116,100 @@ export function textClaimsWoId(text: string, woId: string): boolean {
   return false;
 }
 
-interface GhPrRow {
-  number?: number;
-  state?: string;
-  title?: string;
-  url?: string;
-  headRefName?: string;
-  body?: string;
+export class ClaimDiscoveryError extends Error {
+  constructor(readonly code: 'request_failed' | 'invalid_response' | 'invalid_repository') {
+    super(`claim_discovery_${code}`);
+    this.name = 'ClaimDiscoveryError';
+  }
 }
 
 export async function ghPrSearchDefault(
   repo: string,
   woId: string,
-  execFn: typeof execFileAsync = execFileAsync
+  execFn: (
+    command: string,
+    args: string[],
+    options: { timeout: number; maxBuffer: number }
+  ) => Promise<{ stdout: string; stderr: string }> = execFileAsync
 ): Promise<WoClaim[]> {
   if (process.env.SMART_CAULDRON_HERMETIC === '1') {
-    console.log('[smart-cauldron/already-satisfied] skipping GitHub search in hermetic mode');
+    console.log('[smart-cauldron/already-satisfied] skipping GitHub discovery in hermetic mode');
     return [];
   }
+  const safeRepo = /^[A-Za-z0-9_-]+\/[A-Za-z0-9_-][A-Za-z0-9_.-]*$/;
+  if (safeRepo.exec(repo)?.[0] !== repo) throw new ClaimDiscoveryError('invalid_repository');
+  let stdout: string;
   try {
-    const { stdout } = await execFn(
+    ({ stdout } = await execFn(
       'gh',
       [
-        'pr',
-        'list',
-        '--repo',
-        repo,
-        '--state',
-        'all',
-        '--search',
-        woId,
-        '--limit',
-        '20',
-        '--json',
-        'number,state,title,url,headRefName,body',
+        'api',
+        `repos/${repo}/pulls?state=all&per_page=100&sort=created&direction=asc`,
+        '--paginate',
+        '--slurp',
       ],
-      { timeout: 30000 }
-    );
-    const rows = JSON.parse(stdout || '[]') as GhPrRow[];
-    if (!Array.isArray(rows)) return [];
+      // Complete PR histories include bodies; keep a finite bound without the
+      // default execFile buffer truncating ordinary multi-page repositories.
+      { timeout: 30000, maxBuffer: 16 * 1024 * 1024 }
+    ));
+  } catch {
+    // Do not expose provider diagnostics or interpret failed pagination as absence.
+    throw new ClaimDiscoveryError('request_failed');
+  }
+  try {
+    const pages: unknown = JSON.parse(stdout);
+    if (!Array.isArray(pages) || pages.length === 0) throw new Error('missing pages');
     const out: WoClaim[] = [];
-    for (const row of rows) {
-      const stateRaw = (row.state ?? '').toUpperCase();
-      if (stateRaw !== 'OPEN' && stateRaw !== 'MERGED') continue;
-      const number = typeof row.number === 'number' ? row.number : NaN;
-      if (!Number.isFinite(number)) continue;
-      const title = row.title ?? '';
-      const body = row.body ?? '';
-      const head = row.headRefName ?? '';
-      const url = row.url ?? '';
-      if (
-        !textClaimsWoId(title, woId) &&
-        !textClaimsWoId(body, woId) &&
-        !textClaimsWoId(head, woId)
-      ) {
-        continue;
+    const seen = new Map<number, string>();
+    for (const page of pages) {
+      if (!Array.isArray(page)) throw new Error('invalid page');
+      for (const value of page) {
+        if (!value || typeof value !== 'object') throw new Error('invalid row');
+        const row = value as Record<string, unknown>;
+        const head = row.head as Record<string, unknown> | null;
+        if (
+          typeof row.number !== 'number' ||
+          !Number.isSafeInteger(row.number) ||
+          row.number <= 0 ||
+          (row.state !== 'open' && row.state !== 'closed') ||
+          typeof row.title !== 'string' ||
+          (row.body !== null && typeof row.body !== 'string') ||
+          !head ||
+          typeof head.ref !== 'string' ||
+          !head.ref ||
+          typeof row.html_url !== 'string' ||
+          !row.html_url ||
+          (row.merged_at !== null &&
+            (typeof row.merged_at !== 'string' ||
+              !Number.isFinite(Date.parse(row.merged_at)) ||
+              row.state !== 'closed'))
+        ) {
+          throw new Error('invalid row');
+        }
+        const { number, title, html_url: url } = row;
+        const body = row.body ?? '';
+        const fingerprint = JSON.stringify([row.state, row.merged_at, title, body, head.ref, url]);
+        const prior = seen.get(number);
+        if (prior !== undefined) {
+          if (prior !== fingerprint) throw new Error('conflicting page overlap');
+          continue;
+        }
+        seen.set(number, fingerprint);
+        // Validate every row before deciding whether it is a relevant claim.
+        if (row.state === 'closed' && row.merged_at === null) continue;
+        if (
+          !textClaimsWoId(title, woId) &&
+          !textClaimsWoId(body, woId) &&
+          !textClaimsWoId(head.ref, woId)
+        ) {
+          continue;
+        }
+        out.push({ number, state: row.merged_at === null ? 'OPEN' : 'MERGED', title, url, repo });
       }
-      out.push({
-        number,
-        state: stateRaw as WoClaimState,
-        title,
-        url,
-        repo,
-      });
     }
     return out;
   } catch {
-    // Fail open on gh outage -- cascade must not die because GitHub search blipped.
-    // Callers treat null/empty as "unknown, proceed" and rely on other gates.
-    return [];
+    throw new ClaimDiscoveryError('invalid_response');
   }
 }
 

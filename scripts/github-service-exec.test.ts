@@ -159,6 +159,61 @@ describe('complete REST pull-list quota admission', () => {
     expect(tokens).toEqual(['synthetic-app', 'synthetic-fallback']);
   });
 
+  test('actual Smart Cauldron discovery crosses the metered wrapper with Search exhausted', async () => {
+    const { ghPrSearchDefault } = await import('../packages/smart-cauldron/src/already-satisfied');
+    const originalHermetic = process.env.SMART_CAULDRON_HERMETIC;
+    delete process.env.SMART_CAULDRON_HERMETIC;
+    try {
+      await exhaust('search');
+      const commands: string[][] = [];
+      const claims = await ghPrSearchDefault(
+        'synthetic/test',
+        'WO-TEST-001',
+        async (command, argv) => {
+          const result = await runGitHubServiceCommand({
+            service: identity.service,
+            identity,
+            command,
+            args: argv as string[],
+            execute: executed => {
+              commands.push(executed);
+              return {
+                exitCode: 0,
+                stdout: new TextEncoder().encode(
+                  JSON.stringify([
+                    [
+                      {
+                        number: 1,
+                        state: 'closed',
+                        merged_at: '2026-10-18T00:00:00Z',
+                        title: 'Implements WO-TEST-001',
+                        body: null,
+                        head: { ref: 'synthetic' },
+                        html_url: 'https://github.com/synthetic/test/pull/1',
+                      },
+                    ],
+                  ])
+                ),
+                stderr: new TextEncoder().encode(
+                  '* Request at synthetic\n< HTTP/2 200\n< x-ratelimit-resource: core\n* Request took synthetic\n'
+                ),
+              };
+            },
+          });
+          return {
+            stdout: new TextDecoder().decode(result.stdout),
+            stderr: new TextDecoder().decode(result.stderr),
+          };
+        }
+      );
+      expect(commands).toEqual([['gh', ...args]]);
+      expect(claims).toMatchObject([{ number: 1, state: 'MERGED' }]);
+    } finally {
+      if (originalHermetic === undefined) delete process.env.SMART_CAULDRON_HERMETIC;
+      else process.env.SMART_CAULDRON_HERMETIC = originalHermetic;
+    }
+  });
+
   test('an unexpected traced Search response remains metered and blocks a later unknown command', async () => {
     await runGitHubServiceCommand({
       service: identity.service,
