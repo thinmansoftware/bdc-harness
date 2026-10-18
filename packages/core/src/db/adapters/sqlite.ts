@@ -89,6 +89,7 @@ export class SqliteAdapter implements IDatabase {
   private wave2Installing = false;
 
   constructor(dbPath: string) {
+    const bootstrapStartedAt = performance.now();
     // Ensure directory exists
     const dir = dirname(dbPath);
     if (!existsSync(dir)) {
@@ -111,7 +112,7 @@ export class SqliteAdapter implements IDatabase {
     this.ensureTmExpectationsShape();
 
     // Initialize schema if needed
-    this.initSchema();
+    this.initSchema(bootstrapStartedAt);
   }
 
   /**
@@ -124,9 +125,20 @@ export class SqliteAdapter implements IDatabase {
     if (!this.wave2SchemaPromise) {
       this.wave2SchemaPromise = (async (): Promise<void> => {
         this.wave2Installing = true;
+        const startedAt = performance.now();
         try {
           await installM31TargetV2Sqlite(this);
+          const m31FinishedAt = performance.now();
           await installOverseerControlPlaneSqlite(this);
+          const finishedAt = performance.now();
+          getLog().info(
+            {
+              m31Ms: m31FinishedAt - startedAt,
+              controlPlaneMs: finishedAt - m31FinishedAt,
+              totalMs: finishedAt - startedAt,
+            },
+            'db.sqlite_wave2_bootstrap_timing'
+          );
         } finally {
           this.wave2Installing = false;
         }
@@ -422,10 +434,14 @@ export class SqliteAdapter implements IDatabase {
     }
   }
 
-  private initSchema(): void {
+  private initSchema(bootstrapStartedAt: number): void {
+    const schemaStartedAt = performance.now();
     this.createSchema();
+    const schemaCreatedAt = performance.now();
     this.migrateColumns();
+    const columnsMigratedAt = performance.now();
     this.seedDispatchPrincipals();
+    const principalsSeededAt = performance.now();
     // Phase 1.5 partial unique indexes must run only after sender_principal_id exists.
     const postMigrateCols = this.pragmaAll("PRAGMA table_info('agent_dispatch_messages')") as {
       name: string;
@@ -463,6 +479,19 @@ export class SqliteAdapter implements IDatabase {
     // per the established pattern.
     this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_snapshot ON tm_adoption(snapshot_id)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_thread ON tm_adoption(thread_ref)');
+    const finishedAt = performance.now();
+    getLog().info(
+      {
+        // Preparation includes directory/open/PRAGMAs and the pre-schema shape check.
+        prepareMs: schemaStartedAt - bootstrapStartedAt,
+        createSchemaMs: schemaCreatedAt - schemaStartedAt,
+        migrateColumnsMs: columnsMigratedAt - schemaCreatedAt,
+        seedPrincipalsMs: principalsSeededAt - columnsMigratedAt,
+        postMigrationIndexesMs: finishedAt - principalsSeededAt,
+        totalMs: finishedAt - bootstrapStartedAt,
+      },
+      'db.sqlite_bootstrap_timing'
+    );
   }
 
   /**
