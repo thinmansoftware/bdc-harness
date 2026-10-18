@@ -65,6 +65,46 @@ describe('dagNodeSchema wall_timeout_ms field', () => {
   });
 });
 
+describe('dagNodeSchema deny_pull_request_mutations field', () => {
+  it('keeps the flag on a command node through parse', () => {
+    const node = dagNodeSchema.parse({
+      id: 'guarded',
+      command: 'my-cmd',
+      deny_pull_request_mutations: true,
+    });
+    expect(node.deny_pull_request_mutations).toBe(true);
+  });
+
+  it('keeps the flag on a prompt node through parse', () => {
+    const node = dagNodeSchema.parse({
+      id: 'opus-repair',
+      prompt: 'Repair it.',
+      deny_pull_request_mutations: true,
+    });
+    expect(node.deny_pull_request_mutations).toBe(true);
+  });
+
+  it('keeps the flag on a loop node through parse', () => {
+    const node = dagNodeSchema.parse({
+      id: 'implement',
+      deny_pull_request_mutations: true,
+      loop: { prompt: 'Implement it.', until: 'COMPLETE', max_iterations: 1 },
+    });
+    expect(node.deny_pull_request_mutations).toBe(true);
+  });
+
+  it('keeps an explicit false and omits the field when unset', () => {
+    const denied = dagNodeSchema.parse({
+      id: 'guarded',
+      command: 'my-cmd',
+      deny_pull_request_mutations: false,
+    });
+    const plain = dagNodeSchema.parse({ id: 'plain', command: 'my-cmd' });
+    expect(denied.deny_pull_request_mutations).toBe(false);
+    expect(plain.deny_pull_request_mutations).toBeUndefined();
+  });
+});
+
 describe('deriveNodeExecutionRequirements', () => {
   it('keeps a text-only plan eligible for chat providers', () => {
     const node = dagNodeSchema.parse({ id: 'plan', prompt: 'Plan it.', allowed_tools: [] });

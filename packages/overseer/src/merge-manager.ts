@@ -11,6 +11,7 @@ import {
   type MergeProvenanceResult,
 } from './merge-provenance';
 import type { QualifiedMergeEvidence } from './actions/merge-ready';
+import { isBuilderWorktreeHead } from './merge-candidate-discovery';
 import {
   getRepoBasePolicy,
   hasRepoPolicyEntry,
@@ -551,6 +552,12 @@ async function mergePreconditionMiss(
   useLegacyAllowedBases: boolean,
   reviewGateLogin: string
 ): Promise<string | null> {
+  // Second layer of the builder-worktree gate (bdc-xo#2307). A run-derived
+  // candidate whose head is archon/(task|thread)-* must not merge even if
+  // discovery never saw it. Same predicate as discovery.
+  if (isBuilderWorktreeHead(evidence.record.headBranch)) {
+    return 'builder_worktree_head';
+  }
   const headSha = evidence.head_sha;
   const checks = evidence.required_checks;
   if (

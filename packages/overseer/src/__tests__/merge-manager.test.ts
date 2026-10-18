@@ -978,7 +978,7 @@ describe('per-repo base effect overrides', () => {
     return {
       ...record,
       repo,
-      headBranch: 'archon/thread-effects',
+      headBranch: 'fix/effects-thread',
       prEvidence: {
         ...record.prEvidence,
         pr: { owner: 'thinmansoftware', repo, number: 91 },
@@ -1200,5 +1200,45 @@ describe('per-repo merge base policy', () => {
     } finally {
       delete process.env.MERGE_MANAGER_ALLOWED_BASES;
     }
+  });
+});
+
+describe('merge manager builder worktree head', () => {
+  test('refuses a builder worktree head before any merge mutation', async () => {
+    const builderRecord: WatchedRunRecord = {
+      ...record,
+      headBranch: 'archon/task-web-worker-123',
+    };
+    const assembled = evidence({
+      record: builderRecord,
+      resulting_deployment_effect: 'none',
+    });
+    const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'c'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction: mock(async () => undefined),
+      findPullRequest: async () => builderRecord.prEvidence,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(builderRecord);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'builder_worktree_head',
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(mergePullRequest).not.toHaveBeenCalled();
   });
 });

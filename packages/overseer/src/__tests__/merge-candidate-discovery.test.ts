@@ -1491,3 +1491,116 @@ describe('watchOnce -- an unavailable sweep is distinct from a healthy empty one
     expect(heartbeat?.obj.prDiscoveryUnavailableReason).toBe('not_run');
   });
 });
+
+describe('builder-early pull requests (bdc-xo#2307)', () => {
+  const noInFlight = async (): Promise<ReadonlySet<string>> => new Set();
+
+  test('builder worktree head is not a merge candidate', async () => {
+    let evidenceLookups = 0;
+    const pull = pr({ prNumber: 915, headRef: 'archon/task-web-worker-123' });
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [pull],
+        findPullRequest: async () => {
+          evidenceLookups += 1;
+          return greenEvidence(915);
+        },
+        listInFlightWoIds: noInFlight,
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions).toHaveLength(1);
+    expect(result.exclusions[0]?.reason).toBe('builder_worktree_head');
+    expect(evidenceLookups).toBe(0);
+  });
+
+  test('canonical lane head is still a candidate', async () => {
+    const pull = pr({
+      prNumber: 916,
+      headRef: 'feat/wo-harness-x-01-thread-abc12345',
+      woId: 'WO-HARNESS-X-01',
+    });
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [pull],
+        findPullRequest: async () => greenEvidence(916),
+        listInFlightWoIds: noInFlight,
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    expect(result.exclusions).toHaveLength(0);
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0]?.prEvidence.pr?.number).toBe(916);
+  });
+
+  test('non-canonical sibling of a lane PR is superseded', async () => {
+    const builder = pr({ prNumber: 917, headRef: 'wo/harness-x-01', woId: 'WO-HARNESS-X-01' });
+    const lane = pr({
+      prNumber: 918,
+      headRef: 'fix/wo-harness-x-01-thread-e663f018',
+      woId: 'WO-HARNESS-X-01',
+    });
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [builder, lane],
+        findPullRequest: async input => {
+          const number = input.prNumber ?? 0;
+          return greenEvidence(number);
+        },
+        listInFlightWoIds: noInFlight,
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    const superseded = result.exclusions.find(item => item.prNumber === 917);
+    expect(superseded?.reason).toBe('superseded_by_lane_pr');
+    expect(superseded?.detail).toContain('#918');
+    expect(result.candidates.map(item => item.prEvidence.pr?.number)).toEqual([918]);
+  });
+
+  test('non-canonical PR is held while its lane run is in flight, and lookup failure fails closed', async () => {
+    const pull = pr({ prNumber: 917, headRef: 'wo/harness-x-01', woId: 'WO-HARNESS-X-01' });
+    const held = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [pull],
+        findPullRequest: async () => greenEvidence(917),
+        listInFlightWoIds: async () => new Set(['WO-HARNESS-X-01']),
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+    expect(held.candidates).toHaveLength(0);
+    expect(held.exclusions[0]?.reason).toBe('lane_run_in_flight');
+
+    const unknown = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [pull],
+        findPullRequest: async () => greenEvidence(917),
+        listInFlightWoIds: async () => {
+          throw new Error('db down');
+        },
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+    expect(unknown.candidates).toHaveLength(0);
+    expect(unknown.exclusions[0]?.reason).toBe('lane_provenance_unknown');
+  });
+
+  test('hand PR with no WO id keeps merging', async () => {
+    const pull = pr({ prNumber: 800, headRef: 'board/m-unrefuse-cursor-20260924' });
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [pull],
+        findPullRequest: async () => greenEvidence(800),
+        listInFlightWoIds: noInFlight,
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    expect(result.exclusions).toHaveLength(0);
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0]?.prEvidence.pr?.number).toBe(800);
+  });
+});

@@ -369,7 +369,9 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     // logged OBJECT (not just the message) kills a mutation that always logs zeros.
     const heartbeat = heartbeatFor(entries);
     expect(heartbeat).toBeDefined();
-    expect(heartbeat?.obj).toEqual({ evaluated: 3, total: 3, eligible: 0 });
+    expect(heartbeat?.obj).toEqual(
+      expect.objectContaining({ evaluated: 3, total: 3, eligible: 0 })
+    );
 
     // Zero merge calls -- driven through the REAL service dispatch gate
     // (handleRecord), not an inline copy of its `action === 'merge_ready'` check.
@@ -408,7 +410,9 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     expect(heartbeat).toBeDefined();
     // Assert the logged OBJECT, not just the message: an empty cycle reports all
     // zeros. (A hardcoded-zeros mutation is caught by Test 4's non-zero counts.)
-    expect(heartbeat?.obj).toEqual({ evaluated: 0, total: 0, eligible: 0 });
+    expect(heartbeat?.obj).toEqual(
+      expect.objectContaining({ evaluated: 0, total: 0, eligible: 0 })
+    );
   });
 
   test('Test 4: heartbeat counts a merge-ready run as eligible and the real gate dispatches it', async () => {
@@ -493,7 +497,9 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     // The observability content is correct, not a fixed shape.
     const heartbeat = heartbeatFor(entries);
     expect(heartbeat).toBeDefined();
-    expect(heartbeat?.obj).toEqual({ evaluated: 2, total: 3, eligible: 1 });
+    expect(heartbeat?.obj).toEqual(
+      expect.objectContaining({ evaluated: 2, total: 3, eligible: 1 })
+    );
 
     // Positive control for the dispatch gate: the REAL handleRecord routes the one
     // merge-ready record to the coordinator exactly once (and the skipped one never).
