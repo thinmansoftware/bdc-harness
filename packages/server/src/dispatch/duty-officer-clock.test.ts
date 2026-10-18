@@ -152,6 +152,7 @@ function relayRecoveryFixture(
   const neighbor = message({
     id: 'healthy-mailbox',
     sender: 'taskmaster',
+    sender_principal_id: 'system:taskmaster',
     task_type: 'agent_message',
     idempotency_key: 'tm:digest:2026-10-18',
     subject_key: 'digest:2026-10-18',
