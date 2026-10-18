@@ -21,6 +21,7 @@ import {
   claimOverseerVerdict,
   finalizeOverseerVerdict,
   getOverseerVerdictsForRun,
+  transitionReviewApprovalVerification,
 } from '@archon/core/db/overseer';
 import { createLogger } from '@archon/paths';
 import {
@@ -84,6 +85,7 @@ export function reviewRecordsVerdictEnabled(
 interface ReviewApprovalVerdictDeps {
   claimVerdict: typeof claimOverseerVerdict;
   finalizeVerdict: typeof finalizeOverseerVerdict;
+  transitionVerification?: typeof transitionReviewApprovalVerification;
 }
 
 interface UnverifiedApprovalVerdictDeps extends ReviewApprovalVerdictDeps {
@@ -104,7 +106,17 @@ export async function recordReviewApprovalVerdict(
 ): Promise<void> {
   const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
   const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
-  if (!claim.claimed || !claim.verdictId) return;
+  if (!claim.claimed) {
+    await (deps.transitionVerification ?? transitionReviewApprovalVerification)({
+      runId,
+      headSha: input.headSha,
+      prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+      verified: true,
+      model: input.model,
+    });
+    return;
+  }
+  if (!claim.verdictId) return;
   await deps.finalizeVerdict({
     verdictId: claim.verdictId,
     status: 'verdict',
@@ -203,21 +215,27 @@ export async function recordUnverifiedApprovalVerdict(
   // an approval the reviewer could not verify. Instead, DOWNGRADE the existing row in
   // place to the held, non-mergeable state.
   const getVerdicts = deps.getVerdictsForRun ?? getOverseerVerdictsForRun;
+  const downgraded = await (deps.transitionVerification ?? transitionReviewApprovalVerification)({
+    runId,
+    headSha: input.headSha,
+    prUrl,
+    verified: false,
+    model: input.model,
+  });
+  if (downgraded) return;
+  // This read is diagnostic only. Ownership predicates live in the UPDATE,
+  // never in a read followed by the unconditional finalizer.
   const rowsForRun = await getVerdicts(runId);
   const forHead = rowsForRun.filter(row => row.head_sha === input.headSha);
-  const unclaimed = forHead.find(row => row.actioned_at === null);
-  if (unclaimed) {
-    if (unclaimed.verdict === 'approved_unverified' && unclaimed.proposed_action === 'none') return;
-    await deps.finalizeVerdict({
-      verdictId: unclaimed.id,
-      status: 'verdict',
-      verdict: 'approved_unverified',
-      proposedAction: 'none',
-      model: input.model,
-      prUrl,
-    });
+  if (
+    forHead.some(
+      row =>
+        row.actioned_at === null &&
+        row.verdict === 'approved_unverified' &&
+        row.proposed_action === 'none'
+    )
+  )
     return;
-  }
 
   // No unclaimed row for this head. `actioned_at` being set means two very different
   // things, and conflating them is what let an unverified approval merge:

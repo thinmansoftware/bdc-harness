@@ -369,6 +369,32 @@ describe('handleNodeFailure node-failure Dispatch notification', () => {
     expect(errorPortion.length).toBeLessThanOrEqual(300);
   });
 
+  test('quoted fixture secrets never reach persisted failure notifications', async () => {
+    const runId = 'run-quoted-redaction';
+    await handleNodeFailure(
+      {
+        store: makeStore(),
+        emitter: { emit: () => undefined },
+        log: makeLog({ errors: [] }),
+        logNodeError: () => Promise.resolve(),
+      },
+      makeRun({ id: runId }),
+      node('patch-pr-body'),
+      {
+        ...baseCtx,
+        errorMsg:
+          'unknown failure password="fixture-secret" {"token":"fixture-token"}; Bearer fixture+/tail==; Authorization: Basic basic-fixture==',
+      }
+    );
+    const rows = await dispatchRows(`overseer-node-failure:${runId}:patch-pr-body`);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.body).not.toContain('fixture-secret');
+    expect(rows[0]!.body).not.toContain('fixture-token');
+    expect(rows[0]!.body).not.toContain('tail');
+    expect(rows[0]!.body).not.toContain('basic-fixture');
+    expect(rows[0]!.body).toContain('[redacted]');
+  });
+
   test('14 a failed dispatch write does not throw or recurse; logs once', async () => {
     const recorded: RecordedLog = { errors: [] };
     const run = makeRun({ id: 'run-14' });

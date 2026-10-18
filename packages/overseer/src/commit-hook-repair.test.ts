@@ -14,7 +14,7 @@
  * their own files.
  */
 import { describe, expect, test } from 'bun:test';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -25,6 +25,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import YAML from 'yaml';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..', '..');
@@ -60,6 +61,39 @@ function extractCommitCore(): string {
   if (after === undefined) throw new Error('commit-core start marker not found in commit-and-push');
   const body = after.split(`\n${CORE_END}`)[0];
   return `${body}\n`;
+}
+
+function shellPath(path: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  return process.platform === 'win32'
+    ? normalized.replace(/^([A-Za-z]):/, (_match, drive: string) => `/${drive.toLowerCase()}`)
+    : normalized;
+}
+
+function spawnFixtureBash(
+  script: string,
+  options: { cwd?: string; encoding: 'utf8'; env: NodeJS.ProcessEnv },
+  binDir: string,
+  tool: 'git' | 'gh'
+): SpawnSyncReturns<string> {
+  return spawnSync(
+    'bash',
+    [
+      '-c',
+      'export PATH="$FIXTURE_BIN:$PATH"; [ "$(command -v "$FIXTURE_TOOL")" = "$FIXTURE_BIN/$FIXTURE_TOOL" ] || exit 97; exec bash "$1"',
+      'fixture',
+      shellPath(script),
+    ],
+    {
+      ...options,
+      env: {
+        ...options.env,
+        PATH: process.env.PATH,
+        FIXTURE_BIN: shellPath(binDir),
+        FIXTURE_TOOL: tool,
+      },
+    }
+  );
 }
 
 /** Resolve the real git binary (before any stub is placed on PATH). */
@@ -99,7 +133,7 @@ function makeRealHookRepo(): {
   const eslintConfig = join(meta, 'eslint.config.mjs');
   writeFileSync(
     eslintConfig,
-    `import tseslint from ${JSON.stringify(TS_ESLINT)};\n` +
+    `import tseslint from ${JSON.stringify(pathToFileURL(TS_ESLINT).href)};\n` +
       `export default [{\n` +
       `  files: ['**/*.ts'],\n` +
       `  languageOptions: { parser: tseslint.parser },\n` +
@@ -143,7 +177,6 @@ function makeRealHookRepo(): {
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    PATH: `${binDir}:${process.env.PATH ?? ''}`,
   };
   return {
     repo,
@@ -162,17 +195,22 @@ function runCore(
   stageMode: 'all' | 'prestaged',
   message = 'feat: commit-hook-repair fixture'
 ): { status: number | null; stdout: string } {
-  const r = spawnSync('bash', [ctx.coreScript], {
-    cwd: ctx.repo,
-    encoding: 'utf8',
-    env: {
-      ...ctx.env,
-      CORE_COMMIT_MESSAGE: message,
-      CORE_HOOK_OUTPUT_FILE: ctx.hookOut,
-      CORE_STAGE_MODE: stageMode,
-      CORE_ATTEMPT_FILE: ctx.attemptFile,
+  const r = spawnFixtureBash(
+    ctx.coreScript,
+    {
+      cwd: ctx.repo,
+      encoding: 'utf8',
+      env: {
+        ...ctx.env,
+        CORE_COMMIT_MESSAGE: message,
+        CORE_HOOK_OUTPUT_FILE: ctx.hookOut,
+        CORE_STAGE_MODE: stageMode,
+        CORE_ATTEMPT_FILE: ctx.attemptFile,
+      },
     },
-  });
+    join(ctx.meta, 'bin'),
+    'git'
+  );
   return { status: r.status, stdout: `${r.stdout ?? ''}${r.stderr ?? ''}` };
 }
 
@@ -345,15 +383,19 @@ describe('Test 7: unpushed_repair_makes_open_pr_draft', () => {
     const gateScript = join(binDir, 'gate.sh');
     writeFileSync(gateScript, gateBash);
 
-    const r = spawnSync('bash', [gateScript], {
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        PATH: `${binDir}:${process.env.PATH ?? ''}`,
-        ARCHON_NODE_OUT: nodeOut,
-        ARTIFACTS_DIR: artifacts,
+    const r = spawnFixtureBash(
+      gateScript,
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ARCHON_NODE_OUT: nodeOut,
+          ARTIFACTS_DIR: artifacts,
+        },
       },
-    });
+      binDir,
+      'gh'
+    );
 
     // load_bearing failure -- the run fails closed.
     expect(r.status).not.toBe(0);
@@ -475,15 +517,19 @@ describe('Test 7b: gate_reports_class_and_attempt', () => {
     if (!gateBash) throw new Error('commit-hook-gate node/bash missing');
     const gateScript = join(binDir, 'gate.sh');
     writeFileSync(gateScript, gateBash);
-    const r = spawnSync('bash', [gateScript], {
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        PATH: `${binDir}:${process.env.PATH ?? ''}`,
-        ARCHON_NODE_OUT: nodeOut,
-        ARTIFACTS_DIR: artifacts,
+    const r = spawnFixtureBash(
+      gateScript,
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ARCHON_NODE_OUT: nodeOut,
+          ARTIFACTS_DIR: artifacts,
+        },
       },
-    });
+      binDir,
+      'gh'
+    );
     return { status: r.status, stdout: `${r.stdout ?? ''}${r.stderr ?? ''}` };
   }
 

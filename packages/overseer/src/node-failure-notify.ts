@@ -50,20 +50,38 @@ const MAX_ERROR_LINE = 300;
  * carries more than this first line regardless.
  */
 export function redactSecretsFromErrorLine(line: string): string {
-  return (
-    line
-      // Authorization: Bearer xxxxx  /  Authorization xxxxx
-      .replace(
-        /\bauthorization\b\s*[:=]?\s*(?:bearer\s+)?[^\s,;'"]+/gi,
-        'Authorization: [redacted]'
-      )
-      .replace(/\bbearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]')
-      // token / api[_-]key / key / secret / password / passwd / pwd = value
-      .replace(
-        /\b(api[_-]?key|access[_-]?token|secret|password|passwd|pwd|token|key)\b\s*[:=]\s*[^\s,;'"]+/gi,
-        '$1=[redacted]'
-      )
-  );
+  const assignment =
+    /\b(authorization|api[_-]?key|access[_-]?token|secret|password|passwd|pwd|token|key)\b["']?\s*[:=]\s*|\bauthorization\b\s+|\bbearer\s+/gi;
+  const pieces: string[] = [];
+  let copied = 0;
+  let match: RegExpExecArray | null;
+  while ((match = assignment.exec(line)) !== null) {
+    let end = assignment.lastIndex;
+    const authorization = /^authorization\b/i.test(match[0]);
+    const quote = line[end];
+    if (quote === '"' || quote === "'") {
+      end += 1;
+      // Escapes consume the next character. An unterminated value consumes
+      // the remaining line, rather than exposing a partially quoted secret.
+      while (end < line.length) {
+        if (line[end] === '\\') {
+          end = Math.min(end + 2, line.length);
+        } else if (line[end++] === quote) {
+          break;
+        }
+      }
+    } else {
+      // Unquoted Authorization may include Basic or another scheme plus a
+      // credential. Conservatively remove its whole field through a delimiter.
+      const delimiter = authorization ? /[,;]/ : /[\s,;]/;
+      while (end < line.length && !delimiter.test(line[end])) end += 1;
+    }
+    pieces.push(line.slice(copied, assignment.lastIndex), '[redacted]');
+    copied = end;
+    assignment.lastIndex = end;
+  }
+  pieces.push(line.slice(copied));
+  return pieces.join('');
 }
 
 /**

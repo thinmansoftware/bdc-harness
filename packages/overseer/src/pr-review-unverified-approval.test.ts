@@ -206,6 +206,15 @@ describe('unverified approval end-to-end (WO node-failure-repair)', () => {
     const captured: ReviewEventCapture[] = [];
     const outcome = await runAndSubmitReview(work('msg-21c'), deps(captured, 'APPROVE'));
     expect(outcome.disposition).toBe('approved');
+    const rows = await verdictRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.verdict).toBe('merge_candidate');
+    expect(rows[0]?.proposed_action).toBe('flag_merge_ready');
+    const { listUnactionedFlagMergeReadyVerdicts, claimVerdictForMergeExecution } =
+      await import('@archon/core/db/overseer');
+    const ready = await listUnactionedFlagMergeReadyVerdicts();
+    expect(ready).toHaveLength(1);
+    expect(await claimVerdictForMergeExecution(ready[0]!.id)).toBe(true);
   });
 
   test('22 a repeated unverified approval writes exactly one duty-officer message', async () => {
@@ -286,6 +295,78 @@ describe('unverified approval end-to-end (WO node-failure-repair)', () => {
 
     // The unverified outcome still escalates: the bounded re-review is enqueued.
     expect(await reviewWorkItems()).toHaveLength(1);
+  });
+
+  test.each([
+    'wrong-run',
+    'wrong-head',
+    'wrong-pr',
+    'status',
+    'verdict',
+    'action',
+    'actioned',
+    'mutation',
+    'reason',
+    'merge',
+  ])('held promotion preserves ineligible %s evidence', async kind => {
+    await runAndSubmitReview(work('held'), deps([], 'APPROVE_UNVERIFIED', 'fixture unavailable'));
+    const edits: Record<string, string> = {
+      status: "status = 'claimed'",
+      verdict: "verdict = 'CHANGES_REQUESTED'",
+      action: "proposed_action = 'other'",
+      actioned: "actioned_at = '2026-01-01'",
+      mutation: 'mutation_sent = 0',
+      reason: "action_reason = 'processing'",
+      merge: "merge_sha = 'merged-fixture'",
+    };
+    if (edits[kind]) await db.query(`UPDATE overseer_verdicts SET ${edits[kind]}`);
+    const before = await db.query('SELECT * FROM overseer_verdicts');
+    const { transitionReviewApprovalVerification } = await import('@archon/core/db/overseer');
+    expect(
+      await transitionReviewApprovalVerification({
+        runId:
+          kind === 'wrong-run'
+            ? 'pr-discovery:other/repo#55'
+            : `pr-discovery:${OWNER}/${REPO}#${PR}`,
+        headSha: kind === 'wrong-head' ? 'other-head' : HEAD,
+        prUrl: `https://github.com/${OWNER}/${REPO}/pull/${kind === 'wrong-pr' ? 56 : PR}`,
+        verified: true,
+      })
+    ).toBe(false);
+    expect((await db.query('SELECT * FROM overseer_verdicts')).rows).toEqual(before.rows);
+  });
+
+  test('merge claim winning at the conditional downgrade boundary is never overwritten', async () => {
+    await runAndSubmitReview(work('before-race'), deps([], 'APPROVE'));
+    const {
+      claimOverseerVerdict,
+      finalizeOverseerVerdict,
+      claimVerdictForMergeExecution,
+      transitionReviewApprovalVerification,
+    } = await import('@archon/core/db/overseer');
+    const { recordUnverifiedApprovalVerdict } = await import('./pr-review-wiring');
+    const row = (await db.query<{ id: string }>('SELECT id FROM overseer_verdicts')).rows[0]!;
+    await recordUnverifiedApprovalVerdict(
+      { owner: OWNER, repo: REPO, prNumber: PR, headSha: HEAD },
+      {
+        claimVerdict: claimOverseerVerdict,
+        finalizeVerdict: finalizeOverseerVerdict,
+        transitionVerification: async input => {
+          expect(await claimVerdictForMergeExecution(row.id)).toBe(true);
+          return transitionReviewApprovalVerification(input);
+        },
+      }
+    );
+    const after = (
+      await db.query<{ verdict: string; action_reason: string; proposed_action: string }>(
+        'SELECT verdict, action_reason, proposed_action FROM overseer_verdicts'
+      )
+    ).rows[0]!;
+    expect(after).toEqual({
+      verdict: 'merge_candidate',
+      proposed_action: 'flag_merge_ready',
+      action_reason: 'processing',
+    });
   });
 
   test('22 the verified path writes no duty-officer unverified escalation', async () => {

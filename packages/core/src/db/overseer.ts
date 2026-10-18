@@ -690,6 +690,36 @@ export async function claimOverseerVerdict(input: {
   return { claimed: true, verdictId: row.id, retryCount: nextRetry };
 }
 
+/** Change only an exact, unactioned review approval between verified and held. */
+export async function transitionReviewApprovalVerification(input: {
+  runId: string;
+  headSha: string;
+  prUrl: string;
+  verified: boolean;
+  model?: string;
+}): Promise<boolean> {
+  const result = await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET verdict = $4, proposed_action = $5, model = $6, updated_at = $7
+     WHERE run_id = $1 AND head_sha = $2 AND pr_url = $3
+       AND status = 'verdict' AND verdict = $8 AND proposed_action = $9
+       AND actioned_at IS NULL AND mutation_sent IS NULL
+       AND action_reason IS NULL AND merge_sha IS NULL`,
+    [
+      input.runId,
+      input.headSha,
+      input.prUrl,
+      input.verified ? 'merge_candidate' : 'approved_unverified',
+      input.verified ? 'flag_merge_ready' : 'none',
+      input.model ?? null,
+      new Date().toISOString(),
+      input.verified ? 'approved_unverified' : 'merge_candidate',
+      input.verified ? 'none' : 'flag_merge_ready',
+    ]
+  );
+  return result.rowCount === 1;
+}
+
 /** Finalize a claimed verdict row with either a semantic verdict or a health-alarm state. */
 export async function finalizeOverseerVerdict(input: {
   verdictId: string;
