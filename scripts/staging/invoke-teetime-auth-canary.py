@@ -23,6 +23,7 @@ def main():
     parser.add_argument('--expected-sha', required=True)
     parser.add_argument('--synthetic', action='store_true')
     parser.add_argument('--disconnect-before-auth', action='store_true')
+    parser.add_argument('--frame-test', choices=['partial', 'oversized'])
     args = parser.parse_args()
     assert re.fullmatch('sha256:[a-f0-9]{64}', args.image)
     assert re.fullmatch('[a-f0-9]{40}', args.expected_sha)
@@ -69,7 +70,9 @@ def main():
             child.kill(); child.wait(timeout=5)
             print(json.dumps({'disconnectInjected': True, 'owner': ready['owner'], 'credentialsUsed': False}))
             return 0
-        if args.synthetic:
+        if args.frame_test:
+            payload = b'\x00\x00\x00\x04x' if args.frame_test == 'partial' else b'\x00\x01\x00\x01'
+        elif args.synthetic:
             def token(value):
                 return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b'=').decode()
             jwt = token({'alg':'RS256'})+'.'+token({'exp':time.time()+7200,
@@ -81,7 +84,7 @@ def main():
             assert auth_path.stat().st_size <= 65536 and not auth_path.is_symlink()
             original = auth_path.read_bytes()
             payload = validate_payload(io.BytesIO(original), time.time())
-        child.stdin.write(encode_frame(payload)); child.stdin.close()
+        child.stdin.write(payload if args.frame_test else encode_frame(payload)); child.stdin.close()
         del payload
         report = inbox.get(timeout=180)
         assert isinstance(report, dict) and report['type'] == 'RESULT'
@@ -92,17 +95,21 @@ def main():
         # Only known status fields leave this operator; no raw remote diagnostics.
         result = report['result']
         keys = {'passed','cleanupVerified','credentialReceived','preflightPassed','authUnchanged',
-                'artifactVerified','modelInvocations','servedModelVerified'}
+                'artifactVerified','modelInvocations','servedModelVerified','preflightChecks','authenticationRejected'}
         assert set(result) == keys
-        assert all(type(result[k]) is bool for k in keys-{'modelInvocations'})
+        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks'})
+        assert type(result['preflightChecks']) is int and 0 <= result['preflightChecks'] <= 6
         assert type(result['modelInvocations']) is int and result['modelInvocations'] in [0,1]
         if original is not None:
             original_unchanged = auth_path.read_bytes() == original
         print(json.dumps({'owner':ready['owner'],'result':result,'synthetic':args.synthetic,
                           'originalAuthUnchanged':original_unchanged}))
         assert original_unchanged and result['cleanupVerified']
-        if args.synthetic:
+        if args.frame_test:
+            assert not result['credentialReceived'] and not result['passed'] and result['modelInvocations'] == 0
+        elif args.synthetic:
             assert result['credentialReceived'] and not result['passed'] and result['modelInvocations'] == 0
+            assert result['preflightChecks'] == 5 and result['authenticationRejected']
         else:
             assert result['passed']
         return 0

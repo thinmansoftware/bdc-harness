@@ -38,7 +38,8 @@ def main():
     manifest = {'owner': owner, 'deadline': time.time()+210, 'containers': [], 'networks': []}
     outcome = {'passed': False, 'cleanupVerified': False, 'credentialReceived': False,
                'preflightPassed': False, 'authUnchanged': False, 'artifactVerified': False,
-               'modelInvocations': 0, 'servedModelVerified': False}
+               'modelInvocations': 0, 'servedModelVerified': False, 'preflightChecks': 0,
+               'authenticationRejected': False}
     def d(*parts, **kwargs):
         return subprocess.run([args.docker, *parts], capture_output=True, check=True,
                               timeout=kwargs.pop('timeout', 15), **kwargs).stdout
@@ -169,9 +170,10 @@ def main():
         returncode, output = capture([args.docker, 'exec', '-w', '/workspace', ids['worker'],
             'python3', '-I', '/app/scripts/staging/teetime_canary_worker.py'], timeout=140)
         result = json.loads(output)
-        keys = {'passed', 'preflightPassed', 'authUnchanged', 'artifactVerified', 'modelInvocations', 'servedModelVerified'}
+        keys = {'passed', 'preflightPassed', 'authUnchanged', 'artifactVerified', 'modelInvocations', 'servedModelVerified', 'preflightChecks', 'authenticationRejected'}
         assert set(result) == keys
-        assert all(type(result[k]) is bool for k in keys-{'modelInvocations'})
+        assert all(type(result[k]) is bool for k in keys-{'modelInvocations','preflightChecks'})
+        assert type(result['preflightChecks']) is int and 0 <= result['preflightChecks'] <= 6
         assert type(result['modelInvocations']) is int and result['modelInvocations'] in [0, 1]
         outcome.update(result)
         assert returncode == 0 and result['passed']

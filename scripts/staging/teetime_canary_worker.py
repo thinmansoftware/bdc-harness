@@ -12,6 +12,8 @@ ROOT = Path('/app/scripts/staging')
 AUTH = Path('/home/appuser/.codex/auth.json')
 ENV = {'HOME': '/home/appuser', 'CODEX_HOME': '/home/appuser/.codex',
        'PATH': '/usr/local/bin:/usr/bin:/bin'}
+PREFLIGHT_CHECKS = 0
+AUTH_REJECTED = False
 
 
 def bounded_process(argv, timeout, env=ENV):
@@ -69,6 +71,7 @@ def check_config(config):
 
 
 def preflight():
+    global PREFLIGHT_CHECKS, AUTH_REJECTED
     options = json.loads(bounded_process(['bun', '-e',
         'import {restrictedClientOptions} from "/app/packages/providers/src/codex/restricted-policy.ts";'
         'console.log(JSON.stringify(restrictedClientOptions("teetime-connect-v1")))'], 5))
@@ -126,7 +129,11 @@ def preflight():
                 if 'id' not in response:
                     assert 'error' not in response
                     continue
-                assert response['id'] == expected and 'error' not in response
+                assert response['id'] == expected
+                if expected == 7 and 'error' in response:
+                    text = str(response['error'].get('message', '')).lower()
+                    AUTH_REJECTED = '401' in text or 'unauthorized' in text
+                assert 'error' not in response
                 result = response['result']
                 if expected == 1:
                     child.stdin.write(b'{"method":"initialized"}\n'); child.stdin.flush()
@@ -146,7 +153,10 @@ def preflight():
                     assert result['requiresOpenaiAuth'] is True
                 elif expected == 7:
                     assert isinstance(result.get('rateLimits'), dict)
+                    PREFLIGHT_CHECKS = 6
                     return
+                if expected > 1:
+                    PREFLIGHT_CHECKS = expected-1
                 method, params = requests[expected-1]
                 expected += 1
                 send(expected, method, params)
@@ -191,6 +201,8 @@ def main():
         except Exception:
             result['authUnchanged'] = False
         result['passed'] = result['passed'] and result['authUnchanged']
+        result['preflightChecks'] = PREFLIGHT_CHECKS
+        result['authenticationRejected'] = AUTH_REJECTED
         print(json.dumps(result), flush=True)
     return 0 if result['passed'] else 1
 
