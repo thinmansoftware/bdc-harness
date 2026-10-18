@@ -5,7 +5,7 @@
  *
  * S1 removed (WO-HARNESS-LANE-REVIEWERS-SOL-TERRA-01): the codex lane's review
  * seats are provider codex on purpose. Model inequality (S2) is the self-review
- * guarantee -- gpt-5.6-terra reviews, gpt-5.6-sol builds.
+ * guarantee -- gpt-5.6-terra reviews, gpt-6-astra builds.
  * S2: No self-review (general) -- for every lane, builder-model != reviewer-model
  *     (model ID differs between implement and the review nodes diff-review / diff-review-final /
  *     opus-rereview / apply-diff-review-final).
