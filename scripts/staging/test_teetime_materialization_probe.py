@@ -2,11 +2,25 @@
 import copy
 import time
 import unittest
+import hashlib
+import base64
 
-from probe_teetime_materialization import validate_manifest, validate_resources, require_state
+from probe_teetime_materialization import validate_manifest, validate_resources, require_state, test_process_evidence
 
 
 class ProbeTests(unittest.TestCase):
+    def test_actual_test_stdout_and_exit_are_preserved(self):
+        output = b'{"readonlyDenial": "EROFS"}\n'
+        evidence = test_process_evidence(0, 0, output)
+        self.assertEqual(base64.b64decode(evidence['testStdoutBase64']), output)
+        self.assertEqual(evidence['testStdoutHash'], hashlib.sha256(output).hexdigest())
+        self.assertEqual(evidence['testContainerExitCode'], 0)
+        self.assertIs(evidence['testCompleted'], True)
+        self.assertIs(evidence['testTruncated'], False)
+        for code, container_code in [(1, 0), (0, 1), (True, 0)]:
+            with self.assertRaises(ValueError):
+                test_process_evidence(code, container_code, output)
+
     def setUp(self):
         self.now = time.time()
         self.manifest = {'owner': 'teetime-materialize-'+'a'*12, 'image': 'sha256:'+'b'*64,

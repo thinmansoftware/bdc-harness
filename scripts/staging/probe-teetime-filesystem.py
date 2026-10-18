@@ -20,8 +20,15 @@ selector.add_argument('--artifact-fixture',action='store_true')
 selector.add_argument('--artifact-import-only',action='store_true')
 parser.add_argument('--artifact-case',choices=['success','duplicate'],default='success')
 parser.add_argument('--artifact-source')
+parser.add_argument('--artifact-joined',action='store_true')
+parser.add_argument('--fixture-owner')
 parser.add_argument('--pids-budget',type=int,choices=[64,128],default=64)
 args = parser.parse_args()
+if args.artifact_joined:
+    if not args.artifact_fixture or re.fullmatch('teetime-fs-[a-f0-9]{12}',args.fixture_owner or '') is None:
+        parser.error('joined fixture requires artifact fixture and fixed owned identity')
+elif args.fixture_owner is not None:
+    parser.error('caller identity only supported by fixed joined artifact fixture')
 if not __debug__:
     raise RuntimeError('assertion-enabled Python required')
 assert re.fullmatch('sha256:[a-f0-9]{64}',args.image)
@@ -41,7 +48,7 @@ worker_name = ('probe-teetime-sdk-import-worker.py' if args.artifact_import_only
 source = (root/worker_name).read_bytes()
 compile(source,'filesystem-probe','exec')
 assert len(source) < 65536 and source.isascii()
-name = 'teetime-fs-'+uuid.uuid4().hex[:12]
+name = args.fixture_owner if args.artifact_joined else 'teetime-fs-'+uuid.uuid4().hex[:12]
 receipt = Path.home()/name
 receipt.mkdir(exist_ok=False)
 created = False
@@ -65,18 +72,22 @@ try:
         extra += ['--tmpfs',path+':uid=1001,gid=1001,size=64m']
     for path in ['/workspace/.codex','/workspace/.agents']:
         extra += ['--tmpfs',path+':ro,uid=1001,gid=1001,size=1m']
+    fixture_args = ([args.artifact_case] if args.artifact_fixture else [])
+    if args.artifact_joined:
+        assert not d('ps','-aq','--filter','name=^/'+name+'$').strip()
+        fixture_args += ['joined',name]
     identifier = d('create','-i','--name',name,'--label','teetime.owner='+name,
         '--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges:true',
         '--security-opt','seccomp='+str(profile),'--user','1001:1001','--memory','512m',
         '--memory-swap','512m','--cpus','1','--pids-limit',str(args.pids_budget),'--no-healthcheck',
         '--log-driver','none',*extra,'--entrypoint','python3',args.image,'-I','-',
-        *([args.artifact_case] if args.artifact_fixture else [])).decode().strip()
+        *fixture_args).decode().strip()
     created = True
     state = json.loads(d('inspect',identifier))[0]
     host = state['HostConfig']
     assert state['Image'] == args.image and state['Config']['User'] == '1001:1001'
     assert state['Config']['Labels']['teetime.owner'] == name
-    expected_command = ['-I','-']+([args.artifact_case] if args.artifact_fixture else [])
+    expected_command = ['-I','-']+fixture_args
     assert state['Config']['Entrypoint'] == ['python3'] and state['Config']['Cmd'] == expected_command
     assert state['Config']['OpenStdin'] is True and state['Config']['StdinOnce'] is True
     assert state['Config']['AttachStdin'] is True
@@ -125,12 +136,15 @@ try:
               'probeSha256':hashlib.sha256(source).hexdigest(),'pidsLimit':args.pids_budget,'result':result}
     if artifact_mode:
         report.update({'artifactSourceSha':args.artifact_source,'artifactFileHashes':artifact_hashes})
+    if args.artifact_joined:
+        report.update({'fixtureOwner':name,'joinedFixture':True})
     (receipt/'result.json').write_text(json.dumps(report,indent=2))
     print(json.dumps(report))
 finally:
     if created:
         state = json.loads(d('inspect',identifier))[0]
         assert state['Config']['Labels']['teetime.owner'] == name
+        assert state['Name'] == '/'+name and state['Image'] == args.image
         d('rm','-f',identifier)
         assert identifier not in d('container','ls','--all','--quiet','--no-trunc','--filter','id='+identifier).decode().split()
     print(json.dumps({'receiptDirectory':str(receipt),'cleanupVerified':True}))

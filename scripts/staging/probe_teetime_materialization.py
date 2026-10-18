@@ -1,5 +1,6 @@
 """Standalone fixed provenance lifecycle. No model, auth, publication or app QA."""
 import argparse
+import base64
 import hashlib
 import json
 import math
@@ -18,6 +19,7 @@ from teetime_bounded_process import capture
 from teetime_git_objects import build_git_objects
 from teetime_materialization_frame import decode_frame, encode_frame
 from teetime_snapshot import SnapshotFile, snapshot_manifest
+from teetime_artifact_materialization import PreparedMaterialization
 
 ROLES = ('verify', 'writer', 'test')
 CASES = ('clean', 'writer-failure', 'forced-writing', 'forced-after-writer')
@@ -197,7 +199,17 @@ def watchdog(args):
         parent.close()
 
 
-def run(args):
+def test_process_evidence(code, container_code, output):
+    if (type(code) is not int or code != 0 or type(container_code) is not int or container_code != 0
+            or type(output) is not bytes or len(output) > 4096):
+        raise ValueError('normal bounded test process required')
+    return {'testExitCode': code, 'testContainerExitCode': container_code,
+        'testStdoutBase64': base64.b64encode(output).decode('ascii'),
+        'testStdoutHash': hashlib.sha256(output).hexdigest(), 'testCompleted': True,
+        'testTruncated': False, 'testTermination': 'normal'}
+
+
+def run(args, *, prepared=None, sdk_evidence=None):
     files = (SnapshotFile('data.bin', '100644', b'\x00\xffbinary'),
              SnapshotFile('index.html', '100644', b'<p>synthetic-artifact-ready</p>\n'),
              SnapshotFile('src/run.sh', '100755', b'#!/bin/sh\nexit 0\n'))
@@ -205,6 +217,15 @@ def run(args):
     tree = build_git_objects(files, expected_format='sha1').root_tree
     ids = {'expected_manifest_hash': digest, 'expected_tree': tree}
     raw = encode_frame(files, **ids)
+    if prepared is not None:
+        if type(prepared) is not PreparedMaterialization or type(sdk_evidence) is not dict or args.case != 'clean':
+            raise ValueError('fixed joined provenance input required')
+        raw = prepared.frame
+        digest, tree = prepared.manifest_hash, prepared.source_tree
+        ids = {'expected_manifest_hash': digest, 'expected_tree': tree}
+        files = decode_frame(raw, **ids)
+    elif sdk_evidence is not None:
+        raise ValueError('SDK evidence requires its prepared candidate')
     if len(raw) > 65536 or decode_frame(raw, **ids) != files:
         raise ValueError('fixed transport bound or candidate validation')
     manifest = validate_manifest({'owner': 'teetime-materialize-'+uuid.uuid4().hex[:12],
@@ -239,6 +260,8 @@ def run(args):
     outcome = {'owner': owner, 'source': args.source, 'image': args.image, 'case': args.case,
                'kind': 'fixed provenance fixture, not app QA or admission', 'passed': False,
                'manifestHash': digest, 'sourceTree': tree, 'phase': 'watchdog'}
+    if sdk_evidence is not None:
+        outcome['sdkEvidence'] = sdk_evidence
     try:
         for _ in range(30):
             if (root/'watchdog-ready.json').exists():
@@ -343,7 +366,8 @@ def run(args):
         if (code != 0 or info['State']['Running'] or info['State']['ExitCode'] != 0
                 or json.loads(output) != expected_result):
             raise ValueError('fixed readonly test process or receipt mismatch')
-        outcome.update({'passed': True, 'testStarted': True, 'testExitCode': code, 'testReceipt': expected_result,
+        outcome.update(test_process_evidence(code, info['State']['ExitCode'], output))
+        outcome.update({'passed': True, 'testStarted': True, 'testReceipt': json.loads(output),
             'testCommandHash': hashlib.sha256(json.dumps(test_command, separators=(',', ':')).encode()).hexdigest(),
             'helperHashes': expected, 'phase': 'complete'})
     except Exception as error:

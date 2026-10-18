@@ -6,6 +6,7 @@ import io
 import json
 import os
 import queue
+import re
 from pathlib import Path
 import sys
 import threading
@@ -16,7 +17,10 @@ from teetime_bounded_process import capture
 from teetime_fixture_diagnostics import DiagnosticProtocol
 from teetime_snapshot import SnapshotFile, snapshot_manifest
 
-if not __debug__ or os.getuid() != 1001 or sys.argv[1:] not in [['success'], ['duplicate']]:
+joined = (len(sys.argv) == 4 and sys.argv[2] == 'joined'
+          and re.fullmatch('teetime-fs-[a-f0-9]{12}',sys.argv[3]) is not None)
+if (not __debug__ or os.getuid() != 1001 or sys.argv[1:2] not in [['success'], ['duplicate']]
+        or (len(sys.argv) != 2 and not joined)):
     raise SystemExit('invalid fixed artifact fixture')
 case = sys.argv[1]
 os.chdir('/workspace')
@@ -29,10 +33,15 @@ original = b'{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-auth-fixture"}'
 auth.write_bytes(original)
 auth.chmod(0o600)
 base = (SnapshotFile('README.md', '100644', b'trusted fixture base\n'),)
+if joined:
+    base = (SnapshotFile('data.bin', '100644', b'\x00\xffbinary'),
+            SnapshotFile('src/run.sh', '100755', b'#!/bin/sh\nexit 0\n'))
 policy = Path('/app/packages/providers/src/codex/restricted-policy.ts').read_bytes()
 binding = {'runId': 'artifact-fixture-run', 'nodeId': 'implement', 'attempt': 1,
     'authorityHash': 'sha256:'+'a'*64, 'policyHash': 'sha256:'+hashlib.sha256(policy).hexdigest(),
     'baseManifestHash': hashlib.sha256(snapshot_manifest(base).encode()).hexdigest()}
+if joined:
+    binding['runId'] = sys.argv[3]
 content = '<p>synthetic-artifact-ready</p>\n'
 artifact = json.dumps({'version': 1, 'binding': binding, 'operations': [
     {'action': 'write', 'path': 'index.html', 'baseHash': None, 'mode': '100644', 'content': content}]},
@@ -157,7 +166,7 @@ try {
  const {collectArtifactStream}=await import('/app/scripts/staging/teetime-artifact-stream.ts');
  const {ArtifactProviderLifecycle}=await import('/app/scripts/staging/teetime-sdk-lifecycle.ts');
  mark('factory-construct');
- const provider=createRestrictedCanaryWorkerProvider({runId:'artifact-fixture-run',policyDigest:FIXTURE_POLICY,workspace:'/workspace'});
+ const provider=createRestrictedCanaryWorkerProvider({runId:FIXTURE_RUN_ID,policyDigest:FIXTURE_POLICY,workspace:'/workspace'});
  lifecycle=new ArtifactProviderLifecycle(controller,()=>clearTimeout(timer));
  async function* observed() {
   for await(const chunk of lifecycle.observe(provider.sendQuery('Synthetic infrastructure fixture. Return one JSON artifact message only. Do not use tools or modify any files.','/workspace',undefined,{abortSignal:controller.signal}))) {
@@ -184,7 +193,8 @@ const normalProviderEnd=lifecycle?.normalEnd??false,providerIteratorClosed=lifec
 emit(JSON.stringify({kind:'result',accepted,bytesBase64,intercepted,threads,optionsVerified,threadOptionsVerified,
  importIntercepted,normalProviderEnd,providerIteratorClosed,counts,abortedBeforeCleanup,phase,errorName,errorCode})+'\n');
 '''
-bootstrap = 'const FIXTURE_URL='+json.dumps(url)+';\nconst FIXTURE_POLICY='+json.dumps(binding['policyHash'])+';\n'+code
+bootstrap = ('const FIXTURE_URL='+json.dumps(url)+';\nconst FIXTURE_POLICY='+json.dumps(binding['policyHash'])+
+             ';\nconst FIXTURE_RUN_ID='+json.dumps(binding['runId'])+';\n'+code)
 protocol = DiagnosticProtocol()
 exit_code = None
 failure = None
@@ -220,8 +230,8 @@ if sdk['accepted']:
     raw = base64.b64decode(sdk['bytesBase64'], validate=True)
     candidate = parse_artifact(raw, base_files=base, expected_binding=binding,
                                allowed_paths={'index.html': ('100644',)})
-    candidate_verified = (raw == artifact.encode() and candidate.files == (
-        base[0], SnapshotFile('index.html', '100644', content.encode())))
+    expected_files = tuple(sorted((*base, SnapshotFile('index.html', '100644', content.encode())), key=lambda f:f.path))
+    candidate_verified = raw == artifact.encode() and candidate.files == expected_files
 workspace_unchanged = (set(path.name for path in Path('/workspace').iterdir()) == {'.codex', '.agents'}
     and all(not list(Path('/workspace', name).iterdir()) for name in ['.codex', '.agents']))
 common = (state['requests'] == 1 and not state['errors'] and state['modelVerified']

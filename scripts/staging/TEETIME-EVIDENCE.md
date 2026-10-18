@@ -442,6 +442,58 @@ whether identical raw bytes came from a failed/duplicate stream. A separately
 reviewed controller must prove actual successful stream/process custody before
 calling it, parse outside the worker against frozen controller-owned inputs, and
 reject failed/duplicate outcomes before any materialization resource is created.
-The joined controller/fixture, actual output receipt binding and runtime path are
-not implemented or qualified by this pure slice. Existing headCommit,6000-byte
+The pure slice does not qualify the joined controller or runtime path. Existing headCommit,6000-byte
 review wire, frozen authority and v1 policy/workflow contracts remain unchanged.
+
+## Fixed joined controller (source preparation)
+
+probe_teetime_joined.py is a separate credential-free controller. It requires a
+reviewed frozen source-manifest.json at the archive root and exact builder/test
+image IDs. It hashes every consumed controller dependency against that manifest
+before invoking any child. The existing SDK operator accepts --artifact-joined
+and --fixture-owner only for the fixed artifact fixture; default behavior remains
+the original README-based candidate. The joined fixture uses the three-file
+candidate above and binds its artifact runId to the fresh known SDK worker name.
+
+The controller captures the actual SDK operator process with a110-second/16384-byte
+bound. Only normal exit zero and exactly one strict report plus one cleanup frame
+can advance. Image, source, helper hashes, owner, SDK options, one request/thread/
+constructor, one assistant/result, closed iterator, normal completion, non-abort,
+unchanged synthetic auth/workspace and absence of real credentials are checked.
+Artifact bytes use bounded canonical base64. The host recomputes the trusted base,
+binding and allowed paths and passes the pure prepared frame directly to the
+existing materialization lifecycle. No raw receipt file or success flag is input.
+
+Before the SDK child starts, its exact worker name must be absent twice. Following
+child exit/timeout, the controller checks name, immutable image and ownership label
+before removing only that container, then verifies absence twice. A foreign target
+is never removed and blocks materialization. This bounded reconciliation is NOT
+an independent prephase watchdog: abrupt parent loss or late daemon completion
+during that SDK prephase remains unqualified. The existing independent pinned
+materialization watchdog applies only after successful SDK validation/cleanup.
+
+Trusted test evidence retains actual stdout bytes in base64 plus SHA-256, actual
+attach/container exits, normal termination, completion and nontruncation from the
+bounded capture. Parsed receipt fields are derived from those actual bytes. The
+command remains teetime-materialization-provenance-v1; it is not application QA.
+
+Source tests (no Docker, auth or provider requests):
+
+```text
+python -m unittest discover -s scripts/staging -p test_teetime_joined_fixture.py
+python -m unittest discover -s scripts/staging -p test_teetime_materialization_probe.py
+```
+
+After separate review/CI/frozen-image qualification only, the fixed operator form is:
+
+```text
+python -I scripts/staging/probe_teetime_joined.py --docker <docker-executable> --builder-image sha256:<exact-builder-image> --image sha256:<exact-materialization-image> --source <40-hex-reviewed-source> --base-source <40-hex-base-source>
+```
+
+STOP POINT: no joined runtime or authenticated artifact compliance is claimed by
+source tests. No commit identity, reviewer wire, policy, registration, workflow,
+replay/approval authority or application behavior is changed by this slice.
+The fixed synthetic authorityHash (sha256 followed by64 a characters) is not a
+loaded RunAuthority and cannot qualify authority admission. Independent architect
+review approved source publication/CI only; runtime needs the new exact frozen
+source, complete helper manifest, composite image IDs and exact-source CI first.
