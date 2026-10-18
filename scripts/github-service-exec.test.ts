@@ -66,7 +66,9 @@ describe('operation-scoped GitHub CLI authentication', () => {
             'process.stdout.write("synthetic-pr-result")',
           ],
           {
-            timeout: 5000,
+            // This real CLI also initializes its disposable SQLite database.
+            // Keep a finite child limit within the integration-test budget.
+            timeout: 20_000,
             env: {
               PATH: process.env.PATH,
               SystemRoot: process.env.SystemRoot,
@@ -84,7 +86,7 @@ describe('operation-scoped GitHub CLI authentication', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 10000);
+  }, 30_000);
   test('command launch failures are persisted as CLI attempts without a permission retry', async () => {
     let launches = 0;
     let caught: unknown;
