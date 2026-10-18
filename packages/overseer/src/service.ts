@@ -2,9 +2,11 @@ import { createLogger } from '@archon/paths';
 import {
   claimOverseerVerdict,
   claimVerdictForMergeExecution,
+  deferVerdictClaimForMergeExecution,
   finalizeOverseerVerdict,
   getOverseerWatchRunById,
   insertOverseerAction,
+  listActiveRunUserMessages,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
@@ -13,6 +15,7 @@ import {
   releaseVerdictClaimForMergeExecution,
   reserveOverseerMergeSlot,
 } from '@archon/core/db/overseer';
+import { hasActiveRunForWo } from './active-run-guard';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
 import type { OverseerVerdictStoreDeps } from './types.ts';
 import { runAuthorizedEscalation } from './authorized-escalation';
@@ -433,7 +436,9 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
             listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
             claimVerdict: claimVerdictForMergeExecution,
             releaseVerdictClaim: releaseVerdictClaimForMergeExecution,
+            deferVerdictClaim: deferVerdictClaimForMergeExecution,
             getRunById: getOverseerWatchRunById,
+            hasActiveRunForWo: (woId: string) => hasActiveRunForWo(woId, listActiveRunUserMessages),
             reserveMergeSlot: reserveOverseerMergeSlot,
             releaseMergeSlot: releaseOverseerMergeSlot,
             recordOutcome: recordVerdictMergeOutcome,

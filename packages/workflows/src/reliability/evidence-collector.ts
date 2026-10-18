@@ -246,6 +246,59 @@ function parsePullRequest(json: string): PullRequestEvidence | null {
   };
 }
 
+// Authority-branch lookup misses when the lane pushes HEAD under a different
+// ref. Accept exactly one open PR at that sha on the authority base, then
+// re-fetch it with pr view. Zero, several, or any error yields null.
+async function lookupPullRequestByHeadSha(
+  run: EvidenceCommandRunner,
+  cwd: string,
+  repository: string,
+  headSha: string,
+  baseBranch: string
+): Promise<PullRequestEvidence | null> {
+  try {
+    const result = await run('gh', ['api', `repos/${repository}/commits/${headSha}/pulls`], cwd);
+    const parsed: unknown = JSON.parse(result.stdout);
+    if (!Array.isArray(parsed)) return null;
+    const matches = parsed.filter(entry => {
+      if (typeof entry !== 'object' || entry === null) return false;
+      const record = entry as Record<string, unknown>;
+      const state = record.state;
+      if (typeof state !== 'string' || state.toLowerCase() !== 'open') return false;
+      const head = record.head;
+      const base = record.base;
+      if (typeof head !== 'object' || head === null) return false;
+      if (typeof base !== 'object' || base === null) return false;
+      const headRecord = head as Record<string, unknown>;
+      const baseRecord = base as Record<string, unknown>;
+      if (headRecord.sha !== headSha || baseRecord.ref !== baseBranch) return false;
+      const number = record.number;
+      return typeof number === 'number' && Number.isInteger(number) && number > 0;
+    });
+    if (matches.length !== 1) return null;
+    const only = matches[0];
+    if (typeof only !== 'object' || only === null) return null;
+    const number = (only as Record<string, unknown>).number;
+    if (typeof number !== 'number') return null;
+    const view = await run(
+      'gh',
+      [
+        'pr',
+        'view',
+        String(number),
+        '--repo',
+        repository,
+        '--json',
+        'url,number,state,isDraft,baseRefName,headRefName,headRefOid,files,statusCheckRollup',
+      ],
+      cwd
+    );
+    return parsePullRequest(view.stdout);
+  } catch {
+    return null;
+  }
+}
+
 export async function collectRuntimeEvidence(
   store: Pick<IWorkflowStore, 'getRunAuthority' | 'listWorkflowEvents'>,
   run: EvidenceCommandRunner,
@@ -306,6 +359,15 @@ export async function collectRuntimeEvidence(
   } catch {
     pullRequest = null;
   }
+  if (pullRequest === null) {
+    pullRequest = await lookupPullRequestByHeadSha(
+      run,
+      request.cwd,
+      repository,
+      headSha,
+      authority.baseBranch
+    );
+  }
   const events = await store.listWorkflowEvents(request.runId);
   const gates = request.requiredGateIds.map(id => gateFromEvents(id, events));
   return collectMechanicalEvidence({
@@ -331,17 +393,18 @@ export function collectMechanicalEvidence(
 ): CollectedMechanicalEvidence {
   const diffPaths = input.git.changes.map(change => change.path);
   const pullRequest = input.pullRequest;
+  const prCorroborates =
+    pullRequest !== null &&
+    pullRequest.baseRef === input.authority.baseBranch &&
+    pullRequest.headSha === input.git.headSha &&
+    pullRequestIdentityMatches(pullRequest, input.authority.canonicalRemote) &&
+    pathsEqual(pullRequest.files, diffPaths);
   const scopeValid =
     input.git.mergeBaseSha === input.authority.baseSha &&
-    input.git.headBranch === input.authority.headBranch &&
     normalizedRemote(input.git.originRemote) ===
       normalizedRemote(input.authority.canonicalRemote) &&
-    (pullRequest === null ||
-      (pullRequest.baseRef === input.authority.baseBranch &&
-        pullRequest.headRef === input.authority.headBranch &&
-        pullRequest.headSha === input.git.headSha &&
-        pullRequestIdentityMatches(pullRequest, input.authority.canonicalRemote) &&
-        pathsEqual(pullRequest.files, diffPaths)));
+    (input.git.headBranch === input.authority.headBranch || prCorroborates) &&
+    (pullRequest === null || prCorroborates);
   const requiredChecksPassed =
     pullRequest?.requiredChecks.every(check => check.state === 'passed') ?? false;
   const pullRequestReady =
@@ -351,7 +414,11 @@ export function collectMechanicalEvidence(
     !pullRequest.draft &&
     requiredChecksPassed;
   const gateState = requiredGateState(input.gates);
-  const validationState: ValidationState = !scopeValid ? 'failed' : gateState;
+  const validationState: ValidationState = !scopeValid
+    ? input.executionState === 'running'
+      ? 'indeterminate'
+      : 'failed'
+    : gateState;
   const validationReason = !scopeValid
     ? 'gate_scope_mismatch'
     : validationState === 'failed'

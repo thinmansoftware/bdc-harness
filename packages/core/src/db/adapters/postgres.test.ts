@@ -225,6 +225,10 @@ describe('PostgresAdapter', () => {
       // Phase 0 set; migration 040 itself must not, or this migration's own
       // history would be rewritten. Checked only against `combined` below,
       // never against `migration` (040).
+      // WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01 (migration
+      // 046) adds 'taskmaster' the same way, for the same reason: Overseer
+      // hands CHANGES_REQUESTED verdicts back to it as remediation candidates,
+      // and createMessage rejects any unseeded recipient.
       const laterMigrationPrincipals = [
         ['overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 'TRUE'],
         ['overseer-review-route', 'Overseer Review Route', 'notify_only', 'TRUE'],
@@ -233,6 +237,7 @@ describe('PostgresAdapter', () => {
         // WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01 (migration 056): Astra Codex
         // desktop Board/XO seat, added after Phase 0, so combined carries it.
         ['astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 'TRUE'],
+        ['taskmaster', 'Taskmaster', 'worker_poll', 'TRUE'],
       ] as const;
 
       expect(migration).toContain(
