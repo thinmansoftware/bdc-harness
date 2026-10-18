@@ -3,6 +3,7 @@
  */
 import type { WorkflowDefinition, WorkflowLoadError, DagNode, WorkflowNodeHooks } from './schemas';
 import { isLoopNode, isApprovalNode, isCancelNode, isScriptNode } from './schemas';
+import { findUntrustedTextToken } from './executor-shared';
 import { createLogger } from '@archon/paths';
 import {
   isRegisteredProvider,
@@ -214,6 +215,18 @@ function validateDagStructure(nodes: DagNode[]): string | null {
   if (visited < nodes.length) {
     const cycleNodes = nodes.filter(n => (inDegree.get(n.id) ?? 0) > 0).map(n => n.id);
     return `Cycle detected among nodes: ${cycleNodes.join(', ')}`;
+  }
+
+  for (const node of nodes) {
+    if (!isScriptNode(node)) continue;
+    const token = findUntrustedTextToken(node.script);
+    if (token) {
+      return (
+        `Node '${node.id}' script contains untrusted token $${token}. ` +
+        `Read process.env.ARCHON_${token} (bun) or os.environ["ARCHON_${token}"] (python) ` +
+        `instead of splicing $${token} into script source.`
+      );
+    }
   }
 
   // Check $nodeId.output references in when: and prompt: fields.

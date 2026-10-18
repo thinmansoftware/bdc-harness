@@ -14,6 +14,7 @@ import { describe, it, expect } from 'bun:test';
 import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { parseWorkflow } from './loader';
+import { findUntrustedTextToken } from './executor-shared';
 import {
   clearRegistry,
   getMissingProviderExecutionCapabilities,
@@ -586,4 +587,109 @@ describe('plan-review repair-target record', () => {
     });
     expect(blocks[0]).toBe(blocks[1]);
   });
+});
+
+describe('active lanes do not splice untrusted text into executable fields', () => {
+  const WORKFLOWS_DIR = join(REPO_ROOT, '.archon/workflows');
+
+  function listYaml(dir: string): string[] {
+    const out: string[] = [];
+    for (const ent of readdirSync(dir, { withFileTypes: true })) {
+      if (ent.name === 'retired') continue;
+      const full = join(dir, ent.name);
+      if (ent.isDirectory()) {
+        out.push(...listYaml(full));
+      } else if (ent.name.endsWith('.yaml') || ent.name.endsWith('.yml')) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+
+  function walkFields(node: unknown, hits: string[], path: string): void {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      node.forEach((item, index) => walkFields(item, hits, `${path}[${String(index)}]`));
+      return;
+    }
+    const rec = node as Record<string, unknown>;
+    const id = typeof rec.id === 'string' ? rec.id : path;
+    for (const field of ['bash', 'until_bash', 'script'] as const) {
+      const value = rec[field];
+      if (typeof value !== 'string') continue;
+      const token = findUntrustedTextToken(value);
+      if (token) hits.push(`${path} node=${id} field=${field} token=${token}`);
+    }
+    for (const [key, value] of Object.entries(rec)) {
+      if (key === 'bash' || key === 'until_bash' || key === 'script') continue;
+      if (value && typeof value === 'object') walkFields(value, hits, `${path}.${key}`);
+    }
+  }
+
+  it('no bash, until_bash, or script field contains a raw untrusted token', () => {
+    const hits: string[] = [];
+    for (const file of listYaml(WORKFLOWS_DIR)) {
+      const raw = Bun.YAML.parse(readFileSync(file, 'utf8')) as unknown;
+      const fileHits: string[] = [];
+      walkFields(raw, fileHits, file);
+      hits.push(...fileHits);
+    }
+    expect(hits).toEqual([]);
+  });
+});
+
+describe('migrated workflow fixtures keep their own inputs', () => {
+  it('keeps the implement prompt fallback as text for the AI', () => {
+    for (const file of LANE_FILES) {
+      const lane = loadLane(file);
+      const prompt = lane.nodes?.find(node => node.id === 'implement')?.loop?.prompt ?? '';
+      expect(prompt).toContain('${USER_MESSAGE:-}');
+      expect(prompt).not.toContain('ARCHON_USER_MESSAGE');
+    }
+  });
+  for (const ambientMessage of [undefined, 'WO-OTHER-01 issue=999']) {
+    it(`issue fallback uses its fixture with ambient message ${String(ambientMessage)}`, () => {
+      const lane = Bun.YAML.parse(
+        readFileSync(
+          join(REPO_ROOT, '.archon/workflows/test-workflows/e2e-read-spec-issue-fallback.yaml'),
+          'utf8'
+        )
+      ) as { nodes: Array<{ id: string; bash?: string }> };
+      const script = lane.nodes.find(node => node.id === 'test-explicit-issue-number')?.bash;
+      expect(script).toBeDefined();
+      const fakeGh = `gh() {
+        [ "$1 $2 $3" = "issue view 193" ] || return 1
+        printf 'synthetic issue body'
+      }`;
+      const result = Bun.spawnSync(['bash', '-c', `${fakeGh}\n${script ?? ''}`], {
+        env: { ...process.env, ARCHON_USER_MESSAGE: ambientMessage },
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 10_000,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.toString()).toContain('from issue #193');
+      expect(result.stderr.toString()).toBe('');
+    });
+  }
+
+  for (const args of [undefined, 'major --dry-run']) {
+    it(`release argument parser handles ${String(args)} without running release actions`, () => {
+      const lane = Bun.YAML.parse(
+        readFileSync(join(REPO_ROOT, '.archon/workflows/experimental/archon-release.yaml'), 'utf8')
+      ) as { nodes: Array<{ id: string; script?: string }> };
+      const script = lane.nodes.find(node => node.id === 'parse-args')?.script;
+      expect(script).toBeDefined();
+      const result = Bun.spawnSync([process.execPath, '-e', script ?? ''], {
+        env: { ...process.env, ARCHON_ARGUMENTS: args },
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 10_000,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout.toString())).toEqual(
+        args ? { bump: 'major', dryRun: 'true' } : { bump: 'patch', dryRun: 'false' }
+      );
+    });
+  }
 });

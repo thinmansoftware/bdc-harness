@@ -47,13 +47,15 @@ describe('telegram-auth', () => {
   });
 
   describe('isUserAuthorized', () => {
-    describe('open access mode (empty allowedIds)', () => {
-      test('should allow any user ID when no whitelist', () => {
-        expect(isUserAuthorized(123456, [])).toBe(true);
+    describe('empty allowlist denies unless open access', () => {
+      test('refuses every sender when the list is empty', () => {
+        expect(isUserAuthorized(123, [])).toBe(false);
+        expect(isUserAuthorized(123456, [])).toBe(false);
+        expect(isUserAuthorized(undefined, [])).toBe(false);
       });
 
-      test('should allow undefined user ID when no whitelist', () => {
-        expect(isUserAuthorized(undefined, [])).toBe(true);
+      test('allows a sender only when open access is explicit', () => {
+        expect(isUserAuthorized(123, [], true)).toBe(true);
       });
     });
 

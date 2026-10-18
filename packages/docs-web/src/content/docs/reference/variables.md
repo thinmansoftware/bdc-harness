@@ -29,6 +29,14 @@ These variables are substituted by the workflow executor in all node types (`com
 | `$REJECTION_REASON` | Reviewer feedback from an approval node rejection | Only available in `on_reject` prompts. Empty string elsewhere |
 | `$LOOP_PREV_OUTPUT` | Cleaned output of the previous loop iteration (loop nodes only) | Empty string on the first iteration. Useful for `fresh_context: true` loops that need to reference the prior pass without carrying the full session history |
 
+### Executable nodes
+
+In `bash`, `until_bash`, and `script` nodes these eight values are environment variables, not spliced text:
+
+`ARCHON_USER_MESSAGE`, `ARCHON_ARGUMENTS`, `ARCHON_CONTEXT`, `ARCHON_EXTERNAL_CONTEXT`, `ARCHON_ISSUE_CONTEXT`, `ARCHON_LOOP_USER_INPUT`, `ARCHON_REJECTION_REASON`, `ARCHON_LOOP_PREV_OUTPUT`.
+
+`ARCHON_ARGUMENTS` is the user message. The three context names share the issue/PR context (or empty). A `$NAME` or `${NAME...}` reference in a `bash` or `until_bash` node is rewritten to `${ARCHON_NAME...}` before the script runs. `script` nodes must read `process.env.ARCHON_<NAME>` (bun) or `os.environ["ARCHON_<NAME>"]` (python). A raw `$NAME` token in a `script` node is rejected at load time. Prompt text still receives the values directly.
+
 ### Context Variable Behavior
 
 The three context aliases (`$CONTEXT`, `$EXTERNAL_CONTEXT`, `$ISSUE_CONTEXT`) all resolve to the same value. When no issue context is available, they are replaced with an empty string to avoid sending the literal `$CONTEXT` text to the AI.

@@ -6,6 +6,7 @@ import { Bot, Context } from 'grammy';
 import type { IPlatformAdapter, MessageMetadata } from '@archon/core';
 import { createLogger } from '@archon/paths';
 import { parseAllowedUserIds, isUserAuthorized } from './auth';
+import { isOpenAccessEnabled } from '../../utils/open-access';
 import { convertToTelegramMarkdown, stripMarkdown } from './markdown';
 import { splitIntoParagraphChunks } from '../../utils/message-splitting';
 import type { TelegramMessageContext } from './types';
@@ -23,6 +24,7 @@ export class TelegramAdapter implements IPlatformAdapter {
   private bot: Bot;
   private streamingMode: 'stream' | 'batch';
   private allowedUserIds: number[];
+  private openAccess: boolean;
   private messageHandler: ((ctx: TelegramMessageContext) => Promise<void>) | null = null;
 
   constructor(token: string, mode: 'stream' | 'batch' = 'stream') {
@@ -30,15 +32,17 @@ export class TelegramAdapter implements IPlatformAdapter {
     this.bot = new Bot(token);
     this.streamingMode = mode;
 
-    // Parse Telegram user whitelist (optional - empty = open access)
-    // Support both TELEGRAM_ALLOWED_USER_IDS and TELEGRAM_ALLOWED_USERS
+    // Empty allowlist denies every sender unless ARCHON_CHAT_OPEN_ACCESS=true.
     this.allowedUserIds = parseAllowedUserIds(
       process.env.TELEGRAM_ALLOWED_USER_IDS ?? process.env.TELEGRAM_ALLOWED_USERS
     );
+    this.openAccess = isOpenAccessEnabled(process.env.ARCHON_CHAT_OPEN_ACCESS);
     if (this.allowedUserIds.length > 0) {
       getLog().info({ userCount: this.allowedUserIds.length }, 'telegram.whitelist_enabled');
+    } else if (this.openAccess) {
+      getLog().warn('telegram.open_access_enabled');
     } else {
-      getLog().info('telegram.whitelist_disabled');
+      getLog().warn('telegram.whitelist_empty_denying_all');
     }
 
     getLog().info({ mode }, 'telegram.adapter_initialized');
@@ -204,7 +208,7 @@ export class TelegramAdapter implements IPlatformAdapter {
 
       // Authorization check - verify sender is in whitelist
       const userId = ctx.from?.id;
-      if (!isUserAuthorized(userId, this.allowedUserIds)) {
+      if (!isUserAuthorized(userId, this.allowedUserIds, this.openAccess)) {
         // Log unauthorized attempt (mask user ID for privacy)
         const maskedId = userId !== undefined ? `${String(userId).slice(0, 4)}***` : 'unknown';
         getLog().info({ maskedUserId: maskedId }, 'telegram.unauthorized_message');
@@ -231,7 +235,7 @@ export class TelegramAdapter implements IPlatformAdapter {
 
       // Authorization check - same whitelist as text messages
       const userId = ctx.from?.id;
-      if (!isUserAuthorized(userId, this.allowedUserIds)) {
+      if (!isUserAuthorized(userId, this.allowedUserIds, this.openAccess)) {
         const maskedId = userId !== undefined ? `${String(userId).slice(0, 4)}***` : 'unknown';
         getLog().info({ maskedUserId: maskedId }, 'telegram.unauthorized_callback');
         try {

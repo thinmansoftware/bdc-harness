@@ -205,6 +205,7 @@ describe('GitHubAdapter', () => {
   describe('self-filtering', () => {
     // Test context for self-filtering tests
     let originalAllowedUsers: string | undefined;
+    let originalOpenAccess: string | undefined;
 
     /**
      * Creates an adapter with mocked signature verification for self-filtering tests.
@@ -253,7 +254,10 @@ describe('GitHubAdapter', () => {
 
     beforeEach(() => {
       originalAllowedUsers = process.env.GITHUB_ALLOWED_USERS;
+      originalOpenAccess = process.env.ARCHON_CHAT_OPEN_ACCESS;
       delete process.env.GITHUB_ALLOWED_USERS;
+      // Empty allowlist now denies. These tests cover self-filtering, so opt in.
+      process.env.ARCHON_CHAT_OPEN_ACCESS = 'true';
       mockLockManager.acquireLock.mockClear();
       mockGetOrCreateConversation.mockClear();
       mockFindCodebaseByRepoUrl.mockClear();
@@ -263,6 +267,11 @@ describe('GitHubAdapter', () => {
     afterEach(() => {
       if (originalAllowedUsers !== undefined) {
         process.env.GITHUB_ALLOWED_USERS = originalAllowedUsers;
+      }
+      if (originalOpenAccess !== undefined) {
+        process.env.ARCHON_CHAT_OPEN_ACCESS = originalOpenAccess;
+      } else {
+        delete process.env.ARCHON_CHAT_OPEN_ACCESS;
       }
     });
 

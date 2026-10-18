@@ -4,9 +4,10 @@
  */
 
 /**
- * Parse comma-separated GitHub usernames from environment variable
- * Returns empty array if not set or invalid (open access mode)
- * Normalizes usernames to lowercase for case-insensitive matching
+ * Parse comma-separated GitHub usernames from environment variable.
+ * Returns an empty array when unset or invalid. An empty list denies every
+ * sender unless the caller passes openAccess.
+ * Normalizes usernames to lowercase for case-insensitive matching.
  */
 export function parseAllowedUsers(envValue: string | undefined): string[] {
   if (!envValue || envValue.trim() === '') {
@@ -20,25 +21,21 @@ export function parseAllowedUsers(envValue: string | undefined): string[] {
 }
 
 /**
- * Check if a GitHub username is authorized
- * Returns true if:
- * - allowedUsers is empty (open access mode)
- * - username (case-insensitive) is in allowedUsers
+ * Check if a GitHub username is authorized.
+ * An empty allowlist denies everyone unless openAccess is true.
  */
 export function isGitHubUserAuthorized(
   username: string | undefined,
-  allowedUsers: string[]
+  allowedUsers: string[],
+  openAccess = false
 ): boolean {
-  // Open access mode - no whitelist configured
   if (allowedUsers.length === 0) {
-    return true;
+    return openAccess;
   }
 
-  // No username available
   if (username === undefined || username.trim() === '') {
     return false;
   }
 
-  // Case-insensitive comparison
   return allowedUsers.includes(username.toLowerCase());
 }

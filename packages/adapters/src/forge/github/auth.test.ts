@@ -43,17 +43,15 @@ describe('github-auth', () => {
   });
 
   describe('isGitHubUserAuthorized', () => {
-    describe('open access mode (empty allowedUsers)', () => {
-      test('should allow any username when no whitelist', () => {
-        expect(isGitHubUserAuthorized('anyuser', [])).toBe(true);
+    describe('empty allowlist denies unless open access', () => {
+      test('refuses every sender when the list is empty', () => {
+        expect(isGitHubUserAuthorized('anyuser', [])).toBe(false);
+        expect(isGitHubUserAuthorized(undefined, [])).toBe(false);
+        expect(isGitHubUserAuthorized('', [])).toBe(false);
       });
 
-      test('should allow undefined username when no whitelist', () => {
-        expect(isGitHubUserAuthorized(undefined, [])).toBe(true);
-      });
-
-      test('should allow empty username when no whitelist', () => {
-        expect(isGitHubUserAuthorized('', [])).toBe(true);
+      test('allows a sender only when open access is explicit', () => {
+        expect(isGitHubUserAuthorized('anyuser', [], true)).toBe(true);
       });
     });
 

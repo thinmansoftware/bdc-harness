@@ -4,8 +4,9 @@
  */
 
 /**
- * Parse comma-separated user IDs from environment variable
- * Returns empty array if not set or invalid (open access mode)
+ * Parse comma-separated user IDs from environment variable.
+ * Returns an empty array when unset or invalid. An empty list denies every
+ * sender unless the caller passes openAccess.
  */
 export function parseAllowedUserIds(envValue: string | undefined): number[] {
   if (!envValue || envValue.trim() === '') {
@@ -21,18 +22,18 @@ export function parseAllowedUserIds(envValue: string | undefined): number[] {
 }
 
 /**
- * Check if a user ID is authorized
- * Returns true if:
- * - allowedIds is empty (open access mode)
- * - userId is in allowedIds
+ * Check if a user ID is authorized.
+ * An empty allowlist denies everyone unless openAccess is true.
  */
-export function isUserAuthorized(userId: number | undefined, allowedIds: number[]): boolean {
-  // Open access mode - no whitelist configured
+export function isUserAuthorized(
+  userId: number | undefined,
+  allowedIds: number[],
+  openAccess = false
+): boolean {
   if (allowedIds.length === 0) {
-    return true;
+    return openAccess;
   }
 
-  // No user ID available (should not happen in normal Telegram flow)
   if (userId === undefined) {
     return false;
   }

@@ -91,19 +91,17 @@ if [ -z "$REF" ]; then
   exit 1
 fi
 
-# Replace live read-spec capture with fixture env READ_SPEC_FIXTURE
+# Replace the executor-owned node-output assignment with the fixture value.
+# Refuse a changed node shape rather than accidentally evaluating a raw token.
 TESTABLE=$(printf '%s\n' "$REF" | awk '
-  BEGIN { skip=0 }
-  /_RS_OUT=\$\(python3/ {
-    skip=1
+  /^_RS_OUT=\$read-spec\.output$/ {
+    count++
     print "_RS_OUT=\"${READ_SPEC_FIXTURE:-}\""
     next
   }
-  skip && /BDC_NODE_OUTPUT_READ_SPEC/ { next }
-  skip && /\$read-spec\.output/ { next }
-  skip && /^\)/ { skip=0; next }
   { print }
-')
+  END { if (count != 1) exit 1 }
+') || { echo "FATAL: expected exactly one direct read-spec assignment" >&2; exit 1; }
 
 run_case() {
   local wo="$1" um="$2" rs="$3"
@@ -118,7 +116,7 @@ run_case() {
       echo 'unset WO_ID 2>/dev/null || true'
       echo 'WO_ID=""'
     fi
-    echo "export USER_MESSAGE=$(printf '%q' "$um")"
+    echo "export ARCHON_USER_MESSAGE=$(printf '%q' "$um")"
     echo "export READ_SPEC_FIXTURE=$(printf '%q' "$rs")"
     printf '%s\n' "$TESTABLE"
     echo 'printf "RESOLVED=%s\n" "$WO_ID"'

@@ -38,7 +38,7 @@ To restrict bot access to specific users:
 TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
 ```
 
-When set, only listed user IDs can interact with the bot. When empty/unset, the bot responds to all users.
+When set, only listed user IDs can interact with the bot. When empty or unset, every sender is refused. Set `ARCHON_CHAT_OPEN_ACCESS=true` to allow every Telegram user.
 
 ## Configure Streaming Mode (Optional)
 
