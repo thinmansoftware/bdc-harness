@@ -7,6 +7,7 @@ import {
   type DispatchMessage,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
+import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 
 const log = createLogger('taskmaster/expectations');
 const DEFAULT_RETRY_DELAY_MS = 15 * 60 * 1000;
@@ -145,14 +146,6 @@ export function nextPageUrl(linkHeader: string | null | undefined): string | nul
   return null;
 }
 
-function githubHeaders(): Record<string, string> {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  return {
-    accept: 'application/vnd.github+json',
-    ...(token ? { authorization: `Bearer ${token}` } : {}),
-  };
-}
-
 export async function checkEvidence(
   spec: EvidenceSpec,
   deps: Pick<ExpectationDeps, 'fetch' | 'query'> = {}
@@ -172,7 +165,11 @@ export async function checkEvidence(
     let url: string | null =
       `https://api.github.com/repos/${spec.repo}/issues/${spec.number}/comments?per_page=100`;
     for (let page = 1; url && page <= MAX_COMMENT_PAGES; page += 1) {
-      const response = await fetchImpl(url, { headers: githubHeaders() });
+      const response = await serviceGitHubFetchWithPermissionFallback({
+        service: 'taskmaster',
+        fetch: fetchImpl,
+        url,
+      });
       if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
       const comments = (await response.json()) as {
         html_url?: string;
@@ -211,10 +208,11 @@ export async function checkEvidence(
     return { ok: false, pointer: null };
   }
   if (spec.kind === 'label_present') {
-    const response = await fetchImpl(
-      `https://api.github.com/repos/${spec.repo}/issues/${spec.number}`,
-      { headers: githubHeaders() }
-    );
+    const response = await serviceGitHubFetchWithPermissionFallback({
+      service: 'taskmaster',
+      fetch: fetchImpl,
+      url: `https://api.github.com/repos/${spec.repo}/issues/${spec.number}`,
+    });
     if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
     const issue = (await response.json()) as {
       html_url?: string;
@@ -230,10 +228,12 @@ export async function checkEvidence(
     const qualifier = spec.head_branch
       ? `head:${spec.head_branch}`
       : `in:title ${spec.title_prefix ?? ''}`;
-    const response = await fetchImpl(
-      `https://api.github.com/search/issues?q=${encodeURIComponent(`repo:${spec.repo} is:pr is:open ${qualifier}`)}`,
-      { headers: githubHeaders() }
-    );
+    const response = await serviceGitHubFetchWithPermissionFallback({
+      service: 'taskmaster',
+      fetch: fetchImpl,
+      resource: 'search',
+      url: `https://api.github.com/search/issues?q=${encodeURIComponent(`repo:${spec.repo} is:pr is:open ${qualifier}`)}`,
+    });
     if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
     const result = (await response.json()) as {
       items?: { html_url?: string; title?: string }[];

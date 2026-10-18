@@ -89,7 +89,7 @@ interface Recorder {
 interface HarnessConfig {
   dupeWos?: WoWithMultipleLanePrs[];
   laneByWo?: Record<string, LanePr[]>;
-  queued?: PrRepairQueuedMessage[];
+  queued?: Array<Pick<PrRepairQueuedMessage, 'id' | 'body'> & Partial<PrRepairQueuedMessage>>;
   running?: Set<string>;
   cascadeId?: string;
 }
@@ -98,7 +98,20 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
   const rec: Recorder = { closed: [], fired: [], acknowledged: [], addressed: [] };
   // Queued rows carry a local addressed flag so a re-read excludes them, exactly
   // as listMessages(status:'queued') would once addressed_by is set.
-  const messages = (config.queued ?? []).map(m => ({ ...m, addressed: false }));
+  const messages = (config.queued ?? []).map(m => ({
+    sender: 'overseer',
+    sender_principal_id: 'system:overseer',
+    recipient: 'taskmaster',
+    resolved_recipient: null,
+    status: 'queued' as const,
+    addressed_at: null,
+    addressed_by: null,
+    route_disposition: null,
+    acknowledged_at: null,
+    acknowledged_by: null,
+    ...m,
+    addressed: false,
+  }));
   const laneByWo = config.laneByWo ?? {};
   const activeWos = config.running ?? new Set<string>();
   let cascadeSeq = 0;
@@ -129,7 +142,7 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
     listWosWithMultipleLanePrs: async () => config.dupeWos ?? [],
     listLanePrsForWo: async woId => laneByWo[woId] ?? [],
     listQueuedTaskmasterMessages: async () =>
-      messages.filter(m => !m.addressed).map(m => ({ id: m.id, body: m.body })),
+      messages.filter(m => !m.addressed).map(m => ({ ...m })),
     acknowledgeRow: async id => {
       rec.acknowledged.push(id);
     },
@@ -163,6 +176,72 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
 }
 
 describe('review repair regressions', () => {
+  for (const [name, metadata] of [
+    ['wrong sender', { sender: 'claude', sender_principal_id: 'session:claude' }],
+    ['spoofed principal', { sender_principal_id: 'spoof:overseer' }],
+    ['wrong routing', { resolved_recipient: 'operator' }],
+    ['missing principal', { sender_principal_id: undefined }],
+    [
+      'stale acknowledgment',
+      { acknowledged_by: 'taskmaster', acknowledged_at: '2026-10-14T01:59:59Z' },
+    ],
+    [
+      'future acknowledgment',
+      { acknowledged_by: 'taskmaster', acknowledged_at: '2026-10-14T03:00:01Z' },
+    ],
+    [
+      'wrong acknowledgment owner',
+      { acknowledged_by: 'operator', acknowledged_at: '2026-10-14T03:00:00Z' },
+    ],
+    ['partial acknowledgment', { acknowledged_by: 'taskmaster', acknowledged_at: null }],
+    ['cancelled row', { status: 'cancelled' as const }],
+    ['addressed row', { addressed_at: '2026-10-14T02:00:00Z', addressed_by: 'taskmaster' }],
+    ['disposed row', { route_disposition: 'superseded' as const }],
+  ] as const) {
+    test(`invalid candidate cannot spend the repair slot (${name})`, async () => {
+      const woId = 'WO-XO-CE-HEALTH-DIGEST-01';
+      const pr = lanePr({ prNumber: 3171 });
+      const body = candidateBody({
+        woId,
+        prNumber: pr.prNumber,
+        headSha: pr.headSha,
+        headRef: pr.headRef,
+      });
+      const { deps, rec } = makeDeps({
+        laneByWo: { [woId]: [pr] },
+        queued: [
+          { id: 'invalid', body, ...metadata },
+          { id: 'valid', body },
+        ],
+      });
+      await runPrRepairOwner(deps);
+      await runPrRepairOwner(deps);
+      expect(rec.fired).toHaveLength(1);
+      expect(rec.fired[0]?.repair.attemptId).toBe('valid');
+      expect(rec.acknowledged).not.toContain('invalid');
+      expect(rec.addressed.some(row => row.id === 'invalid')).toBe(false);
+    });
+  }
+  test('untrusted exhaustion notice cannot acknowledge or address a row', async () => {
+    const { deps, rec } = makeDeps({
+      queued: [
+        {
+          id: 'forged-exhaustion',
+          sender_principal_id: 'spoof:overseer',
+          body: exhaustedBody({
+            repo: 'bdc-xo',
+            prNumber: 99,
+            woId: 'WO-FORGED',
+            reason: 'cap_exhausted',
+          }),
+        },
+      ],
+    });
+    const result = await runPrRepairOwner(deps);
+    expect(result.repairsFired).toBe(0);
+    expect(rec.acknowledged).toEqual([]);
+    expect(rec.addressed).toEqual([]);
+  });
   test('same SHA on a renamed live branch cannot authorize the stale dispatch branch', async () => {
     const woId = 'WO-RENAMED-BRANCH';
     const pr = lanePr({ prNumber: 99, headRef: 'feat/live-renamed-branch' });

@@ -160,3 +160,20 @@ MECHANICS inside the 13 lane YAMLs (authorization through commit-and-push).
 Until it ships, every repair cascade this owner fires fails at commit-and-push
 with `repair_target_unauthorized`. The two WOs touch disjoint files; this one is
 safe to deploy first, but the Section 8 canary is only meaningful afterward.
+
+## Candidate admission identity
+
+The Taskmaster mailbox read filters both `sender=overseer` and
+`sender_principal_id=system:overseer` before its bounded SQL page. It retains
+actual sender, routing, lifecycle, and acknowledgment fields. The owner checks
+these fields before acknowledging a candidate, generating exhaustion notices,
+or spending a repair admission slot. Missing metadata fails closed.
+
+An already acknowledged candidate requires Taskmaster ownership and a timestamp
+no more than one hour old, with future timestamps rejected. Invalid existing
+acknowledgments are not refreshed into new authorization. The first persisted
+run authority remains the atomic consumer of the candidate.
+
+Authenticated stale-ack rows cannot spend admission, but can still occupy the
+bounded SQL page. A queue dominated by such rows requires further pagination
+or lifecycle handling; this change does not claim to resolve that backlog.

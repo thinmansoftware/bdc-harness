@@ -31,6 +31,7 @@
  * runs in tests with no network and no real GitHub writes.
  */
 import type { CascadeRunRecord } from '@archon/smart-cauldron/types';
+import type { DispatchMessage } from '@archon/core/db/dispatch';
 import type {
   LanePr,
   LanePrFetcher,
@@ -52,9 +53,42 @@ export const MAX_DEDUPE_WOS_PER_TICK = 5;
 export const PR_REPAIR_RUNBOOK_PATH = 'docs/operations/pr-repair-owner.md';
 
 /** A queued dispatch row as the owner needs to read it. */
-export interface PrRepairQueuedMessage {
-  id: string;
-  body: string;
+export type PrRepairQueuedMessage = Pick<
+  DispatchMessage,
+  | 'id'
+  | 'body'
+  | 'sender'
+  | 'sender_principal_id'
+  | 'recipient'
+  | 'resolved_recipient'
+  | 'status'
+  | 'addressed_at'
+  | 'addressed_by'
+  | 'route_disposition'
+  | 'acknowledged_at'
+  | 'acknowledged_by'
+>;
+
+function authenticatedRepairMessage(message: PrRepairQueuedMessage): boolean {
+  return (
+    message.sender === 'overseer' &&
+    message.sender_principal_id === 'system:overseer' &&
+    message.recipient === 'taskmaster' &&
+    (message.resolved_recipient === null || message.resolved_recipient === 'taskmaster') &&
+    message.status === 'queued' &&
+    message.addressed_at === null &&
+    message.addressed_by === null &&
+    message.route_disposition === null
+  );
+}
+
+function repairAcknowledgmentEligible(message: PrRepairQueuedMessage, now: number): boolean {
+  if (message.acknowledged_by === null && message.acknowledged_at === null) return true;
+  const acknowledgedAt = message.acknowledged_at ? Date.parse(message.acknowledged_at) : NaN;
+  const age = now - acknowledgedAt;
+  return (
+    message.acknowledged_by === 'taskmaster' && Number.isFinite(age) && age >= 0 && age <= 3600000
+  );
 }
 
 /** The lane_repair candidate body fields the owner acts on. */
@@ -388,8 +422,17 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
   const candidates: { id: string; candidate: LaneRepairCandidate }[] = [];
   const exhausted: { id: string; row: ExhaustedRow }[] = [];
   for (const message of queued) {
+    // Metadata is authority. Reject before acknowledgment, GitHub reads or the
+    // bounded admission allowance; a matching JSON body is not a trusted sender.
+    if (!authenticatedRepairMessage(message)) continue;
     const candidate = parseLaneRepairCandidate(message.body);
     if (candidate) {
+      if (!repairAcknowledgmentEligible(message, now())) {
+        digestItems.push(
+          `${slug(candidate.owner, candidate.repo, candidate.prNumber)} ${candidate.woId} repair_acknowledgment_invalid`
+        );
+        continue;
+      }
       candidates.push({ id: message.id, candidate });
       continue;
     }

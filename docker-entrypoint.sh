@@ -113,6 +113,11 @@ else
 fi
 unset _GH_AUTH_TOKEN
 
+if [ -n "${GITHUB_APP_ID:-}${GITHUB_APP_RUN_NODES_ID:-}${GITHUB_APP_TASKMASTER_ID:-}" ]; then
+  $RUNNER git config --global credential."https://github.com".helper \
+    '!f() { if [ "$1" = get ]; then token=$(bun /app/scripts/github-service-token.ts run_nodes) || exit; printf "username=x-access-token\npassword=%s\n" "$token"; fi; }; f'
+fi
+
 # Pin the glibc Claude Code binary to bypass the SDK's musl-first resolver.
 # Bun's hoisted linker installs both glibc and musl optional-dep variants for
 # the current CPU arch; the SDK picks musl first, which fails to execute on

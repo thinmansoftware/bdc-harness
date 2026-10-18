@@ -15,6 +15,7 @@
  */
 import { createHash } from 'crypto';
 import { createLogger } from '@archon/paths';
+import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { getDatabase } from '@archon/core';
 import { createGhLanePrFetcher } from '@archon/smart-cauldron/open-pr-guard';
 import { runCascade } from '@archon/smart-cauldron/cascade';
@@ -37,6 +38,7 @@ import {
   runPrRepairOwner,
   resolvePrRepairDedupeWindowHours,
   type PrRepairOwnerDeps,
+  type PrRepairQueuedMessage,
 } from './pr-repair-owner';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
@@ -343,6 +345,8 @@ interface GithubIssue {
  * labels), so each label is queried separately and results are deduped by
  * issue number -- OR semantics, never requiring both simultaneously.
  */
+// Project-labelled issues without an explicit priority default to P1 during
+// adoption; priority-less wo and arc issues remain in the triage list.
 const WORK_LABELS = ['wo', 'project', 'arc'] as const;
 const MAX_PAGES_PER_LABEL = 10;
 const GITHUB_RATE_LIMIT_FLOOR = 5;
@@ -461,7 +465,6 @@ export async function defaultListThreads(
     .split(',')
     .map(r => r.trim())
     .filter(Boolean);
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const threads: ListedThread[] = [];
   const unlabelledPriorityTriage: string[] = [];
   let prClaimLookups = 0;
@@ -474,15 +477,12 @@ export async function defaultListThreads(
       page: number
     ): Promise<GithubIssue[]> => {
       try {
-        const response = await fetchImpl(
-          `https://api.github.com/repos/${repo}/issues?state=open&labels=${label}&per_page=100&page=${page}`,
-          {
-            headers: {
-              accept: 'application/vnd.github+json',
-              ...(token ? { authorization: `Bearer ${token}` } : {}),
-            },
-          }
-        );
+        const response = await serviceGitHubFetchWithPermissionFallback({
+          service: 'taskmaster',
+          fetch: fetchImpl,
+          url: `https://api.github.com/repos/${repo}/issues?state=open&labels=${label}&per_page=100&page=${page}`,
+          init: { headers: { accept: 'application/vnd.github+json' } },
+        });
         assertGithubRateLimit(response, `work-sor:${repo}:${label}:${page}`);
         if (!response.ok) {
           log.warn({ repo, label, page, status: response.status }, 'taskmaster.github_read_failed');
@@ -501,14 +501,18 @@ export async function defaultListThreads(
         if (seen.has(issue.number)) continue; // carried both labels
         seen.add(issue.number);
         const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
-        const priority = priorityFromLabels(labels);
-        if (priority === null) {
-          const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
-          unlabelledPriorityTriage.push(ref);
-          log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
-          continue;
-        }
         const normalizedLabels = labels.map(label => label.trim().toLowerCase());
+        let priority = priorityFromLabels(labels);
+        if (priority === null) {
+          if (normalizedLabels.includes('project')) {
+            priority = 'P1';
+          } else {
+            const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
+            unlabelledPriorityTriage.push(ref);
+            log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
+            continue;
+          }
+        }
         const hasClaimStatus = normalizedLabels.some(label =>
           ['status:building', 'status:review'].includes(label)
         );
@@ -579,14 +583,6 @@ interface GithubIssueEvent {
   label?: { name?: string } | null;
 }
 
-function githubHeaders(): Record<string, string> {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  return {
-    accept: 'application/vnd.github+json',
-    ...(token ? { authorization: `Bearer ${token}` } : {}),
-  };
-}
-
 /** HTTP failure from the open-PR claim search. Carries the response status for the warning. */
 class PrClaimLookupError extends Error {
   readonly status: number;
@@ -613,7 +609,11 @@ async function lookupOpenPrClaim(
   const query = `is:pr is:open in:title,body ${woId} org:${owner}`;
   const url = `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=1`;
   try {
-    const response = await fetchImpl(url, { headers: githubHeaders() });
+    const response = await serviceGitHubFetchWithPermissionFallback({
+      service: 'taskmaster',
+      fetch: fetchImpl,
+      url,
+    });
     if (!response.ok) {
       throw new PrClaimLookupError(response.status);
     }
@@ -690,10 +690,11 @@ export async function defaultGetGithubIssueEvidence(
   if (!match) return null;
   const repo = match[1];
   const issueNumber = match[2];
-  const issueResponse = await fetchImpl(
-    `https://api.github.com/repos/${repo}/issues/${issueNumber}`,
-    { headers: githubHeaders() }
-  );
+  const issueResponse = await serviceGitHubFetchWithPermissionFallback({
+    service: 'taskmaster',
+    fetch: fetchImpl,
+    url: `https://api.github.com/repos/${repo}/issues/${issueNumber}`,
+  });
   assertGithubRateLimit(issueResponse, `evidence:issue:${repo}#${issueNumber}`);
   if (!issueResponse.ok) {
     throw new Error(`taskmaster_github_issue_evidence_read_failed:${issueResponse.status}`);
@@ -701,10 +702,11 @@ export async function defaultGetGithubIssueEvidence(
   const issue = (await issueResponse.json()) as GithubIssueDetail;
   // Fetch full comment list (no since=). Grading still filters post-since in
   // memory; adoption needs the latest marker regardless of age.
-  const commentsResponse = await fetchImpl(
-    `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?per_page=100`,
-    { headers: githubHeaders() }
-  );
+  const commentsResponse = await serviceGitHubFetchWithPermissionFallback({
+    service: 'taskmaster',
+    fetch: fetchImpl,
+    url: `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments?per_page=100`,
+  });
   assertGithubRateLimit(commentsResponse, `evidence:comments:${repo}#${issueNumber}`);
   if (!commentsResponse.ok) {
     throw new Error(
@@ -712,10 +714,11 @@ export async function defaultGetGithubIssueEvidence(
     );
   }
   const comments = (await commentsResponse.json()) as GithubIssueComment[];
-  const eventsResponse = await fetchImpl(
-    `https://api.github.com/repos/${repo}/issues/${issueNumber}/events?per_page=100`,
-    { headers: githubHeaders() }
-  );
+  const eventsResponse = await serviceGitHubFetchWithPermissionFallback({
+    service: 'taskmaster',
+    fetch: fetchImpl,
+    url: `https://api.github.com/repos/${repo}/issues/${issueNumber}/events?per_page=100`,
+  });
   assertGithubRateLimit(eventsResponse, `evidence:events:${repo}#${issueNumber}`);
   if (!eventsResponse.ok) {
     throw new Error(`taskmaster_github_issue_evidence_read_failed:events:${eventsResponse.status}`);
@@ -834,9 +837,13 @@ export function createRealPrRepairOwnerDeps(
     },
     listWosWithMultipleLanePrs: opts => listWosWithMultipleLanePrs(opts),
     listLanePrsForWo: (woId, opts) => listLanePrsForWo(woId, opts),
-    async listQueuedTaskmasterMessages(): Promise<{ id: string; body: string }[]> {
-      const rows = await listMessages({ recipient: 'taskmaster', status: 'queued' });
-      return rows.map(row => ({ id: row.id, body: row.body }));
+    async listQueuedTaskmasterMessages(): Promise<PrRepairQueuedMessage[]> {
+      return listMessages({
+        recipient: 'taskmaster',
+        status: 'queued',
+        sender: 'overseer',
+        sender_principal_id: 'system:overseer',
+      });
     },
     async acknowledgeRow(id): Promise<void> {
       const result = await acknowledgeMessage({ id, principal_id: 'taskmaster' });
@@ -883,12 +890,58 @@ export function createRealPrRepairOwnerDeps(
  * one `outcome='sent'` row per day and zero self-pause events in that window. Retirement is
  * a board decision, not an automatic expiry -- the code MUST NOT self-disable.
  */
-function digestProposal(
+export interface GitHubDigestData {
+  usage: { service: string; pool_id: string; calls: number; peak: number }[];
+  pools: { pool_id: string; resource: string; remaining: number; limit: number }[];
+  servicesByPool: Map<string, string[]>;
+}
+
+export async function loadGitHubDigestData(nowMs: number): Promise<GitHubDigestData> {
+  const since = new Date(nowMs - 24 * 60 * 60 * 1000).toISOString();
+  const db = getDatabase();
+  const usage = await db.query<{
+    service: string;
+    pool_id: string;
+    calls: number | string;
+    peak: number | string;
+  }>(
+    `SELECT service, pool_id, SUM(calls) AS calls, MAX(calls) AS peak FROM github_api_usage
+     WHERE hour_bucket >= $1 GROUP BY service, pool_id ORDER BY service, pool_id`,
+    [since]
+  );
+  const pools = await db.query<{
+    pool_id: string;
+    resource: string;
+    remaining: number | string;
+    limit: number | string;
+  }>(
+    `SELECT pool_id, resource, remaining, "limit" AS limit FROM github_api_pool_state
+     WHERE resource IN ('core', 'search', 'graphql') ORDER BY pool_id, resource`
+  );
+  const servicesByPool = new Map<string, string[]>();
+  for (const row of usage.rows) {
+    const services = servicesByPool.get(row.pool_id) ?? [];
+    if (!services.includes(row.service)) services.push(row.service);
+    servicesByPool.set(row.pool_id, services);
+  }
+  return {
+    usage: usage.rows.map(row => ({ ...row, calls: Number(row.calls), peak: Number(row.peak) })),
+    pools: pools.rows.map(row => ({
+      ...row,
+      remaining: Number(row.remaining),
+      limit: Number(row.limit),
+    })),
+    servicesByPool,
+  };
+}
+
+export function digestProposal(
   actions24h: taskmasterDb.TmJournalEntry[],
   control: taskmasterDb.TmControlState,
   nowMs: number,
   expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>,
   unlabelledPriorityTriage: string[] = [],
+  github?: GitHubDigestData,
   prRepairItems: string[] = []
 ): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
@@ -921,6 +974,23 @@ function digestProposal(
   const prRepairSummary = prRepairItems.length
     ? ` PR repair needs a person: ${prRepairItems.join('; ')}.`
     : '';
+  const githubUsage =
+    github?.usage
+      .map(
+        row =>
+          `GitHub API last 24h by service: ${row.service} (pool ${row.pool_id}) ${(row.calls / 24).toFixed(2)} avg calls/h, ${row.peak} peak calls/h.`
+      )
+      .join(' ') ?? '';
+  const githubPools =
+    github?.pools
+      .map(row => {
+        const state = `${row.pool_id}/${row.resource} ${row.remaining}/${row.limit}.`;
+        if (row.limit > 0 && row.remaining < row.limit * 0.2) {
+          return `${state} GITHUB-QUOTA-LOW ${row.pool_id}/${row.resource} (${(github.servicesByPool.get(row.pool_id) ?? []).join(', ')}).`;
+        }
+        return state;
+      })
+      .join(' ') ?? '';
   return {
     type: 'digest',
     threadRef: `digest:${dateKey}`,
@@ -931,7 +1001,7 @@ function digestProposal(
       `Taskmaster daily canary for ${dateKey}: state=${control.pause_state}, ` +
       `scope=${control.pause_scope ?? 'none'}, actor=${control.pause_actor ?? 'none'}, ` +
       `updated_at=${control.updated_at}; ${summary}; ${pauseDetail}.` +
-      `${expectationSummary}${triageSummary}${prRepairSummary} ` +
+      `${expectationSummary}${triageSummary}${prRepairSummary} ${githubUsage} ${githubPools} ` +
       'Pause/resume/status runbook: xo-wiki/wiki/tools/taskmaster/_index.md.',
     idempotencyKey: `tm:digest:${dateKey}`,
     actsImmediately: true,
@@ -1372,7 +1442,33 @@ export async function refreshAdoption(
   }
 }
 
-export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
+function isDeliverySuppressedExpiry(action: taskmasterDb.TmJournalEntry): boolean {
+  if (action.outcome !== 'expired') return false;
+  try {
+    const proposal: unknown = JSON.parse(action.proposal_json);
+    return (
+      typeof proposal === 'object' &&
+      proposal !== null &&
+      !Array.isArray(proposal) &&
+      Boolean((proposal as Record<string, unknown>).suppressed)
+    );
+  } catch {
+    return false;
+  }
+}
+
+let tickQueue: Promise<void> = Promise.resolve();
+
+export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
+  const result = tickQueue.then(() => runTick(state, deps));
+  tickQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
+async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<TickResult> {
   const now = deps.now ?? ((): Date => new Date());
   const dal = deps.db ?? taskmasterDb;
   const createTask = deps.createTask ?? createAuthenticatedMessage;
@@ -1488,6 +1584,15 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
+  const recentEscalateP0ByThread = new Set(
+    actions24h
+      .filter(
+        action =>
+          action.action_type === 'escalate_p0' &&
+          (action.outcome === 'sent' || isDeliverySuppressedExpiry(action))
+      )
+      .map(action => canonicalizeThreadRef(action.thread_ref))
+  );
   const readHealth = deps.getHealthSample ?? taskmasterDb.getHealthSample;
   let codexHealth: taskmasterDb.TmHealthSample | null = null;
   let xaiHealth: taskmasterDb.TmHealthSample | null = null;
@@ -1788,6 +1893,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   // Daily digest: one summary message per UTC day through the same path.
   let expectationCounts: Record<taskmasterDb.TmExpectationStatus, number> | undefined;
+  let githubDigest: GitHubDigestData | undefined;
   try {
     expectationCounts = dal.getExpectationCounts
       ? await dal.getExpectationCounts()
@@ -1815,12 +1921,20 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     }
   }
 
+  if (!deps.db) {
+    try {
+      githubDigest = await loadGitHubDigestData(nowMs);
+    } catch (error) {
+      log.warn({ err: error as Error }, 'taskmaster.github_digest_failed');
+    }
+  }
   const digest = digestProposal(
     actions24h,
     control,
     nowMs,
     expectationCounts,
     unlabelledPriorityTriage,
+    githubDigest,
     prRepairItems
   );
   proposals.push(digest);
@@ -1856,6 +1970,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   let digestSentThisTick = false;
 
   for (const proposal of proposals) {
+    const canonicalProposalRef = canonicalizeThreadRef(proposal.threadRef);
+    if (proposal.type === 'escalate_p0' && recentEscalateP0ByThread.has(canonicalProposalRef)) {
+      continue;
+    }
     let existingAction =
       actionsByKey.get(proposal.idempotencyKey) ??
       (await dal.getActionByIdempotencyKey(proposal.idempotencyKey));
@@ -2075,6 +2193,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             JSON.stringify({ ...proposal, suppressed })
           );
           journalRow.outcome = 'expired';
+          recentEscalateP0ByThread.add(canonicalProposalRef);
           result.expired += 1;
           log.info(
             {
@@ -2185,6 +2304,9 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         await dal.updateActionOutcome(journalRow.id, 'sent');
       }
       journalRow.outcome = 'sent';
+      if (proposal.type === 'escalate_p0') {
+        recentEscalateP0ByThread.add(canonicalProposalRef);
+      }
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
       if (proposal.type === 'fire_cauldron') firesThisTick += 1;
