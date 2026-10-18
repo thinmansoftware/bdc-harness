@@ -4,6 +4,7 @@
  * fake dispatch); no mock.module.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { randomUUID } from 'crypto';
 import { fireBackoffDecision } from './backoff';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
@@ -11,7 +12,11 @@ import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { Database } from 'bun:sqlite';
 import { runCascade as realRunCascade } from '@archon/smart-cauldron/cascade';
-import { acquireWoLock as realAcquireWoLock } from '@archon/smart-cauldron/wo-lock';
+import {
+  acquireWoLock as realAcquireWoLock,
+  releaseWoLock as realReleaseWoLock,
+  isWoExecutionSettled,
+} from '@archon/smart-cauldron/wo-lock';
 import { readCascadeRecordById } from '@archon/smart-cauldron/frontier-approval';
 import { rootLogger } from '@archon/paths';
 import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
@@ -43,7 +48,12 @@ import {
   type GithubIssueEvidence,
   type AdoptionRefreshResult,
 } from './loop';
-import { checkEvidence, checkExpectations, readCascadeWorkflowEvidence } from './expectations';
+import {
+  checkEvidence,
+  checkExpectations,
+  readCascadeWorkflowEvidence,
+  readCascadeCustodyEvidence,
+} from './expectations';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
@@ -321,15 +331,28 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
         (await dal.recordAction({ ...data, action_type: 'fire_cauldron', outcome: 'pending' }));
       // A row returned by another owner is not an execution grant.
       if (row.outcome !== 'pending' && row.outcome !== 'deferred') return { status: 'held' };
-      const token = `launch-${row.id}`;
+      const original = deferred ? JSON.parse(deferred.proposal_json) : proposal;
+      const retryLaunch = original.fireLaunch;
+      const token = retryLaunch ? randomUUID() : `launch-${row.id}`;
+      const cascadeId = retryLaunch ? `tm:fire:launch:${token}` : data.idempotency_key;
       row.outcome = 'pending';
       row.proposal_json = JSON.stringify({
-        ...proposal,
+        ...original,
+        cascadeId,
+        fireDrainDeferral: undefined,
+        ...(retryLaunch
+          ? {
+              fireLaunchHistory: [
+                ...(original.fireLaunchHistory ?? []),
+                { launch: retryLaunch, proof: original.fireDrainDeferral },
+              ],
+            }
+          : {}),
         fireLaunch: {
-          version: 1,
+          version: retryLaunch ? 2 : 1,
           state: 'active',
           token,
-          cascadeId: data.idempotency_key,
+          cascadeId,
           ...proposal.fireEvidence,
           claimedAt: new Date(world.nowMs).toISOString(),
         },
@@ -348,6 +371,38 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
         fireLaunch: { ...proposal.fireLaunch, state: 'released', releaseReason: reason },
       });
       stored.outcome = reason === 'settled-cascade' ? stored.outcome : 'expired';
+      row.proposal_json = stored.proposal_json;
+      row.outcome = stored.outcome;
+      return true;
+    },
+    deferFireLaunch: async (
+      row: TmJournalEntry,
+      token: string,
+      proof: import('@archon/core/db/taskmaster').TmFireDrainProof
+    ) => {
+      const stored = world.journal.find(entry => entry.id === row.id);
+      if (!stored || stored.outcome !== 'pending' || stored.proposal_json !== row.proposal_json)
+        return false;
+      const proposal = JSON.parse(stored.proposal_json);
+      const launch = proposal.fireLaunch;
+      if (
+        launch?.state !== 'active' ||
+        launch.token !== token ||
+        proof.cascadeId !== launch.cascadeId ||
+        proof.executionSettled !== true
+      )
+        return false;
+      stored.proposal_json = JSON.stringify({
+        ...proposal,
+        fireDrainDeferral: proof,
+        fireLaunch: {
+          ...launch,
+          state: 'released',
+          releaseReason: 'drain-refused',
+          releasedAt: new Date().toISOString(),
+        },
+      });
+      stored.outcome = 'deferred';
       row.proposal_json = stored.proposal_json;
       row.outcome = stored.outcome;
       return true;
@@ -1698,6 +1753,152 @@ describe('pending fire custody', () => {
     });
     return { deps, fires: () => fires };
   }
+
+  test('confirmed immediate drain deferrals refund only their own fire budget', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    let calls = 0;
+    const fixture = setup(world, {
+      listThreads: async () =>
+        Array.from({ length: 6 }, (_, i) =>
+          makeListedThread({
+            ref: `gh:thinmansoftware/bdc-harness#${700 + i}`,
+            priority: 'P0',
+            isUnclaimedP0: true,
+            title: `WO-HARNESS-BUDGET-${10 + i}`,
+          })
+        ),
+      readFireCascadeEvidence: async identity => ({
+        kind: 'drain-refused',
+        version: 1,
+        ...identity,
+        project: identity.project!,
+        workflowName: 'bound-workflow',
+        completedAt: new Date(world.nowMs).toISOString(),
+        executionSettled: true,
+      }),
+      runCascade: async options => {
+        calls++;
+        const admission = {
+          cascadeId: options.dispatchId,
+          woId: options.woId,
+          project: options.project,
+          status: 'running',
+          attempts: [],
+          request: { dryRun: false },
+        } as never;
+        options.onAdmission?.(admission, true);
+        return admission;
+      },
+    });
+    const result = await tick(createTaskmasterState(60000), fixture.deps);
+    expect(calls).toBe(6);
+    expect(result.effects).toBe(0);
+    expect(
+      world.journal.filter(row => row.action_type === 'fire_cauldron' && row.outcome === 'deferred')
+    ).toHaveLength(6);
+    expect(world.expectations.size).toBe(0);
+  });
+
+  test('late drain after running admission waits for release, defers without expectation, and retries a fresh generation', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'tm-drain-joint-'));
+    const world = makeWorld();
+    seedDigestSent(world);
+    let draining = false;
+    let allowFire!: () => void;
+    const fireGate = new Promise<void>(resolve => {
+      allowFire = resolve;
+    });
+    let allowRelease!: () => void;
+    const releaseGate = new Promise<void>(resolve => {
+      allowRelease = resolve;
+    });
+    let atRelease!: () => void;
+    const releaseStarted = new Promise<void>(resolve => {
+      atRelease = resolve;
+    });
+    const flights: ReturnType<typeof realRunCascade>[] = [];
+    let providerCalls = 0;
+    let firstOptions: Parameters<typeof realRunCascade>[0] | undefined;
+    const fixture = setup(world, {
+      getCauldronDrainState: async () => ({ mode: draining ? 'draining' : 'normal' }) as never,
+      readFireCascadeEvidence: identity =>
+        readCascadeCustodyEvidence(identity, {
+          readCascade: id => readCascadeRecordById(id, outDir),
+          readWoSettlement: (wo, project, cascade) =>
+            isWoExecutionSettled(wo, project, cascade, outDir),
+        }),
+      runCascade: requested => {
+        const options = {
+          ...requested,
+          outDir,
+          deps: {
+            findWoClaim: async () => null,
+            fetchNodeTimeouts: async () => ({}),
+            fire: async () => {
+              providerCalls++;
+              await fireGate;
+              return {
+                ok: false,
+                runId: null,
+                conversationId: null,
+                infraError: 'HTTP 503 cauldron_draining',
+                drainRefused: true,
+              };
+            },
+            releaseWoLock: async (...args: Parameters<typeof realReleaseWoLock>) => {
+              atRelease();
+              await releaseGate;
+              await realReleaseWoLock(...args);
+            },
+          },
+        };
+        firstOptions ??= options;
+        const flight = realRunCascade(options);
+        flights.push(flight);
+        return flight;
+      },
+    });
+    try {
+      const first = await tick(createTaskmasterState(60000), fixture.deps);
+      const row = world.journal.find(item => item.action_type === 'fire_cauldron')!;
+      const initial = JSON.parse(row.proposal_json);
+      expect(first.effects).toBe(0);
+      expect(row.outcome).toBe('pending');
+      draining = true;
+      allowFire();
+      await releaseStarted;
+      expect((await realRunCascade(firstOptions!)).status).toBe('drain-deferred');
+      await tick(createTaskmasterState(60000), fixture.deps);
+      expect(row.outcome).toBe('pending');
+      expect(world.expectations.size).toBe(0);
+      expect(providerCalls).toBe(1);
+      allowRelease();
+      await flights[0];
+      await tick(createTaskmasterState(60000), fixture.deps);
+      expect(row.outcome).toBe('deferred');
+      const deferred = JSON.parse(row.proposal_json);
+      expect(deferred.fireLaunch.state).toBe('released');
+      expect(deferred.fireLaunch.token).toBe(initial.fireLaunch.token);
+      expect(deferred.fireDrainDeferral.cascadeId).toBe(initial.cascadeId);
+      expect(world.expectations.size).toBe(0);
+      draining = false;
+      await tick(createTaskmasterState(60000), fixture.deps);
+      await Promise.all(flights);
+      const retried = JSON.parse(row.proposal_json);
+      expect(providerCalls).toBe(2);
+      expect(retried.cascadeId).not.toBe(initial.cascadeId);
+      expect(retried.cascadeId).toBe(`tm:fire:launch:${retried.fireLaunch.token}`);
+      expect(retried.fireLaunchHistory).toHaveLength(1);
+      expect(retried.fireLaunchHistory[0].proof).toEqual(deferred.fireDrainDeferral);
+      expect(world.expectations.size).toBe(0);
+    } finally {
+      allowFire();
+      allowRelease();
+      await Promise.allSettled(flights);
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
 
   test('joint real cascade custody follows actual workflow through replay and settled release', async () => {
     const outDir = await mkdtemp(join(tmpdir(), 'tm-cascade-joint-'));

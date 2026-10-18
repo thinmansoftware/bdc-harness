@@ -7,7 +7,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
-import { acquireWoLock, releaseWoLock } from '../wo-lock.js';
+import { acquireWoLock, releaseWoLock, isWoExecutionSettled } from '../wo-lock.js';
 
 const tempDirs: string[] = [];
 
@@ -22,6 +22,33 @@ async function makeOutDir(): Promise<string> {
 }
 
 describe('wo-lock', () => {
+  test('settlement observation requires exact released generation and never repairs evidence', async () => {
+    const outDir = await makeOutDir();
+    expect(await isWoExecutionSettled('WO-LOCK-01', 'shopops', 'prior', outDir)).toBe(false);
+    const prior = await acquireWoLock('WO-LOCK-01', 'shopops', 'prior', outDir);
+    expect(await isWoExecutionSettled('WO-LOCK-01', 'shopops', 'prior', outDir)).toBe(false);
+    await releaseWoLock('WO-LOCK-01', 'shopops', 'prior', outDir, prior.executionToken!);
+    const released = await readFile(prior.path, 'utf8');
+    expect(await isWoExecutionSettled('WO-LOCK-01', 'shopops', 'prior', outDir)).toBe(true);
+    expect(await isWoExecutionSettled('WO-LOCK-01', 'shopops', 'other', outDir)).toBe(false);
+    expect(await isWoExecutionSettled('WO-LOCK-01', 'other-project', 'prior', outDir)).toBe(false);
+    expect(await readFile(prior.path, 'utf8')).toBe(released);
+    for (const patch of [
+      { executionToken: undefined },
+      { status: 'invented' },
+      { woId: 'other' },
+      { project: 'other' },
+    ]) {
+      const malformed = JSON.stringify({ ...JSON.parse(released), ...patch });
+      await writeFile(prior.path, malformed);
+      expect(await isWoExecutionSettled('WO-LOCK-01', 'shopops', 'prior', outDir)).toBe(false);
+      expect(await readFile(prior.path, 'utf8')).toBe(malformed);
+    }
+    await writeFile(prior.path, released);
+    await acquireWoLock('WO-LOCK-01', 'shopops', 'replacement', outDir);
+    expect(await isWoExecutionSettled('WO-LOCK-01', 'shopops', 'prior', outDir)).toBe(false);
+  });
+
   test('concurrent takeover of a released lock grants exactly one cascade', async () => {
     const outDir = await makeOutDir();
     const prior = await acquireWoLock('WO-LOCK-01', 'shopops', 'prior', outDir);

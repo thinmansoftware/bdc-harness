@@ -8,6 +8,7 @@ import {
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
+import { isWoExecutionSettled } from '@archon/smart-cauldron/wo-lock';
 import { readCascadeRecordById } from '@archon/smart-cauldron/frontier-approval';
 
 const log = createLogger('taskmaster/expectations');
@@ -52,19 +53,57 @@ export interface EvidenceResult {
 export interface CascadeEvidenceDeps {
   readCascade?: typeof readCascadeRecordById;
   query?: ExpectationDeps['query'];
+  readWoSettlement?: typeof isWoExecutionSettled;
 }
 
-/** Exact bound run evidence shared by grading and the loop-owned completion check. */
-export async function readCascadeWorkflowEvidence(
-  identity: { cascadeId: string; woId: string; project: string | undefined },
-  deps: CascadeEvidenceDeps = {}
-): Promise<{
+export interface CascadeWorkflowEvidence {
   earliestRunId: string;
   completedRunId: string | null;
   status: string;
   prOpened: boolean;
   settled?: boolean;
-}> {
+}
+
+export interface CascadeDrainDeferralEvidence {
+  kind: 'drain-refused';
+  version: 1;
+  cascadeId: string;
+  woId: string;
+  project: string;
+  workflowName: string;
+  completedAt: string;
+  executionSettled: true;
+}
+
+interface CascadeIdentity {
+  cascadeId: string;
+  woId: string;
+  project: string | undefined;
+}
+
+/** Actual workflow evidence remains mandatory for grading and expectations. */
+export async function readCascadeWorkflowEvidence(
+  identity: CascadeIdentity,
+  deps: CascadeEvidenceDeps = {}
+): Promise<CascadeWorkflowEvidence> {
+  const evidence = await readCascadeProjection(identity, deps, false);
+  if ('kind' in evidence) throw new Error('taskmaster_cascade_evidence_unknown');
+  return evidence;
+}
+
+/** Custody alone may recognize a fresh named no-fire refusal after owner release. */
+export async function readCascadeCustodyEvidence(
+  identity: CascadeIdentity,
+  deps: CascadeEvidenceDeps = {}
+): Promise<CascadeWorkflowEvidence | CascadeDrainDeferralEvidence> {
+  return readCascadeProjection(identity, deps, true);
+}
+
+async function readCascadeProjection(
+  identity: CascadeIdentity,
+  deps: CascadeEvidenceDeps,
+  allowDrainDeferral: boolean
+): Promise<CascadeWorkflowEvidence | CascadeDrainDeferralEvidence> {
   try {
     if (
       [identity.cascadeId, identity.woId, identity.project].some(
@@ -82,6 +121,7 @@ export async function readCascadeWorkflowEvidence(
     const visited = new Set<string>();
     const runs = new Map<string, string>();
     let settled = true;
+    let drainProof: CascadeDrainDeferralEvidence | undefined;
     let cascadeId: string | null = identity.cascadeId;
     while (cascadeId !== null) {
       // Follow explicit approval links only; bounded even for corrupted records.
@@ -97,6 +137,27 @@ export async function readCascadeWorkflowEvidence(
         !Array.isArray(record.attempts)
       )
         throw new Error('invalid cascade scope');
+      const finalAttempt = record.attempts.at(-1);
+      const namedFinalDrain =
+        record.status === 'drain-deferred' &&
+        finalAttempt?.runId === null &&
+        finalAttempt.outcome === 'drain-deferred' &&
+        typeof finalAttempt.workflowName === 'string' &&
+        !!finalAttempt.workflowName.trim() &&
+        typeof finalAttempt.completedAt === 'string' &&
+        Number.isFinite(Date.parse(finalAttempt.completedAt)) &&
+        typeof finalAttempt.startedAt === 'string' &&
+        Number.isFinite(Date.parse(finalAttempt.startedAt)) &&
+        Date.parse(finalAttempt.completedAt) >= Date.parse(finalAttempt.startedAt) &&
+        record.frontierApproval === undefined &&
+        record.supervisorRecovery === undefined;
+      const drainSettled =
+        namedFinalDrain &&
+        (await (deps.readWoSettlement ?? isWoExecutionSettled)(
+          record.woId,
+          record.project,
+          cascadeId
+        ));
       if (
         ![
           'won',
@@ -105,14 +166,16 @@ export async function readCascadeWorkflowEvidence(
           'cancelled',
           'frontier-rejected',
           'frontier-approved',
-        ].includes(record.status)
+        ].includes(record.status) &&
+        !drainSettled
       )
         settled = false;
       for (const attempt of record.attempts) {
         if (!attempt || typeof attempt.workflowName !== 'string' || !attempt.workflowName)
           throw new Error('invalid attempt');
         if (attempt.runId === null) {
-          settled = false; // A timed-out discovery may still own provider work.
+          // Only the positively settled final named refusal is non-owning.
+          if (attempt !== finalAttempt || !drainSettled) settled = false;
           continue;
         }
         if (typeof attempt.runId !== 'string' || !attempt.runId.trim())
@@ -148,10 +211,32 @@ export async function readCascadeWorkflowEvidence(
       )
         settled = false;
       if (record.supervisorRecovery) settled = false;
+      if (
+        allowDrainDeferral &&
+        visited.size === 1 &&
+        cascadeId === identity.cascadeId &&
+        record.attempts.length === 1 &&
+        drainSettled &&
+        typeof finalAttempt.completedAt === 'string'
+      ) {
+        drainProof = {
+          kind: 'drain-refused',
+          version: 1,
+          cascadeId,
+          woId: record.woId,
+          project: record.project,
+          workflowName: finalAttempt.workflowName,
+          completedAt: finalAttempt.completedAt,
+          executionSettled: true,
+        };
+      }
       cascadeId = resume ?? null;
     }
     // A valid admission without an actual workflow ID is still not ready.
-    if (runs.size === 0) throw new Error('no actual run');
+    if (runs.size === 0) {
+      if (drainProof && visited.size === 1) return drainProof;
+      throw new Error('no actual run');
+    }
     let firstRunId: string | undefined;
     let status: string | undefined;
     let completed = false;

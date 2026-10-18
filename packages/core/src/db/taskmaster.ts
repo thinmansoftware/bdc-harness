@@ -1038,13 +1038,84 @@ export async function listPendingFireActions(): Promise<TmJournalEntry[]> {
 }
 
 export interface TmFireLaunch {
-  version: 1;
+  version: 1 | 2;
   state: 'active' | 'released';
   token: string;
   cascadeId: string;
   woId: string;
   project: string;
   claimedAt: string;
+  releasedAt?: string;
+  releaseReason?: string;
+}
+
+export interface TmFireDrainProof {
+  kind: 'drain-refused';
+  version: 1;
+  cascadeId: string;
+  woId: string;
+  project: string;
+  workflowName: string;
+  completedAt: string;
+  executionSettled: true;
+}
+
+function validDrainProof(proof: unknown, launch: TmFireLaunch): proof is TmFireDrainProof {
+  if (!proof || typeof proof !== 'object' || Array.isArray(proof)) return false;
+  if (
+    Object.keys(proof).length !== 8 ||
+    Object.keys(proof).some(
+      key =>
+        ![
+          'kind',
+          'version',
+          'cascadeId',
+          'woId',
+          'project',
+          'workflowName',
+          'completedAt',
+          'executionSettled',
+        ].includes(key)
+    )
+  )
+    return false;
+  const value = proof as TmFireDrainProof;
+  return (
+    value.kind === 'drain-refused' &&
+    value.version === 1 &&
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-boolean-literal-compare -- Runtime proof must explicitly attest settlement.
+    value.executionSettled === true &&
+    value.cascadeId === launch.cascadeId &&
+    value.woId === launch.woId &&
+    value.project === launch.project &&
+    typeof value.workflowName === 'string' &&
+    !!value.workflowName.trim() &&
+    typeof value.completedAt === 'string' &&
+    Number.isFinite(Date.parse(value.completedAt))
+  );
+}
+
+function validFireLaunch(
+  launch: TmFireLaunch,
+  key: string,
+  woId: string,
+  project: string
+): boolean {
+  return (
+    !!launch &&
+    [1, 2].includes(launch.version) &&
+    ['active', 'released'].includes(launch.state) &&
+    typeof launch.token === 'string' &&
+    !!launch.token.trim() &&
+    (launch.version === 1
+      ? launch.cascadeId === key
+      : /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(launch.token) &&
+        launch.cascadeId === `tm:fire:launch:${launch.token}`) &&
+    launch.woId === woId &&
+    launch.project === project &&
+    typeof launch.claimedAt === 'string' &&
+    Number.isFinite(Date.parse(launch.claimedAt))
+  );
 }
 
 /** Parse existing metadata conservatively; corrupt unresolved custody cannot grant capacity. */
@@ -1068,22 +1139,47 @@ export function fireLaunchMetadata(row: TmJournalEntry): {
     !project ||
     /\s/.test(project) ||
     !row.idempotency_key ||
-    proposal.idempotencyKey !== row.idempotency_key ||
-    (proposal.cascadeId !== undefined && proposal.cascadeId !== row.idempotency_key)
+    proposal.idempotencyKey !== row.idempotency_key
   )
     throw new Error('taskmaster_fire_launch_metadata_unknown');
   const launch = proposal.fireLaunch as TmFireLaunch | undefined;
   if (
-    launch !== undefined &&
-    (launch?.version !== 1 ||
-      !['active', 'released'].includes(launch.state) ||
-      typeof launch.token !== 'string' ||
-      !launch.token.trim() ||
-      launch.cascadeId !== row.idempotency_key ||
-      launch.woId !== woId ||
-      launch.project !== project ||
-      typeof launch.claimedAt !== 'string' ||
-      !Number.isFinite(Date.parse(launch.claimedAt)))
+    (launch !== undefined && !validFireLaunch(launch, row.idempotency_key, woId, project)) ||
+    (proposal.cascadeId !== undefined &&
+      proposal.cascadeId !== (launch?.cascadeId ?? row.idempotency_key))
+  )
+    throw new Error('taskmaster_fire_launch_metadata_unknown');
+  const history = proposal.fireLaunchHistory;
+  if (history !== undefined) {
+    if (!Array.isArray(history) || !launch)
+      throw new Error('taskmaster_fire_launch_metadata_unknown');
+    const tokens = new Set([launch.token]);
+    const ids = new Set([launch.cascadeId]);
+    for (const entry of history as { launch: TmFireLaunch; proof: TmFireDrainProof }[]) {
+      const prior = entry?.launch;
+      if (
+        !prior ||
+        !validFireLaunch(prior, row.idempotency_key, woId, project) ||
+        prior.state !== 'released' ||
+        prior.releaseReason !== 'drain-refused' ||
+        typeof prior.releasedAt !== 'string' ||
+        !Number.isFinite(Date.parse(prior.releasedAt)) ||
+        !validDrainProof(entry.proof, prior) ||
+        tokens.has(prior.token) ||
+        ids.has(prior.cascadeId)
+      )
+        throw new Error('taskmaster_fire_launch_metadata_unknown');
+      tokens.add(prior.token);
+      ids.add(prior.cascadeId);
+    }
+  }
+  if (
+    proposal.fireDrainDeferral !== undefined &&
+    (launch?.state !== 'released' ||
+      launch.releaseReason !== 'drain-refused' ||
+      typeof launch.releasedAt !== 'string' ||
+      !Number.isFinite(Date.parse(launch.releasedAt)) ||
+      !validDrainProof(proposal.fireDrainDeferral, launch))
   )
     throw new Error('taskmaster_fire_launch_metadata_unknown');
   return { proposal, woId, project, launch: launch ?? null };
@@ -1142,7 +1238,12 @@ export async function claimFireLaunch(data: {
       grade: null,
     } as TmJournalEntry;
     const parsed = fireLaunchMetadata(candidate);
-    if (parsed.launch || !Number.isFinite(Date.parse(data.proof_deadline_at)))
+    if (
+      parsed.launch ||
+      parsed.proposal.fireLaunchHistory !== undefined ||
+      parsed.proposal.fireDrainDeferral !== undefined ||
+      !Number.isFinite(Date.parse(data.proof_deadline_at))
+    )
       throw new Error('taskmaster_fire_launch_invalid_request');
     const all = await query<TmJournalRow>(
       "SELECT * FROM tm_journal WHERE action_type = 'fire_cauldron' OR idempotency_key = $1 ORDER BY created_at ASC, id ASC",
@@ -1158,12 +1259,17 @@ export async function claimFireLaunch(data: {
         return { status: 'held' };
       }
       if (row.idempotency_key === data.idempotency_key) {
-        // A deferred proposal has never acquired execution authority. Failed,
-        // expired, claimed, and uncertain keys never acquire a second grant.
+        // Only an unlaunched proposal or a proven released drain generation retries.
+        // Failed, expired, active, and uncertain keys never acquire a second grant.
         if (
           retry ||
           row.outcome !== 'deferred' ||
-          prior.launch ||
+          (prior.launch !== null &&
+            !(
+              prior.launch.state === 'released' &&
+              prior.launch.releaseReason === 'drain-refused' &&
+              validDrainProof(prior.proposal.fireDrainDeferral, prior.launch)
+            )) ||
           prior.woId !== parsed.woId ||
           prior.project !== parsed.project ||
           row.thread_ref !== data.thread_ref ||
@@ -1190,14 +1296,24 @@ export async function claimFireLaunch(data: {
     )
       return { status: 'stale' };
     const token = randomUUID();
+    const executionId = `tm:fire:launch:${token}`;
+    const proposal = { ...original.proposal };
+    if (original.launch) {
+      proposal.fireLaunchHistory = [
+        ...((proposal.fireLaunchHistory as unknown[] | undefined) ?? []),
+        { launch: original.launch, proof: proposal.fireDrainDeferral },
+      ];
+    }
+    delete proposal.fireDrainDeferral;
+    delete proposal.fireHoldReason;
     const proposalJson = JSON.stringify({
-      ...original.proposal,
-      cascadeId: data.idempotency_key,
+      ...proposal,
+      cascadeId: executionId,
       fireLaunch: {
-        version: 1,
+        version: 2,
         state: 'active',
         token,
-        cascadeId: data.idempotency_key,
+        cascadeId: executionId,
         woId: parsed.woId,
         project: parsed.project,
         claimedAt: now,
@@ -1277,6 +1393,44 @@ export async function releaseFireLaunch(
   if (result.rowCount !== 1) return false;
   row.proposal_json = updated;
   row.outcome = outcome;
+  return true;
+}
+
+/** Atomically defer and release only a positively settled named no-fire generation. */
+export async function deferFireLaunch(
+  row: TmJournalEntry,
+  token: string,
+  proof: TmFireDrainProof
+): Promise<boolean> {
+  const parsed = fireLaunchMetadata(row);
+  const launch = parsed.launch;
+  if (
+    row.outcome !== 'pending' ||
+    launch?.state !== 'active' ||
+    launch.token !== token ||
+    !validDrainProof(proof, launch)
+  )
+    return false;
+  const proposal = { ...parsed.proposal };
+  delete proposal.fireHoldReason;
+  const updated = JSON.stringify({
+    ...proposal,
+    fireLaunch: {
+      ...launch,
+      state: 'released',
+      releaseReason: 'drain-refused',
+      releasedAt: new Date().toISOString(),
+    },
+    fireDrainDeferral: proof,
+  });
+  const result = await getDatabase().query(
+    `UPDATE tm_journal SET outcome = 'deferred', proposal_json = $1
+     WHERE id = $2 AND action_type = 'fire_cauldron' AND outcome = 'pending' AND proposal_json = $3`,
+    [updated, row.id, row.proposal_json]
+  );
+  if (result.rowCount !== 1) return false;
+  row.proposal_json = updated;
+  row.outcome = 'deferred';
   return true;
 }
 

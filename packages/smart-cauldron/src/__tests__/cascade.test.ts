@@ -156,6 +156,65 @@ describe('provider lifetime release fencing', () => {
     return (await acquireWoLock(opts.woId, opts.project!, 'later-dispatch', opts.outDir)).acquired;
   }
 
+  test('named no-provider drain refusal discharges only its own invocation', async () => {
+    const opts = options({
+      fire: async () => ({
+        ok: false,
+        runId: null,
+        conversationId: null,
+        infraError: 'HTTP 503: cauldron_draining',
+        drainRefused: true,
+      }),
+    });
+    expect((await runCascade(opts)).status).toBe('drain-deferred');
+    expect(await isFree(opts)).toBe(true);
+  });
+
+  test.each(['conversation', 'run-id', 'generic-503'])(
+    'uncertain drain-like result does not discharge provider lifetime (%s)',
+    async mode => {
+      const opts = options({
+        fire: async () => ({
+          ok: false,
+          runId: mode === 'run-id' ? 'uncertain-run' : null,
+          conversationId: mode === 'conversation' ? 'uncertain-conversation' : null,
+          infraError: 'HTTP 503',
+          drainRefused: mode !== 'generic-503',
+        }),
+      });
+      expect((await runCascade(opts)).status).toBe('infra-alert');
+      expect(await isFree(opts)).toBe(false);
+    }
+  );
+
+  test.each(['unresolved', 'terminal'] as const)(
+    'later named drain refusal preserves the earlier invocation lifetime (%s)',
+    async mode => {
+      let fires = 0;
+      const opts = options({
+        fire: async () =>
+          ++fires === 1
+            ? makeFireOk('earlier-run')
+            : {
+                ok: false,
+                runId: null,
+                conversationId: null,
+                infraError: 'HTTP 503: cauldron_draining',
+                drainRefused: true,
+              },
+        poll: async () => {
+          if (mode === 'unresolved') throw new TimeoutError('earlier invocation unresolved');
+          return makePollResult({ runId: 'earlier-run', terminalStatus: 'failed' });
+        },
+        cancel: async () => ({ ok: true, error: null }),
+      });
+      opts.entryOverride = 'cursor';
+      expect((await runCascade(opts)).status).toBe('drain-deferred');
+      expect(fires).toBe(2);
+      expect(await isFree(opts)).toBe(mode === 'terminal');
+    }
+  );
+
   test('checkpoint failure before invocation releases without starting provider work', async () => {
     let fires = 0;
     const opts = options({

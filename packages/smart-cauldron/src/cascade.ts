@@ -492,6 +492,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           'frontier-approved',
           'cancelled',
           'refused',
+          'drain-deferred',
         ].includes(record.status)
       )
         throw new Error('admission unknown');
@@ -937,7 +938,16 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       const fireResult: FireResult = await fireImpl(fireOptions);
       attempt.runId = fireResult.runId;
 
-      if (fireResult.drainRefused) {
+      if (
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-boolean-literal-compare -- Only an explicit no-provider refusal can discharge ownership.
+        fireResult.ok === false &&
+        fireResult.drainRefused === true &&
+        fireResult.runId === null &&
+        fireResult.conversationId === null
+      ) {
+        // This named refusal proves only this invocation never started provider work.
+        // Earlier uncertain invocations must continue holding the WO lifetime lock.
+        unresolvedInvocations.delete(invocation);
         attempt.outcome = 'drain-deferred';
         attempt.infraErrorReason = fireResult.infraError;
         attempt.completedAt = new Date().toISOString();

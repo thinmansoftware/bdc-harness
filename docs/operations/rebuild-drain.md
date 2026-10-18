@@ -106,3 +106,36 @@ the current environment- and commit-scoped approval and deployment evidence.
 Historical M-181 entries do not authorize a new rebuild. Host installation,
 rebuild logging, pin retention, automatic run recovery, and a recreate reservation
 remain separate work; `recreateSafe` is an observation, not a reservation.
+
+## Taskmaster late drain custody
+
+A drain may begin after Taskmaster receives running admission but before the
+provider fire. Running admission alone does not count as sent work. Taskmaster
+reconciles the durable cascade and actual workflow identity on later ticks,
+including after restart.
+
+A fresh cascade can be deferred without a workflow expectation only when it has
+one completed named drain-refused attempt with no run ID, no frontier continuation
+or supervisor delegation, and the exact WO/project/cascade execution lock records
+a validated release. A terminal cascade checkpoint appears before lock release;
+it cannot authorize a retry while release is still pending. Missing, malformed,
+legacy tokenless, or superseded lock evidence keeps custody held.
+
+The journal atomically stores this proof, releases the matching launch token, and
+marks the action deferred. A stale comparison grants no capacity. A later eligible
+tick after drain clears can claim a fresh execution generation under the same
+action key, original deadline, recipient, and spec authority. Version 2 execution
+IDs use `tm:fire:launch:<launch token>`. Previous drain generations and their proof
+remain in `fireLaunchHistory`; their immutable cascade records are preserved.
+Legacy version 1 key-bound claims remain readable.
+
+Ambiguous provider responses, generic HTTP 503, cancellation acknowledgments, and
+missing run discovery do not prove no fire. A later named refusal discharges only
+its own invocation. Earlier actual runs retain their normal workflow expectation;
+this partial cascade never becomes a fresh no-fire retry. Release requires all
+actual workflows terminal, no earlier ambiguous null attempt, and positive WO
+execution settlement. An existing journal is preserved when global drain is on.
+
+Confirmed no-fire deferrals refund that caller's fire reservation while retaining
+per-item and per-scope tick guards. They never count as sent or useful work. These
+source controls do not establish runtime activation or the seven-day bad-run gate.

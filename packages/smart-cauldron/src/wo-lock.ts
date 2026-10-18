@@ -175,3 +175,25 @@ export async function releaseWoLock(
     log.warn('smart_cauldron.wo_lock_release_unknown');
   }
 }
+
+/** Read-only proof of release; absence or a superseding owner remains unknown. */
+export async function isWoExecutionSettled(
+  woId: string,
+  project: string,
+  cascadeId: string,
+  outDir = './cascade-runs'
+): Promise<boolean> {
+  try {
+    if ([woId, project, cascadeId].some(value => typeof value !== 'string' || !value.trim()))
+      return false;
+    const record = await readValidatedLock(lockPath(outDir, woId, project), woId, project);
+    return (
+      record.cascadeId === cascadeId &&
+      record.status === 'released' &&
+      typeof record.executionToken === 'string' &&
+      record.executionToken.trim().length > 0
+    );
+  } catch {
+    return false;
+  }
+}

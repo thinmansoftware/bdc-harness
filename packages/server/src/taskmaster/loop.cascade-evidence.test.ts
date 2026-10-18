@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import type { CascadeAttempt, CascadeRunRecord } from '@archon/smart-cauldron/types';
 import { defaultGetFireRunEvidence } from './loop';
-import { readCascadeWorkflowEvidence } from './expectations';
+import { readCascadeWorkflowEvidence, readCascadeCustodyEvidence } from './expectations';
 
 const identity = { cascadeId: 'cascade-exact', woId: 'WO-TEST-01', project: 'bdc-harness' };
 let db: Database;
@@ -72,6 +72,112 @@ function probe(
 }
 
 describe('exact cascade-bound fire usefulness evidence', () => {
+  test('fresh named drain refusal requires positive execution settlement and cannot grade useful', async () => {
+    const drained = record({
+      status: 'drain-deferred',
+      attempts: [{ ...attempt(null), outcome: 'drain-deferred' }],
+    });
+    let released = false;
+    let reads = 0;
+    const deps = {
+      readCascade: async () => {
+        reads++;
+        return drained;
+      },
+      readWoSettlement: async () => released,
+      query: async <T>() => {
+        throw new Error('no provider SQL expected');
+        return { rows: [] as T[] };
+      },
+    };
+    await expect(readCascadeCustodyEvidence(identity, deps)).rejects.toThrow(
+      'taskmaster_cascade_evidence_unknown'
+    );
+    released = true;
+    expect(await readCascadeCustodyEvidence(identity, deps)).toEqual({
+      kind: 'drain-refused',
+      version: 1,
+      ...identity,
+      workflowName: 'bound-workflow',
+      completedAt: new Date(1).toISOString(),
+      executionSettled: true,
+    });
+    expect(reads).toBe(2);
+    await expect(readCascadeWorkflowEvidence(identity, deps)).rejects.toThrow(
+      'taskmaster_cascade_evidence_unknown'
+    );
+  });
+
+  test.each([
+    'missing-completion',
+    'malformed-completion',
+    'earlier-unknown',
+    'wrong-scope',
+    'dry-run',
+    'frontier',
+    'delegation',
+    'running',
+  ])('drain no-fire proof rejects %s', async mode => {
+    const drained = record({
+      status: 'drain-deferred',
+      attempts: [{ ...attempt(null), outcome: 'drain-deferred' }],
+    });
+    if (mode === 'missing-completion') drained.attempts[0]!.completedAt = null;
+    if (mode === 'malformed-completion') drained.attempts[0]!.completedAt = 'invalid';
+    if (mode === 'earlier-unknown') drained.attempts.unshift(attempt(null));
+    if (mode === 'wrong-scope') drained.project = 'other';
+    if (mode === 'dry-run') drained.request!.dryRun = true;
+    if (mode === 'frontier')
+      drained.frontierApproval = { resumeCascadeId: null } as CascadeRunRecord['frontierApproval'];
+    if (mode === 'delegation')
+      drained.supervisorRecovery = {} as CascadeRunRecord['supervisorRecovery'];
+    if (mode === 'running') drained.status = 'running';
+    await expect(
+      readCascadeCustodyEvidence(identity, {
+        readCascade: async () => drained,
+        readWoSettlement: async () => true,
+      })
+    ).rejects.toThrow('taskmaster_cascade_evidence_unknown');
+  });
+
+  test('earlier actual provider work takes precedence over a later drain refusal', async () => {
+    seed('actual-run', 'failed');
+    const bound = await readCascadeCustodyEvidence(identity, {
+      readCascade: async () =>
+        record({
+          status: 'drain-deferred',
+          attempts: [attempt('actual-run'), { ...attempt(null), outcome: 'drain-deferred' }],
+        }),
+      readWoSettlement: async () => true,
+      query: async <T>(sql: string, params: unknown[] = []) => ({
+        rows: db.query(sql).all(...(params as string[])) as T[],
+      }),
+    });
+    expect(bound).toMatchObject({ earliestRunId: 'actual-run', status: 'failed' });
+    expect(bound).not.toHaveProperty('kind', 'drain-refused');
+  });
+
+  test.each(['settled', 'running-lock', 'running-provider', 'earlier-ambiguous'])(
+    'partial drain settles only all positively terminated invocations (%s)',
+    async mode => {
+      seed('actual-run', mode === 'running-provider' ? 'running' : 'failed');
+      const attempts = [
+        attempt('actual-run'),
+        { ...attempt(null), outcome: 'drain-deferred' as const },
+      ];
+      if (mode === 'earlier-ambiguous') attempts.unshift(attempt(null));
+      const result = await readCascadeCustodyEvidence(identity, {
+        readCascade: async () => record({ status: 'drain-deferred', attempts }),
+        readWoSettlement: async () => mode !== 'running-lock',
+        query: async <T>(sql: string, params: unknown[] = []) => ({
+          rows: db.query(sql).all(...(params as string[])) as T[],
+        }),
+      });
+      expect(result).toMatchObject({ earliestRunId: 'actual-run', settled: mode === 'settled' });
+      expect(result).not.toHaveProperty('kind', 'drain-refused');
+    }
+  );
+
   test.each([
     ['won', 'completed', true],
     ['blocked', 'failed', true],

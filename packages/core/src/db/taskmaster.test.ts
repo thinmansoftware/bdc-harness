@@ -49,6 +49,8 @@ import {
   listPendingFireActions,
   claimFireLaunch,
   releaseFireLaunch,
+  deferFireLaunch,
+  fireLaunchMetadata,
   listFireLaunchClaims,
   transitionPendingFireAction,
   getExpectationByRegistrationKey,
@@ -85,6 +87,131 @@ describe('durable fire launch grants', () => {
       expectedEpoch: 0,
     };
   }
+
+  test('proven drain deferral retries once with fresh execution identity and retained history', async () => {
+    const request = input('tm:fire:drain-generation');
+    const first = await claimFireLaunch(request);
+    expect(first.status).toBe('claimed');
+    if (first.status !== 'claimed') throw new Error('missing first grant');
+    const originalDeadline = first.row.proof_deadline_at;
+    const prior = fireLaunchMetadata(first.row).launch!;
+    const proof = {
+      kind: 'drain-refused' as const,
+      version: 1 as const,
+      cascadeId: prior.cascadeId,
+      woId: prior.woId,
+      project: prior.project,
+      workflowName: 'bound-workflow',
+      completedAt: new Date().toISOString(),
+      executionSettled: true as const,
+    };
+    const stale = { ...first.row };
+    expect(await deferFireLaunch(first.row, 'wrong-token', proof)).toBe(false);
+    expect(await deferFireLaunch(first.row, first.token, proof)).toBe(true);
+    expect(await deferFireLaunch(stale, first.token, proof)).toBe(false);
+    expect(first.row.outcome).toBe('deferred');
+    expect(await listFireLaunchClaims()).toHaveLength(0);
+    const retries = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        claimFireLaunch({
+          ...request,
+          proof_deadline_at: new Date(Date.now() + 172800000).toISOString(),
+        })
+      )
+    );
+    expect(retries.filter(result => result.status === 'claimed')).toHaveLength(1);
+    const next = retries.find(result => result.status === 'claimed')!;
+    if (next.status !== 'claimed') throw new Error('missing retry');
+    const current = fireLaunchMetadata(next.row);
+    expect(current.launch?.version).toBe(2);
+    expect(current.launch?.cascadeId).toBe(`tm:fire:launch:${next.token}`);
+    expect(current.launch?.cascadeId).not.toBe(prior.cascadeId);
+    expect(next.row.proof_deadline_at).toBe(originalDeadline);
+    expect(current.proposal.fireLaunchHistory).toEqual([
+      {
+        launch: {
+          ...prior,
+          state: 'released',
+          releaseReason: 'drain-refused',
+          releasedAt: expect.any(String),
+        },
+        proof,
+      },
+    ]);
+    expect(await listFireLaunchClaims()).toHaveLength(1);
+    await resetTaskmaster({ actor: 'test', reason: 'v2 preservation' });
+    await expireParkedActions();
+    expect(await deferFireLaunch(stale, first.token, proof)).toBe(false);
+    const afterReset = (await getActionByIdempotencyKey(request.idempotency_key))!;
+    expect(afterReset.outcome).toBe('pending');
+    expect(afterReset.proposal_json).toBe(next.row.proposal_json);
+  });
+
+  test.each(['unsettled', 'wrong-scope', 'malformed-time', 'extra-field'])(
+    'no-fire drain deferral rejects %s evidence without releasing authority',
+    async mode => {
+      const first = await claimFireLaunch(input('tm:fire:invalid-drain'));
+      if (first.status !== 'claimed') throw new Error('missing grant');
+      const launch = fireLaunchMetadata(first.row).launch!;
+      const proof = {
+        kind: 'drain-refused',
+        version: 1,
+        woId: launch.woId,
+        cascadeId: launch.cascadeId,
+        workflowName: 'bound-workflow',
+        completedAt: mode === 'malformed-time' ? 'invalid' : new Date().toISOString(),
+        executionSettled: mode !== 'unsettled',
+        project: mode === 'wrong-scope' ? 'other' : launch.project,
+        ...(mode === 'extra-field' ? { diagnostic: 'not retained' } : {}),
+      };
+      expect(await deferFireLaunch(first.row, first.token, proof as never)).toBe(false);
+      expect(await listFireLaunchClaims()).toHaveLength(1);
+    }
+  );
+
+  test.each([
+    'missing-release-date',
+    'malformed-release-date',
+    'malformed-history',
+    'wrong-execution-id',
+    'expired',
+    'authority-drift',
+  ])('drain retry refuses %s without creating invalid authority', async mode => {
+    const request = input('tm:fire:drain-control');
+    const first = await claimFireLaunch(request);
+    if (first.status !== 'claimed') throw new Error('missing grant');
+    const launch = fireLaunchMetadata(first.row).launch!;
+    const proof = {
+      kind: 'drain-refused' as const,
+      version: 1 as const,
+      cascadeId: launch.cascadeId,
+      woId: launch.woId,
+      project: launch.project,
+      workflowName: 'bound-workflow',
+      completedAt: new Date().toISOString(),
+      executionSettled: true as const,
+    };
+    expect(await deferFireLaunch(first.row, first.token, proof)).toBe(true);
+    const proposal = JSON.parse(first.row.proposal_json);
+    if (mode === 'missing-release-date') delete proposal.fireLaunch.releasedAt;
+    if (mode === 'malformed-release-date') proposal.fireLaunch.releasedAt = 'invalid';
+    if (mode === 'malformed-history') proposal.fireLaunchHistory = [{}];
+    if (mode === 'wrong-execution-id') proposal.fireLaunch.cascadeId = 'other';
+    const json = JSON.stringify(proposal);
+    await updateActionOutcome(first.row.id, 'deferred', json);
+    if (mode === 'expired')
+      await db.query('UPDATE tm_journal SET proof_deadline_at = $1 WHERE id = $2', [
+        new Date(0).toISOString(),
+        first.row.id,
+      ]);
+    if (mode === 'authority-drift')
+      request.proposal_json = JSON.stringify({
+        ...JSON.parse(request.proposal_json),
+        recipient: 'xo',
+      });
+    expect((await claimFireLaunch(request)).status).toBe(mode === 'expired' ? 'stale' : 'held');
+    expect((await getActionByIdempotencyKey(request.idempotency_key))?.proposal_json).toBe(json);
+  });
 
   test.each(['same-key', 'different-buckets'])('%s has exactly one grant', async mode => {
     const results = await Promise.all(
