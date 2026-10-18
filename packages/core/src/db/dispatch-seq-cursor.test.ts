@@ -193,6 +193,64 @@ describe('listMessagesBySeqCursor over a store larger than one page', () => {
   });
 });
 
+describe('listMessagesBySeqCursor openOnly', () => {
+  beforeEach(() => {
+    process.env.BUN_ENV = 'test';
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-seq-open-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(currentDbPath);
+  });
+
+  afterEach(async () => {
+    delete process.env.BUN_ENV;
+    await db.close();
+    cleanupDb(currentDbPath);
+  });
+
+  test('openOnly excludes disposed, addressed and deferred queued rows; default keeps them', async () => {
+    const now = new Date().toISOString();
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    const rows: [string, number, string | null, string | null, string | null][] = [
+      ['open-1', 1, null, null, null],
+      ['disposed', 2, 'expired', null, null],
+      ['addressed', 3, null, now, null],
+      ['deferred', 4, null, null, future],
+      ['open-2', 5, null, null, null],
+    ];
+    for (const [id, seq, disposition, addressedAt, notBefore] of rows) {
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient, body,
+            status, created_at, priority, fencing_token, seq, route_disposition,
+            addressed_at, not_before)
+         VALUES ($1, $1, $1, 'agent_message', 'taskmaster', 'xo', 'x', 'queued', $2,
+                 'normal', 0, $3, $4, $5, $6)`,
+        [id, now, seq, disposition, addressedAt, notBefore]
+      );
+    }
+    const open = await listMessagesBySeqCursor({
+      recipient: 'xo',
+      status: 'queued',
+      openOnly: true,
+      limit: 50,
+    });
+    expect(open.map(row => row.id)).toEqual(['open-1', 'open-2']);
+    expect(open.map(row => row.cursor_seq)).toEqual([1, 5]);
+    const resumed = await listMessagesBySeqCursor({
+      recipient: 'xo',
+      status: 'queued',
+      openOnly: true,
+      afterSeq: 1,
+      limit: 50,
+    });
+    expect(resumed.map(row => row.id)).toEqual(['open-2']);
+    const all = await listMessagesBySeqCursor({ recipient: 'xo', status: 'queued', limit: 50 });
+    expect(all).toHaveLength(5);
+  });
+});
+
 describe('overseer_sweep_cursor durability', () => {
   beforeEach(() => {
     process.env.BUN_ENV = 'test';

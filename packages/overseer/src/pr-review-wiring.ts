@@ -47,6 +47,14 @@ import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
+import {
+  countPriorRemediationAttempts,
+  parseRemediationCandidateBody,
+  remediationIdempotencyKey,
+  REMEDIATION_RECIPIENT,
+  REMEDIATION_SENDER,
+} from './remediation-candidate';
+import type { RemediationEmitResult } from './remediation-candidate';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -1018,6 +1026,10 @@ export function createRealSubmitDeps(
         approved: result.verdict === 'APPROVE',
         summary,
         reviewedHeadSha: result.reviewed_head_sha,
+        // Structured findings ride alongside the flattened summary so
+        // remediation classification can read severity per finding. The
+        // summary string has already lost that.
+        findings: result.findings,
         ...(indeterminateCode ? { reasonCode: indeterminateCode } : {}),
       };
     },
@@ -1082,6 +1094,101 @@ export function createRealSubmitDeps(
           }),
         }
       );
+    },
+
+    /**
+     * Attempts are derived from the durable dispatch rows themselves rather
+     * than from a separate counter table: every prior candidate IS a row under
+     * this PR's subject key, so the count cannot drift out of agreement with
+     * the queue it is supposed to bound.
+     */
+    async countPriorRemediationAttempts(input): Promise<number> {
+      const messages = await dispatch.listMessages({
+        recipient: REMEDIATION_RECIPIENT,
+        subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+      });
+      return countPriorRemediationAttempts(messages, input);
+    },
+
+    /**
+     * Writes the proposal onto the seam Taskmaster already reads.
+     *
+     * TWO INVARIANTS MUST HOLD AT ONCE:
+     *   (A) BOUNDED -- at most MAX_REMEDIATION_ATTEMPTS candidates per PR,
+     *       however concurrent deliveries interleave.
+     *   (B) IDEMPOTENT -- a redelivered verdict (same reviewed head) must not
+     *       add a second candidate.
+     *
+     * A single UNIQUE index cannot carry both, and this PR proved it four times:
+     * keying on (PR, head, attempt) or (PR, head) lost (A); keying on
+     * (PR, attempt) lost (B); doing a read-then-insert in application code lost
+     * (B) again under concurrency, because the dedupe read was not atomic
+     * against a concurrent insert -- two deliveries of the SAME head both
+     * cleared the check and then took different slots.
+     *
+     * So the atomicity now comes from the DATABASE, via the capped-subject
+     * fence: the dedupe read and the slot insert happen inside ONE transaction
+     * (BEGIN IMMEDIATE on sqlite, FOR UPDATE row locks on postgres). The head
+     * is the dedupe token, giving (B); the attempt slot is the key, giving (A).
+     *
+     * The fence reports the slot it ACTUALLY claimed, which may differ from the
+     * attempt the caller predicted when a concurrent racer took an earlier one.
+     * That is what the receipt must record.
+     */
+    async emitRemediationCandidate(body): Promise<RemediationEmitResult> {
+      const result = await dispatch.createCappedSubjectMessage(
+        // Sender authentication (PR #669) binds an explicit sender context.
+        // REMEDIATION_SENDER (not REVIEW_SENDER) is bound deliberately: the
+        // exported constant IS the wire contract, so binding it keeps the
+        // declared and authenticated senders from drifting apart.
+        { kind: 'system', sender: REMEDIATION_SENDER },
+        {
+          correlation_id: `overseer-remediation:${body.owner}/${body.repo}#${body.prNumber}`,
+          // Replaced per-slot by the fence; a placeholder would be misleading,
+          // so the real slot key is supplied through `slotKey` below.
+          idempotency_key: remediationIdempotencyKey({
+            owner: body.owner,
+            repo: body.repo,
+            prNumber: body.prNumber,
+            attempt: 1,
+          }),
+          // Reuses the existing run_review task type: this is queued
+          // review-loop work, and a new task_type would need a DB
+          // CHECK-constraint migration for no behavioral gain. The `kind`
+          // discriminator in the body identifies a remediation candidate.
+          task_type: 'run_review',
+          recipient: REMEDIATION_RECIPIENT,
+          body: JSON.stringify(body),
+          subject_key: reviewSubjectKey(body.owner, body.repo, body.prNumber),
+          // REQUIRED for attempt 2+. Once any earlier message under this
+          // subject key is terminal, the insert throws
+          // `repeat_reason_required` -- the dispatch layer refuses to silently
+          // re-open a settled subject. Without this the cap of 2 would
+          // effectively be a cap of 1.
+          repeat_reason: `remediation attempt for head ${body.headSha}`,
+        },
+        {
+          maxRows: body.maxAttempts,
+          // The HEAD identifies the verdict, so it is the dedupe token.
+          dedupeToken: body.headSha,
+          readDedupeToken: stored => parseRemediationCandidateBody(stored)?.headSha ?? null,
+          slotKey: slot =>
+            remediationIdempotencyKey({
+              owner: body.owner,
+              repo: body.repo,
+              prNumber: body.prNumber,
+              attempt: slot,
+            }),
+          // The stored body records the slot actually won, so the durable row
+          // and the receipt cannot disagree about which attempt this was.
+          slotBody: slot => JSON.stringify({ ...body, attempt: slot }),
+        }
+      );
+      return {
+        claimed: result.claimed,
+        ...(result.slot !== null ? { attempt: result.slot } : {}),
+        ...(result.reason ? { reason: result.reason } : {}),
+      };
     },
   };
 }

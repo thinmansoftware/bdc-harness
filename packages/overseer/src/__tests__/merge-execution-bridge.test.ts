@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { rootLogger } from '@archon/paths';
 import {
+  buildCeScopeCompareAdapter,
   runMergeExecutionBridgeOnce,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
@@ -178,6 +179,62 @@ afterEach(() => {
 });
 
 describe('merge execution bridge', () => {
+  test('production CE compare adapter accepts 150 page-one files as complete', async () => {
+    const compareCommits = mock(async () => ({
+      data: {
+        files: Array.from({ length: 150 }, (_, index) => ({
+          filename: `src/components/ce/file-${index}.ts`,
+          status: 'modified',
+        })),
+      },
+    }));
+    const result = await buildCeScopeCompareAdapter({ repos: { compareCommits } })(
+      'thinmansoftware',
+      'lspro-react',
+      'base',
+      'head'
+    );
+
+    expect(compareCommits).toHaveBeenCalledTimes(1);
+    expect(compareCommits).toHaveBeenCalledWith(expect.objectContaining({ page: 1 }));
+    expect(result.files).toHaveLength(150);
+    expect(result.complete).toBe(true);
+  });
+
+  test('production CE compare adapter rejects the 300-file cap as truncated', async () => {
+    const compareCommits = mock(async () => ({
+      data: {
+        files: Array.from({ length: 300 }, (_, index) => ({
+          filename: `src/components/ce/file-${index}.ts`,
+          status: 'modified',
+        })),
+      },
+    }));
+    const result = await buildCeScopeCompareAdapter({ repos: { compareCommits } })(
+      'thinmansoftware',
+      'lspro-react',
+      'base',
+      'head'
+    );
+
+    expect(compareCommits).toHaveBeenCalledTimes(1);
+    expect(result.files).toHaveLength(300);
+    expect(result.complete).toBe(false);
+  });
+
+  test('production CE compare adapter rejects a missing files array as truncated', async () => {
+    const compareCommits = mock(async () => ({ data: {} }));
+    const result = await buildCeScopeCompareAdapter({ repos: { compareCommits } })(
+      'thinmansoftware',
+      'lspro-react',
+      'base',
+      'head'
+    );
+
+    expect(compareCommits).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ complete: false });
+  });
+
   test('docs-only PR into bdc-xo main merges when docs_only is merge', async () => {
     process.env.MERGE_MANAGER_REPO_POLICY = JSON.stringify({
       'thinmansoftware/bdc-xo': { main: { unattended: true, docs_only: 'merge' } },
@@ -758,8 +815,13 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(h.outcomes[0]).toEqual(expect.objectContaining({ mutationSent: false, reason }));
   });
 
-  test('(e) records pr_context_unresolvable and sends no mutation when the fetch throws', async () => {
+  test('(e) defers pr_context_fetch_failed and sends no mutation when the fetch throws', async () => {
     const { h } = runlessHarness([runlessVerdict('runless-throws')]);
+    const deferrals: { verdictId: string; reason: string; notBefore: string }[] = [];
+    h.store.deferVerdictClaim = async (verdictId, reason, notBefore) => {
+      deferrals.push({ verdictId, reason, notBefore });
+      return true;
+    };
     h.github.findPullRequest = async () => {
       throw new Error('github unavailable');
     };
@@ -768,14 +830,10 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(h.approvals).toBe(0);
     expect(h.occupied).toBe(0);
     expect(h.claimReleases).toEqual([]);
-    expect(h.outcomes).toEqual([
-      expect.objectContaining({
-        verdictId: 'runless-throws',
-        mutationSent: false,
-        reason: 'pr_context_unresolvable',
-      }),
+    expect(h.outcomes).toEqual([]);
+    expect(deferrals).toEqual([
+      expect.objectContaining({ verdictId: 'runless-throws', reason: 'pr_context_fetch_failed' }),
     ]);
-    expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
   });
 
   test('(f) a verdict WITH a run id whose run row is missing still records run_context_unresolvable', async () => {

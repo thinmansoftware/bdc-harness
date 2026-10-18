@@ -77,6 +77,7 @@ describe('lane registration and war-council-validator pin', () => {
     // new lane to be acknowledged here AND given an explicit validator-pin branch
     // in S4b below, rather than silently inheriting a default.
     expect(LANE_FILES).toEqual([
+      'bdc-feature-development-astra.yaml',
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-cursor.yaml',
@@ -161,6 +162,12 @@ describe('lane registration and war-council-validator pin', () => {
         // Grok builds; a repository-capable non-Grok judge validates.
         expect(wcv.provider).toBe('codex-opr');
         expect(wcv.model).not.toBe('x-ai/grok-4.6');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-astra.yaml') {
+        expect(wcv.provider).toBe('claude');
+        expect(wcv.model).toBe('claude-fable-5');
         return;
       }
 
@@ -629,4 +636,60 @@ describe('active lanes do not splice untrusted text into executable fields', () 
     }
     expect(hits).toEqual([]);
   });
+});
+
+describe('migrated workflow fixtures keep their own inputs', () => {
+  it('keeps the implement prompt fallback as text for the AI', () => {
+    for (const file of LANE_FILES) {
+      const lane = loadLane(file);
+      const prompt = lane.nodes?.find(node => node.id === 'implement')?.loop?.prompt ?? '';
+      expect(prompt).toContain('${USER_MESSAGE:-}');
+      expect(prompt).not.toContain('ARCHON_USER_MESSAGE');
+    }
+  });
+  for (const ambientMessage of [undefined, 'WO-OTHER-01 issue=999']) {
+    it(`issue fallback uses its fixture with ambient message ${String(ambientMessage)}`, () => {
+      const lane = Bun.YAML.parse(
+        readFileSync(
+          join(REPO_ROOT, '.archon/workflows/test-workflows/e2e-read-spec-issue-fallback.yaml'),
+          'utf8'
+        )
+      ) as { nodes: Array<{ id: string; bash?: string }> };
+      const script = lane.nodes.find(node => node.id === 'test-explicit-issue-number')?.bash;
+      expect(script).toBeDefined();
+      const fakeGh = `gh() {
+        [ "$1 $2 $3" = "issue view 193" ] || return 1
+        printf 'synthetic issue body'
+      }`;
+      const result = Bun.spawnSync(['bash', '-c', `${fakeGh}\n${script ?? ''}`], {
+        env: { ...process.env, ARCHON_USER_MESSAGE: ambientMessage },
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 10_000,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.toString()).toContain('from issue #193');
+      expect(result.stderr.toString()).toBe('');
+    });
+  }
+
+  for (const args of [undefined, 'major --dry-run']) {
+    it(`release argument parser handles ${String(args)} without running release actions`, () => {
+      const lane = Bun.YAML.parse(
+        readFileSync(join(REPO_ROOT, '.archon/workflows/experimental/archon-release.yaml'), 'utf8')
+      ) as { nodes: Array<{ id: string; script?: string }> };
+      const script = lane.nodes.find(node => node.id === 'parse-args')?.script;
+      expect(script).toBeDefined();
+      const result = Bun.spawnSync([process.execPath, '-e', script ?? ''], {
+        env: { ...process.env, ARCHON_ARGUMENTS: args },
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 10_000,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout.toString())).toEqual(
+        args ? { bump: 'major', dryRun: 'true' } : { bump: 'patch', dryRun: 'false' }
+      );
+    });
+  }
 });

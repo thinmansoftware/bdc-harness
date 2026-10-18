@@ -1,6 +1,11 @@
 import { listCodebases } from '@archon/core/db/codebases';
 import { createHash } from 'crypto';
 import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
+import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
+import {
   freezeWorkOrderSource,
   type ExpectedSpecIdentity,
 } from '@archon/core/workflows/work-order-source';
@@ -32,10 +37,6 @@ export interface FireEligibilityDeps {
 }
 
 const WO_ID_RE = /\b(WO-[A-Z][A-Z0-9-]*-\d+)\b/;
-
-function githubToken(): string | undefined {
-  return process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-}
 
 function headers(token: string): Record<string, string> {
   return {
@@ -72,7 +73,8 @@ export async function checkFireEligibility(
   // resolveWorkOrderSource, so the token is resolved and asserted here instead.
   // Unauthenticated canonical reads would break private-repo access and burn
   // the 60/hr anonymous rate limit.
-  const token = deps.githubToken ?? githubToken();
+  const identity = resolveServiceGitHubAuth('taskmaster');
+  const token = deps.githubToken ?? (await getServiceGitHubToken(identity));
   if (!token) return { eligible: false, reason: 'github_auth_missing' };
   let frozen;
   try {
@@ -128,10 +130,18 @@ export async function checkFireEligibility(
 
   // Mirrors fire.ps1's `gh pr list --state all --search <WO>` gate, while
   // enforcing a WO token boundary to avoid generic-title substring matches.
-  const searchResponse = await fetchImpl(
-    `https://api.github.com/search/issues?q=${encodeURIComponent(`${woId} repo:${targetRepo} is:pr`)}`,
-    { headers: headers(token) }
-  );
+  const searchResponse = deps.githubToken
+    ? await fetchImpl(
+        `https://api.github.com/search/issues?q=${encodeURIComponent(`${woId} repo:${targetRepo} is:pr`)}`,
+        { headers: headers(token) }
+      )
+    : await serviceGitHubFetchWithPermissionFallback({
+        service: 'taskmaster',
+        fetch: fetchImpl,
+        resource: 'search',
+        identity,
+        url: `https://api.github.com/search/issues?q=${encodeURIComponent(`${woId} repo:${targetRepo} is:pr`)}`,
+      });
   assertRateLimit(searchResponse);
   if (!searchResponse.ok)
     throw new Error(`taskmaster_fire_pr_search_failed:${searchResponse.status}`);

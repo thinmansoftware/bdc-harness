@@ -9,10 +9,29 @@ import {
   makeLoaderMock,
 } from '../test/workflow-mock-factories';
 import {
-  resetSeatUsageCacheForTests,
-  setSeatUsageReaderForTests,
-  type SeatReading,
-} from '@archon/workflows/reliability/seat-usage';
+  clearOperatorSetting as realClearOperatorSetting,
+  getOperatorSetting as realGetOperatorSetting,
+  setOperatorSetting as realSetOperatorSetting,
+} from '@archon/core/db/operator-settings';
+
+const realOperatorSettings = {
+  getOperatorSetting: realGetOperatorSetting,
+  setOperatorSetting: realSetOperatorSetting,
+  clearOperatorSetting: realClearOperatorSetting,
+};
+
+// This file's tests keep the cutoff in memory. Stop 1 also loads the real
+// operator-settings tests in this process, so the mock delegates to the
+// snapshotted module unless memory mode is on.
+let operatorSettingsMemory = false;
+let operatorSettingsWriteFails = false;
+let operatorSettingsSetCalls = 0;
+let operatorSettingStore: {
+  setting_value: string;
+  updated_at: string;
+  updated_by: string;
+  reason: string | null;
+} | null = null;
 
 delete process.env.ARCHON_OPERATOR_TOKEN;
 delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
@@ -118,6 +137,53 @@ mock.module('@archon/core/utils/commands', () => ({
   findMarkdownFilesRecursive: mock(async () => []),
 }));
 
+mock.module('@archon/core/db/operator-settings', () => ({
+  getOperatorSetting: async (key: string) => {
+    if (!operatorSettingsMemory) return realOperatorSettings.getOperatorSetting(key);
+    if (!operatorSettingStore) return null;
+    return {
+      setting_key: key,
+      setting_value: operatorSettingStore.setting_value,
+      updated_at: operatorSettingStore.updated_at,
+      updated_by: operatorSettingStore.updated_by,
+      reason: operatorSettingStore.reason,
+    };
+  },
+  setOperatorSetting: async (
+    key: string,
+    value: string,
+    updatedBy: string,
+    reason: string | null
+  ) => {
+    if (!operatorSettingsMemory) {
+      await realOperatorSettings.setOperatorSetting(key, value, updatedBy, reason);
+      return;
+    }
+    if (operatorSettingsWriteFails) throw new Error('db write failed');
+    operatorSettingsSetCalls += 1;
+    operatorSettingStore = {
+      setting_value: value,
+      updated_at: new Date().toISOString(),
+      updated_by: updatedBy,
+      reason,
+    };
+  },
+  clearOperatorSetting: async (key: string) => {
+    if (!operatorSettingsMemory) {
+      await realOperatorSettings.clearOperatorSetting(key);
+      return;
+    }
+    if (operatorSettingsWriteFails) throw new Error('db write failed');
+    operatorSettingStore = null;
+  },
+}));
+
+import {
+  getSeatCutoff,
+  resetSeatUsageCacheForTests,
+  setSeatUsageReaderForTests,
+  type SeatReading,
+} from '@archon/workflows/reliability/seat-usage';
 import { registerApiRoutes } from './api';
 
 function seat(
@@ -175,6 +241,10 @@ describe('fuelglass seat routes', () => {
   let app: OpenAPIHono;
 
   beforeEach(() => {
+    operatorSettingsMemory = true;
+    operatorSettingsWriteFails = false;
+    operatorSettingsSetCalls = 0;
+    operatorSettingStore = null;
     resetSeatUsageCacheForTests();
     delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
     setSeatUsageReaderForTests(async () => ({
@@ -194,6 +264,9 @@ describe('fuelglass seat routes', () => {
   });
 
   afterEach(() => {
+    operatorSettingsMemory = false;
+    operatorSettingsWriteFails = false;
+    operatorSettingStore = null;
     resetSeatUsageCacheForTests();
     delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
   });
@@ -234,9 +307,15 @@ describe('fuelglass seat routes', () => {
       expect(err.error).toContain('seat_cutoff_out_of_range');
     }
     const after = (await (await app.request('/api/fuelglass/seats')).json()) as {
-      cutoff: { percent: number; source: string };
+      cutoff: { percent: number; source: string; set_at?: string; set_by?: string };
     };
     expect(after.cutoff).toEqual({ percent: 90, source: 'default' });
+    expect(after.cutoff).not.toHaveProperty('set_at');
+    expect(after.cutoff).not.toHaveProperty('set_by');
+    expect(operatorSettingsSetCalls).toBe(0);
+    const notNumber = await postCutoff('x');
+    expect(notNumber.status).toBe(400);
+    expect(operatorSettingsSetCalls).toBe(0);
     const ok = await postCutoff(95);
     expect(ok.status).toBe(200);
     const okBody = (await ok.json()) as { cutoff: { percent: number; source: string } };
@@ -266,9 +345,13 @@ describe('fuelglass seat routes', () => {
     const second = await app.request('/api/fuelglass/seats');
     const after = (await second.json()) as {
       gate_enabled: boolean;
-      cutoff: { percent: number; source: string };
+      cutoff: { percent: number; source: string; set_at?: string; set_by?: string };
     };
-    expect(after.cutoff).toEqual({ percent: 90, source: 'operator' });
+    expect(after.cutoff.percent).toBe(90);
+    expect(after.cutoff.source).toBe('operator');
+    expect(after.cutoff.set_by).toBe('operator-token');
+    expect(after.cutoff.set_at).toBeString();
+    expect(new Date(after.cutoff.set_at ?? '').toISOString()).toBe(after.cutoff.set_at);
     expect(after.gate_enabled).toBe(true);
 
     const tooHigh = await app.request('/api/fuelglass/cutoff', {
@@ -293,5 +376,42 @@ describe('fuelglass seat routes', () => {
     expect(cleared.status).toBe(200);
     const clearedBody = (await cleared.json()) as { cutoff: { percent: number; source: string } };
     expect(clearedBody.cutoff).toEqual({ percent: 90, source: 'default' });
+  });
+
+  test('failed write does not arm the override', async () => {
+    const before = getSeatCutoff();
+    operatorSettingsWriteFails = true;
+    const res = await postCutoff(95);
+    expect(res.status).toBe(500);
+    expect(getSeatCutoff()).toEqual(before);
+    expect(operatorSettingStore).toBeNull();
+  });
+
+  test('seats response shows provenance for an operator cutoff', async () => {
+    const bare = await app.request('/api/fuelglass/seats');
+    const bareBody = (await bare.json()) as {
+      cutoff: { set_at?: string; set_by?: string };
+    };
+    expect(bareBody.cutoff).not.toHaveProperty('set_at');
+    expect(bareBody.cutoff).not.toHaveProperty('set_by');
+
+    const setCutoff = await app.request('/api/fuelglass/cutoff', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ percent: 95, reason: 'quota fix' }),
+    });
+    expect(setCutoff.status).toBe(200);
+    const posted = (await setCutoff.json()) as { cutoff: { percent: number; source: string } };
+    expect(posted.cutoff).toEqual({ percent: 95, source: 'operator' });
+
+    const seats = await app.request('/api/fuelglass/seats');
+    const body = (await seats.json()) as {
+      cutoff: { percent: number; source: string; set_at?: string; set_by?: string };
+    };
+    expect(body.cutoff.source).toBe('operator');
+    expect(body.cutoff.percent).toBe(95);
+    expect(body.cutoff.set_by).toBe('operator-token');
+    expect(body.cutoff.set_at).toBeString();
+    expect(new Date(body.cutoff.set_at ?? '').toISOString()).toBe(body.cutoff.set_at);
   });
 });
