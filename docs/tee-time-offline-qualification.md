@@ -177,3 +177,19 @@ Source copy into the candidate Docker image makes the fixture helper available;
 it is not an entrypoint, factory registration, merge or production deployment.
 No real approval, served-model attestation, context/output capacity, compaction
 absence, review quality, authenticated behavior or BDC laptop readiness is proven.
+
+The first dispatched set at source
+`5a323917b7a1b86ec27e95869e47124d1c16fd64` failed its first positive case in
+run39148458683. It produced no valid capability receipt; the remaining three
+cases did not run. The bounded attach helper discarded stderr, so no failure
+phase was established. Its exact container and the isolated compose resources
+were removed; the scoped always step verified reviewer-container absence.
+Separate PR run39148465031 passed existing checks while skipping these cases.
+Neither result qualifies a reviewer.
+
+The diagnostic revision wraps initialization/imports in a guarded main and emits
+one closed phase/category frame on failure, preserving nonzero status. The runner
+validates its shape but cannot accept it as success. No raw error, stack, request,
+environment, path or model text is emitted. Dispatch now defaults to `none` and
+offers only `positive-only`; another full case set requires a reviewed source
+change. Publication does not itself authorize the next diagnostic attempt.

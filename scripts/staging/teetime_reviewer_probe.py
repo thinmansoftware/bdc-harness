@@ -1,8 +1,28 @@
 """Closed resource and cleanup helpers for credential-free reviewer fixtures."""
 import json
 import re
+from teetime_artifact_contract import unique_object, reject_constant
 
 CASES = ('positive', 'shell', 'patch', 'code-mode')
+FAILURE_PHASES = ('bootstrap','options-import','home','cli-version','catalog-read','catalog-compare',
+                  'catalog-write','configuration','server','sdk-import','sdk-run','final-check')
+FAILURE_CATEGORIES = ('module-resolution','fixture-input','native-process','catalog-identity',
+                      'configuration','request-protocol','sdk-stream','case-acceptance','cleanup-failed','other')
+
+
+def reviewer_failure_diagnostic(raw, exit_code):
+    if (type(exit_code) is not int or not 1 <= exit_code <= 255 or type(raw) is not bytes
+            or not 1 <= len(raw) <= 2048 or not raw.isascii() or len(raw.strip().splitlines()) != 1):
+        raise ValueError('reviewer failure diagnostic framing')
+    try:
+        frame = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
+    except (ValueError, RecursionError):
+        raise ValueError('reviewer failure diagnostic JSON') from None
+    if (type(frame) is not dict or set(frame) != {'kind','phase','category'}
+            or frame['kind'] != 'teetime-reviewer-failure-v1'
+            or frame['phase'] not in FAILURE_PHASES or frame['category'] not in FAILURE_CATEGORIES):
+        raise ValueError('reviewer failure diagnostic fields')
+    return frame
 
 
 def reviewer_settings(case, owner):

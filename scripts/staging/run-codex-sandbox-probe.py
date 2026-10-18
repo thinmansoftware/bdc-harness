@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import uuid
 from teetime_bounded_process import capture
-from teetime_reviewer_probe import reviewer_settings, verify_reviewer_limits, remove_owned_reviewer
+from teetime_reviewer_probe import reviewer_settings, verify_reviewer_limits, remove_owned_reviewer, reviewer_failure_diagnostic
 
 
 def main():
@@ -270,6 +270,9 @@ console.log(JSON.stringify(hashes));
             result = docker("start", "-ai", name, input=source.decode("utf-8"))
         # Never print arbitrary container output or inherited image environment.
         if result.returncode:
+            if args.kind == 'reviewer':
+                diagnostic = reviewer_failure_diagnostic(result.stdout.encode('utf-8'), result.returncode)
+                print(json.dumps({'reviewerFailureDiagnostic':diagnostic}), flush=True)
             stopped = json.loads(docker("inspect", name, check=True).stdout)[0]
             print(json.dumps({"probeFailureBoundary": {
                 "imageId": data["Image"], "apparmor": stopped.get("AppArmorProfile"),

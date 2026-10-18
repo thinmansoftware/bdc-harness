@@ -12,6 +12,14 @@ on:
       - '.dockerignore'
       - '.github/workflows/offline-qualification.yml'
   workflow_dispatch:
+    inputs:
+      reviewer_fixture_scope:
+        description: Reviewed credential-free case scope; select only an independently approved scope
+        type: choice
+        default: none
+        options:
+          - none
+          - positive-only
 
 permissions:
   contents: read
@@ -144,7 +152,12 @@ jobs:
           python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --kind configuration --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
           python3 scripts/staging/run-codex-sandbox-probe.py --apparmor-profile "$profile" --kind configuration --hostile-project --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
           if [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            for reviewer_case in positive shell patch code-mode; do
+            case "${{ inputs.reviewer_fixture_scope }}" in
+              none) reviewer_cases='' ;;
+              positive-only) reviewer_cases='positive' ;;
+              *) echo 'Unrecognized reviewer case scope'; exit 1 ;;
+            esac
+            for reviewer_case in $reviewer_cases; do
               python3 scripts/staging/run-codex-sandbox-probe.py --kind reviewer --reviewer-case "$reviewer_case" --reviewer-owner "teetime-reviewer-${{ github.run_id }}-${{ github.run_attempt }}" --apparmor-profile "$profile" --image "$QUALIFICATION_IMAGE" --expected-sha "$(git rev-parse HEAD)"
             done
           fi

@@ -1,7 +1,7 @@
 import json
 import unittest
 from types import SimpleNamespace
-from teetime_reviewer_probe import reviewer_settings, verify_reviewer_limits, remove_owned_reviewer
+from teetime_reviewer_probe import reviewer_settings, verify_reviewer_limits, remove_owned_reviewer, reviewer_failure_diagnostic
 
 
 OWNER = 'teetime-reviewer-123-1'
@@ -10,6 +10,26 @@ ID = 'b'*64
 
 
 class ReviewerProbeTests(unittest.TestCase):
+    def test_failure_diagnostic_never_satisfies_success_or_zero_exit(self):
+        frame={'kind':'teetime-reviewer-failure-v1','phase':'catalog-compare','category':'catalog-identity'}
+        raw=json.dumps(frame).encode()+b'\n'
+        self.assertEqual(reviewer_failure_diagnostic(raw,1),frame)
+        for code in (0,None,True):
+            with self.assertRaises(ValueError): reviewer_failure_diagnostic(raw,code)
+        with self.assertRaises(ValueError):
+            reviewer_failure_diagnostic(b'{"passed":true,"modelInvocations":0}\n',1)
+
+    def test_malformed_or_extra_failure_diagnostics_rejected(self):
+        frame={'kind':'teetime-reviewer-failure-v1','phase':'catalog-compare','category':'catalog-identity'}
+        for changed in [{**frame,'extra':'secret'},{**frame,'phase':'unknown'},
+                        {**frame,'category':'raw error text'}]:
+            with self.assertRaises(ValueError):
+                reviewer_failure_diagnostic(json.dumps(changed).encode(),1)
+        raw=json.dumps(frame).encode()+b'\n'
+        for changed in [raw+raw,b'not json',raw+b'\nextra',b'x'*2049,
+                        raw.replace(b'"phase":',b'"phase":"sdk-run","phase":')]:
+            with self.assertRaises(ValueError): reviewer_failure_diagnostic(changed,1)
+
     def test_closed_cases_owner_and_resource_limits(self):
         for case in ('positive', 'shell', 'patch', 'code-mode'):
             settings = reviewer_settings(case, OWNER)
