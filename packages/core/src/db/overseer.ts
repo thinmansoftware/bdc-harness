@@ -690,7 +690,7 @@ export async function claimOverseerVerdict(input: {
   return { claimed: true, verdictId: row.id, retryCount: nextRetry };
 }
 
-/** Change only an exact, unactioned review approval between verified and held. */
+/** Change an exact unactioned review approval, or hold a neutral fresh PR claim. */
 export async function transitionReviewApprovalVerification(input: {
   runId: string;
   headSha: string;
@@ -698,11 +698,24 @@ export async function transitionReviewApprovalVerification(input: {
   verified: boolean;
   model?: string;
 }): Promise<boolean> {
+  const scope = /^pr-discovery:([A-Za-z0-9_-]+)\/([A-Za-z0-9_.-]+)#([1-9][0-9]*)$/.exec(
+    input.runId
+  );
+  const canHoldClaim =
+    !input.verified &&
+    scope?.[0] === input.runId &&
+    input.prUrl === `https://github.com/${scope[1]}/${scope[2]}/pull/${scope[3]}`;
   const result = await getDatabase().query(
     `UPDATE overseer_verdicts
-     SET verdict = $4, proposed_action = $5, model = $6, updated_at = $7
-     WHERE run_id = $1 AND head_sha = $2 AND pr_url = $3
-       AND status = 'verdict' AND verdict = $8 AND proposed_action = $9
+     SET status = 'verdict', verdict = $4, proposed_action = $5, model = $6,
+         updated_at = $7, pr_url = $3
+     WHERE run_id = $1 AND head_sha = $2
+       AND ((status = 'verdict' AND pr_url = $3 AND verdict = $8 AND proposed_action = $9)
+         OR ($10 = true AND status = 'claimed' AND (pr_url IS NULL OR pr_url = $3)
+           AND verdict IS NULL AND proposed_action IS NULL AND confidence IS NULL
+           AND model IS NULL AND model_rung IS NULL AND proposed_tier IS NULL
+           AND required_tier IS NULL AND effective_tier IS NULL AND reason IS NULL
+           AND (evidence_digest IS NULL OR evidence_digest = '') AND evidence IS NULL))
        AND actioned_at IS NULL AND mutation_sent IS NULL
        AND action_reason IS NULL AND merge_sha IS NULL`,
     [
@@ -715,6 +728,7 @@ export async function transitionReviewApprovalVerification(input: {
       new Date().toISOString(),
       input.verified ? 'approved_unverified' : 'merge_candidate',
       input.verified ? 'none' : 'flag_merge_ready',
+      canHoldClaim,
     ]
   );
   return result.rowCount === 1;
@@ -742,13 +756,15 @@ export async function finalizeOverseerVerdict(input: {
   // the whole watcher down in production on 2026-07-30 (the exception escaped
   // watchLoop and runOverseerService aborted every task). Read the row back
   // with a SELECT instead.
-  await db.query(
+  const finalized = await db.query(
     `UPDATE overseer_verdicts
      SET status = $2, verdict = $3, confidence = $4, model = $5, model_rung = $6,
          proposed_action = $7, proposed_tier = $8, required_tier = $9, effective_tier = $10,
          reason = $11, evidence_digest = COALESCE($12, evidence_digest),
          evidence = $13, pr_url = COALESCE($14, pr_url), updated_at = $15
-     WHERE id = $1`,
+     WHERE id = $1 AND status = 'claimed'
+       AND actioned_at IS NULL AND mutation_sent IS NULL
+       AND action_reason IS NULL AND merge_sha IS NULL`,
     [
       input.verdictId,
       input.status,
@@ -767,6 +783,8 @@ export async function finalizeOverseerVerdict(input: {
       new Date().toISOString(),
     ]
   );
+  if (finalized.rowCount !== 1)
+    throw new Error(`overseer_verdict_finalize_claim_lost:${input.verdictId}`);
   const readBack = await db.query<OverseerVerdictRow>(
     'SELECT * FROM overseer_verdicts WHERE id = $1',
     [input.verdictId]

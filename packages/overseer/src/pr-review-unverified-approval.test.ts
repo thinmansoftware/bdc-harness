@@ -150,6 +150,147 @@ async function reviewWorkItems(): Promise<{ repeat_reason: string | null }[]> {
 }
 
 describe('unverified approval end-to-end (WO node-failure-repair)', () => {
+  test('unverified observation holds a fresh verified claim before its finalization', async () => {
+    const { recordReviewApprovalVerdict, recordUnverifiedApprovalVerdict } =
+      await import('./pr-review-wiring');
+    const { claimOverseerVerdict, finalizeOverseerVerdict } =
+      await import('@archon/core/db/overseer');
+    const input = { owner: OWNER, repo: REPO, prNumber: PR, headSha: HEAD };
+    await expect(
+      recordReviewApprovalVerdict(input, {
+        claimVerdict: claimOverseerVerdict,
+        finalizeVerdict: async value => {
+          await recordUnverifiedApprovalVerdict(input);
+          return finalizeOverseerVerdict(value);
+        },
+      })
+    ).rejects.toThrow('overseer_verdict_finalize_claim_lost');
+    expect(await verdictRows()).toEqual([
+      { verdict: 'approved_unverified', proposed_action: 'none' },
+    ]);
+  });
+
+  test.each(['semantic', 'health'] as const)(
+    'judge-first %s finalization cannot overwrite a fresh hold or act afterward',
+    async kind => {
+      const { handleRecordJudgeFirst } = await import('./judge-first-pipeline');
+      const { recordUnverifiedApprovalVerdict } = await import('./pr-review-wiring');
+      const { claimOverseerVerdict, finalizeOverseerVerdict } =
+        await import('@archon/core/db/overseer');
+      let actions = 0;
+      const unavailable = async (): Promise<never> => {
+        throw new Error('unexpected downstream action');
+      };
+      await expect(
+        handleRecordJudgeFirst(
+          {
+            runId: `pr-discovery:${OWNER}/${REPO}#${PR}`,
+            woId: 'WO-TEST-01',
+            owner: OWNER,
+            repo: REPO,
+            status: 'completed',
+            action: 'merge_ready',
+            reason: 'test evidence',
+            prEvidence: {
+              exists: true,
+              state: 'open',
+              headSha: HEAD,
+              checks: { total: 0, passed: 0, failed: 0, pending: 0 },
+              mergeable: true,
+            },
+          },
+          {
+            listRunsForWatch: async () => [],
+            listRunEvents: async () => [],
+            insertOverseerAction: async () => {
+              actions++;
+            },
+            findPullRequest: unavailable,
+            mergePullRequest: unavailable,
+          },
+          {
+            dryRun: false,
+            actor: 'test',
+            maxRetries: 0,
+            verdictStore: {
+              claimVerdict: claimOverseerVerdict,
+              finalizeVerdict: finalizeOverseerVerdict,
+            },
+            judge: async () => {
+              await recordUnverifiedApprovalVerdict({
+                owner: OWNER,
+                repo: REPO,
+                prNumber: PR,
+                headSha: HEAD,
+              });
+              return kind === 'semantic'
+                ? {
+                    kind: 'verdict',
+                    verdict: 'merge_candidate',
+                    confidence: 0.9,
+                    proposedAction: 'flag_merge_ready',
+                    proposedTier: 0,
+                    reason: 'fixture',
+                    model: 'test',
+                    modelRung: 0,
+                  }
+                : { kind: 'judge_unavailable', reason: 'fixture', model: 'test', modelRung: 0 };
+            },
+            escalate: unavailable,
+          }
+        )
+      ).rejects.toThrow('overseer_verdict_finalize_claim_lost');
+      expect(actions).toBe(0);
+      expect(await verdictRows()).toEqual([
+        { verdict: 'approved_unverified', proposed_action: 'none' },
+      ]);
+    }
+  );
+
+  test.each([
+    'wrong-run',
+    'wrong-head',
+    'wrong-pr',
+    'noncanonical-pr',
+    'semantic',
+    'action',
+    'model',
+    'digest',
+    'evidence',
+    'actioned',
+    'mutation',
+    'reason',
+    'merge',
+  ])('claimed-slot hold preserves ineligible %s evidence', async kind => {
+    const { claimOverseerVerdict, transitionReviewApprovalVerification } =
+      await import('@archon/core/db/overseer');
+    const runId = `pr-discovery:${OWNER}/${REPO}#${PR}`;
+    await claimOverseerVerdict({ runId, woId: runId, headSha: HEAD });
+    const edits: Record<string, string> = {
+      'wrong-pr': "pr_url = 'https://github.com/other/repo/pull/9'",
+      semantic: "verdict = 'merge_candidate'",
+      action: "proposed_action = 'flag_merge_ready'",
+      model: "model = 'other-owner'",
+      digest: "evidence_digest = 'other-owner'",
+      evidence: "evidence = 'other-owner'",
+      actioned: "actioned_at = '2026-01-01'",
+      mutation: 'mutation_sent = 0',
+      reason: "action_reason = 'processing'",
+      merge: "merge_sha = 'old'",
+    };
+    if (edits[kind]) await db.query(`UPDATE overseer_verdicts SET ${edits[kind]}`);
+    const before = await db.query('SELECT * FROM overseer_verdicts');
+    expect(
+      await transitionReviewApprovalVerification({
+        runId: kind === 'wrong-run' ? 'pr-discovery:other/repo#55' : runId,
+        headSha: kind === 'wrong-head' ? 'other' : HEAD,
+        prUrl: `https://github.com/${OWNER}/${REPO}/pull/${kind === 'noncanonical-pr' ? 56 : PR}`,
+        verified: false,
+      })
+    ).toBe(false);
+    expect((await db.query('SELECT * FROM overseer_verdicts')).rows).toEqual(before.rows);
+  });
+
   beforeEach(() => {
     currentDbPath = join(
       import.meta.dir,
@@ -158,6 +299,44 @@ describe('unverified approval end-to-end (WO node-failure-repair)', () => {
     db = new SqliteAdapter(currentDbPath);
   });
 
+  test.each(['verdict', 'health', 'actioned', 'mutation', 'reason', 'merge'])(
+    'shared finalizer refuses lost %s state without rewriting it',
+    async kind => {
+      const { claimOverseerVerdict, finalizeOverseerVerdict } =
+        await import('@archon/core/db/overseer');
+      const runId = `pr-discovery:${OWNER}/${REPO}#${PR}`;
+      const claim = await claimOverseerVerdict({ runId, woId: runId, headSha: HEAD });
+      const edit: Record<string, string> = {
+        verdict: "status = 'verdict'",
+        health: "status = 'judge_unavailable'",
+        actioned: "actioned_at = '2026-01-01'",
+        mutation: 'mutation_sent = 0',
+        reason: "action_reason = 'processing'",
+        merge: "merge_sha = 'old'",
+      };
+      await db.query(`UPDATE overseer_verdicts SET ${edit[kind]}`);
+      const before = await db.query('SELECT * FROM overseer_verdicts');
+      await expect(
+        finalizeOverseerVerdict({
+          verdictId: claim.verdictId!,
+          status: 'verdict',
+          verdict: 'merge_candidate',
+          proposedAction: 'flag_merge_ready',
+        })
+      ).rejects.toThrow('overseer_verdict_finalize_claim_lost');
+      expect((await db.query('SELECT * FROM overseer_verdicts')).rows).toEqual(before.rows);
+    }
+  );
+
+  test('verified observation cannot promote a neutral claim it did not win', async () => {
+    const { claimOverseerVerdict } = await import('@archon/core/db/overseer');
+    const { recordReviewApprovalVerdict } = await import('./pr-review-wiring');
+    const runId = `pr-discovery:${OWNER}/${REPO}#${PR}`;
+    await claimOverseerVerdict({ runId, woId: runId, headSha: HEAD });
+    const before = await db.query('SELECT * FROM overseer_verdicts');
+    await recordReviewApprovalVerdict({ owner: OWNER, repo: REPO, prNumber: PR, headSha: HEAD });
+    expect((await db.query('SELECT * FROM overseer_verdicts')).rows).toEqual(before.rows);
+  });
   afterEach(async () => {
     await db.close();
     cleanupDb(currentDbPath);
