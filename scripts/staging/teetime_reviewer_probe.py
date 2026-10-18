@@ -15,9 +15,32 @@ REJECTIONS = ('none','endpoint','upgrade-limit','wire-bound','decoding','tool-in
               'request-shape','denial-mismatch')
 SIGNALS = ('SIGTERM','SIGKILL','SIGABRT','SIGSEGV','SIGINT','SIGPIPE','SIGBUS','SIGILL')
 STDERR_CATEGORIES = ('other','config-overrides','codex-home','exec-policy','config-load','app-server-start')
+STARTUP_STAGES = ('config-overrides','codex-home','exec-policy','config-load','app-server-start',
+                  'thread-start','model-catalog','other')
+CAUSE_CATEGORIES = ('model-catalog-json','auth-key-missing','os-error','other')
+OS_ERRNOS = (2,11,13,24,28,30)
 
 
-def validate_failure_evidence(value):
+def validate_startup_evidence(value):
+    if (type(value) is not dict or set(value) != {'stderrBytes','classificationLimited','startupStages',
+                                                'causeCategories','osErrnos'}
+            or type(value['stderrBytes']) is not int or not 0 <= value['stderrBytes'] <= 2147483647
+            or type(value['classificationLimited']) is not bool
+            or value['classificationLimited'] != (value['stderrBytes'] > 65536)):
+        raise ValueError('reviewer startup framing')
+    for field,allowed in [('startupStages',STARTUP_STAGES),('causeCategories',CAUSE_CATEGORIES),
+                          ('osErrnos',OS_ERRNOS)]:
+        items=value[field]
+        item_type=int if field == 'osErrnos' else str
+        if (type(items) is not list or any(type(item) is not item_type or item not in allowed for item in items)
+                or items != [item for item in allowed if item in items]
+                or (field != 'osErrnos' and (not items or ('other' in items and items != ['other'])))):
+            raise ValueError('reviewer startup inventory')
+    if bool(value['osErrnos']) != ('os-error' in value['causeCategories']):
+        raise ValueError('reviewer startup errno mismatch')
+
+
+def validate_failure_evidence(value, version=2):
     if (type(value) is not dict or set(value) != {'requests','websocketAttempts','validatedRequests',
                                                 'firstRejection','eventCounts','sdkFailure'}):
         raise ValueError('reviewer diagnostic evidence fields')
@@ -31,7 +54,9 @@ def validate_failure_evidence(value):
             or not 0 <= count <= 65 for key,count in counts.items()) or sum(counts.values()) > 65):
         raise ValueError('reviewer diagnostic event inventory')
     failure = value['sdkFailure']
-    if (type(failure) is not dict or set(failure) != {'kind','exitCode','signal','stderrCategory'}
+    fields={'kind','exitCode','signal','stderrCategory'}
+    if version == 3: fields.add('startupEvidence')
+    if (type(failure) is not dict or set(failure) != fields
             or failure['kind'] not in ('cli-exit','sdk-parse','aborted','other')
             or failure['stderrCategory'] not in STDERR_CATEGORIES):
         raise ValueError('reviewer diagnostic SDK inventory')
@@ -42,6 +67,9 @@ def validate_failure_evidence(value):
             raise ValueError('reviewer diagnostic SDK termination')
     elif failure['exitCode'] is not None or failure['signal'] is not None or failure['stderrCategory'] != 'other':
         raise ValueError('reviewer diagnostic SDK classification')
+    if version == 3:
+        if failure['kind'] == 'cli-exit': validate_startup_evidence(failure['startupEvidence'])
+        elif failure['startupEvidence'] is not None: raise ValueError('reviewer startup without CLI exit')
 
 
 def reviewer_failure_diagnostic(raw, exit_code):
@@ -52,13 +80,13 @@ def reviewer_failure_diagnostic(raw, exit_code):
         frame = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
     except (ValueError, RecursionError):
         raise ValueError('reviewer failure diagnostic JSON') from None
-    if (type(frame) is not dict or frame.get('kind') not in ('teetime-reviewer-failure-v1','teetime-reviewer-failure-v2')
+    if (type(frame) is not dict or frame.get('kind') not in ('teetime-reviewer-failure-v1','teetime-reviewer-failure-v2','teetime-reviewer-failure-v3')
             or frame.get('phase') not in FAILURE_PHASES or frame.get('category') not in FAILURE_CATEGORIES):
         raise ValueError('reviewer failure diagnostic fields')
     fields = {'kind','phase','category'}
-    if frame['kind'] == 'teetime-reviewer-failure-v2': fields.add('evidence')
+    if frame['kind'] in ('teetime-reviewer-failure-v2','teetime-reviewer-failure-v3'): fields.add('evidence')
     if set(frame) != fields: raise ValueError('reviewer failure diagnostic fields')
-    if 'evidence' in frame: validate_failure_evidence(frame['evidence'])
+    if 'evidence' in frame: validate_failure_evidence(frame['evidence'], 3 if frame['kind'].endswith('v3') else 2)
     return frame
 
 

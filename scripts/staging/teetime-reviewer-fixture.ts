@@ -320,6 +320,52 @@ export function reviewerDiagnosticCategory(
   return category;
 }
 
+export interface ReviewerStartupEvidence {
+  stderrBytes: number;
+  classificationLimited: boolean;
+  startupStages: string[];
+  causeCategories: string[];
+  osErrnos: number[];
+}
+
+/** Matched source evidence only; stage wrappers and nested causes are distinct. */
+export function inspectReviewerStartupStderr(raw: string): ReviewerStartupEvidence {
+  const stderrBytes = Buffer.byteLength(raw);
+  const classificationLimited = stderrBytes > 65536;
+  const sample = classificationLimited ? raw.slice(0, 8191) + '\n' + raw.slice(-8191) : raw;
+  const prefixes: Record<string, string> = {
+    'Error parsing -c overrides:': 'config-overrides',
+    'Error finding codex home:': 'codex-home',
+    'Error loading rules:': 'exec-policy',
+    'Error loading config.toml:': 'config-load',
+    'failed to initialize in-process app-server client:': 'app-server-start',
+    'thread/start:': 'thread-start',
+    'failed to parse model_catalog_json path `': 'model-catalog',
+  };
+  const found = new Set<string>();
+  for (const rawLine of sample.split(/\r?\n/)) {
+    const line = rawLine.startsWith('Error: ') ? rawLine.slice(7) : rawLine;
+    for (const [prefix, stage] of Object.entries(prefixes))
+      if (line.startsWith(prefix)) found.add(stage);
+  }
+  const startupStages = Object.values(prefixes).filter(stage => found.has(stage));
+  const osErrnos = [2, 11, 13, 24, 28, 30].filter(code =>
+    sample.includes('(os error ' + code + ')')
+  );
+  const causeCategories: string[] = [];
+  if (sample.includes('failed to parse model_catalog_json path `'))
+    causeCategories.push('model-catalog-json');
+  if (sample.includes('API key auth is missing a key.')) causeCategories.push('auth-key-missing');
+  if (osErrnos.length) causeCategories.push('os-error');
+  return {
+    stderrBytes,
+    classificationLimited,
+    startupStages: startupStages.length ? startupStages : ['other'],
+    causeCategories: causeCategories.length ? causeCategories : ['other'],
+    osErrnos,
+  };
+}
+
 /** Pure diagnostics only. No raw errors, request data, paths or arbitrary keys escape. */
 export function reviewerFailureEvidence(
   error: unknown,
@@ -335,6 +381,7 @@ export function reviewerFailureEvidence(
     exitCode: number | null;
     signal: string | null;
     stderrCategory: string;
+    startupEvidence: ReviewerStartupEvidence | null;
   };
 } {
   const value = fixtureRecord(observation);
@@ -376,17 +423,25 @@ export function reviewerFailureEvidence(
     exitCode: number | null;
     signal: string | null;
     stderrCategory: string;
-  } = { kind: 'other', exitCode: null, signal: null, stderrCategory: 'other' };
+    startupEvidence: ReviewerStartupEvidence | null;
+  } = {
+    kind: 'other',
+    exitCode: null,
+    signal: null,
+    stderrCategory: 'other',
+    startupEvidence: null,
+  };
   const message = (error as { message?: unknown } | null)?.message;
-  if (typeof message === 'string' && message.length <= 65536) {
+  if (typeof message === 'string') {
     const exit =
       /^Codex Exec exited with (?:code ([0-9]{1,3})|signal (SIGTERM|SIGKILL|SIGABRT|SIGSEGV|SIGINT|SIGPIPE|SIGBUS|SIGILL)): /.exec(
-        message
+        message.slice(0, 100)
       );
     if (exit && (exit[1] === undefined || Number(exit[1]) <= 255)) {
       sdkFailure.kind = 'cli-exit';
       sdkFailure.exitCode = exit[1] === undefined ? null : Number(exit[1]);
       sdkFailure.signal = exit[2] ?? null;
+      sdkFailure.startupEvidence = inspectReviewerStartupStderr(message.slice(exit[0].length));
       // Fixed prefixes verified at pinned b1a547b1 exec/src/lib.rs. Only codes escape.
       const prefixes: Record<string, string> = {
         'Error parsing -c overrides:': 'config-overrides',
@@ -395,13 +450,9 @@ export function reviewerFailureEvidence(
         'Error loading config.toml:': 'config-load',
         'failed to initialize in-process app-server client:': 'app-server-start',
       };
-      for (const line of message.slice(exit[0].length).split(/\r?\n/)) {
-        const prefix = Object.keys(prefixes).find(prefix => line.startsWith(prefix));
-        if (prefix !== undefined) {
-          sdkFailure.stderrCategory = prefixes[prefix];
-          break;
-        }
-      }
+      const stages = sdkFailure.startupEvidence.startupStages;
+      if (stages.length === 1 && Object.values(prefixes).includes(stages[0]))
+        sdkFailure.stderrCategory = stages[0];
     } else if (message.startsWith('Failed to parse item: ')) sdkFailure.kind = 'sdk-parse';
   }
   if ((error as { name?: unknown } | null)?.name === 'AbortError') sdkFailure.kind = 'aborted';

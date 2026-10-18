@@ -10,6 +10,22 @@ ID = 'b'*64
 
 
 class ReviewerProbeTests(unittest.TestCase):
+    def test_v3_startup_evidence_is_closed_bounded_and_not_a_success_receipt(self):
+        startup={'stderrBytes':100,'classificationLimited':False,'startupStages':['thread-start'],
+                 'causeCategories':['os-error'],'osErrnos':[13]}
+        failure={'kind':'cli-exit','exitCode':1,'signal':None,'stderrCategory':'other','startupEvidence':startup}
+        evidence={'requests':0,'websocketAttempts':0,'validatedRequests':0,'firstRejection':'none',
+                  'eventCounts':{},'sdkFailure':failure}
+        frame={'kind':'teetime-reviewer-failure-v3','phase':'sdk-run','category':'sdk-process','evidence':evidence}
+        self.assertEqual(reviewer_failure_diagnostic(json.dumps(frame).encode(),1),frame)
+        for patch in [{'stderrBytes':True},{'stderrBytes':-1},{'classificationLimited':True},
+                      {'startupStages':['thread-start','thread-start']},{'startupStages':['private']},
+                      {'startupStages':['other','thread-start']},{'causeCategories':['other']},
+                      {'osErrnos':[13,2]},{'osErrnos':[999]},{'extra':'private'}]:
+            changed={**frame,'evidence':{**evidence,'sdkFailure':{**failure,'startupEvidence':{**startup,**patch}}}}
+            with self.assertRaises(ValueError): reviewer_failure_diagnostic(json.dumps(changed).encode(),1)
+        with self.assertRaises(ValueError): reviewer_failure_diagnostic(json.dumps(frame).encode(),0)
+
     def test_v2_closed_failure_evidence_retains_counts_without_raw_errors(self):
         evidence = {'requests':0, 'websocketAttempts':0, 'validatedRequests':0,
                     'firstRejection':'none', 'eventCounts':{},

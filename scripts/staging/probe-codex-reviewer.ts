@@ -602,7 +602,7 @@ void main().catch((error: unknown) => {
   process.stdout.write(
     JSON.stringify(
       evidence
-        ? { kind: 'teetime-reviewer-failure-v2', phase, category, evidence }
+        ? { kind: 'teetime-reviewer-failure-v3', phase, category, evidence }
         : { kind: 'teetime-reviewer-failure-v1', phase, category }
     ) + '\n'
   );

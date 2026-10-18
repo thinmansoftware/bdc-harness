@@ -12,6 +12,7 @@ import {
   verifyReviewerUtilityControls,
   reviewerFailureEvidence,
   reviewerDiagnosticCategory,
+  inspectReviewerStartupStderr,
 } from './teetime-reviewer-fixture';
 
 const raw = readFileSync(
@@ -19,6 +20,36 @@ const raw = readFileSync(
 );
 const original = JSON.parse(raw.toString());
 const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
+
+test('startup diagnostics separate reviewed wrappers, nested causes and bounded stderr metadata', () => {
+  const plain = 'thread/start: private Permission denied (os error 13)';
+  for (const value of [plain, 'Error: ' + plain]) {
+    const result = inspectReviewerStartupStderr(value);
+    expect(result.startupStages).toEqual(['thread-start']);
+    expect(result.causeCategories).toEqual(['os-error']);
+    expect(result.osErrnos).toEqual([13]);
+    expect(result.stderrBytes).toBe(Buffer.byteLength(value));
+    expect(result.classificationLimited).toBe(false);
+    expect(JSON.stringify(result)).not.toContain('private');
+  }
+  const multiple = inspectReviewerStartupStderr(
+    'Error: thread/start: private\nError: failed to parse model_catalog_json path `private` as JSON: private\nAPI key auth is missing a key. (os error 2) (os error 13)'
+  );
+  expect(multiple.startupStages).toEqual(['thread-start', 'model-catalog']);
+  expect(multiple.causeCategories).toEqual(['model-catalog-json', 'auth-key-missing', 'os-error']);
+  expect(multiple.osErrnos).toEqual([2, 13]);
+  expect(inspectReviewerStartupStderr('Error: Error: thread/start: private').startupStages).toEqual(
+    ['other']
+  );
+  expect(inspectReviewerStartupStderr('private unknown error').causeCategories).toEqual(['other']);
+  const oversized = inspectReviewerStartupStderr(
+    'Error: thread/start: ' + 'x'.repeat(70000) + '\n(os error 30)'
+  );
+  expect(oversized.classificationLimited).toBe(true);
+  expect(oversized.stderrBytes).toBeGreaterThan(65536);
+  expect(oversized.osErrnos).toEqual([30]);
+  expect(inspectReviewerStartupStderr('').stderrBytes).toBe(0);
+});
 
 test('cleanup failure stays primary when an SDK process or parsing failure also occurred', () => {
   for (const kind of ['cli-exit', 'sdk-parse', 'other'])
@@ -40,7 +71,7 @@ test('failure evidence distinguishes SDK process exits without retaining stderr 
     new Error('Codex Exec exited with code 2: synthetic-private-error'),
     observation
   );
-  expect(evidence.sdkFailure).toEqual({
+  expect(evidence.sdkFailure).toMatchObject({
     kind: 'cli-exit',
     exitCode: 2,
     signal: null,
@@ -53,7 +84,7 @@ test('failure evidence distinguishes SDK process exits without retaining stderr 
       new Error('Codex Exec exited with signal SIGKILL: private'),
       observation
     ).sdkFailure
-  ).toEqual({ kind: 'cli-exit', exitCode: null, signal: 'SIGKILL', stderrCategory: 'other' });
+  ).toMatchObject({ kind: 'cli-exit', exitCode: null, signal: 'SIGKILL', stderrCategory: 'other' });
   expect(
     reviewerFailureEvidence(new Error('Failed to parse item: private'), observation).sdkFailure.kind
   ).toBe('sdk-parse');
@@ -81,7 +112,7 @@ test('failure evidence distinguishes SDK process exits without retaining stderr 
       new Error('Codex Exec exited with code 1: ' + 'x'.repeat(65537)),
       observation
     ).sdkFailure.kind
-  ).toBe('other');
+  ).toBe('cli-exit');
 });
 
 test('failure observations reject unbounded, inconsistent or arbitrary event and rejection fields', () => {
