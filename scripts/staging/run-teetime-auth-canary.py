@@ -90,7 +90,8 @@ def main():
             identifier = d('create', '--name', owner+'-'+role, '--label', 'teetime.owner='+owner,
                 '--network', network, '--read-only', '--cap-drop', 'ALL', '--security-opt',
                 'no-new-privileges:true', '--user', '1001:1001', '--memory', '512m',
-                '--memory-swap', '512m', '--cpus', '1', '--pids-limit', '64', '--no-healthcheck',
+                '--memory-swap', '512m', '--cpus', '1', '--pids-limit',
+                '128' if role == 'worker' else '64', '--no-healthcheck',
                 '--log-driver', 'none', *extra, '--entrypoint', 'python3', args.image, *command).decode().strip()
             ids[role] = identifier
             manifest['containers'].append(identifier)
@@ -102,7 +103,8 @@ def main():
             assert not host.get('CapAdd') and not info['Mounts']
             assert not any(host.get(k) for k in ['Binds', 'Devices', 'DeviceRequests', 'PortBindings', 'PidMode'])
             assert host['Memory'] == host['MemorySwap'] == 512*1024**2
-            assert host['NanoCpus'] == 1000000000 and host['PidsLimit'] == 64
+            assert host['NanoCpus'] == 1000000000
+            assert host['PidsLimit'] == (128 if role == 'worker' else 64)
             assert host['LogConfig']['Type'] == 'none'
             assert config['Labels']['teetime.owner'] == owner and config['Entrypoint'] == ['python3']
             expected_names = {owner+'-internal'} if role == 'worker' else {owner+'-internal', owner+'-egress'}

@@ -263,3 +263,51 @@ policy overrides on image3042606f. An earlier exit-code-only interpretation as a
 original-HOME write was incorrect; no filesystem-policy expansion was applied.
 The operator probe is scripts/staging/probe-teetime-apply-patch.py and uses no auth
 or model. It is a diagnostic, not an admission gate based on helper exit alone.
+
+## Task-resource diagnostic, October 18
+
+The fourth authenticated attempt, teetime-auth-a303b182eda9, failed on source
+9e52898203137d0448ec58e69f599f1e8ecef91b/image81882465. Six preflight checks passed;
+the task reported file_change_failed after8253ms, abortfalse, observed OOMdelta0,
+no proxy timeout, no terminal and no artifact. Auth remained unchanged and owned
+cleanup passed. This attempt is FAILED.
+
+The separate no-auth probe probe-teetime-filesystem.py uses an owned networknone
+container. Its filesystem worker exercises the installed exec-server backend with
+a source-constructed context; successful operations do not attest the model turn.
+Its --patch-fixture worker instead imports the real SDK and unchanged restricted
+option helpers. It substitutes only a loopback base URL, synthetic API credential
+and removal of proxy variables. The fixture emits the pinned upstream response
+event shapes, verifies actual Responses Lite additional_tools and code-mode exec
+advertisement, and invokes only the fixed nested apply_patch call. No credentials
+or real provider requests occur. The HTTP-only fixture records rejected WebSocket
+upgrade attempts separately; these are not evidence of production transport health.
+
+Initial harness/import/schema failures are retained as diagnostic failures. Mixed
+write outcomes led to two frozen repetitions at each PID budget, with worker hash
+44e185f3cd47920b020458138edf70ebe55166ddf7923008b09d2f7f7b4835b7:
+
+| Owned run suffix | PID cap | Artifact | PID-limit events added | Peak tasks |
+| ---------------- | ------- | -------- | ---------------------- | ---------- |
+| 2c22b310e3e8     | 64      | Failed   | 3                      | 64         |
+| 3901dcfeed11     | 64      | Exact    | 0                      | 64         |
+| 7022f3b45929     | 128     | Exact    | 0                      | 64         |
+| 345aa7dc950c     | 128     | Exact    | 0                      | 66         |
+
+All four preserved synthetic auth, observed the expected live arg0 helper links,
+recorded no observation errors and verified owned cleanup. Observations are
+best-effort and cannot change the fixed SSE responses. Missing counters remain
+unknown. This proves a concrete task-limit contributor in the synthetic failure;
+it does not establish the cause of every earlier authenticated failure.
+The first two result JSON objects predate the pidsLimit receipt field; their64
+budget is evidenced by the executed launcher's create/inspect checks and logged
+invocations, not a retroactively added field. Cleanup success was printed
+separately by the launcher; a later timestamped owned-resource absence observation
+is retained alongside the result objects, not represented as the original receipt.
+
+The candidate raises only the isolated builder worker cap to128 and checks that
+exact value. The gateway stays64; memory512MiB, CPU1, sandbox, filesystem, network,
+authentication, model, deadlines and acceptance checks remain unchanged. This
+finite adjustment still requires source review, CI, an exact-image negative-auth
+rehearsal and separate review before another authenticated diagnostic. It grants
+no lane admission or application readiness.
