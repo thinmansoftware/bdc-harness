@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import * as connection from '@archon/core/db/connection';
 import { serviceGitHubFetch } from '@archon/core/github/request';
-import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
+import { parseGitHubQuotaError, resetGitHubApiMeterForTests } from '@archon/core/github/metering';
 import { Octokit } from '@octokit/rest';
 import { attachGitHubQuotaHooks } from '../adapters/github-real-deps';
 
@@ -53,7 +53,15 @@ test('real CLI processes persist request counts and refuse an exhausted shared p
     const first = run(`console.error(${JSON.stringify(trace)}); process.exit(1);`);
     expect(first.exitCode).toBe(1);
     const stderr = first.stderr?.toString() ?? '';
-    expect(stderr).toContain('API rate limit exceeded');
+    const quota = {
+      version: 1,
+      kind: 'pool_backoff',
+      poolId: 'user-pat',
+      resource: 'core',
+      retryAtMs: reset * 1000,
+    };
+    expect(parseGitHubQuotaError(stderr)).toEqual(quota);
+    expect(stderr).not.toContain('API rate limit exceeded');
     expect(stderr).not.toContain('synthetic-secret-token');
     expect(stderr).not.toContain('private request/response');
     db = new SqliteAdapter(join(home, 'archon.db'));
@@ -91,6 +99,7 @@ test('real CLI processes persist request counts and refuse an exhausted shared p
       httpError = error;
     }
     expect(String(httpError)).toContain('github_pool_backoff');
+    expect(httpError).toMatchObject(quotaFields(quota));
     resetGitHubApiMeterForTests();
     const client = new Octokit({ request: { fetch: fetcher } });
     attachGitHubQuotaHooks(client, 'overseer', 'user-pat');
@@ -101,9 +110,11 @@ test('real CLI processes persist request counts and refuse an exhausted shared p
       octokitError = error;
     }
     expect(String(octokitError)).toContain('github_pool_backoff');
+    expect(octokitError).toMatchObject(quotaFields(quota));
     expect(requests).toBe(0);
     const second = run(`await Bun.write(${JSON.stringify(marker)}, 'unexpected execution');`);
     expect(second.exitCode).toBe(1);
+    expect(parseGitHubQuotaError(second.stderr?.toString())).toEqual(quota);
     expect(existsSync(marker)).toBe(false);
     const unchanged = await db.query<{ calls: number }>(
       'SELECT SUM(calls) AS calls FROM github_api_usage'
@@ -117,3 +128,11 @@ test('real CLI processes persist request counts and refuse an exhausted shared p
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+function quotaFields(quota: { poolId: string; resource: string; retryAtMs: number }): {
+  poolId: string;
+  resource: string;
+  retryAtMs: number;
+} {
+  return { poolId: quota.poolId, resource: quota.resource, retryAtMs: quota.retryAtMs };
+}
