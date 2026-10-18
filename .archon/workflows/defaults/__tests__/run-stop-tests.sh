@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# run-stop-tests.sh -- unit tests for the run-stop-tests node core (rst_*) in
+# run-stop-tests.sh -- unit tests for the run-stop-tests node core (rst_*) and the
+# dependency-prep core (dprep_ensure_js_deps) in
 # .archon/workflows/defaults/bdc-feature-development-codex.yaml and its byte-identical
 # mirrors in the other 12 bdc-feature-development lanes.
 #
@@ -12,6 +13,8 @@
 # core functions from the canonical YAML (awk range-match on the BEGIN/END markers)
 # and exercise them against fixtures. A parity test asserts the core is byte-identical
 # across all 13 lanes (this repo has no shared-include mechanism for workflow YAMLs).
+# dprep_ensure_js_deps is called by prep-dependencies and by run-stop-tests. Both
+# copies are extracted from the canonical YAML and parity-checked at each call site.
 #
 # Run: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh
 # Exits 0 on all-pass, 1 on any failure. ASCII only.
@@ -36,6 +39,15 @@ assert_contains() {
     PASS=$((PASS + 1)); echo "PASS: $label"
   else
     FAIL=$((FAIL + 1)); echo "FAIL: $label"; echo "  needle:   $needle"; echo "  haystack: $haystack"
+  fi
+}
+
+assert_not_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  if printf '%s\n' "$haystack" | grep -Fq "$needle"; then
+    FAIL=$((FAIL + 1)); echo "FAIL: $label"; echo "  needle present: $needle"
+  else
+    PASS=$((PASS + 1)); echo "PASS: $label"
   fi
 }
 
@@ -68,12 +80,13 @@ extract_core() {
   ' | sed 's/^      //'
 }
 
-extract_core_occurrence() {
-  # extract_core_occurrence <yaml> <marker> <n> -> one independently extracted core.
-  tr -d '\r' < "$1" | awk -v m="$2" -v wanted="$3" '
-    index($0, "# ---- BEGIN " m " core") { occurrence++; capture = (occurrence == wanted); next }
-    index($0, "# ---- END " m " core") { capture = 0 }
-    capture
+extract_core_nth() {
+  # extract_core_nth <yaml> <marker> <n>  -> the nth core body (1-based).
+  # extract_core concatenates every match, so the two dprep copies are split here.
+  tr -d '\r' < "$1" | awk -v m="$2" -v n="$3" '
+    index($0, "# ---- BEGIN " m " core") { seen++; if (seen == n + 0) c = 1; next }
+    index($0, "# ---- END " m " core") { if (c) { c = 0; exit } next }
+    c
   ' | sed 's/^      //'
 }
 
@@ -86,73 +99,35 @@ for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_s
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-DPREP_CORE="$(extract_core_occurrence "$CANONICAL_YAML" dprep 1)"
+DPREP_CORE="$(extract_core_nth "$CANONICAL_YAML" dprep 1)"
 if [ -z "$DPREP_CORE" ]; then
   echo "FATAL: could not extract dprep core from $CANONICAL_YAML"; exit 1
 fi
+if [ -n "$(extract_core_nth "$CANONICAL_YAML" dprep 3)" ]; then
+  echo "FATAL: canonical yaml has more than 2 dprep cores"; exit 1
+fi
 eval "$DPREP_CORE"
-if ! declare -F dprep_ensure_js_deps >/dev/null; then echo "FATAL: dprep_ensure_js_deps not defined after eval"; exit 1; fi
+if ! declare -F dprep_ensure_js_deps >/dev/null; then
+  echo "FATAL: dprep_ensure_js_deps not defined after eval"; exit 1
+fi
 
-echo "--- Parity: rst and dprep cores byte-identical across all 13 lanes ---"
+echo "--- Parity: rst core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$RST_CORE" "$(extract_core "$DEFAULTS/$lane" rst)"
-  assert_eq "two dprep cores in $lane" "2" "$(grep -c 'BEGIN dprep core' "$DEFAULTS/$lane")"
-  assert_eq "dprep occurrence 1 parity $lane" "$DPREP_CORE" "$(extract_core_occurrence "$DEFAULTS/$lane" dprep 1)"
-  assert_eq "dprep occurrence 2 parity $lane" "$DPREP_CORE" "$(extract_core_occurrence "$DEFAULTS/$lane" dprep 2)"
-  assert_eq "one prep-dependencies node in $lane" "1" "$(grep -c '^  - id: prep-dependencies$' "$DEFAULTS/$lane")"
-  assert_eq "implement depends on prep-dependencies in $lane" "1" "$(awk '/^  - id: implement$/{inside=1; next} inside && /^  - id: /{inside=0} inside && /depends_on: \[prep-dependencies\]/{n++} END{print n+0}' "$DEFAULTS/$lane")"
 done
 
-echo "--- dprep_ensure_js_deps ---"
-TMP="$(mktemp -d)"
-mkdir -p "$TMP/bin" "$TMP/install" "$TMP/no-lock" "$TMP/empty"
-printf '{}\n' > "$TMP/install/package.json"
-: > "$TMP/install/bun.lock"
-cat > "$TMP/bin/bun" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$DPREP_RECORD"
-mkdir -p node_modules
-EOF
-chmod +x "$TMP/bin/bun"
-export DPREP_RECORD="$TMP/bun.calls"
-OUT="$(cd "$TMP/install" && PATH="$TMP/bin:$PATH" dprep_ensure_js_deps)"; RC=$?
-assert_contains "dprep installs a missing bun worktree" "dprep: installing JS dependencies (bun install --frozen-lockfile)" "$OUT"
-assert_eq "dprep install argv" "install --frozen-lockfile" "$(cat "$DPREP_RECORD")"
-assert_eq "dprep creates node_modules" "yes" "$([ -d "$TMP/install/node_modules" ] && echo yes || echo no)"
-assert_eq "dprep install returns zero" "0" "$RC"
-OUT="$(cd "$TMP/install" && PATH="$TMP/bin:$PATH" dprep_ensure_js_deps)"; RC=$?
-assert_contains "dprep skips existing node_modules" "dprep: node_modules present, skipping" "$OUT"
-assert_eq "dprep existing node_modules returns zero" "0" "$RC"
-printf '{}\n' > "$TMP/no-lock/package.json"
-OUT="$(cd "$TMP/no-lock" && PATH="$TMP/bin:$PATH" dprep_ensure_js_deps)"; RC=$?
-assert_contains "dprep skips package without bun lockfile" "dprep: no package.json with a bun lockfile, skipping" "$OUT"
-assert_eq "dprep no-lock returns zero" "0" "$RC"
-OUT="$(cd "$TMP/empty" && PATH="$TMP/bin:$PATH" dprep_ensure_js_deps)"; RC=$?
-assert_contains "dprep skips directory without package" "dprep: no package.json with a bun lockfile, skipping" "$OUT"
-assert_eq "dprep empty directory returns zero" "0" "$RC"
-assert_eq "dprep skip paths do not call bun again" "1" "$(wc -l < "$DPREP_RECORD" | tr -d ' ')"
-mkdir -p "$TMP/no-bun"
-printf '{}\n' > "$TMP/no-bun/package.json"; : > "$TMP/no-bun/bun.lock"
-OUT="$(cd "$TMP/no-bun" && PATH=/usr/bin:/bin dprep_ensure_js_deps)"; RC=$?
-assert_contains "dprep skips when bun is missing" "dprep: bun not found, skipping" "$OUT"
-assert_eq "dprep missing bun returns zero" "0" "$RC"
-mkdir -p "$TMP/fail/bin" "$TMP/fail/repo"
-cat > "$TMP/fail/bin/bun" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-chmod +x "$TMP/fail/bin/bun"
-(
-  cd "$TMP/fail/repo" && git init -q . && git config user.email t@t && git config user.name t
-  printf '{}\n' > package.json && : > bun.lock && git add package.json bun.lock && git commit -qm base
-)
-BEFORE="$(cd "$TMP/fail/repo" && git status --porcelain --untracked-files=no)"
-OUT="$(cd "$TMP/fail/repo" && PATH="$TMP/fail/bin:$PATH" dprep_ensure_js_deps)"; RC=$?
-AFTER="$(cd "$TMP/fail/repo" && git status --porcelain --untracked-files=no)"
-assert_contains "dprep failed install is reported" "dprep: install failed rc=1 (continuing" "$OUT"
-assert_eq "dprep failed install returns zero" "0" "$RC"
-assert_eq "dprep leaves tracked files untouched" "$BEFORE" "$AFTER"
-rm -rf "$TMP"
+echo "--- Parity: dprep core byte-identical across all 13 lanes (2 occurrences each) ---"
+for lane in $LANES; do
+  assert_eq "dprep count $lane" "2" "$(grep -c 'BEGIN dprep core' "$DEFAULTS/$lane")"
+  assert_eq "dprep occ1 $lane" "$DPREP_CORE" "$(extract_core_nth "$DEFAULTS/$lane" dprep 1)"
+  assert_eq "dprep occ2 $lane" "$DPREP_CORE" "$(extract_core_nth "$DEFAULTS/$lane" dprep 2)"
+  impl_dep="$(awk '
+    $0 ~ /^  - id: implement$/ { hit = 1; next }
+    hit && $0 ~ /^    depends_on:/ { print; exit }
+    hit && $0 ~ /^  - id: / { exit }
+  ' "$DEFAULTS/$lane")"
+  assert_eq "implement depends_on $lane" "    depends_on: [prep-dependencies]" "$impl_dep"
+done
 
 echo "--- rst_class ---"
 SPEC_M157='# WO-SHOPOPS-M157-CGC-DEALER-API-01
@@ -250,7 +225,7 @@ assert_eq "jest all green" "35 35" "$(printf 'Tests:       35 passed, 35 total\n
 ESC="$(printf '\033')"
 assert_eq "vitest with ANSI colour" "190 195" "$(printf ' %s[2mTest Files %s[22m 1 failed | 25 passed (26)\n %s[2m      Tests %s[22m %s[31m5 failed%s[39m | %s[32m190 passed%s[39m %s[90m(195)%s[39m\n' "$ESC" "$ESC" "$ESC" "$ESC" "$ESC" "$ESC" "$ESC" "$ESC" "$ESC" "$ESC" | rst_parse_counts)"
 assert_eq "vitest all green with skipped" "35 37" "$(printf '      Tests  35 passed | 2 skipped (37)\n' | rst_parse_counts)"
-assert_eq "vitest plain all-pass summary" "12 12" "$(printf '      Tests  12 passed (12)\n' | rst_parse_counts)"
+assert_eq "vitest all green plain" "12 12" "$(printf '      Tests  12 passed (12)\n' | rst_parse_counts)"
 assert_eq "bun test" "4 5" "$(printf ' 4 pass\n 1 fail\n 9 expect() calls\nRan 5 tests across 1 file.\n' | rst_parse_counts)"
 assert_eq "node:test (non-ASCII info glyph)" "4 4" "$(printf '\342\204\271 tests 4\n\342\204\271 pass 4\n\342\204\271 fail 0\n' | rst_parse_counts)"
 assert_eq "TAP" "3 4" "$(printf 'ok 1 - a\nnot ok 2 - b\n# tests 4\n# pass 3\n# fail 1\n' | rst_parse_counts)"
@@ -468,63 +443,203 @@ printf 'bash ./silent.sh\n' > "$TMP/cmds"
 assert_eq "no counts parsed -> exit only" "0  " "$(cd "$TMP" && rst_run_commands ./cmds ./log3)"
 rm -rf "$TMP"
 
-echo "--- rst_run_commands: bun fallbacks and closed allowlist ---"
+echo "--- dprep_ensure_js_deps and npx/npm translation ---"
+ORIG_PATH="$PATH"
+BIN="$(mktemp -d)"
+REC="$BIN/argv.txt"
+ENVREC="$BIN/env.txt"
+
+echo "--- test 1: bun worktree without node_modules installs ---"
+cat > "$BIN/bun" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$REC"
+printf 'GH_TOKEN=%s\\n' "\${GH_TOKEN-unset}" >> "$ENVREC"
+printf 'TEST_URL=%s\\n' "\${DISPATCH_POSTGRES_PHASE15_TEST_URL-unset}" >> "$ENVREC"
+mkdir -p node_modules
+EOF
+chmod +x "$BIN/bun"
+export PATH="$BIN:/usr/bin:/bin"
+export GH_TOKEN=production-shaped-test-value
+export DISPATCH_POSTGRES_PHASE15_TEST_URL=postgresql://localhost/phase15
 TMP="$(mktemp -d)"
-mkdir -p "$TMP/bin"
-cat > "$TMP/bin/bunx" <<'EOF'
+printf '{}\n' > "$TMP/package.json"
+: > "$TMP/bun.lock"
+out="$(cd "$TMP" && dprep_ensure_js_deps)"
+rc=$?
+assert_eq "test1 rc" "0" "$rc"
+assert_contains "test1 installing line" "dprep: installing JS dependencies (bun install --frozen-lockfile)" "$out"
+assert_contains "test1 install ok" "dprep: install ok (" "$out"
+assert_eq "test1 argv" "install --frozen-lockfile" "$(cat "$REC")"
+assert_eq "test1 scrubbed GH_TOKEN" "GH_TOKEN=unset" "$(head -1 "$ENVREC")"
+assert_eq "test1 kept TEST_URL" "TEST_URL=postgresql://localhost/phase15" "$(sed -n '2p' "$ENVREC")"
+if [ -d "$TMP/node_modules" ]; then PASS=$((PASS + 1)); echo "PASS: test1 node_modules exists"; else FAIL=$((FAIL + 1)); echo "FAIL: test1 node_modules exists"; fi
+
+echo "--- test 2: prep is idempotent and skips when not applicable ---"
+out="$(cd "$TMP" && dprep_ensure_js_deps)"
+rc=$?
+assert_eq "test2 present rc" "0" "$rc"
+assert_contains "test2 node_modules present" "dprep: node_modules present, skipping" "$out"
+TMP2="$(mktemp -d)"
+printf '{}\n' > "$TMP2/package.json"
+out="$(cd "$TMP2" && dprep_ensure_js_deps)"
+rc=$?
+assert_eq "test2 no lock rc" "0" "$rc"
+assert_contains "test2 no lock" "dprep: no package.json with a bun lockfile, skipping" "$out"
+TMP3="$(mktemp -d)"
+out="$(cd "$TMP3" && dprep_ensure_js_deps)"
+rc=$?
+assert_eq "test2 empty rc" "0" "$rc"
+assert_contains "test2 empty dir" "dprep: no package.json with a bun lockfile, skipping" "$out"
+assert_eq "test2 bun call count stays 1" "1" "$(wc -l < "$REC" | tr -d ' ')"
+
+echo "--- test 3: missing bun skips cleanly ---"
+TMP4="$(mktemp -d)"
+printf '{}\n' > "$TMP4/package.json"
+: > "$TMP4/bun.lock"
+out="$(cd "$TMP4" && PATH="/usr/bin:/bin" dprep_ensure_js_deps)"
+rc=$?
+assert_eq "test3 rc" "0" "$rc"
+assert_contains "test3 bun missing" "dprep: bun not found, skipping" "$out"
+
+echo "--- test 4: a failed install never fails the run ---"
+cat > "$BIN/bun" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" > "$RST_RECORD"
-printf '      Tests  3 passed (3)\n'
+exit 1
 EOF
-chmod +x "$TMP/bin/bunx"
-export RST_RECORD="$TMP/bunx.argv" RST_NPX_BIN=definitely-missing-npx
-printf 'npx vitest run x.test.ts\n' > "$TMP/cmds"
-RESULT="$(cd "$TMP" && PATH="$TMP/bin:$PATH" rst_run_commands ./cmds ./npx.log)"
-assert_eq "missing npx uses bunx and preserves counts" "0 3 3" "$RESULT"
-assert_eq "bunx receives original npx arguments" "vitest run x.test.ts" "$(cat "$TMP/bunx.argv")"
-assert_contains "npx fallback is logged" "rst_run_commands: npx not found, running as: bunx vitest run x.test.ts" "$(cat "$TMP/npx.log")"
+chmod +x "$BIN/bun"
+TMP5="$(mktemp -d)"
+(
+  cd "$TMP5" || exit 1
+  git init -q .
+  git config user.email t@t
+  git config user.name t
+  printf '{}\n' > package.json
+  printf '{}\n' > bun.lock
+  git add package.json bun.lock
+  git commit -qm base
+  dprep_ensure_js_deps > "$TMP5/out"
+  printf '%s\n' "$?" > "$TMP5/rc"
+  git status --porcelain --untracked-files=no > "$TMP5/porcelain"
+)
+assert_eq "test4 rc" "0" "$(tr -d '[:space:]' < "$TMP5/rc")"
+assert_contains "test4 failed install continues" "dprep: install failed rc=1 (continuing" "$(cat "$TMP5/out")"
+assert_eq "test4 tracked files untouched" "" "$(cat "$TMP5/porcelain")"
+
+echo "--- test 5: npx becomes bunx when npx is absent ---"
+: > "$REC"
+cat > "$BIN/bunx" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$REC"
+printf '      Tests  3 passed (3)\\n'
+EOF
+chmod +x "$BIN/bunx"
+rm -f "$BIN/bun"
+export PATH="$BIN:/usr/bin:/bin"
+export RST_NPX_BIN="rst-npx-missing"
+TMP6="$(mktemp -d)"
+printf 'npx vitest run x.test.ts\n' > "$TMP6/cmds"
+result="$(cd "$TMP6" && rst_run_commands ./cmds ./log)"
+assert_eq "test5 counts" "0 3 3" "$result"
+assert_eq "test5 bunx argv" "vitest run x.test.ts" "$(cat "$REC")"
+assert_contains "test5 translation" "rst_run_commands: npx not found, running as: bunx vitest run x.test.ts" "$(cat "$TMP6/log")"
 SOURCE=spec_declared
-assert_eq "npx fallback report has real counts" "$(printf 'TESTS_STATUS=passed\nTESTS_LINE=3/3 (npx vitest run x.test.ts)')" "$(rst_report CODE 'npx vitest run x.test.ts' 0 '3 3')"
-cat > "$TMP/bin/bun" <<'EOF'
+report="$(rst_report CODE 'npx vitest run x.test.ts' "${result%% *}" "${result#* }")"
+assert_contains "test5 status" "TESTS_STATUS=passed" "$report"
+assert_contains "test5 line" "TESTS_LINE=3/3 (npx vitest run x.test.ts)" "$report"
+rm -f "$BIN/bunx"
+cat > "$BIN/bun" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' "$*" > "$RST_RECORD"
-printf '      Tests  2 passed (2)\n'
+printf '%s\\n' "\$*" >> "$REC"
+printf '      Tests  3 passed (3)\\n'
 EOF
-chmod +x "$TMP/bin/bun"
-export RST_RECORD="$TMP/bun.argv" RST_NPM_BIN=definitely-missing-npm
-printf 'npm test\n' > "$TMP/cmds"
-RESULT="$(cd "$TMP" && PATH="$TMP/bin:$PATH" rst_run_commands ./cmds ./npm.log)"
-assert_eq "missing npm uses bun with real counts" "0 2 2" "$RESULT"
-assert_eq "npm test becomes bun run test" "run test" "$(cat "$TMP/bun.argv")"
-assert_contains "npm fallback is logged" "rst_run_commands: npm not found, running as: bun run test" "$(cat "$TMP/npm.log")"
-printf 'npm run test:unit -- --watch=false\n' > "$TMP/cmds"
-RESULT="$(cd "$TMP" && PATH="$TMP/bin:$PATH" rst_run_commands ./cmds ./npm-run.log)"
-assert_eq "missing npm run uses bun with real counts" "0 2 2" "$RESULT"
-assert_eq "npm run preserves run, script, and arguments" "run test:unit -- --watch=false" "$(cat "$TMP/bun.argv")"
-assert_contains "npm run fallback is logged" "rst_run_commands: npm not found, running as: bun run test:unit -- --watch=false" "$(cat "$TMP/npm-run.log")"
-cat > "$TMP/bin/npx" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" > "$RST_RECORD"
-printf '      Tests  4 passed (4)\n'
-EOF
-chmod +x "$TMP/bin/npx"
+chmod +x "$BIN/bun"
+: > "$REC"
+result="$(cd "$TMP6" && rst_run_commands ./cmds ./logb)"
+assert_eq "test5 bun x argv" "x vitest run x.test.ts" "$(cat "$REC")"
+assert_contains "test5 bun x translation" "rst_run_commands: npx not found, running as: bun x vitest run x.test.ts" "$(cat "$TMP6/logb")"
+
+echo "--- test 6: npm test becomes bun run test; real npx is left alone ---"
 unset RST_NPX_BIN
-export RST_RECORD="$TMP/npx.argv"
-printf 'npx vitest run y.test.ts\n' > "$TMP/cmds"
-RESULT="$(cd "$TMP" && PATH="$TMP/bin:$PATH" rst_run_commands ./cmds ./real-npx.log)"
-assert_eq "real npx is left alone" "0 4 4" "$RESULT"
-assert_eq "real npx receives declared arguments" "vitest run y.test.ts" "$(cat "$TMP/npx.argv")"
-if grep -q 'npx not found' "$TMP/real-npx.log"; then FAIL=$((FAIL+1)); echo "FAIL: real npx must not log a translation"; else PASS=$((PASS+1)); echo "PASS: real npx logs no translation"; fi
-for c in 'npx vitest run x.test.ts; rm -rf /' 'npx vitest run $(id)' 'npm install' "bunx -e 'x'"; do
-  if rst_command_looks_runnable "$c"; then FAIL=$((FAIL+1)); echo "FAIL: closed allowlist accepted: $c"; else PASS=$((PASS+1)); echo "PASS: closed allowlist rejects: $c"; fi
+export RST_NPM_BIN="rst-npm-missing"
+: > "$REC"
+cat > "$BIN/bun" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$REC"
+printf '      Tests  2 passed (2)\\n'
+EOF
+chmod +x "$BIN/bun"
+TMP7="$(mktemp -d)"
+printf 'npm test\n' > "$TMP7/cmds"
+result="$(cd "$TMP7" && rst_run_commands ./cmds ./log)"
+assert_eq "test6 bun argv" "run test" "$(cat "$REC")"
+assert_contains "test6 npm translation" "rst_run_commands: npm not found, running as: bun run test" "$(cat "$TMP7/log")"
+printf 'npm run unit -- --run extra.test.ts\n' > "$TMP7/cmds"
+: > "$REC"
+result="$(cd "$TMP7" && rst_run_commands ./cmds ./logr)"
+assert_eq "test6 npm run argv" "run unit -- --run extra.test.ts" "$(cat "$REC")"
+assert_contains "test6 npm run translation" "rst_run_commands: npm not found, running as: bun run unit -- --run extra.test.ts" "$(cat "$TMP7/logr")"
+REC2="$BIN/npx-argv.txt"
+cat > "$BIN/npx" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$REC2"
+printf '      Tests  1 passed (1)\\n'
+EOF
+chmod +x "$BIN/npx"
+unset RST_NPX_BIN
+printf 'npx vitest run y.test.ts\n' > "$TMP7/cmds"
+result="$(cd "$TMP7" && rst_run_commands ./cmds ./logn)"
+assert_eq "test6 npx argv" "vitest run y.test.ts" "$(cat "$REC2")"
+assert_not_contains "test6 real npx not rewritten" "npx not found" "$(cat "$TMP7/logn")"
+rm -f "$BIN/bun"
+cat > "$BIN/npm" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$REC"
+printf '      Tests  2 passed (2)\\n'
+EOF
+chmod +x "$BIN/npm"
+unset RST_NPM_BIN
+: > "$REC"
+printf 'npm test\n' > "$TMP7/cmds"
+result="$(cd "$TMP7" && rst_run_commands ./cmds ./logm)"
+assert_eq "test6 real npm argv" "test" "$(cat "$REC")"
+assert_not_contains "test6 real npm not rewritten" "npm not found" "$(cat "$TMP7/logm")"
+
+echo "--- test 7: the allowlist is not widened ---"
+for c in \
+  "npx vitest run x.test.ts; rm -rf /" \
+  'npx vitest run $(id)' \
+  "npm install" \
+  "bunx -e 'x'"; do
+  if rst_command_looks_runnable "$c"; then
+    FAIL=$((FAIL + 1)); echo "FAIL: test7 not runnable expected: $c"
+  else
+    PASS=$((PASS + 1)); echo "PASS: test7 not runnable: $c"
+  fi
 done
-: > "$TMP/invoked"
-export RST_RECORD="$TMP/invoked"
-printf 'npx vitest run x.test.ts; rm -rf /\n' > "$TMP/cmds"
-RESULT="$(cd "$TMP" && PATH="$TMP/bin:$PATH" rst_run_commands ./cmds ./refused.log)"
-assert_contains "rst_run_commands refuses unsafe command" "refusing non-runnable command" "$(cat "$TMP/refused.log")"
-assert_eq "unsafe command invokes no stub" "0" "$(wc -c < "$TMP/invoked" | tr -d ' ')"
-rm -rf "$TMP"
+INVOKED="$BIN/invoked"
+rm -f "$INVOKED"
+cat > "$BIN/bunx" <<EOF
+#!/usr/bin/env bash
+printf 'invoked\\n' >> "$INVOKED"
+EOF
+chmod +x "$BIN/bunx"
+cat > "$BIN/npx" <<EOF
+#!/usr/bin/env bash
+printf 'invoked\\n' >> "$INVOKED"
+EOF
+chmod +x "$BIN/npx"
+printf 'npx vitest run x.test.ts; rm -rf /\n' > "$TMP7/cmds"
+result="$(cd "$TMP7" && rst_run_commands ./cmds ./log7)"
+assert_contains "test7 refused" "rst_run_commands: refusing non-runnable command" "$(cat "$TMP7/log7")"
+if [ -f "$INVOKED" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL: test7 stub was invoked"
+else
+  PASS=$((PASS + 1)); echo "PASS: test7 stub was not invoked"
+fi
+
+unset RST_NPX_BIN RST_NPM_BIN GH_TOKEN
+export PATH="$ORIG_PATH"
+rm -rf "$BIN" "$TMP" "$TMP2" "$TMP3" "$TMP4" "$TMP5" "$TMP6" "$TMP7"
 
 echo
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"
