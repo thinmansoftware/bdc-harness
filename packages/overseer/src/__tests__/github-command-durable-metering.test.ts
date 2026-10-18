@@ -116,4 +116,6 @@ test('real CLI processes persist request counts and refuse an exhausted shared p
     Bun.gc(true);
     rmSync(home, { recursive: true, force: true });
   }
-});
+  // Two real CLI subprocesses initialize independent databases. Match the
+  // package's 30-second integration-test budget on slower Windows runners.
+}, 30_000);
