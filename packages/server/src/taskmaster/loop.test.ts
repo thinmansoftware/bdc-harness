@@ -281,6 +281,70 @@ function makeWorld(): FakeWorld {
 function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): TaskmasterDeps {
   let journalSeq = world.journal.length;
   const dal = {
+    listFireLaunchClaims: async () =>
+      world.journal.filter(row => {
+        try {
+          return JSON.parse(row.proposal_json).fireLaunch?.state === 'active';
+        } catch {
+          return false;
+        }
+      }),
+    claimFireLaunch: async (
+      data: Parameters<typeof import('@archon/core/db/taskmaster').claimFireLaunch>[0]
+    ): Promise<import('@archon/core/db/taskmaster').TmFireLaunchResult> => {
+      if (world.control.epoch !== data.expectedEpoch) return { status: 'stale' };
+      if (world.control.pause_state !== 'RUNNING') return { status: 'paused' };
+      const proposal = JSON.parse(data.proposal_json);
+      for (const existing of world.journal) {
+        if (existing.idempotency_key === data.idempotency_key && existing.outcome !== 'deferred')
+          return { status: 'held' };
+        const prior = JSON.parse(existing.proposal_json);
+        if (
+          prior.fireLaunch?.state === 'active' &&
+          prior.fireLaunch.woId === proposal.fireEvidence.woId &&
+          prior.fireLaunch.project === proposal.fireEvidence.project
+        )
+          return { status: 'held' };
+      }
+      const deferred = world.journal.find(
+        row => row.idempotency_key === data.idempotency_key && row.outcome === 'deferred'
+      );
+      const row =
+        deferred ??
+        (await dal.recordAction({ ...data, action_type: 'fire_cauldron', outcome: 'pending' }));
+      // A row returned by another owner is not an execution grant.
+      if (row.outcome !== 'pending' && row.outcome !== 'deferred') return { status: 'held' };
+      const token = `launch-${row.id}`;
+      row.outcome = 'pending';
+      row.proposal_json = JSON.stringify({
+        ...proposal,
+        fireLaunch: {
+          version: 1,
+          state: 'active',
+          token,
+          cascadeId: data.idempotency_key,
+          ...proposal.fireEvidence,
+          claimedAt: new Date(world.nowMs).toISOString(),
+        },
+      });
+      return { status: 'claimed', row, token };
+    },
+    releaseFireLaunch: async (row: TmJournalEntry, token: string, reason: string) => {
+      const stored = world.journal.find(entry => entry.id === row.id);
+      if (!stored || stored.proposal_json !== row.proposal_json || stored.outcome !== row.outcome)
+        return false;
+      const proposal = JSON.parse(row.proposal_json);
+      if (proposal.fireLaunch?.state !== 'active' || proposal.fireLaunch.token !== token)
+        return false;
+      stored.proposal_json = JSON.stringify({
+        ...proposal,
+        fireLaunch: { ...proposal.fireLaunch, state: 'released', releaseReason: reason },
+      });
+      stored.outcome = reason === 'settled-cascade' ? stored.outcome : 'expired';
+      row.proposal_json = stored.proposal_json;
+      row.outcome = stored.outcome;
+      return true;
+    },
     listPendingFireActions: async () =>
       world.journal.filter(row => row.action_type === 'fire_cauldron' && row.outcome === 'pending'),
     transitionPendingFireAction: async (
@@ -1581,6 +1645,29 @@ describe('pending fire custody', () => {
     expect(fire?.outcome).toBe('pending');
   });
 
+  test('a raced existing fire row cannot grant a second invocation', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world);
+    const record = fixture.deps.db!.recordAction;
+    fixture.deps.db!.recordAction = async data => {
+      const row = await record(data);
+      if (data.action_type === 'fire_cauldron') {
+        row.outcome = 'sent';
+        row.proposal_json = JSON.stringify({
+          ...JSON.parse(row.proposal_json),
+          runId: 'winning-run',
+          fireLaunch: { version: 1, state: 'active', token: 'other-process' },
+        });
+      }
+      return row;
+    };
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(0);
+    const fire = world.journal.find(row => row.action_type === 'fire_cauldron')!;
+    expect(JSON.parse(fire.proposal_json).runId).toBe('winning-run');
+  });
+
   test('journal sent identity is the actual workflow and stored supervision is cascade-bound', async () => {
     const world = makeWorld();
     seedDigestSent(world);
@@ -1628,6 +1715,50 @@ describe('pending fire custody', () => {
     expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('expired');
     expect(result.effects).toBe(0);
     expect(world.expectations.size).toBe(0);
+  });
+
+  test('sent running custody holds a new bucket until the whole cascade is settled', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    let settled = false;
+    const fixture = setup(world, {
+      readFireCascadeEvidence: async () => ({
+        earliestRunId: 'actual-run',
+        completedRunId: 'actual-run',
+        status: 'completed',
+        prOpened: false,
+        settled,
+      }),
+    });
+    await tick(createTaskmasterState(60000), fixture.deps);
+    expect(fixture.fires()).toBe(1);
+    world.nowMs += 4 * 3600000;
+    await tick(createTaskmasterState(60000), fixture.deps);
+    expect(fixture.fires()).toBe(1);
+    const first = world.journal.find(row => row.action_type === 'fire_cauldron')!;
+    expect(JSON.parse(first.proposal_json).fireLaunch.state).toBe('active');
+    settled = true;
+    world.nowMs += 4 * 3600000;
+    await tick(createTaskmasterState(60000), fixture.deps);
+    expect(JSON.parse(first.proposal_json).fireLaunch.state).toBe('released');
+    expect(fixture.fires()).toBe(2);
+  });
+
+  test('fresh pause after claim aborts only the owned launch before invocation', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world);
+    const claim = fixture.deps.db!.claimFireLaunch!;
+    fixture.deps.db!.claimFireLaunch = async data => {
+      const result = await claim(data);
+      world.control = { ...world.control, pause_state: 'PAUSED', pause_scope: 'effects' };
+      return result;
+    };
+    await tick(createTaskmasterState(60000), fixture.deps);
+    expect(fixture.fires()).toBe(0);
+    const fire = world.journal.find(row => row.action_type === 'fire_cauldron')!;
+    expect(fire.outcome).toBe('expired');
+    expect(JSON.parse(fire.proposal_json).fireLaunch.releaseReason).toBe('aborted-before-invoke');
   });
 
   test('ambiguous dispatch rejection retains pending custody instead of retryable failure', async () => {

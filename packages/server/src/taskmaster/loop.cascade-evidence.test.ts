@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import type { CascadeAttempt, CascadeRunRecord } from '@archon/smart-cauldron/types';
 import { defaultGetFireRunEvidence } from './loop';
+import { readCascadeWorkflowEvidence } from './expectations';
 
 const identity = { cascadeId: 'cascade-exact', woId: 'WO-TEST-01', project: 'bdc-harness' };
 let db: Database;
@@ -71,6 +72,68 @@ function probe(
 }
 
 describe('exact cascade-bound fire usefulness evidence', () => {
+  test.each([
+    ['won', 'completed', true],
+    ['blocked', 'failed', true],
+    ['running', 'completed', false],
+    ['won', 'running', false],
+    ['pending-frontier-approval', 'completed', false],
+    ['infra-alert', 'completed', false],
+    ['recovery-delegated', 'completed', false],
+    ['spec-repair', 'completed', false],
+  ] as const)(
+    'settled custody requires cascade %s and workflow %s',
+    async (status, workflow, settled) => {
+      seed('actual-run', workflow);
+      const result = await readCascadeWorkflowEvidence(identity, {
+        readCascade: async () => record({ status }),
+        query: async <T>(sql: string, params: unknown[] = []) => ({
+          rows: db.query(sql).all(...(params as string[])) as T[],
+        }),
+      });
+      expect(result.settled).toBe(settled);
+    }
+  );
+
+  test('a null-run attempt prevents release even after another bound attempt completes', async () => {
+    seed('actual-run', 'completed');
+    const result = await readCascadeWorkflowEvidence(identity, {
+      readCascade: async () =>
+        record({ status: 'won', attempts: [attempt(null), attempt('actual-run')] }),
+      query: async <T>(sql: string, params: unknown[] = []) => ({
+        rows: db.query(sql).all(...(params as string[])) as T[],
+      }),
+    });
+    expect(result.completedRunId).toBe('actual-run');
+    expect(result.settled).toBe(false);
+  });
+
+  test('approved frontier chain releases only after its explicit resumed cascade settles', async () => {
+    seed('actual-run', 'failed');
+    seed('resume-run', 'completed');
+    const parent = record({
+      status: 'frontier-approved',
+      frontierApproval: {
+        resolution: 'approved',
+        resumeCascadeId: 'resume',
+      } as CascadeRunRecord['frontierApproval'],
+    });
+    const resumed = record({
+      cascadeId: 'resume',
+      status: 'running',
+      attempts: [attempt('resume-run')],
+    });
+    const read = () =>
+      readCascadeWorkflowEvidence(identity, {
+        readCascade: async id => (id === identity.cascadeId ? parent : resumed),
+        query: async <T>(sql: string, params: unknown[] = []) => ({
+          rows: db.query(sql).all(...(params as string[])) as T[],
+        }),
+      });
+    expect((await read()).settled).toBe(false);
+    resumed.status = 'won';
+    expect((await read()).settled).toBe(true);
+  });
   test('a completed actual run remains useful', async () => {
     seed('actual-run', 'completed');
     expect(await probe()).toMatchObject({ status: 'completed', prOpened: false });
