@@ -200,3 +200,34 @@ trusted test source beyond the earlier131072-byte conservative full-frame bound.
 The new finite bound covers the derived closed inventory without reducing coverage
 or expanding model output. Actual launcher support/packet bounds are still pending;
 this pure helper does not prove transport readiness or grant an account attempt.
+
+## Preparation-only staging entry source
+
+teetime-supervised-controller.ts and teetime-supervised-entry-guard.ts add the
+fixed Windows/Bun1.3.13 preparation entry from Task2. They are not yet installed,
+qualified on the staging host, registered through XO intake or execution-admitted.
+The sole accepted action is --prepare --input-sha256; there is no run/publish mode.
+The reviewed outer command must enforce Bun --no-env-file before entry. Reject
+DATABASE_URL (including empty), foreign assistant or ARCHON_HOME before DB imports.
+
+The fixed owned root is homedir()/teetime-supervised-01, with frozen source under
+harness/, operator-input.json and harness-source-manifest.json, four complete plan
+files under plan/ and the isolated archon/ project tree. The source-file inventory,
+workspace link targets, binary/helper/case/asset bytes and all plan hashes are read
+back. Host dependencies still need frozen acquisition/readback; links alone do not
+attest third-party package bytes. Existing unrelated checkout dependencies are not
+silently reused. Actual laptop inspection found the old project package but no
+root pino/pg/zod or workspace-link package paths, so it is not a qualified runtime.
+
+The preparation entry checks the actual Git origin, named worktree/staging refs,
+and absence of archon.db plus SQLite -wal/-shm/-journal sidecars. It retains claims
+on failure; normal real-store readback/close is required before lock release. A
+separate original-app bundle was acquired on the PC only: bf6e8935, tree3b6c5d68,
+README93 bytes, bundle1027 bytes SHA256
+0dce582e29f0ba9035a77882f4ac6c898f34d790327297422c46f641701495ca.
+GitHub staging was rechecked. No working tree/BDC source/account/run was created.
+
+Six local entry/guard tests pass26 assertions, including real sidecar fixtures,
+wrong-origin rejection and a child entry rejecting shared DB before core imports.
+These do not exercise successful operational preparation. The actual source/store
+qualification and future authenticated launcher/candidate/CI/CD gates remain separate.

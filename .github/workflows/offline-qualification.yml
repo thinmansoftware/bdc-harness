@@ -96,6 +96,7 @@ jobs:
           bun test ./packages/workflows/src/reliability/tee-time-supervised-bootstrap.test.ts
           bun test ./packages/workflows/src/reliability/tee-time-supervised-prepare.test.ts
           bun ./scripts/staging/qualify-teetime-supervised-sqlite.ts
+          bun test ./scripts/staging/teetime-supervised-entry-guard.test.ts ./scripts/staging/teetime-supervised-controller.test.ts
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test
           bun --filter @archon/server type-check
