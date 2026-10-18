@@ -1233,6 +1233,16 @@
       "args": [],
       "includes": {},
       "excludes": {}
+    },
+    {
+      "comment": "Chromium sandbox chroot with outer capabilities dropped",
+      "names": [
+        "chroot"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [],
+      "includes": {},
+      "excludes": {}
     }
   ]
 }

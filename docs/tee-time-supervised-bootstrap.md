@@ -116,3 +116,17 @@ could still prevent a sandbox. Source publication grants no retry. One new
 source/hash-bound environment-only smoke needs independent review before use.
 Keep Chromium sandboxing enabled and preserve all other controls; no SYS_ADMIN,
 privilege, host IPC, AppArmor disable or broad daemon-policy change is proposed.
+
+The first profile selection attempt was rejected before start; its receipt folder
+contains only result.json and cleanup was verified. The next independently reviewed
+operator correction passed no-new-privileges:true explicitly and recorded closed
+preflight diagnostics. Preflight passed; Chromium then failed at
+sys_chroot("/proc/self/fdinfo/"). Client/container exit1, no OOM, and cleanup passed.
+The retained default permits chroot only with CAP_SYS_CHROOT, which CapDrop=ALL
+excludes. The independently reviewed source repair adds exactly one unconditional
+chroot allow rule. Seccomp cannot restrict its pathname or attest it runs only
+inside a child namespace; kernel capability checks and the outer container controls
+remain. No capabilities are added. The precise source comparison test now requires
+only the namespace rule and this chroot rule over the unchanged default.
+One fresh hash-bound static smoke is conditionally approved after commit/freeze;
+preserve failure and stop if it fails. No application/account run follows from it.

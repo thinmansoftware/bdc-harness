@@ -11,7 +11,9 @@ class BrowserSeccompTests(unittest.TestCase):
         extra={'comment':'Playwright documented user namespace sandbox permissions',
             'names':['clone','setns','unshare'],'action':'SCMP_ACT_ALLOW',
             'args':[],'includes':{},'excludes':{}}
-        self.assertEqual(actual,{**base,'syscalls':base['syscalls']+[extra]})
+        chroot={'comment':'Chromium sandbox chroot with outer capabilities dropped',
+            'names':['chroot'],'action':'SCMP_ACT_ALLOW','args':[],'includes':{},'excludes':{}}
+        self.assertEqual(actual,{**base,'syscalls':base['syscalls']+[extra,chroot]})
         self.assertEqual(actual['defaultAction'],'SCMP_ACT_ERRNO')
         self.assertNotIn('mount',extra['names'])
 
