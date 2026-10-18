@@ -130,3 +130,47 @@ remain. No capabilities are added. The precise source comparison test now requir
 only the namespace rule and this chroot rule over the unchanged default.
 One fresh hash-bound static smoke is conditionally approved after commit/freeze;
 preserve failure and stop if it fails. No application/account run follows from it.
+
+The source809ecbfd48c6dd2570144406a344e8e852c2dfe2 smoke subsequently passed:
+Chromium156.0.8078.4, sandbox enabled,390px static fixture, client/container exit0,
+no OOM and owned-container absence verified. Profile SHA256
+971a338323570a78dbfcb6337720373afab0fa9b621e6a0f48be404fb5a4dae6.
+This qualifies only that static browser environment. Source CI39168977518 also
+passed on the809ecbfd source lineage; it did not execute an account/model case.
+
+## Proposed ONE synthetic framework qualification
+
+qualify-teetime-framework.py is a source template that rejects its unfrozen source
+markers. Before use an operator must freeze its exact source revision, public
+payload/hash and derived helper/hash under independent review. It is not an app
+or an operational build entry. Fixed image/profile remain the qualified values.
+
+The source fixture is deliberately titled Framework environment only. Six trusted
+prepared assets are combined with the four source-owned fixture texts. A first
+unprivileged, no-network container uses one fresh owned volume, copies only the
+public image Bun cache, performs --frozen-lockfile --ignore-scripts install, and
+runs installed Next typegen. It records complete generated config bytes. Its sole
+writer is removed before a second container mounts that source/dependency volume
+read-only. Only .next, /tmp and /results are writable tmpfs paths. That verifier
+runs the fixed unit, Next webpack build, typecheck and two-viewport browser commands,
+checks source hashes unchanged, and closes the owned resources. Each role is capped
+at3GiB RAM/swap,2 CPUs,256 PIDs, private IPC256MiB and a300-second phase deadline.
+No account, host mount, Docker socket, host port, provider, production or product
+feature is involved. A failed/unknown result remains failed and needs a new review.
+
+The Next declaration/config asset contents were grounded in the installed16.4.2
+writeAppTypeDeclarations/writeConfigurationDefaults sources. In particular this
+version also imports .next/types/root-params.d.ts. Generated config is an output
+to inspect/freeze, not a reason to silently rewrite a later reviewed candidate.
+The complete case/WO and model execution remain unadmitted until this and the
+remaining source/controller/launcher checks are satisfied.
+
+Independent pre-execution review required four controller corrections: reject any
+existing exact volume name and validate local driver/options/mountpoint; bound stdin
+delivery and reap the attach process; verify the complete security/argv/tmpfs/mount
+preflight; and bind verifier initial/final hashes to accepted writer bytes. These
+are implemented with custody regressions observed failing before implementation
+and then passing. Only next-env.d.ts and tsconfig.json may be generated changes;
+their complete bytes are retained for inspection/freeze. All other fixture bytes
+must remain identical. The300-second outer deadline intentionally overrides the
+sum of the individual120-second command limits. Timeout remains failure.

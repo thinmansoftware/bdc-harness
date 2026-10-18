@@ -1,0 +1,28 @@
+import { defineConfig } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './walkthrough',
+  forbidOnly: true,
+  retries: 0,
+  workers: 1,
+  timeout: 30000,
+  expect: { timeout: 5000 },
+  outputDir: '/results/playwright',
+  reporter: [['line']],
+  use: {
+    baseURL: 'http://127.0.0.1:3187',
+    browserName: 'chromium',
+    launchOptions: { chromiumSandbox: true },
+    viewport: { width: 390, height: 844 },
+    screenshot: 'only-on-failure',
+    trace: 'retain-on-failure',
+    acceptDownloads: true,
+  },
+  webServer: {
+    command: '/opt/teetime/node/bin/node /workspace/app/node_modules/next/dist/bin/next start --hostname 127.0.0.1 --port 3187',
+    url: 'http://127.0.0.1:3187',
+    reuseExistingServer: false,
+    timeout: 20000,
+    env: { NEXT_TELEMETRY_DISABLED: '1' },
+  },
+});

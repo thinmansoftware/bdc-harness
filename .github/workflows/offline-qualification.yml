@@ -65,6 +65,7 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_git_commit.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_git_base.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_browser_seccomp.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_framework_qualification.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_snapshot_exporter.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_artifact_contract.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_materialization_frame.py
