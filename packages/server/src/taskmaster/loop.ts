@@ -2365,7 +2365,9 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
               table: 'remote_agent_workflow_runs',
               where: { id: runIds, status: CASCADE_SUCCESS_STATUSES },
             }),
-            due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+            due_at: new Date(
+              Date.parse(admittedPermission.admittedAt) + PROOF_DEADLINE_MS
+            ).toISOString(),
             on_absence: 'escalate',
             max_retries: 0,
           });

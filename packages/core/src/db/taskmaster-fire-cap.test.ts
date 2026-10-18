@@ -105,6 +105,27 @@ test('admission rechecks UTC day after asynchronous preflight', async () => {
   expect(result.allowed).toBe(true);
   expect(result.admission?.utcDay).toBe('2026-10-18');
 });
+test('proof deadline follows actual admission rather than stale preflight time', async () => {
+  const input = await request('proof-clock', '2026-10-16T23:59:59.000Z');
+  await tm.reserveAutomaticFire(input, db);
+  const permission = await tm.authorizeAutomaticFire({ ...input, now }, db);
+  expect(permission.allowed).toBe(true);
+  await tm.settleAutomaticFire(
+    {
+      actionKey: input.actionKey,
+      cascadeId: input.cascadeId,
+      state: 'admitted',
+      admittedAt: now,
+      runIds: ['child'],
+    },
+    db
+  );
+  const result = await db.query<{ proof_deadline_at: string }>(
+    'SELECT proof_deadline_at FROM tm_journal WHERE id=$1',
+    [input.journalId]
+  );
+  expect(result.rows[0]?.proof_deadline_at).toBe('2026-10-19T12:00:00.000Z');
+});
 test('admission clock is read after waiting for the database transaction lock', async () => {
   const input = await request('lock-midnight', '2026-10-17T23:59:59.000Z');
   await tm.reserveAutomaticFire(input, db);

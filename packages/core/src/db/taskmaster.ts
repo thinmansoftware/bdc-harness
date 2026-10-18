@@ -227,6 +227,21 @@ export async function settleAutomaticFire(
       input.cascadeId,
     ]
   );
+  if (input.state === 'admitted' && input.admittedAt) {
+    // Async preflight may outlive the original journal deadline. Supervision
+    // starts from the proven admission clock, never the stale proposal clock.
+    await db.query(
+      `UPDATE tm_journal SET proof_deadline_at=$1 WHERE id IN (
+         SELECT journal_id FROM tm_fire_admissions WHERE action_key=$2
+         AND cascade_id=$3 AND state='admitted' AND admitted_at=$4)`,
+      [
+        new Date(Date.parse(input.admittedAt) + 86_400_000).toISOString(),
+        input.actionKey,
+        input.cascadeId,
+        input.admittedAt,
+      ]
+    );
+  }
 }
 export async function listAutomaticFireAdmissions(
   db: IDatabase = getDatabase()

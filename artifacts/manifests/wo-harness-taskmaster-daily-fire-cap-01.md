@@ -5,13 +5,13 @@ Scope: source/test/draft-PR only, A2 bdc-xo#2002 comment6250714249
 Files modified: .github/workflows/test.yml, packages/core/package.json, packages/core/src/db/adapters/sqlite.ts, packages/core/src/db/taskmaster.ts, packages/server/src/taskmaster/loop.ts, packages/server/src/taskmaster/loop.test.ts, packages/smart-cauldron/src/cascade.ts, packages/smart-cauldron/src/recorder.ts, packages/smart-cauldron/src/types.ts
 Files created: migrations/063_tm_fire_admissions.sql, packages/core/src/db/taskmaster-fire-cap.test.ts, packages/core/src/db/taskmaster-fire-cap.postgres.test.ts, packages/core/src/db/taskmaster-fire-cap-race.fixture.ts, packages/server/src/taskmaster/daily-fire-cap.test.ts, docs/operations/taskmaster-daily-fire-cap.md, artifacts/manifests/wo-harness-taskmaster-daily-fire-cap-01.md
 Files deleted: none
-Tests: 138 pass, 0 fail, 586 assertions (bun test packages/server/src/taskmaster/daily-fire-cap.test.ts packages/core/src/db/taskmaster-fire-cap.test.ts packages/server/src/taskmaster/loop.test.ts packages/server/src/taskmaster/fire-eligibility.test.ts)
+Tests: 139 pass, 0 fail, 588 assertions (bun test packages/server/src/taskmaster/daily-fire-cap.test.ts packages/core/src/db/taskmaster-fire-cap.test.ts packages/server/src/taskmaster/loop.test.ts packages/server/src/taskmaster/fire-eligibility.test.ts)
 Additional tests: core journal DAL 103 pass/0 fail; cascade and recorder 38 pass/0 fail.
-PostgreSQL tests: BLOCKED locally before connection because TASKMASTER_POSTGRES_TEST_URL is absent. Existing disposable PostgreSQL17 CI job is wired to run packages/core/src/db/taskmaster-fire-cap.postgres.test.ts. No skipped/mock dialect proof is accepted.
+PostgreSQL tests: original bb987e9f hosted PG17 suite passed 3/3 with 10 assertions and cleanup SUCCESS; local fixture remains absent. The admission-deadline refinement requires fresh exact-head hosted verification. Existing disposable PostgreSQL17 CI job is wired to run packages/core/src/db/taskmaster-fire-cap.postgres.test.ts. No skipped/mock dialect proof is accepted.
 Types: bun run type-check exited 0 across the workspace and script project.
 Lint: changed production TypeScript and race fixture exited 0; repository policy excludes \*.test.ts from ESLint. No lint configuration changed.
 Formatting: changed supported source formats checked with the existing Prettier; SQL has no installed Prettier parser and remains ASCII/manual SQL formatting.
-PRs: pending draft source publication; not REVIEW-ready.
+PRs: https://github.com/thinmansoftware/bdc-harness/pull/1166 (DRAFT, not REVIEW-ready).
 Merge ancestors: thinmansoftware/bdc-harness dev base e2f3b0a9ca040796a3eeb7902fd7d0c9f073f632, refreshed before worktree creation; behind_by: 0 at start. Refresh before publication.
 New DAL signatures: reserveAutomaticFire, authorizeAutomaticFire, releaseAutomaticFire, settleAutomaticFire, listAutomaticFireAdmissions, seedAutomaticFireHistory, updateAutomaticFireExpectation. Database parameters are optional isolated-test seams; runtime uses the existing database connection.
 New cascade contract: optional awaited beforeAdmission gate; automaticFireAdmission provenance; exact stable readCascadeRecord lookup. Existing manual callers remain optional/unmodified.

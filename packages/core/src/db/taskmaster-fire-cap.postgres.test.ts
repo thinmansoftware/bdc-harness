@@ -116,6 +116,13 @@ test('PostgreSQL replay grants one invocation; rebooking uses the admission day 
     },
     second
   );
+  const deadline = await first!.query<{ proof_deadline_at: Date | string }>(
+    'SELECT proof_deadline_at FROM tm_journal WHERE id=$1',
+    [input.journalId]
+  );
+  expect(new Date(deadline.rows[0]!.proof_deadline_at).toISOString()).toBe(
+    '2026-10-20T00:00:01.000Z'
+  );
   const a = { ...(await request('next')), now: '2026-10-19T00:01:00.000Z' };
   const b = { ...(await request('overflow')), now: '2026-10-19T00:01:00.000Z' };
   expect((await reserveAutomaticFire(a, first)).allowed).toBe(true);
