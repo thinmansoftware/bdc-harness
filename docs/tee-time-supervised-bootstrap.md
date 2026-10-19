@@ -1,5 +1,36 @@
 # Tee-time supervised bootstrap source preparation
 
+## Unregistered minimal diagnostic data contract
+
+`collectMinimalDiagnostic` in scripts/staging/teetime-minimal-diagnostic.ts is a
+source-only collector, not an executable or account entrypoint. It sends only
+`Reply with exactly OK.` to a supplied query callback, once. It requires one
+assistant chunk then one clean result, normal closed completion and no abort.
+Thinking is bounded and discarded. ASCII trim is explicit; malformed Unicode,
+unexpected tools/routes/system chunks, ordering, excess chunks/content and
+cleanup uncertainty reject. Only closed origin/hint/code and bounded lifecycle
+counts leave the collector; no response, app source or private error text.
+Failure records keep primary code/provenance plus an explicit cleanupFailure
+boolean. A later SDK return or callback exception cannot overwrite a latched
+bound or provider failure. Chunk65 stays chunk_limit with categorized count64;
+callback-only cleanup is cleanup_failed/true with no normal provider end.
+
+scripts/staging/teetime_minimal_diagnostic.py independently validates the exact
+version1 teetime-minimal-diagnostic schema and actual child exit0/1. A valid
+failure packet is still failed; passing proves only the tiny protocol. It grants
+no wrapper custody, served-model identity, general entitlement or app acceptance.
+Existing demo/fixed-artifact/worker/historical packets are unchanged.
+
+Source verification: `bun test ./scripts/staging/teetime-minimal-diagnostic.test.ts`,
+`python -m unittest discover -s scripts/staging -p test_teetime_minimal_diagnostic.py`,
+and `bun test src/codex/restricted-provider.test.ts` from packages/providers. The
+last command includes actual mocked native-event to collector to Python-parser
+integration. Offline CI runs all three. No runtime selector, account delivery,
+image replacement or diagnostic claim is registered. A real diagnostic still
+requires separately reviewed worker/deadline/reaping, proxy-counter contract,
+immutable inputs, exact carrier, authority and one-use execution gates. No
+implementation attempt5 and no automatic retry.
+
 ## Source-only failure origin preservation
 
 After consumed attempt4, provider.ts retains a private WeakMap record with only
