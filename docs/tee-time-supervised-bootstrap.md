@@ -231,3 +231,30 @@ Six local entry/guard tests pass26 assertions, including real sidecar fixtures,
 wrong-origin rejection and a child entry rejecting shared DB before core imports.
 These do not exercise successful operational preparation. The actual source/store
 qualification and future authenticated launcher/candidate/CI/CD gates remain separate.
+
+## Owned host dependency acquisition
+
+Source93b6bb611fb424aac3b756993f0c1a8dc702f7ca passed CI39173214668.
+A local Git archive contains2082 files/40352772 source bytes; archive SHA256
+695b3c49b38bc1d1b92fffdbd0d00c58846498cec0eb7d5af3d8169c212db1f3,
+manifest SHA25613cd53880ca4180158711640a6dde69c6ab727864a758fae595c1555820588ce.
+The laptop Bun1.3.13 binary hash was read directly:
+8dc0cd4351f596df6bb71c03575168078bb0f9872ef4d5ff1b8579dd9507cf70.
+The intended teetime-supervised-01 root was absent at that observation.
+
+The draft scripts/staging/acquire-teetime-controller-deps.py accepts only these
+fixed public inputs under teetime-controller-input-93b6 in the laptop home. It
+creates a fresh staging root, rejects archive links/unsafe paths, verifies all
+source bytes, and runs only the pinned Bun frozen-lockfile install with lifecycle
+scripts disabled. The environment has owned empty home/config/cache/temp paths
+and no inherited credentials, proxy or preload settings. The install has a600s
+deadline and2MiB output bound; failure retains the owned directory without retry.
+Source bytes, workspace links and dependency inventory are checked afterward.
+Existing Claude SDK package bytes are inert dependencies of this harness; the
+installer does not import or execute them or any provider. This does not qualify
+the actual controller or authorize account delivery.
+
+Invocation after independent wrapper review and frozen-input readback:
+`C:/Program Files/Python312/python.exe -I -B <frozen-wrapper-path>`.
+No invocation has been made at this source checkpoint. A successful install must
+retain its actual receipt before the complete preparation package is evaluated.
