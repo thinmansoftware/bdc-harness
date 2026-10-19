@@ -23,7 +23,33 @@ REAL_POPEN=subprocess.Popen
 REAL_THREAD_START=threading.Thread.start
 
 
+def close_fixture_pipes(child):
+    errors=[]
+    for pipe in [child.stdin,child.stdout]:
+        if pipe and not pipe.closed:
+            try:pipe.close()
+            except BrokenPipeError:pass
+            except Exception as error:errors.append(error)
+    if errors:raise errors[0]
+
+
 class MinimalOperatorTests(unittest.TestCase):
+    def test_fixture_broken_pipe_does_not_skip_stdout_close(self):
+        class Pipe:
+            closed=False
+            def __init__(self,error=None):self.error=error
+            def close(self):
+                self.closed=True
+                if self.error:raise self.error
+        child=type('Child',(),{})()
+        child.stdin=Pipe(BrokenPipeError());child.stdout=Pipe()
+        close_fixture_pipes(child)
+        self.assertTrue(child.stdin.closed);self.assertTrue(child.stdout.closed)
+        child.stdin=Pipe(RuntimeError('unexpected fixture cleanup failure'))
+        child.stdout=Pipe()
+        with self.assertRaises(RuntimeError):close_fixture_pipes(child)
+        self.assertTrue(child.stdout.closed)
+
     def cleanup_fixture_children(self):
         for timer in getattr(self,'timers',[]):
             timer.cancel()
@@ -170,7 +196,7 @@ sys.stdout.write(%r);sys.stdout.flush();sys.exit(%r)
             child.wait(timeout=3)
             for thread in threads:
                 if thread.ident is not None:thread.join(timeout=1)
-            child.stdin.close();child.stdout.close()
+            close_fixture_pipes(child)
 
     def test_maximum_frame_deadline_kills_nonreading_child_and_settles_writer(self):
         child=REAL_POPEN([sys.executable,'-I','-c','import time;time.sleep(30)'],
@@ -182,7 +208,7 @@ sys.stdout.write(%r);sys.stdout.flush();sys.exit(%r)
             self.assertIsNotNone(child.poll())
         finally:
             if child.poll() is None:child.kill();child.wait(timeout=3)
-            child.stdin.close();child.stdout.close()
+            close_fixture_pipes(child)
 
 
 if __name__=='__main__':unittest.main()
