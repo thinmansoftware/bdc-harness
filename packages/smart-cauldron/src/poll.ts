@@ -8,6 +8,8 @@
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { serviceGitHubCommandEnvironment } from '@archon/core/github/service-identity';
+import { assertGitHubPoolAvailable, recordGitHubApiCall } from '@archon/core/github/metering';
 import type { PollResult } from './types.js';
 
 const execFileAsync = promisify(execFile);
@@ -595,13 +597,22 @@ async function findExistingPrForBranch(
  * Injectable exec seam for testing the exact gh invocation without replacing
  * child_process globally.
  */
-type ExecFileFn = (command: string, args: string[]) => Promise<{ stdout: string; stderr: string }>;
+type ExecFileFn = (
+  command: string,
+  args: string[],
+  options?: { env?: NodeJS.ProcessEnv }
+) => Promise<{ stdout: string; stderr: string }>;
+
+export async function smartCauldronGhEnv(): Promise<{ env: NodeJS.ProcessEnv; poolId: string }> {
+  return serviceGitHubCommandEnvironment('smart_cauldron');
+}
 
 /** Default `gh pr list --head <branch> --repo <repo>` production lookup. */
 export async function ghPrListForBranchDefault(
   branch: string,
   repo: string | null,
-  execFn: ExecFileFn = execFileAsync
+  execFn: ExecFileFn = execFileAsync,
+  resolveAuth: typeof smartCauldronGhEnv = smartCauldronGhEnv
 ): Promise<string | null> {
   if (!repo) {
     console.log(
@@ -611,20 +622,32 @@ export async function ghPrListForBranchDefault(
     return null;
   }
   try {
-    const { stdout } = await execFn('gh', [
-      'pr',
-      'list',
-      '--repo',
-      repo,
-      '--head',
-      branch,
-      '--state',
-      'open',
-      '--json',
-      'url',
-      '--jq',
-      '.[0].url // empty',
-    ]);
+    const auth = await resolveAuth();
+    assertGitHubPoolAvailable(auth.poolId, 'core');
+    const { stdout } = await execFn(
+      'gh',
+      [
+        'pr',
+        'list',
+        '--repo',
+        repo,
+        '--head',
+        branch,
+        '--state',
+        'open',
+        '--json',
+        'url',
+        '--jq',
+        '.[0].url // empty',
+      ],
+      { env: auth.env }
+    );
+    recordGitHubApiCall({
+      service: 'smart_cauldron',
+      poolId: auth.poolId,
+      resource: 'core',
+      status: 0,
+    });
     const url = stdout.trim();
     return url.length > 0 ? url : null;
   } catch (err) {
@@ -683,15 +706,19 @@ function nonEmptyModelField(value: unknown): string | null {
  */
 async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
   try {
-    const { stdout } = await execFileAsync('gh', [
-      'pr',
-      'view',
-      prUrl,
-      '--json',
-      'mergeable',
-      '--jq',
-      '.mergeable',
-    ]);
+    const auth = await smartCauldronGhEnv();
+    assertGitHubPoolAvailable(auth.poolId, 'core');
+    const { stdout } = await execFileAsync(
+      'gh',
+      ['pr', 'view', prUrl, '--json', 'mergeable', '--jq', '.mergeable'],
+      { env: auth.env }
+    );
+    recordGitHubApiCall({
+      service: 'smart_cauldron',
+      poolId: auth.poolId,
+      resource: 'core',
+      status: 0,
+    });
     const val = stdout.trim().toUpperCase();
     if (val === 'MERGEABLE') return true;
     if (val === 'CONFLICTING' || val === 'BLOCKED') return false;

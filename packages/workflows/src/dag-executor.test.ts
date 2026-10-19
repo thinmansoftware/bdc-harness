@@ -14662,15 +14662,20 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
     expect(progress?.data?.chunks_seen).toBe(1);
   });
 
-  it('a chatty healthy node is not killed and its progress is throttled', async () => {
+  it('a healthy stream emits progress at deterministic throttle boundaries', async () => {
     const prev = process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
+    const originalNow = Date.now;
+    const base = originalNow();
+    let progressNow = base;
+    Date.now = () => progressNow;
     process.env.ARCHON_NODE_PROGRESS_EVENT_MS = '50';
     try {
       mockSendQueryDag.mockImplementation(async function* () {
-        const started = Date.now();
-        while (Date.now() - started < 400) {
+        // This fixture checks chunk/throttle boundaries, not real idle timing.
+        // Real silence and cancellation retain their separate timer controls.
+        for (const offset of [0, 10, 20, 49, 50, 60, 99, 100]) {
+          progressNow = base + offset;
           yield { type: 'assistant', content: 'working' };
-          await new Promise(resolve => setTimeout(resolve, 20));
         }
         yield { type: 'result', sessionId: 'chatty-session' };
       });
@@ -14690,8 +14695,7 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
       );
       expect(failed).toHaveLength(0);
       expect(completed).toHaveLength(1);
-      expect(progress.length).toBeGreaterThanOrEqual(2);
-      expect(progress.length).toBeLessThanOrEqual(10);
+      expect(progress.map(event => event.data?.chunks_seen)).toEqual([1, 5, 8]);
       expect(progress[0]?.data?.provider).toBe('claude');
       expect(progress[0]?.data?.last_chunk_type).toBe('assistant');
       expect(progress[0]?.data?.chunks_seen).toBe(1);
@@ -14701,6 +14705,7 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
         expect(event.data?.last_chunk_type).not.toBe('');
       }
     } finally {
+      Date.now = originalNow;
       if (prev === undefined) delete process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
       else process.env.ARCHON_NODE_PROGRESS_EVENT_MS = prev;
     }

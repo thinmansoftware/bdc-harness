@@ -1417,10 +1417,63 @@ nodes:
   # inside the run worktree and emits the OBSERVED pass/total. It never trusts a builder
   # or validator claim. Always exits 0; the validator quotes TESTS_* as ground truth and
   # stamp-manifest-evidence writes TESTS_LINE into the manifest "Tests:" line.
-  - id: run-stop-tests
+  - id: resolve-test-command
     persona: major-build
     load_bearing: true
     depends_on: [format-autofix]
+    task_class: clerical
+    timeout: 60000
+    bash: |
+      set -uo pipefail
+      ORIGIN="$(git remote get-url origin 2>/dev/null || true)"
+      if ! MAP_RESPONSE="$(timeout 30 gh api 'repos/thinmansoftware/bdc-xo/contents/scripts/cauldron/cauldron-projects.json?ref=main' 2>/dev/null)"; then
+        printf 'TEST_COMMAND_SOURCE=wo-spec\nTEST_COMMAND_FALLBACK=unavailable\nTEST_COMMAND_MAP_SHA=\nTEST_COMMAND_B64=\n'
+        exit 0
+      fi
+      # Structured data only: no shell evaluation or command execution here.
+      python3 -c '
+      import base64, json, re, sys
+      def normalize(value, allow_slug=False):
+          if not isinstance(value, str):
+              return None
+          prefix = r"(?:https://github[.]com/|git@github[.]com:)"
+          if allow_slug:
+              prefix += "?"
+          match = re.fullmatch(prefix + r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:[.]git)?/?", value, re.I)
+          return match.group(1).lower() if match else None
+      reason = "malformed"
+      sha = ""
+      command = ""
+      try:
+          envelope = json.load(sys.stdin)
+          revision = envelope.get("sha", "")
+          if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+              raise ValueError("invalid map revision")
+          sha = revision.lower()
+          content = base64.b64decode("".join(envelope["content"].split()), validate=True)
+          projects = json.loads(content)
+          if not isinstance(projects, dict):
+              raise ValueError("invalid project map")
+          slug = normalize(sys.argv[1])
+          matches = [value for value in projects.values() if isinstance(value, dict) and slug is not None and normalize(value.get("repo"), True) == slug]
+          reason = "invalid-origin" if slug is None else "missing" if not matches else "ambiguous" if len(matches) != 1 else "invalid-command"
+          if len(matches) == 1:
+              candidate = matches[0].get("test_command")
+              if isinstance(candidate, str) and candidate.strip() and len(candidate) <= 4096 and "\n" not in candidate and "\r" not in candidate and "\x00" not in candidate:
+                  command = candidate
+                  reason = ""
+      except (ValueError, TypeError, KeyError, AttributeError):
+          reason = "malformed"
+      print("TEST_COMMAND_SOURCE=" + ("project-map" if command else "wo-spec"))
+      print("TEST_COMMAND_FALLBACK=" + reason)
+      print("TEST_COMMAND_MAP_SHA=" + sha)
+      print("TEST_COMMAND_B64=" + base64.b64encode(command.encode()).decode())
+      ' "$ORIGIN" <<< "$MAP_RESPONSE"
+
+  - id: run-stop-tests
+    persona: major-build
+    load_bearing: true
+    depends_on: [format-autofix, resolve-test-command]
     task_class: clerical
     timeout: 1800000
     bash: |
@@ -1680,7 +1733,8 @@ nodes:
       rst_parse_counts() {
         local esc raw counts
         esc="$(printf '\033')"
-        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g")"
+        # Bun --filter prefixes each workspace test line; normalize parser input only.
+        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g" | sed -E 's/^(@[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)?[A-Za-z0-9_-][A-Za-z0-9_.-]*:test[[:blank:]]+\|[[:blank:]]*//')"
         counts="$(printf '%s\n' "$raw" | awk '
           /^[ \t]*Passed: [0-9]+[ \t]+Failed: [0-9]+[ \t]+Total: [0-9]+/ { p += $2; t += $6; hit = 1; next }
           /^[ \t]*Tests: [0-9]+\/[0-9]+[ \t]*$/ { split($2, a, "/"); p += a[1]; t += a[2]; hit = 1; next }
@@ -1902,6 +1956,25 @@ nodes:
       $(printf '%s\n' "$SPEC" | rst_extract_commands)
       EOF_CMDS
       [ -s "$CMDS" ] && SOURCE="spec_declared"
+      RESOLUTION="$(cat <<'BDC_TEST_COMMAND_RESOLUTION' | capture_node_output
+      $resolve-test-command.output
+      BDC_TEST_COMMAND_RESOLUTION
+      )"
+      MAP_SOURCE="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_SOURCE=//p' | head -1)"
+      MAP_SHA="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_MAP_SHA=//p' | head -1)"
+      MAP_FALLBACK="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_FALLBACK=//p' | head -1)"
+      MAP_COMMAND="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_B64=//p' | head -1 | base64 --decode 2>/dev/null || true)"
+      SELECTED_SOURCE="spec_declared"
+      if [ "$MAP_SOURCE" = "project-map" ] && [ -n "$MAP_COMMAND" ]; then
+        if rst_command_looks_runnable "$MAP_COMMAND"; then
+          printf '%s\n' "$MAP_COMMAND" > "$CMDS"
+          SELECTED_SOURCE="project-map"
+        else
+          MAP_FALLBACK="unsafe-command"
+        fi
+      fi
+      echo "TESTS_MAP_SHA=$MAP_SHA"
+      echo "TESTS_MAP_FALLBACK=$MAP_FALLBACK"
       EXIT_CODE=0
       COUNTS=""
       CMD_JOINED=""
@@ -1926,7 +1999,7 @@ nodes:
         (
           cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && dprep_ensure_js_deps
         ) >&2
-        if ! rst_try "spec_declared"; then
+        if ! rst_try "$SELECTED_SOURCE" && [ "$SELECTED_SOURCE" != "project-map" ]; then
           if [ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]; then
             TRIED="spec_declared command(s) exited $EXIT_CODE with no parseable counts: $CMD_JOINED"
           else
@@ -1961,7 +2034,13 @@ nodes:
       echo "TESTS_EXIT=$EXIT_CODE"
       echo "TESTS_PASSED=${COUNTS%% *}"
       echo "TESTS_TOTAL=${COUNTS##* }"
-      rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS"
+      if [ "$SOURCE" = "project-map" ]; then
+        SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
+      else
+        REPORT_SOURCE="${SOURCE%% *}"
+        if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
+        rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
+      fi
       echo "TESTS_LOG=$LOG"
       if [ -s "$LOG" ]; then
         echo "--- last 80 lines of test output ---"
