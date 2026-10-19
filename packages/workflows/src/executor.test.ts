@@ -70,6 +70,12 @@ registerBuiltinProviders();
 // --- Import after mocks ---
 import { executeWorkflow, resolveExecutorLane, LaneAvailabilityRefusedError } from './executor';
 import { markEngineDarkIfZeroUsage, resetEngineAvailabilityForTests } from './engine-availability';
+import {
+  resetSeatUsageCacheForTests,
+  setSeatUsageReaderForTests,
+  type SeatId,
+  type SeatReading,
+} from './reliability/seat-usage';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun } from './schemas';
@@ -150,6 +156,37 @@ function getExecutedWorkflow(): WorkflowDefinition {
   return mockExecuteDagWorkflow.mock.calls[0]?.[4] as WorkflowDefinition;
 }
 
+// These orchestration tests mock the DAG/provider. Seat capacity must be a
+// fixture too, so host credentials and live subscription usage cannot decide
+// whether an unrelated policy/resume test reaches that mocked DAG.
+beforeEach(() => {
+  resetSeatUsageCacheForTests();
+  setSeatUsageReaderForTests(async seats => {
+    const readings: Partial<Record<SeatId, SeatReading>> = {};
+    for (const seat of seats) {
+      const gateWindows =
+        seat === 'claude'
+          ? ['five_hour', 'seven_day']
+          : seat === 'codex'
+            ? ['primary', 'secondary']
+            : ['monthly'];
+      const week = { used_percent: 0, remaining_percent: 100, resets_at: '2030-01-01T00:00:00Z' };
+      readings[seat] = {
+        seat,
+        limit_source: 'measured',
+        windows: gateWindows.map(name => ({ name, ...week })),
+        seven_day: seat === 'cursor' ? 'NOT_APPLICABLE' : week,
+        gate_windows: gateWindows,
+        note: 'synthetic orchestration fixture',
+        probed_at: '2026-10-17T00:00:00Z',
+        endpoint: 'https://fixture.invalid',
+      };
+    }
+    return readings;
+  });
+});
+afterEach(resetSeatUsageCacheForTests);
+
 describe('executeWorkflow', () => {
   beforeEach(() => {
     mockLogFn.mockClear();
@@ -158,6 +195,233 @@ describe('executeWorkflow', () => {
     mockEmitter.unregisterRun.mockClear();
     mockEmitter.emit.mockClear();
     mockExecuteDagWorkflow.mockImplementation(async (): Promise<string | undefined> => undefined);
+  });
+
+  it('uses synthetic seat usage without probing credentials from the host', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'executor-seat-fixture-'));
+    const credentialsFile = join(cwd, 'credentials.json');
+    await writeFile(
+      credentialsFile,
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: 'synthetic-seat-marker',
+          expiresAt: Date.now() + 60_000,
+        },
+      })
+    );
+    const previousPath = process.env.FUELGLASS_CLAUDE_CREDENTIALS_FILE;
+    const previousFetch = globalThis.fetch;
+    let networkCalls = 0;
+    process.env.FUELGLASS_CLAUDE_CREDENTIALS_FILE = credentialsFile;
+    globalThis.fetch = (async () => {
+      networkCalls += 1;
+      return Response.json({ seven_day: { utilization: 99, resets_at: '2030-01-01T00:00:00Z' } });
+    }) as typeof fetch;
+    try {
+      const result = await executeWorkflow(
+        makeDeps(),
+        makePlatform(),
+        'conv-1',
+        cwd,
+        makeWorkflow(),
+        'fixture',
+        'db-conv-1'
+      );
+      expect(networkCalls).toBe(0);
+      expect(result.success).toBe(true);
+      expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousPath === undefined) delete process.env.FUELGLASS_CLAUDE_CREDENTIALS_FILE;
+      else process.env.FUELGLASS_CLAUDE_CREDENTIALS_FILE = previousPath;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  describe('binding-v2 common execution closed gate', () => {
+    const reserved = 'bdc-feature-development-codex-only';
+    const markers = [
+      null,
+      undefined,
+      false,
+      'corrupt',
+      { version: 'codex-only-v1' },
+      { version: 'codex-only-v2' },
+    ];
+
+    function expectNoExecution(deps: WorkflowDeps, store: IWorkflowStore): void {
+      expect(deps.getAgentProvider).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+      expect(store.getCompletedDagNodeOutputs).not.toHaveBeenCalled();
+      expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+      expect(store.updateWorkflowRun).not.toHaveBeenCalled();
+      expect(store.failWorkflowRun).not.toHaveBeenCalled();
+      expect(store.createWorkflowEvent).not.toHaveBeenCalled();
+      expect(mockEmitter.registerRun).not.toHaveBeenCalled();
+    }
+
+    function entryDeps(store: IWorkflowStore): WorkflowDeps {
+      const deps = makeDeps(store);
+      deps.loadConfig = mock(async (): Promise<WorkflowConfig> => {
+        throw new Error('closed gate must precede config');
+      });
+      return deps;
+    }
+
+    it('refuses the actual reserved definition before config or store access', async () => {
+      const store = makeStore();
+      const deps = entryDeps(store);
+      const platform = makePlatform();
+      const result = await executeWorkflow(
+        deps,
+        platform,
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ name: reserved }),
+        '/workflow run operator-alias',
+        'db-conv-1',
+        'codebase-id'
+      );
+      expect(result).toEqual({ success: false, error: 'codex_only_binding_required' });
+      expect(deps.loadConfig).not.toHaveBeenCalled();
+      expect(store.getCodebaseEnvVars).not.toHaveBeenCalled();
+      expect(store.findResumableRun).not.toHaveBeenCalled();
+      expect(platform.sendMessage).not.toHaveBeenCalled();
+      expectNoExecution(deps, store);
+    });
+
+    it.each(markers)(
+      'refuses a precreated provider wait with marker %j without activation',
+      async marker => {
+        const run = makeRun({
+          id: 'restricted-wait',
+          status: 'waiting_provider',
+          metadata: { codex_only_dispatch: marker },
+        });
+        const before = structuredClone(run);
+        const store = makeStore();
+        const deps = entryDeps(store);
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow(),
+          'resume',
+          'db-conv-1',
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          run
+        );
+        expect(result).toEqual({ success: false, error: 'codex_only_resume_unsupported' });
+        expect(deps.loadConfig).not.toHaveBeenCalled();
+        expect(store.findResumableRun).not.toHaveBeenCalled();
+        expectNoExecution(deps, store);
+        expect(run).toEqual(before);
+      }
+    );
+
+    it('refuses a named restricted precreated run whose marker is missing', async () => {
+      const run = makeRun({ workflow_name: reserved, status: 'paused', metadata: {} });
+      const before = structuredClone(run);
+      const store = makeStore();
+      const deps = entryDeps(store);
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ name: reserved }),
+        'resume',
+        'db-conv-1',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        run
+      );
+      expect(result).toEqual({ success: false, error: 'codex_only_resume_unsupported' });
+      expect(deps.loadConfig).not.toHaveBeenCalled();
+      expectNoExecution(deps, store);
+      expect(run).toEqual(before);
+    });
+
+    it.each(markers)(
+      'refuses a looked-up restricted run with marker %j before outputs or replacement',
+      async marker => {
+        const run = makeRun({
+          id: 'restricted-prior',
+          status: 'failed',
+          metadata: { codex_only_dispatch: marker, approval: { type: 'interactive_loop' } },
+        });
+        const before = structuredClone(run);
+        const store = makeStore({
+          findResumableRun: mock(async () => run),
+          getCompletedDagNodeOutputs: mock(async (): Promise<Map<string, string>> => {
+            throw new Error('must not degrade restricted output failure into a fresh run');
+          }),
+        });
+        const deps = makeDeps(store);
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow(),
+          'generic resume',
+          'db-conv-1'
+        );
+        expect(result).toEqual({ success: false, error: 'codex_only_resume_unsupported' });
+        expect(store.findResumableRun).toHaveBeenCalledTimes(1);
+        expectNoExecution(deps, store);
+        expect(run).toEqual(before);
+      }
+    );
+
+    it('does not cancel an ordinary pending claim when a restricted named prior run is found', async () => {
+      const prior = makeRun({ id: 'restricted-prior', workflow_name: reserved, status: 'failed' });
+      const claim = makeRun({ id: 'ordinary-claim', status: 'pending' });
+      const snapshots = structuredClone([prior, claim]);
+      const store = makeStore({ findResumableRun: mock(async () => prior) });
+      const deps = makeDeps(store);
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'generic resume',
+        'db-conv-1',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        claim
+      );
+      expect(result).toEqual({ success: false, error: 'codex_only_resume_unsupported' });
+      expectNoExecution(deps, store);
+      expect([prior, claim]).toEqual(snapshots);
+    });
+
+    it('preserves ordinary execution and model selection without a restriction marker', async () => {
+      const store = makeStore();
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ provider: 'codex', model: 'gpt-5.6-sol' }),
+        'ordinary',
+        'db-conv-1'
+      );
+      expect(result.workflowRunId).toBe('run-123');
+      expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('gpt-5.6-sol');
+    });
   });
 
   // -------------------------------------------------------------------------

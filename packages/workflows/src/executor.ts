@@ -509,6 +509,17 @@ export async function resolveExecutorLane(opts: {
   return undefined;
 }
 
+const CODEX_ONLY_WORKFLOW_NAME = 'bdc-feature-development-codex-only';
+
+function isCodexOnlyRun(run: WorkflowRun | null | undefined): boolean {
+  return (
+    run !== null &&
+    run !== undefined &&
+    (run.workflow_name === CODEX_ONLY_WORKFLOW_NAME ||
+      Object.prototype.hasOwnProperty.call(run.metadata ?? {}, 'codex_only_dispatch'))
+  );
+}
+
 /**
  * Execute a complete DAG-based workflow.
  *
@@ -547,6 +558,14 @@ export async function executeWorkflow(
   authoritySource?: RunAuthorityDispatch,
   modelOverride?: ModelOverride
 ): Promise<WorkflowExecutionResult> {
+  // Never strip a persisted restriction through a generic provider-wait/recovery entry.
+  if (isCodexOnlyRun(preCreatedRun)) {
+    return { success: false, error: 'codex_only_resume_unsupported' };
+  }
+  // Keep this reserved lane closed until full v2 binding and strict transport are enforced.
+  if (workflow.name === CODEX_ONLY_WORKFLOW_NAME) {
+    return { success: false, error: 'codex_only_binding_required' };
+  }
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
   const dbEnvVars = codebaseId ? await deps.store.getCodebaseEnvVars(codebaseId) : {};
@@ -620,6 +639,11 @@ export async function executeWorkflow(
         conversationId,
         '! Could not check for a prior run to resume (database error). Starting a fresh run instead.'
       );
+    }
+
+    // Presence, including malformed/unknown markers, refuses before output/activation fallback.
+    if (isCodexOnlyRun(resumableRun)) {
+      return { success: false, error: 'codex_only_resume_unsupported' };
     }
 
     // Step 2: Activate the resume -- propagate as error if this fails
