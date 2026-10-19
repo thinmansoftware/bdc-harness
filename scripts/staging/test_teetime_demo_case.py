@@ -11,6 +11,29 @@ from teetime_demo_case import prepare_demo_base, parse_demo_artifact, MODEL_PATH
 
 
 class DemoCaseTests(unittest.TestCase):
+    def test_builder_prompt_binds_complete_contract_and_readonly_assets(self):
+        from teetime_demo_case import build_demo_prompt
+        prepared = self.prepare()
+        binding = {'runId': 'real-run', 'nodeId': 'implement', 'attempt': 1,
+                   'authorityHash': 'sha256:' + 'a' * 64, 'policyHash': 'sha256:' + 'b' * 64,
+                   'baseManifestHash': prepared.manifest_hash}
+        contract = b'Complete reviewed UI contract.\n'
+        prompt = build_demo_prompt(prepared=prepared, binding=binding,
+                                  ui_contract=contract, ui_contract_hash=hashlib.sha256(contract).hexdigest())
+        self.assertIn(contract.decode(), prompt)
+        self.assertIn(canonical(binding), prompt)
+        self.assertIn('walkthrough/demo.spec.ts', prompt)
+        self.assertIn('65536', prompt)
+        self.assertIn(self.original[0].sha256, prompt)
+        for file in prepared.files:
+            self.assertIn(file.content.decode(), prompt)
+        with self.assertRaises(ValueError):
+            build_demo_prompt(prepared=prepared, binding=binding, ui_contract=contract+b'changed',
+                              ui_contract_hash=hashlib.sha256(contract).hexdigest())
+        with self.assertRaises(ValueError):
+            build_demo_prompt(prepared=prepared, binding={**binding, 'baseManifestHash':'0'*64},
+                              ui_contract=contract, ui_contract_hash=hashlib.sha256(contract).hexdigest())
+
     def setUp(self):
         self.original = (SnapshotFile('README.md', '100644', b'Simulated original\n'),)
         self.tree = build_git_objects(self.original, expected_format='sha1').root_tree
