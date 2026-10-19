@@ -8,6 +8,7 @@ import {
   mockDiscoverWorkflowsWithConfig,
 } from '../test/workflow-mock-factories';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import { dispatchBindingSchema } from '@archon/workflows/reliability/dispatch-binding';
 
 // The operator-token gate in registerApiRoutes() activates whenever
 // ARCHON_OPERATOR_TOKEN is set. Clear it at module level so these tests run
@@ -117,6 +118,139 @@ const MOCK_CONV = {
   deleted_at: null,
   codebase_id: null,
 };
+
+describe('binding-v2 shared DTO foundation', () => {
+  const binding = {
+    version: 'codex-only-v2',
+    project: 'shopops',
+    codebaseId: 'owned-codebase-id',
+    codebaseName: 'shopops',
+    defaultCwd: '/work/shopops',
+    workflowName: 'bdc-feature-development-codex-only',
+    workflowSha256: 'a'.repeat(64),
+  };
+
+  test('accepts the exact v2 comparison fields without changing identity', () => {
+    expect(dispatchBindingSchema.parse(binding)).toEqual(binding);
+    const reversed = Object.fromEntries(Object.entries(binding).reverse());
+    expect(JSON.stringify(dispatchBindingSchema.parse(reversed))).toBe(JSON.stringify(binding));
+    expect(Object.keys(reversed)[0]).toBe('workflowSha256');
+  });
+
+  test('requires every comparison field and string value', () => {
+    for (const field of Object.keys(binding)) {
+      const missing: Record<string, unknown> = { ...binding };
+      delete missing[field];
+      expect(dispatchBindingSchema.safeParse(missing).success).toBe(false);
+      expect(dispatchBindingSchema.safeParse({ ...binding, [field]: null }).success).toBe(false);
+      expect(dispatchBindingSchema.safeParse({ ...binding, [field]: 7 }).success).toBe(false);
+    }
+    for (const invalid of [null, [], 'binding', 7]) {
+      expect(dispatchBindingSchema.safeParse(invalid).success).toBe(false);
+    }
+  });
+
+  test('rejects unknown fields instead of dropping authority or model inputs', () => {
+    for (const field of ['model', 'provider', 'workflow', 'token', 'unexpected']) {
+      expect(dispatchBindingSchema.safeParse({ ...binding, [field]: 'extra' }).success).toBe(false);
+    }
+  });
+
+  test('requires the exact protocol version and reserved workflow', () => {
+    for (const version of ['codex-only-v1', 'codex-only-v3', 'CODEX-ONLY-V2', 'codex-only-v2 ']) {
+      expect(dispatchBindingSchema.safeParse({ ...binding, version }).success).toBe(false);
+    }
+    for (const workflowName of [
+      'default',
+      'codex',
+      '/workflow run bdc-feature-development-codex-only',
+    ]) {
+      expect(dispatchBindingSchema.safeParse({ ...binding, workflowName }).success).toBe(false);
+    }
+  });
+
+  test('accepts only a lowercase full SHA256 digest', () => {
+    for (const workflowSha256 of [
+      '',
+      'a'.repeat(63),
+      'a'.repeat(65),
+      'A'.repeat(64),
+      'g'.repeat(64),
+    ]) {
+      expect(dispatchBindingSchema.safeParse({ ...binding, workflowSha256 }).success).toBe(false);
+    }
+  });
+
+  test('enforces exact identity limits without trimming or truncating', () => {
+    for (const [field, maximum] of [
+      ['project', 512],
+      ['codebaseId', 128],
+      ['codebaseName', 512],
+    ] as const) {
+      const value = 'x'.repeat(maximum);
+      expect(dispatchBindingSchema.parse({ ...binding, [field]: value })[field]).toBe(value);
+      expect(dispatchBindingSchema.safeParse({ ...binding, [field]: value + 'x' }).success).toBe(
+        false
+      );
+      expect(dispatchBindingSchema.safeParse({ ...binding, [field]: '' }).success).toBe(false);
+    }
+    const defaultCwd = '/' + 'x'.repeat(4095);
+    expect(dispatchBindingSchema.parse({ ...binding, defaultCwd }).defaultCwd).toBe(defaultCwd);
+    expect(
+      dispatchBindingSchema.safeParse({ ...binding, defaultCwd: defaultCwd + 'x' }).success
+    ).toBe(false);
+    const literal = { ...binding, project: ' ShopOps ', defaultCwd: '/work/../shopops/' };
+    expect(dispatchBindingSchema.parse(literal)).toEqual(literal);
+  });
+
+  test('rejects C0, DEL and C1 controls in identity fields and cwd', () => {
+    for (const field of ['project', 'codebaseId', 'codebaseName', 'defaultCwd'] as const) {
+      for (const control of ['\u0000', '\n', '\u007f', '\u0085']) {
+        expect(
+          dispatchBindingSchema.safeParse({ ...binding, [field]: binding[field] + control }).success
+        ).toBe(false);
+      }
+    }
+  });
+
+  test('retains existing cross-platform lexical absolute-path semantics', () => {
+    // Matching the preflight predicate is not proof of filesystem ownership or accessibility.
+    for (const defaultCwd of [
+      '/work/shopops',
+      'C:\\work\\shopops',
+      'C:/work/shopops',
+      '\\\\host\\share\\shopops',
+      '\\shopops',
+    ]) {
+      expect(dispatchBindingSchema.parse({ ...binding, defaultCwd }).defaultCwd).toBe(defaultCwd);
+    }
+    for (const defaultCwd of ['', 'shopops', '../shopops', 'C:shopops']) {
+      expect(dispatchBindingSchema.safeParse({ ...binding, defaultCwd }).success).toBe(false);
+    }
+  });
+
+  test('keeps unenforced v2 requests closed at the actual atomic API', async () => {
+    const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+    const adapter = { setConversationDbId: mock(() => {}) } as unknown as WebAdapter;
+    registerApiRoutes(app, adapter, {} as ConversationLockManager);
+    const beforeCreate = mockGetOrCreateConversation.mock.calls.length;
+    const beforeMessage = mockAddMessage.mock.calls.length;
+    const beforeDispatch = mockHandleMessage.mock.calls.length;
+    const response = await app.request('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        codebaseId: binding.codebaseId,
+        message: '/workflow run ' + binding.workflowName,
+        dispatchBinding: binding,
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect(mockGetOrCreateConversation.mock.calls.length).toBe(beforeCreate);
+    expect(mockAddMessage.mock.calls.length).toBe(beforeMessage);
+    expect(mockHandleMessage.mock.calls.length).toBe(beforeDispatch);
+  });
+});
 
 describe('GET /api/conversations/:id', () => {
   test('returns conversation JSON by platform conversation ID', async () => {
