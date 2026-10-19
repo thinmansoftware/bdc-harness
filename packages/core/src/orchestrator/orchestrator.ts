@@ -289,6 +289,14 @@ export async function dispatchBackgroundWorkflow(
     prBranch?: string;
   }
 ): Promise<void> {
+  if (workflow.name === 'bdc-feature-development-codex-only') {
+    await ctx.platform.sendMessage(
+      ctx.conversationId,
+      'Codex-only dispatch is not available yet; no background worker was started.'
+    );
+    return;
+  }
+
   const frozenSpecSource = workflow.run_authority?.required
     ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
     : undefined;

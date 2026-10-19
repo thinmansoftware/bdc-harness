@@ -100,12 +100,13 @@ mock.module('@archon/isolation', () => ({
   getIsolationProvider: mock(() => ({})),
 }));
 
+const mockCreateWorkflowDeps = mock(() => ({
+  store: { createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })) },
+  getAgentProvider: () => ({}),
+  loadConfig: async () => ({}),
+}));
 mock.module('../workflows/store-adapter', () => ({
-  createWorkflowDeps: mock(() => ({
-    store: { createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })) },
-    getAgentProvider: () => ({}),
-    loadConfig: async () => ({}),
-  })),
+  createWorkflowDeps: mockCreateWorkflowDeps,
 }));
 
 mock.module('../config/config-loader', () => ({
@@ -119,10 +120,11 @@ mock.module('../services/cleanup-service', () => ({
   STALE_THRESHOLD_DAYS: 7,
 }));
 
+const mockExecuteWorkflow = mock(() =>
+  Promise.resolve({ success: true, summary: '', workflowRunId: 'run-1' })
+);
 mock.module('@archon/workflows/executor', () => ({
-  executeWorkflow: mock(() =>
-    Promise.resolve({ success: true, summary: '', workflowRunId: 'run-1' })
-  ),
+  executeWorkflow: mockExecuteWorkflow,
 }));
 
 // Dynamic imports inside dispatchBackgroundWorkflow (escalation linker).
@@ -180,6 +182,8 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
     mockUpdateConversation.mockClear();
     mockFreeze.mockClear();
     mockGetCodebase.mockClear();
+    mockCreateWorkflowDeps.mockClear();
+    mockExecuteWorkflow.mockClear();
     mockResolve.mockImplementation((_input: unknown) => {
       callOrder.push('resolve');
       return Promise.resolve({ status: 'none' as const, cwd: '/workspace/worker' });
@@ -188,6 +192,76 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
     mockFreeze.mockImplementation(() => {
       callOrder.push('freeze');
       return Promise.resolve({ frozen: true });
+    });
+  });
+
+  describe('binding-v2 background closed gate', () => {
+    const reserved = 'bdc-feature-development-codex-only';
+    const refusal = 'Codex-only dispatch is not available yet; no background worker was started.';
+
+    function expectNoWorkerDispatch(): void {
+      expect(mockFreeze).not.toHaveBeenCalled();
+      expect(mockGetOrCreateConversation).not.toHaveBeenCalled();
+      expect(mockUpdateConversation).not.toHaveBeenCalled();
+      expect(mockGetCodebase).not.toHaveBeenCalled();
+      expect(mockResolve).not.toHaveBeenCalled();
+      expect(mockCreateWorkflowDeps).not.toHaveBeenCalled();
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+      expect(callOrder).toEqual([]);
+    }
+
+    test.each([false, true])(
+      'refuses the actual reserved definition before authority and worker work (required=%s)',
+      async required => {
+        const ctx = makeCtx({ originalMessage: '/workflow run operator-alias' });
+        const workflow = makeWorkflow({
+          name: reserved,
+          run_authority: {
+            required,
+            spec_repository: 'owner/repo',
+            spec_revision: 'abc123',
+            spec_paths: ['docs/x.md'],
+          },
+        } as Partial<WorkflowDefinition>);
+
+        await dispatchBackgroundWorkflow(ctx as never, workflow);
+
+        expect(ctx.platform.sendMessage).toHaveBeenCalledTimes(1);
+        expect(ctx.platform.sendMessage).toHaveBeenCalledWith('parent-platform-conv', refusal);
+        expectNoWorkerDispatch();
+      }
+    );
+
+    test('refuses before worker work even without a codebase', async () => {
+      const ctx = makeCtx({ codebaseId: undefined });
+
+      await dispatchBackgroundWorkflow(ctx as never, makeWorkflow({ name: reserved }));
+
+      expect(ctx.platform.sendMessage).toHaveBeenCalledWith('parent-platform-conv', refusal);
+      expectNoWorkerDispatch();
+    });
+
+    test('notification failure cannot fall through to worker dispatch', async () => {
+      const ctx = makeCtx();
+      ctx.platform.sendMessage.mockRejectedValueOnce(new Error('notification unavailable'));
+
+      await expect(
+        dispatchBackgroundWorkflow(ctx as never, makeWorkflow({ name: reserved }))
+      ).rejects.toThrow('notification unavailable');
+
+      expect(ctx.platform.sendMessage).toHaveBeenCalledTimes(1);
+      expectNoWorkerDispatch();
+    });
+
+    test('ordinary definitions are not restricted by command text', async () => {
+      const ctx = makeCtx({ originalMessage: `/workflow run ${reserved}` });
+
+      await dispatchBackgroundWorkflow(ctx as never, makeWorkflow());
+
+      expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(1);
+      expect(mockResolve).toHaveBeenCalledTimes(1);
+      expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+      expect(ctx.platform.sendMessage).not.toHaveBeenCalledWith('parent-platform-conv', refusal);
     });
   });
 
