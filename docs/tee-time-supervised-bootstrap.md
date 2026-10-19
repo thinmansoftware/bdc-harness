@@ -1,5 +1,34 @@
 # Tee-time supervised bootstrap source preparation
 
+## Unregistered minimal diagnostic worker source
+
+teetime_minimal_worker.py and teetime_minimal_worker_result.py define a separate
+worker receipt, not an artifact result. Existing controller selectors do not
+call them. A future admitted image could invoke the worker with fixed --nonce
+and --source arguments only after source custody, READY and account-delivery
+gates. This source does not establish those gates or authorize invocation.
+
+The worker reuses unchanged preflight, fixed environment, bounded process-group
+capture, workspace snapshot and OOM observation from teetime_canary_worker.py.
+It validates syntax/image-source/UID/cwd before auth reads, checks all6 preflights
+and unchanged auth/workspace before one capture of the fixed-response entry.
+Child timeout100s is independent of the cooperative query timer90s; the future
+outer container still needs a deadline and owned-resource removal.
+
+taskStarted means capture attempted, not proof of child/model startup. A capture
+exception does not claim reaping. A returned abnormal child exit can establish
+reaping while exposing null taskExitCode/taskReceipt. Missing/malformed receipt
+leaves invocation count unknown. An independently validated failed child receipt
+stays failed. Final cleanup/OOM uncertainty overrides task success but preserves
+already validated diagnostic evidence. No private auth hash or raw errors leave
+the worker; identity fields are source/nonce only. It cannot accept app source.
+
+Offline check: `python -m unittest discover -s scripts/staging -p test_teetime_minimal_worker.py`.
+Synthetic metadata normalization is test-only. No worker/controller selector,
+image, account delivery, claim or real diagnostic is registered by these files.
+Actual-script invalid-argument subprocess tests use a synthetic auth-access trap;
+unknown/missing/help arguments exit1 with empty stdout/stderr before auth access.
+
 ## Unregistered fixed-response diagnostic entry source
 
 teetime-minimal-diagnostic-entry.ts is not registered in any worker/controller
