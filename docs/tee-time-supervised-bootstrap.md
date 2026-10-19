@@ -50,6 +50,24 @@ controller must additionally bound this whole observation process and its reap.
 
 `python -B -m unittest discover -s scripts/staging -p test_teetime_successor_observation.py`
 
+observe_minimal_plan in scripts/staging/teetime_plan_observation.py reads only
+the actual private PR3392 head, fixed minimal-diagnostic-admission.json carrier,
+complete bounded review pages and app staging ref. It binds the local diagnostic
+packet and complete external inventory byte hashes to the canonical reviewed
+carrier and recomputed admission hash. The remote verifier must still measure
+all installed files. This read-only observer never submits or grants approval.
+readMinimalPlanObservation in scripts/staging/teetime-plan-observation.ts checks
+the resulting distinct 32768-byte canonical ASCII packet, invocation nonce,
+source/inventory/operator/admission hashes and sixty-second freshness. The shared
+phase review validator remains responsible for independent actionable chronology.
+The original product observer/parser retains its packet and bounds.
+
+`python -B -m unittest discover -s scripts/staging -p test_teetime_minimal_plan_observation.py`
+
+`python -B -m unittest discover -s scripts/staging -p test_teetime_plan_observation.py`
+
+`bun test ./scripts/staging/teetime-plan-observation.test.ts`
+
 ## Source-only diagnostic claim and shared review primitives
 
 claimSupervisedDiagnosticPhase in packages/workflows/src/reliability/

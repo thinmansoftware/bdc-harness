@@ -12,10 +12,26 @@ export interface ObservationBinding {
   reviewHead: string;
 }
 
-export function readPlanObservation(
+export interface MinimalObservationBinding extends ObservationBinding {
+  admissionHash: string;
+  installedManifestHash: string;
+  sourceSha: string;
+  operatorInputHash: string;
+}
+
+export function readPlanObservation(raw:Buffer, expected:ObservationBinding, nowMs:number) {
+  return readObservation(raw,expected,nowMs);
+}
+
+export function readMinimalPlanObservation(raw:Buffer, expected:MinimalObservationBinding, nowMs:number) {
+  return readObservation(raw,expected,nowMs,expected);
+}
+
+function readObservation(
   raw: Buffer,
   expected: ObservationBinding,
-  nowMs: number
+  nowMs: number,
+  minimal?: MinimalObservationBinding
 ): {
   observationHash: string;
   expiresAtMs: number;
@@ -24,7 +40,7 @@ export function readPlanObservation(
   if (
     !Buffer.isBuffer(raw) ||
     !raw.length ||
-    raw.length > 65536 ||
+    raw.length > (minimal ? 32768 : 65536) ||
     raw.some(byte => byte > 127) ||
     !Number.isSafeInteger(nowMs)
   )
@@ -46,6 +62,7 @@ export function readPlanObservation(
     'packagePath',
     'review',
   ];
+  if(minimal)keys.push('admissionHash','installedManifestHash','sourceSha','operatorInputHash');
   if (
     !value ||
     typeof value !== 'object' ||
@@ -56,11 +73,11 @@ export function readPlanObservation(
     throw new Error('closed observation packet required');
   if (
     value.version !== 1 ||
-    value.kind !== 'tee-time-plan-observation' ||
+    value.kind !== (minimal ? 'tee-time-minimal-plan-observation' : 'tee-time-plan-observation') ||
     value.remote !== 'bdc-server' ||
     value.repository !== 'thinmansoftware/bdc-xo' ||
     value.pullRequest !== 3392 ||
-    value.packagePath !== 'docs/tee-time/supervised-demo-execution.json' ||
+    value.packagePath !== (minimal ? 'docs/tee-time/minimal-diagnostic-admission.json' : 'docs/tee-time/supervised-demo-execution.json') ||
     value.nonce !== expected.nonce ||
     value.remoteStagingSha !== expected.baseSha ||
     !/^[a-f0-9]{40}$/.test(expected.baseSha) ||
@@ -73,6 +90,12 @@ export function readPlanObservation(
     !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(expected.runId)
   )
     throw new Error('observation invocation binding differs');
+  if(minimal && (!/^[a-f0-9]{32}$/.test(expected.runId) ||
+      ![minimal.admissionHash,minimal.installedManifestHash].every(v=>/^sha256:[a-f0-9]{64}$/.test(v)) ||
+      !/^[a-f0-9]{40}$/.test(minimal.sourceSha) || !/^[a-f0-9]{64}$/.test(minimal.operatorInputHash) ||
+      ['admissionHash','installedManifestHash','sourceSha','operatorInputHash'].some(key=>
+        value[key]!==minimal[key as keyof MinimalObservationBinding])))
+    throw new Error('minimal observation inventory or admission differs');
   if (
     !Number.isSafeInteger(value.observedAtMs) ||
     !Number.isSafeInteger(value.expiresAtMs) ||

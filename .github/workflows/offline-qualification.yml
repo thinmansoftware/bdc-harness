@@ -77,6 +77,7 @@ jobs:
           bun test ./scripts/staging/teetime-minimal-diagnostic-runner.test.ts
           python3 -m unittest discover -s scripts/staging -p test_teetime_demo_execution.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_plan_observation.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_plan_observation.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_demo_controller_check.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_operator_delivery.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_artifact_workspace.py
