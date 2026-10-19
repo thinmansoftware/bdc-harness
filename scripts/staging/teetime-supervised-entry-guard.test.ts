@@ -11,6 +11,13 @@ import {
   validatePreparationObservation,
   assertFreshSqliteLocation,
 } from './teetime-supervised-entry-guard';
+import * as guards from './teetime-supervised-entry-guard';
+
+test('operational runtime remains Windows Bun1.3.13 even when CI uses another runner',()=>{
+  expect(()=>guards.assertPrepareRuntime('win32','1.3.13')).not.toThrow();
+  for(const [platform,version] of [['linux','1.3.13'],['win32','1.3.11'],['win32','1.3.14']])
+    expect(()=>guards.assertPrepareRuntime(platform,version)).toThrow();
+});
 
 const root = resolve(tmpdir(), 'synthetic-teetime-entry');
 const manifest = () => ({

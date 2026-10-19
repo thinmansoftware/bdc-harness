@@ -81,6 +81,7 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_plan_observation.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_demo_controller_check.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_operator_delivery.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_operator.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_artifact_workspace.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_successor_observation.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_snapshot_exporter.py

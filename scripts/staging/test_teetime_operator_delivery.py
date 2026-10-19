@@ -12,6 +12,24 @@ operator = importlib.util.module_from_spec(spec); spec.loader.exec_module(operat
 
 
 class OperatorDeliveryTests(unittest.TestCase):
+    def test_minimal_packet_reaches_only_separate_supervised_entry(self):
+        from test_teetime_minimal_execution import MinimalExecutionTests
+        fixture=MinimalExecutionTests();fixture.setUp();execution=fixture.parse()
+        args=SimpleNamespace(input_sha256='6'*64,diagnostic_package_hash=execution.package_hash,
+            source_manifest_sha256='c'*64,diagnostic_source=execution.source,plan_head='e'*40)
+        command=operator.minimal_supervised_command(execution,args,'f'*32)
+        self.assertIn('\\minimal-diagnostic-execution-harness\\scripts\\staging\\teetime-supervised-controller.ts',command)
+        self.assertIn(' --claim-minimal-diagnostic --input-sha256 ',command)
+        self.assertNotIn('run-teetime-auth-canary.py',command)
+        self.assertNotIn(' --claim-model ',command)
+        for key,bad in [('input_sha256','7'*64),('diagnostic_package_hash','0'*64),
+                ('diagnostic_source','f'*40),('plan_head',"';unexpected")]:
+            previous=getattr(args,key);setattr(args,key,bad)
+            try:
+                with self.subTest(key=key),self.assertRaises(ValueError):
+                    operator.minimal_supervised_command(execution,args,'f'*32)
+            finally:setattr(args,key,previous)
+
     def test_each_package_uses_only_its_fixed_controller_mode_and_root(self):
         from test_teetime_demo_execution import DemoExecutionTests
         f=DemoExecutionTests();f.setUp();first=f.parse()

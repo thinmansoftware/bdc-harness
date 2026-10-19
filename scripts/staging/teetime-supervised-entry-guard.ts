@@ -3,6 +3,10 @@ import { lstat, readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 
+export function assertPrepareRuntime(platform:string,bunVersion:string):void {
+  if(platform!=='win32'||bunVersion!=='1.3.13')throw new Error('fixed Windows staging runtime required');
+}
+
 export interface PreparedEntryManifest {
   version: 1;
   kind: 'tee-time-supervised-prepare';

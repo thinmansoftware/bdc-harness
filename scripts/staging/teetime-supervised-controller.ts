@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   assertPrepareEnvironment,
+  assertPrepareRuntime,
   frozenEntryFile,
   ordinaryDirectory,
   validatePrepareManifest,
@@ -82,13 +83,12 @@ export async function prepare(): Promise<Record<string, unknown>> {
   const diagnosticDeadline = minimal ? performance.now() + 420000 : undefined;
   // No database consumer has been imported above this boundary.
   assertPrepareEnvironment(ROOT, join(homedir(), 'teetime-supervised-01'), process.env);
+  assertPrepareRuntime(process.platform,Bun.version);
   const fourth = process.argv[2] === '--claim-transport-repair';
   const third = process.argv[2] === '--claim-diagnostic-successor';
   const successor = process.argv[2] === '--claim-successor';
   const claim = minimal || fourth || third || successor || process.argv[2] === '--claim-model';
   if (
-    process.platform !== 'win32' ||
-    Bun.version !== '1.3.13' ||
     SOURCE !== join(ROOT, minimal ? 'minimal-diagnostic-execution-harness' : fourth ? 'transport-repair-execution-harness' : third ? 'diagnostic-execution-harness' : successor ? 'successor-execution-harness' : claim ? 'execution-harness' : 'harness') ||
     process.argv.length !== (claim ? 15 : 5) ||
     (!claim && process.argv[2] !== '--prepare') ||

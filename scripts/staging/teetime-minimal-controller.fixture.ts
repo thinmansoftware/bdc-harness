@@ -63,10 +63,10 @@ const inputReader={read:()=>underlying.read(),cancel:async()=>{
   if(scenario==='cancel-repeat-reject'&&cancelCalls>1)throw new Error('synthetic repeated cancellation rejection');
   if(scenario==='cancel-hang')return new Promise<void>(()=>{});
 }};
+const nativeBunVersion=Bun.version;
 const runtime=Bun as unknown as {stdin:unknown;file:unknown;spawn:unknown};
 runtime.stdin={stream:()=>({getReader:()=>inputReader})};
 runtime.file=(_name:Parameters<typeof Bun.file>[0])=>({arrayBuffer:async()=>Buffer.from('pinned').buffer});
-Object.defineProperty(process,'platform',{value:'win32'});
 globalThis.setTimeout=((fn:()=>void,ms?:number,...args:unknown[])=>realTimer(fn,
   [3000,5000,15000].includes(ms??0)?25:ms,...args)) as typeof setTimeout;
 process.stdout.write=((chunk:Uint8Array|string,...args:unknown[])=>{
@@ -95,6 +95,7 @@ mock.module('node:fs/promises',()=>({...fs,
 const sourceCase={version:1,kind:'teetime-supervised-demo-source-contract',repository:'thinmansoftware/whats-that-tee-time',
   woId:'WO-TEETIME-SIMULATED-WALKTHROUGH-01',workflow:'bdc-teetime-supervised-walkthrough',executionAdmitted:false,preparedAssets:{}};
 mock.module(join(worktree,'scripts/staging/teetime-supervised-entry-guard.ts'),()=>({
+  assertPrepareRuntime:()=>{events.push('mocked-runtime-preflight');},
   assertPrepareEnvironment:()=>{},ordinaryDirectory:async()=>{},assertFreshSqliteLocation:async()=>{throw new Error('fresh DB forbidden');},
   validatePrepareManifest:()=>input,validatePreparationObservation:(v:unknown)=>v,
   frozenEntryFile:async(name:string)=>{
@@ -163,7 +164,8 @@ try {await (await import('./teetime-supervised-controller')).prepare();}
 catch(error){failure=error;process.exitCode=1;}
 finally {
   runtime.file=realBunFile;
-  await fs.writeFile(join(home,'audit.json'),JSON.stringify({events,records,unchanged:records.slice(0,4).map(supervisedAttemptHash).every((v,i)=>v===original[i]),
+  await fs.writeFile(join(home,'audit.json'),JSON.stringify({events,records,nativeBunVersion,
+    unchanged:records.slice(0,4).map(supervisedAttemptHash).every((v,i)=>v===original[i]),
     run,lockRetained:existsSync(join(control,'controller.lock')),claimRetained:existsSync(join(control,'diagnostic.claim.json')),
     failure:failure instanceof Error?{name:failure.name,message:failure.message,stack:failure.stack}:null}));
 }

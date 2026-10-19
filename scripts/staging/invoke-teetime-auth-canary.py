@@ -15,10 +15,19 @@ from teetime_auth_receiver import validate_payload
 from teetime_canary_protocol import encode_frame
 
 
-def deliver_observation(child, raw, timeout=15):
+def deliver_observation(child, raw, timeout=15, *, deadline=None, _writers=None):
     """Bounded pre-auth write. Failure kills/reaps only the owned SSH child."""
-    if type(raw) is not bytes or not 1 <= len(raw) <= 65537:
+    return _deliver_input(child,raw,timeout,65537,deadline,_writers)
+
+
+def _deliver_input(child, raw, timeout, maximum, deadline=None, writers=None):
+    if type(raw) is not bytes or not 1 <= len(raw) <= maximum:
         raise ValueError('bounded observation delivery required')
+    def remaining(limit):
+        if deadline is None:return limit
+        value=deadline-time.monotonic()
+        if value<=0:raise TimeoutError('operator outer deadline')
+        return min(limit,value)
     result = queue.Queue(maxsize=1)
     def write():
         try:
@@ -28,20 +37,39 @@ def deliver_observation(child, raw, timeout=15):
         except (BrokenPipeError, OSError):
             result.put(False)
     writer = threading.Thread(target=write, daemon=True)
-    writer.start()
+    if writers is not None:writers.append(writer)
     try:
-        if result.get(timeout=timeout) is not True:
+        writer.start()
+        if result.get(timeout=remaining(timeout)) is not True:
             raise ValueError('observation delivery failed')
-        writer.join(timeout=3)
+        writer.join(timeout=remaining(3))
         if writer.is_alive():
             raise ValueError('observation writer did not stop')
     except BaseException:
-        if child.poll() is None:
-            child.kill(); child.wait(timeout=5)
-        writer.join(timeout=3)
-        if writer.is_alive():
+        # One failed/expired reap must not skip writer settlement. At an expired
+        # outer deadline, zero-time polls/joins still record the uncertainty.
+        def cleanup_remaining(limit):
+            return limit if deadline is None else max(0,min(limit,deadline-time.monotonic()))
+        uncertain=False
+        try:
+            if child.poll() is None:child.kill()
+        except BaseException:uncertain=True
+        try:child.wait(timeout=cleanup_remaining(5))
+        except BaseException:uncertain=True
+        try:
+            if writer.ident is not None:writer.join(timeout=cleanup_remaining(3))
+            if writer.is_alive():uncertain=True
+        except BaseException:uncertain=True
+        if uncertain:
             raise ValueError('observation delivery cleanup uncertain') from None
         raise
+
+
+def deliver_credential_frame(child,raw,timeout=15,*,deadline,_writers=None):
+    if (type(raw) is not bytes or not 5<=len(raw)<=65540
+            or int.from_bytes(raw[:4],'big')!=len(raw)-4):
+        raise ValueError('single bounded credential frame required')
+    return _deliver_input(child,raw,timeout,65540,deadline,_writers)
 
 
 def supervised_command(execution, args, nonce):
@@ -58,6 +86,167 @@ def supervised_command(execution, args, nonce):
     return command
 
 
+def minimal_supervised_command(execution, args, nonce):
+    """Fixed supervised entry only; matching bytes alone never grant execution."""
+    from teetime_minimal_execution import MinimalExecution
+    if type(execution) is not MinimalExecution:
+        raise ValueError('separate minimal execution required')
+    for value,size in [(nonce,32),(args.input_sha256,64),(args.diagnostic_package_hash,64),
+            (args.source_manifest_sha256,64),(args.diagnostic_source,40),(args.plan_head,40)]:
+        if type(value) is not str or re.fullmatch('[a-f0-9]{'+str(size)+'}',value) is None:
+            raise ValueError('closed minimal command identities required')
+    if (args.input_sha256!=execution.operator_input_hash or args.diagnostic_package_hash!=execution.package_hash
+            or args.diagnostic_source!=execution.source):
+        raise ValueError('minimal command packet differs')
+    return (r'''$ErrorActionPreference='Stop'; & "$env:USERPROFILE\.bun\bin\bun.exe" --no-env-file "$env:USERPROFILE\teetime-supervised-01\minimal-diagnostic-execution-harness\scripts\staging\teetime-supervised-controller.ts" --claim-minimal-diagnostic --input-sha256 '''
+        +"'"+args.input_sha256+"' --execution-sha256 '"+args.diagnostic_package_hash
+        +"' --source-manifest-sha256 '"+args.source_manifest_sha256+"' --source-sha '"+args.diagnostic_source
+        +"' --review-head '"+args.plan_head+"' --nonce '"+nonce+"'")
+
+
+MINIMAL_OUTER_SECONDS=450
+MINIMAL_TRANSPORT_SECONDS=420
+
+
+def run_minimal_operator(args,root):
+    from teetime_minimal_execution import parse_minimal_execution
+    from teetime_minimal_protocol import (diagnostic_hashes,validate_diagnostic_selector,
+        validate_diagnostic_ready,validate_diagnostic_report)
+    from teetime_plan_observation import observe_minimal_plan
+    from teetime_successor_observation import frozen_file
+    from teetime_joined_fixture import strict_json
+    validate_diagnostic_selector(args.task,args.diagnostic_source,args.artifact_source,args.demo_package_hash)
+    if args.synthetic or args.disconnect_before_auth or args.frame_test:
+        raise ValueError('minimal diagnostic cannot be a credential fixture')
+    for value,size in [(args.diagnostic_package_hash,64),(args.plan_head,40),(args.input_sha256,64),
+            (args.source_manifest_sha256,64)]:
+        if type(value) is not str or re.fullmatch('[a-f0-9]{'+str(size)+'}',value) is None:
+            raise ValueError('closed minimal operator identities required')
+    source_root=Path(root).resolve().parents[1]
+    packet=frozen_file(source_root/'minimal-execution.json','sha256:'+args.diagnostic_package_hash,32768)
+    execution=parse_minimal_execution(packet,args.diagnostic_package_hash)
+    if (execution.image,execution.source,execution.base_source,execution.operator_input_hash)!=(
+            args.image,args.diagnostic_source,args.expected_sha,args.input_sha256):
+        raise ValueError('minimal operator packet differs')
+    inventory=frozen_file(source_root.parent/'minimal-diagnostic-execution-source-manifest.json',
+        'sha256:'+args.source_manifest_sha256,2*1024*1024)
+    hashes=diagnostic_hashes(root,execution.source,execution.base_source)
+    if hashes!=dict(execution.selected_hashes):raise ValueError('minimal local helpers differ')
+    nonce=uuid.uuid4().hex
+    observation=observe_minimal_plan(packet,args.diagnostic_package_hash,inventory,
+        args.source_manifest_sha256,args.plan_head,nonce)
+    command=minimal_supervised_command(execution,args,nonce)
+    encoded=base64.b64encode(command.encode('utf-16le')).decode('ascii')
+    began=time.monotonic();outer=began+MINIMAL_OUTER_SECONDS;transport=began+MINIMAL_TRANSPORT_SECONDS
+    def remaining(deadline,maximum):
+        value=deadline-time.monotonic()
+        if value<=0:raise TimeoutError('minimal operator deadline')
+        return min(value,maximum)
+    child=None;watchdog=None;reader=None;writers=[]
+    watchdog_started=False;reader_started=False
+    expired=threading.Event()
+    def expire():
+        expired.set()
+        try:
+            if child is not None and child.poll() is None:child.kill()
+        except OSError:pass
+    inbox=queue.Queue();protocol_error=object()
+    def read_output():
+        try:
+            total=0
+            while True:
+                line=child.stdout.readline(32770)
+                if not line:break
+                total+=len(line)
+                if len(line)>32769 or total>65536 or not line.endswith(b'\n') or not line.isascii():
+                    raise ValueError('minimal operator protocol bound')
+                inbox.put((line[:-1],strict_json(line)))
+        except BaseException:inbox.put(protocol_error)
+        finally:inbox.put(None)
+    original=None;auth_path=Path.home()/'.codex/auth.json';record=None;result_code=None
+    try:
+        child=subprocess.Popen(['ssh','-T','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
+            'bdc-server','powershell','-NoProfile','-EncodedCommand',encoded],
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        watchdog=threading.Timer(max(0,transport-time.monotonic()),expire);watchdog.daemon=True
+        watchdog.start();watchdog_started=True
+        reader=threading.Thread(target=read_output,daemon=True)
+        reader.start();reader_started=True
+        deliver_observation(child,observation+b'\n',timeout=remaining(transport,15),deadline=outer,_writers=writers)
+        del observation
+        first=inbox.get(timeout=remaining(transport,120))
+        if type(first) is not tuple:raise ValueError('minimal READY missing')
+        _,ready=first
+        validate_diagnostic_ready(ready,nonce=nonce,image=execution.image,base_source=execution.base_source,
+            source=execution.source,hashes=hashes)
+        # No original login read precedes this independent exact READY check.
+        remaining(transport,15)
+        if expired.is_set():raise TimeoutError('minimal transport expired before account read')
+        original=frozen_file(auth_path,limit=65536)
+        payload=validate_payload(io.BytesIO(original),time.time())
+        frame=encode_frame(payload)
+        try:deliver_credential_frame(child,frame,timeout=remaining(transport,15),deadline=outer,_writers=writers)
+        finally:del payload,frame
+        child.stdin.close()
+        final=inbox.get(timeout=remaining(transport,420))
+        if type(final) is not tuple:raise ValueError('minimal RESULT missing')
+        report_raw,_=final
+        exit_code=child.wait(timeout=remaining(transport,10))
+        if inbox.get(timeout=remaining(transport,5)) is not None:
+            raise ValueError('minimal trailing protocol data')
+        report=validate_diagnostic_report(report_raw,exit_code,ready=ready)
+        if expired.is_set():raise TimeoutError('minimal SSH deadline exceeded')
+        record={'owner':ready['owner'],'task':'minimal-diagnostic','diagnosticSourceSha':execution.source,
+            'result':report['result'],'proxyMetrics':report['proxyMetrics'],'originalAuthUnchanged':True}
+        result_code=0 if report['result']['passed'] else 1
+    finally:
+        errors=[]
+        def cleanup_remaining(limit):return max(0,min(limit,outer-time.monotonic()))
+        def attempt(action):
+            try:action()
+            except BaseException:errors.append(True)
+        try:
+            if watchdog is not None:attempt(watchdog.cancel)
+            if child is not None:
+                def kill_owned():
+                    if child.poll() is None:child.kill()
+                attempt(kill_owned)
+                attempt(lambda:child.wait(timeout=cleanup_remaining(10)))
+            writer_done=True
+            for writer in writers:
+                if writer.ident is not None:attempt(lambda w=writer:w.join(timeout=cleanup_remaining(3)))
+                if writer.is_alive():writer_done=False;errors.append(True)
+            reader_done=True
+            if reader is not None:
+                if reader_started or reader.ident is not None:attempt(lambda:reader.join(timeout=cleanup_remaining(3)))
+                if reader.is_alive():reader_done=False;errors.append(True)
+            if watchdog is not None:
+                if watchdog_started or watchdog.ident is not None:attempt(lambda:watchdog.join(timeout=cleanup_remaining(1)))
+                if watchdog.is_alive():errors.append(True)
+            if child is not None:
+                # Buffered close can acquire a writer's lock or flush to a live
+                # nonreading peer. Do neither without settled ownership proof.
+                def close_input():
+                    if child.stdin is not None and not child.stdin.closed:
+                        if not writer_done or child.poll() is None:
+                            raise ValueError('minimal input close uncertain')
+                        child.stdin.close()
+                attempt(close_input)
+                if reader_done:attempt(child.stdout.close)
+            if original is not None:
+                def original_readback():
+                    if time.monotonic()>=outer or frozen_file(auth_path,limit=65536)!=original:
+                        raise ValueError('original login equality not verified')
+                attempt(original_readback)
+            attempt(lambda:remaining(outer,1))
+        finally:
+            if original is not None:del original
+        if errors:raise ValueError('minimal operator cleanup uncertain') from None
+    if record is None or result_code is None:raise ValueError('minimal operator result absent')
+    print(json.dumps(record,sort_keys=True,separators=(',',':')))
+    return result_code
+
+
 def main():
     if not __debug__:
         raise ValueError('assertions required')
@@ -67,15 +256,20 @@ def main():
     parser.add_argument('--synthetic', action='store_true')
     parser.add_argument('--disconnect-before-auth', action='store_true')
     parser.add_argument('--frame-test', choices=['partial', 'oversized'])
-    parser.add_argument('--task', choices=['filesystem', 'artifact', 'supervised-demo'], default='filesystem')
+    parser.add_argument('--task', choices=['filesystem', 'artifact', 'supervised-demo', 'minimal-diagnostic'], default='filesystem')
     parser.add_argument('--artifact-source')
     parser.add_argument('--demo-package-hash')
     parser.add_argument('--plan-head')
     parser.add_argument('--input-sha256')
     parser.add_argument('--source-manifest-sha256')
+    parser.add_argument('--diagnostic-source')
+    parser.add_argument('--diagnostic-package-hash')
     args = parser.parse_args()
     assert re.fullmatch('sha256:[a-f0-9]{64}', args.image)
     assert re.fullmatch('[a-f0-9]{40}', args.expected_sha)
+    if args.task=='minimal-diagnostic':return run_minimal_operator(args,Path(__file__).parent)
+    if args.diagnostic_source is not None or args.diagnostic_package_hash is not None:
+        parser.error('minimal-only arguments rejected')
     nonce = uuid.uuid4().hex
     root = Path(__file__).parent
     artifact_mode = args.task in ['artifact','supervised-demo']

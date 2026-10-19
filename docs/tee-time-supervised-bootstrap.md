@@ -47,8 +47,52 @@ Docker, Python process, account, provider or operational database action.
 
 `bun x tsc --noEmit -p scripts/tsconfig.json`
 
-PC operator selection and its outer SSH deadline remain separate unfinished
-integration. Source tests/review do not authorize installation or a live canary.
+The PC source selector is documented below. Source tests/review do not authorize
+installation or a live canary.
+
+## Source-only PC minimal operator route
+
+invoke-teetime-auth-canary.py accepts a separate --task minimal-diagnostic with
+--diagnostic-source and --diagnostic-package-hash plus the existing plan-head,
+input-sha256 and source-manifest-sha256 identities. It rejects artifact/demo
+identities and synthetic/disconnect/frame-test flags in this mode. The parsed
+packet, measured selected helper hashes and external inventory bytes bind the
+live read-only GitHub observation. Only the fixed supervised minimal Bun entry
+can receive the request; there is no direct laptop authentication-controller route.
+
+The PC starts one 450-second outer budget before SSH creation and one 420-second
+transport deadline, with no reset after READY. A watchdog kills an overlong owned
+SSH child. Observation and the single credential frame use bounded fifteen-second
+delivery and writer settlement. Diagnostic protocol bounds are 32768-byte JSON
+lines and 65536 total bytes. The original local Codex login is read only after
+strict independent READY validation, remains in memory/one framed pipe only and
+must read back unchanged before public receipt emission. No auth hash is retained.
+
+All post-spawn setup is protected, including timer/reader construction and start.
+Reap, every tracked writer, reader/timer settlement and original-auth readback are
+attempted independently within the remaining outer budget. A failed reap or
+expired deadline cannot skip the other settlement checks. Buffered input is never
+closed while a writer may own its lock or the peer remains unverified live.
+Any uncertainty prevents public success. Valid failing outer receipts preserve
+their closed nested evidence and return failure. Actual exit, strict RESULT and
+EOF are required; missing, duplicate, trailing or contradictory output rejects.
+
+`python -B -m unittest discover -s scripts/staging -p test_teetime_minimal_operator.py`
+
+`python -B -m unittest discover -s scripts/staging -p test_teetime_operator_delivery.py`
+
+These tests use fake SSH, real local pipes and synthetic auth only. They cover
+invalid READY without login reads, changed auth, failed/missing reports, timeout
+reaping, maximum frame backpressure, timer/reader-start failure, expired input
+deadline and reap failure that still checks original-auth equality. No operational
+SSH, account access, model inference or provider operation occurs in the tests.
+
+CI correction: its Bun1.3.11 runner cannot satisfy the deliberately pinned
+Windows Bun1.3.13 runtime. assertPrepareRuntime in the existing entry-guard module
+preserves that exact predicate and receives actual process values in production.
+The orchestration fixture explicitly mocks this common preflight boundary and
+records that fact; direct unit tests prove the real predicate rejects Linux,
+Bun1.3.11 and Bun1.3.14. CI fixture success is not runtime qualification.
 
 ## Source-only minimal diagnostic admission caller
 

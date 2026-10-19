@@ -16,10 +16,11 @@ test(`minimal controller full mocked branch: ${scenario}`,async()=>{
     let out:string,err:string,exit:number;
     try {[out,err,exit]=await Promise.all([new Response(child.stdout).text(),new Response(child.stderr).text(),child.exited]);}
     finally {clearTimeout(timeout);}
-    const audit=JSON.parse(await readFile(join(root,'audit.json'),'utf8'));
+    const audit=JSON.parse(await readFile(join(root,'audit.json'),'utf8').catch(error=>{throw new Error(err||String(error));}));
     // Bun currently warns about an existing duplicate yaml dependency key.
     // This fixture verifies lifecycle behavior, not package-manifest cleanup.
     expect(err).not.toContain('error:');expect(audit.unchanged).toBe(true);expect(audit.run.status).toBe('paused');
+    expect(audit.events).toContain('mocked-runtime-preflight');
     expect(audit.records,audit.failure?.message).toHaveLength(5);expect(audit.claimRetained).toBe(true);
     const row=audit.records[4];expect(row.nodeId).toBe('diagnose-transport');expect(row.attemptNumber).toBe(1);expect(row.supersedesAttemptId).toBeNull();
     if(scenario==='success'||scenario==='cancel-repeat-reject'){
