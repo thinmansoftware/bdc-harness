@@ -1,5 +1,55 @@
 # Tee-time supervised bootstrap source preparation
 
+## Source-only supervised minimal entry integration
+
+teetime-supervised-controller.ts recognizes a distinct --claim-minimal-diagnostic
+mode using the existing fifteen-argument closed claim grammar. It requires the
+fixed minimal-diagnostic-execution-harness source, external
+minimal-diagnostic-execution-source-manifest.json and a fresh
+control-minimal-diagnostic-1 root. Ownership binds the independently derived
+admission hash. The original prepared source/runtime checks remain mandatory.
+Its own monotonic 420-second budget starts before common checks; observation
+delivery is bounded to fifteen seconds, and admission/launch require more than
+315 seconds remaining. This source branch is not operationally admitted yet.
+
+teetime_minimal_controller_check.py accepts only metadata, predecessor, ready or
+report plus the frozen packet hash. It independently parses minimal-execution.json,
+measures selected helper bytes and uses the separate diagnostic receipt validators.
+Its predecessor mode invokes the bounded four-history local observer. Metadata
+and receipt summaries contain no product prompt, app artifact or response text.
+Missing task evidence remains an unknown invocation count. The controller bounds
+checker output, process lifetime, stdin delivery and process/writer settlement.
+
+MinimalDiagnosticAdmissionFailure preserves the exact source-created public row
+identity if insertion or subsequent admission checks fail. The controller either
+completes that exact unchanged pending row as indeterminate or reports the closed
+persistence-unresolved failure while retaining custody. It never reconstructs a
+row from discovery. Every completion checks the complete five-row set, historical
+hashes, original paused run and prepared binding before and after the write.
+
+One shared reader-cancellation promise must settle, and the raw final receipt
+must be exclusively flushed/read back, before terminal success, ownership release
+or RESULT emission. Cleanup, retention or transport uncertainty attempts an
+indeterminate completion. Failed completion persistence/readback stays explicitly
+unresolved; it cannot become a reported success or trigger a retry.
+
+The full-path fixture mocks common entry preflight, current-state observations,
+SQLite and subprocess boundaries. It exercises the real admission, claim files,
+forwarding and lifecycle branch with synthetic five-byte input only. Its short
+timers test logical cleanup failures, not real timeout duration. It performs no
+Docker, Python process, account, provider or operational database action.
+
+`python -B -m unittest discover -s scripts/staging -p test_teetime_minimal_controller_check.py`
+
+`bun test ./scripts/staging/teetime-minimal-controller-integration.test.ts`
+
+`bun test ./scripts/staging/teetime-supervised-controller.test.ts`
+
+`bun x tsc --noEmit -p scripts/tsconfig.json`
+
+PC operator selection and its outer SSH deadline remain separate unfinished
+integration. Source tests/review do not authorize installation or a live canary.
+
 ## Source-only minimal diagnostic admission caller
 
 claimMinimalDiagnosticAttempt in packages/workflows/src/reliability/

@@ -31,6 +31,18 @@ export interface MinimalDiagnosticAdmission {
   remainingMs(): number;
 }
 
+// Carries only the exact source-created public row identity. It never carries
+// raw database/provider errors or permits reconstruction from a discovered row.
+export class MinimalDiagnosticAdmissionFailure extends Error {
+  readonly persistence='unresolved' as const;
+  readonly attempt:Readonly<ProviderAttemptRecord>;
+  constructor(attempt:Readonly<ProviderAttemptRecord>) {
+    super('minimal diagnostic admission persistence unresolved');
+    this.name='MinimalDiagnosticAdmissionFailure';this.attempt=attempt;
+    Object.freeze(this);
+  }
+}
+
 export async function claimMinimalDiagnosticAttempt(input: MinimalDiagnosticAdmission): Promise<Readonly<ProviderAttemptRecord>> {
   // Snapshot every descriptor/function before first await. Store/controller are
   // trusted capabilities, not untrusted packet objects.
@@ -96,8 +108,12 @@ export async function claimMinimalDiagnosticAttempt(input: MinimalDiagnosticAdmi
     declaredProvider:TEE_TIME_SUPERVISED_POLICY.provider,declaredModel:TEE_TIME_SUPERVISED_POLICY.model,
     requiredCapabilities:Object.freeze(['text_generation'] as const),startedAt:new Date().toISOString(),completedAt:null,
     servedModelId:null,outcomeClass:null,reasonCode:null,resumeAt:null,supersedesAttemptId:null});
-  if(!(await create(attempt)))throw new Error('diagnostic persistence failed; claim remains consumed');
-  await history(attempt); await state(); await recheckExecution(); await controller.assertOwned(); budget();
+  try {
+    if(!(await create(attempt)))throw new Error('diagnostic persistence failed; claim remains consumed');
+    await history(attempt); await state(); await recheckExecution(); await controller.assertOwned(); budget();
+  } catch {
+    throw new MinimalDiagnosticAdmissionFailure(attempt);
+  }
   // Caller still owns the closed transport and must check the same deadline
   // immediately before launch. Returning this row never starts a provider.
   return attempt;

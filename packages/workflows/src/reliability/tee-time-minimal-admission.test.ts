@@ -8,6 +8,7 @@ import { supervisedAttemptHash, type SupervisedPlanReview } from './tee-time-sup
 import type { ProviderAttemptRecord } from './types';
 import type { IWorkflowStore } from '../store';
 import { claimMinimalDiagnosticAttempt } from './tee-time-minimal-admission';
+import * as admission from './tee-time-minimal-admission';
 
 const roots: string[] = [];
 const hash = (char: string) => 'sha256:' + char.repeat(64);
@@ -119,6 +120,17 @@ test('post-persistence drift and depleted budget keep consumed claim without adm
     await expect(claimMinimalDiagnosticAttempt(f.input)).rejects.toThrow();
     expect(await readFile(join(f.root,'diagnostic.claim.json'),'utf8')).toContain('diagnostic');
   }
+});
+
+test('post-insertion failure preserves the exact attempt identity as unresolved persistence',async()=>{
+  const f=await fixture(),insert=f.input.store.createProviderAttempt;
+  f.input.store.createProviderAttempt=async row=>{const ok=await insert(row);f.remaining(315000);return ok;};
+  let failure:unknown;
+  try {await claimMinimalDiagnosticAttempt(f.input);}catch(error){failure=error;}
+  expect(failure).toBeInstanceOf(admission.MinimalDiagnosticAdmissionFailure);
+  const value=failure as InstanceType<typeof admission.MinimalDiagnosticAdmissionFailure>;
+  expect(supervisedAttemptHash(value.attempt)).toBe(supervisedAttemptHash(f.records[4]));
+  expect(value.persistence).toBe('unresolved');expect(Object.isFrozen(value.attempt)).toBe(true);
 });
 
 test('caller identity mutation during callbacks cannot change the frozen claim',async()=>{

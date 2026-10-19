@@ -74,6 +74,7 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_protocol.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_controller.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_execution.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_controller_check.py
           bun test ./scripts/staging/teetime-minimal-diagnostic-runner.test.ts
           python3 -m unittest discover -s scripts/staging -p test_teetime_demo_execution.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_plan_observation.py
@@ -121,6 +122,7 @@ jobs:
           bun test ./packages/workflows/src/reliability/tee-time-supervised-prepare.test.ts
           bun ./scripts/staging/qualify-teetime-supervised-sqlite.ts
           bun test ./scripts/staging/teetime-supervised-entry-guard.test.ts ./scripts/staging/teetime-supervised-controller.test.ts
+          bun test ./scripts/staging/teetime-minimal-controller-integration.test.ts
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test
           bun --filter @archon/server type-check

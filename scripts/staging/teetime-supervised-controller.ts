@@ -17,6 +17,9 @@ import {
 const hash = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
 const ROOT = join(homedir(), 'teetime-supervised-01');
 const SOURCE = resolve(fileURLToPath(new URL('../../', import.meta.url)));
+class MinimalPersistenceUnresolved extends Error {
+  constructor(){super('minimal diagnostic persistence unresolved');this.name='MinimalPersistenceUnresolved';}
+}
 async function verifySource(
   source: string,
   expected: string,
@@ -75,16 +78,18 @@ async function verifySource(
 }
 
 export async function prepare(): Promise<Record<string, unknown>> {
+  const minimal = process.argv[2] === '--claim-minimal-diagnostic';
+  const diagnosticDeadline = minimal ? performance.now() + 420000 : undefined;
   // No database consumer has been imported above this boundary.
   assertPrepareEnvironment(ROOT, join(homedir(), 'teetime-supervised-01'), process.env);
   const fourth = process.argv[2] === '--claim-transport-repair';
   const third = process.argv[2] === '--claim-diagnostic-successor';
   const successor = process.argv[2] === '--claim-successor';
-  const claim = fourth || third || successor || process.argv[2] === '--claim-model';
+  const claim = minimal || fourth || third || successor || process.argv[2] === '--claim-model';
   if (
     process.platform !== 'win32' ||
     Bun.version !== '1.3.13' ||
-    SOURCE !== join(ROOT, fourth ? 'transport-repair-execution-harness' : third ? 'diagnostic-execution-harness' : successor ? 'successor-execution-harness' : claim ? 'execution-harness' : 'harness') ||
+    SOURCE !== join(ROOT, minimal ? 'minimal-diagnostic-execution-harness' : fourth ? 'transport-repair-execution-harness' : third ? 'diagnostic-execution-harness' : successor ? 'successor-execution-harness' : claim ? 'execution-harness' : 'harness') ||
     process.argv.length !== (claim ? 15 : 5) ||
     (!claim && process.argv[2] !== '--prepare') ||
     process.argv[3] !== '--input-sha256' ||
@@ -126,7 +131,7 @@ export async function prepare(): Promise<Record<string, unknown>> {
       SOURCE,
       process.argv[8]!,
       process.argv[10]!,
-      fourth ? 'transport-repair-execution-source-manifest.json' : third ? 'diagnostic-execution-source-manifest.json' : successor ? 'successor-execution-source-manifest.json' : 'execution-source-manifest.json'
+      minimal ? 'minimal-diagnostic-execution-source-manifest.json' : fourth ? 'transport-repair-execution-source-manifest.json' : third ? 'diagnostic-execution-source-manifest.json' : successor ? 'successor-execution-source-manifest.json' : 'execution-source-manifest.json'
     );
     for (const name of [
       'packages/workflows/src/executor.ts',
@@ -178,8 +183,8 @@ export async function prepare(): Promise<Record<string, unknown>> {
   // A fresh preparation must never attach to an existing database.
   if (!claim) await assertFreshSqliteLocation(archon);
   const originalControl = join(ROOT, 'control');
-  const control = fourth ? join(ROOT, 'control-attempt-4') : third ? join(ROOT, 'control-attempt-3') : successor ? join(ROOT, 'control-attempt-2') : originalControl;
-  if (fourth || third || successor) {
+  const control = minimal ? join(ROOT, 'control-minimal-diagnostic-1') : fourth ? join(ROOT, 'control-attempt-4') : third ? join(ROOT, 'control-attempt-3') : successor ? join(ROOT, 'control-attempt-2') : originalControl;
+  if (minimal || fourth || third || successor) {
     await ordinaryDirectory(originalControl);
     await mkdir(control); // Deterministic exclusive successor location. Never recover/reuse.
   } else if (claim) await ordinaryDirectory(control);
@@ -191,9 +196,13 @@ export async function prepare(): Promise<Record<string, unknown>> {
   const bootstrap =
     await import('../../packages/workflows/src/reliability/tee-time-supervised-bootstrap');
   const caseHash = 'sha256:' + hash(raw);
+  const minimalAdmissionHash = minimal ? 'sha256:' + hash(Buffer.from(JSON.stringify({
+    executionHash: process.argv[6]!, installedManifestHash: process.argv[8]!,
+    kind: 'teetime-minimal-admission', operatorInputHash: process.argv[4]!, source: process.argv[10]!, version: 1,
+  }), 'ascii')) : undefined;
   const ownership = await bootstrap.acquireSupervisedController(
     control,
-    claim ? 'sha256:' + process.argv[6]! : caseHash
+    minimal ? minimalAdmissionHash! : claim ? 'sha256:' + process.argv[6]! : caseHash
   );
   let connection: typeof import('../../packages/core/src/db/connection') | undefined;
   try {
@@ -281,6 +290,159 @@ export async function prepare(): Promise<Record<string, unknown>> {
       headBranch: 'demo/simulated-walkthrough-01',
       observe,
     };
+    if (minimal) {
+      const { claimMinimalDiagnosticAttempt, MinimalDiagnosticAdmissionFailure } = await import('../../packages/workflows/src/reliability/tee-time-minimal-admission');
+      const { supervisedAttemptHash } = await import('../../packages/workflows/src/reliability/tee-time-supervised-model-phase');
+      const { readMinimalPlanObservation } = await import('./teetime-plan-observation');
+      const { readObservationLine, forwardMinimalDiagnosticLauncher } = await import('./teetime-supervised-transport');
+      const { open, readFile, lstat } = await import('node:fs/promises');
+      const deadline=diagnosticDeadline!;
+      const remaining=()=>deadline-performance.now();
+      async function bounded<T>(promise:Promise<T>, limit:number):Promise<T> {
+        const ms=Math.min(limit,remaining()-10000);
+        if(ms<=0)throw new Error('minimal controller deadline');
+        let timer:ReturnType<typeof setTimeout>|undefined;
+        try {return await Promise.race([promise,new Promise<never>((_,reject)=>{
+          timer=setTimeout(()=>reject(new Error('minimal controller deadline')),ms);})]);}
+        finally {clearTimeout(timer);}
+      }
+      const executionHash=process.argv[6]!;
+      const packageBytes=await frozenEntryFile(join(SOURCE,'minimal-execution.json'),executionHash,32768);
+      const env={SYSTEMROOT:process.env.SYSTEMROOT!,WINDIR:process.env.WINDIR!,USERPROFILE:homedir(),
+        PATH:dirname(input.binaryPaths.python)};
+      async function check(mode:'metadata'|'predecessor'|'ready'|'report',bytes?:Buffer) {
+        if(remaining()<=10000)throw new Error('minimal check budget exhausted');
+        const child=Bun.spawn([input.binaryPaths.python,'-I','-B',
+          join(SOURCE,'scripts/staging/teetime_minimal_controller_check.py'),mode,executionHash],
+          {cwd:control,env,stdin:bytes?'pipe':'ignore',stdout:'pipe',stderr:'ignore'});
+        const output=(async()=>{
+          const chunks:Buffer[]=[];let count=0;
+          for await(const chunk of child.stdout){count+=chunk.length;if(count>16384)
+            throw new Error('minimal check output bound');chunks.push(Buffer.from(chunk));}
+          return Buffer.concat(chunks);
+        })();
+        // Always observe rejection even if stdin delivery fails first.
+        void output.catch(()=>undefined);
+        const writing=(async()=>{if(bytes&&child.stdin){child.stdin.write(bytes);await child.stdin.flush();child.stdin.end();}})();
+        void writing.catch(()=>undefined);
+        try {
+          const [raw,exit]=await bounded(Promise.all([output,child.exited,writing]),mode==='predecessor'?30000:15000);
+          if(exit!==0)throw new Error('independent minimal check rejected');
+          return JSON.parse(raw.toString('ascii'));
+        } finally {
+          if(child.exitCode===null)child.kill();
+          let timer:ReturnType<typeof setTimeout>|undefined;
+          try {await Promise.race([Promise.all([child.exited,output.catch(()=>undefined),writing.catch(()=>undefined)]),
+            new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('minimal check cleanup uncertain')),
+              Math.max(1,Math.min(5000,remaining())));})]);} finally {clearTimeout(timer);}
+        }
+      }
+      const execution=await check('metadata');
+      if(execution.source!==process.argv[10] || execution.packageHash!==executionHash ||
+          execution.operatorInputHash!==process.argv[4] || !Array.isArray(execution.predecessors) || execution.predecessors.length!==4)
+        throw new Error('minimal metadata differs from frozen invocation');
+      const initial=await bootstrap.readSupervisedBinding(api,preparation);
+      const pausedRunSnapshot=JSON.stringify(await api.store.getWorkflowRun(initial.runId));
+      if(initial.runId!==execution.runId || initial.authorityHash!==execution.authorityHash ||
+          initial.bindingHash!==execution.preparedBindingHash)throw new Error('minimal prepared binding differs');
+      const inputReader=Bun.stdin.stream().getReader();
+      let cancellation:Promise<void>|undefined;
+      const reader={read:()=>inputReader.read(),cancel:()=>
+        cancellation??=Promise.resolve().then(()=>inputReader.cancel())};
+      async function settleReader(){
+        let timer:ReturnType<typeof setTimeout>|undefined;
+        try {await Promise.race([reader.cancel(),new Promise<never>((_,reject)=>{
+          timer=setTimeout(()=>reject(new Error('minimal reader cleanup uncertain')),Math.max(1,Math.min(3000,remaining())));})]);}
+        finally {clearTimeout(timer);}
+      }
+      let phaseFailed=false;
+      try {
+        const observationRaw=await bounded(readObservationLine(reader),15000);
+        const expected={nonce:process.argv[14]!,baseSha:input.baseSha,executionHash:'sha256:'+executionHash,
+          preparedBindingHash:initial.bindingHash,runId:initial.runId,reviewHead:process.argv[12]!,
+          admissionHash:minimalAdmissionHash!,installedManifestHash:'sha256:'+process.argv[8]!,
+          sourceSha:process.argv[10]!,operatorInputHash:process.argv[4]!};
+        const observation=()=>readMinimalPlanObservation(observationRaw,expected,Date.now());
+        const attempt=await claimMinimalDiagnosticAttempt({controller:ownership,store:api.store,runId:initial.runId,
+          admissionHash:minimalAdmissionHash!,executionHash:expected.executionHash,preparedBindingHash:initial.bindingHash,
+          authorityHash:initial.authorityHash,runPolicyHash:execution.runPolicyHash,reviewHead:expected.reviewHead,
+          nonce:expected.nonce,predecessors:execution.predecessors,remainingMs:remaining,
+          readPrepared:async()=>{observation();return bootstrap.readSupervisedBinding(api,preparation);},
+          readReview:async()=>observation().review,
+          recheckExecution:async()=>{
+            observation();
+            await verifySource(SOURCE,process.argv[8]!,process.argv[10]!,'minimal-diagnostic-execution-source-manifest.json');
+            if(!(await frozenEntryFile(join(SOURCE,'minimal-execution.json'),executionHash,32768)).equals(packageBytes) ||
+                JSON.stringify(await check('metadata'))!==JSON.stringify(execution))throw new Error('minimal execution changed');
+          },
+          observe:async()=>{
+            await bootstrap.readSupervisedBinding(api,preparation);
+            const actual=await check('predecessor');
+            if(!actual || Object.keys(actual).sort().join(',')!=='expiresAt,observedAt,predecessors,resourcesAbsent' ||
+                !Array.isArray(actual.predecessors)||actual.predecessors.length!==4 ||
+                actual.predecessors.some((p:Record<string,unknown>,i:number)=>!p ||
+                  Object.keys(p).sort().join(',')!=='lockHash,manifestHash' ||
+                  p.lockHash!==execution.predecessors[i].lockHash||p.manifestHash!==execution.predecessors[i].manifestHash))
+              throw new Error('minimal actual historical reconciliation differs');
+            return {predecessors:execution.predecessors.map((p:Record<string,unknown>)=>({...p})),runId:initial.runId,
+              runPaused:true as const,resourcesAbsent:actual.resourcesAbsent,observedAt:actual.observedAt,expiresAt:actual.expiresAt};
+          }}).catch(async error=>{
+            if(error instanceof MinimalDiagnosticAdmissionFailure)await complete(error.attempt,null);
+            throw error;
+          });
+        async function complete(attempt:Parameters<typeof supervisedAttemptHash>[0],passed:boolean|null) {
+          async function readback(expected:Parameters<typeof supervisedAttemptHash>[0]) {
+            const rows=await api.store.listProviderAttempts(initial.runId);
+            const row=rows.find(p=>p.attemptId===attempt.attemptId);
+            if(rows.length!==5||!row||supervisedAttemptHash(row)!==supervisedAttemptHash(expected)||
+                execution.predecessors.some((p:{attemptId:string;rowHash:string})=>{
+                  const prior=rows.find(r=>r.attemptId===p.attemptId);return !prior||supervisedAttemptHash(prior)!==p.rowHash;}) ||
+                JSON.stringify(await bootstrap.readSupervisedBinding(api,preparation))!==JSON.stringify(initial) ||
+                JSON.stringify(await api.store.getWorkflowRun(initial.runId))!==pausedRunSnapshot)
+              throw new Error('minimal completion readback unresolved');
+          }
+          const completion={attemptId:attempt.attemptId,completedAt:new Date().toISOString(),servedModelId:null,
+            outcomeClass:passed===true?'success' as const:'quality' as const,
+            reasonCode:passed===null?'required_stage_indeterminate' as const:
+              passed?'execution_completed' as const:'required_stage_failed' as const,resumeAt:null};
+          try {
+            await readback(attempt);
+            if(!(await api.store.completeProviderAttempt(completion)))throw new Error('minimal completion persistence unresolved');
+            await readback({...attempt,...completion});
+          }catch {throw new MinimalPersistenceUnresolved();}
+        }
+        async function retain(name:string,bytes:Buffer) {
+          await ownership.assertOwned();const path=join(control,name);const file=await open(path,'wx',0o600);
+          try {await file.writeFile(bytes);await file.sync();}finally{await file.close();}
+          const info=await lstat(path);
+          if(!info.isFile()||info.isSymbolicLink()||!(await readFile(path)).equals(bytes))
+            throw new Error('minimal retained observation readback failed');
+        }
+        const result=await (async()=>{
+          await retain('diagnostic-plan-observation.json',observationRaw);
+          if(remaining()<=315000)throw new Error('insufficient minimal launch budget');
+          const result=await forwardMinimalDiagnosticLauncher({reader,nonce:expected.nonce,deadlineMs:deadline,
+            spawn:()=>Bun.spawn([input.binaryPaths.python,'-I','-B',join(SOURCE,'scripts/staging/run-teetime-auth-canary.py'),
+              '--docker','C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe','--image',execution.image,
+              '--expected-sha',execution.baseSource,'--nonce',expected.nonce,'--task','minimal-diagnostic',
+              '--diagnostic-source',execution.source],{cwd:control,env,stdin:'pipe',stdout:'pipe',stderr:'ignore'}),
+            validateReady:async bytes=>{await ownership.assertOwned();await check('ready',bytes);},
+            validateReport:async bytes=>{await ownership.assertOwned();return check('report',bytes);},
+            emitReady:bytes=>{process.stdout.write(bytes);process.stdout.write('\n');}});
+          await settleReader();
+          await retain('diagnostic-result.json',result.report);
+          return result;
+        })().catch(async error=>{await complete(attempt,null);throw error;});
+        await complete(attempt,result.summary.passed);
+        await connection.closeDatabase();connection=undefined;
+        if(result.summary.passed)await ownership.releaseAfterNormalCompletion();
+        process.stdout.write(result.report);process.stdout.write('\n');
+        if(!result.summary.passed)process.exitCode=1;
+        return {forwarded:true};
+      }catch(error){phaseFailed=true;throw error;} finally {
+        try {await settleReader();}catch(error){if(!phaseFailed)throw error;}
+      }
+    }
     if (claim) {
       const { claimSupervisedModelAttempt, supervisedAttemptHash } =
         await import('../../packages/workflows/src/reliability/tee-time-supervised-model-phase');
@@ -570,17 +732,18 @@ if (import.meta.main) {
   try {
     const result = await prepare();
     if (result.forwarded !== true) process.stdout.write(JSON.stringify(result) + '\n');
-  } catch {
+  } catch (error) {
     process.stdout.write(
       JSON.stringify({
         kind:
+          process.argv[2] === '--claim-minimal-diagnostic' ? 'tee-time-supervised-minimal-diagnostic' :
           ['--claim-model', '--claim-successor', '--claim-diagnostic-successor', '--claim-transport-repair'].includes(process.argv[2]!)
             ? 'tee-time-supervised-model'
             : 'tee-time-supervised-prepare',
         passed: false,
-        failureCategory: 'entry-rejected',
-        accountProvided: ['--claim-model', '--claim-successor', '--claim-diagnostic-successor', '--claim-transport-repair'].includes(process.argv[2]!) ? null : false,
-        modelInvocations: ['--claim-model', '--claim-successor', '--claim-diagnostic-successor', '--claim-transport-repair'].includes(process.argv[2]!) ? null : 0,
+        failureCategory: error instanceof MinimalPersistenceUnresolved ? 'persistence-unresolved' : 'entry-rejected',
+        accountProvided: ['--claim-minimal-diagnostic','--claim-model', '--claim-successor', '--claim-diagnostic-successor', '--claim-transport-repair'].includes(process.argv[2]!) ? null : false,
+        modelInvocations: ['--claim-minimal-diagnostic','--claim-model', '--claim-successor', '--claim-diagnostic-successor', '--claim-transport-repair'].includes(process.argv[2]!) ? null : 0,
         operationalLaneReady: false,
       }) + '\n'
     );
