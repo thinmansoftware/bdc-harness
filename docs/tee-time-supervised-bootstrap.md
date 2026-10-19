@@ -1,5 +1,32 @@
 # Tee-time supervised bootstrap source preparation
 
+## Unregistered fixed-response diagnostic entry source
+
+teetime-minimal-diagnostic-entry.ts is not registered in any worker/controller
+selector and is not admitted for execution. It rejects extra argv before any
+guarded logger/collector/provider import. It silences console, stdout and stderr
+before dynamic imports, preserving a single private emitter for the closed
+receipt. Initialization failure without a valid collector receipt exits1 with
+no packet. No caller prompt, model/path/duration override or stdin input is read.
+
+The runner delegates exactly once to collectMinimalDiagnostic with its fixed
+literal. A lazy async generator creates the existing restricted canary provider
+and sends with /workspace, no resume and abortSignal only. Factory/import errors
+remain unknown unless the actual provider tagged them. The measured policy hash
+and fixed run label are not approved custody or persisted authority.
+
+Its fixed90000ms timer begins before lazy initialization, is cleared on iterator
+closure and in finally, and cannot abort a closed iterator. This is cooperative:
+noncooperative imports/streams require the future worker's outer deadline and
+process reaping. Clock injection is a source-test seam only, with no runtime
+argv/env selector. Offline verification:
+`bun test ./scripts/staging/teetime-minimal-diagnostic-runner.test.ts`.
+Tests include independent Python validation, held-stream abort, private failure
+and cleanup handling, and exact entry bytes with invalid argv plus an import
+sentinel outside the repo's pre-entry duplicate-yaml warning. No account/model
+is contacted. Worker/report integration, image, source custody and one-use
+execution authority remain separate unimplemented gates.
+
 ## Unregistered proxy diagnostic receipt
 
 The source-only `--diagnostic-receipt` flag on teetime_connect_proxy.py selects a
