@@ -21,6 +21,19 @@ active = 0
 process_bytes = 0
 outcomes = Counter()
 
+DENIAL_REASONS = frozenset({'request_line_or_destination', 'duplicate_header',
+                          'unsupported_header', 'invalid_header_value',
+                          'encoding_or_framing'})
+
+
+class ConnectPolicyError(ValueError):
+    """Fixed diagnostic reason only; never retain request bytes or header data."""
+    def __init__(self, reason):
+        if reason not in DENIAL_REASONS:
+            raise ValueError('unknown policy denial reason')
+        self.reason = reason
+        super().__init__(reason)
+
 
 def configure_task(task):
     # Fixed selectors only, no caller-supplied duration or destination override.
@@ -32,23 +45,30 @@ def configure_task(task):
 
 def parse_connect(data):
     if len(data) > HEADER_LIMIT or not data.endswith(b'\r\n\r\n'):
-        raise ValueError('invalid header boundary')
-    lines = data.decode('ascii').split('\r\n')
+        raise ConnectPolicyError('encoding_or_framing')
+    try:
+        lines = data.decode('ascii').split('\r\n')
+    except UnicodeError:
+        raise ConnectPolicyError('encoding_or_framing') from None
     if lines[0] != 'CONNECT chatgpt.com:443 HTTP/1.1' or lines[-2:] != ['', '']:
-        raise ValueError('destination or method rejected')
+        raise ConnectPolicyError('request_line_or_destination')
     seen = set()
     for line in lines[1:-2]:
         key, sep, value = line.partition(':')
         key = key.lower()
         value = value.strip(' ')
-        if not sep or key in seen:
-            raise ValueError('ambiguous header')
+        if not sep:
+            raise ConnectPolicyError('encoding_or_framing')
+        if key in seen:
+            raise ConnectPolicyError('duplicate_header')
         seen.add(key)
         if key == 'host' and value == 'chatgpt.com:443':
             continue
         if key in ['proxy-connection', 'connection'] and value.lower() == 'keep-alive':
             continue
-        raise ValueError('unexpected header')
+        raise ConnectPolicyError('invalid_header_value' if key in
+                                 ['host', 'proxy-connection', 'connection']
+                                 else 'unsupported_header')
     return 'chatgpt.com'
 
 

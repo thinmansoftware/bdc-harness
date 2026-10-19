@@ -9,6 +9,38 @@ from teetime_connect_proxy import parse_connect, validate_addresses, handle_clie
 
 
 class PolicyTests(unittest.TestCase):
+    def test_denial_reason_is_closed_and_contains_no_request_material(self):
+        prefix = b'CONNECT chatgpt.com:443 HTTP/1.1\r\n'
+        cases = [
+            (b'CONNECT other.invalid:443 HTTP/1.1\r\n\r\n', 'request_line_or_destination'),
+            (prefix+b'Host: chatgpt.com:443\r\nHost: chatgpt.com:443\r\n\r\n', 'duplicate_header'),
+            (prefix+b'Authorization: synthetic-private-marker\r\n\r\n', 'unsupported_header'),
+            (prefix+b'Host: other.invalid:443\r\n\r\n', 'invalid_header_value'),
+            (prefix+b'Connection: close\r\n\r\n', 'invalid_header_value'),
+            (prefix+b'no-colon\r\n\r\n', 'encoding_or_framing'),
+            (prefix+b'\xff\r\n\r\n', 'encoding_or_framing'),
+            (prefix+b'\r\npipelined-private-marker', 'encoding_or_framing'),
+            (b'x'*4097, 'encoding_or_framing'),
+        ]
+        for data, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertRaises(proxy.ConnectPolicyError) as rejected:
+                    parse_connect(data)
+                self.assertIsInstance(rejected.exception, ValueError)
+                self.assertEqual(rejected.exception.reason, reason)
+                self.assertEqual(str(rejected.exception), reason)
+                self.assertNotIn('private-marker', repr(rejected.exception))
+                self.assertNotIn('other.invalid', repr(rejected.exception))
+        with self.assertRaises(ValueError):
+            proxy.ConnectPolicyError('arbitrary-private-marker')
+
+    def test_reason_categories_preserve_all_previously_allowed_headers(self):
+        for suffix in [b'', b'Host: chatgpt.com:443\r\n',
+                       b'Connection: KEEP-ALIVE\r\n',
+                       b'proxy-connection: keep-alive\r\n',
+                       b'host: chatgpt.com:443\r\nConnection: keep-alive\r\n']:
+            self.assertEqual(parse_connect(b'CONNECT chatgpt.com:443 HTTP/1.1\r\n'+suffix+b'\r\n'), 'chatgpt.com')
+
     def test_closed_demo_duration_preserves_canary_default(self):
         from teetime_demo_execution import DEMO_LIMITS
         try:

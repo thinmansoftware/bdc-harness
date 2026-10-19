@@ -562,3 +562,35 @@ Remaining operational gates are a freshly frozen/installed source, measured imag
 including its actual parser/helper bytes, complete attempt-2 prompt/package, and
 new independent exact-head approval. No source fixture authorizes an authenticated
 successor. Do not invoke the closed entry from the existing consumed installation.
+
+## Third-attempt diagnostic source (no retry authority)
+
+Attempt 3 is terminal and consumed, with no app candidate. Its retained
+model_access_hint is derived from message classification, not an observed server
+status. The mocked provider provenance regression demonstrates that a local
+catalog error can become the same account-access wording. Run it with:
+
+`bun test ./packages/providers/src/codex/provider.test.ts`
+
+The CONNECT parser now raises a ValueError subclass with five fixed reasons.
+Its acceptance rules, aggregate counters and receipt shape are unchanged. The
+reason contains no host/header/payload values. Verify with:
+
+`python -B -m unittest discover -s scripts/staging -p test_teetime_connect_proxy.py`
+
+The native diagnostic helper `scripts/staging/teetime_native_transport_fixture.py`
+is not a production worker or authenticated-canary entrypoint. It requires a
+separately reviewed owned container: pinned image, network none, read-only root,
+user 1001, fresh tmpfs /tmp, no host mounts, account files, ports or Docker socket.
+The wrapper must inspect these properties before start, bound/reap the process,
+remove only the exact owned container and prove absence. The helper uses the
+pinned SDK/binary, a synthetic API credential and an empty temporary HOME.
+A loopback mock feeds native CONNECT bytes to the parser and always returns403;
+it never resolves or dials an upstream or terminates TLS. Only finite reason
+counts and fixed event/cleanup fields may leave it. Fixture-specific base URL and
+proxy values must never enter production configuration.
+
+Passing this API-auth transport fixture does not establish ChatGPT-login
+transport parity, entitlement, completed inference or the original failure's
+cause. No real account access, binary/model change, proxy policy relaxation or
+fourth authenticated attempt is authorized by these source changes.

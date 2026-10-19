@@ -1,5 +1,7 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
+import { classifyProbeError } from '../probe/probe-classifier';
+import { classifyCanaryException } from '../../../../scripts/staging/teetime-canary-result';
 
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
@@ -1330,6 +1332,56 @@ describe('CodexProvider', () => {
       await expect(consumeGenerator()).rejects.toThrow(
         'update your model in ~/.archon/config.yaml'
       );
+    });
+
+    test('credential-free provenance: wording and synthetic status do not prove server rejection', async () => {
+      // These are constructed errors, not observations from an account or HTTP server.
+      for (const [message, probeClass, providerPrefix, hint] of [
+        [
+          'model not found in bundled catalog',
+          'structural_model_not_supported',
+          '[ERROR] Model',
+          'model_access_hint',
+        ],
+        [
+          'model is not supported when using Codex with a ChatGPT account',
+          'structural_model_not_supported',
+          '[ERROR] Model',
+          'model_access_hint',
+        ],
+        ['proxy CONNECT rejected: 403 Forbidden', 'unknown', 'Codex auth error:', 'other'],
+        ['network connection reset', 'transient_timeout', 'Codex unknown:', 'transport_hint'],
+      ]) {
+        const original = new Error(message);
+        const direct = classifyProbeError(original);
+        expect(direct.errorClass).toBe(probeClass);
+        expect(direct.httpStatus).toBeUndefined();
+        // The provider supplies this constant; it was not read from a response.
+        expect(classifyProbeError({ httpStatus: 400, message }).httpStatus).toBe(400);
+        mockRunStreamed.mockClear();
+        mockRunStreamed.mockRejectedValue(original);
+        let caught: Error | undefined;
+        try {
+          for await (const _ of client.sendQuery('synthetic fixture', '/workspace', undefined, {
+            model: 'gpt-5.6-sol',
+          })) {
+            /* mocked SDK only */
+          }
+        } catch (error) {
+          caught = error as Error;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect(caught!.message.startsWith(providerPrefix!)).toBe(true);
+        expect(Object.hasOwn(caught!, 'status')).toBe(false);
+        expect(Object.hasOwn(caught!, 'httpStatus')).toBe(false);
+        expect(classifyCanaryException(caught, false)).toBe(hint);
+        expect(mockRunStreamed).toHaveBeenCalledTimes(1);
+        if (probeClass === 'structural_model_not_supported') {
+          // Local catalog wording becomes the same account-access explanation.
+          expect(caught!.message).toContain('not available for your account');
+          expect(caught!.message).not.toContain(message!);
+        }
+      }
     });
 
     test('ignores items without text or command', async () => {
