@@ -85,7 +85,7 @@ test('stdin startup entry failure stays closed through independent Python projec
       expect(result.exitCode).toBe(1);
       expect(result.signalCode ?? null).toBeNull();
       expect(JSON.parse(new TextDecoder().decode(result.stdout))).toEqual(
-        { kind: 'teetime-startup-capture-failed-v2', phase }
+        { kind: 'teetime-startup-capture-failed-v3', phase, exchange: null }
       );
       expect(new TextDecoder().decode(result.stderr)).toBe('');
       expect(new TextDecoder().decode(result.stdout)).not.toContain('PRIVATE');
@@ -105,4 +105,29 @@ test('stdin startup entry failure stays closed through independent Python projec
       throw new Error('owned startup test cleanup path rejected');
     rmSync(target, { recursive: true });
   }
+});
+
+
+test('actual failure emitter carries synthetic exchange evidence through independent host parser', () => {
+  const entry=readFileSync(new URL('./probe-codex-startup.ts',import.meta.url),'utf8');
+  const protocol=pathToFileURL(fileURLToPath(new URL('./teetime-startup-protocol.ts',import.meta.url))).href;
+  // Replace main only in this synthetic stdin fixture: native preflight/spawn is
+  // unreachable. Keep the actual outer failure emitter and actual exchange code.
+  const main=`async function main():Promise<void>{
+    const {exchangeStartup}=await import(${JSON.stringify(protocol)});
+    const frames=[{id:1,result:{userAgent:'codex_exec/0.153.3 (Linux synthetic; x86_64) (codex_exec; 0.153.3)',codexHome:'/home/appuser/.codex',platformFamily:'unix',platformOs:'linux'}},{method:'configWarning',params:{summary:'PRIVATE-NATIVE-TEXT',details:null}}];
+    await exchangeStartup({stdout:(async function*(){for(const v of frames)yield Buffer.from(JSON.stringify(v)+'\\n');})(),stderr:(async function*(){})(),exited:Promise.resolve(1),write:()=>{},kill:()=>{}},1000,value=>{phase=value;},value=>{exchangeEvidence={...value};});
+  }\n`;
+  const input=entry.slice(0,entry.indexOf('async function main(): Promise<void> {'))+main+entry.slice(entry.indexOf('void main().catch'));
+  const env=process.platform==='win32'&&process.env.SystemRoot?{SystemRoot:process.env.SystemRoot}:{};
+  const result=Bun.spawnSync([process.execPath,'--no-env-file','run','-'],{cwd:tmpdir(),env,stdin:Buffer.from(input),stdout:'pipe',stderr:'pipe',timeout:3000,maxBuffer:16384});
+  expect(result.exitCode).toBe(1);expect(new TextDecoder().decode(result.stderr)).toBe('');
+  const value=JSON.parse(new TextDecoder().decode(result.stdout));
+  expect(value.kind).toBe('teetime-startup-capture-failed-v3');expect(value.phase).toBe('thread-start-exchange');
+  expect(value.exchange.category).toBe('notification-shape');expect(value.exchange.reapUncertain).toBe(false);
+  expect(new TextDecoder().decode(result.stdout)).not.toContain('PRIVATE-NATIVE-TEXT');
+  expect(new TextDecoder().decode(result.stdout)).not.toContain('configWarning');
+  const python=spawnSync(process.platform==='win32'?'python':'python3',['-I','-B','-c',
+    'import sys;sys.path.insert(0,sys.argv[1]);from teetime_startup_packet import startup_failure_diagnostic,startup_metadata;raw=sys.stdin.buffer.read();v=startup_failure_diagnostic(raw,1);assert v["exchange"]["category"]=="notification-shape";assert v["exchange"]["response2Observed"] is False;assert v["exchange"]["acceptedNotifications"]==0;assert 0<v["exchange"]["observedBytes"]<=65536;\ntry:startup_metadata(raw)\nexcept ValueError:pass\nelse:raise AssertionError("failure cannot become success")',fileURLToPath(new URL('./',import.meta.url))],{input:result.stdout,encoding:'utf8',timeout:3000});
+  expect(python.status).toBe(0);
 });

@@ -14,6 +14,7 @@ type FailurePhase = 'context' | 'imports' | 'binary-identity' | 'home-checks'
   | 'native-spawn' | 'initialize-exchange' | 'thread-start-exchange'
   | 'postchecks' | 'packet-serialization';
 let phase: FailurePhase = 'context';
+let exchangeEvidence: Startup.StartupExchangeObservation | null = null;
 async function main(): Promise<void> {
   requireValue(process.env.TEE_TIME_SANDBOX_PROBE === '1' && process.getuid?.() === 1001);
   // This entry is supplied on stdin from /workspace, not loaded at its source path.
@@ -94,7 +95,7 @@ async function main(): Promise<void> {
     kill: () => {
       if (child.exitCode === null) child.kill('SIGKILL');
     },
-  }, 12000, value => { phase = value; });
+  }, 12000, value => { phase = value; }, value => { exchangeEvidence = { ...value }; });
   phase = 'postchecks';
   requireValue(child.exitCode !== null && hash(readFileSync(RESTRICTED_BINARY)) === binaryHash);
   requireValue(readFileSync(home + '/auth.json', 'utf8') === auth);
@@ -118,6 +119,6 @@ async function main(): Promise<void> {
 }
 void main().catch(() => {
   // Never stringify native failures, private RPC data, stderr or stack traces.
-  process.stdout.write(JSON.stringify({ kind: 'teetime-startup-capture-failed-v2', phase }));
+  process.stdout.write(JSON.stringify({ kind: 'teetime-startup-capture-failed-v3', phase, exchange: exchangeEvidence }));
   process.exitCode = 1;
 });

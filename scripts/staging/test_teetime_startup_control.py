@@ -15,6 +15,24 @@ from teetime_startup_packet import startup_metadata, startup_failure_diagnostic
 
 
 class StartupControlTests(unittest.TestCase):
+    def test_v3_failure_projection_bounds_exchange_and_preserves_legacy_v2(self):
+        exchange={'category':'notification-shape','response2Observed':False,
+                  'acceptedNotifications':0,'observedBytes':240,'reapUncertain':True}
+        good={'kind':'teetime-startup-capture-failed-v3','phase':'thread-start-exchange','exchange':exchange}
+        self.assertEqual(startup_failure_diagnostic(json.dumps(good).encode(),1),good)
+        early={'kind':'teetime-startup-capture-failed-v3','phase':'imports','exchange':None}
+        self.assertEqual(startup_failure_diagnostic(json.dumps(early).encode(),1),early)
+        for change in [{'category':'PRIVATE'}, {'observedBytes':True}, {'observedBytes':65538},
+                       {'observedBytes':-1}, {'acceptedNotifications':2}, {'acceptedNotifications':True},
+                       {'response2Observed':1}, {'reapUncertain':0}, {'error':'PRIVATE'}]:
+            with self.assertRaises(ValueError) as caught:
+                startup_failure_diagnostic(json.dumps({**good,'exchange':{**exchange,**change}}).encode(),1)
+            self.assertNotIn('PRIVATE',str(caught.exception))
+        for value in [{**good,'phase':'imports'}, {k:v for k,v in good.items() if k!='exchange'},
+                      {**good,'exchange':{}}, {**good,'extra':'PRIVATE'}]:
+            with self.assertRaises(ValueError): startup_failure_diagnostic(json.dumps(value).encode(),1)
+        with self.assertRaises(ValueError): startup_metadata(json.dumps(good).encode())
+
     def test_failure_projection_is_closed_and_never_accepts_private_or_ambiguous_output(self):
         good={'kind':'teetime-startup-capture-failed-v2','phase':'native-version'}
         self.assertEqual(startup_failure_diagnostic(json.dumps(good).encode(),1),good)

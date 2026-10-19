@@ -128,3 +128,58 @@ Python validator, synthetic initialize/thread-start boundaries, private-marker
 rejection and cleanup uncertainty. No Codex executable is started by these tests.
 No native capture, account delivery, turn/query, fallback, policy relaxation,
 implementation attempt or production action is authorized by this source change.
+
+
+## Consumed capture 3 and closed rejection evidence successor
+
+Run39239917881 at XOactivation87ab8b87cecab469cb4d789c7115626067224c99
+and helperd5e1f8d33b76eb0e699e8f674e296687c3e23d05 failed at the fixed
+thread-start-exchange boundary. Owned cleanup passed, private artifact count0.
+That finite grant is consumed. This proves initialize validation reached the
+callback before writing thread/start; it does not prove the write completed,
+thread creation began, or a particular native error occurred.
+
+An offline actual-parser replay reproduces a coverage gap: valid configWarning
+between initialize and response2 is rejected, while the same sequence without it
+succeeds. Pinned upstream b1a547b1f73ce86205d9222ac19cff334b3b7a2e emits
+ConfigWarning during initialization (initialize_processor.rs161-179), declares
+wire method configWarning (protocol/common.rs1928), and its notification shape
+in protocol/v2/config.rs1117-1130. This is a supported hypothesis, not the observed
+cause. Do not broaden accepted notifications or alter native settings on that basis.
+
+Independent architect approved source implementation/offline tests only. Add
+internally branded fixed rejection categories to the existing protocol file:
+write, utf8-json, notification-shape, response-envelope, response-payload,
+output-bound, eof-incomplete, deadline, stream, unknown. Preserve only internal
+brands, never arbitrary error names/messages/properties/causes. Keep the first
+observed primary category; cleanup uncertainty cannot erase it.
+
+The failure-only observer is finalized once after bounded cleanup. It receives a
+snapshot with category, response2Observed, acceptedNotifications, observedBytes
+and reapUncertain. A parsed object with exact numeric id2 establishes observed,
+not accepted. Count notifications only after existing validation; at most1 is
+accepted. Byte count saturates65537, which means at least65537, not exact length.
+Cleanup-only failure uses unknown/reapUncertaintrue and cannot return success.
+Late streams cannot mutate emitted evidence; a throwing observer is contained.
+
+Entry emits strict failure-v3 with explicit exchange:null if exchange evidence
+was not finalized, otherwise only this closed metadata. Non-null exchange is
+valid only in initialize-exchange/thread-start-exchange phases. The independent
+Python projector requires exact keys, known enums, actual bool/int types and
+bounds, preserving historical v2 parsing. Invalid packets retain only fixed
+unknown metadata, never raw output. Successful private v1 custody is unchanged;
+a failed capture still cannot create/upload a successful private artifact.
+
+TDD first demonstrated missing observations and unsupported v3 frames. Offline
+coverage includes configWarning rejection, malformed envelopes/payloads/UTF8/JSON,
+EOF, overflow, writes/streams, no spoofed category, uncertain reaping, observer
+failure, late settlement, and existing deadline/private RPC error behavior.
+Synthetic stdin main replaces native preflight/spawn only in the test fixture,
+then uses the actual exchange/emitter and independent Python parser. No native
+Codex executable, account, query, provider or booking is involved in these tests.
+
+All request payloads, models, auth, confinement, limits, timeouts, fallback policy
+and successful packet paths remain unchanged. No new runtime helper dependency.
+Source publication needs actual independent review and checks. Any later native
+capture needs separately reviewed activation and a fresh finite execution grant.
+No authenticated diagnostic or fifth implementation attempt is authorized here.

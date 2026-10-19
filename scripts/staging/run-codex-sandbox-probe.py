@@ -302,7 +302,7 @@ console.log(JSON.stringify(hashes));
                 try:
                     diagnostic = startup_failure_diagnostic(result.stdout, result.returncode)
                 except ValueError:
-                    diagnostic = {'kind':'teetime-startup-capture-failed-v2','phase':'unknown'}
+                    diagnostic = {'kind':'teetime-startup-capture-failed-v3','phase':'unknown','exchange':None}
                 print(json.dumps({'startupFailureDiagnostic':diagnostic}), flush=True)
             if args.kind == 'reviewer':
                 diagnostic = reviewer_failure_diagnostic(result.stdout.encode('utf-8'), result.returncode)

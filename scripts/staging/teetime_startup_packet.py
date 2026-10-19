@@ -28,11 +28,34 @@ def startup_failure_diagnostic(raw, exit_code):
         value = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
     except (ValueError, RecursionError):
         raise ValueError('startup failure diagnostic JSON') from None
-    if (type(value) is not dict or set(value) != {'kind','phase'}
-            or value['kind'] != 'teetime-startup-capture-failed-v2'
-            or type(value['phase']) is not str or value['phase'] not in phases):
+    if (type(value) is not dict or type(value.get('phase')) is not str
+            or value['phase'] not in phases):
         raise ValueError('startup failure diagnostic fields')
-    return {'kind':'teetime-startup-capture-failed-v2','phase':value['phase']}
+    if (set(value) == {'kind','phase'}
+            and value['kind'] == 'teetime-startup-capture-failed-v2'):
+        return {'kind':value['kind'],'phase':value['phase']}
+    if (set(value) != {'kind','phase','exchange'}
+            or value['kind'] != 'teetime-startup-capture-failed-v3'):
+        raise ValueError('startup failure diagnostic fields')
+    exchange=value['exchange']
+    if exchange is not None:
+        categories={'write','utf8-json','notification-shape','response-envelope',
+                    'response-payload','output-bound','eof-incomplete','deadline','stream','unknown'}
+        if (value['phase'] not in {'initialize-exchange','thread-start-exchange'}
+                or type(exchange) is not dict
+                or set(exchange) != {'category','response2Observed','acceptedNotifications',
+                                     'observedBytes','reapUncertain'}
+                or type(exchange['category']) is not str or exchange['category'] not in categories
+                or type(exchange['response2Observed']) is not bool
+                or type(exchange['reapUncertain']) is not bool
+                or type(exchange['acceptedNotifications']) is not int
+                or not 0 <= exchange['acceptedNotifications'] <= 1
+                or type(exchange['observedBytes']) is not int
+                or not 0 <= exchange['observedBytes'] <= 65537):
+            raise ValueError('startup failure exchange fields')
+        exchange={key:exchange[key] for key in ('category','response2Observed',
+                  'acceptedNotifications','observedBytes','reapUncertain')}
+    return {'kind':value['kind'],'phase':value['phase'],'exchange':exchange}
 
 
 def startup_metadata(raw):
