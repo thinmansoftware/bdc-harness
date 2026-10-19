@@ -1,7 +1,61 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve, posix } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// Focused source-recipe contract, not proof of an installed image or a general
+// Dockerfile interpreter. Only unchanged source-to-/app copies count here.
+function startupImageDependencies(recipe: string): string[] {
+  const root = fileURLToPath(new URL('../../', import.meta.url));
+  const final = recipe.split(/^FROM /m).at(-1)!;
+  expect(final.startsWith('oven/bun:1.3.11-slim AS production')).toBe(true);
+  const copied = final.split(/\r?\n/).flatMap(line => {
+    const match = /^COPY ([\w./-]+) \.\/([\w./-]+)$/.exec(line);
+    return match && match[1] === match[2] ? [match[1]!] : [];
+  });
+  const entry = readFileSync(new URL('./probe-codex-startup.ts', import.meta.url), 'utf8');
+  const targets = [...entry.matchAll(/const \w+Path = '\/app\/([^']+)';/g)].map(match => match[1]!);
+  expect(targets.sort()).toEqual([
+    'packages/providers/src/codex/restricted-policy.ts',
+    'scripts/staging/teetime-reviewer-fixture.ts',
+    'scripts/staging/teetime-startup-protocol.ts',
+  ]);
+  const pending = [...targets], visited = new Set<string>();
+  const scanner = new Bun.Transpiler({ loader: 'ts' });
+  while (pending.length) {
+    const name = pending.pop()!;
+    if (visited.has(name)) continue;
+    if (name.startsWith('../') || !existsSync(resolve(root, name)))
+      throw new Error('unresolved startup dependency: ' + name);
+    if (!copied.some(source => source.endsWith('/') ? name.startsWith(source) : name === source))
+      throw new Error('startup dependency absent from final-stage recipe: ' + name);
+    visited.add(name);
+    for (const item of scanner.scanImports(readFileSync(resolve(root, name), 'utf8'))) {
+      if (item.path.startsWith('node:')) continue;
+      if (item.kind !== 'import-statement' || !item.path.startsWith('.'))
+        throw new Error('unsupported startup dependency form');
+      const path = posix.normalize(posix.join(posix.dirname(name), item.path));
+      pending.push(path.endsWith('.ts') ? path : path + '.ts');
+    }
+  }
+  return [...visited].sort();
+}
+
+test('final image recipe covers startup literal imports and their runtime closure', () => {
+  const recipe = readFileSync(new URL('../../Dockerfile', import.meta.url), 'utf8');
+  expect(startupImageDependencies(recipe)).toContain('packages/providers/src/codex/sdk-failure-evidence.ts');
+});
+
+test('build-stage source and provider package metadata cannot supply missing startup runtime files', () => {
+  const recipe = readFileSync(new URL('../../Dockerfile', import.meta.url), 'utf8');
+  for (const line of [
+    'COPY scripts/staging/teetime-startup-protocol.ts ./scripts/staging/teetime-startup-protocol.ts',
+    'COPY packages/providers/ ./packages/providers/',
+  ]) {
+    expect(() => startupImageDependencies(recipe.replace(line, ''))).toThrow('startup dependency absent');
+  }
+});
 
 test('stdin startup entry reaches its closed context guard from a foreign cwd', () => {
   const directory = mkdtempSync(join(tmpdir(), 'teetime-startup-entry-'));

@@ -235,6 +235,7 @@ COPY .archon/ ./.archon/
 COPY migrations/ ./migrations/
 COPY scripts/staging/verify-offline-qualification.ts ./scripts/staging/verify-offline-qualification.ts
 COPY scripts/staging/teetime-reviewer-fixture.ts ./scripts/staging/teetime-reviewer-fixture.ts
+COPY scripts/staging/teetime-startup-protocol.ts ./scripts/staging/teetime-startup-protocol.ts
 COPY tsconfig*.json ./
 
 # Fix permissions for appuser

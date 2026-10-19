@@ -171,6 +171,13 @@ jobs:
             sleep 5
           done
           exit 1
+      - name: Verify startup runtime dependency bytes in staging image
+        run: |
+          set -euo pipefail
+          files=(scripts/staging/teetime-startup-protocol.ts scripts/staging/teetime-reviewer-fixture.ts packages/providers/src/codex/restricted-policy.ts packages/providers/src/codex/restricted-review-catalog.ts packages/providers/src/codex/sdk-failure-evidence.ts)
+          sha256sum "${files[@]}" > "$RUNNER_TEMP/startup-source.sha256"
+          docker exec -w /app "$QUALIFICATION_CONTAINER" sha256sum "${files[@]}" > "$RUNNER_TEMP/startup-image.sha256"
+          cmp "$RUNNER_TEMP/startup-source.sha256" "$RUNNER_TEMP/startup-image.sha256"
       - name: Require named sandbox and configuration isolation
         run: |
           set -euo pipefail
