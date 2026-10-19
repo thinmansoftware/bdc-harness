@@ -115,6 +115,8 @@ jobs:
           bun test ./packages/paths/src/tee-time-supervised-policy.test.ts
           bun test ./packages/workflows/src/reliability/tee-time-supervised-bootstrap.test.ts
           bun test ./packages/workflows/src/reliability/tee-time-supervised-model-phase.test.ts
+          bun test ./packages/workflows/src/reliability/tee-time-minimal-admission.test.ts
+          bun x tsc --noEmit -p packages/workflows/tsconfig.json
           bun test ./packages/workflows/src/reliability/tee-time-supervised-prepare.test.ts
           bun ./scripts/staging/qualify-teetime-supervised-sqlite.ts
           bun test ./scripts/staging/teetime-supervised-entry-guard.test.ts ./scripts/staging/teetime-supervised-controller.test.ts

@@ -48,22 +48,60 @@ async function settle<T>(promise: Promise<T>, milliseconds: number): Promise<T> 
   }
 }
 
-// Call only after the durable model claim and provider-attempt readback succeed.
-export async function forwardSupervisedLauncher(input: {
+interface LauncherInput<Summary> {
   spawn: () => Subprocess<'pipe', 'pipe', 'ignore'>;
   reader: InputReader;
   nonce: string;
   validateReady: (raw: Buffer) => Promise<void>;
-  validateReport: (raw: Buffer) => Promise<ReceiptSummary>;
+  validateReport: (raw: Buffer) => Promise<Summary>;
   emitReady: (raw: Buffer) => void;
-}): Promise<{ report: Buffer; summary: ReceiptSummary; exitCode: number }> {
+}
+
+export interface MinimalDiagnosticSummary {
+  passed: boolean;
+  cleanupVerified: boolean;
+  proxyMetricsVerified: boolean;
+  modelInvocations: number | null;
+}
+
+// Call only after the durable model claim and provider-attempt readback succeed.
+export async function forwardSupervisedLauncher(input: LauncherInput<ReceiptSummary>):
+Promise<{ report: Buffer; summary: ReceiptSummary; exitCode: number }> {
+  return forwardLauncher(input);
+}
+
+// Separate closed profile. Deadline is the caller's existing monotonic deadline,
+// never a new budget after READY. The same strict Python validators must inspect
+// original bytes before either credential forwarding or report acceptance.
+export async function forwardMinimalDiagnosticLauncher(
+  input: LauncherInput<MinimalDiagnosticSummary> & {deadlineMs: number}
+): Promise<{report: Buffer; summary: MinimalDiagnosticSummary; exitCode: number}> {
+  const remaining=input.deadlineMs-performance.now();
+  if(!Number.isFinite(remaining)||remaining<=315000||remaining>420000)
+    throw new Error('closed diagnostic transport budget required');
+  return forwardLauncher(input,input.deadlineMs);
+}
+
+async function forwardLauncher<Summary>(input: LauncherInput<Summary>, deadlineMs?:number):
+Promise<{report:Buffer;summary:Summary;exitCode:number}> {
+  const diagnostic=deadlineMs!==undefined;
+  const lineBound=diagnostic?32768:98304,totalBound=diagnostic?65536:196608;
+  const operationRemaining=()=>deadlineMs!-performance.now()-10000;
+  const bounded=async<T>(operation:()=>Promise<T>):Promise<T>=>{
+    if(!diagnostic)return operation();
+    const ms=operationRemaining();
+    if(ms<=0)throw new Error('diagnostic transport deadline');
+    const value=await settle(Promise.resolve().then(operation),ms);
+    if(operationRemaining()<=0)throw new Error('diagnostic transport deadline');
+    return value;
+  };
   const child = input.spawn();
   let expired = false;
   const timer = setTimeout(() => {
     expired = true;
     child.kill();
     void input.reader.cancel().catch(() => undefined);
-  }, 740000);
+  }, diagnostic ? Math.max(0,operationRemaining()) : 740000);
   // Child exit must unblock an upstream SSH reader that never supplies EOF.
   void child.exited.then(() => input.reader.cancel()).catch(() => undefined);
   let signalReady!: () => void;
@@ -102,12 +140,12 @@ export async function forwardSupervisedLauncher(input: {
   try {
     for await (const chunk of child.stdout) {
       total += chunk.length;
-      if (total > 196608) throw new Error('launcher total output bound');
+      if (total > totalBound) throw new Error('launcher total output bound');
       pending = Buffer.concat([pending, Buffer.from(chunk)]);
       for (;;) {
         const newline = pending.indexOf(10);
         if (newline < 0) break;
-        if (newline > 98304) throw new Error('launcher line output bound');
+        if (newline > lineBound) throw new Error('launcher line output bound');
         const raw = pending.subarray(0, newline);
         pending = pending.subarray(newline + 1);
         if (!raw.length || raw.some(byte => byte > 127))
@@ -115,7 +153,7 @@ export async function forwardSupervisedLauncher(input: {
         const value = JSON.parse(raw.toString('ascii')) as Record<string, unknown>;
         if (value.nonce !== input.nonce) throw new Error('launcher nonce differs');
         if (!ready && value.type === 'READY') {
-          await input.validateReady(raw);
+          await bounded(()=>input.validateReady(raw));
           ready = value;
           readyBytes = Buffer.from(raw);
           input.emitReady(raw);
@@ -125,34 +163,35 @@ export async function forwardSupervisedLauncher(input: {
           reportBytes = Buffer.from(raw);
         } else throw new Error('unexpected or repeated launcher frame');
       }
-      if (pending.length > 98304) throw new Error('launcher line output bound');
+      if (pending.length > lineBound) throw new Error('launcher line output bound');
     }
     const exitCode = await child.exited;
     if (!ready || !readyBytes || !report || !reportBytes || pending.length || expired)
       throw new Error('launcher completion incomplete');
-    await settle(pumpFailure, 3000);
+    await bounded(()=>settle(pumpFailure, 3000));
     // Preserve original JSON bytes so Python strict_json sees duplicate keys.
-    const summary = await input.validateReport(
-      Buffer.concat([
+    const validationBytes = Buffer.concat([
         Buffer.from('{"ready":'),
         readyBytes,
         Buffer.from(',"report":'),
         reportBytes,
         Buffer.from(',"exitCode":' + exitCode + '}'),
-      ])
-    );
+      ]);
+    const summary = await bounded(()=>input.validateReport(validationBytes));
     return { report: reportBytes, summary, exitCode };
   } finally {
     clearTimeout(timer);
     rejectReady(new Error('launcher ended before READY'));
     if (child.exitCode === null) child.kill();
+    const cleanupBound=(maximum:number)=>diagnostic
+      ? Math.max(1,Math.min(maximum,deadlineMs!-performance.now())) : maximum;
     const cleanup = await Promise.allSettled([
-      settle(input.reader.cancel(), 3000),
+      settle(input.reader.cancel(), cleanupBound(3000)),
       settle(
         pumpFailure.catch(() => undefined),
-        3000
+        cleanupBound(3000)
       ),
-      settle(child.exited, 5000),
+      settle(child.exited, cleanupBound(5000)),
     ]);
     if (cleanup.some(item => item.status === 'rejected'))
       throw new Error('supervised transport cleanup uncertain');

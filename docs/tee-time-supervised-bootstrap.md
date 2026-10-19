@@ -1,5 +1,39 @@
 # Tee-time supervised bootstrap source preparation
 
+## Source-only minimal diagnostic admission caller
+
+claimMinimalDiagnosticAttempt in packages/workflows/src/reliability/
+tee-time-minimal-admission.ts consumes a separate diagnostic claim and persists
+one diagnose-transport attempt1. It never launches a provider. Inputs include
+the reviewed admission/execution/prepared/authority/policy hashes, nonce, exact
+four predecessors, current-state observation callbacks and remaining budget.
+Callbacks must read the actual reviewed carrier and full installed inventory;
+caller-supplied descriptors alone are not authority. History reads cover the
+complete run attempt set. Exclusive flushed nonce-bound observation persistence
+and exact five-row readback precede return. Any partial failure stays consumed.
+The original run remains paused and all four implementation records unchanged.
+
+Offline verification (no account, Docker, model or operational database):
+
+`bun test ./packages/workflows/src/reliability/tee-time-minimal-admission.test.ts`
+
+`bun x tsc --noEmit -p packages/workflows/tsconfig.json`
+
+The eventual controller must enforce the same deadline immediately before
+launch and handle terminal persistence uncertainty. This helper is not a new
+runtime entry point, installation grant or authenticated diagnostic approval.
+
+forwardMinimalDiagnosticLauncher in scripts/staging/teetime-supervised-transport.ts
+uses the existing private forwarding machinery with a separate closed profile:
+32768-byte lines, 65536-byte total, existing monotonic deadline, ten-second
+settlement reserve and nullable unknown model-invocation count. It validates
+READY before emitting it and preserves raw report bytes for independent strict
+validation. It cannot reset the budget after READY or synthesize app artifacts.
+The original forwardSupervisedLauncher profile and public summary stay unchanged.
+Only a later governed controller may connect this wrapper to real transport.
+
+`bun test ./scripts/staging/teetime-supervised-transport.test.ts`
+
 ## Source-only diagnostic claim and shared review primitives
 
 claimSupervisedDiagnosticPhase in packages/workflows/src/reliability/

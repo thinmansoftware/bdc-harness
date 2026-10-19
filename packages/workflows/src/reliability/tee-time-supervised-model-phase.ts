@@ -150,7 +150,7 @@ function reconcileSuccessor(
   return identity;
 }
 
-function chainIdentity(entries: readonly SupervisedPredecessor[], count: 2 | 3 = 2): string {
+function chainIdentity(entries: readonly SupervisedPredecessor[], count: 2 | 3 | 4 = 2): string {
   if (!Array.isArray(entries) || entries.length !== count)
     throw new Error('closed predecessor count required');
   const identities = entries.map(predecessorIdentity);
@@ -162,7 +162,7 @@ function chainIdentity(entries: readonly SupervisedPredecessor[], count: 2 | 3 =
 }
 
 function reconcileThird(expected: readonly SupervisedPredecessor[], observed: SupervisedChainReconciliation,
-  rows: readonly ProviderAttemptRecord[], runId: string, count: 2 | 3 = 2): string {
+  rows: readonly ProviderAttemptRecord[], runId: string, count: 2 | 3 | 4 = 2): string {
   const identity = chainIdentity(expected, count);
   const now = Date.now();
   if (!observed || Object.keys(observed).sort().join(',') !==
@@ -187,6 +187,15 @@ function reconcileThird(expected: readonly SupervisedPredecessor[], observed: Su
       throw new Error('terminal predecessor rows differ');
   }
   return identity;
+}
+
+// Diagnostic sidecar only: validate the complete four-row implementation set.
+// This does not extend the model attempt selector or create a fifth attempt.
+export function reconcileMinimalDiagnosticHistory(
+  expected: readonly SupervisedPredecessor[], observed: SupervisedChainReconciliation,
+  rows: readonly ProviderAttemptRecord[], runId: string
+): void {
+  reconcileThird(expected, observed, rows, runId, 4);
 }
 
 export async function claimSupervisedModelAttempt(input: {
