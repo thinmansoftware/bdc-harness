@@ -13,6 +13,7 @@ IMAGE_PATHS = tuple('scripts/staging/'+name for name in [
     'teetime_joined_fixture.py', 'teetime_artifact_materialization.py',
     'teetime_fixture_diagnostics.py',
     'teetime_demo_execution.py', 'teetime_demo_case.py', 'teetime_demo_result.py',
+    'teetime_artifact_workspace.py',
     'teetime-demo-task-entry.ts', 'teetime-demo-task.ts',
     'teetime_materialization_frame.py', 'teetime_snapshot.py', 'teetime_git_objects.py'])+tuple(
     'packages/providers/src/codex/'+name for name in ['provider.ts', 'restricted-policy.ts', 'restricted-run-factory.ts'])+(
@@ -90,16 +91,27 @@ def validate_ready(value, *, nonce, image, base_source, source, hashes, executio
             raise ValueError('artifact READY owned identity rejected')
 
 
-def empty_worker_result():
-    return {**dict.fromkeys(WORKER_BOOL, False), 'modelInvocations': 0, 'preflightChecks': 0,
+def empty_worker_result(*, demo=False):
+    value = {**dict.fromkeys(WORKER_BOOL, False), 'modelInvocations': 0, 'preflightChecks': 0,
         'assistantCount': 0, 'resultCount': 0, 'thinkingCount': 0, 'elapsedMs': 0,
         'oomKillDelta': None, 'failureCategory': 'not_started', 'artifactBase64': None,
         **dict.fromkeys(IDENTITIES, None)}
+    if demo:
+        value['workspaceDiagnostic'] = {'category':'inspection_failed','entryCount':0,'maskEntryCount':0}
+    return value
 
 
 def validate_worker_result(value, *, nonce, policy_hash, execution=None):
-    if type(value) is not dict or set(value) != set(empty_worker_result()):
+    if type(value) is not dict or set(value) != set(empty_worker_result(demo=execution is not None)):
         raise ValueError('artifact worker schema rejected')
+    if execution is not None:
+        diagnostic = value['workspaceDiagnostic']
+        from teetime_artifact_workspace import WORKSPACE_CATEGORIES
+        if (type(diagnostic) is not dict or set(diagnostic) != {'category','entryCount','maskEntryCount'}
+                or diagnostic['category'] not in WORKSPACE_CATEGORIES
+                or any(type(diagnostic[key]) is not int or not 0 <= diagnostic[key] <= 17 for key in ['entryCount','maskEntryCount'])
+                or value['workspaceUnchanged'] != (diagnostic == {'category':'unchanged','entryCount':2,'maskEntryCount':0})):
+            raise ValueError('bounded workspace diagnostic rejected')
     if any(type(value[key]) is not bool for key in WORKER_BOOL) or value['servedModelVerified']:
         raise ValueError('artifact worker flags rejected')
     for key, bound in [('preflightChecks', 6), ('assistantCount', 1), ('resultCount', 1),

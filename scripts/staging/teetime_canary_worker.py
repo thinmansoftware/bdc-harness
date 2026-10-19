@@ -286,7 +286,7 @@ def artifact_main(nonce, source, execution=None):
     validate_selector('artifact', source, nonce)
     if os.environ.get('TEETIME_AUTH_ARTIFACT_SOURCE_SHA') != source:
         raise ValueError('artifact image source rejected')
-    result = empty_worker_result()
+    result = empty_worker_result(demo=execution is not None)
     original = before_workspace = candidate = task = None
     policy_hash = None
     worker_started=time.monotonic() if execution is not None else None
@@ -349,6 +349,9 @@ def artifact_main(nonce, source, execution=None):
                 and artifact_workspace_snapshot() == before_workspace)
         except Exception:
             pass
+        if execution is not None:
+            from teetime_artifact_workspace import workspace_diagnostic
+            result['workspaceDiagnostic'] = workspace_diagnostic(Path('/workspace'), before_workspace, os.getuid())
         result['preflightChecks'] = PREFLIGHT_CHECKS
         result['authenticationRejected'] = AUTH_REJECTED
         try:

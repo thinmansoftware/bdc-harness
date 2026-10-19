@@ -19,6 +19,7 @@ from teetime_canary_protocol import read_frame
 from teetime_watchdog import cleanup
 from teetime_bounded_process import capture
 from teetime_proxy_receipt import parse_proxy_receipt
+from teetime_artifact_workspace import worker_tmpfs
 
 
 def main():
@@ -76,7 +77,7 @@ def main():
                'proxyMetricsVerified': False, 'taskDiagnosticsPresent': False}
     if artifact_mode:
         outcome = {'passed': False, 'cleanupVerified': False, 'credentialReceived': False,
-                   'proxyMetricsVerified': False, 'artifactResult': empty_worker_result()}
+                   'proxyMetricsVerified': False, 'artifactResult': empty_worker_result(demo=execution is not None)}
     proxy_thread = None
     proxy_results = queue.Queue(maxsize=1)
     proxy_ready = threading.Event()
@@ -116,10 +117,8 @@ def main():
                 if execution: command+=['--task','supervised-demo']
             if role == 'worker':
                 extra = ['--security-opt', 'seccomp='+str(profile)]
-                for path in ['/home/appuser', '/workspace', '/tmp']:
-                    extra += ['--tmpfs', path+':uid=1001,gid=1001,size=64m']
-                for path in ['/workspace/.codex', '/workspace/.agents']:
-                    extra += ['--tmpfs', path+':ro,uid=1001,gid=1001,size=1m']
+                for path, options in worker_tmpfs(artifact_mode).items():
+                    extra += ['--tmpfs', path+':'+options]
                 command = ['-I', '-c', 'import time; time.sleep('+str(DEMO_LIMITS['containerSeconds'] if execution else 240)+')']
             identifier = d('create', '--name', owner+'-'+role, '--label', 'teetime.owner='+owner,
                 '--network', network, '--read-only', '--cap-drop', 'ALL', '--security-opt',
@@ -147,7 +146,7 @@ def main():
                 assert config['Cmd'] == ['-I', '-c', 'import time; time.sleep('+str(DEMO_LIMITS['containerSeconds'] if execution else 240)+')']
                 assert len(host['SecurityOpt']) == 2 and 'no-new-privileges:true' in host['SecurityOpt']
                 assert json.loads(next(v[8:] for v in host['SecurityOpt'] if v.startswith('seccomp='))) == candidate
-                assert set(host['Tmpfs']) == {'/home/appuser', '/workspace', '/tmp', '/workspace/.codex', '/workspace/.agents'}
+                assert host['Tmpfs'] == worker_tmpfs(artifact_mode)
                 for path in ['/workspace/.codex', '/workspace/.agents']:
                     assert 'ro' in host['Tmpfs'][path].split(',')
             else:
@@ -197,6 +196,10 @@ def main():
         # Actual-image masks must deny mutation before any credential exists.
         mask_check = "from pathlib import Path; import subprocess; p=['/workspace/.codex','/workspace/.agents']; assert all(not list(Path(x).iterdir()) for x in p); assert all(subprocess.run(['sh','-c','touch '+x+'/blocked'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode != 0 for x in p)"
         d('exec', ids['worker'], 'python3', '-I', '-c', mask_check)
+        if artifact_mode:
+            readonly_check = "import sys,json;sys.path.insert(0,'/app/scripts/staging');from teetime_artifact_workspace import require_readonly_workspace;print(json.dumps(require_readonly_workspace('/workspace')))"
+            denied = json.loads(d('exec', ids['worker'], 'python3', '-I', '-c', readonly_check))
+            assert denied.get('write') == denied.get('create') == 'EROFS' and denied.get('rename') in ['EROFS','EBUSY']
         manifest_path = receipt/'manifest.json'
         manifest_path.write_text(json.dumps(manifest))
         subprocess.Popen([sys.executable, str(root/'teetime_watchdog.py'), '--docker', args.docker,

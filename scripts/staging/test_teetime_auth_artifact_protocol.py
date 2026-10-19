@@ -44,6 +44,7 @@ class ArtifactProtocolTests(unittest.TestCase):
             for path in MODEL_PATHS if path!='README.md']}).encode()
         candidate=parse_demo_artifact(raw,prepared=execution.prepared,expected_binding=dict(execution.binding))
         value=self.worker()
+        value['workspaceDiagnostic']={'category':'unchanged','entryCount':2,'maskEntryCount':0}
         value.update({'artifactBase64':base64.b64encode(raw).decode(),'artifactHash':candidate.artifact_hash,
                       'bindingHash':candidate.binding_hash,'manifestHash':candidate.manifest_hash,
                       'sourceTree':candidate.source_tree,'elapsedMs':600000})
@@ -52,6 +53,20 @@ class ArtifactProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError): validate_worker_result(value,nonce=self.nonce,policy_hash='b'*64)
         with self.assertRaises(ValueError):
             validate_worker_result({**value,'sourceTree':'0'*40},nonce=self.nonce,policy_hash='b'*64,execution=execution)
+
+    def test_demo_workspace_diagnostics_are_closed_bounded_and_consistent(self):
+        import test_teetime_demo_execution as fixtures
+        fixture=fixtures.DemoExecutionTests();fixture.setUp();execution=fixture.parse()
+        value=empty_worker_result(demo=True)
+        value['workspaceDiagnostic']={'category':'inventory_changed','entryCount':17,'maskEntryCount':0}
+        validate_worker_result(value,nonce=self.nonce,policy_hash='b'*64,execution=execution)
+        for diagnostic in [{'category':'private-file-name','entryCount':2,'maskEntryCount':0},
+                           {'category':'inventory_changed','entryCount':18,'maskEntryCount':0},
+                           {'category':'unchanged','entryCount':2,'maskEntryCount':0},
+                           {'category':'inspection_failed','entryCount':0,'maskEntryCount':0,'path':'private'}]:
+            with self.subTest(diagnostic=diagnostic),self.assertRaises(ValueError):
+                validate_worker_result({**value,'workspaceDiagnostic':diagnostic},
+                                      nonce=self.nonce,policy_hash='b'*64,execution=execution)
 
     def test_transitive_image_python_import_closure_is_frozen_and_measured(self):
         staging = Path(__file__).resolve().parent

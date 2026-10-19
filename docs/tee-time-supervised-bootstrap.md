@@ -438,3 +438,49 @@ CI39188515400 passed at6de728c3b56872ac868f4947c6900a5f72998aff, before this sli
 This connection still needs frozen-source CI, image/package publication, actual
 independent plan review and operational qualification. No authenticated model call,
 app candidate, preview or app acceptance is claimed by these source tests.
+
+## First actual supervised artifact attempt and workspace repair
+
+The exact independent plan approval was recorded/read back as review5566379440 on
+private XO PR3392 head87752712da99215e31b94de945f9326a6e5e094c, package
+9c78858430bb9a2b4f367ca61a0c4b8741e9d6b7070e4bb4628bae7a8e48032d.
+The source was e06e33948b6d2a52d47e27d93eacf014ce5cf16e and measured worker
+9d80557360897e64268ee5f245c1e82d25dc09665de71544700d3a587e531945.
+The native base actually reports3a9fbee193100897c5064dabfdc2cd6697b7618e;
+an incorrect historical base assumption and initial LF/CRLF policy-hash mismatch
+were rejected before controller/account use and retained separately.
+
+Actual attempt ec3fd06e-5f27-4eda-9af1-2f759e4157ae on the existing paused run
+completed at2026-10-19T02:43:09.062Z. Six authenticated preflights, one query,
+one assistant/terminal, normal stream/iterator closure and candidate parsing ran.
+Final workspaceUnchanged was false, so every artifact byte/identity was scrubbed.
+The result is FAILED: quality/required_stage_failed, not an accepted app candidate.
+Worker auth remained unchanged, OOM delta0, proxy and owned cleanup verified.
+A fresh read found no owned containers/networks. First result SHA256:
+131db951dc23fff63896c9fb581783e0da86cb9abe72521b2acb67e17b4608b5.
+The first claim, lock, authority and receipts remain retained; no automatic retry.
+The failed packet does not identify the workspace delta; its cause is unproven.
+
+The source repair removes writable /workspace tmpfs in artifact/demo modes only,
+requires an image-owned empty directory and retains the two read-only masks.
+Before READY, actual write/create denial must be EROFS and rename must fail with
+EROFS/EBUSY. Filesystem-canary mounts remain unchanged. The new image must separately
+prove the underlying ordinary two-directory inventory before runtime masks apply.
+No such repaired-image qualification or second authenticated attempt is claimed yet.
+
+Demo-only diagnostics contain a closed category and capped counts, no names/content
+or raw exception. They remain subject to strict consistency and cannot convert a
+failed workspace check into success. Four workspace tests, eleven protocol tests,
+six worker tests, four existing operator tests and two controller-parser tests pass.
+
+```
+python -m unittest discover -s scripts/staging -p test_teetime_artifact_workspace.py
+python -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_protocol.py
+python -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_worker.py
+```
+
+Any successor needs a separately reviewed package binding the terminal first
+attempt/result and explicit reconciliation, a fresh attempt-specific control root,
+supersedesAttemptId, fresh approval and the existing store/claim readback. The
+existing first-attempt rejection is not bypassed or reset. App implementation,
+actual app tests, app CI/CD, candidate review and preview remain outstanding.
