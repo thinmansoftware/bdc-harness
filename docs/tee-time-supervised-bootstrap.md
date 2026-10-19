@@ -1,5 +1,27 @@
 # Tee-time supervised bootstrap source preparation
 
+## Source-only one-use diagnostic packet syntax
+
+teetime_minimal_execution.py parses a separate canonical bounded diagnostic
+execution packet. It contains no caller prompt, product frame, artifact path or
+execution permission. It binds fixed provider/model/limits, selected helper
+identities, four distinct chronological predecessor identities and separate
+run-policy and measured provider-policy hashes. Inputs are snapshotted into a
+frozen dataclass and immutable nested mappings. Parsing is not live verification
+of policy, history, review, custody or resources.
+
+The complete installed inventory includes the packet, so it is external rather
+than embedded in a circular packet hash. minimal_admission_hash hashes the exact
+domain/version-tagged canonical object binding packet/inventory/operator/source.
+validate_minimal_carrier compares the exact canonical carrier to those identities.
+It does not fetch GitHub or establish an actual approval. The future observer
+must read the fixed carrier from the actual independently reviewed current head.
+
+Offline check: `python -m unittest discover -s scripts/staging -p test_teetime_minimal_execution.py`.
+Claim persistence, complete live attempt-set reconciliation, operator integration
+and actual review observation remain unimplemented. No database/account/image
+mutation, fifth implementation attempt or authenticated diagnostic is enabled.
+
 ## Source-only minimal remote controller branch
 
 The uninstalled run-teetime-auth-canary.py source now has an explicit
