@@ -381,3 +381,20 @@ or automatically replayed. GitHub/SQLite are not an atomic transaction.
 The operational PC observation packet and remote entry join are still outstanding.
 No model-phase claim has been consumed by these source tests. New demo collector,
 execution/result and phase-transition tests are explicitly included in offline CI.
+
+## Live plan observation source checkpoint
+
+CI39187639845 passed at25f06984880139f5c192b87b04633a0f04799785.
+The PC observer now reads the actual private PR3392, exact-head package bytes,
+all review pages and a final PR head. It emits a closed packet bound to the run,
+package, prepared binding, remote and fresh nonce. The remote parser rejects
+expired, foreign or malformed packets and freezes its parsed review snapshot.
+Five Python and four Bun tests pass, including a Python-produced packet consumed
+by the TypeScript parser. The live PC GitHub read succeeded; the execution package
+has not yet been published, so no approval or execution is claimed.
+
+The45-second collection window is a freshness rejection window, not an overall
+process deadline. Individual reads are bounded; GitHub observations are not an
+atomic snapshot. The operational join must recheck expiry on every callback and
+must accept only the live authenticated SSH packet, never a saved receipt. The
+remote persisted-run join and authenticated launcher remain outstanding.
