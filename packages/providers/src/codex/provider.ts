@@ -40,6 +40,7 @@ import {
 } from '../auth-refresh/index.js';
 import { createLogger } from '@archon/paths';
 import { classifyProbeError } from '../probe/probe-classifier';
+import { inspectSdkFailureEvidence, type SdkFailureEvidence } from './sdk-failure-evidence';
 // Internal diagnostic metadata only. No text, identifiers or caller properties.
 export type CodexFailureOrigin =
   | 'sdk_iterator_exception'
@@ -53,6 +54,8 @@ export interface CodexFailureOriginRecord {
 }
 
 const records = new WeakMap<object, Readonly<CodexFailureOriginRecord>>();
+const sdkEvidence = new WeakMap<object, Readonly<SdkFailureEvidence>>();
+const unknownSdkEvidence = inspectSdkFailureEvidence(null);
 const unknown = Object.freeze({ version: 1, origin: 'unknown' } as const);
 const origins = new Set<string>([
   'sdk_iterator_exception', 'native_turn_failed',
@@ -62,16 +65,25 @@ function identity(value: unknown): value is object {
   return value !== null && (typeof value === 'object' || typeof value === 'function');
 }
 export function markCodexFailureOrigin<T>(value: T, origin: CodexFailureOrigin): T {
-  if (identity(value) && !records.has(value) && origins.has(origin))
+  if (identity(value) && !records.has(value) && origins.has(origin)) {
     records.set(value, Object.freeze({ version: 1, origin }));
+    if (origin === 'sdk_iterator_exception') sdkEvidence.set(value, inspectSdkFailureEvidence(value));
+  }
   return value;
 }
 export function readCodexFailureOrigin(value: unknown): Readonly<CodexFailureOriginRecord> {
   return identity(value) ? records.get(value) ?? unknown : unknown;
 }
+export function readCodexSdkFailureEvidence(value: unknown): Readonly<SdkFailureEvidence> {
+  return identity(value) ? sdkEvidence.get(value) ?? unknownSdkEvidence : unknownSdkEvidence;
+}
 export function copyCodexFailureOrigin<T>(source: unknown, replacement: T): T {
   const record = identity(source) ? records.get(source) : undefined;
-  if (record && identity(replacement) && !records.has(replacement)) records.set(replacement, record);
+  if (record && identity(replacement) && !records.has(replacement)) {
+    records.set(replacement, record);
+    const detail = sdkEvidence.get(source as object);
+    if (detail) sdkEvidence.set(replacement, detail);
+  }
   return replacement;
 }
 

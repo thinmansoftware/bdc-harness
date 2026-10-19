@@ -77,3 +77,19 @@ test('SDK iterator return failure preserves identity and is not a consumer failu
   expect(provenance.readCodexFailureOrigin(failed))
     .toEqual({ version: 1, origin: 'sdk_iterator_exception' });
 });
+
+test('private SDK evidence survives replacement without extending origin-only record', async () => {
+  const failure = new Error('Codex Exec exited with code 1: Error loading rules: PRIVATE');
+  const events = { [Symbol.asyncIterator]() { return { next: async () => { throw failure; } }; } };
+  let observed: unknown;
+  try { for await (const _ of provenance.codexEventsWithFailureOrigin(events)) void _; }
+  catch (error) { observed = error; }
+  const replacement = provenance.copyCodexFailureOrigin(observed, new Error('enriched private'));
+  expect(provenance.readCodexFailureOrigin(replacement)).toEqual({ version: 1, origin: 'sdk_iterator_exception' });
+  const details = provenance.readCodexSdkFailureEvidence(replacement);
+  expect(details.kind).toBe('cli-exit');
+  expect(details.startupEvidence?.startupStages).toEqual(['exec-policy']);
+  expect(JSON.stringify(details)).not.toContain('PRIVATE');
+  expect(Object.keys(replacement)).toEqual([]);
+  expect(provenance.readCodexSdkFailureEvidence({ ...details }).kind).toBe('other');
+});

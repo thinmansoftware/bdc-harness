@@ -91,6 +91,20 @@ No model/account/binary change, fallback, wider egress, automatic retry, generic
 resume, fifth implementation attempt, Claude/Fable, production deployment,
 golf-provider traffic, booking, payment or purchase is included.
 
+## First source slice and admission limitation
+
+The SDK evidence helper is shared with the existing reviewer fixture, captured
+privately before enrichment, and read separately from the unchanged origin-only
+record. Getter-only or inherited names remain unknown; abort recognition is not
+exhaustive. Own data properties are read without invoking getters.
+
+The new helper must enter every applicable measured transitive dependency closure
+in the subsequent explicitly versioned receipt/source-package slice, with negative
+tests for missing or substituted bytes. Do not append it to historical shared
+path sets and silently reinterpret old packages. Until that work is qualified,
+no new diagnostic image or execution package may use this provider revision.
+Previously frozen installed sources remain unchanged.
+
 The final objective remains the simulated demo: accepted app source, functional
 booking-rule tests, build/typecheck, deterministic browser walkthrough, isolated
 preview and device verification. None is replaced by a passing diagnostic.

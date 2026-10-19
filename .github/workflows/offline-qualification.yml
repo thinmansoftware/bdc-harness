@@ -136,6 +136,7 @@ jobs:
           cd packages/providers
           bun test src/codex/restricted-provider.test.ts
           bun test src/codex/failure-provenance.test.ts
+          bun test src/codex/sdk-failure-evidence.test.ts
           bun test src/codex/restricted-canary-transport.test.ts
           bun test src/codex/restricted-sdk.test.ts
           bun test src/community/pi/restricted-review.test.ts
