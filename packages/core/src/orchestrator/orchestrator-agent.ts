@@ -248,8 +248,21 @@ async function dispatchOrchestratorWorkflow(
   workflow: WorkflowDefinition,
   userMessage: string,
   isolationHints?: HandleMessageContext['isolationHints'],
-  modelOverride?: ModelOverride
+  modelOverride?: ModelOverride,
+  announceStart = false
 ): Promise<void> {
+  if (workflow.name === 'bdc-feature-development-codex-only') {
+    await platform.sendMessage(
+      conversationId,
+      'Codex-only dispatch is not available yet; no workflow was started.'
+    );
+    return;
+  }
+
+  if (announceStart) {
+    await platform.sendMessage(conversationId, `Starting workflow: \`${workflow.name}\``);
+  }
+
   // Auto-attach project to conversation
   await db.updateConversation(conversation.id, {
     codebase_id: codebase.id,
@@ -1812,13 +1825,14 @@ async function handleWorkflowRunSlashCommand(
     return true;
   }
 
+  let globalWorkflow: WorkflowDefinition | undefined;
   try {
     const globalDiscovery = await discoverWorkflowsWithConfig(
       getArchonWorkspacesPath(),
       loadConfig
     );
     const globalWorkflows = globalDiscovery.workflows.map(w => w.workflow);
-    const globalWorkflow = resolveWorkflowByName(workflowName, globalWorkflows);
+    globalWorkflow = resolveWorkflowByName(workflowName, globalWorkflows);
     if (globalWorkflow) {
       const binding = resolveBoundCodebase({
         workflowName,
@@ -1831,7 +1845,6 @@ async function handleWorkflowRunSlashCommand(
         { workflowName, boundCodebase: codebase.name, source: binding.source },
         'workflow_codebase_bound'
       );
-      await platform.sendMessage(conversationId, `Starting workflow: \`${globalWorkflow.name}\``);
       await dispatchOrchestratorWorkflow(
         platform,
         conversationId,
@@ -1840,11 +1853,15 @@ async function handleWorkflowRunSlashCommand(
         globalWorkflow,
         binding.userMessage,
         isolationHints,
-        modelOverride
+        modelOverride,
+        true
       );
       return true;
     }
   } catch (error) {
+    if (globalWorkflow?.name === 'bdc-feature-development-codex-only') {
+      throw error;
+    }
     getLog().warn({ err: error as Error, workflowName }, 'global_workflow_run_discovery_failed');
   }
 
@@ -1878,7 +1895,6 @@ async function handleWorkflowRunSlashCommand(
       { workflowName: workflow.name, boundCodebase: codebase.name, source: binding.source },
       'workflow_codebase_bound'
     );
-    await platform.sendMessage(conversationId, `Starting workflow: \`${workflow.name}\``);
     await dispatchOrchestratorWorkflow(
       platform,
       conversationId,
@@ -1887,7 +1903,8 @@ async function handleWorkflowRunSlashCommand(
       workflow,
       binding.userMessage,
       isolationHints,
-      modelOverride
+      modelOverride,
+      true
     );
     return true;
   }
@@ -1910,7 +1927,6 @@ async function handleWorkflowRunSlashCommand(
           },
           'workflow_codebase_bound'
         );
-        await platform.sendMessage(conversationId, `Starting workflow: \`${match.workflow.name}\``);
         await dispatchOrchestratorWorkflow(
           platform,
           conversationId,
@@ -1919,7 +1935,8 @@ async function handleWorkflowRunSlashCommand(
           match.workflow,
           binding.userMessage,
           isolationHints,
-          modelOverride
+          modelOverride,
+          true
         );
         return true;
       }

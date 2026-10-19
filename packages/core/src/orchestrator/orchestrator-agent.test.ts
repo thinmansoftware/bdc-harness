@@ -2163,3 +2163,168 @@ describe('dispatchOrchestratorWorkflow -- default isolation key (Gap #2)', () =>
     expect(hints.workflowId).toBe('conv-1');
   });
 });
+
+describe('binding-v2 parent closed admission', () => {
+  const reserved = 'bdc-feature-development-codex-only';
+
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockParseCommand.mockReset();
+    mockHandleCommand.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockUpdateConversation.mockClear();
+    mockValidateAndResolveIsolation.mockClear();
+    mockExecuteWorkflow.mockClear();
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockSendQuery.mockClear();
+    mockFindResumableRunByParentConversation.mockReset();
+    mockFindResumableRunByParentConversation.mockImplementation(() => Promise.resolve(null));
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [], errors: [] })
+    );
+    mockValidateAndResolveIsolation.mockImplementation(() =>
+      Promise.resolve({ status: 'new', cwd: '/worktrees/conv-1' })
+    );
+  });
+
+  function setup(mode: string, actualName = reserved, userMessage = 'WO-parent-gate') {
+    const codebase = makeCodebaseForSync();
+    const scoped = mode === 'scoped';
+    const conversation = makeConversation({ codebase_id: scoped ? codebase.id : null });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    const codebases = mode === 'multiple' ? [codebase, makeCodebase('other-project')] : [codebase];
+    mockListCodebases.mockImplementation(() => Promise.resolve(codebases));
+    const requestName = mode === 'case-alias' ? actualName.toUpperCase() : actualName;
+    const args = ['run', requestName, userMessage];
+    if (mode === 'multiple') args.push('--project', codebase.name);
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args });
+    const workflow = makeTestWorkflowWithSource({
+      name: actualName,
+      interactive: mode === 'interactive',
+    });
+    let discoveries = 0;
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() => {
+      discoveries += 1;
+      const fallback = mode === 'repository' || mode === 'multiple';
+      return Promise.resolve({
+        workflows: fallback && discoveries === 1 ? [] : [workflow],
+        errors: [],
+      });
+    });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'ok',
+        workflow: { definition: workflow.workflow, args: userMessage },
+      })
+    );
+    if (mode === 'resumable') {
+      mockFindResumableRunByParentConversation.mockImplementation(() =>
+        Promise.resolve({
+          id: 'prior-run',
+          working_path: '/worktrees/prior-run',
+          status: 'failed',
+        })
+      );
+    }
+    const platform = makePlatform();
+    if (mode === 'non-web') platform.getPlatformType = mock(() => 'slack' as const);
+    return { platform, command: `/workflow run ${requestName} ${userMessage}` };
+  }
+
+  function expectClosed(platform: IPlatformAdapter) {
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('no workflow was started')
+    );
+    expect(platform.sendMessage).not.toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('Starting workflow:')
+    );
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+    expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
+    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockSendQuery).not.toHaveBeenCalled();
+  }
+
+  test.each([
+    'global',
+    'case-alias',
+    'repository',
+    'multiple',
+    'interactive',
+    'resumable',
+    'non-web',
+    'scoped',
+  ])('refuses actual reserved definition at parent boundary: %s', async mode => {
+    const { platform, command } = setup(mode);
+    await handleMessage(platform, 'conv-1', command);
+    expectClosed(platform);
+  });
+
+  test('failed global refusal notification cannot search or dispatch a replacement', async () => {
+    const { platform, command } = setup('global');
+    const messages: string[] = [];
+    platform.sendMessage = mock(async (_id: string, text: string) => {
+      messages.push(text);
+      if (messages.length === 1) throw new Error('parent refusal delivery failed');
+    });
+    await handleMessage(platform, 'conv-1', command);
+    expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(1);
+    expect(messages[0]).toContain('no workflow was started');
+    expect(messages).not.toContain(`Starting workflow: \`${reserved}\``);
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+    expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
+    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockSendQuery).not.toHaveBeenCalled();
+  });
+
+  test.each(['global', 'repository', 'multiple'])(
+    'ordinary %s keeps exact Starting message before attachment despite reserved message text',
+    async mode => {
+      const { platform, command } = setup(mode, 'assist', `Discuss ${reserved}`);
+      const order: string[] = [];
+      const send = platform.sendMessage;
+      platform.sendMessage = mock(async (id: string, text: string) => {
+        order.push(text);
+        await send(id, text);
+      });
+      mockUpdateConversation.mockImplementation(async () => {
+        order.push('attach');
+      });
+      await handleMessage(platform, 'conv-1', command);
+      expect(order[0]).toBe('Starting workflow: `assist`');
+      expect(order[1]).toBe('attach');
+      expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+      mockUpdateConversation.mockImplementation(() => Promise.resolve());
+    }
+  );
+
+  test('ordinary global discovery error still uses repository fallback', async () => {
+    const { platform, command } = setup('repository', 'assist');
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({
+        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+        errors: [],
+      })
+    );
+    mockDiscoverWorkflowsWithConfig.mockImplementationOnce(() =>
+      Promise.reject(new Error('global unavailable'))
+    );
+    await handleMessage(platform, 'conv-1', command);
+    expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(2);
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'Starting workflow: `assist`');
+  });
+});
