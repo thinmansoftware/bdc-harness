@@ -6,7 +6,7 @@ import stat
 import tempfile
 import unittest
 
-from teetime_startup_packet import startup_metadata, write_private_packet, read_private_metadata
+from teetime_startup_packet import startup_metadata, capture_metadata, write_private_packet, read_private_metadata
 
 
 def packet():
@@ -115,6 +115,63 @@ class StartupPacketTests(unittest.TestCase):
             path.chmod(0o600)
             os.link(path,root/'hardlink')
             with self.assertRaises(ValueError): read_private_metadata(root,'teetime-startup-123-1')
+
+
+
+class StartupWarningEnvelopeTests(unittest.TestCase):
+    def envelope(self, warnings=None):
+        return {'kind':'teetime-thread-start-debug-v2','outcome':packet(),
+                'configWarnings':warnings if warnings is not None else [{'summary':'PRIVATE-WARNING','details':None}]}
+
+    def test_new_envelope_preserves_legacy_rejection_and_projects_no_private_fields(self):
+        raw=encode(self.envelope())
+        with self.assertRaises(ValueError): startup_metadata(raw)
+        result=capture_metadata(raw)
+        self.assertEqual(result['kind'],'teetime-thread-start-metadata-v2')
+        self.assertEqual(result['configWarnings'],{'kind':'configWarning','count':1})
+        self.assertEqual(result['sha256'],hashlib.sha256(raw).hexdigest())
+        self.assertEqual(result['bytes'],len(raw))
+        self.assertEqual(result['rpcCode'],-32603)
+        self.assertNotIn('PRIVATE',json.dumps(result))
+        self.assertNotIn('summary',json.dumps(result))
+        self.assertEqual(capture_metadata(encode(packet())),startup_metadata(encode(packet())))
+
+    def test_optional_fields_null_details_and_complete_positive_ranges(self):
+        for warning in [{'summary':'','details':None},
+                        {'summary':'private','details':'details','path':'/private/path',
+                         'range':{'start':{'line':2,'column':2},'end':{'line':1,'column':1}}}]:
+            value=self.envelope([warning])
+            value['outcome'].update(threadCreated=True,rpcError=None)
+            result=capture_metadata(encode(value))
+            self.assertTrue(result['threadCreated'])
+            self.assertNotIn('private',json.dumps(result))
+
+    def test_rejects_wrong_schema_types_ranges_versions_and_warning_limits(self):
+        good={'summary':'private','details':None}
+        bad=[{}, {'summary':'private'}, {**good,'summary':None}, {**good,'details':2},
+             {**good,'path':None}, {**good,'range':None}, {**good,'extra':1},
+             {**good,'summary':'\ud800'}, {**good,'range':{'start':{},'end':{}}}]
+        for number in [0,-1,1.5,True,9007199254740992]:
+            bad.append({**good,'range':{'start':{'line':number,'column':1},'end':{'line':1,'column':1}}})
+        for warning in bad:
+            with self.subTest(warning=repr(warning)):
+                with self.assertRaises(ValueError): capture_metadata(encode(self.envelope([warning])))
+        for warnings in [None,{},[good]*5,[{'summary':'x'*16384,'details':None}]]:
+            value=self.envelope(); value['configWarnings']=warnings
+            with self.assertRaises(ValueError): capture_metadata(encode(value))
+        for patch in [{'kind':'unknown'}, {'extra':1}, {'outcome':self.envelope()}]:
+            with self.assertRaises(ValueError): capture_metadata(encode({**self.envelope(),**patch}))
+        raw=encode(self.envelope())
+        with self.assertRaises(ValueError): capture_metadata(raw.replace(b'"outcome":',b'"outcome":{},"outcome":'))
+
+    @unittest.skipUnless(os.name=='posix','requires actual POSIX filesystem')
+    def test_private_custody_round_trips_v2_bytes_and_projects_only_metadata(self):
+        raw=encode(self.envelope())
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve()
+            path=write_private_packet(root,'teetime-startup-123-1',raw)
+            self.assertEqual(path.read_bytes(),raw)
+            self.assertEqual(read_private_metadata(root,'teetime-startup-123-1'),capture_metadata(raw))
 
 
 if __name__=='__main__': unittest.main()

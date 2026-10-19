@@ -113,11 +113,60 @@ def startup_metadata(raw):
             'catalogHash':value['catalogHash'],'modelTurnsSent':0}
 
 
+def capture_metadata(raw):
+    """Explicit version routing; the historical startup_metadata reader stays v1-only."""
+    if type(raw) is not bytes or not 1 <= len(raw) <= 65536:
+        raise ValueError('startup capture byte bound')
+    try:
+        value=json.loads(raw.decode('utf-8'),object_pairs_hook=unique_object,parse_constant=reject_constant)
+    except (ValueError,UnicodeError,RecursionError):
+        raise ValueError('startup capture JSON rejected') from None
+    if type(value) is dict and value.get('kind')=='teetime-thread-start-debug-v1':
+        return startup_metadata(raw)
+    if (type(value) is not dict or set(value)!={'kind','outcome','configWarnings'}
+            or value['kind']!='teetime-thread-start-debug-v2'):
+        raise ValueError('startup capture envelope rejected')
+    warnings=value['configWarnings']
+    if type(warnings) is not list or len(warnings)>4:
+        raise ValueError('startup warning count rejected')
+    def position(item):
+        return (type(item) is dict and set(item)=={'line','column'}
+                and all(type(item[key]) is int and 1<=item[key]<=9007199254740991
+                        for key in ('line','column')))
+    retained_bytes=0
+    for warning in warnings:
+        if (type(warning) is not dict or not {'summary','details'}<=set(warning)
+                or not set(warning)<={'summary','details','path','range'}
+                or type(warning['summary']) is not str
+                or not (warning['details'] is None or type(warning['details']) is str)
+                or ('path' in warning and type(warning['path']) is not str)):
+            raise ValueError('startup warning fields rejected')
+        if 'range' in warning:
+            span=warning['range']
+            if (type(span) is not dict or set(span)!={'start','end'}
+                    or not position(span['start']) or not position(span['end'])):
+                raise ValueError('startup warning range rejected')
+        try:
+            retained_bytes+=len(json.dumps(warning,separators=(',',':'),ensure_ascii=False,allow_nan=False).encode('utf-8'))
+        except (ValueError,UnicodeError,RecursionError):
+            raise ValueError('startup warning encoding rejected') from None
+    if retained_bytes>16384:
+        raise ValueError('startup warning byte bound')
+    try:
+        outcome=json.dumps(value['outcome'],separators=(',',':'),ensure_ascii=False,allow_nan=False).encode('utf-8')
+    except (ValueError,UnicodeError,RecursionError):
+        raise ValueError('startup capture outcome encoding rejected') from None
+    metadata=startup_metadata(outcome)
+    return {**metadata,'kind':'teetime-thread-start-metadata-v2',
+            'sha256':hashlib.sha256(raw).hexdigest(),'bytes':len(raw),
+            'configWarnings':{'kind':'configWarning','count':len(warnings)}}
+
+
 def write_private_packet(root,owner,raw):
     # Trusted parent precondition: a fresh runner-owned parent, not exposed to the
     # container or concurrent untrusted host actors. These checks do not defend
     # against an actor replacing ancestor directories in a shared filesystem.
-    startup_metadata(raw)
+    capture_metadata(raw)
     if re.fullmatch('teetime-startup-[0-9]+-[0-9]+',owner or '') is None:
         raise ValueError('startup private owner rejected')
     if os.name!='posix': raise RuntimeError('startup private storage requires qualified POSIX permissions')
@@ -170,4 +219,4 @@ def read_private_metadata(root,owner):
         stable=('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
         if any(getattr(info,key)!=getattr(after,key) for key in stable) or len(raw)!=info.st_size:
             raise ValueError('startup private upload file changed')
-    return startup_metadata(raw)
+    return capture_metadata(raw)

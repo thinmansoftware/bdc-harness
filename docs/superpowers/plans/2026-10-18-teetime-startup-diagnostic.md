@@ -183,3 +183,76 @@ and successful packet paths remain unchanged. No new runtime helper dependency.
 Source publication needs actual independent review and checks. Any later native
 capture needs separately reviewed activation and a fresh finite execution grant.
 No authenticated diagnostic or fifth implementation attempt is authorized here.
+
+
+## Pinned ConfigWarning conformance correction source plan
+
+Actual capture39245375824 at activation401e556d24b67e1bc3c1c7cfdea9ecab502844aa
+and helper91cf085976aa630f55f318025e2e276666f0a61b failed with v3
+thread-start-exchange/notification-shape, response2Observedfalse,
+acceptedNotifications0, observedBytes1846, reapUncertainfalse. Owned cleanup
+passed and artifact count0. Its finite grant is consumed, no retry authorized.
+This proves local notification rejection, not that configWarning was received.
+
+The independent replay and pinned native protocol establish a separate real
+conformance gap. The independent architect approved source preparation and offline
+tests for a narrow correction, without another metadata-only capture first.
+Warning text must remain privately inspectable: a count alone could conceal a
+configuration warning needed to interpret the eventual thread-start result.
+
+Reuse StartupProtocol. Accept only method configWarning during the existing
+thread-exchange state with a validated closed notification envelope. Parameters:
+summary:string, details:required string|null, path:optional string, range:optional
+object with exactly start/end positions. Each position has exactly line/column,
+positive safe integers per the pinned 1-based documentation. Do not invent a
+position-ordering rule. Keep unknown methods and malformed shapes rejected.
+
+Permit at most4 warnings and16384 total UTF-8 bytes of retained warning JSON,
+within the existing65536 aggregate output bound and unchanged exchange deadline.
+Keep thread/started count separate. No request, native config, model, auth,
+confinement, resource, timeout, retry or fallback change.
+
+Introduce an explicitly versioned private capture envelope for validated warning
+objects and the existing v1 outcome. Reuse v1 validation internally; its exact
+fields/meaning and historical reader path stay unchanged. Version public capture
+metadata/counters explicitly if changed. Public evidence permits only a fixed
+known-warning kind/count, never summary/details/path/range values or arbitrary
+method strings. Retain warnings only through validated private custody, with
+whole-envelope hashes/byte bounds and unchanged ownership/exclusive-file cleanup.
+A warning is neither approval nor proof of configuration correctness or thread
+creation. Require private inspection before interpreting captured warnings.
+
+The initial slice should keep failed exchange handling unsuccessful and closed;
+no new artifact-on-failure bypass. If response2 cannot be captured and reaped,
+absence of a private warning artifact is a limitation, not permission to retry.
+Success capture may contain a valid native RPC error, as in the existing design;
+it still cannot imply a successful thread or qualify a real account/builder.
+
+TDD: replay warning then valid RPC error/success, null details, omitted optional
+fields, complete ranges; reject wrong keys/types, null optional objects, unsafe
+integers, count and retained-byte overflow, malformed/unknown notifications.
+Verify separate counts and existing bounds, private v1 historical acceptance,
+strict versioned envelope validation, no warning text/path in public metadata,
+and actual synthetic entry-to-independent-host projection without native code.
+
+Source publication needs independent actual-diff review and new exact CI. Any
+later activation and single native capture require their own recorded review and
+fresh finite exact-case approval. No account, query or implementation attempt is
+authorized by this source plan. The full simulated demo remains the goal.
+
+
+### ConfigWarning source verification
+
+TDD observed the existing protocol rejecting valid ConfigWarning, the absent
+independent v2 validator, and the actual private emitter failing the new host
+projection before implementation. Local verification after correction:
+26 Bun tests /256 assertions passed;13 packet tests passed with3 POSIX-only
+skips on Windows;10 control tests passed with1 POSIX-only skip. Scripts TypeScript
+check exited0. Changed code ASCII and git diff whitespace checks passed.
+
+Independent Codex intake_architect inspected all8 changed files against91cf0859
+and approved SOURCE PUBLICATION ONLY, no required findings. Reviewer did not
+rerun tests. New exact CI must establish actual Linux/POSIX custody results before
+activation review. No native capture, account operation, dispatch or retry was
+approved or performed. Failed-exchange v3 counters retain their prior meaning:
+acceptedNotifications counts thread/started only, never configuration warnings.

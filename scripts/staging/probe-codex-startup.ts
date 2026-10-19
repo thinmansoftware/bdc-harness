@@ -101,17 +101,22 @@ async function main(): Promise<void> {
   requireValue(readFileSync(home + '/auth.json', 'utf8') === auth);
   requireValue(readFileSync(catalogPath, 'utf8') === compared.catalogText);
   phase = 'packet-serialization';
+  const { configWarnings, ...outcome } = result;
   const packet = JSON.stringify({
-    kind: 'teetime-thread-start-debug-v1',
-    steps: ['initialize', 'initialized', 'thread/start'],
-    ...result,
-    binaryHash,
-    sourceFixtureHash: compared.sourceFixtureHash,
-    catalogHash: compared.catalogHash,
-    authUnchanged: true,
-    catalogUnchanged: true,
-    childReaped: true,
-    modelTurnsSent: 0,
+    kind: 'teetime-thread-start-debug-v2',
+    configWarnings,
+    outcome: {
+      kind: 'teetime-thread-start-debug-v1',
+      steps: ['initialize', 'initialized', 'thread/start'],
+      ...outcome,
+      binaryHash,
+      sourceFixtureHash: compared.sourceFixtureHash,
+      catalogHash: compared.catalogHash,
+      authUnchanged: true,
+      catalogUnchanged: true,
+      childReaped: true,
+      modelTurnsSent: 0,
+    },
   });
   requireValue(Buffer.byteLength(packet) <= 65536);
   // Private controller capture only. This must never be piped into public CI logs.

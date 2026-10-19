@@ -24,6 +24,12 @@ interface Outcome {
   threadCreated: boolean;
   rpcError: Record<string, unknown> | null;
 }
+export interface ConfigWarning {
+  summary: string;
+  details: string | null;
+  path?: string;
+  range?: { start: { line: number; column: number }; end: { line: number; column: number } };
+}
 const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -68,6 +74,11 @@ export class StartupProtocol {
   private state: 'new' | 'initialize' | 'thread' | 'complete' | 'failed' = 'new';
   private result?: Outcome;
   private notified = false;
+  private retainedWarnings: ConfigWarning[] = [];
+  private warningBytes = 0;
+
+  warnings(): ConfigWarning[] { return structuredClone(this.retainedWarnings); }
+
 
   begin(): Message {
     if (this.state !== 'new') throw new Error('startup protocol already started');
@@ -99,6 +110,32 @@ export class StartupProtocol {
     if (!object(value) || !['initialize', 'thread'].includes(this.state)) reject('response-envelope');
     if (value.jsonrpc !== undefined && value.jsonrpc !== '2.0') reject('response-envelope');
     if (value.id === undefined) {
+      if (value.method === 'configWarning') {
+        const params = value.params;
+        const text = (v: unknown): v is string => typeof v === 'string'
+          && Buffer.from(v, 'utf8').toString('utf8') === v;
+        const position = (v: unknown): boolean => object(v)
+          && Object.keys(v).length === 2 && Object.hasOwn(v, 'line') && Object.hasOwn(v, 'column')
+          && Number.isSafeInteger(v.line) && (v.line as number) > 0
+          && Number.isSafeInteger(v.column) && (v.column as number) > 0;
+        if (this.state !== 'thread'
+          || Object.keys(value).some(key => !['method', 'params', 'jsonrpc'].includes(key))
+          || !object(params)
+          || Object.keys(params).some(key => !['summary', 'details', 'path', 'range'].includes(key))
+          || !text(params.summary) || !Object.hasOwn(params, 'details')
+          || !(params.details === null || text(params.details))
+          || (Object.hasOwn(params, 'path') && !text(params.path))
+          || (Object.hasOwn(params, 'range') && (!object(params.range)
+            || Object.keys(params.range).length !== 2
+            || !position(params.range.start) || !position(params.range.end))))
+          reject('notification-shape');
+        const bytes = Buffer.byteLength(JSON.stringify(params));
+        if (this.retainedWarnings.length >= 4 || this.warningBytes + bytes > 16384)
+          reject('output-bound');
+        this.retainedWarnings.push(structuredClone(params) as unknown as ConfigWarning);
+        this.warningBytes += bytes;
+        return [];
+      }
       if (
         this.state !== 'thread' ||
         this.notified ||
@@ -213,7 +250,7 @@ interface StartupChild {
 export async function exchangeStartup(child: StartupChild, timeout = 12000,
   observePhase?: (phase: 'initialize-exchange' | 'thread-start-exchange') => void,
   observeFailure?: (value: StartupExchangeObservation) => void
-): Promise<Outcome> {
+): Promise<Outcome & { configWarnings: ConfigWarning[] }> {
   const protocol = new StartupProtocol();
   let bytes = 0, acceptedNotifications = 0;
   let response2Observed = false, done = false, reapUncertain = false;
@@ -271,7 +308,7 @@ export async function exchangeStartup(child: StartupChild, timeout = 12000,
           } catch { reject('utf8-json'); }
           if (object(response) && response.id === 2) response2Observed = true;
           const requests = protocol.accept(response);
-          if (object(response) && response.id === undefined) acceptedNotifications++;
+          if (object(response) && response.id === undefined && response.method === 'thread/started') acceptedNotifications++;
           for (const request of requests) {
             if (request.method === 'thread/start') phase('thread-start-exchange');
             write(JSON.stringify(request) + '\n');
@@ -322,5 +359,5 @@ export async function exchangeStartup(child: StartupChild, timeout = 12000,
   }
   if (primary !== undefined || reapUncertain || outcome === undefined)
     throw new Error('startup exchange rejected');
-  return outcome;
+  return { ...outcome, configWarnings: protocol.warnings() };
 }

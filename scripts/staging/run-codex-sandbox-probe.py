@@ -8,7 +8,7 @@ import subprocess
 import uuid
 from teetime_bounded_process import capture
 from teetime_reviewer_probe import reviewer_settings, verify_reviewer_limits, remove_owned_reviewer, reviewer_failure_diagnostic
-from teetime_startup_packet import startup_metadata, write_private_packet, startup_failure_diagnostic
+from teetime_startup_packet import capture_metadata, write_private_packet, startup_failure_diagnostic
 from teetime_startup_control import startup_settings, require_private_context, verify_startup_identity, BINARY_HASH
 
 
@@ -321,7 +321,7 @@ console.log(JSON.stringify(hashes));
                                + "; " + diagnostic)
         if args.kind == 'startup':
             startup_raw=result.stdout
-            metadata=startup_metadata(startup_raw)
+            metadata=capture_metadata(startup_raw)
             verify_startup_identity(metadata)
             assert stopped['State']['OOMKilled'] is False
             startup_receipt={'kind':'teetime-thread-start-receipt-v1','metadata':metadata,
