@@ -11,10 +11,21 @@ import {
   type SupervisedReconciliation,
 } from './tee-time-supervised-model-phase';
 import type { ProviderAttemptRecord } from './types';
+import * as modelPhase from './tee-time-supervised-model-phase';
 
 const roots: string[] = [];
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true });
+});
+
+test('shared exact-head review selection retains independent actionable chronology', async () => {
+  const f = await fixture();
+  const review = await f.input.readReview();
+  expect(modelPhase.approvedSupervisedPlanReview(review, f.input.reviewHead)).toBe(123);
+  expect(() => modelPhase.approvedSupervisedPlanReview({...review, head: 'f'.repeat(40)}, f.input.reviewHead)).toThrow();
+  expect(() => modelPhase.approvedSupervisedPlanReview({...review, author: 'thinman-overseer[bot]'}, f.input.reviewHead)).toThrow();
+  expect(() => modelPhase.approvedSupervisedPlanReview({...review, reviews: [...review.reviews,
+    {...review.reviews[0]!, id: 999, state: 'CHANGES_REQUESTED', submittedAt: '2026-10-19T23:59:00.000Z'}]}, f.input.reviewHead)).toThrow();
 });
 
 async function successorFixture() {

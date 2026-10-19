@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { acquireSupervisedController, claimSupervisedPhase } from './tee-time-supervised-bootstrap';
+import * as bootstrap from './tee-time-supervised-bootstrap';
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -22,6 +23,38 @@ const reviewed = {
   reviewer: 'independent-reviewer',
   state: 'APPROVED' as const,
 };
+
+test('diagnostic claim is separate, exclusive and cannot enter legacy phase selector', async () => {
+  const root = await fixture();
+  const owner = await acquireSupervisedController(root, binding);
+  await expect(claimSupervisedPhase(owner, 'diagnostic' as 'model', reviewed)).rejects.toThrow();
+  await bootstrap.claimSupervisedDiagnosticPhase(owner, reviewed);
+  expect(await readFile(join(root, 'diagnostic.claim.json'), 'ascii')).toBe(JSON.stringify({
+    version: 1, phase: 'diagnostic', ...reviewed,
+  }) + '\n');
+  await expect(bootstrap.claimSupervisedDiagnosticPhase(owner, reviewed)).rejects.toThrow();
+  expect((await readdir(root)).includes('model.claim.json')).toBe(false);
+  await owner.releaseAfterNormalCompletion();
+});
+
+test('partial diagnostic claim is preserved and never recovered automatically', async () => {
+  const root = await fixture();
+  const owner = await acquireSupervisedController(root, binding);
+  await writeFile(join(root, 'diagnostic.claim.json'), 'partial');
+  await expect(bootstrap.claimSupervisedDiagnosticPhase(owner, reviewed)).rejects.toThrow();
+  expect(await readFile(join(root, 'diagnostic.claim.json'), 'ascii')).toBe('partial');
+  await owner.releaseAfterNormalCompletion();
+});
+
+test('legacy model claim bytes are unchanged by shared diagnostic primitive', async () => {
+  const root = await fixture();
+  const owner = await acquireSupervisedController(root, binding);
+  await claimSupervisedPhase(owner, 'model', reviewed);
+  expect(await readFile(join(root, 'model.claim.json'), 'ascii')).toBe(JSON.stringify({
+    version: 1, phase: 'model', ...reviewed,
+  }) + '\n');
+  await owner.releaseAfterNormalCompletion();
+});
 
 test('exclusive controller ownership persists until verified normal completion', async () => {
   const root = await fixture();

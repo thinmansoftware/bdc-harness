@@ -113,6 +113,24 @@ export async function claimSupervisedPhase(
 ): Promise<void> {
   if (!active.has(controller) || !['model', 'publish'].includes(phase))
     throw new Error('owned controller and closed phase required');
+  await claimReviewedPhase(controller, phase, review);
+}
+
+// Separate fixed sidecar phase. This primitive does not establish actual review,
+// run policy, history reconciliation or provider-attempt persistence.
+export async function claimSupervisedDiagnosticPhase(
+  controller: SupervisedController,
+  review: SupervisedReview
+): Promise<void> {
+  await claimReviewedPhase(controller, 'diagnostic', review);
+}
+
+async function claimReviewedPhase(
+  controller: SupervisedController,
+  phase: 'model' | 'publish' | 'diagnostic',
+  review: SupervisedReview
+): Promise<void> {
+  if (!active.has(controller)) throw new Error('owned controller required');
   if (
     !review ||
     Object.keys(review).sort().join(',') !== 'bindingHash,reviewHead,reviewId,reviewer,state' ||

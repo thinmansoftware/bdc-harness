@@ -25,6 +25,36 @@ export interface SupervisedPlanReview {
   }[];
 }
 
+// Pure shared review chronology. The caller must obtain actual current GitHub
+// records; structurally valid data alone is never an operational grant.
+export function approvedSupervisedPlanReview(review: SupervisedPlanReview, reviewHead: string): number {
+  const gate = 'thinman-overseer[bot]';
+  if (
+    review.head !== reviewHead || review.state !== 'OPEN' || !review.complete ||
+    review.author.toLowerCase() === gate || !Array.isArray(review.reviews)
+  ) throw new Error('current complete independent plan review required');
+  const latest = new Map<string, SupervisedPlanReview['reviews'][number]>();
+  for (const item of review.reviews) {
+    if (!Number.isSafeInteger(item.id) || item.id <= 0 || typeof item.login !== 'string' ||
+      !/^[a-f0-9]{40}$/.test(item.head) || typeof item.submittedAt !== 'string' ||
+      !Number.isFinite(Date.parse(item.submittedAt)) ||
+      !['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED', 'COMMENTED', 'PENDING'].includes(item.state))
+      throw new Error('malformed actual review record');
+    if (item.state === 'COMMENTED' || item.state === 'PENDING') continue;
+    const login = item.login.toLowerCase();
+    const prior = latest.get(login);
+    if (prior && Date.parse(prior.submittedAt) === Date.parse(item.submittedAt) &&
+      (prior.state !== item.state || prior.head !== item.head))
+      throw new Error('ambiguous actionable review chronology');
+    if (!prior || Date.parse(prior.submittedAt) < Date.parse(item.submittedAt)) latest.set(login, item);
+  }
+  const approval = latest.get(gate);
+  if (!approval || approval.state !== 'APPROVED' || approval.head !== reviewHead ||
+      [...latest.values()].some(item => item.state === 'CHANGES_REQUESTED'))
+    throw new Error('independent exact-head approval missing or superseded');
+  return approval.id;
+}
+
 // This is one explicitly reviewed successor, not a retry policy. The operational
 // callback must observe the original files, paused run and Docker resources.
 export interface SupervisedPredecessor {
@@ -216,47 +246,7 @@ export async function claimSupervisedModelAttempt(input: {
   const review = await input.readReview();
   const reviewSnapshot = JSON.stringify(review);
   const gate = 'thinman-overseer[bot]';
-  if (
-    review.head !== input.reviewHead ||
-    review.state !== 'OPEN' ||
-    !review.complete ||
-    review.author.toLowerCase() === gate ||
-    !Array.isArray(review.reviews)
-  )
-    throw new Error('current complete independent plan review required');
-  const latest = new Map<string, SupervisedPlanReview['reviews'][number]>();
-  for (const item of review.reviews) {
-    if (
-      !Number.isSafeInteger(item.id) ||
-      item.id <= 0 ||
-      typeof item.login !== 'string' ||
-      !/^[a-f0-9]{40}$/.test(item.head) ||
-      typeof item.submittedAt !== 'string' ||
-      !Number.isFinite(Date.parse(item.submittedAt)) ||
-      !['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED', 'COMMENTED', 'PENDING'].includes(item.state)
-    )
-      throw new Error('malformed actual review record');
-    if (item.state === 'COMMENTED' || item.state === 'PENDING') continue;
-    const login = item.login.toLowerCase();
-    const prior = latest.get(login);
-    if (
-      prior &&
-      Date.parse(prior.submittedAt) === Date.parse(item.submittedAt) &&
-      (prior.state !== item.state || prior.head !== item.head)
-    )
-      throw new Error('ambiguous actionable review chronology');
-    if (!prior || Date.parse(prior.submittedAt) < Date.parse(item.submittedAt))
-      latest.set(login, item);
-  }
-  const approval = latest.get(gate);
-  if (
-    !approval ||
-    approval.state !== 'APPROVED' ||
-    approval.head !== input.reviewHead ||
-    [...latest.values()].some(item => item.state === 'CHANGES_REQUESTED')
-  )
-    throw new Error('independent exact-head approval missing or superseded');
-  const approvalId = approval.id;
+  const approvalId = approvedSupervisedPlanReview(review, input.reviewHead);
   const previous = structuredClone(await store.listProviderAttempts(runId, 'implement'));
   const fourthSnapshot = fourth
     ? reconcileThird(fourth.predecessors, structuredClone(await fourth.observe()), previous, runId, 3) : null;

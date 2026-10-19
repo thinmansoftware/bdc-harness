@@ -1,5 +1,25 @@
 # Tee-time supervised bootstrap source preparation
 
+## Source-only diagnostic claim and shared review primitives
+
+claimSupervisedDiagnosticPhase in packages/workflows/src/reliability/
+tee-time-supervised-bootstrap.ts writes only diagnostic.claim.json through the
+same private exclusive/flushed validation and custody primitive. Its input is an
+owned SupervisedController plus SupervisedReview. claimSupervisedPhase still
+accepts only model/publish, with identical legacy receipt bytes. Existing partial
+claims are never overwritten or automatically recovered. This is an internal
+source primitive, not an operator entry or actual review/run/history verifier.
+
+approvedSupervisedPlanReview in tee-time-supervised-model-phase.ts extracts the
+unchanged pure independent exact-head review chronology for future diagnostic
+reuse. The existing model caller uses it with its original snapshots/readbacks.
+It cannot fetch GitHub or establish that supplied records are actual/current.
+
+Offline checks: `bun test ./packages/workflows/src/reliability/tee-time-supervised-bootstrap.test.ts`
+and `bun test ./packages/workflows/src/reliability/tee-time-supervised-model-phase.test.ts`.
+Tests write only synthetic temporary claims. No real diagnostic claim/provider
+row or account delivery is created; the full admission caller remains unimplemented.
+
 ## Source-only one-use diagnostic packet syntax
 
 teetime_minimal_execution.py parses a separate canonical bounded diagnostic
