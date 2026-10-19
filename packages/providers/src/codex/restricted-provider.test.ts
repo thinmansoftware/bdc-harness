@@ -2,6 +2,7 @@ import { test, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import type { SendQueryOptions } from '../types';
 import { restrictedClientOptions, restrictedThreadOptions } from './restricted-policy';
+import { readCodexFailureOrigin } from './provider';
 
 mock.module('@archon/paths', () => ({ createLogger: () => createMockLogger() }));
 mock.module('./binary-resolver', () => ({
@@ -54,6 +55,64 @@ async function consume(
   for await (const chunk of provider.sendQuery('synthetic test', '/workspace', id, options))
     void chunk;
 }
+
+test('native turn.failed origin survives enriched model-access wording', async () => {
+  injectedEvents = [{ type: 'turn.failed', error: { message: 'model not available PRIVATE-NATIVE' } }];
+  let failed: unknown;
+  try { await consume(new CodexProvider({ restricted: true, restrictedTransport: 'teetime-connect-v1' })); }
+  catch (error) { failed = error; }
+  expect(failed).toBeInstanceOf(Error);
+  expect(readCodexFailureOrigin(failed)).toEqual({ version: 1, origin: 'native_turn_failed' });
+  expect(JSON.stringify(readCodexFailureOrigin(failed))).not.toContain('PRIVATE-NATIVE');
+  expect(runStreamed).toHaveBeenCalledTimes(1);
+  expect(reactive).not.toHaveBeenCalled();
+});
+
+test('SDK run acquisition and iterator failures are distinct from event-handler exceptions', async () => {
+  for (const mode of ['acquisition', 'advancement', 'handler']) {
+    runStreamed.mockImplementationOnce(async () => {
+      if (mode === 'acquisition') throw new Error('PRIVATE-ACQUISITION');
+      return { events: (async function* () {
+        if (mode === 'advancement') throw new Error('PRIVATE-ADVANCEMENT');
+        yield { type: 'item.started' }; // Invalid native event, interpreter throws.
+      })() };
+    });
+    let failed: unknown;
+    try { await consume(new CodexProvider({ restricted: true, restrictedTransport: 'teetime-connect-v1' })); }
+    catch (error) { failed = error; }
+    expect(failed).toBeInstanceOf(Error);
+    expect(readCodexFailureOrigin(failed)).toEqual({ version: 1,
+      origin: mode === 'handler' ? 'unknown' : 'sdk_iterator_exception' });
+  }
+});
+
+test('actual client and thread initialization failures retain their narrow origin', async () => {
+  for (const boundary of [sdk, start]) {
+    boundary.mockImplementationOnce(() => { throw new Error('PRIVATE-INITIALIZATION'); });
+    let failed: unknown;
+    try { await consume(new CodexProvider({ restricted: true, restrictedTransport: 'teetime-connect-v1' })); }
+    catch (error) { failed = error; }
+    expect(failed).toBeInstanceOf(Error);
+    expect(readCodexFailureOrigin(failed)).toEqual({ version: 1, origin: 'provider_initialization' });
+  }
+});
+
+test('only an actual unrecovered native error tags incomplete results', async () => {
+  for (const mode of ['native-error', 'empty', 'recovered']) {
+    runStreamed.mockImplementationOnce(async () => ({ events: (async function* () {
+      if (mode !== 'empty') yield { type: 'error', message: 'PRIVATE-STREAM' };
+      if (mode === 'recovered') yield { type: 'turn.completed', usage: null };
+    })() }));
+    const chunks = [];
+    for await (const chunk of new CodexProvider({ restricted: true }).sendQuery('test', '/workspace'))
+      chunks.push(chunk);
+    const terminal = chunks.at(-1)!;
+    expect(terminal.type).toBe('result');
+    expect(terminal.isError).toBe(mode === 'recovered' ? undefined : true);
+    expect(readCodexFailureOrigin(terminal)).toEqual({ version: 1,
+      origin: mode === 'native-error' ? 'native_stream_error_without_terminal' : 'unknown' });
+  }
+});
 
 test('restricted startup and owned resume use fixed options without global auth', async () => {
   const provider = new CodexProvider({ restricted: true });

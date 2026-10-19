@@ -1,5 +1,29 @@
 # Tee-time supervised bootstrap source preparation
 
+## Source-only failure origin preservation
+
+After consumed attempt4, provider.ts retains a private WeakMap record with only
+version1 and a closed origin. It tags actual SDK iterator acquisition/advancement,
+native turn.failed, unrecovered native error without a terminal, and client/thread
+initialization boundaries. Interpretation errors and ordinary incomplete streams
+remain unknown; recovered native errors do not mark successful results. Existing
+enrichment copies only trusted identity metadata, without inspecting arbitrary
+properties. Direct-file helpers are internal/testing APIs, not package exports.
+
+No message, header, path, identifier, private-message hash or arbitrary error
+property is retained in this record. It does not infer an HTTP status or
+entitlement. Existing hints, errors/chunks, retry/fallback and acceptance remain
+unchanged. It stays within the already measured provider file, adding no runtime
+dependency or artifact-manifest shape. No worker/report protocol or proxy policy
+changes occur in this slice. No installed image or account operation is implied.
+
+Verification commands from packages/providers:
+`bun test src/codex/failure-provenance.test.ts` and
+`bun test src/codex/restricted-provider.test.ts`.
+The offline qualification workflow runs both. Later strict failure-only receipts,
+separately versioned CONNECT reason counts and any minimal authenticated
+diagnostic require their own concrete reviews. No implementation attempt5.
+
 ## Closed transport-repair successor source
 
 Version4 is only implementation attempt4, with exactly three ordered immutable
