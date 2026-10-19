@@ -19,7 +19,7 @@ worker = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(worker)
 
 
 class ArtifactWorkerTests(unittest.TestCase):
-    def fixture(self, mode):
+    def fixture(self, mode, demo=False):
         nonce, source = 'a'*32, 'b'*40
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); workspace = root/'workspace'; workspace.mkdir()
@@ -32,6 +32,20 @@ class ArtifactWorkerTests(unittest.TestCase):
                 'modelInvocations': 1, 'assistantCount': 1, 'resultCount': 1, 'thinkingCount': 0,
                 'normalProviderEnd': True, 'providerIteratorClosed': True, 'aborted': False,
                 'failureCategory': 'none', 'servedModelVerified': False}
+            execution=None
+            if demo:
+                import test_teetime_demo_execution as fixtures
+                from teetime_demo_case import MODEL_PATHS
+                fixture=fixtures.DemoExecutionTests();fixture.setUp()
+                fixture.value['source']=source
+                fixture.value['binding']['policyHash']='sha256:'+policy_hash
+                execution=fixture.parse()
+                artifact={'version':1,'binding':dict(execution.binding),'operations':[
+                    {'action':'write','path':path,'baseHash':None,'mode':'100644','content':'// app\n'}
+                    for path in MODEL_PATHS if path!='README.md']}
+                packet['artifactBase64']=base64.b64encode(json.dumps(artifact).encode()).decode()
+                del packet['passed'];del packet['failureCategory']
+                packet.update({'kind':'supervised-demo-v1','collected':True})
             class FixturePath:
                 def __new__(cls, value):
                     if value == '/workspace': return workspace
@@ -52,9 +66,14 @@ class ArtifactWorkerTests(unittest.TestCase):
                 worker.AUTH_REJECTED = mode == 'auth_rejection'
                 if mode == 'auth_rejection': raise ValueError('fixed synthetic auth failure')
                 if mode == 'preflight_mutation': (workspace/'unexpected').write_bytes(b'private-data')
-            def task(argv, timeout):
-                self.assertEqual(argv[0], 'bun'); self.assertEqual(argv[-1], nonce)
-                self.assertEqual(timeout, 100)
+            def task(argv, timeout, **kwargs):
+                self.assertEqual(argv[0], 'bun')
+                if demo:
+                    self.assertTrue(argv[-1].endswith('teetime-demo-task-entry.ts'))
+                    self.assertGreaterEqual(timeout,610);self.assertLessEqual(timeout,625)
+                    self.assertEqual(json.loads(kwargs['input_bytes'])['runId'],execution.binding['runId'])
+                else:
+                    self.assertEqual(argv[-1], nonce);self.assertEqual(timeout, 100)
                 if mode == 'changed_auth': auth.write_bytes(b'changed-private-auth')
                 if mode == 'extra_file': (workspace/'unexpected').write_bytes(b'private-workspace-data')
                 if mode == 'mask_file': (workspace/'.codex'/'hidden').write_bytes(b'private-hidden-data')
@@ -68,9 +87,24 @@ class ArtifactWorkerTests(unittest.TestCase):
                 patch.object(worker, 'bounded_process', side_effect=task) as invoked, \
                 patch.object(worker, 'oom_kills', side_effect=[0, 1 if mode == 'oom' else 0]), \
                 patch.dict(worker.os.environ, {'TEETIME_AUTH_ARTIFACT_SOURCE_SHA': source}), \
+                (patch.object(worker.time,'monotonic',side_effect=[1000,1020,1020]) if mode=='budget_exhaustion' else contextlib.nullcontext()), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
-                status = worker.artifact_main(nonce, source)
+                status = worker.artifact_main(nonce, source,execution)
             return status, json.loads(output.getvalue()), invoked.call_count, output.getvalue()
+
+    def test_demo_candidate_uses_bound_input_and_same_custody_checks(self):
+        status,result,calls,_=self.fixture('valid',demo=True)
+        self.assertEqual(status,0);self.assertEqual(calls,1);self.assertTrue(result['passed'])
+        for mode in ['changed_auth','extra_file','mask_file','oom','timeout','malformed']:
+            with self.subTest(mode=mode):
+                status,result,calls,output=self.fixture(mode,demo=True)
+                self.assertEqual(status,1);self.assertEqual(calls,1)
+                self.assertIsNone(result['artifactBase64']);self.assertNotIn('private',output)
+
+    def test_demo_preflight_time_cannot_consume_full_query_budget(self):
+        status,result,calls,_=self.fixture('budget_exhaustion',demo=True)
+        self.assertEqual(status,1);self.assertEqual(calls,0)
+        self.assertFalse(result['taskStarted']);self.assertEqual(result['modelInvocations'],0)
 
     def test_exact_task_and_actual_unchanged_auth_workspace_pass(self):
         status, result, calls, _ = self.fixture('valid')

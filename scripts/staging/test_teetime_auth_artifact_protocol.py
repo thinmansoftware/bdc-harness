@@ -19,6 +19,40 @@ from teetime_fixed_artifact import expected_artifact, validate_task_result
 
 
 class ArtifactProtocolTests(unittest.TestCase):
+    def test_demo_ready_binds_package_and_cannot_downgrade_to_fixed_canary(self):
+        import test_teetime_demo_execution as fixtures
+        fixture=fixtures.DemoExecutionTests();fixture.setUp()
+        execution=fixture.parse()
+        hashes={**self.hashes,'packages/providers/src/codex/restricted-policy.ts':'b'*64}
+        ready={**self.ready,'task':'supervised-demo','artifactContractHash':execution.package_hash,
+               'image':execution.image,'sourceSha':execution.base_source,
+               'artifactSourceSha':execution.source,'hashes':hashes}
+        args=dict(nonce=self.nonce,image=execution.image,base_source=execution.base_source,
+                  source=execution.source,hashes=hashes)
+        validate_ready(ready,**args,execution=execution)
+        with self.assertRaises(ValueError): validate_ready(ready,**args)
+        for key,value in [('task','artifact'),('artifactContractHash','0'*64),('image',self.image)]:
+            with self.subTest(key=key),self.assertRaises(ValueError):
+                validate_ready({**ready,key:value},**args,execution=execution)
+
+    def test_demo_worker_reparses_candidate_and_rejects_edited_identity(self):
+        import test_teetime_demo_execution as fixtures
+        from teetime_demo_case import MODEL_PATHS,parse_demo_artifact
+        fixture=fixtures.DemoExecutionTests();fixture.setUp();execution=fixture.parse()
+        raw=json.dumps({'version':1,'binding':dict(execution.binding),'operations':[
+            {'action':'write','path':path,'mode':'100644','baseHash':None,'content':'// source\n'}
+            for path in MODEL_PATHS if path!='README.md']}).encode()
+        candidate=parse_demo_artifact(raw,prepared=execution.prepared,expected_binding=dict(execution.binding))
+        value=self.worker()
+        value.update({'artifactBase64':base64.b64encode(raw).decode(),'artifactHash':candidate.artifact_hash,
+                      'bindingHash':candidate.binding_hash,'manifestHash':candidate.manifest_hash,
+                      'sourceTree':candidate.source_tree,'elapsedMs':600000})
+        actual=validate_worker_result(value,nonce=self.nonce,policy_hash='b'*64,execution=execution)
+        self.assertEqual(actual.source_tree,candidate.source_tree)
+        with self.assertRaises(ValueError): validate_worker_result(value,nonce=self.nonce,policy_hash='b'*64)
+        with self.assertRaises(ValueError):
+            validate_worker_result({**value,'sourceTree':'0'*40},nonce=self.nonce,policy_hash='b'*64,execution=execution)
+
     def test_transitive_image_python_import_closure_is_frozen_and_measured(self):
         staging = Path(__file__).resolve().parent
         modules = {path.stem: path.name for path in staging.glob('*.py')}

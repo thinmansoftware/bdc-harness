@@ -325,3 +325,33 @@ Architect source review approved publication of this collector slice, with these
 limitations: modelInvocations counts attempted query calls, the600s timer covers
 the query only, and the outer launcher must bound the complete process and align
 proxy/watchdog/credential lifetimes. No independent plan approval was fabricated.
+
+## Demo transport integration checkpoint
+
+Head5e2bd3e0fe808373fc00b01e8899f2312f54c594 passed CI39186188069.
+The next source slice adds a closed immutable execution package, complete prepared
+base reconstruction and READY/RESULT binding to that package hash. The existing
+worker now has a supervised-demo branch that uses the same auth/workspace/OOM
+checks and independently parses the source candidate. The remote controller can
+carry that bounded packet. The operator CLI deliberately rejects this selector
+before SSH/account access until the persisted review/claim/attempt join exists.
+
+Frozen demo timing is query600s, complete worker630s, controller proxy720s,
+watchdog780s and idle container810s. One worker deadline starts before preflight;
+the provider cannot start unless at least610s remain after a5s cleanup reserve.
+The task receives only that remaining budget, with the unchanged600s query timer.
+The outer capture allows650s for process reaping. Setup must leave690s before
+READY and660s after credential delivery on the original watchdog clock. Canary
+defaults remain unchanged. The proxy retains its30s idle-tunnel limit.
+
+The package binding is immutable after parsing, including a regression against
+changing its run ID after hash validation. Exact hash matching remains data
+integrity evidence, not independent approval or authority. Actual prepared binding,
+source/image inspection and the phase claim still need the trusted controller join.
+
+Credential-free Linux qualification on the cached laptop image exercised the
+actual nonblocking160000-byte task stdin writer, a child that stopped reading
+until its deadline, and an early-exit child. All passed with process reaping and
+zero model invocations. Receipt demo-stdin-worker-qualification-final.json retains
+worker source hash fed874a67da698341d1927a74f9b322b6c4bcab80d74256383f247c7ac41b7bc.
+No authenticated demo run, app candidate or preview exists at this checkpoint.

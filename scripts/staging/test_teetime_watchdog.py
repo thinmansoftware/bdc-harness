@@ -6,6 +6,15 @@ from unittest.mock import patch
 from teetime_watchdog import validate_manifest, cleanup
 
 class ManifestTests(unittest.TestCase):
+    def test_demo_deadline_is_closed_and_canary_bound_unchanged(self):
+        from teetime_demo_execution import DEMO_LIMITS
+        data=self.valid();data['deadline']=1000+DEMO_LIMITS['watchdogSeconds']
+        self.assertEqual(validate_manifest(data,1000,'supervised-demo'),data)
+        with self.assertRaises(ValueError): validate_manifest(data,1000)
+        with self.assertRaises(ValueError): validate_manifest(data,1000,'unbounded')
+        data['deadline']+=1
+        with self.assertRaises(ValueError): validate_manifest(data,1000,'supervised-demo')
+
     def valid(self):
         return {'owner':'teetime-auth-0123456789ab','deadline':1100,
                 'containers':['a'*64],'networks':['b'*64]}

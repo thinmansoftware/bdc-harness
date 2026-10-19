@@ -9,6 +9,17 @@ from teetime_connect_proxy import parse_connect, validate_addresses, handle_clie
 
 
 class PolicyTests(unittest.TestCase):
+    def test_closed_demo_duration_preserves_canary_default(self):
+        from teetime_demo_execution import DEMO_LIMITS
+        try:
+            proxy.configure_task('supervised-demo')
+            self.assertEqual(proxy.TOTAL_SECONDS,DEMO_LIMITS['controllerSeconds'])
+            with self.assertRaises(ValueError): proxy.configure_task('unbounded')
+        finally:
+            proxy.configure_task('canary')
+        self.assertEqual(proxy.TOTAL_SECONDS,300)
+        self.assertEqual(proxy.IDLE_SECONDS,30)
+
     def test_exact_authority(self):
         self.assertEqual(parse_connect(b'CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n'), 'chatgpt.com')
 

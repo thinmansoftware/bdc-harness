@@ -22,6 +22,14 @@ process_bytes = 0
 outcomes = Counter()
 
 
+def configure_task(task):
+    # Fixed selectors only, no caller-supplied duration or destination override.
+    global TOTAL_SECONDS
+    if task not in ['canary', 'supervised-demo']:
+        raise ValueError('closed proxy task required')
+    TOTAL_SECONDS = 720 if task == 'supervised-demo' else 300
+
+
 def parse_connect(data):
     if len(data) > HEADER_LIMIT or not data.endswith(b'\r\n\r\n'):
         raise ValueError('invalid header boundary')
@@ -156,6 +164,10 @@ async def main():
 
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--task', choices=['canary', 'supervised-demo'], default='canary')
+    configure_task(parser.parse_args().task)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

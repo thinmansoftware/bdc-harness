@@ -28,12 +28,19 @@ def oom_kills():
         return None
 
 
-def bounded_process(argv, timeout, env=ENV):
+def bounded_process(argv, timeout, env=ENV, input_bytes=None):
+    if input_bytes is not None and (type(input_bytes) is not bytes or len(input_bytes)>160000):
+        raise ValueError('bounded task input required')
     child = subprocess.Popen(argv, cwd='/workspace', env=env, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, start_new_session=True)
+                             stderr=subprocess.PIPE, stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+                             start_new_session=True)
     selector = selectors.DefaultSelector()
     selector.register(child.stdout, selectors.EVENT_READ, 'out')
     selector.register(child.stderr, selectors.EVENT_READ, 'err')
+    position=0
+    if input_bytes is not None:
+        os.set_blocking(child.stdin.fileno(),False)
+        selector.register(child.stdin,selectors.EVENT_WRITE,'in')
     output = bytearray()
     total = 0
     deadline = time.monotonic() + timeout
@@ -42,6 +49,12 @@ def bounded_process(argv, timeout, env=ENV):
             if time.monotonic() >= deadline:
                 raise TimeoutError('worker timeout')
             for key, _ in selector.select(.1):
+                if key.data=='in':
+                    if position<len(input_bytes):
+                        position+=os.write(child.stdin.fileno(),input_bytes[position:position+4096])
+                    if position==len(input_bytes):
+                        selector.unregister(child.stdin);child.stdin.close()
+                    continue
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -263,7 +276,7 @@ def artifact_workspace_snapshot():
     return tuple(records)
 
 
-def artifact_main(nonce, source):
+def artifact_main(nonce, source, execution=None):
     import hashlib
     import sys
     # Python -I excludes the script directory. Only the immutable image source is added.
@@ -276,8 +289,10 @@ def artifact_main(nonce, source):
     result = empty_worker_result()
     original = before_workspace = candidate = task = None
     policy_hash = None
+    worker_started=time.monotonic() if execution is not None else None
+    worker_deadline=worker_started+630 if execution is not None else None
     before_oom = oom_kills()
-    started = None
+    started = worker_started
     try:
         assert __debug__ and os.getuid() == 1001 and Path.cwd() == Path('/workspace')
         info = AUTH.lstat()
@@ -292,11 +307,27 @@ def artifact_main(nonce, source):
         assert artifact_workspace_snapshot() == before_workspace
         result['preflightPassed'] = True
         policy_hash = hashlib.sha256(Path('/app/packages/providers/src/codex/restricted-policy.ts').read_bytes()).hexdigest()
+        if execution is not None:
+            if execution.source!=source or execution.binding['policyHash']!='sha256:'+policy_hash:
+                raise ValueError('demo worker source or policy differs')
+            task_budget=worker_deadline-time.monotonic()-5
+            # Preserve the complete query allowance plus initialization and
+            # iterator shutdown. Never silently shorten an admitted query.
+            if task_budget<610:
+                raise ValueError('insufficient complete demo query budget')
         result['taskStarted'] = True
         result['modelInvocations'] = None  # Unknown until a valid task receipt arrives.
-        started = time.monotonic()
-        raw = bounded_process(['bun', str(ROOT/'teetime-fixed-artifact-task.ts'), nonce], 100)
-        candidate = validate_task_result(0, raw, nonce=nonce, policy_hash=policy_hash)
+        if execution is None: started = time.monotonic()
+        if execution is None:
+            raw = bounded_process(['bun', str(ROOT/'teetime-fixed-artifact-task.ts'), nonce], 100)
+            candidate = validate_task_result(0, raw, nonce=nonce, policy_hash=policy_hash)
+        else:
+            from teetime_demo_execution import task_input,DEMO_LIMITS
+            from teetime_demo_result import validate_demo_task_result
+            raw=bounded_process(['bun',str(ROOT/'teetime-demo-task-entry.ts')],
+                task_budget,input_bytes=task_input(execution))
+            candidate=validate_demo_task_result(0,raw,prepared=execution.prepared,
+                expected_binding=dict(execution.binding))
         task = json.loads(raw)  # Strict duplicate/schema validation already succeeded.
         result['taskDiagnosticsPresent'] = True
         for key in ['modelInvocations', 'assistantCount', 'resultCount', 'thinkingCount',
@@ -331,7 +362,7 @@ def artifact_main(nonce, source):
                 'artifactBase64': task['artifactBase64'], 'artifactHash': candidate.artifact_hash,
                 'bindingHash': candidate.binding_hash, 'manifestHash': candidate.manifest_hash,
                 'sourceTree': candidate.source_tree})
-            validate_worker_result(result, nonce=nonce, policy_hash=policy_hash)
+            validate_worker_result(result, nonce=nonce, policy_hash=policy_hash,execution=execution)
         except Exception:
             result.update({'passed': False, 'artifactVerified': False, 'artifactBase64': None,
                 'artifactHash': None, 'bindingHash': None, 'manifestHash': None, 'sourceTree': None,
@@ -344,15 +375,25 @@ if __name__ == '__main__':
     import argparse
     import re
     parser = argparse.ArgumentParser()
-    parser.add_argument('--task', choices=['filesystem', 'artifact'], default='filesystem')
+    parser.add_argument('--task', choices=['filesystem', 'artifact', 'supervised-demo'], default='filesystem')
     parser.add_argument('--nonce')
     parser.add_argument('--artifact-source')
+    parser.add_argument('--demo-package-hash')
     args = parser.parse_args()
     if args.task == 'filesystem':
-        if args.nonce is not None or args.artifact_source is not None:
+        if args.nonce is not None or args.artifact_source is not None or args.demo_package_hash is not None:
             parser.error('artifact-only arguments rejected in filesystem mode')
         raise SystemExit(main())
     if (re.fullmatch('[a-f0-9]{32}', args.nonce or '') is None
             or re.fullmatch('[a-f0-9]{40}', args.artifact_source or '') is None):
         parser.error('artifact mode requires exact nonce and source')
-    raise SystemExit(artifact_main(args.nonce, args.artifact_source))
+    execution=None
+    if args.task=='supervised-demo':
+        import sys
+        sys.path.insert(0,str(ROOT))
+        from teetime_demo_execution import parse_demo_execution,MAX_EXECUTION_BYTES
+        execution=parse_demo_execution(sys.stdin.buffer.read(MAX_EXECUTION_BYTES+1),args.demo_package_hash)
+        if execution.source!=args.artifact_source: parser.error('demo source differs')
+    elif args.demo_package_hash is not None:
+        parser.error('demo-only package hash rejected')
+    raise SystemExit(artifact_main(args.nonce, args.artifact_source,execution))

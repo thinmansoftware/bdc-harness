@@ -26,8 +26,9 @@ def main():
     parser.add_argument('--image', required=True)
     parser.add_argument('--expected-sha', required=True)
     parser.add_argument('--nonce', required=True)
-    parser.add_argument('--task', choices=['filesystem', 'artifact'], default='filesystem')
+    parser.add_argument('--task', choices=['filesystem', 'artifact', 'supervised-demo'], default='filesystem')
     parser.add_argument('--artifact-source')
+    parser.add_argument('--demo-package-hash')
     args = parser.parse_args()
     if os.name != 'nt' or not __debug__:
         raise ValueError('Windows assertion-enabled controller required')
@@ -35,7 +36,17 @@ def main():
     assert re.fullmatch('[a-f0-9]{40}', args.expected_sha)
     assert re.fullmatch('[a-f0-9]{32}', args.nonce)
     root = Path(__file__).parent
-    artifact_mode = args.task == 'artifact'
+    artifact_mode = args.task in ['artifact','supervised-demo']
+    execution=execution_raw=None
+    if args.task=='supervised-demo':
+        from teetime_demo_execution import parse_demo_execution,MAX_EXECUTION_BYTES,DEMO_LIMITS
+        path=root.resolve().parents[1]/'demo-execution.json'
+        assert path.is_file() and not path.is_symlink() and path.stat().st_size<=MAX_EXECUTION_BYTES
+        execution_raw=path.read_bytes()
+        execution=parse_demo_execution(execution_raw,args.demo_package_hash)
+        assert (execution.image,execution.source,execution.base_source)==(args.image,args.artifact_source,args.expected_sha)
+    elif args.demo_package_hash is not None:
+        parser.error('demo-only package hash rejected')
     if artifact_mode:
         from teetime_auth_artifact_protocol import (artifact_hashes, artifact_identity, IMAGE_PATHS,
             POLICY_PATH, empty_worker_result, validate_selector, validate_worker_result)
@@ -43,13 +54,17 @@ def main():
         validate_selector(args.task, args.artifact_source, args.nonce)
         frozen_hashes = artifact_hashes(root, args.artifact_source, args.expected_sha)
         contract_hash = artifact_identity(args.nonce, frozen_hashes[POLICY_PATH])
+        if execution is not None:
+            from teetime_auth_artifact_protocol import validate_execution_context
+            validate_execution_context(execution,args.image,args.expected_sha,args.artifact_source,frozen_hashes[POLICY_PATH])
+            contract_hash=execution.package_hash
     elif args.artifact_source is not None:
         parser.error('artifact-only source rejected in filesystem mode')
     proxy_source = (root/'teetime_connect_proxy.py').read_bytes()
     owner = 'teetime-auth-' + uuid.uuid4().hex[:12]
     receipt = Path.home()/owner
     receipt.mkdir(exist_ok=False)
-    manifest = {'owner': owner, 'deadline': time.time()+210, 'containers': [], 'networks': []}
+    manifest = {'owner': owner, 'deadline': time.time()+(DEMO_LIMITS['watchdogSeconds'] if execution else 210), 'containers': [], 'networks': []}
     outcome = {'passed': False, 'cleanupVerified': False, 'credentialReceived': False,
                'preflightPassed': False, 'authUnchanged': False, 'artifactVerified': False,
                'modelInvocations': 0, 'servedModelVerified': False, 'preflightChecks': 0,
@@ -97,13 +112,14 @@ def main():
             command = ['-I', '-']
             if role == 'gateway':
                 extra = ['-i']
+                if execution: command+=['--task','supervised-demo']
             if role == 'worker':
                 extra = ['--security-opt', 'seccomp='+str(profile)]
                 for path in ['/home/appuser', '/workspace', '/tmp']:
                     extra += ['--tmpfs', path+':uid=1001,gid=1001,size=64m']
                 for path in ['/workspace/.codex', '/workspace/.agents']:
                     extra += ['--tmpfs', path+':ro,uid=1001,gid=1001,size=1m']
-                command = ['-I', '-c', 'import time; time.sleep(240)']
+                command = ['-I', '-c', 'import time; time.sleep('+str(DEMO_LIMITS['containerSeconds'] if execution else 240)+')']
             identifier = d('create', '--name', owner+'-'+role, '--label', 'teetime.owner='+owner,
                 '--network', network, '--read-only', '--cap-drop', 'ALL', '--security-opt',
                 'no-new-privileges:true', '--user', '1001:1001', '--memory', '512m',
@@ -127,14 +143,14 @@ def main():
             expected_names = {owner+'-internal'} if role == 'worker' else {owner+'-internal', owner+'-egress'}
             assert set(info['NetworkSettings']['Networks']) == expected_names
             if role == 'worker':
-                assert config['Cmd'] == ['-I', '-c', 'import time; time.sleep(240)']
+                assert config['Cmd'] == ['-I', '-c', 'import time; time.sleep('+str(DEMO_LIMITS['containerSeconds'] if execution else 240)+')']
                 assert len(host['SecurityOpt']) == 2 and 'no-new-privileges:true' in host['SecurityOpt']
                 assert json.loads(next(v[8:] for v in host['SecurityOpt'] if v.startswith('seccomp='))) == candidate
                 assert set(host['Tmpfs']) == {'/home/appuser', '/workspace', '/tmp', '/workspace/.codex', '/workspace/.agents'}
                 for path in ['/workspace/.codex', '/workspace/.agents']:
                     assert 'ro' in host['Tmpfs'][path].split(',')
             else:
-                assert config['Cmd'] == ['-I', '-'] and config['OpenStdin'] is True
+                assert config['Cmd'] == (['-I','-','--task','supervised-demo'] if execution else ['-I','-']) and config['OpenStdin'] is True
                 assert host['SecurityOpt'] == ['no-new-privileges:true'] and not host.get('Tmpfs')
             d('start', identifier)
             started = inspect(identifier)
@@ -171,7 +187,7 @@ def main():
         def collect_proxy():
             try:
                 proxy_results.put(capture([args.docker,'attach','--sig-proxy=false',ids['gateway']],
-                    timeout=205,limit=4096,input_bytes=proxy_source,on_stdout=proxy_output))
+                    timeout=DEMO_LIMITS['controllerSeconds'] if execution else 205,limit=4096,input_bytes=proxy_source,on_stdout=proxy_output))
             except BaseException:
                 proxy_results.put(None)
         proxy_thread = threading.Thread(target=collect_proxy, daemon=True)
@@ -183,7 +199,7 @@ def main():
         manifest_path = receipt/'manifest.json'
         manifest_path.write_text(json.dumps(manifest))
         subprocess.Popen([sys.executable, str(root/'teetime_watchdog.py'), '--docker', args.docker,
-                          '--manifest', str(manifest_path)], stdin=subprocess.DEVNULL,
+                          '--manifest', str(manifest_path),*(['--task','supervised-demo'] if execution else [])], stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
             creationflags=subprocess.DETACHED_PROCESS|subprocess.CREATE_NEW_PROCESS_GROUP|subprocess.CREATE_BREAKAWAY_FROM_JOB)
         for _ in range(50):
@@ -193,7 +209,7 @@ def main():
         ready = json.loads((receipt/'watchdog-ready.json').read_text())
         manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
         assert ready['owner'] == owner and ready['deadline'] == manifest['deadline']
-        assert ready['manifestSha256'] == manifest_hash and manifest['deadline']-time.time() > 170
+        assert ready['manifestSha256'] == manifest_hash and manifest['deadline']-time.time() > (690 if execution else 170)
         kernel = ctypes.WinDLL('kernel32', use_last_error=True)
         kernel.OpenProcess.restype = ctypes.c_void_p
         kernel.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
@@ -208,7 +224,7 @@ def main():
             'sourceSha': args.expected_sha, 'owner': owner, 'manifestSha256': manifest_hash,
             'workerId': ids['worker'], 'gatewayId': ids['gateway'], 'hashes': hashes}
         if artifact_mode:
-            ready.update({'task': 'artifact', 'artifactSourceSha': args.artifact_source,
+            ready.update({'task': args.task, 'artifactSourceSha': args.artifact_source,
                           'artifactContractHash': contract_hash})
         print(json.dumps(ready), flush=True)
         inbox = queue.Queue(maxsize=1)
@@ -226,14 +242,17 @@ def main():
         del payload
         assert installed == {'installed': True}
         outcome['credentialReceived'] = True
-        assert manifest['deadline']-time.time() > 145
-        worker_args = (['--task', 'artifact', '--nonce', args.nonce, '--artifact-source', args.artifact_source]
+        assert manifest['deadline']-time.time() > (660 if execution else 145)
+        worker_args = (['--task', args.task, '--nonce', args.nonce, '--artifact-source', args.artifact_source]
                        if artifact_mode else [])
-        returncode, output = capture([args.docker, 'exec', '-w', '/workspace', ids['worker'],
-            'python3', '-I', '/app/scripts/staging/teetime_canary_worker.py', *worker_args], timeout=140)
+        if execution: worker_args+=['--demo-package-hash',execution.package_hash]
+        returncode, output = capture([args.docker, 'exec', *(['-i'] if execution else []), '-w', '/workspace', ids['worker'],
+            'python3', '-I', '/app/scripts/staging/teetime_canary_worker.py', *worker_args],
+            timeout=650 if execution else 140,limit=DEMO_LIMITS['protocolLineBytes'] if execution else 4096,
+            input_bytes=execution_raw,input_limit=262144 if execution else 65536)
         if artifact_mode:
             result = strict_json(output)
-            validate_worker_result(result, nonce=args.nonce, policy_hash=frozen_hashes[POLICY_PATH])
+            validate_worker_result(result, nonce=args.nonce, policy_hash=frozen_hashes[POLICY_PATH],execution=execution)
             assert type(returncode) is int and returncode == (0 if result['passed'] else 1)
             outcome['artifactResult'] = result
             outcome['passed'] = result['passed']
@@ -283,7 +302,7 @@ def main():
         report = {'type': 'RESULT', 'nonce': args.nonce, 'owner': owner,
                   'result': outcome, 'cleanupErrors': errors, 'receiptDirectory': str(receipt), 'proxyMetrics': proxy_metrics}
         if artifact_mode:
-            report.update({'task': 'artifact', 'artifactSourceSha': args.artifact_source,
+            report.update({'task': args.task, 'artifactSourceSha': args.artifact_source,
                            'artifactContractHash': contract_hash})
         (receipt/'result.json').write_text(json.dumps(report, indent=2))
         print(json.dumps(report), flush=True)

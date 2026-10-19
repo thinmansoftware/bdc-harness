@@ -24,14 +24,22 @@ def main():
     parser.add_argument('--synthetic', action='store_true')
     parser.add_argument('--disconnect-before-auth', action='store_true')
     parser.add_argument('--frame-test', choices=['partial', 'oversized'])
-    parser.add_argument('--task', choices=['filesystem', 'artifact'], default='filesystem')
+    parser.add_argument('--task', choices=['filesystem', 'artifact', 'supervised-demo'], default='filesystem')
     parser.add_argument('--artifact-source')
+    parser.add_argument('--demo-package-hash')
     args = parser.parse_args()
     assert re.fullmatch('sha256:[a-f0-9]{64}', args.image)
     assert re.fullmatch('[a-f0-9]{40}', args.expected_sha)
     nonce = uuid.uuid4().hex
     root = Path(__file__).parent
-    artifact_mode = args.task == 'artifact'
+    artifact_mode = args.task in ['artifact','supervised-demo']
+    execution=None
+    if args.task=='supervised-demo':
+        # The source protocol is available for qualification, but authenticated
+        # dispatch must first be joined to the persisted supervised phase claim.
+        raise ValueError('supervised demo requires reviewed controller entry')
+    if args.demo_package_hash is not None:
+        parser.error('demo-only package hash rejected')
     if artifact_mode:
         from teetime_auth_artifact_protocol import artifact_hashes, validate_selector, validate_ready, validate_report, POLICY_PATH
         from teetime_joined_fixture import strict_json

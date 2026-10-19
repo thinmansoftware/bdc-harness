@@ -5,8 +5,10 @@ import threading
 import time
 
 
-def capture(argv, timeout, limit=4096, input_bytes=None, on_stdout=None, *, env=None):
-    if input_bytes is not None and (not isinstance(input_bytes, bytes) or len(input_bytes) > 65536):
+def capture(argv, timeout, limit=4096, input_bytes=None, on_stdout=None, *, env=None, input_limit=65536):
+    if type(input_limit) is not int or input_limit not in [65536,262144]:
+        raise ValueError('closed subprocess input limit required')
+    if input_bytes is not None and (not isinstance(input_bytes, bytes) or len(input_bytes) > input_limit):
         raise ValueError('bounded subprocess input exceeded')
     child = subprocess.Popen(argv, stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
