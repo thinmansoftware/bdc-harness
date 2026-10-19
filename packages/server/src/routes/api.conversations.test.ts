@@ -156,6 +156,14 @@ describe('binding-v2 shared DTO foundation', () => {
     }
   });
 
+  test('rejects whitespace-only identity without trimming valid values', () => {
+    for (const field of ['project', 'codebaseId', 'codebaseName'] as const) {
+      for (const value of [' ', '   ', '\u00a0']) {
+        expect(dispatchBindingSchema.safeParse({ ...binding, [field]: value }).success).toBe(false);
+      }
+    }
+  });
+
   test('requires the exact protocol version and reserved workflow', () => {
     for (const version of ['codex-only-v1', 'codex-only-v3', 'CODEX-ONLY-V2', 'codex-only-v2 ']) {
       expect(dispatchBindingSchema.safeParse({ ...binding, version }).success).toBe(false);

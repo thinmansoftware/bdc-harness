@@ -6,7 +6,8 @@ function comparisonText(maximum: number): z.ZodString {
     .string()
     .min(1)
     .max(maximum)
-    .regex(/^\P{Cc}*$/u, 'Control characters are not allowed');
+    .regex(/^\P{Cc}*$/u, 'Control characters are not allowed')
+    .regex(/\S/u, 'Expected a nonblank value');
 }
 
 /** A comparison snapshot, not dispatch authority or proof of filesystem ownership. */
