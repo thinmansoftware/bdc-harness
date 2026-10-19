@@ -230,6 +230,7 @@ console.log(JSON.stringify(hashes));
     try:
         if controller is not None:
             controller.resources('before')
+            controller.require_headroom()
             image_id = docker("image", "inspect", args.image, "--format", "{{.Id}}", check=True).stdout.strip()
             assert image_id.startswith("sha256:") and len(image_id) == 71
         if network:
@@ -242,6 +243,7 @@ console.log(JSON.stringify(hashes));
             assert owned["Name"] == volume and owned["Labels"].get("teetime.probe") == name
             fixture_step(True)
             fixture_before = fixture_step(False)
+        if controller is not None: controller.require_headroom()
         created = docker(*options)
         if created.returncode:
             raise RuntimeError("disposable probe container creation failed")

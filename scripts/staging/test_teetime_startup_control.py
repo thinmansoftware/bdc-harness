@@ -331,4 +331,163 @@ class StartupUncertainCreationTests(unittest.TestCase):
         controller.finish_cleanup.assert_called_once_with(True)
         self.assertFalse(any(parts[0]=='start' for parts in calls))
 
+class StartupHeadroomTests(unittest.TestCase):
+    def cgroup(self,changes=None):
+        root='/sys/fs/cgroup'
+        values={
+            '/proc/self/mountinfo':'22 1 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n',
+            '/proc/self/cgroup':'0::/jobs/task\n',
+            root+'/cgroup.controllers':'cpu memory pids\n',
+            root+'/jobs/memory.max':str(4*1024**3),
+            root+'/jobs/memory.current':str(2*1024**3),
+            root+'/jobs/task/memory.max':'max\n',
+            root+'/jobs/task/memory.current':str(1024**3)}
+        values.update(changes or {})
+        def read(path,limit):
+            value=values.get(str(path).replace('\\','/'))
+            if isinstance(value,Exception):raise value
+            if value is None:raise FileNotFoundError('PRIVATE')
+            if len(value.encode('ascii'))>limit:raise ValueError('PRIVATE')
+            return value
+        return read
+
+    def test_cgroup_ancestor_limit_is_accounted_even_when_leaf_is_unlimited(self):
+        import teetime_startup_control as control
+        with patch.object(control,'_cgroup_text',side_effect=self.cgroup(),create=True), \
+             patch.object(Path,'is_symlink',return_value=False):
+            self.assertEqual(control.effective_cgroup_headroom(),2*1024**3)
+
+    def test_cgroup_unknown_or_hidden_ancestry_is_never_unlimited(self):
+        import teetime_startup_control as control
+        for changes in [
+                {'/proc/self/cgroup':'0::/../outside'},
+                {'/proc/self/cgroup':'1:memory:/jobs'},
+                {'/proc/self/mountinfo':'22 1 0:1 /hidden /sys/fs/cgroup rw - cgroup2 cgroup rw'},
+                {'/sys/fs/cgroup/memory.max':'max'},
+                {'/sys/fs/cgroup/cgroup.controllers':'cpu'},
+                {'/sys/fs/cgroup/jobs/memory.current':None},
+                {'/sys/fs/cgroup/jobs/memory.current':'-1'},
+                {'/sys/fs/cgroup/jobs/memory.current':OSError('PRIVATE')},
+                {'/sys/fs/cgroup/jobs/memory.max':'true'},
+                {'/sys/fs/cgroup/jobs/memory.max':'max\n\n'},
+                {'/sys/fs/cgroup/jobs/memory.current':'1\n2'},
+                {'/sys/fs/cgroup/jobs/memory.max':'9'*100},
+                {'/proc/self/mountinfo':self.cgroup()('/proc/self/mountinfo',262144)*2},
+                {'/proc/self/cgroup':'0::/'+'/'.join(['a']*33)}]:
+            with self.subTest(changes=changes), \
+                 patch.object(control,'_cgroup_text',side_effect=self.cgroup(changes),create=True), \
+                 patch.object(Path,'is_symlink',return_value=False):
+                self.assertIsNone(control.effective_cgroup_headroom())
+
+    def test_cgroup_over_limit_is_zero_and_symlink_is_unknown(self):
+        import teetime_startup_control as control
+        with patch.object(control,'_cgroup_text',side_effect=self.cgroup({
+                '/sys/fs/cgroup/jobs/memory.current':str(5*1024**3)}),create=True), \
+             patch.object(Path,'is_symlink',return_value=False):
+            self.assertEqual(control.effective_cgroup_headroom(),0)
+        with patch.object(control,'_cgroup_text',side_effect=self.cgroup(),create=True), \
+             patch.object(Path,'is_symlink',return_value=True):
+            self.assertIsNone(control.effective_cgroup_headroom())
+
+    def test_verified_root_exemption_is_known_and_identity_change_is_unknown(self):
+        import teetime_startup_control as control
+        read=self.cgroup({'/proc/self/cgroup':'0::/\n'})
+        with patch.object(control,'_cgroup_text',side_effect=read,create=True), \
+             patch.object(Path,'is_symlink',return_value=False):
+            self.assertEqual(control.effective_cgroup_headroom(),9007199254740991)
+        for changing in ['/proc/self/cgroup','/proc/self/mountinfo']:
+            seen={}
+            def changed(path,limit):
+                key=str(path);seen[key]=seen.get(key,0)+1
+                value=read(path,limit)
+                return value+'\n' if key==changing and seen[key]>1 else value
+            with self.subTest(changing=changing), \
+                 patch.object(control,'_cgroup_text',side_effect=changed,create=True), \
+                 patch.object(Path,'is_symlink',return_value=False):
+                self.assertIsNone(control.effective_cgroup_headroom())
+
+    def test_cgroup_file_reader_enforces_byte_and_ascii_bounds(self):
+        import teetime_startup_control as control
+        for raw in [b'x'*129,b'\xff']:
+            stream=io.BytesIO(raw)
+            with patch('builtins.open',return_value=stream):
+                with self.assertRaises((ValueError,UnicodeError)):
+                    control._cgroup_text('unused',128)
+
+    def test_known_host_and_effective_cgroup_headroom_are_both_required(self):
+        import teetime_startup_control as control
+        minimum=1536*1024*1024
+        disk_minimum=2*1024*1024*1024
+        for memory,cgroup,disk,accepted in [
+                (minimum,minimum,disk_minimum,True),
+                (177405952,minimum*2,disk_minimum,False),
+                (minimum*2,minimum-1,disk_minimum,False),
+                (minimum,minimum,disk_minimum-1,False),
+                (None,minimum,disk_minimum,False),
+                (minimum,None,disk_minimum,False),
+                (minimum,minimum,None,False),
+                (True,minimum,disk_minimum,False)]:
+            with self.subTest(memory=memory,cgroup=cgroup,disk=disk), \
+                 patch.object(control,'resource_snapshot',return_value={
+                     'memoryAvailableBytes':memory,'diskFreeBytes':disk,
+                     'visibleControllerCgroupOomKills':None}), \
+                 patch.object(control,'effective_cgroup_headroom',return_value=cgroup,create=True):
+                if accepted:control.require_startup_headroom()
+                else:
+                    with self.assertRaisesRegex(RuntimeError,'startup resource headroom unavailable'):
+                        control.require_startup_headroom()
+
+    def test_failed_headroom_emits_failure_without_spawning_or_private_details(self):
+        import teetime_startup_control as control
+        events=[];calls=[]
+        controller=StartupController('teetime-startup-123-1','teetime-sandbox-probe-'+'a'*12,
+            emitter=events.append,runner=lambda *args,**kwargs:(calls.append(args) or (0,b'')))
+        with patch.object(control,'require_startup_headroom',side_effect=RuntimeError('PRIVATE'),create=True):
+            with self.assertRaisesRegex(RuntimeError,'startup resource headroom unavailable'):
+                controller.require_headroom()
+        self.assertEqual([(event['phase'],event['edge']) for event in events],
+                         [('resource-gate','start'),('resource-gate','failure')])
+        self.assertEqual(calls,[])
+        self.assertNotIn('PRIVATE',json.dumps(events))
+
+    def test_headroom_logging_failure_also_blocks_forward_work(self):
+        import teetime_startup_control as control
+        for fail_at in [1,2]:
+            events=[]
+            def emitter(event):
+                events.append(event)
+                if len(events)==fail_at:raise OSError('PRIVATE')
+            controller=StartupController('teetime-startup-123-1','teetime-sandbox-probe-'+'a'*12,
+                                         emitter=emitter)
+            with patch.object(control,'require_startup_headroom') as check:
+                with self.assertRaisesRegex(RuntimeError,'startup resource headroom unavailable'):
+                    controller.require_headroom()
+                self.assertEqual(check.call_count,0 if fail_at==1 else 1)
+
+    def test_second_gate_failure_prevents_create_start_and_attach_but_allows_cleanup(self):
+        from unittest.mock import Mock
+        spec=importlib.util.spec_from_file_location('teetime_headroom_integration',Path(__file__).with_name('run-codex-sandbox-probe.py'))
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        controller=Mock();calls=[]
+        controller.require_headroom.side_effect=[None,RuntimeError('startup resource headroom unavailable')]
+        def docker(_binary,*parts,**kwargs):
+            calls.append(parts)
+            if parts[:2]==('image','inspect'):out='sha256:'+'a'*64
+            elif parts[:2]==('container','ls'):out=''
+            else:raise AssertionError('unexpected forward operation')
+            return SimpleNamespace(returncode=0,stdout=out)
+        controller.docker.side_effect=docker
+        argv=['probe','--kind','startup','--image','fixed-image','--expected-sha','a'*40,
+              '--startup-owner','teetime-startup-123-1','--startup-root','unused',
+              '--apparmor-profile','teetime-probe-mount-123-1']
+        with patch('sys.argv',argv),patch.object(module,'require_private_context'), \
+             patch.object(module,'StartupController',return_value=controller):
+            with self.assertRaisesRegex(RuntimeError,'startup resource headroom unavailable'):module.main()
+        self.assertEqual(controller.require_headroom.call_count,2)
+        self.assertFalse(any(parts[0] in {'create','start'} for parts in calls))
+        controller.attach.assert_not_called()
+        controller.enter_cleanup.assert_called_once()
+        controller.finish_cleanup.assert_called_once_with(True)
+
+
 if __name__=='__main__': unittest.main()

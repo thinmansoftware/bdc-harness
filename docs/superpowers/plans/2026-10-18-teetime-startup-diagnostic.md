@@ -341,3 +341,54 @@ not a hard whole-process deadline. Synchronous telemetry/logging and the existin
 post-cleanup private-context check are outside this enforcement. No SIGKILL-safe
 wall-clock or cleanup guarantee is claimed. Source review did not rerun tests;
 new Linux/POSIX CI is required. No activation or execution grant is conveyed.
+
+
+### Resource-precondition correction after capture 39254781844
+
+Capture39254781844 is terminal failure/exit137. Container create, inspect and
+start completed; attach started at855ms, without an end receipt before the host
+controller was killed. Precreation MemAvailable177405952bytes is about169MiB.
+DiskFreeBytes4970270720 and visible-cgroup oom-kill count null do not prove an
+OOM cause. No native result/private artifact; cleanup remains UNVERIFIED.
+The finite capture grant is consumed; this source increment authorizes no retry.
+
+Independent prebuild review approved source-only startup headroom checks inside
+the protected block: before first Docker command and again immediately before
+create. Provisional floors are1536MiB memory (worker768MiB plus768MiB allowance
+for controller/daemon/runner) and2GiB disk. These are admission floors, not
+demonstrated sizing, reserved resources, production capacity or an OOM guarantee.
+Disk uses the runner root filesystem; it does not claim to measure a separately
+mounted Docker data root. Samples are non-atomic and cannot reserve resources.
+
+Effective memory is the minimum of MemAvailable and every supported finite
+ancestor's max(0,memory.max-memory.current). The read-only collector supports a
+single cgroup2 hierarchy mounted at/sys/fs/cgroup with root/ and an exempt root
+without memory.max. It requires the memory controller; root cgroup.type is not
+required because the kernel exposes that file only on non-root cgroups. Other
+layouts, hidden roots, duplicate/overlaid mounts, v1, symlinks, malformed/missing
+descendant counters or unknown measurements fail closed. This is a supported
+layout check, not general proof that namespace virtualization is impossible.
+Membership and mount records are read again after collection; changes reject.
+At most32 ancestors; fixed ASCII inputs/read bounds and safe decimal integers.
+Unknown never becomes zero or unlimited. Known exempt/unlimited paths use a
+safe-integer ceiling only after complete supported-layout validation.
+
+The gate emits only closed resource-gate start/end/failure milestones. Logging
+failure also stops forward work; existing owned cleanup remains available.
+Historical cleanup is not inferred from these offline tests. Tests cover exact
+floors/one-byte-below, unknown/malformed counters, tighter ancestors with unlimited
+descendants, usage above limit, root exemption, hidden/duplicate mounts, symlinks,
+depth overflow, changing membership/mounts, bounded ASCII reads, logging failure,
+and second-check failure preventing create/start/attach while cleanup executes.
+
+The proposed individually owned BuildKit build/teardown is a separate source
+correction. No privileged builder, build, native executable, account, workflow
+activation or dispatch is authorized by this increment. Existing auth/model,
+worker768MiB/no-swap128pids1CPU confinement and command budgets remain unchanged.
+
+Client clarification: this is an MVP demonstration of the planned app, not a
+production launch. Prioritize the simulated golfer walkthrough and its stated
+approval/price-change/unavailable/uncertain-result behaviors. Defer production
+scaling, operational hardening, live integrations and release work. This guard
+only prevents repeating a capture on a demonstrably resource-starved runner;
+it does not add a production-readiness requirement to demo acceptance.
