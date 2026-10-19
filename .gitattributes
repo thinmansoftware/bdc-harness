@@ -13,3 +13,4 @@ packages/overseer/src/__tests__/fixtures/reconcile/*.md -text
 
 scripts/staging/codex-apparmor-mount-rules.txt text eol=lf
 packages/providers/src/codex/restricted-review-model-base.json text eol=lf
+scripts/staging/fixtures/teetime-connect-proxy-v1-source.txt text eol=lf

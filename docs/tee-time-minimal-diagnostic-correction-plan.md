@@ -122,6 +122,16 @@ are unique canonical-order enums; byte count/classificationLimited and stage
 summary are reconciled. Raw error strings and arbitrary destinations never enter
 the packet. These categories remain diagnostic classifications, not server facts.
 
+The separate proxy v2 source API adds requestLineReasons with exactly framing,
+method, http_version, authority and unknown. Classification runs only after the
+original parser rejects, in that precedence order; it reports the first failed
+structural check, not every defect or its causal importance. Exactly one count
+is recorded per request_line_or_destination denial; missing/unrecognized source
+metadata maps to unknown. These totals must equal the existing denial count.
+Existing v1 snapshots and runtime selection remain unchanged. The synthetic
+differential corpus compares accepted results and original denial reasons with
+the exact pre-change Git source, frozen at322864a0867579500d94f412f0925c02eb8ae9a2.
+
 `teetime_minimal_v2_contract.py` defines separate measured image/all-path sets
 including the new SDK helper in both sets and the host-only verifier only in the
 all-path set. Its read-only verifier requires an external

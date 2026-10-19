@@ -23,6 +23,14 @@ def _constant(_value):
 
 
 def parse_proxy_diagnostic_receipt(raw):
+    return _parse(raw, 1)
+
+
+def parse_proxy_diagnostic_receipt_v2(raw):
+    return _parse(raw, 2)
+
+
+def _parse(raw, version):
     if type(raw) is not bytes or len(raw) > 4096:
         raise ValueError('invalid diagnostic bound')
     try:
@@ -35,11 +43,11 @@ def parse_proxy_diagnostic_receipt(raw):
                    for line in lines]
     if (type(ready) is not dict or set(ready) != {'proxyReady', 'diagnosticVersion'}
             or ready['proxyReady'] is not True or type(ready['diagnosticVersion']) is not int
-            or ready['diagnosticVersion'] != 1):
+            or ready['diagnosticVersion'] != version):
         raise ValueError('invalid diagnostic ready record')
     if (type(data) is not dict or set(data) != {'version', 'kind', 'outcomes', 'bytes',
-            'active', 'parserReasons', 'nonParserReasons'}
-            or type(data['version']) is not int or data['version'] != 1
+            'active', 'parserReasons', 'nonParserReasons'} | ({'requestLineReasons'} if version == 2 else set())
+            or type(data['version']) is not int or data['version'] != version
             or data['kind'] != 'teetime-proxy-diagnostic'):
         raise ValueError('invalid diagnostic fields')
     for key, names in [('outcomes', OUTCOMES), ('parserReasons', PARSER), ('nonParserReasons', PHASES)]:
@@ -49,6 +57,12 @@ def parse_proxy_diagnostic_receipt(raw):
               *data['parserReasons'].values(), *data['nonParserReasons'].values()]
     if any(type(value) is not int or not 0 <= value <= 10**9 for value in values):
         raise ValueError('invalid diagnostic counter value')
+    if version == 2:
+        reasons = data['requestLineReasons']
+        if (type(reasons) is not dict or set(reasons) != {'framing', 'method', 'http_version', 'authority', 'unknown'}
+                or any(type(count) is not int or not 0 <= count <= 10**9 for count in reasons.values())
+                or sum(reasons.values()) != data['parserReasons']['request_line_or_destination']):
+            raise ValueError('request-line accounting differs')
     counts = data['outcomes']
     failures = counts['rejected_or_closed'] + counts['timeout']
     if (data['active'] != 0 or data['bytes'] > 64*1024*1024

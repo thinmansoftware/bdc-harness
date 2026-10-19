@@ -22,6 +22,7 @@ process_bytes = 0
 outcomes = Counter()
 parser_reasons = Counter()
 non_parser_reasons = Counter()
+request_line_reasons = Counter()
 diagnostic_invalid = False
 
 DENIAL_REASONS = frozenset({'request_line_or_destination', 'duplicate_header',
@@ -31,6 +32,7 @@ NON_PARSER_REASONS = frozenset({'connection_limit', 'header_read', 'dns_lookup',
                                'dns_validation', 'upstream_connect', 'tunnel'})
 OUTCOME_NAMES = frozenset({'header_or_destination_denied', 'dns_denied', 'byte_limit',
                            'timeout', 'rejected_or_closed', 'closed'})
+REQUEST_LINE_REASONS = frozenset({'framing', 'method', 'http_version', 'authority', 'unknown'})
 
 
 def build_proxy_receipt(diagnostic=False):
@@ -56,12 +58,26 @@ def build_proxy_receipt(diagnostic=False):
             'nonParserReasons': phases}
 
 
+def build_proxy_receipt_v2():
+    """Unselected source API; never reclassifies an old receipt."""
+    value = build_proxy_receipt(True)
+    if set(request_line_reasons)-REQUEST_LINE_REASONS: raise ValueError('unknown request-line category')
+    reasons = {key: request_line_reasons.get(key, 0) for key in sorted(REQUEST_LINE_REASONS)}
+    if (any(type(count) is not int or not 0 <= count <= 10**9 for count in reasons.values())
+            or sum(reasons.values()) != value['parserReasons']['request_line_or_destination']):
+        raise ValueError('request-line diagnostic accounting differs')
+    return {**value, 'version': 2, 'requestLineReasons': reasons}
+
+
 class ConnectPolicyError(ValueError):
     """Fixed diagnostic reason only; never retain request bytes or header data."""
-    def __init__(self, reason):
+    def __init__(self, reason, request_line_reason=None):
         if reason not in DENIAL_REASONS:
             raise ValueError('unknown policy denial reason')
         self.reason = reason
+        self.request_line_reason = request_line_reason if (
+            reason == 'request_line_or_destination' and type(request_line_reason) is str
+            and request_line_reason in REQUEST_LINE_REASONS) else 'unknown'
         super().__init__(reason)
 
 
@@ -73,6 +89,17 @@ def configure_task(task):
     TOTAL_SECONDS = 720 if task == 'supervised-demo' else 300
 
 
+def _rejected_request_line_reason(lines):
+    # Called only AFTER the original parser rejects. This is the first failed
+    # structural check, not a complete defect list or a causal server diagnosis.
+    parts = lines[0].split(' ')
+    if len(parts) != 3 or lines[-2:] != ['', '']: return 'framing'
+    if parts[0] != 'CONNECT': return 'method'
+    if parts[2] != 'HTTP/1.1': return 'http_version'
+    if parts[1] != 'chatgpt.com:443': return 'authority'
+    return 'unknown'
+
+
 def parse_connect(data):
     if len(data) > HEADER_LIMIT or not data.endswith(b'\r\n\r\n'):
         raise ConnectPolicyError('encoding_or_framing')
@@ -81,7 +108,7 @@ def parse_connect(data):
     except UnicodeError:
         raise ConnectPolicyError('encoding_or_framing') from None
     if lines[0] != 'CONNECT chatgpt.com:443 HTTP/1.1' or lines[-2:] != ['', '']:
-        raise ConnectPolicyError('request_line_or_destination')
+        raise ConnectPolicyError('request_line_or_destination', _rejected_request_line_reason(lines))
     seen = set()
     for line in lines[1:-2]:
         key, sep, value = line.partition(':')
@@ -128,6 +155,7 @@ async def handle_client(reader, writer):
     tasks = []
     phase = 'connection_limit'
     parser_reason = None
+    request_line_reason = 'unknown'
     try:
         if active >= TUNNEL_LIMIT:
             raise ValueError('connection bound')
@@ -151,6 +179,9 @@ async def handle_client(reader, writer):
                 outcomes['header_or_destination_denied'] += 1
                 if type(error) is ConnectPolicyError and error.reason in DENIAL_REASONS:
                     parser_reason = error.reason
+                    detail = getattr(error, 'request_line_reason', None)
+                    if type(detail) is str and detail in REQUEST_LINE_REASONS:
+                        request_line_reason = detail
                 else:
                     diagnostic_invalid = True
                 raise
@@ -205,6 +236,8 @@ async def handle_client(reader, writer):
         outcomes['timeout' if isinstance(error, TimeoutError) else 'rejected_or_closed'] += 1
         if parser_reason is not None:
             parser_reasons[parser_reason] += 1
+            if parser_reason == 'request_line_or_destination':
+                request_line_reasons[request_line_reason] += 1
         elif phase in NON_PARSER_REASONS:
             non_parser_reasons[phase] += 1
         else:
