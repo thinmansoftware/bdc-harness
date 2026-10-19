@@ -258,3 +258,22 @@ Invocation after independent wrapper review and frozen-input readback:
 `C:/Program Files/Python312/python.exe -I -B <frozen-wrapper-path>`.
 No invocation has been made at this source checkpoint. A successful install must
 retain its actual receipt before the complete preparation package is evaluated.
+
+Subsequent actual execution on the BDC laptop succeeded with wrapper45b66ba9
+(full SHA25645b66ba9ad8796b93060850f2a37ffa9e77925b6db919450ef05343297a0573e).
+The install process returned0 and was reaped; lifecycle scripts remained disabled.
+All2082 archived source files were unchanged, including the lock. The complete
+dependency inventory covered69388 entries and has SHA256
+eb1f4fff70bbe3708ad1b4d34e63ca0e102d90ea554647e77d48abe09469a129.
+No account, model invocation or controller start occurred. The exact receipt and
+process receipt are retained in the local audit directory.
+
+The separate app source and named demo/simulated-walkthrough-01 worktree were also
+created beneath the isolated ARCHON_HOME from the verified bundle. Actual HEAD,
+local staging and origin/staging all matched bf6e8935768cf39ebb56b3ef44535830fd71ea7f;
+GitHub staging was read back at that same commit. No feature was implemented.
+
+The complete UI-contract/prepared-base prompt helper now has7 passing pure tests,
+including rejection of contract drift and wrong prepared-base identity. It supplies
+complete immutable source references and exact artifact binding, without truncating
+the contract or granting execution. Actual demo task/protocol wiring remains pending.
