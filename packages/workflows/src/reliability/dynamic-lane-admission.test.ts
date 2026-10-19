@@ -1,15 +1,336 @@
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import fixtureJson from './fixtures/dynamic-lane/eligible-synthetic.json';
+import haikuFixture from './fixtures/dynamic-lane/eligible-haiku-synthetic.json';
 import {
   canonicalDynamicLaneJson,
   dynamicLaneSnapshotSchema,
   evaluateDynamicLane,
   type DynamicLaneSnapshot,
+  type DynamicLaneV4Snapshot,
 } from './dynamic-lane-admission';
 
 const clone = (): DynamicLaneSnapshot =>
-  dynamicLaneSnapshotSchema.parse(structuredClone(fixtureJson));
+  dynamicLaneSnapshotSchema.parse(structuredClone(fixtureJson)) as DynamicLaneSnapshot;
+
+const v4 = (): DynamicLaneV4Snapshot =>
+  dynamicLaneSnapshotSchema.parse(structuredClone(haikuFixture)) as DynamicLaneV4Snapshot;
+
+function withHaikuDecision(input: DynamicLaneV4Snapshot, routeIndex = 0): DynamicLaneV4Snapshot {
+  const first = evaluateDynamicLane(input);
+  input.decisionExchanges = input.routingResourcePlan
+    .slice(0, routeIndex + 1)
+    .map((route, index) => ({
+      routeId: route.routeId,
+      engineId: route.engineId,
+      adapterId: route.adapterId,
+      transport: route.transport,
+      accountId: route.accountId,
+      origin: 'synthetic',
+      requestedModel: route.requestedModel,
+      servedModel: route.requestedModel,
+      attemptId: `attempt-${index}`,
+      startedAt: `2026-10-17T11:59:0${index * 2}.000Z`,
+      completedAt: `2026-10-17T11:59:0${index * 2 + 1}.000Z`,
+      usage: { inputTokens: 20, outputTokens: 8 },
+      latencyMs: 10,
+      cashCost: null,
+      outcome: index === routeIndex ? 'success' : 'availability',
+      response:
+        index === routeIndex
+          ? {
+              schemaVersion: 'dynamic-lane-response/v1',
+              decisionId: input.decisionId,
+              snapshotHash: first.snapshotHash,
+              requestHash: first.requestHash,
+              choice: 'select',
+              candidateId: 'codex-plan',
+              rationale: 'Use eligible worker.',
+              evidenceReferences: ['evidence-001'],
+            }
+          : null,
+    }));
+  return input;
+}
+
+describe('model-neutral Haiku offline v4', () => {
+  test('an actual call retains consumption and charges even when served identity is rejected', () => {
+    for (const servedModel of [null, 'wrong-model']) {
+      const input = withHaikuDecision(v4());
+      Object.assign(input.decisionExchanges[0] as object, { servedModel, cashCost: 1 });
+      const out = evaluateDynamicLane(input);
+      expect(out.proposedBinding).toBeNull();
+      expect(out.routerCallsConsumed).toBe(1);
+      expect(out.charges['haiku-sub']).toBe(1);
+      expect(out.attemptHistory).toHaveLength(1);
+    }
+  });
+
+  test('API billing evidence must exist before the API call starts', () => {
+    const input = v4();
+    input.routingResourcePlan[2]!.apiBillingEvidence!.availableAt = '2026-10-17T11:59:59.000Z';
+    const out = evaluateDynamicLane(withHaikuDecision(input, 2));
+    expect(out.proposedBinding).toBeNull();
+    expect(out.routerCallsConsumed).toBe(3);
+  });
+
+  test('completed receipt mismatch is checked for abstentions and failed calls too', () => {
+    const input = withHaikuDecision(v4());
+    const accepted = evaluateDynamicLane(input);
+    input.priorDecisions!.entries.push({
+      decisionId: input.decisionId,
+      snapshotHash: accepted.snapshotHash,
+      receipt: accepted,
+      exchanges: structuredClone(input.decisionExchanges),
+    });
+    const response = (input.decisionExchanges[0] as { response: Record<string, unknown> }).response;
+    response.choice = 'abstain';
+    response.candidateId = null;
+    expect(evaluateDynamicLane(input).disposition).toBe('prior_receipt_mismatch');
+    Object.assign(input.decisionExchanges[0] as object, { outcome: 'refused', response: null });
+    expect(evaluateDynamicLane(input).disposition).toBe('prior_receipt_mismatch');
+  });
+  test('normalized worker facts do not retain the legacy single-router account field', () => {
+    const out = evaluateDynamicLane(v4());
+    expect(out.normalizedRequest!.eligibleCandidates[0]).not.toHaveProperty('routerAccountId');
+  });
+
+  test.each([
+    'understand',
+    'plan',
+    'build',
+    'independent_review',
+    'verify',
+    'evidence_return',
+  ] as const)('Haiku can select a qualified worker for %s', role => {
+    const input = v4();
+    input.aiRole = role;
+    input.roleObjective!.role = role;
+    input.candidateProfiles!.forEach(p => p.applicableRoles.push(role));
+    if (role === 'independent_review')
+      input.currentArtifactHash = input.reviewTargetHash = 'sha256:artifact';
+    expect(evaluateDynamicLane(withHaikuDecision(input)).decision).toBe('propose');
+  });
+  test('completed prior receipt is recomputed and replayed without double charging', () => {
+    const input = withHaikuDecision(v4());
+    const first = evaluateDynamicLane(input);
+    input.priorDecisions!.entries.push({
+      decisionId: input.decisionId,
+      snapshotHash: first.snapshotHash,
+      receipt: first,
+      exchanges: input.decisionExchanges,
+    });
+    input.decisionExchanges = [];
+    const replay = evaluateDynamicLane(input);
+    expect(replay.decision).toBe('propose');
+    expect(replay.routerCallsConsumed).toBe(first.routerCallsConsumed);
+    expect(replay.charges).toEqual(first.charges);
+    (
+      input.priorDecisions!.entries[0]!.receipt as { proposedBinding: { model: string } }
+    ).proposedBinding.model = 'forged';
+    expect(evaluateDynamicLane(input).proposedBinding).toBeNull();
+  });
+
+  test.each([
+    'capacity',
+    'context',
+    'router-expiry',
+    'binding',
+    'billing',
+    'profile',
+    'node',
+    'reference',
+    'later-outcome',
+  ])('rejects missing or invalid %s evidence', change => {
+    const input = v4();
+    let index = 0;
+    if (change === 'capacity') input.accounts[1]!.capacity = 'unknown';
+    if (change === 'context') input.candidates[0]!.contextCompatible = null;
+    if (change === 'router-expiry') input.accounts[0]!.expiresAt = input.evaluationTime;
+    if (change === 'binding') input.routingResourcePlan[0]!.bindingEvidence = null;
+    if (change === 'billing') {
+      index = 2;
+      input.routingResourcePlan[2]!.apiBillingEvidence = null;
+    }
+    if (change === 'profile') input.candidateProfiles![0]!.sourceRefs = [];
+    if (change === 'node') input.nodeId = 'wrong';
+    if (change === 'later-outcome') input.decisionEvidence!.items[0]!.kind = 'later_outcome';
+    withHaikuDecision(input, index);
+    if (change === 'reference')
+      (
+        input.decisionExchanges[0] as { response: { evidenceReferences: string[] } }
+      ).response.evidenceReferences = ['unknown'];
+    expect(evaluateDynamicLane(input).proposedBinding).toBeNull();
+  });
+
+  test('v3 missing new safety facts abstains while retaining legacy provenance', () => {
+    for (const key of [
+      'routerCallsConsumed',
+      'routerCallCeiling',
+      'monthlyBudgetPolicy',
+      'priorDecisions',
+      'legacyRoutingEvidence',
+    ] as const) {
+      const input = clone();
+      delete input[key];
+      const result = evaluateDynamicLane(input);
+      expect(result.schemaVersion).toBe('dynamic-lane-receipt/v3');
+      expect(result.request).toBeNull();
+    }
+  });
+  test('Haiku is the first decision route and needs no invented confidence', () => {
+    const out = evaluateDynamicLane(withHaikuDecision(v4()));
+    expect(out.schemaVersion).toBe('dynamic-lane-receipt/v4');
+    expect(out.engineId).toBe('haiku');
+    expect(out.servedModel).toBe('claude-haiku-5-5');
+    expect(out.decision).toBe('propose');
+    expect(out.proposedBinding?.candidateId).toBe('codex-plan');
+    expect(out.normalizedRequest?.allowedChoices).toEqual(['claude-plan', 'codex-plan', 'abstain']);
+    expect(out.distribution).toBeNull();
+    expect(out.postExecutionReview).toBe('unissued');
+  });
+
+  test.each([1, 2])(
+    'availability failures permit route %i without resetting consumed calls',
+    index => {
+      const input = withHaikuDecision(v4(), index);
+      const out = evaluateDynamicLane(input);
+      expect(out.decision).toBe('propose');
+      expect(out.engineId).toBe(index === 1 ? 'luna' : 'haiku');
+      expect(out.transport).toBe(index === 1 ? 'subscription' : 'api');
+      expect(out.routerCallsConsumed).toBe(index + 1);
+    }
+  );
+
+  test('last permitted successful call is accepted; a later fallback cannot pass the ceiling', () => {
+    const input = v4();
+    input.routerCallsConsumed = 2;
+    expect(evaluateDynamicLane(withHaikuDecision(input)).decision).toBe('propose');
+    const exhausted = v4();
+    exhausted.routerCallsConsumed = 3;
+    expect(evaluateDynamicLane(exhausted).normalizedRequest).toBeNull();
+    const tooMany = v4();
+    tooMany.routerCallsConsumed = 2;
+    expect(evaluateDynamicLane(withHaikuDecision(tooMany, 1)).proposedBinding).toBeNull();
+  });
+
+  test('a skipped known unavailable route consumes no call', () => {
+    const input = v4();
+    input.accounts[0]!.capacity = 'exhausted';
+    withHaikuDecision(input, 1);
+    input.decisionExchanges = input.decisionExchanges.slice(1);
+    const out = evaluateDynamicLane(input);
+    expect(out.decision).toBe('propose');
+    expect(out.engineId).toBe('luna');
+    expect(out.routerCallsConsumed).toBe(1);
+  });
+
+  test('distinct fallback accounts and failed-call charges retain the original candidate set', () => {
+    const input = v4();
+    input.accounts.find(a => a.accountId === 'luna-sub')!.limit = 2;
+    const out = evaluateDynamicLane(withHaikuDecision(input, 1));
+    expect(out.proposedBinding).toBeNull();
+    expect(out.disposition).toContain('budget');
+    const shared = v4();
+    shared.routingResourcePlan[1]!.accountId = 'haiku-sub';
+    shared.accounts[0]!.limit = 3.5;
+    expect(evaluateDynamicLane(withHaikuDecision(shared, 1)).proposedBinding).toBeNull();
+  });
+
+  test.each([
+    'refused',
+    'malformed',
+    'abstain',
+    'unknown-served',
+    'wrong-transport',
+    'extra-response',
+  ])('%s cannot trigger fallback or selection', change => {
+    const input = withHaikuDecision(v4(), 1);
+    const first = input.decisionExchanges[0] as Record<string, unknown>;
+    const final = input.decisionExchanges[1] as Record<string, unknown>;
+    if (change === 'refused') first.outcome = 'refused';
+    if (change === 'malformed') {
+      first.outcome = 'success';
+      first.response = { choice: 7 };
+    }
+    if (change === 'abstain') {
+      first.outcome = 'success';
+      first.response = { ...(final.response as object), choice: 'abstain', candidateId: null };
+    }
+    if (change === 'unknown-served') first.servedModel = null;
+    if (change === 'wrong-transport') final.transport = 'api';
+    if (change === 'extra-response') (final.response as Record<string, unknown>).dispatch = true;
+    expect(evaluateDynamicLane(input).proposedBinding).toBeNull();
+  });
+
+  test('identical delivered attempts are counted once; conflicting attempts and prior hashes reject', () => {
+    const input = withHaikuDecision(v4());
+    input.decisionExchanges.push(structuredClone(input.decisionExchanges[0]));
+    const out = evaluateDynamicLane(input);
+    expect(out.decision).toBe('propose');
+    expect(out.routerCallsConsumed).toBe(1);
+    (input.decisionExchanges[1] as Record<string, unknown>).servedModel = 'wrong';
+    expect(evaluateDynamicLane(input).proposedBinding).toBeNull();
+    const conflict = v4();
+    conflict.priorDecisions!.entries.push({
+      decisionId: conflict.decisionId,
+      snapshotHash: 'sha256:wrong',
+      receipt: null,
+      exchanges: [],
+    });
+    expect(evaluateDynamicLane(conflict).normalizedRequest).toBeNull();
+  });
+
+  test('monthly uncapped policy never removes run/account limits, cost evidence or expiry', () => {
+    const input = v4();
+    input.budget.limit = 0;
+    expect(evaluateDynamicLane(withHaikuDecision(input)).proposedBinding).toBeNull();
+    const expired = v4();
+    expired.monthlyBudgetPolicy!.effectiveUntil = '2026-10-16T00:00:00.000Z';
+    expect(evaluateDynamicLane(expired).normalizedRequest).toBeNull();
+    const unknown = v4();
+    unknown.monthlyBudgetPolicy = null;
+    expect(evaluateDynamicLane(unknown).normalizedRequest).toBeNull();
+    const unknownCost = v4();
+    unknownCost.routingResourcePlan[0]!.estimatedCost = null;
+    expect(evaluateDynamicLane(unknownCost).proposedBinding).toBeNull();
+  });
+
+  test('Haiku and unqualified reviewer candidates cannot satisfy review', () => {
+    for (const change of ['haiku', 'weak', 'missing', 'wrong-family', 'artifact']) {
+      const input = v4();
+      input.aiRole = 'independent_review';
+      input.roleObjective!.role = input.aiRole;
+      input.currentArtifactHash = input.reviewTargetHash = 'sha256:artifact';
+      input.candidateProfiles!.forEach(p => p.applicableRoles.push(input.aiRole));
+      input.contributingFamilies = [
+        {
+          family: 'anthropic',
+          evidenceRef: 'fixture:contributor',
+          availableAt: '2026-10-17T11:00:00.000Z',
+        },
+      ];
+      if (change === 'haiku') input.candidates[0]!.model = 'claude-haiku-5-5';
+      if (change === 'weak') input.candidates[0]!.reviewerQualification!.strength = 'weak';
+      if (change === 'missing') input.candidates[0]!.reviewerQualification = null;
+      if (change === 'wrong-family') input.candidates[0]!.family = 'anthropic';
+      if (change === 'artifact') input.reviewTargetHash = 'wrong';
+      expect(evaluateDynamicLane(withHaikuDecision(input)).proposedBinding).toBeNull();
+    }
+    const valid = v4();
+    valid.aiRole = 'independent_review';
+    valid.roleObjective!.role = valid.aiRole;
+    valid.currentArtifactHash = valid.reviewTargetHash = 'sha256:artifact';
+    valid.candidateProfiles!.forEach(p => p.applicableRoles.push(valid.aiRole));
+    expect(evaluateDynamicLane(withHaikuDecision(valid)).decision).toBe('propose');
+  });
+
+  test.each(['cancelled', 'activeWriter', 'paused'])('v4 preserves %s hard gate', field => {
+    const input = v4();
+    Object.assign(input, { [field]: true });
+    expect(evaluateDynamicLane(input).normalizedRequest).toBeNull();
+  });
+});
 
 function withAcceptedExchange(
   input: DynamicLaneSnapshot,
@@ -43,6 +364,39 @@ function withAcceptedExchange(
 }
 
 describe('dynamic lane offline admission scenarios', () => {
+  test('review regression: distribution determines the unique winner', () => {
+    for (const distribution of [
+      { 'codex-plan': 0.5, 'claude-plan': 0.5, abstain: 0 },
+      { 'codex-plan': 0.4, 'claude-plan': 0.6, abstain: 0 },
+      { 'codex-plan': 0.4, 'claude-plan': 0.1, abstain: 0.5 },
+    ]) {
+      const input = clone();
+      input.policy.minimumWinningProbability = 0.4;
+      const ready = withAcceptedExchange(input);
+      ready.jevExchange!.distribution = distribution;
+      expect(evaluateDynamicLane(ready).proposedBinding).toBeNull();
+    }
+  });
+
+  test('review regression: omitted and empty semantic evidence evaluates to abstention', () => {
+    for (const key of ['taskBrief', 'roleObjective', 'decisionEvidence', 'candidateProfiles']) {
+      for (const value of [undefined, null, {}]) {
+        const input = { ...fixtureJson, [key]: value };
+        const parsed = dynamicLaneSnapshotSchema.safeParse(input);
+        expect(parsed.success).toBe(true);
+        if (parsed.success) expect(evaluateDynamicLane(parsed.data).request).toBeNull();
+      }
+    }
+  });
+
+  test('review regression: decision calls have a separate ceiling', () => {
+    const input = dynamicLaneSnapshotSchema.parse({
+      ...fixtureJson,
+      routerCallsConsumed: 3,
+      routerCallCeiling: 3,
+    });
+    expect(evaluateDynamicLane(input).request).toBeNull();
+  });
   test('explicit authorization admits only allowlisted candidates', () => {
     const input = clone();
     input.candidateAllowlist = ['codex-plan'];

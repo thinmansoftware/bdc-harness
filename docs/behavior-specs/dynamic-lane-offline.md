@@ -1,101 +1,73 @@
-# Offline Jev Dynamic Lane routing behavior v3
+# Offline Dynamic Lane behavior v4
 
-Proposed implementation contract. No live execution authority is created by this document.
+Proposed October 15, 2026 amendment for #2475 and #3264. Haiku is the default decision engine. No live authority is created.
 
-## Interface and ownership
+## Scope and versions
 
-The proposed evaluator belongs in the existing bdc-harness workflow reliability package. It accepts one validated, versioned decision-time snapshot, constructs a Jev request from eligible candidates, consumes a supplied synthetic or recorded Jev response, and produces one deterministic receipt. A local replay CLI is its first caller. Jev is the per-step decision engine; MTA supplies optional model-profile/evaluation context. No live API call occurs in this offline slice.
+Extend #1024's pure evaluator/replay CLI. Supplied snapshots and synthetic/recorded exchanges produce deterministic receipts. No network/model calls, database writes, reservations, leases, dispatch, workflow registration or cancellation. Reuse existing DagNode, RunAuthorityRecord, ProviderAttemptRecord and ExecutionCapability types where applicable; new fields are local contract fields, not DB columns. Derive validation/types from one schema.
 
-Use existing DagNode, RunAuthorityRecord, ProviderAttemptRecord and ExecutionCapability types where they describe the input. Snapshot-only fields are NEW contract fields; they are not database columns. Derive runtime validation and TypeScript types from a single schema following repository conventions.
+Versions: `dynamic-lane-snapshot/v4`, `dynamic-lane-request/v1`, `dynamic-lane-response/v1`, `dynamic-lane-receipt/v4`, policy `offline-admission/v4`. Explicit v3 Jev inputs retain legacy parsing/receipt provenance with reviewed tie/limit/semantic fixes. Never silently migrate their hashes or invent Haiku probabilities. Offline inputs cannot claim live provenance.
 
-The snapshot must explicitly supply: fixed evaluation time; run/node/scope identifiers; AI role; authority; ready/dependency state; cancellation/pause state; evidence of custody and active writers; candidate allowlist; configured model-binding inputs; required capabilities; per-account capacity observations with measured and expiry times; finite nonnegative budget limit, spend, outstanding commitments and verification allowance; bounded router-call and next-step cost estimates; existing attempt history and attempt ceiling; contributing model families with identity evidence; current artifact hash and review-target hash; and optional MTA model-profile context. The Jev exchange is a separate record bound to the hash of these decision inputs, excluding the exchange and output to avoid a self-referential hash.
+## Snapshot and evidence
 
-No production defaults may fill missing authority, custody, capacity, costs, review identities, timestamps, artifact hashes or policy limits. Fixtures may state these values explicitly. Required freshness and independence are supplied policy constraints, never inferred from a model name or endpoint.
+Structural envelope requires supported version, fixed evaluationTime, runId, nodeId, actual DagNode, role, candidates and policy. Require nodeId == node.id. Invalid types/timestamps, duplicate candidate/account/profile/route IDs and nonfinite/negative amounts/counters fail parsing. Unsupported envelope versions fail.
 
-### Required decision-time task and model context
+Omitted/null/empty taskBrief, roleObjective, decisionEvidence and candidateProfiles normalize to unknown semantic evidence and evaluated abstention, exit 0. Well-shaped unsupported semantic packet versions yield insufficiency; malformed envelope types still fail. Missing authority/capacity/cost/identity is unknown, never a process default.
 
-The NEW versioned snapshot contract also requires these semantic inputs, all included in snapshotHash and the constructed request:
+Required proposal evidence:
 
-- taskBrief: {version, text, sourceRef, availableAt}, describing the task known at this boundary.
-- roleObjective: {version, role, text, acceptanceCriteria, sourceRef, availableAt}. acceptanceCriteria is a nonempty list of explicit criteria for this step; role must match the snapshot's AI role.
-- decisionEvidence: {version, availability, items, noPriorArtifactReason}. Each item contains evidenceId, sourceRef, contentHash, observedAt, availableAt and the relevant sanitized content. availability is supplied or no_prior_artifact. The latter is permitted only for initial intake with a stated reason; it does not waive taskBrief, roleObjective or acceptanceCriteria. Other AI steps require cited evidence items for their role. Missing evidence must not be mislabeled no_prior_artifact.
-- candidateProfiles: a versioned record per eligible candidate, containing candidateId, profileVersion, applicableRoles, observations, sourceRefs, availableAt and limitations. Each observation records its task/evaluation scope and provenance. Missing, unsupported-version or role-inapplicable profiles exclude that candidate. No surviving profiles means abstention.
+- Matching authority/scope, ready dependencies, no cancellation/pause, valid custody, active-writer evidence and acknowledged cancellation where applicable.
+- Explicit candidate allowlist/configured binding, required capabilities/context compatibility.
+- Known account-specific capacity: account/seat/window, observedAt/expiresAt, sourceRef and state. Require observedAt <= evaluationTime < expiresAt. ResetAt alone never proves recovery.
+- Run/account spend, limits, commitments, verification allowance, bounded router and next-step estimates. Unknown cost is insufficient. Decision routes/workers identify account and transport.
+- Monthly policy tagged `uncapped` or `limited`, effectiveFrom/effectiveUntil and authorizationRef. October 2026 uncapped follows #3264; missing/null/expired is unknown. Other configured limits remain binding.
+- Existing worker attempts/providerAttemptCeiling, plus independent routerCallsConsumed/routerCallCeiling. routerCallsConsumed means run-wide calls consumed BEFORE this decision's first attempt and excludes the supplied current-decision history. Derive resulting consumption by adding unique actual calls in that history; never reset on fallback/replay. Check capacity BEFORE each call; a final successful call that brings resulting consumption exactly to the ceiling remains valid. Skipping an unavailable route makes no call and consumes zero calls.
+- For review: matching artifact/target hashes, all contributor served families with identity provenance, candidate-family mapping and explicit strong-reviewer qualification/version. Haiku is excluded.
 
-These are required evidence slots, distinct from the structural envelope. Omitted, null or empty semantic inputs normalize to missing evidence and produce an evaluated abstention (CLI exit 0) before a Jev request is constructed. Malformed structural envelope types still produce nonzero exit. Unsupported semantic packet versions produce an explicit unsupported-evidence-version reason. Do not fetch or invent replacements.
+Preserve v3 task/acceptance/evidence/profile packets and availableAt <= evaluationTime. Reject this decision's later outcome as input. Initial intake may cite explicit no-prior-artifact evidence. Profiles need applicable observations, sources and limitations. Small synthetic tests do not certify role winners or probabilities.
 
-Only evidence availableAt <= evaluationTime may enter decision state. Separate later outcomes into a different outcome record outside the snapshot and Jev request; never feed the result of the step being predicted back into its inputs. Historical outcomes from other cases may inform profiles only if available before the current decision. Reject a supplied packet marked as this decision's later outcome rather than silently removing it and accepting the rest.
+## Normalized request and response
 
-The matrix observations are provisional profiles, not certified role winners: the small two-task synthetic evaluation supports further GLM/Kimi builder, DeepSeek Pro planning and Flash intake/validation trials. It does not establish production calibration or qualify Fable. Do not hardcode those assignments, production success probabilities or confidence thresholds from these observations. Candidate profiles must carry these limitations and their source evidence.
+Request fields: schemaVersion, decisionId, policyVersion, promptVersion, snapshotHash, runId, nodeId, role, taskBrief, roleObjective, decisionEvidence, eligibleCandidates, allowedChoices and routingResourcePlan. Candidates include exact candidateId, sanitized resolved provider/model/account/transport, applicable profile and code-computed capacity/budget facts. allowedChoices is exactly eligible IDs plus `abstain`. No eligible candidate means no request.
 
-The required envelope (version, evaluation time, run/node identity, candidate list and policy structure) must validate. Evidence slots explicitly allow null values: missing authority, capacity, cost or identity evidence is a valid snapshot that yields abstention, not a CLI parse error. An absent/invalid Jev exchange yields a recorded wait/abstention; do not choose a baseline model silently. Invalid numeric policy values or malformed required envelope fields cause CLI error; unknown evidence does not. Observations after evaluationTime are invalid evidence; evaluationTime >= expiresAt means expired.
+Canonical JSON sorts object keys, preserves defined array order and appends one newline for CLI output. snapshotHash covers normalized decision inputs excluding exchanges, output and prior-decision ledger (avoiding self-reference); record that ledger's separate canonical hash as priorLedgerHash in the receipt. requestHash covers the actual canonical request. A decisionId binds to one snapshotHash. Supply a trusted prior-decision ledger/reference with availableAt/sourceRef and known prior decisionId/snapshotHash/receipt references (explicit empty ledger is allowed). Detect conflicting ID/hash reuse only against that supplied evidence. Missing ledger is insufficient evidence. An identical supplied completed-decision receipt is validated and replayed, not charged again. The pure CLI cannot detect reuse across unrelated files or retain counters; cross-invocation uniqueness/durability belongs to the later runtime store. Stable input/time/exchanges produce byte-identical receipts.
 
-## Decision order
+Response fields: schemaVersion, decisionId, requestHash, snapshotHash, choice (`select` or `abstain`), candidateId (eligible ID for select, null for abstain), rationale and evidenceReferences. Reject extra/unknown fields, illegal choice/ID combinations and references absent from request evidence. Bound rationale to 2,000 characters; it is explanation, not authority.
 
-1. Reject malformed input with an explicit diagnostic and no eligible proposal. Version mismatches and nonfinite/negative numeric values are invalid.
-2. Cancellation and human pause prevent a proposal, even with a favorable Jev response.
-3. Missing/mismatched run authority, custody, dependency evidence, or non-ready step prevents a proposal. No unfinished conflicting writer or unacknowledged cancellation may be treated as absent.
-4. Resolve baseline binding through resolveModelForNode. Preserve explicit operator bindings by restricting the eligible set accordingly. Jev cannot change their provider/model or relax required capabilities.
-5. Filter candidates by allowlist, existing provider registration/capability facts, fresh known capacity, and known budget. Require a routerAccountId and workerAccountId per candidate, plus a run-wide budget and per-account budgets. For the run, spend + outstanding commitments + router-call allowance + next-step cost + remaining verification allowance must not exceed the run limit. For each charged account, apply that same check using only spend, commitments, verification allowance and new charges assigned to that account. If router and worker share an account, combine both new charges exactly once in its check; if distinct, check both accounts separately. Reject a candidate when either account or the run lacks headroom. Unknown cost is insufficient evidence, not zero. Explicit router-call limits are additional to the existing worker provider-attempt ceiling; count neither as the other. Include a fixture with exhausted Jev account and healthy worker account.
-6. Apply the existing total-provider-attempt counting semantics read from beginProviderAttempt. No replay may reset or subtract consumed attempts. Do not create a second execution counter.
-7. For an independent-review proposal, require currentArtifactHash == reviewTargetHash, known historical served-family evidence for all contributors, and explicit candidate-to-family mapping evidence distinct from every contributing family under the supplied independence policy. Unknown contributor identity or candidate mapping remains insufficient evidence. This only qualifies a proposed reviewer: the future served identity and substantive review verdict are not yet known. The receipt must explicitly leave post-execution independent review unissued; it cannot mark a review satisfied or approved.
-8. Construct a pinned Jev Choice question with only eligible candidate IDs plus an explicit abstain option. Include the step's task, evidence, eligible model profiles and code-computed capacity/cost facts. No candidates means no request is needed. All AI roles use this same boundary contract. The first slice uses Choice; Score/Noul extensions need their own rubric tests.
-9. Validate the supplied Jev exchange against the exact snapshot/request hash, requested model, returned model/version, rubric version, candidate options, probability distribution and policy thresholds. Thresholds are explicit fixture policy, not claimed calibrated production values. Tied, low-confidence, malformed, stale, mismatched or abstaining decisions yield wait/abstention. Transport/auth/rate-limit failures produce evidence, not hidden retries or worker-model fallback. A chosen candidate must still pass hard filters against the decision snapshot.
-10. Return a proposed binding or an explained wait/abstention, including every rejection reason and evidence reference. Required receipt fields: schemaVersion, policyVersion, snapshotHash, requestHash or null, eligibleCandidateIds, decision, proposedBinding or null, decisionOrigin (none, synthetic_jev or recorded_jev), jevDisposition, candidateRejections, evidenceReferences, requestedJevModel, returnedJevModel or null, questionVersion, recorded distribution or null, usage/latency or explicitly unknown, and postExecutionReview (unissued). Prefilter rejection or a missing exchange uses decisionOrigin none and null returned-model/distribution fields; test both cases. These are NEW local receipt fields, not database columns. Decision labels are not persisted workflow states. Identical inputs and explicit time produce byte-identical normalized receipts.
+Exchange provenance is separate: engineId, adapterId, transport (`subscription` or `api`), sanitized accountId, origin (`synthetic` or `recorded`), requestedModel, servedModel or explicit unknown, attemptId, startedAt/completedAt, usage/latency/cash cost or explicit unknowns, outcome class, normalized response or null. Validate identity/route/account/time/hash consistency. Synthetic served identity is only a fixture assertion. Unknown served identity in recorded qualification produces wait; request/auth-cache presence is not proof.
 
-Vendor confidence and the probability assigned to the winning option are distinct fields. Do not substitute one for the other when applying explicit fixture thresholds.
+Distribution/confidence is optional adapter evidence. Haiku/Luna invent neither. If supplied, probabilities must be finite and normalized over the exact choice set. Derive the unique maximum; reject hidden ties, nonmaximal selection and an abstain maximum. A tied flag cannot override facts. Self-reported confidence never bypasses gates.
 
-## Jev transport contract for later live integration
+## Evaluation order
 
-Target: POST https://openrouter.ai/api/alpha/decisions, model typesafe/jev-1.13, text state and typed questions. Use the official request/response schema at https://openrouter.ai/blog/tutorials/how-to-use-jev/ and https://openrouter.ai/typesafe/jev-1.13/api. Do not assume normal chat-completions or typesafe/jev-router are equivalent. Keep raw API wire fields separate from the local normalized receipt schema above. Freeze sanitized example fixtures against the actual documented schema. Synthetic fixtures must not be described as authenticated responses.
+1. Validate structural envelope; normalize semantic unknowns. Malformed input is diagnostic/nonzero exit.
+2. Enforce cancellation/pause, authority, custody, writer and dependency gates before request.
+3. Reuse resolveModelForNode precedence, explicit pins and existing capability derivation. Do not build an alternate resolver.
+4. Filter allowlist, registered capability facts, fresh account capacity, semantic/profile applicability and resources. For limited ledgers, spend + commitments + router allowance + next step + verification allowance must fit each run/account limit. Separate accounts are checked separately; shared charges combine once. Uncapped monthly policy waives only its monthly ceiling. Missing router capacity rejects even with a healthy worker.
+5. Independently enforce worker and router-call ceilings before request; no second worker execution counter.
+6. Filter REVIEWER candidates by strong qualification, exact artifact/target and complete independent family provenance. Missing/weak qualification rejects. Selection leaves actual served identity/review unissued.
+7. Build sanitized normalized request with eligible IDs plus abstain. No credentials/private customer content.
+8. Validate supplied ordered route history and response against exact hashes, identity, evidence and choices. Recheck selected candidate's snapshot gates.
+9. Emit proposed binding or explained wait/abstention. Live dispatch requires fresh gate/reservation checks beyond this offline slice.
 
-Live adapter calls, account access, worker dispatch, atomic budget reservation and custody recheck are later work. No new key is needed for this offline implementation.
+## Decision fallback policy
 
-## Side effects and failure interpretation
+Haiku `claude-haiku-5-5` subscription -> `gpt-6-luna` subscription -> Haiku `claude-haiku-5-5` API -> wait. Require explicit qualified adapter/account/billing transport. API needs recorded authorized binding and current balance/expiry or documented billing-status evidence; replay reads no credential. No new keys/purchases. Actual qualification must prove subscription mode cannot silently bill API.
 
-The evaluator performs no network calls, model calls, store writes, reservations, lease claims, workflow registration, cancellation or execution. A positive receipt means only that the supplied snapshot satisfies this offline policy. It does not prove that capacity is still available or custody is valid at dispatch time.
+Advance only on deterministic route unavailability or classified availability/quota failure. At most one actual call per route and three total per decision, additionally bounded by the remaining routerCallCeiling computed above. Failed calls consume the ceiling; skipped routes do not. Selection completes the decision. Substantive abstention, malformed/refused/incomplete output, wrong/unknown served identity, cancelled/paused/lost custody or insufficient evidence stop. No repair retry or direct API shortcut.
 
-Availability errors, unknown infrastructure errors, and coding defects remain distinct. Provider reset time does not itself prove recovered capacity; a new observation is required. Offline failure handling produces evidence, not an automatic retry or tier climb.
+Every route supplies its own accountId, transport, call-cost estimate and reservation/usage evidence in a routingResourcePlan included in the normalized request. Preserve failed-call charges/commitments once and evaluate each next route against remaining run/account resources plus worker and verification allowances. Unknown actual charge retains its bounded reservation; it is never erased or changed to zero. Shared accounts combine charges once; distinct fallback accounts are independently checked. Initial worker eligibility uses the supplied resource plan. If later charges/headroom cannot support the original eligible choices, wait; do not alter candidates or request hash midway.
 
-## Replay CLI
+Histories require ordered attempt IDs, matching decisions/times and legal transitions with no new attempt after terminal outcome. Normalize byte-identical repeated attempt deliveries to one attempt/charge; conflicting duplicates fail. Reject fabricated/out-of-order chains. New snapshot requires new decisionId and supplied inherited run-wide consumption. Empty candidate set waits before calls. This ladder selects the engine, not a worker or reviewer.
 
-Proposed NEW invocation: bun run scripts/replay-dynamic-lane.ts --input <fixture.json>.
+## Receipt and CLI
 
-Read one UTF-8 JSON snapshot from the named file, print one normalized JSON receipt to stdout, and use stderr for diagnostics. Exit 0 for valid evaluated snapshots, including wait/abstention; exit nonzero for invalid input or I/O failure. Do not overwrite the input. Document redirection if a saved receipt is wanted. Do not inspect credentials or mutate any workflow state.
+Receipt fields: schemaVersion, policyVersion, promptVersion, decisionId, snapshotHash, requestHash/normalizedRequest or null, eligibleCandidateIds, candidateRejections, decision (`propose`, `wait`, `abstain`), proposedBinding or null, decisionOrigin (`none`, `synthetic`, `recorded`), engine/adapter/transport/account or null, requested/served model or null, disposition/reasons, attempts and consumed/remaining counters, evidenceReferences, usage/cash cost/latency or unknowns, optional distribution and postExecutionReview (`unissued`). Missing exchange uses origin none and null served/distribution. Positive receipt qualifies only supplied offline facts, not execution/review.
 
-## Invariants and acceptance
+Keep sanitized vendor wire payload/provenance outside normalized schema. Invocation: `bun run scripts/replay-dynamic-lane.ts --input <fixture.json>`. Read one UTF-8 JSON input; canonical receipt stdout, diagnostics stderr. Exit 0 for evaluated wait/abstention/proposal, nonzero for structural/I/O failure. Preserve input bytes; no network/provider/store/credential activity. Document v3/v4 compatibility.
 
-Preserve existing fixed-lane behavior, resolver precedence, capability requirements, attempt semantics and Taskmaster/Overseer ownership. No DAG executor hook, DB schema, provider plugin, workflow YAML or generated-default change is in scope. Live integration requires a later reviewed contract with atomic shared-account reservations, custody revalidation, prompt/loop/failover coverage and independent evidence that Jev routing is useful. MTA daily observations support calibration.
+## Acceptance and boundaries
 
-Acceptance requires success at each AI role, cancellation, pause, dependencies, missing authority, future/expired capacity, shared budget including router cost, invalid numeric values, exhausted worker and router limits, conflicting writer, incomplete cancellation, same-family review, unknown identity, wrong artifact hash, capability mismatch, and absent/invalid/stale/tied/abstaining Jev responses. CLI tests must verify stdout, exit status, unchanged input and zero external effects. Repeat deterministic replay and run existing resolver/failover regressions.
+Tests cover all AI roles; Haiku default; strong review; every fallback/no-fallback transition; ceilings/exhaustion including successful last allowed call; skipped route versus failed call; distinct fallback accounts and retained charges; identical repeated attempts without double charging and conflicting duplicates; prior-ledger hash conflicts; omitted/empty/unsupported semantic evidence; allowlist/pins/capabilities; duplicate identity; shared and uncapped-policy budgets/expiry; stale/future/reset-only capacity; custody/writer/cancellation; profile/outcome leakage; review family/identity/artifact/qualification; malformed/wrong-model/refused/abstaining output; derived distribution ties/nonmaximum/abstain winner; legacy fixtures; canonical CLI and zero effects. Legacy v3 without new router/resource/ledger or strong-reviewer evidence retains v3 provenance but produces explicit insufficient-evidence abstention; never synthesize those facts to preserve an old positive fixture.
 
-## FuelGlass eligibility clarification
-
-John's design clarification, September 27, 2026. Proposed behavior; not evidence of implemented routing. Extends the offline replay acceptance contract; live integration remains later work.
-
-Claude remains a registered candidate with its supported roles and model profile. Temporary exhaustion does not remove Claude from the roster or make the Dynamic Lane permanently Codex-only.
-
-At every AI decision boundary:
-
-1. Resolve the candidate's actual execution account and effective provider/model binding.
-2. Read the supplied FuelGlass observation for that account. Code applies freshness, capacity windows, policy thresholds and outstanding reservations before constructing Jev options.
-3. Exclude Claude when capacity is exhausted, below the required policy headroom, unknown, stale or unavailable. Apply this rule consistently to all candidates. Missing evidence does not mean available capacity.
-4. Give Jev only eligible candidate IDs plus abstain. Keep excluded candidates and reasons in the audit receipt, outside selectable options.
-5. Reject a response selecting an excluded candidate. No trial call, hidden retry or fallback may bypass the exclusion.
-6. For later live integration, recheck current capacity and reserve required headroom before dispatch. A change since selection invalidates the proposal and requires a fresh decision or wait.
-7. Re-admit Claude on a fresh observation proving sufficient capacity, subject to all other gates. A predicted reset time alone is insufficient.
-
-Offline replay uses explicit synthetic or recorded FuelGlass snapshots; it makes no provider or FuelGlass calls. Exact runtime fields and adapter mapping remain to be verified.
-
-### Required FuelGlass acceptance cases
-
-- Claude is registered and healthy: it can appear in Jev options if all other gates pass; selection is not guaranteed.
-- Claude is registered but exhausted: absent from constructed Jev request options, capacity rejection in receipt, no proposed Claude binding, and the supplied provider-attempt count remains unchanged by replay. Zero actual Claude calls while excluded is a later live integration criterion.
-- Claude capacity is unknown, stale or future-dated: excluded.
-- Reset time passes without a fresh reading: still excluded.
-- A fresh healthy reading arrives: Claude may return to the eligible set.
-- A supplied Jev response selects excluded Claude: invalid decision, no dispatch.
-- In later live integration, capacity is lost after selection: no Claude dispatch under the stale proposal.
-- No eligible candidates: explained wait/abstention.
-- Every effective AI binding, including planning, loops, repairs, review and delivery, must be covered before claiming the live lane avoids exhausted providers.
-
-The separate Codex-only supervised repair concerns the current builder bootstrap. It does not redefine the intended Dynamic Lane roster or establish that the current dispatcher already implements these gates.
+No executor hook, DB schema, provider plugin, workflow YAML, generated-default, live adapter or production default is included. Later runtime work requires reviewed source integration/plan and the shadow/staging gates in `docs/superpowers/specs/2026-10-15-dynamic-lane-haiku-design.md`.

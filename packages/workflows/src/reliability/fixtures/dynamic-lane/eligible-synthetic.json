@@ -5,7 +5,11 @@
   "nodeId": "plan",
   "scopeId": "scope-synthetic-001",
   "aiRole": "plan",
-  "node": { "id": "plan", "prompt": "Create a plan.", "allowed_tools": [] },
+  "node": {
+    "id": "plan",
+    "prompt": "Create a plan.",
+    "allowed_tools": []
+  },
   "authority": {
     "runId": "run-synthetic-001",
     "dispatchId": "dispatch-001",
@@ -27,8 +31,14 @@
     "runtimeImageRevision": null,
     "createdAt": "2026-09-26T10:00:00.000Z"
   },
-  "expectedAuthority": { "runScopeSha": "scope-sha-001", "headBranch": "fixture/dynamic-lane" },
-  "custody": { "known": true, "held": true },
+  "expectedAuthority": {
+    "runScopeSha": "scope-sha-001",
+    "headBranch": "fixture/dynamic-lane"
+  },
+  "custody": {
+    "known": true,
+    "held": true
+  },
   "ready": true,
   "dependenciesComplete": true,
   "cancelled": false,
@@ -51,6 +61,12 @@
         "family": "openai",
         "sourceRef": "registry:codex-plan",
         "availableAt": "2026-09-26T11:00:00.000Z"
+      },
+      "reviewerQualification": {
+        "strength": "strong",
+        "version": "reviewer-qualification/v1",
+        "sourceRef": "fixture:legacy-qualification",
+        "availableAt": "2026-09-26T11:00:00.000Z"
       }
     },
     {
@@ -66,6 +82,12 @@
       "familyMappingEvidence": {
         "family": "anthropic",
         "sourceRef": "registry:claude-plan",
+        "availableAt": "2026-09-26T11:00:00.000Z"
+      },
+      "reviewerQualification": {
+        "strength": "strong",
+        "version": "reviewer-qualification/v1",
+        "sourceRef": "fixture:legacy-qualification",
         "availableAt": "2026-09-26T11:00:00.000Z"
       }
     }
@@ -155,7 +177,11 @@
       "profileVersion": "candidate-profile/v1",
       "applicableRoles": ["plan"],
       "observations": [
-        { "scope": "synthetic", "provenance": "fixture", "availableAt": "2026-09-26T11:00:00.000Z" }
+        {
+          "scope": "synthetic",
+          "provenance": "fixture",
+          "availableAt": "2026-09-26T11:00:00.000Z"
+        }
       ],
       "sourceRefs": ["fixture:profile:codex"],
       "availableAt": "2026-09-26T11:00:00.000Z",
@@ -166,7 +192,11 @@
       "profileVersion": "candidate-profile/v1",
       "applicableRoles": ["plan"],
       "observations": [
-        { "scope": "synthetic", "provenance": "fixture", "availableAt": "2026-09-26T11:00:00.000Z" }
+        {
+          "scope": "synthetic",
+          "provenance": "fixture",
+          "availableAt": "2026-09-26T11:00:00.000Z"
+        }
       ],
       "sourceRefs": ["fixture:profile:claude"],
       "availableAt": "2026-09-26T11:00:00.000Z",
@@ -181,5 +211,27 @@
     "requestedJevModel": "typesafe/jev-1.13",
     "rubricVersion": "rubric/v1"
   },
-  "jevExchange": null
+  "jevExchange": null,
+  "routerCallsConsumed": 0,
+  "routerCallCeiling": 3,
+  "monthlyBudgetPolicy": {
+    "mode": "limited",
+    "effectiveFrom": "2026-09-01T00:00:00.000Z",
+    "effectiveUntil": "2026-10-01T00:00:00.000Z",
+    "authorizationRef": "fixture:legacy-budget",
+    "limit": 1000,
+    "spend": 0,
+    "commitments": 0
+  },
+  "priorDecisions": {
+    "availableAt": "2026-09-26T11:00:00.000Z",
+    "sourceRef": "fixture:legacy-ledger",
+    "entries": []
+  },
+  "legacyRoutingEvidence": {
+    "accountId": "jev",
+    "callEstimate": 1,
+    "sourceRef": "fixture:legacy-router",
+    "availableAt": "2026-09-26T11:00:00.000Z"
+  }
 }

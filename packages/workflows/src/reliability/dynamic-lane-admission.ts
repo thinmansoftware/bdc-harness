@@ -22,6 +22,52 @@ const finiteNonnegative = z.number().finite().nonnegative();
 const nonblank = z.string().trim().min(1);
 const timestamp = z.string().datetime({ offset: true });
 
+const monthlyBudgetPolicySchema = z.discriminatedUnion('mode', [
+  z.object({
+    mode: z.literal('uncapped'),
+    effectiveFrom: timestamp,
+    effectiveUntil: timestamp,
+    authorizationRef: nonblank,
+  }),
+  z.object({
+    mode: z.literal('limited'),
+    effectiveFrom: timestamp,
+    effectiveUntil: timestamp,
+    authorizationRef: nonblank,
+    limit: finiteNonnegative,
+    spend: finiteNonnegative,
+    commitments: finiteNonnegative,
+  }),
+]);
+const qualificationSchema = z.object({
+  strength: z.enum(['strong', 'weak']),
+  version: nonblank,
+  sourceRef: nonblank,
+  availableAt: timestamp,
+});
+const priorDecisionsSchema = z.object({
+  availableAt: timestamp,
+  sourceRef: nonblank,
+  entries: z.array(
+    z.object({
+      decisionId: nonblank,
+      snapshotHash: nonblank,
+      receipt: z.unknown().nullable(),
+      exchanges: z.array(z.unknown()),
+    })
+  ),
+});
+const semanticUnknown = (value: unknown): unknown =>
+  value === undefined ||
+  value === null ||
+  (typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0)
+    ? null
+    : value;
+const semanticSlot = <T extends z.ZodTypeAny>(
+  schema: T
+): z.ZodEffects<z.ZodNullable<T>, z.output<T> | null, unknown> =>
+  z.preprocess(semanticUnknown, schema.nullable());
+
 const authoritySchema: z.ZodType<RunAuthorityRecord> = z.object({
   runId: nonblank,
   dispatchId: nonblank,
@@ -99,6 +145,9 @@ const candidateSchema = z.object({
   capabilities: z.array(z.enum(['text', 'repositoryRead', 'repositoryWrite', 'shell'])),
   nextStepCost: finiteNonnegative.nullable(),
   family: nonblank.nullable(),
+  transport: z.enum(['subscription', 'api']).nullable().optional(),
+  contextCompatible: z.boolean().nullable().optional(),
+  reviewerQualification: qualificationSchema.nullable().optional(),
   familyMappingEvidence: z
     .object({ family: nonblank, sourceRef: nonblank, availableAt: timestamp })
     .nullable(),
@@ -106,6 +155,9 @@ const candidateSchema = z.object({
 
 const accountSchema = z.object({
   accountId: nonblank,
+  seat: nonblank.optional(),
+  window: nonblank.optional(),
+  sourceRef: nonblank.optional(),
   limit: finiteNonnegative,
   spend: finiteNonnegative,
   commitments: finiteNonnegative,
@@ -234,19 +286,18 @@ const dynamicLaneSnapshotStructuralSchema = z.object({
   ),
   currentArtifactHash: z.string().nullable(),
   reviewTargetHash: z.string().nullable(),
-  taskBrief: semanticTextSchema.nullable(),
-  roleObjective: roleObjectiveSchema.nullable(),
-  decisionEvidence: z
-    .object({
+  taskBrief: semanticSlot(semanticTextSchema),
+  roleObjective: semanticSlot(roleObjectiveSchema),
+  decisionEvidence: semanticSlot(
+    z.object({
       version: nonblank,
       availability: z.enum(['supplied', 'no_prior_artifact']),
       items: z.array(evidenceItemSchema),
       noPriorArtifactReason: z.string().nullable(),
     })
-    .nullable(),
-  candidateProfiles: z
-    .array(profileSchema)
-    .superRefine((profiles, ctx) => {
+  ),
+  candidateProfiles: semanticSlot(
+    z.array(profileSchema).superRefine((profiles, ctx) => {
       const seen = new Set<string>();
       profiles.forEach((profile, index) => {
         if (seen.has(profile.candidateId)) {
@@ -259,7 +310,20 @@ const dynamicLaneSnapshotStructuralSchema = z.object({
         seen.add(profile.candidateId);
       });
     })
-    .nullable(),
+  ),
+  routerCallsConsumed: z.number().int().nonnegative().optional(),
+  routerCallCeiling: z.number().int().nonnegative().optional(),
+  monthlyBudgetPolicy: monthlyBudgetPolicySchema.nullable().optional(),
+  priorDecisions: priorDecisionsSchema.nullable().optional(),
+  legacyRoutingEvidence: z
+    .object({
+      accountId: nonblank,
+      callEstimate: finiteNonnegative,
+      sourceRef: nonblank,
+      availableAt: timestamp,
+    })
+    .nullable()
+    .optional(),
   policy: z.object({
     maxCapacityAgeMs: finiteNonnegative,
     maxJevAgeMs: finiteNonnegative,
@@ -278,8 +342,6 @@ export type DynamicLaneSnapshot = Omit<
   z.infer<typeof dynamicLaneSnapshotStructuralSchema>,
   'jevExchange'
 > & { jevExchange?: JevExchange | null };
-export const dynamicLaneSnapshotSchema =
-  dynamicLaneSnapshotStructuralSchema as unknown as z.ZodType<DynamicLaneSnapshot>;
 export type DynamicLaneDecision = 'propose' | 'wait' | 'abstain';
 type CandidateProfile = NonNullable<DynamicLaneSnapshot['candidateProfiles']>[number];
 export interface JevChoiceRequest {
@@ -394,7 +456,10 @@ function receiptBase(snapshot: DynamicLaneSnapshot, snapshotHash: string): Dynam
   };
 }
 
-export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneReceipt {
+function evaluateLegacyDynamicLane(
+  snapshot: DynamicLaneSnapshot,
+  gatesOnly = false
+): DynamicLaneReceipt {
   const decisionInputs = { ...snapshot, jevExchange: undefined };
   const snapshotHash = hash(decisionInputs);
   const out = receiptBase(snapshot, snapshotHash);
@@ -412,6 +477,43 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
     return out;
   }
 
+  if (!gatesOnly) {
+    if (snapshot.routerCallsConsumed === undefined || snapshot.routerCallCeiling === undefined)
+      globalReasons.push('router_limit_evidence_missing');
+    else if (snapshot.routerCallsConsumed >= snapshot.routerCallCeiling)
+      globalReasons.push('router_call_ceiling');
+    if (
+      !snapshot.legacyRoutingEvidence ||
+      !atOrBefore(snapshot.legacyRoutingEvidence.availableAt, snapshot.evaluationTime)
+    )
+      globalReasons.push('routing_resource_evidence_missing');
+    if (
+      !snapshot.priorDecisions ||
+      !atOrBefore(snapshot.priorDecisions.availableAt, snapshot.evaluationTime)
+    )
+      globalReasons.push('prior_decision_ledger_missing');
+    const monthly = snapshot.monthlyBudgetPolicy;
+    if (
+      !monthly ||
+      !atOrBefore(monthly.effectiveFrom, snapshot.evaluationTime) ||
+      atOrBefore(monthly.effectiveUntil, snapshot.evaluationTime)
+    )
+      globalReasons.push('monthly_budget_policy_missing_or_expired');
+    else if (
+      monthly.mode === 'limited' &&
+      snapshot.candidates.some(
+        c =>
+          c.nextStepCost === null ||
+          monthly.spend +
+            monthly.commitments +
+            (c.nextStepCost ?? 0) +
+            (snapshot.budget.routerCallAllowance ?? 0) +
+            snapshot.budget.verificationAllowance >
+            monthly.limit
+      )
+    )
+      globalReasons.push('monthly_budget_exhausted');
+  }
   if (snapshot.cancelled) globalReasons.push('cancelled');
   if (snapshot.paused) globalReasons.push('paused_for_human');
   if (!snapshot.ready) globalReasons.push('step_not_ready');
@@ -557,6 +659,13 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
       reasons.push('provider_attempt_ceiling');
     if (snapshot.aiRole === 'independent_review') {
       if (
+        /haiku/i.test(candidate.model) ||
+        candidate.reviewerQualification?.strength !== 'strong' ||
+        candidate.reviewerQualification.version !== 'reviewer-qualification/v1' ||
+        !atOrBefore(candidate.reviewerQualification.availableAt, snapshot.evaluationTime)
+      )
+        reasons.push('strong_reviewer_qualification_missing');
+      if (
         !snapshot.currentArtifactHash ||
         snapshot.currentArtifactHash !== snapshot.reviewTargetHash
       )
@@ -597,6 +706,7 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
     return out;
   }
 
+  if (gatesOnly) return out;
   const request: JevChoiceRequest = {
     questionVersion: QUESTION_VERSION,
     requestedModel: snapshot.policy.requestedJevModel,
@@ -732,6 +842,10 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
   const distributionKeys = Object.keys(exchange.distribution).sort();
   if (distributionKeys.join('|') !== [...out.eligibleCandidateIds, 'abstain'].sort().join('|'))
     invalid.push('distribution_options_mismatch');
+  const ranked = Object.entries(exchange.distribution).sort((a, b) => b[1] - a[1]);
+  if (ranked.length > 1 && ranked[0][1] === ranked[1][1]) invalid.push('derived_tie');
+  if (ranked[0]?.[0] !== exchange.choice || ranked[0]?.[0] === 'abstain')
+    invalid.push('not_unique_winner');
   const sum = Object.values(exchange.distribution).reduce((total, value) => total + value, 0);
   if (Math.abs(sum - 1) > 0.000001) invalid.push('invalid_distribution');
   const selected = snapshot.candidates.find(item => item.candidateId === exchange.choice);
@@ -749,6 +863,520 @@ export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneR
   };
   out.jevDisposition = 'accepted';
   return out;
+}
+
+const routeSchema = z.object({
+  routeId: nonblank,
+  engineId: nonblank,
+  adapterId: nonblank,
+  requestedModel: nonblank,
+  transport: z.enum(['subscription', 'api']),
+  accountId: nonblank,
+  estimatedCost: finiteNonnegative.nullable(),
+  authorized: z.boolean(),
+  bindingEvidence: z.object({ sourceRef: nonblank, availableAt: timestamp }).nullable(),
+  apiBillingEvidence: z
+    .object({
+      sourceRef: nonblank,
+      availableAt: timestamp,
+      expiresAt: timestamp,
+      status: z.enum(['available', 'exhausted', 'unknown']),
+    })
+    .nullable(),
+});
+const v4CandidateSchema = candidateSchema.omit({ routerAccountId: true });
+const v4SnapshotSchema = dynamicLaneSnapshotStructuralSchema
+  .omit({ jevExchange: true, legacyRoutingEvidence: true })
+  .extend({
+    schemaVersion: z.literal('dynamic-lane-snapshot/v4'),
+    decisionId: nonblank,
+    promptVersion: nonblank,
+    routerCallsConsumed: z.number().int().nonnegative(),
+    routerCallCeiling: z.number().int().nonnegative(),
+    monthlyBudgetPolicy: monthlyBudgetPolicySchema.nullable().default(null),
+    priorDecisions: priorDecisionsSchema.nullable().default(null),
+    candidates: z.array(v4CandidateSchema).superRefine((candidates, ctx) => {
+      if (new Set(candidates.map(c => c.candidateId)).size !== candidates.length)
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate candidateId' });
+    }),
+    budget: dynamicLaneSnapshotStructuralSchema.shape.budget.omit({ routerCallAllowance: true }),
+    policy: z.object({ maxCapacityAgeMs: finiteNonnegative, maxDecisionAgeMs: finiteNonnegative }),
+    routingResourcePlan: z
+      .array(routeSchema)
+      .length(3)
+      .superRefine((routes, ctx) => {
+        if (new Set(routes.map(r => r.routeId)).size !== routes.length)
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'duplicate routeId' });
+      }),
+    decisionExchanges: z.array(z.unknown()).default([]),
+  });
+export type DynamicLaneV4Snapshot = z.infer<typeof v4SnapshotSchema>;
+export const dynamicLaneSnapshotSchema = z.discriminatedUnion('schemaVersion', [
+  dynamicLaneSnapshotStructuralSchema,
+  v4SnapshotSchema,
+]) as unknown as z.ZodType<DynamicLaneSnapshot | DynamicLaneV4Snapshot>;
+
+const normalizedResponseSchema = z
+  .object({
+    schemaVersion: z.literal('dynamic-lane-response/v1'),
+    decisionId: nonblank,
+    requestHash: nonblank,
+    snapshotHash: nonblank,
+    choice: z.enum(['select', 'abstain']),
+    candidateId: nonblank.nullable(),
+    rationale: z.string().max(2000),
+    evidenceReferences: z.array(nonblank),
+  })
+  .strict();
+const exchangeSchema = z
+  .object({
+    routeId: nonblank,
+    engineId: nonblank,
+    adapterId: nonblank,
+    accountId: nonblank,
+    transport: z.enum(['subscription', 'api']),
+    origin: z.enum(['synthetic', 'recorded']),
+    requestedModel: nonblank,
+    servedModel: nonblank.nullable(),
+    attemptId: nonblank,
+    startedAt: timestamp,
+    completedAt: timestamp,
+    usage: z.record(finiteNonnegative).nullable(),
+    latencyMs: finiteNonnegative.nullable(),
+    cashCost: finiteNonnegative.nullable(),
+    outcome: z.enum(['success', 'availability', 'quota', 'refused', 'cancelled']),
+    response: z.unknown().nullable(),
+    distribution: z.record(finiteNonnegative).optional(),
+  })
+  .strict();
+const normalizedRequestSchema = z.object({
+  schemaVersion: z.literal('dynamic-lane-request/v1'),
+  decisionId: nonblank,
+  policyVersion: nonblank,
+  promptVersion: nonblank,
+  snapshotHash: nonblank,
+  runId: nonblank,
+  nodeId: nonblank,
+  role: nonblank,
+  taskBrief: semanticTextSchema,
+  roleObjective: roleObjectiveSchema,
+  decisionEvidence: dynamicLaneSnapshotStructuralSchema.shape.decisionEvidence,
+  eligibleCandidates: z.array(
+    v4CandidateSchema.extend({
+      profile: profileSchema,
+      workerAccount: accountSchema,
+      runHeadroom: finiteNonnegative,
+    })
+  ),
+  allowedChoices: z.array(nonblank),
+  routingResourcePlan: z.array(routeSchema),
+});
+const v4ReceiptSchema = z.object({
+  schemaVersion: z.literal('dynamic-lane-receipt/v4'),
+  policyVersion: z.literal('offline-admission/v4'),
+  promptVersion: nonblank,
+  decisionId: nonblank,
+  snapshotHash: nonblank,
+  priorLedgerHash: nonblank.nullable(),
+  requestHash: nonblank.nullable(),
+  normalizedRequest: normalizedRequestSchema.nullable(),
+  eligibleCandidateIds: z.array(nonblank),
+  candidateRejections: z.record(z.array(nonblank)),
+  decision: z.enum(['propose', 'wait', 'abstain']),
+  proposedBinding: candidateSchema
+    .pick({
+      candidateId: true,
+      provider: true,
+      model: true,
+      workerAccountId: true,
+      transport: true,
+    })
+    .nullable(),
+  decisionOrigin: z.enum(['none', 'synthetic', 'recorded']),
+  disposition: nonblank,
+  engineId: nonblank.nullable(),
+  adapterId: nonblank.nullable(),
+  transport: z.enum(['subscription', 'api']).nullable(),
+  accountId: nonblank.nullable(),
+  requestedModel: nonblank.nullable(),
+  servedModel: nonblank.nullable(),
+  routerCallsConsumed: z.number().int().nonnegative(),
+  routerCallsRemaining: z.number().int().nonnegative(),
+  attemptHistory: z.array(exchangeSchema),
+  charges: z.record(finiteNonnegative),
+  evidenceReferences: z.array(nonblank),
+  usage: z.record(finiteNonnegative).nullable(),
+  cashCost: finiteNonnegative.nullable(),
+  latencyMs: finiteNonnegative.nullable(),
+  distribution: z.record(finiteNonnegative).nullable(),
+  postExecutionReview: z.literal('unissued'),
+});
+export type DynamicLaneV4Receipt = z.infer<typeof v4ReceiptSchema>;
+
+const decisionRoutes = [
+  ['haiku-subscription', 'haiku', 'claude-haiku-5-5', 'subscription'],
+  ['luna-subscription', 'luna', 'gpt-6-luna', 'subscription'],
+  ['haiku-api', 'haiku', 'claude-haiku-5-5', 'api'],
+] as const;
+
+function evaluateV4Core(snapshot: DynamicLaneV4Snapshot): DynamicLaneV4Receipt {
+  const { decisionExchanges, priorDecisions, ...inputs } = snapshot;
+  const snapshotHash = hash(inputs);
+  const out: DynamicLaneV4Receipt = {
+    schemaVersion: 'dynamic-lane-receipt/v4',
+    policyVersion: 'offline-admission/v4',
+    promptVersion: snapshot.promptVersion,
+    decisionId: snapshot.decisionId,
+    snapshotHash,
+    priorLedgerHash: priorDecisions ? hash(priorDecisions) : null,
+    requestHash: null,
+    normalizedRequest: null,
+    eligibleCandidateIds: [],
+    candidateRejections: {},
+    decision: 'wait',
+    proposedBinding: null,
+    decisionOrigin: 'none',
+    disposition: 'not_evaluated',
+    engineId: null,
+    adapterId: null,
+    transport: null,
+    accountId: null,
+    requestedModel: null,
+    servedModel: null,
+    routerCallsConsumed: snapshot.routerCallsConsumed,
+    routerCallsRemaining: Math.max(0, snapshot.routerCallCeiling - snapshot.routerCallsConsumed),
+    attemptHistory: [],
+    charges: {},
+    evidenceReferences: [],
+    usage: null,
+    cashCost: null,
+    latencyMs: null,
+    distribution: null,
+    postExecutionReview: 'unissued',
+  };
+  const stop = (reason: string): DynamicLaneV4Receipt => {
+    out.disposition = reason;
+    out.proposedBinding = null;
+    out.decision = 'wait';
+    return out;
+  };
+  const now = Date.parse(snapshot.evaluationTime);
+  const validAt = (observed: string, expires?: string): boolean =>
+    Date.parse(observed) <= now && (!expires || now < Date.parse(expires));
+  const matchingPrior = priorDecisions?.entries.find(
+    p => p.decisionId === snapshot.decisionId && p.snapshotHash === snapshotHash
+  );
+  const rawHistory = decisionExchanges.length
+    ? decisionExchanges
+    : (matchingPrior?.exchanges ?? []);
+  const history: z.infer<typeof exchangeSchema>[] = [];
+  const delivered = new Map<string, string>();
+  let unknownReservation = false;
+  // Supplied actual calls remain consumed even when admission or response validation refuses them.
+  // The running budget below separately checks whether each call was affordable before it began.
+  for (const raw of rawHistory) {
+    const parsed = exchangeSchema.safeParse(raw);
+    if (!parsed.success) return stop('malformed_exchange');
+    const item = parsed.data;
+    const bytes = canonicalDynamicLaneJson(item);
+    if (delivered.has(item.attemptId)) {
+      if (delivered.get(item.attemptId) !== bytes) return stop('conflicting_attempt_delivery');
+      continue;
+    }
+    delivered.set(item.attemptId, bytes);
+    history.push(item);
+    out.attemptHistory.push(item);
+    out.routerCallsConsumed++;
+    out.routerCallsRemaining = Math.max(0, snapshot.routerCallCeiling - out.routerCallsConsumed);
+    const recordedRoute = snapshot.routingResourcePlan.find(
+      r => r.routeId === item.routeId && r.accountId === item.accountId
+    );
+    const charge = item.cashCost ?? recordedRoute?.estimatedCost;
+    if (charge === undefined || charge === null) unknownReservation = true;
+    else out.charges[item.accountId] = (out.charges[item.accountId] ?? 0) + charge;
+  }
+  if (unknownReservation) return stop('actual_call_reservation_unknown');
+  const monthly = snapshot.monthlyBudgetPolicy;
+  if (!monthly || !validAt(monthly.effectiveFrom, monthly.effectiveUntil))
+    return stop('monthly_policy_missing_or_expired');
+  if (!priorDecisions || !validAt(priorDecisions.availableAt))
+    return stop('prior_ledger_missing_or_future');
+  const priors = priorDecisions.entries.filter(p => p.decisionId === snapshot.decisionId);
+  if (priors.some(p => p.snapshotHash !== snapshotHash)) return stop('decision_id_conflict');
+  if (priors.length > 1) return stop('duplicate_prior_decision');
+  // A stored receipt is never authority: recompute all gates and the supplied exchange evidence below.
+  if (snapshot.routerCallsConsumed >= snapshot.routerCallCeiling)
+    return stop('router_call_ceiling');
+  if (
+    snapshot.routingResourcePlan.some((route, i) => {
+      const expected = decisionRoutes[i];
+      return (
+        route.routeId !== expected[0] ||
+        route.engineId !== expected[1] ||
+        route.requestedModel !== expected[2] ||
+        route.transport !== expected[3]
+      );
+    })
+  )
+    return stop('invalid_decision_route_order_or_binding');
+
+  // Reuse the existing deterministic worker admission logic, without constructing a Jev request.
+  // Router accounting is performed per actual route below, rather than charged to a worker account.
+  const admission = evaluateLegacyDynamicLane(
+    {
+      ...snapshot,
+      schemaVersion: 'dynamic-lane-snapshot/v3',
+      candidates: snapshot.candidates.map(c => ({ ...c, routerAccountId: c.workerAccountId })),
+      budget: { ...snapshot.budget, routerCallAllowance: 0 },
+      policy: {
+        ...snapshot.policy,
+        maxJevAgeMs: snapshot.policy.maxDecisionAgeMs,
+        minimumWinningProbability: 0,
+        minimumVendorConfidence: 0,
+        requestedJevModel: 'not-called',
+        rubricVersion: 'not-called',
+      },
+    },
+    true
+  );
+  out.candidateRejections = admission.candidateRejections;
+  out.evidenceReferences = admission.evidenceReferences;
+  const accounts = new Map(snapshot.accounts.map(a => [a.accountId, a]));
+  let eligible = snapshot.candidates.filter(c =>
+    admission.eligibleCandidateIds.includes(c.candidateId)
+  );
+  for (const c of eligible) {
+    const account = accounts.get(c.workerAccountId);
+    const reasons = out.candidateRejections[c.candidateId] ?? [];
+    if (!c.transport || c.contextCompatible !== true)
+      reasons.push('worker_transport_or_context_unknown');
+    if (!account?.seat || !account.window || !account.sourceRef)
+      reasons.push('account_identity_evidence_missing');
+    out.candidateRejections[c.candidateId] = reasons;
+  }
+  eligible = eligible
+    .filter(c => !out.candidateRejections[c.candidateId]?.length)
+    .sort((a, b) => asciiCompare(a.candidateId, b.candidateId));
+  if (!eligible.length) return stop('no_eligible_candidates');
+
+  const charges = new Map<string, number>();
+  const totalCharges = (): number => [...charges.values()].reduce((a, b) => a + b, 0);
+  const canFund = (
+    candidate: (typeof eligible)[number],
+    route: z.infer<typeof routeSchema>,
+    callCost: number
+  ): boolean => {
+    if (candidate.nextStepCost === null) return false;
+    const workerCost = candidate.nextStepCost;
+    const newTotal = totalCharges() + callCost + workerCost + snapshot.budget.verificationAllowance;
+    if (snapshot.budget.spend + snapshot.budget.commitments + newTotal > snapshot.budget.limit)
+      return false;
+    if (
+      monthly.mode === 'limited' &&
+      monthly.spend + monthly.commitments + newTotal > monthly.limit
+    )
+      return false;
+    const perAccount = new Map(charges);
+    perAccount.set(route.accountId, (perAccount.get(route.accountId) ?? 0) + callCost);
+    perAccount.set(
+      candidate.workerAccountId,
+      (perAccount.get(candidate.workerAccountId) ?? 0) + workerCost
+    );
+    return [...perAccount].every(([id, charge]) => {
+      const a = accounts.get(id);
+      return !!a && a.spend + a.commitments + a.verificationAllowance + charge <= a.limit;
+    });
+  };
+  let position = 0;
+  let previousTime = -Infinity;
+  for (const route of snapshot.routingResourcePlan) {
+    const account = accounts.get(route.accountId);
+    if (
+      !account?.seat ||
+      !account.window ||
+      !account.sourceRef ||
+      !account.observedAt ||
+      !account.expiresAt ||
+      !validAt(account.observedAt, account.expiresAt) ||
+      now - Date.parse(account.observedAt) > snapshot.policy.maxCapacityAgeMs
+    )
+      return stop('decision_account_unknown_or_stale');
+    if (!route.authorized || !route.bindingEvidence || !validAt(route.bindingEvidence.availableAt))
+      return stop('decision_binding_unqualified');
+    if (
+      route.transport === 'api' &&
+      (route.apiBillingEvidence?.status !== 'available' ||
+        !validAt(route.apiBillingEvidence.availableAt, route.apiBillingEvidence.expiresAt))
+    )
+      return stop('api_billing_unqualified');
+    if (account.capacity === 'unknown') return stop('decision_capacity_unknown');
+    if (account.capacity === 'exhausted' || account.capacity === 'unavailable') {
+      if (history[position]?.routeId === route.routeId) return stop('call_on_skipped_route');
+      continue;
+    }
+    if (route.estimatedCost === null) return stop('decision_cost_unknown');
+    const estimatedCost = route.estimatedCost;
+    if (!out.normalizedRequest) {
+      for (const c of eligible)
+        if (!canFund(c, route, route.estimatedCost))
+          out.candidateRejections[c.candidateId].push('initial_route_budget_exhausted');
+      eligible = eligible.filter(c => !out.candidateRejections[c.candidateId]?.length);
+      if (!eligible.length) return stop('initial_route_budget_exhausted');
+      out.eligibleCandidateIds = eligible.map(c => c.candidateId);
+      out.normalizedRequest = {
+        schemaVersion: 'dynamic-lane-request/v1',
+        decisionId: snapshot.decisionId,
+        policyVersion: out.policyVersion,
+        promptVersion: snapshot.promptVersion,
+        snapshotHash,
+        runId: snapshot.runId,
+        nodeId: snapshot.nodeId,
+        role: snapshot.aiRole,
+        taskBrief: requiredValue(snapshot.taskBrief, 'task brief'),
+        roleObjective: requiredValue(snapshot.roleObjective, 'role objective'),
+        decisionEvidence: snapshot.decisionEvidence,
+        eligibleCandidates: eligible.map(c => ({
+          ...c,
+          profile: requiredValue(
+            snapshot.candidateProfiles?.find(p => p.candidateId === c.candidateId),
+            'profile'
+          ),
+          workerAccount: requiredValue(accounts.get(c.workerAccountId), 'worker account'),
+          runHeadroom:
+            snapshot.budget.limit -
+            snapshot.budget.spend -
+            snapshot.budget.commitments -
+            snapshot.budget.verificationAllowance,
+        })),
+        allowedChoices: [...out.eligibleCandidateIds, 'abstain'],
+        routingResourcePlan: snapshot.routingResourcePlan,
+      };
+      out.requestHash = hash(out.normalizedRequest);
+    }
+    if (!eligible.every(c => canFund(c, route, estimatedCost)))
+      return stop('fallback_budget_exhausted');
+    if (snapshot.routerCallsConsumed + position >= snapshot.routerCallCeiling || position >= 3)
+      return stop('router_call_ceiling');
+    const attempt = history[position];
+    if (!attempt) return stop('missing_exchange');
+    if (
+      attempt.routeId !== route.routeId ||
+      attempt.engineId !== route.engineId ||
+      attempt.adapterId !== route.adapterId ||
+      attempt.accountId !== route.accountId ||
+      attempt.transport !== route.transport ||
+      attempt.requestedModel !== route.requestedModel ||
+      attempt.servedModel !== route.requestedModel
+    )
+      return stop('exchange_binding_or_served_identity_mismatch');
+    if (
+      !validAt(attempt.completedAt) ||
+      Date.parse(attempt.startedAt) > Date.parse(attempt.completedAt) ||
+      Date.parse(attempt.startedAt) < previousTime ||
+      now - Date.parse(attempt.completedAt) > snapshot.policy.maxDecisionAgeMs ||
+      Date.parse(account.observedAt) > Date.parse(attempt.startedAt) ||
+      Date.parse(route.bindingEvidence.availableAt) > Date.parse(attempt.startedAt) ||
+      (route.transport === 'api' &&
+        route.apiBillingEvidence &&
+        Date.parse(route.apiBillingEvidence.availableAt) > Date.parse(attempt.startedAt))
+    )
+      return stop('stale_future_or_out_of_order_exchange');
+    previousTime = Date.parse(attempt.completedAt);
+    position++;
+    const charge = attempt.cashCost ?? route.estimatedCost;
+    charges.set(route.accountId, (charges.get(route.accountId) ?? 0) + charge);
+    if (!eligible.every(c => canFund(c, route, 0))) return stop('observed_cost_budget_exhausted');
+    if (attempt.outcome === 'availability' || attempt.outcome === 'quota') {
+      if (attempt.response !== null) return stop('response_on_failed_attempt');
+      continue;
+    }
+    if (attempt.outcome !== 'success') return stop(`decision_${attempt.outcome}`);
+    const parsed = normalizedResponseSchema.safeParse(attempt.response);
+    if (!parsed.success) return stop('malformed_response');
+    const response = parsed.data;
+    if (
+      response.decisionId !== snapshot.decisionId ||
+      response.snapshotHash !== snapshotHash ||
+      response.requestHash !== out.requestHash
+    )
+      return stop('response_hash_or_decision_mismatch');
+    if (response.evidenceReferences.some(ref => !out.evidenceReferences.includes(ref)))
+      return stop('unknown_response_evidence');
+    if (position !== history.length) return stop('attempt_after_terminal_outcome');
+    if (response.choice === 'abstain')
+      return stop(
+        response.candidateId === null ? 'decision_abstained' : 'invalid_abstain_candidate'
+      );
+    const selected = eligible.find(c => c.candidateId === response.candidateId);
+    if (!selected) return stop('choice_not_eligible');
+    if (attempt.distribution) {
+      const entries = Object.entries(attempt.distribution).sort((a, b) => b[1] - a[1]);
+      const keys = Object.keys(attempt.distribution).sort();
+      if (
+        keys.join('|') !== [...out.eligibleCandidateIds, 'abstain'].sort().join('|') ||
+        Math.abs(entries.reduce((sum, e) => sum + e[1], 0) - 1) > 0.000001 ||
+        entries[0]?.[0] !== selected.candidateId ||
+        (entries.length > 1 && entries[0][1] === entries[1][1])
+      )
+        return stop('invalid_distribution_winner');
+      out.distribution = attempt.distribution;
+    }
+    // Selection is rechecked against the same admitted worker facts, never a model-supplied binding.
+    out.proposedBinding = {
+      candidateId: selected.candidateId,
+      provider: selected.provider,
+      model: selected.model,
+      workerAccountId: selected.workerAccountId,
+      transport: selected.transport,
+    };
+    out.decision = 'propose';
+    out.disposition = 'accepted';
+    out.decisionOrigin = attempt.origin;
+    out.engineId = route.engineId;
+    out.adapterId = route.adapterId;
+    out.transport = route.transport;
+    out.accountId = route.accountId;
+    out.requestedModel = attempt.requestedModel;
+    out.servedModel = attempt.servedModel;
+    out.usage = attempt.usage;
+    out.cashCost = attempt.cashCost;
+    out.latencyMs = attempt.latencyMs;
+    return out;
+  }
+  return stop(
+    position < history.length ? 'unexpected_attempt_history' : 'all_decision_routes_unavailable'
+  );
+}
+
+function evaluateV4(snapshot: DynamicLaneV4Snapshot): DynamicLaneV4Receipt {
+  const out = evaluateV4Core(snapshot);
+  const prior = snapshot.priorDecisions?.entries.find(
+    p => p.decisionId === snapshot.decisionId && p.snapshotHash === out.snapshotHash
+  );
+  if (prior?.receipt !== undefined && prior.receipt !== null) {
+    const stored = v4ReceiptSchema.safeParse(prior.receipt);
+    const reason = !stored.success
+      ? 'invalid_prior_receipt'
+      : canonicalDynamicLaneJson({ ...stored.data, priorLedgerHash: null }) !==
+          canonicalDynamicLaneJson({ ...out, priorLedgerHash: null })
+        ? 'prior_receipt_mismatch'
+        : null;
+    if (reason) return { ...out, disposition: reason, decision: 'wait', proposedBinding: null };
+  }
+  return out;
+}
+
+export function evaluateDynamicLane(snapshot: DynamicLaneSnapshot): DynamicLaneReceipt;
+export function evaluateDynamicLane(snapshot: DynamicLaneV4Snapshot): DynamicLaneV4Receipt;
+export function evaluateDynamicLane(
+  snapshot: DynamicLaneSnapshot | DynamicLaneV4Snapshot
+): DynamicLaneReceipt | DynamicLaneV4Receipt;
+export function evaluateDynamicLane(
+  snapshot: DynamicLaneSnapshot | DynamicLaneV4Snapshot
+): DynamicLaneReceipt | DynamicLaneV4Receipt {
+  return snapshot.schemaVersion === 'dynamic-lane-snapshot/v4'
+    ? evaluateV4(snapshot)
+    : evaluateLegacyDynamicLane(snapshot);
 }
 
 export type { ExecutionCapability, OutcomeReasonCode, ProviderAttemptRecord, RunAuthorityRecord };
