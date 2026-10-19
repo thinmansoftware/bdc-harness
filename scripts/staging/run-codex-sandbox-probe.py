@@ -9,7 +9,7 @@ import uuid
 from teetime_bounded_process import capture
 from teetime_reviewer_probe import reviewer_settings, verify_reviewer_limits, remove_owned_reviewer, reviewer_failure_diagnostic
 from teetime_startup_packet import capture_metadata, write_private_packet, startup_failure_diagnostic
-from teetime_startup_control import startup_settings, require_private_context, verify_startup_identity, BINARY_HASH
+from teetime_startup_control import startup_settings, require_private_context, verify_startup_identity, BINARY_HASH, StartupController
 
 
 def completed_capture(code,output,kind):
@@ -76,12 +76,19 @@ def main():
     peer = name + "-peer"
     temporary = {"/tmp", "/home/appuser", "/workspace", "/protected"}
 
+    controller = StartupController(args.startup_owner,name) if args.kind=='startup' else None
+
     def docker(*parts, **kwargs):
+        if controller is not None:
+            if set(kwargs)-{'check'}: raise ValueError('startup Docker options rejected')
+            return controller.docker(args.docker,*parts,**kwargs)
         return subprocess.run([args.docker, *parts], capture_output=True,
                               text=True, timeout=120, **kwargs)
 
-    image_id = docker("image", "inspect", args.image, "--format", "{{.Id}}", check=True).stdout.strip()
-    assert image_id.startswith("sha256:") and len(image_id) == 71
+    image_id = None
+    if controller is None:
+        image_id = docker("image", "inspect", args.image, "--format", "{{.Id}}", check=True).stdout.strip()
+        assert image_id.startswith("sha256:") and len(image_id) == 71
     peer_url = None
 
     def inspect_network():
@@ -221,6 +228,10 @@ console.log(JSON.stringify(hashes));
             temporary.add(path)
             options.extend(["--tmpfs", path + ":ro,uid=1001,gid=1001"])
     try:
+        if controller is not None:
+            controller.resources('before')
+            image_id = docker("image", "inspect", args.image, "--format", "{{.Id}}", check=True).stdout.strip()
+            assert image_id.startswith("sha256:") and len(image_id) == 71
         if network:
             peer_url = start_peer()
             options.extend(["--env", "TEE_TIME_PROBE_PEER=" + peer_url])
@@ -282,8 +293,11 @@ console.log(JSON.stringify(hashes));
             running = json.loads(docker("inspect", name, check=True).stdout)[0]
             assert running["State"]["Running"] and running["AppArmorProfile"] == args.apparmor_profile
             if args.kind in ('reviewer','startup'):
-                code, output = capture([args.docker, 'attach', '--sig-proxy=false', name],
-                                       90, limit=65536, input_bytes=source)
+                if controller is not None:
+                    code, output = controller.attach([args.docker, 'attach', '--sig-proxy=false', name],source)
+                else:
+                    code, output = capture([args.docker, 'attach', '--sig-proxy=false', name],
+                                           90, limit=65536, input_bytes=source)
                 result = completed_capture(code,output,args.kind)
             else:
                 result = docker("attach", "--sig-proxy=false", name, input=source.decode("utf-8"))
@@ -348,32 +362,41 @@ console.log(JSON.stringify(hashes));
                           "probeSha256": hashlib.sha256(source).hexdigest(),
                           "probe": evidence}))
     finally:
-        if args.kind in ('reviewer','startup'):
-            remove_owned_reviewer(docker, name,args.startup_owner if args.kind=='startup' else args.reviewer_owner,
-                                  startup=args.kind=='startup')
-        remaining = docker("container", "ls", "-aq", "--filter", "name=^/" + name + "$")
-        if remaining.returncode:
-            raise RuntimeError("could not verify probe cleanup for " + name)
-        if remaining.stdout.strip() and docker("rm", "-f", name).returncode:
-            raise RuntimeError("probe cleanup failed for " + name)
-        if network:
-            remaining = docker("container", "ls", "-aq", "--filter", "name=^/" + peer + "$")
-            if remaining.returncode or (remaining.stdout.strip() and docker("rm", "-f", peer).returncode):
-                raise RuntimeError("peer cleanup failed: " + peer)
-            existing = docker("network", "ls", "-q", "--filter", "name=^" + network + "$")
-            if existing.returncode:
-                raise RuntimeError("could not verify network cleanup: " + network)
-            if existing.stdout.strip():
-                inspect_network()
-                docker("network", "rm", network, check=True)
-        if volume:
-            existing = docker("volume", "ls", "-q", "--filter", "name=^" + volume + "$")
-            if existing.returncode:
-                raise RuntimeError("could not verify fixture volume cleanup: " + volume)
-            if existing.stdout.strip():
-                owned = json.loads(docker("volume", "inspect", volume, check=True).stdout)[0]
-                assert owned["Name"] == volume and owned["Labels"].get("teetime.probe") == name
-                docker("volume", "rm", volume, check=True)
+        if controller is not None: controller.enter_cleanup()
+        try:
+            if args.kind in ('reviewer','startup'):
+                remove_owned_reviewer(docker, name,args.startup_owner if args.kind=='startup' else args.reviewer_owner,
+                                      startup=args.kind=='startup')
+            remaining = docker("container", "ls", "-aq", "--filter", "name=^/" + name + "$")
+            if remaining.returncode:
+                raise RuntimeError("could not verify probe cleanup for " + name)
+            if remaining.stdout.strip() and docker("rm", "-f", name).returncode:
+                raise RuntimeError("probe cleanup failed for " + name)
+            if network:
+                remaining = docker("container", "ls", "-aq", "--filter", "name=^/" + peer + "$")
+                if remaining.returncode or (remaining.stdout.strip() and docker("rm", "-f", peer).returncode):
+                    raise RuntimeError("peer cleanup failed: " + peer)
+                existing = docker("network", "ls", "-q", "--filter", "name=^" + network + "$")
+                if existing.returncode:
+                    raise RuntimeError("could not verify network cleanup: " + network)
+                if existing.stdout.strip():
+                    inspect_network()
+                    docker("network", "rm", network, check=True)
+            if volume:
+                existing = docker("volume", "ls", "-q", "--filter", "name=^" + volume + "$")
+                if existing.returncode:
+                    raise RuntimeError("could not verify fixture volume cleanup: " + volume)
+                if existing.stdout.strip():
+                    owned = json.loads(docker("volume", "inspect", volume, check=True).stdout)[0]
+                    assert owned["Name"] == volume and owned["Labels"].get("teetime.probe") == name
+                    docker("volume", "rm", volume, check=True)
+        except BaseException:
+            if controller is not None: controller.finish_cleanup(False)
+            raise
+        else:
+            if controller is not None: controller.finish_cleanup(True)
+        finally:
+            if controller is not None: controller.resources('after')
     if args.kind=='startup':
         assert startup_raw is not None and startup_receipt is not None
         require_private_context(args.startup_root,args.startup_owner)

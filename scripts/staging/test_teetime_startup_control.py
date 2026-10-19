@@ -9,7 +9,7 @@ import traceback
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
-from teetime_startup_control import startup_settings, verify_startup_identity, require_private_repository, require_private_context, BINARY_HASH, CATALOG_HASH
+from teetime_startup_control import startup_settings, verify_startup_identity, require_private_repository, require_private_context, BINARY_HASH, CATALOG_HASH, StartupController
 from teetime_reviewer_probe import remove_owned_reviewer
 from teetime_startup_packet import startup_metadata, startup_failure_diagnostic
 
@@ -134,5 +134,201 @@ class StartupControlTests(unittest.TestCase):
         remove_owned_reviewer(docker,name,'teetime-startup-123-1',startup=True)
         self.assertIn(('rm','-f',identifier),calls)
 
+
+
+class StartupControllerTests(unittest.TestCase):
+    def control(self, clock=None, runner=None, emitter=None):
+        self.now=[0.0]; self.events=[]
+        return StartupController('teetime-startup-123-1','teetime-sandbox-probe-'+'a'*12,
+            clock=clock or (lambda:self.now[0]), emitter=emitter or self.events.append,
+            runner=runner or (lambda *args,**kwargs:(0,b'ready')))
+
+    def test_closed_milestone_precedes_blocking_command_and_reports_actual_exit_only(self):
+        def run(*args,**kwargs):
+            self.assertEqual(self.events[-1]['phase'],'image-inspect')
+            self.assertEqual(self.events[-1]['edge'],'start')
+            self.assertEqual(kwargs['limit'],131072)
+            self.assertLessEqual(kwargs['timeout'],115)
+            return 7,b'PRIVATE-OUTPUT'
+        controller=self.control(runner=run)
+        result=controller.docker('docker','image','inspect','private-image')
+        self.assertEqual(result.returncode,7)
+        self.assertEqual(result.stdout,'PRIVATE-OUTPUT')
+        self.assertEqual(self.events[-1]['exitCode'],7)
+        self.assertNotIn('PRIVATE',json.dumps(self.events))
+        self.assertNotIn('private-image',json.dumps(self.events))
+
+    def test_one_main_deadline_and_cleanup_window_do_not_restart_per_command(self):
+        controller=self.control();self.now[0]=118
+        with self.assertRaises(TimeoutError):controller.docker('docker','inspect','ignored')
+        controller.enter_cleanup();self.assertLessEqual(controller.remaining(120),27)
+        self.now[0]=149
+        with self.assertRaises(TimeoutError):controller.docker('docker','container','ls')
+        early=self.control();self.now[0]=10;early.enter_cleanup();self.now[0]=39
+        with self.assertRaises(TimeoutError):early.docker('docker','container','ls')
+
+    def test_timeout_overflow_and_unknown_exit_remain_uncertain_not_synthetic_status(self):
+        for failure in [TimeoutError('PRIVATE'),ValueError('PRIVATE'),OSError('PRIVATE')]:
+            def run(*args,**kwargs):raise failure
+            controller=self.control(runner=run)
+            with self.assertRaises(RuntimeError):controller.docker('docker','create','private')
+            last=self.events[-1]
+            self.assertEqual(last['edge'],'failure')
+            self.assertIsNone(last['exitCode'])
+            self.assertNotIn('PRIVATE',json.dumps(self.events))
+
+    def test_attach_keeps_original_native_output_and_duration_caps(self):
+        observed=[]
+        def run(*args,**kwargs):observed.append(kwargs);return 0,b'PRIVATE-PACKET'
+        controller=self.control(runner=run)
+        result=controller.attach(['docker','attach','fixed'],b'source')
+        self.assertEqual(result,(0,b'PRIVATE-PACKET'))
+        self.assertEqual(observed[0]['limit'],65536)
+        self.assertLessEqual(observed[0]['timeout'],90)
+        self.assertNotIn('PRIVATE',json.dumps(self.events))
+
+    def test_unknown_operation_rejected_before_spawn_and_logging_failure_cannot_block_cleanup(self):
+        calls=[]
+        controller=self.control(runner=lambda *args,**kwargs:(calls.append(args) or (0,b'')))
+        with self.assertRaises(ValueError):controller.docker('docker','exec','PRIVATE')
+        self.assertEqual(calls,[])
+        def fail(_event):raise OSError('PRIVATE')
+        controller=self.control(emitter=fail,runner=lambda *args,**kwargs:(calls.append(args) or (0,b'')))
+        with self.assertRaises(RuntimeError):controller.docker('docker','create','private')
+        self.assertEqual(calls,[])
+        controller.enter_cleanup();controller.docker('docker','container','ls')
+        self.assertEqual(len(calls),1)
+
+    def test_milestone_and_counter_bounds_are_independent_and_missing_is_null(self):
+        controller=self.control()
+        with patch('teetime_startup_control.resource_snapshot',return_value={
+            'memoryAvailableBytes':None,'diskFreeBytes':None,'visibleControllerCgroupOomKills':None}):
+            controller.resources('before')
+        self.assertEqual(self.events[-1]['resources'],{
+            'memoryAvailableBytes':None,'diskFreeBytes':None,'visibleControllerCgroupOomKills':None})
+        for _ in range(70):
+            try:controller.docker('docker','inspect','private')
+            except RuntimeError:pass
+        self.assertLessEqual(len(self.events),64)
+        controller.enter_cleanup()
+        controller.docker('docker','container','ls')
+
+
+class StartupControllerIntegrationTests(unittest.TestCase):
+    def test_outer_cleanup_protects_first_docker_failure_and_does_not_claim_absence(self):
+        from unittest.mock import Mock
+        spec=importlib.util.spec_from_file_location('teetime_startup_outer_cleanup_test',Path(__file__).with_name('run-codex-sandbox-probe.py'))
+        runner=importlib.util.module_from_spec(spec);spec.loader.exec_module(runner)
+        controller=Mock()
+        controller.docker.side_effect=RuntimeError('first Docker outcome unknown')
+        argv=['probe','--kind','startup','--image','fixed-image','--expected-sha','a'*40,
+              '--startup-owner','teetime-startup-123-1','--startup-root','unused',
+              '--apparmor-profile','teetime-probe-mount-123-1']
+        with patch('sys.argv',argv),patch.object(runner,'require_private_context'), \
+             patch.object(runner,'StartupController',return_value=controller,create=True), \
+             patch.object(runner.subprocess,'run',side_effect=RuntimeError('first Docker outcome unknown')), \
+             patch.object(runner,'remove_owned_reviewer',side_effect=RuntimeError('cleanup unverified')) as cleanup:
+            with self.assertRaisesRegex(RuntimeError,'cleanup unverified'):runner.main()
+        cleanup.assert_called_once()
+        controller.enter_cleanup.assert_called_once()
+        controller.finish_cleanup.assert_called_once_with(False)
+        controller.resources.assert_any_call('after')
+
+
+class StartupControllerProcessTests(unittest.TestCase):
+    def test_real_synthetic_block_and_overflow_are_reaped_and_never_publish_child_data(self):
+        import subprocess,sys,time
+        from teetime_bounded_process import capture
+        for source,limit in [('import time;time.sleep(20)',4096),('print("PRIVATE"*1000)',64)]:
+            events=[];children=[];real_popen=subprocess.Popen
+            def spawn(*args,**kwargs):
+                child=real_popen(*args,**kwargs);children.append(child);return child
+            controller=StartupController('teetime-startup-123-1','teetime-sandbox-probe-'+'a'*12,
+                emitter=events.append)
+            with patch('teetime_bounded_process.subprocess.Popen',side_effect=spawn):
+                with self.assertRaises(RuntimeError):
+                    controller.command([sys.executable,'-c',source],'attach',.2,limit)
+            self.assertEqual(events[0]['edge'],'start')
+            self.assertEqual(events[-1]['edge'],'failure')
+            self.assertIsNone(events[-1]['exitCode'])
+            self.assertNotIn('PRIVATE',json.dumps(events))
+            self.assertTrue(children and all(child.poll() is not None for child in children))
+
+    def test_terminated_synthetic_controller_has_start_receipt_and_no_false_cleanup_success(self):
+        import subprocess,sys
+        from teetime_bounded_process import capture
+        parent=[];real_popen=subprocess.Popen
+        def spawn(*args,**kwargs):
+            child=real_popen(*args,**kwargs);parent.append(child);return child
+        source=("import sys,time;sys.path.insert(0,sys.argv[1]);"
+                "from teetime_startup_control import StartupController;"
+                "c=StartupController('teetime-startup-123-1','teetime-sandbox-probe-aaaaaaaaaaaa',runner=lambda *a,**k:time.sleep(20));"
+                "c.docker('docker','create','synthetic')")
+        def observed(chunk):
+            if b'"edge":"start"' in chunk:parent[0].kill()
+        with patch('teetime_bounded_process.subprocess.Popen',side_effect=spawn):
+            code,raw=capture([sys.executable,'-u','-c',source,str(Path(__file__).parent)],5,
+                             limit=4096,on_stdout=observed)
+        self.assertNotEqual(code,0)
+        records=[json.loads(line) for line in raw.splitlines()]
+        self.assertEqual(len(records),1)
+        self.assertEqual(records[0]['phase'],'container-create')
+        self.assertEqual(records[0]['edge'],'start')
+        self.assertIsNone(records[0]['exitCode'])
+        self.assertTrue(all(child.poll() is not None for child in parent))
+
+    def test_resource_reads_are_byte_bounded_nullable_and_not_worker_oom_claims(self):
+        reads=[]
+        class Source(io.BytesIO):
+            def read(self,size=-1):reads.append(size);return super().read(size)
+        def opened(path,*args,**kwargs):
+            return Source(b'MemAvailable: 17 kB\n' if path=='/proc/meminfo' else b'oom_kill 3\n')
+        with patch('builtins.open',side_effect=opened),patch('teetime_startup_control.os.statvfs',
+                return_value=SimpleNamespace(f_bavail=10,f_frsize=4096),create=True):
+            from teetime_startup_control import resource_snapshot
+            self.assertEqual(resource_snapshot(),{'memoryAvailableBytes':17408,'diskFreeBytes':40960,
+                             'visibleControllerCgroupOomKills':3})
+        self.assertEqual(reads,[65537,4097])
+        with patch('builtins.open',side_effect=OSError('PRIVATE')),patch('teetime_startup_control.os.statvfs',
+                side_effect=OSError('PRIVATE'),create=True):
+            self.assertTrue(all(value is None for value in resource_snapshot().values()))
+
+
+class StartupControllerIdentityTests(unittest.TestCase):
+    def test_public_owned_identity_is_bounded_before_observation(self):
+        for owner in ['teetime-startup-'+'1'*100+'-1','teetime-startup-1-'+'1'*100]:
+            with self.assertRaises(ValueError):StartupController(owner,'teetime-sandbox-probe-aaaaaaaaaaaa')
+
+
+class StartupUncertainCreationTests(unittest.TestCase):
+    def test_uncertain_creation_reconciles_owned_id_before_removal(self):
+        from unittest.mock import Mock
+        spec=importlib.util.spec_from_file_location('teetime_startup_creation_test',Path(__file__).with_name('run-codex-sandbox-probe.py'))
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        state={'created':False,'removed':False};calls=[];identifier='b'*64
+        controller=Mock()
+        def factory(owner,name):state.update(owner=owner,name=name);return controller
+        def docker(_binary,*parts,**kwargs):
+            calls.append(parts)
+            if parts[:2]==('image','inspect'):out='sha256:'+'a'*64
+            elif parts[0]=='create':
+                state['created']=True;raise RuntimeError('creation outcome unknown')
+            elif parts[:2]==('container','ls'):out=identifier if state['created'] and not state['removed'] else ''
+            elif parts[0]=='inspect':out=json.dumps([{'Id':identifier,'Name':'/'+state['name'],
+                'Config':{'Labels':{'teetime.startup-fixture':state['owner']}}}])
+            elif parts[0]=='rm':
+                self.assertEqual(parts,('rm','-f',identifier));state['removed']=True;out=''
+            else:raise AssertionError('unexpected operation')
+            return SimpleNamespace(returncode=0,stdout=out)
+        controller.docker.side_effect=docker
+        argv=['probe','--kind','startup','--image','fixed-image','--expected-sha','a'*40,
+              '--startup-owner','teetime-startup-123-1','--startup-root','unused',
+              '--apparmor-profile','teetime-probe-mount-123-1']
+        with patch('sys.argv',argv),patch.object(module,'require_private_context'), \
+             patch.object(module,'StartupController',side_effect=factory):
+            with self.assertRaisesRegex(RuntimeError,'creation outcome unknown'):module.main()
+        self.assertTrue(state['removed'])
+        controller.finish_cleanup.assert_called_once_with(True)
+        self.assertFalse(any(parts[0]=='start' for parts in calls))
 
 if __name__=='__main__': unittest.main()

@@ -256,3 +256,88 @@ rerun tests. New exact CI must establish actual Linux/POSIX custody results befo
 activation review. No native capture, account operation, dispatch or retry was
 approved or performed. Failed-exchange v3 counters retain their prior meaning:
 acceptedNotifications counts thread/started only, never configuration warnings.
+
+
+## Controller interruption evidence and proposed bounded source correction
+
+Consumed run39250421265 at activationdeb12f8ea30c2afcc61e8e847d6eac4c9485a5ad
+and helper42e1755b49a0aaa11f01058a6e1ac9619cb3ce49 ended FAILURE. Actual source
+validation and image build passed, imagee387ac2d96367a81f68daa660024389f8a61b8c0f53cb0e9e6d44131e0f86b2f.
+Shell reports the host Python controller Killed, exit137, about103 seconds into
+capture step. No controller/native receipt, zero artifacts. Always-cleanup and
+post steps were skipped. Original hosted runner is inaccessible; owned resource
+absence is UNVERIFIED. Run/job annotations establish only137, not OOM, timeout,
+parser progress or native cause. Do not infer absent counters are healthy.
+
+Independent architect inspected source and evidence: first flushed receipt is
+after attach/inspect; individual Docker calls have120s bounds without one overall
+controller deadline. SIGKILL prevents Python finally; workflow always cannot
+promise cleanup if the runner cannot continue. No retry is approved.
+Oracle lookup found no directly applicable controller/137 contract or prior fix.
+
+Proposed source-only slice, pending prebuild review:
+
+- Extend existing teetime_startup_control.py with StartupController, used only
+  by startup route of run-codex-sandbox-probe.py. Preserve private-context check
+  before any controller/Docker work; leave other probe routes unchanged.
+- One monotonic120s main-operation budget plus reserved30s cleanup window,
+  absolute cutoff at start+150s; cleanup deadline is min(entry+30s, absolute).
+  Each subprocess gets at most its old120s Docker or90s attach cap,
+  further limited by remaining phase budget minus5s reserved owned-child reaping.
+  Reject exhausted budget before spawning. Cleanup switches to the reserved
+  window in finally and cannot claim success without actual removal/readback.
+  Native exchange12s/reap5s, auth/config/resource/output/policy remain unchanged.
+- Startup Docker calls use existing bounded capture with131072 host-command
+  output cap; attach retains65536. No change to shared capture implementation.
+  Command classification has fixed known kinds only: image inspection, create,
+  inspect, start, attach, owned inventory/remove. No arbitrary command text public.
+- Flush closed milestones BEFORE/AFTER or fixed failure for every blocking
+  startup host operation. Fixed kind/phase/edge, bounded elapsed time, exact
+  owner and generated container name, optional bounded int exit status only.
+  No raw stdout/stderr/native packet/arguments/image environment or errors.
+  Bounded event count. A missing end receipt is uncertainty, not a completed
+  command, successful cleanup or a native-stage diagnosis.
+- Bounded host counters before creation and after attempted cleanup: fixed
+  MemAvailable, filesystem free bytes and visible-cgroup oom_kill count only.
+  Missing/unreadable/malformed values are null, never healthy or OOM evidence.
+  State visible scope; no arbitrary paths/environment, process or customer data.
+- TDD with synthetic child/fake Docker operations: milestone precedes spawn,
+  blocked command, shared-deadline exhaustion, attach timeout/output overflow,
+  cleanup reserve and failure, unknown command/phase, public redaction, and
+  synthetic controller termination. No native Codex/account/container run.
+- Existing control test discovery supplies offline CI; no new trigger or native
+  execution. Source publication needs actual diff review/new CI. Later activation
+  and any one capture require separate exact-case review. Keep historical cleanup
+  UNVERIFIED; never use a new host to claim absence on the old runner.
+
+
+### Controller source implementation verification
+
+Prebuild architect approved source/offline work with anchored deadlines, outer
+cleanup protection before first Docker command, bounded telemetry/event count,
+visible-controller cgroup scope, and no invented status for uncertain reaping.
+These clarifications are implemented in the existing startup control module and
+startup-only runner route; other probe routes/shared capture remain unchanged.
+At most64 milestones of1024 bytes, bounded owner/name and elapsed/exit scalars.
+Telemetry missing/malformed/unreadable values remain null; logging failure stops
+new main work but cannot prevent owned cleanup. Cleanup status reflects actual
+owned inventory/removal checks, not process termination or a finally intention.
+
+TDD observed absent controller class, first Docker failure bypassing outer
+cleanup, and unbounded public owner identity before correction. Synthetic tests
+exercise blocked/overflowing Python children and their reaping, terminated fake
+controller with a flushed start/no completion, deadline exhaustion, cleanup
+reserve exhaustion, observer failure, and uncertain creation with exact owned-ID
+reconciliation before removal. No native executable/container/account was run.
+Local22 control tests passed with1 Windows POSIX-only skip;13 packet tests with3
+POSIX-only skips,9 bounded process tests and9 reviewer probe tests passed.
+Historical run39250421265 cleanup stays UNVERIFIED and grant consumed. No new
+runtime approval follows. Source publication needs independent actual-diff review.
+
+
+Independent actual-diff review approved SOURCE PUBLICATION ONLY with no blocking
+findings. Clarification:150s bounds startup-controller subprocess budgets; it is
+not a hard whole-process deadline. Synchronous telemetry/logging and the existing
+post-cleanup private-context check are outside this enforcement. No SIGKILL-safe
+wall-clock or cleanup guarantee is claimed. Source review did not rerun tests;
+new Linux/POSIX CI is required. No activation or execution grant is conveyed.
