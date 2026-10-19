@@ -398,3 +398,43 @@ process deadline. Individual reads are bounded; GitHub observations are not an
 atomic snapshot. The operational join must recheck expiry on every callback and
 must accept only the live authenticated SSH packet, never a saved receipt. The
 remote persisted-run join and authenticated launcher remain outstanding.
+
+## Supervised model launcher connection
+
+The source now connects the fresh PC observation to the existing paused run and
+one-use claim, persists/reads the restricted provider attempt, and only then starts
+the existing authenticated launcher. The original preparation archive and authority
+stay unchanged. The new execution archive is separately inventoried; prepared
+runtime-revision inputs must match, and full authority readback remains active.
+The PC observation also reads the actual app staging ref before emission.
+
+The operational entry uses Bun1.3.13 with --no-env-file from the separately frozen
+ROOT/execution-harness source. Its closed argument sequence is:
+
+```
+bun --no-env-file scripts/staging/teetime-supervised-controller.ts --claim-model --input-sha256 INPUT_HASH --execution-sha256 PACKAGE_HASH --source-manifest-sha256 INVENTORY_HASH --source-sha SOURCE_SHA --review-head PLAN_HEAD --nonce FRESH_NONCE
+```
+
+Use only the PC operator entry to invoke it over authenticated SSH. That entry now
+accepts --task supervised-demo with --image, --expected-sha, --artifact-source,
+--demo-package-hash, --plan-head, --input-sha256 and --source-manifest-sha256. It
+reads the frozen local demo-execution.json, obtains fresh actual GitHub observations
+and writes one bounded observation line. Login remains unread until independently
+validated READY. No saved observation file is an accepted authority input.
+
+The same single remote stdin reader then carries the bounded credential frame.
+Raw READY/RESULT bytes reach the independent Python validator unchanged; duplicate
+keys cannot disappear through JSON normalization. All child/input/output waits are
+bounded. Cancellation, pump settlement and reaping are all attempted even when one
+cleanup promise fails. An uncertain outcome retains the consumed claim and lock;
+there is no automatic retry. The run remains paused throughout.
+
+Verification includes eight real-child transport tests, two bounded operator-write
+failure tests, two independent candidate/cleanup parser tests, and both entry
+rejection paths. Existing protocol, worker, model-phase and entry-guard tests pass.
+Local scripts typecheck remains blocked by missing pre-existing provider SDK
+dependencies; no errors for these new files remained in its diagnostic output.
+CI39188515400 passed at6de728c3b56872ac868f4947c6900a5f72998aff, before this slice.
+This connection still needs frozen-source CI, image/package publication, actual
+independent plan review and operational qualification. No authenticated model call,
+app candidate, preview or app acceptance is claimed by these source tests.

@@ -15,6 +15,35 @@ from teetime_auth_receiver import validate_payload
 from teetime_canary_protocol import encode_frame
 
 
+def deliver_observation(child, raw, timeout=15):
+    """Bounded pre-auth write. Failure kills/reaps only the owned SSH child."""
+    if type(raw) is not bytes or not 1 <= len(raw) <= 65537:
+        raise ValueError('bounded observation delivery required')
+    result = queue.Queue(maxsize=1)
+    def write():
+        try:
+            child.stdin.write(raw)
+            child.stdin.flush()
+            result.put(True)
+        except (BrokenPipeError, OSError):
+            result.put(False)
+    writer = threading.Thread(target=write, daemon=True)
+    writer.start()
+    try:
+        if result.get(timeout=timeout) is not True:
+            raise ValueError('observation delivery failed')
+        writer.join(timeout=3)
+        if writer.is_alive():
+            raise ValueError('observation writer did not stop')
+    except BaseException:
+        if child.poll() is None:
+            child.kill(); child.wait(timeout=5)
+        writer.join(timeout=3)
+        if writer.is_alive():
+            raise ValueError('observation delivery cleanup uncertain') from None
+        raise
+
+
 def main():
     if not __debug__:
         raise ValueError('assertions required')
@@ -27,6 +56,9 @@ def main():
     parser.add_argument('--task', choices=['filesystem', 'artifact', 'supervised-demo'], default='filesystem')
     parser.add_argument('--artifact-source')
     parser.add_argument('--demo-package-hash')
+    parser.add_argument('--plan-head')
+    parser.add_argument('--input-sha256')
+    parser.add_argument('--source-manifest-sha256')
     args = parser.parse_args()
     assert re.fullmatch('sha256:[a-f0-9]{64}', args.image)
     assert re.fullmatch('[a-f0-9]{40}', args.expected_sha)
@@ -34,12 +66,27 @@ def main():
     root = Path(__file__).parent
     artifact_mode = args.task in ['artifact','supervised-demo']
     execution=None
+    observation = None
     if args.task=='supervised-demo':
-        # The source protocol is available for qualification, but authenticated
-        # dispatch must first be joined to the persisted supervised phase claim.
-        raise ValueError('supervised demo requires reviewed controller entry')
-    if args.demo_package_hash is not None:
-        parser.error('demo-only package hash rejected')
+        from teetime_demo_execution import parse_demo_execution, MAX_EXECUTION_BYTES
+        from teetime_plan_observation import observe_plan
+        for value, size in [(args.demo_package_hash,64), (args.plan_head,40),
+                            (args.input_sha256,64), (args.source_manifest_sha256,64)]:
+            if type(value) is not str or re.fullmatch('[a-f0-9]{'+str(size)+'}',value) is None:
+                raise ValueError('closed supervised operator arguments required')
+        if args.synthetic or args.disconnect_before_auth or args.frame_test:
+            raise ValueError('real supervised phase cannot be used as a transport fixture')
+        path=root.resolve().parents[1]/'demo-execution.json'
+        if not path.is_file() or path.is_symlink() or path.stat().st_size>MAX_EXECUTION_BYTES:
+            raise ValueError('bounded frozen local package required')
+        execution_raw=path.read_bytes()
+        execution=parse_demo_execution(execution_raw,args.demo_package_hash)
+        if (execution.image,execution.source,execution.base_source)!=(args.image,args.artifact_source,args.expected_sha):
+            raise ValueError('operator execution identity differs')
+        observation=observe_plan(execution_raw,args.demo_package_hash,args.plan_head,nonce)
+    elif any(value is not None for value in [args.demo_package_hash,args.plan_head,
+                                            args.input_sha256,args.source_manifest_sha256]):
+        parser.error('demo-only arguments rejected')
     if artifact_mode:
         from teetime_auth_artifact_protocol import artifact_hashes, validate_selector, validate_ready, validate_report, POLICY_PATH
         from teetime_joined_fixture import strict_json
@@ -54,6 +101,8 @@ def main():
     command = command.replace('CANARY_CONTEXT', context)
     if artifact_mode:
         command += " --task artifact --artifact-source '"+args.artifact_source+"'"
+    if execution is not None:
+        command = r'''$ErrorActionPreference='Stop'; & "$env:USERPROFILE\.bun\bin\bun.exe" --no-env-file "$env:USERPROFILE\teetime-supervised-01\execution-harness\scripts\staging\teetime-supervised-controller.ts" --claim-model --input-sha256 '''+"'"+args.input_sha256+"' --execution-sha256 '"+args.demo_package_hash+"' --source-manifest-sha256 '"+args.source_manifest_sha256+"' --source-sha '"+args.artifact_source+"' --review-head '"+args.plan_head+"' --nonce '"+nonce+"'"
     encoded = base64.b64encode(command.encode('utf-16le')).decode()
     child = subprocess.Popen(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
         'bdc-server', 'powershell', '-NoProfile', '-EncodedCommand', encoded], stdin=subprocess.PIPE,
@@ -64,11 +113,12 @@ def main():
         try:
             total = 0
             while True:
-                line = child.stdout.readline(16385)
+                line_limit = 98304 if execution else 16384
+                line = child.stdout.readline(line_limit+1)
                 if not line:
                     break
                 total += len(line)
-                if len(line) > 16384 or total > 32768:
+                if len(line) > line_limit or total > (196608 if execution else 32768):
                     raise ValueError('protocol output bound')
                 inbox.put(strict_json(line) if artifact_mode else json.loads(line))
         except BaseException:
@@ -81,10 +131,13 @@ def main():
     auth_path = Path.home()/'.codex'/'auth.json'
     original_unchanged = True
     try:
-        ready = inbox.get(timeout=75)
+        if observation is not None:
+            deliver_observation(child, observation+b'\n')
+            del observation
+        ready = inbox.get(timeout=120 if execution else 75)
         if artifact_mode:
             validate_ready(ready, nonce=nonce, image=args.image, base_source=args.expected_sha,
-                           source=args.artifact_source, hashes=frozen_hashes)
+                           source=args.artifact_source, hashes=frozen_hashes, execution=execution)
         else:
             assert isinstance(ready, dict) and ready['type'] == 'READY'
             assert set(ready) == {'type','nonce','image','sourceSha','owner','manifestSha256','workerId','gatewayId','hashes'}
@@ -116,7 +169,7 @@ def main():
             payload = validate_payload(io.BytesIO(original), time.time())
         child.stdin.write(payload if args.frame_test else encode_frame(payload)); child.stdin.close()
         del payload
-        report = inbox.get(timeout=180)
+        report = inbox.get(timeout=690 if execution else 180)
         if artifact_mode:
             child_exit = child.wait(timeout=10)
             assert inbox.get(timeout=5) is None
@@ -124,7 +177,7 @@ def main():
                 original_unchanged = auth_path.read_bytes() == original
             assert original_unchanged
             # The validator checks cleanup before independently reparsing artifact bytes.
-            validate_report(report, child_exit, ready=ready, policy_hash=frozen_hashes[POLICY_PATH])
+            validate_report(report, child_exit, ready=ready, policy_hash=frozen_hashes[POLICY_PATH],execution=execution)
             outcome = report['result']
             result = outcome['artifactResult']
             assert outcome['cleanupVerified'] and outcome['proxyMetricsVerified']
@@ -135,7 +188,7 @@ def main():
                 assert result['preflightChecks'] == 5 and result['authenticationRejected'] and not result['taskStarted']
             else:
                 assert outcome['passed']
-            print(json.dumps({'owner': ready['owner'], 'task': 'artifact', 'artifactSourceSha': args.artifact_source,
+            print(json.dumps({'owner': ready['owner'], 'task': args.task, 'artifactSourceSha': args.artifact_source,
                 'result': outcome, 'proxyMetrics': report['proxyMetrics'], 'synthetic': args.synthetic,
                 'originalAuthUnchanged': original_unchanged}))
             return 0

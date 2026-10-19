@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from teetime_auth_receiver import validate_payload
 from teetime_canary_protocol import read_frame
 from teetime_watchdog import cleanup

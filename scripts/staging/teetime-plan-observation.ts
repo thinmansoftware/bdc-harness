@@ -5,6 +5,7 @@ import type { SupervisedPlanReview } from '../../packages/workflows/src/reliabil
 
 export interface ObservationBinding {
   nonce: string;
+  baseSha: string;
   executionHash: string;
   preparedBindingHash: string;
   runId: string;
@@ -34,6 +35,7 @@ export function readPlanObservation(
     'kind',
     'remote',
     'nonce',
+    'remoteStagingSha',
     'observedAtMs',
     'expiresAtMs',
     'executionHash',
@@ -60,6 +62,8 @@ export function readPlanObservation(
     value.pullRequest !== 3392 ||
     value.packagePath !== 'docs/tee-time/supervised-demo-execution.json' ||
     value.nonce !== expected.nonce ||
+    value.remoteStagingSha !== expected.baseSha ||
+    !/^[a-f0-9]{40}$/.test(expected.baseSha) ||
     !/^[a-f0-9]{32}$/.test(expected.nonce) ||
     value.executionHash !== expected.executionHash ||
     !/^sha256:[a-f0-9]{64}$/.test(expected.executionHash) ||

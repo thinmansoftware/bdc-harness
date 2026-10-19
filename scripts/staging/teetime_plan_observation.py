@@ -17,11 +17,13 @@ from teetime_joined_fixture import strict_json
 REPOSITORY = 'thinmansoftware/bdc-xo'
 PLAN_PR = 3392
 PACKAGE_PATH = 'docs/tee-time/supervised-demo-execution.json'
+APP_STAGING_ENDPOINT = 'repos/thinmansoftware/whats-that-tee-time/git/ref/heads/staging'
+APP_BASE_SHA = 'bf6e8935768cf39ebb56b3ef44535830fd71ea7f'
 GH = r'C:\Program Files\GitHub CLI\gh.exe'
 
 
 def github_read(endpoint):
-    if not endpoint.startswith('repos/'+REPOSITORY+'/') or '\n' in endpoint:
+    if (not endpoint.startswith('repos/'+REPOSITORY+'/') and endpoint != APP_STAGING_ENDPOINT) or '\n' in endpoint:
         raise ValueError('closed GitHub read target required')
     env = dict(os.environ)
     env['GH_HOST'] = 'github.com'
@@ -79,11 +81,16 @@ def observe_plan(execution_raw, execution_hash, expected_head, nonce, *, read=gi
         raise ValueError('review pagination incomplete')
     if validate_pull(read(endpoint)) != author:
         raise ValueError('plan author changed during observation')
+    staging = read(APP_STAGING_ENDPOINT)
+    if (type(staging) is not dict or staging.get('ref') != 'refs/heads/staging'
+            or staging.get('object',{}).get('sha') != APP_BASE_SHA
+            or staging.get('object',{}).get('type') != 'commit'):
+        raise ValueError('actual remote app staging changed')
     now = clock()
     if not 0 <= now-began <= 45:
         raise ValueError('plan observation exceeded fresh-read window')
     packet = {'version':1, 'kind':'tee-time-plan-observation', 'remote':'bdc-server',
-        'nonce':nonce, 'observedAtMs':int(now*1000), 'expiresAtMs':int(now*1000)+60000,
+        'nonce':nonce, 'remoteStagingSha':APP_BASE_SHA, 'observedAtMs':int(now*1000), 'expiresAtMs':int(now*1000)+60000,
         'executionHash':'sha256:'+execution_hash, 'preparedBindingHash':execution.prepared_binding_hash,
         'runId':execution.binding['runId'], 'repository':REPOSITORY, 'pullRequest':PLAN_PR,
         'packagePath':PACKAGE_PATH,

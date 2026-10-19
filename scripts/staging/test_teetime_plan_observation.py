@@ -4,7 +4,7 @@ import json
 import unittest
 import test_teetime_demo_execution as execution_tests
 from teetime_artifact_contract import canonical
-from teetime_plan_observation import observe_plan, REPOSITORY, PLAN_PR, PACKAGE_PATH
+from teetime_plan_observation import observe_plan, REPOSITORY, PLAN_PR, PACKAGE_PATH, APP_STAGING_ENDPOINT, APP_BASE_SHA
 
 
 class PlanObservationTests(unittest.TestCase):
@@ -24,6 +24,8 @@ class PlanObservationTests(unittest.TestCase):
 
     def read(self,path):
         self.calls.append(path)
+        if path == APP_STAGING_ENDPOINT:
+            return {'ref':'refs/heads/staging','object':{'sha':APP_BASE_SHA,'type':'commit'}}
         if '/contents/' in path:return self.contents
         if '/reviews?' in path:return self.reviews
         return self.pull
@@ -37,7 +39,7 @@ class PlanObservationTests(unittest.TestCase):
         self.assertEqual(value['nonce'],self.nonce)
         self.assertEqual(value['expiresAtMs']-value['observedAtMs'],60000)
         self.assertEqual(value['review']['reviews'][0]['submittedAt'],'2026-10-19T00:00:00Z')
-        self.assertEqual(len(self.calls),4)
+        self.assertEqual(len(self.calls),5)
 
     def test_foreign_head_or_changed_package_cannot_become_observation(self):
         self.pull['head']['sha']='0'*40

@@ -15,6 +15,7 @@ test('actual Python producer bytes are accepted by the TypeScript parser', () =>
     raw,
     {
       nonce: '2'.repeat(32),
+      baseSha: 'bf6e8935768cf39ebb56b3ef44535830fd71ea7f',
       runId: 'actual-run',
       reviewHead: '1'.repeat(40),
       preparedBindingHash: 'sha256:' + 'c'.repeat(64),
@@ -27,6 +28,7 @@ test('actual Python producer bytes are accepted by the TypeScript parser', () =>
 
 const expected = {
   nonce: 'a'.repeat(32),
+  baseSha: 'bf6e8935768cf39ebb56b3ef44535830fd71ea7f',
   executionHash: 'sha256:' + 'b'.repeat(64),
   preparedBindingHash: 'sha256:' + 'c'.repeat(64),
   runId: 'actual-run',
@@ -38,6 +40,7 @@ function packet() {
     kind: 'tee-time-plan-observation',
     remote: 'bdc-server',
     nonce: expected.nonce,
+    remoteStagingSha: expected.baseSha,
     observedAtMs: 100000,
     expiresAtMs: 160000,
     executionHash: expected.executionHash,
