@@ -18,11 +18,13 @@ class OperatorDeliveryTests(unittest.TestCase):
         f.third_package();third=f.parse()
         f.value.update(version=2,kind='supervised-demo-v2',predecessor=f.value.pop('predecessors')[0])
         f.value['binding']['attempt']=2;second=f.parse()
+        g=DemoExecutionTests();g.setUp();g.fourth_package();fourth=g.parse()
         args=SimpleNamespace(input_sha256='a'*64,demo_package_hash='b'*64,
             source_manifest_sha256='c'*64,artifact_source='d'*40,plan_head='e'*40)
         for execution,folder,mode in [(first,'execution-harness','--claim-model'),
                 (second,'successor-execution-harness','--claim-successor'),
-                (third,'diagnostic-execution-harness','--claim-diagnostic-successor')]:
+                (third,'diagnostic-execution-harness','--claim-diagnostic-successor'),
+                (fourth,'transport-repair-execution-harness','--claim-transport-repair')]:
             command=operator.supervised_command(execution,args,'f'*32)
             self.assertIn('\\'+folder+'\\scripts\\staging\\teetime-supervised-controller.ts',command)
             self.assertIn(' '+mode+' --input-sha256 ',command)

@@ -116,5 +116,34 @@ class DemoExecutionTests(unittest.TestCase):
             else:self.value['binding']['attempt']=2
             with self.subTest(kind=kind),self.assertRaises(ValueError):self.parse()
 
+    def fourth_package(self):
+        self.third_package()
+        self.value.update(version=4,kind='supervised-demo-v4')
+        self.value['binding']['attempt']=4
+        self.value['predecessors'].append({
+            'attemptId':'65380465-a8b3-462f-a114-11f941be8bf3',
+            'completedAt':'2026-10-19T04:36:57.507Z','owner':'teetime-auth-558227ab727a',
+            **{key:'sha256:'+'3'*64 for key in
+               ('rowHash','executionHash','resultHash','claimHash','manifestHash','lockHash')}})
+
+    def test_fourth_package_requires_exact_three_immutable_histories(self):
+        self.fourth_package(); execution=self.parse()
+        self.assertEqual(execution.binding['attempt'],4)
+        self.assertEqual(len(execution.predecessors),3)
+        with self.assertRaises(TypeError): execution.predecessors[2]['owner']='changed'
+        original=canonical(self.value)
+        for kind in ['reversed','duplicate_id','duplicate_owner','extra','missing','legacy_field','version5','wrong_kind','attempt']:
+            self.value=json.loads(original); entries=self.value['predecessors']
+            if kind=='reversed':entries.reverse()
+            elif kind=='duplicate_id':entries[2]['attemptId']=entries[0]['attemptId']
+            elif kind=='duplicate_owner':entries[2]['owner']=entries[0]['owner']
+            elif kind=='extra':entries.append(entries[2])
+            elif kind=='missing':entries.pop()
+            elif kind=='legacy_field':self.value['predecessor']=entries[0]
+            elif kind=='version5':self.value.update(version=5,kind='supervised-demo-v5')
+            elif kind=='wrong_kind':self.value['kind']='supervised-demo-v3'
+            else:self.value['binding']['attempt']=3
+            with self.subTest(kind=kind),self.assertRaises(ValueError):self.parse()
+
 
 if __name__ == '__main__': unittest.main()

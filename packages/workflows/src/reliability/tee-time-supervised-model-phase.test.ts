@@ -71,6 +71,84 @@ async function thirdFixture() {
       runPaused:true as const,resourcesAbsent:true as const,observedAt:Date.now(),expiresAt:Date.now()+20000})}}};
 }
 
+async function fourthFixture() {
+  const f=await thirdFixture();
+  const third: ProviderAttemptRecord={...f.second,
+    attemptId:'65380465-a8b3-462f-a114-11f941be8bf3',attemptNumber:3,
+    startedAt:'2026-10-19T04:36:44.737Z',completedAt:'2026-10-19T04:36:57.507Z',
+    supersedesAttemptId:f.second.attemptId};
+  f.records.push(third);
+  const entries=[...f.entries.map(item=>({...item})),{...f.predecessor,attemptId:third.attemptId,
+    completedAt:third.completedAt!,rowHash:supervisedAttemptHash(third),owner:'teetime-auth-558227ab727a'}];
+  const {diagnosticSuccessor:_old,...base}=f.input;
+  return {...f,entries,third,input:{...base,transportRepairSuccessor:{predecessors:entries,
+    observe:async()=>({predecessors:entries.map(item=>({...item})),runId:'prepared-run',
+      runPaused:true as const,resourcesAbsent:true as const,observedAt:Date.now(),expiresAt:Date.now()+20000})}}};
+}
+
+test('closed fourth claim preserves three histories, links third and cannot repeat',async()=>{
+  const f=await fourthFixture();const hashes=f.records.map(supervisedAttemptHash);
+  const next=await claimSupervisedModelAttempt(f.input);
+  expect(next.attemptNumber).toBe(4);expect(next.supersedesAttemptId).toBe(f.third.attemptId);
+  expect(f.records.slice(0,3).map(supervisedAttemptHash)).toEqual(hashes);
+  expect(f.records).toHaveLength(4);
+  await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+  await f.input.controller.releaseAfterNormalCompletion();
+});
+
+test('fourth claim rejects malformed chain and stale or changed history before consumption',async()=>{
+  for(const kind of ['reversed','duplicate_id','duplicate_owner','extra','missing','link','active','row',
+    'stale','resources','paused','expiry','mixed']){
+    const f=await fourthFixture();const observe=f.input.transportRepairSuccessor.observe;
+    if(kind==='reversed')f.entries.reverse();
+    if(kind==='duplicate_id')f.entries[2].attemptId=f.entries[0].attemptId;
+    if(kind==='duplicate_owner')f.entries[2].owner=f.entries[0].owner;
+    if(kind==='extra')f.entries.push({...f.entries[2]});
+    if(kind==='missing')f.records.pop();
+    if(kind==='link')Object.assign(f.third,{supersedesAttemptId:f.previous.attemptId});
+    if(kind==='active')Object.assign(f.third,{completedAt:null});
+    if(kind==='row')Object.assign(f.second,{servedModelId:'changed'});
+    if(kind==='mixed')Object.assign(f.input,{diagnosticSuccessor:{predecessors:f.entries,observe}});
+    f.input.transportRepairSuccessor.observe=async()=>{
+      const value=await observe();
+      if(kind==='stale')value.observedAt-=60000;
+      if(kind==='resources')Object.assign(value,{resourcesAbsent:false});
+      if(kind==='paused')Object.assign(value,{runPaused:false});
+      if(kind==='expiry')value.expiresAt=Date.now()-1;
+      return value;
+    };
+    await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+    await expect(readFile(join(f.root,'model.claim.json'))).rejects.toThrow();
+    await f.input.controller.releaseAfterNormalCompletion();
+  }
+});
+
+test('fourth claim snapshots all descriptors and verifies every historical readback',async()=>{
+  for(const index of [0,1,2]){
+    const f=await fourthFixture();let checks=0;
+    f.input.recheckExecution=async()=>{if(++checks===2)f.entries[index].claimHash='sha256:'+'0'.repeat(64);};
+    await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+    await expect(readFile(join(f.root,'model.claim.json'))).rejects.toThrow();
+    await f.input.controller.releaseAfterNormalCompletion();
+    const g=await fourthFixture();const create=g.input.store.createProviderAttempt;
+    g.input.store.createProviderAttempt=async(attempt)=>{
+      const created=await create(attempt);Object.assign(g.records[index],{reasonCode:'changed'});return created;
+    };
+    await expect(claimSupervisedModelAttempt(g.input)).rejects.toThrow('readback differs');
+    expect(JSON.parse(await readFile(join(g.root,'model.claim.json'),'utf8')).phase).toBe('model');
+    await g.input.controller.releaseAfterNormalCompletion();
+  }
+});
+
+test('concurrent fourth claims insert exactly one linked attempt',async()=>{
+  const f=await fourthFixture();
+  const settled=await Promise.allSettled([claimSupervisedModelAttempt(f.input),claimSupervisedModelAttempt(f.input)]);
+  expect(settled.filter(item=>item.status==='fulfilled')).toHaveLength(1);
+  expect(f.records).toHaveLength(4);
+  expect(f.records[3].supersedesAttemptId).toBe(f.third.attemptId);
+  await f.input.controller.releaseAfterNormalCompletion();
+});
+
 test('closed third claim preserves both histories and links only the second attempt',async()=>{
   const f=await thirdFixture();const hashes=f.records.map(supervisedAttemptHash);
   const next=await claimSupervisedModelAttempt(f.input);

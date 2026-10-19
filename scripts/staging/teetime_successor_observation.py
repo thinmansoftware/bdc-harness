@@ -32,18 +32,19 @@ def observe_files(root, predecessor, run_id, query, *, history=1, retained=None,
     """
     root = Path(root)
     started = int(time.time()*1000) if started is None else started
-    if history not in (1,2):
+    if history not in (1,2,3):
         raise ValueError('closed historical attempt required')
-    old = root/('execution-harness/demo-execution.json' if history == 1
-                else 'successor-execution-harness/demo-execution.json')
+    old = root/{1:'execution-harness/demo-execution.json',
+                2:'successor-execution-harness/demo-execution.json',
+                3:'diagnostic-execution-harness/demo-execution.json'}[history]
     package_raw = frozen_file(old, predecessor['executionHash'])
     package = strict_json(package_raw)
-    if (package.get('version') != history or package.get('kind') != ('supervised-demo-v1' if history == 1 else 'supervised-demo-v2')
+    if (package.get('version') != history or package.get('kind') != 'supervised-demo-v'+str(history)
             or package.get('binding', {}).get('runId') != run_id
             or package['binding'].get('nodeId') != 'implement'
             or package['binding'].get('attempt') != history):
         raise ValueError('original first execution differs')
-    control = root/('control' if history == 1 else 'control-attempt-2')
+    control = root/{1:'control',2:'control-attempt-2',3:'control-attempt-3'}[history]
     claim_raw = frozen_file(control/'model.claim.json', predecessor['claimHash'], 4096)
     claim = strict_json(claim_raw)
     if (set(claim) != {'version','phase','bindingHash','reviewId','reviewHead','reviewer','state'}
@@ -94,6 +95,20 @@ def observe_files(root, predecessor, run_id, query, *, history=1, retained=None,
                 or any(worker[key] is not None for key in
                        ['artifactBase64','artifactHash','bindingHash','manifestHash','sourceTree'])):
             raise ValueError('closed unknown-statistics second attempt required')
+    if history == 3:
+        from teetime_auth_artifact_protocol import empty_worker_result
+        from teetime_artifact_contract import canonical
+        elapsed = worker.get('elapsedMs')
+        if type(elapsed) is not int or not 1 <= elapsed <= 630000:
+            raise ValueError('bounded retained third attempt elapsed time required')
+        expected = empty_worker_result(demo=True)
+        expected.update(modelInvocations=1,authUnchanged=True,workspaceUnchanged=True,
+            workspaceDiagnostic={'category':'unchanged','entryCount':2,'maskEntryCount':0},
+            preflightPassed=True,preflightChecks=6,taskStarted=True,oomKillDelta=0,
+            taskDiagnosticsPresent=True,providerIteratorClosed=True,elapsedMs=elapsed,failureCategory='rejected',
+            taskFailureDiagnostic={'stage':'stream','exceptionCategory':'model_access_hint','lastEvent':'none'})
+        if canonical(worker) != canonical(expected):
+            raise ValueError('closed retained third failure semantics required')
     receipt = root.parent/owner
     manifest_raw = frozen_file(receipt/'manifest.json', predecessor['manifestHash'], 4096)
     manifest = strict_json(manifest_raw)
@@ -141,9 +156,17 @@ def observe_files(root, predecessor, run_id, query, *, history=1, retained=None,
 
 
 def observe_two_histories(root, predecessors, run_id, query, execution):
+    return _observe_histories(root, predecessors, run_id, query, execution, count=2)
+
+
+def observe_three_histories(root, predecessors, run_id, query, execution):
+    return _observe_histories(root, predecessors, run_id, query, execution, count=3)
+
+
+def _observe_histories(root, predecessors, run_id, query, execution, *, count):
     from teetime_demo_execution import parse_demo_execution
-    if len(predecessors) != 2 or execution.binding['attempt'] != 3:
-        raise ValueError('two ordered histories required')
+    if count not in (2,3) or len(predecessors) != count or execution.binding['attempt'] != count+1:
+        raise ValueError('closed ordered histories required')
     started = int(time.time()*1000)
     retained = []
     results = [observe_files(root, prior, run_id, query, history=index+1,
@@ -153,6 +176,8 @@ def observe_two_histories(root, predecessors, run_id, query, execution):
                 for index, prior in enumerate(predecessors)]
     if dict(packages[1].predecessor) != dict(predecessors[0]):
         raise ValueError('retained predecessor chain differs')
+    if count == 3 and [dict(item) for item in packages[2].predecessors] != [dict(item) for item in predecessors[:2]]:
+        raise ValueError('retained third package chain differs')
     for old in packages:
         if (old.prepared_binding_hash != execution.prepared_binding_hash
                 or old.prepared != execution.prepared
@@ -197,5 +222,7 @@ def observe_local(root, predecessor, run_id, *, execution=None):
             raise ValueError('actual Docker observation failed')
         return raw
     if execution is not None:
+        if execution.binding['attempt'] == 4:
+            return observe_three_histories(root, predecessor, run_id, query, execution)
         return observe_two_histories(root, predecessor, run_id, query, execution)
     return observe_files(root, predecessor, run_id, query)

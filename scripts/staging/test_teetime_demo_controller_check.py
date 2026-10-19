@@ -99,5 +99,17 @@ class ControllerCheckTests(unittest.TestCase):
             self.assertEqual(observed.call_args.args[1],self.execution.predecessors)
             self.assertEqual(observed.call_args.kwargs['execution'],self.execution)
 
+    def test_fourth_metadata_routes_exact_three_histories_to_combined_observer(self):
+        fixture=execution_tests.DemoExecutionTests();fixture.setUp();fixture.fourth_package()
+        self.raw=canonical(fixture.value).encode();self.execution=fixture.parse()
+        metadata=self.invoke('metadata')
+        self.assertEqual(metadata['binding']['attempt'],4)
+        self.assertIsNone(metadata['predecessor'])
+        self.assertEqual(metadata['predecessors'],fixture.value['predecessors'])
+        with patch('teetime_successor_observation.observe_local',return_value={'fixture':True}) as observed:
+            self.assertEqual(self.invoke('predecessor'),{'fixture':True})
+            self.assertEqual(observed.call_args.args[1],self.execution.predecessors)
+            self.assertEqual(observed.call_args.kwargs['execution'],self.execution)
+
 
 if __name__ == '__main__': unittest.main()

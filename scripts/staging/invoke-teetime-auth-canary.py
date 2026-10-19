@@ -46,7 +46,10 @@ def deliver_observation(child, raw, timeout=15):
 
 def supervised_command(execution, args, nonce):
     command = r'''$ErrorActionPreference='Stop'; & "$env:USERPROFILE\.bun\bin\bun.exe" --no-env-file "$env:USERPROFILE\teetime-supervised-01\execution-harness\scripts\staging\teetime-supervised-controller.ts" --claim-model --input-sha256 '''+"'"+args.input_sha256+"' --execution-sha256 '"+args.demo_package_hash+"' --source-manifest-sha256 '"+args.source_manifest_sha256+"' --source-sha '"+args.artifact_source+"' --review-head '"+args.plan_head+"' --nonce '"+nonce+"'"
-    if execution.predecessors:
+    if execution.binding['attempt'] == 4:
+        command = command.replace('\\execution-harness\\', '\\transport-repair-execution-harness\\').replace(
+            ' --claim-model ', ' --claim-transport-repair ')
+    elif execution.predecessors:
         command = command.replace('\\execution-harness\\', '\\diagnostic-execution-harness\\').replace(
             ' --claim-model ', ' --claim-diagnostic-successor ')
     elif execution.predecessor is not None:

@@ -77,13 +77,14 @@ async function verifySource(
 export async function prepare(): Promise<Record<string, unknown>> {
   // No database consumer has been imported above this boundary.
   assertPrepareEnvironment(ROOT, join(homedir(), 'teetime-supervised-01'), process.env);
+  const fourth = process.argv[2] === '--claim-transport-repair';
   const third = process.argv[2] === '--claim-diagnostic-successor';
   const successor = process.argv[2] === '--claim-successor';
-  const claim = third || successor || process.argv[2] === '--claim-model';
+  const claim = fourth || third || successor || process.argv[2] === '--claim-model';
   if (
     process.platform !== 'win32' ||
     Bun.version !== '1.3.13' ||
-    SOURCE !== join(ROOT, third ? 'diagnostic-execution-harness' : successor ? 'successor-execution-harness' : claim ? 'execution-harness' : 'harness') ||
+    SOURCE !== join(ROOT, fourth ? 'transport-repair-execution-harness' : third ? 'diagnostic-execution-harness' : successor ? 'successor-execution-harness' : claim ? 'execution-harness' : 'harness') ||
     process.argv.length !== (claim ? 15 : 5) ||
     (!claim && process.argv[2] !== '--prepare') ||
     process.argv[3] !== '--input-sha256' ||
@@ -125,7 +126,7 @@ export async function prepare(): Promise<Record<string, unknown>> {
       SOURCE,
       process.argv[8]!,
       process.argv[10]!,
-      third ? 'diagnostic-execution-source-manifest.json' : successor ? 'successor-execution-source-manifest.json' : 'execution-source-manifest.json'
+      fourth ? 'transport-repair-execution-source-manifest.json' : third ? 'diagnostic-execution-source-manifest.json' : successor ? 'successor-execution-source-manifest.json' : 'execution-source-manifest.json'
     );
     for (const name of [
       'packages/workflows/src/executor.ts',
@@ -177,8 +178,8 @@ export async function prepare(): Promise<Record<string, unknown>> {
   // A fresh preparation must never attach to an existing database.
   if (!claim) await assertFreshSqliteLocation(archon);
   const originalControl = join(ROOT, 'control');
-  const control = third ? join(ROOT, 'control-attempt-3') : successor ? join(ROOT, 'control-attempt-2') : originalControl;
-  if (third || successor) {
+  const control = fourth ? join(ROOT, 'control-attempt-4') : third ? join(ROOT, 'control-attempt-3') : successor ? join(ROOT, 'control-attempt-2') : originalControl;
+  if (fourth || third || successor) {
     await ordinaryDirectory(originalControl);
     await mkdir(control); // Deterministic exclusive successor location. Never recover/reuse.
   } else if (claim) await ordinaryDirectory(control);
@@ -335,9 +336,9 @@ export async function prepare(): Promise<Record<string, unknown>> {
         }
       }
       const execution = await check('metadata');
-      if (execution.binding.attempt !== (third ? 3 : successor ? 2 : 1) ||
+      if (execution.binding.attempt !== (fourth ? 4 : third ? 3 : successor ? 2 : 1) ||
           (successor ? execution.predecessor === null : execution.predecessor !== null) ||
-          !Array.isArray(execution.predecessors) || execution.predecessors.length !== (third ? 2 : 0))
+          !Array.isArray(execution.predecessors) || execution.predecessors.length !== (fourth ? 3 : third ? 2 : 0))
         throw new Error('execution package differs from closed entry mode');
       if (execution.source !== process.argv[10] || execution.packageHash !== executionHash)
         throw new Error('actual execution source differs');
@@ -359,6 +360,26 @@ export async function prepare(): Promise<Record<string, unknown>> {
       };
       const observation = () => readPlanObservation(observationRaw, expected, Date.now());
       let reconciliation: Record<string, unknown> | undefined;
+      const chainSuccessor = third || fourth ? {
+        predecessors: execution.predecessors,
+        observe: async () => {
+          await bootstrap.readSupervisedBinding(api, preparation);
+          const actual = await check('predecessor');
+          if (Object.keys(actual).sort().join(',') !==
+              'expiresAt,observedAt,predecessors,resourcesAbsent' ||
+              !Array.isArray(actual.predecessors) || actual.predecessors.length !== (fourth ? 3 : 2) ||
+              actual.predecessors.some((item: Record<string, unknown>, index: number) =>
+                !item || Object.keys(item).sort().join(',') !== 'lockHash,manifestHash' ||
+                item.lockHash !== execution.predecessors[index].lockHash ||
+                item.manifestHash !== execution.predecessors[index].manifestHash))
+            throw new Error('actual historical chain reconciliation differs');
+          const value = {predecessors: execution.predecessors.map((item: Record<string, unknown>) => ({...item})),
+            runId: initial.runId, runPaused: true as const, resourcesAbsent: actual.resourcesAbsent,
+            observedAt: actual.observedAt, expiresAt: actual.expiresAt};
+          reconciliation = structuredClone(value);
+          return value;
+        },
+      } : undefined;
       const attempt = await claimSupervisedModelAttempt({
         controller: ownership,
         executionHash: expected.executionHash,
@@ -381,26 +402,8 @@ export async function prepare(): Promise<Record<string, unknown>> {
           if (JSON.stringify(await check('metadata')) !== JSON.stringify(execution))
             throw new Error('execution context changed');
         },
-        ...(third ? { diagnosticSuccessor: {
-          predecessors: execution.predecessors,
-          observe: async () => {
-            await bootstrap.readSupervisedBinding(api, preparation);
-            const actual = await check('predecessor');
-            if (Object.keys(actual).sort().join(',') !==
-                'expiresAt,observedAt,predecessors,resourcesAbsent' ||
-                !Array.isArray(actual.predecessors) || actual.predecessors.length !== 2 ||
-                actual.predecessors.some((item: Record<string, unknown>, index: number) =>
-                  !item || Object.keys(item).sort().join(',') !== 'lockHash,manifestHash' ||
-                  item.lockHash !== execution.predecessors[index].lockHash ||
-                  item.manifestHash !== execution.predecessors[index].manifestHash))
-              throw new Error('actual historical chain reconciliation differs');
-            const value = {predecessors: execution.predecessors.map((item: Record<string, unknown>) => ({...item})),
-              runId: initial.runId, runPaused: true as const, resourcesAbsent: actual.resourcesAbsent,
-              observedAt: actual.observedAt, expiresAt: actual.expiresAt};
-            reconciliation = structuredClone(value);
-            return value;
-          },
-        }} : {}),
+        ...(fourth ? {transportRepairSuccessor: chainSuccessor} : {}),
+        ...(third ? {diagnosticSuccessor: chainSuccessor} : {}),
         ...(successor ? { successor: {
           predecessor: execution.predecessor,
           observe: async () => {
@@ -434,7 +437,7 @@ export async function prepare(): Promise<Record<string, unknown>> {
       } finally {
         await evidence.close();
       }
-      if (third || successor) {
+      if (fourth || third || successor) {
         if (!reconciliation) throw new Error('successor reconciliation evidence missing');
         const evidence = await open(join(control, 'predecessor-reconciliation.json'), 'wx', 0o600);
         try {
@@ -517,13 +520,13 @@ export async function prepare(): Promise<Record<string, unknown>> {
         throw new Error('attempt completion persistence failed');
       const persisted = await api.store.listProviderAttempts(initial.runId, 'implement');
       const completed = persisted.find(row => row.attemptId === attempt.attemptId);
-      const history = third ? execution.predecessors : successor ? [execution.predecessor] : [];
+      const history = fourth || third ? execution.predecessors : successor ? [execution.predecessor] : [];
       const historyChanged = history.some((prior: {attemptId: string;rowHash: string}) => {
         const row = persisted.find(item => item.attemptId === prior.attemptId);
         return !row || supervisedAttemptHash(row) !== prior.rowHash;
       });
       if (
-        persisted.length !== (third ? 3 : successor ? 2 : 1) || !completed ||
+        persisted.length !== (fourth ? 4 : third ? 3 : successor ? 2 : 1) || !completed ||
         supervisedAttemptHash(completed) !== supervisedAttemptHash(expectedCompleted) ||
         historyChanged
       )
@@ -571,13 +574,13 @@ if (import.meta.main) {
     process.stdout.write(
       JSON.stringify({
         kind:
-          ['--claim-model', '--claim-successor', '--claim-diagnostic-successor'].includes(process.argv[2]!)
+          ['--claim-model', '--claim-successor', '--claim-diagnostic-successor', '--claim-transport-repair'].includes(process.argv[2]!)
             ? 'tee-time-supervised-model'
             : 'tee-time-supervised-prepare',
         passed: false,
         failureCategory: 'entry-rejected',
-        accountProvided: ['--claim-model', '--claim-successor', '--claim-diagnostic-successor'].includes(process.argv[2]!) ? null : false,
-        modelInvocations: ['--claim-model', '--claim-successor', '--claim-diagnostic-successor'].includes(process.argv[2]!) ? null : 0,
+        accountProvided: ['--claim-model', '--claim-successor', '--claim-diagnostic-successor', '--claim-transport-repair'].includes(process.argv[2]!) ? null : false,
+        modelInvocations: ['--claim-model', '--claim-successor', '--claim-diagnostic-successor', '--claim-transport-repair'].includes(process.argv[2]!) ? null : 0,
         operationalLaneReady: false,
       }) + '\n'
     );

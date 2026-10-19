@@ -7,7 +7,7 @@ import subprocess
 import sys
 from unittest.mock import patch
 
-from teetime_successor_observation import observe_files, observe_two_histories
+from teetime_successor_observation import observe_files, observe_two_histories, observe_three_histories
 from teetime_bounded_process import capture
 
 
@@ -88,6 +88,108 @@ class SuccessorObservationTests(unittest.TestCase):
         from teetime_demo_execution import parse_demo_execution
         raw=canonical(self.third_value).encode()
         return parse_demo_execution(raw,hashlib.sha256(raw).hexdigest())
+
+    def prepare_fourth(self):
+        import copy
+        from teetime_auth_artifact_protocol import empty_worker_result
+        self.prepare_third()
+        self.prior={'owner':'teetime-auth-558227ab727a'}
+        self.write('execution',self.root/'diagnostic-execution-harness/demo-execution.json',self.third_value)
+        for key,name in [('claim','model.claim.json'),('lock','controller.lock')]:
+            value=json.loads((self.root/'control-attempt-2'/name).read_bytes())
+            value['bindingHash']=self.prior['executionHash']
+            self.write(key,self.root/'control-attempt-3'/name,value)
+        worker=empty_worker_result(demo=True)
+        worker.update(modelInvocations=1,authUnchanged=True,workspaceUnchanged=True,
+            workspaceDiagnostic={'category':'unchanged','entryCount':2,'maskEntryCount':0},
+            preflightPassed=True,preflightChecks=6,taskStarted=True,oomKillDelta=0,
+            taskDiagnosticsPresent=True,providerIteratorClosed=True,elapsedMs=5418,failureCategory='rejected',
+            taskFailureDiagnostic={'stage':'stream','exceptionCategory':'model_access_hint','lastEvent':'none'})
+        self.write('result',self.root/'control-attempt-3/model-result.json',
+            {'type':'RESULT','task':'supervised-demo','owner':self.prior['owner'],
+             'artifactContractHash':self.prior['executionHash'][7:],'cleanupErrors':[],
+             'result':{'passed':False,'cleanupVerified':True,'proxyMetricsVerified':True,'artifactResult':worker}})
+        self.write('manifest',self.root.parent/self.prior['owner']/'manifest.json',
+            {'owner':self.prior['owner'],'deadline':1,'containers':['3'*64,'4'*64],'networks':['5'*64,'6'*64]})
+        third={**self.prior,'attemptId':'65380465-a8b3-462f-a114-11f941be8bf3',
+            'completedAt':'2026-10-19T04:36:57.507Z','rowHash':'sha256:'+'3'*64}
+        self.third_value=copy.deepcopy(self.third_value)
+        self.third_value.update(version=4,kind='supervised-demo-v4')
+        self.third_value['binding']['attempt']=4
+        self.third_value['predecessors'].append(third)
+        return self.parse_third()
+
+    def test_three_histories_reconcile_all_fifteen_files_and_share_budget(self):
+        execution=self.prepare_fourth();calls=[]
+        value=observe_three_histories(self.root,execution.predecessors,'actual-run',lambda cmd:calls.append(cmd) or b'',execution)
+        self.assertEqual(len(calls),12);self.assertEqual(len(value['predecessors']),3)
+        self.assertTrue(value['resourcesAbsent'])
+        with patch('teetime_successor_observation.time.time',side_effect=[100,101,102,121]):
+            with self.assertRaises(ValueError):
+                observe_three_histories(self.root,execution.predecessors,'actual-run',lambda cmd:b'',execution)
+
+    def test_third_retained_failure_semantics_cannot_be_reinterpreted(self):
+        self.prepare_fourth();path=self.paths['result'];original=path.read_bytes()
+        for key,changed in [('modelInvocations',None),('taskDiagnosticsPresent',False),
+                ('providerIteratorClosed',False),('normalProviderEnd',True),('authUnchanged',False),
+                ('workspaceUnchanged',False),('assistantCount',1),('thinkingCount',1),
+                ('artifactBase64','private-source'),('taskFailureDiagnostic',None),('failureCategory','not_started')]:
+            value=json.loads(original);value['result']['artifactResult'][key]=changed
+            self.write('result',path,value)
+            self.third_value['predecessors'][2]['resultHash']=self.prior['resultHash']
+            execution=self.parse_third()
+            with self.subTest(key=key),self.assertRaises(ValueError):
+                observe_three_histories(self.root,execution.predecessors,'actual-run',lambda cmd:b'',execution)
+
+    def test_three_histories_recheck_all_files_after_last_resource_query(self):
+        execution=self.prepare_fourth()
+        paths=[]
+        for folder,control,prior in zip(['execution-harness','successor-execution-harness','diagnostic-execution-harness'],
+                                      ['control','control-attempt-2','control-attempt-3'],execution.predecessors):
+            paths.extend([self.root/folder/'demo-execution.json',self.root/control/'model.claim.json',
+                self.root/control/'controller.lock',self.root/control/'model-result.json',
+                self.root.parent/prior['owner']/'manifest.json'])
+        for path in paths:
+            original=path.read_bytes();calls=0
+            def query(command):
+                nonlocal calls
+                calls+=1
+                if calls==12:path.write_bytes(original+b' ')
+                return b''
+            try:
+                with self.subTest(path=path.name),self.assertRaises(ValueError):
+                    observe_three_histories(self.root,execution.predecessors,'actual-run',query,execution)
+            finally:path.write_bytes(original)
+
+    def test_third_exact_resources_and_additional_owner_resources_are_checked(self):
+        execution=self.prepare_fourth()
+        for resource in ['3'*64,'5'*64]:
+            def query(command):return b'' if '--filter' in command else (resource+'\n').encode()
+            with self.subTest(resource=resource),self.assertRaises(ValueError):
+                observe_three_histories(self.root,execution.predecessors,'actual-run',query,execution)
+        def owned(command):
+            return ('9'*64+'\n').encode() if '--filter' in command and command[-1].endswith(self.prior['owner']) else b''
+        with self.assertRaises(ValueError):
+            observe_three_histories(self.root,execution.predecessors,'actual-run',owned,execution)
+
+    def test_retained_third_package_chain_and_authority_must_match(self):
+        self.prepare_fourth()
+        original={key:path.read_bytes() for key,path in self.paths.items()}
+        for kind in ['pair','authority','prepared']:
+            package=json.loads(original['execution'])
+            if kind=='pair':package['predecessors'][0]['resultHash']='sha256:'+'9'*64
+            elif kind=='authority':package['binding']['authorityHash']='sha256:'+'9'*64
+            else:package['preparedBindingHash']='sha256:'+'9'*64
+            self.write('execution',self.paths['execution'],package)
+            for key in ['claim','lock','result']:
+                value=json.loads(original[key])
+                if key=='result':value['artifactContractHash']=self.prior['executionHash'][7:]
+                else:value['bindingHash']=self.prior['executionHash']
+                self.write(key,self.paths[key],value)
+            self.third_value['predecessors'][2].update(self.prior)
+            execution=self.parse_third()
+            with self.subTest(kind=kind),self.assertRaises(ValueError):
+                observe_three_histories(self.root,execution.predecessors,'actual-run',lambda cmd:b'',execution)
 
     def test_combined_histories_preserve_unknown_statistics_and_share_budget(self):
         execution=self.prepare_third();calls=[]

@@ -67,14 +67,15 @@ def parse_demo_execution(raw, expected_hash):
             'assetHashes', 'prompt', 'promptHash', 'limits'}
     successor = type(value) is dict and value.get('version') == 2
     diagnostic_successor = type(value) is dict and value.get('version') == 3
+    transport_repair = type(value) is dict and value.get('version') == 4
     if successor:
         keys.add('predecessor')
-    if diagnostic_successor:
+    if diagnostic_successor or transport_repair:
         keys.add('predecessors')
     if type(value) is not dict or set(value) != keys or canonical(value).encode('ascii') != raw:
         raise ValueError('closed canonical demo execution package required')
-    if (type(value['version']) is not int or value['version'] not in (1, 2, 3)
-            or value['kind'] != ('supervised-demo-v3' if diagnostic_successor else 'supervised-demo-v2' if successor else 'supervised-demo-v1')):
+    if (type(value['version']) is not int or value['version'] not in (1, 2, 3, 4)
+            or value['kind'] != ('supervised-demo-v4' if transport_repair else 'supervised-demo-v3' if diagnostic_successor else 'supervised-demo-v2' if successor else 'supervised-demo-v1')):
         raise ValueError('demo package version rejected')
     for key, pattern in [('preparedBindingHash', 'sha256:[a-f0-9]{64}'),
                          ('image', 'sha256:[a-f0-9]{64}'), ('source', '[a-f0-9]{40}'),
@@ -86,18 +87,20 @@ def parse_demo_execution(raw, expected_hash):
         raise ValueError('demo execution limits differ')
     binding = value['binding']
     validate_binding(binding)
-    if binding['nodeId'] != 'implement' or binding['attempt'] != (3 if diagnostic_successor else 2 if successor else 1):
+    if binding['nodeId'] != 'implement' or binding['attempt'] != (4 if transport_repair else 3 if diagnostic_successor else 2 if successor else 1):
         raise ValueError('closed supervised implementation attempt required')
     predecessor = predecessor_identity(value['predecessor']) if successor else None
     predecessors = ()
-    if diagnostic_successor:
+    if diagnostic_successor or transport_repair:
         entries = value['predecessors']
-        if type(entries) is not list or len(entries) != 2:
-            raise ValueError('exactly two ordered predecessors required')
+        count = 3 if transport_repair else 2
+        if type(entries) is not list or len(entries) != count:
+            raise ValueError('exact ordered predecessor count required')
         predecessors = tuple(predecessor_identity(entry) for entry in entries)
-        if (len({entry['attemptId'] for entry in predecessors}) != 2
-                or len({entry['owner'] for entry in predecessors}) != 2
-                or predecessors[0]['completedAt'] >= predecessors[1]['completedAt']):
+        if (len({entry['attemptId'] for entry in predecessors}) != count
+                or len({entry['owner'] for entry in predecessors}) != count
+                or any(left['completedAt'] >= right['completedAt'] for left,right in
+                       zip(predecessors,predecessors[1:]))):
             raise ValueError('distinct chronological predecessors required')
     frame = value['preparedFrame']
     if type(frame) is not dict or set(frame) != {'version', 'manifestHash', 'sourceTree', 'files'}:

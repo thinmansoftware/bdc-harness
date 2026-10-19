@@ -120,40 +120,41 @@ function reconcileSuccessor(
   return identity;
 }
 
-function chainIdentity(entries: readonly SupervisedPredecessor[]): string {
-  if (!Array.isArray(entries) || entries.length !== 2)
-    throw new Error('closed two-predecessor chain required');
+function chainIdentity(entries: readonly SupervisedPredecessor[], count: 2 | 3 = 2): string {
+  if (!Array.isArray(entries) || entries.length !== count)
+    throw new Error('closed predecessor count required');
   const identities = entries.map(predecessorIdentity);
-  if (entries[0].attemptId === entries[1].attemptId || entries[0].owner === entries[1].owner ||
-      entries[0].completedAt >= entries[1].completedAt)
+  if (new Set(entries.map(item => item.attemptId)).size !== count ||
+      new Set(entries.map(item => item.owner)).size !== count ||
+      entries.slice(1).some((item,index) => entries[index].completedAt >= item.completedAt))
     throw new Error('distinct chronological predecessor chain required');
   return JSON.stringify(identities);
 }
 
 function reconcileThird(expected: readonly SupervisedPredecessor[], observed: SupervisedChainReconciliation,
-  rows: readonly ProviderAttemptRecord[], runId: string): string {
-  const identity = chainIdentity(expected);
+  rows: readonly ProviderAttemptRecord[], runId: string, count: 2 | 3 = 2): string {
+  const identity = chainIdentity(expected, count);
   const now = Date.now();
   if (!observed || Object.keys(observed).sort().join(',') !==
       'expiresAt,observedAt,predecessors,resourcesAbsent,runId,runPaused' ||
-      chainIdentity(observed.predecessors) !== identity || observed.runId !== runId ||
+      chainIdentity(observed.predecessors, count) !== identity || observed.runId !== runId ||
       observed.runPaused !== true || observed.resourcesAbsent !== true ||
       !Number.isSafeInteger(observed.observedAt) || !Number.isSafeInteger(observed.expiresAt) ||
       observed.observedAt > now + 5000 || observed.observedAt < now - 30000 ||
       observed.expiresAt <= now || observed.expiresAt <= observed.observedAt ||
-      observed.expiresAt > observed.observedAt + 30000 || rows.length !== 2)
-    throw new Error('fresh two-predecessor reconciliation required');
-  for (let index = 0; index < 2; index++) {
+      observed.expiresAt > observed.observedAt + 30000 || rows.length !== count)
+    throw new Error('fresh predecessor chain reconciliation required');
+  for (let index = 0; index < count; index++) {
     const prior = expected[index];
     const row = rows.find(item => item.attemptNumber === index + 1);
     if (!row || row.attemptId !== prior.attemptId || row.runId !== runId || row.nodeId !== 'implement' ||
         row.completedAt !== prior.completedAt || row.outcomeClass !== 'quality' ||
         row.reasonCode !== 'required_stage_failed' || row.resumeAt !== null ||
-        row.supersedesAttemptId !== (index === 0 ? null : expected[0].attemptId) ||
+        row.supersedesAttemptId !== (index === 0 ? null : expected[index-1].attemptId) ||
         row.provider !== TEE_TIME_SUPERVISED_POLICY.provider || row.model !== TEE_TIME_SUPERVISED_POLICY.model ||
         row.declaredProvider !== TEE_TIME_SUPERVISED_POLICY.provider ||
         row.declaredModel !== TEE_TIME_SUPERVISED_POLICY.model || supervisedAttemptHash(row) !== prior.rowHash)
-      throw new Error('two terminal predecessor rows differ');
+      throw new Error('terminal predecessor rows differ');
   }
   return identity;
 }
@@ -167,6 +168,10 @@ export async function claimSupervisedModelAttempt(input: {
   readReview: () => Promise<SupervisedPlanReview>;
   recheckExecution: () => Promise<void>;
   store: Pick<IWorkflowStore, 'listProviderAttempts' | 'createProviderAttempt'>;
+  transportRepairSuccessor?: {
+    predecessors: readonly SupervisedPredecessor[];
+    observe: () => Promise<SupervisedChainReconciliation>;
+  };
   diagnosticSuccessor?: {
     predecessors: readonly SupervisedPredecessor[];
     observe: () => Promise<SupervisedChainReconciliation>;
@@ -188,7 +193,12 @@ export async function claimSupervisedModelAttempt(input: {
     observe: input.diagnosticSuccessor.observe,
   } : undefined;
   if (third) chainIdentity(third.predecessors);
-  if (third && successor) throw new Error('mixed successor modes rejected');
+  const fourth = input.transportRepairSuccessor ? {
+    predecessors: Object.freeze(input.transportRepairSuccessor.predecessors.map(item => Object.freeze({ ...item }))),
+    observe: input.transportRepairSuccessor.observe,
+  } : undefined;
+  if (fourth) chainIdentity(fourth.predecessors, 3);
+  if ([successor, third, fourth].filter(Boolean).length > 1) throw new Error('mixed successor modes rejected');
   if (
     !/^sha256:[a-f0-9]{64}$/.test(input.executionHash) ||
     !/^sha256:[a-f0-9]{64}$/.test(input.preparedBindingHash) ||
@@ -248,12 +258,14 @@ export async function claimSupervisedModelAttempt(input: {
     throw new Error('independent exact-head approval missing or superseded');
   const approvalId = approval.id;
   const previous = structuredClone(await store.listProviderAttempts(runId, 'implement'));
+  const fourthSnapshot = fourth
+    ? reconcileThird(fourth.predecessors, structuredClone(await fourth.observe()), previous, runId, 3) : null;
   const thirdSnapshot = third
     ? reconcileThird(third.predecessors, structuredClone(await third.observe()), previous, runId) : null;
   const predecessorSnapshot = successor
     ? reconcileSuccessor(successor.predecessor, structuredClone(await successor.observe()), previous, runId)
     : null;
-  if (!successor && !third && previous.length !== 0)
+  if (!successor && !third && !fourth && previous.length !== 0)
     throw new Error('supervised implementation attempt already exists');
   await input.recheckExecution();
   const finalPrepared = await input.readPrepared();
@@ -275,6 +287,12 @@ export async function claimSupervisedModelAttempt(input: {
     if (reconcileThird(third.predecessors, observed, rows, runId) !== thirdSnapshot)
       throw new Error('predecessor chain changed before claim');
   }
+  if (fourth) {
+    const observed = structuredClone(await fourth.observe());
+    const rows = structuredClone(await store.listProviderAttempts(runId, 'implement'));
+    if (reconcileThird(fourth.predecessors, observed, rows, runId, 3) !== fourthSnapshot)
+      throw new Error('transport repair history changed before claim');
+  }
   await claimSupervisedPhase(controller, 'model', {
     bindingHash: input.executionHash,
     reviewId: approvalId,
@@ -286,7 +304,7 @@ export async function claimSupervisedModelAttempt(input: {
     attemptId: randomUUID(),
     runId,
     nodeId: 'implement',
-    attemptNumber: third ? 3 : successor ? 2 : 1,
+    attemptNumber: fourth ? 4 : third ? 3 : successor ? 2 : 1,
     provider: TEE_TIME_SUPERVISED_POLICY.provider,
     model: TEE_TIME_SUPERVISED_POLICY.model,
     declaredProvider: TEE_TIME_SUPERVISED_POLICY.provider,
@@ -298,14 +316,18 @@ export async function claimSupervisedModelAttempt(input: {
     outcomeClass: null,
     reasonCode: null,
     resumeAt: null,
-    supersedesAttemptId: third ? third.predecessors[1].attemptId : successor ? successor.predecessor.attemptId : null,
+    supersedesAttemptId: fourth ? fourth.predecessors[2].attemptId : third ? third.predecessors[1].attemptId : successor ? successor.predecessor.attemptId : null,
   });
   if (!(await store.createProviderAttempt(attempt)))
     throw new Error('provider attempt persistence failed; phase remains consumed');
   const persisted = await store.listProviderAttempts(runId, 'implement');
   const inserted = persisted.find(row => row.attemptId === attempt.attemptId);
   if (
-    persisted.length !== (third ? 3 : successor ? 2 : 1) || !inserted ||
+    persisted.length !== (fourth ? 4 : third ? 3 : successor ? 2 : 1) || !inserted ||
+    (fourth && fourth.predecessors.some(prior => {
+      const row = persisted.find(item => item.attemptId === prior.attemptId);
+      return !row || supervisedAttemptHash(row) !== prior.rowHash;
+    })) ||
     (third && third.predecessors.some(prior => {
       const row = persisted.find(item => item.attemptId === prior.attemptId);
       return !row || supervisedAttemptHash(row) !== prior.rowHash;

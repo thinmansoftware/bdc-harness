@@ -1,5 +1,38 @@
 # Tee-time supervised bootstrap source preparation
 
+## Closed transport-repair successor source
+
+Version4 is only implementation attempt4, with exactly three ordered immutable
+predecessor identities. Existing versions1-3 remain unchanged; version5 is not
+supported. V2's single predecessor must equal history1; V3's entire ordered pair
+must equal histories1-2. All historical preparation/authority/base bindings must
+equal the new package. The third retained failure remains stream/model_access_hint,
+with no source, unchanged auth/workspace and verified cleanup. History2 retains
+its old absent-diagnostic schema and unknown invocation count.
+
+The source-owned observer checks all15 retained files and twelve resource
+queries under the existing shared20-second/30-second-freshness bounds. The claim
+requires exactly three terminal rows and their full16-field hashes twice, then
+reads back four rows and all historical hashes before READY and after completion.
+Predecessor descriptors are snapshotted before operational callbacks.
+
+The only new controller flag is --claim-transport-repair. Its source directory is
+transport-repair-execution-harness, inventory
+transport-repair-execution-source-manifest.json, and exclusive control-attempt-4.
+The PC operator selects this fixed route only for a parsed v4 package. Invocation
+uses the existing `invoke-teetime-auth-canary.py --task supervised-demo` options:
+--image, --expected-sha, --artifact-source, --demo-package-hash, --plan-head,
+--input-sha256 and --source-manifest-sha256. Every value must come from the newly
+frozen reviewed carrier; never substitute or recover consumed input roots.
+
+This is source preparation only. The corrected transport passed separate
+credential-free synthetic compatibility, but neither that result nor this code
+authorizes installation, a new image/package, credentials or another attempt.
+Those require their own concrete scripts, measurements and independent reviews.
+If a corrected authenticated attempt again yields model_access_hint, preserve
+the result and stop full implementation attempts; investigate account/model
+provenance rather than adding attempt5. No automatic continuation or fallback.
+
 ## Closed diagnostic successor source
 
 Version 3 is only implementation attempt 3, with exactly two ordered immutable
