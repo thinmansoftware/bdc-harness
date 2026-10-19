@@ -15,12 +15,65 @@ CODES = {'provider_exception', 'chunk_limit', 'content_rejected', 'content_limit
 
 
 def validate_minimal_diagnostic(exit_code, raw):
+    return _validate(exit_code, raw, 1)
+
+
+def validate_minimal_diagnostic_v2(exit_code, raw):
+    """Explicit v2 syntax; never upgrades or changes historical v1 evidence."""
+    return _validate(exit_code, raw, 2)
+
+
+def _ordered(values, allowed, *, nonempty=True):
+    if (type(values) is not list or len(values) > len(allowed) or (nonempty and not values)
+            or any(type(item) is not type(allowed[0]) for item in values)
+            or values != [item for item in allowed if item in values]):
+        raise ValueError('closed canonical diagnostic array required')
+    if 'other' in values and values != ['other']:
+        raise ValueError('neutral classification cannot mix with observations')
+
+
+def _sdk_evidence(value):
+    keys = {'version', 'kind', 'exitCode', 'signal', 'stderrCategory', 'startupEvidence'}
+    if (type(value) is not dict or set(value) != keys or type(value['version']) is not int
+            or value['version'] != 1 or value['kind'] not in ['cli-exit', 'sdk-parse', 'aborted', 'other']):
+        raise ValueError('closed SDK evidence required')
+    code, signal, startup = value['exitCode'], value['signal'], value['startupEvidence']
+    if value['kind'] != 'cli-exit':
+        if code is not None or signal is not None or startup is not None or value['stderrCategory'] != 'other':
+            raise ValueError('non-exit SDK classification has exit evidence')
+        return
+    if (code is None) == (signal is None):
+        raise ValueError('exactly one SDK exit observation required')
+    if code is not None and (type(code) is not int or not 0 <= code <= 255):
+        raise ValueError('SDK exit code bound')
+    if signal is not None and signal not in ['SIGTERM', 'SIGKILL', 'SIGABRT', 'SIGSEGV', 'SIGINT', 'SIGPIPE', 'SIGBUS', 'SIGILL']:
+        raise ValueError('SDK signal allowlist')
+    if type(startup) is not dict or set(startup) != {'stderrBytes', 'classificationLimited', 'startupStages', 'causeCategories', 'osErrnos'}:
+        raise ValueError('closed startup evidence required')
+    size = startup['stderrBytes']
+    if (type(size) is not int or not 0 <= size <= 10**9
+            or type(startup['classificationLimited']) is not bool
+            or startup['classificationLimited'] != (size > 65536)):
+        raise ValueError('startup byte classification contradiction')
+    stages, causes, errnos = startup['startupStages'], startup['causeCategories'], startup['osErrnos']
+    _ordered(stages, ['config-overrides', 'codex-home', 'exec-policy', 'config-load', 'app-server-start', 'thread-start', 'model-catalog', 'other'])
+    _ordered(causes, ['model-catalog-json', 'auth-key-missing', 'os-error', 'other'])
+    _ordered(errnos, [2, 11, 13, 24, 28, 30], nonempty=False)
+    if ('os-error' in causes) != bool(errnos) or ('model-catalog' in stages and 'model-catalog-json' not in causes):
+        raise ValueError('startup cause classification contradiction')
+    if size == 0 and (stages != ['other'] or causes != ['other'] or errnos):
+        raise ValueError('startup observations without bytes')
+    category = stages[0] if len(stages) == 1 and stages[0] in ['config-overrides', 'codex-home', 'exec-policy', 'config-load', 'app-server-start'] else 'other'
+    if value['stderrCategory'] != category: raise ValueError('startup stage summary differs')
+
+
+def _validate(exit_code, raw, version):
     if (type(exit_code) is not int or exit_code not in (0, 1) or type(raw) is not bytes
             or not 1 <= len(raw) <= 4096 or not raw.isascii()):
         raise ValueError('bounded normal diagnostic result required')
     value = strict_json(raw)
     if (type(value) is not dict or set(value) != KEYS or type(value['version']) is not int
-            or value['version'] != 1 or value['kind'] != 'teetime-minimal-diagnostic'
+            or value['version'] != version or value['kind'] != 'teetime-minimal-diagnostic'
             or any(type(value[key]) is not bool for key in BOOLS)):
         raise ValueError('closed diagnostic schema required')
     bounds = {'modelInvocations': 1, 'assistantCount': 2, 'resultCount': 2,
@@ -40,7 +93,7 @@ def validate_minimal_diagnostic(exit_code, raw):
         return value
     failed = value['failure']
     if (exit_code != 1 or value['responseVerified'] or type(failed) is not dict
-            or set(failed) != {'code', 'exceptionCategory', 'provenance', 'cleanupFailure'}
+            or set(failed) != ({'code', 'exceptionCategory', 'provenance', 'cleanupFailure'} | ({'sdkEvidence'} if version == 2 else set()))
             or type(failed['cleanupFailure']) is not bool
             or type(failed['code']) is not str or failed['code'] not in CODES
             or type(failed['exceptionCategory']) is not str or failed['exceptionCategory'] not in HINTS):
@@ -50,6 +103,9 @@ def validate_minimal_diagnostic(exit_code, raw):
             or type(origin['version']) is not int or origin['version'] != 1
             or type(origin['origin']) is not str or origin['origin'] not in ORIGINS):
         raise ValueError('closed trusted origin syntax required')
+    if version == 2:
+        if origin['origin'] == 'sdk_iterator_exception': _sdk_evidence(failed['sdkEvidence'])
+        elif failed['sdkEvidence'] is not None: raise ValueError('SDK evidence without SDK provenance')
     code, hint = failed['code'], failed['exceptionCategory']
     if failed['cleanupFailure'] and value['normalProviderEnd']:
         raise ValueError('cleanup exception contradicts normal provider end')

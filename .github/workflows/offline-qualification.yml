@@ -70,6 +70,8 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_demo_case.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_demo_result.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_diagnostic.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_diagnostic_v2.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_v2_contract.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_worker.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_protocol.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_controller.py
@@ -111,6 +113,7 @@ jobs:
           bun test ./scripts/staging/teetime-fixed-artifact.test.ts
           bun test ./scripts/staging/teetime-demo-task.test.ts
           bun test ./scripts/staging/teetime-minimal-diagnostic.test.ts
+          bun test ./scripts/staging/teetime-minimal-diagnostic-v2.test.ts
           bun test ./scripts/staging/teetime-plan-observation.test.ts
           bun test ./scripts/staging/teetime-supervised-transport.test.ts
           bun test packages/workflows/src/reliability/tee-time-review-package.test.ts

@@ -105,6 +105,31 @@ path sets and silently reinterpret old packages. Until that work is qualified,
 no new diagnostic image or execution package may use this provider revision.
 Previously frozen installed sources remain unchanged.
 
+## Explicit v2 source API
+
+`collectMinimalDiagnosticV2` emits version2. Every failed v2 packet requires
+`sdkEvidence`: a private, immutable SDK classification for sdk_iterator_exception,
+or null for other origins. Success keeps failure:null. The shared selector is
+private and no installed worker/runtime entry selects the new API. The separate
+Python `validate_minimal_diagnostic_v2` rejects version1 rather than upgrading it;
+the existing v1 validator keeps its original schema.
+
+SDK evidence version1 has exactly kind, exitCode, signal, stderrCategory and
+startupEvidence in addition to version. cli-exit requires one numeric exit0..255
+or an allowlisted signal and non-null startup evidence. Other kinds require null
+exit/signal/startup and neutral category. Startup stages, causes and errno arrays
+are unique canonical-order enums; byte count/classificationLimited and stage
+summary are reconciled. Raw error strings and arbitrary destinations never enter
+the packet. These categories remain diagnostic classifications, not server facts.
+
+`teetime_minimal_v2_contract.py` defines separate measured image/all-path sets
+including the new SDK helper in both sets and the host-only verifier only in the
+all-path set. Its read-only verifier requires an external
+frozen manifest hash, exact v2 source identity, complete selected key set and each
+actual file hash. Substituting both a file and an untrusted manifest cannot replace
+the original frozen hash. Historical shared path sets are unchanged. This helper
+does not supply the future execution packet, image, admission or account authority.
+
 The final objective remains the simulated demo: accepted app source, functional
 booking-rule tests, build/typecheck, deterministic browser walkthrough, isolated
 preview and device verification. None is replaced by a passing diagnostic.

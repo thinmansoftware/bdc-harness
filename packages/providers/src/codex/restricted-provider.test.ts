@@ -3,7 +3,7 @@ import { createMockLogger } from '../test/mocks/logger';
 import type { SendQueryOptions } from '../types';
 import { restrictedClientOptions, restrictedThreadOptions } from './restricted-policy';
 import { readCodexFailureOrigin } from './provider';
-import { collectMinimalDiagnostic } from '../../../../scripts/staging/teetime-minimal-diagnostic';
+import { collectMinimalDiagnostic, collectMinimalDiagnosticV2 } from '../../../../scripts/staging/teetime-minimal-diagnostic';
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 
@@ -67,6 +67,27 @@ test('native turn.failed origin survives enriched model-access wording', async (
   expect(failed).toBeInstanceOf(Error);
   expect(readCodexFailureOrigin(failed)).toEqual({ version: 1, origin: 'native_turn_failed' });
   expect(JSON.stringify(readCodexFailureOrigin(failed))).not.toContain('PRIVATE-NATIVE');
+  expect(runStreamed).toHaveBeenCalledTimes(1);
+  expect(reactive).not.toHaveBeenCalled();
+});
+
+test('actual SDK exception boundary reaches v2 Python validation with closed metadata', async () => {
+  failures = ['Codex Exec exited with code 1: Error loading rules: PRIVATE-RULE (os error 13)'];
+  const provider = new CodexProvider({restricted: true, restrictedTransport: 'teetime-connect-v1'});
+  const packet = await collectMinimalDiagnosticV2((prompt, signal) =>
+    provider.sendQuery(prompt, '/workspace', undefined, {abortSignal: signal}), new AbortController(), () => {});
+  expect(packet.failure?.provenance.origin).toBe('sdk_iterator_exception');
+  expect(packet.failure?.sdkEvidence?.kind).toBe('cli-exit');
+  expect(packet.failure?.sdkEvidence?.startupEvidence?.startupStages).toEqual(['exec-policy']);
+  expect(JSON.stringify(packet)).not.toContain('PRIVATE');
+  const script = ['import sys,json', 'sys.path.insert(0,sys.argv[1])',
+    'from teetime_minimal_diagnostic import validate_minimal_diagnostic_v2',
+    'print(json.dumps(validate_minimal_diagnostic_v2(1,sys.stdin.buffer.read(4097))))'].join(';');
+  const parsed = spawnSync(process.platform === 'win32' ? 'python' : 'python3',
+    ['-I', '-B', '-c', script, resolve(import.meta.dir, '../../../../scripts/staging')],
+    {input: JSON.stringify(packet), encoding: 'utf8', timeout: 10000, maxBuffer: 8192});
+  expect(parsed.status).toBe(0);
+  expect(JSON.parse(parsed.stdout)).toEqual(packet);
   expect(runStreamed).toHaveBeenCalledTimes(1);
   expect(reactive).not.toHaveBeenCalled();
 });

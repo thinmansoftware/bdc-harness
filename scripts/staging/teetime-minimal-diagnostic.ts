@@ -1,6 +1,7 @@
 // Unregistered data collector only. No account, worker, CLI or artifact entry.
 import type { MessageChunk } from '../../packages/providers/src/types';
-import { readCodexFailureOrigin, type CodexFailureOriginRecord } from '../../packages/providers/src/codex/provider';
+import { readCodexFailureOrigin, readCodexSdkFailureEvidence, type CodexFailureOriginRecord } from '../../packages/providers/src/codex/provider';
+import type { SdkFailureEvidence } from '../../packages/providers/src/codex/sdk-failure-evidence';
 import { ArtifactProviderLifecycle } from './teetime-sdk-lifecycle';
 import { classifyCanaryException } from './teetime-canary-result';
 
@@ -31,6 +32,17 @@ export interface MinimalDiagnosticResult {
   aborted: boolean;
   failure: Readonly<Failure> | null;
 }
+interface FailureV2 extends Failure {
+  readonly sdkEvidence: Readonly<SdkFailureEvidence> | null;
+}
+export interface MinimalDiagnosticV2Result extends Omit<MinimalDiagnosticResult, 'version' | 'failure'> {
+  version: 2;
+  failure: Readonly<FailureV2> | null;
+}
+type InternalResult = Omit<MinimalDiagnosticResult, 'version' | 'failure'> & {
+  version: 1 | 2;
+  failure: Readonly<Failure | FailureV2> | null;
+};
 function hint(error: unknown, aborted: boolean): Hint {
   try { return classifyCanaryException(error, aborted) as Hint; }
   catch { return aborted ? 'aborted' : 'other'; }
@@ -52,28 +64,49 @@ function wellFormed(value: string): boolean {
 
 // The future caller must independently enforce its process deadline/reaping and
 // all authority/credential/workspace gates. This function grants none of them.
-export async function collectMinimalDiagnostic(
+export function collectMinimalDiagnostic(
   query: (prompt: string, signal: AbortSignal) => AsyncIterable<MessageChunk>,
   controller: AbortController,
   onClosed: () => void
 ): Promise<Readonly<MinimalDiagnosticResult>> {
-  const result: MinimalDiagnosticResult = {
-    version: 1, kind: 'teetime-minimal-diagnostic', passed: false, responseVerified: false,
+  return collect(1, query, controller, onClosed) as Promise<Readonly<MinimalDiagnosticResult>>;
+}
+
+// Source-only v2 API. No runtime entry or installed execution package selects it.
+export function collectMinimalDiagnosticV2(
+  query: (prompt: string, signal: AbortSignal) => AsyncIterable<MessageChunk>,
+  controller: AbortController,
+  onClosed: () => void
+): Promise<Readonly<MinimalDiagnosticV2Result>> {
+  return collect(2, query, controller, onClosed) as Promise<Readonly<MinimalDiagnosticV2Result>>;
+}
+
+async function collect(version: 1 | 2,
+  query: (prompt: string, signal: AbortSignal) => AsyncIterable<MessageChunk>,
+  controller: AbortController, onClosed: () => void): Promise<Readonly<InternalResult>> {
+  const result: InternalResult = {
+    version, kind: 'teetime-minimal-diagnostic', passed: false, responseVerified: false,
     modelInvocations: 0, assistantCount: 0, resultCount: 0, thinkingCount: 0,
     chunkCount: 0, normalProviderEnd: false, providerIteratorClosed: false,
     aborted: false, failure: null,
   };
-  let primary: Readonly<Failure> | undefined;
+  let primary: Readonly<Failure | FailureV2> | undefined;
+  function recordFailure(code: FailureCode, provenance = readCodexFailureOrigin(null),
+    category: Hint = 'none', error?: unknown): Readonly<Failure | FailureV2> {
+    const base = failure(code, provenance, category);
+    return version === 1 ? base : Object.freeze({...base,
+      sdkEvidence: provenance.origin === 'sdk_iterator_exception' ? readCodexSdkFailureEvidence(error) : null});
+  }
   let cleanupFailed = false, examinedBytes = 0, assistantText = '';
   function reject(code: FailureCode, provenance = readCodexFailureOrigin(null)): never {
-    primary ??= failure(code, provenance);
+    primary ??= recordFailure(code, provenance);
     throw new Error('minimal diagnostic rejected');
   }
   const lifecycle = new ArtifactProviderLifecycle(controller, () => {
     try { onClosed(); }
     catch {
       cleanupFailed = true;
-      primary ??= failure('cleanup_failed');
+      primary ??= recordFailure('cleanup_failed');
       throw new Error('minimal diagnostic cleanup failed');
     }
   });
@@ -86,8 +119,8 @@ export async function collectMinimalDiagnostic(
         // Snapshot before lifecycle cleanup can change the signal. Raw error
         // text stays in the existing hint classifier and never enters a packet.
         if (primary) cleanupFailed = true; // An exception while unwinding a known failure.
-        else primary = failure('provider_exception', readCodexFailureOrigin(error),
-          hint(error, controller.signal.aborted));
+        else primary = recordFailure('provider_exception', readCodexFailureOrigin(error),
+          hint(error, controller.signal.aborted), error);
         throw error;
       }
     }
@@ -122,7 +155,7 @@ export async function collectMinimalDiagnostic(
         if (chunk.type === 'assistant') assistantText = content;
       } catch (error) {
         // Latch interpretation failures before for-await closes the SDK iterator.
-        primary ??= failure('content_rejected');
+        primary ??= recordFailure('content_rejected');
         throw error;
       }
     }
@@ -134,7 +167,7 @@ export async function collectMinimalDiagnostic(
     result.passed = result.responseVerified = true;
   } catch {
     result.passed = result.responseVerified = false;
-    primary ??= failure('content_rejected');
+    primary ??= recordFailure('content_rejected');
   } finally {
     assistantText = '';
     lifecycle.abortIfActive();
