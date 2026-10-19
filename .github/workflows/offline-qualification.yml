@@ -67,6 +67,8 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_browser_seccomp.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_framework_qualification.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_demo_case.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_demo_result.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_demo_execution.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_snapshot_exporter.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_artifact_contract.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_materialization_frame.py
@@ -90,10 +92,12 @@ jobs:
           bun test ./scripts/staging/teetime-startup-protocol.test.ts
           bun test ./scripts/staging/teetime-startup-entry.test.ts
           bun test ./scripts/staging/teetime-fixed-artifact.test.ts
+          bun test ./scripts/staging/teetime-demo-task.test.ts
           bun test packages/workflows/src/reliability/tee-time-review-package.test.ts
           bun test packages/workflows/src/reliability/tee-time-controller-input.test.ts
           bun test ./packages/paths/src/tee-time-supervised-policy.test.ts
           bun test ./packages/workflows/src/reliability/tee-time-supervised-bootstrap.test.ts
+          bun test ./packages/workflows/src/reliability/tee-time-supervised-model-phase.test.ts
           bun test ./packages/workflows/src/reliability/tee-time-supervised-prepare.test.ts
           bun ./scripts/staging/qualify-teetime-supervised-sqlite.ts
           bun test ./scripts/staging/teetime-supervised-entry-guard.test.ts ./scripts/staging/teetime-supervised-controller.test.ts

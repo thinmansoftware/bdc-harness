@@ -355,3 +355,29 @@ until its deadline, and an early-exit child. All passed with process reaping and
 zero model invocations. Receipt demo-stdin-worker-qualification-final.json retains
 worker source hash fed874a67da698341d1927a74f9b322b6c4bcab80d74256383f247c7ac41b7bc.
 No authenticated demo run, app candidate or preview exists at this checkpoint.
+
+## Supervised model phase transition
+
+The source-only claimSupervisedModelAttempt helper now joins current independent
+exact-head review, the prepared binding, the existing exclusive model-phase claim,
+and creation/readback of the sole restricted provider attempt. It rechecks current
+state before claiming, snapshots observations before later awaits, rejects stale or
+superseded approvals using submission time, and retains the consumed claim after
+persistence failure. The attempt records codex-native-strict/text_generation and
+does not assert a served model. Fourteen focused transition/bootstrap tests pass,
+including shared-object mutation and wrong persisted-attempt readback regressions.
+Independent architect source review accepted the corrected helper for publication.
+
+These callbacks are not operational authority by themselves. The existing PC
+operator must fetch the real current PR/head, exact execution-package bytes and
+every review page before supplying the bounded observation over authenticated SSH.
+The laptop GitHub CLI is installed but its read-only user request returned401;
+GitHub credentials remain on the PC. The accepted narrow route uses no token copy
+or new approval service. The remote entry still verifies its actual prepared run,
+base/source/package, and persists the claim/attempt before any account delivery.
+Observation-to-claim must have a short fixed validity window and cannot be queued
+or automatically replayed. GitHub/SQLite are not an atomic transaction.
+
+The operational PC observation packet and remote entry join are still outstanding.
+No model-phase claim has been consumed by these source tests. New demo collector,
+execution/result and phase-transition tests are explicitly included in offline CI.
