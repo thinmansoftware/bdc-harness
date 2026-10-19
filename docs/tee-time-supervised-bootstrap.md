@@ -43,6 +43,10 @@ resource absence, then rereads all twenty files within one twenty-second window.
 It preserves the unrelated reviewer service. The source-owned query adapter must
 bound each Docker subprocess within the shared remaining monotonic deadline.
 This is read-only evidence gathering, not approval or an execution entry point.
+observe_minimal_local supplies the same fixed Windows Docker query adapter used
+by legacy observe_local. One monotonic twenty-second budget bounds all queries;
+each subprocess gets at most four seconds and the remaining budget. The eventual
+controller must additionally bound this whole observation process and its reap.
 
 `python -B -m unittest discover -s scripts/staging -p test_teetime_successor_observation.py`
 

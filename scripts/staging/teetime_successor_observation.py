@@ -213,7 +213,7 @@ def _observe_histories(root, predecessors, run_id, query, execution, *, count):
                             for item in results]}
 
 
-def observe_local(root, predecessor, run_id, *, execution=None):
+def _local_query(root):
     deadline = time.monotonic()+20
     root = Path(root)
     if os.name != 'nt' or root != Path.home()/'teetime-supervised-01':
@@ -239,6 +239,18 @@ def observe_local(root, predecessor, run_id, *, execution=None):
         if code != 0:
             raise ValueError('actual Docker observation failed')
         return raw
+    return query
+
+
+def observe_minimal_local(root, execution):
+    from teetime_minimal_execution import MinimalExecution
+    if not isinstance(execution, MinimalExecution):
+        raise ValueError('closed minimal execution required')
+    return observe_minimal_histories(root, execution, _local_query(root))
+
+
+def observe_local(root, predecessor, run_id, *, execution=None):
+    query = _local_query(root)
     if execution is not None:
         if execution.binding['attempt'] == 4:
             return observe_three_histories(root, predecessor, run_id, query, execution)

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import subprocess
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from teetime_successor_observation import observe_files, observe_two_histories, observe_three_histories
@@ -154,6 +155,29 @@ class SuccessorObservationTests(unittest.TestCase):
         with patch('teetime_successor_observation.time.time',side_effect=[100,101,102,103,121]):
             with self.assertRaises(ValueError):
                 observations.observe_minimal_histories(self.root,execution,lambda cmd:b'')
+
+    def test_minimal_local_adapter_uses_shared_bounded_read_only_docker_query(self):
+        execution=self.prepare_minimal();calls=[]
+        with patch('teetime_successor_observation._local_query',return_value=lambda cmd:calls.append(cmd) or b''):
+            value=observations.observe_minimal_local(self.root,execution)
+        self.assertTrue(value['resourcesAbsent']);self.assertEqual(len(calls),16)
+        self.assertTrue(all(cmd[0] in ('ps','network') for cmd in calls))
+
+    def test_local_query_bounds_each_capture_by_same_monotonic_budget(self):
+        config=self.root/'execution-image-ad7682e21f8c-repair1/docker-config'
+        config.mkdir(parents=True)
+        with patch('teetime_successor_observation.Path.home',return_value=self.root.parent), \
+                patch('teetime_successor_observation.os',SimpleNamespace(name='nt',environ={'PATH':'synthetic','GH_TOKEN':'synthetic'})), \
+                patch('teetime_successor_observation.time.monotonic',side_effect=[100,101,119,121]), \
+                patch('teetime_successor_observation.capture',return_value=(0,b'')) as bounded:
+            query=observations._local_query(self.root)
+            query(['ps','-a']);query(['network','ls'])
+            with self.assertRaises(ValueError):query(['ps','-a'])
+            self.assertEqual([call.args[1] for call in bounded.call_args_list],[4,1])
+            for call in bounded.call_args_list:
+                self.assertIn('npipe:////./pipe/dockerDesktopLinuxEngine',call.args[0])
+                self.assertEqual(call.kwargs['limit'],65536)
+                self.assertNotIn('GH_TOKEN',call.kwargs['env'])
 
     def test_minimal_rechecks_all_twenty_files_and_exact_fourth_resources(self):
         execution=self.prepare_minimal();paths=[]
