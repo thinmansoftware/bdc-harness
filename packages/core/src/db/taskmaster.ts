@@ -223,7 +223,7 @@ export async function settleAutomaticFire(
      utc_day=COALESCE($3,utc_day),run_ids_json=$4,updated_at=$5
      WHERE action_key=$6 AND cascade_id=$7
        AND $1 <> 'released' AND (state <> 'admitted' OR $1='admitted')
-       AND (admitted_at IS NULL OR $2 IS NULL OR admitted_at=$2)`,
+       AND (admitted_at IS NULL OR CAST($2 AS TEXT) IS NULL OR admitted_at=$2)`,
     [
       input.state,
       input.admittedAt ?? null,

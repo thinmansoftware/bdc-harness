@@ -81,6 +81,28 @@ added. The local checkpoint remains BLOCKED pending fresh exact-head CI/PG,
 independent/App review, post-build validation and the unresolved failure's
 disposition. It authorizes no publication, runtime release or registry effect.
 
+## PostgreSQL settlement typing correction (2026-10-19)
+
+Published checkpoint863161e398e07947a4e7e8b79a7553eb11317c80 failed the
+real PG17 cap suite: four passed, two failed, sixteen assertions. Both the
+existing replay/rebooking case and the new unowned-settlement case reported
+42P08, an undetermined parameter$2 type in the settlement null guard. Both
+release/authorize orderings passed. The original hosted failure is retained;
+Ubuntu, Windows, Docker and CodeQL success do not erase it.
+
+The correction gives that null check an explicit portable `CAST($2 AS TEXT)`.
+The column is TEXT in both dialects. All release/provenance/time guards and the
+parameter order remain unchanged, as do schema, adapters and transactions.
+Existing four-file regressions pass175/0/1006assertions without skips/filters;
+workspace/script types and production DAL lint exit0. The local isolated PG
+fixture is absent, so real dialect acceptance still requires fresh hosted CI
+at the correction head. This does not resolve the separate recorder EPERM.
+
+John's own-draft rule permits continued source commits, ordinary pushes,
+description updates and tests on the owner's draft PR1166 against dev without
+another XO grant. It does not authorize ready-for-review, merge, runtime,
+database, credential or production changes. The manifest remains BLOCKED.
+
 ## Verification
 
 From a clean checkout with existing dependencies:
