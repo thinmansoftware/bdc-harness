@@ -1,10 +1,50 @@
 # Tee-time supervised bootstrap source preparation
 
+## Source-only minimal remote controller branch
+
+The uninstalled run-teetime-auth-canary.py source now has an explicit
+--task minimal-diagnostic --diagnostic-source <40hex> branch. Artifact/demo
+arguments cannot be mixed with it. Arguments, including help, fail silently
+before setup. This is not an admitted operator/account route; the operator
+entry has no corresponding selector and no diagnostic claim exists.
+
+teetime_minimal_protocol.py verifies the selected helper closure, a distinct
+READY identity and raw RESULT with closed nested worker/proxy evidence. New
+manifest helpers are mandatory with an exact selected key set; old manifests
+cannot launch this branch. Full installed source custody and approved policy
+remain the future governed launcher's responsibility. Existing artifact and
+filesystem protocol shapes/defaults are unchanged.
+
+The branch reuses Docker inspection, restricted worker/masks, auth receiver,
+watchdog and owned cleanup. Gateway uses --diagnostic-receipt with unchanged
+network/parser policy. Fixed bounds: watchdog300seconds, worker sleep330,
+worker capture180/output8192, proxy capture at most295 with5seconds reserved for
+its process reaping. Require >265seconds at READY and >225 after installation.
+Use one monotonic controller deadline for setup, shutdown and cleanup; do not
+reset it. cleanup has an optional finite monotonic deadline on this route only;
+legacy default timeout behavior remains unchanged. Owned-label absence is
+checked after known-ID cleanup so a lost create response cannot imply cleanup.
+Unknown capture IDs are null, not invented. Cleanup reasons are a closed enum.
+
+A validated worker diagnostic survives outer proxy/cleanup failure as evidence,
+but the controller cannot pass without verified credentials, proxy and cleanup.
+Missing/malformed worker output stays null with unknown model invocation count.
+No app artifact output or acceptance exists on this route. Raw JSON duplicate
+validation precedes nested parsing. A valid diagnostic does not prove served
+model identity, entitlement, an application build or client acceptance.
+
+Offline checks: test_teetime_minimal_protocol.py, test_teetime_minimal_controller.py
+and test_teetime_watchdog.py through unittest discover. The actual controller
+main is exercised with a fully synthetic Docker/watchdog/credential-frame driver
+for success and cleanup failure; no Docker/account/model is contacted. New
+operator integration and Cauldron one-use admission remain separate reviewed
+work before installation or authentication. No attempt5 or automatic retry.
+
 ## Unregistered minimal diagnostic worker source
 
 teetime_minimal_worker.py and teetime_minimal_worker_result.py define a separate
-worker receipt, not an artifact result. Existing controller selectors do not
-call them. A future admitted image could invoke the worker with fixed --nonce
+worker receipt, not an artifact result. The source-only remote branch above now
+calls them. A future admitted image could invoke the worker with fixed --nonce
 and --source arguments only after source custody, READY and account-delivery
 gates. This source does not establish those gates or authorize invocation.
 
@@ -24,15 +64,15 @@ already validated diagnostic evidence. No private auth hash or raw errors leave
 the worker; identity fields are source/nonce only. It cannot accept app source.
 
 Offline check: `python -m unittest discover -s scripts/staging -p test_teetime_minimal_worker.py`.
-Synthetic metadata normalization is test-only. No worker/controller selector,
-image, account delivery, claim or real diagnostic is registered by these files.
+Synthetic metadata normalization is test-only. No installed image, operator
+account route, persisted claim or real diagnostic is registered by these files.
 Actual-script invalid-argument subprocess tests use a synthetic auth-access trap;
 unknown/missing/help arguments exit1 with empty stdout/stderr before auth access.
 
 ## Unregistered fixed-response diagnostic entry source
 
-teetime-minimal-diagnostic-entry.ts is not registered in any worker/controller
-selector and is not admitted for execution. It rejects extra argv before any
+teetime-minimal-diagnostic-entry.ts is called only by the new source worker path
+and is not admitted for execution. It rejects extra argv before any
 guarded logger/collector/provider import. It silences console, stdout and stderr
 before dynamic imports, preserving a single private emitter for the closed
 receipt. Initialization failure without a valid collector receipt exits1 with
@@ -53,8 +93,8 @@ argv/env selector. Offline verification:
 Tests include independent Python validation, held-stream abort, private failure
 and cleanup handling, and exact entry bytes with invalid argv plus an import
 sentinel outside the repo's pre-entry duplicate-yaml warning. No account/model
-is contacted. Worker/report integration, image, source custody and one-use
-execution authority remain separate unimplemented gates.
+is contacted. Worker/report source integration is described above; image, full
+source custody, operator route and one-use execution remain unimplemented gates.
 
 ## Unregistered proxy diagnostic receipt
 
@@ -110,10 +150,10 @@ Source verification: `bun test ./scripts/staging/teetime-minimal-diagnostic.test
 `python -m unittest discover -s scripts/staging -p test_teetime_minimal_diagnostic.py`,
 and `bun test src/codex/restricted-provider.test.ts` from packages/providers. The
 last command includes actual mocked native-event to collector to Python-parser
-integration. Offline CI runs all three. No runtime selector, account delivery,
-image replacement or diagnostic claim is registered. A real diagnostic still
-requires separately reviewed worker/deadline/reaping, proxy-counter contract,
-immutable inputs, exact carrier, authority and one-use execution gates. No
+integration. Offline CI runs all three. The source-only remote selector above
+does not register account delivery, an installed image or a diagnostic claim.
+A real diagnostic still requires reviewed immutable inputs, exact carrier,
+operator integration, authority and one-use execution gates. No
 implementation attempt5 and no automatic retry.
 
 ## Source-only failure origin preservation

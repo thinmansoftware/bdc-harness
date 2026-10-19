@@ -56,4 +56,18 @@ class ManifestTests(unittest.TestCase):
         with patch('teetime_watchdog.subprocess.run',side_effect=subprocess.CalledProcessError(1,['docker'])):
             self.assertEqual(len(cleanup('docker',self.valid())),2)
 
+    def test_optional_monotonic_deadline_bounds_commands_without_reset(self):
+        with patch('teetime_watchdog.time.monotonic', side_effect=[100,102]), \
+                patch('teetime_watchdog.subprocess.run', return_value=SimpleNamespace(stdout=b'')) as run:
+            self.assertEqual(cleanup('docker',self.valid(),deadline=103),[])
+            self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list],[3,1])
+        with patch('teetime_watchdog.time.monotonic', return_value=100), \
+                patch('teetime_watchdog.subprocess.run') as run:
+            errors=cleanup('docker',self.valid(),deadline=100)
+            self.assertEqual(len(errors),2)
+            self.assertEqual({item['failure'] for item in errors},{'TimeoutError'})
+            run.assert_not_called()
+        for deadline in [True,float('inf'),float('nan'),'PRIVATE']:
+            with self.assertRaises(ValueError): cleanup('docker',self.valid(),deadline=deadline)
+
 if __name__=='__main__': unittest.main()

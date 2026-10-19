@@ -71,6 +71,8 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_demo_result.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_diagnostic.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_worker.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_protocol.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_controller.py
           bun test ./scripts/staging/teetime-minimal-diagnostic-runner.test.ts
           python3 -m unittest discover -s scripts/staging -p test_teetime_demo_execution.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_plan_observation.py

@@ -30,10 +30,14 @@ def validate_manifest(data,now,task='canary'):
     if len(set(ids))!=len(ids): raise ValueError('duplicate resource id')
     return data
 
-def cleanup(docker,manifest):
+def cleanup(docker,manifest,*,deadline=None):
+    if deadline is not None and (type(deadline) not in (int,float) or not math.isfinite(deadline)):
+        raise ValueError('finite cleanup deadline required')
     errors=[]
     def command(*args):
-        return subprocess.run([docker,*args],capture_output=True,timeout=12,check=True).stdout
+        timeout=12 if deadline is None else min(12,deadline-time.monotonic())
+        if timeout<=0: raise TimeoutError('cleanup deadline')
+        return subprocess.run([docker,*args],capture_output=True,timeout=timeout,check=True).stdout
     for kind,key in [('container','containers'),('network','networks')]:
         for resource in manifest[key]:
             try:
