@@ -35,6 +35,73 @@ async function run(path: string, cwd = import.meta.dir) {
 }
 
 describe('replay-dynamic-lane CLI', () => {
+  test('evaluator and CLI prohibit provider, store, network, credential, clock and write access', async () => {
+    const input = await readFile(fixture, 'utf8');
+    const haikuInput = await readFile(
+      resolve(
+        import.meta.dir,
+        '../packages/workflows/src/reliability/fixtures/dynamic-lane/eligible-haiku-synthetic.json'
+      ),
+      'utf8'
+    );
+    const guarded = `
+      import { mock } from 'bun:test';
+      import { plugin } from 'bun';
+      import * as fs from 'node:fs/promises';
+      process.stdout.write('');
+      process.stderr.write('');
+      const deny = () => { throw new Error('prohibited offline operation'); };
+      let reads = 0;
+      const onlyInput = async path => {
+        if (String(path) !== ${JSON.stringify(fixture)} || ++reads !== 1) deny();
+        return ${JSON.stringify(input)};
+      };
+      mock.module('node:fs/promises', () => Object.fromEntries(
+        Object.keys(fs).map(key => [key, key === 'readFile' ? onlyInput : deny])
+      ));
+      plugin({ name: 'offline-side-effect-guard', setup(build) {
+        build.onResolve({ filter: ${/^(?:node:)?(?:fs$|net|tls|http|https|http2|dns|child_process)|^bun:(?:sqlite|ffi)|@archon\/(?:providers|core)|(?:^|[\\/])(?:providers|db|executor|dag-executor|run-lease|run-authority|resolve-binding)(?:[\\/.]|$)/.toString()} }, deny);
+      }});
+      globalThis.fetch = deny;
+      for (const key of ['file', 'write', 'spawn', 'spawnSync', 'connect', 'listen', 'serve', 'SQL']) {
+        if (key in Bun) Bun[key] = deny;
+      }
+      Date.now = deny;
+      const originalEnv = process.env;
+      process.env = new Proxy(originalEnv, { get(target, key) {
+        if (typeof key === 'string' && /TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL/.test(key)) deny();
+        return Reflect.get(target, key);
+      }});
+      const { replayDynamicLane } = await import(${JSON.stringify(script)});
+      const { evaluateDynamicLane, dynamicLaneSnapshotSchema } = await import(${JSON.stringify(
+        resolve(import.meta.dir, '../packages/workflows/src/reliability/dynamic-lane-admission.ts')
+      )});
+      const value = dynamicLaneSnapshotSchema.parse(JSON.parse(${JSON.stringify(input)}));
+      evaluateDynamicLane(value);
+      evaluateDynamicLane(dynamicLaneSnapshotSchema.parse(JSON.parse(${JSON.stringify(haikuInput)})));
+      const status = await replayDynamicLane(['--input', ${JSON.stringify(fixture)}]);
+      if (status !== 0 || reads !== 1) throw new Error('offline invocation contract failed');
+      process.env = originalEnv;
+    `;
+    const child = Bun.spawn([process.execPath, 'run', '-'], {
+      cwd: tmpdir(),
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { PATH: process.env.PATH ?? '' },
+    });
+    child.stdin.write(guarded);
+    child.stdin.end();
+    const [status, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    expect(stderr).toBe('');
+    expect(status).toBe(0);
+    expect(JSON.parse(stdout).postExecutionReview).toBe('unissued');
+  });
+
   test('v4 Haiku proposal replays with no credentials and preserves the input bytes', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'dynamic-lane-v4-'));
     temporary.push(dir);

@@ -90,9 +90,68 @@ describe('model-neutral Haiku offline v4', () => {
     Object.assign(input.decisionExchanges[0] as object, { outcome: 'refused', response: null });
     expect(evaluateDynamicLane(input).disposition).toBe('prior_receipt_mismatch');
   });
+  test('independent review refuses an empty contributor provenance list', () => {
+    for (const input of [v4(), clone()]) {
+      input.aiRole = 'independent_review';
+      input.roleObjective!.role = input.aiRole;
+      input.candidateProfiles!.forEach(p => p.applicableRoles.push(input.aiRole));
+      input.currentArtifactHash = input.reviewTargetHash = 'sha256:artifact';
+      input.contributingFamilies = [];
+      const out = evaluateDynamicLane(input);
+      expect(out.eligibleCandidateIds).toEqual([]);
+      expect(out.candidateRejections['codex-plan']).toContain('contributor_provenance_missing');
+    }
+  });
+
   test('normalized worker facts do not retain the legacy single-router account field', () => {
     const out = evaluateDynamicLane(v4());
     expect(out.normalizedRequest!.eligibleCandidates[0]).not.toHaveProperty('routerAccountId');
+  });
+
+  test('persona pin takes precedence over the node model when filtering workers', () => {
+    for (const input of [v4(), clone()]) {
+      input.modelResolution.nodeModel = 'claude-synthetic';
+      input.modelResolution.personaModel = 'gpt-synthetic';
+      expect(evaluateDynamicLane(input).eligibleCandidateIds).toEqual(['codex-plan']);
+      input.modelResolution.personaModel = 'unqualified-persona-model';
+      expect(evaluateDynamicLane(input).eligibleCandidateIds).toEqual([]);
+    }
+  });
+
+  test('actual node pins cannot be omitted or contradicted by resolution facts', () => {
+    for (const input of [v4(), clone()]) {
+      input.node = { ...input.node, provider: 'codex', model: 'gpt-synthetic' };
+      expect(evaluateDynamicLane(input).eligibleCandidateIds).toEqual(['codex-plan']);
+      input.modelResolution.nodeModel = 'different-node-model';
+      expect(evaluateDynamicLane(input).eligibleCandidateIds).toEqual([]);
+    }
+  });
+
+  test('quota failures retain charges and permit the next qualified route', () => {
+    const input = withHaikuDecision(v4(), 1);
+    Object.assign(input.decisionExchanges[0] as object, { outcome: 'quota', cashCost: 0.5 });
+    const out = evaluateDynamicLane(input);
+    expect(out.decision).toBe('propose');
+    expect(out.engineId).toBe('luna');
+    expect(out.routerCallsConsumed).toBe(2);
+    expect(out.charges['haiku-sub']).toBe(0.5);
+  });
+
+  test('v4 optional distributions require the selected unique maximum', () => {
+    for (const distribution of [
+      { 'codex-plan': 0.5, 'claude-plan': 0.5, abstain: 0 },
+      { 'codex-plan': 0.4, 'claude-plan': 0.6, abstain: 0 },
+      { 'codex-plan': 0.4, 'claude-plan': 0.1, abstain: 0.5 },
+    ]) {
+      const input = withHaikuDecision(v4());
+      Object.assign(input.decisionExchanges[0] as object, { distribution });
+      expect(evaluateDynamicLane(input).proposedBinding).toBeNull();
+    }
+    const valid = withHaikuDecision(v4());
+    Object.assign(valid.decisionExchanges[0] as object, {
+      distribution: { 'codex-plan': 0.8, 'claude-plan': 0.15, abstain: 0.05 },
+    });
+    expect(evaluateDynamicLane(valid).decision).toBe('propose');
   });
 
   test.each([
@@ -107,8 +166,16 @@ describe('model-neutral Haiku offline v4', () => {
     input.aiRole = role;
     input.roleObjective!.role = role;
     input.candidateProfiles!.forEach(p => p.applicableRoles.push(role));
-    if (role === 'independent_review')
+    if (role === 'independent_review') {
       input.currentArtifactHash = input.reviewTargetHash = 'sha256:artifact';
+      input.contributingFamilies = [
+        {
+          family: 'google',
+          evidenceRef: 'fixture:prior-builder',
+          availableAt: '2026-10-17T11:00:00.000Z',
+        },
+      ];
+    }
     expect(evaluateDynamicLane(withHaikuDecision(input)).decision).toBe('propose');
   });
   test('completed prior receipt is recomputed and replayed without double charging', () => {
@@ -321,6 +388,13 @@ describe('model-neutral Haiku offline v4', () => {
     valid.aiRole = 'independent_review';
     valid.roleObjective!.role = valid.aiRole;
     valid.currentArtifactHash = valid.reviewTargetHash = 'sha256:artifact';
+    valid.contributingFamilies = [
+      {
+        family: 'google',
+        evidenceRef: 'fixture:prior-builder',
+        availableAt: '2026-10-17T11:00:00.000Z',
+      },
+    ];
     valid.candidateProfiles!.forEach(p => p.applicableRoles.push(valid.aiRole));
     expect(evaluateDynamicLane(withHaikuDecision(valid)).decision).toBe('propose');
   });
@@ -584,6 +658,13 @@ describe('dynamic lane offline admission scenarios', () => {
       input.candidateProfiles!.forEach(profile => profile.applicableRoles.push(role));
       if (role === 'independent_review') {
         input.currentArtifactHash = input.reviewTargetHash = 'sha256:artifact';
+        input.contributingFamilies = [
+          {
+            family: 'google',
+            evidenceRef: 'fixture:prior-builder',
+            availableAt: '2026-09-26T11:00:00.000Z',
+          },
+        ];
       }
       const ready = withAcceptedExchange(input);
       const a = canonicalDynamicLaneJson(evaluateDynamicLane(ready));

@@ -562,12 +562,23 @@ function evaluateLegacyDynamicLane(
     out.evidenceReferences.push(item.evidenceId);
   }
 
+  const actualNodeProvider = 'provider' in snapshot.node ? snapshot.node.provider : undefined;
+  const actualNodeModel = 'model' in snapshot.node ? snapshot.node.model : undefined;
+  const nodeProvider = snapshot.modelResolution.nodeProvider ?? actualNodeProvider;
+  const nodeModel = snapshot.modelResolution.nodeModel ?? actualNodeModel;
+  if (
+    (actualNodeProvider &&
+      snapshot.modelResolution.nodeProvider &&
+      actualNodeProvider !== nodeProvider) ||
+    (actualNodeModel && snapshot.modelResolution.nodeModel && actualNodeModel !== nodeModel)
+  )
+    globalReasons.push('node_resolution_facts_mismatch');
   const resolved = resolveModelForNode({
     nodeId: snapshot.nodeId,
     workflowProvider: snapshot.modelResolution.workflowProvider,
     workflowModel: snapshot.modelResolution.workflowModel,
-    nodeProvider: snapshot.modelResolution.nodeProvider,
-    nodeModel: snapshot.modelResolution.nodeModel,
+    nodeProvider,
+    nodeModel,
     personaModel: snapshot.modelResolution.personaModel,
     assistantModels: snapshot.modelResolution.assistantModels,
   });
@@ -593,13 +604,13 @@ function evaluateLegacyDynamicLane(
     const binding = snapshot.modelResolution.operatorBinding;
     if (binding && (candidate.provider !== binding.provider || candidate.model !== binding.model))
       reasons.push('operator_binding_mismatch');
+    if (!binding && nodeProvider && candidate.provider !== resolved.provider)
+      reasons.push('resolved_provider_mismatch');
     if (
       !binding &&
-      snapshot.modelResolution.nodeProvider &&
-      candidate.provider !== resolved.provider
+      (snapshot.modelResolution.personaModel || nodeModel) &&
+      candidate.model !== resolved.model
     )
-      reasons.push('resolved_provider_mismatch');
-    if (!binding && snapshot.modelResolution.nodeModel && candidate.model !== resolved.model)
       reasons.push('resolved_model_mismatch');
     if (!profile) reasons.push('candidate_profile_missing');
     else {
@@ -679,6 +690,8 @@ function evaluateLegacyDynamicLane(
         if (!atOrBefore(candidate.familyMappingEvidence.availableAt, snapshot.evaluationTime))
           reasons.push('future_reviewer_family_mapping');
       }
+      if (snapshot.contributingFamilies.length === 0)
+        reasons.push('contributor_provenance_missing');
       if (snapshot.contributingFamilies.some(item => !item.family))
         reasons.push('contributor_family_unknown');
       if (
