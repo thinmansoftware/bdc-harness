@@ -1,5 +1,34 @@
 # Tee-time supervised bootstrap source preparation
 
+## Unregistered proxy diagnostic receipt
+
+The source-only `--diagnostic-receipt` flag on teetime_connect_proxy.py selects a
+separate version1 ready/final receipt. Existing callers do not set it; default
+ready/final output and connection policy are unchanged. All accounting stays in
+the existing measured module, with no new proxy runtime import dependency.
+
+Only five fixed parser denial counters and six fixed non-parser phase counters
+are exposed, alongside legacy aggregates. Count one outer handled failure per
+connection; concurrent pump failures can increment legacy byte_limit twice.
+Normal EOF, cancellation and suppressed cleanup errors are not handled failures.
+Unknown parser exceptions explicitly invalidate the diagnostic even if totals
+coincidentally agree. Reports require settled active0, closed enums, exact bounded
+integers and consistent totals. No raw headers, values, destinations or errors
+are returned. Aggregate reasons cannot establish which request caused inference
+failure, nor prove account entitlement.
+
+`parse_proxy_diagnostic_receipt` in teetime_proxy_diagnostic_receipt.py validates
+the separate two-line ASCII receipt independently (4096-byte maximum, duplicate
+and nonfinite JSON rejection). It rejects legacy receipts; the legacy parser
+rejects diagnostic receipts. Offline checks:
+`python -m unittest discover -s scripts/staging -p 'test_teetime_proxy_diagnostic*.py'`,
+plus existing connect-proxy, native-header and legacy-receipt suites.
+
+This is not proxy activation, image installation, diagnostic execution authority
+or an implementation retry. A future one-use diagnostic needs a separately
+reviewed worker protocol, immutable inputs, lifecycle and execution gates. No
+attempt5 or automatic retry is registered.
+
 ## Unregistered minimal diagnostic data contract
 
 `collectMinimalDiagnostic` in scripts/staging/teetime-minimal-diagnostic.ts is a
