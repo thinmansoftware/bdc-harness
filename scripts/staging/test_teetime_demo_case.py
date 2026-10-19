@@ -18,8 +18,11 @@ class DemoCaseTests(unittest.TestCase):
                    'authorityHash': 'sha256:' + 'a' * 64, 'policyHash': 'sha256:' + 'b' * 64,
                    'baseManifestHash': prepared.manifest_hash}
         contract = b'Complete reviewed UI contract.\n'
+        plans = {'work-order.md': b'Complete work order', 'implementation-plan.md': b'Complete plan'}
+        plan_args = {'plan_files': plans,
+                     'plan_hashes': {name: hashlib.sha256(raw).hexdigest() for name, raw in plans.items()}}
         prompt = build_demo_prompt(prepared=prepared, binding=binding,
-                                  ui_contract=contract, ui_contract_hash=hashlib.sha256(contract).hexdigest())
+                                  ui_contract=contract, ui_contract_hash=hashlib.sha256(contract).hexdigest(), **plan_args)
         self.assertIn(contract.decode(), prompt)
         self.assertIn(canonical(binding), prompt)
         self.assertIn('walkthrough/demo.spec.ts', prompt)
@@ -29,10 +32,16 @@ class DemoCaseTests(unittest.TestCase):
             self.assertIn(file.content.decode(), prompt)
         with self.assertRaises(ValueError):
             build_demo_prompt(prepared=prepared, binding=binding, ui_contract=contract+b'changed',
-                              ui_contract_hash=hashlib.sha256(contract).hexdigest())
+                              ui_contract_hash=hashlib.sha256(contract).hexdigest(), **plan_args)
         with self.assertRaises(ValueError):
             build_demo_prompt(prepared=prepared, binding={**binding, 'baseManifestHash':'0'*64},
-                              ui_contract=contract, ui_contract_hash=hashlib.sha256(contract).hexdigest())
+                              ui_contract=contract, ui_contract_hash=hashlib.sha256(contract).hexdigest(), **plan_args)
+        for raw in plans.values():
+            self.assertIn(raw.decode(), prompt)
+        plans['work-order.md'] += b'changed'
+        with self.assertRaises(ValueError):
+            build_demo_prompt(prepared=prepared, binding=binding, ui_contract=contract,
+                              ui_contract_hash=hashlib.sha256(contract).hexdigest(), **plan_args)
 
     def setUp(self):
         self.original = (SnapshotFile('README.md', '100644', b'Simulated original\n'),)

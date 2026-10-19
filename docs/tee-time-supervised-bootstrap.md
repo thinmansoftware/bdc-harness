@@ -277,3 +277,51 @@ The complete UI-contract/prepared-base prompt helper now has7 passing pure tests
 including rejection of contract drift and wrong prepared-base identity. It supplies
 complete immutable source references and exact artifact binding, without truncating
 the contract or granting execution. Actual demo task/protocol wiring remains pending.
+
+## Actual isolated preparation and demo collector checkpoint
+
+The preparation-only entry now succeeded on the BDC laptop, with actual child
+exit0 and reaped=true. Run6e1379d3959a5e5b373130cb11742018 was created and read back
+paused through the real isolated Cauldron store. It used source93b6bb611fb424aac3b756993f0c1a8dc702f7ca.
+Case hash: sha256:e03c392ccbc926e097e113e80a472591d70e772b8630d0e8d2027bfebc351084.
+Authority hash: sha256:52a48f0855ef52bbf2b2530e8e932b256b658a010c591c7badd984dcffe17e32.
+Prepared binding: sha256:4288d5136730fc31b67cf11f136dfdbc2abed73ac064805dd89bf630199bf7e7.
+No account was supplied and modelInvocations=0; operationalLaneReady=false.
+Actual stdout/process receipts are retained in the local audit directory and
+the laptop prepare-evidence-complete-archive directory.
+
+Two earlier preparation attempts rejected before store creation because hashes
+from Git blobs did not match CRLF bytes in the Windows-produced Git archive.
+The final input explicitly binds actual archive case/helper bytes, with no
+runtime hash normalization. Original inputs and failed receipts remain retained.
+
+The new unregistered demo task collector reuses the existing stream collector
+and SDK lifecycle unchanged. It returns collected data, never a passed build.
+The separate Python validator checks actual task exit, canonical bounded base64,
+normal single invocation/terminal evidence and parse_demo_artifact against the
+prepared base and actual expected binding. A complete65536-byte artifact fits
+the90112-byte task-result bound; overflows and immutable-file changes fail closed.
+The entry takes only a bounded stdin packet and uses the actual supplied run ID,
+verified worker-policy bytes and an explicit600s model deadline. It does not
+load an arbitrary prompt file, grant authority, or implement a fallback provider.
+
+Local verification:12 Bun tests pass (including unchanged fixed canary),10 Python
+tests pass. Local full scripts typecheck is BLOCKED by missing provider/ACP SDK
+dependencies in this checkout; no clean typecheck is claimed. Source checkpoint
+a97a12be5 passed CI39185176814 before these new collector files.
+
+Still required before any model invocation: finish the closed demo selector and
+READY/result transport, freeze the new execution-package identity referencing the
+existing prepared binding, independently review the exact current plan/head,
+consume the model-phase claim and persist the real provider attempt. The prepared
+authority is not rewritten to pretend it covered the new execution package.
+Then validate and test the actual app candidate and publish only isolated staging.
+
+The prompt builder now requires and hash-checks the complete work order and
+implementation plan too. A local size rehearsal with the frozen plan documents
+produced120041 prompt bytes and123553 encoded input bytes, within131072/160000
+bounds. This is sizing evidence, not a frozen operational execution package.
+Architect source review approved publication of this collector slice, with these
+limitations: modelInvocations counts attempted query calls, the600s timer covers
+the query only, and the outer launcher must bound the complete process and align
+proxy/watchdog/credential lifetimes. No independent plan approval was fabricated.
