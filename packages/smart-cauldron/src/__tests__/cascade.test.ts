@@ -228,7 +228,7 @@ describe('binding-v2 durable replay foundation', () => {
       ).rejects.toThrow('dispatch identity conflict');
       expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
     }
-    for (const codexOnly of [undefined, false]) {
+    for (const codexOnly of [true, undefined, false]) {
       await expect(runCascade({ ...opts, codexOnly, dispatchBinding: undefined })).rejects.toThrow(
         'dispatch identity conflict'
       );
