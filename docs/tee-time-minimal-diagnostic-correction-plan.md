@@ -143,3 +143,33 @@ does not supply the future execution packet, image, admission or account authori
 The final objective remains the simulated demo: accepted app source, functional
 booking-rule tests, build/typecheck, deterministic browser walkthrough, isolated
 preview and device verification. None is replaced by a passing diagnostic.
+
+## Failed operator records
+
+`validate_minimal_operator_record` takes explicit receipt_version1 or2 and actual
+integer process exit0 or1. Worker and task versions must match that selector;
+proxy versions must match it too. Null worker results, exits or unavailable proxy
+metrics remain null with corresponding verification flags. A nested successful
+worker with outer cleanup failure remains a failed outer result. Overall success
+requires all controller flags, validated worker success and actual exit0.
+
+This parser retains originalAuthUnchanged:true only as the frozen operator's
+statement. A nested worker nonce is syntax consistency, not independent READY/run
+authority. The caller must separately prove exact source custody, execution
+identity, process settlement and capture bounds. This API cannot authorize a
+run or reconstruct the lost historical PC equality receipt. The v2 worker
+validator is explicit and source-only; no existing worker entry selects it.
+
+`teetime_minimal_pc_envelope.py` is a new host-only source template derived from
+the reviewed one-use envelope. Its CLI exits2 with source-template-not-admitted
+before preflight. Its main/data path is exercised only with synthetic fixtures.
+After a settled, bounded exit0/1 it independently validates and retains the
+operator record, including valid failures, without promoting nested evidence to
+outer success. Unknown/malformed/unsettled output retains a fixed failure only.
+
+The template's historical constants are not a new binding. A future package must
+explicitly rebind the source, receipt selector, immutable limits/inventory and
+one-use authority, include this host helper in its measured closure, and obtain
+separate review before any execution entry can be enabled. The consumed PC
+launcher, local claim and old execution source are unchanged. These source tests
+neither recreate the lost old operator output nor authorize another query.

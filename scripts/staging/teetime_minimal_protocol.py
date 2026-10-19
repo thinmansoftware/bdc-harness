@@ -5,8 +5,8 @@ from pathlib import Path
 import re
 from teetime_auth_artifact_protocol import ALL_PATHS as LEGACY_PATHS, IMAGE_PATHS as LEGACY_IMAGE, artifact_hashes
 from teetime_joined_fixture import exact, strict_json
-from teetime_minimal_worker_result import validate_minimal_worker
-from teetime_proxy_diagnostic_receipt import parse_proxy_diagnostic_receipt
+from teetime_minimal_worker_result import validate_minimal_worker, validate_minimal_worker_v2
+from teetime_proxy_diagnostic_receipt import parse_proxy_diagnostic_receipt, parse_proxy_diagnostic_receipt_v2
 
 EXTRA = tuple('scripts/staging/'+name for name in [
     'teetime-minimal-diagnostic.ts', 'teetime-minimal-diagnostic-runner.ts',
@@ -21,6 +21,53 @@ FAILURES = frozenset({'CalledProcessError', 'TimeoutExpired', 'TimeoutError', 'V
 
 def _hex(value, size, prefix=''):
     return type(value) is str and re.fullmatch(re.escape(prefix)+'[a-f0-9]{'+str(size)+'}', value) is not None
+
+
+def validate_minimal_operator_record(raw, actual_exit, *, expected_source, receipt_version):
+    """Closed retained data only, not independent READY/run authority.
+
+    Caller must establish frozen source custody, process settlement and output
+    bounds. A nested nonce is syntax consistency, not an independent observation.
+    Original-login equality remains the frozen operator's statement, unchanged.
+    """
+    if (type(raw) is not bytes or not 1 <= len(raw) <= 32768 or not raw.isascii()
+            or type(actual_exit) is not int or actual_exit not in [0, 1]
+            or type(receipt_version) is not int or receipt_version not in [1, 2]
+            or not _hex(expected_source, 40)):
+        raise ValueError('bounded versioned operator data required')
+    value = strict_json(raw)
+    if (type(value) is not dict or set(value) != {'owner', 'task', 'diagnosticSourceSha',
+            'result', 'proxyMetrics', 'originalAuthUnchanged'}
+            or type(value['owner']) is not str or re.fullmatch('teetime-auth-[a-f0-9]{12}', value['owner']) is None
+            or value['task'] != 'minimal-diagnostic' or value['diagnosticSourceSha'] != expected_source
+            or value['originalAuthUnchanged'] is not True):
+        raise ValueError('closed operator identity required')
+    outcome = value['result']
+    flags = {'passed', 'cleanupVerified', 'credentialReceived', 'proxyMetricsVerified'}
+    if (type(outcome) is not dict or set(outcome) != flags | {'workerExitCode', 'workerResult'}
+            or any(type(outcome[key]) is not bool for key in flags)):
+        raise ValueError('closed operator outcome required')
+    worker, code = outcome['workerResult'], outcome['workerExitCode']
+    if code is not None and (type(code) is not int or code not in [0, 1] or not outcome['credentialReceived']):
+        raise ValueError('worker exit contradicts operator evidence')
+    if worker is not None:
+        if type(worker) is not dict or not outcome['credentialReceived'] or code is None:
+            raise ValueError('worker receipt without observed process')
+        validator = validate_minimal_worker if receipt_version == 1 else validate_minimal_worker_v2
+        validator(code, json.dumps(worker, ensure_ascii=True).encode('ascii'),
+                  nonce=worker.get('nonce'), source=expected_source)
+    metrics = value['proxyMetrics']
+    if outcome['proxyMetricsVerified']:
+        ready = {'proxyReady': True, 'diagnosticVersion': receipt_version}
+        parser = parse_proxy_diagnostic_receipt if receipt_version == 1 else parse_proxy_diagnostic_receipt_v2
+        parser(json.dumps(ready).encode('ascii')+b'\n'+json.dumps(metrics).encode('ascii'))
+    elif metrics is not None:
+        raise ValueError('unverified proxy metrics cannot be retained')
+    success = (outcome['credentialReceived'] and outcome['cleanupVerified']
+               and outcome['proxyMetricsVerified'] and worker is not None and worker['passed'])
+    if outcome['passed'] != success or actual_exit != (0 if success else 1):
+        raise ValueError('operator success or exit contradiction')
+    return value
 
 
 def validate_diagnostic_selector(task, source, artifact_source, demo_hash):

@@ -2,7 +2,7 @@
 import json
 import re
 from teetime_joined_fixture import strict_json
-from teetime_minimal_diagnostic import validate_minimal_diagnostic
+from teetime_minimal_diagnostic import validate_minimal_diagnostic, validate_minimal_diagnostic_v2
 
 KEYS = {'version', 'kind', 'nonce', 'source', 'passed', 'preflightPassed', 'preflightChecks',
         'authenticationRejected', 'authUnchanged', 'workspaceUnchanged', 'taskStarted',
@@ -12,6 +12,15 @@ BOOLS = {'passed', 'preflightPassed', 'authenticationRejected', 'authUnchanged',
 
 
 def validate_minimal_worker(exit_code, raw, *, nonce, source):
+    return _validate_worker(exit_code, raw, nonce=nonce, source=source, version=1)
+
+
+def validate_minimal_worker_v2(exit_code, raw, *, nonce, source):
+    """Explicit source-only v2 schema; no worker entry selects it yet."""
+    return _validate_worker(exit_code, raw, nonce=nonce, source=source, version=2)
+
+
+def _validate_worker(exit_code, raw, *, nonce, source, version):
     if (type(nonce) is not str or re.fullmatch('[a-f0-9]{32}', nonce) is None
             or type(source) is not str or re.fullmatch('[a-f0-9]{40}', source) is None
             or type(exit_code) is not int or exit_code not in (0, 1)
@@ -19,7 +28,7 @@ def validate_minimal_worker(exit_code, raw, *, nonce, source):
         raise ValueError('bounded worker identity and receipt required')
     data = strict_json(raw)
     if (type(data) is not dict or set(data) != KEYS or type(data['version']) is not int
-            or data['version'] != 1 or data['kind'] != 'teetime-minimal-worker'
+            or data['version'] != version or data['kind'] != 'teetime-minimal-worker'
             or data['nonce'] != nonce or data['source'] != source
             or any(type(data[key]) is not bool for key in BOOLS)
             or type(data['failureCategory']) is not str
@@ -46,7 +55,8 @@ def validate_minimal_worker(exit_code, raw, *, nonce, source):
     if task is not None:
         if not (data['taskStarted'] and data['taskProcessReaped'] and data['preflightPassed']) or task_exit is None:
             raise ValueError('worker child receipt without observations')
-        validate_minimal_diagnostic(task_exit, json.dumps(task, ensure_ascii=True).encode('ascii'))
+        validator = validate_minimal_diagnostic if version == 1 else validate_minimal_diagnostic_v2
+        validator(task_exit, json.dumps(task, ensure_ascii=True).encode('ascii'))
     clean = data['authUnchanged'] and data['workspaceUnchanged'] and oom == 0
     success = clean and data['preflightPassed'] and task is not None and task['passed']
     if data['passed'] != success or (exit_code == 0) != success:

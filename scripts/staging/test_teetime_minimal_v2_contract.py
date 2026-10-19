@@ -35,6 +35,8 @@ class V2ClosureTests(unittest.TestCase):
         self.assertIn(dependency, V2_ALL_PATHS); self.assertIn(dependency, V2_IMAGE_PATHS)
         verifier = 'scripts/staging/teetime_minimal_v2_contract.py'
         self.assertIn(verifier, V2_ALL_PATHS); self.assertNotIn(verifier, V2_IMAGE_PATHS)
+        envelope = 'scripts/staging/teetime_minimal_pc_envelope.py'
+        self.assertIn(envelope, V2_ALL_PATHS); self.assertNotIn(envelope, V2_IMAGE_PATHS)
         self.assertTrue(set(ALL_PATHS).issubset(V2_ALL_PATHS))
         self.assertEqual(self.verify(), self.manifest['fileHashes'])
 

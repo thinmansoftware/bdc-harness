@@ -10,7 +10,8 @@ V2_IMAGE_PATHS = tuple(dict.fromkeys((*IMAGE_PATHS, 'packages/providers/src/code
 # Host verifier imports host-only reconciliation helpers; never copy it alone
 # into the worker image or claim that the worker can independently import it.
 V2_ALL_PATHS = tuple(dict.fromkeys((*ALL_PATHS, *V2_IMAGE_PATHS,
-                                  'scripts/staging/teetime_minimal_v2_contract.py')))
+                                  'scripts/staging/teetime_minimal_v2_contract.py',
+                                  'scripts/staging/teetime_minimal_pc_envelope.py')))
 
 
 def verify_v2_closure(root, raw, *, expected_manifest_hash, source, base_source):
