@@ -8,6 +8,7 @@ import sys
 from unittest.mock import patch
 
 from teetime_successor_observation import observe_files, observe_two_histories, observe_three_histories
+import teetime_successor_observation as observations
 from teetime_bounded_process import capture
 
 
@@ -49,6 +50,7 @@ class SuccessorObservationTests(unittest.TestCase):
         from teetime_auth_artifact_protocol import empty_worker_result
         from test_teetime_demo_execution import DemoExecutionTests
         fixture=DemoExecutionTests();fixture.setUp()
+        fixture.value['binding']['runId']=getattr(self,'fixture_run_id','actual-run')
         self.write('execution',self.paths['execution'],fixture.value)
         for key in ['claim','lock','result']:
             value=json.loads(self.paths[key].read_bytes())
@@ -118,6 +120,83 @@ class SuccessorObservationTests(unittest.TestCase):
         self.third_value['binding']['attempt']=4
         self.third_value['predecessors'].append(third)
         return self.parse_third()
+
+    def prepare_minimal(self):
+        from test_teetime_minimal_execution import MinimalExecutionTests
+        self.fixture_run_id='a'*32
+        fourth=self.prepare_fourth()
+        self.prior={'owner':'teetime-auth-aa4d4667b872'}
+        self.write('execution',self.root/'transport-repair-execution-harness/demo-execution.json',self.third_value)
+        for key,name in [('claim','model.claim.json'),('lock','controller.lock')]:
+            value=json.loads((self.root/'control-attempt-3'/name).read_bytes())
+            value['bindingHash']=self.prior['executionHash']
+            self.write(key,self.root/'control-attempt-4'/name,value)
+        result=json.loads((self.root/'control-attempt-3/model-result.json').read_bytes())
+        result['owner']=self.prior['owner'];result['artifactContractHash']=self.prior['executionHash'][7:]
+        result['result']['artifactResult']['taskFailureDiagnostic']['exceptionCategory']='other'
+        self.write('result',self.root/'control-attempt-4/model-result.json',result)
+        self.write('manifest',self.root.parent/self.prior['owner']/'manifest.json',
+            {'owner':self.prior['owner'],'deadline':1,'containers':['7'*64,'8'*64],'networks':['9'*64,'0'*64]})
+        last={**self.prior,'attemptId':'9739548a-2977-4524-99f3-644d152bc04e',
+              'completedAt':'2026-10-19T05:41:36.685Z','rowHash':'sha256:'+'4'*64}
+        fixture=MinimalExecutionTests();fixture.setUp()
+        fixture.value.update(predecessors=[*[dict(p) for p in fourth.predecessors],last],
+            preparedBindingHash=fourth.prepared_binding_hash,authorityHash=fourth.binding['authorityHash'])
+        self.minimal_fixture=fixture
+        return fixture.parse()
+
+    def test_minimal_reconciles_four_histories_without_a_fifth_product_packet(self):
+        execution=self.prepare_minimal();calls=[]
+        value=observations.observe_minimal_histories(self.root,execution,lambda cmd:calls.append(cmd) or b'')
+        self.assertTrue(value['resourcesAbsent']);self.assertEqual(len(value['predecessors']),4)
+        self.assertEqual(len(calls),16)
+        self.assertFalse(any('teetime-review-20261017' in str(cmd) for cmd in calls))
+        with patch('teetime_successor_observation.time.time',side_effect=[100,101,102,103,121]):
+            with self.assertRaises(ValueError):
+                observations.observe_minimal_histories(self.root,execution,lambda cmd:b'')
+
+    def test_minimal_rechecks_all_twenty_files_and_exact_fourth_resources(self):
+        execution=self.prepare_minimal();paths=[]
+        for folder,control,prior in zip(['execution-harness','successor-execution-harness',
+                'diagnostic-execution-harness','transport-repair-execution-harness'],
+                ['control','control-attempt-2','control-attempt-3','control-attempt-4'],execution.predecessors):
+            paths.extend([self.root/folder/'demo-execution.json',self.root/control/'model.claim.json',
+                self.root/control/'controller.lock',self.root/control/'model-result.json',
+                self.root.parent/prior['owner']/'manifest.json'])
+        for path in paths:
+            original=path.read_bytes();calls=0
+            def query(command):
+                nonlocal calls
+                calls+=1
+                if calls==16:path.write_bytes(original+b' ')
+                return b''
+            try:
+                with self.subTest(path=str(path)),self.assertRaises(ValueError):
+                    observations.observe_minimal_histories(self.root,execution,query)
+            finally:path.write_bytes(original)
+        for resource in ['7'*64,'9'*64]:
+            with self.subTest(resource=resource),self.assertRaises(ValueError):
+                observations.observe_minimal_histories(self.root,execution,
+                    lambda cmd:b'' if '--filter' in cmd else (resource+'\n').encode())
+
+    def test_minimal_preserves_fourth_failure_and_prepared_authority(self):
+        self.prepare_minimal();original=self.paths['result'].read_bytes()
+        for key,bad in [('modelInvocations',None),('normalProviderEnd',True),('taskDiagnosticsPresent',False),
+                ('authUnchanged',False),('workspaceUnchanged',False),('thinkingCount',1),
+                ('taskFailureDiagnostic',{'stage':'stream','exceptionCategory':'model_access_hint','lastEvent':'none'})]:
+            value=json.loads(original);value['result']['artifactResult'][key]=bad
+            self.write('result',self.paths['result'],value)
+            self.minimal_fixture.value['predecessors'][3]['resultHash']=self.prior['resultHash']
+            execution=self.minimal_fixture.parse()
+            with self.subTest(key=key),self.assertRaises(ValueError):
+                observations.observe_minimal_histories(self.root,execution,lambda cmd:b'')
+        self.paths['result'].write_bytes(original)
+        self.minimal_fixture.value['predecessors'][3]['resultHash']='sha256:'+hashlib.sha256(original).hexdigest()
+        for key in ['authorityHash','preparedBindingHash']:
+            old=self.minimal_fixture.value[key];self.minimal_fixture.value[key]='sha256:'+'f'*64
+            with self.subTest(key=key),self.assertRaises(ValueError):
+                observations.observe_minimal_histories(self.root,self.minimal_fixture.parse(),lambda cmd:b'')
+            self.minimal_fixture.value[key]=old
 
     def test_three_histories_reconcile_all_fifteen_files_and_share_budget(self):
         execution=self.prepare_fourth();calls=[]

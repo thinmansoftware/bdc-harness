@@ -32,11 +32,12 @@ def observe_files(root, predecessor, run_id, query, *, history=1, retained=None,
     """
     root = Path(root)
     started = int(time.time()*1000) if started is None else started
-    if history not in (1,2,3):
+    if history not in (1,2,3,4):
         raise ValueError('closed historical attempt required')
     old = root/{1:'execution-harness/demo-execution.json',
                 2:'successor-execution-harness/demo-execution.json',
-                3:'diagnostic-execution-harness/demo-execution.json'}[history]
+                3:'diagnostic-execution-harness/demo-execution.json',
+                4:'transport-repair-execution-harness/demo-execution.json'}[history]
     package_raw = frozen_file(old, predecessor['executionHash'])
     package = strict_json(package_raw)
     if (package.get('version') != history or package.get('kind') != 'supervised-demo-v'+str(history)
@@ -44,7 +45,7 @@ def observe_files(root, predecessor, run_id, query, *, history=1, retained=None,
             or package['binding'].get('nodeId') != 'implement'
             or package['binding'].get('attempt') != history):
         raise ValueError('original first execution differs')
-    control = root/{1:'control',2:'control-attempt-2',3:'control-attempt-3'}[history]
+    control = root/{1:'control',2:'control-attempt-2',3:'control-attempt-3',4:'control-attempt-4'}[history]
     claim_raw = frozen_file(control/'model.claim.json', predecessor['claimHash'], 4096)
     claim = strict_json(claim_raw)
     if (set(claim) != {'version','phase','bindingHash','reviewId','reviewHead','reviewer','state'}
@@ -95,20 +96,21 @@ def observe_files(root, predecessor, run_id, query, *, history=1, retained=None,
                 or any(worker[key] is not None for key in
                        ['artifactBase64','artifactHash','bindingHash','manifestHash','sourceTree'])):
             raise ValueError('closed unknown-statistics second attempt required')
-    if history == 3:
+    if history in (3,4):
         from teetime_auth_artifact_protocol import empty_worker_result
         from teetime_artifact_contract import canonical
         elapsed = worker.get('elapsedMs')
         if type(elapsed) is not int or not 1 <= elapsed <= 630000:
-            raise ValueError('bounded retained third attempt elapsed time required')
+            raise ValueError('bounded retained terminal attempt elapsed time required')
         expected = empty_worker_result(demo=True)
         expected.update(modelInvocations=1,authUnchanged=True,workspaceUnchanged=True,
             workspaceDiagnostic={'category':'unchanged','entryCount':2,'maskEntryCount':0},
             preflightPassed=True,preflightChecks=6,taskStarted=True,oomKillDelta=0,
             taskDiagnosticsPresent=True,providerIteratorClosed=True,elapsedMs=elapsed,failureCategory='rejected',
-            taskFailureDiagnostic={'stage':'stream','exceptionCategory':'model_access_hint','lastEvent':'none'})
+            taskFailureDiagnostic={'stage':'stream','exceptionCategory':
+                'model_access_hint' if history == 3 else 'other','lastEvent':'none'})
         if canonical(worker) != canonical(expected):
-            raise ValueError('closed retained third failure semantics required')
+            raise ValueError('closed retained terminal failure semantics required')
     receipt = root.parent/owner
     manifest_raw = frozen_file(receipt/'manifest.json', predecessor['manifestHash'], 4096)
     manifest = strict_json(manifest_raw)
@@ -163,9 +165,19 @@ def observe_three_histories(root, predecessors, run_id, query, execution):
     return _observe_histories(root, predecessors, run_id, query, execution, count=3)
 
 
+def observe_minimal_histories(root, execution, query):
+    """Separate diagnostic packet; never interpret it as product attempt5."""
+    from teetime_minimal_execution import MinimalExecution
+    if not isinstance(execution, MinimalExecution):
+        raise ValueError('closed minimal execution required')
+    return _observe_histories(root, execution.predecessors, execution.run_id, query, execution, count=4)
+
+
 def _observe_histories(root, predecessors, run_id, query, execution, *, count):
     from teetime_demo_execution import parse_demo_execution
-    if count not in (2,3) or len(predecessors) != count or execution.binding['attempt'] != count+1:
+    if count not in (2,3,4) or len(predecessors) != count:
+        raise ValueError('closed ordered histories required')
+    if count != 4 and execution.binding['attempt'] != count+1:
         raise ValueError('closed ordered histories required')
     started = int(time.time()*1000)
     retained = []
@@ -176,12 +188,18 @@ def _observe_histories(root, predecessors, run_id, query, execution, *, count):
                 for index, prior in enumerate(predecessors)]
     if dict(packages[1].predecessor) != dict(predecessors[0]):
         raise ValueError('retained predecessor chain differs')
-    if count == 3 and [dict(item) for item in packages[2].predecessors] != [dict(item) for item in predecessors[:2]]:
-        raise ValueError('retained third package chain differs')
+    for index in range(2,count):
+        if [dict(item) for item in packages[index].predecessors] != [dict(item) for item in predecessors[:index]]:
+            raise ValueError('retained package chain differs')
+    reference = packages[0] if count == 4 else execution
+    if count == 4 and (reference.prepared_binding_hash != execution.prepared_binding_hash
+            or reference.binding['runId'] != execution.run_id
+            or reference.binding['authorityHash'] != execution.authority_hash):
+        raise ValueError('diagnostic historical preparation or authority differs')
     for old in packages:
-        if (old.prepared_binding_hash != execution.prepared_binding_hash
-                or old.prepared != execution.prepared
-                or any(old.binding[key] != execution.binding[key] for key in
+        if (old.prepared_binding_hash != reference.prepared_binding_hash
+                or old.prepared != reference.prepared
+                or any(old.binding[key] != reference.binding[key] for key in
                        ['runId','nodeId','authorityHash','policyHash','baseManifestHash'])):
             raise ValueError('historical preparation or authority differs')
     for path,raw in retained:

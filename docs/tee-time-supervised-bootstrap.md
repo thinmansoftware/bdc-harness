@@ -34,6 +34,18 @@ Only a later governed controller may connect this wrapper to real transport.
 
 `bun test ./scripts/staging/teetime-supervised-transport.test.ts`
 
+observe_minimal_histories in scripts/staging/teetime_successor_observation.py
+accepts only the separate parsed MinimalExecution packet. It verifies the four
+fixed historical installations and controls, including transport-repair attempt4,
+without constructing a fifth product packet. It preserves each retained failure,
+checks all linked packages/preparation/authority, verifies exact and owner-labelled
+resource absence, then rereads all twenty files within one twenty-second window.
+It preserves the unrelated reviewer service. The source-owned query adapter must
+bound each Docker subprocess within the shared remaining monotonic deadline.
+This is read-only evidence gathering, not approval or an execution entry point.
+
+`python -B -m unittest discover -s scripts/staging -p test_teetime_successor_observation.py`
+
 ## Source-only diagnostic claim and shared review primitives
 
 claimSupervisedDiagnosticPhase in packages/workflows/src/reliability/
