@@ -20,6 +20,11 @@ def check(root, package_hash, mode, raw=b''):
     hashes = artifact_hashes(root / 'scripts' / 'staging', execution.source, execution.base_source)
     validate_execution_context(execution, execution.image, execution.base_source,
                                execution.source, hashes[POLICY_PATH])
+    if mode == 'predecessor':
+        if execution.predecessor is None:
+            raise ValueError('successor predecessor required')
+        from teetime_successor_observation import observe_local
+        return observe_local(root.parent, dict(execution.predecessor), execution.binding['runId'])
     if mode == 'metadata':
         return {'packageHash': execution.package_hash,
                 'preparedBindingHash': execution.prepared_binding_hash,
@@ -48,11 +53,11 @@ def check(root, package_hash, mode, raw=b''):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['metadata', 'ready', 'report'])
+    parser.add_argument('mode', choices=['metadata', 'ready', 'report', 'predecessor'])
     parser.add_argument('package_hash')
     args = parser.parse_args()
     try:
-        raw = sys.stdin.buffer.read(196609) if args.mode != 'metadata' else b''
+        raw = sys.stdin.buffer.read(196609) if args.mode in ['ready','report'] else b''
         value = check(Path(__file__).resolve().parents[2], args.package_hash, args.mode, raw)
         sys.stdout.write(json.dumps(value, sort_keys=True, separators=(',', ':')))
     except Exception:

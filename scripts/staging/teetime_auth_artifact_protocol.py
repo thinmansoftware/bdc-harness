@@ -20,6 +20,7 @@ IMAGE_PATHS = tuple('scripts/staging/'+name for name in [
     'packages/providers/src/types.ts', 'packages/paths/src/logger.ts')
 ALL_PATHS = tuple(dict.fromkeys((*IMAGE_PATHS, *('scripts/staging/'+name for name in [
     'invoke-teetime-auth-canary.py', 'run-teetime-auth-canary.py', 'teetime_connect_proxy.py',
+    'teetime_successor_observation.py',
     'teetime_watchdog.py', 'teetime_bounded_process.py', 'teetime_proxy_receipt.py',
     'teetime_canary_protocol.py', 'codex-probe-seccomp.json', 'moby-default-seccomp.json',
     'codex-probe-minimization.json']))))

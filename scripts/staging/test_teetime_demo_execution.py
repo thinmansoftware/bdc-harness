@@ -73,7 +73,7 @@ class DemoExecutionTests(unittest.TestCase):
         self.value['predecessor'] = {
             'attemptId': 'ec3fd06e-5f27-4eda-9af1-2f759e4157ae',
             'completedAt': '2026-10-19T02:43:09.062Z', 'owner': 'teetime-auth-5eca42816a98',
-            **{key: 'sha256:'+'1'*64 for key in ('rowHash','executionHash','resultHash','claimHash')}}
+            **{key: 'sha256:'+'1'*64 for key in ('rowHash','executionHash','resultHash','claimHash','manifestHash','lockHash')}}
         execution = self.parse()
         self.assertEqual(execution.binding['attempt'], 2)
         with self.assertRaises(TypeError): execution.predecessor['owner'] = 'changed'

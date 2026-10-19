@@ -77,11 +77,12 @@ async function verifySource(
 export async function prepare(): Promise<Record<string, unknown>> {
   // No database consumer has been imported above this boundary.
   assertPrepareEnvironment(ROOT, join(homedir(), 'teetime-supervised-01'), process.env);
-  const claim = process.argv[2] === '--claim-model';
+  const successor = process.argv[2] === '--claim-successor';
+  const claim = successor || process.argv[2] === '--claim-model';
   if (
     process.platform !== 'win32' ||
     Bun.version !== '1.3.13' ||
-    SOURCE !== join(ROOT, claim ? 'execution-harness' : 'harness') ||
+    SOURCE !== join(ROOT, successor ? 'successor-execution-harness' : claim ? 'execution-harness' : 'harness') ||
     process.argv.length !== (claim ? 15 : 5) ||
     (!claim && process.argv[2] !== '--prepare') ||
     process.argv[3] !== '--input-sha256' ||
@@ -123,7 +124,7 @@ export async function prepare(): Promise<Record<string, unknown>> {
       SOURCE,
       process.argv[8]!,
       process.argv[10]!,
-      'execution-source-manifest.json'
+      successor ? 'successor-execution-source-manifest.json' : 'execution-source-manifest.json'
     );
     for (const name of [
       'packages/workflows/src/executor.ts',
@@ -174,8 +175,12 @@ export async function prepare(): Promise<Record<string, unknown>> {
   const archon = join(ROOT, 'archon');
   // A fresh preparation must never attach to an existing database.
   if (!claim) await assertFreshSqliteLocation(archon);
-  const control = join(ROOT, 'control');
-  if (claim) await ordinaryDirectory(control);
+  const originalControl = join(ROOT, 'control');
+  const control = successor ? join(ROOT, 'control-attempt-2') : originalControl;
+  if (successor) {
+    await ordinaryDirectory(originalControl);
+    await mkdir(control); // Deterministic exclusive successor location. Never recover/reuse.
+  } else if (claim) await ordinaryDirectory(control);
   else await mkdir(control); // No recursive reuse or stale-claim recovery.
   process.env.ARCHON_HOME = archon;
   process.env.DEFAULT_AI_ASSISTANT = 'codex';
@@ -260,7 +265,7 @@ export async function prepare(): Promise<Record<string, unknown>> {
         paths.getRunArtifactsPath('thinmansoftware', 'whats-that-tee-time', id),
     };
     const preparation = {
-      preparationRoot: control,
+      preparationRoot: originalControl,
       repositoryRoot: repository,
       worktreePath: worktree,
       dispatchId: input.dispatchId,
@@ -275,7 +280,7 @@ export async function prepare(): Promise<Record<string, unknown>> {
       observe,
     };
     if (claim) {
-      const { claimSupervisedModelAttempt } =
+      const { claimSupervisedModelAttempt, supervisedAttemptHash } =
         await import('../../packages/workflows/src/reliability/tee-time-supervised-model-phase');
       const { readPlanObservation } = await import('./teetime-plan-observation');
       const { readObservationLine, forwardSupervisedLauncher } =
@@ -287,7 +292,7 @@ export async function prepare(): Promise<Record<string, unknown>> {
         262144
       );
       const reader = Bun.stdin.stream().getReader();
-      async function check(mode: 'metadata' | 'ready' | 'report', bytes?: Buffer) {
+      async function check(mode: 'metadata' | 'ready' | 'report' | 'predecessor', bytes?: Buffer) {
         const child = Bun.spawn(
           [
             input.binaryPaths.python,
@@ -299,13 +304,16 @@ export async function prepare(): Promise<Record<string, unknown>> {
           ],
           {
             cwd: control,
-            env: { SYSTEMROOT: process.env.SYSTEMROOT!, WINDIR: process.env.WINDIR! },
+            env: { SYSTEMROOT: process.env.SYSTEMROOT!, WINDIR: process.env.WINDIR!,
+                   USERPROFILE: homedir(), PATH: dirname(input.binaryPaths.python) },
             stdin: bytes ? 'pipe' : 'ignore',
             stdout: 'pipe',
             stderr: 'ignore',
           }
         );
-        const timer = setTimeout(() => child.kill(), 15000);
+        // The predecessor collector has a 20s total query budget plus bounded
+        // child reaping. Its 30s freshness rule still rejects slow observations.
+        const timer = setTimeout(() => child.kill(), mode === 'predecessor' ? 30000 : 15000);
         try {
           if (bytes && child.stdin) {
             child.stdin.write(bytes);
@@ -326,10 +334,9 @@ export async function prepare(): Promise<Record<string, unknown>> {
         }
       }
       const execution = await check('metadata');
-      // V2 parsing is source preparation only until its deterministic custody and
-      // live predecessor observer are joined. Never run v2 through the v1 entry.
-      if (execution.binding.attempt !== 1 || execution.predecessor !== null)
-        throw new Error('successor operational entry not admitted');
+      if (execution.binding.attempt !== (successor ? 2 : 1) ||
+          (successor ? execution.predecessor === null : execution.predecessor !== null))
+        throw new Error('execution package differs from closed entry mode');
       if (execution.source !== process.argv[10] || execution.packageHash !== executionHash)
         throw new Error('actual execution source differs');
       const initial = await bootstrap.readSupervisedBinding(api, preparation);
@@ -349,6 +356,7 @@ export async function prepare(): Promise<Record<string, unknown>> {
         reviewHead: process.argv[12]!,
       };
       const observation = () => readPlanObservation(observationRaw, expected, Date.now());
+      let reconciliation: Record<string, unknown> | undefined;
       const attempt = await claimSupervisedModelAttempt({
         controller: ownership,
         executionHash: expected.executionHash,
@@ -371,6 +379,29 @@ export async function prepare(): Promise<Record<string, unknown>> {
           if (JSON.stringify(await check('metadata')) !== JSON.stringify(execution))
             throw new Error('execution context changed');
         },
+        ...(successor ? { successor: {
+          predecessor: execution.predecessor,
+          observe: async () => {
+            // This independently verifies the actual operator-paused run,
+            // authority, runtime revisions and original preparation custody.
+            await bootstrap.readSupervisedBinding(api, preparation);
+            const actual = await check('predecessor');
+            if (Object.keys(actual).sort().join(',') !==
+                'expiresAt,lockHash,manifestHash,observedAt,resourcesAbsent' ||
+                actual.lockHash !== execution.predecessor.lockHash ||
+                actual.manifestHash !== execution.predecessor.manifestHash)
+              throw new Error('actual predecessor reconciliation differs');
+            const value = {
+              predecessor: { ...execution.predecessor }, runId: initial.runId,
+              nodeId: 'implement' as const, attemptNumber: 1 as const,
+              outcomeClass: 'quality' as const, reasonCode: 'required_stage_failed' as const,
+              runPaused: true as const, resourcesAbsent: actual.resourcesAbsent,
+              observedAt: actual.observedAt, expiresAt: actual.expiresAt,
+            };
+            reconciliation = structuredClone(value);
+            return value;
+          },
+        } } : {}),
       });
       // Observation is evidence only; this file is written AFTER the durable claim.
       const { open } = await import('node:fs/promises');
@@ -380,6 +411,14 @@ export async function prepare(): Promise<Record<string, unknown>> {
         await evidence.sync();
       } finally {
         await evidence.close();
+      }
+      if (successor) {
+        if (!reconciliation) throw new Error('successor reconciliation evidence missing');
+        const evidence = await open(join(control, 'predecessor-reconciliation.json'), 'wx', 0o600);
+        try {
+          await evidence.writeFile(JSON.stringify(reconciliation));
+          await evidence.sync();
+        } finally { await evidence.close(); }
       }
       const result = await forwardSupervisedLauncher({
         reader,
@@ -443,23 +482,24 @@ export async function prepare(): Promise<Record<string, unknown>> {
         throw error; // Consumed claim/lock remain; no automatic relaunch.
       });
       const completedAt = new Date().toISOString();
+      const completion = {
+        attemptId: attempt.attemptId, completedAt, servedModelId: null,
+        outcomeClass: result.summary.passed ? 'success' as const : 'quality' as const,
+        reasonCode: result.summary.passed ? 'execution_completed' as const : 'required_stage_failed' as const,
+        resumeAt: null,
+      };
+      const expectedCompleted = { ...attempt, ...completion };
       if (
-        !(await api.store.completeProviderAttempt({
-          attemptId: attempt.attemptId,
-          completedAt,
-          servedModelId: null,
-          outcomeClass: result.summary.passed ? 'success' : 'quality',
-          reasonCode: result.summary.passed ? 'execution_completed' : 'required_stage_failed',
-          resumeAt: null,
-        }))
+        !(await api.store.completeProviderAttempt(completion))
       )
         throw new Error('attempt completion persistence failed');
       const persisted = await api.store.listProviderAttempts(initial.runId, 'implement');
+      const completed = persisted.find(row => row.attemptId === attempt.attemptId);
+      const predecessor = successor ? persisted.find(row => row.attemptId === execution.predecessor.attemptId) : null;
       if (
-        persisted.length !== 1 ||
-        persisted[0].attemptId !== attempt.attemptId ||
-        persisted[0].completedAt !== completedAt ||
-        persisted[0].outcomeClass !== (result.summary.passed ? 'success' : 'quality')
+        persisted.length !== (successor ? 2 : 1) || !completed ||
+        supervisedAttemptHash(completed) !== supervisedAttemptHash(expectedCompleted) ||
+        (successor && (!predecessor || supervisedAttemptHash(predecessor) !== execution.predecessor.rowHash))
       )
         throw new Error('attempt completion readback differs');
       const receipt = await open(join(control, 'model-result.json'), 'wx', 0o600);
@@ -505,13 +545,13 @@ if (import.meta.main) {
     process.stdout.write(
       JSON.stringify({
         kind:
-          process.argv[2] === '--claim-model'
+          ['--claim-model', '--claim-successor'].includes(process.argv[2]!)
             ? 'tee-time-supervised-model'
             : 'tee-time-supervised-prepare',
         passed: false,
         failureCategory: 'entry-rejected',
-        accountProvided: process.argv[2] === '--claim-model' ? null : false,
-        modelInvocations: process.argv[2] === '--claim-model' ? null : 0,
+        accountProvided: ['--claim-model', '--claim-successor'].includes(process.argv[2]!) ? null : false,
+        modelInvocations: ['--claim-model', '--claim-successor'].includes(process.argv[2]!) ? null : 0,
         operationalLaneReady: false,
       }) + '\n'
     );

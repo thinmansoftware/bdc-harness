@@ -489,7 +489,7 @@ actual app tests, app CI/CD, candidate review and preview remain outstanding.
 The first simulated-app source attempt failed its workspace check. It remains
 consumed. A version-2 execution package can describe exactly attempt 2, with a
 closed predecessor ID/completion time/row hash/execution hash/result hash/claim
-hash/resource owner. Version 1 remains first-attempt-only.
+hash/resource owner/manifest hash/lock hash. Version 1 remains first-attempt-only.
 
 The model-phase helper can validate a separately reviewed successor using two
 fresh source-owned reconciliation observations and complete stored-row readback.
@@ -498,8 +498,20 @@ stale or uncertain observations, changed rows, existing successors and concurren
 duplicate claims. This is a point-in-time operator observation, not an atomic
 Docker/SQLite transaction or a generic retry service.
 
-Successor OPERATIONAL ENTRY IS NOT ADMITTED yet. Both existing operator and
-controller reject version 2 before launch/account delivery. Remaining work is the
-live original-file/resource observer, deterministic successor installation/control
-directory, original preparation custody, and a new independently reviewed frozen
-execution package. No source fixture authorizes an authenticated successor.
+Successor OPERATIONAL EXECUTION IS NOT ADMITTED yet. Source now provides a closed
+`--claim-successor` entry in `successor-execution-harness`, requiring the complete
+`successor-execution-source-manifest.json` inventory. It creates the deterministic
+`control-attempt-2` directory exclusively, never reusing or recovering an existing
+directory. Original preparation custody always remains `control` and `harness`.
+
+Before the successor claim, a source-owned callback verifies the actual paused
+run and authority, original package/claim/lock/result/manifest hashes, terminal
+workspace failure and cleanup, absent exact Docker IDs (even without labels), and
+absent additional owned resources. Files are reread for stability. Both
+reconciliations expire after 30 seconds. Failed queries or uncertain state reject.
+The bounded observer has no account access and makes no Docker mutations.
+
+Remaining operational gates are a freshly frozen/installed source, measured image
+including its actual parser/helper bytes, complete attempt-2 prompt/package, and
+new independent exact-head approval. No source fixture authorizes an authenticated
+successor. Do not invoke the closed entry from the existing consumed installation.

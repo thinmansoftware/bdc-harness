@@ -81,8 +81,6 @@ def main():
             raise ValueError('bounded frozen local package required')
         execution_raw=path.read_bytes()
         execution=parse_demo_execution(execution_raw,args.demo_package_hash)
-        if execution.predecessor is not None:
-            raise ValueError('successor operational entry not admitted')
         if (execution.image,execution.source,execution.base_source)!=(args.image,args.artifact_source,args.expected_sha):
             raise ValueError('operator execution identity differs')
         observation=observe_plan(execution_raw,args.demo_package_hash,args.plan_head,nonce)
@@ -105,6 +103,9 @@ def main():
         command += " --task artifact --artifact-source '"+args.artifact_source+"'"
     if execution is not None:
         command = r'''$ErrorActionPreference='Stop'; & "$env:USERPROFILE\.bun\bin\bun.exe" --no-env-file "$env:USERPROFILE\teetime-supervised-01\execution-harness\scripts\staging\teetime-supervised-controller.ts" --claim-model --input-sha256 '''+"'"+args.input_sha256+"' --execution-sha256 '"+args.demo_package_hash+"' --source-manifest-sha256 '"+args.source_manifest_sha256+"' --source-sha '"+args.artifact_source+"' --review-head '"+args.plan_head+"' --nonce '"+nonce+"'"
+        if execution.predecessor is not None:
+            command = command.replace('\\execution-harness\\', '\\successor-execution-harness\\').replace(
+                ' --claim-model ', ' --claim-successor ')
     encoded = base64.b64encode(command.encode('utf-16le')).decode()
     child = subprocess.Popen(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
         'bdc-server', 'powershell', '-NoProfile', '-EncodedCommand', encoded], stdin=subprocess.PIPE,

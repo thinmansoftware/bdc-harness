@@ -72,7 +72,7 @@ def parse_demo_execution(raw, expected_hash):
     if successor:
         prior = value['predecessor']
         if (type(prior) is not dict or set(prior) != {'attemptId', 'completedAt', 'rowHash',
-                'executionHash', 'resultHash', 'claimHash', 'owner'}
+                'executionHash', 'resultHash', 'claimHash', 'owner', 'manifestHash', 'lockHash'}
                 or type(prior['attemptId']) is not str
                 or re.fullmatch('[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', prior['attemptId']) is None
                 or type(prior['completedAt']) is not str
@@ -80,7 +80,7 @@ def parse_demo_execution(raw, expected_hash):
                 or type(prior['owner']) is not str
                 or re.fullmatch('teetime-auth-[a-f0-9]{12}', prior['owner']) is None
                 or any(type(prior[key]) is not str or re.fullmatch('sha256:[a-f0-9]{64}', prior[key]) is None
-                       for key in ('rowHash', 'executionHash', 'resultHash', 'claimHash'))):
+                       for key in ('rowHash', 'executionHash', 'resultHash', 'claimHash', 'manifestHash', 'lockHash'))):
             raise ValueError('closed successor predecessor binding required')
         datetime.strptime(prior['completedAt'], '%Y-%m-%dT%H:%M:%S.%fZ')
         predecessor = MappingProxyType(dict(prior))

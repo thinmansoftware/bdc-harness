@@ -69,5 +69,23 @@ class ControllerCheckTests(unittest.TestCase):
         self.raw += b' '
         with self.assertRaises(ValueError): self.invoke('metadata')
 
+    def test_successor_metadata_and_live_observer_are_bound_to_package(self):
+        with self.assertRaises(ValueError): self.invoke('predecessor')
+        fixture = execution_tests.DemoExecutionTests(); fixture.setUp()
+        fixture.value.update(version=2, kind='supervised-demo-v2')
+        fixture.value['binding']['attempt'] = 2
+        fixture.value['predecessor'] = {
+            'attemptId':'ec3fd06e-5f27-4eda-9af1-2f759e4157ae',
+            'completedAt':'2026-10-19T02:43:09.062Z', 'owner':'teetime-auth-5eca42816a98',
+            **{key:'sha256:'+'1'*64 for key in
+               ['rowHash','executionHash','resultHash','claimHash','manifestHash','lockHash']}}
+        self.raw = canonical(fixture.value).encode()
+        self.execution = fixture.parse()
+        self.assertEqual(self.invoke('metadata')['predecessor'],fixture.value['predecessor'])
+        with patch('teetime_successor_observation.observe_local',return_value={'fixture':True}) as observed:
+            self.assertEqual(self.invoke('predecessor'),{'fixture':True})
+            self.assertEqual(observed.call_args.args[1],fixture.value['predecessor'])
+            self.assertEqual(observed.call_args.args[2],'actual-run')
+
 
 if __name__ == '__main__': unittest.main()

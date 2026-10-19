@@ -34,6 +34,7 @@ async function successorFixture() {
     rowHash: supervisedAttemptHash(previous), executionHash: 'sha256:' + '1'.repeat(64),
     resultHash: 'sha256:' + '2'.repeat(64), claimHash: 'sha256:' + '3'.repeat(64),
     owner: 'teetime-auth-5eca42816a98',
+    manifestHash: 'sha256:'+'4'.repeat(64), lockHash: 'sha256:'+'5'.repeat(64),
   };
   const observe = async (): Promise<SupervisedReconciliation> => ({
     predecessor: { ...predecessor }, runId: 'prepared-run', nodeId: 'implement',
@@ -153,6 +154,16 @@ test('returned reconciliation is snapshotted before subsequent store callbacks',
   };
   await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
   await expect(readFile(join(f.root, 'model.claim.json'))).rejects.toThrow();
+  await f.input.controller.releaseAfterNormalCompletion();
+});
+
+test('complete attempt projection detects drift in every persisted field', async () => {
+  const f = await successorFixture();
+  const expected = supervisedAttemptHash(f.previous);
+  for (const key of Object.keys(f.previous) as (keyof ProviderAttemptRecord)[]) {
+    const changed = { ...f.previous, [key]: key === 'requiredCapabilities' ? [] : 'different' };
+    expect(supervisedAttemptHash(changed as ProviderAttemptRecord)).not.toBe(expected);
+  }
   await f.input.controller.releaseAfterNormalCompletion();
 });
 async function fixture() {

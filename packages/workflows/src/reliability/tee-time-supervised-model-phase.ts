@@ -35,6 +35,8 @@ export interface SupervisedPredecessor {
   resultHash: string;
   claimHash: string;
   owner: string;
+  manifestHash: string;
+  lockHash: string;
 }
 export interface SupervisedReconciliation {
   predecessor: SupervisedPredecessor;
@@ -59,18 +61,19 @@ export function supervisedAttemptHash(row: ProviderAttemptRecord): string {
 
 function predecessorIdentity(value: SupervisedPredecessor): string {
   if (!value || Object.keys(value).sort().join(',') !==
-      'attemptId,claimHash,completedAt,executionHash,owner,resultHash,rowHash' ||
+      'attemptId,claimHash,completedAt,executionHash,lockHash,manifestHash,owner,resultHash,rowHash' ||
       !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value.attemptId) ||
       !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.completedAt) ||
       !Number.isFinite(Date.parse(value.completedAt)) ||
       Number(value.completedAt.slice(0, 4)) < 1 ||
       new Date(value.completedAt).toISOString() !== value.completedAt ||
       !/^teetime-auth-[a-f0-9]{12}$/.test(value.owner) ||
-      ![value.rowHash, value.executionHash, value.resultHash, value.claimHash].every(
+      ![value.rowHash, value.executionHash, value.resultHash, value.claimHash,
+        value.manifestHash, value.lockHash].every(
         item => typeof item === 'string' && /^sha256:[a-f0-9]{64}$/.test(item)))
     throw new Error('closed predecessor binding required');
   return JSON.stringify([value.attemptId, value.completedAt, value.rowHash,
-    value.executionHash, value.resultHash, value.claimHash, value.owner]);
+    value.executionHash, value.resultHash, value.claimHash, value.owner, value.manifestHash, value.lockHash]);
 }
 
 function reconcileSuccessor(

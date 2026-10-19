@@ -33,7 +33,8 @@ test('operational prepare rejects shared DB before imports and emits closed diag
   }
 });
 
-test('model entry rejects shared DB without READY, account delivery or launcher output', async () => {
+for (const mode of ['--claim-model','--claim-successor'])
+test(`${mode} entry rejects shared DB without READY, account delivery or launcher output`, async () => {
   const env: Record<string, string> = { DATABASE_URL: '' };
   for (const key of ['SYSTEMROOT', 'WINDIR', 'PATH', 'USERPROFILE', 'HOME'])
     if (process.env[key]) env[key] = process.env[key]!;
@@ -42,7 +43,7 @@ test('model entry rejects shared DB without READY, account delivery or launcher 
       process.execPath,
       '--no-env-file',
       fileURLToPath(new URL('./teetime-supervised-controller.ts', import.meta.url)),
-      '--claim-model',
+      mode,
       '--input-sha256',
       '0'.repeat(64),
     ],
