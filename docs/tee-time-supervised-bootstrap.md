@@ -594,3 +594,31 @@ Passing this API-auth transport fixture does not establish ChatGPT-login
 transport parity, entitlement, completed inference or the original failure's
 cause. No real account access, binary/model change, proxy policy relaxation or
 fourth authenticated attempt is authorized by these source changes.
+
+## Contract Amendment: bounded User-Agent metadata
+
+Two separately reviewed synthetic ChatGPT-mode fixtures reproduced eleven
+unsupported_header denials; the closed header classifier identified user_agent
+in all eleven. The API-key framing fixture had no such denials. These are
+credential-free compatibility observations, not proof of attempt3's cause or
+model entitlement. Original receipts and frozen parsers remain immutable.
+
+The independently reviewed source-only amendment permits one case-insensitive
+User-Agent field: its value must be at most256 bytes before trimming, contain
+only ASCII0x20 through0x7e, and contain a non-space character after existing space
+trimming. No value is logged, hashed or persisted. Destination/method/port,
+duplicate detection, total-header bound, DNS validation, tunnel byte/time limits
+and every other header rule remain unchanged. Authorization, Proxy-Authorization
+and Accept still fail closed. This is a new parser/source identity, never an edit
+to a consumed package or live proxy installation.
+
+Source stop conditions:
+
+- `python -B -m unittest discover -s scripts/staging -p test_teetime_connect_proxy.py`
+- `python -B -m unittest discover -s scripts/staging -p test_teetime_native_header_diagnostic.py`
+- New exact-head CI, then separate review of one frozen synthetic ChatGPT fixture
+  using the amended parser. Require local mode proof, no unsupported headers,
+  no upstream/turn completion and verified process/resource cleanup.
+
+This amendment is source preparation only. It grants no authenticated retry,
+model/binary change, egress expansion or production deployment.

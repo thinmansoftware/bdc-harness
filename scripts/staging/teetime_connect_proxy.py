@@ -56,6 +56,7 @@ def parse_connect(data):
     for line in lines[1:-2]:
         key, sep, value = line.partition(':')
         key = key.lower()
+        raw_value = value
         value = value.strip(' ')
         if not sep:
             raise ConnectPolicyError('encoding_or_framing')
@@ -66,8 +67,11 @@ def parse_connect(data):
             continue
         if key in ['proxy-connection', 'connection'] and value.lower() == 'keep-alive':
             continue
+        if key == 'user-agent' and value and len(raw_value) <= 256 and all(
+                0x20 <= ord(character) <= 0x7e for character in raw_value):
+            continue
         raise ConnectPolicyError('invalid_header_value' if key in
-                                 ['host', 'proxy-connection', 'connection']
+                                 ['host', 'proxy-connection', 'connection', 'user-agent']
                                  else 'unsupported_header')
     return 'chatgpt.com'
 

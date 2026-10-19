@@ -5,10 +5,26 @@ from unittest.mock import patch
 from unittest.mock import AsyncMock
 import teetime_connect_proxy as proxy
 
-from teetime_connect_proxy import parse_connect, validate_addresses, handle_client
+from teetime_connect_proxy import parse_connect, validate_addresses, handle_client, ConnectPolicyError
 
 
 class PolicyTests(unittest.TestCase):
+    def test_bounded_user_agent_metadata_contract(self):
+        prefix=b'CONNECT chatgpt.com:443 HTTP/1.1\r\n'
+        for value in [b' codex_cli_rs/0.153.3 (Linux; x86_64) ', b'x'*256]:
+            self.assertEqual(parse_connect(prefix+b'uSeR-aGeNt:'+value+b'\r\n\r\n'),'chatgpt.com')
+        for value in [b'',b'   ',b'x'*257,b' '+b'x'*256,b'x'*256+b' ',
+                      b'\tx',b'x\t',b'x\x01',b'x\x7f',b'x\xff']:
+            with self.subTest(valueLength=len(value)),self.assertRaises(ConnectPolicyError):
+                parse_connect(prefix+b'User-Agent:'+value+b'\r\n\r\n')
+        with self.assertRaises(ConnectPolicyError) as duplicate:
+            parse_connect(prefix+b'User-Agent: x\r\nuser-agent: x\r\n\r\n')
+        self.assertEqual(duplicate.exception.reason,'duplicate_header')
+        for name in [b'Authorization',b'Proxy-Authorization',b'Accept',b'X-Unknown']:
+            with self.subTest(name=name),self.assertRaises(ConnectPolicyError) as denied:
+                parse_connect(prefix+name+b': x\r\nUser-Agent: x\r\n\r\n')
+            self.assertEqual(denied.exception.reason,'unsupported_header')
+
     def test_denial_reason_is_closed_and_contains_no_request_material(self):
         prefix = b'CONNECT chatgpt.com:443 HTTP/1.1\r\n'
         cases = [
