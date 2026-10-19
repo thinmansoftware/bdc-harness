@@ -32,6 +32,7 @@ function loadLiveTiers() {
 import { loadRuleset } from '../conductor.js';
 import { TimeoutError } from '../poll.js';
 import { resumeFrontierTier } from '../frontier-approval.js';
+import type { CodexOnlyDispatchBinding } from '../../../workflows/src/reliability/dispatch-binding.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -122,6 +123,222 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     },
   };
 }
+
+describe('binding-v2 durable replay foundation', () => {
+  function binding(): CodexOnlyDispatchBinding {
+    return {
+      version: 'codex-only-v2',
+      project: 'test-project',
+      codebaseId: 'owned-codebase',
+      codebaseName: 'test-project',
+      defaultCwd: '/owned/registered/project',
+      workflowName: 'bdc-feature-development-codex-only',
+      workflowSha256: 'a'.repeat(64),
+    };
+  }
+
+  function options(): RunCascadeOptions {
+    return baseOpts({
+      dispatchId: randomUUID(),
+      codexOnly: true,
+      dispatchBinding: binding(),
+      entryOverride: 'codex',
+      dryRun: true,
+    });
+  }
+
+  function recordPath(opts: RunCascadeOptions): string {
+    const digest = createHash('sha256').update(opts.dispatchId!).digest('hex').slice(0, 24);
+    return join(opts.outDir!, `dispatch-${digest}`, 'cascade-record.json');
+  }
+
+  test('persists the complete comparison snapshot before admission callback', async () => {
+    const opts = options();
+    const admissions: boolean[] = [];
+    opts.onAdmission = (record, created) => {
+      expect(record.request.dispatchBinding).toEqual(binding());
+      admissions.push(created);
+    };
+    const record = await runCascade(opts);
+    expect(record.status).toBe('planned');
+    expect(record.request).toEqual({
+      woClass: 'CODE',
+      tags: ['mechanical'],
+      entryOverride: 'codex',
+      codexOnly: true,
+      dispatchBinding: binding(),
+      dryRun: true,
+    });
+    expect(JSON.parse(await readFile(recordPath(opts), 'utf8'))).toEqual(record);
+    expect(admissions).toEqual([true]);
+  });
+
+  test('reordered identical binding replays without overwrite or successor', async () => {
+    const opts = options();
+    const admissions: boolean[] = [];
+    let fires = 0;
+    opts.onAdmission = (_record, created) => admissions.push(created);
+    opts.deps!.fire = async () => {
+      fires++;
+      return makeFireOk('must-not-fire');
+    };
+    const first = await runCascade(opts);
+    const bytes = await readFile(recordPath(opts), 'utf8');
+    const reordered = Object.fromEntries(
+      Object.entries(binding()).reverse()
+    ) as CodexOnlyDispatchBinding;
+    const replay = await runCascade({ ...opts, dispatchBinding: reordered });
+    expect(replay).toEqual(first);
+    expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
+    expect(admissions).toEqual([true, false]);
+    expect(fires).toBe(0);
+    expect(Object.keys(first.request.dispatchBinding!)).toEqual(Object.keys(binding()));
+  });
+
+  test('caller mutation cannot change the parsed durable snapshot', async () => {
+    const opts = options();
+    const pending = runCascade(opts);
+    opts.dispatchBinding!.codebaseId = 'caller-replacement';
+    const record = await pending;
+    expect(record.request.dispatchBinding).toEqual(binding());
+    expect(JSON.parse(await readFile(recordPath(opts), 'utf8'))).toEqual(record);
+  });
+
+  test('changed comparison fields conflict without replacing the existing record', async () => {
+    const opts = options();
+    let admissions = 0;
+    opts.onAdmission = () => {
+      admissions++;
+    };
+    await runCascade(opts);
+    const bytes = await readFile(recordPath(opts), 'utf8');
+    for (const change of [
+      { codebaseId: 'replacement-id' },
+      { codebaseName: 'replacement-name' },
+      { defaultCwd: '/replacement/registered/project' },
+      { workflowSha256: 'b'.repeat(64) },
+      { project: 'replacement-project' },
+    ]) {
+      await expect(
+        runCascade({
+          ...opts,
+          project: change.project ?? opts.project,
+          dispatchBinding: { ...binding(), ...change },
+        })
+      ).rejects.toThrow('dispatch identity conflict');
+      expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
+    }
+    for (const codexOnly of [undefined, false]) {
+      await expect(runCascade({ ...opts, codexOnly, dispatchBinding: undefined })).rejects.toThrow(
+        'dispatch identity conflict'
+      );
+      expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
+    }
+    expect(admissions).toBe(1);
+  });
+
+  test.each(['absent', 'codex-only-v1', 'codex-only-v99'])(
+    'historical %s binding cannot replay as the same v2 dispatch',
+    async version => {
+      const opts = options();
+      const historical = await runCascade({ ...opts, dispatchBinding: undefined });
+      if (version !== 'absent') {
+        historical.request.dispatchBinding = { ...binding(), version } as CodexOnlyDispatchBinding;
+        await writeFile(recordPath(opts), JSON.stringify(historical, null, 2) + '\n');
+      }
+      const bytes = await readFile(recordPath(opts), 'utf8');
+      await expect(runCascade(opts)).rejects.toThrow('dispatch identity conflict');
+      expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
+    }
+  );
+
+  test('malformed or contradictory bindings refuse before reads or admission', async () => {
+    const previous = globalThis.fetch;
+    let effects = 0;
+    globalThis.fetch = (async () => {
+      effects++;
+      throw new Error('must not read');
+    }) as typeof fetch;
+    try {
+      for (const invalid of [
+        { ...binding(), version: 'codex-only-v1' },
+        { ...binding(), version: 'codex-only-v99' },
+        { ...binding(), workflowName: 'ordinary-workflow' },
+        { ...binding(), project: 'other-project' },
+        { ...binding(), defaultCwd: 'relative/project' },
+        { ...binding(), extra: true },
+        null,
+      ]) {
+        const opts = options();
+        opts.dispatchBinding = invalid as CodexOnlyDispatchBinding;
+        opts.onAdmission = () => {
+          effects++;
+        };
+        opts.deps!.createRecord = async () => {
+          effects++;
+          throw new Error('must not admit');
+        };
+        await expect(runCascade(opts)).rejects.toThrow('codex_only_invalid_options');
+      }
+      for (const codexOnly of [undefined, false]) {
+        const opts = { ...options(), codexOnly };
+        opts.onAdmission = () => {
+          effects++;
+        };
+        opts.deps!.createRecord = async () => {
+          effects++;
+          throw new Error('must not admit');
+        };
+        await expect(runCascade(opts)).rejects.toThrow('codex_only_invalid_options');
+      }
+      expect(effects).toBe(0);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  test('bound live options fail closed until execution propagation is implemented', async () => {
+    const previous = globalThis.fetch;
+    let effects = 0;
+    globalThis.fetch = (async () => {
+      effects++;
+      throw new Error('must not read');
+    }) as typeof fetch;
+    try {
+      for (const dryRun of [undefined, false, 'true' as unknown as boolean]) {
+        const opts = { ...options(), dryRun };
+        opts.onAdmission = () => {
+          effects++;
+        };
+        opts.deps!.acquireWoLock = async () => {
+          effects++;
+          throw new Error('must not lock');
+        };
+        opts.deps!.createRecord = async () => {
+          effects++;
+          throw new Error('must not admit');
+        };
+        opts.deps!.fire = async () => {
+          effects++;
+          throw new Error('must not fire');
+        };
+        await expect(runCascade(opts)).rejects.toThrow('codex_only_binding_not_supported');
+      }
+      expect(effects).toBe(0);
+      expect(CODEX_ONLY_DISPATCH_CAPABILITY).toBe('codex-only-v1');
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  test('ordinary absent and false plans omit both restricted request fields', async () => {
+    for (const codexOnly of [undefined, false]) {
+      const record = await runCascade({ ...options(), codexOnly, dispatchBinding: undefined });
+      expect('codexOnly' in record.request).toBe(false);
+      expect('dispatchBinding' in record.request).toBe(false);
+    }
+  });
+});
 
 describe('bounded supervised Codex-only dispatch', () => {
   async function withRegistration(work: () => Promise<void>): Promise<void> {

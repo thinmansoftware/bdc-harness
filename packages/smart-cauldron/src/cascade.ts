@@ -19,6 +19,10 @@
 
 import { randomUUID } from 'crypto';
 import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
+import {
+  dispatchBindingSchema,
+  type CodexOnlyDispatchBinding,
+} from '../../workflows/src/reliability/dispatch-binding.js';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
@@ -211,6 +215,8 @@ export interface RunCascadeOptions {
   entryOverride?: TierName;
   /** Explicit, bounded supervised dispatch; requires entryOverride codex. */
   codexOnly?: boolean;
+  /** Optional v2 comparison snapshot. Bound live dispatch remains unsupported until fully wired. */
+  dispatchBinding?: CodexOnlyDispatchBinding;
   /**
    * Seed the informed-climb context of the FIRST attempt. Used only when
    * resuming an approved frontier-approval pause (WO-HARNESS-FRONTIER-CLIMB-
@@ -271,6 +277,17 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     throw new Error('codex_only_invalid_options');
   }
   const codexOnly = opts.codexOnly === true;
+  let dispatchBinding: CodexOnlyDispatchBinding | undefined;
+  if (opts.dispatchBinding !== undefined) {
+    const parsed = dispatchBindingSchema.safeParse(opts.dispatchBinding);
+    if (!codexOnly || !parsed.success || parsed.data.project !== opts.project) {
+      throw new Error('codex_only_invalid_options');
+    }
+    // Snapshot before any await; normalize key order without changing comparison values.
+    dispatchBinding = parsed.data;
+    // Never admit a bound live request while downstream execution could drop its restriction.
+    if (opts.dryRun !== true) throw new Error('codex_only_binding_not_supported');
+  }
   const {
     woId,
     dispatchId,
@@ -422,6 +439,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         tags: [...(tags ?? [])].sort(),
         entryOverride: entryOverride ?? null,
         ...(codexOnly ? { codexOnly: true as const } : {}),
+        ...(dispatchBinding ? { dispatchBinding } : {}),
         dryRun: true,
       },
       createdAt,
@@ -465,6 +483,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         tags: [...(tags ?? [])].sort(),
         entryOverride: entryOverride ?? null,
         ...(codexOnly ? { codexOnly: true as const } : {}),
+        ...(dispatchBinding ? { dispatchBinding } : {}),
         dryRun: false,
       },
       createdAt,
@@ -500,6 +519,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           tags: [...(tags ?? [])].sort(),
           entryOverride: entryOverride ?? null,
           ...(codexOnly ? { codexOnly: true as const } : {}),
+          ...(dispatchBinding ? { dispatchBinding } : {}),
           dryRun: false,
         },
         createdAt,
@@ -571,6 +591,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           tags: [...(tags ?? [])].sort(),
           entryOverride: entryOverride ?? null,
           ...(codexOnly ? { codexOnly: true as const } : {}),
+          ...(dispatchBinding ? { dispatchBinding } : {}),
           dryRun: false,
         },
         createdAt,

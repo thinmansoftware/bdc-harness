@@ -6,6 +6,7 @@
  */
 
 import type { EntrySelection } from './headroom.js';
+import type { CodexOnlyDispatchBinding } from '../../workflows/src/reliability/dispatch-binding.js';
 
 export type TierName = string; // e.g. "zero", "qwen", "codex", "claude", "frontier"
 
@@ -122,6 +123,8 @@ export interface CascadeRunRecord {
     dryRun: boolean;
     /** Omitted on legacy requests to preserve replay identity. */
     codexOnly?: true;
+    /** Full comparison identity; its version discriminates restricted protocol replays. */
+    dispatchBinding?: CodexOnlyDispatchBinding;
   };
   createdAt: string;
   status: CascadeStatus;
