@@ -5,13 +5,155 @@ import { join } from 'node:path';
 import { acquireSupervisedController } from './tee-time-supervised-bootstrap';
 import {
   claimSupervisedModelAttempt,
+  supervisedAttemptHash,
   type SupervisedPlanReview,
+  type SupervisedPredecessor,
+  type SupervisedReconciliation,
 } from './tee-time-supervised-model-phase';
 import type { ProviderAttemptRecord } from './types';
 
 const roots: string[] = [];
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true });
+});
+
+async function successorFixture() {
+  const f = await fixture();
+  const previous: ProviderAttemptRecord = {
+    attemptId: 'ec3fd06e-5f27-4eda-9af1-2f759e4157ae', runId: 'prepared-run',
+    nodeId: 'implement', attemptNumber: 1, provider: 'codex-native-strict',
+    model: 'gpt-5.6-sol', declaredProvider: 'codex-native-strict', declaredModel: 'gpt-5.6-sol',
+    requiredCapabilities: ['text_generation'], startedAt: '2026-10-19T02:40:48.408Z',
+    completedAt: '2026-10-19T02:43:09.062Z', servedModelId: null,
+    outcomeClass: 'quality', reasonCode: 'required_stage_failed', resumeAt: null,
+    supersedesAttemptId: null,
+  };
+  f.records.push(previous);
+  const predecessor: SupervisedPredecessor = {
+    attemptId: previous.attemptId, completedAt: previous.completedAt!,
+    rowHash: supervisedAttemptHash(previous), executionHash: 'sha256:' + '1'.repeat(64),
+    resultHash: 'sha256:' + '2'.repeat(64), claimHash: 'sha256:' + '3'.repeat(64),
+    owner: 'teetime-auth-5eca42816a98',
+  };
+  const observe = async (): Promise<SupervisedReconciliation> => ({
+    predecessor: { ...predecessor }, runId: 'prepared-run', nodeId: 'implement',
+    attemptNumber: 1, outcomeClass: 'quality', reasonCode: 'required_stage_failed',
+    runPaused: true, resourcesAbsent: true, observedAt: Date.now(), expiresAt: Date.now() + 20000,
+  });
+  return { ...f, predecessor, previous, input: { ...f.input, successor: { predecessor, observe } } };
+}
+
+test('fresh reconciled successor preserves terminal predecessor and links attempt 2', async () => {
+  const f = await successorFixture();
+  const original = supervisedAttemptHash(f.previous);
+  const next = await claimSupervisedModelAttempt(f.input);
+  expect(next.attemptNumber).toBe(2);
+  expect(next.supersedesAttemptId).toBe(f.previous.attemptId);
+  expect(supervisedAttemptHash(f.records[0])).toBe(original);
+  expect(f.records).toHaveLength(2);
+  await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+  await f.input.controller.releaseAfterNormalCompletion();
+});
+
+test('stale, forged, uncertain and failed resource observations reject before claim', async () => {
+  for (const kind of ['stale', 'future', 'expiry', 'result', 'claim', 'execution', 'owner',
+    'run', 'resources', 'paused', 'extra', 'query-failure']) {
+    const f = await successorFixture();
+    const initial = f.input.successor.observe;
+    f.input.successor.observe = async () => {
+      if (kind === 'query-failure') throw new Error('Docker observation failed');
+      const value = await initial();
+      if (kind === 'stale') value.observedAt -= 60000;
+      if (kind === 'future') value.observedAt += 60000;
+      if (kind === 'expiry') value.expiresAt = Date.now() - 1;
+      if (kind === 'result') value.predecessor.resultHash = 'sha256:' + '0'.repeat(64);
+      if (kind === 'claim') value.predecessor.claimHash = 'sha256:' + '0'.repeat(64);
+      if (kind === 'execution') value.predecessor.executionHash = 'sha256:' + '0'.repeat(64);
+      if (kind === 'owner') value.predecessor.owner = 'teetime-auth-000000000000';
+      if (kind === 'run') value.runId = 'foreign-run';
+      if (kind === 'resources') Object.assign(value, { resourcesAbsent: false });
+      if (kind === 'paused') Object.assign(value, { runPaused: false });
+      if (kind === 'extra') Object.assign(value, { ignored: true });
+      return value;
+    };
+    await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+    expect(f.records).toHaveLength(1);
+    await expect(readFile(join(f.root, 'model.claim.json'))).rejects.toThrow();
+    await f.input.controller.releaseAfterNormalCompletion();
+  }
+});
+
+test('nonterminal, changed or duplicated predecessor rows reject before claim', async () => {
+  for (const kind of ['completion', 'outcome', 'reason', 'provider', 'link', 'capabilities', 'successor']) {
+    const f = await successorFixture();
+    if (kind === 'completion') Object.assign(f.previous, { completedAt: null });
+    if (kind === 'outcome') Object.assign(f.previous, { outcomeClass: 'success' });
+    if (kind === 'reason') Object.assign(f.previous, { reasonCode: 'execution_completed' });
+    if (kind === 'provider') Object.assign(f.previous, { provider: 'foreign' });
+    if (kind === 'link') Object.assign(f.previous, { supersedesAttemptId: 'foreign' });
+    if (kind === 'capabilities') Object.assign(f.previous, { requiredCapabilities: [] });
+    if (kind === 'successor') f.records.push({ ...f.previous, attemptNumber: 2 });
+    await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+    await expect(readFile(join(f.root, 'model.claim.json'))).rejects.toThrow();
+    await f.input.controller.releaseAfterNormalCompletion();
+  }
+});
+
+test('predecessor mutation during final recheck cannot consume successor claim', async () => {
+  const f = await successorFixture();
+  let reads = 0;
+  const initial = f.input.successor.observe;
+  f.input.successor.observe = async () => {
+    if (++reads === 2) Object.assign(f.previous, { servedModelId: 'changed' });
+    return initial();
+  };
+  await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+  await expect(readFile(join(f.root, 'model.claim.json'))).rejects.toThrow();
+  await f.input.controller.releaseAfterNormalCompletion();
+});
+
+test('concurrent successor claims cannot insert two attempts', async () => {
+  const f = await successorFixture();
+  const settled = await Promise.allSettled([
+    claimSupervisedModelAttempt(f.input), claimSupervisedModelAttempt(f.input),
+  ]);
+  expect(settled.filter(item => item.status === 'fulfilled')).toHaveLength(1);
+  expect(f.records).toHaveLength(2);
+  expect(f.records[1].supersedesAttemptId).toBe(f.previous.attemptId);
+  await f.input.controller.releaseAfterNormalCompletion();
+});
+
+test('initial callbacks cannot replace the supplied predecessor identity', async () => {
+  const f = await successorFixture();
+  const initial = f.input.recheckExecution;
+  f.input.recheckExecution = async () => {
+    f.predecessor.resultHash = 'sha256:' + '0'.repeat(64);
+    return initial();
+  };
+  await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+  await expect(readFile(join(f.root, 'model.claim.json'))).rejects.toThrow();
+  await f.input.controller.releaseAfterNormalCompletion();
+});
+
+test('returned reconciliation is snapshotted before subsequent store callbacks', async () => {
+  const f = await successorFixture();
+  const initial = f.input.successor.observe;
+  let observation: SupervisedReconciliation | undefined;
+  let reads = 0;
+  f.input.successor.observe = async () => {
+    observation = await initial();
+    if (++reads === 2) Object.assign(observation, { resourcesAbsent: false });
+    return observation;
+  };
+  const list = f.input.store.listProviderAttempts;
+  f.input.store.listProviderAttempts = async () => {
+    // A shared mutable false observation must not become true after it returned.
+    if (observation) Object.assign(observation, { resourcesAbsent: true });
+    return list();
+  };
+  await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+  await expect(readFile(join(f.root, 'model.claim.json'))).rejects.toThrow();
+  await f.input.controller.releaseAfterNormalCompletion();
 });
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'teetime-model-phase-'));

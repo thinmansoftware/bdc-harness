@@ -1,6 +1,7 @@
 // Narrow supervised model transition. No provider, network or credential access.
 // Operational callbacks must read actual current GitHub/run state under custody.
 import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { TEE_TIME_SUPERVISED_POLICY } from '../../../paths/src/tee-time-supervised-policy';
 import type { IWorkflowStore } from '../store';
 import type { ProviderAttemptRecord } from './types';
@@ -24,6 +25,89 @@ export interface SupervisedPlanReview {
   }[];
 }
 
+// This is one explicitly reviewed successor, not a retry policy. The operational
+// callback must observe the original files, paused run and Docker resources.
+export interface SupervisedPredecessor {
+  attemptId: string;
+  completedAt: string;
+  rowHash: string;
+  executionHash: string;
+  resultHash: string;
+  claimHash: string;
+  owner: string;
+}
+export interface SupervisedReconciliation {
+  predecessor: SupervisedPredecessor;
+  runId: string;
+  nodeId: 'implement';
+  attemptNumber: 1;
+  outcomeClass: 'quality';
+  reasonCode: 'required_stage_failed';
+  runPaused: true;
+  resourcesAbsent: true;
+  observedAt: number;
+  expiresAt: number;
+}
+export function supervisedAttemptHash(row: ProviderAttemptRecord): string {
+  // Fixed projection includes every persisted field, including null values.
+  const values = [row.attemptId, row.runId, row.nodeId, row.attemptNumber,
+    row.provider, row.model, row.declaredProvider, row.declaredModel,
+    row.requiredCapabilities, row.startedAt, row.completedAt, row.servedModelId,
+    row.outcomeClass, row.reasonCode, row.resumeAt, row.supersedesAttemptId];
+  return 'sha256:' + createHash('sha256').update(JSON.stringify(values)).digest('hex');
+}
+
+function predecessorIdentity(value: SupervisedPredecessor): string {
+  if (!value || Object.keys(value).sort().join(',') !==
+      'attemptId,claimHash,completedAt,executionHash,owner,resultHash,rowHash' ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value.attemptId) ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.completedAt) ||
+      !Number.isFinite(Date.parse(value.completedAt)) ||
+      Number(value.completedAt.slice(0, 4)) < 1 ||
+      new Date(value.completedAt).toISOString() !== value.completedAt ||
+      !/^teetime-auth-[a-f0-9]{12}$/.test(value.owner) ||
+      ![value.rowHash, value.executionHash, value.resultHash, value.claimHash].every(
+        item => typeof item === 'string' && /^sha256:[a-f0-9]{64}$/.test(item)))
+    throw new Error('closed predecessor binding required');
+  return JSON.stringify([value.attemptId, value.completedAt, value.rowHash,
+    value.executionHash, value.resultHash, value.claimHash, value.owner]);
+}
+
+function reconcileSuccessor(
+  expected: SupervisedPredecessor,
+  observed: SupervisedReconciliation,
+  rows: readonly ProviderAttemptRecord[],
+  runId: string
+): string {
+  const identity = predecessorIdentity(expected);
+  const now = Date.now();
+  if (!observed || Object.keys(observed).sort().join(',') !==
+      'attemptNumber,expiresAt,nodeId,observedAt,outcomeClass,predecessor,reasonCode,resourcesAbsent,runId,runPaused' ||
+      predecessorIdentity(observed.predecessor) !== identity ||
+      observed.runId !== runId || observed.nodeId !== 'implement' ||
+      observed.attemptNumber !== 1 || observed.outcomeClass !== 'quality' ||
+      observed.reasonCode !== 'required_stage_failed' ||
+      observed.runPaused !== true || observed.resourcesAbsent !== true ||
+      !Number.isSafeInteger(observed.observedAt) || !Number.isSafeInteger(observed.expiresAt) ||
+      observed.observedAt > now + 5000 || observed.observedAt < now - 30000 ||
+      observed.expiresAt <= now || observed.expiresAt <= observed.observedAt ||
+      observed.expiresAt > observed.observedAt + 30000)
+    throw new Error('fresh verified predecessor reconciliation required');
+  const row = rows[0];
+  if (rows.length !== 1 || !row || row.attemptId !== expected.attemptId ||
+      row.runId !== runId || row.nodeId !== 'implement' || row.attemptNumber !== 1 ||
+      row.completedAt !== expected.completedAt || row.outcomeClass !== 'quality' ||
+      row.reasonCode !== 'required_stage_failed' || row.resumeAt !== null ||
+      row.supersedesAttemptId !== null ||
+      row.provider !== TEE_TIME_SUPERVISED_POLICY.provider ||
+      row.model !== TEE_TIME_SUPERVISED_POLICY.model ||
+      row.declaredProvider !== TEE_TIME_SUPERVISED_POLICY.provider ||
+      row.declaredModel !== TEE_TIME_SUPERVISED_POLICY.model ||
+      supervisedAttemptHash(row) !== expected.rowHash)
+    throw new Error('sole completed predecessor differs');
+  return identity;
+}
+
 export async function claimSupervisedModelAttempt(input: {
   controller: SupervisedController;
   executionHash: string;
@@ -33,8 +117,18 @@ export async function claimSupervisedModelAttempt(input: {
   readReview: () => Promise<SupervisedPlanReview>;
   recheckExecution: () => Promise<void>;
   store: Pick<IWorkflowStore, 'listProviderAttempts' | 'createProviderAttempt'>;
+  successor?: {
+    predecessor: SupervisedPredecessor;
+    observe: () => Promise<SupervisedReconciliation>;
+  };
 }): Promise<Readonly<ProviderAttemptRecord>> {
   const { controller, store } = input;
+  // Snapshot before any operational callback can mutate the caller's descriptor.
+  const successor = input.successor ? {
+    predecessor: Object.freeze({ ...input.successor.predecessor }),
+    observe: input.successor.observe,
+  } : undefined;
+  if (successor) predecessorIdentity(successor.predecessor);
   if (
     !/^sha256:[a-f0-9]{64}$/.test(input.executionHash) ||
     !/^sha256:[a-f0-9]{64}$/.test(input.preparedBindingHash) ||
@@ -93,7 +187,11 @@ export async function claimSupervisedModelAttempt(input: {
   )
     throw new Error('independent exact-head approval missing or superseded');
   const approvalId = approval.id;
-  if ((await store.listProviderAttempts(runId, 'implement')).length !== 0)
+  const previous = await store.listProviderAttempts(runId, 'implement');
+  const predecessorSnapshot = successor
+    ? reconcileSuccessor(successor.predecessor, structuredClone(await successor.observe()), previous, runId)
+    : null;
+  if (!successor && previous.length !== 0)
     throw new Error('supervised implementation attempt already exists');
   await input.recheckExecution();
   const finalPrepared = await input.readPrepared();
@@ -103,6 +201,12 @@ export async function claimSupervisedModelAttempt(input: {
     JSON.stringify(finalReview) !== reviewSnapshot
   )
     throw new Error('supervised state changed before claim');
+  if (successor) {
+    const observed = structuredClone(await successor.observe());
+    const rows = await store.listProviderAttempts(runId, 'implement');
+    if (reconcileSuccessor(successor.predecessor, observed, rows, runId) !== predecessorSnapshot)
+      throw new Error('predecessor changed before successor claim');
+  }
   await claimSupervisedPhase(controller, 'model', {
     bindingHash: input.executionHash,
     reviewId: approvalId,
@@ -114,7 +218,7 @@ export async function claimSupervisedModelAttempt(input: {
     attemptId: randomUUID(),
     runId,
     nodeId: 'implement',
-    attemptNumber: 1,
+    attemptNumber: successor ? 2 : 1,
     provider: TEE_TIME_SUPERVISED_POLICY.provider,
     model: TEE_TIME_SUPERVISED_POLICY.model,
     declaredProvider: TEE_TIME_SUPERVISED_POLICY.provider,
@@ -126,16 +230,19 @@ export async function claimSupervisedModelAttempt(input: {
     outcomeClass: null,
     reasonCode: null,
     resumeAt: null,
-    supersedesAttemptId: null,
+    supersedesAttemptId: successor ? successor.predecessor.attemptId : null,
   });
   if (!(await store.createProviderAttempt(attempt)))
     throw new Error('provider attempt persistence failed; phase remains consumed');
   const persisted = await store.listProviderAttempts(runId, 'implement');
+  const inserted = persisted.find(row => row.attemptId === attempt.attemptId);
   if (
-    persisted.length !== 1 ||
+    persisted.length !== (successor ? 2 : 1) || !inserted ||
+    (successor && supervisedAttemptHash(persisted.find(row => row.attemptId ===
+      successor.predecessor.attemptId)!) !== successor.predecessor.rowHash) ||
     Object.keys(attempt).some(
       key =>
-        JSON.stringify(persisted[0][key as keyof ProviderAttemptRecord]) !==
+        JSON.stringify(inserted[key as keyof ProviderAttemptRecord]) !==
         JSON.stringify(attempt[key as keyof ProviderAttemptRecord])
     )
   )

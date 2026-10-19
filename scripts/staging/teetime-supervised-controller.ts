@@ -326,6 +326,10 @@ export async function prepare(): Promise<Record<string, unknown>> {
         }
       }
       const execution = await check('metadata');
+      // V2 parsing is source preparation only until its deterministic custody and
+      // live predecessor observer are joined. Never run v2 through the v1 entry.
+      if (execution.binding.attempt !== 1 || execution.predecessor !== null)
+        throw new Error('successor operational entry not admitted');
       if (execution.source !== process.argv[10] || execution.packageHash !== executionHash)
         throw new Error('actual execution source differs');
       const initial = await bootstrap.readSupervisedBinding(api, preparation);

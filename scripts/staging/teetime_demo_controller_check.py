@@ -24,7 +24,8 @@ def check(root, package_hash, mode, raw=b''):
         return {'packageHash': execution.package_hash,
                 'preparedBindingHash': execution.prepared_binding_hash,
                 'image': execution.image, 'source': execution.source, 'baseSource': execution.base_source,
-                'binding': dict(execution.binding)}
+                'binding': dict(execution.binding),
+                'predecessor': dict(execution.predecessor) if execution.predecessor else None}
     if len(raw) > 196608:
         raise ValueError('bounded controller receipt required')
     value = strict_json(raw)

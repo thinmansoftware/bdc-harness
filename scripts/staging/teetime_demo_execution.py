@@ -6,6 +6,7 @@ persist the provider attempt before credentials or this packet reach a worker.
 import hashlib
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from types import MappingProxyType
 from typing import Mapping
 
@@ -34,6 +35,7 @@ class DemoExecution:
     prepared: object
     prompt: str
     prompt_hash: str
+    predecessor: Mapping | None = None
 
 
 def parse_demo_execution(raw, expected_hash):
@@ -46,9 +48,13 @@ def parse_demo_execution(raw, expected_hash):
     keys = {'version', 'kind', 'preparedBindingHash', 'image', 'source', 'baseSource',
             'binding', 'preparedFrame', 'originalTree', 'originalManifestHash',
             'assetHashes', 'prompt', 'promptHash', 'limits'}
+    successor = type(value) is dict and value.get('version') == 2
+    if successor:
+        keys.add('predecessor')
     if type(value) is not dict or set(value) != keys or canonical(value).encode('ascii') != raw:
         raise ValueError('closed canonical demo execution package required')
-    if type(value['version']) is not int or value['version'] != 1 or value['kind'] != 'supervised-demo-v1':
+    if (type(value['version']) is not int or value['version'] not in (1, 2)
+            or value['kind'] != ('supervised-demo-v2' if successor else 'supervised-demo-v1')):
         raise ValueError('demo package version rejected')
     for key, pattern in [('preparedBindingHash', 'sha256:[a-f0-9]{64}'),
                          ('image', 'sha256:[a-f0-9]{64}'), ('source', '[a-f0-9]{40}'),
@@ -60,8 +66,24 @@ def parse_demo_execution(raw, expected_hash):
         raise ValueError('demo execution limits differ')
     binding = value['binding']
     validate_binding(binding)
-    if binding['nodeId'] != 'implement' or binding['attempt'] != 1:
-        raise ValueError('closed first supervised implementation attempt required')
+    if binding['nodeId'] != 'implement' or binding['attempt'] != (2 if successor else 1):
+        raise ValueError('closed supervised implementation attempt required')
+    predecessor = None
+    if successor:
+        prior = value['predecessor']
+        if (type(prior) is not dict or set(prior) != {'attemptId', 'completedAt', 'rowHash',
+                'executionHash', 'resultHash', 'claimHash', 'owner'}
+                or type(prior['attemptId']) is not str
+                or re.fullmatch('[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', prior['attemptId']) is None
+                or type(prior['completedAt']) is not str
+                or re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', prior['completedAt']) is None
+                or type(prior['owner']) is not str
+                or re.fullmatch('teetime-auth-[a-f0-9]{12}', prior['owner']) is None
+                or any(type(prior[key]) is not str or re.fullmatch('sha256:[a-f0-9]{64}', prior[key]) is None
+                       for key in ('rowHash', 'executionHash', 'resultHash', 'claimHash'))):
+            raise ValueError('closed successor predecessor binding required')
+        datetime.strptime(prior['completedAt'], '%Y-%m-%dT%H:%M:%S.%fZ')
+        predecessor = MappingProxyType(dict(prior))
     frame = value['preparedFrame']
     if type(frame) is not dict or set(frame) != {'version', 'manifestHash', 'sourceTree', 'files'}:
         raise ValueError('complete prepared frame required')
@@ -81,7 +103,7 @@ def parse_demo_execution(raw, expected_hash):
             or '\0' in prompt or hashlib.sha256(prompt.encode('ascii')).hexdigest() != value['promptHash']):
         raise ValueError('frozen complete prompt required')
     execution = DemoExecution(expected_hash, value['preparedBindingHash'], value['image'],
-        value['source'], value['baseSource'], MappingProxyType(dict(binding)), prepared, prompt, value['promptHash'])
+        value['source'], value['baseSource'], MappingProxyType(dict(binding)), prepared, prompt, value['promptHash'], predecessor)
     task_input(execution)  # Check escaped wire size before any authenticated work.
     return execution
 

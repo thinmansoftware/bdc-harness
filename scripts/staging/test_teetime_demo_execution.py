@@ -66,5 +66,26 @@ class DemoExecutionTests(unittest.TestCase):
         self.value['promptHash'] = hashlib.sha256(self.value['prompt'].encode()).hexdigest()
         with self.assertRaises(ValueError): self.parse()
 
+    def test_successor_requires_exact_link_and_remains_immutable(self):
+        self.value.update(version=2, kind='supervised-demo-v2')
+        self.value['binding']['attempt'] = 2
+        with self.assertRaises(ValueError): self.parse()
+        self.value['predecessor'] = {
+            'attemptId': 'ec3fd06e-5f27-4eda-9af1-2f759e4157ae',
+            'completedAt': '2026-10-19T02:43:09.062Z', 'owner': 'teetime-auth-5eca42816a98',
+            **{key: 'sha256:'+'1'*64 for key in ('rowHash','executionHash','resultHash','claimHash')}}
+        execution = self.parse()
+        self.assertEqual(execution.binding['attempt'], 2)
+        with self.assertRaises(TypeError): execution.predecessor['owner'] = 'changed'
+        original = canonical(self.value)
+        for kind in ['attempt', 'owner', 'rowHash', 'extra', 'version']:
+            self.value = json.loads(original)
+            if kind == 'attempt': self.value['binding']['attempt'] = 1
+            elif kind == 'owner': self.value['predecessor']['owner'] = 'foreign'
+            elif kind == 'rowHash': self.value['predecessor']['rowHash'] = '0'*64
+            elif kind == 'extra': self.value['predecessor']['ignored'] = True
+            else: self.value['version'] = 1
+            with self.subTest(kind=kind), self.assertRaises(ValueError): self.parse()
+
 
 if __name__ == '__main__': unittest.main()

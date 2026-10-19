@@ -484,3 +484,22 @@ attempt/result and explicit reconciliation, a fresh attempt-specific control roo
 supersedesAttemptId, fresh approval and the existing store/claim readback. The
 existing first-attempt rejection is not bypassed or reset. App implementation,
 actual app tests, app CI/CD, candidate review and preview remain outstanding.
+# Bounded successor source preparation
+
+The first simulated-app source attempt failed its workspace check. It remains
+consumed. A version-2 execution package can describe exactly attempt 2, with a
+closed predecessor ID/completion time/row hash/execution hash/result hash/claim
+hash/resource owner. Version 1 remains first-attempt-only.
+
+The model-phase helper can validate a separately reviewed successor using two
+fresh source-owned reconciliation observations and complete stored-row readback.
+It inserts attempt 2 with supersedesAttemptId and preserves attempt 1. It rejects
+stale or uncertain observations, changed rows, existing successors and concurrent
+duplicate claims. This is a point-in-time operator observation, not an atomic
+Docker/SQLite transaction or a generic retry service.
+
+Successor OPERATIONAL ENTRY IS NOT ADMITTED yet. Both existing operator and
+controller reject version 2 before launch/account delivery. Remaining work is the
+live original-file/resource observer, deterministic successor installation/control
+directory, original preparation custody, and a new independently reviewed frozen
+execution package. No source fixture authorizes an authenticated successor.

@@ -81,6 +81,8 @@ def main():
             raise ValueError('bounded frozen local package required')
         execution_raw=path.read_bytes()
         execution=parse_demo_execution(execution_raw,args.demo_package_hash)
+        if execution.predecessor is not None:
+            raise ValueError('successor operational entry not admitted')
         if (execution.image,execution.source,execution.base_source)!=(args.image,args.artifact_source,args.expected_sha):
             raise ValueError('operator execution identity differs')
         observation=observe_plan(execution_raw,args.demo_package_hash,args.plan_head,nonce)
