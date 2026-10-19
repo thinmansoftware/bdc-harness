@@ -2,6 +2,19 @@
 import { fixtureClientOptions, parseUniqueFixtureJson } from './teetime-reviewer-fixture';
 import { RESTRICTED_BINARY } from '../../packages/providers/src/codex/restricted-policy';
 
+export function startupCommandOutput(result: {
+  success: boolean; exitCode: number; signalCode?: string | null;
+  stdout: Uint8Array; stderr: Uint8Array;
+  exitedDueToTimeout?: boolean; exitedDueToMaxBuffer?: boolean;
+}, maxBuffer: number): Uint8Array {
+  if (result.success !== true || result.exitCode !== 0
+      || (result.signalCode !== null && result.signalCode !== undefined)
+      || result.exitedDueToTimeout === true || result.exitedDueToMaxBuffer === true
+      || result.stdout.length + result.stderr.length > maxBuffer)
+    throw new Error('startup command rejected');
+  return result.stdout;
+}
+
 interface Message {
   method: string;
   id?: number;
@@ -10,6 +23,12 @@ interface Message {
 interface Outcome {
   threadCreated: boolean;
   rpcError: Record<string, unknown> | null;
+}
+export interface ConfigWarning {
+  summary: string;
+  details: string | null;
+  path?: string;
+  range?: { start: { line: number; column: number }; end: { line: number; column: number } };
 }
 const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -32,10 +51,34 @@ export function startupArguments(): string[] {
   return args;
 }
 
+export type StartupRejectionCategory = 'write' | 'utf8-json' | 'notification-shape'
+  | 'response-envelope' | 'response-payload' | 'output-bound' | 'eof-incomplete'
+  | 'deadline' | 'stream' | 'unknown';
+export interface StartupExchangeObservation {
+  category: StartupRejectionCategory;
+  response2Observed: boolean;
+  acceptedNotifications: number;
+  observedBytes: number; // Saturates at 65537, meaning at least 65537 bytes.
+  reapUncertain: boolean;
+}
+// Only this module can brand a fault. Never inspect caller-controlled error data.
+class StartupFault extends Error {
+  constructor(readonly category: StartupRejectionCategory) { super('startup rejected'); }
+}
+function reject(category: StartupRejectionCategory): never { throw new StartupFault(category); }
+function categoryOf(error: unknown): StartupRejectionCategory {
+  return error instanceof StartupFault ? error.category : 'unknown';
+}
+
 export class StartupProtocol {
   private state: 'new' | 'initialize' | 'thread' | 'complete' | 'failed' = 'new';
   private result?: Outcome;
   private notified = false;
+  private retainedWarnings: ConfigWarning[] = [];
+  private warningBytes = 0;
+
+  warnings(): ConfigWarning[] { return structuredClone(this.retainedWarnings); }
+
 
   begin(): Message {
     if (this.state !== 'new') throw new Error('startup protocol already started');
@@ -57,16 +100,42 @@ export class StartupProtocol {
   accept(value: unknown): Message[] {
     try {
       return this.consume(value);
-    } catch {
+    } catch (error) {
       this.state = 'failed';
-      throw new Error('startup protocol response rejected');
+      throw new StartupFault(categoryOf(error));
     }
   }
 
   private consume(value: unknown): Message[] {
-    if (!object(value) || !['initialize', 'thread'].includes(this.state)) throw new Error();
-    if (value.jsonrpc !== undefined && value.jsonrpc !== '2.0') throw new Error();
+    if (!object(value) || !['initialize', 'thread'].includes(this.state)) reject('response-envelope');
+    if (value.jsonrpc !== undefined && value.jsonrpc !== '2.0') reject('response-envelope');
     if (value.id === undefined) {
+      if (value.method === 'configWarning') {
+        const params = value.params;
+        const text = (v: unknown): v is string => typeof v === 'string'
+          && Buffer.from(v, 'utf8').toString('utf8') === v;
+        const position = (v: unknown): boolean => object(v)
+          && Object.keys(v).length === 2 && Object.hasOwn(v, 'line') && Object.hasOwn(v, 'column')
+          && Number.isSafeInteger(v.line) && (v.line as number) > 0
+          && Number.isSafeInteger(v.column) && (v.column as number) > 0;
+        if (this.state !== 'thread'
+          || Object.keys(value).some(key => !['method', 'params', 'jsonrpc'].includes(key))
+          || !object(params)
+          || Object.keys(params).some(key => !['summary', 'details', 'path', 'range'].includes(key))
+          || !text(params.summary) || !Object.hasOwn(params, 'details')
+          || !(params.details === null || text(params.details))
+          || (Object.hasOwn(params, 'path') && !text(params.path))
+          || (Object.hasOwn(params, 'range') && (!object(params.range)
+            || Object.keys(params.range).length !== 2
+            || !position(params.range.start) || !position(params.range.end))))
+          reject('notification-shape');
+        const bytes = Buffer.byteLength(JSON.stringify(params));
+        if (this.retainedWarnings.length >= 4 || this.warningBytes + bytes > 16384)
+          reject('output-bound');
+        this.retainedWarnings.push(structuredClone(params) as unknown as ConfigWarning);
+        this.warningBytes += bytes;
+        return [];
+      }
       if (
         this.state !== 'thread' ||
         this.notified ||
@@ -77,7 +146,7 @@ export class StartupProtocol {
         typeof value.params.thread.id !== 'string' ||
         !value.params.thread.id
       )
-        throw new Error();
+        reject('notification-shape');
       this.notified = true;
       return [];
     }
@@ -86,7 +155,7 @@ export class StartupProtocol {
       Object.keys(value).some(key => !['id', 'result', 'error', 'jsonrpc'].includes(key)) ||
       Object.hasOwn(value, 'error') === Object.hasOwn(value, 'result')
     )
-      throw new Error();
+      reject('response-envelope');
     if (this.state === 'initialize') {
       const result = value.result;
       if (
@@ -100,7 +169,7 @@ export class StartupProtocol {
         !result.userAgent.startsWith('codex_exec/0.153.3 (') ||
         !result.userAgent.endsWith(' (codex_exec; 0.153.3)')
       )
-        throw new Error();
+        reject('response-payload');
       this.state = 'thread';
       return [
         { method: 'initialized' },
@@ -147,7 +216,7 @@ export class StartupProtocol {
         Buffer.byteLength(error.message) < 1 ||
         Buffer.byteLength(error.message) > 32768
       )
-        throw new Error();
+        reject('response-payload');
       this.result = { threadCreated: false, rpcError: structuredClone(error) };
     } else {
       if (
@@ -156,7 +225,7 @@ export class StartupProtocol {
         typeof value.result.thread.id !== 'string' ||
         !value.result.thread.id
       )
-        throw new Error();
+        reject('response-payload');
       this.result = { threadCreated: true, rpcError: null };
     }
     this.state = 'complete';
@@ -178,70 +247,117 @@ interface StartupChild {
 }
 
 /** Bounded child exchange. Raw stderr is counted and discarded, never interpolated. */
-export async function exchangeStartup(child: StartupChild, timeout = 12000): Promise<Outcome> {
+export async function exchangeStartup(child: StartupChild, timeout = 12000,
+  observePhase?: (phase: 'initialize-exchange' | 'thread-start-exchange') => void,
+  observeFailure?: (value: StartupExchangeObservation) => void
+): Promise<Outcome & { configWarnings: ConfigWarning[] }> {
   const protocol = new StartupProtocol();
-  let bytes = 0;
-  let done = false;
+  let bytes = 0, acceptedNotifications = 0;
+  let response2Observed = false, done = false, reapUncertain = false;
+  let primary: StartupRejectionCategory | undefined;
+  let outcome: Outcome | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_resolve, reject) => {
+  const deadline = new Promise<never>((_resolve, rejectDeadline) => {
     timer = setTimeout(() => {
-      reject(new Error('startup deadline'));
+      const error = new StartupFault('deadline');
+      primary ??= error.category;
+      rejectDeadline(error);
     }, timeout);
   });
   function count(chunk: Uint8Array): void {
-    bytes += chunk.length;
-    if (bytes > 65536) throw new Error('startup output bound');
+    bytes = Math.min(65537, bytes + chunk.length);
+    if (bytes > 65536) reject('output-bound');
+  }
+  function stop(): void {
+    try { child.kill(); } catch { reapUncertain = true; }
+  }
+  function write(value: string): void {
+    try { child.write(value); } catch { primary ??= 'write'; reject('write'); }
+  }
+  function phase(value: 'initialize-exchange' | 'thread-start-exchange'): void {
+    try { observePhase?.(value); } catch { primary ??= 'unknown'; reject('unknown'); }
   }
   const errors = (async (): Promise<void> => {
-    for await (const chunk of child.stderr) count(chunk);
+    try { for await (const chunk of child.stderr) count(chunk); }
+    catch (error) {
+      const category = error instanceof StartupFault ? error.category : 'stream';
+      primary ??= category;
+      throw new StartupFault(category);
+    }
   })();
   const output = (async (): Promise<Outcome> => {
     const decoder = new TextDecoder('utf-8', { fatal: true });
     let buffer = '';
-    child.write(JSON.stringify(protocol.begin()) + '\n');
-    for await (const chunk of child.stdout) {
-      count(chunk);
-      buffer += decoder.decode(chunk, { stream: true });
-      let end: number;
-      while ((end = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, end);
-        buffer = buffer.slice(end + 1);
-        if (!line.trim()) throw new Error('startup empty line');
-        const response = parseUniqueFixtureJson(Buffer.from(line));
-        for (const request of protocol.accept(response))
-          child.write(JSON.stringify(request) + '\n');
-        if ((response as { id?: unknown }).id === 2) {
-          const result = protocol.outcome();
-          done = true;
-          child.kill();
-          return result;
+    try {
+      phase('initialize-exchange');
+      let initial: Message;
+      try { initial = protocol.begin(); } catch { primary ??= 'unknown'; reject('unknown'); }
+      write(JSON.stringify(initial) + '\n');
+      for await (const chunk of child.stdout) {
+        count(chunk);
+        try { buffer += decoder.decode(chunk, { stream: true }); }
+        catch { reject('utf8-json'); }
+        let end: number;
+        while ((end = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, end);
+          buffer = buffer.slice(end + 1);
+          let response: unknown;
+          try {
+            if (!line.trim()) reject('utf8-json');
+            response = parseUniqueFixtureJson(Buffer.from(line));
+          } catch { reject('utf8-json'); }
+          if (object(response) && response.id === 2) response2Observed = true;
+          const requests = protocol.accept(response);
+          if (object(response) && response.id === undefined && response.method === 'thread/started') acceptedNotifications++;
+          for (const request of requests) {
+            if (request.method === 'thread/start') phase('thread-start-exchange');
+            write(JSON.stringify(request) + '\n');
+          }
+          if (object(response) && response.id === 2) {
+            const result = protocol.outcome();
+            done = true;
+            stop();
+            return result;
+          }
         }
       }
+      try { decoder.decode(); } catch { reject('utf8-json'); }
+      reject('eof-incomplete');
+    } catch (error) {
+      const category = error instanceof StartupFault ? error.category : 'stream';
+      primary ??= category;
+      throw new StartupFault(category);
     }
-    decoder.decode();
-    throw new Error('startup incomplete response');
   })();
   try {
     const [result] = await Promise.race([Promise.all([output, errors]), deadline]);
-    if (!done) throw new Error('startup incomplete');
-    return result;
-  } catch {
-    throw new Error('startup exchange rejected');
+    if (!done) reject('eof-incomplete');
+    outcome = result;
+  } catch (error) {
+    primary ??= categoryOf(error);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
-    child.kill();
+    stop();
     let reapTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
         child.exited,
-        new Promise<never>((_resolve, reject) => {
-          reapTimer = setTimeout(() => {
-            reject(new Error('startup child reap rejected'));
-          }, 5000);
+        new Promise<never>((_resolve, rejectReap) => {
+          reapTimer = setTimeout(() => rejectReap(new Error('startup child reap rejected')), 5000);
         }),
       ]);
-    } finally {
-      if (reapTimer !== undefined) clearTimeout(reapTimer);
+    } catch { reapUncertain = true; }
+    finally { if (reapTimer !== undefined) clearTimeout(reapTimer); }
+    if (primary !== undefined || reapUncertain) {
+      const observation: StartupExchangeObservation = {
+        category: primary ?? 'unknown', response2Observed, acceptedNotifications,
+        observedBytes: bytes, reapUncertain,
+      };
+      // Final snapshot only; late stream settlement cannot change this evidence.
+      try { observeFailure?.({ ...observation }); } catch { /* Fail closed, no raw observer errors. */ }
     }
   }
+  if (primary !== undefined || reapUncertain || outcome === undefined)
+    throw new Error('startup exchange rejected');
+  return { ...outcome, configWarnings: protocol.warnings() };
 }

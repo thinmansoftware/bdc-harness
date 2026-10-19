@@ -64,7 +64,7 @@ def safe_metadata(root):
     return raw
 
 
-def read_git_base(git_binary,repository,commit):
+def read_git_base(git_binary,repository,commit,*,worktree=None,run_scope=None,branch=None):
     executable=Path(git_binary);root=Path(repository)
     if (not executable.is_absolute() or not executable.is_file() or not root.is_absolute()
         or not root.is_dir() or os.path.normcase(str(root.resolve()))!=os.path.normcase(os.path.abspath(root))
@@ -80,20 +80,72 @@ def read_git_base(git_binary,repository,commit):
     prefix=[str(executable),'--no-replace-objects','--no-lazy-fetch','--git-dir='+str(root/'.git'),
         '-c','core.fsmonitor=false','-c','core.hooksPath='+os.devnull,'-c','credential.helper=',
         '-c','protocol.allow=never']
-    def command(parts,limit=4096,input_bytes=None,allowed=(0,)):
+    def command(parts,limit=4096,input_bytes=None,allowed=(0,),admin=None):
         remaining=deadline-time.monotonic()
         if remaining<=0:raise ValueError('base reader process budget exceeded')
         try:
-            code,output=capture(prefix+parts,min(3,remaining),limit=limit,input_bytes=input_bytes,env=env)
+            selected=prefix if admin is None else [
+                ('--git-dir='+str(admin)) if item.startswith('--git-dir=') else item for item in prefix]
+            code,output=capture(selected+parts,min(3,remaining),limit=limit,input_bytes=input_bytes,env=env)
         except Exception:
             raise ValueError('bounded Git read failed') from None
         if code not in allowed:raise ValueError('Git object or metadata unavailable')
         return output
+    def observe_worktree():
+        if worktree is None:
+            if run_scope is not None or branch is not None:raise ValueError('complete worktree observation required')
+            return None
+        if (type(run_scope) is not str or re.fullmatch('[a-f0-9]{40}',run_scope) is None
+            or type(branch) is not str or re.fullmatch('[A-Za-z0-9][A-Za-z0-9_/-]{0,99}',branch) is None
+            or any(part in ('','..','.') for part in branch.split('/'))):
+            raise ValueError('exact run scope and named worktree branch required')
+        target=Path(worktree)
+        def ordinary(path,directory=False):
+            if (not path.is_absolute() or path.is_symlink() or not path.exists()
+                or bool(getattr(path.lstat(),'st_file_attributes',0)&0x400)
+                or os.path.normcase(str(path.resolve()))!=os.path.normcase(os.path.abspath(path))
+                or (not path.is_dir() if directory else not path.is_file())):
+                raise ValueError('ordinary registered worktree metadata required')
+        def metadata_text(path):
+            ordinary(path)
+            if path.stat().st_size>4096:raise ValueError('worktree metadata bound')
+            raw=path.read_bytes()
+            if b'\x00' in raw:raise ValueError('worktree metadata null rejected')
+            return raw.decode('ascii').strip()
+        ordinary(target,True)
+        gitfile=target/'.git'
+        pointer=metadata_text(gitfile)
+        if not pointer.startswith('gitdir: '):raise ValueError('linked worktree required')
+        admin=Path(pointer[8:])
+        common=root/'.git'
+        registration=common/'worktrees'
+        ordinary(registration,True);ordinary(admin,True)
+        if admin.parent!=registration:raise ValueError('foreign worktree registration')
+        if metadata_text(admin/'commondir')!='../..':raise ValueError('foreign common Git directory')
+        backlink=Path(metadata_text(admin/'gitdir'))
+        if os.path.normcase(str(backlink))!=os.path.normcase(str(gitfile)):
+            raise ValueError('worktree registration backlink differs')
+        if metadata_text(admin/'HEAD')!='ref: refs/heads/'+branch:
+            raise ValueError('actual named branch required')
+        if any(os.path.lexists(admin/name) for name in ('config.worktree','locked','HEAD.lock','commondir.lock')):
+            raise ValueError('unsupported or changing worktree metadata')
+        def exact_ref(name,location=None):
+            raw=command(['rev-parse','--verify',name],64,admin=location).strip()
+            if re.fullmatch(b'[a-f0-9]{40}',raw) is None:raise ValueError('exact ref observation required')
+            return raw.decode('ascii')
+        head=exact_ref('HEAD',admin)
+        local=exact_ref('refs/heads/staging')
+        remote=exact_ref('refs/remotes/origin/staging')
+        if head!=run_scope or local!=commit or remote!=commit:raise ValueError('worktree or staging base moved')
+        return {'state':'registered-head-and-both-bases-observed-stable',
+            'headCommit':head,'headBranch':branch,'localStagingCommit':local,'remoteStagingCommit':remote}
+    observation=observe_worktree()
     if command(['rev-parse','--show-object-format']).strip()!=b'sha1':raise ValueError('SHA-1 repository required')
     origin_raw=command(['config','--local','--no-includes','--get','remote.origin.url'],1024,allowed=(0,1))
     origin=origin_raw.decode('ascii').strip() or None
     allowed_remotes={f'https://github.com/{REMOTE}',f'https://github.com/{REMOTE}.git',f'git@github.com:{REMOTE}',f'git@github.com:{REMOTE}.git'}
     if origin is not None and origin not in allowed_remotes:raise ValueError('foreign or credential-bearing remote prohibited')
+    if worktree is not None and origin is None:raise ValueError('registered worktree requires canonical origin')
     consumed=0
     def object_bytes(oid,kind,bound):
         nonlocal consumed
@@ -140,15 +192,20 @@ def read_git_base(git_binary,repository,commit):
     manifest=hashlib.sha256(snapshot_manifest(snapshot).encode('ascii')).hexdigest()
     frame=encode_frame(snapshot,expected_manifest_hash=manifest,expected_tree=tree)
     if safe_metadata(root)!=config_before:raise ValueError('Git configuration changed during capture')
+    if observe_worktree()!=observation:raise ValueError('worktree observations changed during capture')
     result={'version':1,'baseCommit':commit,'sourceTree':tree,'manifestHash':manifest,
         'frameBase64':base64.b64encode(frame).decode('ascii'),'origin':origin}
+    if observation is not None:result['worktreeObservation']=observation
     encode_result(result)
     return result
 
 
 if __name__=='__main__':
     try:
-        if len(sys.argv)!=4:raise ValueError('three fixed arguments required')
-        sys.stdout.buffer.write(encode_result(read_git_base(*sys.argv[1:]))+b'\n')
+        if len(sys.argv)==4:result=read_git_base(*sys.argv[1:])
+        elif len(sys.argv)==8 and sys.argv[4]=='--observe-worktree':
+            result=read_git_base(*sys.argv[1:4],worktree=sys.argv[5],run_scope=sys.argv[6],branch=sys.argv[7])
+        else:raise ValueError('fixed committed-base or worktree-observation arguments required')
+        sys.stdout.buffer.write(encode_result(result)+b'\n')
     except Exception:
         raise SystemExit('Committed base not verified; no repository changes performed.') from None

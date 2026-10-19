@@ -2,6 +2,10 @@ import { test, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import type { SendQueryOptions } from '../types';
 import { restrictedClientOptions, restrictedThreadOptions } from './restricted-policy';
+import { readCodexFailureOrigin } from './provider';
+import { collectMinimalDiagnostic, collectMinimalDiagnosticV2 } from '../../../../scripts/staging/teetime-minimal-diagnostic';
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
 
 mock.module('@archon/paths', () => ({ createLogger: () => createMockLogger() }));
 mock.module('./binary-resolver', () => ({
@@ -54,6 +58,120 @@ async function consume(
   for await (const chunk of provider.sendQuery('synthetic test', '/workspace', id, options))
     void chunk;
 }
+
+test('native turn.failed origin survives enriched model-access wording', async () => {
+  injectedEvents = [{ type: 'turn.failed', error: { message: 'model not available PRIVATE-NATIVE' } }];
+  let failed: unknown;
+  try { await consume(new CodexProvider({ restricted: true, restrictedTransport: 'teetime-connect-v1' })); }
+  catch (error) { failed = error; }
+  expect(failed).toBeInstanceOf(Error);
+  expect(readCodexFailureOrigin(failed)).toEqual({ version: 1, origin: 'native_turn_failed' });
+  expect(JSON.stringify(readCodexFailureOrigin(failed))).not.toContain('PRIVATE-NATIVE');
+  expect(runStreamed).toHaveBeenCalledTimes(1);
+  expect(reactive).not.toHaveBeenCalled();
+});
+
+test('actual SDK exception boundary reaches v2 Python validation with closed metadata', async () => {
+  failures = ['Codex Exec exited with code 1: Error loading rules: PRIVATE-RULE (os error 13)'];
+  const provider = new CodexProvider({restricted: true, restrictedTransport: 'teetime-connect-v1'});
+  const packet = await collectMinimalDiagnosticV2((prompt, signal) =>
+    provider.sendQuery(prompt, '/workspace', undefined, {abortSignal: signal}), new AbortController(), () => {});
+  expect(packet.failure?.provenance.origin).toBe('sdk_iterator_exception');
+  expect(packet.failure?.sdkEvidence?.kind).toBe('cli-exit');
+  expect(packet.failure?.sdkEvidence?.startupEvidence?.startupStages).toEqual(['exec-policy']);
+  expect(JSON.stringify(packet)).not.toContain('PRIVATE');
+  const script = ['import sys,json', 'sys.path.insert(0,sys.argv[1])',
+    'from teetime_minimal_diagnostic import validate_minimal_diagnostic_v2',
+    'print(json.dumps(validate_minimal_diagnostic_v2(1,sys.stdin.buffer.read(4097))))'].join(';');
+  const parsed = spawnSync(process.platform === 'win32' ? 'python' : 'python3',
+    ['-I', '-B', '-c', script, resolve(import.meta.dir, '../../../../scripts/staging')],
+    {input: JSON.stringify(packet), encoding: 'utf8', timeout: 10000, maxBuffer: 8192});
+  expect(parsed.status).toBe(0);
+  expect(JSON.parse(parsed.stdout)).toEqual(packet);
+  expect(runStreamed).toHaveBeenCalledTimes(1);
+  expect(reactive).not.toHaveBeenCalled();
+});
+
+test('SDK run acquisition and iterator failures are distinct from event-handler exceptions', async () => {
+  for (const mode of ['acquisition', 'advancement', 'handler']) {
+    runStreamed.mockImplementationOnce(async () => {
+      if (mode === 'acquisition') throw new Error('PRIVATE-ACQUISITION');
+      return { events: (async function* () {
+        if (mode === 'advancement') throw new Error('PRIVATE-ADVANCEMENT');
+        yield { type: 'item.started' }; // Invalid native event, interpreter throws.
+      })() };
+    });
+    let failed: unknown;
+    try { await consume(new CodexProvider({ restricted: true, restrictedTransport: 'teetime-connect-v1' })); }
+    catch (error) { failed = error; }
+    expect(failed).toBeInstanceOf(Error);
+    expect(readCodexFailureOrigin(failed)).toEqual({ version: 1,
+      origin: mode === 'handler' ? 'unknown' : 'sdk_iterator_exception' });
+  }
+});
+
+test('actual client and thread initialization failures retain their narrow origin', async () => {
+  for (const boundary of [sdk, start]) {
+    boundary.mockImplementationOnce(() => { throw new Error('PRIVATE-INITIALIZATION'); });
+    let failed: unknown;
+    try { await consume(new CodexProvider({ restricted: true, restrictedTransport: 'teetime-connect-v1' })); }
+    catch (error) { failed = error; }
+    expect(failed).toBeInstanceOf(Error);
+    expect(readCodexFailureOrigin(failed)).toEqual({ version: 1, origin: 'provider_initialization' });
+  }
+});
+
+test('only an actual unrecovered native error tags incomplete results', async () => {
+  for (const mode of ['native-error', 'empty', 'recovered']) {
+    runStreamed.mockImplementationOnce(async () => ({ events: (async function* () {
+      if (mode !== 'empty') yield { type: 'error', message: 'PRIVATE-STREAM' };
+      if (mode === 'recovered') yield { type: 'turn.completed', usage: null };
+    })() }));
+    const chunks = [];
+    for await (const chunk of new CodexProvider({ restricted: true }).sendQuery('test', '/workspace'))
+      chunks.push(chunk);
+    const terminal = chunks.at(-1)!;
+    expect(terminal.type).toBe('result');
+    expect(terminal.isError).toBe(mode === 'recovered' ? undefined : true);
+    expect(readCodexFailureOrigin(terminal)).toEqual({ version: 1,
+      origin: mode === 'native-error' ? 'native_stream_error_without_terminal' : 'unknown' });
+  }
+});
+
+test('actual mocked provider events survive the diagnostic collector and independent Python validator', async () => {
+  const validator = [
+    'import json,sys',
+    'sys.path.insert(0,sys.argv[1])',
+    'from teetime_minimal_diagnostic import validate_minimal_diagnostic',
+    'v=validate_minimal_diagnostic(int(sys.argv[2]),sys.stdin.buffer.read(4097))',
+    "print(json.dumps({'passed':v['passed'],'origin':None if v['failure'] is None else v['failure']['provenance']['origin']}))",
+  ].join(';');
+  for (const mode of ['native-failure', 'native-incomplete', 'tiny-success']) {
+    injectedEvents = [];
+    if (mode === 'native-failure')
+      injectedEvents = [{ type: 'turn.failed', error: { message: 'invalid request PRIVATE-NATIVE' } }];
+    else if (mode === 'tiny-success')
+      injectedEvents = [{ type: 'item.completed', item: { type: 'agent_message', text: 'OK' } }];
+    else runStreamed.mockImplementationOnce(async () => ({ events: (async function* () {
+      yield { type: 'error', message: 'PRIVATE-INCOMPLETE' };
+    })() }));
+    const provider = new CodexProvider({ restricted: true, restrictedTransport: 'teetime-connect-v1' });
+    const packet = await collectMinimalDiagnostic((prompt, signal) =>
+      provider.sendQuery(prompt, '/workspace', undefined, { abortSignal: signal }),
+    new AbortController(), () => {});
+    expect(packet.passed).toBe(mode === 'tiny-success');
+    const raw = JSON.stringify(packet);
+    expect(raw).not.toContain('PRIVATE-');
+    const parsed = spawnSync(process.platform === 'win32' ? 'python' : 'python3',
+      ['-I', '-B', '-c', validator, resolve(import.meta.dir, '../../../../scripts/staging'),
+        packet.passed ? '0' : '1'],
+      { input: raw, encoding: 'utf8', timeout: 10000, maxBuffer: 4096 });
+    expect(parsed.status).toBe(0);
+    expect(JSON.parse(parsed.stdout)).toEqual({ passed: mode === 'tiny-success',
+      origin: mode === 'tiny-success' ? null : mode === 'native-failure'
+        ? 'native_turn_failed' : 'native_stream_error_without_terminal' });
+  }
+});
 
 test('restricted startup and owned resume use fixed options without global auth', async () => {
   const provider = new CodexProvider({ restricted: true });

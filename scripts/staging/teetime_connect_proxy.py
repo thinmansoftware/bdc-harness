@@ -20,27 +20,116 @@ PROCESS_BYTE_LIMIT = 32 * 1024 * 1024
 active = 0
 process_bytes = 0
 outcomes = Counter()
+parser_reasons = Counter()
+non_parser_reasons = Counter()
+request_line_reasons = Counter()
+diagnostic_invalid = False
+
+DENIAL_REASONS = frozenset({'request_line_or_destination', 'duplicate_header',
+                          'unsupported_header', 'invalid_header_value',
+                          'encoding_or_framing'})
+NON_PARSER_REASONS = frozenset({'connection_limit', 'header_read', 'dns_lookup',
+                               'dns_validation', 'upstream_connect', 'tunnel'})
+OUTCOME_NAMES = frozenset({'header_or_destination_denied', 'dns_denied', 'byte_limit',
+                           'timeout', 'rejected_or_closed', 'closed'})
+REQUEST_LINE_REASONS = frozenset({'framing', 'method', 'http_version', 'authority', 'unknown'})
+
+
+def build_proxy_receipt(diagnostic=False):
+    if not diagnostic:
+        return {'outcomes': dict(outcomes), 'bytes': process_bytes, 'active': active}
+    if diagnostic_invalid or set(outcomes)-OUTCOME_NAMES or set(parser_reasons)-DENIAL_REASONS or set(non_parser_reasons)-NON_PARSER_REASONS:
+        raise ValueError('invalid diagnostic accounting')
+    counts = {key: outcomes.get(key, 0) for key in sorted(OUTCOME_NAMES)}
+    parsers = {key: parser_reasons.get(key, 0) for key in sorted(DENIAL_REASONS)}
+    phases = {key: non_parser_reasons.get(key, 0) for key in sorted(NON_PARSER_REASONS)}
+    values = [process_bytes, active, *counts.values(), *parsers.values(), *phases.values()]
+    if any(type(value) is not int or not 0 <= value <= 10**9 for value in values):
+        raise ValueError('invalid diagnostic counters')
+    failures = counts['rejected_or_closed'] + counts['timeout']
+    if (active != 0 or process_bytes > 64*1024*1024
+            or sum(parsers.values()) != counts['header_or_destination_denied']
+            or sum(parsers.values()) + sum(phases.values()) != failures
+            or phases['dns_validation'] != counts['dns_denied']
+            or failures > counts['closed']):
+        raise ValueError('inconsistent diagnostic counters')
+    return {'version': 1, 'kind': 'teetime-proxy-diagnostic', 'outcomes': counts,
+            'bytes': process_bytes, 'active': active, 'parserReasons': parsers,
+            'nonParserReasons': phases}
+
+
+def build_proxy_receipt_v2():
+    """Unselected source API; never reclassifies an old receipt."""
+    value = build_proxy_receipt(True)
+    if set(request_line_reasons)-REQUEST_LINE_REASONS: raise ValueError('unknown request-line category')
+    reasons = {key: request_line_reasons.get(key, 0) for key in sorted(REQUEST_LINE_REASONS)}
+    if (any(type(count) is not int or not 0 <= count <= 10**9 for count in reasons.values())
+            or sum(reasons.values()) != value['parserReasons']['request_line_or_destination']):
+        raise ValueError('request-line diagnostic accounting differs')
+    return {**value, 'version': 2, 'requestLineReasons': reasons}
+
+
+class ConnectPolicyError(ValueError):
+    """Fixed diagnostic reason only; never retain request bytes or header data."""
+    def __init__(self, reason, request_line_reason=None):
+        if reason not in DENIAL_REASONS:
+            raise ValueError('unknown policy denial reason')
+        self.reason = reason
+        self.request_line_reason = request_line_reason if (
+            reason == 'request_line_or_destination' and type(request_line_reason) is str
+            and request_line_reason in REQUEST_LINE_REASONS) else 'unknown'
+        super().__init__(reason)
+
+
+def configure_task(task):
+    # Fixed selectors only, no caller-supplied duration or destination override.
+    global TOTAL_SECONDS
+    if task not in ['canary', 'supervised-demo']:
+        raise ValueError('closed proxy task required')
+    TOTAL_SECONDS = 720 if task == 'supervised-demo' else 300
+
+
+def _rejected_request_line_reason(lines):
+    # Called only AFTER the original parser rejects. This is the first failed
+    # structural check, not a complete defect list or a causal server diagnosis.
+    parts = lines[0].split(' ')
+    if len(parts) != 3 or lines[-2:] != ['', '']: return 'framing'
+    if parts[0] != 'CONNECT': return 'method'
+    if parts[2] != 'HTTP/1.1': return 'http_version'
+    if parts[1] != 'chatgpt.com:443': return 'authority'
+    return 'unknown'
 
 
 def parse_connect(data):
     if len(data) > HEADER_LIMIT or not data.endswith(b'\r\n\r\n'):
-        raise ValueError('invalid header boundary')
-    lines = data.decode('ascii').split('\r\n')
+        raise ConnectPolicyError('encoding_or_framing')
+    try:
+        lines = data.decode('ascii').split('\r\n')
+    except UnicodeError:
+        raise ConnectPolicyError('encoding_or_framing') from None
     if lines[0] != 'CONNECT chatgpt.com:443 HTTP/1.1' or lines[-2:] != ['', '']:
-        raise ValueError('destination or method rejected')
+        raise ConnectPolicyError('request_line_or_destination', _rejected_request_line_reason(lines))
     seen = set()
     for line in lines[1:-2]:
         key, sep, value = line.partition(':')
         key = key.lower()
+        raw_value = value
         value = value.strip(' ')
-        if not sep or key in seen:
-            raise ValueError('ambiguous header')
+        if not sep:
+            raise ConnectPolicyError('encoding_or_framing')
+        if key in seen:
+            raise ConnectPolicyError('duplicate_header')
         seen.add(key)
         if key == 'host' and value == 'chatgpt.com:443':
             continue
         if key in ['proxy-connection', 'connection'] and value.lower() == 'keep-alive':
             continue
-        raise ValueError('unexpected header')
+        if key == 'user-agent' and value and len(raw_value) <= 256 and all(
+                0x20 <= ord(character) <= 0x7e for character in raw_value):
+            continue
+        raise ConnectPolicyError('invalid_header_value' if key in
+                                 ['host', 'proxy-connection', 'connection', 'user-agent']
+                                 else 'unsupported_header')
     return 'chatgpt.com'
 
 
@@ -59,16 +148,20 @@ def validate_addresses(records):
 
 
 async def handle_client(reader, writer):
-    global active, process_bytes
+    global active, process_bytes, diagnostic_invalid
     upstream = None
     admitted = False
     established = False
     tasks = []
+    phase = 'connection_limit'
+    parser_reason = None
+    request_line_reason = 'unknown'
     try:
         if active >= TUNNEL_LIMIT:
             raise ValueError('connection bound')
         active += 1
         admitted = True
+        phase = 'header_read'
         async with asyncio.timeout(TOTAL_SECONDS):
             data = bytearray()
             async with asyncio.timeout(HEADER_SECONDS):
@@ -80,19 +173,34 @@ async def handle_client(reader, writer):
                     if len(data) > HEADER_LIMIT or (b'\r\n\r\n' in data and not data.endswith(b'\r\n\r\n')):
                         raise ValueError('headers or pipelining rejected')
             try:
+                phase = 'parser'
                 host = parse_connect(bytes(data))
-            except ValueError:
+            except ValueError as error:
                 outcomes['header_or_destination_denied'] += 1
+                if type(error) is ConnectPolicyError and error.reason in DENIAL_REASONS:
+                    parser_reason = error.reason
+                    detail = getattr(error, 'request_line_reason', None)
+                    if type(detail) is str and detail in REQUEST_LINE_REASONS:
+                        request_line_reason = detail
+                else:
+                    diagnostic_invalid = True
+                raise
+            except Exception:
+                diagnostic_invalid = True
                 raise
             loop = asyncio.get_running_loop()
             async with asyncio.timeout(CONNECT_SECONDS):
+                phase = 'dns_lookup'
                 records = await loop.getaddrinfo(host, 443, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=6)
                 try:
+                    phase = 'dns_validation'
                     address = validate_addresses(records)
                 except ValueError:
                     outcomes['dns_denied'] += 1
                     raise
+                phase = 'upstream_connect'
                 upstream_reader, upstream = await asyncio.open_connection(address, 443, family=socket.AF_INET)
+            phase = 'tunnel'
             writer.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
             await writer.drain()
             established = True
@@ -126,6 +234,14 @@ async def handle_client(reader, writer):
                 task.result()
     except (ValueError, UnicodeError, OSError, TimeoutError, asyncio.IncompleteReadError) as error:
         outcomes['timeout' if isinstance(error, TimeoutError) else 'rejected_or_closed'] += 1
+        if parser_reason is not None:
+            parser_reasons[parser_reason] += 1
+            if parser_reason == 'request_line_or_destination':
+                request_line_reasons[request_line_reason] += 1
+        elif phase in NON_PARSER_REASONS:
+            non_parser_reasons[phase] += 1
+        else:
+            diagnostic_invalid = True
         if not established:
             writer.write(b'HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
     finally:
@@ -145,9 +261,9 @@ async def handle_client(reader, writer):
         outcomes['closed'] += 1
 
 
-async def main():
+async def main(diagnostic=False):
     server = await asyncio.start_server(handle_client, '0.0.0.0', 3128, limit=HEADER_LIMIT)
-    print('{"proxyReady":true}', flush=True)
+    print('{"proxyReady":true,"diagnosticVersion":1}' if diagnostic else '{"proxyReady":true}', flush=True)
     async with server:
         try:
             await asyncio.wait_for(server.serve_forever(), TOTAL_SECONDS)
@@ -156,9 +272,15 @@ async def main():
 
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--task', choices=['canary', 'supervised-demo'], default='canary')
+    parser.add_argument('--diagnostic-receipt', action='store_true')
+    args = parser.parse_args()
+    configure_task(args.task)
     try:
-        asyncio.run(main())
+        asyncio.run(main(args.diagnostic_receipt))
     except KeyboardInterrupt:
         pass
     finally:
-        print(json.dumps({'outcomes':dict(outcomes), 'bytes':process_bytes, 'active':active}))
+        print(json.dumps(build_proxy_receipt(args.diagnostic_receipt)))

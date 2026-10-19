@@ -9,14 +9,18 @@ from teetime_joined_fixture import exact, strict_json
 IMAGE_PATHS = tuple('scripts/staging/'+name for name in [
     'teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime_auth_artifact_protocol.py',
     'teetime-fixed-artifact-task.ts', 'teetime-fixed-artifact.ts', 'teetime-artifact-stream.ts',
-    'teetime-sdk-lifecycle.ts', 'teetime_fixed_artifact.py', 'teetime_artifact_contract.py',
+    'teetime-sdk-lifecycle.ts', 'teetime-canary-result.ts', 'teetime_fixed_artifact.py', 'teetime_artifact_contract.py',
     'teetime_joined_fixture.py', 'teetime_artifact_materialization.py',
     'teetime_fixture_diagnostics.py',
+    'teetime_demo_execution.py', 'teetime_demo_case.py', 'teetime_demo_result.py',
+    'teetime_artifact_workspace.py',
+    'teetime-demo-task-entry.ts', 'teetime-demo-task.ts',
     'teetime_materialization_frame.py', 'teetime_snapshot.py', 'teetime_git_objects.py'])+tuple(
     'packages/providers/src/codex/'+name for name in ['provider.ts', 'restricted-policy.ts', 'restricted-run-factory.ts'])+(
     'packages/providers/src/types.ts', 'packages/paths/src/logger.ts')
 ALL_PATHS = tuple(dict.fromkeys((*IMAGE_PATHS, *('scripts/staging/'+name for name in [
     'invoke-teetime-auth-canary.py', 'run-teetime-auth-canary.py', 'teetime_connect_proxy.py',
+    'teetime_successor_observation.py',
     'teetime_watchdog.py', 'teetime_bounded_process.py', 'teetime_proxy_receipt.py',
     'teetime_canary_protocol.py', 'codex-probe-seccomp.json', 'moby-default-seccomp.json',
     'codex-probe-minimization.json']))))
@@ -28,7 +32,7 @@ IDENTITIES = ('artifactHash', 'bindingHash', 'manifestHash', 'sourceTree')
 
 
 def validate_selector(task, source, nonce):
-    if task not in ['filesystem', 'artifact'] or type(task) is not str:
+    if task not in ['filesystem', 'artifact', 'supervised-demo'] or type(task) is not str:
         raise ValueError('closed canary selector required')
     if type(nonce) is not str or re.fullmatch('[a-f0-9]{32}', nonce) is None:
         raise ValueError('fixed canary nonce required')
@@ -68,7 +72,7 @@ def artifact_hashes(staging_root, source, base_source):
     return hashes
 
 
-def validate_ready(value, *, nonce, image, base_source, source, hashes):
+def validate_ready(value, *, nonce, image, base_source, source, hashes, execution=None):
     validate_selector('artifact', source, nonce)
     keys = {'type', 'nonce', 'image', 'sourceSha', 'owner', 'manifestSha256', 'workerId',
             'gatewayId', 'hashes', 'task', 'artifactSourceSha', 'artifactContractHash'}
@@ -77,6 +81,9 @@ def validate_ready(value, *, nonce, image, base_source, source, hashes):
     expected = {'type': 'READY', 'nonce': nonce, 'image': image, 'sourceSha': base_source,
         'hashes': hashes, 'task': 'artifact', 'artifactSourceSha': source,
         'artifactContractHash': artifact_identity(nonce, hashes[POLICY_PATH])}
+    if execution is not None:
+        validate_execution_context(execution, image, base_source, source, hashes[POLICY_PATH])
+        expected.update({'task': 'supervised-demo', 'artifactContractHash': execution.package_hash})
     if not exact({key: value[key] for key in expected}, expected):
         raise ValueError('artifact READY binding rejected')
     for key, pattern in [('owner', 'teetime-auth-[a-f0-9]{12}'), ('manifestSha256', '[a-f0-9]{64}'),
@@ -85,20 +92,40 @@ def validate_ready(value, *, nonce, image, base_source, source, hashes):
             raise ValueError('artifact READY owned identity rejected')
 
 
-def empty_worker_result():
-    return {**dict.fromkeys(WORKER_BOOL, False), 'modelInvocations': 0, 'preflightChecks': 0,
+def empty_worker_result(*, demo=False):
+    value = {**dict.fromkeys(WORKER_BOOL, False), 'modelInvocations': 0, 'preflightChecks': 0,
         'assistantCount': 0, 'resultCount': 0, 'thinkingCount': 0, 'elapsedMs': 0,
         'oomKillDelta': None, 'failureCategory': 'not_started', 'artifactBase64': None,
         **dict.fromkeys(IDENTITIES, None)}
+    if demo:
+        value['workspaceDiagnostic'] = {'category':'inspection_failed','entryCount':0,'maskEntryCount':0}
+        value['taskFailureDiagnostic'] = None
+    return value
 
 
-def validate_worker_result(value, *, nonce, policy_hash):
-    if type(value) is not dict or set(value) != set(empty_worker_result()):
+def validate_worker_result(value, *, nonce, policy_hash, execution=None):
+    if type(value) is not dict or set(value) != set(empty_worker_result(demo=execution is not None)):
         raise ValueError('artifact worker schema rejected')
+    if execution is not None:
+        failure = value['taskFailureDiagnostic']
+        if failure is not None:
+            from teetime_demo_result import validate_failure_statistics
+            validate_failure_statistics(value, failure)
+            if value['passed'] or not value['taskDiagnosticsPresent'] or value['modelInvocations'] is None:
+                raise ValueError('failed task diagnostic contradicts result')
+        diagnostic = value['workspaceDiagnostic']
+        from teetime_artifact_workspace import WORKSPACE_CATEGORIES
+        if (type(diagnostic) is not dict or set(diagnostic) != {'category','entryCount','maskEntryCount'}
+                or diagnostic['category'] not in WORKSPACE_CATEGORIES
+                or any(type(diagnostic[key]) is not int or not 0 <= diagnostic[key] <= 17 for key in ['entryCount','maskEntryCount'])
+                or value['workspaceUnchanged'] != (diagnostic == {'category':'unchanged','entryCount':2,'maskEntryCount':0})):
+            raise ValueError('bounded workspace diagnostic rejected')
     if any(type(value[key]) is not bool for key in WORKER_BOOL) or value['servedModelVerified']:
         raise ValueError('artifact worker flags rejected')
-    for key, bound in [('preflightChecks', 6), ('assistantCount', 1), ('resultCount', 1),
-                       ('thinkingCount', 64), ('elapsedMs', 120000)]:
+    failed_demo = execution is not None and value['taskFailureDiagnostic'] is not None and not value['passed']
+    for key, bound in [('preflightChecks', 6), ('assistantCount', 2 if failed_demo else 1),
+                       ('resultCount', 2 if failed_demo else 1), ('thinkingCount', 65 if failed_demo else 64),
+                       ('elapsedMs', 630000 if execution is not None else 120000)]:
         if type(value[key]) is not int or not 0 <= value[key] <= bound:
             raise ValueError('artifact worker counter rejected')
     invocations, oom = value['modelInvocations'], value['oomKillDelta']
@@ -131,9 +158,18 @@ def validate_worker_result(value, *, nonce, policy_hash):
     packet = {key: value[key] for key in ['passed', 'artifactBase64', 'modelInvocations',
         'assistantCount', 'resultCount', 'thinkingCount', 'normalProviderEnd', 'providerIteratorClosed',
         'aborted', 'failureCategory', 'servedModelVerified']}
-    packet['kind'] = 'fixed-artifact-v1'
     import json
-    candidate = validate_task_result(0, json.dumps(packet).encode('ascii'), nonce=nonce, policy_hash=policy_hash)
+    if execution is None:
+        packet['kind'] = 'fixed-artifact-v1'
+        candidate = validate_task_result(0, json.dumps(packet).encode('ascii'), nonce=nonce, policy_hash=policy_hash)
+    else:
+        from teetime_demo_result import validate_demo_task_result
+        validate_execution_context(execution, execution.image, execution.base_source, execution.source, policy_hash)
+        del packet['passed']
+        del packet['failureCategory']
+        packet.update({'kind': 'supervised-demo-v1', 'collected': True})
+        candidate = validate_demo_task_result(0, json.dumps(packet).encode('ascii'),
+            prepared=execution.prepared, expected_binding=dict(execution.binding))
     expected = {'artifactHash': candidate.artifact_hash, 'bindingHash': candidate.binding_hash,
                 'manifestHash': candidate.manifest_hash, 'sourceTree': candidate.source_tree}
     if not exact({key: value[key] for key in IDENTITIES}, expected):
@@ -141,7 +177,7 @@ def validate_worker_result(value, *, nonce, policy_hash):
     return candidate
 
 
-def validate_report(report, exit_code, *, ready, policy_hash):
+def validate_report(report, exit_code, *, ready, policy_hash, execution=None):
     keys = {'type', 'nonce', 'owner', 'result', 'cleanupErrors', 'receiptDirectory', 'proxyMetrics',
             'task', 'artifactSourceSha', 'artifactContractHash'}
     if type(report) is not dict or set(report) != keys:
@@ -178,5 +214,17 @@ def validate_report(report, exit_code, *, ready, policy_hash):
         raise ValueError('artifact cleanup or compliance uncertain')
     if not outcome['passed'] and type(worker) is dict and worker.get('passed') is True:
         raise ValueError('uncertain controller cannot emit successful artifact')
-    candidate = validate_worker_result(worker, nonce=ready['nonce'], policy_hash=policy_hash)
+    if execution is not None and (ready['task'] != 'supervised-demo' or ready['artifactContractHash'] != execution.package_hash):
+        raise ValueError('demo report execution binding rejected')
+    if execution is None and ready['task'] != 'artifact':
+        raise ValueError('fixed report selector rejected')
+    candidate = validate_worker_result(worker, nonce=ready['nonce'], policy_hash=policy_hash, execution=execution)
     return candidate if outcome['passed'] else None
+
+
+def validate_execution_context(execution, image, base_source, source, policy_hash):
+    from teetime_demo_execution import DemoExecution
+    if (not isinstance(execution, DemoExecution) or execution.image != image
+            or execution.source != source or execution.base_source != base_source
+            or execution.binding['policyHash'] != 'sha256:' + policy_hash):
+        raise ValueError('demo execution context differs')

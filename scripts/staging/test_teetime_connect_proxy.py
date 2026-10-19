@@ -5,10 +5,69 @@ from unittest.mock import patch
 from unittest.mock import AsyncMock
 import teetime_connect_proxy as proxy
 
-from teetime_connect_proxy import parse_connect, validate_addresses, handle_client
+from teetime_connect_proxy import parse_connect, validate_addresses, handle_client, ConnectPolicyError
 
 
 class PolicyTests(unittest.TestCase):
+    def test_bounded_user_agent_metadata_contract(self):
+        prefix=b'CONNECT chatgpt.com:443 HTTP/1.1\r\n'
+        for value in [b' codex_cli_rs/0.153.3 (Linux; x86_64) ', b'x'*256]:
+            self.assertEqual(parse_connect(prefix+b'uSeR-aGeNt:'+value+b'\r\n\r\n'),'chatgpt.com')
+        for value in [b'',b'   ',b'x'*257,b' '+b'x'*256,b'x'*256+b' ',
+                      b'\tx',b'x\t',b'x\x01',b'x\x7f',b'x\xff']:
+            with self.subTest(valueLength=len(value)),self.assertRaises(ConnectPolicyError):
+                parse_connect(prefix+b'User-Agent:'+value+b'\r\n\r\n')
+        with self.assertRaises(ConnectPolicyError) as duplicate:
+            parse_connect(prefix+b'User-Agent: x\r\nuser-agent: x\r\n\r\n')
+        self.assertEqual(duplicate.exception.reason,'duplicate_header')
+        for name in [b'Authorization',b'Proxy-Authorization',b'Accept',b'X-Unknown']:
+            with self.subTest(name=name),self.assertRaises(ConnectPolicyError) as denied:
+                parse_connect(prefix+name+b': x\r\nUser-Agent: x\r\n\r\n')
+            self.assertEqual(denied.exception.reason,'unsupported_header')
+
+    def test_denial_reason_is_closed_and_contains_no_request_material(self):
+        prefix = b'CONNECT chatgpt.com:443 HTTP/1.1\r\n'
+        cases = [
+            (b'CONNECT other.invalid:443 HTTP/1.1\r\n\r\n', 'request_line_or_destination'),
+            (prefix+b'Host: chatgpt.com:443\r\nHost: chatgpt.com:443\r\n\r\n', 'duplicate_header'),
+            (prefix+b'Authorization: synthetic-private-marker\r\n\r\n', 'unsupported_header'),
+            (prefix+b'Host: other.invalid:443\r\n\r\n', 'invalid_header_value'),
+            (prefix+b'Connection: close\r\n\r\n', 'invalid_header_value'),
+            (prefix+b'no-colon\r\n\r\n', 'encoding_or_framing'),
+            (prefix+b'\xff\r\n\r\n', 'encoding_or_framing'),
+            (prefix+b'\r\npipelined-private-marker', 'encoding_or_framing'),
+            (b'x'*4097, 'encoding_or_framing'),
+        ]
+        for data, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertRaises(proxy.ConnectPolicyError) as rejected:
+                    parse_connect(data)
+                self.assertIsInstance(rejected.exception, ValueError)
+                self.assertEqual(rejected.exception.reason, reason)
+                self.assertEqual(str(rejected.exception), reason)
+                self.assertNotIn('private-marker', repr(rejected.exception))
+                self.assertNotIn('other.invalid', repr(rejected.exception))
+        with self.assertRaises(ValueError):
+            proxy.ConnectPolicyError('arbitrary-private-marker')
+
+    def test_reason_categories_preserve_all_previously_allowed_headers(self):
+        for suffix in [b'', b'Host: chatgpt.com:443\r\n',
+                       b'Connection: KEEP-ALIVE\r\n',
+                       b'proxy-connection: keep-alive\r\n',
+                       b'host: chatgpt.com:443\r\nConnection: keep-alive\r\n']:
+            self.assertEqual(parse_connect(b'CONNECT chatgpt.com:443 HTTP/1.1\r\n'+suffix+b'\r\n'), 'chatgpt.com')
+
+    def test_closed_demo_duration_preserves_canary_default(self):
+        from teetime_demo_execution import DEMO_LIMITS
+        try:
+            proxy.configure_task('supervised-demo')
+            self.assertEqual(proxy.TOTAL_SECONDS,DEMO_LIMITS['controllerSeconds'])
+            with self.assertRaises(ValueError): proxy.configure_task('unbounded')
+        finally:
+            proxy.configure_task('canary')
+        self.assertEqual(proxy.TOTAL_SECONDS,300)
+        self.assertEqual(proxy.IDLE_SECONDS,30)
+
     def test_exact_authority(self):
         self.assertEqual(parse_connect(b'CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n'), 'chatgpt.com')
 

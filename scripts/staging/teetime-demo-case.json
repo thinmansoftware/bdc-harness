@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "kind": "teetime-supervised-demo-source-contract",
+  "caseId": "simulated-walkthrough-v1",
+  "repository": "thinmansoftware/whats-that-tee-time",
+  "woId": "WO-TEETIME-SIMULATED-WALKTHROUGH-01",
+  "workflow": "bdc-teetime-supervised-walkthrough",
+  "executionAdmitted": false,
+  "modelOperationBytes": 65536,
+  "completeCandidateFrameBytes": 147456,
+  "modelPaths": ["app/layout.tsx", "app/page.tsx", "app/globals.css", "lib/demo.ts", "lib/courses.ts", "tests/demo.test.ts", "README.md"],
+  "preparedAssets": {
+    "package.json": "package.json",
+    "bun.lock": "bun.lock",
+    "tsconfig.json": "tsconfig.json",
+    "next-env.d.ts": "next-env.d.ts.txt",
+    "next.config.mjs": "next.config.mjs",
+    "playwright.config.ts": "playwright.config.ts.txt",
+    "playwright.staging.config.ts": "playwright.staging.config.ts.txt",
+    "walkthrough/demo.spec.ts": "walkthrough.spec.ts.txt",
+    ".gitignore": "gitignore.txt"
+  },
+  "scenarios": ["success", "price-increase", "unavailable", "uncertain"],
+  "reconciliationResults": ["confirmed", "absent"],
+  "previewPort": 3187,
+  "timeZone": "America/New_York",
+  "fixture": {
+    "courseId": "cedar-lantern",
+    "courseName": "Cedar Lantern (fictional)",
+    "distanceMiles": 15,
+    "date": "2026-10-24",
+    "time": "08:40",
+    "players": 4,
+    "greenFeeCentsPerPlayer": 8500,
+    "feesCentsPerPlayer": 500,
+    "totalCents": 36000,
+    "increasedTotalCents": 40000,
+    "cancellationHours": 24
+  },
+  "prohibited": ["Claude", "Fable", "fallback", "real-provider-traffic", "real-booking", "payment", "account-collection", "production", "external-assets", "external-telemetry"]
+}

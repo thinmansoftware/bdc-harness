@@ -1,30 +1,101 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve, posix } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
-test('stdin startup entry reaches its closed context guard from a foreign cwd', () => {
+// Focused source-recipe contract, not proof of an installed image or a general
+// Dockerfile interpreter. Only unchanged source-to-/app copies count here.
+function startupImageDependencies(recipe: string): string[] {
+  const root = fileURLToPath(new URL('../../', import.meta.url));
+  const final = recipe.split(/^FROM /m).at(-1)!;
+  expect(final.startsWith('oven/bun:1.3.11-slim AS production')).toBe(true);
+  const copied = final.split(/\r?\n/).flatMap(line => {
+    const match = /^COPY ([\w./-]+) \.\/([\w./-]+)$/.exec(line);
+    return match && match[1] === match[2] ? [match[1]!] : [];
+  });
+  const entry = readFileSync(new URL('./probe-codex-startup.ts', import.meta.url), 'utf8');
+  const targets = [...entry.matchAll(/const \w+Path = '\/app\/([^']+)';/g)].map(match => match[1]!);
+  expect(targets.sort()).toEqual([
+    'packages/providers/src/codex/restricted-policy.ts',
+    'scripts/staging/teetime-reviewer-fixture.ts',
+    'scripts/staging/teetime-startup-protocol.ts',
+  ]);
+  const pending = [...targets], visited = new Set<string>();
+  const scanner = new Bun.Transpiler({ loader: 'ts' });
+  while (pending.length) {
+    const name = pending.pop()!;
+    if (visited.has(name)) continue;
+    if (name.startsWith('../') || !existsSync(resolve(root, name)))
+      throw new Error('unresolved startup dependency: ' + name);
+    if (!copied.some(source => source.endsWith('/') ? name.startsWith(source) : name === source))
+      throw new Error('startup dependency absent from final-stage recipe: ' + name);
+    visited.add(name);
+    for (const item of scanner.scanImports(readFileSync(resolve(root, name), 'utf8'))) {
+      if (item.path.startsWith('node:')) continue;
+      if (item.kind !== 'import-statement' || !item.path.startsWith('.'))
+        throw new Error('unsupported startup dependency form');
+      const path = posix.normalize(posix.join(posix.dirname(name), item.path));
+      pending.push(path.endsWith('.ts') ? path : path + '.ts');
+    }
+  }
+  return [...visited].sort();
+}
+
+test('final image recipe covers startup literal imports and their runtime closure', () => {
+  const recipe = readFileSync(new URL('../../Dockerfile', import.meta.url), 'utf8');
+  expect(startupImageDependencies(recipe)).toContain('packages/providers/src/codex/sdk-failure-evidence.ts');
+});
+
+test('build-stage source and provider package metadata cannot supply missing startup runtime files', () => {
+  const recipe = readFileSync(new URL('../../Dockerfile', import.meta.url), 'utf8');
+  for (const line of [
+    'COPY scripts/staging/teetime-startup-protocol.ts ./scripts/staging/teetime-startup-protocol.ts',
+    'COPY packages/providers/ ./packages/providers/',
+  ]) {
+    expect(() => startupImageDependencies(recipe.replace(line, ''))).toThrow('startup dependency absent');
+  }
+});
+
+test('stdin startup entry failure stays closed through independent Python projection', () => {
   const directory = mkdtempSync(join(tmpdir(), 'teetime-startup-entry-'));
   try {
     const env: Record<string, string> = { TEE_TIME_SANDBOX_PROBE: '0' };
     if (process.platform === 'win32' && process.env.SystemRoot)
       env.SystemRoot = process.env.SystemRoot;
-    const result = Bun.spawnSync([process.execPath, 'run', '-'], {
-      cwd: directory,
-      env,
-      stdin: readFileSync(new URL('./probe-codex-startup.ts', import.meta.url)),
-      stdout: 'pipe',
-      stderr: 'pipe',
-      timeout: 3000,
-      killSignal: 'SIGKILL',
-      maxBuffer: 16384,
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.signalCode ?? null).toBeNull();
-    expect(new TextDecoder().decode(result.stdout)).toBe(
-      '{"kind":"teetime-startup-capture-failed-v1"}'
-    );
-    expect(new TextDecoder().decode(result.stderr)).toBe('');
+    const entry = readFileSync(new URL('./probe-codex-startup.ts', import.meta.url), 'utf8');
+    for (const phase of ['context', 'imports']) {
+      // Synthetic source fixture only: bypass the context guard to exercise an
+      // early missing import. No native executable or account can be reached.
+      const input = phase === 'context' ? entry : entry
+        .replace("requireValue(process.env.TEE_TIME_SANDBOX_PROBE === '1' && process.getuid?.() === 1001);", 'requireValue(true);')
+        .replace("'/app/packages/providers/src/codex/restricted-policy.ts'",
+          JSON.stringify(pathToFileURL(join(directory, 'PRIVATE-MISSING-MODULE.ts')).href));
+      const result = Bun.spawnSync([process.execPath, 'run', '-'], {
+        cwd: directory,
+        env,
+        stdin: Buffer.from(input),
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 3000,
+        killSignal: 'SIGKILL',
+        maxBuffer: 16384,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.signalCode ?? null).toBeNull();
+      expect(JSON.parse(new TextDecoder().decode(result.stdout))).toEqual(
+        { kind: 'teetime-startup-capture-failed-v3', phase, exchange: null }
+      );
+      expect(new TextDecoder().decode(result.stderr)).toBe('');
+      expect(new TextDecoder().decode(result.stdout)).not.toContain('PRIVATE');
+      const python = spawnSync(process.platform === 'win32' ? 'python' : 'python3', [
+        '-I', '-B', '-c',
+        'import sys;sys.path.insert(0,sys.argv[1]);from teetime_startup_packet import startup_failure_diagnostic,startup_metadata;raw=sys.stdin.buffer.read();v=startup_failure_diagnostic(raw,1);assert v["phase"]==sys.argv[2];\ntry: startup_metadata(raw)\nexcept ValueError: pass\nelse: raise AssertionError("failure cannot be private success")',
+        fileURLToPath(new URL('./', import.meta.url)), phase,
+      ], { input: result.stdout, encoding: 'utf8', timeout: 3000 });
+      expect(python.status).toBe(0);
+    }
   } finally {
     const target = realpathSync(directory);
     if (
@@ -33,5 +104,53 @@ test('stdin startup entry reaches its closed context guard from a foreign cwd', 
     )
       throw new Error('owned startup test cleanup path rejected');
     rmSync(target, { recursive: true });
+  }
+});
+
+
+test('actual failure emitter carries synthetic exchange evidence through independent host parser', () => {
+  const entry=readFileSync(new URL('./probe-codex-startup.ts',import.meta.url),'utf8');
+  const protocol=pathToFileURL(fileURLToPath(new URL('./teetime-startup-protocol.ts',import.meta.url))).href;
+  // Replace main only in this synthetic stdin fixture: native preflight/spawn is
+  // unreachable. Keep the actual outer failure emitter and actual exchange code.
+  const main=`async function main():Promise<void>{
+    const {exchangeStartup}=await import(${JSON.stringify(protocol)});
+    const frames=[{id:1,result:{userAgent:'codex_exec/0.153.3 (Linux synthetic; x86_64) (codex_exec; 0.153.3)',codexHome:'/home/appuser/.codex',platformFamily:'unix',platformOs:'linux'}},{method:'unknownNotification',params:{summary:'PRIVATE-NATIVE-TEXT',details:null}}];
+    await exchangeStartup({stdout:(async function*(){for(const v of frames)yield Buffer.from(JSON.stringify(v)+'\\n');})(),stderr:(async function*(){})(),exited:Promise.resolve(1),write:()=>{},kill:()=>{}},1000,value=>{phase=value;},value=>{exchangeEvidence={...value};});
+  }\n`;
+  const input=entry.slice(0,entry.indexOf('async function main(): Promise<void> {'))+main+entry.slice(entry.indexOf('void main().catch'));
+  const env=process.platform==='win32'&&process.env.SystemRoot?{SystemRoot:process.env.SystemRoot}:{};
+  const result=Bun.spawnSync([process.execPath,'--no-env-file','run','-'],{cwd:tmpdir(),env,stdin:Buffer.from(input),stdout:'pipe',stderr:'pipe',timeout:3000,maxBuffer:16384});
+  expect(result.exitCode).toBe(1);expect(new TextDecoder().decode(result.stderr)).toBe('');
+  const value=JSON.parse(new TextDecoder().decode(result.stdout));
+  expect(value.kind).toBe('teetime-startup-capture-failed-v3');expect(value.phase).toBe('thread-start-exchange');
+  expect(value.exchange.category).toBe('notification-shape');expect(value.exchange.reapUncertain).toBe(false);
+  expect(new TextDecoder().decode(result.stdout)).not.toContain('PRIVATE-NATIVE-TEXT');
+  expect(new TextDecoder().decode(result.stdout)).not.toContain('configWarning');
+  const python=spawnSync(process.platform==='win32'?'python':'python3',['-I','-B','-c',
+    'import sys;sys.path.insert(0,sys.argv[1]);from teetime_startup_packet import startup_failure_diagnostic,startup_metadata;raw=sys.stdin.buffer.read();v=startup_failure_diagnostic(raw,1);assert v["exchange"]["category"]=="notification-shape";assert v["exchange"]["response2Observed"] is False;assert v["exchange"]["acceptedNotifications"]==0;assert 0<v["exchange"]["observedBytes"]<=65536;\ntry:startup_metadata(raw)\nexcept ValueError:pass\nelse:raise AssertionError("failure cannot become success")',fileURLToPath(new URL('./',import.meta.url))],{input:result.stdout,encoding:'utf8',timeout:3000});
+  expect(python.status).toBe(0);
+});
+
+
+test('actual private emitter carries warnings through independent v2 projection, never legacy acceptance', () => {
+  const entry=readFileSync(new URL('./probe-codex-startup.ts',import.meta.url),'utf8');
+  const protocol=pathToFileURL(fileURLToPath(new URL('./teetime-startup-protocol.ts',import.meta.url))).href;
+  for (const success of [false,true]) {
+    const main=`async function main():Promise<void>{
+      const {exchangeStartup}=await import(${JSON.stringify(protocol)});
+      const frames=[{id:1,result:{userAgent:'codex_exec/0.153.3 (Linux synthetic; x86_64) (codex_exec; 0.153.3)',codexHome:'/home/appuser/.codex',platformFamily:'unix',platformOs:'linux'}},
+        {method:'configWarning',params:{summary:'PRIVATE-WARNING',details:null,path:'/private/path'}},
+        ${success ? "{id:2,result:{thread:{id:'synthetic'}}}" : "{id:2,error:{code:-32603,message:'PRIVATE-ERROR'}}"}];
+      const result=await exchangeStartup({stdout:(async function*(){for(const v of frames)yield Buffer.from(JSON.stringify(v)+'\\n');})(),stderr:(async function*(){})(),exited:Promise.resolve(0),write:()=>{},kill:()=>{}},1000);
+      const binaryHash='b'.repeat(64), compared={sourceFixtureHash:'59f2bbc19bce43c67d6f1cdd99886953a256d948788d85810c774b17375c1fb6',catalogHash:'c'.repeat(64)};
+    `;
+    const input=entry.slice(0,entry.indexOf('async function main(): Promise<void> {'))+main+entry.slice(entry.indexOf("  phase = 'packet-serialization';"));
+    const env=process.platform==='win32'&&process.env.SystemRoot?{SystemRoot:process.env.SystemRoot}:{};
+    const result=Bun.spawnSync([process.execPath,'--no-env-file','run','-'],{cwd:tmpdir(),env,stdin:Buffer.from(input),stdout:'pipe',stderr:'pipe',timeout:3000,maxBuffer:65536});
+    expect(result.exitCode).toBe(0); expect(new TextDecoder().decode(result.stderr)).toBe('');
+    const python=spawnSync(process.platform==='win32'?'python':'python3',['-I','-B','-c',
+      'import sys,json;sys.path.insert(0,sys.argv[1]);from teetime_startup_packet import capture_metadata,startup_metadata;raw=sys.stdin.buffer.read();v=capture_metadata(raw);assert v["kind"]=="teetime-thread-start-metadata-v2";assert v["configWarnings"]=={"kind":"configWarning","count":1};assert "PRIVATE" not in json.dumps(v);assert "/private/path" not in json.dumps(v);\ntry:startup_metadata(raw)\nexcept ValueError:pass\nelse:raise AssertionError("legacy accepted v2")',fileURLToPath(new URL('./',import.meta.url))],{input:result.stdout,encoding:'utf8',timeout:3000});
+    expect(python.status).toBe(0);
   }
 });

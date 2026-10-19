@@ -7,6 +7,15 @@ from teetime_bounded_process import capture
 
 
 class CaptureTests(unittest.TestCase):
+    def test_demo_packet_input_is_explicit_and_bounded(self):
+        packet=b'x'*262144
+        command=[sys.executable,'-c','import sys; print(len(sys.stdin.buffer.read()))']
+        with self.assertRaises(ValueError): capture(command,5,input_bytes=packet)
+        code,output=capture(command,5,input_bytes=packet,input_limit=262144)
+        self.assertEqual(code,0);self.assertEqual(output.strip(),b'262144')
+        with self.assertRaises(ValueError): capture(command,5,input_bytes=packet+b'x',input_limit=262144)
+        with self.assertRaises(ValueError): capture(command,5,input_limit=999999)
+
     def test_explicit_environment_excludes_parent_git_sentinel(self):
         with patch.dict(os.environ, {'GIT_TEST_PARENT_SENTINEL':'parent'}):
             code,output=capture([sys.executable,'-c',

@@ -9,13 +9,15 @@ import re
 import subprocess
 import time
 
-def validate_manifest(data,now):
+def validate_manifest(data,now,task='canary'):
+    if task not in ['canary','supervised-demo']: raise ValueError('closed watchdog task required')
     if not isinstance(data,dict) or set(data)!={'owner','deadline','containers','networks'}:
         raise ValueError('invalid watchdog manifest')
     if not re.fullmatch(r'teetime-auth-[a-f0-9]{12}',str(data['owner'])):
         raise ValueError('invalid owner')
     deadline=data['deadline']
-    if isinstance(deadline,bool) or not isinstance(deadline,(int,float)) or not math.isfinite(deadline) or not now<deadline<=now+300:
+    maximum=780 if task=='supervised-demo' else 300
+    if isinstance(deadline,bool) or not isinstance(deadline,(int,float)) or not math.isfinite(deadline) or not now<deadline<=now+maximum:
         raise ValueError('invalid deadline')
     ids=[]
     for key in ['containers','networks']:
@@ -28,10 +30,14 @@ def validate_manifest(data,now):
     if len(set(ids))!=len(ids): raise ValueError('duplicate resource id')
     return data
 
-def cleanup(docker,manifest):
+def cleanup(docker,manifest,*,deadline=None):
+    if deadline is not None and (type(deadline) not in (int,float) or not math.isfinite(deadline)):
+        raise ValueError('finite cleanup deadline required')
     errors=[]
     def command(*args):
-        return subprocess.run([docker,*args],capture_output=True,timeout=12,check=True).stdout
+        timeout=12 if deadline is None else min(12,deadline-time.monotonic())
+        if timeout<=0: raise TimeoutError('cleanup deadline')
+        return subprocess.run([docker,*args],capture_output=True,timeout=timeout,check=True).stdout
     for kind,key in [('container','containers'),('network','networks')]:
         for resource in manifest[key]:
             try:
@@ -53,10 +59,11 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--docker',required=True)
     parser.add_argument('--manifest',type=Path,required=True)
+    parser.add_argument('--task',choices=['canary','supervised-demo'],default='canary')
     args=parser.parse_args()
     if args.manifest.stat().st_size>4096: raise ValueError('oversized manifest')
     raw=args.manifest.read_bytes()
-    manifest=validate_manifest(json.loads(raw),time.time())
+    manifest=validate_manifest(json.loads(raw),time.time(),args.task)
     root=args.manifest.parent
     # Convert once to monotonic time so a wall-clock adjustment cannot extend it.
     deadline=time.monotonic()+max(0,manifest['deadline']-time.time())

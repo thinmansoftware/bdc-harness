@@ -1,5 +1,71 @@
 import { expect, test } from 'bun:test';
-import { StartupProtocol, startupArguments, exchangeStartup } from './teetime-startup-protocol';
+import { StartupProtocol, startupArguments, exchangeStartup, startupCommandOutput } from './teetime-startup-protocol';
+const childEnv = process.platform === 'win32' && process.env.SystemRoot
+  ? { SystemRoot: process.env.SystemRoot } : {};
+
+test('successful bounded synchronous child accepts absent no-signal field', () => {
+  // Harmless local Bun child only: no Codex executable, account, socket or query.
+  const child = Bun.spawnSync([process.execPath, '--no-env-file', '-e', 'process.stdout.write("ready")'], {
+    env: childEnv,
+    stdout: 'pipe', stderr: 'pipe', timeout: 2000, killSignal: 'SIGKILL', maxBuffer: 4096,
+  });
+  expect(child.success).toBe(true);
+  expect(child.exitCode).toBe(0);
+  expect(startupCommandOutput(child, 4096)).toEqual(Buffer.from('ready'));
+});
+
+test('startup command guard still rejects failure, signals, overflow and timeout', () => {
+  const good = { success: true, exitCode: 0, signalCode: null,
+    stdout: Buffer.from('ready'), stderr: Buffer.alloc(0) };
+  expect(startupCommandOutput({ ...good, signalCode: null }, 4096)).toEqual(good.stdout);
+  for (const change of [
+    { success: false }, { exitCode: 1 }, { signalCode: 'SIGKILL' }, { signalCode: '' },
+    { exitedDueToTimeout: true }, { exitedDueToMaxBuffer: true },
+    { stdout: Buffer.alloc(4097) }, { stderr: Buffer.alloc(4096) },
+  ]) expect(() => startupCommandOutput({ ...good, ...change }, 4096)).toThrow('startup command rejected');
+  const timedOut = Bun.spawnSync([process.execPath, '--no-env-file', '-e', 'setTimeout(() => {}, 10000)'], {
+    env: childEnv,
+    stdout: 'pipe', stderr: 'pipe', timeout: 50, killSignal: 'SIGKILL', maxBuffer: 4096,
+  });
+  expect(() => startupCommandOutput(timedOut, 4096)).toThrow('startup command rejected');
+});
+
+test('exchange exposes only its current fixed boundary on synthetic failures', async () => {
+  for (const failAt of ['initialize-exchange', 'thread-start-exchange']) {
+    const phases: string[] = [], sent: string[] = [];
+    async function* output(): AsyncGenerator<Uint8Array> {
+      if (failAt === 'thread-start-exchange')
+        yield Buffer.from(JSON.stringify({ id: 1, result: initialized }) + '\n');
+      throw new Error('PRIVATE-STREAM-TEXT');
+    }
+    let killed = false;
+    await expect(exchangeStartup({
+      stdout: output(), stderr: (async function* () {})(), exited: Promise.resolve(1),
+      write: line => { sent.push(JSON.parse(line).method); }, kill: () => { killed = true; },
+    }, 1000, phase => { phases.push(phase); })).rejects.toThrow('startup exchange rejected');
+    expect(killed).toBe(true);
+    expect(phases.at(-1)).toBe(failAt);
+    expect(phases).not.toContain('PRIVATE-STREAM-TEXT');
+    expect(sent).not.toContain('turn/start');
+  }
+});
+
+test('a complete synthetic RPC response cannot succeed when owned reaping is uncertain', async () => {
+  const exited = Promise.reject(new Error('PRIVATE-REAP-FAILURE'));
+  void exited.catch(() => {});
+  let accepted = false, kills = 0;
+  async function* output(): AsyncGenerator<Uint8Array> {
+    yield Buffer.from(JSON.stringify({ id: 1, result: initialized }) + '\n');
+    yield Buffer.from('{"id":2,"result":{"thread":{"id":"synthetic"}}}\n');
+  }
+  try {
+    await exchangeStartup({ stdout: output(), stderr: (async function* () {})(), exited,
+      write: () => {}, kill: () => { kills++; } }, 1000);
+    accepted = true;
+  } catch { /* No raw cleanup error is published. */ }
+  expect(accepted).toBe(false);
+  expect(kills).toBeGreaterThan(0);
+});
 
 const initialized = {
   userAgent: 'codex_exec/0.153.3 (Linux synthetic; x86_64) (codex_exec; 0.153.3)',
@@ -142,7 +208,7 @@ test('exchange captures private error without sending any turn and always reaps 
     1000
   );
   expect(killed).toBe(true);
-  expect(result).toEqual({ threadCreated: false, rpcError: { code: -32603, message: 'private' } });
+  expect(result).toEqual({ threadCreated: false, rpcError: { code: -32603, message: 'private' }, configWarnings: [] });
   expect(sent.map(value => (value as { method: string }).method)).toEqual([
     'initialize',
     'initialized',
@@ -199,6 +265,7 @@ test('exchange rejects overflow, partial UTF8 and truncated protocol without exp
 });
 
 test('exchange times out without retry and reaps the owned process', async () => {
+  let observation: any;
   let reap!: (value: number) => void;
   let release!: () => void;
   const wait = new Promise<void>(resolve => {
@@ -225,8 +292,160 @@ test('exchange times out without retry and reaps the owned process', async () =>
           release();
         },
       },
-      20
+      20, undefined, value => { observation = value; }
     )
   ).rejects.toThrow('startup exchange rejected');
   expect(sent).toHaveLength(1);
+  expect(observation.category).toBe('deadline');
+  expect(observation.reapUncertain).toBe(false);
+});
+
+
+test('closed exchange observation distinguishes rejection without exposing native data', async () => {
+  const init = Buffer.from(JSON.stringify({id:1,result:initialized}) + '\n');
+  const cases: {chunks: Buffer[]; category: string; response2Observed: boolean; notifications?: number}[] = [
+    {chunks:[init, Buffer.from('{"method":"unknownNotification","params":{"summary":"PRIVATE-MARKER","details":null}}\n')], category:'notification-shape', response2Observed:false},
+    {chunks:[init, Buffer.from('{"method":"thread/started","params":{"thread":{"id":"synthetic"}}}\n'), Buffer.from('{"id":2,"result":{}}\n')], category:'response-payload', response2Observed:true, notifications:1},
+    {chunks:[init, Buffer.from('{"id":3,"result":{}}\n')], category:'response-envelope', response2Observed:false},
+    {chunks:[init, Buffer.from('{"id":2,"result":{}}\n')], category:'response-payload', response2Observed:true},
+    {chunks:[init, Buffer.from('{"id":2,"result":{},"error":{}}\n')], category:'response-envelope', response2Observed:true},
+    {chunks:[init, Buffer.from('{"id":2')], category:'eof-incomplete', response2Observed:false},
+    {chunks:[Buffer.from([255])], category:'utf8-json', response2Observed:false},
+    {chunks:[Buffer.from('{"id":1,"id":1}\n')], category:'utf8-json', response2Observed:false},
+    {chunks:[Buffer.alloc(70000)], category:'output-bound', response2Observed:false},
+  ];
+  for(const item of cases) {
+    let observed: any;
+    await expect(exchangeStartup({stdout:(async function*(){yield* item.chunks;})(),
+      stderr:(async function*(){})(), exited:Promise.resolve(1), write:()=>{}, kill:()=>{}},
+      1000, undefined, value=>{observed=value;})).rejects.toThrow('startup exchange rejected');
+    expect(observed?.category).toBe(item.category);
+    expect(observed.response2Observed).toBe(item.response2Observed);
+    expect(observed.reapUncertain).toBe(false);
+    expect(observed.acceptedNotifications).toBe(item.notifications ?? 0);
+    expect(observed.observedBytes).toBe(Math.min(item.chunks.reduce((n,b)=>n+b.length,0),65537));
+    expect(JSON.stringify(observed)).not.toContain('PRIVATE-MARKER');
+    expect(JSON.stringify(observed)).not.toContain('configWarning');
+  }
+});
+
+test('primary rejection survives uncertain reaping and valid RPC errors remain private outcomes', async () => {
+  for(const failReap of [false,true]) {
+    let observed:any;
+    const exited=failReap?Promise.reject(new Error('PRIVATE-REAP')):Promise.resolve(1);
+    void exited.catch(()=>{});
+    const chunks=[{id:1,result:initialized},{method:'unknownNotification',params:{summary:'PRIVATE',details:null}}];
+    await expect(exchangeStartup({stdout:(async function*(){for(const value of chunks)yield Buffer.from(JSON.stringify(value)+'\n');})(),
+      stderr:(async function*(){})(),exited,write:()=>{},kill:()=>{}},1000,undefined,value=>{observed=value;})).rejects.toThrow('startup exchange rejected');
+    expect(observed.category).toBe('notification-shape');expect(observed.reapUncertain).toBe(failReap);
+  }
+  let observed:any;
+  const frames=[{id:1,result:initialized},{id:2,error:{code:-32602,message:'PRIVATE-RPC'}}];
+  const result=await exchangeStartup({stdout:(async function*(){for(const v of frames)yield Buffer.from(JSON.stringify(v)+'\n');})(),stderr:(async function*(){})(),exited:Promise.resolve(0),write:()=>{},kill:()=>{}},1000,undefined,value=>{observed=value;});
+  expect(result).toEqual({threadCreated:false,rpcError:{code:-32602,message:'PRIVATE-RPC'},configWarnings:[]});
+  expect(observed).toBeUndefined();
+});
+
+
+test('cleanup-only uncertainty, observer throws and late stream settlement stay closed', async () => {
+  const frames=[{id:1,result:initialized},{id:2,result:{thread:{id:'synthetic'}}}];
+  let calls=0, observation:any;
+  const exited=Promise.reject({category:'PRIVATE',message:'PRIVATE'});void exited.catch(()=>{});
+  await expect(exchangeStartup({stdout:(async function*(){for(const v of frames)yield Buffer.from(JSON.stringify(v)+'\n');})(),
+    stderr:(async function*(){})(),exited,write:()=>{},kill:()=>{}},1000,undefined,value=>{calls++;observation=value;throw new Error('PRIVATE-OBSERVER');})).rejects.toThrow('startup exchange rejected');
+  expect(calls).toBe(1);expect(observation.category).toBe('unknown');expect(observation.reapUncertain).toBe(true);expect(observation.response2Observed).toBe(true);
+  let release!:()=>void; const wait=new Promise<void>(resolve=>{release=resolve;});
+  calls=0; observation=undefined;
+  await expect(exchangeStartup({stdout:(async function*(){yield Buffer.from(JSON.stringify({id:1,result:initialized})+'\n');yield Buffer.from('{"method":"unknownNotification","params":{"summary":"PRIVATE","details":null}}\n');})(),
+    stderr:(async function*(){await wait;yield Buffer.alloc(70000);})(),exited:Promise.resolve(1),write:()=>{},kill:()=>{}},1000,undefined,value=>{calls++;observation=value;})).rejects.toThrow('startup exchange rejected');
+  const snapshot=JSON.stringify(observation); release();await new Promise(resolve=>setTimeout(resolve,0));
+  expect(calls).toBe(1);expect(JSON.stringify(observation)).toBe(snapshot);expect(observation.category).toBe('notification-shape');
+});
+
+test('writes and external stream errors cannot spoof diagnostic categories', async () => {
+  for(const category of ['write','stream']) {
+    let observation:any;
+    const hostile={category:'notification-shape',message:'PRIVATE',cause:{}};
+    await expect(exchangeStartup({stdout:(async function*(){if(category==='stream')throw hostile;})(),stderr:(async function*(){})(),
+      exited:Promise.resolve(1),write:()=>{if(category==='write')throw hostile;},kill:()=>{}},1000,undefined,value=>{observation=value;})).rejects.toThrow('startup exchange rejected');
+    expect(observation.category).toBe(category);expect(JSON.stringify(observation)).not.toContain('PRIVATE');
+  }
+});
+
+
+test('initial write is latched before a later stderr rejection can replace it', async () => {
+  let calls=0, observed:any, killed=false;
+  await expect(exchangeStartup({stdout:(async function*(){})(),stderr:(async function*(){throw new Error('PRIVATE-LATER-STDERR');})(),
+    exited:Promise.resolve(1),write:()=>{throw new Error('PRIVATE-FIRST-WRITE');},kill:()=>{killed=true;}},1000,undefined,value=>{calls++;expect(killed).toBe(true);observed=value;})).rejects.toThrow('startup exchange rejected');
+  expect(calls).toBe(1);expect(observed.category).toBe('write');
+  expect(JSON.stringify(observed)).not.toContain('PRIVATE');
+});
+
+test('phase observer setup failures remain unknown and never become raw stream text', async () => {
+  let observed:any;
+  await expect(exchangeStartup({stdout:(async function*(){})(),stderr:(async function*(){})(),exited:Promise.resolve(1),write:()=>{},kill:()=>{}},
+    1000,()=>{throw new Error('PRIVATE-PHASE');},value=>{observed=value;})).rejects.toThrow('startup exchange rejected');
+  expect(observed.category).toBe('unknown');expect(JSON.stringify(observed)).not.toContain('PRIVATE');
+});
+
+
+test('config warnings preserve private fields through success and RPC error without new requests', () => {
+  const warnings = [
+    {summary:'PRIVATE-WARNING',details:null},
+    {summary:'PRIVATE-WARNING',details:'private details',path:'/private/config',
+      range:{start:{line:2,column:3},end:{line:1,column:1}}},
+  ];
+  for (const ending of [{id:2,result:{thread:{id:'synthetic'}}},
+    {id:2,error:{code:-32603,message:'private RPC'}}]) {
+    const protocol = new StartupProtocol();
+    protocol.begin(); protocol.accept({id:1,result:initialized});
+    for (const params of warnings)
+      expect(protocol.accept({method:'configWarning',params})).toEqual([]);
+    protocol.accept(ending);
+    expect(protocol.warnings()).toEqual(warnings);
+    const copy=protocol.warnings(); copy[0].summary='changed';
+    expect(protocol.warnings()[0].summary).toBe('PRIVATE-WARNING');
+  }
+});
+
+test('config warning schema, state, count and private byte bounds fail closed', () => {
+  const good={summary:'private',details:null};
+  const bad: unknown[]=[{}, {...good,summary:null}, {summary:'private'}, {...good,details:1},
+    {...good,path:null}, {...good,range:null}, {...good,extra:1},
+    {...good,range:{start:{line:1,column:1},end:{line:1,column:1},extra:1}}];
+  for (const number of [0,-1,1.5,Number.MAX_SAFE_INTEGER+1,true])
+    bad.push({...good,range:{start:{line:number,column:1},end:{line:1,column:1}}});
+  for (const params of bad) {
+    const protocol=new StartupProtocol(); protocol.begin(); protocol.accept({id:1,result:initialized});
+    expect(()=>protocol.accept({method:'configWarning',params})).toThrow();
+    expect(()=>protocol.outcome()).toThrow();
+  }
+  const early=new StartupProtocol(); early.begin();
+  expect(()=>early.accept({method:'configWarning',params:good})).toThrow();
+  const count=new StartupProtocol(); count.begin(); count.accept({id:1,result:initialized});
+  for(let i=0;i<4;i++) count.accept({method:'configWarning',params:good});
+  expect(()=>count.accept({method:'configWarning',params:good})).toThrow();
+  const bytes=new StartupProtocol(); bytes.begin(); bytes.accept({id:1,result:initialized});
+  expect(()=>bytes.accept({method:'configWarning',params:{summary:'x'.repeat(16384),details:null}})).toThrow();
+});
+
+
+test('warning bytes are cumulative UTF8 and thread notifications remain separately counted on failure', async () => {
+  const warning={summary:'x'.repeat(16355),details:null};
+  expect(Buffer.byteLength(JSON.stringify(warning))).toBe(16384);
+  const protocol=new StartupProtocol(); protocol.begin(); protocol.accept({id:1,result:initialized});
+  protocol.accept({method:'configWarning',params:warning});
+  expect(()=>protocol.accept({method:'configWarning',params:{summary:'',details:null}})).toThrow();
+  const multi=new StartupProtocol(); multi.begin(); multi.accept({id:1,result:initialized});
+  expect(()=>multi.accept({method:'configWarning',params:{summary:'\u00e9'.repeat(8192),details:null}})).toThrow();
+  let observed:any;
+  const frames=[{id:1,result:initialized},
+    {method:'configWarning',params:{summary:'PRIVATE-CONFIG',details:null}},
+    {method:'thread/started',params:{thread:{id:'synthetic'}}},
+    {method:'unknownNotification',params:{private:'PRIVATE'}}];
+  await expect(exchangeStartup({stdout:(async function*(){for(const frame of frames)yield Buffer.from(JSON.stringify(frame)+'\n');})(),
+    stderr:(async function*(){})(),exited:Promise.resolve(1),write:()=>{},kill:()=>{}},1000,undefined,v=>{observed=v;})).rejects.toThrow('startup exchange rejected');
+  expect(observed.acceptedNotifications).toBe(1);
+  expect(observed.category).toBe('notification-shape');
+  expect(JSON.stringify(observed)).not.toContain('PRIVATE');
 });

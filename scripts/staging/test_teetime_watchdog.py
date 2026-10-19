@@ -6,6 +6,15 @@ from unittest.mock import patch
 from teetime_watchdog import validate_manifest, cleanup
 
 class ManifestTests(unittest.TestCase):
+    def test_demo_deadline_is_closed_and_canary_bound_unchanged(self):
+        from teetime_demo_execution import DEMO_LIMITS
+        data=self.valid();data['deadline']=1000+DEMO_LIMITS['watchdogSeconds']
+        self.assertEqual(validate_manifest(data,1000,'supervised-demo'),data)
+        with self.assertRaises(ValueError): validate_manifest(data,1000)
+        with self.assertRaises(ValueError): validate_manifest(data,1000,'unbounded')
+        data['deadline']+=1
+        with self.assertRaises(ValueError): validate_manifest(data,1000,'supervised-demo')
+
     def valid(self):
         return {'owner':'teetime-auth-0123456789ab','deadline':1100,
                 'containers':['a'*64],'networks':['b'*64]}
@@ -46,5 +55,19 @@ class ManifestTests(unittest.TestCase):
     def test_daemon_failure_is_not_absence(self):
         with patch('teetime_watchdog.subprocess.run',side_effect=subprocess.CalledProcessError(1,['docker'])):
             self.assertEqual(len(cleanup('docker',self.valid())),2)
+
+    def test_optional_monotonic_deadline_bounds_commands_without_reset(self):
+        with patch('teetime_watchdog.time.monotonic', side_effect=[100,102]), \
+                patch('teetime_watchdog.subprocess.run', return_value=SimpleNamespace(stdout=b'')) as run:
+            self.assertEqual(cleanup('docker',self.valid(),deadline=103),[])
+            self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list],[3,1])
+        with patch('teetime_watchdog.time.monotonic', return_value=100), \
+                patch('teetime_watchdog.subprocess.run') as run:
+            errors=cleanup('docker',self.valid(),deadline=100)
+            self.assertEqual(len(errors),2)
+            self.assertEqual({item['failure'] for item in errors},{'TimeoutError'})
+            run.assert_not_called()
+        for deadline in [True,float('inf'),float('nan'),'PRIVATE']:
+            with self.assertRaises(ValueError): cleanup('docker',self.valid(),deadline=deadline)
 
 if __name__=='__main__': unittest.main()

@@ -40,6 +40,73 @@ import {
 } from '../auth-refresh/index.js';
 import { createLogger } from '@archon/paths';
 import { classifyProbeError } from '../probe/probe-classifier';
+import { inspectSdkFailureEvidence, type SdkFailureEvidence } from './sdk-failure-evidence';
+// Internal diagnostic metadata only. No text, identifiers or caller properties.
+export type CodexFailureOrigin =
+  | 'sdk_iterator_exception'
+  | 'native_turn_failed'
+  | 'native_stream_error_without_terminal'
+  | 'provider_initialization'
+  | 'unknown';
+export interface CodexFailureOriginRecord {
+  readonly version: 1;
+  readonly origin: CodexFailureOrigin;
+}
+
+const records = new WeakMap<object, Readonly<CodexFailureOriginRecord>>();
+const sdkEvidence = new WeakMap<object, Readonly<SdkFailureEvidence>>();
+const unknownSdkEvidence = inspectSdkFailureEvidence(null);
+const unknown = Object.freeze({ version: 1, origin: 'unknown' } as const);
+const origins = new Set<string>([
+  'sdk_iterator_exception', 'native_turn_failed',
+  'native_stream_error_without_terminal', 'provider_initialization', 'unknown',
+]);
+function identity(value: unknown): value is object {
+  return value !== null && (typeof value === 'object' || typeof value === 'function');
+}
+export function markCodexFailureOrigin<T>(value: T, origin: CodexFailureOrigin): T {
+  if (identity(value) && !records.has(value) && origins.has(origin)) {
+    records.set(value, Object.freeze({ version: 1, origin }));
+    if (origin === 'sdk_iterator_exception') sdkEvidence.set(value, inspectSdkFailureEvidence(value));
+  }
+  return value;
+}
+export function readCodexFailureOrigin(value: unknown): Readonly<CodexFailureOriginRecord> {
+  return identity(value) ? records.get(value) ?? unknown : unknown;
+}
+export function readCodexSdkFailureEvidence(value: unknown): Readonly<SdkFailureEvidence> {
+  return identity(value) ? sdkEvidence.get(value) ?? unknownSdkEvidence : unknownSdkEvidence;
+}
+export function copyCodexFailureOrigin<T>(source: unknown, replacement: T): T {
+  const record = identity(source) ? records.get(source) : undefined;
+  if (record && identity(replacement) && !records.has(replacement)) {
+    records.set(replacement, record);
+    const detail = sdkEvidence.get(source as object);
+    if (detail) sdkEvidence.set(replacement, detail);
+  }
+  return replacement;
+}
+
+// Only SDK iterator operations are inside the catches. Event interpretation is
+// outside this adapter, so its exceptions cannot be mislabeled as SDK errors.
+export async function* codexEventsWithFailureOrigin<T>(events: AsyncIterable<T>): AsyncGenerator<T> {
+  let iterator: AsyncIterator<T>;
+  try { iterator = events[Symbol.asyncIterator](); }
+  catch (error) { throw markCodexFailureOrigin(error, 'sdk_iterator_exception'); }
+  const adapter: AsyncIterableIterator<T> = {
+    [Symbol.asyncIterator]() { return this; },
+    async next() {
+      try { return await iterator.next(); }
+      catch (error) { throw markCodexFailureOrigin(error, 'sdk_iterator_exception'); }
+    },
+    async return() {
+      try { return iterator.return ? await iterator.return() : { done: true, value: undefined }; }
+      catch (error) { throw markCodexFailureOrigin(error, 'sdk_iterator_exception'); }
+    },
+  };
+  for await (const event of adapter) yield event;
+}
+
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -434,7 +501,7 @@ async function* streamCodexEvents(
       // (e.g. usage-limit turn.failed -> 'unknown' error class -> failback).
       // Previously this yielded an error-result chunk and returned normally,
       // which caused the try block in sendQuery to succeed and bypass failback.
-      throw new Error(errorMessage);
+      throw markCodexFailureOrigin(new Error(errorMessage), 'native_turn_failed');
     }
 
     if (event.type === 'item.completed') {
@@ -650,13 +717,16 @@ async function* streamCodexEvents(
   // that streamed nothing but never raised an isError.
   const message = lastNonMcpError ?? 'Codex stream closed without turn.completed or turn.failed';
   getLog().error({ message }, 'stream_incomplete');
-  yield {
+  const incomplete: MessageChunk = {
     type: 'result',
     sessionId: threadId ?? undefined,
     isError: true,
     errorSubtype: 'codex_stream_incomplete',
     errors: [message],
   };
+  if (lastNonMcpError !== undefined)
+    markCodexFailureOrigin(incomplete, 'native_stream_error_without_terminal');
+  yield incomplete;
 }
 
 // --- Error Classification & Retry ----------------------------------------
@@ -672,7 +742,7 @@ function classifyAndEnrichCodexError(
 
   if (errorClass === 'model_access') {
     return {
-      enrichedError: new Error(buildModelAccessMessage(model)),
+      enrichedError: copyCodexFailureOrigin(error, new Error(buildModelAccessMessage(model))),
       errorClass,
       shouldRetry: false,
     };
@@ -681,13 +751,13 @@ function classifyAndEnrichCodexError(
   if (errorClass === 'auth') {
     const enrichedError = new Error(`Codex auth error: ${error.message}`);
     enrichedError.cause = error;
-    return { enrichedError, errorClass, shouldRetry: false };
+    return { enrichedError: copyCodexFailureOrigin(error, enrichedError), errorClass, shouldRetry: false };
   }
 
   const enrichedError = new Error(`Codex ${errorClass}: ${error.message}`);
   enrichedError.cause = error;
   const shouldRetry = errorClass === 'rate_limit' || errorClass === 'crash';
-  return { enrichedError, errorClass, shouldRetry };
+  return { enrichedError: copyCodexFailureOrigin(error, enrichedError), errorClass, shouldRetry };
 }
 
 function toErrorMessage(error: unknown): string {
@@ -702,7 +772,7 @@ function toCodexAuthPathError(error: unknown): Error {
   if (error instanceof Error) {
     authError.cause = error;
   }
-  return authError;
+  return copyCodexFailureOrigin(error, authError);
 }
 
 // --- Codex Provider ------------------------------------------------------
@@ -780,11 +850,11 @@ export class CodexProvider implements IAgentProvider {
         env: buildCodexEnv(requestEnv),
       });
     } catch (error) {
-      const err = error as Error;
+      const err = markCodexFailureOrigin(error, 'provider_initialization') as Error;
       if (isModelAccessError(err.message)) {
-        throw new Error(buildModelAccessMessage());
+        throw copyCodexFailureOrigin(err, new Error(buildModelAccessMessage()));
       }
-      throw new Error(`Codex query failed: ${err.message}`);
+      throw copyCodexFailureOrigin(err, new Error(`Codex query failed: ${err.message}`));
     }
   }
 
@@ -817,9 +887,14 @@ export class CodexProvider implements IAgentProvider {
     const codexConfig = parseCodexConfig(assistantConfig);
 
     // 1. Initialize SDK and build thread options
-    const codex = this.restricted
-      ? new Codex(restrictedClientOptions(this.restrictedTransport))
-      : await this.createCodexClient(codexConfig.codexBinaryPath, requestOptions?.env);
+    let codex: Codex;
+    try {
+      codex = this.restricted
+        ? new Codex(restrictedClientOptions(this.restrictedTransport))
+        : await this.createCodexClient(codexConfig.codexBinaryPath, requestOptions?.env);
+    } catch (error) {
+      throw markCodexFailureOrigin(error, 'provider_initialization');
+    }
     const threadOptions = this.restricted
       ? restrictedThreadOptions()
       : buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
@@ -858,11 +933,11 @@ export class CodexProvider implements IAgentProvider {
         try {
           thread = codex.startThread(threadOptions);
         } catch (startError) {
-          const err = startError as Error;
+          const err = markCodexFailureOrigin(startError, 'provider_initialization') as Error;
           if (isModelAccessError(err.message)) {
-            throw new Error(buildModelAccessMessage(requestOptions?.model));
+            throw copyCodexFailureOrigin(err, new Error(buildModelAccessMessage(requestOptions?.model)));
           }
-          throw new Error(`Codex query failed: ${err.message}`);
+          throw copyCodexFailureOrigin(err, new Error(`Codex query failed: ${err.message}`));
         }
         sessionResumeFailed = true;
       }
@@ -871,11 +946,11 @@ export class CodexProvider implements IAgentProvider {
       try {
         thread = codex.startThread(threadOptions);
       } catch (error) {
-        const err = error as Error;
+        const err = markCodexFailureOrigin(error, 'provider_initialization') as Error;
         if (isModelAccessError(err.message)) {
-          throw new Error(buildModelAccessMessage(requestOptions?.model));
+          throw copyCodexFailureOrigin(err, new Error(buildModelAccessMessage(requestOptions?.model)));
         }
-        throw new Error(`Codex query failed: ${err.message}`);
+        throw copyCodexFailureOrigin(err, new Error(`Codex query failed: ${err.message}`));
       }
     }
 
@@ -907,21 +982,25 @@ export class CodexProvider implements IAgentProvider {
         try {
           thread = codex.startThread(threadOptions);
         } catch (startError) {
-          const err = startError as Error;
+          const err = markCodexFailureOrigin(startError, 'provider_initialization') as Error;
           if (isModelAccessError(err.message)) {
-            throw new Error(buildModelAccessMessage(requestOptions?.model));
+            throw copyCodexFailureOrigin(err, new Error(buildModelAccessMessage(requestOptions?.model)));
           }
-          throw new Error(`Codex query failed: ${err.message}`);
+          throw copyCodexFailureOrigin(err, new Error(`Codex query failed: ${err.message}`));
         }
       }
 
       try {
         // 4. Run streamed turn
-        const result = await thread.runStreamed(prompt, turnOptions);
+        const result = await (async () => {
+          try { return await thread.runStreamed(prompt, turnOptions); }
+          catch (error) { throw markCodexFailureOrigin(error, 'sdk_iterator_exception'); }
+        })();
 
         // 5. Stream normalized events (fresh state per attempt to avoid dedup leaks)
         yield* streamCodexEvents(
-          this.trackRestrictedSessions(result.events as AsyncIterable<Record<string, unknown>>),
+          this.trackRestrictedSessions(codexEventsWithFailureOrigin(
+            result.events as AsyncIterable<Record<string, unknown>>)),
           hasOutputFormat,
           thread.id,
           requestOptions?.abortSignal
@@ -964,11 +1043,11 @@ export class CodexProvider implements IAgentProvider {
           try {
             thread = codex.startThread(threadOptions);
           } catch (startError) {
-            const startErr = startError as Error;
+            const startErr = markCodexFailureOrigin(startError, 'provider_initialization') as Error;
             if (isModelAccessError(startErr.message)) {
-              throw new Error(buildModelAccessMessage(requestOptions?.model));
+              throw copyCodexFailureOrigin(startErr, new Error(buildModelAccessMessage(requestOptions?.model)));
             }
-            throw new Error(`Codex query failed: ${startErr.message}`);
+            throw copyCodexFailureOrigin(startErr, new Error(`Codex query failed: ${startErr.message}`));
           }
           // Restart the loop at attempt 0 without consuming a retry slot --
           // the rollout restart is a single-shot self-heal, distinct from

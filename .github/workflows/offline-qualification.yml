@@ -50,6 +50,7 @@ jobs:
           python3 scripts/staging/test_cleanup_apparmor_audit.py
           python3 scripts/staging/test_apparmor_negatives.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_connect_proxy.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_native_header_diagnostic.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_auth_receiver.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_watchdog.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_canary_protocol.py
@@ -64,6 +65,30 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_git_objects.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_git_commit.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_git_base.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_browser_seccomp.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_framework_qualification.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_demo_case.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_demo_result.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_diagnostic.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_diagnostic_v2.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_v2_contract.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_proxy_diagnostic_v2.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_worker.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_protocol.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_controller.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_execution.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_controller_check.py
+          bun test ./scripts/staging/teetime-minimal-diagnostic-runner.test.ts
+          python3 -m unittest discover -s scripts/staging -p test_teetime_demo_execution.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_plan_observation.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_plan_observation.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_demo_controller_check.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_operator_delivery.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_operator.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_operator_record.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_minimal_pc_envelope.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_artifact_workspace.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_successor_observation.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_snapshot_exporter.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_artifact_contract.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_materialization_frame.py
@@ -77,7 +102,9 @@ jobs:
           python3 -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_protocol.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_operator.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_auth_artifact_worker.py
+          python3 -m unittest discover -s scripts/staging -p test_teetime_worker_capture.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_proxy_receipt.py
+          python3 -m unittest discover -s scripts/staging -p 'test_teetime_proxy_diagnostic*.py'
           python3 -m unittest discover -s scripts/staging -p test_teetime_canary_diagnostics.py
           python3 -m unittest discover -s scripts/staging -p test_teetime_operator_protocol.py
           bun test ./scripts/staging/teetime-canary-result.test.ts
@@ -87,8 +114,22 @@ jobs:
           bun test ./scripts/staging/teetime-startup-protocol.test.ts
           bun test ./scripts/staging/teetime-startup-entry.test.ts
           bun test ./scripts/staging/teetime-fixed-artifact.test.ts
+          bun test ./scripts/staging/teetime-demo-task.test.ts
+          bun test ./scripts/staging/teetime-minimal-diagnostic.test.ts
+          bun test ./scripts/staging/teetime-minimal-diagnostic-v2.test.ts
+          bun test ./scripts/staging/teetime-plan-observation.test.ts
+          bun test ./scripts/staging/teetime-supervised-transport.test.ts
           bun test packages/workflows/src/reliability/tee-time-review-package.test.ts
           bun test packages/workflows/src/reliability/tee-time-controller-input.test.ts
+          bun test ./packages/paths/src/tee-time-supervised-policy.test.ts
+          bun test ./packages/workflows/src/reliability/tee-time-supervised-bootstrap.test.ts
+          bun test ./packages/workflows/src/reliability/tee-time-supervised-model-phase.test.ts
+          bun test ./packages/workflows/src/reliability/tee-time-minimal-admission.test.ts
+          bun x tsc --noEmit -p packages/workflows/tsconfig.json
+          bun test ./packages/workflows/src/reliability/tee-time-supervised-prepare.test.ts
+          bun ./scripts/staging/qualify-teetime-supervised-sqlite.ts
+          bun test ./scripts/staging/teetime-supervised-entry-guard.test.ts ./scripts/staging/teetime-supervised-controller.test.ts
+          bun test ./scripts/staging/teetime-minimal-controller-integration.test.ts
           bun test packages/paths/src/offline-qualification.test.ts
           bun --filter @archon/server test
           bun --filter @archon/server type-check
@@ -100,6 +141,8 @@ jobs:
         run: |
           cd packages/providers
           bun test src/codex/restricted-provider.test.ts
+          bun test src/codex/failure-provenance.test.ts
+          bun test src/codex/sdk-failure-evidence.test.ts
           bun test src/codex/restricted-canary-transport.test.ts
           bun test src/codex/restricted-sdk.test.ts
           bun test src/community/pi/restricted-review.test.ts
@@ -128,6 +171,13 @@ jobs:
             sleep 5
           done
           exit 1
+      - name: Verify startup runtime dependency bytes in staging image
+        run: |
+          set -euo pipefail
+          files=(scripts/staging/teetime-startup-protocol.ts scripts/staging/teetime-reviewer-fixture.ts packages/providers/src/codex/restricted-policy.ts packages/providers/src/codex/restricted-review-catalog.ts packages/providers/src/codex/sdk-failure-evidence.ts)
+          sha256sum "${files[@]}" > "$RUNNER_TEMP/startup-source.sha256"
+          docker exec -w /app "$QUALIFICATION_CONTAINER" sha256sum "${files[@]}" > "$RUNNER_TEMP/startup-image.sha256"
+          cmp "$RUNNER_TEMP/startup-source.sha256" "$RUNNER_TEMP/startup-image.sha256"
       - name: Require named sandbox and configuration isolation
         run: |
           set -euo pipefail
