@@ -33,6 +33,7 @@ class ControllerCheckTests(unittest.TestCase):
                                         expected_binding=dict(self.execution.binding))
         worker = protocol.worker()
         worker['workspaceDiagnostic']={'category':'unchanged','entryCount':2,'maskEntryCount':0}
+        worker['taskFailureDiagnostic']=None
         worker.update({'artifactBase64': base64.b64encode(artifact).decode(),
                        'artifactHash': candidate.artifact_hash, 'bindingHash': candidate.binding_hash,
                        'manifestHash': candidate.manifest_hash, 'sourceTree': candidate.source_tree})

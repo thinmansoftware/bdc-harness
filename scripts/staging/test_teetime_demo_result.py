@@ -4,7 +4,7 @@ import json
 import unittest
 import test_teetime_demo_case as demo_case_tests
 from teetime_demo_case import MODEL_PATHS
-from teetime_demo_result import validate_demo_task_result, MAX_DEMO_TASK_RESULT
+from teetime_demo_result import validate_demo_task_result, validate_demo_task_failure, MAX_DEMO_TASK_RESULT
 
 
 class DemoResultTests(unittest.TestCase):
@@ -61,6 +61,44 @@ class DemoResultTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.validate(self.packet(), 1)
         with self.assertRaises(ValueError):
             self.validate(self.packet().replace(b'"collected": true', b'"collected": true,"collected": true'))
+
+    def test_failed_envelope_has_diagnostics_but_cannot_pass_candidate_validation(self):
+        packet=self.packet(collected=False,artifactBase64=None,assistantCount=0,resultCount=0,
+            normalProviderEnd=False,providerIteratorClosed=True,
+            failureDiagnostic={'stage':'stream','exceptionCategory':'process_hint','lastEvent':'system'})
+        parsed=validate_demo_task_failure(1,packet)
+        self.assertEqual(parsed['modelInvocations'],1)
+        self.assertEqual(parsed['failureDiagnostic']['exceptionCategory'],'process_hint')
+        with self.assertRaises(ValueError): self.validate(packet,1)
+        with self.assertRaises(ValueError): self.validate(packet,0)
+        for code in [0,2,True]:
+            with self.subTest(code=code),self.assertRaises(ValueError):validate_demo_task_failure(code,packet)
+        with self.assertRaises(ValueError):validate_demo_task_failure(1,self.packet())
+
+    def test_failed_envelope_rejects_drift_extra_duplicate_and_truncated_output(self):
+        value=json.loads(self.packet(collected=False,artifactBase64=None,
+            failureDiagnostic={'stage':'stream','exceptionCategory':'other','lastEvent':'assistant'}))
+        for change in [{'assistantCount':3},{'modelInvocations':True},{'thinkingCount':66},
+                       {'unexpected':'private-text'},{'collected':True},{'artifactBase64':'private-data'},
+                       {'failureDiagnostic':{'stage':'private-text','exceptionCategory':'other','lastEvent':'none'}},
+                       {'failureDiagnostic':None}]:
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                validate_demo_task_failure(1,json.dumps({**value,**change}).encode())
+        raw=json.dumps(value).encode()
+        for bad in [raw[:-1],raw+b'x',b'x'*(MAX_DEMO_TASK_RESULT+1),
+                    raw.replace(b'"collected": false',b'"collected": false,"collected": false')]:
+            with self.assertRaises(ValueError):validate_demo_task_failure(1,bad)
+
+    def test_failure_statistics_reject_contradictory_stage_event_and_closure(self):
+        diagnostic={'stage':'stream','exceptionCategory':'other','lastEvent':'assistant'}
+        value=json.loads(self.packet(collected=False,artifactBase64=None,failureDiagnostic=diagnostic))
+        for change in [{'normalProviderEnd':True,'providerIteratorClosed':False},
+                       {'assistantCount':0},
+                       {'failureDiagnostic':{**diagnostic,'stage':'policy'}},
+                       {'failureDiagnostic':{**diagnostic,'stage':'provider_initialization'}},
+                       {'failureDiagnostic':{**diagnostic,'lastEvent':'thinking'}}]:
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                validate_demo_task_failure(1,json.dumps({**value,**change}).encode())
 
 
 if __name__ == '__main__': unittest.main()

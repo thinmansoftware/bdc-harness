@@ -3,13 +3,15 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { rootLogger } from '../../packages/paths/src/logger';
-import { collectDemoTask, type DemoTaskResult } from './teetime-demo-task';
+import { collectDemoTask, type DemoTaskResult, type DemoFailureDiagnostic } from './teetime-demo-task';
+import { classifyCanaryException } from './teetime-canary-result';
 
 const emit = process.stdout.write.bind(process.stdout);
 rootLogger.level = 'silent';
 console.log = console.info = console.warn = console.error = console.debug = (): void => {};
 const controller = new AbortController();
 let timer: ReturnType<typeof setTimeout> | undefined;
+let stage: DemoFailureDiagnostic['stage'] = 'input';
 let result: Readonly<DemoTaskResult> = {
   kind: 'supervised-demo-v1',
   collected: false,
@@ -56,10 +58,12 @@ try {
     createHash('sha256').update(input.prompt, 'ascii').digest('hex') !== input.promptHash
   )
     throw new Error('demo input identity rejected');
+  stage = 'policy';
   const policyHash = createHash('sha256')
     .update(readFileSync('/app/packages/providers/src/codex/restricted-policy.ts'))
     .digest('hex');
   if (policyHash !== input.policyHash) throw new Error('demo policy differs');
+  stage = 'provider_initialization';
   const { createRestrictedCanaryWorkerProvider } =
     await import('../../packages/providers/src/codex/restricted-run-factory');
   const provider = createRestrictedCanaryWorkerProvider({
@@ -77,8 +81,10 @@ try {
     controller,
     () => clearTimeout(timer)
   );
-} catch {
+} catch (error) {
   // Never emit provider errors, input text, credentials or rejected source.
+  result = {...result, failureDiagnostic: Object.freeze({stage, lastEvent: 'none',
+    exceptionCategory: classifyCanaryException(error, controller.signal.aborted)})};
 } finally {
   clearTimeout(timer);
 }

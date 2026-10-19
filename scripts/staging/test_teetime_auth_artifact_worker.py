@@ -72,14 +72,29 @@ class ArtifactWorkerTests(unittest.TestCase):
                     self.assertTrue(argv[-1].endswith('teetime-demo-task-entry.ts'))
                     self.assertGreaterEqual(timeout,610);self.assertLessEqual(timeout,625)
                     self.assertEqual(json.loads(kwargs['input_bytes'])['runId'],execution.binding['runId'])
+                    self.assertIs(kwargs['include_exit_code'],True)
                 else:
                     self.assertEqual(argv[-1], nonce);self.assertEqual(timeout, 100)
                 if mode == 'changed_auth': auth.write_bytes(b'changed-private-auth')
                 if mode == 'extra_file': (workspace/'unexpected').write_bytes(b'private-workspace-data')
                 if mode == 'mask_file': (workspace/'.codex'/'hidden').write_bytes(b'private-hidden-data')
                 if mode == 'timeout': raise TimeoutError('private exception must not escape')
-                if mode == 'malformed': return b'{"private":"must-not-escape"}'
-                return json.dumps(packet).encode()
+                if mode == 'failed_packet':
+                    packet.update(collected=False,artifactBase64=None,assistantCount=0,resultCount=0,
+                        normalProviderEnd=False,providerIteratorClosed=True,
+                        failureDiagnostic={'stage':'stream','exceptionCategory':'transport_hint','lastEvent':'none'})
+                if mode in ['duplicate_assistant','duplicate_result','thinking_overflow']:
+                    packet.update(collected=False,artifactBase64=None,normalProviderEnd=False,
+                        providerIteratorClosed=True,assistantCount=0,resultCount=0,thinkingCount=0,
+                        failureDiagnostic={'stage':'stream','exceptionCategory':'other','lastEvent':'thinking'})
+                    key,event,count={'duplicate_assistant':('assistantCount','assistant',2),
+                                     'duplicate_result':('resultCount','result',2),
+                                     'thinking_overflow':('thinkingCount','thinking',65)}[mode]
+                    packet[key]=count;packet['failureDiagnostic']['lastEvent']=event
+                code=1 if mode in ['failed_packet','failure_success_exit','duplicate_assistant',
+                                   'duplicate_result','thinking_overflow'] else 0
+                raw=b'{"private":"must-not-escape"}' if mode=='malformed' else json.dumps(packet).encode()
+                return (code,raw) if demo else raw
             with patch.object(worker, 'Path', FixturePath), patch.object(worker, 'AUTH', auth), \
                 patch.object(worker.os, 'getuid', return_value=1001, create=True), \
                 patch.object(Path, 'lstat', normalized_lstat), patch.object(worker, 'preflight', side_effect=preflight), \
@@ -106,11 +121,35 @@ class ArtifactWorkerTests(unittest.TestCase):
         self.assertEqual(status,1);self.assertEqual(calls,0)
         self.assertFalse(result['taskStarted']);self.assertEqual(result['modelInvocations'],0)
 
+    def test_failed_task_packet_retains_only_diagnostics_and_never_a_candidate(self):
+        status,result,calls,raw=self.fixture('failed_packet',demo=True)
+        self.assertEqual(status,1);self.assertEqual(calls,1)
+        self.assertFalse(result['passed']);self.assertIsNone(result['artifactBase64'])
+        self.assertTrue(result['taskDiagnosticsPresent']);self.assertEqual(result['modelInvocations'],1)
+        self.assertEqual(result['taskFailureDiagnostic'],
+            {'stage':'stream','exceptionCategory':'transport_hint','lastEvent':'none'})
+        self.assertNotIn('private',raw)
+        status,result,_,_=self.fixture('failure_success_exit',demo=True)
+        self.assertEqual(status,1);self.assertIsNone(result['modelInvocations'])
+        self.assertFalse(result['taskDiagnosticsPresent']);self.assertIsNone(result['taskFailureDiagnostic'])
+
     def test_exact_task_and_actual_unchanged_auth_workspace_pass(self):
         status, result, calls, _ = self.fixture('valid')
         self.assertEqual(status, 0); self.assertEqual(calls, 1)
         self.assertTrue(result['passed']); self.assertTrue(result['authUnchanged'])
         self.assertTrue(result['workspaceUnchanged']); self.assertIsNotNone(result['artifactBase64'])
+
+    def test_rejected_stream_counts_survive_worker_and_outer_validation(self):
+        import test_teetime_demo_execution as fixtures
+        from teetime_auth_artifact_protocol import validate_worker_result
+        for mode,key,count in [('duplicate_assistant','assistantCount',2),
+                               ('duplicate_result','resultCount',2),('thinking_overflow','thinkingCount',65)]:
+            with self.subTest(mode=mode):
+                status,result,_,_=self.fixture(mode,demo=True)
+                self.assertEqual(status,1);self.assertIsNone(result['artifactBase64'])
+                self.assertTrue(result['taskDiagnosticsPresent']);self.assertEqual(result[key],count)
+                fixture=fixtures.DemoExecutionTests();fixture.setUp();execution=fixture.parse()
+                self.assertIsNone(validate_worker_result(result,nonce='a'*32,policy_hash='b'*64,execution=execution))
 
     def test_auth_workspace_mask_mutation_oom_and_bad_process_cannot_emit_bytes(self):
         for mode in ['changed_auth', 'extra_file', 'mask_file', 'oom', 'timeout', 'malformed']:

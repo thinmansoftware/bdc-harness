@@ -26,7 +26,46 @@ test('entry rejects malformed and oversized input without an invocation', () => 
     expect(result.modelInvocations).toBe(0);
     expect(result.collected).toBe(false);
     expect(result.artifactBase64).toBeNull();
+    expect(result.failureDiagnostic.stage).toBe('input');
   }
+});
+
+test('policy entry failure is classified before constructing the provider', () => {
+  const input=JSON.stringify({runId:'test-run',policyHash:'0'.repeat(64),prompt,promptHash:hash});
+  const child=spawnSync(process.execPath,[join(import.meta.dirname,'teetime-demo-task-entry.ts')],
+    {cwd:tmpdir(),input,timeout:5000,maxBuffer:4096});
+  expect(child.status).toBe(1);
+  const result=JSON.parse(child.stdout.toString());
+  expect(result.modelInvocations).toBe(0);
+  expect(result.failureDiagnostic.stage).toBe('policy');
+  expect(result.failureDiagnostic.lastEvent).toBe('none');
+  expect(JSON.stringify(result)).not.toContain('/app');
+});
+
+test('provider error hint survives cleanup abort and omits its raw diagnostic', async () => {
+  const control=new AbortController();
+  const result=await collectDemoTask(async function*(){
+    throw new Error('401 authentication private-value');
+    yield terminal;
+  },prompt,hash,control,()=>{});
+  expect(result.failureDiagnostic).toEqual({stage:'stream',exceptionCategory:'auth_hint',lastEvent:'none'});
+  expect(result.collected).toBe(false);
+  expect(JSON.stringify(result)).not.toContain('private-value');
+  const inputControl=new AbortController();
+  const rejected=await collectDemoTask(async function*(){yield terminal;},prompt+'changed',hash,inputControl,()=>{});
+  expect(inputControl.signal.aborted).toBe(true);
+  expect(rejected.failureDiagnostic?.exceptionCategory).toBe('other');
+  expect(rejected.failureDiagnostic?.stage).toBe('input');
+});
+
+test('failed stream retains event type without its private contents', async () => {
+  const result = await collectDemoTask(async function* () {
+    yield { type: 'assistant', content: 'private-source-value' };
+    throw new Error('network private-error-value');
+  }, prompt, hash, new AbortController(), () => {});
+  expect(result.failureDiagnostic?.lastEvent).toBe('assistant');
+  expect(result.artifactBase64).toBeNull();
+  expect(JSON.stringify(result)).not.toContain('private-');
 });
 
 test('full 64KiB artifact is collected once without claiming validation', async () => {

@@ -9,7 +9,7 @@ from teetime_joined_fixture import exact, strict_json
 IMAGE_PATHS = tuple('scripts/staging/'+name for name in [
     'teetime_auth_receiver.py', 'teetime_canary_worker.py', 'teetime_auth_artifact_protocol.py',
     'teetime-fixed-artifact-task.ts', 'teetime-fixed-artifact.ts', 'teetime-artifact-stream.ts',
-    'teetime-sdk-lifecycle.ts', 'teetime_fixed_artifact.py', 'teetime_artifact_contract.py',
+    'teetime-sdk-lifecycle.ts', 'teetime-canary-result.ts', 'teetime_fixed_artifact.py', 'teetime_artifact_contract.py',
     'teetime_joined_fixture.py', 'teetime_artifact_materialization.py',
     'teetime_fixture_diagnostics.py',
     'teetime_demo_execution.py', 'teetime_demo_case.py', 'teetime_demo_result.py',
@@ -99,6 +99,7 @@ def empty_worker_result(*, demo=False):
         **dict.fromkeys(IDENTITIES, None)}
     if demo:
         value['workspaceDiagnostic'] = {'category':'inspection_failed','entryCount':0,'maskEntryCount':0}
+        value['taskFailureDiagnostic'] = None
     return value
 
 
@@ -106,6 +107,12 @@ def validate_worker_result(value, *, nonce, policy_hash, execution=None):
     if type(value) is not dict or set(value) != set(empty_worker_result(demo=execution is not None)):
         raise ValueError('artifact worker schema rejected')
     if execution is not None:
+        failure = value['taskFailureDiagnostic']
+        if failure is not None:
+            from teetime_demo_result import validate_failure_statistics
+            validate_failure_statistics(value, failure)
+            if value['passed'] or not value['taskDiagnosticsPresent'] or value['modelInvocations'] is None:
+                raise ValueError('failed task diagnostic contradicts result')
         diagnostic = value['workspaceDiagnostic']
         from teetime_artifact_workspace import WORKSPACE_CATEGORIES
         if (type(diagnostic) is not dict or set(diagnostic) != {'category','entryCount','maskEntryCount'}
@@ -115,8 +122,10 @@ def validate_worker_result(value, *, nonce, policy_hash, execution=None):
             raise ValueError('bounded workspace diagnostic rejected')
     if any(type(value[key]) is not bool for key in WORKER_BOOL) or value['servedModelVerified']:
         raise ValueError('artifact worker flags rejected')
-    for key, bound in [('preflightChecks', 6), ('assistantCount', 1), ('resultCount', 1),
-                       ('thinkingCount', 64), ('elapsedMs', 630000 if execution is not None else 120000)]:
+    failed_demo = execution is not None and value['taskFailureDiagnostic'] is not None and not value['passed']
+    for key, bound in [('preflightChecks', 6), ('assistantCount', 2 if failed_demo else 1),
+                       ('resultCount', 2 if failed_demo else 1), ('thinkingCount', 65 if failed_demo else 64),
+                       ('elapsedMs', 630000 if execution is not None else 120000)]:
         if type(value[key]) is not int or not 0 <= value[key] <= bound:
             raise ValueError('artifact worker counter rejected')
     invocations, oom = value['modelInvocations'], value['oomKillDelta']

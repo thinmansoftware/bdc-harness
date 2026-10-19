@@ -28,7 +28,9 @@ def oom_kills():
         return None
 
 
-def bounded_process(argv, timeout, env=ENV, input_bytes=None):
+def bounded_process(argv, timeout, env=ENV, input_bytes=None, *, include_exit_code=False):
+    if type(include_exit_code) is not bool:
+        raise ValueError('closed worker capture mode required')
     if input_bytes is not None and (type(input_bytes) is not bytes or len(input_bytes)>160000):
         raise ValueError('bounded task input required')
     child = subprocess.Popen(argv, cwd='/workspace', env=env, stdout=subprocess.PIPE,
@@ -65,14 +67,17 @@ def bounded_process(argv, timeout, env=ENV, input_bytes=None):
                 if key.data == 'out':
                     output.extend(chunk)
         code = child.wait(timeout=max(.1, deadline-time.monotonic()))
-        if code:
+        if code and not include_exit_code:
             raise ValueError('worker subprocess failed')
-        return bytes(output)
+        return (code, bytes(output)) if include_exit_code else bytes(output)
     finally:
         selector.close()
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGKILL)
         child.wait(timeout=3)
+        for stream in [child.stdin, child.stdout, child.stderr]:
+            if stream is not None:
+                stream.close()
 
 
 def check_config(config):
@@ -323,12 +328,17 @@ def artifact_main(nonce, source, execution=None):
             candidate = validate_task_result(0, raw, nonce=nonce, policy_hash=policy_hash)
         else:
             from teetime_demo_execution import task_input,DEMO_LIMITS
-            from teetime_demo_result import validate_demo_task_result
-            raw=bounded_process(['bun',str(ROOT/'teetime-demo-task-entry.ts')],
-                task_budget,input_bytes=task_input(execution))
-            candidate=validate_demo_task_result(0,raw,prepared=execution.prepared,
-                expected_binding=dict(execution.binding))
-        task = json.loads(raw)  # Strict duplicate/schema validation already succeeded.
+            from teetime_demo_result import validate_demo_task_result, validate_demo_task_failure
+            code,raw=bounded_process(['bun',str(ROOT/'teetime-demo-task-entry.ts')],
+                task_budget,input_bytes=task_input(execution),include_exit_code=True)
+            if code == 1:
+                task=validate_demo_task_failure(code,raw)
+                result['taskFailureDiagnostic']=dict(task['failureDiagnostic'])
+            else:
+                candidate=validate_demo_task_result(code,raw,prepared=execution.prepared,
+                    expected_binding=dict(execution.binding))
+        if task is None:
+            task = json.loads(raw)  # Strict duplicate/schema validation already succeeded.
         result['taskDiagnosticsPresent'] = True
         for key in ['modelInvocations', 'assistantCount', 'resultCount', 'thinkingCount',
                     'normalProviderEnd', 'providerIteratorClosed', 'aborted']:

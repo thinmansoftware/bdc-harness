@@ -1,5 +1,25 @@
 # Tee-time supervised bootstrap source preparation
 
+## Failed task diagnostic preservation
+
+The demo worker may retain a strict failure-only packet after a normally captured
+exit 1. It contains bounded counts, lifecycle flags, a closed stage, an exception
+category hint, and the last event type only. It never contains raw errors, event
+contents, credentials, or source bytes. Failure packets require `collected=false`
+and a null artifact. Exit/status contradictions, extra or duplicate fields,
+malformed packets, timeout, overflow, and uncertain reaping remain failures with
+unknown task diagnostics. Legacy fixed-artifact subprocess handling is unchanged.
+
+These diagnostics do not authorize another authenticated attempt or turn a failed
+task into a candidate. Both existing attempts remain terminal and preserved. The
+underlying second task failure remains unknown; this repair addresses the proven
+loss of its bounded diagnostics at the subprocess boundary.
+
+`test_teetime_worker_capture.py` exercises real POSIX child exit, timeout, combined
+output limits, input, and reaping without credentials or networking. Windows skips
+these four tests because pipe selection and process groups require POSIX; that
+skip is not execution evidence. Run them in the isolated Linux test container.
+
 Parent: thinmansoftware/bdc-xo#3332.
 Governing proposal: bdc-xo PR3391, merged ccde0e9db705400523c4fec740aff2be0b8d0658.
 

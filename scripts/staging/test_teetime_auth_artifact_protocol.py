@@ -45,6 +45,7 @@ class ArtifactProtocolTests(unittest.TestCase):
         candidate=parse_demo_artifact(raw,prepared=execution.prepared,expected_binding=dict(execution.binding))
         value=self.worker()
         value['workspaceDiagnostic']={'category':'unchanged','entryCount':2,'maskEntryCount':0}
+        value['taskFailureDiagnostic']=None
         value.update({'artifactBase64':base64.b64encode(raw).decode(),'artifactHash':candidate.artifact_hash,
                       'bindingHash':candidate.binding_hash,'manifestHash':candidate.manifest_hash,
                       'sourceTree':candidate.source_tree,'elapsedMs':600000})
@@ -67,6 +68,27 @@ class ArtifactProtocolTests(unittest.TestCase):
             with self.subTest(diagnostic=diagnostic),self.assertRaises(ValueError):
                 validate_worker_result({**value,'workspaceDiagnostic':diagnostic},
                                       nonce=self.nonce,policy_hash='b'*64,execution=execution)
+
+    def test_demo_failure_diagnostic_requires_known_failed_task_statistics(self):
+        import test_teetime_demo_execution as fixtures
+        fixture=fixtures.DemoExecutionTests();fixture.setUp();execution=fixture.parse()
+        value=empty_worker_result(demo=True)
+        diagnostic={'stage':'stream','exceptionCategory':'transport_hint','lastEvent':'none'}
+        for changed in [
+                {'taskFailureDiagnostic':diagnostic},
+                {'taskDiagnosticsPresent':True,'taskFailureDiagnostic':diagnostic},
+                {'taskDiagnosticsPresent':True,'modelInvocations':1,
+                 'taskFailureDiagnostic':{**diagnostic,'exceptionCategory':'raw-private-error'}},
+                {'passed':True,'taskDiagnosticsPresent':True,'modelInvocations':1,
+                 'taskFailureDiagnostic':diagnostic},
+                {'taskDiagnosticsPresent':True,'modelInvocations':1,'normalProviderEnd':True,
+                 'providerIteratorClosed':False,'taskFailureDiagnostic':diagnostic},
+                {'taskDiagnosticsPresent':True,'modelInvocations':1,
+                 'taskFailureDiagnostic':{**diagnostic,'stage':'input'}},
+                {'taskDiagnosticsPresent':True,'modelInvocations':1,
+                 'taskFailureDiagnostic':{**diagnostic,'lastEvent':'assistant'}}]:
+            with self.subTest(changed=changed),self.assertRaises(ValueError):
+                validate_worker_result({**value,**changed},nonce=self.nonce,policy_hash='b'*64,execution=execution)
 
     def test_transitive_image_python_import_closure_is_frozen_and_measured(self):
         staging = Path(__file__).resolve().parent
