@@ -1,5 +1,71 @@
 import { expect, test } from 'bun:test';
-import { StartupProtocol, startupArguments, exchangeStartup } from './teetime-startup-protocol';
+import { StartupProtocol, startupArguments, exchangeStartup, startupCommandOutput } from './teetime-startup-protocol';
+const childEnv = process.platform === 'win32' && process.env.SystemRoot
+  ? { SystemRoot: process.env.SystemRoot } : {};
+
+test('successful bounded synchronous child accepts absent no-signal field', () => {
+  // Harmless local Bun child only: no Codex executable, account, socket or query.
+  const child = Bun.spawnSync([process.execPath, '--no-env-file', '-e', 'process.stdout.write("ready")'], {
+    env: childEnv,
+    stdout: 'pipe', stderr: 'pipe', timeout: 2000, killSignal: 'SIGKILL', maxBuffer: 4096,
+  });
+  expect(child.success).toBe(true);
+  expect(child.exitCode).toBe(0);
+  expect(startupCommandOutput(child, 4096)).toEqual(Buffer.from('ready'));
+});
+
+test('startup command guard still rejects failure, signals, overflow and timeout', () => {
+  const good = { success: true, exitCode: 0, signalCode: null,
+    stdout: Buffer.from('ready'), stderr: Buffer.alloc(0) };
+  expect(startupCommandOutput({ ...good, signalCode: null }, 4096)).toEqual(good.stdout);
+  for (const change of [
+    { success: false }, { exitCode: 1 }, { signalCode: 'SIGKILL' }, { signalCode: '' },
+    { exitedDueToTimeout: true }, { exitedDueToMaxBuffer: true },
+    { stdout: Buffer.alloc(4097) }, { stderr: Buffer.alloc(4096) },
+  ]) expect(() => startupCommandOutput({ ...good, ...change }, 4096)).toThrow('startup command rejected');
+  const timedOut = Bun.spawnSync([process.execPath, '--no-env-file', '-e', 'setTimeout(() => {}, 10000)'], {
+    env: childEnv,
+    stdout: 'pipe', stderr: 'pipe', timeout: 50, killSignal: 'SIGKILL', maxBuffer: 4096,
+  });
+  expect(() => startupCommandOutput(timedOut, 4096)).toThrow('startup command rejected');
+});
+
+test('exchange exposes only its current fixed boundary on synthetic failures', async () => {
+  for (const failAt of ['initialize-exchange', 'thread-start-exchange']) {
+    const phases: string[] = [], sent: string[] = [];
+    async function* output(): AsyncGenerator<Uint8Array> {
+      if (failAt === 'thread-start-exchange')
+        yield Buffer.from(JSON.stringify({ id: 1, result: initialized }) + '\n');
+      throw new Error('PRIVATE-STREAM-TEXT');
+    }
+    let killed = false;
+    await expect(exchangeStartup({
+      stdout: output(), stderr: (async function* () {})(), exited: Promise.resolve(1),
+      write: line => { sent.push(JSON.parse(line).method); }, kill: () => { killed = true; },
+    }, 1000, phase => { phases.push(phase); })).rejects.toThrow('startup exchange rejected');
+    expect(killed).toBe(true);
+    expect(phases.at(-1)).toBe(failAt);
+    expect(phases).not.toContain('PRIVATE-STREAM-TEXT');
+    expect(sent).not.toContain('turn/start');
+  }
+});
+
+test('a complete synthetic RPC response cannot succeed when owned reaping is uncertain', async () => {
+  const exited = Promise.reject(new Error('PRIVATE-REAP-FAILURE'));
+  void exited.catch(() => {});
+  let accepted = false, kills = 0;
+  async function* output(): AsyncGenerator<Uint8Array> {
+    yield Buffer.from(JSON.stringify({ id: 1, result: initialized }) + '\n');
+    yield Buffer.from('{"id":2,"result":{"thread":{"id":"synthetic"}}}\n');
+  }
+  try {
+    await exchangeStartup({ stdout: output(), stderr: (async function* () {})(), exited,
+      write: () => {}, kill: () => { kills++; } }, 1000);
+    accepted = true;
+  } catch { /* No raw cleanup error is published. */ }
+  expect(accepted).toBe(false);
+  expect(kills).toBeGreaterThan(0);
+});
 
 const initialized = {
   userAgent: 'codex_exec/0.153.3 (Linux synthetic; x86_64) (codex_exec; 0.153.3)',

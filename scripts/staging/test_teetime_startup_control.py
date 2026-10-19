@@ -11,10 +11,25 @@ from unittest.mock import patch
 from types import SimpleNamespace
 from teetime_startup_control import startup_settings, verify_startup_identity, require_private_repository, require_private_context, BINARY_HASH, CATALOG_HASH
 from teetime_reviewer_probe import remove_owned_reviewer
-from teetime_startup_packet import startup_metadata
+from teetime_startup_packet import startup_metadata, startup_failure_diagnostic
 
 
 class StartupControlTests(unittest.TestCase):
+    def test_failure_projection_is_closed_and_never_accepts_private_or_ambiguous_output(self):
+        good={'kind':'teetime-startup-capture-failed-v2','phase':'native-version'}
+        self.assertEqual(startup_failure_diagnostic(json.dumps(good).encode(),1),good)
+        hostile='PRIVATE-OUTPUT-MARKER'
+        for raw,code in [
+            (json.dumps({**good,'error':hostile}).encode(),1),
+            (json.dumps({**good,'phase':hostile}).encode(),1),
+            (b'{"kind":"teetime-startup-capture-failed-v2","phase":"imports","phase":"context"}',1),
+            (json.dumps(good).encode()+b' '+hostile.encode(),1),
+            (b'x'*2049,1),(b'\xff',1),(json.dumps(good).encode(),0),
+            (json.dumps(good).encode(),True),
+        ]:
+            with self.assertRaises(ValueError) as caught: startup_failure_diagnostic(raw,code)
+            self.assertNotIn(hostile,str(caught.exception))
+        with self.assertRaises(ValueError): startup_metadata(json.dumps(good).encode())
     def test_invalid_native_utf8_cannot_escape_through_host_traceback(self):
         spec=importlib.util.spec_from_file_location('teetime_startup_capture_test',Path(__file__).with_name('run-codex-sandbox-probe.py'))
         runner=importlib.util.module_from_spec(spec)

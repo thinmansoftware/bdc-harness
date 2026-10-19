@@ -2,6 +2,19 @@
 import { fixtureClientOptions, parseUniqueFixtureJson } from './teetime-reviewer-fixture';
 import { RESTRICTED_BINARY } from '../../packages/providers/src/codex/restricted-policy';
 
+export function startupCommandOutput(result: {
+  success: boolean; exitCode: number; signalCode?: string | null;
+  stdout: Uint8Array; stderr: Uint8Array;
+  exitedDueToTimeout?: boolean; exitedDueToMaxBuffer?: boolean;
+}, maxBuffer: number): Uint8Array {
+  if (result.success !== true || result.exitCode !== 0
+      || (result.signalCode !== null && result.signalCode !== undefined)
+      || result.exitedDueToTimeout === true || result.exitedDueToMaxBuffer === true
+      || result.stdout.length + result.stderr.length > maxBuffer)
+    throw new Error('startup command rejected');
+  return result.stdout;
+}
+
 interface Message {
   method: string;
   id?: number;
@@ -178,7 +191,9 @@ interface StartupChild {
 }
 
 /** Bounded child exchange. Raw stderr is counted and discarded, never interpolated. */
-export async function exchangeStartup(child: StartupChild, timeout = 12000): Promise<Outcome> {
+export async function exchangeStartup(child: StartupChild, timeout = 12000,
+  observePhase?: (phase: 'initialize-exchange' | 'thread-start-exchange') => void
+): Promise<Outcome> {
   const protocol = new StartupProtocol();
   let bytes = 0;
   let done = false;
@@ -198,6 +213,7 @@ export async function exchangeStartup(child: StartupChild, timeout = 12000): Pro
   const output = (async (): Promise<Outcome> => {
     const decoder = new TextDecoder('utf-8', { fatal: true });
     let buffer = '';
+    observePhase?.('initialize-exchange');
     child.write(JSON.stringify(protocol.begin()) + '\n');
     for await (const chunk of child.stdout) {
       count(chunk);
@@ -208,8 +224,10 @@ export async function exchangeStartup(child: StartupChild, timeout = 12000): Pro
         buffer = buffer.slice(end + 1);
         if (!line.trim()) throw new Error('startup empty line');
         const response = parseUniqueFixtureJson(Buffer.from(line));
-        for (const request of protocol.accept(response))
+        for (const request of protocol.accept(response)) {
+          if (request.method === 'thread/start') observePhase?.('thread-start-exchange');
           child.write(JSON.stringify(request) + '\n');
+        }
         if ((response as { id?: unknown }).id === 2) {
           const result = protocol.outcome();
           done = true;

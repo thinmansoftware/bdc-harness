@@ -97,3 +97,34 @@ internally. This reproduction supplies the same fixed synthetic auth file and a
 closed native environment with a synthetic CODEX_API_KEY. Its fixed loopback
 endpoint has no response server. A diagnostic thread success does not qualify
 SDK transport or reviewer operation. No history fallback/retry is permitted.
+
+## October 19 source correction after capture39235275411
+
+That one approved capture failed before retaining a private packet. Its finite
+grant is consumed. Cleanup passed; no actual native ThreadStart boundary or cause
+was established. The separate reviewer fixture39232400259 also remains failed;
+this correction does not explain that fixture or the authenticated diagnostic.
+
+The startup wrapper incorrectly required synchronous Bun signalCode to be null.
+Bun1.3.11 declares SyncSubprocess.signalCode optional; a harmless local Bun1.3.13
+child successfully exiting0 has that field absent. The regression failed against
+the old guard. Accept only null/undefined no-signal with success:true, exit0,
+no timeout/buffer-limit flag and the unchanged combined output-byte bound.
+The same harmless regression must pass under CI's pinned Bun1.3.11. References:
+https://github.com/oven-sh/bun/blob/bun-v1.3.11/packages/bun-types/bun.d.ts
+https://bun.com/reference/bun/SyncSubprocess/signalCode
+
+Failure-v2 adds only a fixed current-phase enum, emitted independently of dynamic
+imports. It indicates the observed operation boundary, not the cause or proof that
+initialization/reaping completed. Python strictly validates the nonzero-exit frame
+before any public projection; malformed/unknown output yields a generic phase.
+No raw error, stderr, RPC value, path, stack or arbitrary property is published.
+The successful private packet remains version1 and its custody/schema are unchanged.
+A failure frame never becomes a successful capture or private upload.
+
+Offline regressions cover the actual harmless synchronous child, termination and
+output limits, context/import failure through the real stdin entry and independent
+Python validator, synthetic initialize/thread-start boundaries, private-marker
+rejection and cleanup uncertainty. No Codex executable is started by these tests.
+No native capture, account delivery, turn/query, fallback, policy relaxation,
+implementation attempt or production action is authorized by this source change.

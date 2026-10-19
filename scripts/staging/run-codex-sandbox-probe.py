@@ -8,7 +8,7 @@ import subprocess
 import uuid
 from teetime_bounded_process import capture
 from teetime_reviewer_probe import reviewer_settings, verify_reviewer_limits, remove_owned_reviewer, reviewer_failure_diagnostic
-from teetime_startup_packet import startup_metadata, write_private_packet
+from teetime_startup_packet import startup_metadata, write_private_packet, startup_failure_diagnostic
 from teetime_startup_control import startup_settings, require_private_context, verify_startup_identity, BINARY_HASH
 
 
@@ -298,6 +298,12 @@ console.log(JSON.stringify(hashes));
             result = docker("start", "-ai", name, input=source.decode("utf-8"))
         # Never print arbitrary container output or inherited image environment.
         if result.returncode:
+            if args.kind == 'startup':
+                try:
+                    diagnostic = startup_failure_diagnostic(result.stdout, result.returncode)
+                except ValueError:
+                    diagnostic = {'kind':'teetime-startup-capture-failed-v2','phase':'unknown'}
+                print(json.dumps({'startupFailureDiagnostic':diagnostic}), flush=True)
             if args.kind == 'reviewer':
                 diagnostic = reviewer_failure_diagnostic(result.stdout.encode('utf-8'), result.returncode)
                 print(json.dumps({'reviewerFailureDiagnostic':diagnostic}), flush=True)

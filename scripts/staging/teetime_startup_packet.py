@@ -15,6 +15,26 @@ FIELDS = {'kind','steps','threadCreated','rpcError','binaryHash','sourceFixtureH
 SOURCE_HASH = '59f2bbc19bce43c67d6f1cdd99886953a256d948788d85810c774b17375c1fb6'
 
 
+def startup_failure_diagnostic(raw, exit_code):
+    """Closed observation boundary, never a cause, successful capture or authority."""
+    phases = {'context','imports','binary-identity','home-checks','native-version',
+              'catalog-read','catalog-compare','synthetic-setup','native-spawn',
+              'initialize-exchange','thread-start-exchange','postchecks','packet-serialization'}
+    if (type(exit_code) is not int or exit_code != 1 or type(raw) is not bytes
+            or not 1 <= len(raw) <= 2048 or not raw.isascii()
+            or len(raw.strip().splitlines()) != 1):
+        raise ValueError('startup failure diagnostic framing')
+    try:
+        value = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
+    except (ValueError, RecursionError):
+        raise ValueError('startup failure diagnostic JSON') from None
+    if (type(value) is not dict or set(value) != {'kind','phase'}
+            or value['kind'] != 'teetime-startup-capture-failed-v2'
+            or type(value['phase']) is not str or value['phase'] not in phases):
+        raise ValueError('startup failure diagnostic fields')
+    return {'kind':'teetime-startup-capture-failed-v2','phase':value['phase']}
+
+
 def startup_metadata(raw):
     if type(raw) is not bytes or not 1 <= len(raw) <= 65536:
         raise ValueError('startup packet byte bound')

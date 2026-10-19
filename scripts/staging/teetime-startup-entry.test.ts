@@ -2,7 +2,8 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, posix } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 // Focused source-recipe contract, not proof of an installed image or a general
 // Dockerfile interpreter. Only unchanged source-to-/app copies count here.
@@ -57,28 +58,44 @@ test('build-stage source and provider package metadata cannot supply missing sta
   }
 });
 
-test('stdin startup entry reaches its closed context guard from a foreign cwd', () => {
+test('stdin startup entry failure stays closed through independent Python projection', () => {
   const directory = mkdtempSync(join(tmpdir(), 'teetime-startup-entry-'));
   try {
     const env: Record<string, string> = { TEE_TIME_SANDBOX_PROBE: '0' };
     if (process.platform === 'win32' && process.env.SystemRoot)
       env.SystemRoot = process.env.SystemRoot;
-    const result = Bun.spawnSync([process.execPath, 'run', '-'], {
-      cwd: directory,
-      env,
-      stdin: readFileSync(new URL('./probe-codex-startup.ts', import.meta.url)),
-      stdout: 'pipe',
-      stderr: 'pipe',
-      timeout: 3000,
-      killSignal: 'SIGKILL',
-      maxBuffer: 16384,
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.signalCode ?? null).toBeNull();
-    expect(new TextDecoder().decode(result.stdout)).toBe(
-      '{"kind":"teetime-startup-capture-failed-v1"}'
-    );
-    expect(new TextDecoder().decode(result.stderr)).toBe('');
+    const entry = readFileSync(new URL('./probe-codex-startup.ts', import.meta.url), 'utf8');
+    for (const phase of ['context', 'imports']) {
+      // Synthetic source fixture only: bypass the context guard to exercise an
+      // early missing import. No native executable or account can be reached.
+      const input = phase === 'context' ? entry : entry
+        .replace("requireValue(process.env.TEE_TIME_SANDBOX_PROBE === '1' && process.getuid?.() === 1001);", 'requireValue(true);')
+        .replace("'/app/packages/providers/src/codex/restricted-policy.ts'",
+          JSON.stringify(pathToFileURL(join(directory, 'PRIVATE-MISSING-MODULE.ts')).href));
+      const result = Bun.spawnSync([process.execPath, 'run', '-'], {
+        cwd: directory,
+        env,
+        stdin: Buffer.from(input),
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 3000,
+        killSignal: 'SIGKILL',
+        maxBuffer: 16384,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.signalCode ?? null).toBeNull();
+      expect(JSON.parse(new TextDecoder().decode(result.stdout))).toEqual(
+        { kind: 'teetime-startup-capture-failed-v2', phase }
+      );
+      expect(new TextDecoder().decode(result.stderr)).toBe('');
+      expect(new TextDecoder().decode(result.stdout)).not.toContain('PRIVATE');
+      const python = spawnSync(process.platform === 'win32' ? 'python' : 'python3', [
+        '-I', '-B', '-c',
+        'import sys;sys.path.insert(0,sys.argv[1]);from teetime_startup_packet import startup_failure_diagnostic,startup_metadata;raw=sys.stdin.buffer.read();v=startup_failure_diagnostic(raw,1);assert v["phase"]==sys.argv[2];\ntry: startup_metadata(raw)\nexcept ValueError: pass\nelse: raise AssertionError("failure cannot be private success")',
+        fileURLToPath(new URL('./', import.meta.url)), phase,
+      ], { input: result.stdout, encoding: 'utf8', timeout: 3000 });
+      expect(python.status).toBe(0);
+    }
   } finally {
     const target = realpathSync(directory);
     if (
