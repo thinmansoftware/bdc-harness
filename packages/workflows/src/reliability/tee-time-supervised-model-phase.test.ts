@@ -56,6 +56,74 @@ test('fresh reconciled successor preserves terminal predecessor and links attemp
   await f.input.controller.releaseAfterNormalCompletion();
 });
 
+async function thirdFixture() {
+  const f = await successorFixture();
+  const second: ProviderAttemptRecord = {...f.previous,
+    attemptId:'2a99ad54-3b2b-45ae-a923-6c1a7073ac30',attemptNumber:2,
+    startedAt:'2026-10-19T03:27:24.370Z',completedAt:'2026-10-19T03:27:36.872Z',
+    supersedesAttemptId:f.previous.attemptId};
+  f.records.push(second);
+  const entries = [{...f.predecessor},{...f.predecessor,attemptId:second.attemptId,
+    completedAt:second.completedAt!,rowHash:supervisedAttemptHash(second),owner:'teetime-auth-d2a4ae153136'}];
+  const {successor: _old, ...base} = f.input;
+  return {...f,entries,second,input:{...base,diagnosticSuccessor:{predecessors:entries,
+    observe:async () => ({predecessors:entries.map(item=>({...item})),runId:'prepared-run',
+      runPaused:true as const,resourcesAbsent:true as const,observedAt:Date.now(),expiresAt:Date.now()+20000})}}};
+}
+
+test('closed third claim preserves both histories and links only the second attempt',async()=>{
+  const f=await thirdFixture();const hashes=f.records.map(supervisedAttemptHash);
+  const next=await claimSupervisedModelAttempt(f.input);
+  expect(next.attemptNumber).toBe(3);expect(next.supersedesAttemptId).toBe(f.second.attemptId);
+  expect(f.records.slice(0,2).map(supervisedAttemptHash)).toEqual(hashes);
+  expect(f.records).toHaveLength(3);
+  await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+  await f.input.controller.releaseAfterNormalCompletion();
+});
+
+test('third claim rejects chain, row, freshness and ownership drift before consumption',async()=>{
+  for(const kind of ['reversed','duplicate','owner','extra','missing','supersession','active','row',
+    'stale','resources','paused','expiry']){
+    const f=await thirdFixture();const observe=f.input.diagnosticSuccessor.observe;
+    if(kind==='reversed')f.entries.reverse();
+    if(kind==='duplicate')f.entries[1].attemptId=f.entries[0].attemptId;
+    if(kind==='owner')f.entries[1].owner=f.entries[0].owner;
+    if(kind==='extra')f.entries.push({...f.entries[1]});
+    if(kind==='missing')f.records.pop();
+    if(kind==='supersession')Object.assign(f.second,{supersedesAttemptId:null});
+    if(kind==='active')Object.assign(f.second,{completedAt:null});
+    if(kind==='row')Object.assign(f.previous,{declaredModel:'foreign'});
+    f.input.diagnosticSuccessor.observe=async()=>{
+      const value=await observe();
+      if(kind==='stale')value.observedAt-=60000;
+      if(kind==='resources')Object.assign(value,{resourcesAbsent:false});
+      if(kind==='paused')Object.assign(value,{runPaused:false});
+      if(kind==='expiry')value.expiresAt=Date.now()-1;
+      return value;
+    };
+    await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+    await expect(readFile(join(f.root,'model.claim.json'))).rejects.toThrow();
+    await f.input.controller.releaseAfterNormalCompletion();
+  }
+});
+
+test('third claim snapshots both descriptors and rejects either changed predecessor on readback',async()=>{
+  for(const index of [0,1]){
+    const f=await thirdFixture();let checks=0;
+    f.input.recheckExecution=async()=>{if(++checks===2)f.entries[index].resultHash='sha256:'+'0'.repeat(64);};
+    await expect(claimSupervisedModelAttempt(f.input)).rejects.toThrow();
+    await expect(readFile(join(f.root,'model.claim.json'))).rejects.toThrow();
+    await f.input.controller.releaseAfterNormalCompletion();
+    const g=await thirdFixture();const create=g.input.store.createProviderAttempt;
+    g.input.store.createProviderAttempt=async(attempt)=>{
+      const created=await create(attempt);Object.assign(g.records[index],{reasonCode:'changed'});return created;
+    };
+    await expect(claimSupervisedModelAttempt(g.input)).rejects.toThrow('readback differs');
+    expect(JSON.parse(await readFile(join(g.root,'model.claim.json'),'utf8')).phase).toBe('model');
+    await g.input.controller.releaseAfterNormalCompletion();
+  }
+});
+
 test('stale, forged, uncertain and failed resource observations reject before claim', async () => {
   for (const kind of ['stale', 'future', 'expiry', 'result', 'claim', 'execution', 'owner',
     'run', 'resources', 'paused', 'extra', 'query-failure']) {

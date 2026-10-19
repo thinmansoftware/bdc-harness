@@ -24,23 +24,26 @@ def frozen_file(path, expected=None, limit=262144):
     return raw
 
 
-def observe_files(root, predecessor, run_id, query):
+def observe_files(root, predecessor, run_id, query, *, history=1, retained=None, started=None):
     """query is the source-owned bounded Docker reader; tests inject fixtures.
 
     The controller must independently read the actual paused run and stored row.
     Return values alone are not evidence that those database checks occurred.
     """
     root = Path(root)
-    started = int(time.time()*1000)
-    old = root/'execution-harness/demo-execution.json'
+    started = int(time.time()*1000) if started is None else started
+    if history not in (1,2):
+        raise ValueError('closed historical attempt required')
+    old = root/('execution-harness/demo-execution.json' if history == 1
+                else 'successor-execution-harness/demo-execution.json')
     package_raw = frozen_file(old, predecessor['executionHash'])
     package = strict_json(package_raw)
-    if (package.get('version') != 1 or package.get('kind') != 'supervised-demo-v1'
+    if (package.get('version') != history or package.get('kind') != ('supervised-demo-v1' if history == 1 else 'supervised-demo-v2')
             or package.get('binding', {}).get('runId') != run_id
             or package['binding'].get('nodeId') != 'implement'
-            or package['binding'].get('attempt') != 1):
+            or package['binding'].get('attempt') != history):
         raise ValueError('original first execution differs')
-    control = root/'control'
+    control = root/('control' if history == 1 else 'control-attempt-2')
     claim_raw = frozen_file(control/'model.claim.json', predecessor['claimHash'], 4096)
     claim = strict_json(claim_raw)
     if (set(claim) != {'version','phase','bindingHash','reviewId','reviewHead','reviewer','state'}
@@ -71,12 +74,26 @@ def observe_files(root, predecessor, run_id, query):
             or type(outcome.get('artifactResult')) is not dict):
         raise ValueError('terminal cleanup not verified')
     worker = outcome['artifactResult']
-    if (worker.get('authUnchanged') is not True or worker.get('normalProviderEnd') is not True
+    if history == 1 and (worker.get('authUnchanged') is not True or worker.get('normalProviderEnd') is not True
             or worker.get('providerIteratorClosed') is not True
             or worker.get('modelInvocations') != 1 or worker.get('workspaceUnchanged') is not False
             or any(worker.get(key) is not None for key in
                    ['artifactBase64','artifactHash','bindingHash','manifestHash','sourceTree'])):
         raise ValueError('closed failed workspace attempt required')
+    if history == 2:
+        from teetime_auth_artifact_protocol import empty_worker_result
+        old_keys = set(empty_worker_result(demo=True)) - {'taskFailureDiagnostic'}
+        if (set(worker) != old_keys or worker['modelInvocations'] is not None
+                or worker['taskDiagnosticsPresent'] is not False or worker['passed'] is not False
+                or worker['normalProviderEnd'] is not False or worker['providerIteratorClosed'] is not False
+                or worker['authUnchanged'] is not True or worker['workspaceUnchanged'] is not True
+                or worker['workspaceDiagnostic'] != {'category':'unchanged','entryCount':2,'maskEntryCount':0}
+                or worker['preflightPassed'] is not True or worker['preflightChecks'] != 6
+                or worker['taskStarted'] is not True or worker['oomKillDelta'] != 0
+                or worker['assistantCount'] != 0 or worker['resultCount'] != 0
+                or any(worker[key] is not None for key in
+                       ['artifactBase64','artifactHash','bindingHash','manifestHash','sourceTree'])):
+            raise ValueError('closed unknown-statistics second attempt required')
     receipt = root.parent/owner
     manifest_raw = frozen_file(receipt/'manifest.json', predecessor['manifestHash'], 4096)
     manifest = strict_json(manifest_raw)
@@ -114,12 +131,46 @@ def observe_files(root, predecessor, run_id, query):
     ended = int(time.time()*1000)
     if ended < started or ended-started > 20000:
         raise ValueError('predecessor observation deadline exceeded')
+    if retained is not None:
+        retained.extend([(old,package_raw),(control/'model.claim.json',claim_raw),
+                         (control/'controller.lock',lock_raw),(control/'model-result.json',result_raw),
+                         (receipt/'manifest.json',manifest_raw)])
     return {'resourcesAbsent': True, 'observedAt': started, 'expiresAt': started+30000,
             'manifestHash': 'sha256:'+hashlib.sha256(manifest_raw).hexdigest(),
             'lockHash': 'sha256:'+hashlib.sha256(lock_raw).hexdigest()}
 
 
-def observe_local(root, predecessor, run_id):
+def observe_two_histories(root, predecessors, run_id, query, execution):
+    from teetime_demo_execution import parse_demo_execution
+    if len(predecessors) != 2 or execution.binding['attempt'] != 3:
+        raise ValueError('two ordered histories required')
+    started = int(time.time()*1000)
+    retained = []
+    results = [observe_files(root, prior, run_id, query, history=index+1,
+                             retained=retained, started=started)
+               for index, prior in enumerate(predecessors)]
+    packages = [parse_demo_execution(retained[index*5][1], prior['executionHash'][7:])
+                for index, prior in enumerate(predecessors)]
+    if dict(packages[1].predecessor) != dict(predecessors[0]):
+        raise ValueError('retained predecessor chain differs')
+    for old in packages:
+        if (old.prepared_binding_hash != execution.prepared_binding_hash
+                or old.prepared != execution.prepared
+                or any(old.binding[key] != execution.binding[key] for key in
+                       ['runId','nodeId','authorityHash','policyHash','baseManifestHash'])):
+            raise ValueError('historical preparation or authority differs')
+    for path,raw in retained:
+        if frozen_file(path) != raw:
+            raise ValueError('historical bytes changed during combined observation')
+    ended = int(time.time()*1000)
+    if ended < started or ended-started > 20000:
+        raise ValueError('combined historical observation deadline exceeded')
+    return {'resourcesAbsent':True,'observedAt':started,'expiresAt':started+30000,
+            'predecessors':[{'manifestHash':item['manifestHash'],'lockHash':item['lockHash']}
+                            for item in results]}
+
+
+def observe_local(root, predecessor, run_id, *, execution=None):
     deadline = time.monotonic()+20
     root = Path(root)
     if os.name != 'nt' or root != Path.home()/'teetime-supervised-01':
@@ -145,4 +196,6 @@ def observe_local(root, predecessor, run_id):
         if code != 0:
             raise ValueError('actual Docker observation failed')
         return raw
+    if execution is not None:
+        return observe_two_histories(root, predecessor, run_id, query, execution)
     return observe_files(root, predecessor, run_id, query)

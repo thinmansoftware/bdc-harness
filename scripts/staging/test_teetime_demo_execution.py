@@ -87,5 +87,34 @@ class DemoExecutionTests(unittest.TestCase):
             else: self.value['version'] = 1
             with self.subTest(kind=kind), self.assertRaises(ValueError): self.parse()
 
+    def third_package(self):
+        self.value.update(version=3,kind='supervised-demo-v3')
+        self.value['binding']['attempt']=3
+        self.value['predecessors']=[{
+            'attemptId':identifier,'completedAt':completed,'owner':owner,
+            **{key:'sha256:'+digit*64 for key in
+               ('rowHash','executionHash','resultHash','claimHash','manifestHash','lockHash')}}
+            for identifier,completed,owner,digit in [
+                ('ec3fd06e-5f27-4eda-9af1-2f759e4157ae','2026-10-19T02:43:09.062Z','teetime-auth-5eca42816a98','1'),
+                ('2a99ad54-3b2b-45ae-a923-6c1a7073ac30','2026-10-19T03:27:36.872Z','teetime-auth-d2a4ae153136','2')]]
+
+    def test_third_package_is_closed_ordered_and_immutable(self):
+        self.third_package();execution=self.parse()
+        self.assertIsNone(execution.predecessor)
+        self.assertEqual(len(execution.predecessors),2)
+        with self.assertRaises(TypeError):execution.predecessors[1]['owner']='changed'
+        original=canonical(self.value)
+        for kind in ['reversed','duplicate_id','duplicate_owner','extra','missing','legacy_field','version','attempt']:
+            self.value=json.loads(original);entries=self.value['predecessors']
+            if kind=='reversed':entries.reverse()
+            elif kind=='duplicate_id':entries[1]['attemptId']=entries[0]['attemptId']
+            elif kind=='duplicate_owner':entries[1]['owner']=entries[0]['owner']
+            elif kind=='extra':entries.append(entries[1])
+            elif kind=='missing':entries.pop()
+            elif kind=='legacy_field':self.value['predecessor']=entries[0]
+            elif kind=='version':self.value['version']=2
+            else:self.value['binding']['attempt']=2
+            with self.subTest(kind=kind),self.assertRaises(ValueError):self.parse()
+
 
 if __name__ == '__main__': unittest.main()

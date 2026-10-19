@@ -44,6 +44,17 @@ def deliver_observation(child, raw, timeout=15):
         raise
 
 
+def supervised_command(execution, args, nonce):
+    command = r'''$ErrorActionPreference='Stop'; & "$env:USERPROFILE\.bun\bin\bun.exe" --no-env-file "$env:USERPROFILE\teetime-supervised-01\execution-harness\scripts\staging\teetime-supervised-controller.ts" --claim-model --input-sha256 '''+"'"+args.input_sha256+"' --execution-sha256 '"+args.demo_package_hash+"' --source-manifest-sha256 '"+args.source_manifest_sha256+"' --source-sha '"+args.artifact_source+"' --review-head '"+args.plan_head+"' --nonce '"+nonce+"'"
+    if execution.predecessors:
+        command = command.replace('\\execution-harness\\', '\\diagnostic-execution-harness\\').replace(
+            ' --claim-model ', ' --claim-diagnostic-successor ')
+    elif execution.predecessor is not None:
+        command = command.replace('\\execution-harness\\', '\\successor-execution-harness\\').replace(
+            ' --claim-model ', ' --claim-successor ')
+    return command
+
+
 def main():
     if not __debug__:
         raise ValueError('assertions required')
@@ -102,10 +113,7 @@ def main():
     if artifact_mode:
         command += " --task artifact --artifact-source '"+args.artifact_source+"'"
     if execution is not None:
-        command = r'''$ErrorActionPreference='Stop'; & "$env:USERPROFILE\.bun\bin\bun.exe" --no-env-file "$env:USERPROFILE\teetime-supervised-01\execution-harness\scripts\staging\teetime-supervised-controller.ts" --claim-model --input-sha256 '''+"'"+args.input_sha256+"' --execution-sha256 '"+args.demo_package_hash+"' --source-manifest-sha256 '"+args.source_manifest_sha256+"' --source-sha '"+args.artifact_source+"' --review-head '"+args.plan_head+"' --nonce '"+nonce+"'"
-        if execution.predecessor is not None:
-            command = command.replace('\\execution-harness\\', '\\successor-execution-harness\\').replace(
-                ' --claim-model ', ' --claim-successor ')
+        command = supervised_command(execution, args, nonce)
     encoded = base64.b64encode(command.encode('utf-16le')).decode()
     child = subprocess.Popen(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
         'bdc-server', 'powershell', '-NoProfile', '-EncodedCommand', encoded], stdin=subprocess.PIPE,

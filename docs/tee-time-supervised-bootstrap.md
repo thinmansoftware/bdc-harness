@@ -1,5 +1,32 @@
 # Tee-time supervised bootstrap source preparation
 
+## Closed diagnostic successor source
+
+Version 3 is only implementation attempt 3, with exactly two ordered immutable
+predecessor identities. The retained V2 package must link to predecessor 1;
+both packages must preserve the same preparation, authority and assets. Existing
+V1/V2 package contracts remain unchanged. The second historical receipt retains
+its null invocation count and absent diagnostics; the new diagnostic field is
+not imposed retrospectively.
+
+The observer checks both consumed packages/claims/locks/results/manifests and
+historical resource IDs/owners under one 20-second budget and 30-second freshness
+window, then rereads all historical bytes. The model phase requires exactly the
+two terminal rows, checks both full 16-field hashes twice before claim, and
+verifies both unchanged hashes alongside the inserted third row. Completion
+checks all three rows again. This is point-in-time reconciliation, not an atomic
+Docker/SQLite snapshot.
+
+The fixed new selector is `--claim-diagnostic-successor`, source directory
+`diagnostic-execution-harness`, inventory
+`diagnostic-execution-source-manifest.json`, and exclusive `control-attempt-3`.
+It neither reuses attempt-2 mode nor resumes generic execution. An existing third
+row, consumed claim, changed history or rejected gate cannot cause a relaunch.
+
+This is source preparation only. Image qualification, fresh frozen execution
+package and independent exact-carrier plan review remain necessary before any
+new account delivery or authenticated attempt. No candidate or demo is implied.
+
 ## Failed task diagnostic preservation
 
 The demo worker may retain a strict failure-only packet after a normally captured

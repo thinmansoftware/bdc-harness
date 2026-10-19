@@ -33,7 +33,7 @@ test('operational prepare rejects shared DB before imports and emits closed diag
   }
 });
 
-for (const mode of ['--claim-model','--claim-successor'])
+for (const mode of ['--claim-model','--claim-successor','--claim-diagnostic-successor'])
 test(`${mode} entry rejects shared DB without READY, account delivery or launcher output`, async () => {
   const env: Record<string, string> = { DATABASE_URL: '' };
   for (const key of ['SYSTEMROOT', 'WINDIR', 'PATH', 'USERPROFILE', 'HOME'])

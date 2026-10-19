@@ -21,6 +21,9 @@ def check(root, package_hash, mode, raw=b''):
     validate_execution_context(execution, execution.image, execution.base_source,
                                execution.source, hashes[POLICY_PATH])
     if mode == 'predecessor':
+        if execution.predecessors:
+            from teetime_successor_observation import observe_local
+            return observe_local(root.parent, execution.predecessors, execution.binding['runId'],execution=execution)
         if execution.predecessor is None:
             raise ValueError('successor predecessor required')
         from teetime_successor_observation import observe_local
@@ -30,7 +33,8 @@ def check(root, package_hash, mode, raw=b''):
                 'preparedBindingHash': execution.prepared_binding_hash,
                 'image': execution.image, 'source': execution.source, 'baseSource': execution.base_source,
                 'binding': dict(execution.binding),
-                'predecessor': dict(execution.predecessor) if execution.predecessor else None}
+                'predecessor': dict(execution.predecessor) if execution.predecessor else None,
+                'predecessors':[dict(entry) for entry in execution.predecessors]}
     if len(raw) > 196608:
         raise ValueError('bounded controller receipt required')
     value = strict_json(raw)
