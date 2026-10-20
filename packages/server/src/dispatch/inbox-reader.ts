@@ -2,6 +2,7 @@ import { appendFile, mkdir, open, readdir, rename, unlink } from 'node:fs/promis
 import { createHash, randomUUID } from 'crypto';
 import { join } from 'path';
 import {
+  createAuthenticatedMessage,
   disposeMessageByMachine,
   heartbeatWorker,
   listMessagesBySeqCursor,
@@ -16,6 +17,7 @@ import {
   type InboxClassification,
   type InboxMessage,
 } from './inbox-reader-rules';
+import { defaultOperatorInboxSurfacePath } from './operator-inbox-consumer';
 
 export const INBOX_READER_WORKER_ID = 'inbox-reader';
 export const INBOX_READER_ACTOR = 'system:inbox-reader';
@@ -34,6 +36,8 @@ export interface InboxReaderConfig {
   gapAlertHours: number;
   alertRepeatHours: number;
   retentionDays: number;
+  canaryAgeHours: number;
+  canaryMax: number;
 }
 
 interface CountSet {
@@ -70,6 +74,7 @@ export interface Digest {
   disposal_plan: { id: string; recipient: string; rule_id: string; reason: string }[];
   disposal_results: { id: string; ok: boolean; reason: string | null }[];
   alerts: AlertRow[];
+  canary: Record<string, { unread_older_than_6h: number }>;
   content_hash: string;
   last_run_at: string;
   run_file: string | null;
@@ -82,6 +87,10 @@ interface ReaderState {
   last_alert_at?: Record<string, string>;
   cursors?: Record<string, number>;
   rotation?: number;
+  surface_cursor?: number;
+  owner_ack_overdue?: Record<string, string>;
+  owner_ack_escalated?: Record<string, string>;
+  github_subject_state?: Record<string, 'OPEN' | 'CLOSED' | 'MERGED'>;
 }
 
 export interface InboxListFilters {
@@ -100,7 +109,7 @@ export interface InboxReaderDeps {
   disposeMessageByMachine?: (data: {
     id: string;
     actor: string;
-    disposition: 'expired';
+    disposition: 'expired' | 'auto_surfaced' | 'superseded';
     requireNoReceipt: true;
   }) => Promise<DispatchMailboxResult | { ok: false; reason: string }>;
   registerWorker?: typeof registerWorker;
@@ -108,6 +117,10 @@ export interface InboxReaderDeps {
   atomicWrite?: (path: string, contents: string) => Promise<void>;
   readText?: (path: string) => Promise<string>;
   appendText?: (path: string, contents: string) => Promise<void>;
+  surfacePath?: string;
+  publishDigestSections?: (dateUtc: string, sections: Record<string, string>) => Promise<void>;
+  createAuthenticatedMessage?: typeof createAuthenticatedMessage;
+  getGithubSubjectState?: (subjectKey: string) => Promise<'OPEN' | 'CLOSED' | 'MERGED' | null>;
   log?: {
     info: (data: unknown, message?: string) => void;
     warn: (data: unknown, message?: string) => void;
@@ -143,7 +156,7 @@ export function resolveInboxReaderConfig(
   if (env.INBOX_READER_MODE && env.INBOX_READER_MODE !== 'dry-run' && mode === 'dry-run') {
     logger.warn(`invalid INBOX_READER_MODE=${env.INBOX_READER_MODE}; using dry-run`);
   }
-  const operatorOwner: Owner = env.INBOX_READER_OPERATOR_OWNER === 'reader' ? 'reader' : 'consumer';
+  const operatorOwner: Owner = env.INBOX_READER_OPERATOR_OWNER === 'consumer' ? 'consumer' : 'reader';
   return {
     intervalMs,
     mode,
@@ -155,6 +168,8 @@ export function resolveInboxReaderConfig(
     gapAlertHours: positive(env.INBOX_READER_GAP_ALERT_HOURS, 2),
     alertRepeatHours: positive(env.INBOX_READER_ALERT_REPEAT_HOURS, 6),
     retentionDays: Math.max(1, integer(env.INBOX_READER_RETENTION_DAYS, 14)),
+    canaryAgeHours: positive(env.INBOX_READER_CANARY_AGE_HOURS, 6),
+    canaryMax: Math.max(0, integer(env.INBOX_READER_CANARY_MAX, 25)),
   };
 }
 
@@ -437,9 +452,27 @@ export async function runInboxReader(
     }
     await mkdir(join(root, 'runs'), { recursive: true });
     const state = await readState(read, join(root, 'state.json'));
+    const surfaceStart = state.surface_cursor ?? 0;
+    let surfaceEnd = surfaceStart;
+    let surfaceReport: ReturnType<typeof buildReportFromSurfaceLines> | null = null;
+    if (config.operatorOwner === 'reader') {
+      try {
+        const surface = await read(deps.surfacePath ?? defaultOperatorInboxSurfacePath());
+        const bytes = Buffer.from(surface);
+        const remainder = bytes.subarray(Math.min(surfaceStart, bytes.length)).toString('utf8');
+        const allLines = remainder.split('\n');
+        const complete = allLines.slice(0, remainder.endsWith('\n') ? -1 : -1).slice(0, 2_000);
+        surfaceReport = buildReportFromSurfaceLines(complete);
+        surfaceEnd = surfaceStart + Buffer.byteLength(complete.map(line => `${line}\n`).join(''));
+      } catch {
+        // The rollback consumer may never have created surface.jsonl.
+      }
+    }
     const counts: Record<string, CountSet> = {};
     const countsByRule: Record<string, number> = {};
     const classified: { message: InboxMessage; result: InboxClassification }[] = [];
+    const githubSubjectState = { ...(state.github_subject_state ?? {}) };
+    let githubLookups = 0;
     const pageInfo: { recipient: string; full: boolean }[] = [];
     const listed = await listAllRecipients(
       list,
@@ -464,8 +497,29 @@ export async function runInboxReader(
           counts[recipient].skipped += 1;
           continue;
         }
-        const result = classifyInboxMessage(message);
-        classified.push({ message, result });
+        let candidate = message;
+        const needsSubjectState = Boolean(
+          message.subject_key?.startsWith('gh:') &&
+          (message.task_type === 'xo_escalation_handoff' || /Unclaimed P0|changes_requested|blocked|custody/i.test(message.body))
+        );
+        if (needsSubjectState) {
+          let subjectState = githubSubjectState[message.subject_key!];
+          if (!subjectState && deps.getGithubSubjectState && githubLookups < 50) {
+            githubLookups += 1;
+            try {
+              subjectState = (await deps.getGithubSubjectState(message.subject_key!)) ?? undefined;
+              if (subjectState) githubSubjectState[message.subject_key!] = subjectState;
+            } catch {
+              // Unknown is deliberately non-terminal: the classifier keeps it open.
+            }
+          }
+          candidate = { ...message, subject_state: subjectState ?? null };
+        }
+        let result = classifyInboxMessage(candidate);
+        if (needsSubjectState && candidate.subject_state === null) {
+          result = { class: 'ACTIONABLE', rule_id: 'subject_state_unavailable', action: 'BRING', reason: 'GitHub subject state unavailable', collapse_key: message.subject_key };
+        }
+        classified.push({ message: candidate, result });
         counts[recipient][result.class] += 1;
         countsByRule[result.rule_id] = (countsByRule[result.rule_id] ?? 0) + 1;
       }
@@ -477,7 +531,7 @@ export async function runInboxReader(
       { recipient: string; collapse_key: string; ids: string[]; dates: string[] }
     >();
     for (const { message, result } of classified) {
-      if (result.class === 'ACTIONABLE') {
+      if (result.action === 'BRING') {
         actionable.push({
           id: message.id,
           recipient: message.recipient,
@@ -493,7 +547,7 @@ export async function runInboxReader(
         });
         continue;
       }
-      if (result.class === 'NUDGE') {
+      if (result.action === 'COLLAPSE') {
         const key = `${message.recipient}:${result.collapse_key}`;
         const group = nudgeMap.get(key) ?? {
           recipient: message.recipient,
@@ -509,7 +563,7 @@ export async function runInboxReader(
         counts[message.recipient].acked_open += 1;
       } else if (started.getTime() - Date.parse(message.created_at) < config.minAgeMs) {
         counts[message.recipient].too_young += 1;
-      } else {
+      } else if (result.action === 'DROP' || (result.action === 'DIGEST' && message.recipient === 'xo') || (result.action === 'COLLAPSE' && (result.rule_id.startsWith('nudge_') || classified.some(other => other.message.id !== message.id && other.message.recipient === message.recipient && other.result.collapse_key === result.collapse_key && other.message.created_at > message.created_at)))) {
         const number = result.rule_id.startsWith('info_review')
           ? 'R1'
           : result.rule_id.startsWith('info_submit')
@@ -528,7 +582,13 @@ export async function runInboxReader(
       }
     }
     const alerts: AlertRow[] = [];
+    const canary: Digest['canary'] = {};
     for (const recipient of config.recipients) {
+      const unreadOld = classified.filter(item => item.message.recipient === recipient && item.message.acknowledged_at === null && started.getTime() - Date.parse(item.message.created_at) > config.canaryAgeHours * 3_600_000).map(item => item.message);
+      canary[recipient] = { unread_older_than_6h: unreadOld.length };
+      if (unreadOld.length > config.canaryMax && !isSuppressed(state, 'queued_age_canary', recipient, started.getTime(), config.alertRepeatHours)) {
+        alerts.push(createAlert(started, 'queued_age_canary', recipient, unreadOld, 'unread mailbox depth exceeds canary maximum'));
+      }
       const stale = classified
         .filter(
           item =>
@@ -602,13 +662,32 @@ export async function runInboxReader(
       disposal_plan: plan,
       disposal_results: [],
       alerts: [...alerts],
+      canary,
       content_hash: hash,
       last_run_at: started.toISOString(),
       run_file: runRequired ? runFile : null,
     };
+    const overdue = classified.filter(({ message, result }) =>
+      result.action === 'BRING' && message.acknowledged_at === null &&
+      started.getTime() - Date.parse(message.created_at) >= 24 * 3_600_000 &&
+      !state.owner_ack_overdue?.[message.id]
+    );
+    const escalations = classified.filter(({ message, result }) =>
+      result.action === 'BRING' && message.acknowledged_at === null &&
+      started.getTime() - Date.parse(message.created_at) >= 72 * 3_600_000 &&
+      !state.owner_ack_escalated?.[message.id]
+    );
+    const sections: Record<string, string> = {};
+    if (surfaceReport) sections.operator_backlog = `Counts: ${JSON.stringify(surfaceReport.counts)}\nParse errors: ${surfaceReport.parse_errors}`;
+    if (overdue.length) sections.overdue = overdue.map(({ message }) =>
+      `- ${message.recipient} ${message.id} ${message.subject_key ?? '(no subject)'}; default: hold and retry`
+    ).join('\n');
     let disposalAuthorized = true;
     try {
       await writeDigest(digest, root, writer, runRequired);
+      if (deps.publishDigestSections && Object.keys(sections).length) {
+        await deps.publishDigestSections(started.toISOString().slice(0, 10), sections);
+      }
       const latest = JSON.parse(await read(join(root, 'latest.json'))) as Digest;
       const artifacts = [latest];
       if (runRequired) artifacts.push(JSON.parse(await read(join(root, runFile))) as Digest);
@@ -622,13 +701,33 @@ export async function runInboxReader(
       errors.push(`digest_write_failed:${(error as Error).message}`);
       logger.error({ error }, 'digest_write_failed');
     }
+    const nextOverdue = { ...(state.owner_ack_overdue ?? {}) };
+    const nextEscalated = { ...(state.owner_ack_escalated ?? {}) };
+    if (disposalAuthorized) {
+      const createMessage = deps.createAuthenticatedMessage ?? createAuthenticatedMessage;
+      for (const { message } of overdue) {
+        nextOverdue[message.id] = started.toISOString();
+      }
+      for (const { message } of escalations) {
+        await createMessage(INBOX_READER_ACTOR, {
+            recipient: 'duty-officer', task_type: 'agent_message', priority: 'normal',
+            correlation_id: message.correlation_id ?? `owner-ack-overdue:${message.id}`,
+            idempotency_key: `owner-ack-overdue:${message.id}`,
+            subject_key: message.subject_key ?? undefined,
+            body: JSON.stringify({ kind: 'owner_ack_overdue', message_id: message.id, recipient: message.recipient, subject_key: message.subject_key, default_if_unanswered: 'hold and retry' }),
+        });
+        nextEscalated[message.id] = started.toISOString();
+      }
+    }
     const successes: Record<string, number> = {};
     if (config.mode === 'enforce' && disposalAuthorized) {
       for (const item of plan) {
+        const classification = classified.find(value => value.message.id === item.id)?.result;
+        const recipient = classified.find(value => value.message.id === item.id)?.message.recipient;
         const result = await dispose({
           id: item.id,
           actor: INBOX_READER_ACTOR,
-          disposition: 'expired',
+          disposition: classification?.action === 'COLLAPSE' ? 'superseded' : classification?.action === 'DIGEST' && recipient === 'xo' ? 'auto_surfaced' : 'expired',
           requireNoReceipt: true,
         });
         digest.disposal_results.push({
@@ -691,7 +790,7 @@ export async function runInboxReader(
     for (const alert of alerts) lastAlertAt[alertKey(alert.kind, alert.recipient)] = alert.at;
     await writer(
       join(root, 'state.json'),
-      `${JSON.stringify({ last_run_at: started.toISOString(), content_hash: hash, run_file: digest.run_file, last_alert_at: lastAlertAt, cursors: nextCursors, rotation: (state.rotation ?? 0) + 1 }, null, 2)}\n`
+      `${JSON.stringify({ last_run_at: started.toISOString(), content_hash: hash, run_file: digest.run_file, last_alert_at: lastAlertAt, cursors: nextCursors, rotation: (state.rotation ?? 0) + 1, surface_cursor: disposalAuthorized ? surfaceEnd : surfaceStart, owner_ack_overdue: nextOverdue, owner_ack_escalated: nextEscalated, github_subject_state: githubSubjectState }, null, 2)}\n`
     );
     const cutoff = started.getTime() - config.retentionDays * 86_400_000;
     for (const file of await readdir(join(root, 'runs'))) {

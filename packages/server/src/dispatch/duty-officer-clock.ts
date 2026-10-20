@@ -18,6 +18,7 @@ import { createLogger } from '@archon/paths';
 import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
+import { routeOpsEvent } from './ops-event-routing';
 import {
   mintAppInstallationToken,
   runSecurityDetector,
@@ -95,6 +96,7 @@ export interface DutyOfficerClockDeps {
   postAlarmComment?: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
   listAlarmIssueComments?: (issue: DutyOfficerStaleIssue) => Promise<WorkerAlarmIssueComment[]>;
   now?: () => Date;
+  appendOpsDigest?: (section: string, line: string) => Promise<void>;
 }
 
 export function githubToken(): string | null {
@@ -417,14 +419,38 @@ async function escalateToXo(
 ): Promise<void> {
   const excerpt = (verdict.body || claimed.body).slice(0, excerptLimit);
   const subjectKey = escalationSubjectKey(claimed.subject_key);
+  try {
+    const payload = JSON.parse(claimed.body) as { kind?: string; recipient?: string; message_id?: string };
+    if (payload.kind === 'owner_ack_overdue') {
+      await deps.appendOpsDigest?.('escalated', `- owner ack overdue: ${payload.recipient ?? 'unknown'} ${payload.message_id ?? claimed.id}`);
+      if (payload.recipient === 'xo') return;
+    }
+  } catch {
+    // Ordinary text message.
+  }
+  const routing = routeOpsEvent({
+    sender: claimed.sender,
+    task_type: isTaskmasterBlockerReport(claimed) ? 'blocker_report' : claimed.task_type,
+    priority: isTaskmasterSelfPause(claimed) ? 'blocker' : claimed.priority,
+    body: excerpt,
+    subject_key: claimed.subject_key,
+    created_at: claimed.created_at,
+  });
+  if (routing.class === 'ROUTINE') {
+    await deps.appendOpsDigest?.('routine', `- ${claimed.subject_key ?? claimed.id}: ${excerpt}`);
+    return;
+  }
   await deps.createAuthenticatedMessage(DUTY_OFFICER_SENDER, {
     correlation_id: claimed.correlation_id || `do-clock:${claimed.id}`,
     idempotency_key: `do-clock-escalation:${claimed.id}`,
     task_type: 'agent_message',
     recipient: 'xo',
-    priority: claimed.priority === 'blocker' ? 'blocker' : 'normal',
+    priority: routing.class === 'BLOCKER' ? 'blocker' : 'normal',
     body: JSON.stringify({
-      kind: 'duty_officer_escalation',
+      kind: 'ops_interrupt',
+      class: routing.class,
+      item: claimed.subject_key ?? claimed.id,
+      default_if_unanswered: verdict.reason || 'hold and retry on the next Duty Officer tick',
       source_id: claimed.id,
       task_type: claimed.task_type,
       subject_key: claimed.subject_key,

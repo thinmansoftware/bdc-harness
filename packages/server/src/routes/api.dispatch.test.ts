@@ -1631,7 +1631,7 @@ describe('dispatch API', () => {
         target: 'overseer',
       }),
     });
-    expect(overseer.status).toBe(200);
+    expect(overseer.status).toBe(400);
 
     const status = await app.request('/api/dispatch/status', {
       headers: { 'x-archon-operator-token': 'secret-token' },
@@ -1641,7 +1641,7 @@ describe('dispatch API', () => {
       (
         (await status.json()) as { execution_handoffs: { recipient: string }[] }
       ).execution_handoffs.map(handoff => handoff.recipient)
-    ).toEqual(expect.arrayContaining(['cauldron', 'overseer']));
+    ).toEqual(['cauldron']);
 
     const rejected = await app.request('/api/dispatch/execution-handoffs', {
       method: 'POST',
@@ -1929,10 +1929,7 @@ describe('dispatch API', () => {
           constraints: [],
         }),
       });
-      expect(response.status).toBe(200);
-      const handoff = (await response.json()) as { sender: string; sender_principal_id: string };
-      expect(handoff.sender).toBe('xo');
-      expect(handoff.sender_principal_id).toBe('xo-principal');
+      expect(response.status).toBe(400);
     });
 
     test('malformed registry fails closed and never becomes legacy traffic', async () => {

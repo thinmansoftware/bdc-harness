@@ -4495,9 +4495,7 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     const escalations = world.sentMessages.filter(m =>
       m.idempotency_key.startsWith('tm:escalate_p0:')
     );
-    expect(escalations).toHaveLength(1);
-    expect(escalations[0]?.recipient).toBe('operator');
-    expect(escalations[0]?.body).toContain('Unclaimed P0');
+    expect(escalations).toHaveLength(0);
   });
 
   test('kill switch TASKMASTER_ESCALATE_TO_ISSUE=false restores the dispatch path for a gh-ref', async () => {
@@ -4520,8 +4518,7 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
       const escalations = world.sentMessages.filter(m =>
         m.idempotency_key.startsWith('tm:escalate_p0:')
       );
-      expect(escalations).toHaveLength(1);
-      expect(escalations[0]?.recipient).toBe('operator');
+      expect(escalations).toHaveLength(0);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_ESCALATE_TO_ISSUE;
       else process.env.TASKMASTER_ESCALATE_TO_ISSUE = prior;
@@ -4613,10 +4610,10 @@ describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', 
       );
       expect(reportCalls).toHaveLength(MAX_BLOCKER_REPORTS_PER_TICK);
       for (const c of reportCalls) {
-        expect(c.recipient).toBe('duty-officer');
+        expect(c.recipient).toBe('xo');
+        expect(c.priority).toBe('blocker');
         expect(c.subject_key).toMatch(/^gh:thinmansoftware\/bdc-xo#\d+$/);
         expect(c.repeat_reason).toBe('tm:blocker_report:repeated');
-        expect(c.priority).toBeUndefined();
       }
       // The other 2 are journaled deferred.
       const deferred = world.journal.filter(
@@ -4625,7 +4622,7 @@ describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', 
       expect(deferred).toHaveLength(2);
       // No createTask addressed to xo or an owner seat.
       expect(
-        createCalls.some(c => ['xo', 'major-build', 'captain-ci', 'operator'].includes(c.recipient))
+        createCalls.some(c => ['major-build', 'captain-ci', 'operator'].includes(c.recipient))
       ).toBe(false);
       // Each blocker_report expectation: give_up / 0 retries (no redispatch).
       const blockerExps = registered.filter(e => e.recipient === 'duty-officer');
@@ -4875,7 +4872,7 @@ describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', 
         m => m.idempotency_key === `tm:blocker_report:${B.ref}:${Math.floor(T0 / (72 * HOUR))}`
       );
       expect(blockerB).toHaveLength(1);
-      expect(blockerB[0]?.recipient).toBe('duty-officer');
+      expect(blockerB[0]?.recipient).toBe('xo');
     } finally {
       restoreFlag();
       if (priorFire === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;

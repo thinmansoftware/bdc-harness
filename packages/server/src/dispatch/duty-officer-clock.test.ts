@@ -340,7 +340,7 @@ describe('duty officer clock', () => {
     });
   });
 
-  test('escalates a queued run_report to xo with no LLM and no GitHub call', async () => {
+  test('routes a routine queued run_report to digest with no XO row', async () => {
     const queued = [message({ id: 'one' })];
     const deps = fakeDeps(queued);
     const previousGh = process.env.GH_TOKEN;
@@ -352,19 +352,7 @@ describe('duty officer clock', () => {
     await tickDutyOfficerClock(deps);
 
     expect(deps.claimMessage).toHaveBeenCalled();
-    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
-    const createCall = (
-      deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
-    ).mock.calls[0];
-    expect(createCall[0]).toEqual({ kind: 'system', sender: 'dispatch' });
-    expect(createCall[1]).toEqual(
-      expect.objectContaining({
-        recipient: 'xo',
-        task_type: 'agent_message',
-        correlation_id: 'correlation-one',
-        idempotency_key: 'do-clock-escalation:one',
-      })
-    );
+    expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
     expect(deps.postResult).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'one', status: 'done', task_outcome: 'succeeded' })
     );
@@ -539,7 +527,7 @@ describe('duty officer clock', () => {
     expect(githubIssueInAllowList({ owner: 'other', repo: 'bdc-xo', number: 1 })).toBe(false);
   });
 
-  test('judge outage on a run_report still mechanical-escalates to xo', async () => {
+  test('judge outage on an ordinary run_report does not interrupt XO', async () => {
     const queued = [message({ id: 'outage' })];
     const deps = fakeDeps(queued);
     deps.judge = mock(async () => ({
@@ -552,10 +540,7 @@ describe('duty officer clock', () => {
 
     await tickDutyOfficerClock(deps);
 
-    expect(deps.createAuthenticatedMessage).toHaveBeenCalledWith(
-      { kind: 'system', sender: 'dispatch' },
-      expect.objectContaining({ recipient: 'xo', idempotency_key: 'do-clock-escalation:outage' })
-    );
+    expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
     expect(deps.postResult).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'outage', status: 'done', task_outcome: 'succeeded' })
     );
@@ -619,7 +604,7 @@ describe('duty officer clock', () => {
         lines.some(line => line.includes('duty_officer_security_detector_skipped_in_flight'))
       ).toBe(true);
       expect(deps.listMessages).toHaveBeenCalledTimes(4);
-      expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(2);
+      expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
       expect(deps.judge).toHaveBeenCalledTimes(2);
       expect(deps.llm).not.toHaveBeenCalled();
     } finally {
@@ -699,7 +684,7 @@ describe('duty officer clock', () => {
     };
     expect(data.recipient).toBe('xo');
     expect(data.idempotency_key).toBe('do-clock-escalation:br-1');
-    expect(data.priority).toBe('normal');
+    expect(data.priority).toBe('blocker');
     expect(data.subject_key).toBe('gh:thinmansoftware/bdc-xo#2274');
     const parsed = JSON.parse(data.body) as {
       reason: string;

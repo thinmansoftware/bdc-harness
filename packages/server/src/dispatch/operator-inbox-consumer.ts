@@ -151,6 +151,12 @@ export function classifyOperatorMessage(message: OperatorInboxMessage): Classifi
   const text = bodyText(message);
   const woId = extractWoId(text);
   const issueRef = extractIssueRef(text);
+  try {
+    const disposition = String((JSON.parse(text) as { disposition?: unknown }).disposition ?? '');
+    if (['ignored_event','ignored_draft','queued','checks_pending','approved','superseded_head','stale_head','duplicate_delivery'].includes(disposition)) {
+      return { kind: 'digest_only', reason: 'benign_review_receipt', woId, issueRef };
+    }
+  } catch { /* non-JSON messages continue through the text classifier */ }
 
   // Taskmaster digests and similar agent_message no-action traffic.
   if (message.task_type === 'agent_message') {

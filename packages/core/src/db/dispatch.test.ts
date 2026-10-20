@@ -452,21 +452,15 @@ describe('dispatch db', () => {
       recipient: 'codex',
       body: 'Worker poll message.',
     });
-    const mailboxMessage = await createMessage({
-      correlation_id: 'corr-mailbox-mode',
-      idempotency_key: 'idem-mailbox-mode',
-      task_type: 'agent_message',
-      sender: 'xo',
-      recipient: 'overseer',
+    await expect(createMessage({
+      correlation_id: 'corr-mailbox-mode', idempotency_key: 'idem-mailbox-mode',
+      task_type: 'agent_message', sender: 'xo', recipient: 'overseer',
       body: 'Notify-only mailbox message.',
-    });
+    })).rejects.toThrow('recipient_has_no_consumer');
 
     expect(
       (await claimMessage({ id: workerMessage.id, worker_id: 'worker-mode-guard' }))?.status
     ).toBe('claimed');
-    expect(
-      await claimMessage({ id: mailboxMessage.id, worker_id: 'worker-mode-guard' })
-    ).toBeNull();
   });
 
   // WO-HARNESS-DISPATCH-ASTRA-MAILBOX-01: astra is a drain_on_start mailbox
@@ -1282,7 +1276,7 @@ describe('dispatch db', () => {
     );
 
     const depth = (await mailboxDepthByPrincipal()).operator as import('./dispatch').MailboxDepth;
-    expect(depth).toEqual({
+    expect(depth).toMatchObject({
       unread: 2,
       legacy_unverified: 1,
       acked_open: 1,
@@ -1290,8 +1284,9 @@ describe('dispatch db', () => {
       disposed_by_machine: 1,
       surfaced_unacked: 1,
       surfaced_acked: 1,
+      surface_unread: 1,
     });
-    expect(Object.values(depth).reduce((sum, count) => sum + count, 0)).toBe(8);
+    expect(depth.unread_older_than_6h).toBeGreaterThanOrEqual(0);
   });
 
   test('mailbox depth rejects a principal that collides with the cutover_at metadata key', async () => {

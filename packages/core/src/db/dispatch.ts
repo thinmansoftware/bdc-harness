@@ -164,6 +164,8 @@ export interface MailboxDepth {
   disposed_by_machine: number;
   surfaced_unacked: number;
   surfaced_acked: number;
+  unread_older_than_6h: number;
+  surface_unread: number;
 }
 
 export type MailboxDepthResult = { cutover_at: string | null } & Record<
@@ -308,6 +310,26 @@ async function assessDispatchRecipientWithQuery(
       delivery_mode: principal.delivery_mode,
       reason: 'inactive_principal',
     };
+  }
+  if (principal.delivery_mode === 'notify_only' || canonicalPrincipal === 'overseer-reviewer') {
+    // These principals are consumed directly by code rather than a same-named
+    // worker. Keep this list explicit so a newly configured mailbox fails loud.
+    const NOTIFY_ONLY_CONSUMERS = new Set([
+      'do', // packages/server/src/dispatch/duty-officer-clock.ts
+      'duty-officer', // packages/server/src/dispatch/duty-officer-clock.ts
+      'cauldron', // packages/server/src/cauldron/worker.ts
+      'overseer-review-route', // packages/overseer/src/pr-review-wiring.ts
+      'taskmaster', // packages/server/src/taskmaster/loop.ts
+    ]);
+    const workers = await query<{ capabilities: unknown }>('SELECT capabilities FROM agent_dispatch_workers');
+    const served = workers.rows.some(row => {
+      const capabilities = parseCapabilities(row.capabilities);
+      return capabilities.principal === canonicalPrincipal ||
+        (Array.isArray(capabilities.providers) && capabilities.providers.includes(canonicalPrincipal));
+    });
+    if (!served && !NOTIFY_ONLY_CONSUMERS.has(canonicalPrincipal)) {
+      return { ok: false, canonical_principal: canonicalPrincipal, delivery_mode: principal.delivery_mode, reason: 'recipient_has_no_consumer' };
+    }
   }
   return {
     ok: true,
@@ -535,7 +557,7 @@ export async function createCappedSubjectMessage(
       const message = await createAuthenticatedMessageWithQuery(query, {
         bound,
         data: { ...data, idempotency_key: key, body: slotBody },
-      });
+      }, null, true);
       // createAuthenticatedMessageWithQuery returns the EXISTING row on an
       // idempotency conflict rather than throwing, so a bare `true` would
       // report a replay as a fresh insert (PR #740 round 6). Inside the lock a
@@ -730,7 +752,8 @@ async function createAuthenticatedMessageWithQuery(
     bound: { sender: string; sender_principal_id: string | null };
     data: CreateAuthenticatedMessageData;
   },
-  supersedesId: string | null = null
+  supersedesId: string | null = null,
+  skipSubjectSupersede = false
 ): Promise<DispatchMessage> {
   const data = input.data;
   const bound = input.bound;
@@ -740,6 +763,10 @@ async function createAuthenticatedMessageWithQuery(
   const existing = await findIdempotentMessage(query, data.idempotency_key, bound);
   const existingRow = existing.rows[0];
   if (existingRow) return normalizeMessage(existingRow);
+
+  if ((sender === 'duty-officer' || sender === 'do') && canonicalizePrincipal(data.recipient) === 'operator') {
+    throw new Error('dispatch_recipient_rejected:duty_officer_to_operator');
+  }
 
   const subjectKey =
     data.subject_key == null ? null : normalizeDispatchSubjectKey(data.subject_key);
@@ -803,12 +830,35 @@ async function createAuthenticatedMessageWithQuery(
     ]
   );
   const row = result.rows[0];
-  if (row) return normalizeMessage(row);
+  if (row) {
+    const message = normalizeMessage(row);
+    if (supersedesId === null && !skipSubjectSupersede) await supersedeOlderUnreadBySubject(query, message);
+    return message;
+  }
 
   const conflict = await findIdempotentMessage(query, data.idempotency_key, bound);
   const conflictRow = conflict.rows[0];
   if (!conflictRow) throw new Error('dispatch_idempotency_namespace_conflict');
   return normalizeMessage(conflictRow);
+}
+
+export async function supersedeOlderUnreadBySubject(
+  query: DispatchQueryExecutor,
+  newMessage: DispatchMessage
+): Promise<number> {
+  if (!newMessage.subject_key) return 0;
+  const principal = await getDispatchPrincipal(query, canonicalizePrincipal(newMessage.recipient));
+  if (!principal || (principal.delivery_mode !== 'drain_on_start' && principal.delivery_mode !== 'notify_only')) return 0;
+  const updated = await query(
+    `UPDATE agent_dispatch_messages
+     SET route_disposition = 'superseded', route_disposed_at = $1
+     WHERE recipient = $2 AND subject_key = $3 AND id <> $4
+       AND status = 'queued' AND acknowledged_at IS NULL AND addressed_at IS NULL
+       AND route_disposition IS NULL AND created_at <= $5
+       AND (priority <> 'blocker' OR $6 = 'blocker')`,
+    [nowIso(), canonicalizePrincipal(newMessage.recipient), newMessage.subject_key, newMessage.id, newMessage.created_at, newMessage.priority]
+  );
+  return updated.rowCount;
 }
 
 async function findIdempotentMessage(
@@ -1435,13 +1485,13 @@ export async function disposeMessageByMachine(
   data: {
     id: string;
     actor: string;
-    disposition: 'expired' | 'auto_surfaced';
+    disposition: 'expired' | 'auto_surfaced' | 'superseded';
     requireNoReceipt?: boolean;
   },
   transactionQuery?: DispatchQueryExecutor
 ): Promise<DispatchMailboxResult> {
   if (!data.actor.startsWith('system:')) return { ok: false, reason: 'machine_actor_required' };
-  if (data.disposition !== 'expired' && data.disposition !== 'auto_surfaced') {
+  if (!['expired', 'auto_surfaced', 'superseded'].includes(data.disposition)) {
     return { ok: false, reason: 'disposition_invalid' };
   }
 
@@ -1580,6 +1630,8 @@ export async function mailboxDepthByPrincipal(): Promise<MailboxDepthResult> {
     disposed_by_machine: number | string;
     surfaced_unacked: number | string;
     surfaced_acked: number | string;
+    unread_older_than_6h: number | string;
+    surface_unread: number | string;
   }>(`WITH cutover AS (
       SELECT applied_at FROM dispatch_receipt_cutover WHERE id = 1
     ), mailbox_rows AS (
@@ -1601,7 +1653,9 @@ export async function mailboxDepthByPrincipal(): Promise<MailboxDepthResult> {
       SUM(CASE WHEN is_legacy = 0 AND cutover_at IS NOT NULL AND route_disposition = 'expired' AND acknowledged_at IS NULL AND addressed_at IS NULL AND route_disposed_at >= cutover_at THEN 1 ELSE 0 END) AS disposed_by_machine,
       SUM(CASE WHEN is_legacy = 0 AND route_disposition = 'auto_surfaced' AND acknowledged_at IS NULL THEN 1 ELSE 0 END) AS surfaced_unacked,
       SUM(CASE WHEN is_legacy = 0 AND cutover_at IS NOT NULL AND route_disposition = 'auto_surfaced' AND acknowledged_at >= cutover_at THEN 1 ELSE 0 END) AS surfaced_acked
-    FROM mailbox_rows GROUP BY principal_id, cutover_at`);
+      ,SUM(CASE WHEN id IS NOT NULL AND acknowledged_at IS NULL AND addressed_at IS NULL AND route_disposition IS NULL AND created_at < $1 THEN 1 ELSE 0 END) AS unread_older_than_6h
+      ,SUM(CASE WHEN id IS NOT NULL AND route_disposition = 'auto_surfaced' AND acknowledged_at IS NULL THEN 1 ELSE 0 END) AS surface_unread
+    FROM mailbox_rows GROUP BY principal_id, cutover_at`, [new Date(Date.now() - 6 * 3_600_000).toISOString()]);
   const principals: Record<string, MailboxDepth> = {};
   let cutoverAt: string | null = null;
   for (const row of result.rows) {
@@ -1617,6 +1671,8 @@ export async function mailboxDepthByPrincipal(): Promise<MailboxDepthResult> {
       disposed_by_machine: Number(row.disposed_by_machine),
       surfaced_unacked: Number(row.surfaced_unacked),
       surfaced_acked: Number(row.surfaced_acked),
+      unread_older_than_6h: Number(row.unread_older_than_6h),
+      surface_unread: Number(row.surface_unread),
     };
   }
   return { cutover_at: cutoverAt, ...principals };

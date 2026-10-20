@@ -4739,6 +4739,9 @@ export function registerApiRoutes(
     } catch (error) {
       const authMapped = mapDispatchPrincipalAuthError(c, error);
       if (authMapped) return authMapped;
+      if (error instanceof Error && error.message.startsWith('dispatch_recipient_rejected:')) {
+        return apiError(c, 400, error.message);
+      }
       if (error instanceof Error && error.message.includes('invalid')) {
         return apiError(c, 400, error.message);
       }

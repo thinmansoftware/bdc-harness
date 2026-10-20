@@ -30,6 +30,7 @@ import {
   reviewSubjectKey,
   type ReviewRouteConfig,
   type ReviewWorkBody,
+  BENIGN_RECEIPT_DISPOSITIONS,
 } from './pr-review-wiring';
 
 /** Receipt recipient the submit path writes its verdicts to. */
@@ -249,7 +250,7 @@ export function createRealRecheckIngestDeps(config: ReviewRouteConfig): RecheckI
     },
 
     async recordReceipt(input): Promise<void> {
-      await dispatch.createAuthenticatedMessage(
+      const receipt = await dispatch.createAuthenticatedMessage(
         { kind: 'system', sender: REVIEW_SENDER },
         {
           correlation_id: input.correlationId || `pr-recheck-receipt:${input.deliveryId}`,
@@ -269,6 +270,9 @@ export function createRealRecheckIngestDeps(config: ReviewRouteConfig): RecheckI
           }),
         }
       );
+      if (BENIGN_RECEIPT_DISPOSITIONS.has(input.disposition)) {
+        await dispatch.disposeMessageByMachine({ id: receipt.id, actor: 'system:overseer-receipts', disposition: 'expired', requireNoReceipt: true });
+      }
     },
 
     async listCheckRunsForRef(input): Promise<{ runs: RecheckCheckRun[]; complete: boolean }> {

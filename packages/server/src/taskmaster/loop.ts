@@ -29,6 +29,7 @@ import {
   type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
+import { routeOpsEvent } from '../dispatch/ops-event-routing';
 import {
   adoptionContentHash,
   classifyThread,
@@ -206,6 +207,7 @@ export interface TaskmasterDeps {
   now?: () => Date;
   db?: TaskmasterDal;
   createTask?: typeof createAuthenticatedMessage;
+  appendOpsDigest?: (section: string, line: string) => Promise<void>;
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
   listThreads?: () => Promise<ThreadSnapshot[] | ListedThreadResult>;
   headroom?: () => Promise<HeadroomReading>;
@@ -2133,14 +2135,37 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           JSON.stringify({ ...proposal, cascadeId: admitted.cascadeId, runId: admitted.cascadeId })
         );
       } else {
+        const routedEscalation = proposal.type === 'escalate_p0' || proposal.type === 'blocker_report'
+          ? routeOpsEvent({
+              sender: 'taskmaster',
+              task_type: proposal.type === 'blocker_report' ? 'blocker_report' : 'agent_message',
+              body: proposal.body,
+              subject_key: canonicalizeThreadRef(proposal.threadRef),
+              created_at: new Date(nowMs).toISOString(),
+            })
+          : null;
+        if (routedEscalation?.class === 'ROUTINE') {
+          await deps.appendOpsDigest?.('routine', `- ${proposal.threadRef}: ${proposal.body}`);
+          await dal.updateActionOutcome(journalRow.id, 'sent');
+          journalRow.outcome = 'sent';
+          touchedThisTick.add(proposal.threadRef);
+          result.effects += 1;
+          continue;
+        }
         const dispatched = await createTask(
           { kind: 'system', sender: 'taskmaster' },
           {
             correlation_id: `tm-${journalRow.id}`,
             idempotency_key: proposal.idempotencyKey,
             task_type: 'agent_message',
-            recipient: proposal.type === 'digest' ? 'duty-officer' : proposal.recipient,
-            body: proposal.body,
+            recipient: routedEscalation ? 'xo' : proposal.type === 'digest' ? 'duty-officer' : proposal.recipient,
+            priority: routedEscalation?.class === 'BLOCKER' ? 'blocker' : 'normal',
+            body: routedEscalation ? JSON.stringify({
+              kind: 'ops_interrupt', class: routedEscalation.class,
+              item: canonicalizeThreadRef(proposal.threadRef),
+              default_if_unanswered: 'hold and retry on the next Taskmaster cycle',
+              detail: proposal.body,
+            }) : proposal.body,
             // Same-subject grouping + unconditional per-verb repeat reason
             // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
             subject_key: canonicalizeThreadRef(proposal.threadRef),

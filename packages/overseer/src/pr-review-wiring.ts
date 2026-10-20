@@ -47,6 +47,11 @@ import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
+
+export const BENIGN_RECEIPT_DISPOSITIONS = new Set([
+  'ignored_event', 'ignored_draft', 'queued', 'checks_pending', 'approved',
+  'superseded_head', 'stale_head', 'duplicate_delivery',
+]);
 import {
   countPriorRemediationAttempts,
   parseRemediationCandidateBody,
@@ -807,7 +812,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
       // Receipts ride the same durable store as the work itself. A receipt is
       // never allowed to fail the ingest path (the caller wraps this), but it
       // must be attempted for every terminal disposition.
-      await dispatch.createAuthenticatedMessage(
+      const receipt = await dispatch.createAuthenticatedMessage(
         { kind: 'system', sender: REVIEW_SENDER },
         {
           correlation_id: input.correlationId || `pr-review-receipt:${input.deliveryId}`,
@@ -827,6 +832,9 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
           }),
         }
       );
+      if (BENIGN_RECEIPT_DISPOSITIONS.has(input.disposition)) {
+        await dispatch.disposeMessageByMachine({ id: receipt.id, actor: 'system:overseer-receipts', disposition: 'expired', requireNoReceipt: true });
+      }
     },
   };
 }
@@ -1078,7 +1086,7 @@ export function createRealSubmitDeps(
           'overseer.pr_review.required_contexts_unavailable_blocked'
         );
       }
-      await (overrides.createReceiptMessage ?? dispatch.createAuthenticatedMessage)(
+      const receipt = await (overrides.createReceiptMessage ?? dispatch.createAuthenticatedMessage)(
         { kind: 'system', sender: REVIEW_SENDER },
         {
           correlation_id: input.correlationId,
@@ -1094,6 +1102,9 @@ export function createRealSubmitDeps(
           }),
         }
       );
+      if (BENIGN_RECEIPT_DISPOSITIONS.has(input.disposition)) {
+        await dispatch.disposeMessageByMachine({ id: receipt.id, actor: 'system:overseer-receipts', disposition: 'expired', requireNoReceipt: true });
+      }
     },
 
     /**

@@ -114,3 +114,28 @@ The reader never acknowledges, addresses or cancels; it only machine-disposes IN
 
 Direct receipt operations and cancellation are prohibited. The legacy non-terminal surface
 disposition remains owned by the existing operator consumer and is not produced by this reader.
+# Ops inbox digest and mailbox triage
+
+The Duty Officer uses the open `ops-inbox` issue in `OPS_INBOX_REPO` (default
+`thinmansoftware/bdc-xo`). There is one marked comment per UTC day and each
+writer owns a fenced section. Routine events go to the digest; decisions and
+human-only steps interrupt XO at normal priority; blockers, owner questions,
+security, and money risks interrupt at blocker priority. Rules X1-X5c and
+O1-O10 are first-match wins. Blocker priority, unknown sender/task pairs, and
+events classified NEEDS_A_PERSON or BLOCKER are always brought forward.
+
+The reader is dry-run unless `INBOX_READER_MODE=enforce`. It owns `xo` and
+`operator` by default; set `INBOX_READER_OPERATOR_OWNER=consumer` to roll back.
+`INBOX_READER_MAX_PER_RUN` bounds a pass, GitHub subject-state reads are capped
+at 50, and `surface_cursor` advances only after a successful digest write.
+Canary defaults are six hours and 25 rows (`INBOX_READER_CANARY_AGE_HOURS`,
+`INBOX_READER_CANARY_MAX`); alert repetition defaults to six hours. Open action
+mail is noted after 24 hours and escalated to Duty Officer after 72 hours.
+
+Before an enforce backlog pass, obtain John's reconfirmation, cap
+`INBOX_READER_MAX_PER_RUN`, inspect `latest.json`, enable enforce for the bounded
+pass, then restore dry-run and verify `mode` is `dry-run`.
+
+Status: `curl -sS http://localhost:3090/api/dispatch/status`. A principal is
+clean only when `unread`, `surface_unread`, and `unread_older_than_6h` are all
+zero. XO owns post-rebuild runtime verification.

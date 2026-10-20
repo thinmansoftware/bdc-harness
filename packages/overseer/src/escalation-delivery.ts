@@ -40,6 +40,7 @@ export interface OperatorCardChannelDeps {
   notion_database_id: string;
   builder_monitor_url: string;
   resolve_owner: (woId: string) => Promise<string | null>;
+  create_message: typeof createAuthenticatedMessage;
 }
 
 const defaultStore: DeliveryStore = {
@@ -78,6 +79,7 @@ export function createDefaultOperatorCardChannels(
       process.env.BUILDER_MONITOR_WEBHOOK_URL ??
       DEFAULT_BUILDER_MONITOR_URL,
     resolve_owner: overrides.resolve_owner ?? resolveWoBoardSeatOwner,
+    create_message: overrides.create_message ?? createAuthenticatedMessage,
   };
 
   const dispatch: OperatorCardChannel = {
@@ -92,16 +94,30 @@ export function createDefaultOperatorCardChannels(
           error_class: assessment.reason ?? 'content_guard_rejected',
         };
       }
-      const message = await createAuthenticatedMessage(
-        { kind: 'system', sender: 'overseer' },
-        {
+      const input = {
           correlation_id: card.card.run_id,
           idempotency_key: idempotencyKey,
           task_type: 'run_report',
           recipient: (await deps.resolve_owner(card.card.wo_id)) ?? 'operator',
           body,
-        }
-      );
+        } as const;
+      let message;
+      try {
+        message = await deps.create_message({ kind: 'system', sender: 'overseer' }, input);
+      } catch (error) {
+        if (!(error instanceof Error) || !error.message.includes('recipient_has_no_consumer')) throw error;
+        message = await deps.create_message(
+          { kind: 'system', sender: 'overseer' },
+          {
+            ...input,
+            idempotency_key: `${idempotencyKey}:xo-fallback`,
+            task_type: 'agent_message',
+            recipient: 'xo',
+            priority: 'blocker',
+            body: JSON.stringify({ kind: 'ops_interrupt', class: 'BLOCKER', item: card.card.wo_id, default_if_unanswered: 'hold the run pending owner review', detail: body }),
+          }
+        );
+      }
       return {
         outcome: 'succeeded',
         sanitized_status: 'dispatch_queued',

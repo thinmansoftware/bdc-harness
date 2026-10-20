@@ -207,6 +207,8 @@ export const dispatchStatusResponseSchema = z
         disposed_by_machine: z.number(),
         surfaced_unacked: z.number(),
         surfaced_acked: z.number(),
+        unread_older_than_6h: z.number(),
+        surface_unread: z.number(),
       })
     ),
     operator_reports: z.array(dispatchStatusItemSchema),

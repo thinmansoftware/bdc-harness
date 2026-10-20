@@ -162,6 +162,7 @@ describe('inbox reader', () => {
     const config = resolveInboxReaderConfig({
       INBOX_READER_MODE: 'enforce',
       INBOX_READER_MAX_PER_RUN: '620',
+      INBOX_READER_OPERATOR_OWNER: 'consumer',
     });
 
     const first = await runInboxReader(deps, config);
@@ -292,9 +293,9 @@ describe('inbox reader', () => {
   });
 
   test('T15 operator consumer start is gated on the owner flag', () => {
-    expect(shouldStartOperatorInboxConsumer({})).toBe(true);
-    expect(shouldStartOperatorInboxConsumer({ INBOX_READER_OPERATOR_OWNER: 'reader' })).toBe(false);
-    expect(shouldStartOperatorInboxConsumer({ INBOX_READER_OPERATOR_OWNER: 'READER' })).toBe(true);
+    expect(shouldStartOperatorInboxConsumer({})).toBe(false);
+    expect(shouldStartOperatorInboxConsumer({ INBOX_READER_OPERATOR_OWNER: 'consumer' })).toBe(true);
+    expect(shouldStartOperatorInboxConsumer({ INBOX_READER_OPERATOR_OWNER: 'READER' })).toBe(false);
   });
 
   test('T16 heartbeat every run, even when listing fails', async () => {
@@ -344,7 +345,7 @@ describe('inbox reader', () => {
             : { ok: true, message: { id: data.id } as never },
         log: { info: () => {}, warn: () => {}, error: () => {} },
       },
-      resolveInboxReaderConfig({ INBOX_READER_MODE: 'enforce' })
+      resolveInboxReaderConfig({ INBOX_READER_MODE: 'enforce', INBOX_READER_OPERATOR_OWNER: 'consumer' })
     );
     expect(result.skipped_race).toBe(1);
     expect(result.errors).toHaveLength(0);
@@ -370,7 +371,7 @@ describe('inbox reader', () => {
           log: { info: () => {}, warn: () => {}, error: () => {} },
         },
         {
-          ...resolveInboxReaderConfig({ INBOX_READER_MODE: mode }),
+          ...resolveInboxReaderConfig({ INBOX_READER_MODE: mode, INBOX_READER_OPERATOR_OWNER: 'consumer' }),
           maxPerRun: 5,
           alertRepeatHours: 0,
         }
