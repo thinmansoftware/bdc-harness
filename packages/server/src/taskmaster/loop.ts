@@ -109,8 +109,10 @@ export function classifyEscalationRouting(proposal: ActionProposal): OpsRouteRes
 /**
  * Append exactly one line to the `routine` section of the day's ops-inbox
  * digest comment. Best-effort: a GitHub failure is logged and rethrown so the
- * caller suppresses the Dispatch row this tick but journals 'expired' for a
- * retry next tick (it never falls back to creating the row).
+ * caller suppresses the Dispatch row this tick but journals 'failed' (a
+ * retryable outcome, not the terminal 'expired') so the append is retried on a
+ * later tick until the action's proof deadline (it never falls back to creating
+ * the row).
  */
 function defaultOpsDigestAppend(dateUtc: string, line: string): Promise<void> {
   return upsertDigestSection(createRealOpsInboxGitHub(), dateUtc, 'routine', line).then(
@@ -2190,19 +2192,23 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         // as a tick effect by the shared bookkeeping below.
         //
         // The digest append is best-effort: if GitHub fails, the row is NOT
-        // created as a fallback -- the action is journaled 'expired' with
-        // suppressed='digest_unavailable' and retried on the next tick.
+        // created as a fallback -- the action is journaled 'failed' (NOT the
+        // terminal 'expired', which line ~1898 permanently skips and would drop
+        // the escalation for good) with suppressed='digest_unavailable'. A
+        // 'failed' row with a future proof_deadline_at is retried on a later
+        // tick (see the ['failed','deferred'] retry branch above) until its
+        // deadline, at which point it expires like any other unmet proof.
         const dateUtc = new Date(nowMs).toISOString().slice(0, 10);
         try {
           await opsDigestAppend(dateUtc, `- ${proposal.body}`);
         } catch (error) {
           await dal.updateActionOutcome(
             journalRow.id,
-            'expired',
+            'failed',
             JSON.stringify({ ...proposal, suppressed: 'digest_unavailable' })
           );
-          journalRow.outcome = 'expired';
-          result.expired += 1;
+          journalRow.outcome = 'failed';
+          tickFailures += 1;
           log.error(
             { err: error as Error, threadRef: proposal.threadRef },
             'taskmaster.ops_digest_append_failed'

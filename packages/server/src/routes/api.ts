@@ -90,7 +90,11 @@ import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
 import { startTaskmaster, getTaskmasterRuntime, getTickHealth } from '../taskmaster/loop';
 import { startTaskmasterDeadmanChecker } from '@archon/overseer/taskmaster-deadman-check';
 import { startOperatorInboxConsumer } from '../dispatch/operator-inbox-consumer';
-import { startInboxReader, shouldStartOperatorInboxConsumer } from '../dispatch/inbox-reader';
+import {
+  startInboxReader,
+  shouldStartOperatorInboxConsumer,
+  surfaceMessageIdsPastCursor,
+} from '../dispatch/inbox-reader';
 import {
   taskmasterStatusResponseSchema,
   taskmasterPauseBodySchema,
@@ -4666,30 +4670,21 @@ export function registerApiRoutes(
       ]);
 
       // Amendment A7 (additive, read-only): per-principal unread_older_than_6h
-      // and surface_unread. These are DB-derivable proxies computed here rather
-      // than in mailboxDepthByPrincipal (that query is owned by another part and
-      // not edited by this change). Rows are attributed to a principal by the
-      // same canonical recipient expression mailboxDepthByPrincipal uses
+      // and surface_unread. Rows are attributed to a principal by the same
+      // canonical recipient expression mailboxDepthByPrincipal uses
       // (LOWER(TRIM(COALESCE(resolved_recipient, recipient)))).
       //
       // unread_older_than_6h: strictly-unread rows (acknowledged_at,
       //   addressed_at, and route_disposition all NULL) created more than 6h ago.
-      // surface_unread: auto_surfaced rows not yet acknowledged -- the
-      //   DB-derivable proxy for "surfaced by the reader and still unread". The
-      //   reader-surface-cursor nuance is computed by the reader; the status
-      //   endpoint reports the DB-derivable number.
       const sixHoursAgoIso = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
       const a7Rows = await getDatabase().query<{
         principal_id: string;
         unread_older_than_6h: number | string;
-        surface_unread: number | string;
       }>(
         `SELECT LOWER(TRIM(COALESCE(resolved_recipient, recipient))) AS principal_id,
            SUM(CASE WHEN acknowledged_at IS NULL AND addressed_at IS NULL
                       AND route_disposition IS NULL AND created_at < $1
-                    THEN 1 ELSE 0 END) AS unread_older_than_6h,
-           SUM(CASE WHEN route_disposition = 'auto_surfaced' AND acknowledged_at IS NULL
-                    THEN 1 ELSE 0 END) AS surface_unread
+                    THEN 1 ELSE 0 END) AS unread_older_than_6h
          FROM agent_dispatch_messages
          WHERE TRIM(COALESCE(resolved_recipient, recipient)) <> ''
          GROUP BY LOWER(TRIM(COALESCE(resolved_recipient, recipient)))`,
@@ -4701,7 +4696,40 @@ export function registerApiRoutes(
           (bucket as Record<string, number>).unread_older_than_6h = Number(
             row.unread_older_than_6h
           );
-          (bucket as Record<string, number>).surface_unread = Number(row.surface_unread);
+        }
+      }
+
+      // surface_unread: auto_surfaced rows PAST the reader's surface cursor (A7),
+      // NOT merely every unacked auto_surfaced row. A surfaced row already behind
+      // the cursor has been folded into the digest backlog (read) and must not
+      // count -- counting it reports a false backlog. The cursor lives in the
+      // reader's state.json, so the honest set is the surface.jsonl message IDs
+      // past the cursor, intersected with rows still auto_surfaced and unread.
+      const surfaceCounts: Record<string, number> = {};
+      const surfaceIds = await surfaceMessageIdsPastCursor();
+      if (surfaceIds.length > 0) {
+        const placeholders = surfaceIds.map((_, index) => `$${index + 1}`).join(', ');
+        const surfaceRows = await getDatabase().query<{
+          principal_id: string;
+          surface_unread: number | string;
+        }>(
+          `SELECT LOWER(TRIM(COALESCE(resolved_recipient, recipient))) AS principal_id,
+             COUNT(*) AS surface_unread
+           FROM agent_dispatch_messages
+           WHERE id IN (${placeholders})
+             AND route_disposition = 'auto_surfaced'
+             AND acknowledged_at IS NULL
+             AND addressed_at IS NULL
+           GROUP BY LOWER(TRIM(COALESCE(resolved_recipient, recipient)))`,
+          surfaceIds
+        );
+        for (const row of surfaceRows.rows) {
+          surfaceCounts[row.principal_id] = Number(row.surface_unread);
+        }
+      }
+      for (const [principal, bucket] of Object.entries(mailbox as Record<string, unknown>)) {
+        if (bucket && typeof bucket === 'object') {
+          (bucket as Record<string, number>).surface_unread = surfaceCounts[principal] ?? 0;
         }
       }
       const queue: Record<dispatchDb.DispatchMessageStatus, number> = {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { readWorkerHeartbeatAlarmConfig } from './worker-heartbeat-alarm';
@@ -632,6 +632,42 @@ describe('inbox reader', () => {
     const r2 = await harness(rows, { mode: 'dry-run', ops: fakeOps(), createMessage, root });
     expect(r2.result.digest?.overdue).toHaveLength(0);
     expect(created).toHaveLength(1);
+  });
+
+  test('Test 28b overdue_note_retries_when_overdue_section_write_fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'inbox-reader-'));
+    roots.push(root);
+    const rows = [
+      msg({
+        id: 'xo-25h',
+        recipient: 'xo',
+        sender: 'codex',
+        task_type: 'agent_message',
+        body: 'needs a look',
+        created_at: '2026-09-28T11:00:00.000Z', // 25h before NOW, note-only (not 72h)
+      }),
+    ];
+
+    // Run 1: the overdue-section upsert FAILS. The row is detected as overdue,
+    // but because the GitHub write never landed the noted_at stamp must NOT be
+    // persisted -- otherwise the note is suppressed forever.
+    const r1 = await harness(rows, { mode: 'dry-run', ops: fakeOps('overdue'), root });
+    expect(r1.result.digest?.overdue.map(o => o.id)).toEqual(['xo-25h']);
+    const state1 = JSON.parse(await readFile(join(root, 'state.json'), 'utf8'));
+    expect(state1.owner_ack_overdue?.['xo-25h']?.noted_at ?? null).toBeNull();
+
+    // Run 2: the overdue-section upsert SUCCEEDS. The note is retried (the prior
+    // failure did not suppress it) and only now is noted_at committed.
+    const okOps = fakeOps();
+    const r2 = await harness(rows, { mode: 'dry-run', ops: okOps, root });
+    expect(r2.result.digest?.overdue.map(o => o.id)).toEqual(['xo-25h']);
+    expect(okOps.calls.some(call => call.section === 'overdue')).toBe(true);
+    const state2 = JSON.parse(await readFile(join(root, 'state.json'), 'utf8'));
+    expect(typeof state2.owner_ack_overdue?.['xo-25h']?.noted_at).toBe('string');
+
+    // Run 3: with noted_at now persisted, the note is not repeated.
+    const r3 = await harness(rows, { mode: 'dry-run', ops: fakeOps(), root });
+    expect(r3.result.digest?.overdue).toHaveLength(0);
   });
 
   test('Test 30 canary_fires_above_25_not_at_25', async () => {

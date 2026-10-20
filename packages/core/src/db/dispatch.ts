@@ -309,17 +309,19 @@ async function assessDispatchRecipientWithQuery(
       reason: 'inactive_principal',
     };
   }
-  // WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 (A3): a `notify_only` principal is a
-  // mailbox that no worker polls. Refuse a send to one unless an actual consumer
-  // exists -- a registered worker that serves it (regardless of its current
-  // availability) OR a code-level consumer named in NOTIFY_ONLY_CONSUMERS.
-  // `worker_poll` queues are left unchanged: they are poll queues whose consumer
-  // is whatever worker claims them, and rejecting them wholesale would break the
-  // established send path for every agent seat. `drain_on_start`/`alias_resolved`
-  // are unchanged.
+  // WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 (A3): a `notify_only` mailbox or a
+  // `worker_poll` queue with no consumer is a dead letterbox -- rows pile up
+  // unread forever. Per A3, a principal in EITHER mode is accepted only if an
+  // actual consumer exists: a registered worker that serves it (regardless of
+  // its current availability) OR a code-level consumer named in
+  // SERVED_BY_CODE_CONSUMERS. `worker_poll` is NOT exempt: an agent seat that a
+  // worker serves passes the registered-worker check, and a queue drained by
+  // in-repo code (e.g. `do`, polled by duty-officer-clock.ts, whose worker only
+  // advertises `duty-officer`) is named in the code list. `drain_on_start` /
+  // `alias_resolved` are unchanged.
   if (
-    principal.delivery_mode === 'notify_only' &&
-    !NOTIFY_ONLY_CONSUMERS.has(canonicalPrincipal) &&
+    (principal.delivery_mode === 'notify_only' || principal.delivery_mode === 'worker_poll') &&
+    !SERVED_BY_CODE_CONSUMERS.has(canonicalPrincipal) &&
     !(await principalHasRegisteredWorker(query, canonicalPrincipal))
   ) {
     return {
@@ -353,20 +355,35 @@ function isExecutionHandoffData(data: CreateAuthenticatedMessageData): boolean {
 }
 
 /**
- * Code-level allow-list of `notify_only` principals that DO have a consumer,
- * so a send to them is not refused with `recipient_has_no_consumer`. Every
- * entry names the consumer. `overseer` is deliberately absent -- it has no
- * worker and no in-repo consumer, so its 21 unread rows can never be read and
- * sends to it must be rejected (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 A3).
+ * Code-level allow-list of `notify_only` / `worker_poll` principals that DO
+ * have a consumer drained by in-repo code (not by a row in
+ * `agent_dispatch_workers`), so a send to them is not refused with
+ * `recipient_has_no_consumer`. Every entry names its consuming file. `overseer`
+ * is deliberately absent -- it has no worker and no in-repo consumer, so its
+ * unread rows can never be read and sends to it must be rejected
+ * (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 A3).
  */
-const NOTIFY_ONLY_CONSUMERS = new Set<string>([
-  // cauldron: consumed out-of-process by the Cauldron lane conductor
-  // (scripts/cauldron), which polls its queue; no in-repo worker row.
+const SERVED_BY_CODE_CONSUMERS = new Set<string>([
+  // cauldron (notify_only): consumed out-of-process by the Cauldron lane
+  // conductor (scripts/cauldron), which polls its queue; no in-repo worker row.
   'cauldron',
-  // overseer-review-route: review-route run_reports are consumed by the inbox
-  // reader (packages/server/src/dispatch/inbox-reader-rules.ts allow-list) and
-  // the Overseer review worker.
+  // overseer-review-route (notify_only): review-route run_reports are consumed
+  // by the inbox reader (packages/server/src/dispatch/inbox-reader-rules.ts
+  // allow-list) and the Overseer review worker.
   'overseer-review-route',
+  // do (worker_poll): read by packages/server/src/dispatch/duty-officer-clock.ts
+  // (DUTY_OFFICER_RECIPIENTS), but the live duty-officer-clock worker advertises
+  // only principal `duty-officer`, so `do` has no worker row of its own. Without
+  // this entry A3 would wrongly reject the Duty Officer alias (work-order A3,
+  // Test 23).
+  'do',
+  // taskmaster (worker_poll): Overseer hands remediation candidates to it via
+  // createAuthenticatedMessage (packages/overseer/src/remediation-candidate.ts,
+  // REMEDIATION_RECIPIENT), but the Taskmaster loop consumes its own queue
+  // in-process on each tick (packages/server/src/taskmaster/loop.ts) and
+  // registers no worker row. Without this entry A3 would wrongly reject every
+  // remediation hand-back.
+  'taskmaster',
 ]);
 
 /**

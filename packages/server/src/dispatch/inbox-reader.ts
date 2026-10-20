@@ -1,4 +1,4 @@
-import { appendFile, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
+import { appendFile, mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'crypto';
 import { join } from 'path';
 import {
@@ -919,6 +919,11 @@ export async function runInboxReader(
     // ---- A5: owner-ack overdue (24h note, 72h duty-officer hand-off) ----
     const ownerAck = { ...(state.owner_ack_overdue ?? {}) };
     const overdue: OverdueLine[] = [];
+    // IDs whose noted_at was stamped THIS run. The stamp is committed to
+    // owner_ack_overdue (and thus state.json) only after the overdue-section
+    // upsert below succeeds; if that write fails these are rolled back so the
+    // 24h note is retried, not permanently suppressed (review finding).
+    const newlyNotedIds: string[] = [];
     for (const { message, result } of classified) {
       if (result.action !== 'BRING') continue;
       if (message.acknowledged_at !== null) continue;
@@ -932,6 +937,7 @@ export async function runInboxReader(
           default_action: result.reason,
         });
         tracked.noted_at = started.toISOString();
+        newlyNotedIds.push(message.id);
       }
       if (ageMs > OWNER_ACK_ESCALATE_HOURS * 3_600_000 && !tracked.escalated_at) {
         try {
@@ -956,7 +962,7 @@ export async function runInboxReader(
     }
     digest.overdue = overdue;
     if (overdue.length > 0) {
-      await upsert(
+      const overduePosted = await upsert(
         'overdue',
         overdue
           .map(
@@ -965,6 +971,16 @@ export async function runInboxReader(
           )
           .join('\n')
       );
+      if (!overduePosted) {
+        // The overdue section was NOT posted (GitHub failure or no ops-inbox
+        // client). Roll back the noted_at stamps recorded this run so the 24h
+        // note is retried on the next run instead of being marked complete and
+        // suppressed forever by a write that never landed.
+        for (const id of newlyNotedIds) {
+          const tracked = ownerAck[id];
+          if (tracked) delete tracked.noted_at;
+        }
+      }
     }
 
     // ---- Page-not-advancing alerts ----
@@ -1080,6 +1096,60 @@ function buildLiveSectionMarkdown(digest: Digest): string {
 export function defaultOperatorInboxSurfacePath(readerRoot: string): string {
   if (process.env.OPERATOR_INBOX_SURFACE_PATH) return process.env.OPERATOR_INBOX_SURFACE_PATH;
   return join(readerRoot, '..', 'operator-inbox', 'surface.jsonl');
+}
+
+/**
+ * A7 (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01): the `messageId`s of operator
+ * surface.jsonl entries that sit PAST the reader's persisted surface cursor --
+ * i.e. surfaced rows the reader has not yet folded into the digest backlog, so
+ * they are still genuinely unread. `/api/dispatch/status` uses these to compute
+ * `surface_unread` honestly: a surfaced row already BEHIND the cursor is in the
+ * digest (read) and must NOT be counted, which a plain "auto_surfaced AND
+ * unacked" DB query cannot distinguish.
+ *
+ * Reads `surface_cursor` (a byte offset into surface.jsonl) from the reader's
+ * `state.json`, then returns every complete surface line's `messageId` from
+ * that offset to end-of-file. Best-effort and read-only: a missing/invalid
+ * state file means cursor 0 (whole file is past the cursor); a missing surface
+ * file means no backlog. Malformed lines are skipped.
+ */
+export async function surfaceMessageIdsPastCursor(deps?: {
+  root?: string;
+  read?: (path: string) => Promise<string>;
+}): Promise<string[]> {
+  const root = deps?.root ?? join(getArchonHome(), 'inbox-reader');
+  const read = deps?.read ?? ((path: string): Promise<string> => readFile(path, 'utf8'));
+  let cursor = 0;
+  try {
+    const state = JSON.parse(await read(join(root, 'state.json'))) as ReaderState;
+    if (typeof state.surface_cursor === 'number' && Number.isFinite(state.surface_cursor)) {
+      cursor = Math.max(0, state.surface_cursor);
+    }
+  } catch {
+    cursor = 0;
+  }
+  let fullText: string;
+  try {
+    fullText = await read(defaultOperatorInboxSurfacePath(root));
+  } catch {
+    return [];
+  }
+  const buf = Buffer.from(fullText, 'utf8');
+  if (cursor >= buf.length) return [];
+  // split('\n') leaves a trailing partial/empty element; drop it so only
+  // newline-terminated lines are counted (matches processSurfaceBacklog).
+  const complete = buf.subarray(cursor).toString('utf8').split('\n').slice(0, -1);
+  const ids: string[] = [];
+  for (const line of complete) {
+    if (!line.trim()) continue;
+    try {
+      const entry = JSON.parse(line) as { messageId?: unknown };
+      if (typeof entry.messageId === 'string') ids.push(entry.messageId);
+    } catch {
+      /* skip a malformed surface line */
+    }
+  }
+  return ids;
 }
 
 /**

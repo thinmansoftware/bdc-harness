@@ -245,7 +245,7 @@ async function makeSeparateProcessMailboxFixture(
 }
 
 describe('dispatch db', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     getDatabaseCalls = 0;
     process.env.BUN_ENV = 'test';
     setBoardPrincipalResolverForTests(async () => ({
@@ -258,6 +258,19 @@ describe('dispatch db', () => {
       `.test-dispatch-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
     );
     db = new SqliteAdapter(currentDbPath);
+    // A3 (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01): a send to a `worker_poll`
+    // agent seat is accepted only when a worker row serves it, mirroring
+    // production where each live agent worker registers via POST /api/workers.
+    // Register one such worker for the executor seats these fixtures use as
+    // generic recipients so the A3 no-consumer guard admits them; tests that
+    // assert the guard REJECTS an unserved recipient use `overseer`
+    // (notify_only, no worker), which this row does not serve.
+    await registerWorker({
+      worker_id: 'agent-seat-fixture-worker',
+      host: 'fixture-host',
+      capabilities: { providers: ['codex', 'claude', 'grok', 'fusion', 'overseer-reviewer'] },
+      max_concurrency: 4,
+    });
   });
 
   afterEach(async () => {
@@ -3343,6 +3356,27 @@ describe('dispatch db', () => {
           sender: 'xo',
           recipient: 'overseer',
           body: 'nobody reads this',
+        })
+      ).rejects.toThrow('dispatch_recipient_rejected:recipient_has_no_consumer');
+
+      // A3 covers worker_poll too, not only notify_only: `cursor` is a seeded,
+      // active worker_poll seat with no registered worker and no code-level
+      // consumer, so a send to it is an unread dead queue and must be rejected.
+      // (The shared fixture worker deliberately does NOT serve `cursor`.)
+      await expect(assessDispatchRecipient('cursor')).resolves.toEqual({
+        ok: false,
+        canonical_principal: 'cursor',
+        delivery_mode: 'worker_poll',
+        reason: 'recipient_has_no_consumer',
+      });
+      await expect(
+        createMessage({
+          correlation_id: 'corr-wp-no-consumer',
+          idempotency_key: 'idem-wp-no-consumer',
+          task_type: 'agent_message',
+          sender: 'xo',
+          recipient: 'cursor',
+          body: 'no worker ever polls cursor',
         })
       ).rejects.toThrow('dispatch_recipient_rejected:recipient_has_no_consumer');
 
