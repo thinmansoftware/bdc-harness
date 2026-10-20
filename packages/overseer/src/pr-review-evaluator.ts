@@ -293,8 +293,14 @@ export function applyRequiredCheckGate<T extends CheckGateResult>(
   if (parsed.verdict !== 'APPROVE' && parsed.verdict !== 'REQUEST_CHANGES') return parsed;
 
   const checks = [...partition.gating, ...partition.nonRequired];
-  const checksByName = new Map(checks.map(check => [normalizedCheckName(check.name), check]));
+  const checkNames = new Set(checks.map(check => normalizedCheckName(check.name)));
   const gatingNames = new Set(partition.gating.map(check => normalizedCheckName(check.name)));
+  const failedChecksByName = new Map<string, PrReviewCheck>();
+  for (const check of checks) {
+    if (check.status !== 'completed' || conclusionIsPassing(check.conclusion)) continue;
+    const name = normalizedCheckName(check.name);
+    if (!failedChecksByName.has(name)) failedChecksByName.set(name, check);
+  }
   const findingsByCheck = new Map<string, IndependentReviewFinding[]>();
   const reconciled: IndependentReviewFinding[] = [];
 
@@ -304,12 +310,11 @@ export function applyRequiredCheckGate<T extends CheckGateResult>(
       continue;
     }
     const scopedName = normalizedCheckName(finding.scope.slice('checks/'.length));
-    const check = checksByName.get(scopedName);
     // A check-scoped finding is only authoritative when it corresponds to
     // check evidence fetched for this exact head. Drop invented or stale check
     // names so they cannot turn an otherwise passing review into a rejection.
-    if (!check) continue;
-    if (check.status === 'completed' && conclusionIsPassing(check.conclusion)) continue;
+    if (!checkNames.has(scopedName)) continue;
+    if (!failedChecksByName.has(scopedName)) continue;
     const held = findingsByCheck.get(scopedName) ?? [];
     held.push(finding);
     findingsByCheck.set(scopedName, held);
@@ -317,9 +322,7 @@ export function applyRequiredCheckGate<T extends CheckGateResult>(
     // removes duplicates and makes repeated applications deep-equal.
   }
 
-  for (const check of checks) {
-    if (check.status !== 'completed' || conclusionIsPassing(check.conclusion)) continue;
-    const name = normalizedCheckName(check.name);
+  for (const [name, check] of failedChecksByName) {
     const scope = `checks/${check.name}`;
     if (gatingNames.has(name)) {
       const existing = findingsByCheck

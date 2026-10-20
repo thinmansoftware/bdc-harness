@@ -101,6 +101,37 @@ test('required_failure_still_blocks', async () => {
   });
 });
 
+test('same-named failures from different apps emit one finding per check scope', async () => {
+  const variants = (name: string): PrReviewCheck[] => [
+    {
+      id: 1,
+      name,
+      status: 'completed',
+      conclusion: 'failure',
+      app: { slug: 'github-actions' },
+    },
+    {
+      id: 2,
+      name,
+      status: 'completed',
+      conclusion: 'failure',
+      app: { slug: 'buildkite' },
+    },
+  ];
+  const checks = [
+    ...variants('test (ubuntu-latest)'),
+    ...variants('test (windows-latest)'),
+    { name: 'docker-build', status: 'completed', conclusion: 'success' },
+  ];
+  const result = await evaluatePullRequest(input, deps(checks, modelOutput('APPROVE'), REQUIRED));
+
+  expect(result.verdict).toBe('REQUEST_CHANGES');
+  expect(result.findings.filter(f => f.scope === 'checks/test (ubuntu-latest)')).toHaveLength(1);
+  expect(result.findings.filter(f => f.scope === 'checks/test (windows-latest)')).toHaveLength(1);
+  expect(result.findings.find(f => f.scope.includes('ubuntu'))?.severity).toBe('major');
+  expect(result.findings.find(f => f.scope.includes('windows'))?.severity).toBe('note');
+});
+
 test('superseded_failed_attempt_then_success_counts_as_success', async () => {
   const attempts = (name: string): PrReviewCheck[] => [
     {
