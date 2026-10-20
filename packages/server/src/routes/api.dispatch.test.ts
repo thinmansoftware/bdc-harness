@@ -838,6 +838,81 @@ describe('dispatch API', () => {
     ]);
   });
 
+  test('A7: dispatch status reports surface_unread and unread_older_than_6h per principal', async () => {
+    const app = makeApp('secret-token');
+
+    // 3 auto_surfaced operator rows still unread (past the reader surface cursor
+    // proxy: auto_surfaced AND acknowledged_at IS NULL) -> surface_unread = 3.
+    const surfacedUnread: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const m = await createMessage({
+        correlation_id: `op-surf-${i}`,
+        idempotency_key: `op-surf-${i}`,
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: `surfaced operator blocker ${i}`,
+      });
+      surfacedUnread.push(m.id);
+    }
+    for (const id of surfacedUnread) {
+      await db.query(
+        "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+        [id, new Date().toISOString()]
+      );
+    }
+
+    // 2 auto_surfaced operator rows BEFORE the cursor, modeled as already
+    // acknowledged -> excluded from surface_unread (acknowledged_at NOT NULL).
+    for (let i = 0; i < 2; i += 1) {
+      const m = await createMessage({
+        correlation_id: `op-acked-${i}`,
+        idempotency_key: `op-acked-${i}`,
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: `already-acked surfaced operator blocker ${i}`,
+      });
+      await db.query(
+        `UPDATE agent_dispatch_messages
+         SET route_disposition = 'auto_surfaced', route_disposed_at = $2,
+             acknowledged_at = $2, acknowledged_by = 'operator'
+         WHERE id = $1`,
+        [m.id, new Date().toISOString()]
+      );
+    }
+
+    // 1 strictly-unread xo row older than 6h -> xo.unread_older_than_6h = 1.
+    const oldXo = await createMessage({
+      correlation_id: 'xo-old-1',
+      idempotency_key: 'xo-old-1',
+      task_type: 'run_report',
+      sender: 'claude',
+      recipient: 'xo',
+      body: 'seven-hour-old xo report still unread',
+    });
+    await db.query('UPDATE agent_dispatch_messages SET created_at = $2 WHERE id = $1', [
+      oldXo.id,
+      new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString(),
+    ]);
+
+    const response = await app.request('/api/dispatch/status', {
+      headers: { 'x-archon-operator-token': 'secret-token' },
+    });
+    expect(response.status).toBe(200);
+    const status = (await response.json()) as {
+      mailbox: Record<string, { surface_unread?: number; unread_older_than_6h?: number }>;
+    };
+
+    expect(status.mailbox.operator?.surface_unread).toBe(3);
+    // The 3 surfaced-unread rows are disposed (route_disposition set), so they
+    // are NOT strictly-unread; the operator has no >6h strictly-unread rows.
+    expect(status.mailbox.operator?.unread_older_than_6h).toBe(0);
+    expect(status.mailbox.xo?.unread_older_than_6h).toBe(1);
+    // The xo row is strictly unread (no disposition) so it is not surface_unread.
+    expect(status.mailbox.xo?.surface_unread).toBe(0);
+  });
+
   test('acknowledges a mailbox message without changing its queue status', async () => {
     const message = await createMessage({
       ...VALID_BODY,

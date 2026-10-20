@@ -290,6 +290,64 @@ describe('operator inbox consumer (WO-HARNESS-OPERATOR-INBOX-CONSUMER-01)', () =
     ).toBe('digest_only');
   });
 
+  test('A1: benign review receipt (approved) is digest_only/expired; changes_requested stays needs_human', async () => {
+    // A review receipt whose disposition is benign must be classified
+    // digest_only and machine-disposed 'expired' -- never surfaced as a
+    // needs_human escalation. The benign set is owned by
+    // packages/overseer/src/pr-review-wiring.ts (BENIGN_RECEIPT_DISPOSITIONS).
+    const approved = makeMessage({
+      id: 'receipt-approved',
+      task_type: 'run_report',
+      sender: 'overseer',
+      body: JSON.stringify({
+        kind: 'pr_review_ingest_receipt',
+        deliveryId: 'd-1',
+        owner: 'thinmansoftware',
+        repo: 'bdc-xo',
+        prNumber: 1189,
+        headSha: 'abc123',
+        disposition: 'approved',
+        reason: null,
+      }),
+    });
+    const changesRequested = makeMessage({
+      id: 'receipt-changes',
+      task_type: 'run_report',
+      sender: 'overseer',
+      body: JSON.stringify({
+        kind: 'pr_review_ingest_receipt',
+        deliveryId: 'd-2',
+        owner: 'thinmansoftware',
+        repo: 'bdc-xo',
+        prNumber: 1190,
+        headSha: 'def456',
+        disposition: 'changes_requested',
+        reason: 'needs tests',
+      }),
+    });
+
+    // Unit-level: the classifier returns the expected kinds.
+    expect(classifyOperatorMessage(approved).kind).toBe('digest_only');
+    expect(classifyOperatorMessage(approved).reason).toBe('benign_receipt_disposition:approved');
+    expect(classifyOperatorMessage(changesRequested).kind).toBe('needs_human');
+
+    // Drain-level: approved is expired with no surface; changes_requested is
+    // surfaced and auto_surfaced (left for a human).
+    const world = makeWorld([approved, changesRequested]);
+    const result = await drainOperatorInbox(makeDeps(world));
+
+    expect(result.processed).toBe(2);
+    expect(result.digests).toBe(1);
+    expect(result.needsHuman).toBe(1);
+
+    const approvedRow = world.messages.find(m => m.id === 'receipt-approved')!;
+    const changesRow = world.messages.find(m => m.id === 'receipt-changes')!;
+    expect(approvedRow.route_disposition).toBe('expired');
+    expect(changesRow.route_disposition).toBe('auto_surfaced');
+    expect(world.surfaces.map(s => s.messageId)).toEqual(['receipt-changes']);
+    expect(world.surfaces[0]!.classification).toBe('needs_human');
+  });
+
   test('resolveOperatorInboxIntervalMs: default 60000, 0 disables, invalid falls back', () => {
     expect(resolveOperatorInboxIntervalMs(undefined)).toBe(60_000);
     expect(resolveOperatorInboxIntervalMs('0')).toBe(0);

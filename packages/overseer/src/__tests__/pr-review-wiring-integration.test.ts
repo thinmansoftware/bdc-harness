@@ -20,7 +20,7 @@
  * this test fails with the exact real-world symptom instead of passing
  * vacuously against a fake.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, test, mock } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, test, mock, spyOn } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps.ts';
@@ -54,6 +54,8 @@ const {
   reviewSubjectKey,
   REVIEW_RECIPIENT,
   REVIEW_SENDER,
+  OVERSEER_RECEIPTS_ACTOR,
+  BENIGN_RECEIPT_DISPOSITIONS,
 } = await import('../pr-review-wiring.ts');
 const {
   AUTO_REREVIEW_REASON_PREFIX,
@@ -1149,6 +1151,211 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       correlationPrefix: 'pr-review:thinmansoftware/a_c#1@',
     });
     expect(found).toHaveLength(0);
+  });
+});
+
+/**
+ * WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 Amendment A1 -- benign Overseer
+ * receipts self-dispose so they never sit as unread operator mail, while
+ * remaining in the store so the subject_key read-back (listPriorReviewWork /
+ * collectVerdicts) still finds them.
+ *
+ * Real-DB home: Test 19/20 assert against route_disposition, acknowledged_at
+ * and the real disposeMessageByMachine path, none of which exist in the
+ * hermetic pr-review-wiring.test.ts. Adding a connection mock to that hermetic
+ * file would override getDatabase for every later-loaded file in the overseer
+ * batch; this file already owns the isolated real-DB harness, so the behavior
+ * belongs here.
+ */
+describe('A1 benign receipt self-dispose against a real SqliteAdapter', () => {
+  beforeEach(() => {
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-benign-receipt-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(currentDbPath);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    cleanupDb(currentDbPath);
+  });
+
+  async function receiptRow(idempotencyKey: string): Promise<{
+    route_disposition: string | null;
+    acknowledged_at: string | null;
+    addressed_at: string | null;
+    status: string;
+  } | null> {
+    const rows = await db.query<{
+      route_disposition: string | null;
+      acknowledged_at: string | null;
+      addressed_at: string | null;
+      status: string;
+    }>(
+      `SELECT route_disposition, acknowledged_at, addressed_at, status
+       FROM agent_dispatch_messages WHERE idempotency_key = $1`,
+      [idempotencyKey]
+    );
+    return rows.rows[0] ?? null;
+  }
+
+  function ingestPayload(prNumber: number, headSha: string): string {
+    return JSON.stringify({
+      action: 'opened',
+      number: prNumber,
+      pull_request: {
+        number: prNumber,
+        draft: false,
+        head: { sha: headSha, ref: 'feature-branch' },
+        base: { ref: 'dev', sha: 'f'.repeat(40) },
+        user: { login: 'bluedevilcollectibles' },
+      },
+      repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+    });
+  }
+
+  // Test 19: benign_receipt_written_disposed_and_still_read_back.
+  test('Test 19: a benign submit and ingest receipt are written, disposed expired, and still read back', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    // The actor is fixed by the producer; a benign dispose is the machine path.
+    expect(OVERSEER_RECEIPTS_ACTOR).toBe('system:overseer-receipts');
+    expect(BENIGN_RECEIPT_DISPOSITIONS.has('approved')).toBe(true);
+    expect(BENIGN_RECEIPT_DISPOSITIONS.has('ignored_draft')).toBe(true);
+
+    const ingestDeps = createRealIngestDeps(config);
+    const headSha = 'a'.repeat(40);
+
+    // A real review for PR #1, so the approved verdict has a review to attach to.
+    const review = await ingestPullRequestEvent(
+      {
+        rawBody: ingestPayload(1, headSha),
+        signature: sign(ingestPayload(1, headSha), config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'benign-review-1',
+      },
+      ingestDeps
+    );
+    expect(review.disposition).toBe('queued');
+    await db.query(
+      `UPDATE agent_dispatch_messages SET status = 'done', completed_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [review.messageId]
+    );
+
+    // Observe that the dispose runs through the machine path with the fixed
+    // actor. spyOn calls through, so the real disposition still happens.
+    const disposeSpy = spyOn(dispatchModule, 'disposeMessageByMachine');
+    try {
+      // Benign submit receipt 'approved'.
+      await createRealSubmitDeps('thinman-overseer[bot]', {
+        octokit: submitOctokit(),
+        recordApprovalVerdict: async () => {},
+      }).recordReceipt({
+        correlationId: review.correlationId ?? '',
+        messageId: review.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 1,
+        headSha,
+        disposition: 'approved',
+        event: 'APPROVE',
+      });
+
+      // Benign ingest receipt 'ignored_draft'.
+      await ingestDeps.recordReceipt({
+        correlationId: 'pr-review:thinmansoftware/bdc-harness#1@ignored',
+        deliveryId: 'benign-ingest-1',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 1,
+        headSha,
+        disposition: 'ignored_draft',
+      });
+
+      expect(disposeSpy.mock.calls.length).toBe(2);
+      for (const call of disposeSpy.mock.calls) {
+        expect(call[0]).toMatchObject({
+          actor: 'system:overseer-receipts',
+          disposition: 'expired',
+          requireNoReceipt: true,
+        });
+      }
+    } finally {
+      disposeSpy.mockRestore();
+    }
+
+    // Both rows exist, disposed 'expired', with no human receipt.
+    const submitReceipt = await receiptRow(`pr-review-submit-receipt:${review.messageId}:approved`);
+    const ingestReceipt = await receiptRow('pr-review-receipt:benign-ingest-1:ignored_draft');
+    for (const row of [submitReceipt, ingestReceipt]) {
+      expect(row).not.toBeNull();
+      expect(row?.route_disposition).toBe('expired');
+      expect(row?.acknowledged_at).toBeNull();
+      expect(row?.addressed_at).toBeNull();
+      // M-129: machine disposition never writes status 'cancelled'.
+      expect(row?.status).not.toBe('cancelled');
+    }
+
+    // The disposed approved receipt is still found by the subject_key read-back.
+    const prior = await ingestDeps.listPriorReviewWork({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 1,
+    });
+    expect(prior.find(work => work.messageId === review.messageId)?.verdict).toBe('approved');
+  });
+
+  // Test 20: non_benign_receipt_stays_open.
+  test('Test 20: a non-benign changes_requested receipt stays open and is never disposed', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    expect(BENIGN_RECEIPT_DISPOSITIONS.has('changes_requested')).toBe(false);
+
+    const ingestDeps = createRealIngestDeps(config);
+    const headSha = 'c'.repeat(40);
+    const review = await ingestPullRequestEvent(
+      {
+        rawBody: ingestPayload(2, headSha),
+        signature: sign(ingestPayload(2, headSha), config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'nonbenign-review-1',
+      },
+      ingestDeps
+    );
+    expect(review.disposition).toBe('queued');
+    await db.query(
+      `UPDATE agent_dispatch_messages SET status = 'done', completed_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      [review.messageId]
+    );
+
+    const disposeSpy = spyOn(dispatchModule, 'disposeMessageByMachine');
+    try {
+      await createRealSubmitDeps('thinman-overseer[bot]', {
+        octokit: submitOctokit(),
+        recordApprovalVerdict: async () => {},
+      }).recordReceipt({
+        correlationId: review.correlationId ?? '',
+        messageId: review.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 2,
+        headSha,
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      });
+      expect(disposeSpy.mock.calls.length).toBe(0);
+    } finally {
+      disposeSpy.mockRestore();
+    }
+
+    const row = await receiptRow(`pr-review-submit-receipt:${review.messageId}:changes_requested`);
+    expect(row).not.toBeNull();
+    expect(row?.route_disposition).toBeNull();
   });
 });
 

@@ -60,6 +60,8 @@ import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import { fireBackoffDecision } from './backoff';
 import { checkExpectations } from './expectations';
 import { canonicalizeThreadRef } from './thread-ref';
+import { routeOpsEvent, type OpsRouteResult } from '../dispatch/ops-event-routing';
+import { createRealOpsInboxGitHub, upsertDigestSection } from '../dispatch/ops-inbox';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -80,6 +82,40 @@ let realEscalationDelivery: EscalationDeliveryDeps | null = null;
 function defaultEscalationDelivery(): EscalationDeliveryDeps {
   realEscalationDelivery ??= createRealEscalationDeliveryDeps();
   return realEscalationDelivery;
+}
+
+/**
+ * Ops-event routing for the mailbox-row-creating escalations
+ * (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01). escalate_p0 (non-gh, not delivered
+ * to a GitHub issue) and blocker_report proposals used to always create an
+ * operator/duty-officer Dispatch mailbox row. They are now classified by the
+ * ops-event router: ROUTINE -> a digest line and NO row; interrupt
+ * (NEEDS_A_PERSON / BLOCKER) -> keep creating the row exactly as before.
+ *
+ * Pure (no DB, no GitHub): the caller turns a ROUTINE verdict into a digest
+ * line and an interrupt verdict into the existing createTask + registerExpectation.
+ */
+export function classifyEscalationRouting(proposal: ActionProposal): OpsRouteResult {
+  return routeOpsEvent({
+    sender: 'taskmaster',
+    task_type: 'agent_message',
+    priority: proposal.type === 'blocker_report' ? 'blocker' : undefined,
+    body: proposal.body,
+    subject_key: canonicalizeThreadRef(proposal.threadRef),
+    taskmaster_blocker_report: proposal.type === 'blocker_report',
+  });
+}
+
+/**
+ * Append exactly one line to the `routine` section of the day's ops-inbox
+ * digest comment. Best-effort: a GitHub failure is logged and rethrown so the
+ * caller suppresses the Dispatch row this tick but journals 'expired' for a
+ * retry next tick (it never falls back to creating the row).
+ */
+function defaultOpsDigestAppend(dateUtc: string, line: string): Promise<void> {
+  return upsertDigestSection(createRealOpsInboxGitHub(), dateUtc, 'routine', line).then(
+    () => undefined
+  );
 }
 
 /** Ratified Q1 budgets. */
@@ -244,6 +280,13 @@ export interface TaskmasterDeps {
    * claim when the real DAL is in use (no deps.db), else none.
    */
   escalationDelivery?: EscalationDeliveryDeps;
+  /**
+   * Ops-inbox digest append seam (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01). When
+   * an escalate_p0 / blocker_report routes ROUTINE, exactly one line is appended
+   * here instead of creating a Dispatch mailbox row. Tests inject a fake;
+   * production defaults to the pinned ops-inbox issue's daily digest comment.
+   */
+  opsDigestAppend?: (dateUtc: string, line: string) => Promise<void>;
 }
 
 export interface TickResult {
@@ -1367,6 +1410,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   const now = deps.now ?? ((): Date => new Date());
   const dal = deps.db ?? taskmasterDb;
   const createTask = deps.createTask ?? createAuthenticatedMessage;
+  const opsDigestAppend = deps.opsDigestAppend ?? defaultOpsDigestAppend;
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
   const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
@@ -2131,6 +2175,49 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           journalRow.id,
           'sent',
           JSON.stringify({ ...proposal, cascadeId: admitted.cascadeId, runId: admitted.cascadeId })
+        );
+      } else if (
+        (proposal.type === 'escalate_p0' || proposal.type === 'blocker_report') &&
+        classifyEscalationRouting(proposal).destination === 'digest'
+      ) {
+        // WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01: a mailbox-row-creating
+        // escalation (escalate_p0 not delivered to a GitHub issue, or
+        // blocker_report) that the ops-event router classifies ROUTINE is
+        // appended to the Duty Officer's daily digest comment instead of
+        // creating a Dispatch mailbox row. No row is created, so no expectation
+        // is registered. Graded 'delivered_to_issue' (the existing non-mailbox
+        // delivery grade, excluded from the M-155 useful-rate floor) and counted
+        // as a tick effect by the shared bookkeeping below.
+        //
+        // The digest append is best-effort: if GitHub fails, the row is NOT
+        // created as a fallback -- the action is journaled 'expired' with
+        // suppressed='digest_unavailable' and retried on the next tick.
+        const dateUtc = new Date(nowMs).toISOString().slice(0, 10);
+        try {
+          await opsDigestAppend(dateUtc, `- ${proposal.body}`);
+        } catch (error) {
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'expired',
+            JSON.stringify({ ...proposal, suppressed: 'digest_unavailable' })
+          );
+          journalRow.outcome = 'expired';
+          result.expired += 1;
+          log.error(
+            { err: error as Error, threadRef: proposal.threadRef },
+            'taskmaster.ops_digest_append_failed'
+          );
+          continue;
+        }
+        await dal.updateActionOutcome(journalRow.id, 'sent');
+        await dal.gradeAction(journalRow.id, 'delivered_to_issue');
+        log.info(
+          {
+            actionType: proposal.type,
+            threadRef: proposal.threadRef,
+            idempotencyKey: proposal.idempotencyKey,
+          },
+          'taskmaster.escalation_routed_to_digest'
         );
       } else {
         const dispatched = await createTask(

@@ -68,7 +68,60 @@ const REVIEW_REVIEWER_IDENTITY_DEFAULT = 'thinman-overseer[bot]';
 
 /** Code-fixed Overseer sender that owns queued review work. */
 export const REVIEW_SENDER = 'overseer';
+
+/**
+ * Receipt dispositions that are purely informational -- they record that a
+ * delivery was handled but carry no action for a human. Per Excerpt 4 rule O1,
+ * benign receipts are still WRITTEN (so the read-back by subject_key keeps
+ * finding them) but are immediately machine-disposed 'expired' so they never
+ * sit as unread operator mail. Non-benign dispositions (changes_requested,
+ * blocked, blocked_required_contexts_unavailable, submission_failed,
+ * merge_custody_conflict, rejected_signature, and any other value) stay open.
+ */
+export const BENIGN_RECEIPT_DISPOSITIONS = new Set<string>([
+  'ignored_event',
+  'ignored_draft',
+  'queued',
+  'checks_pending',
+  'approved',
+  'superseded_head',
+  'stale_head',
+  'duplicate_delivery',
+]);
+
 const log = createLogger('overseer/pr-review-wiring');
+
+/** Machine actor that owns the dispose of benign Overseer receipts. */
+export const OVERSEER_RECEIPTS_ACTOR = 'system:overseer-receipts';
+
+/**
+ * Machine-dispose a benign receipt 'expired'. The row stays in the store (so
+ * the subject_key read-back keeps finding it); only its route disposition
+ * changes so it never counts as unread operator mail. This must NEVER throw:
+ * a receipt that cannot be disposed is still a correctly written receipt, and
+ * failing here would wrongly fail the ingest path.
+ */
+async function disposeBenignReceipt(messageId: string, disposition: string): Promise<void> {
+  try {
+    const disposed = await dispatch.disposeMessageByMachine({
+      id: messageId,
+      actor: OVERSEER_RECEIPTS_ACTOR,
+      disposition: 'expired',
+      requireNoReceipt: true,
+    });
+    if (!disposed.ok) {
+      log.warn(
+        { messageId, disposition, reason: disposed.reason },
+        'overseer.pr_review.benign_receipt_dispose_failed'
+      );
+    }
+  } catch (error) {
+    log.warn(
+      { messageId, disposition, err: error },
+      'overseer.pr_review.benign_receipt_dispose_errored'
+    );
+  }
+}
 
 export function reviewRecordsVerdictEnabled(
   env: Record<string, string | undefined> = process.env
@@ -807,7 +860,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
       // Receipts ride the same durable store as the work itself. A receipt is
       // never allowed to fail the ingest path (the caller wraps this), but it
       // must be attempted for every terminal disposition.
-      await dispatch.createAuthenticatedMessage(
+      const receipt = await dispatch.createAuthenticatedMessage(
         { kind: 'system', sender: REVIEW_SENDER },
         {
           correlation_id: input.correlationId || `pr-review-receipt:${input.deliveryId}`,
@@ -827,6 +880,12 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
           }),
         }
       );
+      // A benign receipt is written (so subject_key read-back still finds it)
+      // and then immediately machine-disposed 'expired' so it is never left as
+      // unread operator mail. Disposal must never fail the ingest path.
+      if (BENIGN_RECEIPT_DISPOSITIONS.has(input.disposition)) {
+        await disposeBenignReceipt(receipt.id, input.disposition);
+      }
     },
   };
 }
@@ -1078,7 +1137,7 @@ export function createRealSubmitDeps(
           'overseer.pr_review.required_contexts_unavailable_blocked'
         );
       }
-      await (overrides.createReceiptMessage ?? dispatch.createAuthenticatedMessage)(
+      const receipt = await (overrides.createReceiptMessage ?? dispatch.createAuthenticatedMessage)(
         { kind: 'system', sender: REVIEW_SENDER },
         {
           correlation_id: input.correlationId,
@@ -1094,6 +1153,13 @@ export function createRealSubmitDeps(
           }),
         }
       );
+      // Benign submit receipts (e.g. 'approved') are written for the read-back
+      // then machine-disposed 'expired' so they are not left as unread operator
+      // mail. changes_requested / blocked_required_contexts_unavailable are NOT
+      // benign and stay open. Disposal must never fail the receipt path.
+      if (BENIGN_RECEIPT_DISPOSITIONS.has(input.disposition)) {
+        await disposeBenignReceipt(receipt.id, input.disposition);
+      }
     },
 
     /**

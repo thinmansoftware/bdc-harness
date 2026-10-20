@@ -16,6 +16,7 @@
  * / check_suite name cannot be matched to a verdict-named check.
  */
 import * as dispatch from '@archon/core/db/dispatch';
+import { createLogger } from '@archon/paths';
 import type {
   RecheckCheckRun,
   RecheckIngestDeps,
@@ -25,12 +26,15 @@ import type { SubmitOutcome } from './pr-review-submit.ts';
 import { recheckCorrelationId } from './pr-review-check-ingest';
 import { createRealOctokitClient } from './adapters/github-real-deps';
 import {
+  BENIGN_RECEIPT_DISPOSITIONS,
   REVIEW_RECIPIENT,
   REVIEW_SENDER,
   reviewSubjectKey,
   type ReviewRouteConfig,
   type ReviewWorkBody,
 } from './pr-review-wiring';
+
+const log = createLogger('overseer/pr-review-check-wiring');
 
 /** Receipt recipient the submit path writes its verdicts to. */
 const RECEIPT_RECIPIENT = 'operator';
@@ -249,7 +253,7 @@ export function createRealRecheckIngestDeps(config: ReviewRouteConfig): RecheckI
     },
 
     async recordReceipt(input): Promise<void> {
-      await dispatch.createAuthenticatedMessage(
+      const receipt = await dispatch.createAuthenticatedMessage(
         { kind: 'system', sender: REVIEW_SENDER },
         {
           correlation_id: input.correlationId || `pr-recheck-receipt:${input.deliveryId}`,
@@ -269,6 +273,30 @@ export function createRealRecheckIngestDeps(config: ReviewRouteConfig): RecheckI
           }),
         }
       );
+      // Benign recheck receipts are written (so the subject_key read-back still
+      // finds them) then immediately machine-disposed 'expired' so they are not
+      // left as unread operator mail. Disposal must never fail the ingest path.
+      if (BENIGN_RECEIPT_DISPOSITIONS.has(input.disposition)) {
+        try {
+          const disposed = await dispatch.disposeMessageByMachine({
+            id: receipt.id,
+            actor: 'system:overseer-receipts',
+            disposition: 'expired',
+            requireNoReceipt: true,
+          });
+          if (!disposed.ok) {
+            log.warn(
+              { messageId: receipt.id, disposition: input.disposition, reason: disposed.reason },
+              'overseer.pr_recheck.benign_receipt_dispose_failed'
+            );
+          }
+        } catch (error) {
+          log.warn(
+            { messageId: receipt.id, disposition: input.disposition, err: error },
+            'overseer.pr_recheck.benign_receipt_dispose_errored'
+          );
+        }
+      }
     },
 
     async listCheckRunsForRef(input): Promise<{ runs: RecheckCheckRun[]; complete: boolean }> {

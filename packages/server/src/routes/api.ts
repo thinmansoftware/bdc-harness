@@ -195,6 +195,7 @@ import * as taskmasterDb from '@archon/core/db/taskmaster';
 import * as workflowEventDb from '@archon/core/db/workflow-events';
 import * as messageDb from '@archon/core/db/messages';
 import * as dispatchDb from '@archon/core/db/dispatch';
+import { getDatabase } from '@archon/core/db/connection';
 import * as knownBadBindingsDb from '@archon/core/db/known-bad-bindings';
 import * as boardAuthorityDb from '@archon/core/db/board-authority';
 import * as boardScopeApprovalDb from '@archon/core/db/board-scope-approvals';
@@ -4663,6 +4664,46 @@ export function registerApiRoutes(
         dispatchDb.listMessages({ limit: 500 }),
         dispatchDb.mailboxDepthByPrincipal(),
       ]);
+
+      // Amendment A7 (additive, read-only): per-principal unread_older_than_6h
+      // and surface_unread. These are DB-derivable proxies computed here rather
+      // than in mailboxDepthByPrincipal (that query is owned by another part and
+      // not edited by this change). Rows are attributed to a principal by the
+      // same canonical recipient expression mailboxDepthByPrincipal uses
+      // (LOWER(TRIM(COALESCE(resolved_recipient, recipient)))).
+      //
+      // unread_older_than_6h: strictly-unread rows (acknowledged_at,
+      //   addressed_at, and route_disposition all NULL) created more than 6h ago.
+      // surface_unread: auto_surfaced rows not yet acknowledged -- the
+      //   DB-derivable proxy for "surfaced by the reader and still unread". The
+      //   reader-surface-cursor nuance is computed by the reader; the status
+      //   endpoint reports the DB-derivable number.
+      const sixHoursAgoIso = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+      const a7Rows = await getDatabase().query<{
+        principal_id: string;
+        unread_older_than_6h: number | string;
+        surface_unread: number | string;
+      }>(
+        `SELECT LOWER(TRIM(COALESCE(resolved_recipient, recipient))) AS principal_id,
+           SUM(CASE WHEN acknowledged_at IS NULL AND addressed_at IS NULL
+                      AND route_disposition IS NULL AND created_at < $1
+                    THEN 1 ELSE 0 END) AS unread_older_than_6h,
+           SUM(CASE WHEN route_disposition = 'auto_surfaced' AND acknowledged_at IS NULL
+                    THEN 1 ELSE 0 END) AS surface_unread
+         FROM agent_dispatch_messages
+         WHERE TRIM(COALESCE(resolved_recipient, recipient)) <> ''
+         GROUP BY LOWER(TRIM(COALESCE(resolved_recipient, recipient)))`,
+        [sixHoursAgoIso]
+      );
+      for (const row of a7Rows.rows) {
+        const bucket = (mailbox as Record<string, unknown>)[row.principal_id];
+        if (bucket && typeof bucket === 'object') {
+          (bucket as Record<string, number>).unread_older_than_6h = Number(
+            row.unread_older_than_6h
+          );
+          (bucket as Record<string, number>).surface_unread = Number(row.surface_unread);
+        }
+      }
       const queue: Record<dispatchDb.DispatchMessageStatus, number> = {
         queued: 0,
         claimed: 0,

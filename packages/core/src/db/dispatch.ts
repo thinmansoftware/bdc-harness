@@ -124,7 +124,7 @@ export type DispatchRecipientAssessment =
       ok: false;
       canonical_principal: string;
       delivery_mode: DispatchDeliveryMode | null;
-      reason: 'missing_principal' | 'inactive_principal';
+      reason: 'missing_principal' | 'inactive_principal' | 'recipient_has_no_consumer';
     };
 
 export type DispatchMailboxResult =
@@ -309,12 +309,85 @@ async function assessDispatchRecipientWithQuery(
       reason: 'inactive_principal',
     };
   }
+  // WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 (A3): a `notify_only` principal is a
+  // mailbox that no worker polls. Refuse a send to one unless an actual consumer
+  // exists -- a registered worker that serves it (regardless of its current
+  // availability) OR a code-level consumer named in NOTIFY_ONLY_CONSUMERS.
+  // `worker_poll` queues are left unchanged: they are poll queues whose consumer
+  // is whatever worker claims them, and rejecting them wholesale would break the
+  // established send path for every agent seat. `drain_on_start`/`alias_resolved`
+  // are unchanged.
+  if (
+    principal.delivery_mode === 'notify_only' &&
+    !NOTIFY_ONLY_CONSUMERS.has(canonicalPrincipal) &&
+    !(await principalHasRegisteredWorker(query, canonicalPrincipal))
+  ) {
+    return {
+      ok: false,
+      canonical_principal: canonicalPrincipal,
+      delivery_mode: principal.delivery_mode,
+      reason: 'recipient_has_no_consumer',
+    };
+  }
   return {
     ok: true,
     canonical_principal: canonicalPrincipal,
     delivery_mode: principal.delivery_mode,
     reason: null,
   };
+}
+
+/**
+ * True when the outbound message is an approved execution handoff. Handoffs are
+ * work items claimed by an executor seat, not mailbox notifications, so they are
+ * exempt from the A3 `recipient_has_no_consumer` guard. Kept in sync with the
+ * `isExecutionHandoff` predicate in packages/server/src/routes/api.ts.
+ */
+function isExecutionHandoffData(data: CreateAuthenticatedMessageData): boolean {
+  if (data.task_type !== 'run_report') return false;
+  try {
+    return (JSON.parse(data.body) as { kind?: string }).kind === 'approved_execution_handoff';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Code-level allow-list of `notify_only` principals that DO have a consumer,
+ * so a send to them is not refused with `recipient_has_no_consumer`. Every
+ * entry names the consumer. `overseer` is deliberately absent -- it has no
+ * worker and no in-repo consumer, so its 21 unread rows can never be read and
+ * sends to it must be rejected (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 A3).
+ */
+const NOTIFY_ONLY_CONSUMERS = new Set<string>([
+  // cauldron: consumed out-of-process by the Cauldron lane conductor
+  // (scripts/cauldron), which polls its queue; no in-repo worker row.
+  'cauldron',
+  // overseer-review-route: review-route run_reports are consumed by the inbox
+  // reader (packages/server/src/dispatch/inbox-reader-rules.ts allow-list) and
+  // the Overseer review worker.
+  'overseer-review-route',
+]);
+
+/**
+ * True when any registered worker serves the principal, regardless of the
+ * worker's current availability. A worker serves a principal when its
+ * capabilities name it as `principal` or list it under `providers`.
+ */
+async function principalHasRegisteredWorker(
+  query: DispatchQueryExecutor,
+  principalId: string
+): Promise<boolean> {
+  const result = await query<{ capabilities: unknown }>(
+    'SELECT capabilities FROM agent_dispatch_workers'
+  );
+  for (const row of result.rows) {
+    const caps = parseCapabilities(row.capabilities);
+    if (caps.principal === principalId) return true;
+    const providers = caps.providers;
+    if (Array.isArray(providers) && providers.includes(principalId)) return true;
+  }
+  return false;
 }
 
 function parseCapabilities(value: unknown): Record<string, unknown> {
@@ -532,10 +605,17 @@ export async function createCappedSubjectMessage(
       const key = fence.slotKey(slot);
       if (taken.has(key)) continue;
       const slotBody = fence.slotBody(slot);
-      const message = await createAuthenticatedMessageWithQuery(query, {
-        bound,
-        data: { ...data, idempotency_key: key, body: slotBody },
-      });
+      const message = await createAuthenticatedMessageWithQuery(
+        query,
+        {
+          bound,
+          data: { ...data, idempotency_key: key, body: slotBody },
+        },
+        null,
+        // Capped-subject slots own their bounded semantics; they must NOT
+        // supersede each other (A4 exemption).
+        { supersedeOlder: false }
+      );
       // createAuthenticatedMessageWithQuery returns the EXISTING row on an
       // idempotency conflict rather than throwing, so a bare `true` would
       // report a replay as a fresh insert (PR #740 round 6). Inside the lock a
@@ -730,7 +810,8 @@ async function createAuthenticatedMessageWithQuery(
     bound: { sender: string; sender_principal_id: string | null };
     data: CreateAuthenticatedMessageData;
   },
-  supersedesId: string | null = null
+  supersedesId: string | null = null,
+  opts: { supersedeOlder?: boolean } = {}
 ): Promise<DispatchMessage> {
   const data = input.data;
   const bound = input.bound;
@@ -756,10 +837,30 @@ async function createAuthenticatedMessageWithQuery(
 
   const recipientAssessment = await assessDispatchRecipientWithQuery(query, data.recipient);
   if (!recipientAssessment.ok) {
-    throw new Error(`dispatch_recipient_rejected:${recipientAssessment.reason}`);
+    // Execution handoffs are claimed work items (surfaced via
+    // /api/dispatch/execution-handoffs and picked up by the executor seat), not
+    // unread mailbox notifications, so the A3 no-consumer guard -- which targets
+    // mailbox spam -- does not apply to them. All other rejection reasons
+    // (missing/inactive principal, board alias) still throw.
+    const handoffExempt =
+      recipientAssessment.reason === 'recipient_has_no_consumer' && isExecutionHandoffData(data);
+    if (!handoffExempt) {
+      throw new Error(`dispatch_recipient_rejected:${recipientAssessment.reason}`);
+    }
   }
   if (recipientAssessment.canonical_principal === 'board' && data.recipient_alias !== 'board') {
     throw new Error('dispatch_recipient_rejected:board_alias_metadata_required');
+  }
+  // WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 (A3): the Duty Officer seat's
+  // decision lists must go to the XO mailbox, never to operator (a drain-on-start
+  // mailbox John reads only at session start, where they get buried). Refuse the
+  // operator route loudly so the sender is re-pointed to 'xo'.
+  const canonicalSender = canonicalizePrincipal(sender);
+  if (
+    (canonicalSender === 'duty-officer' || canonicalSender === 'do') &&
+    recipientAssessment.canonical_principal === 'operator'
+  ) {
+    throw new Error('dispatch_recipient_rejected:duty_officer_to_operator');
   }
 
   const now = nowIso();
@@ -803,12 +904,59 @@ async function createAuthenticatedMessageWithQuery(
     ]
   );
   const row = result.rows[0];
-  if (row) return normalizeMessage(row);
+  if (row) {
+    const inserted = normalizeMessage(row);
+    // A genuinely NEW insert supersedes older unread rows on the same subject in
+    // the same mailbox (A4). This runs ONLY here -- never on the idempotency hit
+    // above nor the conflict re-read below -- so an idempotent replay supersedes
+    // nothing (Test 27). Opt out for capped-subject slots and the explicit
+    // supersede path, which own their own semantics.
+    if (opts.supersedeOlder !== false) {
+      await supersedeOlderUnreadBySubject(query, inserted);
+    }
+    return inserted;
+  }
 
   const conflict = await findIdempotentMessage(query, data.idempotency_key, bound);
   const conflictRow = conflict.rows[0];
   if (!conflictRow) throw new Error('dispatch_idempotency_namespace_conflict');
   return normalizeMessage(conflictRow);
+}
+
+/**
+ * Supersede older unread rows on the same subject in the same mailbox
+ * (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 A4).
+ *
+ * Applies ONLY to mailbox recipients (`drain_on_start` / `notify_only`);
+ * `worker_poll` work queues and `alias_resolved` are untouched. Marks every
+ * OLDER row (every other matching row, since this one is the newest insert)
+ * with `route_disposition = 'superseded'` + `route_disposed_at`, but ONLY when
+ * that row is still strictly unread (queued, no ack, no address, no prior
+ * disposition). It never writes `status` (never 'cancelled'), never touches a
+ * row carrying a receipt, and never writes `acknowledged_at`/`addressed_at`, so
+ * the M-129 two-phase receipt invariant is preserved.
+ *
+ * Blocker guard: a blocker-priority row is superseded only by a newer
+ * blocker-priority row -- a normal row never hides a blocker.
+ */
+async function supersedeOlderUnreadBySubject(
+  query: DispatchQueryExecutor,
+  newMessage: DispatchMessage
+): Promise<void> {
+  if (!newMessage.subject_key) return;
+  const canonicalRecipient = canonicalizePrincipal(newMessage.recipient);
+  const principal = await getDispatchPrincipal(query, canonicalRecipient);
+  if (!principal || !isMailboxDeliveryMode(principal.delivery_mode)) return;
+  const blockerGuard = newMessage.priority === 'blocker' ? '' : " AND priority <> 'blocker'";
+  await query(
+    `UPDATE agent_dispatch_messages
+       SET route_disposition = 'superseded', route_disposed_at = $4
+     WHERE recipient = $1 AND subject_key = $2 AND id <> $3
+       AND status = 'queued'
+       AND acknowledged_at IS NULL AND addressed_at IS NULL
+       AND route_disposition IS NULL${blockerGuard}`,
+    [canonicalRecipient, newMessage.subject_key, newMessage.id, nowIso()]
+  );
 }
 
 async function findIdempotentMessage(
@@ -1435,13 +1583,17 @@ export async function disposeMessageByMachine(
   data: {
     id: string;
     actor: string;
-    disposition: 'expired' | 'auto_surfaced';
+    disposition: 'expired' | 'auto_surfaced' | 'superseded';
     requireNoReceipt?: boolean;
   },
   transactionQuery?: DispatchQueryExecutor
 ): Promise<DispatchMailboxResult> {
   if (!data.actor.startsWith('system:')) return { ok: false, reason: 'machine_actor_required' };
-  if (data.disposition !== 'expired' && data.disposition !== 'auto_surfaced') {
+  if (
+    data.disposition !== 'expired' &&
+    data.disposition !== 'auto_surfaced' &&
+    data.disposition !== 'superseded'
+  ) {
     return { ok: false, reason: 'disposition_invalid' };
   }
 
@@ -2059,7 +2211,10 @@ export async function supersedeMessage(data: {
         bound,
         data: data.replacement,
       },
-      data.id
+      data.id,
+      // The explicit 1:1 supersede path writes its own terminal state on the
+      // source row; it must not also run the bulk subject supersede (A4).
+      { supersedeOlder: false }
     );
     const update = await query(
       `UPDATE agent_dispatch_messages SET status = 'cancelled', route_disposition = 'superseded',
