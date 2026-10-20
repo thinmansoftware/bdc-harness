@@ -239,6 +239,13 @@ async function defaultClaudeComplete(input: DutyOfficerClaudeCompleteInput): Pro
       if (chunk.type === 'assistant') {
         text += chunk.content;
       }
+      if (chunk.type === 'result' && chunk.isError === true) {
+        // ClaudeProvider yields result.isError without throwing, so earlier
+        // assistant text is not a verdict.
+        throw new Error(
+          'duty_officer_judge_claude_result_error:' + (chunk.errorSubtype ?? 'unknown')
+        );
+      }
     }
     if (controller.signal.aborted) {
       throw new Error(`duty_officer_judge_timeout_${input.timeoutMs}`);

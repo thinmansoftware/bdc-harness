@@ -1,5 +1,7 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
+import { ClaudeProvider } from '@archon/providers';
+import type { MessageChunk } from '@archon/providers/types';
 import {
   DUTY_OFFICER_DEFAULT_CLAUDE_MODEL,
   DUTY_OFFICER_SYSTEM_PROMPT,
@@ -342,5 +344,98 @@ describe('duty officer judge', () => {
           entry.obj.provider === 'subscription'
       )
     ).toBe(true);
+  });
+
+  test('claude_stream_error_result_after_verdict_is_not_ok', async () => {
+    const envKeys = [
+      'DUTY_OFFICER_JUDGE_ENABLED',
+      'DUTY_OFFICER_JUDGE_PROVIDER',
+      'OPENROUTER_API_KEY',
+      'GLM_API_KEY',
+      'XAI_API_KEY',
+    ] as const;
+    const prior = new Map<string, string | undefined>();
+    for (const key of envKeys) {
+      prior.set(key, process.env[key]);
+    }
+
+    const sendQuery = spyOn(ClaudeProvider.prototype, 'sendQuery').mockImplementation(
+      async function* (): AsyncGenerator<MessageChunk> {
+        yield { type: 'assistant', content: '{"action":"nudge","reason":"r","body":"b"}' };
+        yield { type: 'result', isError: true, errorSubtype: 'error_during_execution' };
+      }
+    );
+
+    const restoreEnv = (): void => {
+      for (const key of envKeys) {
+        const value = prior.get(key);
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    };
+
+    try {
+      process.env.DUTY_OFFICER_JUDGE_ENABLED = 'true';
+      process.env.DUTY_OFFICER_JUDGE_PROVIDER = 'claude';
+      process.env.OPENROUTER_API_KEY = 'or-test';
+
+      const capturedA = captureLog();
+      const caseA = countingFetch(href => {
+        if (!href.includes('openrouter.ai')) {
+          throw new Error(`unexpected_fetch:${href}`);
+        }
+        return openRouterVerdict('nudge', 'fallback', 'from openrouter');
+      });
+      sendQuery.mockClear();
+      const verdictA = await judgeDutyOfficerItem(message(), {
+        fetchImpl: caseA.fetchImpl,
+        log: capturedA.log,
+      });
+      expect(sendQuery).toHaveBeenCalled();
+      expect(caseA.urls).toHaveLength(1);
+      expect(verdictA.status).toBe('ok');
+      expect(verdictA.action).toBe('nudge');
+      expect(verdictA.transport).toContain('openrouter:');
+      expect(
+        capturedA.info.some(
+          entry => entry.msg === 'duty_officer_judge_ok' && entry.obj.provider === 'openrouter'
+        )
+      ).toBe(true);
+      expect(
+        capturedA.info.some(
+          entry => entry.msg === 'duty_officer_judge_ok' && entry.obj.provider === 'claude'
+        )
+      ).toBe(false);
+      expect(
+        verdictA.failures.some(failure =>
+          failure.error.includes('duty_officer_judge_claude_result_error')
+        )
+      ).toBe(true);
+
+      delete process.env.OPENROUTER_API_KEY;
+      delete process.env.GLM_API_KEY;
+      delete process.env.XAI_API_KEY;
+      const caseB = countingFetch();
+      sendQuery.mockClear();
+      const verdictB = await judgeDutyOfficerItem(message(), {
+        fetchImpl: caseB.fetchImpl,
+      });
+      expect(sendQuery).toHaveBeenCalled();
+      expect(caseB.urls).toHaveLength(0);
+      expect(verdictB.status).toBe('failed');
+      expect(verdictB.reason).toBe('duty_officer_judge_outage');
+      expect(verdictB.status).not.toBe('ok');
+      expect(
+        verdictB.failures.some(failure =>
+          failure.error.includes('duty_officer_judge_claude_result_error')
+        )
+      ).toBe(true);
+    } finally {
+      sendQuery.mockRestore();
+      restoreEnv();
+    }
   });
 });
