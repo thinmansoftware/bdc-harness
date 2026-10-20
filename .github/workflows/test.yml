@@ -108,6 +108,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Smoke test -- packaged GitHub helper dependency closure
+        run: |
+          docker run --rm --network none --user appuser --entrypoint bun archon-ci:test build \
+            /app/scripts/github-service-token.ts /app/scripts/github-service-exec.ts \
+            --target=bun --outdir /tmp/archon-github-helper-smoke
+
       - name: Smoke test -- container starts and serves /api/health
         run: |
           docker run -d --name archon-smoke -e PORT=3000 -e CLAUDE_USE_GLOBAL_AUTH=true -p 3000:3000 archon-ci:test
