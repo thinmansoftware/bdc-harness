@@ -467,6 +467,19 @@ function evaluateLegacyDynamicLane(
   const semantic = snapshot.taskBrief;
   const objective = snapshot.roleObjective;
   const evidence = snapshot.decisionEvidence;
+  // Legacy allowance and evidenced estimate must never lower one another's reservation.
+  // The v4 gates-only caller accounts for its separate decision routes after worker admission.
+  const routerCallAllowance =
+    snapshot.budget.routerCallAllowance === null
+      ? null
+      : gatesOnly
+        ? snapshot.budget.routerCallAllowance
+        : snapshot.legacyRoutingEvidence
+          ? Math.max(
+              snapshot.budget.routerCallAllowance,
+              snapshot.legacyRoutingEvidence.callEstimate
+            )
+          : null;
 
   if (snapshot.nodeId !== snapshot.node.id) {
     for (const candidate of snapshot.candidates) {
@@ -507,7 +520,7 @@ function evaluateLegacyDynamicLane(
           monthly.spend +
             monthly.commitments +
             (c.nextStepCost ?? 0) +
-            (snapshot.budget.routerCallAllowance ?? 0) +
+            (routerCallAllowance ?? 0) +
             snapshot.budget.verificationAllowance >
             monthly.limit
       )
@@ -623,10 +636,12 @@ function evaluateLegacyDynamicLane(
       if (profile.observations.some(item => !atOrBefore(item.availableAt, snapshot.evaluationTime)))
         reasons.push('future_profile_observation');
     }
-    if (candidate.nextStepCost === null || snapshot.budget.routerCallAllowance === null)
+    if (!gatesOnly && snapshot.legacyRoutingEvidence?.accountId !== candidate.routerAccountId)
+      reasons.push('routing_account_mismatch');
+    if (candidate.nextStepCost === null || routerCallAllowance === null)
       reasons.push('cost_unknown');
     else {
-      const total = candidate.nextStepCost + snapshot.budget.routerCallAllowance;
+      const total = candidate.nextStepCost + routerCallAllowance;
       if (
         snapshot.budget.spend +
           snapshot.budget.commitments +
@@ -636,7 +651,7 @@ function evaluateLegacyDynamicLane(
       )
         reasons.push('run_budget_exhausted');
       const charges = new Map<string, number>();
-      charges.set(candidate.routerAccountId, snapshot.budget.routerCallAllowance);
+      charges.set(candidate.routerAccountId, routerCallAllowance);
       charges.set(
         candidate.workerAccountId,
         (charges.get(candidate.workerAccountId) ?? 0) + candidate.nextStepCost
@@ -758,13 +773,13 @@ function evaluateLegacyDynamicLane(
             },
             facts: {
               nextStepCost: candidate.nextStepCost,
-              routerCallAllowance: snapshot.budget.routerCallAllowance,
+              routerCallAllowance,
               runHeadroomBeforeStep:
                 snapshot.budget.limit -
                 snapshot.budget.spend -
                 snapshot.budget.commitments -
                 snapshot.budget.verificationAllowance,
-              runBudget: snapshot.budget,
+              runBudget: { ...snapshot.budget, routerCallAllowance },
               routerAccount: {
                 accountId: router.accountId,
                 capacity: router.capacity,

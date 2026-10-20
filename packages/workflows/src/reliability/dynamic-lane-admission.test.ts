@@ -438,6 +438,61 @@ function withAcceptedExchange(
 }
 
 describe('dynamic lane offline admission scenarios', () => {
+  test('legacy router evidence binds the candidate account', () => {
+    const input = clone();
+    input.legacyRoutingEvidence!.accountId = 'codex';
+    const out = evaluateDynamicLane(withAcceptedExchange(input));
+    expect(out.proposedBinding).toBeNull();
+    expect(out.candidateRejections['codex-plan']).toContain('routing_account_mismatch');
+  });
+
+  test.each(['run', 'account', 'monthly'] as const)(
+    'legacy evidenced router estimate cannot understate the %s budget',
+    ledger => {
+      const input = clone();
+      input.legacyRoutingEvidence!.callEstimate = 100;
+      input.budget.routerCallAllowance = 1;
+      input.budget.limit = ledger === 'run' ? 10 : 1000;
+      input.accounts[0]!.limit = ledger === 'account' ? 10 : 1000;
+      if (ledger === 'monthly' && input.monthlyBudgetPolicy?.mode === 'limited')
+        input.monthlyBudgetPolicy.limit = 10;
+      const out = evaluateDynamicLane(withAcceptedExchange(input));
+      expect(out.proposedBinding).toBeNull();
+      expect(out.candidateRejections['codex-plan']).toContain(
+        ledger === 'account' ? 'account_budget_exhausted:jev' : `${ledger}_budget_exhausted`
+      );
+    }
+  );
+
+  test.each([
+    [1, 3, 3],
+    [3, 1, 3],
+  ])(
+    'legacy request uses the conservative allowance %i / estimate %i',
+    (allowance, estimate, cost) => {
+      const input = clone();
+      input.budget.routerCallAllowance = allowance;
+      input.legacyRoutingEvidence!.callEstimate = estimate;
+      const out = evaluateDynamicLane(withAcceptedExchange(input));
+      expect(out.decision).toBe('propose');
+      expect(out.request!.question.options[0]).toMatchObject({
+        facts: { routerCallAllowance: cost, runBudget: { routerCallAllowance: cost } },
+      });
+    }
+  );
+
+  test('legacy evidenced router cost combines with a shared worker account exactly once', () => {
+    const input = clone();
+    input.legacyRoutingEvidence!.callEstimate = 3;
+    input.candidates[0]!.workerAccountId = 'jev';
+    input.accounts[0]!.limit = 7; // spend1 + verification1 + router3 + worker2
+    expect(evaluateDynamicLane(withAcceptedExchange(input)).decision).toBe('propose');
+    input.accounts[0]!.limit = 6;
+    const out = evaluateDynamicLane(withAcceptedExchange(input));
+    expect(out.proposedBinding).toBeNull();
+    expect(out.candidateRejections['codex-plan']).toContain('account_budget_exhausted:jev');
+  });
+
   test('review regression: distribution determines the unique winner', () => {
     for (const distribution of [
       { 'codex-plan': 0.5, 'claude-plan': 0.5, abstain: 0 },
