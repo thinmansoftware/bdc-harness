@@ -2521,3 +2521,200 @@ describe('binding-v2 parent closed admission', () => {
     expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'Starting workflow: `assist`');
   });
 });
+
+describe('binding-v2 foreground resume closed gate', () => {
+  const reserved = 'bdc-feature-development-codex-only';
+  const refusal = 'Codex-only continuation is not available; the prior run was left unchanged.';
+  const unverified = 'Workflow continuation could not be verified; no workflow was started.';
+
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockParseCommand.mockReset();
+    mockHandleCommand.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockFindResumableRunByParentConversation.mockReset();
+    mockUpdateConversation.mockClear();
+    mockValidateAndResolveIsolation.mockClear();
+    mockExecuteWorkflow.mockClear();
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockSendQuery.mockClear();
+    mockNaturalApprovalUpdate.mockClear();
+    mockCreateWorkflowEvent.mockClear();
+  });
+
+  function setup(mode: string, row: unknown, interactive = false) {
+    const codebase = makeCodebaseForSync();
+    const conversation = makeConversation({ codebase_id: mode === 'scoped' ? codebase.id : null });
+    const workflow = makeTestWorkflowWithSource({ name: 'assist', interactive });
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(conversation));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    mockListCodebases.mockImplementation(() => Promise.resolve([codebase]));
+    mockParseCommand.mockReturnValueOnce({
+      command: 'workflow',
+      args: ['run', 'assist', 'WO-guard'],
+    });
+    mockHandleCommand.mockImplementation(() =>
+      Promise.resolve({
+        success: true,
+        message: 'ok',
+        workflow: { definition: workflow.workflow, args: 'WO-guard' },
+      })
+    );
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [workflow], errors: [] })
+    );
+    mockFindResumableRunByParentConversation.mockImplementation(() => Promise.resolve(row));
+    return makePlatform();
+  }
+
+  function row(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'prior-run',
+      workflow_name: 'assist',
+      parent_conversation_id: 'conv-1',
+      status: 'failed',
+      working_path: '/worktrees/prior-run',
+      metadata: {},
+      ...overrides,
+    };
+  }
+
+  function expectNoDispatch() {
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+    expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockSendQuery).not.toHaveBeenCalled();
+    expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+    expect(mockFindResumableRunByParentConversation).toHaveBeenCalledTimes(1);
+    expect(mockFindResumableRunByParentConversation).toHaveBeenCalledWith('assist', 'conv-1');
+  }
+
+  for (const mode of ['global', 'scoped']) {
+    const markers: [string, unknown][] = [
+      ['null', null],
+      ['undefined', undefined],
+      ['false', false],
+      ['corrupt', 'bad'],
+      ['v1', { version: 'codex-only-v1' }],
+      ['v2', { version: 'codex-only-v2' }],
+      ['unknown', { version: 'future' }],
+    ];
+    for (const [index, [label, marker]] of markers.entries()) {
+      test(`${mode} refuses persisted ${label} marker before resume or replacement`, async () => {
+        const prior = row({
+          metadata: { codex_only_dispatch: marker },
+          status: index % 2 ? 'paused' : 'failed',
+          working_path: index % 2 ? null : '/worktrees/prior-run',
+        });
+        const before = structuredClone(prior);
+        const platform = setup(mode, prior, index % 2 === 0);
+        await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+        expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+        expect(platform.sendMessage).not.toHaveBeenCalledWith(
+          'conv-1',
+          expect.stringContaining('Starting workflow:')
+        );
+        expectNoDispatch();
+        expect(prior).toEqual(before);
+        expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(mode === 'global' ? 1 : 0);
+      });
+    }
+
+    test.each([undefined, null])(
+      `${mode} refuses reserved persisted name with metadata %s and no working path`,
+      async metadata => {
+        const prior = row({ workflow_name: reserved, metadata, working_path: null });
+        const before = structuredClone(prior);
+        const platform = setup(mode, prior);
+        await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+        expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+        expectNoDispatch();
+        expect(prior).toEqual(before);
+      }
+    );
+
+    test(`${mode} lookup error cannot rediscover or dispatch a replacement`, async () => {
+      const platform = setup(mode, null);
+      mockFindResumableRunByParentConversation.mockRejectedValueOnce(
+        new Error('lookup unavailable')
+      );
+      await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', unverified);
+      expectNoDispatch();
+      expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(mode === 'global' ? 1 : 0);
+    });
+
+    const malformed: [string, unknown][] = [
+      ['undefined', undefined],
+      ['primitive', false],
+      ['array', []],
+      ['missing name', {}],
+      ['bad name', row({ workflow_name: 3 })],
+      ['metadata string', row({ metadata: 'bad' })],
+      ['metadata array', row({ metadata: [] })],
+      ['bad path', row({ working_path: 3 })],
+    ];
+    test.each(malformed)(
+      `${mode} malformed %s output cannot start a replacement`,
+      async (_label, output) => {
+        const platform = setup(mode, output);
+        await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+        expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', unverified);
+        expectNoDispatch();
+        expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(mode === 'global' ? 1 : 0);
+      }
+    );
+
+    test(`${mode} both refusal notification failures cannot reach discovery fallback`, async () => {
+      const platform = setup(mode, row({ metadata: { codex_only_dispatch: false } }));
+      const messages: string[] = [];
+      platform.sendMessage = mock(async (_id: string, text: string) => {
+        if (text === 'ok') return;
+        messages.push(text);
+        throw new Error('notification unavailable');
+      });
+      await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+      expect(messages).toEqual([refusal, unverified]);
+      expectNoDispatch();
+      expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(mode === 'global' ? 1 : 0);
+    });
+  }
+
+  test.each([false, true])(
+    'ordinary web interactive=%s preserves foreground cwd and parent identity',
+    async interactive => {
+      const platform = setup('scoped', row({ metadata: null }), interactive);
+      await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+      expect(mockFindResumableRunByParentConversation).toHaveBeenCalledTimes(1);
+      expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockExecuteWorkflow.mock.calls[0][3]).toBe('/worktrees/prior-run');
+      expect(mockExecuteWorkflow.mock.calls[0][10]).toBe('conv-1');
+      expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+      expect(mockValidateAndResolveIsolation).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test.each([null, undefined, ''])(
+    'ordinary missing path %s retains background replacement behavior',
+    async working_path => {
+      const platform = setup('scoped', row({ working_path, metadata: undefined }));
+      await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+      expect(mockFindResumableRunByParentConversation).toHaveBeenCalledTimes(1);
+      expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    }
+  );
+
+  test('ordinary non-web dispatch retains no parent resume lookup', async () => {
+    const platform = setup('scoped', null, true);
+    platform.getPlatformType = mock(() => 'slack' as const);
+    await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+  });
+});

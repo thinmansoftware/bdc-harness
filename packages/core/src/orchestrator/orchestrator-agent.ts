@@ -259,6 +259,60 @@ async function dispatchOrchestratorWorkflow(
     return;
   }
 
+  let resumableRun: Awaited<ReturnType<typeof workflowDb.findResumableRunByParentConversation>> =
+    null;
+  if (platform.getPlatformType() === 'web') {
+    try {
+      resumableRun = await workflowDb.findResumableRunByParentConversation(
+        workflow.name,
+        conversation.id
+      );
+      if (resumableRun !== null) {
+        if (
+          typeof resumableRun !== 'object' ||
+          Array.isArray(resumableRun) ||
+          typeof resumableRun.workflow_name !== 'string'
+        ) {
+          throw new Error('Invalid foreground resume lookup result');
+        }
+        if (
+          resumableRun.workflow_name === 'bdc-feature-development-codex-only' ||
+          Object.prototype.hasOwnProperty.call(resumableRun.metadata ?? {}, 'codex_only_dispatch')
+        ) {
+          await platform.sendMessage(
+            conversationId,
+            'Codex-only continuation is not available; the prior run was left unchanged.'
+          );
+          return;
+        }
+        if (
+          (resumableRun.metadata != null &&
+            (typeof resumableRun.metadata !== 'object' || Array.isArray(resumableRun.metadata))) ||
+          (resumableRun.working_path != null && typeof resumableRun.working_path !== 'string')
+        ) {
+          throw new Error('Invalid foreground resume lookup fields');
+        }
+      }
+    } catch {
+      getLog().warn(
+        { conversationId, workflowName: workflow.name },
+        'orchestrator.foreground_resume_precheck_failed'
+      );
+      try {
+        await platform.sendMessage(
+          conversationId,
+          'Workflow continuation could not be verified; no workflow was started.'
+        );
+      } catch {
+        getLog().warn(
+          { conversationId, workflowName: workflow.name },
+          'orchestrator.foreground_resume_refusal_notification_failed'
+        );
+      }
+      return;
+    }
+  }
+
   if (announceStart) {
     await platform.sendMessage(conversationId, `Starting workflow: \`${workflow.name}\``);
   }
@@ -323,10 +377,6 @@ async function dispatchOrchestratorWorkflow(
     // Check for a resumable run from a prior dispatch (e.g. approved approval gate).
     // A new background dispatch would create a new worker conversation and never find
     // the prior run's worktree. Execute in foreground to reuse the original working path.
-    const resumableRun = await workflowDb.findResumableRunByParentConversation(
-      workflow.name,
-      conversation.id
-    );
     if (resumableRun?.working_path) {
       getLog().info(
         {
