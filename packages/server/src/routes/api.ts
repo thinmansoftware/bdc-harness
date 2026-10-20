@@ -3050,9 +3050,10 @@ export function registerApiRoutes(
    * no run row was ever created). Validate the name synchronously here and
    * reject BEFORE accepting the dispatch.
    *
-   * Fails open on discovery errors -- a broken YAML tree is surfaced by the
-   * command handler in-conversation; only a definitive "no such workflow"
-   * (or ambiguous name) is rejected at the API boundary.
+   * Ordinary discovery errors degrade to in-conversation reporting. The reserved
+   * Codex-only token remains closed before discovery, and an actually resolved
+   * reserved definition is refused before dispatch-auth checks. Unknown and
+   * ambiguous names remain rejected at this API boundary.
    */
   const WORKFLOW_RUN_COMMAND = /^\/workflow\s+run\s+(\S+)/;
   const DEFAULT_BUILDER_MONITOR_URL =
@@ -3158,6 +3159,9 @@ export function registerApiRoutes(
     const match = WORKFLOW_RUN_COMMAND.exec(message.trim());
     if (!match) return { valid: true };
     const workflowName = match[1];
+    if (workflowName.toLowerCase() === 'bdc-feature-development-codex-only') {
+      return { valid: false, error: 'Codex-only dispatch is not available yet.' };
+    }
 
     // Parse and validate the optional atomic `--from origin/<branch>` override
     // BEFORE resolving the workflow so malformed/unsafe input fails closed even
@@ -3215,6 +3219,9 @@ export function registerApiRoutes(
         valid: false,
         error: `Workflow "${workflowName}" not found. Use GET /api/workflows to list available workflows.`,
       };
+    }
+    if (workflow.name === 'bdc-feature-development-codex-only') {
+      return { valid: false, error: 'Codex-only dispatch is not available yet.' };
     }
     const xaiRefusal = openRouterXaiRefusalForRun(workflow, modelOverride);
     if (xaiRefusal) {

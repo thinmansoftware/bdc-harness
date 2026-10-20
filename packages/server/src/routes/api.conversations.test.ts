@@ -101,9 +101,14 @@ const mockAddMessage = mock(async (_convId: string, _role: string, _content: str
 mock.module('@archon/core/db/messages', () => ({
   addMessage: mockAddMessage,
 }));
+const mockAdmissionCodebase = mock(async (_id?: string) => null as { default_cwd: string } | null);
+const mockAdmissionCodexGate = mock(async () => ({ fresh: true, reason: 'test fixture' }));
+mock.module('@archon/providers/auth-refresh/dispatch-gate', () => ({
+  checkCodexDispatchGate: mockAdmissionCodexGate,
+}));
 mock.module('@archon/core/db/codebases', () => ({
   listCodebases: mock(async () => [{ default_cwd: '/tmp/project' }]),
-  getCodebase: mock(async () => null),
+  getCodebase: mockAdmissionCodebase,
 }));
 
 import { registerApiRoutes } from './api';
@@ -947,5 +952,147 @@ describe('GET /api/conversations/:id -- forge platform IDs with encoded slashes'
 
     const response = await app.request('/api/conversations/unknown-org%2Funknown-repo%2399');
     expect(response.status).toBe(404);
+  });
+});
+
+describe('binding-v2 API closed admission', () => {
+  const reserved = 'bdc-feature-development-codex-only';
+  const reservedWorkflow = {
+    name: reserved,
+    description: 'Owned in-memory API fixture',
+    provider: 'codex',
+    nodes: [{ id: 'n', prompt: 'No provider runs in this test' }],
+  } as WorkflowDefinition;
+
+  function setup(workflow: WorkflowDefinition = reservedWorkflow, scoped = false) {
+    mockGetOrCreateConversation.mockClear();
+    mockAddMessage.mockClear();
+    mockUpdateConversationTitle.mockClear();
+    mockGenerateAndSetTitle.mockClear();
+    mockHandleMessage.mockClear();
+    mockAdmissionCodebase.mockReset();
+    mockAdmissionCodebase.mockImplementation(async () =>
+      scoped ? { default_cwd: '/tmp/project' } : null
+    );
+    mockAdmissionCodexGate.mockClear();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockImplementation(async () => ({
+      workflows: [{ workflow, source: 'project' as const }],
+      errors: [],
+    }));
+    const mapping = mock(() => {});
+    const acquireLock = mock(async (_id: string, fn: () => Promise<void>) => {
+      await fn();
+      return { status: 'started' as const };
+    });
+    const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+    registerApiRoutes(
+      app,
+      {
+        setConversationDbId: mapping,
+        emitLockEvent: mock(() => {}),
+        emitSSE: mock(async () => {}),
+      } as unknown as WebAdapter,
+      { acquireLock } as unknown as ConversationLockManager
+    );
+    const post = (message: string) =>
+      app.request('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message,
+          ...(scoped ? { codebaseId: 'owned-in-memory-project' } : {}),
+        }),
+      });
+    return { post, mapping, acquireLock };
+  }
+
+  async function expectClosed(response: Response, effects: ReturnType<typeof setup>) {
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      dispatched: false,
+      error: 'Codex-only dispatch is not available yet.',
+    });
+    expect(mockGetOrCreateConversation).not.toHaveBeenCalled();
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockUpdateConversationTitle).not.toHaveBeenCalled();
+    expect(mockGenerateAndSetTitle).not.toHaveBeenCalled();
+    expect(effects.mapping).not.toHaveBeenCalled();
+    expect(effects.acquireLock).not.toHaveBeenCalled();
+    expect(mockHandleMessage).not.toHaveBeenCalled();
+    expect(mockAdmissionCodexGate).not.toHaveBeenCalled();
+  }
+
+  test.each(['canonical', 'case', 'whitespace', 'discovery-unavailable', 'scoped'])(
+    'refuses canonical token before discovery and atomic writes: %s',
+    async mode => {
+      const effects = setup(reservedWorkflow, mode === 'scoped');
+      if (mode === 'discovery-unavailable') {
+        mockDiscoverWorkflowsWithConfig.mockImplementation(async () => {
+          throw new Error('fixture discovery unavailable');
+        });
+      }
+      const token = mode === 'case' ? reserved.toUpperCase() : reserved;
+      const message =
+        mode === 'whitespace'
+          ? `  /workflow   run\t${token} WO-fixture  `
+          : `/workflow run ${token} WO-fixture`;
+      await expectClosed(await effects.post(message), effects);
+      expect(mockDiscoverWorkflowsWithConfig).not.toHaveBeenCalled();
+    }
+  );
+
+  test.each(['codex-only', 'feature-development'])(
+    'refuses actual reserved definition selected by real resolver: %s',
+    async alias => {
+      const effects = setup();
+      await expectClosed(await effects.post(`/workflow run ${alias} WO-fixture`), effects);
+      expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test('ordinary workflow with reserved message text still dispatches', async () => {
+    const effects = setup({ ...reservedWorkflow, name: 'ordinary', provider: 'claude' });
+    const response = await effects.post(`/workflow run ordinary Discuss ${reserved}`);
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { accepted: boolean }).accepted).toBe(true);
+    expect(effects.acquireLock).toHaveBeenCalledTimes(1);
+    expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+    expect(mockAdmissionCodexGate).not.toHaveBeenCalled();
+  });
+
+  test('ordinary Codex workflow still consults existing dispatch gate', async () => {
+    const effects = setup({ ...reservedWorkflow, name: 'ordinary-codex' });
+    expect((await effects.post('/workflow run ordinary-codex WO-fixture')).status).toBe(200);
+    expect(mockAdmissionCodexGate).toHaveBeenCalledTimes(1);
+    expect(effects.acquireLock).toHaveBeenCalledTimes(1);
+  });
+
+  test('ordinary discovery-error degradation remains unchanged', async () => {
+    const effects = setup({ ...reservedWorkflow, name: 'ordinary' });
+    mockDiscoverWorkflowsWithConfig.mockImplementation(async () => {
+      throw new Error('ordinary discovery unavailable');
+    });
+    expect((await effects.post('/workflow run ordinary WO-fixture')).status).toBe(200);
+    expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(1);
+    expect(effects.acquireLock).toHaveBeenCalledTimes(1);
+    expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test('real ambiguous suffix remains rejected before atomic effects', async () => {
+    const effects = setup();
+    mockDiscoverWorkflowsWithConfig.mockImplementation(async () => ({
+      workflows: [reservedWorkflow, { ...reservedWorkflow, name: 'other-codex-only' }].map(
+        workflow => ({ workflow, source: 'project' as const })
+      ),
+      errors: [],
+    }));
+    const response = await effects.post('/workflow run codex-only WO-fixture');
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: string }).error).toContain('Ambiguous');
+    expect(mockGetOrCreateConversation).not.toHaveBeenCalled();
+    expect(effects.acquireLock).not.toHaveBeenCalled();
+    expect(mockAdmissionCodexGate).not.toHaveBeenCalled();
   });
 });
