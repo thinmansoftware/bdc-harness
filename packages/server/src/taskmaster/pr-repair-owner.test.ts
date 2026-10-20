@@ -9,7 +9,14 @@
  * GitHub writes.
  */
 import { describe, expect, test } from 'bun:test';
-import type { LanePr, WoWithMultipleLanePrs } from '@archon/core/db/lane-pr-registry';
+import { Database } from 'bun:sqlite';
+import {
+  listWosWithMultipleLanePrs,
+  type LanePr,
+  type LanePrGithubInfo,
+  type LanePrRegistryDb,
+  type WoWithMultipleLanePrs,
+} from '@archon/core/db/lane-pr-registry';
 import {
   buildSupersededComment,
   resolvePrRepairDedupeWindowHours,
@@ -139,7 +146,10 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
           }
         : null;
     },
-    listWosWithMultipleLanePrs: async () => config.dupeWos ?? [],
+    listWosWithMultipleLanePrs: async () => ({
+      groups: config.dupeWos ?? [],
+      unresolved: [],
+    }),
     listLanePrsForWo: async woId => laneByWo[woId] ?? [],
     listQueuedTaskmasterMessages: async () =>
       messages.filter(m => !m.addressed).map(m => ({ ...m })),
@@ -173,6 +183,100 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
     resolveEntryTier: () => undefined,
   };
   return { deps, rec };
+}
+
+function makeRegistryDb(): { db: LanePrRegistryDb; sqlite: Database } {
+  const sqlite = new Database(':memory:');
+  sqlite.run(
+    `CREATE TABLE remote_agent_workflow_runs (
+       id TEXT PRIMARY KEY,
+       workflow_name TEXT,
+       status TEXT,
+       started_at TEXT,
+       completed_at TEXT,
+       user_message TEXT
+     )`
+  );
+  sqlite.run(
+    `CREATE TABLE remote_agent_workflow_events (
+       id TEXT PRIMARY KEY,
+       workflow_run_id TEXT,
+       event_type TEXT,
+       step_index INTEGER,
+       step_name TEXT,
+       data TEXT,
+       created_at TEXT
+     )`
+  );
+  const db: LanePrRegistryDb = {
+    async query<T>(sql: string, params: unknown[] = []): Promise<{ rows: T[]; rowCount: number }> {
+      const translated = sql.replace(/\$\d+/g, '?');
+      const rows = sqlite.query(translated).all(...(params as never[])) as T[];
+      return { rows, rowCount: rows.length };
+    },
+  };
+  return { db, sqlite };
+}
+
+let registryEventSeq = 0;
+
+function seedLanePair(
+  sqlite: Database,
+  input: { runId: string; woId: string; repo: string; older: number; newer: number }
+): void {
+  sqlite.run(
+    `INSERT INTO remote_agent_workflow_runs
+       (id, workflow_name, status, started_at, completed_at, user_message)
+     VALUES (?, 'bdc-feature-development', 'completed', ?, ?, ?)`,
+    [
+      input.runId,
+      '2026-10-14T01:00:00Z',
+      '2026-10-14T02:00:00Z',
+      `WO_ID=${input.woId} --project ${input.repo}`,
+    ]
+  );
+  const cite = (stepName: string, prNumber: number): void => {
+    registryEventSeq += 1;
+    sqlite.run(
+      `INSERT INTO remote_agent_workflow_events
+         (id, workflow_run_id, event_type, step_index, step_name, data, created_at)
+       VALUES (?, ?, 'node_completed', 0, ?, ?, '2026-10-14T01:00:00Z')`,
+      [
+        `evt-${registryEventSeq}`,
+        input.runId,
+        stepName,
+        JSON.stringify({
+          output: `opened https://github.com/thinmansoftware/${input.repo}/pull/${prNumber}`,
+        }),
+      ]
+    );
+  };
+  cite('implement', input.older);
+  cite('open-pr-if-needed', input.newer);
+}
+
+function registryPr(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  woId: string
+): LanePrGithubInfo | null {
+  if (owner !== 'thinmansoftware') return null;
+  if (repo !== 'bdc-xo' && repo !== 'shopops') return null;
+  const createdAt =
+    prNumber === 202 || prNumber === 101 ? '2026-10-14T01:40:00Z' : '2026-10-14T01:10:00Z';
+  return {
+    number: prNumber,
+    state: 'OPEN',
+    reviewDecision: 'CHANGES_REQUESTED',
+    createdAt,
+    headRefName: `feat/${woId.toLowerCase()}-thread-${prNumber}`,
+    headSha: `sha-${prNumber}`,
+    headRepoFullName: `${owner}/${repo}`,
+    baseRepoFullName: `${owner}/${repo}`,
+    title: `Implement ${woId}`,
+    body: `Closes ${woId}.`,
+  };
 }
 
 describe('review repair regressions', () => {
@@ -880,6 +984,67 @@ describe('runPrRepairOwner', () => {
     await runPrRepairOwner(deps);
     expect(rec.fired).toHaveLength(1);
     expect(rec.closed).toHaveLength(2);
+  });
+
+  test('fetch_failure_one_wo_does_not_block_other_wo_or_exhaustion', async () => {
+    const woA = 'WO-HARNESS-FETCH-FAIL-A-01';
+    const woB = 'WO-HARNESS-FETCH-FAIL-B-01';
+    const exhaustedWo = 'WO-SHOPOPS-STRIPE-ORPHANED-INVOICE-ATTRIBUTION-01';
+    const { db, sqlite } = makeRegistryDb();
+    seedLanePair(sqlite, {
+      runId: 'run-a',
+      woId: woA,
+      repo: 'bdc-xo',
+      older: 102,
+      newer: 101,
+    });
+    seedLanePair(sqlite, {
+      runId: 'run-b',
+      woId: woB,
+      repo: 'shopops',
+      older: 201,
+      newer: 202,
+    });
+    const { deps, rec } = makeDeps({
+      queued: [
+        {
+          id: 'ex-iso',
+          body: exhaustedBody({
+            repo: 'shopops',
+            prNumber: 873,
+            woId: exhaustedWo,
+            reason: 'attempt_cap',
+          }),
+        },
+      ],
+    });
+    deps.fetchPr = async (owner, repo, prNumber) => {
+      if (owner === 'thinmansoftware' && repo === 'bdc-xo' && prNumber === 101) {
+        throw new Error('github_transient_failure');
+      }
+      return registryPr(owner, repo, prNumber, repo === 'shopops' ? woB : woA);
+    };
+    deps.listWosWithMultipleLanePrs = opts => listWosWithMultipleLanePrs({ ...opts, db });
+
+    try {
+      const result = await runPrRepairOwner(deps);
+      expect(rec.closed).toEqual([
+        expect.objectContaining({
+          prNumber: 201,
+          comment: expect.stringContaining('Superseded by #202'),
+        }),
+      ]);
+      expect(rec.closed.some(close => close.prNumber === 101 || close.prNumber === 102)).toBe(
+        false
+      );
+      expect(result.digestItems).toEqual([
+        `thinmansoftware/shopops#873 ${exhaustedWo} attempt_cap`,
+      ]);
+      await result.commitExhausted();
+      expect(rec.addressed).toEqual([{ id: 'ex-iso', note: 'digested' }]);
+    } finally {
+      sqlite.close();
+    }
   });
 });
 

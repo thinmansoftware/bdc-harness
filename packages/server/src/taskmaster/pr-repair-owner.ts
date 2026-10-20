@@ -35,7 +35,7 @@ import type { DispatchMessage } from '@archon/core/db/dispatch';
 import type {
   LanePr,
   LanePrFetcher,
-  WoWithMultipleLanePrs,
+  ListWosWithMultipleLanePrsResult,
 } from '@archon/core/db/lane-pr-registry';
 
 /** Default dedupe lookback window (hours). Overridable via env. */
@@ -135,12 +135,12 @@ export interface PrRepairOwnerDeps {
   fetchPr: LanePrFetcher;
   /** Fresh RUNNING state and the captured epoch, immediately before each effect. */
   canApplyEffect: () => Promise<boolean>;
-  /** WOs with 2+ lane-created PRs within the window. */
+  /** WOs with 2+ lane-created PRs within the window, plus unresolved lookups. */
   listWosWithMultipleLanePrs: (opts: {
     fetchPr: LanePrFetcher;
     withinHours?: number;
     now?: () => number;
-  }) => Promise<WoWithMultipleLanePrs[]>;
+  }) => Promise<ListWosWithMultipleLanePrsResult>;
   /** Every lane-created PR for one WO. */
   listLanePrsForWo: (
     woId: string,
@@ -380,9 +380,21 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     }
     return [...groups.values()].some(prs => planDedupe(prs).toClose.length > 0);
   };
-  const dupeWos = (
-    await deps.listWosWithMultipleLanePrs({ fetchPr: deps.fetchPr, withinHours, now })
-  )
+  const dedupe = await deps.listWosWithMultipleLanePrs({
+    fetchPr: deps.fetchPr,
+    withinHours,
+    now,
+  });
+  for (const unresolved of dedupe.unresolved) {
+    log('pr_repair.dedupe_lookup_failed', {
+      woId: unresolved.woId,
+      owner: unresolved.owner,
+      repo: unresolved.repo,
+      prNumber: unresolved.prNumber,
+      error: unresolved.error,
+    });
+  }
+  const dupeWos = dedupe.groups
     .filter(entry => {
       const openByRepository = new Map<string, number>();
       for (const pr of entry.prs) {
@@ -448,10 +460,23 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     if (!(await deps.canApplyEffect())) break;
 
     // Re-prove the LANE PR RULE: the PR must still be lane-created for this WO.
-    const lanePrs = await deps.listLanePrsForWo(candidate.woId, {
-      fetchPr: deps.fetchPr,
-      now,
-    });
+    // A lookup failure leaves the row queued. It is not a not-lane refusal.
+    let lanePrs: LanePr[];
+    try {
+      lanePrs = await deps.listLanePrsForWo(candidate.woId, {
+        fetchPr: deps.fetchPr,
+        now,
+      });
+    } catch (error) {
+      log('pr_repair.lane_lookup_failed', {
+        woId: candidate.woId,
+        owner: candidate.owner,
+        repo: candidate.repo,
+        prNumber: candidate.prNumber,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
     // Match the full repository slug (case-insensitive) AND the PR number:
     // identical PR numbers for the same WO can exist across repositories, so
     // matching prNumber alone could select and repair the wrong PR.
@@ -512,7 +537,19 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     // same collapse-first rule. Re-read after closes: failed or unsafe closes
     // never authorize a repair over another OPEN claimant.
     await closePlan(candidate.woId, plan);
-    const afterDedupe = await deps.listLanePrsForWo(candidate.woId, { fetchPr: deps.fetchPr, now });
+    let afterDedupe: LanePr[];
+    try {
+      afterDedupe = await deps.listLanePrsForWo(candidate.woId, { fetchPr: deps.fetchPr, now });
+    } catch (error) {
+      log('pr_repair.lane_lookup_failed', {
+        woId: candidate.woId,
+        owner: candidate.owner,
+        repo: candidate.repo,
+        prNumber: candidate.prNumber,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
     const otherOpen = afterDedupe.some(
       pr =>
         pr.state === 'OPEN' &&

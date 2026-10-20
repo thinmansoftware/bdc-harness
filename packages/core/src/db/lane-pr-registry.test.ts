@@ -393,15 +393,136 @@ describe('lane-pr-registry', () => {
     const { db, sqlite } = makeDb();
     seedE1E2(sqlite);
     const fetchPr = digestFetcher();
-    const wos = await listWosWithMultipleLanePrs({
-      db,
-      fetchPr,
-      now: () => Date.parse('2026-10-14T12:00:00Z'),
-      withinHours: 168,
-    });
+    const wos = (
+      await listWosWithMultipleLanePrs({
+        db,
+        fetchPr,
+        now: () => Date.parse('2026-10-14T12:00:00Z'),
+        withinHours: 168,
+      })
+    ).groups;
     const digest = wos.find(w => w.woId === WO_DIGEST);
     const trial = wos.find(w => w.woId === WO_TRIAL);
     expect(digest?.prs.map(p => p.prNumber).sort((a, b) => a - b)).toEqual([3170, 3171, 3172]);
     expect(trial?.prs.map(p => p.prNumber).sort((a, b) => a - b)).toEqual([870, 871]);
+  });
+
+  test('fetch_failure_isolated_per_wo_group', async () => {
+    const woA = 'WO-HARNESS-FETCH-FAIL-A-01';
+    const woB = 'WO-HARNESS-FETCH-FAIL-B-01';
+    const { db, sqlite } = makeDb();
+    const now = (): number => Date.parse('2026-10-14T12:00:00Z');
+    // The resolvable sibling is inserted first so a partial result would leak
+    // if the failed group were not dropped after the later throw.
+    seedRun(sqlite, {
+      id: 'run-a',
+      workflow: 'bdc-feature-development',
+      woId: woA,
+      startedAt: '2026-10-14T01:00:00Z',
+      completedAt: '2026-10-14T02:00:00Z',
+    });
+    seedEvent(sqlite, 'run-a', 'implement', 'https://github.com/thinmansoftware/bdc-xo/pull/102');
+    seedEvent(
+      sqlite,
+      'run-a',
+      'open-pr-if-needed',
+      'https://github.com/thinmansoftware/bdc-xo/pull/101'
+    );
+    seedRun(sqlite, {
+      id: 'run-b',
+      workflow: 'bdc-feature-development',
+      woId: woB,
+      startedAt: '2026-10-14T01:00:00Z',
+      completedAt: '2026-10-14T02:00:00Z',
+    });
+    seedEvent(sqlite, 'run-b', 'implement', 'https://github.com/thinmansoftware/shopops/pull/201');
+    seedEvent(
+      sqlite,
+      'run-b',
+      'open-pr-if-needed',
+      'https://github.com/thinmansoftware/shopops/pull/202'
+    );
+
+    const info = (
+      owner: string,
+      repo: string,
+      n: number,
+      woId: string,
+      headRefName: string
+    ): LanePrGithubInfo => ({
+      number: n,
+      state: 'OPEN',
+      reviewDecision: 'CHANGES_REQUESTED',
+      createdAt: '2026-10-14T01:20:00Z',
+      headRefName,
+      headSha: `sha-${n}`,
+      headRepoFullName: `${owner}/${repo}`,
+      baseRepoFullName: `${owner}/${repo}`,
+      title: `Implement ${woId}`,
+      body: `Closes ${woId}.`,
+    });
+    const table: Record<string, LanePrGithubInfo> = {
+      'thinmansoftware/bdc-xo#102': info(
+        'thinmansoftware',
+        'bdc-xo',
+        102,
+        woA,
+        'feat/wo-harness-fetch-fail-a-01-thread-102'
+      ),
+      'thinmansoftware/bdc-xo#101': info(
+        'thinmansoftware',
+        'bdc-xo',
+        101,
+        woA,
+        'feat/wo-harness-fetch-fail-a-01-thread-101'
+      ),
+      'thinmansoftware/shopops#201': info(
+        'thinmansoftware',
+        'shopops',
+        201,
+        woB,
+        'feat/wo-harness-fetch-fail-b-01-thread-201'
+      ),
+      'thinmansoftware/shopops#202': info(
+        'thinmansoftware',
+        'shopops',
+        202,
+        woB,
+        'feat/wo-harness-fetch-fail-b-01-thread-202'
+      ),
+    };
+
+    try {
+      const result = await listWosWithMultipleLanePrs({
+        db,
+        now,
+        withinHours: 168,
+        fetchPr: async (owner, repo, prNumber) => {
+          if (owner === 'thinmansoftware' && repo === 'bdc-xo' && prNumber === 101) {
+            throw new Error('github_transient_failure');
+          }
+          return table[`${owner}/${repo}#${prNumber}`] ?? null;
+        },
+      });
+      const woBGroup = result.groups.find(group => group.woId === woB);
+      expect(woBGroup?.prs.map(pr => pr.prNumber).sort((a, b) => a - b)).toEqual([201, 202]);
+      expect(result.groups.some(group => group.woId === woA)).toBe(false);
+      expect(
+        result.groups.some(group =>
+          group.prs.some(pr => pr.prNumber === 101 || pr.prNumber === 102)
+        )
+      ).toBe(false);
+      expect(result.unresolved).toEqual([
+        {
+          woId: woA,
+          owner: 'thinmansoftware',
+          repo: 'bdc-xo',
+          prNumber: 101,
+          error: 'github_transient_failure',
+        },
+      ]);
+    } finally {
+      sqlite.close();
+    }
   });
 });

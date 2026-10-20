@@ -31,9 +31,12 @@
  * reviewDecision, title, body) is an INJECTED fetcher, so tests run with no
  * network and no real GitHub reads.
  */
+import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 import type { IDatabase } from './adapters/types';
 import { extractWoId } from '../escalation/escalation-linker';
+
+const log = createLogger('db/lane-pr-registry');
 
 /**
  * A minimal read-only database surface -- the SELECTs this module needs. Reuses
@@ -103,6 +106,33 @@ export interface ListWosWithMultipleLanePrsOptions extends ListLanePrsOptions {
 export interface WoWithMultipleLanePrs {
   woId: string;
   prs: LanePr[];
+}
+
+/**
+ * A WO+repository whose lane-PR lookup threw. Dedupe must not act on a partial
+ * set for this group. `error` is the normalized message only; callers that must
+ * rethrow keep the original thrown value separately.
+ */
+export interface UnresolvedLanePrGroup {
+  woId: string;
+  owner: string;
+  repo: string;
+  prNumber: number;
+  error: string;
+}
+
+/** Dedupe-eligible groups plus the WO+repository lookups that failed closed. */
+export interface ListWosWithMultipleLanePrsResult {
+  groups: WoWithMultipleLanePrs[];
+  unresolved: UnresolvedLanePrGroup[];
+}
+
+/** Internal resolution: public metadata plus the original thrown values. */
+interface LanePrResolution {
+  prs: LanePr[];
+  unresolved: UnresolvedLanePrGroup[];
+  /** Encounter order. listLanePrsForWo rethrows the first value unchanged. */
+  thrown: unknown[];
 }
 
 const WINDOW_SLACK_MS = 60_000;
@@ -203,6 +233,15 @@ function toText(data: unknown): string {
   } catch {
     return '';
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** WO plus the lowercased repository slug. Two WOs in one repo stay distinct. */
+function laneGroupKey(woId: string, owner: string, repo: string): string {
+  return `${woId}|${owner.toLowerCase()}/${repo.toLowerCase()}`;
 }
 
 function parseMs(value: string | null | undefined): number | null {
@@ -308,7 +347,7 @@ async function resolveLanePrs(
   woId: string,
   fetchPr: LanePrFetcher,
   nowMs: number
-): Promise<LanePr[]> {
+): Promise<LanePrResolution> {
   // Group citations by PR so each PR is fetched once; a PR cited by multiple
   // runs is attributed to the first run whose window contains its created_at.
   const byPr = new Map<string, PrCitation[]>();
@@ -319,25 +358,69 @@ async function resolveLanePrs(
     else byPr.set(key, [citation]);
   }
 
-  const resolved: LanePr[] = [];
+  // A thrown lookup fails the whole WO+repository. Null is still "not a lane
+  // PR" and does not poison the group. Siblings resolved before the throw are
+  // dropped so callers never see a partial set.
+  const resolvedByGroup = new Map<string, LanePr[]>();
+  const failed = new Map<string, { citation: PrCitation; error: unknown }>();
   for (const group of byPr.values()) {
     const first = group[0];
-    const info = await fetchPr(first.owner, first.repo, first.prNumber);
+    const groupKey = laneGroupKey(woId, first.owner, first.repo);
+    if (failed.has(groupKey)) continue;
+    let info: LanePrGithubInfo | null;
+    try {
+      info = await fetchPr(first.owner, first.repo, first.prNumber);
+    } catch (error) {
+      log.warn(
+        {
+          woId,
+          owner: first.owner,
+          repo: first.repo,
+          prNumber: first.prNumber,
+          error: errorMessage(error),
+        },
+        'lane_pr.lookup_failed'
+      );
+      failed.set(groupKey, { citation: first, error });
+      resolvedByGroup.delete(groupKey);
+      continue;
+    }
     if (!info) continue;
     for (const citation of group) {
       const lane = applyRuleBcd(citation, info, woId, nowMs);
       if (lane) {
-        resolved.push(lane);
+        const list = resolvedByGroup.get(groupKey) ?? [];
+        list.push(lane);
+        resolvedByGroup.set(groupKey, list);
         break;
       }
     }
   }
-  return resolved;
+
+  const prs: LanePr[] = [];
+  for (const [groupKey, lanes] of resolvedByGroup) {
+    if (failed.has(groupKey)) continue;
+    prs.push(...lanes);
+  }
+  const unresolved: UnresolvedLanePrGroup[] = [];
+  const thrown: unknown[] = [];
+  for (const failure of failed.values()) {
+    unresolved.push({
+      woId,
+      owner: failure.citation.owner,
+      repo: failure.citation.repo,
+      prNumber: failure.citation.prNumber,
+      error: errorMessage(failure.error),
+    });
+    thrown.push(failure.error);
+  }
+  return { prs, unresolved, thrown };
 }
 
 /**
  * Every PR provably lane-created for WO `woId`. Read-only; GitHub facts come
- * from the injected fetcher.
+ * from the injected fetcher. Fail-closed: if any WO+repository lookup throws,
+ * the original error is rethrown and no partial list is returned.
  */
 export async function listLanePrsForWo(woId: string, opts: ListLanePrsOptions): Promise<LanePr[]> {
   if (!woId) return [];
@@ -356,17 +439,22 @@ export async function listLanePrsForWo(woId: string, opts: ListLanePrsOptions): 
     [`%${woId}%`]
   );
   const citations = collectCitations(result.rows, woId);
-  return resolveLanePrs(citations, woId, opts.fetchPr, nowMs);
+  const resolved = await resolveLanePrs(citations, woId, opts.fetchPr, nowMs);
+  if (resolved.thrown.length > 0) {
+    throw resolved.thrown[0];
+  }
+  return resolved.prs;
 }
 
 /**
- * Every WO that has 2 or more lane-created PRs within the dedupe window. Used
- * by the PR repair owner's dedupe sweep to find duplicate-PR WOs without
- * scanning the whole store per WO.
+ * Every WO that has 2 or more lane-created PRs in one repository within the
+ * dedupe window, plus any WO+repository whose lookup threw. A failed group is
+ * omitted from `groups` (no partial set). A healthy repository for the same WO
+ * stays eligible on its own. One failed lookup does not reject the call.
  */
 export async function listWosWithMultipleLanePrs(
   opts: ListWosWithMultipleLanePrsOptions
-): Promise<WoWithMultipleLanePrs[]> {
+): Promise<ListWosWithMultipleLanePrsResult> {
   const db = opts.db ?? getDatabase();
   const nowMs = (opts.now ?? Date.now)();
   const withinHours = opts.withinHours ?? 168;
@@ -396,12 +484,25 @@ export async function listWosWithMultipleLanePrs(
     else byWo.set(runWoId, citations);
   }
 
-  const out: WoWithMultipleLanePrs[] = [];
+  const groups: WoWithMultipleLanePrs[] = [];
+  const unresolved: UnresolvedLanePrGroup[] = [];
   for (const [woId, citations] of byWo) {
-    const prs = await resolveLanePrs(citations, woId, opts.fetchPr, nowMs);
-    if (prs.length >= 2) out.push({ woId, prs });
+    const resolved = await resolveLanePrs(citations, woId, opts.fetchPr, nowMs);
+    unresolved.push(...resolved.unresolved);
+    const byRepo = new Map<string, LanePr[]>();
+    for (const pr of resolved.prs) {
+      const repoKey = `${pr.owner.toLowerCase()}/${pr.repo.toLowerCase()}`;
+      const list = byRepo.get(repoKey) ?? [];
+      list.push(pr);
+      byRepo.set(repoKey, list);
+    }
+    const eligible: LanePr[] = [];
+    for (const prs of byRepo.values()) {
+      if (prs.length >= 2) eligible.push(...prs);
+    }
+    if (eligible.length >= 2) groups.push({ woId, prs: eligible });
   }
-  return out;
+  return { groups, unresolved };
 }
 
 /**

@@ -4,8 +4,13 @@
  * fake dispatch); no mock.module.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
+import {
+  listWosWithMultipleLanePrs,
+  type LanePrRegistryDb,
+} from '@archon/core/db/lane-pr-registry';
 import { rootLogger } from '@archon/paths';
 import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
 
@@ -39,6 +44,7 @@ import {
   type AdoptionRefreshResult,
 } from './loop';
 import { checkEvidence } from './expectations';
+import { runPrRepairOwner, type PrRepairQueuedMessage } from './pr-repair-owner';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
@@ -4899,7 +4905,110 @@ describe('production repair-owner GitHub fetcher', () => {
     }
     expect((caught as Error)?.message).toBe('github_transient_failure');
   });
+
+  test('a throwing fetcher for one citation does not throw the owner tick', async () => {
+    const woId = 'WO-HARNESS-LOOP-ISO-01';
+    const { db, sqlite } = makeLoopRegistryDb();
+    sqlite.run(
+      `INSERT INTO remote_agent_workflow_runs
+         (id, workflow_name, status, started_at, completed_at, user_message)
+       VALUES ('run-loop-iso', 'bdc-feature-development', 'completed', ?, ?, ?)`,
+      ['2026-10-14T01:00:00Z', '2026-10-14T02:00:00Z', `WO_ID=${woId} --project bdc-xo`]
+    );
+    sqlite.run(
+      `INSERT INTO remote_agent_workflow_events
+         (id, workflow_run_id, event_type, step_index, step_name, data, created_at)
+       VALUES ('evt-loop-iso', 'run-loop-iso', 'node_completed', 0, 'implement', ?, ?)`,
+      [
+        JSON.stringify({
+          output: 'opened https://github.com/thinmansoftware/bdc-xo/pull/1120',
+        }),
+        '2026-10-14T01:00:00Z',
+      ]
+    );
+    let fetches = 0;
+    const fetcher = createGhLaneFetcher((async () => {
+      fetches += 1;
+      throw new Error('github_transient_failure');
+    }) as Parameters<typeof createGhLaneFetcher>[0]);
+    const exhausted: PrRepairQueuedMessage = {
+      id: 'ex-loop',
+      body: JSON.stringify({
+        kind: 'overseer_remediation_exhausted',
+        owner: 'thinmansoftware',
+        repo: 'shopops',
+        prNumber: 873,
+        headSha: 'sha-exhausted',
+        woId: 'WO-SHOPOPS-STRIPE-ORPHANED-INVOICE-ATTRIBUTION-01',
+        reason: 'attempt_cap',
+      }),
+      sender: 'overseer',
+      sender_principal_id: 'system:overseer',
+      recipient: 'taskmaster',
+      resolved_recipient: null,
+      status: 'queued',
+      addressed_at: null,
+      addressed_by: null,
+      route_disposition: null,
+      acknowledged_at: null,
+      acknowledged_by: null,
+    };
+    try {
+      const result = await runPrRepairOwner({
+        now: () => Date.parse('2026-10-14T12:00:00Z'),
+        fetchPr: fetcher,
+        canApplyEffect: async () => true,
+        listWosWithMultipleLanePrs: opts => listWosWithMultipleLanePrs({ ...opts, db }),
+        listLanePrsForWo: async () => [],
+        listQueuedTaskmasterMessages: async () => [exhausted],
+        acknowledgeRow: async () => undefined,
+        addressRow: async () => undefined,
+        closePr: async () => undefined,
+        hasRunningRunForWo: async () => false,
+        fireRepairCascade: async () => ({ cascadeId: 'unused', status: 'won' }),
+      });
+      expect(fetches).toBe(1);
+      expect(result.digestItems).toEqual([
+        'thinmansoftware/shopops#873 WO-SHOPOPS-STRIPE-ORPHANED-INVOICE-ATTRIBUTION-01 attempt_cap',
+      ]);
+    } finally {
+      sqlite.close();
+    }
+  });
 });
+
+function makeLoopRegistryDb(): { db: LanePrRegistryDb; sqlite: Database } {
+  const sqlite = new Database(':memory:');
+  sqlite.run(
+    `CREATE TABLE remote_agent_workflow_runs (
+       id TEXT PRIMARY KEY,
+       workflow_name TEXT,
+       status TEXT,
+       started_at TEXT,
+       completed_at TEXT,
+       user_message TEXT
+     )`
+  );
+  sqlite.run(
+    `CREATE TABLE remote_agent_workflow_events (
+       id TEXT PRIMARY KEY,
+       workflow_run_id TEXT,
+       event_type TEXT,
+       step_index INTEGER,
+       step_name TEXT,
+       data TEXT,
+       created_at TEXT
+     )`
+  );
+  const db: LanePrRegistryDb = {
+    async query<T>(sql: string, params: unknown[] = []): Promise<{ rows: T[]; rowCount: number }> {
+      const translated = sql.replace(/\$\d+/g, '?');
+      const rows = sqlite.query(translated).all(...(params as never[])) as T[];
+      return { rows, rowCount: rows.length };
+    },
+  };
+  return { db, sqlite };
+}
 
 test('production repair-owner effect gate reads fresh pause and captured epoch', async () => {
   let epoch = 5;
