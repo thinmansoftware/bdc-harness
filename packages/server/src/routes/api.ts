@@ -2579,6 +2579,13 @@ export function registerApiRoutes(
     return c.json({ error: message, ...(detail ? { detail } : {}) }, status);
   }
 
+  function isCodexOnlyContinuation(run: WorkflowRun): boolean {
+    return (
+      run.workflow_name === 'bdc-feature-development-codex-only' ||
+      Object.prototype.hasOwnProperty.call(run.metadata ?? {}, 'codex_only_dispatch')
+    );
+  }
+
   function isBoardPrincipalAuthError(error: unknown): boolean {
     return error instanceof Error && error.message.startsWith('board_principal_auth_');
   }
@@ -6524,6 +6531,9 @@ export function registerApiRoutes(
       if (!run) {
         return apiError(c, 404, 'Workflow run not found');
       }
+      if (isCodexOnlyContinuation(run)) {
+        return apiError(c, 400, 'codex_only_resume_unsupported');
+      }
       if (!RESUMABLE_WORKFLOW_STATUSES.includes(run.status)) {
         return apiError(c, 400, `Cannot resume workflow in '${run.status}' status`);
       }
@@ -6589,6 +6599,9 @@ export function registerApiRoutes(
         // into a fact in the archon logs.
         getLog().info({ runId }, 'api.workflow_run_approve_not_found');
         return apiError(c, 404, 'Workflow run not found');
+      }
+      if (isCodexOnlyContinuation(run)) {
+        return apiError(c, 400, 'codex_only_resume_unsupported');
       }
       // WO-MC-APPROVE-GATE-RELIABILITY-01: idempotency. Users re-click Approve
       // when the UI looks stuck. Once the gate is approved the route flips the

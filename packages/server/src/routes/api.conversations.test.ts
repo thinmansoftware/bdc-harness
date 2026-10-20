@@ -8,6 +8,7 @@ import {
   mockDiscoverWorkflowsWithConfig,
 } from '../test/workflow-mock-factories';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
+import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { dispatchBindingSchema } from '@archon/workflows/reliability/dispatch-binding';
 
 // The operator-token gate in registerApiRoutes() activates whenever
@@ -84,8 +85,14 @@ const mockGetOrCreateConversation = mock(
     codebase_id: null,
   })
 );
+const mockContinuationGetConversation = mock(async (id: string) => ({
+  id,
+  platform_type: 'web',
+  platform_conversation_id: 'web-' + id,
+}));
 mock.module('@archon/core/db/conversations', () => ({
   findConversationByPlatformId: mockFindConversationByPlatformId,
+  getConversationById: mockContinuationGetConversation,
   softDeleteConversation: mockSoftDeleteConversation,
   updateConversationTitle: mockUpdateConversationTitle,
   listConversations: mock(async () => []),
@@ -93,8 +100,28 @@ mock.module('@archon/core/db/conversations', () => ({
 }));
 
 mock.module('@archon/core/db/isolation-environments', () => ({}));
-mock.module('@archon/core/db/workflows', () => ({}));
-mock.module('@archon/core/db/workflow-events', () => ({}));
+const mockContinuationGetRun = mock(async (_id: string): Promise<WorkflowRun | null> => null);
+const mockContinuationResume = mock(async (_id: string) => {});
+const mockContinuationUpdate = mock(async (_id: string, _update: unknown) => {});
+const mockContinuationCancel = mock(async (_id: string) => {});
+const mockContinuationEvent = mock(async (_event: unknown) => {});
+const mockContinuationExecute = mock(async () => ({ success: true }));
+const mockContinuationDeps = mock(() => ({}));
+const mockContinuationLane = mock(
+  async (request: { workflowName?: string }) => request.workflowName
+);
+mock.module('@archon/core/db/workflows', () => ({
+  getWorkflowRun: mockContinuationGetRun,
+  resumeWorkflowRunFromPause: mockContinuationResume,
+  updateWorkflowRun: mockContinuationUpdate,
+  cancelWorkflowRun: mockContinuationCancel,
+}));
+mock.module('@archon/core/db/workflow-events', () => ({
+  createWorkflowEvent: mockContinuationEvent,
+}));
+mock.module('@archon/core/workflows', () => ({ createWorkflowDeps: mockContinuationDeps }));
+mock.module('@archon/workflows/executor', () => ({ executeWorkflow: mockContinuationExecute }));
+mock.module('../adapters/web/workflow-bridge', () => ({ resolveWebLane: mockContinuationLane }));
 const mockAddMessage = mock(async (_convId: string, _role: string, _content: string) => ({
   id: 'msg-uuid-1',
 }));
@@ -1094,5 +1121,242 @@ describe('binding-v2 API closed admission', () => {
     expect(mockGetOrCreateConversation).not.toHaveBeenCalled();
     expect(effects.acquireLock).not.toHaveBeenCalled();
     expect(mockAdmissionCodexGate).not.toHaveBeenCalled();
+  });
+});
+
+describe('binding-v2 API continuation closed gate', () => {
+  const reserved = 'bdc-feature-development-codex-only';
+
+  function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
+    return {
+      id: 'owned-memory-run',
+      workflow_name: 'ordinary-workflow',
+      conversation_id: 'owned-memory-worker',
+      parent_conversation_id: 'owned-memory-parent',
+      codebase_id: null,
+      status: 'paused',
+      user_message: 'fixture',
+      metadata: { paused_by: 'operator', approval: { nodeId: 'gate', message: 'fixture' } },
+      started_at: new Date(0),
+      completed_at: null,
+      last_activity_at: null,
+      working_path: '/owned-memory-worktree',
+      archived_at: null,
+      archived_by: null,
+      archive_reason: null,
+      ...overrides,
+    };
+  }
+
+  function setup(run: WorkflowRun | null) {
+    mockContinuationGetRun.mockReset();
+    mockContinuationGetRun.mockImplementation(async () => run);
+    for (const effect of [
+      mockContinuationResume,
+      mockContinuationUpdate,
+      mockContinuationCancel,
+      mockContinuationEvent,
+      mockContinuationGetConversation,
+      mockContinuationExecute,
+      mockContinuationDeps,
+      mockContinuationLane,
+      mockHandleMessage,
+      mockGetOrCreateConversation,
+    ]) {
+      effect.mockClear();
+    }
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockImplementation(async () => ({
+      workflows: [
+        {
+          workflow: {
+            name: run?.workflow_name ?? 'ordinary-workflow',
+            description: 'Owned memory fixture',
+            nodes: [{ id: 'n', prompt: 'fixture' }],
+          },
+          source: 'project' as const,
+        },
+      ],
+      errors: [],
+    }));
+    const mapping = mock(() => {});
+    const bridge = mock(() => () => {});
+    const acquireLock = mock(async () => ({ status: 'started' as const }));
+    const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+    registerApiRoutes(
+      app,
+      {
+        setConversationDbId: mapping,
+        setupEventBridge: bridge,
+        emitLockEvent: mock(() => {}),
+        emitSSE: mock(async () => {}),
+      } as unknown as WebAdapter,
+      { acquireLock } as unknown as ConversationLockManager
+    );
+    const post = (action: string) =>
+      app.request('/api/workflows/runs/owned-memory-run/' + action, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+    return { post, mapping, bridge, acquireLock };
+  }
+
+  function expectNoContinuation(effects: ReturnType<typeof setup>) {
+    for (const effect of [
+      mockContinuationResume,
+      mockContinuationUpdate,
+      mockContinuationCancel,
+      mockContinuationEvent,
+      mockContinuationGetConversation,
+      mockContinuationExecute,
+      mockContinuationDeps,
+      mockContinuationLane,
+      mockDiscoverWorkflowsWithConfig,
+      mockHandleMessage,
+      mockGetOrCreateConversation,
+      effects.mapping,
+      effects.bridge,
+      effects.acquireLock,
+    ])
+      expect(effect).not.toHaveBeenCalled();
+  }
+
+  for (const action of ['resume', 'approve']) {
+    for (const [label, marker] of [
+      ['null', null],
+      ['undefined', undefined],
+      ['false', false],
+      ['corrupt', 'corrupt'],
+      ['v1', { version: 'codex-only-v1' }],
+      ['v2', { version: 'codex-only-v2' }],
+      ['unknown', { version: 'codex-only-v999' }],
+    ] as const) {
+      test('refuses ' + action + ' with own ' + label + ' marker before effects', async () => {
+        const run = makeRun({
+          metadata: {
+            paused_by: 'operator',
+            approval: { nodeId: 'gate', message: 'fixture' },
+            codex_only_dispatch: marker,
+          },
+        });
+        const before = structuredClone(run);
+        const effects = setup(run);
+        const response = await effects.post(action);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: 'codex_only_resume_unsupported' });
+        expect(mockContinuationGetRun).toHaveBeenCalledTimes(1);
+        expectNoContinuation(effects);
+        expect(run).toEqual(before);
+        expect(Object.hasOwn(run.metadata, 'codex_only_dispatch')).toBe(true);
+      });
+    }
+    test('refuses named reserved ' + action + ' with missing marker', async () => {
+      const run = makeRun({ workflow_name: reserved });
+      const before = structuredClone(run);
+      const effects = setup(run);
+      const response = await effects.post(action);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'codex_only_resume_unsupported' });
+      expectNoContinuation(effects);
+      expect(run).toEqual(before);
+    });
+    test('preserves missing-run404 for ' + action, async () => {
+      const effects = setup(null);
+      const response = await effects.post(action);
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: 'Workflow run not found' });
+      expectNoContinuation(effects);
+    });
+    test('preserves lookup-error500 for ' + action + ' without replacement', async () => {
+      const effects = setup(null);
+      mockContinuationGetRun.mockImplementation(async () => {
+        throw new Error('owned lookup failure');
+      });
+      expect((await effects.post(action)).status).toBe(500);
+      expectNoContinuation(effects);
+    });
+  }
+
+  for (const status of ['failed', 'waiting_provider', 'completed'] as const) {
+    test('refuses restricted approve ' + status + ' before idempotent success', async () => {
+      const run = makeRun({
+        status,
+        metadata: {
+          codex_only_dispatch: false,
+          approval_response: 'approved',
+          approval: { nodeId: 'gate', type: 'interactive_loop' },
+        },
+      });
+      const before = structuredClone(run);
+      const effects = setup(run);
+      const response = await effects.post('approve');
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'codex_only_resume_unsupported' });
+      expectNoContinuation(effects);
+      expect(run).toEqual(before);
+    });
+  }
+
+  test('preserves ordinary operator-pause activation and event', async () => {
+    const effects = setup(makeRun());
+    expect((await effects.post('resume')).status).toBe(200);
+    expect(mockContinuationResume).toHaveBeenCalledWith('owned-memory-run');
+    expect(mockContinuationEvent).toHaveBeenCalledWith({
+      workflow_run_id: 'owned-memory-run',
+      event_type: 'run_resumed',
+      data: { actor: 'operator' },
+    });
+    expect(mockContinuationExecute).not.toHaveBeenCalled();
+  });
+  test('preserves ordinary failed-run readiness without writes', async () => {
+    const effects = setup(makeRun({ status: 'failed', metadata: {} }));
+    const response = await effects.post('resume');
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { message: string }).message).toContain('ready to resume');
+    expectNoContinuation(effects);
+  });
+  for (const type of ['approval', 'interactive_loop']) {
+    test('preserves ordinary ' + type + ' persistence', async () => {
+      const effects = setup(
+        makeRun({
+          parent_conversation_id: null,
+          metadata: { approval: { nodeId: 'gate', message: 'fixture', type } },
+        })
+      );
+      expect((await effects.post('approve')).status).toBe(200);
+      expect(mockContinuationUpdate).toHaveBeenCalledWith('owned-memory-run', {
+        status: 'failed',
+        metadata:
+          type === 'interactive_loop'
+            ? { loop_user_input: 'Approved' }
+            : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 },
+      });
+      expect(mockContinuationEvent).toHaveBeenCalledTimes(type === 'interactive_loop' ? 1 : 2);
+      expect(mockContinuationGetConversation).not.toHaveBeenCalled();
+      expect(mockContinuationExecute).not.toHaveBeenCalled();
+    });
+  }
+  test('preserves ordinary already-approved idempotent response', async () => {
+    const effects = setup(
+      makeRun({ status: 'failed', metadata: { approval_response: 'approved' } })
+    );
+    const response = await effects.post('approve');
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { message: string }).message).toContain('already approved');
+    expectNoContinuation(effects);
+  });
+  test('keeps explicit abandonment available for a restricted run', async () => {
+    const effects = setup(
+      makeRun({
+        workflow_name: reserved,
+        metadata: { codex_only_dispatch: { version: 'codex-only-v2' } },
+      })
+    );
+    expect((await effects.post('abandon')).status).toBe(200);
+    expect(mockContinuationCancel).toHaveBeenCalledWith('owned-memory-run');
+    expect(mockContinuationUpdate).not.toHaveBeenCalled();
+    expect(mockContinuationEvent).not.toHaveBeenCalled();
+    expect(mockContinuationExecute).not.toHaveBeenCalled();
   });
 });
