@@ -14,6 +14,7 @@ import {
   checksAreTerminal,
   evaluatePullRequest,
   parseReviewVerdict,
+  partitionChecksByRequired,
   runReviewModelProcess,
   DEFAULT_CURSOR_JUDGE_MODEL,
   type PrReviewDeps,
@@ -209,7 +210,7 @@ describe('governed PR-code reviewer', () => {
       deps({
         fetchEvidence: async () => ({
           diff: '+ change',
-          checks: [{ name: 'unit', status: 'completed', conclusion: 'failure' }],
+          checks: [{ name: 'test', status: 'completed', conclusion: 'failure' }],
         }),
         invokeModel: async (_binary, value) => {
           prompt = value;
@@ -235,7 +236,7 @@ describe('governed PR-code reviewer', () => {
     const prompt = buildReviewPrompt({
       request: input,
       diff: '+ code',
-      checks: [],
+      checkPartition: partitionChecksByRequired([], []),
       acceptanceCriteria: 'must pass',
     });
     expect(prompt).toContain('code diff');
