@@ -947,15 +947,22 @@ serviceSuite('service', () => {
   });
 });
 
+// A cold SQLite schema plus durable service writes took 40s in Windows CI.
+// Match the package script's bounded integration budget for directory invocations.
 if (!invokedDirectly) {
   test('service suite passes with isolated database state', () => {
-    const child = Bun.spawnSync(['bun', 'test', import.meta.path, '--timeout', '30000'], {
-      cwd: process.cwd(),
-      env: process.env,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const child = Bun.spawnSync(
+      [process.execPath, 'test', import.meta.path, '--timeout', '90000'],
+      {
+        cwd: process.cwd(),
+        env: process.env,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 600_000,
+        killSignal: 'SIGKILL',
+      }
+    );
     const output = new TextDecoder().decode(child.stdout) + new TextDecoder().decode(child.stderr);
     expect(child.exitCode, output).toBe(0);
-  });
+  }, 610_000);
 }
