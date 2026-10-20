@@ -273,6 +273,8 @@ describe('duty officer judge', () => {
     delete process.env.OPENROUTER_API_KEY;
     delete process.env.GLM_API_KEY;
     delete process.env.XAI_API_KEY;
+    process.env.GLM_API_KEY = 'glm-only';
+    process.env.XAI_API_KEY = 'xai-only';
     const caseB = countingFetch();
     const verdictB = await judgeDutyOfficerItem(message(), {
       fetchImpl: caseB.fetchImpl,
@@ -285,6 +287,20 @@ describe('duty officer judge', () => {
     expect(verdictB.action).not.toBe('escalate_xo');
     expect(verdictB.action).not.toBe('nudge');
     expect(verdictB.status).not.toBe('ok');
+  });
+
+  test('default ladder still accepts GLM_API_KEY without OPENROUTER_API_KEY', async () => {
+    process.env.DUTY_OFFICER_JUDGE_ENABLED = 'true';
+    process.env.GLM_API_KEY = 'glm-test';
+    const { fetchImpl, urls } = countingFetch(() =>
+      openRouterVerdict('hold', 'glm default', 'park')
+    );
+    const verdict = await judgeDutyOfficerItem(message(), { fetchImpl });
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain('openrouter.ai');
+    expect(verdict.status).toBe('ok');
+    expect(verdict.action).toBe('hold');
+    expect(verdict.transport).toContain('openrouter:');
   });
 
   test('claude_path_does_not_use_xai', async () => {

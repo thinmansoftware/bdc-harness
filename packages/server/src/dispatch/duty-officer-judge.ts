@@ -70,6 +70,16 @@ function openRouterKey(): string | null {
   return token ? token : null;
 }
 
+/**
+ * Claude-path fallback credential. OPENROUTER_API_KEY only.
+ * GLM_API_KEY still feeds the default ladder via openRouterKey(); it must not
+ * authorize a paid fallback after a Claude failure.
+ */
+function claudeFallbackOpenRouterKey(): string | null {
+  const token = process.env.OPENROUTER_API_KEY?.trim();
+  return token ? token : null;
+}
+
 function xaiKey(): string | null {
   const token = process.env.XAI_API_KEY?.trim();
   return token ? token : null;
@@ -331,6 +341,7 @@ export async function judgeDutyOfficerItem(
   const timeoutMs = Math.max(5_000, Number(process.env.DUTY_OFFICER_JUDGE_TIMEOUT_MS) || 45_000);
   const failures: { transport: string; error: string }[] = [];
   const orKey = openRouterKey();
+  const claudeOrKey = claudeFallbackOpenRouterKey();
   const xKey = xaiKey();
   if (process.env.DUTY_OFFICER_JUDGE_ENABLED !== 'true') {
     return unconfigured('judge_disabled', failures);
@@ -358,7 +369,7 @@ export async function judgeDutyOfficerItem(
           timeoutMs,
         }),
     });
-    if (orKey) rungs.push(openRouterRung(orKey, userPrompt, fetchImpl, timeoutMs));
+    if (claudeOrKey) rungs.push(openRouterRung(claudeOrKey, userPrompt, fetchImpl, timeoutMs));
   } else {
     if (orKey) rungs.push(openRouterRung(orKey, userPrompt, fetchImpl, timeoutMs));
     if (xKey) rungs.push(xaiRung(xKey, userPrompt, fetchImpl, timeoutMs));
