@@ -6,7 +6,9 @@
  * unconfigured deployment must have NO endpoint rather than an endpoint that
  * accepts unverified input, so these tests pin that behavior.
  */
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
+import * as laneRegistry from '@archon/core/db/lane-pr-registry';
+import type { LanePr } from '@archon/core/db/lane-pr-registry';
 import {
   createRealSubmitDeps,
   isExactHeadCiGreen,
@@ -486,5 +488,70 @@ describe('parseReviewWorkBody', () => {
     expect(parsed?.baseRef).toBe('');
     expect(parsed?.author).toBe('');
     expect(parsed?.headCiGreen).toBe(false);
+  });
+});
+
+describe('resolveLaneRepairContext head race', () => {
+  const reviewed = 'a'.repeat(40);
+  const moved = 'b'.repeat(40);
+
+  function lane(headSha: string): LanePr {
+    return {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 42,
+      headRef: 'feat/wo-harness-pr-repair-owner-and-dedupe-01',
+      headSha,
+      state: 'OPEN',
+      reviewDecision: 'CHANGES_REQUESTED',
+      createdAt: '2026-10-20T00:00:00Z',
+      runId: 'run-1',
+      workflowName: 'bdc-feature-development',
+    };
+  }
+
+  test('returns null when the live head moved during review', async () => {
+    const spy = spyOn(laneRegistry, 'attributeLanePr').mockResolvedValue({
+      woId: 'WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01',
+      lane: lane(moved),
+    });
+    try {
+      const deps = createRealSubmitDeps('review-app[bot]', { octokit: submitOctokit() });
+      if (!deps.resolveLaneRepairContext) throw new Error('lane repair context must be wired');
+      const context = await deps.resolveLaneRepairContext({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 42,
+        headSha: reviewed,
+      });
+      expect(context).toBeNull();
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('returns the lane context when the live head still matches the reviewed SHA', async () => {
+    const spy = spyOn(laneRegistry, 'attributeLanePr').mockResolvedValue({
+      woId: 'WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01',
+      lane: lane(reviewed),
+    });
+    try {
+      const deps = createRealSubmitDeps('review-app[bot]', { octokit: submitOctokit() });
+      if (!deps.resolveLaneRepairContext) throw new Error('lane repair context must be wired');
+      const context = await deps.resolveLaneRepairContext({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 42,
+        headSha: reviewed,
+      });
+      expect(context).toEqual({
+        woId: 'WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01',
+        headRef: 'feat/wo-harness-pr-repair-owner-and-dedupe-01',
+        workflowName: 'bdc-feature-development',
+      });
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

@@ -15,6 +15,7 @@ import {
   type LanePr,
   type LanePrGithubInfo,
   type LanePrRegistryDb,
+  type UnresolvedLanePrGroup,
   type WoWithMultipleLanePrs,
 } from '@archon/core/db/lane-pr-registry';
 import {
@@ -96,6 +97,7 @@ interface Recorder {
 interface HarnessConfig {
   dupeWos?: WoWithMultipleLanePrs[];
   laneByWo?: Record<string, LanePr[]>;
+  unresolvedByWo?: Record<string, UnresolvedLanePrGroup[]>;
   queued?: Array<Pick<PrRepairQueuedMessage, 'id' | 'body'> & Partial<PrRepairQueuedMessage>>;
   running?: Set<string>;
   cascadeId?: string;
@@ -150,7 +152,10 @@ function makeDeps(config: HarnessConfig): { deps: PrRepairOwnerDeps; rec: Record
       groups: config.dupeWos ?? [],
       unresolved: [],
     }),
-    listLanePrsForWo: async woId => laneByWo[woId] ?? [],
+    listLanePrsForWo: async woId => ({
+      prs: laneByWo[woId] ?? [],
+      unresolved: config.unresolvedByWo?.[woId] ?? [],
+    }),
     listQueuedTaskmasterMessages: async () =>
       messages.filter(m => !m.addressed).map(m => ({ ...m })),
     acknowledgeRow: async id => {
@@ -723,7 +728,7 @@ describe('runPrRepairOwner', () => {
 
   test('Test 5: human_prs_untouched', async () => {
     const woId = 'WO-XO-CE-HEALTH-DIGEST-01';
-    // No PR is lane-created: listLanePrsForWo returns [] and there are no dupe WOs.
+    // No PR is lane-created: listLanePrsForWo returns no PRs and there are no dupe WOs.
     const { deps, rec } = makeDeps({
       laneByWo: { [woId]: [] },
       queued: [
@@ -1045,6 +1050,137 @@ describe('runPrRepairOwner', () => {
     } finally {
       sqlite.close();
     }
+  });
+
+  test('an unresolved sibling repository does not block a healthy repository repair', async () => {
+    const woId = 'WO-HARNESS-REPO-ISO-01';
+    const healthy = lanePr({
+      repo: 'shopops',
+      prNumber: 301,
+      headSha: 'sha-301',
+      headRef: 'feat/wo-harness-repo-iso-01-thread-301',
+    });
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: [healthy] },
+      unresolvedByWo: {
+        [woId]: [
+          {
+            woId,
+            owner: 'thinmansoftware',
+            repo: 'bdc-xo',
+            prNumber: 101,
+            error: 'github_transient_failure',
+          },
+        ],
+      },
+      queued: [
+        {
+          id: 'row-healthy',
+          body: candidateBody({
+            repo: 'shopops',
+            prNumber: 301,
+            headSha: 'sha-301',
+            woId,
+            headRef: healthy.headRef,
+          }),
+        },
+      ],
+    });
+
+    const result = await runPrRepairOwner(deps);
+
+    expect(rec.fired).toHaveLength(1);
+    expect(rec.fired[0]?.repair.prNumber).toBe(301);
+    expect(rec.fired[0]?.project).toBe('shopops');
+    expect(result.repairsFired).toBe(1);
+    expect(rec.addressed).toHaveLength(0);
+  });
+
+  test('an unresolved candidate repository stays queued', async () => {
+    const woId = 'WO-HARNESS-REPO-ISO-01';
+    const sibling = lanePr({
+      repo: 'shopops',
+      prNumber: 301,
+      headSha: 'sha-301',
+      headRef: 'feat/wo-harness-repo-iso-01-thread-301',
+    });
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: [sibling] },
+      unresolvedByWo: {
+        [woId]: [
+          {
+            woId,
+            owner: 'thinmansoftware',
+            repo: 'bdc-xo',
+            prNumber: 102,
+            error: 'github_transient_failure',
+          },
+        ],
+      },
+      queued: [
+        {
+          id: 'row-blocked',
+          body: candidateBody({
+            repo: 'bdc-xo',
+            prNumber: 102,
+            headSha: 'sha-102',
+            woId,
+            headRef: 'feat/wo-harness-repo-iso-01-thread-102',
+          }),
+        },
+      ],
+    });
+
+    const result = await runPrRepairOwner(deps);
+
+    expect(rec.fired).toHaveLength(0);
+    expect(result.repairsFired).toBe(0);
+    expect(rec.acknowledged).toHaveLength(0);
+    expect(rec.addressed).toHaveLength(0);
+  });
+
+  test('a later unresolved read of the candidate repository withholds the repair', async () => {
+    const woId = 'WO-XO-CE-HEALTH-DIGEST-01';
+    const pr = lanePr({ prNumber: 3171, headSha: 'head-3171' });
+    const { deps, rec } = makeDeps({
+      laneByWo: { [woId]: [pr] },
+      queued: [
+        {
+          id: 'row-late',
+          body: candidateBody({
+            prNumber: 3171,
+            headSha: 'head-3171',
+            woId,
+            headRef: pr.headRef,
+          }),
+        },
+      ],
+    });
+    let calls = 0;
+    deps.listLanePrsForWo = async () => {
+      calls += 1;
+      if (calls === 1) return { prs: [pr], unresolved: [] };
+      return {
+        prs: [],
+        unresolved: [
+          {
+            woId,
+            owner: pr.owner,
+            repo: pr.repo,
+            prNumber: pr.prNumber,
+            error: 'github_transient_failure',
+          },
+        ],
+      };
+    };
+
+    const result = await runPrRepairOwner(deps);
+
+    expect(calls).toBe(2);
+    expect(rec.fired).toHaveLength(0);
+    expect(result.repairsFired).toBe(0);
+    expect(rec.acknowledged).toHaveLength(0);
+    expect(rec.addressed).toHaveLength(0);
   });
 });
 

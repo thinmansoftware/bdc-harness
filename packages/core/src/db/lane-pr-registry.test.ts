@@ -19,23 +19,24 @@ import {
 const WO_DIGEST = 'WO-XO-CE-HEALTH-DIGEST-01';
 const WO_TRIAL = 'WO-SHOPOPS-OWNER-ALERT-TRIAL-STATE-01';
 
-test('registry propagates an attributed PR lookup failure', async () => {
+test('a failed repository group is unresolved and does not reject the call', async () => {
   const { db, sqlite } = makeDb();
   seedE1E2(sqlite);
   try {
-    let failure: unknown;
-    try {
-      await listLanePrsForWo(WO_DIGEST, {
-        db,
-        fetchPr: async () => {
-          throw new Error('github_unavailable');
-        },
-      });
-    } catch (error) {
-      failure = error;
-    }
-    expect(failure).toBeInstanceOf(Error);
-    expect((failure as Error).message).toBe('github_unavailable');
+    const result = await listLanePrsForWo(WO_DIGEST, {
+      db,
+      fetchPr: async () => {
+        throw new Error('github_unavailable');
+      },
+    });
+    expect(result.prs).toEqual([]);
+    expect(result.unresolved).toHaveLength(1);
+    expect(result.unresolved[0]).toMatchObject({
+      woId: WO_DIGEST,
+      owner: 'thinmansoftware',
+      repo: 'bdc-xo',
+      error: 'github_unavailable',
+    });
   } finally {
     sqlite.close();
   }
@@ -249,10 +250,10 @@ describe('lane-pr-registry', () => {
     const fetchPr = digestFetcher();
     const now = (): number => Date.parse('2026-10-14T12:00:00Z');
 
-    const digest = await listLanePrsForWo(WO_DIGEST, { db, fetchPr, now });
+    const digest = (await listLanePrsForWo(WO_DIGEST, { db, fetchPr, now })).prs;
     expect(digest.map(p => p.prNumber).sort((a, b) => a - b)).toEqual([3170, 3171, 3172]);
 
-    const trial = await listLanePrsForWo(WO_TRIAL, { db, fetchPr, now });
+    const trial = (await listLanePrsForWo(WO_TRIAL, { db, fetchPr, now })).prs;
     expect(trial.map(p => p.prNumber).sort((a, b) => a - b)).toEqual([870, 871]);
 
     // Exclusions: the decoy 31700 and the older PR never appear.
@@ -289,11 +290,13 @@ describe('lane-pr-registry', () => {
         { headRepoFullName: 'someforker/bdc-xo' }
       ),
     });
-    const result = await listLanePrsForWo(WO_DIGEST, {
-      db,
-      fetchPr,
-      now: () => Date.parse('2026-10-14T12:00:00Z'),
-    });
+    const result = (
+      await listLanePrsForWo(WO_DIGEST, {
+        db,
+        fetchPr,
+        now: () => Date.parse('2026-10-14T12:00:00Z'),
+      })
+    ).prs;
     expect(result).toHaveLength(0);
   });
 
@@ -320,11 +323,13 @@ describe('lane-pr-registry', () => {
         { headRepoFullName: null }
       ),
     });
-    const result = await listLanePrsForWo(WO_DIGEST, {
-      db,
-      fetchPr,
-      now: () => Date.parse('2026-10-14T12:00:00Z'),
-    });
+    const result = (
+      await listLanePrsForWo(WO_DIGEST, {
+        db,
+        fetchPr,
+        now: () => Date.parse('2026-10-14T12:00:00Z'),
+      })
+    ).prs;
     expect(result).toHaveLength(0);
   });
 
@@ -351,11 +356,13 @@ describe('lane-pr-registry', () => {
         { headRepoFullName: 'ThinmanSoftware/BDC-XO' }
       ),
     });
-    const result = await listLanePrsForWo(WO_DIGEST, {
-      db,
-      fetchPr,
-      now: () => Date.parse('2026-10-14T12:00:00Z'),
-    });
+    const result = (
+      await listLanePrsForWo(WO_DIGEST, {
+        db,
+        fetchPr,
+        now: () => Date.parse('2026-10-14T12:00:00Z'),
+      })
+    ).prs;
     expect(result).toHaveLength(1);
   });
 
@@ -381,11 +388,13 @@ describe('lane-pr-registry', () => {
         '2026-10-14T01:50:00Z'
       ),
     });
-    const result = await listLanePrsForWo(WO_DIGEST, {
-      db,
-      fetchPr,
-      now: () => Date.parse('2026-10-14T12:00:00Z'),
-    });
+    const result = (
+      await listLanePrsForWo(WO_DIGEST, {
+        db,
+        fetchPr,
+        now: () => Date.parse('2026-10-14T12:00:00Z'),
+      })
+    ).prs;
     expect(result).toHaveLength(0);
   });
 
@@ -515,6 +524,63 @@ describe('lane-pr-registry', () => {
       expect(result.unresolved).toEqual([
         {
           woId: woA,
+          owner: 'thinmansoftware',
+          repo: 'bdc-xo',
+          prNumber: 101,
+          error: 'github_transient_failure',
+        },
+      ]);
+    } finally {
+      sqlite.close();
+    }
+  });
+
+  test('listLanePrsForWo keeps a healthy repository when a sibling repository lookup throws', async () => {
+    const { db, sqlite } = makeDb();
+    const now = (): number => Date.parse('2026-10-14T12:00:00Z');
+    seedRun(sqlite, {
+      id: 'run-same-wo',
+      workflow: 'bdc-feature-development',
+      woId: WO_DIGEST,
+      startedAt: '2026-10-14T01:00:00Z',
+      completedAt: '2026-10-14T02:00:00Z',
+    });
+    seedEvent(
+      sqlite,
+      'run-same-wo',
+      'implement',
+      'https://github.com/thinmansoftware/bdc-xo/pull/101'
+    );
+    seedEvent(
+      sqlite,
+      'run-same-wo',
+      'open-pr-if-needed',
+      'https://github.com/thinmansoftware/shopops/pull/201'
+    );
+    const healthy = shopopsPr(
+      201,
+      'feat/wo-xo-ce-health-digest-01-thread-201',
+      '2026-10-14T01:20:00Z'
+    );
+    healthy.title = `Implement ${WO_DIGEST}`;
+    healthy.body = `Closes ${WO_DIGEST}.`;
+    try {
+      const result = await listLanePrsForWo(WO_DIGEST, {
+        db,
+        now,
+        fetchPr: async (owner, repo, prNumber) => {
+          if (owner === 'thinmansoftware' && repo === 'bdc-xo' && prNumber === 101) {
+            throw new Error('github_transient_failure');
+          }
+          if (owner === 'thinmansoftware' && repo === 'shopops' && prNumber === 201) return healthy;
+          return null;
+        },
+      });
+      expect(result.prs.map(pr => pr.prNumber)).toEqual([201]);
+      expect(result.prs[0]?.repo).toBe('shopops');
+      expect(result.unresolved).toEqual([
+        {
+          woId: WO_DIGEST,
           owner: 'thinmansoftware',
           repo: 'bdc-xo',
           prNumber: 101,

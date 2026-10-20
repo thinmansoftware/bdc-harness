@@ -1196,7 +1196,10 @@ export function createRealSubmitDeps(
      * Structural lane-repair proof: one targeted event-store read
      * (attributeLanePr) plus one GitHub PR read. Returns {woId, headRef,
      * workflowName} only when the LANE PR RULE proves this PR was built by the
-     * lane for that WO; null otherwise (a human PR, a fork, or the spec branch).
+     * lane for that WO AND the attributed live head SHA still equals the
+     * reviewed SHA. A head that moved during review returns null so a stale
+     * candidate cannot consume a permanent attempt slot. Null also covers a
+     * human PR, a fork, or the spec branch.
      */
     async resolveLaneRepairContext(input): Promise<{
       woId: string;
@@ -1246,6 +1249,10 @@ export function createRealSubmitDeps(
           { fetchPr }
         );
         if (!attribution) return null;
+        // The attribution read is live. The review examined input.headSha.
+        // Emitting against a head that has since moved spends an attempt slot
+        // the owner will only refuse later.
+        if (attribution.lane.headSha !== input.headSha) return null;
         return {
           woId: attribution.woId,
           headRef: attribution.lane.headRef,

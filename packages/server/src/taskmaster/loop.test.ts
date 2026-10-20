@@ -4959,7 +4959,7 @@ describe('production repair-owner GitHub fetcher', () => {
         fetchPr: fetcher,
         canApplyEffect: async () => true,
         listWosWithMultipleLanePrs: opts => listWosWithMultipleLanePrs({ ...opts, db }),
-        listLanePrsForWo: async () => [],
+        listLanePrsForWo: async () => ({ prs: [], unresolved: [] }),
         listQueuedTaskmasterMessages: async () => [exhausted],
         acknowledgeRow: async () => undefined,
         addressRow: async () => undefined,

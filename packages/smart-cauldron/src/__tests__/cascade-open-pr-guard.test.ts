@@ -40,7 +40,7 @@ test('production registry fetch errors retry once and refuse the climb', async (
   }) as typeof import('@archon/git').execFileAsync;
   const spy = spyOn(registry, 'listLanePrsForWo').mockImplementation(async (_woId, options) => {
     await options.fetchPr('thinmansoftware', 'bdc-xo', 55);
-    return [];
+    return { prs: [], unresolved: [] };
   });
   try {
     let failure: unknown;

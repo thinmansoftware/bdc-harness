@@ -35,6 +35,7 @@ import type { DispatchMessage } from '@archon/core/db/dispatch';
 import type {
   LanePr,
   LanePrFetcher,
+  ListLanePrsForWoResult,
   ListWosWithMultipleLanePrsResult,
 } from '@archon/core/db/lane-pr-registry';
 
@@ -141,11 +142,14 @@ export interface PrRepairOwnerDeps {
     withinHours?: number;
     now?: () => number;
   }) => Promise<ListWosWithMultipleLanePrsResult>;
-  /** Every lane-created PR for one WO. */
+  /**
+   * Every lane-created PR for one WO, plus repository groups whose lookup
+   * failed. A failed group is absent from `prs`.
+   */
   listLanePrsForWo: (
     woId: string,
     opts: { fetchPr: LanePrFetcher; now?: () => number }
-  ) => Promise<LanePr[]>;
+  ) => Promise<ListLanePrsForWoResult>;
   /** Queued lane_repair candidate + exhausted rows addressed to Taskmaster. */
   listQueuedTaskmasterMessages: () => Promise<PrRepairQueuedMessage[]>;
   /** Acknowledge a queued row as 'taskmaster'. */
@@ -455,28 +459,57 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
   // (2) REPAIR -- at most MAX_REPAIR_FIRES_PER_TICK fires this tick -------------
   let repairsFired = 0;
   let admissionAttempts = 0;
+  // Null means withhold: the row stays queued. A thrown lookup, or an
+  // unresolved group for THIS repository, is not a not-lane refusal. An
+  // unresolved sibling repository does not withhold this candidate.
+  const loadLanePrs = async (
+    woId: string,
+    owner: string,
+    repo: string,
+    prNumber: number
+  ): Promise<LanePr[] | null> => {
+    let listed: ListLanePrsForWoResult;
+    try {
+      listed = await deps.listLanePrsForWo(woId, { fetchPr: deps.fetchPr, now });
+    } catch (error) {
+      log('pr_repair.lane_lookup_failed', {
+        woId,
+        owner,
+        repo,
+        prNumber,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+    const repoKey = `${owner}/${repo}`.toLowerCase();
+    const blocked = listed.unresolved.find(
+      group => `${group.owner}/${group.repo}`.toLowerCase() === repoKey
+    );
+    if (blocked) {
+      log('pr_repair.lane_lookup_failed', {
+        woId,
+        owner,
+        repo,
+        prNumber,
+        error: blocked.error,
+      });
+      return null;
+    }
+    return listed.prs;
+  };
   for (const { id, candidate } of candidates) {
     if (admissionAttempts >= MAX_REPAIR_FIRES_PER_TICK) break;
     if (!(await deps.canApplyEffect())) break;
 
     // Re-prove the LANE PR RULE: the PR must still be lane-created for this WO.
-    // A lookup failure leaves the row queued. It is not a not-lane refusal.
-    let lanePrs: LanePr[];
-    try {
-      lanePrs = await deps.listLanePrsForWo(candidate.woId, {
-        fetchPr: deps.fetchPr,
-        now,
-      });
-    } catch (error) {
-      log('pr_repair.lane_lookup_failed', {
-        woId: candidate.woId,
-        owner: candidate.owner,
-        repo: candidate.repo,
-        prNumber: candidate.prNumber,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      continue;
-    }
+    // A lookup failure for this repository leaves the row queued.
+    const lanePrs = await loadLanePrs(
+      candidate.woId,
+      candidate.owner,
+      candidate.repo,
+      candidate.prNumber
+    );
+    if (!lanePrs) continue;
     // Match the full repository slug (case-insensitive) AND the PR number:
     // identical PR numbers for the same WO can exist across repositories, so
     // matching prNumber alone could select and repair the wrong PR.
@@ -537,19 +570,13 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     // same collapse-first rule. Re-read after closes: failed or unsafe closes
     // never authorize a repair over another OPEN claimant.
     await closePlan(candidate.woId, plan);
-    let afterDedupe: LanePr[];
-    try {
-      afterDedupe = await deps.listLanePrsForWo(candidate.woId, { fetchPr: deps.fetchPr, now });
-    } catch (error) {
-      log('pr_repair.lane_lookup_failed', {
-        woId: candidate.woId,
-        owner: candidate.owner,
-        repo: candidate.repo,
-        prNumber: candidate.prNumber,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      continue;
-    }
+    const afterDedupe = await loadLanePrs(
+      candidate.woId,
+      candidate.owner,
+      candidate.repo,
+      candidate.prNumber
+    );
+    if (!afterDedupe) continue;
     const otherOpen = afterDedupe.some(
       pr =>
         pr.state === 'OPEN' &&

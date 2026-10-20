@@ -109,9 +109,9 @@ export interface WoWithMultipleLanePrs {
 }
 
 /**
- * A WO+repository whose lane-PR lookup threw. Dedupe must not act on a partial
- * set for this group. `error` is the normalized message only; callers that must
- * rethrow keep the original thrown value separately.
+ * A WO+repository whose lane-PR lookup threw. Dedupe and repair must not treat
+ * a missing PR in this group as proof it is not lane-created. `error` is the
+ * normalized message only.
  */
 export interface UnresolvedLanePrGroup {
   woId: string;
@@ -127,12 +127,20 @@ export interface ListWosWithMultipleLanePrsResult {
   unresolved: UnresolvedLanePrGroup[];
 }
 
-/** Internal resolution: public metadata plus the original thrown values. */
+/**
+ * Lane PRs proven for one WO, plus the WO+repository lookups that failed.
+ * A failed repository is omitted from `prs`. A healthy repository for the
+ * same WO stays in `prs`. The call itself does not throw for a group failure.
+ */
+export interface ListLanePrsForWoResult {
+  prs: LanePr[];
+  unresolved: UnresolvedLanePrGroup[];
+}
+
+/** Internal resolution shared by the single-WO and multi-WO queries. */
 interface LanePrResolution {
   prs: LanePr[];
   unresolved: UnresolvedLanePrGroup[];
-  /** Encounter order. listLanePrsForWo rethrows the first value unchanged. */
-  thrown: unknown[];
 }
 
 const WINDOW_SLACK_MS = 60_000;
@@ -403,7 +411,6 @@ async function resolveLanePrs(
     prs.push(...lanes);
   }
   const unresolved: UnresolvedLanePrGroup[] = [];
-  const thrown: unknown[] = [];
   for (const failure of failed.values()) {
     unresolved.push({
       woId,
@@ -412,18 +419,22 @@ async function resolveLanePrs(
       prNumber: failure.citation.prNumber,
       error: errorMessage(failure.error),
     });
-    thrown.push(failure.error);
   }
-  return { prs, unresolved, thrown };
+  return { prs, unresolved };
 }
 
 /**
- * Every PR provably lane-created for WO `woId`. Read-only; GitHub facts come
- * from the injected fetcher. Fail-closed: if any WO+repository lookup throws,
- * the original error is rethrown and no partial list is returned.
+ * Every PR provably lane-created for WO `woId`, plus any WO+repository whose
+ * lookup threw. Read-only; GitHub facts come from the injected fetcher. A
+ * failed repository is omitted from `prs` (no partial set for that group). A
+ * healthy repository for the same WO stays in `prs`. One failed lookup does
+ * not reject the call.
  */
-export async function listLanePrsForWo(woId: string, opts: ListLanePrsOptions): Promise<LanePr[]> {
-  if (!woId) return [];
+export async function listLanePrsForWo(
+  woId: string,
+  opts: ListLanePrsOptions
+): Promise<ListLanePrsForWoResult> {
+  if (!woId) return { prs: [], unresolved: [] };
   const db = opts.db ?? getDatabase();
   const nowMs = (opts.now ?? Date.now)();
   const eventTypes = LANE_EVENT_TYPES.map(t => `'${t}'`).join(', ');
@@ -440,10 +451,7 @@ export async function listLanePrsForWo(woId: string, opts: ListLanePrsOptions): 
   );
   const citations = collectCitations(result.rows, woId);
   const resolved = await resolveLanePrs(citations, woId, opts.fetchPr, nowMs);
-  if (resolved.thrown.length > 0) {
-    throw resolved.thrown[0];
-  }
-  return resolved.prs;
+  return { prs: resolved.prs, unresolved: resolved.unresolved };
 }
 
 /**

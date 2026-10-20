@@ -237,7 +237,14 @@ export function createDefaultOpenPrGuardLookup(
       attemptRunIds,
     }): Promise<{ owner: string; repo: string; prNumber: number }[]> {
       if (attemptRunIds.length === 0) return [];
-      const lanePrs = await listLanePrsForWo(woId, { fetchPr });
+      const listed = await listLanePrsForWo(woId, { fetchPr });
+      // The climb guard still fails closed when any repository group is
+      // unreadable. The repair owner is the caller that withholds only the
+      // failed group; climbing over an unreadable PR would hide a blocker.
+      if (listed.unresolved.length > 0) {
+        throw new Error(listed.unresolved[0]?.error || 'lane_pr_lookup_failed');
+      }
+      const lanePrs = listed.prs;
       const runIds = new Set(attemptRunIds);
       return lanePrs
         .filter(pr => runIds.has(pr.runId))
