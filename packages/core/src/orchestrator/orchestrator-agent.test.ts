@@ -137,10 +137,11 @@ mock.module('../workflows/store-adapter', () => ({
 
 const mockGetPausedWorkflowRun = mock(() => Promise.resolve(null as unknown));
 const mockFindResumableRunByParentConversation = mock(() => Promise.resolve(null as unknown));
+const mockNaturalApprovalUpdate = mock(() => Promise.resolve());
 mock.module('../db/workflows', () => ({
   getPausedWorkflowRun: mockGetPausedWorkflowRun,
   findResumableRunByParentConversation: mockFindResumableRunByParentConversation,
-  updateWorkflowRun: mock(() => Promise.resolve()),
+  updateWorkflowRun: mockNaturalApprovalUpdate,
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
@@ -1378,6 +1379,7 @@ describe('natural-language approval routing', () => {
     mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(null));
     mockCreateWorkflowEvent.mockReset();
     mockCreateWorkflowEvent.mockImplementation(() => Promise.resolve());
+    mockNaturalApprovalUpdate.mockClear();
     mockGetOrCreateConversation.mockReset();
     mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
     mockGetCodebase.mockReset();
@@ -1405,6 +1407,22 @@ describe('natural-language approval routing', () => {
 
     // Approval events should be written
     expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(2);
+    expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(1, {
+      workflow_run_id: 'run-1',
+      event_type: 'node_completed',
+      step_name: 'gate-1',
+      data: { node_output: '', approval_decision: 'approved' },
+    });
+    expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(2, {
+      workflow_run_id: 'run-1',
+      event_type: 'approval_received',
+      step_name: 'gate-1',
+      data: { decision: 'approved', comment: 'looks good, proceed with implementation' },
+    });
+    expect(mockNaturalApprovalUpdate).toHaveBeenCalledWith('run-1', {
+      status: 'failed',
+      metadata: { approval_response: 'approved', rejection_reason: '', rejection_count: 0 },
+    });
     // Resuming message sent
     expect(platform.sendMessage).toHaveBeenCalledWith(
       'conv-1',
@@ -1506,6 +1524,181 @@ describe('natural-language approval routing', () => {
       'conv-1',
       expect.stringContaining('Approval failed')
     );
+  });
+
+  describe('binding-v2 natural-language continuation closed gate', () => {
+    const reserved = 'bdc-feature-development-codex-only';
+    const refusal = 'Codex-only continuation is not available; the paused run was left unchanged.';
+
+    function prepare(run: ReturnType<typeof makePausedRun>) {
+      const conversation = makeConversation({ codebase_id: 'codebase-1', cwd: '/repos/test-repo' });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(run));
+      mockGetCodebase.mockImplementation(() => Promise.resolve(makeApprovalCodebase()));
+      mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+        Promise.resolve({
+          workflows: [{ workflow: approvalWorkflow }],
+          errors: [],
+        })
+      );
+      for (const effect of [
+        mockNaturalApprovalUpdate,
+        mockCreateWorkflowEvent,
+        mockGetCodebase,
+        mockListCodebases,
+        mockDiscoverWorkflowsWithConfig,
+        mockSyncWorkspace,
+        mockValidateAndResolveIsolation,
+        mockLaunchSession,
+        mockFindResumableRunByParentConversation,
+        mockExecuteWorkflow,
+        mockDispatchBackgroundWorkflow,
+        mockSendQuery,
+        mockHandleCommand,
+        mockUpdateConversation,
+      ])
+        effect.mockClear();
+      return { conversation, platform: makePlatform() };
+    }
+
+    function expectNoApprovalWork() {
+      for (const effect of [
+        mockNaturalApprovalUpdate,
+        mockCreateWorkflowEvent,
+        mockGetCodebase,
+        mockListCodebases,
+        mockDiscoverWorkflowsWithConfig,
+        mockSyncWorkspace,
+        mockValidateAndResolveIsolation,
+        mockLaunchSession,
+        mockFindResumableRunByParentConversation,
+        mockExecuteWorkflow,
+        mockDispatchBackgroundWorkflow,
+        mockSendQuery,
+        mockHandleCommand,
+        mockUpdateConversation,
+      ])
+        expect(effect).not.toHaveBeenCalled();
+    }
+
+    for (const kind of ['standard', 'interactive_loop'] as const) {
+      for (const [label, marker] of [
+        ['null', null],
+        ['undefined', undefined],
+        ['false', false],
+        ['corrupt', 'corrupt'],
+        ['v1', { version: 'codex-only-v1' }],
+        ['v2', { version: 'codex-only-v2' }],
+        ['unknown', { version: 'codex-only-v999' }],
+      ] as const) {
+        test(
+          'refuses ' + kind + ' with own ' + label + ' marker before approval work',
+          async () => {
+            const run = makePausedRun({
+              metadata: {
+                approval: { nodeId: 'gate-1', type: kind },
+                codex_only_dispatch: marker,
+              },
+            });
+            const before = structuredClone(run);
+            const { platform } = prepare(run);
+            await handleMessage(platform, 'conv-1', 'owned synthetic approval');
+            expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+            expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+            expect(run).toEqual(before);
+            expectNoApprovalWork();
+          }
+        );
+      }
+      test('refuses ' + kind + ' reserved name without marker before approval work', async () => {
+        const run = makePausedRun({
+          workflow_name: reserved,
+          metadata: { approval: { nodeId: 'gate-1', type: kind } },
+        });
+        const before = structuredClone(run);
+        const { platform } = prepare(run);
+        await handleMessage(platform, 'conv-1', 'owned synthetic approval');
+        expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+        expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+        expect(run).toEqual(before);
+        expectNoApprovalWork();
+      });
+    }
+
+    for (const [label, extra] of [
+      ['missing approval', { metadata: { codex_only_dispatch: null } }],
+      ['corrupt approval', { metadata: { codex_only_dispatch: false, approval: 'bad' } }],
+      ['reserved null metadata', { workflow_name: reserved, metadata: null }],
+    ] as const) {
+      test('refuses restricted ' + label + ' without suggesting a resume bypass', async () => {
+        const run = makePausedRun(extra);
+        const before = structuredClone(run);
+        const { platform } = prepare(run);
+        await handleMessage(platform, 'conv-1', 'owned synthetic approval');
+        expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+        expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+        expect(run).toEqual(before);
+        expectNoApprovalWork();
+      });
+    }
+
+    test('failed refusal notification performs no approval or fallback work', async () => {
+      const run = makePausedRun({ workflow_name: reserved });
+      const before = structuredClone(run);
+      const { platform } = prepare(run);
+      platform.sendMessage = mock(() => Promise.resolve());
+      (platform.sendMessage as ReturnType<typeof mock>).mockRejectedValueOnce(
+        new Error('owned notification failure')
+      );
+      await handleMessage(platform, 'conv-1', 'owned synthetic approval');
+      expect(platform.sendMessage).toHaveBeenCalledTimes(2);
+      expect(platform.sendMessage).toHaveBeenNthCalledWith(1, 'conv-1', refusal);
+      expect(platform.sendMessage).toHaveBeenNthCalledWith(
+        2,
+        'conv-1',
+        'Error: owned notification failure'
+      );
+      expect(run).toEqual(before);
+      expectNoApprovalWork();
+    });
+
+    test('ordinary interactive loop retains input event update and dispatch', async () => {
+      const run = makePausedRun({
+        metadata: { approval: { nodeId: 'loop-1', type: 'interactive_loop' } },
+      });
+      const { platform } = prepare(run);
+      await handleMessage(platform, 'conv-1', 'owned next loop input');
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(1);
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
+        workflow_run_id: 'run-1',
+        event_type: 'approval_received',
+        step_name: 'loop-1',
+        data: { decision: 'approved', comment: 'owned next loop input' },
+      });
+      expect(mockNaturalApprovalUpdate).toHaveBeenCalledTimes(1);
+      expect(mockNaturalApprovalUpdate).toHaveBeenCalledWith('run-1', {
+        status: 'failed',
+        metadata: { loop_user_input: 'owned next loop input' },
+      });
+      expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    });
+
+    test('explicit cancel command bypasses NL interception without asserting real cancellation', async () => {
+      const run = makePausedRun({ workflow_name: reserved });
+      const { platform, conversation } = prepare(run);
+      mockGetPausedWorkflowRun.mockReset();
+      mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(null));
+      mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['cancel', 'run-1'] });
+      mockHandleCommand.mockReturnValueOnce(
+        Promise.resolve({ success: true, message: 'owned cancel requested', workflow: undefined })
+      );
+      await handleMessage(platform, 'conv-1', '/workflow cancel run-1');
+      expect(mockGetPausedWorkflowRun).not.toHaveBeenCalled();
+      expect(mockHandleCommand).toHaveBeenCalledWith(conversation, '/workflow cancel run-1');
+      expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+      expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    });
   });
 });
 

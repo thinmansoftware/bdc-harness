@@ -650,6 +650,16 @@ export async function handleMessage(
     if (!message.startsWith('/')) {
       const pausedRun = await workflowDb.getPausedWorkflowRun(conversation.id);
       if (pausedRun) {
+        if (
+          pausedRun.workflow_name === 'bdc-feature-development-codex-only' ||
+          Object.prototype.hasOwnProperty.call(pausedRun.metadata ?? {}, 'codex_only_dispatch')
+        ) {
+          await platform.sendMessage(
+            conversationId,
+            'Codex-only continuation is not available; the paused run was left unchanged.'
+          );
+          return;
+        }
         const approvalRaw = pausedRun.metadata.approval;
         const hasValidApproval =
           approvalRaw != null &&
