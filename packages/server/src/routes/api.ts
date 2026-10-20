@@ -3368,6 +3368,7 @@ export function registerApiRoutes(
     run: WorkflowRun,
     action: 'approve' | 'reject' | 'provider_wait'
   ): Promise<boolean> {
+    if (isCodexOnlyContinuation(run)) return false;
     if (!run.parent_conversation_id) return false;
     if (!run.conversation_id || !run.working_path) return false;
     // Literal event names per action -- greppable for ops tooling. Keeping the

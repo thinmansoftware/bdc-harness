@@ -1,4 +1,6 @@
-import { describe, test, expect, mock } from 'bun:test';
+import { describe, test, expect, mock, spyOn } from 'bun:test';
+import * as providerWaitScheduler from '@archon/workflows/reliability/wait-scheduler';
+import type { IWorkflowStore } from '@archon/workflows/store';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -138,7 +140,27 @@ mock.module('@archon/core/db/codebases', () => ({
   getCodebase: mockAdmissionCodebase,
 }));
 
-import { registerApiRoutes } from './api';
+const mockWaitTaskmasterStart = mock(() => {});
+const mockWaitDeadmanStart = mock(() => {});
+const mockWaitInboxStart = mock(() => {});
+const mockWaitConsumerStart = mock(() => {});
+mock.module('../taskmaster/loop', () => ({
+  startTaskmaster: mockWaitTaskmasterStart,
+  getTaskmasterRuntime: mock(() => null),
+  getTickHealth: mock(() => 'test'),
+}));
+mock.module('@archon/overseer/taskmaster-deadman-check', () => ({
+  startTaskmasterDeadmanChecker: mockWaitDeadmanStart,
+}));
+mock.module('../dispatch/operator-inbox-consumer', () => ({
+  startOperatorInboxConsumer: mockWaitConsumerStart,
+}));
+mock.module('../dispatch/inbox-reader', () => ({
+  startInboxReader: mockWaitInboxStart,
+  shouldStartOperatorInboxConsumer: mock(() => false),
+}));
+
+import { registerApiRoutes, stopProviderWaitScheduler } from './api';
 
 const MOCK_CONV = {
   id: 'internal-uuid-123',
@@ -1558,5 +1580,299 @@ describe('binding-v2 API continuation closed gate', () => {
       expect((await effects.post('reject')).status).toBe(500);
       expectNoContinuation(effects);
     });
+  });
+});
+
+describe('restricted provider-wait registered timer', () => {
+  const realProcessDueProviderWaits = providerWaitScheduler.processDueProviderWaits;
+  const reserved = 'bdc-feature-development-codex-only';
+
+  async function runRegisteredTick(
+    run: WorkflowRun,
+    mode: 'normal' | 'cancel-before' | 'cancel-after' | 'release-fails' = 'normal'
+  ) {
+    const before = structuredClone(run);
+    const oldNodeEnv = process.env.NODE_ENV;
+    const oldInterval = process.env.ARCHON_PROVIDER_WAIT_POLL_INTERVAL_MS;
+    const oldGetConversation = mockContinuationGetConversation.getMockImplementation();
+    const oldExecute = mockContinuationExecute.getMockImplementation();
+    const oldDeps = mockContinuationDeps.getMockImplementation();
+    const oldLane = mockContinuationLane.getMockImplementation();
+    const oldDiscovery = mockDiscoverWorkflowsWithConfig.getMockImplementation();
+    const promises: ReturnType<typeof realProcessDueProviderWaits>[] = [];
+    const timer = { unref: mock(() => {}) };
+    const mapping = mock(() => {});
+    const bridge = mock(() => () => {});
+    let statusReads = 0;
+    const wait = {
+      state: 'scheduled' as 'scheduled' | 'claimed' | 'completed' | 'cancelled',
+      claimToken: null as string | null,
+      ownerId: null as string | null,
+      resumeAt: null as string | null,
+    };
+    const store = {
+      listDueProviderWaits: mock(async () => [{ waitId: 'owned-wait', runId: run.id }]),
+      getWorkflowRunStatus: mock(async () => {
+        statusReads += 1;
+        return mode === 'cancel-before' || (mode === 'cancel-after' && statusReads > 1)
+          ? 'cancelled'
+          : 'waiting_provider';
+      }),
+      claimProviderWait: mock(async (data: Parameters<IWorkflowStore['claimProviderWait']>[0]) => {
+        if (data.waitId !== 'owned-wait' || wait.state !== 'scheduled') return false;
+        wait.state = 'claimed';
+        wait.claimToken = data.claimToken;
+        wait.ownerId = data.ownerId;
+        return true;
+      }),
+      getWorkflowRun: mock(async () => run),
+      completeProviderWait: mock(
+        async (data: Parameters<IWorkflowStore['completeProviderWait']>[0]) => {
+          if (
+            data.waitId !== 'owned-wait' ||
+            wait.state !== 'claimed' ||
+            data.claimToken !== wait.claimToken
+          )
+            return false;
+          wait.state = 'completed';
+          return true;
+        }
+      ),
+      releaseProviderWaitClaim: mock(
+        async (data: Parameters<NonNullable<IWorkflowStore['releaseProviderWaitClaim']>>[0]) => {
+          // Model cancellation winning after the callback but before release CAS.
+          if (mode === 'release-fails') wait.state = 'cancelled';
+          if (
+            data.waitId !== 'owned-wait' ||
+            wait.state !== 'claimed' ||
+            data.claimToken !== wait.claimToken
+          )
+            return false;
+          wait.state = 'scheduled';
+          wait.resumeAt = data.resumeAt;
+          wait.claimToken = null;
+          wait.ownerId = null;
+          return true;
+        }
+      ),
+      cancelProviderWaits: mock(async () => {
+        wait.state = 'cancelled';
+        return 1;
+      }),
+    };
+    for (const effect of [
+      mockContinuationGetConversation,
+      mockContinuationExecute,
+      mockContinuationDeps,
+      mockContinuationLane,
+      mockWaitTaskmasterStart,
+      mockWaitDeadmanStart,
+      mockWaitInboxStart,
+      mockWaitConsumerStart,
+    ])
+      effect.mockClear();
+    mockContinuationGetConversation.mockImplementation(async id => ({
+      id,
+      platform_type: 'web',
+      platform_conversation_id: 'web-' + id,
+    }));
+    mockContinuationDeps.mockImplementation(() => ({ store: store as unknown as IWorkflowStore }));
+    mockContinuationLane.mockImplementation(async request => request.workflowName);
+    // Only the final executor boundary is stubbed. The registered callback,
+    // shared helper and scheduler below all execute their actual source.
+    mockContinuationExecute.mockImplementation(async () => ({
+      success: false,
+      error: 'codex_only_resume_unsupported',
+    }));
+    if (
+      !Object.hasOwn(run.metadata ?? {}, 'codex_only_dispatch') &&
+      run.workflow_name !== reserved
+    ) {
+      mockContinuationExecute.mockImplementation(async () => ({ success: true }));
+    }
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockImplementation(async () => ({
+      workflows: [
+        {
+          workflow: {
+            name: run.workflow_name,
+            description: 'Owned provider-wait fixture',
+            nodes: [{ id: 'fixture', prompt: 'owned fixture' }],
+          },
+          source: 'project' as const,
+        },
+      ],
+      errors: [],
+    }));
+    stopProviderWaitScheduler();
+    const intervalSpy = spyOn(globalThis, 'setInterval').mockImplementation(
+      (() => timer) as unknown as typeof setInterval
+    );
+    const clearSpy = spyOn(globalThis, 'clearInterval').mockImplementation(() => {});
+    const schedulerSpy = spyOn(providerWaitScheduler, 'processDueProviderWaits').mockImplementation(
+      (...args: Parameters<typeof realProcessDueProviderWaits>) => {
+        const promise = realProcessDueProviderWaits(...args);
+        promises.push(promise);
+        return promise;
+      }
+    );
+    try {
+      process.env.NODE_ENV = 'provider-wait-hermetic-test';
+      process.env.ARCHON_PROVIDER_WAIT_POLL_INTERVAL_MS = '15000';
+      const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+      registerApiRoutes(
+        app,
+        {
+          setConversationDbId: mapping,
+          setupEventBridge: bridge,
+        } as unknown as WebAdapter,
+        {} as ConversationLockManager
+      );
+      expect(intervalSpy).toHaveBeenCalledTimes(1);
+      expect(timer.unref).toHaveBeenCalledTimes(1);
+      expect(promises).toHaveLength(1);
+      let result;
+      if (mode === 'release-fails') {
+        await expect(promises[0]).rejects.toThrow('provider_wait_resume_not_dispatched: ' + run.id);
+      } else {
+        result = await promises[0];
+      }
+      expect(run).toEqual(before);
+      expect(mockWaitTaskmasterStart).toHaveBeenCalledTimes(1);
+      expect(mockWaitDeadmanStart).toHaveBeenCalledTimes(1);
+      expect(mockWaitInboxStart).toHaveBeenCalledTimes(1);
+      expect(mockWaitConsumerStart).not.toHaveBeenCalled();
+      return { store, wait, result, mapping, bridge };
+    } finally {
+      await Promise.allSettled(promises);
+      stopProviderWaitScheduler();
+      schedulerSpy.mockRestore();
+      clearSpy.mockRestore();
+      intervalSpy.mockRestore();
+      if (oldNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = oldNodeEnv;
+      if (oldInterval === undefined) delete process.env.ARCHON_PROVIDER_WAIT_POLL_INTERVAL_MS;
+      else process.env.ARCHON_PROVIDER_WAIT_POLL_INTERVAL_MS = oldInterval;
+      if (oldGetConversation)
+        mockContinuationGetConversation.mockImplementation(oldGetConversation);
+      if (oldExecute) mockContinuationExecute.mockImplementation(oldExecute);
+      if (oldDeps) mockContinuationDeps.mockImplementation(oldDeps);
+      if (oldLane) mockContinuationLane.mockImplementation(oldLane);
+      if (oldDiscovery) mockDiscoverWorkflowsWithConfig.mockImplementation(oldDiscovery);
+    }
+  }
+
+  function makeWaitRun(extra: Partial<WorkflowRun> = {}): WorkflowRun {
+    return {
+      id: 'owned-provider-wait-run',
+      workflow_name: 'ordinary-wait-workflow',
+      status: 'waiting_provider',
+      parent_conversation_id: 'owned-wait-parent',
+      conversation_id: 'owned-wait-worker',
+      working_path: '/tmp/owned-provider-wait',
+      metadata: {},
+      ...extra,
+    } as WorkflowRun;
+  }
+
+  function expectRefused(effects: Awaited<ReturnType<typeof runRegisteredTick>>) {
+    expect(effects.store.completeProviderWait).not.toHaveBeenCalled();
+    expect(effects.store.releaseProviderWaitClaim).toHaveBeenCalledTimes(1);
+    expect(effects.store.releaseProviderWaitClaim).toHaveBeenCalledWith({
+      waitId: 'owned-wait',
+      claimToken: expect.any(String),
+      resumeAt: expect.any(String),
+    });
+    expect(effects.store.cancelProviderWaits).not.toHaveBeenCalled();
+    expect(effects.store.getWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(mockContinuationDeps).toHaveBeenCalledTimes(1);
+    for (const effect of [
+      mockContinuationGetConversation,
+      mockContinuationExecute,
+      mockContinuationLane,
+      mockDiscoverWorkflowsWithConfig,
+      effects.mapping,
+      effects.bridge,
+    ])
+      expect(effect).not.toHaveBeenCalled();
+  }
+
+  for (const [label, marker] of [
+    ['null', null],
+    ['undefined', undefined],
+    ['false', false],
+    ['corrupt', 'corrupt'],
+    ['v1', { version: 'codex-only-v1' }],
+    ['v2', { version: 'codex-only-v2' }],
+    ['unknown', { version: 'codex-only-v999' }],
+  ] as const) {
+    test('defers own ' + label + ' marker before resume effects', async () => {
+      const effects = await runRegisteredTick(
+        makeWaitRun({ metadata: { codex_only_dispatch: marker } })
+      );
+      expect(effects.result).toEqual({ due: 1, resumed: 0, cancelled: 0, deferred: 1 });
+      expect(effects.wait).toEqual({
+        state: 'scheduled',
+        claimToken: null,
+        ownerId: null,
+        resumeAt: expect.any(String),
+      });
+      expectRefused(effects);
+    });
+  }
+
+  test('defers reserved name without marker before resume effects', async () => {
+    const effects = await runRegisteredTick(makeWaitRun({ workflow_name: reserved }));
+    expect(effects.result).toEqual({ due: 1, resumed: 0, cancelled: 0, deferred: 1 });
+    expect(effects.wait.state).toBe('scheduled');
+    expect(effects.wait.claimToken).toBeNull();
+    expect(effects.wait.ownerId).toBeNull();
+    expectRefused(effects);
+  });
+
+  test('preserves ordinary eligible provider-wait completion', async () => {
+    const effects = await runRegisteredTick(makeWaitRun());
+    expect(effects.result).toEqual({ due: 1, resumed: 1, cancelled: 0, deferred: 0 });
+    expect(effects.wait.state).toBe('completed');
+    expect(effects.store.completeProviderWait).toHaveBeenCalledTimes(1);
+    expect(effects.store.releaseProviderWaitClaim).not.toHaveBeenCalled();
+    expect(mockContinuationExecute).toHaveBeenCalledTimes(1);
+    expect(mockContinuationDeps).toHaveBeenCalledTimes(2);
+    expect(effects.mapping).toHaveBeenCalledTimes(1);
+    expect(effects.bridge).toHaveBeenCalledTimes(1);
+  });
+
+  test('preserves ordinary missing-parent defer', async () => {
+    const effects = await runRegisteredTick(makeWaitRun({ parent_conversation_id: null }));
+    expect(effects.result).toEqual({ due: 1, resumed: 0, cancelled: 0, deferred: 1 });
+    expectRefused(effects);
+  });
+
+  for (const mode of ['cancel-before', 'cancel-after'] as const) {
+    test('preserves ' + mode + ' claim cancellation', async () => {
+      const effects = await runRegisteredTick(makeWaitRun({ workflow_name: reserved }), mode);
+      expect(effects.result).toEqual({ due: 1, resumed: 0, cancelled: 1, deferred: 0 });
+      expect(effects.wait.state).toBe('cancelled');
+      expect(effects.store.cancelProviderWaits).toHaveBeenCalledTimes(1);
+      expect(effects.store.claimProviderWait).toHaveBeenCalledTimes(
+        mode === 'cancel-before' ? 0 : 1
+      );
+      expect(effects.store.getWorkflowRun).not.toHaveBeenCalled();
+      expect(effects.store.releaseProviderWaitClaim).not.toHaveBeenCalled();
+      expect(effects.store.completeProviderWait).not.toHaveBeenCalled();
+      expect(mockContinuationExecute).not.toHaveBeenCalled();
+      expect(effects.mapping).not.toHaveBeenCalled();
+      expect(effects.bridge).not.toHaveBeenCalled();
+    });
+  }
+
+  test('retains refusal when claim release fails without false completion', async () => {
+    const effects = await runRegisteredTick(
+      makeWaitRun({ workflow_name: reserved }),
+      'release-fails'
+    );
+    expect(effects.result).toBeUndefined();
+    expect(effects.wait.state).toBe('cancelled');
+    expectRefused(effects);
   });
 });
