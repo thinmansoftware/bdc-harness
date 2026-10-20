@@ -278,6 +278,18 @@ function extractRepairTargetSelection(): string {
 
 const REPAIR_TARGET_SELECTION = extractRepairTargetSelection();
 
+function extractCleanPushSelection(yaml: string): string {
+  const source = yaml.replace(/\r\n/g, '\n');
+  const nodeStart = source.indexOf('  - id: commit-and-push\n');
+  const start = source.indexOf('      git status --short\n', nodeStart);
+  const end = source.indexOf(
+    '      else\n        # Dirty working tree: stage + validate against plan + commit',
+    start
+  );
+  if (nodeStart < 0 || start < 0 || end < 0) throw new Error('clean push anchors missing');
+  return `set -euo pipefail\n${source.slice(start, end).replace(/^      /gm, '')}fi\necho "SELECTED_TARGET=$UNIQUE_BRANCH"\n`;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -473,6 +485,62 @@ describe('F-6A: BRANCH allowlist regex validator', () => {
 });
 
 describe('F-7C: remote-search fallback when origin ref is missing', () => {
+  for (const lane of REPAIR_COVERAGE_LANES) {
+    it(`preserves the authorized repair target through zero-ahead recovery (${basename(lane)})`, () => {
+      writeFileSync(join(worktreeDir, 'repair.txt'), 'already committed repair\n');
+      git(['add', 'repair.txt'], worktreeDir);
+      git(['commit', '-m', 'repair'], worktreeDir);
+      const target = 'feat/zzz-thread-target';
+      git(['push', 'origin', `HEAD:${target}`], worktreeDir);
+      git(['push', 'origin', 'HEAD:feat/aaa-thread-unrelated'], worktreeDir);
+      const result = bash(extractCleanPushSelection(readFileSync(lane, 'utf8')), worktreeDir, {
+        UNIQUE_BRANCH: target,
+        REPAIR_TARGET_PR: '826',
+        REPAIR_TARGET_BRANCH: target,
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(result.stdout).toContain(`SELECTED_TARGET=${target}`);
+      expect(result.stdout).not.toContain('Recovered push target from remote:');
+    }, 30_000);
+  }
+
+  it('retains ordinary same-SHA recovery in the actual clean push path', () => {
+    writeFileSync(join(worktreeDir, 'ordinary.txt'), 'ordinary change\n');
+    git(['add', 'ordinary.txt'], worktreeDir);
+    git(['commit', '-m', 'ordinary'], worktreeDir);
+    git(['push', 'origin', 'HEAD:feat/aaa-thread-existing'], worktreeDir);
+    const result = bash(
+      extractCleanPushSelection(readFileSync(REPAIR_COVERAGE_LANES[0], 'utf8')),
+      worktreeDir,
+      {
+        UNIQUE_BRANCH: 'feat/missing-thread-target',
+        REPAIR_TARGET_PR: '',
+      }
+    );
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stdout).toContain('SELECTED_TARGET=feat/aaa-thread-existing');
+  }, 30_000);
+
+  it('retains ordinary no-work refusal when no remote ref matches the ancestor HEAD', () => {
+    const original = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+    writeFileSync(join(worktreeDir, 'remote-ahead.txt'), 'remote ahead\n');
+    git(['add', 'remote-ahead.txt'], worktreeDir);
+    git(['commit', '-m', 'remote ahead'], worktreeDir);
+    git(['push', 'origin', 'main'], worktreeDir);
+    git(['reset', '--hard', original], worktreeDir);
+    const result = bash(
+      extractCleanPushSelection(readFileSync(REPAIR_COVERAGE_LANES[0], 'utf8')),
+      worktreeDir,
+      {
+        UNIQUE_BRANCH: 'feat/missing-thread-target',
+        REPAIR_TARGET_PR: '',
+      }
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('implement loop did not produce work');
+    expect(result.stdout).not.toContain('SELECTED_TARGET=');
+  }, 30_000);
+
   it('Test 2: recovers UNIQUE_BRANCH from origin when ls-remote HEAD matches local HEAD', () => {
     // Simulate the failure mode: the agent's work was committed and pushed to
     // origin under a different branch (archon/thread-abc123) than the target
