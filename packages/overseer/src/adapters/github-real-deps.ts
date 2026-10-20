@@ -265,7 +265,15 @@ export interface RealGitHubOctokitLike {
   checks: {
     listForRef(input: Record<string, unknown>): Promise<{
       data: {
-        check_runs: { name?: string; status: string; conclusion: string | null }[];
+        check_runs: {
+          name?: string;
+          status: string;
+          conclusion: string | null;
+          id?: number;
+          started_at?: string | null;
+          completed_at?: string | null;
+          app?: { slug?: string; name?: string } | null;
+        }[];
       };
     }>;
   };
@@ -372,7 +380,15 @@ export type BoundReposMethodName = (typeof BOUND_REPOS_METHODS)[number] &
 
 export interface ExactHeadPullRequestEvidence {
   diff: string;
-  checks: { name: string; status: string; conclusion: string | null }[];
+  checks: {
+    name: string;
+    status: string;
+    conclusion: string | null;
+    id?: number;
+    started_at?: string | null;
+    completed_at?: string | null;
+    app?: { slug?: string; name?: string };
+  }[];
   /**
    * Required status-check contexts enforced on the PR's base branch.
    *
@@ -532,10 +548,18 @@ export function createRealFetchExactHeadPullRequestEvidence(
       diff: (comparison.data.files ?? [])
         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
         .join('\n'),
+      // Carry the attempt fields (id, started_at, completed_at, app) through so
+      // the verdict path can collapse superseded reruns to the latest attempt per
+      // check (WO-HARNESS-OVERSEER-GRADE-REQUIRED-CHECKS-01). name/status/
+      // conclusion are unchanged.
       checks: checkRuns.data.check_runs.map((run, index) => ({
         name: run.name?.trim() || `check-${index + 1}`,
         status: run.status,
         conclusion: run.conclusion,
+        id: run.id,
+        started_at: run.started_at,
+        completed_at: run.completed_at,
+        app: run.app ? { slug: run.app.slug, name: run.app.name } : undefined,
       })),
       requiredContexts,
     };

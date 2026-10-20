@@ -2,6 +2,7 @@ import type { IndependentReviewFinding, ReviewAgentIdentity } from './independen
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
 import { classifyJudgeOutage, type JudgeOutage } from './judge-ladder-health';
+import { conclusionIsPassing, latestAttemptPerCheck } from './pr-review-check-ingest';
 import { createLogger } from '@archon/paths';
 import {
   buildJudgeTransport,
@@ -90,6 +91,17 @@ export interface PrReviewCheck {
   name: string;
   status: string;
   conclusion: string | null;
+  /**
+   * Optional check-run attempt fields (#WO-HARNESS-OVERSEER-GRADE-REQUIRED-CHECKS-01).
+   * Carried from `checks.listForRef` so the verdict path can collapse superseded
+   * reruns to the single latest attempt (completed_at, else started_at, tie by
+   * id; key = name plus app) via `latestAttemptPerCheck`. Optional so existing
+   * evidence doubles that emit only name/status/conclusion keep compiling.
+   */
+  id?: number;
+  started_at?: string | null;
+  completed_at?: string | null;
+  app?: { slug?: string; name?: string };
 }
 
 export interface PrReviewResult {
@@ -171,7 +183,7 @@ export interface PrReviewDeps {
 }
 
 interface ParsedReviewVerdict {
-  verdict: Exclude<PrReviewVerdict, 'INDETERMINATE' | 'CHECKS_PENDING' | 'CHECKS_UNAVAILABLE'>;
+  verdict: 'APPROVE' | 'REQUEST_CHANGES';
   findings: IndependentReviewFinding[];
   reviewed_head_sha: string;
 }
@@ -229,10 +241,63 @@ export function parseReviewVerdict(stdout: string): ParsedReviewVerdict | null {
   }
 }
 
+/**
+ * A PR's checks split into the set that gates the verdict (required status-check
+ * contexts on the base branch) and the rest (informational only), each reduced
+ * to the latest attempt per check. See `partitionChecksByRequired`.
+ */
+export interface ChecksPartition {
+  gating: PrReviewCheck[];
+  nonRequired: PrReviewCheck[];
+}
+
+const CHECKS_SCOPE_PREFIX = 'checks/';
+
+/** Trimmed, case-insensitive key -- the same equality `checksAreTerminal` uses. */
+function normalizeCheckName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+/**
+ * Split the latest attempt per check into the gating set (its name matches a
+ * required status-check context on the base branch) and the rest.
+ *
+ * The verdict is gated ONLY by the gating set. Attempts are collapsed with the
+ * EXISTING ranking (`latestAttemptPerCheck`: completed_at, else started_at, tie
+ * by id; key = name plus app) so a failed attempt superseded by a passing rerun
+ * of the same check at the same head is represented by the passing attempt.
+ *
+ * When `requiredContexts` is `undefined` or empty, every check is `gating` --
+ * exactly today's behavior (every check gates). `null` (UNKNOWN) never reaches
+ * this path in the verdict flow: `checksAreTerminal` defers on it; it is treated
+ * here like `undefined` for defensiveness.
+ */
+export function partitionChecksByRequired(
+  checks: PrReviewCheck[],
+  requiredContexts?: readonly string[] | null
+): ChecksPartition {
+  const latest = latestAttemptPerCheck(checks);
+  if (
+    requiredContexts === undefined ||
+    requiredContexts === null ||
+    requiredContexts.length === 0
+  ) {
+    return { gating: latest, nonRequired: [] };
+  }
+  const required = new Set(requiredContexts.map(normalizeCheckName));
+  const gating: PrReviewCheck[] = [];
+  const nonRequired: PrReviewCheck[] = [];
+  for (const check of latest) {
+    if (required.has(normalizeCheckName(check.name))) gating.push(check);
+    else nonRequired.push(check);
+  }
+  return { gating, nonRequired };
+}
+
 export function buildReviewPrompt(input: {
   request: PrReviewInput;
   diff: string;
-  checks: PrReviewCheck[];
+  partition: ChecksPartition;
   acceptanceCriteria: string | null;
 }): string {
   return [
@@ -241,17 +306,144 @@ export function buildReviewPrompt(input: {
     'Report blocking issues as severity blocker or major. Advisory issues use minor or note.',
     'Return only one JSON object with this exact shape:',
     '{"verdict":"APPROVE|REQUEST_CHANGES","findings":[{"scope":"non-empty","severity":"blocker|major|minor|note","summary":"non-empty"}],"reviewed_head_sha":"exact input SHA"}',
-    'Use REQUEST_CHANGES only with at least one blocker or major finding. Never approve when checks fail or a stated acceptance criterion is unmet.',
+    'Use REQUEST_CHANGES only with at least one blocker or major finding. Do not approve when a REQUIRED check fails or a stated acceptance criterion is unmet.',
     '',
     `Repository: ${input.request.owner}/${input.request.repo}`,
     `Pull request: ${input.request.pr_number}`,
     `Exact head SHA: ${input.request.head_sha}`,
     `Work order: ${input.request.wo_id ?? 'unavailable'}`,
     `Acceptance criteria: ${input.acceptanceCriteria ?? 'unavailable; evaluate diff and checks only'}`,
-    `Checks: ${JSON.stringify(input.checks)}`,
+    `Required checks (these gate the verdict): ${JSON.stringify(input.partition.gating)}`,
+    `Non-required checks (informational only; report a failure as severity note, never blocker or major): ${JSON.stringify(input.partition.nonRequired)}`,
     'Diff:',
     input.diff,
   ].join('\n');
+}
+
+/** The check name a `checks/<name>` finding scope refers to, or null for a code finding. */
+function checkNameFromScope(scope: string): string | null {
+  const trimmed = scope.trim();
+  if (!trimmed.toLowerCase().startsWith(CHECKS_SCOPE_PREFIX)) return null;
+  const name = trimmed.slice(CHECKS_SCOPE_PREFIX.length).trim();
+  return name.length > 0 ? name : null;
+}
+
+/**
+ * A latest attempt is a PASS when it completed with a passing conclusion
+ * (`conclusionIsPassing`: success, neutral, skipped) and a FAILURE when it
+ * completed with anything else. At gate time every reported check is completed
+ * (`checksAreTerminal` already held), so these are exhaustive and mutually
+ * exclusive for checks in the partition.
+ */
+function checkPassed(check: PrReviewCheck): boolean {
+  return check.status === 'completed' && conclusionIsPassing(check.conclusion);
+}
+function checkFailed(check: PrReviewCheck): boolean {
+  return check.status === 'completed' && !conclusionIsPassing(check.conclusion);
+}
+
+function nonRequiredNoteFinding(name: string): IndependentReviewFinding {
+  return {
+    scope: `${CHECKS_SCOPE_PREFIX}${name}`,
+    severity: 'note',
+    summary: `Check ${name} is not a required check on the base branch; its failure is non-blocking.`,
+  };
+}
+
+function hasChecksFindingFor(findings: readonly IndependentReviewFinding[], name: string): boolean {
+  const key = normalizeCheckName(name);
+  return findings.some(finding => {
+    const scoped = checkNameFromScope(finding.scope);
+    return scoped !== null && normalizeCheckName(scoped) === key;
+  });
+}
+
+function isBlocking(finding: IndependentReviewFinding): boolean {
+  return finding.severity === 'blocker' || finding.severity === 'major';
+}
+
+/**
+ * The verdict is gated ONLY by the required status-check contexts, judged on the
+ * latest attempt per check. Deterministic, pure, and idempotent: applying it
+ * twice yields the same result as once.
+ *
+ * Rules (WO-HARNESS-OVERSEER-GRADE-REQUIRED-CHECKS-01):
+ * - A `checks/<name>` model finding whose matching latest attempt PASSED (a
+ *   superseded attempt, or a check now green) is removed.
+ * - A `checks/<name>` model finding matching a NON-required failing check is
+ *   downgraded to a non-blocking `note`.
+ * - A `checks/<name>` model finding matching a REQUIRED failing check (or naming
+ *   no check present in the partition) is kept as the model wrote it.
+ * - Each REQUIRED failure forces REQUEST_CHANGES; if no blocker/major finding
+ *   survives, a synthetic `major checks/<name>` is added so the block is visible.
+ * - Each NON-required failure gets a `note checks/<name>` if one is not present.
+ * - A code finding (scope not starting with `checks/`) is never touched.
+ * - REQUEST_CHANGES with no blocker/major remaining becomes APPROVE.
+ */
+export function applyRequiredCheckGate(
+  parsed: { verdict: 'APPROVE' | 'REQUEST_CHANGES'; findings: IndependentReviewFinding[] },
+  partition: ChecksPartition
+): { verdict: 'APPROVE' | 'REQUEST_CHANGES'; findings: IndependentReviewFinding[] } {
+  const gatingByName = new Map<string, PrReviewCheck>();
+  for (const check of partition.gating) gatingByName.set(normalizeCheckName(check.name), check);
+  const nonRequiredByName = new Map<string, PrReviewCheck>();
+  for (const check of partition.nonRequired) {
+    nonRequiredByName.set(normalizeCheckName(check.name), check);
+  }
+
+  const requiredFailureNames = partition.gating.filter(checkFailed).map(check => check.name);
+  const nonRequiredFailureNames = partition.nonRequired
+    .filter(checkFailed)
+    .map(check => check.name);
+
+  const findings: IndependentReviewFinding[] = [];
+
+  // 1. Transform the model's findings against the actual latest-attempt states.
+  for (const finding of parsed.findings) {
+    const name = checkNameFromScope(finding.scope);
+    if (name === null) {
+      findings.push(finding); // CODE finding -- never touched.
+      continue;
+    }
+    const key = normalizeCheckName(name);
+    const gatingCheck = gatingByName.get(key);
+    const nonRequiredCheck = nonRequiredByName.get(key);
+    const matched = gatingCheck ?? nonRequiredCheck;
+    if (matched && checkPassed(matched)) {
+      continue; // Superseded / now-green check -- drop the finding.
+    }
+    if (nonRequiredCheck && checkFailed(nonRequiredCheck)) {
+      findings.push(nonRequiredNoteFinding(nonRequiredCheck.name)); // Downgrade to note.
+      continue;
+    }
+    findings.push(finding); // Required failure, or a check not in the partition -- keep as-is.
+  }
+
+  // 2. Every non-required failure must appear as a non-blocking note.
+  for (const name of nonRequiredFailureNames) {
+    if (!hasChecksFindingFor(findings, name)) findings.push(nonRequiredNoteFinding(name));
+  }
+
+  // 3. A red required check always blocks. Force REQUEST_CHANGES, and if nothing
+  //    blocking survives, name each required failure with a synthetic major.
+  let verdict: 'APPROVE' | 'REQUEST_CHANGES' = parsed.verdict;
+  if (requiredFailureNames.length > 0) {
+    verdict = 'REQUEST_CHANGES';
+    if (!findings.some(isBlocking)) {
+      for (const name of requiredFailureNames) {
+        findings.push({
+          scope: `${CHECKS_SCOPE_PREFIX}${name}`,
+          severity: 'major',
+          summary: `Required check ${name} failed on the base branch and blocks the verdict.`,
+        });
+      }
+    }
+  }
+
+  // 4. REQUEST_CHANGES with no blocker/major left becomes APPROVE.
+  if (verdict === 'REQUEST_CHANGES' && !findings.some(isBlocking)) verdict = 'APPROVE';
+
+  return { verdict, findings };
 }
 
 function indeterminate(
@@ -514,10 +706,11 @@ export async function evaluatePullRequest(
     }
   }
   const acceptanceCriteriaAvailable = nonEmpty(acceptanceCriteria);
+  const partition = partitionChecksByRequired(evidence.checks, evidence.requiredContexts);
   const prompt = buildReviewPrompt({
     request: input,
     diff: evidence.diff,
-    checks: evidence.checks,
+    partition,
     acceptanceCriteria,
   });
   const ladder = deps.ladder ?? defaultReviewLadder();
@@ -604,8 +797,17 @@ export async function evaluatePullRequest(
         return indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch');
       }
       getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_verdict_produced');
+      // DETERMINISTIC REQUIRED-CHECK GATE. The model's verdict is gated by the
+      // base branch's required status-check contexts (judged on the latest
+      // attempt per check); non-required failures become non-blocking notes.
+      const gated = applyRequiredCheckGate(
+        { verdict: parsed.verdict, findings: parsed.findings },
+        partition
+      );
       return {
-        ...parsed,
+        verdict: gated.verdict,
+        findings: gated.findings,
+        reviewed_head_sha: parsed.reviewed_head_sha,
         reviewer: { provider: deps.reviewer.provider, model: binary },
         acceptance_criteria_available: acceptanceCriteriaAvailable,
       };

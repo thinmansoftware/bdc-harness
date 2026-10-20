@@ -235,7 +235,7 @@ describe('governed PR-code reviewer', () => {
     const prompt = buildReviewPrompt({
       request: input,
       diff: '+ code',
-      checks: [],
+      partition: { gating: [], nonRequired: [] },
       acceptanceCriteria: 'must pass',
     });
     expect(prompt).toContain('code diff');

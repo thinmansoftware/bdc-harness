@@ -387,8 +387,18 @@ function checkAttemptIsNewer(candidate: RecheckCheckRun, current: RecheckCheckRu
   return (candidate.id ?? 0) > (current.id ?? 0);
 }
 
-function latestAttemptPerCheck(runs: RecheckCheckRun[]): RecheckCheckRun[] {
-  const latest = new Map<string, RecheckCheckRun>();
+/**
+ * Collapse a list of check runs to the single latest attempt per check,
+ * keyed by name plus app. Ranking is completed_at, else started_at, tie by id
+ * (see checkAttemptKey / checkAttemptRank / checkAttemptIsNewer).
+ *
+ * Exported (not copied) so the Overseer verdict path in pr-review-evaluator.ts
+ * obeys the SAME latest-attempt rule the recheck and stale-sweep paths already
+ * obey. Generic over RecheckCheckRun subtypes so a typed caller (e.g. the
+ * evaluator's PrReviewCheck) keeps its own element type on the way out.
+ */
+export function latestAttemptPerCheck<T extends RecheckCheckRun>(runs: T[]): T[] {
+  const latest = new Map<string, T>();
   for (const run of runs) {
     const key = checkAttemptKey(run);
     const held = latest.get(key);
