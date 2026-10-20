@@ -1884,19 +1884,16 @@ export function createRealGitHubClientDeps(
     listPullRequestReviews: async (
       input
     ): Promise<{ login: string; state: string; commitId: string }[]> => {
-      if (!octokit.pulls.listReviews) {
-        throw new Error('overseer_real_adapter_missing_list_reviews_api');
-      }
-      const response = await octokit.pulls.listReviews({
+      const result = await fetchAllPullRequestReviews(octokit, {
         owner: input.owner,
         repo: input.repo,
-        pull_number: input.number,
-        per_page: 100,
+        prNumber: input.number,
       });
-      return response.data.map(review => ({
-        login: review.user?.login ?? '',
+      if (!result.complete) throw new Error('overseer_reviews_incomplete');
+      return result.reviews.map(review => ({
+        login: review.login,
         state: review.state,
-        commitId: review.commit_id,
+        commitId: review.commitId ?? '',
       }));
     },
     commentOnPullRequest: async (input): Promise<{ commented: boolean; url?: string }> => {

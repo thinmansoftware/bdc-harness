@@ -98,6 +98,15 @@ function harness(rows: OverseerVerdictRow[], opts: HarnessOptions = {}) {
       return true;
     },
     getRunById: async runId => run(runId),
+    listRunEvents: async runId => [
+      {
+        id: `event-${runId}`,
+        workflow_run_id: runId,
+        event_type: 'node_completed',
+        step_name: 'implement',
+        data: {},
+      },
+    ],
     reserveMergeSlot: async (verdictId, _since, limit) => {
       reserveSlotCalls.push(verdictId);
       const existing = slots.get(verdictId);
@@ -130,6 +139,9 @@ function harness(rows: OverseerVerdictRow[], opts: HarnessOptions = {}) {
 
   const github: GitHubClientDeps = {
     findPullRequest: async () => evidence,
+    listPullRequestReviews: async () => [
+      { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: evidence.headSha ?? '' },
+    ],
     approvePullRequest: async input => {
       expect(input.expectedHeadSha).toBe(HEAD);
       approvals += 1;

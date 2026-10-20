@@ -10,6 +10,9 @@ describe('merge skip classification', () => {
       'open_pr_not_found',
       'changed_files_unresolved',
       'pr_context_fetch_failed',
+      'review_gate_reviews_unavailable',
+      'review_gate_reviews_lookup_failed',
+      'review_gate_approval_missing_for_head',
       'merge_failed:Pull Request is not mergeable',
       'merge_failed:Merge already in progress',
       'merge_failed:API rate limit exceeded',
@@ -42,6 +45,8 @@ describe('merge skip classification', () => {
       'merge_failed',
       'merge_failed:Head branch was modified',
       'transient_exhausted:mergeable_state_not_clean',
+      'transient_exhausted:review_gate_approval_missing_for_head',
+      'execution_evidence_unavailable',
     ];
     for (const reason of transient) expect(classifyMergeSkip(reason), reason).toBe('transient');
     for (const reason of terminal) expect(classifyMergeSkip(reason), reason).toBe('terminal');

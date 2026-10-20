@@ -83,6 +83,15 @@ function makeHarness(rows: OverseerVerdictRow[], evidence: () => PullRequestEvid
         headBranch: 'feature',
         metadata: {},
       }) as OverseerWatchRun,
+    listRunEvents: async runId => [
+      {
+        id: `event-${runId}`,
+        workflow_run_id: runId,
+        event_type: 'node_completed',
+        step_name: 'implement',
+        data: {},
+      },
+    ],
     reserveMergeSlot: async () => true,
     releaseMergeSlot: async id => {
       releases.push(id);
@@ -94,6 +103,9 @@ function makeHarness(rows: OverseerVerdictRow[], evidence: () => PullRequestEvid
   };
   const github: GitHubClientDeps = {
     findPullRequest: async () => evidence(),
+    listPullRequestReviews: async () => [
+      { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: evidence().headSha ?? '' },
+    ],
     mergePullRequest: async () => {
       merges += 1;
       return { merged: true, mergeSha: 'merged' };

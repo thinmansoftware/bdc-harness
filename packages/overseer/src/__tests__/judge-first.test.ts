@@ -646,7 +646,11 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
 
   test('merge_candidate with a genuinely merge-ready PR flags and hands off to the steward', async () => {
     const state: FakeStoreState = { claims: [], finalized: [] };
-    const { actions, deps } = makeDeps();
+    const { actions, deps } = makeDeps([makeEvent('1', 'completed')]);
+    deps.listPullRequestReviews = async () => [
+      { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: 'abc123' },
+    ];
+    deps.findPullRequest = async () => record.prEvidence;
     let coordinatorCalled = 0;
     const record = makeRecord({
       prEvidence: {
@@ -677,7 +681,11 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
 
   test('dry run: flag_merge_ready receipt written, steward handoff suppressed', async () => {
     const state: FakeStoreState = { claims: [], finalized: [] };
-    const { actions, deps } = makeDeps();
+    const { actions, deps } = makeDeps([makeEvent('1', 'completed')]);
+    deps.listPullRequestReviews = async () => [
+      { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: 'def456' },
+    ];
+    deps.findPullRequest = async () => record.prEvidence;
     let coordinatorCalled = 0;
     const record = makeRecord({
       prEvidence: {

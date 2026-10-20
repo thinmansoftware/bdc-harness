@@ -7,6 +7,9 @@ const TRANSIENT_EXACT_REASONS = new Set([
   'open_pr_not_found',
   'changed_files_unresolved',
   'pr_context_fetch_failed',
+  'review_gate_reviews_unavailable',
+  'review_gate_reviews_lookup_failed',
+  'review_gate_approval_missing_for_head',
 ]);
 
 const TRANSIENT_MESSAGE_PATTERN =

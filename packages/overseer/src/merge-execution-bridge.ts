@@ -33,7 +33,12 @@ import {
 } from './merge-repo-policy';
 import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
-import { createRealOctokitClient } from './adapters/github-real-deps';
+import type { OverseerWorkflowEvent } from './types.ts';
+import {
+  createRealOctokitClient,
+  deriveReviewDecision,
+  resolveReviewGateLogin,
+} from './adapters/github-real-deps';
 import { classifyMergeSkip, isRateLimitSkip } from './merge-skip-classification';
 import {
   getScopeApprovalDecision,
@@ -61,6 +66,7 @@ export interface MergeExecutionBridgeStore {
   releaseVerdictClaim(verdictId: string, reason: string): Promise<boolean>;
   deferVerdictClaim?(verdictId: string, reason: string, notBefore: string): Promise<boolean>;
   getRunById(runId: string): Promise<OverseerWatchRun | null>;
+  listRunEvents?(runId: string): Promise<OverseerWorkflowEvent[]>;
   // Optional so older/test stores that predate the active-run guard keep prior
   // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
   hasActiveRunForWo?(woId: string): Promise<boolean>;
@@ -85,6 +91,8 @@ export interface MergeExecutionBridgeOptions {
   retryMaxDelayMinutes?: number;
   retryMaxAttempts?: number;
   repoConfig?: MergeExecutionRepoConfig;
+  reviewGateLogin?: string;
+  listRunEvents?: (runId: string) => Promise<OverseerWorkflowEvent[]>;
   ceScopeRecheckDeps?: CeScopeRecheckDeps;
 }
 
@@ -678,6 +686,50 @@ async function mergeClaimedVerdict(
   if (!basePolicy?.unattended) {
     await skip('integration_base_mismatch', pr.htmlUrl);
     return undefined;
+  }
+
+  const reviewGateLogin = options.reviewGateLogin ?? resolveReviewGateLogin();
+  if (!reviewGateLogin || !options.github.listPullRequestReviews) {
+    await skip('review_gate_reviews_unavailable', pr.htmlUrl);
+    return undefined;
+  }
+  let reviews: Awaited<ReturnType<NonNullable<GitHubClientDeps['listPullRequestReviews']>>>;
+  try {
+    reviews = await options.github.listPullRequestReviews(pr.pr);
+  } catch {
+    await skip('review_gate_reviews_lookup_failed', pr.htmlUrl);
+    return undefined;
+  }
+  if (deriveReviewDecision(reviews, { headSha: pr.headSha, reviewGateLogin }) !== 'APPROVED') {
+    await skip('review_gate_approval_missing_for_head', pr.htmlUrl);
+    return undefined;
+  }
+  if (!isRunlessVerdict(verdict)) {
+    const listRunEvents =
+      options.listRunEvents ??
+      (options.store.listRunEvents
+        ? (runId: string): Promise<OverseerWorkflowEvent[]> =>
+            options.store.listRunEvents?.(runId) ??
+            Promise.reject(new Error('execution_event_reader_unavailable'))
+        : undefined);
+    if (!listRunEvents) {
+      await skip('execution_evidence_unavailable', pr.htmlUrl);
+      return undefined;
+    }
+    try {
+      const events = await listRunEvents(verdict.run_id);
+      if (
+        !events.some(event =>
+          ['node_started', 'node_completed', 'node_failed'].includes(event.event_type)
+        )
+      ) {
+        await skip('execution_evidence_unavailable', pr.htmlUrl);
+        return undefined;
+      }
+    } catch {
+      await skip('execution_evidence_unavailable', pr.htmlUrl);
+      return undefined;
+    }
   }
 
   // Defer the merge while a Cauldron run for the SAME WO is still executing, so
