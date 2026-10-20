@@ -189,6 +189,22 @@ test('code_finding_kept_and_gate_is_idempotent', async () => {
   );
 });
 
+test('unreported_check_finding_cannot_block_passing_required_checks', async () => {
+  const result = await evaluatePullRequest(
+    input,
+    deps(
+      passingRequired,
+      modelOutput('REQUEST_CHANGES', [
+        { scope: 'checks/invented-check', severity: 'major', summary: 'failed' },
+      ]),
+      REQUIRED
+    )
+  );
+
+  expect(result.verdict).toBe('APPROVE');
+  expect(result.findings).toEqual([]);
+});
+
 test('no_required_set_keeps_todays_behavior', async () => {
   const checks = [{ name: 'test', status: 'completed', conclusion: 'failure' }];
   const result = await evaluatePullRequest(input, deps(checks, modelOutput('APPROVE'), undefined));

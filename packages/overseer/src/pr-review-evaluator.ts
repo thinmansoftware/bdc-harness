@@ -305,10 +305,10 @@ export function applyRequiredCheckGate<T extends CheckGateResult>(
     }
     const scopedName = normalizedCheckName(finding.scope.slice('checks/'.length));
     const check = checksByName.get(scopedName);
-    if (!check) {
-      reconciled.push(finding);
-      continue;
-    }
+    // A check-scoped finding is only authoritative when it corresponds to
+    // check evidence fetched for this exact head. Drop invented or stale check
+    // names so they cannot turn an otherwise passing review into a rejection.
+    if (!check) continue;
     if (check.status === 'completed' && conclusionIsPassing(check.conclusion)) continue;
     const held = findingsByCheck.get(scopedName) ?? [];
     held.push(finding);
