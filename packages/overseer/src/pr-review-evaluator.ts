@@ -358,6 +358,25 @@ function hasChecksFindingFor(findings: readonly IndependentReviewFinding[], name
   });
 }
 
+/**
+ * True when a BLOCKING (blocker/major) finding is already scoped to this exact
+ * check. Used to decide per-required-failure whether a synthetic major is still
+ * needed: a global "any blocking finding exists" test would let an unrelated
+ * code major -- or a blocking finding for a DIFFERENT required failure -- mask a
+ * required failure that otherwise has no visible block.
+ */
+function hasBlockingChecksFindingFor(
+  findings: readonly IndependentReviewFinding[],
+  name: string
+): boolean {
+  const key = normalizeCheckName(name);
+  return findings.some(finding => {
+    if (!isBlocking(finding)) return false;
+    const scoped = checkNameFromScope(finding.scope);
+    return scoped !== null && normalizeCheckName(scoped) === key;
+  });
+}
+
 function isBlocking(finding: IndependentReviewFinding): boolean {
   return finding.severity === 'blocker' || finding.severity === 'major';
 }
@@ -374,8 +393,11 @@ function isBlocking(finding: IndependentReviewFinding): boolean {
  *   downgraded to a non-blocking `note`.
  * - A `checks/<name>` model finding matching a REQUIRED failing check (or naming
  *   no check present in the partition) is kept as the model wrote it.
- * - Each REQUIRED failure forces REQUEST_CHANGES; if no blocker/major finding
- *   survives, a synthetic `major checks/<name>` is added so the block is visible.
+ * - Each REQUIRED failure forces REQUEST_CHANGES; any required failure without a
+ *   surviving blocking (`blocker`/`major`) `checks/<name>` finding of its own
+ *   gets a synthetic `major checks/<name>` so every block is individually
+ *   visible -- an unrelated code major, or a block for another required failure,
+ *   never masks it.
  * - Each NON-required failure gets a `note checks/<name>` if one is not present.
  * - A code finding (scope not starting with `checks/`) is never touched.
  * - REQUEST_CHANGES with no blocker/major remaining becomes APPROVE.
@@ -424,19 +446,23 @@ export function applyRequiredCheckGate(
     if (!hasChecksFindingFor(findings, name)) findings.push(nonRequiredNoteFinding(name));
   }
 
-  // 3. A red required check always blocks. Force REQUEST_CHANGES, and if nothing
-  //    blocking survives, name each required failure with a synthetic major.
+  // 3. A red required check always blocks. Force REQUEST_CHANGES, and name EACH
+  //    required failure that has no surviving blocking checks finding of its own
+  //    with a synthetic major. Checked per-check (not a global
+  //    `findings.some(isBlocking)`): an unrelated code major, or a blocking
+  //    finding for a DIFFERENT required failure, must NOT suppress the mandated
+  //    `major checks/<name>` for a required failure that otherwise has no
+  //    visible block.
   let verdict: 'APPROVE' | 'REQUEST_CHANGES' = parsed.verdict;
   if (requiredFailureNames.length > 0) {
     verdict = 'REQUEST_CHANGES';
-    if (!findings.some(isBlocking)) {
-      for (const name of requiredFailureNames) {
-        findings.push({
-          scope: `${CHECKS_SCOPE_PREFIX}${name}`,
-          severity: 'major',
-          summary: `Required check ${name} failed on the base branch and blocks the verdict.`,
-        });
-      }
+    for (const name of requiredFailureNames) {
+      if (hasBlockingChecksFindingFor(findings, name)) continue;
+      findings.push({
+        scope: `${CHECKS_SCOPE_PREFIX}${name}`,
+        severity: 'major',
+        summary: `Required check ${name} failed on the base branch and blocks the verdict.`,
+      });
     }
   }
 

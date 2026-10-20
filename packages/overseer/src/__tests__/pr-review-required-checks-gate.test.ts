@@ -282,6 +282,48 @@ describe('required-check verdict gate', () => {
     expect(result.findings).toEqual(once.findings);
   });
 
+  test('5b unrelated_block_does_not_mask_per_required_failure_major', () => {
+    // Both required checks failed; one required failure already has a model
+    // blocking finding (docker-build), and there is an unrelated code major.
+    // The OTHER required failure (test (ubuntu-latest)) has no finding of its
+    // own and MUST still receive a synthetic major -- a global "some blocking
+    // finding exists" test would have suppressed it.
+    const checks: PrReviewCheck[] = [
+      { name: 'docker-build', status: 'completed', conclusion: 'failure' },
+      { name: 'test (ubuntu-latest)', status: 'completed', conclusion: 'failure' },
+    ];
+    const modelFindings: IndependentReviewFinding[] = [
+      { scope: 'packages/overseer/src/x.ts', severity: 'major', summary: 'unrelated code bug' },
+      { scope: 'checks/docker-build', severity: 'major', summary: 'docker build failed' },
+    ];
+    const partition = partitionChecksByRequired(checks, REQUIRED);
+    const gated = applyRequiredCheckGate(
+      { verdict: 'REQUEST_CHANGES', findings: modelFindings },
+      partition
+    );
+    expect(gated.verdict).toBe('REQUEST_CHANGES');
+
+    // The masked required failure now has exactly one synthetic major.
+    const ubuntu = gated.findings.filter(
+      finding => finding.scope === 'checks/test (ubuntu-latest)'
+    );
+    expect(ubuntu.length).toBe(1);
+    expect(ubuntu[0]?.severity).toBe('major');
+    expect(ubuntu[0]?.summary).toContain('failed on the base branch');
+
+    // The already-blocked required failure is NOT duplicated.
+    const docker = gated.findings.filter(finding => finding.scope === 'checks/docker-build');
+    expect(docker.length).toBe(1);
+    expect(docker[0]?.severity).toBe('major');
+
+    // The unrelated code finding is untouched and still present.
+    const code = gated.findings.find(finding => finding.scope === 'packages/overseer/src/x.ts');
+    expect(code?.severity).toBe('major');
+
+    // Applying the gate again is a deep-equal no-op (still idempotent).
+    expect(applyRequiredCheckGate(gated, partition)).toEqual(gated);
+  });
+
   test('6 no_required_set_keeps_todays_behavior', async () => {
     const checks: PrReviewCheck[] = [{ name: 'test', status: 'completed', conclusion: 'failure' }];
     // requiredContexts omitted (undefined): every check gates, exactly as today.
