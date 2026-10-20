@@ -1359,4 +1359,204 @@ describe('binding-v2 API continuation closed gate', () => {
     expect(mockContinuationEvent).not.toHaveBeenCalled();
     expect(mockContinuationExecute).not.toHaveBeenCalled();
   });
+
+  describe('binding-v2 API rejection closed gate', () => {
+    function approval(onRejectPrompt: unknown = 'Fix the rejected fixture', maximum?: number) {
+      return {
+        nodeId: 'gate',
+        message: 'fixture',
+        onRejectPrompt,
+        ...(maximum === undefined ? {} : { onRejectMaxAttempts: maximum }),
+      };
+    }
+    async function expectRefused(run: WorkflowRun) {
+      const before = structuredClone(run);
+      const effects = setup(run);
+      const response = await effects.post('reject');
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'codex_only_resume_unsupported' });
+      expect(mockContinuationGetRun).toHaveBeenCalledTimes(1);
+      expectNoContinuation(effects);
+      expect(run).toEqual(before);
+    }
+    function expectNoLaunch(effects: ReturnType<typeof setup>) {
+      for (const effect of [
+        mockContinuationUpdate,
+        mockContinuationResume,
+        mockContinuationGetConversation,
+        mockContinuationExecute,
+        mockContinuationDeps,
+        mockContinuationLane,
+        mockDiscoverWorkflowsWithConfig,
+        effects.mapping,
+        effects.bridge,
+        effects.acquireLock,
+        mockHandleMessage,
+      ])
+        expect(effect).not.toHaveBeenCalled();
+    }
+    async function expectCancelled(run: WorkflowRun, limit = false) {
+      const effects = setup(run);
+      const response = await effects.post('reject');
+      expect(response.status).toBe(200);
+      if (limit)
+        expect(((await response.json()) as { message: string }).message).toContain(
+          'max attempts reached'
+        );
+      expect(mockContinuationCancel).toHaveBeenCalledTimes(1);
+      expect(mockContinuationCancel).toHaveBeenCalledWith('owned-memory-run');
+      expect(mockContinuationEvent).toHaveBeenCalledTimes(1);
+      expect(mockContinuationEvent).toHaveBeenCalledWith({
+        workflow_run_id: 'owned-memory-run',
+        event_type: 'approval_received',
+        step_name: 'gate',
+        data: { decision: 'rejected', reason: 'Rejected' },
+      });
+      expectNoLaunch(effects);
+    }
+
+    for (const [label, marker] of [
+      ['null', null],
+      ['undefined', undefined],
+      ['false', false],
+      ['corrupt', 'corrupt'],
+      ['v1', { version: 'codex-only-v1' }],
+      ['v2', { version: 'codex-only-v2' }],
+      ['unknown', { version: 'codex-only-v999' }],
+    ] as const) {
+      test(
+        'refuses rejection continuation with own ' + label + ' marker before event',
+        async () => {
+          const run = makeRun({ metadata: { approval: approval(), codex_only_dispatch: marker } });
+          await expectRefused(run);
+          expect(Object.hasOwn(run.metadata, 'codex_only_dispatch')).toBe(true);
+        }
+      );
+    }
+    test('refuses named restricted rejection without marker before event', async () => {
+      await expectRefused(makeRun({ workflow_name: reserved, metadata: { approval: approval() } }));
+    });
+    for (const [label, prompt] of [
+      ['empty', ''],
+      ['null', null],
+      ['false', false],
+      ['zero', 0],
+    ] as const) {
+      test(
+        'treats ' + label + ' on-reject prompt as present under existing comparison',
+        async () => {
+          await expectRefused(
+            makeRun({ workflow_name: reserved, metadata: { approval: approval(prompt) } })
+          );
+        }
+      );
+    }
+    test('refuses below custom rejection limit without changing count', async () => {
+      await expectRefused(
+        makeRun({
+          workflow_name: reserved,
+          metadata: { approval: approval('Fix', 4), rejection_count: 2 },
+        })
+      );
+    });
+    test('refuses malformed numeric count under unchanged comparison semantics', async () => {
+      await expectRefused(
+        makeRun({
+          workflow_name: reserved,
+          metadata: { approval: approval(), rejection_count: 'not-a-number' },
+        })
+      );
+    });
+    test('preserves restricted no-handler cancellation', async () => {
+      await expectCancelled(
+        makeRun({
+          workflow_name: reserved,
+          metadata: {
+            approval: { nodeId: 'gate', message: 'fixture' },
+            codex_only_dispatch: false,
+          },
+        })
+      );
+    });
+    test('preserves restricted default rejection-limit cancellation', async () => {
+      await expectCancelled(
+        makeRun({
+          workflow_name: reserved,
+          metadata: { approval: approval(), rejection_count: 2 },
+        }),
+        true
+      );
+    });
+    test('preserves restricted custom rejection-limit cancellation', async () => {
+      await expectCancelled(
+        makeRun({ workflow_name: reserved, metadata: { approval: approval('Fix', 1) } }),
+        true
+      );
+    });
+    test('preserves restricted above-limit cancellation', async () => {
+      await expectCancelled(
+        makeRun({
+          workflow_name: reserved,
+          metadata: { approval: approval(), rejection_count: 5 },
+        }),
+        true
+      );
+    });
+    test('preserves ordinary rejection continuation persistence', async () => {
+      const effects = setup(
+        makeRun({
+          parent_conversation_id: null,
+          metadata: { approval: approval(), rejection_count: 1 },
+        })
+      );
+      const response = await effects.post('reject');
+      expect(response.status).toBe(200);
+      expect(mockContinuationEvent).toHaveBeenCalledTimes(1);
+      expect(mockContinuationUpdate).toHaveBeenCalledWith('owned-memory-run', {
+        status: 'failed',
+        metadata: { rejection_reason: 'Rejected', rejection_count: 2 },
+      });
+      expect(mockContinuationCancel).not.toHaveBeenCalled();
+      expect(mockContinuationGetConversation).not.toHaveBeenCalled();
+      expect(mockContinuationExecute).not.toHaveBeenCalled();
+    });
+    test('preserves ordinary no-handler cancellation', async () => {
+      await expectCancelled(makeRun());
+    });
+    test('preserves ordinary rejection-limit cancellation', async () => {
+      await expectCancelled(
+        makeRun({ metadata: { approval: approval(), rejection_count: 2 } }),
+        true
+      );
+    });
+    test('preserves restricted already-cancelled idempotency', async () => {
+      const effects = setup(makeRun({ workflow_name: reserved, status: 'cancelled' }));
+      const response = await effects.post('reject');
+      expect(response.status).toBe(200);
+      expect(((await response.json()) as { message: string }).message).toContain(
+        'already rejected'
+      );
+      expectNoContinuation(effects);
+    });
+    test('preserves failed status rejection without effects', async () => {
+      const effects = setup(makeRun({ workflow_name: reserved, status: 'failed' }));
+      const response = await effects.post('reject');
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: "Cannot reject workflow in 'failed' status" });
+      expectNoContinuation(effects);
+    });
+    test('preserves rejection missing-run404', async () => {
+      const effects = setup(null);
+      expect((await effects.post('reject')).status).toBe(404);
+      expectNoContinuation(effects);
+    });
+    test('preserves rejection lookup-error500 without replacement', async () => {
+      const effects = setup(null);
+      mockContinuationGetRun.mockImplementation(async () => {
+        throw new Error('owned reject lookup failure');
+      });
+      expect((await effects.post('reject')).status).toBe(500);
+      expectNoContinuation(effects);
+    });
+  });
 });

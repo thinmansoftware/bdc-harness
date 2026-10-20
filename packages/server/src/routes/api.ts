@@ -6734,6 +6734,13 @@ export function registerApiRoutes(
       const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
       const reason = body.reason ?? 'Rejected';
       const approval = run.metadata.approval as ApprovalContext | undefined;
+      const hasOnReject = approval?.onRejectPrompt !== undefined;
+      const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
+      const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
+      const atLimit = currentCount + 1 >= maxAttempts;
+      if (isCodexOnlyContinuation(run) && hasOnReject && !atLimit) {
+        return apiError(c, 400, 'codex_only_resume_unsupported');
+      }
       await workflowEventDb.createWorkflowEvent({
         workflow_run_id: runId,
         event_type: 'approval_received',
@@ -6741,11 +6748,8 @@ export function registerApiRoutes(
         data: { decision: 'rejected', reason },
       });
 
-      const hasOnReject = approval?.onRejectPrompt !== undefined;
       if (hasOnReject) {
-        const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
-        const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
-        if (currentCount + 1 >= maxAttempts) {
+        if (atLimit) {
           await workflowDb.cancelWorkflowRun(runId);
           return c.json({
             success: true,
