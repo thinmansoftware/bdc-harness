@@ -32,19 +32,14 @@ Each successful judgment logs `duty_officer_judge_ok` with `provider`, `model`, 
 ## Replay
 
 ```bash
-bun scripts/dispatch/do-judge-replay.ts --from-store --out <path>
 bun scripts/dispatch/do-judge-replay.ts --fixture <path> --out <path>
 ```
 
-`--from-store` reads `agent_dispatch_messages` (the durable store of judged inputs; judge verdicts are not written to `remote_agent_workflow_events`). It selects the newest done `duty-officer` and `do` rows and keeps the last 50 whose `result_body` records a paid-model transport (`openrouter:` or `xai:`). `escalated_to_xo` is the recorded `escalate_xo` verdict. `cued` is the recorded `nudge` verdict. A null transport is a mechanical finish and is skipped. Hold is a release, not a stored result, so the loader does not invent hold rows. Pass `DATABASE_URL` or use the default `archon.db`, the same resolution the server uses.
+The fixture is a JSON array. Each record has `id`, `recordedAction` (`escalate_xo`, `nudge`, `hold`, or `failed`), and `input` (the dispatch message). The report JSON has `total`, `agreementCount`, and `rows` (`id`, `oldVerdict`, `newVerdict`, `agree`).
 
-`--fixture` reads a JSON array. Each record has `id`, `recordedAction` (`escalate_xo`, `nudge`, `hold`, or `failed`), and `input` (the dispatch message). Use it for an offline comparison. Do not pass `--fixture` and `--from-store` together.
+Replay is fixture-in/report-out. It does not post mail and does not post to GitHub. Before judging, the CLI sets `DUTY_OFFICER_JUDGE_PROVIDER=claude` and `DUTY_OFFICER_JUDGE_ENABLED=true`, and deletes `OPENROUTER_API_KEY`, `GLM_API_KEY`, and `XAI_API_KEY`, so the replay cannot call OpenRouter. A bad fixture or a failed report write exits nonzero and does not invent verdicts.
 
-The report JSON has `total`, `agreementCount`, and `rows` (`id`, `oldVerdict`, `newVerdict`, `agree`).
-
-Replay does not post mail and does not post to GitHub. Before judging, the CLI sets `DUTY_OFFICER_JUDGE_PROVIDER=claude` and `DUTY_OFFICER_JUDGE_ENABLED=true`, and deletes `OPENROUTER_API_KEY`, `GLM_API_KEY`, and `XAI_API_KEY`, so the replay cannot call OpenRouter. A bad fixture, a failed store read, or a failed report write exits nonzero and does not invent verdicts.
-
-Posting the accepted comparison on the WO issue remains an operator task. This command does not post it.
+Exporting the last 50 real inputs and posting the accepted comparison are operator tasks outside this change.
 
 ## Production switch
 

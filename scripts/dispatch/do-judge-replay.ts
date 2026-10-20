@@ -2,24 +2,19 @@ import { readFile, writeFile } from 'fs/promises';
 import type { DispatchMessage } from '../../packages/core/src/db/dispatch';
 import { judgeDutyOfficerItem } from '../../packages/server/src/dispatch/duty-officer-judge';
 import {
-  loadRecentDutyOfficerJudgeRecords,
   parseReplayFixture,
   runDoJudgeReplay,
   type ReplayAction,
-  type ReplayRecord,
 } from '../../packages/server/src/dispatch/do-judge-replay';
 
 export const DO_JUDGE_REPLAY_USAGE =
-  'usage: bun scripts/dispatch/do-judge-replay.ts --out <path> (--fixture <path> | --from-store)';
+  'usage: bun scripts/dispatch/do-judge-replay.ts --fixture <path> --out <path>';
 
 export function parseReplayArgs(
   argv: readonly string[]
-):
-  | { ok: true; fixture: string | null; fromStore: boolean; out: string }
-  | { ok: false; usage: string } {
+): { ok: true; fixture: string; out: string } | { ok: false; usage: string } {
   let fixture: string | undefined;
   let out: string | undefined;
-  let fromStore = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--fixture') {
@@ -28,22 +23,12 @@ export function parseReplayArgs(
     } else if (arg === '--out') {
       out = argv[i + 1];
       i += 1;
-    } else if (arg === '--from-store') {
-      fromStore = true;
     }
   }
-  if (!out || out.startsWith('--')) {
+  if (!fixture || !out) {
     return { ok: false, usage: DO_JUDGE_REPLAY_USAGE };
   }
-  const fixturePresent = typeof fixture === 'string' && fixture !== '' && !fixture.startsWith('--');
-  if (fromStore) {
-    if (fixturePresent) return { ok: false, usage: DO_JUDGE_REPLAY_USAGE };
-    return { ok: true, fixture: null, fromStore: true, out };
-  }
-  if (!fixturePresent || fixture === undefined) {
-    return { ok: false, usage: DO_JUDGE_REPLAY_USAGE };
-  }
-  return { ok: true, fixture, fromStore: false, out };
+  return { ok: true, fixture, out };
 }
 
 export function prepareReplayEnv(env: NodeJS.ProcessEnv): void {
@@ -59,20 +44,11 @@ async function classifyWithJudge(message: DispatchMessage): Promise<ReplayAction
   return verdict.status === 'ok' ? verdict.action : 'failed';
 }
 
-export async function defaultLoadStoreRecords(): Promise<ReplayRecord[]> {
-  const { getDatabase } = await import('../../packages/core/src/db/connection');
-  const db = getDatabase();
-  return loadRecentDutyOfficerJudgeRecords((sql, params) =>
-    db.query<DispatchMessage>(sql, [...params])
-  );
-}
-
 export async function runReplayCli(options: {
   argv: readonly string[];
   readText?: (path: string) => Promise<string>;
   writeText?: (path: string, text: string) => Promise<void>;
   classify?: (message: DispatchMessage) => ReplayAction | Promise<ReplayAction>;
-  loadStoreRecords?: () => Promise<ReplayRecord[]>;
   env?: NodeJS.ProcessEnv;
   stderr?: (line: string) => void;
 }): Promise<number> {
@@ -91,28 +67,18 @@ export async function runReplayCli(options: {
   prepareReplayEnv(env);
 
   try {
-    let records: ReplayRecord[];
-    if (parsed.fromStore) {
-      const loadStoreRecords = options.loadStoreRecords ?? defaultLoadStoreRecords;
-      records = await loadStoreRecords();
-    } else {
-      if (!parsed.fixture) {
-        stderr(DO_JUDGE_REPLAY_USAGE);
-        return 2;
-      }
-      const readText =
-        options.readText ?? ((path: string): Promise<string> => readFile(path, 'utf8'));
-      const raw = await readText(parsed.fixture);
-      let json: unknown;
-      try {
-        json = JSON.parse(raw) as unknown;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        stderr(`do_judge_replay_fixture_invalid: ${message}`);
-        return 1;
-      }
-      records = parseReplayFixture(json);
+    const readText =
+      options.readText ?? ((path: string): Promise<string> => readFile(path, 'utf8'));
+    const raw = await readText(parsed.fixture);
+    let json: unknown;
+    try {
+      json = JSON.parse(raw) as unknown;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      stderr(`do_judge_replay_fixture_invalid: ${message}`);
+      return 1;
     }
+    const records = parseReplayFixture(json);
     const report = await runDoJudgeReplay({
       records,
       classify: options.classify ?? classifyWithJudge,

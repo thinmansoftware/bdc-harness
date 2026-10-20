@@ -5,39 +5,16 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'bun:test';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
-import {
-  DO_JUDGE_REPLAY_STORE_LIMIT,
-  DO_JUDGE_REPLAY_STORE_SCAN,
-  DUTY_OFFICER_JUDGE_REPLAY_SQL,
-  loadRecentDutyOfficerJudgeRecords,
-  parseReplayFixture,
-  recordedModelAction,
-  runDoJudgeReplay,
-  selectStoredJudgeReplayRecords,
-  type ReplayAction,
-} from './do-judge-replay';
+import { parseReplayFixture, runDoJudgeReplay, type ReplayAction } from './do-judge-replay';
 import { runReplayCli } from '../../../../scripts/dispatch/do-judge-replay';
 
 const SCRIPT_PATH = fileURLToPath(
   new URL('../../../../scripts/dispatch/do-judge-replay.ts', import.meta.url)
 );
+const MODULE_PATH = fileURLToPath(new URL('./do-judge-replay.ts', import.meta.url));
 
 function input(id: string): DispatchMessage {
   return { id } as DispatchMessage;
-}
-
-function stored(
-  id: string,
-  result: { disposition: string; transport: string | null } | null,
-  extra: Partial<DispatchMessage> = {}
-): DispatchMessage {
-  return {
-    id,
-    recipient: 'duty-officer',
-    status: 'done',
-    result_body: result === null ? null : JSON.stringify(result),
-    ...extra,
-  } as DispatchMessage;
 }
 
 describe('do judge replay', () => {
@@ -91,58 +68,34 @@ describe('do judge replay', () => {
     expect(source.includes('postIssueComment')).toBe(false);
     expect(source.includes('openrouter.ai')).toBe(false);
     expect(source.includes('gh ')).toBe(false);
-    expect(source.includes('--from-store')).toBe(true);
-    expect(source.includes('defaultLoadStoreRecords')).toBe(true);
-    expect(source.includes('getDatabase')).toBe(true);
-    expect(source.includes('loadRecentDutyOfficerJudgeRecords')).toBe(true);
   });
 
-  test('store loader keeps the last 50 paid-model verdicts', async () => {
-    const decoys: DispatchMessage[] = [
-      stored('mechanical', { disposition: 'escalated_to_xo', transport: null }),
-      stored('claude-row', { disposition: 'cued', transport: 'claude:claude-haiku-5-5' }),
-      stored('mailbox', {
-        disposition: 'taskmaster_mailbox',
-        transport: 'openrouter:x-ai/grok-4.7',
-      }),
-      stored('held', null, { status: 'queued' }),
-      stored(
-        'other-recipient',
-        { disposition: 'cued', transport: 'xai:grok-4.7' },
-        {
-          recipient: 'xo',
-        }
-      ),
-      stored('bad-json', null, { result_body: '{not json' }),
-    ];
-    const judged = Array.from({ length: 60 }, (_, index) =>
-      stored(`m${index}`, {
-        disposition: index % 2 === 0 ? 'cued' : 'escalated_to_xo',
-        transport: index % 3 === 0 ? 'xai:grok-4.7' : 'openrouter:x-ai/grok-4.7',
-      })
-    );
-    let seenSql = '';
-    let seenParams: readonly unknown[] = [];
-    const records = await loadRecentDutyOfficerJudgeRecords(async (sql, params) => {
-      seenSql = sql;
-      seenParams = params;
-      return { rows: [...decoys, ...judged] };
-    });
+  test('replay stays fixture-in and does not open a database', async () => {
+    const script = readFileSync(SCRIPT_PATH, 'utf8');
+    const moduleSource = readFileSync(MODULE_PATH, 'utf8');
+    for (const source of [script, moduleSource]) {
+      expect(source.includes('getDatabase')).toBe(false);
+      expect(source.includes('agent_dispatch_messages')).toBe(false);
+      expect(source.includes('--from-store')).toBe(false);
+    }
 
-    expect(seenSql).toBe(DUTY_OFFICER_JUDGE_REPLAY_SQL);
-    expect(seenSql).toContain('agent_dispatch_messages');
-    expect(seenSql).toContain("'duty-officer'");
-    expect(seenSql).toContain('ORDER BY completed_at DESC');
-    expect(seenParams).toEqual([DO_JUDGE_REPLAY_STORE_SCAN]);
-    expect(DO_JUDGE_REPLAY_STORE_LIMIT).toBe(50);
-    expect(records).toHaveLength(50);
-    expect(records[0]).toMatchObject({ id: 'm0', recordedAction: 'nudge' });
-    expect(records[1]).toMatchObject({ id: 'm1', recordedAction: 'escalate_xo' });
-    expect(records.some(row => row.recordedAction === 'hold')).toBe(false);
-    expect(records.some(row => row.recordedAction === 'failed')).toBe(false);
-    expect(records.some(row => row.id === 'mechanical' || row.id === 'claude-row')).toBe(false);
-    expect(recordedModelAction(null)).toBeNull();
-    expect(selectStoredJudgeReplayRecords(judged, 2)).toHaveLength(2);
+    const lines: string[] = [];
+    const code = await runReplayCli({
+      argv: ['bun', 'script', '--from-store', '--out', 'report.json'],
+      env: {},
+      readText: async () => {
+        throw new Error('fixture should not be read');
+      },
+      classify: async () => {
+        throw new Error('classify should not run');
+      },
+      stderr: line => {
+        lines.push(line);
+      },
+    });
+    expect(code).toBe(2);
+    expect(lines.join('\n')).toContain('--fixture');
+    expect(lines.join('\n')).not.toContain('fixture should not be read');
   });
 
   test('cli writes a report and exits 2 when arguments are missing', async () => {
@@ -233,62 +186,6 @@ describe('do judge replay', () => {
     });
     expect(code).not.toBe(0);
     expect(errors.join('\n')).toContain('disk full');
-  });
-
-  test('cli loads stored judge inputs when --from-store is set', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'do-judge-replay-store-'));
-    try {
-      const outPath = join(dir, 'report.json');
-      const records = Array.from({ length: 50 }, (_, index) => ({
-        id: `s${index}`,
-        input: input(`s${index}`),
-        recordedAction: 'escalate_xo' as const,
-      }));
-      let loaded = 0;
-      const code = await runReplayCli({
-        argv: ['bun', 'scripts/dispatch/do-judge-replay.ts', '--from-store', '--out', outPath],
-        env: { OPENROUTER_API_KEY: 'or-test', GLM_API_KEY: 'glm-test' },
-        loadStoreRecords: async () => {
-          loaded += 1;
-          return records;
-        },
-        writeText: async (path, text) => {
-          writeFileSync(path, text);
-        },
-        classify: () => {
-          return 'nudge';
-        },
-      });
-      expect(loaded).toBe(1);
-      expect(code).toBe(0);
-      const report = JSON.parse(readFileSync(outPath, 'utf8')) as {
-        total: number;
-        agreementCount: number;
-      };
-      expect(report.total).toBe(50);
-      expect(report.agreementCount).toBe(0);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  test('cli rejects --fixture together with --from-store', async () => {
-    const lines: string[] = [];
-    const code = await runReplayCli({
-      argv: ['bun', 'script', '--fixture', 'fixture.json', '--from-store', '--out', 'report.json'],
-      env: {},
-      loadStoreRecords: async () => {
-        throw new Error('store should not be read');
-      },
-      readText: async () => {
-        throw new Error('fixture should not be read');
-      },
-      stderr: line => {
-        lines.push(line);
-      },
-    });
-    expect(code).toBe(2);
-    expect(lines.join('\n')).toContain('--from-store');
   });
 
   test('cli returns nonzero for a malformed fixture', async () => {
