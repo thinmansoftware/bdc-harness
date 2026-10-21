@@ -3,7 +3,7 @@
  *
  * WO-HARNESS-TIER-LADDER-UNIFY-01 done-when #4:
  *   1. mechanical CODE enters zero (live ruleset)
- *   2. INFRA / money route stronger (claude)
+ *   2. INFRA / money / auth / security / feature enter cursor
  *   3. --entry override wins over ruleset
  *   4. dark lane (glm / refusedTiers) is hard-refused
  */
@@ -62,20 +62,46 @@ describe('live ruleset routing', () => {
     expect(ruleset.defaultEntry).toBe('cursor');
   });
 
-  test('feature-tagged CODE still enters codex', () => {
+  test('feature-tagged CODE enters cursor', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ woClass: 'CODE', tags: ['feature'] }, ruleset)).toBe('codex');
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['feature'] }, ruleset)).toBe('cursor');
   });
 
-  test('INFRA routes stronger (claude)', () => {
+  test('INFRA enters cursor', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ woClass: 'INFRA' }, ruleset)).toBe('claude');
+    expect(pickEntryTier({ woClass: 'INFRA' }, ruleset)).toBe('cursor');
   });
 
-  test('money tag routes stronger (claude)', () => {
+  test('money, billing, security, and auth enter cursor', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ tags: ['money'] }, ruleset)).toBe('claude');
-    expect(pickEntryTier({ tags: ['billing'] }, ruleset)).toBe('claude');
+    expect(pickEntryTier({ tags: ['money'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['billing'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['security'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['auth'] }, ruleset)).toBe('cursor');
+  });
+
+  test('mechanical CODE with overlapping cursor tags still enters zero', () => {
+    const ruleset = loadRuleset();
+    expect(ruleset.rules[0]?.match).toEqual({ woClass: 'CODE', tags: ['mechanical'] });
+    expect(ruleset.rules[0]?.entry).toBe('zero');
+
+    const overlapping = [
+      'billing',
+      'money',
+      'payment',
+      'stripe',
+      'auth',
+      'oauth',
+      'security',
+      'feature',
+      'net-new',
+      'multi-surface',
+    ];
+    for (const tag of overlapping) {
+      expect(pickEntryTier({ woClass: 'CODE', tags: ['mechanical', tag] }, ruleset)).toBe('zero');
+      expect(pickEntryTier({ woClass: 'CODE', tags: [tag] }, ruleset)).toBe('cursor');
+    }
+    expect(pickEntryTier({ woClass: 'INFRA', tags: ['mechanical'] }, ruleset)).toBe('cursor');
   });
 });
 
