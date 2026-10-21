@@ -33,7 +33,12 @@ import {
   isTerminalRefreshReason,
   refreshIfAuthFailed,
 } from '../auth-refresh/index.js';
-import { createLogger } from '@archon/paths';
+import {
+  buildLaneSubprocessEnv,
+  createLogger,
+  laneSpawnActive,
+  laneSpawnArgv,
+} from '@archon/paths';
 import { classifyProbeError } from '../probe/probe-classifier';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -748,15 +753,42 @@ export class CodexProvider implements IAgentProvider {
     configCodexBinaryPath: string | undefined,
     requestEnv?: Record<string, string>
   ): Promise<Codex> {
-    if (!requestEnv || Object.keys(requestEnv).length === 0) {
+    // Lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01): when the launcher is
+    // active, every codex spawn must drop to the lane UID with a scrubbed env --
+    // including the no-requestEnv path, which otherwise reuses the cached,
+    // unscrubbed singleton. Off-lane with no requestEnv keeps the fast singleton.
+    const laneActive = laneSpawnActive();
+    if (!laneActive && (!requestEnv || Object.keys(requestEnv).length === 0)) {
       return getCodex(configCodexBinaryPath);
     }
 
     try {
-      return new Codex({
-        codexPathOverride: await resolveCodexBinaryPath(configCodexBinaryPath),
-        env: buildCodexEnv(requestEnv),
-      });
+      const realBinary = await resolveCodexBinaryPath(configCodexBinaryPath);
+      const baseEnv = buildCodexEnv(requestEnv ?? {});
+      let codexPathOverride: string | undefined = realBinary;
+      let env = baseEnv;
+      if (laneActive) {
+        // The Codex SDK fully replaces process.env with `env`, so a scrubbed env
+        // is authoritative -- the reviewer/merge/PAT material is removed from the
+        // codex subprocess regardless of UID. When an explicit codex binary path
+        // is known, also drop to the lane UID: the SDK accepts only a single
+        // executable path (no exec-arg hook), so the launcher reads
+        // ARCHON_LANE_WRAPPED_CMD and prepends the real binary. When the path is
+        // resolved by the SDK itself (realBinary undefined in source builds), the
+        // env scrub still applies.
+        const scrubbed = buildLaneSubprocessEnv(baseEnv);
+        const laneEnv: Record<string, string> = {};
+        for (const [key, value] of Object.entries(scrubbed)) {
+          if (value !== undefined) laneEnv[key] = value;
+        }
+        if (realBinary) {
+          const laneArgv = laneSpawnArgv([realBinary]);
+          laneEnv.ARCHON_LANE_WRAPPED_CMD = realBinary;
+          codexPathOverride = laneArgv[0] ?? realBinary;
+        }
+        env = laneEnv;
+      }
+      return new Codex({ codexPathOverride, env });
     } catch (error) {
       const err = error as Error;
       if (isModelAccessError(err.message)) {

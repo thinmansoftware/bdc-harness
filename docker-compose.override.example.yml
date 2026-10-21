@@ -35,3 +35,28 @@ services:
 # After adding, rebuild + restart: docker compose build && docker compose up -d
 # Verify: docker exec archon-app-1 sh -c 'ls /root/.codex/auth.json'
 # Context: WO-HARNESS-CODEX-AUTH-FAILBACK-01 (2026-06-29), anchor incident 2026-06-11.
+
+# GitHub App key mounts -- lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01):
+# The reviewer (Overseer) and Builder 2 App private keys are mounted read-only
+# into the container. Their HOST ownership/modes are what enforce the boundary --
+# the server (appuser 1001) can read them, a builder lane (laneuser 1002) cannot
+# read the reviewer key but CAN read the Builder 2 key (lanes ARE Builder 2).
+#
+# Required HOST owner/group/mode for each PEM (set by the post-merge rebuild step
+# in docs/operations/container-github-app-auth.md):
+#   thinman-overseer.pem    root : archon-secrets(1100) : 0440   (reviewer -- lane MUST NOT read)
+#   thinman-builder-2.pem    root : laneuser(1002)       : 0440   (Builder 2 -- lane MUST read)
+#   thinman-builder.pem      REMOVED -- drop this unused mount from your host override
+#
+# Example production docker-compose.override.yml (gitignored on the host -- do
+# NOT add it here); the thinman-builder.pem line is intentionally absent:
+#
+# services:
+#   app:
+#     volumes:
+#       - /opt/bdc/archon/secrets/thinman-overseer.private-key.pem:/run/secrets/thinman-overseer.pem:ro
+#       - /opt/bdc/archon/secrets/thinman-builder-2.private-key.pem:/run/secrets/thinman-builder-2.pem:ro
+#
+# Verify after rebuild (see docs/operations/container-github-app-auth.md, Stops 4-6):
+#   docker exec -u 1002:1002 archon-app-1 cat /run/secrets/thinman-overseer.pem   # Permission denied
+#   docker exec -u 1002:1002 archon-app-1 test -r /run/secrets/thinman-builder-2.pem  # exit 0

@@ -108,10 +108,20 @@ services:
     volumes:
       - ${ARCHON_DATA:-archon_data}:/.archon
       - ${ARCHON_USER_HOME:-archon_user_home}:/home/appuser
+      # Lane home (WO-HARNESS-APP-KEY-ISOLATION-01): the laneuser (UID 1002) home
+      # is persisted on its own named volume so lane provider auth/config survives
+      # rebuilds. Seeded from /home/appuser by the entrypoint WITHOUT the server's
+      # GitHub credentials. Override with ARCHON_LANE_HOME=/abs/path if needed.
+      - ${ARCHON_LANE_HOME:-archon_lane_home}:/home/laneuser
       # Optional (Option A -- mounted PEM). Uncomment and set
-      # GITHUB_APP_PRIVATE_KEY_HOST_PATH in .env to mount the App private key as a
-      # read-only file, then set GITHUB_APP_PRIVATE_KEY_PATH=/run/secrets/thinman-overseer.pem
-      # (keeps the key out of `docker compose config` output and process env).
+      # GITHUB_APP_PRIVATE_KEY_HOST_PATH in .env to mount the reviewer (Overseer)
+      # App private key as a read-only file, then set
+      # GITHUB_APP_PRIVATE_KEY_PATH=/run/secrets/thinman-overseer.pem.
+      # WO-HARNESS-APP-KEY-ISOLATION-01: on the host this file MUST be owner root,
+      # group archon-secrets (GID 1100), mode 0440 -- so the server (appuser, a
+      # member of archon-secrets) can read it but a builder lane (laneuser, 1002,
+      # NOT in archon-secrets) cannot. See
+      # docs/operations/container-github-app-auth.md for the exact host commands.
       - ${GITHUB_APP_PRIVATE_KEY_HOST_PATH:-/dev/null}:/run/secrets/thinman-overseer.pem:ro
       # PR #848: host cursor-agent credential directory (the ~/.cursor of the
       # user who ran `cursor-agent login`), read-only. Set CURSOR_CONFIG_HOST_PATH
@@ -209,6 +219,8 @@ services:
 volumes:
   archon_data:
   archon_user_home:
+  # Lane home (WO-HARNESS-APP-KEY-ISOLATION-01): laneuser (UID 1002) home.
+  archon_lane_home:
   postgres_data:
   caddy_data:
   caddy_config:

@@ -24,7 +24,7 @@
  * absent PR head SHA -- yields `verified: false` and the merge is held, never merged.
  */
 
-import { createLogger } from '@archon/paths';
+import { buildLaneSubprocessEnv, createLogger, laneSpawnArgv } from '@archon/paths';
 import { isPullRequestDiscoveredCandidate } from './merge-candidate-discovery';
 import type { WatchedRunRecord } from './types.ts';
 
@@ -64,9 +64,16 @@ export interface MergeProvenanceDeps {
  */
 export async function readWorktreeHeadShaWithGit(workingPath: string): Promise<string | null> {
   try {
-    const subprocess = Bun.spawn(['git', '-C', workingPath, 'rev-parse', 'HEAD'], {
+    // WO-HARNESS-APP-KEY-ISOLATION-01: workingPath is the run's worktree, under
+    // /.archon/workspaces. `rev-parse` reads the clone's lane-controlled
+    // .git/config, so run it as the lane UID with a scrubbed env when the
+    // launcher is active (no-op in local dev / CI).
+    const laneArgv = laneSpawnArgv(['git', '-C', workingPath, 'rev-parse', 'HEAD']);
+    const laneActive = laneArgv[0] !== 'git';
+    const subprocess = Bun.spawn(laneArgv, {
       stdout: 'pipe',
       stderr: 'pipe',
+      ...(laneActive ? { env: buildLaneSubprocessEnv(process.env) } : {}),
     });
     const [stdout, exitCode] = await Promise.all([
       new Response(subprocess.stdout).text(),

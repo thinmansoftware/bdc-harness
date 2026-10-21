@@ -36,6 +36,72 @@ if [ "$(id -u)" = "0" ]; then
       echo "[archon] WARN: failed to copy /run/secrets/cursor-config into /home/appuser/.cursor -- cursor judge rung / provider will report Authentication required unless CURSOR_API_KEY is set" >&2
     fi
   fi
+  # --- Lane UID isolation: filesystem boundary (WO-HARNESS-APP-KEY-ISOLATION-01) ---
+  # Separate the identity lanes run under (laneuser, 1002) from the server
+  # (appuser, 1001) which holds the reviewer key and PATs. Idempotent: safe to
+  # re-run on every start.
+  if getent group laneuser >/dev/null 2>&1; then
+    # Server home readable+traversable but NOT writable by the lane: a lane must
+    # not be able to plant a credential helper / alias that the server's own git
+    # would later run as appuser.
+    chmod 0755 /home/appuser 2>/dev/null || true
+
+    # Seed the lane home once with ONLY provider auth/config. NEVER copy
+    # .git-credentials or gh hosts.yml (those carry the server's GitHub identity).
+    if [ ! -f /home/laneuser/.archon-lane-seeded ]; then
+      for item in .claude .claude.json .codex .cursor; do
+        if [ -e "/home/appuser/$item" ]; then
+          cp -a "/home/appuser/$item" "/home/laneuser/$item" 2>/dev/null || true
+        fi
+      done
+      touch /home/laneuser/.archon-lane-seeded
+    fi
+    # Never leak the server's git credentials into the lane home.
+    rm -f /home/laneuser/.git-credentials /home/laneuser/.config/gh/hosts.yml 2>/dev/null || true
+    chown -Rh laneuser:laneuser /home/laneuser 2>/dev/null || true
+    chmod 0700 /home/laneuser 2>/dev/null || true
+
+    # Lane gitconfig: safe.directory + the run_nodes (Builder 2) App credential
+    # helper so lanes keep self-minting Builder 2 tokens (never the PAT/reviewer).
+    # The Builder 2 App id is read into a local var so this if-condition does not
+    # textually match the reviewer-vs-builder install gate below (line ~177),
+    # which docker-entrypoint-app-helper.test.ts lifts by first 'if' line
+    # mentioning GITHUB_APP_RUN_NODES_ID.
+    lane_run_nodes_id="${GITHUB_APP_RUN_NODES_ID:-}"
+    gosu laneuser git config --global --replace-all safe.directory '*' 2>/dev/null || true
+    if [ -n "$lane_run_nodes_id" ]; then
+      gosu laneuser git config --global credential."https://github.com".helper \
+        '!f() { if [ "$1" = get ]; then token=$(bun /app/scripts/github-service-token.ts run_nodes) || exit; printf "username=x-access-token\npassword=%s\n" "$token"; fi; }; f' 2>/dev/null || true
+    fi
+
+    # Database + /.archon traversal closed to the lane (other) UID. /.archon is
+    # 0751 (traverse-only for others) so laneuser can reach the group-writable
+    # workspaces subtree but cannot read the DB or create files at the top level.
+    chmod 0751 /.archon 2>/dev/null || true
+    for dbf in /.archon/archon.db /.archon/archon.db-wal /.archon/archon.db-shm; do
+      if [ -e "$dbf" ]; then
+        chown 1001:1001 "$dbf" 2>/dev/null || true
+        chmod 0600 "$dbf" 2>/dev/null || true
+      fi
+    done
+
+    # Lane-writable allowlist: workspace clones/worktrees, run artifacts,
+    # node-out and run logs become group laneuser, setgid, group-writable (2775)
+    # so BOTH the server and the lane can write them.
+    if [ -d /.archon/workspaces ]; then
+      chgrp -R laneuser /.archon/workspaces 2>/dev/null || true
+      chmod -R g+rwX /.archon/workspaces 2>/dev/null || true
+      find /.archon/workspaces -type d -exec chmod g+s {} + 2>/dev/null || true
+      # core.sharedRepository=group on each workspace clone so lane + server git
+      # produce group-writable objects. Run as laneuser (never server UID in a
+      # workspace path) to honor the reverse-path rule.
+      find /.archon/workspaces -type d -name '.git' -prune 2>/dev/null | while IFS= read -r gd; do
+        repo_root="$(dirname "$gd")"
+        gosu laneuser git -C "$repo_root" config core.sharedRepository group 2>/dev/null || true
+      done
+    fi
+  fi
+
   # WO-168 Tier 1: /host-artifacts is a host bind mount for load-bearing
   # workflow output (git bundles, raw artifacts). Workflow nodes run as
   # appuser, so we must own it. Best-effort: if the mount is missing
@@ -142,6 +208,12 @@ if [ -z "${CLAUDE_BIN_PATH:-}" ]; then
   fi
   unset _CLAUDE_BIN_CANDIDATE
 fi
+
+# Lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01): umask 0002 so files the
+# server creates inside the group-laneuser workspace allowlist stay
+# group-writable (the lane can clean them). appuser is the sole member of its own
+# primary group, so this does not widen access to the server's home.
+umask 0002
 
 # Run setup-auth (exits after configuring Codex credentials), then exec the server
 # exec ensures bun is PID 1 and receives SIGTERM for graceful shutdown

@@ -31,6 +31,7 @@ import type {
   ProviderCapabilities,
   SendQueryOptions,
 } from '../../types';
+import { buildLaneSubprocessEnv, laneSpawnArgv } from '@archon/paths';
 import { CURSOR_AGENT_CAPABILITIES } from './capabilities';
 import { parseCursorAgentConfig } from './config';
 
@@ -111,8 +112,16 @@ export class CursorAgentProvider implements IAgentProvider {
       throw new Error('provider:cursor requires a non-empty cwd (worktree path)');
     }
     const model = options?.model ?? this.model;
-    const argv = buildCursorAgentArgv(this.binaryPath, model, cwd);
-    const child = this.spawn(argv, { cwd, env: { ...process.env, ...(options?.env ?? {}) } });
+    const baseArgv = buildCursorAgentArgv(this.binaryPath, model, cwd);
+    // Lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01): run cursor-agent as
+    // the lane UID with reviewer/merge/PAT material scrubbed when the launcher is
+    // active; otherwise (local dev / CI) spawn unchanged.
+    const argv = laneSpawnArgv(baseArgv);
+    const laneActive = argv[0] !== baseArgv[0];
+    const spawnEnv = laneActive
+      ? buildLaneSubprocessEnv({ ...process.env, ...(options?.env ?? {}) })
+      : { ...process.env, ...(options?.env ?? {}) };
+    const child = this.spawn(argv, { cwd, env: spawnEnv });
     const onAbort = (): void => {
       child.kill();
     };

@@ -81,6 +81,10 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     gnupg \
     gosu \
+    # libcap2-bin provides setcap, used to grant cap_setuid,cap_setgid to the
+    # root-owned lane launcher (WO-HARNESS-APP-KEY-ISOLATION-01). util-linux
+    # (setpriv) is already present in the base image.
+    libcap2-bin \
     # jq is load-bearing: lane read-spec bash nodes parse GitHub API JSON with it
     # (2026-07-10 outage #2: image shipped without jq -> read-spec exit 127)
     jq \
@@ -174,6 +178,54 @@ RUN mkdir -p /opt/cursor-agent \
 # Claude Code refuses to run with --dangerously-skip-permissions as root for security
 RUN useradd -m -u 1001 -s /bin/bash appuser \
     && chown -R appuser:appuser /app
+
+# ---------------------------------------------------------------------------
+# Lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01)
+# ---------------------------------------------------------------------------
+# A Cauldron builder lane runs untrusted, AI-authored code. It must not be able
+# to read the Overseer (reviewer) App key, the merge/operator PATs, or the
+# server process environment, nor write the server's gitconfig / home / database.
+# Every lane subprocess gets a distinct unprivileged identity (laneuser, 1002)
+# via a setuid launcher; the server (appuser, 1001) keeps the keys.
+#
+#   group laneuser (1002)       lane primary group; appuser is a supplementary
+#                               member so it can read/clean lane output.
+#   group archon-secrets (1100) owns the reviewer/merge key mounts (0440);
+#                               appuser is the ONLY member, laneuser is not.
+#   group archon-launch (1101)  may execute the setuid launcher; appuser only.
+#   /usr/local/libexec/archon/lane-setpriv  root-owned copy of setpriv carrying
+#                               cap_setuid,cap_setgid+ep, mode 0750
+#                               root:archon-launch -- the server stays
+#                               capability-free and laneuser cannot execute it.
+#
+# GIDs 1100/1101 are fixed defaults (confirmed unused in the base image);
+# groupadd fails the build loudly on any collision.
+RUN groupadd -g 1002 laneuser \
+    && useradd -m -u 1002 -g laneuser -s /bin/bash -d /home/laneuser laneuser \
+    && chown laneuser:laneuser /home/laneuser \
+    && chmod 0700 /home/laneuser \
+    && groupadd -g 1100 archon-secrets \
+    && groupadd -g 1101 archon-launch \
+    && usermod -aG laneuser,archon-secrets,archon-launch appuser \
+    && install -d -m 0755 /usr/local/libexec/archon \
+    && cp "$(command -v setpriv)" /usr/local/libexec/archon/lane-setpriv \
+    && chown root:archon-launch /usr/local/libexec/archon/lane-setpriv \
+    && chmod 0750 /usr/local/libexec/archon/lane-setpriv \
+    && setcap cap_setuid,cap_setgid+ep /usr/local/libexec/archon/lane-setpriv
+
+# Install the lane launcher wrapper on PATH, then assert (load-bearing, Test 4)
+# that laneuser CANNOT execute the setuid launcher (the archon-launch group gate)
+# and that appuser CAN drop to the lane UID through it.
+COPY scripts/container/archon-lane-exec.sh /usr/local/bin/archon-lane-exec
+RUN sed -i 's/\r$//' /usr/local/bin/archon-lane-exec \
+    && chmod 0755 /usr/local/bin/archon-lane-exec \
+    && if gosu laneuser /usr/local/libexec/archon/lane-setpriv --reuid=1002 --regid=1002 -- true 2>/dev/null; then \
+         echo "ERROR: laneuser can execute lane-setpriv -- archon-launch gate is broken" >&2 && exit 1; \
+       else echo "[archon] OK: lane-setpriv denied to laneuser (archon-launch gate)"; fi \
+    && DROP_UID="$(gosu appuser /usr/local/bin/archon-lane-exec id -u)" \
+    && if [ "$DROP_UID" != "1002" ]; then \
+         echo "ERROR: archon-lane-exec dropped to UID '$DROP_UID', expected 1002 (setcap/file-caps failure)" >&2 && exit 1; \
+       else echo "[archon] OK: archon-lane-exec drops appuser to lane UID 1002"; fi
 
 # Create Archon directories
 RUN mkdir -p /.archon/workspaces /.archon/worktrees \

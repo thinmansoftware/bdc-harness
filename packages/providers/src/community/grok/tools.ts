@@ -4,6 +4,7 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { buildLaneSubprocessEnv, laneSpawnArgv } from '@archon/paths';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 
@@ -128,12 +129,17 @@ export async function executeGrokTool(
         const shell = process.platform === 'win32' ? 'cmd.exe' : 'bash';
         const shellArgs =
           process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-lc', command];
+        // Lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01): the grok bash tool
+        // runs lane-authored shell, so drop to the lane UID with a scrubbed env
+        // when the launcher is active (no-op in local dev / CI / on Windows).
+        const laneArgv = laneSpawnArgv([shell, ...shellArgs]);
+        const laneActive = laneArgv[0] !== shell;
         try {
-          const { stdout, stderr } = await execFileAsync(shell, shellArgs, {
+          const { stdout, stderr } = await execFileAsync(laneArgv[0], laneArgv.slice(1), {
             cwd,
             timeout,
             maxBuffer: 8 * 1024 * 1024,
-            env: process.env,
+            env: laneActive ? buildLaneSubprocessEnv(process.env) : process.env,
             windowsHide: true,
           });
           const out = `${stdout ?? ''}${stderr ? `\nSTDERR:\n${stderr}` : ''}`.trim();

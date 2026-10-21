@@ -47,12 +47,23 @@ function getArchonHome(): string {
   return process.env.ARCHON_HOME ?? join(homedir(), '.archon');
 }
 
+// mock.module replaces the ENTIRE @archon/paths module, so exec.ts's lane
+// helpers (buildLaneSubprocessEnv, laneSpawnArgv) must be provided here too.
+// Import the real implementations via a relative path (a different specifier, so
+// not intercepted by this mock) and re-expose them -- they are pure functions.
+import {
+  buildLaneSubprocessEnv as realBuildLaneSubprocessEnv,
+  laneSpawnArgv as realLaneSpawnArgv,
+} from '../../paths/src/lane-env';
+
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   getArchonWorktreesPath: () => join(getArchonHome(), 'worktrees'),
   getArchonWorkspacesPath: () => join(getArchonHome(), 'workspaces'),
   getProjectWorktreesPath: (owner: string, repo: string) =>
     join(getArchonHome(), 'workspaces', owner, repo, 'worktrees'),
+  buildLaneSubprocessEnv: realBuildLaneSubprocessEnv,
+  laneSpawnArgv: realLaneSpawnArgv,
 }));
 
 // ---------------------------------------------------------------------------
@@ -2206,6 +2217,95 @@ branch refs/heads/feature/auth
       );
       expect(await git.isValidBranchName('whatever')).toBe(false);
       execSpy.mockRestore();
+    });
+  });
+
+  // ==========================================================================
+  // Lane UID isolation routing (WO-HARNESS-APP-KEY-ISOLATION-01, Test 8 core)
+  //
+  // resolveLaneGitSpawn is the server-side chokepoint: a git command whose cwd
+  // or -C/--git-dir/--work-tree target resolves under the workspaces root is
+  // rewritten to run through the lane launcher with a scrubbed env, so a
+  // lane-planted .git/config (credential.helper, core.fsmonitor, hooks, etc.)
+  // can never execute under the server UID. The full Test 8 (marker files owned
+  // by UID 1002, not 1001) is an image test gated below.
+  // ==========================================================================
+  describe('resolveLaneGitSpawn (lane routing decision)', () => {
+    const WS = join(tmpdir(), 'archon-ws-test');
+    const injected = { exists: () => true, workspaceRoot: WS };
+
+    test('wraps a git command whose cwd is under the workspaces root', () => {
+      const routed = git.resolveLaneGitSpawn(
+        'git',
+        ['status', '--porcelain'],
+        { cwd: join(WS, 'thinmansoftware/bdc-harness/worktrees/x') },
+        injected
+      );
+      expect(routed.cmd).toBe('/usr/local/bin/archon-lane-exec');
+      expect(routed.args).toEqual(['git', 'status', '--porcelain']);
+      // env is scrubbed: a reviewer/PAT var does not survive, HOME is repointed.
+      const routedWithEnv = git.resolveLaneGitSpawn(
+        'git',
+        ['status'],
+        { cwd: join(WS, 'a'), env: { GH_TOKEN: 'secret', PATH: '/usr/bin' } },
+        injected
+      );
+      expect(routedWithEnv.options?.env?.GH_TOKEN).toBeUndefined();
+      expect(routedWithEnv.options?.env?.HOME).toBe('/home/laneuser');
+      expect(routedWithEnv.options?.env?.PATH).toBe('/usr/bin');
+    });
+
+    test('wraps when the workspace path is given via -C (space and = forms)', () => {
+      for (const args of [
+        ['-C', join(WS, 'repo'), 'rev-parse', 'HEAD'],
+        [`--git-dir=${join(WS, 'repo', '.git')}`, 'rev-parse', 'HEAD'],
+        ['--work-tree', join(WS, 'repo'), 'checkout', '.'],
+      ]) {
+        const routed = git.resolveLaneGitSpawn('git', args, undefined, injected);
+        expect(routed.cmd).toBe('/usr/local/bin/archon-lane-exec');
+        expect(routed.args).toEqual(['git', ...args]);
+      }
+    });
+
+    test('does NOT wrap git outside the workspaces root', () => {
+      const routed = git.resolveLaneGitSpawn(
+        'git',
+        ['status'],
+        { cwd: join(tmpdir(), 'some-other-dir') },
+        injected
+      );
+      expect(routed.cmd).toBe('git');
+      expect(routed.args).toEqual(['status']);
+    });
+
+    test('does NOT wrap non-git commands even inside the workspaces root', () => {
+      const routed = git.resolveLaneGitSpawn(
+        'bash',
+        ['-c', 'echo hi'],
+        { cwd: join(WS, 'repo') },
+        injected
+      );
+      expect(routed.cmd).toBe('bash');
+    });
+
+    test('does NOT wrap when isolation is disabled', () => {
+      const routed = git.resolveLaneGitSpawn(
+        'git',
+        ['status'],
+        { cwd: join(WS, 'repo') },
+        { ...injected, env: { ARCHON_LANE_UID_ISOLATION: '0' } }
+      );
+      expect(routed.cmd).toBe('git');
+    });
+
+    test('does NOT wrap when the launcher is absent (local dev / CI)', () => {
+      const routed = git.resolveLaneGitSpawn(
+        'git',
+        ['status'],
+        { cwd: join(WS, 'repo') },
+        { workspaceRoot: WS, exists: () => false }
+      );
+      expect(routed.cmd).toBe('git');
     });
   });
 });

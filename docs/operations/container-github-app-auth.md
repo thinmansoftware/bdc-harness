@@ -84,7 +84,11 @@ The private key must never be committed to git and must never appear in
 `docker-compose.yml`. Bind-mount the PEM from the host into the container:
 
 1. Place the PEM on the host outside any git repo, e.g.
-   `/opt/bdc/archon/secrets/thinman-overseer-app.private-key.pem`, mode `0600`.
+   `/opt/bdc/archon/secrets/thinman-overseer-app.private-key.pem`. The owner,
+   group, and mode are NO LONGER plain `0600` -- lane UID isolation requires a
+   specific owner/group/mode per key so a builder lane cannot read the reviewer
+   key. See "Lane key isolation" below for the required table and the exact host
+   commands. (WO-HARNESS-APP-KEY-ISOLATION-01)
 2. In `docker-compose.yml`, add a read-only bind mount for the app service:
    ```yaml
    volumes:
@@ -319,3 +323,115 @@ it also checks payload forwarding and identical-byte permission retry:
 ```bash
 bun test ./scripts/github-service-exec.test.ts
 ```
+
+## Lane key isolation (WO-HARNESS-APP-KEY-ISOLATION-01)
+
+A Cauldron builder lane runs untrusted, AI-authored code inside `archon-app-1`.
+Before this change the reviewer server and every lane ran as the same UID (1001)
+in one process tree, so a lane could read the Overseer (reviewer) App private
+key, the merge-manager / user PATs, and the server process environment
+(`/proc/1/environ`), and could therefore sign or act as the reviewer. `chmod`
+alone cannot fix this because the keys and the lane share a UID.
+
+The fix gives every lane subprocess a distinct unprivileged identity
+(`laneuser`, UID 1002) via a root-owned, `setcap`'d launcher
+(`/usr/local/libexec/archon/lane-setpriv`, invoked through
+`/usr/local/bin/archon-lane-exec`). The server (`appuser`, UID 1001) keeps the
+keys; lanes get a scrubbed environment, a separate `/home/laneuser`, and no read
+access to the reviewer key, the server environment, or the database. Lanes keep
+the Builder 2 (`run_nodes`) key because lanes ARE Builder 2.
+
+### Required host owner/group/mode for the key mounts
+
+The container image creates these groups: `laneuser` (GID 1002), `archon-secrets`
+(GID 1100), `archon-launch` (GID 1101). `appuser` is a member of all three;
+`laneuser` is a member of none of `archon-secrets`/`archon-launch`. The HOST PEM
+files map their group by GID (the host does not need matching group names), so
+set them by numeric GID:
+
+| Host PEM file                         | Mounted at                              | Owner | Group (GID)         | Mode | Lane can read? |
+|---------------------------------------|-----------------------------------------|-------|---------------------|------|----------------|
+| `thinman-overseer.private-key.pem`    | `/run/secrets/thinman-overseer.pem`     | root  | `archon-secrets` (1100) | 0440 | NO (reviewer)  |
+| `thinman-builder-2.private-key.pem`   | `/run/secrets/thinman-builder-2.pem`    | root  | `laneuser` (1002)   | 0440 | YES (Builder 2)|
+| `thinman-builder.private-key.pem`     | (none -- REMOVE this mount)             | -     | -                   | -    | -              |
+
+The previous runbook said host mode `0600`; that is replaced by the table above
+(0440 with the owning group doing the read-gating). `appuser` reads the reviewer
+key through its `archon-secrets` membership; `laneuser` cannot.
+
+### Post-merge rebuild step: lane key isolation
+
+Applied ONLY on the host by the operator (Rule 11.5 rebuild, John pinged). Never
+performed by a lane.
+
+```bash
+# 0) Record current state for rollback.
+cd /opt/bdc/archon
+cp docker-compose.override.yml docker-compose.override.yml.bak.$(date +%s)
+ls -ln /opt/bdc/archon/secrets/*.private-key.pem > /opt/bdc/archon/secrets/.pre-isolation-ls-ln.txt
+ls -ldn /.archon /home/appuser 2>/dev/null >> /opt/bdc/archon/secrets/.pre-isolation-ls-ln.txt || true
+
+# 1) Re-own the host PEMs (numeric owner/group; 1100=archon-secrets, 1002=laneuser).
+chown 0:1100 /opt/bdc/archon/secrets/thinman-overseer.private-key.pem
+chmod 0440   /opt/bdc/archon/secrets/thinman-overseer.private-key.pem
+chown 0:1002 /opt/bdc/archon/secrets/thinman-builder-2.private-key.pem
+chmod 0440   /opt/bdc/archon/secrets/thinman-builder-2.private-key.pem
+
+# 2) Remove the unused thinman-builder.pem line from docker-compose.override.yml
+#    (the single-builder key is no longer mounted). Edit the file and delete the
+#    line that bind-mounts thinman-builder.pem (NOT thinman-builder-2.pem).
+
+# 3) Rebuild + recreate per the proven M-181 plan (worktree protection, DB
+#    backup, image pin, explicit fetch, build, verify), then recreate:
+sudo docker compose build && sudo docker compose up -d
+
+# 4) Run the Section 8 runtime checks (Stops 4-12) below and paste output on the
+#    WO issue.
+```
+
+### Runtime verification (Stops 4-12; paste output on the WO issue)
+
+```bash
+# Stop 4: reviewer key unreadable by the lane UID
+docker exec -u 1002:1002 archon-app-1 cat /run/secrets/thinman-overseer.pem > /dev/null   # non-zero, Permission denied
+# Stop 5: server env unreadable by the lane UID
+docker exec -u 1002:1002 archon-app-1 head -c0 /proc/1/environ                            # non-zero, Permission denied
+# Stop 6: Builder 2 key still readable by the lane UID
+docker exec -u 1002:1002 archon-app-1 test -r /run/secrets/thinman-builder-2.pem          # exit 0
+# Stop 7: server holds the secrets group; reviewer key mode
+docker exec archon-app-1 grep -c '^Groups:.*1100' /proc/1/status                          # 1
+docker exec archon-app-1 stat -c '%a %u %g' /run/secrets/thinman-overseer.pem             # 440 0 1100
+# Stop 10: no auth errors after rebuild
+docker logs archon-app-1 --since 30m 2>&1 | grep -c 'github_app_auth_private_key_unreadable'   # 0
+# Stop 11: database + server config closed to the lane UID
+docker exec archon-app-1 stat -c '%a %u' /.archon/archon.db /.archon/archon.db-wal /.archon/archon.db-shm   # 600 1001 each
+docker exec -u 1002:1002 archon-app-1 test -w /home/appuser/.gitconfig                    # non-zero
+docker exec -u 1002:1002 archon-app-1 test -r /.archon/archon.db                          # non-zero
+# Stop 12: lane provider auth still works 24h after rebuild (OAuth refresh-rotation)
+docker logs archon-app-1 --since 24h 2>&1 | grep -ic 'refresh_expired'                    # 0
+```
+
+Stops 8 (Overseer still reviews a canary PR authored by Builder 2) and 9 (no
+worktree process at UID 1001 for the whole canary run) are the end-to-end canary
+checks in the WO Section 8.
+
+### In-image self-test
+
+The image tests in `scripts/container/lane-isolation.test.ts` (Tests 4, 7, 8)
+run inside `archon-app-1`:
+
+```bash
+docker exec -e ARCHON_LANE_ISOLATION_IMAGE_TEST=1 archon-app-1 \
+  bun test /app/scripts/container/lane-isolation.test.ts
+```
+
+### Rollback (minutes)
+
+1. Host: restore the backed-up `docker-compose.override.yml` and the recorded
+   owner/modes from `/opt/bdc/archon/secrets/.pre-isolation-ls-ln.txt`
+   (`chown 1000:1000`, `chmod 0644` on the PEMs; restore `/.archon`,
+   `archon.db*`, `/home/appuser`).
+2. Or set `ARCHON_LANE_UID_ISOLATION=0` in `.env` and recreate the container:
+   lanes run as 1001 again (previous behavior), the launcher is bypassed.
+3. Or redeploy the previous pinned image tag from the M-181 backup, and revert
+   the PR on `dev`.

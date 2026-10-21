@@ -80,6 +80,36 @@ export function consumeGitHubTrace(
   return { stderr: visible.join('\n'), observations };
 }
 
+/** Services a builder lane (laneuser UID) is permitted to act as. A lane IS
+ * Builder 2 (run_nodes); smart_cauldron is the lane's own batch identity. Any
+ * other service (overseer, merge_manager, taskmaster, ...) is refused so a lane
+ * cannot mint or act as the reviewer / merge manager even though the gh shim
+ * reads ARCHON_GITHUB_SERVICE, which a lane can set.
+ * (WO-HARNESS-APP-KEY-ISOLATION-01, Test 3) */
+const LANE_ALLOWED_SERVICES: ReadonlySet<GitHubService> = new Set<GitHubService>([
+  'run_nodes',
+  'smart_cauldron',
+]);
+
+/** The unprivileged lane UID (laneuser); overridable for tests. */
+function laneUid(): number {
+  const parsed = Number.parseInt(process.env.ARCHON_LANE_UID ?? '1002', 10);
+  return Number.isNaN(parsed) ? 1002 : parsed;
+}
+
+/** Throw lane_service_forbidden when a builder lane (lane UID) requests a
+ * non-builder GitHub service. */
+export function assertLaneServiceAllowed(
+  service: GitHubService,
+  currentUid: number | undefined
+): void {
+  if (currentUid === laneUid() && !LANE_ALLOWED_SERVICES.has(service)) {
+    throw new Error(
+      `lane_service_forbidden: builder lane may not act as GitHub service '${service}'`
+    );
+  }
+}
+
 export async function runGitHubServiceCommand(input: {
   service: GitHubService;
   command: string;
@@ -91,10 +121,48 @@ export async function runGitHubServiceCommand(input: {
   token?: (identity: ServiceGitHubAuth) => Promise<string>;
   execute?: (command: string[], env: Record<string, string | undefined>) => CommandResult;
   db?: IDatabase;
+  /** Effective UID of this process; defaults to process.getuid(). Injected in tests. */
+  currentUid?: number;
+  /** Observability hook invoked once when metering is skipped (unwritable DB). */
+  onMeteringSkipped?: () => void;
 }): Promise<CommandResult> {
   const env = input.env ?? process.env;
+  assertLaneServiceAllowed(input.service, input.currentUid ?? process.getuid?.());
   const identity = input.identity ?? resolveServiceGitHubAuth(input.service, env);
-  const db = input.db ?? getDatabase();
+  // Metering persists to archon.db. A builder lane (laneuser UID) cannot open or
+  // write the server-owned archon.db (0600 owner 1001); when the DB is
+  // unavailable, skip metering with a single warning rather than failing the gh
+  // command the lane needs. (WO-HARNESS-APP-KEY-ISOLATION-01, Test 3)
+  let db: IDatabase | undefined = input.db;
+  if (!db) {
+    try {
+      db = getDatabase();
+    } catch {
+      db = undefined;
+    }
+  }
+  let meteringSkipLogged = false;
+  const skipMetering = (): void => {
+    if (meteringSkipLogged) return;
+    meteringSkipLogged = true;
+    process.stderr.write(
+      'github_metering_skipped: archon.db not accessible from this process; continuing without GitHub API metering\n'
+    );
+    input.onMeteringSkipped?.();
+  };
+  /** Persist buffered meter rows, degrading to a skip when the DB is unwritable. */
+  const flushMeter = async (): Promise<void> => {
+    if (!db) {
+      skipMetering();
+      return;
+    }
+    try {
+      await flushGitHubApiMeter(db);
+    } catch {
+      skipMetering();
+      db = undefined;
+    }
+  };
   const execute =
     input.execute ??
     ((command, childEnv): CommandResult =>
@@ -120,12 +188,28 @@ export async function runGitHubServiceCommand(input: {
     permissionFallback = false
   ): Promise<CommandResult> => {
     // A gh command may use REST and GraphQL in the same operation. Refuse
-    // conservatively if any of its pool's known resources is exhausted.
-    await assertPersistedGitHubPoolAvailable(
-      selected.poolId,
-      ['core', 'graphql', 'search', 'cli'],
-      db
-    );
+    // conservatively if any of its pool's known resources is exhausted. When the
+    // DB is unreachable (lane UID), skip the check rather than block the command.
+    if (db) {
+      try {
+        await assertPersistedGitHubPoolAvailable(
+          selected.poolId,
+          ['core', 'graphql', 'search', 'cli'],
+          db
+        );
+      } catch (poolError) {
+        // Preserve a genuine pool-availability refusal (github_pool_backoff);
+        // only swallow DB-access failures (unwritable/unreadable archon.db from
+        // a lane UID) as a metering skip.
+        if (poolError instanceof Error && poolError.message.startsWith('github_pool_backoff')) {
+          throw poolError;
+        }
+        skipMetering();
+        db = undefined;
+      }
+    } else {
+      skipMetering();
+    }
     const token =
       selected.kind === 'pat'
         ? selected.token
@@ -147,7 +231,7 @@ export async function runGitHubServiceCommand(input: {
         status: 0,
         permissionFallback,
       });
-      await flushGitHubApiMeter(db);
+      await flushMeter();
       throw error;
     }
     const trace = consumeGitHubTrace(
@@ -172,7 +256,7 @@ export async function runGitHubServiceCommand(input: {
       });
     }
     // Persist before exit/retry so the next CLI process sees the same pool.
-    await flushGitHubApiMeter(db);
+    await flushMeter();
     let stderr = trace.stderr;
     for (const secret of [token, fallback]) {
       if (secret) stderr = stderr.split(secret).join('[redacted]');
@@ -216,9 +300,15 @@ if (import.meta.main) {
     if (result.stderr.byteLength) await Bun.write(Bun.stderr, result.stderr);
     process.exitCode = result.exitCode;
   } catch (error) {
-    console.error(
-      `github_service_command_failed:${error instanceof Error ? error.name : 'unknown'}`
-    );
+    // Surface the lane refusal verbatim so operators (and Stop/Test 3) see why a
+    // builder lane was denied a non-builder GitHub service.
+    if (error instanceof Error && error.message.startsWith('lane_service_forbidden')) {
+      console.error(error.message);
+    } else {
+      console.error(
+        `github_service_command_failed:${error instanceof Error ? error.name : 'unknown'}`
+      );
+    }
     process.exitCode = 1;
   } finally {
     await closeDatabase();

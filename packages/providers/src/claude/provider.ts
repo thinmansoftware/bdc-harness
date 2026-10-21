@@ -36,6 +36,7 @@ import type {
   ProviderCapabilities,
   NodeConfig,
 } from '../types';
+import { buildLaneSubprocessEnv, laneSpawnArgv } from '@archon/paths';
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { resolveClaudeBinaryPath } from './binary-resolver';
@@ -598,13 +599,33 @@ function buildBaseClaudeOptions(
   const isJsExecutable = shouldPassNoEnvFile(cliPath);
   getLog().debug({ cliPath: cliPath ?? null, isJsExecutable }, 'claude.subprocess_env_file_flag');
 
+  // Lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01): when the lane launcher
+  // is active, run the Claude CLI subprocess through it (dropping to the lane UID)
+  // and scrub reviewer/merge/PAT material from its env. The SDK takes a single
+  // executable plus executableArgs, so the launcher becomes the executable and
+  // the real CLI path is prepended to executableArgs. In dev mode (cliPath
+  // undefined, SDK resolves from node_modules) or without the launcher, the prior
+  // behavior is preserved unchanged.
+  const baseExecutableArgs = isJsExecutable ? ['--no-env-file'] : [];
+  let executablePath = cliPath;
+  let executableArgs = baseExecutableArgs;
+  let resolvedEnv = env;
+  if (cliPath !== undefined) {
+    const laneArgv = laneSpawnArgv([cliPath, ...baseExecutableArgs]);
+    if (laneArgv[0] !== cliPath) {
+      executablePath = laneArgv[0];
+      executableArgs = laneArgv.slice(1);
+      resolvedEnv = buildLaneSubprocessEnv(env);
+    }
+  }
+
   return {
     cwd,
     // In compiled binaries, the resolver supplies an absolute executable path;
     // in dev mode it returns undefined and the SDK resolves from node_modules.
-    ...(cliPath !== undefined ? { pathToClaudeCodeExecutable: cliPath } : {}),
-    ...(isJsExecutable ? { executableArgs: ['--no-env-file'] } : {}),
-    env,
+    ...(executablePath !== undefined ? { pathToClaudeCodeExecutable: executablePath } : {}),
+    ...(executableArgs.length > 0 ? { executableArgs } : {}),
+    env: resolvedEnv,
     model: requestOptions?.model ?? assistantDefaults.model,
     abortController: controller,
     ...(requestOptions?.outputFormat !== undefined

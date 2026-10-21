@@ -17,6 +17,7 @@ import {
   win32 as win32Path,
 } from 'path';
 import { execFileAsync } from '@archon/git';
+import { buildLaneSubprocessEnv, laneSpawnArgv } from '@archon/core/github/lane-env';
 import { discoverScriptsForCwd } from './script-discovery';
 import { resolveModelForNode, type ModelOverride } from './model-override';
 import type {
@@ -3298,10 +3299,17 @@ async function executeBashNode(
           scriptPreparationFailed: true,
         });
       }
-      ({ stdout, stderr } = await execFileAsync('bash', [scriptFile], {
+      // Lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01): run the bash node
+      // as the unprivileged lane UID with reviewer/merge/PAT material scrubbed.
+      // When the launcher is absent (local dev / CI) laneSpawnArgv is a no-op and
+      // the env is left untouched so existing behavior is preserved.
+      const bashArgv = laneSpawnArgv(['bash', scriptFile]);
+      const bashLaneActive = bashArgv[0] !== 'bash';
+      const bashEnv = bashLaneActive ? buildLaneSubprocessEnv(subprocessEnv) : subprocessEnv;
+      ({ stdout, stderr } = await execFileAsync(bashArgv[0], bashArgv.slice(1), {
         cwd,
         timeout,
-        env: subprocessEnv,
+        env: bashEnv,
       }));
     } finally {
       try {
@@ -3664,10 +3672,21 @@ async function executeScriptNode(
       }
     }
 
-    const { stdout, stderr } = await execFileAsync(cmd, args, {
+    // Lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01): run the script node
+    // as the unprivileged lane UID with reviewer/merge/PAT material scrubbed.
+    // When lane isolation is active the env is ALWAYS built via
+    // buildLaneSubprocessEnv({...process.env, ...envVars}) -- a script node with
+    // no env: keys must NOT inherit the raw server process.env. When the launcher
+    // is absent (local dev / CI) the prior subprocessEnv behavior is preserved.
+    const scriptArgv = laneSpawnArgv([cmd, ...args]);
+    const scriptLaneActive = scriptArgv[0] !== cmd;
+    const scriptEnv = scriptLaneActive
+      ? buildLaneSubprocessEnv({ ...process.env, ...(envVars ?? {}) })
+      : subprocessEnv;
+    const { stdout, stderr } = await execFileAsync(scriptArgv[0], scriptArgv.slice(1), {
       cwd,
       timeout,
-      env: subprocessEnv,
+      env: scriptEnv,
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -4815,7 +4834,16 @@ async function executeLoopNode(
           nodeOutputs,
           true // escapedForBash
         );
-        await execFileAsync('bash', ['-c', substitutedBash], { cwd });
+        // Lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01): the loop
+        // until_bash predicate runs lane-authored shell, so it drops to the lane
+        // UID with a scrubbed env when the launcher is active.
+        const loopArgv = laneSpawnArgv(['bash', '-c', substitutedBash]);
+        const loopLaneActive = loopArgv[0] !== 'bash';
+        await execFileAsync(
+          loopArgv[0],
+          loopArgv.slice(1),
+          loopLaneActive ? { cwd, env: buildLaneSubprocessEnv(process.env) } : { cwd }
+        );
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;

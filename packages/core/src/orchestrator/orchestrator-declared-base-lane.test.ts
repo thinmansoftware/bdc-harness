@@ -25,6 +25,13 @@ mock.module('@archon/paths', () => ({
   getArchonWorkspacesPath: mock(() => '/home/test/.archon/workspaces'),
   ensureArchonWorkspacesPath: mock(() => Promise.resolve('/home/test/.archon/workspaces')),
   getArchonHome: mock(() => '/home/test/.archon'),
+  // Lane isolation helpers (WO-HARNESS-APP-KEY-ISOLATION-01): @archon/git exec.ts
+  // now imports these from @archon/paths. Identity stubs match the no-launcher
+  // behavior used in tests (laneSpawnArgv returns argv unchanged).
+  getProjectWorktreesPath: (owner: string, repo: string) =>
+    `/home/test/.archon/workspaces/${owner}/${repo}/worktrees`,
+  buildLaneSubprocessEnv: (env: Record<string, string | undefined>) => env,
+  laneSpawnArgv: (argv: string[]) => argv,
 }));
 
 mock.module('../db/conversations', () => ({

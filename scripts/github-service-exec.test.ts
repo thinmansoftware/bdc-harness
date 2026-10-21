@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
+  assertLaneServiceAllowed,
   githubCommandReadsStdin,
   runGitHubServiceCommand as runCommand,
 } from './github-service-exec';
@@ -350,5 +351,85 @@ describe('operation-scoped GitHub CLI authentication', () => {
     expect(mints).toBe(1);
     // The App 403 surfaces as a failure rather than a reviewer-authored success.
     expect(result.exitCode).toBe(1);
+  });
+});
+
+describe('lane UID isolation (WO-HARNESS-APP-KEY-ISOLATION-01, Test 3)', () => {
+  const LANE_UID = 1002;
+
+  test('assertLaneServiceAllowed refuses non-builder services at the lane UID', () => {
+    for (const service of ['overseer', 'merge_manager', 'taskmaster', 'duty_officer'] as const) {
+      expect(() => assertLaneServiceAllowed(service, LANE_UID)).toThrow('lane_service_forbidden');
+    }
+    // Builder services are allowed from the lane.
+    expect(() => assertLaneServiceAllowed('run_nodes', LANE_UID)).not.toThrow();
+    expect(() => assertLaneServiceAllowed('smart_cauldron', LANE_UID)).not.toThrow();
+    // Off-lane (server UID / undefined) everything is permitted -- the server
+    // process legitimately acts as the reviewer.
+    expect(() => assertLaneServiceAllowed('overseer', 1001)).not.toThrow();
+    expect(() => assertLaneServiceAllowed('overseer', undefined)).not.toThrow();
+  });
+
+  test('runGitHubServiceCommand refuses overseer from a lane and never spawns gh', async () => {
+    let executed = false;
+    await expect(
+      runCommand({
+        service: 'overseer',
+        command: 'gh',
+        args: ['pr', 'view', '1'],
+        currentUid: LANE_UID,
+        db,
+        env: { GH_TOKEN: 'x' },
+        execute: () => {
+          executed = true;
+          return { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+        },
+      })
+    ).rejects.toThrow('lane_service_forbidden');
+    expect(executed).toBe(false);
+  });
+
+  test('a read-only archon.db degrades to a metering skip without failing the gh call', async () => {
+    let skipped = 0;
+    // A DB whose every operation throws, simulating the lane's unreadable/
+    // unwritable server-owned archon.db (0600 owner 1001).
+    const readonlyDb = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('attempt to write a readonly database');
+        },
+      }
+    ) as unknown as SqliteAdapter;
+
+    const result = await runCommand({
+      service: 'run_nodes',
+      command: 'gh',
+      args: ['pr', 'view', '1', '--json', 'mergeable'],
+      currentUid: LANE_UID,
+      db: readonlyDb,
+      identity: {
+        kind: 'pat',
+        service: 'run_nodes',
+        token: 'builder-pat',
+        poolId: 'user-pat',
+        distinct: false,
+      },
+      env: { GH_TOKEN: 'builder-pat' },
+      onMeteringSkipped: () => {
+        skipped += 1;
+      },
+      execute: () => ({
+        exitCode: 0,
+        stdout: new TextEncoder().encode('{"mergeable":"MERGEABLE"}'),
+        stderr: new Uint8Array(),
+      }),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(new TextDecoder().decode(result.stdout)).toContain('MERGEABLE');
+    // The warning is emitted exactly once even though both the pool check and
+    // the flush hit the dead DB.
+    expect(skipped).toBe(1);
   });
 });

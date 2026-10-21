@@ -35,6 +35,17 @@ export {
   getWebDistDir,
 } from './archon-paths';
 
+// Lane subprocess isolation (WO-HARNESS-APP-KEY-ISOLATION-01)
+export {
+  buildLaneSubprocessEnv,
+  laneSpawnArgv,
+  laneSpawnActive,
+  laneExecPath,
+  laneUidIsolationEnabled,
+  LANE_HOME,
+  DEFAULT_LANE_EXEC_PATH,
+} from './lane-env';
+
 // Logger
 export { createLogger, setLogLevel, getLogLevel, rootLogger } from './logger';
 export type { Logger } from './logger';

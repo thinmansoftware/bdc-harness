@@ -52,8 +52,7 @@ import { executeWorkflow } from '@archon/workflows/executor';
 import { parseDeclaredBaseBranch } from '@archon/workflows/reliability/run-authority';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import type { ModelOverride } from '@archon/workflows/model-override';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execFileAsync } from '@archon/git';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { freezeWorkOrderSource } from '../workflows/work-order-source';
 import {
@@ -254,7 +253,10 @@ export interface WorkflowRoutingContext {
   readonly modelOverride?: ModelOverride;
 }
 
-const execFileAsync = promisify(execFile);
+// WO-HARNESS-APP-KEY-ISOLATION-01: use the @archon/git execFileAsync chokepoint
+// so originBranchExists -- which runs `git -C <repoPath> ls-remote` against a
+// path that is typically under /.archon/workspaces -- is routed through the lane
+// launcher (distinct UID + scrubbed env) instead of inheriting the server env.
 
 /**
  * Verify a branch exists on origin (WO-HARNESS-BASE-LANE-AUTHORITY-01).
