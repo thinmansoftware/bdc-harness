@@ -37,11 +37,19 @@ const reviewIds = [
   'findings-consolidate',
   'apply-diff-review-final',
 ];
-const bindingKeys = new Set(['provider', 'model', 'persona', 'agent']);
+const bindingKeys = new Set([
+  'provider',
+  'model',
+  'persona',
+  'agent',
+  'failover_provider',
+  'failover_model',
+]);
 const withoutBindings = (node: Node): Record<string, unknown> =>
   Object.fromEntries(Object.entries(node).filter(([key]) => !bindingKeys.has(key)));
 // Only model attribution text may differ inside a prompt or shell body.
 const attributionChanges = [
+  ['BDC_FEATURE_DEVELOPMENT_CODEX_', 'BDC_FEATURE_DEVELOPMENT_ASTRA_'],
   [
     'Co-Authored-By: Claude (Cauldron major-build) <noreply@anthropic.com>',
     'Co-Authored-By: Astra (Cauldron major-build) <noreply@openai.com>',

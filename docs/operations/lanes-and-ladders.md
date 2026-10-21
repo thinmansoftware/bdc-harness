@@ -64,3 +64,50 @@ an App identity via `GET /app` as `<slug>[bot]`. The node calls it as
 `bun /app/scripts/github-service-login.ts "${ARCHON_GITHUB_SERVICE:-run_nodes}"`
 when that file is present in the image, and falls back to `gh api user` otherwise.
 See `WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01`.
+
+## Final review contract (Slice T)
+
+Before a ready pull request can open, `diff-review-final` performs a fresh review
+of the complete final diff at the captured HEAD. It reads every changed file in
+full and the direct callers and callees of changed functions. Its output is:
+
+```
+DIFF_REVIEW_FINAL=<satisfied|needs_revision>
+REVIEWED_HEAD=<captured head>
+FILES_READ:
+- <path>
+UNRESOLVED:
+- [<severity>] <file:line> <finding>
+SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
+```
+
+Satisfaction requires `UNRESOLVED` to contain exactly `- (none)`. The gate binds
+the verdict to the current HEAD, every path in the captured file manifest, and a
+fresh SHA-256 recomputation of the diff. It fails closed with the first applicable
+reason: `verdict_missing`, `verdict_needs_revision`, `findings_present`,
+`unresolved_missing`, `head_mismatch`, `files_not_read`,
+`diff_changed_after_review`, or `repair_not_done`. The one post-final repair pass
+uses the same contract with `OPUS_REREVIEW` and `DIFF_OPUS_*` provenance.
+
+Final reviewers must be from a family disjoint from every builder and builder
+failover in the lane. The current assignments are:
+
+| Builder family | Final reviewer family |
+| --- | --- |
+| Anthropic | OpenAI |
+| OpenAI | Anthropic (`-codex`) or DeepSeek (`-codex-only`) |
+| xAI | OpenAI or DeepSeek |
+| Moonshot | DeepSeek |
+| Qwen | DeepSeek |
+
+Generate a recorded replay through the configured provider/model with:
+
+```
+bun scripts/final-review-replay.ts \
+  --lane .archon/workflows/defaults/bdc-feature-development-codex.yaml \
+  --fixture packages/workflows/src/fixtures/final-review/<fixture>
+```
+
+The fixture supplies `diff-final.patch`, `diff-final.files`, `spec.md`, and
+optionally `head.txt`. The command writes provider-produced `recording.txt` and
+provenance `meta.json`; recordings must never be written by hand.

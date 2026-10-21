@@ -1,0 +1,27 @@
+### committed diff (0000000000000000000000000000000000000000..HEAD)
+diff --git a/packages/workflows/src/run-lease.ts b/packages/workflows/src/run-lease.ts
+index 6fd9e98..5c006bf 100644
+--- a/packages/workflows/src/run-lease.ts
++++ b/packages/workflows/src/run-lease.ts
+@@ -24,6 +24,9 @@ export async function withRunLease<T>(
+   const leaseToken = options.leaseToken ?? randomUUID();
+   const leaseDurationMs = options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
+   const heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
++  if (leaseDurationMs <= 0 || heartbeatIntervalMs <= 0) {
++    throw new Error('run_lease_invalid_duration');
++  }
+   const acquiredAt = now();
+   const claimed = await store.claimRunLease({
+     runId,
+@@ -35,7 +38,7 @@ export async function withRunLease<T>(
+     expiresAt: new Date(acquiredAt.getTime() + leaseDurationMs).toISOString(),
+     releasedAt: null,
+   });
+-  if (!claimed) throw new Error(`run_lease_conflict: active worker owns run ${runId}`);
++  if (claimed) throw new Error(`run_lease_conflict: active worker owns run ${runId}`);
+
+   let leaseValid = true;
+   let heartbeatInFlight = false;
+
+### unstaged working-tree diff (HEAD..worktree)
+

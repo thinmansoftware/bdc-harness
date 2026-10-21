@@ -37,6 +37,7 @@ interface NodeDef {
   id: string;
   provider?: string;
   model?: string;
+  failover_model?: string;
 }
 
 interface LaneDef {
@@ -102,5 +103,38 @@ describe('lane cross-model review', () => {
         'Self-review violations detected:\n' + violations.map(v => '  ' + v).join('\n')
       );
     }
+  });
+
+  it('sliceTProof final reviewer family differs from every builder family', () => {
+    const family = (model: string): string => {
+      if (/^(gpt-|o[0-9])/.test(model)) return 'openai';
+      if (/^(claude-|sonnet|opus|haiku|fable)/.test(model)) return 'anthropic';
+      if (/^grok-/.test(model)) return 'xai';
+      if (/^deepseek\//.test(model)) return 'deepseek';
+      if (/^(moonshotai\/|kimi)/.test(model)) return 'moonshot';
+      if (/^qwen\//.test(model)) return 'qwen';
+      if (/^glm/.test(model)) return 'zhipu';
+      throw new Error(`unmapped model family: ${model}`);
+    };
+    const violations: string[] = [];
+    for (const file of LANE_FILES) {
+      const lane = loadLane(file);
+      const nodes = lane.nodes ?? [];
+      const families = (items: NodeDef[]) =>
+        new Set(
+          items.flatMap(item => [
+            family(resolveModel(item, lane)),
+            ...(item.failover_model ? [family(item.failover_model)] : []),
+          ])
+        );
+      const builders = families(nodes.filter(item => BUILD_NODE_IDS.has(item.id)));
+      const reviewers = families(
+        nodes.filter(item => item.id === 'diff-review-final' || item.id === 'opus-rereview')
+      );
+      for (const reviewer of reviewers) {
+        if (builders.has(reviewer)) violations.push(`${file}: ${reviewer}`);
+      }
+    }
+    expect(violations).toEqual([]);
   });
 });
