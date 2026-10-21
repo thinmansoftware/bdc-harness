@@ -4,8 +4,10 @@
  * fake dispatch); no mock.module.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { readFileSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, unlinkSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'node:os';
+import { closeDatabase } from '@archon/core/db/connection';
+import { join, resolve, sep } from 'path';
 import { rootLogger } from '@archon/paths';
 import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
 
@@ -1912,6 +1914,60 @@ describe('failed effect reuse and successful-tick health', () => {
     expect(state.deadman.lastTickAtMs).toBe(T0);
   });
 
+  test.each(['rejected', 'empty', 'page-cap'])(
+    'adoption snapshot after %s work-SOR read retains the correct custody',
+    async mode => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const deps = makeDeps(world, {
+        listThreads: async () => {
+          if (mode === 'rejected') throw new Error('synthetic rejected work-SOR read');
+          if (mode === 'page-cap')
+            return defaultListThreads((async input => {
+              const url = new URL(String(input));
+              const page = Number(url.searchParams.get('page'));
+              return new Response(
+                JSON.stringify(
+                  url.searchParams.get('labels') === 'wo'
+                    ? Array.from({ length: 100 }, (_, i) => ({
+                        number: (page - 1) * 100 + i + 1,
+                        updated_at: new Date(T0).toISOString(),
+                        labels: ['wo', 'prio:P1'],
+                        assignees: [],
+                      }))
+                    : []
+                )
+              );
+            }) as typeof fetch);
+          return [];
+        },
+        getGithubIssueEvidence: async () => makeEvidence(),
+      });
+      await refreshAdoption(
+        [makeListedThread({ ref: 'gh:thinmansoftware/bdc-xo#123', title: 'known work' })],
+        deps
+      );
+      const beforeMeta = structuredClone(world.adoptionMeta);
+      const beforeRows = structuredClone(world.adoptionRows);
+      const state = createTaskmasterState(60_000);
+      const result = await tick(state, deps);
+      if (mode !== 'empty') {
+        expect(world.adoptionMeta).toEqual(beforeMeta);
+        expect(world.adoptionRows).toEqual(beforeRows);
+        expect(result.successful).toBe(false);
+        expect(state.deadman.lastTickAtMs).toBeNull();
+        if (mode === 'page-cap') {
+          expect(result.effects).toBe(0);
+          expect(world.sentMessages).toEqual([]);
+        }
+      } else {
+        expect(world.adoptionMeta.row_count).toBe(0);
+        expect(world.adoptionRows).toEqual([]);
+        expect(result.successful).toBe(true);
+      }
+    }
+  );
+
   test('a failed source read does not advance the successful heartbeat', async () => {
     const world = makeWorld();
     seedDigestSent(world);
@@ -2934,18 +2990,36 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
         });
       }) as typeof fetch;
 
-      const threads = await defaultListThreads(fetchImpl);
+      await expect(defaultListThreads(fetchImpl)).rejects.toThrow(
+        'taskmaster_github_work_sor_incomplete'
+      );
       const woPages = urls
         .filter(url => new URL(url).searchParams.get('labels') === 'wo')
         .map(url => Number(new URL(url).searchParams.get('page')));
       expect(woPages).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-      expect(threads).toHaveLength(1000);
       expect(
         chunks.filter(chunk => chunk.includes('taskmaster.github_page_limit_reached'))
       ).toHaveLength(1);
     } finally {
       stream.write = originalWrite;
     }
+  });
+
+  test('short tenth label page remains a complete read', async () => {
+    const fetchImpl = (async input => {
+      const url = new URL(String(input));
+      const page = Number(url.searchParams.get('page'));
+      return new Response(
+        JSON.stringify(
+          url.searchParams.get('labels') === 'wo'
+            ? Array.from({ length: page === 10 ? 99 : 100 }, (_, i) =>
+                ghIssue((page - 1) * 100 + i + 1, ['wo', 'prio:P1'])
+              )
+            : []
+        )
+      );
+    }) as typeof fetch;
+    expect(await defaultListThreads(fetchImpl)).toHaveLength(999);
   });
 
   test('queries wo, project, and arc separately while preserving an explicit repo override', async () => {
@@ -3233,13 +3307,28 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
       const url = String(input);
       if (url.includes('/search/issues')) {
         searchUrls.push(url);
-        return new Response(JSON.stringify({ items: [{ title: 'WO-EXAMPLE-FOO-01' }] }), {
-          status: 200,
-          headers: {
-            'content-type': 'application/json',
-            'x-ratelimit-remaining': '100',
-          },
-        });
+        return new Response(
+          JSON.stringify({
+            total_count: 2,
+            incomplete_results: false,
+            items: [
+              {
+                number: 762,
+                state: 'open',
+                pull_request: {},
+                title: 'WO-EXAMPLE-FOO-01',
+                body: null,
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': 'application/json',
+              'x-ratelimit-remaining': '100',
+            },
+          }
+        );
       }
       const label = new URL(url).searchParams.get('labels') ?? '';
       const issues =
@@ -3268,53 +3357,337 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     expect(threads[0]?.isUnclaimedP0).toBe(false);
   });
 
-  test('pr_lookup_fails_open', async () => {
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = String(input);
-      if (url.includes('/search/issues')) {
-        return new Response('rate limited', {
-          status: 403,
-          headers: { 'x-ratelimit-remaining': '0' },
+  test('pr_lookup_failure_rejects_unknown_claim', async () =>
+    withIsolatedClaimMeter(async () => {
+      const fetchImpl = (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes('/search/issues')) {
+          return new Response('rate limited', {
+            status: 403,
+            headers: { 'x-ratelimit-remaining': '0' },
+          });
+        }
+        const label = new URL(url).searchParams.get('labels') ?? '';
+        const issues =
+          label === 'wo' ? [ghIssue(32, ['wo', 'prio:P0'], { title: 'WO-EXAMPLE-FOO-01' })] : [];
+        return new Response(JSON.stringify(issues), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '100',
+          },
         });
+      }) as typeof fetch;
+
+      // Pino keeps the destination on a local Symbol(pino.stream), not Symbol.for.
+      const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+        symbol => symbol.description === 'pino.stream'
+      );
+      if (streamSymbol === undefined) {
+        throw new Error('pino.stream symbol missing on rootLogger');
       }
-      const label = new URL(url).searchParams.get('labels') ?? '';
-      const issues =
-        label === 'wo' ? [ghIssue(32, ['wo', 'prio:P0'], { title: 'WO-EXAMPLE-FOO-01' })] : [];
-      return new Response(JSON.stringify(issues), {
-        status: 200,
-        headers: {
-          'content-type': 'application/json',
-          'x-ratelimit-remaining': '100',
+      const stream = (
+        rootLogger as unknown as Record<symbol, { write: (chunk: string) => boolean }>
+      )[streamSymbol];
+      const chunks: string[] = [];
+      const originalWrite = stream.write;
+      stream.write = (chunk: string) => {
+        chunks.push(String(chunk));
+        return true;
+      };
+      try {
+        await expect(defaultListThreads(fetchImpl)).rejects.toThrow(
+          'taskmaster_pr_claim_lookup_failed:403'
+        );
+        expect(chunks.join('')).toContain('taskmaster.pr_claim_lookup_failed');
+      } finally {
+        stream.write = originalWrite;
+      }
+    }));
+
+  async function withIsolatedClaimMeter(body: () => Promise<void>): Promise<void> {
+    const priorHome = process.env.ARCHON_HOME;
+    const priorDatabase = process.env.DATABASE_URL;
+    resetGitHubApiMeterForTests();
+    await closeDatabase();
+    delete process.env.DATABASE_URL;
+    const fixtureHome = mkdtempSync(join(tmpdir(), 'claim-meter-fixture-'));
+    process.env.ARCHON_HOME = fixtureHome;
+    try {
+      await body();
+    } finally {
+      resetGitHubApiMeterForTests();
+      try {
+        await closeDatabase();
+      } finally {
+        if (priorHome === undefined) delete process.env.ARCHON_HOME;
+        else process.env.ARCHON_HOME = priorHome;
+        if (priorDatabase === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = priorDatabase;
+        if (!resolve(fixtureHome).startsWith(resolve(tmpdir()) + sep)) {
+          throw new Error('claim_fixture_cleanup_outside_temp');
+        }
+        rmSync(fixtureHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+      }
+    }
+  }
+
+  const unknownClaimResponses: [string, () => Response][] = [
+    ['HTTP 429', () => new Response('limited', { status: 429 })],
+    [
+      'transport',
+      () => {
+        throw new Error('fixture claim network failure');
+      },
+    ],
+    ['bad JSON', () => new Response('{')],
+    ['missing total', () => Response.json({ incomplete_results: false, items: [] })],
+    ['missing completeness', () => Response.json({ total_count: 0, items: [] })],
+    ['incomplete', () => Response.json({ total_count: 0, incomplete_results: true, items: [] })],
+    [
+      'positive total without row',
+      () => Response.json({ total_count: 1, incomplete_results: false, items: [] }),
+    ],
+    [
+      'negative total',
+      () => Response.json({ total_count: -1, incomplete_results: false, items: [] }),
+    ],
+    [
+      'malformed positive row',
+      () => Response.json({ total_count: 1, incomplete_results: false, items: [null] }),
+    ],
+  ];
+  for (const [name, response] of unknownClaimResponses) {
+    test(`unknown PR claim ${name} preserves the committed snapshot through tick`, async () =>
+      withIsolatedClaimMeter(async () => {
+        const world = makeWorld();
+        seedDigestSent(world);
+        let eligibilityCalls = 0;
+        let searchCalls = 0;
+        const fetchImpl = (async input => {
+          const url = new URL(String(input));
+          if (url.pathname === '/search/issues') {
+            searchCalls++;
+            return response();
+          }
+          return Response.json(
+            url.searchParams.get('labels') === 'wo'
+              ? [ghIssue(901, ['wo', 'prio:P0'], { title: 'WO-CLAIM-UNKNOWN-01' })]
+              : []
+          );
+        }) as typeof fetch;
+        const deps = makeDeps(world, {
+          listThreads: () => defaultListThreads(fetchImpl),
+          getGithubIssueEvidence: async () => makeEvidence(),
+          checkFireEligibility: async () => {
+            eligibilityCalls++;
+            return { eligible: false, reason: 'fixture' };
+          },
+        });
+        await refreshAdoption(
+          [makeListedThread({ ref: 'gh:thinmansoftware/bdc-xo#123', title: 'prior known work' })],
+          deps
+        );
+        const beforeMeta = structuredClone(world.adoptionMeta);
+        const beforeRows = structuredClone(world.adoptionRows);
+        const state = createTaskmasterState(60_000);
+        const result = await tick(state, deps);
+        expect(searchCalls).toBe(1);
+        expect(result.successful).toBe(false);
+        expect(world.adoptionMeta).toEqual(beforeMeta);
+        expect(world.adoptionRows).toEqual(beforeRows);
+        expect(state.deadman.lastTickAtMs).toBeNull();
+        expect(eligibilityCalls).toBe(0);
+        expect(world.sentMessages).toEqual([]);
+        expect(result.effects).toBe(0);
+      }));
+  }
+
+  function budgetClaimFetch(
+    count: number,
+    searched: string[],
+    failAt = -1,
+    claimed = false
+  ): typeof fetch {
+    return (async input => {
+      const url = new URL(String(input));
+      if (url.pathname === '/search/issues') {
+        searched.push(url.searchParams.get('q') ?? '');
+        if (searched.length === failAt) return new Response('unavailable', { status: 503 });
+        return Response.json(
+          {
+            total_count: claimed ? 1 : 0,
+            incomplete_results: false,
+            items: claimed
+              ? [
+                  {
+                    number: 9000,
+                    state: 'open',
+                    title: 'claimed work',
+                    body: null,
+                    pull_request: {},
+                  },
+                ]
+              : [],
+          },
+          {
+            headers: { 'x-ratelimit-remaining': '100' },
+          }
+        );
+      }
+      return Response.json(
+        url.searchParams.get('labels') === 'wo'
+          ? Array.from({ length: count }, (_, i) =>
+              ghIssue(1000 + i, ['wo', 'prio:P0'], {
+                title: `WO-BUDGET-${String(i).padStart(3, '0')}-01`,
+              })
+            )
+          : [],
+        { headers: { 'x-ratelimit-remaining': '100' } }
+      );
+    }) as typeof fetch;
+  }
+
+  test('claim budget keeps all 63 issues visible and rotates fresh verification', async () =>
+    withIsolatedClaimMeter(async () => {
+      const cursor = { lastVerifiedRef: null as string | null };
+      const searched: string[] = [];
+      const covered = new Set<string>();
+      for (let tickIndex = 0; tickIndex < 7; tickIndex++) {
+        const before = searched.length;
+        const rows = await defaultListThreads(budgetClaimFetch(63, searched), cursor);
+        expect(rows).toHaveLength(63);
+        expect(searched.length - before).toBe(10);
+        const deferred = rows.filter(row => row.prClaimVerification === 'deferred_budget');
+        expect(deferred).toHaveLength(53);
+        expect(
+          deferred.every(row => row.isUnclaimed === undefined && row.isUnclaimedP0 === undefined)
+        ).toBe(true);
+        for (const row of rows.filter(row => row.prClaimVerification === undefined)) {
+          expect(row.isUnclaimedP0).toBe(true);
+          covered.add(row.ref);
+        }
+      }
+      expect(covered.size).toBe(63);
+    }));
+
+  test('claim budget deferral suppresses interventions while adoption and heartbeat continue', async () =>
+    withIsolatedClaimMeter(async () => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const cursor = { lastVerifiedRef: null as string | null };
+      const searched: string[] = [];
+      const eligibleTitles: string[] = [];
+      let deferredRef = '';
+      const deps = makeDeps(world, {
+        listThreads: async () => {
+          const rows = await defaultListThreads(budgetClaimFetch(11, searched, -1, true), cursor);
+          const deferred = rows.find(row => row.prClaimVerification === 'deferred_budget');
+          expect(deferred).toBeDefined();
+          deferredRef = deferred?.ref ?? '';
+          return rows;
+        },
+        getGithubIssueEvidence: async () => makeEvidence(),
+        checkFireEligibility: async title => {
+          eligibleTitles.push(title);
+          return { eligible: false, reason: 'fixture' };
         },
       });
-    }) as typeof fetch;
+      const state = createTaskmasterState(60_000);
+      const priorFire = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+      const result = await (async () => {
+        try {
+          return await tick(state, deps);
+        } finally {
+          if (priorFire === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+          else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFire;
+        }
+      })();
+      expect(result.successful).toBe(true);
+      expect(world.adoptionMeta.row_count).toBe(11);
+      expect(state.deadman.lastTickAtMs).toBe(T0);
+      expect(world.journal.some(row => row.thread_ref === deferredRef)).toBe(false);
+      expect(eligibleTitles).toEqual([]);
+      expect(result.deferred).toBeGreaterThanOrEqual(1);
+    }));
 
-    // Pino keeps the destination on a local Symbol(pino.stream), not Symbol.for.
-    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
-      symbol => symbol.description === 'pino.stream'
-    );
-    if (streamSymbol === undefined) {
-      throw new Error('pino.stream symbol missing on rootLogger');
-    }
-    const stream = (rootLogger as unknown as Record<symbol, { write: (chunk: string) => boolean }>)[
-      streamSymbol
-    ];
-    const chunks: string[] = [];
-    const originalWrite = stream.write;
-    stream.write = (chunk: string) => {
-      chunks.push(String(chunk));
-      return true;
+  test('failed claim selection does not advance the verification cursor', async () =>
+    withIsolatedClaimMeter(async () => {
+      const cursor = { lastVerifiedRef: 'gh:thinmansoftware/bdc-harness#1003' };
+      const searched: string[] = [];
+      await expect(defaultListThreads(budgetClaimFetch(11, searched, 2), cursor)).rejects.toThrow();
+      expect(cursor.lastVerifiedRef).toBe('gh:thinmansoftware/bdc-harness#1003');
+      const retry: string[] = [];
+      await defaultListThreads(budgetClaimFetch(11, retry), cursor);
+      expect(retry[0]).toBe(searched[0]);
+    }));
+
+  test('claim budget preserves independent ruling delivery', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const deferred: ListedThread = {
+      ...ruling(),
+      title: 'WO-RULING-01',
+      prClaimVerification: 'deferred_budget',
     };
-    try {
-      const threads = await defaultListThreads(fetchImpl);
-      expect(threads).toHaveLength(1);
-      expect(threads[0]?.isUnclaimed).toBe(true);
-      expect(threads[0]?.isUnclaimedP0).toBe(true);
-      expect(chunks.join('')).toContain('taskmaster.pr_claim_lookup_failed');
-    } finally {
-      stream.write = originalWrite;
-    }
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        listUndeliveredRulings: async () => [deferred],
+        listThreads: async () => [],
+      })
+    );
+    expect(world.journal.filter(row => row.outcome === 'sent').map(row => row.action_type)).toEqual(
+      ['digest', 'deliver_ruling']
+    );
   });
+
+  test('claim budget excludes assigned and active-status work and preserves non-WO facts', async () =>
+    withIsolatedClaimMeter(async () => {
+      let searches = 0;
+      const fetchImpl = (async input => {
+        const url = new URL(String(input));
+        if (url.pathname === '/search/issues') {
+          searches++;
+          return Response.json({ total_count: 0, incomplete_results: false, items: [] });
+        }
+        return Response.json(
+          url.searchParams.get('labels') === 'wo'
+            ? [
+                ghIssue(11, ['wo', 'prio:P0'], {
+                  title: 'WO-ASSIGNED-01',
+                  assignees: [{ login: 'owner' }],
+                }),
+                ghIssue(12, ['wo', 'prio:P0', 'status:building'], { title: 'WO-BUILDING-01' }),
+                ghIssue(13, ['wo', 'prio:P0', 'status:review'], { title: 'WO-REVIEW-01' }),
+                ghIssue(14, ['wo', 'prio:P0'], { title: 'ordinary issue' }),
+                ghIssue(15, ['wo', 'prio:P0'], { title: 'WO-VERIFY-01' }),
+              ]
+            : []
+        );
+      }) as typeof fetch;
+      const rows = await defaultListThreads(fetchImpl, { lastVerifiedRef: null });
+      expect(searches).toBe(1);
+      expect(rows.every(row => row.prClaimVerification === undefined)).toBe(true);
+      expect(rows.map(row => row.isUnclaimedP0)).toEqual([false, false, false, true, true]);
+    }));
+
+  test('complete empty PR claim permits the existing unclaimed classification', async () =>
+    withIsolatedClaimMeter(async () => {
+      const fetchImpl = (async input => {
+        const url = new URL(String(input));
+        if (url.pathname === '/search/issues')
+          return Response.json({ total_count: 0, incomplete_results: false, items: [] });
+        return Response.json(
+          url.searchParams.get('labels') === 'wo'
+            ? [ghIssue(902, ['wo', 'prio:P0'], { title: 'WO-CLAIM-EMPTY-01' })]
+            : []
+        );
+      }) as typeof fetch;
+      const threads = await defaultListThreads(fetchImpl);
+      expect(threads[0]?.isUnclaimedP0).toBe(true);
+    }));
 });
 
 // ---------------------------------------------------------------------------
