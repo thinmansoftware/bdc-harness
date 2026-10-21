@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { rootLogger } from '@archon/paths';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
+import {
+  DispatchNonSystemCapability,
+  resolveDispatchSenderCapability,
+} from '@archon/core/db/dispatch-sender-authority';
 import {
   resetSecurityDetectorStateForTests,
   runSecurityDetector,
@@ -10,6 +15,9 @@ import {
 import {
   githubIssueInAllowList,
   githubNudgeEnabled,
+  isTaskmasterBlockerReport,
+  isTaskmasterMailbox,
+  isTaskmasterSelfPause,
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
@@ -180,6 +188,107 @@ async function seedDetector(): Promise<DutyOfficerClockDeps> {
   await tickDutyOfficerClock(deps);
   return deps;
 }
+
+function httpTaskmasterLabel(mode: 'off' | 'warn' | 'enforce') {
+  const oldMode = process.env.DISPATCH_SENDER_AUTH_MODE;
+  const oldRegistry = process.env.DISPATCH_PRINCIPALS_JSON;
+  const token = 'synthetic-taskmaster-label-token';
+  try {
+    process.env.DISPATCH_SENDER_AUTH_MODE = mode;
+    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+      {
+        credential_id: 'fixture-credential',
+        principal_id: 'fixture_principal',
+        token_sha256: createHash('sha256').update(token).digest('hex'),
+        status: 'active',
+        send_as: ['taskmaster'],
+        receive_as: [],
+        roles: ['send'],
+      },
+    ]);
+    const issued = DispatchNonSystemCapability.fromHttpRequest({
+      requested_sender: 'taskmaster',
+      ...(mode === 'enforce' ? { principal_id: 'fixture_principal', token } : {}),
+    });
+    return resolveDispatchSenderCapability(issued.capability);
+  } finally {
+    if (oldMode === undefined) delete process.env.DISPATCH_SENDER_AUTH_MODE;
+    else process.env.DISPATCH_SENDER_AUTH_MODE = oldMode;
+    if (oldRegistry === undefined) delete process.env.DISPATCH_PRINCIPALS_JSON;
+    else process.env.DISPATCH_PRINCIPALS_JSON = oldRegistry;
+  }
+}
+
+describe('Taskmaster shortcut provenance', () => {
+  test.each([undefined, null, 'fixture_principal', 'board:xo', 'system:overseer'])(
+    'plain Taskmaster labels with principal %s cannot enter internal shortcuts',
+    principal => {
+      const item = message({
+        id: 'non-system-taskmaster',
+        sender: 'taskmaster',
+        sender_principal_id: principal,
+        idempotency_key: 'tm:blocker_report:external',
+        correlation_id: 'tm-self-pause-external',
+      });
+      expect(isTaskmasterMailbox(item)).toBe(false);
+      expect(isTaskmasterBlockerReport(item)).toBe(false);
+      expect(isTaskmasterSelfPause(item)).toBe(false);
+    }
+  );
+
+  test('genuine system Taskmaster digest, blocker and self-pause signals remain recognized', () => {
+    const item = message({
+      id: 'system-taskmaster',
+      sender: 'taskmaster',
+      sender_principal_id: 'system:taskmaster',
+      idempotency_key: 'tm:digest:2026-10-18',
+    });
+    expect(isTaskmasterMailbox(item)).toBe(true);
+    expect(isTaskmasterBlockerReport(item)).toBe(false);
+    expect(isTaskmasterSelfPause(item)).toBe(false);
+    expect(
+      isTaskmasterBlockerReport({ ...item, idempotency_key: 'tm:blocker_report:internal' })
+    ).toBe(true);
+    expect(isTaskmasterSelfPause({ ...item, idempotency_key: 'tm:self-pause:internal' })).toBe(
+      true
+    );
+  });
+
+  test.each(['off', 'warn', 'enforce'] as const)(
+    'supported HTTP capability in %s mode uses generic handling despite the Taskmaster label',
+    async mode => {
+      const bound = httpTaskmasterLabel(mode);
+      expect(bound.sender).toBe('taskmaster');
+      expect(bound.sender_principal_id).toBe(mode === 'enforce' ? 'fixture_principal' : null);
+      const deps = fakeDeps([
+        message({
+          id: 'external-digest',
+          ...bound,
+          task_type: 'agent_message',
+          idempotency_key: 'tm:digest:external',
+        }),
+        message({
+          id: 'external-blocker',
+          ...bound,
+          task_type: 'agent_message',
+          idempotency_key: 'tm:blocker_report:external',
+        }),
+      ]);
+      deps.judge = mock(async () => ({
+        status: 'ok' as const,
+        action: 'hold' as const,
+        reason: 'generic_hold',
+        body: '',
+        failures: [],
+      }));
+      await tickDutyOfficerClock(deps);
+      expect(deps.judge).toHaveBeenCalledTimes(2);
+      expect(deps.releaseMessage).toHaveBeenCalledTimes(2);
+      expect(deps.postResult).not.toHaveBeenCalled();
+      expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
+    }
+  );
+});
 
 describe('duty officer clock', () => {
   test('fresh deps each tick preserve detector throttle and verdict until the interval expires', async () => {
@@ -404,6 +513,7 @@ describe('duty officer clock', () => {
         correlation_id: 'tm-journal-digest',
         task_type: 'agent_message',
         sender: 'taskmaster',
+        sender_principal_id: 'system:taskmaster',
         subject_key: 'digest:2026-09-18',
         body: 'sent=0, parked=0',
       }),
@@ -429,6 +539,7 @@ describe('duty officer clock', () => {
         correlation_id: 'tm-journal-digest-nudge',
         task_type: 'agent_message',
         sender: 'taskmaster',
+        sender_principal_id: 'system:taskmaster',
         subject_key: 'digest:2026-09-18',
         body: 'sent=0, parked=0',
       }),
@@ -460,6 +571,7 @@ describe('duty officer clock', () => {
         idempotency_key: 'tm:self-pause:3',
         task_type: 'agent_message',
         sender: 'taskmaster',
+        sender_principal_id: 'system:taskmaster',
         subject_key: 'taskmaster:self-pause',
         body: 'Taskmaster self-paused',
       }),
@@ -493,6 +605,7 @@ describe('duty officer clock', () => {
         idempotency_key: 'tm:self-pause:4',
         task_type: 'agent_message',
         sender: 'taskmaster',
+        sender_principal_id: 'system:taskmaster',
         subject_key: 'taskmaster:self-pause',
         body: 'Taskmaster self-paused',
       }),
@@ -570,6 +683,7 @@ describe('duty officer clock', () => {
         idempotency_key: 'tm:self-pause:5',
         task_type: 'agent_message',
         sender: 'taskmaster',
+        sender_principal_id: 'system:taskmaster',
         subject_key: 'taskmaster:self-pause',
         body: 'Taskmaster self-paused',
       }),
@@ -671,6 +785,7 @@ describe('duty officer clock', () => {
     const blockerMsg = message({
       id: 'br-1',
       sender: 'taskmaster',
+      sender_principal_id: 'system:taskmaster',
       task_type: 'agent_message',
       idempotency_key: 'tm:blocker_report:gh:thinmansoftware/bdc-xo#2274:7',
       subject_key: 'gh:thinmansoftware/bdc-xo#2274',
@@ -725,6 +840,7 @@ describe('duty officer clock', () => {
     const blockerMsg = message({
       id: 'br-2',
       sender: 'taskmaster',
+      sender_principal_id: 'system:taskmaster',
       task_type: 'agent_message',
       idempotency_key: 'tm:blocker_report:gh:thinmansoftware/bdc-xo#2275:7',
       subject_key: 'gh:thinmansoftware/bdc-xo#2275',
@@ -735,6 +851,7 @@ describe('duty officer clock', () => {
     const digestMsg = message({
       id: 'dg-1',
       sender: 'taskmaster',
+      sender_principal_id: 'system:taskmaster',
       task_type: 'agent_message',
       idempotency_key: 'tm:digest:2026-10-05',
       subject_key: 'digest:2026-10-05',
