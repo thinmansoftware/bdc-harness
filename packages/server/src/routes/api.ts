@@ -6285,7 +6285,10 @@ export function registerApiRoutes(
         return apiError(c, 400, `Cannot cancel workflow in '${run.status}' status`);
       }
       const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
-      const reason = body.reason ?? '';
+      const reason =
+        typeof body.reason === 'string' && body.reason.trim()
+          ? body.reason
+          : 'API cancellation requested; caller did not supply a reason';
       await workflowDb.cancelWorkflowRun(runId);
       void workflowEventDb.createWorkflowEvent({
         workflow_run_id: runId,
