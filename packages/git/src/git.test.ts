@@ -710,6 +710,10 @@ branch refs/heads/feature/auth
 
       expect(result).toBe(true);
       expect(execSpy).toHaveBeenCalledWith('git', [
+        '-c',
+        'core.preloadIndex=false',
+        '-c',
+        'index.threads=1',
         '-C',
         '/workspace/repo',
         'status',

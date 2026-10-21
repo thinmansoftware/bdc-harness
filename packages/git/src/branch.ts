@@ -149,10 +149,24 @@ export async function checkout(repoPath: RepoPath, branchName: BranchName): Prom
  * expected "path doesn't exist" scenarios.
  */
 export async function hasUncommittedChanges(
-  workingPath: RepoPath | WorktreePath
+  workingPath: RepoPath | WorktreePath,
+  options?: GitCheckOptions
 ): Promise<boolean> {
   try {
-    const { stdout } = await execFileAsync('git', ['-C', workingPath, 'status', '--porcelain']);
+    const operation = (): ReturnType<typeof execFileAsync> =>
+      execFileAsync('git', [
+        '-c',
+        'core.preloadIndex=false',
+        '-c',
+        'index.threads=1',
+        '-C',
+        workingPath,
+        'status',
+        '--porcelain',
+      ]);
+    const { stdout } = options?.execute
+      ? await options.execute(workingPath, operation)
+      : await operation();
     return stdout.trim().length > 0;
   } catch (error) {
     const err = error as Error & { code?: string };
@@ -351,10 +365,25 @@ export async function isAncestorOf(
  * Throws for unexpected errors (permission denied, corruption).
  */
 export async function getLastCommitDate(
-  workingPath: RepoPath | WorktreePath
+  workingPath: RepoPath | WorktreePath,
+  options?: GitCheckOptions
 ): Promise<Date | null> {
   try {
-    const { stdout } = await execFileAsync('git', ['-C', workingPath, 'log', '-1', '--format=%ci']);
+    const operation = (): ReturnType<typeof execFileAsync> =>
+      execFileAsync('git', [
+        '-c',
+        'core.preloadIndex=false',
+        '-c',
+        'index.threads=1',
+        '-C',
+        workingPath,
+        'log',
+        '-1',
+        '--format=%ci',
+      ]);
+    const { stdout } = options?.execute
+      ? await options.execute(workingPath, operation)
+      : await operation();
     const trimmed = stdout.trim();
     if (!trimmed) return null;
     const date = new Date(trimmed);
@@ -380,5 +409,39 @@ export async function getLastCommitDate(
     // Unexpected errors (permission denied, corruption) - propagate
     getLog().error({ err: error, workingPath }, 'last_commit_date_check_failed');
     throw new Error(`Failed to get last commit date for ${workingPath}: ${err.message}`);
+  }
+}
+
+export interface GitCheckOptions {
+  execute?: <T>(path: string, operation: () => Promise<T>) => Promise<T>;
+}
+
+/** Fail-safe pushed-state check scoped to this worktree's HEAD. */
+export async function hasUnpushedCommits(
+  workingPath: RepoPath | WorktreePath,
+  options?: GitCheckOptions
+): Promise<boolean> {
+  try {
+    const operation = (): ReturnType<typeof execFileAsync> =>
+      execFileAsync('git', [
+        '-c',
+        'core.preloadIndex=false',
+        '-c',
+        'index.threads=1',
+        '-C',
+        workingPath,
+        'branch',
+        '-r',
+        '--contains',
+        'HEAD',
+        '--format=%(refname)',
+      ]);
+    const { stdout } = options?.execute
+      ? await options.execute(workingPath, operation)
+      : await operation();
+    return stdout.trim().length === 0;
+  } catch (error) {
+    getLog().warn({ err: error, workingPath }, 'unpushed_commits_check_failed_assuming_unpushed');
+    return true;
   }
 }

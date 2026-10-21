@@ -15,6 +15,7 @@ mock.module('@archon/git', () => ({
   execFileAsync: mock(async () => ({ stdout: '', stderr: '' })),
   getCanonicalRepoPath: mock(async (path: string) => path),
   getLastCommitDate: mock(async () => null),
+  hasUnpushedCommits: mock(async () => false),
   getWorktreeBase: () => ({
     base: '/unused/workspaces/owner/repo/worktrees',
     layout: 'workspace-scoped',
@@ -73,7 +74,8 @@ describe('sweepTerminalWorkflowWorktrees', () => {
 
   beforeEach(async () => {
     workspacesRoot = await mkdtemp(join(tmpdir(), 'archon-worktree-sweep-'));
-    quarantineRoot = await mkdtemp(join(tmpdir(), 'archon-worktree-quarantine-'));
+    quarantineRoot = join(workspacesRoot, '.quarantine');
+    await mkdir(quarantineRoot, { recursive: true });
     mockDestroy.mockClear();
     mockListWorkflowRunsWithWorkingPath.mockClear();
     mockListWorkflowRunsWithWorkingPath.mockResolvedValue([]);
@@ -203,7 +205,11 @@ describe('sweepTerminalWorkflowWorktrees', () => {
     expect(report.quarantined).toEqual([quarantinePath]);
     expect(report.quarantinedBytes).toBeGreaterThan(0);
     expect(report.bytesFreed).toBe(0);
-    expect(prunedRepos).toEqual(['/repos/owner/repo']);
+    expect(prunedRepos).toEqual([]);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ repoPath: '/repos/owner/repo' }),
+      'worktree_sweep_prune_refused_outside_workspaces'
+    );
     expect(mockLogger.info).toHaveBeenCalledWith(
       expect.objectContaining({
         worktreePath,
@@ -729,7 +735,17 @@ describe('sweepTerminalWorkflowWorktrees', () => {
 
     expect(mockedExec).toHaveBeenCalledWith(
       'git',
-      ['-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
+      [
+        '-c',
+        'core.preloadIndex=false',
+        '-c',
+        'index.threads=1',
+        '-C',
+        worktreePath,
+        'status',
+        '--porcelain',
+        '--untracked-files=all',
+      ],
       expect.anything()
     );
     expect(existsSync(worktreePath)).toBe(true);
