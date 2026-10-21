@@ -141,6 +141,111 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
   };
 }
 
+function relayRecoveryFixture(
+  failure:
+    | 'before-write'
+    | 'after-write'
+    | 'stale-fence'
+    | 'completion-before-write'
+    | 'completion-after-write'
+) {
+  const source = message({ id: 'generic-relay' });
+  const neighbor = message({
+    id: 'healthy-mailbox',
+    sender: 'taskmaster',
+    sender_principal_id: 'system:taskmaster',
+    task_type: 'agent_message',
+    idempotency_key: 'tm:digest:2026-10-18',
+    subject_key: 'digest:2026-10-18',
+    body: 'sent=0, parked=0',
+  });
+  const rows = [source, neighbor];
+  const relays = new Map<string, { id: string }>();
+  const deps = fakeDeps(rows);
+  deps.listMessages = mock(async ({ recipient, status }) =>
+    rows
+      .filter(row => row.recipient === recipient && row.status === status)
+      .map(row => ({ ...row }))
+  );
+  deps.claimMessage = mock(async (input: Parameters<DutyOfficerClockDeps['claimMessage']>[0]) => {
+    const row = rows.find(item => item.id === input.id);
+    if (
+      !row ||
+      row.status !== 'queued' ||
+      (row.not_before !== null && Date.parse(row.not_before) > Date.now())
+    ) {
+      return null;
+    }
+    row.status = 'claimed';
+    row.lease_owner = input.worker_id;
+    row.fencing_token++;
+    return { ...row };
+  });
+  deps.releaseMessage = mock(
+    async (input: Parameters<DutyOfficerClockDeps['releaseMessage']>[0]) => {
+      const row = rows.find(item => item.id === input.id);
+      if (
+        !row ||
+        row.status !== 'claimed' ||
+        row.lease_owner !== input.worker_id ||
+        row.fencing_token !== input.fencing_token
+      ) {
+        return null;
+      }
+      row.status = 'queued';
+      row.lease_owner = null;
+      row.not_before = input.not_before ?? null;
+      return { ...row };
+    }
+  );
+  let completionAttempted = false;
+  deps.postResult = mock(async (input: Parameters<DutyOfficerClockDeps['postResult']>[0]) => {
+    const row = rows.find(item => item.id === input.id);
+    if (
+      !row ||
+      row.status !== 'claimed' ||
+      row.lease_owner !== input.worker_id ||
+      row.fencing_token !== input.fencing_token
+    ) {
+      return null;
+    }
+    const firstSourceCompletion = row.id === source.id && !completionAttempted;
+    if (firstSourceCompletion) {
+      completionAttempted = true;
+      if (failure === 'completion-before-write') throw new Error('completion database unavailable');
+    }
+    row.status = input.status ?? 'done';
+    row.task_outcome = input.task_outcome ?? null;
+    row.result_body = input.result_body;
+    if (firstSourceCompletion && failure === 'completion-after-write') {
+      throw new Error('completion acknowledgement lost after write');
+    }
+    return { ...row };
+  });
+  let attempted = false;
+  deps.createAuthenticatedMessage = mock(async (_context, data) => {
+    if (!attempted) {
+      attempted = true;
+      if (failure === 'stale-fence') {
+        source.fencing_token++;
+        source.lease_owner = 'new-worker';
+      }
+      if (failure === 'before-write' || failure === 'stale-fence') {
+        throw new Error('relay database unavailable');
+      }
+      if (failure === 'after-write') {
+        relays.set(data.idempotency_key, { id: 'durable-xo-relay' });
+        throw new Error('relay acknowledgement lost after write');
+      }
+    }
+    if (!relays.has(data.idempotency_key)) {
+      relays.set(data.idempotency_key, { id: 'durable-xo-relay' });
+    }
+    return relays.get(data.idempotency_key);
+  });
+  return { deps, source, neighbor, relays };
+}
+
 afterEach(() => {
   stopDutyOfficerClock();
   resetSecurityDetectorStateForTests();
@@ -429,6 +534,75 @@ describe('duty officer nudge delivery evidence', () => {
 });
 
 describe('duty officer clock', () => {
+  test.each(['before-write', 'after-write', 'completion-before-write'] as const)(
+    'generic relay failure %s is held, respects backoff and retries without duplicate delivery',
+    async failure => {
+      const { deps, source, neighbor, relays } = relayRecoveryFixture(failure);
+      const started = Date.now();
+      await tickDutyOfficerClock(deps);
+
+      expect(source.status).toBe('queued');
+      expect(Date.parse(source.not_before!)).toBeGreaterThanOrEqual(started + 60_000);
+      expect(source.task_outcome).toBeNull();
+      expect(neighbor.status).toBe('done');
+      expect(deps.postResult).toHaveBeenCalledTimes(failure === 'completion-before-write' ? 2 : 1);
+      expect(deps.releaseMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: source.id,
+          worker_id: 'duty-officer-clock',
+          fencing_token: 1,
+        })
+      );
+      expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+      await tickDutyOfficerClock(deps);
+      expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+
+      // Advance the held fixture's eligibility without changing global clocks.
+      source.not_before = new Date(Date.now() - 1).toISOString();
+      await tickDutyOfficerClock(deps);
+      expect(source.status).toBe('done');
+      expect(source.task_outcome).toBe('succeeded');
+      expect(source.fencing_token).toBe(2);
+      expect(relays.size).toBe(1);
+      expect([...relays.keys()]).toEqual([`do-clock-escalation:${source.id}`]);
+      expect(JSON.parse(source.result_body!).disposition).toBe('escalated_to_xo');
+      await tickDutyOfficerClock(deps);
+      expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  test('generic relay completion acknowledgement failure cannot reopen completed work', async () => {
+    const { deps, source, neighbor, relays } = relayRecoveryFixture('completion-after-write');
+    await tickDutyOfficerClock(deps);
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: source.id, worker_id: 'duty-officer-clock', fencing_token: 1 })
+    );
+    expect(source.status).toBe('done');
+    expect(source.task_outcome).toBe('succeeded');
+    expect(source.not_before).toBeNull();
+    expect(neighbor.status).toBe('done');
+    expect(relays.size).toBe(1);
+    await tickDutyOfficerClock(deps);
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+    expect(deps.postResult).toHaveBeenCalledTimes(2);
+  });
+
+  test('generic relay failure cannot release a newer claim or report success', async () => {
+    const { deps, source, neighbor, relays } = relayRecoveryFixture('stale-fence');
+    await tickDutyOfficerClock(deps);
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: source.id, fencing_token: 1 })
+    );
+    expect(source.status).toBe('claimed');
+    expect(source.lease_owner).toBe('new-worker');
+    expect(source.fencing_token).toBe(2);
+    expect(source.task_outcome).toBeNull();
+    expect(source.result_body).toBeNull();
+    expect(neighbor.status).toBe('done');
+    expect(relays.size).toBe(0);
+    expect(deps.postResult).toHaveBeenCalledTimes(1);
+  });
+
   test('fresh deps each tick preserve detector throttle and verdict until the interval expires', async () => {
     resetSecurityDetectorStateForTests();
     process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
