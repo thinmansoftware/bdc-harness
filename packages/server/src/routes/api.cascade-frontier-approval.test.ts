@@ -38,6 +38,7 @@ type MockCascadeRecord = {
   woId: string;
   status: string;
   frontierApproval?: MockFrontierPacket;
+  claimDiscoveryBlock?: { phase: string; reason: string; checkedAt: string };
 };
 
 const mockReadCascadeRecordById = mock(
@@ -50,6 +51,7 @@ const mockClaimFrontierResolution = mock(
     path: '/tmp/claim.json',
   })
 );
+const mockReleaseFrontierClaim = mock(async (_id: string) => {});
 const mockResumeFrontierTier = mock(
   async (
     _record: MockCascadeRecord,
@@ -81,6 +83,7 @@ const mockRejectFrontierTier = mock(
 mock.module('@archon/smart-cauldron/frontier-approval', () => ({
   readCascadeRecordById: mockReadCascadeRecordById,
   claimFrontierResolution: mockClaimFrontierResolution,
+  releaseFrontierClaim: mockReleaseFrontierClaim,
   resumeFrontierTier: mockResumeFrontierTier,
   rejectFrontierTier: mockRejectFrontierTier,
 }));
@@ -273,6 +276,7 @@ describe('POST /api/cascades/:id/approve-frontier', () => {
     mockReadCascadeRecordById.mockReset();
     mockClaimFrontierResolution.mockReset();
     mockResumeFrontierTier.mockReset();
+    mockReleaseFrontierClaim.mockClear();
     mockClaimFrontierResolution.mockImplementation(async (_id, resolution) => ({
       claimed: true,
       resolution,
@@ -341,6 +345,42 @@ describe('POST /api/cascades/:id/approve-frontier', () => {
     expect(body.resolution).toBe('approved');
     expect(mockResumeFrontierTier).not.toHaveBeenCalled();
   });
+
+  for (const discoveryBlocked of [false, true]) {
+    test(`409 rolls back blocked approval with truthful reason (discovery=${discoveryBlocked})`, async () => {
+      mockReadCascadeRecordById.mockImplementationOnce(async () => PAUSED_RECORD);
+      mockResumeFrontierTier.mockImplementationOnce(async (_record, opts) => {
+        const blocked: MockCascadeRecord = {
+          cascadeId: 'blocked-resume',
+          woId: _record.woId,
+          status: 'blocked',
+          ...(discoveryBlocked
+            ? {
+                claimDiscoveryBlock: {
+                  phase: 'admission',
+                  reason: 'request_failed',
+                  checkedAt: new Date(0).toISOString(),
+                },
+              }
+            : {}),
+        };
+        opts?.onAdmission?.(blocked, true);
+        return blocked;
+      });
+      const res = await makeApp().request('/api/cascades/cascade-1/approve-frontier', {
+        method: 'POST',
+      });
+      expect(res.status).toBe(409);
+      const body = JSON.stringify(await res.json());
+      expect(body).toContain(
+        discoveryBlocked
+          ? 'claim discovery could not be completed'
+          : 'another cascade is already active'
+      );
+      if (discoveryBlocked) expect(body).not.toContain('another cascade is already active');
+      expect(mockReleaseFrontierClaim).toHaveBeenCalledWith('cascade-1');
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

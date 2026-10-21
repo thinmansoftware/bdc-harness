@@ -7,6 +7,58 @@ Audience: PART 1 is for humans and any model. PART 2 is the working contract for
 builder/planner/reviewer/repair agents running inside a lane -- written so the
 cheapest model on the roster can follow it without inference.
 
+## Proposed source repair for review: WO lock metadata mutations (2026-10-18)
+
+Acquisition and release serialize their read-modify-write sequence through a
+short exclusive `wx` guard beside the existing WO/project lock. The guard is held
+only during metadata I/O. Contention waits at most two seconds, then acquisition
+throws UNKNOWN; it never reclaims the guard by age, PID or malformed content.
+An abandoned guard needs explicit reconciliation. Each invocation removes only
+the guard it created, and guard cleanup failure emits a fixed warning.
+
+Only a validated record in explicit `released` state permits a different cascade
+to take over. Exact WO/project, nonempty cascade identity, known status and valid
+timestamps are required before interpreting stored evidence. Replacement remains
+an atomic temporary-file rename under the guard. Release errors retain shared
+evidence and emit a sanitized warning; they never unlink the shared lock.
+
+This source proposal addresses concurrent released-lock takeover and unsafe
+release-error deletion. It preserves same-cascade reacquisition, whose separate
+lifetime gap remains: a duplicate admission can reach the existing cascade
+finally block and release the original caller's running lock. Explicit acquisition
+ownership is follow-on work. This proposal is not full acceptance of bdc-xo#1546,
+a live two-lane canary, or merge/deployment authority. A mixed-version writer that
+does not obey this guard is outside its serialization guarantee.
+
+## Proposed source repair for review: same-dispatch execution ownership (2026-10-18)
+
+The follow-on proposal gives a fresh or explicitly released-lock acquirer a
+random execution-generation token, persisted in the WO lock. Same-ID running
+reacquisition remains recognizable but returns an explicit null token: it is a
+read-only replay, never a second execution grant. Missing ownership metadata from
+an injected acquisition dependency is UNKNOWN, not implicit permission.
+
+A replay branches before discovery, admission creation and the owner's finally
+block. It reads the durable record through the existing recorder module,
+validates exact cascade/WO/project, the existing request identity comparison,
+a known status and an attempts array, then reports admission with `created=false`.
+Missing or unparseable records, conflicting identity/request and invalid
+status/attempts envelopes are UNKNOWN and perform no write, fire or release.
+This is not complete field-by-field record-schema validation. It also prevents
+a replay arriving before admission from becoming its writer. The frontier
+module retains its existing reader export by forwarding the shared reader.
+
+Only the execution-token owner enters provider execution and cleanup. Release
+compares exact cascade identity and token under the metadata guard, including
+when a later generation reuses the same cascade ID. Stale or missing tokens
+leave evidence untouched. Genuine-owner fixtures now state ownership explicitly.
+
+Legacy running lock records without a generation token remain conservatively
+held; they require explicit reconciliation or a coordinated drain before any
+future version transition. No token is silently backfilled, and mixed-version
+writers remain outside the guarantee. This is source validation for review,
+not a deployment, live canary or full closure of bdc-xo#1546.
+
 ---
 
 # PART 1 -- The system in plain words
