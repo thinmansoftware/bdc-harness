@@ -119,6 +119,8 @@ describe('cascade default escalation boundary', () => {
         entryOverride: 'codex',
         overseerPermit: permit,
         deps: {
+          // This test exercises escalation authority, not live GitHub discovery.
+          findWoClaim: async () => null,
           fire: async () => ({
             ok: false,
             runId: null,

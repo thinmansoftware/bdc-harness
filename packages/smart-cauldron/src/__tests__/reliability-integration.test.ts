@@ -44,6 +44,7 @@ async function persistedRecord(dir: string): Promise<CascadeRunRecord> {
 
 function winningDeps(fire: ReturnType<typeof mock>): CascadeDeps {
   return {
+    findWoClaim: async () => null,
     preflight: async () => undefined,
     fire,
     poll: async options => ({

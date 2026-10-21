@@ -7,6 +7,29 @@ Audience: PART 1 is for humans and any model. PART 2 is the working contract for
 builder/planner/reviewer/repair agents running inside a lane -- written so the
 cheapest model on the roster can follow it without inference.
 
+## Proposed source repair for review: WO lock metadata mutations (2026-10-18)
+
+Acquisition and release serialize their read-modify-write sequence through a
+short exclusive `wx` guard beside the existing WO/project lock. The guard is held
+only during metadata I/O. Contention waits at most two seconds, then acquisition
+throws UNKNOWN; it never reclaims the guard by age, PID or malformed content.
+An abandoned guard needs explicit reconciliation. Each invocation removes only
+the guard it created, and guard cleanup failure emits a fixed warning.
+
+Only a validated record in explicit `released` state permits a different cascade
+to take over. Exact WO/project, nonempty cascade identity, known status and valid
+timestamps are required before interpreting stored evidence. Replacement remains
+an atomic temporary-file rename under the guard. Release errors retain shared
+evidence and emit a sanitized warning; they never unlink the shared lock.
+
+This source proposal addresses concurrent released-lock takeover and unsafe
+release-error deletion. It preserves same-cascade reacquisition, whose separate
+lifetime gap remains: a duplicate admission can reach the existing cascade
+finally block and release the original caller's running lock. Explicit acquisition
+ownership is follow-on work. This proposal is not full acceptance of bdc-xo#1546,
+a live two-lane canary, or merge/deployment authority. A mixed-version writer that
+does not obey this guard is outside its serialization guarantee.
+
 ---
 
 # PART 1 -- The system in plain words

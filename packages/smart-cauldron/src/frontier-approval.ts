@@ -213,9 +213,9 @@ export async function resumeFrontierTier(
   });
 
   // Only record the approval on the original paused record once the premium tier
-  // actually fired. A 'blocked' result means nothing fired (WO lock held by a
-  // live duplicate) -- leaving the record pending lets a retry succeed once the
-  // duplicate clears, instead of stranding it 'approved' with no fire.
+  // actually fired. A 'blocked' result can mean a WO lock held by a live
+  // duplicate or incomplete claim discovery. Keep the record pending so the
+  // operator can retry after the blocker clears.
   if (result.status !== 'blocked') {
     await annotateResolution(record, 'approved', outDir, { resumeCascadeId });
   }
