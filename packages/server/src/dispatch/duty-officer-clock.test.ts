@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { generateKeyPairSync } from 'node:crypto';
 import { rootLogger } from '@archon/paths';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
+import { clearServiceGitHubTokenCache } from '@archon/core/github/service-identity';
 import {
   resetSecurityDetectorStateForTests,
   runSecurityDetector,
@@ -10,11 +12,69 @@ import {
 import {
   githubIssueInAllowList,
   githubNudgeEnabled,
+  githubToken,
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
   type DutyOfficerClockDeps,
 } from './duty-officer-clock';
+
+// GitHub App env keys the duty_officer identity resolves from; cleared between
+// the App-identity tests below so a leaked key never flips a PAT test to App.
+const DUTY_OFFICER_APP_ENV_KEYS = [
+  'GITHUB_APP_DUTY_OFFICER_ID',
+  'GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY_PATH',
+  'GITHUB_APP_TASKMASTER_ID',
+  'GITHUB_APP_TASKMASTER_INSTALLATION_ID',
+  'GITHUB_APP_TASKMASTER_PRIVATE_KEY',
+  'GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH',
+  'GITHUB_APP_ID',
+  'GITHUB_APP_INSTALLATION_ID',
+  'GITHUB_APP_PRIVATE_KEY',
+  'GITHUB_APP_PRIVATE_KEY_PATH',
+] as const;
+
+function captureAppEnv(): Record<string, string | undefined> {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of DUTY_OFFICER_APP_ENV_KEYS) saved[key] = process.env[key];
+  return saved;
+}
+
+function restoreAppEnv(saved: Record<string, string | undefined>): void {
+  for (const key of DUTY_OFFICER_APP_ENV_KEYS) {
+    const value = saved[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+function clearAppEnv(): void {
+  for (const key of DUTY_OFFICER_APP_ENV_KEYS) delete process.env[key];
+}
+
+function testAppPrivateKey(): string {
+  return generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+  }).privateKey;
+}
+
+function captureRootLoggerLines(): { lines: string[]; restore: () => void } {
+  const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+    symbol => symbol.description === 'pino.stream'
+  )!;
+  const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+    streamSymbol
+  ];
+  const lines: string[] = [];
+  const write = spyOn(stream, 'write').mockImplementation(line => {
+    lines.push(line);
+  });
+  return { lines, restore: () => write.mockRestore() };
+}
 
 test('explicit GitHub nudge switch still requires a usable authenticated identity', () => {
   process.env.DUTY_OFFICER_GH_NUDGE = 'true';
@@ -25,6 +85,95 @@ test('explicit GitHub nudge switch still requires a usable authenticated identit
   expect(githubNudgeEnabled()).toBe(false);
   process.env.GH_TOKEN = 'synthetic-pat';
   expect(githubNudgeEnabled()).toBe(true);
+});
+
+// Test 2 (a): a PAT identity returns the configured token verbatim -- unchanged
+// behaviour -- and the nudge agrees with a non-null token.
+test('github token returns the PAT verbatim under a PAT identity', async () => {
+  const saved = captureAppEnv();
+  clearServiceGitHubTokenCache();
+  clearAppEnv();
+  delete process.env.GITHUB_TOKEN;
+  process.env.GH_TOKEN = 'synthetic-pat';
+  process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+  try {
+    expect(githubNudgeEnabled()).toBe(true);
+    expect(await githubToken()).toBe('synthetic-pat');
+  } finally {
+    restoreAppEnv(saved);
+    clearServiceGitHubTokenCache();
+  }
+});
+
+// Test 1 (githubToken half) + Test 2 (b): under an App identity githubToken()
+// mints an installation token via getServiceGitHubToken, and the nudge agrees
+// (both enabled AND a non-null token for the same environment).
+test('github token mints an installation token and the nudge agrees under an App identity', async () => {
+  const saved = captureAppEnv();
+  clearServiceGitHubTokenCache();
+  clearAppEnv();
+  delete process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  process.env.GITHUB_APP_DUTY_OFFICER_ID = '4574893';
+  process.env.GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID = '789';
+  process.env.GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY = testAppPrivateKey();
+  process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+  const fetchMock = spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+    expect(String(url)).toBe('https://api.github.com/app/installations/789/access_tokens');
+    expect(init?.method).toBe('POST');
+    return Response.json({ token: 't-app-installation', expires_at: '2026-10-21T13:00:00Z' });
+  });
+  try {
+    expect(githubNudgeEnabled()).toBe(true);
+    expect(await githubToken()).toBe('t-app-installation');
+  } finally {
+    fetchMock.mockRestore();
+    clearServiceGitHubTokenCache();
+    restoreAppEnv(saved);
+  }
+});
+
+// Test 3: githubToken() resolves null without throwing when the identity cannot
+// be resolved (incomplete App config) or when the App token mint fails, and the
+// mint failure is logged at warn with no token material.
+test('github token returns null without throwing on bad config or mint failure', async () => {
+  const saved = captureAppEnv();
+  const logs = captureRootLoggerLines();
+  clearServiceGitHubTokenCache();
+  try {
+    // (a) incomplete App config makes resolveServiceGitHubAuth throw.
+    clearAppEnv();
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    process.env.GITHUB_APP_DUTY_OFFICER_ID = '4574893';
+    expect(await githubToken()).toBeNull();
+
+    // (b) a complete App config whose installation-token mint returns 401.
+    clearAppEnv();
+    process.env.GITHUB_APP_DUTY_OFFICER_ID = '4574893';
+    process.env.GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID = '789';
+    process.env.GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY = testAppPrivateKey();
+    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response('unauthorized', { status: 401 })
+    );
+    try {
+      expect(await githubToken()).toBeNull();
+    } finally {
+      fetchMock.mockRestore();
+    }
+  } finally {
+    logs.restore();
+    clearServiceGitHubTokenCache();
+    restoreAppEnv(saved);
+  }
+  const warnRecords = logs.lines
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+    .filter(record => record.msg === 'duty_officer_github_token_resolve_failed');
+  expect(
+    warnRecords.some(record => String(record.error).includes('github_app_token_mint_failed'))
+  ).toBe(true);
+  // No token material (private key PEM) ever reaches the log.
+  expect(logs.lines.join('')).not.toContain('PRIVATE KEY');
 });
 
 function message(overrides: Partial<DispatchMessage> & { id: string }): DispatchMessage {

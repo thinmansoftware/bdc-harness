@@ -2,6 +2,7 @@ import {
   resolveGitHubAppAuth,
   resolveRealOctokitAuthOptions,
 } from '@archon/overseer/adapters/github-real-deps';
+import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
 import { createLogger } from '@archon/paths';
 
 const log = createLogger('dispatch/duty-officer-security-detector');
@@ -10,7 +11,10 @@ const DETECTOR_MARKER = '<!-- security-detector-issue -->';
 const COMMENT_MARKER = '<!-- security-detector -->';
 const REPORT_TITLE = /^Security Scan -- (\d{4})-W(\d{2})$/;
 // Clock ticks create fresh deps; throttle state lives for the process lifetime.
-const PROCESS_RUNS = new Map<string, { last_run_at: number }>();
+// `errored` records whether the last completed run failed: an error run only
+// consumes the short error-backoff window, never the full six-hour interval, so
+// a transient token/read failure retries soon instead of silencing the detector.
+const PROCESS_RUNS = new Map<string, { last_run_at: number; errored: boolean }>();
 
 export function resetSecurityDetectorStateForTests(): void {
   PROCESS_RUNS.clear();
@@ -24,7 +28,7 @@ export interface SecurityDetectorReason {
 }
 export interface SecurityDetectorDeps {
   fetchImpl: typeof fetch;
-  readToken: () => string | null;
+  readToken: () => Promise<string | null>;
   writeTokenProvider: (signal: AbortSignal) => Promise<string | null>;
   signal?: AbortSignal;
   now: () => Date;
@@ -284,14 +288,35 @@ export async function runSecurityDetector(
   signal.throwIfAborted();
   const now = deps.now();
   const interval = positiveMs('DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS', 21_600_000);
+  const errorBackoff = positiveMs(
+    'DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS',
+    900_000,
+    1_000
+  );
   const repo = targetRepo();
   const stateKey = `duty-officer-clock:${repo.toLowerCase()}`;
   const previous = PROCESS_RUNS.get(stateKey);
-  if (previous !== undefined && now.getTime() - previous.last_run_at < interval) {
-    log.info('duty_officer_security_detector_skipped_throttle');
-    return null;
+  if (previous !== undefined) {
+    // An error run only reserves the short backoff; a clean/alarm/disarmed run
+    // reserves the full interval. The write happens at the finalized verdict
+    // (recordRun), never at entry, so an error never consumes the six-hour slot.
+    const window = previous.errored ? errorBackoff : interval;
+    if (now.getTime() - previous.last_run_at < window) {
+      log.info('duty_officer_security_detector_skipped_throttle');
+      return null;
+    }
   }
-  PROCESS_RUNS.set(stateKey, { last_run_at: now.getTime() });
+  // Record the completed run's slot at a terminal verdict. An observation_error
+  // verdict only reserves the short error-backoff window; a non-error verdict
+  // (clean, alarm, disarmed) reserves the full interval. A write-auth refusal
+  // leaves a non-error verdict in place, so it still throttles normally -- it is
+  // not the read-token failure this backoff exists to retry.
+  const recordRun = (r: SecurityDetectorResult): void => {
+    PROCESS_RUNS.set(stateKey, {
+      last_run_at: now.getTime(),
+      errored: r.verdict === 'observation_error',
+    });
+  };
   const trustedLogins = new Set(
     (
       process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS ??
@@ -305,7 +330,7 @@ export async function runSecurityDetector(
   const evaluatedAt = now.toISOString();
   const armedAt = process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT?.trim() || '9999-12-31';
   const armed = now.getTime() >= Date.parse(`${armedAt}T00:00:00Z`);
-  const token = deps.readToken();
+  const token = await deps.readToken();
   const result: SecurityDetectorResult = {
     verdict: armed ? 'clean' : 'disarmed',
     reasons: [],
@@ -316,7 +341,17 @@ export async function runSecurityDetector(
   if (!token) {
     result.verdict = 'observation_error';
     result.last_error = 'duty_officer_github_token_missing';
-    log.error('duty_officer_security_detector_observation_error');
+    let identityKind: string;
+    try {
+      identityKind = resolveServiceGitHubAuth('duty_officer').kind;
+    } catch {
+      identityKind = 'none';
+    }
+    log.error(
+      { last_error: result.last_error, identity_kind: identityKind },
+      'duty_officer_security_detector_observation_error'
+    );
+    recordRun(result);
     return result;
   }
 
@@ -349,7 +384,10 @@ export async function runSecurityDetector(
         } else {
           result.verdict = 'observation_error';
           result.last_error = (error as Error).message;
-          log.error({ err: error }, 'duty_officer_security_detector_observation_error');
+          log.error(
+            { err: error, last_error: result.last_error },
+            'duty_officer_security_detector_observation_error'
+          );
         }
       }
     }
@@ -427,7 +465,10 @@ export async function runSecurityDetector(
     signal.throwIfAborted();
     result.verdict = 'observation_error';
     result.last_error = (error as Error).message;
-    log.error({ err: error }, 'duty_officer_security_detector_observation_error');
+    log.error(
+      { err: error, last_error: result.last_error },
+      'duty_officer_security_detector_observation_error'
+    );
   }
 
   if (result.verdict !== 'observation_error') {
@@ -446,11 +487,13 @@ export async function runSecurityDetector(
     signal.throwIfAborted();
     result.last_error = (error as Error).message;
     log.error({ err: error }, 'duty_officer_security_detector_write_refused_no_app_auth');
+    recordRun(result);
     return result;
   }
   if (!writeToken) {
     result.last_error = 'app_auth_missing';
     log.warn('duty_officer_security_detector_write_refused_no_app_auth');
+    recordRun(result);
     return result;
   }
 
@@ -559,5 +602,6 @@ export async function runSecurityDetector(
     log.info('duty_officer_security_detector_marker_patched');
   }
   log.info({ verdict: result.verdict }, 'duty_officer_security_detector_ran');
+  recordRun(result);
   return result;
 }

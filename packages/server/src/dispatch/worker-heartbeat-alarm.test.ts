@@ -1,12 +1,59 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { generateKeyPairSync } from 'node:crypto';
+import { rootLogger } from '@archon/paths';
 import type { DispatchWorker } from '@archon/core/db/dispatch';
+import { clearServiceGitHubTokenCache } from '@archon/core/github/service-identity';
 import {
   evaluateWorkerHeartbeats,
+  postWorkerAlarmComment,
   runWorkerHeartbeatAlarm,
   type WorkerAlarmIssueComment,
   type WorkerHeartbeatAlarmDeps,
 } from './worker-heartbeat-alarm';
 import { tickDutyOfficerClock, type DutyOfficerClockDeps } from './duty-officer-clock';
+
+const DUTY_OFFICER_APP_ENV_KEYS = [
+  'GITHUB_APP_DUTY_OFFICER_ID',
+  'GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY_PATH',
+] as const;
+
+function captureAppEnv(): Record<string, string | undefined> {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of DUTY_OFFICER_APP_ENV_KEYS) saved[key] = process.env[key];
+  return saved;
+}
+
+function restoreAppEnv(saved: Record<string, string | undefined>): void {
+  for (const key of DUTY_OFFICER_APP_ENV_KEYS) {
+    const value = saved[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+function testAppPrivateKey(): string {
+  return generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+  }).privateKey;
+}
+
+function captureRootLoggerLines(): { lines: string[]; restore: () => void } {
+  const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+    symbol => symbol.description === 'pino.stream'
+  )!;
+  const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+    streamSymbol
+  ];
+  const lines: string[] = [];
+  const write = spyOn(stream, 'write').mockImplementation(line => {
+    lines.push(line);
+  });
+  return { lines, restore: () => write.mockRestore() };
+}
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -187,6 +234,51 @@ describe('runWorkerHeartbeatAlarm', () => {
     process.env.DISPATCH_WORKER_ALARM_ENABLED = 'false';
     await runWorkerHeartbeatAlarm(deps);
     expect(downCount(deps.comments, 'A')).toBe(1);
+  });
+
+  // Test 6: under a GitHub App identity the alarm mints an installation token,
+  // the no-token guard passes (no worker_heartbeat_alarm_no_token), and the
+  // comment POST carries the minted token.
+  test('Test 6: heartbeat_alarm_works_under_app_identity', async () => {
+    const saved = captureAppEnv();
+    const logs = captureRootLoggerLines();
+    clearServiceGitHubTokenCache();
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    process.env.GITHUB_APP_DUTY_OFFICER_ID = '4574893';
+    process.env.GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID = '789';
+    process.env.GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY = testAppPrivateKey();
+    process.env.DISPATCH_WORKER_ALARM_WORKERS = 'A';
+    process.env.DUTY_OFFICER_GH_REPO = 'thinmansoftware/bdc-xo';
+    const commentAuthHeaders: string[] = [];
+    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      if (String(url).endsWith('/access_tokens')) {
+        expect(init?.method).toBe('POST');
+        return Response.json({ token: 't-app-installation', expires_at: '2026-10-21T13:00:00Z' });
+      }
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      commentAuthHeaders.push(headers.Authorization ?? '');
+      return new Response('{}', { status: 201 });
+    });
+    const nowMs = Date.parse('2026-09-28T12:00:00.000Z');
+    const deps = alarmDeps({ workers: { A: worker('A', nowMs - 11 * MINUTE) }, now: () => nowMs });
+    try {
+      await runWorkerHeartbeatAlarm(deps);
+      // Guard passed (token minted) and the alarm posted via the deps stub.
+      expect(downCount(deps.comments, 'A')).toBe(1);
+      // The real comment writer carries the minted installation token.
+      await postWorkerAlarmComment(
+        { owner: 'thinmansoftware', repo: 'bdc-xo', number: 1 },
+        'heartbeat alarm body'
+      );
+      expect(commentAuthHeaders).toContain('Bearer t-app-installation');
+    } finally {
+      logs.restore();
+      fetchMock.mockRestore();
+      clearServiceGitHubTokenCache();
+      restoreAppEnv(saved);
+    }
+    expect(logs.lines.some(line => line.includes('worker_heartbeat_alarm_no_token'))).toBe(false);
   });
 });
 

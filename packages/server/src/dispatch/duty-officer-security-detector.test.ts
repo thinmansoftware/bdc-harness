@@ -19,7 +19,7 @@ function deps(
 ): SecurityDetectorDeps {
   return {
     fetchImpl,
-    readToken: () => null,
+    readToken: async () => null,
     writeTokenProvider: async () => null,
     now: () => now,
     buildSha: 'abc1234',
@@ -90,7 +90,7 @@ describe('duty officer security detector', () => {
           ]);
         }) as typeof fetch
       );
-      d.readToken = () => 'read-token';
+      d.readToken = async () => 'read-token';
       try {
         for (let run = 0; run < 2; run += 1) {
           if (allowList === undefined) delete process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS;
@@ -164,7 +164,7 @@ describe('duty officer security detector', () => {
         return new Promise<Response>(() => {});
       }) as typeof fetch
     );
-    d.readToken = () => 'read-token';
+    d.readToken = async () => 'read-token';
     d.writeTokenProvider = mock(async () => 'app-token');
     const controller = new AbortController();
     const signal = controller.signal;
@@ -198,7 +198,7 @@ describe('duty officer security detector', () => {
         return Response.json({ number: 42 });
       }) as typeof fetch
     );
-    d.readToken = () => 'read-token';
+    d.readToken = async () => 'read-token';
     d.writeTokenProvider = async () => 'app-token';
     await expect(runSecurityDetector(d, controller.signal)).rejects.toThrow('test_deadline');
     expect(writes).toEqual(['POST']);
@@ -213,7 +213,7 @@ describe('duty officer security detector', () => {
         return Response.json(String(_url).includes('/runs?') ? { workflow_runs: [] } : []);
       }) as typeof fetch
     );
-    d.readToken = () => 'read-token';
+    d.readToken = async () => 'read-token';
     d.writeTokenProvider = async signal => {
       expect(signal).toBe(controller.signal);
       controller.abort(new Error('test_deadline'));
@@ -307,7 +307,7 @@ describe('duty officer security detector', () => {
 
   test('writes_use_app_token_reads_use_pat_and_no_app_means_no_writes', async () => {
     const d = deps();
-    d.readToken = () => null;
+    d.readToken = async () => null;
     d.writeTokenProvider = mock(async () => 'ghs_app');
     const result = await runSecurityDetector(d);
     expect(result?.wrote).toHaveLength(0);
@@ -317,5 +317,135 @@ describe('duty officer security detector', () => {
   test('never_labels_detector_issue_security_scan_and_tolerates_label_422 contract', () => {
     const detectorLabels = ['security-detector', 'prio:P0'];
     expect(detectorLabels).not.toContain('security-scan');
+  });
+
+  // Test 1 (detector half): an App installation token supplied by readToken is
+  // the Bearer token on every GitHub read, and the run reaches a non-error
+  // verdict. The githubToken() resolution half lives in duty-officer-clock.test.
+  test('app_identity_yields_a_read_token_and_detector_runs', async () => {
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+    const authHeaders: string[] = [];
+    const d = deps(
+      mock(async (url, init) => {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        if ((init?.method ?? 'GET') === 'GET') authHeaders.push(headers.Authorization ?? '');
+        if (String(url).includes('/runs?')) {
+          return Response.json({
+            workflow_runs: [{ created_at: '2026-09-29T00:00:00Z', conclusion: 'success' }],
+          });
+        }
+        return Response.json([]);
+      }) as typeof fetch
+    );
+    d.readToken = async () => 't-app';
+    const result = await runSecurityDetector(d);
+    expect(result?.verdict).not.toBe('observation_error');
+    expect(result?.verdict === 'clean' || result?.verdict === 'alarm').toBe(true);
+    expect(authHeaders.length).toBeGreaterThan(0);
+    expect(authHeaders.every(header => header === 'Bearer t-app')).toBe(true);
+  });
+
+  // Test 4: every observation_error log line carries last_error (and the
+  // token-missing branch also carries the resolved identity kind).
+  test('observation_error_logs_carry_last_error', async () => {
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    )!;
+    const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+      streamSymbol
+    ];
+    const lines: string[] = [];
+    const write = spyOn(stream, 'write').mockImplementation(line => {
+      lines.push(line);
+    });
+    try {
+      // (a) readToken resolves null -> token-missing observation_error.
+      await runSecurityDetector(deps());
+      // (b) reads throw duty_officer_github_http_500 -> observation_error.
+      resetSecurityDetectorStateForTests();
+      process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+      const d = deps(mock(async () => new Response('boom', { status: 500 })) as typeof fetch);
+      d.readToken = async () => 'read-token';
+      await runSecurityDetector(d);
+    } finally {
+      write.mockRestore();
+    }
+    const errorRecords = lines
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+      .filter(record => record.msg === 'duty_officer_security_detector_observation_error');
+    expect(errorRecords.length).toBeGreaterThanOrEqual(2);
+    for (const record of errorRecords) {
+      expect(typeof record.last_error).toBe('string');
+      expect((record.last_error as string).length).toBeGreaterThan(0);
+    }
+    const tokenMissing = errorRecords.find(
+      record => record.last_error === 'duty_officer_github_token_missing'
+    );
+    expect(tokenMissing).toBeDefined();
+    expect(['pat', 'app', 'none']).toContain(tokenMissing!.identity_kind);
+    expect(errorRecords.some(record => record.last_error === 'duty_officer_github_http_500')).toBe(
+      true
+    );
+  });
+
+  // Test 5: an observation_error run reserves only the short error-backoff, not
+  // the six-hour interval; the next eligible tick with a working token runs.
+  test('error_run_does_not_consume_the_six_hour_slot', async () => {
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = '60000';
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+    const T = now.getTime();
+    try {
+      const first = await runSecurityDetector(deps());
+      expect(first?.verdict).toBe('observation_error');
+
+      const fetchImpl = mock(async (url: string | URL | Request, init?: RequestInit) => {
+        if ((init?.method ?? 'GET') !== 'GET') return Response.json({ number: 99 });
+        if (String(url).includes('/runs?')) {
+          return Response.json({
+            workflow_runs: [{ created_at: '2026-09-29T00:00:00Z', conclusion: 'success' }],
+          });
+        }
+        return Response.json([]);
+      });
+      const working: SecurityDetectorDeps = {
+        fetchImpl: fetchImpl as typeof fetch,
+        readToken: async () => 'read-token',
+        writeTokenProvider: async () => 'app-token',
+        now: () => new Date(T + 61_000),
+        buildSha: 'abc1234',
+      };
+      const second = await runSecurityDetector(working);
+      expect(second).not.toBeNull();
+      expect(second?.verdict).not.toBe('observation_error');
+      expect(second!.wrote.length).toBeGreaterThan(0);
+
+      const third = await runSecurityDetector({ ...working, now: () => new Date(T + 62_000) });
+      expect(third).toBeNull();
+    } finally {
+      delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS;
+    }
+  });
+
+  // Test 8: repeated error runs back off to the error-backoff cadence -- they
+  // neither spin every tick nor fall into the old six-hour suppression.
+  test('repeated_errors_back_off_not_spin', async () => {
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = '60000';
+    const T = now.getTime();
+    const ranAt: number[] = [];
+    try {
+      for (let t = 0; t <= 120_000; t += 10_000) {
+        const result = await runSecurityDetector({
+          fetchImpl: mock(async () => new Response('{}')) as typeof fetch,
+          readToken: async () => null,
+          writeTokenProvider: async () => null,
+          now: () => new Date(T + t),
+          buildSha: 'abc1234',
+        });
+        if (result !== null) ranAt.push(t);
+      }
+    } finally {
+      delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS;
+    }
+    expect(ranAt).toEqual([0, 60_000, 120_000]);
   });
 });

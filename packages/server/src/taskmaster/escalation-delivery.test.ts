@@ -5,11 +5,13 @@
  * delivery-claim tests use the REAL database-backed claim on a temp SQLite
  * file (two adapters on one file model two processes sharing the DB).
  */
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { generateKeyPairSync } from 'node:crypto';
 import { unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import { clearServiceGitHubTokenCache } from '@archon/core/github/service-identity';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
@@ -887,5 +889,76 @@ describe('marker trust: only the poster identity suppresses', () => {
     expect((await deliverEscalationToIssue(params, deps)).posted).toBe(false);
     expect(userCalls).toBe(2);
     expect(posts).toBe(0);
+  });
+});
+
+describe('escalation delivery GitHub auth under a GitHub App identity', () => {
+  const APP_ENV_KEYS = [
+    'GITHUB_APP_DUTY_OFFICER_ID',
+    'GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID',
+    'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY',
+    'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY_PATH',
+  ] as const;
+
+  function testAppPrivateKey(): string {
+    return generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+    }).privateKey;
+  }
+
+  // Test 7: with options.token undefined the request mints an installation
+  // token via the shared accessor; with an explicit options.token the explicit
+  // token still wins and no mint happens.
+  test('Test 7: app identity mints the token, explicit token still wins', async () => {
+    const saved: Record<string, string | undefined> = {};
+    for (const key of APP_ENV_KEYS) saved[key] = process.env[key];
+    const savedGh = { GH_TOKEN: process.env.GH_TOKEN, GITHUB_TOKEN: process.env.GITHUB_TOKEN };
+    clearServiceGitHubTokenCache();
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    process.env.GITHUB_APP_DUTY_OFFICER_ID = '4574893';
+    process.env.GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID = '789';
+    process.env.GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY = testAppPrivateKey();
+
+    const mintSpy = spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      expect(String(url)).toBe('https://api.github.com/app/installations/789/access_tokens');
+      expect(init?.method).toBe('POST');
+      return Response.json({ token: 't-app-installation', expires_at: '2026-10-21T13:00:00Z' });
+    });
+    const authHeaders: string[] = [];
+    const fetchImpl = async (_input: string, reqInit?: RequestInit): Promise<Response> => {
+      const headers = (reqInit?.headers ?? {}) as Record<string, string>;
+      authHeaders.push(headers.Authorization ?? '');
+      return new Response(JSON.stringify([]), { status: 200 });
+    };
+
+    try {
+      // (a) token undefined -> mints and uses the installation token.
+      const appDeps = createRealEscalationDeliveryDeps({ fetchImpl });
+      await appDeps.listIssueComments(ISSUE);
+      expect(authHeaders).toContain('Bearer t-app-installation');
+      expect(mintSpy).toHaveBeenCalledTimes(1);
+
+      // (b) explicit token still wins; no mint is attempted.
+      authHeaders.length = 0;
+      mintSpy.mockClear();
+      const explicitDeps = createRealEscalationDeliveryDeps({ fetchImpl, token: 'explicit-token' });
+      await explicitDeps.listIssueComments(ISSUE);
+      expect(authHeaders).toContain('Bearer explicit-token');
+      expect(mintSpy).not.toHaveBeenCalled();
+    } finally {
+      mintSpy.mockRestore();
+      clearServiceGitHubTokenCache();
+      for (const key of APP_ENV_KEYS) {
+        if (saved[key] === undefined) delete process.env[key];
+        else process.env[key] = saved[key];
+      }
+      if (savedGh.GH_TOKEN === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = savedGh.GH_TOKEN;
+      if (savedGh.GITHUB_TOKEN === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = savedGh.GITHUB_TOKEN;
+    }
   });
 });

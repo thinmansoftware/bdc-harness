@@ -319,3 +319,61 @@ it also checks payload forwarding and identical-byte permission retry:
 ```bash
 bun test ./scripts/github-service-exec.test.ts
 ```
+
+## Duty Officer (security detector, heartbeat alarm, escalation delivery)
+
+The in-container Duty Officer clock resolves its GitHub identity for the
+`duty_officer` service. Precedence (see
+`packages/core/src/github/service-identity.ts`,
+`SERVICE_GITHUB_AUTH_PRECEDENCE.duty_officer`):
+
+```
+service_app  ->  taskmaster_app_alias  ->  shared_overseer_app  ->  pat
+```
+
+Since bdc-harness #1187/#1202 `duty_officer` resolves to the shared Overseer
+App (kind `app`), not a PAT.
+
+`githubToken()` in `packages/server/src/dispatch/duty-officer-clock.ts` returns a
+usable token for BOTH identity kinds:
+
+- `pat` -- returns the configured token verbatim (unchanged behaviour).
+- `app` -- mints and caches an installation token via the shared
+  `getServiceGitHubToken(identity)` (cached per `poolId`).
+- Returns `null` for kind `none`, a blank PAT, or a mint failure. A mint
+  failure is logged at `warn` as `duty_officer_github_token_resolve_failed`
+  with the error message only -- never the token material.
+
+The three `duty_officer`-token consumers therefore all work under an App
+identity:
+
+- security detector (`duty-officer-security-detector.ts`, `readToken`),
+- worker heartbeat alarm (`worker-heartbeat-alarm.ts`), and
+- Taskmaster escalation delivery (`taskmaster/escalation-delivery.ts`).
+
+### Security detector error backoff
+
+When the detector cannot complete (verdict `observation_error` -- e.g. a
+missing token or a GitHub read failure) it logs
+`duty_officer_security_detector_observation_error` with a `last_error` field
+(and, on the token-missing branch, the resolved `identity_kind`). An error run
+no longer consumes the full six-hour throttle slot
+(`DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS`, default 21600000). Instead it
+reserves only a short retry window controlled by:
+
+```
+# Retry backoff after an observation_error run (ms). Default 900000 (15 min),
+# floor 1000. A clean/alarm/disarmed verdict still throttles for the full
+# DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS.
+DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS=900000
+```
+
+To confirm the detector is healthy after a rebuild, grep the container logs:
+
+```bash
+# A successful run (verdict clean/alarm/disarmed):
+docker logs archon-app-1 2>&1 | grep duty_officer_security_detector_ran
+# An error run, now with its cause attached:
+docker logs archon-app-1 2>&1 | grep duty_officer_security_detector_observation_error
+# (each such line carries last_error, e.g. duty_officer_github_token_missing)
+```

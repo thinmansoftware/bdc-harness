@@ -15,7 +15,10 @@ import {
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
-import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
 import {
@@ -97,11 +100,20 @@ export interface DutyOfficerClockDeps {
   now?: () => Date;
 }
 
-export function githubToken(): string | null {
+// Resolve the duty_officer GitHub token for both PAT and App identities. For a
+// PAT this returns the configured token verbatim (unchanged behaviour); for a
+// GitHub App it mints and caches an installation token via the shared
+// getServiceGitHubToken. Returns null for kind none, a blank PAT, or a mint
+// failure (logged at warn, never the token material) so callers degrade loudly
+// rather than silently running under a missing token.
+export async function githubToken(): Promise<string | null> {
   try {
     const identity = resolveServiceGitHubAuth('duty_officer');
-    return identity.kind === 'pat' ? identity.token : null;
-  } catch {
+    if (identity.kind === 'none') return null;
+    const token = await getServiceGitHubToken(identity);
+    return token.trim() ? token : null;
+  } catch (error) {
+    log.warn({ error: (error as Error).message }, 'duty_officer_github_token_resolve_failed');
     return null;
   }
 }

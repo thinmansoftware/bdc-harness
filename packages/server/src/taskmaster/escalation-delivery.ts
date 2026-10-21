@@ -442,7 +442,7 @@ async function githubRequest(
   if (!url.startsWith(`${GITHUB_API_ORIGIN}/`)) {
     throw new Error('taskmaster_github_url_not_api_origin');
   }
-  const token = options.token !== undefined ? options.token : githubToken();
+  const token = options.token !== undefined ? options.token : await githubToken();
   if (!token) throw new Error('taskmaster_github_token_missing');
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
@@ -527,8 +527,8 @@ function toEscalationComment(raw: unknown): EscalationIssueComment {
  */
 function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () => Promise<string> {
   let cached: { token: string | null; login: Promise<string> } | null = null;
-  return (): Promise<string> => {
-    const token = options.token !== undefined ? options.token : githubToken();
+  return async (): Promise<string> => {
+    const token = options.token !== undefined ? options.token : await githubToken();
     if (cached?.token === token) return cached.login;
     const login = (async (): Promise<string> => {
       const response = await githubRequest(`${GITHUB_API_ORIGIN}/user`, options);
