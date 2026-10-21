@@ -302,6 +302,7 @@ import {
 } from './schemas/cascade.schemas';
 import {
   drainBodySchema,
+  drainDispatchErrorSchema,
   drainResponseSchema,
   throttleBodySchema,
   throttleResponseSchema,
@@ -420,6 +421,16 @@ function jsonError(description: string): {
   description: string;
 } {
   return { content: { 'application/json': { schema: errorSchema } }, description };
+}
+
+function jsonDrainError(description: string): {
+  content: { 'application/json': { schema: typeof drainDispatchErrorSchema } };
+  description: string;
+} {
+  return {
+    content: { 'application/json': { schema: drainDispatchErrorSchema } },
+    description,
+  };
 }
 
 const cwdQuerySchema = z.object({ cwd: z.string().optional() });
@@ -606,7 +617,7 @@ const createConversationRoute = createRoute({
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
-    503: jsonError('Cauldron draining'),
+    503: jsonDrainError('Cauldron draining'),
   },
 });
 
@@ -690,7 +701,7 @@ const sendMessageRoute = createRoute({
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
-    503: jsonError('Cauldron draining'),
+    503: jsonDrainError('Cauldron draining'),
   },
 });
 
@@ -1656,7 +1667,7 @@ const runWorkflowRoute = createRoute({
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
-    503: jsonError('Cauldron draining'),
+    503: jsonDrainError('Cauldron draining'),
   },
 });
 
@@ -1845,6 +1856,7 @@ const approveFrontierRoute = createRoute({
     404: jsonError('Cascade not found'),
     422: jsonError('Cascade is not awaiting frontier approval'),
     500: jsonError('Server error'),
+    503: jsonDrainError('Cauldron draining'),
   },
 });
 
@@ -1949,6 +1961,7 @@ const adminDrainRoute = createRoute({
       description: 'Drain state updated',
     },
     400: jsonError('Bad request'),
+    409: jsonError('Drain ownership changed or is no longer active'),
     500: jsonError('Server error'),
   },
 });
@@ -2708,15 +2721,32 @@ export function registerApiRoutes(
     }
   }
 
+  function cauldronDrainingResponse(
+    c: Context,
+    activeLeaseCount: number,
+    activeRunCount: number
+  ): Response {
+    c.header('Retry-After', '60');
+    return c.json(
+      {
+        error: 'Cauldron is draining; new dispatch is disabled',
+        detail: `active_leases=${String(activeLeaseCount)} active_runs=${String(activeRunCount)}`,
+        code: 'cauldron_draining',
+      },
+      503
+    );
+  }
+
+  async function mapCauldronDrainingError(c: Context, error: unknown): Promise<Response | null> {
+    if (!(error instanceof workflowDb.CauldronDrainingError)) return null;
+    const drain = await workflowDb.getCauldronDrainState().catch(() => null);
+    return cauldronDrainingResponse(c, drain?.activeLeaseCount ?? 0, drain?.activeRunCount ?? 0);
+  }
+
   async function rejectNewDispatchIfDraining(c: Context): Promise<Response | null> {
     const drain = await workflowDb.getCauldronDrainState();
     if (drain.mode !== 'draining') return null;
-    return apiError(
-      c,
-      503,
-      'Cauldron is draining; new dispatch is disabled',
-      `active_leases=${String(drain.activeLeaseCount)} active_runs=${String(drain.activeRunCount)}`
-    );
+    return cauldronDrainingResponse(c, drain.activeLeaseCount, drain.activeRunCount);
   }
 
   /**
@@ -3273,6 +3303,7 @@ export function registerApiRoutes(
           ...extraContext,
         });
       } catch (error) {
+        if (error instanceof workflowDb.CauldronDrainingError) throw error;
         getLog().error({ err: error, conversationId }, 'handle_message_failed');
         try {
           await webAdapter.emitSSE(
@@ -4044,6 +4075,8 @@ export function registerApiRoutes(
 
       return c.json({ conversationId: conversation.platform_conversation_id, id: conversation.id });
     } catch (error) {
+      const draining = await mapCauldronDrainingError(c, error);
+      if (draining) return draining;
       getLog().error({ err: error }, 'create_conversation_failed');
       return apiError(c, 500, 'Failed to create conversation');
     }
@@ -4282,12 +4315,14 @@ export function registerApiRoutes(
       extraContext = { attachedFiles: savedFiles };
       filesToCleanup = { files: savedFiles, uploadDir };
     }
-    const result = await dispatchToOrchestrator(
-      conversationId,
-      message,
-      extraContext,
-      filesToCleanup
-    );
+    let result: Awaited<ReturnType<typeof dispatchToOrchestrator>>;
+    try {
+      result = await dispatchToOrchestrator(conversationId, message, extraContext, filesToCleanup);
+    } catch (error) {
+      const draining = await mapCauldronDrainingError(c, error);
+      if (draining) return draining;
+      throw error;
+    }
     return c.json(result);
   });
 
@@ -6065,6 +6100,8 @@ export function registerApiRoutes(
       const result = await dispatchToOrchestrator(conversationId, fullMessage, { modelOverride });
       return c.json(result);
     } catch (error) {
+      const draining = await mapCauldronDrainingError(c, error);
+      if (draining) return draining;
       getLog().error({ err: error }, 'run_workflow_failed');
       return apiError(c, 500, 'Failed to run workflow');
     }
@@ -6245,6 +6282,8 @@ export function registerApiRoutes(
       if (!record.frontierApproval) {
         return apiError(c, 422, 'Cascade is not awaiting frontier approval');
       }
+      const drainRejection = await rejectNewDispatchIfDraining(c);
+      if (drainRejection) return drainRejection;
       // Exactly-once guard: the first resolver (approve or reject) wins; any
       // later call observes the recorded resolution and returns an idempotent
       // no-op WITHOUT firing again.
@@ -6271,6 +6310,10 @@ export function registerApiRoutes(
       const resumePromise = resumeFrontierTier(record, {
         token,
         onAdmission: r => resolveAdmission?.(r),
+        assertDispatchAllowed: async () => {
+          const drain = await workflowDb.getCauldronDrainState();
+          if (drain.mode === 'draining') throw new workflowDb.CauldronDrainingError();
+        },
       });
       void resumePromise.catch((error: unknown) => {
         getLog().error(
@@ -6280,11 +6323,9 @@ export function registerApiRoutes(
       });
       // Race so a synchronous resume failure surfaces as 500 instead of hanging.
       const admitted = await Promise.race([admission, resumePromise]);
-      // A 'blocked' admission means the resumed cascade refused to fire because a
-      // duplicate live cascade already holds the WO lock (smart-cauldron
-      // acquireWoLock): nothing fired, no premium usage was spent, and the paused
-      // record was left untouched by resumeFrontierTier. Roll back the approval
-      // claim so the operator can retry/reject once the duplicate clears -- do NOT
+      // A blocked admission can mean a duplicate WO lock or unknown claim state.
+      // The paused record remains untouched by resumeFrontierTier. Roll back the
+      // approval claim so the operator can retry/reject once the blocker clears -- do NOT
       // report success, or the cascadeId would be wedged 'approved' forever with
       // neither a fire nor a path to re-resolve (WO Test 2 fail condition).
       if (admitted.status === 'blocked') {
@@ -6296,8 +6337,10 @@ export function registerApiRoutes(
         return apiError(
           c,
           409,
-          `Frontier resume for ${record.woId} could not fire: another cascade is already active for this WO. ` +
-            'The approval was rolled back -- retry once it clears.'
+          `Frontier resume for ${record.woId} could not fire: ` +
+            (admitted.claimDiscoveryBlock
+              ? 'claim discovery could not be completed. The approval was rolled back -- retry after GitHub discovery recovers.'
+              : 'another cascade is already active for this WO. The approval was rolled back -- retry once it clears.')
         );
       }
       return c.json({
@@ -6309,6 +6352,16 @@ export function registerApiRoutes(
         resumeCascadeId: admitted.cascadeId,
       });
     } catch (error) {
+      const draining = await mapCauldronDrainingError(c, error);
+      if (draining) {
+        await releaseFrontierClaim(cascadeId).catch((releaseError: unknown) => {
+          getLog().error(
+            { err: releaseError, cascadeId },
+            'frontier_approval_drain_claim_release_failed'
+          );
+        });
+        return draining;
+      }
       getLog().error({ err: error, cascadeId }, 'frontier_approval_approve_failed');
       return apiError(c, 500, 'Failed to approve frontier climb');
     }
@@ -6502,10 +6555,20 @@ export function registerApiRoutes(
         actor,
         reason: body.reason ?? null,
         updatedAt,
+        clearOnBoot: body.clearOnBoot,
+        expectedDrainToken: body.expectedDrainToken,
       });
       const state = await workflowDb.getCauldronDrainState(updatedAt);
-      return c.json({ success: true, changed: transition.changed, ...state });
+      return c.json({
+        success: true,
+        changed: transition.changed,
+        ...state,
+        acquiredDrainToken: transition.acquiredDrainToken,
+      });
     } catch (error) {
+      if (error instanceof workflowDb.CauldronDrainOwnershipConflict) {
+        return apiError(c, 409, 'cauldron_drain_ownership_conflict');
+      }
       getLog().error({ err: error }, 'admin_drain_api_failed');
       return apiError(c, 500, 'Failed to update drain state');
     }

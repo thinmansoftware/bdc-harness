@@ -19,6 +19,9 @@ import {
 } from './overseer-control-plane-sqlite';
 
 const log = createLogger('db/taskmaster');
+// Pending fire rows may already own provider work; reset must preserve custody.
+const EXPIRE_UNSENT_PROPOSALS =
+  "outcome = 'parked' OR (outcome = 'pending' AND action_type <> 'fire_cauldron')";
 
 export type TmActionType =
   | 'deliver_ruling'
@@ -363,6 +366,15 @@ export async function registerExpectation(data: {
   if (!existingRow)
     throw new Error('tm_expectations registration conflict without an existing row');
   return existingRow.id;
+}
+
+/** Exact readback for idempotent internal registration; no replacement of old evidence. */
+export async function getExpectationByRegistrationKey(key: string): Promise<TmExpectation | null> {
+  const result = await getDatabase().query<TmExpectation>(
+    'SELECT * FROM tm_expectations WHERE registration_key = $1',
+    [key]
+  );
+  return result.rows[0] ? normalizeExpectation(result.rows[0]) : null;
 }
 
 /**
@@ -972,7 +984,7 @@ export async function resetTaskmaster(data: { actor: string; reason: string | nu
     if (!previousRow) throw new Error('tm_control singleton missing during reset');
     const previous = normalizeControl(previousRow);
     const expired = await query(
-      "UPDATE tm_journal SET outcome = 'expired' WHERE outcome IN ('parked', 'pending')"
+      `UPDATE tm_journal SET outcome = 'expired' WHERE ${EXPIRE_UNSENT_PROPOSALS}`
     );
     const transition = await query(
       `UPDATE tm_control SET pause_state = 'RUNNING', epoch = epoch + 1, updated_at = $1
@@ -1015,6 +1027,426 @@ export async function getActionByIdempotencyKey(key: string): Promise<TmJournalE
   );
   const row = result.rows[0];
   return row ? normalizeJournal(row) : null;
+}
+
+/** Unresolved fire custody has no age cutoff: elapsed time does not prove no fire. */
+export async function listPendingFireActions(): Promise<TmJournalEntry[]> {
+  const result = await getDatabase().query<TmJournalRow>(
+    "SELECT * FROM tm_journal WHERE action_type = 'fire_cauldron' AND outcome = 'pending' ORDER BY created_at ASC"
+  );
+  return result.rows.map(normalizeJournal);
+}
+
+export interface TmFireLaunch {
+  version: 1 | 2;
+  state: 'active' | 'released';
+  token: string;
+  cascadeId: string;
+  woId: string;
+  project: string;
+  claimedAt: string;
+  releasedAt?: string;
+  releaseReason?: string;
+}
+
+export interface TmFireDrainProof {
+  kind: 'drain-refused';
+  version: 1;
+  cascadeId: string;
+  woId: string;
+  project: string;
+  workflowName: string;
+  completedAt: string;
+  executionSettled: true;
+}
+
+function validDrainProof(proof: unknown, launch: TmFireLaunch): proof is TmFireDrainProof {
+  if (!proof || typeof proof !== 'object' || Array.isArray(proof)) return false;
+  if (
+    Object.keys(proof).length !== 8 ||
+    Object.keys(proof).some(
+      key =>
+        ![
+          'kind',
+          'version',
+          'cascadeId',
+          'woId',
+          'project',
+          'workflowName',
+          'completedAt',
+          'executionSettled',
+        ].includes(key)
+    )
+  )
+    return false;
+  const value = proof as TmFireDrainProof;
+  return (
+    value.kind === 'drain-refused' &&
+    value.version === 1 &&
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-boolean-literal-compare -- Runtime proof must explicitly attest settlement.
+    value.executionSettled === true &&
+    value.cascadeId === launch.cascadeId &&
+    value.woId === launch.woId &&
+    value.project === launch.project &&
+    typeof value.workflowName === 'string' &&
+    !!value.workflowName.trim() &&
+    typeof value.completedAt === 'string' &&
+    Number.isFinite(Date.parse(value.completedAt))
+  );
+}
+
+function validFireLaunch(
+  launch: TmFireLaunch,
+  key: string,
+  woId: string,
+  project: string
+): boolean {
+  return (
+    !!launch &&
+    [1, 2].includes(launch.version) &&
+    ['active', 'released'].includes(launch.state) &&
+    typeof launch.token === 'string' &&
+    !!launch.token.trim() &&
+    (launch.version === 1
+      ? launch.cascadeId === key
+      : /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(launch.token) &&
+        launch.cascadeId === `tm:fire:launch:${launch.token}`) &&
+    launch.woId === woId &&
+    launch.project === project &&
+    typeof launch.claimedAt === 'string' &&
+    Number.isFinite(Date.parse(launch.claimedAt))
+  );
+}
+
+/** Parse existing metadata conservatively; corrupt unresolved custody cannot grant capacity. */
+export function fireLaunchMetadata(row: TmJournalEntry): {
+  proposal: Record<string, unknown>;
+  woId: string;
+  project: string;
+  launch: TmFireLaunch | null;
+} {
+  const proposal = JSON.parse(row.proposal_json) as Record<string, unknown>;
+  const evidence = proposal?.fireEvidence as { woId?: unknown; project?: unknown } | undefined;
+  const woId = evidence?.woId;
+  const project = evidence?.project;
+  if (
+    !proposal ||
+    Array.isArray(proposal) ||
+    proposal.type !== 'fire_cauldron' ||
+    typeof woId !== 'string' ||
+    /^WO-(?:[A-Z0-9]+-)+\d{2,}$/.exec(woId)?.[0] !== woId ||
+    typeof project !== 'string' ||
+    !project ||
+    /\s/.test(project) ||
+    !row.idempotency_key ||
+    proposal.idempotencyKey !== row.idempotency_key
+  )
+    throw new Error('taskmaster_fire_launch_metadata_unknown');
+  const launch = proposal.fireLaunch as TmFireLaunch | undefined;
+  if (
+    (launch !== undefined && !validFireLaunch(launch, row.idempotency_key, woId, project)) ||
+    (proposal.cascadeId !== undefined &&
+      proposal.cascadeId !== (launch?.cascadeId ?? row.idempotency_key))
+  )
+    throw new Error('taskmaster_fire_launch_metadata_unknown');
+  const history = proposal.fireLaunchHistory;
+  if (history !== undefined) {
+    if (!Array.isArray(history) || !launch)
+      throw new Error('taskmaster_fire_launch_metadata_unknown');
+    const tokens = new Set([launch.token]);
+    const ids = new Set([launch.cascadeId]);
+    for (const entry of history as { launch: TmFireLaunch; proof: TmFireDrainProof }[]) {
+      const prior = entry?.launch;
+      if (
+        !prior ||
+        !validFireLaunch(prior, row.idempotency_key, woId, project) ||
+        prior.state !== 'released' ||
+        prior.releaseReason !== 'drain-refused' ||
+        typeof prior.releasedAt !== 'string' ||
+        !Number.isFinite(Date.parse(prior.releasedAt)) ||
+        !validDrainProof(entry.proof, prior) ||
+        tokens.has(prior.token) ||
+        ids.has(prior.cascadeId)
+      )
+        throw new Error('taskmaster_fire_launch_metadata_unknown');
+      tokens.add(prior.token);
+      ids.add(prior.cascadeId);
+    }
+  }
+  if (
+    proposal.fireDrainDeferral !== undefined &&
+    (launch?.state !== 'released' ||
+      launch.releaseReason !== 'drain-refused' ||
+      typeof launch.releasedAt !== 'string' ||
+      !Number.isFinite(Date.parse(launch.releasedAt)) ||
+      !validDrainProof(proposal.fireDrainDeferral, launch))
+  )
+    throw new Error('taskmaster_fire_launch_metadata_unknown');
+  return { proposal, woId, project, launch: launch ?? null };
+}
+
+/** Includes sent/otherwise reclassified active claims, without an age cutoff. */
+export async function listFireLaunchClaims(): Promise<TmJournalEntry[]> {
+  const rows = await getDatabase().query<TmJournalRow>(
+    "SELECT * FROM tm_journal WHERE action_type = 'fire_cauldron' ORDER BY created_at ASC, id ASC"
+  );
+  return rows.rows.map(normalizeJournal).filter(row => {
+    try {
+      return fireLaunchMetadata(row).launch?.state === 'active';
+    } catch {
+      return true;
+    } // Unknown metadata cannot establish a released claim.
+  });
+}
+
+export type TmFireLaunchResult =
+  | { status: 'claimed'; row: TmJournalEntry; token: string }
+  | { status: 'held' | 'paused' | 'stale' };
+
+/** One execution grant, even across processes and different bucket keys. No TTL takeover. */
+export async function claimFireLaunch(data: {
+  thread_ref: string;
+  proposal_json: string;
+  idempotency_key: string;
+  before_hash: string;
+  proof_predicate: string;
+  proof_deadline_at: string;
+  expectedEpoch: number;
+}): Promise<TmFireLaunchResult> {
+  const db = getDatabase();
+  const claim = async (query: OverseerControlPlaneQuery): Promise<TmFireLaunchResult> => {
+    const now = new Date().toISOString();
+    await query(
+      `INSERT INTO tm_control (id, pause_state, epoch, updated_at)
+      VALUES (1, 'RUNNING', 0, $1) ON CONFLICT (id) DO NOTHING`,
+      [now]
+    );
+    const control = await query<TmControlRow>(
+      'SELECT * FROM tm_control WHERE id = 1' + (db.dialect === 'postgres' ? ' FOR UPDATE' : '')
+    );
+    const current = control.rows[0];
+    if (!current) throw new Error('tm_control singleton missing during fire claim');
+    if (Number(current.epoch) !== data.expectedEpoch) return { status: 'stale' };
+    if (current.pause_state !== 'RUNNING') return { status: 'paused' };
+    const candidate = {
+      ...data,
+      id: randomUUID(),
+      created_at: now,
+      action_type: 'fire_cauldron',
+      outcome: 'pending',
+      graded_at: null,
+      grade: null,
+    } as TmJournalEntry;
+    const parsed = fireLaunchMetadata(candidate);
+    if (
+      parsed.launch ||
+      parsed.proposal.fireLaunchHistory !== undefined ||
+      parsed.proposal.fireDrainDeferral !== undefined ||
+      !Number.isFinite(Date.parse(data.proof_deadline_at))
+    )
+      throw new Error('taskmaster_fire_launch_invalid_request');
+    const all = await query<TmJournalRow>(
+      "SELECT * FROM tm_journal WHERE action_type = 'fire_cauldron' OR idempotency_key = $1 ORDER BY created_at ASC, id ASC",
+      [data.idempotency_key]
+    );
+    let retry: TmJournalEntry | undefined;
+    for (const raw of all.rows) {
+      const row = normalizeJournal(raw);
+      let prior: ReturnType<typeof fireLaunchMetadata>;
+      try {
+        prior = fireLaunchMetadata(row);
+      } catch {
+        return { status: 'held' };
+      }
+      if (row.idempotency_key === data.idempotency_key) {
+        // Only an unlaunched proposal or a proven released drain generation retries.
+        // Failed, expired, active, and uncertain keys never acquire a second grant.
+        if (
+          retry ||
+          row.outcome !== 'deferred' ||
+          (prior.launch !== null &&
+            !(
+              prior.launch.state === 'released' &&
+              prior.launch.releaseReason === 'drain-refused' &&
+              validDrainProof(prior.proposal.fireDrainDeferral, prior.launch)
+            )) ||
+          prior.woId !== parsed.woId ||
+          prior.project !== parsed.project ||
+          row.thread_ref !== data.thread_ref ||
+          fireLaunchAuthority(prior.proposal) !== fireLaunchAuthority(parsed.proposal)
+        )
+          return { status: 'held' };
+        retry = row;
+      }
+      if (
+        (row.outcome === 'pending' ||
+          prior.launch?.state === 'active' ||
+          (row.outcome === 'sent' && prior.launch === null)) &&
+        prior.woId === parsed.woId &&
+        prior.project === parsed.project
+      )
+        return { status: 'held' };
+    }
+    const row = retry ?? candidate;
+    const original = retry ? fireLaunchMetadata(retry) : parsed;
+    if (
+      !row.proof_deadline_at ||
+      !Number.isFinite(Date.parse(row.proof_deadline_at)) ||
+      Date.parse(row.proof_deadline_at) <= Date.now()
+    )
+      return { status: 'stale' };
+    const token = randomUUID();
+    const executionId = `tm:fire:launch:${token}`;
+    const proposal = { ...original.proposal };
+    if (original.launch) {
+      proposal.fireLaunchHistory = [
+        ...((proposal.fireLaunchHistory as unknown[] | undefined) ?? []),
+        { launch: original.launch, proof: proposal.fireDrainDeferral },
+      ];
+    }
+    delete proposal.fireDrainDeferral;
+    delete proposal.fireHoldReason;
+    const proposalJson = JSON.stringify({
+      ...proposal,
+      cascadeId: executionId,
+      fireLaunch: {
+        version: 2,
+        state: 'active',
+        token,
+        cascadeId: executionId,
+        woId: parsed.woId,
+        project: parsed.project,
+        claimedAt: now,
+      },
+    });
+    if (retry) {
+      const changed = await query(
+        `UPDATE tm_journal SET outcome = 'pending', proposal_json = $1
+        WHERE id = $2 AND outcome = 'deferred' AND proposal_json = $3`,
+        [proposalJson, retry.id, retry.proposal_json]
+      );
+      if (changed.rowCount !== 1) return { status: 'held' };
+    } else {
+      await query(
+        `INSERT INTO tm_journal
+        (id, created_at, thread_ref, action_type, proposal_json, idempotency_key,
+         before_hash, proof_predicate, proof_deadline_at, outcome)
+        VALUES ($1, $2, $3, 'fire_cauldron', $4, $5, $6, $7, $8, 'pending')`,
+        [
+          row.id,
+          now,
+          row.thread_ref,
+          proposalJson,
+          data.idempotency_key,
+          data.before_hash,
+          data.proof_predicate,
+          data.proof_deadline_at,
+        ]
+      );
+    }
+    return {
+      status: 'claimed',
+      token,
+      row: { ...row, outcome: 'pending', proposal_json: proposalJson },
+    };
+  };
+  return db.dialect === 'sqlite'
+    ? withOverseerControlPlaneImmediateTransaction(db, claim)
+    : db.withTransaction(claim);
+}
+
+function fireLaunchAuthority(proposal: Record<string, unknown>): string {
+  const evidence = proposal.fireEvidence as Record<string, unknown>;
+  const spec = evidence.expectedSpec as Record<string, unknown> | undefined;
+  return JSON.stringify([
+    proposal.recipient,
+    evidence.targetRepo,
+    spec?.specSource,
+    spec?.specRevision,
+    spec?.specHash,
+  ]);
+}
+
+/** Release only the exact active claim read by a positive-evidence caller. */
+export async function releaseFireLaunch(
+  row: TmJournalEntry,
+  token: string,
+  reason: 'aborted-before-invoke' | 'verified-no-fire' | 'settled-cascade'
+): Promise<boolean> {
+  const parsed = fireLaunchMetadata(row);
+  if (parsed.launch?.state !== 'active' || parsed.launch.token !== token) return false;
+  const updated = JSON.stringify({
+    ...parsed.proposal,
+    fireLaunch: {
+      ...parsed.launch,
+      state: 'released',
+      releasedAt: new Date().toISOString(),
+      releaseReason: reason,
+    },
+  });
+  const outcome = reason === 'settled-cascade' ? row.outcome : 'expired';
+  const result = await getDatabase().query(
+    `UPDATE tm_journal SET proposal_json = $1, outcome = $2
+    WHERE id = $3 AND proposal_json = $4 AND outcome = $5 AND action_type = 'fire_cauldron'`,
+    [updated, outcome, row.id, row.proposal_json, row.outcome]
+  );
+  if (result.rowCount !== 1) return false;
+  row.proposal_json = updated;
+  row.outcome = outcome;
+  return true;
+}
+
+/** Atomically defer and release only a positively settled named no-fire generation. */
+export async function deferFireLaunch(
+  row: TmJournalEntry,
+  token: string,
+  proof: TmFireDrainProof
+): Promise<boolean> {
+  const parsed = fireLaunchMetadata(row);
+  const launch = parsed.launch;
+  if (
+    row.outcome !== 'pending' ||
+    launch?.state !== 'active' ||
+    launch.token !== token ||
+    !validDrainProof(proof, launch)
+  )
+    return false;
+  const proposal = { ...parsed.proposal };
+  delete proposal.fireHoldReason;
+  const updated = JSON.stringify({
+    ...proposal,
+    fireLaunch: {
+      ...launch,
+      state: 'released',
+      releaseReason: 'drain-refused',
+      releasedAt: new Date().toISOString(),
+    },
+    fireDrainDeferral: proof,
+  });
+  const result = await getDatabase().query(
+    `UPDATE tm_journal SET outcome = 'deferred', proposal_json = $1
+     WHERE id = $2 AND action_type = 'fire_cauldron' AND outcome = 'pending' AND proposal_json = $3`,
+    [updated, row.id, row.proposal_json]
+  );
+  if (result.rowCount !== 1) return false;
+  row.proposal_json = updated;
+  row.outcome = 'deferred';
+  return true;
+}
+
+/** Conditional custody transition; stale reconciliations cannot overwrite newer truth. */
+export async function transitionPendingFireAction(
+  id: string,
+  expectedProposalJson: string,
+  outcome: 'pending' | 'sent' | 'expired',
+  proposalJson: string
+): Promise<boolean> {
+  const result = await getDatabase().query(
+    `UPDATE tm_journal SET outcome = $1, proposal_json = $2
+     WHERE id = $3 AND action_type = 'fire_cauldron' AND outcome = 'pending' AND proposal_json = $4`,
+    [outcome, proposalJson, id, expectedProposalJson]
+  );
+  return result.rowCount === 1;
 }
 
 /**
@@ -1084,12 +1516,10 @@ export async function getActionsSince(
 export async function expireParkedActions(): Promise<number> {
   const db = getDatabase();
   const pending = await db.query<{ id: string }>(
-    "SELECT id FROM tm_journal WHERE outcome IN ('parked', 'pending')"
+    `SELECT id FROM tm_journal WHERE ${EXPIRE_UNSENT_PROPOSALS}`
   );
   if (pending.rows.length === 0) return 0;
-  await db.query(
-    "UPDATE tm_journal SET outcome = 'expired' WHERE outcome IN ('parked', 'pending')"
-  );
+  await db.query(`UPDATE tm_journal SET outcome = 'expired' WHERE ${EXPIRE_UNSENT_PROPOSALS}`);
   return pending.rows.length;
 }
 

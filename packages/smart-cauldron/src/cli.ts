@@ -47,6 +47,7 @@ import type { CascadeStatus } from './types.js';
  *   refused                   -> 10 (already-satisfied guard declined to fire; no tier ran,
  *                                    attempts=0 -- a refusal is not a win and must never read
  *                                    as won=0 (bdc-xo#2140))
+ *   drain-deferred            -> 11 (Cauldron drain refused the fire; deferred, not an infra alert)
  *
  * spec-repair MUST NOT collapse to 0 -- it is a distinct, visible outcome
  * (frontier tier gate-failed) and callers key off the exit code. cancelled
@@ -76,6 +77,8 @@ export function statusToExitCode(status: CascadeStatus): number {
       return 9;
     case 'refused':
       return 10;
+    case 'drain-deferred':
+      return 11;
     default:
       return 0;
   }

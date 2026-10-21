@@ -72,6 +72,8 @@ jobs:
     env:
       DISPATCH_POSTGRES_PHASE15_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/phase15
       TASKMASTER_POSTGRES_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/phase15
+      DRAIN_POSTGRES_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/phase15
+      DRAIN_POSTGRES_GUARD_ONLY: '0'
     steps:
       - uses: actions/checkout@v4
       - name: Setup Bun
@@ -86,6 +88,14 @@ jobs:
         run: bun test packages/core/src/db/taskmaster.postgres.test.ts
       - name: CE scope approvals PostgreSQL integration
         run: bun test packages/core/src/db/board-scope-approvals.postgres.test.ts
+
+      - name: Rebuild script drain tests
+        env:
+          REBUILD_PYTHON: python3
+        run: bun test ./deploy/rebuild-archon.test.ts
+
+      - name: Drain generation PostgreSQL integration
+        run: bun test ./packages/core/src/db/workflows.drain.postgres.test.ts
 
   docker-build:
     runs-on: ubuntu-latest

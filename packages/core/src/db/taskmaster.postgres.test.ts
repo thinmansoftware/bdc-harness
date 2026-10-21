@@ -10,7 +10,14 @@ let primary: PostgresAdapter;
 let secondary: PostgresAdapter;
 let active: PostgresAdapter;
 mock.module('./connection', () => ({ getDatabase: () => active }));
-const { resetTaskmaster, upsertHealthSample } = await import('./taskmaster');
+const {
+  resetTaskmaster,
+  upsertHealthSample,
+  claimFireLaunch,
+  listFireLaunchClaims,
+  deferFireLaunch,
+  fireLaunchMetadata,
+} = await import('./taskmaster');
 const { createAuthenticatedMessage } = await import('./dispatch');
 const healthMigration = readFileSync(
   resolve(import.meta.dir, '../../../../migrations/046_tm_health_provider_pk.sql'),
@@ -24,7 +31,9 @@ beforeAll(async () => {
   if (
     !['postgres:', 'postgresql:'].includes(url.protocol) ||
     !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) ||
-    (url.pathname !== '/phase15' && !url.pathname.endsWith('_test'))
+    (url.pathname !== '/phase15' && !url.pathname.endsWith('_test')) ||
+    url.search !== '' ||
+    url.hash !== ''
   ) {
     throw new Error('Taskmaster integration requires a loopback test database');
   }
@@ -63,6 +72,11 @@ beforeAll(async () => {
       'utf8'
     )
   );
+  for (const migration of ['045_taskmaster_fire_verb.sql', '060_taskmaster_blocker_report.sql']) {
+    await primary.query(
+      readFileSync(resolve(import.meta.dir, '../../../../migrations', migration), 'utf8')
+    );
+  }
 });
 
 beforeEach(async () => {
@@ -88,6 +102,91 @@ afterAll(async () => {
       await admin.close();
     }
   }
+});
+
+test.each(['same-key', 'different-buckets'])(
+  'independent PostgreSQL pools grant one fire: %s',
+  async mode => {
+    await primary.query("UPDATE tm_control SET pause_state='RUNNING' WHERE id=1");
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, i) => {
+        active = i % 2 === 0 ? primary : secondary;
+        const key = mode === 'same-key' ? 'one-key' : `bucket-${i}`;
+        return claimFireLaunch({
+          thread_ref: 'gh:thinmansoftware/bdc-harness#700',
+          proposal_json: JSON.stringify({
+            type: 'fire_cauldron',
+            idempotencyKey: key,
+            recipient: 'operator',
+            fireEvidence: { woId: 'WO-HARNESS-CUSTODY-01', project: 'bdc-harness' },
+          }),
+          idempotency_key: key,
+          before_hash: 'before',
+          proof_predicate: 'actual run',
+          proof_deadline_at: new Date(Date.now() + 86400000).toISOString(),
+          expectedEpoch: 7,
+        });
+      })
+    );
+    expect(results.filter(result => result.status === 'claimed')).toHaveLength(1);
+    expect(results.filter(result => result.status === 'held')).toHaveLength(7);
+    expect(await listFireLaunchClaims()).toHaveLength(1);
+  }
+);
+
+test('PostgreSQL drain deferral CAS permits one fresh retry and rejects the old generation', async () => {
+  await primary.query("UPDATE tm_control SET pause_state='RUNNING' WHERE id=1");
+  const key = 'tm:fire:pg-drain';
+  const request = {
+    thread_ref: 'gh:thinmansoftware/bdc-harness#700',
+    proposal_json: JSON.stringify({
+      type: 'fire_cauldron',
+      idempotencyKey: key,
+      recipient: 'operator',
+      fireEvidence: { woId: 'WO-HARNESS-CUSTODY-01', project: 'bdc-harness' },
+    }),
+    idempotency_key: key,
+    before_hash: 'before',
+    proof_predicate: 'actual run',
+    proof_deadline_at: new Date(Date.now() + 86400000).toISOString(),
+    expectedEpoch: 7,
+  };
+  const first = await claimFireLaunch(request);
+  if (first.status !== 'claimed') throw new Error('missing first grant');
+  const prior = fireLaunchMetadata(first.row).launch!;
+  const proof = {
+    kind: 'drain-refused' as const,
+    version: 1 as const,
+    cascadeId: prior.cascadeId,
+    woId: prior.woId,
+    project: prior.project,
+    workflowName: 'bound-workflow',
+    completedAt: new Date().toISOString(),
+    executionSettled: true as const,
+  };
+  const stale = { ...first.row };
+  const deferrals = await Promise.all(
+    [primary, secondary].map(pool => {
+      active = pool;
+      return deferFireLaunch({ ...stale }, first.token, proof);
+    })
+  );
+  expect(deferrals.filter(Boolean)).toHaveLength(1);
+  const retries = await Promise.all(
+    Array.from({ length: 8 }, (_, i) => {
+      active = i % 2 === 0 ? primary : secondary;
+      return claimFireLaunch(request);
+    })
+  );
+  expect(retries.filter(result => result.status === 'claimed')).toHaveLength(1);
+  const retry = retries.find(result => result.status === 'claimed')!;
+  if (retry.status !== 'claimed') throw new Error('missing retry grant');
+  expect(fireLaunchMetadata(retry.row).launch?.cascadeId).toBe(`tm:fire:launch:${retry.token}`);
+  expect(retry.row.proof_deadline_at).toBe(first.row.proof_deadline_at);
+  expect(fireLaunchMetadata(retry.row).proposal.fireLaunchHistory).toHaveLength(1);
+  active = primary;
+  expect(await deferFireLaunch(stale, first.token, proof)).toBe(false);
+  expect(await listFireLaunchClaims()).toHaveLength(1);
 });
 
 test('independent PostgreSQL pools serialize overlapping resets with one transition', async () => {

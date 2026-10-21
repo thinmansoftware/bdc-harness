@@ -102,6 +102,7 @@ import {
   logConfig,
   getPort,
 } from '@archon/core';
+import { applyCauldronDrainClearOnBoot } from '@archon/core/db/workflows';
 import type { IPlatformAdapter } from '@archon/core';
 import {
   createLogger,
@@ -300,6 +301,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().info(runningReconcile, 'startup_running_reconciliation_completed');
   } catch (error) {
     getLog().fatal({ err: error }, 'startup_running_reconciliation_failed');
+    process.exit(1);
+  }
+
+  try {
+    const bootDrain = await applyCauldronDrainClearOnBoot(startupReconciliationAt);
+    if (bootDrain === 'persisted') {
+      getLog().warn({}, 'cauldron_drain_persisted_across_boot');
+    }
+  } catch (error) {
+    getLog().fatal({ err: error }, 'cauldron_drain_boot_failed');
     process.exit(1);
   }
 

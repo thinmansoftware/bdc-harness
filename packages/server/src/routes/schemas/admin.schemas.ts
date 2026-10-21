@@ -29,6 +29,12 @@ export const drainBodySchema = z
   .object({
     draining: z.boolean(),
     reason: z.string().trim().max(500).optional(),
+    clearOnBoot: z.boolean().default(false),
+    expectedDrainToken: z.string().uuid().optional(),
+  })
+  .refine(body => !body.draining || body.expectedDrainToken === undefined, {
+    message: 'expectedDrainToken is only valid when clearing drain',
+    path: ['expectedDrainToken'],
   })
   .openapi('AdminDrainBody');
 
@@ -38,9 +44,25 @@ export const drainResponseSchema = z
     changed: z.boolean().optional(),
     mode: z.enum(['normal', 'draining']),
     drained: z.boolean(),
+    recreateSafe: z.boolean(),
     activeLeaseCount: z.number().int().nonnegative(),
     activeRunCount: z.number().int().nonnegative(),
+    pendingRunCount: z.number().int().nonnegative(),
+    runningRunCount: z.number().int().nonnegative(),
+    survivingRunCount: z.number().int().nonnegative(),
     activeRunIds: z.array(z.string()),
+    clearOnBoot: z.boolean(),
+    drainToken: z.string().uuid().nullable(),
+    acquiredDrainToken: z.string().uuid().nullable().optional(),
     updatedAt: z.string().nullable(),
   })
   .openapi('AdminDrainResponse');
+
+/** 503 body for routes that refuse new dispatch while Cauldron is draining. */
+export const drainDispatchErrorSchema = z
+  .object({
+    error: z.string(),
+    detail: z.string().optional(),
+    code: z.literal('cauldron_draining'),
+  })
+  .openapi('DrainDispatchError');

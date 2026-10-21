@@ -84,11 +84,24 @@ const normalDrainState = {
   activeRunIds: [] as string[],
   drained: false,
   updatedAt: null as string | null,
+  drainToken: null as string | null,
 };
+class CauldronDrainingError extends Error {
+  readonly code = 'cauldron_draining' as const;
+  constructor() {
+    super('cauldron_draining');
+    this.name = 'CauldronDrainingError';
+  }
+}
+class CauldronDrainOwnershipConflict extends Error {
+  readonly code = 'cauldron_drain_ownership_conflict';
+}
+
 const mockGetCauldronDrainState = mock(async () => normalDrainState);
 const mockSetCauldronDrainMode = mock(async (data: { mode: 'normal' | 'draining' }) => ({
   changed: true,
   mode: data.mode,
+  acquiredDrainToken: null as string | null,
 }));
 const mockRunCascade = mock(
   async (opts: {
@@ -278,6 +291,8 @@ mock.module('@archon/core/db/workflows', () => ({
   sumWorkflowTokensInWindow: mockSumWorkflowTokensInWindow,
   getCauldronDrainState: mockGetCauldronDrainState,
   setCauldronDrainMode: mockSetCauldronDrainMode,
+  CauldronDrainingError,
+  CauldronDrainOwnershipConflict,
   getRunOutcome: mockGetRunOutcome,
 }));
 
@@ -777,6 +792,55 @@ describe('POST /api/workflows/:name/run', () => {
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
   });
 
+  test('named_reason_in_http_body', async () => {
+    mockGetCauldronDrainState.mockResolvedValueOnce({
+      ...normalDrainState,
+      mode: 'draining',
+      activeLeaseCount: 2,
+      activeRunCount: 2,
+      activeRunIds: ['run-a', 'run-b'],
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'WO-TEST-001' }),
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('60');
+    expect(await response.json()).toEqual({
+      error: 'Cauldron is draining; new dispatch is disabled',
+      code: 'cauldron_draining',
+      detail: 'active_leases=2 active_runs=2',
+    });
+  });
+
+  test('maps a post-check drain race to 503', async () => {
+    mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
+    mockHandleMessage.mockImplementationOnce(async () => {
+      throw new CauldronDrainingError();
+    });
+    mockGetCauldronDrainState.mockReset();
+    mockGetCauldronDrainState.mockResolvedValueOnce(normalDrainState).mockResolvedValueOnce({
+      ...normalDrainState,
+      mode: 'draining',
+      activeLeaseCount: 1,
+      activeRunCount: 1,
+      activeRunIds: ['run-race'],
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: 'web-test-abc', message: 'WO-TEST-001' }),
+    });
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { code: string; detail: string };
+    expect(body.code).toBe('cauldron_draining');
+    expect(body.detail).toBe('active_leases=1 active_runs=1');
+    expect(mockHandleMessage).toHaveBeenCalled();
+  });
+
   test('sends /workflow run <name> <message> to orchestrator', async () => {
     mockFindConversationByPlatformId.mockImplementationOnce(async () => MOCK_CONV);
     mockAddMessage.mockImplementationOnce(async () => ({
@@ -929,7 +993,61 @@ describe('GET/POST /api/admin/drain', () => {
     mockSetCauldronDrainMode.mockImplementation(async data => ({
       changed: true,
       mode: data.mode,
+      acquiredDrainToken: null,
     }));
+  });
+
+  test('grants only the acquired generation, forwards conditional clear, and rejects stale ownership', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    const first = '11111111-1111-4111-8111-111111111111';
+    const replacement = '22222222-2222-4222-8222-222222222222';
+    try {
+      const { app } = makeApp();
+      const post = (body: object): Promise<Response> =>
+        app.request('/api/admin/drain', {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer test-operator-token',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(body),
+        });
+      mockSetCauldronDrainMode.mockResolvedValueOnce({
+        changed: true,
+        mode: 'draining',
+        acquiredDrainToken: first,
+      });
+      mockGetCauldronDrainState.mockResolvedValueOnce({
+        ...normalDrainState,
+        mode: 'draining',
+        drainToken: replacement,
+      });
+      const acquired = await post({ draining: true, clearOnBoot: true });
+      expect(acquired.status).toBe(200);
+      expect(await acquired.json()).toMatchObject({
+        changed: true,
+        acquiredDrainToken: first,
+        drainToken: replacement,
+      });
+      mockSetCauldronDrainMode.mockRejectedValueOnce(new CauldronDrainOwnershipConflict());
+      const stale = await post({ draining: false, expectedDrainToken: first });
+      expect(stale.status).toBe(409);
+      expect(mockSetCauldronDrainMode).toHaveBeenLastCalledWith(
+        expect.objectContaining({ mode: 'normal', expectedDrainToken: first })
+      );
+      mockSetCauldronDrainMode.mockClear();
+      for (const body of [
+        { draining: true, expectedDrainToken: first },
+        { draining: false, expectedDrainToken: 'malformed' },
+      ]) {
+        expect((await post(body)).status).toBe(400);
+      }
+      expect(mockSetCauldronDrainMode).not.toHaveBeenCalled();
+    } finally {
+      if (previousToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+    }
   });
 
   test('reuses operator authentication for drain controls', async () => {

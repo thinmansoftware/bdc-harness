@@ -7,6 +7,114 @@ Audience: PART 1 is for humans and any model. PART 2 is the working contract for
 builder/planner/reviewer/repair agents running inside a lane -- written so the
 cheapest model on the roster can follow it without inference.
 
+## Proposed source repair for review: WO lock metadata mutations (2026-10-18)
+
+Acquisition and release serialize their read-modify-write sequence through a
+short exclusive `wx` guard beside the existing WO/project lock. The guard is held
+only during metadata I/O. Contention waits at most two seconds, then acquisition
+throws UNKNOWN; it never reclaims the guard by age, PID or malformed content.
+An abandoned guard needs explicit reconciliation. Each invocation removes only
+the guard it created, and guard cleanup failure emits a fixed warning.
+
+Only a validated record in explicit `released` state permits a different cascade
+to take over. Exact WO/project, nonempty cascade identity, known status and valid
+timestamps are required before interpreting stored evidence. Replacement remains
+an atomic temporary-file rename under the guard. Release errors retain shared
+evidence and emit a sanitized warning; they never unlink the shared lock.
+
+This source proposal addresses concurrent released-lock takeover and unsafe
+release-error deletion. It preserves same-cascade reacquisition, whose separate
+lifetime gap remains: a duplicate admission can reach the existing cascade
+finally block and release the original caller's running lock. Explicit acquisition
+ownership is follow-on work. This proposal is not full acceptance of bdc-xo#1546,
+a live two-lane canary, or merge/deployment authority. A mixed-version writer that
+does not obey this guard is outside its serialization guarantee.
+
+## Proposed source repair for review: same-dispatch execution ownership (2026-10-18)
+
+The follow-on proposal gives a fresh or explicitly released-lock acquirer a
+random execution-generation token, persisted in the WO lock. Same-ID running
+reacquisition remains recognizable but returns an explicit null token: it is a
+read-only replay, never a second execution grant. Missing ownership metadata from
+an injected acquisition dependency is UNKNOWN, not implicit permission.
+
+A replay branches before discovery, admission creation and the owner's finally
+block. It reads the durable record through the existing recorder module,
+validates exact cascade/WO/project, the existing request identity comparison,
+a known status and an attempts array, then reports admission with `created=false`.
+Missing or unparseable records, conflicting identity/request and invalid
+status/attempts envelopes are UNKNOWN and perform no write, fire or release.
+This is not complete field-by-field record-schema validation. It also prevents
+a replay arriving before admission from becoming its writer. The frontier
+module retains its existing reader export by forwarding the shared reader.
+
+Only the execution-token owner enters provider execution and cleanup. Release
+compares exact cascade identity and token under the metadata guard, including
+when a later generation reuses the same cascade ID. Stale or missing tokens
+leave evidence untouched. Genuine-owner fixtures now state ownership explicitly.
+
+Legacy running lock records without a generation token remain conservatively
+held; they require explicit reconciliation or a coordinated drain before any
+future version transition. No token is silently backfilled, and mixed-version
+writers remain outside the guarantee. This is source validation for review,
+not a deployment, live canary or full closure of bdc-xo#1546.
+
+## Proposed source repair for review: Windows checkpoint replacement (2026-10-18)
+
+The composed Taskmaster/cascade fixture repeatedly failed at atomic record rename
+with Windows `EPERM` while supervision read the same record. The evidence
+establishes the rename failure, not its underlying handle-sharing cause.
+
+The recorder writes its unique temporary payload once, then retries only that
+same rename on Windows `EPERM` or `EBUSY`: at most five attempts with waits of
+10, 20, 40 and 80 milliseconds (150 milliseconds total scheduled backoff, plus
+filesystem I/O). Other errors and non-Windows behavior remain immediate failures.
+Exhaustion throws the filesystem error and retains both the old destination and
+temporary evidence. It never unlinks, copies over, truncates or recreates the
+payload and never retries provider execution.
+
+The real composed fixture failed three repeated runs before the repair and
+passed three after it. It exercises pending admission, an actual workflow SQL
+projection, sent custody, read-only replay preserving the live lock, exact
+completion proof and settled release. Provider calls and Taskmaster storage are
+deterministic test dependencies; this is not a live provider or production test.
+
+Persistence exhaustion remains a separate lifetime risk: the existing cascade
+finally can release its token even when provider ownership is unresolved. This
+bounded persistence repair does not establish safe release on that error path.
+
+## Proposed source repair for review: unexpected provider-lifetime failure paths (2026-10-18)
+
+The follow-on proposal tracks each provider invocation separately before it is
+called. Only a recognized terminal poll status with that invocation's exact,
+nonempty actual run ID discharges it. This proof is recorded before judging or
+later persistence. Fire throw/ambiguous return, transport error, timeout,
+cancellation HTTP acknowledgment, recovery acceptance, attempt timestamps and a
+later invocation's completion do not discharge earlier work.
+
+Unexpected exits retain the generation-owned WO lock while any invocation is
+unresolved and emit a fixed warning. Failures before invocation and failures
+after matching terminal proof can release normally. No cancellation, retry,
+climb, authority, TTL or takeover policy is added.
+
+There is a narrow legacy exception to preserve the successful existing frontier
+approval contract. The no-cancel-to-nowhere branch can nominate only its own
+invocation with a nonempty actual provider run ID after the notification routine
+returns successfully and the pause checkpoint completes. Release then requires that it is the only unresolved
+invocation and that the final record write and normal return succeeded. This
+exception is not provider terminal proof; its warning says so explicitly.
+Top-of-loop pauses and earlier unknown invocations cannot inherit the exception.
+
+The governing WOs are pinned at bdc-xo commit
+`8303e2fa898faa5aedbce48cffc1360943d96a94`: STALL-DETECTOR-FIX requires leaving
+the current run running before approval; FRONTIER-CLIMB-APPROVAL-GATE requires
+successful approval to fire the preserved premium packet. This proposal preserves
+that successful legacy path, not complete approval behavior on unexpected errors.
+Failed notification or incomplete persistence can leave a held approval packet
+that blocks resume; explicit reconciliation is required. A complete reviewed
+provider-lifetime transfer/cancellation design for approval remains open. There
+is no universal lifetime-fence or full bdc-xo#1546 acceptance claim.
+
 ---
 
 # PART 1 -- The system in plain words

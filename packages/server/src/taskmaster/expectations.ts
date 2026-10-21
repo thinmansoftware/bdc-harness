@@ -8,6 +8,8 @@ import {
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
+import { isWoExecutionSettled } from '@archon/smart-cauldron/wo-lock';
+import { readCascadeRecordById } from '@archon/smart-cauldron/frontier-approval';
 
 const log = createLogger('taskmaster/expectations');
 const DEFAULT_RETRY_DELAY_MS = 15 * 60 * 1000;
@@ -33,12 +35,262 @@ export type EvidenceSpec =
 
 type EvidenceScalar = string | number | boolean;
 
+/** Loop-owned evidence only; the public registration schema retains six kinds. */
+export type InternalEvidenceSpec =
+  | EvidenceSpec
+  | {
+      kind: 'cascade_workflow_completed';
+      cascadeId: string;
+      woId: string;
+      project: string;
+    };
+
 export interface EvidenceResult {
   ok: boolean;
   pointer: string | null;
 }
 
+export interface CascadeEvidenceDeps {
+  readCascade?: typeof readCascadeRecordById;
+  query?: ExpectationDeps['query'];
+  readWoSettlement?: typeof isWoExecutionSettled;
+}
+
+export interface CascadeWorkflowEvidence {
+  earliestRunId: string;
+  completedRunId: string | null;
+  status: string;
+  prOpened: boolean;
+  settled?: boolean;
+}
+
+export interface CascadeDrainDeferralEvidence {
+  kind: 'drain-refused';
+  version: 1;
+  cascadeId: string;
+  woId: string;
+  project: string;
+  workflowName: string;
+  completedAt: string;
+  executionSettled: true;
+}
+
+interface CascadeIdentity {
+  cascadeId: string;
+  woId: string;
+  project: string | undefined;
+}
+
+/** Actual workflow evidence remains mandatory for grading and expectations. */
+export async function readCascadeWorkflowEvidence(
+  identity: CascadeIdentity,
+  deps: CascadeEvidenceDeps = {}
+): Promise<CascadeWorkflowEvidence> {
+  const evidence = await readCascadeProjection(identity, deps, false);
+  if ('kind' in evidence) throw new Error('taskmaster_cascade_evidence_unknown');
+  return evidence;
+}
+
+/** Custody alone may recognize a fresh named no-fire refusal after owner release. */
+export async function readCascadeCustodyEvidence(
+  identity: CascadeIdentity,
+  deps: CascadeEvidenceDeps = {}
+): Promise<CascadeWorkflowEvidence | CascadeDrainDeferralEvidence> {
+  return readCascadeProjection(identity, deps, true);
+}
+
+async function readCascadeProjection(
+  identity: CascadeIdentity,
+  deps: CascadeEvidenceDeps,
+  allowDrainDeferral: boolean
+): Promise<CascadeWorkflowEvidence | CascadeDrainDeferralEvidence> {
+  try {
+    if (
+      [identity.cascadeId, identity.woId, identity.project].some(
+        value => typeof value !== 'string' || !value.trim()
+      )
+    )
+      throw new Error('missing identity');
+    const read = deps.readCascade ?? readCascadeRecordById;
+    const query =
+      deps.query ??
+      // Generic query results preserve the existing database dependency contract.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters
+      (<T>(sql: string, params?: unknown[]): Promise<{ rows: readonly T[] }> =>
+        getDatabase().query<T>(sql, params));
+    const visited = new Set<string>();
+    const runs = new Map<string, string>();
+    let settled = true;
+    let drainProof: CascadeDrainDeferralEvidence | undefined;
+    let cascadeId: string | null = identity.cascadeId;
+    while (cascadeId !== null) {
+      // Follow explicit approval links only; bounded even for corrupted records.
+      if (visited.has(cascadeId) || visited.size >= 8) throw new Error('invalid cascade chain');
+      visited.add(cascadeId);
+      const record = await read(cascadeId);
+      if (
+        record?.cascadeId !== cascadeId ||
+        record.woId !== identity.woId ||
+        record.project !== identity.project ||
+        typeof record.request?.dryRun !== 'boolean' ||
+        record.request.dryRun ||
+        !Array.isArray(record.attempts)
+      )
+        throw new Error('invalid cascade scope');
+      const finalAttempt = record.attempts.at(-1);
+      const namedFinalDrain =
+        record.status === 'drain-deferred' &&
+        finalAttempt?.runId === null &&
+        finalAttempt.outcome === 'drain-deferred' &&
+        typeof finalAttempt.workflowName === 'string' &&
+        !!finalAttempt.workflowName.trim() &&
+        typeof finalAttempt.completedAt === 'string' &&
+        Number.isFinite(Date.parse(finalAttempt.completedAt)) &&
+        typeof finalAttempt.startedAt === 'string' &&
+        Number.isFinite(Date.parse(finalAttempt.startedAt)) &&
+        Date.parse(finalAttempt.completedAt) >= Date.parse(finalAttempt.startedAt) &&
+        record.frontierApproval === undefined &&
+        record.supervisorRecovery === undefined;
+      const drainSettled =
+        namedFinalDrain &&
+        (await (deps.readWoSettlement ?? isWoExecutionSettled)(
+          record.woId,
+          record.project,
+          cascadeId
+        ));
+      if (
+        ![
+          'won',
+          'blocked',
+          'refused',
+          'cancelled',
+          'frontier-rejected',
+          'frontier-approved',
+        ].includes(record.status) &&
+        !drainSettled
+      )
+        settled = false;
+      for (const attempt of record.attempts) {
+        if (!attempt || typeof attempt.workflowName !== 'string' || !attempt.workflowName)
+          throw new Error('invalid attempt');
+        if (attempt.runId === null) {
+          // Only the positively settled final named refusal is non-owning.
+          if (attempt !== finalAttempt || !drainSettled) settled = false;
+          continue;
+        }
+        if (typeof attempt.runId !== 'string' || !attempt.runId.trim())
+          throw new Error('invalid run id');
+        const prior = runs.get(attempt.runId);
+        if (prior !== undefined && prior !== attempt.workflowName)
+          throw new Error('conflicting run binding');
+        runs.set(attempt.runId, attempt.workflowName);
+      }
+      if (
+        record.frontierApproval !== undefined &&
+        (!record.frontierApproval ||
+          typeof record.frontierApproval !== 'object' ||
+          !Object.hasOwn(record.frontierApproval, 'resumeCascadeId'))
+      )
+        throw new Error('invalid frontier packet');
+      const resume: unknown = record.frontierApproval?.resumeCascadeId;
+      if (resume !== undefined && resume !== null && (typeof resume !== 'string' || !resume.trim()))
+        throw new Error('invalid resume');
+      if (
+        record.status === 'frontier-approved' &&
+        (record.frontierApproval?.resolution !== 'approved' || typeof resume !== 'string')
+      )
+        settled = false;
+      if (
+        record.frontierApproval &&
+        !(
+          (record.frontierApproval.resolution === 'approved' && typeof resume === 'string') ||
+          (record.frontierApproval.resolution === 'rejected' &&
+            record.status === 'frontier-rejected' &&
+            resume === null)
+        )
+      )
+        settled = false;
+      if (record.supervisorRecovery) settled = false;
+      if (
+        allowDrainDeferral &&
+        visited.size === 1 &&
+        cascadeId === identity.cascadeId &&
+        record.attempts.length === 1 &&
+        drainSettled &&
+        typeof finalAttempt.completedAt === 'string'
+      ) {
+        drainProof = {
+          kind: 'drain-refused',
+          version: 1,
+          cascadeId,
+          woId: record.woId,
+          project: record.project,
+          workflowName: finalAttempt.workflowName,
+          completedAt: finalAttempt.completedAt,
+          executionSettled: true,
+        };
+      }
+      cascadeId = resume ?? null;
+    }
+    // A valid admission without an actual workflow ID is still not ready.
+    if (runs.size === 0) {
+      if (drainProof && visited.size === 1) return drainProof;
+      throw new Error('no actual run');
+    }
+    let firstRunId: string | undefined;
+    let status: string | undefined;
+    let completed = false;
+    let completedRunId: string | null = null;
+    let prOpened = false;
+    for (const [runId, workflowName] of runs) {
+      const result = await query<{
+        id: string;
+        workflow_name: string;
+        status: string;
+        metadata: string | null;
+      }>(
+        'SELECT id, workflow_name, status, metadata FROM remote_agent_workflow_runs WHERE id = $1 AND workflow_name = $2',
+        [runId, workflowName]
+      );
+      const row = result.rows[0];
+      if (
+        result.rows.length !== 1 ||
+        row?.id !== runId ||
+        row.workflow_name !== workflowName ||
+        typeof row.status !== 'string' ||
+        !row.status
+      )
+        throw new Error('unproven workflow identity');
+      firstRunId ??= runId;
+      status = row.status;
+      completed ||= row.status === 'completed';
+      if (!['completed', 'failed', 'escalated', 'cancelled'].includes(row.status)) settled = false;
+      if (row.status === 'completed') completedRunId ??= runId;
+      try {
+        // Preserve existing PR metadata semantics; this phase changes ownership
+        // binding, not the metadata producer's evidence contract.
+        const metadata = JSON.parse(row.metadata ?? '{}') as Record<string, unknown>;
+        prOpened ||= Boolean(metadata.prUrl ?? metadata.pr_url ?? metadata.pullRequestUrl);
+      } catch {
+        // Malformed metadata proves no PR; known workflow status stays usable.
+      }
+    }
+    if (!firstRunId || !status) throw new Error('no proven workflow');
+    return {
+      earliestRunId: firstRunId,
+      completedRunId,
+      status: completed ? 'completed' : status,
+      prOpened,
+      settled,
+    };
+  } catch {
+    // UNKNOWN must throw so the existing grading catch skips noise grading too.
+    throw new Error('taskmaster_cascade_evidence_unknown');
+  }
+}
+
 export interface ExpectationDeps {
+  readCascade?: typeof readCascadeRecordById;
   fetch?: typeof fetch;
   // Generic result typing keeps evidence implementations free of unsafe casts.
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters
@@ -459,7 +711,7 @@ async function sendRedispatch(
 export function renderEscalationBody(expectation: taskmasterDb.TmExpectation): string {
   let evidence: string;
   try {
-    const spec = JSON.parse(expectation.evidence_json) as EvidenceSpec;
+    const spec = JSON.parse(expectation.evidence_json) as InternalEvidenceSpec;
     evidence = describeEvidence(spec);
   } catch {
     // Never let an unparseable spec swallow the escalation itself.
@@ -486,8 +738,10 @@ export function renderEscalationBody(expectation: taskmasterDb.TmExpectation): s
 }
 
 /** One evidence spec as a phrase, for the escalation body. */
-function describeEvidence(spec: EvidenceSpec): string {
+function describeEvidence(spec: InternalEvidenceSpec): string {
   switch (spec.kind) {
+    case 'cascade_workflow_completed':
+      return `a completed workflow in cascade ${spec.cascadeId} for ${spec.woId} on ${spec.project}`;
     case 'issue_comment_exists':
       return `a comment on ${spec.repo}#${String(spec.number)}${
         spec.author ? ` by ${spec.author}` : ''
@@ -515,10 +769,18 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
   for (const expectation of active) {
     let evidence: EvidenceResult;
     try {
-      evidence = await (
-        deps.checkEvidence ??
-        ((spec: EvidenceSpec): Promise<EvidenceResult> => checkEvidence(spec, deps))
-      )(JSON.parse(expectation.evidence_json) as EvidenceSpec);
+      const spec = JSON.parse(expectation.evidence_json) as InternalEvidenceSpec;
+      if (spec.kind === 'cascade_workflow_completed') {
+        const bound = await readCascadeWorkflowEvidence(spec, deps);
+        evidence = bound.completedRunId
+          ? { ok: true, pointer: `workflow:${bound.completedRunId}` }
+          : { ok: false, pointer: null };
+      } else {
+        evidence = await (
+          deps.checkEvidence ??
+          ((publicSpec: EvidenceSpec): Promise<EvidenceResult> => checkEvidence(publicSpec, deps))
+        )(spec);
+      }
     } catch (error) {
       log.warn(
         { err: error as Error, expectationId: expectation.id },
