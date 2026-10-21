@@ -176,7 +176,187 @@ nodes:
         echo "ERROR: repair_target_head_mismatch: fetched ${FETCHED_SHA} != live ${REPAIR_TARGET_LIVE_OID}" >&2
         exit 1
       fi
-      git checkout -B "$SPEC_REPAIR_BRANCH" FETCH_HEAD
+      # ---- BEGIN rtw core (byte-identical across lanes; extracted by unit test) ----
+      # Reclaim a repair branch held by another worktree only when every signal says
+      # the holder is dead: not this worktree; every remote_agent_workflow_runs row
+      # for that working_path is completed, failed, escalated, or cancelled with
+      # completed_at at least RTW_MIN_AGE_SECONDS old (default 600); no resolvable
+      # process cwd under RTW_PROC_ROOT (default /proc) is the holder or inside it;
+      # and git status --porcelain is empty. If the holder tip is not an ancestor of
+      # FETCH_HEAD, push it to refs/heads/backup/<branch>-<sha7>-<UTC stamp> first.
+      # Then remove that worktree once and retry the checkout once. Anything else is
+      # refused. Never removes any other worktree. Env overrides: RTW_RUNS_DB
+      # (default /.archon/archon.db), RTW_MIN_AGE_SECONDS (default 600), RTW_PROC_ROOT
+      # (default /proc).
+      rtw_refuse() {
+        printf 'repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\n' "$branch" "$holder" "$1"
+        rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
+        return 1
+      }
+      rtw_checkout_repair_branch() {
+        local branch="$1"
+        local err_file rtw_query rtw_db_out rtw_db_err err
+        local checkout_code=0 retry_code=0 ancestor_code=0 rtw_db_code=0 row_seen=0
+        local holder="" rtw_top="" rtw_db="" min_age="" proc_root=""
+        local best_id="" best_status="" best_ts="" best_epoch=-1
+        local holder_sha="" backup_ref="" sha7="" stamp="" id8=""
+        local row_id="" row_status="" row_completed="" row_epoch="" now_epoch="" row_age=0
+        local resolved="" cwdlink=""
+        err_file=$(mktemp)
+        rtw_query=$(mktemp)
+        rtw_db_out=$(mktemp)
+        rtw_db_err=$(mktemp)
+        if git checkout -B "$branch" FETCH_HEAD 2>"$err_file"; then
+          rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
+          return 0
+        else
+          checkout_code=$?
+        fi
+        err=$(cat "$err_file")
+        if ! printf '%s\n' "$err" | grep -F -q 'is already used by worktree at' \
+          && ! printf '%s\n' "$err" | grep -F -q 'is already checked out at'; then
+          printf '%s\n' "$err" >&2
+          rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
+          return "$checkout_code"
+        fi
+        holder=$(printf '%s\n' "$err" | sed -nE "s/.* at '([^']*)'.*/\1/p")
+        holder=${holder%%$'\n'*}
+        if [ -z "$holder" ]; then
+          holder="unknown"
+          rtw_refuse "could not parse holder path" || return
+        fi
+        rtw_top=$(git rev-parse --show-toplevel)
+        if [ "$holder" = "$rtw_top" ]; then
+          rtw_refuse "holder is this worktree" || return
+        fi
+        rtw_db="${RTW_RUNS_DB:-/.archon/archon.db}"
+        min_age="${RTW_MIN_AGE_SECONDS:-600}"
+        cat > "$rtw_query" << 'RTW_BUN'
+      import { Database } from "bun:sqlite";
+      const dbPath = process.argv[2];
+      const holderPath = process.argv[3];
+      let db;
+      try {
+        db = new Database(dbPath, { readonly: true });
+      } catch (err) {
+        process.stderr.write("db_open_failed\n");
+        process.exit(2);
+      }
+      let rows;
+      try {
+        rows = db.query("SELECT id, status, completed_at FROM remote_agent_workflow_runs WHERE working_path = ?").all(holderPath);
+      } catch (err) {
+        process.stderr.write("db_query_failed\n");
+        process.exit(4);
+      }
+      if (!Array.isArray(rows) || rows.length === 0) {
+        process.stderr.write("no_rows\n");
+        process.exit(3);
+      }
+      for (const row of rows) {
+        const id = row.id == null ? "" : String(row.id);
+        const status = row.status == null ? "" : String(row.status);
+        const completed = row.completed_at == null ? "" : String(row.completed_at);
+        process.stdout.write(id + "\t" + status + "\t" + completed + "\n");
+      }
+      RTW_BUN
+        if bun "$rtw_query" "$rtw_db" "$holder" >"$rtw_db_out" 2>"$rtw_db_err"; then
+          rtw_db_code=0
+        else
+          rtw_db_code=$?
+        fi
+        if [ "$rtw_db_code" -ne 0 ]; then
+          if [ "$rtw_db_code" -eq 3 ]; then
+            rtw_refuse "no run row for holder" || return
+          fi
+          rtw_refuse "runs db unreadable" || return
+        fi
+        while IFS=$'\t' read -r row_id row_status row_completed || [ -n "${row_id:-}" ]; do
+          [ -n "${row_id:-}${row_status:-}${row_completed:-}" ] || continue
+          row_seen=1
+          case "$row_status" in
+            completed|failed|escalated|cancelled) ;;
+            *) rtw_refuse "status ${row_status} is not terminal" || return ;;
+          esac
+          if [ -z "$row_completed" ]; then
+            rtw_refuse "completed_at missing" || return
+          fi
+          if ! row_epoch=$(date -u -d "$row_completed" +%s 2>/dev/null); then
+            rtw_refuse "completed_at unparseable" || return
+          fi
+          now_epoch=$(date -u +%s)
+          row_age=$((now_epoch - row_epoch))
+          if [ "$row_age" -lt "$min_age" ]; then
+            rtw_refuse "completed_at is only ${row_age}s old" || return
+          fi
+          if [ "$row_epoch" -gt "$best_epoch" ]; then
+            best_epoch=$row_epoch
+            best_id=$row_id
+            best_status=$row_status
+            best_ts=$row_completed
+          fi
+        done < "$rtw_db_out"
+        if [ "$row_seen" -eq 0 ]; then
+          rtw_refuse "no run row for holder" || return
+        fi
+        proc_root="${RTW_PROC_ROOT:-/proc}"
+        if [ ! -d "$proc_root" ]; then
+          rtw_refuse "process root missing" || return
+        fi
+        for cwdlink in "$proc_root"/*/cwd; do
+          case "$cwdlink" in
+            *'*'*) continue ;;
+          esac
+          [ -L "$cwdlink" ] || [ -e "$cwdlink" ] || continue
+          resolved=$(readlink -f "$cwdlink" 2>/dev/null || true)
+          if command -v cygpath >/dev/null 2>&1; then
+            resolved=$(cygpath -m "$resolved")
+          fi
+          [ -n "$resolved" ] || continue
+          if [ "$resolved" = "$holder" ] || [ "${resolved#"$holder"/}" != "$resolved" ]; then
+            rtw_refuse "live process cwd under holder" || return
+          fi
+        done
+        if [ -n "$(git -C "$holder" status --porcelain)" ]; then
+          rtw_refuse "worktree is dirty" || return
+        fi
+        holder_sha=$(git -C "$holder" rev-parse HEAD)
+        backup_ref=""
+        if git merge-base --is-ancestor "$holder_sha" FETCH_HEAD; then
+          backup_ref=""
+        else
+          ancestor_code=$?
+          if [ "$ancestor_code" -ne 1 ]; then
+            rtw_refuse "could not compare holder tip to FETCH_HEAD" || return
+          fi
+          sha7=$(printf '%s' "$holder_sha" | cut -c1-7)
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          backup_ref="refs/heads/backup/${branch}-${sha7}-${stamp}"
+          if ! git push origin "${holder_sha}:${backup_ref}"; then
+            rtw_refuse "backup push failed" || return
+          fi
+        fi
+        if ! git worktree remove "$holder"; then
+          rtw_refuse "worktree remove failed" || return
+        fi
+        id8=$(printf '%s' "$best_id" | cut -c1-8)
+        printf 'repair_target_worktree_reclaimed: %s (run %s status %s completed_at %s) held %s\n' \
+          "$holder" "$id8" "$best_status" "$best_ts" "$branch"
+        if [ -n "$backup_ref" ]; then
+          printf 'backup_branch: %s\n' "$backup_ref"
+        fi
+        if git checkout -B "$branch" FETCH_HEAD 2>"$err_file"; then
+          rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
+          return 0
+        else
+          retry_code=$?
+          cat "$err_file" >&2
+          rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
+          return "$retry_code"
+        fi
+      }
+      # ---- END rtw core ----
+      rtw_checkout_repair_branch "$SPEC_REPAIR_BRANCH"
       echo "REPAIR_TARGET=#${SPEC_REPAIR_PR}"
       echo "REPAIR_TARGET_BRANCH=${SPEC_REPAIR_BRANCH}"
       echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LIVE_OID}"
@@ -375,7 +555,7 @@ nodes:
     failover_provider: openrouter
     failover_model: deepseek/deepseek-v4-pro-0813
     persona: war-council-architect-opr
-    depends_on: [plan]
+    depends_on: [plan, checkout-repair-target]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
@@ -409,6 +589,8 @@ nodes:
         worktree. Ensure the approved plan remains a minimal plan that VERIFIES the
         existing state rather than re-creating it.
         Spec: $read-spec.output
+        Lane-verified repair-target record (verified by the lane with the GitHub CLI before plan-review ran):
+        $checkout-repair-target.output
 
         ## Attack the plan on these dimensions
         1. Scope creep -- any file not justified by the spec.
@@ -417,13 +599,17 @@ nodes:
         4. Rule 20 staging gate -- if target repo is lspro-react / shopops-storefront /
            shopops, plan MUST require --base staging. If not those, must NOT.
         4b. Repair target -- when the spec declares `Repair target: PR #N (branch X)`,
-           use WebFetch to verify that PR #N is open on the target repo and its head
-           branch is X. An open matching PR is self-authorizing: preserve it in the
-           approved plan as `repair_target_authorized_by_spec: #N`; never ask whether
-           it is canonical or whether to close it and rebuild fresh. If it is closed,
-           fail this plan iteration with the literal reason `declared repair target #N
-           is closed`. If it is not on the target repo, its branch does not match X, or
-           it cannot be verified, fail with `declared repair target #N is not on <repo>`.
+           parse REPAIR_TARGET and REPAIR_TARGET_BRANCH from the lane-verified repair-target record supplied above. When both the PR number and the branch
+           match, that match is self-authorizing: preserve it in the approved plan,
+           inside the APPROVED_PLAN fence, as a line by itself exactly
+           `repair_target_authorized_by_spec: #N` with no bullet, quote, backticks,
+           or other text on that line, and not inside a code block; never ask whether
+           it is canonical or whether to close it and rebuild fresh. When
+           REPAIR_TARGET=none despite a declared target, fail this plan iteration
+           with the literal reason `declared repair target #N was not verified by the lane`.
+           When either the PR number or the branch differs, fail this plan iteration
+           with the literal reason `declared repair target #N does not match the lane-verified record`.
+           Decide only from that record. Do not access the network in this step.
         5. Out-of-scope list present and correct.
 
         ## Self-repair (the point -- do not just report)
@@ -516,11 +702,65 @@ nodes:
       printf '%s\n' "$RUN_SCOPE_SHA" > "$ARTIFACTS_DIR/run-scope-sha.txt"
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
+  - id: prep-dependencies
+    depends_on: [capture-run-scope]
+    trigger_rule: all_done
+    timeout: 900000
+    bash: |
+      set -uo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
+      # dprep_ensure_js_deps installs bun-lockfile JavaScript dependencies when
+      # node_modules is absent. prep-dependencies calls it before implement, and
+      # run-stop-tests calls it before the first rst_try. Always returns 0. The
+      # install subshell unsets the same credential families as rst_scrub_env and
+      # keeps *_TEST_* names. node_modules is never symlinked or copied.
+      dprep_ensure_js_deps() {
+        if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
+          printf 'dprep: no package.json with a bun lockfile, skipping\n'
+          return 0
+        fi
+        if [ -d node_modules ]; then
+          printf 'dprep: node_modules present, skipping\n'
+          return 0
+        fi
+        if ! command -v bun >/dev/null 2>&1; then
+          printf 'dprep: bun not found, skipping\n'
+          return 0
+        fi
+        local start now elapsed rc=0
+        start="$(date +%s)"
+        printf 'dprep: installing JS dependencies (bun install --frozen-lockfile) in %s\n' "$(pwd)"
+        (
+          for name in $(env | sed -n 's/=.*//p'); do
+            case "$name" in
+              *_TEST_*) continue ;;
+              OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL)
+                unset "$name"
+                ;;
+            esac
+          done
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+        ) || rc=$?
+        now="$(date +%s)"
+        elapsed=$((now - start))
+        if [ "$rc" -eq 0 ]; then
+          printf 'dprep: install ok (%ss)\n' "$elapsed"
+        else
+          printf 'dprep: install failed rc=%s (continuing; run-stop-tests reports the real result)\n' "$rc"
+        fi
+        return 0
+      }
+      # ---- END dprep core ----
+      dprep_ensure_js_deps
+      exit 0
+
   - id: implement
     provider: openrouter
     model: qwen/qwen3-coder-next
     persona: major-build-opr
-    depends_on: [capture-run-scope]
+    depends_on: [prep-dependencies]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
@@ -1178,10 +1418,63 @@ nodes:
   # inside the run worktree and emits the OBSERVED pass/total. It never trusts a builder
   # or validator claim. Always exits 0; the validator quotes TESTS_* as ground truth and
   # stamp-manifest-evidence writes TESTS_LINE into the manifest "Tests:" line.
-  - id: run-stop-tests
+  - id: resolve-test-command
     persona: major-build
     load_bearing: true
     depends_on: [format-autofix]
+    task_class: clerical
+    timeout: 60000
+    bash: |
+      set -uo pipefail
+      ORIGIN="$(git remote get-url origin 2>/dev/null || true)"
+      if ! MAP_RESPONSE="$(timeout 30 gh api 'repos/thinmansoftware/bdc-xo/contents/scripts/cauldron/cauldron-projects.json?ref=main' 2>/dev/null)"; then
+        printf 'TEST_COMMAND_SOURCE=wo-spec\nTEST_COMMAND_FALLBACK=unavailable\nTEST_COMMAND_MAP_SHA=\nTEST_COMMAND_B64=\n'
+        exit 0
+      fi
+      # Structured data only: no shell evaluation or command execution here.
+      python3 -c '
+      import base64, json, re, sys
+      def normalize(value, allow_slug=False):
+          if not isinstance(value, str):
+              return None
+          prefix = r"(?:https://github[.]com/|git@github[.]com:)"
+          if allow_slug:
+              prefix += "?"
+          match = re.fullmatch(prefix + r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:[.]git)?/?", value, re.I)
+          return match.group(1).lower() if match else None
+      reason = "malformed"
+      sha = ""
+      command = ""
+      try:
+          envelope = json.load(sys.stdin)
+          revision = envelope.get("sha", "")
+          if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+              raise ValueError("invalid map revision")
+          sha = revision.lower()
+          content = base64.b64decode("".join(envelope["content"].split()), validate=True)
+          projects = json.loads(content)
+          if not isinstance(projects, dict):
+              raise ValueError("invalid project map")
+          slug = normalize(sys.argv[1])
+          matches = [value for value in projects.values() if isinstance(value, dict) and slug is not None and normalize(value.get("repo"), True) == slug]
+          reason = "invalid-origin" if slug is None else "missing" if not matches else "ambiguous" if len(matches) != 1 else "invalid-command"
+          if len(matches) == 1:
+              candidate = matches[0].get("test_command")
+              if isinstance(candidate, str) and candidate.strip() and len(candidate) <= 4096 and "\n" not in candidate and "\r" not in candidate and "\x00" not in candidate:
+                  command = candidate
+                  reason = ""
+      except (ValueError, TypeError, KeyError, AttributeError):
+          reason = "malformed"
+      print("TEST_COMMAND_SOURCE=" + ("project-map" if command else "wo-spec"))
+      print("TEST_COMMAND_FALLBACK=" + reason)
+      print("TEST_COMMAND_MAP_SHA=" + sha)
+      print("TEST_COMMAND_B64=" + base64.b64encode(command.encode()).decode())
+      ' "$ORIGIN" <<< "$MAP_RESPONSE"
+
+  - id: run-stop-tests
+    persona: major-build
+    load_bearing: true
+    depends_on: [format-autofix, resolve-test-command]
     task_class: clerical
     timeout: 1800000
     bash: |
@@ -1441,7 +1734,8 @@ nodes:
       rst_parse_counts() {
         local esc raw counts
         esc="$(printf '\033')"
-        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g")"
+        # Bun --filter prefixes each workspace test line; normalize parser input only.
+        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g" | sed -E 's/^(@[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)?[A-Za-z0-9_-][A-Za-z0-9_.-]*:test[[:blank:]]+\|[[:blank:]]*//')"
         counts="$(printf '%s\n' "$raw" | awk '
           /^[ \t]*Passed: [0-9]+[ \t]+Failed: [0-9]+[ \t]+Total: [0-9]+/ { p += $2; t += $6; hit = 1; next }
           /^[ \t]*Tests: [0-9]+\/[0-9]+[ \t]*$/ { split($2, a, "/"); p += a[1]; t += a[2]; hit = 1; next }
@@ -1522,6 +1816,29 @@ nodes:
                 set -- $segment
                 set +f
                 if [ $# -eq 0 ]; then rc=1; break; fi
+                # Rewrite npx/npm to bun only after the original argv passed the allowlist.
+                # When the real binary is on PATH, leave the command unchanged.
+                if [ "$1" = "npx" ] && ! command -v "${RST_NPX_BIN:-npx}" >/dev/null 2>&1; then
+                  if command -v bunx >/dev/null 2>&1; then
+                    shift
+                    set -- bunx "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  elif command -v bun >/dev/null 2>&1; then
+                    shift
+                    set -- bun x "$@"
+                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
+                  fi
+                elif [ "$1" = "npm" ] && ! command -v "${RST_NPM_BIN:-npm}" >/dev/null 2>&1 && command -v bun >/dev/null 2>&1; then
+                  if [ "${2:-}" = "test" ]; then
+                    shift 2
+                    set -- bun run test "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  elif [ "${2:-}" = "run" ] && [ -n "${3:-}" ]; then
+                    shift 2
+                    set -- bun run "$@"
+                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
+                  fi
+                fi
                 timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
                 rc=$?
                 [ "$rc" -ne 0 ] && break
@@ -1577,6 +1894,50 @@ nodes:
       }
       # ---- END rst core ----
 
+      # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
+      # dprep_ensure_js_deps installs bun-lockfile JavaScript dependencies when
+      # node_modules is absent. prep-dependencies calls it before implement, and
+      # run-stop-tests calls it before the first rst_try. Always returns 0. The
+      # install subshell unsets the same credential families as rst_scrub_env and
+      # keeps *_TEST_* names. node_modules is never symlinked or copied.
+      dprep_ensure_js_deps() {
+        if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
+          printf 'dprep: no package.json with a bun lockfile, skipping\n'
+          return 0
+        fi
+        if [ -d node_modules ]; then
+          printf 'dprep: node_modules present, skipping\n'
+          return 0
+        fi
+        if ! command -v bun >/dev/null 2>&1; then
+          printf 'dprep: bun not found, skipping\n'
+          return 0
+        fi
+        local start now elapsed rc=0
+        start="$(date +%s)"
+        printf 'dprep: installing JS dependencies (bun install --frozen-lockfile) in %s\n' "$(pwd)"
+        (
+          for name in $(env | sed -n 's/=.*//p'); do
+            case "$name" in
+              *_TEST_*) continue ;;
+              OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL)
+                unset "$name"
+                ;;
+            esac
+          done
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+        ) || rc=$?
+        now="$(date +%s)"
+        elapsed=$((now - start))
+        if [ "$rc" -eq 0 ]; then
+          printf 'dprep: install ok (%ss)\n' "$elapsed"
+        else
+          printf 'dprep: install failed rc=%s (continuing; run-stop-tests reports the real result)\n' "$rc"
+        fi
+        return 0
+      }
+      # ---- END dprep core ----
+
       SPEC=$read-spec.output
       CLASS="$(printf '%s\n' "$SPEC" | rst_class)"
       EVIDENCE_DIR="${ARTIFACTS_DIR:-.}/evidence"
@@ -1596,6 +1957,25 @@ nodes:
       $(printf '%s\n' "$SPEC" | rst_extract_commands)
       EOF_CMDS
       [ -s "$CMDS" ] && SOURCE="spec_declared"
+      RESOLUTION="$(cat <<'BDC_TEST_COMMAND_RESOLUTION' | capture_node_output
+      $resolve-test-command.output
+      BDC_TEST_COMMAND_RESOLUTION
+      )"
+      MAP_SOURCE="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_SOURCE=//p' | head -1)"
+      MAP_SHA="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_MAP_SHA=//p' | head -1)"
+      MAP_FALLBACK="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_FALLBACK=//p' | head -1)"
+      MAP_COMMAND="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_B64=//p' | head -1 | base64 --decode 2>/dev/null || true)"
+      SELECTED_SOURCE="spec_declared"
+      if [ "$MAP_SOURCE" = "project-map" ] && [ -n "$MAP_COMMAND" ]; then
+        if rst_command_looks_runnable "$MAP_COMMAND"; then
+          printf '%s\n' "$MAP_COMMAND" > "$CMDS"
+          SELECTED_SOURCE="project-map"
+        else
+          MAP_FALLBACK="unsafe-command"
+        fi
+      fi
+      echo "TESTS_MAP_SHA=$MAP_SHA"
+      echo "TESTS_MAP_FALLBACK=$MAP_FALLBACK"
       EXIT_CODE=0
       COUNTS=""
       CMD_JOINED=""
@@ -1617,7 +1997,10 @@ nodes:
         # that exited 0 with no parseable counts (or no command at all) falls through;
         # the earlier attempt stays in the log and in TESTS_SOURCE.
         TRIED=""
-        if ! rst_try "spec_declared"; then
+        (
+          cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && dprep_ensure_js_deps
+        ) >&2
+        if ! rst_try "$SELECTED_SOURCE" && [ "$SELECTED_SOURCE" != "project-map" ]; then
           if [ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]; then
             TRIED="spec_declared command(s) exited $EXIT_CODE with no parseable counts: $CMD_JOINED"
           else
@@ -1652,7 +2035,13 @@ nodes:
       echo "TESTS_EXIT=$EXIT_CODE"
       echo "TESTS_PASSED=${COUNTS%% *}"
       echo "TESTS_TOTAL=${COUNTS##* }"
-      rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS"
+      if [ "$SOURCE" = "project-map" ]; then
+        SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
+      else
+        REPORT_SOURCE="${SOURCE%% *}"
+        if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
+        rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
+      fi
       echo "TESTS_LOG=$LOG"
       if [ -s "$LOG" ]; then
         echo "--- last 80 lines of test output ---"
@@ -2951,13 +3340,19 @@ nodes:
       Validator:
       $war-council-validator.output
 
+      Approved plan (output of plan-review; use ONLY the text between === APPROVED_PLAN_BEGIN === and === APPROVED_PLAN_END ===):
+      $plan-review.output
+
       ## Branch Name Derivation Rules (F-6A prevention)
       First check for `Repair target: PR #N (branch X)` in the spec. Verify it with
       `gh pr view N --repo <target-repo> --json state,headRefName`: state must be OPEN
       and headRefName must equal X. On success, emit the normal fields below plus
       `repair_target_pr: #N` and `repair_target_branch: <verified-headRefName-from-gh>`;
-      emit `repair_target_authorized_by_spec: #N` ONLY when the approved plan carried
-      that authorization. Use that verified head as the feature branch and stop
+      emit `repair_target_authorized_by_spec: #N` only when the fenced approved-plan
+      block contains a line by itself exactly `repair_target_authorized_by_spec: #N`,
+      with no bullet, quote, backticks, or other text on that line, and not inside a
+      code block, and N matches the spec Repair target PR. Reviewer critique outside
+      the fence never authorizes a target. Never invent the field. Use that verified head as the feature branch and stop
       without deriving a fresh branch. On a closed PR or repo/branch mismatch, fail
       closed with the exact declared-repair-target reason from the approved plan.
       Never mint a replacement.
@@ -3210,7 +3605,88 @@ nodes:
         REPAIR_TARGET_AUTHORIZED=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_authorized_by_spec:[[:space:]]*\(#[0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
         SPEC_REPAIR_PR=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #\([0-9][0-9]*\)[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
         SPEC_REPAIR_BRANCH=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #[0-9][0-9]*[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
-        if [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" != true ] || [ "$REPAIR_TARGET_AUTHORIZED" != "#${REPAIR_TARGET_PR}" ] || [ "$SPEC_REPAIR_PR" != "$REPAIR_TARGET_PR" ] || [ "$SPEC_REPAIR_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
+        # ---- BEGIN rta core (byte-identical across lanes; extracted by unit test) ----
+        # Authorize only from exactly one standalone field inside exactly one
+        # approved-plan fence in the raw plan-review text. Prose, quotes, bullets,
+        # code blocks, and text outside the fence do not authorize.
+        rta_plan_authorizes() {
+          local raw="$1"
+          local want_pr="$2"
+          local line="" stripped="" captured=""
+          local begin_count=0 end_count=0 begin_idx=-1 end_idx=-1
+          local in_code=0 field_count=0 i=0
+          local fence_char="" fence_size=0 marker="" tail=""
+          local -a lines=()
+          local begin_re='^ {0,3}===[[:blank:]]*APPROVED_PLAN_BEGIN[[:blank:]]*===[[:blank:]]*$'
+          local end_re='^ {0,3}===[[:blank:]]*APPROVED_PLAN_END[[:blank:]]*===[[:blank:]]*$'
+          local field_re=$'^ {0,3}repair_target_authorized_by_spec:[ \t]*#([0-9]+)[ \t]*$'
+          local fence_re=$'^[ \t]*(`{3,}|~{3,})'
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            lines+=("$line")
+          done <<< "$raw"
+          stripped=$(printf '%s\n' "${lines[@]}")
+          begin_count=$(printf '%s\n' "$stripped" | grep -oiE "$begin_re" | wc -l | tr -d '[:space:]') || true
+          end_count=$(printf '%s\n' "$stripped" | grep -oiE "$end_re" | wc -l | tr -d '[:space:]') || true
+          begin_count=${begin_count:-0}
+          end_count=${end_count:-0}
+          for ((i=0; i<${#lines[@]}; i++)); do
+            if printf '%s\n' "${lines[$i]}" | grep -qiE "$begin_re"; then
+              if [ "$begin_idx" -lt 0 ]; then
+                begin_idx=$i
+              fi
+            fi
+            if printf '%s\n' "${lines[$i]}" | grep -qiE "$end_re"; then
+              end_idx=$i
+            fi
+          done
+          if [ "$begin_count" -ne 1 ] || [ "$end_count" -ne 1 ] || [ "$begin_idx" -lt 0 ] || [ "$end_idx" -lt 0 ] || [ "$begin_idx" -ge "$end_idx" ]; then
+            printf 'repair_target_plan_authorization_refused: fence_count\n'
+            return 1
+          fi
+          for ((i=0; i<end_idx; i++)); do
+            line="${lines[$i]}"
+            if [ "$i" -eq "$begin_idx" ] && [ "$in_code" -eq 1 ]; then
+              printf 'repair_target_plan_authorization_refused: no_standalone_field\n'
+              return 1
+            fi
+            if [[ "$line" =~ $fence_re ]]; then
+              marker="${BASH_REMATCH[1]}"
+              tail="${line#*"$marker"}"
+              if [ "$in_code" -eq 0 ]; then
+                in_code=1
+                fence_char="${marker:0:1}"
+                fence_size=${#marker}
+              elif [ "${marker:0:1}" = "$fence_char" ] && [ "${#marker}" -ge "$fence_size" ] && [[ "$tail" =~ ^[[:space:]]*$ ]]; then
+                in_code=0
+              fi
+              continue
+            fi
+            if [ "$in_code" -eq 1 ] || [ "$i" -le "$begin_idx" ]; then
+              continue
+            fi
+            if [[ "$line" =~ $field_re ]]; then
+              field_count=$((field_count + 1))
+              captured="${BASH_REMATCH[1]}"
+            fi
+          done
+          if [ "$field_count" -eq 0 ] || [ "$in_code" -eq 1 ]; then
+            printf 'repair_target_plan_authorization_refused: no_standalone_field\n'
+            return 1
+          fi
+          if [ "$field_count" -gt 1 ]; then
+            printf 'repair_target_plan_authorization_refused: multiple_fields\n'
+            return 1
+          fi
+          if [ "$captured" != "$want_pr" ]; then
+            printf 'repair_target_plan_authorization_refused: pr_mismatch\n'
+            return 1
+          fi
+          printf 'repair_target_plan_authorization: ok #%s\n' "$captured"
+          return 0
+        }
+        # ---- END rta core ----
+        if [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" != true ] || [ "$REPAIR_TARGET_AUTHORIZED" != "#${REPAIR_TARGET_PR}" ] || [ "$SPEC_REPAIR_PR" != "$REPAIR_TARGET_PR" ] || [ "$SPEC_REPAIR_BRANCH" != "$REPAIR_TARGET_BRANCH" ] || ! rta_plan_authorizes "$PLAN_REVIEW_RAW" "$REPAIR_TARGET_PR"; then
           echo "repair_target_unauthorized"
           echo "ERROR: repair_target_unauthorized: refusing to select an existing branch without a spec-bound authorization matching PR #${REPAIR_TARGET_PR} branch ${REPAIR_TARGET_BRANCH}" >&2
           exit 1
@@ -3537,6 +4013,39 @@ nodes:
       # run a0dae1f8. Now: look for an existing PR BEFORE attempting create, and
       # re-check after each create attempt so a non-zero-exit-but-created PR is
       # caught instead of triggering a spurious failure.
+      # WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01: builders build, the reviewer
+      # reviews. Refuse to open a PR when the gh identity we are about to use is the
+      # reviewer identity. Incident 2026-10-20: lanes with no builder App opened
+      # shopops #887/#888/#889 as thinman-overseer[bot]; Overseer refused each with
+      # custody_conflict. Fail closed if the acting login cannot be resolved at all.
+      REVIEWER_LOGIN="${OVERSEER_REVIEW_IDENTITY:-thinman-overseer[bot]}"
+      resolve_acting_login() {
+        if [ -f /app/scripts/github-service-login.ts ]; then
+          bun /app/scripts/github-service-login.ts "${ARCHON_GITHUB_SERVICE:-run_nodes}" 2>/dev/null
+        else
+          gh api user --jq .login 2>/dev/null
+        fi
+      }
+      normalize_login() {
+        printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's#^app/##;s/\[bot\]$//'
+      }
+      ACTING_LOGIN="$(resolve_acting_login | head -n 1 | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+      if [ -z "$ACTING_LOGIN" ]; then
+        echo "ERROR: acting_login_unresolved: cannot determine the GitHub identity for gh pr create" >&2
+        exit 1
+      fi
+      if [ "$(normalize_login "$ACTING_LOGIN")" = "$(normalize_login "$REVIEWER_LOGIN")" ]; then
+        echo "ERROR: builder_is_reviewer: acting login ${ACTING_LOGIN} equals reviewer identity ${REVIEWER_LOGIN} -- builders build, the reviewer reviews (bdc-xo WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01)" >&2
+        exit 1
+      fi
+      # The builder identity is confirmed distinct from the reviewer. Disable the
+      # github-service-exec permission fallback so an App 403 on gh pr create fails
+      # closed instead of silently retrying with the reviewer/user PAT fallback
+      # (ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN/GH_TOKEN/GITHUB_TOKEN). Without this
+      # a distinct builder App could pass the guard and still open the PR as the
+      # reviewer via the fallback token.
+      export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
+      echo "acting_login=${ACTING_LOGIN}"
       PR_OK=false
       EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
         --json url --jq '.[0].url // empty' 2>/dev/null || true)

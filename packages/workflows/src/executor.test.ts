@@ -159,7 +159,10 @@ function getExecutedWorkflow(): WorkflowDefinition {
 // These orchestration tests mock the DAG/provider. Seat capacity must be a
 // fixture too, so host credentials and live subscription usage cannot decide
 // whether an unrelated policy/resume test reaches that mocked DAG.
+let savedTelegramBotToken: string | undefined;
 beforeEach(() => {
+  savedTelegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
+  delete process.env.TELEGRAM_BOT_TOKEN;
   resetSeatUsageCacheForTests();
   setSeatUsageReaderForTests(async seats => {
     const readings: Partial<Record<SeatId, SeatReading>> = {};
@@ -185,7 +188,11 @@ beforeEach(() => {
     return readings;
   });
 });
-afterEach(resetSeatUsageCacheForTests);
+afterEach(() => {
+  resetSeatUsageCacheForTests();
+  if (savedTelegramBotToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
+  else process.env.TELEGRAM_BOT_TOKEN = savedTelegramBotToken;
+});
 
 describe('executeWorkflow', () => {
   beforeEach(() => {

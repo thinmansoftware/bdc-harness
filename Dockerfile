@@ -97,6 +97,8 @@ RUN apt-get update && apt-get install -y \
     # spends 20 minutes discovering it.
     shellcheck \
     postgresql-client \
+    # Required by Python WO tests; keep the distro-managed pytest runtime.
+    python3-pytest \
     unzip \
     # Chromium for agent-browser E2E testing (drives browser via CDP)
     chromium \
@@ -130,7 +132,7 @@ RUN curl -fsSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${T
 
 # Install agent-browser CLI (Vercel Labs) for E2E testing workflows
 # - Uses npm (not bun) because postinstall script downloads the native Rust binary
-# - After install, symlink the Rust binary directly and purge nodejs/npm (~60MB saved)
+# - Keep nodejs/npm: WO tests require npm and npx at runtime.
 # - The npm entry point is a Node.js wrapper; the native binary works standalone
 # - agent-browser auto-detects Docker (via /.dockerenv) and adds --no-sandbox to Chromium
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
@@ -145,8 +147,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
        fi \
     && npm cache clean --force \
     && rm -rf /usr/local/lib/node_modules/agent-browser \
-    && apt-get purge -y nodejs npm \
-    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)
@@ -154,8 +154,8 @@ ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Install the Cursor CLI (cursor-agent) for the Overseer `cursor` judge rung and
 # the `cursor` agent provider (PR #848). The official installer drops a
-# self-contained bundle (it ships its own node runtime, so the nodejs purge above
-# does not affect it) under $HOME/.local/share/cursor-agent plus a launcher at
+# self-contained bundle (it ships its own node runtime) under
+# $HOME/.local/share/cursor-agent plus a launcher at
 # $HOME/.local/bin/cursor-agent. Install under a fixed, world-readable HOME so
 # appuser can execute it, then expose it on PATH. No credential is baked in:
 # auth comes at runtime from ~/.cursor (seeded by the entrypoint) or CURSOR_API_KEY.
@@ -235,6 +235,9 @@ COPY .archon/ ./.archon/
 COPY migrations/ ./migrations/
 COPY tsconfig*.json ./
 
+# Entrypoints used by the container GitHub transport and credential preflight.
+COPY scripts/github-service-token.ts scripts/github-service-exec.ts scripts/github-service-login.ts ./scripts/
+
 # Fix permissions for appuser
 RUN chown -R appuser:appuser /app
 
@@ -254,6 +257,12 @@ RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.curso
 # covers worktrees created at arbitrary depths after container startup.
 RUN git config --global --add safe.directory '*' && \
     gosu appuser git config --global --add safe.directory '*'
+
+# Fail the image build if the final runtime loses a lane test runner.
+RUN gosu appuser node --version \
+    && gosu appuser npm --version \
+    && gosu appuser npx --version \
+    && gosu appuser pytest --version
 
 # Copy entrypoint script (fixes volume permissions, drops to appuser)
 # sed strips Windows CRLF in case .gitattributes eol=lf was bypassed

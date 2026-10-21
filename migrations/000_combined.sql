@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS remote_agent_codebases (
   repository_url VARCHAR(500),
   default_cwd VARCHAR(500) NOT NULL,
   ai_assistant_type VARCHAR(20) DEFAULT 'claude',
+  default_branch VARCHAR(255) DEFAULT 'main',
   allow_env_keys BOOLEAN NOT NULL DEFAULT FALSE,
   commands JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMP DEFAULT NOW(),
@@ -623,6 +624,10 @@ VALUES
   -- WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 (migration 043): the PR-event review
   -- route's sender and worker-poll recipient. Without these rows every
   -- review enqueue is rejected as missing_principal.
+  -- WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01 (migration 046):
+  -- recipient of Overseer's remediation candidates. worker_poll -- the
+  -- Taskmaster loop claims its own work on its tick.
+  ('taskmaster', 'Taskmaster', 'worker_poll', TRUE),
   ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
   ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE),
   ('duty-officer', 'Duty Officer', 'worker_poll', TRUE),

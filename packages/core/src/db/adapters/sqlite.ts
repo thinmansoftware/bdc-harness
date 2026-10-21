@@ -89,6 +89,7 @@ export class SqliteAdapter implements IDatabase {
   private wave2Installing = false;
 
   constructor(dbPath: string) {
+    const bootstrapStartedAt = performance.now();
     // Ensure directory exists
     const dir = dirname(dbPath);
     if (!existsSync(dir)) {
@@ -111,7 +112,7 @@ export class SqliteAdapter implements IDatabase {
     this.ensureTmExpectationsShape();
 
     // Initialize schema if needed
-    this.initSchema();
+    this.initSchema(bootstrapStartedAt);
   }
 
   /**
@@ -124,9 +125,20 @@ export class SqliteAdapter implements IDatabase {
     if (!this.wave2SchemaPromise) {
       this.wave2SchemaPromise = (async (): Promise<void> => {
         this.wave2Installing = true;
+        const startedAt = performance.now();
         try {
           await installM31TargetV2Sqlite(this);
+          const m31FinishedAt = performance.now();
           await installOverseerControlPlaneSqlite(this);
+          const finishedAt = performance.now();
+          getLog().info(
+            {
+              m31Ms: m31FinishedAt - startedAt,
+              controlPlaneMs: finishedAt - m31FinishedAt,
+              totalMs: finishedAt - startedAt,
+            },
+            'db.sqlite_wave2_bootstrap_timing'
+          );
         } finally {
           this.wave2Installing = false;
         }
@@ -422,10 +434,14 @@ export class SqliteAdapter implements IDatabase {
     }
   }
 
-  private initSchema(): void {
+  private initSchema(bootstrapStartedAt: number): void {
+    const schemaStartedAt = performance.now();
     this.createSchema();
+    const schemaCreatedAt = performance.now();
     this.migrateColumns();
+    const columnsMigratedAt = performance.now();
     this.seedDispatchPrincipals();
+    const principalsSeededAt = performance.now();
     // Phase 1.5 partial unique indexes must run only after sender_principal_id exists.
     const postMigrateCols = this.pragmaAll("PRAGMA table_info('agent_dispatch_messages')") as {
       name: string;
@@ -463,6 +479,19 @@ export class SqliteAdapter implements IDatabase {
     // per the established pattern.
     this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_snapshot ON tm_adoption(snapshot_id)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_tm_adoption_thread ON tm_adoption(thread_ref)');
+    const finishedAt = performance.now();
+    getLog().info(
+      {
+        // Preparation includes directory/open/PRAGMAs and the pre-schema shape check.
+        prepareMs: schemaStartedAt - bootstrapStartedAt,
+        createSchemaMs: schemaCreatedAt - schemaStartedAt,
+        migrateColumnsMs: columnsMigratedAt - schemaCreatedAt,
+        seedPrincipalsMs: principalsSeededAt - columnsMigratedAt,
+        postMigrationIndexesMs: finishedAt - principalsSeededAt,
+        totalMs: finishedAt - bootstrapStartedAt,
+      },
+      'db.sqlite_bootstrap_timing'
+    );
   }
 
   /**
@@ -659,6 +688,36 @@ export class SqliteAdapter implements IDatabase {
           )
         `);
     }
+    // Migration 060 (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01): widen
+    // tm_journal.action_type CHECK to accept the sixth verb 'blocker_report'.
+    // SQLite cannot ALTER a CHECK, so rebuild transactionally. Re-read the
+    // schema fresh -- the migration-056 rebuild above may have just recreated
+    // the table with a CHECK that still lacks 'blocker_report', so the stale
+    // schema string from that block cannot be reused here. Separate block (do
+    // not edit the 045/055/056 CHECK literals) so each widen is independently
+    // idempotent. Only action_type widens; the grade CHECK is carried forward
+    // exactly as migration 056 left it.
+    const journalSchema4 = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
+      .get() as { sql?: string } | undefined;
+    if (journalSchema4?.sql && !journalSchema4.sql.includes('blocker_report')) {
+      this.rebuildTmJournal(`
+          CREATE TABLE tm_journal_new (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            thread_ref TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')),
+            proposal_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            before_hash TEXT,
+            proof_predicate TEXT,
+            proof_deadline_at TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+            graded_at TEXT,
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+          )
+        `);
+    }
     // Migration 046: older on-disk databases used a composite primary key for
     // tm_health. Add a provider-only UNIQUE index (allowed by the WO) instead
     // of rebuilding: table constraints, columns, indexes and triggers survive.
@@ -725,6 +784,9 @@ export class SqliteAdapter implements IDatabase {
         ['action_reason', 'TEXT'],
         ['merge_sha', 'TEXT'],
         ['pr_url', 'TEXT'],
+        ['merge_attempts', 'INTEGER NOT NULL DEFAULT 0'],
+        ['merge_not_before', 'TEXT'],
+        ['merge_last_transient_reason', 'TEXT'],
       ];
       for (const [name, definition] of additions) {
         if (!verdictColNames.has(name)) {
@@ -1240,7 +1302,13 @@ export class SqliteAdapter implements IDatabase {
         ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1),
         ('overseer-review-route', 'Overseer Review Route', 'notify_only', 1),
         ('duty-officer', 'Duty Officer', 'worker_poll', 1),
-        ('do', 'Duty Officer alias', 'worker_poll', 1)
+        ('do', 'Duty Officer alias', 'worker_poll', 1),
+        -- WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
+        -- (migration 046 parity): Overseer hands CHANGES_REQUESTED verdicts
+        -- back as remediation candidates addressed to 'taskmaster'. Without
+        -- this row createAuthenticatedMessage rejects every one with
+        -- missing_principal.
+        ('taskmaster', 'Taskmaster', 'worker_poll', 1)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`
@@ -2244,6 +2312,9 @@ export class SqliteAdapter implements IDatabase {
         action_reason TEXT,
         merge_sha TEXT,
         pr_url TEXT,
+        merge_attempts INTEGER NOT NULL DEFAULT 0,
+        merge_not_before TEXT,
+        merge_last_transient_reason TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
@@ -2371,7 +2442,7 @@ export class SqliteAdapter implements IDatabase {
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         thread_ref TEXT NOT NULL,
         action_type TEXT NOT NULL CHECK (
-          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron')
+          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')
         ),
         proposal_json TEXT NOT NULL,
         idempotency_key TEXT,
@@ -2526,6 +2597,28 @@ export class SqliteAdapter implements IDatabase {
         claimed_at TEXT NOT NULL,
         lease_expires_at TEXT NOT NULL,
         posted_at TEXT
+      );
+
+      -- Per-service GitHub API usage and latest quota state (migration 062).
+      CREATE TABLE IF NOT EXISTS github_api_usage (
+        hour_bucket TEXT NOT NULL,
+        service TEXT NOT NULL,
+        pool_id TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        calls INTEGER NOT NULL DEFAULT 0,
+        rate_limited INTEGER NOT NULL DEFAULT 0,
+        permission_fallbacks INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (hour_bucket, service, pool_id, resource)
+      );
+
+      CREATE TABLE IF NOT EXISTS github_api_pool_state (
+        pool_id TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        "limit" INTEGER,
+        remaining INTEGER,
+        reset_at TEXT,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY (pool_id, resource)
       );
 
       -- operator settings (migration 059).

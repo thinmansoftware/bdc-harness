@@ -1317,3 +1317,237 @@ describe('escalation reaches a human (bdc-xo#2007)', () => {
     expect(body).toContain('EXHAUSTED');
   });
 });
+
+describe('PR expectations use complete REST discovery', () => {
+  const spec: EvidenceSpec = {
+    kind: 'pr_opened',
+    repo: 'x/y',
+    head_branch: 'fix/expected',
+    title_prefix: 'fix(expected):',
+  };
+  function row(number: number, override: Record<string, unknown> = {}) {
+    return {
+      number,
+      state: 'open',
+      title: 'unrelated',
+      html_url: `https://github.com/x/y/pull/${number}`,
+      head: { ref: 'other' },
+      ...override,
+    };
+  }
+  function fixture(pages: unknown[]) {
+    const seen: string[] = [];
+    const fetcher = (async (input: string | URL | Request) => {
+      const url = String(input);
+      seen.push(url);
+      if (url.includes('/search/'))
+        return new Response(JSON.stringify({ message: 'Search exhausted' }), { status: 403 });
+      const page = Number(new URL(url).searchParams.get('page'));
+      const value = page <= pages.length ? pages[page - 1] : [];
+      if (value instanceof Error) throw value;
+      if (value instanceof Response) return value;
+      return new Response(JSON.stringify(value), {
+        headers:
+          Array.isArray(value) && value.length === 100
+            ? {
+                link: `<https://api.github.com/repos/x/y/pulls?state=open&per_page=100&sort=created&direction=asc&page=${page + 1}>; rel="next"`,
+              }
+            : {},
+      });
+    }) as typeof fetch;
+    return { seen, fetch: fetcher };
+  }
+  test('later matching branch and title provides a pointer without Search', async () => {
+    const f = fixture([
+      Array.from({ length: 100 }, (_, i) => row(i + 1)),
+      [row(101, { title: 'fix(expected): done', head: { ref: 'fix/expected' } })],
+    ]);
+    expect(await checkEvidence(spec, f)).toEqual({
+      ok: true,
+      pointer: 'https://github.com/x/y/pull/101',
+    });
+    expect(f.seen.some(url => url.includes('/search/'))).toBe(false);
+    expect(f.seen).toHaveLength(2);
+  });
+  test('both supplied predicates must match; prefix alone or branch alone is insufficient', async () => {
+    const f = fixture([
+      [row(1, { title: 'fix(expected): title only' }), row(2, { head: { ref: 'fix/expected' } })],
+    ]);
+    expect(await checkEvidence(spec, f)).toEqual({ ok: false, pointer: null });
+    expect(f.seen.some(url => url.includes('/search/'))).toBe(false);
+  });
+  test.each(['head', 'prefix', 'any'])('%s-only contract remains usable', async mode => {
+    const evidence: EvidenceSpec =
+      mode === 'head'
+        ? { kind: 'pr_opened', repo: 'x/y', head_branch: 'other' }
+        : mode === 'prefix'
+          ? { kind: 'pr_opened', repo: 'x/y', title_prefix: 'unrelated' }
+          : { kind: 'pr_opened', repo: 'x/y' };
+    const f = fixture([[row(1)]]);
+    expect(await checkEvidence(evidence, f)).toEqual({
+      ok: true,
+      pointer: 'https://github.com/x/y/pull/1',
+    });
+  });
+  test.each([
+    'null',
+    'object',
+    'number',
+    'state',
+    'title',
+    'html_url',
+    'head',
+    'HTTP',
+    'JSON',
+    'late-error',
+    'cap',
+  ])('%s cannot become absence', async mode => {
+    const full = Array.from({ length: 100 }, (_, i) => row(i + 1));
+    const pages: unknown[] =
+      mode === 'null'
+        ? [null]
+        : mode === 'object'
+          ? [{}]
+          : mode === 'HTTP'
+            ? [new Response('{}', { status: 403 })]
+            : mode === 'JSON'
+              ? [new Response('bad-json')]
+              : mode === 'late-error'
+                ? [full, new Error('later page unavailable')]
+                : mode === 'cap'
+                  ? Array.from({ length: 100 }, () => full)
+                  : [[{ ...row(1), [mode]: undefined }]];
+    const f = fixture(pages);
+    await expect(checkEvidence(spec, f)).rejects.toThrow();
+    expect(f.seen.some(url => url.includes('/search/'))).toBe(false);
+  });
+  test('fork head with exact branch matches without narrowing the owner', async () => {
+    const f = fixture([
+      [
+        row(1, {
+          title: 'fix(expected): from fork',
+          head: { ref: 'fix/expected', user: { login: 'other-owner' } },
+        }),
+      ],
+    ]);
+    expect((await checkEvidence(spec, f)).ok).toBe(true);
+    expect(new URL(f.seen[0]!).searchParams.has('head')).toBe(false);
+  });
+  test('branch prefix is not an exact branch', async () => {
+    const f = fixture([
+      [row(1, { title: 'fix(expected): longer', head: { ref: 'fix/expected-more' } })],
+    ]);
+    expect((await checkEvidence(spec, f)).ok).toBe(false);
+  });
+  test.each([
+    'https://foreign.example/repos/x/y/pulls?state=open',
+    'https://api.github.com/repos/other/repo/pulls?state=open',
+    'https://api.github.com/repos/x/y/pulls?state=closed',
+    'https://api.github.com/repos/x/y/pulls?state=open&per_page=100&sort=created&direction=asc&page=1',
+  ])('invalid or cyclic next link %s is unknown before another authenticated read', async next => {
+    const f = fixture([
+      new Response(JSON.stringify([row(1)]), { headers: { link: `<${next}>; rel="next"` } }),
+    ]);
+    await expect(checkEvidence(spec, f)).rejects.toThrow('pagination_invalid');
+    expect(f.seen).toHaveLength(1);
+  });
+  test.each(['extra-filter', 'duplicate-key', 'multiple-next', 'reordered-cycle'])(
+    '%s pagination cannot authorize absence or side effects',
+    async mode => {
+      const root =
+        'https://api.github.com/repos/x/y/pulls?state=open&per_page=100&sort=created&direction=asc&page=2';
+      const link =
+        mode === 'extra-filter'
+          ? `<${root}&head=other>; rel="next"`
+          : mode === 'duplicate-key'
+            ? `<${root}&state=all>; rel="next"`
+            : mode === 'multiple-next'
+              ? `<${root}>; rel="next", <${root}&head=other>; rel="next"`
+              : '<https://api.github.com/repos/x/y/pulls?page=1&direction=asc&sort=created&per_page=100&state=open>; rel="next"';
+      const make = () => fixture([new Response('[]', { headers: { link } })]);
+      const f = make();
+      await expect(checkEvidence(spec, f)).rejects.toThrow('pagination_invalid');
+      expect(f.seen).toHaveLength(1);
+      const effects: string[] = [];
+      await checkExpectations(new Date(), {
+        ...make(),
+        listDueExpectations: async () => [{ ...base, evidence_json: JSON.stringify(spec) }],
+        markMet: async () => {
+          effects.push('met');
+          return true;
+        },
+        markFailed: async () => {
+          effects.push('failed');
+          return true;
+        },
+        claimRedispatchAttempt: async () => {
+          effects.push('retry');
+          return null;
+        },
+        markGivenUp: async () => {
+          effects.push('give_up');
+          return true;
+        },
+        claimEscalation: async () => {
+          effects.push('escalate');
+          return true;
+        },
+      });
+      expect(effects).toEqual([]);
+    }
+  );
+  test('malformed pagination does not prove completion', async () => {
+    const f = fixture([new Response('[]', { headers: { link: 'malformed-header' } })]);
+    await expect(checkEvidence(spec, f)).rejects.toThrow('pagination_invalid');
+  });
+  test('short page with unquoted next relation is followed', async () => {
+    const next =
+      'https://api.github.com/repos/x/y/pulls?state=open&per_page=100&sort=created&direction=asc&page=2';
+    const f = fixture([
+      new Response(JSON.stringify([row(1)]), { headers: { link: `<${next}>; rel=next` } }),
+      [row(2, { title: 'fix(expected): done', head: { ref: 'fix/expected' } })],
+    ]);
+    expect((await checkEvidence(spec, f)).pointer).toBe('https://github.com/x/y/pull/2');
+  });
+  test.each([
+    { kind: 'pr_opened', repo: '../outside' },
+    { kind: 'pr_opened', repo: 'x/y', head_branch: 'owner:branch' },
+  ] as const)('unrecognized scope remains unknown', async evidence => {
+    const f = fixture([[]]);
+    await expect(checkEvidence(evidence, f)).rejects.toThrow('scope_unknown');
+    expect(f.seen).toEqual([]);
+  });
+  test('conflicting duplicate identity is unknown', async () => {
+    const f = fixture([[row(1), row(1, { title: 'changed' })]]);
+    await expect(checkEvidence(spec, f)).rejects.toThrow();
+  });
+  test('unknown probe leaves due supervision active without redispatch or escalation', async () => {
+    const f = fixture([{}]);
+    const effects: string[] = [];
+    await checkExpectations(new Date(), {
+      ...f,
+      listDueExpectations: async () => [{ ...base, evidence_json: JSON.stringify(spec) }],
+      markMet: async () => {
+        effects.push('met');
+        return true;
+      },
+      markFailed: async () => {
+        effects.push('failed');
+        return true;
+      },
+      claimRedispatchAttempt: async () => {
+        effects.push('retry');
+        return null;
+      },
+      markGivenUp: async () => {
+        effects.push('give_up');
+        return true;
+      },
+      claimEscalation: async () => {
+        effects.push('escalate');
+        return true;
+      },
+    });
+    expect(effects).toEqual([]);
+  });
+});

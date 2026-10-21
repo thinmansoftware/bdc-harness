@@ -15,6 +15,8 @@ import {
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
+import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
+import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
 import {
   mintAppInstallationToken,
@@ -96,12 +98,22 @@ export interface DutyOfficerClockDeps {
 }
 
 export function githubToken(): string | null {
-  const token = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
-  return token ? token : null;
+  try {
+    const identity = resolveServiceGitHubAuth('duty_officer');
+    return identity.kind === 'pat' ? identity.token : null;
+  } catch {
+    return null;
+  }
 }
 
 export function githubNudgeEnabled(): boolean {
-  return process.env.DUTY_OFFICER_GH_NUDGE === 'true' && Boolean(githubToken());
+  if (process.env.DUTY_OFFICER_GH_NUDGE !== 'true') return false;
+  try {
+    const identity = resolveServiceGitHubAuth('duty_officer');
+    return identity.kind === 'app' || (identity.kind === 'pat' && Boolean(identity.token.trim()));
+  } catch {
+    return false;
+  }
 }
 
 function githubTimeoutMs(): number {
@@ -121,6 +133,18 @@ export function isTaskmasterSelfPause(message: DispatchMessage): boolean {
 
 export function isTaskmasterMailbox(message: DispatchMessage): boolean {
   return message.sender === 'taskmaster';
+}
+
+/**
+ * A Taskmaster blocker_report (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01):
+ * sender 'taskmaster' AND an idempotency key in the blocker_report namespace.
+ * These skip the judge entirely and are relayed to the XO once, then finished.
+ */
+export function isTaskmasterBlockerReport(message: DispatchMessage): boolean {
+  return (
+    message.sender === 'taskmaster' &&
+    (message.idempotency_key ?? '').startsWith('tm:blocker_report:')
+  );
 }
 
 function namedNextStep(body: string): string | null {
@@ -155,11 +179,8 @@ async function githubJson<T>(
   path: string,
   options?: { method?: string; extraHeaders?: Record<string, string>; body?: string }
 ): Promise<T> {
-  const token = githubToken();
-  if (!token) throw new Error('duty_officer_github_token_missing');
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
     'User-Agent': 'bdc-harness-duty-officer-clock',
     'X-GitHub-Api-Version': '2022-11-28',
   };
@@ -168,11 +189,15 @@ async function githubJson<T>(
       headers[key] = options.extraHeaders[key];
     }
   }
-  const response = await fetch(`https://api.github.com${path}`, {
-    method: options?.method,
-    headers,
-    body: options?.body,
-    signal: AbortSignal.timeout(githubTimeoutMs()),
+  const response = await serviceGitHubFetchWithPermissionFallback({
+    service: 'duty_officer',
+    url: `https://api.github.com${path}`,
+    init: {
+      method: options?.method,
+      headers,
+      body: options?.body,
+      signal: AbortSignal.timeout(githubTimeoutMs()),
+    },
   });
   if (!response.ok) {
     throw new Error(`duty_officer_github_http_${response.status}`);
@@ -387,9 +412,10 @@ function mechanicalVerdict(claimed: DispatchMessage): DutyOfficerJudgeVerdict {
 async function escalateToXo(
   deps: DutyOfficerClockDeps,
   claimed: DispatchMessage,
-  verdict: DutyOfficerJudgeVerdict
+  verdict: DutyOfficerJudgeVerdict,
+  excerptLimit = 500
 ): Promise<void> {
-  const excerpt = (verdict.body || claimed.body).slice(0, 500);
+  const excerpt = (verdict.body || claimed.body).slice(0, excerptLimit);
   const subjectKey = escalationSubjectKey(claimed.subject_key);
   await deps.createAuthenticatedMessage(DUTY_OFFICER_SENDER, {
     correlation_id: claimed.correlation_id || `do-clock:${claimed.id}`,
@@ -402,6 +428,7 @@ async function escalateToXo(
       source_id: claimed.id,
       task_type: claimed.task_type,
       subject_key: claimed.subject_key,
+      thread_ref: claimed.subject_key,
       transport: verdict.transport ?? null,
       reason: verdict.reason,
       excerpt,
@@ -426,6 +453,33 @@ async function holdItem(deps: DutyOfficerClockDeps, claimed: DispatchMessage): P
 }
 
 async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
+  // A Taskmaster blocker_report is relayed to the XO once, WITHOUT the judge
+  // (zero LLM): the report is already content-complete and its whole purpose is
+  // to reach the XO via this clock. A failed relay holds the item and retries
+  // with the same escalation key, so the XO gets exactly one copy.
+  if (isTaskmasterBlockerReport(claimed)) {
+    const verdict: DutyOfficerJudgeVerdict = {
+      status: 'unconfigured',
+      action: 'escalate_xo',
+      reason: 'taskmaster_blocker_report',
+      // Full source body (<=500 chars by construction; capped at 2000 in
+      // escalateToXo defensively).
+      body: claimed.body,
+      failures: [],
+    };
+    try {
+      await escalateToXo(deps, claimed, verdict, 2000);
+    } catch (error) {
+      log.error({ err: error, messageId: claimed.id }, 'duty_officer_blocker_report_relay_failed');
+      await holdItem(deps, claimed);
+      return;
+    }
+    await finishItem(deps, claimed, 'done', 'succeeded', {
+      disposition: 'taskmaster_blocker_report_relayed',
+      transport: verdict.transport ?? null,
+    });
+    return;
+  }
   let verdict = await deps.judge(claimed);
   if (verdict.status === 'unconfigured') {
     verdict = mechanicalVerdict(claimed);
