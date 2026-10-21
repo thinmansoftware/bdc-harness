@@ -4282,6 +4282,39 @@ nodes:
       # run a0dae1f8. Now: look for an existing PR BEFORE attempting create, and
       # re-check after each create attempt so a non-zero-exit-but-created PR is
       # caught instead of triggering a spurious failure.
+      # WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01: builders build, the reviewer
+      # reviews. Refuse to open a PR when the gh identity we are about to use is the
+      # reviewer identity. Incident 2026-10-20: lanes with no builder App opened
+      # shopops #887/#888/#889 as thinman-overseer[bot]; Overseer refused each with
+      # custody_conflict. Fail closed if the acting login cannot be resolved at all.
+      REVIEWER_LOGIN="${OVERSEER_REVIEW_IDENTITY:-thinman-overseer[bot]}"
+      resolve_acting_login() {
+        if [ -f /app/scripts/github-service-login.ts ]; then
+          bun /app/scripts/github-service-login.ts "${ARCHON_GITHUB_SERVICE:-run_nodes}" 2>/dev/null
+        else
+          gh api user --jq .login 2>/dev/null
+        fi
+      }
+      normalize_login() {
+        printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's#^app/##;s/\[bot\]$//'
+      }
+      ACTING_LOGIN="$(resolve_acting_login | head -n 1 | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+      if [ -z "$ACTING_LOGIN" ]; then
+        echo "ERROR: acting_login_unresolved: cannot determine the GitHub identity for gh pr create" >&2
+        exit 1
+      fi
+      if [ "$(normalize_login "$ACTING_LOGIN")" = "$(normalize_login "$REVIEWER_LOGIN")" ]; then
+        echo "ERROR: builder_is_reviewer: acting login ${ACTING_LOGIN} equals reviewer identity ${REVIEWER_LOGIN} -- builders build, the reviewer reviews (bdc-xo WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01)" >&2
+        exit 1
+      fi
+      # The builder identity is confirmed distinct from the reviewer. Disable the
+      # github-service-exec permission fallback so an App 403 on gh pr create fails
+      # closed instead of silently retrying with the reviewer/user PAT fallback
+      # (ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN/GH_TOKEN/GITHUB_TOKEN). Without this
+      # a distinct builder App could pass the guard and still open the PR as the
+      # reviewer via the fallback token.
+      export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
+      echo "acting_login=${ACTING_LOGIN}"
       PR_OK=false
       EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
         --json url --jq '.[0].url // empty' 2>/dev/null || true)
