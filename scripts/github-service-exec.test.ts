@@ -4,9 +4,20 @@ import {
   assertLaneGitHubService,
   runGitHubServiceCommand as runCommand,
 } from './github-service-exec';
-import { serviceGitHubCommandEnvironment } from '../packages/core/src/github/service-identity';
+import {
+  resolveServiceGitHubAuth,
+  serviceGitHubCommandEnvironment,
+} from '../packages/core/src/github/service-identity';
 import { generateKeyPairSync } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -433,9 +444,17 @@ describe('operation-scoped GitHub CLI authentication', () => {
       expect(existsSync(join(home, 'archon.db'))).toBe(false);
       const laneFiles = readdirSync(spool).filter(name => name.endsWith('.json'));
       expect(laneFiles.length).toBe(1);
+      const laneBody = JSON.parse(readFileSync(join(spool, laneFiles[0] ?? ''), 'utf8')) as {
+        service?: string;
+        poolId?: string;
+        resource?: string;
+      };
+      expect(laneBody.service).toBeUndefined();
+      expect(laneBody.poolId).toBeUndefined();
+      expect(laneBody.resource).toBe('cli');
 
       writeFileSync(
-        join(spool, 'poison-overseer.json'),
+        join(spool, '4-5-abcd.json'),
         JSON.stringify({
           v: 1,
           service: 'overseer',
@@ -457,16 +476,21 @@ describe('operation-scoped GitHub CLI authentication', () => {
         })
       );
 
+      const identity = resolveServiceGitHubAuth('run_nodes');
       const ingested = await ingestLaneGitHubMeterSpool(db, spool);
       expect(ingested).toBe(2);
+      expect(existsSync(join(spool, 'poison-count.json'))).toBe(true);
       const hour = currentGitHubHourBucket();
-      const usage = await db.query<{ calls: number; service: string }>(
-        'SELECT service, calls FROM github_api_usage WHERE hour_bucket = $1',
-        [hour]
-      );
-      const runNodes = usage.rows.find(row => row.service === 'run_nodes');
-      expect(runNodes?.calls).toBe(2);
+      const usage = await db.query<{
+        calls: number;
+        service: string;
+        pool_id: string;
+      }>('SELECT service, pool_id, calls FROM github_api_usage WHERE hour_bucket = $1', [hour]);
+      expect(usage.rows.every(row => row.service === 'run_nodes')).toBe(true);
+      expect(usage.rows.every(row => row.pool_id === identity.poolId)).toBe(true);
+      expect(usage.rows.some(row => row.pool_id === 'reviewer')).toBe(false);
       expect(usage.rows.some(row => row.service === 'overseer')).toBe(false);
+      expect(usage.rows.reduce((sum, row) => sum + row.calls, 0)).toBe(2);
     } finally {
       await closeDatabase();
       resetDatabase();

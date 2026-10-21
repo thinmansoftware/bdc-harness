@@ -25,12 +25,78 @@ for lane_name in $(env | sed -n 's/^\([A-Za-z0-9_]*DATABASE[A-Za-z0-9_]*\)=.*/\1
 done
 export ARCHON_GITHUB_SERVICE=run_nodes HOME=/home/laneuser
 
-# Bash-node scripts are mode 0600 and owned by the server. Open the script
-# before the UID switch, then hand that descriptor to bash on stdin.
-# Passing the script path to bash reopens it as the lane UID and is denied.
-if [ "$1" = "bash" ] && [ -n "${2:-}" ] && [ -f "$2" ]; then
-  exec 9<"$2"
+# Bash-node scripts are mode 0600 and owned by the server. Copy the script
+# with an O_NOFOLLOW openat walk before the UID switch, then hand the copy
+# to bash on stdin. A shell open follows symlinks, and a path swap between
+# a check and a second open would copy server-readable bytes into the lane.
+# Flags such as `bash -c` are not script paths and stay on the original argv.
+lane_take_script=0
+if [ "$1" = "bash" ] && [ -n "${2:-}" ]; then
+  case "$2" in
+    -*) lane_take_script=0 ;;
+    *) lane_take_script=1 ;;
+  esac
+fi
+if [ "$lane_take_script" -eq 1 ]; then
+  lane_script=$2
   shift 2
+  lane_dir=$(mktemp -d)
+  chmod 700 "$lane_dir"
+  lane_copy="$lane_dir/script"
+  if ! python3 - "$lane_script" > "$lane_copy" <<'PY'
+import os, stat, sys
+
+path = sys.argv[1]
+if path == "" or "\0" in path:
+    sys.exit(66)
+if not os.path.isabs(path):
+    path = os.path.join(os.getcwd(), path)
+parts = []
+for part in path.split("/"):
+    if part == "" or part == ".":
+        continue
+    if part == "..":
+        if not parts:
+            sys.exit(66)
+        parts.pop()
+        continue
+    parts.append(part)
+if not parts:
+    sys.exit(66)
+flags_dir = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+flags_file = os.O_RDONLY | os.O_NOFOLLOW
+dirfd = None
+try:
+    dirfd = os.open("/", flags_dir)
+    for index, part in enumerate(parts):
+        last = index == len(parts) - 1
+        opened = os.open(part, flags_file if last else flags_dir, dir_fd=dirfd)
+        os.close(dirfd)
+        dirfd = opened
+    info = os.fstat(dirfd)
+    if not stat.S_ISREG(info.st_mode):
+        sys.exit(66)
+    while True:
+        chunk = os.read(dirfd, 65536)
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+except OSError:
+    sys.exit(66)
+finally:
+    if dirfd is not None:
+        try:
+            os.close(dirfd)
+        except OSError:
+            pass
+PY
+  then
+    rm -rf "$lane_dir"
+    echo "archon-lane-exec: refusing bash script path" >&2
+    exit 66
+  fi
+  exec 9<"$lane_copy"
+  rm -rf "$lane_dir"
   exec 0<&9 9<&-
   set -- bash -s -- "$@"
 fi

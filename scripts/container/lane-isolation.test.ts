@@ -54,9 +54,55 @@ describe('container lane isolation', () => {
 
   test('lane launcher feeds 0600 bash scripts on stdin and scrubs database env', () => {
     expect(launcherSource).not.toContain('/proc/self/fd/');
+    expect(launcherSource).not.toContain('[ -f ');
+    expect(launcherSource).toContain('O_NOFOLLOW');
     expect(launcherSource).toContain('bash -s');
     expect(launcherSource).toContain('DATABASE_URL');
     expect(launcherSource).toContain('exec 0<&9');
+  });
+
+  test('bash script opener refuses symlinks and reads a regular 0600 file', () => {
+    const start = launcherSource.indexOf("<<'PY'\n");
+    const end = launcherSource.indexOf('\nPY\n', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const program = launcherSource.slice(start + "<<'PY'\n".length, end);
+    const directory = mkdtempSync(join(tmpdir(), 'lane-bash-nofollow-'));
+    const script = join(directory, 'node.sh');
+    const secret = join(directory, 'secret');
+    const link = join(directory, 'link.sh');
+    const hidden = join(directory, 'hidden');
+    const dirLink = join(directory, 'dirlink');
+    try {
+      writeFileSync(script, 'echo lane-bash-ok\n', { mode: 0o600 });
+      chmodSync(script, 0o600);
+      writeFileSync(secret, 'SECRET-BYTES\n', { mode: 0o600 });
+      symlinkSync(secret, link);
+      mkdirSync(hidden);
+      writeFileSync(join(hidden, 'node.sh'), 'echo hidden\n');
+      symlinkSync(hidden, dirLink);
+
+      const opened = Bun.spawnSync(['python3', '-', script], {
+        stdin: new TextEncoder().encode(program),
+      });
+      expect(opened.exitCode).toBe(0);
+      expect(new TextDecoder().decode(opened.stdout)).toBe('echo lane-bash-ok\n');
+
+      const followed = Bun.spawnSync(['python3', '-', link], {
+        stdin: new TextEncoder().encode(program),
+      });
+      expect(followed.exitCode).toBe(66);
+      expect(new TextDecoder().decode(followed.stdout)).toBe('');
+      expect(readFileSync(secret, 'utf8')).toBe('SECRET-BYTES\n');
+
+      const viaDirectory = Bun.spawnSync(['python3', '-', join(dirLink, 'node.sh')], {
+        stdin: new TextEncoder().encode(program),
+      });
+      expect(viaDirectory.exitCode).toBe(66);
+      expect(new TextDecoder().decode(viaDirectory.stdout)).not.toContain('hidden');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   containerTest('launcher_drops_to_lane_uid_with_no_caps', () => {
