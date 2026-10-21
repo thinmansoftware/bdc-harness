@@ -402,11 +402,11 @@ describe('Test: progress-timeout respects the frontier approval gate + records a
   test('a frontier tier that needs approval: the current run is not cancelled', async () => {
     let cancelCalls = 0;
     const deps: CascadeDeps = {
-      // Enter at claude (non-premium, human-typed) so the climb target is the
-      // premium frontier tier.
-      fire: async () => makeFireOk('run-claude'),
+      // Entry is codex and the next automatic climb is frontier, so the hung
+      // run is not cancelled.
+      fire: async () => makeFireOk('run-codex'),
       poll: async () => {
-        throw new TimeoutError('[smart-cauldron/poll] Run run-claude stalled: no new events');
+        throw new TimeoutError('[smart-cauldron/poll] Run run-codex stalled: no new events');
       },
       judge: () => makePassVerdict(),
       escalate: async () => {
@@ -419,17 +419,17 @@ describe('Test: progress-timeout respects the frontier approval gate + records a
       },
     };
 
-    const record = await runCascade(baseOpts({ deps, entryOverride: 'claude' }));
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'codex' }));
 
     // No cancel-to-nowhere: the hung run was left RUNNING, not cancelled, because
     // the climb target (frontier) requires operator approval.
     expect(cancelCalls).toBe(0);
     expect(record.status).toBe('pending-frontier-approval');
     expect(record.frontierApproval?.tierName).toBe('frontier');
-    // The timed-out claude attempt is recorded; frontier was never fired.
+    // The timed-out codex attempt is recorded; frontier was never fired.
     expect(record.attempts.length).toBe(1);
     expect(record.attempts[0]?.outcome).toBe('progress-timeout');
-    expect(record.attempts.map(a => a.tier)).toEqual(['claude']);
+    expect(record.attempts.map(a => a.tier)).toEqual(['codex']);
   });
 
   test('the cancel reason is non-empty', async () => {
