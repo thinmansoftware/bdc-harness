@@ -43,7 +43,7 @@ jobs:
         run: bun run format:check
 
       - name: GitHub service command and credential routing regressions
-        run: bun test ./scripts/github-service-exec.test.ts packages/overseer/src/__tests__/github-command-durable-metering.test.ts ./scripts/github-service-token.test.ts ./scripts/container/gh-merge-guard.test.ts
+        run: bun test ./scripts/github-service-exec.test.ts packages/overseer/src/__tests__/github-command-durable-metering.test.ts ./scripts/github-service-token.test.ts ./scripts/container/gh-merge-guard.test.ts ./scripts/container/docker-entrypoint-app-helper.test.ts
 
       - name: Run tests
         if: runner.os != 'Windows'

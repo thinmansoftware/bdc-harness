@@ -16,8 +16,8 @@ export const SERVICE_GITHUB_AUTH_PRECEDENCE = {
   merge_manager: ['service_app', 'merge_manager_pat', 'hold'],
   taskmaster: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
   duty_officer: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
-  smart_cauldron: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
-  run_nodes: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
+  smart_cauldron: ['service_app', 'pat'],
+  run_nodes: ['service_app', 'pat'],
 } as const satisfies Record<GitHubService, readonly string[]>;
 
 export interface GitHubAppIdentity {
@@ -117,6 +117,26 @@ export function resolveServiceGitHubAuth(
       return { kind: 'none', service: 'merge_manager', poolId: 'none', distinct: false };
     }
   }
+
+  // Builder lanes must never share the reviewer identity or borrow the Taskmaster
+  // alias. They resolve their own App (GITHUB_APP_RUN_NODES_* / _SMART_CAULDRON_*)
+  // or the PAT -- nothing else. A builder App that equals the reviewer App is a
+  // hard error so a lane can never open a PR authored by thinman-overseer[bot].
+  if (service === 'run_nodes' || service === 'smart_cauldron') {
+    if (own) {
+      const reviewer =
+        resolveApp('GITHUB_APP_OVERSEER_', 'overseer', env) ??
+        resolveApp('GITHUB_APP_', 'overseer', env);
+      if (reviewer?.appId === own.appId) {
+        throw new Error(
+          `builder_identity_equals_reviewer: ${service} App id equals the reviewer App id`
+        );
+      }
+      return own;
+    }
+    return pat(service, env.GITHUB_TOKEN ?? env.GH_TOKEN ?? '', 'user-pat', false);
+  }
+
   if (own) return own;
 
   if (service === 'overseer' || service === 'pr_discovery') {
