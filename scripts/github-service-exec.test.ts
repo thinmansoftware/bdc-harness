@@ -121,6 +121,32 @@ describe('operation-scoped GitHub CLI authentication', () => {
     );
     expect(usage.rows[0]?.calls).toBe(1);
   });
+  test('an unreadable metering database does not block the GitHub command', async () => {
+    let launches = 0;
+    const result = await runCommand({
+      service: 'run_nodes',
+      command: 'synthetic-gh',
+      args: [],
+      identity: {
+        kind: 'pat',
+        service: 'run_nodes',
+        token: 'synthetic-pat',
+        poolId: 'user-pat',
+        distinct: false,
+      },
+      db: {
+        query: async () => {
+          throw new Error('synthetic unreadable database');
+        },
+      } as unknown as SqliteAdapter,
+      execute: () => {
+        launches += 1;
+        return { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(launches).toBe(1);
+  });
   test('Smart Cauldron override survives the actual container wrapper and keeps PAT fallback', async () => {
     const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 })
       .privateKey.export({ type: 'pkcs8', format: 'pem' })

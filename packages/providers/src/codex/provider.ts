@@ -760,7 +760,7 @@ export class CodexProvider implements IAgentProvider {
 
     try {
       return new Codex({
-        codexPathOverride: await resolveCodexBinaryPath(configCodexBinaryPath),
+        codexPathOverride: laneExecutablePath(await resolveCodexBinaryPath(configCodexBinaryPath)),
         env: buildCodexEnv(requestEnv),
       });
     } catch (error) {

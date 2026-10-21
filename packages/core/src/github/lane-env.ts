@@ -1,8 +1,9 @@
-import { chmodSync, existsSync, writeFileSync } from 'fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { createHash } from 'crypto';
 
 export const LANE_HOME = '/home/laneuser';
 export const LANE_LAUNCHER = '/usr/local/bin/archon-lane-exec';
+const LANE_SHIM_DIRECTORY = '/tmp/archon-lane-sdk';
 
 export function laneIsolationAvailable(): boolean {
   return process.env.ARCHON_LANE_UID_ISOLATION !== '0' && existsSync(LANE_LAUNCHER);
@@ -58,13 +59,41 @@ export function laneExecutablePath(executable: string | undefined): string | und
     return executable;
   }
   const digest = createHash('sha256').update(executable).digest('hex').slice(0, 16);
-  const wrapper = `/tmp/archon-lane-sdk-${digest}`;
-  if (!existsSync(wrapper)) {
-    const quoted = executable.replaceAll("'", "'\\''");
-    writeFileSync(wrapper, `#!/bin/sh\nexec '${LANE_LAUNCHER}' '${quoted}' "$@"\n`, {
-      mode: 0o755,
-    });
-    chmodSync(wrapper, 0o755);
+  const currentUid = process.getuid?.();
+  if (currentUid === undefined) {
+    throw new Error('lane_sdk_shim_owner_unavailable');
+  }
+  try {
+    mkdirSync(LANE_SHIM_DIRECTORY, { mode: 0o755 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  const directoryStat = lstatSync(LANE_SHIM_DIRECTORY);
+  if (
+    !directoryStat.isDirectory() ||
+    directoryStat.isSymbolicLink() ||
+    directoryStat.uid !== currentUid ||
+    (directoryStat.mode & 0o022) !== 0
+  ) {
+    throw new Error('lane_sdk_shim_directory_unsafe');
+  }
+  const wrapper = `${LANE_SHIM_DIRECTORY}/${digest}`;
+  const quoted = executable.replaceAll("'", "'\\''");
+  const contents = `#!/bin/sh\nexec '${LANE_LAUNCHER}' '${quoted}' "$@"\n`;
+  try {
+    writeFileSync(wrapper, contents, { mode: 0o755, flag: 'wx' });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const wrapperStat = lstatSync(wrapper);
+    if (
+      !wrapperStat.isFile() ||
+      wrapperStat.isSymbolicLink() ||
+      wrapperStat.uid !== currentUid ||
+      (wrapperStat.mode & 0o022) !== 0 ||
+      readFileSync(wrapper, 'utf8') !== contents
+    ) {
+      throw new Error('lane_sdk_shim_unsafe');
+    }
   }
   return wrapper;
 }

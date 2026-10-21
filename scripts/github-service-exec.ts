@@ -141,11 +141,19 @@ export async function runGitHubServiceCommand(input: {
   ): Promise<CommandResult> => {
     // A gh command may use REST and GraphQL in the same operation. Refuse
     // conservatively if any of its pool's known resources is exhausted.
-    await assertPersistedGitHubPoolAvailable(
-      selected.poolId,
-      ['core', 'graphql', 'search', 'cli'],
-      db
-    );
+    try {
+      await assertPersistedGitHubPoolAvailable(
+        selected.poolId,
+        ['core', 'graphql', 'search', 'cli'],
+        db
+      );
+    } catch (error) {
+      if (String(error).includes('github_pool_backoff:')) throw error;
+      if (!meteringWarningPrinted) {
+        console.error('github_service_metering_skipped:database_not_readable');
+        meteringWarningPrinted = true;
+      }
+    }
     const token =
       selected.kind === 'pat'
         ? selected.token
