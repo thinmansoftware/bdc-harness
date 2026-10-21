@@ -115,6 +115,9 @@ export {
   stopCleanupScheduler,
   onConversationClosed,
   SESSION_RETENTION_DAYS,
+  tryRunScheduledCleanup,
+  isCleanupInFlight,
+  type CleanupReport,
 } from './services/cleanup-service';
 export {
   sweepTerminalWorkflowWorktrees,

@@ -27,7 +27,9 @@ import {
   registerRepository,
   ConversationNotFoundError,
   generateAndSetTitle,
+  tryRunScheduledCleanup,
 } from '@archon/core';
+import { cleanupReportSchema } from './schemas/maintenance.schemas';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
 import { conductorSeatUsage } from '../services/conductor-seat-usage';
@@ -2442,6 +2444,22 @@ const getUpdateCheckRoute = createRoute({
   },
 });
 
+const postMaintenanceCleanupRoute = createRoute({
+  method: 'post',
+  path: '/api/maintenance/cleanup',
+  tags: ['System'],
+  summary: 'Run housekeeping immediately, outside the scheduled window if necessary',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: cleanupReportSchema } },
+      description: 'Cleanup report',
+    },
+    401: jsonError('Missing or invalid operator token'),
+    409: jsonError('Cleanup already in progress'),
+    500: jsonError('Server error'),
+  },
+});
+
 // Taskmaster Slice 1 operator routes (WO-HARNESS-TASKMASTER-SLICE1-01).
 // Auth is covered by the global /api/* operator-token middleware.
 const getTaskmasterStatusRoute = createRoute({
@@ -2594,7 +2612,8 @@ export function registerApiRoutes(
   lockManager: ConversationLockManager,
   activePlatforms?: readonly string[],
   canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
-  dispatchMailboxActorResolvedHook?: () => Promise<void>
+  dispatchMailboxActorResolvedHook?: () => Promise<void>,
+  maintenanceCleanupRunner: typeof tryRunScheduledCleanup = tryRunScheduledCleanup
 ): void {
   function apiError(
     c: Context,
@@ -5883,6 +5902,17 @@ export function registerApiRoutes(
   ): void {
     app.openapi(route, handler as never);
   }
+
+  registerOpenApiRoute(postMaintenanceCleanupRoute, async c => {
+    try {
+      const result = await maintenanceCleanupRunner({ source: 'manual' });
+      if (!result.started) return apiError(c, 409, 'Cleanup already in progress');
+      return c.json(result.report);
+    } catch (error) {
+      getLog().error({ err: error }, 'maintenance_cleanup_route_failed');
+      return apiError(c, 500, 'Maintenance cleanup failed');
+    }
+  });
 
   /**
    * Access Zod-validated body from a handler registered via registerOpenApiRoute.

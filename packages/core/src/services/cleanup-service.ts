@@ -25,6 +25,8 @@ import { createLogger } from '@archon/paths';
 import type { IsolationEnvironmentRow } from '@archon/isolation';
 import { ConversationNotFoundError } from '../types';
 import { sweepTerminalWorkflowWorktrees } from './worktree-sweep';
+import { createMaintenanceGitContext, type MaintenanceGitContext } from './maintenance-git-limiter';
+import { getMaintenanceWindow } from './maintenance-window';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -35,7 +37,7 @@ function getLog(): ReturnType<typeof createLogger> {
 
 // Configuration constants (configurable via env vars)
 const STALE_THRESHOLD_DAYS = parseInt(process.env.STALE_THRESHOLD_DAYS ?? '14', 10);
-const CLEANUP_INTERVAL_HOURS = parseInt(process.env.CLEANUP_INTERVAL_HOURS ?? '6', 10);
+const CLEANUP_TICK_MINUTES = parseInt(process.env.MAINTENANCE_TICK_MINUTES ?? '15', 10);
 const SESSION_RETENTION_DAYS = parseInt(process.env.SESSION_RETENTION_DAYS ?? '30', 10);
 
 // Export configuration for use by other modules
@@ -43,6 +45,8 @@ export { STALE_THRESHOLD_DAYS, SESSION_RETENTION_DAYS };
 
 // Module-level variable for scheduler
 let cleanupIntervalId: NodeJS.Timeout | null = null;
+let cleanupInFlight = false;
+let lastScheduledWindowKey: string | null = null;
 
 export interface CleanupReport {
   removed: string[];
@@ -127,6 +131,7 @@ export async function onConversationClosed(
 export interface RemoveEnvironmentOptions {
   force?: boolean;
   deleteRemoteBranch?: boolean;
+  maintenanceContext?: MaintenanceGitContext;
 }
 
 /**
@@ -182,7 +187,10 @@ export async function removeEnvironment(
   try {
     // If path exists, check for uncommitted changes (unless force)
     if (pathExists && !options?.force) {
-      const hasChanges = await hasUncommittedChanges(toWorktreePath(env.working_path));
+      const hasChanges = await hasUncommittedChanges(
+        toWorktreePath(env.working_path),
+        options?.maintenanceContext ? { execute: options.maintenanceContext.execute } : undefined
+      );
       if (hasChanges) {
         getLog().warn({ envId, workingPath: env.working_path }, 'env_has_uncommitted_changes');
         return { ...noopResult, skippedReason: 'has uncommitted changes' };
@@ -259,11 +267,17 @@ type RemovalBlocker =
   | { reason: 'uncommitted_changes'; display: string }
   | { reason: 'in_use'; display: string; conversationCount: number };
 
-async function getRemovalBlocker(env: {
-  id: string;
-  working_path: string;
-}): Promise<RemovalBlocker | null> {
-  const hasChanges = await hasUncommittedChanges(toWorktreePath(env.working_path));
+async function getRemovalBlocker(
+  env: {
+    id: string;
+    working_path: string;
+  },
+  maintenanceContext?: MaintenanceGitContext
+): Promise<RemovalBlocker | null> {
+  const hasChanges = await hasUncommittedChanges(
+    toWorktreePath(env.working_path),
+    maintenanceContext ? { execute: maintenanceContext.execute } : undefined
+  );
   if (hasChanges) return { reason: 'uncommitted_changes', display: 'has uncommitted changes' };
   const conversations = await isolationEnvDb.getConversationsUsingEnv(env.id);
   if (conversations.length > 0)
@@ -280,8 +294,9 @@ async function getRemovalBlocker(env: {
  * 1. Find and remove merged branches
  * 2. Find and remove stale environments
  */
-export async function runScheduledCleanup(): Promise<CleanupReport> {
-  getLog().info('cleanup_started');
+export async function runScheduledCleanup(
+  maintenanceContext = createMaintenanceGitContext()
+): Promise<CleanupReport> {
   const report: CleanupReport = { removed: [], skipped: [], errors: [], sessionsDeleted: 0 };
 
   try {
@@ -298,7 +313,10 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
         const pathExists = await worktreeExists(toWorktreePath(env.working_path));
         if (!pathExists) {
           // Path doesn't exist - call removeEnvironment to clean up branch and mark as destroyed
-          const removeResult = await removeEnvironment(env.id, { force: false });
+          const removeResult = await removeEnvironment(env.id, {
+            force: false,
+            maintenanceContext,
+          });
           if (removeResult.skippedReason) {
             report.skipped.push({ id: env.id, reason: removeResult.skippedReason });
           } else {
@@ -317,7 +335,7 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
         );
 
         if (merged) {
-          const blocker = await getRemovalBlocker(env);
+          const blocker = await getRemovalBlocker(env, maintenanceContext);
           if (blocker) {
             report.skipped.push({ id: env.id, reason: `merged but ${blocker.display}` });
             if (blocker.reason === 'in_use') {
@@ -335,6 +353,7 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
           const mergedResult = await removeEnvironment(env.id, {
             force: false,
             deleteRemoteBranch: true,
+            maintenanceContext,
           });
           if (mergedResult.skippedReason) {
             report.skipped.push({ id: env.id, reason: mergedResult.skippedReason });
@@ -350,9 +369,9 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
         }
 
         // Check if environment is stale
-        const isStale = await isEnvironmentStale(env, STALE_THRESHOLD_DAYS);
+        const isStale = await isEnvironmentStale(env, STALE_THRESHOLD_DAYS, maintenanceContext);
         if (isStale) {
-          const blocker = await getRemovalBlocker(env);
+          const blocker = await getRemovalBlocker(env, maintenanceContext);
           if (blocker) {
             report.skipped.push({ id: env.id, reason: `stale but ${blocker.display}` });
             if (blocker.reason === 'in_use') {
@@ -366,7 +385,7 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
             continue;
           }
 
-          const staleResult = await removeEnvironment(env.id, { force: false });
+          const staleResult = await removeEnvironment(env.id, { force: false, maintenanceContext });
           if (staleResult.skippedReason) {
             report.skipped.push({ id: env.id, reason: staleResult.skippedReason });
           } else {
@@ -396,7 +415,7 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
   }
 
   try {
-    await sweepTerminalWorkflowWorktrees();
+    await sweepTerminalWorkflowWorktrees({ maintenanceContext });
   } catch (error) {
     const err = error as Error;
     getLog().error({ err: error }, 'terminal_worktree_sweep_failed');
@@ -421,10 +440,14 @@ export async function runScheduledCleanup(): Promise<CleanupReport> {
  */
 async function isEnvironmentStale(
   env: IsolationEnvironmentRow,
-  staleDays: number
+  staleDays: number,
+  maintenanceContext?: MaintenanceGitContext
 ): Promise<boolean> {
   // Check last commit date in the worktree
-  const lastCommit = await getLastCommitDate(toWorktreePath(env.working_path));
+  const lastCommit = await getLastCommitDate(
+    toWorktreePath(env.working_path),
+    maintenanceContext ? { execute: maintenanceContext.execute } : undefined
+  );
   if (lastCommit) {
     const daysSinceCommit = (Date.now() - lastCommit.getTime()) / (1000 * 60 * 60 * 24);
     if (daysSinceCommit < staleDays) {
@@ -662,29 +685,81 @@ export async function cleanupMergedWorktrees(
 
 /**
  * Start the cleanup scheduler
- * Runs cleanup cycle every CLEANUP_INTERVAL_HOURS
+ * Installs the maintenance-window tick. Startup itself never runs cleanup.
  */
-export function startCleanupScheduler(): void {
+export function startCleanupScheduler(
+  options: { now?: () => Date; setIntervalFn?: typeof setInterval } = {}
+): void {
   if (cleanupIntervalId) {
     getLog().warn('scheduler_already_running');
     return;
   }
 
-  const intervalMs = CLEANUP_INTERVAL_HOURS * 60 * 60 * 1000;
-  getLog().info({ intervalHours: CLEANUP_INTERVAL_HOURS }, 'scheduler_starting');
-
-  // Run immediately on startup, then at interval
-  void runScheduledCleanup().catch(err => {
-    getLog().error({ err }, 'initial_cleanup_failed');
-  });
-
-  cleanupIntervalId = setInterval(() => {
-    void runScheduledCleanup().catch(err => {
+  const intervalMs = CLEANUP_TICK_MINUTES * 60 * 1000;
+  getLog().info({ intervalMinutes: CLEANUP_TICK_MINUTES }, 'scheduler_starting');
+  const tick = (): void => {
+    const window = getMaintenanceWindow((options.now ?? ((): Date => new Date()))());
+    if (
+      !window.inside ||
+      !window.windowKey ||
+      window.error ||
+      cleanupInFlight ||
+      lastScheduledWindowKey === window.windowKey
+    ) {
+      getLog().debug(
+        {
+          reason: window.error
+            ? 'invalid_config'
+            : !window.inside
+              ? 'outside_window'
+              : cleanupInFlight
+                ? 'in_flight'
+                : 'already_claimed',
+          error: window.error,
+        },
+        'maintenance_window_skip'
+      );
+      return;
+    }
+    lastScheduledWindowKey = window.windowKey;
+    void tryRunScheduledCleanup({ source: 'scheduled' }).catch(err => {
       getLog().error({ err }, 'scheduled_cleanup_failed');
     });
-  }, intervalMs);
+  };
+  cleanupIntervalId = (options.setIntervalFn ?? setInterval)(tick, intervalMs);
 
   getLog().info('scheduler_started');
+}
+
+export type CleanupRunAttempt =
+  | { started: false; reason: 'in_flight' }
+  | { started: true; report: CleanupReport };
+
+export async function tryRunScheduledCleanup(options: {
+  source: 'scheduled' | 'manual';
+  maintenanceContext?: MaintenanceGitContext;
+}): Promise<CleanupRunAttempt> {
+  if (cleanupInFlight) return { started: false, reason: 'in_flight' };
+  cleanupInFlight = true;
+  getLog().info({ source: options.source }, 'cleanup_started');
+  try {
+    return { started: true, report: await runScheduledCleanup(options.maintenanceContext) };
+  } catch (error) {
+    const report: CleanupReport = {
+      removed: [],
+      skipped: [],
+      errors: [{ id: 'scheduler', error: (error as Error).message }],
+      sessionsDeleted: 0,
+    };
+    getLog().error({ err: error }, 'scheduled_cleanup_failed');
+    return { started: true, report };
+  } finally {
+    cleanupInFlight = false;
+  }
+}
+
+export function isCleanupInFlight(): boolean {
+  return cleanupInFlight;
 }
 
 /**

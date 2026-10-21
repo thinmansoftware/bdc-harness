@@ -1,9 +1,10 @@
-import { mkdir, readdir, rename, rm, stat } from 'fs/promises';
-import { basename, dirname, join, relative, resolve } from 'path';
+import { mkdir, readdir, rename, rm, stat, realpath } from 'fs/promises';
+import { basename, dirname, join, relative, resolve, sep, isAbsolute } from 'path';
 import {
   execFileAsync,
   getCanonicalRepoPath,
   getLastCommitDate,
+  hasUnpushedCommits,
   getWorktreeBase,
   toRepoPath,
   toWorktreePath,
@@ -20,6 +21,7 @@ import {
   updateStatus as defaultUpdateEnvStatus,
 } from '../db/isolation-environments';
 import { listWorkflowRunsWithWorkingPath } from '../db/workflows';
+import { createMaintenanceGitContext, type MaintenanceGitContext } from './maintenance-git-limiter';
 
 const HOURS_TO_MS = 60 * 60 * 1000;
 const DAYS_TO_MS = 24 * HOURS_TO_MS;
@@ -88,6 +90,8 @@ export interface WorktreeSweepOptions {
   pruneWorktree?: (repoPath: string) => Promise<void>;
   removeQuarantineDir?: (path: string) => Promise<void>;
   destroyWorktree?: (worktreePath: string) => Promise<void>;
+  maintenanceContext?: MaintenanceGitContext;
+  hasUnpushedCommitsFn?: (worktreePath: string) => Promise<boolean>;
 }
 
 function defaultWorkspacesRoot(): string {
@@ -146,7 +150,9 @@ async function directorySize(path: string): Promise<number> {
 }
 
 function defaultQuarantineRoot(workspacesRoot: string): string {
-  return resolve(join(workspacesRoot, '..', 'worktree-quarantine'));
+  // Quarantine is still deletion-capable storage, so keep it inside the one
+  // container-managed tree this maintenance job is authorized to mutate.
+  return resolve(join(workspacesRoot, '.worktree-quarantine'));
 }
 
 function quarantineDateFolder(now: Date): string {
@@ -185,6 +191,7 @@ async function getWorktreeLastCommitDate(
   try {
     return await getLastCommitDateFn(worktreePath);
   } catch (error) {
+    if ((error as Error).name === 'MaintenanceGitUnavailableError') return null;
     getLog().warn({ err: error, worktreePath }, 'worktree_sweep_last_commit_date_lookup_failed');
     return null;
   }
@@ -203,11 +210,26 @@ async function getWorktreeLastCommitDate(
  * per-worktree, so one stash anywhere in the repo would preserve every worktree of
  * that repo forever and reintroduce the never-sweep bug this file exists to fix.
  */
-async function defaultHasUncommittedWork(worktreePath: string): Promise<boolean> {
-  const { stdout } = await execFileAsync(
-    'git',
-    ['-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'],
-    { timeout: 30000 }
+async function defaultHasUncommittedWork(
+  worktreePath: string,
+  context: MaintenanceGitContext
+): Promise<boolean> {
+  const { stdout } = await context.execute(worktreePath, () =>
+    execFileAsync(
+      'git',
+      [
+        '-c',
+        'core.preloadIndex=false',
+        '-c',
+        'index.threads=1',
+        '-C',
+        worktreePath,
+        'status',
+        '--porcelain',
+        '--untracked-files=all',
+      ],
+      { timeout: 30000 }
+    )
   );
   return stdout.trim().length > 0;
 }
@@ -362,18 +384,59 @@ async function defaultDestroyWorktree(worktreePath: string): Promise<void> {
   await getIsolationProvider().destroy(worktreePath, { force: true });
 }
 
-async function defaultPruneWorktree(repoPath: string): Promise<void> {
-  await execFileAsync('git', ['-C', repoPath, 'worktree', 'prune'], { timeout: 30000 });
+async function defaultPruneWorktree(
+  repoPath: string,
+  context: MaintenanceGitContext
+): Promise<void> {
+  await context.execute(repoPath, () =>
+    execFileAsync(
+      'git',
+      [
+        '-c',
+        'core.preloadIndex=false',
+        '-c',
+        'index.threads=1',
+        '-C',
+        repoPath,
+        'worktree',
+        'prune',
+      ],
+      { timeout: 30000 }
+    )
+  );
+}
+
+function isContained(root: string, target: string): boolean {
+  const rel = relative(root, target);
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+async function canonicalTargetPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    const parent = dirname(path);
+    if (parent === path) return resolve(path);
+    return join(await canonicalTargetPath(parent), basename(path));
+  }
 }
 
 export async function sweepTerminalWorkflowWorktrees(
   opts: WorktreeSweepOptions = {}
 ): Promise<WorktreeSweepReport> {
+  const maintenanceContext = opts.maintenanceContext ?? createMaintenanceGitContext();
   const gracePeriodMs = opts.gracePeriodMs ?? WORKTREE_SWEEP_GRACE_PERIOD_MS;
   const orphanAgeMs = opts.orphanAgeMs ?? WORKTREE_ORPHAN_AGE_MS;
   const quarantineRetentionMs = opts.quarantineRetentionMs ?? WORKTREE_QUARANTINE_RETENTION_MS;
   const workspacesRoot = opts.workspacesRoot ?? defaultWorkspacesRoot();
+  const canonicalWorkspacesRoot = await realpath(workspacesRoot).catch(() =>
+    resolve(workspacesRoot)
+  );
   const quarantineRoot = opts.quarantineRoot ?? defaultQuarantineRoot(workspacesRoot);
+  const canonicalQuarantineRoot = await canonicalTargetPath(quarantineRoot);
+  if (!isContained(canonicalWorkspacesRoot, canonicalQuarantineRoot)) {
+    throw new Error('quarantine_root_outside_workspaces');
+  }
   const now = opts.now ?? new Date();
   const listRuns = opts.listRuns ?? listWorkflowRunsWithWorkingPath;
   const listActiveEnvironments = opts.listActiveEnvironments ?? listActiveEnvironmentsForSweep;
@@ -382,19 +445,54 @@ export async function sweepTerminalWorkflowWorktrees(
   const updateEnvStatus = opts.updateEnvStatus ?? defaultUpdateEnvStatus;
   const getLastCommitDateFn =
     opts.getLastCommitDateFn ??
-    ((path: string): Promise<Date | null> => getLastCommitDate(toWorktreePath(path)));
-  const hasUncommittedWorkFn = opts.hasUncommittedWorkFn ?? defaultHasUncommittedWork;
+    ((path: string): Promise<Date | null> =>
+      getLastCommitDate(toWorktreePath(path), { execute: maintenanceContext.execute }));
+  const hasUncommittedWorkFn =
+    opts.hasUncommittedWorkFn ??
+    ((path: string): Promise<boolean> => defaultHasUncommittedWork(path, maintenanceContext));
+  const hasUnpushedCommitsFn =
+    opts.hasUnpushedCommitsFn ??
+    ((path: string): Promise<boolean> =>
+      hasUnpushedCommits(toWorktreePath(path), { execute: maintenanceContext.execute }));
   const getCanonicalRepoPathFn =
     opts.getCanonicalRepoPathFn ??
     ((path: string): Promise<string> => getCanonicalRepoPath(toWorktreePath(path)));
-  const moveDir = opts.moveDir ?? rename;
-  const pruneWorktree = opts.pruneWorktree ?? defaultPruneWorktree;
+  const assertContainedTarget = async (path: string): Promise<void> => {
+    const canonical = await canonicalTargetPath(path);
+    if (!isContained(canonicalWorkspacesRoot, canonical)) {
+      throw new Error('target_outside_allowed_root');
+    }
+  };
+  const moveDir = async (from: string, to: string): Promise<void> => {
+    await assertContainedTarget(from);
+    await assertContainedTarget(to);
+    await (opts.moveDir ?? rename)(from, to);
+  };
+  const pruneWorktree = async (repoPath: string): Promise<void> => {
+    const canonical = await realpath(repoPath).catch(() => resolve(repoPath));
+    if (!isContained(canonicalWorkspacesRoot, canonical)) {
+      getLog().warn({ repoPath: canonical }, 'worktree_sweep_prune_refused_outside_workspaces');
+      return;
+    }
+    await (
+      opts.pruneWorktree ??
+      ((path: string): Promise<void> => defaultPruneWorktree(path, maintenanceContext))
+    )(canonical);
+  };
   const removeQuarantineDir =
     opts.removeQuarantineDir ??
     (async (path: string): Promise<void> => {
+      const canonical = await canonicalTargetPath(path);
+      if (!isContained(canonicalQuarantineRoot, canonical)) {
+        throw new Error('target_outside_allowed_root');
+      }
+      await assertContainedTarget(path);
       await rm(path, { recursive: true, force: true });
     });
-  const destroyWorktree = opts.destroyWorktree ?? defaultDestroyWorktree;
+  const destroyWorktree = async (path: string): Promise<void> => {
+    await assertContainedTarget(path);
+    await (opts.destroyWorktree ?? defaultDestroyWorktree)(path);
+  };
 
   const report: WorktreeSweepReport = {
     scanned: 0,
@@ -430,71 +528,193 @@ export async function sweepTerminalWorkflowWorktrees(
   const worktreeDirs = await listArchonWorktreeDirs(workspacesRoot);
   report.scanned = worktreeDirs.length;
 
-  for (const worktreeDir of worktreeDirs) {
-    const normalizedPath = resolve(worktreeDir);
-    const run = runsByPath.get(normalizedPath);
+  let nextWorktree = 0;
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const worktreeDir = worktreeDirs[nextWorktree++];
+      if (!worktreeDir) return;
+      if (maintenanceContext.tripped) {
+        report.skipped.push({ path: worktreeDir, reason: 'maintenance_git_unavailable' });
+        continue;
+      }
+      const normalizedPath = resolve(worktreeDir);
+      const run = runsByPath.get(normalizedPath);
 
-    if (!run) {
-      const env = envsByPath.get(normalizedPath);
-      const dirStat = await stat(worktreeDir);
+      if (!run) {
+        const env = envsByPath.get(normalizedPath);
+        const dirStat = await stat(worktreeDir);
 
-      if (env) {
-        if (env.created_by_platform === 'telegram') {
-          report.skipped.push({ path: worktreeDir, reason: 'env_platform:telegram' });
-          getLog().warn(
-            { worktreePath: worktreeDir, envId: env.id, reason: 'env_platform:telegram' },
-            'worktree_sweep_env_only_skipped'
-          );
+        if (env) {
+          if (env.created_by_platform === 'telegram') {
+            report.skipped.push({ path: worktreeDir, reason: 'env_platform:telegram' });
+            getLog().warn(
+              { worktreePath: worktreeDir, envId: env.id, reason: 'env_platform:telegram' },
+              'worktree_sweep_env_only_skipped'
+            );
+            continue;
+          }
+
+          if (
+            await hasActiveSessionForEnvironment(env.id, getConversationsUsingEnv, getActiveSession)
+          ) {
+            report.skipped.push({ path: worktreeDir, reason: 'env_has_active_session' });
+            getLog().warn(
+              { worktreePath: worktreeDir, envId: env.id, reason: 'env_has_active_session' },
+              'worktree_sweep_env_only_skipped'
+            );
+            continue;
+          }
+
+          const lastCommitDate = await getWorktreeLastCommitDate(worktreeDir, getLastCommitDateFn);
+          const envCreatedAt =
+            env.created_at instanceof Date ? env.created_at : new Date(env.created_at);
+          // Directory mtime deliberately does NOT participate here -- see durableActivityDate().
+          // A no-git worktree with no commits falls back to envCreatedAt, which is still real
+          // evidence (the environment row itself has a provable creation time); only in the
+          // theoretical case where neither exists does this collapse to "no evidence", and an
+          // absent active session (already checked above) means it is immediately reclaimable.
+          const activityDate = durableActivityDate(lastCommitDate, envCreatedAt);
+          const ageMs = activityDate ? now.getTime() - activityDate.getTime() : Infinity;
+          if (ageMs <= orphanAgeMs) {
+            report.skipped.push({ path: worktreeDir, reason: 'env_inside_orphan_age' });
+            getLog().warn(
+              { worktreePath: worktreeDir, envId: env.id, reason: 'env_inside_orphan_age' },
+              'worktree_sweep_env_only_skipped'
+            );
+            continue;
+          }
+
+          // Age says reclaim and no session owns it -- but session absence does not prove
+          // the tree holds no work. Genuine uncommitted changes (modified, staged, or
+          // untracked files) are valuable regardless of commit age and must be preserved.
+          // Only a clean tree, proven by a successful git status, may be reclaimed.
+          const workVerdict = await checkUncommittedWork(worktreeDir, hasUncommittedWorkFn);
+          if (workVerdict.preserve) {
+            const reason = `env_${workVerdict.reason}`;
+            report.skipped.push({ path: worktreeDir, reason });
+            getLog().warn(
+              {
+                worktreePath: worktreeDir,
+                envId: env.id,
+                reason,
+                ...(workVerdict.error ? { error: workVerdict.error } : {}),
+              },
+              'worktree_sweep_env_only_skipped'
+            );
+            continue;
+          }
+          if (await hasUnpushedCommitsFn(worktreeDir)) {
+            report.skipped.push({ path: worktreeDir, reason: 'env_unpushed_or_unknown' });
+            continue;
+          }
+
+          try {
+            const quarantine = await quarantineWorktreeDir({
+              workspacesRoot,
+              quarantineRoot,
+              worktreePath: worktreeDir,
+              now,
+              moveDir,
+              getCanonicalRepoPathFn,
+              pruneWorktree,
+            });
+            try {
+              await updateEnvStatus(env.id, 'destroyed');
+              report.quarantined.push(quarantine.quarantinePath);
+              report.quarantinedBytes += quarantine.bytes;
+              getLog().info(
+                {
+                  worktreePath: worktreeDir,
+                  quarantinePath: quarantine.quarantinePath,
+                  class: 'env-only',
+                  reason: 'older_than_orphan_age',
+                  envId: env.id,
+                  bytes: quarantine.bytes,
+                },
+                'worktree_sweep_quarantined_worktree'
+              );
+            } catch (error) {
+              const err = error as Error;
+              report.errors.push({ path: worktreeDir, error: err.message });
+              getLog().error(
+                { err, worktreePath: worktreeDir, envId: env.id },
+                'worktree_sweep_env_status_update_failed'
+              );
+              try {
+                await moveDir(quarantine.quarantinePath, worktreeDir);
+                getLog().warn(
+                  {
+                    worktreePath: worktreeDir,
+                    quarantinePath: quarantine.quarantinePath,
+                    envId: env.id,
+                  },
+                  'worktree_sweep_env_quarantine_rolled_back'
+                );
+              } catch (rollbackError) {
+                const rollbackErr = rollbackError as Error;
+                report.quarantined.push(quarantine.quarantinePath);
+                report.quarantinedBytes += quarantine.bytes;
+                report.errors.push({ path: quarantine.quarantinePath, error: rollbackErr.message });
+                getLog().error(
+                  {
+                    err: rollbackErr,
+                    worktreePath: worktreeDir,
+                    quarantinePath: quarantine.quarantinePath,
+                    envId: env.id,
+                  },
+                  'worktree_sweep_env_quarantine_rollback_failed'
+                );
+              }
+            }
+          } catch (error) {
+            const err = error as Error;
+            report.errors.push({ path: worktreeDir, error: err.message });
+            getLog().error(
+              { err, worktreePath: worktreeDir, envId: env.id },
+              'worktree_sweep_quarantine_failed'
+            );
+          }
           continue;
         }
 
-        if (
-          await hasActiveSessionForEnvironment(env.id, getConversationsUsingEnv, getActiveSession)
-        ) {
-          report.skipped.push({ path: worktreeDir, reason: 'env_has_active_session' });
-          getLog().warn(
-            { worktreePath: worktreeDir, envId: env.id, reason: 'env_has_active_session' },
-            'worktree_sweep_env_only_skipped'
-          );
-          continue;
-        }
-
+        // No run row AND no env row: Archon's own bookkeeping has nothing on this
+        // worktree at all, so there is no created_at to prove how old it is. This is
+        // also the window a worktree sits in while it is still being provisioned --
+        // checked out (possibly at an OLD commit) but its env/run row not yet written.
+        // Judging it by commit date alone would quarantine it mid-provision, so here
+        // directory mtime DOES participate: the worktree is as recent as the newest of
+        // its last commit and its mtime. mtime only ever makes an unmatched worktree
+        // look newer, never older, and the uncommitted-work guard below still applies
+        // once it does age out. The env-backed path above keeps mtime out because it
+        // has created_at as durable evidence (the actual 2026-09-22 incident class).
         const lastCommitDate = await getWorktreeLastCommitDate(worktreeDir, getLastCommitDateFn);
-        const envCreatedAt =
-          env.created_at instanceof Date ? env.created_at : new Date(env.created_at);
-        // Directory mtime deliberately does NOT participate here -- see durableActivityDate().
-        // A no-git worktree with no commits falls back to envCreatedAt, which is still real
-        // evidence (the environment row itself has a provable creation time); only in the
-        // theoretical case where neither exists does this collapse to "no evidence", and an
-        // absent active session (already checked above) means it is immediately reclaimable.
-        const activityDate = durableActivityDate(lastCommitDate, envCreatedAt);
-        const ageMs = activityDate ? now.getTime() - activityDate.getTime() : Infinity;
-        if (ageMs <= orphanAgeMs) {
-          report.skipped.push({ path: worktreeDir, reason: 'env_inside_orphan_age' });
-          getLog().warn(
-            { worktreePath: worktreeDir, envId: env.id, reason: 'env_inside_orphan_age' },
-            'worktree_sweep_env_only_skipped'
-          );
+        const activityDate = newestDate(lastCommitDate, dirStat.mtime) ?? dirStat.mtime;
+        if (now.getTime() - activityDate.getTime() <= orphanAgeMs) {
+          report.orphaned.push(worktreeDir);
+          getLog().warn({ worktreePath: worktreeDir }, 'worktree_sweep_orphaned_worktree');
           continue;
         }
 
-        // Age says reclaim and no session owns it -- but session absence does not prove
-        // the tree holds no work. Genuine uncommitted changes (modified, staged, or
-        // untracked files) are valuable regardless of commit age and must be preserved.
-        // Only a clean tree, proven by a successful git status, may be reclaimed.
+        // Same rule as the env-backed path: old is not the same as empty. A worktree
+        // Archon has no record of can still hold someone's uncommitted work.
         const workVerdict = await checkUncommittedWork(worktreeDir, hasUncommittedWorkFn);
         if (workVerdict.preserve) {
-          const reason = `env_${workVerdict.reason}`;
+          const reason = `unmatched_${workVerdict.reason}`;
+          report.orphaned.push(worktreeDir);
           report.skipped.push({ path: worktreeDir, reason });
           getLog().warn(
             {
               worktreePath: worktreeDir,
-              envId: env.id,
               reason,
               ...(workVerdict.error ? { error: workVerdict.error } : {}),
             },
-            'worktree_sweep_env_only_skipped'
+            'worktree_sweep_orphaned_worktree'
           );
+          continue;
+        }
+        if (await hasUnpushedCommitsFn(worktreeDir)) {
+          report.orphaned.push(worktreeDir);
+          report.skipped.push({ path: worktreeDir, reason: 'unmatched_unpushed_or_unknown' });
           continue;
         }
 
@@ -508,165 +728,88 @@ export async function sweepTerminalWorkflowWorktrees(
             getCanonicalRepoPathFn,
             pruneWorktree,
           });
-          try {
-            await updateEnvStatus(env.id, 'destroyed');
-            report.quarantined.push(quarantine.quarantinePath);
-            report.quarantinedBytes += quarantine.bytes;
-            getLog().info(
-              {
-                worktreePath: worktreeDir,
-                quarantinePath: quarantine.quarantinePath,
-                class: 'env-only',
-                reason: 'older_than_orphan_age',
-                envId: env.id,
-                bytes: quarantine.bytes,
-              },
-              'worktree_sweep_quarantined_worktree'
-            );
-          } catch (error) {
-            const err = error as Error;
-            report.errors.push({ path: worktreeDir, error: err.message });
-            getLog().error(
-              { err, worktreePath: worktreeDir, envId: env.id },
-              'worktree_sweep_env_status_update_failed'
-            );
-            try {
-              await moveDir(quarantine.quarantinePath, worktreeDir);
-              getLog().warn(
-                {
-                  worktreePath: worktreeDir,
-                  quarantinePath: quarantine.quarantinePath,
-                  envId: env.id,
-                },
-                'worktree_sweep_env_quarantine_rolled_back'
-              );
-            } catch (rollbackError) {
-              const rollbackErr = rollbackError as Error;
-              report.quarantined.push(quarantine.quarantinePath);
-              report.quarantinedBytes += quarantine.bytes;
-              report.errors.push({ path: quarantine.quarantinePath, error: rollbackErr.message });
-              getLog().error(
-                {
-                  err: rollbackErr,
-                  worktreePath: worktreeDir,
-                  quarantinePath: quarantine.quarantinePath,
-                  envId: env.id,
-                },
-                'worktree_sweep_env_quarantine_rollback_failed'
-              );
-            }
-          }
+          report.quarantined.push(quarantine.quarantinePath);
+          report.quarantinedBytes += quarantine.bytes;
+          getLog().info(
+            {
+              worktreePath: worktreeDir,
+              quarantinePath: quarantine.quarantinePath,
+              class: 'unmatched',
+              reason: 'older_than_orphan_age',
+              bytes: quarantine.bytes,
+            },
+            'worktree_sweep_quarantined_worktree'
+          );
         } catch (error) {
           const err = error as Error;
+          report.orphaned.push(worktreeDir);
           report.errors.push({ path: worktreeDir, error: err.message });
-          getLog().error(
-            { err, worktreePath: worktreeDir, envId: env.id },
-            'worktree_sweep_quarantine_failed'
-          );
+          getLog().error({ err, worktreePath: worktreeDir }, 'worktree_sweep_quarantine_failed');
         }
         continue;
       }
 
-      // No run row AND no env row: Archon's own bookkeeping has nothing on this
-      // worktree at all, so there is no created_at to prove how old it is. This is
-      // also the window a worktree sits in while it is still being provisioned --
-      // checked out (possibly at an OLD commit) but its env/run row not yet written.
-      // Judging it by commit date alone would quarantine it mid-provision, so here
-      // directory mtime DOES participate: the worktree is as recent as the newest of
-      // its last commit and its mtime. mtime only ever makes an unmatched worktree
-      // look newer, never older, and the uncommitted-work guard below still applies
-      // once it does age out. The env-backed path above keeps mtime out because it
-      // has created_at as durable evidence (the actual 2026-09-22 incident class).
-      const lastCommitDate = await getWorktreeLastCommitDate(worktreeDir, getLastCommitDateFn);
-      const activityDate = newestDate(lastCommitDate, dirStat.mtime) ?? dirStat.mtime;
-      if (now.getTime() - activityDate.getTime() <= orphanAgeMs) {
-        report.orphaned.push(worktreeDir);
-        getLog().warn({ worktreePath: worktreeDir }, 'worktree_sweep_orphaned_worktree');
+      if (!isTerminalStatus(run.status)) {
+        report.skipped.push({ path: worktreeDir, runId: run.id, reason: `status:${run.status}` });
         continue;
       }
 
-      // Same rule as the env-backed path: old is not the same as empty. A worktree
-      // Archon has no record of can still hold someone's uncommitted work.
+      const ageMs = completedAtAgeMs(run.completed_at, now);
+      if (ageMs === null) {
+        report.skipped.push({ path: worktreeDir, runId: run.id, reason: 'missing_terminal_at' });
+        continue;
+      }
+      if (ageMs < gracePeriodMs) {
+        report.skipped.push({ path: worktreeDir, runId: run.id, reason: 'inside_grace_period' });
+        continue;
+      }
+
+      const terminalEnv = envsByPath.get(normalizedPath);
+      if (
+        terminalEnv &&
+        (await hasActiveSessionForEnvironment(
+          terminalEnv.id,
+          getConversationsUsingEnv,
+          getActiveSession
+        ))
+      ) {
+        report.skipped.push({ path: worktreeDir, runId: run.id, reason: 'env_has_active_session' });
+        continue;
+      }
       const workVerdict = await checkUncommittedWork(worktreeDir, hasUncommittedWorkFn);
       if (workVerdict.preserve) {
-        const reason = `unmatched_${workVerdict.reason}`;
-        report.orphaned.push(worktreeDir);
-        report.skipped.push({ path: worktreeDir, reason });
-        getLog().warn(
-          {
-            worktreePath: worktreeDir,
-            reason,
-            ...(workVerdict.error ? { error: workVerdict.error } : {}),
-          },
-          'worktree_sweep_orphaned_worktree'
-        );
+        report.skipped.push({ path: worktreeDir, runId: run.id, reason: workVerdict.reason });
+        continue;
+      }
+      if (await hasUnpushedCommitsFn(worktreeDir)) {
+        report.skipped.push({ path: worktreeDir, runId: run.id, reason: 'unpushed_or_unknown' });
         continue;
       }
 
       try {
-        const quarantine = await quarantineWorktreeDir({
-          workspacesRoot,
-          quarantineRoot,
-          worktreePath: worktreeDir,
-          now,
-          moveDir,
-          getCanonicalRepoPathFn,
-          pruneWorktree,
-        });
-        report.quarantined.push(quarantine.quarantinePath);
-        report.quarantinedBytes += quarantine.bytes;
+        const bytes = await directorySize(worktreeDir);
+        await destroyWorktree(worktreeDir);
+        report.removed.push(worktreeDir);
+        report.bytesFreed += bytes;
         getLog().info(
-          {
-            worktreePath: worktreeDir,
-            quarantinePath: quarantine.quarantinePath,
-            class: 'unmatched',
-            reason: 'older_than_orphan_age',
-            bytes: quarantine.bytes,
-          },
-          'worktree_sweep_quarantined_worktree'
+          { worktreePath: worktreeDir, runId: run.id, bytesFreed: bytes },
+          'worktree_sweep_removed'
         );
       } catch (error) {
         const err = error as Error;
-        report.orphaned.push(worktreeDir);
-        report.errors.push({ path: worktreeDir, error: err.message });
-        getLog().error({ err, worktreePath: worktreeDir }, 'worktree_sweep_quarantine_failed');
+        report.errors.push({ path: worktreeDir, runId: run.id, error: err.message });
+        getLog().error(
+          { err, worktreePath: worktreeDir, runId: run.id },
+          'worktree_sweep_remove_failed'
+        );
       }
-      continue;
     }
-
-    if (!isTerminalStatus(run.status)) {
-      report.skipped.push({ path: worktreeDir, runId: run.id, reason: `status:${run.status}` });
-      continue;
-    }
-
-    const ageMs = completedAtAgeMs(run.completed_at, now);
-    if (ageMs === null) {
-      report.skipped.push({ path: worktreeDir, runId: run.id, reason: 'missing_terminal_at' });
-      continue;
-    }
-    if (ageMs < gracePeriodMs) {
-      report.skipped.push({ path: worktreeDir, runId: run.id, reason: 'inside_grace_period' });
-      continue;
-    }
-
-    try {
-      const bytes = await directorySize(worktreeDir);
-      await destroyWorktree(worktreeDir);
-      report.removed.push(worktreeDir);
-      report.bytesFreed += bytes;
-      getLog().info(
-        { worktreePath: worktreeDir, runId: run.id, bytesFreed: bytes },
-        'worktree_sweep_removed'
-      );
-    } catch (error) {
-      const err = error as Error;
-      report.errors.push({ path: worktreeDir, runId: run.id, error: err.message });
-      getLog().error(
-        { err, worktreePath: worktreeDir, runId: run.id },
-        'worktree_sweep_remove_failed'
-      );
-    }
-  }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(maintenanceContext.concurrency, worktreeDirs.length) }, () =>
+      worker()
+    )
+  );
 
   const reportPayload = {
     scanned: report.scanned,

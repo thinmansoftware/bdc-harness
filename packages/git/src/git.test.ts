@@ -710,6 +710,10 @@ branch refs/heads/feature/auth
 
       expect(result).toBe(true);
       expect(execSpy).toHaveBeenCalledWith('git', [
+        '-c',
+        'core.preloadIndex=false',
+        '-c',
+        'index.threads=1',
         '-C',
         '/workspace/repo',
         'status',
@@ -757,6 +761,32 @@ branch refs/heads/feature/auth
       const result = await git.hasUncommittedChanges('/workspace/locked');
 
       expect(result).toBe(true);
+    });
+
+    test('does not repeat per-path errors after the maintenance limiter trips', async () => {
+      mockLogger.error.mockClear();
+      const error = new Error('maintenance git unavailable for this cleanup run');
+      error.name = 'MaintenanceGitUnavailableError';
+      const execute = mock(async () => Promise.reject(error));
+
+      expect(await git.hasUncommittedChanges('/workspace/later', { execute })).toBe(true);
+      expect(mockLogger.error).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'uncommitted_changes_check_failed_assuming_dirty'
+      );
+    });
+
+    test('does not log unpushed-check warnings after the maintenance limiter trips', async () => {
+      mockLogger.warn.mockClear();
+      const error = new Error('maintenance git unavailable for this cleanup run');
+      error.name = 'MaintenanceGitUnavailableError';
+      const execute = mock(async () => Promise.reject(error));
+
+      expect(await git.hasUnpushedCommits('/workspace/later', { execute })).toBe(true);
+      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'unpushed_commits_check_failed_assuming_unpushed'
+      );
     });
   });
 
