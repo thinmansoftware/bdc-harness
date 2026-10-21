@@ -1,7 +1,7 @@
 import { unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import { getDatabase } from '@archon/core/db/connection';
@@ -251,6 +251,31 @@ function relayRecoveryFixture(
   return { deps, source, neighbor, relays };
 }
 
+const dutyOfficerProcessEnvKeys = ['DUTY_OFFICER_GH_NUDGE', 'GH_TOKEN', 'GITHUB_TOKEN'] as const;
+
+type DutyOfficerProcessEnvKey = (typeof dutyOfficerProcessEnvKeys)[number];
+
+function readDutyOfficerProcessEnv(): Record<DutyOfficerProcessEnvKey, string | undefined> {
+  return {
+    DUTY_OFFICER_GH_NUDGE: process.env.DUTY_OFFICER_GH_NUDGE,
+    GH_TOKEN: process.env.GH_TOKEN,
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+  };
+}
+
+function writeDutyOfficerProcessEnv(
+  prior: Record<DutyOfficerProcessEnvKey, string | undefined>
+): void {
+  for (const key of dutyOfficerProcessEnvKeys) {
+    const value = prior[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+// Captured before any test in this file mutates the process environment.
+const dutyOfficerProcessEnvBeforeFile = readDutyOfficerProcessEnv();
+
 afterEach(() => {
   stopDutyOfficerClock();
   resetSecurityDetectorStateForTests();
@@ -263,6 +288,13 @@ afterEach(() => {
   delete process.env.GITHUB_TOKEN;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS;
   delete process.env.ARCHON_BUILD_SHA;
+});
+
+afterAll(() => {
+  // afterEach clears the GitHub nudge keys so cases inside this file stay
+  // hermetic. Put the pre-file values back so later files in the same Bun
+  // process do not observe that clear.
+  writeDutyOfficerProcessEnv(dutyOfficerProcessEnvBeforeFile);
 });
 
 const priorDetectorResult: SecurityDetectorResult = {
@@ -1205,26 +1237,28 @@ describe('duty officer clock', () => {
 });
 
 test('duty officer sqlite race isolation', async () => {
+  const prior = readDutyOfficerProcessEnv();
   const privatePath = join(
     tmpdir(),
     `duty-officer-sqlite-race-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
   );
-  const privateDb = new SqliteAdapter(privatePath);
-  await privateDb.close();
-  process.env.DUTY_OFFICER_GH_NUDGE = 'true';
-  process.env.GH_TOKEN = 'synthetic-pat';
-  delete process.env.GITHUB_TOKEN;
-  const bodies = ['[]', JSON.stringify({ id: 1 })];
-  let fetchCalls = 0;
-  const fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async () => {
-    const body = bodies[Math.min(fetchCalls, bodies.length - 1)] ?? '[]';
-    fetchCalls += 1;
-    return new Response(body, {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  });
+  let fetchStub: { mockRestore: () => void } | null = null;
   try {
+    const privateDb = new SqliteAdapter(privatePath);
+    await privateDb.close();
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    delete process.env.GITHUB_TOKEN;
+    const bodies = ['[]', JSON.stringify({ id: 1 })];
+    let fetchCalls = 0;
+    fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      const body = bodies[Math.min(fetchCalls, bodies.length - 1)] ?? '[]';
+      fetchCalls += 1;
+      return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
     const live = getDatabase();
     expect(live).not.toBe(privateDb);
     await live.query('SELECT 1');
@@ -1235,7 +1269,8 @@ test('duty officer sqlite race isolation', async () => {
       )
     ).toBe(true);
   } finally {
-    fetchStub.mockRestore();
+    fetchStub?.mockRestore();
+    writeDutyOfficerProcessEnv(prior);
     for (const suffix of ['', '-wal', '-shm']) {
       try {
         unlinkSync(privatePath + suffix);

@@ -95,7 +95,19 @@ function isRewindProbe(value: Record<string, unknown>): value is RewindProbe {
   );
 }
 
-function parseProbe(line: string): ProbePayload {
+function probeResultLines(stdout: string): string[] {
+  return stdout
+    .split('\n')
+    .map(item => item.trim())
+    .filter(item => item.startsWith('PROBE='));
+}
+
+function parseProbe(stdout: string): ProbePayload {
+  const lines = probeResultLines(stdout);
+  if (lines.length !== 1) {
+    throw new Error(`expected exactly one PROBE= line, found ${lines.length}: ${stdout}`);
+  }
+  const line = lines[0] ?? '';
   const parsed: unknown = JSON.parse(line.slice('PROBE='.length));
   if (!isRecord(parsed)) throw new Error(`unexpected probe payload: ${line}`);
   if (isPageProbe(parsed) || isWalkProbe(parsed) || isRewindProbe(parsed)) return parsed;
@@ -119,12 +131,13 @@ function runProbe(scenario: string): ProbePayload {
         `SQLite probe exited ${proc.exitCode}: ${proc.stderr.toString()} ${proc.stdout.toString()}`
       );
     }
-    const line = proc.stdout
-      .toString()
-      .split('\n')
-      .find(item => item.startsWith('PROBE='));
-    if (!line) throw new Error(`missing probe output: ${proc.stderr.toString()}`);
-    return parseProbe(line);
+    const stdout = proc.stdout.toString();
+    try {
+      return parseProbe(stdout);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`${message}; stderr: ${proc.stderr.toString()}`);
+    }
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -135,6 +148,20 @@ function runPageProbe(scenario: string): PageProbe {
   if (payload.kind !== 'page') throw new Error(`expected page probe, got ${payload.kind}`);
   return payload;
 }
+
+describe('probe result line protocol', () => {
+  test('requires exactly one PROBE= line', () => {
+    const payload = parseProbe('log line\nPROBE={"kind":"rewind","afterSeq":1,"cursor":2}\n');
+    expect(payload).toEqual({ kind: 'rewind', afterSeq: 1, cursor: 2 });
+
+    expect(() => parseProbe('no probe here\n')).toThrow(/exactly one PROBE= line, found 0/);
+    expect(() =>
+      parseProbe(
+        'PROBE={"kind":"rewind","afterSeq":1,"cursor":2}\nPROBE={"kind":"rewind","afterSeq":3,"cursor":4}\n'
+      )
+    ).toThrow(/exactly one PROBE= line, found 2/);
+  });
+});
 
 describe('listRealSweepCandidates over a block of unparseable rows', () => {
   test('a page of only-malformed rows reports its raw position, not an empty list', () => {
