@@ -8,6 +8,7 @@ import {
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
+import { readCascadeRecordById } from '@archon/smart-cauldron/frontier-approval';
 
 const log = createLogger('taskmaster/expectations');
 const DEFAULT_RETRY_DELAY_MS = 15 * 60 * 1000;
@@ -36,6 +37,115 @@ type EvidenceScalar = string | number | boolean;
 export interface EvidenceResult {
   ok: boolean;
   pointer: string | null;
+}
+
+export interface CascadeEvidenceDeps {
+  readCascade?: typeof readCascadeRecordById;
+  query?: ExpectationDeps['query'];
+}
+
+/** Exact internal run evidence for usefulness grading; no new registration kind. */
+export async function readCascadeWorkflowEvidence(
+  identity: { cascadeId: string; woId: string; project: string | undefined },
+  deps: CascadeEvidenceDeps = {}
+): Promise<{ earliestRunId: string; status: string; prOpened: boolean }> {
+  try {
+    if (
+      [identity.cascadeId, identity.woId, identity.project].some(
+        value => typeof value !== 'string' || !value.trim()
+      )
+    )
+      throw new Error('missing identity');
+    const read = deps.readCascade ?? readCascadeRecordById;
+    const query =
+      deps.query ??
+      // Generic query results preserve the existing database dependency contract.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters
+      (<T>(sql: string, params?: unknown[]): Promise<{ rows: readonly T[] }> =>
+        getDatabase().query<T>(sql, params));
+    const visited = new Set<string>();
+    const runs = new Map<string, string>();
+    let cascadeId: string | null = identity.cascadeId;
+    while (cascadeId !== null) {
+      // Follow explicit approval links only; bounded even for corrupted records.
+      if (visited.has(cascadeId) || visited.size >= 8) throw new Error('invalid cascade chain');
+      visited.add(cascadeId);
+      const record = await read(cascadeId);
+      if (
+        record?.cascadeId !== cascadeId ||
+        record.woId !== identity.woId ||
+        record.project !== identity.project ||
+        typeof record.request?.dryRun !== 'boolean' ||
+        record.request.dryRun ||
+        !Array.isArray(record.attempts)
+      )
+        throw new Error('invalid cascade scope');
+      for (const attempt of record.attempts) {
+        if (!attempt || typeof attempt.workflowName !== 'string' || !attempt.workflowName)
+          throw new Error('invalid attempt');
+        if (attempt.runId === null) continue;
+        if (typeof attempt.runId !== 'string' || !attempt.runId.trim())
+          throw new Error('invalid run id');
+        const prior = runs.get(attempt.runId);
+        if (prior !== undefined && prior !== attempt.workflowName)
+          throw new Error('conflicting run binding');
+        runs.set(attempt.runId, attempt.workflowName);
+      }
+      if (
+        record.frontierApproval !== undefined &&
+        (!record.frontierApproval ||
+          typeof record.frontierApproval !== 'object' ||
+          !Object.hasOwn(record.frontierApproval, 'resumeCascadeId'))
+      )
+        throw new Error('invalid frontier packet');
+      const resume: unknown = record.frontierApproval?.resumeCascadeId;
+      if (resume !== undefined && resume !== null && (typeof resume !== 'string' || !resume.trim()))
+        throw new Error('invalid resume');
+      cascadeId = resume ?? null;
+    }
+    // A valid admission without an actual workflow ID is still not ready.
+    if (runs.size === 0) throw new Error('no actual run');
+    let firstRunId: string | undefined;
+    let status: string | undefined;
+    let completed = false;
+    let prOpened = false;
+    for (const [runId, workflowName] of runs) {
+      const result = await query<{
+        id: string;
+        workflow_name: string;
+        status: string;
+        metadata: string | null;
+      }>(
+        'SELECT id, workflow_name, status, metadata FROM remote_agent_workflow_runs WHERE id = $1 AND workflow_name = $2',
+        [runId, workflowName]
+      );
+      const row = result.rows[0];
+      if (
+        result.rows.length !== 1 ||
+        row?.id !== runId ||
+        row.workflow_name !== workflowName ||
+        typeof row.status !== 'string' ||
+        !row.status
+      )
+        throw new Error('unproven workflow identity');
+      firstRunId ??= runId;
+      status = row.status;
+      completed ||= row.status === 'completed';
+      try {
+        // Preserve existing PR metadata semantics; this phase changes ownership
+        // binding, not the metadata producer's evidence contract.
+        const metadata = JSON.parse(row.metadata ?? '{}') as Record<string, unknown>;
+        prOpened ||= Boolean(metadata.prUrl ?? metadata.pr_url ?? metadata.pullRequestUrl);
+      } catch {
+        // Malformed metadata proves no PR; known workflow status stays usable.
+      }
+    }
+    if (!firstRunId || !status) throw new Error('no proven workflow');
+    return { earliestRunId: firstRunId, status: completed ? 'completed' : status, prOpened };
+  } catch {
+    // UNKNOWN must throw so the existing grading catch skips noise grading too.
+    throw new Error('taskmaster_cascade_evidence_unknown');
+  }
 }
 
 export interface ExpectationDeps {
