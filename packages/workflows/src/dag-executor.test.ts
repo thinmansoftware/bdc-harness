@@ -1195,10 +1195,13 @@ describe('executeDagWorkflow -- loop idle ceiling override', () => {
     await runIdleWorkflow(store, 400);
 
     const elapsedMs = performance.now() - startedAt;
-    const failed = recordedEvents(store).find(
-      e => e.event_type === 'node_failed' && e.step_name === 'diff-repair'
+    const failedIteration = recordedEvents(store).find(
+      e => e.event_type === 'loop_iteration_failed' && e.step_name === 'diff-repair'
     );
-    expect(String(failed?.data?.error ?? '')).toContain('exceeded idle timeout (400ms)');
+    expect(String(failedIteration?.data?.error ?? '')).toContain('exceeded idle timeout (400ms)');
+    expect(failedIteration?.data?.iteration).toBe(1);
+    expect(failedIteration?.data?.idleTimedOut).toBe(true);
+    expect(failedIteration?.data?.idleTimeoutMs).toBe(400);
     expect(elapsedMs).toBeGreaterThanOrEqual(400);
     expect(elapsedMs).toBeLessThan(2000);
   });
@@ -1213,10 +1216,13 @@ describe('executeDagWorkflow -- loop idle ceiling override', () => {
 
     await runIdleWorkflow(store);
 
-    const failed = recordedEvents(store).find(
-      e => e.event_type === 'node_failed' && e.step_name === 'diff-repair'
+    const failedIteration = recordedEvents(store).find(
+      e => e.event_type === 'loop_iteration_failed' && e.step_name === 'diff-repair'
     );
-    expect(String(failed?.data?.error ?? '')).toContain('exceeded idle timeout (50ms)');
+    expect(String(failedIteration?.data?.error ?? '')).toContain('exceeded idle timeout (50ms)');
+    expect(failedIteration?.data?.iteration).toBe(1);
+    expect(failedIteration?.data?.idleTimedOut).toBe(true);
+    expect(failedIteration?.data?.idleTimeoutMs).toBe(50);
   });
 
   it('idleCeilingProof default resolves to exactly 180000 ms', () => {

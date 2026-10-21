@@ -4696,7 +4696,33 @@ async function executeLoopNode(
         iterationAttemptCompleted = true;
       }
       const idleError = `Loop '${node.id}' iteration ${String(i)} exceeded idle timeout (${String(effectiveIdleTimeout)}ms)`;
+      const iterationDuration = Date.now() - iterationStart;
       await safeSendMessage(platform, conversationId, idleError, msgContext);
+      getWorkflowEventEmitter().emit({
+        type: 'loop_iteration_failed',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        iteration: i,
+        error: idleError,
+      });
+      await deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'loop_iteration_failed',
+          step_name: node.id,
+          data: {
+            iteration: i,
+            error: idleError,
+            duration: iterationDuration,
+            nodeId: node.id,
+            idleTimedOut: true,
+            idleTimeoutMs: effectiveIdleTimeout,
+            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+          },
+        })
+        .catch((evtErr: Error) => {
+          logEventStoreError(evtErr, i);
+        });
       await persistLoopNodeFailed(idleError);
       return {
         state: 'failed',
