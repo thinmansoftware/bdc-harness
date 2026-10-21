@@ -79,6 +79,10 @@ function utcMinutesAgo(minutes: number): string {
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
 }
 
+function utcSecondsAgo(seconds: number): string {
+  return utcMinutesAgo(seconds / 60);
+}
+
 interface Fixture {
   readonly root: string;
   readonly origin: string;
@@ -212,21 +216,92 @@ describe('repair-target worktree reclaim', () => {
     expect(worktrees(fixture.caller)).toContain(holder);
   }, 30000);
 
-  it('Test 7b: a terminal holder only two minutes old is refused', () => {
+  it('Test 4 (F3a): a recent completed holder stays age-gated and the reason reaches STDERR', () => {
+    // WO-HARNESS-REPAIR-PATH-HOTFIX-01: completed (and any non-abandoned) status keeps
+    // the RTW_MIN_AGE_SECONDS gate. The refusal reason must appear on STDERR so the
+    // event store records it, not only on STDOUT.
     const fixture = makeFixture({ hold: true, withOther: false });
     roots.push(fixture.root);
     const holder = holderPath(fixture.holder);
     writeRuns(fixture.dbPath, [
       {
         id: 'abcd1234ef567890',
-        status: 'failed',
+        status: 'completed',
         working_path: holder,
-        completed_at: utcMinutesAgo(2),
+        completed_at: utcSecondsAgo(15),
       },
     ]);
     const result = runCheckout(fixture, fixture.dbPath);
     expect(result.exitCode, show(result)).toBe(1);
     expect(result.stdout).toContain('repair_target_branch_held:');
+    expect(result.stdout).toContain('completed_at is only');
+    expect(result.stderr).toContain('repair_target_branch_held:');
+    expect(result.stderr).toContain('completed_at is only');
+    expect(worktrees(fixture.caller)).toContain(holder);
+  }, 30000);
+
+  it('Test 3 (F3a): a recent escalated holder is reclaimed despite the age gate', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'escalated',
+        working_path: holder,
+        completed_at: utcSecondsAgo(15),
+      },
+    ]);
+    const result = runCheckout(fixture, fixture.dbPath);
+    if (result.exitCode !== 0) throw new Error(show(result));
+    expect(result.stdout).toContain('repair_target_worktree_reclaimed:');
+    expect(worktrees(fixture.caller)).not.toContain(holder);
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], fixture.caller).trim()).toBe('feat/x');
+  }, 30000);
+
+  it('Test 5a (F3a): a recent failed holder with a live cwd is still refused', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    const nested = join(holder, 'nested');
+    mkdirSync(nested);
+    const pidDir = join(fixture.procRoot, '4242');
+    mkdirSync(pidDir);
+    symlinkSync(nested, join(pidDir, 'cwd'));
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: holder,
+        completed_at: utcSecondsAgo(15),
+      },
+    ]);
+    const result = runCheckout(fixture, fixture.dbPath);
+    expect(result.exitCode, show(result)).toBe(1);
+    expect(result.stdout).toContain('repair_target_branch_held:');
+    expect(result.stdout).toContain('live process cwd under holder');
+    expect(result.stderr).toContain('live process cwd under holder');
+    expect(worktrees(fixture.caller)).toContain(holder);
+  }, 30000);
+
+  it('Test 5b (F3a): a recent cancelled holder with a dirty tree is still refused', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    writeFileSync(join(holder, 'dirty.txt'), 'dirty\n');
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'cancelled',
+        working_path: holder,
+        completed_at: utcSecondsAgo(15),
+      },
+    ]);
+    const result = runCheckout(fixture, fixture.dbPath);
+    expect(result.exitCode, show(result)).toBe(1);
+    expect(result.stdout).toContain('repair_target_branch_held:');
+    expect(result.stdout).toContain('worktree is dirty');
+    expect(result.stderr).toContain('worktree is dirty');
     expect(worktrees(fixture.caller)).toContain(holder);
   }, 30000);
 

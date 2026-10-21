@@ -228,10 +228,10 @@ describe('bundled-defaults', () => {
       ];
       const OPEN_MODEL = [
         'bdc-feature-development-fusion-cx-qwen',
-        'bdc-feature-development-grok',
         'bdc-feature-development-zero-open',
         'bdc-feature-development-zero',
       ];
+      const EXTENDED_IMPLEMENT_IDLE = ['bdc-feature-development-grok'];
       const OUT_OF_SCOPE_NODES = ['opus-repair', 'diff-review', 'diff-review-final'];
 
       for (const name of REASONING_BOUND) {
@@ -276,7 +276,29 @@ describe('bundled-defaults', () => {
         });
       }
 
-      for (const name of [...REASONING_BOUND, ...OPEN_MODEL]) {
+      for (const name of EXTENDED_IMPLEMENT_IDLE) {
+        it(`${name} keeps the default plan-review idle timeout and extends implement`, () => {
+          withDefaultLoopIterationIdleEnv(() => {
+            const content = BUNDLED_WORKFLOWS[name];
+            const workflow = parseBundledWorkflow(name);
+            const planReview = extractWorkflowNode(content, 'plan-review');
+            const implement = extractWorkflowNode(content, 'implement');
+            const planReviewNode = getWorkflowNode(workflow, 'plan-review');
+            const implementNode = getWorkflowNode(workflow, 'implement');
+
+            expect(planReview).not.toContain('idle_timeout: 570000');
+            expect(planReviewNode.idle_timeout).toBeUndefined();
+            expect(resolveLoopIterationIdleTimeoutMs(planReviewNode.idle_timeout)).toBe(
+              LOOP_ITERATION_IDLE_TIMEOUT_MS
+            );
+            expect(implement).toContain('idle_timeout: 570000');
+            expect(implementNode.idle_timeout).toBe(570000);
+            expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(570000);
+          });
+        });
+      }
+
+      for (const name of [...REASONING_BOUND, ...OPEN_MODEL, ...EXTENDED_IMPLEMENT_IDLE]) {
         for (const nodeId of OUT_OF_SCOPE_NODES) {
           it(`${name} does not apply the plan-review/implement idle timeout to ${nodeId}`, () => {
             withDefaultLoopIterationIdleEnv(() => {
@@ -295,7 +317,7 @@ describe('bundled-defaults', () => {
         }
       }
 
-      for (const name of [...REASONING_BOUND, ...OPEN_MODEL]) {
+      for (const name of [...REASONING_BOUND, ...OPEN_MODEL, ...EXTENDED_IMPLEMENT_IDLE]) {
         it(`${name} diffRepairIdleCeiling sets the diff-repair idle and wall ceilings`, () => {
           const content = BUNDLED_WORKFLOWS[name];
           const nodeSource = extractWorkflowNode(content, 'diff-repair');

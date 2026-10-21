@@ -34,10 +34,17 @@ const EXPECTED_LANES = [
 interface LaneNode {
   readonly id: string;
   readonly depends_on?: readonly string[];
+  readonly when?: string;
   readonly bash?: string;
   readonly prompt?: string;
+  readonly idle_timeout?: number;
   readonly loop?: { readonly prompt?: string };
 }
+
+const CURSOR_GROK_LANES = [
+  'bdc-feature-development-cursor.yaml',
+  'bdc-feature-development-grok.yaml',
+];
 
 function laneFiles(): string[] {
   return readdirSync(LANES_DIR)
@@ -124,6 +131,58 @@ describe('repair-target lane wiring', () => {
       expect(commit.bash ?? '', file).toContain('rta_plan_authorizes');
       expect(commit.bash ?? '', file).toContain('PLAN_REVIEW_RAW');
       expect(commit.bash ?? '', file).not.toContain('grep -Eq "repair_target_authorized_by_spec');
+    }
+  });
+
+  it('Test 7 (repair-path-hotfix): node-output capture, gates, and idle timeouts', () => {
+    for (const file of EXPECTED_LANES) {
+      const yaml = readLane(file);
+      const nodes = nodesOf(file);
+
+      // 1a: exactly two byte-identical reads of the decide handoff file, zero old heredocs.
+      expect(yaml.split('ARCHON_NODE_OUT/decide-push-target.out').length - 1, file).toBe(2);
+      expect(yaml, file).not.toContain('BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET');
+
+      // 1a: commit-and-push reads both handoff files and fails closed on STDERR.
+      const commit = nodeOf(nodes, 'commit-and-push', file).bash ?? '';
+      expect(commit, file).toContain('DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"');
+      expect(commit, file).toContain('PLAN_REVIEW_OUT_FILE="$ARCHON_NODE_OUT/plan-review.out"');
+      expect(commit, file).toContain('if [ ! -r "$DECIDE_OUT_FILE" ]; then');
+      expect(commit, file).toContain('if [ ! -r "$PLAN_REVIEW_OUT_FILE" ]; then');
+      expect(commit, file).toContain('failing closed (F1)." >&2');
+      expect(commit, file).toContain('DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")');
+      expect(commit, file).toContain('PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")');
+
+      // 1a: open-pr-if-needed reads the decide handoff file in every lane.
+      const openPr = yaml.split('  - id: open-pr-if-needed\n')[1]?.split('\n  - id: ')[0] ?? '';
+      expect(openPr, file).toContain('ARCHON_NODE_OUT/decide-push-target.out');
+
+      // 1b: plan-review gates on a non-empty checkout record.
+      const planReview = nodeOf(nodes, 'plan-review', file);
+      expect(planReview.when ?? '', file).toContain(
+        "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
+      );
+      expect(planReview.when ?? '', file).toContain("$checkout-repair-target.output != ''");
+
+      // 1d: patch-pr-body gates on a non-empty open-pr-if-needed output.
+      const patch = nodeOf(nodes, 'patch-pr-body', file);
+      expect(patch.when ?? '', file).toContain("$open-pr-if-needed.output != ''");
+
+      // 1f: head-moved guard adopts an ancestor live head instead of always refusing.
+      expect(commit, file).toContain('git merge-base --is-ancestor "$REPAIR_TARGET_LIVE_OID" HEAD');
+      expect(commit, file).toContain('not an ancestor of HEAD');
+
+      // 1c: idle_timeout: 570000 added to the cursor and grok implement nodes only.
+      // Other lanes keep their pre-existing implement timeout (600000 or none) and must
+      // carry exactly one idle_timeout: 570000 (the diff-repair setting from #1209).
+      const implement = nodeOf(nodes, 'implement', file);
+      if (CURSOR_GROK_LANES.includes(file)) {
+        expect(implement.idle_timeout, file).toBe(570000);
+        expect(yaml.split('idle_timeout: 570000').length - 1, file).toBe(2);
+      } else {
+        expect(implement.idle_timeout, file).not.toBe(570000);
+        expect(yaml.split('idle_timeout: 570000').length - 1, file).toBe(1);
+      }
     }
   });
 

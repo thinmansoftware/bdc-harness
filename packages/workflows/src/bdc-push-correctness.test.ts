@@ -966,6 +966,23 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
     expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
   });
 
+  it('fails closed when the live repair-target head OID is unavailable (empty)', () => {
+    // F2 fail-closed (WO-HARNESS-REPAIR-PATH-HOTFIX-01): an empty live head OID can never
+    // reach the head-moved ancestry check -- the lane refuses earlier at fetch verification.
+    const branch = 'feat/wo-repair-target-01';
+    git(['push', 'origin', `HEAD:${branch}`], worktreeDir);
+    const leaseSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+    const result = bash(REPAIR_TARGET_SELECTION, worktreeDir, {
+      DECIDE_OUTPUT: authorizedDecideOutput(branch),
+      SPEC_TEXT: matchingSpec(branch),
+      CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${leaseSha}`,
+      PATH: fakeGhPath('OPEN', branch, { headRefOid: '' }),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('repair_target_fetch_failed');
+    expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
+  });
+
   it('fails closed on a conflicting repair-target rebase and leaves the worktree idle', () => {
     const branch = 'feat/wo-repair-target-01';
     const initSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
@@ -1490,26 +1507,67 @@ describe('Spec-authorized repair onto wo and Cauldron task branches', () => {
   );
 
   itAcrossRepairLanes(
-    'Test 3: rejects a moved checkout lease and a lease that is not an ancestor',
+    'Test 6 (F2): head-moved guard adopts an ancestor live head and refuses a foreign one',
     targetLane => {
-      const movedLease = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+      const staleLease = 'cccccccccccccccccccccccccccccccccccccccc';
+      // Case (a): the live PR head differs from the checkout lease but IS an ancestor of
+      // HEAD -- the builder's own mid-run commit advanced it. WO-HARNESS-REPAIR-PATH-HOTFIX-01
+      // adopts the live OID as the lease and PROCEEDS instead of refusing its own run.
       for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-        const oid = publishHead(branch);
+        const oid = publishHead(branch); // oid == worktree HEAD, an ancestor of itself
         for (const lane of [targetLane]) {
           const commit = extractCommitSelection(readFileSync(lane, 'utf8'), lane);
-          const label = `${basename(lane)} ${branch} head-moved`;
-          const moved = bash(commit, worktreeDir, {
+          const label = `${basename(lane)} ${branch} ancestor-adopt`;
+          const adopted = bash(commit, worktreeDir, {
             DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
             SPEC_TEXT: matchingRepairSpec(branch),
-            CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${movedLease}`,
+            CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${staleLease}`,
             PATH: fakeGhPath('OPEN', branch, { headRefOid: oid }),
           });
-          if (moved.exitCode === 0) throw new Error(showResult(moved, label));
-          expect(moved.stderr).toContain('repair_target_head_moved');
-          expect(moved.stdout).not.toContain('UNIQUE_BRANCH=');
+          if (adopted.exitCode !== 0) throw new Error(showResult(adopted, label));
+          expect(adopted.stderr).toContain('repair_target_head_moved');
+          expect(adopted.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${oid}`);
+          expect(adopted.stdout).toContain(`UNIQUE_BRANCH=${branch}`);
         }
       }
 
+      // Case (b): the live PR head differs from the lease and is a FOREIGN commit not
+      // reachable from HEAD (a genuine concurrent push). The guard still refuses.
+      for (const branch of ACCEPTED_REPAIR_BRANCHES) {
+        const initSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+        const fileName = `foreign-${branch.replace(/[^A-Za-z0-9]/g, '_')}.txt`;
+        writeFileSync(join(worktreeDir, fileName), 'foreign head\n');
+        git(['add', fileName], worktreeDir);
+        git(['commit', '-m', `foreign ${branch}`], worktreeDir);
+        const foreignSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+        git(['push', 'origin', `HEAD:${branch}`], worktreeDir);
+        git(['reset', '--hard', initSha], worktreeDir);
+        writeFileSync(join(worktreeDir, 'implement.txt'), `run ${branch}\n`);
+        git(['add', 'implement.txt'], worktreeDir);
+        git(['commit', '-m', `implement ${branch}`], worktreeDir);
+        for (const lane of [targetLane]) {
+          const commit = extractCommitSelection(readFileSync(lane, 'utf8'), lane);
+          const label = `${basename(lane)} ${branch} foreign-refuse`;
+          const result = bash(commit, worktreeDir, {
+            DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
+            SPEC_TEXT: matchingRepairSpec(branch),
+            CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${staleLease}`,
+            PATH: fakeGhPath('OPEN', branch, { headRefOid: foreignSha }),
+          });
+          if (result.exitCode === 0) throw new Error(showResult(result, label));
+          expect(result.stdout).toContain('repair_target_head_moved');
+          expect(result.stderr).toContain('repair_target_head_moved');
+          expect(result.stderr).toContain('not an ancestor of HEAD');
+          expect(result.stdout).not.toContain('UNIQUE_BRANCH=');
+        }
+      }
+    },
+    120000
+  );
+
+  itAcrossRepairLanes(
+    'Test 3: rejects a lease that is not an ancestor of HEAD',
+    targetLane => {
       for (const branch of ACCEPTED_REPAIR_BRANCHES) {
         const initSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
         const fileName = `pr-only-${branch.replace(/[^A-Za-z0-9]/g, '_')}.txt`;
