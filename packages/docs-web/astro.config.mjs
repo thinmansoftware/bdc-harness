@@ -1,7 +1,10 @@
 import { defineConfig } from 'astro/config';
+import { unified } from '@astrojs/markdown-remark';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
+  compressHTML: true,
+  markdown: { processor: unified() },
   site: 'https://archon.diy',
   integrations: [
     starlight({
@@ -26,31 +29,31 @@ export default defineConfig({
         { label: '  Roadmap', link: '/roadmap/' },
         {
           label: 'The Book of Archon',
-          autogenerate: { directory: 'book' },
+          items: [{ autogenerate: { directory: 'book' } }],
         },
         {
           label: 'Getting Started',
-          autogenerate: { directory: 'getting-started' },
+          items: [{ autogenerate: { directory: 'getting-started' } }],
         },
         {
           label: 'Guides',
-          autogenerate: { directory: 'guides' },
+          items: [{ autogenerate: { directory: 'guides' } }],
         },
         {
           label: 'Adapters',
-          autogenerate: { directory: 'adapters' },
+          items: [{ autogenerate: { directory: 'adapters' } }],
         },
         {
           label: 'Deployment',
-          autogenerate: { directory: 'deployment' },
+          items: [{ autogenerate: { directory: 'deployment' } }],
         },
         {
           label: 'Reference',
-          autogenerate: { directory: 'reference' },
+          items: [{ autogenerate: { directory: 'reference' } }],
         },
         {
           label: 'Contributing',
-          autogenerate: { directory: 'contributing' },
+          items: [{ autogenerate: { directory: 'contributing' } }],
         },
       ],
       customCss: ['./src/styles/custom.css'],
