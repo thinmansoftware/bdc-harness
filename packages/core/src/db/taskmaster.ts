@@ -216,7 +216,7 @@ export async function listExpectations(filter: {
   }
   const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
   const db = getDatabase();
-  const total = await db.query<{ count: number }>(
+  const total = await db.query<{ count: number | string }>(
     `SELECT COUNT(*) AS count FROM tm_expectations${where}`,
     params
   );
@@ -227,7 +227,7 @@ export async function listExpectations(filter: {
   );
   return {
     rows: rows.rows.map(normalizeExpectation),
-    total: total.rows[0]?.count ?? 0,
+    total: Number(total.rows[0]?.count ?? 0),
   };
 }
 
@@ -249,11 +249,11 @@ export async function listExpectations(filter: {
  * supervisor's own headroom, nor the supervisor the front door's.
  */
 export async function countExternalExpectationsSince(since: string): Promise<number> {
-  const result = await getDatabase().query<{ count: number }>(
+  const result = await getDatabase().query<{ count: number | string }>(
     "SELECT COUNT(*) AS count FROM tm_expectations WHERE registration_key LIKE 'ext:%' AND created_at >= $1",
     [since]
   );
-  return result.rows[0]?.count ?? 0;
+  return Number(result.rows[0]?.count ?? 0);
 }
 
 /**

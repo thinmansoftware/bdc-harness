@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -2186,6 +2186,31 @@ describe('tm_suppression DAL (M-155 exception push)', () => {
 describe('expectation front door (bdc-xo#2007)', () => {
   const spec = JSON.stringify({ kind: 'pr_opened', repo: 'thinmansoftware/fuelglass' });
   const future = (): string => new Date(Date.now() + 86_400_000).toISOString();
+
+  test('normalizes PostgreSQL string counts before serializing the registry response', async () => {
+    const query = spyOn(db, 'query')
+      .mockResolvedValueOnce({ rows: [{ count: '42' }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 });
+    try {
+      const result = await listExpectations({ limit: 10 });
+      expect(result.total).toBe(42);
+      expect(JSON.parse(JSON.stringify(result))).toEqual({ rows: [], total: 42 });
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  test('normalizes PostgreSQL string counts in the external registration count', async () => {
+    const query = spyOn(db, 'query').mockResolvedValueOnce({
+      rows: [{ count: '7' }],
+      rowCount: 1,
+    });
+    try {
+      expect(await countExternalExpectationsSince(new Date(0).toISOString())).toBe(7);
+    } finally {
+      query.mockRestore();
+    }
+  });
 
   test('a caller-supplied key replaces the derived one and is idempotent', async () => {
     const first = await registerExpectationReportingCreation({
