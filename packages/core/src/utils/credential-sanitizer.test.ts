@@ -30,6 +30,16 @@ describe('credential-sanitizer', () => {
       const input = 'https://unknown_token@github.com/user/repo';
       expect(sanitizeCredentials(input)).toBe('https://[REDACTED]@github.com/user/repo');
     });
+
+    it('should sanitize HTTP GitHub URLs regardless of protocol casing', () => {
+      process.env.GH_TOKEN = '';
+      expect(sanitizeCredentials('http://token@github.com/user/repo')).toBe(
+        'http://[REDACTED]@github.com/user/repo'
+      );
+      expect(sanitizeCredentials('HTTPS://token@github.com/user/repo')).toBe(
+        'HTTPS://[REDACTED]@github.com/user/repo'
+      );
+    });
   });
 
   describe('sanitizeError', () => {

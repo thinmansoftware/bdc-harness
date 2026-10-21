@@ -558,6 +558,31 @@ describe('PATCH /api/codebases/:id', () => {
     expect(body.default_branch).toBe('staging');
   });
 
+  test('verifies a branch using a legacy credential-bearing stored GitHub URL', async () => {
+    mockGetCodebase
+      .mockImplementationOnce(async () => ({
+        ...MOCK_CODEBASE,
+        repository_url: 'HTTPS://legacy-token@github.com/user/repo.git',
+      }))
+      .mockImplementationOnce(async () => ({ ...MOCK_CODEBASE, default_branch: 'staging' }));
+    mockGitHubFetch.mockImplementationOnce(async () => new Response('{}', { status: 200 }));
+
+    const response = await makeApp().request('/api/codebases/codebase-uuid-1', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ default_branch: 'staging' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockGitHubFetch).toHaveBeenCalledWith({
+      service: 'smart_cauldron',
+      url: 'https://api.github.com/repos/user/repo/branches/staging',
+    });
+    expect(mockUpdateCodebase).toHaveBeenCalledWith('codebase-uuid-1', {
+      default_branch: 'staging',
+    });
+  });
+
   test('rejects a branch that does not exist on the remote', async () => {
     mockGetCodebase.mockImplementationOnce(async () => MOCK_CODEBASE);
     mockGitHubFetch.mockImplementationOnce(async () => new Response('{}', { status: 404 }));
@@ -667,7 +692,7 @@ describe('PATCH /api/codebases/:id', () => {
     mockGetCodebase
       .mockImplementationOnce(async () => ({
         ...MOCK_CODEBASE,
-        repository_url: 'https://x-access-token:ghoFAKE123@github.com/user/repo.git',
+        repository_url: 'HTTP://x-access-token:ghoFAKE123@github.com/user/repo.git',
       }))
       .mockImplementationOnce(async () => ({
         ...MOCK_CODEBASE,

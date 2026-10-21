@@ -109,6 +109,26 @@ import {
   registerMetaResponseSchema,
 } from './schemas/taskmaster.schemas';
 
+function extractGitHubRepo(value: string): [string, string] | null {
+  try {
+    const repositoryUrl = new URL(value);
+    if (
+      !['http:', 'https:'].includes(repositoryUrl.protocol) ||
+      repositoryUrl.hostname !== 'github.com'
+    ) {
+      return null;
+    }
+    const parts = repositoryUrl.pathname
+      .replace(/\.git$/i, '')
+      .split('/')
+      .filter(Boolean);
+    return parts.length === 2 ? [parts[0], parts[1]] : null;
+  } catch {
+    const parts = normalizeRepo(value).split('/');
+    return parts.length === 2 && parts.every(part => part.length > 0) ? [parts[0], parts[1]] : null;
+  }
+}
+
 const parsedRegisterStaleAfterMs = Number.parseInt(
   process.env.TASKMASTER_REGISTER_STALE_AFTER_MS ?? '',
   10
@@ -5713,8 +5733,8 @@ export function registerApiRoutes(
           return apiError(c, 409, 'repository_url_not_github');
         }
 
-        const repoParts = normalizeRepo(effectiveRepositoryUrl).split('/');
-        if (repoParts.length !== 2 || repoParts.some(part => part.length === 0)) {
+        const repoParts = extractGitHubRepo(effectiveRepositoryUrl);
+        if (!repoParts) {
           return apiError(c, 409, 'repository_url_not_github');
         }
 

@@ -20,7 +20,10 @@ export function sanitizeCredentials(input: string): string {
   }
 
   // Catch any URL-embedded credentials we might have missed
-  result = result.replace(/https:\/\/[^@\s]+@github\.com/g, 'https://[REDACTED]@github.com');
+  result = result.replace(
+    /(https?:\/\/)[^@\s]+@(github\.com)/gi,
+    (_match, scheme: string, host: string) => `${scheme}[REDACTED]@${host}`
+  );
 
   return result;
 }
