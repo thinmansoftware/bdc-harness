@@ -232,7 +232,7 @@ describe('bundled-defaults', () => {
         'bdc-feature-development-zero-open',
         'bdc-feature-development-zero',
       ];
-      const OUT_OF_SCOPE_NODES = ['opus-repair', 'diff-review', 'diff-review-final', 'diff-repair'];
+      const OUT_OF_SCOPE_NODES = ['opus-repair', 'diff-review', 'diff-review-final'];
 
       for (const name of REASONING_BOUND) {
         it(`${name} applies the 10-minute idle timeout to plan-review and implement`, () => {
@@ -293,6 +293,21 @@ describe('bundled-defaults', () => {
             });
           });
         }
+      }
+
+      for (const name of [...REASONING_BOUND, ...OPEN_MODEL]) {
+        it(`${name} diffRepairIdleCeiling sets the diff-repair idle and wall ceilings`, () => {
+          const content = BUNDLED_WORKFLOWS[name];
+          const nodeSource = extractWorkflowNode(content, 'diff-repair');
+          const workflow = parseBundledWorkflow(name);
+          const node = getWorkflowNode(workflow, 'diff-repair');
+
+          expect(nodeSource).not.toContain('idle_timeout: 600000');
+          expect(nodeSource).toContain('idle_timeout: 570000');
+          expect(nodeSource).toContain('wall_timeout_ms: 1230000');
+          expect(node.idle_timeout).toBe(570000);
+          expect(node.wall_timeout_ms).toBe(1230000);
+        });
       }
     });
 
