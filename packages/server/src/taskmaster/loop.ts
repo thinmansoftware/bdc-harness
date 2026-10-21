@@ -547,6 +547,7 @@ export async function defaultListThreads(
         if (issues.length < 100) break;
         if (page === MAX_PAGES_PER_LABEL) {
           log.warn({ repo, label, page }, 'taskmaster.github_page_limit_reached');
+          throw new Error('taskmaster_github_work_sor_incomplete');
         }
       }
     }
@@ -585,7 +586,9 @@ class PrClaimLookupError extends Error {
 /**
  * True when GitHub search returns at least one open pull request whose title
  * or body contains the work-order id, scoped to the repository owner.
- * Failures are logged and returned as false so the work-SOR read stays up.
+ * Only a valid complete empty response proves absence. Unknown claim evidence
+ * rejects this work-SOR read so the prior adoption snapshot remains authoritative.
+ * The separate lookup cap still leaves skipped claims unverified; it is unchanged.
  */
 async function lookupOpenPrClaim(
   fetchImpl: typeof fetch,
@@ -605,13 +608,48 @@ async function lookupOpenPrClaim(
     if (!response.ok) {
       throw new PrClaimLookupError(response.status);
     }
-    const body = (await response.json()) as { items?: unknown[] } | null;
-    return Array.isArray(body?.items) && body.items.length > 0;
+    const body = (await response.json()) as {
+      total_count?: unknown;
+      incomplete_results?: unknown;
+      items?: unknown;
+    } | null;
+    if (
+      !body ||
+      Array.isArray(body) ||
+      body.incomplete_results !== false ||
+      typeof body.total_count !== 'number' ||
+      !Number.isSafeInteger(body.total_count) ||
+      body.total_count < 0 ||
+      !Array.isArray(body.items) ||
+      body.items.length > 1 ||
+      (body.total_count === 0 ? body.items.length !== 0 : body.items.length !== 1)
+    ) {
+      throw new Error('taskmaster_pr_claim_lookup_unknown');
+    }
+    if (body.total_count === 0) return false;
+    const item = body.items[0] as Record<string, unknown> | null;
+    if (
+      !item ||
+      typeof item !== 'object' ||
+      Array.isArray(item) ||
+      !Number.isSafeInteger(item.number) ||
+      (item.number as number) <= 0 ||
+      item.state !== 'open' ||
+      typeof item.title !== 'string' ||
+      !(item.body === null || typeof item.body === 'string') ||
+      !item.pull_request ||
+      typeof item.pull_request !== 'object' ||
+      Array.isArray(item.pull_request)
+    ) {
+      throw new Error('taskmaster_pr_claim_lookup_unknown');
+    }
+    // One valid positive row proves presence even when more matches exist.
+    return true;
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error));
     const status = error instanceof PrClaimLookupError ? error.status : undefined;
     log.warn({ err, repo, woId, status }, 'taskmaster.pr_claim_lookup_failed');
-    return false;
+    throw err;
   }
 }
 
@@ -1614,6 +1652,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   let rulings: ThreadSnapshot[] = [];
   let threads: ThreadSnapshot[] = [];
   let unlabelledPriorityTriage: string[] = [];
+  let threadsReadSucceeded = false;
   try {
     rulings = await (deps.listUndeliveredRulings ?? defaultListUndeliveredRulings)();
   } catch (error) {
@@ -1622,9 +1661,10 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   }
   try {
     const listed = await (deps.listThreads ?? defaultListThreads)();
+    const triage = 'unlabelledPriorityTriage' in listed ? listed.unlabelledPriorityTriage : [];
     threads = listed;
-    unlabelledPriorityTriage =
-      'unlabelledPriorityTriage' in listed ? listed.unlabelledPriorityTriage : [];
+    unlabelledPriorityTriage = triage;
+    threadsReadSucceeded = true;
   } catch (error) {
     tickFailures += 1;
     log.warn({ err: error as Error }, 'taskmaster.threads_read_failed');
@@ -1632,8 +1672,9 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
   // Adoption projection refresh (M-155 WO 1). Uses the already-fetched
   // thread list; must not re-list. Failures suppress heartbeat via
-  // tickFailures but never abort the send/grade phase.
-  {
+  // tickFailures but never abort the send/grade phase. A rejected source read
+  // must not turn the synthetic empty fallback into a committed projection.
+  if (threadsReadSucceeded) {
     const adoptionResult = await refreshAdoption(threads, deps);
     if (adoptionResult.failed) tickFailures += 1;
   }
