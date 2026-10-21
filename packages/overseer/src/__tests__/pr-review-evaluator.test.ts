@@ -693,6 +693,38 @@ describe('governed PR-code reviewer', () => {
       )
     ).toBe(false);
   });
+
+  test('cross-app CHECKS_PENDING keeps the pending app name regardless of input order', async () => {
+    const pending = {
+      name: 'test (ubuntu-latest)',
+      status: 'in_progress' as const,
+      conclusion: null,
+      app: { slug: 'github-actions' },
+    };
+    const completed = {
+      name: 'test (ubuntu-latest)',
+      status: 'completed' as const,
+      conclusion: 'success',
+      app: { slug: 'buildkite' },
+    };
+    for (const checks of [
+      [pending, completed],
+      [completed, pending],
+    ]) {
+      const result = await evaluatePullRequest(
+        input,
+        deps({
+          fetchEvidence: async () => ({
+            diff: '+ change',
+            requiredContexts: ['test (ubuntu-latest)'],
+            checks,
+          }),
+        })
+      );
+      expect(result.verdict).toBe('CHECKS_PENDING');
+      expect(result.pendingChecks).toEqual(['test (ubuntu-latest)']);
+    }
+  });
 });
 
 // PR #848 -- the CURSOR rail as a judge rung. Both configured rungs

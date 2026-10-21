@@ -548,12 +548,15 @@ function checksPending(
   requiredContexts: string[] | null | undefined
 ): PrReviewResult {
   const latest = latestAttemptPerCheck(checks);
-  const latestByName = new Map(latest.map(check => [normalizedCheckName(check.name), check]));
+  // Same per-(app, name) latest set as checksAreTerminal. A name-only Map
+  // drops a pending app when a completed app with the same check name is last.
   const pendingChecks =
     requiredContexts && requiredContexts.length > 0
       ? requiredContexts.flatMap(context => {
-          const check = latestByName.get(normalizedCheckName(context));
-          return check?.status === 'completed' ? [] : [check?.name ?? context.trim()];
+          const name = normalizedCheckName(context);
+          const applicable = latest.filter(check => normalizedCheckName(check.name) === name);
+          if (applicable.length === 0) return [context.trim()];
+          return applicable.filter(check => check.status !== 'completed').map(check => check.name);
         })
       : latest.filter(check => check.status !== 'completed').map(check => check.name);
   return {
