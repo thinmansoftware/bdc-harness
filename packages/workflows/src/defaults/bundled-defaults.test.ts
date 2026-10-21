@@ -262,27 +262,16 @@ describe('bundled-defaults', () => {
             const planReviewNode = getWorkflowNode(workflow, 'plan-review');
             const implementNode = getWorkflowNode(workflow, 'implement');
 
-            // plan-review keeps the default loop idle timeout for every open-model lane.
             expect(planReview).not.toContain('idle_timeout: 600000');
+            expect(implement).not.toContain('idle_timeout: 600000');
             expect(planReviewNode.idle_timeout).toBeUndefined();
+            expect(implementNode.idle_timeout).toBeUndefined();
             expect(resolveLoopIterationIdleTimeoutMs(planReviewNode.idle_timeout)).toBe(
               LOOP_ITERATION_IDLE_TIMEOUT_MS
             );
-
-            // WO-HARNESS-REPAIR-PATH-HOTFIX-01 item 1c: the grok lane pins implement to a
-            // 570000ms idle ceiling (grok goes silent >3min during installs/tests); every
-            // other open-model lane keeps the default loop idle timeout on implement.
-            if (name === 'bdc-feature-development-grok') {
-              expect(implement).toContain('idle_timeout: 570000');
-              expect(implementNode.idle_timeout).toBe(570000);
-              expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(570000);
-            } else {
-              expect(implement).not.toContain('idle_timeout: 600000');
-              expect(implementNode.idle_timeout).toBeUndefined();
-              expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(
-                LOOP_ITERATION_IDLE_TIMEOUT_MS
-              );
-            }
+            expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(
+              LOOP_ITERATION_IDLE_TIMEOUT_MS
+            );
           });
         });
       }

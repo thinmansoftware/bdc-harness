@@ -114,12 +114,9 @@ describe('already-satisfied lane wiring', () => {
 
       const node = (id: string) => result.workflow?.nodes.find(n => n.id === id);
       const skipWhen = "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'";
-      // WO-HARNESS-REPAIR-PATH-HOTFIX-01 item 1b: plan-review also fails the run at the
-      // real node when checkout-repair-target produced no record (empty output).
-      const planReviewWhen = `${skipWhen} && $checkout-repair-target.output != ''`;
 
       expect(node('plan')?.when).toBe(skipWhen);
-      expect(node('plan-review')?.when).toBe(planReviewWhen);
+      expect(node('plan-review')?.when).toBe(skipWhen);
       expect(node('plan-review')?.trigger_rule).toBe('all_done');
       expect(node('implement')?.when).toBe(skipWhen);
       expect(node('implement')?.trigger_rule).toBe('all_done');

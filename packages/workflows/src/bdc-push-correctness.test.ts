@@ -253,6 +253,20 @@ function extractCommitSelection(yaml: string, laneLabel: string): string {
   return `set -euo pipefail\n${block}echo "UNIQUE_BRANCH=$UNIQUE_BRANCH"\n`;
 }
 
+function extractCommitCapture(yaml: string, laneLabel: string): string {
+  const result = parseWorkflow(yaml, basename(laneLabel));
+  if (!result.workflow) {
+    throw new Error(`${laneLabel}: ${result.error?.error ?? 'failed to parse'}`);
+  }
+  const bash = result.workflow.nodes.find(node => node.id === 'commit-and-push')?.bash;
+  const endMarker = 'PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")';
+  const end = bash?.indexOf(endMarker) ?? -1;
+  if (!bash || end < 0) {
+    throw new Error(`commit-and-push capture anchors missing in ${laneLabel}`);
+  }
+  return `${bash.slice(0, end + endMarker.length)}\n`;
+}
+
 function extractCheckoutRepair(yaml: string, laneLabel: string): string {
   yaml = yaml.replace(/\r\n/g, '\n');
   const nodeStart = yaml.indexOf('  - id: checkout-repair-target\n');
@@ -488,6 +502,7 @@ describe('F1 replay: quoted-heredoc decide capture vs node-out file capture', ()
   });
 
   it('Test 2: the node-out file capture authorizes #7 and reaches UNIQUE_BRANCH', () => {
+    const lane = join(DEFAULTS_DIR, 'bdc-feature-development.yaml');
     const branch = 'feat/x';
     const planText = fencedPlanReview([
       'Commit message: fix: x',
@@ -515,17 +530,8 @@ describe('F1 replay: quoted-heredoc decide capture vs node-out file capture', ()
       expect(parseResult.stdout).toContain('AUTHORIZED=<#7>');
 
       // And end-to-end: the real commit-selection guard reaches UNIQUE_BRANCH=feat/x.
-      const newCapture = [
-        'set -euo pipefail',
-        'DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"',
-        'if [ ! -s "$DECIDE_OUT_FILE" ]; then echo "ERROR: missing decide node-out" >&2; exit 1; fi',
-        'DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")',
-        'PLAN_REVIEW_OUT_FILE="$ARCHON_NODE_OUT/plan-review.out"',
-        'if [ ! -s "$PLAN_REVIEW_OUT_FILE" ]; then echo "ERROR: missing plan node-out" >&2; exit 1; fi',
-        'PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")',
-        '',
-      ].join('\n');
-      const result = bash(newCapture + REPAIR_TARGET_SELECTION, worktreeDir, {
+      const capture = extractCommitCapture(readFileSync(lane, 'utf8'), lane);
+      const result = bash(capture + REPAIR_TARGET_SELECTION, worktreeDir, {
         ARCHON_NODE_OUT: nodeOutDir,
         SPEC_TEXT: spec,
         CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${headOid}`,
