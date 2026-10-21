@@ -15,6 +15,7 @@ export const codebaseSchema = z
     name: z.string(),
     repository_url: z.string().nullable(),
     default_cwd: z.string(),
+    default_branch: z.string().nullable(),
     ai_assistant_type: z.string(),
     commands: z.record(codebaseCommandSchema),
     created_at: z.string(),
@@ -38,6 +39,20 @@ export const addCodebaseBodySchema = z
     message: 'Provide either "url" or "path", not both and not neither',
   })
   .openapi('AddCodebaseBody');
+
+/** PATCH /api/codebases/:id request body. */
+export const updateCodebaseBodySchema = z
+  .object({
+    name: z.string().min(1).optional(),
+    default_branch: z.string().min(1).optional(),
+    default_cwd: z.string().min(1).optional(),
+    repository_url: z.string().min(1).nullable().optional(),
+  })
+  .strict()
+  .refine(body => Object.keys(body).length > 0, {
+    message: 'Provide at least one field to update',
+  })
+  .openapi('UpdateCodebaseBody');
 
 /** DELETE /api/codebases/:id response. */
 export const deleteCodebaseResponseSchema = z

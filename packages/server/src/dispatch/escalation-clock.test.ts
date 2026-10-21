@@ -10,6 +10,7 @@ type Candidate = {
 };
 
 const calls = { notices: 0, handoffs: 0, list: 0, claim: 0, release: 0 };
+const releasedClaims: { id: string; leg: string; claimed_at: string }[] = [];
 let candidates: Candidate[] = [];
 let listBarrier: Promise<void> | null = null;
 mock.module('@archon/core/db/dispatch', () => ({
@@ -38,7 +39,12 @@ mock.module('@archon/core/db/dispatch', () => ({
     candidate[column] = now;
     return { id };
   },
-  releaseDispatchEscalationClaim: async () => {
+  releaseDispatchEscalationClaim: async (claim: {
+    id: string;
+    leg: string;
+    claimed_at: string;
+  }) => {
+    releasedClaims.push(claim);
     calls.release++;
     return true;
   },
@@ -61,6 +67,7 @@ describe('dispatch escalation clock', () => {
     process.env.DISPATCH_TELEGRAM_ENABLED = enabledValue;
     process.env.DISPATCH_SMS_ENABLED = enabledValue;
     candidates = [];
+    releasedClaims.length = 0;
     listBarrier = null;
   });
   afterEach(() => {
@@ -154,4 +161,18 @@ describe('dispatch escalation clock', () => {
     expect(calls.notices).toBe(1);
     expect(calls.list).toBe(1);
   });
+  test.each(['telegram', 'sms'] as const)(
+    'a %s refusal releases exactly its claim',
+    async refusedLeg => {
+      setSenderAuthMode('enforce');
+      candidates = [{ id: 'refused', created_at: '2026-08-07T00:00:00.000Z' }];
+      const now = '2026-08-08T00:00:00.000Z';
+      await tickDispatchEscalationClock({
+        now: () => new Date(now),
+        telegram: refusedLeg === 'telegram' ? async () => false : async () => {},
+        sms: refusedLeg === 'sms' ? async () => false : async () => {},
+      });
+      expect(releasedClaims).toEqual([{ id: 'refused', leg: refusedLeg, claimed_at: now }]);
+    }
+  );
 });

@@ -265,7 +265,15 @@ export interface RealGitHubOctokitLike {
   checks: {
     listForRef(input: Record<string, unknown>): Promise<{
       data: {
-        check_runs: { name?: string; status: string; conclusion: string | null }[];
+        check_runs: {
+          id?: number;
+          name?: string;
+          status: string;
+          conclusion: string | null;
+          started_at?: string | null;
+          completed_at?: string | null;
+          app?: { slug?: string; name?: string };
+        }[];
       };
     }>;
   };
@@ -533,9 +541,13 @@ export function createRealFetchExactHeadPullRequestEvidence(
         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
         .join('\n'),
       checks: checkRuns.data.check_runs.map((run, index) => ({
+        id: run.id,
         name: run.name?.trim() || `check-${index + 1}`,
         status: run.status,
         conclusion: run.conclusion,
+        started_at: run.started_at,
+        completed_at: run.completed_at,
+        app: run.app,
       })),
       requiredContexts,
     };

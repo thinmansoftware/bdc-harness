@@ -36,4 +36,16 @@ describe('production Docker packaging', () => {
     // Debian installs fd-find's binary as `fdfind`; agents invoke `fd`.
     expect(dockerfile).toContain('/usr/local/bin/fd');
   });
+  it('retains the build toolchain and probes it in the final image', async () => {
+    const dockerfile = await readFile(
+      join(import.meta.dir, '..', '..', '..', 'Dockerfile'),
+      'utf8'
+    );
+    const runtime = dockerfile.split('AS production')[1] ?? '';
+    expect(runtime).toContain('python3-pytest');
+    expect(runtime).not.toMatch(/apt-get purge[^\n]*(?:nodejs|npm)/);
+    for (const probe of ['node --version', 'npm --version', 'npx --version', 'pytest --version']) {
+      expect(runtime).toContain(probe);
+    }
+  });
 });

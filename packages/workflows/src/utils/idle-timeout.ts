@@ -90,7 +90,8 @@ const ABORT_SENTINEL = Symbol('ABORT');
  * `timeoutMs`, the wrapper returns normally -- converting a hang into a clean exit.
  *
  * When `shouldResetTimer` is provided and returns `false` for a yielded value, the
- * timer is NOT reset -- it keeps counting from the previous reset point. Most callers
+ * timer is NOT reset -- provider wait accumulates since the previous reset. Time
+ * spent processing a yielded value belongs to the consumer and is excluded. Most callers
  * should omit this parameter (every message resets the timer, which is the correct
  * default for a deadlock detector).
  *
@@ -115,7 +116,7 @@ export async function* withIdleTimeout<T>(
   abortSignal?: AbortSignal
 ): AsyncGenerator<T> {
   let timedOut = false;
-  let timerStartedAt = Date.now();
+  let idleWaitMs = 0;
 
   try {
     while (true) {
@@ -124,9 +125,16 @@ export async function* withIdleTimeout<T>(
         return;
       }
 
-      const elapsed = Date.now() - timerStartedAt;
-      const remaining = Math.max(0, timeoutMs - elapsed);
+      const remaining = timeoutMs - idleWaitMs;
+      // An immediately resolving filtered stream can beat a zero-delay timer.
+      // Stop before requesting another value once its wait budget is spent.
+      if (remaining <= 0) {
+        // No next() is pending here, so normal generator cleanup is safe.
+        onTimeout?.();
+        return;
+      }
 
+      const waitStartedAt = performance.now();
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeoutPromise = new Promise<typeof IDLE_TIMEOUT_SENTINEL>(resolve => {
         timer = setTimeout(() => {
@@ -134,32 +142,38 @@ export async function* withIdleTimeout<T>(
         }, remaining);
       });
 
-      // Start waiting for the next value from the generator
-      const nextPromise = generator.next();
-
       let removeAbortListener: (() => void) | undefined;
-      const abortPromise: Promise<typeof ABORT_SENTINEL> | undefined = abortSignal
-        ? new Promise(resolve => {
-            const onAbort = (): void => {
-              resolve(ABORT_SENTINEL);
-            };
-            abortSignal.addEventListener('abort', onAbort);
-            removeAbortListener = (): void => {
-              abortSignal.removeEventListener('abort', onAbort);
-            };
-            if (abortSignal.aborted) resolve(ABORT_SENTINEL);
-          })
-        : undefined;
+      let nextPromise: Promise<IteratorResult<T>>;
+      let result: IteratorResult<T> | typeof IDLE_TIMEOUT_SENTINEL | typeof ABORT_SENTINEL;
+      try {
+        // Start waiting for the next value from the generator
+        nextPromise = generator.next();
 
-      const result = await Promise.race<
-        IteratorResult<T> | typeof IDLE_TIMEOUT_SENTINEL | typeof ABORT_SENTINEL
-      >(
-        abortPromise !== undefined
-          ? [nextPromise, timeoutPromise, abortPromise]
-          : [nextPromise, timeoutPromise]
-      );
-      clearTimeout(timer);
-      removeAbortListener?.();
+        const abortPromise: Promise<typeof ABORT_SENTINEL> | undefined = abortSignal
+          ? new Promise(resolve => {
+              const onAbort = (): void => {
+                resolve(ABORT_SENTINEL);
+              };
+              abortSignal.addEventListener('abort', onAbort);
+              removeAbortListener = (): void => {
+                abortSignal.removeEventListener('abort', onAbort);
+              };
+              if (abortSignal.aborted) resolve(ABORT_SENTINEL);
+            })
+          : undefined;
+
+        result = await Promise.race<
+          IteratorResult<T> | typeof IDLE_TIMEOUT_SENTINEL | typeof ABORT_SENTINEL
+        >(
+          abortPromise !== undefined
+            ? [nextPromise, timeoutPromise, abortPromise]
+            : [nextPromise, timeoutPromise]
+        );
+      } finally {
+        clearTimeout(timer);
+        removeAbortListener?.();
+      }
+      idleWaitMs += performance.now() - waitStartedAt;
 
       if (result === ABORT_SENTINEL) {
         timedOut = true;
@@ -185,7 +199,7 @@ export async function* withIdleTimeout<T>(
 
       // Reset the timer unless the predicate says not to
       if (!shouldResetTimer || shouldResetTimer(result.value)) {
-        timerStartedAt = Date.now();
+        idleWaitMs = 0;
       }
 
       yield result.value;

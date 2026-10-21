@@ -16,8 +16,8 @@ export const SERVICE_GITHUB_AUTH_PRECEDENCE = {
   merge_manager: ['service_app', 'merge_manager_pat', 'hold'],
   taskmaster: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
   duty_officer: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
-  smart_cauldron: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
-  run_nodes: ['service_app', 'taskmaster_app_alias', 'shared_overseer_app', 'pat'],
+  smart_cauldron: ['service_app', 'pat'],
+  run_nodes: ['service_app', 'pat'],
 } as const satisfies Record<GitHubService, readonly string[]>;
 
 export interface GitHubAppIdentity {
@@ -117,6 +117,26 @@ export function resolveServiceGitHubAuth(
       return { kind: 'none', service: 'merge_manager', poolId: 'none', distinct: false };
     }
   }
+
+  // Builder lanes must never share the reviewer identity or borrow the Taskmaster
+  // alias. They resolve their own App (GITHUB_APP_RUN_NODES_* / _SMART_CAULDRON_*)
+  // or the PAT -- nothing else. A builder App that equals the reviewer App is a
+  // hard error so a lane can never open a PR authored by thinman-overseer[bot].
+  if (service === 'run_nodes' || service === 'smart_cauldron') {
+    if (own) {
+      const reviewer =
+        resolveApp('GITHUB_APP_OVERSEER_', 'overseer', env) ??
+        resolveApp('GITHUB_APP_', 'overseer', env);
+      if (reviewer?.appId === own.appId) {
+        throw new Error(
+          `builder_identity_equals_reviewer: ${service} App id equals the reviewer App id`
+        );
+      }
+      return own;
+    }
+    return pat(service, env.GITHUB_TOKEN ?? env.GH_TOKEN ?? '', 'user-pat', false);
+  }
+
   if (own) return own;
 
   if (service === 'overseer' || service === 'pr_discovery') {
@@ -150,16 +170,12 @@ function base64Url(value: string | Uint8Array): string {
   return Buffer.from(value).toString('base64url');
 }
 
-export async function getServiceGitHubToken(
-  identity: ServiceGitHubAuth,
-  options: { fetch?: typeof fetch; apiBaseUrl?: string; now?: () => number } = {}
-): Promise<string> {
-  if (identity.kind === 'pat') return identity.token;
-  if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
-  const now = (options.now ?? Date.now)();
-  const cached = tokenCache.get(identity.poolId);
-  if (cached && cached.expiresAt - now > 5 * 60_000) return cached.token;
-
+// Mint a signed GitHub App JWT (RS256) for the given App identity. `now` is a
+// resolved epoch-millisecond timestamp; it defaults to the current time. Shared
+// by getServiceGitHubToken (installation-token mint) and
+// scripts/github-service-login.ts (GET /app slug lookup) so the header/payload/
+// signature shape stays in lockstep.
+export function buildAppJwt(identity: GitHubAppIdentity, now: number = Date.now()): string {
   const header = base64Url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
   const payload = base64Url(
     JSON.stringify({
@@ -171,7 +187,20 @@ export async function getServiceGitHubToken(
   const signature = base64Url(
     sign('RSA-SHA256', Buffer.from(`${header}.${payload}`), identity.privateKey)
   );
-  const jwt = `${header}.${payload}.${signature}`;
+  return `${header}.${payload}.${signature}`;
+}
+
+export async function getServiceGitHubToken(
+  identity: ServiceGitHubAuth,
+  options: { fetch?: typeof fetch; apiBaseUrl?: string; now?: () => number } = {}
+): Promise<string> {
+  if (identity.kind === 'pat') return identity.token;
+  if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
+  const now = (options.now ?? Date.now)();
+  const cached = tokenCache.get(identity.poolId);
+  if (cached && cached.expiresAt - now > 5 * 60_000) return cached.token;
+
+  const jwt = buildAppJwt(identity, now);
   const response = await (options.fetch ?? fetch)(
     `${options.apiBaseUrl ?? 'https://api.github.com'}/app/installations/${identity.installationId}/access_tokens`,
     {
