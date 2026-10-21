@@ -99,6 +99,37 @@ function good(head: string): string {
   return `DIFF_REVIEW_FINAL=satisfied\nREVIEWED_HEAD=${head}\nFILES_READ:\n- a.ts\nUNRESOLVED:\n- (none)\nSEMANTIC_RISK=LOW`;
 }
 
+function goodOpus(head: string): string {
+  return `OPUS_REREVIEW=satisfied\nREVIEWED_HEAD=${head}\nFILES_READ:\n- a.ts\nUNRESOLVED:\n- (none)\nSEMANTIC_RISK=LOW`;
+}
+
+async function classifyOpus(review: string, setup = repo()) {
+  const capture = [
+    `DIFF_OPUS_BASE=${setup.head}`,
+    `DIFF_OPUS_HEAD=${setup.head}`,
+    `DIFF_OPUS_SHA256=${sha(setup.patch)}`,
+    `DIFF_OPUS_FILES=${join(setup.artifacts, 'diff-final.files')}`,
+  ].join('\n');
+  const outputs = new Map([
+    ['opus-rereview', { state: 'completed' as const, output: review }],
+    ['capture-diff-opus', { state: 'completed' as const, output: capture }],
+  ]);
+  const script = substituteNodeOutputRefs(node('classify-opus-rereview').bash ?? '', outputs, true);
+  const proc = Bun.spawn(['bash', '-c', script], {
+    cwd: setup.cwd,
+    env: { ...process.env, ARTIFACTS_DIR: setup.artifacts },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode !== 0) throw new Error(stderr);
+  return JSON.parse(stdout.trim()) as Record<string, unknown>;
+}
+
 afterEach(() => {
   while (temporary.length) rmSync(temporary.pop()!, { recursive: true, force: true });
 });
@@ -157,9 +188,12 @@ describe('Slice T final review contract', () => {
       status: 'BLOCKED',
       reason: 'findings_present',
     });
-    const opusScript = node('classify-opus-rereview').bash ?? '';
-    expect(opusScript).toContain('reason=findings_present');
-    expect(opusScript).toContain('verdict=needs_revision');
+    const opusSetup = repo();
+    const opusReview = goodOpus(opusSetup.head).replace('- (none)', '- [minor] a.ts:3 x');
+    expect(await classifyOpus(opusReview, opusSetup)).toMatchObject({
+      verdict: 'needs_revision',
+      reason: 'findings_present',
+    });
   });
 
   it('sliceTProof original c8731715 output no longer passes', async () => {
