@@ -61,6 +61,7 @@ function claimStubs(): Pick<CascadeDeps, 'findWoClaim' | 'acquireWoLock' | 'rele
     findWoClaim: async () => null,
     acquireWoLock: async (woId, project, cascadeId) => ({
       acquired: true,
+      executionToken: 'test-execution-owner',
       path: 'in-memory-test-lock',
       record: {
         woId,
