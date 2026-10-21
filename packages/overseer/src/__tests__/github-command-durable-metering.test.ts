@@ -28,6 +28,9 @@ test('real CLI processes persist request counts and refuse an exhausted shared p
       stdin: new Uint8Array(),
       stdout: 'pipe',
       stderr: 'pipe',
+      // Each real CLI initializes an owned SQLite database before its command.
+      // Bound both children explicitly within the integration-test budget.
+      timeout: 20_000,
     });
   let db: SqliteAdapter | undefined;
   let databaseSpy: ReturnType<typeof spyOn> | undefined;
@@ -116,4 +119,6 @@ test('real CLI processes persist request counts and refuse an exhausted shared p
     Bun.gc(true);
     rmSync(home, { recursive: true, force: true });
   }
-});
+  // Two bounded real CLI subprocesses initialize independent databases.
+  // Leave room for both child limits and the parent's database assertions.
+}, 45_000);
