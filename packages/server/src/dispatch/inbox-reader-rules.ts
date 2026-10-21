@@ -75,15 +75,40 @@ export function classifyInboxMessage(message: InboxMessage): InboxClassification
       return result('ACTIONABLE', 'body_not_json', 'overseer report body is not a JSON object');
     }
     const body = parsed as Record<string, unknown>;
-    if (
-      body.kind === 'pr_review_submit_receipt' &&
-      ['approved', 'changes_requested'].includes(String(body.disposition)) &&
-      ['APPROVE', 'REQUEST_CHANGES'].includes(String(body.event))
-    ) {
+    // Explicit or malformed operator intent must outrank every informational rule.
+    if ('needsOperator' in body && body.needsOperator !== false) {
+      return result(
+        'ACTIONABLE',
+        'operator_required',
+        'receipt explicitly requires operator attention'
+      );
+    }
+    const remediation = body.remediation;
+    const handedOff =
+      remediation !== null &&
+      typeof remediation === 'object' &&
+      !Array.isArray(remediation) &&
+      'emitted' in remediation &&
+      remediation.emitted === true &&
+      'attempt' in remediation &&
+      typeof remediation.attempt === 'number' &&
+      Number.isSafeInteger(remediation.attempt) &&
+      remediation.attempt > 0;
+    const approved = body.disposition === 'approved' && body.event === 'APPROVE';
+    const repairQueued =
+      body.disposition === 'changes_requested' && body.event === 'REQUEST_CHANGES' && handedOff;
+    if (body.kind === 'pr_review_submit_receipt' && (approved || repairQueued)) {
       return result(
         'INFO_DUPLICATE',
         'info_review_posted',
-        'verdict already posted as a GitHub PR review'
+        'verdict posted and no unresolved operator handoff'
+      );
+    }
+    if (body.kind === 'pr_review_submit_receipt' && body.disposition === 'changes_requested') {
+      return result(
+        'ACTIONABLE',
+        'review_requires_owner',
+        'changes requested without a proven automatic repair handoff'
       );
     }
     if (
