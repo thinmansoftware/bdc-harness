@@ -223,7 +223,7 @@ export async function tickReviewWorkerClock(
               headSha: work.headSha,
               defer_until: deferUntil,
               pending_checks: pendingChecks,
-              ...(pendingChecks.length === 0 ? { reason: 'no_checks_reported' } : {}),
+              ...(outcome.pendingChecks === undefined ? { reason: 'no_checks_reported' } : {}),
             },
             'overseer_review_checks_pending_deferred'
           );

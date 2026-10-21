@@ -75,7 +75,11 @@ describe('unprotected base zero-check attempt bound', () => {
       },
       repos: {
         compareCommits: async () => ({ data: { files: [] } }),
-        getAllStatusCheckContexts: async () => ({ data: [] }),
+        getAllStatusCheckContexts: async () => {
+          throw Object.assign(new Error('Branch not protected'), { status: 404 });
+        },
+        getBranchRules: async () => ({ data: [] }),
+        getBranch: async () => ({ data: { protected: false } }),
       },
       checks: { listForRef: async () => ({ data: { check_runs: checkRuns } }) },
     } as unknown as RealGitHubOctokitLike;

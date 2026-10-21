@@ -475,9 +475,10 @@ export function reviewErrorCode(error: string | undefined): string | null {
  *
  * When `requiredContexts` is a known set (branch-protection required status
  * checks on the base branch) it is the authoritative complete-suite signal:
- * terminal only when EVERY required context has reported a check run AND every
- * reported check has completed. A required context that has not shown up yet
- * (or one that is present but still in_progress) keeps the suite non-terminal.
+ * terminal only when EVERY required context has reported a completed check run.
+ * Optional reported checks do not affect terminality. A required context that
+ * has not shown up yet (or one that is present but still in_progress) keeps the
+ * suite non-terminal.
  *
  * `null` means the authoritative set could NOT be obtained. That is never
  * terminal: we defer rather than fall back to the reported-checks heuristic,
@@ -560,7 +561,7 @@ function checksPending(
     reviewer: deps.reviewer,
     acceptance_criteria_available: false,
     error: 'checks_pending',
-    pendingChecks,
+    ...(checks.length === 0 ? {} : { pendingChecks }),
   };
 }
 

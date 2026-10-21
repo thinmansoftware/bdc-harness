@@ -534,7 +534,11 @@ export function createRealFetchExactHeadPullRequestEvidence(
     const requiredContexts: string[] | null =
       resolution.state === 'known' ? resolution.contexts : null;
     let noChecksBlocked: ExactHeadPullRequestEvidence['requiredContextsBlocked'];
-    if (resolution.state === 'known' && resolution.contexts.length === 0) {
+    if (
+      resolution.state === 'known' &&
+      resolution.source === 'unprotected_branch' &&
+      resolution.contexts.length === 0
+    ) {
       const zeroChecksKey: AttemptCounterKey = {
         owner: input.owner,
         repo: input.repo,

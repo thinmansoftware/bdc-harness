@@ -267,7 +267,6 @@ describe('review worker clock', () => {
     const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
     const deps = fakeDeps([message('no-checks')], () => ({
       disposition: 'checks_pending',
-      pendingChecks: [],
     }));
     deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
     await tickReviewWorkerClock(CONFIG, deps);
@@ -275,6 +274,18 @@ describe('review worker clock', () => {
       message: 'overseer_review_checks_pending_deferred',
       data: expect.objectContaining({ pending_checks: [], reason: 'no_checks_reported' }),
     });
+  });
+
+  test('does not call an explicit empty pending list no_checks_reported', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+    const deps = fakeDeps([message('unknown-contexts')], () => ({
+      disposition: 'checks_pending',
+      pendingChecks: [],
+    }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(warnings[0]?.data).toEqual(expect.objectContaining({ pending_checks: [] }));
+    expect(warnings[0]?.data).not.toHaveProperty('reason');
   });
 
   // bdc-harness #782 part 2: a rate limit is a deferral with GitHub's own reset

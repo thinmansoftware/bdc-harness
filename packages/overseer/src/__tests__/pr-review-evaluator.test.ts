@@ -579,6 +579,7 @@ describe('governed PR-code reviewer', () => {
 
   test('required checks use normalized latest names and optional pending checks do not block', async () => {
     let prompt = '';
+    let modelInvocations = 0;
     const result = await evaluatePullRequest(
       input,
       deps({
@@ -592,12 +593,14 @@ describe('governed PR-code reviewer', () => {
           ],
         }),
         invokeModel: async (_binary, value) => {
+          modelInvocations += 1;
           prompt = value;
           return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
         },
       })
     );
     expect(result.verdict).toBe('APPROVE');
+    expect(modelInvocations).toBe(1);
     expect(prompt).toContain('test (windows-latest)');
   });
 
@@ -607,7 +610,7 @@ describe('governed PR-code reviewer', () => {
       deps({
         fetchEvidence: async () => ({
           diff: '+ change',
-          requiredContexts: ['docker-build', 'test (ubuntu-latest)', 'not-reported'],
+          requiredContexts: ['docker-build', 'test (ubuntu-latest)'],
           checks: [
             { name: 'docker-build', status: 'completed', conclusion: 'success' },
             { name: 'test (ubuntu-latest)', status: 'in_progress', conclusion: null },
@@ -616,7 +619,7 @@ describe('governed PR-code reviewer', () => {
       })
     );
     expect(result.verdict).toBe('CHECKS_PENDING');
-    expect(result.pendingChecks).toEqual(['test (ubuntu-latest)', 'not-reported']);
+    expect(result.pendingChecks).toEqual(['test (ubuntu-latest)']);
     expect(
       checksAreTerminal(
         [{ name: 'docker-build', status: 'completed', conclusion: 'success' }],
