@@ -21,8 +21,6 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os';
 import { basename, delimiter, join } from 'path';
 import { parseWorkflow } from './loader';
-import { substituteNodeOutputRefs } from './dag-executor';
-import type { NodeOutput } from './schemas/workflow-run';
 import {
   clearRegistry,
   registerBuiltinProviders,
@@ -253,20 +251,6 @@ function extractCommitSelection(yaml: string, laneLabel: string): string {
   return `set -euo pipefail\n${block}echo "UNIQUE_BRANCH=$UNIQUE_BRANCH"\n`;
 }
 
-function extractCommitCapture(yaml: string, laneLabel: string): string {
-  const result = parseWorkflow(yaml, basename(laneLabel));
-  if (!result.workflow) {
-    throw new Error(`${laneLabel}: ${result.error?.error ?? 'failed to parse'}`);
-  }
-  const bash = result.workflow.nodes.find(node => node.id === 'commit-and-push')?.bash;
-  const endMarker = 'PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")';
-  const end = bash?.indexOf(endMarker) ?? -1;
-  if (!bash || end < 0) {
-    throw new Error(`commit-and-push capture anchors missing in ${laneLabel}`);
-  }
-  return `${bash.slice(0, end + endMarker.length)}\n`;
-}
-
 function extractCheckoutRepair(yaml: string, laneLabel: string): string {
   yaml = yaml.replace(/\r\n/g, '\n');
   const nodeStart = yaml.indexOf('  - id: checkout-repair-target\n');
@@ -458,94 +442,6 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// WO-HARNESS-REPAIR-PATH-HOTFIX-01 replay (F1): the old quoted-heredoc capture of
-// $decide-push-target.output goes through the executor's shellQuote/wrap path and
-// appends a trailing single-quote to the LAST line, so the $-anchored authorization
-// sed returns empty. The node-out file capture is byte-identical and parses #7.
-// ---------------------------------------------------------------------------
-describe('F1 replay: quoted-heredoc decide capture vs node-out file capture', () => {
-  const decideText = [
-    'push_target: feature-branch: feat/should-not-mint',
-    'repair_target_pr: #7',
-    'repair_target_branch: feat/x',
-    'repo: thinmansoftware/bdc-harness',
-    'repair_target_authorized_by_spec: #7',
-  ].join('\n');
-
-  const AUTH_PARSER = [
-    "DECIDE_OUTPUT_CLEAN=$(printf '%s\\n' \"$DECIDE_OUTPUT\" | tr -d '`')",
-    "REPAIR_TARGET_AUTHORIZED=$(printf '%s\\n' \"$DECIDE_OUTPUT_CLEAN\" | sed -n 's/^[[:space:]]*repair_target_authorized_by_spec:[[:space:]]*\\(#[0-9][0-9]*\\)[[:space:]]*$/\\1/p' | head -n 1)",
-    'printf \'AUTHORIZED=<%s>\\n\' "$REPAIR_TARGET_AUTHORIZED"',
-    '',
-  ].join('\n');
-
-  it('Test 1: the old quoted-heredoc capture yields an empty authorization', () => {
-    const oldCapture = [
-      'set -euo pipefail',
-      "DECIDE_OUTPUT=$(cat <<'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013'",
-      '$decide-push-target.output',
-      'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013',
-      ')',
-      '',
-    ].join('\n');
-    const nodeOutputs = new Map<string, NodeOutput>([
-      ['decide-push-target', { state: 'completed', output: decideText }],
-    ]);
-    const substituted = substituteNodeOutputRefs(oldCapture, nodeOutputs, true);
-    // The executor wrapped the last line with a trailing single quote.
-    expect(substituted).toContain("repair_target_authorized_by_spec: #7'");
-    const result = bash(substituted + AUTH_PARSER, worktreeDir);
-    expect(result.exitCode, showResult(result, 'replay-old')).toBe(0);
-    expect(result.stdout).toContain('AUTHORIZED=<>');
-    expect(result.stdout).not.toContain('AUTHORIZED=<#7>');
-  });
-
-  it('Test 2: the node-out file capture authorizes #7 and reaches UNIQUE_BRANCH', () => {
-    const lane = join(DEFAULTS_DIR, 'bdc-feature-development.yaml');
-    const branch = 'feat/x';
-    const planText = fencedPlanReview([
-      'Commit message: fix: x',
-      'repair_target_authorized_by_spec: #7',
-    ]);
-    const spec = ['WO: WO-TEST', `Repair target: PR #7 (branch ${branch})`].join('\n');
-    const nodeOutDir = mkdtempSync(join(tmpdir(), 'bdc-nodeout-'));
-    try {
-      writeFileSync(join(nodeOutDir, 'decide-push-target.out'), decideText);
-      writeFileSync(join(nodeOutDir, 'plan-review.out'), planText);
-      const headOid = publishHead(branch);
-
-      // Confirm the standalone node-out parse alone yields #7 (no trailing-quote corruption).
-      const parseOnly = [
-        'set -euo pipefail',
-        'DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"',
-        'if [ ! -s "$DECIDE_OUT_FILE" ]; then echo "ERROR: missing decide node-out" >&2; exit 1; fi',
-        'DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")',
-        '',
-      ].join('\n');
-      const parseResult = bash(parseOnly + AUTH_PARSER, worktreeDir, {
-        ARCHON_NODE_OUT: nodeOutDir,
-      });
-      expect(parseResult.exitCode, showResult(parseResult, 'replay-new-parse')).toBe(0);
-      expect(parseResult.stdout).toContain('AUTHORIZED=<#7>');
-
-      // And end-to-end: the real commit-selection guard reaches UNIQUE_BRANCH=feat/x.
-      const capture = extractCommitCapture(readFileSync(lane, 'utf8'), lane);
-      const result = bash(capture + REPAIR_TARGET_SELECTION, worktreeDir, {
-        ARCHON_NODE_OUT: nodeOutDir,
-        SPEC_TEXT: spec,
-        CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${headOid}`,
-        PATH: fakeGhPath('OPEN', branch, { headRefOid: headOid }),
-      });
-      expect(result.exitCode, showResult(result, 'replay-new-e2e')).toBe(0);
-      expect(result.stdout).not.toContain('repair_target_unauthorized');
-      expect(result.stdout).toContain('UNIQUE_BRANCH=feat/x');
-    } finally {
-      rmSync(nodeOutDir, { recursive: true, force: true });
-    }
-  });
-});
-
 describe('F-6A: BRANCH allowlist regex validator', () => {
   it('Test 1: rejects malformed double-thread-suffix branch name', () => {
     const result = bash(F6A_VALIDATOR, worktreeDir, {

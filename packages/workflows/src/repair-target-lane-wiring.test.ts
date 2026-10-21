@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'bun:test';
-import { readFileSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { delimiter, join } from 'path';
 import {
   clearRegistry,
   registerBuiltinProviders,
   registerCommunityProviders,
 } from '@archon/providers';
 import { parseWorkflow } from './loader';
+import { substituteNodeOutputRefs } from './dag-executor';
+import type { NodeOutput } from './schemas/workflow-run';
 
 clearRegistry();
 registerBuiltinProviders();
@@ -83,7 +86,122 @@ function step4b(prompt: string): string {
   return prompt.slice(start, end);
 }
 
+function runBash(script: string, cwd: string, env: Record<string, string> = {}) {
+  const result = Bun.spawnSync(['bash', '-c', script], {
+    cwd,
+    env: { ...process.env, ...env },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  return {
+    exitCode: result.exitCode ?? 1,
+    stdout: result.stdout.toString(),
+    stderr: result.stderr.toString(),
+  };
+}
+
+const AUTH_PARSER = [
+  "DECIDE_OUTPUT_CLEAN=$(printf '%s\\n' \"$DECIDE_OUTPUT\" | tr -d '`')",
+  "REPAIR_TARGET_AUTHORIZED=$(printf '%s\\n' \"$DECIDE_OUTPUT_CLEAN\" | sed -n 's/^[[:space:]]*repair_target_authorized_by_spec:[[:space:]]*\\(#[0-9][0-9]*\\)[[:space:]]*$/\\1/p' | head -n 1)",
+  'printf \'AUTHORIZED=<%s>\\n\' "$REPAIR_TARGET_AUTHORIZED"',
+  '',
+].join('\n');
+
+const REPLAY_DECIDE_TEXT = [
+  'push_target: feature-branch: feat/should-not-mint',
+  'repair_target_pr: #7',
+  'repair_target_branch: feat/x',
+  'repo: thinmansoftware/bdc-harness',
+  'repair_target_authorized_by_spec: #7',
+].join('\n');
+
 describe('repair-target lane wiring', () => {
+  it('Replay Test 1: the old quoted-heredoc capture yields an empty authorization', () => {
+    const oldCapture = [
+      'set -euo pipefail',
+      "DECIDE_OUTPUT=$(cat <<'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013'",
+      '$decide-push-target.output',
+      'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013',
+      ')',
+      '',
+    ].join('\n');
+    const nodeOutputs = new Map<string, NodeOutput>([
+      ['decide-push-target', { state: 'completed', output: REPLAY_DECIDE_TEXT }],
+    ]);
+    const substituted = substituteNodeOutputRefs(oldCapture, nodeOutputs, true);
+    expect(substituted).toContain("repair_target_authorized_by_spec: #7'");
+    const result = runBash(substituted + AUTH_PARSER, REPO_ROOT);
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.stdout).toContain('AUTHORIZED=<>');
+  });
+
+  it('Replay Test 2: node-out capture authorizes #7 and reaches UNIQUE_BRANCH', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'repair-target-replay-'));
+    const nodeOut = join(fixture, 'node-out');
+    const fakeBin = join(fixture, 'bin');
+    try {
+      for (const dir of [nodeOut, fakeBin]) Bun.spawnSync(['mkdir', '-p', dir]);
+      Bun.spawnSync(['git', 'init', '--initial-branch=main'], { cwd: fixture });
+      Bun.spawnSync(['git', 'config', 'user.email', 'test@test.com'], { cwd: fixture });
+      Bun.spawnSync(['git', 'config', 'user.name', 'Test'], { cwd: fixture });
+      writeFileSync(join(fixture, 'README.md'), 'init\n');
+      Bun.spawnSync(['git', 'add', 'README.md'], { cwd: fixture });
+      Bun.spawnSync(['git', 'commit', '-m', 'init'], { cwd: fixture });
+      const headOid = runBash('git rev-parse HEAD', fixture).stdout.trim();
+      Bun.spawnSync(['git', 'init', '--bare', join(fixture, 'origin')]);
+      Bun.spawnSync(['git', 'remote', 'add', 'origin', join(fixture, 'origin')], { cwd: fixture });
+      Bun.spawnSync(['git', 'push', 'origin', 'HEAD:feat/x'], { cwd: fixture });
+      writeFileSync(join(nodeOut, 'decide-push-target.out'), REPLAY_DECIDE_TEXT);
+      writeFileSync(
+        join(nodeOut, 'plan-review.out'),
+        '=== APPROVED_PLAN_BEGIN ===\nCommit message: fix: x\nrepair_target_authorized_by_spec: #7\n=== APPROVED_PLAN_END ===\n'
+      );
+      writeFileSync(
+        join(fakeBin, 'gh'),
+        `#!/bin/sh
+filter=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--jq" ]; then filter=$2; break; fi
+  shift
+done
+[ -n "$filter" ] || exit 2
+printf '%s\\n' '${JSON.stringify({ state: 'OPEN', headRefName: 'feat/x', isCrossRepository: false, headRepositoryOwner: { login: 'thinmansoftware' }, headRepository: { name: 'bdc-harness' }, headRefOid: headOid })}' | jq -r "$filter"
+`
+      );
+      chmodSync(join(fakeBin, 'gh'), 0o755);
+
+      const nodes = nodesOf('bdc-feature-development.yaml');
+      const commitBash =
+        nodeOf(nodes, 'commit-and-push', 'bdc-feature-development.yaml').bash ?? '';
+      const captureEnd = 'PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")';
+      const capture = commitBash.slice(0, commitBash.indexOf(captureEnd) + captureEnd.length);
+      const guardStart = "DECIDE_OUTPUT_CLEAN=$(printf '%s\\n' \"$DECIDE_OUTPUT\" | tr -d '`')";
+      const guardEnd = '\ngit status --short';
+      let guard = commitBash.slice(commitBash.indexOf(guardStart), commitBash.indexOf(guardEnd));
+      guard = guard
+        .replace('SPEC_TEXT=$read-spec.output', 'SPEC_TEXT="${SPEC_TEXT-}"')
+        .replace(
+          'CHECKOUT_OUTPUT=$checkout-repair-target.output',
+          'CHECKOUT_OUTPUT="${CHECKOUT_OUTPUT-}"'
+        );
+      const result = runBash(
+        `${capture}\n${guard}\necho "UNIQUE_BRANCH=$UNIQUE_BRANCH"\n`,
+        fixture,
+        {
+          ARCHON_NODE_OUT: nodeOut,
+          SPEC_TEXT: 'WO: WO-TEST\nRepair target: PR #7 (branch feat/x)',
+          CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${headOid}`,
+          PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ''}`,
+        }
+      );
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(result.stdout).toContain('UNIQUE_BRANCH=feat/x');
+      expect(result.stdout).not.toContain('repair_target_unauthorized');
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
   it('Test 2: the EXPECTED_LANES list cannot drift', () => {
     expect(laneFiles()).toEqual(EXPECTED_LANES);
   });
