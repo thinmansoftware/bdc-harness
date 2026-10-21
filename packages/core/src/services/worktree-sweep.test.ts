@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { mkdtemp, rm, writeFile, mkdir, utimes, rename } from 'fs/promises';
+import { mkdtemp, rm, writeFile, mkdir, utimes, rename, symlink } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -892,7 +892,7 @@ describe('sweepTerminalWorkflowWorktrees', () => {
     );
   });
 
-  test('uses and retains the default quarantine root outside workspaces', async () => {
+  test('uses and retains the default quarantine root inside workspaces', async () => {
     const parent = await mkdtemp(join(tmpdir(), 'archon-default-quarantine-'));
     const root = join(parent, 'workspaces');
     await mkdir(root, { recursive: true });
@@ -909,8 +909,8 @@ describe('sweepTerminalWorkflowWorktrees', () => {
         getCanonicalRepoPathFn: async () => root,
       });
       const quarantined = join(
-        parent,
-        'worktree-quarantine',
+        root,
+        '.worktree-quarantine',
         '2026-07-13',
         'owner__repo__thread-old'
       );
@@ -922,9 +922,37 @@ describe('sweepTerminalWorkflowWorktrees', () => {
         now: new Date('2026-07-22T00:00:00Z'),
         quarantineRetentionMs: 7 * 24 * 60 * 60 * 1000,
       });
-      expect(second.quarantineDeleted).toEqual([join(parent, 'worktree-quarantine', '2026-07-13')]);
+      expect(second.quarantineDeleted).toEqual([join(root, '.worktree-quarantine', '2026-07-13')]);
     } finally {
       await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('refuses a configured quarantine root outside workspaces', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'archon-outside-quarantine-'));
+    try {
+      await expect(
+        sweepTerminalWorkflowWorktrees({ workspacesRoot, quarantineRoot: outside })
+      ).rejects.toThrow('quarantine_root_outside_workspaces');
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('refuses a quarantine destination that escapes through a symlink', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'archon-symlink-quarantine-'));
+    const link = join(workspacesRoot, 'quarantine-link');
+    await symlink(outside, link);
+    try {
+      await expect(
+        sweepTerminalWorkflowWorktrees({
+          workspacesRoot,
+          quarantineRoot: join(link, 'nested'),
+        })
+      ).rejects.toThrow('quarantine_root_outside_workspaces');
+      expect(existsSync(join(outside, 'nested'))).toBe(false);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
     }
   });
 

@@ -447,6 +447,9 @@ export async function hasUnpushedCommits(
       : await operation();
     return stdout.trim().length === 0;
   } catch (error) {
+    // The maintenance limiter owns the sole run-level diagnostic. Its sentinel
+    // is expected for every queued path after an EAGAIN trip.
+    if ((error as Error).name === 'MaintenanceGitUnavailableError') return true;
     getLog().warn({ err: error, workingPath }, 'unpushed_commits_check_failed_assuming_unpushed');
     return true;
   }

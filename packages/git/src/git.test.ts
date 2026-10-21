@@ -775,6 +775,19 @@ branch refs/heads/feature/auth
         'uncommitted_changes_check_failed_assuming_dirty'
       );
     });
+
+    test('does not log unpushed-check warnings after the maintenance limiter trips', async () => {
+      mockLogger.warn.mockClear();
+      const error = new Error('maintenance git unavailable for this cleanup run');
+      error.name = 'MaintenanceGitUnavailableError';
+      const execute = mock(async () => Promise.reject(error));
+
+      expect(await git.hasUnpushedCommits('/workspace/later', { execute })).toBe(true);
+      expect(mockLogger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'unpushed_commits_check_failed_assuming_unpushed'
+      );
+    });
   });
 
   describe('getDefaultBranch', () => {

@@ -150,7 +150,9 @@ async function directorySize(path: string): Promise<number> {
 }
 
 function defaultQuarantineRoot(workspacesRoot: string): string {
-  return resolve(join(workspacesRoot, '..', 'worktree-quarantine'));
+  // Quarantine is still deletion-capable storage, so keep it inside the one
+  // container-managed tree this maintenance job is authorized to mutate.
+  return resolve(join(workspacesRoot, '.worktree-quarantine'));
 }
 
 function quarantineDateFolder(now: Date): string {
@@ -189,6 +191,7 @@ async function getWorktreeLastCommitDate(
   try {
     return await getLastCommitDateFn(worktreePath);
   } catch (error) {
+    if ((error as Error).name === 'MaintenanceGitUnavailableError') return null;
     getLog().warn({ err: error, worktreePath }, 'worktree_sweep_last_commit_date_lookup_failed');
     return null;
   }
@@ -408,6 +411,16 @@ function isContained(root: string, target: string): boolean {
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
+async function canonicalTargetPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    const parent = dirname(path);
+    if (parent === path) return resolve(path);
+    return join(await canonicalTargetPath(parent), basename(path));
+  }
+}
+
 export async function sweepTerminalWorkflowWorktrees(
   opts: WorktreeSweepOptions = {}
 ): Promise<WorktreeSweepReport> {
@@ -420,9 +433,10 @@ export async function sweepTerminalWorkflowWorktrees(
     resolve(workspacesRoot)
   );
   const quarantineRoot = opts.quarantineRoot ?? defaultQuarantineRoot(workspacesRoot);
-  const canonicalQuarantineRoot = await realpath(quarantineRoot).catch(() =>
-    resolve(quarantineRoot)
-  );
+  const canonicalQuarantineRoot = await canonicalTargetPath(quarantineRoot);
+  if (!isContained(canonicalWorkspacesRoot, canonicalQuarantineRoot)) {
+    throw new Error('quarantine_root_outside_workspaces');
+  }
   const now = opts.now ?? new Date();
   const listRuns = opts.listRuns ?? listWorkflowRunsWithWorkingPath;
   const listActiveEnvironments = opts.listActiveEnvironments ?? listActiveEnvironmentsForSweep;
@@ -443,19 +457,15 @@ export async function sweepTerminalWorkflowWorktrees(
   const getCanonicalRepoPathFn =
     opts.getCanonicalRepoPathFn ??
     ((path: string): Promise<string> => getCanonicalRepoPath(toWorktreePath(path)));
-  const assertContainedTarget = async (root: string, path: string): Promise<void> => {
-    const canonical = await realpath(path).catch(() => resolve(path));
-    if (!isContained(root, canonical)) throw new Error('target_outside_allowed_root');
-  };
-  const moveDir = async (from: string, to: string): Promise<void> => {
-    const canonicalFrom = await realpath(from).catch(() => resolve(from));
-    const fromWorkspace = isContained(canonicalWorkspacesRoot, canonicalFrom);
-    const fromQuarantine = isContained(canonicalQuarantineRoot, canonicalFrom);
-    const toWorkspace = isContained(canonicalWorkspacesRoot, resolve(to));
-    const toQuarantine = isContained(canonicalQuarantineRoot, resolve(to));
-    if ((!fromWorkspace && !fromQuarantine) || (!toWorkspace && !toQuarantine)) {
+  const assertContainedTarget = async (path: string): Promise<void> => {
+    const canonical = await canonicalTargetPath(path);
+    if (!isContained(canonicalWorkspacesRoot, canonical)) {
       throw new Error('target_outside_allowed_root');
     }
+  };
+  const moveDir = async (from: string, to: string): Promise<void> => {
+    await assertContainedTarget(from);
+    await assertContainedTarget(to);
     await (opts.moveDir ?? rename)(from, to);
   };
   const pruneWorktree = async (repoPath: string): Promise<void> => {
@@ -472,11 +482,15 @@ export async function sweepTerminalWorkflowWorktrees(
   const removeQuarantineDir =
     opts.removeQuarantineDir ??
     (async (path: string): Promise<void> => {
-      await assertContainedTarget(canonicalQuarantineRoot, path);
+      const canonical = await canonicalTargetPath(path);
+      if (!isContained(canonicalQuarantineRoot, canonical)) {
+        throw new Error('target_outside_allowed_root');
+      }
+      await assertContainedTarget(path);
       await rm(path, { recursive: true, force: true });
     });
   const destroyWorktree = async (path: string): Promise<void> => {
-    await assertContainedTarget(canonicalWorkspacesRoot, path);
+    await assertContainedTarget(path);
     await (opts.destroyWorktree ?? defaultDestroyWorktree)(path);
   };
 
