@@ -52,7 +52,7 @@ function assertRateLimit(response: Response): void {
   }
 }
 
-function normalizeRepo(value: string): string {
+export function normalizeRepo(value: string): string {
   return value
     .trim()
     .replace(/^https?:\/\/github\.com\//i, '')
