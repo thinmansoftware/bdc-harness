@@ -165,6 +165,14 @@ export interface CascadeRunRecord {
     prUrl: string;
     checkedAtTier: TierName | null;
   };
+  /** Discovery uncertainty blocks provider spend; contains no provider diagnostics. */
+  claimDiscoveryBlock?: {
+    phase: 'admission' | 'before-fire' | 'before-climb';
+    reason: 'request_failed' | 'invalid_response' | 'invalid_repository';
+    checkedAt: string;
+    /** Validated local pool-backoff evidence; no automatic retry is scheduled. */
+    quota?: import('@archon/core/github/metering').GitHubQuotaMetadata;
+  };
   supervisorRecovery?: {
     ownerId: string;
     fencingToken: number;

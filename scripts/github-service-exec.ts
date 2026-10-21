@@ -12,6 +12,9 @@ import {
   flushGitHubApiMeter,
   observationFromResponse,
   recordGitHubApiCall,
+  GitHubPoolBackoffError,
+  GITHUB_QUOTA_RECORD_PREFIX,
+  serializeGitHubQuotaError,
   type GitHubApiObservation,
 } from '../packages/core/src/github/metering';
 
@@ -19,6 +22,27 @@ interface CommandResult {
   exitCode: number;
   stdout: Uint8Array;
   stderr: Uint8Array;
+}
+
+/** Narrow proof for one REST-only command; ambiguous commands may mix resources. */
+function commandResources(command: string, args: readonly string[]): readonly string[] {
+  const executable = command.split(/[\\/]/).at(-1);
+  const endpoint = args[1] ?? '';
+  const pulls =
+    /^repos\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\/pulls\?state=all&per_page=100&sort=created&direction=asc$/;
+  if (
+    (executable === 'gh' || executable === 'gh.exe') &&
+    args.length === 4 &&
+    args[0] === 'api' &&
+    args[2] === '--paginate' &&
+    args[3] === '--slurp' &&
+    // Compare the whole match: '$' alone also accepts a trailing newline.
+    pulls.exec(endpoint)?.[0] === endpoint
+  ) {
+    // Keep the CLI transport/secondary-limit gate even for a proven REST call.
+    return ['core', 'cli'];
+  }
+  return ['core', 'graphql', 'search', 'cli'];
 }
 
 /** Only buffer input when gh explicitly requests it, so permission retries can replay it. */
@@ -92,6 +116,11 @@ export async function runGitHubServiceCommand(input: {
   execute?: (command: string[], env: Record<string, string | undefined>) => CommandResult;
   db?: IDatabase;
 }): Promise<CommandResult> {
+  // Classify and execute the same argv even if a caller mutates its input while
+  // quota checks or token minting await. Permission retries reuse this snapshot.
+  const command = input.command;
+  const args = [...input.args];
+  const resources = commandResources(command, args);
   const env = input.env ?? process.env;
   const identity = input.identity ?? resolveServiceGitHubAuth(input.service, env);
   const db = input.db ?? getDatabase();
@@ -119,20 +148,14 @@ export async function runGitHubServiceCommand(input: {
     selected: ServiceGitHubAuth,
     permissionFallback = false
   ): Promise<CommandResult> => {
-    // A gh command may use REST and GraphQL in the same operation. Refuse
-    // conservatively if any of its pool's known resources is exhausted.
-    await assertPersistedGitHubPoolAvailable(
-      selected.poolId,
-      ['core', 'graphql', 'search', 'cli'],
-      db
-    );
+    await assertPersistedGitHubPoolAvailable(selected.poolId, resources, db);
     const token =
       selected.kind === 'pat'
         ? selected.token
         : await (input.token ?? getServiceGitHubToken)(selected);
     let result: CommandResult;
     try {
-      result = execute([input.command, ...input.args], {
+      result = execute([command, ...args], {
         ...env,
         GH_TOKEN: token,
         GITHUB_TOKEN: token,
@@ -173,10 +196,25 @@ export async function runGitHubServiceCommand(input: {
     }
     // Persist before exit/retry so the next CLI process sees the same pool.
     await flushGitHubApiMeter(db);
+    // Only captured HTTP observations establish a first-response quota refusal.
+    // No-trace prose keeps its existing conservative local backoff, without
+    // promoting arbitrary provider diagnostics into structured response truth.
+    if (result.exitCode !== 0) {
+      const limited = trace.observations.filter(observation => observation.rateLimited);
+      limited.sort((a, b) => (b.backoffUntil ?? 0) - (a.backoffUntil ?? 0));
+      if (limited[0])
+        throw new GitHubPoolBackoffError(
+          selected.poolId,
+          limited[0].resource,
+          limited[0].backoffUntil ?? Date.now()
+        );
+    }
     let stderr = trace.stderr;
     for (const secret of [token, fallback]) {
       if (secret) stderr = stderr.split(secret).join('[redacted]');
     }
+    // The provider cannot inject the wrapper's reserved error protocol.
+    stderr = stderr.split(GITHUB_QUOTA_RECORD_PREFIX).join('[untrusted-quota-record]:');
     return { ...result, stderr: new TextEncoder().encode(stderr) };
   };
   const result = await invoke(identity);
@@ -198,6 +236,13 @@ export async function runGitHubServiceCommand(input: {
   return result;
 }
 
+export function githubServiceErrorDiagnostic(error: unknown): string {
+  return (
+    serializeGitHubQuotaError(error) ??
+    `github_service_command_failed:${error instanceof Error ? error.name : 'unknown'}`
+  );
+}
+
 if (import.meta.main) {
   // stdout is gh's machine-readable response, never database startup logs.
   rootLogger.level = 'silent';
@@ -216,9 +261,7 @@ if (import.meta.main) {
     if (result.stderr.byteLength) await Bun.write(Bun.stderr, result.stderr);
     process.exitCode = result.exitCode;
   } catch (error) {
-    console.error(
-      `github_service_command_failed:${error instanceof Error ? error.name : 'unknown'}`
-    );
+    console.error(githubServiceErrorDiagnostic(error));
     process.exitCode = 1;
   } finally {
     await closeDatabase();

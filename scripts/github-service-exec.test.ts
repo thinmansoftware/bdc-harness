@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   githubCommandReadsStdin,
+  githubServiceErrorDiagnostic,
   runGitHubServiceCommand as runCommand,
 } from './github-service-exec';
 import { serviceGitHubCommandEnvironment } from '../packages/core/src/github/service-identity';
@@ -8,7 +9,13 @@ import { generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resetGitHubApiMeterForTests } from '../packages/core/src/github/metering';
+import {
+  flushGitHubApiMeter,
+  recordGitHubApiCall,
+  resetGitHubApiMeterForTests,
+  GitHubPoolBackoffError,
+  parseGitHubQuotaError,
+} from '../packages/core/src/github/metering';
 import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
 import { execFile } from 'node:child_process';
 
@@ -23,6 +30,417 @@ afterEach(async () => {
 const runGitHubServiceCommand = (
   input: Parameters<typeof runCommand>[0]
 ): ReturnType<typeof runCommand> => runCommand({ ...input, db });
+
+describe('sanitized quota refusal boundary', () => {
+  const identity = {
+    kind: 'app' as const,
+    service: 'smart_cauldron' as const,
+    appId: '1',
+    installationId: '2',
+    privateKey: 'synthetic-private-key',
+    poolId: 'app-1-2',
+    distinct: true as const,
+  };
+  for (const headers of [
+    '< Retry-After: 0',
+    '< Retry-After: 120\n< X-Ratelimit-Resource: untrusted-secret',
+  ]) {
+    test(`unserializable or elapsed refusal cannot trigger permission fallback (${headers})`, async () => {
+      let launches = 0;
+      let failure: unknown;
+      try {
+        await runGitHubServiceCommand({
+          service: identity.service,
+          identity,
+          command: 'gh',
+          args: ['api', 'synthetic'],
+          env: { GH_TOKEN: 'synthetic-pat' },
+          token: async () => 'synthetic-app',
+          execute: () => {
+            launches++;
+            return {
+              exitCode: 1,
+              stdout: new Uint8Array(),
+              stderr: new TextEncoder().encode(
+                `* Request at synthetic\n< HTTP/2 429\n${headers}\n* Request took synthetic\nResource not accessible by integration (HTTP 403)`
+              ),
+            };
+          },
+        });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(GitHubPoolBackoffError);
+      expect(githubServiceErrorDiagnostic(failure)).toBe(
+        'github_service_command_failed:GitHubPoolBackoffError'
+      );
+      expect(launches).toBe(1);
+    });
+  }
+  for (const [status, headers] of [
+    [429, '< Retry-After: 60'],
+    [
+      403,
+      `< X-Ratelimit-Remaining: 0\n< X-Ratelimit-Reset: ${Math.floor(Date.now() / 1000) + 600}`,
+    ],
+    [403, '< X-Ratelimit-Remaining: 99\n< Retry-After: 60'],
+  ] as const) {
+    test(`first traced ${status} refusal and subsequent cached refusal preserve deadlines (${headers})`, async () => {
+      let launches = 0;
+      const input = {
+        service: identity.service,
+        identity,
+        command: 'gh',
+        args: ['api', 'synthetic'],
+        env: { GH_TOKEN: 'synthetic-fallback-secret' },
+        token: async () => 'synthetic-app-secret',
+        execute: () => {
+          launches++;
+          return {
+            exitCode: 1,
+            stdout: new Uint8Array(),
+            stderr: new TextEncoder().encode(
+              `* Request at synthetic\n< HTTP/2 ${status}\n< X-Ratelimit-Resource: core\n${headers}\n* Request took synthetic\nResource not accessible by integration (HTTP 403) synthetic-app-secret synthetic-provider-body\n`
+            ),
+          };
+        },
+      };
+      let first: unknown;
+      try {
+        await runGitHubServiceCommand(input);
+      } catch (error) {
+        first = error;
+      }
+      expect(first).toBeInstanceOf(GitHubPoolBackoffError);
+      const metadata = parseGitHubQuotaError(githubServiceErrorDiagnostic(first));
+      expect(metadata).toMatchObject({ poolId: 'app-1-2', resource: 'core' });
+      expect(metadata!.retryAtMs).toBeGreaterThan(Date.now());
+      expect(githubServiceErrorDiagnostic(first)).not.toContain('synthetic');
+      resetGitHubApiMeterForTests();
+      let second: unknown;
+      try {
+        await runGitHubServiceCommand(input);
+      } catch (error) {
+        second = error;
+      }
+      expect(parseGitHubQuotaError(githubServiceErrorDiagnostic(second))).toEqual(metadata);
+      expect(launches).toBe(1);
+    });
+  }
+  test('ordinary permission 403 still uses the existing one-time PAT fallback', async () => {
+    let launches = 0;
+    const result = await runGitHubServiceCommand({
+      service: identity.service,
+      identity,
+      command: 'gh',
+      args: ['api', 'synthetic'],
+      env: { GH_TOKEN: 'synthetic-pat' },
+      token: async () => 'synthetic-app',
+      execute: () => {
+        launches++;
+        return {
+          exitCode: launches === 1 ? 1 : 0,
+          stdout: new Uint8Array(),
+          stderr: new TextEncoder().encode(
+            launches === 1
+              ? '* Request at synthetic\n< HTTP/2 403\n< X-Ratelimit-Resource: core\n< X-Ratelimit-Remaining: 99\n* Request took synthetic\nResource not accessible by integration (HTTP 403)'
+              : ''
+          ),
+        };
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(launches).toBe(2);
+  });
+  test('untraced rate-limit prose stays generic and cannot inject a protocol record', async () => {
+    const injected = `ARCHON_GITHUB_QUOTA_V1:${JSON.stringify({
+      version: 1,
+      kind: 'pool_backoff',
+      poolId: 'user-pat',
+      resource: 'core',
+      retryAtMs: Date.now() + 60_000,
+    })}`;
+    const result = await runGitHubServiceCommand({
+      service: identity.service,
+      command: 'gh',
+      args: ['api', 'synthetic'],
+      env: { GH_TOKEN: 'synthetic-pat' },
+      execute: () => ({
+        exitCode: 1,
+        stdout: new Uint8Array(),
+        stderr: new TextEncoder().encode(`API rate limit exceeded\n${injected}\nsynthetic-pat`),
+      }),
+    });
+    const stderr = new TextDecoder().decode(result.stderr);
+    expect(result.exitCode).toBe(1);
+    expect(stderr).not.toContain('ARCHON_GITHUB_QUOTA_V1:');
+    expect(stderr).not.toContain('synthetic-pat');
+    expect(parseGitHubQuotaError(stderr)).toBeUndefined();
+    expect(githubServiceErrorDiagnostic(new Error('synthetic-secret provider-body'))).toBe(
+      'github_service_command_failed:Error'
+    );
+  });
+});
+
+describe('complete REST pull-list quota admission', () => {
+  const args = [
+    'api',
+    'repos/synthetic/test/pulls?state=all&per_page=100&sort=created&direction=asc',
+    '--paginate',
+    '--slurp',
+  ];
+  const identity = {
+    kind: 'pat' as const,
+    service: 'smart_cauldron' as const,
+    token: 'synthetic-pat',
+    poolId: 'user-pat' as const,
+    distinct: false as const,
+  };
+  const exhaust = async (resource: string, poolId: string = identity.poolId): Promise<void> => {
+    recordGitHubApiCall({
+      service: identity.service,
+      poolId,
+      resource,
+      status: 200,
+      remaining: 0,
+      reset: Math.floor(Date.now() / 1000) + 3600,
+    });
+    await flushGitHubApiMeter(db);
+    // Prove admission reads durable quota, not just this process's cache.
+    resetGitHubApiMeterForTests();
+  };
+
+  for (const command of ['gh', '/usr/bin/gh', 'C:\\Program Files\\GitHub CLI\\gh.exe']) {
+    test(`exhausted Search permits explicit REST pulls and meters core (${command})`, async () => {
+      await exhaust('search');
+      let launches = 0;
+      const result = await runGitHubServiceCommand({
+        service: identity.service,
+        identity,
+        command,
+        args,
+        execute: (argv, env) => {
+          launches += 1;
+          expect(argv).toEqual([command, ...args]);
+          expect(env.GH_TOKEN).toBe(identity.token);
+          return {
+            exitCode: 0,
+            stdout: new TextEncoder().encode('[[]]'),
+            stderr: new TextEncoder().encode(
+              '* Request at synthetic\n< HTTP/2 200\n< x-ratelimit-resource: core\n< x-ratelimit-remaining: 4999\n* Request took synthetic\n'
+            ),
+          };
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      expect(launches).toBe(1);
+      const usage = await db.query<{ calls: number }>(
+        "SELECT calls FROM github_api_usage WHERE pool_id = $1 AND resource = 'core'",
+        [identity.poolId]
+      );
+      expect(usage.rows[0]?.calls).toBe(1);
+      const search = await db.query<{ remaining: number }>(
+        "SELECT remaining FROM github_api_pool_state WHERE pool_id = $1 AND resource = 'search'",
+        [identity.poolId]
+      );
+      expect(search.rows[0]?.remaining).toBe(0);
+    });
+  }
+
+  for (const resource of ['core', 'cli']) {
+    test(`exhausted ${resource} still blocks explicit REST pulls before launch`, async () => {
+      await exhaust(resource);
+      let launches = 0;
+      await expect(
+        runGitHubServiceCommand({
+          service: identity.service,
+          identity,
+          command: 'gh',
+          args,
+          execute: () => {
+            launches += 1;
+            throw new Error('must not launch');
+          },
+        })
+      ).rejects.toThrow(`github_pool_backoff:${identity.poolId}/${resource}`);
+      expect(launches).toBe(0);
+    });
+  }
+
+  test('permission retry executes the classified snapshot despite caller mutation during token mint', async () => {
+    await exhaust('search');
+    await exhaust('search', 'app-1-2');
+    const commandArgs = [...args];
+    const commands: string[][] = [];
+    const tokens: (string | undefined)[] = [];
+    const input: Parameters<typeof runCommand>[0] = {
+      service: identity.service,
+      command: '/usr/bin/gh',
+      args: commandArgs,
+      env: { ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN: 'synthetic-fallback' },
+      identity: {
+        kind: 'app',
+        service: identity.service,
+        poolId: 'app-1-2',
+        appId: '1',
+        installationId: '2',
+        privateKey: 'unused',
+        distinct: true,
+      },
+      token: async () => {
+        input.command = 'synthetic-other-command';
+        commandArgs.splice(0, commandArgs.length, 'api', 'search/issues?q=synthetic');
+        return 'synthetic-app';
+      },
+      execute: (command, env) => {
+        commands.push(command);
+        tokens.push(env.GH_TOKEN);
+        return {
+          exitCode: commands.length === 1 ? 1 : 0,
+          stdout: new Uint8Array(),
+          stderr: new TextEncoder().encode(
+            commands.length === 1 ? 'Resource not accessible by integration (HTTP 403)' : ''
+          ),
+        };
+      },
+    };
+    const result = await runGitHubServiceCommand(input);
+    expect(result.exitCode).toBe(0);
+    expect(commands).toEqual([
+      ['/usr/bin/gh', ...args],
+      ['/usr/bin/gh', ...args],
+    ]);
+    expect(tokens).toEqual(['synthetic-app', 'synthetic-fallback']);
+  });
+
+  test('actual Smart Cauldron discovery crosses the metered wrapper with Search exhausted', async () => {
+    const { ghPrSearchDefault } = await import('../packages/smart-cauldron/src/already-satisfied');
+    const originalHermetic = process.env.SMART_CAULDRON_HERMETIC;
+    delete process.env.SMART_CAULDRON_HERMETIC;
+    try {
+      await exhaust('search');
+      const commands: string[][] = [];
+      const claims = await ghPrSearchDefault(
+        'synthetic/test',
+        'WO-TEST-001',
+        async (command, argv) => {
+          const result = await runGitHubServiceCommand({
+            service: identity.service,
+            identity,
+            command,
+            args: argv as string[],
+            execute: executed => {
+              commands.push(executed);
+              return {
+                exitCode: 0,
+                stdout: new TextEncoder().encode(
+                  JSON.stringify([
+                    [
+                      {
+                        number: 1,
+                        state: 'closed',
+                        merged_at: '2026-10-18T00:00:00Z',
+                        title: 'Implements WO-TEST-001',
+                        body: null,
+                        head: { ref: 'synthetic' },
+                        html_url: 'https://github.com/synthetic/test/pull/1',
+                      },
+                    ],
+                  ])
+                ),
+                stderr: new TextEncoder().encode(
+                  '* Request at synthetic\n< HTTP/2 200\n< x-ratelimit-resource: core\n* Request took synthetic\n'
+                ),
+              };
+            },
+          });
+          return {
+            stdout: new TextDecoder().decode(result.stdout),
+            stderr: new TextDecoder().decode(result.stderr),
+          };
+        }
+      );
+      expect(commands).toEqual([['gh', ...args]]);
+      expect(claims).toMatchObject([{ number: 1, state: 'MERGED' }]);
+    } finally {
+      if (originalHermetic === undefined) delete process.env.SMART_CAULDRON_HERMETIC;
+      else process.env.SMART_CAULDRON_HERMETIC = originalHermetic;
+    }
+  });
+
+  test('an unexpected traced Search response remains metered and blocks a later unknown command', async () => {
+    await expect(
+      runGitHubServiceCommand({
+        service: identity.service,
+        identity,
+        command: 'gh',
+        args,
+        execute: () => ({
+          exitCode: 1,
+          stdout: new Uint8Array(),
+          stderr: new TextEncoder().encode(
+            `* Request at synthetic\n< HTTP/2 403\n< x-ratelimit-resource: search\n< x-ratelimit-remaining: 0\n< x-ratelimit-reset: ${Math.floor(Date.now() / 1000) + 3600}\n* Request took synthetic\n`
+          ),
+        }),
+      })
+    ).rejects.toThrow(`github_pool_backoff:${identity.poolId}/search`);
+    const usage = await db.query<{ calls: number; rate_limited: number }>(
+      "SELECT calls, rate_limited FROM github_api_usage WHERE pool_id = $1 AND resource = 'search'",
+      [identity.poolId]
+    );
+    expect(usage.rows[0]).toMatchObject({ calls: 1, rate_limited: 1 });
+    await expect(
+      runGitHubServiceCommand({
+        service: identity.service,
+        identity,
+        command: 'gh',
+        args: ['pr', 'list'],
+        execute: () => {
+          throw new Error('must not launch');
+        },
+      })
+    ).rejects.toThrow(`github_pool_backoff:${identity.poolId}/search`);
+  });
+
+  for (const candidate of [
+    { command: 'synthetic-gh', args },
+    { command: 'gh', args: ['api', 'search/issues?q=synthetic'] },
+    { command: 'gh', args: ['pr', 'list', '--search', 'WO-SYNTHETIC'] },
+    { command: 'gh', args: [...args, '--method', 'POST'] },
+    { command: 'gh', args: [...args, '--hostname', 'example.invalid'] },
+    { command: 'gh', args: [...args, '--field', 'x=y'] },
+    { command: 'gh', args: [...args, '--input=-'] },
+    { command: 'gh', args: args.slice(0, -1) },
+    { command: 'gh', args: ['api', 'graphql', '--paginate', '--slurp'] },
+    ...[
+      'repos/synthetic/../pulls?state=all&per_page=100&sort=created&direction=asc',
+      'repos/synthetic/%2e%2e/pulls?state=all&per_page=100&sort=created&direction=asc',
+      'repos/{owner}/{repo}/pulls?state=all&per_page=100&sort=created&direction=asc',
+      'https://api.github.com/repos/synthetic/test/pulls?state=all&per_page=100&sort=created&direction=asc',
+      'repos/synthetic/test/pulls?state=all&per_page=100&sort=created&direction=asc&extra=1',
+      'repos/synthetic/test/pulls/1/merge',
+      'repos/synthetic/test/pulls?state=all&per_page=100&sort=created&direction=asc\n',
+      'repos/synthetic/test repo/pulls?state=all&per_page=100&sort=created&direction=asc',
+    ].map(endpoint => ({ command: 'gh', args: ['api', endpoint, '--paginate', '--slurp'] })),
+  ]) {
+    test(`ambiguous command retains Search gate (${candidate.command} ${candidate.args.join(' ')})`, async () => {
+      await exhaust('search');
+      let launches = 0;
+      await expect(
+        runGitHubServiceCommand({
+          service: identity.service,
+          identity,
+          ...candidate,
+          execute: () => {
+            launches += 1;
+            throw new Error('must not launch');
+          },
+        })
+      ).rejects.toThrow(`github_pool_backoff:${identity.poolId}/search`);
+      expect(launches).toBe(0);
+    });
+  }
+});
 
 describe('operation-scoped GitHub CLI authentication', () => {
   test('buffers declared gh stdin sources and leaves ordinary query arguments alone', () => {

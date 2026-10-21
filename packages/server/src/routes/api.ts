@@ -6405,11 +6405,9 @@ export function registerApiRoutes(
       });
       // Race so a synchronous resume failure surfaces as 500 instead of hanging.
       const admitted = await Promise.race([admission, resumePromise]);
-      // A 'blocked' admission means the resumed cascade refused to fire because a
-      // duplicate live cascade already holds the WO lock (smart-cauldron
-      // acquireWoLock): nothing fired, no premium usage was spent, and the paused
-      // record was left untouched by resumeFrontierTier. Roll back the approval
-      // claim so the operator can retry/reject once the duplicate clears -- do NOT
+      // A blocked admission can mean a duplicate WO lock or unknown claim state.
+      // The paused record remains untouched by resumeFrontierTier. Roll back the
+      // approval claim so the operator can retry/reject once the blocker clears -- do NOT
       // report success, or the cascadeId would be wedged 'approved' forever with
       // neither a fire nor a path to re-resolve (WO Test 2 fail condition).
       if (admitted.status === 'blocked') {
@@ -6421,8 +6419,10 @@ export function registerApiRoutes(
         return apiError(
           c,
           409,
-          `Frontier resume for ${record.woId} could not fire: another cascade is already active for this WO. ` +
-            'The approval was rolled back -- retry once it clears.'
+          `Frontier resume for ${record.woId} could not fire: ` +
+            (admitted.claimDiscoveryBlock
+              ? 'claim discovery could not be completed. The approval was rolled back -- retry after GitHub discovery recovers.'
+              : 'another cascade is already active for this WO. The approval was rolled back -- retry once it clears.')
         );
       }
       return c.json({

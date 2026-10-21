@@ -30,6 +30,13 @@ function loadLiveTiers() {
 }
 import { loadRuleset } from '../conductor.js';
 import { TimeoutError } from '../poll.js';
+import { readCascadeRecordById } from '../frontier-approval.js';
+import { ClaimDiscoveryError, ghPrSearchDefault } from '../already-satisfied.js';
+import {
+  GitHubPoolBackoffError,
+  serializeGitHubQuotaError,
+  type GitHubQuotaMetadata,
+} from '@archon/core/github/metering';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -120,6 +127,261 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     },
   };
 }
+
+describe('claim discovery uncertainty', () => {
+  for (const [phase, lookupNumber] of [
+    ['admission', 1],
+    ['before-fire', 2],
+    ['before-climb', 3],
+  ] as const) {
+    test(`${phase} retains actual discovery quota in its durable blocked receipt`, async () => {
+      const retryAtMs = Date.now() + 120_000;
+      const wire = serializeGitHubQuotaError(
+        new GitHubPoolBackoffError('app-123-456', 'search', retryAtMs)
+      )!;
+      let lookups = 0,
+        fires = 0,
+        executions = 0;
+      const hermetic = process.env.SMART_CAULDRON_HERMETIC;
+      delete process.env.SMART_CAULDRON_HERMETIC;
+      try {
+        const options = baseOpts({
+          dispatchId: `quota-receipt-${randomUUID()}`,
+          deps: {
+            findWoClaim: async () => {
+              if (++lookups !== lookupNumber) return null;
+              await ghPrSearchDefault('thinmansoftware/test-project', 'WO-TEST-001', async () => {
+                executions++;
+                throw Object.assign(new Error('synthetic-private-error'), {
+                  stderr: 'synthetic-private-diagnostic\n' + wire + '\n',
+                });
+              });
+              throw new Error('discovery unexpectedly succeeded');
+            },
+            fire: async () => {
+              fires++;
+              return makeFireOk('prior-run');
+            },
+            poll: async () => makePollResult(),
+            judge: () => makeFailVerdict('needs revision'),
+            escalate: async () => undefined,
+          },
+        });
+        const result = await runCascade(options);
+        expect(result.status).toBe('blocked');
+        expect(result.claimDiscoveryBlock).toMatchObject({
+          phase,
+          reason: 'request_failed',
+          quota: {
+            version: 1,
+            kind: 'pool_backoff',
+            poolId: 'app-123-456',
+            resource: 'search',
+            retryAtMs,
+          },
+        });
+        expect(executions).toBe(1);
+        expect(lookups).toBe(lookupNumber);
+        expect(fires).toBe(phase === 'before-climb' ? 1 : 0);
+        expect(JSON.stringify(result)).not.toContain('synthetic-private');
+        expect(await readCascadeRecordById(result.cascadeId, options.outDir)).toEqual(result);
+        const replay = await runCascade({
+          ...options,
+          deps: {
+            ...options.deps,
+            findWoClaim: async () => null,
+          },
+        });
+        expect(replay).toEqual(result);
+        expect(fires).toBe(phase === 'before-climb' ? 1 : 0);
+      } finally {
+        if (hermetic === undefined) delete process.env.SMART_CAULDRON_HERMETIC;
+        else process.env.SMART_CAULDRON_HERMETIC = hermetic;
+      }
+    });
+  }
+
+  test('only valid request-failed quota is retained and copied', async () => {
+    const valid: GitHubQuotaMetadata = {
+      version: 1,
+      kind: 'pool_backoff',
+      poolId: 'user-pat',
+      resource: 'core',
+      retryAtMs: Date.now() + 120_000,
+    };
+    for (const [error, expected] of [
+      [new ClaimDiscoveryError('request_failed', valid), valid],
+      [new ClaimDiscoveryError('invalid_response', valid), undefined],
+      [new ClaimDiscoveryError('invalid_repository', valid), undefined],
+      [Object.assign(new Error('private'), { quota: valid }), undefined],
+      ...[
+        { ...valid, retryAtMs: 0 },
+        { ...valid, retryAtMs: '123' },
+        { ...valid, retryAtMs: Infinity },
+        { ...valid, resource: 'private' },
+        { ...valid, poolId: 'private' },
+        { ...valid, private: 'synthetic-private' },
+      ].map(value => [
+        new ClaimDiscoveryError('request_failed', value as GitHubQuotaMetadata),
+        undefined,
+      ]),
+    ] as const) {
+      const options = baseOpts({
+        deps: {
+          findWoClaim: async () => {
+            throw error;
+          },
+        },
+      });
+      const result = await runCascade(options);
+      expect(result.status).toBe('blocked');
+      expect(result.claimDiscoveryBlock?.quota).toEqual(expected);
+      if (expected) expect(result.claimDiscoveryBlock?.quota).not.toBe(expected);
+      expect(result.attempts).toHaveLength(0);
+      expect(JSON.stringify(result)).not.toContain('private');
+      expect(await readCascadeRecordById(result.cascadeId, options.outDir)).toEqual(result);
+    }
+  });
+
+  for (const [phase, lookupNumber] of [
+    ['admission', 1],
+    ['before-fire', 2],
+    ['before-climb', 3],
+  ] as const) {
+    test(`${phase} persists a truthful blocked receipt and prevents further fire`, async () => {
+      let lookups = 0;
+      let fires = 0;
+      let releases = 0;
+      let admitted: CascadeRunRecord | undefined;
+      const options = baseOpts({
+        onAdmission: record => {
+          admitted = structuredClone(record);
+        },
+        deps: {
+          findWoClaim: async () => {
+            if (++lookups === lookupNumber) throw new Error('synthetic-sensitive-provider-detail');
+            return null;
+          },
+          fire: async () => {
+            fires += 1;
+            return makeFireOk('run-before-block');
+          },
+          poll: async () => makePollResult(),
+          judge: () => makeFailVerdict('needs revision'),
+          escalate: async () => undefined,
+          releaseWoLock: async () => {
+            releases += 1;
+          },
+        },
+      });
+      const result = await runCascade(options);
+      expect(result.status).toBe('blocked');
+      expect(result.winningTier).toBeNull();
+      expect(result.claimDiscoveryBlock).toMatchObject({ phase, reason: 'request_failed' });
+      expect(Number.isFinite(Date.parse(result.claimDiscoveryBlock!.checkedAt))).toBe(true);
+      expect(fires).toBe(phase === 'before-climb' ? 1 : 0);
+      expect(releases).toBe(1);
+      expect(JSON.stringify(result)).not.toContain('synthetic-sensitive-provider-detail');
+      expect(await readCascadeRecordById(result.cascadeId, options.outDir)).toEqual(result);
+      if (phase === 'admission') {
+        expect(admitted?.status).toBe('blocked');
+        expect(result.attempts).toHaveLength(0);
+      } else if (phase === 'before-fire') {
+        expect(result.attempts[0]).toMatchObject({ runId: null, outcome: 'infra-error' });
+        expect(result.attempts[0]?.completedAt).not.toBeNull();
+      } else {
+        expect(result.attempts).toHaveLength(1);
+        expect(result.attempts[0]).toMatchObject({
+          runId: 'run-before-block',
+          outcome: 'gate-failed',
+        });
+      }
+    });
+  }
+
+  test('replayed dispatch returns its original blocked receipt after discovery recovers', async () => {
+    const options = baseOpts({
+      dispatchId: `claim-block-${randomUUID()}`,
+      deps: {
+        findWoClaim: async () => {
+          throw new Error('unavailable');
+        },
+      },
+    });
+    const first = await runCascade(options);
+    let fires = 0;
+    const replay = await runCascade({
+      ...options,
+      deps: {
+        ...options.deps,
+        findWoClaim: async () => null,
+        fire: async () => {
+          fires += 1;
+          return makeFireOk('must-not-fire');
+        },
+      },
+    });
+    expect(replay).toEqual(first);
+    expect(fires).toBe(0);
+    expect(await readCascadeRecordById(first.cascadeId, options.outDir)).toEqual(first);
+  });
+
+  for (const claimState of ['unknown', 'claimed'] as const) {
+    test(`admission persistence failure releases WO lock (${claimState})`, async () => {
+      let releases = 0;
+      let admissions = 0;
+      await expect(
+        runCascade(
+          baseOpts({
+            onAdmission: () => {
+              admissions += 1;
+            },
+            deps: {
+              findWoClaim: async () => {
+                if (claimState === 'unknown') throw new Error('unavailable');
+                return {
+                  number: 1,
+                  state: 'OPEN',
+                  title: 'claim',
+                  url: 'synthetic',
+                  repo: 'org/repo',
+                };
+              },
+              createRecord: async () => {
+                throw new Error('synthetic persistence failure');
+              },
+              releaseWoLock: async () => {
+                releases += 1;
+              },
+            },
+          })
+        )
+      ).rejects.toThrow('synthetic persistence failure');
+      expect(releases).toBe(1);
+      expect(admissions).toBe(0);
+    });
+  }
+
+  test('explicit allowClaimed bypass remains explicit and performs no lookup', async () => {
+    let lookups = 0;
+    const result = await runCascade(
+      baseOpts({
+        allowClaimed: true,
+        deps: {
+          findWoClaim: async () => {
+            lookups += 1;
+            throw new Error('must not look up');
+          },
+          fire: async () => makeFireOk('allowed-run'),
+          poll: async () => makePollResult(),
+          judge: () => makePassVerdict(),
+        },
+      })
+    );
+    expect(result.status).toBe('won');
+    expect(lookups).toBe(0);
+  });
+});
 
 test('cascade preserves the eligibility identity on every attempted lane', async () => {
   const expectedSpec = {
