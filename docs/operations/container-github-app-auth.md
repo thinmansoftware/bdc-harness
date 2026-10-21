@@ -206,8 +206,10 @@ the ONE shared thinman-overseer App (4574893, installation153295654) for
 Taskmaster and Duty Officer. Merge Manager never uses the reviewing Overseer App
 or shared user PAT.
 
-Existing shared App configuration becomes eligible for those services after
-the reviewed rebuild; activation must therefore verify this routing change.
+Existing shared App configuration becomes eligible only for Taskmaster and
+Duty Officer after the reviewed rebuild; the builder lanes (`run_nodes` and
+`smart_cauldron`) are never eligible for the shared reviewer App (see
+"Builder App" above). Activation must therefore verify this routing change.
 CLI commands resolve credentials per operation through the existing merge guard;
 git's credential helper also resolves at operation time. Parent PAT environment
 values are preserved, and only an explicitly permission-denied CLI call retries
