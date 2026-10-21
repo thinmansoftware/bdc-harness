@@ -807,6 +807,8 @@ export async function searchOpenPullRequestsReferencingTracker(
     // Paginate to exhaustion. If completeness cannot be established, throw so the
     // caller leaves the tracker open (a missed holder would close it prematurely).
     let retrieved = 0;
+    let expectedTotal: number | undefined;
+    const identities = new Set<string>();
     for (let page = 1; ; page++) {
       if (page > OPEN_PR_SEARCH_MAX_PAGES) {
         throw new Error(`open PR search exceeds retrievable results for query: ${q}`);
@@ -816,39 +818,101 @@ export async function searchOpenPullRequestsReferencingTracker(
         per_page: OPEN_PR_SEARCH_PAGE_SIZE,
         page,
       });
-      if (search.data.incomplete_results) {
-        throw new Error(`open PR search returned incomplete results for query: ${q}`);
+      const data = search.data;
+      if (
+        !data ||
+        typeof data !== 'object' ||
+        data.incomplete_results !== false ||
+        typeof data.total_count !== 'number' ||
+        !Number.isSafeInteger(data.total_count) ||
+        (data.total_count ?? -1) < 0 ||
+        !Array.isArray(data.items) ||
+        data.items.length > OPEN_PR_SEARCH_PAGE_SIZE
+      ) {
+        throw new Error(`open PR search returned incomplete or malformed results for query: ${q}`);
       }
-      const items = search.data.items;
-      retrieved += items.length;
-      for (const item of items) {
-        if (!item.pull_request || item.state !== 'open') continue;
-        const repo = parseRepositoryFromUrl(item.repository_url);
-        if (!repo) continue;
-        const key = `${repo.owner}/${repo.repo}#${item.number}`;
-        if (results.has(key)) continue;
-        results.set(key, {
-          owner: repo.owner,
-          repo: repo.repo,
-          number: item.number,
-          title: item.title,
-          body: item.body,
-          htmlUrl:
-            item.html_url ?? `https://github.com/${repo.owner}/${repo.repo}/pull/${item.number}`,
-        });
+      const total = data.total_count;
+      if (total > OPEN_PR_SEARCH_PAGE_SIZE * OPEN_PR_SEARCH_MAX_PAGES) {
+        throw new Error(`open PR search exceeds retrievable results for query: ${q}`);
       }
-      const total = search.data.total_count;
-      if (items.length < OPEN_PR_SEARCH_PAGE_SIZE) {
-        if (total !== undefined && retrieved < total) {
-          throw new Error(`open PR search short page before total_count for query: ${q}`);
+      if (expectedTotal !== undefined && total !== expectedTotal) {
+        throw new Error(`open PR search total changed for query: ${q}`);
+      }
+      expectedTotal = total;
+      retrieved += data.items.length;
+      for (const item of data.items) {
+        const candidate = validatedOpenSearchPullRequest(item);
+        const key = `${candidate.owner}/${candidate.repo}#${candidate.number}`.toLowerCase();
+        identities.add(key);
+        const prior = results.get(key);
+        if (
+          prior &&
+          (prior.title !== candidate.title ||
+            prior.body !== candidate.body ||
+            prior.htmlUrl.toLowerCase() !== candidate.htmlUrl.toLowerCase())
+        ) {
+          throw new Error(`open PR search returned conflicting copies for ${key}`);
         }
-        break;
+        results.set(key, candidate);
       }
-      if (total !== undefined && retrieved >= total) break;
+      if (retrieved > total || identities.size > total) {
+        throw new Error(`open PR search exceeds total_count for query: ${q}`);
+      }
+      if (identities.size === total) break;
+      if (data.items.length < OPEN_PR_SEARCH_PAGE_SIZE) {
+        throw new Error(`open PR search short page before distinct total_count for query: ${q}`);
+      }
     }
   }
 
   return [...results.values()];
+}
+
+/** Malformed or stale holder evidence must never become permission to close a tracker. */
+function validatedOpenSearchPullRequest(item: unknown): ReconcileOpenPullRequest {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    throw new Error('open PR search returned malformed row');
+  }
+  const row = item as Record<string, unknown>;
+  if (
+    !Number.isSafeInteger(row.number) ||
+    (row.number as number) <= 0 ||
+    typeof row.title !== 'string' ||
+    !(row.body === null || typeof row.body === 'string') ||
+    row.state !== 'open' ||
+    !row.pull_request ||
+    typeof row.pull_request !== 'object' ||
+    Array.isArray(row.pull_request) ||
+    typeof row.repository_url !== 'string' ||
+    typeof row.html_url !== 'string'
+  ) {
+    throw new Error('open PR search returned malformed row');
+  }
+  const repository =
+    /^https:\/\/api\.github\.com\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(
+      row.repository_url
+    );
+  const owner = repository?.[1];
+  const repo = repository?.[2];
+  if (
+    !owner ||
+    !repo ||
+    repo === '.' ||
+    repo === '..' ||
+    owner.toLowerCase() !== DEFAULT_ORG ||
+    row.html_url.toLowerCase() !==
+      `https://github.com/${owner}/${repo}/pull/${row.number as number}`.toLowerCase()
+  ) {
+    throw new Error('open PR search returned inconsistent repository or PR identity');
+  }
+  return {
+    owner,
+    repo,
+    number: row.number as number,
+    title: row.title,
+    body: row.body,
+    htmlUrl: row.html_url,
+  };
 }
 
 async function findTrackerIssueByStem(
