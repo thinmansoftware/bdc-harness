@@ -479,6 +479,10 @@ reviewer_guard() {
     echo "ERROR: builder_is_reviewer: acting login ${ACTING_LOGIN} equals reviewer identity ${REVIEWER_LOGIN} -- builders build, the reviewer reviews (bdc-xo WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01)" >&2
     return 1
   fi
+  # Lifted from the YAML guard: disable the github-service-exec permission fallback
+  # so an App 403 on gh pr create fails closed instead of silently retrying with the
+  # reviewer/user PAT fallback. (github-service-exec.test.ts asserts the TS behavior.)
+  export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
   echo "acting_login=${ACTING_LOGIN}"
   return 0
 }
@@ -520,6 +524,7 @@ else
   _no "Test 22b: fails closed when identity unknown" "rc=1 acting_login_unresolved creates=0" "rc=$RC creates=$(_guard_create_count) out=$OUT"
 fi
 unset -f gh
+unset ARCHON_GITHUB_NO_PERMISSION_FALLBACK
 rm -f "$GUARD_CREATE_COUNT_FILE"
 
 # Test 23 (Section 7 Test 6) -- all 13 bdc-feature-development*.yaml lanes carry the

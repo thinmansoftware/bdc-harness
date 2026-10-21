@@ -309,4 +309,46 @@ describe('operation-scoped GitHub CLI authentication', () => {
       }
     });
   }
+  // WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01 regression: the open-pr-if-needed
+  // node sets ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1 so a distinct builder App that
+  // passes the lane's acting-login guard but lacks pr-create permission fails closed
+  // instead of silently opening the PR with the reviewer/user PAT fallback.
+  test('ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1 blocks the permission fallback on App 403', async () => {
+    const used: string[] = [];
+    let mints = 0;
+    const result = await runGitHubServiceCommand({
+      service: 'run_nodes' as const,
+      command: 'gh',
+      args: ['pr', 'create', '--title', 'x'],
+      env: {
+        GH_TOKEN: 'reviewer-pat',
+        GITHUB_TOKEN: 'reviewer-pat',
+        ARCHON_GITHUB_NO_PERMISSION_FALLBACK: '1',
+      },
+      identity: {
+        kind: 'app' as const,
+        service: 'run_nodes' as const,
+        appId: '1',
+        installationId: '2',
+        privateKey: 'unused-synthetic',
+        poolId: 'app-1-2',
+        distinct: true as const,
+      },
+      token: async () => `app-${++mints}`,
+      execute: (_command: string[], env: Record<string, string | undefined>) => {
+        used.push(env.GH_TOKEN ?? '');
+        return {
+          exitCode: 1,
+          stdout: new Uint8Array(),
+          stderr: new TextEncoder().encode('Resource not accessible by integration (HTTP 403)'),
+        };
+      },
+    });
+    // The builder App token is tried exactly once; the reviewer PAT is never used.
+    expect(used).toEqual(['app-1']);
+    expect(used).not.toContain('reviewer-pat');
+    expect(mints).toBe(1);
+    // The App 403 surfaces as a failure rather than a reviewer-authored success.
+    expect(result.exitCode).toBe(1);
+  });
 });

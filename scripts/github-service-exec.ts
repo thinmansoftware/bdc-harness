@@ -106,6 +106,15 @@ export async function runGitHubServiceCommand(input: {
         stderr: 'pipe',
       }));
   const fallback = env.ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN || env.GH_TOKEN || env.GITHUB_TOKEN;
+  // WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01: a lane that must never author
+  // as the reviewer (the open-pr-if-needed node) sets
+  // ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1 so an App permission 403 fails closed
+  // instead of silently retrying with the reviewer/user PAT fallback. Without
+  // this, a distinct builder App can pass the lane's acting-login guard and then
+  // open the PR as the reviewer via the fallback token.
+  const permissionFallbackDisabled =
+    env.ARCHON_GITHUB_NO_PERMISSION_FALLBACK === '1' ||
+    env.ARCHON_GITHUB_NO_PERMISSION_FALLBACK === 'true';
   const invoke = async (
     selected: ServiceGitHubAuth,
     permissionFallback = false
@@ -178,7 +187,8 @@ export async function runGitHubServiceCommand(input: {
     /(?:HTTP 403|GraphQL:)[\s\S]*resource not accessible by integration|resource not accessible by integration[\s\S]*HTTP 403/i.test(
       stderr
     ) &&
-    fallback
+    fallback &&
+    !permissionFallbackDisabled
   ) {
     return invoke(
       { kind: 'pat', service: input.service, token: fallback, poolId: 'user-pat', distinct: false },

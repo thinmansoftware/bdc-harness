@@ -4336,6 +4336,13 @@ nodes:
         echo "ERROR: builder_is_reviewer: acting login ${ACTING_LOGIN} equals reviewer identity ${REVIEWER_LOGIN} -- builders build, the reviewer reviews (bdc-xo WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01)" >&2
         exit 1
       fi
+      # The builder identity is confirmed distinct from the reviewer. Disable the
+      # github-service-exec permission fallback so an App 403 on gh pr create fails
+      # closed instead of silently retrying with the reviewer/user PAT fallback
+      # (ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN/GH_TOKEN/GITHUB_TOKEN). Without this
+      # a distinct builder App could pass the guard and still open the PR as the
+      # reviewer via the fallback token.
+      export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
       echo "acting_login=${ACTING_LOGIN}"
       PR_OK=false
       EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
