@@ -1,5 +1,10 @@
+import { unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
+import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import { getDatabase } from '@archon/core/db/connection';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import {
@@ -1197,4 +1202,46 @@ describe('duty officer clock', () => {
     ).mock.calls.find(c => (c[0] as { id: string }).id === 'br-2')![0] as { result_body: string };
     expect(JSON.parse(br2Finish.result_body).disposition).toBe('taskmaster_blocker_report_relayed');
   });
+});
+
+test('duty officer sqlite race isolation', async () => {
+  const privatePath = join(
+    tmpdir(),
+    `duty-officer-sqlite-race-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+  );
+  const privateDb = new SqliteAdapter(privatePath);
+  await privateDb.close();
+  process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+  process.env.GH_TOKEN = 'synthetic-pat';
+  delete process.env.GITHUB_TOKEN;
+  const bodies = ['[]', JSON.stringify({ id: 1 })];
+  let fetchCalls = 0;
+  const fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async () => {
+    const body = bodies[Math.min(fetchCalls, bodies.length - 1)] ?? '[]';
+    fetchCalls += 1;
+    return new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  });
+  try {
+    const live = getDatabase();
+    expect(live).not.toBe(privateDb);
+    await live.query('SELECT 1');
+    expect(
+      await postGithubIssueComment(
+        { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2274 },
+        'cue'
+      )
+    ).toBe(true);
+  } finally {
+    fetchStub.mockRestore();
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        unlinkSync(privatePath + suffix);
+      } catch {
+        // The private file may already be gone after close().
+      }
+    }
+  }
 });
