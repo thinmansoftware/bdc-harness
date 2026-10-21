@@ -2702,6 +2702,8 @@ nodes:
     depends_on: [diff-review, classify-diff-review, resolve-review-base]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
+    idle_timeout: 570000
+    wall_timeout_ms: 1230000
     loop:
       fresh_context: true
       # NF3 + schema fix: the loader REQUIRES loop.until (schemas/loop.ts:11,
