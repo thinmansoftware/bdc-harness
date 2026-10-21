@@ -203,8 +203,9 @@ mock.module('@archon/isolation', () => ({
   },
 }));
 
+const mockSyncArchonToWorktree = mock(() => Promise.resolve());
 mock.module('../utils/worktree-sync', () => ({
-  syncArchonToWorktree: mock(() => Promise.resolve()),
+  syncArchonToWorktree: mockSyncArchonToWorktree,
 }));
 
 mock.module('@archon/git', () => ({
@@ -2717,4 +2718,156 @@ describe('binding-v2 foreground resume closed gate', () => {
     expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
     expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
   });
+});
+
+describe('binding-v2 generic result closed admission', () => {
+  const reserved = 'bdc-feature-development-codex-only';
+  const refusal = 'Codex-only dispatch is not available yet; no workflow was started.';
+
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockParseCommand.mockReset();
+    mockHandleCommand.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockFindResumableRunByParentConversation.mockReset();
+    mockFindResumableRunByParentConversation.mockImplementation(() => Promise.resolve(null));
+    mockUpdateConversation.mockReset();
+    mockUpdateConversation.mockImplementation(() => Promise.resolve());
+    mockSyncArchonToWorktree.mockClear();
+    mockSyncWorkspace.mockClear();
+    mockValidateAndResolveIsolation.mockClear();
+    mockExecuteWorkflow.mockClear();
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockSendQuery.mockClear();
+    mockNaturalApprovalUpdate.mockClear();
+    mockCreateWorkflowEvent.mockClear();
+  });
+
+  function setup(scoped: boolean, actualName: string, projectCount = 1, interactive = false) {
+    const codebase = makeCodebaseForSync();
+    const conversation = makeConversation({ codebase_id: scoped ? codebase.id : null });
+    const workflow = makeTestWorkflowWithSource({ name: actualName, interactive });
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(conversation));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    mockListCodebases.mockImplementation(() =>
+      Promise.resolve(projectCount === 1 ? [codebase] : [codebase, makeCodebase('other-project')])
+    );
+    mockParseCommand.mockReturnValueOnce({
+      command: 'workflow',
+      args: ['run', actualName, 'WO-generic-result'],
+    });
+    mockHandleCommand.mockImplementation(() =>
+      Promise.resolve({
+        success: true,
+        message: `Starting workflow: \`${actualName}\``,
+        workflow: { definition: workflow.workflow, args: 'WO-generic-result' },
+      })
+    );
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [workflow], errors: [] })
+    );
+    return { platform: makePlatform(), command: `/workflow run ${actualName} WO-generic-result` };
+  }
+
+  function expectNoDelegation() {
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+    expect(mockSyncArchonToWorktree).not.toHaveBeenCalled();
+    expect(mockSyncWorkspace).not.toHaveBeenCalled();
+    expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
+    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockSendQuery).not.toHaveBeenCalled();
+    expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+  }
+
+  for (const mode of ['background', 'interactive', 'non-web']) {
+    test(`scoped ${mode} refuses selected reserved result before announcing or delegating`, async () => {
+      const { platform, command } = setup(true, reserved, 1, mode === 'interactive');
+      if (mode === 'non-web') platform.getPlatformType = mock(() => 'slack' as const);
+      await handleMessage(platform, 'conv-1', command);
+      expect(mockHandleCommand).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+      expect(platform.sendMessage).not.toHaveBeenCalledWith(
+        'conv-1',
+        `Starting workflow: \`${reserved}\``
+      );
+      expect(mockDiscoverWorkflowsWithConfig).not.toHaveBeenCalled();
+      expectNoDelegation();
+    });
+  }
+
+  test('scoped refusal notification failure never delegates or retries the handler', async () => {
+    const { platform, command } = setup(true, reserved);
+    const messages: string[] = [];
+    platform.sendMessage = mock(async (_id: string, text: string) => {
+      messages.push(text);
+      if (text === refusal) throw new Error('owned refusal output failure');
+    });
+    await handleMessage(platform, 'conv-1', command);
+    expect(mockHandleCommand).toHaveBeenCalledTimes(1);
+    expect(messages[0]).toBe(refusal);
+    expect(messages).not.toContain(`Starting workflow: \`${reserved}\``);
+    expectNoDelegation();
+  });
+
+  test('ordinary selected definition preserves handler message despite reserved words', async () => {
+    const { platform, command } = setup(true, 'assist');
+    const message = `Starting workflow: \`assist\`; discuss ${reserved}`;
+    mockHandleCommand.mockImplementation(() =>
+      Promise.resolve({
+        success: true,
+        message,
+        workflow: { definition: makeTestWorkflow({ name: 'assist' }), args: 'WO-generic-result' },
+      })
+    );
+    await handleMessage(platform, 'conv-1', command);
+    expect(mockHandleCommand).toHaveBeenCalledTimes(1);
+    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', message);
+    expect(platform.sendMessage).not.toHaveBeenCalledWith('conv-1', refusal);
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+    expect(mockDispatchBackgroundWorkflow.mock.calls[0][1].name).toBe('assist');
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('generic non-workflow result preserves the original response', async () => {
+    const { platform, command } = setup(true, 'assist');
+    const message = `No execution requested for ${reserved}`;
+    mockHandleCommand.mockImplementation(() =>
+      Promise.resolve({ success: true, message, workflow: undefined })
+    );
+    await handleMessage(platform, 'conv-1', command);
+    expect(mockHandleCommand).toHaveBeenCalledTimes(1);
+    expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', message);
+    expectNoDelegation();
+  });
+
+  for (const projectCount of [1, 2]) {
+    test(`unscoped ${projectCount}-project reserved direct slash never uses generic handler`, async () => {
+      const { platform, command } = setup(false, reserved, projectCount);
+      await handleMessage(platform, 'conv-1', command);
+      expect(mockHandleCommand).not.toHaveBeenCalled();
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+      expect(platform.sendMessage).not.toHaveBeenCalledWith(
+        'conv-1',
+        `Starting workflow: \`${reserved}\``
+      );
+      expectNoDelegation();
+    });
+
+    test(`unscoped ${projectCount}-project ordinary direct slash keeps original dispatch`, async () => {
+      const { platform, command } = setup(false, 'assist', projectCount);
+      await handleMessage(platform, 'conv-1', command);
+      expect(mockHandleCommand).not.toHaveBeenCalled();
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'Starting workflow: `assist`');
+      expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockDispatchBackgroundWorkflow.mock.calls[0][1].name).toBe('assist');
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    });
+  }
 });

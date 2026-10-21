@@ -875,6 +875,13 @@ export async function handleMessage(
 
         getLog().debug({ command, conversationId }, 'deterministic_command');
         const result = await commandHandler.handleCommand(conversation, message);
+        if (result.workflow?.definition.name === 'bdc-feature-development-codex-only') {
+          await platform.sendMessage(
+            conversationId,
+            'Codex-only dispatch is not available yet; no workflow was started.'
+          );
+          return;
+        }
         await platform.sendMessage(conversationId, result.message);
 
         if (result.workflow) {
