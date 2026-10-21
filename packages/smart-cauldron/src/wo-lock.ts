@@ -122,12 +122,12 @@ export async function acquireWoLock(
       return { acquired: true, path: filePath, record: existing };
     }
     const age = lockAgeMs(existing);
+    const liveness = await isCascadeLive(existing.cascadeId, livenessOptions(outDir, deps));
     let reason: 'no-live-run' | 'max-age' | null = null;
-    if (age > maximumLockAgeMs()) {
+    if (liveness === 'dead' && age >= LOCK_GRACE_MS) {
+      reason = 'no-live-run';
+    } else if (liveness === 'unknown' && age > maximumLockAgeMs()) {
       reason = 'max-age';
-    } else {
-      const liveness = await isCascadeLive(existing.cascadeId, livenessOptions(outDir, deps));
-      if (liveness === 'dead' && age >= LOCK_GRACE_MS) reason = 'no-live-run';
     }
     if (reason === null) return { acquired: false, path: filePath, record: existing };
 
@@ -213,8 +213,6 @@ export async function reconcileStaleWoLocks(
       result.keptUnknown++;
       continue;
     }
-    if (lockAgeMs(record) < LOCK_GRACE_MS) continue;
-
     await backupStaleLock(filePath, record);
     await releaseWoLock(record.woId, record.project, record.cascadeId, outDir);
     result.released++;

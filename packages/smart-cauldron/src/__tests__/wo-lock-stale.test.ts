@@ -96,16 +96,20 @@ describe('stale WO locks', () => {
     const outDir = await makeOutDir();
     process.env.SMART_CAULDRON_WO_LOCK_MAX_AGE_MS = '1000';
     await createLock(outDir, 'WO-T', 'proj', 'C-OLD', 2_000);
+    await createCascadeRecord(outDir, 'C-OLD', 'R1');
+    let readAttempts = 0;
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (...args: unknown[]) => logs.push(args.join(' '));
     try {
       const result = await acquireWoLock('WO-T', 'proj', 'C-NEW', outDir, {
         runStatusReader: async () => {
+          readAttempts++;
           throw new Error('network failure');
         },
       });
       expect(result.acquired).toBe(true);
+      expect(readAttempts).toBe(1);
       expect(logs[0]).toContain('reason=max-age');
     } finally {
       console.log = originalLog;
@@ -133,7 +137,7 @@ describe('stale WO locks', () => {
 
   test('startup reconciliation releases only a dead running lock', async () => {
     const outDir = await makeOutDir();
-    const dead = await createLock(outDir, 'WO-A', 'proj', 'C-DEAD', 600_000);
+    const dead = await createLock(outDir, 'WO-A', 'proj', 'C-DEAD', 1);
     const live = await createLock(outDir, 'WO-B', 'proj', 'C-LIVE', 600_000);
     const released = await createLock(outDir, 'WO-C', 'proj', 'C-DONE', 600_000, 'released');
     await createCascadeRecord(outDir, 'C-DEAD', 'R-DEAD');

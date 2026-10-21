@@ -304,16 +304,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  try {
-    const woLockReconcile = await reconcileStaleWoLocks('./cascade-runs', {
-      apiBaseUrl: process.env.ARCHON_API_BASE_URL,
-      token: process.env.ARCHON_OPERATOR_TOKEN,
-    });
-    getLog().info(woLockReconcile, 'startup_wo_lock_reconciliation_completed');
-  } catch (error) {
-    getLog().warn({ err: error }, 'startup_wo_lock_reconciliation_failed');
-  }
-
   startOverseerRuntimeWithRealMergeManager();
 
   const config = await loadConfig();
@@ -824,6 +814,17 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     idleTimeout: 255, // Max value (seconds) - prevents SSE connections from being killed
   });
   getLog().info({ port: server.port, hostname }, 'server_listening');
+
+  try {
+    const woLockReconcile = await reconcileStaleWoLocks('./cascade-runs', {
+      apiBaseUrl: process.env.ARCHON_API_BASE_URL ?? `http://127.0.0.1:${String(server.port)}`,
+      token: process.env.ARCHON_OPERATOR_TOKEN,
+    });
+    getLog().info(woLockReconcile, 'startup_wo_lock_reconciliation_completed');
+  } catch (error) {
+    getLog().warn({ err: error }, 'startup_wo_lock_reconciliation_failed');
+  }
+
   startDispatchEscalationClock();
 
   // Initialize Telegram adapter (conditional, skipped in CLI serve mode)
