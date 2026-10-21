@@ -14,6 +14,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { buildLaneSubprocessEnv, laneSpawnArgv } from '../../core/src/github/lane-env';
 import { dirname } from 'node:path';
 import {
   computePolicyTupleDigest,
@@ -201,9 +202,11 @@ export function verifyPolicyRegistryIdentities(
 
 function detectGitObjectFormat(registryPath: string): GitObjectFormat | undefined {
   try {
-    const output = execFileSync('git', ['rev-parse', '--show-object-format'], {
+    const argv = laneSpawnArgv(['git', 'rev-parse', '--show-object-format']);
+    const output = execFileSync(argv[0], argv.slice(1), {
       cwd: dirname(registryPath),
       encoding: 'utf8',
+      env: buildLaneSubprocessEnv(process.env),
     }).trim();
     return output === 'sha256' ? 'sha256' : output === 'sha1' ? 'sha1' : undefined;
   } catch {

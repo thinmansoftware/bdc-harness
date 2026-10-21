@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   githubCommandReadsStdin,
+  assertLaneGitHubService,
   runGitHubServiceCommand as runCommand,
 } from './github-service-exec';
 import { serviceGitHubCommandEnvironment } from '../packages/core/src/github/service-identity';
@@ -25,6 +26,11 @@ const runGitHubServiceCommand = (
 ): ReturnType<typeof runCommand> => runCommand({ ...input, db });
 
 describe('operation-scoped GitHub CLI authentication', () => {
+  test('lane_service_forbidden rejects reviewer services for UID 1002', () => {
+    expect(() => assertLaneGitHubService('overseer', 1002)).toThrow('lane_service_forbidden');
+    expect(() => assertLaneGitHubService('run_nodes', 1002)).not.toThrow();
+    expect(() => assertLaneGitHubService('smart_cauldron', 1002)).not.toThrow();
+  });
   test('buffers declared gh stdin sources and leaves ordinary query arguments alone', () => {
     for (const args of [
       ['api', 'repos/synthetic/test', '--input', '-'],

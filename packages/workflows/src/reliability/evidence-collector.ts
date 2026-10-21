@@ -1,4 +1,5 @@
 import { reduceRunOutcome } from './outcome-reducer';
+import { laneSpawnArgv } from '../../../core/src/github/lane-env';
 import type { IWorkflowStore, WorkflowEventRecord } from '../store';
 import type {
   ExecutionState,
@@ -306,8 +307,10 @@ export async function collectRuntimeEvidence(
 ): Promise<CollectedMechanicalEvidence> {
   const authority = await store.getRunAuthority(request.runId);
   if (!authority) throw new Error('scope_authority_missing: persisted run authority');
-  const git = async (args: readonly string[]): Promise<string> =>
-    (await run('git', ['-C', request.cwd, ...args], request.cwd)).stdout.trim();
+  const git = async (args: readonly string[]): Promise<string> => {
+    const argv = laneSpawnArgv(['git', '-C', request.cwd, ...args]);
+    return (await run(argv[0], argv.slice(1), request.cwd)).stdout.trim();
+  };
   const headSha = await git(['rev-parse', '--verify', 'HEAD^{commit}']);
   const headBranch = await git(['symbolic-ref', '--quiet', '--short', 'HEAD']);
   const originRemote = await git(['remote', 'get-url', 'origin']);
