@@ -547,6 +547,7 @@ export async function defaultListThreads(
         if (issues.length < 100) break;
         if (page === MAX_PAGES_PER_LABEL) {
           log.warn({ repo, label, page }, 'taskmaster.github_page_limit_reached');
+          throw new Error('taskmaster_github_work_sor_incomplete');
         }
       }
     }
@@ -1614,6 +1615,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   let rulings: ThreadSnapshot[] = [];
   let threads: ThreadSnapshot[] = [];
   let unlabelledPriorityTriage: string[] = [];
+  let threadsReadSucceeded = false;
   try {
     rulings = await (deps.listUndeliveredRulings ?? defaultListUndeliveredRulings)();
   } catch (error) {
@@ -1622,9 +1624,10 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   }
   try {
     const listed = await (deps.listThreads ?? defaultListThreads)();
+    const triage = 'unlabelledPriorityTriage' in listed ? listed.unlabelledPriorityTriage : [];
     threads = listed;
-    unlabelledPriorityTriage =
-      'unlabelledPriorityTriage' in listed ? listed.unlabelledPriorityTriage : [];
+    unlabelledPriorityTriage = triage;
+    threadsReadSucceeded = true;
   } catch (error) {
     tickFailures += 1;
     log.warn({ err: error as Error }, 'taskmaster.threads_read_failed');
@@ -1632,8 +1635,9 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
   // Adoption projection refresh (M-155 WO 1). Uses the already-fetched
   // thread list; must not re-list. Failures suppress heartbeat via
-  // tickFailures but never abort the send/grade phase.
-  {
+  // tickFailures but never abort the send/grade phase. A rejected source read
+  // must not turn the synthetic empty fallback into a committed projection.
+  if (threadsReadSucceeded) {
     const adoptionResult = await refreshAdoption(threads, deps);
     if (adoptionResult.failed) tickFailures += 1;
   }

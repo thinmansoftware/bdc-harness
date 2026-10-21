@@ -1912,6 +1912,60 @@ describe('failed effect reuse and successful-tick health', () => {
     expect(state.deadman.lastTickAtMs).toBe(T0);
   });
 
+  test.each(['rejected', 'empty', 'page-cap'])(
+    'adoption snapshot after %s work-SOR read retains the correct custody',
+    async mode => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const deps = makeDeps(world, {
+        listThreads: async () => {
+          if (mode === 'rejected') throw new Error('synthetic rejected work-SOR read');
+          if (mode === 'page-cap')
+            return defaultListThreads((async input => {
+              const url = new URL(String(input));
+              const page = Number(url.searchParams.get('page'));
+              return new Response(
+                JSON.stringify(
+                  url.searchParams.get('labels') === 'wo'
+                    ? Array.from({ length: 100 }, (_, i) => ({
+                        number: (page - 1) * 100 + i + 1,
+                        updated_at: new Date(T0).toISOString(),
+                        labels: ['wo', 'prio:P1'],
+                        assignees: [],
+                      }))
+                    : []
+                )
+              );
+            }) as typeof fetch);
+          return [];
+        },
+        getGithubIssueEvidence: async () => makeEvidence(),
+      });
+      await refreshAdoption(
+        [makeListedThread({ ref: 'gh:thinmansoftware/bdc-xo#123', title: 'known work' })],
+        deps
+      );
+      const beforeMeta = structuredClone(world.adoptionMeta);
+      const beforeRows = structuredClone(world.adoptionRows);
+      const state = createTaskmasterState(60_000);
+      const result = await tick(state, deps);
+      if (mode !== 'empty') {
+        expect(world.adoptionMeta).toEqual(beforeMeta);
+        expect(world.adoptionRows).toEqual(beforeRows);
+        expect(result.successful).toBe(false);
+        expect(state.deadman.lastTickAtMs).toBeNull();
+        if (mode === 'page-cap') {
+          expect(result.effects).toBe(0);
+          expect(world.sentMessages).toEqual([]);
+        }
+      } else {
+        expect(world.adoptionMeta.row_count).toBe(0);
+        expect(world.adoptionRows).toEqual([]);
+        expect(result.successful).toBe(true);
+      }
+    }
+  );
+
   test('a failed source read does not advance the successful heartbeat', async () => {
     const world = makeWorld();
     seedDigestSent(world);
@@ -2934,18 +2988,36 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
         });
       }) as typeof fetch;
 
-      const threads = await defaultListThreads(fetchImpl);
+      await expect(defaultListThreads(fetchImpl)).rejects.toThrow(
+        'taskmaster_github_work_sor_incomplete'
+      );
       const woPages = urls
         .filter(url => new URL(url).searchParams.get('labels') === 'wo')
         .map(url => Number(new URL(url).searchParams.get('page')));
       expect(woPages).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-      expect(threads).toHaveLength(1000);
       expect(
         chunks.filter(chunk => chunk.includes('taskmaster.github_page_limit_reached'))
       ).toHaveLength(1);
     } finally {
       stream.write = originalWrite;
     }
+  });
+
+  test('short tenth label page remains a complete read', async () => {
+    const fetchImpl = (async input => {
+      const url = new URL(String(input));
+      const page = Number(url.searchParams.get('page'));
+      return new Response(
+        JSON.stringify(
+          url.searchParams.get('labels') === 'wo'
+            ? Array.from({ length: page === 10 ? 99 : 100 }, (_, i) =>
+                ghIssue((page - 1) * 100 + i + 1, ['wo', 'prio:P1'])
+              )
+            : []
+        )
+      );
+    }) as typeof fetch;
+    expect(await defaultListThreads(fetchImpl)).toHaveLength(999);
   });
 
   test('queries wo, project, and arc separately while preserving an explicit repo override', async () => {
