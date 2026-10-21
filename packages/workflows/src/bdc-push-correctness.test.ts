@@ -21,6 +21,8 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os';
 import { basename, delimiter, join } from 'path';
 import { parseWorkflow } from './loader';
+import { substituteNodeOutputRefs } from './dag-executor';
+import type { NodeOutput } from './schemas/workflow-run';
 import {
   clearRegistry,
   registerBuiltinProviders,
@@ -251,6 +253,20 @@ function extractCommitSelection(yaml: string, laneLabel: string): string {
   return `set -euo pipefail\n${block}echo "UNIQUE_BRANCH=$UNIQUE_BRANCH"\n`;
 }
 
+function extractCommitCapture(yaml: string, laneLabel: string): string {
+  const result = parseWorkflow(yaml, basename(laneLabel));
+  if (!result.workflow) {
+    throw new Error(`${laneLabel}: ${result.error?.error ?? 'failed to parse'}`);
+  }
+  const bash = result.workflow.nodes.find(node => node.id === 'commit-and-push')?.bash;
+  const endMarker = 'PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")';
+  const end = bash?.indexOf(endMarker) ?? -1;
+  if (!bash || end < 0) {
+    throw new Error(`commit-and-push capture anchors missing in ${laneLabel}`);
+  }
+  return `${bash.slice(0, end + endMarker.length)}\n`;
+}
+
 function extractCheckoutRepair(yaml: string, laneLabel: string): string {
   yaml = yaml.replace(/\r\n/g, '\n');
   const nodeStart = yaml.indexOf('  - id: checkout-repair-target\n');
@@ -442,6 +458,94 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// WO-HARNESS-REPAIR-PATH-HOTFIX-01 replay (F1): the old quoted-heredoc capture of
+// $decide-push-target.output goes through the executor's shellQuote/wrap path and
+// appends a trailing single-quote to the LAST line, so the $-anchored authorization
+// sed returns empty. The node-out file capture is byte-identical and parses #7.
+// ---------------------------------------------------------------------------
+describe('F1 replay: quoted-heredoc decide capture vs node-out file capture', () => {
+  const decideText = [
+    'push_target: feature-branch: feat/should-not-mint',
+    'repair_target_pr: #7',
+    'repair_target_branch: feat/x',
+    'repo: thinmansoftware/bdc-harness',
+    'repair_target_authorized_by_spec: #7',
+  ].join('\n');
+
+  const AUTH_PARSER = [
+    "DECIDE_OUTPUT_CLEAN=$(printf '%s\\n' \"$DECIDE_OUTPUT\" | tr -d '`')",
+    "REPAIR_TARGET_AUTHORIZED=$(printf '%s\\n' \"$DECIDE_OUTPUT_CLEAN\" | sed -n 's/^[[:space:]]*repair_target_authorized_by_spec:[[:space:]]*\\(#[0-9][0-9]*\\)[[:space:]]*$/\\1/p' | head -n 1)",
+    'printf \'AUTHORIZED=<%s>\\n\' "$REPAIR_TARGET_AUTHORIZED"',
+    '',
+  ].join('\n');
+
+  it('Test 1: the old quoted-heredoc capture yields an empty authorization', () => {
+    const oldCapture = [
+      'set -euo pipefail',
+      "DECIDE_OUTPUT=$(cat <<'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013'",
+      '$decide-push-target.output',
+      'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013',
+      ')',
+      '',
+    ].join('\n');
+    const nodeOutputs = new Map<string, NodeOutput>([
+      ['decide-push-target', { state: 'completed', output: decideText }],
+    ]);
+    const substituted = substituteNodeOutputRefs(oldCapture, nodeOutputs, true);
+    // The executor wrapped the last line with a trailing single quote.
+    expect(substituted).toContain("repair_target_authorized_by_spec: #7'");
+    const result = bash(substituted + AUTH_PARSER, worktreeDir);
+    expect(result.exitCode, showResult(result, 'replay-old')).toBe(0);
+    expect(result.stdout).toContain('AUTHORIZED=<>');
+    expect(result.stdout).not.toContain('AUTHORIZED=<#7>');
+  });
+
+  it('Test 2: the node-out file capture authorizes #7 and reaches UNIQUE_BRANCH', () => {
+    const lane = join(DEFAULTS_DIR, 'bdc-feature-development.yaml');
+    const branch = 'feat/x';
+    const planText = fencedPlanReview([
+      'Commit message: fix: x',
+      'repair_target_authorized_by_spec: #7',
+    ]);
+    const spec = ['WO: WO-TEST', `Repair target: PR #7 (branch ${branch})`].join('\n');
+    const nodeOutDir = mkdtempSync(join(tmpdir(), 'bdc-nodeout-'));
+    try {
+      writeFileSync(join(nodeOutDir, 'decide-push-target.out'), decideText);
+      writeFileSync(join(nodeOutDir, 'plan-review.out'), planText);
+      const headOid = publishHead(branch);
+
+      // Confirm the standalone node-out parse alone yields #7 (no trailing-quote corruption).
+      const parseOnly = [
+        'set -euo pipefail',
+        'DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"',
+        'if [ ! -s "$DECIDE_OUT_FILE" ]; then echo "ERROR: missing decide node-out" >&2; exit 1; fi',
+        'DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")',
+        '',
+      ].join('\n');
+      const parseResult = bash(parseOnly + AUTH_PARSER, worktreeDir, {
+        ARCHON_NODE_OUT: nodeOutDir,
+      });
+      expect(parseResult.exitCode, showResult(parseResult, 'replay-new-parse')).toBe(0);
+      expect(parseResult.stdout).toContain('AUTHORIZED=<#7>');
+
+      // And end-to-end: the real commit-selection guard reaches UNIQUE_BRANCH=feat/x.
+      const capture = extractCommitCapture(readFileSync(lane, 'utf8'), lane);
+      const result = bash(capture + REPAIR_TARGET_SELECTION, worktreeDir, {
+        ARCHON_NODE_OUT: nodeOutDir,
+        SPEC_TEXT: spec,
+        CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${headOid}`,
+        PATH: fakeGhPath('OPEN', branch, { headRefOid: headOid }),
+      });
+      expect(result.exitCode, showResult(result, 'replay-new-e2e')).toBe(0);
+      expect(result.stdout).not.toContain('repair_target_unauthorized');
+      expect(result.stdout).toContain('UNIQUE_BRANCH=feat/x');
+    } finally {
+      rmSync(nodeOutDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('F-6A: BRANCH allowlist regex validator', () => {
   it('Test 1: rejects malformed double-thread-suffix branch name', () => {
     const result = bash(F6A_VALIDATOR, worktreeDir, {
@@ -1490,26 +1594,73 @@ describe('Spec-authorized repair onto wo and Cauldron task branches', () => {
   );
 
   itAcrossRepairLanes(
-    'Test 3: rejects a moved checkout lease and a lease that is not an ancestor',
+    'Test 6: head-moved guard adopts an ancestor live OID and refuses a foreign or child one',
     targetLane => {
+      // WO-HARNESS-REPAIR-PATH-HOTFIX-01 (F2 / item 1f), with the F-T6 fixture rule:
+      // the live OID must NEVER equal HEAD, or `git merge-base --is-ancestor X X` would
+      // pass in both argument orders and could not tell a correct guard from a reversed one.
+      const commit = extractCommitSelection(readFileSync(targetLane, 'utf8'), targetLane);
       const movedLease = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
-      for (const branch of ACCEPTED_REPAIR_BRANCHES) {
-        const oid = publishHead(branch);
-        for (const lane of [targetLane]) {
-          const commit = extractCommitSelection(readFileSync(lane, 'utf8'), lane);
-          const label = `${basename(lane)} ${branch} head-moved`;
-          const moved = bash(commit, worktreeDir, {
-            DECIDE_OUTPUT: authorizedRepairDecideOutput(branch),
-            SPEC_TEXT: matchingRepairSpec(branch),
-            CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${movedLease}`,
-            PATH: fakeGhPath('OPEN', branch, { headRefOid: oid }),
-          });
-          if (moved.exitCode === 0) throw new Error(showResult(moved, label));
-          expect(moved.stderr).toContain('repair_target_head_moved');
-          expect(moved.stdout).not.toContain('UNIQUE_BRANCH=');
-        }
-      }
+      const baseSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
 
+      // Case (a): live OID is a DISTINCT PARENT of HEAD (live != HEAD) -> adopt it and proceed.
+      const parentOid = baseSha;
+      git(['push', 'origin', `HEAD:wo/case-a`], worktreeDir);
+      writeFileSync(join(worktreeDir, 'child-a.txt'), 'child a\n');
+      git(['add', 'child-a.txt'], worktreeDir);
+      git(['commit', '-m', 'child a'], worktreeDir);
+      const resA = bash(commit, worktreeDir, {
+        DECIDE_OUTPUT: authorizedRepairDecideOutput('wo/case-a'),
+        SPEC_TEXT: matchingRepairSpec('wo/case-a'),
+        CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${movedLease}`,
+        PATH: fakeGhPath('OPEN', 'wo/case-a', { headRefOid: parentOid }),
+      });
+      if (resA.exitCode !== 0) throw new Error(showResult(resA, `${basename(targetLane)} case-a`));
+      expect(resA.stdout).toContain(`REPAIR_TARGET_LEASE_SHA=${parentOid}`);
+      expect(resA.stdout).toContain('UNIQUE_BRANCH=wo/case-a');
+      expect(resA.stdout).not.toContain('repair_target_head_moved');
+
+      // Case (b): live OID shares NO ancestry with HEAD (foreign commit) -> refuse.
+      git(['reset', '--hard', baseSha], worktreeDir);
+      writeFileSync(join(worktreeDir, 'pr-only-b.txt'), 'pr only b\n');
+      git(['add', 'pr-only-b.txt'], worktreeDir);
+      git(['commit', '-m', 'pr only b'], worktreeDir);
+      const foreignOid = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+      git(['push', 'origin', `HEAD:wo/case-b`], worktreeDir);
+      git(['reset', '--hard', baseSha], worktreeDir);
+      writeFileSync(join(worktreeDir, 'impl-b.txt'), 'impl b\n');
+      git(['add', 'impl-b.txt'], worktreeDir);
+      git(['commit', '-m', 'impl b'], worktreeDir);
+      const resB = bash(commit, worktreeDir, {
+        DECIDE_OUTPUT: authorizedRepairDecideOutput('wo/case-b'),
+        SPEC_TEXT: matchingRepairSpec('wo/case-b'),
+        CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${movedLease}`,
+        PATH: fakeGhPath('OPEN', 'wo/case-b', { headRefOid: foreignOid }),
+      });
+      if (resB.exitCode === 0) throw new Error(showResult(resB, `${basename(targetLane)} case-b`));
+      expect(resB.stderr).toContain('repair_target_head_moved');
+      expect(resB.stdout).not.toContain('UNIQUE_BRANCH=');
+
+      // Case (c): live OID is a CHILD of HEAD (HEAD is the ancestor) -> refuse. This fails if
+      // the merge-base argument order is reversed, because is-ancestor(HEAD, child) passes.
+      git(['reset', '--hard', baseSha], worktreeDir);
+      writeFileSync(join(worktreeDir, 'child-c.txt'), 'child c\n');
+      git(['add', 'child-c.txt'], worktreeDir);
+      git(['commit', '-m', 'child c'], worktreeDir);
+      const childOid = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
+      git(['push', 'origin', `HEAD:wo/case-c`], worktreeDir);
+      git(['reset', '--hard', baseSha], worktreeDir);
+      const resC = bash(commit, worktreeDir, {
+        DECIDE_OUTPUT: authorizedRepairDecideOutput('wo/case-c'),
+        SPEC_TEXT: matchingRepairSpec('wo/case-c'),
+        CHECKOUT_OUTPUT: `REPAIR_TARGET_LEASE_SHA=${movedLease}`,
+        PATH: fakeGhPath('OPEN', 'wo/case-c', { headRefOid: childOid }),
+      });
+      if (resC.exitCode === 0) throw new Error(showResult(resC, `${basename(targetLane)} case-c`));
+      expect(resC.stderr).toContain('repair_target_head_moved');
+      expect(resC.stdout).not.toContain('UNIQUE_BRANCH=');
+
+      git(['reset', '--hard', baseSha], worktreeDir);
       for (const branch of ACCEPTED_REPAIR_BRANCHES) {
         const initSha = bash('git rev-parse HEAD', worktreeDir).stdout.trim();
         const fileName = `pr-only-${branch.replace(/[^A-Za-z0-9]/g, '_')}.txt`;
