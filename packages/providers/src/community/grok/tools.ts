@@ -2,12 +2,130 @@
  * Local worktree tools for the Grok agent tool loop.
  * Paths are resolved under cwd; traversal outside cwd is rejected.
  */
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
+import {
+  buildLaneSubprocessEnv,
+  laneIsolationAvailable,
+  laneSpawnArgv,
+} from '../../../../core/src/github/lane-env';
 
 const execFileAsync = promisify(execFile);
+
+export interface GrokSpawnResult {
+  stdout: string;
+  stderr: string;
+  code: number;
+}
+
+export interface GrokSpawnOptions {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  input: string;
+  timeout: number;
+}
+
+export type GrokFileSpawn = (
+  file: string,
+  args: string[],
+  options: GrokSpawnOptions
+) => Promise<GrokSpawnResult>;
+
+const FILE_TOOL_PROGRAM = [
+  "const fs = require('node:fs');",
+  "const path = require('node:path');",
+  "const input = JSON.parse(fs.readFileSync(0, 'utf8'));",
+  'function fail(message) { process.stderr.write(String(message)); process.exit(1); }',
+  'try {',
+  "  if (input.op === 'read') {",
+  "    process.stdout.write(fs.readFileSync(input.path, 'utf8'));",
+  "  } else if (input.op === 'write') {",
+  '    fs.mkdirSync(path.dirname(input.path), { recursive: true });',
+  "    fs.writeFileSync(input.path, String(input.content ?? ''), 'utf8');",
+  "    process.stdout.write('OK');",
+  "  } else if (input.op === 'edit') {",
+  "    const text = fs.readFileSync(input.path, 'utf8');",
+  "    const oldText = String(input.old ?? '');",
+  "    if (!text.includes(oldText)) fail('old_string not found');",
+  "    fs.writeFileSync(input.path, text.replace(oldText, String(input.new ?? '')), 'utf8');",
+  "    process.stdout.write('OK');",
+  "  } else fail('unknown op');",
+  '} catch (error) {',
+  '  fail(error && error.message ? error.message : String(error));',
+  '}',
+].join('\n');
+
+function spawnFileTool(
+  file: string,
+  args: string[],
+  options: GrokSpawnOptions
+): Promise<GrokSpawnResult> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(file, args, {
+      cwd: options.cwd,
+      env: options.env,
+      windowsHide: true,
+    });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+    }, options.timeout);
+    const finish = (result: GrokSpawnResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise(result);
+    };
+    child.stdout?.on('data', (chunk: Buffer | string) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on('data', (chunk: Buffer | string) => {
+      stderr += String(chunk);
+    });
+    child.on('error', error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', code => {
+      finish({ stdout, stderr, code: code ?? 1 });
+    });
+    child.stdin?.end(options.input);
+  });
+}
+
+async function runLaneFileTool(
+  op: 'read' | 'write' | 'edit',
+  payload: { path: string; content?: string; old?: string; new?: string },
+  cwd: string,
+  relPath: string,
+  contentLength: number,
+  spawnImpl: GrokFileSpawn | undefined
+): Promise<string> {
+  const laneArgv = laneSpawnArgv([process.execPath, '-e', FILE_TOOL_PROGRAM]);
+  const run = spawnImpl ?? spawnFileTool;
+  const result = await run(laneArgv[0], laneArgv.slice(1), {
+    cwd,
+    env: buildLaneSubprocessEnv(process.env),
+    input: JSON.stringify({ op, ...payload }),
+    timeout: 30_000,
+  });
+  if (result.code !== 0) {
+    const detail = (result.stderr || result.stdout || 'file tool failed').trim();
+    return `ERROR: ${detail.slice(0, 100_000)}`;
+  }
+  if (op === 'read') {
+    const text = result.stdout;
+    return text.length > 200_000 ? `${text.slice(0, 200_000)}\n...[truncated]` : text;
+  }
+  if (op === 'write') return `OK wrote ${relPath} (${contentLength} bytes)`;
+  return `OK edited ${relPath}`;
+}
 
 export const GROK_AGENT_TOOLS = [
   {
@@ -110,7 +228,7 @@ export async function executeGrokTool(
   cwd: string,
   name: string,
   argsJson: string,
-  options?: { bashTimeoutMs?: number }
+  options?: { bashTimeoutMs?: number; spawnFile?: GrokFileSpawn }
 ): Promise<string> {
   let args: Record<string, unknown> = {};
   try {
@@ -129,11 +247,12 @@ export async function executeGrokTool(
         const shellArgs =
           process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-lc', command];
         try {
-          const { stdout, stderr } = await execFileAsync(shell, shellArgs, {
+          const laneArgv = laneSpawnArgv([shell, ...shellArgs]);
+          const { stdout, stderr } = await execFileAsync(laneArgv[0], laneArgv.slice(1), {
             cwd,
             timeout,
             maxBuffer: 8 * 1024 * 1024,
-            env: process.env,
+            env: buildLaneSubprocessEnv(process.env),
             windowsHide: true,
           });
           const out = `${stdout ?? ''}${stderr ? `\nSTDERR:\n${stderr}` : ''}`.trim();
@@ -152,6 +271,9 @@ export async function executeGrokTool(
       case 'read_file': {
         const path = asString(args.path);
         const full = resolveInCwd(cwd, path);
+        if (laneIsolationAvailable()) {
+          return await runLaneFileTool('read', { path: full }, cwd, path, 0, options?.spawnFile);
+        }
         if (!existsSync(full)) return `ERROR: file not found: ${path}`;
         const text = readFileSync(full, 'utf8');
         return text.length > 200_000 ? text.slice(0, 200_000) + '\n...[truncated]' : text;
@@ -160,6 +282,16 @@ export async function executeGrokTool(
         const path = asString(args.path);
         const content = asString(args.content);
         const full = resolveInCwd(cwd, path);
+        if (laneIsolationAvailable()) {
+          return await runLaneFileTool(
+            'write',
+            { path: full, content },
+            cwd,
+            path,
+            content.length,
+            options?.spawnFile
+          );
+        }
         mkdirSync(dirname(full), { recursive: true });
         writeFileSync(full, content, 'utf8');
         return `OK wrote ${path} (${content.length} bytes)`;
@@ -169,6 +301,16 @@ export async function executeGrokTool(
         const oldStr = asString(args.old_string);
         const newStr = asString(args.new_string);
         const full = resolveInCwd(cwd, path);
+        if (laneIsolationAvailable()) {
+          return await runLaneFileTool(
+            'edit',
+            { path: full, old: oldStr, new: newStr },
+            cwd,
+            path,
+            0,
+            options?.spawnFile
+          );
+        }
         if (!existsSync(full)) return `ERROR: file not found: ${path}`;
         const text = readFileSync(full, 'utf8');
         if (!text.includes(oldStr)) return `ERROR: old_string not found in ${path}`;

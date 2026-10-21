@@ -2,8 +2,9 @@
  * Tests for the Claude binary resolver in dev mode (BUNDLED_IS_BINARY=false).
  * Separate file because binary-mode tests mock BUNDLED_IS_BINARY=true.
  *
- * Dev mode normally lets the SDK resolve the binary from its bundled
- * platform package. CLAUDE_BIN_PATH is honored as an escape hatch for
+ * Dev mode resolves the binary from the SDK's bundled platform package so
+ * the provider can wrap it with lane UID isolation. CLAUDE_BIN_PATH remains
+ * an escape hatch for
  * environments where SDK auto-resolution picks the wrong variant -- most
  * notably glibc Linux hosts, where the SDK prefers the musl binary first
  * and silently falls over with a misleading "not found" error.
@@ -38,14 +39,15 @@ describe('resolveClaudeBinaryPath (dev mode)', () => {
     fileExistsSpy?.mockRestore();
   });
 
-  test('returns undefined when nothing is configured', async () => {
+  test('resolves the SDK platform binary when nothing is configured', async () => {
     const result = await resolver.resolveClaudeBinaryPath();
-    expect(result).toBeUndefined();
+    expect(result).toContain('@anthropic-ai/claude-agent-sdk-');
+    expect(result).toEndWith(process.platform === 'win32' ? 'claude.exe' : 'claude');
   });
 
-  test('returns undefined when only config path is set (config is binary-mode only)', async () => {
+  test('uses the SDK platform binary when only config path is set', async () => {
     const result = await resolver.resolveClaudeBinaryPath('/some/custom/path');
-    expect(result).toBeUndefined();
+    expect(result).toContain('@anthropic-ai/claude-agent-sdk-');
   });
 
   test('honors CLAUDE_BIN_PATH env var when file exists', async () => {
@@ -73,12 +75,12 @@ describe('resolveClaudeBinaryPath (dev mode)', () => {
     expect(result).toBe('/env/claude');
   });
 
-  test('falls through to undefined when CLAUDE_BIN_PATH is the empty string', async () => {
+  test('falls through to the SDK binary when CLAUDE_BIN_PATH is the empty string', async () => {
     // Pin the contract: an unset shell variable that gets exported as empty
     // (e.g. `export CLAUDE_BIN_PATH=`) must behave the same as fully unset,
     // not throw "file does not exist".
     process.env.CLAUDE_BIN_PATH = '';
     const result = await resolver.resolveClaudeBinaryPath();
-    expect(result).toBeUndefined();
+    expect(result).toContain('@anthropic-ai/claude-agent-sdk-');
   });
 });

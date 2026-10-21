@@ -35,3 +35,7 @@ services:
 # After adding, rebuild + restart: docker compose build && docker compose up -d
 # Verify: docker exec archon-app-1 sh -c 'ls /root/.codex/auth.json'
 # Context: WO-HARNESS-CODEX-AUTH-FAILBACK-01 (2026-06-29), anchor incident 2026-06-11.
+
+# Builder 2 key isolation: set GITHUB_APP_RUN_NODES_PRIVATE_KEY_HOST_PATH in .env.
+# The host PEM must be owned root:1002 and mode 0440. The base compose mounts it
+# read-only at /run/secrets/thinman-builder-2.pem; no thinman-builder.pem mount is used.

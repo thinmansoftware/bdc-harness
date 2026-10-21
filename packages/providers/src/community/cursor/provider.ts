@@ -33,6 +33,7 @@ import type {
 } from '../../types';
 import { CURSOR_AGENT_CAPABILITIES } from './capabilities';
 import { parseCursorAgentConfig } from './config';
+import { buildLaneSubprocessEnv, laneSpawnArgv } from '../../../../core/src/github/lane-env';
 
 export const DEFAULT_CURSOR_AGENT_MODEL = 'grok-4.7-high';
 export const DEFAULT_CURSOR_AGENT_BINARY = 'cursor-agent';
@@ -112,7 +113,10 @@ export class CursorAgentProvider implements IAgentProvider {
     }
     const model = options?.model ?? this.model;
     const argv = buildCursorAgentArgv(this.binaryPath, model, cwd);
-    const child = this.spawn(argv, { cwd, env: { ...process.env, ...(options?.env ?? {}) } });
+    const child = this.spawn(laneSpawnArgv(argv), {
+      cwd,
+      env: buildLaneSubprocessEnv({ ...process.env, ...(options?.env ?? {}) }),
+    });
     const onAbort = (): void => {
       child.kill();
     };

@@ -12,12 +12,13 @@
  * 4. Autodetect canonical install paths (npm prefix defaults per platform)
  * 5. Throw with install instructions
  *
- * In dev mode (BUNDLED_IS_BINARY=false), returns undefined so the SDK
- * uses its normal node_modules-based resolution.
+ * In dev mode (BUNDLED_IS_BINARY=false), resolves the installed CLI entrypoint
+ * so the provider can apply lane isolation before the CLI starts.
  */
 import { existsSync as _existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
 import { BUNDLED_IS_BINARY, getArchonHome, createLogger } from '@archon/paths';
 
 /** Wrapper for existsSync -- enables spyOn in tests (direct imports can't be spied on). */
@@ -46,13 +47,16 @@ function getVendorBinaryName(): string | undefined {
 /**
  * Resolve the path to the Codex native binary.
  *
- * In dev mode: returns undefined (let SDK resolve via node_modules).
+ * In dev mode: resolves the CLI entrypoint via the SDK's node_modules tree.
  * In binary mode: resolves from env/config/vendor dir, or throws with install instructions.
  */
 export async function resolveCodexBinaryPath(
   configCodexBinaryPath?: string
 ): Promise<string | undefined> {
-  if (!BUNDLED_IS_BINARY) return undefined;
+  if (!BUNDLED_IS_BINARY) {
+    const requireFromSdk = createRequire(import.meta.resolve('@openai/codex-sdk'));
+    return requireFromSdk.resolve('@openai/codex/bin/codex.js');
+  }
 
   // 1. Environment variable override
   const envPath = process.env.CODEX_BIN_PATH;

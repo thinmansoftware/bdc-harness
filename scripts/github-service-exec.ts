@@ -12,6 +12,7 @@ import {
   flushGitHubApiMeter,
   observationFromResponse,
   recordGitHubApiCall,
+  writeLaneMeterObservation,
   type GitHubApiObservation,
 } from '../packages/core/src/github/metering';
 
@@ -19,6 +20,14 @@ interface CommandResult {
   exitCode: number;
   stdout: Uint8Array;
   stderr: Uint8Array;
+}
+
+const LANE_UID = 1002;
+
+export function assertLaneGitHubService(service: string, uid = process.getuid?.()): void {
+  if (uid === LANE_UID && service !== 'run_nodes' && service !== 'smart_cauldron') {
+    throw new Error('lane_service_forbidden');
+  }
 }
 
 /** Only buffer input when gh explicitly requests it, so permission retries can replay it. */
@@ -91,10 +100,19 @@ export async function runGitHubServiceCommand(input: {
   token?: (identity: ServiceGitHubAuth) => Promise<string>;
   execute?: (command: string[], env: Record<string, string | undefined>) => CommandResult;
   db?: IDatabase;
+  /** Test seam. Production uses the process uid. */
+  uid?: number;
+  /** Test seam. Production uses the lane meter spool under ARCHON_HOME. */
+  spoolDir?: string;
 }): Promise<CommandResult> {
+  const uid = input.uid ?? process.getuid?.();
+  assertLaneGitHubService(input.service, uid);
+  const laneMetering = uid === LANE_UID;
   const env = input.env ?? process.env;
   const identity = input.identity ?? resolveServiceGitHubAuth(input.service, env);
-  const db = input.db ?? getDatabase();
+  // A lane holds no database handle. Observations land in the spool and the
+  // server process records github_api_usage.
+  const db = laneMetering ? undefined : (input.db ?? getDatabase());
   const execute =
     input.execute ??
     ((command, childEnv): CommandResult =>
@@ -115,17 +133,53 @@ export async function runGitHubServiceCommand(input: {
   const permissionFallbackDisabled =
     env.ARCHON_GITHUB_NO_PERMISSION_FALLBACK === '1' ||
     env.ARCHON_GITHUB_NO_PERMISSION_FALLBACK === 'true';
+  let meteringWarningPrinted = false;
+  const persistObservation = (observation: GitHubApiObservation): void => {
+    if (laneMetering) {
+      try {
+        writeLaneMeterObservation(observation, input.spoolDir);
+      } catch {
+        if (!meteringWarningPrinted) {
+          console.error('github_service_metering_skipped:database_not_writable');
+          meteringWarningPrinted = true;
+        }
+      }
+      return;
+    }
+    recordGitHubApiCall(observation);
+  };
+  const flushMetering = async (): Promise<void> => {
+    if (laneMetering || !db) return;
+    try {
+      await flushGitHubApiMeter(db);
+    } catch {
+      if (!meteringWarningPrinted) {
+        console.error('github_service_metering_skipped:database_not_writable');
+        meteringWarningPrinted = true;
+      }
+    }
+  };
   const invoke = async (
     selected: ServiceGitHubAuth,
     permissionFallback = false
   ): Promise<CommandResult> => {
     // A gh command may use REST and GraphQL in the same operation. Refuse
     // conservatively if any of its pool's known resources is exhausted.
-    await assertPersistedGitHubPoolAvailable(
-      selected.poolId,
-      ['core', 'graphql', 'search', 'cli'],
-      db
-    );
+    try {
+      if (!laneMetering && db) {
+        await assertPersistedGitHubPoolAvailable(
+          selected.poolId,
+          ['core', 'graphql', 'search', 'cli'],
+          db
+        );
+      }
+    } catch (error) {
+      if (String(error).includes('github_pool_backoff:')) throw error;
+      if (!meteringWarningPrinted) {
+        console.error('github_service_metering_skipped:database_not_readable');
+        meteringWarningPrinted = true;
+      }
+    }
     const token =
       selected.kind === 'pat'
         ? selected.token
@@ -140,14 +194,14 @@ export async function runGitHubServiceCommand(input: {
         CLICOLOR: '0',
       });
     } catch (error) {
-      recordGitHubApiCall({
+      persistObservation({
         service: input.service,
         poolId: selected.poolId,
         resource: 'cli',
         status: 0,
         permissionFallback,
       });
-      await flushGitHubApiMeter(db);
+      await flushMetering();
       throw error;
     }
     const trace = consumeGitHubTrace(
@@ -156,12 +210,12 @@ export async function runGitHubServiceCommand(input: {
       selected.poolId,
       permissionFallback
     );
-    for (const observation of trace.observations) recordGitHubApiCall(observation);
+    for (const observation of trace.observations) persistObservation(observation);
     // No trace (transport/startup failure or a non-HTTP command) is an explicit
     // CLI attempt, not a fabricated successful API request.
     if (!trace.observations.length) {
       const rateLimited = /(?:API|secondary) rate limit|abuse detection/i.test(trace.stderr);
-      recordGitHubApiCall({
+      persistObservation({
         service: input.service,
         poolId: selected.poolId,
         resource: 'cli',
@@ -172,7 +226,7 @@ export async function runGitHubServiceCommand(input: {
       });
     }
     // Persist before exit/retry so the next CLI process sees the same pool.
-    await flushGitHubApiMeter(db);
+    await flushMetering();
     let stderr = trace.stderr;
     for (const secret of [token, fallback]) {
       if (secret) stderr = stderr.split(secret).join('[redacted]');
@@ -204,6 +258,7 @@ if (import.meta.main) {
   const [service, command, ...args] = process.argv.slice(2);
   if (!service || !command) throw new Error('github_service_command_required');
   try {
+    assertLaneGitHubService(service);
     const result = await runGitHubServiceCommand({
       service: service as GitHubService,
       command,

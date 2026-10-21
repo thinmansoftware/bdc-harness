@@ -21,6 +21,40 @@ if [ "$(id -u)" = "0" ]; then
     echo "ERROR: Failed to fix ownership of /home/appuser -- volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
+  chmod 0755 /home/appuser
+
+  # Seed a separate, persistent lane HOME once. Never copy git credentials or
+  # gh hosts: lanes authenticate through the Builder 2 App helper.
+  if [ ! -e /home/laneuser/.archon-seeded ]; then
+    for provider_dir in .claude .codex .cursor .grok; do
+      if [ -d "/home/appuser/$provider_dir" ]; then
+        cp -a "/home/appuser/$provider_dir" /home/laneuser/
+      fi
+    done
+    git config --file /home/laneuser/.gitconfig credential.https://github.com.helper '!bun /app/scripts/github-service-login.ts'
+    git config --file /home/laneuser/.gitconfig --add safe.directory '*'
+    touch /home/laneuser/.archon-seeded
+  fi
+  chown -Rh laneuser:laneuser /home/laneuser
+  chmod 0700 /home/laneuser
+
+  chown appuser:appuser /.archon
+  chmod 0751 /.archon
+  for lane_dir in /.archon/workspaces /.archon/worktrees /.archon/artifacts /.archon/artifacts/lane-meter /.archon/node-out /.archon/run-logs /host-artifacts; do
+    [ -e "$lane_dir" ] || mkdir -p "$lane_dir"
+    chown -R appuser:laneuser "$lane_dir"
+    find "$lane_dir" -type d -exec chmod 2775 {} +
+    find "$lane_dir" -type f -exec chmod g+rw {} +
+  done
+  for db_file in /.archon/archon.db /.archon/archon.db-wal /.archon/archon.db-shm; do
+    if [ -e "$db_file" ]; then
+      chown appuser:appuser "$db_file"
+      chmod 0600 "$db_file"
+    fi
+  done
+  find /.archon/workspaces -type d -name .git -prune -print 2>/dev/null | while IFS= read -r git_dir; do
+    gosu laneuser git -C "${git_dir%/.git}" config core.sharedRepository group || true
+  done
   # PR #848: seed cursor-agent auth state from the read-only host mount.
   # docker-compose.yml binds ${CURSOR_CONFIG_HOST_PATH:-/dev/null} at
   # /run/secrets/cursor-config. Only a non-empty DIRECTORY is copied; the

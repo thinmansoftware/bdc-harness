@@ -14,13 +14,13 @@
  * 3. Autodetect canonical install path (binary mode only -- native installer default)
  * 4. Throw with install instructions (binary mode only)
  *
- * In dev mode (BUNDLED_IS_BINARY=false), if no env var is set, returns
- * undefined so the caller omits `pathToClaudeCodeExecutable` entirely and
- * the SDK resolves via its normal node_modules lookup.
+ * In dev mode (BUNDLED_IS_BINARY=false), resolves the executable from the
+ * SDK's installed platform package so callers can apply lane isolation.
  */
 import { existsSync as _existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
 import { BUNDLED_IS_BINARY, createLogger } from '@archon/paths';
 
 /** Wrapper for existsSync -- enables spyOn in tests (direct imports can't be spied on). */
@@ -54,14 +54,22 @@ const INSTALL_INSTRUCTIONS =
   '        claudeBinaryPath: /absolute/path/to/claude\n\n' +
   'See: https://archon.diy/docs/reference/configuration#claude';
 
+function resolveSdkClaudePath(): string {
+  const platform = `${process.platform}-${process.arch}`;
+  const requireFromSdk = createRequire(import.meta.resolve('@anthropic-ai/claude-agent-sdk'));
+  const packageJson = requireFromSdk.resolve(
+    `@anthropic-ai/claude-agent-sdk-${platform}/package.json`
+  );
+  return join(packageJson, '..', process.platform === 'win32' ? 'claude.exe' : 'claude');
+}
+
 /**
  * Resolve the path to the Claude Code executable (native binary in SDK 0.2.x;
  * legacy `cli.js` is still accepted for operators pinned to npm-installed
  * SDKs that ship a JS entry point).
  *
- * In dev mode: honors `CLAUDE_BIN_PATH` if set; otherwise returns undefined
- * (let SDK resolve from its bundled per-platform native binary in
- * `@anthropic-ai/claude-agent-sdk-<platform>`).
+ * In dev mode: honors `CLAUDE_BIN_PATH` if set; otherwise resolves the bundled
+ * per-platform native binary in `@anthropic-ai/claude-agent-sdk-<platform>`.
  * In binary mode: resolves from env/config/autodetect, or throws with
  * install instructions.
  */
@@ -84,7 +92,7 @@ export async function resolveClaudeBinaryPath(
     return envPath;
   }
 
-  if (!BUNDLED_IS_BINARY) return undefined;
+  if (!BUNDLED_IS_BINARY) return resolveSdkClaudePath();
 
   // 2. Config file override
   if (configClaudeBinaryPath) {

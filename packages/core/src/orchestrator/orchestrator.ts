@@ -52,8 +52,7 @@ import { executeWorkflow } from '@archon/workflows/executor';
 import { parseDeclaredBaseBranch } from '@archon/workflows/reliability/run-authority';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import type { ModelOverride } from '@archon/workflows/model-override';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execFileAsync } from '../../../git/src/exec';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { freezeWorkOrderSource } from '../workflows/work-order-source';
 import {
@@ -253,8 +252,6 @@ export interface WorkflowRoutingContext {
   readonly isolationHints?: IsolationHints;
   readonly modelOverride?: ModelOverride;
 }
-
-const execFileAsync = promisify(execFile);
 
 /**
  * Verify a branch exists on origin (WO-HARNESS-BASE-LANE-AUTHORITY-01).

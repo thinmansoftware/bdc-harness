@@ -109,6 +109,7 @@ import {
   validateAppDefaultsPaths,
   shutdownTelemetry,
 } from '@archon/paths';
+import { startLaneGitHubMeterIngest } from '@archon/core/github/metering';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -320,6 +321,8 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   // Start cleanup scheduler
   startCleanupScheduler();
+  // Lane gh calls cannot open archon.db. Drain their spool into github_api_usage.
+  startLaneGitHubMeterIngest();
 
   // Startup recovery remains observe-only. It never flips another worker's row,
   // resumes a run, or touches a worktree without an explicit lease-CAS recovery.

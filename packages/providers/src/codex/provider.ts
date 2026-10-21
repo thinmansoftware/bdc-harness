@@ -35,6 +35,11 @@ import {
 } from '../auth-refresh/index.js';
 import { createLogger } from '@archon/paths';
 import { classifyProbeError } from '../probe/probe-classifier';
+import {
+  buildLaneSubprocessEnv,
+  laneExecutablePath,
+  laneIsolationAvailable,
+} from '../../../core/src/github/lane-env';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -62,7 +67,7 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
   if (!codexInitPromise) {
     codexInitPromise = (async (): Promise<Codex> => {
       const codexPathOverride = await resolveCodexBinaryPath(configCodexBinaryPath);
-      const instance = new Codex({ codexPathOverride });
+      const instance = new Codex({ codexPathOverride: laneExecutablePath(codexPathOverride) });
       codexInstance = instance;
       return instance;
     })().catch(err => {
@@ -147,7 +152,8 @@ function buildCodexEnv(requestEnv: Record<string, string>): Record<string, strin
     Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)
   );
   // Managed project env intentionally overrides inherited process env for project-scoped execution.
-  return { ...baseEnv, ...requestEnv };
+  const env = { ...baseEnv, ...requestEnv };
+  return (laneIsolationAvailable() ? buildLaneSubprocessEnv(env) : env) as Record<string, string>;
 }
 
 // Maps stale/dead model slugs to the live default for the human-readable
@@ -754,7 +760,7 @@ export class CodexProvider implements IAgentProvider {
 
     try {
       return new Codex({
-        codexPathOverride: await resolveCodexBinaryPath(configCodexBinaryPath),
+        codexPathOverride: laneExecutablePath(await resolveCodexBinaryPath(configCodexBinaryPath)),
         env: buildCodexEnv(requestEnv),
       });
     } catch (error) {

@@ -81,6 +81,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     gnupg \
     gosu \
+    libcap2-bin \
     # jq is load-bearing: lane read-spec bash nodes parse GitHub API JSON with it
     # (2026-07-10 outage #2: image shipped without jq -> read-spec exit 127)
     jq \
@@ -172,8 +173,27 @@ RUN mkdir -p /opt/cursor-agent \
 
 # Create non-root user for running Claude Code
 # Claude Code refuses to run with --dangerously-skip-permissions as root for security
-RUN useradd -m -u 1001 -s /bin/bash appuser \
+RUN ! getent group 1002 >/dev/null \
+    && ! getent group 1100 >/dev/null \
+    && ! getent group 1101 >/dev/null \
+    && groupadd -g 1002 laneuser \
+    && groupadd -g 1100 archon-secrets \
+    && groupadd -g 1101 archon-launch \
+    && useradd -m -u 1001 -s /bin/bash appuser \
+    && useradd -m -u 1002 -g laneuser -s /bin/bash laneuser \
+    && usermod -a -G laneuser,archon-secrets,archon-launch appuser \
+    && chmod 0755 /home/appuser \
+    && chmod 0700 /home/laneuser \
     && chown -R appuser:appuser /app
+
+COPY scripts/container/archon-lane-exec.sh /usr/local/bin/archon-lane-exec
+RUN mkdir -p /usr/local/libexec/archon \
+    && cp "$(command -v setpriv)" /usr/local/libexec/archon/lane-setpriv \
+    && chown root:archon-launch /usr/local/libexec/archon/lane-setpriv \
+    && chmod 0750 /usr/local/libexec/archon/lane-setpriv \
+    && setcap cap_setuid,cap_setgid+ep /usr/local/libexec/archon/lane-setpriv \
+    && chmod 0755 /usr/local/bin/archon-lane-exec \
+    && ! gosu laneuser /usr/local/libexec/archon/lane-setpriv --version
 
 # Create Archon directories
 RUN mkdir -p /.archon/workspaces /.archon/worktrees \

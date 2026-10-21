@@ -1,14 +1,31 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   githubCommandReadsStdin,
+  assertLaneGitHubService,
   runGitHubServiceCommand as runCommand,
 } from './github-service-exec';
-import { serviceGitHubCommandEnvironment } from '../packages/core/src/github/service-identity';
+import {
+  resolveServiceGitHubAuth,
+  serviceGitHubCommandEnvironment,
+} from '../packages/core/src/github/service-identity';
 import { generateKeyPairSync } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resetGitHubApiMeterForTests } from '../packages/core/src/github/metering';
+import {
+  currentGitHubHourBucket,
+  ingestLaneGitHubMeterSpool,
+  resetGitHubApiMeterForTests,
+} from '../packages/core/src/github/metering';
+import { closeDatabase, resetDatabase } from '../packages/core/src/db/connection';
 import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
 import { execFile } from 'node:child_process';
 
@@ -25,6 +42,11 @@ const runGitHubServiceCommand = (
 ): ReturnType<typeof runCommand> => runCommand({ ...input, db });
 
 describe('operation-scoped GitHub CLI authentication', () => {
+  test('lane_service_forbidden rejects reviewer services for UID 1002', () => {
+    expect(() => assertLaneGitHubService('overseer', 1002)).toThrow('lane_service_forbidden');
+    expect(() => assertLaneGitHubService('run_nodes', 1002)).not.toThrow();
+    expect(() => assertLaneGitHubService('smart_cauldron', 1002)).not.toThrow();
+  });
   test('buffers declared gh stdin sources and leaves ordinary query arguments alone', () => {
     for (const args of [
       ['api', 'repos/synthetic/test', '--input', '-'],
@@ -114,6 +136,32 @@ describe('operation-scoped GitHub CLI authentication', () => {
       "SELECT calls FROM github_api_usage WHERE resource = 'cli'"
     );
     expect(usage.rows[0]?.calls).toBe(1);
+  });
+  test('an unreadable metering database does not block the GitHub command', async () => {
+    let launches = 0;
+    const result = await runCommand({
+      service: 'run_nodes',
+      command: 'synthetic-gh',
+      args: [],
+      identity: {
+        kind: 'pat',
+        service: 'run_nodes',
+        token: 'synthetic-pat',
+        poolId: 'user-pat',
+        distinct: false,
+      },
+      db: {
+        query: async () => {
+          throw new Error('synthetic unreadable database');
+        },
+      } as unknown as SqliteAdapter,
+      execute: () => {
+        launches += 1;
+        return { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(launches).toBe(1);
   });
   test('Smart Cauldron override survives the actual container wrapper and keeps PAT fallback', async () => {
     const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 })
@@ -350,5 +398,105 @@ describe('operation-scoped GitHub CLI authentication', () => {
     expect(mints).toBe(1);
     // The App 403 surfaces as a failure rather than a reviewer-authored success.
     expect(result.exitCode).toBe(1);
+  });
+
+  test('lane_gh_call_is_metered_by_the_server', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'lane-meter-home-'));
+    const spool = join(home, 'spool');
+    mkdirSync(spool);
+    const previousHome = process.env.ARCHON_HOME;
+    process.env.ARCHON_HOME = home;
+    resetDatabase();
+    let laneOpenedDatabase = false;
+    const laneDb: SqliteAdapter = Object.assign(Object.create(db), {
+      query: async () => {
+        laneOpenedDatabase = true;
+        throw new Error('lane_opened_database');
+      },
+      withTransaction: async () => {
+        laneOpenedDatabase = true;
+        throw new Error('lane_opened_database');
+      },
+    });
+    try {
+      const result = await runCommand({
+        service: 'run_nodes',
+        command: 'gh',
+        args: ['pr', 'view', '1'],
+        uid: 1002,
+        spoolDir: spool,
+        db: laneDb,
+        identity: {
+          kind: 'pat',
+          service: 'run_nodes',
+          token: 'synthetic-pat',
+          poolId: 'user-pat',
+          distinct: false,
+        },
+        execute: () => ({
+          exitCode: 0,
+          stdout: new Uint8Array(),
+          stderr: new Uint8Array(),
+        }),
+      });
+      expect(result.exitCode).toBe(0);
+      expect(laneOpenedDatabase).toBe(false);
+      expect(existsSync(join(home, 'archon.db'))).toBe(false);
+      const laneFiles = readdirSync(spool).filter(name => name.endsWith('.json'));
+      expect(laneFiles.length).toBe(1);
+      const laneBody = JSON.parse(readFileSync(join(spool, laneFiles[0] ?? ''), 'utf8')) as {
+        service?: string;
+        poolId?: string;
+        resource?: string;
+      };
+      expect(laneBody.service).toBeUndefined();
+      expect(laneBody.poolId).toBeUndefined();
+      expect(laneBody.resource).toBe('cli');
+
+      writeFileSync(
+        join(spool, '4-5-abcd.json'),
+        JSON.stringify({
+          v: 1,
+          service: 'overseer',
+          poolId: 'reviewer',
+          resource: 'core',
+          status: 200,
+          calls: 99999,
+        })
+      );
+      writeFileSync(
+        join(spool, 'poison-count.json'),
+        JSON.stringify({
+          v: 1,
+          service: 'run_nodes',
+          poolId: 'user-pat',
+          resource: 'cli',
+          status: 0,
+          calls: 50,
+        })
+      );
+
+      const identity = resolveServiceGitHubAuth('run_nodes');
+      const ingested = await ingestLaneGitHubMeterSpool(db, spool);
+      expect(ingested).toBe(2);
+      expect(existsSync(join(spool, 'poison-count.json'))).toBe(true);
+      const hour = currentGitHubHourBucket();
+      const usage = await db.query<{
+        calls: number;
+        service: string;
+        pool_id: string;
+      }>('SELECT service, pool_id, calls FROM github_api_usage WHERE hour_bucket = $1', [hour]);
+      expect(usage.rows.every(row => row.service === 'run_nodes')).toBe(true);
+      expect(usage.rows.every(row => row.pool_id === identity.poolId)).toBe(true);
+      expect(usage.rows.some(row => row.pool_id === 'reviewer')).toBe(false);
+      expect(usage.rows.some(row => row.service === 'overseer')).toBe(false);
+      expect(usage.rows.reduce((sum, row) => sum + row.calls, 0)).toBe(2);
+    } finally {
+      await closeDatabase();
+      resetDatabase();
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

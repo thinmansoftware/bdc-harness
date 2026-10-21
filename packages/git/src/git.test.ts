@@ -59,6 +59,26 @@ mock.module('@archon/paths', () => ({
 // Import modules AFTER mocking
 // ---------------------------------------------------------------------------
 import * as git from './index';
+import { shouldIsolateWorkspaceGit } from './exec';
+
+describe('workspace git UID isolation', () => {
+  test('detects workspace targets in cwd and git path arguments', () => {
+    expect(shouldIsolateWorkspaceGit('git', ['status'], '/.archon/workspaces/acme/repo')).toBe(
+      true
+    );
+    expect(
+      shouldIsolateWorkspaceGit('git', ['-C', '/.archon/workspaces/acme/repo', 'status'])
+    ).toBe(true);
+    expect(
+      shouldIsolateWorkspaceGit('git', ['--git-dir=/.archon/workspaces/acme/repo/.git', 'status'])
+    ).toBe(true);
+    expect(
+      shouldIsolateWorkspaceGit('git', ['--work-tree', '/.archon/workspaces/acme/repo', 'status'])
+    ).toBe(true);
+    expect(shouldIsolateWorkspaceGit('git', ['status'], '/tmp/repo')).toBe(false);
+    expect(shouldIsolateWorkspaceGit('bash', ['/.archon/workspaces/acme/repo'])).toBe(false);
+  });
+});
 
 // ============================================================================
 // Tests

@@ -1,6 +1,21 @@
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { join } from 'node:path';
+import { createLogger, getArchonHome } from '@archon/paths';
 import { getDatabase } from '../db/connection';
 import type { IDatabase } from '../db/adapters/types';
-import type { GitHubService } from './service-identity';
+import { resolveServiceGitHubAuth, type GitHubService } from './service-identity';
 
 export interface GitHubApiObservation {
   service: GitHubService;
@@ -250,5 +265,261 @@ export function resetGitHubApiMeterForTests(): void {
   backoff.clear();
   if (flushTimer) clearTimeout(flushTimer);
   flushTimer = null;
+  if (laneMeterTimer) clearInterval(laneMeterTimer);
+  laneMeterTimer = null;
+  laneIngestTail = Promise.resolve();
   lastFlushAt = 0;
+}
+
+const LANE_METER_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+const LANE_METER_FILE = /^[0-9]+-[0-9]+-[0-9a-f]+\.json$/;
+const LANE_METER_MAX_BYTES = 1024;
+let laneMeterTimer: ReturnType<typeof setInterval> | null = null;
+let laneIngestTail: Promise<void> = Promise.resolve();
+let meterLog: ReturnType<typeof createLogger> | undefined;
+
+function getMeterLog(): ReturnType<typeof createLogger> {
+  if (!meterLog) meterLog = createLogger('github.metering');
+  return meterLog;
+}
+
+/** Lane-writable spool. The server process is the only writer to archon.db. */
+export function laneMeterSpoolDir(): string {
+  return join(getArchonHome(), 'artifacts', 'lane-meter');
+}
+
+export function currentGitHubHourBucket(now = Date.now()): string {
+  return new Date(Math.floor(now / 3_600_000) * 3_600_000).toISOString();
+}
+
+/**
+ * Persist one lane observation as a file. Does not open the database.
+ * Service and pool id are omitted: the server stamps run_nodes identity at ingest.
+ */
+export function writeLaneMeterObservation(
+  observation: GitHubApiObservation,
+  directory = laneMeterSpoolDir()
+): void {
+  mkdirSync(directory, { recursive: true });
+  const name = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`;
+  const path = join(directory, name);
+  writeFileSync(
+    path,
+    JSON.stringify({
+      v: 1,
+      resource: observation.resource,
+      status: observation.status,
+    }),
+    { flag: 'wx' }
+  );
+  try {
+    chmodSync(path, 0o640);
+  } catch {
+    // The create mode is already owner-readable. Group mode is best-effort.
+  }
+}
+
+interface AcceptedLaneMeter {
+  resource: string;
+  status: number;
+}
+
+interface SpoolClaim {
+  path: string;
+  dev: number;
+  ino: number;
+  row: AcceptedLaneMeter;
+}
+
+function acceptLaneMeterPayload(raw: string): AcceptedLaneMeter | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const row = parsed as Record<string, unknown>;
+  if (row.v !== 1) return undefined;
+  // Lane-supplied service and poolId are never read. Identity is server-side.
+  if (typeof row.resource !== 'string' || !LANE_METER_ID.test(row.resource)) return undefined;
+  if (
+    typeof row.status !== 'number' ||
+    !Number.isInteger(row.status) ||
+    row.status < 0 ||
+    row.status > 599
+  ) {
+    return undefined;
+  }
+  return {
+    resource: row.resource,
+    status: row.status,
+  };
+}
+
+/** Linux lane isolation requires O_NOFOLLOW. Windows CI has no lane uid split. */
+function spoolOpenFlags(): number {
+  const noFollow = (constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
+  if (process.platform !== 'win32') {
+    if (typeof noFollow !== 'number') throw new Error('lane_meter_nofollow_unavailable');
+    return constants.O_RDONLY | noFollow;
+  }
+  return constants.O_RDONLY;
+}
+
+function openSpoolNoFollow(path: string): number {
+  return openSync(path, spoolOpenFlags());
+}
+
+function sameSpoolInode(
+  path: string,
+  dev: number,
+  ino: number
+): { dev: number; ino: number } | undefined {
+  try {
+    const listed = lstatSync(path);
+    if (listed.isSymbolicLink() || !listed.isFile()) return undefined;
+    if (listed.dev !== dev || listed.ino !== ino) return undefined;
+    return { dev: listed.dev, ino: listed.ino };
+  } catch {
+    return undefined;
+  }
+}
+
+function unlinkClaimed(path: string, dev: number, ino: number): void {
+  if (!sameSpoolInode(path, dev, ino)) return;
+  let fd: number | undefined;
+  try {
+    fd = openSpoolNoFollow(path);
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== dev || opened.ino !== ino) return;
+  } catch {
+    return;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  if (!sameSpoolInode(path, dev, ino)) return;
+  try {
+    unlinkSync(path);
+  } catch {
+    // Leave the file. The next ingest retries it.
+  }
+}
+
+function readSpoolClaim(
+  directory: string,
+  name: string
+): { path: string; raw: string; dev: number; ino: number } | undefined {
+  if (!LANE_METER_FILE.test(name) || name.includes('/') || name.includes('\\')) return undefined;
+  const path = join(directory, name);
+  let listed: ReturnType<typeof lstatSync>;
+  try {
+    listed = lstatSync(path);
+  } catch {
+    return undefined;
+  }
+  if (listed.isSymbolicLink()) {
+    try {
+      unlinkSync(path);
+    } catch {
+      // A remaining symlink is skipped again on the next tick.
+    }
+    return undefined;
+  }
+  if (!listed.isFile()) return undefined;
+  let fd: number | undefined;
+  try {
+    fd = openSpoolNoFollow(path);
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== listed.dev || opened.ino !== listed.ino)
+      return undefined;
+    if (opened.size > LANE_METER_MAX_BYTES) {
+      closeSync(fd);
+      fd = undefined;
+      unlinkClaimed(path, opened.dev, opened.ino);
+      return undefined;
+    }
+    return { path, raw: readFileSync(fd, 'utf8'), dev: opened.dev, ino: opened.ino };
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function resolveRunNodesMeterIdentity(): { service: 'run_nodes'; poolId: string } {
+  const auth = resolveServiceGitHubAuth('run_nodes');
+  if (auth.service !== 'run_nodes' || auth.poolId === 'none' || auth.poolId.length === 0) {
+    throw new Error('lane_meter_identity_unresolved');
+  }
+  return { service: 'run_nodes', poolId: auth.poolId };
+}
+
+async function ingestLaneGitHubMeterSpoolOnce(db: IDatabase, directory: string): Promise<number> {
+  let listed: ReturnType<typeof lstatSync>;
+  try {
+    listed = lstatSync(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
+  if (!listed.isDirectory() || listed.isSymbolicLink()) return 0;
+  const names = readdirSync(directory);
+  const accepted: SpoolClaim[] = [];
+  for (const name of names) {
+    const claim = readSpoolClaim(directory, name);
+    if (!claim) continue;
+    const row = acceptLaneMeterPayload(claim.raw);
+    if (!row) {
+      unlinkClaimed(claim.path, claim.dev, claim.ino);
+      continue;
+    }
+    accepted.push({ path: claim.path, dev: claim.dev, ino: claim.ino, row });
+  }
+  if (accepted.length === 0) return 0;
+  const identity = resolveRunNodesMeterIdentity();
+  const hourBucket = currentGitHubHourBucket();
+  await db.withTransaction(async query => {
+    for (const item of accepted) {
+      await query(
+        `INSERT INTO github_api_usage (hour_bucket, service, pool_id, resource, calls, rate_limited, permission_fallbacks)
+         VALUES ($1, $2, $3, $4, 1, 0, 0)
+         ON CONFLICT (hour_bucket, service, pool_id, resource) DO UPDATE SET
+           calls = github_api_usage.calls + 1`,
+        [hourBucket, identity.service, identity.poolId, item.row.resource]
+      );
+    }
+  });
+  for (const item of accepted) unlinkClaimed(item.path, item.dev, item.ino);
+  return accepted.length;
+}
+
+/**
+ * Record lane observations from the spool. Each accepted file increments
+ * calls by 1 under the server-resolved run_nodes pool. Lane-supplied service,
+ * pool id, counts, hour buckets, and pool-state fields are ignored.
+ * Files stay on disk until the database write commits, so a failed ingest retries.
+ */
+export async function ingestLaneGitHubMeterSpool(
+  db: IDatabase = getDatabase(),
+  directory = laneMeterSpoolDir()
+): Promise<number> {
+  const run = laneIngestTail.then(() => ingestLaneGitHubMeterSpoolOnce(db, directory));
+  laneIngestTail = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+export function startLaneGitHubMeterIngest(intervalMs = 15_000): void {
+  if (laneMeterTimer) return;
+  const tick = (): void => {
+    void ingestLaneGitHubMeterSpool().catch((error: unknown) => {
+      getMeterLog().error({ err: error }, 'lane_meter_ingest_failed');
+    });
+  };
+  tick();
+  laneMeterTimer = setInterval(tick, intervalMs);
+  laneMeterTimer.unref?.();
 }

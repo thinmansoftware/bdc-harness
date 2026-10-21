@@ -39,6 +39,11 @@ import type {
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { resolveClaudeBinaryPath } from './binary-resolver';
+import {
+  buildLaneSubprocessEnv,
+  laneExecutablePath,
+  laneIsolationAvailable,
+} from '../../../core/src/github/lane-env';
 import { claudeProviderThrottle } from './throttle';
 import {
   AUTH_PATTERNS,
@@ -103,7 +108,9 @@ function buildSubprocessEnv(): NodeJS.ProcessEnv {
     { authMode },
     authMode === 'global' ? 'using_global_auth' : 'using_explicit_tokens'
   );
-  return { ...process.env };
+  return (
+    laneIsolationAvailable() ? buildLaneSubprocessEnv(process.env) : { ...process.env }
+  ) as Record<string, string>;
 }
 
 /** Max retries for transient subprocess failures */
@@ -602,7 +609,7 @@ function buildBaseClaudeOptions(
     cwd,
     // In compiled binaries, the resolver supplies an absolute executable path;
     // in dev mode it returns undefined and the SDK resolves from node_modules.
-    ...(cliPath !== undefined ? { pathToClaudeCodeExecutable: cliPath } : {}),
+    ...(cliPath !== undefined ? { pathToClaudeCodeExecutable: laneExecutablePath(cliPath) } : {}),
     ...(isJsExecutable ? { executableArgs: ['--no-env-file'] } : {}),
     env,
     model: requestOptions?.model ?? assistantDefaults.model,
