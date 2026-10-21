@@ -10,7 +10,8 @@ let primary: PostgresAdapter;
 let secondary: PostgresAdapter;
 let active: PostgresAdapter;
 mock.module('./connection', () => ({ getDatabase: () => active }));
-const { resetTaskmaster, upsertHealthSample } = await import('./taskmaster');
+const { resetTaskmaster, upsertHealthSample, claimFireLaunch, listFireLaunchClaims } =
+  await import('./taskmaster');
 const { createAuthenticatedMessage } = await import('./dispatch');
 const healthMigration = readFileSync(
   resolve(import.meta.dir, '../../../../migrations/046_tm_health_provider_pk.sql'),
@@ -63,6 +64,11 @@ beforeAll(async () => {
       'utf8'
     )
   );
+  for (const migration of ['045_taskmaster_fire_verb.sql', '060_taskmaster_blocker_report.sql']) {
+    await primary.query(
+      readFileSync(resolve(import.meta.dir, '../../../../migrations', migration), 'utf8')
+    );
+  }
 });
 
 beforeEach(async () => {
@@ -89,6 +95,36 @@ afterAll(async () => {
     }
   }
 });
+
+test.each(['same-key', 'different-buckets'])(
+  'independent PostgreSQL pools grant one fire: %s',
+  async mode => {
+    await primary.query("UPDATE tm_control SET pause_state='RUNNING' WHERE id=1");
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, i) => {
+        active = i % 2 === 0 ? primary : secondary;
+        const key = mode === 'same-key' ? 'one-key' : `bucket-${i}`;
+        return claimFireLaunch({
+          thread_ref: 'gh:thinmansoftware/bdc-harness#700',
+          proposal_json: JSON.stringify({
+            type: 'fire_cauldron',
+            idempotencyKey: key,
+            recipient: 'operator',
+            fireEvidence: { woId: 'WO-HARNESS-CUSTODY-01', project: 'bdc-harness' },
+          }),
+          idempotency_key: key,
+          before_hash: 'before',
+          proof_predicate: 'actual run',
+          proof_deadline_at: new Date(Date.now() + 86400000).toISOString(),
+          expectedEpoch: 7,
+        });
+      })
+    );
+    expect(results.filter(result => result.status === 'claimed')).toHaveLength(1);
+    expect(results.filter(result => result.status === 'held')).toHaveLength(7);
+    expect(await listFireLaunchClaims()).toHaveLength(1);
+  }
+);
 
 test('independent PostgreSQL pools serialize overlapping resets with one transition', async () => {
   expect(primary.dialect).toBe('postgres');
