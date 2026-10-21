@@ -73,10 +73,14 @@ function git(args: string[], cwd: string): string {
   return result.stdout.toString();
 }
 
-function utcMinutesAgo(minutes: number): string {
-  const d = new Date(Date.now() - minutes * 60 * 1000);
+function utcSecondsAgo(seconds: number): string {
+  const d = new Date(Date.now() - seconds * 1000);
   const p = (n: number): string => String(n).padStart(2, '0');
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+function utcMinutesAgo(minutes: number): string {
+  return utcSecondsAgo(minutes * 60);
 }
 
 interface Fixture {
@@ -212,14 +216,16 @@ describe('repair-target worktree reclaim', () => {
     expect(worktrees(fixture.caller)).toContain(holder);
   }, 30000);
 
-  it('Test 7b: a terminal holder only two minutes old is refused', () => {
+  it('Test 7b: a completed holder only two minutes old is refused by the age gate', () => {
+    // The age gate stays in force for `completed` holders (only escalated/failed/
+    // cancelled skip it, per WO-HARNESS-REPAIR-PATH-HOTFIX-01 F3a / item 1e).
     const fixture = makeFixture({ hold: true, withOther: false });
     roots.push(fixture.root);
     const holder = holderPath(fixture.holder);
     writeRuns(fixture.dbPath, [
       {
         id: 'abcd1234ef567890',
-        status: 'failed',
+        status: 'completed',
         working_path: holder,
         completed_at: utcMinutesAgo(2),
       },
@@ -336,5 +342,94 @@ describe('repair-target worktree reclaim', () => {
     expect(first.stdout).not.toContain('repair_target_worktree_reclaimed:');
     expect(second.stdout).not.toContain('repair_target_worktree_reclaimed:');
     expect(worktrees(fixture.caller)).toContain(other);
+  }, 30000);
+
+  // WO-HARNESS-REPAIR-PATH-HOTFIX-01 F3a / item 1e: escalated/failed/cancelled holders
+  // skip the RTW_MIN_AGE_SECONDS age gate (a conductor climbs ~11-26s after the prior
+  // rung ends), while the completed age gate and the live-cwd/dirty safety checks remain.
+  it('Test 3: an escalated holder 15s old with no live cwd and a clean tree is reclaimed', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'older-completed-row',
+        status: 'completed',
+        working_path: holder,
+        completed_at: utcMinutesAgo(20),
+      },
+      {
+        id: 'abcd1234ef567890',
+        status: 'escalated',
+        working_path: holder,
+        completed_at: utcSecondsAgo(15),
+      },
+    ]);
+    const result = runCheckout(fixture, fixture.dbPath);
+    if (result.exitCode !== 0) throw new Error(show(result));
+    expect(result.stdout).toContain('repair_target_worktree_reclaimed:');
+    expect(result.stdout).not.toContain('completed_at is only');
+    expect(worktrees(fixture.caller)).not.toContain(holder);
+  }, 30000);
+
+  it('Test 4: a completed holder 15s old stays age-gated and prints the reason on STDERR', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'completed',
+        working_path: holder,
+        completed_at: utcSecondsAgo(15),
+      },
+    ]);
+    const result = runCheckout(fixture, fixture.dbPath);
+    expect(result.exitCode, show(result)).toBe(1);
+    expect(result.stderr).toContain('repair_target_branch_held:');
+    expect(result.stderr).toContain('completed_at is only');
+    expect(worktrees(fixture.caller)).toContain(holder);
+  }, 30000);
+
+  it('Test 5a: a failed holder 15s old is still refused when a live process cwd is under it', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    const nested = join(holder, 'nested');
+    mkdirSync(nested);
+    const pidDir = join(fixture.procRoot, '4242');
+    mkdirSync(pidDir);
+    symlinkSync(nested, join(pidDir, 'cwd'));
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: holder,
+        completed_at: utcSecondsAgo(15),
+      },
+    ]);
+    const result = runCheckout(fixture, fixture.dbPath);
+    expect(result.exitCode, show(result)).toBe(1);
+    expect(result.stderr).toContain('live process cwd under holder');
+    expect(worktrees(fixture.caller)).toContain(holder);
+  }, 30000);
+
+  it('Test 5b: a failed holder 15s old is still refused when the worktree is dirty', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    writeFileSync(join(holder, 'dirty.txt'), 'dirty\n');
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: holder,
+        completed_at: utcSecondsAgo(15),
+      },
+    ]);
+    const result = runCheckout(fixture, fixture.dbPath);
+    expect(result.exitCode, show(result)).toBe(1);
+    expect(result.stderr).toContain('worktree is dirty');
+    expect(worktrees(fixture.caller)).toContain(holder);
   }, 30000);
 });
