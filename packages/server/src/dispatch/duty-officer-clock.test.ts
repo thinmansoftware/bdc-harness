@@ -1,10 +1,6 @@
-import { unlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
-import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
-import { getDatabase } from '@archon/core/db/connection';
+import { closeDatabase, getDatabase } from '@archon/core/db/connection';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import {
@@ -1239,14 +1235,16 @@ describe('duty officer clock', () => {
 
 test('duty officer sqlite race isolation', async () => {
   const prior = readDutyOfficerProcessEnv();
-  const privatePath = join(
-    tmpdir(),
-    `duty-officer-sqlite-race-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
-  );
   let fetchStub: { mockRestore: () => void } | null = null;
+  // Install the process singleton duty-officer reuses. GitHub metering calls
+  // getDatabase() on each request; a separately constructed adapter is not that handle.
+  const closedHandle = getDatabase();
   try {
-    const privateDb = new SqliteAdapter(privatePath);
-    await privateDb.close();
+    expect(closedHandle.dialect).toBe('sqlite');
+    await closedHandle.query('SELECT 1');
+    await closeDatabase();
+    await expect(closedHandle.query('SELECT 1')).rejects.toThrow();
+
     process.env.DUTY_OFFICER_GH_NUDGE = 'true';
     process.env.GH_TOKEN = 'synthetic-pat';
     delete process.env.GITHUB_TOKEN;
@@ -1260,24 +1258,21 @@ test('duty officer sqlite race isolation', async () => {
         headers: { 'Content-Type': 'application/json' },
       });
     });
-    const live = getDatabase();
-    expect(live).not.toBe(privateDb);
-    await live.query('SELECT 1');
+
+    // postGithubIssueComment reads pool state through the singleton. If that
+    // call receives closedHandle, the closed-database query rejects and this fails.
     expect(
       await postGithubIssueComment(
         { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2274 },
         'cue'
       )
     ).toBe(true);
+
+    const reopened = getDatabase();
+    expect(reopened).not.toBe(closedHandle);
+    await reopened.query('SELECT 1');
   } finally {
     fetchStub?.mockRestore();
     writeDutyOfficerProcessEnv(prior);
-    for (const suffix of ['', '-wal', '-shm']) {
-      try {
-        unlinkSync(privatePath + suffix);
-      } catch {
-        // The private file may already be gone after close().
-      }
-    }
   }
 });
