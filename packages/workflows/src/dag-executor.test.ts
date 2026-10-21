@@ -14989,6 +14989,36 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
     }
   });
 
+  it('a healthy node survives slow status persistence between provider chunks', async () => {
+    let processingFirstChunk = false;
+    let delayedStatusRead = false;
+    mockSendQueryDag.mockImplementation(async function* () {
+      processingFirstChunk = true;
+      yield { type: 'assistant', content: 'working' };
+      await new Promise(resolve => setTimeout(resolve, 20));
+      yield { type: 'result', sessionId: 'slow-consumer-session' };
+    });
+
+    const store = createMockStore();
+    (store.getWorkflowRunStatus as ReturnType<typeof mock>).mockImplementation(async () => {
+      if (processingFirstChunk && !delayedStatusRead) {
+        delayedStatusRead = true;
+        await new Promise(resolve => setTimeout(resolve, 400));
+      }
+      return 'running' as const;
+    });
+    await runPromptNode(store, 'slow-consumer-node', 200, 'silent-slow-consumer');
+
+    const events = eventsOf(store);
+    expect(delayedStatusRead).toBe(true);
+    expect(
+      events.filter(e => e.event_type === 'node_failed' && e.step_name === 'slow-consumer-node')
+    ).toHaveLength(0);
+    expect(
+      events.filter(e => e.event_type === 'node_completed' && e.step_name === 'slow-consumer-node')
+    ).toHaveLength(1);
+  });
+
   it('cancel lands while the provider is silent', async () => {
     const prev = process.env.ARCHON_NODE_CANCEL_POLL_MS;
     process.env.ARCHON_NODE_CANCEL_POLL_MS = '50';
