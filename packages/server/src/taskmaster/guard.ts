@@ -24,6 +24,7 @@ export const TM_ALLOWED_ACTION_TYPES = [
   'digest',
   'fire_cauldron',
   'blocker_report',
+  'pr_repair',
 ] as const;
 export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
 
@@ -156,7 +157,7 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       reason: `blocker_report_recipient_invalid: blocker_report must address 'duty-officer', not '${proposal.recipient}'.`,
     };
   }
-  if (toDutyOfficer && !isBlockerReport) {
+  if (toDutyOfficer && !isBlockerReport && proposal.type !== 'pr_repair') {
     return {
       allowed: false,
       forbiddenEffect: true,

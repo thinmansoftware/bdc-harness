@@ -952,11 +952,11 @@ describe('lane-repair hand-back (overseer side)', () => {
     opts: {
       priorAttempts?: number;
       findings?: readonly IndependentReviewFinding[];
-      lane?: { woId: string; headRef: string; workflowName: string } | null;
+      lane?: Awaited<ReturnType<NonNullable<SubmitDeps['resolveLaneRepairContext']>>>;
     } = {}
   ) {
     const candidates: unknown[] = [];
-    const exhausted = new Map<string, { reason: string }>();
+    const exhausted = new Map<string, { reason: string; buildLine: string }>();
     const base: SubmitDeps = {
       reviewerIdentity: 'thinman-overseer[bot]',
       runReviewer: async () => ({
@@ -980,7 +980,8 @@ describe('lane-repair hand-back (overseer side)', () => {
       emitRemediationExhausted: async input => {
         // Model ON CONFLICT DO NOTHING: one row per PR ever.
         const key = `${input.owner}/${input.repo}#${input.prNumber}`;
-        if (!exhausted.has(key)) exhausted.set(key, { reason: input.reason });
+        if (!exhausted.has(key))
+          exhausted.set(key, { reason: input.reason, buildLine: input.buildLine });
       },
     };
     return { deps: base, candidates, exhausted };
@@ -1030,13 +1031,27 @@ describe('lane-repair hand-back (overseer side)', () => {
     expect([...exhausted.values()][0]?.reason).toBe('non_auto_finding');
   });
 
-  test('a non-lane PR (null context) is never handed back and never exhausted', async () => {
-    const { deps, candidates, exhausted } = laneDeps({ lane: null });
+  test('build_line_split_never_both', async () => {
+    const { deps, candidates, exhausted } = laneDeps({
+      lane: {
+        laneRepair: null,
+        identity: {
+          title: `Repair ${LANE_WO}`,
+          body: '',
+          headRef: 'feat/hand-built-fix',
+          prUrl: 'https://github.com/thinmansoftware/bdc-xo/pull/3171',
+        },
+      },
+    });
     const outcome = await runAndSubmitReview(laneWork(), deps);
 
     expect(outcome.remediation?.emitted).toBe(false);
     expect(candidates).toHaveLength(0);
-    expect(exhausted.size).toBe(0);
+    expect(exhausted.size).toBe(1);
+    expect([...exhausted.values()][0]).toEqual({
+      reason: 'outside_cauldron',
+      buildLine: 'outside',
+    });
   });
 });
 

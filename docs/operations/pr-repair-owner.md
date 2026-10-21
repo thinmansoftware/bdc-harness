@@ -3,16 +3,17 @@
 WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01
 
 The PR repair owner is a Taskmaster tick step. It decides WHEN a lane-built pull
-request that the Overseer rejected (CHANGES_REQUESTED) is repaired in place, it
+request that the Overseer rejected (CHANGES_REQUESTED) is routed to its owner, it
 collapses duplicate lane-built PRs for one Work Order to a single survivor, and
 it surfaces exhausted or human-judgment cases as a single line in the Duty
 Officer daily digest. It edits no lane YAML and opens no new PR for a repair --
-the repair runs on the rejected PR's own branch.
+Taskmaster never starts a repair cascade.
 
 ## What it does, each tick
 
-The owner runs once per Taskmaster tick, ONLY while `pause_state` is `RUNNING`.
-Pausing the Taskmaster is the kill switch (see below). Each tick it performs
+The owner plans work once per Taskmaster tick. Its effects use the same journal,
+pause gate, and ten-effect tick budget as every other Taskmaster effect. Pausing
+the Taskmaster is the kill switch (see below). Each tick it performs
 three bounded steps:
 
 1. **Dedupe sweep.** Over at most 5 Work Orders that have two or more
@@ -40,9 +41,8 @@ three bounded steps:
    - requires the PR OPEN with its live head SHA equal to the reviewed head
      (else `refused:stale_head`);
    - skips (leaves the row queued) while any run for the WO is `pending` or `running`;
-   - otherwise acknowledges the row as `taskmaster`, fires EXACTLY ONE bounded
-     repair cascade on the PR's branch (the cascade never climbs). Admission does
-     not address or consume the row: the first run-authority transaction does.
+   - otherwise resolves the WO owner and sends one idempotent Taskmaster nudge
+     with reason `cauldron_repair_pending`; no cascade is fired.
 
    Freezing requires the candidate's owner/repository to match the resolved
    execution repository, not the separate spec repository. It rejects addressed,
@@ -62,10 +62,12 @@ three bounded steps:
    remediation candidate's attempt-slot key; a third CHANGES_REQUESTED verdict
    produces an `overseer_remediation_exhausted` row instead of a candidate.
 
-3. **Exhausted.** Each queued `overseer_remediation_exhausted` row becomes one
-   digest line `<owner>/<repo>#<N> <WO> <reason>` (reason is `attempt_cap` or
-   `non_auto_finding`). Those rows are addressed ONLY AFTER the digest carrying
-   them is sent, so a failed digest never loses the line.
+3. **Hand-off.** Cauldron exhaustion and outside-Cauldron rejection rows are
+   sent to the owner named by an allowed `owner:<seat>` label, falling back to
+   the existing assignee mapping. If no safe owner resolves, the row becomes
+   `<owner>/<repo>#<N> <WO|no-wo> repair_owner_unresolved:<reason>` in the daily
+   digest. A row is addressed only when its exact line appears in the body of
+   the persisted digest message, including idempotent digest retries.
 
 ## The LANE PR RULE
 
@@ -98,13 +100,12 @@ target PR from that guard.
 
 - `PR_REPAIR_DEDUPE_WINDOW_HOURS` -- dedupe lookback window in hours (default
   168). WOs whose newest lane run started before this cutoff are not swept.
-- `ARCHON_OPERATOR_TOKEN` -- forwarded to the repair cascade.
 - `GITHUB_TOKEN` / `GH_TOKEN` -- used by `gh` for PR read and PR close.
 
 ## Kill switch
 
-Pause the Taskmaster. While `pause_state` is not `RUNNING`, the owner does not
-run at all -- no dedupe closes, no repair fires.
+Pause the Taskmaster. Discovery continues so work is visible as parked, but no
+dedupe close or owner nudge executes.
 
 ```
 # status / pause / resume runbook:
@@ -154,12 +155,9 @@ comment; the branch is always kept.
 
 ## Runtime dependency
 
-Live repair runs succeed only after WO-HARNESS-REPAIR-TARGET-LANE-01
-(bdc-xo #3069) is merged and deployed. That WO repairs the in-place repair
-MECHANICS inside the 13 lane YAMLs (authorization through commit-and-push).
-Until it ships, every repair cascade this owner fires fails at commit-and-push
-with `repair_target_unauthorized`. The two WOs touch disjoint files; this one is
-safe to deploy first, but the Section 8 canary is only meaningful afterward.
+WO-HARNESS-REPAIR-TARGET-LANE-01 remains the authority/mechanics dependency for
+an Overseer-owned in-place repair. Taskmaster only routes ownership and never
+invokes those mechanics.
 
 ## Candidate admission identity
 

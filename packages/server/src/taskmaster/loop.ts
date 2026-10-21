@@ -33,12 +33,12 @@ import {
 } from '@archon/core/db/dispatch';
 import { listLanePrsForWo, listWosWithMultipleLanePrs } from '@archon/core/db/lane-pr-registry';
 import { execFileAsync } from '@archon/git';
-import { loadLadder } from '@archon/smart-cauldron/ladder';
 import {
   runPrRepairOwner,
   resolvePrRepairDedupeWindowHours,
   type PrRepairOwnerDeps,
   type PrRepairQueuedMessage,
+  type RepairOwnerIssue,
 } from './pr-repair-owner';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
@@ -418,6 +418,7 @@ export const TM_REPEAT_REASON_BY_TYPE: Record<TmActionType, string> = {
   digest: 'tm:digest:repeated',
   fire_cauldron: 'tm:fire_cauldron:repeated',
   blocker_report: 'tm:blocker_report:repeated',
+  pr_repair: 'tm:pr_repair:repeated',
 };
 
 /** Listed work-SOR thread with optional adoption fields carried from the issue payload. */
@@ -810,30 +811,18 @@ export const createGhLaneFetcher = createGhLanePrFetcher;
  */
 export function createRealPrRepairOwnerDeps(
   nowMs: number,
-  expectedEpoch: number,
-  getControl: typeof taskmasterDb.getPauseState = taskmasterDb.getPauseState
+  _expectedEpoch: number,
+  _getControl: typeof taskmasterDb.getPauseState = taskmasterDb.getPauseState
 ): PrRepairOwnerDeps {
   const fetchPr = createGhLaneFetcher();
-  let tierByWorkflow: Map<string, string> | null = null;
-  const resolveEntryTier = (workflowName: string | null): string | undefined => {
-    if (!workflowName) return undefined;
-    if (!tierByWorkflow) {
-      tierByWorkflow = new Map();
-      try {
-        for (const tier of loadLadder()) tierByWorkflow.set(tier.workflowName, tier.name);
-      } catch {
-        tierByWorkflow = new Map();
-      }
-    }
-    return tierByWorkflow.get(workflowName);
-  };
   return {
     now: () => nowMs,
     fetchPr,
     dedupeWindowHours: resolvePrRepairDedupeWindowHours(process.env.PR_REPAIR_DEDUPE_WINDOW_HOURS),
+    planEffects: true,
     canApplyEffect: async (): Promise<boolean> => {
-      const fresh = await getControl();
-      return fresh.pause_state === 'RUNNING' && fresh.epoch === expectedEpoch;
+      const fresh = await _getControl();
+      return fresh.pause_state === 'RUNNING' && fresh.epoch === _expectedEpoch;
     },
     listWosWithMultipleLanePrs: opts => listWosWithMultipleLanePrs(opts),
     listLanePrsForWo: (woId, opts) => listLanePrsForWo(woId, opts),
@@ -879,9 +868,30 @@ export function createRealPrRepairOwnerDeps(
       );
       return (result.rows[0]?.n ?? 0) > 0;
     },
-    fireRepairCascade: opts => runCascade({ ...opts, deps: { seatUsage: conductorSeatUsage } }),
-    resolveEntryTier,
-    token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+    async listOwnerIssues(): Promise<RepairOwnerIssue[]> {
+      const issues = await defaultListThreads();
+      return issues.map(issue => ({
+        title: issue.title ?? '',
+        state: 'open',
+        labels: issue.labels ?? [],
+        ownerLogin: issue.ownerLogin ?? null,
+      }));
+    },
+    resolveRecipient,
+    async createOwnerNudge(input): Promise<DispatchMessage> {
+      return createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        {
+          correlation_id: input.idempotencyKey,
+          idempotency_key: input.idempotencyKey,
+          task_type: 'agent_message',
+          recipient: input.recipient,
+          body: input.body,
+          subject_key: input.subjectKey,
+          repeat_reason: 'PR repair owner follow-up.',
+        }
+      );
+    },
   };
 }
 
@@ -1910,12 +1920,20 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // the owner is exercised directly in pr-repair-owner.test.ts). It must never
   // break the tick: any failure degrades to "no items this tick".
   let prRepairItems: string[] = [];
-  let commitPrRepairExhausted: (() => Promise<void>) | null = null;
-  if (control.pause_state === 'RUNNING' && !deps.db) {
+  let commitPrRepairDigestLines: ((body: string) => Promise<void>) | null = null;
+  const prRepairEffects = new Map<
+    string,
+    Awaited<ReturnType<typeof runPrRepairOwner>>['effects'][number]
+  >();
+  if (!deps.db) {
     try {
       const owner = await runPrRepairOwner(createRealPrRepairOwnerDeps(nowMs, epoch));
       prRepairItems = owner.digestItems;
-      commitPrRepairExhausted = owner.commitExhausted;
+      commitPrRepairDigestLines = owner.commitDigestLines;
+      for (const effect of owner.effects) {
+        prRepairEffects.set(effect.proposal.idempotencyKey, effect);
+        proposals.push(effect.proposal);
+      }
     } catch (error) {
       log.warn({ err: error as Error }, 'taskmaster.pr_repair_owner_failed');
     }
@@ -1967,7 +1985,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // once the digest itself was successfully sent (not deduped/skipped,
   // deferred, parked, rejected, or failed). See the commitPrRepairExhausted
   // gate after the proposal loop.
-  let digestSentThisTick = false;
+  let persistedDigestBody: string | null = null;
 
   for (const proposal of proposals) {
     const canonicalProposalRef = canonicalizeThreadRef(proposal.threadRef);
@@ -2136,11 +2154,15 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
 
     try {
+      const repairEffect = prRepairEffects.get(proposal.idempotencyKey);
       const escalationIssue =
         proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
           ? parseGithubThreadRef(proposal.threadRef)
           : null;
-      if (escalationIssue) {
+      if (repairEffect) {
+        await repairEffect.apply();
+        await dal.updateActionOutcome(journalRow.id, 'sent');
+      } else if (escalationIssue) {
         // WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01: deliver the escalation as
         // a GitHub issue comment (where the owner and Duty Officer look), not to
         // the operator dispatch mailbox (a drain_on_start principal with no
@@ -2277,6 +2299,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
           }
         );
+        if (proposal.type === 'digest') persistedDigestBody = dispatched.body;
         const registerExpectation =
           dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
         await registerExpectation?.({
@@ -2311,7 +2334,6 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       result.effects += 1;
       if (proposal.type === 'fire_cauldron') firesThisTick += 1;
       if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
-      if (proposal.type === 'digest') digestSentThisTick = true;
       log.info(
         {
           actionType: proposal.type,
@@ -2334,9 +2356,9 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // If the digest was deduped/skipped, deferred, parked, rejected, or failed,
   // the exhausted line never reached a person -- leave the row queued for the
   // next tick instead of marking it delivered and dropping the line.
-  if (commitPrRepairExhausted && digestSentThisTick) {
+  if (commitPrRepairDigestLines && persistedDigestBody !== null) {
     try {
-      await commitPrRepairExhausted();
+      await commitPrRepairDigestLines(persistedDigestBody);
     } catch (error) {
       log.warn({ err: error as Error }, 'taskmaster.pr_repair_commit_failed');
     }

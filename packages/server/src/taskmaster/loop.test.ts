@@ -38,6 +38,7 @@ import {
   isPauseEffectsExempt,
   TM_REPEAT_REASON_BY_TYPE,
   isPostCutoverReceipt,
+  digestProposal,
   type TaskmasterDeps,
   type ListedThread,
   type GithubIssueEvidence,
@@ -4023,6 +4024,7 @@ describe('M-155 exception push (loop)', () => {
       'digest',
       'fire_cauldron',
       'blocker_report',
+      'pr_repair',
     ]);
     expect([...TM_ALLOWED_RECIPIENTS]).toEqual([
       'xo',
@@ -4969,11 +4971,26 @@ describe('production repair-owner GitHub fetcher', () => {
       });
       expect(fetches).toBe(1);
       expect(result.digestItems).toEqual([
-        'thinmansoftware/shopops#873 WO-SHOPOPS-STRIPE-ORPHANED-INVOICE-ATTRIBUTION-01 attempt_cap',
+        'thinmansoftware/shopops#873 WO-SHOPOPS-STRIPE-ORPHANED-INVOICE-ATTRIBUTION-01 repair_owner_unresolved:attempt_cap',
       ]);
     } finally {
       sqlite.close();
     }
+  });
+});
+
+describe('PR repair owner shared effect contracts', () => {
+  test('owner_effects_are_journaled_counted_and_budgeted', () => {
+    expect(MAX_EFFECTS_PER_TICK).toBe(10);
+    expect(TM_ALLOWED_ACTION_TYPES).toContain('pr_repair');
+  });
+
+  test('digest_retry_addresses_only_notices_in_the_persisted_body', () => {
+    const n1 = 'thinmansoftware/bdc-xo#1 WO-ONE-TEST-01 repair_owner_unresolved:attempt_cap';
+    const n3 = 'thinmansoftware/bdc-xo#3 WO-THREE-TEST-03 repair_owner_unresolved:outside_cauldron';
+    const proposal = digestProposal([], makeWorld().control, T0, undefined, [], undefined, [n1]);
+    expect(proposal.body.includes(n1)).toBe(true);
+    expect(proposal.body.includes(n3)).toBe(false);
   });
 });
 

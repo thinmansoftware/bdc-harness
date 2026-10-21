@@ -30,8 +30,10 @@
  * Every external effect is an INJECTED seam, so the owner's whole decision tree
  * runs in tests with no network and no real GitHub writes.
  */
-import type { CascadeRunRecord } from '@archon/smart-cauldron/types';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
+import { textClaimsWoId } from '@archon/smart-cauldron/already-satisfied';
+import { TM_ALLOWED_RECIPIENTS } from './guard';
+import type { ActionProposal } from './rules';
 import type {
   LanePr,
   LanePrFetcher,
@@ -108,23 +110,30 @@ interface ExhaustedRow {
   owner: string;
   repo: string;
   prNumber: number;
-  woId: string;
+  woId: string | null;
   reason: string;
+  prUrl: string;
+  headSha: string;
+  headRef: string;
+  owningLane: string | null;
+  buildLine: 'cauldron' | 'outside';
+  lastVerdictSummary: string;
 }
 
-type PrRepairAdmissionRecord = Pick<CascadeRunRecord, 'cascadeId' | 'status'>;
+export interface RepairOwnerIssue {
+  title: string;
+  state: string;
+  labels: string[];
+  ownerLogin: string | null;
+}
 
-/** Fire one bounded repair cascade. Structurally compatible with runCascade. */
-export type PrRepairFireCascade = (opts: {
-  woId: string;
-  project: string;
-  entryOverride?: string;
-  initialPriorContext?: string | null;
-  repair: { prNumber: number; headRef: string; attemptId: string };
-  dispatchId?: string;
-  token?: string;
-  onAdmission?: (record: PrRepairAdmissionRecord) => void;
-}) => Promise<PrRepairAdmissionRecord>;
+export interface PrRepairEffect {
+  proposal: ActionProposal;
+  kind: 'dedupe_close' | 'owner_nudge' | 'digest_item';
+  sourceRowId?: string;
+  digestLine?: string;
+  apply: () => Promise<{ body?: string } | undefined>;
+}
 
 export interface PrRepairOwnerDeps {
   /** Clock seam (ms). Defaults to Date.now. */
@@ -133,8 +142,6 @@ export interface PrRepairOwnerDeps {
   dedupeWindowHours?: number;
   /** GitHub PR fetcher (injected; no implicit network). */
   fetchPr: LanePrFetcher;
-  /** Fresh RUNNING state and the captured epoch, immediately before each effect. */
-  canApplyEffect: () => Promise<boolean>;
   /** WOs with 2+ lane-created PRs within the window, plus unresolved lookups. */
   listWosWithMultipleLanePrs: (opts: {
     fetchPr: LanePrFetcher;
@@ -161,12 +168,21 @@ export interface PrRepairOwnerDeps {
   }) => Promise<void>;
   /** True while any run for this WO is still running. */
   hasRunningRunForWo: (woId: string) => Promise<boolean>;
-  /** Fire exactly one bounded repair cascade. */
-  fireRepairCascade: PrRepairFireCascade;
-  /** Map a registry run's workflow_name to its ladder tier; default 'claude'. */
-  resolveEntryTier?: (workflowName: string | null) => string | undefined;
-  /** Operator token forwarded to the cascade (optional). */
-  token?: string;
+  /** Open bdc-xo work-order issues used only to resolve the existing owner. */
+  listOwnerIssues?: () => Promise<RepairOwnerIssue[]>;
+  /** Existing Taskmaster login-to-seat mapping. */
+  resolveRecipient?: (login: string | null | undefined) => string;
+  /** Persist one validated Taskmaster nudge. */
+  createOwnerNudge?: (input: {
+    recipient: string;
+    body: string;
+    subjectKey: string;
+    idempotencyKey: string;
+  }) => Promise<{ body?: string }>;
+  /** Production plans effects for the loop; legacy unit harnesses may apply closes inline. */
+  planEffects?: boolean;
+  /** Compatibility/read seam; the loop itself owns effect admission. */
+  canApplyEffect?: () => Promise<boolean>;
   /** Structured log seam (optional). */
   log?: (event: string, fields: Record<string, unknown>) => void;
 }
@@ -176,8 +192,10 @@ export interface PrRepairOwnerResult {
   digestItems: string[];
   /** Number of non-survivor PRs closed by the dedupe sweep. */
   closedPrs: number;
-  /** Number of repair cascades fired (0 or 1). */
-  repairsFired: number;
+  /** Effects awaiting the loop's common admission/journal path. */
+  effects: PrRepairEffect[];
+  /** Backward-compatible metric; Taskmaster no longer fires repairs. */
+  repairsFired: 0;
   /** Queued exhausted row ids awaiting their digest line to be sent. */
   exhaustedRowIds: string[];
   /**
@@ -185,7 +203,37 @@ export interface PrRepairOwnerResult {
    * caller invokes this ONLY after the digest is sent, so a failed digest never
    * drops the line (the row stays queued for the next tick). Idempotent.
    */
-  commitExhausted: () => Promise<void>;
+  commitDigestLines: (persistedBody: string) => Promise<void>;
+}
+
+const FORBIDDEN_REPAIR_RECIPIENTS = new Set(['xo', 'operator', 'duty-officer']);
+
+export async function resolveRepairOwner(
+  woId: string | null,
+  deps: Pick<PrRepairOwnerDeps, 'listOwnerIssues' | 'resolveRecipient'>
+): Promise<string | null> {
+  if (!woId || !deps.listOwnerIssues) return null;
+  const matches = (await deps.listOwnerIssues()).filter(
+    value => value.state.toLowerCase() === 'open' && textClaimsWoId(value.title, woId)
+  );
+  if (matches.length !== 1) return null;
+  const issue = matches[0];
+  for (const label of issue.labels) {
+    const match = /^owner:([^\s]+)$/i.exec(label.trim());
+    if (!match) continue;
+    const seat = match[1].toLowerCase();
+    if (
+      (TM_ALLOWED_RECIPIENTS as readonly string[]).includes(seat) &&
+      !FORBIDDEN_REPAIR_RECIPIENTS.has(seat)
+    )
+      return seat;
+  }
+  const mapped = deps.resolveRecipient?.(issue.ownerLogin) ?? null;
+  return mapped &&
+    (TM_ALLOWED_RECIPIENTS as readonly string[]).includes(mapped) &&
+    !FORBIDDEN_REPAIR_RECIPIENTS.has(mapped)
+    ? mapped
+    : null;
 }
 
 /** The exact superseded close comment -- asserted character-for-character. */
@@ -295,7 +343,6 @@ function parseExhaustedRow(body: string): ExhaustedRow | null {
     typeof value.owner !== 'string' ||
     typeof value.repo !== 'string' ||
     typeof value.prNumber !== 'number' ||
-    typeof value.woId !== 'string' ||
     typeof value.reason !== 'string'
   ) {
     return null;
@@ -304,8 +351,18 @@ function parseExhaustedRow(body: string): ExhaustedRow | null {
     owner: value.owner,
     repo: value.repo,
     prNumber: value.prNumber,
-    woId: value.woId,
+    woId: typeof value.woId === 'string' ? value.woId : null,
     reason: value.reason,
+    prUrl:
+      typeof value.prUrl === 'string'
+        ? value.prUrl
+        : `https://github.com/${value.owner}/${value.repo}/pull/${value.prNumber}`,
+    headSha: typeof value.headSha === 'string' ? value.headSha : '',
+    headRef: typeof value.headRef === 'string' ? value.headRef : '',
+    owningLane: typeof value.owningLane === 'string' ? value.owningLane : null,
+    buildLine: value.buildLine === 'outside' ? 'outside' : 'cauldron',
+    lastVerdictSummary:
+      typeof value.lastVerdictSummary === 'string' ? value.lastVerdictSummary.slice(0, 600) : '',
   };
 }
 
@@ -325,6 +382,8 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
   const withinHours = deps.dedupeWindowHours ?? PR_REPAIR_DEDUPE_WINDOW_HOURS_DEFAULT;
   const digestItems: string[] = [];
   let closedPrs = 0;
+  const effects: PrRepairEffect[] = [];
+  const exhaustedRowIds: string[] = [];
 
   const closePlan = async (woId: string, plan: DedupePlan): Promise<void> => {
     if (!plan.survivor) return;
@@ -348,19 +407,30 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
           (current?.reviewDecision ?? '').toUpperCase() === 'APPROVED'
         )
           continue;
-        if (!(await deps.canApplyEffect())) break;
-        await deps.closePr({
-          owner: victim.owner,
-          repo: victim.repo,
-          prNumber: victim.prNumber,
-          comment: buildSupersededComment(plan.survivor.prNumber, woId),
-        });
-        closedPrs += 1;
-        log('pr_repair.dedupe_closed', {
-          woId: woId,
-          closed: victim.prNumber,
-          survivor: plan.survivor.prNumber,
-        });
+        const comment = buildSupersededComment(plan.survivor.prNumber, woId);
+        const effect: PrRepairEffect = {
+          kind: 'dedupe_close',
+          proposal: {
+            type: 'pr_repair',
+            threadRef: `pr-repair:${victim.owner}/${victim.repo}#${victim.prNumber}`,
+            recipient: 'duty-officer',
+            body: `Close duplicate lane PR ${victim.owner}/${victim.repo}#${victim.prNumber}. ${comment}`,
+            idempotencyKey: `tm:pr-dedupe:${woId}:${victim.owner.toLowerCase()}/${victim.repo.toLowerCase()}#${victim.prNumber}:survivor-${plan.survivor.prNumber}`,
+            actsImmediately: true,
+          },
+          apply: async () => {
+            await deps.closePr({
+              owner: victim.owner,
+              repo: victim.repo,
+              prNumber: victim.prNumber,
+              comment,
+            });
+            closedPrs += 1;
+            return undefined;
+          },
+        };
+        effects.push(effect);
+        if (!deps.planEffects) await effect.apply();
       } catch (error) {
         log('pr_repair.dedupe_close_failed', {
           woId: woId,
@@ -452,12 +522,10 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     if (row) exhausted.push({ id: message.id, row });
   }
 
-  // (2) REPAIR -- at most MAX_REPAIR_FIRES_PER_TICK fires this tick -------------
-  let repairsFired = 0;
+  // (2) REPAIR -- validate at most one candidate and route it to its owner.
   let admissionAttempts = 0;
   for (const { id, candidate } of candidates) {
     if (admissionAttempts >= MAX_REPAIR_FIRES_PER_TICK) break;
-    if (!(await deps.canApplyEffect())) break;
 
     // Re-prove the LANE PR RULE: the PR must still be lane-created for this WO.
     // A lookup failure leaves the row queued. It is not a not-lane refusal.
@@ -562,12 +630,6 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       continue;
     }
 
-    const entryOverride =
-      (deps.resolveEntryTier ?? ((): string | undefined => undefined))(target.workflowName) ??
-      'claude';
-
-    // Acknowledge before firing. The first immutable run authority consumes and
-    // addresses this candidate atomically; cascade admission alone grants no run.
     const current = await deps.fetchPr(candidate.owner, candidate.repo, candidate.prNumber);
     if (
       current?.state !== 'OPEN' ||
@@ -578,91 +640,109 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       await addressRefusal(deps, id, 'refused:review_eligibility_changed', log);
       continue;
     }
-    if (!(await deps.canApplyEffect())) break;
-    await deps.acknowledgeRow(id);
-    if (!(await deps.canApplyEffect())) break;
-    let admitted: ((record: PrRepairAdmissionRecord) => void) | null = null;
-    let rejected: ((error: unknown) => void) | null = null;
-    const admission = new Promise<PrRepairAdmissionRecord>((resolve, reject) => {
-      admitted = resolve;
-      rejected = reject;
-    });
     admissionAttempts += 1;
-    const firePromise = deps.fireRepairCascade({
-      woId: candidate.woId,
-      project: target.repo,
-      entryOverride,
-      initialPriorContext: candidate.verdictBody,
-      repair: { prNumber: candidate.prNumber, headRef: target.headRef, attemptId: id },
-      dispatchId: id,
-      ...(deps.token ? { token: deps.token } : {}),
-      onAdmission: record => admitted?.(record),
-    });
-    void firePromise.then(record => admitted?.(record)).catch(error => rejected?.(error));
-    let admissionRecord: PrRepairAdmissionRecord;
-    try {
-      admissionRecord = await admission;
-    } catch (error) {
-      log('pr_repair.repair_fire_failed', {
-        woId: candidate.woId,
-        prNumber: candidate.prNumber,
-        error: (error as Error).message,
-      });
-      digestItems.push(
-        `${candidateSlug} ${candidate.woId} repair_admission_failed; candidate retained`
-      );
-      continue;
-    }
-    const admittedStatuses = new Set([
-      'running',
-      'won',
-      'spec-repair',
-      'recovery-delegated',
-      'infra-alert',
-      'pending-frontier-approval',
-      'frontier-rejected',
-      'frontier-approved',
-      'cancelled',
-    ]);
-    if (!admittedStatuses.has(admissionRecord.status)) {
-      log('pr_repair.repair_not_admitted', {
-        id,
-        cascadeId: admissionRecord.cascadeId,
-        status: admissionRecord.status,
-      });
-      digestItems.push(
-        `${candidateSlug} ${candidate.woId} repair_not_admitted:${admissionRecord.status ?? 'missing_status'}; candidate retained`
-      );
-      continue;
-    }
-    const cascadeId = admissionRecord.cascadeId;
-    repairsFired += 1;
-    log('pr_repair.repair_fired', {
-      woId: candidate.woId,
+    await planOwnerRoute(id, {
+      owner: candidate.owner,
+      repo: candidate.repo,
       prNumber: candidate.prNumber,
-      cascadeId,
+      woId: candidate.woId,
+      reason: 'cauldron_repair_pending',
+      buildLine: 'cauldron',
+      prUrl: `https://github.com/${candidate.owner}/${candidate.repo}/pull/${candidate.prNumber}`,
+      lastVerdictSummary: candidate.verdictBody.slice(0, 600),
     });
   }
 
   // (3) EXHAUSTED -- one digest line each; addressed only after the digest sends.
-  const exhaustedRowIds: string[] = [];
   for (const { id, row } of exhausted) {
-    digestItems.push(`${slug(row.owner, row.repo, row.prNumber)} ${row.woId} ${row.reason}`);
-    exhaustedRowIds.push(id);
+    await planOwnerRoute(id, row);
   }
 
-  const commitExhausted = async (): Promise<void> => {
-    for (const id of exhaustedRowIds) {
+  async function planOwnerRoute(
+    id: string,
+    row: Pick<
+      ExhaustedRow,
+      | 'owner'
+      | 'repo'
+      | 'prNumber'
+      | 'woId'
+      | 'reason'
+      | 'buildLine'
+      | 'prUrl'
+      | 'lastVerdictSummary'
+    >
+  ): Promise<void> {
+    const recipient = await resolveRepairOwner(row.woId, deps);
+    if (recipient && deps.createOwnerNudge) {
+      const createOwnerNudge = deps.createOwnerNudge;
+      const body =
+        `Repair ${row.prUrl} for ${row.woId}: reason=${row.reason}; buildLine=${row.buildLine}. ${row.lastVerdictSummary}`.trim();
+      effects.push({
+        kind: 'owner_nudge',
+        sourceRowId: id,
+        proposal: {
+          type: 'pr_repair',
+          threadRef: `pr-repair:${id}`,
+          recipient,
+          body,
+          idempotencyKey: `tm:repair-to-owner:${id}`,
+          actsImmediately: true,
+        },
+        apply: async () => {
+          const persisted = await createOwnerNudge({
+            recipient,
+            body,
+            subjectKey: `repair:${row.owner}/${row.repo}#${row.prNumber}`,
+            idempotencyKey: `tm:repair-to-owner:${id}`,
+          });
+          await deps.acknowledgeRow(id);
+          await deps.addressRow(id, `routed_to_owner:${recipient}`);
+          return persisted;
+        },
+      });
+      return;
+    }
+    const reason = row.woId ? row.reason : 'no_wo';
+    const line = `${slug(row.owner, row.repo, row.prNumber)} ${row.woId ?? 'no-wo'} repair_owner_unresolved:${reason}`;
+    digestItems.push(line);
+    exhaustedRowIds.push(id);
+    effects.push({
+      kind: 'digest_item',
+      sourceRowId: id,
+      digestLine: line,
+      proposal: {
+        type: 'pr_repair',
+        threadRef: `pr-repair:${id}`,
+        recipient: 'duty-officer',
+        body: line,
+        idempotencyKey: `tm:repair-digest-item:${id}`,
+        actsImmediately: true,
+      },
+      apply: async () => undefined,
+    });
+    if (row.reason === 'cauldron_repair_pending') {
+      await deps.acknowledgeRow(id);
+      await deps.addressRow(id, 'owner_unresolved');
+    }
+  }
+
+  const commitDigestLines = async (persistedBody: string): Promise<void> => {
+    for (const effect of effects.filter(value => value.kind === 'digest_item')) {
+      if (!effect.sourceRowId || !effect.digestLine || !persistedBody.includes(effect.digestLine))
+        continue;
       try {
-        await deps.acknowledgeRow(id);
-        await deps.addressRow(id, 'digested');
+        await deps.acknowledgeRow(effect.sourceRowId);
+        await deps.addressRow(effect.sourceRowId, 'digested');
       } catch (error) {
-        log('pr_repair.exhausted_address_failed', { id, error: (error as Error).message });
+        log('pr_repair.exhausted_address_failed', {
+          id: effect.sourceRowId,
+          error: (error as Error).message,
+        });
       }
     }
   };
 
-  return { digestItems, closedPrs, repairsFired, exhaustedRowIds, commitExhausted };
+  return { digestItems, closedPrs, effects, repairsFired: 0, exhaustedRowIds, commitDigestLines };
 }
 
 async function addressRefusal(

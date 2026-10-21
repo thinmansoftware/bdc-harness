@@ -1199,10 +1199,10 @@ export function createRealSubmitDeps(
      * lane for that WO; null otherwise (a human PR, a fork, or the spec branch).
      */
     async resolveLaneRepairContext(input): Promise<{
-      woId: string;
-      headRef: string;
-      workflowName: string;
+      laneRepair: { woId: string; headRef: string; workflowName: string } | null;
+      identity: { title: string; body: string; headRef: string; prUrl: string };
     } | null> {
+      let identity: LanePrGithubInfo | null = null;
       const fetchPr = async (
         prOwner: string,
         prRepo: string,
@@ -1224,7 +1224,7 @@ export function createRealSubmitDeps(
             : (d.state ?? '').toUpperCase() === 'CLOSED'
               ? 'CLOSED'
               : 'OPEN';
-          return {
+          identity = {
             number: d.number,
             state: stateRaw,
             reviewDecision: null,
@@ -1236,6 +1236,7 @@ export function createRealSubmitDeps(
             title: d.title ?? '',
             body: d.body ?? '',
           };
+          return identity;
         } catch {
           return null;
         }
@@ -1245,11 +1246,22 @@ export function createRealSubmitDeps(
           { owner: input.owner, repo: input.repo, prNumber: input.prNumber },
           { fetchPr }
         );
-        if (!attribution) return null;
+        if (!identity) return null;
+        const prIdentity = identity as LanePrGithubInfo;
         return {
-          woId: attribution.woId,
-          headRef: attribution.lane.headRef,
-          workflowName: attribution.lane.workflowName,
+          laneRepair: attribution
+            ? {
+                woId: attribution.woId,
+                headRef: attribution.lane.headRef,
+                workflowName: attribution.lane.workflowName,
+              }
+            : null,
+          identity: {
+            title: prIdentity.title,
+            body: prIdentity.body,
+            headRef: prIdentity.headRefName,
+            prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+          },
         };
       } catch {
         return null;
@@ -1265,12 +1277,16 @@ export function createRealSubmitDeps(
      */
     async emitRemediationExhausted(input): Promise<void> {
       const slug = `${input.owner.toLowerCase()}/${input.repo.toLowerCase()}#${input.prNumber}`;
+      const key =
+        input.buildLine === 'outside'
+          ? `overseer-repair-to-owner:${slug}:${input.headSha}`
+          : `overseer-remediation-exhausted:${slug}`;
       await (overrides.createReceiptMessage ?? dispatch.createAuthenticatedMessage)(
         { kind: 'system', sender: REMEDIATION_SENDER },
         {
-          correlation_id: `overseer-remediation-exhausted:${slug}`,
-          idempotency_key: `overseer-remediation-exhausted:${slug}`,
-          task_type: 'run_report',
+          correlation_id: key,
+          idempotency_key: key,
+          task_type: 'run_review',
           recipient: REMEDIATION_RECIPIENT,
           subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
           repeat_reason: `lane-repair exhausted (${input.reason}) for ${slug}`,
@@ -1280,8 +1296,13 @@ export function createRealSubmitDeps(
             repo: input.repo,
             prNumber: input.prNumber,
             headSha: input.headSha,
+            headRef: input.headRef,
             woId: input.woId,
+            prUrl: input.prUrl,
+            owningLane: input.owningLane,
+            buildLine: input.buildLine,
             reason: input.reason,
+            lastVerdictSummary: input.lastVerdictSummary,
           }),
         }
       );
