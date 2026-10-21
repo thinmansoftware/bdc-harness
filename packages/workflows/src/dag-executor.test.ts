@@ -63,6 +63,7 @@ import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import { getWorkflowEventEmitter } from './event-emitter';
 import type { GateResult } from './gate-result';
+import { resolveLoopIterationIdleTimeoutMs } from './utils/idle-timeout';
 
 // --- Mock helpers ---
 
@@ -1085,6 +1086,142 @@ describe('executeDagWorkflow -- mechanical evidence node', () => {
     } finally {
       await rm(testDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('executeDagWorkflow -- loop idle ceiling override', () => {
+  let testDir: string;
+  let previousWall: string | undefined;
+  let previousIdle: string | undefined;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-loop-idle-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+    previousWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    previousIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    process.env.ARCHON_LOOP_ITERATION_WALL_MS = '2000';
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    if (previousWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    else process.env.ARCHON_LOOP_ITERATION_WALL_MS = previousWall;
+    if (previousIdle === undefined) delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = previousIdle;
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  async function runIdleWorkflow(store: IWorkflowStore, idleTimeout?: number): Promise<void> {
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-loop-idle',
+      testDir,
+      {
+        name: 'loop-idle-ceiling',
+        nodes: [
+          {
+            id: 'diff-repair',
+            ...(idleTimeout === undefined ? {} : { idle_timeout: idleTimeout }),
+            loop: {
+              prompt: 'repair the diff',
+              until: 'PLAN_REVIEW_APPROVED',
+              max_iterations: 1,
+            },
+          },
+        ],
+      },
+      makeWorkflowRun(`loop-idle-${Date.now()}`),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+  }
+
+  function recordedEvents(store: IWorkflowStore) {
+    return (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+    );
+  }
+
+  it('idleCeilingProof long silent turn completes under the node ceiling', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      yield { type: 'assistant', content: 'PLAN_REVIEW_APPROVED' };
+    });
+    const store = createMockStore();
+
+    await runIdleWorkflow(store, 400);
+
+    const events = recordedEvents(store);
+    expect(
+      events.some(e => e.event_type === 'node_completed' && e.step_name === 'diff-repair')
+    ).toBe(true);
+    expect(events.some(e => String(e.data?.error ?? '').includes('exceeded idle timeout'))).toBe(
+      false
+    );
+    const completedIterations = events.filter(
+      e => e.event_type === 'loop_iteration_completed' && e.step_name === 'diff-repair'
+    );
+    expect(completedIterations).toHaveLength(1);
+    expect(completedIterations[0]?.data?.iteration).toBe(1);
+  });
+
+  it('idleCeilingProof truly silent iteration still fails at the node ceiling', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      const options = arguments[3] as { abortSignal?: AbortSignal } | undefined;
+      await new Promise<void>(resolve => {
+        const signal = options?.abortSignal;
+        if (!signal || signal.aborted) {
+          resolve();
+          return;
+        }
+        signal.addEventListener('abort', () => resolve(), { once: true });
+      });
+    });
+    const store = createMockStore();
+    const startedAt = performance.now();
+
+    await runIdleWorkflow(store, 400);
+
+    const elapsedMs = performance.now() - startedAt;
+    const failed = recordedEvents(store).find(
+      e => e.event_type === 'node_failed' && e.step_name === 'diff-repair'
+    );
+    expect(String(failed?.data?.error ?? '')).toContain('exceeded idle timeout (400ms)');
+    expect(elapsedMs).toBeGreaterThanOrEqual(400);
+    expect(elapsedMs).toBeLessThan(2000);
+  });
+
+  it('idleCeilingProof default ceiling still fails a silent node with no override', async () => {
+    process.env.ARCHON_LOOP_ITERATION_IDLE_MS = '50';
+    mockSendQueryDag.mockImplementation(async function* () {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      yield { type: 'assistant', content: 'PLAN_REVIEW_APPROVED' };
+    });
+    const store = createMockStore();
+
+    await runIdleWorkflow(store);
+
+    const failed = recordedEvents(store).find(
+      e => e.event_type === 'node_failed' && e.step_name === 'diff-repair'
+    );
+    expect(String(failed?.data?.error ?? '')).toContain('exceeded idle timeout (50ms)');
+  });
+
+  it('idleCeilingProof default resolves to exactly 180000 ms', () => {
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    expect(resolveLoopIterationIdleTimeoutMs(undefined)).toBe(180000);
   });
 });
 
