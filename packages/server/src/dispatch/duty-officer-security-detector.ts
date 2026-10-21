@@ -1,3 +1,4 @@
+import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
 import {
   resolveGitHubAppAuth,
   resolveRealOctokitAuthOptions,
@@ -10,7 +11,7 @@ const DETECTOR_MARKER = '<!-- security-detector-issue -->';
 const COMMENT_MARKER = '<!-- security-detector -->';
 const REPORT_TITLE = /^Security Scan -- (\d{4})-W(\d{2})$/;
 // Clock ticks create fresh deps; throttle state lives for the process lifetime.
-const PROCESS_RUNS = new Map<string, { last_run_at: number }>();
+const PROCESS_RUNS = new Map<string, { last_run_at: number; window_ms: number }>();
 
 export function resetSecurityDetectorStateForTests(): void {
   PROCESS_RUNS.clear();
@@ -24,7 +25,7 @@ export interface SecurityDetectorReason {
 }
 export interface SecurityDetectorDeps {
   fetchImpl: typeof fetch;
-  readToken: () => string | null;
+  readToken: () => Promise<string | null>;
   writeTokenProvider: (signal: AbortSignal) => Promise<string | null>;
   signal?: AbortSignal;
   now: () => Date;
@@ -284,14 +285,24 @@ export async function runSecurityDetector(
   signal.throwIfAborted();
   const now = deps.now();
   const interval = positiveMs('DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS', 21_600_000);
+  const errorBackoff = positiveMs(
+    'DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS',
+    900_000,
+    1_000
+  );
   const repo = targetRepo();
   const stateKey = `duty-officer-clock:${repo.toLowerCase()}`;
   const previous = PROCESS_RUNS.get(stateKey);
-  if (previous !== undefined && now.getTime() - previous.last_run_at < interval) {
+  if (previous !== undefined && now.getTime() - previous.last_run_at < previous.window_ms) {
     log.info('duty_officer_security_detector_skipped_throttle');
     return null;
   }
-  PROCESS_RUNS.set(stateKey, { last_run_at: now.getTime() });
+  const recordRun = (verdict: SecurityDetectorVerdict): void => {
+    PROCESS_RUNS.set(stateKey, {
+      last_run_at: now.getTime(),
+      window_ms: verdict === 'observation_error' ? errorBackoff : interval,
+    });
+  };
   const trustedLogins = new Set(
     (
       process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS ??
@@ -305,7 +316,6 @@ export async function runSecurityDetector(
   const evaluatedAt = now.toISOString();
   const armedAt = process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT?.trim() || '9999-12-31';
   const armed = now.getTime() >= Date.parse(`${armedAt}T00:00:00Z`);
-  const token = deps.readToken();
   const result: SecurityDetectorResult = {
     verdict: armed ? 'clean' : 'disarmed',
     reasons: [],
@@ -313,10 +323,23 @@ export async function runSecurityDetector(
     marker_home: null,
     wrote: [],
   };
+  signal.throwIfAborted();
+  const token = await deps.readToken();
+  signal.throwIfAborted();
   if (!token) {
     result.verdict = 'observation_error';
     result.last_error = 'duty_officer_github_token_missing';
-    log.error('duty_officer_security_detector_observation_error');
+    let identityKind = 'none';
+    try {
+      identityKind = resolveServiceGitHubAuth('duty_officer').kind;
+    } catch {
+      identityKind = 'none';
+    }
+    log.error(
+      { last_error: 'duty_officer_github_token_missing', identity_kind: identityKind },
+      'duty_officer_security_detector_observation_error'
+    );
+    recordRun(result.verdict);
     return result;
   }
 
@@ -349,7 +372,10 @@ export async function runSecurityDetector(
         } else {
           result.verdict = 'observation_error';
           result.last_error = (error as Error).message;
-          log.error({ err: error }, 'duty_officer_security_detector_observation_error');
+          log.error(
+            { err: error, last_error: (error as Error).message },
+            'duty_officer_security_detector_observation_error'
+          );
         }
       }
     }
@@ -427,7 +453,10 @@ export async function runSecurityDetector(
     signal.throwIfAborted();
     result.verdict = 'observation_error';
     result.last_error = (error as Error).message;
-    log.error({ err: error }, 'duty_officer_security_detector_observation_error');
+    log.error(
+      { err: error, last_error: (error as Error).message },
+      'duty_officer_security_detector_observation_error'
+    );
   }
 
   if (result.verdict !== 'observation_error') {
@@ -446,118 +475,131 @@ export async function runSecurityDetector(
     signal.throwIfAborted();
     result.last_error = (error as Error).message;
     log.error({ err: error }, 'duty_officer_security_detector_write_refused_no_app_auth');
+    recordRun(result.verdict);
     return result;
   }
   if (!writeToken) {
     result.last_error = 'app_auth_missing';
     log.warn('duty_officer_security_detector_write_refused_no_app_auth');
+    recordRun(result.verdict);
     return result;
   }
 
-  if (result.verdict !== 'observation_error') {
-    const json = {
-      verdict: result.verdict,
-      reasons: result.reasons,
-      evaluated_at: evaluatedAt,
-      build_sha: deps.buildSha,
-      armed_at: armedAt,
-    };
-    const titleReasons =
-      result.verdict === 'disarmed'
-        ? 'disarmed'
-        : [...new Set(result.reasons.map(r => r.code))].join(',') || 'clean';
-    const body = `${DETECTOR_MARKER}\n\n\`\`\`json\n${JSON.stringify(json)}\n\`\`\``;
-    if (result.verdict === 'clean' && detector) {
-      await request(
-        deps,
-        repo,
-        `/repos/${repo}/issues/${detector.number}/comments`,
-        writeToken,
-        'POST',
-        {
-          body: 'Security detector evaluation is clean; closing the persistent alarm.',
-        }
-      );
-      await request(deps, repo, `/repos/${repo}/issues/${detector.number}`, writeToken, 'PATCH', {
-        state: 'closed',
-      });
-      result.wrote.push('issue_closed');
-      log.info('duty_officer_security_detector_issue_closed');
-    } else if (result.verdict !== 'clean') {
-      const payload = {
-        title: `DETECTOR: security scan -- ${titleReasons}`,
-        body,
-        labels: ['security-detector', priority(result.reasons, result.verdict)],
+  try {
+    if (result.verdict !== 'observation_error') {
+      const json = {
+        verdict: result.verdict,
+        reasons: result.reasons,
+        evaluated_at: evaluatedAt,
+        build_sha: deps.buildSha,
+        armed_at: armedAt,
       };
-      if (detector) {
-        const existingLabels = issueLabels(detector);
-        const sameLabels = payload.labels.every(label => existingLabels.includes(label));
-        if (detector.title !== payload.title || detector.body !== payload.body || !sameLabels) {
-          await writeWithLabelFallback(
-            deps,
-            repo,
-            `/repos/${repo}/issues/${detector.number}`,
-            writeToken,
-            'PATCH',
-            payload
-          );
-          result.wrote.push('issue_updated');
-          log.info('duty_officer_security_detector_issue_updated');
-        }
-      } else {
-        const created = await writeWithLabelFallback<Issue>(
+      const titleReasons =
+        result.verdict === 'disarmed'
+          ? 'disarmed'
+          : [...new Set(result.reasons.map(r => r.code))].join(',') || 'clean';
+      const body = `${DETECTOR_MARKER}\n\n\`\`\`json\n${JSON.stringify(json)}\n\`\`\``;
+      if (result.verdict === 'clean' && detector) {
+        await request(
           deps,
           repo,
-          `/repos/${repo}/issues`,
+          `/repos/${repo}/issues/${detector.number}/comments`,
+          writeToken,
+          'POST',
+          {
+            body: 'Security detector evaluation is clean; closing the persistent alarm.',
+          }
+        );
+        await request(deps, repo, `/repos/${repo}/issues/${detector.number}`, writeToken, 'PATCH', {
+          state: 'closed',
+        });
+        result.wrote.push('issue_closed');
+        log.info('duty_officer_security_detector_issue_closed');
+      } else if (result.verdict !== 'clean') {
+        const payload = {
+          title: `DETECTOR: security scan -- ${titleReasons}`,
+          body,
+          labels: ['security-detector', priority(result.reasons, result.verdict)],
+        };
+        if (detector) {
+          const existingLabels = issueLabels(detector);
+          const sameLabels = payload.labels.every(label => existingLabels.includes(label));
+          if (detector.title !== payload.title || detector.body !== payload.body || !sameLabels) {
+            await writeWithLabelFallback(
+              deps,
+              repo,
+              `/repos/${repo}/issues/${detector.number}`,
+              writeToken,
+              'PATCH',
+              payload
+            );
+            result.wrote.push('issue_updated');
+            log.info('duty_officer_security_detector_issue_updated');
+          }
+        } else {
+          const created = await writeWithLabelFallback<Issue>(
+            deps,
+            repo,
+            `/repos/${repo}/issues`,
+            writeToken,
+            'POST',
+            payload
+          );
+          detector = created;
+          result.marker_home ??= created.number;
+          result.wrote.push('issue_opened');
+          log.info('duty_officer_security_detector_issue_opened');
+        }
+      }
+    }
+
+    if (result.marker_home !== null) {
+      let list = comments.get(result.marker_home);
+      if (!list) {
+        list = await request<Comment[]>(
+          deps,
+          repo,
+          `/repos/${repo}/issues/${result.marker_home}/comments?per_page=100`,
+          token
+        );
+      }
+      const marker = list.find(
+        comment =>
+          comment.body?.includes(COMMENT_MARKER) && comment.user?.login === 'thinman-overseer[bot]'
+      );
+      const payload = { body: markerBody(result, armedAt, deps.buildSha) };
+      if (marker) {
+        await request(
+          deps,
+          repo,
+          `/repos/${repo}/issues/comments/${marker.id}`,
+          writeToken,
+          'PATCH',
+          payload
+        );
+      } else {
+        await request(
+          deps,
+          repo,
+          `/repos/${repo}/issues/${result.marker_home}/comments`,
           writeToken,
           'POST',
           payload
         );
-        detector = created;
-        result.marker_home ??= created.number;
-        result.wrote.push('issue_opened');
-        log.info('duty_officer_security_detector_issue_opened');
       }
+      result.wrote.push('marker_patched');
+      log.info('duty_officer_security_detector_marker_patched');
     }
-  }
-
-  if (result.marker_home !== null) {
-    let list = comments.get(result.marker_home);
-    if (!list) {
-      list = await request<Comment[]>(
-        deps,
-        repo,
-        `/repos/${repo}/issues/${result.marker_home}/comments?per_page=100`,
-        token
-      );
-    }
-    const marker = list.find(
-      comment =>
-        comment.body?.includes(COMMENT_MARKER) && comment.user?.login === 'thinman-overseer[bot]'
+  } catch (error) {
+    signal.throwIfAborted();
+    result.verdict = 'observation_error';
+    result.last_error = (error as Error).message;
+    log.error(
+      { err: error, last_error: (error as Error).message },
+      'duty_officer_security_detector_observation_error'
     );
-    const payload = { body: markerBody(result, armedAt, deps.buildSha) };
-    if (marker) {
-      await request(
-        deps,
-        repo,
-        `/repos/${repo}/issues/comments/${marker.id}`,
-        writeToken,
-        'PATCH',
-        payload
-      );
-    } else {
-      await request(
-        deps,
-        repo,
-        `/repos/${repo}/issues/${result.marker_home}/comments`,
-        writeToken,
-        'POST',
-        payload
-      );
-    }
-    result.wrote.push('marker_patched');
-    log.info('duty_officer_security_detector_marker_patched');
   }
   log.info({ verdict: result.verdict }, 'duty_officer_security_detector_ran');
+  recordRun(result.verdict);
   return result;
 }

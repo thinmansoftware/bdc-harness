@@ -15,7 +15,10 @@ import {
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
-import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
 import {
@@ -97,11 +100,17 @@ export interface DutyOfficerClockDeps {
   now?: () => Date;
 }
 
-export function githubToken(): string | null {
+export async function githubToken(): Promise<string | null> {
   try {
     const identity = resolveServiceGitHubAuth('duty_officer');
-    return identity.kind === 'pat' ? identity.token : null;
-  } catch {
+    if (identity.kind === 'none') return null;
+    if (identity.kind === 'pat' && identity.token.trim() === '') return null;
+    return await getServiceGitHubToken(identity);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('github_app_token_mint_failed')) {
+      log.warn({ error: message }, 'duty_officer_github_token_mint_failed');
+    }
     return null;
   }
 }

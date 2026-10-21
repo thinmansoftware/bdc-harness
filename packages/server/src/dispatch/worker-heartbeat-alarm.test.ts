@@ -1,12 +1,41 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { DispatchWorker } from '@archon/core/db/dispatch';
+import { rootLogger } from '@archon/paths';
+import * as serviceIdentity from '@archon/core/github/service-identity';
 import {
   evaluateWorkerHeartbeats,
+  listWorkerAlarmIssueComments,
+  postWorkerAlarmComment,
   runWorkerHeartbeatAlarm,
   type WorkerAlarmIssueComment,
   type WorkerHeartbeatAlarmDeps,
 } from './worker-heartbeat-alarm';
 import { tickDutyOfficerClock, type DutyOfficerClockDeps } from './duty-officer-clock';
+
+const APP_ENV_KEYS = [
+  'GITHUB_APP_DUTY_OFFICER_ID',
+  'GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY_PATH',
+  'GITHUB_APP_TASKMASTER_ID',
+  'GITHUB_APP_TASKMASTER_INSTALLATION_ID',
+  'GITHUB_APP_TASKMASTER_PRIVATE_KEY',
+  'GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH',
+  'GITHUB_APP_ID',
+  'GITHUB_APP_INSTALLATION_ID',
+  'GITHUB_APP_PRIVATE_KEY',
+  'GITHUB_APP_PRIVATE_KEY_PATH',
+] as const;
+
+let savedAppEnv: Record<string, string | undefined> = {};
+
+beforeEach(() => {
+  savedAppEnv = {};
+  for (const key of APP_ENV_KEYS) {
+    savedAppEnv[key] = process.env[key];
+    delete process.env[key];
+  }
+});
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -77,6 +106,11 @@ afterEach(() => {
   delete process.env.DUTY_OFFICER_GH_REPO;
   delete process.env.GH_TOKEN;
   delete process.env.GITHUB_TOKEN;
+  serviceIdentity.clearServiceGitHubTokenCache();
+  for (const key of APP_ENV_KEYS) {
+    if (savedAppEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = savedAppEnv[key];
+  }
 });
 
 describe('runWorkerHeartbeatAlarm', () => {
@@ -253,5 +287,70 @@ describe('worker heartbeat alarm inside the Duty Officer tick', () => {
     // Next tick: C is still stale and the post now succeeds.
     await expect(tickDutyOfficerClock(deps)).resolves.toBeUndefined();
     expect(downCount(alarm.comments, 'C')).toBe(1);
+  });
+});
+
+describe('worker heartbeat alarm under an App identity', () => {
+  test('posts the alarm comment with the minted token', async () => {
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    delete process.env.DUTY_OFFICER_GH_REPO;
+    process.env.DISPATCH_WORKER_ALARM_WORKERS = 'A';
+    const nowMs = Date.parse('2026-09-28T12:00:00.000Z');
+    const lastHb = nowMs - 11 * MINUTE;
+    const calls: { method: string; authorization: string }[] = [];
+    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const method = init?.method ?? 'GET';
+      calls.push({
+        method,
+        authorization: new Headers(init?.headers).get('authorization') ?? '',
+      });
+      if (method === 'POST') return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+      return Response.json([]);
+    });
+    const resolve = spyOn(serviceIdentity, 'resolveServiceGitHubAuth').mockReturnValue({
+      kind: 'app',
+      service: 'duty_officer',
+      appId: '4574893',
+      installationId: '153295654',
+      privateKey: 'PEM_SENTINEL_DO_NOT_LOG',
+      poolId: 'app-test',
+      distinct: true,
+    });
+    const mint = spyOn(serviceIdentity, 'getServiceGitHubToken').mockResolvedValue('t-app');
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    if (streamSymbol === undefined) throw new Error('pino.stream symbol missing on rootLogger');
+    const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+      streamSymbol
+    ];
+    const lines: string[] = [];
+    const write = spyOn(stream, 'write').mockImplementation(line => {
+      lines.push(String(line));
+    });
+    const deps = alarmDeps({ workers: { A: worker('A', lastHb) }, now: () => nowMs });
+    try {
+      await runWorkerHeartbeatAlarm({
+        ...deps,
+        listIssueComments: listWorkerAlarmIssueComments,
+        postAlarmComment: postWorkerAlarmComment,
+      });
+      const posts = calls.filter(call => call.method === 'POST');
+      expect(posts).toEqual([{ method: 'POST', authorization: 'Bearer t-app' }]);
+      expect(
+        calls.some(call => call.method === 'GET' && call.authorization === 'Bearer t-app')
+      ).toBe(true);
+      const joined = lines.join('');
+      expect(joined).not.toContain('worker_heartbeat_alarm_no_token');
+      expect(joined).not.toContain('worker_heartbeat_alarm_token_missing');
+      expect(joined).not.toContain('t-app');
+      expect(joined).not.toContain('PEM_SENTINEL_DO_NOT_LOG');
+    } finally {
+      write.mockRestore();
+      fetchMock.mockRestore();
+      resolve.mockRestore();
+      mint.mockRestore();
+    }
   });
 });
