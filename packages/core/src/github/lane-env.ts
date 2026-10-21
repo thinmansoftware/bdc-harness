@@ -5,8 +5,41 @@ export const LANE_HOME = '/home/laneuser';
 export const LANE_LAUNCHER = '/usr/local/bin/archon-lane-exec';
 const LANE_SHIM_DIRECTORY = '/tmp/archon-lane-sdk';
 
+/** Test-only launcher probe. Production spawn paths keep LANE_LAUNCHER. */
+let launcherPathForTests: string | undefined;
+
+export function setLaneLauncherPathForTests(path: string | undefined): void {
+  launcherPathForTests = path;
+}
+
 export function laneIsolationAvailable(): boolean {
-  return process.env.ARCHON_LANE_UID_ISOLATION !== '0' && existsSync(LANE_LAUNCHER);
+  const launcher = launcherPathForTests ?? LANE_LAUNCHER;
+  return process.env.ARCHON_LANE_UID_ISOLATION !== '0' && existsSync(launcher);
+}
+
+const DATABASE_CONNECTION_KEYS = new Set([
+  'DATABASE_URL',
+  'PGHOST',
+  'PGHOSTADDR',
+  'PGPORT',
+  'PGUSER',
+  'PGPASSWORD',
+  'PGDATABASE',
+  'PGPASSFILE',
+  'PGSERVICE',
+  'PGSERVICEFILE',
+  'PGOPTIONS',
+  'PGSSLMODE',
+  'PGSSLKEY',
+  'PGSSLCERT',
+  'PGSSLROOTCERT',
+  'PGSSLCRL',
+  'SQLITE_PATH',
+  'SQLITE_DATABASE',
+]);
+
+function isDatabaseCredential(key: string): boolean {
+  return DATABASE_CONNECTION_KEYS.has(key) || key.includes('DATABASE');
 }
 
 const FORBIDDEN_SERVICES = [
@@ -21,6 +54,9 @@ const FORBIDDEN_SERVICES = [
 export function buildLaneSubprocessEnv(
   input: NodeJS.ProcessEnv | Record<string, string | undefined>
 ): NodeJS.ProcessEnv {
+  if (!laneIsolationAvailable()) {
+    return { ...input };
+  }
   const forbidden = new Set([
     'GITHUB_APP_PRIVATE_KEY',
     'GITHUB_APP_PRIVATE_KEY_PATH',
@@ -39,6 +75,7 @@ export function buildLaneSubprocessEnv(
     Object.entries(input).filter(
       ([key]) =>
         !forbidden.has(key) &&
+        !isDatabaseCredential(key) &&
         !FORBIDDEN_SERVICES.some(service => key.startsWith(`GITHUB_APP_${service}_`))
     )
   );

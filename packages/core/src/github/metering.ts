@@ -1,3 +1,13 @@
+import {
+  chmodSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { join } from 'node:path';
+import { createLogger, getArchonHome } from '@archon/paths';
 import { getDatabase } from '../db/connection';
 import type { IDatabase } from '../db/adapters/types';
 import type { GitHubService } from './service-identity';
@@ -250,5 +260,159 @@ export function resetGitHubApiMeterForTests(): void {
   backoff.clear();
   if (flushTimer) clearTimeout(flushTimer);
   flushTimer = null;
+  if (laneMeterTimer) clearInterval(laneMeterTimer);
+  laneMeterTimer = null;
   lastFlushAt = 0;
+}
+
+const LANE_METER_SERVICES = new Set<GitHubService>(['run_nodes', 'smart_cauldron']);
+const LANE_METER_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+let laneMeterTimer: ReturnType<typeof setInterval> | null = null;
+let meterLog: ReturnType<typeof createLogger> | undefined;
+
+function getMeterLog(): ReturnType<typeof createLogger> {
+  if (!meterLog) meterLog = createLogger('github.metering');
+  return meterLog;
+}
+
+/** Lane-writable spool. The server process is the only writer to archon.db. */
+export function laneMeterSpoolDir(): string {
+  return join(getArchonHome(), 'artifacts', 'lane-meter');
+}
+
+export function currentGitHubHourBucket(now = Date.now()): string {
+  return new Date(Math.floor(now / 3_600_000) * 3_600_000).toISOString();
+}
+
+/** Persist one lane observation as a file. Does not open the database. */
+export function writeLaneMeterObservation(
+  observation: GitHubApiObservation,
+  directory = laneMeterSpoolDir()
+): void {
+  mkdirSync(directory, { recursive: true });
+  const name = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`;
+  const path = join(directory, name);
+  writeFileSync(
+    path,
+    JSON.stringify({
+      v: 1,
+      service: observation.service,
+      poolId: observation.poolId,
+      resource: observation.resource,
+      status: observation.status,
+    }),
+    { flag: 'wx' }
+  );
+  try {
+    chmodSync(path, 0o640);
+  } catch {
+    // The create mode is already owner-readable. Group mode is best-effort.
+  }
+}
+
+interface AcceptedLaneMeter {
+  service: GitHubService;
+  poolId: string;
+  resource: string;
+  status: number;
+}
+
+function acceptLaneMeterPayload(raw: string): AcceptedLaneMeter | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const row = parsed as Record<string, unknown>;
+  if (row.v !== 1) return undefined;
+  if (typeof row.service !== 'string' || !LANE_METER_SERVICES.has(row.service as GitHubService)) {
+    return undefined;
+  }
+  if (typeof row.poolId !== 'string' || !LANE_METER_ID.test(row.poolId)) return undefined;
+  if (typeof row.resource !== 'string' || !LANE_METER_ID.test(row.resource)) return undefined;
+  if (
+    typeof row.status !== 'number' ||
+    !Number.isInteger(row.status) ||
+    row.status < 0 ||
+    row.status > 599
+  ) {
+    return undefined;
+  }
+  return {
+    service: row.service as GitHubService,
+    poolId: row.poolId,
+    resource: row.resource,
+    status: row.status,
+  };
+}
+
+/**
+ * Record lane observations from the spool. Each accepted file increments
+ * calls by 1 for that service. Lane-supplied counts, hour buckets, and
+ * pool-state fields are ignored so a lane cannot write arbitrary rows.
+ */
+export async function ingestLaneGitHubMeterSpool(
+  db: IDatabase = getDatabase(),
+  directory = laneMeterSpoolDir()
+): Promise<number> {
+  let names: string[];
+  try {
+    names = readdirSync(directory).filter(name => name.endsWith('.json'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
+  const claimed: { path: string; raw: string; row?: AcceptedLaneMeter }[] = [];
+  for (const name of names) {
+    const path = join(directory, name);
+    let raw = '';
+    try {
+      raw = readFileSync(path, 'utf8');
+      unlinkSync(path);
+    } catch {
+      continue;
+    }
+    claimed.push({ path, raw, row: acceptLaneMeterPayload(raw) });
+  }
+  const accepted = claimed.flatMap(item => (item.row ? [item.row] : []));
+  if (accepted.length === 0) return 0;
+  const hourBucket = currentGitHubHourBucket();
+  try {
+    await db.withTransaction(async query => {
+      for (const row of accepted) {
+        await query(
+          `INSERT INTO github_api_usage (hour_bucket, service, pool_id, resource, calls, rate_limited, permission_fallbacks)
+           VALUES ($1, $2, $3, $4, 1, 0, 0)
+           ON CONFLICT (hour_bucket, service, pool_id, resource) DO UPDATE SET
+             calls = github_api_usage.calls + 1`,
+          [hourBucket, row.service, row.poolId, row.resource]
+        );
+      }
+    });
+  } catch (error) {
+    for (const item of claimed) {
+      if (!item.row) continue;
+      try {
+        writeFileSync(item.path, item.raw, { flag: 'wx' });
+      } catch {
+        // The next ingest cannot see a file we failed to restore.
+      }
+    }
+    throw error;
+  }
+  return accepted.length;
+}
+
+export function startLaneGitHubMeterIngest(intervalMs = 15_000): void {
+  if (laneMeterTimer) return;
+  const tick = (): void => {
+    void ingestLaneGitHubMeterSpool().catch((error: unknown) => {
+      getMeterLog().error({ err: error }, 'lane_meter_ingest_failed');
+    });
+  };
+  tick();
+  laneMeterTimer = setInterval(tick, intervalMs);
+  laneMeterTimer.unref?.();
 }

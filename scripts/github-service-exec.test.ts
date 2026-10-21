@@ -6,10 +6,15 @@ import {
 } from './github-service-exec';
 import { serviceGitHubCommandEnvironment } from '../packages/core/src/github/service-identity';
 import { generateKeyPairSync } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resetGitHubApiMeterForTests } from '../packages/core/src/github/metering';
+import {
+  currentGitHubHourBucket,
+  ingestLaneGitHubMeterSpool,
+  resetGitHubApiMeterForTests,
+} from '../packages/core/src/github/metering';
+import { closeDatabase, resetDatabase } from '../packages/core/src/db/connection';
 import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
 import { execFile } from 'node:child_process';
 
@@ -382,5 +387,92 @@ describe('operation-scoped GitHub CLI authentication', () => {
     expect(mints).toBe(1);
     // The App 403 surfaces as a failure rather than a reviewer-authored success.
     expect(result.exitCode).toBe(1);
+  });
+
+  test('lane_gh_call_is_metered_by_the_server', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'lane-meter-home-'));
+    const spool = join(home, 'spool');
+    mkdirSync(spool);
+    const previousHome = process.env.ARCHON_HOME;
+    process.env.ARCHON_HOME = home;
+    resetDatabase();
+    let laneOpenedDatabase = false;
+    const laneDb: SqliteAdapter = Object.assign(Object.create(db), {
+      query: async () => {
+        laneOpenedDatabase = true;
+        throw new Error('lane_opened_database');
+      },
+      withTransaction: async () => {
+        laneOpenedDatabase = true;
+        throw new Error('lane_opened_database');
+      },
+    });
+    try {
+      const result = await runCommand({
+        service: 'run_nodes',
+        command: 'gh',
+        args: ['pr', 'view', '1'],
+        uid: 1002,
+        spoolDir: spool,
+        db: laneDb,
+        identity: {
+          kind: 'pat',
+          service: 'run_nodes',
+          token: 'synthetic-pat',
+          poolId: 'user-pat',
+          distinct: false,
+        },
+        execute: () => ({
+          exitCode: 0,
+          stdout: new Uint8Array(),
+          stderr: new Uint8Array(),
+        }),
+      });
+      expect(result.exitCode).toBe(0);
+      expect(laneOpenedDatabase).toBe(false);
+      expect(existsSync(join(home, 'archon.db'))).toBe(false);
+      const laneFiles = readdirSync(spool).filter(name => name.endsWith('.json'));
+      expect(laneFiles.length).toBe(1);
+
+      writeFileSync(
+        join(spool, 'poison-overseer.json'),
+        JSON.stringify({
+          v: 1,
+          service: 'overseer',
+          poolId: 'reviewer',
+          resource: 'core',
+          status: 200,
+          calls: 99999,
+        })
+      );
+      writeFileSync(
+        join(spool, 'poison-count.json'),
+        JSON.stringify({
+          v: 1,
+          service: 'run_nodes',
+          poolId: 'user-pat',
+          resource: 'cli',
+          status: 0,
+          calls: 50,
+        })
+      );
+
+      const ingested = await ingestLaneGitHubMeterSpool(db, spool);
+      expect(ingested).toBe(2);
+      const hour = currentGitHubHourBucket();
+      const usage = await db.query<{ calls: number; service: string }>(
+        'SELECT service, calls FROM github_api_usage WHERE hour_bucket = $1',
+        [hour]
+      );
+      const runNodes = usage.rows.find(row => row.service === 'run_nodes');
+      expect(runNodes?.calls).toBe(2);
+      expect(usage.rows.some(row => row.service === 'overseer')).toBe(false);
+    } finally {
+      await closeDatabase();
+      resetDatabase();
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

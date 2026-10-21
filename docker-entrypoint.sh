@@ -40,7 +40,7 @@ if [ "$(id -u)" = "0" ]; then
 
   chown appuser:appuser /.archon
   chmod 0751 /.archon
-  for lane_dir in /.archon/workspaces /.archon/worktrees /.archon/artifacts /.archon/node-out /.archon/run-logs /host-artifacts; do
+  for lane_dir in /.archon/workspaces /.archon/worktrees /.archon/artifacts /.archon/artifacts/lane-meter /.archon/node-out /.archon/run-logs /host-artifacts; do
     [ -e "$lane_dir" ] || mkdir -p "$lane_dir"
     chown -R appuser:laneuser "$lane_dir"
     find "$lane_dir" -type d -exec chmod 2775 {} +
