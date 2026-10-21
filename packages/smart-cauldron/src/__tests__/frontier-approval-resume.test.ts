@@ -99,7 +99,7 @@ async function producePausedRecord(
 ): Promise<CascadeRunRecord> {
   const deps: CascadeDeps = {
     fire: async opts => makeFireOk(`run-${opts.workflowName}`),
-    poll: async () => makeFailPoll(),
+    poll: async requested => ({ ...makeFailPoll(), runId: requested.runId }),
     judge: () => makeFailVerdict('validator: needs_revision'),
     escalate: async () => undefined,
     findWoClaim: async () => null,
@@ -135,7 +135,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
             fires++;
             return makeFireOk('must-not-fire');
           },
-          poll: async () => makePassPoll(),
+          poll: async requested => ({ ...makePassPoll(), runId: requested.runId }),
           judge: () => makePassVerdict(),
           findWoClaim: async () => null,
         },
@@ -164,7 +164,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
           messages.push(options.message);
           return makeFireOk('bound-resume');
         },
-        poll: async () => makePassPoll(),
+        poll: async requested => ({ ...makePassPoll(), runId: requested.runId }),
         judge: () => makePassVerdict(),
         findWoClaim: async () => null,
       },
@@ -191,7 +191,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
         fireMessages.push(opts.message);
         return makeFireOk(`resume-run-${firedWorkflows.length}`);
       },
-      poll: async () => makePassPoll(),
+      poll: async requested => ({ ...makePassPoll(), runId: requested.runId }),
       judge: () => makePassVerdict(),
       escalate: async () => undefined,
       findWoClaim: async () => null,
@@ -269,7 +269,7 @@ describe('frontier-approval reject + direct-entry bypass (Test 3)', () => {
         firedWorkflows.push(opts.workflowName);
         return makeFireOk(`direct-run-${firedWorkflows.length}`);
       },
-      poll: async () => makePassPoll(),
+      poll: async requested => ({ ...makePassPoll(), runId: requested.runId }),
       judge: () => makePassVerdict(),
       escalate: async () => undefined,
       findWoClaim: async () => null,
@@ -295,6 +295,38 @@ describe('frontier-approval reject + direct-entry bypass (Test 3)', () => {
 });
 
 describe('frontier-approval resume dead-end guard (Test 2 failure mode: zero fire -> retryable)', () => {
+  test('unknown claims preserve the original pending packet and a durable blocked resume', async () => {
+    const outDir = await makeOutDir();
+    const paused = await producePausedRecord(outDir, 'WO-FRONTIER-DISCOVERY-001');
+    const original = await readCascadeRecordById(paused.cascadeId, outDir);
+    const claim = await claimFrontierResolution(paused.cascadeId, 'approved', outDir);
+    expect(claim.claimed).toBe(true);
+    let fires = 0;
+    const resumed = await resumeFrontierTier(paused, {
+      token: 'test-token',
+      outDir,
+      deps: {
+        findWoClaim: async () => {
+          throw new Error('unavailable');
+        },
+        fire: async () => {
+          fires += 1;
+          return makeFireOk('must-not-fire');
+        },
+      },
+    });
+    expect(resumed.status).toBe('blocked');
+    expect(resumed.claimDiscoveryBlock?.phase).toBe('admission');
+    expect(resumed.attempts).toHaveLength(0);
+    expect(fires).toBe(0);
+    expect(await readCascadeRecordById(resumed.cascadeId, outDir)).toEqual(resumed);
+    expect(await readCascadeRecordById(paused.cascadeId, outDir)).toEqual(original);
+    await releaseFrontierClaim(paused.cascadeId, outDir);
+    expect((await claimFrontierResolution(paused.cascadeId, 'approved', outDir)).claimed).toBe(
+      true
+    );
+  });
+
   test('approve whose resume is blocked by a duplicate WO lock fires nothing, is rolled back, and stays retryable', async () => {
     const outDir = await makeOutDir();
     const paused = await producePausedRecord(outDir, 'WO-FRONTIER-BLOCKED-001');
@@ -307,7 +339,7 @@ describe('frontier-approval resume dead-end guard (Test 2 failure mode: zero fir
         firedWorkflows.push(opts.workflowName);
         return makeFireOk(`should-not-fire-${firedWorkflows.length}`);
       },
-      poll: async () => makePassPoll(),
+      poll: async requested => ({ ...makePassPoll(), runId: requested.runId }),
       judge: () => makePassVerdict(),
       escalate: async () => undefined,
       findWoClaim: async () => null,
