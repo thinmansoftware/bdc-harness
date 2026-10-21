@@ -19,17 +19,15 @@
  * REAL DATABASE ON PURPOSE. The bug lives in the seam between the DAL's raw
  * page and the wiring's parsed output; a mocked lister cannot show it.
  */
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { unlinkSync } from 'fs';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
-import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
 
-let db: SqliteAdapter;
-let currentDbPath = '';
-
-mock.module('@archon/core/db/connection', () => ({
-  getDatabase: () => db,
-}));
+let db: ReturnType<typeof getDatabase>;
+let currentHome = '';
+const originalArchonHome = process.env.ARCHON_HOME;
 
 const { listRealSweepCandidates } = await import('./stale-verdict-sweep-wiring');
 const { runStaleVerdictSweep, createMemorySweepCursor } = await import('./stale-verdict-sweep');
@@ -40,16 +38,6 @@ const TOTAL_ROWS = 60;
 const MALFORMED_THROUGH = 50;
 /** The only row that can ever become a candidate. */
 const ELIGIBLE_ROW = 55;
-
-function cleanupDb(path: string): void {
-  for (const suffix of ['', '-wal', '-shm']) {
-    try {
-      unlinkSync(path + suffix);
-    } catch {
-      /* file may not exist */
-    }
-  }
-}
 
 /**
  * Seed 60 completed run_review rows. Rows 1-50 carry bodies the review-work
@@ -96,18 +84,21 @@ async function seedRows(): Promise<void> {
 describe('listRealSweepCandidates over a block of unparseable rows', () => {
   beforeEach(async () => {
     process.env.BUN_ENV = 'test';
-    currentDbPath = join(
-      import.meta.dir,
-      `.test-sweep-malformed-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
-    );
-    db = new SqliteAdapter(currentDbPath);
+    await closeDatabase();
+    resetDatabase();
+    currentHome = mkdtempSync(join(tmpdir(), 'archon-sweep-malformed-'));
+    process.env.ARCHON_HOME = currentHome;
+    db = getDatabase();
     await seedRows();
   });
 
   afterEach(async () => {
     delete process.env.BUN_ENV;
-    await db.close();
-    cleanupDb(currentDbPath);
+    await closeDatabase();
+    resetDatabase();
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+    rmSync(currentHome, { recursive: true, force: true });
   });
 
   test('a page of only-malformed rows reports its raw position, not an empty list', async () => {
@@ -142,18 +133,21 @@ describe('listRealSweepCandidates over a block of unparseable rows', () => {
 describe('the sweep walks past malformed rows across heartbeats', () => {
   beforeEach(async () => {
     process.env.BUN_ENV = 'test';
-    currentDbPath = join(
-      import.meta.dir,
-      `.test-sweep-walk-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
-    );
-    db = new SqliteAdapter(currentDbPath);
+    await closeDatabase();
+    resetDatabase();
+    currentHome = mkdtempSync(join(tmpdir(), 'archon-sweep-walk-'));
+    process.env.ARCHON_HOME = currentHome;
+    db = getDatabase();
     await seedRows();
   });
 
   afterEach(async () => {
     delete process.env.BUN_ENV;
-    await db.close();
-    cleanupDb(currentDbPath);
+    await closeDatabase();
+    resetDatabase();
+    if (originalArchonHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalArchonHome;
+    rmSync(currentHome, { recursive: true, force: true });
   });
 
   test('row 55 is reached on the SECOND heartbeat, with no rewind after the first', async () => {

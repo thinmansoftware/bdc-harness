@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
+import { closeDatabase, getDatabase } from '@archon/core/db/connection';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import {
@@ -26,6 +27,21 @@ test('explicit GitHub nudge switch still requires a usable authenticated identit
   expect(githubNudgeEnabled()).toBe(false);
   process.env.GH_TOKEN = 'synthetic-pat';
   expect(githubNudgeEnabled()).toBe(true);
+});
+
+test('duty officer sqlite race isolation', async () => {
+  const priorHandle = getDatabase();
+  await priorHandle.query('SELECT 1 AS live');
+  await closeDatabase();
+
+  const reopenedHandle = getDatabase();
+  try {
+    expect(reopenedHandle).not.toBe(priorHandle);
+    const result = await reopenedHandle.query<{ live: number }>('SELECT 1 AS live');
+    expect(result.rows[0]?.live).toBe(1);
+  } finally {
+    await closeDatabase();
+  }
 });
 
 function message(overrides: Partial<DispatchMessage> & { id: string }): DispatchMessage {
