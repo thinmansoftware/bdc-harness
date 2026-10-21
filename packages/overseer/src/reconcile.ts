@@ -75,7 +75,8 @@ export interface ReconcileDeps {
     org: string;
     since: string;
   }) => Promise<ReconcileMergedPullRequest[]>;
-  findTrackerIssueByStem: (stem: string) => Promise<ReconcileTrackerIssue | null>;
+  /** Optional scope is fresh for each run; default reads share only that run's snapshot. */
+  findTrackerIssueByStem: (stem: string, scope?: object) => Promise<ReconcileTrackerIssue | null>;
   addTrackerEvidenceComment: (input: {
     issue: ReconcileTrackerIssue;
     body: string;
@@ -155,6 +156,7 @@ export interface OctokitLike {
     }>;
   };
   issues: {
+    listForRepo?(input: Record<string, unknown>): Promise<{ data: unknown }>;
     createComment(input: Record<string, unknown>): Promise<unknown>;
     addLabels(input: Record<string, unknown>): Promise<unknown>;
     update(input: Record<string, unknown>): Promise<unknown>;
@@ -176,6 +178,8 @@ export interface ReconcileResult {
 
 export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<ReconcileResult> {
   const deps = input.deps ?? createDefaultReconcileDeps();
+  const trackerLookupScope = {};
+  const successfullyClosedTrackers = new Set<string>();
   const logger = deps.log ?? log;
   const org = input.org ?? DEFAULT_ORG;
   const since = await resolveSearchSince(input, deps);
@@ -238,7 +242,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
     for (const stem of classified.evidence) {
       let tracker: ReconcileTrackerIssue | null;
       try {
-        tracker = await deps.findTrackerIssueByStem(stem);
+        tracker = await deps.findTrackerIssueByStem(stem, trackerLookupScope);
       } catch (error) {
         if (isRateLimitError(error)) {
           logger.warn(
@@ -258,6 +262,8 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       }
       if (!tracker) continue;
       if (tracker.state !== 'open') continue;
+      const trackerIdentity = `${tracker.owner}/${tracker.repo}#${tracker.number}`.toLowerCase();
+      if (successfullyClosedTrackers.has(trackerIdentity)) continue;
 
       // RE-CLOSE GUARD. If this PR already closed this tracker once and the
       // tracker is open again, a human reopened it on purpose. The same merged
@@ -369,6 +375,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       });
       await deps.addTrackerLabel({ issue: tracker, label: DONE_LABEL });
       await deps.closeTrackerIssue({ issue: tracker });
+      successfullyClosedTrackers.add(trackerIdentity);
       await (deps.insertAction ?? insertDefaultOverseerAction)({
         prRef,
         woId: stem,
@@ -653,6 +660,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
   }
 
   let octokit: Promise<OctokitLike> | null = null;
+  const trackerSnapshots = new WeakMap<object, Promise<TrackerIssueSnapshot>>();
   const getOctokit = async (): Promise<OctokitLike> => {
     octokit ??= Promise.all([import('@octokit/rest'), import('@archon/core/github/request')]).then(
       ([module, transport]) => {
@@ -682,7 +690,17 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
   return {
     readCursor: readReconcileCursorFromActions,
     searchMergedPullRequests: async input => searchMergedPullRequests(await getOctokit(), input),
-    findTrackerIssueByStem: async stem => findTrackerIssueByStem(await getOctokit(), stem),
+    findTrackerIssueByStem: async (stem, scope): Promise<ReconcileTrackerIssue | null> => {
+      let snapshot = scope ? trackerSnapshots.get(scope) : undefined;
+      if (!snapshot) {
+        // Store before awaiting: concurrent lookups share completion or failure.
+        // A direct no-scope call always reads anew; reused factories cannot cache
+        // tracker state across runReconcileOnce invocations.
+        snapshot = getOctokit().then(client => readTrackerIssueSnapshot(client));
+        if (scope) trackerSnapshots.set(scope, snapshot);
+      }
+      return findTrackerIssueByStem(await snapshot, stem);
+    },
     listOpenPullRequestsReferencingTracker: async input =>
       searchOpenPullRequestsReferencingTracker(await getOctokit(), input),
     listPullRequestFiles: async (pr): Promise<string[]> => {
@@ -807,6 +825,8 @@ export async function searchOpenPullRequestsReferencingTracker(
     // Paginate to exhaustion. If completeness cannot be established, throw so the
     // caller leaves the tracker open (a missed holder would close it prematurely).
     let retrieved = 0;
+    let expectedTotal: number | undefined;
+    const identities = new Set<string>();
     for (let page = 1; ; page++) {
       if (page > OPEN_PR_SEARCH_MAX_PAGES) {
         throw new Error(`open PR search exceeds retrievable results for query: ${q}`);
@@ -816,57 +836,214 @@ export async function searchOpenPullRequestsReferencingTracker(
         per_page: OPEN_PR_SEARCH_PAGE_SIZE,
         page,
       });
-      if (search.data.incomplete_results) {
-        throw new Error(`open PR search returned incomplete results for query: ${q}`);
+      const data = search.data;
+      if (
+        !data ||
+        typeof data !== 'object' ||
+        data.incomplete_results !== false ||
+        typeof data.total_count !== 'number' ||
+        !Number.isSafeInteger(data.total_count) ||
+        (data.total_count ?? -1) < 0 ||
+        !Array.isArray(data.items) ||
+        data.items.length > OPEN_PR_SEARCH_PAGE_SIZE
+      ) {
+        throw new Error(`open PR search returned incomplete or malformed results for query: ${q}`);
       }
-      const items = search.data.items;
-      retrieved += items.length;
-      for (const item of items) {
-        if (!item.pull_request || item.state !== 'open') continue;
-        const repo = parseRepositoryFromUrl(item.repository_url);
-        if (!repo) continue;
-        const key = `${repo.owner}/${repo.repo}#${item.number}`;
-        if (results.has(key)) continue;
-        results.set(key, {
-          owner: repo.owner,
-          repo: repo.repo,
-          number: item.number,
-          title: item.title,
-          body: item.body,
-          htmlUrl:
-            item.html_url ?? `https://github.com/${repo.owner}/${repo.repo}/pull/${item.number}`,
-        });
+      const total = data.total_count;
+      if (total > OPEN_PR_SEARCH_PAGE_SIZE * OPEN_PR_SEARCH_MAX_PAGES) {
+        throw new Error(`open PR search exceeds retrievable results for query: ${q}`);
       }
-      const total = search.data.total_count;
-      if (items.length < OPEN_PR_SEARCH_PAGE_SIZE) {
-        if (total !== undefined && retrieved < total) {
-          throw new Error(`open PR search short page before total_count for query: ${q}`);
+      if (expectedTotal !== undefined && total !== expectedTotal) {
+        throw new Error(`open PR search total changed for query: ${q}`);
+      }
+      expectedTotal = total;
+      retrieved += data.items.length;
+      for (const item of data.items) {
+        const candidate = validatedOpenSearchPullRequest(item);
+        const key = `${candidate.owner}/${candidate.repo}#${candidate.number}`.toLowerCase();
+        identities.add(key);
+        const prior = results.get(key);
+        if (
+          prior &&
+          (prior.title !== candidate.title ||
+            prior.body !== candidate.body ||
+            prior.htmlUrl.toLowerCase() !== candidate.htmlUrl.toLowerCase())
+        ) {
+          throw new Error(`open PR search returned conflicting copies for ${key}`);
         }
-        break;
+        results.set(key, candidate);
       }
-      if (total !== undefined && retrieved >= total) break;
+      if (retrieved > total || identities.size > total) {
+        throw new Error(`open PR search exceeds total_count for query: ${q}`);
+      }
+      if (identities.size === total) break;
+      if (data.items.length < OPEN_PR_SEARCH_PAGE_SIZE) {
+        throw new Error(`open PR search short page before distinct total_count for query: ${q}`);
+      }
     }
   }
 
   return [...results.values()];
 }
 
-async function findTrackerIssueByStem(
-  octokit: OctokitLike,
+/** Malformed or stale holder evidence must never become permission to close a tracker. */
+function validatedOpenSearchPullRequest(item: unknown): ReconcileOpenPullRequest {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    throw new Error('open PR search returned malformed row');
+  }
+  const row = item as Record<string, unknown>;
+  if (
+    !Number.isSafeInteger(row.number) ||
+    (row.number as number) <= 0 ||
+    typeof row.title !== 'string' ||
+    !(row.body === null || typeof row.body === 'string') ||
+    row.state !== 'open' ||
+    !row.pull_request ||
+    typeof row.pull_request !== 'object' ||
+    Array.isArray(row.pull_request) ||
+    typeof row.repository_url !== 'string' ||
+    typeof row.html_url !== 'string'
+  ) {
+    throw new Error('open PR search returned malformed row');
+  }
+  const repository =
+    /^https:\/\/api\.github\.com\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(
+      row.repository_url
+    );
+  const owner = repository?.[1];
+  const repo = repository?.[2];
+  if (
+    !owner ||
+    !repo ||
+    repo === '.' ||
+    repo === '..' ||
+    owner.toLowerCase() !== DEFAULT_ORG ||
+    row.html_url.toLowerCase() !==
+      `https://github.com/${owner}/${repo}/pull/${row.number as number}`.toLowerCase()
+  ) {
+    throw new Error('open PR search returned inconsistent repository or PR identity');
+  }
+  return {
+    owner,
+    repo,
+    number: row.number as number,
+    title: row.title,
+    body: row.body,
+    htmlUrl: row.html_url,
+  };
+}
+
+const TRACKER_ISSUE_PAGE_SIZE = 100;
+const TRACKER_ISSUE_MAX_PAGES = 100;
+interface TrackerSnapshotRow {
+  readonly number: number;
+  readonly title: string;
+  readonly state: 'open' | 'closed';
+  readonly htmlUrl: string;
+  readonly pullRequest: boolean;
+}
+type TrackerIssueSnapshot = ReadonlyMap<number, TrackerSnapshotRow>;
+
+async function readTrackerIssueSnapshot(octokit: OctokitLike): Promise<TrackerIssueSnapshot> {
+  const issues = octokit.issues;
+  if (!issues.listForRepo) throw new Error('tracker issue REST listing is unavailable');
+  const rows = new Map<number, TrackerSnapshotRow>();
+  // At most 100 logical core reads per invocation. Created order reduces churn;
+  // REST pagination is not an atomic snapshot and issue numbers need not increase.
+  for (let page = 1; page <= TRACKER_ISSUE_MAX_PAGES; page++) {
+    const response = await issues.listForRepo({
+      owner: DEFAULT_ORG,
+      repo: DEFAULT_TRACKER_REPO,
+      state: 'all',
+      sort: 'created',
+      direction: 'asc',
+      per_page: TRACKER_ISSUE_PAGE_SIZE,
+      page,
+    });
+    if (
+      !response ||
+      !Array.isArray(response.data) ||
+      response.data.length > TRACKER_ISSUE_PAGE_SIZE
+    ) {
+      throw new Error('tracker issue REST listing returned a malformed page');
+    }
+    for (const value of response.data) {
+      const row = validatedTrackerSnapshotRow(value);
+      const prior = rows.get(row.number);
+      if (
+        prior &&
+        (prior.title !== row.title ||
+          prior.state !== row.state ||
+          prior.htmlUrl.toLowerCase() !== row.htmlUrl.toLowerCase() ||
+          prior.pullRequest !== row.pullRequest)
+      ) {
+        throw new Error(`tracker issue REST listing returned conflicting copies of ${row.number}`);
+      }
+      rows.set(row.number, row);
+    }
+    if (response.data.length < TRACKER_ISSUE_PAGE_SIZE) return rows;
+  }
+  throw new Error('tracker issue REST listing exceeded its complete-page budget');
+}
+
+function validatedTrackerSnapshotRow(value: unknown): TrackerSnapshotRow {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('tracker issue REST listing returned a malformed row');
+  }
+  const row = value as Record<string, unknown>;
+  const pullRequest = row.pull_request !== undefined;
+  const repositoryUrl = `https://api.github.com/repos/${DEFAULT_ORG}/${DEFAULT_TRACKER_REPO}`;
+  const webUrl = `https://github.com/${DEFAULT_ORG}/${DEFAULT_TRACKER_REPO}/${pullRequest ? 'pull' : 'issues'}/${row.number}`;
+  if (
+    !Number.isSafeInteger(row.number) ||
+    (row.number as number) <= 0 ||
+    typeof row.title !== 'string' ||
+    !(row.body === null || typeof row.body === 'string') ||
+    (row.state !== 'open' && row.state !== 'closed') ||
+    typeof row.repository_url !== 'string' ||
+    row.repository_url.toLowerCase() !== repositoryUrl ||
+    typeof row.html_url !== 'string' ||
+    row.html_url.toLowerCase() !== webUrl.toLowerCase()
+  ) {
+    throw new Error('tracker issue REST listing returned a malformed identity or state');
+  }
+  if (pullRequest) {
+    const detail = row.pull_request as Record<string, unknown> | null;
+    const expected = `https://api.github.com/repos/${DEFAULT_ORG}/${DEFAULT_TRACKER_REPO}/pulls/${row.number}`;
+    if (
+      !detail ||
+      typeof detail !== 'object' ||
+      Array.isArray(detail) ||
+      typeof detail.url !== 'string' ||
+      detail.url.toLowerCase() !== expected.toLowerCase()
+    ) {
+      throw new Error('tracker issue REST listing returned malformed PR metadata');
+    }
+  }
+  // Retain only identity/matching metadata, not potentially large unused bodies.
+  return {
+    number: row.number as number,
+    title: row.title,
+    state: row.state,
+    htmlUrl: row.html_url,
+    pullRequest,
+  };
+}
+
+function findTrackerIssueByStem(
+  snapshot: TrackerIssueSnapshot,
   stem: string
-): Promise<ReconcileTrackerIssue | null> {
-  const search = await octokit.search.issuesAndPullRequests({
-    q: `repo:${DEFAULT_ORG}/${DEFAULT_TRACKER_REPO} is:issue ${stem} in:title`,
-    per_page: 10,
-  });
-  const exact = search.data.items.find(item => item.title === stem && !item.pull_request);
+): ReconcileTrackerIssue | null {
+  const matches = [...snapshot.values()].filter(row => !row.pullRequest && row.title === stem);
+  if (matches.length > 1) throw new Error(`tracker issue title is ambiguous: ${stem}`);
+  const exact = matches[0];
   if (!exact) return null;
   return {
     owner: DEFAULT_ORG,
     repo: DEFAULT_TRACKER_REPO,
     number: exact.number,
     title: exact.title,
-    state: exact.state === 'open' ? 'open' : 'closed',
+    state: exact.state,
   };
 }
 
