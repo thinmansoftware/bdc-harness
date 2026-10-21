@@ -485,109 +485,119 @@ export async function runSecurityDetector(
     return result;
   }
 
-  if (result.verdict !== 'observation_error') {
-    const json = {
-      verdict: result.verdict,
-      reasons: result.reasons,
-      evaluated_at: evaluatedAt,
-      build_sha: deps.buildSha,
-      armed_at: armedAt,
-    };
-    const titleReasons =
-      result.verdict === 'disarmed'
-        ? 'disarmed'
-        : [...new Set(result.reasons.map(r => r.code))].join(',') || 'clean';
-    const body = `${DETECTOR_MARKER}\n\n\`\`\`json\n${JSON.stringify(json)}\n\`\`\``;
-    if (result.verdict === 'clean' && detector) {
-      await request(
-        deps,
-        repo,
-        `/repos/${repo}/issues/${detector.number}/comments`,
-        writeToken,
-        'POST',
-        {
-          body: 'Security detector evaluation is clean; closing the persistent alarm.',
-        }
-      );
-      await request(deps, repo, `/repos/${repo}/issues/${detector.number}`, writeToken, 'PATCH', {
-        state: 'closed',
-      });
-      result.wrote.push('issue_closed');
-      log.info('duty_officer_security_detector_issue_closed');
-    } else if (result.verdict !== 'clean') {
-      const payload = {
-        title: `DETECTOR: security scan -- ${titleReasons}`,
-        body,
-        labels: ['security-detector', priority(result.reasons, result.verdict)],
+  try {
+    if (result.verdict !== 'observation_error') {
+      const json = {
+        verdict: result.verdict,
+        reasons: result.reasons,
+        evaluated_at: evaluatedAt,
+        build_sha: deps.buildSha,
+        armed_at: armedAt,
       };
-      if (detector) {
-        const existingLabels = issueLabels(detector);
-        const sameLabels = payload.labels.every(label => existingLabels.includes(label));
-        if (detector.title !== payload.title || detector.body !== payload.body || !sameLabels) {
-          await writeWithLabelFallback(
-            deps,
-            repo,
-            `/repos/${repo}/issues/${detector.number}`,
-            writeToken,
-            'PATCH',
-            payload
-          );
-          result.wrote.push('issue_updated');
-          log.info('duty_officer_security_detector_issue_updated');
-        }
-      } else {
-        const created = await writeWithLabelFallback<Issue>(
+      const titleReasons =
+        result.verdict === 'disarmed'
+          ? 'disarmed'
+          : [...new Set(result.reasons.map(r => r.code))].join(',') || 'clean';
+      const body = `${DETECTOR_MARKER}\n\n\`\`\`json\n${JSON.stringify(json)}\n\`\`\``;
+      if (result.verdict === 'clean' && detector) {
+        await request(
           deps,
           repo,
-          `/repos/${repo}/issues`,
+          `/repos/${repo}/issues/${detector.number}/comments`,
+          writeToken,
+          'POST',
+          {
+            body: 'Security detector evaluation is clean; closing the persistent alarm.',
+          }
+        );
+        await request(deps, repo, `/repos/${repo}/issues/${detector.number}`, writeToken, 'PATCH', {
+          state: 'closed',
+        });
+        result.wrote.push('issue_closed');
+        log.info('duty_officer_security_detector_issue_closed');
+      } else if (result.verdict !== 'clean') {
+        const payload = {
+          title: `DETECTOR: security scan -- ${titleReasons}`,
+          body,
+          labels: ['security-detector', priority(result.reasons, result.verdict)],
+        };
+        if (detector) {
+          const existingLabels = issueLabels(detector);
+          const sameLabels = payload.labels.every(label => existingLabels.includes(label));
+          if (detector.title !== payload.title || detector.body !== payload.body || !sameLabels) {
+            await writeWithLabelFallback(
+              deps,
+              repo,
+              `/repos/${repo}/issues/${detector.number}`,
+              writeToken,
+              'PATCH',
+              payload
+            );
+            result.wrote.push('issue_updated');
+            log.info('duty_officer_security_detector_issue_updated');
+          }
+        } else {
+          const created = await writeWithLabelFallback<Issue>(
+            deps,
+            repo,
+            `/repos/${repo}/issues`,
+            writeToken,
+            'POST',
+            payload
+          );
+          detector = created;
+          result.marker_home ??= created.number;
+          result.wrote.push('issue_opened');
+          log.info('duty_officer_security_detector_issue_opened');
+        }
+      }
+    }
+
+    if (result.marker_home !== null) {
+      let list = comments.get(result.marker_home);
+      if (!list) {
+        list = await request<Comment[]>(
+          deps,
+          repo,
+          `/repos/${repo}/issues/${result.marker_home}/comments?per_page=100`,
+          token
+        );
+      }
+      const marker = list.find(
+        comment =>
+          comment.body?.includes(COMMENT_MARKER) && comment.user?.login === 'thinman-overseer[bot]'
+      );
+      const payload = { body: markerBody(result, armedAt, deps.buildSha) };
+      if (marker) {
+        await request(
+          deps,
+          repo,
+          `/repos/${repo}/issues/comments/${marker.id}`,
+          writeToken,
+          'PATCH',
+          payload
+        );
+      } else {
+        await request(
+          deps,
+          repo,
+          `/repos/${repo}/issues/${result.marker_home}/comments`,
           writeToken,
           'POST',
           payload
         );
-        detector = created;
-        result.marker_home ??= created.number;
-        result.wrote.push('issue_opened');
-        log.info('duty_officer_security_detector_issue_opened');
       }
+      result.wrote.push('marker_patched');
+      log.info('duty_officer_security_detector_marker_patched');
     }
-  }
-
-  if (result.marker_home !== null) {
-    let list = comments.get(result.marker_home);
-    if (!list) {
-      list = await request<Comment[]>(
-        deps,
-        repo,
-        `/repos/${repo}/issues/${result.marker_home}/comments?per_page=100`,
-        token
-      );
-    }
-    const marker = list.find(
-      comment =>
-        comment.body?.includes(COMMENT_MARKER) && comment.user?.login === 'thinman-overseer[bot]'
+  } catch (error) {
+    signal.throwIfAborted();
+    result.verdict = 'observation_error';
+    result.last_error = (error as Error).message;
+    log.error(
+      { err: error, last_error: (error as Error).message },
+      'duty_officer_security_detector_observation_error'
     );
-    const payload = { body: markerBody(result, armedAt, deps.buildSha) };
-    if (marker) {
-      await request(
-        deps,
-        repo,
-        `/repos/${repo}/issues/comments/${marker.id}`,
-        writeToken,
-        'PATCH',
-        payload
-      );
-    } else {
-      await request(
-        deps,
-        repo,
-        `/repos/${repo}/issues/${result.marker_home}/comments`,
-        writeToken,
-        'POST',
-        payload
-      );
-    }
-    result.wrote.push('marker_patched');
-    log.info('duty_officer_security_detector_marker_patched');
   }
   log.info({ verdict: result.verdict }, 'duty_officer_security_detector_ran');
   recordRun(result.verdict);

@@ -513,4 +513,96 @@ describe('duty officer security detector', () => {
     }
     expect(executed).toEqual([0, 60, 120]);
   });
+
+  test('github write and marker failures record observation_error backoff', async () => {
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = '60000';
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+    process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
+    process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
+    const t0 = Date.parse('2026-09-30T12:00:00.000Z');
+    const logs = captureLogs();
+    try {
+      for (const failingPath of ['/issues', '/comments']) {
+        resetSecurityDetectorStateForTests();
+        logs.lines.length = 0;
+        let nowMs = t0;
+        const writes: string[] = [];
+        const fetchImpl = mock(async (url: string | URL | Request, init?: RequestInit) => {
+          const href = String(url);
+          const method = init?.method ?? 'GET';
+          if (method !== 'GET') {
+            writes.push(href);
+            const isCommentWrite = href.includes('/comments') && !href.includes('/comments?');
+            const isIssueWrite = href.includes('/issues') && !isCommentWrite;
+            if (
+              (failingPath === '/comments' && isCommentWrite) ||
+              (failingPath === '/issues' && isIssueWrite)
+            ) {
+              return new Response('unavailable', { status: 500 });
+            }
+            return Response.json({
+              number: 88,
+              id: 9,
+              title: 'created',
+              state: 'open',
+              body: 'created',
+              created_at: '2026-09-30T12:00:00.000Z',
+              updated_at: '2026-09-30T12:00:00.000Z',
+            });
+          }
+          if (href.includes('/runs?')) {
+            return Response.json({
+              workflow_runs: [{ created_at: '2026-09-29T00:00:00.000Z', conclusion: 'success' }],
+            });
+          }
+          if (href.includes('/comments')) {
+            return Response.json([]);
+          }
+          return Response.json([
+            {
+              number: 77,
+              title: 'Security Scan -- 2026-W40',
+              labels: ['security-scan'],
+              state: 'open',
+              body: 'weekly',
+              created_at: '2026-09-28T00:00:00.000Z',
+              updated_at: '2026-09-29T00:00:00.000Z',
+            },
+          ]);
+        });
+        const d = deps(fetchImpl as typeof fetch);
+        d.readToken = async () => 'read-token';
+        d.writeTokenProvider = async () => 'write-token';
+        d.now = () => new Date(nowMs);
+
+        const first = await runSecurityDetector(d);
+        expect(first?.verdict).toBe('observation_error');
+        expect(first?.last_error).toBe('duty_officer_github_http_500');
+        expect(writes.some(href => href.includes(failingPath))).toBe(true);
+        if (failingPath === '/comments') {
+          expect(first?.wrote).toContain('issue_opened');
+          expect(first?.wrote).not.toContain('marker_patched');
+        } else {
+          expect(first?.wrote).toEqual([]);
+        }
+        expect(
+          observationRecords(logs.lines).some(
+            record => record.last_error === 'duty_officer_github_http_500'
+          )
+        ).toBe(true);
+
+        const callsAfterFailure = fetchImpl.mock.calls.length;
+        nowMs = t0 + 30_000;
+        expect(await runSecurityDetector(d)).toBeNull();
+        expect(fetchImpl.mock.calls.length).toBe(callsAfterFailure);
+
+        nowMs = t0 + 61_000;
+        const retried = await runSecurityDetector(d);
+        expect(retried?.verdict).toBe('observation_error');
+        expect(fetchImpl.mock.calls.length).toBeGreaterThan(callsAfterFailure);
+      }
+    } finally {
+      logs.restore();
+    }
+  });
 });
