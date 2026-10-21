@@ -295,6 +295,38 @@ describe('frontier-approval reject + direct-entry bypass (Test 3)', () => {
 });
 
 describe('frontier-approval resume dead-end guard (Test 2 failure mode: zero fire -> retryable)', () => {
+  test('unknown claims preserve the original pending packet and a durable blocked resume', async () => {
+    const outDir = await makeOutDir();
+    const paused = await producePausedRecord(outDir, 'WO-FRONTIER-DISCOVERY-001');
+    const original = await readCascadeRecordById(paused.cascadeId, outDir);
+    const claim = await claimFrontierResolution(paused.cascadeId, 'approved', outDir);
+    expect(claim.claimed).toBe(true);
+    let fires = 0;
+    const resumed = await resumeFrontierTier(paused, {
+      token: 'test-token',
+      outDir,
+      deps: {
+        findWoClaim: async () => {
+          throw new Error('unavailable');
+        },
+        fire: async () => {
+          fires += 1;
+          return makeFireOk('must-not-fire');
+        },
+      },
+    });
+    expect(resumed.status).toBe('blocked');
+    expect(resumed.claimDiscoveryBlock?.phase).toBe('admission');
+    expect(resumed.attempts).toHaveLength(0);
+    expect(fires).toBe(0);
+    expect(await readCascadeRecordById(resumed.cascadeId, outDir)).toEqual(resumed);
+    expect(await readCascadeRecordById(paused.cascadeId, outDir)).toEqual(original);
+    await releaseFrontierClaim(paused.cascadeId, outDir);
+    expect((await claimFrontierResolution(paused.cascadeId, 'approved', outDir)).claimed).toBe(
+      true
+    );
+  });
+
   test('approve whose resume is blocked by a duplicate WO lock fires nothing, is rolled back, and stays retryable', async () => {
     const outDir = await makeOutDir();
     const paused = await producePausedRecord(outDir, 'WO-FRONTIER-BLOCKED-001');
