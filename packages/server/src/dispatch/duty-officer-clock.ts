@@ -510,11 +510,16 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
     verdict = mechanicalVerdict(claimed);
   }
   if (verdict.action === 'escalate_xo') {
-    await escalateToXo(deps, claimed, verdict);
-    await finishItem(deps, claimed, 'done', 'succeeded', {
-      disposition: 'escalated_to_xo',
-      transport: verdict.transport ?? null,
-    });
+    try {
+      await escalateToXo(deps, claimed, verdict);
+      await finishItem(deps, claimed, 'done', 'succeeded', {
+        disposition: 'escalated_to_xo',
+        transport: verdict.transport ?? null,
+      });
+    } catch (error) {
+      log.error({ err: error, messageId: claimed.id }, 'duty_officer_escalation_delivery_failed');
+      await holdItem(deps, claimed);
+    }
     return;
   }
   if (verdict.action === 'nudge') {
