@@ -39,7 +39,9 @@ export {
   isPatchEquivalent,
   isAncestorOf,
   getLastCommitDate,
+  hasUnpushedCommits,
 } from './branch';
+export type { GitCheckOptions } from './branch';
 
 // Repository operations
 export {
