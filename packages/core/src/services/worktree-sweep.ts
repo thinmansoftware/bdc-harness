@@ -420,6 +420,9 @@ export async function sweepTerminalWorkflowWorktrees(
     resolve(workspacesRoot)
   );
   const quarantineRoot = opts.quarantineRoot ?? defaultQuarantineRoot(workspacesRoot);
+  const canonicalQuarantineRoot = await realpath(quarantineRoot).catch(() =>
+    resolve(quarantineRoot)
+  );
   const now = opts.now ?? new Date();
   const listRuns = opts.listRuns ?? listWorkflowRunsWithWorkingPath;
   const listActiveEnvironments = opts.listActiveEnvironments ?? listActiveEnvironmentsForSweep;
@@ -440,15 +443,19 @@ export async function sweepTerminalWorkflowWorktrees(
   const getCanonicalRepoPathFn =
     opts.getCanonicalRepoPathFn ??
     ((path: string): Promise<string> => getCanonicalRepoPath(toWorktreePath(path)));
-  const assertSafeTarget = async (path: string): Promise<void> => {
+  const assertContainedTarget = async (root: string, path: string): Promise<void> => {
     const canonical = await realpath(path).catch(() => resolve(path));
-    if (!isContained(canonicalWorkspacesRoot, canonical))
-      throw new Error('target_outside_workspaces');
+    if (!isContained(root, canonical)) throw new Error('target_outside_allowed_root');
   };
   const moveDir = async (from: string, to: string): Promise<void> => {
-    await assertSafeTarget(from);
-    if (!isContained(canonicalWorkspacesRoot, resolve(to)))
-      throw new Error('target_outside_workspaces');
+    const canonicalFrom = await realpath(from).catch(() => resolve(from));
+    const fromWorkspace = isContained(canonicalWorkspacesRoot, canonicalFrom);
+    const fromQuarantine = isContained(canonicalQuarantineRoot, canonicalFrom);
+    const toWorkspace = isContained(canonicalWorkspacesRoot, resolve(to));
+    const toQuarantine = isContained(canonicalQuarantineRoot, resolve(to));
+    if ((!fromWorkspace && !fromQuarantine) || (!toWorkspace && !toQuarantine)) {
+      throw new Error('target_outside_allowed_root');
+    }
     await (opts.moveDir ?? rename)(from, to);
   };
   const pruneWorktree = async (repoPath: string): Promise<void> => {
@@ -465,11 +472,11 @@ export async function sweepTerminalWorkflowWorktrees(
   const removeQuarantineDir =
     opts.removeQuarantineDir ??
     (async (path: string): Promise<void> => {
-      await assertSafeTarget(path);
+      await assertContainedTarget(canonicalQuarantineRoot, path);
       await rm(path, { recursive: true, force: true });
     });
   const destroyWorktree = async (path: string): Promise<void> => {
-    await assertSafeTarget(path);
+    await assertContainedTarget(canonicalWorkspacesRoot, path);
     await (opts.destroyWorktree ?? defaultDestroyWorktree)(path);
   };
 

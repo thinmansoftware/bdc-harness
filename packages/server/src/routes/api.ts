@@ -2612,7 +2612,8 @@ export function registerApiRoutes(
   lockManager: ConversationLockManager,
   activePlatforms?: readonly string[],
   canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
-  dispatchMailboxActorResolvedHook?: () => Promise<void>
+  dispatchMailboxActorResolvedHook?: () => Promise<void>,
+  maintenanceCleanupRunner: typeof tryRunScheduledCleanup = tryRunScheduledCleanup
 ): void {
   function apiError(
     c: Context,
@@ -5904,7 +5905,7 @@ export function registerApiRoutes(
 
   registerOpenApiRoute(postMaintenanceCleanupRoute, async c => {
     try {
-      const result = await tryRunScheduledCleanup({ source: 'manual' });
+      const result = await maintenanceCleanupRunner({ source: 'manual' });
       if (!result.started) return apiError(c, 409, 'Cleanup already in progress');
       return c.json(result.report);
     } catch (error) {

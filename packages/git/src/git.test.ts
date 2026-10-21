@@ -762,6 +762,19 @@ branch refs/heads/feature/auth
 
       expect(result).toBe(true);
     });
+
+    test('does not repeat per-path errors after the maintenance limiter trips', async () => {
+      mockLogger.error.mockClear();
+      const error = new Error('maintenance git unavailable for this cleanup run');
+      error.name = 'MaintenanceGitUnavailableError';
+      const execute = mock(async () => Promise.reject(error));
+
+      expect(await git.hasUncommittedChanges('/workspace/later', { execute })).toBe(true);
+      expect(mockLogger.error).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'uncommitted_changes_check_failed_assuming_dirty'
+      );
+    });
   });
 
   describe('getDefaultBranch', () => {

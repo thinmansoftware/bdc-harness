@@ -50,6 +50,7 @@ mock.module('../db/sessions', () => ({
 }));
 
 import { sweepTerminalWorkflowWorktrees } from './worktree-sweep';
+import { createMaintenanceGitContext } from './maintenance-git-limiter';
 
 async function createWorktree(
   root: string,
@@ -888,6 +889,115 @@ describe('sweepTerminalWorkflowWorktrees', () => {
         orphaned: 0,
       }),
       'worktree_sweep_disk_report'
+    );
+  });
+
+  test('uses and retains the default quarantine root outside workspaces', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'archon-default-quarantine-'));
+    const root = join(parent, 'workspaces');
+    await mkdir(root, { recursive: true });
+    const worktreePath = await createWorktree(root, 'owner', 'repo', 'thread-old');
+    await setMtime(worktreePath, '2026-07-01T00:00:00Z');
+
+    try {
+      const first = await sweepTerminalWorkflowWorktrees({
+        workspacesRoot: root,
+        now: new Date('2026-07-13T00:00:00Z'),
+        orphanAgeMs: 7 * 24 * 60 * 60 * 1000,
+        hasUncommittedWorkFn: async () => false,
+        hasUnpushedCommitsFn: async () => false,
+        getCanonicalRepoPathFn: async () => root,
+      });
+      const quarantined = join(
+        parent,
+        'worktree-quarantine',
+        '2026-07-13',
+        'owner__repo__thread-old'
+      );
+      expect(first.quarantined).toEqual([quarantined]);
+      expect(existsSync(quarantined)).toBe(true);
+
+      const second = await sweepTerminalWorkflowWorktrees({
+        workspacesRoot: root,
+        now: new Date('2026-07-22T00:00:00Z'),
+        quarantineRetentionMs: 7 * 24 * 60 * 60 * 1000,
+      });
+      expect(second.quarantineDeleted).toEqual([join(parent, 'worktree-quarantine', '2026-07-13')]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('preserves an eligible old worktree when it has unpushed commits', async () => {
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-unpushed');
+    await setMtime(worktreePath, '2026-05-01T00:00:00Z');
+    const report = await sweepTerminalWorkflowWorktrees({
+      ...oldEnvSweepOpts(workspacesRoot, quarantineRoot),
+      hasUncommittedWorkFn: async () => false,
+      hasUnpushedCommitsFn: async () => true,
+    });
+
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(report.skipped).toContainEqual({
+      path: worktreePath,
+      reason: 'unmatched_unpushed_or_unknown',
+    });
+  });
+
+  test('refuses git prune when the canonical repository is outside workspaces', async () => {
+    const worktreePath = await createWorktree(workspacesRoot, 'owner', 'repo', 'thread-prune');
+    await setMtime(worktreePath, '2026-05-01T00:00:00Z');
+    const prune = mock(async () => undefined);
+    await sweepTerminalWorkflowWorktrees({
+      ...oldEnvSweepOpts(workspacesRoot, quarantineRoot),
+      hasUncommittedWorkFn: async () => false,
+      hasUnpushedCommitsFn: async () => false,
+      getCanonicalRepoPathFn: async () => '/opt/bdc/archon',
+      pruneWorktree: prune,
+    });
+
+    expect(prune).not.toHaveBeenCalled();
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      { repoPath: '/opt/bdc/archon' },
+      'worktree_sweep_prune_refused_outside_workspaces'
+    );
+  });
+
+  test('bounds maintenance git concurrency and halts queued work after EAGAIN', async () => {
+    const context = createMaintenanceGitContext('2');
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const operations = Array.from({ length: 4 }, (_, index) =>
+      context.execute(`path-${index}`, async () => {
+        await gate;
+        return index;
+      })
+    );
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(context.inFlight).toBe(2);
+    release();
+    expect(await Promise.all(operations)).toEqual([0, 1, 2, 3]);
+    expect(context.maxInFlight).toBe(2);
+
+    const exhausted = createMaintenanceGitContext('1');
+    const eagain = Object.assign(new Error('resource temporarily unavailable'), { code: 'EAGAIN' });
+    await expect(exhausted.execute('first', async () => Promise.reject(eagain))).rejects.toThrow(
+      'maintenance git unavailable'
+    );
+    const laterOperation = mock(async () => 'not run');
+    await expect(exhausted.execute('later', laterOperation)).rejects.toThrow(
+      'maintenance git unavailable'
+    );
+    expect(laterOperation).not.toHaveBeenCalled();
+    expect(exhausted.resourceExhaustionCount).toBe(1);
+    const exhaustionLogs = mockLogger.error.mock.calls.filter(
+      call => call[1] === 'maintenance_git_resource_exhausted'
+    );
+    expect(exhaustionLogs).toHaveLength(1);
+    expect(exhaustionLogs[0]?.[0]).toEqual(
+      expect.objectContaining({ firstPath: 'first', count: 1 })
     );
   });
 });

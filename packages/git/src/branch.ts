@@ -171,6 +171,12 @@ export async function hasUncommittedChanges(
   } catch (error) {
     const err = error as Error & { code?: string };
 
+    // The maintenance limiter already emits the single run-level EAGAIN
+    // diagnostic. Once it has tripped, every queued check fails with this
+    // sentinel; treating each sentinel as an independent git failure creates
+    // misleading per-worktree error spam.
+    if (err.name === 'MaintenanceGitUnavailableError') return true;
+
     // Only return false for expected "path doesn't exist" scenarios
     if (err.code === 'ENOENT' || err.message.includes('No such file or directory')) {
       getLog().debug({ workingPath }, 'path_not_found_no_uncommitted_changes');
