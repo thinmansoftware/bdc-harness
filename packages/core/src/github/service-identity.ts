@@ -170,16 +170,12 @@ function base64Url(value: string | Uint8Array): string {
   return Buffer.from(value).toString('base64url');
 }
 
-export async function getServiceGitHubToken(
-  identity: ServiceGitHubAuth,
-  options: { fetch?: typeof fetch; apiBaseUrl?: string; now?: () => number } = {}
-): Promise<string> {
-  if (identity.kind === 'pat') return identity.token;
-  if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
-  const now = (options.now ?? Date.now)();
-  const cached = tokenCache.get(identity.poolId);
-  if (cached && cached.expiresAt - now > 5 * 60_000) return cached.token;
-
+// Mint a signed GitHub App JWT (RS256) for the given App identity. `now` is a
+// resolved epoch-millisecond timestamp; it defaults to the current time. Shared
+// by getServiceGitHubToken (installation-token mint) and
+// scripts/github-service-login.ts (GET /app slug lookup) so the header/payload/
+// signature shape stays in lockstep.
+export function buildAppJwt(identity: GitHubAppIdentity, now: number = Date.now()): string {
   const header = base64Url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
   const payload = base64Url(
     JSON.stringify({
@@ -191,7 +187,20 @@ export async function getServiceGitHubToken(
   const signature = base64Url(
     sign('RSA-SHA256', Buffer.from(`${header}.${payload}`), identity.privateKey)
   );
-  const jwt = `${header}.${payload}.${signature}`;
+  return `${header}.${payload}.${signature}`;
+}
+
+export async function getServiceGitHubToken(
+  identity: ServiceGitHubAuth,
+  options: { fetch?: typeof fetch; apiBaseUrl?: string; now?: () => number } = {}
+): Promise<string> {
+  if (identity.kind === 'pat') return identity.token;
+  if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
+  const now = (options.now ?? Date.now)();
+  const cached = tokenCache.get(identity.poolId);
+  if (cached && cached.expiresAt - now > 5 * 60_000) return cached.token;
+
+  const jwt = buildAppJwt(identity, now);
   const response = await (options.fetch ?? fetch)(
     `${options.apiBaseUrl ?? 'https://api.github.com'}/app/installations/${identity.installationId}/access_tokens`,
     {
