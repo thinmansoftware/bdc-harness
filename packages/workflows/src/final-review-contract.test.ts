@@ -8,6 +8,21 @@ import { substituteNodeOutputRefs } from './dag-executor';
 const ROOT = join(import.meta.dir, '..', '..', '..');
 const LANES = join(ROOT, '.archon/workflows/defaults');
 const CODEX = 'bdc-feature-development-codex.yaml';
+const LANE_FILES = [
+  'bdc-feature-development-astra.yaml',
+  'bdc-feature-development-codex-only.yaml',
+  CODEX,
+  'bdc-feature-development-cursor.yaml',
+  'bdc-feature-development-fable.yaml',
+  'bdc-feature-development-fusion-cx-kimi.yaml',
+  'bdc-feature-development-fusion-cx-qwen.yaml',
+  'bdc-feature-development-grok.yaml',
+  'bdc-feature-development-kimi-k3.yaml',
+  'bdc-feature-development-zero-claude.yaml',
+  'bdc-feature-development-zero-open.yaml',
+  'bdc-feature-development-zero.yaml',
+  'bdc-feature-development.yaml',
+];
 const FIXTURES = join(import.meta.dir, 'fixtures/final-review');
 const temporary: string[] = [];
 
@@ -135,6 +150,12 @@ afterEach(() => {
 });
 
 describe('Slice T final review contract', () => {
+  it('supplies captured Opus provenance to every rereviewer', () => {
+    for (const file of LANE_FILES) {
+      expect(node('opus-rereview', file).prompt).toContain('$capture-diff-opus.output');
+    }
+  });
+
   it('sliceTProof c8731715 replay reports the cross-app check collapse', async () => {
     const fixture = join(FIXTURES, 'c8731715');
     const meta = JSON.parse(readFileSync(join(fixture, 'meta.json'), 'utf8'));

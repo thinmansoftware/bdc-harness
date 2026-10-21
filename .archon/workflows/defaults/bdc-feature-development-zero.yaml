@@ -3072,6 +3072,9 @@ nodes:
       Review the WHOLE final diff in $ARTIFACTS_DIR/diff-opus.patch against the spec: $read-spec.output
       Open and read in full every file listed in $ARTIFACTS_DIR/diff-opus.files, plus the direct callers and callees of every changed function. Do not review only patch hunks. Report every open finding from THIS fresh review; a finding of any severity blocks satisfaction.
 
+      Capture provenance (use its DIFF_OPUS_HEAD value verbatim for REVIEWED_HEAD):
+      $capture-diff-opus.output
+
       ## Output (STDOUT only, exact block)
       OPUS_REREVIEW=<satisfied|needs_revision>
       REVIEWED_HEAD=<the DIFF_OPUS_HEAD value from capture-diff-opus>
