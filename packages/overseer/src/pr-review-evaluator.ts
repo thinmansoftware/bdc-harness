@@ -125,6 +125,8 @@ export interface PrReviewResult {
    * callers that prefer a duration to an instant.
    */
   retry_after_ms?: number;
+  /** Names of checks still awaited. Set only on CHECKS_PENDING. */
+  pendingChecks?: string[];
 }
 
 export interface PrReviewModelResult {
@@ -497,14 +499,14 @@ export function checksAreTerminal(
 ): boolean {
   // UNKNOWN required set -- fail closed. Must be checked before any heuristic.
   if (requiredContexts === null) return false;
-  // A reported check that is still queued/in_progress means the suite is mid
-  // flight regardless of what is required -- never terminal.
   const allReportedCompleted = checks.every(check => check.status === 'completed');
   if (requiredContexts !== undefined && requiredContexts.length > 0) {
-    const completedNames = new Set(
-      checks.filter(check => check.status === 'completed').map(check => check.name)
+    const latestByName = new Map(
+      latestAttemptPerCheck(checks).map(check => [normalizedCheckName(check.name), check])
     );
-    return allReportedCompleted && requiredContexts.every(context => completedNames.has(context));
+    return requiredContexts.every(
+      context => latestByName.get(normalizedCheckName(context))?.status === 'completed'
+    );
   }
   return checks.length > 0 && allReportedCompleted;
 }
@@ -536,7 +538,21 @@ function rateLimited(
   };
 }
 
-function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult {
+function checksPending(
+  input: PrReviewInput,
+  deps: PrReviewDeps,
+  checks: PrReviewCheck[],
+  requiredContexts: string[] | null | undefined
+): PrReviewResult {
+  const latest = latestAttemptPerCheck(checks);
+  const latestByName = new Map(latest.map(check => [normalizedCheckName(check.name), check]));
+  const pendingChecks =
+    requiredContexts && requiredContexts.length > 0
+      ? requiredContexts.flatMap(context => {
+          const check = latestByName.get(normalizedCheckName(context));
+          return check?.status === 'completed' ? [] : [check?.name ?? context.trim()];
+        })
+      : latest.filter(check => check.status !== 'completed').map(check => check.name);
   return {
     verdict: 'CHECKS_PENDING',
     findings: [],
@@ -544,6 +560,7 @@ function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult
     reviewer: deps.reviewer,
     acceptance_criteria_available: false,
     error: 'checks_pending',
+    pendingChecks,
   };
 }
 
@@ -604,7 +621,7 @@ export async function evaluatePullRequest(
   // must NOT be coalesced (e.g. `?? []`), which would erase the unknown state
   // and silently fail open. The model is not invoked in this branch.
   if (!checksAreTerminal(evidence.checks, evidence.requiredContexts)) {
-    return checksPending(input, deps);
+    return checksPending(input, deps, evidence.checks, evidence.requiredContexts);
   }
 
   let acceptanceCriteria: string | null = null;

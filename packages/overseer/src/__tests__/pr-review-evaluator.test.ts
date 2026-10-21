@@ -576,6 +576,54 @@ describe('governed PR-code reviewer', () => {
     expect(result.error).toBe('checks_pending');
     expect(modelInvoked).toBe(false);
   });
+
+  test('required checks use normalized latest names and optional pending checks do not block', async () => {
+    let prompt = '';
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        fetchEvidence: async () => ({
+          diff: '+ change',
+          requiredContexts: ['docker-build', 'test (ubuntu-latest)'],
+          checks: [
+            { name: 'Docker-Build', status: 'completed', conclusion: 'success' },
+            { name: ' test (ubuntu-latest) ', status: 'completed', conclusion: 'success' },
+            { name: 'test (windows-latest)', status: 'in_progress', conclusion: null },
+          ],
+        }),
+        invokeModel: async (_binary, value) => {
+          prompt = value;
+          return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
+        },
+      })
+    );
+    expect(result.verdict).toBe('APPROVE');
+    expect(prompt).toContain('test (windows-latest)');
+  });
+
+  test('CHECKS_PENDING identifies running required checks but not absent ones', async () => {
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        fetchEvidence: async () => ({
+          diff: '+ change',
+          requiredContexts: ['docker-build', 'test (ubuntu-latest)', 'not-reported'],
+          checks: [
+            { name: 'docker-build', status: 'completed', conclusion: 'success' },
+            { name: 'test (ubuntu-latest)', status: 'in_progress', conclusion: null },
+          ],
+        }),
+      })
+    );
+    expect(result.verdict).toBe('CHECKS_PENDING');
+    expect(result.pendingChecks).toEqual(['test (ubuntu-latest)', 'not-reported']);
+    expect(
+      checksAreTerminal(
+        [{ name: 'docker-build', status: 'completed', conclusion: 'success' }],
+        null
+      )
+    ).toBe(false);
+  });
 });
 
 // PR #848 -- the CURSOR rail as a judge rung. Both configured rungs

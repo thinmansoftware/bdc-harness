@@ -96,6 +96,9 @@ export const DEFAULT_MAX_ATTEMPTS = 5;
 /** Stable log/receipt code for the terminal blocked outcome. */
 export const REQUIRED_CONTEXTS_BLOCKED_REASON = 'required_contexts_unavailable_blocked' as const;
 
+/** Stable reason for an unprotected base whose head never reports CI. */
+export const UNPROTECTED_BASE_NO_CHECKS_REASON = 'unprotected_base_no_checks' as const;
+
 /**
  * Stands in for the base branch when the PR's base ref could not be read. A
  * distinct literal, never a blank or a wildcard: "we could not see the base" is
