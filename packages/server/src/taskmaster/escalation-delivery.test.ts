@@ -5,7 +5,8 @@
  * delivery-claim tests use the REAL database-backed claim on a temp SQLite
  * file (two adapters on one file model two processes sharing the DB).
  */
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import * as serviceIdentity from '@archon/core/github/service-identity';
 import { unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -887,5 +888,51 @@ describe('marker trust: only the poster identity suppresses', () => {
     expect((await deliverEscalationToIssue(params, deps)).posted).toBe(false);
     expect(userCalls).toBe(2);
     expect(posts).toBe(0);
+  });
+
+  test('omitted token mints an App installation token; an explicit token is kept', async () => {
+    const mint = spyOn(serviceIdentity, 'getServiceGitHubToken').mockResolvedValue('t-app');
+    const resolve = spyOn(serviceIdentity, 'resolveServiceGitHubAuth').mockReturnValue({
+      kind: 'app',
+      service: 'duty_officer',
+      appId: '4574893',
+      installationId: '153295654',
+      privateKey: 'PEM_SENTINEL_DO_NOT_LOG',
+      poolId: 'app-test',
+      distinct: true,
+    });
+    const auths: string[] = [];
+    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+      auths.push(new Headers(init?.headers).get('authorization') ?? '');
+      if (new URL(input).pathname === '/user') {
+        return Response.json({ login: POSTER });
+      }
+      return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+    };
+    try {
+      const minted = createRealEscalationDeliveryDeps({ fetchImpl });
+      await minted.postIssueComment(ISSUE, 'hello');
+      expect(await minted.posterLogin()).toBe(POSTER);
+      expect(auths.every(header => header === 'Bearer t-app')).toBe(true);
+      expect(auths.length).toBeGreaterThan(0);
+      expect(mint).toHaveBeenCalled();
+
+      mint.mockClear();
+      auths.length = 0;
+      const explicit = createRealEscalationDeliveryDeps({ fetchImpl, token: 'explicit-token' });
+      await explicit.postIssueComment(ISSUE, 'hello');
+      expect(auths).toEqual(['Bearer explicit-token']);
+      expect(mint).not.toHaveBeenCalled();
+
+      mint.mockClear();
+      await expect(
+        createRealEscalationDeliveryDeps({ fetchImpl, token: null }).postIssueComment(ISSUE, 'x')
+      ).rejects.toThrow('taskmaster_github_token_missing');
+      expect(mint).not.toHaveBeenCalled();
+    } finally {
+      mint.mockRestore();
+      resolve.mockRestore();
+      serviceIdentity.clearServiceGitHubTokenCache();
+    }
   });
 });

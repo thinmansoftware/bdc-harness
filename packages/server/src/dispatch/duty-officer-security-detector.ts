@@ -1,3 +1,4 @@
+import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
 import {
   resolveGitHubAppAuth,
   resolveRealOctokitAuthOptions,
@@ -10,7 +11,7 @@ const DETECTOR_MARKER = '<!-- security-detector-issue -->';
 const COMMENT_MARKER = '<!-- security-detector -->';
 const REPORT_TITLE = /^Security Scan -- (\d{4})-W(\d{2})$/;
 // Clock ticks create fresh deps; throttle state lives for the process lifetime.
-const PROCESS_RUNS = new Map<string, { last_run_at: number }>();
+const PROCESS_RUNS = new Map<string, { last_run_at: number; window_ms: number }>();
 
 export function resetSecurityDetectorStateForTests(): void {
   PROCESS_RUNS.clear();
@@ -24,7 +25,7 @@ export interface SecurityDetectorReason {
 }
 export interface SecurityDetectorDeps {
   fetchImpl: typeof fetch;
-  readToken: () => string | null;
+  readToken: () => Promise<string | null>;
   writeTokenProvider: (signal: AbortSignal) => Promise<string | null>;
   signal?: AbortSignal;
   now: () => Date;
@@ -284,14 +285,24 @@ export async function runSecurityDetector(
   signal.throwIfAborted();
   const now = deps.now();
   const interval = positiveMs('DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS', 21_600_000);
+  const errorBackoff = positiveMs(
+    'DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS',
+    900_000,
+    1_000
+  );
   const repo = targetRepo();
   const stateKey = `duty-officer-clock:${repo.toLowerCase()}`;
   const previous = PROCESS_RUNS.get(stateKey);
-  if (previous !== undefined && now.getTime() - previous.last_run_at < interval) {
+  if (previous !== undefined && now.getTime() - previous.last_run_at < previous.window_ms) {
     log.info('duty_officer_security_detector_skipped_throttle');
     return null;
   }
-  PROCESS_RUNS.set(stateKey, { last_run_at: now.getTime() });
+  const recordRun = (verdict: SecurityDetectorVerdict): void => {
+    PROCESS_RUNS.set(stateKey, {
+      last_run_at: now.getTime(),
+      window_ms: verdict === 'observation_error' ? errorBackoff : interval,
+    });
+  };
   const trustedLogins = new Set(
     (
       process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS ??
@@ -305,7 +316,6 @@ export async function runSecurityDetector(
   const evaluatedAt = now.toISOString();
   const armedAt = process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT?.trim() || '9999-12-31';
   const armed = now.getTime() >= Date.parse(`${armedAt}T00:00:00Z`);
-  const token = deps.readToken();
   const result: SecurityDetectorResult = {
     verdict: armed ? 'clean' : 'disarmed',
     reasons: [],
@@ -313,10 +323,23 @@ export async function runSecurityDetector(
     marker_home: null,
     wrote: [],
   };
+  signal.throwIfAborted();
+  const token = await deps.readToken();
+  signal.throwIfAborted();
   if (!token) {
     result.verdict = 'observation_error';
     result.last_error = 'duty_officer_github_token_missing';
-    log.error('duty_officer_security_detector_observation_error');
+    let identityKind = 'none';
+    try {
+      identityKind = resolveServiceGitHubAuth('duty_officer').kind;
+    } catch {
+      identityKind = 'none';
+    }
+    log.error(
+      { last_error: 'duty_officer_github_token_missing', identity_kind: identityKind },
+      'duty_officer_security_detector_observation_error'
+    );
+    recordRun(result.verdict);
     return result;
   }
 
@@ -349,7 +372,10 @@ export async function runSecurityDetector(
         } else {
           result.verdict = 'observation_error';
           result.last_error = (error as Error).message;
-          log.error({ err: error }, 'duty_officer_security_detector_observation_error');
+          log.error(
+            { err: error, last_error: (error as Error).message },
+            'duty_officer_security_detector_observation_error'
+          );
         }
       }
     }
@@ -427,7 +453,10 @@ export async function runSecurityDetector(
     signal.throwIfAborted();
     result.verdict = 'observation_error';
     result.last_error = (error as Error).message;
-    log.error({ err: error }, 'duty_officer_security_detector_observation_error');
+    log.error(
+      { err: error, last_error: (error as Error).message },
+      'duty_officer_security_detector_observation_error'
+    );
   }
 
   if (result.verdict !== 'observation_error') {
@@ -446,11 +475,13 @@ export async function runSecurityDetector(
     signal.throwIfAborted();
     result.last_error = (error as Error).message;
     log.error({ err: error }, 'duty_officer_security_detector_write_refused_no_app_auth');
+    recordRun(result.verdict);
     return result;
   }
   if (!writeToken) {
     result.last_error = 'app_auth_missing';
     log.warn('duty_officer_security_detector_write_refused_no_app_auth');
+    recordRun(result.verdict);
     return result;
   }
 
@@ -559,5 +590,6 @@ export async function runSecurityDetector(
     log.info('duty_officer_security_detector_marker_patched');
   }
   log.info({ verdict: result.verdict }, 'duty_officer_security_detector_ran');
+  recordRun(result.verdict);
   return result;
 }
