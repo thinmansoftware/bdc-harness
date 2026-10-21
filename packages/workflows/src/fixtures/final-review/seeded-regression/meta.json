@@ -1,0 +1,11 @@
+{
+  "lane": "bdc-feature-development-codex.yaml",
+  "node": "diff-review-final",
+  "provider": "claude",
+  "model": "claude-fable-5",
+  "prompt_template_sha256": "cb8cde33a99a33c2c04341fd9680a27d4f4bc973df704fa0c41134a0b480abcd",
+  "fixture_patch_sha256": "0549c998460bfacff738ad7478e7a429d5718fdac5b6b2ed225cee20a9de89ae",
+  "head": "1111111111111111111111111111111111111111",
+  "recorded_at": "2026-10-21T16:07:14.939Z",
+  "command": "bun scripts/final-review-replay.ts --lane /.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/task-web-worker-1792598085461-v9cpv8/.archon/workflows/defaults/bdc-feature-development-codex.yaml --fixture /.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/task-web-worker-1792598085461-v9cpv8/packages/workflows/src/fixtures/final-review/seeded-regression"
+}

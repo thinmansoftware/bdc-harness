@@ -1,0 +1,25 @@
+I'll review the final diff against the spec. Starting by reading the patch and file list.The patch shows a suspicious inverted condition. Now reading the full file as it exists in the tree, plus checking callers.The file on disk doesn't match the patch — let me check the callers (dag-executor) and the store contract to complete the review.Review complete. The final diff fails the spec on the core requirement, and the patch doesn't even match the code on disk.
+
+Key findings:
+
+1. **Inverted lease-claim check (critical).** The final patch changes `if (!claimed) throw run_lease_conflict` to `if (claimed) throw run_lease_conflict`. Since `claimRunLease` returns `RunLeaseRecord | null` (store.ts:153), the patched code throws `run_lease_conflict` when the lease **was** acquired and proceeds when the claim **failed** — the exact opposite of the spec ("must proceed only after claimRunLease reports that the lease was acquired. A failed claim must throw run_lease_conflict"). A losing worker would run the workflow concurrently with the lease owner, and would also heartbeat/release a lease it never held.
+
+2. **Patch/tree provenance mismatch (high).** The on-disk `run-lease.ts` does not contain either hunk of the final patch: line 42 still reads `if (!claimed)` and the non-positive-duration guard is absent entirely. The declared `DIFF_FINAL_HEAD` is a placeholder (`1111…`). The "final diff" and the "final code" are two different states, so the artifact cannot be trusted as the reviewed final state.
+
+3. **Missing duration validation in the actual tree (high).** The spec requires rejecting non-positive lease durations. The on-disk `run-lease.ts:30-31` accepts any `leaseDurationMs`/`heartbeatIntervalMs` without a guard (a value ≤ 0 would produce an already-expired lease and a pathological `setInterval`). Only the (mismatched) patch adds this guard.
+
+The caller (`dag-executor.ts:6866` wrapping `executeDagWorkflowInternal` via `withRunLease`, plus the `isRunLeaseValid` checks at 5604 and 6464) relies on the conflict throw to prevent concurrent execution, so finding 1 directly defeats that protection.
+
+DIFF_REVIEW_FINAL=needs_revision
+REVIEWED_HEAD=1111111111111111111111111111111111111111
+FILES_READ:
+- packages/workflows/src/fixtures/final-review/seeded-regression/diff-final.patch
+- packages/workflows/src/fixtures/final-review/seeded-regression/diff-final.files
+- packages/workflows/src/run-lease.ts
+- packages/workflows/src/dag-executor.ts
+- packages/workflows/src/store.ts
+UNRESOLVED:
+- [critical] packages/workflows/src/run-lease.ts:41 (patched state, diff-final.patch hunk 2) Claim check inverted to `if (claimed) throw`: throws run_lease_conflict on successful claim and proceeds when claimRunLease returns null, allowing a worker that lost the claim to execute the run and heartbeat/release a lease it does not own — direct spec violation.
+- [high] packages/workflows/src/fixtures/final-review/seeded-regression/diff-final.patch:1 Final-diff provenance mismatch: patch final state (inverted check + duration guard) does not match on-disk run-lease.ts (`if (!claimed)` at line 42, no guard), and DIFF_FINAL_HEAD is a placeholder hash; the reviewed artifact is not the actual final code.
+- [high] packages/workflows/src/run-lease.ts:30 On-disk final code has no rejection of non-positive leaseDurationMs (or heartbeatIntervalMs); spec requires rejecting non-positive lease durations — a value <= 0 yields an already-expired lease and a zero/negative setInterval period.
+SEMANTIC_RISK=HIGH
