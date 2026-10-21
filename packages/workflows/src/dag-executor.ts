@@ -17,6 +17,7 @@ import {
   win32 as win32Path,
 } from 'path';
 import { execFileAsync } from '@archon/git';
+import { buildLaneSubprocessEnv, laneSpawnArgv } from '../../core/src/github/lane-env';
 import { discoverScriptsForCwd } from './script-discovery';
 import { resolveModelForNode, type ModelOverride } from './model-override';
 import type {
@@ -3250,7 +3251,7 @@ async function executeBashNode(
         Object.entries(resolvedInputs).map(([k, v]) => [`INPUT_${k.toUpperCase()}`, v])
       )
     : {};
-  const subprocessEnv: NodeJS.ProcessEnv = {
+  const subprocessEnv: NodeJS.ProcessEnv = buildLaneSubprocessEnv({
     ...process.env,
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
@@ -3273,7 +3274,7 @@ async function executeBashNode(
     ARCHON_NODE_OUT: join(artifactsDir || tmpdir(), 'node-out'),
     ...inputEnvVars,
     ...(envVars ?? {}),
-  };
+  });
 
   const safeNodeId = node.id.replace(/[^A-Za-z0-9._-]/g, '_');
   const safeRunId = workflowRun.id.replace(/[^A-Za-z0-9._-]/g, '_');
@@ -3298,7 +3299,8 @@ async function executeBashNode(
           scriptPreparationFailed: true,
         });
       }
-      ({ stdout, stderr } = await execFileAsync('bash', [scriptFile], {
+      const laneArgv = laneSpawnArgv(['bash', scriptFile]);
+      ({ stdout, stderr } = await execFileAsync(laneArgv[0], laneArgv.slice(1), {
         cwd,
         timeout,
         env: subprocessEnv,
@@ -3558,8 +3560,7 @@ async function executeScriptNode(
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const subprocessEnv =
-    envVars && Object.keys(envVars).length > 0 ? { ...process.env, ...envVars } : undefined;
+  const subprocessEnv = buildLaneSubprocessEnv({ ...process.env, ...(envVars ?? {}) });
 
   // Build the command and args based on runtime and inline vs named
   let cmd = '';
@@ -3664,7 +3665,8 @@ async function executeScriptNode(
       }
     }
 
-    const { stdout, stderr } = await execFileAsync(cmd, args, {
+    const laneArgv = laneSpawnArgv([cmd, ...args]);
+    const { stdout, stderr } = await execFileAsync(laneArgv[0], laneArgv.slice(1), {
       cwd,
       timeout,
       env: subprocessEnv,
@@ -4815,7 +4817,11 @@ async function executeLoopNode(
           nodeOutputs,
           true // escapedForBash
         );
-        await execFileAsync('bash', ['-c', substitutedBash], { cwd });
+        const laneArgv = laneSpawnArgv(['bash', '-c', substitutedBash]);
+        await execFileAsync(laneArgv[0], laneArgv.slice(1), {
+          cwd,
+          env: buildLaneSubprocessEnv(process.env),
+        });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;

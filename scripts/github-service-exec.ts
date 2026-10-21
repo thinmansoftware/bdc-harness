@@ -21,6 +21,14 @@ interface CommandResult {
   stderr: Uint8Array;
 }
 
+const LANE_UID = 1002;
+
+export function assertLaneGitHubService(service: string, uid = process.getuid?.()): void {
+  if (uid === LANE_UID && service !== 'run_nodes' && service !== 'smart_cauldron') {
+    throw new Error('lane_service_forbidden');
+  }
+}
+
 /** Only buffer input when gh explicitly requests it, so permission retries can replay it. */
 export function githubCommandReadsStdin(args: string[]): boolean {
   if (args[0] === 'workflow' && args[1] === 'run' && args.includes('--json')) return true;
@@ -92,6 +100,7 @@ export async function runGitHubServiceCommand(input: {
   execute?: (command: string[], env: Record<string, string | undefined>) => CommandResult;
   db?: IDatabase;
 }): Promise<CommandResult> {
+  assertLaneGitHubService(input.service);
   const env = input.env ?? process.env;
   const identity = input.identity ?? resolveServiceGitHubAuth(input.service, env);
   const db = input.db ?? getDatabase();
@@ -115,17 +124,36 @@ export async function runGitHubServiceCommand(input: {
   const permissionFallbackDisabled =
     env.ARCHON_GITHUB_NO_PERMISSION_FALLBACK === '1' ||
     env.ARCHON_GITHUB_NO_PERMISSION_FALLBACK === 'true';
+  let meteringWarningPrinted = false;
+  const flushMetering = async (): Promise<void> => {
+    try {
+      await flushGitHubApiMeter(db);
+    } catch {
+      if (!meteringWarningPrinted) {
+        console.error('github_service_metering_skipped:database_not_writable');
+        meteringWarningPrinted = true;
+      }
+    }
+  };
   const invoke = async (
     selected: ServiceGitHubAuth,
     permissionFallback = false
   ): Promise<CommandResult> => {
     // A gh command may use REST and GraphQL in the same operation. Refuse
     // conservatively if any of its pool's known resources is exhausted.
-    await assertPersistedGitHubPoolAvailable(
-      selected.poolId,
-      ['core', 'graphql', 'search', 'cli'],
-      db
-    );
+    try {
+      await assertPersistedGitHubPoolAvailable(
+        selected.poolId,
+        ['core', 'graphql', 'search', 'cli'],
+        db
+      );
+    } catch (error) {
+      if (String(error).includes('github_pool_backoff:')) throw error;
+      if (!meteringWarningPrinted) {
+        console.error('github_service_metering_skipped:database_not_readable');
+        meteringWarningPrinted = true;
+      }
+    }
     const token =
       selected.kind === 'pat'
         ? selected.token
@@ -147,7 +175,7 @@ export async function runGitHubServiceCommand(input: {
         status: 0,
         permissionFallback,
       });
-      await flushGitHubApiMeter(db);
+      await flushMetering();
       throw error;
     }
     const trace = consumeGitHubTrace(
@@ -172,7 +200,7 @@ export async function runGitHubServiceCommand(input: {
       });
     }
     // Persist before exit/retry so the next CLI process sees the same pool.
-    await flushGitHubApiMeter(db);
+    await flushMetering();
     let stderr = trace.stderr;
     for (const secret of [token, fallback]) {
       if (secret) stderr = stderr.split(secret).join('[redacted]');
@@ -204,6 +232,7 @@ if (import.meta.main) {
   const [service, command, ...args] = process.argv.slice(2);
   if (!service || !command) throw new Error('github_service_command_required');
   try {
+    assertLaneGitHubService(service);
     const result = await runGitHubServiceCommand({
       service: service as GitHubService,
       command,

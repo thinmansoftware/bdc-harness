@@ -84,7 +84,9 @@ The private key must never be committed to git and must never appear in
 `docker-compose.yml`. Bind-mount the PEM from the host into the container:
 
 1. Place the PEM on the host outside any git repo, e.g.
-   `/opt/bdc/archon/secrets/thinman-overseer-app.private-key.pem`, mode `0600`.
+   `/opt/bdc/archon/secrets/thinman-overseer-app.private-key.pem`, owned
+   `root:1100` (`archon-secrets`) with mode `0440`. The Builder 2 key is owned
+   `root:1002` (`laneuser`) with mode `0440`.
 2. In `docker-compose.yml`, add a read-only bind mount for the app service:
    ```yaml
    volumes:
@@ -319,3 +321,42 @@ it also checks payload forwarding and identical-byte permission retry:
 ```bash
 bun test ./scripts/github-service-exec.test.ts
 ```
+
+## Post-merge rebuild step: lane key isolation
+
+Run on the Docker host, never from a builder lane:
+
+```bash
+cd /opt/bdc/archon
+cp -a docker-compose.override.yml docker-compose.override.yml.pre-lane-isolation
+ls -ln docker-compose.override.yml secrets/*.private-key.pem /.archon /.archon/archon.db* /home/appuser
+sudo chown root:1100 secrets/thinman-overseer-app.private-key.pem
+sudo chmod 0440 secrets/thinman-overseer-app.private-key.pem
+sudo chown root:1002 secrets/thinman-builder-2.private-key.pem
+sudo chmod 0440 secrets/thinman-builder-2.private-key.pem
+sudo chown root:1100 secrets/thinman-builder.private-key.pem
+sudo chmod 0440 secrets/thinman-builder.private-key.pem
+sed -i.bak '/thinman-builder\.pem/d' docker-compose.override.yml
+docker compose build app
+docker compose up -d --force-recreate app
+```
+
+Use the pinned M-181 rebuild procedure, then run Stops 4-12 from
+WO-HARNESS-APP-KEY-ISOLATION-01. Verify UID 1002 cannot read the reviewer PEM,
+`/proc/1/environ`, or `archon.db`; can read Builder 2's PEM; and that the
+canary PR is opened by Builder 2 and reviewed by `thinman-overseer[bot]` at the
+exact head SHA.
+
+Rollback:
+
+```bash
+cd /opt/bdc/archon
+cp -a docker-compose.override.yml.pre-lane-isolation docker-compose.override.yml
+sudo chown 1000:1000 secrets/*.private-key.pem
+sudo chmod 0644 secrets/*.private-key.pem
+printf '\nARCHON_LANE_UID_ISOLATION=0\n' >> .env
+docker compose up -d --force-recreate app
+```
+
+Restore the recorded ownership and modes for `/.archon`, `archon.db*`, and
+`/home/appuser`, or redeploy the previous pinned M-181 image if necessary.

@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
+import { buildLaneSubprocessEnv, laneSpawnArgv } from '../../../../core/src/github/lane-env';
 
 const execFileAsync = promisify(execFile);
 
@@ -129,11 +130,12 @@ export async function executeGrokTool(
         const shellArgs =
           process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-lc', command];
         try {
-          const { stdout, stderr } = await execFileAsync(shell, shellArgs, {
+          const laneArgv = laneSpawnArgv([shell, ...shellArgs]);
+          const { stdout, stderr } = await execFileAsync(laneArgv[0], laneArgv.slice(1), {
             cwd,
             timeout,
             maxBuffer: 8 * 1024 * 1024,
-            env: process.env,
+            env: buildLaneSubprocessEnv(process.env),
             windowsHide: true,
           });
           const out = `${stdout ?? ''}${stderr ? `\nSTDERR:\n${stderr}` : ''}`.trim();

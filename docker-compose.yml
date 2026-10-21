@@ -108,11 +108,15 @@ services:
     volumes:
       - ${ARCHON_DATA:-archon_data}:/.archon
       - ${ARCHON_USER_HOME:-archon_user_home}:/home/appuser
+      - archon_lane_home:/home/laneuser
+      # Reviewer key host file must be root:1100 (archon-secrets) mode 0440.
+      # Builder 2 key must be root:1002 (laneuser) mode 0440.
       # Optional (Option A -- mounted PEM). Uncomment and set
       # GITHUB_APP_PRIVATE_KEY_HOST_PATH in .env to mount the App private key as a
       # read-only file, then set GITHUB_APP_PRIVATE_KEY_PATH=/run/secrets/thinman-overseer.pem
       # (keeps the key out of `docker compose config` output and process env).
       - ${GITHUB_APP_PRIVATE_KEY_HOST_PATH:-/dev/null}:/run/secrets/thinman-overseer.pem:ro
+      - ${GITHUB_APP_RUN_NODES_PRIVATE_KEY_HOST_PATH:-/dev/null}:/run/secrets/thinman-builder-2.pem:ro
       # PR #848: host cursor-agent credential directory (the ~/.cursor of the
       # user who ran `cursor-agent login`), read-only. Set CURSOR_CONFIG_HOST_PATH
       # in .env. Default /dev/null makes a missing path harmless: the entrypoint
@@ -209,6 +213,7 @@ services:
 volumes:
   archon_data:
   archon_user_home:
+  archon_lane_home:
   postgres_data:
   caddy_data:
   caddy_config:

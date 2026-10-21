@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   githubCommandReadsStdin,
+  assertLaneGitHubService,
   runGitHubServiceCommand as runCommand,
 } from './github-service-exec';
 import { serviceGitHubCommandEnvironment } from '../packages/core/src/github/service-identity';
@@ -25,6 +26,11 @@ const runGitHubServiceCommand = (
 ): ReturnType<typeof runCommand> => runCommand({ ...input, db });
 
 describe('operation-scoped GitHub CLI authentication', () => {
+  test('lane_service_forbidden rejects reviewer services for UID 1002', () => {
+    expect(() => assertLaneGitHubService('overseer', 1002)).toThrow('lane_service_forbidden');
+    expect(() => assertLaneGitHubService('run_nodes', 1002)).not.toThrow();
+    expect(() => assertLaneGitHubService('smart_cauldron', 1002)).not.toThrow();
+  });
   test('buffers declared gh stdin sources and leaves ordinary query arguments alone', () => {
     for (const args of [
       ['api', 'repos/synthetic/test', '--input', '-'],
@@ -114,6 +120,32 @@ describe('operation-scoped GitHub CLI authentication', () => {
       "SELECT calls FROM github_api_usage WHERE resource = 'cli'"
     );
     expect(usage.rows[0]?.calls).toBe(1);
+  });
+  test('an unreadable metering database does not block the GitHub command', async () => {
+    let launches = 0;
+    const result = await runCommand({
+      service: 'run_nodes',
+      command: 'synthetic-gh',
+      args: [],
+      identity: {
+        kind: 'pat',
+        service: 'run_nodes',
+        token: 'synthetic-pat',
+        poolId: 'user-pat',
+        distinct: false,
+      },
+      db: {
+        query: async () => {
+          throw new Error('synthetic unreadable database');
+        },
+      } as unknown as SqliteAdapter,
+      execute: () => {
+        launches += 1;
+        return { exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array() };
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(launches).toBe(1);
   });
   test('Smart Cauldron override survives the actual container wrapper and keeps PAT fallback', async () => {
     const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 })

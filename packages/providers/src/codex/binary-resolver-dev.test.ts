@@ -14,13 +14,13 @@ mock.module('@archon/paths', () => ({
 import { resolveCodexBinaryPath } from './binary-resolver';
 
 describe('resolveCodexBinaryPath (dev mode)', () => {
-  test('returns undefined when BUNDLED_IS_BINARY is false', async () => {
+  test('resolves the installed CLI entrypoint when BUNDLED_IS_BINARY is false', async () => {
     const result = await resolveCodexBinaryPath();
-    expect(result).toBeUndefined();
+    expect(result).toContain('@openai/codex/bin/codex.js');
   });
 
-  test('returns undefined even with config path set', async () => {
+  test('resolves the installed CLI entrypoint even with config path set', async () => {
     const result = await resolveCodexBinaryPath('/some/custom/path');
-    expect(result).toBeUndefined();
+    expect(result).toContain('@openai/codex/bin/codex.js');
   });
 });

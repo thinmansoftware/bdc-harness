@@ -1,3 +1,5 @@
+import { buildLaneSubprocessEnv, laneSpawnArgv } from '../../core/src/github/lane-env';
+
 /**
  * Merge provenance: bind the PR being merged to the run that actually produced it.
  *
@@ -64,9 +66,10 @@ export interface MergeProvenanceDeps {
  */
 export async function readWorktreeHeadShaWithGit(workingPath: string): Promise<string | null> {
   try {
-    const subprocess = Bun.spawn(['git', '-C', workingPath, 'rev-parse', 'HEAD'], {
+    const subprocess = Bun.spawn(laneSpawnArgv(['git', '-C', workingPath, 'rev-parse', 'HEAD']), {
       stdout: 'pipe',
       stderr: 'pipe',
+      env: buildLaneSubprocessEnv(process.env),
     });
     const [stdout, exitCode] = await Promise.all([
       new Response(subprocess.stdout).text(),
