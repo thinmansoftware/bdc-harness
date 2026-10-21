@@ -66,7 +66,7 @@ of `operator`. It ships in dry-run mode with the existing operator consumer stil
 | `INBOX_READER_MODE` | `dry-run` | Only exact `enforce` enables dispositions. |
 | `INBOX_READER_MAX_PER_RUN` | `500` | Clamped to 1 through 500. |
 | `INBOX_READER_MIN_AGE_MS` | `600000` | May be raised but never lowered below ten minutes. |
-| `INBOX_READER_OPERATOR_OWNER` | `consumer` | Exact `reader` transfers the operator mailbox. |
+| `INBOX_READER_OPERATOR_OWNER` | `reader` | Default is now the reader (A2); exact `consumer` rolls back to the legacy operator consumer. |
 | `INBOX_READER_ACTIONABLE_ALERT_HOURS` | `24` | Positive number. |
 | `INBOX_READER_GAP_ALERT_HOURS` | `2` | Positive number. |
 | `INBOX_READER_ALERT_REPEAT_HOURS` | `6` | Positive number. |
@@ -114,3 +114,97 @@ The reader never acknowledges, addresses or cancels; it only machine-disposes IN
 
 Direct receipt operations and cancellation are prohibited. The legacy non-terminal surface
 disposition remains owned by the existing operator consumer and is not produced by this reader.
+
+## Ops-inbox digest and event routing (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01)
+
+Routine ops events no longer interrupt the XO and no longer pile into an unread Dispatch
+mailbox. The Duty Officer and the inbox reader post them to one pinned GitHub issue (the
+`ops-inbox` issue) as a single daily digest comment; only events that genuinely need a person
+or are a blocker create a Dispatch `xo` interrupt row.
+
+### The ops-inbox issue
+
+One open issue labelled `ops-inbox` in `OPS_INBOX_REPO` (default `thinmansoftware/bdc-xo`)
+holds the digest. `ensureOpsInboxIssue` finds it, or creates the label and the issue
+("OPS INBOX -- daily digest (do not close)") exactly once. There is one digest comment per UTC
+date, addressed by the marker `<!-- ops-inbox-digest:YYYY-MM-DD -->`. Each writer owns a fenced
+section (`<!-- section:KEY -->` ... `<!-- /section:KEY -->`), so independent writers (the
+`routine` section here, the `john-queue` section in WO-HARNESS-TASKMASTER-JOHN-DIGEST-01) update
+the same comment without clobbering each other. This module never closes, cancels, or deletes
+anything.
+
+Read today's digest:
+
+```sh
+gh api "repos/thinmansoftware/bdc-xo/issues/$(gh issue list --repo thinmansoftware/bdc-xo \
+  --label ops-inbox --state open --json number --jq '.[0].number')/comments" --paginate \
+  --jq '.[] | select(.body | contains("ops-inbox-digest:'"$(date -u +%F)"'")) | .body'
+```
+
+### The routing table
+
+`routeOpsEvent(event)` returns one of three classes, first match wins:
+
+| Class | Goes to | Examples |
+|---|---|---|
+| `ROUTINE` | the digest `routine` section; no Dispatch row | run finished, run failed with a retry path, PR opened, checks green, rate-limit reset, session archived, an ORDINARY-priority `expectation EXHAUSTED` notice |
+| `NEEDS_A_PERSON` | one `xo` `ops_interrupt` row, Dispatch priority `normal` | decision / approval / human-only / rotate / `owner:john` / `owner:board`; a customer-facing `broken`/`down`/`wrong`/`failing`/`overcharged` |
+| `BLOCKER` | one `xo` `ops_interrupt` row, Dispatch priority `blocker` | `priority: blocker` or a Taskmaster `blocker_report`; a failure with no retry path (`retries exhausted`, `max attempts`, `gave up`, `all tiers exhausted`, ...); an owner-seat question (`?`); `security`/`secret`/`service_role`/`money`/`billing`/`refund`/`charge` |
+
+A second `BLOCKER` for the same `subject_key` within 24 hours is downgraded to `ROUTINE`
+(digest), so a repeating alarm pages once, not every tick. The `ops_interrupt` body carries
+`kind`, `class`, `item` (the subject_key) and `default_if_unanswered`.
+
+### Additional env flags
+
+| Variable | Default | Rule |
+|---|---:|---|
+| `OPS_INBOX_REPO` | `thinmansoftware/bdc-xo` | `owner/repo` for the ops-inbox issue. |
+| `OPS_INBOX_GITHUB_TIMEOUT_MS` | `15000` | GitHub request timeout, floored at 1000. |
+| `INBOX_READER_CANARY_AGE_HOURS` | `6` | Rows older than this count toward the unread canary. |
+| `INBOX_READER_CANARY_MAX` | `25` | A principal with MORE than this many stale unread rows fires the canary. |
+
+### Owner-ack deadline
+
+For every row the reader classifies ACTIONABLE or BRING, if the recipient has not acknowledged
+it 24 hours after `created_at`, the reader appends one line (once per message id) to the digest
+`overdue` section naming the recipient, message id, subject_key and default action. After 72
+hours it creates exactly one `duty-officer` row (`kind: owner_ack_overdue`); the Duty Officer
+clock appends that to the digest `escalated` section. It never creates a second `xo` row for an
+already-overdue `xo` row, and never acknowledges, addresses or disposes the original.
+
+### Unread canary
+
+Each run computes, per principal, `unread_older_than_6h` (unacknowledged, unaddressed, older
+than `INBOX_READER_CANARY_AGE_HOURS`, and either not route-disposed or an `auto_surfaced` row
+past the surface cursor). If any principal exceeds `INBOX_READER_CANARY_MAX`, OR any queued row
+exists for a principal that has no consumer, the reader writes one `queued_age_canary` alert to
+`alerts.jsonl` and upserts the digest `canary` section (suppressed per recipient for
+`INBOX_READER_ALERT_REPEAT_HOURS`). The per-principal numbers are also written to `latest.json`
+under `canary`.
+
+### Honest inbox status (A7)
+
+`GET /api/dispatch/status` now reports, per principal, `unread_older_than_6h` and
+`surface_unread` (auto_surfaced rows past the reader's surface cursor) alongside the existing
+`surfaced_unacked`:
+
+```sh
+ssh hetzner-prod 'TOKEN=$(docker exec archon-app-1 printenv ARCHON_OPERATOR_TOKEN); \
+  curl -s http://localhost:3090/api/dispatch/status -H "x-archon-operator-token: $TOKEN"' \
+  | jq ".mailbox"
+```
+
+An inbox is clean for a principal only when `unread`, `surface_unread` and
+`unread_older_than_6h` are all `0`. A zero `unread` count alone is not enough.
+
+### Bounded enforce of the new rules
+
+The new triage rules ship in dry-run; the digest lists planned dispositions without writing any.
+Enabling enforce is an XO ops step after the dry-run digest is reviewed and John re-confirms the
+"drain the queue" instruction. Use the bounded procedure from the wiki tool page
+(`xo-wiki/wiki/tools/dispatch-inbox-reader/_index.md`): set `INBOX_READER_MODE=enforce` with
+`INBOX_READER_MAX_PER_RUN` capped low, recreate the container (`docker compose up -d app`),
+watch one or two runs, then revert to `INBOX_READER_MODE=dry-run` and confirm `latest.json`
+reads `"mode": "dry-run"`. Rollback is `INBOX_READER_MODE=dry-run` (dispositions) and
+`INBOX_READER_OPERATOR_OWNER=consumer` (ownership), applied by recreating the container.

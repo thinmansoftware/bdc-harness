@@ -4,7 +4,7 @@ import { removeTempDirWithRetry } from '../test/temp-dir';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { pathToFileURL } from 'url';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { SqliteAdapter } from './adapters/sqlite';
 import { setBoardPrincipalResolverForTests } from './board-authority';
 import { DispatchNonSystemCapability } from './dispatch-sender-authority';
@@ -245,7 +245,7 @@ async function makeSeparateProcessMailboxFixture(
 }
 
 describe('dispatch db', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     getDatabaseCalls = 0;
     process.env.BUN_ENV = 'test';
     setBoardPrincipalResolverForTests(async () => ({
@@ -258,6 +258,19 @@ describe('dispatch db', () => {
       `.test-dispatch-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
     );
     db = new SqliteAdapter(currentDbPath);
+    // A3 (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01): a send to a `worker_poll`
+    // agent seat is accepted only when a worker row serves it, mirroring
+    // production where each live agent worker registers via POST /api/workers.
+    // Register one such worker for the executor seats these fixtures use as
+    // generic recipients so the A3 no-consumer guard admits them; tests that
+    // assert the guard REJECTS an unserved recipient use `overseer`
+    // (notify_only, no worker), which this row does not serve.
+    await registerWorker({
+      worker_id: 'agent-seat-fixture-worker',
+      host: 'fixture-host',
+      capabilities: { providers: ['codex', 'claude', 'grok', 'fusion', 'overseer-reviewer'] },
+      max_concurrency: 4,
+    });
   });
 
   afterEach(async () => {
@@ -457,8 +470,11 @@ describe('dispatch db', () => {
       idempotency_key: 'idem-mailbox-mode',
       task_type: 'agent_message',
       sender: 'xo',
-      recipient: 'overseer',
-      body: 'Notify-only mailbox message.',
+      // operator is drain_on_start -- still a mailbox delivery mode a worker may
+      // not claim. (A send to the notify_only `overseer`, which has no consumer,
+      // is now rejected; see the recipient_has_no_consumer test below.)
+      recipient: 'operator',
+      body: 'Drain-on-start mailbox message.',
     });
 
     expect(
@@ -3324,6 +3340,274 @@ describe('dispatch db', () => {
           fenceFor('')
         )
       ).rejects.toThrow('capped_subject_fence_invalid');
+    });
+  });
+
+  // WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 Amendment A: send-time consumer
+  // guards and subject supersede.
+  describe('A3/A4 send-time guards and subject supersede', () => {
+    test('send_to_recipient_without_consumer_is_rejected', async () => {
+      // overseer: notify_only, no worker, not in the allow-list -> rejected.
+      await expect(
+        createMessage({
+          correlation_id: 'corr-no-consumer',
+          idempotency_key: 'idem-no-consumer',
+          task_type: 'agent_message',
+          sender: 'xo',
+          recipient: 'overseer',
+          body: 'nobody reads this',
+        })
+      ).rejects.toThrow('dispatch_recipient_rejected:recipient_has_no_consumer');
+
+      // A3 covers worker_poll too, not only notify_only: `cursor` is a seeded,
+      // active worker_poll seat with no registered worker and no code-level
+      // consumer, so a send to it is an unread dead queue and must be rejected.
+      // (The shared fixture worker deliberately does NOT serve `cursor`.)
+      await expect(assessDispatchRecipient('cursor')).resolves.toEqual({
+        ok: false,
+        canonical_principal: 'cursor',
+        delivery_mode: 'worker_poll',
+        reason: 'recipient_has_no_consumer',
+      });
+      await expect(
+        createMessage({
+          correlation_id: 'corr-wp-no-consumer',
+          idempotency_key: 'idem-wp-no-consumer',
+          task_type: 'agent_message',
+          sender: 'xo',
+          recipient: 'cursor',
+          body: 'no worker ever polls cursor',
+        })
+      ).rejects.toThrow('dispatch_recipient_rejected:recipient_has_no_consumer');
+
+      // overseer-reviewer: worker_poll with a registered worker naming it.
+      await registerWorker({
+        worker_id: 'overseer-reviewer-worker',
+        host: 'host',
+        capabilities: { principal: 'overseer-reviewer' },
+        max_concurrency: 1,
+      });
+      const reviewer = await createMessage({
+        correlation_id: 'corr-reviewer-ok',
+        idempotency_key: 'idem-reviewer-ok',
+        task_type: 'run_review',
+        sender: 'xo',
+        recipient: 'overseer-reviewer',
+        body: 'review work',
+      });
+      expect(reviewer.recipient).toBe('overseer-reviewer');
+
+      // xo: drain_on_start, always deliverable.
+      const xoRow = await createMessage({
+        correlation_id: 'corr-xo-ok',
+        idempotency_key: 'idem-xo-ok',
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'for xo',
+      });
+      expect(xoRow.recipient).toBe('xo');
+
+      // do: worker_poll, consumed by duty-officer-clock.ts -> deliverable.
+      const doRow = await createMessage({
+        correlation_id: 'corr-do-ok',
+        idempotency_key: 'idem-do-ok',
+        task_type: 'agent_message',
+        sender: 'xo',
+        recipient: 'do',
+        body: 'for the duty officer',
+      });
+      expect(doRow.recipient).toBe('do');
+    });
+
+    test('duty_officer_to_operator_rejected', async () => {
+      await expect(
+        createMessage({
+          correlation_id: 'corr-do-op',
+          idempotency_key: 'idem-do-op',
+          task_type: 'agent_message',
+          sender: 'duty-officer',
+          recipient: 'operator',
+          body: 'decision list to operator',
+        })
+      ).rejects.toThrow('dispatch_recipient_rejected:duty_officer_to_operator');
+
+      const toXo = await createMessage({
+        correlation_id: 'corr-do-xo',
+        idempotency_key: 'idem-do-xo',
+        task_type: 'agent_message',
+        sender: 'duty-officer',
+        recipient: 'xo',
+        body: 'decision list to xo',
+      });
+      expect(toXo.recipient).toBe('xo');
+    });
+
+    test('newer_row_supersedes_older_unread_same_subject', async () => {
+      const subject = 'gh:thinmansoftware/bdc-xo#1538';
+      const rowA = await createMessage({
+        correlation_id: 'corr-sup-a',
+        idempotency_key: 'idem-sup-a',
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'A',
+        subject_key: subject,
+      });
+      const rowB = await createMessage({
+        correlation_id: 'corr-sup-b',
+        idempotency_key: 'idem-sup-b',
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'B',
+        subject_key: subject,
+        repeat_reason: 'second row on the subject',
+      });
+      // Acknowledge B as xo, under a live lease.
+      const bind: XoLeaseBind = {
+        kind: 'xo_lease',
+        lease_id: '22222222-2222-4222-8222-222222222222',
+        fencing_token: 3,
+        holder_token_hash: createHash('sha256').update('sup-holder').digest('hex'),
+        holder_principal_id: 'xo',
+      };
+      await db.query(
+        `INSERT INTO board_xo_leases
+         (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
+          acquired_at, expires_at)
+         VALUES (1, $1, 'xo', 'xo', 'holder', $2, $3, $4, $5)`,
+        [
+          bind.lease_id,
+          bind.holder_token_hash,
+          bind.fencing_token,
+          new Date().toISOString(),
+          new Date(Date.now() + 60_000).toISOString(),
+        ]
+      );
+      expect((await acknowledgeMessage({ id: rowB.id, principal_id: 'xo', bind })).ok).toBe(true);
+
+      const rowC = await createMessage({
+        correlation_id: 'corr-sup-c',
+        idempotency_key: 'idem-sup-c',
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'C',
+        subject_key: subject,
+        repeat_reason: 'newest row on the subject',
+      });
+
+      const afterA = await getMessage(rowA.id);
+      const afterB = await getMessage(rowB.id);
+      const afterC = await getMessage(rowC.id);
+      expect(afterA?.route_disposition).toBe('superseded');
+      expect(afterA?.status).toBe('queued');
+      expect(afterA?.acknowledged_at).toBeNull();
+      expect(afterA?.addressed_at).toBeNull();
+      expect(afterB?.route_disposition).toBeNull();
+      expect(afterB?.acknowledged_at).not.toBeNull();
+      expect(afterC?.route_disposition).toBeNull();
+
+      const cancelled = await db.query<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE status = 'cancelled'"
+      );
+      expect(Number(cancelled.rows[0].n)).toBe(0);
+    });
+
+    test('blocker_not_superseded_by_normal_and_queues_untouched', async () => {
+      const subject = 'wo:WO-BLOCKER-GUARD-01';
+      const blocker = await createMessage({
+        correlation_id: 'corr-blk',
+        idempotency_key: 'idem-blk',
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'blocker',
+        subject_key: subject,
+        priority: 'blocker',
+      });
+      await createMessage({
+        correlation_id: 'corr-norm',
+        idempotency_key: 'idem-norm',
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'normal',
+        subject_key: subject,
+        priority: 'normal',
+        repeat_reason: 'normal follow-up on the subject',
+      });
+      const afterBlocker = await getMessage(blocker.id);
+      expect(afterBlocker?.route_disposition).toBeNull();
+
+      // worker_poll work queue rows on one subject are never superseded.
+      const reviewSubject = 'gh:thinmansoftware/bdc-xo#1600';
+      const review1 = await createMessage({
+        correlation_id: 'corr-rev1',
+        idempotency_key: 'idem-rev1',
+        task_type: 'run_review',
+        sender: 'overseer',
+        recipient: 'overseer-reviewer',
+        body: 'review 1',
+        subject_key: reviewSubject,
+      });
+      const review2 = await createMessage({
+        correlation_id: 'corr-rev2',
+        idempotency_key: 'idem-rev2',
+        task_type: 'run_review',
+        sender: 'overseer',
+        recipient: 'overseer-reviewer',
+        body: 'review 2',
+        subject_key: reviewSubject,
+        repeat_reason: 'second review on the subject',
+      });
+      expect((await getMessage(review1.id))?.route_disposition).toBeNull();
+      expect((await getMessage(review2.id))?.route_disposition).toBeNull();
+    });
+
+    test('idempotent_resend_supersedes_nothing', async () => {
+      const subject = 'wo:WO-RESEND-27-01';
+      // R is the pre-existing row with idempotency_key K.
+      const rowR = await createMessage({
+        correlation_id: 'corr-resend-r',
+        idempotency_key: 'idem-resend-K',
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'R',
+        subject_key: subject,
+      });
+      // Q is an older, still-unread xo row on the same subject. Two coexisting
+      // unread rows on one subject are unreachable through the normal API (A4
+      // supersedes the older on every new insert), so Q is inserted directly to
+      // construct the precondition the idempotent replay must not disturb.
+      const olderCreatedAt = new Date(Date.parse(rowR.created_at) - 60_000).toISOString();
+      const qId = randomUUID();
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id, recipient,
+          body, status, created_at, not_before, priority, fencing_token, recipient_alias, motion_id,
+          motion_revision_sha, subject_key, repeat_reason, supersedes_id, seq)
+         VALUES ($1, $2, $3, 'agent_message', 'operator', NULL, 'xo', 'Q', 'queued', $4, NULL,
+                 'normal', 0, NULL, NULL, NULL, $5, NULL, NULL,
+                 (SELECT COALESCE(MAX(COALESCE(seq, rowid)), 0) + 1 FROM agent_dispatch_messages))`,
+        [qId, 'corr-resend-q', 'idem-resend-q', olderCreatedAt, subject]
+      );
+
+      // The idempotent replay with K returns R and must supersede nothing.
+      const replay = await createMessage({
+        correlation_id: 'corr-resend-r',
+        idempotency_key: 'idem-resend-K',
+        task_type: 'agent_message',
+        sender: 'operator',
+        recipient: 'xo',
+        body: 'R',
+        subject_key: subject,
+      });
+      expect(replay.id).toBe(rowR.id);
+      expect((await getMessage(qId))?.route_disposition).toBeNull();
+      expect((await getMessage(rowR.id))?.route_disposition).toBeNull();
     });
   });
 });

@@ -14,10 +14,14 @@ import {
   type DispatchWorker,
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
-import { createLogger } from '@archon/paths';
+import { createLogger, getArchonHome } from '@archon/paths';
 import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
+import { routeOpsEvent, type OpsEvent } from './ops-event-routing';
+import { createRealOpsInboxGitHub, upsertDigestSection, type OpsInboxGitHub } from './ops-inbox';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
+import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import {
   mintAppInstallationToken,
   runSecurityDetector,
@@ -94,6 +98,16 @@ export interface DutyOfficerClockDeps {
   getWorker?: (workerId: string) => Promise<DispatchWorker | null>;
   postAlarmComment?: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
   listAlarmIssueComments?: (issue: DutyOfficerStaleIssue) => Promise<WorkerAlarmIssueComment[]>;
+  // Ops-inbox digest deps (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01). Optional so
+  // legacy fixtures compile; createRealDutyOfficerClockDeps wires real defaults.
+  opsInboxGitHub?: OpsInboxGitHub;
+  upsertDigestSection?: (
+    gh: OpsInboxGitHub,
+    dateUtc: string,
+    sectionKey: string,
+    markdown: string
+  ) => Promise<unknown>;
+  readReaderDigest?: () => Promise<unknown>;
   now?: () => Date;
 }
 
@@ -269,6 +283,21 @@ export async function postGithubIssueComment(
   );
 }
 
+/**
+ * Default reader-digest loader: reads <ARCHON_HOME>/inbox-reader/latest.json.
+ * Best-effort -- returns null on any error so the mailbox-triage section is
+ * simply omitted rather than breaking the tick.
+ */
+export async function readReaderDigestFromDisk(): Promise<unknown> {
+  try {
+    const path = join(getArchonHome(), 'inbox-reader', 'latest.json');
+    const raw = await readFile(path, 'utf8');
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return null;
+  }
+}
+
 export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
   return {
     registerWorker,
@@ -284,6 +313,9 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
     getWorker,
     postAlarmComment: postWorkerAlarmComment,
     listAlarmIssueComments: listWorkerAlarmIssueComments,
+    opsInboxGitHub: createRealOpsInboxGitHub(),
+    upsertDigestSection,
+    readReaderDigest: readReaderDigestFromDisk,
     judge: judgeDutyOfficerItem,
     securityDetector: signal =>
       runSecurityDetector(
@@ -409,34 +441,154 @@ function mechanicalVerdict(claimed: DispatchMessage): DutyOfficerJudgeVerdict {
   };
 }
 
-async function escalateToXo(
+/**
+ * Per-tick accumulator for batched ops-inbox digest lines. Routine and escalated
+ * lines are collected across every claimed message and flushed with one
+ * upsertDigestSection call per section at the end of the queued-message loop.
+ */
+interface DutyOfficerTickContext {
+  routineLines: string[];
+  escalatedLines: string[];
+}
+
+function newTickContext(): DutyOfficerTickContext {
+  return { routineLines: [], escalatedLines: [] };
+}
+
+function utcDate(now: Date): string {
+  return now.toISOString().slice(0, 10);
+}
+
+/**
+ * Route a claimed item through the ops-event router. ROUTINE items push one line
+ * into the per-tick routine accumulator (no Dispatch row). NEEDS_A_PERSON and
+ * BLOCKER items create exactly one recipient 'xo' ops_interrupt row.
+ */
+async function routeAndEscalate(
   deps: DutyOfficerClockDeps,
   claimed: DispatchMessage,
   verdict: DutyOfficerJudgeVerdict,
+  ctx: DutyOfficerTickContext,
   excerptLimit = 500
 ): Promise<void> {
   const excerpt = (verdict.body || claimed.body).slice(0, excerptLimit);
+  const event: OpsEvent = {
+    sender: claimed.sender,
+    task_type: claimed.task_type,
+    priority: claimed.priority,
+    body: verdict.body || claimed.body,
+    subject_key: claimed.subject_key,
+    taskmaster_blocker_report: isTaskmasterBlockerReport(claimed),
+  };
+  const routed = routeOpsEvent(event, { now: deps.now?.() ?? new Date() });
+
+  if (routed.destination === 'digest') {
+    // ROUTINE: no Dispatch row. Accumulate one line; flushed once per tick.
+    const item = claimed.subject_key ?? claimed.id;
+    ctx.routineLines.push(`- ${claimed.id} [${item}] ${routed.reason}`);
+    return;
+  }
+
+  // interrupt (NEEDS_A_PERSON or BLOCKER): exactly one recipient 'xo' row.
   const subjectKey = escalationSubjectKey(claimed.subject_key);
+  const item = claimed.subject_key ?? subjectKey ?? claimed.id;
   await deps.createAuthenticatedMessage(DUTY_OFFICER_SENDER, {
     correlation_id: claimed.correlation_id || `do-clock:${claimed.id}`,
     idempotency_key: `do-clock-escalation:${claimed.id}`,
     task_type: 'agent_message',
     recipient: 'xo',
-    priority: claimed.priority === 'blocker' ? 'blocker' : 'normal',
+    priority: routed.class === 'BLOCKER' ? 'blocker' : 'normal',
     body: JSON.stringify({
-      kind: 'duty_officer_escalation',
+      kind: 'ops_interrupt',
+      class: routed.class,
+      item,
+      default_if_unanswered: routed.default_if_unanswered,
       source_id: claimed.id,
       task_type: claimed.task_type,
-      subject_key: claimed.subject_key,
-      thread_ref: claimed.subject_key,
-      transport: verdict.transport ?? null,
-      reason: verdict.reason,
+      reason: routed.reason,
       excerpt,
     }),
     ...(subjectKey
       ? { subject_key: subjectKey, repeat_reason: `duty_officer_clock:${claimed.id}` }
       : {}),
   });
+}
+
+/**
+ * Parse an owner_ack_overdue control message. Returns the overdue_recipient when
+ * the claimed body is JSON with kind "owner_ack_overdue", otherwise null.
+ */
+function parseOwnerAckOverdue(body: string): { overdue_recipient: string | null } | null {
+  try {
+    const parsed = JSON.parse(body) as { kind?: unknown; overdue_recipient?: unknown };
+    if (parsed.kind !== 'owner_ack_overdue') return null;
+    return {
+      overdue_recipient:
+        typeof parsed.overdue_recipient === 'string' ? parsed.overdue_recipient : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Flush accumulated routine and escalated digest lines with one
+ * upsertDigestSection call per non-empty section. Guarded: a GitHub failure
+ * logs and never breaks the tick.
+ */
+async function flushDigestSections(
+  deps: DutyOfficerClockDeps,
+  ctx: DutyOfficerTickContext,
+  now: Date
+): Promise<void> {
+  const gh = deps.opsInboxGitHub;
+  const upsert = deps.upsertDigestSection;
+  if (!gh || !upsert) return;
+  const dateUtc = utcDate(now);
+  if (ctx.routineLines.length > 0) {
+    try {
+      await upsert(gh, dateUtc, 'routine', ctx.routineLines.join('\n'));
+    } catch (error) {
+      log.error({ err: error }, 'duty_officer_routine_digest_failed');
+    }
+  }
+  if (ctx.escalatedLines.length > 0) {
+    try {
+      await upsert(gh, dateUtc, 'escalated', ctx.escalatedLines.join('\n'));
+    } catch (error) {
+      log.error({ err: error }, 'duty_officer_escalated_digest_failed');
+    }
+  }
+}
+
+/**
+ * Fill the daily mailbox-triage section from the reader's latest digest. Purely
+ * best-effort: any error (missing dep, bad JSON, GitHub failure) is swallowed so
+ * the tick continues. No test covers this path.
+ */
+async function fillMailboxTriageSection(deps: DutyOfficerClockDeps, now: Date): Promise<void> {
+  const gh = deps.opsInboxGitHub;
+  const upsert = deps.upsertDigestSection;
+  const read = deps.readReaderDigest;
+  if (!gh || !upsert || !read) return;
+  try {
+    const digest = await read();
+    if (!digest || typeof digest !== 'object') return;
+    const record = digest as Record<string, unknown>;
+    const bring = Array.isArray(record.bring) ? record.bring.length : countField(record.bring);
+    const actionable = Array.isArray(record.actionable)
+      ? record.actionable.length
+      : countField(record.actionable);
+    const markdown = `- bring: ${bring}\n- actionable: ${actionable}`;
+    await upsert(gh, utcDate(now), 'mailbox-triage', markdown);
+  } catch (error) {
+    log.error({ err: error }, 'duty_officer_mailbox_triage_failed');
+  }
+}
+
+function countField(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  return 0;
 }
 
 function holdBackoffMs(): number {
@@ -452,23 +604,60 @@ async function holdItem(deps: DutyOfficerClockDeps, claimed: DispatchMessage): P
   });
 }
 
-async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessage): Promise<void> {
-  // A Taskmaster blocker_report is relayed to the XO once, WITHOUT the judge
-  // (zero LLM): the report is already content-complete and its whole purpose is
-  // to reach the XO via this clock. A failed relay holds the item and retries
-  // with the same escalation key, so the XO gets exactly one copy.
+async function handleClaimed(
+  deps: DutyOfficerClockDeps,
+  claimed: DispatchMessage,
+  ctx: DutyOfficerTickContext
+): Promise<void> {
+  // An owner_ack_overdue control message is logged to the day's `escalated`
+  // digest section. If the overdue recipient is already 'xo' there is nothing to
+  // escalate (the item is already on the XO's plate), so no second xo row is
+  // created. Then the item is finished.
+  const overdue = parseOwnerAckOverdue(claimed.body);
+  if (overdue) {
+    const item = claimed.subject_key ?? claimed.id;
+    ctx.escalatedLines.push(
+      `- ${claimed.id} [${item}] owner_ack_overdue recipient=${overdue.overdue_recipient ?? 'unknown'}`
+    );
+    if (overdue.overdue_recipient !== 'xo') {
+      try {
+        const verdict: DutyOfficerJudgeVerdict = {
+          status: 'unconfigured',
+          action: 'escalate_xo',
+          reason: 'owner_ack_overdue',
+          body: claimed.body,
+          failures: [],
+        };
+        await routeAndEscalate(deps, claimed, verdict, ctx);
+      } catch (error) {
+        log.error({ err: error, messageId: claimed.id }, 'duty_officer_overdue_escalate_failed');
+        await holdItem(deps, claimed);
+        return;
+      }
+    }
+    await finishItem(deps, claimed, 'done', 'succeeded', {
+      disposition: 'owner_ack_overdue_logged',
+    });
+    return;
+  }
+
+  // A Taskmaster blocker_report routes through the ops-event table (which marks
+  // it BLOCKER via taskmaster_blocker_report) WITHOUT the judge (zero LLM): the
+  // report is already content-complete and its whole purpose is to reach the XO
+  // via this clock. A failed relay holds the item and retries with the same
+  // escalation key, so the XO gets exactly one copy.
   if (isTaskmasterBlockerReport(claimed)) {
     const verdict: DutyOfficerJudgeVerdict = {
       status: 'unconfigured',
       action: 'escalate_xo',
       reason: 'taskmaster_blocker_report',
       // Full source body (<=500 chars by construction; capped at 2000 in
-      // escalateToXo defensively).
+      // routeAndEscalate defensively).
       body: claimed.body,
       failures: [],
     };
     try {
-      await escalateToXo(deps, claimed, verdict, 2000);
+      await routeAndEscalate(deps, claimed, verdict, ctx, 2000);
     } catch (error) {
       log.error({ err: error, messageId: claimed.id }, 'duty_officer_blocker_report_relay_failed');
       await holdItem(deps, claimed);
@@ -491,7 +680,7 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
       isTaskmasterSelfPause(claimed);
     if (copyToXo) {
       try {
-        await escalateToXo(deps, claimed, verdict);
+        await routeAndEscalate(deps, claimed, verdict, ctx);
       } catch (error) {
         log.error({ err: error, messageId: claimed.id }, 'duty_officer_taskmaster_copy_failed');
         await holdItem(deps, claimed);
@@ -508,7 +697,13 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
     verdict = mechanicalVerdict(claimed);
   }
   if (verdict.action === 'escalate_xo') {
-    await escalateToXo(deps, claimed, verdict);
+    try {
+      await routeAndEscalate(deps, claimed, verdict, ctx);
+    } catch (error) {
+      log.error({ err: error, messageId: claimed.id }, 'duty_officer_escalate_failed');
+      await holdItem(deps, claimed);
+      return;
+    }
     await finishItem(deps, claimed, 'done', 'succeeded', {
       disposition: 'escalated_to_xo',
       transport: verdict.transport ?? null,
@@ -567,6 +762,7 @@ export async function tickDutyOfficerClock(
       log.warn('duty_officer_clock_lease_empty');
     }
 
+    const tickCtx = newTickContext();
     const seen = new Set<string>();
     for (const recipient of DUTY_OFFICER_RECIPIENTS) {
       const queued = await deps.listMessages({ recipient, status: 'queued' });
@@ -579,12 +775,18 @@ export async function tickDutyOfficerClock(
             worker_id: DUTY_OFFICER_WORKER_ID,
           });
           if (!claimed) continue;
-          await handleClaimed(deps, claimed);
+          await handleClaimed(deps, claimed, tickCtx);
         } catch (error) {
           log.error({ err: error, messageId: message.id }, 'duty_officer_work_item_failed');
         }
       }
     }
+
+    // Flush the batched digest sections once per tick (not once per message), and
+    // fill the best-effort mailbox-triage summary from the reader's latest digest.
+    const digestNow = deps.now?.() ?? new Date();
+    await flushDigestSections(deps, tickCtx, digestNow);
+    await fillMailboxTriageSection(deps, digestNow);
 
     try {
       const detectorResult = await detectorDeadline(deps);

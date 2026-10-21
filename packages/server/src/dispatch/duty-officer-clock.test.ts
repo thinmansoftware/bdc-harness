@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
+import { resetOpsRouteSuppressionForTests } from './ops-event-routing';
+import type { OpsInboxGitHub } from './ops-inbox';
 import {
   resetSecurityDetectorStateForTests,
   runSecurityDetector,
@@ -67,15 +69,37 @@ function message(overrides: Partial<DispatchMessage> & { id: string }): Dispatch
   };
 }
 
+/** Records every upsertDigestSection write so tests can assert section contents. */
+interface SectionWrite {
+  dateUtc: string;
+  sectionKey: string;
+  markdown: string;
+}
+
+function fakeOpsInbox(): OpsInboxGitHub {
+  return {
+    findOpenIssueByLabel: mock(async () => ({ number: 1 })),
+    labelExists: mock(async () => true),
+    createLabel: mock(async () => {}),
+    createIssue: mock(async () => ({ number: 1 })),
+    listComments: mock(async () => []),
+    createComment: mock(async () => ({ id: 1 })),
+    updateComment: mock(async () => {}),
+  };
+}
+
 function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
   llm: ReturnType<typeof mock>;
+  sectionWrites: SectionWrite[];
 } {
   const terminal = new Set<string>();
+  const sectionWrites: SectionWrite[] = [];
   const llm = mock(async () => {
     throw new Error('llm_must_not_run');
   });
   return {
     llm,
+    sectionWrites,
     registerWorker: mock(async data => ({
       ...data,
       status: 'available' as const,
@@ -128,6 +152,12 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
     postIssueComment: mock(async () => {
       throw new Error('github_must_not_run_without_nudge_flag');
     }),
+    opsInboxGitHub: fakeOpsInbox(),
+    upsertDigestSection: mock(async (_gh, dateUtc, sectionKey, markdown) => {
+      sectionWrites.push({ dateUtc, sectionKey, markdown });
+      return { issueNumber: 1, commentId: 1, created: false };
+    }),
+    readReaderDigest: mock(async () => null),
     judge: mock(async (item: DispatchMessage) => ({
       status: 'ok' as const,
       transport: 'test',
@@ -139,6 +169,47 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
     securityDetector: mock(async () => null),
   };
 }
+
+/** Count recipient 'xo' rows created via createAuthenticatedMessage. */
+function xoRowCount(deps: DutyOfficerClockDeps): number {
+  const calls = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
+    .mock.calls;
+  return calls.filter(c => (c[1] as { recipient?: string }).recipient === 'xo').length;
+}
+
+/** The parsed body of the Nth recipient 'xo' row. */
+function xoRowBody(deps: DutyOfficerClockDeps, n = 0): Record<string, unknown> {
+  const calls = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
+    .mock.calls;
+  const xo = calls.filter(c => (c[1] as { recipient?: string }).recipient === 'xo');
+  return JSON.parse((xo[n][1] as { body: string }).body) as Record<string, unknown>;
+}
+
+/** The priority of the Nth recipient 'xo' row. */
+function xoRowPriority(deps: DutyOfficerClockDeps, n = 0): string {
+  const calls = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
+    .mock.calls;
+  const xo = calls.filter(c => (c[1] as { recipient?: string }).recipient === 'xo');
+  return (xo[n][1] as { priority: string }).priority;
+}
+
+function routineLines(deps: DutyOfficerClockDeps & { sectionWrites: SectionWrite[] }): string[] {
+  return deps.sectionWrites
+    .filter(w => w.sectionKey === 'routine')
+    .flatMap(w => w.markdown.split('\n'))
+    .filter(line => line.trim().length > 0);
+}
+
+function sectionWritesFor(
+  deps: DutyOfficerClockDeps & { sectionWrites: SectionWrite[] },
+  sectionKey: string
+): SectionWrite[] {
+  return deps.sectionWrites.filter(w => w.sectionKey === sectionKey);
+}
+
+beforeEach(() => {
+  resetOpsRouteSuppressionForTests();
+});
 
 afterEach(() => {
   stopDutyOfficerClock();
@@ -340,42 +411,6 @@ describe('duty officer clock', () => {
     });
   });
 
-  test('escalates a queued run_report to xo with no LLM and no GitHub call', async () => {
-    const queued = [message({ id: 'one' })];
-    const deps = fakeDeps(queued);
-    const previousGh = process.env.GH_TOKEN;
-    const previousGithub = process.env.GITHUB_TOKEN;
-    delete process.env.GH_TOKEN;
-    delete process.env.GITHUB_TOKEN;
-
-    await tickDutyOfficerClock(deps);
-    await tickDutyOfficerClock(deps);
-
-    expect(deps.claimMessage).toHaveBeenCalled();
-    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
-    const createCall = (
-      deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
-    ).mock.calls[0];
-    expect(createCall[0]).toEqual({ kind: 'system', sender: 'dispatch' });
-    expect(createCall[1]).toEqual(
-      expect.objectContaining({
-        recipient: 'xo',
-        task_type: 'agent_message',
-        correlation_id: 'correlation-one',
-        idempotency_key: 'do-clock-escalation:one',
-      })
-    );
-    expect(deps.postResult).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'one', status: 'done', task_outcome: 'succeeded' })
-    );
-    expect(deps.llm).not.toHaveBeenCalled();
-    expect(deps.listStaleIssues).not.toHaveBeenCalled();
-    expect(deps.postIssueComment).not.toHaveBeenCalled();
-
-    if (previousGh !== undefined) process.env.GH_TOKEN = previousGh;
-    if (previousGithub !== undefined) process.env.GITHUB_TOKEN = previousGithub;
-  });
-
   test('startDutyOfficerClock is a no-op in test env and when disabled', async () => {
     const deps = fakeDeps([message({ id: 'never' })]);
     const originalNodeEnv = process.env.NODE_ENV;
@@ -413,7 +448,7 @@ describe('duty officer clock', () => {
 
     await tickDutyOfficerClock(deps);
 
-    expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
+    expect(xoRowCount(deps)).toBe(0);
     expect(deps.postResult).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'digest', status: 'done', task_outcome: 'succeeded' })
     );
@@ -445,76 +480,11 @@ describe('duty officer clock', () => {
 
     await tickDutyOfficerClock(deps);
 
-    expect(deps.createAuthenticatedMessage).not.toHaveBeenCalled();
+    expect(xoRowCount(deps)).toBe(0);
     expect(deps.postResult).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'digest-nudge', status: 'done', task_outcome: 'succeeded' })
     );
     expect(deps.releaseMessage).not.toHaveBeenCalled();
-  });
-
-  test('Taskmaster self-pause copies to xo then succeeds the source row', async () => {
-    const queued = [
-      message({
-        id: 'pause',
-        correlation_id: 'tm-self-pause-3',
-        idempotency_key: 'tm:self-pause:3',
-        task_type: 'agent_message',
-        sender: 'taskmaster',
-        subject_key: 'taskmaster:self-pause',
-        body: 'Taskmaster self-paused',
-      }),
-    ];
-    const deps = fakeDeps(queued);
-
-    await tickDutyOfficerClock(deps);
-
-    const createCall = (
-      deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
-    ).mock.calls[0];
-    expect(createCall[0]).toEqual({ kind: 'system', sender: 'dispatch' });
-    expect(createCall[1]).toEqual(
-      expect.objectContaining({
-        recipient: 'xo',
-        correlation_id: 'tm-self-pause-3',
-      })
-    );
-    expect((createCall[1] as { subject_key?: string }).subject_key).toBeUndefined();
-    expect(deps.postResult).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'pause', status: 'done', task_outcome: 'succeeded' })
-    );
-    expect(deps.releaseMessage).not.toHaveBeenCalled();
-  });
-
-  test('judge-disabled mechanical path copies self-pause to xo without a subject_key', async () => {
-    const queued = [
-      message({
-        id: 'pause-mech',
-        correlation_id: 'tm-self-pause-4',
-        idempotency_key: 'tm:self-pause:4',
-        task_type: 'agent_message',
-        sender: 'taskmaster',
-        subject_key: 'taskmaster:self-pause',
-        body: 'Taskmaster self-paused',
-      }),
-    ];
-    const deps = fakeDeps(queued);
-    deps.judge = mock(async () => ({
-      status: 'unconfigured' as const,
-      action: 'hold' as const,
-      reason: 'judge_disabled',
-      body: '',
-      failures: [],
-    }));
-
-    await tickDutyOfficerClock(deps);
-
-    const payload = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
-      .mock.calls[0][1] as { recipient: string; subject_key?: string };
-    expect(payload.recipient).toBe('xo');
-    expect(payload.subject_key).toBeUndefined();
-    expect(deps.postResult).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'pause-mech', status: 'done', task_outcome: 'succeeded' })
-    );
   });
 
   test('opt-in GitHub nudge posts stale issues; foreign repos are refused', async () => {
@@ -539,57 +509,25 @@ describe('duty officer clock', () => {
     expect(githubIssueInAllowList({ owner: 'other', repo: 'bdc-xo', number: 1 })).toBe(false);
   });
 
-  test('judge outage on a run_report still mechanical-escalates to xo', async () => {
-    const queued = [message({ id: 'outage' })];
-    const deps = fakeDeps(queued);
-    deps.judge = mock(async () => ({
-      status: 'failed' as const,
-      action: 'hold' as const,
-      reason: 'duty_officer_judge_outage',
-      body: 'DO judge outage',
-      failures: [{ transport: 'openrouter:x-ai/grok-4.6', error: '402' }],
-    }));
-
-    await tickDutyOfficerClock(deps);
-
-    expect(deps.createAuthenticatedMessage).toHaveBeenCalledWith(
-      { kind: 'system', sender: 'dispatch' },
-      expect.objectContaining({ recipient: 'xo', idempotency_key: 'do-clock-escalation:outage' })
-    );
-    expect(deps.postResult).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'outage', status: 'done', task_outcome: 'succeeded' })
-    );
-    expect(deps.releaseMessage).not.toHaveBeenCalled();
-  });
-
-  test('self-pause is held when the xo copy throws so Taskmaster can retry', async () => {
-    const queued = [
-      message({
-        id: 'pause-fail',
-        correlation_id: 'tm-self-pause-5',
-        idempotency_key: 'tm:self-pause:5',
-        task_type: 'agent_message',
-        sender: 'taskmaster',
-        subject_key: 'taskmaster:self-pause',
-        body: 'Taskmaster self-paused',
-      }),
-    ];
-    const deps = fakeDeps(queued);
-    deps.createAuthenticatedMessage = mock(async () => {
-      throw new Error('dispatch_unavailable');
-    });
-
-    await tickDutyOfficerClock(deps);
-
-    expect(deps.releaseMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ id: 'pause-fail', worker_id: 'duty-officer-clock' })
-    );
-    expect(deps.postResult).not.toHaveBeenCalled();
-  });
-
   test('never resolving detector does not wedge tick', async () => {
-    const queued = [message({ id: 'detector-timeout' })];
+    // A NEEDS_A_PERSON interrupt item so each tick creates exactly one xo row.
+    const interruptMsg = (id: string): DispatchMessage =>
+      message({
+        id,
+        task_type: 'agent_message',
+        sender: 'overseer',
+        body: 'decision needed: approve deploy',
+      });
+    const queued = [interruptMsg('detector-timeout')];
     const deps = fakeDeps(queued);
+    deps.judge = mock(async (item: DispatchMessage) => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: 'escalate_xo' as const,
+      reason: 'test',
+      body: item.body,
+      failures: [],
+    }));
     let finish!: () => void;
     let receivedSignal: AbortSignal | undefined;
     deps.securityDetector = mock(signal => {
@@ -612,14 +550,14 @@ describe('duty officer clock', () => {
     try {
       await tickDutyOfficerClock(deps);
       expect(receivedSignal?.aborted).toBe(true);
-      queued.push(message({ id: 'after-detector-timeout' }));
+      queued.push(interruptMsg('after-detector-timeout'));
       await tickDutyOfficerClock({ ...deps });
       expect(deps.securityDetector).toHaveBeenCalledTimes(1);
       expect(
         lines.some(line => line.includes('duty_officer_security_detector_skipped_in_flight'))
       ).toBe(true);
       expect(deps.listMessages).toHaveBeenCalledTimes(4);
-      expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(2);
+      expect(xoRowCount(deps)).toBe(2);
       expect(deps.judge).toHaveBeenCalledTimes(2);
       expect(deps.llm).not.toHaveBeenCalled();
     } finally {
@@ -667,113 +605,289 @@ describe('duty officer clock', () => {
     );
   });
 
-  test('blocker_report: clock relays a Taskmaster blocker report to xo once, without the judge', async () => {
-    const blockerMsg = message({
-      id: 'br-1',
-      sender: 'taskmaster',
-      task_type: 'agent_message',
-      idempotency_key: 'tm:blocker_report:gh:thinmansoftware/bdc-xo#2274:7',
-      subject_key: 'gh:thinmansoftware/bdc-xo#2274',
-      correlation_id: 'tm-journal-br-1',
-      body:
-        'Blocker report (P1): "WO-X-01 fix" -- owner: UNASSIGNED. Blocked: no named blocker. ' +
-        'State: labelled blocked for 3h. https://github.com/thinmansoftware/bdc-xo/issues/2274',
-    });
-    const deps = fakeDeps([blockerMsg]);
-    deps.judge = mock(async () => {
-      throw new Error('judge_must_not_run');
-    });
+  // --- WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01 routing tests ---
+
+  test('Test 1 routine_events_land_in_digest_only', async () => {
+    const routineFixtures: DispatchMessage[] = [
+      message({ id: 'r-run-finished', task_type: 'agent_message', body: 'run finished cleanly' }),
+      message({
+        id: 'r-run-failed-retry',
+        task_type: 'agent_message',
+        body: 'run failed; retry scheduled',
+      }),
+      message({ id: 'r-pr-opened', task_type: 'agent_message', body: 'PR opened for review' }),
+      message({ id: 'r-checks-green', task_type: 'agent_message', body: 'checks green on main' }),
+      message({
+        id: 'r-rate-limit',
+        task_type: 'agent_message',
+        body: 'rate-limit window reset',
+      }),
+      message({ id: 'r-session', task_type: 'agent_message', body: 'session archived' }),
+    ];
+    const deps = fakeDeps(routineFixtures);
+    // Judge returns escalate_xo but the ops-event router reclassifies to ROUTINE.
+    deps.judge = mock(async (item: DispatchMessage) => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: 'escalate_xo' as const,
+      reason: 'test',
+      body: item.body,
+      failures: [],
+    }));
 
     await tickDutyOfficerClock(deps);
-    await tickDutyOfficerClock(deps);
 
-    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
-    const call = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
-      .mock.calls[0];
-    const data = call[1] as {
-      recipient: string;
-      idempotency_key: string;
-      priority: string;
-      subject_key?: string;
-      body: string;
-    };
-    expect(data.recipient).toBe('xo');
-    expect(data.idempotency_key).toBe('do-clock-escalation:br-1');
-    expect(data.priority).toBe('normal');
-    expect(data.subject_key).toBe('gh:thinmansoftware/bdc-xo#2274');
-    const parsed = JSON.parse(data.body) as {
-      reason: string;
-      thread_ref: string;
-      excerpt: string;
-    };
-    expect(parsed.reason).toBe('taskmaster_blocker_report');
-    expect(parsed.thread_ref).toBe('gh:thinmansoftware/bdc-xo#2274');
-    expect(parsed.excerpt).toBe(blockerMsg.body);
-
-    const resultCall = (deps.postResult as unknown as { mock: { calls: unknown[][] } }).mock
-      .calls[0][0] as { id: string; status: string; task_outcome: string; result_body: string };
-    expect(resultCall.id).toBe('br-1');
-    expect(resultCall.status).toBe('done');
-    expect(resultCall.task_outcome).toBe('succeeded');
-    expect(JSON.parse(resultCall.result_body).disposition).toBe(
-      'taskmaster_blocker_report_relayed'
-    );
-    expect(deps.judge).not.toHaveBeenCalled();
+    expect(xoRowCount(deps)).toBe(0);
+    expect(routineLines(deps)).toHaveLength(6);
+    // Exactly one upsertDigestSection call for the routine section (batched).
+    expect(sectionWritesFor(deps, 'routine')).toHaveLength(1);
+    for (const fixture of routineFixtures) {
+      expect(routineLines(deps).some(line => line.includes(fixture.id))).toBe(true);
+    }
   });
 
-  test('blocker_report: failed relay is held and retried without a double send', async () => {
-    const blockerMsg = message({
-      id: 'br-2',
+  test('Test 2 needs_person_interrupts_naming_item_and_default', async () => {
+    const queued = [
+      message({
+        id: 'np-1',
+        task_type: 'agent_message',
+        subject_key: 'gh:thinmansoftware/bdc-xo#1538',
+        body: 'decision needed: approve deploy for gh:thinmansoftware/bdc-xo#1538',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    deps.judge = mock(async (item: DispatchMessage) => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: 'escalate_xo' as const,
+      reason: 'test',
+      body: item.body,
+      failures: [],
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    expect(xoRowCount(deps)).toBe(1);
+    expect(xoRowPriority(deps)).toBe('normal');
+    const body = xoRowBody(deps);
+    expect(body.kind).toBe('ops_interrupt');
+    expect(body.class).toBe('NEEDS_A_PERSON');
+    expect(body.item).toBe('gh:thinmansoftware/bdc-xo#1538');
+    expect(typeof body.default_if_unanswered).toBe('string');
+    expect((body.default_if_unanswered as string).length).toBeGreaterThan(0);
+    expect(routineLines(deps)).toHaveLength(0);
+  });
+
+  test('Test 3 blocker_interrupts_with_blocker_priority', async () => {
+    const blockerReport = message({
+      id: 'b-tm-report',
       sender: 'taskmaster',
       task_type: 'agent_message',
-      idempotency_key: 'tm:blocker_report:gh:thinmansoftware/bdc-xo#2275:7',
-      subject_key: 'gh:thinmansoftware/bdc-xo#2275',
-      body:
-        'Blocker report (P1): "WO-Y-02 fix" -- owner: UNASSIGNED. Blocked: no named blocker. ' +
-        'State: labelled blocked for 4h. https://github.com/thinmansoftware/bdc-xo/issues/2275',
+      idempotency_key: 'tm:blocker_report:gh:thinmansoftware/bdc-xo#9001:1',
+      subject_key: 'gh:thinmansoftware/bdc-xo#9001',
+      body: 'Blocker report (P1): WO-Z-01 stuck.',
     });
-    const digestMsg = message({
-      id: 'dg-1',
-      sender: 'taskmaster',
+    const securityMsg = message({
+      id: 'b-security',
       task_type: 'agent_message',
-      idempotency_key: 'tm:digest:2026-10-05',
-      subject_key: 'digest:2026-10-05',
-      body: 'sent=0, parked=0',
+      sender: 'overseer',
+      subject_key: 'gh:thinmansoftware/bdc-xo#9002',
+      body: 'service_role key exposed in logs',
     });
-    const deps = fakeDeps([blockerMsg, digestMsg]);
+    const deps = fakeDeps([blockerReport, securityMsg]);
+    deps.judge = mock(async (item: DispatchMessage) => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: 'escalate_xo' as const,
+      reason: 'test',
+      body: item.body,
+      failures: [],
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    expect(xoRowCount(deps)).toBe(2);
+    const calls = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls;
+    for (const call of calls) {
+      const data = call[1] as { priority: string; body: string };
+      expect(data.priority).toBe('blocker');
+      expect((JSON.parse(data.body) as { class: string }).class).toBe('BLOCKER');
+    }
+    expect(routineLines(deps)).toHaveLength(0);
+  });
+
+  test('Test 4 each_fixture_lands_in_exactly_one_place', async () => {
+    const routineFixtures: DispatchMessage[] = [
+      message({ id: 'r-run-finished', task_type: 'agent_message', body: 'run finished cleanly' }),
+      message({
+        id: 'r-run-failed-retry',
+        task_type: 'agent_message',
+        body: 'run failed; retry scheduled',
+      }),
+      message({ id: 'r-pr-opened', task_type: 'agent_message', body: 'PR opened for review' }),
+      message({ id: 'r-checks-green', task_type: 'agent_message', body: 'checks green on main' }),
+      message({ id: 'r-rate-limit', task_type: 'agent_message', body: 'rate-limit window reset' }),
+      message({ id: 'r-session', task_type: 'agent_message', body: 'session archived' }),
+    ];
+    const interruptFixtures: DispatchMessage[] = [
+      message({
+        id: 'np-1',
+        task_type: 'agent_message',
+        subject_key: 'gh:thinmansoftware/bdc-xo#1538',
+        body: 'decision needed: approve deploy for gh:thinmansoftware/bdc-xo#1538',
+      }),
+      message({
+        id: 'b-tm-report',
+        sender: 'taskmaster',
+        task_type: 'agent_message',
+        idempotency_key: 'tm:blocker_report:gh:thinmansoftware/bdc-xo#9001:1',
+        subject_key: 'gh:thinmansoftware/bdc-xo#9001',
+        body: 'Blocker report (P1): WO-Z-01 stuck.',
+      }),
+      message({
+        id: 'b-security',
+        task_type: 'agent_message',
+        sender: 'overseer',
+        subject_key: 'gh:thinmansoftware/bdc-xo#9002',
+        body: 'service_role key exposed in logs',
+      }),
+    ];
+    const all = [...routineFixtures, ...interruptFixtures];
+    const deps = fakeDeps(all);
+    deps.judge = mock(async (item: DispatchMessage) => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: 'escalate_xo' as const,
+      reason: 'test',
+      body: item.body,
+      failures: [],
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    // 6 routine -> digest lines, 3 interrupts -> xo rows. Each exactly one place.
+    expect(routineLines(deps)).toHaveLength(6);
+    expect(xoRowCount(deps)).toBe(3);
+    // No routine fixture produced an xo row.
+    const xoCalls = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls;
+    const xoSourceIds = xoCalls.map(
+      c => (JSON.parse((c[1] as { body: string }).body) as { source_id: string }).source_id
+    );
+    for (const fixture of routineFixtures) {
+      expect(xoSourceIds).not.toContain(fixture.id);
+      expect(routineLines(deps).some(line => line.includes(fixture.id))).toBe(true);
+    }
+    for (const fixture of interruptFixtures) {
+      expect(xoSourceIds).toContain(fixture.id);
+      expect(routineLines(deps).some(line => line.includes(fixture.id))).toBe(false);
+    }
+  });
+
+  test('Test 15 duty_officer_escalation_routine_never_creates_xo_row', async () => {
+    const queued = [
+      message({
+        id: 'do-routine',
+        task_type: 'agent_message',
+        sender: 'overseer',
+        body: 'run finished cleanly, nothing to see here',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    // The DO judge says escalate, but the ops-event router classifies ROUTINE.
+    deps.judge = mock(async (item: DispatchMessage) => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: 'escalate_xo' as const,
+      reason: 'test',
+      body: item.body,
+      failures: [],
+    }));
+
+    await tickDutyOfficerClock(deps);
+
+    const calls = (deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls;
+    const xoOrOperator = calls.filter(c => {
+      const recipient = (c[1] as { recipient?: string }).recipient;
+      return recipient === 'xo' || recipient === 'operator';
+    });
+    expect(xoOrOperator).toHaveLength(0);
+    expect(routineLines(deps).some(line => line.includes('do-routine'))).toBe(true);
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'do-routine', status: 'done', task_outcome: 'succeeded' })
+    );
+  });
+
+  test('interrupt relay failure holds the item and retries with the same escalation key', async () => {
+    const queued = [
+      message({
+        id: 'np-fail',
+        task_type: 'agent_message',
+        subject_key: 'gh:thinmansoftware/bdc-xo#1600',
+        body: 'decision needed: approve rotation',
+      }),
+    ];
+    const deps = fakeDeps(queued);
+    deps.judge = mock(async (item: DispatchMessage) => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: 'escalate_xo' as const,
+      reason: 'test',
+      body: item.body,
+      failures: [],
+    }));
     let relayCalls = 0;
     deps.createAuthenticatedMessage = mock(async (_context, data) => {
       relayCalls += 1;
-      if (relayCalls === 1 && data.idempotency_key === 'do-clock-escalation:br-2') {
-        throw new Error('relay_failed_once');
-      }
+      if (relayCalls === 1) throw new Error('dispatch_unavailable');
+      if (data.subject_key != null) normalizeDispatchSubjectKey(data.subject_key);
       return { id: 'xo-msg' };
     });
 
     // Tick 1: relay throws -> item held (releaseMessage), not finished.
     await tickDutyOfficerClock(deps);
-    expect(deps.releaseMessage).toHaveBeenCalledWith(expect.objectContaining({ id: 'br-2' }));
-    const postedAfter1 = (
-      deps.postResult as unknown as { mock: { calls: unknown[][] } }
-    ).mock.calls.map(c => (c[0] as { id: string }).id);
-    expect(postedAfter1).not.toContain('br-2');
-    // The digest in the same fixture is finished as a plain mailbox item, NOT relayed.
-    const dgCall = (deps.postResult as unknown as { mock: { calls: unknown[][] } }).mock.calls.find(
-      c => (c[0] as { id: string }).id === 'dg-1'
-    )![0] as { result_body: string };
-    expect(JSON.parse(dgCall.result_body).disposition).toBe('taskmaster_mailbox');
+    expect(deps.releaseMessage).toHaveBeenCalledWith(expect.objectContaining({ id: 'np-fail' }));
+    const postedAfter1 = (deps.postResult as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls;
+    expect(postedAfter1).toHaveLength(0);
 
-    // Tick 2: the message becomes claimable again and relays once with the SAME key.
+    // Tick 2: claimable again, relays once with the SAME escalation key.
     await tickDutyOfficerClock(deps);
-    const brRelays = (
+    const keys = (
       deps.createAuthenticatedMessage as unknown as { mock: { calls: unknown[][] } }
-    ).mock.calls.filter(
-      c => (c[1] as { idempotency_key: string }).idempotency_key === 'do-clock-escalation:br-2'
+    ).mock.calls.map(c => (c[1] as { idempotency_key: string }).idempotency_key);
+    expect(keys).toEqual(['do-clock-escalation:np-fail', 'do-clock-escalation:np-fail']);
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'np-fail', status: 'done', task_outcome: 'succeeded' })
     );
-    expect(brRelays).toHaveLength(2); // one throw + one success, same key -> XO gets exactly one copy
-    const br2Finish = (
-      deps.postResult as unknown as { mock: { calls: unknown[][] } }
-    ).mock.calls.find(c => (c[0] as { id: string }).id === 'br-2')![0] as { result_body: string };
-    expect(JSON.parse(br2Finish.result_body).disposition).toBe('taskmaster_blocker_report_relayed');
+  });
+
+  test('Test 29 overdue_xo_row_does_not_create_another_xo_row', async () => {
+    const queued = [
+      message({
+        id: 'overdue-1',
+        task_type: 'agent_message',
+        sender: 'taskmaster',
+        subject_key: 'gh:thinmansoftware/bdc-xo#4242',
+        body: JSON.stringify({
+          kind: 'owner_ack_overdue',
+          overdue_recipient: 'xo',
+          item: 'gh:thinmansoftware/bdc-xo#4242',
+        }),
+      }),
+    ];
+    const deps = fakeDeps(queued);
+
+    await tickDutyOfficerClock(deps);
+
+    expect(xoRowCount(deps)).toBe(0);
+    const escalated = sectionWritesFor(deps, 'escalated');
+    expect(escalated).toHaveLength(1);
+    expect(escalated[0].markdown).toContain('overdue-1');
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'overdue-1', status: 'done', task_outcome: 'succeeded' })
+    );
   });
 });

@@ -4477,55 +4477,122 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     ).toHaveLength(0);
   });
 
-  test('a non-gh escalate_p0 thread keeps the operator-mailbox dispatch path', async () => {
+  test('a non-gh escalate_p0 classified ROUTINE is appended to the ops digest, not the mailbox', async () => {
+    // WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01: an escalate_p0 that is NOT
+    // delivered to a GitHub issue (non-gh thread ref) is now classified by the
+    // ops-event router. The "Unclaimed P0" body matches no interrupt rule, so it
+    // is ROUTINE -> one digest line and NO Dispatch mailbox row.
     const world = makeWorld();
     seedDigestSent(world);
     const gh = makeIssueCommentSink(world);
+    const appended: Array<{ dateUtc: string; line: string }> = [];
     const deps = makeDeps(world, {
       listThreads: async () => [unclaimedP0('dispatch:orphan-p0-1')],
       escalationDelivery: gh.delivery,
+      opsDigestAppend: async (dateUtc, line) => {
+        appended.push({ dateUtc, line });
+      },
       // Ambient TASKMASTER_FIRE_VERB_ENABLED must not turn these into fire cascades.
       checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
     });
 
     await tick(createTaskmasterState(60_000), deps);
 
-    // No issue comment; the escalation goes out as a dispatch message as before.
+    // No issue comment and no operator-mailbox dispatch row; exactly one digest line.
     expect(gh.posts()).toBe(0);
-    const escalations = world.sentMessages.filter(m =>
-      m.idempotency_key.startsWith('tm:escalate_p0:')
+    expect(
+      world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:escalate_p0:'))
+    ).toHaveLength(0);
+    expect(appended).toHaveLength(1);
+    expect(appended[0]?.line).toContain('Unclaimed P0');
+    const row = world.journal.find(
+      j => j.thread_ref === 'dispatch:orphan-p0-1' && j.action_type === 'escalate_p0'
     );
-    expect(escalations).toHaveLength(1);
-    expect(escalations[0]?.recipient).toBe('operator');
-    expect(escalations[0]?.body).toContain('Unclaimed P0');
+    expect(row?.outcome).toBe('sent');
+    expect(row?.grade).toBe('delivered_to_issue');
   });
 
-  test('kill switch TASKMASTER_ESCALATE_TO_ISSUE=false restores the dispatch path for a gh-ref', async () => {
+  test('kill switch TASKMASTER_ESCALATE_TO_ISSUE=false routes a gh-ref escalate_p0 through ROUTINE digest', async () => {
     const prior = process.env.TASKMASTER_ESCALATE_TO_ISSUE;
     process.env.TASKMASTER_ESCALATE_TO_ISSUE = 'false';
     try {
       const world = makeWorld();
       seedDigestSent(world);
       const gh = makeIssueCommentSink(world);
+      const appended: Array<{ dateUtc: string; line: string }> = [];
       const deps = makeDeps(world, {
         listThreads: async () => [unclaimedP0()],
         escalationDelivery: gh.delivery,
+        opsDigestAppend: async (dateUtc, line) => {
+          appended.push({ dateUtc, line });
+        },
         checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
       });
 
       await tick(createTaskmasterState(60_000), deps);
 
-      // Kill switch off => no issue comment; old dispatch-mailbox path used.
+      // Kill switch off => no issue comment. The escalate_p0 is no longer
+      // delivered to a GitHub issue, so it falls to the ops-event router, which
+      // classifies the "Unclaimed P0" body ROUTINE: one digest line, no mailbox row.
       expect(gh.posts()).toBe(0);
-      const escalations = world.sentMessages.filter(m =>
-        m.idempotency_key.startsWith('tm:escalate_p0:')
-      );
-      expect(escalations).toHaveLength(1);
-      expect(escalations[0]?.recipient).toBe('operator');
+      expect(
+        world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:escalate_p0:'))
+      ).toHaveLength(0);
+      expect(appended).toHaveLength(1);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_ESCALATE_TO_ISSUE;
       else process.env.TASKMASTER_ESCALATE_TO_ISSUE = prior;
     }
+  });
+
+  test('a failed ops-digest append journals the escalation retryable (failed), not terminal (expired), and retries next tick', async () => {
+    // Regression guard for the review finding: on a GitHub failure the digest
+    // branch must NOT journal the row 'expired' (which the per-key skip list
+    // treats as terminal, dropping the escalation for good). It journals
+    // 'failed' -- a retryable outcome whose future proof_deadline_at lets a
+    // later tick re-attempt the append until the deadline. It never falls back
+    // to creating a Dispatch mailbox row.
+    const world = makeWorld();
+    seedDigestSent(world);
+    const gh = makeIssueCommentSink(world);
+    let appendCalls = 0;
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0('dispatch:orphan-p0-2')],
+      escalationDelivery: gh.delivery,
+      opsDigestAppend: async () => {
+        appendCalls += 1;
+        // Fail the first attempt (simulates an ops-inbox GitHub outage), then
+        // succeed so the second tick proves the retry actually re-delivers.
+        if (appendCalls === 1) throw new Error('ops_inbox_github_http_503');
+      },
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+    const refOf = (j: TmJournalEntry): boolean =>
+      j.thread_ref === 'dispatch:orphan-p0-2' && j.action_type === 'escalate_p0';
+    const state = createTaskmasterState(60_000);
+
+    // Tick 1: the append throws.
+    await tick(state, deps);
+    expect(appendCalls).toBe(1);
+    const afterFail = world.journal.filter(refOf);
+    expect(afterFail).toHaveLength(1);
+    expect(afterFail[0]?.outcome).toBe('failed');
+    // No mailbox fallback and no issue comment were created.
+    expect(
+      world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:escalate_p0:'))
+    ).toHaveLength(0);
+    expect(gh.posts()).toBe(0);
+    // The row is reachable for retry: 'failed' is NOT in the terminal skip list.
+    expect(['sent', 'pending', 'rejected', 'expired', 'parked']).not.toContain(
+      afterFail[0]?.outcome
+    );
+
+    // Tick 2 (within the proof deadline): the retry re-attempts and succeeds.
+    world.nowMs += 60_000;
+    await tick(state, deps);
+    expect(appendCalls).toBe(2);
+    const afterRetry = world.journal.filter(refOf);
+    expect(afterRetry.some(r => r.outcome === 'sent')).toBe(true);
   });
 });
 

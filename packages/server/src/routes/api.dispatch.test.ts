@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { createHash } from 'crypto';
 import { unlinkSync } from 'fs';
+import { mkdir, writeFile, rm } from 'fs/promises';
 import { join } from 'path';
+import { getArchonHome } from '@archon/paths';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -318,7 +320,7 @@ const VALID_BODY = {
 };
 
 describe('dispatch API', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     process.env.BUN_ENV = 'test';
     process.env.GITHUB_TOKEN = 'test-token';
     process.env.DISPATCH_WORKER_CREDENTIALS_JSON = JSON.stringify([
@@ -363,6 +365,17 @@ describe('dispatch API', () => {
       `.test-api-dispatch-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
     );
     db = new SqliteAdapter(currentDbPath);
+    // A3 (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01): a send to a worker_poll agent
+    // seat is accepted only when a worker row serves it, mirroring production
+    // where each live agent worker registers. VALID_BODY targets `codex`, so
+    // register a serving worker; tests that assert the no-consumer rejection use
+    // a principal this row does not serve.
+    await registerWorker({
+      worker_id: 'agent-seat-fixture-worker',
+      host: 'fixture-host',
+      capabilities: { providers: ['codex', 'claude', 'grok', 'fusion', 'fable'] },
+      max_concurrency: 4,
+    });
     globalThis.fetch = (async (url: string) => {
       if (url.includes('/git/ref/heads/main')) {
         return Response.json({ object: { sha: 'b'.repeat(40) } });
@@ -836,6 +849,137 @@ describe('dispatch API', () => {
         body_preview: 'Overnight report is ready for John.',
       }),
     ]);
+  });
+
+  test('A7: dispatch status reports surface_unread by surface cursor, not acknowledgement', async () => {
+    const app = makeApp('secret-token');
+
+    // Five auto_surfaced operator rows, ALL still unread in the DB. Each has a
+    // matching line in surface.jsonl in creation order. The reader's surface
+    // cursor sits AFTER the first two lines, so only the last three are "past
+    // the cursor" (not yet folded into the digest) and must count as
+    // surface_unread. The first two are BEHIND the cursor -> already in the
+    // digest backlog (read) -> excluded, even though they are unacknowledged.
+    // This is the A7 contract the old test missed by using acknowledgement as a
+    // stand-in for cursor position.
+    const surfacedIds: string[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      const m = await createMessage({
+        correlation_id: `op-surf-${i}`,
+        idempotency_key: `op-surf-${i}`,
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: `surfaced operator blocker ${i}`,
+      });
+      surfacedIds.push(m.id);
+      await db.query(
+        "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+        [m.id, new Date().toISOString()]
+      );
+    }
+
+    // Write the reader's surface.jsonl and state.json under the (mocked) Archon
+    // home the status endpoint reads via surfaceMessageIdsPastCursor().
+    const home = getArchonHome();
+    const operatorInboxDir = join(home, 'operator-inbox');
+    const readerDir = join(home, 'inbox-reader');
+    const surfacePath = join(operatorInboxDir, 'surface.jsonl');
+    const statePath = join(readerDir, 'state.json');
+    await mkdir(operatorInboxDir, { recursive: true });
+    await mkdir(readerDir, { recursive: true });
+    try {
+      const lines = surfacedIds.map(
+        id =>
+          `${JSON.stringify({ messageId: id, classification: 'needs_human', recipient: 'operator' })}\n`
+      );
+      await writeFile(surfacePath, lines.join(''), 'utf8');
+      // Cursor = byte offset after the first two complete lines.
+      const cursor = Buffer.byteLength(lines[0]! + lines[1]!, 'utf8');
+      await writeFile(statePath, JSON.stringify({ surface_cursor: cursor }), 'utf8');
+
+      // 1 strictly-unread xo row older than 6h -> xo.unread_older_than_6h = 1.
+      const oldXo = await createMessage({
+        correlation_id: 'xo-old-1',
+        idempotency_key: 'xo-old-1',
+        task_type: 'run_report',
+        sender: 'claude',
+        recipient: 'xo',
+        body: 'seven-hour-old xo report still unread',
+      });
+      await db.query('UPDATE agent_dispatch_messages SET created_at = $2 WHERE id = $1', [
+        oldXo.id,
+        new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString(),
+      ]);
+
+      const response = await app.request('/api/dispatch/status', {
+        headers: { 'x-archon-operator-token': 'secret-token' },
+      });
+      expect(response.status).toBe(200);
+      const status = (await response.json()) as {
+        mailbox: Record<string, { surface_unread?: number; unread_older_than_6h?: number }>;
+      };
+
+      // Only the 3 lines past the cursor count -- NOT all 5 unacked surfaced rows.
+      expect(status.mailbox.operator?.surface_unread).toBe(3);
+      // The surfaced rows are disposed (route_disposition set), so none is
+      // strictly-unread; the operator has no >6h strictly-unread rows.
+      expect(status.mailbox.operator?.unread_older_than_6h).toBe(0);
+      expect(status.mailbox.xo?.unread_older_than_6h).toBe(1);
+      // The xo row is strictly unread (no surface line) so it is not surface_unread.
+      expect(status.mailbox.xo?.surface_unread ?? 0).toBe(0);
+    } finally {
+      await rm(surfacePath, { force: true });
+      await rm(statePath, { force: true });
+    }
+  });
+
+  test('A7: surface_unread is 0 when the cursor is at end-of-file (nothing past it)', async () => {
+    const app = makeApp('secret-token');
+
+    const m = await createMessage({
+      correlation_id: 'op-surf-eof',
+      idempotency_key: 'op-surf-eof',
+      task_type: 'run_report',
+      sender: 'overseer',
+      recipient: 'operator',
+      body: 'surfaced but already digested',
+    });
+    await db.query(
+      "UPDATE agent_dispatch_messages SET route_disposition = 'auto_surfaced', route_disposed_at = $2 WHERE id = $1",
+      [m.id, new Date().toISOString()]
+    );
+
+    const home = getArchonHome();
+    const operatorInboxDir = join(home, 'operator-inbox');
+    const readerDir = join(home, 'inbox-reader');
+    const surfacePath = join(operatorInboxDir, 'surface.jsonl');
+    const statePath = join(readerDir, 'state.json');
+    await mkdir(operatorInboxDir, { recursive: true });
+    await mkdir(readerDir, { recursive: true });
+    try {
+      const line = `${JSON.stringify({ messageId: m.id, classification: 'needs_human' })}\n`;
+      await writeFile(surfacePath, line, 'utf8');
+      // Cursor at EOF: the reader already folded the one surfaced row into the
+      // digest, so surface_unread must be 0 even though the DB row is unacked.
+      await writeFile(
+        statePath,
+        JSON.stringify({ surface_cursor: Buffer.byteLength(line, 'utf8') }),
+        'utf8'
+      );
+
+      const response = await app.request('/api/dispatch/status', {
+        headers: { 'x-archon-operator-token': 'secret-token' },
+      });
+      expect(response.status).toBe(200);
+      const status = (await response.json()) as {
+        mailbox: Record<string, { surface_unread?: number }>;
+      };
+      expect(status.mailbox.operator?.surface_unread ?? 0).toBe(0);
+    } finally {
+      await rm(surfacePath, { force: true });
+      await rm(statePath, { force: true });
+    }
   });
 
   test('acknowledges a mailbox message without changing its queue status', async () => {

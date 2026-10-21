@@ -19,6 +19,7 @@ import {
   type DispatchMessage,
   type DispatchMailboxResult,
 } from '@archon/core/db/dispatch';
+import { BENIGN_RECEIPT_DISPOSITIONS } from '@archon/overseer/pr-review-wiring';
 import { createLogger, getArchonHome } from '@archon/paths';
 
 const log = createLogger('dispatch/operator-inbox-consumer');
@@ -147,10 +148,41 @@ function bodyText(message: OperatorInboxMessage): string {
   return message.body;
 }
 
+/**
+ * Best-effort parse of a receipt body's top-level `disposition` field. Review
+ * receipts (pr_review_ingest_receipt / pr_review_submit_receipt) carry their
+ * terminal disposition here (see packages/overseer/src/pr-review-wiring.ts).
+ * Returns null when the body is not JSON or has no string disposition.
+ */
+function extractDisposition(text: string): string | null {
+  try {
+    const parsed = JSON.parse(text) as { disposition?: unknown };
+    return typeof parsed.disposition === 'string' ? parsed.disposition : null;
+  } catch {
+    return null;
+  }
+}
+
 export function classifyOperatorMessage(message: OperatorInboxMessage): Classification {
   const text = bodyText(message);
   const woId = extractWoId(text);
   const issueRef = extractIssueRef(text);
+
+  // Amendment A1: a receipt whose disposition is in the benign set
+  // (BENIGN_RECEIPT_DISPOSITIONS, owned by packages/overseer/src/pr-review-wiring.ts)
+  // is digest_only -- it is a correctly written receipt that must never sit as
+  // unread operator mail. Overseer already machine-disposes these at ingest; the
+  // consumer applies the same rule as a safety net so a benign receipt that
+  // reaches the drain is expired, not surfaced as needs_human.
+  const disposition = extractDisposition(text);
+  if (disposition !== null && BENIGN_RECEIPT_DISPOSITIONS.has(disposition)) {
+    return {
+      kind: 'digest_only',
+      reason: `benign_receipt_disposition:${disposition}`,
+      woId,
+      issueRef,
+    };
+  }
 
   // Taskmaster digests and similar agent_message no-action traffic.
   if (message.task_type === 'agent_message') {

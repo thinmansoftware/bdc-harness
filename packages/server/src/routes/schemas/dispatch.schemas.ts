@@ -207,6 +207,14 @@ export const dispatchStatusResponseSchema = z
         disposed_by_machine: z.number(),
         surfaced_unacked: z.number(),
         surfaced_acked: z.number(),
+        // Amendment A7 (additive, read-only). Both are DB-derivable proxies:
+        // unread_older_than_6h counts strictly-unread rows (no ack/address/route
+        // disposition) with created_at older than 6h; surface_unread counts
+        // auto_surfaced rows not yet acknowledged (a proxy for "past the reader
+        // surface cursor and still unread"). Optional so older clients/handlers
+        // that do not populate them still validate.
+        unread_older_than_6h: z.number().optional(),
+        surface_unread: z.number().optional(),
       })
     ),
     operator_reports: z.array(dispatchStatusItemSchema),

@@ -8,9 +8,11 @@
  */
 import { describe, expect, test } from 'bun:test';
 import {
+  BENIGN_RECEIPT_DISPOSITIONS,
   createRealSubmitDeps,
   isExactHeadCiGreen,
   maybeRecordReviewApprovalVerdict,
+  OVERSEER_RECEIPTS_ACTOR,
   recordReviewApprovalVerdict,
   REVIEW_REVIEWER_IDENTITY_ENV,
   REVIEW_WEBHOOK_SECRET_ENV,
@@ -440,6 +442,44 @@ describe('resolveReviewRouteConfig -- fail closed', () => {
     });
     expect(config?.webhookSecret).toBe('secret-value');
     expect(config?.reviewerIdentity).toBe('thinman-overseer[bot]');
+  });
+});
+
+describe('A1 benign receipt disposition set (WO-HARNESS-DO-MAILBOX-TRIAGE-DIGEST-01)', () => {
+  // The machine actor that owns the self-dispose of benign receipts. It must
+  // NOT be a registered principal, or disposeMessageByMachine returns
+  // machine_actor_conflict. Real-DB proof of the self-dispose end-to-end lives
+  // in pr-review-wiring-integration.test.ts (Tests 19/20); this pins the shared
+  // contract the triage rule O1 and the producer both read.
+  test('names a system: machine actor that is not a seat principal', () => {
+    expect(OVERSEER_RECEIPTS_ACTOR).toBe('system:overseer-receipts');
+    expect(OVERSEER_RECEIPTS_ACTOR.startsWith('system:')).toBe(true);
+  });
+
+  test('matches rule O1 benign dispositions exactly and excludes action-bearing ones', () => {
+    expect([...BENIGN_RECEIPT_DISPOSITIONS].sort()).toEqual(
+      [
+        'approved',
+        'checks_pending',
+        'duplicate_delivery',
+        'ignored_draft',
+        'ignored_event',
+        'queued',
+        'stale_head',
+        'superseded_head',
+      ].sort()
+    );
+    // Dispositions a person must still read are never benign.
+    for (const nonBenign of [
+      'changes_requested',
+      'blocked',
+      'blocked_required_contexts_unavailable',
+      'submission_failed',
+      'merge_custody_conflict',
+      'rejected_signature',
+    ]) {
+      expect(BENIGN_RECEIPT_DISPOSITIONS.has(nonBenign)).toBe(false);
+    }
   });
 });
 
