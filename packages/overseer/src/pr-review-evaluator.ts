@@ -476,9 +476,11 @@ export function reviewErrorCode(error: string | undefined): string | null {
  * When `requiredContexts` is a known set (branch-protection required status
  * checks on the base branch) it is the authoritative complete-suite signal:
  * terminal only when EVERY required context has reported a completed check run.
- * Optional reported checks do not affect terminality. A required context that
- * has not shown up yet (or one that is present but still in_progress) keeps the
- * suite non-terminal.
+ * Optional reported checks do not affect terminality. When more than one app
+ * has a latest run for the same required context, every one of those runs must
+ * be completed. A queued or in_progress run from any app keeps the context
+ * non-terminal. A required context that has not shown up yet (or one that is
+ * present but still in_progress) keeps the suite non-terminal.
  *
  * `null` means the authoritative set could NOT be obtained. That is never
  * terminal: we defer rather than fall back to the reported-checks heuristic,
@@ -502,12 +504,12 @@ export function checksAreTerminal(
   if (requiredContexts === null) return false;
   const allReportedCompleted = checks.every(check => check.status === 'completed');
   if (requiredContexts !== undefined && requiredContexts.length > 0) {
-    const latestByName = new Map(
-      latestAttemptPerCheck(checks).map(check => [normalizedCheckName(check.name), check])
-    );
-    return requiredContexts.every(
-      context => latestByName.get(normalizedCheckName(context))?.status === 'completed'
-    );
+    const latest = latestAttemptPerCheck(checks);
+    return requiredContexts.every(context => {
+      const name = normalizedCheckName(context);
+      const applicable = latest.filter(check => normalizedCheckName(check.name) === name);
+      return applicable.length > 0 && applicable.every(check => check.status === 'completed');
+    });
   }
   return checks.length > 0 && allReportedCompleted;
 }

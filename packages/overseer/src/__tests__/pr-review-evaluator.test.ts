@@ -363,6 +363,72 @@ describe('governed PR-code reviewer', () => {
     expect(checksAreTerminal([], null)).toBe(false);
   });
 
+  test('crossAppRequiredContext pending app listed before completed app is not terminal', () => {
+    expect(
+      checksAreTerminal(
+        [
+          {
+            name: 'test (ubuntu-latest)',
+            status: 'in_progress',
+            conclusion: null,
+            app: { slug: 'github-actions' },
+          },
+          {
+            name: 'test (ubuntu-latest)',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'buildkite' },
+          },
+        ],
+        ['test (ubuntu-latest)']
+      )
+    ).toBe(false);
+  });
+
+  test('crossAppRequiredContext completed app listed before pending app is not terminal', () => {
+    expect(
+      checksAreTerminal(
+        [
+          {
+            name: 'test (ubuntu-latest)',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'buildkite' },
+          },
+          {
+            name: 'test (ubuntu-latest)',
+            status: 'in_progress',
+            conclusion: null,
+            app: { slug: 'github-actions' },
+          },
+        ],
+        ['test (ubuntu-latest)']
+      )
+    ).toBe(false);
+  });
+
+  test('crossAppRequiredContext both apps completed is terminal', () => {
+    expect(
+      checksAreTerminal(
+        [
+          {
+            name: 'test (ubuntu-latest)',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'github-actions' },
+          },
+          {
+            name: 'test (ubuntu-latest)',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'buildkite' },
+          },
+        ],
+        ['test (ubuntu-latest)']
+      )
+    ).toBe(true);
+  });
+
   test('16 a completed reported check with a required context still absent defers to CHECKS_PENDING', async () => {
     let modelInvoked = false;
     const result = await evaluatePullRequest(
