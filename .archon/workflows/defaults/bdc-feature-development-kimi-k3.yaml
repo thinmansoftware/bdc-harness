@@ -2760,10 +2760,8 @@ nodes:
       set -uo pipefail
       mkdir -p "$ARTIFACTS_DIR"
       OUT="$ARTIFACTS_DIR/diff-final.patch"
+      FILES="$ARTIFACTS_DIR/diff-final.files"
       BASE_REF="origin/${BASE_BRANCH:-main}"
-      # NF2: when there is no merge-base and no HEAD~1 (single-commit / no-base repo),
-      # fall back to the empty-tree hash, NOT HEAD. HEAD..HEAD is an EMPTY diff (reviewer
-      # sees nothing); empty-tree..HEAD shows all committed content as added (meaningful).
       EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
       MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
       [ -n "$MB" ] || MB="$EMPTY_TREE"
@@ -2774,115 +2772,120 @@ nodes:
         echo "### unstaged working-tree diff (HEAD..worktree)"
         git diff HEAD 2>/dev/null || true
       } > "$OUT"
+      { git diff --name-only "$MB"..HEAD 2>/dev/null || true; git diff --name-only HEAD 2>/dev/null || true; } | sed '/^$/d' | sort -u > "$FILES"
       echo "DIFF_FINAL_BASE=$MB"
       echo "DIFF_FINAL_ARTIFACT=$OUT"
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
-
+      echo "DIFF_FINAL_HEAD=$(git rev-parse HEAD)"
+      echo "DIFF_FINAL_SHA256=$(sha256sum "$OUT" | awk '{print $1}')"
+      echo "DIFF_FINAL_FILES=$FILES"
   - id: diff-review-final
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading -- see diff-review
     agent: opr-adversarial-reviewer
-    depends_on: [capture-diff-final]
+    depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
     task_class: medium_work
     prompt: |
-      You are the Codex adversarial reviewer doing the FINAL re-review after repair.
-      Read-only. This node decides whether any semantic finding remains before commit --
-      the mechanical repair gate did NOT prove your earlier objections were fixed.
+      You are the adversarial reviewer performing a fresh, full FINAL review of the exact final code. Read-only.
 
       ## Inputs
       Spec: $read-spec.output
       Plan review terminal outcome: $plan-review.output
-      If this output does not contain PLAN_REVIEW_APPROVED, fail closed with
-      DIFF_REVIEW_FINAL=needs_revision. Do not certify a diff after rejected or
-      escalated plan-review output.
-      Your original findings: $diff-review.output
-      Classifier verdict: $classify-diff-review.output
-      Repair pass output: $diff-repair.output
-      Refreshed diff provenance: $capture-diff-final.output
-      (Read the repaired diff at DIFF_FINAL_ARTIFACT = $ARTIFACTS_DIR/diff-final.patch.
-      You have no Bash tool -- do not run git; read that file.)
+      If this output does not contain PLAN_REVIEW_APPROVED, fail closed with DIFF_REVIEW_FINAL=needs_revision.
+      Final diff provenance: $capture-diff-final.output
 
-      ## Branch on the repair outcome FIRST (check the SATISFIED FAST PATH before anything else)
-      - SATISFIED FAST PATH: if your original review verdict was DIFF_REVIEW=satisfied
-        (Classifier verdict above is {"verdict":"satisfied"}), then diff-repair was
-        correctly SKIPPED by its `when:` guard because there were no findings to fix.
-        An empty $diff-repair.output and a missing done.flag are EXPECTED on this path,
-        NOT a failure. Re-inspect the captured diff once more to confirm no new unsafe
-        behavior was introduced between the original review and now (e.g., scope creep,
-        unrelated edits). If the diff is still clean, emit DIFF_REVIEW_FINAL=satisfied
-        with UNRESOLVED: (none). Do NOT treat the skipped repair as failed repair.
-      - If the original verdict was needs_revision AND diff-repair FAILED or exhausted
-        iterations (its output is empty, shows ESCALATION_REQUIRED=true, or the done.flag
-        was never written): do NOT certify. Emit DIFF_REVIEW_FINAL=needs_revision,
-        summarize the unresolved repair state in UNRESOLVED, and carry through any
-        escalation reason. Never PASS on failed repair.
-      - Otherwise (original verdict was needs_revision AND diff-repair signalled done):
-        re-inspect the repaired diff. For EACH finding you raised originally, verify it
-        is actually resolved in the current tree -- not merely claimed resolved.
+      Review the WHOLE final diff in $ARTIFACTS_DIR/diff-final.patch against the spec. Open and read in full every file listed in $ARTIFACTS_DIR/diff-final.files, plus the direct callers and callees of every changed function. Do not review only patch hunks. Report every open finding from THIS fresh review; a finding of any severity blocks satisfaction.
 
-      ## Output (STDOUT only)
-        DIFF_REVIEW_FINAL=<satisfied|needs_revision>
-        UNRESOLVED:
-        - <file:line> <finding still open>   (repeat; or "(none)")
-        SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
-      DIFF_REVIEW_FINAL=satisfied ONLY if every original finding is genuinely resolved and
-      no new unsafe behavior was introduced by the repair.
+      ## Output (STDOUT only, exact block)
+      DIFF_REVIEW_FINAL=<satisfied|needs_revision>
+      REVIEWED_HEAD=<the DIFF_FINAL_HEAD value from capture-diff-final>
+      FILES_READ:
+      - <path>
+      UNRESOLVED:
+      - [<severity>] <file:line> <finding>
+      SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
 
-  # ===== Fix D (2026-05-30): pause-not-fail + Opus-tier on a blocked irreversible gate =====
-  # Replaces commit-and-push's old `exit 1` dead-end. A blocked run must NOT terminate as
-  # "failed"; it goes: classify -> Opus auto-repair (one pass) -> re-classify -> PAUSE
-  # (resumable approval) -> human corrects+resumes OR rejects. A clean run PROCEEDs with no
-  # human gate. An already-satisfied no-op resolves as success. (doctrine: fail-closed-must-
-  # pause-not-fail + self-repair-review-loops autonomy ladder.)
-  #
-  # block-classify: emit ONE JSON line so downstream `when:` can read $block-classify.output.status
-  # (condition-evaluator parses $node.output.field as JSON). status one of:
-  #   PROCEED           -- diff-review-final=satisfied AND real build -> commit/PR
-  #   ALREADY_SATISFIED -- no work needed, worktree clean, legitimately done -> success no-op
-  #   BLOCKED           -- false-completion OR diff-review-final=needs_revision -> repair/pause
+      DIFF_REVIEW_FINAL=satisfied is allowed only when UNRESOLVED contains exactly "- (none)".
   - id: block-classify
-    depends_on: [diff-review-final]
+    depends_on: [diff-review-final, capture-diff-final]
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      DIFF_FINAL=$(cat <<'BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003'
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="\x27" and s.rstrip("\n").endswith("\x27") else s)'
+      }
+      DIFF_FINAL=$(capture_node_output <<'BDC_FEATURE_DEVELOPMENT_KIMI_K3_BLOCK_FINAL_REVIEW'
       $diff-review-final.output
-      BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003
+      BDC_FEATURE_DEVELOPMENT_KIMI_K3_BLOCK_FINAL_REVIEW
       )
-      BUILD=$(cat <<'BDC_FEATURE_DEV_BUILD_ASSERT_IMPLEMENT_PRODUCED_WORK_20260719_004'
+      CAPTURE=$(capture_node_output <<'BDC_FEATURE_DEVELOPMENT_KIMI_K3_BLOCK_FINAL_CAPTURE'
+      $capture-diff-final.output
+      BDC_FEATURE_DEVELOPMENT_KIMI_K3_BLOCK_FINAL_CAPTURE
+      )
+      FIRST_REVIEW=$(capture_node_output <<'BDC_FEATURE_DEVELOPMENT_KIMI_K3_BLOCK_FIRST_REVIEW'
+      $classify-diff-review.output
+      BDC_FEATURE_DEVELOPMENT_KIMI_K3_BLOCK_FIRST_REVIEW
+      )
+      BUILD=$(capture_node_output <<'BDC_FEATURE_DEVELOPMENT_KIMI_K3_BLOCK_BUILD'
       $assert-implement-produced-work.output
-      BDC_FEATURE_DEV_BUILD_ASSERT_IMPLEMENT_PRODUCED_WORK_20260719_004
+      BDC_FEATURE_DEVELOPMENT_KIMI_K3_BLOCK_BUILD
       )
-      PRECHECK=$(cat <<'BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005'
+      PRECHECK=$(capture_node_output <<'BDC_FEATURE_DEVELOPMENT_KIMI_K3_BLOCK_PRECHECK'
       $gate-already-satisfied.output
-      BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005
+      BDC_FEATURE_DEVELOPMENT_KIMI_K3_BLOCK_PRECHECK
       )
+      DIFF_FINAL=$(printf '%b' "$DIFF_FINAL")
+      CAPTURE=$(printf '%b' "$CAPTURE")
+      FIRST_REVIEW=$(printf '%b' "$FIRST_REVIEW")
+      BUILD=$(printf '%b' "$BUILD")
+      PRECHECK=$(printf '%b' "$PRECHECK")
       final_ok=false
-      # Anchor-free parse: diff-review-final is Codex prose; sentinel appears inline,
-      # not at column 0. Take LAST occurrence so the final verdict always wins.
-      final_verdict=$(printf '%s\n' "$DIFF_FINAL" \
-        | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
-        | tail -n 1)
-      if [ "$final_verdict" = "DIFF_REVIEW_FINAL=satisfied" ]; then final_ok=true; fi
-      outcome=$(printf '%s\n' "$BUILD" | sed -n 's/^BUILD_OUTCOME=//p' | head -1)
-
-      # Codex FINDING_2: PROCEED requires BOTH a real build AND a satisfied final review.
-      # A missing/unparseable BUILD_OUTCOME must NOT slip through as PROCEED.
-      if [ "$outcome" = "ALREADY_SATISFIED" ]; then
-        STATUS=ALREADY_SATISFIED
-      elif [ "$outcome" = "REAL_BUILD" ] && [ "$final_ok" = "true" ]; then
-        STATUS=PROCEED
-      else
-        # FALSE_COMPLETE, unknown outcome, or final review not satisfied -> block.
-        STATUS=BLOCKED
+      reason=verdict_missing
+      token=$(printf '%s\n' "$DIFF_FINAL" | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' | tail -n 1 || true)
+      if [ "$token" = "DIFF_REVIEW_FINAL=needs_revision" ]; then
+        reason=verdict_needs_revision
+      elif [ "$token" = "DIFF_REVIEW_FINAL=satisfied" ]; then
+        unresolved=$(printf '%s\n' "$DIFF_FINAL" | awk '/UNRESOLVED:/{on=1; next} /^SEMANTIC_RISK=/{on=0} on && /^- /{print}')
+        if ! printf '%s\n' "$DIFF_FINAL" | grep -q 'UNRESOLVED:'; then
+          reason=unresolved_missing
+        elif [ "$unresolved" != "- (none)" ]; then
+          reason=findings_present
+        else
+          expected_head=$(printf '%s\n' "$CAPTURE" | sed -n 's/^DIFF_FINAL_HEAD=//p' | tail -n 1)
+          reviewed_head=$(printf '%s\n' "$DIFF_FINAL" | sed -n 's/^REVIEWED_HEAD=//p' | tail -n 1)
+          current_head=$(git rev-parse HEAD 2>/dev/null || true)
+          if [ -z "$expected_head" ] || [ "$reviewed_head" != "$expected_head" ] || [ "$current_head" != "$expected_head" ]; then
+            reason=head_mismatch
+          else
+            files_path=$(printf '%s\n' "$CAPTURE" | sed -n 's/^DIFF_FINAL_FILES=//p' | tail -n 1)
+            files_read=$(printf '%s\n' "$DIFF_FINAL" | awk '/FILES_READ:/{on=1; next} /^UNRESOLVED:/{on=0} on && /^- /{sub(/^- /, ""); print}')
+            missing=false
+            [ -f "$files_path" ] || missing=true
+            if [ "$missing" = false ]; then while IFS= read -r path; do [ -z "$path" ] || printf '%s\n' "$files_read" | grep -Fxq "$path" || missing=true; done < "$files_path"; fi
+            if [ "$missing" = true ]; then
+              reason=files_not_read
+            else
+              base=$(printf '%s\n' "$CAPTURE" | sed -n 's/^DIFF_FINAL_BASE=//p' | tail -n 1)
+              expected_sha=$(printf '%s\n' "$CAPTURE" | sed -n 's/^DIFF_FINAL_SHA256=//p' | tail -n 1)
+              recheck="$ARTIFACTS_DIR/diff-final.recheck.patch"
+              { echo "### committed diff ($base..HEAD)"; git diff "$base"..HEAD 2>/dev/null || true; echo; echo "### unstaged working-tree diff (HEAD..worktree)"; git diff HEAD 2>/dev/null || true; } > "$recheck"
+              actual_sha=$(sha256sum "$recheck" 2>/dev/null | awk '{print $1}')
+              if [ -z "$expected_sha" ] || [ "$actual_sha" != "$expected_sha" ]; then
+                reason=diff_changed_after_review
+              elif printf '%s\n' "$FIRST_REVIEW" | grep -q '"verdict":"needs_revision"' && [ ! -f "$ARTIFACTS_DIR/diff-repair-done.flag" ]; then
+                reason=repair_not_done
+              else
+                final_ok=true
+                reason=ok
+              fi
+            fi
+          fi
+        fi
       fi
-      # single JSON line = the entire stdout, so $block-classify.output.status parses
-      printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s"}\n' "$STATUS" "$final_ok" "${outcome:-unknown}"
-
-  # opus-repair: one harder AUTONOMOUS fix pass by the Opus overseer when BLOCKED, BEFORE
-  # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
-  # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
+      outcome=$(printf '%s\n' "$BUILD" | sed -n 's/^BUILD_OUTCOME=//p' | head -1)
+      if [ "$outcome" = "ALREADY_SATISFIED" ]; then STATUS=ALREADY_SATISFIED; elif [ "$outcome" = "REAL_BUILD" ] && [ "$final_ok" = true ]; then STATUS=PROCEED; else STATUS=BLOCKED; fi
+      printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s","reason":"%s"}\n' "$STATUS" "$final_ok" "${outcome:-unknown}" "$reason"
   - id: opus-repair
     provider: openrouter
     model: moonshotai/kimi-k3
@@ -2944,60 +2947,100 @@ nodes:
   # autonomy ladder: a passing re-review here lets block-reclassify emit PROCEED so the
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
+
+  - id: capture-diff-opus
+    depends_on: [classify-opus-repair]
+    trigger_rule: all_done
+    when: "$classify-opus-repair.output.fixed == 'true'"
+    bash: |
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR"
+      OUT="$ARTIFACTS_DIR/diff-opus.patch"
+      FILES="$ARTIFACTS_DIR/diff-opus.files"
+      BASE_REF="origin/${BASE_BRANCH:-main}"
+      EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
+      MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+      [ -n "$MB" ] || MB="$EMPTY_TREE"
+      { echo "### committed diff ($MB..HEAD)"; git diff "$MB"..HEAD 2>/dev/null || true; echo; echo "### unstaged working-tree diff (HEAD..worktree)"; git diff HEAD 2>/dev/null || true; } > "$OUT"
+      { git diff --name-only "$MB"..HEAD 2>/dev/null || true; git diff --name-only HEAD 2>/dev/null || true; } | sed '/^$/d' | sort -u > "$FILES"
+      echo "DIFF_OPUS_BASE=$MB"
+      echo "DIFF_OPUS_HEAD=$(git rev-parse HEAD)"
+      echo "DIFF_OPUS_SHA256=$(sha256sum "$OUT" | awk '{print $1}')"
+      echo "DIFF_OPUS_FILES=$FILES"
   - id: opus-rereview
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813  # cross-model adversarial review, not self-grading -- see diff-review
     agent: opr-adversarial-reviewer
-    depends_on: [classify-opus-repair]
+    depends_on: [classify-opus-repair, capture-diff-opus]
     trigger_rule: all_done
     when: "$classify-opus-repair.output.fixed == 'true'"
     prompt: |
-      opus-repair just made autonomous in-scope changes to resolve a BLOCKED build. Re-review
-      ONLY the current worktree diff (the post-repair state). Read-only. Judge ONLY this worktree
-      (no origin/main, no sibling worktrees; never fabricate a diff from already-merged commits).
-      Confirm the build now satisfies the WO and introduces no regression or unsafe behavior.
+      You are the adversarial reviewer performing a fresh, full review after the single autonomous repair pass. Read-only.
+      Review the WHOLE final diff in $ARTIFACTS_DIR/diff-opus.patch against the spec: $read-spec.output
+      Open and read in full every file listed in $ARTIFACTS_DIR/diff-opus.files, plus the direct callers and callees of every changed function. Do not review only patch hunks. Report every open finding from THIS fresh review; a finding of any severity blocks satisfaction.
 
-      ## What opus-repair reported
-      $opus-repair.output
+      Capture provenance (use its DIFF_OPUS_HEAD value verbatim for REVIEWED_HEAD):
+      $capture-diff-opus.output
 
-      ## Original block reason
-      $block-classify.output
-      $diff-review-final.output
+      ## Output (STDOUT only, exact block)
+      OPUS_REREVIEW=<satisfied|needs_revision>
+      REVIEWED_HEAD=<the DIFF_OPUS_HEAD value from capture-diff-opus>
+      FILES_READ:
+      - <path>
+      UNRESOLVED:
+      - [<severity>] <file:line> <finding>
+      SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
 
-      ## Output (STDOUT only, last lines)
-        OPUS_REREVIEW=<satisfied|needs_revision>
-        UNRESOLVED:
-        - <finding still open>   (or "(none)")
-
-  # classify-opus-rereview: grep the OPUS_REREVIEW sentinel out of opus-rereview's
-  # multi-line Codex prose and emit ONE JSON line so block-reclassify can read
-  # $classify-opus-rereview.output.verdict. Mirrors classify-apply-review exactly.
-  # Fail CLOSED: missing/unparseable sentinel -> needs_revision, never satisfied.
-  # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01)
+      OPUS_REREVIEW=satisfied is allowed only when UNRESOLVED contains exactly "- (none)".
   - id: classify-opus-rereview
-    depends_on: [opus-rereview]
+    depends_on: [opus-rereview, capture-diff-opus]
     trigger_rule: all_done
     bash: |
       set -uo pipefail
-      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_OPUS_REREVIEW_20260719_007'
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="\x27" and s.rstrip("\n").endswith("\x27") else s)'
+      }
+      REVIEW=$(capture_node_output <<'BDC_FEATURE_DEVELOPMENT_KIMI_K3_CLASSIFY_OPUS_REVIEW'
       $opus-rereview.output
-      BDC_FEATURE_DEV_REVIEW_OPUS_REREVIEW_20260719_007
+      BDC_FEATURE_DEVELOPMENT_KIMI_K3_CLASSIFY_OPUS_REVIEW
       )
-      verdict=$(printf '%s\n' "$REVIEW" \
-        | grep -oE 'OPUS_REREVIEW=(satisfied|needs_revision)' \
-        | tail -n 1 \
-        | sed 's/OPUS_REREVIEW=//')
-      if [ -z "$verdict" ]; then
-        verdict=needs_revision
+      CAPTURE=$(capture_node_output <<'BDC_FEATURE_DEVELOPMENT_KIMI_K3_CLASSIFY_OPUS_CAPTURE'
+      $capture-diff-opus.output
+      BDC_FEATURE_DEVELOPMENT_KIMI_K3_CLASSIFY_OPUS_CAPTURE
+      )
+      REVIEW=$(printf '%b' "$REVIEW")
+      CAPTURE=$(printf '%b' "$CAPTURE")
+      reason=verdict_missing
+      verdict=needs_revision
+      token=$(printf '%s\n' "$REVIEW" | grep -oE 'OPUS_REREVIEW=(satisfied|needs_revision)' | tail -n 1 || true)
+      if [ "$token" = "OPUS_REREVIEW=needs_revision" ]; then reason=verdict_needs_revision
+      elif [ "$token" = "OPUS_REREVIEW=satisfied" ]; then
+        unresolved=$(printf '%s\n' "$REVIEW" | awk '/UNRESOLVED:/{on=1; next} /^SEMANTIC_RISK=/{on=0} on && /^- /{print}')
+        if ! printf '%s\n' "$REVIEW" | grep -q 'UNRESOLVED:'; then reason=unresolved_missing
+        elif [ "$unresolved" != "- (none)" ]; then reason=findings_present
+        else
+          expected_head=$(printf '%s\n' "$CAPTURE" | sed -n 's/^DIFF_OPUS_HEAD=//p' | tail -n 1)
+          reviewed_head=$(printf '%s\n' "$REVIEW" | sed -n 's/^REVIEWED_HEAD=//p' | tail -n 1)
+          current_head=$(git rev-parse HEAD 2>/dev/null || true)
+          if [ -z "$expected_head" ] || [ "$reviewed_head" != "$expected_head" ] || [ "$current_head" != "$expected_head" ]; then reason=head_mismatch
+          else
+            files_path=$(printf '%s\n' "$CAPTURE" | sed -n 's/^DIFF_OPUS_FILES=//p' | tail -n 1)
+            files_read=$(printf '%s\n' "$REVIEW" | awk '/FILES_READ:/{on=1; next} /^UNRESOLVED:/{on=0} on && /^- /{sub(/^- /, ""); print}')
+            missing=false; [ -f "$files_path" ] || missing=true
+            if [ "$missing" = false ]; then while IFS= read -r path; do [ -z "$path" ] || printf '%s\n' "$files_read" | grep -Fxq "$path" || missing=true; done < "$files_path"; fi
+            if [ "$missing" = true ]; then reason=files_not_read
+            else
+              base=$(printf '%s\n' "$CAPTURE" | sed -n 's/^DIFF_OPUS_BASE=//p' | tail -n 1)
+              expected_sha=$(printf '%s\n' "$CAPTURE" | sed -n 's/^DIFF_OPUS_SHA256=//p' | tail -n 1)
+              recheck="$ARTIFACTS_DIR/diff-opus.recheck.patch"
+              { echo "### committed diff ($base..HEAD)"; git diff "$base"..HEAD 2>/dev/null || true; echo; echo "### unstaged working-tree diff (HEAD..worktree)"; git diff HEAD 2>/dev/null || true; } > "$recheck"
+              actual_sha=$(sha256sum "$recheck" 2>/dev/null | awk '{print $1}')
+              if [ -z "$expected_sha" ] || [ "$actual_sha" != "$expected_sha" ]; then reason=diff_changed_after_review; else verdict=satisfied; reason=ok; fi
+            fi
+          fi
+        fi
       fi
-      printf '{"verdict":"%s"}\n' "$verdict"
-
-  # block-reclassify: after the Opus pass + autonomous re-review (or skip if it wasn't
-  # BLOCKED), re-emit the JSON status. trigger_rule all_done so it runs whether or not
-  # opus-repair / opus-rereview ran. WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01 added
-  # classify-opus-rereview to depends_on and replaced the prior dead-end terminal with a
-  # verdict-gated split: satisfied -> PROCEED (opus-repaired-and-rereviewed-satisfied),
-  # needs_revision -> BLOCKED (opus-made-changes-rereview-failed).
+      printf '{"verdict":"%s","reason":"%s"}\n' "$verdict" "$reason"
   - id: block-reclassify
     depends_on: [block-classify, opus-repair, classify-opus-rereview]
     trigger_rule: all_done
@@ -3149,7 +3192,7 @@ nodes:
       fi
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
-        PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "${BASE_BRANCH:-dev}" \
+        PR_URL=$(gh pr create --draft --repo "$REPO" --head "$BR" --base "${BASE_BRANCH:-dev}" \
           --title "FALLBACK: opus-repaired build needs human review" \
           --body "FALLBACK PATH: a BLOCKED build was auto-repaired by opus-repair, but the non-interactive run could not reach a human approval gate. The repair commit is pushed here for human review instead of being stranded in the worktree. See run artifacts for the original block reason." \
           2>&1 | tail -1 || true)

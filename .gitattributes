@@ -9,3 +9,12 @@ Caddyfile.example text eol=lf
 
 # Verbatim GitHub PR bodies used as reconcile fixtures: keep CRLF bytes as captured
 packages/overseer/src/__tests__/fixtures/reconcile/*.md -text
+
+# Byte-faithful final-review replay captures. A blank context line in a unified
+# diff is a single space, and the capture ends with a trailing newline, so these
+# legitimately trip `git diff --check`. The bytes are pinned by fixture_patch_sha256
+# in each meta.json and must not change, so exempt the capture artifacts from
+# whitespace checks instead of "cleaning" them (which would break replay fidelity).
+packages/workflows/src/fixtures/final-review/**/diff-final.patch -whitespace -text
+packages/workflows/src/fixtures/final-review/**/diff-final.files -whitespace -text
+packages/workflows/src/fixtures/final-review/**/head.txt -whitespace -text

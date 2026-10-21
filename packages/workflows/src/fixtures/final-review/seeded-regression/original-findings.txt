@@ -1,0 +1,1 @@
+- [major] packages/workflows/src/run-lease.ts: lease durations must reject non-positive values.

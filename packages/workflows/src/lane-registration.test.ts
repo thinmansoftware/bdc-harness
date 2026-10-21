@@ -281,8 +281,6 @@ describe('lane registration and war-council-validator pin', () => {
     'plan-review',
     'war-council-validator',
     'diff-review',
-    'diff-review-final',
-    'opus-rereview',
     'findings-consolidate',
     'apply-diff-review-final',
   ] as const;

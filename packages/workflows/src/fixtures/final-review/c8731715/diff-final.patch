@@ -1,0 +1,606 @@
+diff --git a/docs/operations/branch-protection.md b/docs/operations/branch-protection.md
+index 156d1ae0..63901fb3 100644
+--- a/docs/operations/branch-protection.md
++++ b/docs/operations/branch-protection.md
+@@ -46,6 +46,14 @@ gh api repos/thinmansoftware/bdc-harness/branches/dev/protection \
+         and (.required_status_checks.contexts | index("test (ubuntu-latest)") != null)'
+ ```
+ 
++## Reviewer wait behavior
++
++The Overseer reviewer waits only for required contexts. Optional checks do not hold the verdict once every required context has reported a completed latest attempt.
++
++For an unprotected base with zero checks reported on the head, the reviewer stops deferring after `OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS` attempts (default `5`) and returns terminal, non-approving `CHECKS_UNAVAILABLE` with reason `unprotected_base_no_checks`. Protect the base or add CI to resolve that outcome.
++
++To diagnose a review that is still waiting, grep worker logs for `overseer_review_checks_pending_deferred`; the record includes the pending check names or `no_checks_reported` when the head has none.
++
+ ## Apply (full-replace PUT -- preserve existing checks)
+ 
+ GitHub `PUT .../branches/{branch}/protection` is a **full replace**. A minimal
+diff --git a/packages/overseer/src/__tests__/github-real-deps.test.ts b/packages/overseer/src/__tests__/github-real-deps.test.ts
+index 7d13120a..d6f11793 100644
+--- a/packages/overseer/src/__tests__/github-real-deps.test.ts
++++ b/packages/overseer/src/__tests__/github-real-deps.test.ts
+@@ -7,12 +7,14 @@ import { createAppAuth } from '@octokit/auth-app';
+ import {
+   createRealApprovePullRequest,
+   createRealFindPullRequest,
++  createRealFetchExactHeadPullRequestEvidence,
+   createRealGitHubClientDeps,
+   createRealMergePullRequest,
+   resolveGitHubAppAuth,
+   resolveRealOctokitAuthOptions,
+   type RealGitHubOctokitLike,
+ } from '../adapters/github-real-deps.ts';
++import type { AttemptCounterKey, AttemptCounterStore } from '../adapters/required-contexts.ts';
+ import type { PullRequestRef } from '../types.ts';
+ 
+ // WO-HARNESS-OVERSEER-APP-AUTH-01: Overseer authenticates as the Thinman Overseer
+@@ -61,6 +63,94 @@ beforeEach(() => {
+   }
+ });
+ 
++describe('unprotected base zero-check attempt bound', () => {
++  const headSha = 'c'.repeat(40);
++
++  function octokit(checkRuns: Array<{ name: string; status: string; conclusion: string | null }>) {
++    return {
++      pulls: {
++        get: async () => ({
++          data: { head: { sha: headSha }, base: { sha: 'b'.repeat(40), ref: 'main' } },
++        }),
++      },
++      repos: {
++        compareCommits: async () => ({ data: { files: [] } }),
++        getAllStatusCheckContexts: async () => {
++          throw Object.assign(new Error('Branch not protected'), { status: 404 });
++        },
++        getBranchRules: async () => ({ data: [] }),
++        getBranch: async () => ({ data: { protected: false } }),
++      },
++      checks: { listForRef: async () => ({ data: { check_runs: checkRuns } }) },
++    } as unknown as RealGitHubOctokitLike;
++  }
++
++  test('third zero-check evaluation blocks and uses a distinct key namespace', async () => {
++    const counts = new Map<string, number>();
++    const keys: AttemptCounterKey[] = [];
++    const store: AttemptCounterStore = {
++      increment: async key => {
++        keys.push(key);
++        const encoded = JSON.stringify(key);
++        const next = (counts.get(encoded) ?? 0) + 1;
++        counts.set(encoded, next);
++        return next;
++      },
++      clear: async key => {
++        counts.delete(JSON.stringify(key));
++      },
++    };
++    const previous = process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS;
++    process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS = '3';
++    try {
++      const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(
++        octokit([]),
++        undefined,
++        store
++      );
++      expect(
++        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
++          .requiredContextsBlocked
++      ).toBeUndefined();
++      expect(
++        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
++          .requiredContextsBlocked
++      ).toBeUndefined();
++      expect(
++        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
++          .requiredContextsBlocked
++      ).toEqual({ reason: 'unprotected_base_no_checks', attempts: 3, failureKind: 'transient' });
++      expect(keys.every(key => key.baseRef === 'zero-checks:main')).toBe(true);
++    } finally {
++      if (previous === undefined) delete process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS;
++      else process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS = previous;
++    }
++  });
++
++  test('a reported check clears the zero-check streak', async () => {
++    let attempts = 0;
++    const cleared: AttemptCounterKey[] = [];
++    const store: AttemptCounterStore = {
++      increment: async () => ++attempts,
++      clear: async key => {
++        cleared.push(key);
++        attempts = 0;
++      },
++    };
++    const input = { owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha };
++    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
++    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
++    await createRealFetchExactHeadPullRequestEvidence(
++      octokit([{ name: 'test', status: 'in_progress', conclusion: null }]),
++      undefined,
++      store
++    )(input);
++    expect(cleared.some(key => key.baseRef === 'zero-checks:main')).toBe(true);
++    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
++    expect(attempts).toBe(1);
++  });
++});
++
+ afterEach(() => {
+   for (const key of APP_ENV_KEYS) {
+     const prior = savedEnv.get(key);
+diff --git a/packages/overseer/src/__tests__/pr-review-evaluator.test.ts b/packages/overseer/src/__tests__/pr-review-evaluator.test.ts
+index e7323326..e34f201c 100644
+--- a/packages/overseer/src/__tests__/pr-review-evaluator.test.ts
++++ b/packages/overseer/src/__tests__/pr-review-evaluator.test.ts
+@@ -576,6 +576,57 @@ describe('governed PR-code reviewer', () => {
+     expect(result.error).toBe('checks_pending');
+     expect(modelInvoked).toBe(false);
+   });
++
++  test('required checks use normalized latest names and optional pending checks do not block', async () => {
++    let prompt = '';
++    let modelInvocations = 0;
++    const result = await evaluatePullRequest(
++      input,
++      deps({
++        fetchEvidence: async () => ({
++          diff: '+ change',
++          requiredContexts: ['docker-build', 'test (ubuntu-latest)'],
++          checks: [
++            { name: 'Docker-Build', status: 'completed', conclusion: 'success' },
++            { name: ' test (ubuntu-latest) ', status: 'completed', conclusion: 'success' },
++            { name: 'test (windows-latest)', status: 'in_progress', conclusion: null },
++          ],
++        }),
++        invokeModel: async (_binary, value) => {
++          modelInvocations += 1;
++          prompt = value;
++          return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
++        },
++      })
++    );
++    expect(result.verdict).toBe('APPROVE');
++    expect(modelInvocations).toBe(1);
++    expect(prompt).toContain('test (windows-latest)');
++  });
++
++  test('CHECKS_PENDING identifies running required checks but not absent ones', async () => {
++    const result = await evaluatePullRequest(
++      input,
++      deps({
++        fetchEvidence: async () => ({
++          diff: '+ change',
++          requiredContexts: ['docker-build', 'test (ubuntu-latest)'],
++          checks: [
++            { name: 'docker-build', status: 'completed', conclusion: 'success' },
++            { name: 'test (ubuntu-latest)', status: 'in_progress', conclusion: null },
++          ],
++        }),
++      })
++    );
++    expect(result.verdict).toBe('CHECKS_PENDING');
++    expect(result.pendingChecks).toEqual(['test (ubuntu-latest)']);
++    expect(
++      checksAreTerminal(
++        [{ name: 'docker-build', status: 'completed', conclusion: 'success' }],
++        null
++      )
++    ).toBe(false);
++  });
+ });
+ 
+ // PR #848 -- the CURSOR rail as a judge rung. Both configured rungs
+diff --git a/packages/overseer/src/__tests__/pr-review-submit.test.ts b/packages/overseer/src/__tests__/pr-review-submit.test.ts
+index 8ebd2b7f..c1802cd1 100644
+--- a/packages/overseer/src/__tests__/pr-review-submit.test.ts
++++ b/packages/overseer/src/__tests__/pr-review-submit.test.ts
+@@ -219,11 +219,13 @@ describe('checks pending (WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01)', () =
+         summary: '',
+         reviewedHeadSha: HEAD,
+         checksPending: true,
++        pendingChecks: ['test (windows-latest)'],
+       }),
+     });
+     const outcome = await runAndSubmitReview(WORK, deps);
+     expect(outcome.disposition).toBe('checks_pending');
+     expect(outcome.reason).toBe('checks_not_terminal');
++    expect(outcome.pendingChecks).toEqual(['test (windows-latest)']);
+     // No REQUEST_CHANGES (or any review) is submitted on checks-pending grounds.
+     expect(rec.submitted).toHaveLength(0);
+     // A receipt is still recorded so the defer is observable.
+diff --git a/packages/overseer/src/__tests__/pr-review-wiring.test.ts b/packages/overseer/src/__tests__/pr-review-wiring.test.ts
+index 758f56ed..b107d946 100644
+--- a/packages/overseer/src/__tests__/pr-review-wiring.test.ts
++++ b/packages/overseer/src/__tests__/pr-review-wiring.test.ts
+@@ -276,11 +276,17 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
+     const deps = createRealSubmitDeps('review-app[bot]', {
+       octokit: submitOctokit(),
+       recordApprovalVerdict: async () => {},
+-      evaluate: async () => reviewResult({ verdict: 'CHECKS_PENDING', error: 'checks_pending' }),
++      evaluate: async () =>
++        reviewResult({
++          verdict: 'CHECKS_PENDING',
++          error: 'checks_pending',
++          pendingChecks: ['test (windows-latest)'],
++        }),
+     });
+ 
+     const verdict = await deps.runReviewer(work);
+     expect(verdict.checksPending).toBe(true);
++    expect(verdict.pendingChecks).toEqual(['test (windows-latest)']);
+     expect(verdict.approved).toBe(false);
+     // Distinct from INDETERMINATE/REQUEST_CHANGES: no summary is fabricated, so
+     // it cannot be conflated into a REQUEST_CHANGES-producing approved=false.
+@@ -332,6 +338,21 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
+     expect(verdict.summary).not.toContain('Grant the Overseer GitHub App');
+   });
+ 
++  test('the no-checks blocked summary explains how to make the base reviewable', async () => {
++    const deps = createRealSubmitDeps('review-app[bot]', {
++      octokit: submitOctokit(),
++      recordApprovalVerdict: async () => {},
++      evaluate: async () =>
++        reviewResult({
++          verdict: 'CHECKS_UNAVAILABLE',
++          error: 'unprotected_base_no_checks:attempts=5:reason=transient',
++        }),
++    });
++    const verdict = await deps.runReviewer(work);
++    expect(verdict.summary).toContain('no branch protection and no CI reported');
++    expect(verdict.summary).toContain('protect the base or add CI');
++  });
++
+   test('does not expose internal INDETERMINATE errors in the GitHub summary', async () => {
+     const secretError = 'model_error:token=super-secret-provider-detail';
+     const deps = createRealSubmitDeps('review-app[bot]', {
+diff --git a/packages/overseer/src/adapters/github-real-deps.ts b/packages/overseer/src/adapters/github-real-deps.ts
+index aeeec8fb..db4759b4 100644
+--- a/packages/overseer/src/adapters/github-real-deps.ts
++++ b/packages/overseer/src/adapters/github-real-deps.ts
+@@ -18,8 +18,14 @@ import type {
+   PullRequestEvidence,
+   PullRequestRef,
+ } from '../types.ts';
+-import { resolveRequiredContexts } from './required-contexts';
++import {
++  REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
++  UNPROTECTED_BASE_NO_CHECKS_REASON,
++  resolveMaxAttempts,
++  resolveRequiredContexts,
++} from './required-contexts';
+ import type {
++  AttemptCounterKey,
+   AttemptCounterStore,
+   REQUIRED_CONTEXTS_BLOCKED_REASON,
+   RequiredContextsFailureKind,
+@@ -405,7 +411,7 @@ export interface ExactHeadPullRequestEvidence {
+    * reported-checks heuristic.
+    */
+   requiredContextsBlocked?: {
+-    reason: typeof REQUIRED_CONTEXTS_BLOCKED_REASON;
++    reason: typeof REQUIRED_CONTEXTS_BLOCKED_REASON | typeof UNPROTECTED_BASE_NO_CHECKS_REASON;
+     attempts: number;
+     failureKind: RequiredContextsFailureKind;
+   };
+@@ -527,6 +533,32 @@ export function createRealFetchExactHeadPullRequestEvidence(
+     // prevent (#775).
+     const requiredContexts: string[] | null =
+       resolution.state === 'known' ? resolution.contexts : null;
++    let noChecksBlocked: ExactHeadPullRequestEvidence['requiredContextsBlocked'];
++    if (
++      resolution.state === 'known' &&
++      resolution.source === 'unprotected_branch' &&
++      resolution.contexts.length === 0
++    ) {
++      const zeroChecksKey: AttemptCounterKey = {
++        owner: input.owner,
++        repo: input.repo,
++        baseRef: `zero-checks:${baseRef ?? ''}`,
++        headSha: input.headSha,
++      };
++      if (checkRuns.data.check_runs.length === 0) {
++        const attempts = await attemptStore.increment(zeroChecksKey, Date.now());
++        const maxAttempts = resolveMaxAttempts(process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]);
++        if (attempts >= maxAttempts) {
++          noChecksBlocked = {
++            reason: UNPROTECTED_BASE_NO_CHECKS_REASON,
++            attempts,
++            failureKind: 'transient',
++          };
++        }
++      } else {
++        await attemptStore.clear(zeroChecksKey);
++      }
++    }
+     return {
+       ...(resolution.state === 'exhausted'
+         ? {
+@@ -537,6 +569,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
+             },
+           }
+         : {}),
++      ...(noChecksBlocked ? { requiredContextsBlocked: noChecksBlocked } : {}),
+       diff: (comparison.data.files ?? [])
+         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
+         .join('\n'),
+diff --git a/packages/overseer/src/adapters/required-contexts.ts b/packages/overseer/src/adapters/required-contexts.ts
+index 78d5342a..6b5d1f2b 100644
+--- a/packages/overseer/src/adapters/required-contexts.ts
++++ b/packages/overseer/src/adapters/required-contexts.ts
+@@ -96,6 +96,9 @@ export const DEFAULT_MAX_ATTEMPTS = 5;
+ /** Stable log/receipt code for the terminal blocked outcome. */
+ export const REQUIRED_CONTEXTS_BLOCKED_REASON = 'required_contexts_unavailable_blocked' as const;
+ 
++/** Stable reason for an unprotected base whose head never reports CI. */
++export const UNPROTECTED_BASE_NO_CHECKS_REASON = 'unprotected_base_no_checks' as const;
++
+ /**
+  * Stands in for the base branch when the PR's base ref could not be read. A
+  * distinct literal, never a blank or a wildcard: "we could not see the base" is
+diff --git a/packages/overseer/src/pr-review-evaluator.ts b/packages/overseer/src/pr-review-evaluator.ts
+index ef217804..edeee90b 100644
+--- a/packages/overseer/src/pr-review-evaluator.ts
++++ b/packages/overseer/src/pr-review-evaluator.ts
+@@ -125,6 +125,8 @@ export interface PrReviewResult {
+    * callers that prefer a duration to an instant.
+    */
+   retry_after_ms?: number;
++  /** Names of checks still awaited. Set only on CHECKS_PENDING. */
++  pendingChecks?: string[];
+ }
+ 
+ export interface PrReviewModelResult {
+@@ -473,9 +475,10 @@ export function reviewErrorCode(error: string | undefined): string | null {
+  *
+  * When `requiredContexts` is a known set (branch-protection required status
+  * checks on the base branch) it is the authoritative complete-suite signal:
+- * terminal only when EVERY required context has reported a check run AND every
+- * reported check has completed. A required context that has not shown up yet
+- * (or one that is present but still in_progress) keeps the suite non-terminal.
++ * terminal only when EVERY required context has reported a completed check run.
++ * Optional reported checks do not affect terminality. A required context that
++ * has not shown up yet (or one that is present but still in_progress) keeps the
++ * suite non-terminal.
+  *
+  * `null` means the authoritative set could NOT be obtained. That is never
+  * terminal: we defer rather than fall back to the reported-checks heuristic,
+@@ -497,14 +500,14 @@ export function checksAreTerminal(
+ ): boolean {
+   // UNKNOWN required set -- fail closed. Must be checked before any heuristic.
+   if (requiredContexts === null) return false;
+-  // A reported check that is still queued/in_progress means the suite is mid
+-  // flight regardless of what is required -- never terminal.
+   const allReportedCompleted = checks.every(check => check.status === 'completed');
+   if (requiredContexts !== undefined && requiredContexts.length > 0) {
+-    const completedNames = new Set(
+-      checks.filter(check => check.status === 'completed').map(check => check.name)
++    const latestByName = new Map(
++      latestAttemptPerCheck(checks).map(check => [normalizedCheckName(check.name), check])
++    );
++    return requiredContexts.every(
++      context => latestByName.get(normalizedCheckName(context))?.status === 'completed'
+     );
+-    return allReportedCompleted && requiredContexts.every(context => completedNames.has(context));
+   }
+   return checks.length > 0 && allReportedCompleted;
+ }
+@@ -536,7 +539,21 @@ function rateLimited(
+   };
+ }
+ 
+-function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult {
++function checksPending(
++  input: PrReviewInput,
++  deps: PrReviewDeps,
++  checks: PrReviewCheck[],
++  requiredContexts: string[] | null | undefined
++): PrReviewResult {
++  const latest = latestAttemptPerCheck(checks);
++  const latestByName = new Map(latest.map(check => [normalizedCheckName(check.name), check]));
++  const pendingChecks =
++    requiredContexts && requiredContexts.length > 0
++      ? requiredContexts.flatMap(context => {
++          const check = latestByName.get(normalizedCheckName(context));
++          return check?.status === 'completed' ? [] : [check?.name ?? context.trim()];
++        })
++      : latest.filter(check => check.status !== 'completed').map(check => check.name);
+   return {
+     verdict: 'CHECKS_PENDING',
+     findings: [],
+@@ -544,6 +561,7 @@ function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult
+     reviewer: deps.reviewer,
+     acceptance_criteria_available: false,
+     error: 'checks_pending',
++    ...(checks.length === 0 ? {} : { pendingChecks }),
+   };
+ }
+ 
+@@ -604,7 +622,7 @@ export async function evaluatePullRequest(
+   // must NOT be coalesced (e.g. `?? []`), which would erase the unknown state
+   // and silently fail open. The model is not invoked in this branch.
+   if (!checksAreTerminal(evidence.checks, evidence.requiredContexts)) {
+-    return checksPending(input, deps);
++    return checksPending(input, deps, evidence.checks, evidence.requiredContexts);
+   }
+ 
+   let acceptanceCriteria: string | null = null;
+diff --git a/packages/overseer/src/pr-review-submit.ts b/packages/overseer/src/pr-review-submit.ts
+index b9bebd4c..e59b6356 100644
+--- a/packages/overseer/src/pr-review-submit.ts
++++ b/packages/overseer/src/pr-review-submit.ts
+@@ -58,6 +58,8 @@ export interface ReviewerVerdict {
+    * fixes). The worker releases and retries the item on a later tick.
+    */
+   checksPending?: boolean;
++  /** Names of checks still awaited when `checksPending` is true. */
++  pendingChecks?: readonly string[];
+   /**
+    * Set when the required status-check contexts could not be read after the
+    * configured attempt bound (#775). TERMINAL and NON-APPROVING: unlike
+@@ -203,6 +205,8 @@ export interface SubmitOutcome {
+    * `rate_limited` as the duration form of `retryAfter`.
+    */
+   retryAfterMs?: number;
++  /** Names of checks still awaited on a checks-pending deferral. */
++  pendingChecks?: readonly string[];
+ }
+ 
+ export interface SubmitDeps {
+@@ -401,6 +405,7 @@ export async function runAndSubmitReview(
+     return finish(deps, work, work.headSha, {
+       disposition: 'checks_pending',
+       reason: 'checks_not_terminal',
++      ...(verdict.pendingChecks ? { pendingChecks: verdict.pendingChecks } : {}),
+     });
+   }
+ 
+diff --git a/packages/overseer/src/pr-review-wiring.ts b/packages/overseer/src/pr-review-wiring.ts
+index 6c0b6bb0..b7d49aa3 100644
+--- a/packages/overseer/src/pr-review-wiring.ts
++++ b/packages/overseer/src/pr-review-wiring.ts
+@@ -27,6 +27,7 @@ import {
+   summarizeChecks,
+ } from './adapters/github-real-deps';
+ import type { ExactHeadPullRequestEvidence } from './adapters/github-real-deps.ts';
++import { UNPROTECTED_BASE_NO_CHECKS_REASON } from './adapters/required-contexts';
+ import {
+   MAX_REREVIEW_ATTEMPTS_ENV,
+   MAX_TOTAL_REREVIEWS_ENV,
+@@ -860,6 +861,9 @@ const INDETERMINATE_REVIEW_SUMMARY =
+  * and NOT approved, so nobody reads a comment-only review as a soft pass.
+  */
+ export function buildRequiredContextsBlockedSummary(error: string | undefined): string {
++  if (error?.startsWith(UNPROTECTED_BASE_NO_CHECKS_REASON)) {
++    return 'Review blocked, not approved: the base has no branch protection and no CI reported on this head; protect the base or add CI.';
++  }
+   const attemptsMatch = /attempts=(\d+)/.exec(error ?? '');
+   const attempts = attemptsMatch?.[1] ?? 'the configured number of';
+   const reasonMatch = /reason=(permission|transient)/.exec(error ?? '');
+@@ -959,6 +963,7 @@ export function createRealSubmitDeps(
+           summary: '',
+           reviewedHeadSha: result.reviewed_head_sha,
+           checksPending: true,
++          ...(result.pendingChecks ? { pendingChecks: result.pendingChecks } : {}),
+         };
+       }
+       // CHECKS_UNAVAILABLE (#775): terminal, never approving. Carries its own
+diff --git a/packages/server/src/dispatch/review-worker-clock.test.ts b/packages/server/src/dispatch/review-worker-clock.test.ts
+index 30a52566..10edc48d 100644
+--- a/packages/server/src/dispatch/review-worker-clock.test.ts
++++ b/packages/server/src/dispatch/review-worker-clock.test.ts
+@@ -229,10 +229,13 @@ describe('review worker clock', () => {
+   // released (not posted as a result) with a future not_before, and is retried
+   // until it reaches a terminal disposition.
+   test('defers (never posts) a checks-pending item with a future not_before', async () => {
++    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+     const deps = fakeDeps([message('pending', 'exact-head')], () => ({
+       disposition: 'checks_pending',
+       reason: 'checks_not_terminal',
++      pendingChecks: ['test (windows-latest)'],
+     }));
++    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+ 
+     const before = Date.now();
+     await tickReviewWorkerClock(CONFIG, deps);
+@@ -246,10 +249,45 @@ describe('review worker clock', () => {
+     expect(deferArg.id).toBe('pending');
+     expect(deferArg.fencing_token).toBe(1);
+     expect(new Date(deferArg.defer_until).getTime()).toBeGreaterThan(before);
++    expect(warnings).toEqual([
++      expect.objectContaining({
++        message: 'overseer_review_checks_pending_deferred',
++        data: expect.objectContaining({
++          messageId: 'pending',
++          defer_until: deferArg.defer_until,
++          pending_checks: ['test (windows-latest)'],
++        }),
++      }),
++    ]);
+     // A defer is not a terminal result.
+     expect(deps.postResult).not.toHaveBeenCalled();
+   });
+ 
++  test('logs no_checks_reported when a checks-pending outcome has no names', async () => {
++    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
++    const deps = fakeDeps([message('no-checks')], () => ({
++      disposition: 'checks_pending',
++    }));
++    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
++    await tickReviewWorkerClock(CONFIG, deps);
++    expect(warnings[0]).toEqual({
++      message: 'overseer_review_checks_pending_deferred',
++      data: expect.objectContaining({ pending_checks: [], reason: 'no_checks_reported' }),
++    });
++  });
++
++  test('does not call an explicit empty pending list no_checks_reported', async () => {
++    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
++    const deps = fakeDeps([message('unknown-contexts')], () => ({
++      disposition: 'checks_pending',
++      pendingChecks: [],
++    }));
++    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
++    await tickReviewWorkerClock(CONFIG, deps);
++    expect(warnings[0]?.data).toEqual(expect.objectContaining({ pending_checks: [] }));
++    expect(warnings[0]?.data).not.toHaveProperty('reason');
++  });
++
+   // bdc-harness #782 part 2: a rate limit is a deferral with GitHub's own reset
+   // clock, never a terminal verdict.
+   test('defers a rate-limited item until the reported retry instant', async () => {
+diff --git a/packages/server/src/dispatch/review-worker-clock.ts b/packages/server/src/dispatch/review-worker-clock.ts
+index 76cc3152..636eb261 100644
+--- a/packages/server/src/dispatch/review-worker-clock.ts
++++ b/packages/server/src/dispatch/review-worker-clock.ts
+@@ -47,6 +47,10 @@ const CHECKS_PENDING_BACKOFF_MS = Math.max(
+ let timer: ReturnType<typeof setInterval> | null = null;
+ let inFlight = false;
+ 
++interface ReviewWorkerLogger {
++  warn(data: Record<string, unknown>, message: string): void;
++}
++
+ export interface ReviewWorkerDeps {
+   registerWorker: typeof registerWorker;
+   heartbeatWorker: typeof heartbeatWorker;
+@@ -62,6 +66,8 @@ export interface ReviewWorkerDeps {
+   deferMessage: typeof deferMessage;
+   runAndSubmitReview: typeof runAndSubmitReview;
+   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
++  /** Optional logger seam for deterministic observability tests. */
++  logger?: ReviewWorkerLogger;
+   /**
+    * Backstop for lost check-completion deliveries (#782 part 3). Optional so a
+    * test double can omit it; when absent the sweep simply does not run and the
+@@ -206,11 +212,26 @@ export async function tickReviewWorkerClock(
+           // WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7 names this
+           // transition `deferMessage`; it is the same fenced claimed->queued
+           // transition, called by its WO name.
++          const deferUntil = new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString();
++          const pendingChecks = outcome.pendingChecks ?? [];
++          (deps.logger ?? log).warn(
++            {
++              messageId: claimed.id,
++              owner: work.owner,
++              repo: work.repo,
++              prNumber: work.prNumber,
++              headSha: work.headSha,
++              defer_until: deferUntil,
++              pending_checks: pendingChecks,
++              ...(outcome.pendingChecks === undefined ? { reason: 'no_checks_reported' } : {}),
++            },
++            'overseer_review_checks_pending_deferred'
++          );
+           await deps.deferMessage({
+             id: claimed.id,
+             worker_id: REVIEW_WORKER_ID,
+             fencing_token: claimed.fencing_token,
+-            defer_until: new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString(),
++            defer_until: deferUntil,
+           });
+           continue;
+         }
+

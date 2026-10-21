@@ -1,0 +1,29 @@
+I'll review the final diff against the spec. Starting with the diff artifact and file list.Confirmed: zero `crossAppRequiredContext` tests (Stop 10 requires ≥3). Now reading the changed files in full, starting with the evaluator and its check-ingest callee.Review complete. The decisive facts:
+
+**The repair was never applied.** `DIFF_FINAL_HEAD=8915d6c1` is the exact head the Overseer reviewed as CHANGES_REQUESTED on 2026-10-21 — no repair commit exists on top of it. The final state of `checksAreTerminal` in the diff is precisely the code the repair spec orders fixed: it builds `new Map(latestAttemptPerCheck(checks).map(check => [normalizedCheckName(check.name), check]))`, keyed by normalized name only. I confirmed in `pr-review-check-ingest.ts` that `latestAttemptPerCheck` keys by `name@app` (checkAttemptKey, line 369-373) and deliberately returns one latest run **per app** for the same check name — the name-only Map then lets whichever run appears later in iteration order overwrite the other. A required context with a pending run from app A and a completed run from app B is order-dependently judged terminal, and since `applyRequiredCheckGate` only reacts to *completed* failing gating runs, an APPROVE can be posted while required CI is still running. The three mandated `crossAppRequiredContext` regression tests are absent (grep count 0; Stop 10 requires ≥3).
+
+The rest of the branch (pending-checks logging, zero-checks attempt bound, blocked summary, docs) is internally consistent with its base and the original WO, but the repair findings gate everything (Rule G).
+
+DIFF_REVIEW_FINAL=needs_revision
+REVIEWED_HEAD=8915d6c1b786ca96f06efda211ed285a2bb1ac48
+FILES_READ:
+- packages/workflows/src/fixtures/final-review/c8731715/diff-final.patch
+- packages/workflows/src/fixtures/final-review/c8731715/diff-final.files
+- packages/overseer/src/pr-review-evaluator.ts
+- packages/overseer/src/pr-review-check-ingest.ts
+- packages/overseer/src/adapters/required-contexts.ts
+- packages/overseer/src/adapters/github-real-deps.ts
+- packages/overseer/src/pr-review-wiring.ts
+- packages/overseer/src/pr-review-submit.ts
+- packages/server/src/dispatch/review-worker-clock.ts
+- packages/server/src/dispatch/review-worker-clock.test.ts
+- packages/overseer/src/__tests__/pr-review-evaluator.test.ts
+- packages/overseer/src/__tests__/github-real-deps.test.ts
+- packages/overseer/src/__tests__/pr-review-submit.test.ts
+- packages/overseer/src/__tests__/pr-review-wiring.test.ts
+- docs/operations/branch-protection.md
+UNRESOLVED:
+- [major] packages/overseer/src/pr-review-evaluator.ts:503-508 (final state per diff hunk) The mandated repair is absent: checksAreTerminal keys latest runs by normalized name alone, collapsing distinct apps' runs that latestAttemptPerCheck (pr-review-check-ingest.ts:369-398) preserves per (app, name). A pending required-context run from one app is overwritten by a completed run from another app (order-dependent Map insertion), so the context is judged terminal and review — including APPROVE, since applyRequiredCheckGate ignores in_progress gating runs — can proceed before required CI completes. This is the verbatim Overseer CHANGES_REQUESTED finding at this same head; the fix (treat a required context terminal only when EVERY applicable latest run for it has completed) was never pushed.
+- [major] packages/overseer/src/__tests__/pr-review-evaluator.test.ts Stop 10 fails: 0 occurrences of 'crossAppRequiredContext' (required >= 3). The three ordered cross-app regression tests (pending-then-completed -> false; completed-then-pending -> false; both completed -> true) do not exist in the diff or on the branch.
+- [minor] packages/overseer/src/pr-review-evaluator.ts:556-564 (final state per diff hunk) The new checksPending() pending-names computation repeats the same name-only Map collapse: when a required context is held non-terminal by app A's pending run while app B's completed run occupies the name key, the context is omitted from pendingChecks, so the new overseer_review_checks_pending_deferred log can report an empty or incomplete pending list while the worker defers. Fix alongside the checksAreTerminal repair by considering all latest runs per required context.
+SEMANTIC_RISK=HIGH

@@ -1,0 +1,11 @@
+{
+  "lane": "bdc-feature-development-codex.yaml",
+  "node": "diff-review-final",
+  "provider": "claude",
+  "model": "claude-fable-5",
+  "prompt_template_sha256": "cb8cde33a99a33c2c04341fd9680a27d4f4bc973df704fa0c41134a0b480abcd",
+  "fixture_patch_sha256": "a752a94d243f06eae6525373e7c14138a4b1890959a55e8456c8e92147f5d2b1",
+  "head": "8915d6c1b786ca96f06efda211ed285a2bb1ac48",
+  "recorded_at": "2026-10-21T16:06:09.298Z",
+  "command": "bun scripts/final-review-replay.ts --lane /.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/task-web-worker-1792598085461-v9cpv8/.archon/workflows/defaults/bdc-feature-development-codex.yaml --fixture /.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/task-web-worker-1792598085461-v9cpv8/packages/workflows/src/fixtures/final-review/c8731715"
+}
