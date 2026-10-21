@@ -252,8 +252,14 @@ describe('bundled-defaults', () => {
         });
       }
 
+      // WO-HARNESS-REPAIR-PATH-HOTFIX-01 item 1c: the grok lane pins the implement
+      // loop to a 570s idle ceiling (grok goes silent >3min during installs/tests;
+      // finding F4). Its plan-review still keeps the default, and every other
+      // open-model lane keeps the default on both nodes.
+      const IMPLEMENT_IDLE_PINNED = new Set(['bdc-feature-development-grok']);
+
       for (const name of OPEN_MODEL) {
-        it(`${name} keeps the default loop idle timeout on plan-review and implement`, () => {
+        it(`${name} keeps the default loop idle timeout on plan-review`, () => {
           withDefaultLoopIterationIdleEnv(() => {
             const content = BUNDLED_WORKFLOWS[name];
             const workflow = parseBundledWorkflow(name);
@@ -263,15 +269,23 @@ describe('bundled-defaults', () => {
             const implementNode = getWorkflowNode(workflow, 'implement');
 
             expect(planReview).not.toContain('idle_timeout: 600000');
-            expect(implement).not.toContain('idle_timeout: 600000');
             expect(planReviewNode.idle_timeout).toBeUndefined();
-            expect(implementNode.idle_timeout).toBeUndefined();
             expect(resolveLoopIterationIdleTimeoutMs(planReviewNode.idle_timeout)).toBe(
               LOOP_ITERATION_IDLE_TIMEOUT_MS
             );
-            expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(
-              LOOP_ITERATION_IDLE_TIMEOUT_MS
-            );
+
+            expect(implement).not.toContain('idle_timeout: 600000');
+            if (IMPLEMENT_IDLE_PINNED.has(name)) {
+              expect(implement).toContain('idle_timeout: 570000');
+              expect(implementNode.idle_timeout).toBe(570000);
+              expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(570000);
+            } else {
+              expect(implement).not.toContain('idle_timeout: 570000');
+              expect(implementNode.idle_timeout).toBeUndefined();
+              expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(
+                LOOP_ITERATION_IDLE_TIMEOUT_MS
+              );
+            }
           });
         });
       }

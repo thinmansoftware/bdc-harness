@@ -221,6 +221,7 @@ nodes:
       # (default /proc).
       rtw_refuse() {
         printf 'repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\n' "$branch" "$holder" "$1"
+        printf 'repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\n' "$branch" "$holder" "$1" >&2
         rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
         return 1
       }
@@ -315,11 +316,6 @@ nodes:
           if ! row_epoch=$(date -u -d "$row_completed" +%s 2>/dev/null); then
             rtw_refuse "completed_at unparseable" || return
           fi
-          now_epoch=$(date -u +%s)
-          row_age=$((now_epoch - row_epoch))
-          if [ "$row_age" -lt "$min_age" ]; then
-            rtw_refuse "completed_at is only ${row_age}s old" || return
-          fi
           if [ "$row_epoch" -gt "$best_epoch" ]; then
             best_epoch=$row_epoch
             best_id=$row_id
@@ -329,6 +325,14 @@ nodes:
         done < "$rtw_db_out"
         if [ "$row_seen" -eq 0 ]; then
           rtw_refuse "no run row for holder" || return
+        fi
+        now_epoch=$(date -u +%s)
+        row_age=$((now_epoch - best_epoch))
+        if [ "$row_age" -lt "$min_age" ]; then
+          case "$best_status" in
+            escalated|failed|cancelled) ;;
+            *) rtw_refuse "completed_at is only ${row_age}s old" || return ;;
+          esac
         fi
         proc_root="${RTW_PROC_ROOT:-/proc}"
         if [ ! -d "$proc_root" ]; then
@@ -579,7 +583,7 @@ nodes:
     idle_timeout: 600000
     depends_on: [plan, checkout-repair-target]
     trigger_rule: all_done
-    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
+    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true' && $checkout-repair-target.output != ''"
     task_class: medium_work
     loop:
       fresh_context: true
@@ -3590,19 +3594,23 @@ nodes:
       # creates `"'multiline\nagent\noutput'"` which bash mis-tokenizes - line 2+ of
       # the agent output becomes bare commands. Assign directly to bash vars, then
       # quote the var reference. Engine-level fix tracked in WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      DECIDE_OUTPUT=$(cat <<'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013'
-      $decide-push-target.output
-      BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013
-      )
+      DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"
+      if [ ! -s "$DECIDE_OUT_FILE" ]; then
+        echo "ERROR: commit-and-push: decide-push-target node-output file missing or empty: $DECIDE_OUT_FILE" >&2
+        exit 1
+      fi
+      DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")
       # plan-review emits a fenced output. Extract ONLY the approved-plan block so the
       # changed-file allowlist + commit message never ingest reviewer critique (F8 fix).
       # Must be the revised plan (not pre-review) or a plan-review scope change would be
       # rejected by the allowlist. FAIL CLOSED if the fence is absent (NF1): never fall
       # back to raw output, or PLAN_REVIEW_FINDINGS critique would poison the allowlist.
-      PLAN_REVIEW_RAW=$(cat <<'BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_014'
-      $plan-review.output
-      BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_014
-      )
+      PLAN_REVIEW_OUT_FILE="$ARCHON_NODE_OUT/plan-review.out"
+      if [ ! -s "$PLAN_REVIEW_OUT_FILE" ]; then
+        echo "ERROR: commit-and-push: plan-review node-output file missing or empty: $PLAN_REVIEW_OUT_FILE" >&2
+        exit 1
+      fi
+      PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")
       # Extract APPROVED_PLAN (single-line-safe; open-model canary 3604d5bcc7b2).
       PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | python3 -c 'import sys,re;t=sys.stdin.read();m=re.search(r"===\s*APPROVED_PLAN_BEGIN\s*===(.*?)===\s*APPROVED_PLAN_END\s*===",t,re.S|re.I);body=(m.group(1).strip() if m else "");body=re.sub(r"(?<!\n)(##)",r"\n\1",body);body=re.sub(r"(?<!\n)(```)",r"\n\1",body);print(body)')
       if [ -z "$PLAN_OUTPUT" ]; then
@@ -3919,9 +3927,18 @@ nodes:
         fi
         CHECKOUT_LEASE_SHA=$(printf '%s\n' "${CHECKOUT_OUTPUT-}" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1)
         if [ -n "$CHECKOUT_LEASE_SHA" ] && [ "$REPAIR_TARGET_LIVE_OID" != "$CHECKOUT_LEASE_SHA" ]; then
-          echo "repair_target_head_moved"
-          echo "ERROR: repair_target_head_moved: live ${REPAIR_TARGET_LIVE_OID} != checkout ${CHECKOUT_LEASE_SHA}" >&2
-          exit 1
+          # WO-HARNESS-REPAIR-PATH-HOTFIX-01 (F2/1f): the live PR head advanced past the
+          # checkout lease. If the live head is already an ancestor of HEAD -- this run
+          # pushed its own commit mid-run, so HEAD already contains the live head -- adopt
+          # the live OID as the lease and continue. Refuse only when the live head is NOT
+          # an ancestor of HEAD (a foreign commit this run would clobber on force-push).
+          if git merge-base --is-ancestor "$REPAIR_TARGET_LIVE_OID" HEAD; then
+            CHECKOUT_LEASE_SHA="$REPAIR_TARGET_LIVE_OID"
+          else
+            echo "repair_target_head_moved"
+            echo "ERROR: repair_target_head_moved: live ${REPAIR_TARGET_LIVE_OID} != checkout ${CHECKOUT_LEASE_SHA}" >&2
+            exit 1
+          fi
         fi
         REPAIR_TARGET_LEASE_SHA="${CHECKOUT_LEASE_SHA:-$REPAIR_TARGET_LIVE_OID}"
         echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LEASE_SHA}"
@@ -4978,7 +4995,7 @@ nodes:
   - id: patch-pr-body
     persona: major-build
     depends_on: [build-manifest, verify-manifest-assertions, stamp-manifest-pr, manifest-consistency-check, manifest-evidence-check]
-    when: "$manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK'"
+    when: "$manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK' && $open-pr-if-needed.output != ''"
     trigger_rule: all_done
     task_class: clerical
     bash: |
