@@ -79,6 +79,30 @@ describe('live ruleset routing', () => {
     expect(pickEntryTier({ tags: ['security'] }, ruleset)).toBe('cursor');
     expect(pickEntryTier({ tags: ['auth'] }, ruleset)).toBe('cursor');
   });
+
+  test('mechanical CODE with overlapping cursor tags still enters zero', () => {
+    const ruleset = loadRuleset();
+    expect(ruleset.rules[0]?.match).toEqual({ woClass: 'CODE', tags: ['mechanical'] });
+    expect(ruleset.rules[0]?.entry).toBe('zero');
+
+    const overlapping = [
+      'billing',
+      'money',
+      'payment',
+      'stripe',
+      'auth',
+      'oauth',
+      'security',
+      'feature',
+      'net-new',
+      'multi-surface',
+    ];
+    for (const tag of overlapping) {
+      expect(pickEntryTier({ woClass: 'CODE', tags: ['mechanical', tag] }, ruleset)).toBe('zero');
+      expect(pickEntryTier({ woClass: 'CODE', tags: [tag] }, ruleset)).toBe('cursor');
+    }
+    expect(pickEntryTier({ woClass: 'INFRA', tags: ['mechanical'] }, ruleset)).toBe('cursor');
+  });
 });
 
 describe('cascade entry override and refuse', () => {

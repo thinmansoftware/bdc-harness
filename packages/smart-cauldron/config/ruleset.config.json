@@ -1,7 +1,14 @@
 {
-  "_comment": "Smart Cauldron conductor ruleset v1.3. Rules are evaluated top-down; first match wins (ANY-of match on tags). defaultEntry fires when no rule matches. woClass/tags are supplied entirely by the CLI caller via --class/--tags (smart-cauldron does not parse WO frontmatter itself) -- a WO 'acquires' a tag only if the caller passes it explicitly on the command line. 2026-07-07: mechanical CODE work now routes to zero, an exhaustion lane with no paid review seat. Money/auth/infra stay on the stronger lane. 2026-09-29 (John, extension of M-20260929h: cursor grok lanes become the new lanes): plain CODE (no tags) and defaultEntry now enter at cursor instead of codex; mechanical CODE stays on zero (the documented fallback lane when the Codex seat is the constraint); feature/net-new/multi-surface stays on codex; the Claude lane stays shut (billing/auth/INFRA rules unchanged). Seat-headroom routing (headroom.ts) still moves entry off any seat past the threshold. 2026-10-21 (John): billing/money/payment/stripe, auth/oauth/security, INFRA, and feature/net-new/multi-surface enter at cursor because Codex 429s fail back onto the Claude seat. Mechanical CODE stays on zero; codex remains the next climb rung; claude stays refused.",
+  "_comment": "Smart Cauldron conductor ruleset v1.3. Rules are evaluated top-down; first match wins (ANY-of match on tags). defaultEntry fires when no rule matches. woClass/tags are supplied entirely by the CLI caller via --class/--tags (smart-cauldron does not parse WO frontmatter itself) -- a WO 'acquires' a tag only if the caller passes it explicitly on the command line. 2026-07-07: mechanical CODE work now routes to zero, an exhaustion lane with no paid review seat. Money/auth/infra stay on the stronger lane. 2026-09-29 (John, extension of M-20260929h: cursor grok lanes become the new lanes): plain CODE (no tags) and defaultEntry now enter at cursor instead of codex; mechanical CODE stays on zero (the documented fallback lane when the Codex seat is the constraint); feature/net-new/multi-surface stays on codex; the Claude lane stays shut (billing/auth/INFRA rules unchanged). Seat-headroom routing (headroom.ts) still moves entry off any seat past the threshold. 2026-10-21 (John): billing/money/payment/stripe, auth/oauth/security, INFRA, and feature/net-new/multi-surface enter at cursor because Codex 429s fail back onto the Claude seat. Mechanical CODE stays on zero; codex remains the next climb rung; claude stays refused. The mechanical CODE rule is evaluated first, so a CODE WO tagged mechanical enters zero even when it also carries billing, money, payment, stripe, auth, oauth, security, feature, net-new, or multi-surface.",
   "defaultEntry": "cursor",
   "rules": [
+    {
+      "match": {
+        "woClass": "CODE",
+        "tags": ["mechanical"]
+      },
+      "entry": "zero"
+    },
     {
       "match": {
         "tags": ["billing", "money", "payment", "stripe"]
@@ -25,13 +32,6 @@
         "tags": ["feature", "net-new", "multi-surface"]
       },
       "entry": "cursor"
-    },
-    {
-      "match": {
-        "woClass": "CODE",
-        "tags": ["mechanical"]
-      },
-      "entry": "zero"
     },
     {
       "match": {
