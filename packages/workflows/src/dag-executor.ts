@@ -70,6 +70,7 @@ import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter, buildGateResultField } from './event-emitter';
 import type { GateResult } from './event-emitter';
 import type { IWorkflowStore } from './store';
+import { sumRunSpendUsd } from './run-spend';
 import { detectSilentFailure } from './silent-failure-detector';
 import { handleNodeFailure } from './overseer-bridge';
 import { evaluateCondition } from './condition-evaluator';
@@ -834,6 +835,18 @@ class ResourceExhaustedPause extends Error {
     this.name = 'ResourceExhaustedPause';
     this.info = info;
   }
+}
+
+/** Thrown inside a loop iteration when the provider reports error_max_budget_usd. */
+class LoopCostCapStop extends Error {
+  constructor() {
+    super('error_max_budget_usd');
+    this.name = 'LoopCostCapStop';
+  }
+}
+
+function formatCostCapMessage(nodeId: string, cap: number | undefined): string {
+  return `Node '${nodeId}' exceeded cost cap${cap !== undefined ? ` of $${cap.toFixed(2)}` : ''}.`;
 }
 
 const RESOURCE_EXHAUSTED_DEFAULT_BACKOFF_MS = [60_000, 300_000, 900_000, 1_800_000];
@@ -2506,9 +2519,7 @@ async function executeNodeInternal(
             { nodeId: node.id, maxBudgetUsd: cap, durationMs: Date.now() - nodeStartTime },
             'dag.node_budget_cap_exceeded'
           );
-          throw new Error(
-            `Node '${node.id}' exceeded cost cap${cap !== undefined ? ` of $${cap.toFixed(2)}` : ''}.`
-          );
+          throw new Error(formatCostCapMessage(node.id, cap));
         }
         // Fail loudly on any other SDK error result. Previously we broke out of
         // the stream silently, producing empty/partial output without signaling
@@ -3092,6 +3103,20 @@ async function executeNodeInternal(
       }
     }
 
+    const allowedBudget = nodeOptions?.maxBudgetUsd;
+    let costUsdEstimate: number | undefined;
+    // Only a missing OpenRouter cost is unknown spend. Ordinary Claude/Codex
+    // failures are not estimated, and zero is never written to mean "unknown".
+    if (
+      err.message.includes('openrouter_cost_missing') &&
+      typeof allowedBudget === 'number' &&
+      Number.isFinite(allowedBudget)
+    ) {
+      const meteredCost = nodeCostUsd ?? 0;
+      const estimate = allowedBudget - meteredCost;
+      if (estimate > 0) costUsdEstimate = estimate;
+    }
+
     await deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
@@ -3108,6 +3133,8 @@ async function executeNodeInternal(
             : {}),
           ...(nodeModelUsage ? { model_usage: nodeModelUsage } : {}),
           ...(nodeTokens ? { tokens: nodeTokens } : {}),
+          ...(nodeCostUsd !== undefined ? { cost_usd: nodeCostUsd } : {}),
+          ...(costUsdEstimate !== undefined ? { cost_usd_estimate: costUsdEstimate } : {}),
           // Model attribution on the failure path (WO-HARNESS-MODEL-ATTRIBUTION-01).
           // Mirrors the node_completed contract (see the sibling block above) so a
           // per-model, per-seat scoreboard can compute failure rates -- not just
@@ -3861,16 +3888,28 @@ function buildLoopNodeOptions(
     options.env = config.envVars;
   }
   if (node.systemPrompt !== undefined) options.systemPrompt = node.systemPrompt;
+  if (node.maxBudgetUsd !== undefined) options.maxBudgetUsd = node.maxBudgetUsd;
   options.assistantConfig = config.assistants[provider] ?? {};
-  // Pass workflow-level options as nodeConfig so providers can apply them
+  // Pass workflow-level options plus this node's cap and tool lists. Loop
+  // calls replace maxBudgetUsd with the remaining budget before sendQuery.
+  const nodeConfig: NodeConfig = {};
   if (workflowLevelOptions) {
-    options.nodeConfig = {
-      effort: workflowLevelOptions.effort,
-      thinking: workflowLevelOptions.thinking,
-      sandbox: workflowLevelOptions.sandbox,
-      betas: workflowLevelOptions.betas,
-      fallbackModel: workflowLevelOptions.fallbackModel,
-    };
+    nodeConfig.effort = workflowLevelOptions.effort;
+    nodeConfig.thinking = workflowLevelOptions.thinking;
+    nodeConfig.sandbox = workflowLevelOptions.sandbox;
+    nodeConfig.betas = workflowLevelOptions.betas;
+    nodeConfig.fallbackModel = workflowLevelOptions.fallbackModel;
+  }
+  if (node.maxBudgetUsd !== undefined) nodeConfig.maxBudgetUsd = node.maxBudgetUsd;
+  if (node.allowed_tools !== undefined) nodeConfig.allowed_tools = node.allowed_tools;
+  if (node.denied_tools !== undefined) nodeConfig.denied_tools = node.denied_tools;
+  if (
+    workflowLevelOptions ||
+    node.maxBudgetUsd !== undefined ||
+    node.allowed_tools !== undefined ||
+    node.denied_tools !== undefined
+  ) {
+    options.nodeConfig = nodeConfig;
   }
   return options;
 }
@@ -4003,6 +4042,7 @@ async function executeLoopNode(
             : {}),
           entry_rung: deriveEntryRung(workflowProvider, workflowModel),
           ...(loopTotalTokens ? { frontier_cost_usd: computeFrontierCost(loopTotalTokens) } : {}),
+          ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
         },
       })
       .catch((evtErr: Error) => {
@@ -4126,6 +4166,7 @@ async function executeLoopNode(
           ...(loopServedModelId !== undefined ? { served_model_id: loopServedModelId } : {}),
           entry_rung: deriveEntryRung(workflowProvider, workflowModel),
           ...(loopTotalTokens ? { frontier_cost_usd: computeFrontierCost(loopTotalTokens) } : {}),
+          ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
         },
       })
       .catch((err: Error) => {
@@ -4145,7 +4186,32 @@ async function executeLoopNode(
     };
   };
 
+  let capSpendUsd = 0;
+  // Resume (and any re-entry that already recorded this node's spend) must
+  // report cumulative loop cost, not only the post-resume portion. The cap
+  // already rebuilds from prior events; the terminal cost uses the same sum.
+  if (node.maxBudgetUsd !== undefined || isLoopResume) {
+    const priorEvents = await deps.store.listWorkflowEvents(workflowRun.id);
+    const priorNodeSpendUsd = sumRunSpendUsd(
+      priorEvents.filter(event => event.step_name === node.id)
+    );
+    if (node.maxBudgetUsd !== undefined) capSpendUsd = priorNodeSpendUsd;
+    if (priorNodeSpendUsd > 0) loopTotalCostUsd = priorNodeSpendUsd;
+  }
+
   for (let i = startIteration; i <= loop.max_iterations; i++) {
+    if (node.maxBudgetUsd !== undefined && !(node.maxBudgetUsd - capSpendUsd > 0)) {
+      const errorMsg = formatCostCapMessage(node.id, node.maxBudgetUsd);
+      await safeSendMessage(platform, conversationId, errorMsg, msgContext);
+      await persistLoopNodeFailed(errorMsg);
+      return {
+        state: 'failed',
+        output: lastIterationOutput,
+        error: errorMsg,
+        ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+      };
+    }
     const iterationStart = Date.now();
 
     // Check for non-running status between iterations. `paused` is tolerated
@@ -4218,6 +4284,74 @@ async function executeLoopNode(
     let iterationAttempt: ProviderAttemptRecord | undefined;
     let iterationAttemptCompleted = false;
     const wallBreaches: { attempt: 1 | 2; elapsedMs: number; wallMs: number }[] = [];
+    // Per-iteration amounts only. Cleared after they are persisted so a later
+    // attempt in the same iteration does not write them a second time.
+    let iterationMeteredCost: number | undefined;
+    let iterationEstimateCost: number | undefined;
+
+    const iterationCostData = (): Record<string, unknown> => ({
+      ...(iterationMeteredCost !== undefined ? { cost_usd: iterationMeteredCost } : {}),
+      ...(iterationEstimateCost !== undefined && iterationEstimateCost > 0
+        ? { cost_usd_estimate: iterationEstimateCost }
+        : {}),
+    });
+
+    const costPersistFailure = (err: Error): NodeExecutionResult => ({
+      state: 'failed',
+      output: fullOutput || lastIterationOutput,
+      error: `loop_cost_persist_failed: ${err.message}`,
+      ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
+      ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+    });
+
+    const persistLoopIterationEvent = async (
+      eventType: 'loop_iteration_completed' | 'loop_iteration_failed',
+      data: Record<string, unknown>
+    ): Promise<NodeExecutionResult | undefined> => {
+      try {
+        await deps.store.createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: eventType,
+          step_name: node.id,
+          data,
+        });
+        return undefined;
+      } catch (evtErr) {
+        const err = evtErr as Error;
+        logEventStoreError(err, i);
+        return costPersistFailure(err);
+      }
+    };
+
+    // Persist this iteration's unpersisted cost before another paid call.
+    // A no-cost attempt writes nothing, matching loops that have no cap.
+    const persistUnpersistedAttemptCost = async (
+      error: string
+    ): Promise<NodeExecutionResult | undefined> => {
+      const hasEstimate = iterationEstimateCost !== undefined && iterationEstimateCost > 0;
+      if (iterationMeteredCost === undefined && !hasEstimate) {
+        return undefined;
+      }
+      getWorkflowEventEmitter().emit({
+        type: 'loop_iteration_failed',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        iteration: i,
+        error,
+      });
+      const failure = await persistLoopIterationEvent('loop_iteration_failed', {
+        iteration: i,
+        error,
+        nodeId: node.id,
+        duration: Date.now() - iterationStart,
+        ...iterationCostData(),
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+      });
+      if (failure) return failure;
+      iterationMeteredCost = undefined;
+      iterationEstimateCost = undefined;
+      return undefined;
+    };
 
     const emitWallBreach = async (
       attempt: 1 | 2,
@@ -4267,25 +4401,20 @@ async function executeLoopNode(
         iteration: i,
         error: wallError,
       });
-      await deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'loop_iteration_failed',
-          step_name: node.id,
-          data: {
-            iteration: i,
-            error: wallError,
-            duration,
-            nodeId: node.id,
-            wallTimedOut: true,
-            wallTimeoutMs: effectiveWallTimeout,
-            wallBreaches,
-            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
-          },
-        })
-        .catch((evtErr: Error) => {
-          logEventStoreError(evtErr, i);
-        });
+      const iterationPersistFailed = await persistLoopIterationEvent('loop_iteration_failed', {
+        iteration: i,
+        error: wallError,
+        duration,
+        nodeId: node.id,
+        wallTimedOut: true,
+        wallTimeoutMs: effectiveWallTimeout,
+        wallBreaches,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+        ...iterationCostData(),
+      });
+      if (iterationPersistFailed) return iterationPersistFailed;
+      iterationMeteredCost = undefined;
+      iterationEstimateCost = undefined;
       await persistLoopNodeFailed(`Loop iteration ${i} failed: ${wallError}`);
       return {
         state: 'failed',
@@ -4313,8 +4442,42 @@ async function executeLoopNode(
       iterationAttempt = undefined;
       iterationAttemptCompleted = false;
       iterationIdleTimedOut = false;
+      let attemptMeteredCost: number | undefined;
+      let attemptEstimateCharged = false;
+      let attemptAllowedUsd: number | undefined;
+
+      const chargeWallAbortEstimate = (): void => {
+        if (node.maxBudgetUsd === undefined || attemptEstimateCharged) return;
+        if (attemptMeteredCost !== undefined) return;
+        if (attemptAllowedUsd === undefined || !(attemptAllowedUsd > 0)) return;
+        iterationEstimateCost = (iterationEstimateCost ?? 0) + attemptAllowedUsd;
+        capSpendUsd += attemptAllowedUsd;
+        loopTotalCostUsd = (loopTotalCostUsd ?? 0) + attemptAllowedUsd;
+        attemptEstimateCharged = true;
+      };
+
+      const refuseWhenBudgetSpent = async (): Promise<NodeExecutionResult | undefined> => {
+        if (node.maxBudgetUsd === undefined) return undefined;
+        const remainingBudgetUsd = node.maxBudgetUsd - capSpendUsd;
+        if (remainingBudgetUsd > 0) {
+          attemptAllowedUsd = remainingBudgetUsd;
+          return undefined;
+        }
+        const errorMsg = formatCostCapMessage(node.id, node.maxBudgetUsd);
+        await safeSendMessage(platform, conversationId, errorMsg, msgContext);
+        await persistLoopNodeFailed(errorMsg);
+        return {
+          state: 'failed',
+          output: fullOutput || lastIterationOutput,
+          error: errorMsg,
+          ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
+          ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+        };
+      };
 
       try {
+        const budgetStop = await refuseWhenBudgetSpent();
+        if (budgetStop) return budgetStop;
         // Build prompt -- substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
         // Pass loopUserInput on the first resumed iteration; '' on all others (non-interactive
         // or subsequent iterations) so $LOOP_USER_INPUT substitutes to empty string explicitly.
@@ -4339,6 +4502,15 @@ async function executeLoopNode(
         const iterationOptions: SendQueryOptions | undefined = {
           ...resolvedOptions,
           abortSignal: iterationAbortController.signal,
+          ...(attemptAllowedUsd !== undefined
+            ? {
+                maxBudgetUsd: attemptAllowedUsd,
+                nodeConfig: {
+                  ...resolvedOptions.nodeConfig,
+                  maxBudgetUsd: attemptAllowedUsd,
+                },
+              }
+            : {}),
         };
 
         iterationAttempt = await beginProviderAttempt(
@@ -4428,7 +4600,10 @@ async function executeLoopNode(
             }
             if (msg.sessionId) currentSessionId = msg.sessionId;
             if (msg.cost !== undefined) {
+              attemptMeteredCost = (attemptMeteredCost ?? 0) + msg.cost;
+              iterationMeteredCost = (iterationMeteredCost ?? 0) + msg.cost;
               loopTotalCostUsd = (loopTotalCostUsd ?? 0) + msg.cost;
+              if (node.maxBudgetUsd !== undefined) capSpendUsd += msg.cost;
             }
             if (msg.tokens) {
               const t = msg.tokens;
@@ -4446,6 +4621,9 @@ async function executeLoopNode(
             if (msg.servedModelId !== undefined) loopServedModelId = msg.servedModelId;
             if (msg.servedModelMissingReason !== undefined) {
               loopServedMissingReason = msg.servedModelMissingReason;
+            }
+            if (msg.isError && msg.errorSubtype === 'error_max_budget_usd') {
+              throw new LoopCostCapStop();
             }
             // Fail the iteration loudly on SDK error results. Previously we broke
             // silently, producing empty output and continuing to the next iteration --
@@ -4556,6 +4734,38 @@ async function executeLoopNode(
           // rate_limit chunks: already log.warn'd in claude.ts; not surfaced to SSE per design
         }
       } catch (error) {
+        if (!iterationWallTimedOut && error instanceof LoopCostCapStop) {
+          const capMessage = formatCostCapMessage(
+            node.id,
+            node.maxBudgetUsd ?? resolvedOptions.maxBudgetUsd
+          );
+          getWorkflowEventEmitter().emit({
+            type: 'loop_iteration_failed',
+            runId: workflowRun.id,
+            nodeId: node.id,
+            iteration: i,
+            error: capMessage,
+          });
+          const capPersisted = await persistLoopIterationEvent('loop_iteration_failed', {
+            iteration: i,
+            error: capMessage,
+            duration: Date.now() - iterationStart,
+            nodeId: node.id,
+            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+            ...iterationCostData(),
+          });
+          if (capPersisted) return capPersisted;
+          iterationMeteredCost = undefined;
+          iterationEstimateCost = undefined;
+          await persistLoopNodeFailed(capMessage);
+          return {
+            state: 'failed',
+            output: fullOutput,
+            error: capMessage,
+            ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
+            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+          };
+        }
         let failureError: unknown = error;
         if (iterationWallTimedOut) {
           failureError = new Error(
@@ -4600,8 +4810,13 @@ async function executeLoopNode(
         }
 
         if (iterationWallTimedOut) {
+          chargeWallAbortEstimate();
           await emitWallBreach(wallAttempt, Date.now() - attemptStartedAt, attemptWallTimeout);
           if (wallAttempt === 1) {
+            const persisted = await persistUnpersistedAttemptCost(
+              `Loop '${node.id}' iteration ${String(i)} wall attempt 1 aborted before usage`
+            );
+            if (persisted) return persisted;
             fullOutput = '';
             cleanOutput = '';
             continue;
@@ -4610,6 +4825,21 @@ async function executeLoopNode(
         }
 
         const err = failureError as Error;
+        if (
+          node.maxBudgetUsd !== undefined &&
+          !attemptEstimateCharged &&
+          err.message.includes('openrouter_cost_missing') &&
+          attemptAllowedUsd !== undefined
+        ) {
+          const metered = attemptMeteredCost ?? 0;
+          const estimate = attemptAllowedUsd - metered;
+          if (estimate > 0) {
+            iterationEstimateCost = (iterationEstimateCost ?? 0) + estimate;
+            capSpendUsd += estimate;
+            loopTotalCostUsd = (loopTotalCostUsd ?? 0) + estimate;
+            attemptEstimateCharged = true;
+          }
+        }
         const duration = Date.now() - iterationStart;
         getLog().error({ err, nodeId: node.id, iteration: i }, 'loop_node.iteration_failed');
         getWorkflowEventEmitter().emit({
@@ -4619,25 +4849,17 @@ async function executeLoopNode(
           iteration: i,
           error: err.message,
         });
-        deps.store
-          .createWorkflowEvent({
-            workflow_run_id: workflowRun.id,
-            event_type: 'loop_iteration_failed',
-            step_name: node.id,
-            // Persist aggregate tokens accumulated across iterations BEFORE the
-            // failure so per-node token attribution survives loop SDK errors.
-            // Mirrors the omit-when-absent contract used on loop completion.
-            data: {
-              iteration: i,
-              error: err.message,
-              duration,
-              nodeId: node.id,
-              ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
-            },
-          })
-          .catch((evtErr: Error) => {
-            logEventStoreError(evtErr, i);
-          });
+        const iterationPersistFailed = await persistLoopIterationEvent('loop_iteration_failed', {
+          iteration: i,
+          error: err.message,
+          duration,
+          nodeId: node.id,
+          ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+          ...iterationCostData(),
+        });
+        if (iterationPersistFailed) return iterationPersistFailed;
+        iterationMeteredCost = undefined;
+        iterationEstimateCost = undefined;
         await persistLoopNodeFailed(`Loop iteration ${i} failed: ${err.message}`);
         return {
           state: 'failed',
@@ -4651,6 +4873,8 @@ async function executeLoopNode(
       }
 
       // Wall timeout without a thrown abort: retry once, then fail closed.
+      // An aborted attempt that never delivered usage is charged its whole
+      // allowed remaining budget, then persisted before wall attempt two.
       if (iterationWallTimedOut) {
         if (iterationAttempt && !iterationAttemptCompleted) {
           await finishProviderAttempt(deps, iterationAttempt, {
@@ -4660,8 +4884,13 @@ async function executeLoopNode(
           });
           iterationAttemptCompleted = true;
         }
+        chargeWallAbortEstimate();
         await emitWallBreach(wallAttempt, Date.now() - attemptStartedAt, attemptWallTimeout);
         if (wallAttempt === 1) {
+          const persisted = await persistUnpersistedAttemptCost(
+            `Loop '${node.id}' iteration ${String(i)} wall attempt 1 aborted before usage`
+          );
+          if (persisted) return persisted;
           fullOutput = '';
           cleanOutput = '';
           continue;
@@ -4697,6 +4926,8 @@ async function executeLoopNode(
       }
       const idleError = `Loop '${node.id}' iteration ${String(i)} exceeded idle timeout (${String(effectiveIdleTimeout)}ms)`;
       await safeSendMessage(platform, conversationId, idleError, msgContext);
+      const idlePersisted = await persistUnpersistedAttemptCost(idleError);
+      if (idlePersisted) return idlePersisted;
       await persistLoopNodeFailed(idleError);
       return {
         state: 'failed',
@@ -4738,24 +4969,17 @@ async function executeLoopNode(
         iteration: i,
         error: emptyError,
       });
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'loop_iteration_failed',
-          step_name: node.id,
-          // Same token-persistence rationale as the SDK-error branch above:
-          // empty-output failures still carry accumulated loopTotalTokens.
-          data: {
-            iteration: i,
-            error: emptyError,
-            duration: iterationDuration,
-            nodeId: node.id,
-            ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
-          },
-        })
-        .catch((evtErr: Error) => {
-          logEventStoreError(evtErr, i);
-        });
+      const emptyPersisted = await persistLoopIterationEvent('loop_iteration_failed', {
+        iteration: i,
+        error: emptyError,
+        duration: iterationDuration,
+        nodeId: node.id,
+        ...(loopTotalTokens ? { tokens: loopTotalTokens } : {}),
+        ...iterationCostData(),
+      });
+      if (emptyPersisted) return emptyPersisted;
+      iterationMeteredCost = undefined;
+      iterationEstimateCost = undefined;
       await persistLoopNodeFailed(`Loop iteration ${i} failed: ${emptyError}`);
       return {
         state: 'failed',
@@ -4863,22 +5087,17 @@ async function executeLoopNode(
       duration,
       completionDetected,
     });
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'loop_iteration_completed',
-        step_name: node.id,
-        data: {
-          iteration: i,
-          duration,
-          completionDetected,
-          nodeId: node.id,
-          signalHints,
-        },
-      })
-      .catch((err: Error) => {
-        logEventStoreError(err, i);
-      });
+    const completedPersisted = await persistLoopIterationEvent('loop_iteration_completed', {
+      iteration: i,
+      duration,
+      completionDetected,
+      nodeId: node.id,
+      signalHints,
+      ...iterationCostData(),
+    });
+    if (completedPersisted) return completedPersisted;
+    iterationMeteredCost = undefined;
+    iterationEstimateCost = undefined;
 
     await logNodeComplete(logDir, workflowRun.id, `${node.id}-iteration-${String(i)}`, node.id, {
       durationMs: duration,
@@ -4960,6 +5179,7 @@ async function executeLoopNode(
             ...(loopServedModelId !== undefined ? { served_model_id: loopServedModelId } : {}),
             entry_rung: deriveEntryRung(workflowProvider, workflowModel),
             ...(loopTotalTokens ? { frontier_cost_usd: computeFrontierCost(loopTotalTokens) } : {}),
+            ...(loopTotalCostUsd !== undefined ? { cost_usd: loopTotalCostUsd } : {}),
           },
         })
         .catch((err: Error) => {
