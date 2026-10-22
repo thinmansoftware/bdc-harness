@@ -11552,6 +11552,75 @@ describe('agent persona dispatch', () => {
     await writeFile(join(testDir, '.archon', 'agents', `${name}.md`), content, 'utf-8');
   }
 
+  it('Cursor YAML plan-review preserves strict Terra through actual loop and persona execution', async () => {
+    const { registerCursorAgentProvider } =
+      await import('../../providers/src/community/cursor/registration');
+    registerCursorAgentProvider();
+    try {
+      const repoRoot = join(import.meta.dir, '../../..');
+      const file = 'bdc-feature-development-cursor.yaml';
+      const actual = parseWorkflow(
+        await readFile(join(repoRoot, '.archon/workflows/defaults', file), 'utf8'),
+        file
+      );
+      if (!actual.workflow)
+        throw new Error(actual.error?.error ?? 'actual_cursor_workflow_missing');
+      const selected = actual.workflow.nodes.find(candidate => candidate.id === 'plan-review');
+      if (!selected || !('loop' in selected)) throw new Error('actual_plan_review_loop_missing');
+      const personaName = selected.agent ?? selected.persona;
+      if (!personaName) throw new Error('actual_plan_review_persona_missing');
+      await writeFile(
+        join(testDir, '.archon/agents', `${personaName}.md`),
+        await readFile(join(repoRoot, '.archon/agents', `${personaName}.md`), 'utf8')
+      );
+      const store = createMockStore();
+      const deps = createMockDeps(store);
+      const captured = mock(async function* () {
+        yield { type: 'assistant' as const, content: 'PLAN_REVIEW_APPROVED' };
+        yield { type: 'result' as const, sessionId: 'offline-cursor-terra-loop' };
+      });
+      const originalProvider = deps.getAgentProvider;
+      deps.getAgentProvider = mock((id: string) => {
+        if (id !== 'codex-native-strict') throw new Error(`unexpected_test_provider:${id}`);
+        return { ...originalProvider(id), sendQuery: captured };
+      });
+      await executeDagWorkflow(
+        deps,
+        createMockPlatform(),
+        'offline-cursor-terra',
+        testDir,
+        // Only remove upstream test-fixture dependencies/condition. Keep the actual
+        // loop/model/provider/persona/prompt so the production dispatch path runs.
+        {
+          name: 'isolated-cursor-terra-loop',
+          nodes: [{ ...selected, depends_on: [], when: undefined }],
+        },
+        makeWorkflowRun(),
+        actual.workflow.provider!,
+        actual.workflow.model,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        {
+          ...minimalConfig,
+          assistant: 'cursor',
+          assistants: { cursor: { model: 'grok-4.7-high' }, 'codex-native-strict': {} },
+        }
+      );
+      expect(captured).toHaveBeenCalledTimes(1);
+      const options = (captured.mock.calls as unknown[][])[0][3] as Record<string, unknown>;
+      expect(options.model).toBe('gpt-5.6-terra');
+      expect(options.systemPrompt).toContain(
+        'You are the War Council Architect for Blue Devil Collectibles.'
+      );
+      expect(store.completeWorkflowRun).toHaveBeenCalled();
+    } finally {
+      clearRegistry();
+      registerBuiltinProviders();
+    }
+  });
+
   for (const provider of ['codex-native-strict', 'claude']) {
     for (const loop of [false, true]) {
       it(`Astra lane binds ${provider} ${loop ? 'loop' : 'prompt'} with a separate persona`, async () => {

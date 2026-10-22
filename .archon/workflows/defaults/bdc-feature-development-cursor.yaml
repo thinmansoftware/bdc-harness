@@ -3,7 +3,7 @@ description: |
   Dedicated Cursor-rail lane for feature Work Orders. Planning, implementation,
   and repair seats run through provider cursor (local cursor-agent CLI on the
   operator's Cursor subscription) with grok-4.7-high. Every review and
-  judge seat runs on provider codex with gpt-5.6-sol, so the
+  judge seat runs on provider codex-native-strict with gpt-5.6-terra, so the
   builder never grades its own output.
   Node graph,
   bash bodies and sentinels are byte-identical to bdc-feature-development-grok.
@@ -18,7 +18,7 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Dedicated Cursor execution default. Review nodes override to provider codex / gpt-5.6-sol.
+# Dedicated Cursor execution default. Review nodes override to provider codex-native-strict / gpt-5.6-terra.
 provider: cursor
 model: grok-4.7-high
 
@@ -545,9 +545,10 @@ nodes:
   - id: plan-review
     persona: war-council-architect-opr
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: war-council-architect-opr
     # Cross-model boundary: Grok 4.7 authors the plan on the Cursor rail;
-    # Codex (gpt-5.6-sol) reviews it. The builder never grades its own work.
+    # Codex (gpt-5.6-terra) reviews it. The builder never grades its own work.
     depends_on: [plan, checkout-repair-target]
     trigger_rule: all_done
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true' && $checkout-repair-target.output != ''"
@@ -2495,8 +2496,9 @@ nodes:
       exit 0
 
   - id: war-council-validator
-    # Codex/Sol judge; never the Cursor builder model.
+    # Codex/Terra judge; never the Cursor builder model.
     provider: codex-native-strict
+    model: gpt-5.6-terra
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
@@ -2635,6 +2637,7 @@ nodes:
   - id: diff-review
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -2905,6 +2908,7 @@ nodes:
   - id: diff-review-final
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -3071,6 +3075,7 @@ nodes:
   - id: opus-rereview
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3289,6 +3294,7 @@ nodes:
   - id: findings-consolidate
     persona: xo-opr
     provider: codex-native-strict
+    model: gpt-5.6-terra
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -3418,6 +3424,7 @@ nodes:
   - id: apply-diff-review-final
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done

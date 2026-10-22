@@ -4,7 +4,8 @@
  * WO-HARNESS-REVIEW-SEATS-NO-CLAUDE-FALLBACK-01:
  * served feature-development review seats fail closed on Codex. They use
  * provider codex-native-strict, carry no failover_provider, and do not pin a
- * node model when an agent or persona is set. No review-family node in these
+ * node model when an agent or persona is set, except the explicitly approved
+ * seven Cursor-lane Terra pins. No review-family node in these
  * lanes remains on plain provider codex.
  */
 
@@ -70,7 +71,7 @@ function isReviewFamily(node: NodeDef): boolean {
 
 describe('review seats fail closed (no Claude fallback)', () => {
   for (const { file, seats } of LANES) {
-    it(`${file}: listed seats are strict, unpinned, and have no failover`, () => {
+    it(`${file}: listed seats keep strict model policy and have no failover`, () => {
       const nodes = loadLane(file).nodes ?? [];
       for (const id of seats) {
         const node = nodes.find(candidate => candidate.id === id);
@@ -78,7 +79,11 @@ describe('review seats fail closed (no Claude fallback)', () => {
         expect(node?.provider, `${id}:provider`).toBe('codex-native-strict');
         expect(node?.failover_provider, `${id}:failover_provider`).toBeUndefined();
         if (node?.agent || node?.persona) {
-          expect(node?.model, `${id}:model`).toBeUndefined();
+          if (file === 'bdc-feature-development-cursor.yaml') {
+            expect(node?.model, `${id}:model`).toBe('gpt-5.6-terra');
+          } else {
+            expect(node?.model, `${id}:model`).toBeUndefined();
+          }
         }
       }
     });
