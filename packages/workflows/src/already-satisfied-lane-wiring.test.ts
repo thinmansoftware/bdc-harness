@@ -123,7 +123,9 @@ describe('already-satisfied lane wiring', () => {
       expect(node('plan')?.when).toBe(skipWhen);
       expect(node('plan-review')?.when).toBe(planReviewWhen);
       expect(node('plan-review')?.trigger_rule).toBe('all_done');
-      expect(node('implement')?.when).toBe(skipWhen);
+      expect(node('implement')?.when).toBe(
+        `${skipWhen} && $repair-gate.output.REPAIR_GATE_ALLOW == 'yes'`
+      );
       expect(node('implement')?.trigger_rule).toBe('all_done');
 
       for (const id of [

@@ -11,15 +11,15 @@
  * let a spec line equal to the delimiter terminate the heredoc and hand the rest
  * of the spec to bash. The executor already renders `$read-spec.output` as a
  * shellQuote-wrapped single-quoted value (dag-executor substituteNodeOutputRefs
- * with escapedForBash=true), so the safe shape is the direct assignment
- * `SPEC_TEXT=$read-spec.output` -- the same fix the Overseer accepted for
- * commit-and-push on #826 round 9.
+ * with escapedForBash=true). Decision nodes now read the hash-verified
+ * authority file instead of that substitution. A heredoc around
+ * `$read-spec.output` is still forbidden.
  *
  * Three layers here:
  *   1. a sweep over EVERY default lane: no heredoc body may contain
  *      `$read-spec.output` (the class, not one node);
- *   2. wiring: every lane that carries resolve-review-base uses the direct
- *      assignment;
+ *   2. wiring: every lane that carries resolve-review-base reads the
+ *      authority file;
  *   3. a runtime proof with the production substitution: a spec that carries
  *      the old delimiter cannot execute anything from the fixed node, and the
  *      legacy heredoc shape (kept inline as a fixture) DOES execute it -- so the
@@ -27,7 +27,15 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { parseWorkflow } from './loader';
@@ -120,7 +128,7 @@ describe('#841 sweep: no default lane wraps $read-spec.output in a heredoc', () 
   }
 });
 
-describe('#841 wiring: resolve-review-base reads the spec by direct assignment', () => {
+describe('#841 wiring: resolve-review-base reads the authority file', () => {
   const lanesWithNode = LANE_FILES.filter(
     f => f.startsWith('bdc-feature-development') && nodeBash(f, 'resolve-review-base') !== undefined
   );
@@ -130,10 +138,11 @@ describe('#841 wiring: resolve-review-base reads the spec by direct assignment',
   });
 
   for (const file of lanesWithNode) {
-    it(`${file}: SPEC_TEXT=$read-spec.output, no cat/heredoc capture`, () => {
+    it(`${file}: reads the authority file, no heredoc capture`, () => {
       const bash = nodeBash(file, 'resolve-review-base') ?? '';
-      expect(bash).toContain('SPEC_TEXT=$read-spec.output');
-      expect(bash).not.toContain('SPEC_TEXT=$(cat');
+      expect(bash).toContain('RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"');
+      expect(bash).toContain('SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")');
+      expect(bash).not.toContain('SPEC_TEXT=$read-spec.output');
       expect(bash).not.toContain("<<'");
     });
   }
@@ -158,14 +167,17 @@ describe('#841 runtime: a hostile spec cannot execute from the fixed node', () =
     const dir = mkdtempSync(join(tmpdir(), 'rsb-fixed-'));
     try {
       const marker = join(dir, 'injected');
+      mkdirSync(join(dir, 'authority'), { recursive: true });
+      writeFileSync(join(dir, 'authority', 'work-order.md'), HOSTILE_SPEC);
       const bash = nodeBash('bdc-feature-development.yaml', 'resolve-review-base');
       expect(bash).toBeDefined();
-      // No git remote here, so the declared base cannot be verified and the node
-      // falls through to the env default -- the point is that it gets there at
-      // all, with the hostile lines still inside SPEC_TEXT.
+      // No matching remote branch, so the declared base cannot be verified and the
+      // node falls through to the env default -- the point is that it gets there
+      // at all, with the hostile lines still inside SPEC_TEXT.
       const res = await runBash(render(bash ?? '', HOSTILE_SPEC), {
         INJECT_MARKER: marker,
         BASE_BRANCH: 'dev',
+        ARTIFACTS_DIR: dir,
       });
       expect(existsSync(marker)).toBe(false);
       expect(res.exitCode).toBe(0);
