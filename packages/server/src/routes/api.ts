@@ -337,8 +337,11 @@ import {
 import {
   boardRecipientResponseSchema,
   xoLeaseAcquireBodySchema,
+  xoLeaseHandoffBodySchema,
+  xoLeaseHandoffResponseSchema,
   xoLeaseReleaseBodySchema,
   xoLeaseRenewBodySchema,
+  xoLeaseReservationSchema,
   xoLeaseSchema,
   scopeApprovalRecordBodySchema,
   scopeApprovalRevokeBodySchema,
@@ -1057,6 +1060,43 @@ const currentXoLeaseRoute = createRoute({
     200: {
       content: { 'application/json': { schema: xoLeaseSchema.nullable() } },
       description: 'Current XO lease or null',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const directXoLeaseHandoffRoute = createRoute({
+  method: 'post',
+  path: '/api/board/xo-lease/handoff',
+  tags: ['Board Authority'],
+  summary: 'Direct the active XO lease to a named successor',
+  request: {
+    body: {
+      content: { 'application/json': { schema: xoLeaseHandoffBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: xoLeaseHandoffResponseSchema } },
+      description: 'Directed handoff reservation',
+    },
+    401: jsonError('Board principal rejected'),
+    403: jsonError('John seat required'),
+    409: jsonError('Handoff conflict'),
+    500: jsonError('Server error'),
+  },
+});
+
+const directedXoLeaseReservationRoute = createRoute({
+  method: 'get',
+  path: '/api/board/xo-lease/handoff',
+  tags: ['Board Authority'],
+  summary: 'Read the unexpired directed XO lease reservation',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: xoLeaseReservationSchema.nullable() } },
+      description: 'Unexpired reservation or null',
     },
     500: jsonError('Server error'),
   },
@@ -4851,6 +4891,49 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'board_xo_lease_current_failed');
       return apiError(c, 500, 'Failed to read current XO lease');
+    }
+  });
+
+  registerOpenApiRoute(directXoLeaseHandoffRoute, async c => {
+    try {
+      const body = getValidatedBody(c, xoLeaseHandoffBodySchema);
+      const principal = await boardAuthorityDb.authenticateBoardPrincipal(body);
+      const result = await boardAuthorityDb.directXoLeaseHandoff({
+        principal,
+        expected_fencing_token: body.expected_fencing_token,
+        successor_principal_id: body.successor_principal_id,
+        reservation_ms: body.reservation_ms,
+      });
+      if (
+        !result.ok ||
+        !result.handed_off_lease_id ||
+        result.fencing_token === undefined ||
+        !result.successor_principal_id ||
+        !result.reserved_until
+      ) {
+        const reason = result.reason ?? 'xo_lease_conflict';
+        if (reason === 'handoff_requires_john_seat') return apiError(c, 403, reason);
+        return apiError(c, 409, reason);
+      }
+      return c.json({
+        handed_off_lease_id: result.handed_off_lease_id,
+        fencing_token: result.fencing_token,
+        successor_principal_id: result.successor_principal_id,
+        reserved_until: result.reserved_until,
+      });
+    } catch (error) {
+      if (isBoardPrincipalAuthError(error)) return apiError(c, 401, (error as Error).message);
+      getLog().error({ err: error }, 'board_xo_lease_handoff_failed');
+      return apiError(c, 500, 'Failed to direct XO lease handoff');
+    }
+  });
+
+  registerOpenApiRoute(directedXoLeaseReservationRoute, async c => {
+    try {
+      return c.json(await boardAuthorityDb.getDirectedXoLeaseReservation());
+    } catch (error) {
+      getLog().error({ err: error }, 'board_xo_lease_handoff_read_failed');
+      return apiError(c, 500, 'Failed to read XO lease handoff');
     }
   });
 

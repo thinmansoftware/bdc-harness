@@ -669,7 +669,10 @@ CREATE TABLE IF NOT EXISTS board_xo_leases (
   acquired_at TIMESTAMPTZ NOT NULL,
   renewed_at TIMESTAMPTZ,
   expires_at TIMESTAMPTZ NOT NULL,
-  released_at TIMESTAMPTZ
+  released_at TIMESTAMPTZ,
+  handoff_successor_principal_id TEXT,
+  handoff_reserved_until TEXT,
+  handoff_directed_by TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_board_xo_leases_active
@@ -699,7 +702,8 @@ CREATE TABLE IF NOT EXISTS board_audit_events (
       'manual_initiation_recorded',
       'ce_scope_approval_recorded',
       'ce_scope_approval_revoked',
-      'ce_scope_approval_rejected'
+      'ce_scope_approval_rejected',
+      'xo_lease_handoff_directed'
     )
   ),
   actor_principal_id TEXT,
