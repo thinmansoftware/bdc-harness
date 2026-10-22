@@ -28,6 +28,36 @@ const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const DEFAULT_MAX_TURNS = 40;
 
 type ChatMessage = OpenAI.Chat.ChatCompletionMessageParam;
+type GrokTool = (typeof GROK_AGENT_TOOLS)[number];
+
+function resolveCallBudgetUsd(options: SendQueryOptions | undefined): number | undefined {
+  const raw = options?.nodeConfig?.maxBudgetUsd ?? options?.maxBudgetUsd;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined;
+  return raw;
+}
+
+/** Finite zero is a real cost. Missing, non-numeric, and negative costs are not. */
+function readOpenRouterUsageCost(usage: unknown): number | undefined {
+  if (typeof usage !== 'object' || usage === null) return undefined;
+  const cost = (usage as { cost?: unknown }).cost;
+  if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0) return undefined;
+  return cost;
+}
+
+function advertisedGrokTools(options: SendQueryOptions | undefined): GrokTool[] {
+  const allowed = options?.nodeConfig?.allowed_tools;
+  const denied = options?.nodeConfig?.denied_tools;
+  let tools: GrokTool[] = [...GROK_AGENT_TOOLS];
+  if (allowed !== undefined) {
+    const allow = new Set(allowed);
+    tools = tools.filter(tool => allow.has(tool.function.name));
+  }
+  if (denied !== undefined && denied.length > 0) {
+    const deny = new Set(denied);
+    tools = tools.filter(tool => !deny.has(tool.function.name));
+  }
+  return tools;
+}
 
 export class GrokAgentProvider implements IAgentProvider {
   private readonly model: string | undefined;
@@ -110,10 +140,35 @@ export class GrokAgentProvider implements IAgentProvider {
     }
     messages.push({ role: 'user', content: userContent });
 
+    const cap = resolveCallBudgetUsd(options);
+    const tools = advertisedGrokTools(options);
+    const advertisedNames = new Set(tools.map(tool => tool.function.name));
+
     let totalIn = 0;
     let totalOut = 0;
+    let totalCost: number | undefined;
     let servedModelId: string | undefined;
     let finalText = '';
+
+    const buildTokens = (): TokenUsage | undefined =>
+      totalIn + totalOut > 0
+        ? {
+            input: totalIn,
+            output: totalOut,
+            total: totalIn + totalOut,
+            ...(totalCost !== undefined ? { cost: totalCost } : {}),
+          }
+        : undefined;
+
+    const yieldKnownCostError = (errorSubtype: string, errors: string[]): MessageChunk => ({
+      type: 'result',
+      isError: true,
+      errorSubtype,
+      errors,
+      ...(totalCost !== undefined ? { cost: totalCost } : {}),
+      ...(buildTokens() !== undefined ? { tokens: buildTokens() } : {}),
+      ...(servedModelId !== undefined ? { servedModelId } : {}),
+    });
 
     for (let turn = 0; turn < this.maxTurns; turn++) {
       let completion: OpenAI.Chat.Completions.ChatCompletion;
@@ -122,13 +177,15 @@ export class GrokAgentProvider implements IAgentProvider {
           {
             model: resolvedModel,
             messages,
-            tools: GROK_AGENT_TOOLS,
-            tool_choice: 'auto',
+            ...(tools.length > 0 ? { tools, tool_choice: 'auto' as const } : {}),
           },
           { signal: options?.abortSignal }
         );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        if (totalCost !== undefined) {
+          yield yieldKnownCostError('openrouter_request_failed', [msg]);
+        }
         throw new Error(`Grok/OpenRouter request failed: ${msg}`);
       }
 
@@ -140,9 +197,19 @@ export class GrokAgentProvider implements IAgentProvider {
         totalOut += completion.usage.completion_tokens ?? 0;
       }
 
+      const turnCost = readOpenRouterUsageCost(completion.usage);
+      if (turnCost === undefined) {
+        yield yieldKnownCostError('openrouter_cost_missing', ['openrouter_cost_missing']);
+        return;
+      }
+      totalCost = (totalCost ?? 0) + turnCost;
+
       const choice = completion.choices[0];
       const msg = choice?.message;
       if (!msg) {
+        yield yieldKnownCostError('openrouter_empty_message', [
+          'Grok/OpenRouter returned empty message',
+        ]);
         throw new Error('Grok/OpenRouter returned empty message');
       }
 
@@ -158,9 +225,14 @@ export class GrokAgentProvider implements IAgentProvider {
         yield { type: 'assistant', content: msg.content };
       }
 
-      const toolCalls = msg.tool_calls ?? [];
+      const toolCalls = (msg.tool_calls ?? []).filter(call => call.type === 'function');
+      const overCap =
+        cap !== undefined && totalCost >= cap && (toolCalls.length > 0 || totalCost > cap);
+      if (overCap) {
+        yield yieldKnownCostError('error_max_budget_usd', ['error_max_budget_usd']);
+        return;
+      }
       if (toolCalls.length === 0) {
-        // Model finished without tools
         break;
       }
 
@@ -184,6 +256,21 @@ export class GrokAgentProvider implements IAgentProvider {
           toolInput,
           toolCallId: call.id,
         };
+        if (!advertisedNames.has(name)) {
+          const rejection = `ERROR: tool '${name}' is not allowed`;
+          yield {
+            type: 'tool_result',
+            toolName: name,
+            toolOutput: rejection,
+            toolCallId: call.id,
+          };
+          messages.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: rejection,
+          });
+          continue;
+        }
         const result = await executeGrokTool(cwd, name, args, {
           bashTimeoutMs: this.bashTimeoutMs,
         });
@@ -195,10 +282,7 @@ export class GrokAgentProvider implements IAgentProvider {
       }
     }
 
-    const tokens: TokenUsage | undefined =
-      totalIn + totalOut > 0
-        ? { input: totalIn, output: totalOut, total: totalIn + totalOut }
-        : undefined;
+    const tokens = buildTokens();
 
     let structuredOutput: unknown;
     if (options?.outputFormat?.type === 'json_schema' && finalText) {
@@ -211,7 +295,8 @@ export class GrokAgentProvider implements IAgentProvider {
 
     yield {
       type: 'result',
-      tokens,
+      ...(tokens !== undefined ? { tokens } : {}),
+      ...(totalCost !== undefined ? { cost: totalCost } : {}),
       stopReason: 'stop',
       structuredOutput,
       ...(servedModelId !== undefined ? { servedModelId } : {}),

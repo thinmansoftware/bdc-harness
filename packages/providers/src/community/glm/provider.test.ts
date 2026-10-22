@@ -26,27 +26,72 @@ const mockStreamIterator = {
     };
     yield {
       choices: [{ delta: {} }],
-      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cost: 0 },
     };
   }),
 };
 
 const mockCreate = mock(async () => mockStreamIterator);
 
-const mockOpenAI = mock(function () {
-  return {
-    chat: {
-      completions: {
-        create: mockCreate,
-      },
+const mockOpenAI = mock((_arg?: unknown) => ({
+  chat: {
+    completions: {
+      create: mockCreate,
     },
+  },
+}));
+
+interface OpenRouterMockSlots {
+  grokCreate?: (body: unknown, options?: { signal?: AbortSignal }) => Promise<unknown>;
+  glmCreate?: (body: unknown, options?: { signal?: AbortSignal }) => Promise<unknown>;
+  grokCtor?: (arg: unknown) => void;
+  glmCtor?: (arg: unknown) => void;
+}
+
+function openRouterMockSlots(): OpenRouterMockSlots {
+  const bag = globalThis as typeof globalThis & {
+    __bdcOpenRouterMockSlots?: OpenRouterMockSlots;
   };
-});
+  bag.__bdcOpenRouterMockSlots ??= {};
+  return bag.__bdcOpenRouterMockSlots;
+}
+
+function dispatchOpenRouterCreate(
+  body: unknown,
+  options?: { signal?: AbortSignal }
+): Promise<unknown> {
+  const streaming =
+    typeof body === 'object' && body !== null && (body as { stream?: unknown }).stream === true;
+  const slots = openRouterMockSlots();
+  const fn = streaming ? slots.glmCreate : slots.grokCreate;
+  if (!fn) {
+    throw new Error(
+      streaming
+        ? 'openai mock: GLM streaming dispatcher is not registered'
+        : 'openai mock: Grok dispatcher is not registered'
+    );
+  }
+  return fn(body, options);
+}
+
+function SharedOpenAI(arg: unknown): {
+  chat: { completions: { create: typeof dispatchOpenRouterCreate } };
+} {
+  const slots = openRouterMockSlots();
+  slots.grokCtor?.(arg);
+  slots.glmCtor?.(arg);
+  return { chat: { completions: { create: dispatchOpenRouterCreate } } };
+}
 
 mock.module('openai', () => ({
-  default: mockOpenAI,
-  OpenAI: mockOpenAI,
+  default: SharedOpenAI,
+  OpenAI: SharedOpenAI,
 }));
+
+openRouterMockSlots().glmCreate = (body, options) => mockCreate(body, options);
+openRouterMockSlots().glmCtor = (arg: unknown): void => {
+  mockOpenAI(arg);
+};
 
 // --- Import under test (after mocks) ---------------------------------------
 
@@ -67,7 +112,8 @@ describe('GlmProvider', () => {
     registerBuiltinProviders();
     // Reset GLM_API_KEY between tests
     delete process.env['GLM_API_KEY'];
-    mockCreate.mockClear();
+    mockCreate.mockReset();
+    mockCreate.mockImplementation(async () => mockStreamIterator);
     mockOpenAI.mockClear();
   });
 
@@ -147,7 +193,7 @@ describe('GlmProvider', () => {
         yield {
           model: 'z-ai/glm-5.2-20260616',
           choices: [{ delta: {} }],
-          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+          usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8, cost: 0 },
         };
       },
     }));
@@ -268,5 +314,178 @@ describe('GlmProvider', () => {
       repositoryWrite: false,
       shell: false,
     });
+    expect(getProviderCapabilities('glm').costControl).toBe(true);
+    expect(getProviderCapabilities('glm').toolRestrictions).toBe(false);
+  });
+
+  test('emits usage.cost from the final stream chunk and fails closed when it is missing', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+    mockCreate.mockImplementationOnce(async () => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield { model: 'z-ai/glm-5.2', choices: [{ delta: { content: 'hi' } }], usage: null };
+        yield {
+          model: 'z-ai/glm-5.2',
+          choices: [{ delta: {} }],
+          usage: { prompt_tokens: 8, completion_tokens: 2, total_tokens: 10, cost: 0.004 },
+        };
+      },
+    }));
+    const provider = new GlmProvider();
+    const chunks = [];
+    for await (const chunk of provider.sendQuery('cost', '/tmp', undefined, { model: 'glm-5.2' })) {
+      chunks.push(chunk);
+    }
+    const result = chunks.find(chunk => chunk.type === 'result');
+    expect(result && result.type === 'result' ? result.cost : undefined).toBe(0.004);
+    expect(result && result.type === 'result' ? result.tokens?.cost : undefined).toBe(0.004);
+    expect(result && result.type === 'result' ? result.isError : false).toBeFalsy();
+
+    mockCreate.mockImplementationOnce(async () => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield { choices: [{ delta: { content: 'hi' } }], usage: null };
+        yield {
+          choices: [{ delta: {} }],
+          usage: { prompt_tokens: 8, completion_tokens: 2, total_tokens: 10 },
+        };
+      },
+    }));
+    const missingChunks = [];
+    for await (const chunk of provider.sendQuery('missing', '/tmp', undefined, {
+      model: 'glm-5.2',
+    })) {
+      missingChunks.push(chunk);
+    }
+    const missing = missingChunks.find(chunk => chunk.type === 'result');
+    expect(missing && missing.type === 'result' ? missing.errorSubtype : undefined).toBe(
+      'openrouter_cost_missing'
+    );
+    expect(missing && missing.type === 'result' ? missing.cost : undefined).toBeUndefined();
+  });
+
+  test('carries primary cost onto a failback result and does not emit an error result first', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+    mockCreate.mockImplementationOnce(async () => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield { choices: [{ delta: { content: 'partial' } }], usage: null };
+        yield {
+          choices: [{ delta: {} }],
+          usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6, cost: 0.002 },
+        };
+        throw new Error('socket hang up');
+      },
+    }));
+    const failbackSendQuery = mock(async function* () {
+      yield { type: 'assistant' as const, content: 'fallback' };
+      yield { type: 'result' as const, cost: 0.003 };
+    });
+    const failbackFactory = mock(() => ({ sendQuery: failbackSendQuery, getType: () => 'claude' }));
+    const provider = new GlmProvider({
+      failbackProviderFactory: failbackFactory as unknown as () => GlmProvider,
+    });
+    const chunks = [];
+    for await (const chunk of provider.sendQuery('failback', '/tmp')) {
+      chunks.push(chunk);
+    }
+    expect(chunks.some(chunk => chunk.type === 'result' && chunk.isError)).toBe(false);
+    expect(chunks.some(chunk => chunk.type === 'provider_route')).toBe(true);
+    const result = chunks.find(chunk => chunk.type === 'result');
+    expect(result && result.type === 'result' ? result.cost : undefined).toBe(0.005);
+  });
+
+  test('emits known cost then rethrows when a stream fails after usage without failback', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+    mockCreate.mockImplementationOnce(async () => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield {
+          choices: [{ delta: { content: 'paid' } }],
+          usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3, cost: 0.002 },
+        };
+        throw new Error('socket hang up');
+      },
+    }));
+    const provider = new GlmProvider();
+    const chunks = [];
+    let thrown: Error | undefined;
+    try {
+      for await (const chunk of provider.sendQuery('nofb', '/tmp')) {
+        chunks.push(chunk);
+      }
+    } catch (err) {
+      thrown = err as Error;
+    }
+    const result = chunks.find(chunk => chunk.type === 'result');
+    expect(result && result.type === 'result' ? result.isError : undefined).toBe(true);
+    expect(result && result.type === 'result' ? result.cost : undefined).toBe(0.002);
+    expect(thrown?.message).toContain('socket hang up');
+  });
+
+  test('does not fail back when the stream dies before its usage chunk', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+    mockCreate.mockImplementationOnce(async () => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield { choices: [{ delta: { content: 'partial' } }], usage: null };
+        throw new Error('socket hang up');
+      },
+    }));
+    const failbackFactory = mock(() => {
+      throw new Error('failback must not run before usage');
+    });
+    const provider = new GlmProvider({
+      failbackProviderFactory: failbackFactory as unknown as () => GlmProvider,
+    });
+    const chunks = [];
+    for await (const chunk of provider.sendQuery('early', '/tmp', undefined, {
+      nodeConfig: { maxBudgetUsd: 0.01 },
+    })) {
+      chunks.push(chunk);
+    }
+    expect(failbackFactory).not.toHaveBeenCalled();
+    const result = chunks.find(chunk => chunk.type === 'result');
+    expect(result && result.type === 'result' ? result.errorSubtype : undefined).toBe(
+      'openrouter_cost_missing'
+    );
+    expect(result && result.type === 'result' ? result.cost : undefined).toBeUndefined();
+  });
+
+  test('returns error_max_budget_usd when the real cost is above the cap and allows an equal cap', async () => {
+    process.env['GLM_API_KEY'] = 'sk-or-test';
+    mockCreate.mockImplementation(async () => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield {
+          choices: [{ delta: { content: 'over' } }],
+          usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3, cost: 0.004 },
+        };
+      },
+    }));
+    const provider = new GlmProvider();
+    const over = [];
+    for await (const chunk of provider.sendQuery('over', '/tmp', undefined, {
+      nodeConfig: { maxBudgetUsd: 0.002 },
+    })) {
+      over.push(chunk);
+    }
+    const overResult = over.find(chunk => chunk.type === 'result');
+    expect(overResult && overResult.type === 'result' ? overResult.errorSubtype : undefined).toBe(
+      'error_max_budget_usd'
+    );
+    expect(overResult && overResult.type === 'result' ? overResult.cost : undefined).toBe(0.004);
+
+    mockCreate.mockImplementation(async () => ({
+      [Symbol.asyncIterator]: async function* () {
+        yield {
+          choices: [{ delta: { content: 'equal' } }],
+          usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3, cost: 0.002 },
+        };
+      },
+    }));
+    const equal = [];
+    for await (const chunk of provider.sendQuery('equal', '/tmp', undefined, {
+      maxBudgetUsd: 0.002,
+    })) {
+      equal.push(chunk);
+    }
+    const equalResult = equal.find(chunk => chunk.type === 'result');
+    expect(equalResult && equalResult.type === 'result' ? equalResult.isError : false).toBeFalsy();
+    expect(equalResult && equalResult.type === 'result' ? equalResult.cost : undefined).toBe(0.002);
   });
 });

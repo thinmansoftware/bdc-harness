@@ -11,12 +11,13 @@ import type { ProviderCapabilities } from '../../types';
  * - hooks: false -- no SDK hook callbacks.
  * - skills: false -- no skill loading.
  * - agents: false -- no inline sub-agent definitions.
- * - toolRestrictions: false -- no per-node tool allow/deny lists.
+ * - toolRestrictions: false -- no tools, so no per-node allow/deny lists.
  * - structuredOutput: true -- best-effort (JSON instruction appended to prompt,
  *   parse on result), matching the Pi provider comment. Reliable on
  *   instruction-following models; parse failures degrade gracefully.
  * - envInjection: true -- env vars passed to subprocess contexts.
- * - costControl: false -- no maxBudgetUsd enforcement.
+ * - costControl is true -- maxBudgetUsd is checked after the single completion.
+ *   A missing OpenRouter usage.cost fails the call closed.
  * - effortControl: true -- accepted but no-op stub (field silently dropped,
  *   model default used). Declared true so the dag-executor does not warn
  *   when effort: is set in a workflow node.
@@ -34,7 +35,7 @@ export const GLM_CAPABILITIES: ProviderCapabilities = {
   toolRestrictions: false,
   structuredOutput: true,
   envInjection: true,
-  costControl: false,
+  costControl: true,
   effortControl: true,
   thinkingControl: false,
   fallbackModel: false,
