@@ -22,6 +22,8 @@ export default tseslint.config(
       '**/*.js',
       '*.mjs',
       '**/*.test.ts',
+      // This boot-chown test is linted on purpose (WO-HARNESS-BOOT-CHOWN-FAST-01).
+      '!scripts/container/docker-entrypoint-boot-chown.test.ts',
       '**/src/test/**', // Test helper files (mock factories, fixtures)
       '*.d.ts', // Root-level declaration files (not in tsconfig project scope)
       '**/*.generated.d.ts', // Auto-generated declaration files (e.g. openapi-typescript output)
