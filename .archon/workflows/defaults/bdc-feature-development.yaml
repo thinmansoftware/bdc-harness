@@ -2627,6 +2627,7 @@ nodes:
 
   - id: diff-review
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -2885,6 +2886,7 @@ nodes:
 
   - id: diff-review-final
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -3050,6 +3052,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3392,6 +3395,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
