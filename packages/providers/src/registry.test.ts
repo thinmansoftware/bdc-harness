@@ -1,4 +1,48 @@
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, mock } from 'bun:test';
+
+const mockCodexRunStreamed = mock(() => Promise.reject(new Error('unconfigured Codex failure')));
+const mockCodexStartThread = mock(() => ({
+  id: 'strict-registry-test-thread',
+  runStreamed: mockCodexRunStreamed,
+}));
+const MockCodex = mock(() => ({
+  startThread: mockCodexStartThread,
+  resumeThread: mockCodexStartThread,
+}));
+const MockClaudeProvider = mock(() => ({
+  getType: () => 'claude',
+  getCapabilities: () => ({
+    execution: { text: true, repositoryRead: true, repositoryWrite: true, shell: true },
+    sessionResume: true,
+    mcp: true,
+    hooks: true,
+    skills: true,
+    agents: true,
+    toolRestrictions: true,
+    structuredOutput: true,
+    envInjection: true,
+    costControl: true,
+    effortControl: true,
+    thinkingControl: true,
+    fallbackModel: true,
+    sandbox: true,
+  }),
+  async *sendQuery() {
+    yield { type: 'result' as const };
+  },
+}));
+
+mock.module('@openai/codex-sdk', () => ({ Codex: MockCodex }));
+mock.module('./claude/provider', () => ({ ClaudeProvider: MockClaudeProvider }));
+mock.module('./auth-refresh/index.js', () => ({
+  AUTH_PATTERNS: ['unauthorized', 'authentication', '401', '403'],
+  ensureFreshAuth: mock(async () => {}),
+  refreshIfAuthFailed: mock(async () => ({ refreshed: false, reason: 'no_creds' as const })),
+  isTerminalRefreshReason: () => false,
+  buildReauthMessage: (provider: string, reason: string) => `${provider} auth failed: ${reason}`,
+  isAuthErrorMessage: (message: string | undefined) =>
+    /unauthorized|authentication|\b401\b|\b403\b/i.test(message ?? ''),
+}));
 import {
   getAgentProvider,
   getProviderCapabilities,
@@ -21,6 +65,7 @@ import {
   registerOprZeroProvider,
 } from './community/glm/registration';
 import { UnknownProviderError } from './errors';
+import { resetCodexSingleton } from './codex/provider';
 import type { ProviderRegistration, IAgentProvider, ProviderCapabilities } from './types';
 
 /** Minimal mock provider for testing registration. */
@@ -65,6 +110,11 @@ function makeMockRegistration(
 
 describe('registry', () => {
   beforeEach(() => {
+    resetCodexSingleton();
+    MockCodex.mockClear();
+    mockCodexStartThread.mockClear();
+    mockCodexRunStreamed.mockClear();
+    MockClaudeProvider.mockClear();
     clearRegistry();
     registerBuiltinProviders();
   });
@@ -95,6 +145,26 @@ describe('registry', () => {
       expect(
         typeof Object.getOwnPropertyDescriptor(ordinary, 'failbackProviderFactory')?.value
       ).toBe('function');
+    });
+
+    test.each([
+      ['429/provider unavailable', new Error('429 provider unavailable after retries')],
+      ['authentication failure', new Error('401 unauthorized: authentication failed')],
+    ])('strict native Codex fails closed on %s', async (_label, terminalError) => {
+      mockCodexRunStreamed.mockRejectedValue(terminalError);
+      const provider = getRegistration('codex-native-strict').factory();
+      Object.defineProperty(provider, 'retryBaseDelayMs', { value: 1 });
+      const chunks: Array<{ type?: string }> = [];
+
+      const consume = async (): Promise<void> => {
+        for await (const chunk of provider.sendQuery('review this change', '/workspace')) {
+          chunks.push(chunk);
+        }
+      };
+
+      await expect(consume()).rejects.toThrow();
+      expect(chunks.some(chunk => chunk.type === 'provider_route')).toBe(false);
+      expect(MockClaudeProvider).not.toHaveBeenCalled();
     });
 
     test('throws UnknownProviderError for unknown type', () => {

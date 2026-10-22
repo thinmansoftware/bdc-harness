@@ -149,10 +149,10 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-cursor.yaml') {
-        // Grok 4.7 builds on the Cursor rail; the judge is Codex gpt-5.6-sol
+        // Grok 4.7 builds on the Cursor rail; the judge is strict Codex
         // so the lane never grades its own work.
-        expect(wcv.provider).toBe('codex');
-        expect(wcv.model).toBe('gpt-5.6-sol');
+        expect(wcv.provider).toBe('codex-native-strict');
+        expect(wcv.model).toBeUndefined();
         expect(wcv.persona).toBe('captain-ci-validator-codex');
         return;
       }
@@ -172,15 +172,14 @@ describe('lane registration and war-council-validator pin', () => {
 
       if (file === 'bdc-feature-development-codex-only.yaml') {
         // Claude-out / Codex-in: validator on codex with model-free persona.
-        expect(wcv.provider).toBe('codex');
+        expect(wcv.provider).toBe('codex-native-strict');
         return;
       }
 
       if (file === 'bdc-feature-development-codex.yaml') {
-        // This lane builds with gpt-5.6-sol. The judge is gpt-5.6-terra so
-        // the builder never grades its own work.
-        expect(wcv.provider).toBe('codex');
-        expect(wcv.model).toBe('gpt-5.6-terra');
+        // This lane builds with gpt-5.6-sol. The judge uses strict Codex.
+        expect(wcv.provider).toBe('codex-native-strict');
+        expect(wcv.model).toBeUndefined();
         expect(wcv.persona).toBe('captain-ci-validator-codex');
         return;
       }
@@ -298,7 +297,7 @@ describe('lane registration and war-council-validator pin', () => {
     return node?.persona ?? node?.agent;
   }
 
-  it('S4l: the Cursor lane builds on grok-4.7 and reviews on Codex gpt-5.6-sol', () => {
+  it('S4l: the Cursor lane builds on grok-4.7 and reviews on strict Codex', () => {
     const file = 'bdc-feature-development-cursor.yaml';
     const lane = loadLane(file);
     const grok = loadLane('bdc-feature-development-grok.yaml');
@@ -325,10 +324,10 @@ describe('lane registration and war-council-validator pin', () => {
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = node(id);
       const source = codexNode(id);
-      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex');
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
       expect(reviewNode?.provider, `${file}:${id}:provider`).toBe(source?.provider);
-      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-5.6-sol');
-      expect(source?.model, `codex:${id}:model`).toBe('gpt-5.6-terra');
+      expect(reviewNode?.model, `${file}:${id}:model`).toBeUndefined();
+      expect(source?.model, `codex:${id}:model`).toBeUndefined();
       expect(reviewNode?.persona, `${file}:${id}:persona`).toBe(source?.persona);
       expect(reviewNode?.agent, `${file}:${id}:agent`).toBe(source?.agent);
       expect(REVIEW_PERSONA_ALLOWLIST.has(reviewPersona(reviewNode) ?? '')).toBe(true);
@@ -351,13 +350,13 @@ describe('lane registration and war-council-validator pin', () => {
     expect(content).not.toMatch(/^\s*provider:\s*(grok|codex-opr)\b/m);
   });
 
-  it('Test 1: cursor-lane review seats are Codex gpt-5.6-sol with model-free personas', () => {
+  it('Test 1: cursor-lane review seats are strict Codex with model-free personas', () => {
     const lane = loadLane('bdc-feature-development-cursor.yaml');
     const nodes = lane.nodes ?? [];
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = nodes.find(candidate => candidate.id === id);
-      expect(reviewNode?.provider, id).toBe('codex');
-      expect(reviewNode?.model, id).toBe('gpt-5.6-sol');
+      expect(reviewNode?.provider, id).toBe('codex-native-strict');
+      expect(reviewNode?.model, id).toBeUndefined();
       expect(reviewNode?.provider, id).not.toBe('claude');
       expect(reviewNode?.provider, id).not.toBe('cursor');
       expect(reviewNode?.model ?? '', id).not.toMatch(/grok/i);
@@ -369,14 +368,13 @@ describe('lane registration and war-council-validator pin', () => {
     }
   });
 
-  it('Test 2: codex-lane review seats are Codex gpt-5.6-terra', () => {
+  it('Test 2: codex-lane review seats are strict Codex with no node model', () => {
     const lane = loadLane('bdc-feature-development-codex.yaml');
     const nodes = lane.nodes ?? [];
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = nodes.find(candidate => candidate.id === id);
-      expect(reviewNode?.provider, id).toBe('codex');
-      expect(reviewNode?.model, id).toBe('gpt-5.6-terra');
-      expect(reviewNode?.model, id).not.toBe('gpt-5.6-sol');
+      expect(reviewNode?.provider, id).toBe('codex-native-strict');
+      expect(reviewNode?.model, id).toBeUndefined();
       expect(reviewNode?.provider, id).not.toBe('claude');
       const persona = reviewPersona(reviewNode);
       expect(REVIEW_PERSONA_ALLOWLIST.has(persona ?? ''), id).toBe(true);
@@ -394,7 +392,7 @@ describe('lane registration and war-council-validator pin', () => {
     }
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = (cursor.nodes ?? []).find(candidate => candidate.id === id);
-      expect(reviewNode?.model, `cursor:${id}`).toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, `cursor:${id}`).toBeUndefined();
       expect(reviewNode?.model, `cursor:${id}`).not.toBe(cursor.model);
     }
 
@@ -405,8 +403,7 @@ describe('lane registration and war-council-validator pin', () => {
     }
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
-      expect(reviewNode?.model, `codex:${id}`).toBe('gpt-5.6-terra');
-      expect(reviewNode?.model, `codex:${id}`).not.toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, `codex:${id}`).toBeUndefined();
       expect(reviewNode?.model, `codex:${id}`).not.toBe(codex.model);
     }
   });
