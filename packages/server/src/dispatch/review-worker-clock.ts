@@ -47,6 +47,10 @@ const CHECKS_PENDING_BACKOFF_MS = Math.max(
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
 
+interface ReviewWorkerLogger {
+  warn(data: Record<string, unknown>, message: string): void;
+}
+
 export interface ReviewWorkerDeps {
   registerWorker: typeof registerWorker;
   heartbeatWorker: typeof heartbeatWorker;
@@ -62,6 +66,8 @@ export interface ReviewWorkerDeps {
   deferMessage: typeof deferMessage;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
+  /** Optional logger seam for deterministic observability tests. */
+  logger?: ReviewWorkerLogger;
   /**
    * Backstop for lost check-completion deliveries (#782 part 3). Optional so a
    * test double can omit it; when absent the sweep simply does not run and the
@@ -224,11 +230,26 @@ export async function tickReviewWorkerClock(
           // WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7 names this
           // transition `deferMessage`; it is the same fenced claimed->queued
           // transition, called by its WO name.
+          const deferUntil = new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString();
+          const pendingChecks = outcome.pendingChecks ?? [];
+          (deps.logger ?? log).warn(
+            {
+              messageId: claimed.id,
+              owner: work.owner,
+              repo: work.repo,
+              prNumber: work.prNumber,
+              headSha: work.headSha,
+              defer_until: deferUntil,
+              pending_checks: pendingChecks,
+              ...(outcome.pendingChecks === undefined ? { reason: 'no_checks_reported' } : {}),
+            },
+            'overseer_review_checks_pending_deferred'
+          );
           await deps.deferMessage({
             id: claimed.id,
             worker_id: REVIEW_WORKER_ID,
             fencing_token: claimed.fencing_token,
-            defer_until: new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString(),
+            defer_until: deferUntil,
           });
           continue;
         }

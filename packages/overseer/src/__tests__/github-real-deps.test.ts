@@ -7,12 +7,14 @@ import { createAppAuth } from '@octokit/auth-app';
 import {
   createRealApprovePullRequest,
   createRealFindPullRequest,
+  createRealFetchExactHeadPullRequestEvidence,
   createRealGitHubClientDeps,
   createRealMergePullRequest,
   resolveGitHubAppAuth,
   resolveRealOctokitAuthOptions,
   type RealGitHubOctokitLike,
 } from '../adapters/github-real-deps.ts';
+import type { AttemptCounterKey, AttemptCounterStore } from '../adapters/required-contexts.ts';
 import type { PullRequestRef } from '../types.ts';
 
 // WO-HARNESS-OVERSEER-APP-AUTH-01: Overseer authenticates as the Thinman Overseer
@@ -59,6 +61,94 @@ beforeEach(() => {
     savedEnv.set(key, process.env[key]);
     delete process.env[key];
   }
+});
+
+describe('unprotected base zero-check attempt bound', () => {
+  const headSha = 'c'.repeat(40);
+
+  function octokit(checkRuns: Array<{ name: string; status: string; conclusion: string | null }>) {
+    return {
+      pulls: {
+        get: async () => ({
+          data: { head: { sha: headSha }, base: { sha: 'b'.repeat(40), ref: 'main' } },
+        }),
+      },
+      repos: {
+        compareCommits: async () => ({ data: { files: [] } }),
+        getAllStatusCheckContexts: async () => {
+          throw Object.assign(new Error('Branch not protected'), { status: 404 });
+        },
+        getBranchRules: async () => ({ data: [] }),
+        getBranch: async () => ({ data: { protected: false } }),
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: checkRuns } }) },
+    } as unknown as RealGitHubOctokitLike;
+  }
+
+  test('third zero-check evaluation blocks and uses a distinct key namespace', async () => {
+    const counts = new Map<string, number>();
+    const keys: AttemptCounterKey[] = [];
+    const store: AttemptCounterStore = {
+      increment: async key => {
+        keys.push(key);
+        const encoded = JSON.stringify(key);
+        const next = (counts.get(encoded) ?? 0) + 1;
+        counts.set(encoded, next);
+        return next;
+      },
+      clear: async key => {
+        counts.delete(JSON.stringify(key));
+      },
+    };
+    const previous = process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS;
+    process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS = '3';
+    try {
+      const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(
+        octokit([]),
+        undefined,
+        store
+      );
+      expect(
+        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
+          .requiredContextsBlocked
+      ).toBeUndefined();
+      expect(
+        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
+          .requiredContextsBlocked
+      ).toBeUndefined();
+      expect(
+        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
+          .requiredContextsBlocked
+      ).toEqual({ reason: 'unprotected_base_no_checks', attempts: 3, failureKind: 'transient' });
+      expect(keys.every(key => key.baseRef === 'zero-checks:main')).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS;
+      else process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS = previous;
+    }
+  });
+
+  test('a reported check clears the zero-check streak', async () => {
+    let attempts = 0;
+    const cleared: AttemptCounterKey[] = [];
+    const store: AttemptCounterStore = {
+      increment: async () => ++attempts,
+      clear: async key => {
+        cleared.push(key);
+        attempts = 0;
+      },
+    };
+    const input = { owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha };
+    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
+    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
+    await createRealFetchExactHeadPullRequestEvidence(
+      octokit([{ name: 'test', status: 'in_progress', conclusion: null }]),
+      undefined,
+      store
+    )(input);
+    expect(cleared.some(key => key.baseRef === 'zero-checks:main')).toBe(true);
+    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
+    expect(attempts).toBe(1);
+  });
 });
 
 afterEach(() => {

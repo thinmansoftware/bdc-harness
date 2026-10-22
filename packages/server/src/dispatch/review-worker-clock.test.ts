@@ -233,10 +233,13 @@ describe('review worker clock', () => {
   // released (not posted as a result) with a future not_before, and is retried
   // until it reaches a terminal disposition.
   test('defers (never posts) a checks-pending item with a future not_before', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
     const deps = fakeDeps([message('pending', 'exact-head')], () => ({
       disposition: 'checks_pending',
       reason: 'checks_not_terminal',
+      pendingChecks: ['test (windows-latest)'],
     }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
 
     const before = Date.now();
     await tickReviewWorkerClock(CONFIG, deps);
@@ -250,8 +253,43 @@ describe('review worker clock', () => {
     expect(deferArg.id).toBe('pending');
     expect(deferArg.fencing_token).toBe(1);
     expect(new Date(deferArg.defer_until).getTime()).toBeGreaterThan(before);
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        message: 'overseer_review_checks_pending_deferred',
+        data: expect.objectContaining({
+          messageId: 'pending',
+          defer_until: deferArg.defer_until,
+          pending_checks: ['test (windows-latest)'],
+        }),
+      }),
+    ]);
     // A defer is not a terminal result.
     expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  test('logs no_checks_reported when a checks-pending outcome has no names', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+    const deps = fakeDeps([message('no-checks')], () => ({
+      disposition: 'checks_pending',
+    }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(warnings[0]).toEqual({
+      message: 'overseer_review_checks_pending_deferred',
+      data: expect.objectContaining({ pending_checks: [], reason: 'no_checks_reported' }),
+    });
+  });
+
+  test('does not call an explicit empty pending list no_checks_reported', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+    const deps = fakeDeps([message('unknown-contexts')], () => ({
+      disposition: 'checks_pending',
+      pendingChecks: [],
+    }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(warnings[0]?.data).toEqual(expect.objectContaining({ pending_checks: [] }));
+    expect(warnings[0]?.data).not.toHaveProperty('reason');
   });
 
   // bdc-harness #782 part 2: a rate limit is a deferral with GitHub's own reset

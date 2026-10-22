@@ -276,11 +276,17 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),
       recordApprovalVerdict: async () => {},
-      evaluate: async () => reviewResult({ verdict: 'CHECKS_PENDING', error: 'checks_pending' }),
+      evaluate: async () =>
+        reviewResult({
+          verdict: 'CHECKS_PENDING',
+          error: 'checks_pending',
+          pendingChecks: ['test (windows-latest)'],
+        }),
     });
 
     const verdict = await deps.runReviewer(work);
     expect(verdict.checksPending).toBe(true);
+    expect(verdict.pendingChecks).toEqual(['test (windows-latest)']);
     expect(verdict.approved).toBe(false);
     // Distinct from INDETERMINATE/REQUEST_CHANGES: no summary is fabricated, so
     // it cannot be conflated into a REQUEST_CHANGES-producing approved=false.
@@ -330,6 +336,21 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     // sentence must not be the same for both.
     expect(verdict.summary).toContain('transient');
     expect(verdict.summary).not.toContain('Grant the Overseer GitHub App');
+  });
+
+  test('the no-checks blocked summary explains how to make the base reviewable', async () => {
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      recordApprovalVerdict: async () => {},
+      evaluate: async () =>
+        reviewResult({
+          verdict: 'CHECKS_UNAVAILABLE',
+          error: 'unprotected_base_no_checks:attempts=5:reason=transient',
+        }),
+    });
+    const verdict = await deps.runReviewer(work);
+    expect(verdict.summary).toContain('no branch protection and no CI reported');
+    expect(verdict.summary).toContain('protect the base or add CI');
   });
 
   test('does not expose internal INDETERMINATE errors in the GitHub summary', async () => {

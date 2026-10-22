@@ -18,8 +18,14 @@ import type {
   PullRequestEvidence,
   PullRequestRef,
 } from '../types.ts';
-import { resolveRequiredContexts } from './required-contexts';
+import {
+  REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
+  UNPROTECTED_BASE_NO_CHECKS_REASON,
+  resolveMaxAttempts,
+  resolveRequiredContexts,
+} from './required-contexts';
 import type {
+  AttemptCounterKey,
   AttemptCounterStore,
   REQUIRED_CONTEXTS_BLOCKED_REASON,
   RequiredContextsFailureKind,
@@ -406,7 +412,7 @@ export interface ExactHeadPullRequestEvidence {
    * reported-checks heuristic.
    */
   requiredContextsBlocked?: {
-    reason: typeof REQUIRED_CONTEXTS_BLOCKED_REASON;
+    reason: typeof REQUIRED_CONTEXTS_BLOCKED_REASON | typeof UNPROTECTED_BASE_NO_CHECKS_REASON;
     attempts: number;
     failureKind: RequiredContextsFailureKind;
   };
@@ -528,6 +534,32 @@ export function createRealFetchExactHeadPullRequestEvidence(
     // prevent (#775).
     const requiredContexts: string[] | null =
       resolution.state === 'known' ? resolution.contexts : null;
+    let noChecksBlocked: ExactHeadPullRequestEvidence['requiredContextsBlocked'];
+    if (
+      resolution.state === 'known' &&
+      resolution.source === 'unprotected_branch' &&
+      resolution.contexts.length === 0
+    ) {
+      const zeroChecksKey: AttemptCounterKey = {
+        owner: input.owner,
+        repo: input.repo,
+        baseRef: `zero-checks:${baseRef ?? ''}`,
+        headSha: input.headSha,
+      };
+      if (checkRuns.data.check_runs.length === 0) {
+        const attempts = await attemptStore.increment(zeroChecksKey, Date.now());
+        const maxAttempts = resolveMaxAttempts(process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]);
+        if (attempts >= maxAttempts) {
+          noChecksBlocked = {
+            reason: UNPROTECTED_BASE_NO_CHECKS_REASON,
+            attempts,
+            failureKind: 'transient',
+          };
+        }
+      } else {
+        await attemptStore.clear(zeroChecksKey);
+      }
+    }
     return {
       ...(resolution.state === 'exhausted'
         ? {
@@ -538,6 +570,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
             },
           }
         : {}),
+      ...(noChecksBlocked ? { requiredContextsBlocked: noChecksBlocked } : {}),
       diff: (comparison.data.files ?? [])
         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
         .join('\n'),
