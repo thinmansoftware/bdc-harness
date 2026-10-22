@@ -596,6 +596,7 @@ nodes:
     idle_timeout: 600000
     persona: war-council-architect-opr
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: war-council-architect-opr
     depends_on: [plan, checkout-repair-target]
     trigger_rule: all_done
@@ -2583,6 +2584,7 @@ nodes:
 
   - id: war-council-validator
     provider: codex-native-strict
+    model: gpt-5.6-terra
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
@@ -2726,6 +2728,7 @@ nodes:
   - id: diff-review
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -2986,6 +2989,7 @@ nodes:
   - id: diff-review-final
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -3151,6 +3155,7 @@ nodes:
   - id: opus-rereview
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3369,6 +3374,7 @@ nodes:
   - id: findings-consolidate
     persona: xo-opr
     provider: codex-native-strict
+    model: gpt-5.6-terra
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -3497,6 +3503,7 @@ nodes:
   - id: apply-diff-review-final
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
