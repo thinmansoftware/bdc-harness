@@ -3272,8 +3272,9 @@ nodes:
   # Purely ADDITIVE: it reads block-reclassify, never blocks the existing pause-gate / commit-and-push
   # path (trigger_rule all_done; no-ops on interactive runs and on runs with nothing to salvage).
   - id: noninteractive-salvage
-    depends_on: [block-reclassify]
+    depends_on: [block-reclassify, repair-gate]
     trigger_rule: all_done
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
     bash: |
       set -uo pipefail
       RECLASS=$(cat <<'BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_011'

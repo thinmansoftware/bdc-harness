@@ -49,6 +49,7 @@ const GUARDED = [
   'apply-suggested-fix',
   'commit-and-push',
   'open-pr-if-needed',
+  'noninteractive-salvage',
 ] as const;
 
 const PR = '9999';
@@ -389,6 +390,8 @@ describe('repair run guards', () => {
           expect(node.when, `${file} ${id}`).toBeDefined();
           expect(evaluateCondition(node.when ?? '', outputs).result, `${file} ${id}`).toBe(false);
         }
+        const salvage = nodeOf(nodes, 'noninteractive-salvage', file);
+        expect(salvage.when, file).toBe("$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'");
         const fail = nodeOf(nodes, 'repair-gate-fail', file);
         expect(fail.trigger_rule, file).toBe('all_done');
         expect(evaluateCondition(fail.when ?? '', outputs).result, file).toBe(true);
@@ -408,6 +411,7 @@ describe('repair run guards', () => {
       const nodes = nodesOf(file);
       const gate = nodeOf(nodes, 'repair-gate', file);
       const implement = nodeOf(nodes, 'implement', file);
+      const salvage = nodeOf(nodes, 'noninteractive-salvage', file);
       for (const item of [
         { reason: 'plan_review_skipped', plan: undefined },
         { reason: 'plan_review_not_approved', plan: 'PLAN_REVIEW_PASS=false\n' },
@@ -432,6 +436,7 @@ describe('repair run guards', () => {
           expect(result.stderr, label).toContain(`repair_gate_closed: ${item.reason}`);
           const outputs = permissive(result.stdout.trim());
           expect(evaluateCondition(implement.when ?? '', outputs).result, label).toBe(false);
+          expect(evaluateCondition(salvage.when ?? '', outputs).result, label).toBe(false);
         } finally {
           rmSync(artifacts, { recursive: true, force: true });
           rmSync(nodeOut, { recursive: true, force: true });
@@ -453,8 +458,13 @@ describe('repair run guards', () => {
         const na = bash(gate.bash ?? '', { ARTIFACTS_DIR: plain, ARCHON_NODE_OUT: openOut });
         expect(na.exitCode, show(na, file)).toBe(0);
         expect(na.stdout.trim(), file).toBe('{"REPAIR_GATE":"n/a","REPAIR_GATE_ALLOW":"yes"}');
+        const salvage = nodeOf(nodes, 'noninteractive-salvage', file);
         expect(
           evaluateCondition(implement.when ?? '', permissive(na.stdout.trim())).result,
+          file
+        ).toBe(true);
+        expect(
+          evaluateCondition(salvage.when ?? '', permissive(na.stdout.trim())).result,
           file
         ).toBe(true);
 
@@ -469,6 +479,10 @@ describe('repair run guards', () => {
         expect(opened.stdout.trim(), file).toBe('{"REPAIR_GATE":"open","REPAIR_GATE_ALLOW":"yes"}');
         expect(
           evaluateCondition(implement.when ?? '', permissive(opened.stdout.trim())).result,
+          file
+        ).toBe(true);
+        expect(
+          evaluateCondition(salvage.when ?? '', permissive(opened.stdout.trim())).result,
           file
         ).toBe(true);
       } finally {
