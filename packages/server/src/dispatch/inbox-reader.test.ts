@@ -690,6 +690,7 @@ describe('xo action watch', () => {
     root?: string;
     store?: Map<string, XoActionStoredMessage>;
     list?: (sinceIso: string) => Promise<XoActionComment[]>;
+    createXoActionMessage?: InboxReaderDeps['createXoActionMessage'];
   }) {
     const root = input.root ?? (await mkdtemp(join(tmpdir(), 'inbox-reader-xo-')));
     if (!input.root) roots.push(root);
@@ -714,7 +715,7 @@ describe('xo action watch', () => {
           return input.comments ?? [];
         }),
       getCurrentXoLease: async () => (input.leaseId ? { lease_id: input.leaseId } : null),
-      createXoActionMessage: xoActionSender(store),
+      createXoActionMessage: input.createXoActionMessage ?? xoActionSender(store),
     };
     const result = await runInboxReader(deps, resolveInboxReaderConfig({}));
     const state = JSON.parse(await Bun.file(join(root, 'state.json')).text()) as {
@@ -858,5 +859,147 @@ describe('xo action watch', () => {
       skipped: 'rate_limit',
     });
     expect(markdown).toContain('XO ACTION: skipped rate_limit');
+  });
+
+  test('failed_send_is_retried_before_the_cursor_advances_past_it', async () => {
+    const since = '2026-10-22T18:00:00.000Z';
+    const failedAt = '2026-10-22T18:02:00.000Z';
+    const laterAt = '2026-10-22T18:04:00.000Z';
+    const failed = xoComment({
+      id: 'old-fail',
+      body: 'XO ACTION: retry me',
+      created_at: failedAt,
+    });
+    const later = xoComment({
+      id: 'new-ok',
+      body: 'XO ACTION: already delivered',
+      created_at: laterAt,
+    });
+    const store = new Map<string, XoActionStoredMessage>();
+    const deliver = xoActionSender(store);
+    const failingSender = (async (_context, data: CreateAuthenticatedMessageData) => {
+      if (data.idempotency_key === 'inbox-reader:xo-action:old-fail') {
+        throw new Error('dispatch down');
+      }
+      return deliver(_context, data);
+    }) as NonNullable<InboxReaderDeps['createXoActionMessage']>;
+    const first = await runWatch({
+      since,
+      comments: [failed, later],
+      store,
+      createXoActionMessage: failingSender,
+    });
+    expect(first.result.errors).toEqual([]);
+    expect(first.result.digest?.xo_action).toEqual({
+      scanned: 2,
+      qualified: 2,
+      sent: 1,
+      skipped: null,
+    });
+    expect(first.store.has('inbox-reader:xo-action:new-ok')).toBe(true);
+    expect(first.store.has('inbox-reader:xo-action:old-fail')).toBe(false);
+    expect(first.state.xo_action_since).toBe(failedAt);
+
+    const second = await runWatch({
+      root: first.root,
+      comments: [failed, later],
+      store,
+    });
+    expect(second.listed).toEqual([failedAt]);
+    expect(second.result.errors).toEqual([]);
+    expect(second.store.has('inbox-reader:xo-action:old-fail')).toBe(true);
+    expect(second.store.size).toBe(2);
+    expect(second.result.digest?.xo_action).toEqual({
+      scanned: 2,
+      qualified: 2,
+      sent: 2,
+      skipped: null,
+    });
+    expect(second.state.xo_action_since).toBe(laterAt);
+  });
+
+  test('failed_send_on_a_full_page_does_not_advance_to_the_last_comment', async () => {
+    const since = '2026-10-22T18:00:00.000Z';
+    const failedAt = '2026-10-22T18:01:00.000Z';
+    const comments = Array.from({ length: 100 }, (_, index) =>
+      xoComment({
+        id: `page-${index}`,
+        body: 'XO ACTION: page',
+        created_at: new Date(Date.parse(failedAt) + index * 1000).toISOString(),
+      })
+    );
+    const store = new Map<string, XoActionStoredMessage>();
+    const deliver = xoActionSender(store);
+    const failingSender = (async (_context, data: CreateAuthenticatedMessageData) => {
+      if (data.idempotency_key === 'inbox-reader:xo-action:page-0') {
+        throw new Error('dispatch down');
+      }
+      return deliver(_context, data);
+    }) as NonNullable<InboxReaderDeps['createXoActionMessage']>;
+    const first = await runWatch({
+      since,
+      comments,
+      store,
+      createXoActionMessage: failingSender,
+    });
+    expect(first.result.errors).toEqual([]);
+    expect(first.result.digest?.xo_action).toEqual({
+      scanned: 100,
+      qualified: 100,
+      sent: 99,
+      skipped: null,
+    });
+    expect(first.state.xo_action_since).toBe(failedAt);
+    expect(first.store.has('inbox-reader:xo-action:page-0')).toBe(false);
+
+    const second = await runWatch({
+      root: first.root,
+      comments,
+      store,
+    });
+    expect(second.listed).toEqual([failedAt]);
+    expect(second.store.has('inbox-reader:xo-action:page-0')).toBe(true);
+    expect(second.store.size).toBe(100);
+  });
+
+  test('failed_send_without_a_timestamp_keeps_the_prior_cursor', async () => {
+    const since = '2026-10-22T18:00:00.000Z';
+    const laterAt = '2026-10-22T18:04:00.000Z';
+    const failed = xoComment({
+      id: 'untimed',
+      body: 'XO ACTION: retry me',
+      created_at: '',
+    });
+    const later = xoComment({
+      id: 'later',
+      body: 'XO ACTION: already delivered',
+      created_at: laterAt,
+    });
+    const store = new Map<string, XoActionStoredMessage>();
+    const deliver = xoActionSender(store);
+    const failingSender = (async (_context, data: CreateAuthenticatedMessageData) => {
+      if (data.idempotency_key === 'inbox-reader:xo-action:untimed') {
+        throw new Error('dispatch down');
+      }
+      return deliver(_context, data);
+    }) as NonNullable<InboxReaderDeps['createXoActionMessage']>;
+    const first = await runWatch({
+      since,
+      comments: [failed, later],
+      store,
+      createXoActionMessage: failingSender,
+    });
+    expect(first.result.errors).toEqual([]);
+    expect(first.store.has('inbox-reader:xo-action:untimed')).toBe(false);
+    expect(first.store.has('inbox-reader:xo-action:later')).toBe(true);
+    expect(first.state.xo_action_since).toBe(since);
+
+    const second = await runWatch({
+      root: first.root,
+      comments: [failed, later],
+      store,
+    });
+    expect(second.listed).toEqual([since]);
+    expect(second.store.has('inbox-reader:xo-action:untimed')).toBe(true);
   });
 });

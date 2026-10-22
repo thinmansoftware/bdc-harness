@@ -280,6 +280,41 @@ function xoActionSkip(
   };
 }
 
+/**
+ * Cursor after doorbell sends. GitHub `since` is inclusive, so a failed send
+ * stays in the next window: the cursor may move up to that comment and no
+ * further. Later successes are idempotent and are listed again. An unparseable
+ * failure timestamp holds the current window so the comment is still retried.
+ */
+function selectCursorAfterXoActionSends(input: {
+  prior: string | undefined;
+  startedIso: string;
+  comments: readonly { created_at: string }[];
+  earliestFailedAt: string | null;
+  failedWithoutTimestamp: boolean;
+}): string | null {
+  if (input.failedWithoutTimestamp) {
+    return selectSkippedXoActionCursor(input.prior, input.startedIso);
+  }
+  const advanced = selectXoActionCursor({
+    prior: input.prior,
+    startedIso: input.startedIso,
+    comments: input.comments,
+  });
+  if (input.earliestFailedAt === null) return advanced;
+  const failedMs = parseXoActionTimestamp(input.earliestFailedAt);
+  const floorMs = parseXoActionTimestamp(input.prior ?? input.startedIso);
+  if (failedMs === null || (floorMs !== null && failedMs < floorMs)) {
+    return selectSkippedXoActionCursor(input.prior, input.startedIso);
+  }
+  // No forward cursor was proposed (unknown page boundary). Keeping the prior
+  // window still includes the failed comment.
+  if (advanced === null) return null;
+  const advancedMs = parseXoActionTimestamp(advanced);
+  if (advancedMs === null || advancedMs > failedMs) return input.earliestFailedAt;
+  return advanced;
+}
+
 function xoActionCommentQualifies(
   comment: XoActionComment,
   leaseId: string,
@@ -354,6 +389,9 @@ async function runXoActionWatch(
 
   let qualified = 0;
   let sent = 0;
+  let earliestFailedAt: string | null = null;
+  let earliestFailedAtMs = Number.POSITIVE_INFINITY;
+  let failedWithoutTimestamp = false;
   for (const comment of comments) {
     const issue = comment.issue;
     if (issue === null || !xoActionCommentQualifies(comment, leaseId, watermarkMs)) continue;
@@ -377,10 +415,23 @@ async function runXoActionWatch(
       sent += 1;
     } catch (error) {
       logger.error({ error, commentId: comment.id }, 'xo_action_send_failed');
+      const createdMs = parseXoActionTimestamp(comment.created_at);
+      if (createdMs === null) {
+        failedWithoutTimestamp = true;
+      } else if (createdMs < earliestFailedAtMs) {
+        earliestFailedAtMs = createdMs;
+        earliestFailedAt = comment.created_at;
+      }
     }
   }
 
-  const cursor = selectXoActionCursor({ prior, startedIso, comments });
+  const cursor = selectCursorAfterXoActionSends({
+    prior,
+    startedIso,
+    comments,
+    earliestFailedAt,
+    failedWithoutTimestamp,
+  });
   return {
     digest: { scanned: comments.length, qualified, sent, skipped: null },
     ...(cursor === null ? {} : { cursor }),
