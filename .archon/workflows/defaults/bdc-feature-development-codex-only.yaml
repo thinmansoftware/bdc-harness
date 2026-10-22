@@ -3679,9 +3679,7 @@ nodes:
     depends_on: [decide-push-target, classify-apply-review, classify-opus-rereview, repair-gate]
     trigger_rule: all_done
     when: >-
-      $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-reclassify.output.status == 'PROCEED' ||
-      $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-apply-review.output.verdict == 'satisfied' ||
-      $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-opus-rereview.output.verdict == 'satisfied'
+      $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-reclassify.output.status == 'PROCEED' || $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-apply-review.output.verdict == 'satisfied' || $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-opus-rereview.output.verdict == 'satisfied'
     load_bearing: true
     bash: |
       set -euo pipefail
