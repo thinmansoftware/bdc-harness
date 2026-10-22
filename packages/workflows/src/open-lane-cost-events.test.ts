@@ -525,6 +525,56 @@ describe('open lane cost events', () => {
         event => event.event_type === 'loop_iteration_completed' && event.data.cost_usd === 0.004
       )
     ).toBe(true);
+    const completed = harness.events.find(
+      event => event.event_type === 'node_completed' && event.step_name === 'review'
+    );
+    expect(completed?.data.cost_usd).toBe(0.005);
+    expect(harness.completions.at(-1)?.total_cost_usd).toBe(0.005);
+  });
+
+  test('resumed loop failure reports cumulative cost when the cap is already spent', async () => {
+    const harness = createHarness([
+      { kind: 'chunks', chunks: [assistant('draft'), result(0.004)] },
+      { kind: 'chunks', chunks: [assistant('should not run'), result(0.001)] },
+    ]);
+    const workflow = {
+      name: 'loop-resume-cap',
+      nodes: [
+        {
+          id: 'review',
+          maxBudgetUsd: 0.004,
+          loop: {
+            prompt: 'review',
+            until: 'COMPLETE',
+            max_iterations: 4,
+            interactive: true,
+            gate_message: 'review this',
+          },
+        },
+      ],
+    };
+    const workflowRun = runRecord('loop-resume-cap');
+    await runWorkflow(harness, dir, workflow, workflowRun);
+    expect(harness.pauses).toHaveLength(1);
+    expect(harness.calls).toHaveLength(1);
+
+    harness.status.value = 'running';
+    workflowRun.metadata = {
+      approval: {
+        nodeId: 'review',
+        message: 'review this',
+        type: 'interactive_loop',
+        iteration: 1,
+      },
+    };
+    await runWorkflow(harness, dir, workflow, workflowRun);
+    expect(harness.calls).toHaveLength(1);
+    const terminal = harness.events.find(
+      event => event.event_type === 'node_failed' && event.step_name === 'review'
+    );
+    expect(terminal?.data.cost_usd).toBe(0.004);
+    expect(String(terminal?.data.error)).toContain('exceeded cost cap');
+    expect(sumRunSpendUsd(harness.events)).toBe(0.004);
   });
 
   test('charges an aborted wall attempt its allowed budget and refuses the retry call', async () => {

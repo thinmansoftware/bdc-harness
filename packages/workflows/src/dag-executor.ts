@@ -4187,9 +4187,16 @@ async function executeLoopNode(
   };
 
   let capSpendUsd = 0;
-  if (node.maxBudgetUsd !== undefined) {
+  // Resume (and any re-entry that already recorded this node's spend) must
+  // report cumulative loop cost, not only the post-resume portion. The cap
+  // already rebuilds from prior events; the terminal cost uses the same sum.
+  if (node.maxBudgetUsd !== undefined || isLoopResume) {
     const priorEvents = await deps.store.listWorkflowEvents(workflowRun.id);
-    capSpendUsd = sumRunSpendUsd(priorEvents.filter(event => event.step_name === node.id));
+    const priorNodeSpendUsd = sumRunSpendUsd(
+      priorEvents.filter(event => event.step_name === node.id)
+    );
+    if (node.maxBudgetUsd !== undefined) capSpendUsd = priorNodeSpendUsd;
+    if (priorNodeSpendUsd > 0) loopTotalCostUsd = priorNodeSpendUsd;
   }
 
   for (let i = startIteration; i <= loop.max_iterations; i++) {
