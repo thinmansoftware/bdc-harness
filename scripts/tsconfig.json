@@ -14,7 +14,6 @@
     "dispatch-worker/**/*.ts",
     "staging/**/*.ts",
     "taskmaster/**/*.ts",
-    "mta/**/*.ts",
-    "container/docker-entrypoint-boot-chown.test.ts"
+    "mta/**/*.ts"
   ]
 }
