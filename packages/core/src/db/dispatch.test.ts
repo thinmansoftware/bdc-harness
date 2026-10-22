@@ -1,3 +1,4 @@
+import { Database } from 'bun:sqlite';
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { existsSync, mkdtempSync, unlinkSync, writeFileSync } from 'fs';
 import { removeTempDirWithRetry } from '../test/temp-dir';
@@ -1913,6 +1914,98 @@ describe('dispatch db', () => {
       route_disposition: null,
       route_disposed_at: null,
     });
+  });
+
+  test('first nested transaction error keeps the sibling receipt and leaves no failed transaction', async () => {
+    const sibling = await createQueuedOperatorMessage('idem-nested-sibling');
+    const contender = await createQueuedOperatorMessage('idem-nested-contender');
+    const followUp = await createQueuedOperatorMessage('idem-nested-follow-up');
+    const siblingAckAt = '2026-01-15T00:00:00.000Z';
+    const reader = new Database(currentDbPath, { readonly: true });
+    const originalQuery = db.query.bind(db);
+    const rollbackStatements: string[] = [];
+    const querySpy = spyOn(db, 'query').mockImplementation((sql: string, params?: unknown[]) => {
+      if (sql.trim().toUpperCase() === 'ROLLBACK') rollbackStatements.push(sql);
+      return originalQuery(sql, params);
+    });
+    const sleepSpy = spyOn(Bun, 'sleep').mockImplementation(() => Promise.resolve());
+    let siblingOpen = false;
+
+    const readCommittedAck = (id: string): string | null => {
+      const row = reader
+        .query('SELECT acknowledged_at FROM agent_dispatch_messages WHERE id = ?')
+        .get(id) as { acknowledged_at: string | null } | null;
+      if (!row) throw new Error('mailbox_nested_row_missing');
+      return row.acknowledged_at;
+    };
+
+    try {
+      await originalQuery('BEGIN');
+      siblingOpen = true;
+      const update = await originalQuery(
+        `UPDATE agent_dispatch_messages
+         SET acknowledged_at = $2, acknowledged_by = 'operator'
+         WHERE id = $1 AND acknowledged_at IS NULL`,
+        [sibling.id, siblingAckAt]
+      );
+      expect(update.rowCount).toBe(1);
+      // The other connection must not see the receipt until the sibling commits.
+      expect(readCommittedAck(sibling.id)).toBeNull();
+
+      await expect(
+        acknowledgeMessage({ id: contender.id, principal_id: 'operator' })
+      ).rejects.toThrow('cannot start a transaction within a transaction');
+
+      const writerSibling = await originalQuery<{
+        acknowledged_at: string | null;
+        acknowledged_by: string | null;
+      }>('SELECT acknowledged_at, acknowledged_by FROM agent_dispatch_messages WHERE id = $1', [
+        sibling.id,
+      ]);
+      expect(writerSibling.rows[0]).toMatchObject({
+        acknowledged_at: siblingAckAt,
+        acknowledged_by: 'operator',
+      });
+      const writerContender = await originalQuery<{
+        acknowledged_at: string | null;
+        acknowledged_by: string | null;
+      }>('SELECT acknowledged_at, acknowledged_by FROM agent_dispatch_messages WHERE id = $1', [
+        contender.id,
+      ]);
+      expect(writerContender.rows[0]).toMatchObject({
+        acknowledged_at: null,
+        acknowledged_by: null,
+      });
+      // Skipped ROLLBACK left the sibling transaction open: still invisible elsewhere.
+      expect(readCommittedAck(sibling.id)).toBeNull();
+      expect(readCommittedAck(contender.id)).toBeNull();
+      expect(rollbackStatements).toEqual([]);
+      expect(sleepSpy).toHaveBeenCalledTimes(2);
+
+      await originalQuery('COMMIT');
+      siblingOpen = false;
+      expect(readCommittedAck(sibling.id)).toBe(siblingAckAt);
+      expect(readCommittedAck(contender.id)).toBeNull();
+
+      const follow = await acknowledgeMessage({ id: followUp.id, principal_id: 'operator' });
+      expect(follow.ok).toBe(true);
+      if (!follow.ok) throw new Error('expected follow-up acknowledgement');
+      expect(readCommittedAck(followUp.id)).toBe(follow.message.acknowledged_at);
+      expect(rollbackStatements).toEqual([]);
+      expect((await getMessage(contender.id))?.acknowledged_at).toBeNull();
+      expect((await getMessage(sibling.id))?.acknowledged_at).toBe(siblingAckAt);
+    } finally {
+      sleepSpy.mockRestore();
+      querySpy.mockRestore();
+      if (siblingOpen) {
+        try {
+          await originalQuery('ROLLBACK');
+        } catch {
+          /* Release the sibling transaction after an assertion failure. */
+        }
+      }
+      reader.close();
+    }
   });
 
   test('addressing revalidates final status when a guarded update loses to cancellation', async () => {
