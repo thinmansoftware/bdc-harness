@@ -143,8 +143,11 @@ export function githubCommandChangesPullRequestAuthorship(args: string[]): boole
     return true;
   }
 
+  // Parsed command, not args[0]: a leading global flag (-R / --repo) shifts
+  // `api` off index 0. Treating that as a read would retry an App 403 as the
+  // PAT and mix PR authorship.
   return (
-    args[0] === 'api' &&
+    command === 'api' &&
     args.some(
       token =>
         token.includes('createPullRequest') ||

@@ -577,6 +577,14 @@ describe('operation-scoped GitHub CLI authentication', () => {
         '-f',
         'query=mutation { createPullRequest(input: {}) { clientMutationId } }',
       ],
+      [
+        '-R',
+        'o/r',
+        'api',
+        'graphql',
+        '-f',
+        'query=mutation { createPullRequest(input: {}) { clientMutationId } }',
+      ],
     ];
     const reads = [
       ['pr', 'view', '12'],
@@ -609,6 +617,14 @@ describe('operation-scoped GitHub CLI authentication', () => {
     for (const args of [
       ['pr', 'create', '--repo', 'o/r', '--head', 'b'],
       ['pr', '--repo', 'o/r', 'create', '--head', 'b'],
+      [
+        '-R',
+        'o/r',
+        'api',
+        'graphql',
+        '-f',
+        'query=mutation { createPullRequest(input: {}) { clientMutationId } }',
+      ],
     ]) {
       let calls = 0;
       const result = await runGitHubServiceCommand({
