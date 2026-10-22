@@ -100,11 +100,18 @@ function nodeOf(nodes: readonly LaneNode[], id: string, file: string): LaneNode 
 function bash(script: string, cwd?: string, env: Record<string, string> = {}): RunResult {
   const dir = mkdtempSync(join(tmpdir(), 'rrg-'));
   const scriptPath = join(dir, 'run.sh');
+  const childEnv = { ...process.env, ...env };
+  if (process.platform === 'win32' && env.PATH !== undefined) {
+    // Windows treats these keys as aliases; keep the explicit fixture PATH.
+    for (const key of Object.keys(childEnv)) {
+      if (key !== 'PATH' && key.toUpperCase() === 'PATH') delete childEnv[key];
+    }
+  }
   try {
     writeFileSync(scriptPath, script);
     const result = Bun.spawnSync(['bash', scriptPath], {
       cwd,
-      env: { ...process.env, ...env },
+      env: childEnv,
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -322,7 +329,7 @@ describe('repair run guards', () => {
     }
   });
 
-  it('each_refusal_names_its_condition_on_stderr', () => {
+  describe('each_refusal_names_its_condition_on_stderr', () => {
     const branch = EXAMPLE_BRANCH;
     const matching = heavySpec(repairDeclaration(EXAMPLE_PR, branch));
     const cases: Array<{
@@ -368,29 +375,32 @@ describe('repair run guards', () => {
         token: 'condition=plan_authorization',
       },
     ];
-    for (const file of EXPECTED_LANES) {
-      const commit = nodeOf(nodesOf(file), 'commit-and-push', file);
-      for (const item of cases) {
-        const result = runAuth(commit.bash ?? '', item.spec, item.decide, item.plan);
-        const label = `${file} ${item.name}\n${result.stdout}\n${result.stderr}`;
-        expect(result.exitCode, label).toBe(1);
-        expect(result.stdout, label).toContain('repair_target_unauthorized');
-        expect(result.stderr, label).toContain(`repair_target_unauthorized: ${item.token}`);
-        if (item.name === 'plan_authorization')
-          expect(result.stderr, label).toContain('fence_count');
-        if (item.name === 'decide_authorized_pr_mismatch') {
-          expect(result.stderr, label).toContain('#1214');
-          expect(result.stderr, label).toContain(`#${EXAMPLE_PR}`);
+    // Each refusal still runs against every lane, with its own timeout budget.
+    for (const item of cases) {
+      it(item.name, () => {
+        for (const file of EXPECTED_LANES) {
+          const commit = nodeOf(nodesOf(file), 'commit-and-push', file);
+          const result = runAuth(commit.bash ?? '', item.spec, item.decide, item.plan);
+          const label = `${file} ${item.name}\n${result.stdout}\n${result.stderr}`;
+          expect(result.exitCode, label).toBe(1);
+          expect(result.stdout, label).toContain('repair_target_unauthorized');
+          expect(result.stderr, label).toContain(`repair_target_unauthorized: ${item.token}`);
+          if (item.name === 'plan_authorization')
+            expect(result.stderr, label).toContain('fence_count');
+          if (item.name === 'decide_authorized_pr_mismatch') {
+            expect(result.stderr, label).toContain('#1214');
+            expect(result.stderr, label).toContain(`#${EXAMPLE_PR}`);
+          }
+          if (item.name === 'spec_pr_mismatch') {
+            expect(result.stderr, label).toContain('1214');
+            expect(result.stderr, label).toContain(EXAMPLE_PR);
+          }
+          if (item.name === 'spec_branch_mismatch') {
+            expect(result.stderr, label).toContain('feat/other-branch');
+            expect(result.stderr, label).toContain(branch);
+          }
         }
-        if (item.name === 'spec_pr_mismatch') {
-          expect(result.stderr, label).toContain('1214');
-          expect(result.stderr, label).toContain(EXAMPLE_PR);
-        }
-        if (item.name === 'spec_branch_mismatch') {
-          expect(result.stderr, label).toContain('feat/other-branch');
-          expect(result.stderr, label).toContain(branch);
-        }
-      }
+      });
     }
   });
 
@@ -506,6 +516,10 @@ describe('repair run guards', () => {
       );
       chmodSync(join(bin, 'gh'), 0o755);
       writeAuthority(artifacts, `WO: EXAMPLE\n${repairDeclaration(EXAMPLE_PR, EXAMPLE_BRANCH)}\n`);
+      const inheritedBin = join(artifacts, 'inherited-bin');
+      mkdirSync(inheritedBin);
+      writeFileSync(join(inheritedBin, 'gh'), '#!/bin/sh\nexit 97\n');
+      chmodSync(join(inheritedBin, 'gh'), 0o755);
       for (const file of EXPECTED_LANES) {
         const nodes = nodesOf(file);
         git(['config', `branch.${EXAMPLE_BRANCH}.remote`, 'origin'], work);
@@ -514,6 +528,8 @@ describe('repair run guards', () => {
         const result = bash(checkout.bash ?? '', work, {
           ARTIFACTS_DIR: artifacts,
           PATH: `${bin}${delimiter}${process.env.PATH ?? ''}`,
+          // A competing Windows spelling must not hide the fixture's gh.
+          pAtH: `${inheritedBin}${delimiter}${process.env.PATH ?? ''}`,
           FAKE_GH_STATE: 'OPEN',
           FAKE_GH_BRANCH: EXAMPLE_BRANCH,
           FAKE_GH_HEAD_OID: tip,
