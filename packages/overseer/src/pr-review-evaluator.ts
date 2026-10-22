@@ -475,10 +475,10 @@ export function reviewErrorCode(error: string | undefined): string | null {
  *
  * When `requiredContexts` is a known set (branch-protection required status
  * checks on the base branch) it is the authoritative complete-suite signal:
- * terminal only when EVERY required context has reported a completed check run.
- * Optional reported checks do not affect terminality. A required context that
- * has not shown up yet (or one that is present but still in_progress) keeps the
- * suite non-terminal.
+ * terminal only when EVERY required context has reported a check run AND every
+ * applicable latest run for that context (one per GitHub App identity) has
+ * completed. A required context that has not shown up yet (or one whose latest
+ * run from any app is still in_progress) keeps the suite non-terminal.
  *
  * `null` means the authoritative set could NOT be obtained. That is never
  * terminal: we defer rather than fall back to the reported-checks heuristic,
@@ -500,15 +500,17 @@ export function checksAreTerminal(
 ): boolean {
   // UNKNOWN required set -- fail closed. Must be checked before any heuristic.
   if (requiredContexts === null) return false;
-  const allReportedCompleted = checks.every(check => check.status === 'completed');
   if (requiredContexts !== undefined && requiredContexts.length > 0) {
-    const latestByName = new Map(
-      latestAttemptPerCheck(checks).map(check => [normalizedCheckName(check.name), check])
-    );
-    return requiredContexts.every(
-      context => latestByName.get(normalizedCheckName(context))?.status === 'completed'
-    );
+    const latest = latestAttemptPerCheck(checks);
+    return requiredContexts.every(context => {
+      const normalizedContext = normalizedCheckName(context);
+      const applicable = latest.filter(
+        check => normalizedCheckName(check.name) === normalizedContext
+      );
+      return applicable.length > 0 && applicable.every(check => check.status === 'completed');
+    });
   }
+  const allReportedCompleted = checks.every(check => check.status === 'completed');
   return checks.length > 0 && allReportedCompleted;
 }
 

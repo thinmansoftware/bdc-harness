@@ -363,6 +363,72 @@ describe('governed PR-code reviewer', () => {
     expect(checksAreTerminal([], null)).toBe(false);
   });
 
+  test('crossAppRequiredContext pending app before completed app is non-terminal', () => {
+    expect(
+      checksAreTerminal(
+        [
+          {
+            name: 'test',
+            status: 'in_progress',
+            conclusion: null,
+            app: { slug: 'app-a' },
+          },
+          {
+            name: 'test',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'app-b' },
+          },
+        ],
+        ['test']
+      )
+    ).toBe(false);
+  });
+
+  test('crossAppRequiredContext completed app before pending app is non-terminal', () => {
+    expect(
+      checksAreTerminal(
+        [
+          {
+            name: 'test',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'app-b' },
+          },
+          {
+            name: 'test',
+            status: 'in_progress',
+            conclusion: null,
+            app: { slug: 'app-a' },
+          },
+        ],
+        ['test']
+      )
+    ).toBe(false);
+  });
+
+  test('crossAppRequiredContext is terminal when every apps latest run completed', () => {
+    expect(
+      checksAreTerminal(
+        [
+          {
+            name: 'test',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'app-a' },
+          },
+          {
+            name: 'test',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'app-b' },
+          },
+        ],
+        ['test']
+      )
+    ).toBe(true);
+  });
+
   test('16 a completed reported check with a required context still absent defers to CHECKS_PENDING', async () => {
     let modelInvoked = false;
     const result = await evaluatePullRequest(
