@@ -45,6 +45,20 @@ function isAvailabilityError(err: unknown): boolean {
   );
 }
 
+function resolveCallBudgetUsd(options: SendQueryOptions | undefined): number | undefined {
+  const raw = options?.nodeConfig?.maxBudgetUsd ?? options?.maxBudgetUsd;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined;
+  return raw;
+}
+
+/** Finite zero is a real cost. Missing, non-numeric, and negative costs are not. */
+function readOpenRouterUsageCost(usage: unknown): number | undefined {
+  if (typeof usage !== 'object' || usage === null) return undefined;
+  const cost = (usage as { cost?: unknown }).cost;
+  if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0) return undefined;
+  return cost;
+}
+
 /**
  * GlmProvider -- community provider wrapping the OpenAI chat completions API
  * pointed at the OpenRouter endpoint (https://openrouter.ai/api/v1).
@@ -140,6 +154,7 @@ export class GlmProvider implements IAgentProvider {
     }
     messages.push({ role: 'user', content: userContent });
 
+    const cap = resolveCallBudgetUsd(options);
     let stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
     try {
       stream = await client.chat.completions.create({
@@ -149,6 +164,7 @@ export class GlmProvider implements IAgentProvider {
         stream_options: { include_usage: true },
       });
     } catch (err) {
+      // No usage chunk exists yet, so there is no known primary cost to carry.
       if (isAvailabilityError(err) && this.failbackProviderFactory) {
         const failback = this.failbackProviderFactory();
         yield {
@@ -170,25 +186,39 @@ export class GlmProvider implements IAgentProvider {
       throw err;
     }
 
-    try {
-      let accumulatedContent = '';
-      let usage: OpenAI.CompletionUsage | undefined;
-      // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01):
-      // OpenRouter SSE chunks carry the served model on every chunk (per the
-      // OpenAI wire protocol). Capture the LAST non-empty value -- in practice
-      // every chunk repeats the same value, but reading the last one guards
-      // against an early empty/placeholder chunk.
-      let capturedServedModel: string | undefined;
+    let accumulatedContent = '';
+    let usage: OpenAI.CompletionUsage | undefined;
+    let usageCost: number | undefined;
+    // Layer 1 served-model capture (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01):
+    // OpenRouter SSE chunks carry the served model on every chunk (per the
+    // OpenAI wire protocol). Capture the LAST non-empty value -- in practice
+    // every chunk repeats the same value, but reading the last one guards
+    // against an early empty/placeholder chunk.
+    let capturedServedModel: string | undefined;
 
+    const tokenUsage = (): TokenUsage | undefined =>
+      usage
+        ? {
+            input: usage.prompt_tokens ?? 0,
+            output: usage.completion_tokens ?? 0,
+            total: usage.total_tokens ?? 0,
+            ...(usageCost !== undefined ? { cost: usageCost } : {}),
+          }
+        : undefined;
+
+    try {
       for await (const chunk of stream) {
         // Capture served model id from any chunk that carries it.
         if (typeof chunk.model === 'string' && chunk.model.length > 0) {
           capturedServedModel = chunk.model;
         }
 
-        // Capture usage from final chunk (present when include_usage: true)
+        // Capture usage from the final chunk (present when include_usage: true).
+        // A later usage chunk replaces an earlier one; cost is read from that
+        // final chunk only.
         if (chunk.usage) {
           usage = chunk.usage;
+          usageCost = readOpenRouterUsageCost(chunk.usage);
         }
 
         const delta = chunk.choices[0]?.delta;
@@ -202,27 +232,19 @@ export class GlmProvider implements IAgentProvider {
           };
         }
       }
-
-      // Emit result chunk with token usage
-      const tokenUsage: TokenUsage | undefined = usage
-        ? {
-            input: usage.prompt_tokens ?? 0,
-            output: usage.completion_tokens ?? 0,
-            total: usage.total_tokens ?? 0,
-          }
-        : undefined;
-
-      yield {
-        type: 'result',
-        tokens: tokenUsage,
-        stopReason: 'stop',
-        structuredOutput:
-          options?.outputFormat?.type === 'json_schema'
-            ? tryParseJson(accumulatedContent)
-            : undefined,
-        ...(capturedServedModel !== undefined ? { servedModelId: capturedServedModel } : {}),
-      };
     } catch (err) {
+      // A stream that dies before a usable usage.cost must not fail back.
+      // The unmetered call's cost is unknown, so treating it as free is wrong.
+      if (usageCost === undefined) {
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'openrouter_cost_missing',
+          errors: ['openrouter_cost_missing'],
+          ...(capturedServedModel !== undefined ? { servedModelId: capturedServedModel } : {}),
+        };
+        return;
+      }
       if (isAvailabilityError(err) && this.failbackProviderFactory) {
         const failback = this.failbackProviderFactory();
         yield {
@@ -238,11 +260,69 @@ export class GlmProvider implements IAgentProvider {
             '[GLM FAILBACK] GLM/OpenRouter stream error. Task delegated to Claude. ' +
             'Reduced cross-model adversarial value -- human review recommended.',
         };
-        yield* failback.sendQuery(prompt, _cwd, undefined, options);
+        // The executor assigns msg.cost, so the primary's known cost has to
+        // ride on the failback result. Do not emit an error result first.
+        for await (const chunk of failback.sendQuery(prompt, _cwd, undefined, options)) {
+          if (chunk.type === 'result') {
+            const own =
+              typeof chunk.cost === 'number' && Number.isFinite(chunk.cost) ? chunk.cost : 0;
+            yield { ...chunk, cost: usageCost + own };
+          } else {
+            yield chunk;
+          }
+        }
         return;
       }
+      const message = err instanceof Error ? err.message : String(err);
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'openrouter_request_failed',
+        errors: [message],
+        cost: usageCost,
+        ...(tokenUsage() !== undefined ? { tokens: tokenUsage() } : {}),
+        ...(capturedServedModel !== undefined ? { servedModelId: capturedServedModel } : {}),
+      };
       throw err;
     }
+
+    if (usageCost === undefined) {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'openrouter_cost_missing',
+        errors: ['openrouter_cost_missing'],
+        ...(tokenUsage() !== undefined ? { tokens: tokenUsage() } : {}),
+        ...(capturedServedModel !== undefined ? { servedModelId: capturedServedModel } : {}),
+      };
+      return;
+    }
+
+    const tokens = tokenUsage();
+    if (cap !== undefined && usageCost > cap) {
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'error_max_budget_usd',
+        errors: ['error_max_budget_usd'],
+        cost: usageCost,
+        ...(tokens !== undefined ? { tokens } : {}),
+        ...(capturedServedModel !== undefined ? { servedModelId: capturedServedModel } : {}),
+      };
+      return;
+    }
+
+    yield {
+      type: 'result',
+      ...(tokens !== undefined ? { tokens } : {}),
+      cost: usageCost,
+      stopReason: 'stop',
+      structuredOutput:
+        options?.outputFormat?.type === 'json_schema'
+          ? tryParseJson(accumulatedContent)
+          : undefined,
+      ...(capturedServedModel !== undefined ? { servedModelId: capturedServedModel } : {}),
+    };
   }
 }
 
