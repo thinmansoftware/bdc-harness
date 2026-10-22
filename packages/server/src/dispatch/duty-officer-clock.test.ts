@@ -1,6 +1,10 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
-import { closeDatabase, getDatabase } from '@archon/core/db/connection';
+import { getDatabase } from '@archon/core/db/connection';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import {
@@ -1233,17 +1237,43 @@ describe('duty officer clock', () => {
   });
 });
 
-test('duty officer sqlite race isolation', async () => {
+test('dutyOfficerSqliteRaceIsolation', async () => {
   const prior = readDutyOfficerProcessEnv();
   let fetchStub: { mockRestore: () => void } | null = null;
-  // Install the process singleton duty-officer reuses. GitHub metering calls
-  // getDatabase() on each request; a separately constructed adapter is not that handle.
-  const closedHandle = getDatabase();
+  const home = mkdtempSync(join(tmpdir(), 'duty-officer-sqlite-race-'));
+  const parentHandle = getDatabase();
   try {
-    expect(closedHandle.dialect).toBe('sqlite');
-    await closedHandle.query('SELECT 1');
-    await closeDatabase();
-    await expect(closedHandle.query('SELECT 1')).rejects.toThrow();
+    expect(parentHandle.dialect).toBe('sqlite');
+    await parentHandle.query('SELECT 1');
+
+    const connectionUrl = JSON.stringify(
+      pathToFileURL(resolve(import.meta.dir, '../../../core/src/db/connection.ts')).href
+    );
+    const script = `
+      const { getDatabase, closeDatabase } = await import(${connectionUrl});
+      try {
+        const db = getDatabase();
+        if (db.dialect !== 'sqlite') throw new Error('isolated_sqlite_required');
+        await db.query('SELECT 1');
+      } finally {
+        await closeDatabase();
+      }
+    `;
+    const scriptPath = join(home, 'close-isolated-database.ts');
+    writeFileSync(scriptPath, script);
+    const env: NodeJS.ProcessEnv = { ...process.env, ARCHON_HOME: home };
+    delete env.DATABASE_URL;
+    const proc = Bun.spawnSync([process.execPath, 'run', scriptPath], {
+      env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 45_000,
+    });
+    expect(
+      proc.exitCode,
+      `isolated SQLite close exited ${proc.exitCode}: ${proc.stderr.toString()} ${proc.stdout.toString()}`
+    ).toBe(0);
+    await parentHandle.query('SELECT 1');
 
     process.env.DUTY_OFFICER_GH_NUDGE = 'true';
     process.env.GH_TOKEN = 'synthetic-pat';
@@ -1268,11 +1298,11 @@ test('duty officer sqlite race isolation', async () => {
       )
     ).toBe(true);
 
-    const reopened = getDatabase();
-    expect(reopened).not.toBe(closedHandle);
-    await reopened.query('SELECT 1');
+    expect(getDatabase()).toBe(parentHandle);
+    await parentHandle.query('SELECT 1');
   } finally {
     fetchStub?.mockRestore();
     writeDutyOfficerProcessEnv(prior);
+    rmSync(home, { recursive: true, force: true });
   }
 });
