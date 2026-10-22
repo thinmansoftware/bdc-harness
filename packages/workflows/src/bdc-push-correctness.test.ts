@@ -229,6 +229,22 @@ const REJECTED_REPAIR_BRANCHES = [
   'wo/foo;rm',
 ] as const;
 
+const AUTHORITY_PREAMBLE = [
+  'RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"',
+  'if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then',
+  '  echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2',
+  '  exit 1',
+  'fi',
+  'SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")',
+].join('\n');
+
+function rewriteAuthorityRead(block: string, laneLabel: string): string {
+  if (block.includes('SPEC_TEXT=$read-spec.output') || !block.includes(AUTHORITY_PREAMBLE)) {
+    throw new Error(`authority read missing in ${laneLabel}`);
+  }
+  return block.replace(AUTHORITY_PREAMBLE, 'SPEC_TEXT="${SPEC_TEXT-}"');
+}
+
 function extractCommitSelection(yaml: string, laneLabel: string): string {
   yaml = yaml.replace(/\r\n/g, '\n');
   const startMarker = "DECIDE_OUTPUT_CLEAN=$(printf '%s\\n' \"$DECIDE_OUTPUT\" | tr -d '`')";
@@ -238,18 +254,13 @@ function extractCommitSelection(yaml: string, laneLabel: string): string {
     throw new Error(`commit selection anchors missing in ${laneLabel}`);
   }
   let block = yaml.slice(start, end + 1).replace(/^      /gm, '');
-  if (
-    !block.includes('SPEC_TEXT=$read-spec.output') ||
-    !block.includes('CHECKOUT_OUTPUT=$checkout-repair-target.output')
-  ) {
-    throw new Error(`commit engine substitutions missing in ${laneLabel}`);
+  if (!block.includes('CHECKOUT_OUTPUT=$checkout-repair-target.output')) {
+    throw new Error(`commit checkout substitution missing in ${laneLabel}`);
   }
-  block = block
-    .replace('SPEC_TEXT=$read-spec.output', 'SPEC_TEXT="${SPEC_TEXT-}"')
-    .replace(
-      'CHECKOUT_OUTPUT=$checkout-repair-target.output',
-      'CHECKOUT_OUTPUT="${CHECKOUT_OUTPUT-}"'
-    );
+  block = rewriteAuthorityRead(block, laneLabel).replace(
+    'CHECKOUT_OUTPUT=$checkout-repair-target.output',
+    'CHECKOUT_OUTPUT="${CHECKOUT_OUTPUT-}"'
+  );
   return `set -euo pipefail\n${block}echo "UNIQUE_BRANCH=$UNIQUE_BRANCH"\n`;
 }
 
@@ -273,18 +284,16 @@ function extractCheckoutRepair(yaml: string, laneLabel: string): string {
   if (nodeStart < 0) {
     throw new Error(`checkout-repair-target missing in ${laneLabel}`);
   }
-  const startMarker = '      set -euo pipefail\n      SPEC_TEXT=$read-spec.output';
+  const startMarker =
+    '      set -euo pipefail\n      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"';
   const start = yaml.indexOf(startMarker, nodeStart);
   const endMarker = '      echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LIVE_OID}"';
   const end = start < 0 ? -1 : yaml.indexOf(endMarker, start);
   if (start < 0 || end < 0) {
     throw new Error(`checkout bash anchors missing in ${laneLabel}`);
   }
-  const raw = yaml.slice(start, end + endMarker.length);
-  if (!raw.includes('SPEC_TEXT=$read-spec.output')) {
-    throw new Error(`checkout engine substitution missing in ${laneLabel}`);
-  }
-  return `${raw.replace(/^      /gm, '').replace('SPEC_TEXT=$read-spec.output', 'SPEC_TEXT="${SPEC_TEXT-}"')}\n`;
+  const raw = yaml.slice(start, end + endMarker.length).replace(/^      /gm, '');
+  return `${rewriteAuthorityRead(raw, laneLabel)}\n`;
 }
 
 function extractRepairTargetSelection(): string {
@@ -874,7 +883,7 @@ describe('Lane consistency: all feature-development lanes share review-base wiri
       expect(yaml).toContain('  - id: resolve-review-base\n');
       expect(yaml).toContain('depends_on: [war-council-validator, resolve-review-base]');
       expect(yaml).toContain(
-        'depends_on: [diff-review, classify-diff-review, resolve-review-base]'
+        'depends_on: [diff-review, classify-diff-review, resolve-review-base, repair-gate]'
       );
       expect(yaml).toContain('depends_on: [checkpoint-diff-repair, resolve-review-base]');
       expect(yaml).not.toContain('BASE_REF="origin/${BASE_BRANCH:-main}"');
@@ -922,7 +931,8 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).toContain('repair_target_malformed');
       expect(yaml).toContain('repair_target_unauthorized');
       expect(yaml).toContain('s/^[[:space:]]*Repair target:[[:space:]]*PR #');
-      expect(yaml).toContain('SPEC_TEXT=$read-spec.output');
+      expect(yaml).toContain('RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"');
+      expect(yaml).not.toContain('SPEC_TEXT=$read-spec.output');
       expect(yaml).not.toContain('BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC');
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
     }
@@ -953,7 +963,8 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       expect(yaml).toContain('repair_target_malformed');
       expect(yaml).toContain('repair_target_unauthorized');
       expect(yaml).toContain('s/^[[:space:]]*Repair target:[[:space:]]*PR #');
-      expect(yaml).toContain('SPEC_TEXT=$read-spec.output');
+      expect(yaml).toContain('RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"');
+      expect(yaml).not.toContain('SPEC_TEXT=$read-spec.output');
       expect(yaml).not.toContain('BDC_FEATURE_DEV_SPEC_TEXT_READ_SPEC');
       expect(yaml).toContain('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
       expect(yaml).toContain('--force-with-lease=');
@@ -1001,7 +1012,10 @@ describe('Plan-review repair targets and operator-recorded stops', () => {
       const checkout = result.workflow.nodes.find(node => node.id === 'checkout-repair-target');
       expect(checkout, basename(lane)).toBeDefined();
       expect(checkout?.depends_on ?? []).toContain('read-spec');
-      expect(checkout?.bash).toContain('SPEC_TEXT=$read-spec.output');
+      expect(checkout?.bash).toContain(
+        'RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"'
+      );
+      expect(checkout?.bash).not.toContain('SPEC_TEXT=$read-spec.output');
       expect(checkout?.bash).toContain('git checkout -B');
       expect(checkout?.bash).toContain('repair_target_rejected:fork');
       expect(checkout?.bash).toContain('REPAIR_TARGET_LEASE_SHA=');
@@ -1384,7 +1398,8 @@ describe('Spec-authorized repair onto wo and Cauldron task branches', () => {
       const label = basename(lane);
       expect(yaml.split(ORDINARY_BRANCH_PATTERN).length - 1, label).toBe(1);
       expect(yaml.split(repairPattern).length - 1, label).toBe(2);
-      expect(yaml, label).toContain('SPEC_TEXT=$read-spec.output');
+      expect(yaml, label).toContain('RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"');
+      expect(yaml, label).not.toContain('SPEC_TEXT=$read-spec.output');
       expect(yaml, label).toContain('CHECKOUT_OUTPUT=$checkout-repair-target.output');
       const repairAssign = block.indexOf('UNIQUE_BRANCH="$REPAIR_TARGET_BRANCH"');
       const ordinaryAssign = block.indexOf(ORDINARY_BRANCH_PATTERN);
