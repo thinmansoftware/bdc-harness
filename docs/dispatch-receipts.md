@@ -114,3 +114,18 @@ The reader never acknowledges, addresses or cancels; it only machine-disposes IN
 
 Direct receipt operations and cancellation are prohibited. The legacy non-terminal surface
 disposition remains owned by the existing operator consumer and is not produced by this reader.
+
+### XO ACTION comments
+
+An agent that cannot send Dispatch can still reach the acting XO by commenting on an issue in
+`thinmansoftware/bdc-xo`. Put `XO ACTION` in the first line, in any case. The inbox reader normally
+runs every five minutes and creates one `agent_message` for `xo` with subject
+`gh:thinmansoftware/bdc-xo#<issue>`. The message body holds the comment URL, the author, the
+created time, and the first 500 characters of the comment.
+
+A comment also qualifies when its body contains the current `board_xo_leases.lease_id`. Session
+IDs do not qualify, because the lease row has no session-id field.
+
+The same GitHub comment id cannot create a second message. The first run stores a cursor at the
+run start and does not import older comments. The reader makes at most one comment-listing call
+per run, and it skips that call while the shared GitHub core rate limit remaining is below 500.
