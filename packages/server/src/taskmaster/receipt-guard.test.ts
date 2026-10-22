@@ -31,6 +31,8 @@ import {
   isAutomatedComment,
   latestSubstantiveComment,
   readLatestSubstantiveComment,
+  RECEIPT_COMMENT_PAGE_CAP,
+  RECEIPT_COMMENT_PAGE_SIZE,
   type ReceiptCheckOutcome,
   type ReceiptComment,
 } from './receipt-guard';
@@ -830,6 +832,54 @@ describe('receipt guard', () => {
     });
     const logged = logs.split('taskmaster.receipt_check_budget_exhausted').length - 1;
     expect(logged).toBe(4);
+
+    // Five full pages (100 comments each) hits the page cap and fails open.
+    // A fresh tick budget keeps this case off the 10-request exhaustion path.
+    const pageCapState = createReceiptCheckState();
+    let pageCapRequests = 0;
+    const pageCapFetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/access_tokens')) {
+        return new Response(
+          JSON.stringify({
+            token: 'ghs_test',
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          }),
+          { status: 200, headers: rateHeaders }
+        );
+      }
+      pageCapRequests += 1;
+      const parsed = new URL(url);
+      expect(parsed.searchParams.get('per_page')).toBe(String(RECEIPT_COMMENT_PAGE_SIZE));
+      const page = Number(parsed.searchParams.get('page'));
+      expect(page).toBe(pageCapRequests);
+      expect(page).toBeLessThanOrEqual(RECEIPT_COMMENT_PAGE_CAP);
+      const rows = Array.from({ length: RECEIPT_COMMENT_PAGE_SIZE }, (_, offset) => {
+        const index = (page - 1) * RECEIPT_COMMENT_PAGE_SIZE + offset;
+        return {
+          body: `page-cap comment ${index}`,
+          created_at: new Date(
+            Date.parse('2026-01-01T00:00:00.000Z') + index * 60_000
+          ).toISOString(),
+        };
+      });
+      return new Response(JSON.stringify(rows), { status: 200, headers: rateHeaders });
+    }) as typeof fetch;
+
+    const pageCapLogs = await capturePino(async () => {
+      const capped = await readLatestSubstantiveComment(
+        'gh:thinmansoftware/bdc-xo#500',
+        updatedAt,
+        pageCapState,
+        pageCapFetch
+      );
+      expect(capped).toEqual({ failOpen: true, reason: 'page_cap' });
+    });
+    expect(RECEIPT_COMMENT_PAGE_CAP).toBe(5);
+    expect(pageCapRequests).toBe(5);
+    expect(pageCapState.requestsUsed).toBe(5);
+    expect(pageCapLogs).toContain('taskmaster.receipt_check_budget_exhausted');
+    expect(pageCapLogs).toContain('"reason":"page_cap"');
   });
 
   test('10. owner label suppresses only the unclaimed-P0 escalation', async () => {
@@ -899,6 +949,43 @@ describe('receipt guard', () => {
       const nowMs = Date.parse('2026-09-29T12:00:00.000Z');
       const context = { interventionsLast24h: 0, nowMs };
       expect(computeNextAction(owner, classifyThread(owner, nowMs), context)).toBeNull();
+
+      // Same owner label, but idle past the P0 clock. Escalation stays
+      // suppressed; the stale-thread nudge to the thread recipient still emits.
+      // A receipt on that stale thread suppresses the nudge as well.
+      const staleOwner = {
+        ...owner,
+        lastActivityAt: new Date(nowMs - 5 * 3_600_000).toISOString(),
+      };
+      const staleContext = {
+        interventionsLast24h: 0,
+        nowMs,
+        adoption: adoption({
+          thread_ref: staleOwner.ref,
+          issue_number: 1997,
+          title: 'Cursor owned P0',
+          owner_login: 'cursor',
+          priority: 'P0',
+        }),
+      };
+      expect(classifyThread(staleOwner, nowMs)).toBe('ready');
+      const staleProposal = computeNextAction(
+        staleOwner,
+        classifyThread(staleOwner, nowMs),
+        staleContext
+      );
+      expect(staleProposal?.type).toBe('nudge');
+      expect(staleProposal?.recipient).toBe(owner.recipient);
+      expect(staleProposal?.threadRef).toBe(owner.ref);
+      expect(staleProposal?.idempotencyKey.startsWith(`tm:nudge:${owner.ref}:`)).toBe(true);
+      expect(
+        computeNextAction(
+          { ...staleOwner, hasReceipt: true },
+          classifyThread(staleOwner, nowMs),
+          staleContext
+        )
+      ).toBeNull();
+
       expect(computeNextAction(malformed, classifyThread(malformed, nowMs), context)?.type).toBe(
         'escalate_p0'
       );
