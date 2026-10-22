@@ -2307,9 +2307,9 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
 
   test('codex-native-strict fails closed on 429 and never routes to Claude', async () => {
     mockRunStreamed.mockRejectedValue(new Error('429 too many requests'));
-    const claudeFactory = mock(() => {
-      throw new Error('Claude provider must not be constructed');
-    });
+    // Claude is constructed only by calling failbackProviderFactory. The strict
+    // seat stores null, so there is no factory to spy. Null plus a thrown
+    // error and no provider_route chunk is the proof it cannot run.
     const strict = new CodexProvider({
       retryBaseDelayMs: 1,
       failbackProviderFactory: null,
@@ -2325,14 +2325,12 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
 
     await expect(consume()).rejects.toThrow(/429/);
     expect(chunks.some(chunk => chunk.type === 'provider_route')).toBe(false);
-    expect(claudeFactory).not.toHaveBeenCalled();
   });
 
   test('codex-native-strict fails closed on auth rotation and never routes to Claude', async () => {
     mockRunStreamed.mockRejectedValue(new Error(AUTH_ROTATION_ERROR));
-    const claudeFactory = mock(() => {
-      throw new Error('Claude provider must not be constructed');
-    });
+    // Same null-factory proof as the 429 case. A disconnected Claude factory
+    // mock cannot observe construction, because this provider never receives it.
     const strict = new CodexProvider({
       retryBaseDelayMs: 1,
       failbackProviderFactory: null,
@@ -2348,7 +2346,6 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
 
     await expect(consume()).rejects.toThrow(/refresh token was already used/);
     expect(chunks.some(chunk => chunk.type === 'provider_route')).toBe(false);
-    expect(claudeFactory).not.toHaveBeenCalled();
   });
 
   test('isAuthFailureError: single-shot guard prevents double-delegation', async () => {
