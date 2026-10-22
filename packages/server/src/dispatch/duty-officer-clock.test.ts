@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
+import { closeDatabase, getDatabase } from '@archon/core/db/connection';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import {
@@ -246,16 +247,49 @@ function relayRecoveryFixture(
   return { deps, source, neighbor, relays };
 }
 
+const dutyOfficerProcessEnvKeys = ['DUTY_OFFICER_GH_NUDGE', 'GH_TOKEN', 'GITHUB_TOKEN'] as const;
+
+type DutyOfficerProcessEnvKey = (typeof dutyOfficerProcessEnvKeys)[number];
+
+function readDutyOfficerProcessEnv(): Record<DutyOfficerProcessEnvKey, string | undefined> {
+  return {
+    DUTY_OFFICER_GH_NUDGE: process.env.DUTY_OFFICER_GH_NUDGE,
+    GH_TOKEN: process.env.GH_TOKEN,
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+  };
+}
+
+function writeDutyOfficerProcessEnv(
+  prior: Record<DutyOfficerProcessEnvKey, string | undefined>
+): void {
+  for (const key of dutyOfficerProcessEnvKeys) {
+    const value = prior[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+// Shared by beforeEach and afterEach. A finally inside one test cannot stick:
+// this hook used to delete the three keys after every test and wipe values
+// that were already set for the Bun process.
+let dutyOfficerProcessEnvSnapshot: Record<DutyOfficerProcessEnvKey, string | undefined> = {
+  DUTY_OFFICER_GH_NUDGE: undefined,
+  GH_TOKEN: undefined,
+  GITHUB_TOKEN: undefined,
+};
+
+beforeEach(() => {
+  dutyOfficerProcessEnvSnapshot = readDutyOfficerProcessEnv();
+});
+
 afterEach(() => {
   stopDutyOfficerClock();
   resetSecurityDetectorStateForTests();
   delete process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS;
   delete process.env.DUTY_OFFICER_CLOCK_ENABLED;
-  delete process.env.DUTY_OFFICER_GH_NUDGE;
+  writeDutyOfficerProcessEnv(dutyOfficerProcessEnvSnapshot);
   delete process.env.DUTY_OFFICER_GH_REPO;
-  delete process.env.GH_TOKEN;
-  delete process.env.GITHUB_TOKEN;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS;
   delete process.env.ARCHON_BUILD_SHA;
 });
@@ -1197,4 +1231,48 @@ describe('duty officer clock', () => {
     ).mock.calls.find(c => (c[0] as { id: string }).id === 'br-2')![0] as { result_body: string };
     expect(JSON.parse(br2Finish.result_body).disposition).toBe('taskmaster_blocker_report_relayed');
   });
+});
+
+test('duty officer sqlite race isolation', async () => {
+  const prior = readDutyOfficerProcessEnv();
+  let fetchStub: { mockRestore: () => void } | null = null;
+  // Install the process singleton duty-officer reuses. GitHub metering calls
+  // getDatabase() on each request; a separately constructed adapter is not that handle.
+  const closedHandle = getDatabase();
+  try {
+    expect(closedHandle.dialect).toBe('sqlite');
+    await closedHandle.query('SELECT 1');
+    await closeDatabase();
+    await expect(closedHandle.query('SELECT 1')).rejects.toThrow();
+
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    delete process.env.GITHUB_TOKEN;
+    const bodies = ['[]', JSON.stringify({ id: 1 })];
+    let fetchCalls = 0;
+    fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      const body = bodies[Math.min(fetchCalls, bodies.length - 1)] ?? '[]';
+      fetchCalls += 1;
+      return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    // postGithubIssueComment reads pool state through the singleton. If that
+    // call receives closedHandle, the closed-database query rejects and this fails.
+    expect(
+      await postGithubIssueComment(
+        { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2274 },
+        'cue'
+      )
+    ).toBe(true);
+
+    const reopened = getDatabase();
+    expect(reopened).not.toBe(closedHandle);
+    await reopened.query('SELECT 1');
+  } finally {
+    fetchStub?.mockRestore();
+    writeDutyOfficerProcessEnv(prior);
+  }
 });
