@@ -962,6 +962,10 @@ describe('resolveAgentPersona', () => {
       'gpt-6-astra'
     );
     expect(resolveAgentPersona(persona, 'gpt-6-astra', 'codex').model).toBeUndefined();
+  });
+
+  it('strict Codex preserves an undefined model when the persona also omits model', () => {
+    const persona = makePersona({ model: undefined });
     expect(resolveAgentPersona(persona, undefined, 'codex-native-strict').model).toBeUndefined();
   });
 
