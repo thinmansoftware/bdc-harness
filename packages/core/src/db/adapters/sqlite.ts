@@ -81,6 +81,7 @@ const TM_JOURNAL_INDEXES: readonly string[] = [
 
 export class SqliteAdapter implements IDatabase {
   private db: Database;
+  private closed = false;
   readonly dialect = 'sqlite' as const;
   readonly sql: SqlDialect = sqliteDialect;
   /** M-42 Slice 8: registration of reviewed isolated Wave 2 schema installers. */
@@ -97,22 +98,30 @@ export class SqliteAdapter implements IDatabase {
     }
 
     this.db = new Database(dbPath);
+    try {
+      // Enable WAL mode for better concurrent performance
+      this.db.run('PRAGMA journal_mode = WAL');
 
-    // Enable WAL mode for better concurrent performance
-    this.db.run('PRAGMA journal_mode = WAL');
+      // Retry busy locks up to 5s to avoid SQLITE_BUSY during parallel workflows
+      this.db.run('PRAGMA busy_timeout = 5000');
 
-    // Retry busy locks up to 5s to avoid SQLITE_BUSY during parallel workflows
-    this.db.run('PRAGMA busy_timeout = 5000');
+      // Enable foreign keys
+      this.db.run('PRAGMA foreign_keys = ON');
 
-    // Enable foreign keys
-    this.db.run('PRAGMA foreign_keys = ON');
+      // Settle any outdated tm_expectations shape BEFORE initSchema, whose
+      // index creation would otherwise fail against the old table.
+      this.ensureTmExpectationsShape();
 
-    // Settle any outdated tm_expectations shape BEFORE initSchema, whose
-    // index creation would otherwise fail against the old table.
-    this.ensureTmExpectationsShape();
-
-    // Initialize schema if needed
-    this.initSchema(bootstrapStartedAt);
+      // Initialize schema if needed
+      this.initSchema(bootstrapStartedAt);
+    } catch (error) {
+      try {
+        this.releaseDatabaseSync();
+      } catch (releaseError) {
+        getLog().warn({ err: releaseError as Error }, 'db.sqlite_constructor_release_failed');
+      }
+      throw error;
+    }
   }
 
   /**
@@ -240,6 +249,13 @@ export class SqliteAdapter implements IDatabase {
   }
 
   async close(): Promise<void> {
+    this.releaseDatabaseSync();
+  }
+
+  /** Synchronous, idempotent handle release shared by close() and constructor failure. */
+  private releaseDatabaseSync(): void {
+    if (this.closed) return;
+    this.closed = true;
     // Checkpoint and truncate the WAL before closing so the -wal/-shm files are
     // released; on Windows a lingering WAL handle makes rmSync fail with EBUSY.
     try {

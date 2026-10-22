@@ -1486,6 +1486,10 @@ export async function disposeMessageByMachine(
   return withRetriedMailboxTransaction(() => getDatabase().withTransaction(execute));
 }
 
+export const MAILBOX_SQLITE_BUSY_TIMEOUT_MS = 5000;
+export const MAILBOX_TRANSACTION_MAX_ATTEMPTS = 3;
+export const MAILBOX_TRANSACTION_RETRY_DEADLINE_MS = 16000;
+
 function isRetriableMailboxTransactionError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return (
@@ -1496,13 +1500,44 @@ function isRetriableMailboxTransactionError(error: unknown): boolean {
 }
 
 async function withRetriedMailboxTransaction<T>(fn: () => Promise<T>): Promise<T> {
-  const maxAttempts = 3;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  const started = Date.now();
+  let priorLockFailure = false;
+  for (let attempt = 1; attempt <= MAILBOX_TRANSACTION_MAX_ATTEMPTS; attempt += 1) {
+    const attemptStarted = Date.now();
     try {
       return await fn();
     } catch (error) {
-      if (!isRetriableMailboxTransactionError(error) || attempt === maxAttempts) throw error;
-      await Bun.sleep(attempt * 10);
+      if (!isRetriableMailboxTransactionError(error)) throw error;
+      const attemptDurationMs = Date.now() - attemptStarted;
+      const elapsed = Date.now() - started;
+      if (
+        attempt === MAILBOX_TRANSACTION_MAX_ATTEMPTS ||
+        elapsed >= MAILBOX_TRANSACTION_RETRY_DEADLINE_MS
+      ) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : '';
+      const nested = message.includes('cannot start a transaction within a transaction');
+      const lockFailure = message.includes('database is locked') || message.includes('SQLITE_BUSY');
+      // A lock error can leave this attempt's deferred transaction open.
+      // The first nested BEGIN belongs to a sibling on this connection;
+      // rolling that back discards the sibling receipt (same-connection
+      // acknowledgement/address races). A nested error after our own lock
+      // failure may still be our leftover transaction.
+      if (lockFailure || (nested && priorLockFailure)) {
+        try {
+          await getDatabase().query('ROLLBACK');
+        } catch (rollbackError) {
+          log.warn({ err: rollbackError as Error }, 'dispatch.mailbox_transaction_rollback_failed');
+        }
+      }
+      if (lockFailure) priorLockFailure = true;
+      const unusedBusy = Math.max(0, MAILBOX_SQLITE_BUSY_TIMEOUT_MS - attemptDurationMs);
+      const sleepMs = Math.min(
+        unusedBusy + (process.pid % 200) + attempt * 10,
+        MAILBOX_TRANSACTION_RETRY_DEADLINE_MS - elapsed
+      );
+      if (sleepMs > 0) await Bun.sleep(sleepMs);
     }
   }
   throw new Error('mailbox_transaction_retry_exhausted');
