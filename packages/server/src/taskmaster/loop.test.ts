@@ -1695,6 +1695,44 @@ describe('fire_cauldron loop', () => {
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
   });
+
+  test('refresh_lane_health_runs_once_before_cursor_and_zero_health_is_read', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    // Yield once so a missing await in tick would let the health reads
+    // observe the pre-refresh state. The flag flips only after that yield.
+    let refreshCalls = 0;
+    let refreshed = false;
+    let readBeforeRefresh = false;
+    const cursorZeroReads: string[] = [];
+    await tick(
+      createTaskmasterState(60_000),
+      makeDeps(world, {
+        refreshLaneHealth: async () => {
+          refreshCalls += 1;
+          await Promise.resolve();
+          refreshed = true;
+        },
+        getHealthSample: async provider => {
+          if ((provider === 'cursor' || provider === 'zero') && !refreshed) {
+            readBeforeRefresh = true;
+          }
+          if (provider === 'cursor' || provider === 'zero') cursorZeroReads.push(provider);
+          return {
+            provider,
+            state: 'degraded',
+            sampled_at: new Date(world.nowMs).toISOString(),
+            expires_at: new Date(world.nowMs + 60_000).toISOString(),
+            evidence: null,
+          };
+        },
+      })
+    );
+    expect(refreshCalls).toBe(1);
+    expect(refreshed).toBe(true);
+    expect(readBeforeRefresh).toBe(false);
+    expect([...cursorZeroReads].sort()).toEqual(['cursor', 'zero']);
+  });
 });
 
 describe('pending fire custody', () => {
