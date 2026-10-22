@@ -150,7 +150,12 @@ nodes:
     load_bearing: true
     bash: |
       set -euo pipefail
-      SPEC_TEXT=$read-spec.output
+      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"
+      if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then
+        echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2
+        exit 1
+      fi
+      SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")
       SPEC_REPAIR_PR=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #\([0-9][0-9]*\)[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
       SPEC_REPAIR_BRANCH=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #[0-9][0-9]*[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
       if [ -z "$SPEC_REPAIR_PR" ] || [ -z "$SPEC_REPAIR_BRANCH" ]; then
@@ -393,6 +398,14 @@ nodes:
       }
       # ---- END rtw core ----
       rtw_checkout_repair_branch "$SPEC_REPAIR_BRANCH"
+      git fetch origin "+refs/heads/${SPEC_REPAIR_BRANCH}:refs/remotes/origin/${SPEC_REPAIR_BRANCH}"
+      git branch --set-upstream-to="origin/${SPEC_REPAIR_BRANCH}" "${SPEC_REPAIR_BRANCH}"
+      REPAIR_TARGET_UPSTREAM_OID=$(git rev-parse '@{upstream}')
+      if [ "$REPAIR_TARGET_UPSTREAM_OID" != "$REPAIR_TARGET_LIVE_OID" ]; then
+        echo "ERROR: repair_target_upstream_mismatch: expected=${REPAIR_TARGET_LIVE_OID} actual=${REPAIR_TARGET_UPSTREAM_OID}" >&2
+        exit 1
+      fi
+      echo "REPAIR_TARGET_UPSTREAM=origin/${SPEC_REPAIR_BRANCH}"
       echo "REPAIR_TARGET=#${SPEC_REPAIR_PR}"
       echo "REPAIR_TARGET_BRANCH=${SPEC_REPAIR_BRANCH}"
       echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LIVE_OID}"
@@ -796,13 +809,59 @@ nodes:
       dprep_ensure_js_deps
       exit 0
 
+  - id: repair-gate
+    depends_on: [checkout-repair-target, plan-review]
+    trigger_rule: all_done
+    task_class: clerical
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"
+      if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then
+        echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2
+        exit 1
+      fi
+      SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")
+      SPEC_REPAIR_PR=$(printf '%s\n' "$SPEC_TEXT" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #\([0-9][0-9]*\)[[:space:]]*(branch [^[:space:]]*)[[:space:]]*$/\1/p' | head -n 1)
+      if [ -z "$SPEC_REPAIR_PR" ]; then
+        printf '{"REPAIR_GATE":"n/a"}\n'
+        exit 0
+      fi
+      CHECKOUT_OUT_FILE="$ARCHON_NODE_OUT/checkout-repair-target.out"
+      PLAN_REVIEW_OUT_FILE="$ARCHON_NODE_OUT/plan-review.out"
+      if [ ! -s "$CHECKOUT_OUT_FILE" ] || ! grep -Fxq "REPAIR_TARGET=#${SPEC_REPAIR_PR}" "$CHECKOUT_OUT_FILE"; then
+        reason=checkout_failed
+      elif [ ! -s "$PLAN_REVIEW_OUT_FILE" ]; then
+        reason=plan_review_skipped
+      elif ! grep -Fxq 'PLAN_REVIEW_PASS=true' "$PLAN_REVIEW_OUT_FILE"; then
+        reason=plan_review_not_approved
+      else
+        printf '{"REPAIR_GATE":"open"}\n'
+        exit 0
+      fi
+      printf 'repair_gate_closed: %s\n' "$reason" >&2
+      printf '{"REPAIR_GATE":"closed","REPAIR_GATE_REASON":"%s"}\n' "$reason"
+
+  - id: repair-gate-fail
+    depends_on: [repair-gate]
+    trigger_rule: all_done
+    when: "$repair-gate.output.REPAIR_GATE == 'closed'"
+    task_class: clerical
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      GATE_OUT_FILE="$ARCHON_NODE_OUT/repair-gate.out"
+      reason=$(sed -n 's/.*"REPAIR_GATE_REASON":"\([^"]*\)".*/\1/p' "$GATE_OUT_FILE" | head -n 1)
+      printf 'repair_gate_closed: %s\n' "${reason:-unknown}" >&2
+      exit 1
+
   - id: implement
     idle_timeout: 600000
     provider: codex
     model: gpt-5.6-sol
-    depends_on: [prep-dependencies]
+    depends_on: [prep-dependencies, repair-gate]
     trigger_rule: all_done
-    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
+    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true' && $repair-gate.output.REPAIR_GATE != 'closed'"
     task_class: medium_work
     wall_timeout_ms: 1800000
     loop:
@@ -968,7 +1027,8 @@ nodes:
   # WO-HARNESS-IMPLEMENT-CHECKPOINT-PUSH-01
   - id: checkpoint-push
     persona: overseer
-    depends_on: [implement]
+    depends_on: [implement, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE != 'closed'"
     trigger_rule: all_done
     bash: |
       set -uo pipefail
@@ -1009,7 +1069,7 @@ nodes:
       Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>" \
         2>/dev/null || { echo "WARN: checkpoint commit failed -- continuing" >&2; exit 0; }
 
-      if git push -u origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
+      if git push origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
         echo "checkpoint-push: WIP branch pushed -- ${WIP_BRANCH}"
         echo "CHECKPOINT_BRANCH=${WIP_BRANCH}"
         echo "CHECKPOINT_SHA=$(git rev-parse HEAD)"
@@ -2573,7 +2633,12 @@ nodes:
     depends_on: [read-spec]
     bash: |
       set -uo pipefail
-      SPEC_TEXT=$read-spec.output
+      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"
+      if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then
+        echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2
+        exit 1
+      fi
+      SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")
       # Same 3 patterns decide-push-target's Base Branch Override section already
       # documents (plain header, markdown-bold, YAML field), in priority order.
       DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '^Base branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^Base branch:[[:space:]]*//')
@@ -2691,8 +2756,8 @@ nodes:
   - id: diff-repair
     provider: codex
     model: gpt-5.6-sol
-    depends_on: [diff-review, classify-diff-review, resolve-review-base]
-    when: "$classify-diff-review.output.verdict == 'needs_revision'"
+    depends_on: [diff-review, classify-diff-review, resolve-review-base, repair-gate]
+    when: "$classify-diff-review.output.verdict == 'needs_revision' && $repair-gate.output.REPAIR_GATE != 'closed'"
     task_class: medium_work
     idle_timeout: 570000
     wall_timeout_ms: 1230000
@@ -2813,7 +2878,8 @@ nodes:
   # judged the stale committed HEAD at 11 locations, block-classify->BLOCKED, and the fix
   # was lost. WO-HARNESS-DIFF-REPAIR-COMMITS-BEFORE-FINAL-REVIEW-01.
   - id: checkpoint-diff-repair
-    depends_on: [diff-repair]
+    depends_on: [diff-repair, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE != 'closed'"
     trigger_rule: all_done
     bash: |
       set -uo pipefail
@@ -3000,8 +3066,8 @@ nodes:
   - id: opus-repair
     provider: codex
     model: gpt-5.6-sol
-    depends_on: [block-classify]
-    when: "$block-classify.output.status == 'BLOCKED'"
+    depends_on: [block-classify, repair-gate]
+    when: "$block-classify.output.status == 'BLOCKED' && $repair-gate.output.REPAIR_GATE != 'closed'"
     prompt: |
       The bdc-feature-development run is BLOCKED before the irreversible commit. Before a
       human is paused, you get ONE autonomous repair pass. Diagnose and, if you can,
@@ -3374,9 +3440,9 @@ nodes:
     model: claude-opus-5-5
     effort: xhigh
     context: fresh
-    depends_on: [pause-gate]
+    depends_on: [pause-gate, repair-gate]
     trigger_rule: all_done
-    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    when: "$pause-gate.output.decision_verb == 'approve_with_fix' && $repair-gate.output.REPAIR_GATE != 'closed'"
     prompt: |
       The operator authorized specific fixes at the approval gate. Apply ONLY the fixes whose
       ids appear in authorized_fix_ids. Do NOT apply any other finding.
@@ -3592,9 +3658,9 @@ nodes:
   # backoff) and node fails closed if all attempts fail.
   - id: commit-and-push
     persona: overseer
-    depends_on: [decide-push-target, classify-apply-review, classify-opus-rereview]
+    depends_on: [decide-push-target, classify-apply-review, classify-opus-rereview, repair-gate]
     trigger_rule: all_done
-    when: "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied' || $classify-opus-rereview.output.verdict == 'satisfied'"
+    when: "$block-reclassify.output.status == 'PROCEED' && $repair-gate.output.REPAIR_GATE != 'closed' || $classify-apply-review.output.verdict == 'satisfied' && $repair-gate.output.REPAIR_GATE != 'closed' || $classify-opus-rereview.output.verdict == 'satisfied' && $repair-gate.output.REPAIR_GATE != 'closed'"
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -3770,10 +3836,13 @@ nodes:
         echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
         exit 1
       fi
-      # Direct assignment, never a heredoc: the executor substitutes $read-spec.output
-      # shellQuote-wrapped (single-quoted, embedded quotes escaped), so untrusted spec
-      # text can neither terminate a delimiter nor be evaluated by this shell.
-      SPEC_TEXT=$read-spec.output
+      # Read the hash-verified run authority from disk; never authorize from substituted output.
+      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"
+      if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then
+        echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2
+        exit 1
+      fi
+      SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")
       CHECKOUT_OUTPUT=$checkout-repair-target.output
       REPAIR_TARGET_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       REPAIR_TARGET_PR=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_pr:[[:space:]]*#\{0,1\}\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
@@ -3812,6 +3881,7 @@ nodes:
           local line="" stripped="" captured=""
           local begin_count=0 end_count=0 begin_idx=-1 end_idx=-1
           local in_code=0 field_count=0 i=0
+          RTA_LAST_REASON=
           local fence_char="" fence_size=0 marker="" tail=""
           local -a lines=()
           local begin_re='^ {0,3}===[[:blank:]]*APPROVED_PLAN_BEGIN[[:blank:]]*===[[:blank:]]*$'
@@ -3838,13 +3908,17 @@ nodes:
             fi
           done
           if [ "$begin_count" -ne 1 ] || [ "$end_count" -ne 1 ] || [ "$begin_idx" -lt 0 ] || [ "$end_idx" -lt 0 ] || [ "$begin_idx" -ge "$end_idx" ]; then
+            RTA_LAST_REASON=fence_count
             printf 'repair_target_plan_authorization_refused: fence_count\n'
+            printf 'repair_target_plan_authorization_refused: fence_count\n' >&2
             return 1
           fi
           for ((i=0; i<end_idx; i++)); do
             line="${lines[$i]}"
             if [ "$i" -eq "$begin_idx" ] && [ "$in_code" -eq 1 ]; then
-              printf 'repair_target_plan_authorization_refused: no_standalone_field\n'
+              RTA_LAST_REASON=no_standalone_field
+            printf 'repair_target_plan_authorization_refused: no_standalone_field\n'
+            printf 'repair_target_plan_authorization_refused: no_standalone_field\n' >&2
               return 1
             fi
             if [[ "$line" =~ $fence_re ]]; then
@@ -3868,24 +3942,50 @@ nodes:
             fi
           done
           if [ "$field_count" -eq 0 ] || [ "$in_code" -eq 1 ]; then
+            RTA_LAST_REASON=no_standalone_field
             printf 'repair_target_plan_authorization_refused: no_standalone_field\n'
+            printf 'repair_target_plan_authorization_refused: no_standalone_field\n' >&2
             return 1
           fi
           if [ "$field_count" -gt 1 ]; then
+            RTA_LAST_REASON=multiple_fields
             printf 'repair_target_plan_authorization_refused: multiple_fields\n'
+            printf 'repair_target_plan_authorization_refused: multiple_fields\n' >&2
             return 1
           fi
           if [ "$captured" != "$want_pr" ]; then
+            RTA_LAST_REASON=pr_mismatch
             printf 'repair_target_plan_authorization_refused: pr_mismatch\n'
+            printf 'repair_target_plan_authorization_refused: pr_mismatch\n' >&2
             return 1
           fi
           printf 'repair_target_plan_authorization: ok #%s\n' "$captured"
           return 0
         }
         # ---- END rta core ----
-        if [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" != true ] || [ "$REPAIR_TARGET_AUTHORIZED" != "#${REPAIR_TARGET_PR}" ] || [ "$SPEC_REPAIR_PR" != "$REPAIR_TARGET_PR" ] || [ "$SPEC_REPAIR_BRANCH" != "$REPAIR_TARGET_BRANCH" ] || ! rta_plan_authorizes "$PLAN_REVIEW_RAW" "$REPAIR_TARGET_PR"; then
+        if [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" != true ]; then
           echo "repair_target_unauthorized"
-          echo "ERROR: repair_target_unauthorized: refusing to select an existing branch without a spec-bound authorization matching PR #${REPAIR_TARGET_PR} branch ${REPAIR_TARGET_BRANCH}" >&2
+          echo "ERROR: repair_target_unauthorized: condition=decide_authorized_missing authorized_present=${REPAIR_TARGET_AUTHORIZED_PRESENT}" >&2
+          exit 1
+        fi
+        if [ "$REPAIR_TARGET_AUTHORIZED" != "#${REPAIR_TARGET_PR}" ]; then
+          echo "repair_target_unauthorized"
+          echo "ERROR: repair_target_unauthorized: condition=decide_authorized_pr_mismatch authorized=${REPAIR_TARGET_AUTHORIZED:-missing} repair_pr=#${REPAIR_TARGET_PR}" >&2
+          exit 1
+        fi
+        if [ "$SPEC_REPAIR_PR" != "$REPAIR_TARGET_PR" ]; then
+          echo "repair_target_unauthorized"
+          echo "ERROR: repair_target_unauthorized: condition=spec_pr_mismatch spec_pr=#${SPEC_REPAIR_PR:-missing} repair_pr=#${REPAIR_TARGET_PR}" >&2
+          exit 1
+        fi
+        if [ "$SPEC_REPAIR_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
+          echo "repair_target_unauthorized"
+          echo "ERROR: repair_target_unauthorized: condition=spec_branch_mismatch spec_branch=${SPEC_REPAIR_BRANCH:-missing} repair_branch=${REPAIR_TARGET_BRANCH}" >&2
+          exit 1
+        fi
+        if ! rta_plan_authorizes "$PLAN_REVIEW_RAW" "$REPAIR_TARGET_PR"; then
+          echo "repair_target_unauthorized"
+          echo "ERROR: repair_target_unauthorized: condition=plan_authorization reason=${RTA_LAST_REASON:-unknown}" >&2
           exit 1
         fi
         REPO_FOR_CHECK=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repo:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
@@ -4126,7 +4226,8 @@ nodes:
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
     persona: major-build
-    depends_on: [commit-and-push]
+    depends_on: [commit-and-push, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE != 'closed'"
     task_class: clerical
     load_bearing: true
     bash: |

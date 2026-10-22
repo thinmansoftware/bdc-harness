@@ -119,11 +119,13 @@ describe('already-satisfied lane wiring', () => {
       // the repair-target checkout failed, so plan-review must not run on it.
       const planReviewWhen =
         "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true' && $checkout-repair-target.output != ''";
+      const implementWhen =
+        "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true' && $repair-gate.output.REPAIR_GATE != 'closed'";
 
       expect(node('plan')?.when).toBe(skipWhen);
       expect(node('plan-review')?.when).toBe(planReviewWhen);
       expect(node('plan-review')?.trigger_rule).toBe('all_done');
-      expect(node('implement')?.when).toBe(skipWhen);
+      expect(node('implement')?.when).toBe(implementWhen);
       expect(node('implement')?.trigger_rule).toBe('all_done');
 
       for (const id of [
