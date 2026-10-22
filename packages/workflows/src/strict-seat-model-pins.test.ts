@@ -80,12 +80,9 @@ function diskWorkflows(): WorkflowDefinition[] {
 }
 
 function bundledWorkflows(): WorkflowDefinition[] {
-  const workflows: WorkflowDefinition[] = [];
-  for (const [name, content] of Object.entries(BUNDLED_WORKFLOWS)) {
-    const parsed = parseWorkflow(content, `${name}.yaml`);
-    if (parsed.workflow) workflows.push(parsed.workflow);
-  }
-  return workflows;
+  return Object.entries(BUNDLED_WORKFLOWS).map(([name, content]) =>
+    loadWorkflow(content, `${name}.yaml`)
+  );
 }
 
 function effectiveProvider(workflow: WorkflowDefinition, node: WorkflowNode): string | undefined {
