@@ -24,6 +24,7 @@
  */
 import { createHash } from 'crypto';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
+import type { RemediationCandidateBody } from '@archon/overseer/remediation-candidate';
 import type { FireEligibilityEvidence } from './fire-eligibility';
 import { WO_ID_RE } from './guard';
 import { canonicalizeThreadRef } from './thread-ref';
@@ -36,7 +37,10 @@ export type TmActionType =
   | 'escalate_p0'
   | 'digest'
   | 'fire_cauldron'
-  | 'blocker_report';
+  | 'blocker_report'
+  // WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01: an owner nudge built from an
+  // Overseer remediation candidate. Acts immediately, like deliver_ruling.
+  | 'remediation_nudge';
 
 export type FireEvidence = FireEligibilityEvidence;
 
@@ -79,6 +83,13 @@ export interface ActionProposal {
   contentIncomplete?: boolean;
   /** Mechanical evidence required before the non-message fire effect is admitted. */
   fireEvidence?: FireEvidence;
+  /**
+   * Dispatch message id of the Overseer remediation candidate this proposal
+   * consumes (remediation_nudge and its no-thread escalation only). When set,
+   * the loop marks that candidate row consumed after a successful send so it is
+   * not re-read on a later tick.
+   */
+  remediationCandidateId?: string;
 }
 
 const MINUTE_MS = 60_000;
@@ -605,5 +616,87 @@ export function computeBlockerReport(
     body,
     idempotencyKey: `tm:blocker_report:${canonicalRef}:${bucket}`,
     actsImmediately: false,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * remediation_nudge (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01)
+ *
+ * An Overseer CHANGES_REQUESTED verdict handed back to Taskmaster becomes ONE
+ * gated nudge to the owner of the work item named by the candidate's woId. The
+ * Taskmaster is a drill sergeant: it applies pressure so the OWNER fixes the
+ * rejected PR. It does NOT fire a builder and it does NOT create work items.
+ *
+ * When the candidate names no woId, or no open work thread matches it, the
+ * candidate is NOT dropped: it becomes an operator escalation (the existing
+ * escalate_p0 route/wording), so an unownable rejection still reaches a human.
+ * ------------------------------------------------------------------ */
+
+/** The verdict body is truncated to this many characters in the nudge body. */
+export const REMEDIATION_VERDICT_MAX_CHARS = 1500;
+
+export interface RemediationNudgeContext {
+  /**
+   * The open work thread matched to this candidate's woId, if any. Its
+   * `recipient` is the already-resolved, allowlisted seat the thread was opened
+   * against -- the nudge addresses that seat directly (the same recipient the
+   * ordinary nudge path uses), never a login re-resolved at nudge time.
+   */
+  thread?: ThreadSnapshot;
+}
+
+/**
+ * Build the one proposal a remediation candidate produces: a remediation_nudge
+ * to the matched owner thread, or -- when there is no woId or no matching open
+ * thread -- an operator escalation so the candidate is never silently dropped.
+ *
+ * PURE: no I/O, no clock. The caller supplies the matched thread (resolved from
+ * the already-fetched thread list) and subjects the returned proposal to the
+ * existing pause / per-item cap / guard / journal pipeline.
+ */
+export function computeRemediationNudge(
+  candidate: RemediationCandidateBody,
+  context: RemediationNudgeContext
+): ActionProposal {
+  const prRef = `${candidate.owner}/${candidate.repo}#${candidate.prNumber}`;
+  const headShort = candidate.headSha.slice(0, 7);
+  // One stable key per (PR, attempt, reviewed head). No time bucket: a candidate
+  // is a discrete unit of work, not a recurring clock, so the key identifies the
+  // verdict and the tm_journal row under it prevents a second send.
+  const idempotencyKey = `tm:remediation_nudge:${prRef}:${candidate.attempt}:${headShort}`;
+
+  if (!candidate.woId || !context.thread) {
+    const why = candidate.woId
+      ? `work order ${candidate.woId} has no open work thread`
+      : 'the candidate carries no work order id';
+    return {
+      type: 'escalate_p0',
+      threadRef: `remediation:${prRef}`,
+      recipient: 'operator',
+      body:
+        `Unroutable remediation candidate: PR ${prRef} (head ${candidate.headSha}, ` +
+        `attempt ${candidate.attempt} of ${candidate.maxAttempts}) was returned ` +
+        `CHANGES_REQUESTED, but ${why}. This is an escalation for John's attention; ` +
+        'no automated assignment is made (Slice 1 has no assignment authority).',
+      idempotencyKey,
+      actsImmediately: true,
+    };
+  }
+
+  const verdict =
+    candidate.verdictBody.length > REMEDIATION_VERDICT_MAX_CHARS
+      ? candidate.verdictBody.slice(0, REMEDIATION_VERDICT_MAX_CHARS)
+      : candidate.verdictBody;
+  return {
+    type: 'remediation_nudge',
+    threadRef: context.thread.ref,
+    recipient: context.thread.recipient,
+    body:
+      `Remediation (attempt ${candidate.attempt} of ${candidate.maxAttempts}): the review of ` +
+      `PR ${prRef} at head ${candidate.headSha} was returned CHANGES_REQUESTED. You own ` +
+      `${candidate.woId}; address the review findings and push a fix. The attempt cap is ` +
+      `${candidate.maxAttempts}.\n\nReviewer verdict:\n${verdict}`,
+    idempotencyKey,
+    actsImmediately: true,
   };
 }
