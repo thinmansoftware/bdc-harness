@@ -683,6 +683,22 @@ describe('repair run guards', () => {
     }
   });
 
+  it('standalone_false_before_large_plan_cannot_open_gate', () => {
+    const spec = heavySpec(repairDeclaration(EXAMPLE_PR, EXAMPLE_BRANCH));
+    const plan = 'PLAN_REVIEW_PASS=false\n' + 'x'.repeat(100000) + '\nPLAN_REVIEW_PASS=true\n';
+    for (const file of EXPECTED_LANES) {
+      const gate = nodeOf(nodesOf(file), 'repair-gate', file);
+      const result = runRepairGate(gate.bash ?? '', spec, {
+        'checkout-repair-target.out': `REPAIR_TARGET=#${EXAMPLE_PR}\n`,
+        'plan-review.out': plan,
+      });
+      const parsed = gateJson(result.stdout);
+      expect(parsed.REPAIR_GATE, file).toBe('closed');
+      expect(parsed.REPAIR_GATE_ALLOW, file).toBe('no');
+      expect(parsed.REPAIR_GATE_REASON, file).toBe('plan_review_not_approved');
+    }
+  });
+
   it('plan_review_quoted_pass_does_not_open_gate', () => {
     const spec = `WO: EXAMPLE\n${repairDeclaration(EXAMPLE_PR, EXAMPLE_BRANCH)}\n`;
     const checkout = `REPAIR_TARGET=#${EXAMPLE_PR}\n`;

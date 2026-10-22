@@ -724,7 +724,7 @@ nodes:
       fi
       last_verdict=$(printf '%s\n' "$PLAN_OUT" | grep -xE 'PLAN_REVIEW_PASS=(true|false)' | tail -n 1 || true)
       false_present=0
-      if printf '%s\n' "$PLAN_OUT" | grep -qxF 'PLAN_REVIEW_PASS=false'; then
+      if printf '%s\n' "$PLAN_OUT" | grep -xF 'PLAN_REVIEW_PASS=false' >/dev/null; then
         false_present=1
       fi
       if [ "$false_present" -eq 1 ] || [ "$last_verdict" != "PLAN_REVIEW_PASS=true" ]; then
