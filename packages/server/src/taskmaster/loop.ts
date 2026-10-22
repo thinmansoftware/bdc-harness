@@ -56,6 +56,7 @@ import {
 import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
+import { refreshLaneHealth } from './lane-health';
 import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import { fireBackoffDecision } from './backoff';
 import {
@@ -231,6 +232,8 @@ export interface TaskmasterDeps {
     project?: string
   ) => Promise<{ status: string; prOpened?: boolean } | null>;
   getHealthSample?: typeof taskmasterDb.getHealthSample;
+  /** Refresh cursor and zero tm_health before the lane decision. */
+  refreshLaneHealth?: () => Promise<void>;
   /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
   onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
   checkExpectations?: (now: Date) => Promise<void>;
@@ -1631,14 +1634,28 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       )
       .map(action => canonicalizeThreadRef(action.thread_ref))
   );
+  try {
+    if (deps.refreshLaneHealth) await deps.refreshLaneHealth();
+    else if (!deps.db) await refreshLaneHealth();
+  } catch (error) {
+    log.warn({ err: error as Error }, 'taskmaster.lane_health_refresh_failed');
+  }
   const readHealth = deps.getHealthSample ?? taskmasterDb.getHealthSample;
   let codexHealth: taskmasterDb.TmHealthSample | null = null;
   let xaiHealth: taskmasterDb.TmHealthSample | null = null;
+  let cursorHealth: taskmasterDb.TmHealthSample | null = null;
+  let zeroHealth: taskmasterDb.TmHealthSample | null = null;
   try {
-    [codexHealth, xaiHealth] = await Promise.all([readHealth('codex'), readHealth('xai')]);
+    [codexHealth, xaiHealth, cursorHealth, zeroHealth] = await Promise.all([
+      readHealth('codex'),
+      readHealth('xai'),
+      readHealth('cursor'),
+      readHealth('zero'),
+    ]);
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.lane_health_read_failed');
   }
+  const laneHealth = { codex: codexHealth, xai: xaiHealth, cursor: cursorHealth, zero: zeroHealth };
   let laneDecision: ReturnType<typeof decideFireLane>;
   try {
     const seatUsage = await conductorSeatUsage();
@@ -1648,16 +1665,16 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       const used = bindingUsedPercent(seatUsage[lane]);
       if (typeof used === 'number' && used >= thresholdPercent) overThreshold[lane] = true;
     }
-    laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth }, overThreshold);
+    laneDecision = decideFireLane(headroom, laneHealth, overThreshold);
     // The routing threshold only steers between lanes; it must never hold a fire that the
     // unfiltered decision would dispatch (seats below the run-start cutoff stay usable).
     if (laneDecision.holding) {
-      const unfiltered = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+      const unfiltered = decideFireLane(headroom, laneHealth);
       if (!unfiltered.holding) laneDecision = unfiltered;
     }
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.seat_headroom_read_failed');
-    laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+    laneDecision = decideFireLane(headroom, laneHealth);
   }
 
   // Grade previously sent actions against the external SOR.
@@ -2285,6 +2302,10 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
             deps: { seatUsage: conductorSeatUsage },
             onAdmission: record => resolveAdmission?.(record),
+            entryOverride:
+              laneDecision.lane === 'cursor' || laneDecision.lane === 'zero'
+                ? laneDecision.lane
+                : undefined,
           });
           void cascadePromise.catch(() => {
             log.warn({ journalId: journalRow.id }, 'taskmaster.fire_cascade_failed');

@@ -8,6 +8,10 @@ import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { rootLogger } from '@archon/paths';
 import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
+import {
+  setSeatUsageReaderForTests,
+  unknownSeatReading,
+} from '@archon/workflows/reliability/seat-usage';
 
 // A synthetic exhausted response belongs to its test, never the next caller.
 beforeEach(resetGitHubApiMeterForTests);
@@ -1369,7 +1373,7 @@ describe('fire_cauldron loop', () => {
           }) as NonNullable<TaskmasterDeps['runCascade']>,
         })
       );
-      expect(healthProviders.sort()).toEqual(['codex', 'xai']);
+      expect(healthProviders.sort()).toEqual(['codex', 'cursor', 'xai', 'zero']);
       expect(admissions).toBe(1);
       expect(
         world.journal.filter(row => row.action_type === 'fire_cauldron').map(row => row.thread_ref)
@@ -1411,7 +1415,7 @@ describe('fire_cauldron loop', () => {
       world.nowMs += 60_000;
     }
     expect(monitorTicks).toEqual([1, 97]);
-    expect(healthReads).toBe(97 * 2);
+    expect(healthReads).toBe(97 * 4);
   });
 
   test('pause scope=effects parks an eligible fire without admitting a cascade', async () => {
@@ -1504,6 +1508,191 @@ describe('fire_cauldron loop', () => {
       );
       expect(evidenceCalls).toBe(1);
       expect(world.journal.find(row => row.id === testCase.id)?.grade).toBe(testCase.grade);
+    }
+  });
+
+  test('entry_override_passed_for_cursor_and_zero_only', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    const low = {
+      state: 'LOW' as const,
+      tokensRemaining: 0,
+      isUnknown: false,
+      source: 'test' as const,
+      observedAt: new Date(T0).toISOString(),
+    };
+    const fireOnce = async (phase: 'cursor' | 'zero', ref: string): Promise<unknown> => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      let entryOverride: unknown;
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => [
+            makeListedThread({
+              ref,
+              priority: 'P1',
+              isUnclaimed: true,
+              title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+            }),
+          ],
+          headroom: async () => low,
+          getHealthSample: async provider => {
+            const state =
+              provider === 'codex'
+                ? 'degraded'
+                : provider === 'cursor'
+                  ? phase === 'cursor'
+                    ? 'healthy'
+                    : 'degraded'
+                  : provider === 'zero' && phase === 'zero'
+                    ? 'healthy'
+                    : 'degraded';
+            return {
+              provider,
+              state,
+              sampled_at: new Date(T0).toISOString(),
+              expires_at: new Date(T0 + 60_000).toISOString(),
+              evidence: null,
+            };
+          },
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-01',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+            },
+          }),
+          runCascade: (async options => {
+            admissions += 1;
+            entryOverride = options.entryOverride;
+            const record = { cascadeId: `cascade-${phase}`, status: 'running' } as never;
+            options.onAdmission?.(record, true);
+            return record;
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        })
+      );
+      expect(admissions).toBe(1);
+      return entryOverride;
+    };
+    try {
+      expect(await fireOnce('cursor', 'gh:thinmansoftware/bdc-harness#611')).toBe('cursor');
+      expect(await fireOnce('zero', 'gh:thinmansoftware/bdc-harness#612')).toBe('zero');
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('entry_override_absent_for_claude_codex_xai', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    const low = {
+      state: 'LOW' as const,
+      tokensRemaining: 0,
+      isUnknown: false,
+      source: 'test' as const,
+      observedAt: new Date(T0).toISOString(),
+    };
+    const cases = [
+      {
+        ref: 'gh:thinmansoftware/bdc-harness#621',
+        lane: 'claude',
+        headroom: undefined,
+        health: {} as Partial<Record<string, 'healthy' | 'degraded'>>,
+      },
+      {
+        ref: 'gh:thinmansoftware/bdc-harness#622',
+        lane: 'codex',
+        headroom: low,
+        health: {
+          codex: 'healthy' as const,
+          cursor: 'degraded' as const,
+          zero: 'degraded' as const,
+        },
+      },
+      {
+        ref: 'gh:thinmansoftware/bdc-harness#623',
+        lane: 'xai',
+        headroom: low,
+        health: {
+          codex: 'degraded' as const,
+          cursor: 'degraded' as const,
+          zero: 'degraded' as const,
+          xai: 'healthy' as const,
+        },
+      },
+    ];
+    // Measured Claude seat usage in this environment would skip the default
+    // lane. Unknown readings keep the test on the headroom decision.
+    setSeatUsageReaderForTests(async seats => {
+      const readings: Partial<
+        Record<(typeof seats)[number], ReturnType<typeof unknownSeatReading>>
+      > = {};
+      for (const seat of seats) readings[seat] = unknownSeatReading(seat, 'test');
+      return readings;
+    });
+    try {
+      for (const testCase of cases) {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const seen: unknown[] = [];
+        await tick(
+          createTaskmasterState(60_000),
+          makeDeps(world, {
+            listThreads: async () => [
+              makeListedThread({
+                ref: testCase.ref,
+                priority: 'P1',
+                isUnclaimed: true,
+                title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+              }),
+            ],
+            ...(testCase.headroom ? { headroom: async () => testCase.headroom } : {}),
+            getHealthSample: async provider => {
+              const state = testCase.health[provider];
+              if (!state) return null;
+              return {
+                provider,
+                state,
+                sampled_at: new Date(T0).toISOString(),
+                expires_at: new Date(T0 + 60_000).toISOString(),
+                evidence: null,
+              };
+            },
+            checkFireEligibility: async () => ({
+              eligible: true,
+              evidence: {
+                woId: 'WO-HARNESS-EXAMPLE-01',
+                targetRepo: 'thinmansoftware/bdc-harness',
+                project: 'bdc-harness',
+                specVerifiedAt: new Date(T0).toISOString(),
+                noOpenOrMergedPr: true,
+                expectedSpec: EXPECTED_SPEC,
+              },
+            }),
+            runCascade: (async options => {
+              seen.push(options.entryOverride);
+              const record = { cascadeId: `cascade-${testCase.ref}`, status: 'running' } as never;
+              options.onAdmission?.(record, true);
+              return record;
+            }) as NonNullable<TaskmasterDeps['runCascade']>,
+          })
+        );
+        expect(seen).toEqual([undefined]);
+        expect(
+          world.journal.find(row => row.action_type === 'fire_cauldron')?.proposal_json
+        ).toContain(`on ${testCase.lane} lane`);
+      }
+    } finally {
+      setSeatUsageReaderForTests(null);
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
   });
 });
