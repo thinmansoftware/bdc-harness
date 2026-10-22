@@ -7,7 +7,8 @@
  * (createAuthenticatedMessage) -- there is no second messaging path.
  *
  * Tick order (spec Section 8): pause state + epoch -> headroom -> reads ->
- * classify -> propose -> two-tick confirm -> guard -> journal ROW FIRST ->
+ * classify -> propose -> two-tick confirm -> guard -> effect budgets ->
+ * receipt filter -> journal ROW FIRST ->
  * epoch re-check -> createAuthenticatedMessage -> journal outcome + proof deadline.
  *
  * Budgets (ratified Q1): max 10 effects/tick, 1 effect/item/tick, max 3
@@ -64,6 +65,14 @@ import {
   type CascadeEvidenceDeps,
 } from './expectations';
 import { canonicalizeThreadRef } from './thread-ref';
+import {
+  createReceiptCheckState,
+  hasReceiptMarker,
+  latestSubstantiveComment,
+  readLatestSubstantiveComment,
+  type ReceiptCheckOutcome,
+  type ReceiptCheckState,
+} from './receipt-guard';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -222,6 +231,16 @@ export interface TaskmasterDeps {
     threadRef: string,
     sinceIso: string
   ) => Promise<GithubIssueEvidence | null>;
+  /**
+   * Comment read for the receipt filter. Default is the paginated reader.
+   * Tests inject a fake. Called only for a nudge or escalate_p0 that has
+   * already passed confirmation and the effect-budget gates.
+   */
+  readIssueComments?: (
+    threadRef: string,
+    updatedAt: string,
+    budget: ReceiptCheckState
+  ) => Promise<ReceiptCheckOutcome>;
   checkFireEligibility?: (issueTitle: string) => Promise<FireEligibilityResult>;
   runCascade?: typeof runCascade;
   readFireCascadeEvidence?: typeof readCascadeWorkflowEvidence;
@@ -532,6 +551,7 @@ export async function defaultListThreads(
           isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
           isUnclaimed,
           isUnclaimedP0: priority === 'P0' && isUnclaimed,
+          hasOwnerLabel: parseOwnerLabel(JSON.stringify(labels)) !== null,
           recipient: resolveRecipient(ownerLogin),
           title: issue.title ?? null,
           ownerLogin,
@@ -1485,6 +1505,20 @@ function isDeliverySuppressedExpiry(action: taskmasterDb.TmJournalEntry): boolea
   }
 }
 
+/** Drop two-tick confirmation entries for a thread whose receipt suppressed the send. */
+function clearReceiptPending(state: TaskmasterState, threadRef: string): void {
+  const refs = [threadRef, canonicalizeThreadRef(threadRef)];
+  for (const ref of refs) {
+    const nudgePrefix = `tm:nudge:${ref}:`;
+    const escalatePrefix = `tm:escalate_p0:${ref}:`;
+    for (const key of [...state.pendingConfirm.keys()]) {
+      if (key.startsWith(nudgePrefix) || key.startsWith(escalatePrefix)) {
+        state.pendingConfirm.delete(key);
+      }
+    }
+  }
+}
+
 let tickQueue: Promise<void> = Promise.resolve();
 
 export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
@@ -1504,6 +1538,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
   const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
+  const readIssueComments = deps.readIssueComments ?? readLatestSubstantiveComment;
   const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
   const executeCascade = deps.runCascade ?? runCascade;
   const readFireEvidence = deps.readFireCascadeEvidence ?? readCascadeWorkflowEvidence;
@@ -1988,6 +2023,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   result.proposals = proposals.length;
 
   const touchedThisTick = new Set<string>();
+  const receiptCheck = createReceiptCheckState();
   let firesThisTick = 0;
   let unconfirmedFireReservations = 0;
   let blockerReportsThisTick = 0;
@@ -2117,6 +2153,30 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         actionsByKey.set(proposal.idempotencyKey, existingAction);
       }
       continue;
+    }
+
+    // Receipt filter: after confirmation and effect budgets, before the journal
+    // row. Only nudge and escalate_p0. A receipt drops the proposal with no
+    // journal row and clears pending confirmation. A failed read fails open.
+    if (proposal.type === 'nudge' || proposal.type === 'escalate_p0') {
+      const listed = threads.find(item => item.ref === proposal.threadRef);
+      const updatedAt = listed?.lastActivityAt ?? '';
+      try {
+        const outcome = await readIssueComments(proposal.threadRef, updatedAt, receiptCheck);
+        if (!outcome.failOpen) {
+          const latest = latestSubstantiveComment(outcome.comments);
+          const suppress = latest !== null && hasReceiptMarker(latest.body);
+          if (suppress) {
+            clearReceiptPending(state, proposal.threadRef);
+            continue;
+          }
+        }
+      } catch (error) {
+        log.warn(
+          { err: error as Error, threadRef: proposal.threadRef },
+          'taskmaster.receipt_check_failed'
+        );
+      }
     }
 
     // ROW FIRST, always -- then the effect.
