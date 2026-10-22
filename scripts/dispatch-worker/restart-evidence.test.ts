@@ -86,6 +86,7 @@ describe('instance-lock restart evidence', () => {
         deathLogFile,
         pid: 5003,
         isAlive: (pid: number) => pid === 6000, // 6000 is alive
+        lookupProcess: () => null,
       })
     ).rejects.toThrow('dispatch_worker_already_running');
 

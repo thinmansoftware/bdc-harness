@@ -177,9 +177,29 @@ The worker enforces single-instance-per-worker-id via a local PID lockfile at
 `~/.config/bdc/dispatch-worker-<worker_id>.lock` (see `instance-lock.ts` for the design rationale
 -- a local PID check rather than a check against the drop-box server's own registration/heartbeat
 state, because the server heartbeat row can look "fresh" for up to `heartbeat_interval_ms` after a
-worker has actually crashed). On startup, if the lock is held by another live PID the worker
-refuses to start and exits non-zero rather than risk double-claiming dispatch messages. A lock left
-by a dead PID is automatically reclaimed by the next start -- no manual cleanup required.
+worker has actually crashed). The lock JSON keeps `pid` and `started_at`, and adds `start_time`
+(holder process creation time, UTC ISO-8601) and `executable` (process name; CIM `Win32_Process.Name`
+on Windows) when the identity lookup returns them. Either new field is omitted when its value is null.
+
+On startup, a different PID that is alive with the same `start_time` and the same `executable`
+(or a missing executable on either side) still refuses to start with `dispatch_worker_already_running`.
+The lock is stale, and is reclaimed without throwing, when that live PID's `start_time` differs, or
+when the start times match and both executable names are non-empty but differ. Each identity reclaim
+logs one stderr line containing `dispatch_worker_lock_stale`, the PID, and exactly one reason
+category: `start_time`, `executable`, or `legacy_lock`. An identity-mismatch reclaim sets no restart
+evidence and does not append a death-log line. A pre-upgrade lock with only `pid` and `started_at`
+is reclaimed only when the live process identity exists and its `start_time` is strictly later than
+`started_at`; a failed lookup, an unparseable timestamp, or a live start at or before `started_at`
+fails closed with `dispatch_worker_already_running`. A lock left by a dead PID is still reclaimed
+automatically and still appends one death-log line before the lock is overwritten.
+
+`start-windows.ps1` opens one SSH tunnel and reuses it for every worker attempt. Tunnel setup
+failures throw immediately. A non-zero worker exit is retried for at most five attempts. After
+attempts 1 through 4 the launcher logs `DISPATCH_WORKER_RETRY attempt=<n> exit=<code> sleep_s=<seconds>`
+and sleeps 30, 60, 90, then 120 seconds. It does not sleep after attempt 5; that attempt throws
+`Dispatch worker exited with code <n>`. If the captured worker stderr contains
+`dispatch_worker_already_running`, the launcher logs `DISPATCH_WORKER_ALREADY_RUNNING`, finishes
+successfully, and still tears the tunnel down. It does not re-implement lock identity in PowerShell.
 
 Diagnostics are written to a size-rotating log file at
 `~/.config/bdc/logs/dispatch-worker-<worker_id>.log` (see `worker-log.ts`), 5 MB per file, 5
