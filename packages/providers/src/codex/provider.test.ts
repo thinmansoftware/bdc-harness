@@ -2305,6 +2305,52 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     await expect(consume()).rejects.toThrow();
   });
 
+  test('codex-native-strict fails closed on 429 and never routes to Claude', async () => {
+    mockRunStreamed.mockRejectedValue(new Error('429 too many requests'));
+    const claudeFactory = mock(() => {
+      throw new Error('Claude provider must not be constructed');
+    });
+    const strict = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: null,
+    });
+    expect(Object.getOwnPropertyDescriptor(strict, 'failbackProviderFactory')?.value).toBeNull();
+
+    const chunks: { type: string }[] = [];
+    const consume = async (): Promise<void> => {
+      for await (const chunk of strict.sendQuery('review this diff', '/workspace')) {
+        chunks.push(chunk as { type: string });
+      }
+    };
+
+    await expect(consume()).rejects.toThrow(/429/);
+    expect(chunks.some(chunk => chunk.type === 'provider_route')).toBe(false);
+    expect(claudeFactory).not.toHaveBeenCalled();
+  });
+
+  test('codex-native-strict fails closed on auth rotation and never routes to Claude', async () => {
+    mockRunStreamed.mockRejectedValue(new Error(AUTH_ROTATION_ERROR));
+    const claudeFactory = mock(() => {
+      throw new Error('Claude provider must not be constructed');
+    });
+    const strict = new CodexProvider({
+      retryBaseDelayMs: 1,
+      failbackProviderFactory: null,
+    });
+    expect(Object.getOwnPropertyDescriptor(strict, 'failbackProviderFactory')?.value).toBeNull();
+
+    const chunks: { type: string }[] = [];
+    const consume = async (): Promise<void> => {
+      for await (const chunk of strict.sendQuery('review this diff', '/workspace')) {
+        chunks.push(chunk as { type: string });
+      }
+    };
+
+    await expect(consume()).rejects.toThrow(/refresh token was already used/);
+    expect(chunks.some(chunk => chunk.type === 'provider_route')).toBe(false);
+    expect(claudeFactory).not.toHaveBeenCalled();
+  });
+
   test('isAuthFailureError: single-shot guard prevents double-delegation', async () => {
     // WO spec section 11.4: authFailbackUsed prevents re-entry. The first auth-class
     // catch fires the failback and returns. The loop does not continue after the return,

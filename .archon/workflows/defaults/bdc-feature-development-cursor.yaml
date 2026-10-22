@@ -544,8 +544,7 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     persona: war-council-architect-opr
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
     agent: war-council-architect-opr
     # Cross-model boundary: Grok 4.7 authors the plan on the Cursor rail;
     # Codex (gpt-5.6-sol) reviews it. The builder never grades its own work.
@@ -2497,8 +2496,7 @@ nodes:
 
   - id: war-council-validator
     # Codex/Sol judge; never the Cursor builder model.
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
@@ -2636,8 +2634,7 @@ nodes:
 
   - id: diff-review
     persona: codex-adversarial-reviewer
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -2907,8 +2904,7 @@ nodes:
 
   - id: diff-review-final
     persona: codex-adversarial-reviewer
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -3074,8 +3070,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     persona: codex-adversarial-reviewer
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3293,8 +3288,7 @@ nodes:
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
     persona: xo-opr
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -3423,8 +3417,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     persona: codex-adversarial-reviewer
-    provider: codex
-    model: gpt-5.6-sol
+    provider: codex-native-strict
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
