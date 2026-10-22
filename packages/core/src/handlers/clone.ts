@@ -163,30 +163,51 @@ async function registerRepoAtPath(
   };
 }
 
+const UNSUPPORTED_REPOSITORY_URL = 'unsupported repository URL';
+
 /**
- * Normalize a repo URL: strip trailing slashes and convert SSH to HTTPS.
+ * Normalize a remote repo URL to HTTPS and parse it.
+ * Local paths are handled by the caller and never reach this function.
+ * Option-like values, non-HTTPS schemes, and unparseable URLs are rejected
+ * before any git process is started.
  */
 function normalizeRepoUrl(rawUrl: string): {
   workingUrl: string;
   ownerName: string;
   repoName: string;
   targetPath: string;
+  parsed: URL;
 } {
-  const normalizedUrl = rawUrl.replace(/\/+$/, '');
-
-  let workingUrl = normalizedUrl;
-  if (normalizedUrl.startsWith('git@github.com:')) {
-    workingUrl = normalizedUrl.replace('git@github.com:', 'https://github.com/');
+  if (rawUrl.startsWith('-')) {
+    throw new Error(UNSUPPORTED_REPOSITORY_URL);
   }
 
+  let candidate = rawUrl.replace(/\/+$/, '');
+  if (candidate.startsWith('git@github.com:')) {
+    candidate = candidate.replace('git@github.com:', 'https://github.com/');
+  } else if (candidate.startsWith('github.com/')) {
+    candidate = `https://${candidate}`;
+  } else if (candidate.startsWith('http://github.com/') || candidate === 'http://github.com') {
+    candidate = `https://${candidate.slice('http://'.length)}`;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error(UNSUPPORTED_REPOSITORY_URL);
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error(UNSUPPORTED_REPOSITORY_URL);
+  }
+
+  const workingUrl = parsed.toString();
   const urlParts = workingUrl.replace(/\.git$/, '').split('/');
   const repoName = urlParts.pop() ?? 'unknown';
   const ownerName = urlParts.pop() ?? 'unknown';
-
-  // Clone into project-centric source/ directory
   const targetPath = getProjectSourcePath(ownerName, repoName);
 
-  return { workingUrl, ownerName, repoName, targetPath };
+  return { workingUrl, ownerName, repoName, targetPath, parsed };
 }
 
 /**
@@ -201,7 +222,7 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
     return registerRepository(resolvedPath);
   }
 
-  const { workingUrl, ownerName, repoName, targetPath } = normalizeRepoUrl(repoUrl);
+  const { workingUrl, ownerName, repoName, targetPath, parsed } = normalizeRepoUrl(repoUrl);
 
   // Check if source directory already has a git repo
   let directoryExists = false;
@@ -243,18 +264,19 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
 
   getLog().info({ url: workingUrl, targetPath }, 'clone_started');
 
-  // Build clone command with authentication if GitHub token is available
+  // Add GH_TOKEN only for a credential-free https://github.com URL.
+  // Hostname is exact: github.com.evil.com and user@host tricks do not match.
   let cloneUrl = workingUrl;
   const ghToken = process.env.GH_TOKEN;
-
-  if (ghToken && workingUrl.includes('github.com')) {
-    if (workingUrl.startsWith('https://github.com')) {
-      cloneUrl = workingUrl.replace('https://github.com', `https://${ghToken}@github.com`);
-    } else if (workingUrl.startsWith('http://github.com')) {
-      cloneUrl = workingUrl.replace('http://github.com', `https://${ghToken}@github.com`);
-    } else if (!workingUrl.startsWith('http')) {
-      cloneUrl = `https://${ghToken}@${workingUrl}`;
-    }
+  if (
+    ghToken &&
+    parsed.protocol === 'https:' &&
+    parsed.hostname === 'github.com' &&
+    parsed.username === '' &&
+    parsed.password === ''
+  ) {
+    parsed.username = ghToken;
+    cloneUrl = parsed.toString();
     getLog().debug('clone_authenticated');
   }
 
@@ -269,7 +291,7 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
   }
 
   try {
-    await execFileAsync('git', ['clone', cloneUrl, targetPath]);
+    await execFileAsync('git', ['clone', '--', cloneUrl, targetPath]);
   } catch (error) {
     const safeErr = sanitizeError(error as Error);
     throw new Error(`Failed to clone repository: ${safeErr.message}`);
