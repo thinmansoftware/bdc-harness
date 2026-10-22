@@ -174,6 +174,34 @@ async function raceProcesses(
 }
 
 describe('known-bad-bindings real SQLite callers', () => {
+  test('real fixture exposes the audited migration029 columns and identity', async () => {
+    const schema = await left.query<{ name: string; type: string; pk: number }>(
+      'PRAGMA table_info(known_bad_bindings)'
+    );
+    // Literal inventory from migration029, independently checked against the
+    // adapter-created disposable file (not inferred from a production database).
+    expect(schema.rows.map(column => column.name)).toEqual([
+      'id',
+      'binding_key',
+      'provider_id',
+      'model_id',
+      'auth_context_id',
+      'assistant_config_hash',
+      'node_override_hash',
+      'error_class',
+      'http_status',
+      'error_body_excerpt',
+      'first_seen_at',
+      'last_seen_at',
+      'hit_count',
+      'source',
+      'cleared_at',
+      'clear_reason',
+    ]);
+    expect(schema.rows.filter(column => column.pk).map(column => column.name)).toEqual(['id']);
+    expect(schema.rows.find(column => column.name === 'hit_count')?.type).toBe('INTEGER');
+  });
+
   test('increments original row after an unrelated insert and preserves diagnostics', async () => {
     const original = await seed();
     await left.query('UPDATE known_bad_bindings SET last_seen_at = $1 WHERE binding_key = $2', [
