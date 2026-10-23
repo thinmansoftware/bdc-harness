@@ -1,6 +1,13 @@
 import { z } from '@hono/zod-openapi';
 import { posix, win32 } from 'node:path';
 
+export type CodexOnlyV2ProviderId = 'codex' | 'codex-native-strict';
+
+/** Literal admission only; this does not choose a provider transport. */
+export function isCodexOnlyV2ProviderId(providerId: unknown): providerId is CodexOnlyV2ProviderId {
+  return providerId === 'codex' || providerId === 'codex-native-strict';
+}
+
 function comparisonText(maximum: number): z.ZodString {
   return z
     .string()

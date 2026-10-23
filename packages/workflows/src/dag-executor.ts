@@ -135,6 +135,10 @@ import type {
   TerminalWorkflowPersistence,
 } from './reliability/types';
 import { withRunLease } from './run-lease';
+import {
+  isCodexOnlyV2ProviderId,
+  type CodexOnlyV2ProviderId,
+} from './reliability/dispatch-binding';
 
 function cancellationPersistence(
   runId: string,
@@ -1970,6 +1974,7 @@ export interface PreparedDagBindings {
 
 type DagBindingRole = 'primary' | 'availability' | 'quota' | 'approval-rejection';
 interface PreparedDagBindingState {
+  identityPolicy: 'codex-only-v2' | undefined;
   inputs: {
     cwd: string;
     workflow: DagBindingWorkflow;
@@ -1996,8 +2001,12 @@ export async function prepareDagBindings(
   workflowProvider: string,
   workflowModel: string | undefined,
   config: WorkflowConfig,
-  modelOverride?: ModelOverride
+  modelOverride?: ModelOverride,
+  identityPolicy?: 'codex-only-v2'
 ): Promise<PreparedDagBindings> {
+  if (identityPolicy !== undefined && identityPolicy !== 'codex-only-v2') {
+    throw new Error('prepared_dag_bindings: invalid identity_policy');
+  }
   const inputs = structuredClone({
     cwd,
     workflow,
@@ -2006,11 +2015,31 @@ export async function prepareDagBindings(
     config,
     modelOverride,
   });
-  assertPreparedCodexProvider(inputs.workflowProvider);
-  assertPreparedCodexProvider(inputs.workflow.failover_provider);
-  assertPreparedCodexProvider(inputs.modelOverride?.workflow?.provider);
+  const assertProvider = (provider: unknown): void => {
+    if (identityPolicy === 'codex-only-v2') {
+      if (provider !== undefined && !isCodexOnlyV2ProviderId(provider)) {
+        throw new Error('prepared_dag_bindings: v2 requires literal Codex provider identity');
+      }
+    } else {
+      assertPreparedCodexProvider(provider as string | undefined);
+    }
+  };
+  assertProvider(inputs.workflowProvider);
+  assertProvider(inputs.workflow.failover_provider);
+  assertProvider(inputs.modelOverride?.workflow?.provider);
+  if (identityPolicy === 'codex-only-v2') {
+    // The public execution shape omits the raw root provider; do not lose its declaration.
+    assertProvider((inputs.workflow as DagBindingWorkflow & { provider?: unknown }).provider);
+    for (const node of inputs.workflow.nodes) {
+      assertProvider(node.provider);
+      assertProvider(node.failover_provider);
+    }
+    for (const override of Object.values(inputs.modelOverride?.nodes ?? {})) {
+      assertProvider(override.provider);
+    }
+  }
   const registry = structuredClone(await loadAgentRegistry(join(cwd, '.archon', 'agents')));
-  const state: PreparedDagBindingState = { inputs, registry, bindings: new Map() };
+  const state: PreparedDagBindingState = { identityPolicy, inputs, registry, bindings: new Map() };
   const defaults = dagWorkflowLevelOptions(inputs.workflow);
   for (const [index, owner] of inputs.workflow.nodes.entries()) {
     const records = new Map<DagBindingRole, DagBindingResult>();
@@ -2029,11 +2058,12 @@ export async function prepareDagBindings(
         workflowLevelOptions: defaults,
         kind: selected ? 'selected-loop' : isLoopNode(node) ? 'loop' : 'prompt',
       };
-      assertPreparedCodexProvider(node.provider);
-      assertPreparedCodexProvider(node.failover_provider);
-      assertPreparedCodexProvider(input.modelOverride?.nodes?.[node.id]?.provider);
+      assertProvider(node.provider);
+      assertProvider(node.failover_provider);
+      assertProvider(input.modelOverride?.nodes?.[node.id]?.provider);
       const base = resolveDagBindingBase(input);
-      assertPreparedCodexProvider(base.provider);
+      assertProvider(base.declaredProvider);
+      assertProvider(base.provider);
       const ref = node as { agent?: string; persona?: string };
       const agentName = ref.agent ?? ref.persona;
       if (agentName && !registry.has(agentName)) {
@@ -2041,8 +2071,8 @@ export async function prepareDagBindings(
       }
       const persona = agentName ? resolveAgent(agentName, registry) : undefined;
       const result = finishDagPersonaBinding(input, base, persona);
-      assertPreparedCodexProvider(result.provider);
-      assertPreparedCodexProvider(result.factoryProvider);
+      assertProvider(result.provider);
+      assertProvider(result.factoryProvider);
       records.set(role, result);
       return result;
     };
@@ -2082,6 +2112,87 @@ export async function prepareDagBindings(
   const handle = Object.freeze({}) as PreparedDagBindings;
   preparedDagBindingStates.set(handle, state);
   return handle;
+}
+
+export type PreparedDagModelEvidence =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'undefined' }
+  | { readonly kind: 'value'; readonly value: string };
+
+export interface PreparedDagBindingEvidence {
+  readonly ownerIndex: number;
+  readonly ownerNodeId: string;
+  readonly role: 'primary' | 'availability' | 'quota' | 'approval-rejection';
+  readonly declaredProvider: CodexOnlyV2ProviderId;
+  readonly effectiveProvider: CodexOnlyV2ProviderId;
+  readonly canonicalProvider: CodexOnlyV2ProviderId;
+  readonly factoryRequestedProvider: CodexOnlyV2ProviderId;
+  readonly logicalProvider: 'codex';
+  readonly requiredTransport: 'codex-native-strict';
+  readonly prePersonaModel: PreparedDagModelEvidence;
+  readonly resolvedModel: PreparedDagModelEvidence;
+  readonly declaredModel: PreparedDagModelEvidence;
+  readonly requestModel: PreparedDagModelEvidence;
+}
+
+function preparedDagModelEvidence(record: object, key: string): PreparedDagModelEvidence {
+  if (!Object.hasOwn(record, key)) return Object.freeze({ kind: 'absent' });
+  const value = (record as Record<string, unknown>)[key];
+  if (value === undefined) return Object.freeze({ kind: 'undefined' });
+  if (typeof value !== 'string') {
+    throw new Error('prepared_dag_bindings: evidence model must be a string or undefined');
+  }
+  return Object.freeze({ kind: 'value', value });
+}
+
+function preparedDagEvidenceProvider(provider: string): CodexOnlyV2ProviderId {
+  if (!isCodexOnlyV2ProviderId(provider)) {
+    throw new Error('prepared_dag_bindings: evidence requires literal Codex provider identity');
+  }
+  return provider;
+}
+
+/** Captured binding evidence only; requiredTransport is a future enforcement requirement. */
+export function describePreparedDagBindings(
+  handle: PreparedDagBindings
+): readonly PreparedDagBindingEvidence[] {
+  const state = preparedDagBindingStates.get(handle);
+  if (state?.identityPolicy !== 'codex-only-v2') {
+    throw new Error('prepared_dag_bindings: evidence requires a recognized v2 handle');
+  }
+  const rows: PreparedDagBindingEvidence[] = [];
+  const roles: readonly DagBindingRole[] = [
+    'primary',
+    'availability',
+    'quota',
+    'approval-rejection',
+  ];
+  for (const [ownerIndex, records] of [...state.bindings.entries()].sort(
+    ([left], [right]) => left - right
+  )) {
+    for (const role of roles) {
+      const result = records.get(role);
+      if (!result) continue;
+      rows.push(
+        Object.freeze({
+          ownerIndex,
+          ownerNodeId: state.inputs.workflow.nodes[ownerIndex].id,
+          role,
+          declaredProvider: preparedDagEvidenceProvider(result.base.declaredProvider),
+          effectiveProvider: preparedDagEvidenceProvider(result.base.provider),
+          canonicalProvider: preparedDagEvidenceProvider(result.provider),
+          factoryRequestedProvider: preparedDagEvidenceProvider(result.factoryProvider),
+          logicalProvider: 'codex',
+          requiredTransport: 'codex-native-strict',
+          prePersonaModel: preparedDagModelEvidence(result.base, 'model'),
+          resolvedModel: preparedDagModelEvidence(result, 'model'),
+          declaredModel: preparedDagModelEvidence(result, 'declaredModelId'),
+          requestModel: preparedDagModelEvidence(result.options, 'model'),
+        })
+      );
+    }
+  }
+  return Object.freeze(rows);
 }
 
 /**

@@ -41,7 +41,13 @@ mock.module('@archon/persona-context-loader', () => ({
 }));
 
 // --- Bootstrap provider registry (after path mocks, before dag-executor import) ---
-import { registerBuiltinProviders, registerProviderAlias, clearRegistry } from '@archon/providers';
+import {
+  registerBuiltinProviders,
+  registerProviderAlias,
+  clearRegistry,
+  getRegistration,
+  registerProvider,
+} from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
 
@@ -52,6 +58,7 @@ import {
   substituteNodeOutputRefs,
   executeDagWorkflow,
   prepareDagBindings,
+  describePreparedDagBindings,
   type DagBindingWorkflow,
   type PreparedDagBindings,
   clearAgentRegistryCache,
@@ -68,6 +75,7 @@ import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import { getWorkflowEventEmitter } from './event-emitter';
 import type { GateResult } from './gate-result';
+import { isCodexOnlyV2ProviderId } from './reliability/dispatch-binding';
 
 // --- Mock helpers ---
 
@@ -15983,5 +15991,847 @@ describe('v2 binding-only preparation', () => {
       await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
     }
     noExecutionEffects();
+  });
+
+  describe('v2 literal provider identity', () => {
+    it('admits only the two exact literals before alias resolution', () => {
+      for (const id of ['codex', 'codex-native-strict'])
+        expect(isCodexOnlyV2ProviderId(id)).toBe(true);
+      for (const id of [
+        undefined,
+        null,
+        false,
+        true,
+        0,
+        {},
+        [],
+        '',
+        'Codex',
+        'codex ',
+        ' codex',
+        'codex-opr',
+        'codex-native-strict-extra',
+        'claude',
+      ]) {
+        expect(isCodexOnlyV2ProviderId(id)).toBe(false);
+      }
+    });
+    for (const provider of ['codex', 'codex-native-strict']) {
+      it(`admits the literal ${provider} without changing the declaration`, async () => {
+        workflow.nodes = [{ id: 'work', prompt: 'Work.', provider }];
+        const original = structuredClone(workflow);
+        const handle = await prepareDagBindings(
+          cwd,
+          workflow,
+          provider,
+          'workflow-choice',
+          config,
+          undefined,
+          'codex-only-v2'
+        );
+        expect(Object.isFrozen(handle)).toBe(true);
+        expect(workflow).toEqual(original);
+        noExecutionEffects();
+      });
+    }
+
+    for (const policy of [
+      undefined,
+      null,
+      false,
+      true,
+      0,
+      1,
+      '',
+      'codex-only-v1',
+      'CODEX-ONLY-V2',
+      {},
+      [],
+    ]) {
+      if (policy === undefined) continue;
+      it(`rejects invalid policy ${JSON.stringify(policy)} before cloning or reading the registry`, async () => {
+        // A clone failure would hide an incorrectly ordered policy check.
+        const uncloneable = { ...config, testOnlyFunction: () => undefined };
+        const loader = spyOn(agentRegistry, 'loadAgentRegistry');
+        try {
+          await expect(
+            prepareDagBindings(
+              cwd,
+              workflow,
+              'codex',
+              undefined,
+              uncloneable,
+              undefined,
+              policy as 'codex-only-v2'
+            )
+          ).rejects.toThrow('identity_policy');
+          expect(loader).not.toHaveBeenCalled();
+          noExecutionEffects();
+        } finally {
+          loader.mockRestore();
+        }
+      });
+    }
+
+    for (const explicitUndefined of [false, true]) {
+      it(`retains default strict refusal with explicit undefined=${explicitUndefined}`, async () => {
+        workflow.nodes = [{ id: 'work', prompt: 'Work.', provider: 'codex-native-strict' }];
+        const pending = explicitUndefined
+          ? prepareDagBindings(cwd, workflow, 'codex', undefined, config, undefined, undefined)
+          : prepareDagBindings(cwd, workflow, 'codex', undefined, config);
+        await expect(pending).rejects.toThrow('exact logical codex');
+        noExecutionEffects();
+      });
+    }
+
+    const forbiddenIds: unknown[] = [
+      '',
+      'Codex',
+      'CODEX',
+      ' codex',
+      'codex ',
+      'codex-native-strict ',
+      'codex-native-strict-extra',
+      'codex-opr',
+      'claude',
+      'unknown',
+      null,
+      false,
+      0,
+      {},
+    ];
+    for (const forbidden of forbiddenIds) {
+      it(`refuses raw declaration ${JSON.stringify(forbidden)} even when resolution or node type hides it`, async () => {
+        const id = forbidden as string;
+        const base = { name: 'literal-matrix', nodes: [{ id: 'work', prompt: 'Work.' }] };
+        const cases: {
+          workflow: DagBindingWorkflow;
+          provider?: string;
+          override?: import('./model-override').ModelOverride;
+        }[] = [
+          { workflow: { ...base, provider: id } as DagBindingWorkflow },
+          { workflow: base, provider: id },
+          { workflow: { ...base, failover_provider: id } },
+          { workflow: base, override: { workflow: { provider: id, model: 'override' } } },
+          {
+            workflow: {
+              ...base,
+              nodes: [{ id: 'work', prompt: 'Work.', provider: id, when: 'false' }],
+            },
+          },
+          {
+            workflow: { ...base, nodes: [{ id: 'work', prompt: 'Work.', failover_provider: id }] },
+          },
+          { workflow: base, override: { nodes: { work: { provider: id, model: 'override' } } } },
+          {
+            workflow: {
+              ...base,
+              nodes: [{ id: 'work', bash: 'echo safe', provider: id } as DagNode],
+            },
+          },
+          {
+            workflow: {
+              ...base,
+              nodes: [{ id: 'work', cancel: 'safe', provider: id } as unknown as DagNode],
+            },
+          },
+          {
+            workflow: {
+              ...base,
+              nodes: [{ id: 'work', script: 'safe', provider: id } as unknown as DagNode],
+            },
+          },
+          {
+            workflow: {
+              ...base,
+              nodes: [
+                {
+                  id: 'work',
+                  evidence: { kind: 'manifest_v2' },
+                  provider: id,
+                } as unknown as DagNode,
+              ],
+            },
+          },
+          {
+            workflow: {
+              ...base,
+              nodes: [
+                {
+                  id: 'work',
+                  approval: { message: 'Approve?', on_reject: { prompt: 'Fix.' } },
+                  provider: id,
+                } as DagNode,
+              ],
+            },
+          },
+          {
+            workflow: { ...base, nodes: [{ id: 'work', approval: { message: 'Approve?' } }] },
+            override: { nodes: { work: { provider: id, model: 'override' } } },
+          },
+          {
+            workflow: {
+              ...base,
+              nodes: [
+                { id: 'work', approval: { message: 'Approve?', on_reject: { prompt: 'Fix.' } } },
+              ],
+            },
+            override: { nodes: { 'work:on_reject': { provider: id, model: 'override' } } },
+          },
+          {
+            workflow: {
+              ...base,
+              nodes: [{ id: 'work', bash: 'echo safe', failover_provider: id } as DagNode],
+            },
+          },
+        ];
+        for (const candidate of cases) {
+          await expect(
+            prepareDagBindings(
+              cwd,
+              candidate.workflow,
+              Object.hasOwn(candidate, 'provider') ? candidate.provider! : 'codex',
+              'workflow-choice',
+              config,
+              candidate.override,
+              'codex-only-v2'
+            )
+          ).rejects.toThrow('prepared_dag_bindings');
+        }
+        noExecutionEffects();
+      });
+    }
+
+    it('checks override providers that have no executable owner and permits undefined inheritance', async () => {
+      for (const provider of ['codex', 'codex-native-strict', undefined]) {
+        workflow = {
+          name: 'raw-root',
+          provider,
+          nodes: [
+            { id: 'work', prompt: 'Work.', provider: undefined, failover_provider: undefined },
+          ],
+        } as DagBindingWorkflow;
+        const handle = await prepareDagBindings(
+          cwd,
+          workflow,
+          'codex',
+          undefined,
+          config,
+          { nodes: { unused: { provider, model: 'unused' } } },
+          'codex-only-v2'
+        );
+        expect(Object.isFrozen(handle)).toBe(true);
+      }
+      await expect(
+        prepareDagBindings(
+          cwd,
+          workflow,
+          'codex',
+          undefined,
+          config,
+          { nodes: { unused: { provider: 'claude', model: 'unused' } } },
+          'codex-only-v2'
+        )
+      ).rejects.toThrow('prepared_dag_bindings');
+      noExecutionEffects();
+    });
+
+    it('accepts literal declarations on skipped and synthetic owners without inheriting their identity', async () => {
+      workflow = {
+        name: 'skipped-identities',
+        provider: 'codex-native-strict',
+        failover_provider: 'codex-native-strict',
+        nodes: [
+          { id: 'shell', bash: 'echo safe', provider: 'codex-native-strict' } as DagNode,
+          { id: 'script', script: 'safe', provider: 'codex-native-strict' } as unknown as DagNode,
+          {
+            id: 'cancel',
+            cancel: 'safe',
+            provider: 'codex-native-strict',
+          } as unknown as DagNode,
+          {
+            id: 'evidence',
+            evidence: { kind: 'manifest_v2' },
+            provider: 'codex-native-strict',
+          } as unknown as DagNode,
+          {
+            id: 'gate',
+            provider: 'codex-native-strict',
+            persona: 'missing',
+            approval: { message: 'Approve?', on_reject: { prompt: 'Fix.' } },
+          } as DagNode,
+        ],
+      } as DagBindingWorkflow;
+      const handle = await prepareDagBindings(
+        cwd,
+        workflow,
+        'codex',
+        'workflow-choice',
+        config,
+        { nodes: { shell: { provider: 'codex-native-strict', model: 'unused' } } },
+        'codex-only-v2'
+      );
+      expect(describePreparedDagBindings(handle)).toEqual([
+        expect.objectContaining({
+          ownerIndex: 4,
+          ownerNodeId: 'gate',
+          role: 'approval-rejection',
+          declaredProvider: 'codex',
+          effectiveProvider: 'codex',
+          requestModel: { kind: 'value', value: 'workflow-choice' },
+        }),
+      ]);
+      noExecutionEffects();
+    });
+
+    for (const kind of ['prompt', 'loop']) {
+      it(`refuses a forbidden canonical ${kind} identity after a registry change without constructing providers`, async () => {
+        workflow.nodes = [
+          {
+            id: 'work',
+            provider: 'codex-native-strict',
+            ...(kind === 'loop'
+              ? { loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 } }
+              : { prompt: 'Work.' }),
+          } as DagNode,
+        ];
+        const realLoad = agentRegistry.loadAgentRegistry;
+        const claude = getRegistration('claude');
+        const loader = spyOn(agentRegistry, 'loadAgentRegistry').mockImplementation(
+          async directory => {
+            const registry = await realLoad(directory);
+            clearRegistry();
+            registerProvider(claude);
+            registerProviderAlias('codex-native-strict', 'claude');
+            return registry;
+          }
+        );
+        try {
+          await expect(
+            prepareDagBindings(
+              cwd,
+              workflow,
+              'codex',
+              'workflow-choice',
+              config,
+              undefined,
+              'codex-only-v2'
+            )
+          ).rejects.toThrow('prepared_dag_bindings');
+          noExecutionEffects();
+        } finally {
+          loader.mockRestore();
+          clearRegistry();
+          registerBuiltinProviders();
+        }
+      });
+    }
+  });
+
+  describe('v2 strict binding parity', () => {
+    async function prepare(
+      override?: import('./model-override').ModelOverride,
+      model: string | undefined = 'workflow-choice'
+    ): Promise<PreparedDagBindings> {
+      return prepareDagBindings(cwd, workflow, 'codex', model, config, override, 'codex-only-v2');
+    }
+
+    it('rejects forged, copied and default-policy handles without reinterpreting them', async () => {
+      const legacy = await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
+      const v2 = await prepare();
+      for (const handle of [{}, { ...v2 }, legacy]) {
+        expect(() => describePreparedDagBindings(handle as PreparedDagBindings)).toThrow(
+          'prepared_dag_bindings'
+        );
+      }
+      expect(describePreparedDagBindings(v2)).toHaveLength(1);
+      noExecutionEffects();
+    });
+
+    for (const provider of ['codex', 'codex-native-strict']) {
+      for (const kind of ['prompt', 'command', 'loop']) {
+        for (const withOverride of [false, true]) {
+          it(`preserves original ${provider} ${kind} persona/options with override=${withOverride}`, async () => {
+            await persona('PRIVATE parity role.');
+            await writeFile(join(cwd, '.archon', 'commands', 'parity.md'), 'Command body.');
+            config.assistants.codex = { model: 'ordinary-assistant', parityMarker: 'ordinary-key' };
+            config.assistants['codex-native-strict'] = {
+              model: 'strict-assistant',
+              parityMarker: 'strict-key',
+            };
+            workflow = {
+              name: 'parity',
+              effort: 'high',
+              nodes: [
+                {
+                  id: 'work',
+                  provider,
+                  persona: 'owned',
+                  model: 'node-choice',
+                  systemPrompt: 'Node role.',
+                  ...(kind === 'loop'
+                    ? { loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 } }
+                    : kind === 'command'
+                      ? { command: 'parity' }
+                      : { prompt: 'Work.' }),
+                } as DagNode,
+              ],
+            };
+            const override = withOverride
+              ? { nodes: { work: { provider, model: 'override-choice' } } }
+              : undefined;
+            const handle = await prepare(override);
+            const rows = describePreparedDagBindings(handle);
+            const selectedModel = withOverride ? 'override-choice' : 'node-choice';
+            const loopUndefined = kind === 'loop' && provider === 'codex';
+            expect(rows).toEqual([
+              {
+                ownerIndex: 0,
+                ownerNodeId: 'work',
+                role: 'primary',
+                declaredProvider: provider,
+                effectiveProvider: provider,
+                canonicalProvider: provider,
+                factoryRequestedProvider: provider,
+                logicalProvider: 'codex',
+                requiredTransport: 'codex-native-strict',
+                prePersonaModel: { kind: 'value', value: selectedModel },
+                resolvedModel: loopUndefined
+                  ? { kind: 'undefined' }
+                  : { kind: 'value', value: selectedModel },
+                declaredModel: { kind: 'value', value: selectedModel },
+                requestModel: loopUndefined
+                  ? { kind: 'undefined' }
+                  : { kind: 'value', value: selectedModel },
+              },
+            ]);
+            noExecutionEffects();
+            await run(handle, override);
+            expect(captured).toHaveBeenCalledTimes(1);
+            expect(deps.getAgentProvider).toHaveBeenCalledWith(provider);
+            expect(Object.hasOwn(options(), 'model')).toBe(true);
+            expect(options().model).toBe(loopUndefined ? undefined : selectedModel);
+            expect(options().assistantConfig).toEqual(config.assistants[provider]);
+            expect(options().systemPrompt).toBe('PRIVATE parity role.\n\nNode role.');
+            expect((options().nodeConfig as Record<string, unknown>).effort).toBe('high');
+          });
+        }
+      }
+    }
+
+    for (const provider of ['codex', 'codex-native-strict']) {
+      it(`preserves ${provider} workflow override and assistant selection without rewriting raw keys`, async () => {
+        config.assistants.codex = { model: 'ordinary-assistant' };
+        config.assistants['codex-native-strict'] = { model: 'strict-assistant' };
+        workflow.nodes = [{ id: 'work', prompt: 'Work.', provider }];
+        const selected = provider === 'codex' ? 'workflow-choice' : 'strict-assistant';
+        const handle = await prepare();
+        expect(describePreparedDagBindings(handle)[0].prePersonaModel).toEqual({
+          kind: 'value',
+          value: selected,
+        });
+        await run(handle);
+        expect(options().model).toBe(selected);
+        const override = { workflow: { provider, model: 'workflow-override' } };
+        const overridden = await prepare(override);
+        expect(describePreparedDagBindings(overridden)[0].requestModel).toEqual({
+          kind: 'value',
+          value: 'workflow-override',
+        });
+        await run(overridden, override);
+        expect(options(1).model).toBe('workflow-override');
+        expect(options(1).assistantConfig).toEqual(config.assistants[provider]);
+      });
+    }
+
+    it('records the inherited declaration separately from an effective node override', async () => {
+      workflow.nodes = [{ id: 'work', prompt: 'Work.' }];
+      const override = {
+        nodes: { work: { provider: 'codex-native-strict', model: 'node-override' } },
+      };
+      const handle = await prepare(override);
+      expect(describePreparedDagBindings(handle)[0]).toMatchObject({
+        declaredProvider: 'codex',
+        effectiveProvider: 'codex-native-strict',
+        canonicalProvider: 'codex-native-strict',
+        factoryRequestedProvider: 'codex-native-strict',
+      });
+      await run(handle, override);
+      expect(deps.getAgentProvider).toHaveBeenCalledWith('codex-native-strict');
+      expect(options().model).toBe('node-override');
+    });
+
+    for (const provider of ['codex', 'codex-native-strict']) {
+      for (const kind of ['prompt', 'loop']) {
+        it(`retains pinned-persona refusal for ${provider} ${kind} and the existing prompt override exception`, async () => {
+          await persona('Pinned role.', 'opus');
+          workflow.nodes = [
+            {
+              id: 'work',
+              provider,
+              persona: 'owned',
+              ...(kind === 'loop'
+                ? { loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 } }
+                : { prompt: 'Work.' }),
+            } as DagNode,
+          ];
+          await expect(prepare()).rejects.toThrow("must not declare 'model:'");
+          const override = { nodes: { work: { provider, model: 'override-choice' } } };
+          if (kind === 'loop')
+            await expect(prepare(override)).rejects.toThrow("must not declare 'model:'");
+          else {
+            const handle = await prepare(override);
+            expect(describePreparedDagBindings(handle)[0].requestModel).toEqual({
+              kind: 'value',
+              value: 'override-choice',
+            });
+            await run(handle, override);
+            expect(options().model).toBe('override-choice');
+          }
+        });
+      }
+    }
+
+    it('distinguishes absent requests from own undefined and exact empty strings without changing options', async () => {
+      config.assistants = { codex: {} };
+      workflow.nodes = [
+        { id: 'absent', prompt: 'Work.' },
+        {
+          id: 'undefined',
+          depends_on: ['absent'],
+          persona: 'owned',
+          loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 },
+        },
+        { id: 'empty', depends_on: ['undefined'], prompt: 'Work.', model: '' },
+      ];
+      await persona('Unpinned role.');
+      const handle = await prepareDagBindings(
+        cwd,
+        workflow,
+        'codex',
+        undefined,
+        config,
+        undefined,
+        'codex-only-v2'
+      );
+      const rows = describePreparedDagBindings(handle);
+      expect(rows[0]).toMatchObject({
+        prePersonaModel: { kind: 'undefined' },
+        resolvedModel: { kind: 'undefined' },
+        declaredModel: { kind: 'undefined' },
+        requestModel: { kind: 'absent' },
+      });
+      expect(rows[1]).toMatchObject({
+        prePersonaModel: { kind: 'undefined' },
+        resolvedModel: { kind: 'undefined' },
+        declaredModel: { kind: 'undefined' },
+        requestModel: { kind: 'undefined' },
+      });
+      expect(rows[2]).toMatchObject({
+        prePersonaModel: { kind: 'value', value: '' },
+        resolvedModel: { kind: 'value', value: '' },
+        declaredModel: { kind: 'value', value: '' },
+        requestModel: { kind: 'absent' },
+      });
+      await executeDagWorkflow(
+        deps,
+        platform,
+        'presence',
+        cwd,
+        workflow,
+        makeWorkflowRun(),
+        'codex',
+        undefined,
+        join(cwd, 'artifacts'),
+        join(cwd, 'logs'),
+        'main',
+        'docs/',
+        config,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        handle
+      );
+      expect(Object.hasOwn(options(0), 'model')).toBe(false);
+      expect(Object.hasOwn(options(1), 'model')).toBe(true);
+      expect(options(1).model).toBeUndefined();
+      expect(Object.hasOwn(options(2), 'model')).toBe(false);
+      expect(JSON.parse(JSON.stringify(rows))).toEqual(rows);
+      expect(rows[0].requestModel).not.toEqual(rows[1].requestModel);
+    });
+
+    for (const invalidModel of [null, 0, false, {}, []]) {
+      it(`refuses non-string evidence model ${JSON.stringify(invalidModel)} without coercion`, async () => {
+        const handle = await prepare({ nodes: { work: { model: invalidModel as string } } });
+        expect(() => describePreparedDagBindings(handle)).toThrow('model');
+        noExecutionEffects();
+      });
+    }
+
+    it('orders owner indexes and roles and separates synthetic collisions without leaking owner identity', async () => {
+      workflow.nodes = [
+        {
+          id: 'first',
+          prompt: 'Work.',
+          provider: 'codex',
+          failover_provider: 'codex-native-strict',
+          failover_model: 'failover-choice',
+        },
+        {
+          id: 'gate:on_reject',
+          depends_on: ['first'],
+          prompt: 'Real node.',
+          provider: 'codex-native-strict',
+          model: 'real-node',
+        },
+        {
+          id: 'gate',
+          depends_on: ['gate:on_reject'],
+          provider: 'codex-native-strict',
+          persona: 'missing',
+          approval: { message: 'Approve?', on_reject: { prompt: 'Fix.' } },
+        } as DagNode,
+      ];
+      const handle = await prepare();
+      const rows = describePreparedDagBindings(handle);
+      expect(rows.map(row => [row.ownerIndex, row.ownerNodeId, row.role])).toEqual([
+        [0, 'first', 'primary'],
+        [0, 'first', 'availability'],
+        [0, 'first', 'quota'],
+        [1, 'gate:on_reject', 'primary'],
+        [2, 'gate', 'approval-rejection'],
+      ]);
+      expect(rows[1]).toMatchObject({
+        declaredProvider: 'codex-native-strict',
+        requestModel: { kind: 'value', value: 'failover-choice' },
+      });
+      expect(rows[3]).toMatchObject({
+        declaredProvider: 'codex-native-strict',
+        requestModel: { kind: 'value', value: 'real-node' },
+      });
+      expect(rows[4]).toMatchObject({
+        declaredProvider: 'codex',
+        effectiveProvider: 'codex',
+        requestModel: { kind: 'value', value: 'workflow-choice' },
+      });
+      await run(
+        handle,
+        undefined,
+        makeWorkflowRun('v2-collision', {
+          metadata: {
+            approval: { type: 'approval', nodeId: 'gate', message: 'Approve?' },
+            rejection_reason: 'Fix.',
+          },
+        })
+      );
+      expect(captured).toHaveBeenCalledTimes(3);
+      expect(options(1).model).toBe('real-node');
+      expect(options(2).model).toBe('workflow-choice');
+      expect(options(2).systemPrompt).toBeUndefined();
+    });
+
+    for (const provider of ['codex', 'codex-native-strict']) {
+      for (const kind of ['prompt', 'loop']) {
+        it(`executes ${kind} availability failover to ${provider} with its original selected binding`, async () => {
+          const primaryProvider = provider === 'codex' ? 'codex-native-strict' : 'codex';
+          workflow.nodes = [
+            {
+              id: 'work',
+              provider: primaryProvider,
+              model: 'primary-choice',
+              failover_provider: provider,
+              failover_model: 'target-choice',
+              ...(kind === 'loop'
+                ? { loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 } }
+                : { prompt: 'Work.', retry: { max_attempts: 1, delay_ms: 1000 } }),
+            } as DagNode,
+          ];
+          const override = {
+            nodes: { work: { provider: primaryProvider, model: 'primary-override' } },
+          };
+          let attempts = 0;
+          const transport = mock(async function* () {
+            if (attempts++ === 0) throw new Error('network connection lost');
+            yield { type: 'assistant' as const, content: '<promise>COMPLETE</promise>' };
+            yield { type: 'result' as const, sessionId: 'parity-failover-fake' };
+          });
+          deps.getAgentProvider = mock((id: string) => ({
+            sendQuery: transport,
+            getType: () => id,
+            getCapabilities: mockCodexCapabilities,
+          }));
+          const handle = await prepare(override);
+          const rows = describePreparedDagBindings(handle);
+          expect(rows.map(row => row.role)).toEqual(['primary', 'availability', 'quota']);
+          expect(rows[1]).toMatchObject({
+            declaredProvider: provider,
+            effectiveProvider: kind === 'loop' ? provider : primaryProvider,
+            requestModel: {
+              kind: 'value',
+              value: kind === 'loop' ? 'target-choice' : 'primary-override',
+            },
+          });
+          await run(handle, override);
+          expect(transport).toHaveBeenCalledTimes(2);
+          expect(
+            (deps.getAgentProvider as Mock<(id: string) => unknown>).mock.calls.map(call => call[0])
+          ).toEqual([primaryProvider, kind === 'loop' ? provider : primaryProvider]);
+          expect(
+            ((transport.mock.calls as unknown[][])[1][3] as Record<string, unknown>).model
+          ).toBe(kind === 'loop' ? 'target-choice' : 'primary-override');
+        });
+      }
+    }
+
+    it('returns fresh deeply frozen JSON-safe snapshots using only captured private records', async () => {
+      await persona('PRIVATE body that must never be exposed.');
+      config.envVars = { PRIVATE_TEST_CREDENTIAL: 'private-value' };
+      workflow.nodes = [
+        {
+          id: 'work',
+          prompt: 'PRIVATE prompt.',
+          persona: 'owned',
+          provider: 'codex-native-strict',
+          model: 'assistant-choice',
+        },
+      ];
+      const handle = await prepare();
+      const loader = spyOn(agentRegistry, 'loadAgentRegistry');
+      const beforeLogs = mockLogFn.mock.calls.length;
+      try {
+        const first = describePreparedDagBindings(handle);
+        const second = describePreparedDagBindings(handle);
+        expect(first).toEqual(second);
+        expect(first).not.toBe(second);
+        expect(first[0]).not.toBe(second[0]);
+        expect(first[0].prePersonaModel).not.toBe(second[0].prePersonaModel);
+        expect(Object.isFrozen(first)).toBe(true);
+        for (const row of first) {
+          expect(Object.isFrozen(row)).toBe(true);
+          for (const key of [
+            'prePersonaModel',
+            'resolvedModel',
+            'declaredModel',
+            'requestModel',
+          ] as const) {
+            expect(Object.isFrozen(row[key])).toBe(true);
+          }
+        }
+        expect(Object.keys(first[0]).sort()).toEqual(
+          [
+            'ownerIndex',
+            'ownerNodeId',
+            'role',
+            'declaredProvider',
+            'effectiveProvider',
+            'canonicalProvider',
+            'factoryRequestedProvider',
+            'logicalProvider',
+            'requiredTransport',
+            'prePersonaModel',
+            'resolvedModel',
+            'declaredModel',
+            'requestModel',
+          ].sort()
+        );
+        expect(JSON.stringify(first)).not.toContain('PRIVATE');
+        expect(JSON.stringify(first)).not.toContain('private-value');
+        expect(Reflect.set(first[0], 'effectiveProvider', 'claude')).toBe(false);
+        expect(Reflect.set(first[0].requestModel, 'value', 'mutated')).toBe(false);
+        const copy = structuredClone(first);
+        (copy[0] as unknown as Record<string, unknown>).effectiveProvider = 'claude';
+        expect(describePreparedDagBindings(handle)).toEqual(second);
+        expect(loader).not.toHaveBeenCalled();
+        expect(mockLogFn.mock.calls.length).toBe(beforeLogs);
+        noExecutionEffects();
+        await run(handle);
+        expect(deps.getAgentProvider).toHaveBeenCalledWith('codex-native-strict');
+        expect(options().model).toBe('assistant-choice');
+        expect(options().systemPrompt).toBe('PRIVATE body that must never be exposed.');
+      } finally {
+        loader.mockRestore();
+      }
+    });
+
+    it('keeps projection as snapshot evidence while actual execution refuses stale input before lease', async () => {
+      const handle = await prepare();
+      const before = describePreparedDagBindings(handle);
+      workflow.nodes[0].model = 'caller-mutation';
+      expect(describePreparedDagBindings(handle)).toEqual(before);
+      await expect(run(handle)).rejects.toThrow('prepared_dag_bindings');
+      noExecutionEffects();
+    });
+
+    it('reuses the captured fresh registry after later file changes without accessor reloads', async () => {
+      workflow.nodes = [
+        {
+          id: 'work',
+          provider: 'codex-native-strict',
+          prompt: 'Work.',
+          persona: 'owned',
+          model: 'snapshot-choice',
+        },
+      ];
+      await persona('Captured strict role.');
+      const handle = await prepare();
+      const before = describePreparedDagBindings(handle);
+      await persona('Changed incompatible role.', 'opus');
+      expect(describePreparedDagBindings(handle)).toEqual(before);
+      await run(handle);
+      expect(options().systemPrompt).toBe('Captured strict role.');
+      expect(options().model).toBe('snapshot-choice');
+      await expect(prepare()).rejects.toThrow("must not declare 'model:'");
+    });
+
+    for (const drift of [
+      'cwd',
+      'config',
+      'override',
+      'workflow-provider',
+      'workflow-model',
+      'own-undefined',
+    ]) {
+      it(`preserves prelease ${drift} drift refusal for a v2 handle`, async () => {
+        const override = {
+          nodes: { work: { provider: 'codex-native-strict', model: 'strict-choice' } },
+        };
+        const handle = await prepare(override);
+        const originalCwd = cwd;
+        if (drift === 'cwd') cwd = join(cwd, 'changed');
+        if (drift === 'config') config.assistants.codex.model = 'changed';
+        if (drift === 'override') override.nodes.work.model = 'changed';
+        if (drift === 'own-undefined') workflow.nodes[0].systemPrompt = undefined;
+        try {
+          const pending =
+            drift === 'workflow-provider' || drift === 'workflow-model'
+              ? executeDagWorkflow(
+                  deps,
+                  platform,
+                  'v2-drift',
+                  cwd,
+                  workflow,
+                  makeWorkflowRun(),
+                  drift === 'workflow-provider' ? 'codex-native-strict' : 'codex',
+                  drift === 'workflow-model' ? undefined : 'workflow-choice',
+                  join(cwd, 'artifacts'),
+                  join(cwd, 'logs'),
+                  'main',
+                  'docs/',
+                  config,
+                  undefined,
+                  undefined,
+                  undefined,
+                  override,
+                  handle
+                )
+              : run(handle, override);
+          await expect(pending).rejects.toThrow('prepared_dag_bindings');
+          noExecutionEffects();
+        } finally {
+          cwd = originalCwd;
+        }
+      });
+    }
   });
 });
