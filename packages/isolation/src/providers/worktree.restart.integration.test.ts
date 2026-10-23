@@ -131,37 +131,258 @@ function selectOwnedWorktrees(root: string, canonicalRepo: string, porcelain: st
   return selected;
 }
 
-afterEach(async () => {
-  for (const root of temporaryRoots.splice(0)) {
+interface RestartCleanupOperations {
+  list(canonicalRepo: string): Promise<string>;
+  remove(canonicalRepo: string, worktree: string): Promise<void>;
+  removeRoot(root: string): Promise<void>;
+  observe(record: Record<string, unknown>): void;
+}
+
+const restartCleanupOperations: RestartCleanupOperations = {
+  async list(canonicalRepo) {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', canonicalRepo, 'worktree', 'list', '--porcelain'],
+      { windowsHide: true }
+    );
+    return stdout;
+  },
+  async remove(canonicalRepo, worktree) {
+    await execFileAsync('git', ['-C', canonicalRepo, 'worktree', 'remove', '--force', worktree], {
+      windowsHide: true,
+    });
+  },
+  async removeRoot(root) {
+    await rm(root, { recursive: true, force: true });
+  },
+  observe(record) {
+    process.stderr.write('WORKROOM_RESTART_CLEANUP_FAILURE ' + JSON.stringify(record) + '\n');
+  },
+};
+
+function observeRestartCleanupFailure(
+  root: string,
+  canonicalRepo: string,
+  attemptedTarget: string,
+  phase: string,
+  error: unknown,
+  emit: RestartCleanupOperations['observe']
+): void {
+  try {
+    const bounded = (value: string) => value.slice(0, 1024);
+    const metadata: Record<string, string> = {};
+    if ((typeof error === 'object' && error !== null) || typeof error === 'function') {
+      for (const key of ['code', 'path', 'syscall']) {
+        const descriptor = Object.getOwnPropertyDescriptor(error, key);
+        if (descriptor && 'value' in descriptor && typeof descriptor.value === 'string') {
+          metadata[key] = bounded(descriptor.value);
+        }
+      }
+    }
+    const nativeObservation = (path: string) => {
+      try {
+        if (typeof realpathSync.native !== 'function') return { status: 'native-unavailable' };
+        return { status: 'resolved', value: bounded(realpathSync.native(path)) };
+      } catch {
+        return { status: 'lookup-unavailable' };
+      }
+    };
+    const record = {
+      phase,
+      testProcessPid: process.pid,
+      recordedRoot: bounded(root),
+      canonicalRepo: bounded(canonicalRepo),
+      attemptedTarget: bounded(attemptedTarget),
+      error: metadata,
+      native: {
+        root: nativeObservation(root),
+        canonical: nativeObservation(canonicalRepo),
+        target: nativeObservation(attemptedTarget),
+      },
+      testOwnedChildCompletion:
+        phase === 'root-remove' ? 'git-operations-awaited-or-not-created' : 'UNKNOWN',
+      lockOwner: 'UNKNOWN',
+      nestedPathAttribution: metadata.path ? 'original-error-only' : 'UNKNOWN',
+    };
+    if (JSON.stringify(record).length <= 8192) emit(record);
+  } catch {
+    // Diagnostics never replace the original failure or grant cleanup permission.
+  }
+}
+
+async function cleanupRestartRoot(
+  root: string,
+  operations: RestartCleanupOperations = restartCleanupOperations
+): Promise<void> {
+  const canonicalRepo = join(root, 'canonical');
+  let phase = 'ownership';
+  let attemptedTarget = root;
+  try {
     assertOwnedPath(tmpdir(), root);
     if (!basename(root).startsWith('archon-worktree-restart-')) {
       throw new Error('Unexpected restart fixture root');
     }
-    const canonicalRepo = join(root, 'canonical');
     // Only tolerate setup stopping before git init; real cleanup failures must propagate.
     if (existsSync(join(canonicalRepo, '.git'))) {
-      const { stdout } = await execFileAsync(
-        'git',
-        ['-C', canonicalRepo, 'worktree', 'list', '--porcelain'],
-        { windowsHide: true }
-      );
+      phase = 'git-list';
+      attemptedTarget = canonicalRepo;
+      const stdout = await operations.list(canonicalRepo);
+      phase = 'git-selection';
       const worktrees = selectOwnedWorktrees(root, canonicalRepo, stdout);
       for (const worktree of worktrees) {
-        await execFileAsync(
-          'git',
-          ['-C', canonicalRepo, 'worktree', 'remove', '--force', worktree],
-          {
-            windowsHide: true,
-          }
-        );
+        phase = 'git-remove';
+        attemptedTarget = worktree;
+        await operations.remove(canonicalRepo, worktree);
       }
     }
-    await rm(root, { recursive: true, force: true });
+    phase = 'root-remove';
+    attemptedTarget = root;
+    await operations.removeRoot(root);
+    phase = 'root-absence';
     expect(existsSync(root)).toBe(false);
+  } catch (error) {
+    observeRestartCleanupFailure(
+      root,
+      canonicalRepo,
+      attemptedTarget,
+      phase,
+      error,
+      operations.observe
+    );
+    throw error;
+  }
+}
+
+afterEach(async () => {
+  for (const root of temporaryRoots.splice(0)) {
+    await cleanupRestartRoot(root);
   }
 });
 
 describe('WorktreeProvider restart persistence', () => {
+  async function cleanupFailureFixture() {
+    const root = await mkdtemp(join(tmpdir(), 'archon-worktree-restart-'));
+    temporaryRoots.push(root);
+    const sentinel = join(root, 'retained.txt');
+    await writeFile(sentinel, 'retained\n');
+    return { root, sentinel };
+  }
+
+  test('cleanup reports Git list and removal failures without attempting root removal', async () => {
+    for (const phase of ['git-list', 'git-remove']) {
+      const { root, sentinel } = await cleanupFailureFixture();
+      const canonicalRepo = join(root, 'canonical');
+      const linked = join(root, 'linked');
+      await mkdir(canonicalRepo);
+      await mkdir(linked);
+      await git(canonicalRepo, 'init');
+      const failure = Object.assign(new Error('synthetic Git failure'), { code: 'SYNTHETIC' });
+      const observations: Record<string, unknown>[] = [];
+      let rootAttempts = 0;
+      let removeAttempts = 0;
+      let caught: unknown;
+      try {
+        await cleanupRestartRoot(root, {
+          async list() {
+            if (phase === 'git-list') throw failure;
+            return `worktree ${canonicalRepo}\nworktree ${linked}\n`;
+          },
+          async remove() {
+            removeAttempts++;
+            throw failure;
+          },
+          async removeRoot() {
+            rootAttempts++;
+          },
+          observe(record) {
+            observations.push(record);
+          },
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBe(failure);
+      expect(rootAttempts).toBe(0);
+      expect(removeAttempts).toBe(phase === 'git-list' ? 0 : 1);
+      expect(await readFile(sentinel, 'utf8')).toBe('retained\n');
+      expect(observations).toHaveLength(1);
+      expect(observations[0]?.phase).toBe(phase);
+      expect(observations[0]?.attemptedTarget).toBe(phase === 'git-list' ? canonicalRepo : linked);
+      expect(observations[0]?.lockOwner).toBe('UNKNOWN');
+    }
+  });
+
+  test('cleanup reports one root failure and retains its exact error and supplied nested path', async () => {
+    const { root, sentinel } = await cleanupFailureFixture();
+    const suppliedPath = join(root, 'synthetic-nested', 'locked.txt');
+    const failure = Object.assign(new Error('synthetic root failure'), {
+      code: 'EBUSY',
+      path: suppliedPath,
+      syscall: 'rmdir',
+    });
+    const observations: Record<string, unknown>[] = [];
+    const attempts: string[] = [];
+    let caught: unknown;
+    try {
+      await cleanupRestartRoot(root, {
+        ...restartCleanupOperations,
+        async removeRoot(target) {
+          attempts.push(target);
+          throw failure;
+        },
+        observe(record) {
+          observations.push(record);
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBe(failure);
+    expect(attempts).toEqual([root]);
+    expect(await readFile(sentinel, 'utf8')).toBe('retained\n');
+    expect(existsSync(suppliedPath)).toBe(false);
+    expect(observations).toHaveLength(1);
+    expect(observations[0]?.phase).toBe('root-remove');
+    expect(observations[0]?.error).toEqual({ code: 'EBUSY', path: suppliedPath, syscall: 'rmdir' });
+    expect(observations[0]?.lockOwner).toBe('UNKNOWN');
+    expect(observations[0]?.nestedPathAttribution).toBe('original-error-only');
+  });
+
+  test('cleanup preserves the original error when metadata getters and observation fail', async () => {
+    const { root, sentinel } = await cleanupFailureFixture();
+    const failure = new Error('original synthetic failure');
+    let getterCalls = 0;
+    Object.defineProperty(failure, 'code', {
+      get() {
+        getterCalls++;
+        throw new Error('getter');
+      },
+    });
+    let attempts = 0;
+    let observationAttempts = 0;
+    let caught: unknown;
+    try {
+      await cleanupRestartRoot(root, {
+        ...restartCleanupOperations,
+        async removeRoot() {
+          attempts++;
+          throw failure;
+        },
+        observe() {
+          observationAttempts++;
+          throw new Error('observation');
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBe(failure);
+    expect(attempts).toBe(1);
+    expect(getterCalls).toBe(0);
+    expect(observationAttempts).toBe(1);
+    expect(await readFile(sentinel, 'utf8')).toBe('retained\n');
+  });
+
   async function selectionFixture() {
     const outer = await mkdtemp(join(tmpdir(), 'archon-worktree-restart-'));
     temporaryRoots.push(outer);
