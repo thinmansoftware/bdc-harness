@@ -4,6 +4,7 @@ import {
   registerListResponseSchema,
   registerMetaResponseSchema,
   registerRowSchema,
+  evidenceSpecSchema,
 } from './taskmaster.schemas';
 
 const row = {
@@ -30,6 +31,17 @@ const row = {
 };
 
 describe('taskmaster register schemas', () => {
+  test('the internal cascade proof kind is rejected by public registration', () => {
+    expect(
+      evidenceSpecSchema.safeParse({
+        kind: 'cascade_workflow_completed',
+        cascadeId: 'cascade',
+        woId: 'WO-TEST-01',
+        project: 'bdc-harness',
+      }).success
+    ).toBe(false);
+  });
+
   test('register: row preserves nullable fields as null', () => {
     const parsed = registerRowSchema.parse(row);
     expect(parsed.owner_login).toBeNull();

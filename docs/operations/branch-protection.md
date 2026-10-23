@@ -46,6 +46,14 @@ gh api repos/thinmansoftware/bdc-harness/branches/dev/protection \
         and (.required_status_checks.contexts | index("test (ubuntu-latest)") != null)'
 ```
 
+## Reviewer wait behavior
+
+The Overseer reviewer waits only for required contexts. Optional checks do not hold the verdict once every required context has reported a completed latest attempt.
+
+For an unprotected base with zero checks reported on the head, the reviewer stops deferring after `OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS` attempts (default `5`) and returns terminal, non-approving `CHECKS_UNAVAILABLE` with reason `unprotected_base_no_checks`. Protect the base or add CI to resolve that outcome.
+
+To diagnose a review that is still waiting, grep worker logs for `overseer_review_checks_pending_deferred`; the record includes the pending check names or `no_checks_reported` when the head has none.
+
 ## Apply (full-replace PUT -- preserve existing checks)
 
 GitHub `PUT .../branches/{branch}/protection` is a **full replace**. A minimal

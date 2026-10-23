@@ -3,7 +3,7 @@
  *
  * WO-HARNESS-TIER-LADDER-UNIFY-01 done-when #4:
  *   1. mechanical CODE enters zero (live ruleset)
- *   2. INFRA / money route stronger (claude)
+ *   2. INFRA / money / auth / security / feature enter cursor
  *   3. --entry override wins over ruleset
  *   4. dark lane (glm / refusedTiers) is hard-refused
  */
@@ -12,10 +12,12 @@ import { describe, test, expect } from 'bun:test';
 import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { loadLadder, loadRefusedTiers } from '../ladder.js';
+import { loadLadder, loadPremiumTiers, loadRefusedTiers } from '../ladder.js';
 import { loadRuleset, pickEntryTier } from '../conductor.js';
 import { runCascade } from '../cascade.js';
 import type { CascadeDeps } from '../cascade.js';
+import type { FireResult, GateVerdict, PollResult } from '../types.js';
+
 import { parse } from 'yaml';
 import { readFile } from 'fs/promises';
 import { selectQuotaExhaustionRoute } from '../../../workflows/src/node-failover.js';
@@ -108,7 +110,9 @@ describe('live ladder SOR', () => {
     expect(refused).not.toContain('zero');
     expect(refused).toContain('qwen');
     expect(refused).toContain('glm');
-    expect([...refused].sort()).toEqual(['glm', 'qwen']);
+    expect(refused).toContain('claude');
+    expect(refused).not.toContain('codex');
+    expect([...refused].sort()).toEqual(['claude', 'glm', 'qwen']);
     const firstLive = loadLadder().find(t => !refused.includes(t.name));
     expect(firstLive?.name).toBe('zero');
   });
@@ -128,25 +132,27 @@ describe('live ruleset routing', () => {
     expect(ruleset.defaultEntry).toBe('cursor');
   });
 
-  test('feature-tagged CODE still enters codex', () => {
+  test('feature-tagged CODE enters cursor', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ woClass: 'CODE', tags: ['feature'] }, ruleset)).toBe('codex');
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['feature'] }, ruleset)).toBe('cursor');
   });
 
-  test('INFRA routes stronger (claude)', () => {
+  test('INFRA enters cursor', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ woClass: 'INFRA' }, ruleset)).toBe('claude');
+    expect(pickEntryTier({ woClass: 'INFRA' }, ruleset)).toBe('cursor');
   });
 
-  test('money tag routes stronger (claude)', () => {
+  test('money, billing, security, and auth enter cursor', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ tags: ['money'] }, ruleset)).toBe('claude');
-    expect(pickEntryTier({ tags: ['billing'] }, ruleset)).toBe('claude');
+    expect(pickEntryTier({ tags: ['money'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['billing'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['security'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['auth'] }, ruleset)).toBe('cursor');
   });
 });
 
 describe('cascade entry override and refuse', () => {
-  test('--entry override wins over ruleset (dry-run selects claude)', async () => {
+  test('--entry override wins over ruleset (dry-run selects codex)', async () => {
     const outDir = await mkdtemp(join(tmpdir(), 'sc-ladder-override-'));
     try {
       let fireCalled = false;
@@ -168,7 +174,7 @@ describe('cascade entry override and refuse', () => {
         woId: 'WO-LADDER-ENTRY-OVERRIDE',
         woClass: 'CODE',
         tags: ['mechanical'],
-        entryOverride: 'claude',
+        entryOverride: 'codex',
         dryRun: true,
         outDir,
         project: 'test-project',
@@ -177,8 +183,8 @@ describe('cascade entry override and refuse', () => {
 
       expect(fireCalled).toBe(false);
       expect(record.status).toBe('planned');
-      expect(record.telemetry.entryTier).toBe('claude');
-      expect(record.request.entryOverride).toBe('claude');
+      expect(record.telemetry.entryTier).toBe('codex');
+      expect(record.request.entryOverride).toBe('codex');
     } finally {
       await rm(outDir, { recursive: true, force: true });
     }
@@ -209,4 +215,158 @@ describe('cascade entry override and refuse', () => {
 
     expect(fireCalled).toBe(false);
   });
+
+  test('climb from codex skips claude; next tier is frontier', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'sc-ladder-codex-frontier-'));
+    const firedWorkflows: string[] = [];
+    try {
+      const deps: CascadeDeps = {
+        fire: async opts => {
+          firedWorkflows.push(opts.workflowName);
+          return makeFireOk(`run-${firedWorkflows.length}`);
+        },
+        poll: async () => makePollResult(),
+        judge: () => makeFailVerdict('validator: needs_revision'),
+        escalate: async () => undefined,
+        findWoClaim: async () => null,
+      };
+
+      const record = await runCascade({
+        woId: 'WO-LADDER-CODEX-SKIPS-CLAUDE',
+        woClass: 'CODE',
+        tags: ['mechanical'],
+        entryOverride: 'codex',
+        outDir,
+        project: 'test-project',
+        deps,
+      });
+
+      expect(firedWorkflows).toEqual(['bdc-feature-development-codex']);
+      expect(firedWorkflows).not.toContain('bdc-feature-development');
+      expect(firedWorkflows).not.toContain('bdc-feature-development-fable');
+      expect(record.status).toBe('pending-frontier-approval');
+      expect(record.frontierApproval?.tierName).toBe('frontier');
+      expect(record.frontierApproval?.workflowName).toBe('bdc-feature-development-fable');
+      expect(record.attempts.map(a => a.tier)).toEqual(['codex']);
+      expect(loadPremiumTiers()).toContain('frontier');
+    } finally {
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('cursor climbs to codex', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'sc-ladder-cursor-codex-'));
+    const firedWorkflows: string[] = [];
+    let judgeCall = 0;
+    try {
+      const deps: CascadeDeps = {
+        fire: async opts => {
+          firedWorkflows.push(opts.workflowName);
+          return makeFireOk(`run-${firedWorkflows.length}`);
+        },
+        poll: async () => makePollResult(),
+        judge: () => {
+          judgeCall++;
+          return judgeCall === 1 ? makeFailVerdict('cursor near-miss') : makePassVerdict();
+        },
+        escalate: async () => undefined,
+        findWoClaim: async () => null,
+      };
+
+      const record = await runCascade({
+        woId: 'WO-LADDER-CURSOR-TO-CODEX',
+        woClass: 'CODE',
+        tags: ['mechanical'],
+        entryOverride: 'cursor',
+        outDir,
+        project: 'test-project',
+        deps,
+      });
+
+      expect(record.status).toBe('won');
+      expect(record.winningTier).toBe('codex');
+      expect(record.frontierApproval).toBeUndefined();
+      expect(record.attempts.map(a => a.tier)).toEqual(['cursor', 'codex']);
+      expect(firedWorkflows).toEqual([
+        'bdc-feature-development-cursor',
+        'bdc-feature-development-codex',
+      ]);
+      expect(firedWorkflows).not.toContain('bdc-feature-development');
+    } finally {
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('entry override claude is refused and does not fire', async () => {
+    let fireCalled = false;
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fireCalled = true;
+        return { ok: false, runId: null, conversationId: null, infraError: 'should-not-fire' };
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    let thrown: unknown;
+    try {
+      await runCascade({
+        woId: 'WO-LADDER-CLAUDE-REFUSE',
+        woClass: 'CODE',
+        tags: ['mechanical'],
+        entryOverride: 'claude',
+        dryRun: true,
+        outDir: '/tmp/smart-cauldron-claude-refuse',
+        project: 'test-project',
+        deps,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = thrown instanceof Error ? thrown.message : '';
+    expect(message).toMatch(/Refused dark\/retired entry tier "claude"/);
+    expect(message).toContain('Refused: glm, qwen, claude');
+    expect(fireCalled).toBe(false);
+  });
 });
+
+function makeFireOk(runId: string): FireResult {
+  return { ok: true, runId, conversationId: 'conv-stub', infraError: null };
+}
+
+function makePollResult(): PollResult {
+  return {
+    runId: 'run-stub',
+    terminalStatus: 'failed',
+    validatorVerdict: 'needs_revision',
+    prUrl: null,
+    prMergeable: null,
+    servedModelId: null,
+    rawMetadata: {},
+  };
+}
+
+function makeFailVerdict(reason: string): GateVerdict {
+  return {
+    pass: false,
+    reason,
+    cancelled: false,
+    validatorVerdict: 'needs_revision',
+    prOpened: false,
+    prMergeable: null,
+    terminalStatus: 'failed',
+  };
+}
+
+function makePassVerdict(): GateVerdict {
+  return {
+    pass: true,
+    reason: 'all gate conditions passed',
+    cancelled: false,
+    validatorVerdict: 'satisfied',
+    prOpened: true,
+    prMergeable: true,
+    terminalStatus: 'completed',
+  };
+}

@@ -125,6 +125,8 @@ export interface PrReviewResult {
    * callers that prefer a duration to an instant.
    */
   retry_after_ms?: number;
+  /** Names of checks still awaited. Set only on CHECKS_PENDING. */
+  pendingChecks?: string[];
 }
 
 export interface PrReviewModelResult {
@@ -474,8 +476,9 @@ export function reviewErrorCode(error: string | undefined): string | null {
  * When `requiredContexts` is a known set (branch-protection required status
  * checks on the base branch) it is the authoritative complete-suite signal:
  * terminal only when EVERY required context has reported a check run AND every
- * reported check has completed. A required context that has not shown up yet
- * (or one that is present but still in_progress) keeps the suite non-terminal.
+ * applicable latest run for that context (one per GitHub App identity) has
+ * completed. A required context that has not shown up yet (or one whose latest
+ * run from any app is still in_progress) keeps the suite non-terminal.
  *
  * `null` means the authoritative set could NOT be obtained. That is never
  * terminal: we defer rather than fall back to the reported-checks heuristic,
@@ -497,15 +500,17 @@ export function checksAreTerminal(
 ): boolean {
   // UNKNOWN required set -- fail closed. Must be checked before any heuristic.
   if (requiredContexts === null) return false;
-  // A reported check that is still queued/in_progress means the suite is mid
-  // flight regardless of what is required -- never terminal.
-  const allReportedCompleted = checks.every(check => check.status === 'completed');
   if (requiredContexts !== undefined && requiredContexts.length > 0) {
-    const completedNames = new Set(
-      checks.filter(check => check.status === 'completed').map(check => check.name)
-    );
-    return allReportedCompleted && requiredContexts.every(context => completedNames.has(context));
+    const latest = latestAttemptPerCheck(checks);
+    return requiredContexts.every(context => {
+      const normalizedContext = normalizedCheckName(context);
+      const applicable = latest.filter(
+        check => normalizedCheckName(check.name) === normalizedContext
+      );
+      return applicable.length > 0 && applicable.every(check => check.status === 'completed');
+    });
   }
+  const allReportedCompleted = checks.every(check => check.status === 'completed');
   return checks.length > 0 && allReportedCompleted;
 }
 
@@ -536,7 +541,21 @@ function rateLimited(
   };
 }
 
-function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult {
+function checksPending(
+  input: PrReviewInput,
+  deps: PrReviewDeps,
+  checks: PrReviewCheck[],
+  requiredContexts: string[] | null | undefined
+): PrReviewResult {
+  const latest = latestAttemptPerCheck(checks);
+  const latestByName = new Map(latest.map(check => [normalizedCheckName(check.name), check]));
+  const pendingChecks =
+    requiredContexts && requiredContexts.length > 0
+      ? requiredContexts.flatMap(context => {
+          const check = latestByName.get(normalizedCheckName(context));
+          return check?.status === 'completed' ? [] : [check?.name ?? context.trim()];
+        })
+      : latest.filter(check => check.status !== 'completed').map(check => check.name);
   return {
     verdict: 'CHECKS_PENDING',
     findings: [],
@@ -544,6 +563,7 @@ function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult
     reviewer: deps.reviewer,
     acceptance_criteria_available: false,
     error: 'checks_pending',
+    ...(checks.length === 0 ? {} : { pendingChecks }),
   };
 }
 
@@ -604,7 +624,7 @@ export async function evaluatePullRequest(
   // must NOT be coalesced (e.g. `?? []`), which would erase the unknown state
   // and silently fail open. The model is not invoked in this branch.
   if (!checksAreTerminal(evidence.checks, evidence.requiredContexts)) {
-    return checksPending(input, deps);
+    return checksPending(input, deps, evidence.checks, evidence.requiredContexts);
   }
 
   let acceptanceCriteria: string | null = null;

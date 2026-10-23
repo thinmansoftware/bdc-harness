@@ -26,6 +26,7 @@ import { createHash } from 'crypto';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
 import type { FireEligibilityEvidence } from './fire-eligibility';
 import { WO_ID_RE } from './guard';
+import type { FireLane } from './lane-budget';
 import { canonicalizeThreadRef } from './thread-ref';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
@@ -187,7 +188,7 @@ export interface NextActionContext {
   /** Durable tm_suppression row for this thread's canonical ref, if any. */
   suppression?: SuppressionLike;
   fireEligible?: boolean;
-  fireLane?: 'claude' | 'codex' | 'xai' | null;
+  fireLane?: FireLane | null;
   fireHolding?: boolean;
   fireEscalate?: boolean;
   customerP0Exempt?: boolean;

@@ -70,6 +70,30 @@ function successResult(result: string): unknown {
 }
 
 describe('CursorAgentProvider', () => {
+  test('an already cancelled request never launches a writer or delivers its prompt', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let spawned = 0;
+    const { child, writes } = fakeChild({
+      stdout: streamJson([assistantEvent('should not run'), successResult('should not run')]),
+    });
+    const provider = new CursorAgentProvider({
+      spawn: () => {
+        spawned += 1;
+        return child;
+      },
+    });
+    await expect(
+      collect(
+        provider.sendQuery('cancelled work', '/work/tree', undefined, {
+          abortSignal: controller.signal,
+        })
+      )
+    ).rejects.toThrow('Query aborted');
+    expect(spawned).toBe(0);
+    expect(writes).toEqual([]);
+  });
+
   test('spawns cursor-agent with --workspace <cwd> and the configured model; prompt on stdin', async () => {
     let seenArgv: string[] = [];
     let seenCwd = '';

@@ -1902,10 +1902,16 @@ async function persistTerminalWorkflowRun(
     );
     const currentStatus = runResult.rows[0]?.status;
     if (!currentStatus) throw new Error(`Workflow run not found (id: ${id})`);
+    const failedFromPending = status === 'failed' && currentStatus === 'pending';
     const cancellableStatus =
       status === 'cancelled' &&
       ['pending', 'running', 'waiting_provider', 'paused', 'interrupted'].includes(currentStatus);
-    if (currentStatus !== 'running' && currentStatus !== status && !cancellableStatus) {
+    if (
+      currentStatus !== 'running' &&
+      currentStatus !== status &&
+      !cancellableStatus &&
+      !failedFromPending
+    ) {
       throw new Error(
         `terminal_status_conflict: run ${id} is ${currentStatus}, cannot finalize as ${status}`
       );
@@ -1963,7 +1969,7 @@ async function persistTerminalWorkflowRun(
       throw new Error(`terminal_outcome_conflict: newer outcome already exists for run ${id}`);
     }
 
-    if (currentStatus === 'running' || cancellableStatus) {
+    if (currentStatus === 'running' || cancellableStatus || failedFromPending) {
       const updateResult = await query(
         `UPDATE remote_agent_workflow_runs
          SET status = $1, completed_at = ${dialect.now()},
@@ -2073,7 +2079,7 @@ export async function failWorkflowRun(
     result = await pool.query(
       `UPDATE remote_agent_workflow_runs
        SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
-       WHERE id = $1 AND status = 'running'`,
+       WHERE id = $1 AND status IN ('pending','running')`,
       [id, JSON.stringify({ error })]
     );
   } catch (dbError) {
@@ -2083,7 +2089,7 @@ export async function failWorkflowRun(
   }
   if (result.rowCount === 0) {
     getLog().warn({ workflowRunId: id }, 'db.workflow_run_fail_no_match');
-    throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+    throw new Error(`Workflow run not found or not in pending/running state (id: ${id})`);
   }
 }
 

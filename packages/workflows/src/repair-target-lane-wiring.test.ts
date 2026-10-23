@@ -36,6 +36,7 @@ interface LaneNode {
   readonly depends_on?: readonly string[];
   readonly bash?: string;
   readonly prompt?: string;
+  readonly when?: string;
   readonly loop?: { readonly prompt?: string };
 }
 
@@ -124,6 +125,52 @@ describe('repair-target lane wiring', () => {
       expect(commit.bash ?? '', file).toContain('rta_plan_authorizes');
       expect(commit.bash ?? '', file).toContain('PLAN_REVIEW_RAW');
       expect(commit.bash ?? '', file).not.toContain('grep -Eq "repair_target_authorized_by_spec');
+    }
+  });
+
+  it('Test 7: repair-path-hotfix wiring (node-out captures, when-guards, idle timeouts)', () => {
+    for (const file of EXPECTED_LANES) {
+      const yaml = readLane(file);
+      const nodes = nodesOf(file);
+
+      // 1a: exactly two node-out reads of decide-push-target.out and no old decide heredoc.
+      expect(yaml.split('ARCHON_NODE_OUT/decide-push-target.out').length - 1, file).toBe(2);
+      expect(yaml, file).not.toContain('BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET');
+
+      // 1a: commit-and-push reads both node-output files with explicit non-empty fail-closed checks.
+      const commit = nodeOf(nodes, 'commit-and-push', file);
+      const commitBash = commit.bash ?? '';
+      expect(commitBash, file).toContain(
+        'DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"'
+      );
+      expect(commitBash, file).toContain('DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")');
+      expect(commitBash, file).toContain('if [ ! -s "$DECIDE_OUT_FILE" ]; then');
+      expect(commitBash, file).toContain('PLAN_REVIEW_OUT_FILE="$ARCHON_NODE_OUT/plan-review.out"');
+      expect(commitBash, file).toContain('PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")');
+      expect(commitBash, file).toContain('if [ ! -s "$PLAN_REVIEW_OUT_FILE" ]; then');
+
+      // 1f: head-moved guard adopts an ancestor live OID instead of refusing.
+      expect(commitBash, file).toContain(
+        'if git merge-base --is-ancestor "$REPAIR_TARGET_LIVE_OID" HEAD; then'
+      );
+      expect(commitBash, file).toContain('repair_target_head_moved');
+
+      // 1b: plan-review when-guard fails a failed checkout at the real node.
+      const planReview = nodeOf(nodes, 'plan-review', file);
+      expect(planReview.when ?? '', file).toContain("$checkout-repair-target.output != ''");
+
+      // 1d: patch-pr-body when-guard requires an open PR.
+      const patch = nodeOf(nodes, 'patch-pr-body', file);
+      expect(patch.when ?? '', file).toContain("$open-pr-if-needed.output != ''");
+
+      // 1c: implement idle_timeout only on cursor and grok (diff-repair already carries one,
+      // so those two lanes have exactly two occurrences of idle_timeout: 570000).
+      if (
+        file === 'bdc-feature-development-cursor.yaml' ||
+        file === 'bdc-feature-development-grok.yaml'
+      ) {
+        expect(yaml.split('idle_timeout: 570000').length - 1, file).toBe(2);
+      }
     }
   });
 
