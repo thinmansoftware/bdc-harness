@@ -15929,6 +15929,54 @@ describe('v2 binding-only preparation', () => {
     }
   });
 
+  for (const kind of ['prompt', 'command']) {
+    for (const replacedField of ['systemPrompt', 'allowed_tools']) {
+      it(`ordinary ${kind} preserves pre-registry capture when ${replacedField} is replaced`, async () => {
+        await persona('Registry timing role.');
+        await writeFile(join(cwd, '.archon', 'commands', 'registry-timing.md'), 'Command body.');
+        const originalAllowedTools: string[] = [];
+        const selectedNode = {
+          id: 'work',
+          persona: 'owned',
+          systemPrompt: 'Before registry.',
+          allowed_tools: originalAllowedTools,
+          ...(kind === 'command' ? { command: 'registry-timing' } : { prompt: 'Work.' }),
+        } as DagNode;
+        workflow.nodes = [selectedNode];
+        const realLoad = agentRegistry.loadAgentRegistry;
+        const loader = spyOn(agentRegistry, 'loadAgentRegistry').mockImplementation(
+          async directory => {
+            expect(deps.getAgentProvider).not.toHaveBeenCalled();
+            const registry = await realLoad(directory);
+            if (replacedField === 'systemPrompt') selectedNode.systemPrompt = 'After registry.';
+            else selectedNode.allowed_tools = undefined;
+            return registry;
+          }
+        );
+        try {
+          await run();
+          expect(loader).toHaveBeenCalledTimes(1);
+          expect(captured).toHaveBeenCalledTimes(1);
+          const nodeConfig = options().nodeConfig as Record<string, unknown>;
+          expect(options().systemPrompt).toBe('Registry timing role.\n\nBefore registry.');
+          expect(nodeConfig.systemPrompt).toBe('Registry timing role.\n\nBefore registry.');
+          expect(nodeConfig.allowed_tools).toEqual([]);
+          expect(nodeConfig.allowed_tools).toBe(originalAllowedTools);
+          expect(selectedNode.systemPrompt).toBe(
+            replacedField === 'systemPrompt' ? 'After registry.' : 'Before registry.'
+          );
+          expect(selectedNode.allowed_tools).toBe(
+            replacedField === 'allowed_tools' ? undefined : originalAllowedTools
+          );
+        } finally {
+          loader.mockRestore();
+          selectedNode.systemPrompt = 'Before registry.';
+          selectedNode.allowed_tools = originalAllowedTools;
+        }
+      });
+    }
+  }
+
   it('leaves missing and same-provider quota targets as wait without preparation attempts', async () => {
     for (const failover of [undefined, 'codex']) {
       workflow.nodes = [{ id: 'work', prompt: 'Work.', failover_provider: failover }];

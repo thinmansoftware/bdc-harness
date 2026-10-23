@@ -1730,6 +1730,11 @@ interface DagNodeBindingInput {
   kind: 'prompt' | 'loop' | 'selected-loop';
   // Ordinary loops capture options before the awaited persona-registry read.
   loopOptions?: SendQueryOptions;
+  // Ordinary prompt/command fields are captured before awaiting the registry.
+  promptFields?: {
+    systemPrompt: string | undefined;
+    allowedTools: string[] | undefined;
+  };
 }
 
 interface DagBindingBase {
@@ -1833,8 +1838,12 @@ function resolveDagPromptPersonaBinding(
   const { node, workflowProvider, workflowModel, modelOverride } = input;
   const { provider, model, assistantModels } = base;
   let effectiveModel = model;
-  let effectiveSystemPrompt = node.systemPrompt;
-  let effectiveAllowedTools = node.allowed_tools;
+  const promptFields = input.promptFields ?? {
+    systemPrompt: node.systemPrompt,
+    allowedTools: node.allowed_tools,
+  };
+  let effectiveSystemPrompt = promptFields.systemPrompt;
+  let effectiveAllowedTools = promptFields.allowedTools;
   if (persona) {
     // A per-node override owns the binding completely. It must not be rejected
     // because the persona pins a different provider's model, or because a
@@ -2201,6 +2210,12 @@ async function resolveNodeProviderAndModel(
   // The persona's model overrides the node-resolved model; its system prompt is
   // prepended to any node-level systemPrompt; its tools list (if present) is
   // used as allowed_tools (node-level allowed_tools take precedence if set).
+  if (!preparedBinding) {
+    bindingInput.promptFields = {
+      systemPrompt: node.systemPrompt,
+      allowedTools: node.allowed_tools,
+    };
+  }
   const nodeAgentRef = node as { agent?: string; persona?: string };
   const agentName = nodeAgentRef.agent ?? nodeAgentRef.persona;
   const persona = preparedBinding
