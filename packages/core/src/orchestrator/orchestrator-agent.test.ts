@@ -153,8 +153,9 @@ mock.module('../config/config-loader', () => ({
   loadConfig: mockLoadConfig,
 }));
 
+const mockGenerateAndSetTitle = mock(() => Promise.resolve());
 mock.module('../services/title-generator', () => ({
-  generateAndSetTitle: mock(() => Promise.resolve()),
+  generateAndSetTitle: mockGenerateAndSetTitle,
 }));
 
 const mockDispatchBackgroundWorkflow = mock(() => Promise.resolve());
@@ -1376,6 +1377,8 @@ describe('natural-language approval routing', () => {
   }
 
   beforeEach(() => {
+    mockGenerateAndSetTitle.mockClear();
+    mockLogger.error.mockClear();
     mockGetPausedWorkflowRun.mockReset();
     mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(null));
     mockCreateWorkflowEvent.mockReset();
@@ -1527,12 +1530,494 @@ describe('natural-language approval routing', () => {
     );
   });
 
+  describe('UNKNOWN paused-route boundary', () => {
+    const privateInput = 'owned persisted payload must not escape';
+
+    function prepareUnknown(result: unknown) {
+      const conversation = makeConversation({ title: null, codebase_id: null });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(result));
+      for (const effect of [
+        mockGenerateAndSetTitle,
+        mockNaturalApprovalUpdate,
+        mockCreateWorkflowEvent,
+        mockGetCodebase,
+        mockListCodebases,
+        mockDiscoverWorkflowsWithConfig,
+        mockSyncWorkspace,
+        mockValidateAndResolveIsolation,
+        mockLaunchSession,
+        mockFindResumableRunByParentConversation,
+        mockExecuteWorkflow,
+        mockDispatchBackgroundWorkflow,
+        mockSendQuery,
+        mockHandleCommand,
+        mockUpdateConversation,
+      ])
+        effect.mockClear();
+      return makePlatform();
+    }
+
+    function expectStopped(platform: IPlatformAdapter) {
+      // Conversation lookup/creation already happened before this boundary.
+      expect(mockGetOrCreateConversation).toHaveBeenCalledWith(
+        'web',
+        'conv-1',
+        undefined,
+        undefined
+      );
+      expect(mockGetPausedWorkflowRun).toHaveBeenCalledTimes(1);
+      for (const effect of [
+        mockGenerateAndSetTitle,
+        mockNaturalApprovalUpdate,
+        mockCreateWorkflowEvent,
+        mockGetCodebase,
+        mockListCodebases,
+        mockDiscoverWorkflowsWithConfig,
+        mockSyncWorkspace,
+        mockValidateAndResolveIsolation,
+        mockLaunchSession,
+        mockFindResumableRunByParentConversation,
+        mockExecuteWorkflow,
+        mockDispatchBackgroundWorkflow,
+        mockSendQuery,
+        mockHandleCommand,
+        mockUpdateConversation,
+      ])
+        expect(effect).not.toHaveBeenCalled();
+      expect(platform.sendMessage).toHaveBeenCalledWith(
+        'conv-1',
+        'Error: Paused workflow continuation could not be verified'
+      );
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conversationId: 'conv-1',
+          err: expect.objectContaining({
+            message: 'Paused workflow continuation could not be verified',
+          }),
+        }),
+        'orchestrator_message_failed'
+      );
+      for (const [fields] of mockLogger.error.mock.calls) {
+        const error = (fields as { err?: Error }).err;
+        if (error) {
+          expect(error.message).not.toContain(privateInput);
+          expect(error.cause).toBeUndefined();
+        }
+        expect(JSON.stringify(fields)).not.toContain(privateInput);
+      }
+      expect(
+        JSON.stringify((platform.sendMessage as ReturnType<typeof mock>).mock.calls)
+      ).not.toContain(privateInput);
+    }
+
+    for (const [label, result] of [
+      ['undefined', undefined],
+      ['false', false],
+      ['zero', 0],
+      ['string', privateInput],
+      ['array', []],
+      ['missing workflow name', { id: 'run-1', metadata: {} }],
+      ['nonstring workflow name', makePausedRun({ workflow_name: 123 })],
+      ['missing used ID', { workflow_name: 'prd', metadata: {} }],
+      ['nonstring used ID', makePausedRun({ id: 123 })],
+      ['string metadata', makePausedRun({ metadata: privateInput })],
+      ['false metadata', makePausedRun({ metadata: false })],
+      ['zero metadata', makePausedRun({ metadata: 0 })],
+      ['array metadata', makePausedRun({ metadata: [] })],
+    ] as const) {
+      test('stops ' + label + ' before title and continuation effects', async () => {
+        const platform = prepareUnknown(result);
+        await handleMessage(platform, 'conv-1', 'owned continuation request');
+        expectStopped(platform);
+      });
+    }
+
+    test('stops a rejected lookup without leaking its native cause', async () => {
+      const platform = prepareUnknown(null);
+      mockGetPausedWorkflowRun.mockReset();
+      mockGetPausedWorkflowRun.mockRejectedValueOnce(
+        new Error(privateInput, { cause: { metadata: privateInput } })
+      );
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expectStopped(platform);
+    });
+
+    for (const field of ['workflow_name', 'id', 'metadata'] as const) {
+      test('stops throwing ' + field + ' evaluation before title', async () => {
+        const run = makePausedRun();
+        Object.defineProperty(run, field, {
+          get() {
+            throw new Error(privateInput);
+          },
+        });
+        const platform = prepareUnknown(run);
+        await handleMessage(platform, 'conv-1', 'owned continuation request');
+        expectStopped(platform);
+      });
+    }
+
+    test('stops unreadable marker presence before title', async () => {
+      const metadata = new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor() {
+            throw new Error(privateInput);
+          },
+        }
+      );
+      const platform = prepareUnknown(makePausedRun({ metadata }));
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expectStopped(platform);
+    });
+
+    for (const field of ['approval', 'nodeId', 'type', 'captureResponse'] as const) {
+      test('stops throwing approval ' + field + ' evaluation before title', async () => {
+        const approval = { nodeId: 'gate-1' };
+        const metadata = { approval };
+        Object.defineProperty(field === 'approval' ? metadata : approval, field, {
+          get() {
+            throw new Error(privateInput);
+          },
+        });
+        const platform = prepareUnknown(makePausedRun({ metadata }));
+        await handleMessage(platform, 'conv-1', 'owned continuation request');
+        expectStopped(platform);
+      });
+    }
+
+    test('notification failure cannot restart title or continuation work', async () => {
+      const platform = prepareUnknown(undefined);
+      platform.sendMessage = mock(() => Promise.reject(new Error('owned send failure')));
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expectStopped(platform);
+      expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ conversationId: 'conv-1' }),
+        'error_notification_failed'
+      );
+    });
+
+    test('awaits successful actual null before launching the existing title and normal response', async () => {
+      const platform = prepareUnknown(null);
+      let releaseLookup!: (value: unknown) => void;
+      let enteredLookup!: () => void;
+      const lookupEntered = new Promise<void>(resolve => {
+        enteredLookup = resolve;
+      });
+      const lookup = new Promise<unknown>(resolve => {
+        releaseLookup = resolve;
+      });
+      mockGetPausedWorkflowRun.mockReset();
+      mockGetPausedWorkflowRun.mockImplementationOnce(() => {
+        enteredLookup();
+        return lookup;
+      });
+      const pending = handleMessage(platform, 'conv-1', 'owned normal request');
+      await lookupEntered;
+      expect(mockGenerateAndSetTitle).not.toHaveBeenCalled();
+      expect(mockSendQuery).not.toHaveBeenCalled();
+      releaseLookup(null);
+      await pending;
+      expect(mockGenerateAndSetTitle).toHaveBeenCalledWith(
+        'conv-1',
+        'owned normal request',
+        'claude',
+        '/home/test/.archon/workspaces'
+      );
+      expect(mockSendQuery).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'test response');
+      expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+      expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+    });
+
+    for (const metadata of [null, undefined, {}]) {
+      test(
+        'keeps ordinary missing-context guidance with metadata ' + String(metadata),
+        async () => {
+          const platform = prepareUnknown(makePausedRun({ metadata }));
+          await handleMessage(platform, 'conv-1', 'owned continuation request');
+          expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+          expect(platform.sendMessage).toHaveBeenCalledWith(
+            'conv-1',
+            'A workflow is paused but its approval context is missing. ' +
+              'Use `/workflow approve run-1` or `/workflow reject run-1`.'
+          );
+          expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+          expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+          expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+          expect(mockSendQuery).not.toHaveBeenCalled();
+        }
+      );
+    }
+
+    test('keeps an ordinary empty string run ID usable for guidance', async () => {
+      const platform = prepareUnknown(makePausedRun({ id: '', metadata: {} }));
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledWith(
+        'conv-1',
+        'A workflow is paused but its approval context is missing. ' +
+          'Use `/workflow approve ` or `/workflow reject `.'
+      );
+    });
+
+    test('keeps an untitled slash command outside paused lookup and title generation', async () => {
+      const platform = prepareUnknown(undefined);
+      mockParseCommand.mockReturnValueOnce({ command: 'status', args: [] });
+      mockHandleCommand.mockReturnValueOnce(
+        Promise.resolve({ success: true, message: 'owned status response', workflow: undefined })
+      );
+      await handleMessage(platform, 'conv-1', '/status');
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'owned status response');
+      expect(mockHandleCommand).toHaveBeenCalledTimes(1);
+      expect(mockGetPausedWorkflowRun).not.toHaveBeenCalled();
+      expect(mockGenerateAndSetTitle).not.toHaveBeenCalled();
+    });
+
+    test('keeps captured standard approval payloads with empty string run and node IDs', async () => {
+      const platform = prepareUnknown(
+        makePausedRun({
+          id: '',
+          metadata: { approval: { nodeId: '', captureResponse: true } },
+        })
+      );
+      await handleMessage(platform, 'conv-1', 'owned captured approval');
+      expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(2);
+      expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(1, {
+        workflow_run_id: '',
+        event_type: 'node_completed',
+        step_name: '',
+        data: { node_output: 'owned captured approval', approval_decision: 'approved' },
+      });
+      expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(2, {
+        workflow_run_id: '',
+        event_type: 'approval_received',
+        step_name: '',
+        data: { decision: 'approved', comment: 'owned captured approval' },
+      });
+      expect(mockNaturalApprovalUpdate).toHaveBeenCalledWith('', {
+        status: 'failed',
+        metadata: { approval_response: 'approved', rejection_reason: '', rejection_count: 0 },
+      });
+    });
+
+    test('does not evaluate unused captureResponse for interactive loop approval', async () => {
+      const approval = { nodeId: 'loop-1', type: 'interactive_loop' };
+      const readUnusedCapture = mock(() => {
+        throw new Error(privateInput);
+      });
+      Object.defineProperty(approval, 'captureResponse', { get: readUnusedCapture });
+      const platform = prepareUnknown(makePausedRun({ metadata: { approval } }));
+      await handleMessage(platform, 'conv-1', 'owned next loop input');
+      expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+      expect(readUnusedCapture).not.toHaveBeenCalled();
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(1);
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
+        workflow_run_id: 'run-1',
+        event_type: 'approval_received',
+        step_name: 'loop-1',
+        data: { decision: 'approved', comment: 'owned next loop input' },
+      });
+      expect(mockNaturalApprovalUpdate).toHaveBeenCalledWith('run-1', {
+        status: 'failed',
+        metadata: { loop_user_input: 'owned next loop input' },
+      });
+    });
+
+    test('does not treat an inherited marker as an own restriction', async () => {
+      const metadata = Object.create({ codex_only_dispatch: null });
+      const platform = prepareUnknown(makePausedRun({ metadata }));
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledWith(
+        'conv-1',
+        'A workflow is paused but its approval context is missing. ' +
+          'Use `/workflow approve run-1` or `/workflow reject run-1`.'
+      );
+      expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+      expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+    });
+
+    describe('classified field snapshots', () => {
+      for (const field of ['id', 'workflow_name'] as const) {
+        for (const laterRead of ['throws', 'changes'] as const) {
+          test('uses first ' + field + ' when a later read ' + laterRead, async () => {
+            const first = field === 'id' ? 'run-1' : 'prd';
+            const run = makePausedRun();
+            let reads = 0;
+            Object.defineProperty(run, field, {
+              get() {
+                reads++;
+                if (reads === 1) return first;
+                if (laterRead === 'throws') throw new Error(privateInput);
+                return field === 'id' ? 'unclassified-run' : 'unclassified-workflow';
+              },
+            });
+            const platform = prepareUnknown(run);
+            mockLogger.info.mockClear();
+            mockGetOrCreateConversation.mockReset();
+            mockGetOrCreateConversation.mockResolvedValueOnce(
+              makeConversation({
+                title: null,
+                codebase_id: 'codebase-1',
+                cwd: '/repos/test-repo',
+              })
+            );
+            mockGetCodebase.mockImplementation(() => Promise.resolve(makeApprovalCodebase()));
+            mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+              Promise.resolve({
+                workflows: [{ workflow: approvalWorkflow }],
+                errors: [],
+              })
+            );
+
+            await handleMessage(platform, 'conv-1', 'owned snapshot approval');
+
+            expect(reads).toBe(1);
+            expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+            expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(2);
+            expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(1, {
+              workflow_run_id: 'run-1',
+              event_type: 'node_completed',
+              step_name: 'gate-1',
+              data: { node_output: '', approval_decision: 'approved' },
+            });
+            expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(2, {
+              workflow_run_id: 'run-1',
+              event_type: 'approval_received',
+              step_name: 'gate-1',
+              data: { decision: 'approved', comment: 'owned snapshot approval' },
+            });
+            expect(mockNaturalApprovalUpdate).toHaveBeenCalledWith('run-1', {
+              status: 'failed',
+              metadata: { approval_response: 'approved', rejection_reason: '', rejection_count: 0 },
+            });
+            expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+            expect(mockExecuteWorkflow.mock.calls[0][4]).toBe(approvalWorkflow);
+            expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', ' Resuming **prd**...');
+            expect(mockLogger.info).toHaveBeenCalledWith(
+              {
+                conversationId: 'conv-1',
+                workflowRunId: 'run-1',
+                nodeId: 'gate-1',
+                workflowName: 'prd',
+              },
+              'orchestrator.natural_language_approval_started'
+            );
+            expect(mockLogger.info).toHaveBeenCalledWith(
+              { conversationId: 'conv-1', workflowRunId: 'run-1', workflowName: 'prd' },
+              'orchestrator.natural_language_approval_completed'
+            );
+            expect(mockLogger.error).not.toHaveBeenCalled();
+          });
+        }
+      }
+
+      test('uses the first run ID in missing approval guidance', async () => {
+        const run = makePausedRun({ metadata: {} });
+        let reads = 0;
+        Object.defineProperty(run, 'id', {
+          get() {
+            if (++reads === 1) return 'run-1';
+            throw new Error(privateInput);
+          },
+        });
+        const platform = prepareUnknown(run);
+        await handleMessage(platform, 'conv-1', 'owned snapshot guidance');
+        expect(reads).toBe(1);
+        expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+        expect(platform.sendMessage).toHaveBeenCalledWith(
+          'conv-1',
+          'A workflow is paused but its approval context is missing. ' +
+            'Use `/workflow approve run-1` or `/workflow reject run-1`.'
+        );
+        expect(mockLogger.error).not.toHaveBeenCalled();
+        expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+      });
+
+      test('uses the first run ID in existing approval failure logging and guidance', async () => {
+        const run = makePausedRun();
+        let reads = 0;
+        Object.defineProperty(run, 'id', {
+          get() {
+            return ++reads === 1 ? 'run-1' : 'unclassified-run';
+          },
+        });
+        const platform = prepareUnknown(run);
+        mockCreateWorkflowEvent.mockRejectedValueOnce(new Error('owned event failure'));
+        await handleMessage(platform, 'conv-1', 'owned snapshot error guidance');
+        expect(reads).toBe(1);
+        expect(platform.sendMessage).toHaveBeenCalledWith(
+          'conv-1',
+          'Approval failed: owned event failure. Try again or use `/workflow approve run-1` explicitly.'
+        );
+        expect(mockLogger.error).toHaveBeenCalledWith(
+          expect.objectContaining({ workflowRunId: 'run-1', conversationId: 'conv-1' }),
+          'orchestrator.natural_language_approval_failed'
+        );
+        expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+        expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+      });
+
+      for (const restrictedBy of ['reserved name', 'own marker'] as const) {
+        test('does not consume the unused ID for ' + restrictedBy, async () => {
+          const run = makePausedRun(
+            restrictedBy === 'reserved name'
+              ? { workflow_name: 'bdc-feature-development-codex-only' }
+              : { metadata: { codex_only_dispatch: undefined } }
+          );
+          const readId = mock(() => {
+            throw new Error(privateInput);
+          });
+          Object.defineProperty(run, 'id', { get: readId });
+          const platform = prepareUnknown(run);
+          await handleMessage(platform, 'conv-1', 'owned restricted snapshot');
+          expect(readId).not.toHaveBeenCalled();
+          expect(platform.sendMessage).toHaveBeenCalledWith(
+            'conv-1',
+            'Codex-only continuation is not available; the paused run was left unchanged.'
+          );
+          expect(mockGenerateAndSetTitle).not.toHaveBeenCalled();
+          expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+          expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+          expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+          expect(mockLogger.error).not.toHaveBeenCalled();
+        });
+      }
+    });
+
+    test('refuses an own marker without evaluating its value', async () => {
+      const metadata = {};
+      const readMarker = mock(() => {
+        throw new Error(privateInput);
+      });
+      Object.defineProperty(metadata, 'codex_only_dispatch', { get: readMarker });
+      const platform = prepareUnknown(makePausedRun({ metadata }));
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expect(platform.sendMessage).toHaveBeenCalledWith(
+        'conv-1',
+        'Codex-only continuation is not available; the paused run was left unchanged.'
+      );
+      expect(readMarker).not.toHaveBeenCalled();
+      expect(mockGenerateAndSetTitle).not.toHaveBeenCalled();
+      expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+      expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    });
+  });
+
   describe('binding-v2 natural-language continuation closed gate', () => {
     const reserved = 'bdc-feature-development-codex-only';
     const refusal = 'Codex-only continuation is not available; the paused run was left unchanged.';
 
     function prepare(run: ReturnType<typeof makePausedRun>) {
-      const conversation = makeConversation({ codebase_id: 'codebase-1', cwd: '/repos/test-repo' });
+      const conversation = makeConversation({
+        codebase_id: 'codebase-1',
+        cwd: '/repos/test-repo',
+        title: null,
+      });
       mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
       mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(run));
       mockGetCodebase.mockImplementation(() => Promise.resolve(makeApprovalCodebase()));
@@ -1543,6 +2028,7 @@ describe('natural-language approval routing', () => {
         })
       );
       for (const effect of [
+        mockGenerateAndSetTitle,
         mockNaturalApprovalUpdate,
         mockCreateWorkflowEvent,
         mockGetCodebase,
@@ -1564,6 +2050,7 @@ describe('natural-language approval routing', () => {
 
     function expectNoApprovalWork() {
       for (const effect of [
+        mockGenerateAndSetTitle,
         mockNaturalApprovalUpdate,
         mockCreateWorkflowEvent,
         mockGetCodebase,
