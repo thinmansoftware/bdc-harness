@@ -496,6 +496,60 @@ function withAcceptedExchange(
 }
 
 describe('dynamic lane offline admission scenarios', () => {
+  test.each([
+    ['excluded', 1000],
+    ['excluded', null],
+    ['allowlisted', 1000],
+    ['allowlisted', null],
+  ] as const)(
+    'legacy monthly affordability ignores an %s alternative with cost %s',
+    (authorization, alternativeCost) => {
+      for (const reverse of [false, true]) {
+        const input = clone();
+        input.candidates[1]!.nextStepCost = alternativeCost;
+        if (authorization === 'excluded') input.candidateAllowlist = ['codex-plan'];
+        if (reverse) input.candidates.reverse();
+        input.budget.limit = 2000;
+        input.accounts.forEach(account => (account.limit = 2000));
+        if (input.monthlyBudgetPolicy?.mode !== 'limited')
+          throw new Error('Expected limited fixture');
+        Object.assign(input.monthlyBudgetPolicy, { limit: 8, spend: 2, commitments: 1 });
+        const ready = withAcceptedExchange(input);
+        ready.jevExchange!.distribution = { 'codex-plan': 0.95, abstain: 0.05 };
+        const out = evaluateDynamicLane(ready);
+        expect(out.decision).toBe('propose');
+        expect(out.proposedBinding?.candidateId).toBe('codex-plan');
+        expect(out.eligibleCandidateIds).toEqual(['codex-plan']);
+        expect(out.candidateRejections['codex-plan']).toEqual([]);
+        expect(out.candidateRejections['claude-plan']).toContain(
+          alternativeCost === null ? 'cost_unknown' : 'monthly_budget_exhausted'
+        );
+        if (authorization === 'excluded')
+          expect(out.candidateRejections['claude-plan']).toContain('candidate_not_authorized');
+        expect(out.request?.question.options.map(option => option.optionId)).toEqual([
+          'codex-plan',
+          'abstain',
+        ]);
+      }
+    }
+  );
+
+  test.each([7, 8])('legacy monthly limit %i includes spend, commitments and allowances', limit => {
+    const input = clone();
+    if (input.monthlyBudgetPolicy?.mode !== 'limited') throw new Error('Expected limited fixture');
+    Object.assign(input.monthlyBudgetPolicy, { limit, spend: 2, commitments: 1 });
+    const out = evaluateDynamicLane(withAcceptedExchange(input));
+    if (limit === 8) expect(out.decision).toBe('propose');
+    else {
+      expect(out.proposedBinding).toBeNull();
+      expect(out.request).toBeNull();
+      for (const candidate of input.candidates)
+        expect(out.candidateRejections[candidate.candidateId]).toContain(
+          'monthly_budget_exhausted'
+        );
+    }
+  });
+
   test('legacy router evidence binds the candidate account', () => {
     const input = clone();
     input.legacyRoutingEvidence!.accountId = 'codex';

@@ -467,6 +467,7 @@ function evaluateLegacyDynamicLane(
   const semantic = snapshot.taskBrief;
   const objective = snapshot.roleObjective;
   const evidence = snapshot.decisionEvidence;
+  const monthly = snapshot.monthlyBudgetPolicy;
   // Legacy allowance and evidenced estimate must never lower one another's reservation.
   // The v4 gates-only caller accounts for its separate decision routes after worker admission.
   const routerCallAllowance =
@@ -505,27 +506,12 @@ function evaluateLegacyDynamicLane(
       !atOrBefore(snapshot.priorDecisions.availableAt, snapshot.evaluationTime)
     )
       globalReasons.push('prior_decision_ledger_missing');
-    const monthly = snapshot.monthlyBudgetPolicy;
     if (
       !monthly ||
       !atOrBefore(monthly.effectiveFrom, snapshot.evaluationTime) ||
       atOrBefore(monthly.effectiveUntil, snapshot.evaluationTime)
     )
       globalReasons.push('monthly_budget_policy_missing_or_expired');
-    else if (
-      monthly.mode === 'limited' &&
-      snapshot.candidates.some(
-        c =>
-          c.nextStepCost === null ||
-          monthly.spend +
-            monthly.commitments +
-            (c.nextStepCost ?? 0) +
-            (routerCallAllowance ?? 0) +
-            snapshot.budget.verificationAllowance >
-            monthly.limit
-      )
-    )
-      globalReasons.push('monthly_budget_exhausted');
   }
   if (snapshot.cancelled) globalReasons.push('cancelled');
   if (snapshot.paused) globalReasons.push('paused_for_human');
@@ -642,6 +628,13 @@ function evaluateLegacyDynamicLane(
       reasons.push('cost_unknown');
     else {
       const total = candidate.nextStepCost + routerCallAllowance;
+      if (
+        !gatesOnly &&
+        monthly?.mode === 'limited' &&
+        monthly.spend + monthly.commitments + snapshot.budget.verificationAllowance + total >
+          monthly.limit
+      )
+        reasons.push('monthly_budget_exhausted');
       if (
         snapshot.budget.spend +
           snapshot.budget.commitments +
