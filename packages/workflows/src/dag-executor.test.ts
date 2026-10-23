@@ -3,6 +3,7 @@ import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
+import * as agentRegistry from './agents/registry';
 
 const isWindows = process.platform === 'win32';
 
@@ -40,7 +41,7 @@ mock.module('@archon/persona-context-loader', () => ({
 }));
 
 // --- Bootstrap provider registry (after path mocks, before dag-executor import) ---
-import { registerBuiltinProviders, clearRegistry } from '@archon/providers';
+import { registerBuiltinProviders, registerProviderAlias, clearRegistry } from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
 
@@ -50,6 +51,9 @@ import {
   checkTriggerRule,
   substituteNodeOutputRefs,
   executeDagWorkflow,
+  prepareDagBindings,
+  type DagBindingWorkflow,
+  type PreparedDagBindings,
   clearAgentRegistryCache,
   clearPendingGateResults,
   recordGateResult,
@@ -15221,5 +15225,715 @@ describe('cancel-poll interval cleanup (WO-HARNESS-SILENT-NODE-DETECTION-01)', (
       if (prev === undefined) delete process.env.ARCHON_NODE_CANCEL_POLL_MS;
       else process.env.ARCHON_NODE_CANCEL_POLL_MS = prev;
     }
+  });
+});
+
+describe('v2 binding-only preparation', () => {
+  let cwd: string;
+  let deps: WorkflowDeps;
+  let platform: IWorkflowPlatform;
+  let config: WorkflowConfig;
+  let workflow: DagBindingWorkflow;
+  const captured = mock(async function* () {
+    yield { type: 'assistant' as const, content: '<promise>COMPLETE</promise>' };
+    yield { type: 'result' as const, sessionId: 'binding-only-fake-transport' };
+  });
+
+  beforeEach(async () => {
+    cwd = join(tmpdir(), `dag-binding-v2-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(cwd, '.archon', 'agents'), { recursive: true });
+    await mkdir(join(cwd, '.archon', 'commands'), { recursive: true });
+    await mkdir(join(cwd, 'artifacts'), { recursive: true });
+    await mkdir(join(cwd, 'logs'), { recursive: true });
+    clearAgentRegistryCache();
+    captured.mockClear();
+    mockLoadContext.mockClear();
+    mockLogFn.mockClear();
+    deps = createMockDeps();
+    deps.getAgentProvider = mock(() => ({
+      sendQuery: captured,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+    platform = createMockPlatform();
+    config = structuredClone(minimalConfig);
+    config.assistants.codex = { model: 'assistant-choice' };
+    workflow = { name: 'binding-component', nodes: [{ id: 'work', prompt: 'Work.' }] };
+  });
+
+  afterEach(async () => {
+    clearAgentRegistryCache();
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  async function persona(body: string, model?: string): Promise<void> {
+    await writeFile(
+      join(cwd, '.archon', 'agents', 'owned.md'),
+      `---\nname: owned\n${model ? `model: ${model}\n` : ''}tools: [Read]\n---\n${body}\n`
+    );
+  }
+
+  function run(
+    handle?: PreparedDagBindings,
+    override?: import('./model-override').ModelOverride,
+    runRecord = makeWorkflowRun()
+  ): Promise<string | undefined> {
+    return executeDagWorkflow(
+      deps,
+      platform,
+      'binding-conversation',
+      cwd,
+      workflow,
+      runRecord,
+      'codex',
+      'workflow-choice',
+      join(cwd, 'artifacts'),
+      join(cwd, 'logs'),
+      'main',
+      'docs/',
+      config,
+      undefined,
+      undefined,
+      undefined,
+      override,
+      handle
+    );
+  }
+
+  function noExecutionEffects(): void {
+    expect(deps.getAgentProvider).not.toHaveBeenCalled();
+    expect(captured).not.toHaveBeenCalled();
+    expect(platform.sendMessage).not.toHaveBeenCalled();
+    expect(mockLoadContext).not.toHaveBeenCalled();
+    for (const method of Object.values(deps.store)) {
+      if (typeof method === 'function') expect(method).not.toHaveBeenCalled();
+    }
+  }
+
+  function options(index = 0): Record<string, unknown> {
+    return (captured.mock.calls as unknown[][])[index][3] as Record<string, unknown>;
+  }
+
+  it('refuses a declared missing persona even with a fresh empty registry and no execution effects', async () => {
+    workflow.nodes = [{ id: 'work', prompt: 'Work.', persona: 'missing' }];
+    await expect(
+      prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config)
+    ).rejects.toThrow('agent_not_found');
+    noExecutionEffects();
+  });
+
+  for (const forbidden of ['claude', 'codex-native-strict']) {
+    it(`refuses a false conditional branch declaring ${forbidden}`, async () => {
+      workflow.nodes = [
+        { id: 'hidden', prompt: 'Never fire.', when: 'false', provider: forbidden },
+      ];
+      await expect(
+        prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config)
+      ).rejects.toThrow('codex');
+      noExecutionEffects();
+    });
+  }
+
+  it('refuses forbidden workflow and failover declarations even when node overrides resolve to codex', async () => {
+    workflow.nodes = [
+      { id: 'work', prompt: 'Work.', provider: 'codex', failover_provider: 'claude' },
+    ];
+    await expect(prepareDagBindings(cwd, workflow, 'codex', undefined, config)).rejects.toThrow(
+      'codex'
+    );
+    workflow.nodes = [{ id: 'work', prompt: 'Work.', provider: 'codex' }];
+    await expect(
+      prepareDagBindings(cwd, workflow, 'codex-native-strict', undefined, config)
+    ).rejects.toThrow('codex');
+    noExecutionEffects();
+  });
+
+  for (const drift of [
+    'cwd',
+    'node',
+    'config',
+    'override',
+    'workflow-provider',
+    'workflow-model',
+    'own-undefined',
+  ]) {
+    it(`refuses ${drift} drift before lease reads, writes, messages or providers`, async () => {
+      const override = { nodes: { work: { provider: 'codex', model: 'override-choice' } } };
+      const prepared = await prepareDagBindings(
+        cwd,
+        workflow,
+        'codex',
+        'workflow-choice',
+        config,
+        override
+      );
+      const originalCwd = cwd;
+      if (drift === 'cwd') cwd = join(cwd, 'other');
+      if (drift === 'node') workflow.nodes[0].model = 'changed';
+      if (drift === 'config') config.assistants.codex.model = 'changed';
+      if (drift === 'override') override.nodes.work.model = 'changed';
+      if (drift === 'own-undefined') workflow.nodes[0].systemPrompt = undefined;
+      try {
+        const promise =
+          drift === 'workflow-provider' || drift === 'workflow-model'
+            ? executeDagWorkflow(
+                deps,
+                platform,
+                'binding-conversation',
+                cwd,
+                workflow,
+                makeWorkflowRun(),
+                drift === 'workflow-provider' ? 'claude' : 'codex',
+                drift === 'workflow-model' ? undefined : 'workflow-choice',
+                join(cwd, 'artifacts'),
+                join(cwd, 'logs'),
+                'main',
+                'docs/',
+                config,
+                undefined,
+                undefined,
+                undefined,
+                override,
+                prepared
+              )
+            : run(prepared, override);
+        await expect(promise).rejects.toThrow('prepared');
+        noExecutionEffects();
+      } finally {
+        cwd = originalCwd;
+      }
+    });
+  }
+
+  it('rejects fabricated and copied opaque handles before lease', async () => {
+    const prepared = await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
+    for (const forged of [{}, { ...prepared }]) {
+      await expect(run(forged as PreparedDagBindings)).rejects.toThrow('prepared');
+    }
+    noExecutionEffects();
+    expect(Object.isFrozen(prepared)).toBe(true);
+    expect(Object.keys(prepared)).toEqual([]);
+  });
+
+  it('uses a fresh snapshot despite ordinary stale cache and consumes it after disk changes', async () => {
+    workflow.nodes = [{ id: 'work', prompt: 'Work.', persona: 'owned' }];
+    await persona('STALE ordinary persona.');
+    await run();
+    expect(options().systemPrompt).toContain('STALE ordinary persona.');
+    await persona('FRESH prepared persona.');
+    const prepared = await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
+    await persona('LATER separate invocation.');
+    await run(prepared);
+    expect(options(1).systemPrompt).toContain('FRESH prepared persona.');
+    const later = await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
+    await run(later);
+    expect(options(2).systemPrompt).toContain('LATER separate invocation.');
+    await run();
+    expect(options(3).systemPrompt).toContain('STALE ordinary persona.');
+    expect(deps.getAgentProvider).toHaveBeenCalledTimes(4);
+    expect(deps.getAgentProvider).toHaveBeenCalledWith('codex');
+  });
+
+  for (const kind of ['prompt', 'command', 'loop']) {
+    it(`preserves ${kind} model, own-property options and declared telemetry through actual execution`, async () => {
+      await persona('Owned role.');
+      await writeFile(join(cwd, '.archon', 'commands', 'owned-task.md'), 'Command body.');
+      workflow = {
+        name: 'binding-component',
+        effort: 'high',
+        nodes: [
+          {
+            id: 'work',
+            persona: 'owned',
+            model: 'node-choice',
+            systemPrompt: 'Node role.',
+            ...(kind === 'loop'
+              ? { loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 } }
+              : kind === 'command'
+                ? { command: 'owned-task' }
+                : { prompt: 'Work.' }),
+          } as DagNode,
+        ],
+      };
+      const override = { nodes: { work: { provider: 'codex', model: 'override-choice' } } };
+      const prepared = await prepareDagBindings(
+        cwd,
+        workflow,
+        'codex',
+        'workflow-choice',
+        config,
+        override
+      );
+      noExecutionEffects();
+      await run(prepared, override);
+      expect(captured).toHaveBeenCalledTimes(1);
+      expect(options().model).toBe(kind === 'loop' ? undefined : 'override-choice');
+      expect(Object.hasOwn(options(), 'model')).toBe(true);
+      expect(options().systemPrompt).toBe('Owned role.\n\nNode role.');
+      const nodeConfig = options().nodeConfig as Record<string, unknown>;
+      expect(nodeConfig.effort).toBe('high');
+      expect(nodeConfig.allowed_tools).toEqual(kind === 'loop' ? undefined : ['Read']);
+      expect(options().assistantConfig).toEqual({ model: 'assistant-choice' });
+      expect(mockLoadContext).not.toHaveBeenCalled();
+      expect(deps.store.createWorkflowEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event_type: 'node_completed',
+          step_name: 'work',
+          data: expect.objectContaining({
+            declared_model_id: 'override-choice',
+            ...(kind === 'loop' ? {} : { requested_model_id: 'override-choice' }),
+          }),
+        })
+      );
+      expect(deps.getAgentProvider).toHaveBeenCalledWith('codex');
+    });
+  }
+
+  it('preserves prompt override-aware persona handling but rejects loop persona model pins', async () => {
+    await persona('Pinned role.', 'opus');
+    const override = { nodes: { work: { provider: 'codex', model: 'override-choice' } } };
+    workflow.nodes = [{ id: 'work', prompt: 'Work.', persona: 'owned' }];
+    const prepared = await prepareDagBindings(
+      cwd,
+      workflow,
+      'codex',
+      'workflow-choice',
+      config,
+      override
+    );
+    await run(prepared, override);
+    expect(options().model).toBe('override-choice');
+    workflow.nodes = [
+      {
+        id: 'work',
+        persona: 'owned',
+        loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 },
+      },
+    ];
+    await expect(
+      prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config, override)
+    ).rejects.toThrow("must not declare 'model:'");
+  });
+
+  it('prepares approval rejection using synthetic ID overrides and workflow defaults without inheriting gate persona', async () => {
+    workflow.nodes = [
+      {
+        id: 'gate',
+        persona: 'missing',
+        approval: {
+          message: 'Approve?',
+          on_reject: { prompt: 'Fix $rejection_reason', max_attempts: 2 },
+        },
+      } as DagNode,
+    ];
+    const override = {
+      nodes: { 'gate:on_reject': { provider: 'codex', model: 'rejection-choice' } },
+    };
+    const prepared = await prepareDagBindings(
+      cwd,
+      workflow,
+      'codex',
+      'workflow-choice',
+      config,
+      override
+    );
+    noExecutionEffects();
+    await run(
+      prepared,
+      override,
+      makeWorkflowRun('reject-binding-run', {
+        metadata: {
+          approval: { type: 'approval', nodeId: 'gate', message: 'Approve?' },
+          rejection_reason: 'Change it.',
+        },
+      })
+    );
+    expect(captured).toHaveBeenCalledTimes(1);
+    expect(options().model).toBe('rejection-choice');
+    expect(options().systemPrompt).toBeUndefined();
+    expect(deps.getAgentProvider).toHaveBeenCalledWith('codex');
+  });
+
+  it('loads one fresh registry for all branches and does not rerun binding diagnostics or load context until execution', async () => {
+    await writeFile(
+      join(cwd, '.archon', 'agents', 'owned.md'),
+      '---\nname: owned\ntools: [Read]\ncontext:\n  oracle:\n    - owned-test-query\n---\nPrivate role.\n'
+    );
+    workflow.nodes = [
+      { id: 'work', prompt: 'Work.', persona: 'owned' },
+      {
+        id: 'loop-work',
+        depends_on: ['work'],
+        persona: 'owned',
+        loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 },
+      },
+    ];
+    const diagnostics = (tag: string): number =>
+      (mockLogFn.mock.calls as unknown[][]).filter(call => call[1] === tag).length;
+    const prepared = await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
+    expect(diagnostics('agent.registry_loaded')).toBe(1);
+    expect(diagnostics('agent.resolved')).toBe(2);
+    noExecutionEffects();
+    // Malformed later files would make any hidden registry reload fail.
+    await writeFile(join(cwd, '.archon', 'agents', 'broken.md'), 'malformed');
+    await run(prepared);
+    expect(captured).toHaveBeenCalledTimes(2);
+    expect(diagnostics('agent.registry_loaded')).toBe(1);
+    expect(diagnostics('agent.resolved')).toBe(2);
+    expect(mockLoadContext).toHaveBeenCalledTimes(1);
+    expect(options().systemPrompt).toBe('WIKI+ORACLE CONTEXT BLOCK\n\nPrivate role.');
+    expect(options(1).systemPrompt).toBe('Private role.');
+    expect(
+      mockLogFn.mock.calls
+        .flat()
+        .some(value => typeof value === 'string' && value.includes('Private role.'))
+    ).toBe(false);
+  });
+
+  it('owns execution input copies across caller mutation during the lease read', async () => {
+    workflow.nodes = [{ id: 'work', prompt: 'Original task.', model: 'original-model' }];
+    config.envVars = { OWNED_TEST_VALUE: 'original-value' };
+    const prepared = await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
+    (deps.store.getRunAuthority as Mock<() => Promise<null>>).mockImplementation(async () => {
+      workflow.nodes[0].model = 'caller-mutation';
+      (workflow.nodes[0] as { prompt: string }).prompt = 'Changed task.';
+      config.envVars!.OWNED_TEST_VALUE = 'changed-value';
+      return null;
+    });
+    await run(prepared);
+    expect(options().model).toBe('original-model');
+    expect(options().env).toEqual({ OWNED_TEST_VALUE: 'original-value' });
+    expect((captured.mock.calls as unknown[][])[0][0]).toContain('Original task.');
+    expect((captured.mock.calls as unknown[][])[0][0]).not.toContain('Changed task.');
+  });
+
+  it('separates a real synthetic-looking node from the approval rejection binding', async () => {
+    workflow.nodes = [
+      { id: 'gate:on_reject', prompt: 'Real node.', model: 'real-node-choice' },
+      {
+        id: 'gate',
+        depends_on: ['gate:on_reject'],
+        approval: {
+          message: 'Approve?',
+          on_reject: { prompt: 'Rejection task.' },
+        },
+      },
+    ];
+    const prepared = await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
+    await run(
+      prepared,
+      undefined,
+      makeWorkflowRun('collision-run', {
+        metadata: {
+          approval: { type: 'approval', nodeId: 'gate', message: 'Approve?' },
+          rejection_reason: 'Fix.',
+        },
+      })
+    );
+    expect(captured).toHaveBeenCalledTimes(2);
+    expect(options().model).toBe('real-node-choice');
+    expect(options(1).model).toBe('workflow-choice');
+  });
+
+  it('preserves absent model properties and explicit empty tool restrictions', async () => {
+    await persona('Owned role.');
+    workflow.nodes = [{ id: 'work', prompt: 'Work.', persona: 'owned', allowed_tools: [] }];
+    const prepared = await prepareDagBindings(cwd, workflow, 'codex', undefined, config);
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'no-model',
+      cwd,
+      workflow,
+      makeWorkflowRun(),
+      'codex',
+      undefined,
+      join(cwd, 'artifacts'),
+      join(cwd, 'logs'),
+      'main',
+      'docs/',
+      config,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      prepared
+    );
+    expect(Object.hasOwn(options(), 'model')).toBe(false);
+    expect((options().nodeConfig as Record<string, unknown>).allowed_tools).toEqual([]);
+    expect(options().assistantConfig).toEqual({ model: 'assistant-choice' });
+  });
+
+  for (const kind of ['prompt', 'loop']) {
+    for (const withOverride of [false, true]) {
+      it(`ordinary ${kind} availability failover preserves selected model asymmetry with override=${withOverride}`, async () => {
+        workflow.nodes = [
+          {
+            id: 'work',
+            provider: 'claude',
+            model: 'primary-node-choice',
+            failover_provider: 'codex',
+            ...(kind === 'loop'
+              ? { loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 } }
+              : { prompt: 'Work.', retry: { max_attempts: 1, delay_ms: 1000 } }),
+          } as DagNode,
+        ];
+        let queryCalls = 0;
+        const transport = mock(async function* () {
+          if (queryCalls++ === 0) throw new Error('network connection lost');
+          yield { type: 'assistant' as const, content: '<promise>COMPLETE</promise>' };
+          yield { type: 'result' as const, sessionId: 'ordinary-failover-fake' };
+        });
+        deps.getAgentProvider = mock((provider: string) => ({
+          sendQuery: transport,
+          getType: () => provider,
+          getCapabilities: mockClaudeCapabilities,
+        }));
+        await executeDagWorkflow(
+          deps,
+          platform,
+          'ordinary-failover',
+          cwd,
+          workflow,
+          makeWorkflowRun(),
+          'claude',
+          'workflow-choice',
+          join(cwd, 'artifacts'),
+          join(cwd, 'logs'),
+          'main',
+          'docs/',
+          config,
+          undefined,
+          undefined,
+          undefined,
+          withOverride
+            ? { nodes: { work: { provider: 'claude', model: 'primary-override' } } }
+            : undefined
+        );
+        expect(transport).toHaveBeenCalledTimes(2);
+        const secondOptions = (transport.mock.calls as unknown[][]).at(-1)![3] as Record<
+          string,
+          unknown
+        >;
+        expect(secondOptions.model).toBe(
+          kind === 'prompt' && withOverride ? 'primary-override' : 'assistant-choice'
+        );
+        const factoryCalls = (deps.getAgentProvider as Mock<(provider: string) => unknown>).mock
+          .calls;
+        expect(factoryCalls.map(call => call[0])).toEqual([
+          'claude',
+          kind === 'prompt' && withOverride ? 'claude' : 'codex',
+        ]);
+        expect(deps.store.createWorkflowEvent).toHaveBeenCalledWith(
+          expect.objectContaining({ event_type: 'node_failover' })
+        );
+      });
+    }
+  }
+
+  for (const kind of ['prompt', 'loop']) {
+    for (const failover of [undefined, 'codex']) {
+      it(`prepared ${kind} quota exhaustion with target=${String(failover)} waits without a failover factory call`, async () => {
+        workflow.nodes = [
+          {
+            id: 'work',
+            failover_provider: failover,
+            ...(kind === 'loop'
+              ? { loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 } }
+              : { prompt: 'Work.' }),
+          } as DagNode,
+        ];
+        const transport = mock(async function* () {
+          yield {
+            type: 'result' as const,
+            sessionId: 'quota-fake',
+            isError: true,
+            errorSubtype: 'rate_limit_error',
+            errors: ['quota exhausted; resets later'],
+            tokens: { input: 0, output: 0, total: 0 },
+            cost: 0,
+          };
+        });
+        deps.getAgentProvider = mock(() => ({
+          sendQuery: transport,
+          getType: () => 'codex',
+          getCapabilities: mockCodexCapabilities,
+        }));
+        (deps.store.scheduleProviderWait as Mock<() => Promise<boolean>>).mockResolvedValue(true);
+        (deps.store.upsertRunOutcome as Mock<() => Promise<boolean>>).mockResolvedValue(true);
+        const prepared = await prepareDagBindings(
+          cwd,
+          workflow,
+          'codex',
+          'workflow-choice',
+          config
+        );
+        noExecutionEffects();
+        await run(prepared);
+        expect(transport).toHaveBeenCalledTimes(1);
+        expect(deps.getAgentProvider).toHaveBeenCalledTimes(1);
+        expect(deps.store.scheduleProviderWait).toHaveBeenCalledWith(
+          expect.objectContaining({ provider: 'codex', reasonCode: 'provider_quota_wait' })
+        );
+        const events = (deps.store.createWorkflowEvent as Mock<() => Promise<void>>).mock
+          .calls as unknown[][];
+        expect(
+          events.some(call => (call[0] as { event_type: string }).event_type === 'node_failover')
+        ).toBe(false);
+      });
+    }
+  }
+
+  it('ordinary prompt completes assistant lookup and canonicalization after context loading', async () => {
+    const alias = 'binding-timing-alias';
+    registerProviderAlias(alias, 'codex');
+    await writeFile(
+      join(cwd, '.archon', 'agents', 'owned.md'),
+      '---\nname: owned\ncontext:\n  oracle:\n    - timing-test\n---\nTiming role.'
+    );
+    workflow.nodes = [{ id: 'work', prompt: 'Work.', provider: alias, persona: 'owned' }];
+    config.assistants[alias] = { model: 'before-context' };
+    config.envVars = { TIMING_OPTION: 'before-context' };
+    const beforeContextConfig = structuredClone(config);
+    mockLoadContext.mockImplementation(async () => {
+      expect(
+        (mockLogFn.mock.calls as unknown[][]).filter(call => call[1] === 'agent.resolved')
+      ).toHaveLength(1);
+      config.envVars = { TIMING_OPTION: 'after-context' };
+      config.assistants[alias] = { model: 'after-context' };
+      clearRegistry();
+      registerBuiltinProviders();
+      registerProviderAlias(alias, 'claude');
+      return 'TIMING CONTEXT';
+    });
+    try {
+      await run();
+      expect(captured).toHaveBeenCalledTimes(1);
+      expect(options().model).toBe('before-context');
+      expect(options().assistantConfig).toEqual({ model: 'after-context' });
+      expect(options().env).toEqual({ TIMING_OPTION: 'after-context' });
+      expect(
+        (mockLogFn.mock.calls as unknown[][]).filter(call => call[1] === 'agent.resolved')
+      ).toHaveLength(1);
+      expect((options().nodeConfig as Record<string, unknown>).systemPrompt).toBe(
+        'TIMING CONTEXT\n\nTiming role.'
+      );
+      expect(deps.getAgentProvider).toHaveBeenCalledWith('claude');
+      expect(options().systemPrompt).toBe('TIMING CONTEXT\n\nTiming role.');
+    } finally {
+      config = beforeContextConfig;
+      mockLoadContext.mockImplementation(() => Promise.resolve('WIKI+ORACLE CONTEXT BLOCK'));
+      clearRegistry();
+      registerBuiltinProviders();
+    }
+  });
+
+  it('ordinary loop captures static options after factory construction but before awaited registry resolution', async () => {
+    await persona('Loop timing role.');
+    workflow.nodes = [
+      {
+        id: 'work',
+        persona: 'owned',
+        loop: { prompt: 'Loop.', until: 'COMPLETE', max_iterations: 1 },
+      },
+    ];
+    config.envVars = { LOOP_OPTION: 'before-registry' };
+    const realLoad = agentRegistry.loadAgentRegistry;
+    const loader = spyOn(agentRegistry, 'loadAgentRegistry').mockImplementation(async directory => {
+      expect(deps.getAgentProvider).toHaveBeenCalledTimes(1);
+      const registry = await realLoad(directory);
+      config.assistants.codex = { model: 'after-registry' };
+      config.envVars = { LOOP_OPTION: 'after-registry' };
+      return registry;
+    });
+    try {
+      await run();
+      expect(captured).toHaveBeenCalledTimes(1);
+      expect(options().assistantConfig).toEqual({ model: 'assistant-choice' });
+      expect(options().env).toEqual({ LOOP_OPTION: 'before-registry' });
+      expect(options().model).toBeUndefined();
+      expect(Object.hasOwn(options(), 'model')).toBe(true);
+    } finally {
+      loader.mockRestore();
+    }
+  });
+
+  it('retries a prepared prompt using its selected binding without rereading a changed persona', async () => {
+    await persona('Retry selected role.');
+    workflow.nodes = [{ id: 'work', prompt: 'Work.', persona: 'owned' }];
+    const prepared = await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
+    let attempts = 0;
+    const retryTransport = mock(async function* () {
+      if (attempts++ === 0) {
+        await persona('Changed incompatible role.', 'opus');
+        yield {
+          type: 'result' as const,
+          isError: true,
+          errorSubtype: 'success',
+          errors: ['validator rejected response'],
+          tokens: { input: 1, output: 1, total: 2 },
+          cost: 0.01,
+        };
+        return;
+      }
+      yield { type: 'assistant' as const, content: 'Completed work.' };
+      yield { type: 'result' as const, sessionId: 'retry-fake' };
+    });
+    deps.getAgentProvider = mock(() => ({
+      sendQuery: retryTransport,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    }));
+    await run(prepared);
+    expect(retryTransport).toHaveBeenCalledTimes(2);
+    for (const call of retryTransport.mock.calls as unknown[][]) {
+      expect((call[3] as Record<string, unknown>).model).toBe('workflow-choice');
+      expect((call[3] as Record<string, unknown>).systemPrompt).toBe('Retry selected role.');
+    }
+    expect(
+      (mockLogFn.mock.calls as unknown[][]).filter(call => call[1] === 'agent.resolved')
+    ).toHaveLength(1);
+    expect(deps.store.completeWorkflowRun).toHaveBeenCalled();
+  });
+
+  it('prepared context decoration retains captured options and isolates transport mutations from later use', async () => {
+    await writeFile(
+      join(cwd, '.archon', 'agents', 'owned.md'),
+      '---\nname: owned\ncontext:\n  oracle:\n    - owned-test-query\n---\nCaptured role.'
+    );
+    workflow.nodes = [{ id: 'work', prompt: 'Work.', persona: 'owned' }];
+    config.envVars = { CAPTURED_OPTION: 'captured-value' };
+    const originalConfig = structuredClone(config);
+    const prepared = await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
+    mockLoadContext.mockImplementation(async () => {
+      config.assistants.codex = { model: 'context-mutation' };
+      config.envVars = { CAPTURED_OPTION: 'context-mutation' };
+      return 'CAPTURED CONTEXT';
+    });
+    try {
+      await run(prepared);
+      expect(options().assistantConfig).toEqual({ model: 'assistant-choice' });
+      expect(options().env).toEqual({ CAPTURED_OPTION: 'captured-value' });
+      expect(options().systemPrompt).toBe('CAPTURED CONTEXT\n\nCaptured role.');
+      (options().assistantConfig as Record<string, unknown>).model = 'transport-mutation';
+      (options().nodeConfig as Record<string, unknown>).systemPrompt = 'transport-mutation';
+      config = structuredClone(originalConfig);
+      await run(prepared);
+      expect(options(1).assistantConfig).toEqual({ model: 'assistant-choice' });
+      expect((options(1).nodeConfig as Record<string, unknown>).systemPrompt).toBe(
+        'CAPTURED CONTEXT\n\nCaptured role.'
+      );
+    } finally {
+      config = originalConfig;
+      mockLoadContext.mockImplementation(() => Promise.resolve('WIKI+ORACLE CONTEXT BLOCK'));
+    }
+  });
+
+  it('leaves missing and same-provider quota targets as wait without preparation attempts', async () => {
+    for (const failover of [undefined, 'codex']) {
+      workflow.nodes = [{ id: 'work', prompt: 'Work.', failover_provider: failover }];
+      await prepareDagBindings(cwd, workflow, 'codex', 'workflow-choice', config);
+    }
+    noExecutionEffects();
   });
 });
