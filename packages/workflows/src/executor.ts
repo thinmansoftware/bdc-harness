@@ -511,13 +511,25 @@ export async function resolveExecutorLane(opts: {
 
 const CODEX_ONLY_WORKFLOW_NAME = 'bdc-feature-development-codex-only';
 
-function isCodexOnlyRun(run: WorkflowRun | null | undefined): boolean {
-  return (
-    run !== null &&
-    run !== undefined &&
-    (run.workflow_name === CODEX_ONLY_WORKFLOW_NAME ||
-      Object.prototype.hasOwnProperty.call(run.metadata ?? {}, 'codex_only_dispatch'))
-  );
+function isCodexOnlyRun(run: WorkflowRun): boolean {
+  if (run === null || typeof run !== 'object' || Array.isArray(run)) {
+    throw new Error('Unreadable workflow continuation');
+  }
+  if (typeof run.workflow_name !== 'string') {
+    throw new Error('Unreadable workflow continuation');
+  }
+  if (run.workflow_name === CODEX_ONLY_WORKFLOW_NAME) return true;
+  const metadata: unknown = run.metadata;
+  if (metadata !== null && metadata !== undefined) {
+    if (typeof metadata !== 'object' || Array.isArray(metadata)) {
+      throw new Error('Unreadable workflow continuation');
+    }
+    if (Object.prototype.hasOwnProperty.call(metadata, 'codex_only_dispatch')) return true;
+  }
+  if (typeof run.id !== 'string') {
+    throw new Error('Unreadable workflow continuation');
+  }
+  return false;
 }
 
 /**
@@ -559,8 +571,17 @@ export async function executeWorkflow(
   modelOverride?: ModelOverride
 ): Promise<WorkflowExecutionResult> {
   // Never strip a persisted restriction through a generic provider-wait/recovery entry.
-  if (isCodexOnlyRun(preCreatedRun)) {
-    return { success: false, error: 'codex_only_resume_unsupported' };
+  let isProviderWait = false;
+  try {
+    if (preCreatedRun !== undefined) {
+      if (isCodexOnlyRun(preCreatedRun)) {
+        return { success: false, error: 'codex_only_resume_unsupported' };
+      }
+      isProviderWait = preCreatedRun.status === 'waiting_provider';
+    }
+  } catch {
+    getLog().error({}, 'workflow.continuation_classification_failed');
+    return { success: false, error: 'Unable to read workflow continuation' };
   }
   // Keep this reserved lane closed until full v2 binding and strict transport are enforced.
   if (workflow.name === CODEX_ONLY_WORKFLOW_NAME) {
@@ -608,9 +629,28 @@ export async function executeWorkflow(
   // not rediscover by path: another historical failed row may exist on the same
   // worktree. The status transition is a DB compare-and-swap, so cancellation
   // that wins before this point cannot be resurrected by a late wake callback.
-  if (preCreatedRun?.status === 'waiting_provider') {
-    dagPriorCompletedNodes = await deps.store.getCompletedDagNodeOutputs(preCreatedRun.id);
-    workflowRun = await deps.store.resumeWorkflowRun(preCreatedRun.id);
+  if (isProviderWait && preCreatedRun !== undefined) {
+    try {
+      dagPriorCompletedNodes = await deps.store.getCompletedDagNodeOutputs(preCreatedRun.id);
+      if (
+        !(dagPriorCompletedNodes instanceof Map) ||
+        typeof dagPriorCompletedNodes.size !== 'number'
+      ) {
+        throw new Error('Unreadable completed workflow outputs');
+      }
+    } catch {
+      getLog().error({}, 'workflow.dag_resume_node_outputs_failed');
+      return { success: false, error: 'Unable to read prior workflow outputs' };
+    }
+    try {
+      workflowRun = await deps.store.resumeWorkflowRun(preCreatedRun.id);
+    } catch {
+      getLog().error({}, 'workflow.provider_wait_resume_failed');
+      return {
+        success: false,
+        error: 'Could not confirm workflow resume; write outcome is uncertain',
+      };
+    }
     getLog().info(
       {
         workflowRunId: workflowRun.id,
@@ -618,65 +658,39 @@ export async function executeWorkflow(
       },
       'workflow.provider_wait_resuming'
     );
-  }
-
-  // Resume detection: check for prior failed run on same workflow + worktree
-  {
-    // Step 1: Find prior failed run -- non-critical, fall through on DB error
+  } else {
+    // Resume detection: actual null alone permits the ordinary fresh-run path.
     let resumableRun: Awaited<ReturnType<typeof deps.store.findResumableRun>> = null;
     try {
       resumableRun = await deps.store.findResumableRun(workflow.name, cwd);
-    } catch (error) {
-      const err = error as Error;
-      getLog().error(
-        { err, workflowName: workflow.name, cwd, errorType: err.constructor.name },
-        'workflow_resume_check_failed'
-      );
-      // Non-critical: fall through to create a new run; notify user so they know resume was skipped
-      // (workflowName is already captured in the warn log above for correlation)
-      await safeSendMessage(
-        platform,
-        conversationId,
-        '! Could not check for a prior run to resume (database error). Starting a fresh run instead.'
-      );
-    }
-
-    // Presence, including malformed/unknown markers, refuses before output/activation fallback.
-    if (isCodexOnlyRun(resumableRun)) {
-      return { success: false, error: 'codex_only_resume_unsupported' };
+      // Presence, including unknown markers, refuses before output or activation.
+      if (resumableRun !== null && isCodexOnlyRun(resumableRun)) {
+        return { success: false, error: 'codex_only_resume_unsupported' };
+      }
+    } catch {
+      getLog().error({}, 'workflow_resume_check_failed');
+      return { success: false, error: 'Unable to read workflow continuation' };
     }
 
     // Step 2: Activate the resume -- propagate as error if this fails
-    if (resumableRun) {
+    if (resumableRun !== null) {
       // Load completed node outputs from the prior run's events.
       let priorNodes: Map<string, string>;
+      let hasInteractiveLoopState: unknown;
       try {
         priorNodes = await deps.store.getCompletedDagNodeOutputs(resumableRun.id);
-      } catch (error) {
-        const err = error as Error;
-        getLog().warn(
-          {
-            err,
-            workflowName: workflow.name,
-            resumableRunId: resumableRun.id,
-            errorType: err.constructor.name,
-          },
-          'workflow.dag_resume_node_outputs_failed'
-        );
-        // Intentional: fall back to empty map (fresh start) if prior node outputs can't be loaded.
-        // getCompletedDagNodeOutputs threw unexpectedly -- safe to degrade rather than abort the run.
-        priorNodes = new Map();
-        await safeSendMessage(
-          platform,
-          conversationId,
-          '! Could not load prior node outputs for resume (database error). Starting a fresh run instead.'
-        );
+        if (!(priorNodes instanceof Map) || typeof priorNodes.size !== 'number') {
+          throw new Error('Unreadable completed workflow outputs');
+        }
+        hasInteractiveLoopState =
+          resumableRun.metadata?.approval &&
+          (resumableRun.metadata.approval as Record<string, unknown>).type === 'interactive_loop';
+      } catch {
+        getLog().error({}, 'workflow.dag_resume_node_outputs_failed');
+        return { success: false, error: 'Unable to read prior workflow outputs' };
       }
       // Resume if there are completed nodes OR if the run has interactive loop state
       // (a paused interactive loop may have no completed nodes yet -- just the loop itself pausing)
-      const hasInteractiveLoopState =
-        resumableRun.metadata?.approval &&
-        (resumableRun.metadata.approval as Record<string, unknown>).type === 'interactive_loop';
       if (priorNodes.size > 0 || hasInteractiveLoopState) {
         try {
           // Capture the orphan BEFORE replacing workflowRun. The orchestrator's
