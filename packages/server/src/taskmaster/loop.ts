@@ -2566,6 +2566,12 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             admittedAt: permission.admittedAt,
             runIds: admitted.attempts.flatMap(attempt => (attempt.runId ? [attempt.runId] : [])),
           });
+          // Settlement persists the admission-based deadline. Read it back before
+          // registering immutable supervision, including the crash/recovery path.
+          const settledJournal = await dal.getActionByIdempotencyKey(reservation.actionKey);
+          if (settledJournal?.id !== journalRow.id || settledJournal.outcome !== 'pending')
+            throw new Error('automatic_fire_settled_journal_unavailable');
+          journalRow = settledJournal;
           if (!(await reconcilePendingFire(journalRow, dal, readFireEvidence))) continue;
           unconfirmedFireReservations -= 1;
         } catch {

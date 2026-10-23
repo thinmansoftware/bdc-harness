@@ -1881,6 +1881,151 @@ describe('pending fire custody', () => {
     return { deps, fires: () => fires };
   }
 
+  test.each([false, true])(
+    'delayed admission shares its durable deadline with supervision (crash=%s)',
+    async crashAfterRegistration => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const native = new SqliteAdapter(':memory:');
+      await native.query("UPDATE tm_control SET pause_state='RUNNING',epoch=$1 WHERE id=1", [
+        world.control.epoch,
+      ]);
+      const budget: NonNullable<TaskmasterDeps['fireBudget']> = {
+        reserveAutomaticFire: input => fireBudgetDb.reserveAutomaticFire(input, native),
+        authorizeAutomaticFire: input => fireBudgetDb.authorizeAutomaticFire(input, native),
+        releaseAutomaticFire: input => fireBudgetDb.releaseAutomaticFire(input, native),
+        settleAutomaticFire: input => fireBudgetDb.settleAutomaticFire(input, native),
+        seedAutomaticFireHistory: input => fireBudgetDb.seedAutomaticFireHistory(input, native),
+        listAutomaticFireAdmissions: () => fireBudgetDb.listAutomaticFireAdmissions(native),
+        updateAutomaticFireExpectation: input =>
+          fireBudgetDb.updateAutomaticFireExpectation(input, native),
+      };
+      const fixture = setup(world, { fireBudget: budget });
+      const dal = fixture.deps.db!;
+      let interrupted = false;
+      fixture.deps.db = {
+        ...dal,
+        recordAction: async data => {
+          const row = await dal.recordAction(data);
+          await native.query(
+            `INSERT INTO tm_journal
+          (id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at,proof_deadline_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
+              row.id,
+              row.thread_ref,
+              row.action_type,
+              row.proposal_json,
+              row.idempotency_key,
+              row.outcome,
+              row.created_at,
+              row.proof_deadline_at,
+            ]
+          );
+          return row;
+        },
+        getActionByIdempotencyKey: async key =>
+          (
+            await native.query<TmJournalEntry>(
+              'SELECT * FROM tm_journal WHERE idempotency_key=$1',
+              [key]
+            )
+          ).rows[0] ?? null,
+        listPendingFireActions: async () =>
+          (
+            await native.query<TmJournalEntry>(
+              "SELECT * FROM tm_journal WHERE action_type='fire_cauldron' AND outcome='pending'"
+            )
+          ).rows,
+        registerExpectation: async data => {
+          const key = expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
+          // Match production idempotency: an existing expectation's deadline is retained.
+          await native.query(
+            `INSERT INTO tm_expectations
+          (id,registration_key,dispatch_ref,recipient,evidence_json,due_at,on_absence,max_retries,
+           retries,status,registered_by,self_supervised,created_at,updated_at)
+          VALUES ($1,$1,$2,$3,$4,$5,$6,$7,0,'pending','taskmaster',0,$8,$8)
+          ON CONFLICT(registration_key) DO NOTHING`,
+            [
+              key,
+              data.dispatch_ref,
+              data.recipient,
+              data.evidence_json,
+              data.due_at,
+              data.on_absence,
+              data.max_retries,
+              new Date(world.nowMs).toISOString(),
+            ]
+          );
+          return key;
+        },
+        getExpectationByRegistrationKey: async key =>
+          (
+            await native.query<TmExpectation>(
+              'SELECT * FROM tm_expectations WHERE registration_key=$1',
+              [key]
+            )
+          ).rows[0] ?? null,
+        transitionPendingFireAction: async (id, expected, outcome, proposal) => {
+          if (crashAfterRegistration && outcome === 'sent' && !interrupted) {
+            interrupted = true;
+            return false; // Crash boundary: supervision persisted, journal still pending.
+          }
+          const result = await native.query(
+            `UPDATE tm_journal SET outcome=$1,proposal_json=$2
+          WHERE id=$3 AND outcome='pending' AND proposal_json=$4`,
+            [outcome, proposal, id, expected]
+          );
+          if (result.rowCount)
+            await dal.transitionPendingFireAction!(id, expected, outcome, proposal);
+          return result.rowCount === 1;
+        },
+      };
+      fixture.deps.runCascade = async options => {
+        world.nowMs += 45 * 60_000; // Async preflight finishes well after journal creation.
+        const permission = await options.beforeAdmission!();
+        const record = {
+          cascadeId: options.dispatchId!,
+          woId: options.woId,
+          project: options.project,
+          automaticFireAdmission: permission,
+          status: 'running',
+          attempts: [{ runId: 'actual-delayed-workflow' }],
+        } as Awaited<ReturnType<NonNullable<TaskmasterDeps['runCascade']>>>;
+        options.onAdmission?.(record, true);
+        return record;
+      };
+      try {
+        await tick(createTaskmasterState(60_000), fixture.deps);
+        const row = (
+          await native.query<TmJournalEntry>(
+            "SELECT * FROM tm_journal WHERE action_type='fire_cauldron'"
+          )
+        ).rows[0]!;
+        const expectation = (await native.query<TmExpectation>('SELECT * FROM tm_expectations'))
+          .rows[0]!;
+        const correctDue = new Date(world.nowMs + 86_400_000).toISOString();
+        expect(row.proof_deadline_at).toBe(correctDue);
+        expect(expectation.due_at).toBe(correctDue);
+        expect(row.outcome).toBe(crashAfterRegistration ? 'pending' : 'sent');
+        if (crashAfterRegistration) {
+          fixture.deps.listThreads = async () => []; // Recover custody without proposing new work.
+          await tick(createTaskmasterState(60_000), fixture.deps);
+          const recovered = (
+            await native.query<TmJournalEntry>('SELECT * FROM tm_journal WHERE id=$1', [row.id])
+          ).rows[0]!;
+          expect(recovered.outcome).toBe('sent');
+          expect((await native.query('SELECT * FROM tm_expectations')).rows).toHaveLength(1);
+          expect(
+            (await native.query<TmExpectation>('SELECT * FROM tm_expectations')).rows[0]!.due_at
+          ).toBe(correctDue);
+        }
+      } finally {
+        await native.close();
+      }
+    }
+  );
+
   test('admission without a proven workflow stays pending across later ticks and buckets', async () => {
     const world = makeWorld();
     seedDigestSent(world);

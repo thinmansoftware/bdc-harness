@@ -129,6 +129,25 @@ exact-head review remain required. Original recorder EPERM and earlier PostgreSQ
 failure evidence remain historical facts; these tests do not establish an EPERM
 cause or production readiness.
 
+## Independent review deadline correction (2026-10-23)
+
+Independent Codex review of b8aa135f9 returned CHANGES_REQUIRED for one P2:
+settlement persists permission-time plus24hours, but immediate supervision used
+the in-memory proposal-time deadline. Delayed admission could escalate early;
+a crash after expectation registration could leave restart custody unable to
+match the persisted journal and immutable expectation deadlines.
+
+The loop now rereads the same journal identity after settlement and before
+supervision. Missing or changed pending custody fails closed. The existing
+expectation registration/readback/conditional-transition protocol is retained.
+A shared SQLite journal, admission ledger and expectation store reproduces both
+normal and registration-before-transition crash cases: RED0/2/4assertions,
+thenGREEN2/0/9assertions. Full Taskmaster/cap regression528/0/1966 across17files.
+Filtered runs are targeted red/green diagnostics only; the full suite is unfiltered.
+No schema, admission-limit, provider, credential, recorder or runtime change.
+Fresh candidate CI and reviewer follow-through remain separate requirements;
+b8aa CI and its CHANGES_REQUIRED report are retained as historical evidence.
+
 ## Verification
 
 From a clean checkout with existing dependencies:
