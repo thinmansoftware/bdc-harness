@@ -261,7 +261,7 @@ const dynamicLaneSnapshotStructuralSchema = z.object({
     nodeProvider: z.string().optional(),
     nodeModel: z.string().optional(),
     personaModel: z.string().optional(),
-    assistantModels: z.record(z.string()).optional(),
+    assistantModels: identifierRecord(z.string()).optional(),
     operatorBinding: z.object({ provider: nonblank, model: nonblank }).nullable(),
   }),
   accounts: z.array(accountSchema).superRefine((accounts, ctx) => {
@@ -577,6 +577,10 @@ function evaluateLegacyDynamicLane(
     (actualNodeModel && snapshot.modelResolution.nodeModel && actualNodeModel !== nodeModel)
   )
     globalReasons.push('node_resolution_facts_mismatch');
+  const assistantModels: Record<string, string> = Object.assign(
+    Object.create(null),
+    snapshot.modelResolution.assistantModels
+  );
   const resolved = resolveModelForNode({
     nodeId: snapshot.nodeId,
     workflowProvider: snapshot.modelResolution.workflowProvider,
@@ -584,8 +588,12 @@ function evaluateLegacyDynamicLane(
     nodeProvider,
     nodeModel,
     personaModel: snapshot.modelResolution.personaModel,
-    assistantModels: snapshot.modelResolution.assistantModels,
+    assistantModels,
   });
+  const assistantModel =
+    resolved.provider !== snapshot.modelResolution.workflowProvider
+      ? assistantModels[resolved.provider]
+      : undefined;
   const required = deriveNodeExecutionRequirements(snapshot.node);
   const accounts = new Map(snapshot.accounts.map(account => [account.accountId, account]));
   const profiles = new Map(
@@ -612,7 +620,9 @@ function evaluateLegacyDynamicLane(
       reasons.push('resolved_provider_mismatch');
     if (
       !binding &&
-      (snapshot.modelResolution.personaModel || nodeModel) &&
+      (snapshot.modelResolution.personaModel !== undefined ||
+        nodeModel !== undefined ||
+        assistantModel !== undefined) &&
       candidate.model !== resolved.model
     )
       reasons.push('resolved_model_mismatch');

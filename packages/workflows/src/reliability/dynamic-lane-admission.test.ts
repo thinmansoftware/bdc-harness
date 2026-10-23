@@ -58,6 +58,90 @@ function withHaikuDecision(input: DynamicLaneV4Snapshot, routeIndex = 0): Dynami
 }
 
 describe('model-neutral Haiku offline v4', () => {
+  test.each(['v3', 'v4'] as const)('%s enforces the applicable assistant model pin', version => {
+    const input = version === 'v3' ? clone() : v4();
+    input.modelResolution.workflowProvider = 'claude';
+    input.modelResolution.nodeProvider = 'codex';
+    input.modelResolution.assistantModels = { codex: 'gpt-alternate' };
+    input.candidates.push({
+      ...input.candidates[0]!,
+      candidateId: 'codex-alternate',
+      model: 'gpt-alternate',
+    });
+    input.candidateProfiles!.push({
+      ...input.candidateProfiles![0]!,
+      candidateId: 'codex-alternate',
+    });
+    input.candidateAllowlist.push('codex-alternate');
+    const wrongInput =
+      input.schemaVersion === 'dynamic-lane-snapshot/v4'
+        ? withHaikuDecision(input)
+        : withAcceptedExchange(input);
+    if (wrongInput.schemaVersion === 'dynamic-lane-snapshot/v3')
+      wrongInput.jevExchange!.distribution = {
+        'codex-plan': 0.8,
+        'codex-alternate': 0.15,
+        abstain: 0.05,
+      };
+    const wrongChoice = evaluateDynamicLane(wrongInput);
+    expect(wrongChoice.eligibleCandidateIds).toEqual(['codex-alternate']);
+    expect(wrongChoice.proposedBinding).toBeNull();
+    expect(wrongChoice.candidateRejections['codex-plan']).toContain('resolved_model_mismatch');
+    input.modelResolution.assistantModels.codex = 'gpt-synthetic';
+    const acceptedInput =
+      input.schemaVersion === 'dynamic-lane-snapshot/v4'
+        ? withHaikuDecision(input)
+        : withAcceptedExchange(input);
+    if (acceptedInput.schemaVersion === 'dynamic-lane-snapshot/v3')
+      acceptedInput.jevExchange!.distribution = { 'codex-plan': 0.95, abstain: 0.05 };
+    const accepted = evaluateDynamicLane(acceptedInput);
+    expect(accepted.decision).toBe('propose');
+    expect(accepted.proposedBinding?.candidateId).toBe('codex-plan');
+    expect(accepted.eligibleCandidateIds).toEqual(['codex-plan']);
+    input.modelResolution.assistantModels.codex = 'unqualified-model';
+    expect(evaluateDynamicLane(input).eligibleCandidateIds).toEqual([]);
+  });
+
+  test.each(['v3', 'v4'] as const)('%s assistant pins follow resolver precedence', version => {
+    const input = version === 'v3' ? clone() : v4();
+    input.modelResolution.assistantModels = { codex: 'unused-model', claude: 'unused-model' };
+    // The workflow model takes precedence for the workflow's provider.
+    expect(evaluateDynamicLane(input).eligibleCandidateIds).toEqual(['claude-plan', 'codex-plan']);
+    input.modelResolution.workflowProvider = 'claude';
+    input.modelResolution.nodeProvider = 'codex';
+    input.modelResolution.nodeModel = 'gpt-synthetic';
+    expect(evaluateDynamicLane(input).eligibleCandidateIds).toEqual(['codex-plan']);
+    input.modelResolution.nodeModel = 'different-node-model';
+    input.modelResolution.personaModel = 'gpt-synthetic';
+    expect(evaluateDynamicLane(input).eligibleCandidateIds).toEqual(['codex-plan']);
+    input.modelResolution.operatorBinding = { provider: 'claude', model: 'claude-synthetic' };
+    expect(evaluateDynamicLane(input).eligibleCandidateIds).toEqual(['claude-plan']);
+    input.modelResolution.operatorBinding = null;
+    delete input.modelResolution.nodeModel;
+    delete input.modelResolution.personaModel;
+    input.modelResolution.assistantModels = { claude: 'unrelated-provider-model' };
+    expect(evaluateDynamicLane(input).eligibleCandidateIds).toEqual(['codex-plan']);
+  });
+
+  test.each(['__proto__', 'constructor'])(
+    'assistant maps preserve a literal provider key %s without inherited bindings',
+    provider => {
+      for (const input of [clone(), v4()]) {
+        input.modelResolution.workflowProvider = 'claude';
+        input.modelResolution.nodeProvider = provider;
+        input.modelResolution.assistantModels = Object.fromEntries([[provider, 'gpt-synthetic']]);
+        input.candidates.forEach(candidate => (candidate.provider = provider));
+        const parsed = dynamicLaneSnapshotSchema.parse(input);
+        expect(evaluateDynamicLane(parsed).eligibleCandidateIds).toEqual(['codex-plan']);
+        parsed.modelResolution.assistantModels = {};
+        expect(evaluateDynamicLane(parsed).eligibleCandidateIds).toEqual([
+          'claude-plan',
+          'codex-plan',
+        ]);
+      }
+    }
+  );
+
   test.each(['__proto__', 'constructor', 'toString'])(
     'candidate %s preserves eligibility, distribution and rejection evidence',
     candidateId => {
