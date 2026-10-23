@@ -18,6 +18,7 @@ const v4 = (): DynamicLaneV4Snapshot =>
 
 function withHaikuDecision(input: DynamicLaneV4Snapshot, routeIndex = 0): DynamicLaneV4Snapshot {
   const first = evaluateDynamicLane(input);
+  if (!first.requestHash) return input;
   input.decisionExchanges = input.routingResourcePlan
     .slice(0, routeIndex + 1)
     .map((route, index) => ({
@@ -436,7 +437,10 @@ describe('model-neutral Haiku offline v4', () => {
       if (change === 'missing') input.candidates[0]!.reviewerQualification = null;
       if (change === 'wrong-family') input.candidates[0]!.family = 'anthropic';
       if (change === 'artifact') input.reviewTargetHash = 'wrong';
-      expect(evaluateDynamicLane(withHaikuDecision(input)).proposedBinding).toBeNull();
+      const rejected = evaluateDynamicLane(withHaikuDecision(input));
+      expect(rejected.proposedBinding).toBeNull();
+      expect(rejected.normalizedRequest).toBeNull();
+      expect(rejected.disposition).toBe('no_eligible_candidates');
     }
     const valid = v4();
     valid.aiRole = 'independent_review';
