@@ -58,6 +58,103 @@ function withHaikuDecision(input: DynamicLaneV4Snapshot, routeIndex = 0): Dynami
 }
 
 describe('model-neutral Haiku offline v4', () => {
+  test.each(['__proto__', 'constructor', 'toString'])(
+    'candidate %s preserves eligibility, distribution and rejection evidence',
+    candidateId => {
+      for (const input of [clone(), v4()]) {
+        input.candidateAllowlist = [candidateId];
+        input.candidates[0]!.candidateId = candidateId;
+        input.candidateProfiles![0]!.candidateId = candidateId;
+        const distribution = Object.fromEntries([
+          [candidateId, 0.95],
+          ['abstain', 0.05],
+        ]);
+        if (input.schemaVersion === 'dynamic-lane-snapshot/v4') {
+          withHaikuDecision(input);
+          const attempt = input.decisionExchanges[0] as Record<string, unknown>;
+          (attempt.response as Record<string, unknown>).candidateId = candidateId;
+          attempt.distribution = distribution;
+        } else {
+          input.jevExchange = withAcceptedExchange(input, candidateId).jevExchange;
+          input.jevExchange!.distribution = distribution;
+        }
+        const out = evaluateDynamicLane(input);
+        expect(out.decision).toBe('propose');
+        expect(out.proposedBinding?.candidateId).toBe(candidateId);
+        expect(out.eligibleCandidateIds).toEqual([candidateId]);
+        expect(Object.hasOwn(out.candidateRejections, candidateId)).toBe(true);
+        expect(out.candidateRejections[candidateId]).toEqual([]);
+        const serialized = JSON.parse(canonicalDynamicLaneJson(out));
+        expect(Object.hasOwn(serialized.distribution, candidateId)).toBe(true);
+        expect(serialized.distribution[candidateId]).toBe(0.95);
+        if (input.schemaVersion === 'dynamic-lane-snapshot/v4') {
+          input.priorDecisions!.entries.push({
+            decisionId: input.decisionId,
+            snapshotHash: out.snapshotHash,
+            receipt: serialized,
+            exchanges: structuredClone(input.decisionExchanges),
+          });
+          expect(evaluateDynamicLane(input).decision).toBe('propose');
+          input.priorDecisions!.entries = [];
+        }
+        input.candidateProfiles = [];
+        const refused = evaluateDynamicLane(input);
+        expect(refused.proposedBinding).toBeNull();
+        expect(Object.hasOwn(refused.candidateRejections, candidateId)).toBe(true);
+        expect(refused.candidateRejections[candidateId]).toContain('candidate_profile_missing');
+        expect(
+          JSON.parse(canonicalDynamicLaneJson(refused)).candidateRejections[candidateId]
+        ).toContain('candidate_profile_missing');
+      }
+    }
+  );
+
+  test.each(['__proto__', 'constructor', 'toString'])(
+    'actual charges remain numeric own properties for account %s',
+    accountId => {
+      for (const routeIndex of [0, 1, 2]) {
+        for (const cashCost of [null, 0.25]) {
+          const input = v4();
+          const route = input.routingResourcePlan[routeIndex]!;
+          input.accounts.find(account => account.accountId === route.accountId)!.accountId =
+            accountId;
+          route.accountId = accountId;
+          withHaikuDecision(input, routeIndex);
+          (input.decisionExchanges[routeIndex] as Record<string, unknown>).cashCost = cashCost;
+          input.decisionExchanges.push(structuredClone(input.decisionExchanges[routeIndex]));
+          const out = evaluateDynamicLane(input);
+          expect(out.decision).toBe('propose');
+          expect(Object.hasOwn(out.charges, accountId)).toBe(true);
+          expect(out.charges[accountId]).toBe(cashCost ?? route.estimatedCost!);
+          expect(Number.isFinite(out.charges[accountId])).toBe(true);
+          expect(out.routerCallsConsumed).toBe(routeIndex + 1);
+          const serialized = JSON.parse(canonicalDynamicLaneJson(out));
+          expect(Object.hasOwn(serialized.charges, accountId)).toBe(true);
+          expect(serialized.charges[accountId]).toBe(cashCost ?? route.estimatedCost!);
+          input.priorDecisions!.entries.push({
+            decisionId: input.decisionId,
+            snapshotHash: out.snapshotHash,
+            receipt: serialized,
+            exchanges: structuredClone(input.decisionExchanges),
+          });
+          const replayed = evaluateDynamicLane(input);
+          expect(replayed.decision).toBe('propose');
+          expect(replayed.charges[accountId]).toBe(out.charges[accountId]);
+          const invalidPrior = structuredClone(input);
+          const invalidReceipt = invalidPrior.priorDecisions!.entries[0]!.receipt as {
+            charges: Record<string, unknown>;
+          };
+          invalidReceipt.charges[accountId] = -1;
+          expect(evaluateDynamicLane(invalidPrior).disposition).toBe('invalid_prior_receipt');
+          (input.decisionExchanges[routeIndex] as Record<string, unknown>).requestHash = 'wrong';
+          const refused = evaluateDynamicLane(input);
+          expect(refused.proposedBinding).toBeNull();
+          expect(refused.charges[accountId]).toBe(out.charges[accountId]);
+        }
+      }
+    }
+  );
+
   test.each([
     ['availability', 1, 0],
     ['quota', 1, 0],

@@ -21,6 +21,11 @@ const asciiCompare = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 :
 const finiteNonnegative = z.number().finite().nonnegative();
 const nonblank = z.string().trim().min(1);
 const timestamp = z.string().datetime({ offset: true });
+// z.record's parsed output drops own __proto__ keys; identifiers must survive validation.
+const identifierRecord = <T extends z.ZodTypeAny>(
+  valueSchema: T
+): z.ZodType<Record<string, z.infer<T>>> =>
+  z.custom<Record<string, z.infer<T>>>(value => z.record(valueSchema).safeParse(value).success);
 
 const monthlyBudgetPolicySchema = z.discriminatedUnion('mode', [
   z.object({
@@ -193,7 +198,7 @@ const jevExchangeSchema = z.object({
   abstain: z.boolean(),
   tied: z.boolean(),
   vendorConfidence: finiteNonnegative,
-  distribution: z.record(finiteNonnegative),
+  distribution: identifierRecord(finiteNonnegative),
   usage: z.record(z.unknown()).nullable(),
   latencyMs: finiteNonnegative.nullable(),
 });
@@ -444,7 +449,7 @@ function receiptBase(snapshot: DynamicLaneSnapshot, snapshotHash: string): Dynam
     proposedBinding: null,
     decisionOrigin: 'none',
     jevDisposition: 'not_evaluated',
-    candidateRejections: {},
+    candidateRejections: Object.create(null) as Record<string, string[]>,
     evidenceReferences: [],
     requestedJevModel: snapshot.policy.requestedJevModel,
     returnedJevModel: null,
@@ -970,7 +975,7 @@ const exchangeSchema = z
     cashCost: finiteNonnegative.nullable(),
     outcome: z.enum(['success', 'availability', 'quota', 'refused', 'cancelled']),
     response: z.unknown().nullable(),
-    distribution: z.record(finiteNonnegative).optional(),
+    distribution: identifierRecord(finiteNonnegative).optional(),
   })
   .strict();
 const normalizedRequestSchema = z.object({
@@ -1005,7 +1010,7 @@ const v4ReceiptSchema = z.object({
   requestHash: nonblank.nullable(),
   normalizedRequest: normalizedRequestSchema.nullable(),
   eligibleCandidateIds: z.array(nonblank),
-  candidateRejections: z.record(z.array(nonblank)),
+  candidateRejections: identifierRecord(z.array(nonblank)),
   decision: z.enum(['propose', 'wait', 'abstain']),
   proposedBinding: candidateSchema
     .pick({
@@ -1027,12 +1032,12 @@ const v4ReceiptSchema = z.object({
   routerCallsConsumed: z.number().int().nonnegative(),
   routerCallsRemaining: z.number().int().nonnegative(),
   attemptHistory: z.array(exchangeSchema),
-  charges: z.record(finiteNonnegative),
+  charges: identifierRecord(finiteNonnegative),
   evidenceReferences: z.array(nonblank),
   usage: z.record(finiteNonnegative).nullable(),
   cashCost: finiteNonnegative.nullable(),
   latencyMs: finiteNonnegative.nullable(),
-  distribution: z.record(finiteNonnegative).nullable(),
+  distribution: identifierRecord(finiteNonnegative).nullable(),
   postExecutionReview: z.literal('unissued'),
 });
 export type DynamicLaneV4Receipt = z.infer<typeof v4ReceiptSchema>;
@@ -1056,7 +1061,7 @@ function evaluateV4Core(snapshot: DynamicLaneV4Snapshot): DynamicLaneV4Receipt {
     requestHash: null,
     normalizedRequest: null,
     eligibleCandidateIds: [],
-    candidateRejections: {},
+    candidateRejections: Object.create(null) as Record<string, string[]>,
     decision: 'wait',
     proposedBinding: null,
     decisionOrigin: 'none',
@@ -1070,7 +1075,7 @@ function evaluateV4Core(snapshot: DynamicLaneV4Snapshot): DynamicLaneV4Receipt {
     routerCallsConsumed: snapshot.routerCallsConsumed,
     routerCallsRemaining: Math.max(0, snapshot.routerCallCeiling - snapshot.routerCallsConsumed),
     attemptHistory: [],
-    charges: {},
+    charges: Object.create(null) as Record<string, number>,
     evidenceReferences: [],
     usage: null,
     cashCost: null,
