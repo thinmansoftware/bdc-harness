@@ -418,6 +418,14 @@ export async function createWorkflowRun(data: {
   }
 }
 
+export async function activatePendingWorkflowRun(id: string): Promise<boolean> {
+  const result = await pool.query(
+    "UPDATE remote_agent_workflow_runs SET status = 'running' WHERE id = $1 AND status = 'pending'",
+    [id]
+  );
+  return result.rowCount === 1;
+}
+
 export async function getWorkflowRun(id: string): Promise<WorkflowRun | null> {
   try {
     const result = await pool.query<WorkflowRun>(

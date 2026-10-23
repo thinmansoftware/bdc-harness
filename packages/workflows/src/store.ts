@@ -132,6 +132,7 @@ export interface IWorkflowStore {
     failedAt: string;
   }): Promise<boolean>;
   resumeWorkflowRun(id: string): Promise<WorkflowRun>;
+  activatePendingWorkflowRun?(id: string): Promise<boolean>;
   updateWorkflowRun(
     id: string,
     updates: Partial<Pick<WorkflowRun, 'status' | 'metadata'>>
