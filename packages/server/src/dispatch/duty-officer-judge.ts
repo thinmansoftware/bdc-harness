@@ -1,5 +1,7 @@
-import { createLogger } from '@archon/paths';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
+import { createLogger } from '@archon/paths';
+import { ClaudeProvider } from '@archon/providers';
+import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 
 const log = createLogger('dispatch/duty-officer-judge');
 
@@ -7,6 +9,7 @@ export const DUTY_OFFICER_OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/co
 export const DUTY_OFFICER_XAI_CHAT_URL = 'https://api.x.ai/v1/chat/completions';
 export const DUTY_OFFICER_DEFAULT_OPENROUTER_MODEL = 'x-ai/grok-4.6';
 export const DUTY_OFFICER_DEFAULT_XAI_MODEL = 'grok-4.6';
+export const DUTY_OFFICER_DEFAULT_CLAUDE_MODEL = 'claude-haiku-5-5';
 
 export const DUTY_OFFICER_SYSTEM_PROMPT = `You are the Duty Officer of Blue Devil Collectibles (M-53).
 You are an autonomous agent. John is not your backup and does not read your pass.
@@ -35,9 +38,31 @@ export interface DutyOfficerJudgeVerdict {
   failures: { transport: string; error: string }[];
 }
 
+export interface DutyOfficerClaudeCompleteInput {
+  systemPrompt: string;
+  userPrompt: string;
+  model: string;
+  timeoutMs: number;
+}
+
+export interface DutyOfficerJudgeLog {
+  info: (obj: Record<string, unknown>, msg?: string) => void;
+  warn: (obj: Record<string, unknown>, msg?: string) => void;
+  error: (obj: Record<string, unknown>, msg?: string) => void;
+}
+
 export interface DutyOfficerJudgeDeps {
   fetchImpl?: typeof fetch;
   nowMs?: () => number;
+  claudeComplete?: (input: DutyOfficerClaudeCompleteInput) => Promise<string>;
+  log?: DutyOfficerJudgeLog;
+}
+
+interface JudgeRung {
+  provider: 'claude' | 'openrouter' | 'xai';
+  model: string;
+  transport: string;
+  run: () => Promise<string>;
 }
 
 function openRouterKey(): string | null {
@@ -145,75 +170,221 @@ function briefFor(message: DispatchMessage): string {
   });
 }
 
+function resolveJudgeLog(deps: DutyOfficerJudgeDeps): DutyOfficerJudgeLog {
+  if (deps.log) return deps.log;
+  return {
+    info: (obj, msg): void => {
+      log.info(obj, msg);
+    },
+    warn: (obj, msg): void => {
+      log.warn(obj, msg);
+    },
+    error: (obj, msg): void => {
+      log.error(obj, msg);
+    },
+  };
+}
+
+function claudeModel(): string {
+  return process.env.DUTY_OFFICER_CLAUDE_MODEL?.trim() || DUTY_OFFICER_DEFAULT_CLAUDE_MODEL;
+}
+
+function openRouterModel(): string {
+  return process.env.DUTY_OFFICER_OPENROUTER_MODEL?.trim() || DUTY_OFFICER_DEFAULT_OPENROUTER_MODEL;
+}
+
+function xaiModel(): string {
+  return process.env.DUTY_OFFICER_XAI_MODEL?.trim() || DUTY_OFFICER_DEFAULT_XAI_MODEL;
+}
+
+/**
+ * Only the exact value `claude` opts into the subscription path.
+ * Empty, `openrouter`, and unrecognized values keep the OpenRouter-then-xAI ladder.
+ */
+function resolveJudgeRoute(judgeLog: DutyOfficerJudgeLog): 'claude' | 'default' {
+  const raw = process.env.DUTY_OFFICER_JUDGE_PROVIDER?.trim() ?? '';
+  if (raw === 'claude') return 'claude';
+  if (raw === '' || raw === 'openrouter') return 'default';
+  judgeLog.warn({ provider: raw }, 'duty_officer_judge_provider_unrecognized');
+  return 'default';
+}
+
+function isClaudeTimeout(error: unknown, controller: AbortController): boolean {
+  if (controller.signal.aborted) return true;
+  if (!(error instanceof Error)) return false;
+  return error.name === 'AbortError' || error.message === 'Query aborted';
+}
+
+async function defaultClaudeComplete(input: DutyOfficerClaudeCompleteInput): Promise<string> {
+  // A closed throttle is a rung failure. Do not call waitForRelease; the
+  // Duty Officer clock must fall back instead of parking on the gate.
+  if (claudeProviderThrottle.isThrottled()) {
+    throw new Error('duty_officer_judge_claude_throttled');
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, input.timeoutMs);
+  try {
+    const provider = new ClaudeProvider();
+    let text = '';
+    for await (const chunk of provider.sendQuery(input.userPrompt, process.cwd(), undefined, {
+      model: input.model,
+      systemPrompt: input.systemPrompt,
+      persistSession: false,
+      abortSignal: controller.signal,
+      nodeConfig: { allowed_tools: [] },
+    })) {
+      if (chunk.type === 'assistant') {
+        text += chunk.content;
+      }
+      if (chunk.type === 'result' && chunk.isError === true) {
+        // ClaudeProvider yields result.isError without throwing, so earlier
+        // assistant text is not a verdict.
+        throw new Error(
+          'duty_officer_judge_claude_result_error:' + (chunk.errorSubtype ?? 'unknown')
+        );
+      }
+    }
+    if (controller.signal.aborted) {
+      throw new Error(`duty_officer_judge_timeout_${input.timeoutMs}`);
+    }
+    if (!text.trim()) {
+      throw new Error('duty_officer_judge_empty');
+    }
+    return text;
+  } catch (error) {
+    if (isClaudeTimeout(error, controller)) {
+      throw new Error(`duty_officer_judge_timeout_${input.timeoutMs}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function openRouterRung(
+  apiKey: string,
+  userPrompt: string,
+  fetchImpl: typeof fetch,
+  timeoutMs: number
+): JudgeRung {
+  const model = openRouterModel();
+  return {
+    provider: 'openrouter',
+    model,
+    transport: `openrouter:${model}`,
+    run: () =>
+      chatCompletions({
+        url: DUTY_OFFICER_OPENROUTER_URL,
+        apiKey,
+        model,
+        systemPrompt: DUTY_OFFICER_SYSTEM_PROMPT,
+        userPrompt,
+        fetchImpl,
+        timeoutMs,
+        extraHeaders: {
+          'HTTP-Referer': 'https://ops-cauldron.thinmansoftware.com',
+          'X-Title': 'bdc-duty-officer',
+        },
+      }),
+  };
+}
+
+function xaiRung(
+  apiKey: string,
+  userPrompt: string,
+  fetchImpl: typeof fetch,
+  timeoutMs: number
+): JudgeRung {
+  const model = xaiModel();
+  return {
+    provider: 'xai',
+    model,
+    transport: `xai:${model}`,
+    run: () =>
+      chatCompletions({
+        url: DUTY_OFFICER_XAI_CHAT_URL,
+        apiKey,
+        model,
+        systemPrompt: DUTY_OFFICER_SYSTEM_PROMPT,
+        userPrompt,
+        fetchImpl,
+        timeoutMs,
+      }),
+  };
+}
+
+function unconfigured(
+  reason: string,
+  failures: { transport: string; error: string }[]
+): DutyOfficerJudgeVerdict {
+  return {
+    status: 'unconfigured',
+    action: 'hold',
+    reason,
+    body: '',
+    failures,
+  };
+}
+
 export async function judgeDutyOfficerItem(
   message: DispatchMessage,
   deps: DutyOfficerJudgeDeps = {}
 ): Promise<DutyOfficerJudgeVerdict> {
   const fetchImpl = deps.fetchImpl ?? fetch;
+  const judgeLog = resolveJudgeLog(deps);
   const timeoutMs = Math.max(5_000, Number(process.env.DUTY_OFFICER_JUDGE_TIMEOUT_MS) || 45_000);
   const failures: { transport: string; error: string }[] = [];
   const orKey = openRouterKey();
   const xKey = xaiKey();
-  if (process.env.DUTY_OFFICER_JUDGE_ENABLED !== 'true' || (!orKey && !xKey)) {
-    return {
-      status: 'unconfigured',
-      action: 'hold',
-      reason:
-        process.env.DUTY_OFFICER_JUDGE_ENABLED !== 'true'
-          ? 'judge_disabled'
-          : 'no_openrouter_or_xai_key',
-      body: '',
-      failures,
-    };
+  if (process.env.DUTY_OFFICER_JUDGE_ENABLED !== 'true') {
+    return unconfigured('judge_disabled', failures);
   }
 
-  const rungs: {
-    transport: string;
-    run: () => Promise<string>;
-  }[] = [];
-  if (orKey) {
-    const model =
-      process.env.DUTY_OFFICER_OPENROUTER_MODEL?.trim() || DUTY_OFFICER_DEFAULT_OPENROUTER_MODEL;
-    rungs.push({
-      transport: `openrouter:${model}`,
-      run: () =>
-        chatCompletions({
-          url: DUTY_OFFICER_OPENROUTER_URL,
-          apiKey: orKey,
-          model,
-          systemPrompt: DUTY_OFFICER_SYSTEM_PROMPT,
-          userPrompt: briefFor(message),
-          fetchImpl,
-          timeoutMs,
-          extraHeaders: {
-            'HTTP-Referer': 'https://ops-cauldron.thinmansoftware.com',
-            'X-Title': 'bdc-duty-officer',
-          },
-        }),
-    });
+  const route = resolveJudgeRoute(judgeLog);
+  if (route !== 'claude' && !orKey && !xKey) {
+    return unconfigured('no_openrouter_or_xai_key', failures);
   }
-  if (xKey) {
-    const model = process.env.DUTY_OFFICER_XAI_MODEL?.trim() || DUTY_OFFICER_DEFAULT_XAI_MODEL;
+
+  const userPrompt = briefFor(message);
+  const rungs: JudgeRung[] = [];
+  if (route === 'claude') {
+    const model = claudeModel();
+    const complete = deps.claudeComplete ?? defaultClaudeComplete;
     rungs.push({
-      transport: `xai:${model}`,
+      provider: 'claude',
+      model,
+      transport: `claude:${model}`,
       run: () =>
-        chatCompletions({
-          url: DUTY_OFFICER_XAI_CHAT_URL,
-          apiKey: xKey,
-          model,
+        complete({
           systemPrompt: DUTY_OFFICER_SYSTEM_PROMPT,
-          userPrompt: briefFor(message),
-          fetchImpl,
+          userPrompt,
+          model,
           timeoutMs,
         }),
     });
+    if (orKey) rungs.push(openRouterRung(orKey, userPrompt, fetchImpl, timeoutMs));
+  } else {
+    if (orKey) rungs.push(openRouterRung(orKey, userPrompt, fetchImpl, timeoutMs));
+    if (xKey) rungs.push(xaiRung(xKey, userPrompt, fetchImpl, timeoutMs));
   }
 
   for (const rung of rungs) {
     try {
       const text = await rung.run();
       const parsed = parseDutyOfficerJudgeText(text);
-      log.info({ transport: rung.transport, action: parsed.action }, 'duty_officer_judge_ok');
+      judgeLog.info(
+        {
+          action: 'duty_officer_judge_ok',
+          provider: rung.provider,
+          model: rung.model,
+          transport: rung.transport,
+          verdict: parsed.action,
+        },
+        'duty_officer_judge_ok'
+      );
       return {
         status: 'ok',
         transport: rung.transport,
@@ -224,12 +395,16 @@ export async function judgeDutyOfficerItem(
       };
     } catch (error) {
       const err = error instanceof Error ? error.message : String(error);
-      failures.push({ transport: rung.transport, error: err.slice(0, 240) });
-      log.warn({ transport: rung.transport, err }, 'duty_officer_judge_rung_failed');
+      const recorded = err.slice(0, 240);
+      failures.push({ transport: rung.transport, error: recorded });
+      judgeLog.warn(
+        { provider: rung.provider, transport: rung.transport, err: recorded },
+        'duty_officer_judge_rung_failed'
+      );
     }
   }
 
-  log.error({ failures }, 'duty_officer_judge_all_rungs_failed');
+  judgeLog.error({ failures }, 'duty_officer_judge_all_rungs_failed');
   return {
     status: 'failed',
     action: 'hold',

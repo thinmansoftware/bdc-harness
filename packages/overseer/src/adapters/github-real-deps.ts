@@ -18,8 +18,14 @@ import type {
   PullRequestEvidence,
   PullRequestRef,
 } from '../types.ts';
-import { resolveRequiredContexts } from './required-contexts';
+import {
+  REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
+  UNPROTECTED_BASE_NO_CHECKS_REASON,
+  resolveMaxAttempts,
+  resolveRequiredContexts,
+} from './required-contexts';
 import type {
+  AttemptCounterKey,
   AttemptCounterStore,
   REQUIRED_CONTEXTS_BLOCKED_REASON,
   RequiredContextsFailureKind,
@@ -123,7 +129,7 @@ function otherOpenPrsForWo(
 
 /**
  * One open match is the run's PR even when its head is archon/task-.
- * Several matches: the first non-archon/task- head in search order.
+ * Several matches: the first non-archon/task- head in listing order.
  * Several matches that are all archon/task-: select none.
  */
 function selectWoSearchCandidate(
@@ -166,6 +172,7 @@ export interface RealGitHubOctokitLike {
         deletions?: number;
         html_url: string;
         changed_files?: number;
+        body?: string | null;
         head: { sha: string; ref?: string };
         user?: { login?: string | null } | null;
         created_at?: string;
@@ -265,7 +272,15 @@ export interface RealGitHubOctokitLike {
   checks: {
     listForRef(input: Record<string, unknown>): Promise<{
       data: {
-        check_runs: { name?: string; status: string; conclusion: string | null }[];
+        check_runs: {
+          id?: number;
+          name?: string;
+          status: string;
+          conclusion: string | null;
+          started_at?: string | null;
+          completed_at?: string | null;
+          app?: { slug?: string; name?: string };
+        }[];
       };
     }>;
   };
@@ -397,7 +412,7 @@ export interface ExactHeadPullRequestEvidence {
    * reported-checks heuristic.
    */
   requiredContextsBlocked?: {
-    reason: typeof REQUIRED_CONTEXTS_BLOCKED_REASON;
+    reason: typeof REQUIRED_CONTEXTS_BLOCKED_REASON | typeof UNPROTECTED_BASE_NO_CHECKS_REASON;
     attempts: number;
     failureKind: RequiredContextsFailureKind;
   };
@@ -519,6 +534,32 @@ export function createRealFetchExactHeadPullRequestEvidence(
     // prevent (#775).
     const requiredContexts: string[] | null =
       resolution.state === 'known' ? resolution.contexts : null;
+    let noChecksBlocked: ExactHeadPullRequestEvidence['requiredContextsBlocked'];
+    if (
+      resolution.state === 'known' &&
+      resolution.source === 'unprotected_branch' &&
+      resolution.contexts.length === 0
+    ) {
+      const zeroChecksKey: AttemptCounterKey = {
+        owner: input.owner,
+        repo: input.repo,
+        baseRef: `zero-checks:${baseRef ?? ''}`,
+        headSha: input.headSha,
+      };
+      if (checkRuns.data.check_runs.length === 0) {
+        const attempts = await attemptStore.increment(zeroChecksKey, Date.now());
+        const maxAttempts = resolveMaxAttempts(process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]);
+        if (attempts >= maxAttempts) {
+          noChecksBlocked = {
+            reason: UNPROTECTED_BASE_NO_CHECKS_REASON,
+            attempts,
+            failureKind: 'transient',
+          };
+        }
+      } else {
+        await attemptStore.clear(zeroChecksKey);
+      }
+    }
     return {
       ...(resolution.state === 'exhausted'
         ? {
@@ -529,13 +570,18 @@ export function createRealFetchExactHeadPullRequestEvidence(
             },
           }
         : {}),
+      ...(noChecksBlocked ? { requiredContextsBlocked: noChecksBlocked } : {}),
       diff: (comparison.data.files ?? [])
         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
         .join('\n'),
       checks: checkRuns.data.check_runs.map((run, index) => ({
+        id: run.id,
         name: run.name?.trim() || `check-${index + 1}`,
         status: run.status,
         conclusion: run.conclusion,
+        started_at: run.started_at,
+        completed_at: run.completed_at,
+        app: run.app,
       })),
       requiredContexts,
     };
@@ -834,10 +880,11 @@ export function summarizeChecks(
 
 /**
  * Real findPullRequest: looks up an open PR by head branch first (the run's
- * own PR), then a WO-ID title/body search (mirrors reconcile.ts's approach).
- * A recovered head branch still runs the WO search so sibling open PRs
+ * own PR), then complete REST open-PR discovery with exact WO title/body matching.
+ * A recovered head branch still runs WO discovery so sibling open PRs
  * (including archon/task-* pre-review PRs) land in otherOpenPrsForWo. The
- * search selects a PR only when the head branch did not. Evidence fields are
+ * listing selects a PR only when the head branch did not. REST creation order
+ * replaces Search relevance order; selection priority rules stay unchanged. Evidence fields are
  * populated only from live API data -- no invented defaults beyond the
  * documented "missing" shape.
  */
@@ -849,6 +896,8 @@ export function createRealFindPullRequest(
   const now = options.now ?? Date.now;
   return async (input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence> => {
     if (now() < rateLimitBackoffUntil) return LOOKUP_FAILED_EVIDENCE;
+    const requiresWoDiscovery =
+      input.prNumber == null && Boolean(input.woId && input.woId !== 'unknown');
     try {
       // An explicit number is the only UNIQUE key GitHub offers here. When the
       // caller has it (PR-first discovery always does), address the PR directly
@@ -870,38 +919,80 @@ export function createRealFindPullRequest(
       }
 
       // Head-branch recovery is the normal path (runs do not store headBranch).
-      // That lookup must not skip the WO search: sibling open PRs are the only
+      // That lookup must not skip WO discovery: sibling open PRs are the only
       // source for otherOpenPrsForWo. An explicit prNumber stays unique and
-      // still skips the search. Selection runs only when the head did not resolve.
+      // still skips the listing. Selection runs only when the head did not resolve.
       const resolvedByHeadBranch =
         input.prNumber == null && Boolean(input.headBranch) && prNumber !== null;
       let siblingLookupFailed = false;
       let preserveRateLimitBackoff = false;
 
       const loadWoSearchCandidates = async (): Promise<void> => {
-        const search = await octokit.search.issuesAndPullRequests({
-          // Title AND body: lanes title PRs freely (anchor: canary PR #705,
-          // 'docs(canary): add e2e merge canary marker' -- WO id only in the
-          // body; in:title returned nothing and the run was wrongly closed as
-          // 'no PR'. 9th canary defect, 2026-08-26).
-          // is:open: a closed PR is not this run's current head.
-          q: `repo:${input.owner}/${input.repo} is:pr is:open "${input.woId}"`,
-          per_page: WO_SEARCH_CANDIDATE_LIMIT,
-        });
-        const items = search.data.items
-          .filter(item => item.pull_request)
-          .slice(0, WO_SEARCH_CANDIDATE_LIMIT);
-        for (const item of items) {
+        const woId = input.woId;
+        if (!woId || woId === 'unknown') throw new Error('wo_pr_identity_required');
+        const listing = await fetchAllOpenPullRequests(octokit, { ...input, strict: true });
+        if (!listing.complete) throw new Error('wo_pr_listing_incomplete');
+        const seen = new Map<number, string>();
+        // Validate every row before filtering or admitting even an early match.
+        for (const item of listing.pulls) {
+          if (
+            !item ||
+            !Number.isSafeInteger(item.number) ||
+            item.number <= 0 ||
+            typeof item.title !== 'string' ||
+            !(item.body === null || typeof item.body === 'string') ||
+            item.state !== 'open' ||
+            !item.head ||
+            typeof item.head.ref !== 'string' ||
+            !item.head.ref.trim() ||
+            typeof item.html_url !== 'string' ||
+            typeof item.head.sha !== 'string' ||
+            !item.head.sha.trim()
+          )
+            throw new Error('wo_pr_listing_invalid');
+          const identity = JSON.stringify([
+            item.title,
+            item.body,
+            item.state,
+            item.head.sha,
+            item.head.ref,
+            item.html_url,
+          ]);
+          if (seen.has(item.number) && seen.get(item.number) !== identity)
+            throw new Error('wo_pr_listing_conflicting_duplicate');
+          seen.set(item.number, identity);
+        }
+        const visited = new Set<number>();
+        for (const item of listing.pulls) {
+          if (visited.has(item.number)) continue;
+          visited.add(item.number);
+          if (!claimsExactWo(item.title, item.body, woId)) continue;
           const fetched = await octokit.pulls.get({
             owner: input.owner,
             repo: input.repo,
             pull_number: item.number,
           });
-          if (fetched.data.state !== 'open') continue;
+          if (
+            fetched.data.number !== item.number ||
+            typeof fetched.data.title !== 'string' ||
+            !(fetched.data.body === null || typeof fetched.data.body === 'string') ||
+            !['open', 'closed'].includes(fetched.data.state) ||
+            !fetched.data.head ||
+            typeof fetched.data.head.ref !== 'string' ||
+            !fetched.data.head.ref.trim() ||
+            typeof fetched.data.head.sha !== 'string' ||
+            !fetched.data.head.sha.trim()
+          )
+            throw new Error('wo_pr_candidate_invalid');
+          if (
+            fetched.data.state !== 'open' ||
+            !claimsExactWo(fetched.data.title, fetched.data.body, woId)
+          )
+            continue;
           const login = fetched.data.user?.login;
           woSearchCandidates.push({
             number: fetched.data.number,
-            headRef: fetched.data.head.ref ?? '',
+            headRef: fetched.data.head.ref,
             author: typeof login === 'string' ? login : '',
             createdAt: fetched.data.created_at ?? '',
           });
@@ -911,7 +1002,7 @@ export function createRealFindPullRequest(
       // 'unknown' is parseWoId's could-not-parse fallback, not a WO id --
       // searching for the literal word would return garbage matches.
       // Primary fallback (no PR yet) still throws into the outer catch.
-      // Sibling search after a head-branch hit is best-effort: a search or
+      // Sibling discovery after a head-branch hit is best-effort: a listing or
       // pulls.get failure must not replace the resolved PR with lookup-failed.
       if (input.woId && input.woId !== 'unknown' && prNumber === null) {
         await loadWoSearchCandidates();
@@ -1057,6 +1148,8 @@ export function createRealFindPullRequest(
         noteRateLimitBackoff(error, timestamp, logger, input);
         return LOOKUP_FAILED_EVIDENCE;
       }
+      // WO REST discovery failure never proves absence. Preserve the legacy
+      // direct/head lookup handling below outside primary WO discovery.
       // 422 'cannot be searched' = the repo does not exist or this credential
       // (the App installation) has no access to it. PERMANENT for us: a repo
       // the App cannot read is a repo the Merge Manager could never act on.
@@ -1066,7 +1159,7 @@ export function createRealFindPullRequest(
         typeof error === 'object' && error !== null && 'status' in error
           ? (error as { status?: number }).status
           : undefined;
-      if (status === 422) {
+      if (status === 422 && !requiresWoDiscovery) {
         logger.warn(
           { owner: input.owner, repo: input.repo, woId: input.woId },
           'overseer.github_real_deps.repo_unsearchable_permanent'
@@ -1415,6 +1508,39 @@ export function deriveReviewDecision(
   return 'APPROVED';
 }
 
+/** Exact title/body token claim, using Cauldron's exclusion-heading semantics.
+ * Kept here to avoid an overseer -> smart-cauldron -> overseer package cycle.
+ */
+function claimsExactWo(title: string, body: string | null | undefined, woId: string): boolean {
+  const exclusion =
+    /^\s{0,3}#{1,6}\s*(files?\s+)?(explicitly\s+)?(out\s+of\s+scope|not\s+in\s+scope|explicitly\s+excluded)\b/i;
+  const matches = (text: string): boolean => {
+    let excluded = false;
+    const kept: string[] = [];
+    for (const line of text.split('\n')) {
+      if (exclusion.test(line)) {
+        excluded = true;
+        continue;
+      }
+      if (excluded && /^\s{0,3}#{1,6}\s+\S/.test(line)) excluded = false;
+      if (!excluded) kept.push(line);
+    }
+    const hay = kept.join('\n').toLowerCase();
+    const needle = woId.toLowerCase();
+    for (let from = 0; needle && from <= hay.length; ) {
+      const index = hay.indexOf(needle, from);
+      if (index < 0) return false;
+      const before = hay[index - 1];
+      const after = hay[index + needle.length];
+      if ((!before || /[^a-z0-9-]/.test(before)) && (!after || /[^a-z0-9-]/.test(after)))
+        return true;
+      from = index + 1;
+    }
+    return false;
+  };
+  return matches(title) || matches(body ?? '');
+}
+
 /** Pull a WO id out of a PR title or body, so evidence lookup can search by it. */
 export function extractWoId(title: string, body: string | null | undefined): string | undefined {
   const match = /\bWO-[A-Z0-9][A-Z0-9-]*\b/.exec(`${title}\n${body ?? ''}`);
@@ -1671,11 +1797,13 @@ type OpenPullRequestPage = Awaited<ReturnType<RealGitHubOctokitLike['pulls']['li
  * the PRs we DID read are still legitimate candidates, and holding them because
  * a later page was unreachable would stall merges for the same "silence" reason.
  * So the partial list is returned and the flag travels with it, to be logged and
- * carried on every discovered PR rather than dropped.
+ * carried on every discovered PR rather than dropped. The opt-in strict mode
+ * used for WO lookup rejects malformed pages and fixes creation ordering; that
+ * caller additionally requires completeness and validates all rows before selection.
  */
 export async function fetchAllOpenPullRequests(
   octokit: RealGitHubOctokitLike,
-  input: { owner: string; repo: string }
+  input: { owner: string; repo: string; strict?: boolean }
 ): Promise<{ pulls: OpenPullRequestPage; complete: boolean }> {
   const pulls: OpenPullRequestPage = [];
   for (let page = 1; page <= MAX_OPEN_PR_PAGES; page += 1) {
@@ -1687,7 +1815,9 @@ export async function fetchAllOpenPullRequests(
       state: 'open',
       per_page: OPEN_PR_PAGE_SIZE,
       page,
+      ...(input.strict ? { sort: 'created', direction: 'asc' } : {}),
     });
+    if (input.strict && !Array.isArray(batch.data)) throw new Error('open_pr_listing_invalid_page');
     const data = batch.data ?? [];
     pulls.push(...data);
     // A short page is the last page.

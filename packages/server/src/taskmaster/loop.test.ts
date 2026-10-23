@@ -8,6 +8,10 @@ import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { rootLogger } from '@archon/paths';
 import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
+import {
+  setSeatUsageReaderForTests,
+  unknownSeatReading,
+} from '@archon/workflows/reliability/seat-usage';
 
 // A synthetic exhausted response belongs to its test, never the next caller.
 beforeEach(resetGitHubApiMeterForTests);
@@ -36,7 +40,7 @@ import {
   type GithubIssueEvidence,
   type AdoptionRefreshResult,
 } from './loop';
-import { checkEvidence } from './expectations';
+import { checkEvidence, checkExpectations } from './expectations';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
@@ -52,7 +56,12 @@ import {
   NUDGE_CLOCK_MS,
   type ActionProposal,
 } from './rules';
-import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
+import {
+  expectationRegistrationKey,
+  type TmExpectation,
+  type TmAdoptionRow,
+  type TmSuppressionRow,
+} from '@archon/core/db/taskmaster';
 import type { ThreadSnapshot } from './rules';
 import type {
   TmActionOutcome,
@@ -223,6 +232,7 @@ const T0 = Date.parse('2026-08-07T12:00:00.000Z');
 const TODAY_KEY = new Date(T0).toISOString().slice(0, 10);
 
 interface FakeWorld {
+  expectations: Map<string, TmExpectation>;
   journal: TmJournalEntry[];
   control: TmControlState;
   sentMessages: Array<{
@@ -248,6 +258,7 @@ interface FakeWorld {
 
 function makeWorld(): FakeWorld {
   return {
+    expectations: new Map(),
     journal: [],
     control: {
       pause_state: 'RUNNING',
@@ -274,6 +285,53 @@ function makeWorld(): FakeWorld {
 function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): TaskmasterDeps {
   let journalSeq = world.journal.length;
   const dal = {
+    listPendingFireActions: async () =>
+      world.journal.filter(row => row.action_type === 'fire_cauldron' && row.outcome === 'pending'),
+    transitionPendingFireAction: async (
+      id: string,
+      expectedJson: string,
+      outcome: 'pending' | 'sent' | 'expired',
+      proposalJson: string
+    ) => {
+      const row = world.journal.find(row => row.id === id);
+      if (
+        !row ||
+        row.action_type !== 'fire_cauldron' ||
+        row.outcome !== 'pending' ||
+        row.proposal_json !== expectedJson
+      )
+        return false;
+      row.outcome = outcome;
+      row.proposal_json = proposalJson;
+      return true;
+    },
+    registerExpectation: async (data: {
+      action_ref?: string | null;
+      dispatch_ref: string;
+      recipient: string;
+      evidence_json: string;
+      due_at: string;
+      on_absence: 'redispatch' | 'escalate' | 'give_up';
+      max_retries: number;
+    }) => {
+      const key = expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
+      const prior = world.expectations.get(key);
+      if (prior) return prior.id;
+      const row: TmExpectation = {
+        ...data,
+        id: `expectation-${world.expectations.size + 1}`,
+        retries: 0,
+        status: 'pending',
+        evidence_pointer: null,
+        registered_by: 'taskmaster',
+        self_supervised: 0,
+        created_at: new Date(world.nowMs).toISOString(),
+        updated_at: new Date(world.nowMs).toISOString(),
+      };
+      world.expectations.set(key, row);
+      return row.id;
+    },
+    getExpectationByRegistrationKey: async (key: string) => world.expectations.get(key) ?? null,
     recordAction: async (data: {
       thread_ref: string;
       action_type: TmActionType;
@@ -344,7 +402,10 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     expireParkedActions: async () => {
       let count = 0;
       for (const row of world.journal) {
-        if (row.outcome === 'parked' || row.outcome === 'pending') {
+        if (
+          row.outcome === 'parked' ||
+          (row.outcome === 'pending' && row.action_type !== 'fire_cauldron')
+        ) {
           row.outcome = 'expired';
           count += 1;
         }
@@ -399,6 +460,14 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
   return {
     now: () => new Date(world.nowMs),
     db: dal,
+    // Most fire fixtures model a created workflow; no-run/corruption tests
+    // override this independent SOR proof instead of treating admission as proof.
+    readFireCascadeEvidence: async (identity: { cascadeId: string }) => ({
+      earliestRunId: `actual-${identity.cascadeId}`,
+      completedRunId: null,
+      status: 'running',
+      prOpened: false,
+    }),
     getDispatchReceiptCutoverAt: async () => new Date(T0 - 86_400_000).toISOString(),
     headroom: async () => okHeadroom,
     createTask: (async (
@@ -897,11 +966,12 @@ describe('fire_cauldron loop', () => {
         }) as NonNullable<TaskmasterDeps['runCascade']>,
       });
       const registered: Array<{ dispatch_ref: string; evidence_json: string }> = [];
+      const storeExpectation = deps.db!.registerExpectation!;
       deps.db = {
         ...deps.db!,
         registerExpectation: async data => {
           registered.push(data);
-          return 'expectation-fire';
+          return storeExpectation(data);
         },
       };
       const state = createTaskmasterState(60_000);
@@ -911,10 +981,10 @@ describe('fire_cauldron loop', () => {
       const fires = world.journal.filter(row => row.action_type === 'fire_cauldron');
       expect(fires).toHaveLength(1);
       expect(fires[0]?.outcome).toBe('sent');
-      expect(fires[0]?.proposal_json).toContain('cascade-501');
+      expect(JSON.parse(fires[0]!.proposal_json).runId).toBe(`actual-${fires[0]!.idempotency_key}`);
       expect(registered).toHaveLength(1);
-      expect(registered[0]?.dispatch_ref).toBe('cascade-501');
-      expect(registered[0]?.evidence_json).toContain('remote_agent_workflow_runs');
+      expect(registered[0]?.dispatch_ref).toBe(fires[0]!.idempotency_key);
+      expect(registered[0]?.evidence_json).toContain('cascade_workflow_completed');
       // Deterministic identity: the journal action id is passed so a replayed
       // fire reuses this expectation instead of registering a second one.
       expect(registered[0]?.action_ref).toBe(fires[0]?.id);
@@ -922,28 +992,56 @@ describe('fire_cauldron loop', () => {
       // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching only on
       // the admission row's existence is self-fulfilling -- admission creates
       // that row -- so a failed or stalled cascade would never escalate.
-      const spec = JSON.parse(registered[0]!.evidence_json) as {
-        where: Record<string, unknown>;
-      };
-      expect(spec.where.status).toEqual(['completed']);
+      const spec = JSON.parse(registered[0]!.evidence_json);
+      expect(spec).toMatchObject({
+        kind: 'cascade_workflow_completed',
+        woId: 'WO-HARNESS-EXAMPLE-01',
+        project: 'bdc-harness',
+      });
 
       // Run the registered spec against a run table to prove it: admitted but
       // unfinished is NOT met, failed is NOT met, completed IS met.
-      const runs = [{ id: 'cascade-501', status: 'running' }];
+      const runs = [
+        {
+          id: 'actual-workflow-501',
+          workflow_name: 'bound-workflow',
+          status: 'running',
+          metadata: '{}',
+        },
+      ];
       const query = async <T>(_sql: string, params?: unknown[]) => {
-        const [id, ...statuses] = (params ?? []) as string[];
+        const [id, workflowName] = (params ?? []) as string[];
         return {
           rows: runs.filter(
-            run => run.id === id && statuses.includes(run.status)
+            run => run.id === id && run.workflow_name === workflowName
           ) as unknown as T[],
         };
       };
-      const evidence = spec as unknown as Parameters<typeof checkEvidence>[0];
-      expect((await checkEvidence(evidence, { query })).ok).toBe(false);
+      const probe = async () => {
+        let met = false;
+        await checkExpectations(new Date(T0), {
+          listDueExpectations: async () => [...world.expectations.values()],
+          readCascade: async () =>
+            ({
+              cascadeId: spec.cascadeId,
+              woId: spec.woId,
+              project: spec.project,
+              request: { dryRun: false },
+              attempts: [{ runId: runs[0]!.id, workflowName: 'bound-workflow' }],
+            }) as never,
+          query,
+          markMet: async () => {
+            met = true;
+            return true;
+          },
+        });
+        return met;
+      };
+      expect(await probe()).toBe(false);
       runs[0]!.status = 'failed';
-      expect((await checkEvidence(evidence, { query })).ok).toBe(false);
+      expect(await probe()).toBe(false);
       runs[0]!.status = 'completed';
-      expect((await checkEvidence(evidence, { query })).ok).toBe(true);
+      expect(await probe()).toBe(true);
       expect(world.sentMessages.some(message => message.body.includes('Unclaimed P0'))).toBe(false);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
@@ -1275,7 +1373,7 @@ describe('fire_cauldron loop', () => {
           }) as NonNullable<TaskmasterDeps['runCascade']>,
         })
       );
-      expect(healthProviders.sort()).toEqual(['codex', 'xai']);
+      expect(healthProviders.sort()).toEqual(['codex', 'cursor', 'xai', 'zero']);
       expect(admissions).toBe(1);
       expect(
         world.journal.filter(row => row.action_type === 'fire_cauldron').map(row => row.thread_ref)
@@ -1317,7 +1415,7 @@ describe('fire_cauldron loop', () => {
       world.nowMs += 60_000;
     }
     expect(monitorTicks).toEqual([1, 97]);
-    expect(healthReads).toBe(97 * 2);
+    expect(healthReads).toBe(97 * 4);
   });
 
   test('pause scope=effects parks an eligible fire without admitting a cascade', async () => {
@@ -1366,10 +1464,11 @@ describe('fire_cauldron loop', () => {
     }
   });
 
-  test('grades completed fire useful and overdue running fire noise', async () => {
+  test('grades proven fire evidence and leaves overdue UNKNOWN ungraded', async () => {
     for (const testCase of [
       { id: 'completed-fire', status: 'completed', deadline: T0 + 60_000, grade: 'useful' },
       { id: 'overdue-running-fire', status: 'running', deadline: T0 - 1, grade: 'noise' },
+      { id: 'overdue-unknown-fire', status: null, deadline: T0 - 1, grade: null },
     ] as const) {
       const world = makeWorld();
       seedDigestSent(world);
@@ -1381,7 +1480,7 @@ describe('fire_cauldron loop', () => {
         proposal_json: JSON.stringify({
           type: 'fire_cauldron',
           cascadeId: `cascade-${testCase.id}`,
-          fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01' },
+          fireEvidence: { woId: 'WO-HARNESS-EXAMPLE-01', project: 'bdc-harness' },
         }),
         idempotency_key: `tm:fire:${testCase.id}`,
         before_hash: null,
@@ -1395,8 +1494,14 @@ describe('fire_cauldron loop', () => {
       await tick(
         createTaskmasterState(60_000),
         makeDeps(world, {
-          getFireRunEvidence: async () => {
+          getFireRunEvidence: async (woId, cascadeId, project) => {
             evidenceCalls += 1;
+            expect([woId, cascadeId, project]).toEqual([
+              'WO-HARNESS-EXAMPLE-01',
+              `cascade-${testCase.id}`,
+              'bdc-harness',
+            ]);
+            if (testCase.status === null) throw new Error('taskmaster_cascade_evidence_unknown');
             return { status: testCase.status, prOpened: false };
           },
         })
@@ -1404,6 +1509,554 @@ describe('fire_cauldron loop', () => {
       expect(evidenceCalls).toBe(1);
       expect(world.journal.find(row => row.id === testCase.id)?.grade).toBe(testCase.grade);
     }
+  });
+
+  test('entry_override_passed_for_cursor_and_zero_only', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    const low = {
+      state: 'LOW' as const,
+      tokensRemaining: 0,
+      isUnknown: false,
+      source: 'test' as const,
+      observedAt: new Date(T0).toISOString(),
+    };
+    const fireOnce = async (phase: 'cursor' | 'zero', ref: string): Promise<unknown> => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      let entryOverride: unknown;
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => [
+            makeListedThread({
+              ref,
+              priority: 'P1',
+              isUnclaimed: true,
+              title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+            }),
+          ],
+          headroom: async () => low,
+          getHealthSample: async provider => {
+            const state =
+              provider === 'codex'
+                ? 'degraded'
+                : provider === 'cursor'
+                  ? phase === 'cursor'
+                    ? 'healthy'
+                    : 'degraded'
+                  : provider === 'zero' && phase === 'zero'
+                    ? 'healthy'
+                    : 'degraded';
+            return {
+              provider,
+              state,
+              sampled_at: new Date(T0).toISOString(),
+              expires_at: new Date(T0 + 60_000).toISOString(),
+              evidence: null,
+            };
+          },
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-01',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+            },
+          }),
+          runCascade: (async options => {
+            admissions += 1;
+            entryOverride = options.entryOverride;
+            const record = { cascadeId: `cascade-${phase}`, status: 'running' } as never;
+            options.onAdmission?.(record, true);
+            return record;
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        })
+      );
+      expect(admissions).toBe(1);
+      return entryOverride;
+    };
+    try {
+      expect(await fireOnce('cursor', 'gh:thinmansoftware/bdc-harness#611')).toBe('cursor');
+      expect(await fireOnce('zero', 'gh:thinmansoftware/bdc-harness#612')).toBe('zero');
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('entry_override_absent_for_claude_codex_xai', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    const low = {
+      state: 'LOW' as const,
+      tokensRemaining: 0,
+      isUnknown: false,
+      source: 'test' as const,
+      observedAt: new Date(T0).toISOString(),
+    };
+    const cases = [
+      {
+        ref: 'gh:thinmansoftware/bdc-harness#621',
+        lane: 'claude',
+        headroom: undefined,
+        health: {} as Partial<Record<string, 'healthy' | 'degraded'>>,
+      },
+      {
+        ref: 'gh:thinmansoftware/bdc-harness#622',
+        lane: 'codex',
+        headroom: low,
+        health: {
+          codex: 'healthy' as const,
+          cursor: 'degraded' as const,
+          zero: 'degraded' as const,
+        },
+      },
+      {
+        ref: 'gh:thinmansoftware/bdc-harness#623',
+        lane: 'xai',
+        headroom: low,
+        health: {
+          codex: 'degraded' as const,
+          cursor: 'degraded' as const,
+          zero: 'degraded' as const,
+          xai: 'healthy' as const,
+        },
+      },
+    ];
+    // Measured Claude seat usage in this environment would skip the default
+    // lane. Unknown readings keep the test on the headroom decision.
+    setSeatUsageReaderForTests(async seats => {
+      const readings: Partial<
+        Record<(typeof seats)[number], ReturnType<typeof unknownSeatReading>>
+      > = {};
+      for (const seat of seats) readings[seat] = unknownSeatReading(seat, 'test');
+      return readings;
+    });
+    try {
+      for (const testCase of cases) {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const seen: unknown[] = [];
+        await tick(
+          createTaskmasterState(60_000),
+          makeDeps(world, {
+            listThreads: async () => [
+              makeListedThread({
+                ref: testCase.ref,
+                priority: 'P1',
+                isUnclaimed: true,
+                title: 'WO-HARNESS-EXAMPLE-01 urgent build',
+              }),
+            ],
+            ...(testCase.headroom ? { headroom: async () => testCase.headroom } : {}),
+            getHealthSample: async provider => {
+              const state = testCase.health[provider];
+              if (!state) return null;
+              return {
+                provider,
+                state,
+                sampled_at: new Date(T0).toISOString(),
+                expires_at: new Date(T0 + 60_000).toISOString(),
+                evidence: null,
+              };
+            },
+            checkFireEligibility: async () => ({
+              eligible: true,
+              evidence: {
+                woId: 'WO-HARNESS-EXAMPLE-01',
+                targetRepo: 'thinmansoftware/bdc-harness',
+                project: 'bdc-harness',
+                specVerifiedAt: new Date(T0).toISOString(),
+                noOpenOrMergedPr: true,
+                expectedSpec: EXPECTED_SPEC,
+              },
+            }),
+            runCascade: (async options => {
+              seen.push(options.entryOverride);
+              const record = { cascadeId: `cascade-${testCase.ref}`, status: 'running' } as never;
+              options.onAdmission?.(record, true);
+              return record;
+            }) as NonNullable<TaskmasterDeps['runCascade']>,
+          })
+        );
+        expect(seen).toEqual([undefined]);
+        expect(
+          world.journal.find(row => row.action_type === 'fire_cauldron')?.proposal_json
+        ).toContain(`on ${testCase.lane} lane`);
+      }
+    } finally {
+      setSeatUsageReaderForTests(null);
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+});
+
+describe('pending fire custody', () => {
+  let prior: string | undefined;
+  beforeEach(() => {
+    prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+  });
+  afterEach(() => {
+    if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+  });
+
+  function setup(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}) {
+    let fires = 0;
+    const deps = makeDeps(world, {
+      listUndeliveredRulings: async () => [],
+      escalationDelivery: makeIssueCommentSink(world).delivery,
+      listThreads: async () => [
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#700',
+          priority: 'P0',
+          isUnclaimedP0: true,
+          title: 'WO-HARNESS-CUSTODY-01',
+        }),
+      ],
+      checkFireEligibility: async title => ({
+        eligible: true,
+        evidence: {
+          woId: title,
+          project: 'bdc-harness',
+          targetRepo: 'thinmansoftware/bdc-harness',
+          noOpenOrMergedPr: true,
+          specVerifiedAt: new Date(T0).toISOString(),
+          expectedSpec: EXPECTED_SPEC,
+        },
+      }),
+      runCascade: async options => {
+        fires++;
+        const record = {
+          cascadeId: options.dispatchId,
+          woId: options.woId,
+          project: options.project,
+          status: 'running',
+          attempts: [],
+          request: { dryRun: false },
+        } as never;
+        options.onAdmission?.(record, true);
+        return record;
+      },
+      ...overrides,
+    });
+    return { deps, fires: () => fires };
+  }
+
+  test('admission without a proven workflow stays pending across later ticks and buckets', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world, {
+      readFireCascadeEvidence: async () => {
+        throw new Error('taskmaster_cascade_evidence_unknown');
+      },
+    });
+    const state = createTaskmasterState(60_000);
+    const first = await tick(state, fixture.deps);
+    const fire = world.journal.find(row => row.action_type === 'fire_cauldron');
+    expect(fire?.outcome).toBe('pending');
+    expect(JSON.parse(fire!.proposal_json).runId).toBeUndefined();
+    expect(first.effects).toBe(0);
+    world.nowMs += 4 * 3_600_000;
+    await tick(state, fixture.deps);
+    expect(fixture.fires()).toBe(1);
+    expect(fire?.outcome).toBe('pending');
+  });
+
+  test('journal sent identity is the actual workflow and stored supervision is cascade-bound', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world, {
+      readFireCascadeEvidence: async () => ({
+        earliestRunId: 'actual-workflow-123',
+        completedRunId: null,
+        status: 'running',
+        prOpened: false,
+      }),
+    });
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    const fire = world.journal.find(row => row.action_type === 'fire_cauldron')!;
+    const proposal = JSON.parse(fire.proposal_json);
+    expect(fire.outcome).toBe('sent');
+    expect(proposal.runId).toBe('actual-workflow-123');
+    expect(proposal.cascadeId).toBe(fire.idempotency_key);
+    const stored = [...world.expectations.values()][0]!;
+    expect(JSON.parse(stored.evidence_json)).toMatchObject({
+      kind: 'cascade_workflow_completed',
+      cascadeId: proposal.cascadeId,
+      woId: 'WO-HARNESS-CUSTODY-01',
+      project: 'bdc-harness',
+    });
+    expect(stored.due_at).toBe(fire.proof_deadline_at);
+  });
+
+  test('explicit zero-attempt refusal expires without reporting a sent fire', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world, {
+      runCascade: async options => {
+        const record = {
+          cascadeId: options.dispatchId,
+          woId: options.woId,
+          project: options.project,
+          status: 'refused',
+          attempts: [],
+        } as never;
+        options.onAdmission?.(record, true);
+        return record;
+      },
+    });
+    const result = await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('expired');
+    expect(result.effects).toBe(0);
+    expect(world.expectations.size).toBe(0);
+  });
+
+  test('ambiguous dispatch rejection retains pending custody instead of retryable failure', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    let calls = 0;
+    const fixture = setup(world, {
+      runCascade: async () => {
+        calls++;
+        throw new Error('synthetic ambiguous execution');
+      },
+      readFireCascadeEvidence: async () => {
+        throw new Error('unknown');
+      },
+    });
+    const state = createTaskmasterState(60_000);
+    await tick(state, fixture.deps);
+    await tick(state, fixture.deps);
+    expect(calls).toBe(1);
+    expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('pending');
+  });
+
+  test('four unconfirmed admissions consume only the existing three fire slots', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world, {
+      listThreads: async () =>
+        [1, 2, 3, 4].map(n =>
+          makeListedThread({
+            ref: `gh:thinmansoftware/bdc-harness#${700 + n}`,
+            priority: 'P0',
+            isUnclaimedP0: true,
+            title: `WO-HARNESS-CUSTODY-${String(n).padStart(2, '0')}`,
+          })
+        ),
+      readFireCascadeEvidence: async () => {
+        throw new Error('not ready');
+      },
+    });
+    const result = await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(3);
+    expect(
+      world.journal.filter(row => row.action_type === 'fire_cauldron' && row.outcome === 'pending')
+    ).toHaveLength(3);
+    expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(1);
+    expect(result.effects).toBe(0);
+  });
+
+  function seedPending(world: FakeWorld, ageDays = 8): TmJournalEntry {
+    const key = 'tm:fire:old-custody';
+    const created = world.nowMs - ageDays * 86_400_000;
+    const row: TmJournalEntry = {
+      id: 'old-pending-fire',
+      created_at: new Date(created).toISOString(),
+      thread_ref: 'gh:thinmansoftware/bdc-harness#700',
+      action_type: 'fire_cauldron',
+      proposal_json: JSON.stringify({
+        type: 'fire_cauldron',
+        threadRef: 'gh:thinmansoftware/bdc-harness#700',
+        recipient: 'xo',
+        body: '',
+        actsImmediately: true,
+        idempotencyKey: key,
+        cascadeId: key,
+        fireEvidence: {
+          woId: 'WO-HARNESS-CUSTODY-01',
+          project: 'bdc-harness',
+          targetRepo: 'thinmansoftware/bdc-harness',
+          expectedSpec: EXPECTED_SPEC,
+        },
+      }),
+      idempotency_key: key,
+      before_hash: null,
+      proof_predicate: 'actual workflow completion',
+      proof_deadline_at: new Date(created + 86_400_000).toISOString(),
+      outcome: 'pending',
+      graded_at: null,
+      grade: null,
+    };
+    world.journal.push(row);
+    return row;
+  }
+
+  for (const priorRegistration of ['none', 'matching', 'legacy-wrong'] as const) {
+    test(`old pending fire reconciles exact custody without another invocation (${priorRegistration})`, async () => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const pending = seedPending(world);
+      const due = pending.proof_deadline_at;
+      const key = expectationRegistrationKey(pending.id, pending.idempotency_key!);
+      if (priorRegistration !== 'none') {
+        world.expectations.set(key, {
+          id: 'existing-expectation',
+          dispatch_ref: pending.idempotency_key!,
+          recipient: 'xo',
+          evidence_json: JSON.stringify(
+            priorRegistration === 'matching'
+              ? {
+                  kind: 'cascade_workflow_completed',
+                  cascadeId: pending.idempotency_key,
+                  woId: 'WO-HARNESS-CUSTODY-01',
+                  project: 'bdc-harness',
+                }
+              : {
+                  kind: 'db_row_exists',
+                  table: 'remote_agent_workflow_runs',
+                  where: { id: pending.idempotency_key, status: ['completed'] },
+                }
+          ),
+          due_at: due!,
+          on_absence: 'escalate',
+          max_retries: 0,
+          retries: 0,
+          status: 'pending',
+          evidence_pointer: null,
+          registered_by: 'taskmaster',
+          self_supervised: 0,
+          created_at: pending.created_at,
+          updated_at: pending.created_at,
+        });
+      }
+      let invokes = 0;
+      const fixture = setup(world, {
+        listThreads: async () => [],
+        runCascade: async () => {
+          invokes++;
+          throw new Error('must not invoke');
+        },
+      });
+      await tick(createTaskmasterState(60_000), fixture.deps);
+      expect(invokes).toBe(0);
+      expect(world.expectations.size).toBe(1);
+      const stored = world.expectations.get(key)!;
+      expect(stored.due_at).toBe(due);
+      if (priorRegistration === 'legacy-wrong') {
+        expect(pending.outcome).toBe('pending');
+        expect(JSON.parse(pending.proposal_json).fireHoldReason).toBe(
+          'expectation-registration-mismatch'
+        );
+        expect(JSON.parse(stored.evidence_json).kind).toBe('db_row_exists');
+      } else {
+        expect(pending.outcome).toBe('sent');
+        expect(JSON.parse(pending.proposal_json).runId).toBe(`actual-${pending.idempotency_key}`);
+        if (priorRegistration === 'matching') expect(stored.id).toBe('existing-expectation');
+      }
+    });
+  }
+
+  test('old UNKNOWN custody holds its exact scope across a new key and process', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const pending = seedPending(world);
+    const fixture = setup(world, {
+      readFireCascadeEvidence: async () => {
+        throw new Error('missing record');
+      },
+    });
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(0);
+    expect(pending.outcome).toBe('pending');
+    expect(world.journal.filter(row => row.action_type === 'fire_cauldron')).toHaveLength(1);
+  });
+
+  test('malformed unresolved fire metadata holds all new fires rather than vanishing', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const pending = seedPending(world);
+    pending.proposal_json = '{';
+    const fixture = setup(world);
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(0);
+    expect(pending.outcome).toBe('pending');
+    expect(pending.proposal_json).toBe('{');
+  });
+
+  test('a malformed WO with trailing text cannot evade custody scope matching', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const pending = seedPending(world);
+    const proposal = JSON.parse(pending.proposal_json);
+    proposal.fireEvidence.woId += ' trailing text';
+    pending.proposal_json = JSON.stringify(proposal);
+    const fixture = setup(world);
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(0);
+    expect(pending.outcome).toBe('pending');
+  });
+
+  test('a project with whitespace cannot evade custody scope matching', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const pending = seedPending(world);
+    const proposal = JSON.parse(pending.proposal_json);
+    proposal.fireEvidence.project += ' ';
+    pending.proposal_json = JSON.stringify(proposal);
+    const fixture = setup(world);
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(0);
+    expect(pending.outcome).toBe('pending');
+  });
+
+  test('unavailable pending-custody read prevents new fire', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world);
+    fixture.deps.db!.listPendingFireActions = async () => {
+      throw new Error('unavailable');
+    };
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(fixture.fires()).toBe(0);
+  });
+
+  test('eight confirmed effects plus unconfirmed fire reservations obey the same ten-effect bound', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world, {
+      listUndeliveredRulings: async () =>
+        Array.from({ length: 8 }, (_, n) =>
+          ruling({ ref: `dispatch:budget-${n}`, undeliveredRulingId: `budget-${n}` })
+        ),
+      listThreads: async () =>
+        [1, 2, 3].map(n =>
+          makeListedThread({
+            ref: `gh:thinmansoftware/bdc-harness#${710 + n}`,
+            priority: 'P0',
+            isUnclaimedP0: true,
+            title: `WO-HARNESS-BUDGET-${String(n).padStart(2, '0')}`,
+          })
+        ),
+      readFireCascadeEvidence: async () => {
+        throw new Error('not ready');
+      },
+    });
+    const result = await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(result.effects).toBe(8);
+    expect(fixture.fires()).toBe(2);
+    expect(
+      world.journal.filter(row => row.action_type === 'fire_cauldron' && row.outcome === 'pending')
+    ).toHaveLength(2);
+    expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(1);
   });
 });
 
@@ -1911,6 +2564,39 @@ describe('failed effect reuse and successful-tick health', () => {
     expect(result.failed).toBe(0);
     expect(state.deadman.lastTickAtMs).toBe(T0);
   });
+
+  test.each(['rejected', 'empty'])(
+    'adoption snapshot after %s work-SOR read retains the correct custody',
+    async mode => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const deps = makeDeps(world, {
+        listThreads: async () => {
+          if (mode === 'rejected') throw new Error('synthetic rejected work-SOR read');
+          return [];
+        },
+        getGithubIssueEvidence: async () => makeEvidence(),
+      });
+      await refreshAdoption(
+        [makeListedThread({ ref: 'gh:thinmansoftware/bdc-xo#123', title: 'known work' })],
+        deps
+      );
+      const beforeMeta = structuredClone(world.adoptionMeta);
+      const beforeRows = structuredClone(world.adoptionRows);
+      const state = createTaskmasterState(60_000);
+      const result = await tick(state, deps);
+      if (mode === 'rejected') {
+        expect(world.adoptionMeta).toEqual(beforeMeta);
+        expect(world.adoptionRows).toEqual(beforeRows);
+        expect(result.successful).toBe(false);
+        expect(state.deadman.lastTickAtMs).toBeNull();
+      } else {
+        expect(world.adoptionMeta.row_count).toBe(0);
+        expect(world.adoptionRows).toEqual([]);
+        expect(result.successful).toBe(true);
+      }
+    }
+  );
 
   test('a failed source read does not advance the successful heartbeat', async () => {
     const world = makeWorld();
@@ -4839,10 +5525,6 @@ describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', 
               })
             : null,
       });
-      deps.db = {
-        ...deps.db!,
-        registerExpectation: async () => 'exp',
-      };
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
       world.nowMs += 60_000;

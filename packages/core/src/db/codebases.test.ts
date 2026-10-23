@@ -361,6 +361,28 @@ describe('codebases', () => {
   });
 
   describe('updateCodebase', () => {
+    test('updates default_branch', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateCodebase('codebase-123', { default_branch: 'staging' });
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        'UPDATE remote_agent_codebases SET default_branch = $1, updated_at = NOW() WHERE id = $2',
+        ['staging', 'codebase-123']
+      );
+    });
+
+    test('updates name', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateCodebase('codebase-123', { name: 'thinmansoftware/renamed' });
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        'UPDATE remote_agent_codebases SET name = $1, updated_at = NOW() WHERE id = $2',
+        ['thinmansoftware/renamed', 'codebase-123']
+      );
+    });
+
     test('updates default_cwd only', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 

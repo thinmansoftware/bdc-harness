@@ -2,6 +2,7 @@ import type { IndependentReviewFinding, ReviewAgentIdentity } from './independen
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
 import { classifyJudgeOutage, type JudgeOutage } from './judge-ladder-health';
+import { conclusionIsPassing, latestAttemptPerCheck } from './pr-review-check-ingest';
 import { createLogger } from '@archon/paths';
 import {
   buildJudgeTransport,
@@ -87,9 +88,18 @@ export interface PrReviewInput {
 }
 
 export interface PrReviewCheck {
+  id?: number;
   name: string;
   status: string;
   conclusion: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  app?: { slug?: string; name?: string };
+}
+
+export interface PrReviewCheckPartition {
+  gating: PrReviewCheck[];
+  nonRequired: PrReviewCheck[];
 }
 
 export interface PrReviewResult {
@@ -115,6 +125,8 @@ export interface PrReviewResult {
    * callers that prefer a duration to an instant.
    */
   retry_after_ms?: number;
+  /** Names of checks still awaited. Set only on CHECKS_PENDING. */
+  pendingChecks?: string[];
 }
 
 export interface PrReviewModelResult {
@@ -232,7 +244,7 @@ export function parseReviewVerdict(stdout: string): ParsedReviewVerdict | null {
 export function buildReviewPrompt(input: {
   request: PrReviewInput;
   diff: string;
-  checks: PrReviewCheck[];
+  checkPartition: PrReviewCheckPartition;
   acceptanceCriteria: string | null;
 }): string {
   return [
@@ -241,17 +253,109 @@ export function buildReviewPrompt(input: {
     'Report blocking issues as severity blocker or major. Advisory issues use minor or note.',
     'Return only one JSON object with this exact shape:',
     '{"verdict":"APPROVE|REQUEST_CHANGES","findings":[{"scope":"non-empty","severity":"blocker|major|minor|note","summary":"non-empty"}],"reviewed_head_sha":"exact input SHA"}',
-    'Use REQUEST_CHANGES only with at least one blocker or major finding. Never approve when checks fail or a stated acceptance criterion is unmet.',
+    'Use REQUEST_CHANGES only with at least one blocker or major finding. Never approve when a required check fails or a stated acceptance criterion is unmet.',
     '',
     `Repository: ${input.request.owner}/${input.request.repo}`,
     `Pull request: ${input.request.pr_number}`,
     `Exact head SHA: ${input.request.head_sha}`,
     `Work order: ${input.request.wo_id ?? 'unavailable'}`,
     `Acceptance criteria: ${input.acceptanceCriteria ?? 'unavailable; evaluate diff and checks only'}`,
-    `Checks: ${JSON.stringify(input.checks)}`,
+    `Required checks (these gate the verdict): ${JSON.stringify(input.checkPartition.gating)}`,
+    `Non-required checks (informational only; report a failure as severity note, never blocker or major): ${JSON.stringify(input.checkPartition.nonRequired)}`,
     'Diff:',
     input.diff,
   ].join('\n');
+}
+
+function normalizedCheckName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+export function partitionChecksByRequired(
+  checks: PrReviewCheck[],
+  requiredContexts?: readonly string[] | null
+): PrReviewCheckPartition {
+  const latest = latestAttemptPerCheck(checks);
+  if (requiredContexts == null || requiredContexts.length === 0) {
+    return { gating: latest, nonRequired: [] };
+  }
+  const required = new Set(requiredContexts.map(normalizedCheckName));
+  return {
+    gating: latest.filter(check => required.has(normalizedCheckName(check.name))),
+    nonRequired: latest.filter(check => !required.has(normalizedCheckName(check.name))),
+  };
+}
+
+type CheckGateResult = Pick<PrReviewResult, 'verdict' | 'findings'>;
+
+export function applyRequiredCheckGate<T extends CheckGateResult>(
+  parsed: T,
+  partition: PrReviewCheckPartition
+): T {
+  if (parsed.verdict !== 'APPROVE' && parsed.verdict !== 'REQUEST_CHANGES') return parsed;
+
+  const checks = [...partition.gating, ...partition.nonRequired];
+  const checkNames = new Set(checks.map(check => normalizedCheckName(check.name)));
+  const gatingNames = new Set(partition.gating.map(check => normalizedCheckName(check.name)));
+  const failedChecksByName = new Map<string, PrReviewCheck>();
+  for (const check of checks) {
+    if (check.status !== 'completed' || conclusionIsPassing(check.conclusion)) continue;
+    const name = normalizedCheckName(check.name);
+    if (!failedChecksByName.has(name)) failedChecksByName.set(name, check);
+  }
+  const findingsByCheck = new Map<string, IndependentReviewFinding[]>();
+  const reconciled: IndependentReviewFinding[] = [];
+
+  for (const finding of parsed.findings) {
+    if (!finding.scope.toLowerCase().startsWith('checks/')) {
+      reconciled.push(finding);
+      continue;
+    }
+    const scopedName = normalizedCheckName(finding.scope.slice('checks/'.length));
+    // A check-scoped finding is only authoritative when it corresponds to
+    // check evidence fetched for this exact head. Drop invented or stale check
+    // names so they cannot turn an otherwise passing review into a rejection.
+    if (!checkNames.has(scopedName)) continue;
+    if (!failedChecksByName.has(scopedName)) continue;
+    const held = findingsByCheck.get(scopedName) ?? [];
+    held.push(finding);
+    findingsByCheck.set(scopedName, held);
+    // Known failed check findings are rebuilt canonically below. This both
+    // removes duplicates and makes repeated applications deep-equal.
+  }
+
+  for (const [name, check] of failedChecksByName) {
+    const scope = `checks/${check.name}`;
+    if (gatingNames.has(name)) {
+      const existing = findingsByCheck
+        .get(name)
+        ?.find(finding => finding.severity === 'blocker' || finding.severity === 'major');
+      reconciled.push(
+        existing
+          ? { ...existing, scope }
+          : {
+              scope,
+              severity: 'major',
+              summary: `Required check ${check.name} failed.`,
+            }
+      );
+    } else {
+      reconciled.push({
+        scope,
+        severity: 'note',
+        summary: `${check.name} failed, but it is not a required check on the base branch and is non-blocking.`,
+      });
+    }
+  }
+
+  const hasBlockingFinding = reconciled.some(
+    finding => finding.severity === 'blocker' || finding.severity === 'major'
+  );
+  const hasFailedGatingCheck = partition.gating.some(
+    check => check.status === 'completed' && !conclusionIsPassing(check.conclusion)
+  );
+  const verdict = hasFailedGatingCheck || hasBlockingFinding ? 'REQUEST_CHANGES' : 'APPROVE';
+  return { ...parsed, verdict, findings: reconciled };
 }
 
 function indeterminate(
@@ -372,8 +476,9 @@ export function reviewErrorCode(error: string | undefined): string | null {
  * When `requiredContexts` is a known set (branch-protection required status
  * checks on the base branch) it is the authoritative complete-suite signal:
  * terminal only when EVERY required context has reported a check run AND every
- * reported check has completed. A required context that has not shown up yet
- * (or one that is present but still in_progress) keeps the suite non-terminal.
+ * applicable latest run for that context (one per GitHub App identity) has
+ * completed. A required context that has not shown up yet (or one whose latest
+ * run from any app is still in_progress) keeps the suite non-terminal.
  *
  * `null` means the authoritative set could NOT be obtained. That is never
  * terminal: we defer rather than fall back to the reported-checks heuristic,
@@ -395,15 +500,17 @@ export function checksAreTerminal(
 ): boolean {
   // UNKNOWN required set -- fail closed. Must be checked before any heuristic.
   if (requiredContexts === null) return false;
-  // A reported check that is still queued/in_progress means the suite is mid
-  // flight regardless of what is required -- never terminal.
-  const allReportedCompleted = checks.every(check => check.status === 'completed');
   if (requiredContexts !== undefined && requiredContexts.length > 0) {
-    const completedNames = new Set(
-      checks.filter(check => check.status === 'completed').map(check => check.name)
-    );
-    return allReportedCompleted && requiredContexts.every(context => completedNames.has(context));
+    const latest = latestAttemptPerCheck(checks);
+    return requiredContexts.every(context => {
+      const normalizedContext = normalizedCheckName(context);
+      const applicable = latest.filter(
+        check => normalizedCheckName(check.name) === normalizedContext
+      );
+      return applicable.length > 0 && applicable.every(check => check.status === 'completed');
+    });
   }
+  const allReportedCompleted = checks.every(check => check.status === 'completed');
   return checks.length > 0 && allReportedCompleted;
 }
 
@@ -434,7 +541,21 @@ function rateLimited(
   };
 }
 
-function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult {
+function checksPending(
+  input: PrReviewInput,
+  deps: PrReviewDeps,
+  checks: PrReviewCheck[],
+  requiredContexts: string[] | null | undefined
+): PrReviewResult {
+  const latest = latestAttemptPerCheck(checks);
+  const latestByName = new Map(latest.map(check => [normalizedCheckName(check.name), check]));
+  const pendingChecks =
+    requiredContexts && requiredContexts.length > 0
+      ? requiredContexts.flatMap(context => {
+          const check = latestByName.get(normalizedCheckName(context));
+          return check?.status === 'completed' ? [] : [check?.name ?? context.trim()];
+        })
+      : latest.filter(check => check.status !== 'completed').map(check => check.name);
   return {
     verdict: 'CHECKS_PENDING',
     findings: [],
@@ -442,6 +563,7 @@ function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult
     reviewer: deps.reviewer,
     acceptance_criteria_available: false,
     error: 'checks_pending',
+    ...(checks.length === 0 ? {} : { pendingChecks }),
   };
 }
 
@@ -502,7 +624,7 @@ export async function evaluatePullRequest(
   // must NOT be coalesced (e.g. `?? []`), which would erase the unknown state
   // and silently fail open. The model is not invoked in this branch.
   if (!checksAreTerminal(evidence.checks, evidence.requiredContexts)) {
-    return checksPending(input, deps);
+    return checksPending(input, deps, evidence.checks, evidence.requiredContexts);
   }
 
   let acceptanceCriteria: string | null = null;
@@ -514,10 +636,11 @@ export async function evaluatePullRequest(
     }
   }
   const acceptanceCriteriaAvailable = nonEmpty(acceptanceCriteria);
+  const checkPartition = partitionChecksByRequired(evidence.checks, evidence.requiredContexts);
   const prompt = buildReviewPrompt({
     request: input,
     diff: evidence.diff,
-    checks: evidence.checks,
+    checkPartition,
     acceptanceCriteria,
   });
   const ladder = deps.ladder ?? defaultReviewLadder();
@@ -605,7 +728,7 @@ export async function evaluatePullRequest(
       }
       getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_verdict_produced');
       return {
-        ...parsed,
+        ...applyRequiredCheckGate(parsed, checkPartition),
         reviewer: { provider: deps.reviewer.provider, model: binary },
         acceptance_criteria_available: acceptanceCriteriaAvailable,
       };

@@ -235,6 +235,9 @@ COPY .archon/ ./.archon/
 COPY migrations/ ./migrations/
 COPY tsconfig*.json ./
 
+# Entrypoints used by the container GitHub transport and credential preflight.
+COPY scripts/github-service-token.ts scripts/github-service-exec.ts scripts/github-service-login.ts ./scripts/
+
 # Fix permissions for appuser
 RUN chown -R appuser:appuser /app
 

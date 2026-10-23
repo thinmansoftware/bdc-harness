@@ -87,7 +87,10 @@ import {
 } from '@archon/workflows/schemas/workflow-run';
 import type { ApprovalContext, WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
+import { sanitizeCredentials } from '@archon/core/utils/credential-sanitizer';
+import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { startTaskmaster, getTaskmasterRuntime, getTickHealth } from '../taskmaster/loop';
+import { normalizeRepo } from '../taskmaster/fire-eligibility';
 import { startTaskmasterDeadmanChecker } from '@archon/overseer/taskmaster-deadman-check';
 import { startOperatorInboxConsumer } from '../dispatch/operator-inbox-consumer';
 import { startInboxReader, shouldStartOperatorInboxConsumer } from '../dispatch/inbox-reader';
@@ -282,6 +285,7 @@ import {
   codebaseSchema,
   codebaseIdParamsSchema,
   addCodebaseBodySchema,
+  updateCodebaseBodySchema,
   deleteCodebaseResponseSchema,
   codebaseEnvVarsResponseSchema,
   setEnvVarBodySchema,
@@ -1565,6 +1569,32 @@ const addCodebaseRoute = createRoute({
   },
 });
 
+const updateCodebaseRoute = createRoute({
+  method: 'patch',
+  path: '/api/codebases/{id}',
+  tags: ['Codebases'],
+  summary: 'Edit a codebase registration',
+  request: {
+    params: codebaseIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: updateCodebaseBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: codebaseSchema } },
+      description: 'Updated codebase',
+    },
+    400: jsonError('Bad request'),
+    404: jsonError('Not found'),
+    409: jsonError('Repository URL cannot be resolved to GitHub'),
+    422: jsonError('Branch not found on remote'),
+    502: jsonError('Branch verification unavailable'),
+    500: jsonError('Server error'),
+  },
+});
+
 const deleteCodebaseRoute = createRoute({
   method: 'delete',
   path: '/api/codebases/{id}',
@@ -2572,7 +2602,7 @@ export function registerApiRoutes(
     // (bdc-xo#2007). A cap breach is a rate refusal, not a malformed request:
     // reporting it as 400 would tell a caller to fix a body that is correct,
     // and as 403 would tell it to stop trying rather than to try later.
-    status: 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500 | 503,
+    status: 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500 | 502 | 503,
     message: string,
     detail?: string
   ): Response {
@@ -5652,6 +5682,101 @@ export function registerApiRoutes(
     }
   });
 
+  // PATCH /api/codebases/:id - Edit registration metadata
+  registerOpenApiRoute(updateCodebaseRoute, async c => {
+    const id = c.req.param('id') ?? '';
+    const body = getValidatedBody(c, updateCodebaseBodySchema);
+
+    try {
+      const codebase = await codebaseDb.getCodebase(id);
+      if (!codebase) {
+        return apiError(c, 404, 'Codebase not found');
+      }
+
+      if (typeof body.repository_url === 'string') {
+        let repositoryUrl: URL;
+        try {
+          repositoryUrl = new URL(body.repository_url);
+        } catch {
+          return apiError(c, 400, 'repository_url_invalid');
+        }
+        if (repositoryUrl.username || repositoryUrl.password) {
+          return apiError(c, 400, 'repository_url_contains_credential');
+        }
+      }
+
+      if (body.default_branch !== undefined) {
+        const effectiveRepositoryUrl = Object.prototype.hasOwnProperty.call(body, 'repository_url')
+          ? body.repository_url
+          : codebase.repository_url;
+        if (!effectiveRepositoryUrl) {
+          return apiError(c, 409, 'repository_url_not_github');
+        }
+
+        const repoParts = normalizeRepo(effectiveRepositoryUrl).split('/');
+        if (repoParts.length !== 2 || repoParts.some(part => part.length === 0)) {
+          return apiError(c, 409, 'repository_url_not_github');
+        }
+
+        const [owner, repo] = repoParts;
+        const url = `https://api.github.com/repos/${encodeURIComponent(owner ?? '')}/${encodeURIComponent(repo ?? '')}/branches/${encodeURIComponent(body.default_branch)}`;
+        const verificationUnavailable = (): Response =>
+          apiError(c, 502, 'branch_verification_unavailable');
+        let verificationResponse: Response;
+        try {
+          verificationResponse = await serviceGitHubFetchWithPermissionFallback({
+            service: 'smart_cauldron',
+            url,
+          });
+        } catch {
+          return verificationUnavailable();
+        }
+        if (verificationResponse.status === 404) {
+          return apiError(c, 422, 'branch_not_found_on_remote');
+        }
+        if (!verificationResponse.ok) {
+          return verificationUnavailable();
+        }
+      }
+
+      await codebaseDb.updateCodebase(id, body);
+      const updated = await codebaseDb.getCodebase(id);
+      if (!updated) {
+        return apiError(c, 500, 'Codebase updated but not found');
+      }
+
+      let commands = updated.commands;
+      if (typeof commands === 'string') {
+        try {
+          commands = JSON.parse(commands);
+        } catch (parseErr) {
+          getLog().error({ err: parseErr, codebaseId: updated.id }, 'corrupted_commands_json');
+          commands = {};
+        }
+      }
+
+      const changes: Record<string, { from: unknown; to: unknown }> = {};
+      for (const field of ['name', 'default_branch', 'default_cwd', 'repository_url'] as const) {
+        if (!Object.prototype.hasOwnProperty.call(body, field)) continue;
+        const from = codebase[field];
+        const to = body[field];
+        changes[field] =
+          field === 'repository_url'
+            ? {
+                from: typeof from === 'string' ? sanitizeCredentials(from) : from,
+                to: typeof to === 'string' ? sanitizeCredentials(to) : to,
+              }
+            : { from, to };
+      }
+      getLog().info({ codebaseId: id, changes }, 'codebase_updated');
+
+      return c.json({ ...updated, commands });
+    } catch (error) {
+      getLog().error({ err: error, codebaseId: id }, 'update_codebase_failed');
+      return apiError(c, 500, 'Failed to update codebase');
+    }
+  });
+
   // DELETE /api/codebases/:id - Delete a project and clean up
   registerOpenApiRoute(deleteCodebaseRoute, async c => {
     const id = c.req.param('id') ?? '';
@@ -6160,7 +6285,10 @@ export function registerApiRoutes(
         return apiError(c, 400, `Cannot cancel workflow in '${run.status}' status`);
       }
       const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
-      const reason = body.reason ?? '';
+      const reason =
+        typeof body.reason === 'string' && body.reason.trim()
+          ? body.reason
+          : 'API cancellation requested; caller did not supply a reason';
       await workflowDb.cancelWorkflowRun(runId);
       void workflowEventDb.createWorkflowEvent({
         workflow_run_id: runId,

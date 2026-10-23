@@ -113,9 +113,11 @@ else
 fi
 unset _GH_AUTH_TOKEN
 
-if [ -n "${GITHUB_APP_ID:-}${GITHUB_APP_RUN_NODES_ID:-}${GITHUB_APP_TASKMASTER_ID:-}" ]; then
+if [ -n "${GITHUB_APP_RUN_NODES_ID:-}" ] && [ "${GITHUB_APP_RUN_NODES_ID:-}" != "${GITHUB_APP_ID:-}" ]; then
   $RUNNER git config --global credential."https://github.com".helper \
     '!f() { if [ "$1" = get ]; then token=$(bun /app/scripts/github-service-token.ts run_nodes) || exit; printf "username=x-access-token\npassword=%s\n" "$token"; fi; }; f'
+elif [ -n "${GITHUB_APP_RUN_NODES_ID:-}" ]; then
+  echo "[archon] ERROR: GITHUB_APP_RUN_NODES_ID equals GITHUB_APP_ID -- builder App would be the reviewer; App helper NOT installed, git push uses the PAT" >&2
 fi
 
 # Pin the glibc Claude Code binary to bypass the SDK's musl-first resolver.

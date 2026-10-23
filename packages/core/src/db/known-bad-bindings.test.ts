@@ -6,6 +6,7 @@ const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
 mock.module('./connection', () => ({
   pool: { query: mockQuery },
   getDialect: () => mockPostgresDialect,
+  getDatabase: () => ({ dialect: 'postgres' }),
 }));
 
 import {
@@ -69,6 +70,13 @@ describe('known-bad-bindings db', () => {
     mockQuery.mockResolvedValueOnce(createQueryResult([{ ...row, clear_reason: 'operator' }]));
     const cleared = await clearKnownBadBinding('binding-1', 'operator');
     expect(cleared?.clear_reason).toBe('operator');
+    expect(mockQuery.mock.calls[0]).toEqual([
+      `UPDATE known_bad_bindings
+     SET cleared_at = $2, clear_reason = $3
+     WHERE binding_key = $1 AND cleared_at IS NULL
+     RETURNING *`,
+      ['binding-1', expect.any(String), 'operator'],
+    ]);
   });
 
   test('clears by fire reprobe reason', async () => {
@@ -81,5 +89,34 @@ describe('known-bad-bindings db', () => {
     mockQuery.mockResolvedValueOnce(createQueryResult([{ ...row, hit_count: 2 }]));
     const updated = await incrementKnownBadBindingHit('binding-1');
     expect(updated?.hit_count).toBe(2);
+    expect(mockQuery.mock.calls[0]).toEqual([
+      `UPDATE known_bad_bindings
+     SET hit_count = hit_count + 1, last_seen_at = $2
+     WHERE binding_key = $1 AND cleared_at IS NULL
+     RETURNING *`,
+      ['binding-1', expect.any(String)],
+    ]);
   });
+
+  test('PostgreSQL zero-row increment and clear retain null results', async () => {
+    mockQuery.mockResolvedValueOnce(createQueryResult([]));
+    expect(await incrementKnownBadBindingHit('missing')).toBeNull();
+    mockQuery.mockResolvedValueOnce(createQueryResult([]));
+    expect(await clearKnownBadBinding('missing', 'operator')).toBeNull();
+  });
+
+  for (const mutation of ['increment', 'clear'] as const) {
+    test(`PostgreSQL ${mutation} query errors propagate unchanged`, async () => {
+      const failure = new Error('postgres-test-failure');
+      mockQuery.mockRejectedValueOnce(failure);
+      let caught: unknown;
+      try {
+        if (mutation === 'increment') await incrementKnownBadBindingHit('binding-1');
+        else await clearKnownBadBinding('binding-1', 'operator');
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBe(failure);
+    });
+  }
 });
