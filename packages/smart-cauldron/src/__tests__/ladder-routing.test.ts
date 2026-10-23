@@ -76,6 +76,7 @@ test('current parsed Codex-only lane is refused before admission and leaves glob
   const workflow = parse(await readFile(path, 'utf8'));
   expect(workflow.provider).toBe('codex');
   expect(workflow.name).toBe('bdc-feature-development-codex-only');
+  expect(workflow.failover_provider).toBeUndefined();
   const prompts = workflow.nodes.filter(
     (node: Record<string, unknown>) => node.prompt || node.loop
   );
