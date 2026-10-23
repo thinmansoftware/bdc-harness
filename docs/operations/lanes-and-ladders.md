@@ -35,3 +35,32 @@ tier (cascade hard-refuses before fire).
 
 Do not reconnect broken router entries "to try them." Keep the multi-tier vision;
 do not make dark lanes live entry points.
+
+## Reviewer-author guard
+
+Every `bdc-feature-development*` lane refuses to open a pull request as the
+reviewer identity. The `open-pr-if-needed` node resolves the lane's acting GitHub
+login and, immediately before `gh pr create`, aborts the node if:
+
+- the acting login equals the reviewer identity
+  (`OVERSEER_REVIEW_IDENTITY`, default `thinman-overseer[bot]`; matched
+  case-insensitively, and `app/<slug>` / `<slug>[bot]` are treated as the same
+  identity) -- error token `builder_is_reviewer`; or
+- the acting login cannot be resolved at all -- error token
+  `acting_login_unresolved` (fail closed).
+
+This is the lane-side wall for the 2026-10-20 incident where lanes with no builder
+App opened shopops #887/#888/#889 as `thinman-overseer[bot]`, which Overseer then
+refused with `custody_conflict`. Builders build; the reviewer reviews.
+
+The acting login is resolved by the helper script:
+
+```
+bun scripts/github-service-login.ts <service>
+```
+
+It prints the acting login only (never a token): a PAT identity via `GET /user`,
+an App identity via `GET /app` as `<slug>[bot]`. The node calls it as
+`bun /app/scripts/github-service-login.ts "${ARCHON_GITHUB_SERVICE:-run_nodes}"`
+when that file is present in the image, and falls back to `gh api user` otherwise.
+See `WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01`.

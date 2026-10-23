@@ -498,6 +498,8 @@ test.each([
       }
       await writeRecord(prior, directory);
     }
+    if (scenario === 'matching-permission')
+      await db.query("UPDATE tm_journal SET outcome='pending' WHERE id='collision'");
     const reconcile = async (at: string) => {
       await expect(
         loop.tick(loop.createTaskmasterState(60_000), {
@@ -540,6 +542,14 @@ test.each([
         expect(after.admitted_at).toBe(before.admitted_at);
         expect(after.owner_token).toBe(before.owner_token);
         expect(after.utc_day).toBe(before.utc_day);
+        // Accounting proof alone cannot confirm custody, before or after restart.
+        expect(
+          (
+            await db.query<{ outcome: string }>(
+              "SELECT outcome FROM tm_journal WHERE id='collision'"
+            )
+          ).rows[0]!.outcome
+        ).toBe('pending');
       } else expect(after).toEqual(before);
     };
     await reconcile(day);

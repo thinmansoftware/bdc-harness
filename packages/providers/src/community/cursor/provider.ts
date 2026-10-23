@@ -110,6 +110,9 @@ export class CursorAgentProvider implements IAgentProvider {
     if (!cwd) {
       throw new Error('provider:cursor requires a non-empty cwd (worktree path)');
     }
+    if (options?.abortSignal?.aborted) {
+      throw new Error('Query aborted');
+    }
     const model = options?.model ?? this.model;
     const argv = buildCursorAgentArgv(this.binaryPath, model, cwd);
     const child = this.spawn(argv, { cwd, env: { ...process.env, ...(options?.env ?? {}) } });

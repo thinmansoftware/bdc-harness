@@ -1,8 +1,9 @@
 import { readFile } from 'fs/promises';
 import { z } from 'zod';
-import { CANARY_LANES, type CanaryManifest } from './types';
+import { CANARY_LANES, CANARY_PROBE_WORKFLOWS, type CanaryManifest } from './types';
 
 const laneName = z.enum(CANARY_LANES);
+const probeWorkflow = z.enum(CANARY_PROBE_WORKFLOWS);
 const rawManifestSchema = z.object({
   schema_version: z.literal(1),
   environment: z.object({
@@ -22,7 +23,7 @@ const rawManifestSchema = z.object({
         wo_class: z.enum(['CODE', 'INFRA', 'MIXED']).optional(),
         tags: z.array(z.string().min(1)),
         expected_tier: z.string().min(1),
-        expected_workflow: laneName,
+        expected_workflow: probeWorkflow,
       })
     )
     .min(1),

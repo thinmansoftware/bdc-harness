@@ -103,6 +103,32 @@ description updates and tests on the owner's draft PR1166 against dev without
 another XO grant. It does not authorize ready-for-review, merge, runtime,
 database, credential or production changes. The manifest remains BLOCKED.
 
+## Development integration (2026-10-23)
+
+The owned draft integrates dev240d96283018ba05d6c4d0cb0dea9ee873fad37c
+without rewriting the published cap history. Daily reservation and the awaited
+permission gate now wrap dev's pending-fire custody path. A committed permission
+counts against the daily limit even when the workflow result is uncertain.
+Admission accounting alone cannot mark a journal row sent or replace its
+supervision. The existing exact cascade/workflow proof, expectation readback,
+original proof deadline and conditional pending-to-sent transition own that step.
+Restart accounting retains this separation, including across UTC rollover.
+
+An identity-bound refusal before the permission gate releases only the owner's
+uncommitted reservation. A refusal after committed permission stays charged;
+missing workflow proof keeps custody pending. A release-storage error also keeps
+custody pending. The default two-per-day and existing three-per-tick ceilings
+both apply. Dev's lane routing, pending-scope exclusion and package test isolation
+are retained. No live service, provider, credential or registry change is involved.
+
+Local integrated verification: Taskmaster plus cap526pass/0fail/1957assertions
+across17files, workspace/script types exit0, production DAL/adapter/loop lint
+exit0. Core Taskmaster110pass/0fail/371assertions; SQLite49pass/0fail/357assertions
+with its existing one Windows symlink skip. Fresh hosted Windows/Linux/PG and
+exact-head review remain required. Original recorder EPERM and earlier PostgreSQL
+failure evidence remain historical facts; these tests do not establish an EPERM
+cause or production readiness.
+
 ## Verification
 
 From a clean checkout with existing dependencies:

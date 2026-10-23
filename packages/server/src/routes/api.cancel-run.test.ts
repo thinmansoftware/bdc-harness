@@ -285,7 +285,11 @@ describe('POST /api/workflows/runs/:runId/cancel', () => {
     expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-uuid-1');
   });
 
-  test('captures reason in run_cancelled event', async () => {
+  test.each([
+    'zombie cleanup',
+    'smart-cauldron stall: provider_silent; cascade cascade-123',
+    '  caller supplied reason  ',
+  ])('captures caller reason verbatim in run_cancelled event: %s', async reason => {
     mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_RUNNING_RUN);
     mockGetWorkflowRun.mockImplementationOnce(async () => ({
       ...MOCK_RUNNING_RUN,
@@ -297,7 +301,7 @@ describe('POST /api/workflows/runs/:runId/cancel', () => {
     await app.request('/api/workflows/runs/run-uuid-1/cancel', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reason: 'zombie cleanup' }),
+      body: JSON.stringify({ reason }),
     });
 
     // Allow fire-and-forget event to flush
@@ -306,7 +310,7 @@ describe('POST /api/workflows/runs/:runId/cancel', () => {
       expect.objectContaining({
         workflow_run_id: 'run-uuid-1',
         event_type: 'run_cancelled',
-        data: expect.objectContaining({ reason: 'zombie cleanup' }),
+        data: expect.objectContaining({ reason, actor: 'api' }),
       })
     );
   });
@@ -327,9 +331,44 @@ describe('POST /api/workflows/runs/:runId/cancel', () => {
       expect.objectContaining({
         event_type: 'run_cancelled',
         workflow_run_id: 'run-uuid-1',
+        data: {
+          reason: 'API cancellation requested; caller did not supply a reason',
+          actor: 'api',
+        },
       })
     );
   });
+
+  test.each([{}, { reason: '' }, { reason: '  ' }, { reason: '\r\n\t' }])(
+    'records an explicit missing-reason explanation for %j',
+    async requestBody => {
+      mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_RUNNING_RUN);
+      mockGetWorkflowRun.mockImplementationOnce(async () => ({
+        ...MOCK_RUNNING_RUN,
+        status: 'cancelled' as const,
+      }));
+      mockCancelWorkflowRun.mockImplementationOnce(async () => {});
+      const { app } = makeApp();
+      const response = await app.request('/api/workflows/runs/run-uuid-1/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
+
+      expect(response.status).toBe(200);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          event_type: 'run_cancelled',
+          workflow_run_id: 'run-uuid-1',
+          data: {
+            reason: 'API cancellation requested; caller did not supply a reason',
+            actor: 'api',
+          },
+        })
+      );
+    }
+  );
 
   test('returns updated run row in response body', async () => {
     const cancelledRun = { ...MOCK_RUNNING_RUN, status: 'cancelled' as const, completed_at: NOW };

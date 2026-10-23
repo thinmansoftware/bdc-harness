@@ -387,8 +387,8 @@ function checkAttemptIsNewer(candidate: RecheckCheckRun, current: RecheckCheckRu
   return (candidate.id ?? 0) > (current.id ?? 0);
 }
 
-function latestAttemptPerCheck(runs: RecheckCheckRun[]): RecheckCheckRun[] {
-  const latest = new Map<string, RecheckCheckRun>();
+export function latestAttemptPerCheck<T extends RecheckCheckRun>(runs: T[]): T[] {
+  const latest = new Map<string, T>();
   for (const run of runs) {
     const key = checkAttemptKey(run);
     const held = latest.get(key);

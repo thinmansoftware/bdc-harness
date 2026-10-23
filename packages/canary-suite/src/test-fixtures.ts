@@ -22,22 +22,22 @@ export const manifest: CanaryManifest = {
       id: 'generic-code',
       woClass: 'CODE',
       tags: [],
-      expectedTier: 'codex',
-      expectedWorkflow: 'bdc-feature-development-codex',
+      expectedTier: 'cursor',
+      expectedWorkflow: 'bdc-feature-development-cursor',
     },
     {
       id: 'security-code',
       woClass: 'CODE',
       tags: ['security'],
-      expectedTier: 'claude',
-      expectedWorkflow: 'bdc-feature-development',
+      expectedTier: 'cursor',
+      expectedWorkflow: 'bdc-feature-development-cursor',
     },
     {
       id: 'infra',
       woClass: 'INFRA',
       tags: [],
-      expectedTier: 'claude',
-      expectedWorkflow: 'bdc-feature-development',
+      expectedTier: 'cursor',
+      expectedWorkflow: 'bdc-feature-development-cursor',
     },
   ],
 };
@@ -76,6 +76,7 @@ export const baseSnapshot: CanarySnapshot = {
   ladder: {
     tiers: [
       { name: 'zero', workflowName: 'bdc-feature-development-zero-open', isFrontier: false },
+      { name: 'cursor', workflowName: 'bdc-feature-development-cursor', isFrontier: false },
       { name: 'codex', workflowName: 'bdc-feature-development-codex', isFrontier: false },
       { name: 'claude', workflowName: 'bdc-feature-development', isFrontier: false },
     ],
@@ -83,10 +84,10 @@ export const baseSnapshot: CanarySnapshot = {
   ruleset: {
     defaultEntry: 'codex',
     rules: [
-      { match: { tags: ['security'] }, entry: 'claude' },
-      { match: { woClass: 'INFRA' }, entry: 'claude' },
+      { match: { tags: ['security'] }, entry: 'cursor' },
+      { match: { woClass: 'INFRA' }, entry: 'cursor' },
       { match: { woClass: 'CODE', tags: ['mechanical'] }, entry: 'zero' },
-      { match: { woClass: 'CODE' }, entry: 'codex' },
+      { match: { woClass: 'CODE' }, entry: 'cursor' },
     ],
   },
 };

@@ -418,6 +418,143 @@ fi
 rm -rf "$TMPHOME"
 
 # ---------------------------------------------------------------------------
+# WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01 -- reviewer-author guard.
+# The guard lives in the open-pr-if-needed node (all 13 bdc-feature-development*
+# lanes) immediately before the gh-pr-create block. It resolves the acting GitHub
+# login and refuses to open a PR (exit/return 1 BEFORE any gh pr create) when that
+# login is the reviewer identity, or when it cannot be resolved at all. The
+# function below is lifted from the YAML guard: the only adaptations are the
+# wrapper (reviewer_guard), `local` vars, and exit->return (the open_pr_block
+# lifting discipline above). Keep the logic, strings, and env names in lockstep
+# with the YAML block (Test 23 enforces the 13 lanes stay byte-identical).
+# Tests 20-22 -> Section 7 Tests 3-5 ; Test 23 -> Section 7 Test 6.
+# ---------------------------------------------------------------------------
+GUARD_CREATE_COUNT_FILE=$(mktemp)
+echo 0 > "$GUARD_CREATE_COUNT_FILE"
+export GUARD_CREATE_COUNT_FILE
+_guard_create_count() { cat "$GUARD_CREATE_COUNT_FILE"; }
+_guard_reset() { echo 0 > "$GUARD_CREATE_COUNT_FILE"; }
+
+# gh stub for the guard tests: `gh api user` returns the login chosen by
+# GH_USER_MODE; `gh pr create` must NEVER be reached by the guard, but we count
+# it so the tests can assert zero create calls.
+gh() {
+  case "$1 $2" in
+    "api user")
+      case "$GH_USER_MODE" in
+        overseer)           echo "thinman-overseer[bot]" ;;
+        builder_mixed_case) echo "Thinman-Builder[bot]" ;;
+        distinct)           echo "bluedevilcollectibles" ;;
+        empty)              return 1 ;;
+      esac
+      ;;
+    "pr create")
+      local c; c=$(( $(cat "$GUARD_CREATE_COUNT_FILE") + 1 )); echo "$c" > "$GUARD_CREATE_COUNT_FILE"
+      echo "https://github.com/foo/bar/pull/1"; return 0
+      ;;
+  esac
+}
+export -f gh 2>/dev/null || true
+export GH_USER_MODE
+
+reviewer_guard() {
+  local REVIEWER_LOGIN="${OVERSEER_REVIEW_IDENTITY:-thinman-overseer[bot]}"
+  resolve_acting_login() {
+    if [ -f /app/scripts/github-service-login.ts ]; then
+      bun /app/scripts/github-service-login.ts "${ARCHON_GITHUB_SERVICE:-run_nodes}" 2>/dev/null
+    else
+      gh api user --jq .login 2>/dev/null
+    fi
+  }
+  normalize_login() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's#^app/##;s/\[bot\]$//'
+  }
+  local ACTING_LOGIN
+  ACTING_LOGIN="$(resolve_acting_login | head -n 1 | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+  if [ -z "$ACTING_LOGIN" ]; then
+    echo "ERROR: acting_login_unresolved: cannot determine the GitHub identity for gh pr create" >&2
+    return 1
+  fi
+  if [ "$(normalize_login "$ACTING_LOGIN")" = "$(normalize_login "$REVIEWER_LOGIN")" ]; then
+    echo "ERROR: builder_is_reviewer: acting login ${ACTING_LOGIN} equals reviewer identity ${REVIEWER_LOGIN} -- builders build, the reviewer reviews (bdc-xo WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01)" >&2
+    return 1
+  fi
+  # Lifted from the YAML guard: disable the github-service-exec permission fallback
+  # so an App 403 on gh pr create fails closed instead of silently retrying with the
+  # reviewer/user PAT fallback. (github-service-exec.test.ts asserts the TS behavior.)
+  export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
+  echo "acting_login=${ACTING_LOGIN}"
+  return 0
+}
+
+# Test 20 (Section 7 Test 3) -- refuses the reviewer identity before any create.
+GH_USER_MODE=overseer; _guard_reset; unset OVERSEER_REVIEW_IDENTITY
+OUT=$(reviewer_guard 2>&1); RC=$?
+if [ $RC -eq 1 ] && echo "$OUT" | grep -q "builder_is_reviewer" && [ "$(_guard_create_count)" -eq 0 ]; then
+  _ok "Test 20: guard refuses reviewer identity, create never called"
+else
+  _no "Test 20: guard refuses reviewer identity" "rc=1 builder_is_reviewer creates=0" "rc=$RC creates=$(_guard_create_count) out=$OUT"
+fi
+
+# Test 21 (Section 7 Test 4) -- honors OVERSEER_REVIEW_IDENTITY override, case-insensitively.
+GH_USER_MODE=builder_mixed_case; _guard_reset; OVERSEER_REVIEW_IDENTITY="thinman-builder[bot]"
+OUT=$(reviewer_guard 2>&1); RC=$?
+unset OVERSEER_REVIEW_IDENTITY
+if [ $RC -eq 1 ] && echo "$OUT" | grep -q "builder_is_reviewer" && [ "$(_guard_create_count)" -eq 0 ]; then
+  _ok "Test 21: guard honors env override + case-insensitive match"
+else
+  _no "Test 21: guard honors env override" "rc=1 builder_is_reviewer creates=0" "rc=$RC creates=$(_guard_create_count) out=$OUT"
+fi
+
+# Test 22a (Section 7 Test 5a) -- a distinct builder login passes.
+GH_USER_MODE=distinct; _guard_reset; unset OVERSEER_REVIEW_IDENTITY
+OUT=$(reviewer_guard 2>&1); RC=$?
+if [ $RC -eq 0 ] && echo "$OUT" | grep -q "acting_login=bluedevilcollectibles" && [ "$(_guard_create_count)" -eq 0 ]; then
+  _ok "Test 22a: distinct builder login passes the guard"
+else
+  _no "Test 22a: distinct builder login passes" "rc=0 acting_login=bluedevilcollectibles creates=0" "rc=$RC creates=$(_guard_create_count) out=$OUT"
+fi
+
+# Test 22b (Section 7 Test 5b) -- fails closed when the acting login cannot be resolved.
+GH_USER_MODE=empty; _guard_reset; unset OVERSEER_REVIEW_IDENTITY
+OUT=$(reviewer_guard 2>&1); RC=$?
+if [ $RC -eq 1 ] && echo "$OUT" | grep -q "acting_login_unresolved" && [ "$(_guard_create_count)" -eq 0 ]; then
+  _ok "Test 22b: fails closed (acting_login_unresolved) when identity unknown"
+else
+  _no "Test 22b: fails closed when identity unknown" "rc=1 acting_login_unresolved creates=0" "rc=$RC creates=$(_guard_create_count) out=$OUT"
+fi
+unset -f gh
+unset ARCHON_GITHUB_NO_PERMISSION_FALLBACK
+rm -f "$GUARD_CREATE_COUNT_FILE"
+
+# Test 23 (Section 7 Test 6) -- all 13 bdc-feature-development*.yaml lanes carry the
+# guard exactly once AND the extracted guard block is byte-identical across them.
+GUARD_DEFAULTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+_extract_guard_block() {
+  awk '/WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01: builders build/{f=1} f{print} /echo "acting_login=\$\{ACTING_LOGIN\}"/{if(f){exit}}' "$1"
+}
+T23_FILES=0; T23_BAD=""
+BASE_LANE="${GUARD_DEFAULTS_DIR}/bdc-feature-development.yaml"
+BASE_BLOCK_FILE=$(mktemp); _extract_guard_block "$BASE_LANE" > "$BASE_BLOCK_FILE"
+CUR_BLOCK_FILE=$(mktemp)
+for p in "${GUARD_DEFAULTS_DIR}"/bdc-feature-development*.yaml; do
+  T23_FILES=$((T23_FILES+1))
+  n=$(grep -c 'builder_is_reviewer' "$p" 2>/dev/null); n=${n:-0}
+  _extract_guard_block "$p" > "$CUR_BLOCK_FILE"
+  if [ "$n" -ne 1 ]; then
+    T23_BAD="${T23_BAD} $(basename "$p")(count=$n)"
+  elif ! diff -q "$BASE_BLOCK_FILE" "$CUR_BLOCK_FILE" >/dev/null 2>&1; then
+    T23_BAD="${T23_BAD} $(basename "$p")(block-differs)"
+  fi
+done
+rm -f "$BASE_BLOCK_FILE" "$CUR_BLOCK_FILE"
+if [ "$T23_FILES" -eq 13 ] && [ -z "$T23_BAD" ]; then
+  _ok "Test 23: all 13 lanes carry one byte-identical reviewer-author guard"
+else
+  _no "Test 23: all 13 lanes carry the guard" "13 lanes, count=1, byte-identical" "files=$T23_FILES bad:${T23_BAD}"
+fi
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "================================================"
 echo "RESULTS: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped (integration)"

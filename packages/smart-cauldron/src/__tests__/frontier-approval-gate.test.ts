@@ -5,10 +5,10 @@
  * An AUTOMATIC climb into a premium tier (default ['frontier']) must PAUSE
  * instead of firing: "then dont waste my usage if it will fail" (John,
  * 2026-08-18). This suite proves:
- *   - climb codex->claude->frontier pauses at the premium boundary (no frontier
- *     fire), persists the full escalation packet, and emits exactly one notice;
+ *   - climb from codex skips claude and pauses at frontier (no frontier fire),
+ *     persists the full escalation packet, and emits exactly one notice;
  *   - the paused record is durable and re-readable by cascadeId;
- *   - a purely non-premium climb (codex->claude) is unaffected (no pause).
+ *   - a purely non-premium climb (cursor->codex) is unaffected (no pause).
  *
  * All tests use CascadeDeps injection -- no live API calls.
  */
@@ -22,8 +22,8 @@ import type { CascadeDeps, EscalationCallContext, RunCascadeOptions } from '../c
 import { readCascadeRecordById } from '../frontier-approval.js';
 import type { ConductorRuleset, FireResult, PollResult, GateVerdict } from '../types.js';
 
+const CURSOR_WORKFLOW = 'bdc-feature-development-cursor';
 const CODEX_WORKFLOW = 'bdc-feature-development-codex';
-const CLAUDE_WORKFLOW = 'bdc-feature-development';
 const FABLE_WORKFLOW = 'bdc-feature-development-fable';
 
 const tempDirs: string[] = [];
@@ -92,7 +92,7 @@ function baseOpts(partial: Partial<RunCascadeOptions>): RunCascadeOptions {
 }
 
 describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)', () => {
-  test('climb codex->claude->frontier pauses; frontier never fires; one notice; packet stored', async () => {
+  test('climb from codex skips claude and pauses at frontier; frontier never fires; one notice; packet stored', async () => {
     const outDir = await makeOutDir();
     const firedWorkflows: string[] = [];
     let escalateCalls = 0;
@@ -114,14 +114,14 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
 
     // Paused, not fired.
     expect(record.status).toBe('pending-frontier-approval');
-    // Only the two non-premium tiers fired; frontier was NOT fired.
-    expect(firedWorkflows).toEqual([CODEX_WORKFLOW, CLAUDE_WORKFLOW]);
+    // Only codex fired; claude is refused and frontier was NOT fired.
+    expect(firedWorkflows).toEqual([CODEX_WORKFLOW]);
     expect(firedWorkflows).not.toContain(FABLE_WORKFLOW);
     // Exactly one operator notice for the pause.
     expect(escalateCalls).toBe(1);
-    // No frontier attempt was pushed (only codex + claude were attempted).
-    expect(record.attempts.length).toBe(2);
-    expect(record.attempts.map(a => a.tier)).toEqual(['codex', 'claude']);
+    // No frontier attempt was pushed (only codex was attempted).
+    expect(record.attempts.length).toBe(1);
+    expect(record.attempts.map(a => a.tier)).toEqual(['codex']);
 
     // Full escalation packet preserved.
     const packet = record.frontierApproval;
@@ -132,8 +132,8 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
     expect(packet?.woId).toBe('WO-FRONTIER-GATE-001');
     expect(packet?.resolution).toBeNull();
     expect(packet?.notifiedAt).not.toBeNull();
-    // priorContext is the informed-climb text from the last failed tier (claude).
-    expect(packet?.priorContext).toContain('Prior tier: claude');
+    // priorContext is the informed-climb text from the last failed tier (codex).
+    expect(packet?.priorContext).toContain('Prior tier: codex');
     // Secret boundary: no token field is ever persisted in the packet.
     expect(JSON.stringify(packet)).not.toContain('test-token');
   });
@@ -158,7 +158,7 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
     expect(persisted?.frontierApproval?.resolution).toBeNull();
   });
 
-  test('non-premium climb (codex->claude) is unaffected: wins, no pause, no notice', async () => {
+  test('non-premium climb (cursor->codex) is unaffected: wins, no pause, no notice', async () => {
     const outDir = await makeOutDir();
     const firedWorkflows: string[] = [];
     let escalateCalls = 0;
@@ -172,8 +172,8 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
       poll: async () => makePollResult(),
       judge: () => {
         judgeCall++;
-        // codex fails, claude passes -> classic non-premium climb-and-win.
-        return judgeCall === 1 ? makeFailVerdict('codex near-miss') : makePassVerdict();
+        // cursor fails, codex passes -> classic non-premium climb-and-win.
+        return judgeCall === 1 ? makeFailVerdict('cursor near-miss') : makePassVerdict();
       },
       escalate: async () => {
         escalateCalls++;
@@ -181,13 +181,13 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
       findWoClaim: async () => null,
     };
 
-    const record = await runCascade(baseOpts({ deps, outDir }));
+    const record = await runCascade(baseOpts({ deps, outDir, entryOverride: 'cursor' }));
 
     expect(record.status).toBe('won');
-    expect(record.winningTier).toBe('claude');
+    expect(record.winningTier).toBe('codex');
     expect(record.frontierApproval).toBeUndefined();
     expect(escalateCalls).toBe(0);
-    expect(firedWorkflows).toEqual([CODEX_WORKFLOW, CLAUDE_WORKFLOW]);
+    expect(firedWorkflows).toEqual([CURSOR_WORKFLOW, CODEX_WORKFLOW]);
   });
 
   test('conductor entry directly onto premium (no entryOverride, zero prior attempts) pauses and synthesizes the source event', async () => {

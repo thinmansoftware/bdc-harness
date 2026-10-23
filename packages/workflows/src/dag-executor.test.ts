@@ -56,6 +56,7 @@ import {
   resolveBunRuntimeExecutable,
 } from './dag-executor';
 import { loadMcpConfig } from '@archon/providers/claude/provider';
+import { resolveLoopIterationIdleTimeoutMs } from './utils/idle-timeout';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
 import { discoverWorkflows } from './workflow-discovery';
 import { parseWorkflow } from './loader';
@@ -1084,6 +1085,283 @@ describe('executeDagWorkflow -- mechanical evidence node', () => {
       expect((store.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
     } finally {
       await rm(testDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('executeDagWorkflow -- loop idle ceiling override', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-idle-ceiling-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  // Event-type note (Rule 17 -- codebase is ground truth, not spec prose): the
+  // engine's loop idle-timeout branch records a `node_failed` event via
+  // persistLoopNodeFailed. It does NOT emit a `loop_iteration_failed` event for
+  // the idle case (that type is reserved for the wall-timeout and thrown-error
+  // paths). Tests 2 and 3 therefore assert the real `node_failed` event carrying
+  // the idle-ceiling error text. The governing stop condition is the error text
+  // (the '(Nms)' idle marker), which is identical regardless of event label.
+
+  it('idleCeilingProof long silent turn completes under the node idle ceiling', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    // Node idle_timeout override is 400ms; wall is generous (2000ms). The model
+    // turn is silent for 150ms (longer than a 50ms old-limit analog) before it
+    // yields the completion signal -- the 400ms override must let it finish. Env
+    // idle is left unset to prove the node override (not env) is what governs.
+    process.env.ARCHON_LOOP_ITERATION_WALL_MS = '2000';
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        await new Promise<void>(resolve => setTimeout(resolve, 150));
+        yield { type: 'assistant', content: 'looks good PLAN_REVIEW_APPROVED' };
+        yield { type: 'result', sessionId: 'idle-override-complete-session' };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('idle-ceiling-override-complete-run');
+      const artifactsDir = join(testDir, 'artifacts-idle-complete');
+      const logDir = join(testDir, 'logs-idle-complete');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'idle-ceiling-override-complete',
+          nodes: [
+            {
+              id: 'plan-review',
+              idle_timeout: 400,
+              loop: {
+                prompt: 'review the plan',
+                until: 'PLAN_REVIEW_APPROVED',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      // No idle-timeout failure was recorded anywhere.
+      expect(events.some(e => String(e.data?.error ?? '').includes('exceeded idle timeout'))).toBe(
+        false
+      );
+      // The loop completed on its single iteration.
+      const completed = events.filter(
+        e => e.event_type === 'loop_iteration_completed' && e.step_name === 'plan-review'
+      );
+      expect(completed).toHaveLength(1);
+      expect(completed[0]?.data?.iteration).toBe(1);
+      expect(
+        events.some(e => e.event_type === 'node_completed' && e.step_name === 'plan-review')
+      ).toBe(true);
+      expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    } finally {
+      if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+      else process.env.ARCHON_LOOP_ITERATION_WALL_MS = prevWall;
+      if (prevIdle === undefined) delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+      else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = prevIdle;
+    }
+  });
+
+  it('idleCeilingProof truly silent iteration still fails at the node idle ceiling', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    // Node idle_timeout override is 400ms; wall is 2000ms. The model never
+    // yields, so idle must fire at the 400ms ceiling -- well before the wall.
+    process.env.ARCHON_LOOP_ITERATION_WALL_MS = '2000';
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        // Never yields; also never observes abort -- a genuinely silent stream.
+        await new Promise<void>(() => {});
+        yield { type: 'assistant', content: 'never' };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('idle-ceiling-override-silent-run');
+      const artifactsDir = join(testDir, 'artifacts-idle-silent');
+      const logDir = join(testDir, 'logs-idle-silent');
+
+      const startedAt = Date.now();
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'idle-ceiling-override-silent',
+          nodes: [
+            {
+              id: 'plan-review',
+              idle_timeout: 400,
+              loop: {
+                prompt: 'review the plan',
+                until: 'PLAN_REVIEW_APPROVED',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+      const elapsedMs = Date.now() - startedAt;
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      const failed = events.filter(
+        e => e.event_type === 'node_failed' && e.step_name === 'plan-review'
+      );
+      expect(failed).toHaveLength(1);
+      const errText = String(failed[0]?.data?.error ?? '');
+      expect(errText).toContain('exceeded idle timeout (400ms)');
+      // Failed at the idle ceiling, not the wall ceiling.
+      expect(errText).not.toMatch(/wall timeout/i);
+      expect(
+        events.some(e => e.event_type === 'node_wall_breach' && e.step_name === 'plan-review')
+      ).toBe(false);
+      // The loop did not complete.
+      expect(
+        events.some(e => e.event_type === 'node_completed' && e.step_name === 'plan-review')
+      ).toBe(false);
+      // Idle fired at its 400ms ceiling, before the 2000ms wall.
+      expect(elapsedMs).toBeGreaterThanOrEqual(400);
+      expect(elapsedMs).toBeLessThan(2000);
+    } finally {
+      if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+      else process.env.ARCHON_LOOP_ITERATION_WALL_MS = prevWall;
+      if (prevIdle === undefined) delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+      else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = prevIdle;
+    }
+  });
+
+  it('idleCeilingProof default ceiling still fails a silent node with no override', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    // No node idle_timeout override; the env default analog is 50ms. The model
+    // is silent for 150ms before it would yield -- the 50ms default must still
+    // fail the node closed, proving the default detector was NOT loosened.
+    process.env.ARCHON_LOOP_ITERATION_IDLE_MS = '50';
+    process.env.ARCHON_LOOP_ITERATION_WALL_MS = '2000';
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        await new Promise<void>(resolve => setTimeout(resolve, 150));
+        yield { type: 'assistant', content: 'looks good PLAN_REVIEW_APPROVED' };
+        yield { type: 'result', sessionId: 'idle-default-session' };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('idle-ceiling-default-silent-run');
+      const artifactsDir = join(testDir, 'artifacts-idle-default');
+      const logDir = join(testDir, 'logs-idle-default');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'idle-ceiling-default-silent',
+          nodes: [
+            {
+              id: 'plan-review',
+              loop: {
+                prompt: 'review the plan',
+                until: 'PLAN_REVIEW_APPROVED',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      const failed = events.filter(
+        e => e.event_type === 'node_failed' && e.step_name === 'plan-review'
+      );
+      expect(failed).toHaveLength(1);
+      expect(String(failed[0]?.data?.error ?? '')).toContain('exceeded idle timeout (50ms)');
+      expect(
+        events.some(e => e.event_type === 'node_completed' && e.step_name === 'plan-review')
+      ).toBe(false);
+    } finally {
+      if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+      else process.env.ARCHON_LOOP_ITERATION_WALL_MS = prevWall;
+      if (prevIdle === undefined) delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+      else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = prevIdle;
+    }
+  });
+
+  it('idleCeilingProof default resolves to exactly 180000 ms', () => {
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    try {
+      // No node override and no env override -> engine default 3 * 60 * 1000.
+      expect(resolveLoopIterationIdleTimeoutMs(undefined)).toBe(180000);
+    } finally {
+      if (prevIdle === undefined) delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+      else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = prevIdle;
     }
   });
 });
@@ -11274,6 +11552,75 @@ describe('agent persona dispatch', () => {
     await writeFile(join(testDir, '.archon', 'agents', `${name}.md`), content, 'utf-8');
   }
 
+  it('Cursor YAML plan-review preserves strict Terra through actual loop and persona execution', async () => {
+    const { registerCursorAgentProvider } =
+      await import('../../providers/src/community/cursor/registration');
+    registerCursorAgentProvider();
+    try {
+      const repoRoot = join(import.meta.dir, '../../..');
+      const file = 'bdc-feature-development-cursor.yaml';
+      const actual = parseWorkflow(
+        await readFile(join(repoRoot, '.archon/workflows/defaults', file), 'utf8'),
+        file
+      );
+      if (!actual.workflow)
+        throw new Error(actual.error?.error ?? 'actual_cursor_workflow_missing');
+      const selected = actual.workflow.nodes.find(candidate => candidate.id === 'plan-review');
+      if (!selected || !('loop' in selected)) throw new Error('actual_plan_review_loop_missing');
+      const personaName = selected.agent ?? selected.persona;
+      if (!personaName) throw new Error('actual_plan_review_persona_missing');
+      await writeFile(
+        join(testDir, '.archon/agents', `${personaName}.md`),
+        await readFile(join(repoRoot, '.archon/agents', `${personaName}.md`), 'utf8')
+      );
+      const store = createMockStore();
+      const deps = createMockDeps(store);
+      const captured = mock(async function* () {
+        yield { type: 'assistant' as const, content: 'PLAN_REVIEW_APPROVED' };
+        yield { type: 'result' as const, sessionId: 'offline-cursor-terra-loop' };
+      });
+      const originalProvider = deps.getAgentProvider;
+      deps.getAgentProvider = mock((id: string) => {
+        if (id !== 'codex-native-strict') throw new Error(`unexpected_test_provider:${id}`);
+        return { ...originalProvider(id), sendQuery: captured };
+      });
+      await executeDagWorkflow(
+        deps,
+        createMockPlatform(),
+        'offline-cursor-terra',
+        testDir,
+        // Only remove upstream test-fixture dependencies/condition. Keep the actual
+        // loop/model/provider/persona/prompt so the production dispatch path runs.
+        {
+          name: 'isolated-cursor-terra-loop',
+          nodes: [{ ...selected, depends_on: [], when: undefined }],
+        },
+        makeWorkflowRun(),
+        actual.workflow.provider!,
+        actual.workflow.model,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        {
+          ...minimalConfig,
+          assistant: 'cursor',
+          assistants: { cursor: { model: 'grok-4.7-high' }, 'codex-native-strict': {} },
+        }
+      );
+      expect(captured).toHaveBeenCalledTimes(1);
+      const options = (captured.mock.calls as unknown[][])[0][3] as Record<string, unknown>;
+      expect(options.model).toBe('gpt-5.6-terra');
+      expect(options.systemPrompt).toContain(
+        'You are the War Council Architect for Blue Devil Collectibles.'
+      );
+      expect(store.completeWorkflowRun).toHaveBeenCalled();
+    } finally {
+      clearRegistry();
+      registerBuiltinProviders();
+    }
+  });
+
   for (const provider of ['codex-native-strict', 'claude']) {
     for (const loop of [false, true]) {
       it(`Astra lane binds ${provider} ${loop ? 'loop' : 'prompt'} with a separate persona`, async () => {
@@ -14662,15 +15009,20 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
     expect(progress?.data?.chunks_seen).toBe(1);
   });
 
-  it('a chatty healthy node is not killed and its progress is throttled', async () => {
+  it('a healthy stream emits progress at deterministic throttle boundaries', async () => {
     const prev = process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
+    const originalNow = Date.now;
+    const base = originalNow();
+    let progressNow = base;
+    Date.now = () => progressNow;
     process.env.ARCHON_NODE_PROGRESS_EVENT_MS = '50';
     try {
       mockSendQueryDag.mockImplementation(async function* () {
-        const started = Date.now();
-        while (Date.now() - started < 400) {
+        // This fixture checks chunk/throttle boundaries, not real idle timing.
+        // Real silence and cancellation retain their separate timer controls.
+        for (const offset of [0, 10, 20, 49, 50, 60, 99, 100]) {
+          progressNow = base + offset;
           yield { type: 'assistant', content: 'working' };
-          await new Promise(resolve => setTimeout(resolve, 20));
         }
         yield { type: 'result', sessionId: 'chatty-session' };
       });
@@ -14690,8 +15042,7 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
       );
       expect(failed).toHaveLength(0);
       expect(completed).toHaveLength(1);
-      expect(progress.length).toBeGreaterThanOrEqual(2);
-      expect(progress.length).toBeLessThanOrEqual(10);
+      expect(progress.map(event => event.data?.chunks_seen)).toEqual([1, 5, 8]);
       expect(progress[0]?.data?.provider).toBe('claude');
       expect(progress[0]?.data?.last_chunk_type).toBe('assistant');
       expect(progress[0]?.data?.chunks_seen).toBe(1);
@@ -14701,9 +15052,40 @@ describe('silent node detection (WO-HARNESS-SILENT-NODE-DETECTION-01)', () => {
         expect(event.data?.last_chunk_type).not.toBe('');
       }
     } finally {
+      Date.now = originalNow;
       if (prev === undefined) delete process.env.ARCHON_NODE_PROGRESS_EVENT_MS;
       else process.env.ARCHON_NODE_PROGRESS_EVENT_MS = prev;
     }
+  });
+
+  it('a healthy node survives slow status persistence between provider chunks', async () => {
+    let processingFirstChunk = false;
+    let delayedStatusRead = false;
+    mockSendQueryDag.mockImplementation(async function* () {
+      processingFirstChunk = true;
+      yield { type: 'assistant', content: 'working' };
+      await new Promise(resolve => setTimeout(resolve, 20));
+      yield { type: 'result', sessionId: 'slow-consumer-session' };
+    });
+
+    const store = createMockStore();
+    (store.getWorkflowRunStatus as ReturnType<typeof mock>).mockImplementation(async () => {
+      if (processingFirstChunk && !delayedStatusRead) {
+        delayedStatusRead = true;
+        await new Promise(resolve => setTimeout(resolve, 400));
+      }
+      return 'running' as const;
+    });
+    await runPromptNode(store, 'slow-consumer-node', 200, 'silent-slow-consumer');
+
+    const events = eventsOf(store);
+    expect(delayedStatusRead).toBe(true);
+    expect(
+      events.filter(e => e.event_type === 'node_failed' && e.step_name === 'slow-consumer-node')
+    ).toHaveLength(0);
+    expect(
+      events.filter(e => e.event_type === 'node_completed' && e.step_name === 'slow-consumer-node')
+    ).toHaveLength(1);
   });
 
   it('cancel lands while the provider is silent', async () => {

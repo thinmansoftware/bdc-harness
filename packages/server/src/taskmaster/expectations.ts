@@ -8,6 +8,7 @@ import {
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
+import { readCascadeRecordById } from '@archon/smart-cauldron/frontier-approval';
 
 const log = createLogger('taskmaster/expectations');
 const DEFAULT_RETRY_DELAY_MS = 15 * 60 * 1000;
@@ -33,12 +34,144 @@ export type EvidenceSpec =
 
 type EvidenceScalar = string | number | boolean;
 
+/** Loop-owned evidence only; the public registration schema retains six kinds. */
+export type InternalEvidenceSpec =
+  | EvidenceSpec
+  | {
+      kind: 'cascade_workflow_completed';
+      cascadeId: string;
+      woId: string;
+      project: string;
+    };
+
 export interface EvidenceResult {
   ok: boolean;
   pointer: string | null;
 }
 
+export interface CascadeEvidenceDeps {
+  readCascade?: typeof readCascadeRecordById;
+  query?: ExpectationDeps['query'];
+}
+
+/** Exact bound run evidence shared by grading and the loop-owned completion check. */
+export async function readCascadeWorkflowEvidence(
+  identity: { cascadeId: string; woId: string; project: string | undefined },
+  deps: CascadeEvidenceDeps = {}
+): Promise<{
+  earliestRunId: string;
+  completedRunId: string | null;
+  status: string;
+  prOpened: boolean;
+}> {
+  try {
+    if (
+      [identity.cascadeId, identity.woId, identity.project].some(
+        value => typeof value !== 'string' || !value.trim()
+      )
+    )
+      throw new Error('missing identity');
+    const read = deps.readCascade ?? readCascadeRecordById;
+    const query =
+      deps.query ??
+      // Generic query results preserve the existing database dependency contract.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters
+      (<T>(sql: string, params?: unknown[]): Promise<{ rows: readonly T[] }> =>
+        getDatabase().query<T>(sql, params));
+    const visited = new Set<string>();
+    const runs = new Map<string, string>();
+    let cascadeId: string | null = identity.cascadeId;
+    while (cascadeId !== null) {
+      // Follow explicit approval links only; bounded even for corrupted records.
+      if (visited.has(cascadeId) || visited.size >= 8) throw new Error('invalid cascade chain');
+      visited.add(cascadeId);
+      const record = await read(cascadeId);
+      if (
+        record?.cascadeId !== cascadeId ||
+        record.woId !== identity.woId ||
+        record.project !== identity.project ||
+        typeof record.request?.dryRun !== 'boolean' ||
+        record.request.dryRun ||
+        !Array.isArray(record.attempts)
+      )
+        throw new Error('invalid cascade scope');
+      for (const attempt of record.attempts) {
+        if (!attempt || typeof attempt.workflowName !== 'string' || !attempt.workflowName)
+          throw new Error('invalid attempt');
+        if (attempt.runId === null) continue;
+        if (typeof attempt.runId !== 'string' || !attempt.runId.trim())
+          throw new Error('invalid run id');
+        const prior = runs.get(attempt.runId);
+        if (prior !== undefined && prior !== attempt.workflowName)
+          throw new Error('conflicting run binding');
+        runs.set(attempt.runId, attempt.workflowName);
+      }
+      if (
+        record.frontierApproval !== undefined &&
+        (!record.frontierApproval ||
+          typeof record.frontierApproval !== 'object' ||
+          !Object.hasOwn(record.frontierApproval, 'resumeCascadeId'))
+      )
+        throw new Error('invalid frontier packet');
+      const resume: unknown = record.frontierApproval?.resumeCascadeId;
+      if (resume !== undefined && resume !== null && (typeof resume !== 'string' || !resume.trim()))
+        throw new Error('invalid resume');
+      cascadeId = resume ?? null;
+    }
+    // A valid admission without an actual workflow ID is still not ready.
+    if (runs.size === 0) throw new Error('no actual run');
+    let firstRunId: string | undefined;
+    let status: string | undefined;
+    let completed = false;
+    let completedRunId: string | null = null;
+    let prOpened = false;
+    for (const [runId, workflowName] of runs) {
+      const result = await query<{
+        id: string;
+        workflow_name: string;
+        status: string;
+        metadata: string | null;
+      }>(
+        'SELECT id, workflow_name, status, metadata FROM remote_agent_workflow_runs WHERE id = $1 AND workflow_name = $2',
+        [runId, workflowName]
+      );
+      const row = result.rows[0];
+      if (
+        result.rows.length !== 1 ||
+        row?.id !== runId ||
+        row.workflow_name !== workflowName ||
+        typeof row.status !== 'string' ||
+        !row.status
+      )
+        throw new Error('unproven workflow identity');
+      firstRunId ??= runId;
+      status = row.status;
+      completed ||= row.status === 'completed';
+      if (row.status === 'completed') completedRunId ??= runId;
+      try {
+        // Preserve existing PR metadata semantics; this phase changes ownership
+        // binding, not the metadata producer's evidence contract.
+        const metadata = JSON.parse(row.metadata ?? '{}') as Record<string, unknown>;
+        prOpened ||= Boolean(metadata.prUrl ?? metadata.pr_url ?? metadata.pullRequestUrl);
+      } catch {
+        // Malformed metadata proves no PR; known workflow status stays usable.
+      }
+    }
+    if (!firstRunId || !status) throw new Error('no proven workflow');
+    return {
+      earliestRunId: firstRunId,
+      completedRunId,
+      status: completed ? 'completed' : status,
+      prOpened,
+    };
+  } catch {
+    // UNKNOWN must throw so the existing grading catch skips noise grading too.
+    throw new Error('taskmaster_cascade_evidence_unknown');
+  }
+}
+
 export interface ExpectationDeps {
+  readCascade?: typeof readCascadeRecordById;
   fetch?: typeof fetch;
   // Generic result typing keeps evidence implementations free of unsafe casts.
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters
@@ -225,23 +358,97 @@ export async function checkEvidence(
     return { ok, pointer: ok ? (issue.html_url ?? null) : null };
   }
   if (spec.kind === 'pr_opened') {
-    const qualifier = spec.head_branch
-      ? `head:${spec.head_branch}`
-      : `in:title ${spec.title_prefix ?? ''}`;
-    const response = await serviceGitHubFetchWithPermissionFallback({
-      service: 'taskmaster',
-      fetch: fetchImpl,
-      resource: 'search',
-      url: `https://api.github.com/search/issues?q=${encodeURIComponent(`repo:${spec.repo} is:pr is:open ${qualifier}`)}`,
-    });
-    if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
-    const result = (await response.json()) as {
-      items?: { html_url?: string; title?: string }[];
-    };
-    const match = result.items?.find(
-      item => !spec.title_prefix || item.title?.startsWith(spec.title_prefix)
-    );
-    return { ok: Boolean(match), pointer: match?.html_url ?? null };
+    if (!/^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/.test(spec.repo) || spec.head_branch?.includes(':'))
+      throw new Error('expectation_pr_scope_unknown');
+    const endpoint = `/repos/${spec.repo}/pulls`;
+    let url: string | null =
+      `https://api.github.com${endpoint}?state=open&per_page=100&sort=created&direction=asc&page=1`;
+    const identities = new Map<number, string>();
+    let pointer: string | null = null;
+    for (let page = 1; url && page <= 100; page++) {
+      const parsed = new URL(url);
+      if (
+        parsed.origin !== 'https://api.github.com' ||
+        parsed.pathname !== endpoint ||
+        parsed.username ||
+        parsed.password ||
+        parsed.hash ||
+        parsed.searchParams.get('state') !== 'open' ||
+        parsed.searchParams.get('per_page') !== '100' ||
+        parsed.searchParams.get('sort') !== 'created' ||
+        parsed.searchParams.get('direction') !== 'asc' ||
+        parsed.searchParams.get('page') !== String(page) ||
+        [...parsed.searchParams.keys()].length !== 5 ||
+        ['state', 'per_page', 'sort', 'direction', 'page'].some(
+          key => parsed.searchParams.getAll(key).length !== 1
+        )
+      )
+        throw new Error('expectation_pr_pagination_invalid');
+      const response = await serviceGitHubFetchWithPermissionFallback({
+        service: 'taskmaster',
+        fetch: fetchImpl,
+        resource: 'core',
+        url,
+      });
+      if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
+      const rows: unknown = await response.json();
+      if (!Array.isArray(rows) || rows.length > 100) throw new Error('expectation_pr_page_invalid');
+      for (const value of rows) {
+        if (!value || typeof value !== 'object') throw new Error('expectation_pr_row_invalid');
+        const row = value as Record<string, unknown>;
+        const headRef =
+          typeof row.head === 'object' && row.head !== null
+            ? (row.head as Record<string, unknown>).ref
+            : undefined;
+        if (
+          typeof row.number !== 'number' ||
+          !Number.isSafeInteger(row.number) ||
+          row.number <= 0 ||
+          row.state !== 'open' ||
+          typeof row.title !== 'string' ||
+          typeof row.html_url !== 'string' ||
+          (spec.head_branch && (typeof headRef !== 'string' || !headRef.trim()))
+        )
+          throw new Error('expectation_pr_row_invalid');
+        const evidenceUrl = new URL(row.html_url);
+        if (
+          evidenceUrl.origin !== 'https://github.com' ||
+          evidenceUrl.username ||
+          evidenceUrl.password ||
+          evidenceUrl.pathname.toLowerCase() !== `/${spec.repo}/pull/${row.number}`.toLowerCase() ||
+          evidenceUrl.search ||
+          evidenceUrl.hash
+        )
+          throw new Error('expectation_pr_pointer_invalid');
+        const identity = JSON.stringify([row.state, row.title, row.html_url, headRef ?? null]);
+        if (identities.has(row.number) && identities.get(row.number) !== identity)
+          throw new Error('expectation_pr_identity_conflict');
+        identities.set(row.number, identity);
+        if (
+          !pointer &&
+          (!spec.head_branch || headRef === spec.head_branch) &&
+          (!spec.title_prefix || row.title.startsWith(spec.title_prefix))
+        )
+          pointer = row.html_url;
+      }
+      const link = response.headers.get('link');
+      if (
+        link
+          ?.split(',')
+          .some(
+            part =>
+              !/^\s*<[^>]+>\s*;\s*rel=(?:"(?:next|prev|first|last)"|next|prev|first|last)\s*$/.test(
+                part
+              )
+          )
+      )
+        throw new Error('expectation_pr_pagination_invalid');
+      if ((link?.split(',').filter(part => /\brel=(?:"next"|next)\s*$/.test(part)).length ?? 0) > 1)
+        throw new Error('expectation_pr_pagination_invalid');
+      url = nextPageUrl(link);
+      if (!url) return { ok: pointer !== null, pointer };
+    }
+    throw new Error('expectation_pr_probe_capped');
   }
   if (spec.kind === 'lease_holder_is') {
     const result = await query<{ lease_id: string }>(
@@ -385,7 +592,7 @@ async function sendRedispatch(
 export function renderEscalationBody(expectation: taskmasterDb.TmExpectation): string {
   let evidence: string;
   try {
-    const spec = JSON.parse(expectation.evidence_json) as EvidenceSpec;
+    const spec = JSON.parse(expectation.evidence_json) as InternalEvidenceSpec;
     evidence = describeEvidence(spec);
   } catch {
     // Never let an unparseable spec swallow the escalation itself.
@@ -412,8 +619,10 @@ export function renderEscalationBody(expectation: taskmasterDb.TmExpectation): s
 }
 
 /** One evidence spec as a phrase, for the escalation body. */
-function describeEvidence(spec: EvidenceSpec): string {
+function describeEvidence(spec: InternalEvidenceSpec): string {
   switch (spec.kind) {
+    case 'cascade_workflow_completed':
+      return `a completed workflow in cascade ${spec.cascadeId} for ${spec.woId} on ${spec.project}`;
     case 'issue_comment_exists':
       return `a comment on ${spec.repo}#${String(spec.number)}${
         spec.author ? ` by ${spec.author}` : ''
@@ -441,10 +650,18 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
   for (const expectation of active) {
     let evidence: EvidenceResult;
     try {
-      evidence = await (
-        deps.checkEvidence ??
-        ((spec: EvidenceSpec): Promise<EvidenceResult> => checkEvidence(spec, deps))
-      )(JSON.parse(expectation.evidence_json) as EvidenceSpec);
+      const spec = JSON.parse(expectation.evidence_json) as InternalEvidenceSpec;
+      if (spec.kind === 'cascade_workflow_completed') {
+        const bound = await readCascadeWorkflowEvidence(spec, deps);
+        evidence = bound.completedRunId
+          ? { ok: true, pointer: `workflow:${bound.completedRunId}` }
+          : { ok: false, pointer: null };
+      } else {
+        evidence = await (
+          deps.checkEvidence ??
+          ((publicSpec: EvidenceSpec): Promise<EvidenceResult> => checkEvidence(publicSpec, deps))
+        )(spec);
+      }
     } catch (error) {
       log.warn(
         { err: error as Error, expectationId: expectation.id },
