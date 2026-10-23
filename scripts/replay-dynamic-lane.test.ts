@@ -35,6 +35,70 @@ async function run(path: string, cwd = import.meta.dir) {
 }
 
 describe('replay-dynamic-lane CLI', () => {
+  test('v4 CLI refuses transplanted failure correlation before fallback', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dynamic-lane-correlation-'));
+    temporary.push(dir);
+    const input = dynamicLaneSnapshotSchema.parse(
+      JSON.parse(
+        await readFile(
+          resolve(
+            import.meta.dir,
+            '../packages/workflows/src/reliability/fixtures/dynamic-lane/eligible-haiku-synthetic.json'
+          ),
+          'utf8'
+        )
+      )
+    ) as DynamicLaneV4Snapshot;
+    const pending = evaluateDynamicLane(input);
+    input.decisionExchanges = input.routingResourcePlan.slice(0, 2).map((route, index) => ({
+      decisionId: input.decisionId,
+      snapshotHash: pending.snapshotHash,
+      requestHash: index === 0 ? 'sha256:another-request' : pending.requestHash,
+      routeId: route.routeId,
+      engineId: route.engineId,
+      adapterId: route.adapterId,
+      accountId: route.accountId,
+      transport: route.transport,
+      origin: 'recorded',
+      requestedModel: route.requestedModel,
+      servedModel: route.requestedModel,
+      attemptId: `cli-correlated-${index}`,
+      startedAt: `2026-10-17T11:59:0${index * 2}.000Z`,
+      completedAt: `2026-10-17T11:59:0${index * 2 + 1}.000Z`,
+      usage: null,
+      cashCost: null,
+      latencyMs: null,
+      outcome: index === 0 ? 'availability' : 'success',
+      response:
+        index === 0
+          ? null
+          : {
+              schemaVersion: 'dynamic-lane-response/v1',
+              decisionId: input.decisionId,
+              requestHash: pending.requestHash,
+              snapshotHash: pending.snapshotHash,
+              choice: 'select',
+              candidateId: 'codex-plan',
+              rationale: 'Eligible worker.',
+              evidenceReferences: ['evidence-001'],
+            },
+    }));
+    const path = join(dir, 'transplanted.json');
+    const bytes = JSON.stringify(input);
+    await writeFile(path, bytes);
+    const result = await run(path, dir);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    const receipt = JSON.parse(result.stdout);
+    expect(receipt.decision).toBe('wait');
+    expect(receipt.proposedBinding).toBeNull();
+    expect(receipt.disposition).toBe('exchange_hash_or_decision_mismatch');
+    expect(receipt.routerCallsConsumed).toBe(2);
+    expect(receipt.charges).toEqual({ 'haiku-sub': 1, 'luna-sub': 1 });
+    expect(await readFile(path, 'utf8')).toBe(bytes);
+    expect(await readdir(dir)).toEqual(['transplanted.json']);
+  });
+
   test('evaluator and CLI prohibit provider, store, network, credential, clock and write access', async () => {
     const input = await readFile(fixture, 'utf8');
     const haikuInput = await readFile(
@@ -120,6 +184,9 @@ describe('replay-dynamic-lane CLI', () => {
     const route = input.routingResourcePlan[0]!;
     input.decisionExchanges = [
       {
+        decisionId: input.decisionId,
+        requestHash: pending.requestHash,
+        snapshotHash: pending.snapshotHash,
         routeId: route.routeId,
         engineId: route.engineId,
         adapterId: route.adapterId,

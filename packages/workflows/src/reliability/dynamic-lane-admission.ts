@@ -958,6 +958,9 @@ const normalizedResponseSchema = z
   .strict();
 const exchangeSchema = z
   .object({
+    decisionId: nonblank,
+    snapshotHash: nonblank,
+    requestHash: nonblank,
     routeId: nonblank,
     engineId: nonblank,
     adapterId: nonblank,
@@ -1287,6 +1290,12 @@ function evaluateV4Core(snapshot: DynamicLaneV4Snapshot): DynamicLaneV4Receipt {
       return stop('router_call_ceiling');
     const attempt = history[position];
     if (!attempt) return stop('missing_exchange');
+    if (
+      attempt.decisionId !== snapshot.decisionId ||
+      attempt.snapshotHash !== snapshotHash ||
+      attempt.requestHash !== out.requestHash
+    )
+      return stop('exchange_hash_or_decision_mismatch');
     if (
       attempt.routeId !== route.routeId ||
       attempt.engineId !== route.engineId ||

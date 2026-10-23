@@ -21,6 +21,9 @@ function withHaikuDecision(input: DynamicLaneV4Snapshot, routeIndex = 0): Dynami
   input.decisionExchanges = input.routingResourcePlan
     .slice(0, routeIndex + 1)
     .map((route, index) => ({
+      decisionId: input.decisionId,
+      snapshotHash: first.snapshotHash,
+      requestHash: first.requestHash,
       routeId: route.routeId,
       engineId: route.engineId,
       adapterId: route.adapterId,
@@ -54,6 +57,57 @@ function withHaikuDecision(input: DynamicLaneV4Snapshot, routeIndex = 0): Dynami
 }
 
 describe('model-neutral Haiku offline v4', () => {
+  test.each([
+    ['availability', 1, 0],
+    ['quota', 1, 0],
+    ['availability', 2, 0],
+    ['quota', 2, 0],
+    ['availability', 2, 1],
+    ['quota', 2, 1],
+  ] as const)(
+    'a transplanted %s failure cannot authorize route %i (attempt %i)',
+    (outcome, routeIndex, failedIndex) => {
+      const source = v4();
+      source.decisionId = 'decision-source';
+      withHaikuDecision(source, routeIndex);
+      const target = v4();
+      target.decisionId = 'decision-target';
+      withHaikuDecision(target, routeIndex);
+      target.decisionExchanges[failedIndex] = {
+        ...(source.decisionExchanges[failedIndex] as object),
+        outcome,
+        origin: 'recorded',
+      };
+      const out = evaluateDynamicLane(target);
+      expect(out.proposedBinding).toBeNull();
+      expect(out.disposition).toBe('exchange_hash_or_decision_mismatch');
+      expect(out.routerCallsConsumed).toBe(routeIndex + 1);
+      expect(out.attemptHistory).toHaveLength(routeIndex + 1);
+    }
+  );
+
+  test.each(['decisionId', 'snapshotHash', 'requestHash'] as const)(
+    'every actual outcome requires its own matching %s',
+    field => {
+      for (const outcome of ['success', 'availability', 'quota', 'refused', 'cancelled'] as const) {
+        const input = withHaikuDecision(v4(), outcome === 'success' ? 0 : 1);
+        const attempt = input.decisionExchanges[0] as Record<string, unknown>;
+        attempt.outcome = outcome;
+        if (outcome !== 'success') attempt.response = null;
+        attempt[field] = 'wrong-correlation';
+        const mismatch = evaluateDynamicLane(input);
+        expect(mismatch.proposedBinding).toBeNull();
+        expect(mismatch.disposition).toBe('exchange_hash_or_decision_mismatch');
+        expect(mismatch.routerCallsConsumed).toBe(input.decisionExchanges.length);
+        expect(mismatch.charges['haiku-sub']).toBe(1);
+        delete attempt[field];
+        const missing = evaluateDynamicLane(input);
+        expect(missing.proposedBinding).toBeNull();
+        expect(missing.disposition).toBe('malformed_exchange');
+      }
+    }
+  );
+
   test('an actual call retains consumption and charges even when served identity is rejected', () => {
     for (const servedModel of [null, 'wrong-model']) {
       const input = withHaikuDecision(v4());
