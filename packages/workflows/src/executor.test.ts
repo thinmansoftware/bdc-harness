@@ -1356,6 +1356,184 @@ describe('executeWorkflow', () => {
       return { result, deps, platform };
     }
 
+    describe('consumed-value snapshots', () => {
+      function changingProperty<T extends object>(
+        target: T,
+        key: string,
+        first: unknown,
+        later: () => unknown
+      ): () => number {
+        let reads = 0;
+        Object.defineProperty(target, key, {
+          get() {
+            reads += 1;
+            return reads === 1 ? first : later();
+          },
+        });
+        return () => reads;
+      }
+
+      function laterValue(mode: string): unknown {
+        if (mode === 'throw') throw new Error(sentinel);
+        return 'different-value';
+      }
+
+      function expectPrivate(outcome: Awaited<ReturnType<typeof invoke>>): void {
+        expect(
+          inspect([outcome.result, outcome.platform.sendMessage.mock.calls, mockLogFn.mock.calls], {
+            depth: 8,
+          })
+        ).not.toContain(sentinel);
+      }
+
+      it.each(['throw', 'change'])(
+        'uses the first reserved name without reading its unused ID (%s)',
+        async mode => {
+          const prior = makeRun();
+          const nameReads = changingProperty(
+            prior,
+            'workflow_name',
+            'bdc-feature-development-codex-only',
+            () => laterValue(mode)
+          );
+          const idReads = changingProperty(prior, 'id', 'unused', () => {
+            throw new Error(sentinel);
+          });
+          const store = makeStore({ findResumableRun: mock(async () => prior) });
+          const outcome = await invoke(store);
+          expectStopped(store, outcome);
+          expect(outcome.result.error).toBe('codex_only_resume_unsupported');
+          expect(nameReads()).toBe(1);
+          expect(idReads()).toBe(0);
+        }
+      );
+
+      for (const waiting of [false, true]) {
+        it.each(['throw', 'change'])(
+          `uses original selected identity and name through recovery/CAS (waiting=${waiting}, %s)`,
+          async mode => {
+            const prior = makeRun({ status: waiting ? 'waiting_provider' : 'failed' });
+            const idReads = changingProperty(prior, 'id', 'selected-first', () => laterValue(mode));
+            const nameReads = changingProperty(prior, 'workflow_name', 'ordinary-first', () =>
+              laterValue(mode)
+            );
+            const claim = makeRun({ status: 'pending' });
+            const claimReads = changingProperty(claim, 'id', 'claim-first', () => laterValue(mode));
+            const order: string[] = [];
+            const outputs = new Map([['node', 'output']]);
+            const store = makeStore({
+              findResumableRun: mock(async () => prior),
+              getCompletedDagNodeOutputs: mock(async id => {
+                order.push(`read:${id}`);
+                return outputs;
+              }),
+              resumeWorkflowRun: mock(async id => {
+                order.push(`resume:${id}`);
+                return makeRun({ id });
+              }),
+            });
+            const outcome = await invoke(store, waiting ? prior : claim);
+            expect(outcome.result.success).toBe(true);
+            expect(order).toEqual(['read:selected-first', 'resume:selected-first']);
+            expect(idReads()).toBe(1);
+            expect(nameReads()).toBe(1);
+            expect(store.createWorkflowRun).not.toHaveBeenCalled();
+            expect(store.failWorkflowRun).not.toHaveBeenCalled();
+            if (waiting) {
+              expect(store.findResumableRun).not.toHaveBeenCalled();
+              expect(store.updateWorkflowRun).not.toHaveBeenCalled();
+            } else {
+              expect(claimReads()).toBe(1);
+              expect(store.updateWorkflowRun).toHaveBeenCalledTimes(1);
+              expect(store.updateWorkflowRun).toHaveBeenCalledWith('claim-first', {
+                status: 'cancelled',
+              });
+            }
+            expect(mockExecuteDagWorkflow.mock.calls[0]?.[15]).toBe(outputs);
+            expectPrivate(outcome);
+          }
+        );
+      }
+
+      it('uses one supplied ID when actual null leaves the precreated ordinary run selected', async () => {
+        const claim = makeRun();
+        const idReads = changingProperty(claim, 'id', '', () => {
+          throw new Error(sentinel);
+        });
+        const store = makeStore();
+        const outcome = await invoke(store, claim);
+        expect(outcome.result.success).toBe(true);
+        expect(outcome.result.workflowRunId).toBe('');
+        expect(idReads()).toBe(1);
+        expect(store.createWorkflowRun).not.toHaveBeenCalled();
+        expect(store.failWorkflowRun).not.toHaveBeenCalled();
+        expectPrivate(outcome);
+      });
+
+      for (const waiting of [false, true]) {
+        for (const firstCount of [0, 1]) {
+          it.each(['throw', 'change', 'throw after branch'])(
+            `consumes the original recovered count once (waiting=${waiting}, count=${firstCount}, %s)`,
+            async mode => {
+              const prior = makeRun({
+                id: 'count-prior',
+                status: waiting ? 'waiting_provider' : 'failed',
+              });
+              const claim = makeRun({ id: 'count-claim' });
+              const outputs = new Map(firstCount ? [['node', 'output']] : []);
+              let reads = 0;
+              Object.defineProperty(outputs, 'size', {
+                get() {
+                  reads += 1;
+                  if (reads === 1 || (mode === 'throw after branch' && reads === 2))
+                    return firstCount;
+                  if (mode !== 'change') throw new Error(sentinel);
+                  return firstCount ? 0 : 1;
+                },
+              });
+              const store = makeStore({
+                findResumableRun: mock(async () => prior),
+                getCompletedDagNodeOutputs: mock(async () => outputs),
+                resumeWorkflowRun: mock(async id => makeRun({ id })),
+              });
+              const outcome = await invoke(store, waiting ? prior : claim);
+              expect(outcome.result.success).toBe(true);
+              expect(reads).toBe(1);
+              expect(store.failWorkflowRun).not.toHaveBeenCalled();
+              expectPrivate(outcome);
+              if (waiting || firstCount) {
+                expect(store.resumeWorkflowRun).toHaveBeenCalledTimes(1);
+                expect(store.resumeWorkflowRun).toHaveBeenCalledWith('count-prior');
+                expect(mockExecuteDagWorkflow.mock.calls[0]?.[15]).toBe(outputs);
+                const resumeLog = mockLogFn.mock.calls.find(
+                  call =>
+                    call[1] ===
+                    (waiting ? 'workflow.provider_wait_resuming' : 'workflow.dag_resuming')
+                );
+                expect(resumeLog?.[0]).toEqual(
+                  expect.objectContaining({ priorCompletedCount: firstCount })
+                );
+                if (!waiting)
+                  expect(inspect(outcome.platform.sendMessage.mock.calls)).toContain(
+                    'skipping 1 already-completed node'
+                  );
+              } else {
+                expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+                expect(store.createWorkflowRun).not.toHaveBeenCalled();
+              }
+              if (waiting) expect(store.updateWorkflowRun).not.toHaveBeenCalled();
+              else {
+                expect(store.updateWorkflowRun).toHaveBeenCalledTimes(1);
+                expect(store.updateWorkflowRun).toHaveBeenCalledWith('count-claim', {
+                  status: firstCount ? 'cancelled' : 'running',
+                });
+              }
+            }
+          );
+        }
+      }
+    });
+
     function expectStopped(
       store: IWorkflowStore,
       outcome: Awaited<ReturnType<typeof invoke>>
