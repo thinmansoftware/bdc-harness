@@ -373,7 +373,7 @@ describe('Codex-only pre-admission provider proof', () => {
     await preflightCodexOnly('bdc-harness', 'http://archon.test', 'token');
   });
 
-  test('actual current Codex-only definition passes engine payload validation', async () => {
+  test('actual current Codex-only definition is refused by the logical-provider preflight', async () => {
     const workflow = parse(
       await readFile(
         new URL(
@@ -390,8 +390,18 @@ describe('Codex-only pre-admission provider proof', () => {
         source: 'bundled',
       })
     );
-    await preflightCodexOnly('bdc-harness', 'http://archon.test', 'token');
-    expect(fetchCalls).toHaveLength(2);
+    await expect(preflightCodexOnly('bdc-harness', 'http://archon.test', 'token')).rejects.toThrow(
+      'codex_only_provider_forbidden'
+    );
+    expect(fetchCalls.map(call => call.url)).toEqual([
+      'http://archon.test/api/codebases',
+      'http://archon.test/api/workflows/bdc-feature-development-codex-only?cwd=%2Fwork%2Fharness%20space',
+    ]);
+    expect(fetchCalls.every(call => (call.init?.method ?? 'GET') === 'GET')).toBe(true);
+    expect(
+      fetchCalls.every(call => headerValue(call.init, 'x-archon-operator-token') === 'token')
+    ).toBe(true);
+    expect(fetchCalls.filter(call => call.init?.method === 'POST')).toHaveLength(0);
   });
 
   for (const node of [
