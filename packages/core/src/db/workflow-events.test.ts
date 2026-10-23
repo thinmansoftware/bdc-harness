@@ -2,6 +2,7 @@ import { mock, describe, test, expect, beforeEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import type { WorkflowEventRow } from './workflow-events';
+import { SqliteAdapter } from './adapters/sqlite';
 
 // Mock logger to suppress noisy output during tests
 const mockLogger = createMockLogger();
@@ -36,7 +37,10 @@ import {
 
 describe('workflow-events', () => {
   beforeEach(() => {
-    mockQuery.mockClear();
+    mockQuery.mockReset();
+    mockQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    mockLogger.error.mockClear();
+    mockLogger.warn.mockClear();
   });
 
   const mockEvent: WorkflowEventRow = {
@@ -304,7 +308,7 @@ describe('workflow-events', () => {
       expect(result.get('node-a')).toBe('parsed output');
     });
 
-    test('skips rows with null step_name', async () => {
+    test('rejects the entire recovery for a null step_name', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([
           { step_name: null, data: { node_output: 'should be skipped' } },
@@ -312,13 +316,10 @@ describe('workflow-events', () => {
         ])
       );
 
-      const result = await getCompletedDagNodeOutputs('run-789');
-
-      expect(result.size).toBe(1);
-      expect(result.get('node-a')).toBe('kept');
+      await expect(getCompletedDagNodeOutputs('run-789')).rejects.toThrow();
     });
 
-    test('skips rows where node_output is not a string', async () => {
+    test('rejects the entire recovery when node_output is not a string', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([
           { step_name: 'node-a', data: { node_output: 123 } },
@@ -327,13 +328,10 @@ describe('workflow-events', () => {
         ])
       );
 
-      const result = await getCompletedDagNodeOutputs('run-filter');
-
-      expect(result.size).toBe(1);
-      expect(result.get('node-c')).toBe('valid');
+      await expect(getCompletedDagNodeOutputs('run-filter')).rejects.toThrow();
     });
 
-    test('skips corrupt JSON rows without losing other rows', async () => {
+    test('rejects the entire recovery when a middle row contains corrupt JSON', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([
           { step_name: 'node-a', data: { node_output: 'good first' } },
@@ -342,11 +340,7 @@ describe('workflow-events', () => {
         ])
       );
 
-      const result = await getCompletedDagNodeOutputs('run-corrupt');
-
-      expect(result.size).toBe(2);
-      expect(result.get('node-a')).toBe('good first');
-      expect(result.get('node-c')).toBe('good last');
+      await expect(getCompletedDagNodeOutputs('run-corrupt')).rejects.toThrow();
     });
 
     test('returns empty map when no events exist', async () => {
@@ -361,6 +355,200 @@ describe('workflow-events', () => {
       mockQuery.mockRejectedValueOnce(new Error('connection refused'));
 
       await expect(getCompletedDagNodeOutputs('run-error')).rejects.toThrow('connection refused');
+    });
+  });
+
+  describe('UNKNOWN read contract', () => {
+    const sentinel = 'persisted-private-event-90210';
+    const invalidRecords: [string, { step_name?: unknown; data?: unknown }][] = [
+      ['corrupt JSON', { step_name: 'node-b', data: `{"private":"${sentinel}"` }],
+      ['JSON null', { step_name: 'node-b', data: 'null' }],
+      ['JSON string', { step_name: 'node-b', data: `"${sentinel}"` }],
+      ['JSON number', { step_name: 'node-b', data: '42' }],
+      ['JSON boolean', { step_name: 'node-b', data: 'false' }],
+      ['JSON array', { step_name: 'node-b', data: '[{"node_output":"bad"}]' }],
+      ['direct null', { step_name: 'node-b', data: null }],
+      ['direct undefined', { step_name: 'node-b', data: undefined }],
+      ['missing data', { step_name: 'node-b' }],
+      ['direct number', { step_name: 'node-b', data: 42 }],
+      ['direct boolean', { step_name: 'node-b', data: false }],
+      ['direct array', { step_name: 'node-b', data: [{ node_output: 'bad' }] }],
+      ['missing output', { step_name: 'node-b', data: { private: sentinel } }],
+      [
+        'inherited output',
+        {
+          step_name: 'node-b',
+          data: Object.create({ node_output: 'inherited' }) as Record<string, unknown>,
+        },
+      ],
+      ['null output', { step_name: 'node-b', data: { node_output: null } }],
+      ['undefined output', { step_name: 'node-b', data: { node_output: undefined } }],
+      ['number output', { step_name: 'node-b', data: { node_output: 0 } }],
+      ['boolean output', { step_name: 'node-b', data: { node_output: false } }],
+      ['object output', { step_name: 'node-b', data: { node_output: {} } }],
+      ['array output', { step_name: 'node-b', data: { node_output: [] } }],
+      ['missing step', { data: { node_output: 'bad' } }],
+      ['undefined step', { step_name: undefined, data: { node_output: 'bad' } }],
+      ['null step', { step_name: null, data: { node_output: 'bad' } }],
+      ['number step', { step_name: 0, data: { node_output: 'bad' } }],
+      ['boolean step', { step_name: false, data: { node_output: 'bad' } }],
+      ['object step', { step_name: {}, data: { node_output: 'bad' } }],
+      ['array step', { step_name: [], data: { node_output: 'bad' } }],
+      ['supported incomplete manual completion', { step_name: null, data: {} }],
+    ];
+
+    test.each(invalidRecords)(
+      'rejects %s with no partial map or payload disclosure',
+      async (_label, invalid) => {
+        const rows = [
+          { step_name: 'node-a', data: { node_output: 'good first' } },
+          invalid,
+          { step_name: 'node-c', data: { node_output: 'good last' } },
+        ];
+        const before = rows.map(row => ({ ...row }));
+        mockQuery.mockResolvedValueOnce(createQueryResult(rows));
+
+        const result = getCompletedDagNodeOutputs('run-recovery');
+        await expect(result).rejects.toThrow();
+        const failure: unknown = await result.catch((error: unknown) => error);
+
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message.length).toBeLessThan(200);
+        expect(
+          Bun.inspect({
+            failure,
+            errors: mockLogger.error.mock.calls,
+            warnings: mockLogger.warn.mock.calls,
+          })
+        ).not.toContain(sentinel);
+        expect(rows).toEqual(before);
+        expect(rows[1].data).toBe(invalid.data);
+        expect(mockQuery).toHaveBeenCalledTimes(1);
+      }
+    );
+
+    test('preserves exact empty and whitespace keys, empty outputs and last duplicate ordering', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { step_name: '', data: { node_output: '' } },
+          { step_name: '  ', data: '{"node_output":" "}' },
+          { step_name: 'node-a', data: { node_output: 'first' } },
+          { step_name: '', data: '{"node_output":"last empty key"}' },
+          { step_name: 'node-a', data: { node_output: '' } },
+        ])
+      );
+
+      const result = await getCompletedDagNodeOutputs('run-exact');
+
+      expect([...result]).toEqual([
+        ['', 'last empty key'],
+        ['  ', ' '],
+        ['node-a', ''],
+      ]);
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockQuery).toHaveBeenCalledWith(
+        `SELECT step_name, data FROM remote_agent_workflow_events
+     WHERE workflow_run_id = $1 AND event_type = 'node_completed'
+     ORDER BY created_at ASC`,
+        ['run-exact']
+      );
+    });
+
+    test('keeps successful empty recovery distinct from the identical query failure', async () => {
+      const failure = new Error('database unavailable');
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+      mockQuery.mockRejectedValueOnce(failure);
+
+      expect([...(await getCompletedDagNodeOutputs('run-empty'))]).toEqual([]);
+      await expect(getCompletedDagNodeOutputs('run-empty')).rejects.toBe(failure);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+    });
+
+    test('tolerant event listing still retains corrupt payloads and incomplete manual completions', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { ...mockEvent, event_type: 'node_completed', step_name: null, data: {} },
+          { ...mockEvent, data: '{bad json' },
+        ])
+      );
+
+      const result = await listWorkflowEvents('run-456');
+
+      expect(result[0].step_name).toBeNull();
+      expect(result[0].data).toEqual({});
+      expect(result[1].data).toEqual({ raw: '{bad json' });
+    });
+
+    test('SQLite recovery selects only the exact run completions in chronological order and rejects incomplete rows', async () => {
+      const sqlite = new SqliteAdapter(':memory:');
+      mockQuery.mockImplementation((sql: string, params?: unknown[]) => sqlite.query(sql, params));
+      try {
+        await sqlite.query(
+          `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id)
+           VALUES ('event-conversation', 'test', 'unknown-event-contract')`
+        );
+        for (const id of ['event-run', 'other-run']) {
+          await sqlite.query(
+            `INSERT INTO remote_agent_workflow_runs (id, workflow_name, conversation_id, user_message)
+             VALUES ($1, 'ordinary', 'event-conversation', 'synthetic')`,
+            [id]
+          );
+        }
+        const events = [
+          [
+            'later',
+            'event-run',
+            'node_completed',
+            '',
+            '{"node_output":"last"}',
+            '2026-10-23T12:00:03Z',
+          ],
+          ['other', 'other-run', 'node_completed', null, '{}', '2026-10-23T12:00:02Z'],
+          ['ignored', 'event-run', 'node_started', null, '{}', '2026-10-23T12:00:02Z'],
+          [
+            'space',
+            'event-run',
+            'node_completed',
+            '  ',
+            '{"node_output":""}',
+            '2026-10-23T12:00:02Z',
+          ],
+          [
+            'early',
+            'event-run',
+            'node_completed',
+            '',
+            '{"node_output":"first"}',
+            '2026-10-23T12:00:01Z',
+          ],
+        ];
+        for (const event of events) {
+          await sqlite.query(
+            `INSERT INTO remote_agent_workflow_events (id, workflow_run_id, event_type, step_name, data, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            event
+          );
+        }
+
+        expect([...(await getCompletedDagNodeOutputs('event-run'))]).toEqual([
+          ['', 'last'],
+          ['  ', ''],
+        ]);
+        expect([...(await getCompletedDagNodeOutputs('missing-run'))]).toEqual([]);
+
+        await createDurableWorkflowEvent({
+          workflow_run_id: 'event-run',
+          event_type: 'node_completed',
+        });
+        const before = await sqlite.query('SELECT * FROM remote_agent_workflow_events ORDER BY id');
+        await expect(getCompletedDagNodeOutputs('event-run')).rejects.toThrow();
+        expect(
+          (await sqlite.query('SELECT * FROM remote_agent_workflow_events ORDER BY id')).rows
+        ).toEqual(before.rows);
+      } finally {
+        await sqlite.close();
+        mockQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+      }
     });
   });
 });

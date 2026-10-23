@@ -52,16 +52,24 @@ class WorkflowRunGuardError extends Error {}
 /**
  * Normalize a WorkflowRun row from the database.
  * SQLite stores metadata as TEXT (JSON string), PostgreSQL returns parsed objects.
- * This ensures metadata is always a parsed object regardless of database backend.
+ * Preserve legacy NULL/undefined absence; reject unreadable metadata before assignment.
  */
 function normalizeWorkflowRun<T extends WorkflowRun>(row: T): T {
-  if (typeof row.metadata === 'string') {
+  const rawMetadata: unknown = row.metadata;
+  if (rawMetadata === null || rawMetadata === undefined) return row;
+  let metadata: unknown = rawMetadata;
+  if (typeof rawMetadata === 'string') {
     try {
-      row.metadata = JSON.parse(row.metadata) as Record<string, unknown>;
+      metadata = JSON.parse(rawMetadata);
     } catch {
-      row.metadata = {};
+      // JSON.parse errors may contain persisted input fragments.
+      throw new Error('Unreadable workflow run metadata');
     }
   }
+  if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new Error('Unreadable workflow run metadata');
+  }
+  if (typeof rawMetadata === 'string') row.metadata = metadata as Record<string, unknown>;
   return row;
 }
 
@@ -1540,7 +1548,7 @@ export async function getActiveWorkflowRun(conversationId: string): Promise<Work
 /**
  * Find a paused workflow run for a conversation (or its parent).
  * Used by the message handler to detect approval gates awaiting a natural-language response.
- * Non-throwing: returns null on DB error so the caller can fall through to normal routing.
+ * Only a successful zero-row query means absence; failed reads must stop routing.
  */
 export async function getPausedWorkflowRun(conversationId: string): Promise<WorkflowRun | null> {
   try {
@@ -1550,12 +1558,20 @@ export async function getPausedWorkflowRun(conversationId: string): Promise<Work
        ORDER BY started_at DESC LIMIT 1`,
       [conversationId, conversationId]
     );
-    const row = result.rows[0];
-    return row ? normalizeWorkflowRun(row) : null;
+    if (!result || !Array.isArray(result.rows)) {
+      throw new Error('Unreadable paused workflow result');
+    }
+    if (result.rows.length === 0) return null;
+    const row: WorkflowRun | undefined = result.rows[0];
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) {
+      throw new Error('Unreadable paused workflow row');
+    }
+    return normalizeWorkflowRun(row);
   } catch (error) {
-    const err = error as Error;
-    getLog().error({ err, conversationId }, 'db.workflow_run_get_paused_failed');
-    return null;
+    // Native query errors can contain persisted payloads; retain the cause by
+    // rethrowing it, without copying its message or parser input into logs.
+    getLog().error({ conversationId }, 'db.workflow_run_get_paused_failed');
+    throw error;
   }
 }
 
