@@ -35,17 +35,69 @@
  */
 
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { mkdtemp, readFile, rm as realRm, stat } from 'fs/promises';
+import { tmpdir } from 'os';
+import { basename, dirname, join, resolve } from 'path';
 
 import { ghPrListForBranchDefault, pollForTerminal } from '../poll.js';
 import { judgeGate } from '../judge.js';
 import { runCascade } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult } from '../types.js';
+import { acquireWoLock, releaseWoLock } from '../wo-lock.js';
 
 const originalFetch = globalThis.fetch;
+const intendedTempParent = resolve(tmpdir());
+const fixturePrefix = 'smart-cauldron-pr-detection-';
+const ownedRoots = new Set<string>();
+type RemoveOwnedRoot = (path: string, options: { recursive: true; force: true }) => Promise<void>;
 
-afterEach(() => {
-  globalThis.fetch = originalFetch;
+async function makeOutDir(): Promise<string> {
+  const root = await mkdtemp(join(intendedTempParent, fixturePrefix));
+  ownedRoots.add(root);
+  return root;
+}
+
+async function cleanupTestState(remove: RemoveOwnedRoot = realRm): Promise<void> {
+  try {
+    const roots = [...ownedRoots];
+    const outcomes = await Promise.allSettled(
+      roots.map(async root => {
+        const resolvedRoot = resolve(root);
+        if (
+          !ownedRoots.has(root) ||
+          resolvedRoot !== root ||
+          dirname(resolvedRoot) !== intendedTempParent ||
+          !basename(resolvedRoot).startsWith(fixturePrefix) ||
+          basename(resolvedRoot).length <= fixturePrefix.length
+        ) {
+          throw new Error(`Refusing cleanup of an unowned fixture root: ${root}`);
+        }
+        await remove(resolvedRoot, { recursive: true, force: true });
+        ownedRoots.delete(root);
+      })
+    );
+    const errors: unknown[] = [];
+    const failedRoots: string[] = [];
+    for (const [index, outcome] of outcomes.entries()) {
+      if (outcome.status === 'rejected') {
+        errors.push(outcome.reason);
+        failedRoots.push(roots[index]!);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(
+        errors,
+        `Failed to remove owned fixture roots: ${failedRoots.join(', ')}`
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+afterEach(async () => {
+  await cleanupTestState();
 });
 
 // A completed-run API response carrying the given events.
@@ -319,17 +371,122 @@ function makeFireOk(runId: string): FireResult {
 // path (Scenario 4) reaches defaultSpecRepair, which shells out to `gh issue
 // comment`/`gh issue edit` against a REAL repo -- so every cascade dep below
 // ALSO injects a no-op specRepair stub. The fake id is defense in depth.
-function baseOpts(deps: CascadeDeps): RunCascadeOptions {
+async function baseOpts(deps: CascadeDeps): Promise<RunCascadeOptions> {
   return {
     woId: 'WO-TEST-1502-PR-DETECTION-REGRESSION',
     woClass: 'CODE',
     tags: ['mechanical'],
-    outDir: '/tmp/smart-cauldron-1502-test-runs',
+    outDir: await makeOutDir(),
     token: 'test-token',
     project: 'lspro-react',
     deps,
   };
 }
+
+describe('PR-detection fixture lifecycle', () => {
+  test('fresh roots isolate the same WO and cleanup preserves an untracked sibling', async () => {
+    const deps: CascadeDeps = {};
+    const firstOpts = await baseOpts(deps);
+    const secondOpts = await baseOpts(deps);
+    const firstRoot = firstOpts.outDir!;
+    const secondRoot = secondOpts.outDir!;
+    // Fail before any filesystem operation if allocation still returns a shared root.
+    expect(firstRoot).not.toBe(secondRoot);
+    for (const opts of [firstOpts, secondOpts]) {
+      expect(opts).toMatchObject({
+        woId: 'WO-TEST-1502-PR-DETECTION-REGRESSION',
+        woClass: 'CODE',
+        tags: ['mechanical'],
+        token: 'test-token',
+        project: 'lspro-react',
+      });
+      expect(opts.deps).toBe(deps);
+    }
+    expect((await stat(firstRoot)).isDirectory()).toBe(true);
+    expect((await stat(secondRoot)).isDirectory()).toBe(true);
+
+    const woId = firstOpts.woId;
+    const project = 'lspro-react';
+    let controlRoot: string | undefined;
+    try {
+      const first = await acquireWoLock(woId, project, 'fixture-first', firstRoot);
+      const second = await acquireWoLock(woId, project, 'fixture-second', secondRoot);
+      expect(first.acquired).toBe(true);
+      expect(second.acquired).toBe(true);
+      const refused = await acquireWoLock(woId, project, 'fixture-refused', firstRoot);
+      expect(refused.acquired).toBe(false);
+      expect(refused.record.cascadeId).toBe('fixture-first');
+
+      await releaseWoLock(woId, project, 'fixture-first', firstRoot);
+      await releaseWoLock(woId, project, 'fixture-second', secondRoot);
+      expect(JSON.parse(await readFile(first.path, 'utf8')).status).toBe('released');
+      expect(JSON.parse(await readFile(second.path, 'utf8')).status).toBe('released');
+
+      controlRoot = await mkdtemp(join(intendedTempParent, fixturePrefix));
+      const control = await acquireWoLock(woId, project, 'fixture-control', controlRoot);
+      expect(control.acquired).toBe(true);
+      expect(control.record.status).toBe('running');
+      const controlBytes = await readFile(control.path);
+      globalThis.fetch = (async () => new Response('fixture-fetch')) as typeof fetch;
+
+      await cleanupTestState();
+
+      await expect(stat(firstRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(stat(secondRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(ownedRoots.size).toBe(0);
+      expect(globalThis.fetch).toBe(originalFetch);
+      expect((await stat(controlRoot)).isDirectory()).toBe(true);
+      expect(await readFile(control.path)).toEqual(controlBytes);
+      expect(JSON.parse(await readFile(control.path, 'utf8')).status).toBe('running');
+    } finally {
+      // This control was created by this test; register it only after observation.
+      if (controlRoot !== undefined) ownedRoots.add(controlRoot);
+    }
+  });
+
+  test('cleanup failure stays visible, attempts sibling roots and restores fetch', async () => {
+    const failedRoot = await mkdtemp(join(intendedTempParent, fixturePrefix));
+    ownedRoots.add(failedRoot);
+    const siblingRoot = await mkdtemp(join(intendedTempParent, fixturePrefix));
+    ownedRoots.add(siblingRoot);
+    const removalError = new Error('synthetic owned-root removal failure');
+    const attempts: string[] = [];
+    globalThis.fetch = (async () => new Response('fixture-fetch')) as typeof fetch;
+    let observedError: unknown;
+    try {
+      try {
+        await cleanupTestState((path, options) => {
+          attempts.push(path);
+          if (path === failedRoot) throw removalError;
+          return realRm(path, options);
+        });
+      } catch (error) {
+        observedError = error;
+      }
+
+      expect(observedError).toBeInstanceOf(AggregateError);
+      const failure = observedError as AggregateError;
+      expect(failure.errors).toContain(removalError);
+      expect(failure.message).toContain(failedRoot);
+      expect(attempts).toEqual([failedRoot, siblingRoot]);
+      await expect(stat(siblingRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(ownedRoots.has(siblingRoot)).toBe(false);
+      expect((await stat(failedRoot)).isDirectory()).toBe(true);
+      expect(ownedRoots.has(failedRoot)).toBe(true);
+      expect(globalThis.fetch).toBe(originalFetch);
+    } finally {
+      // Genuine removal of only the new roots arranged by this negative control.
+      for (const root of [failedRoot, siblingRoot]) {
+        if (ownedRoots.has(root)) {
+          await realRm(root, { recursive: true, force: true });
+          ownedRoots.delete(root);
+        }
+      }
+    }
+    await expect(stat(failedRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(ownedRoots.size).toBe(0);
+  });
+});
 
 // No-op spec-repair: prevents the frontier gate-fail path from making real
 // `gh issue comment` / `gh issue edit` GitHub mutations in unit tests.
@@ -370,7 +527,7 @@ describe('cascade does not climb when the completed run landed a PR (issue #1502
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
     };
 
-    const result = await runCascade(baseOpts(deps));
+    const result = await runCascade(await baseOpts(deps));
 
     expect(result.status).toBe('won');
     expect(result.attempts).toHaveLength(1);
@@ -396,7 +553,7 @@ describe('cascade does not climb when the completed run landed a PR (issue #1502
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
     };
 
-    const result = await runCascade(baseOpts(deps));
+    const result = await runCascade(await baseOpts(deps));
 
     expect(result.status).toBe('won');
     expect(result.attempts).toHaveLength(1);
@@ -425,7 +582,7 @@ describe('cascade does not climb when the completed run landed a PR (issue #1502
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
     };
 
-    const result = await runCascade(baseOpts(deps));
+    const result = await runCascade(await baseOpts(deps));
 
     expect(result.status).toBe('won');
     expect(result.attempts).toHaveLength(1);
@@ -449,7 +606,7 @@ describe('cascade does not climb when the completed run landed a PR (issue #1502
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
     };
 
-    const result = await runCascade(baseOpts(deps));
+    const result = await runCascade(await baseOpts(deps));
 
     // The fix must NOT fail-open: the entry tier gate-fails and the ladder climbs.
     expect(result.status).not.toBe('won');
