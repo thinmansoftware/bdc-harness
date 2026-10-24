@@ -54,7 +54,7 @@ const baselineNodesForAstra = baseline.nodes
       // delta; all other opener behavior and gates still compare byte-for-byte.
       return {
         ...node,
-        depends_on: ['commit-and-push'],
+        depends_on: ['commit-and-push', 'repair-gate'],
         bash: node.bash
           .replace(
             '# The first hook failure has no branch output; the successful bounded\n# retry owns the final branch and refreshed remote lease.\n',

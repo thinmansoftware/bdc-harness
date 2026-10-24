@@ -808,7 +808,7 @@ function isTransientNodeError(errorMessage: string): boolean {
  * True when a node error message is the SDK success-contradiction
  * (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01). The throw site formats it as
  * `Node '<id>' failed: SDK returned success...`; the outer retry loop uses this
- * to grant the node exactly one extra re-run, independent of the transient budget.
+ * to apply the bounded contradiction retry policy separately from transient retries.
  */
 function isSdkSuccessContradiction(errorMessage: string): boolean {
   return /failed: SDK returned success\b/.test(errorMessage);
@@ -6101,12 +6101,13 @@ async function executeDagWorkflowInternal(
           };
 
           // SDK success-contradiction (isError=true AND errorSubtype='success')
-          // earns exactly one extra whole-node re-run, independent of the
-          // transient-retry budget (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01).
+          // gets a separate bounded budget: up to two delayed retries for
+          // positive-token truncated output, or the existing one immediate
+          // retry for zero-token contradictions.
           // The transient loop below explicitly excludes the contradiction from
           // its budget (see `isContradiction`), so regardless of the node's
           // on_error setting this outer re-entry is the ONLY thing that retries
-          // it -- exactly once. A contradiction whose errors[] text also matches
+          // it. A contradiction whose errors[] text also matches
           // a FATAL pattern (auth/permission/credit-balance) is NOT re-run: the
           // FATAL guard on the outer check below preserves the "FATAL is never
           // retried" invariant.
@@ -6152,10 +6153,9 @@ async function executeDagWorkflowInternal(
               const isQuotaExhausted = output.quotaExhausted !== undefined;
               // SDK success-contradictions are NEVER retried by this transient
               // budget -- the outer `sdkContradictionRetry` loop grants them
-              // exactly one whole-node re-run. Without this exclusion,
+              // its separate bounded retries. Without this exclusion,
               // on_error:'all' would retry the contradiction maxRetries times
-              // here AND trigger the outer re-run, doubling the promised single
-              // extra execution to up to 2*(maxRetries+1) node runs.
+              // here AND trigger the outer retries, multiplying both budgets.
               const isContradiction = output.error
                 ? isSdkSuccessContradiction(output.error)
                 : false;

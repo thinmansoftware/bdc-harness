@@ -237,6 +237,51 @@ describe('commit hook repair contract', () => {
     }
   });
 
+  for (const mode of ['standalone', 'embedded'] as const) {
+    test(`${mode} retry refuses an unrelated staged file without discarding it`, () => {
+      const fixture = hookFixture();
+      try {
+        expect((mode === 'embedded' ? fixture.runInitialNode() : fixture.run(1)).status).toBe(1);
+        writeFileSync(
+          join(fixture.repo, 'fixture.ts'),
+          'export function value(): number { return 1; }\n'
+        );
+        writeFileSync(
+          join(fixture.repo, 'unrelated staged.ts'),
+          'export const unrelated = true;\n'
+        );
+        expect(
+          spawnSync('git', ['add', '--', 'unrelated staged.ts'], {
+            cwd: fixture.repo,
+            windowsHide: true,
+          }).status
+        ).toBe(0);
+        const retry = mode === 'embedded' ? fixture.runRetryNode() : fixture.run(2);
+        expect(retry.status).toBe(1);
+        expect(retry.stderr).toContain('staged paths outside initial repair scope');
+        expect(readFileSync(join(fixture.repo, 'unrelated staged.ts'), 'utf8')).toBe(
+          'export const unrelated = true;\n'
+        );
+        const staged = spawnSync('git', ['diff', '--cached', '--name-only'], {
+          cwd: fixture.repo,
+          windowsHide: true,
+          encoding: 'utf8',
+        });
+        expect(staged.stdout).toContain('unrelated staged.ts');
+        expect(
+          spawnSync('git', ['rev-parse', '--verify', 'HEAD'], {
+            cwd: fixture.repo,
+            windowsHide: true,
+          }).status
+        ).not.toBe(0);
+        expect(existsSync(join(fixture.artifacts, 'commit-and-push.succeeded'))).toBe(false);
+        expect(readFileSync(join(fixture.artifacts, 'git-argv'), 'utf8')).not.toMatch(/^push /m);
+      } finally {
+        rmSync(fixture.directory, { recursive: true, force: true });
+      }
+    });
+  }
+
   test('a second real hook failure remains failed with the attempt counter at two', () => {
     const fixture = hookFixture();
     try {

@@ -80,6 +80,7 @@ export async function notifyNodeFailure(
   const common = {
     correlation_id: input.runId,
     task_type: 'agent_message' as const,
+    repeat_reason: 'node_failure_escalation',
     body: buildNodeFailureNoticeBody(input),
     ...(subjectIssue ? { subject_key: `gh:thinmansoftware/bdc-xo#${subjectIssue}` } : {}),
   };

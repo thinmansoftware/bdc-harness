@@ -113,6 +113,30 @@ describe('node failure dispatch notification', () => {
     expect(rows.rows).toHaveLength(1);
     expect(rows.rows[0].body).toContain('Class: unknown');
   });
+  test('later node escalation survives addressed WO traffic and remains idempotent', async () => {
+    await caller(
+      'commit-and-push',
+      'lint-staged [FAILED] eslint\nhusky - pre-commit script failed'
+    );
+    await db.query(
+      "UPDATE agent_dispatch_messages SET addressed_at='2026-10-24T00:00:00Z', addressed_by='fixture'"
+    );
+    await caller(
+      'commit-and-push-retry',
+      'lint-staged [FAILED] eslint\nhusky - pre-commit script failed'
+    );
+    await caller(
+      'commit-and-push-retry',
+      'lint-staged [FAILED] eslint\nhusky - pre-commit script failed'
+    );
+    const rows = await db.query<{ recipient: string; repeat_reason: string }>(
+      "SELECT recipient,repeat_reason FROM agent_dispatch_messages WHERE idempotency_key LIKE '%:commit-and-push-retry' ORDER BY recipient"
+    );
+    expect(rows.rows).toEqual([
+      { recipient: 'duty-officer', repeat_reason: 'node_failure_escalation' },
+      { recipient: 'xo', repeat_reason: 'node_failure_escalation' },
+    ]);
+  });
   test('blocker_also_goes_to_xo', () =>
     expect(isNodeFailureBlocker({ ...base, attempt: 2 })).toBe(true));
   test('blocker_table_is_exported_and_complete', async () => {

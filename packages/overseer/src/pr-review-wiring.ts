@@ -1172,6 +1172,7 @@ export function createRealSubmitDeps(
               {
                 correlation_id: input.headSha,
                 idempotency_key: `overseer-review-unverified:${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`,
+                repeat_reason: 'unverified_approval_retry_exhausted',
                 task_type: 'agent_message',
                 recipient: 'duty-officer',
                 priority: 'normal',

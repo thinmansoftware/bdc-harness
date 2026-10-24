@@ -4128,13 +4128,23 @@ nodes:
           git diff --name-only -z
           git diff --cached --name-only -z
           git ls-files --others --exclude-standard -z
-        } | sort -zu > "$staged_paths_file"
+        } | LC_ALL=C sort -zu > "$staged_paths_file"
       elif [ ! -f "$staged_paths_file" ]; then
         echo "ERROR: initial path record missing; refusing to stage unrelated retry files" >&2
         exit 1
       fi
       if [ -s "$staged_paths_file" ]; then
         git add --pathspec-from-file="$staged_paths_file" --pathspec-file-nul
+      fi
+      # A repair may stage additional paths itself. Check the entire index without
+      # resetting or discarding any of that work before committing the frozen scope.
+      index_paths_file="$artifacts_dir/commit-hook-index-paths.nul"
+      outside_paths_file="$artifacts_dir/commit-hook-outside-paths.nul"
+      git diff --cached --name-only -z | LC_ALL=C sort -zu > "$index_paths_file"
+      LC_ALL=C comm -z -23 "$index_paths_file" "$staged_paths_file" > "$outside_paths_file"
+      if [ -s "$outside_paths_file" ]; then
+        echo "ERROR: staged paths outside initial repair scope; refusing commit" >&2
+        exit 1
       fi
       if ! git diff --cached --quiet; then
         hook_output="$artifacts_dir/commit-hook-output.txt"

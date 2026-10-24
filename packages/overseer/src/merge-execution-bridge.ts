@@ -810,6 +810,19 @@ async function mergeClaimedVerdict(
       return undefined;
     }
   }
+  // Slot reservation, approval and CE rechecks await external work. A newer
+  // unverified review recorded during those awaits must still stop this merge.
+  if (
+    await options.store.hasUnverifiedApprovalForHead({
+      ...verdict,
+      pr_url: pr.htmlUrl ?? verdict.pr_url,
+    })
+  ) {
+    await options.store.releaseMergeSlot(verdict.id);
+    await options.store.releaseVerdictClaim(verdict.id, 'approval_unverified');
+    log.info({ verdictId: verdict.id, reason: 'approval_unverified' }, 'merge-coordinator.skip');
+    return undefined;
+  }
   let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
   try {
     merged = await options.github.mergePullRequest({

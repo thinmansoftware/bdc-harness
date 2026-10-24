@@ -110,8 +110,10 @@ describe('unverified approval persistence and execution', () => {
       patOctokit: null,
     });
 
-  async function bridge(): Promise<{ merges: number; reasons: string[] }> {
-    const observed = { merges: 0, reasons: [] as string[] };
+  async function bridge(
+    hooks: { reserve?: () => Promise<void>; approve?: () => Promise<void> } = {}
+  ): Promise<{ merges: number; releasedSlots: number; reasons: string[] }> {
+    const observed = { merges: 0, releasedSlots: 0, reasons: [] as string[] };
     const store: MergeExecutionBridgeStore = {
       listUnactionedVerdicts: verdictStore.listUnactionedFlagMergeReadyVerdicts,
       claimVerdict: verdictStore.claimVerdictForMergeExecution,
@@ -121,8 +123,13 @@ describe('unverified approval persistence and execution', () => {
       },
       getRunById: async () => null,
       hasUnverifiedApprovalForHead: verdictStore.hasUnverifiedApprovalForHead,
-      reserveMergeSlot: async () => true,
-      releaseMergeSlot: async () => {},
+      reserveMergeSlot: async () => {
+        await hooks.reserve?.();
+        return true;
+      },
+      releaseMergeSlot: async () => {
+        observed.releasedSlots += 1;
+      },
       recordOutcome: verdictStore.recordVerdictMergeOutcome,
     };
     const github = {
@@ -138,7 +145,10 @@ describe('unverified approval persistence and execution', () => {
         changedFilePaths: ['packages/overseer/src/code.ts'],
         pr: { owner: work.owner, repo: work.repo, number: 55 },
       }),
-      approvePullRequest: async () => ({ approved: true }),
+      approvePullRequest: async () => {
+        await hooks.approve?.();
+        return { approved: true };
+      },
       mergePullRequest: async () => {
         observed.merges += 1;
         return { merged: true, mergeSha: 'merged' };
@@ -293,6 +303,35 @@ describe('unverified approval persistence and execution', () => {
     );
     expect(holds.rowCount).toBeGreaterThan(0);
   });
+  for (const stage of ['reserve', 'approve'] as const) {
+    test(`unverified review arriving during ${stage} blocks the final merge and releases its slot`, async () => {
+      const initial = await reviewRequest('before-merge');
+      await recordReviewApprovalVerdict({ ...initial, disposition: 'approved' });
+      let persisted = false;
+      const result = await bridge({
+        [stage]: async () => {
+          const negative = await reviewRequest(`during-${stage}`);
+          await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
+          persisted = true;
+        },
+      });
+      expect(persisted).toBe(true);
+      expect(result.merges).toBe(0);
+      expect(result.releasedSlots).toBe(1);
+      expect(result.reasons).toContain('approval_unverified');
+      expect(
+        (
+          await db.query<{ count: number }>(
+            'SELECT COUNT(*) AS count FROM overseer_verdicts WHERE mutation_sent=1'
+          )
+        ).rows[0]?.count
+      ).toBe(0);
+      expect((await bridge()).merges).toBe(0);
+      const retry = await reviewRequest(`verified-after-${stage}`);
+      await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+      expect((await bridge()).merges).toBe(1);
+    });
+  }
 
   test('verified redelivery finishes an interrupted evidence-resolution transition', async () => {
     const negative = await reviewRequest('negative-before-interruption');
@@ -505,5 +544,18 @@ describe('unverified approval persistence and execution', () => {
     expect(rows.rows).toHaveLength(1);
     expect(rows.rows[0].body).toContain(head);
     expect(rows.rows[0].body).toContain('#55');
+  });
+  test('repeated unverified escalation survives addressed PR traffic without duplicates', async () => {
+    const deps = realSubmit();
+    await deps.recordReceipt(receipt);
+    await db.query(
+      "UPDATE agent_dispatch_messages SET addressed_at='2026-10-24T00:00:00Z', addressed_by='fixture'"
+    );
+    await deps.recordReceipt({ ...receipt, messageId: 'review-after-addressed' });
+    await deps.recordReceipt({ ...receipt, messageId: 'review-after-addressed' });
+    const rows = await db.query<{ repeat_reason: string }>(
+      "SELECT repeat_reason FROM agent_dispatch_messages WHERE recipient='duty-officer'"
+    );
+    expect(rows.rows).toEqual([{ repeat_reason: 'unverified_approval_retry_exhausted' }]);
   });
 });
