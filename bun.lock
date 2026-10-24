@@ -22,7 +22,6 @@
         "typescript": "^5.3.0",
         "typescript-eslint": "^8.48.0",
         "yaml": "^2.7.0",
-        "yaml": "^2.7.0",
       },
     },
     "packages/adapters": {
@@ -242,6 +241,7 @@
       "dependencies": {
         "@archon/overseer": "workspace:*",
         "@archon/paths": "workspace:*",
+        "@archon/providers": "workspace:*",
       },
       "devDependencies": {
         "@archon/core": "workspace:*",
