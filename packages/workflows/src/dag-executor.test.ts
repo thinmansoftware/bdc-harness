@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } f
 import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { spawnSync } from 'node:child_process';
 import * as git from '@archon/git';
 
 const isWindows = process.platform === 'win32';
@@ -63,6 +64,7 @@ import { parseWorkflow } from './loader';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import { getWorkflowEventEmitter } from './event-emitter';
+import * as runLease from './run-lease';
 import type { GateResult } from './gate-result';
 
 // --- Mock helpers ---
@@ -14148,6 +14150,283 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
         'Agent prompt.',
       ].join('\n')
     );
+  }
+
+  async function runCommitHookRecoveryScenario(scenario = 'verified'): Promise<{
+    store: IWorkflowStore;
+    events: EventCall[];
+    runGit: (...args: string[]) => string;
+  }> {
+    const repo = join(testDir, 'repo');
+    const remote = join(testDir, 'origin.git');
+    await mkdir(repo);
+    const runGit = (...args: string[]): string => {
+      const result = spawnSync('git', args, {
+        cwd: repo,
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 10000,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    runGit('init', '--bare', remote);
+    runGit('init');
+    runGit('config', 'user.name', 'Harness recovery fixture');
+    runGit('config', 'user.email', 'fixture@example.invalid');
+    runGit('remote', 'add', 'origin', remote);
+    await writeFile(join(repo, 'fixture.txt'), 'broken\n');
+    // A real Git pre-commit failure. No external linter or model is needed to
+    // exercise executor finalization; the hook roundtrip suite tests ESLint.
+    await writeFile(
+      join(repo, '.git', 'hooks', 'pre-commit'),
+      '#!/bin/sh\nif [ "$(cat fixture.txt)" != fixed ]; then\n' +
+        "  printf '%s\\n' 'husky - pre-commit script failed' >&2\n  exit 1\nfi\n",
+      { mode: 0o755 }
+    );
+    const lanePath = join(
+      import.meta.dir,
+      '../../../.archon/workflows/defaults/bdc-feature-development-codex.yaml'
+    );
+    const parsed = parseWorkflow(await readFile(lanePath, 'utf8'), lanePath);
+    if (!parsed.workflow) throw new Error(JSON.stringify(parsed.error));
+    const retry = parsed.workflow.nodes?.find(n => n.id === 'commit-and-push-retry');
+    const terminal = parsed.workflow.nodes?.find(n => n.id === 'commit-hook-terminal');
+    if (!retry || !terminal) throw new Error('Hook recovery nodes missing');
+    const helper = join(import.meta.dir, '../../../.archon/scripts/commit-and-push.sh').replaceAll(
+      '\\',
+      '/'
+    );
+    const artifacts = join(testDir, 'artifacts').replaceAll('\\', '/');
+    await mkdir(artifacts);
+    await writeFile(join(artifacts, 'commit-and-push.sh'), await readFile(helper, 'utf8'));
+    let store = createMockStore();
+    const run = makeWorkflowRun();
+    if (!('bash' in terminal)) throw new Error('Terminal is not Bash');
+    let terminalBash = terminal.bash;
+    if (scenario === 'wrong_run')
+      terminalBash = terminalBash.replace(
+        'HOOK_RECOVERY_RUN_ID=$HARNESS_HOOK_RECOVERY_RUN_ID',
+        'HOOK_RECOVERY_RUN_ID=foreign-run'
+      );
+    if (scenario === 'wrong_invocation')
+      terminalBash = terminalBash.replace(
+        'HOOK_RECOVERY_INVOCATION_ID=$HARNESS_HOOK_RECOVERY_INVOCATION_ID',
+        'HOOK_RECOVERY_INVOCATION_ID=old-invocation'
+      );
+    if (scenario === 'wrong_branch')
+      terminalBash = terminalBash.replace(
+        'HOOK_RECOVERY_BRANCH=$UNIQUE_BRANCH',
+        'HOOK_RECOVERY_BRANCH=foreign-branch'
+      );
+    if (scenario === 'wrong_sha')
+      terminalBash = terminalBash.replace(
+        'HOOK_RECOVERY_HEAD_SHA=$LOCAL_HEAD',
+        `HOOK_RECOVERY_HEAD_SHA=${'0'.repeat(40)}`
+      );
+    if (scenario === 'duplicate_proof') terminalBash += "\nprintf 'HOOK_RECOVERY_VERIFIED=yes\\n'";
+    if (scenario === 'malformed_proof') terminalBash += "\nprintf 'HOOK_RECOVERY_BROKEN\\n'";
+    if (scenario === 'missing_proof')
+      terminalBash = `RECOVERY_OUTPUT=$(\n${terminalBash}\n)\nprintf 'terminal checked\\n'`;
+    if (scenario === 'failed_terminal') terminalBash += '\nexit 1';
+    if (scenario === 'mismatched_success_marker')
+      terminalBash = `printf 'stale-sha\\n' > "$ARTIFACTS_DIR/commit-and-push.succeeded"\n${terminalBash}`;
+    if (scenario === 'unconsumed_eligibility')
+      terminalBash = `printf 'yes\\n' > "$ARTIFACTS_DIR/commit-hook-repair-eligible"\n${terminalBash}`;
+    if (scenario === 'wrong_binding')
+      terminalBash = `printf 'old-run\\nold-invocation\\nfixture\\n' > "$ARTIFACTS_DIR/commit-hook-recovery-binding"\n${terminalBash}`;
+    const nodes: DagNode[] = [
+      {
+        id: 'repair-gate',
+        bash: `printf '{"REPAIR_GATE_ALLOW":"${scenario === 'denied_gate' ? 'no' : 'yes'}"}\\n'`,
+      },
+      {
+        id: 'commit-and-push',
+        bash:
+          scenario === 'non_hook_failure'
+            ? 'echo disk-full >&2; exit 1'
+            : `export UNIQUE_BRANCH=fixture\nbash '${helper}' 1`,
+        depends_on: ['repair-gate'],
+      },
+      {
+        id: 'commit-hook-repair',
+        bash: `printf '${scenario === 'second_hook_failure' ? 'broken' : 'fixed'}\\n' > fixture.txt`,
+        depends_on: ['commit-and-push', 'repair-gate'],
+        trigger_rule: 'all_done',
+      },
+      {
+        id: 'classify-commit-hook-repair',
+        bash:
+          `printf 'UNIQUE_BRANCH=fixture\\n' > "$ARTIFACTS_DIR/commit-and-push.env"\n` +
+          (scenario === 'stale_success_marker'
+            ? `printf 'old-sha\\n' > "$ARTIFACTS_DIR/commit-and-push.succeeded"\n`
+            : '') +
+          `printf '{"verdict":"fixed"}\\n'`,
+        depends_on: ['commit-hook-repair', 'repair-gate'],
+        trigger_rule: 'all_done',
+      },
+      { ...retry, persona: undefined },
+      { ...terminal, persona: undefined, bash: terminalBash },
+    ];
+    if (scenario === 'missing_terminal') nodes.pop();
+    if (scenario === 'additional_failure')
+      nodes.push({
+        id: 'build-manifest',
+        bash: 'exit 1',
+        depends_on: ['commit-hook-terminal'],
+        trigger_rule: 'all_done',
+      });
+    const workflow = { name: parsed.workflow.name, nodes };
+    const execute = async (prior?: Map<string, string>): Promise<void> => {
+      const deps = createMockDeps(store);
+      let terminalSeen = false;
+      if (scenario === 'cancelled' || scenario === 'lease_lost') {
+        const persist = store.createWorkflowEvent;
+        store.createWorkflowEvent = mock(async event => {
+          if (event.event_type === 'node_completed' && event.step_name === 'commit-hook-terminal')
+            terminalSeen = true;
+          return persist(event);
+        });
+        if (scenario === 'cancelled')
+          store.getWorkflowRunStatus = mock(async () => (terminalSeen ? 'cancelled' : 'running'));
+      }
+      if (scenario === 'persist_failure')
+        (store.completeWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+          new Error('terminal write failed')
+        );
+      const leaseSpy =
+        scenario === 'lease_lost'
+          ? spyOn(runLease, 'withRunLease').mockImplementation(async (_store, _runId, operation) =>
+              operation(() => !terminalSeen)
+            )
+          : undefined;
+      try {
+        await executeDagWorkflow(
+          deps,
+          createMockPlatform(),
+          'conv-hook-recovery',
+          repo,
+          workflow,
+          run,
+          'codex',
+          undefined,
+          artifacts,
+          join(testDir, 'logs'),
+          'dev',
+          'docs/',
+          minimalConfig,
+          undefined,
+          undefined,
+          prior
+        );
+      } finally {
+        leaseSpy?.mockRestore();
+      }
+    };
+    if (scenario === 'resumed_old_success') {
+      await execute();
+      expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+      const prior = new Map<string, string>();
+      for (const [event] of eventCalls(store)) {
+        if (
+          event.event_type === 'node_completed' &&
+          event.step_name &&
+          typeof event.data?.node_output === 'string'
+        )
+          prior.set(event.step_name, event.data.node_output);
+      }
+      // Same run, old retry/terminal successes, but a fresh failing commit attempt.
+      prior.delete('commit-and-push');
+      await writeFile(join(repo, 'fixture.txt'), 'broken\n');
+      store = createMockStore();
+      await execute(prior);
+    } else await execute();
+    return { store, events: eventCalls(store), runGit };
+  }
+
+  it('verified hook recovery finalizes completed without erasing the failed commit', async () => {
+    const { store, events, runGit } = await runCommitHookRecoveryScenario();
+    expect(
+      events.find(
+        c => c[0].event_type === 'node_completed' && c[0].step_name === 'commit-and-push-retry'
+      ),
+      JSON.stringify(events)
+    ).toBeDefined();
+    const remoteHead = runGit('ls-remote', 'origin', 'refs/heads/fixture').split(/\s/)[0];
+    expect(remoteHead).toBe(runGit('rev-parse', 'HEAD'));
+    expect(
+      events.filter(c => c[0].event_type === 'node_failed' && c[0].step_name === 'commit-and-push')
+    ).toHaveLength(1);
+    expect(
+      events.find(
+        c => c[0].event_type === 'node_completed' && c[0].step_name === 'commit-hook-terminal'
+      )
+    ).toBeDefined();
+    expect(store.failWorkflowRun).toHaveBeenCalledTimes(0);
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+    const completed = (store.completeWorkflowRun as ReturnType<typeof mock>).mock.calls[0] as [
+      string,
+      Record<string, unknown>,
+      { eventData: Record<string, unknown> },
+    ];
+    expect(completed[1].node_counts).toMatchObject({ failed: 1 });
+    expect(completed[1].recovered_failed_nodes).toEqual(['commit-and-push']);
+    expect(completed[2].eventData.recovered_failed_nodes).toEqual(['commit-and-push']);
+    expect(completed[2].eventData.terminal_cause).toBe('commit_hook_recovered');
+    expect(completed[1].effective_failed_node_count).toBe(0);
+    expect(completed[2]).toMatchObject({
+      outcome: {
+        executionState: 'completed',
+        recoveryState: 'recovered',
+        reasonCodes: expect.arrayContaining(['recovery_completed']),
+      },
+    });
+  });
+
+  for (const scenario of [
+    'second_hook_failure',
+    'non_hook_failure',
+    'denied_gate',
+    'missing_terminal',
+    'failed_terminal',
+    'additional_failure',
+    'wrong_run',
+    'wrong_invocation',
+    'wrong_branch',
+    'wrong_sha',
+    'duplicate_proof',
+    'malformed_proof',
+    'missing_proof',
+    'mismatched_success_marker',
+    'unconsumed_eligibility',
+    'wrong_binding',
+    'stale_success_marker',
+    'resumed_old_success',
+  ]) {
+    it(`hook recovery refuses ${scenario}`, async () => {
+      const { store, events } = await runCommitHookRecoveryScenario(scenario);
+      expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
+      expect(store.completeWorkflowRun).toHaveBeenCalledTimes(0);
+      expect(
+        events.filter(
+          c => c[0].event_type === 'node_failed' && c[0].step_name === 'commit-and-push'
+        )
+      ).toHaveLength(1);
+    });
+  }
+
+  for (const scenario of ['cancelled', 'lease_lost', 'persist_failure']) {
+    it(`hook recovery does not publish success after ${scenario}`, async () => {
+      const { store } = await runCommitHookRecoveryScenario(scenario);
+      if (scenario === 'persist_failure') {
+        expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+        expect(store.updateWorkflowRun).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ status: 'interrupted' })
+        );
+      } else expect(store.completeWorkflowRun).toHaveBeenCalledTimes(0);
+      expect(store.failWorkflowRun).toHaveBeenCalledTimes(0);
+    });
   }
 
   it('artifact-truth: paperwork-only failure after a PR artifact finalizes as completed+degraded', async () => {

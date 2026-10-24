@@ -16,7 +16,10 @@ function hookFixture(options: { pushFails?: boolean } = {}): {
   directory: string;
   repo: string;
   artifacts: string;
-  run: (attempt: number) => ReturnType<typeof spawnSync>;
+  run: (
+    attempt: number,
+    binding?: { runId: string; invocationId: string }
+  ) => ReturnType<typeof spawnSync>;
   runInitialNode: () => ReturnType<typeof spawnSync>;
   runRetryNode: () => ReturnType<typeof spawnSync>;
 } {
@@ -105,10 +108,18 @@ function hookFixture(options: { pushFails?: boolean } = {}): {
         timeout: 20000,
       });
     },
-    run: attempt =>
+    run: (attempt, binding) =>
       spawnSync('bash', [script, String(attempt)], {
         cwd: repo,
-        env,
+        env: {
+          ...env,
+          ...(binding
+            ? {
+                HARNESS_HOOK_RECOVERY_RUN_ID: binding.runId,
+                HARNESS_HOOK_RECOVERY_INVOCATION_ID: binding.invocationId,
+              }
+            : {}),
+        },
         encoding: 'utf8',
         windowsHide: true,
         timeout: 20000,
@@ -119,6 +130,36 @@ function hookFixture(options: { pushFails?: boolean } = {}): {
 const hookFailure = `lint-staged\n[FAILED] eslint\npackages/server/src/taskmaster/loop.ts 1419:19 error Missing return type on function @typescript-eslint/explicit-function-return-type\nhusky - pre-commit script failed`;
 
 describe('commit hook repair contract', () => {
+  for (const changedField of ['runId', 'invocationId'] as const) {
+    test(`bound hook retry refuses changed ${changedField} without consuming eligibility`, () => {
+      const fixture = hookFixture();
+      const binding = { runId: 'bound-run', invocationId: 'bound-invocation' };
+      try {
+        writeFileSync(join(fixture.artifacts, 'commit-hook-recovery-binding'), 'stale-binding\n');
+        const first = fixture.run(1, binding);
+        expect(first.status, first.stderr).toBe(1);
+        expect(readFileSync(join(fixture.artifacts, 'commit-hook-recovery-binding'), 'utf8')).toBe(
+          'bound-run\nbound-invocation\nfixture\n'
+        );
+        writeFileSync(
+          join(fixture.repo, 'fixture.ts'),
+          'export function value(): number { return 1; }\n'
+        );
+        const refused = fixture.run(2, { ...binding, [changedField]: 'foreign' });
+        expect(refused.status, refused.stderr).toBe(1);
+        expect(refused.stderr).toContain('recovery binding changed');
+        expect(readFileSync(join(fixture.artifacts, 'commit-hook-repair-eligible'), 'utf8')).toBe(
+          'yes\n'
+        );
+        expect(existsSync(join(fixture.artifacts, 'commit-and-push.succeeded'))).toBe(false);
+        const accepted = fixture.run(2, binding);
+        expect(accepted.status, accepted.stderr).toBe(0);
+        expect(existsSync(join(fixture.artifacts, 'commit-and-push.succeeded'))).toBe(true);
+      } finally {
+        rmSync(fixture.directory, { recursive: true, force: true });
+      }
+    });
+  }
   test('actual initial caller carries its helper into a target repo without Harness files', () => {
     const fixture = hookFixture();
     try {

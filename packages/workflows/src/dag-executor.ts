@@ -72,6 +72,7 @@ import type { GateResult } from './event-emitter';
 import type { IWorkflowStore } from './store';
 import { detectSilentFailure } from './silent-failure-detector';
 import { handleNodeFailure } from './overseer-bridge';
+import { classifyError as classifyOverseerError } from '@archon/overseer';
 import { evaluateCondition } from './condition-evaluator';
 import {
   logNodeStart,
@@ -3204,7 +3205,8 @@ async function executeBashNode(
   nodeOutputs: Map<string, NodeOutput>,
   issueContext?: string,
   envVars?: Record<string, string>,
-  resolvedInputs?: Record<string, string>
+  resolvedInputs?: Record<string, string>,
+  hookRecoveryInvocationId?: string
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3281,6 +3283,12 @@ async function executeBashNode(
     ARCHON_NODE_OUT: join(artifactsDir || tmpdir(), 'node-out'),
     ...inputEnvVars,
     ...(envVars ?? {}),
+    ...(hookRecoveryInvocationId
+      ? {
+          HARNESS_HOOK_RECOVERY_RUN_ID: workflowRun.id,
+          HARNESS_HOOK_RECOVERY_INVOCATION_ID: hookRecoveryInvocationId,
+        }
+      : {}),
   };
 
   const safeNodeId = node.id.replace(/[^A-Za-z0-9._-]/g, '_');
@@ -5547,6 +5555,9 @@ async function executeDagWorkflowInternal(
   };
   const layers = buildTopologicalLayers(workflow.nodes);
   const nodeOutputs = new Map<string, NodeOutput>();
+  const hookRecoveryInvocationId =
+    workflow.name === 'bdc-feature-development-codex' ? randomUUID() : undefined;
+  const freshHookBashNodes = new Set<string>();
 
   // Pre-populate nodeOutputs from prior run so already-completed nodes are
   // treated as done for trigger-rule and $nodeId.output substitution purposes.
@@ -5819,6 +5830,12 @@ async function executeDagWorkflowInternal(
 
           // 3a. Bash node dispatch -- no AI, no session
           if (isBashNode(node)) {
+            const hookInvocation =
+              hookRecoveryInvocationId &&
+              ['commit-and-push', 'commit-and-push-retry', 'commit-hook-terminal'].includes(node.id)
+                ? hookRecoveryInvocationId
+                : undefined;
+            if (hookInvocation) freshHookBashNodes.add(node.id);
             const output = await executeBashNode(
               deps,
               platform,
@@ -5833,7 +5850,8 @@ async function executeDagWorkflowInternal(
               nodeOutputs,
               issueContext,
               config.envVars,
-              resolvedInputs
+              resolvedInputs,
+              hookInvocation
             );
             return { nodeId: node.id, output };
           }
@@ -6556,7 +6574,126 @@ async function executeDagWorkflowInternal(
     else if (o.state === 'skipped') nodeCounts.skipped++;
   }
   const anyCompleted = nodeCounts.completed > 0;
-  const anyFailed = nodeCounts.failed > 0;
+  const failedNodeIds = [...nodeOutputs.entries()]
+    .filter(([, output]) => output.state === 'failed')
+    .map(([id]) => id);
+
+  // Keep historical failures intact. Only the exact Codex hook-recovery chain
+  // can satisfy its sole initial failure with fresh mechanical push evidence.
+  const hookRecovery = ((): {
+    node_id: 'commit-and-push';
+    retry_node_id: 'commit-and-push-retry';
+    terminal_node_id: 'commit-hook-terminal';
+    run_id: string;
+    invocation_id: string;
+    branch: string;
+    head_sha: string;
+  } | null => {
+    if (
+      !hookRecoveryInvocationId ||
+      failedNodeIds.length !== 1 ||
+      failedNodeIds[0] !== 'commit-and-push'
+    )
+      return null;
+    const initial = nodeOutputs.get('commit-and-push');
+    const retry = nodeOutputs.get('commit-and-push-retry');
+    const terminal = nodeOutputs.get('commit-hook-terminal');
+    if (
+      initial?.state !== 'failed' ||
+      retry?.state !== 'completed' ||
+      terminal?.state !== 'completed' ||
+      classifyOverseerError({ nodeId: 'commit-and-push', message: initial.error }) !==
+        'commit_hook_lint_failure' ||
+      !['commit-and-push', 'commit-and-push-retry', 'commit-hook-terminal'].every(id =>
+        freshHookBashNodes.has(id)
+      ) ||
+      nodeOutputs.get('commit-hook-repair')?.state !== 'completed' ||
+      nodeOutputs.get('classify-commit-hook-repair')?.state !== 'completed' ||
+      !evaluateCondition(
+        "$classify-commit-hook-repair.output.verdict == 'fixed' || $classify-commit-hook-repair.output.verdict == 'already_satisfied'",
+        nodeOutputs
+      ) ||
+      !evaluateCondition("$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'", nodeOutputs)
+    )
+      return null;
+    for (const [id, parent] of [
+      ['commit-and-push-retry', 'classify-commit-hook-repair'],
+      ['commit-hook-terminal', 'commit-and-push-retry'],
+    ] as const) {
+      const node = workflow.nodes.find(candidate => candidate.id === id);
+      if (
+        !node ||
+        !isBashNode(node) ||
+        !node.depends_on?.includes(parent) ||
+        !node.depends_on.includes('repair-gate')
+      )
+        return null;
+    }
+    for (const [id, parent] of [
+      ['commit-hook-repair', 'commit-and-push'],
+      ['classify-commit-hook-repair', 'commit-hook-repair'],
+    ] as const) {
+      const node = workflow.nodes.find(candidate => candidate.id === id);
+      if (!node?.depends_on?.includes(parent) || !node.depends_on.includes('repair-gate'))
+        return null;
+    }
+    const proof = new Map<string, string>();
+    const fields = [
+      'RUN_ID',
+      'INVOCATION_ID',
+      'ATTEMPT',
+      'ELIGIBILITY',
+      'BRANCH',
+      'HEAD_SHA',
+      'VERIFIED',
+    ];
+    for (const line of terminal.output.split(/\r?\n/)) {
+      if (!line.startsWith('HOOK_RECOVERY_')) continue;
+      const match = /^HOOK_RECOVERY_([A-Z_]+)=(.*)$/.exec(line);
+      if (!match || !fields.includes(match[1]) || proof.has(match[1])) return null;
+      proof.set(match[1], match[2]);
+    }
+    const branch = proof.get('BRANCH');
+    const sha = proof.get('HEAD_SHA');
+    if (
+      proof.size !== fields.length ||
+      proof.get('RUN_ID') !== workflowRun.id ||
+      proof.get('INVOCATION_ID') !== hookRecoveryInvocationId ||
+      proof.get('ATTEMPT') !== '2' ||
+      proof.get('ELIGIBILITY') !== 'consumed' ||
+      proof.get('VERIFIED') !== 'yes' ||
+      !branch ||
+      /\s/.test(branch) ||
+      !sha ||
+      !/^[0-9a-f]{40}$/.test(sha)
+    )
+      return null;
+    const retryLines = retry.output.split(/\r?\n/);
+    if (
+      retryLines.filter(line => line.startsWith('unique_branch=')).length !== 1 ||
+      !retryLines.includes(`unique_branch=${branch}`) ||
+      retryLines.filter(line => line.startsWith('VERIFIED: origin/')).length !== 1 ||
+      !retryLines.includes(`VERIFIED: origin/${branch} == local HEAD (${sha})`)
+    )
+      return null;
+    return {
+      node_id: 'commit-and-push',
+      retry_node_id: 'commit-and-push-retry',
+      terminal_node_id: 'commit-hook-terminal',
+      run_id: workflowRun.id,
+      invocation_id: hookRecoveryInvocationId,
+      branch,
+      head_sha: sha,
+    };
+  })();
+  const anyFailed = nodeCounts.failed > 0 && hookRecovery === null;
+  const recoveryMetadata = hookRecovery
+    ? {
+        recovered_failed_nodes: ['commit-and-push'],
+        effective_failed_node_count: 0,
+        hook_recovery: hookRecovery,
+      }
+    : {};
 
   const pushArtifactPresent = [...nodeOutputs.values()].some(o => hasPushArtifact(o.output));
   const hasMechanicalEvidenceNode = workflow.nodes.some(isEvidenceNode);
@@ -6582,10 +6719,17 @@ async function executeDagWorkflowInternal(
       executionState,
       deliverableState,
       validationState,
-      recoveryState: executionState === 'failed' ? 'recoverable' : 'not_needed',
+      recoveryState:
+        executionState === 'failed' ? 'recoverable' : hookRecovery ? 'recovered' : 'not_needed',
       routeState: existing?.routeState ?? 'current',
       primaryReason,
-      reasonCodes: [...new Set([primaryReason, ...(existing?.reasonCodes ?? [])])],
+      reasonCodes: [
+        ...new Set([
+          primaryReason,
+          ...(hookRecovery ? ['recovery_completed' as const] : []),
+          ...(existing?.reasonCodes ?? []),
+        ]),
+      ],
       evidenceRefs: [...new Set([`run:${workflowRun.id}`, ...(existing?.evidenceRefs ?? [])])],
     };
   }
@@ -6739,9 +6883,6 @@ async function executeDagWorkflowInternal(
     // failure class tracked in bdc-harness#344. If EITHER condition is false
     // (a non-paperwork node failed, or no artifact exists) the run fails exactly
     // as before -- unchanged behavior.
-    const failedNodeIds = [...nodeOutputs.entries()]
-      .filter(([, o]) => o.state === 'failed')
-      .map(([id]) => id);
     const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
     if (!hasMechanicalEvidenceNode && allFailuresArePaperwork && pushArtifactPresent) {
       getLog().warn(
@@ -6867,6 +7008,8 @@ async function executeDagWorkflowInternal(
       workflowRun.id,
       {
         node_counts: nodeCounts,
+        ...recoveryMetadata,
+        ...(hookRecovery ? { terminal_cause: 'commit_hook_recovered' } : {}),
         // totalCostUsd starts at 0; only write metadata when at least one node reported cost
         ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
         // totalTokens starts at 0; only write metadata when at least one node reported tokens
@@ -6888,7 +7031,8 @@ async function executeDagWorkflowInternal(
         eventData: {
           duration_ms: duration,
           node_counts: nodeCounts,
-          terminal_cause: 'all_nodes_satisfied',
+          terminal_cause: hookRecovery ? 'commit_hook_recovered' : 'all_nodes_satisfied',
+          ...recoveryMetadata,
         },
       }
     );

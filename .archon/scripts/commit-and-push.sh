@@ -8,8 +8,15 @@ message="${COMMIT_MESSAGE:-feat: ${WO_ID:-work order} implementation}"
 mkdir -p "$artifacts_dir"
 staged_paths_file="$artifacts_dir/commit-hook-staged-paths.nul"
 eligibility_file="$artifacts_dir/commit-hook-repair-eligible"
+binding_file="$artifacts_dir/commit-hook-recovery-binding"
+recovery_binding=$(printf '%s\n' "${HARNESS_HOOK_RECOVERY_RUN_ID:-}" "${HARNESS_HOOK_RECOVERY_INVOCATION_ID:-}" "$unique_branch")
 if [ "$attempt" = 1 ]; then
   rm -f "$artifacts_dir/commit-and-push.succeeded"
+  rm -f "$binding_file"
+  if [ -n "${HARNESS_HOOK_RECOVERY_RUN_ID:-}${HARNESS_HOOK_RECOVERY_INVOCATION_ID:-}" ]; then
+    : "${HARNESS_HOOK_RECOVERY_RUN_ID:?recovery run required}" "${HARNESS_HOOK_RECOVERY_INVOCATION_ID:?recovery invocation required}"
+    printf '%s\n' "$recovery_binding" > "$binding_file"
+  fi
   printf 'no\n' > "$eligibility_file"
 elif [ "$attempt" = 2 ]; then
   if [ -f "$artifacts_dir/commit-and-push.succeeded" ]; then exit 0; fi
@@ -20,6 +27,13 @@ elif [ "$attempt" = 2 ]; then
   if [ "$(cat "$eligibility_file" 2>/dev/null || true)" != yes ]; then
     echo "ERROR: no eligible initial hook failure; refusing retry" >&2
     exit 1
+  fi
+  if [ -f "$binding_file" ] || [ -n "${HARNESS_HOOK_RECOVERY_RUN_ID:-}${HARNESS_HOOK_RECOVERY_INVOCATION_ID:-}" ]; then
+    : "${HARNESS_HOOK_RECOVERY_RUN_ID:?recovery run required}" "${HARNESS_HOOK_RECOVERY_INVOCATION_ID:?recovery invocation required}"
+    if [ "$(cat "$binding_file" 2>/dev/null || true)" != "$recovery_binding" ]; then
+      echo "ERROR: recovery binding changed; refusing retry" >&2
+      exit 1
+    fi
   fi
   printf 'consumed\n' > "$eligibility_file"
 else
