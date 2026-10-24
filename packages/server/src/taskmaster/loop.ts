@@ -13,12 +13,12 @@
  * Budgets (ratified Q1): max 10 effects/tick, 1 effect/item/tick, max 3
  * automated interventions per item per 24h.
  */
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { getDatabase } from '@archon/core';
 import { createGhLanePrFetcher } from '@archon/smart-cauldron/open-pr-guard';
-import { runCascade } from '@archon/smart-cauldron/cascade';
+import { readCascadeRecord, runCascade } from '@archon/smart-cauldron/cascade';
 import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldron/headroom';
 import {
   acknowledgeMessage,
@@ -68,9 +68,14 @@ import {
 import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
+import { refreshLaneHealth } from './lane-health';
 import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import { fireBackoffDecision } from './backoff';
-import { checkExpectations } from './expectations';
+import {
+  checkExpectations,
+  readCascadeWorkflowEvidence,
+  type CascadeEvidenceDeps,
+} from './expectations';
 import { canonicalizeThreadRef } from './thread-ref';
 import {
   createDeadmanState,
@@ -98,6 +103,16 @@ function defaultEscalationDelivery(): EscalationDeliveryDeps {
 export const MAX_EFFECTS_PER_TICK = 10;
 /** Conservative faucet bound for newly eligible work, within the shared cap. */
 export const MAX_FIRES_PER_TICK = 3;
+
+/** Ratified M-155 daily bound; invalid input closes the automatic faucet. */
+export function resolveTaskmasterFireDailyLimit(
+  value: string | undefined = process.env.TASKMASTER_FIRE_MAX_PER_DAY
+): number {
+  if (value === undefined) return 2;
+  if (!/^\d+$/.test(value)) return 0;
+  const limit = Number(value);
+  return Number.isSafeInteger(limit) ? limit : 0;
+}
 
 /**
  * Per-tick cap on blocker_report sends (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01).
@@ -132,16 +147,6 @@ export function isPauseEffectsExempt(proposalType: string, pauseScope: string | 
 const JOURNAL_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PROOF_DEADLINE_MS = 24 * 60 * 60 * 1000;
-
-/**
- * The only cascade run statuses that count as EVIDENCE of success.
- *
- * TERMINAL_WORKFLOW_STATUSES also contains failed / escalated / cancelled --
- * those are terminal but they are the outcomes an expectation exists to catch,
- * so they must NOT satisfy it. A run still pending or running does not satisfy
- * it either: it is simply not yet proven, and the deadline decides.
- */
-const CASCADE_SUCCESS_STATUSES: readonly string[] = ['completed'];
 
 export interface TaskmasterState {
   deadman: DeadmanState;
@@ -191,6 +196,9 @@ type TaskmasterDal = Pick<
       | 'setSuppression'
       | 'clearSuppression'
       | 'registerExpectation'
+      | 'getExpectationByRegistrationKey'
+      | 'listPendingFireActions'
+      | 'transitionPendingFireAction'
       | 'getExpectationCounts'
     >
   >;
@@ -215,6 +223,18 @@ export interface GithubIssueEvidence {
 }
 
 export interface TaskmasterDeps {
+  /** Test seam; injected journal DALs never fall through into the live budget DB. */
+  fireBudget?: Pick<
+    typeof taskmasterDb,
+    | 'reserveAutomaticFire'
+    | 'authorizeAutomaticFire'
+    | 'releaseAutomaticFire'
+    | 'settleAutomaticFire'
+    | 'listAutomaticFireAdmissions'
+    | 'seedAutomaticFireHistory'
+    | 'updateAutomaticFireExpectation'
+  >;
+  readFireCascade?: typeof readCascadeRecord;
   now?: () => Date;
   db?: TaskmasterDal;
   /** Same repair owner with isolated external seams; production uses its existing factory. */
@@ -241,11 +261,15 @@ export interface TaskmasterDeps {
   ) => Promise<GithubIssueEvidence | null>;
   checkFireEligibility?: (issueTitle: string) => Promise<FireEligibilityResult>;
   runCascade?: typeof runCascade;
+  readFireCascadeEvidence?: typeof readCascadeWorkflowEvidence;
   getFireRunEvidence?: (
     woId: string,
-    cascadeId: string
+    cascadeId: string,
+    project?: string
   ) => Promise<{ status: string; prOpened?: boolean } | null>;
   getHealthSample?: typeof taskmasterDb.getHealthSample;
+  /** Refresh cursor and zero tm_health before the lane decision. */
+  refreshLaneHealth?: () => Promise<void>;
   /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
   onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
   checkExpectations?: (now: Date) => Promise<void>;
@@ -303,6 +327,16 @@ export async function defaultFindEffectByIdempotencyKey(
   );
   const row = result.rows[0];
   return row ? { id: row.id, status: row.status, createdAt: row.created_at } : null;
+}
+
+/** Default fire evidence probe, kept injectable for source-backed regressions. */
+export async function defaultGetFireRunEvidence(
+  woId: string,
+  cascadeId: string,
+  project: string | undefined,
+  deps: CascadeEvidenceDeps = {}
+): Promise<{ status: string; prOpened?: boolean } | null> {
+  return readCascadeWorkflowEvidence({ woId, cascadeId, project }, deps);
 }
 
 /** Undelivered ratified rulings: queued board-motion mailbox rows not yet acknowledged. */
@@ -1020,6 +1054,125 @@ export function digestProposal(
   };
 }
 
+interface FireCustody {
+  proposal: ActionProposal & { cascadeId?: string; runId?: string; fireHoldReason?: string };
+  identity: { cascadeId: string; woId: string; project: string };
+  recipient: string;
+  dueAt: string;
+}
+
+function parseFireCustody(action: taskmasterDb.TmJournalEntry): FireCustody {
+  const proposal = JSON.parse(action.proposal_json) as FireCustody['proposal'];
+  const evidence = proposal?.fireEvidence;
+  if (
+    !action.idempotency_key ||
+    proposal?.type !== 'fire_cauldron' ||
+    proposal.idempotencyKey !== action.idempotency_key ||
+    (proposal.cascadeId !== undefined && proposal.cascadeId !== action.idempotency_key) ||
+    typeof evidence?.woId !== 'string' ||
+    WO_ID_RE.exec(evidence.woId)?.[0] !== evidence.woId ||
+    typeof evidence.project !== 'string' ||
+    !evidence.project.trim() ||
+    /\s/.test(evidence.project) ||
+    typeof proposal.recipient !== 'string' ||
+    !proposal.recipient.trim() ||
+    !action.proof_deadline_at ||
+    !Number.isFinite(Date.parse(action.proof_deadline_at))
+  ) {
+    throw new Error('taskmaster_fire_custody_unknown');
+  }
+  return {
+    proposal,
+    identity: { cascadeId: action.idempotency_key, woId: evidence.woId, project: evidence.project },
+    recipient: proposal.recipient,
+    dueAt: action.proof_deadline_at,
+  };
+}
+
+function fireScopeKey(woId: string, project: string): string {
+  return JSON.stringify([woId, project]);
+}
+
+async function retainFireHold(
+  action: taskmasterDb.TmJournalEntry,
+  dal: TaskmasterDal,
+  reason: string
+): Promise<void> {
+  // Preserve malformed original evidence for manual reconciliation.
+  try {
+    const proposal: unknown = JSON.parse(action.proposal_json);
+    if (!proposal || typeof proposal !== 'object' || Array.isArray(proposal)) return;
+    const updated = JSON.stringify({ ...proposal, fireHoldReason: reason });
+    if (
+      updated !== action.proposal_json &&
+      (await dal.transitionPendingFireAction?.(action.id, action.proposal_json, 'pending', updated))
+    )
+      action.proposal_json = updated;
+  } catch {
+    /* A durable malformed row remains held and visible through the warning. */
+  }
+}
+
+/** A read-only provider proof can finalize custody; reconciliation never fires. */
+async function reconcilePendingFire(
+  action: taskmasterDb.TmJournalEntry,
+  dal: TaskmasterDal,
+  readEvidence: NonNullable<TaskmasterDeps['readFireCascadeEvidence']>
+): Promise<boolean> {
+  let reason = 'cascade-evidence-unknown';
+  try {
+    const custody = parseFireCustody(action);
+    const bound = await readEvidence(custody.identity);
+    const register = dal.registerExpectation;
+    const readback = dal.getExpectationByRegistrationKey;
+    const transition = dal.transitionPendingFireAction;
+    if (!register || !readback || !transition) throw new Error('custody storage unavailable');
+    const requested = {
+      action_ref: action.id,
+      dispatch_ref: custody.identity.cascadeId,
+      recipient: custody.recipient,
+      evidence_json: JSON.stringify({ kind: 'cascade_workflow_completed', ...custody.identity }),
+      due_at: custody.dueAt,
+      on_absence: 'escalate' as const,
+      max_retries: 0,
+    };
+    reason = 'expectation-registration-unavailable';
+    const expectationId = await register(requested);
+    const stored = await readback(
+      taskmasterDb.expectationRegistrationKey(action.id, custody.identity.cascadeId)
+    );
+    reason = 'expectation-registration-mismatch';
+    if (
+      stored?.id !== expectationId ||
+      taskmasterDb.expectationSemanticMismatches(stored, requested).length > 0 ||
+      Date.parse(stored.due_at) !== Date.parse(custody.dueAt) ||
+      stored.retries !== 0 ||
+      stored.registered_by !== 'taskmaster' ||
+      stored.self_supervised !== 0
+    )
+      throw new Error('supervision mismatch');
+    const proposal = { ...custody.proposal };
+    delete proposal.fireHoldReason;
+    const updated = JSON.stringify({
+      ...proposal,
+      cascadeId: custody.identity.cascadeId,
+      runId: bound.earliestRunId,
+    });
+    if (!(await transition(action.id, action.proposal_json, 'sent', updated))) return false;
+    action.outcome = 'sent';
+    action.proposal_json = updated;
+    log.info(
+      { journalId: action.id, cascadeId: custody.identity.cascadeId, runId: bound.earliestRunId },
+      'taskmaster.fire_run_verified'
+    );
+    return true;
+  } catch {
+    await retainFireHold(action, dal, reason);
+    log.warn({ journalId: action.id, reason }, 'taskmaster.pending_fire_custody_holding');
+    return false;
+  }
+}
+
 /**
  * Restart reconciliation (Section 11 test 4): a journal row left 'pending'
  * (in-flight marker) is resolved against the external SOR. If the dispatch
@@ -1035,7 +1188,12 @@ async function reconcilePendingActions(
   const since = new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString();
   const actions = await dal.getActionsSince(since);
   for (const action of actions) {
-    if (action.outcome !== 'pending' || !action.idempotency_key) continue;
+    if (
+      action.outcome !== 'pending' ||
+      !action.idempotency_key ||
+      action.action_type === 'fire_cauldron'
+    )
+      continue;
     const effect = await findEffect(action.idempotency_key);
     if (effect) {
       await dal.updateActionOutcome(action.id, 'sent');
@@ -1050,6 +1208,134 @@ async function reconcilePendingActions(
         'taskmaster.reconcile_pending_expired'
       );
     }
+  }
+}
+
+async function reconcileAutomaticFires(
+  dal: TaskmasterDal,
+  budget: NonNullable<TaskmasterDeps['fireBudget']>,
+  read: typeof readCascadeRecord,
+  now: Date
+): Promise<void> {
+  // The seven-day message lookback cannot drop unresolved automatic effects.
+  const history = await dal.getActionsSince('1970-01-01T00:00:00.000Z');
+  const dayStart = `${now.toISOString().slice(0, 10)}T00:00:00.000Z`;
+  for (const action of history) {
+    if (
+      action.action_type !== 'fire_cauldron' ||
+      !action.idempotency_key ||
+      ['parked', 'deferred', 'rejected'].includes(action.outcome)
+    )
+      continue;
+    // Resolved legacy days do not become a permanent new global hold. Old
+    // pending effects and every unresolved NEW ledger identity still reconcile.
+    if (action.outcome !== 'pending' && action.created_at < dayStart) continue;
+    const proposal = JSON.parse(action.proposal_json) as { cascadeId?: string; reason?: string };
+    if (proposal.reason === 'stale_epoch_before_effect') continue;
+    await budget.seedAutomaticFireHistory({
+      actionKey: action.idempotency_key,
+      journalId: action.id,
+      sourceThreadRef: action.thread_ref,
+      ownerToken: 'legacy-reconciliation',
+      cascadeId: proposal.cascadeId ?? action.idempotency_key,
+      now: action.created_at,
+    });
+  }
+  for (const row of await budget.listAutomaticFireAdmissions()) {
+    const record = await read(row.cascade_id);
+    if (!record) continue; // Absence is never proof that a permission was unused.
+    const runIds = record.attempts.flatMap(attempt => (attempt.runId ? [attempt.runId] : []));
+    // A zero-attempt file can predate this permission (manual/dry-run collision).
+    // It is not an owned non-admission witness. Check provenance even for such
+    // records; absent/conflicting evidence stays held. The active owner releases
+    // definitive pre-permission refusals through releaseAutomaticFire below.
+    const source = record.automaticFireAdmission;
+    if (!source) {
+      // A terminal journal label alone is not admission proof. Only an exact,
+      // completed legacy cascade can establish the historical accounting day;
+      // missing evidence and real post-permission unknowns remain held.
+      const action = history.find(action => action.id === row.journal_id);
+      const proposal = action
+        ? (JSON.parse(action.proposal_json) as ActionProposal & {
+            cascadeId?: string;
+          })
+        : null;
+      const admittedAt = Date.parse(record.createdAt);
+      const legacyDryRun: unknown = record.request?.dryRun;
+      if (
+        row.owner_token !== 'legacy-reconciliation' ||
+        action?.action_type !== 'fire_cauldron' ||
+        action.idempotency_key !== row.action_key ||
+        action.thread_ref !== row.source_thread_ref ||
+        proposal?.cascadeId !== row.cascade_id ||
+        record.cascadeId !== row.cascade_id ||
+        typeof proposal.fireEvidence?.woId !== 'string' ||
+        !proposal.fireEvidence.woId.trim() ||
+        typeof proposal.fireEvidence.project !== 'string' ||
+        !proposal.fireEvidence.project.trim() ||
+        proposal.fireEvidence?.woId !== record.woId ||
+        proposal.fireEvidence?.project !== record.project ||
+        legacyDryRun !== false ||
+        !['won', 'blocked', 'spec-repair', 'cancelled', 'frontier-rejected'].includes(
+          record.status
+        ) ||
+        !runIds.length ||
+        !runIds.every(id => typeof id === 'string' && id.trim().length > 0) ||
+        !Number.isFinite(admittedAt) ||
+        !Number.isFinite(Date.parse(action.created_at)) ||
+        admittedAt < Date.parse(action.created_at) ||
+        admittedAt > now.getTime() ||
+        !record.attempts.every(
+          attempt =>
+            Number.isFinite(Date.parse(attempt.startedAt)) &&
+            Date.parse(attempt.startedAt) >= admittedAt &&
+            attempt.completedAt !== null &&
+            Number.isFinite(Date.parse(attempt.completedAt)) &&
+            Date.parse(attempt.completedAt) >= Date.parse(attempt.startedAt) &&
+            Date.parse(attempt.completedAt) <= now.getTime()
+        ) ||
+        // Record creation precedes admission. Crossing midnight before the first
+        // attempt leaves the historical admission day ambiguous, so keep it held.
+        new Date(Date.parse(record.attempts[0].startedAt)).toISOString().slice(0, 10) !==
+          new Date(admittedAt).toISOString().slice(0, 10)
+      )
+        continue;
+      await budget.settleAutomaticFire({
+        actionKey: row.action_key,
+        cascadeId: row.cascade_id,
+        state: 'admitted',
+        admittedAt: new Date(admittedAt).toISOString(),
+        runIds,
+      });
+      // Keep the legacy owner marker and original journal/record provenance.
+      continue;
+    }
+    const recordDryRun: unknown = record.request?.dryRun;
+    if (
+      source.source !== 'taskmaster' ||
+      source.actionKey !== row.action_key ||
+      source.journalId !== row.journal_id ||
+      source.sourceThreadRef !== row.source_thread_ref ||
+      source.cascadeId !== row.cascade_id ||
+      record.cascadeId !== row.cascade_id ||
+      recordDryRun !== false ||
+      !Number.isFinite(Date.parse(source.admittedAt)) ||
+      Date.parse(source.admittedAt) > now.getTime() ||
+      source.utcDay !== source.admittedAt.slice(0, 10) ||
+      (row.admitted_at !== null &&
+        (Date.parse(source.admittedAt) !== Date.parse(row.admitted_at) ||
+          source.utcDay !== row.utc_day))
+    )
+      throw new Error('automatic_fire_provenance_conflict');
+    await budget.settleAutomaticFire({
+      actionKey: row.action_key,
+      cascadeId: row.cascade_id,
+      state: 'admitted',
+      admittedAt: source.admittedAt,
+      runIds,
+    });
+    // Admission accounting does not prove a workflow launch. The existing
+    // pending-fire custody reconciler owns journal confirmation and supervision.
   }
 }
 
@@ -1116,7 +1402,7 @@ async function gradeSentActions(
         const woId = proposal.fireEvidence?.woId;
         const cascadeId = proposal.cascadeId;
         if (!woId || !cascadeId) continue;
-        const run = await getFireRunEvidence(woId, cascadeId);
+        const run = await getFireRunEvidence(woId, cascadeId, proposal.fireEvidence?.project);
         const issue = await getIssueEvidence(action.thread_ref, action.created_at);
         const buildingAtMs = issue?.activeStatusAt ? Date.parse(issue.activeStatusAt) : NaN;
         const deadlineMs = action.proof_deadline_at ? Date.parse(action.proof_deadline_at) : NaN;
@@ -1483,6 +1769,17 @@ export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise
 async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<TickResult> {
   const now = deps.now ?? ((): Date => new Date());
   const dal = deps.db ?? taskmasterDb;
+  const fireBudget = deps.fireBudget ?? (!deps.db ? taskmasterDb : undefined);
+  const readFire = deps.readFireCascade ?? readCascadeRecord;
+  let fireHistoryReady = false;
+  if (fireBudget && resolveFireVerbEnabled()) {
+    try {
+      await reconcileAutomaticFires(dal, fireBudget, readFire, now());
+      fireHistoryReady = true;
+    } catch (error) {
+      log.error({ err: error as Error }, 'taskmaster.fire_history_unknown');
+    }
+  }
   const createTask = deps.createTask ?? createAuthenticatedMessage;
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
@@ -1490,25 +1787,8 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
   const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
   const executeCascade = deps.runCascade ?? runCascade;
-  const getFireRunEvidence =
-    deps.getFireRunEvidence ??
-    (async (woId: string): Promise<{ status: string; prOpened?: boolean } | null> => {
-      const result = await getDatabase().query<{ status: string; metadata: string | null }>(
-        `SELECT status, metadata FROM remote_agent_workflow_runs
-         WHERE user_message LIKE $1 ORDER BY started_at DESC LIMIT 1`,
-        [`%${woId}%`]
-      );
-      const row = result.rows[0];
-      if (!row) return null;
-      let prOpened = false;
-      try {
-        const metadata = JSON.parse(row.metadata ?? '{}') as Record<string, unknown>;
-        prOpened = Boolean(metadata.prUrl ?? metadata.pr_url ?? metadata.pullRequestUrl);
-      } catch {
-        // Malformed metadata is no proof; status and issue evidence remain usable.
-      }
-      return { status: row.status, prOpened };
-    });
+  const readFireEvidence = deps.readFireCascadeEvidence ?? readCascadeWorkflowEvidence;
+  const getFireRunEvidence = deps.getFireRunEvidence ?? defaultGetFireRunEvidence;
   const nowMs = now().getTime();
   const cutoverAt = await (
     deps.getDispatchReceiptCutoverAt ??
@@ -1559,7 +1839,30 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     };
   }
 
-  // 3. Restart reconciliation (once per process, before any new effect).
+  // Fire custody is reconciled every tick, with no journal age cutoff.
+  const pendingFireScopes = new Set<string>();
+  let unknownFireScope = false;
+  try {
+    if (!dal.listPendingFireActions) throw new Error('pending fire reader unavailable');
+    const pendingFires = await dal.listPendingFireActions();
+    for (const action of pendingFires) {
+      await reconcilePendingFire(action, dal, readFireEvidence);
+      if (action.outcome !== 'pending') continue;
+      try {
+        const { identity } = parseFireCustody(action);
+        pendingFireScopes.add(fireScopeKey(identity.woId, identity.project));
+      } catch {
+        unknownFireScope = true;
+        log.warn({ journalId: action.id }, 'taskmaster.pending_fire_scope_unknown');
+      }
+    }
+  } catch {
+    unknownFireScope = true;
+    tickFailures += 1;
+    log.warn('taskmaster.pending_fire_read_failed');
+  }
+
+  // 3. Dispatch restart reconciliation (fire actions use exact cascade custody).
   if (!state.reconciled) {
     state.reconciled = true;
     try {
@@ -1580,7 +1883,11 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   for (const action of lookback) {
     if (action.idempotency_key && !actionsByKey.has(action.idempotency_key))
       actionsByKey.set(action.idempotency_key, action);
-    if (action.outcome === 'sent' && Date.parse(action.created_at) >= since24h) {
+    if (
+      (action.outcome === 'sent' ||
+        (action.action_type === 'fire_cauldron' && action.outcome === 'pending')) &&
+      Date.parse(action.created_at) >= since24h
+    ) {
       interventions24hByThread.set(
         action.thread_ref,
         (interventions24hByThread.get(action.thread_ref) ?? 0) + 1
@@ -1605,14 +1912,28 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       )
       .map(action => canonicalizeThreadRef(action.thread_ref))
   );
+  try {
+    if (deps.refreshLaneHealth) await deps.refreshLaneHealth();
+    else if (!deps.db) await refreshLaneHealth();
+  } catch (error) {
+    log.warn({ err: error as Error }, 'taskmaster.lane_health_refresh_failed');
+  }
   const readHealth = deps.getHealthSample ?? taskmasterDb.getHealthSample;
   let codexHealth: taskmasterDb.TmHealthSample | null = null;
   let xaiHealth: taskmasterDb.TmHealthSample | null = null;
+  let cursorHealth: taskmasterDb.TmHealthSample | null = null;
+  let zeroHealth: taskmasterDb.TmHealthSample | null = null;
   try {
-    [codexHealth, xaiHealth] = await Promise.all([readHealth('codex'), readHealth('xai')]);
+    [codexHealth, xaiHealth, cursorHealth, zeroHealth] = await Promise.all([
+      readHealth('codex'),
+      readHealth('xai'),
+      readHealth('cursor'),
+      readHealth('zero'),
+    ]);
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.lane_health_read_failed');
   }
+  const laneHealth = { codex: codexHealth, xai: xaiHealth, cursor: cursorHealth, zero: zeroHealth };
   let laneDecision: ReturnType<typeof decideFireLane>;
   try {
     const seatUsage = await conductorSeatUsage();
@@ -1622,16 +1943,16 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       const used = bindingUsedPercent(seatUsage[lane]);
       if (typeof used === 'number' && used >= thresholdPercent) overThreshold[lane] = true;
     }
-    laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth }, overThreshold);
+    laneDecision = decideFireLane(headroom, laneHealth, overThreshold);
     // The routing threshold only steers between lanes; it must never hold a fire that the
     // unfiltered decision would dispatch (seats below the run-start cutoff stay usable).
     if (laneDecision.holding) {
-      const unfiltered = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+      const unfiltered = decideFireLane(headroom, laneHealth);
       if (!unfiltered.holding) laneDecision = unfiltered;
     }
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.seat_headroom_read_failed');
-    laneDecision = decideFireLane(headroom, { codex: codexHealth, xai: xaiHealth });
+    laneDecision = decideFireLane(headroom, laneHealth);
   }
 
   // Grade previously sent actions against the external SOR.
@@ -1823,6 +2144,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     );
     if (
       resolveFireVerbEnabled() &&
+      !unknownFireScope &&
       backoff.kind === 'ready' &&
       (item.isUnclaimed ?? item.isUnclaimedP0) &&
       !item.isBlocked &&
@@ -1841,6 +2163,11 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
     const fireEligibleResolved =
       fireResult.eligible &&
+      !unknownFireScope &&
+      !(
+        fireResult.evidence &&
+        pendingFireScopes.has(fireScopeKey(fireResult.evidence.woId, fireResult.evidence.project))
+      ) &&
       Boolean(fireResult.evidence?.expectedSpec) &&
       (!(item as ListedThread).beyondFirstPage || fireBeyondFirstPageAllowed);
     const proposal = computeNextAction(item, classification, {
@@ -1986,6 +2313,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
   const touchedThisTick = new Set<string>();
   let firesThisTick = 0;
+  let unconfirmedFireReservations = 0;
   let blockerReportsThisTick = 0;
   // Did THIS tick's digest actually land as a sent effect? The PR-repair
   // exhausted rows ride this tick's digest; we must only mark them delivered
@@ -2016,6 +2344,17 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       actionsByKey.get(proposal.idempotencyKey) ??
       (await dal.getActionByIdempotencyKey(proposal.idempotencyKey));
     if (existingAction) actionsByKey.set(proposal.idempotencyKey, existingAction);
+    if (
+      proposal.type === 'fire_cauldron' &&
+      (unknownFireScope ||
+        (proposal.fireEvidence &&
+          pendingFireScopes.has(
+            fireScopeKey(proposal.fireEvidence.woId, proposal.fireEvidence.project)
+          )))
+    ) {
+      result.deferred += 1;
+      continue;
+    }
 
     const plannedRepair = prRepairEffects.get(proposal.idempotencyKey);
     if (
@@ -2117,7 +2456,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     // Budgets: max 10 effects/tick, 1 effect/item/tick. Overflow is
     // journaled as deferred, not dropped.
     if (
-      result.effects >= MAX_EFFECTS_PER_TICK ||
+      result.effects + unconfirmedFireReservations >= MAX_EFFECTS_PER_TICK ||
       (proposal.type === 'fire_cauldron' && firesThisTick >= MAX_FIRES_PER_TICK) ||
       (proposal.type === 'blocker_report' &&
         blockerReportsThisTick >= MAX_BLOCKER_REPORTS_PER_TICK) ||
@@ -2150,7 +2489,11 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       journalRow = await dal.recordAction({
         thread_ref: proposal.threadRef,
         action_type: proposal.type,
-        proposal_json: JSON.stringify(proposal),
+        proposal_json: JSON.stringify(
+          proposal.type === 'fire_cauldron'
+            ? { ...proposal, cascadeId: proposal.idempotencyKey }
+            : proposal
+        ),
         idempotency_key: proposal.idempotencyKey,
         before_hash: sha256(proposal.body),
         proof_predicate: proofPredicate(proposal),
@@ -2185,7 +2528,11 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         );
       } else {
         result.expired += 1;
-        await dal.updateActionOutcome(journalRow.id, 'expired');
+        await dal.updateActionOutcome(
+          journalRow.id,
+          'expired',
+          JSON.stringify({ ...proposal, reason: 'stale_epoch_before_effect' })
+        );
       }
       continue;
     }
@@ -2281,59 +2628,164 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         await dal.updateActionOutcome(journalRow.id, 'sent');
         await dal.gradeAction(journalRow.id, 'delivered_to_issue');
       } else if (proposal.type === 'fire_cauldron' && proposal.fireEvidence) {
-        let resolveAdmission: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
-          null;
-        let rejectAdmission: ((error: unknown) => void) | null = null;
-        const admission = new Promise<Awaited<ReturnType<typeof runCascade>>>((resolve, reject) => {
-          resolveAdmission = resolve;
-          rejectAdmission = reject;
-        });
-        const cascadePromise = executeCascade({
-          woId: proposal.fireEvidence.woId,
-          expectedSpec: proposal.fireEvidence.expectedSpec,
-          project: proposal.fireEvidence.project,
-          dispatchId: proposal.idempotencyKey,
-          token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
-          deps: { seatUsage: conductorSeatUsage },
-          onAdmission: record => resolveAdmission?.(record),
-        });
-        void cascadePromise.catch((error: unknown) => {
-          rejectAdmission?.(error);
-          log.error(
-            { err: error, woId: proposal.fireEvidence?.woId },
-            'taskmaster.fire_cascade_failed'
+        if (!fireBudget || !fireHistoryReady) {
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'deferred',
+            JSON.stringify({ ...proposal, reason: 'daily_cap_history_or_store_unavailable' })
           );
-        });
-        const admitted = await admission;
-        const registerExpectation =
-          dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
-        await registerExpectation?.({
-          // Deterministic identity: replaying this journal action after a crash
-          // between the cascade admission and updateActionOutcome reuses the
-          // SAME expectation rather than registering a second one with
-          // different retry/escalation keys.
-          action_ref: journalRow.id,
-          dispatch_ref: admitted.cascadeId,
-          recipient: proposal.recipient,
-          // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching on
-          // the admission row's existence alone is not evidence of anything:
-          // admission is what CREATES that row, so the expectation would be
-          // met the instant it was registered and a failed or stalled cascade
-          // would never escalate (review finding [major]).
-          evidence_json: JSON.stringify({
-            kind: 'db_row_exists',
-            table: 'remote_agent_workflow_runs',
-            where: { id: admitted.cascadeId, status: CASCADE_SUCCESS_STATUSES },
-          }),
-          due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
-          on_absence: 'escalate',
-          max_retries: 0,
-        });
-        await dal.updateActionOutcome(
-          journalRow.id,
-          'sent',
-          JSON.stringify({ ...proposal, cascadeId: admitted.cascadeId, runId: admitted.cascadeId })
+          result.deferred += 1;
+          continue;
+        }
+        const reservation: taskmasterDb.AutomaticFireRequest = {
+          actionKey: proposal.idempotencyKey,
+          journalId: journalRow.id,
+          sourceThreadRef: proposal.threadRef,
+          ownerToken: randomUUID(),
+          cascadeId: proposal.idempotencyKey,
+          epoch,
+          limit: resolveTaskmasterFireDailyLimit(),
+          now: now().toISOString(),
+          clock: () => now().toISOString(),
+        };
+        const reserved = await fireBudget.reserveAutomaticFire(reservation);
+        if (!reserved.allowed) {
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'deferred',
+            JSON.stringify({ ...proposal, reason: reserved.reason })
+          );
+          result.deferred += 1;
+          continue;
+        }
+        let guardAttempted = false;
+        let permission: taskmasterDb.AutomaticFireProvenance | undefined;
+        // Reserve launch budget before admission; pending is not a confirmed send.
+        firesThisTick += 1;
+        unconfirmedFireReservations += 1;
+        touchedThisTick.add(proposal.threadRef);
+        pendingFireScopes.add(
+          fireScopeKey(proposal.fireEvidence.woId, proposal.fireEvidence.project)
         );
+        try {
+          const frozen = JSON.stringify({
+            ...JSON.parse(journalRow.proposal_json),
+            cascadeId: proposal.idempotencyKey,
+          });
+          if (frozen !== journalRow.proposal_json) {
+            if (
+              !(await dal.transitionPendingFireAction?.(
+                journalRow.id,
+                journalRow.proposal_json,
+                'pending',
+                frozen
+              ))
+            )
+              continue;
+            journalRow.proposal_json = frozen;
+          }
+          const custody = parseFireCustody(journalRow);
+          let resolveAdmission: ((record: Awaited<ReturnType<typeof runCascade>>) => void) | null =
+            null;
+          const admission = new Promise<Awaited<ReturnType<typeof runCascade>>>(resolve => {
+            resolveAdmission = resolve;
+          });
+          const cascadePromise = executeCascade({
+            woId: custody.identity.woId,
+            expectedSpec: proposal.fireEvidence.expectedSpec,
+            project: custody.identity.project,
+            dispatchId: custody.identity.cascadeId,
+            token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+            deps: { seatUsage: conductorSeatUsage },
+            beforeAdmission: async () => {
+              guardAttempted = true;
+              const decision = await fireBudget.authorizeAutomaticFire({
+                ...reservation,
+                now: now().toISOString(),
+                limit: resolveTaskmasterFireDailyLimit(),
+              });
+              if (!decision.allowed || !decision.admission)
+                throw new Error(decision.reason ?? 'automatic_fire_permission_missing');
+              permission = decision.admission;
+              return permission;
+            },
+            onAdmission: record => resolveAdmission?.(record),
+            entryOverride:
+              laneDecision.lane === 'cursor' || laneDecision.lane === 'zero'
+                ? laneDecision.lane
+                : undefined,
+          });
+          void cascadePromise.catch(() => {
+            log.warn({ journalId: journalRow.id }, 'taskmaster.fire_cascade_failed');
+          });
+          const admitted = await Promise.race([admission, cascadePromise]);
+          // A direct, identity-bound refusal is positive no-fire evidence. A
+          // missing record encountered after a crash is UNKNOWN, never this path.
+          if (
+            !guardAttempted &&
+            admitted.cascadeId === custody.identity.cascadeId &&
+            admitted.woId === custody.identity.woId &&
+            admitted.project === custody.identity.project &&
+            Array.isArray(admitted.attempts) &&
+            admitted.attempts.length === 0 &&
+            (admitted.status === 'refused' ||
+              admitted.status === 'blocked' ||
+              admitted.status === 'planned')
+          ) {
+            await fireBudget.releaseAutomaticFire(reservation);
+            const expired = JSON.stringify({
+              ...custody.proposal,
+              cascadeId: custody.identity.cascadeId,
+              noFireReason: admitted.status,
+            });
+            if (
+              await dal.transitionPendingFireAction?.(
+                journalRow.id,
+                journalRow.proposal_json,
+                'expired',
+                expired
+              )
+            ) {
+              journalRow.outcome = 'expired';
+              journalRow.proposal_json = expired;
+              result.expired += 1;
+            }
+            continue;
+          }
+          if (
+            !permission ||
+            admitted.automaticFireAdmission?.actionKey !== permission.actionKey ||
+            admitted.cascadeId !== reservation.cascadeId
+          )
+            throw new Error('automatic_fire_admission_guard_not_enforced');
+          await fireBudget.settleAutomaticFire({
+            actionKey: reservation.actionKey,
+            cascadeId: admitted.cascadeId,
+            state: 'admitted',
+            admittedAt: permission.admittedAt,
+            runIds: admitted.attempts.flatMap(attempt => (attempt.runId ? [attempt.runId] : [])),
+          });
+          // Settlement persists the admission-based deadline. Read it back before
+          // registering immutable supervision, including the crash/recovery path.
+          const settledJournal = await dal.getActionByIdempotencyKey(reservation.actionKey);
+          if (settledJournal?.id !== journalRow.id || settledJournal.outcome !== 'pending')
+            throw new Error('automatic_fire_settled_journal_unavailable');
+          journalRow = settledJournal;
+          if (!(await reconcilePendingFire(journalRow, dal, readFireEvidence))) continue;
+          unconfirmedFireReservations -= 1;
+        } catch {
+          // Release only owned capacity without committed permission. A lost
+          // authorization result remains charged and pending.
+          try {
+            await fireBudget.releaseAutomaticFire(reservation);
+          } catch {
+            // Storage uncertainty must not turn pending custody into retryable failure.
+            log.warn({ journalId: journalRow.id }, 'taskmaster.fire_release_unknown');
+          }
+          await retainFireHold(journalRow, dal, 'admission-uncertain');
+          log.warn({ journalId: journalRow.id }, 'taskmaster.fire_admission_unknown');
+          continue;
+        }
       } else {
         const dispatched = await createTask(
           { kind: 'system', sender: 'taskmaster' },
@@ -2382,7 +2834,6 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       }
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
-      if (proposal.type === 'fire_cauldron') firesThisTick += 1;
       if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
       log.info(
         {

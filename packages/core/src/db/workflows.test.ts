@@ -522,7 +522,7 @@ describe('workflows database', () => {
         expect.any(Array)
       );
       expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining("AND status = 'running'"),
+        expect.stringContaining("status IN ('pending','running')"),
         expect.any(Array)
       );
     });
@@ -540,8 +540,97 @@ describe('workflows database', () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
 
       await expect(failWorkflowRun('workflow-run-123', 'some error')).rejects.toThrow(
-        'not found or not in running state'
+        'not found or not in pending/running state'
       );
+    });
+
+    test('fail_pending_run_marks_failed', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await failWorkflowRun('run-1', 'canary_probe_blocked:x');
+
+      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("status = 'failed'");
+      expect(query).toContain("status IN ('pending','running')");
+      expect(params).toContain(JSON.stringify({ error: 'canary_probe_blocked:x' }));
+    });
+
+    test('fail_running_run_still_marks_failed', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await expect(failWorkflowRun('run-1', 'step failed')).resolves.toBeUndefined();
+    });
+
+    test('fail_terminal_run_is_not_overwritten', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 0));
+
+      await expect(failWorkflowRun('run-1', 'late failure')).rejects.toThrow(
+        'not found or not in pending/running state'
+      );
+
+      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain("status IN ('pending','running')");
+      const whereClause = query.slice(query.indexOf('WHERE'));
+      expect(whereClause).toBe("WHERE id = $1 AND status IN ('pending','running')");
+      expect(whereClause).not.toContain('completed');
+      expect(whereClause).not.toContain('cancelled');
+      expect(whereClause).not.toContain('orphaned');
+    });
+
+    test('terminal_persist_accepts_pending_for_failed_only', async () => {
+      const failedTerminal: TerminalWorkflowPersistence = {
+        outcome: {
+          executionState: 'failed',
+          deliverableState: 'worktree_changes',
+          validationState: 'not_run',
+          recoveryState: 'recoverable',
+          routeState: 'current',
+          primaryReason: 'execution_failed',
+          reasonCodes: ['execution_failed'],
+          evidenceRefs: ['run:workflow-run-123'],
+        },
+        updatedAt: '2026-07-09T18:00:00.000Z',
+        eventData: { terminal_cause: 'canary_probe_blocked' },
+      };
+      mockTransactionQuery
+        .mockResolvedValueOnce(createQueryResult([{ status: 'pending' }], 1))
+        .mockResolvedValueOnce(createQueryResult([{ run_id: 'workflow-run-123' }], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
+
+      await failWorkflowRun('workflow-run-123', 'canary_probe_blocked:x', failedTerminal);
+
+      const updateCall = mockTransactionQuery.mock.calls[2] as [string, unknown[]];
+      expect(updateCall[0]).toContain('UPDATE remote_agent_workflow_runs');
+      expect(updateCall[1][0]).toBe('failed');
+      expect(updateCall[1][3]).toBe('pending');
+
+      mockTransactionQuery.mockReset();
+      mockTransactionQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+      mockWithTransaction.mockClear();
+
+      const completedTerminal: TerminalWorkflowPersistence = {
+        outcome: {
+          executionState: 'completed',
+          deliverableState: 'none',
+          validationState: 'not_run',
+          recoveryState: 'not_needed',
+          routeState: 'current',
+          primaryReason: 'execution_completed',
+          reasonCodes: ['execution_completed'],
+          evidenceRefs: ['run:workflow-run-123'],
+        },
+        updatedAt: '2026-07-09T18:00:00.000Z',
+        eventData: { duration_ms: 100 },
+      };
+      mockTransactionQuery.mockResolvedValueOnce(createQueryResult([{ status: 'pending' }], 1));
+
+      await expect(
+        completeWorkflowRun('workflow-run-123', { node_counts: { total: 1 } }, completedTerminal)
+      ).rejects.toThrow('terminal_status_conflict');
+
+      const sqls = mockTransactionQuery.mock.calls.map(call => call[0] as string);
+      expect(sqls.some(sql => sql.includes('UPDATE remote_agent_workflow_runs'))).toBe(false);
     });
   });
 

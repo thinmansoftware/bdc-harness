@@ -211,7 +211,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
     expect(resumed.winningTier).toBe('frontier');
     expect(firedWorkflows).toEqual([FABLE_WORKFLOW]);
     // The resumed fire carried the preserved informed-climb context.
-    expect(fireMessages[0]).toContain('Prior tier: claude');
+    expect(fireMessages[0]).toContain('Prior tier: codex');
     // A distinct resumed cascadeId (not the paused one).
     expect(resumed.cascadeId).not.toBe(paused.cascadeId);
 

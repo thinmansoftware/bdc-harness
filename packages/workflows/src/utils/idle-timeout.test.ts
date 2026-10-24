@@ -207,18 +207,31 @@ describe('withIdleTimeout', () => {
   test('filtered events still consume one cumulative provider wait budget', async () => {
     const onTimeout = mock(() => {});
     const result: number[] = [];
-
-    for await (const value of withIdleTimeout(
-      fromValues([1, 2, 3, 4, 5], 40),
-      100,
-      onTimeout,
-      () => false
-    )) {
-      result.push(value);
+    let providerClockMs = 0;
+    const clock = spyOn(performance, 'now').mockImplementation(() => providerClockMs);
+    // Observe real timers: only elapsed provider wait is controlled, so Windows
+    // scheduling cannot decide how many values fit in a 20ms timing margin.
+    const timers = spyOn(globalThis, 'setTimeout');
+    async function* filteredStream(): AsyncGenerator<number> {
+      for (const value of [1, 2]) {
+        providerClockMs += 40;
+        yield value;
+      }
+      await new Promise<void>(() => {});
     }
 
-    expect(result).toEqual([1, 2]);
-    expect(onTimeout).toHaveBeenCalledTimes(1);
+    try {
+      for await (const value of withIdleTimeout(filteredStream(), 100, onTimeout, () => false)) {
+        result.push(value);
+      }
+
+      expect(result).toEqual([1, 2]);
+      expect(timers.mock.calls.map(([, delay]) => delay)).toEqual([100, 60, 20]);
+      expect(onTimeout).toHaveBeenCalledTimes(1);
+    } finally {
+      timers.mockRestore();
+      clock.mockRestore();
+    }
   });
 
   test('stops an immediately resolving filtered stream when its budget is spent', async () => {

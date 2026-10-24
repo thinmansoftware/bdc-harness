@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import type { ReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
@@ -20,7 +24,7 @@ function message(id: string, headSha = `head-${id}`): DispatchMessage {
     correlation_id: `correlation-${id}`,
     idempotency_key: `review-${id}`,
     task_type: 'run_review',
-    sender: 'overseer-review-route',
+    sender: 'overseer',
     recipient: 'overseer-reviewer',
     body: JSON.stringify({
       owner: 'thinmansoftware',
@@ -229,10 +233,13 @@ describe('review worker clock', () => {
   // released (not posted as a result) with a future not_before, and is retried
   // until it reaches a terminal disposition.
   test('defers (never posts) a checks-pending item with a future not_before', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
     const deps = fakeDeps([message('pending', 'exact-head')], () => ({
       disposition: 'checks_pending',
       reason: 'checks_not_terminal',
+      pendingChecks: ['test (windows-latest)'],
     }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
 
     const before = Date.now();
     await tickReviewWorkerClock(CONFIG, deps);
@@ -246,8 +253,43 @@ describe('review worker clock', () => {
     expect(deferArg.id).toBe('pending');
     expect(deferArg.fencing_token).toBe(1);
     expect(new Date(deferArg.defer_until).getTime()).toBeGreaterThan(before);
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        message: 'overseer_review_checks_pending_deferred',
+        data: expect.objectContaining({
+          messageId: 'pending',
+          defer_until: deferArg.defer_until,
+          pending_checks: ['test (windows-latest)'],
+        }),
+      }),
+    ]);
     // A defer is not a terminal result.
     expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  test('logs no_checks_reported when a checks-pending outcome has no names', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+    const deps = fakeDeps([message('no-checks')], () => ({
+      disposition: 'checks_pending',
+    }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(warnings[0]).toEqual({
+      message: 'overseer_review_checks_pending_deferred',
+      data: expect.objectContaining({ pending_checks: [], reason: 'no_checks_reported' }),
+    });
+  });
+
+  test('does not call an explicit empty pending list no_checks_reported', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+    const deps = fakeDeps([message('unknown-contexts')], () => ({
+      disposition: 'checks_pending',
+      pendingChecks: [],
+    }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(warnings[0]?.data).toEqual(expect.objectContaining({ pending_checks: [] }));
+    expect(warnings[0]?.data).not.toHaveProperty('reason');
   });
 
   // bdc-harness #782 part 2: a rate limit is a deferral with GitHub's own reset
@@ -354,7 +396,7 @@ describe('review worker clock', () => {
     expect(deps.postResult).toHaveBeenCalledWith(expect.objectContaining({ id: 'good' }));
   });
 
-  test('isolates an invalid review body without posting a result and continues the batch', async () => {
+  test('terminates an invalid review body as blocked and continues the batch', async () => {
     const invalid = { ...message('invalid'), body: JSON.stringify({ owner: 'thinmansoftware' }) };
     const deps = fakeDeps([invalid, message('valid')]);
 
@@ -365,9 +407,18 @@ describe('review worker clock', () => {
       expect.objectContaining({ messageId: 'valid' }),
       expect.anything()
     );
-    expect(deps.postResult).toHaveBeenCalledTimes(1);
+    expect(deps.postResult).toHaveBeenCalledTimes(2);
     expect(deps.postResult).toHaveBeenCalledWith(expect.objectContaining({ id: 'valid' }));
-    expect(deps.postResult).not.toHaveBeenCalledWith(expect.objectContaining({ id: 'invalid' }));
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'invalid',
+        fencing_token: 1,
+        status: 'failed',
+        task_outcome: 'blocked',
+        result_body: JSON.stringify({ reason: 'invalid_review_work_body' }),
+      })
+    );
+    expect(deps.createSubmitDeps).toHaveBeenCalledTimes(1);
   });
 
   test('does not start when review route configuration is absent', async () => {
@@ -391,4 +442,85 @@ describe('review worker clock', () => {
       else process.env.NODE_ENV = originalNodeEnv;
     }
   });
+});
+
+describe('invalid review work against isolated real SQLite', () => {
+  for (const conflict of [false, true]) {
+    test(`preserves validation and fencing (conflict=${conflict})`, () => {
+      const home = mkdtempSync(join(tmpdir(), 'review-invalid-'));
+      const url = (path: string) =>
+        JSON.stringify(pathToFileURL(resolve(import.meta.dir, path)).href);
+      const script = `
+        const dispatch = await import(${url('../../../core/src/db/dispatch.ts')});
+        const { getDatabase, closeDatabase } = await import(${url('../../../core/src/db/connection.ts')});
+        const { tickReviewWorkerClock } = await import(${url('./review-worker-clock.ts')});
+        const health = await import(${url('../../../overseer/src/judge-ladder-health.ts')});
+        try {
+          const db = getDatabase();
+          if (db.dialect !== 'sqlite') throw new Error('isolated_sqlite_required');
+          const create = (key, body, repeat_reason = null) => dispatch.createAuthenticatedMessage(
+            { kind: 'system', sender: 'overseer' },
+            { correlation_id: key, idempotency_key: key, task_type: 'run_review', recipient: 'overseer-reviewer', body: JSON.stringify(body), repeat_reason }
+          );
+          const bad = await create('invalid', { owner: 'thinmansoftware' }, 'operator_request:ladder_restored');
+          const good = await create('valid', { owner: 'thinmansoftware', repo: 'bdc-harness', prNumber: 730, headSha: 'a'.repeat(40), baseRef: 'dev', author: 'fixture' });
+          health.recordJudgeRungOutage('fixture-judge', { kind: 'usage_limit', code: 'usage_limit' });
+          let reviews = 0, constructions = 0, nullResults = 0;
+          const deps = {
+            registerWorker: dispatch.registerWorker, heartbeatWorker: dispatch.heartbeatWorker,
+            listMessages: dispatch.listMessages, claimMessage: dispatch.claimMessage,
+            releaseMessage: dispatch.releaseMessage, deferMessage: dispatch.deferMessage,
+            postResult: async input => {
+              if (${conflict} && input.id === bad.id) {
+                await db.query('UPDATE agent_dispatch_messages SET fencing_token = fencing_token + 1 WHERE id = $1', [bad.id]);
+              }
+              const result = await dispatch.postResult(input);
+              if (result === null) nullResults++;
+              return result;
+            },
+            runAndSubmitReview: async () => { reviews++; return { disposition: 'approved' }; },
+            createSubmitDeps: () => { constructions++; return { reviewerIdentity: 'fixture-reviewer' }; },
+          };
+          await tickReviewWorkerClock({ webhookSecret: 'fixture', reviewerIdentity: 'fixture-reviewer' }, deps);
+          const invalid = await dispatch.getMessage(bad.id);
+          const valid = await dispatch.getMessage(good.id);
+          console.log('PROBE=' + JSON.stringify({ invalidStatus: invalid.status, invalidOutcome: invalid.task_outcome, invalidResult: invalid.result_body, validStatus: valid.status, reviews, constructions, nullResults, outages: health.snapshotJudgeLadderHealth().outages.length }));
+        } finally { await closeDatabase(); }
+      `;
+      try {
+        writeFileSync(join(home, 'probe.ts'), script);
+        const env: NodeJS.ProcessEnv = { ...process.env, ARCHON_HOME: home };
+        delete env.DATABASE_URL;
+        const proc = Bun.spawnSync([process.execPath, 'run', join(home, 'probe.ts')], {
+          env,
+          stdout: 'pipe',
+          stderr: 'pipe',
+          timeout: 45_000,
+        });
+        if (proc.exitCode !== 0)
+          throw new Error(
+            `SQLite probe exited ${proc.exitCode}: ${proc.stderr.toString()} ${proc.stdout.toString()}`
+          );
+        expect(proc.exitCode).toBe(0);
+        const line = proc.stdout
+          .toString()
+          .split('\n')
+          .find(line => line.startsWith('PROBE='));
+        if (!line) throw new Error(`missing probe output: ${proc.stderr.toString()}`);
+        const result = JSON.parse(line.slice(6));
+        expect(result.validStatus).toBe('done');
+        expect(result.reviews).toBe(1);
+        expect(result.constructions).toBe(1);
+        expect(result.outages).toBe(1);
+        expect(result.invalidStatus).toBe(conflict ? 'claimed' : 'failed');
+        expect(result.invalidOutcome).toBe(conflict ? null : 'blocked');
+        expect(result.invalidResult).toBe(
+          conflict ? null : JSON.stringify({ reason: 'invalid_review_work_body' })
+        );
+        expect(result.nullResults).toBe(conflict ? 1 : 0);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    }, 60_000);
+  }
 });

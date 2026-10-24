@@ -33,15 +33,15 @@ conductor_probes:
   - id: generic-code
     wo_class: CODE
     tags: []
-    expected_tier: codex
-    expected_workflow: bdc-feature-development-codex
+    expected_tier: cursor
+    expected_workflow: bdc-feature-development-cursor
   - id: security-code
     wo_class: CODE
     tags: [security]
-    expected_tier: claude
-    expected_workflow: bdc-feature-development
+    expected_tier: cursor
+    expected_workflow: bdc-feature-development-cursor
   - id: infra
     wo_class: INFRA
     tags: []
-    expected_tier: claude
-    expected_workflow: bdc-feature-development
+    expected_tier: cursor
+    expected_workflow: bdc-feature-development-cursor

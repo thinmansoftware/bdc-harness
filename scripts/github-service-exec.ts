@@ -21,6 +21,27 @@ interface CommandResult {
   stderr: Uint8Array;
 }
 
+/** Narrow proof for one REST-only command; ambiguous commands may mix resources. */
+function commandResources(command: string, args: readonly string[]): readonly string[] {
+  const executable = command.split(/[\\/]/).at(-1);
+  const endpoint = args[1] ?? '';
+  const pulls =
+    /^repos\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\/pulls\?state=all&per_page=100&sort=created&direction=asc$/;
+  if (
+    (executable === 'gh' || executable === 'gh.exe') &&
+    args.length === 4 &&
+    args[0] === 'api' &&
+    args[2] === '--paginate' &&
+    args[3] === '--slurp' &&
+    // Compare the whole match: '$' alone also accepts a trailing newline.
+    pulls.exec(endpoint)?.[0] === endpoint
+  ) {
+    // Keep the CLI transport/secondary-limit gate even for a proven REST call.
+    return ['core', 'cli'];
+  }
+  return ['core', 'graphql', 'search', 'cli'];
+}
+
 /** Only buffer input when gh explicitly requests it, so permission retries can replay it. */
 export function githubCommandReadsStdin(args: string[]): boolean {
   if (args[0] === 'workflow' && args[1] === 'run' && args.includes('--json')) return true;
@@ -92,6 +113,11 @@ export async function runGitHubServiceCommand(input: {
   execute?: (command: string[], env: Record<string, string | undefined>) => CommandResult;
   db?: IDatabase;
 }): Promise<CommandResult> {
+  // Classify and execute the same argv even if a caller mutates its input while
+  // quota checks or token minting await. Permission retries reuse this snapshot.
+  const command = input.command;
+  const args = [...input.args];
+  const resources = commandResources(command, args);
   const env = input.env ?? process.env;
   const identity = input.identity ?? resolveServiceGitHubAuth(input.service, env);
   const db = input.db ?? getDatabase();
@@ -119,20 +145,14 @@ export async function runGitHubServiceCommand(input: {
     selected: ServiceGitHubAuth,
     permissionFallback = false
   ): Promise<CommandResult> => {
-    // A gh command may use REST and GraphQL in the same operation. Refuse
-    // conservatively if any of its pool's known resources is exhausted.
-    await assertPersistedGitHubPoolAvailable(
-      selected.poolId,
-      ['core', 'graphql', 'search', 'cli'],
-      db
-    );
+    await assertPersistedGitHubPoolAvailable(selected.poolId, resources, db);
     const token =
       selected.kind === 'pat'
         ? selected.token
         : await (input.token ?? getServiceGitHubToken)(selected);
     let result: CommandResult;
     try {
-      result = execute([input.command, ...input.args], {
+      result = execute([command, ...args], {
         ...env,
         GH_TOKEN: token,
         GITHUB_TOKEN: token,

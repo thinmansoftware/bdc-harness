@@ -47,6 +47,10 @@ const CHECKS_PENDING_BACKOFF_MS = Math.max(
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
 
+interface ReviewWorkerLogger {
+  warn(data: Record<string, unknown>, message: string): void;
+}
+
 export interface ReviewWorkerDeps {
   registerWorker: typeof registerWorker;
   heartbeatWorker: typeof heartbeatWorker;
@@ -62,6 +66,8 @@ export interface ReviewWorkerDeps {
   deferMessage: typeof deferMessage;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
+  /** Optional logger seam for deterministic observability tests. */
+  logger?: ReviewWorkerLogger;
   /**
    * Backstop for lost check-completion deliveries (#782 part 3). Optional so a
    * test double can omit it; when absent the sweep simply does not run and the
@@ -173,6 +179,26 @@ export async function tickReviewWorkerClock(
       try {
         const claimed = await deps.claimMessage({ id: message.id, worker_id: REVIEW_WORKER_ID });
         if (!claimed) continue;
+        const body = parseReviewWorkBody(claimed.body);
+        if (!body) {
+          // Permanent input failure: retire through the existing fenced result
+          // path. Never construct a reviewer or apply an override for bad work.
+          const rejected = await deps.postResult({
+            id: claimed.id,
+            worker_id: REVIEW_WORKER_ID,
+            fencing_token: claimed.fencing_token,
+            status: 'failed',
+            task_outcome: 'blocked',
+            result_body: JSON.stringify({ reason: 'invalid_review_work_body' }),
+          });
+          log.warn(
+            { messageId: claimed.id, terminalized: rejected !== null },
+            rejected === null
+              ? 'overseer_review_invalid_body_fence_conflict'
+              : 'overseer_review_invalid_body_blocked'
+          );
+          continue;
+        }
         // OPERATOR OVERRIDE (#847): a hand-enqueued run_review whose
         // repeat_reason starts with `operator_request:ladder_restored` clears
         // the judge-ladder breaker before the judge runs; the recovery pass at
@@ -180,8 +206,6 @@ export async function tickReviewWorkerClock(
         if (applyLadderRestoredRequest(claimed.repeat_reason)) {
           log.info({ messageId: claimed.id }, 'overseer_review_judge_ladder_restored_by_operator');
         }
-        const body = parseReviewWorkBody(claimed.body);
-        if (!body) throw new Error('invalid_review_work_body');
         const work: ReviewWorkItem = {
           correlationId: claimed.correlation_id,
           messageId: claimed.id,
@@ -206,11 +230,26 @@ export async function tickReviewWorkerClock(
           // WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7 names this
           // transition `deferMessage`; it is the same fenced claimed->queued
           // transition, called by its WO name.
+          const deferUntil = new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString();
+          const pendingChecks = outcome.pendingChecks ?? [];
+          (deps.logger ?? log).warn(
+            {
+              messageId: claimed.id,
+              owner: work.owner,
+              repo: work.repo,
+              prNumber: work.prNumber,
+              headSha: work.headSha,
+              defer_until: deferUntil,
+              pending_checks: pendingChecks,
+              ...(outcome.pendingChecks === undefined ? { reason: 'no_checks_reported' } : {}),
+            },
+            'overseer_review_checks_pending_deferred'
+          );
           await deps.deferMessage({
             id: claimed.id,
             worker_id: REVIEW_WORKER_ID,
             fencing_token: claimed.fencing_token,
-            defer_until: new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString(),
+            defer_until: deferUntil,
           });
           continue;
         }

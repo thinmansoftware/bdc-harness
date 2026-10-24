@@ -112,6 +112,8 @@ export interface FrontierApprovalPacket {
 }
 
 export interface CascadeRunRecord {
+  /** Permission provenance for automatic Taskmaster fires; absent for manual/legacy runs. */
+  automaticFireAdmission?: import('@archon/core/db/taskmaster').AutomaticFireProvenance;
   cascadeId: string; // randomUUID
   woId: string;
   project: string | null; // frozen codebase authority; null only for dry-run plans
