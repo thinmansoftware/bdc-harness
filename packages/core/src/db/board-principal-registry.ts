@@ -108,6 +108,22 @@ export function createBoardPrincipalResolver(options?: {
   };
 }
 
+/**
+ * True only for an active XO-seat registry record.
+ * Missing, retiring, disabled, john, and general records are ineligible.
+ * When records are omitted, reads BOARD_PRINCIPALS_JSON.
+ */
+export function isEligibleXoSuccessor(
+  principalId: string,
+  records?: readonly BoardPrincipalRecord[]
+): boolean {
+  const registry = records ?? parseBoardPrincipalRecords(process.env.BOARD_PRINCIPALS_JSON);
+  return registry.some(
+    record =>
+      record.principal_id === principalId && record.status === 'active' && record.seat_id === 'xo'
+  );
+}
+
 /** True when a production principal registry is configured. */
 export function isBoardPrincipalRegistryConfigured(configJson?: string): boolean {
   const raw = configJson ?? process.env.BOARD_PRINCIPALS_JSON;
