@@ -10,6 +10,7 @@ import * as connection from '@archon/core/db/connection';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import * as taskmaster from '@archon/core/db/taskmaster';
 import * as ownerRouting from '@archon/core/utils/owner-recipient';
+import * as dispatch from '@archon/core/db/dispatch';
 import { handleNodeFailure } from './overseer-bridge';
 
 let db: SqliteAdapter;
@@ -22,7 +23,12 @@ afterEach(async () => {
   await db.close();
 });
 
-async function caller(nodeId: string, errorMsg: string, errors?: string[]): Promise<void> {
+async function caller(
+  nodeId: string,
+  errorMsg: string,
+  errors?: string[],
+  loadBearing = true
+): Promise<Awaited<ReturnType<typeof handleNodeFailure>>> {
   const noop = (): void => {};
   const log = {
     info: noop,
@@ -32,7 +38,7 @@ async function caller(nodeId: string, errorMsg: string, errors?: string[]): Prom
     warn: noop,
     debug: noop,
   };
-  await handleNodeFailure(
+  return handleNodeFailure(
     {
       store: { createWorkflowEvent: async () => {} },
       emitter: { emit: noop },
@@ -48,7 +54,7 @@ async function caller(nodeId: string, errorMsg: string, errors?: string[]): Prom
     {
       id: nodeId,
       bash: 'exit 1',
-      load_bearing: true,
+      load_bearing: loadBearing,
     } as Parameters<typeof handleNodeFailure>[2],
     {
       errorMsg,
@@ -255,10 +261,26 @@ describe('node failure dispatch notification', () => {
   });
   test('real closed database notification failure returns through handleNodeFailure', async () => {
     const errors: string[] = [];
+    const sends = spyOn(dispatch, 'createAuthenticatedMessage');
     await db.close();
-    await caller('patch-pr-body', 'novel failure', errors);
-    expect(errors).toContain('overseer.node_failure_notify_failed');
-    expect(errors.length).toBeLessThanOrEqual(3);
+    const result = await caller('patch-pr-body', 'novel failure', errors, false);
+    expect(result).toMatchObject({ output: { state: 'failed' }, decision: 'escalate' });
+    expect(
+      errors.filter(message => message === 'overseer.node_failure_notify_failed')
+    ).toHaveLength(1);
+    expect(sends).toHaveBeenCalledTimes(1);
+  });
+  test('two-recipient closed database failure is bounded and does not reenter escalation', async () => {
+    const errors: string[] = [];
+    const sends = spyOn(dispatch, 'createAuthenticatedMessage');
+    await db.close();
+    const result = await caller('patch-pr-body', 'novel failure', errors);
+    expect(result).toMatchObject({ output: { state: 'failed' }, decision: 'escalate' });
+    expect(
+      errors.filter(message => message === 'overseer.node_failure_notify_failed')
+    ).toHaveLength(2);
+    expect(sends).toHaveBeenCalledTimes(2);
+    expect(errors).toHaveLength(3);
   });
   test('clean_run_creates_no_message', async () => {
     let count = 0;
