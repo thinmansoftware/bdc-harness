@@ -14235,10 +14235,24 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
       terminalBash = `printf 'yes\\n' > "$ARTIFACTS_DIR/commit-hook-repair-eligible"\n${terminalBash}`;
     if (scenario === 'wrong_binding')
       terminalBash = `printf 'old-run\\nold-invocation\\nfixture\\n' > "$ARTIFACTS_DIR/commit-hook-recovery-binding"\n${terminalBash}`;
+    const bypassConditions = scenario.startsWith('valid_proof_');
+    const gateOutput =
+      scenario === 'valid_proof_gate_malformed'
+        ? 'not-json'
+        : JSON.stringify({
+            REPAIR_GATE_ALLOW:
+              scenario === 'denied_gate' || scenario === 'valid_proof_gate_denied' ? 'no' : 'yes',
+          });
+    const verdictOutput =
+      scenario === 'valid_proof_verdict_malformed'
+        ? 'not-json'
+        : JSON.stringify({
+            verdict: scenario === 'valid_proof_verdict_denied' ? 'needs_human' : 'fixed',
+          });
     const nodes: DagNode[] = [
       {
         id: 'repair-gate',
-        bash: `printf '{"REPAIR_GATE_ALLOW":"${scenario === 'denied_gate' ? 'no' : 'yes'}"}\\n'`,
+        bash: `printf '%s\\n' '${gateOutput}'`,
       },
       {
         id: 'commit-and-push',
@@ -14261,12 +14275,17 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
           (scenario === 'stale_success_marker'
             ? `printf 'old-sha\\n' > "$ARTIFACTS_DIR/commit-and-push.succeeded"\n`
             : '') +
-          `printf '{"verdict":"fixed"}\\n'`,
+          `printf '%s\\n' '${verdictOutput}'`,
         depends_on: ['commit-hook-repair', 'repair-gate'],
         trigger_rule: 'all_done',
       },
-      { ...retry, persona: undefined },
-      { ...terminal, persona: undefined, bash: terminalBash },
+      { ...retry, persona: undefined, when: bypassConditions ? undefined : retry.when },
+      {
+        ...terminal,
+        persona: undefined,
+        bash: terminalBash,
+        when: bypassConditions ? undefined : terminal.when,
+      },
     ];
     if (scenario === 'missing_terminal') nodes.pop();
     if (scenario === 'additional_failure')
@@ -14412,6 +14431,23 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
           c => c[0].event_type === 'node_failed' && c[0].step_name === 'commit-and-push'
         )
       ).toHaveLength(1);
+    });
+  }
+
+  for (const scenario of [
+    'valid_proof_gate_denied',
+    'valid_proof_gate_malformed',
+    'valid_proof_verdict_denied',
+    'valid_proof_verdict_malformed',
+  ]) {
+    it(`hook recovery refuses ${scenario} even when YAML conditions are absent`, async () => {
+      const { store, events } = await runCommitHookRecoveryScenario(scenario);
+      const completed = events.filter(c => c[0].event_type === 'node_completed');
+      expect(completed.find(c => c[0].step_name === 'commit-and-push-retry')).toBeDefined();
+      const terminal = completed.find(c => c[0].step_name === 'commit-hook-terminal');
+      expect(terminal?.[0].data?.node_output).toContain('HOOK_RECOVERY_VERIFIED=yes');
+      expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
+      expect(store.completeWorkflowRun).toHaveBeenCalledTimes(0);
     });
   }
 

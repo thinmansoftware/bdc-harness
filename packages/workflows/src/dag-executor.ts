@@ -6598,6 +6598,14 @@ async function executeDagWorkflowInternal(
     const initial = nodeOutputs.get('commit-and-push');
     const retry = nodeOutputs.get('commit-and-push-retry');
     const terminal = nodeOutputs.get('commit-hook-terminal');
+    const repairVerdict = evaluateCondition(
+      "$classify-commit-hook-repair.output.verdict == 'fixed' || $classify-commit-hook-repair.output.verdict == 'already_satisfied'",
+      nodeOutputs
+    );
+    const repairAuthorization = evaluateCondition(
+      "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'",
+      nodeOutputs
+    );
     if (
       initial?.state !== 'failed' ||
       retry?.state !== 'completed' ||
@@ -6609,11 +6617,10 @@ async function executeDagWorkflowInternal(
       ) ||
       nodeOutputs.get('commit-hook-repair')?.state !== 'completed' ||
       nodeOutputs.get('classify-commit-hook-repair')?.state !== 'completed' ||
-      !evaluateCondition(
-        "$classify-commit-hook-repair.output.verdict == 'fixed' || $classify-commit-hook-repair.output.verdict == 'already_satisfied'",
-        nodeOutputs
-      ) ||
-      !evaluateCondition("$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'", nodeOutputs)
+      !repairVerdict.parsed ||
+      !repairVerdict.result ||
+      !repairAuthorization.parsed ||
+      !repairAuthorization.result
     )
       return null;
     for (const [id, parent] of [
