@@ -23,6 +23,307 @@ const log = createLogger('db/taskmaster');
 const EXPIRE_UNSENT_PROPOSALS =
   "outcome = 'parked' OR (outcome = 'pending' AND action_type <> 'fire_cauldron')";
 
+export interface AutomaticFireRequest {
+  actionKey: string;
+  journalId: string;
+  sourceThreadRef: string;
+  ownerToken: string;
+  cascadeId: string;
+  epoch: number;
+  limit: number;
+  now: string;
+  /** Admission-time clock sampled only after the shared DB lock is acquired. */
+  clock?: () => string;
+}
+export interface AutomaticFireProvenance {
+  source: 'taskmaster';
+  actionKey: string;
+  journalId: string;
+  sourceThreadRef: string;
+  cascadeId: string;
+  utcDay: string;
+  admittedAt: string;
+}
+export interface AutomaticFireAdmission {
+  action_key: string;
+  journal_id: string;
+  source_thread_ref: string;
+  owner_token: string;
+  cascade_id: string;
+  utc_day: string;
+  state: 'reserved' | 'admitted' | 'released' | 'unknown';
+  reserved_at: string;
+  admitted_at: string | null;
+  run_ids_json: string;
+}
+export interface AutomaticFireDecision {
+  allowed: boolean;
+  reason?: string;
+  admission?: AutomaticFireProvenance;
+}
+async function fireBudgetTransaction<T>(
+  db: IDatabase,
+  operation: (query: OverseerControlPlaneQuery) => Promise<T>
+): Promise<T> {
+  // Lock a guaranteed singleton, never the possibly empty admission result set.
+  const locked = async (query: OverseerControlPlaneQuery): Promise<T> => {
+    const control = await query<{ id: number }>(
+      'SELECT id FROM tm_control WHERE id=1' + (db.dialect === 'postgres' ? ' FOR UPDATE' : '')
+    );
+    if (control.rowCount !== 1) throw new Error('automatic_fire_control_missing');
+    return operation(query);
+  };
+  return db.dialect === 'sqlite'
+    ? withOverseerControlPlaneImmediateTransaction(db, locked)
+    : db.withTransaction(locked);
+}
+async function fireBudgetRefusal(
+  query: OverseerControlPlaneQuery,
+  input: AutomaticFireRequest,
+  excludeSelf: boolean
+): Promise<string | null> {
+  if (!Number.isSafeInteger(input.limit) || input.limit <= 0)
+    return 'daily_cap_disabled_or_invalid';
+  const control = await query<{ pause_state: string; epoch: number | string }>(
+    'SELECT pause_state,epoch FROM tm_control WHERE id=1'
+  );
+  if (control.rows[0]?.pause_state !== 'RUNNING' || Number(control.rows[0]?.epoch) !== input.epoch)
+    return 'daily_cap_pause_or_epoch';
+  const day = new Date(input.now).toISOString().slice(0, 10);
+  const unknownHistory = await query<{ action_key: string }>(
+    `SELECT action_key FROM tm_fire_admissions WHERE state='unknown'
+     AND owner_token='legacy-reconciliation' AND utc_day=$1 LIMIT 1`,
+    [day]
+  );
+  if (unknownHistory.rowCount) return 'daily_cap_legacy_history_unknown';
+  const legacy = await query<{ outcome: string; proposal_json: string }>(
+    `SELECT j.outcome,j.proposal_json FROM tm_journal j LEFT JOIN tm_fire_admissions a
+       ON a.action_key=j.idempotency_key
+     WHERE j.action_type='fire_cauldron' AND j.created_at >= $1
+       AND j.outcome IN ('sent','failed','expired') AND a.action_key IS NULL`,
+    [`${day}T00:00:00.000Z`]
+  );
+  for (const row of legacy.rows) {
+    // Reconciliation skips this explicit pre-effect expiration. Match it here
+    // without weakening sent/failed history or relying on dialect JSON casts.
+    if (row.outcome === 'expired') {
+      try {
+        const proposal = JSON.parse(row.proposal_json) as { reason?: unknown } | null;
+        if (proposal?.reason === 'stale_epoch_before_effect') continue;
+      } catch {
+        // Malformed history is unknown, never proof that no effect occurred.
+      }
+    }
+    return 'daily_cap_legacy_history_unknown';
+  }
+  const count = await query<{ total: number | string }>(
+    `SELECT COUNT(*) AS total FROM tm_fire_admissions
+     WHERE (state IN ('reserved','unknown') OR (state='admitted' AND utc_day=$1))
+       AND ($2 = '' OR action_key <> $2)`,
+    [day, excludeSelf ? input.actionKey : '']
+  );
+  return Number(count.rows[0]?.total ?? input.limit) >= input.limit ? 'daily_cap_exhausted' : null;
+}
+export async function reserveAutomaticFire(
+  input: AutomaticFireRequest,
+  db: IDatabase = getDatabase()
+): Promise<AutomaticFireDecision> {
+  return fireBudgetTransaction(db, async query => {
+    const existing = await query<AutomaticFireAdmission>(
+      'SELECT * FROM tm_fire_admissions WHERE action_key=$1',
+      [input.actionKey]
+    );
+    // A replay reconciles the durable identity; it never gets a second invocation.
+    if (existing.rowCount) return { allowed: false, reason: 'daily_cap_existing_action' };
+    const reason = await fireBudgetRefusal(query, input, false);
+    if (reason) return { allowed: false, reason };
+    await query(
+      `INSERT INTO tm_fire_admissions(action_key,journal_id,source_thread_ref,owner_token,
+       cascade_id,utc_day,state,reserved_at,updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'reserved',$7,$7)`,
+      [
+        input.actionKey,
+        input.journalId,
+        input.sourceThreadRef,
+        input.ownerToken,
+        input.cascadeId,
+        new Date(input.now).toISOString().slice(0, 10),
+        input.now,
+      ]
+    );
+    return { allowed: true };
+  });
+}
+export async function authorizeAutomaticFire(
+  input: AutomaticFireRequest,
+  db: IDatabase = getDatabase()
+): Promise<AutomaticFireDecision> {
+  return fireBudgetTransaction(db, async query => {
+    input = { ...input, now: input.clock?.() ?? input.now };
+    const existing = await query<AutomaticFireAdmission>(
+      'SELECT * FROM tm_fire_admissions WHERE action_key=$1',
+      [input.actionKey]
+    );
+    const row = existing.rows[0];
+    if (
+      row?.state !== 'reserved' ||
+      row.owner_token !== input.ownerToken ||
+      row.journal_id !== input.journalId ||
+      row.cascade_id !== input.cascadeId ||
+      row.source_thread_ref !== input.sourceThreadRef
+    )
+      return { allowed: false, reason: 'daily_cap_not_owned_reservation' };
+    let stableDay = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const reason = await fireBudgetRefusal(query, input, true);
+      const freshTime = input.clock?.() ?? input.now;
+      if (freshTime.slice(0, 10) !== input.now.slice(0, 10)) {
+        input = { ...input, now: freshTime };
+        continue;
+      }
+      if (reason) return { allowed: false, reason };
+      input = { ...input, now: freshTime };
+      stableDay = true;
+      break;
+    }
+    if (!stableDay) return { allowed: false, reason: 'daily_cap_clock_unstable' };
+    const admission: AutomaticFireProvenance = {
+      source: 'taskmaster',
+      actionKey: input.actionKey,
+      journalId: input.journalId,
+      sourceThreadRef: input.sourceThreadRef,
+      cascadeId: input.cascadeId,
+      utcDay: new Date(input.now).toISOString().slice(0, 10),
+      admittedAt: input.now,
+    };
+    // Permission commits before filesystem admission/provider work. A lost result
+    // remains UNKNOWN and counted, not automatically refunded after a timeout.
+    await query(
+      `UPDATE tm_fire_admissions SET state='unknown',utc_day=$1,admitted_at=$2,updated_at=$2
+       WHERE action_key=$3 AND owner_token=$4 AND state='reserved'`,
+      [admission.utcDay, input.now, input.actionKey, input.ownerToken]
+    );
+    return { allowed: true, admission };
+  });
+}
+export async function releaseAutomaticFire(
+  input: Pick<AutomaticFireRequest, 'actionKey' | 'ownerToken' | 'now'>,
+  db: IDatabase = getDatabase()
+): Promise<boolean> {
+  // Serialize with authorization's control-row lock on BOTH dialects. A CAS
+  // outside that lock could release after authorization read its reservation.
+  return fireBudgetTransaction(db, async query => {
+    const result = await query(
+      `UPDATE tm_fire_admissions SET state='released',updated_at=$1
+       WHERE action_key=$2 AND owner_token=$3 AND state='reserved' AND admitted_at IS NULL`,
+      [input.now, input.actionKey, input.ownerToken]
+    );
+    return result.rowCount === 1;
+  });
+}
+export async function settleAutomaticFire(
+  input: {
+    actionKey: string;
+    cascadeId: string;
+    state: 'admitted' | 'released' | 'unknown';
+    admittedAt?: string;
+    runIds?: string[];
+  },
+  db: IDatabase = getDatabase()
+): Promise<void> {
+  // Settlement has no owner/non-admission witness. Only the owned, serialized
+  // releaseAutomaticFire path can release an uncommitted reservation.
+  await db.query(
+    `UPDATE tm_fire_admissions SET state=$1,admitted_at=COALESCE($2,admitted_at),
+     utc_day=COALESCE($3,utc_day),run_ids_json=$4,updated_at=$5
+     WHERE action_key=$6 AND cascade_id=$7
+       AND $1 <> 'released' AND (state <> 'admitted' OR $1='admitted')
+       AND (admitted_at IS NULL OR CAST($2 AS TEXT) IS NULL OR admitted_at=$2)`,
+    [
+      input.state,
+      input.admittedAt ?? null,
+      input.admittedAt?.slice(0, 10) ?? null,
+      JSON.stringify(input.runIds ?? []),
+      new Date().toISOString(),
+      input.actionKey,
+      input.cascadeId,
+    ]
+  );
+  if (input.state === 'admitted' && input.admittedAt) {
+    // Async preflight may outlive the original journal deadline. Supervision
+    // starts from the proven admission clock, never the stale proposal clock.
+    await db.query(
+      `UPDATE tm_journal SET proof_deadline_at=$1 WHERE id IN (
+         SELECT journal_id FROM tm_fire_admissions WHERE action_key=$2
+         AND cascade_id=$3 AND state='admitted' AND admitted_at=$4
+         AND owner_token <> 'legacy-reconciliation')`,
+      [
+        new Date(Date.parse(input.admittedAt) + 86_400_000).toISOString(),
+        input.actionKey,
+        input.cascadeId,
+        input.admittedAt,
+      ]
+    );
+  }
+}
+export async function listAutomaticFireAdmissions(
+  db: IDatabase = getDatabase()
+): Promise<AutomaticFireAdmission[]> {
+  return [
+    ...(
+      await db.query<AutomaticFireAdmission>(
+        "SELECT * FROM tm_fire_admissions WHERE state <> 'released'"
+      )
+    ).rows,
+  ];
+}
+
+/** Import an unrepresented historical journal identity conservatively before new work. */
+export async function seedAutomaticFireHistory(
+  input: Omit<AutomaticFireRequest, 'limit' | 'epoch'>,
+  db: IDatabase = getDatabase()
+): Promise<void> {
+  await db.query(
+    `INSERT INTO tm_fire_admissions(action_key,journal_id,source_thread_ref,owner_token,
+     cascade_id,utc_day,state,reserved_at,updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,'unknown',$7,$7) ON CONFLICT(action_key) DO NOTHING`,
+    [
+      input.actionKey,
+      input.journalId,
+      input.sourceThreadRef,
+      input.ownerToken,
+      input.cascadeId,
+      new Date(input.now).toISOString().slice(0, 10),
+      input.now,
+    ]
+  );
+}
+
+/** Refresh only the pending Taskmaster expectation for this exact admitted action. */
+export async function updateAutomaticFireExpectation(
+  input: {
+    journalId: string;
+    cascadeId: string;
+    runIds: string[];
+  },
+  db: IDatabase = getDatabase()
+): Promise<void> {
+  await db.query(
+    `UPDATE tm_expectations SET evidence_json=$1,updated_at=$2
+     WHERE registration_key=$3 AND dispatch_ref=$4 AND registered_by='taskmaster' AND status='pending'`,
+    [
+      JSON.stringify({
+        kind: 'db_row_exists',
+        table: 'remote_agent_workflow_runs',
+        where: { id: [...new Set(input.runIds)], status: ['completed'] },
+      }),
+      new Date().toISOString(),
+      expectationRegistrationKey(input.journalId, input.cascadeId),
+      input.cascadeId,
+    ]
+  );
+}
+
 export type TmActionType =
   | 'deliver_ruling'
   | 'nudge'

@@ -512,13 +512,13 @@ export class SqliteAdapter implements IDatabase {
   private rebuildTmJournal(createNewTableSql: string): void {
     this.db.run('BEGIN IMMEDIATE');
     try {
-      const dependents = this.db
-        .prepare(
-          `SELECT type, name, sql FROM sqlite_master
+      const dependents = this.pragmaAll(`SELECT type, name, sql FROM sqlite_master
            WHERE tbl_name = 'tm_journal' AND type IN ('index', 'trigger') AND sql IS NOT NULL
-           ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name`
-        )
-        .all() as { type: string; name: string; sql: string }[];
+           ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name`) as {
+        type: string;
+        name: string;
+        sql: string;
+      }[];
       this.db.run(createNewTableSql);
       this.db.run('INSERT INTO tm_journal_new SELECT * FROM tm_journal');
       this.db.run('DROP TABLE tm_journal');
@@ -533,11 +533,11 @@ export class SqliteAdapter implements IDatabase {
   }
 
   private upgradeBoardAuditEvents(): void {
-    const row = this.db
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'board_audit_events'")
-      .get() as { sql?: string } | undefined;
+    const row = (this.pragmaAll(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'board_audit_events'"
+    )[0] ?? null) as { sql?: string } | undefined;
     if (!row?.sql) return;
-    const columns = this.db.prepare("PRAGMA table_info('board_audit_events')").all() as {
+    const columns = this.pragmaAll("PRAGMA table_info('board_audit_events')") as {
       name: string;
     }[];
     const hasSubjectKey = columns.some(column => column.name === 'subject_key');
@@ -552,14 +552,13 @@ export class SqliteAdapter implements IDatabase {
     if (!hasSubjectKey || requiredTypes.some(type => !tableSql.includes(type))) {
       this.db.run('BEGIN IMMEDIATE');
       try {
-        const dependents = this.db
-          .prepare(
-            `SELECT name, sql FROM sqlite_master
+        const dependents = this.pragmaAll(`SELECT name, sql FROM sqlite_master
              WHERE tbl_name = 'board_audit_events' AND type IN ('index', 'trigger')
                AND sql IS NOT NULL AND name != 'uq_board_audit_events_subject'
-             ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name`
-          )
-          .all() as { name: string; sql: string }[];
+             ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name`) as {
+          name: string;
+          sql: string;
+        }[];
         this.db.run(`CREATE TABLE board_audit_events_new (
           id TEXT PRIMARY KEY,
           event_type TEXT NOT NULL CHECK (event_type IN (
@@ -613,9 +612,9 @@ export class SqliteAdapter implements IDatabase {
     this.upgradeBoardAuditEvents();
     // Migration 045: SQLite cannot alter CHECK constraints. Rebuild existing
     // four-verb journals transactionally before any fire_cauldron insert.
-    const journalSchema = this.db
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
-      .get() as { sql?: string } | undefined;
+    const journalSchema = (this.pragmaAll(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'"
+    )[0] ?? null) as { sql?: string } | undefined;
     if (journalSchema?.sql && !journalSchema.sql.includes('fire_cauldron')) {
       this.rebuildTmJournal(`
           CREATE TABLE tm_journal_new (
@@ -640,9 +639,9 @@ export class SqliteAdapter implements IDatabase {
     // fire_cauldron rebuild above may have just recreated the table (still with
     // the pre-'unheard' grade CHECK), so the stale journalSchema string cannot
     // be reused here.
-    const journalSchema2 = this.db
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
-      .get() as { sql?: string } | undefined;
+    const journalSchema2 = (this.pragmaAll(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'"
+    )[0] ?? null) as { sql?: string } | undefined;
     if (journalSchema2?.sql && !journalSchema2.sql.includes('unheard')) {
       this.rebuildTmJournal(`
           CREATE TABLE tm_journal_new (
@@ -667,9 +666,9 @@ export class SqliteAdapter implements IDatabase {
     // with a CHECK that still lacks 'delivered_to_issue', so the stale schema
     // string from that block cannot be reused here. Separate block (do not edit
     // the 045/055 CHECK literals) so each widen is independently idempotent.
-    const journalSchema3 = this.db
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
-      .get() as { sql?: string } | undefined;
+    const journalSchema3 = (this.pragmaAll(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'"
+    )[0] ?? null) as { sql?: string } | undefined;
     if (journalSchema3?.sql && !journalSchema3.sql.includes('delivered_to_issue')) {
       this.rebuildTmJournal(`
           CREATE TABLE tm_journal_new (
@@ -697,9 +696,9 @@ export class SqliteAdapter implements IDatabase {
     // not edit the 045/055/056 CHECK literals) so each widen is independently
     // idempotent. Only action_type widens; the grade CHECK is carried forward
     // exactly as migration 056 left it.
-    const journalSchema4 = this.db
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
-      .get() as { sql?: string } | undefined;
+    const journalSchema4 = (this.pragmaAll(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'"
+    )[0] ?? null) as { sql?: string } | undefined;
     if (journalSchema4?.sql && !journalSchema4.sql.includes('blocker_report')) {
       this.rebuildTmJournal(`
           CREATE TABLE tm_journal_new (
@@ -722,17 +721,13 @@ export class SqliteAdapter implements IDatabase {
     // tm_health. Add a provider-only UNIQUE index (allowed by the WO) instead
     // of rebuilding: table constraints, columns, indexes and triggers survive.
     const hasHealthConflictTarget = (): boolean =>
-      this.db
-        .prepare(
-          `
+      (this.pragmaAll(`
           SELECT 1 FROM pragma_index_list('tm_health') AS idx
           WHERE idx."unique" = 1 AND idx.partial = 0
             AND (SELECT COUNT(*) FROM pragma_index_info(idx.name)) = 1
             AND (SELECT name FROM pragma_index_info(idx.name)) = 'provider'
           LIMIT 1
-        `
-        )
-        .get() != null;
+        `)[0] ?? null) != null;
     if (!hasHealthConflictTarget()) {
       this.db.run('BEGIN IMMEDIATE');
       try {
@@ -907,9 +902,9 @@ export class SqliteAdapter implements IDatabase {
         ['route_disposed_at', 'TEXT'],
         ['supersedes_id', 'TEXT REFERENCES agent_dispatch_messages(id)'],
       ];
-      const boardDispatchCols = this.db
-        .prepare("PRAGMA table_info('agent_dispatch_messages')")
-        .all() as { name: string }[];
+      const boardDispatchCols = this.pragmaAll("PRAGMA table_info('agent_dispatch_messages')") as {
+        name: string;
+      }[];
       const boardDispatchColNames = new Set(boardDispatchCols.map(c => c.name));
       for (const [name, definition] of boardColumns) {
         if (!boardDispatchColNames.has(name)) {
@@ -919,9 +914,9 @@ export class SqliteAdapter implements IDatabase {
 
       this.db.run('BEGIN');
       try {
-        const dispatchCols = this.db
-          .prepare("PRAGMA table_info('agent_dispatch_messages')")
-          .all() as { name: string }[];
+        const dispatchCols = this.pragmaAll("PRAGMA table_info('agent_dispatch_messages')") as {
+          name: string;
+        }[];
         const dispatchColNames = new Set(dispatchCols.map(c => c.name));
         const priorityNeedsBackfill = !dispatchColNames.has('priority');
         for (const [name, definition] of [...boardColumns, ...phase0Columns]) {
@@ -954,9 +949,9 @@ export class SqliteAdapter implements IDatabase {
     this.migrateDispatchSeq();
 
     try {
-      const actionCols = this.db
-        .prepare("PRAGMA table_info('remote_agent_supervisor_actions')")
-        .all() as { name: string }[];
+      const actionCols = this.pragmaAll("PRAGMA table_info('remote_agent_supervisor_actions')") as {
+        name: string;
+      }[];
       const actionColNames = new Set(actionCols.map(c => c.name));
       if (!actionColNames.has('status')) {
         this.db.run(
@@ -997,16 +992,14 @@ export class SqliteAdapter implements IDatabase {
    */
   private migrateDispatchSeq(): void {
     try {
-      const tableExists = this.db
-        .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
-        )
-        .get() as { name?: string } | null;
+      const tableExists = (this.pragmaAll(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+      )[0] ?? null) as { name?: string } | null;
       if (!tableExists?.name) return;
 
       const colNames = new Set(
         (
-          this.db.prepare("PRAGMA table_info('agent_dispatch_messages')").all() as {
+          this.pragmaAll("PRAGMA table_info('agent_dispatch_messages')") as {
             name: string;
           }[]
         ).map(c => c.name)
@@ -1049,14 +1042,12 @@ export class SqliteAdapter implements IDatabase {
   }
 
   private migrateDispatchSenderPrincipalIdempotency(): void {
-    const tableExists = this.db
-      .prepare(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
-      )
-      .get() as { name?: string } | null;
+    const tableExists = (this.pragmaAll(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+    )[0] ?? null) as { name?: string } | null;
     if (!tableExists?.name) return;
 
-    const cols = this.db.prepare("PRAGMA table_info('agent_dispatch_messages')").all() as {
+    const cols = this.pragmaAll("PRAGMA table_info('agent_dispatch_messages')") as {
       name: string;
       type: string;
       notnull: number;
@@ -1077,22 +1068,18 @@ export class SqliteAdapter implements IDatabase {
       this.db.run('ALTER TABLE agent_dispatch_messages ADD COLUMN sender_principal_id TEXT');
     }
 
-    const indexRows = this.db
-      .prepare(
-        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'agent_dispatch_messages'"
-      )
-      .all() as { name: string; sql: string | null }[];
+    const indexRows = this.pragmaAll(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'agent_dispatch_messages'"
+    ) as { name: string; sql: string | null }[];
     const hasAuth = indexRows.some(
       row => row.name === 'uq_agent_dispatch_messages_sender_idempotency_authenticated'
     );
     const hasLegacy = indexRows.some(
       row => row.name === 'uq_agent_dispatch_messages_idempotency_legacy'
     );
-    const tableSqlRow = this.db
-      .prepare(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
-      )
-      .get() as { sql: string } | null;
+    const tableSqlRow = (this.pragmaAll(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+    )[0] ?? null) as { sql: string } | null;
     const tableSql = tableSqlRow?.sql ?? '';
     const hasInlineUnique =
       /idempotency_key\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(tableSql) ||
@@ -1169,9 +1156,9 @@ export class SqliteAdapter implements IDatabase {
           )
         `);
 
-        const sourceCols = this.db
-          .prepare("PRAGMA table_info('agent_dispatch_messages')")
-          .all() as { name: string }[];
+        const sourceCols = this.pragmaAll("PRAGMA table_info('agent_dispatch_messages')") as {
+          name: string;
+        }[];
         const sourceNames = new Set(sourceCols.map(c => c.name));
         const targetCols = [
           'id',
@@ -1264,7 +1251,7 @@ export class SqliteAdapter implements IDatabase {
         throw error;
       }
 
-      const fkCheck = this.db.prepare('PRAGMA foreign_key_check').all();
+      const fkCheck = this.pragmaAll('PRAGMA foreign_key_check');
       if (fkCheck.length > 0) {
         throw new Error('dispatch_phase15_foreign_key_check_failed');
       }
@@ -2598,6 +2585,24 @@ export class SqliteAdapter implements IDatabase {
         lease_expires_at TEXT NOT NULL,
         posted_at TEXT
       );
+
+      -- Durable automatic-fire budget (migration 063). Never expires unknown effects.
+      CREATE TABLE IF NOT EXISTS tm_fire_admissions (
+        action_key TEXT PRIMARY KEY,
+        journal_id TEXT NOT NULL UNIQUE REFERENCES tm_journal(id),
+        source TEXT NOT NULL DEFAULT 'taskmaster' CHECK (source = 'taskmaster'),
+        source_thread_ref TEXT NOT NULL,
+        owner_token TEXT NOT NULL,
+        cascade_id TEXT NOT NULL,
+        utc_day TEXT NOT NULL CHECK (length(utc_day) = 10),
+        state TEXT NOT NULL CHECK (state IN ('reserved','admitted','released','unknown')),
+        reserved_at TEXT NOT NULL,
+        admitted_at TEXT,
+        updated_at TEXT NOT NULL,
+        run_ids_json TEXT NOT NULL DEFAULT '[]',
+        CHECK (state <> 'admitted' OR admitted_at IS NOT NULL)
+      );
+      CREATE INDEX IF NOT EXISTS idx_tm_fire_admissions_day ON tm_fire_admissions(utc_day,state);
 
       -- Per-service GitHub API usage and latest quota state (migration 062).
       CREATE TABLE IF NOT EXISTS github_api_usage (

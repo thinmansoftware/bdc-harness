@@ -84,6 +84,8 @@ jobs:
         run: bun test packages/core/src/db/dispatch.postgres.test.ts
       - name: Taskmaster health migration and atomic reset PostgreSQL integration
         run: bun test packages/core/src/db/taskmaster.postgres.test.ts
+      - name: Taskmaster durable daily fire cap PostgreSQL integration
+        run: bun test packages/core/src/db/taskmaster-fire-cap.postgres.test.ts
       - name: CE scope approvals PostgreSQL integration
         run: bun test packages/core/src/db/board-scope-approvals.postgres.test.ts
 

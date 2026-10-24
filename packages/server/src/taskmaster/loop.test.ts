@@ -72,6 +72,7 @@ import type {
 } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import * as fireBudgetDb from '@archon/core/db/taskmaster';
 
 describe('Taskmaster reset visibility and canary', () => {
   test('legacy_unverified receipts are never post-cutover evidence', () => {
@@ -282,6 +283,53 @@ function makeWorld(): FakeWorld {
   };
 }
 
+const budgetStores = new WeakMap<FakeWorld, SqliteAdapter>();
+const openedBudgetStores: SqliteAdapter[] = [];
+afterAll(async () => {
+  for (const db of openedBudgetStores) await db.close();
+});
+function fixtureFireBudget(world: FakeWorld): NonNullable<TaskmasterDeps['fireBudget']> {
+  const database = async (): Promise<SqliteAdapter> => {
+    let db = budgetStores.get(world);
+    if (!db) {
+      db = new SqliteAdapter(':memory:');
+      budgetStores.set(world, db);
+      openedBudgetStores.push(db);
+    }
+    await db.query('UPDATE tm_control SET pause_state=$1,epoch=$2 WHERE id=1', [
+      world.control.pause_state,
+      world.control.epoch,
+    ]);
+    for (const row of world.journal)
+      await db.query(
+        `INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET outcome=$6,proposal_json=$4`,
+        [
+          row.id,
+          row.thread_ref,
+          row.action_type,
+          row.proposal_json,
+          row.idempotency_key,
+          row.outcome,
+          row.created_at,
+        ]
+      );
+    return db;
+  };
+  return {
+    reserveAutomaticFire: async input => fireBudgetDb.reserveAutomaticFire(input, await database()),
+    authorizeAutomaticFire: async input =>
+      fireBudgetDb.authorizeAutomaticFire(input, await database()),
+    releaseAutomaticFire: async input => fireBudgetDb.releaseAutomaticFire(input, await database()),
+    settleAutomaticFire: async input => fireBudgetDb.settleAutomaticFire(input, await database()),
+    seedAutomaticFireHistory: async input =>
+      fireBudgetDb.seedAutomaticFireHistory(input, await database()),
+    listAutomaticFireAdmissions: async () =>
+      fireBudgetDb.listAutomaticFireAdmissions(await database()),
+    updateAutomaticFireExpectation: async input =>
+      fireBudgetDb.updateAutomaticFireExpectation(input, await database()),
+  };
+}
 function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): TaskmasterDeps {
   let journalSeq = world.journal.length;
   const dal = {
@@ -546,6 +594,28 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     // Default no-op evidence so adoption refresh never hits the network in unit tests.
     getGithubIssueEvidence: async () => null,
     ...overrides,
+    fireBudget: overrides.fireBudget ?? fixtureFireBudget(world),
+    readFireCascade: overrides.readFireCascade ?? (async () => null),
+    ...(overrides.runCascade
+      ? {
+          runCascade: (async options => {
+            const provenance = await options.beforeAdmission?.();
+            const normalize = (
+              record: Awaited<ReturnType<NonNullable<TaskmasterDeps['runCascade']>>>
+            ) => ({
+              ...record,
+              cascadeId: options.dispatchId!,
+              automaticFireAdmission: provenance,
+              attempts: record.attempts ?? [{ runId: record.cascadeId }],
+            });
+            const record = await overrides.runCascade!({
+              ...options,
+              onAdmission: (record, created) => options.onAdmission?.(normalize(record), created),
+            });
+            return normalize(record);
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        }
+      : {}),
   };
 }
 
@@ -803,6 +873,71 @@ const EXPECTED_SPEC = {
   specHash: `sha256:${'b'.repeat(64)}`,
 };
 describe('fire_cauldron loop', () => {
+  test.each(['refused', 'planned'] as const)(
+    'definitive pre-permission %s releases only the owned reservation',
+    async status => {
+      const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const deps = makeDeps(world, {
+          listThreads: async () => [
+            makeListedThread({
+              ref: 'gh:thinmansoftware/bdc-harness#709',
+              title: 'WO-HARNESS-EXAMPLE-709',
+              priority: 'P0',
+              isUnclaimed: true,
+              isUnclaimedP0: true,
+            }),
+          ],
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-709',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+            },
+          }),
+        });
+        let calls = 0;
+        // Bypass the fixture's automatic gate wrapper: a real pre-admission
+        // refusal/dry-run returns WITHOUT asking for permission.
+        deps.runCascade = async options => {
+          calls++;
+          return {
+            cascadeId: options.dispatchId,
+            woId: options.woId,
+            project: options.project,
+            status,
+            attempts: [],
+          } as never;
+        };
+        const result = await tick(createTaskmasterState(60_000), deps);
+        expect(calls).toBe(1);
+        expect(result.failed).toBe(0);
+        expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe(
+          'expired'
+        );
+        const rows = (
+          await budgetStores.get(world)!.query<{
+            state: string;
+            admitted_at: string | null;
+          }>('SELECT state,admitted_at FROM tm_fire_admissions')
+        ).rows;
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.state).toBe('released');
+        expect(rows[0]?.admitted_at).toBeNull();
+      } finally {
+        if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+        else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+      }
+    }
+  );
+
   test('beyond_first_page_cannot_fire_by_default', async () => {
     const priorFireVerb = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     const priorBeyondPage = process.env.TASKMASTER_FIRE_BEYOND_FIRST_PAGE;
@@ -1174,7 +1309,7 @@ describe('fire_cauldron loop', () => {
     }
   });
 
-  test('fire cap dispatches P0 through P2 first and defers overflow for the next tick', async () => {
+  test('daily cap dispatches P0 and P1 first and preserves overflow across ticks and restart', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -1223,26 +1358,22 @@ describe('fire_cauldron loop', () => {
       });
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
-      expect(admitted).toEqual([
-        'WO-HARNESS-EXAMPLE-510',
-        'WO-HARNESS-EXAMPLE-511',
-        'WO-HARNESS-EXAMPLE-512',
-      ]);
-      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(2);
+      expect(admitted).toEqual(['WO-HARNESS-EXAMPLE-510', 'WO-HARNESS-EXAMPLE-511']);
+      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(3);
 
       world.nowMs += 60_000;
       await tick(state, deps);
-      expect(admitted.slice(3).sort()).toEqual([
-        'WO-HARNESS-EXAMPLE-513',
-        'WO-HARNESS-EXAMPLE-514',
-      ]);
+      expect(admitted).toHaveLength(2);
+      world.nowMs += 60_000;
+      await tick(createTaskmasterState(60_000), deps);
+      expect(admitted).toHaveLength(2);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
   });
 
-  test('prior same-day sent fires do not impose a daily fire ceiling', async () => {
+  test('prior same-day unresolved automatic fires close the daily faucet', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -1299,7 +1430,7 @@ describe('fire_cauldron loop', () => {
           }) as NonNullable<TaskmasterDeps['runCascade']>,
         })
       );
-      expect(admissions).toBe(1);
+      expect(admissions).toBe(0);
       expect(world.journal.filter(row => row.action_type === 'fire_cauldron')).toHaveLength(3);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
@@ -1750,6 +1881,151 @@ describe('pending fire custody', () => {
     return { deps, fires: () => fires };
   }
 
+  test.each([false, true])(
+    'delayed admission shares its durable deadline with supervision (crash=%s)',
+    async crashAfterRegistration => {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const native = new SqliteAdapter(':memory:');
+      await native.query("UPDATE tm_control SET pause_state='RUNNING',epoch=$1 WHERE id=1", [
+        world.control.epoch,
+      ]);
+      const budget: NonNullable<TaskmasterDeps['fireBudget']> = {
+        reserveAutomaticFire: input => fireBudgetDb.reserveAutomaticFire(input, native),
+        authorizeAutomaticFire: input => fireBudgetDb.authorizeAutomaticFire(input, native),
+        releaseAutomaticFire: input => fireBudgetDb.releaseAutomaticFire(input, native),
+        settleAutomaticFire: input => fireBudgetDb.settleAutomaticFire(input, native),
+        seedAutomaticFireHistory: input => fireBudgetDb.seedAutomaticFireHistory(input, native),
+        listAutomaticFireAdmissions: () => fireBudgetDb.listAutomaticFireAdmissions(native),
+        updateAutomaticFireExpectation: input =>
+          fireBudgetDb.updateAutomaticFireExpectation(input, native),
+      };
+      const fixture = setup(world, { fireBudget: budget });
+      const dal = fixture.deps.db!;
+      let interrupted = false;
+      fixture.deps.db = {
+        ...dal,
+        recordAction: async data => {
+          const row = await dal.recordAction(data);
+          await native.query(
+            `INSERT INTO tm_journal
+          (id,thread_ref,action_type,proposal_json,idempotency_key,outcome,created_at,proof_deadline_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [
+              row.id,
+              row.thread_ref,
+              row.action_type,
+              row.proposal_json,
+              row.idempotency_key,
+              row.outcome,
+              row.created_at,
+              row.proof_deadline_at,
+            ]
+          );
+          return row;
+        },
+        getActionByIdempotencyKey: async key =>
+          (
+            await native.query<TmJournalEntry>(
+              'SELECT * FROM tm_journal WHERE idempotency_key=$1',
+              [key]
+            )
+          ).rows[0] ?? null,
+        listPendingFireActions: async () =>
+          (
+            await native.query<TmJournalEntry>(
+              "SELECT * FROM tm_journal WHERE action_type='fire_cauldron' AND outcome='pending'"
+            )
+          ).rows,
+        registerExpectation: async data => {
+          const key = expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
+          // Match production idempotency: an existing expectation's deadline is retained.
+          await native.query(
+            `INSERT INTO tm_expectations
+          (id,registration_key,dispatch_ref,recipient,evidence_json,due_at,on_absence,max_retries,
+           retries,status,registered_by,self_supervised,created_at,updated_at)
+          VALUES ($1,$1,$2,$3,$4,$5,$6,$7,0,'pending','taskmaster',0,$8,$8)
+          ON CONFLICT(registration_key) DO NOTHING`,
+            [
+              key,
+              data.dispatch_ref,
+              data.recipient,
+              data.evidence_json,
+              data.due_at,
+              data.on_absence,
+              data.max_retries,
+              new Date(world.nowMs).toISOString(),
+            ]
+          );
+          return key;
+        },
+        getExpectationByRegistrationKey: async key =>
+          (
+            await native.query<TmExpectation>(
+              'SELECT * FROM tm_expectations WHERE registration_key=$1',
+              [key]
+            )
+          ).rows[0] ?? null,
+        transitionPendingFireAction: async (id, expected, outcome, proposal) => {
+          if (crashAfterRegistration && outcome === 'sent' && !interrupted) {
+            interrupted = true;
+            return false; // Crash boundary: supervision persisted, journal still pending.
+          }
+          const result = await native.query(
+            `UPDATE tm_journal SET outcome=$1,proposal_json=$2
+          WHERE id=$3 AND outcome='pending' AND proposal_json=$4`,
+            [outcome, proposal, id, expected]
+          );
+          if (result.rowCount)
+            await dal.transitionPendingFireAction!(id, expected, outcome, proposal);
+          return result.rowCount === 1;
+        },
+      };
+      fixture.deps.runCascade = async options => {
+        world.nowMs += 45 * 60_000; // Async preflight finishes well after journal creation.
+        const permission = await options.beforeAdmission!();
+        const record = {
+          cascadeId: options.dispatchId!,
+          woId: options.woId,
+          project: options.project,
+          automaticFireAdmission: permission,
+          status: 'running',
+          attempts: [{ runId: 'actual-delayed-workflow' }],
+        } as Awaited<ReturnType<NonNullable<TaskmasterDeps['runCascade']>>>;
+        options.onAdmission?.(record, true);
+        return record;
+      };
+      try {
+        await tick(createTaskmasterState(60_000), fixture.deps);
+        const row = (
+          await native.query<TmJournalEntry>(
+            "SELECT * FROM tm_journal WHERE action_type='fire_cauldron'"
+          )
+        ).rows[0]!;
+        const expectation = (await native.query<TmExpectation>('SELECT * FROM tm_expectations'))
+          .rows[0]!;
+        const correctDue = new Date(world.nowMs + 86_400_000).toISOString();
+        expect(row.proof_deadline_at).toBe(correctDue);
+        expect(expectation.due_at).toBe(correctDue);
+        expect(row.outcome).toBe(crashAfterRegistration ? 'pending' : 'sent');
+        if (crashAfterRegistration) {
+          fixture.deps.listThreads = async () => []; // Recover custody without proposing new work.
+          await tick(createTaskmasterState(60_000), fixture.deps);
+          const recovered = (
+            await native.query<TmJournalEntry>('SELECT * FROM tm_journal WHERE id=$1', [row.id])
+          ).rows[0]!;
+          expect(recovered.outcome).toBe('sent');
+          expect((await native.query('SELECT * FROM tm_expectations')).rows).toHaveLength(1);
+          expect(
+            (await native.query<TmExpectation>('SELECT * FROM tm_expectations')).rows[0]!.due_at
+          ).toBe(correctDue);
+        }
+      } finally {
+        await native.close();
+      }
+    }
+  );
+
   test('admission without a proven workflow stays pending across later ticks and buckets', async () => {
     const world = makeWorld();
     seedDigestSent(world);
@@ -1797,26 +2073,53 @@ describe('pending fire custody', () => {
     expect(stored.due_at).toBe(fire.proof_deadline_at);
   });
 
-  test('explicit zero-attempt refusal expires without reporting a sent fire', async () => {
+  test('explicit zero-attempt refusal before permission expires without reporting a sent fire', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const fixture = setup(world);
+    // Use the real pre-permission boundary, bypassing the admitted-fire wrapper.
+    fixture.deps.runCascade = async options =>
+      ({
+        cascadeId: options.dispatchId,
+        woId: options.woId,
+        project: options.project,
+        status: 'refused',
+        attempts: [],
+      }) as never;
+    const result = await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('expired');
+    expect(result.effects).toBe(0);
+    expect(world.expectations.size).toBe(0);
+  });
+
+  test('zero-attempt refusal after committed permission stays charged and pending', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     const fixture = setup(world, {
-      runCascade: async options => {
-        const record = {
+      runCascade: async options =>
+        ({
           cascadeId: options.dispatchId,
           woId: options.woId,
           project: options.project,
           status: 'refused',
           attempts: [],
-        } as never;
-        options.onAdmission?.(record, true);
-        return record;
+        }) as never,
+      readFireCascadeEvidence: async () => {
+        throw new Error('no workflow proof');
       },
     });
     const result = await tick(createTaskmasterState(60_000), fixture.deps);
-    expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('expired');
+    expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('pending');
     expect(result.effects).toBe(0);
-    expect(world.expectations.size).toBe(0);
+    const rows = (
+      await budgetStores.get(world)!.query<{
+        state: string;
+        admitted_at: string | null;
+      }>('SELECT state,admitted_at FROM tm_fire_admissions')
+    ).rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.state).toBe('admitted');
+    expect(rows[0]!.admitted_at).not.toBeNull();
   });
 
   test('ambiguous dispatch rejection retains pending custody instead of retryable failure', async () => {
@@ -1839,31 +2142,72 @@ describe('pending fire custody', () => {
     expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('pending');
   });
 
-  test('four unconfirmed admissions consume only the existing three fire slots', async () => {
+  test('uncertain release storage preserves pending custody after an ambiguous launch', async () => {
     const world = makeWorld();
     seedDigestSent(world);
+    const budget = fixtureFireBudget(world);
     const fixture = setup(world, {
-      listThreads: async () =>
-        [1, 2, 3, 4].map(n =>
-          makeListedThread({
-            ref: `gh:thinmansoftware/bdc-harness#${700 + n}`,
-            priority: 'P0',
-            isUnclaimedP0: true,
-            title: `WO-HARNESS-CUSTODY-${String(n).padStart(2, '0')}`,
-          })
-        ),
+      fireBudget: {
+        ...budget,
+        releaseAutomaticFire: async () => {
+          throw new Error('synthetic storage uncertainty');
+        },
+      },
+      runCascade: async () => {
+        throw new Error('synthetic lost launch result');
+      },
       readFireCascadeEvidence: async () => {
-        throw new Error('not ready');
+        throw new Error('unknown workflow');
       },
     });
-    const result = await tick(createTaskmasterState(60_000), fixture.deps);
-    expect(fixture.fires()).toBe(3);
-    expect(
-      world.journal.filter(row => row.action_type === 'fire_cauldron' && row.outcome === 'pending')
-    ).toHaveLength(3);
-    expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(1);
-    expect(result.effects).toBe(0);
+    await tick(createTaskmasterState(60_000), fixture.deps);
+    expect(world.journal.find(row => row.action_type === 'fire_cauldron')?.outcome).toBe('pending');
+    const rows = await budget.listAutomaticFireAdmissions();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.state).toBe('unknown');
+    expect(rows[0]!.admitted_at).not.toBeNull();
   });
+
+  test.each([
+    [2, 2],
+    [5, 3],
+  ])(
+    'unconfirmed admissions obey daily limit %i and per-tick ceiling (%i)',
+    async (limit, expected) => {
+      const previous = process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+      process.env.TASKMASTER_FIRE_MAX_PER_DAY = String(limit);
+      try {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const fixture = setup(world, {
+          listThreads: async () =>
+            [1, 2, 3, 4].map(n =>
+              makeListedThread({
+                ref: `gh:thinmansoftware/bdc-harness#${700 + n}`,
+                priority: 'P0',
+                isUnclaimedP0: true,
+                title: `WO-HARNESS-CUSTODY-${String(n).padStart(2, '0')}`,
+              })
+            ),
+          readFireCascadeEvidence: async () => {
+            throw new Error('not ready');
+          },
+        });
+        const result = await tick(createTaskmasterState(60_000), fixture.deps);
+        expect(fixture.fires()).toBe(expected);
+        expect(
+          world.journal.filter(
+            row => row.action_type === 'fire_cauldron' && row.outcome === 'pending'
+          )
+        ).toHaveLength(expected);
+        expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(4 - expected);
+        expect(result.effects).toBe(0);
+      } finally {
+        if (previous === undefined) delete process.env.TASKMASTER_FIRE_MAX_PER_DAY;
+        else process.env.TASKMASTER_FIRE_MAX_PER_DAY = previous;
+      }
+    }
+  );
 
   function seedPending(world: FakeWorld, ageDays = 8): TmJournalEntry {
     const key = 'tm:fire:old-custody';
