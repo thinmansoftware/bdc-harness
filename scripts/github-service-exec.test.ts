@@ -3,6 +3,7 @@ import {
   githubCommandReadsStdin,
   runGitHubServiceCommand as runCommand,
 } from './github-service-exec';
+import { githubCommandChangesPullRequestAuthorship } from './github-service-exec';
 import { serviceGitHubCommandEnvironment } from '../packages/core/src/github/service-identity';
 import { generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
@@ -559,5 +560,133 @@ describe('operation-scoped GitHub CLI authentication', () => {
     expect(mints).toBe(1);
     // The App 403 surfaces as a failure rather than a reviewer-authored success.
     expect(result.exitCode).toBe(1);
+  });
+
+  test('classifies pull request authorship commands', () => {
+    const authorship = [
+      ['pr', 'create', '--repo', 'o/r', '--head', 'b'],
+      ['pr', '--repo', 'o/r', 'create', '--head', 'b'],
+      ['-R', 'o/r', 'pr', 'create'],
+      ['pr', 'review', '12', '--approve'],
+      ['pr', '-R', 'o/r', 'review', '12', '-a'],
+      ['api', 'repos/o/r/pulls', '-f', 'title=x'],
+      ['api', 'repos/o/r/pulls/12/reviews', '-X', 'POST'],
+      [
+        'api',
+        'graphql',
+        '-f',
+        'query=mutation { createPullRequest(input: {}) { clientMutationId } }',
+      ],
+      [
+        '-R',
+        'o/r',
+        'api',
+        'graphql',
+        '-f',
+        'query=mutation { createPullRequest(input: {}) { clientMutationId } }',
+      ],
+    ];
+    const reads = [
+      ['pr', 'view', '12'],
+      ['pr', '--repo', 'o/r', 'view', '12'],
+      ['pr', 'list'],
+      ['pr', 'checks', '12'],
+      ['pr', 'comment', '12', '--body', 'x'],
+      ['api', 'repos/o/r/pulls/12/reviews'],
+      ['api', 'repos/o/r/pulls/12/comments'],
+      ['issue', 'comment', '1', '--body', 'x'],
+    ];
+    expect(
+      authorship.map(args => [args.join(' '), githubCommandChangesPullRequestAuthorship(args)])
+    ).toEqual(authorship.map(args => [args.join(' '), true]));
+    expect(
+      reads.map(args => [args.join(' '), githubCommandChangesPullRequestAuthorship(args)])
+    ).toEqual(reads.map(args => [args.join(' '), false]));
+  });
+
+  test('App 403 does not retry PR creation with the PAT', async () => {
+    const appIdentity = {
+      kind: 'app' as const,
+      service: 'run_nodes' as const,
+      appId: '1',
+      installationId: '2',
+      privateKey: 'unused',
+      poolId: 'app-1-2',
+      distinct: true as const,
+    };
+    for (const args of [
+      ['pr', 'create', '--repo', 'o/r', '--head', 'b'],
+      ['pr', '--repo', 'o/r', 'create', '--head', 'b'],
+      [
+        '-R',
+        'o/r',
+        'api',
+        'graphql',
+        '-f',
+        'query=mutation { createPullRequest(input: {}) { clientMutationId } }',
+      ],
+    ]) {
+      let calls = 0;
+      const result = await runGitHubServiceCommand({
+        service: 'run_nodes',
+        command: 'gh',
+        args,
+        env: { ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN: 'synthetic-fallback' },
+        identity: appIdentity,
+        token: async () => 'synthetic-app',
+        execute: () => {
+          calls += 1;
+          return {
+            exitCode: 1,
+            stdout: new Uint8Array(),
+            stderr: new TextEncoder().encode('HTTP 403 Resource not accessible by integration'),
+          };
+        },
+      });
+      expect(calls).toBe(1);
+      expect(result.exitCode).toBe(1);
+      expect(new TextDecoder().decode(result.stderr)).toContain(
+        'github_service_exec: permission fallback refused for a PR authorship command (authorship must come from one identity)'
+      );
+      const fallbackRows = await db.query<{ permission_fallbacks: number }>(
+        "SELECT permission_fallbacks FROM github_api_usage WHERE pool_id = 'user-pat'"
+      );
+      expect(fallbackRows.rows).toEqual([]);
+    }
+  });
+
+  test('reads retain PAT retry after an App 403', async () => {
+    const calls: Array<string | undefined> = [];
+    const result = await runGitHubServiceCommand({
+      service: 'run_nodes',
+      command: 'gh',
+      args: ['pr', 'view', '12', '--json', 'mergeable'],
+      env: { ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN: 'synthetic-fallback' },
+      identity: {
+        kind: 'app',
+        service: 'run_nodes',
+        appId: '1',
+        installationId: '2',
+        privateKey: 'unused',
+        poolId: 'app-1-2',
+        distinct: true,
+      },
+      token: async () => 'synthetic-app',
+      execute: (_command, env) => {
+        calls.push(env.GH_TOKEN);
+        const first = calls.length === 1;
+        return {
+          exitCode: first ? 1 : 0,
+          stdout: new TextEncoder().encode(first ? '' : 'second-ok'),
+          stderr: new TextEncoder().encode(
+            first ? 'HTTP 403 Resource not accessible by integration' : ''
+          ),
+        };
+      },
+    });
+    expect(calls).toEqual(['synthetic-app', 'synthetic-fallback']);
+    expect(result.exitCode).toBe(0);
+    expect(new TextDecoder().decode(result.stdout)).toBe('second-ok');
+    expect(new TextDecoder().decode(result.stderr)).not.toContain('permission fallback refused');
   });
 });
