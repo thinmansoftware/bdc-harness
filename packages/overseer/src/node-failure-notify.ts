@@ -1,4 +1,6 @@
 import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
+import { getAdoption } from '@archon/core/db/taskmaster';
+import { resolveRecipient } from '@archon/core/utils/owner-recipient';
 import type { ErrorClass } from './classify';
 import type { Decision } from './decide';
 
@@ -77,6 +79,27 @@ export async function notifyNodeFailure(
 ): Promise<void> {
   if (input.decision !== 'escalate') return;
   const subjectIssue = issueNumber(input);
+  let blockerRecipient: 'xo' | undefined;
+  if (isNodeFailureBlocker(input)) {
+    if ((NODE_FAILURE_BLOCKER_CLASSES as readonly string[]).includes(input.errorClass)) {
+      blockerRecipient = 'xo';
+    } else {
+      let ownerLogin: string | null = null;
+      if (subjectIssue) {
+        try {
+          const reference = `gh:thinmansoftware/bdc-xo#${subjectIssue}`;
+          const owner = (await getAdoption()).find(row => row.thread_ref === reference);
+          ownerLogin = owner?.owner_login ?? null;
+        } catch (err) {
+          log.error(
+            { err, runId: input.runId, nodeId: input.nodeId },
+            'overseer.node_failure_owner_lookup_failed'
+          );
+        }
+      }
+      blockerRecipient = resolveRecipient(ownerLogin);
+    }
+  }
   const common = {
     correlation_id: input.runId,
     task_type: 'agent_message' as const,
@@ -91,12 +114,12 @@ export async function notifyNodeFailure(
       recipient: 'duty-officer',
       priority: 'normal' as const,
     },
-    ...(isNodeFailureBlocker(input)
+    ...(blockerRecipient
       ? [
           {
             ...common,
             idempotency_key: `${NODE_FAILURE_BLOCKER_IDEMPOTENCY_PREFIX}:${input.runId}:${input.nodeId}`,
-            recipient: 'xo',
+            recipient: blockerRecipient,
             priority: 'blocker' as const,
           },
         ]

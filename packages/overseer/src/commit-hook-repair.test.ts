@@ -12,7 +12,7 @@ import { evaluateCondition } from '../../workflows/src/condition-evaluator';
 const root = join(import.meta.dir, '../../..');
 const read = (path: string): string => readFileSync(join(root, path), 'utf8');
 
-function hookFixture(): {
+function hookFixture(options: { pushFails?: boolean } = {}): {
   directory: string;
   repo: string;
   artifacts: string;
@@ -59,7 +59,8 @@ function hookFixture(): {
     `set -euo pipefail\nexport UNIQUE_BRANCH=fixture ARTIFACTS_DIR='${unix(artifacts)}'\n` +
       `git() { printf '%s\\n' "$*" >> '${unix(artifacts)}/git-argv'; ` +
       `printf '%s\\n' "\x24{HUSKY-unset}" >> '${unix(artifacts)}/hook-env'; ` +
-      `case "$1" in push) return 0;; ls-remote) printf '%s\\trefs/heads/fixture\\n' "$(command git rev-parse HEAD)";; *) command git "$@";; esac; }\n` +
+      `case "$1" in push) return ${options.pushFails ? 1 : 0};; ls-remote) printf '%s\\trefs/heads/fixture\\n' "$(command git rev-parse HEAD)";; *) command git "$@";; esac; }\n` +
+      (options.pushFails ? 'sleep() { :; }; export -f sleep\n' : '') +
       `source '${unix(join(root, '.archon/scripts/commit-and-push.sh'))}' "$1"\n`
   );
   return {
@@ -126,6 +127,10 @@ describe('commit hook repair contract', () => {
       expect(readFileSync(join(fixture.artifacts, 'commit-hook-output.txt'), 'utf8')).toContain(
         'explicit-function-return-type'
       );
+      expect(
+        readFileSync(join(fixture.artifacts, 'commit-hook-repair-eligible'), 'utf8').trim(),
+        first.stderr + readFileSync(join(fixture.artifacts, 'commit-hook-output.txt'), 'utf8')
+      ).toBe('yes');
       expect(existsSync(join(fixture.repo, '.archon'))).toBe(false);
       expect(readFileSync(join(fixture.artifacts, 'commit-and-push.sh'), 'utf8')).toBe(
         read('.archon/scripts/commit-and-push.sh').replace(/\r\n/g, '\n')
@@ -192,6 +197,14 @@ describe('commit hook repair contract', () => {
     expect(classifyError({ nodeId: 'commit-and-push', message: 'git push rejected' })).not.toBe(
       'commit_hook_lint_failure'
     );
+  });
+  test('unknown_class_still_escalates_and_is_unchanged', () => {
+    const errorClass = classifyError({
+      nodeId: 'patch-pr-body',
+      message: 'unrecognised fixture failure',
+    });
+    expect(errorClass).toBe('unknown');
+    expect(decide({ errorClass, attempt: 1, hasOutput: false }).decision).toBe('escalate');
   });
 
   test('real_hook_repair_roundtrip', () => {
@@ -282,11 +295,69 @@ describe('commit hook repair contract', () => {
     });
   }
 
+  test('non-hook push failure cannot enter the hook retry caller', () => {
+    const fixture = hookFixture({ pushFails: true });
+    try {
+      writeFileSync(join(fixture.artifacts, 'commit-hook-repair-eligible'), 'yes\n');
+      writeFileSync(
+        join(fixture.repo, 'fixture.ts'),
+        'export function value(): number { return 1; }\n'
+      );
+      expect(fixture.runInitialNode().status).toBe(1);
+      const pushes = (): number =>
+        readFileSync(join(fixture.artifacts, 'git-argv'), 'utf8')
+          .split('\n')
+          .filter(line => line.startsWith('push ')).length;
+      expect(pushes()).toBe(3);
+      expect(fixture.run(2).status).toBe(1);
+      expect(pushes()).toBe(3);
+      expect(fixture.runRetryNode().status).toBe(1);
+      expect(pushes()).toBe(3);
+      expect(readFileSync(join(fixture.artifacts, 'commit-hook-attempt.txt'), 'utf8').trim()).toBe(
+        '1'
+      );
+      expect(existsSync(join(fixture.artifacts, 'commit-and-push.succeeded'))).toBe(false);
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+  for (const failure of ['missing-eligibility', 'non-hook-commit'] as const) {
+    test(`retry refuses ${failure}`, () => {
+      const fixture = hookFixture();
+      try {
+        if (failure === 'non-hook-commit') {
+          writeFileSync(
+            join(fixture.repo, 'fixture.ts'),
+            'export function value(): number { return 1; }\n'
+          );
+          for (const key of ['user.name', 'user.email']) {
+            expect(
+              spawnSync('git', ['config', key, ''], { cwd: fixture.repo, windowsHide: true }).status
+            ).toBe(0);
+          }
+        }
+        expect(fixture.run(1).status).toBe(1);
+        if (failure === 'missing-eligibility')
+          rmSync(join(fixture.artifacts, 'commit-hook-repair-eligible'));
+        const retry = fixture.run(2);
+        expect(retry.status).toBe(1);
+        expect(retry.stderr).toContain('no eligible initial hook failure');
+        expect(
+          readFileSync(join(fixture.artifacts, 'commit-hook-attempt.txt'), 'utf8').trim()
+        ).toBe('1');
+        expect(existsSync(join(fixture.artifacts, 'commit-and-push.succeeded'))).toBe(false);
+      } finally {
+        rmSync(fixture.directory, { recursive: true, force: true });
+      }
+    });
+  }
+
   test('a second real hook failure remains failed with the attempt counter at two', () => {
     const fixture = hookFixture();
     try {
       expect(fixture.run(1).status).toBe(1);
       expect(fixture.run(2).status).toBe(1);
+      expect(fixture.run(2).stderr).toContain('no eligible initial hook failure');
       expect(readFileSync(join(fixture.artifacts, 'commit-hook-attempt.txt'), 'utf8').trim()).toBe(
         '2'
       );
@@ -338,6 +409,7 @@ describe('commit hook repair contract', () => {
       );
       // A deliberate replay with no paths is a valid no-op; an absent record is not.
       expect(fixture.run(2).status).toBe(0);
+      rmSync(join(fixture.artifacts, 'commit-and-push.succeeded'));
       rmSync(paths);
       expect(fixture.run(2).status).toBe(1);
     } finally {

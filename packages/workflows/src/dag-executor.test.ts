@@ -14294,6 +14294,7 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
     options: {
       random?: number;
       zeroTokens?: boolean;
+      zeroTokensAfterFirst?: boolean;
       cancelDuringSleep?: boolean;
       deferSleep?: (milliseconds: number) => Promise<void>;
     } = {}
@@ -14324,7 +14325,10 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
         type: 'result',
         isError: true,
         errorSubtype: 'success',
-        tokens: { input: options.zeroTokens ? 0 : 105, output: options.zeroTokens ? 0 : 700 },
+        tokens:
+          options.zeroTokens || (options.zeroTokensAfterFirst && starts.length > 1)
+            ? { input: 0, output: 0 }
+            : { input: 105, output: 700 },
       };
     });
     await executeDagWorkflow(
@@ -14377,6 +14381,11 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
     expect(result.starts).toEqual([0, 0]);
     expect(result.waits).toEqual([]);
     expect(result.failed).toBe(1);
+    const mixed = await runBackoffScenario({ zeroTokensAfterFirst: true });
+    expect(mixed.starts).toEqual([0, 30000]);
+    expect(mixed.waits).toEqual([30000]);
+    expect(mixed.failed).toBe(1);
+    expect(mixed.completed).toBe(0);
   });
 
   it('backoff_is_jittered_bounded_and_cancellable', async () => {

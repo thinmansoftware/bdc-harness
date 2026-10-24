@@ -4117,21 +4117,34 @@ nodes:
       artifacts_dir="${ARTIFACTS_DIR:?ARTIFACTS_DIR required}"
       message="${COMMIT_MESSAGE:-feat: ${WO_ID:-work order} implementation}"
       mkdir -p "$artifacts_dir"
-      printf '%s\n' "$attempt" > "$artifacts_dir/commit-hook-attempt.txt"
+      staged_paths_file="$artifacts_dir/commit-hook-staged-paths.nul"
+      eligibility_file="$artifacts_dir/commit-hook-repair-eligible"
       if [ "$attempt" = 1 ]; then
         rm -f "$artifacts_dir/commit-and-push.succeeded"
+        printf 'no\n' > "$eligibility_file"
+      elif [ "$attempt" = 2 ]; then
+        if [ -f "$artifacts_dir/commit-and-push.succeeded" ]; then exit 0; fi
+        if [ ! -f "$staged_paths_file" ]; then
+          echo "ERROR: initial path record missing; refusing retry" >&2
+          exit 1
+        fi
+        if [ "$(cat "$eligibility_file" 2>/dev/null || true)" != yes ]; then
+          echo "ERROR: no eligible initial hook failure; refusing retry" >&2
+          exit 1
+        fi
+        printf 'consumed\n' > "$eligibility_file"
+      else
+        echo "ERROR: only initial attempt and one hook retry are allowed" >&2
+        exit 1
       fi
+      printf '%s\n' "$attempt" > "$artifacts_dir/commit-hook-attempt.txt"
 
-      staged_paths_file="$artifacts_dir/commit-hook-staged-paths.nul"
       if [ "$attempt" = 1 ]; then
         {
           git diff --name-only -z
           git diff --cached --name-only -z
           git ls-files --others --exclude-standard -z
         } | LC_ALL=C sort -zu > "$staged_paths_file"
-      elif [ ! -f "$staged_paths_file" ]; then
-        echo "ERROR: initial path record missing; refusing to stage unrelated retry files" >&2
-        exit 1
       fi
       if [ -s "$staged_paths_file" ]; then
         git add --pathspec-from-file="$staged_paths_file" --pathspec-file-nul
@@ -4149,6 +4162,14 @@ nodes:
       if ! git diff --cached --quiet; then
         hook_output="$artifacts_dir/commit-hook-output.txt"
         if ! git commit -m "$message" >"$hook_output" 2>&1; then
+          if [ "$attempt" = 1 ] && (
+            shopt -s nocasematch
+            hook_text=$(cat "$hook_output")
+            [[ "$hook_text" == *'husky - pre-commit script failed'* ||
+               ( "$hook_text" == *'lint-staged'* && "$hook_text" == *'[FAILED]'* ) ]]
+          ); then
+            printf 'yes\n' > "$eligibility_file"
+          fi
           cat "$hook_output" >&2
           exit 1
         fi
@@ -4380,6 +4401,10 @@ nodes:
       set -euo pipefail
       if [ -f "$ARTIFACTS_DIR/commit-and-push.succeeded" ]; then
         exit 0
+      fi
+      if [ "$(cat "$ARTIFACTS_DIR/commit-hook-repair-eligible" 2>/dev/null || true)" != yes ]; then
+        echo "ERROR: no eligible initial hook failure; refusing retry" >&2
+        exit 1
       fi
       source "$ARTIFACTS_DIR/commit-and-push.env"
       export UNIQUE_BRANCH COMMIT_MESSAGE REPAIR_TARGET_LEASE_SHA

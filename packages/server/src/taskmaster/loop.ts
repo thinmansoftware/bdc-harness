@@ -29,6 +29,7 @@ import {
   type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
+import { resolveRecipient } from '@archon/core/utils/owner-recipient';
 import {
   adoptionContentHash,
   classifyThread,
@@ -42,7 +43,7 @@ import {
   usefulRateFloorBreached,
 } from './rules';
 import { dutyOfficerClockEnabled } from '../dispatch/duty-officer-clock';
-import { validateProposal, WO_ID_RE, type TmAllowedRecipient } from './guard';
+import { validateProposal, WO_ID_RE } from './guard';
 import {
   buildEscalationCommentBody,
   createDbEscalationDeliveryClaim,
@@ -389,18 +390,7 @@ export { canonicalizeThreadRef };
  * (who reads it, on what cadence, verified). Widening is then a data change
  * here plus a follow-on WO -- never a silent edit.
  */
-export const OWNER_RECIPIENT_MAP: Record<string, TmAllowedRecipient> = {
-  xo: 'xo',
-  'major-build': 'xo',
-  'captain-ci': 'xo',
-  operator: 'xo',
-};
-
-/** Resolve an issue owner login to the dispatch mailbox for ordinary nudges. */
-export function resolveRecipient(ownerLogin: string | null | undefined): TmAllowedRecipient {
-  const key = (ownerLogin ?? '').trim().toLowerCase();
-  return OWNER_RECIPIENT_MAP[key] ?? 'xo';
-}
+export { OWNER_RECIPIENT_MAP, resolveRecipient } from '@archon/core/utils/owner-recipient';
 
 /**
  * Same-subject repeat reasons, passed UNCONDITIONALLY per verb (M-155 WO 3).

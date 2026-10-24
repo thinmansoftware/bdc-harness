@@ -8,6 +8,8 @@ import {
 
 import * as connection from '@archon/core/db/connection';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import * as taskmaster from '@archon/core/db/taskmaster';
+import * as ownerRouting from '@archon/core/utils/owner-recipient';
 import { handleNodeFailure } from './overseer-bridge';
 
 let db: SqliteAdapter;
@@ -20,9 +22,16 @@ afterEach(async () => {
   await db.close();
 });
 
-async function caller(nodeId: string, errorMsg: string): Promise<void> {
+async function caller(nodeId: string, errorMsg: string, errors?: string[]): Promise<void> {
   const noop = (): void => {};
-  const log = { info: noop, error: noop, warn: noop, debug: noop };
+  const log = {
+    info: noop,
+    error: (_fields: unknown, message: string): void => {
+      errors?.push(message);
+    },
+    warn: noop,
+    debug: noop,
+  };
   await handleNodeFailure(
     {
       store: { createWorkflowEvent: async () => {} },
@@ -139,6 +148,78 @@ describe('node failure dispatch notification', () => {
   });
   test('blocker_also_goes_to_xo', () =>
     expect(isNodeFailureBlocker({ ...base, attempt: 2 })).toBe(true));
+  test('blocker_also_goes_to_owner_or_xo', async () => {
+    const snapshot = await taskmaster.beginAdoptionSnapshot();
+    await taskmaster.upsertAdoptionRow(snapshot, {
+      thread_ref: 'gh:thinmansoftware/bdc-xo#3239',
+      repo: 'thinmansoftware/bdc-xo',
+      issue_number: 3239,
+      title: 'fixture',
+      priority: 'P1',
+      labels_json: '[]',
+      owner_login: 'major-build',
+      is_blocked: 0,
+      blocked_reason: null,
+      next_action: null,
+      latest_marker_kind: null,
+      latest_marker_at: null,
+      state: 'open',
+      last_movement_at: null,
+      last_movement_kind: null,
+      attempts_24h: 0,
+      attempts_total: 0,
+      evidence_observed_at: null,
+      source_updated_at: '2026-10-24T00:00:00Z',
+    });
+    await taskmaster.commitAdoptionSnapshot(snapshot);
+    const lookup = spyOn(taskmaster, 'getAdoption');
+    const resolver = spyOn(ownerRouting, 'resolveRecipient');
+    await caller(
+      'commit-and-push-retry',
+      'lint-staged [FAILED] eslint\nhusky - pre-commit script failed'
+    );
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(resolver).toHaveBeenCalledWith('major-build');
+    await notifyNodeFailure(
+      {
+        ...base,
+        runId: 'credits-run',
+        errorClass: 'out_of_credits',
+        metadata: { wo_issue_number: 3239 },
+      },
+      { error: () => {} }
+    );
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(resolver).toHaveBeenCalledTimes(1);
+    const rows = await db.query<{ recipient: string; priority: string }>(
+      "SELECT recipient,priority FROM agent_dispatch_messages WHERE priority='blocker'"
+    );
+    expect(rows.rows).toHaveLength(2);
+    expect(rows.rows.every(row => row.recipient === 'xo')).toBe(true);
+  });
+  for (const failure of [false, true]) {
+    test(`owner routing retains DO delivery with ${failure ? 'failed lookup' : 'missing WO'}`, async () => {
+      const lookup = spyOn(taskmaster, 'getAdoption');
+      if (failure) lookup.mockRejectedValue(new Error('fixture lookup unavailable'));
+      const resolver = spyOn(ownerRouting, 'resolveRecipient');
+      const errors: string[] = [];
+      await notifyNodeFailure(
+        { ...base, attempt: 2, ...(failure ? { metadata: { wo_issue_number: 3239 } } : {}) },
+        {
+          error: (_fields, message) => {
+            errors.push(message);
+          },
+        }
+      );
+      expect(resolver).toHaveBeenCalledWith(null);
+      expect(lookup).toHaveBeenCalledTimes(failure ? 1 : 0);
+      const rows = await db.query<{ recipient: string }>(
+        'SELECT recipient FROM agent_dispatch_messages ORDER BY recipient'
+      );
+      expect(rows.rows.map(row => row.recipient)).toEqual(['duty-officer', 'xo']);
+      if (failure) expect(errors).toContain('overseer.node_failure_owner_lookup_failed');
+    });
+  }
   test('blocker_table_is_exported_and_complete', async () => {
     expect(NODE_FAILURE_BLOCKER_CLASSES).toEqual(['out_of_credits', 'auth_failed']);
     for (const errorClass of NODE_FAILURE_BLOCKER_CLASSES) {
@@ -171,6 +252,13 @@ describe('node failure dispatch notification', () => {
         throw new Error('closed');
       }) as never)
     ).resolves.toBeUndefined();
+  });
+  test('real closed database notification failure returns through handleNodeFailure', async () => {
+    const errors: string[] = [];
+    await db.close();
+    await caller('patch-pr-body', 'novel failure', errors);
+    expect(errors).toContain('overseer.node_failure_notify_failed');
+    expect(errors.length).toBeLessThanOrEqual(3);
   });
   test('clean_run_creates_no_message', async () => {
     let count = 0;
