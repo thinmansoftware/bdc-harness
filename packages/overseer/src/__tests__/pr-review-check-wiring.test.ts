@@ -110,6 +110,7 @@ describe('extractReviewSummary reads the REAL persisted SubmitOutcome shape', ()
   test('approved carries its summary', async () => {
     const { body, outcome } = await persistedResultBody({
       approved: true,
+      verification: 'verified',
       summary: 'No blocking findings.',
       reviewedHeadSha: HEAD,
     });

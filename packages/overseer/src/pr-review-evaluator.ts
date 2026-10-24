@@ -105,6 +105,8 @@ export interface PrReviewCheckPartition {
 
 export interface PrReviewResult {
   verdict: PrReviewVerdict;
+  /** Positive approval requires explicit verification of the exact head. */
+  verification?: 'verified' | 'unverified';
   findings: IndependentReviewFinding[];
   reviewed_head_sha: string;
   reviewer: ReviewAgentIdentity;
@@ -307,13 +309,18 @@ export function partitionChecksByRequired(
   };
 }
 
-type CheckGateResult = Pick<PrReviewResult, 'verdict' | 'findings'>;
+type CheckGateResult = Pick<PrReviewResult, 'verdict' | 'findings' | 'verification'>;
 
 export function applyRequiredCheckGate<T extends CheckGateResult>(
   parsed: T,
   partition: PrReviewCheckPartition
 ): T {
-  if (parsed.verdict !== 'APPROVE' && parsed.verdict !== 'REQUEST_CHANGES') return parsed;
+  if (
+    parsed.verdict !== 'APPROVE' &&
+    parsed.verdict !== 'APPROVE_UNVERIFIED' &&
+    parsed.verdict !== 'REQUEST_CHANGES'
+  )
+    return parsed;
 
   const checks = [...partition.gating, ...partition.nonRequired];
   const checkNames = new Set(checks.map(check => normalizedCheckName(check.name)));
@@ -375,7 +382,14 @@ export function applyRequiredCheckGate<T extends CheckGateResult>(
   const hasFailedGatingCheck = partition.gating.some(
     check => check.status === 'completed' && !conclusionIsPassing(check.conclusion)
   );
-  const verdict = hasFailedGatingCheck || hasBlockingFinding ? 'REQUEST_CHANGES' : 'APPROVE';
+  // Check reconciliation cannot manufacture verification or erase a real code
+  // blocker. Only a positively verified, otherwise clear judgment can approve.
+  const verdict =
+    hasFailedGatingCheck || hasBlockingFinding
+      ? 'REQUEST_CHANGES'
+      : parsed.verification === 'verified' && parsed.verdict !== 'APPROVE_UNVERIFIED'
+        ? 'APPROVE'
+        : 'APPROVE_UNVERIFIED';
   return { ...parsed, verdict, findings: reconciled };
 }
 

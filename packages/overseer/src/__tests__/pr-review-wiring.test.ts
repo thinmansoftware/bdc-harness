@@ -63,6 +63,7 @@ function submitOctokit(): RealGitHubOctokitLike {
 function reviewResult(overrides: Partial<PrReviewResult> = {}): PrReviewResult {
   return {
     verdict: 'APPROVE',
+    verification: 'verified',
     findings: [],
     reviewed_head_sha: HEAD,
     reviewer: { provider: 'test-cli', model: 'test-model' },
@@ -92,6 +93,7 @@ describe('PR review approval verdict recording', () => {
         prNumber: 42,
         headSha: HEAD,
         model: 'review-model',
+        verification: 'verified',
       },
       {
         persistUnverifiedEvidence: async () => true,
@@ -129,7 +131,7 @@ describe('PR review approval verdict recording', () => {
   test('a repeated approval at the same head is a no-op after the claim loses', async () => {
     let finalized = 0;
     await recordReviewApprovalVerdict(
-      { owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD },
+      { owner: 'o', repo: 'r', prNumber: 1, headSha: HEAD, verification: 'verified' },
       {
         persistUnverifiedEvidence: async () => true,
         resolveUnverifiedEvidence: async () => 0,

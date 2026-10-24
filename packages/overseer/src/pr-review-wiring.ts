@@ -101,6 +101,7 @@ export async function recordReviewApprovalVerdict(
     messageId?: string;
     model?: string;
     disposition?: string;
+    verification?: 'verified' | 'unverified';
   },
   deps: ReviewApprovalVerdictDeps = {
     claimVerdict: claimOverseerVerdict,
@@ -113,7 +114,16 @@ export async function recordReviewApprovalVerdict(
   const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
   const prUrl = `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`;
   const evidence = { runId, headSha: input.headSha, prUrl, reviewId: input.messageId };
-  const unverified = input.disposition === 'approved_unverified';
+  // A positive string alone must never clear a hold or create merge authority.
+  // Legacy or injected approvals without explicit verification fail closed.
+  if (
+    input.disposition &&
+    input.disposition !== 'approved' &&
+    input.disposition !== 'approved_unverified'
+  )
+    return;
+  const unverified =
+    input.disposition === 'approved_unverified' || input.verification !== 'verified';
   if (
     unverified &&
     !(await deps.persistUnverifiedEvidence({
@@ -128,7 +138,7 @@ export async function recordReviewApprovalVerdict(
     await deps.reviseVerdict?.({
       runId,
       headSha: input.headSha,
-      unverified: input.disposition === 'approved_unverified',
+      unverified,
       allowUnverifiedResolution: resolved > 0,
     });
     return;
@@ -136,9 +146,8 @@ export async function recordReviewApprovalVerdict(
   await deps.finalizeVerdict({
     verdictId: claim.verdictId,
     status: 'verdict',
-    verdict:
-      input.disposition === 'approved_unverified' ? 'approved_unverified' : 'merge_candidate',
-    proposedAction: input.disposition === 'approved_unverified' ? 'none' : 'flag_merge_ready',
+    verdict: unverified ? 'approved_unverified' : 'merge_candidate',
+    proposedAction: unverified ? 'none' : 'flag_merge_ready',
     model: input.model,
     prUrl,
   });
@@ -147,6 +156,7 @@ export async function recordReviewApprovalVerdict(
 export async function maybeRecordReviewApprovalVerdict(
   input: {
     disposition: string;
+    verification?: 'verified' | 'unverified';
     owner: string;
     repo: string;
     prNumber: number;
@@ -1077,6 +1087,7 @@ export function createRealSubmitDeps(
       return {
         approved: result.verdict === 'APPROVE',
         approvedUnverified: result.verdict === 'APPROVE_UNVERIFIED',
+        ...(result.verification ? { verification: result.verification } : {}),
         ...(result.verification_reason ? { verificationReason: result.verification_reason } : {}),
         summary,
         reviewedHeadSha: result.reviewed_head_sha,
@@ -1091,6 +1102,7 @@ export function createRealSubmitDeps(
       await (overrides.recordApprovalVerdict ?? recordReviewApprovalVerdict)({
         ...work,
         disposition: 'approved_unverified',
+        verification: 'unverified',
         model: modelReviewer.model,
       });
     },

@@ -119,6 +119,25 @@ function fakeDeps(
 afterEach(() => stopReviewWorkerClock());
 
 describe('review worker clock', () => {
+  test('completed unverified review work persists its nonmergeable disposition and verification', async () => {
+    const outcome: SubmitOutcome = {
+      disposition: 'approved_unverified',
+      verification: 'unverified',
+      event: 'COMMENT',
+      reason: 'sandbox unavailable',
+    };
+    const deps = fakeDeps([message('unverified')], () => outcome);
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'done',
+        task_outcome: 'succeeded',
+        result_body: JSON.stringify(outcome),
+      })
+    );
+    expect(deps.deferMessage).not.toHaveBeenCalled();
+  });
+
   test('submits the queued exact head once and marks the item done', async () => {
     const queued = [message('one', 'exact-head')];
     const deps = fakeDeps(queued);

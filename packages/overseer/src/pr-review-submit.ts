@@ -38,6 +38,7 @@ export interface ReviewerVerdict {
   approved: boolean;
   /** Approval judgment that could not verify the exact head; never mergeable. */
   approvedUnverified?: boolean;
+  verification?: 'verified' | 'unverified';
   verificationReason?: string;
   /** Evidence. REQUIRED (non-empty) when approved === false. */
   summary: string;
@@ -170,6 +171,7 @@ export type SubmitDisposition =
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
+  verification?: 'verified' | 'unverified';
   reason?: string;
   event?: OverseerReviewEvent;
   /**
@@ -234,6 +236,7 @@ export interface SubmitDeps {
     prNumber: number;
     headSha: string;
     disposition: SubmitDisposition;
+    verification?: 'verified' | 'unverified';
     event?: OverseerReviewEvent;
     reason?: string;
     /**
@@ -505,7 +508,8 @@ export async function runAndSubmitReview(
     });
   }
 
-  if (verdict.approvedUnverified) {
+  if (verdict.approvedUnverified || (verdict.approved && verdict.verification !== 'verified')) {
+    verdict.verification = 'unverified';
     const reason =
       verdict.verificationReason?.trim() || verdict.summary.trim() || 'verification unavailable';
     try {
@@ -694,9 +698,14 @@ async function handBackToTaskmaster(
  * spread form keeps every terminal branch's shape identical to what it was
  * before this field existed when there is nothing to carry.
  */
-function summaryField(verdict: ReviewerVerdict): { summary?: string } {
+function summaryField(verdict: ReviewerVerdict): Pick<SubmitOutcome, 'summary' | 'verification'> {
   const summary = verdict.summary?.trim() ?? '';
-  return summary.length > 0 ? { summary } : {};
+  return {
+    ...(summary.length > 0 ? { summary } : {}),
+    ...(verdict.verification === 'verified' || verdict.verification === 'unverified'
+      ? { verification: verdict.verification }
+      : {}),
+  };
 }
 
 function errorCode(error: unknown): string {
@@ -719,6 +728,7 @@ async function finish(
       prNumber: work.prNumber,
       headSha,
       disposition: outcome.disposition,
+      ...(outcome.verification ? { verification: outcome.verification } : {}),
       ...(outcome.event ? { event: outcome.event } : {}),
       ...(outcome.reason ? { reason: outcome.reason } : {}),
       ...(outcome.remediation ? { remediation: outcome.remediation } : {}),

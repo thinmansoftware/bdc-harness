@@ -779,6 +779,7 @@ describe('submit path hands a rejected verdict back to Taskmaster', () => {
     const { deps: d, emitted } = deps({
       runReviewer: async () => ({
         approved: true,
+        verification: 'verified',
         summary: 'No blocking findings.',
         reviewedHeadSha: 'f868542e0000000000000000000000000000abcd',
         findings: [],
@@ -805,6 +806,7 @@ describe('submit path hands a rejected verdict back to Taskmaster', () => {
     const { deps: d } = deps({
       runReviewer: async () => ({
         approved: true,
+        verification: 'verified',
         summary: 'No blocking findings. Checks green at this head.',
         reviewedHeadSha: 'f868542e0000000000000000000000000000abcd',
         findings: [],

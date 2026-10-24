@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
-import { parseReviewVerdict } from './pr-review-evaluator';
+import { evaluatePullRequest, parseReviewVerdict } from './pr-review-evaluator';
 import * as connection from '@archon/core/db/connection';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import * as verdictStore from '@archon/core/db/overseer';
@@ -109,6 +109,192 @@ describe('unverified approval persistence and execution', () => {
       octokit: {} as never,
       patOctokit: null,
     });
+
+  function evaluatedSubmit(raw: Record<string, unknown>, failedRequired = false) {
+    const submitted: string[] = [];
+    const deps = createRealSubmitDeps('thinman-overseer[bot]', {
+      octokit: {} as never,
+      patOctokit: null,
+      evaluate: (input, evaluatorDeps) =>
+        evaluatePullRequest(input, {
+          ...evaluatorDeps,
+          fetchAcceptanceCriteria: async () => null,
+          fetchEvidence: async () => ({
+            diff: '+ safe',
+            requiredContexts: ['required'],
+            checks: [
+              {
+                name: 'required',
+                status: 'completed',
+                conclusion: failedRequired ? 'failure' : 'success',
+              },
+              { name: 'optional', status: 'completed', conclusion: 'failure' },
+            ],
+          }),
+          invokeModel: async () => ({
+            exitCode: 0,
+            timedOut: false,
+            stdout: output({ reviewed_head_sha: head, ...raw }),
+          }),
+          ladder: ['judge'],
+        }),
+    });
+    deps.currentHeadSha = async () => head;
+    deps.submitReview = async input => {
+      submitted.push(input.event);
+      return { submitted: true };
+    };
+    return { deps, submitted };
+  }
+
+  test('real evaluator reconciliation cannot promote an unverified rejection into a merge', async () => {
+    const request = await reviewRequest('reconciled-unverified');
+    const runId = 'pr-discovery:thinmansoftware/bdc-harness#55:older-run';
+    await verdictStore.ensureDiscoveryRunRow(runId);
+    await db.query(
+      `INSERT INTO overseer_verdicts
+       (id,run_id,wo_id,head_sha,status,verdict,proposed_action,pr_url)
+       VALUES ('older-ready',$1,'WO-3239',$2,'verdict','merge_candidate','flag_merge_ready',$3)`,
+      [runId, head, prUrl]
+    );
+    const { deps, submitted } = evaluatedSubmit({
+      verdict: 'REQUEST_CHANGES',
+      verification: 'unverified',
+      verification_reason: 'sandbox unavailable',
+      findings: [{ scope: 'checks/optional', severity: 'major', summary: 'Optional check failed' }],
+    });
+    const result = await runAndSubmitReview(request, deps);
+    expect(result.disposition).toBe('approved_unverified');
+    expect(result.verification).toBe('unverified');
+    expect(submitted).toEqual(['COMMENT']);
+    expect(await verdictStore.hasUnverifiedApprovalForHead({ head_sha: head, pr_url: prUrl })).toBe(
+      true
+    );
+    expect((await bridge()).merges).toBe(0);
+  });
+
+  test('unverified approval still reconciles failed required checks into a real rejection', async () => {
+    const { deps, submitted } = evaluatedSubmit(
+      {
+        verification: 'unverified',
+        verification_reason: 'sandbox unavailable',
+      },
+      true
+    );
+    const result = await runAndSubmitReview(await reviewRequest('required-check'), deps);
+    expect(result.disposition).toBe('changes_requested');
+    expect(submitted).toEqual(['REQUEST_CHANGES']);
+    expect(result.verification).toBe('unverified');
+  });
+
+  for (const scope of ['checks/stale', 'checks/required', 'checks/optional']) {
+    test(`unverified rejection concerning ${scope} stays nonmergeable after reconciliation`, async () => {
+      const { deps, submitted } = evaluatedSubmit({
+        verdict: 'REQUEST_CHANGES',
+        verification: 'unverified',
+        verification_reason: 'sandbox unavailable',
+        findings: [{ scope, severity: 'major', summary: 'Check failed' }],
+      });
+      const result = await runAndSubmitReview(await reviewRequest(scope), deps);
+      expect(result.disposition).toBe('approved_unverified');
+      expect(submitted).toEqual(['COMMENT']);
+      expect((await bridge()).merges).toBe(0);
+      const receipts = await db.query<{ body: string }>(
+        "SELECT body FROM agent_dispatch_messages WHERE task_type='run_report'"
+      );
+      expect(
+        receipts.rows.some(row => {
+          const body = JSON.parse(row.body);
+          return (
+            body.kind === 'pr_review_submit_receipt' &&
+            body.disposition === 'approved_unverified' &&
+            body.verification === 'unverified'
+          );
+        })
+      ).toBe(true);
+    });
+  }
+
+  test('real code rejection is retained even when verification is unavailable', async () => {
+    const { deps, submitted } = evaluatedSubmit({
+      verdict: 'REQUEST_CHANGES',
+      verification: 'unverified',
+      verification_reason: 'sandbox unavailable',
+      findings: [{ scope: 'src/code.ts', severity: 'major', summary: 'Unsafe code' }],
+    });
+    const result = await runAndSubmitReview(await reviewRequest('code-blocker'), deps);
+    expect(result.disposition).toBe('changes_requested');
+    expect(submitted).toEqual(['REQUEST_CHANGES']);
+  });
+
+  test('a fresh verified evaluator retry resolves its earlier hold and can merge', async () => {
+    const older = await reviewRequest('before-reconciled-negative');
+    const negative = evaluatedSubmit({
+      verdict: 'REQUEST_CHANGES',
+      verification: 'unverified',
+      verification_reason: 'sandbox unavailable',
+      findings: [{ scope: 'checks/optional', severity: 'major', summary: 'Optional failure' }],
+    });
+    const negativeRequest = await reviewRequest('reconciled-negative');
+    await runAndSubmitReview(negativeRequest, negative.deps);
+    const verified = evaluatedSubmit({
+      verdict: 'REQUEST_CHANGES',
+      findings: [{ scope: 'checks/optional', severity: 'major', summary: 'Optional failure' }],
+    });
+    await runAndSubmitReview(older, verified.deps);
+    expect((await bridge()).merges).toBe(0);
+    const fresh = await runAndSubmitReview(await reviewRequest('fresh-verified'), verified.deps);
+    expect(fresh.disposition).toBe('approved');
+    expect(fresh.verification).toBe('verified');
+    expect(verified.submitted).toEqual(['APPROVE', 'APPROVE']);
+    expect((await bridge()).merges).toBe(1);
+  });
+
+  for (const verification of [undefined, 'unverified', 'invalid'] as const) {
+    test(`submission refuses injected approval with ${verification} verification`, async () => {
+      const request = await reviewRequest('injected-submit');
+      const deps = realSubmit();
+      deps.currentHeadSha = async () => head;
+      deps.runReviewer = async () =>
+        ({
+          approved: true,
+          verification,
+          summary: 'Injected approval',
+          reviewedHeadSha: head,
+        }) as Awaited<ReturnType<SubmitDeps['runReviewer']>>;
+      let event: string | undefined;
+      deps.submitReview = async input => {
+        expect(
+          await verdictStore.hasUnverifiedApprovalForHead({ head_sha: head, pr_url: prUrl })
+        ).toBe(true);
+        event = input.event;
+        return { submitted: true };
+      };
+      const result = await runAndSubmitReview(request, deps);
+      expect(event).toBe('COMMENT');
+      expect(result.disposition).toBe('approved_unverified');
+      expect((await bridge()).merges).toBe(0);
+    });
+
+    test(`recorder refuses injected approval with ${verification} verification`, async () => {
+      const negative = await reviewRequest('recorder-negative');
+      await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
+      const request = await reviewRequest('injected-recorder');
+      await recordReviewApprovalVerdict({
+        ...request,
+        disposition: 'approved',
+        verification,
+      } as Parameters<typeof recordReviewApprovalVerdict>[0]);
+      expect(
+        await verdictStore.hasUnverifiedApprovalForHead({ head_sha: head, pr_url: prUrl })
+      ).toBe(true);
+      const candidates = await db.query<{ count: number }>(
+        "SELECT count(*) AS count FROM overseer_verdicts WHERE proposed_action='flag_merge_ready'"
+      );
+      expect(candidates.rows[0].count).toBe(0);
+      expect((await bridge()).merges).toBe(0);
+    });
+  }
 
   async function bridge(
     hooks: { reserve?: () => Promise<void>; approve?: () => Promise<void> } = {}
@@ -283,7 +469,11 @@ describe('unverified approval persistence and execution', () => {
     const negative = await reviewRequest('initial-unverified');
     await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
     const retry = await reviewRequest('verified-retry');
-    await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+    await recordReviewApprovalVerdict({
+      ...retry,
+      disposition: 'approved',
+      verification: 'verified',
+    });
     const result = await bridge();
     expect(result.merges).toBe(1);
     const rows = await db.query<{ mutation_sent: number }>(
@@ -293,10 +483,18 @@ describe('unverified approval persistence and execution', () => {
   });
   test('old verified approval redelivery cannot clear a newer unverified review', async () => {
     const older = await reviewRequest('old-verified');
-    await recordReviewApprovalVerdict({ ...older, disposition: 'approved' });
+    await recordReviewApprovalVerdict({
+      ...older,
+      disposition: 'approved',
+      verification: 'verified',
+    });
     const negative = await reviewRequest('new-unverified');
     await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
-    await recordReviewApprovalVerdict({ ...older, disposition: 'approved' });
+    await recordReviewApprovalVerdict({
+      ...older,
+      disposition: 'approved',
+      verification: 'verified',
+    });
     expect((await bridge()).merges).toBe(0);
     const holds = await db.query<{ id: string }>(
       "SELECT id FROM overseer_verdicts WHERE verdict='approved_unverified'"
@@ -306,7 +504,11 @@ describe('unverified approval persistence and execution', () => {
   for (const stage of ['reserve', 'approve'] as const) {
     test(`unverified review arriving during ${stage} blocks the final merge and releases its slot`, async () => {
       const initial = await reviewRequest('before-merge');
-      await recordReviewApprovalVerdict({ ...initial, disposition: 'approved' });
+      await recordReviewApprovalVerdict({
+        ...initial,
+        disposition: 'approved',
+        verification: 'verified',
+      });
       let persisted = false;
       const result = await bridge({
         [stage]: async () => {
@@ -328,7 +530,11 @@ describe('unverified approval persistence and execution', () => {
       ).toBe(0);
       expect((await bridge()).merges).toBe(0);
       const retry = await reviewRequest(`verified-after-${stage}`);
-      await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+      await recordReviewApprovalVerdict({
+        ...retry,
+        disposition: 'approved',
+        verification: 'verified',
+      });
       expect((await bridge()).merges).toBe(1);
     });
   }
@@ -340,7 +546,7 @@ describe('unverified approval persistence and execution', () => {
     let failed = false;
     try {
       await recordReviewApprovalVerdict(
-        { ...retry, disposition: 'approved' },
+        { ...retry, disposition: 'approved', verification: 'verified' },
         {
           persistUnverifiedEvidence: verdictStore.recordUnverifiedApprovalEvidence,
           resolveUnverifiedEvidence: verdictStore.resolveUnverifiedApprovalEvidence,
@@ -360,7 +566,11 @@ describe('unverified approval persistence and execution', () => {
       "SELECT verdict FROM overseer_verdicts WHERE run_id LIKE '%:unverified:%'"
     );
     expect(evidence.rows[0].verdict).toBe('approval_verified');
-    await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+    await recordReviewApprovalVerdict({
+      ...retry,
+      disposition: 'approved',
+      verification: 'verified',
+    });
     expect((await bridge()).merges).toBe(1);
   });
 
@@ -368,7 +578,12 @@ describe('unverified approval persistence and execution', () => {
     const negative = await reviewRequest('negative-identity');
     await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
     for (const messageId of [negative.messageId, 'missing-review-request']) {
-      await recordReviewApprovalVerdict({ ...work, messageId, disposition: 'approved' });
+      await recordReviewApprovalVerdict({
+        ...work,
+        messageId,
+        disposition: 'approved',
+        verification: 'verified',
+      });
       expect((await bridge()).merges).toBe(0);
     }
   });
@@ -437,7 +652,11 @@ describe('unverified approval persistence and execution', () => {
         retry.messageId,
       ]);
     }
-    await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+    await recordReviewApprovalVerdict({
+      ...retry,
+      disposition: 'approved',
+      verification: 'verified',
+    });
     expect((await bridge()).merges).toBe(0);
     const rows = await db.query<{ verdict: string }>(
       'SELECT verdict FROM overseer_verdicts WHERE run_id=$1',
@@ -450,7 +669,11 @@ describe('unverified approval persistence and execution', () => {
     await recordReviewApprovalVerdict({ ...work, disposition: 'approved_unverified' });
     await db.query("DELETE FROM overseer_verdicts WHERE run_id LIKE '%:unverified:%'");
     const retry = await reviewRequest('retry-after-legacy');
-    await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+    await recordReviewApprovalVerdict({
+      ...retry,
+      disposition: 'approved',
+      verification: 'verified',
+    });
     expect((await bridge()).merges).toBe(0);
   });
 
@@ -469,7 +692,11 @@ describe('unverified approval persistence and execution', () => {
       }
       return result;
     });
-    await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+    await recordReviewApprovalVerdict({
+      ...retry,
+      disposition: 'approved',
+      verification: 'verified',
+    });
     expect(injected).toBe(true);
     expect((await bridge()).merges).toBe(0);
     const negatives = await db.query<{ verdict: string }>(
@@ -481,7 +708,11 @@ describe('unverified approval persistence and execution', () => {
     ]);
   });
   test('unverified evidence survives a processing merge claim and a verified retry resolves it', async () => {
-    await recordReviewApprovalVerdict({ ...work, disposition: 'approved' });
+    await recordReviewApprovalVerdict({
+      ...work,
+      disposition: 'approved',
+      verification: 'verified',
+    });
     const candidate = await db.query<{ id: string }>(
       "SELECT id FROM overseer_verdicts WHERE proposed_action='flag_merge_ready'"
     );
@@ -508,6 +739,7 @@ describe('unverified approval persistence and execution', () => {
     await recordReviewApprovalVerdict({
       ...retry,
       disposition: 'approved',
+      verification: 'verified',
     });
     expect(await verdictStore.hasUnverifiedApprovalForHead(original)).toBe(false);
     await recordReviewApprovalVerdict({
